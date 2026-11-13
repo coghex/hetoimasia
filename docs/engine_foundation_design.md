@@ -11,7 +11,7 @@ This path remains the architectural reference used by AGENTS.md and existing
 documents. On 2026-09-22 its broad delivery plan was reconciled with the focused
 arcs below. It is an architecture overview, not a document to process into
 another foundation epic. The
-[original plan](archive/history/engine_foundation_design_before_2026-09-22.md)
+[original plan](removed_records.md)
 preserves its bootstrap evidence, original ledger and proposed sequence.
 
 ## Current implementation
@@ -31,7 +31,7 @@ Unmerged implementation branches are not included as delivered capabilities.
 | GPU bookkeeping | [Pure GPU model](gpu_model.md): resource/generation holds, frame ownership, admission budgets and recovery accounting | Performs no Vulkan calls and cannot establish native completion; an owning backend must supply that evidence |
 | Vulkan qualification | The [Vulkan native suite](gpu_backend.md#the-native-suite), which carries the retired proof harness's cases, and retained [compatibility results](vulkan_compatibility_record.md) | Qualifies the [production backend](gpu_backend.md) delivered through #219–#232 rather than a separate harness; the multi-window triangle consumer and its final evidence remain in #233 |
 | Lua | [Private bridge behind an opaque public API](../packages/scripting-lua/README.md) for VM construction, chunks, calls and close, plus the pure task/protocol model | Public application capability registration, protected VM ownership and runtime scheduling/IPC are later slices; Linux and macOS confinement verdicts remain inconclusive |
-| Rendering contracts, 2D and 3D | Reserved component directories and ownership notes | No Cabal libraries or renderer implementations yet; see the [renderer findings](renderer_foundation_findings.md) |
+| Rendering contracts, 2D and 3D | Reserved component directories and ownership notes | No Cabal libraries or renderer implementations yet; see [deferred work](deferred_work.md), FND-3 |
 | Application | [Console entry point](../app/Main.hs) with logging and resource smoke paths | No graphical application or concrete game integration |
 
 The main [Cabal project](../cabal.project) includes the root package, foundation,
@@ -53,10 +53,10 @@ to these focused contracts and work queues:
 | Original concern | Current authority and status |
 | --- | --- |
 | FND-1, CPU resource ownership | [Resource contract](resources.md), delivered through #22; no duplicate slice |
-| FND-2, Vulkan initialization and disposal | [Vulkan backend design](archive/vulkan_backend_design.md), epic #155; native proof #158 delivered; production instance, device and target ownership delivered by #219 ([contract](gpu_backend.md)) |
-| FND-3, minimal depth-tested 3D consumer | [Renderer foundation findings](renderer_foundation_findings.md), FND-3; needs focused refinement |
-| FND-4, independent textured 2D consumer | [Renderer foundation findings](renderer_foundation_findings.md), FND-4; needs focused refinement |
-| FND-5, Lua hosting and application bindings | [Lua runtime design](archive/designs/lua_runtime_design.md), epic #145; binding and protocol model delivered, confinement inconclusive and further processing paused |
+| FND-2, Vulkan initialization and disposal | [Vulkan backend design](removed_records.md), epic #155; native proof #158 delivered; production instance, device and target ownership delivered by #219 ([contract](gpu_backend.md)) |
+| FND-3, minimal depth-tested 3D consumer | [Deferred work](deferred_work.md), FND-3; needs focused refinement |
+| FND-4, independent textured 2D consumer | Delivered by the 2D renderer, [render-2d](../packages/render-2d/README.md) |
+| FND-5, Lua hosting and application bindings | [Lua runtime design](removed_records.md), epic #145; binding and protocol model delivered, confinement inconclusive and further processing paused |
 
 ## Component boundaries
 
@@ -144,8 +144,8 @@ standing permission to publish later changes outside their delivery lane.
 
 ### D-7. Process the dedicated logging and resource designs
 
-The owner requested readiness of the [logging](archive/logging_design.md) and
-[resource](archive/resource_ownership_design.md) designs on 2026-09-10. Those arcs are
+The owner requested readiness of the [logging](removed_records.md) and
+[resource](removed_records.md) designs on 2026-09-10. Those arcs are
 delivered. Their failure and ownership policies remain authoritative; FND-1's
 old entry delegates to #22 rather than creating duplicate work.
 
@@ -154,7 +154,7 @@ old entry delegates to #22 rather than creating duplicate work.
 The owner prioritized methodical infrastructure over rushing another triangle.
 Logging, CPU resource ownership, messaging, runtime initialization/lifecycle,
 worker supervision and GLFW now have dedicated contracts and implementations.
-The [backend design](archive/vulkan_backend_design.md) owns the accepted windowed-triangle
+The [backend design](removed_records.md) owns the accepted windowed-triangle
 milestone, GPU completion rules, capability profiles and Linux/macOS qualification.
 Follow its concrete prerequisites; do not revive the old offscreen-first
 Vulkan bootstrap.
@@ -171,7 +171,7 @@ runs an issue or pull request needs; approved isolated Linux displays need
 none.
 
 Game saves and game-specific determinism remain application-owned.
-[Lua D-23](archive/designs/lua_runtime_design.md#d-23-deterministic-simulation-is-a-design-requirement)
+[Lua D-23](removed_records.md)
 makes deterministic authoritative simulation a requirement: initially qualify
 identical results on the same build/platform for identical initial state,
 content, seed, tick-assigned inputs and scheduling configuration. Engine timing

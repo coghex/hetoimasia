@@ -106,7 +106,7 @@ isolated worktrees.
 
 Documentation is tracked but never gated on CI or review. Land it on `master`
 with `docs-push [-m "message"] <paths...>` from any worktree as soon as it is
-ready: design and report work, guide and project-review ledgers, and the
+ready: design and report work, guide ledgers, and the
 documentation, evidence write-ups and verdicts that go with a code change. A
 pull request links its documentation (`Docs: docs/x.md @ <commit>`) instead of
 containing it, so a documentation fix never costs a re-review or a CI run.

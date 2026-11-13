@@ -1,1021 +1,411 @@
 # GPU retention and frame ownership
 
-Current behavior of `Hetoimasia.GPU.Model`, the pure model in
-`packages/gpu-vulkan/model`: typed identities for everything a graphics session
-tracks, the holds that decide when any of it may be disposed of, frame ownership
-phases and their obligations, validated admission budgets, recovery accounting,
-and bounded owner progress. The accepted policy lives in
-[the Vulkan backend design](archive/vulkan_backend_design.md) (D-15 through D-18, D-22
-through D-26, and P-1, P-2, P-8, P-14 and P-15); this document describes what the
-code does today.
+The contract of `Hetoimasia.GPU.Model`, the pure model in
+`packages/gpu-vulkan/model`: typed identities for everything a graphics
+session tracks, the holds that decide when any of it may be disposed of, frame
+ownership phases, validated admission budgets, recovery accounting, and
+bounded owner progress.
 
-**This model proves no native completion.** It makes no native call, names no
-native type, owns no thread and reads no clock. A submitted use, a presentation
-obligation and an unpresented frame's synchronization end when — and only when —
-the owning boundary supplies the corresponding fact through the injected
+**The model proves no native completion.** It makes no native call, names no
+native type, owns no thread and reads no clock. A submitted use, a
+presentation obligation and an unpresented frame's synchronization end only
+when the owning boundary supplies the corresponding fact through the injected
 `EvidenceSource`. Elapsed time, a returned call, a cancellation, a reset fence
-and a CPU scope exit are none of them evidence, and there is no operation by
-which any of them becomes one. Which native mechanism proved a fact is the
-boundary's business and is deliberately absent from the fact.
+and a CPU scope exit are not evidence.
 
-Scope: one graphics session's bookkeeping, as a value the owner threads. The
-native backend package that owns handles, calls and threads,
-`packages/gpu-vulkan/native`, depends on this package, and this package does
-not depend on it. Today that package holds only VK-6's validation messengers;
-their header-free capture is the diagnostics package, whose contract is
-[Vulkan validation diagnostics](vulkan_diagnostics.md).
-
-## Ownership
-
-| Owner                | Owns                                                                                                |
-| -------------------- | --------------------------------------------------------------------------------------------------- |
-| This model           | Identities, holds, frame phases, admission budgets, recovery accounting, progress bounds and deadlines |
-| The owning boundary  | The session identity, every completion and disposal fact, and reading the clock                      |
-| Foundation           | `Instant`, `Duration`, validated construction and deadline arithmetic ([time](time.md))              |
-| A later backend      | Native handles, calls, threads, and the evidence that answers the injected interface                  |
+| Owner | Owns |
+| --- | --- |
+| This model | Identities, holds, frame phases, admission budgets, recovery accounting, progress bounds and deadlines |
+| The owning boundary | The session identity, every completion and disposal fact, reading the clock |
+| Foundation | `Instant`, `Duration`, deadline arithmetic ([time](time.md)) |
+| The backend (`packages/gpu-vulkan/native`) | Native handles, calls, threads, and the evidence |
 
 ## The package boundary
 
-`hetoimasia-gpu-vulkan-model` depends on `hetoimasia-foundation` and on nothing
-else in this repository: not the Vulkan binding, not GLFW, not the runtime, not a
-game. It is listed in both `cabal.project` and `cabal.project.cpu`, carries the
-per-package `-Werror` entry in `cabal.project.common`, and its suite is
-registered as the CPU validation group `test.vulkan`, whose command runs through
-`cabal.project.cpu`. A developer with no Vulkan SDK can therefore build and run
-it, and that is a permanent property rather than a convenience.
-
-Only `Hetoimasia.GPU.Model`, `Hetoimasia.GPU.Model.Access`,
-`Hetoimasia.GPU.Model.Budget` and `Hetoimasia.GPU.Model.Identity` are exposed. The implementation lives in hidden
-`Hetoimasia.GPU.Model.Internal` modules, which is what makes an identity
-unforgeable: no client can build one, so every value a model is handed was issued
-by some model, and the model it reaches can say whether that model was this one.
-External-client examples in the suite import each implementation module and
-require the compiler to refuse it as hidden in this library.
+`hetoimasia-gpu-vulkan-model` depends only on `hetoimasia-foundation`: not the
+Vulkan binding, GLFW, the runtime or a game. It builds under
+`cabal.project.cpu`, so a developer with no Vulkan SDK can build and test it;
+that is a permanent property. Only `Hetoimasia.GPU.Model`, `.Access`,
+`.Budget` and `.Identity` are exposed. Identities are unforgeable because the
+implementation is hidden: every value a model is handed was issued by some
+model.
 
 ### Implementation modules
 
-The hidden implementation is one immutable `GpuModel` value divided by
-responsibility. Every import points to a lower layer or to a sibling that does
-not import back, so the graph is acyclic without boot files. The modules below
-are all under `Hetoimasia.GPU.Model.Internal`.
+One immutable `GpuModel` value divided by responsibility under
+`Hetoimasia.GPU.Model.Internal`, acyclic without boot files:
 
-| Layer                  | Modules | Owns |
-| ---------------------- | ------- | ---- |
-| Value types            | `Identity`, `Hold`, `Budget`, `Recovery`, `Access` | Identities and misuse, the hold ledger, validated budgets, per-episode recovery and backoff policy, and the ordering rules for managed resources |
-| Representation         | `Records`, `State` | The records a session holds; the `GpuModel` value, its construction, `Outcome`, and the session state that gates admission |
-| Shared building blocks | `Resolve`, `Accounting` | Identity resolution and misuse classification; record edits, object and byte accounting, and freeing a frame slot whose obligations have ended |
-| Read-only queries      | `Work` | The work summary, the one disposal-eligibility rule, replacements owed, and recovery deadlines |
-| Scheduling             | `Scheduling` | The one scheduling rule and the wrappers every transition applies it through |
-| Transitions            | `Session`, `Targets`, `Generations`, `Resources`, `Initialization`, `Memory`, `Frames`, `Recording`, `Submission`, `Presentation`, `Completion`, `TargetRecovery`, `Disposal` | Escalation and device loss; target, generation, managed-resource and allocation lifecycles; image initialization; device-memory reservation and settlement; reservation and acquisition; recorded batches; submission; presentation and abandonment; injected evidence; recovery transitions; disposal and reclamation |
-| Composition            | `Progress` | Owner turns and the deadline of the next one |
-| Views                  | `Observation` | Hold, frame and target views, usage, and the live record count |
+| Layer | Modules |
+| --- | --- |
+| Value types | `Identity`, `Hold`, `Budget`, `Recovery`, `Access` |
+| Representation | `Records`, `State` |
+| Shared building blocks | `Resolve`, `Accounting` |
+| Read-only queries | `Work` |
+| Scheduling | `Scheduling` |
+| Transitions | `Session`, `Targets`, `Generations`, `Resources`, `Initialization`, `Memory`, `Frames`, `Recording`, `Submission`, `Presentation`, `Completion`, `TargetRecovery`, `Disposal` |
+| Composition | `Progress` |
+| Views | `Observation` |
 
-The queries sit below every transition because the schedule is decided from
-them: each transition compares the work summary before and after itself, and
-that summary counts disposable subjects, owed replacements and recovery
-deadlines. `Work`'s `eligible` is the only rule for offering a subject for
-disposal — a retired generation or a managed resource, every hold ended, and no
-earlier failed disposal — and the work summary, owner progress and reclamation
-all read it. The public `disposalEligible` is a narrower observation: it answers
-only whether a live subject still owes a hold, and never authorizes a disposal or
-a retry after one failed. `Recovery` is the episode policy as values;
-`TargetRecovery` applies it to the model's targets. Within the transition layer,
-`Presentation` builds on `Recording`'s batch discard, `Recording` and
-`Submission` on `Initialization`'s withdrawal and publication, and `Disposal`
-on `Completion`'s evidence interface, and nothing imports back.
+Queries sit below every transition because the schedule is decided from them.
+`Work`'s `eligible` is the only rule for offering a subject for disposal: a
+retired generation or a managed resource, every hold ended, and no earlier
+failed disposal. The public `disposalEligible` is narrower: it answers only
+whether a live subject still owes a hold, and never authorizes a disposal or a
+retry after one failed.
 
 ## Answers
 
-Every mutating operation answers exactly one of three things, and they are kept
-apart because they are different facts:
+Every mutating operation answers exactly one of:
 
-```haskell
-data Outcome a
-  = Admitted !a           -- the operation happened
-  | Backpressure !BudgetKind  -- a validated budget is exhausted; nothing failed
-  | Rejected !Misuse      -- typed misuse, detected before any state changed
-```
+- `Admitted a`: the operation happened;
+- `Backpressure kind`: a validated budget is exhausted; nothing failed and
+  nothing changed;
+- `Rejected misuse`: typed misuse, detected before any state changed.
 
-A rejected call is never a partially applied one. Misuse is checked before
-anything is written, so the answer and the state can never disagree about whether
-something happened.
-
-A failed session admits no new work: every admission answers
-`SessionAlreadyFailed`. Recording what a native call already did is not new
-work, so a call whose own failure ended the session — a device loss it raised —
-still has its outcome recorded: an acquisition that owned nothing gives its
-reservation back, and a submission that failed with no effect, or with an effect
-nobody can know, is recorded as such. Only an acquisition that owns an image and
-an accepted submission are refused.
+A failed session admits no new work (`SessionAlreadyFailed`). Recording what a
+native call already did is not new work, so the outcome of a call whose own
+failure ended the session is still recorded.
 
 ## Identities
 
-| Identity         | Names                                                                    |
-| ---------------- | ------------------------------------------------------------------------ |
-| `SessionIdentity`| The session, from a `Unique` the boundary created for it alone            |
-| `DeviceId`       | The one logical device the session owns                                   |
-| `TargetId`       | A rendering target: its number and the incarnation that number is on      |
-| `GenerationId`   | One swapchain generation of one target                                    |
-| `ImageId`        | One tracked image record of one generation, at its index                  |
-| `FrameSlotId`    | One use of one frame slot: the target, the slot, and the use it is on     |
-| `BatchId`        | One recorded batch of commands: a frame's, of its target, or a frame-less one, of the session alone |
-| `SubmissionId`   | One submission record, shared by every frame one call submitted           |
-| `PresentationId` | One record of the target's finite presentation pool                       |
-| `ResourceId`     | One generation of one managed resource                                    |
-| `AllocationId`   | One native allocation attempt, stable across its reclamation and retry    |
+`SessionIdentity`, `DeviceId`, `TargetId`, `GenerationId`, `ImageId`,
+`FrameSlotId`, `BatchId`, `SubmissionId`, `PresentationId`, `ResourceId` and
+`AllocationId`.
 
-Target numbers and frame slot numbers are reused once their records are
-forgotten; incarnations and use counters are not. So a retained identity for a
-retired target or a finished frame is *stale* rather than a handle on its
-successor, and staleness is decidable by comparing counters rather than by
-remembering every identity ever issued.
-
-`Misuse` distinguishes `ForeignIdentity` (another session's), `UnknownIdentity`
-(never issued), `StaleIdentity` (issued, since retired or superseded),
-`AlreadyConsumed` (a one-shot record settled twice), `WrongPhase`,
-`DuplicateSubject` (one call naming the same object twice), `WrongParent` (this
-session's, but not the object it was passed alongside), `EmptySubmission`,
-`EmptyAllocation`, and `SessionAlreadyFailed`. Each names only the *kind* of
-identity, never the value, so a refusal about a foreign value cannot smuggle that
-value back out.
-
-A compound identity is reported as being about *itself*. A generation, frame,
-batch or presentation resolves through its target, but a failure there is
-answered with the kind the caller actually supplied: the category is preserved —
-a foreign parent still means foreign — while naming the parent would describe a
-value the caller never passed. `WrongParent` is kept separate from
-`ForeignIdentity` for the same reason: one target's generation offered to another
-is a mistake about the association between two of this session's own identities,
-not about whose session they came from.
-
-A managed resource is rebuilt only through its *current* generation, and the
-successor is derived from the resource's own counter rather than from the
-identity handed in. Rebuilding through a retained older identity would otherwise
-reissue a number that is already live, overwriting one replacement with another
-and leaking the accounting of the first. Once the last generation of a logical
-resource is disposed of, its current-generation entry is forgotten rather than
-kept as permanent history; a retained identity for it is still stale, decided by
-the monotonic resource counter.
-
-`TargetView` reports the target's recovery epoch and how many cycles are still
-waiting for one of their halves, so a caller — or an example — can see the
-distinctions above rather than infer them.
-
-An image belongs to one *unpresented* owner at a time. The presentation record
-that takes an image at acquisition carries that exact image, and that record
-outlives its frame — the slot is reusable as soon as its own submission
-completes, while the record still owes a retirement. While the frame that took
-the image has not enqueued a presentation for it, a second acquisition of that
-image of that generation is refused: the frame is the only owner, and the refusal
-holds whether the frame is acquired, submitted, failed without enqueuing a
-presentation, in an uncertain-effect state, or retiring while it awaits explicit
-settlement.
-
-Enqueuing the presentation ends that exclusivity. The image is the presentation
-engine's then, and P-2 acquisition synchronization — not a host wait on the older
-present fence — is what makes the next use of it safe, so a second acquisition is
-admitted as soon as a free pool record is available for it. Nothing about the
-older record moves: it still names its own image, it still owes its own
-retirement, and it is discharged by evidence for itself alone. Two live records
-of one generation may therefore name one image, and each settles independently in
-either order. An image the owner never presented is released only by the explicit
-settlement of its unpresented frame, and a reacquisition that finds no free pool
-record is ordinary backpressure rather than a refusal about ownership.
-
-A target is classified `RequiredTarget` or `OptionalTarget` when it is admitted.
-The classification decides only what exhausted recovery escalates to; it never
-weakens an ownership or completion requirement.
+- Target and frame slot numbers are reused once their records are forgotten;
+  incarnations and use counters are not. A retained identity is therefore
+  stale, never a handle on its successor, and staleness is decided by
+  comparing counters.
+- `Misuse` distinguishes `ForeignIdentity`, `UnknownIdentity`,
+  `StaleIdentity`, `AlreadyConsumed`, `WrongPhase`, `DuplicateSubject`,
+  `WrongParent`, `EmptySubmission`, `EmptyAllocation` and
+  `SessionAlreadyFailed`. Each names the kind of identity, never the value. A
+  compound identity is reported as itself, not as its parent.
+- A managed resource is rebuilt only through its current generation, and the
+  successor comes from the resource's own counter.
+- An image has one unpresented owner at a time. Until the frame that took an
+  image enqueues a presentation for it, a second acquisition of that image is
+  refused. After the enqueue the image may be acquired again against a
+  separate free pool record; the older record still owes its own retirement
+  and is discharged only by evidence for itself. No free pool record is
+  backpressure, not a refusal.
+- A target is `RequiredTarget` or `OptionalTarget`. The classification decides
+  only what exhausted recovery escalates to.
 
 ## Holds
 
-Five holds are tracked separately on each generation and each managed resource,
-because discharging one never implies another:
+Five holds are tracked separately on each generation and managed resource:
 
-| Hold                       | Ends when                                                               |
-| -------------------------- | ------------------------------------------------------------------------ |
-| Logical release            | The owner releases or retires the subject                                |
-| Ended CPU use              | The owner certifies no retained capability can record it again           |
-| Recorded reference         | Its batch is discarded, its recorder reset, or the batch is submitted    |
-| Submitted use              | The boundary supplies the completion fact for that submission record     |
-| Presentation obligation    | The boundary supplies retirement evidence, or unpresented-frame settlement |
+| Hold | Ends when |
+| --- | --- |
+| Logical release | The owner releases or retires the subject |
+| Ended CPU use | The owner certifies no retained capability can record it again |
+| Recorded reference | Its batch is discarded, its recorder reset, or the batch is submitted |
+| Submitted use | The boundary supplies the completion fact for that submission record |
+| Presentation obligation | The boundary supplies retirement evidence, or unpresented-frame settlement |
 
-A subject is eligible for disposal only when **every** hold has ended, and the
-model offers nothing else for disposal. `holdView` reports what is still owed;
-`disposalEligible` reports whether a live subject has no outstanding holds.
-That query does not check generation phase or an earlier failed disposal. The
-progress and reclamation paths also require a generation to be retired and
-exclude subjects whose disposal already failed, so a `True` answer never
-authorizes retrying a failed disposal.
+A subject is eligible for disposal only when every hold has ended.
 
-Submitted uses are keyed by their submission record and presentation obligations
-by their presentation record. So a batch of several frames submitted in one call
-shares exactly one record and discharges once, while frames submitted by separate
-calls owe separate records; and rendering completion never recycles presentation
-synchronization, because the two are different keys on different holds.
-
-A subject whose logical release or ended CPU use has been certified takes no new
-recorded reference: the owner has already said that nothing can still record it,
-and a batch admitted afterwards would make that certification false. Batches
-already recorded are untouched by a later certification.
-
-Discarding a batch, resetting a recorder and abandoning unsubmitted work each
-discharge exactly their own references and nothing else. Recording retains the
-exact generations it referenced: rebuilding a managed resource beneath a recorded
-batch leaves the batch naming the generation it recorded, which therefore stays
-undisposable.
-
-A batch is retained incrementally. `recordBatch` admits it against an acquired
-frame with the subjects known then — possibly none besides the frame's own
-generation — and reserves its one record, which is all the accounting a batch
-needs. `extendBatch` then adds references to that same batch before each command
-that names them is recorded, and charges nothing, so an exhausted object budget
-refuses a new batch but never a reference the recorder owes an existing one. The
-batch keeps its identity, and each subject is retained once however many
-commands use it: naming a subject the batch already holds is repeated use, not a
-duplicate. A request naming one subject twice is `DuplicateSubject`, and a subject
-whose logical release or ended CPU use has been certified is `WrongPhase` even if
-the batch already holds it, because a new command would record through it.
-Either refusal changes nothing, and a consumed batch extends no further.
-
-A batch leaves the model by discard, reset, skip or submission, and only the
-last means its work was submitted. `submissionCarries` answers, while a
-submission is outstanding, whether it consumed a given batch — by its full
-identity, so another session's batch of the same number never matches — the positive
-evidence a boundary needs before treating a batch's work as submitted, since a
-frame whose batch was reset can still be submitted without it.
+- Submitted uses are keyed by submission record and presentation obligations
+  by presentation record. Frames submitted in one call share one record.
+  Rendering completion never recycles presentation synchronization.
+- A subject whose logical release or ended CPU use is certified takes no new
+  recorded reference.
+- Discard, reset and abandonment each discharge exactly their own references.
+  A batch keeps the exact generations it recorded, so rebuilding a resource
+  beneath it leaves that generation undisposable.
+- `recordBatch` admits a batch against an acquired frame and reserves its one
+  record. `extendBatch` adds references before each command that names them
+  and charges nothing, so an exhausted object budget never refuses a reference
+  an existing batch owes.
+- A batch leaves by discard, reset, skip or submission. `submissionCarries`
+  answers whether an outstanding submission consumed a given batch.
 
 ## Frame ownership
 
-| Phase                       | Retains                                                        | Legal exits                                                                 |
-| --------------------------- | -------------------------------------------------------------- | ---------------------------------------------------------------------------- |
-| Reserved                    | A slot and a presentation-pool record; no image                | Acquire; a not-ready or out-of-date result returns the reservation whole     |
-| Acquired                    | The exact generation and image, and the pool record             | Record, submit, or safely skip                                              |
-| Submitted                   | Its submission record, plus the image and the pool record       | Enqueue a presentation, or close before presenting                          |
-| Presentation enqueued       | Its presentation record, and its submission until it completes  | The record retires on retirement evidence; the slot frees when the submission does |
-| Retiring or abandoning      | Exactly the obligations it had when it left its previous phase  | Each settles on its own evidence                                            |
-| Uncertain effect            | Its parents, permanently; admission has stopped                 | None: the record can never be discharged                                    |
-| Reusable                    | Nothing                                                         | The slot is issued again under a fresh use number                           |
+| Phase | Retains | Legal exits |
+| --- | --- | --- |
+| Reserved | A slot and a presentation-pool record; no image | Acquire; a not-ready or out-of-date result returns the reservation whole |
+| Acquired | The exact generation and image, and the pool record | Record, submit, or safely skip |
+| Submitted | Its submission record, the image and the pool record | Enqueue a presentation, or close before presenting |
+| Presentation enqueued | Its presentation record, and its submission until it completes | The record retires on retirement evidence; the slot frees when the submission does |
+| Retiring or abandoning | Exactly the obligations it had | Each settles on its own evidence |
+| Uncertain effect | Its parents, permanently; admission has stopped | None |
+| Reusable | Nothing | The slot is issued again under a fresh use number |
 
-The distinctions that lose obligations when collapsed:
+Distinctions that lose obligations when collapsed:
 
 - **Not ready against suboptimal.** A not-ready or timed-out acquisition owns
-  nothing, creates no synchronization obligation, and gives its slot and its
-  untouched pool record straight back. A suboptimal acquisition is a *successful*
-  one: it keeps its image index, coalesces a replacement request beside it, and
-  can be finished or abandoned normally.
-- **Out of date.** No new acquisition obligation is created and the reservation
-  goes back, while every older obligation on the target is untouched.
+  nothing and gives its slot and pool record back. A suboptimal acquisition is
+  successful: it keeps its image and coalesces a replacement request.
 - **The slot against the record.** A frame slot owns command storage and
   acquisition synchronization; the presentation record owns the image once a
-  presentation is enqueued. The slot goes back as soon as its own submission has
-  completed and it holds no unsubmitted recording — in either order, whether the
-  submission completed before the presentation was enqueued or after.
-- **Owned against presented.** Before the enqueue, the frame is the image's only
-  owner and a second acquisition is refused. After it, the image may be acquired
-  again against a separate free pool record, whether or not the older frame's
-  submission has completed yet; the older record is neither retired, recycled,
-  nor discharged by that acquisition.
-- **Skipped against closed.** A skipped unsubmitted frame discharges its
-  unsubmitted recording and keeps its image and acquisition synchronization; a
-  submitted frame closed before presentation keeps *both* its submission
-  obligation and its image obligation. Neither pretends the other happened, and
-  each settles only on its own fact.
+  presentation is enqueued. The slot goes back as soon as its own submission
+  has completed.
+- **Skipped against closed.** A skipped unsubmitted frame keeps its image and
+  acquisition synchronization. A submitted frame closed before presentation
+  keeps both its submission obligation and its image obligation.
 - **No effect against uncertain effect.** A submission that failed with no
-  effects leaves nothing pending, clears the reset fence, and leaves the
-  acquisition and its recording owned and resubmittable. An uncertain-effect
-  outcome creates a record that can never be discharged, retains every parent,
-  and escalates the session — it is never rolled back as if the call did nothing.
-- **A reset fence is not work.** Resetting a submission fence and then submitting
-  nothing leaves no pending submission and no obligation, so no drain may wait on
-  it.
-- **A presentation that enqueued nothing.** The prior rendering and the still-owned
-  image stay owned, and no presentation fence exists to wait on.
+  effect leaves the acquisition and its recording owned and resubmittable. An
+  uncertain effect creates a record that can never be discharged, retains
+  every parent and escalates the session.
+- **A reset fence is not work.** Resetting a fence and submitting nothing
+  leaves no obligation.
+- **A presentation that enqueued nothing** leaves the rendering and the image
+  owned and no presentation fence to wait on.
 
-A frame reserves *two* objects at reservation, before either of the native calls
-whose outcomes they account for: the presentation-pool record it may need, and
-the submission record it may need. Backpressure can therefore never leave an
-admitted frame without the cleanup capacity it needs to be abandoned safely, and
-committing a submission the native call has already performed can never be
-refused for want of accounting — a refusal there would drop the holds for work
-that really was submitted. Frames of one shared submission give back the
-reservations the single record does not need. A reservation that creates no
-obligation returns everything it took; a record that ever covered an acquired
-image is recycled only by retirement evidence for an enqueued presentation, or by
-explicit settlement evidence for a frame that was never presented — and never by
-a later acquisition of the image it named.
+A frame reserves two objects before the native calls they account for: the
+presentation-pool record and the submission record. So backpressure never
+leaves an admitted frame without the capacity to be abandoned safely, and a
+submission the native call already performed is never refused for want of
+accounting.
 
 ## Admission budgets
 
-A configuration is stated as a `BudgetRequest` of `Integer`s and validated once,
-before a model exists. Zero, negative and unrepresentable limits are rejected and
-never clamped; there is no unbounded sentinel.
+A configuration is a `BudgetRequest` of `Integer`s validated once. Zero,
+negative and unrepresentable limits are rejected, never clamped; there is no
+unbounded value. A validated `Budgets` is read-only to clients.
 
-| Budget                 | Default   | Counts                                                              |
-| ---------------------- | --------- | --------------------------------------------------------------------- |
-| Target records         | 16        | Retiring targets too                                                 |
-| Frame slots per target | 2 (1 supported) | Every live frame of the target                                 |
-| Aggregate frame slots  | 32        | Every live frame of the session                                      |
-| Frame-less batches     | 4         | Every frame-less slot in use, from its batch's opening until a discard or its submission's observed completion ([Frame-less batches](#frame-less-batches)) |
-| Live generations       | 2         | Active, constructing and retired together                            |
-| Image tracking limit   | 16        | Tracked image records of one generation                              |
-| Presentation pool      | 18 (derived) | Reserved, unpresented and pending records, shared by the target's active and retired generations |
-| Accounted bytes        | 256 MiB   | Recorded-but-unsubmitted and retired allocations too, device-memory reservations, and the device memory the allocator holds ([Device memory](#device-memory)) |
-| Accounted objects      | 4,096     | Pool records, image records, batch records, submission records and resources |
-| Reclaim examination    | 64        | Records one reclamation pass may examine                             |
-| Progress actions       | 32        | Completion or disposal actions per owner turn                        |
-| Idle backoff cap       | 100 ms    | The last step of the polling schedule                                |
+| Budget | Default | Counts |
+| --- | --- | --- |
+| Target records | 16 | Retiring targets too |
+| Frame slots per target | 2 (1 supported) | Every live frame of the target |
+| Aggregate frame slots | 32 | Every live frame of the session |
+| Frame-less batches | 4 | Slots in use ([Frame-less batches](#frame-less-batches)) |
+| Live generations | 2 | Active, constructing and retired together |
+| Image tracking limit | 16 | Tracked image records of one generation |
+| Presentation pool | 18 (derived) | Image tracking limit plus frame slots, shared by the target's generations |
+| Accounted bytes | 256 MiB | Unsubmitted and retired allocations, reservations, and held device memory |
+| Accounted objects | 4,096 | Pool, image, batch and submission records and resources |
+| Reclaim examination | 64 | Records one reclamation pass may examine |
+| Progress actions | 32 | Completion or disposal actions per owner turn |
+| Idle backoff cap | 100 ms | The last step of the polling schedule |
 
-The presentation pool is **derived**, not configured: it is the overflow-checked
-sum of the image tracking limit and the frame-slot count, so raising frame
-capacity raises the pool with it instead of leaving a frozen constant behind. A
-configuration whose derived sum would not fit is rejected as
-`DerivedBudgetOverflows`.
-
-A validated configuration is **read-only to clients**. `BudgetRequest` is an
-ordinary record, so a small configuration is stated by editing one and
-validating it; `Budgets` is not. Its constructor is unexported, its field labels
-are private to the package, and the twelve limits are read through ordinary
-functions, so record construction and record-update syntax reach no label. There
-is no way for a client to replace a validated limit, and in particular no way to
-set the derived presentation pool to anything but the checked sum it is defined
-as. `newGpuModel` stores the configuration it is handed rather than re-checking
-it, so that closure is what keeps every bound a running model enforces the one
-the validator accepted. External-client compilation examples in the model suite
-hold the boundary: one rejected client per protected limit, one that names the
-constructor, and one accepted client that edits a request, validates it, reads
-every limit and builds a model.
-
-Exhaustion answers `Backpressure` naming the budget. It is not a failure: nothing
-changed, the session is still running, and the caller may try again when the
-budget frees. It never consumes a cleanup record already reserved for admitted
-work, and retired work keeps its accounting until it is actually disposed of, so
-nothing vanishes from the metrics by being retired.
-
-An image count the driver returns that is zero, or above the tracking limit, is
-refused rather than published: the candidate is retired instead, and its
-accounting stays until it is safely disposed of. So is a candidate whose
-construction only finished after the session failed — device loss is terminal, so
-its result is owned for retirement rather than published into a session that is
-over. A replacement request is *counted*, not flagged, and a publication serves
-exactly the request its construction was begun for, so one raised while that
-construction was in flight stays pending.
-
-An allocation attempt that reserves neither bytes nor objects is refused as
-`EmptyAllocation`: it would be a record that costs nothing and therefore bounds
-nothing, which is the one way attempts could accumulate without limit.
-
-Because every admission point is bounded and every record is accounted, storage
-is finite even when no completion ever arrives. The record count is a function of
-the configuration, not of how many attempts were made.
+- Exhaustion answers `Backpressure` naming the budget. It never consumes a
+  cleanup record already reserved, and retired work keeps its accounting until
+  it is disposed of.
+- A driver image count of zero or above the tracking limit is refused: the
+  candidate is retired, not published. So is a candidate whose construction
+  finished after the session failed.
+- A replacement request is counted, not flagged. A publication serves exactly
+  the request its construction began for.
+- An allocation attempt that reserves neither bytes nor objects is
+  `EmptyAllocation`.
+- Storage is finite even when no completion ever arrives: the record count is
+  a function of the configuration.
 
 ### Device memory
 
-The accounted bytes also charge the device memory the backend's allocator holds
-— each block and each dedicated allocation — for as long as it holds it (D-15,
-D-40 of the [GPU resource services design](archive/designs/gpu_resource_services_design.md)).
-Those charges belong to the memory, not to any resource: a block serves many
-resources and may outlive them all, so creating, disposing of or abandoning a
-resource never moves them. The model learns about the memory only as the
-boundary reports it, as plain byte counts:
+Accounted bytes also charge the device memory the backend's allocator holds,
+for as long as it holds it. Those charges belong to the memory, not to a
+resource.
 
-- `reserveDeviceMemory` reserves, for one allocation attempt, the most an
-  allocating call could open, before the call. A reservation the byte budget
-  cannot hold is `Backpressure ByteBudget` and changes nothing. An attempt holds
-  at most one, a failed attempt none until its retry is permitted, and a
-  reservation of nothing is `EmptyAllocation`.
-- `settleDeviceMemory` settles one allocator call's `MemoryEffect` — the bytes
-  it opened and freed — under the attempt's reservation or under none: the
-  reservation is released, what was opened is charged as held, and what was
-  freed is released. It answers `MemorySettled`, or names a defect the
-  boundary must act on: `MemoryBeyondReservation`, memory opened past the
-  reservation, which is charged in full because it is held, even over the
-  budget; or `MemoryFreedUnheld`, a free of more than was held, whose charge
-  stops at zero and so no longer bounds the memory. A call that did both is
-  answered with `MemoryFreedUnheld`, the defect the boundary must treat as
-  terminal. Settlement records what already happened, so a failed
-  session settles too.
-- `createResource` and `rebuildResource` refuse an attempt whose reservation is
-  unsettled (`WrongPhase`), and `abandonAllocation` gives such a reservation
-  back with the rest of the attempt's accounting — never memory already
-  charged as held.
-
-`usageDeviceMemory` is the part of `usageBytes` that is held device memory.
+- `reserveDeviceMemory` reserves, per allocation attempt, the most an
+  allocating call could open, before the call. Over budget is
+  `Backpressure ByteBudget`.
+- `settleDeviceMemory` settles one allocator call's `MemoryEffect`: the
+  reservation is released, what was opened is charged, what was freed is
+  released. It answers `MemorySettled`, `MemoryBeyondReservation` (charged in
+  full, even over budget), or `MemoryFreedUnheld` (the charge no longer bounds
+  the memory; the boundary must treat it as terminal). A failed session
+  settles too.
+- `createResource` and `rebuildResource` refuse an attempt whose reservation
+  is unsettled.
 
 ## Recovery
 
-A recovery episode belongs to its target and survives owner turns. It allows at
-most three construction attempts, with the second 100 ms after the first failure
-and the third 500 ms after the second. Asking early reports the deadline rather
-than spending an attempt.
+A recovery episode belongs to its target and survives owner turns.
 
-An episode holds at most one attempt in flight. A second request while the first
-is outstanding answers `RecoveryOutstanding` rather than spending another of the
-three on one construction, and a failure or success reported with nothing
-outstanding is refused rather than spending one on a construction that never
-began. A terminal session admits no new recovery work at all: device loss is not
-a condition a target can construct its way out of.
-
-The **last** failure of an episode is where recovery is exhausted, not the next
-request for an attempt that no longer exists. Leaving it until someone asked
-would leave the target admitted, unescalated and with nothing scheduled — and on
-an otherwise idle target nobody ever asks.
-
-Close wins there too. An attempt that was outstanding when its target closed
-still has to be settled, but its outcome decides nothing: a retiring target is
-not one recovery can be exhausted on, and a session that has already failed has
-no room for a target to fail it again. An attempt in flight also keeps its target
-from being forgotten, even when the target holds nothing else — forgetting it
-would leave the outcome with nothing to be reported against, and the boundary
-settling it would be told its identity was stale.
-
-Admitting an attempt clears any healthy-progress evidence gathered before it. A
-cycle that the attempt itself interrupted says nothing about a target that has
-just had to be reconstructed again, and carrying it forward would hand the
-episode its budget back on the strength of it.
-
-Nothing raises a spent budget. A nested helper, a changed framebuffer
-observation and an allocation sub-retry all reach the same accounting, which only
-counts up. The single path back to a full budget requires **two** separate
-things: a completed presentation-retirement cycle on the target, and then a full
-second of monotonic progress after it without another failure. Elapsed time alone
-resets nothing.
-
-### Cycles, epochs, and what may be compared with what
-
-A cycle is *both* of its facts. A presentation may retire before its submission
-completes, so retirement on its own is half of one — the frame still owes the
-rendering it submitted — and whichever fact arrives second completes the cycle.
-
-Each cycle is a record of its own, held on the target and keyed by the
-presentation record that identifies it. Both halves are matched to a cycle by
-identity — the presentation by that record, the rendering by the submission the
-cycle is waiting on — so one frame's retirement never pairs with another frame's
-rendering, however many are in flight. It is not held on the frame, because a
-frame slot is reusable as soon as its own submission completes and a cycle can
-outlive that; a half remembered on a frame is a half lost when the slot is
-recycled.
-
-Every target carries a **recovery epoch**. It rises when a recovery attempt is
-admitted, and at no other time, and it never falls — it lives on the target
-rather than on the episode precisely so that resetting the attempt budget cannot
-reissue one.
-
-**Each half carries its own epoch**, stamped when that half arrives, and a cycle
-is credited only when both belong to the epoch the target is in now. The cycle
-does not carry a single stamp of its own, because a half can arrive before the
-cycle is even opened: a submission may complete before its presentation is
-enqueued, and dating that half to the enqueue would hide an attempt that fell
-between the two. The frame remembers the epoch of such an early half until the
-enqueue that opens the cycle it belongs to.
-
-A cycle whose halves straddle an attempt therefore counts for nothing — in either
-order, whether or not the frame was recycled in between, and whether the early
-half arrived before or after the cycle was opened — because an attempt is
-exactly what makes the evidence on either side of it incomparable.
-
-Dropping a cycle's credit touches no hold, no accounting and no record. What it
-settles is whether the target has been *healthy*; the GPU completion facts that
-arrived are applied in full regardless, and every ownership obligation they
-discharge is discharged.
-
-The credit also goes only to an episode that can use it: one with a spent
-attempt, nothing in flight, and a recovery that actually **succeeded**. A cycle
-after a failure is ordinary rendering going on while a retry is still scheduled —
-not the target recovering, and treating it as such would erase that retry.
-
-Exhaustion marks an optional target unavailable and leaves the session running;
-for a required target it fails the graphics session. Device loss, a validation
-error, an unknown submission effect, a failed cleanup and a failed diagnostic
-sink (`DiagnosticSinkFailed`) escalate to the session rather than to a target,
-whatever the target's classification says.
-
-A target can also be **declared unrecoverable** with attempts to spare
-(`declareTargetUnrecoverable`), when the boundary knows no attempt can help —
-the session's one device can no longer present to what the target would be
-rebuilt on, and no second device is ever made (VK-14). It is disposed of exactly
-as exhaustion disposes of it, through the same designation, and answers the
-escalation; it answers none when close already won, the target is already
-unavailable, or the session has already failed, since then there is nothing
-left for it to decide. It settles no attempt: one still outstanding is reported
-first, and its failure may already have exhausted the target.
-
-Close wins. A target that is closing admits no retry, and a construction that
-succeeds after the close was observed is retired rather than published back into
-active rendering.
-
-A generation under construction is not the active generation's operations' to
-touch. `retireGeneration` takes only an active one: retiring a candidate would
-let it be disposed of before its native outcome arrived, leaving that result with
-no ownership record and its own reporting call holding a stale identity. A
-construction ends through `publishGeneration` or `failGenerationConstruction`,
-and through nothing else.
-
-Only the target's current published generation may be handed over as
-`oldSwapchain`. A candidate that is still constructing has nothing to retire and
-is not the active generation, so handing it over would record an irreversible
-retirement of something that never rendered — and would clear the generation that
-actually is active. Handing over the right one retires it *there*, before
-anything is known about the replacement, and that retirement is irreversible: a
-failed construction leaves it retired, and it cannot be handed over a second time.
-
-An allocation attempt carries its own stable identity and exactly one spent-retry
-bit. It may retry only after a reclamation pass confirmed a **successful
-disposal**: examining records is not progress, and neither is requesting a
-disposal that then failed. If the attempt's construction already retired a
-generation as `oldSwapchain`, the retry is refused outright, because the previous
-creation arguments no longer describe the state to construct from. A terminal
-session refuses one too: a retry is an admission of new native work, and
-permitting it would invite a construction whose successful result the model would
-then decline to record.
-
-A reclamation pass reads a bounded window of generation and managed-resource
-records, not just the eligible ones — deciding that a record is ineligible is
-itself an examination, and filtering first would let a pass read every subject
-while reporting that it read almost nothing. A cursor carries from pass to pass,
-so a record beyond one window is reached by a later pass rather than never.
-
-A failed disposal retains the subject's ownership and its accounting, is never
-replayed, and escalates the session. A cleanup failure is never permission to
-proceed as though rollback succeeded.
+- At most three construction attempts: the second 100 ms after the first
+  failure, the third 500 ms after the second. Asking early reports the
+  deadline without spending an attempt.
+- At most one attempt in flight (`RecoveryOutstanding`). A result reported
+  with nothing outstanding is refused. A terminal session admits no recovery.
+- The last failure exhausts the episode, not the next request.
+- A spent budget returns only after a completed presentation-retirement cycle
+  on the target and then one full second of monotonic progress without
+  another failure. Elapsed time alone resets nothing.
+- A cycle is both its facts: the presentation's retirement and its
+  submission's completion, matched by identity and held on the target. Each
+  half carries the target's recovery epoch at arrival, and a cycle is credited
+  only when both halves belong to the current epoch. The epoch rises only when
+  an attempt is admitted. Dropping a cycle's credit touches no hold.
+- Exhaustion marks an optional target unavailable and fails the session for a
+  required one. Device loss, a validation error, an unknown submission effect,
+  a failed cleanup and a failed diagnostic sink escalate to the session
+  whatever the target's classification.
+- `declareTargetUnrecoverable` disposes of a target as exhaustion does, with
+  attempts to spare.
+- Close wins: a closing target admits no retry, and a construction that
+  succeeds after the close is retired, not published.
+- A construction ends only through `publishGeneration` or
+  `failGenerationConstruction`. `retireGeneration` takes only an active
+  generation.
+- Only the current published generation may be handed over as `oldSwapchain`.
+  That retires it at once and irreversibly, whatever the replacement does.
+- An allocation attempt has a stable identity and one retry. It may retry only
+  after a reclamation pass confirmed a successful disposal, and never if its
+  construction already retired a generation as `oldSwapchain`.
+- A reclamation pass examines a bounded window of records, eligible or not,
+  with a cursor carried from pass to pass.
+- A failed disposal keeps the subject's ownership and accounting, is never
+  replayed, and escalates the session.
 
 ## Device loss
 
-The session's first cause and the device's loss are two facts. `noteDeviceLoss`
-records the loss and fails the session with `DeviceLost` — unless something
-failed it first, whose cause is then kept, with its one escalation notice, and
-the loss recorded beside it; `deviceLossObserved` answers whether it was. That is
-what lets a teardown that began for a validation error, say, switch to the
-device-loss rules when a later call reports the loss, without rewriting why the
-session ended.
+`noteDeviceLoss` records the loss and fails the session with `DeviceLost`,
+unless something failed it first, whose cause is kept; `deviceLossObserved`
+answers whether the loss was recorded.
 
-`releaseToDeviceLoss` is the specification's device-loss rule, and nothing
-more: a lost device's objects may be destroyed without waiting for work that may
-never complete. It lets go of every outstanding submission — certain or
-uncertain — every enqueued presentation and every record awaiting an
-unpresented frame's settlement, and every frame that had left acquisition:
-submitted, enqueued, retiring or in the uncertain-effect state. Their submitted
-uses and presentation obligations end, their records and accounting go, and the
-cycles they belonged to are dropped uncredited. It is not completion: no
-submission is recorded as completed, no presentation as retired, no recovery
-episode sees healthy progress, and the facts that would have said so are refused
-afterwards, because their records are gone. An uncertain effect is released
-because what was unknown about it — whether the device ran its work — is exactly
-what the rule makes irrelevant to destroying what it retained.
+`releaseToDeviceLoss` applies the specification's rule that a lost device's
+objects may be destroyed without waiting for work that may never complete. It
+releases every outstanding submission (certain or uncertain), every enqueued
+presentation, every record awaiting unpresented-frame settlement, and every
+frame that had left acquisition. It is not completion: nothing is recorded as
+completed or retired, and no recovery episode sees progress.
 
-What it does not release is everything the loss says nothing about: a frame
-still reserved or acquired, whose unsubmitted recording the boundary must
-invalidate and skip first, and which the answer (`DeviceLossRelease`) names;
-recorded references, logical release and ended CPU use; and every disposal that
-already failed. Before the loss is recorded it is refused as `WrongPhase` of the
-device, and a second release releases nothing.
+It does not release a frame still reserved or acquired (the boundary skips
+those first; the answer names them), recorded references, logical release,
+ended CPU use, or any disposal that already failed.
 
 ## Owner progress
 
-One turn performs at most `progressActionLimit` completion or disposal actions,
-taken round-robin across the targets and the session's own place — its
-frame-less completions and its managed resources. The lead rotates every turn,
-the session's place with the targets', so neither a target nor the session
-starves behind a busy neighbour, and the report names the order it visited the
-targets.
+One turn performs at most `progressActionLimit` completion or disposal
+actions, round-robin across the targets and the session's own place
+(frame-less completions and managed resources), with the lead rotating every
+turn.
 
-The turn answers the absolute instant of the next one:
+The turn answers the instant of the next one:
 
-- a target with render demand that is **not suspended** asks for an opportunity
-  now;
-- so does a pending obligation created since the last turn, because the
-  transition that created it carried no clock reading to anchor an instant to;
-- otherwise it is the earliest of the instants the model is committed to: the
-  poll the last turn anchored, and every absolute recovery deadline — when a
-  target's next construction attempt may begin, and when a healthy period that
-  has started would complete and reset its episode;
-- with nothing pending and nothing scheduled there is no turn to schedule.
+- a target with render demand that is not suspended asks for a turn now;
+- so does a pending obligation created since the last turn;
+- otherwise the earliest of the poll the last turn anchored and every
+  recovery deadline;
+- with nothing pending there is no turn.
 
-`progressDeadline` is the same answer with the first case left out: the
-obligations' own schedule, without render demand. It is what an owner that
-paces its own rendering reads (VK-16's controller,
-[gpu_backend.md](gpu_backend.md#polling-completion)): render demand says a
-frame is wanted now, not that one can be acquired now — every image may be in
-the presentation engine's hands — so an owner that retries an acquisition later
-takes everything else from `progressDeadline`, and would otherwise be told to
-take a turn now for as long as the frame it cannot acquire yet is wanted. New
-demand still restarts the backoff, so the answer after a `requestRender` is
-now until a turn anchors the next poll.
+`progressDeadline` is the same answer without render demand, for an owner that
+paces its own rendering
+([gpu_backend.md](gpu_backend.md#polling-completion)).
 
-### One scheduling rule
+**One scheduling rule.** The model keeps one work summary (render demand, live
+frames, submissions, presentation records, retiring generations, disposable
+subjects, retiring targets, replacements owed, recovery deadlines). A
+transition restarts the schedule when that summary grew. An observed
+completion and a close transition restart it by declaration. A transition that
+only removed work, an observation that changed nothing, and a repeated close
+leave the anchored deadline where it was.
 
-Requirement 7 names four things that restart the schedule: new demand, a new
-obligation, an observed completion, and a close. That was once enforced by two
-dozen transitions each resetting the backoff by hand, and the omissions were not
-visible by reading any one of them — a replacement request slipped through
-unscheduled for exactly that reason.
+`nextDeadline` takes no instant: its answer is a property of the model alone.
+The turn is the only place an instant reaches the backoff. It answers
+`NoTurnNeeded`, `TurnNow`, `TurnAt`, or `TurnUnschedulable` (there is work and
+no candidate instant fits the clock's representation). A recovery delay that
+overflows is kept as `AttemptUnschedulable`, never treated as no delay.
 
-There is now one rule, applied to every transition. The model keeps a single
-**work summary** — render demand, live frames, submissions, presentation records
-in flight, retiring generations, disposable subjects, retiring targets,
-replacements owed, recovery deadlines — and a transition restarts the schedule
-when that summary *grew*. The first two of requirement 7's four are exactly
-"the owner has more to do than before", and fall out of the comparison. The other
-two are not visible in it, since a completion reduces the work and a close can
-too, so those transitions declare themselves.
-
-The reset is for a close *transition*, not a close *call*: a target that is
-already retiring transitions nowhere, so repeating the notification leaves the
-schedule of the cleanup the first close started exactly where it is. Without
-that, repeating a close would be enough to hold the backoff at its first
-interval indefinitely.
-
-A transition that only removed work, and an observation that changed nothing,
-both leave the anchored deadline exactly where it was. Releasing a resource that
-still owes the end of its CPU use creates nothing to do, so it does not restart
-the schedule; ending that CPU use settles the last hold and makes the resource
-disposable, so it does.
-
-The same summary answers what is pending, so what the owner is told to wait for
-and what wakes it can never describe different things. The idle poll covers only
-the part of it that can end *without* the owner: a recovery deadline carries its
-own absolute instant and is not polled for, and a frame the owner has reserved
-or acquired ends when the owner submits or abandons it rather than when anyone
-asks.
-
-`nextDeadline` takes **no instant**, and that is the point: the answer is a
-property of the model alone, so reading the same unchanged model twice gives the
-same answer however much time passed between the reads. A deadline recomputed
-from the reading instant would let an unrelated observation push the next poll
-further away every time something happened to ask. The turn is the only place an
-instant reaches the backoff, so the turn is where the next poll is anchored.
-
-It answers `NoTurnNeeded`, `TurnNow`, `TurnAt` an instant, or
-`TurnUnschedulable`. The last is not another way of saying there is no deadline:
-it means there *is* work and the instant it is due at does not fit the clock's
-representation. It is reported only when no candidate is representable, because a
-deadline that is both actionable and sooner is not made unreachable by some other
-candidate's arithmetic failing. A recovery delay that overflows when it is recorded is kept as
-its own state for the same reason — `AttemptUnscheduled` says no delay is owed
-and `AttemptUnschedulable` says one is owed that cannot be expressed, and
-collapsing the second into the first would admit the next attempt immediately,
-skipping exactly the delay the episode exists to enforce.
-
-The recovery deadlines have to be there. A target whose first attempt has just
-failed and that is otherwise idle has no obligation to poll for, so a schedule
-built from obligations alone would advertise nothing and the owner would never
-come back to make the attempt; and the episode's reset needs a turn to observe
-it, so it would never happen, leaving a later recovery starting from a budget
-that should have come back. A deadline in the past means the owner is overdue,
-and is reported as it stands.
-
-The backoff schedule is 5, 10, 20, 40, 80 and then the configured cap of 100 ms.
-The obligation that created the work asks for a turn now; each poll that finds
-nothing moves one step along, and the last step is the steady state it stays at.
-A turn announces the interval it is at and stores the step after it, so a turn
-that made progress restarts the whole schedule rather than only its first step —
-storing the step it just announced would spend that interval twice and give 5,
-5, 10, 20. New demand, a new obligation, an observed completion
-and a close transition each schedule an immediate opportunity and start the
-schedule over.
-
-The reset is about new work existing, not about who made it. Retiring a
-generation, failing or superseding a construction, certifying ended CPU use,
-releasing a resource and discarding a recorded batch all create retirement or
-disposal work, and each starts the schedule over — a target that retires a
-generation while the session has backed off to its idle interval must not wait
-that interval out before the owner looks at it.
-
-A suspended target contributes no render deadline and keeps every obligation it
-had, including its retirement demand, so suspension silences a deadline and never
-an obligation.
-
-Time enters only as an `Instant` the caller read from the foundation's injected
-clock. The model reads no clock, and a scripted clock is therefore enough to
-prove the whole schedule.
+The backoff is 5, 10, 20, 40, 80 ms and then the configured cap. A turn that
+made progress restarts the whole schedule. A suspended target contributes no
+render deadline and keeps every obligation.
 
 ## Frame-less batches
 
-GRS-12 (#337; resource services design D-12) admits batches that belong to no
-frame: offscreen rendering and uploads, recorded with no swapchain image and
-submitted by themselves. They hold exactly what a frame's batch holds, under
-the same rules, and differ only in what they belong to.
+Batches that belong to no frame: offscreen rendering and uploads, recorded
+with no swapchain image and submitted by themselves. They hold what a frame's
+batch holds under the same rules.
 
-**Admission.** `openFramelessBatch` admits one in the lowest free frame-less
-slot of the session, naming the resource generations it retains, and answers
-its `BatchId` — a frame-less one, resolved through the session alone, with no
-target, synthetic or otherwise — and its slot. It needs a running session, and
-the references follow `recordBatch`'s rules: no duplicate, nothing whose release
-or end of CPU use is certified. A slot counts against the frame-less batch
-budget (default 4) from the opening until a discard drops the batch or the
-completion of its submission is recorded; with every slot taken the answer is
-`Backpressure FramelessBatchBudget`. The opening reserves two objects before
-any native call — the batch's record and the submission record its submission
-will need — so object exhaustion is `Backpressure ObjectBudget` with nothing
-changed, and a submission the queue already accepted can never be refused for
-want of accounting.
-
-**Holds.** A frame-less batch's references are recorded-reference holds keyed
-by its number, as a frame batch's are: `extendBatch` extends them,
-`discardBatch` drops the batch and discharges exactly its own, freeing its slot
-and giving back both objects, and a frame's `resetRecorder` touches none of
-them. `submitFramelessBatch` with `SubmissionAccepted` promotes them to
-submitted uses under a submission record of its own, which carries no frame,
-gives back the batch's object, keeps the reserved one for the record, and
-leaves the slot held by that submission. Recording a completion
-(`SubmissionCompleted`) discharges those uses, gives back the record's object
-and frees the slot; `runProgressTurn` offers frame-less completions in the
-session's own place, before its disposals, so one submission that has not
-signalled never holds back another that has. The session's place rotates with
-the targets' places, so a target with ready work every turn cannot starve it.
-
-**Failure.** `SubmissionFailedWithoutEffect` changes nothing: the batch stays
-held and submittable. `SubmissionEffectUncertain` records the submission
-uncertain — its holds and slot retained for ever, its completion refused — and
-fails the session, as a frame's does.
-
-**Initialization.** An image a frame-less batch initializes is initialized when
-the model records that batch's accepted submission, before anything has
-completed; sealing, a discard, a no-effect failure and an unknown effect never
-publish it ([Ordering managed resources](#ordering-managed-resources)).
-
-**Device loss.** `releaseToDeviceLoss` releases frame-less submissions with
-every other submission, discharging their uses and freeing their slots without
-recording a completion. An unsubmitted frame-less batch is not the loss's to
-release: the boundary discards it, which discharges its references and frees
-its slot. `framelessSlots` reads each slot in use and what holds it.
+- `openFramelessBatch` admits one in the lowest free slot, naming the
+  generations it retains. A slot counts against the budget from the opening
+  until a discard or its submission's recorded completion. It reserves the
+  batch record and the submission record before any native call.
+- `extendBatch` and `discardBatch` work as for a frame batch; a frame's
+  `resetRecorder` touches none of them.
+- `submitFramelessBatch` with `SubmissionAccepted` promotes the references to
+  submitted uses. A recorded completion discharges them and frees the slot.
+- `SubmissionFailedWithoutEffect` changes nothing.
+  `SubmissionEffectUncertain` retains everything for ever and fails the
+  session.
+- Device loss releases frame-less submissions with the rest. An unsubmitted
+  one is the boundary's to discard.
 
 ## Ordering managed resources
 
-GRS-3 (#335; resource services design D-18 and D-26) orders every access a
-batch makes to a managed buffer or image. The legality rules are pure and
-stated in engine terms — a resource's kind and the use a command makes of it —
-in `Hetoimasia.GPU.Model.Access`, which names no native type. The backend maps
-each use onto its own layouts, stages and accesses
-([the backend contract](gpu_backend.md#ordering-managed-resources)).
-
-**Kinds and resting uses.** Every kind has legal uses, and one of them is its
-resting use: what every batch finds the resource in and must leave it in.
+`Hetoimasia.GPU.Model.Access` orders every access a batch makes to a managed
+buffer or image, in engine terms. The backend maps each use onto its own
+layouts, stages and accesses
+([gpu_backend.md](gpu_backend.md#ordering-managed-resources)).
 
 | `ResourceKind` | Resting use | Other legal uses |
 | --- | --- | --- |
 | `TextureResource` | `ShaderSampled` | `TransferWrite` |
-| `DepthTargetResource` | `DepthAttachment` | — |
+| `DepthTargetResource` | `DepthAttachment` | none |
 | `ColorTargetResource` | `ColorAttachment` | `TransferRead` |
 | `VertexResource`, `IndexResource` | `GeometryRead` | `TransferWrite` |
-| `InstanceResource` | `InstanceRead` | — |
-| `LookupResource` | `StorageRead` | — |
-| `StagingResource` | `TransferRead` | — |
+| `InstanceResource` | `InstanceRead` | none |
+| `LookupResource` | `StorageRead` | none |
+| `StagingResource` | `TransferRead` | none |
 
-`restingUse` and `legalUses` state the table; each other use is one the kind's
-usage provides for — a texture is uploaded into, a color target copied out of,
-static geometry staged into. Only an image kind (`isImageKind`) has contents
-that can be undefined. No layout or access state is kept across batches, so
-recording order and submission order can never disagree about it.
+Every batch finds a resource in its resting use and must leave it there. No
+layout or access state is kept across batches.
 
-**A batch's accesses.** A `BatchAccess` is the use each resource a batch has
-touched is in, keyed by whatever identifies a resource to its recorder, which
-threads it while the batch records. An untouched resource is at rest. Three
-pure steps advance it, each answering the barriers the batch then owes, or an
-`AccessRefusal` that changes nothing:
+A `BatchAccess` is threaded by the batch's recorder through three pure steps,
+each answering the barriers owed or an `AccessRefusal` that changes nothing:
 
-- `touch` is a command using a resource in the use it is already in. The first
-  touch finds it at rest and owes the **entry barrier** from the resting use
-  into it; a command that discards the contents (`DiscardsContents`, an
-  attachment pass that clears) takes that barrier from undefined. Any later
-  touch must name the use the batch left the resource in, and owes nothing.
-- `transition` is an explicit move, from a use (`FromUse`) or from undefined
-  contents (`FromUndefined`, images only), into another legal use of the kind
-  — or into the same use, which orders the batch's earlier accesses in it
-  before its later ones. It must start from the use the batch left the
-  resource in, which on the first touch is the resting use. The first touch's
-  transition is itself the entry barrier, one barrier from the resting use
-  straight into its destination; a later one is an explicit
-  `TransitionBarrier`.
-- `sealAccess` decides whether the batch may seal. A batch that leaves any
-  resource away from its resting use is refused (`AwayFromRest`): the
-  consumer's explicit transition back is required, and the exit barriers never
-  stand in for it. Otherwise it owes one **exit barrier** per resource touched,
-  from the resting use back to it — a same-use barrier, still owed.
+- `touch`: a command using a resource in the use it is already in. The first
+  touch owes the entry barrier from the resting use (from undefined when the
+  command discards the contents).
+- `transition`: an explicit move into another legal use, starting from the use
+  the batch left the resource in.
+- `sealAccess`: refuses (`AwayFromRest`) a batch that leaves any resource away
+  from its resting use; otherwise owes one exit barrier per resource touched.
 
-Refusals are `UseNotLegal` (a use the kind never takes), `DiscardNotLegal` (a
-buffer's contents), `UseMismatch` (the resource is in another use) and
-`KindMismatch` (the batch touched it as another kind). A `Barrier` carries the
-resource, its kind, its role (`EntryBarrier`, `TransitionBarrier`,
-`ExitBarrier`), the use it waits for, the use it makes ready, and whether it
-discards; its first scope is always the use the resource was in, even when it
-discards. On the one graphics queue an entry barrier's first scope covers every
-earlier submission, so each batch's entry barriers chain to earlier batches'
-exit barriers: write-after-write, read-after-write and write-after-read between
-batches are ordered even when no layout changes.
+Refusals are `UseNotLegal`, `DiscardNotLegal`, `UseMismatch` and
+`KindMismatch`. On the one graphics queue each batch's entry barriers chain to
+earlier batches' exit barriers, so accesses between batches are ordered even
+when no layout changes.
 
-**Initialization.** The model tracks whether each resource generation's
-contents are usable. `requireInitialization` marks a new image, before any
-batch or submission has named it, as `Uninitialized`. `enterResource` admits a
-batch's first touch of a resource the batch already retains, keeping or
-discarding its contents:
-
-- a resource that needs no initialization, or is `Initialized`, admits any
-  first touch;
-- an `Uninitialized` image admits only a touch that discards its contents, and
-  the batch is then `InitializingIn` it;
-- an image another unsubmitted batch is initializing admits none.
-
-A refusal is `WrongPhase` of the resource. Only `submitFrames` with
-`SubmissionAccepted` publishes the initialization of what its batches
-initialized. Recording, sealing, `resetSubmissionFence`,
-`SubmissionFailedWithoutEffect` and `SubmissionEffectUncertain` never do; an
-uncertain submission, a discarded batch, a reset recorder and a skipped frame
-leave what their batch was initializing `Uninitialized` again, so another batch
-may initialize it. Nothing here changes a resting use, which is the kind's.
-`resourceInitialization` reads where a generation stands.
+**Initialization.** `requireInitialization` marks a new image `Uninitialized`.
+`enterResource` admits a batch's first touch: an uninitialized image admits
+only a touch that discards its contents, and an image another unsubmitted
+batch is initializing admits none. Only an accepted submission publishes the
+initialization. A discard, reset, skip, no-effect failure or uncertain effect
+leaves the image `Uninitialized` again.
 
 ## State
 
-| State             | Owner              | Readers and writers       | Thread | Lifetime     | Reset or disposal                          |
-| ----------------- | ------------------ | ------------------------- | ------ | ------------ | -------------------------------------------- |
-| The `GpuModel`    | The owning boundary| Whoever threads the value | Any    | The session  | A record leaves only when every hold has ended |
-| Escalation notices| The owning boundary| The model raises; `takeEscalations` drains | Any | Until taken | Dropped oldest-first past the window, and counted |
-| Device-memory charges | The owning boundary | Reserved per attempt by `reserveDeviceMemory`; settled by `settleDeviceMemory` after every allocator call | Any | The session | Released only as the boundary reports memory freed |
-| A resource generation's initialization | The owning boundary | Marked by `requireInitialization`; claimed by `enterResource`; published by an accepted `submitFrames`; withdrawn when its batch is dropped or its submission's effect is unknown; read by `resourceInitialization` | Any | The generation's record | Leaves with the record |
-| A batch's accesses (`BatchAccess`) | The batch's recorder | The recorder threads it through `touch`, `transition` and `sealAccess` | The recorder's | One batch's recording | Dropped with the recorder; never kept across batches |
-| Frame-less slots | The owning boundary | `openFramelessBatch` takes one; `discardBatch`, a completion and the device-loss release free it; `framelessSlots` reads them | Any | From a batch's opening until its discard or its submission's completion or release | Bounded by the frame-less batch budget |
+The model owns no mutable state: it is an immutable value and every operation
+returns the next one. Concurrency belongs to the boundary that threads it.
 
-Nothing accumulates as history. A disposed resource's current-generation entry is
-removed, a settled frame gives back the reservations it never used, and a
-disposal that failed is remembered once rather than retried, so the model's record
-count stays a function of the configuration.
+| State | Owner | Lifetime and disposal |
+| --- | --- | --- |
+| The `GpuModel` | The owning boundary | The session. A record leaves only when every hold has ended |
+| Escalation notices | The owning boundary; `takeEscalations` drains | Bounded: at most one per target record plus the session's; the oldest is dropped and counted |
+| Device-memory charges | The owning boundary | Released only as the boundary reports memory freed |
+| A generation's initialization | The owning boundary | Leaves with the record |
+| A batch's accesses | The batch's recorder | One batch's recording |
+| Frame-less slots | The owning boundary | Bounded by the frame-less batch budget |
 
-Escalations are notices, and they are bounded too. Deduplication alone is not a
-bound — a target number is reissued under a fresh incarnation, so a session that
-admits, loses and readmits an optional target for ever would raise a distinct
-notice every time. The retained window holds at most one notice per target record
-the configuration allows, plus the one a failed session can ever raise; beyond
-that the oldest is dropped and `escalationsDropped` counts it. A boundary that
-drains with `takeEscalations` never reaches the bound.
-
-The model owns no mutable state at all: it is an immutable value, and every
-operation returns the next one. Concurrency, if any, belongs to the boundary that
-threads it. Dividing the implementation into modules divides no state: the value's
-representation is `Internal.State` and `Internal.Records`, and each transition
-module changes only the part its responsibility names, through the shared edits in
-`Internal.Accounting` and under the one scheduling rule in `Internal.Scheduling`.
+Nothing accumulates as history.
 
 ## What this contract does not promise
 
 - That any native work has finished. Only an injected fact says that.
 - That a disposal will succeed. A failure is preserved, not retried.
-- That a budget is a driver limit. These are configuration values; byte
-  accounting covers known backend allocations, not memory a driver allocates
-  internally.
-- That a presentation record retiring means an image has appeared on screen.
-  Visual timing is a separate question from safe object reuse.
+- That a budget is a driver limit. Byte accounting covers known backend
+  allocations, not memory a driver allocates internally.
+- That a retired presentation record means an image appeared on screen.
 
 ## The placement reference
 
-The package also builds a public sublibrary, `placement-reference`. It holds
-the pure best-fit block placement #331 built and measured against VMA:
-validated configuration, requests and typed rejections; best fit over a free
-list with coalescing, alignment and `bufferImageGranularity`; per-memory-type
-growth and dedicated routing; and a strategy interface. It is **a test
-reference, not production code.** The owner chose VMA for production
-allocation (resource services design D-38) after neither this placement nor a
-mutable prototype of it met the parity gates, which
-[the parity record](archive/gpu_allocator_parity_record.md) retains.
-
-No library depends on it. `gpu-model-tests` tests it — its `placement` group
-checks every rule by hand and against a brute-force best-fit reference over
-generated scripts — and the optional allocator parity probe measures it. The
-model library itself is unchanged by it, and its clients name the main
-library's unit id to tell the two apart.
+The public sublibrary `placement-reference` holds a pure best-fit block
+placement (free list with coalescing, alignment, `bufferImageGranularity`,
+per-memory-type growth, dedicated routing). It is a test reference, not
+production code: production allocation uses VMA. No library depends on it;
+`gpu-model-tests` checks it against a brute-force reference, and the optional
+allocator parity probe measures it.
 
 ## Verification
 
-`test.vulkan` runs `gpu-model-tests`, the package's own suite, through
-`cabal.project.cpu`:
-
-```
+```bash
 cabal test --project-file cabal.project.cpu hetoimasia-gpu-vulkan-model:gpu-model-tests --test-show-details=direct
 ```
 
-Every example is deterministic and decided by ordering rather than by timing.
-The suite covers no disposal while any hold remains; no completion without an
-injected fact; suboptimal acquisition keeping its image; the skip and
-submitted-unpresented paths settling only their own obligations; a no-effect
-submission failure against the uncertain-effect state; duplicate, stale and
-foreign identities rejected before effects; every budget's exhaustion as
-backpressure; recovery episodes surviving nested helpers and turns without
-replenishment; a target declared unrecoverable with attempts to spare,
-optional and required, and close winning over the declaration;
-`oldSwapchain` retirement surviving failed construction; close
-defeating late publication; the backoff schedule and its resets under a scripted
-clock; bounded round-robin progress across several targets; suspended targets
-retaining retirement demand; disposal failure retaining ownership and accounting
-while escalating the session; and finite storage when completions never arrive.
-
-It also covers the guarantees that are easy to lose at the edges: a submission
-committing with the object budget full, because its record was reserved with the
-frame; a rebuild refused through a retained older identity; an allocation that
-reserves nothing refused outright; one recovery attempt at a time and none at all
-in a failed session; a construction that finished after device loss retired
-rather than published; a replacement request cleared by the publication that
-served it while a newer one stays pending; an image still named by the record
-that outlived its frame, in either completion order, acquirable again by a second
-frame with its own pool record once its presentation is enqueued — before as well
-as after the older submission completes — and refused to a second frame in every
-phase before that enqueue; two records of one image settling independently in
-either retirement order; a pool one generation exhausted by repeated acquisition;
-and a logical resource forgotten after its last generation is disposed of while a
-retained identity for it is still called stale.
-
-Its `access` group covers GRS-3's ordering rules: every kind's legal and
-illegal uses and transitions, a transition from undefined admitted for an image
-only, a use or transition that does not match the use the batch left the
-resource in; the entry barrier owed on the first touch only and an exit barrier
-for every resource touched; a seal refused for every kind left in each of its
-non-resting uses; an image's first touch refused unless it initializes it, and
-any other batch's refused until the initializing batch is submitted; the
-initialization published by an accepted submission before anything completed,
-and by the retry after a no-effect failure, but by no fence reset, no-effect
-failure or unknown effect; and an image left uninitialized by a discard, a
-recorder reset and a skipped frame.
-
-Its `frame-less batches` group covers GRS-12: the budget's default, its
-validation and its backpressure; a frame-less batch in a session with no
-target, and none after failure; object backpressure with nothing changed, and
-the reserved objects given back on a discard, a submission and a completion;
-holds discharged exactly by discard, a frame's reset, submission and
-completion; a record of its own for each submission; a slot kept until its
-submission's completion and freed by a discard; a no-effect failure keeping the
-batch, and an uncertain one retaining everything; a ready frame-less completion
-taken in a one-action turn behind one that has not signalled; identities
-resolved through the session, refusing a stranger's, a consumed one and a frame
-batch; initialization published only by an accepted submission; and release on
-device loss without completion.
-
-It covers the same class of edge for the transitions themselves: a still-
-constructing candidate refused as an `oldSwapchain` predecessor without mutating
-anything; recording refused against a released or CPU-use-ended subject while an
-already-recorded batch survives; one batch extended incrementally, retaining each
-subject once through repeated and overlapping use, charging nothing, refusing a
-duplicated request or a sealed subject without effect, and discharging every
-reference it gained when discarded; a submission naming the batch it consumed and
-not one reset before it, nor another session's batch of the same number; a retry refused in a terminal session for every
-cause that ends one; a reclamation pass reading exactly its window of raw records
-and reaching an eligible one beyond that window on a later pass; and the backoff
-restarting for retirement work whoever created it.
-
-And the scheduling and identity edges: a retry deadline and a healthy-reset
-deadline each advertised on a target with no other work at all; the escalation
-window staying finite under optional-target churn, with what it dropped counted
-and a draining boundary never reaching the bound; every compound identity
-reported by its own kind rather than its parent's; and one target's generation
-offered to another called a wrong parent rather than a foreigner.
-
-And device loss: the loss recorded as the session's first cause and notified
-once, or kept beside an earlier cause that stays the session's; the release
-refused before the loss; a submission and a presentation released without either
-being completed or retired, their cycle dropped uncredited and the facts that
-would have completed them refused; an uncertain effect retaining its generation
-until the loss and released under it; an acquired frame with a recorded batch
-left to be skipped first and released once it has been; a second release
-releasing nothing; and the outcome of the call that failed the session recorded
-— a returned reservation, an uncertain submission — while an owned image and an
-accepted submission are refused.
-
-And the arithmetic edges at the end of the clock's range: a retry delay that
-overflows refusing the next attempt rather than skipping the delay, and a
-schedule that cannot express its next instant saying so rather than reporting
-that no turn is needed — while still answering a finite deadline that is sooner
-when one exists.
-
-And the scheduling contract itself: the same unchanged model read repeatedly
-answering the same deadline; a spent episode marking its target unavailable and
-escalating at the failure that spent it; a target closed while its last attempt
-was in flight settling that attempt without escalating anything, and surviving an
-owner turn so that it can; a closed target's record freed by the turn its own
-schedule asked for, with its capacity reusable afterwards; a replacement nobody
-is building keeping the owner coming back until something is, through the
-generation backpressure that refuses to start it and out the other side once
-capacity returns; a presentation retired before its submission completing no
-cycle until that submission does; a cycle after a failed attempt replenishing
-nothing and leaving the scheduled retry intact; the schedule restarting whole
-after a turn that made progress; and evidence gathered before an attempt
-refusing to replenish the episode that attempt belongs to.
-
-Beyond the examples above, the suite drives **event orderings systematically**.
-The contracts that proved hardest were never about one transition but about the
-order two of them arrived in, and each was found one ordering at a time. A
-script language now enumerates the bounded legal orderings — a frame's whole
-life in both completion orders, a slot reused, two frames in flight, an
-unsubmitted frame abandoned, a submitted frame closed before presenting, a close
-arriving in each phase, a recovery attempt before, after and between a cycle's
-halves, three failures in a row, two presentations in flight whose halves must
-pair only with their own cycles, a rendering half that arrives before its cycle
-is opened with and without an attempt in the gap, and replacement demand raised
-after the schedule has backed off — and checks the model's invariants after *every* step of *every*
-one of them: nothing disposable owes anything, accounting stays inside its
-configuration, storage stays a function of that configuration, silence about the
-schedule means there is genuinely nothing to do, epochs never repeat, and cycles
-never outgrow the pool. A failure names the script and the shortest prefix of
-steps that reached the broken state.
-
-`test.workflow` holds the group's registration to the routing it needs: it is
-assigned to the `haskell-engine` worker, its receipt is published under the name
-the reuse lookup asks for, it is selected when its own package changes or when a
-pull request requests it, its evidence is required by the aggregate, and it stays
-outside the mandatory floor.
+This is the `test.vulkan` validation group. Time enters only as an `Instant`
+the caller supplies, so a scripted clock drives the whole schedule.

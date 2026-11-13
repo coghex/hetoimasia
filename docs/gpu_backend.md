@@ -1,177 +1,32 @@
 # The Vulkan roots and their window integration
 
-This is the delivered contract of VK-7 ([#219](https://github.com/coghex/hetoimasia/issues/219))
-of [the Vulkan backend design](archive/vulkan_backend_design.md): one graphics
-session's Vulkan instance, its explicit debug messenger, its one shared device
-and a target for every window surface handed to it, owned by the supervised
-graphics owner and retired through its protected exit. It covers the design's
-D-7, D-9, D-12, D-14, D-15, D-17, D-22, D-29, D-32 and D-33, and P-1, P-5, P-7,
-P-8 and P-14 as far as this slice reaches.
-
-VK-10 ([#222](https://github.com/coghex/hetoimasia/issues/222)) adds each
-target's **swapchain generations**: their planning, construction, replacement
-and destruction, keyed by the GPU model's identities — D-7, D-16, D-18, D-22
-and D-30, P-2, P-8 and P-15, and Q-12. See
-[Swapchain generations](#swapchain-generations).
-
-VK-11 ([#223](https://github.com/coghex/hetoimasia/issues/223)) adds the
-**renderer-facing boundary**: managed rendering resources, a scoped recorder
-that retains the exact generations each command references, sealed single-use
-batches that can be discarded, readback memory, and the audited `unsafe`
-recording subset — D-15, D-26 and D-28, P-1's renderer-facing boundary and
-P-8. See [Recording through managed resources](#recording-through-managed-resources).
-
-GRS-11 ([#333](https://github.com/coghex/hetoimasia/issues/333)) backs **device
-memory** with VMA: one externally synchronised allocator per device, owned by
-the roots and used on the graphics owner's thread alone, through the engine's
-own `unsafe` C shim; memory types chosen by the engine from each usage's
-properties; the model's accounted bytes charging the blocks VMA holds, through
-a bounded reservation before any call that could open one; VK-14's recovery
-for a no-effect allocating failure; and readback buffers moved onto it as its
-first consumer — D-15, D-16, D-38 and D-40 of the
-[GPU resource services design](archive/designs/gpu_resource_services_design.md). See
-[Device memory](#device-memory).
-
-GRS-2 ([#334](https://github.com/coghex/hetoimasia/issues/334)) adds **managed
-buffers and images**: opaque handles over the model's `ResourceId`, created on
-the graphics owner's thread — and lent to renderers and owner-thread actions
-through the host's `Construction` — from engine-defined kinds that fix their
-usage flags and memory usage; images checked against the device before
-anything is created, each with one owned view of the whole image; their memory
-placed through the allocator and charged as its blocks; and released and
-disposed of like every other managed resource. Nothing records through them
-yet. See [Buffers and images](#buffers-and-images).
-
-VK-12 ([#225](https://github.com/coghex/hetoimasia/issues/225)) adds **frames**:
-non-blocking acquisition, submission of sealed batches with one completion
-obligation per native submission, and safe abandonment — a skipped
-unsubmitted frame and a submitted frame never presented each returned through a
-tracked cleanup submission and maintenance release — with every native effect
-recorded in the same masked step as its bookkeeping. D-15–D-17, D-23 and D-26,
-P-1's scheduling vocabulary and P-2. See
-[Frames: acquisition, submission and abandonment](#frames-acquisition-submission-and-abandonment).
-
-VK-13 ([#227](https://github.com/coghex/hetoimasia/issues/227)) adds
-**presentation**: each target presents independently through a bounded
-presentation pool of render-finished semaphores and present fences, reserved
-with the frame; what was enqueued is read per swapchain from `pResults`; a
-presentation retires, and its generation's presentation hold ends, only when
-its own present fence is observed signalled; and retired generations and
-closing windows retire incrementally from that evidence, with no device-wide
-idle. D-9, D-15, D-18 and D-23, P-2, P-8, P-14 and P-15. See
-[Presentation and retirement](#presentation-and-retirement).
-
-VK-14 ([#229](https://github.com/coghex/hetoimasia/issues/229)) adds
-**recovery**: a lost surface is replaced on the same live window, its
-attachment kept throughout, within the target's bounded recovery episode; a
-target that cannot be recovered is disposed of through its designation — an
-optional one unavailable while every other continues, a required one failing
-the session; and a native allocation failure with no effect gets one bounded
-reclamation pass and at most one retry. D-18, D-22, D-24 and D-25, P-14 and
-P-15. See [Recovery](#recovery).
-
-VK-15 ([#231](https://github.com/coghex/hetoimasia/issues/231)) adds
-**terminal failure**: one latch whose first failure — a device loss, a
-validation error or sink failure the capture reports at a checkpoint, an
-uncertain effect, a failed cleanup, or a required target's exhausted recovery
-— is the session's primary, refuses every later rendering, acquisition,
-submission, presentation and handover naming it, and is reported with what
-teardown found beside it; and teardown after device loss under the
-specification's device-loss rules, with no fence asked or waited on and none
-recorded as signalled. D-17, D-19, D-20, D-22 and D-33, P-2, P-5, P-11 and P-14.
-See [Terminal failure](#terminal-failure).
-
-[#250](https://github.com/coghex/hetoimasia/issues/250) (VKR-2) adds **debug
-names and recording labels**: every native object the backend creates is named
-from identities it already holds — the debug messenger excepted — and every
-batch and every dynamic-rendering pass is bracketed in balanced command-buffer
-labels, which [the diagnostic capture](vulkan_diagnostics.md) now copies. See
-[Names and labels](#names-and-labels).
-
-VK-16 ([#232](https://github.com/coghex/hetoimasia/issues/232)) composes
-**rendering** into the graphics owner and the owner into the main thread's
-loop. The controller constructs the recording and the frames on the owner's
-thread and renders the scene the owner holds when render demand, a newer scene,
-a changed generation or a resumption asks a target for a frame; it paces its
-own acquisition retries and completion polls on the owner's deadlines and the
-model's idle backoff; and a retiring target's retirement is owed until every
-frame and presentation of it has gone on its own evidence.
-`runVulkanOwnerLoop` is the main thread's scheduled owner loop with the owner
-composed in: each turn it publishes the windows' observations, their captured
-render demand and the replacement surfaces the owner asked for, and bounds its
-own wait by the owner's published deadline, with no second engine loop and no
-GPU work on the main thread. D-5, D-15, D-18, D-22 and D-29–D-31, D-33, P-5,
-P-6, P-12 and P-15. See [The composed loop](#the-composed-loop). A required
-target's exhaustion fails the session through the terminal latch, and
-device-loss teardown across submitted work and pending presentations is the
-frames' own ([Terminal failure](#terminal-failure)).
-
-GRS-15 ([#336](https://github.com/coghex/hetoimasia/issues/336)) of
-[the GPU resource services design](archive/designs/gpu_resource_services_design.md)
-lets a session **start its device without a window**: an opt-in host setting,
-`DeviceSurfaceFree`, has the owner's startup select and create the device
-against no surface, and a window handed over later is admitted only if the
-chosen queue family presents to it. A session with no target — one that never
-had a window, or whose windows have all closed — keeps making owner progress
-and retires through the same protected exit. And a consumer on any thread can
-hand the owner a bounded **owner-thread action**, run on the owner's thread
-with the session's `Construction`, with or without targets. D-6, D-12 and D-28
-of that design. See
-[Surface-free sessions and owner-thread actions](#surface-free-sessions-and-owner-thread-actions).
+The contract of the Vulkan backend: one graphics session's instance, debug
+messenger, one shared device with its allocator, a target for every window
+surface handed to it, each target's swapchain generations, the renderer-facing
+recording boundary over managed resources, frames, presentation, recovery and
+terminal failure, composed into the supervised graphics owner and the main
+thread's scheduled loop. The pure accounting it relies on is
+[the GPU model](gpu_model.md); the diagnostic capture is
+[vulkan_diagnostics.md](vulkan_diagnostics.md); the owner it runs in is
+[glfw.md](glfw.md#the-supervised-graphics-owner). Signatures are in the
+modules' export lists.
 
 ## Packages
 
 | Package | Location | Holds | Depends on |
 | --- | --- | --- | --- |
-| `hetoimasia-gpu-vulkan-native` | `packages/gpu-vulkan/native/` | The profile's decisions, the roots over an open native layer, and the production native layer | The binding, the diagnostics package, the GPU model, the foundation — never GLFW |
-| `hetoimasia-gpu-vulkan-glfw` | `packages/gpu-vulkan/glfw/` | The session controller, the main-thread handover, the composition | The native package, `hetoimasia-glfw:runtime-glfw`, `hetoimasia-glfw:vulkan-interop`, the diagnostics package, the model |
+| `hetoimasia-gpu-vulkan-native` | `packages/gpu-vulkan/native/` | The profile's decisions, the roots, generations, recording, frames and allocator over an open native layer, and the production native layers | The binding, the diagnostics package, the GPU model, the foundation; never GLFW |
+| `hetoimasia-gpu-vulkan-glfw` | `packages/gpu-vulkan/glfw/` | The session controller, the main-thread handover, the composition (`Hetoimasia.GPU.Vulkan.GLFW`) | The native package, `hetoimasia-glfw:runtime-glfw`, `:vulkan-interop`, the diagnostics package, the model |
 
-The GLFW package depends on neither, and the native package does not depend on
-the integration package. Both are listed only in `cabal.project.vulkan`, and
-`cabal.project.common` holds their `-Werror` entries; `cabal.project` and
-`cabal.project.cpu` resolve no Vulkan header, binding or loader. Only
-[`tools/vulkan/run.sh`](../tools/vulkan/run.sh) builds them, and the validation
-groups `test.vulkan-headless` and `test.vulkan-native` run through it; see
-[validation.md](validation.md#the-registered-groups). [`packages/gpu-vulkan/README.md`](../packages/gpu-vulkan/README.md) maps
-all four GPU packages.
-
-The integration package's public module is `Hetoimasia.GPU.Vulkan.GLFW`; its
-controller lives in a private `controller` sublibrary. The native package
-exposes `Hetoimasia.GPU.Vulkan.Native.Profile`,
-`Hetoimasia.GPU.Vulkan.Native.Roots` and `Hetoimasia.GPU.Vulkan.Native.Roots.Vulkan`
-beside VK-6's `Hetoimasia.GPU.Vulkan.Native.Diagnostics`, and VK-10's
-`Hetoimasia.GPU.Vulkan.Native.Presentation` — the presentation profile and the
-extent policy, as pure decisions — and `Hetoimasia.GPU.Vulkan.Native.Generations`,
-the generations above the roots; and VK-11's `Hetoimasia.GPU.Vulkan.Native.Recording`
-— managed resources and the recorder over an open native layer —
-`Hetoimasia.GPU.Vulkan.Native.Recording.Vulkan`, its production layer, and
-`Hetoimasia.GPU.Vulkan.Native.Recording.Shaders`, the verification pipeline's
-embedded shaders; and VK-12's `Hetoimasia.GPU.Vulkan.Native.Frames` —
-acquisition, submission and abandonment over an open native layer — and
-`Hetoimasia.GPU.Vulkan.Native.Frames.Vulkan`, its production layer; and GRS-11's
-`Hetoimasia.GPU.Vulkan.Native.Allocator` — the device-memory allocator's shape
-and the engine's memory-type policy — and
-`Hetoimasia.GPU.Vulkan.Native.Allocator.Vulkan`, its production form over VMA
-(see [Device memory](#device-memory)). The package's private modules, which no client can import,
-are the audited `unsafe` subset, `Hetoimasia.GPU.Vulkan.Native.Internal.Commands`;
-the VMA shim's imports, `Hetoimasia.GPU.Vulkan.Native.Internal.Vma`, and the
-allocation protocol above them, `Hetoimasia.GPU.Vulkan.Native.Internal.Allocation`;
-the generations' implementation under
-`Hetoimasia.GPU.Vulkan.Native.Internal.Generations`: `State`, `Uses`,
-`Disposal`, `Reconciliation`, `Step`, `Retirement` and `Observation`, which the
-public generations module re-exports as it always exported them (see
-[How the generations are built](#how-the-generations-are-built)); and the
-recording's implementation under
-`Hetoimasia.GPU.Vulkan.Native.Internal.Recording`: `Layer`, `State`,
-`Construction`, `Recorder`, `Batches`, `Readback` and `Disposal`, which the
-public recording module re-exports as it always exported them (see
-[How the recording is built](#how-the-recording-is-built)); and the frames'
-implementation under `Hetoimasia.GPU.Vulkan.Native.Internal.Frames`: `Layer`,
-`State`, `Acquisition`, `Submission`, `Presentation`, `Abandonment`, `Loss`
-and `Progress` (see [How the frames are built](#how-the-frames-are-built)); and
-VK-14's allocation recovery, `Hetoimasia.GPU.Vulkan.Native.Internal.Reclamation`,
-and its surface recovery, the generations' `Surface` (see
-[How recovery is built](#how-recovery-is-built)).
+Both are listed only in `cabal.project.vulkan` and built only through
+[`tools/vulkan/run.sh`](../tools/vulkan/run.sh); the ordinary projects resolve
+no Vulkan header, binding or loader. Each public native module
+(`Roots`, `Generations`, `Recording`, `Frames`, `Allocator`, `Presentation`,
+`Profile`) has a `.Vulkan` production layer where it makes native calls, and
+its implementation is under `Hetoimasia.GPU.Vulkan.Native.Internal`. The
+audited `unsafe` subset is `Internal.Commands` and the VMA shim's imports are
+`Internal.Vma`. [`packages/gpu-vulkan/README.md`](../packages/gpu-vulkan/README.md)
+maps all four GPU packages.
 
 ## The ownership graph
 
@@ -188,930 +43,446 @@ and its surface recovery, the generations' `Surface` (see
                            └─ roots
                                ├─ instance ◀─ lease (surface bridge)
                                │    ├─ explicit messenger
-                               │    ├─ device (one, shared, selected against the
-                               │    │          first target's surface — or, for a
-                               │    │          surface-free start, against none)
-                               │    │    └─ allocator (VMA, one per device; the
-                               │    │         device memory every allocation
-                               │    │         lies in, charged to the model)
-                               │    └─ target surfaces, one record per target,
-                               │         keyed by the model's TargetId
-                               │           └─ swapchain generations, keyed by
-                               │              GenerationId: each swapchain, its
-                               │              images and their views
+                               │    ├─ device (one, shared)
+                               │    │    └─ allocator (VMA, one per device)
+                               │    └─ target surfaces, keyed by the model's TargetId
+                               │           └─ swapchain generations, keyed by GenerationId
                                └─ GPU model (identities, the session's state)
-                           ├─ recording (managed resources: the consumer's
-                           │    pipelines and layouts, frame storages,
-                           │    readback buffers and their allocations)
-                           └─ owner-thread actions (bounded queue; each run
-                                once on the owner's thread, lent the
-                                recording's Construction)
+                           ├─ recording (managed resources, frame storages, readback)
+                           └─ owner-thread actions (bounded queue)
 ```
 
-- **The instance, its explicit messenger, the device and the device's
-  allocator belong to the roots**, for the session. Every allocation made from
-  the allocator belongs to the managed resource whose memory it is. No target owns the device or gates its lifetime —
-  including the bootstrap target, whose surface the device was selected
-  against — so closing the first-created window cannot release a device
-  another target is using (D-7). A surface-free session's device has no
-  bootstrap target at all, and a session with no target still holds it until
+- **The instance, messenger, device and allocator belong to the roots**, for
+  the session. No target owns the device or gates its lifetime, including the
+  bootstrap target, so closing the first window cannot release a device
+  another target uses. A session with no target still holds the device until
   whole-owner retirement.
-- **An owner-thread action's standing belongs to the controller's queue**
-  from admission until it is settled; what the action constructs belongs to
-  the recording, as the renderer's constructions do, whatever becomes of the
-  action.
 - **Each admitted target's surface belongs to the roots** from admission until
-  its retirement destroys it. Each target record carries the model's
-  `TargetId`, the application's required or optional designation (D-22), the
-  surface's handle and the one action that destroys it.
-- **Each target's swapchain generations belong to the generations above the
-  roots**, from the construction that begins one until its destruction. A
-  generation is the surface's child and the device's: the roots refuse to
-  destroy a target's surface while the model holds any generation of it
-  (`TargetGenerationsRemain`), and every generation of every target goes before
-  the device. Swapchain images are the swapchain's and go with it; the image
-  views are the generation's own.
+  its retirement destroys it.
+- **Each target's swapchain generations belong to the generations module.**
+  The roots refuse to destroy a surface while the model holds any generation
+  of it (`TargetGenerationsRemain`), and every generation goes before the
+  device.
 - **The attachment and the window belong to the main thread.** A surface's
   obligation holds its attachment and the instance's lease from the instant
   the native call returns, so neither the window's release nor the instance's
-  destruction can happen while the surface may exist (P-7).
+  destruction can happen while the surface may exist.
+- What an owner-thread action constructs belongs to the recording, whatever
+  becomes of the action.
 
 ## Composition
 
-`withVulkanOwnerHost` composes, in P-5's order:
+`withVulkanOwnerHost` composes, in order: the loader capability the caller
+holds; the diagnostic lifetime, which both messengers report into and which
+the instance's destruction quiesces; the loader-aware session, entered on the
+process main thread, which copies the required instance extensions into the
+controller; the protected window host and its graphics owner, whose injected
+operations are the controller's; then the body, given a `VulkanHost`. The
+application registers `superviseGraphicsOwner` afterwards so a terminal owner
+failure reaches its checkpoints. It answers the body's result and the
+capture's verdict. An instance the host did not destroy keeps the capture's
+storage retained.
 
-1. the loader capability, which the caller already holds, from
-   `Hetoimasia.GLFW.Vulkan.withLoaderIntegration`;
-2. the diagnostic lifetime (`withDiagnosticCapture`), whose capture both of the
-   instance's messengers report into, and which the instance's destruction
-   quiesces;
-3. the loader-aware session, entered on the calling thread — which must be the
-   process main thread — and which copies the instance extensions the
-   platform's surfaces require (`requiredInstanceExtensions`) into the
-   controller before the owner starts;
-4. the protected window host and its graphics owner
-   (`withGraphicsOwnerHostIn`), whose injected operations are the controller's;
-5. the body, given a `VulkanHost`: the window host, the graphics owner and the
-   controller.
+`withVulkanOwnerHostOver` is the same composition over an injected native
+layer and surface bridge, which the headless examples drive.
 
-Application supervision comes after, as the runner's own: register
-`superviseGraphicsOwner` so a terminal owner failure reaches the application's
-checkpoints. `withVulkanOwnerHostOver` is the same composition over an injected
-native layer and surface bridge, which is what the headless examples drive.
-
-It answers the body's result and the capture's verdict. The verdict's
-quiescence evidence is what the instance's destruction returned; roots whose
-instance was never created prove it trivially. However the host ends, an
-instance it did not destroy keeps the capture's storage retained rather than
-freed under a messenger that may still name it.
-
-`VulkanHostConfig` names the host configuration, the capture configuration,
-the instance layers to enable (each must be offered by the loader), the model's
-budgets, the owner's initial scene, an adjustment to the owner's configuration,
-a `NativeObserver`: something that wraps every native call the controller
-makes — the recording's and the frames' included — for evidence, a
-`VulkanRenderer`, a `FrameObserver`, when the device is created
-(`vulkanDeviceStart`: `DeviceAtFirstSurface`, the default, or
-`DeviceSurfaceFree`), how many owner-thread actions may be queued at once
-(`vulkanActionCapacity`, `defaultActionCapacity` — 64 — by default), how many
-release requests may be (`vulkanReleaseCapacity`, `defaultReleaseCapacity` — 64 —
-by default, a bound of its own), and whether the initial scene is declared to
-reference nothing a release request releases (`vulkanInitialSceneHoldsNothing`,
-off by default; see [A scene for each window](#a-scene-for-each-window)). The observer must run each call once
-and answer what it answered; it decides nothing, and the default observes
-nothing. The renderer records one frame of the scene between the controller's
-transitions into rendering and to presentation, with the session's managed
-construction lent to it ([Consumer construction](#consumer-construction));
-`clearRenderer`, the default, clears it to opaque black. The frame observer is
-told each acquisition, submission, present request, present return and
-observed completion, on the owner's thread, and the default is told nothing.
-`withVulkanOwnerHostOver` also takes the recording's and the frames' native
-layers (`RenderingOps`); `withVulkanOwnerHost` supplies the production ones.
-
-No configuration field turns [verification capture](#verification-capture) on.
-The package's private `controller` sublibrary composes the same production
-host with it (`withVulkanOwnerHostAs CaptureOn`, in
-`Hetoimasia.GPU.Vulkan.GLFW.Internal.Production`), and so does its headless
-seam (`withVulkanOwnerHostHooked`); `withVulkanOwnerHost` is
-`withVulkanOwnerHostAs CaptureOff`, and no host outside the package's own
-suites can capture.
+`VulkanHostConfig` carries the host and capture configurations, the instance
+layers (each must be offered), the model's budgets, the initial scene, a
+`NativeObserver` (wraps every native call for evidence; decides nothing), a
+`VulkanRenderer` (`clearRenderer` by default), a `FrameObserver`,
+`vulkanDeviceStart` (`DeviceAtFirstSurface` or `DeviceSurfaceFree`), the
+action and release-request capacities (64 each), and
+`vulkanInitialSceneHoldsNothing`. No configuration field turns verification
+capture on; only the package's own suites can capture.
 
 ## Threads
 
 | Work | Thread |
 | --- | --- |
-| Loader-aware session, extension copy, window creation, each surface's creation through GLFW | The process main thread |
-| Instance and messenger creation and destruction, device selection and creation, the later-target check, every surface's destruction, device destruction | The graphics owner |
-| Every surface query, swapchain and image view creation and destruction | The graphics owner |
-| Publishing a target's observation (`publishGraphicsObservation`) and capturing its window's render demand | The main thread: `runVulkanOwnerLoop` does both every turn |
-| Publishing the scene (`publishVulkanScene`), or a window's scene (`publishVulkanWindowScene`) | Any application thread |
-| Making a release request (`requestVulkanRelease`) and reading the scenes' state (`readVulkanSceneState`) | Any thread, in `STM` |
-| Adopting a scene for a target, releasing an adopted revision, and the lifecycle's two hooks | The graphics owner, in its step and its teardown |
-| Recording, acquiring, submitting, presenting, abandoning, asking a fence, and destroying frame synchronization and frame storages | The graphics owner |
-| Holding and ending a generation's CPU use | Any thread, in `STM` |
-| Reporting a swapchain call's out-of-date, suboptimal or surface-lost result | The graphics owner, whose acquisitions and presentations produce it |
-| Destroying a lost surface, rechecking a replacement's support, a reclamation pass | The graphics owner |
-| Creating a replacement surface under a target's existing attachment (`replaceVulkanSurfaces`) | The main thread: `runVulkanOwnerLoop` does it every turn |
-| Submitting an owner-thread action (`submitVulkanAction`) and reading or awaiting its outcome | Any thread, in `STM` |
-| Running an owner-thread action, and everything it constructs or releases | The graphics owner, in its step, never beside a frame's rendering |
+| The session, extension copy, window creation, each surface's creation through GLFW, replacement surfaces | The process main thread |
+| Publishing observations and captured render demand | The main thread, every turn of `runVulkanOwnerLoop` |
+| Publishing a scene; submitting an owner-thread action; release requests; holding and ending a generation's CPU use | Any thread |
+| Every other Vulkan call: instance, messenger, device, surface queries and destruction, swapchains, recording, acquisition, submission, presentation, fences, reclamation, running actions | The graphics owner |
 
-The controller makes no GLFW call. A surface is destroyed through the loader
-capability's `vkDestroySurfaceKHR`, a Vulkan call, by the thread that holds its
-obligation — the owner. The owner is one serialized Haskell thread, not a
-promise of OS-thread affinity (P-1), so the evidence below requires its calls
-to share one Haskell thread and each to run off the main OS thread.
+The controller makes no GLFW call. The owner is one serialized Haskell thread,
+not a promise of OS-thread affinity.
 
 ## Startup
 
-The owner's injected startup reads the extensions the session supplied (it is
-refused with `InstanceExtensionsMissing` otherwise), plans the instance
-against what the loader offers, creates the instance with the capture's
-messenger chained into its create info, creates the explicit messenger, and
-leases the instance to the surface bridge. `readReadiness` answers
-`RootsReady` from then on, and an application hands windows over only after it.
-A host configured with `DeviceSurfaceFree` also creates the device in that
-startup, between the messenger and the lease, so `RootsReady` then means a
-device exists too ([Surface-free bootstrap](#surface-free-bootstrap)).
+The owner's startup reads the extensions the session supplied
+(`InstanceExtensionsMissing` otherwise), plans the instance against what the
+loader offers, creates it with the capture's messenger chained in, creates the
+explicit messenger, and leases the instance to the surface bridge.
+`readReadiness` answers `RootsReady` from then on, and windows are handed over
+only after it. With `DeviceSurfaceFree` the device is also created in startup.
 
-The instance plan (`planInstance`) asks for Vulkan 1.3, the window system's
-surface extensions, `VK_EXT_debug_utils`, `VK_KHR_get_surface_capabilities2`
-and `VK_EXT_surface_maintenance1`, `VK_KHR_portability_enumeration` exactly
-where the loader advertises it (with the enumerate-portability flag), and the
-caller's layers. A loader below 1.3, a missing extension or a missing layer is
-`InstanceRefusal`, naming the whole gap, before anything is created. A startup
-that fails part-way leaves what it created recorded, and the owner's drain
-retires and destroys it.
+`planInstance` asks for Vulkan 1.3, the window system's surface extensions,
+`VK_EXT_debug_utils`, `VK_KHR_get_surface_capabilities2`,
+`VK_EXT_surface_maintenance1`, `VK_KHR_portability_enumeration` where
+advertised, and the caller's layers. Anything missing is an `InstanceRefusal`
+naming the whole gap before anything is created. A startup that fails part-way
+leaves what it created recorded, and the owner's drain destroys it.
 
-That request is **strict**: a layer or a validation feature the caller names
-in the host configuration (`vulkanLayers`, `vulkanValidationFeatures`) that the
-loader lacks is a refusal (`InstanceLayersUnavailable`,
-`ValidationFeaturesUnavailable`), never a silent fall back to validating less.
-The samples and the native suites rely on it. Beside it, `vulkanOptionalValidation`
-(LFE-28; `hetoimasia run --vulkan-validation`) is a **best-effort** request:
-`resolveValidation` is a pure function of the choice, the strict request and the
-loader's offer that adds the Khronos layer only if the loader lists it and
-synchronization validation only if an *enabled* layer lists
-`VK_EXT_validation_features`, and drops what is not offered rather than
-refusing. The decision is taken in the owner's startup (`startRootsResolving`),
-the one place the offer is known, and the typed resolution (requested, enabled
-or dropped for each of the two) is written there before the plan is checked and
-read with `readValidationResolution`. It never loosens the strict request, never
-retries a failed creation without validation, and adds no object naming (the
-messenger is still never named). See
-[the run command's Validation section](run_command.md#validation).
+That request is strict: a layer or validation feature named in the host
+configuration that the loader lacks is a refusal, never a silent fall back.
+`vulkanOptionalValidation` (`hetoimasia run --vulkan-validation`) is a
+best-effort request beside it: `resolveValidation` adds the Khronos layer and
+synchronization validation only where offered, drops the rest, and records the
+resolution (`readValidationResolution`). It never loosens the strict request
+([run_command.md](run_command.md#validation)).
 
 ## Admitting targets
 
-`handOverVulkanTarget` runs on the main thread. It attaches the window with a
-protocol whose construction step:
+`handOverVulkanTarget` runs on the main thread. Its construction step, masked
+throughout, registers the attachment with the owner's custody ledger, creates
+the surface through the surface bridge, and deposits it for the owner. It then
+announces the attachment through the owner's bounded port:
+`VulkanTargetHandedOver`, `VulkanAnnouncementDeferred` (port full),
+`VulkanOwnerClosed`, or `VulkanRootsNotReady` (nothing attached). A
+cancellation during the step is delivered only after the attachment is
+published and announced, so the caller loses the answer, not the target.
 
-1. registers the attachment with the owner's custody ledger — exactly
-   `graphicsTargetProtocol`'s construction;
-2. creates the surface through the surface bridge against the instance's lease;
-3. deposits what it created, under the attachment's identity, for the owner.
-
-The step is masked throughout. A cancellation aimed at the main thread
-meanwhile arrives as the mask ends, still inside the step, where the host would
-take it for a failed construction and roll back an attachment whose surface
-exists; the step catches it, and the handover delivers it once the attachment
-is published and announced, so the caller loses the answer rather than the
-target. A synchronous failure is the construction's own. The handover then
-announces the attachment to the owner through its bounded port:
-`VulkanTargetHandedOver` when the port took it, `VulkanAnnouncementDeferred`
-when the port was full, and `VulkanOwnerClosed` once the owner's admission has
-ended. `VulkanRootsNotReady` attaches nothing.
-
-The handover registers the owner's watch over an attachment before it
-attempts the announcement, and withdraws it once the announcement is admitted
-or the port has closed. So an owner that takes a refused port's events and
-then chooses its next deadline always sees the watch; registering it only
-after the refusal would let the owner go idle in between and never learn of
-it. A deferred attachment stays attached, with its surface deposited. The same
-holds for an attachment whose answer a cancellation lost after it was
-published: the handover's recovery re-announces it, and if the port is full it
-is deferred and watched exactly the same way. The caller
-may announce it again with `announceVulkanTarget`, after which the owner
-constructs it as any other target, or release it. Until it is announced the
-owner watches it: while any deferred attachment exists, the owner names its
-own next deadline one host idle bound ahead, so it takes rounds without being
-woken, and its progress step destroys — on its own thread — the surface of any
-deferred attachment whose slot has begun retiring, because it was released or
-its window closed. That destruction is what lets the attachment's retirement
-finish while the session runs; nothing else would ever tell the owner about
-it. An attachment that is still attached may yet be announced, and one whose
-announcement was admitted is the owner's ordinary target, so neither is
-touched. A destruction there that is uncertain is never attempted again: its
-obligation keeps retaining the attachment and the instance, and the step raises
-`UnannouncedSurfaceUncertain`, which ends the owner's run and reaches the
-application's checkpoints like any other owner failure.
+A deferred attachment stays attached with its surface deposited; the caller
+may announce it again with `announceVulkanTarget` or release it. While any
+deferred attachment exists the owner takes rounds on its own deadline and
+destroys, on its thread, the surface of any whose slot has begun retiring. An
+uncertain destruction there is never retried and raises
+`UnannouncedSurfaceUncertain`, which ends the owner's run.
 
 The owner's construction takes the deposit:
 
-- **A live surface** is offered to the roots. Without a device, the first one
-  is the bootstrap:
-  every physical device is queried with each queue family's presentation
-  support for that surface, `selectDevice` takes the first satisfying the
-  profile — Vulkan 1.3, `dynamicRendering`, `synchronization2`, the texture
-  table's six descriptor-indexing features (`runtimeDescriptorArray`, `descriptorBindingPartiallyBound`,
-  `descriptorBindingSampledImageUpdateAfterBind`,
-  `shaderSampledImageArrayNonUniformIndexing`,
-  `descriptorBindingVariableDescriptorCount` and
-  `descriptorBindingUpdateUnusedWhilePending`,
-  [The texture table](#the-texture-table)), `VK_KHR_swapchain`,
-  `VK_EXT_swapchain_maintenance1` and its
-  `swapchainMaintenance1` feature, and one queue family answering both
-  graphics and presentation — and the device is created with that family's one
-  queue and `VK_KHR_portability_subset` exactly where the device advertises
-  it. No satisfying device is `NoCompatibleDevice`, naming every candidate
-  and everything each lacks: a structured startup failure, fatal to the owner,
-  whose drain destroys the surface, the messenger and the instance.
-- **A later surface** — every surface, once a surface-free start has created
-  the device — is checked against the session's queue family with
-  `vkGetPhysicalDeviceSurfaceSupportKHR`. One it cannot present to is rejected
-  with `TargetSurfaceUnsupported`: its surface is destroyed there and then, on
-  the owner's thread, the target settles as a verified rollback, and the
-  device, the instance and every existing target are untouched. No second
-  device and no second queue is ever created (D-7).
-- **An unusable surface** — created but unpublished — is destroyed the same way
-  and rolled back; **a creation that failed** is rolled back with nothing to
-  destroy; **a deposit that never arrived**, because a cancellation lost the
-  step's answer, is found on the lease instead and destroyed.
+- **The first live surface, with no device yet,** is the bootstrap.
+  `selectDevice` takes the first physical device satisfying the profile:
+  Vulkan 1.3, `dynamicRendering`, `synchronization2`, the texture table's six
+  descriptor-indexing features, `VK_KHR_swapchain`,
+  `VK_EXT_swapchain_maintenance1`, and one queue family answering both
+  graphics and presentation. The device is created with that family's one
+  queue. No satisfying device is `NoCompatibleDevice`, naming every candidate
+  and what each lacks, and is fatal to the owner.
+- **A later surface** is checked against the session's queue family. One it
+  cannot present to is `TargetSurfaceUnsupported`: its surface is destroyed
+  and the target settles as a verified rollback. No second device or queue is
+  ever created.
+- **An unusable surface** is destroyed and rolled back; a failed creation is
+  rolled back; a deposit lost to a cancellation is found on the lease and
+  destroyed.
 
-A rejected target's reason is readable with `readTargetRejection` (the most
-recent 64 are kept), and its standing with `readTargetStanding` is
-`TargetUnusable False`: nothing remains, and the main thread releases it. A
-construction whose surface destruction was uncertain settles as partial
-instead, and the owner retires it — which is where the uncertainty is kept.
-An admitted target is `TargetUsable`; `readVulkanTargets` lists each by its
-attachment, with its model identity, designation and surface.
+`readTargetRejection` reads a rejected target's reason (the latest 64 are
+kept), `readTargetStanding` its standing, and `readVulkanTargets` lists the
+admitted targets.
 
 ## Swapchain generations
 
 `Hetoimasia.GPU.Vulkan.Native.Generations` owns every admitted target's
-swapchain generations, above the roots and over their native layer's
-`GenerationOps`. The controller tracks a target as soon as the roots admit it,
-hands every progress step the geometry the owner folded for each constructed
-target, and retires a target's generations before its surface. Each generation
-is the model's `GenerationId`, and each of its images that identity and an
-index; the model decides what a generation owes and when it may go, and this
-module makes the calls and records each result in the same masked step that
-made it.
+swapchain generations, above the roots. Each generation is the model's
+`GenerationId`. The model decides what a generation owes and when it may go;
+this module makes the calls and records each result in the same masked step
+that made it.
 
 ### Lifecycle
 
 | Stage | What happens |
 | --- | --- |
-| Planned | The surface's capabilities, formats and modes are read on the owner's thread, and `planGeneration` decides: the profile's format and FIFO, D-30's extent, and an image count within the surface's limits and the tracking limit. |
-| Constructing | `beginGeneration` reserves the candidate's image accounting at the tracking limit and, for a replacement, retires the active generation there and then. The swapchain is created; its images are enumerated, and their count is checked against the tracking limit **before** any view is built; a view is created for each image. |
-| Active | `publishGeneration` records the count the driver actually returned. The target is `Presenting`. |
-| Retired | Handed over as `oldSwapchain`, retired on its own, refused, failed or superseded. Nothing is acquired from it again, and no CPU use of it can begin. |
-| Destroyed | Once the model reports every hold on it ended — presentation retirement included — its views, newest first, then its swapchain, whose images go with it. Then the model records the disposal. The owner's step destroys at most the model's progress-action limit of generations, one of each target's in turn, starting one target further along each step; a target's own retirement or capacity path destroys all of that target's it can. |
+| Planned | The surface's capabilities, formats and modes are read, and `planGeneration` decides the format, FIFO, the extent, and an image count within the surface's limits and the tracking limit. |
+| Constructing | `beginGeneration` reserves the candidate's image accounting and, for a replacement, retires the active generation there and then. The swapchain is created; its image count is checked against the tracking limit before any view is built. |
+| Active | `publishGeneration` records the count the driver returned. The target is `Presenting`. |
+| Retired | Handed over as `oldSwapchain`, retired on its own, refused, failed or superseded. Nothing is acquired from it again. |
+| Destroyed | Once the model reports every hold ended: its views, newest first, then its swapchain. The owner's step destroys at most the model's progress-action limit of generations, rotating across targets. |
 
-The per-target presentation pool is not a generation's: a retired generation's
-pending presentations keep their pool records, counted against the same target
-capacity a new generation draws on (see
-[The presentation pool](#the-presentation-pool)).
+The per-target presentation pool is not a generation's: a retired
+generation's pending presentations keep their pool records
+([The presentation pool](#the-presentation-pool)).
 
 ### The extent
 
-`chooseExtent` is D-30, in the order of `Hetoimasia.Runtime.GLFW`'s
-`chooseTargetExtent` seam, over the controller's `targetGeometry` view of it:
+`chooseExtent` decides in this order:
 
-1. the target's render eligibility — hidden, minimized, deferred with no
-   framebuffer observed, or closing — withholds it before the surface is asked
-   anything;
-2. a concrete current extent the surface supplies is taken as it is, unless it
-   has no area;
-3. otherwise the application chooses: the last published framebuffer
-   observation, checked for area **before** it is clamped, then clamped to the
-   bounds the platform published, if any, and to the surface's reported bounds;
-   a clamp that still leaves no area is withheld too.
+1. the target's render eligibility (hidden, minimized, deferred with no
+   framebuffer observed, or closing) withholds it before the surface is asked;
+2. a concrete current extent the surface supplies is taken, unless it has no
+   area;
+3. otherwise the last published framebuffer observation, checked for area
+   before it is clamped to the platform's and the surface's bounds.
 
-Nothing is invented: with no observation to choose from the extent is withheld
-(`SuspendedUnobserved`). A withheld extent leaves the target `Suspended`, which
-is not a failure and spends no recovery attempt. The swapchain is always the
-framebuffer's size in physical pixels, never the window's: on a Retina display
-it is twice the window size.
-
-The observation reaches the owner through `publishGraphicsObservation` on the
-main thread, which `runVulkanOwnerLoop` does every turn whenever the window's
-observation is newer than the one it last published. An application that
-drives its own loop publishes it itself, after a handover and after anything
-that changes its window.
+Nothing is invented: with no observation the extent is withheld
+(`SuspendedUnobserved`). A withheld extent leaves the target `Suspended`,
+which is not a failure and spends no recovery attempt. The swapchain is always
+the framebuffer's size in physical pixels. An application that drives its own
+loop publishes observations itself (`publishGraphicsObservation`).
 
 ### The profile
 
-P-15's first profile: single-sample SDR, color-attachment usage only, FIFO,
-opaque composition where offered, and an advertised `B8G8R8A8_SRGB` or
-`R8G8B8A8_SRGB` format in the sRGB nonlinear color space. The transfer usages
-the retired proof harness asked for are neither required nor requested, and
-nothing falls back to a UNORM or an arbitrary format. A surface that cannot
-serve the profile leaves its target `PresentationUnsupported`, naming every gap
-at once; it is a structured target failure, not an assumption.
+Single-sample SDR, color-attachment usage only, FIFO, opaque composition where
+offered, and `B8G8R8A8_SRGB` or `R8G8B8A8_SRGB` in the sRGB nonlinear color
+space. Nothing falls back to a UNORM or arbitrary format. A surface that
+cannot serve the profile leaves its target `PresentationUnsupported`, naming
+every gap.
 
 ### Replacement
 
-A target is rebuilt when its geometry moves, when a swapchain call on its
-active generation answered out of date or suboptimal (`noteSwapchainResult`, or
-a replacement the model counted from an acquisition), or when it resumes after
-its active generation was withdrawn. Those calls run on the
-owner's thread, and so does the report: it makes the owner's next deadline
-immediate, so the owner that reported a result takes the round that
-reconciles it rather than going idle. A report from another thread wakes
-nothing, and the package's public module does not offer one.
+A target is rebuilt when its geometry moves, when a swapchain call answered
+out of date or suboptimal (`noteSwapchainResult`), or when it resumes after
+its active generation was withdrawn.
 
 - **Ordinary resize** is not a failed construction. A move is coalesced for
-  16 ms on the owner's monotonic clock from when it was first seen
-  (`Settling`), and then built from the newest extent and observed geometry. A
-  later change within the period joins the move rather than restarting its
-  wait, so a resize that never pauses — a Cocoa live resize changes the
-  framebuffer about every 8.5 ms — is rebuilt once a period rather than never.
-  Meanwhile the active generation keeps presenting
-  ([Acquisition](#acquisition)): a swapchain that answered suboptimal still
-  presents, scaled to the surface. A move that settles at the extent the
-  active generation already has is adopted without a rebuild, and a move that
-  returns to the active generation's geometry is cancelled. A surface that
-  reports its new extent later than the period is reported by the active
-  generation's next suboptimal or out-of-date answer, as any resize is.
-- **Withdrawal** is not a failed construction either. A target suspended as
-  ineligible while a generation stood — its window hidden or minimized — or
-  whose generation the owner withdrew (`withdrawGeneration`, when its step
-  view's withdrawal count rose before a hide) presents on that generation no
-  more: once eligible it is replaced at once, at whatever extent, handing the
-  old one over, with no settling period and no recovery attempt, and it stays
-  suspended in the model until the replacement is published
-  ([Pacing, suspension and fairness](#pacing-suspension-and-fairness), #357).
-- **Reconciliation without a fresh observation.** With a concrete surface
-  extent, an out-of-date or suboptimal result is enough to rebuild at the
-  surface's new extent: a main thread stalled in a platform modal loop does not
-  hold the target at stale geometry.
-- **Unchanged geometry** is not a resize. An out-of-date or suboptimal result
-  whose plan is the extent the active generation already has makes the rebuild
-  a recovery attempt, admitted by the model's episode: at most three, 100 ms and
-  then 500 ms apart after failures (`RecoveryWaiting`), and exhausting it is
-  escalated through the target's designation — an optional target unavailable,
-  a required one failing the session — and reported as `RecoverySpent`, which
-  [Recovery](#required-and-optional-dispositions) acts on. Nothing retries
-  hot. A next attempt whose delay the clock cannot express — one failing at the
-  very end of its range — is never admitted early: the target is reported as
-  `RecoveryUnscheduled`, builds nothing and asks for no step, whether its
-  surface was lost or a construction failed. A recovery rebuild whose observed geometry
-  has moved — since the active generation, or since the failed construction
-  was planned — first waits for that move to settle, as any resize does; one
-  whose geometry has come back cancels the move it had begun to settle, so a
-  later move waits its own full period.
-- **The irreversible `oldSwapchain` transition.** Replacement hands the active
-  generation over. The model retires it when the replacement is admitted, and
-  it is recorded as handed over to Vulkan immediately before the creation call
-  that passes it — a replacement cancelled before that call never handed it
-  over, and it stays a swapchain Vulkan counts as unretired. It is marked
-  retired before the native call, and a creation
-  that then fails leaves the target without an active generation, in
-  `ConstructionFailed`. The next construction is a fresh one — never passed the
-  retired handle, never replaying the failed call — and a recovery attempt. It
-  begins only once every swapchain of the target that Vulkan still counts as
-  unretired has been destroyed, and, since it hands nothing over, every
-  retired chain still standing too — the one the failed replacement handed over
-  included, however long its holds keep it (VK-14), so a failed candidate that was created goes
-  first, and so does an old generation a cancelled replacement never handed
-  over; a retry that must wait for one spends no recovery attempt.
-- **A newer resize during a replacement** is not lost: the replacement publishes
-  what it was begun for, and the newer geometry is built next, while the
-  generation it replaced keeps its obligations until they end.
+  16 ms from when it was first seen (`Settling`) and then built from the
+  newest geometry. A later change within the period joins the move, so a
+  continuous resize is rebuilt once a period, not never. Meanwhile the active
+  generation keeps presenting. A move that returns to the active geometry is
+  cancelled.
+- **Withdrawal** is not a failed construction. A target suspended while a
+  generation stood, or whose generation the owner withdrew before a hide,
+  presents on that generation no more: once eligible it is replaced at once,
+  with no settling period and no recovery attempt.
+- **Without a fresh observation**, an out-of-date or suboptimal result with a
+  concrete surface extent is enough to rebuild, so a stalled main thread does
+  not hold the target at stale geometry.
+- **Unchanged geometry** makes the rebuild a recovery attempt, admitted by the
+  model's episode: at most three, 100 ms then 500 ms apart
+  (`RecoveryWaiting`), and exhaustion is `RecoverySpent`
+  ([dispositions](#required-and-optional-dispositions)). Nothing retries hot.
+  A delay the clock cannot express is `RecoveryUnscheduled` and is never
+  admitted early.
+- **The `oldSwapchain` transition is irreversible.** Replacement hands the
+  active generation over; it is marked retired before the creation call. A
+  creation that then fails leaves the target in `ConstructionFailed` with no
+  active generation. The next construction is a fresh one, never passed the
+  retired handle, and begins only once every swapchain of the target that
+  Vulkan still counts as unretired, and every retired chain still standing,
+  has been destroyed.
+- A newer resize during a replacement is built next; it is not lost.
 
-### Bounds
+### Bounds and holds
 
-A target holds at most the model's generation limit, two by default, counting
-active, constructing and retired together. At capacity, every retired generation
-whose holds have ended is destroyed first; if the replacement still cannot fit,
-the target is `Backpressured` until a hold ends, and every other target and the
-owner carry on. When only the generation count is in the way and an active
-generation remains, the target keeps presenting from it: those frames spend
-nothing the replacement waits for, since the retired generation's holds end on
-their own present fences. Any other budget suspends the target in the model
-while it waits. With a limit of one, the active
-generation is the only thing in the way: it is retired on its own, awaited, and
-destroyed, and a fresh generation is built without it once its move's period
-has passed — every construction after a target's first is a replacement, and
-is coalesced the same way. No target reserves or
-releases anything of another's.
+A target holds at most the model's generation limit (two by default),
+counting active, constructing and retired. At capacity every retired
+generation whose holds have ended is destroyed first; if the replacement still
+cannot fit the target is `Backpressured` until a hold ends, and it keeps
+presenting from its active generation meanwhile. With a limit of one, the
+active generation is retired, awaited and destroyed before a fresh one is
+built. No target reserves or releases anything of another's.
 
-### Holds
-
-A generation's ended-CPU-use hold is certified when it retires, unless a CPU use
-is still held: `useVulkanGeneration` holds one on the active generation, from
-any thread, and `endVulkanGenerationUse` ends it. While one is held the
-generation is retired but not destroyed; the model's schedule keeps the owner
-polling it, and the owner destroys it at the first step after the use ends.
-A recorded batch holds the generation it records into as a recorded reference
-([Retention](#retention)); a submission holds it until its fence signals
-(VK-12), and a presentation until its present fence signals (VK-13).
+`useVulkanGeneration` holds a CPU use on the active generation from any thread
+and `endVulkanGenerationUse` ends it; while one is held the generation is
+retired but not destroyed. A recorded batch holds the generation it records
+into, a submission holds it until its fence signals, and a presentation until
+its present fence signals.
 
 ### Failure and close
 
-- A destruction that raised is uncertain. The generation is kept, marked so,
-  and never offered again; the session fails with `CleanupFailed` and the roots
-  close admission; the step raises `GenerationDestructionFailed`, which ends the
-  owner's run. The surface above it is retained (`TargetGenerationsRemain`), and
-  with it the device and the instance.
+- A destruction that raised is uncertain. The generation is kept and never
+  offered again; the session fails with `CleanupFailed`; the step raises
+  `GenerationDestructionFailed`, which ends the owner's run. The surface, the
+  device and the instance are retained.
 - An effect whose bookkeeping could not be committed enters the same path
   (`GenerationEffectUncertain`). A creation that raised created nothing.
-- Admission through a construction's settlement is one masked region, so a
-  candidate the model admitted is always settled. Each native effect and its
-  record are consecutive inside it, and a cancellation can land only between
-  effects: whatever
-  exists is recorded, the construction is settled as failed, and the
-  cancellation is then delivered. A creation a cancellation reached after it
-  returned leaves its swapchain owned, and destroyed before the next
-  construction. One a cancellation interrupted *inside* the call — which blocks
-  interruptibly — may have created something whose handle never came back: its
-  candidate is kept uncertain and never destroyed, the session fails with
-  `CleanupFailed`, admission closes, and the surface and everything above are
-  retained.
-- Device loss raised by any generation call is latched as the roots' is.
-- A host that asked for windowed depth (GRS-13) has every generation also own a
-  depth image, made last in its construction, released when the generation is
-  destroyed and destroyed once the batches that recorded it have completed; one
-  that cannot be made fails the construction ([Windowed depth](#windowed-depth)).
+- Admission through a construction's settlement is one masked region. A
+  cancellation can land only between effects, and whatever exists is recorded.
+  A creation interrupted inside the call may have created something whose
+  handle never came back: its candidate is kept uncertain, never destroyed,
+  and the session fails.
 - Close wins: a closed target begins no construction and admits no recovery
-  attempt, and a construction completed after the close is retired rather than
-  published. A target's retirement retires its active generation, destroys every
-  generation whose holds have ended, and raises `GenerationsRetained` —
-  manufacturing no evidence — if any remains, which retains the surface, the
-  window and every parent.
+  attempt. A target's retirement destroys every generation whose holds have
+  ended and raises `GenerationsRetained`, manufacturing no evidence, if any
+  remains.
 
 ### How the generations are built
 
-`Hetoimasia.GPU.Vulkan.Native.Generations` is the entry point and holds no code
-of its own: it re-exports, with unchanged names, signatures and constructor
-visibility, what eight private modules under
-`Hetoimasia.GPU.Vulkan.Native.Internal.Generations` implement. The split (#266)
-moved code and changed no behaviour, and VK-14 added `Surface`; each module's
-Haddock states what it owns.
-
-| Module | Responsibility | Depends on |
-| --- | --- | --- |
-| `State` | The `Generations` and its one map of target records, each with its generation records; the conditions, standings and swapchain results; the constructors and `trackTarget`; the three failures; and the lookup, edit, ended-CPU-use and asynchrony helpers every other module shares. | — |
-| `Uses` | `noteSwapchainResult`, and holding and ending a CPU use of the active generation, in `STM` on any thread. | `State` |
-| `Disposal` | Making the generations and registering their disposer with the roots; destroying every retired generation whose holds ended, views newest first and then the swapchain, each in one masked step; and the model's progress turn that records the disposals. | `State` |
-| `Reconciliation` | One target brought to its latest geometry: eligibility and suspension, planning, settling, recovery through the model's episode, capacity and the one-generation path, and the masked construction, naming and publication of a candidate with its `oldSwapchain` handover. | `State`, `Disposal` |
-| `Step` | `stepGenerations` — disposal, then each named target's reconciliation, then the lost surfaces' release, then one progress turn — and `generationsDeadline`. | `State`, `Disposal`, `Reconciliation`, `Surface` |
-| `Surface` | A lost surface released once its generations have gone, an attempt asked for, and its replacement taken or refused (VK-14). | `State` |
-| `Retirement` | `retireTargetGenerations`: close, retire the active generation, dispose, and forget the target only once none remains. | `State`, `Disposal` |
-| `Observation` | `readTargetGenerations` and its views. | `State` |
-
-The graph is acyclic, and no module adds state: the target records and their
-generation records are the one map `State` creates, and each module edits only
-what its own operation concerns — the table in the public module's Haddock
-names which. A `GenerationUse`'s ended flag belongs to its holder, and a
-construction's note of the creation call in progress to that one construction.
-`Generations` and `GenerationUse` stay abstract: their constructors are
-exported only by `State` and `Uses`, which clients cannot import. The
-recording's private modules still import the public module, and no new module
-declares a foreign import.
+The public module re-exports eight private modules under
+`Internal.Generations`: `State` (the one map of target and generation
+records), `Uses`, `Disposal`, `Reconciliation`, `Step`, `Surface`,
+`Retirement` and `Observation`. The graph is acyclic and only `State` creates
+state. `Generations` and `GenerationUse` stay abstract.
 
 ## Device memory
 
-GRS-11 (#333) backs device memory with VMA beneath the model's accounting, as
-D-38 and D-40 of the [GPU resource services design](archive/designs/gpu_resource_services_design.md)
-decide. `Hetoimasia.GPU.Vulkan.Native.Allocator` is the allocator's shape — an
-open record of calls, `AllocatorOps`, over 64-bit handles — and the engine's
-memory-type policy; `Hetoimasia.GPU.Vulkan.Native.Allocator.Vulkan` is its
-production form, VMA through the engine's own shim; the headless examples
-supply a stand-in that keeps its blocks in Haskell. No VMA type crosses the
-package's public API: the shim's imports are private, and an external-client
-example proves neither they nor the Hackage binding the package links for its
-compiled VMA are reachable.
+Device memory is VMA beneath the model's accounting.
+`Hetoimasia.GPU.Vulkan.Native.Allocator` is the allocator's shape (an open
+record of calls, `AllocatorOps`) and the engine's memory-type policy;
+`Allocator.Vulkan` is its production form through the engine's own shim. No
+VMA type crosses the package's public API.
 
-### Ownership and thread
-
-One allocator per device. The roots create it right after the device — at the
-first admission or a surface-free start — with
-`VMA_ALLOCATOR_CREATE_EXTERNALLY_SYNCHRONIZED_BIT`, the instance's
-`vkGetInstanceProcAddr` and the device's `vkGetDeviceProcAddr` from the
-binding's own dispatch tables, `vulkanApiVersion` 1.3, and an explicit
-large-heap block size of 256 MiB (`largeHeapBlockSize`, VMA's own default, as
-#361 measured it). Every user of the device shares it, and every call to it is
-made on the graphics owner's thread; nothing relies on VMA's internal locking.
-An allocator whose creation raised is absent: the device stays recorded for
-retirement and the failure is raised, and nothing can be allocated
-(`RefusedDeviceAbsent`).
-
-The roots destroy it child before parent: after every target's surface and
-before the device, and only once every allocation made from it has been freed —
-`retireRoots` raises `AllocationsRemain`, retaining the allocator and the
-device, while one remains. Its destruction frees the device memory VMA still
-held, its retained empty blocks, and that is released from the model's
-accounting in the same masked step, exactly once. A destruction that raised is
-uncertain: the allocator is recorded so, the session fails with
-`CleanupFailed`, and the device is retained (`AllocatorRemains`).
+**Ownership.** One allocator per device, created by the roots right after the
+device with `VMA_ALLOCATOR_CREATE_EXTERNALLY_SYNCHRONIZED_BIT` and an explicit
+large-heap block size of 256 MiB. Every call to it is made on the graphics
+owner's thread; nothing relies on VMA's internal locking. The roots destroy it
+after every target's surface and before the device, and only once every
+allocation has been freed (`AllocationsRemain` otherwise). A destruction that
+raised is uncertain: the session fails with `CleanupFailed` and the device is
+retained (`AllocatorRemains`).
 
 ### Usages and memory types
 
-An allocation names a `MemoryUsage`, which states the properties it requires
-and prefers (D-16):
-
 | Usage | Required | Preferred | For |
 | --- | --- | --- | --- |
-| `UsageTexture` | device-local | — | textures, always staged |
-| `UsageStaticGeometry` | device-local | — | static geometry, staged |
+| `UsageTexture` | device-local | none | textures, depth and color targets |
+| `UsageStaticGeometry` | device-local | none | static geometry, staged |
 | `UsageStaging` | host-visible | host-coherent | staging written by the host |
-| `UsageFrameRing` | host-visible | host-coherent | per-frame rings the device reads directly |
+| `UsageFrameRing` | host-visible | host-coherent | per-frame rings the device reads |
 | `UsageReadback` | host-visible | host-cached | readback buffers |
 
-The engine, not VMA, chooses the one memory type an allocation uses
-(`chooseMemoryType`): among the types the buffer's `memoryTypeBits` allow
-with every required property, the one with the most preferred properties, and
-of those the lowest index. It passes only that type's bit to VMA, so VMA can
-neither choose nor fall back to another; VMA still honours the driver's
-preferred or required dedicated allocation within that type. A usage no
-allowed type serves is `RefusedNoMemoryType`, naming the usage, before any
-allocation. Each [buffer or image kind](#buffers-and-images) fixes the usage
-its allocation is made under; depth and color targets, which only the device
-writes and reads, use the texture usage's device-local memory.
+The engine, not VMA, chooses the one memory type (`chooseMemoryType`): among
+the allowed types with every required property, the one with the most
+preferred properties, lowest index first. Only that type's bit is passed to
+VMA, so VMA cannot fall back to another. No serving type is
+`RefusedNoMemoryType`.
 
 ### Accounting and backpressure
 
-The model's accounted bytes charge the device memory VMA holds — each block
-and each dedicated allocation — never a resource's own size (D-15, D-40). The
-private allocation protocol makes a buffer's or an image's memory for an
-allocation attempt in this order; the two differ only in VMA's calls
-(`vmaCreateBuffer` and `vmaCreateImage`, `vmaDestroyBuffer` and
-`vmaDestroyImage`) and in that an image is never mapped:
+The model's accounted bytes charge the device memory VMA holds (each block and
+each dedicated allocation), never a resource's own size. An allocation attempt
+proceeds in this order:
 
-1. The resource's memory requirements are asked of the device without
-   creating it (`vkGetDeviceBufferMemoryRequirements`,
-   `vkGetDeviceImageMemoryRequirements`), and the memory type chosen.
+1. The memory requirements are asked of the device without creating the
+   resource, and the memory type is chosen.
 2. The resource is created in held memory only
-   (`VMA_ALLOCATION_CREATE_NEVER_ALLOCATE_BIT`). That opens nothing and charges
-   nothing new. A request nothing held fits (VMA's
-   `VK_ERROR_OUT_OF_DEVICE_MEMORY`) and one the driver requires dedicated (VMA's
-   `VK_ERROR_FEATURE_NOT_PRESENT`, since a dedicated allocation is never made
-   in held memory) are both the expected miss, `NotPlaced`: they spend no
-   recovery and lead to the next step.
+   (`VMA_ALLOCATION_CREATE_NEVER_ALLOCATE_BIT`), which opens and charges
+   nothing. A miss (`NotPlaced`) spends no recovery.
 3. The attempt reserves the most the allocating call could open
-   (`reserveDeviceMemory`): the larger of the type's preferred block size —
-   VMA's `CalcPreferredBlockSize`, an eighth of a heap of at most 1 GiB and
-   otherwise the configured 256 MiB, aligned to 32 bytes (`preferredBlockSize`)
-   — and the requirements' size. The bound holds only under
-   [D-40](archive/designs/gpu_resource_services_design.md#d-40-the-byte-budget-charges-vmas-blocks-reserved-before-one-can-open)'s
-   preconditions: the allocating call asks VMA to map nothing — no
-   `VMA_ALLOCATION_CREATE_MAPPED_BIT`, nor any other mapping inside the call;
-   the shim passes `VMA_ALLOCATION_CREATE_NEVER_ALLOCATE_BIT` in step 2 and no
-   flags at all here — and `VMA_DEBUG_MARGIN` is zero in the VMA the engine
-   links. Without them VMA can retain a freshly opened block whose commit
-   failed and open a dedicated allocation as well, in one call
-   (#367). A reservation the byte budget cannot hold is
-   `RefusedBackpressure`, answered before the call that could open memory, and
-   never enters recovery. A reservation the model rejects — the session failed,
-   or the attempt may no longer allocate — is refused with its misuse
-   (`RefusedMisuse`), and the call that could open memory is never made.
-4. The allocating call. VMA's device-memory callbacks, counting in C inside
-   that call, record every block or dedicated allocation it opened and freed.
-   Right after it — whether it succeeded or not — the effect is settled
-   (`settleDeviceMemory`): the reservation is replaced by what it opened,
-   nothing if it opened nothing, the rest returned at once, and what it freed
-   released.
+   (`reserveDeviceMemory`): the larger of the type's preferred block size and
+   the requirements' size. Over budget is `RefusedBackpressure`, answered
+   before the call. **The bound holds only if the allocating call asks VMA to
+   map nothing and `VMA_DEBUG_MARGIN` is zero in the linked VMA**; otherwise
+   VMA can retain a failed block and open a dedicated allocation in one call.
+4. The allocating call. VMA's device-memory callbacks record what it opened
+   and freed, and the effect is settled right after (`settleDeviceMemory`),
+   whether the call succeeded or not.
 5. An effect that disagrees with the accounting is a defect
-   (`AccountingFinding`): opening more than was reserved, which under step
-   3's preconditions cannot happen and so shows one of them was broken;
-   freeing more than was charged as held, after which the charge
-   would no longer bound the memory; or an effect the model refused to settle
-   under the attempt, which is then settled under no reservation so nothing
-   held goes uncharged. The resource is destroyed before its allocation is
-   freed, that effect settled too, and the request fails with
-   `AllocatorAccountingDefect`. The memory still held stays charged. The
-   session fails with `CleanupFailed`, and nothing else is freed for it,
-   unless the defect is memory opened beyond a reservation that the budget
-   still holds.
-6. A buffer's host-visible allocation is mapped for its lifetime
-   (`vmaMapMemory`), by this separate call after the allocating call has been
-   settled — never by the allocating call itself, which is step 3's first
-   precondition — so a failed mapping never enters that call's accounting.
-   Persistent mapping for any later buffer or image kind, the host-visible
-   staging ring among them, follows the same rule. An image's allocation is
-   not mapped: it is optimally tiled, and the host never writes it directly
-   (D-16).
+   (`AllocatorAccountingDefect`): the request fails and the session fails with
+   `CleanupFailed`.
+6. A buffer's host-visible allocation is mapped for its lifetime by a separate
+   call after the allocating call is settled, never by the allocating call. An
+   image's allocation is never mapped.
 
-Every later call that can free memory — a destruction, the allocator's own —
-is settled the same way before anything else is admitted, and a defect there
-fails the session the same way, though the destruction itself stands. A block several
-resources share is charged once, and disposing of or abandoning a resource
-releases none of it; VMA's retained empty block stays charged until VMA frees
-it. Under the default 256 MiB byte budget and VMA's 256 MiB large-heap block,
-the bound admits an allocating call on a large heap only while nothing else is
-charged, so a consumer that needs more than one block on such a heap raises
-the budget (D-11); placements in held memory are unaffected.
+Every later call that can free memory is settled the same way. A block several
+resources share is charged once, and VMA's retained empty block stays charged
+until VMA frees it. Under the default 256 MiB budget and 256 MiB block, a
+large heap admits an allocating call only while nothing else is charged; a
+consumer that needs more than one block raises the budget.
 
-### Recovery
+**Recovery.** A no-effect out-of-memory result gets one reclamation pass and
+at most one retry of the whole protocol
+([Allocation recovery](#allocation-recovery)). A placement miss is never a
+failure and backpressure never reaches recovery.
 
-A no-effect out-of-memory result from the allocating call reaches the
-construction's VK-14 recovery with its reservation already returned: one
-reclamation pass and at most one retry, which runs the whole protocol again —
-held memory first, then a fresh reservation against the reconciled
-accounting. Disposing of a resource counts as progress, so a retry can succeed
-by placing in memory the pass emptied, even when no block was freed; the
-nested steps of one construction make one retry between them. A placement miss
-is never a failure, and backpressure never reaches recovery. An effect that is
-uncertain follows the [terminal-failure policy](#terminal-failure).
+**Failure cleanup.** A creation, bind or map that failed leaves nothing
+allocated and no reservation held, and rolls back only itself. A destruction
+that raised there has an unknown effect: the allocation stays counted, the
+session fails with `CleanupFailed`, and the request's own failure is raised.
 
-### Failure cleanup
-
-A creation, bind or map that failed leaves nothing allocated and no
-reservation held. VMA's own creation destroys what it made when its bind
-fails, inside the same call, and the effect it reports is settled; a map that
-failed destroys the buffer and frees its allocation, settling that; an owned
-view whose creation failed destroys its image and frees the image's
-allocation, settling that. Memory such
-a failure left held — a block opened for it and kept, empty — stays charged
-until VMA frees it, and the next request may place in it. Each allocation is
-counted with the roots the moment the call that made it returns, and a
-failed request counts what it made gone only once destroying it returned; a
-destruction that raised there has an unknown effect, so the allocation stays
-counted — the allocator, and the device, are never destroyed under it — the
-session fails with `CleanupFailed`, and the request's own failure is the one
-raised. A failed request
-rolls back only itself: other allocations, their blocks and their mappings are
-untouched.
-
-### Lifetime and mapping
-
-An allocation is freed only when the model allows its resource's disposal,
-after completion evidence has ended every submitted use: VMA tracks no GPU use
-and is never relied on to. Teardown unmaps, destroys the buffer, then frees its
-allocation; for an image it destroys the owned view, then the image, then frees
-its allocation. Each allocation is mapped once, for its lifetime; VMA maps the
-block beneath as it needs, and unmapping one allocation leaves its siblings'
-mappings alone. Flushes and invalidates are allocation-relative ranges given to
-VMA ([Readback memory](#readback-memory)).
-
-### State
-
-| State | Owner | Readers and writers | Thread | Lifetime | Reset or disposal |
-| --- | --- | --- | --- | --- | --- |
-| The allocator | The roots | Created after the device by `createDevice`; read by the allocation protocol; destroyed by `retireRoots` | The owner | The device's | Destroyed once no allocation remains, before the device; uncertain if its destruction raised, retaining the device |
-| Live allocations | The roots | The allocation protocol counts each made and freed; `retireRoots` reads | The owner | The session | Counts down as each is freed |
-| The callbacks' counts | The shim's allocator state | VMA's device-memory callbacks write, inside each call; each shim entry clears them before the call and copies them out after | The owner, inside a VMA call | The allocator's | Freed with the allocator |
-| Device-memory charges | The model (`gpuDeviceMemory`) | Settled after every allocator call; reserved per attempt before an allocating call | The owner | The session | Released only as VMA reports memory freed |
+**Lifetime.** An allocation is freed only when the model allows its resource's
+disposal, after completion evidence has ended every submitted use. VMA tracks
+no GPU use. Teardown unmaps, destroys the buffer (or the view, then the
+image), then frees the allocation.
 
 ## Recording through managed resources
 
-`Hetoimasia.GPU.Vulkan.Native.Recording` is D-26's small Vulkan-specific
-recording interface as VK-11 delivers it. A renderer never holds a native
-handle: it holds opaque managed handles, each naming one generation of one
-managed resource by the model's `ResourceId`, and it records through a
-`Recorder` lent to one consumer action. Every native call goes through an open
-native layer, `RecordingOps`, whose production form is
-`Hetoimasia.GPU.Vulkan.Native.Recording.Vulkan`; the headless examples supply a
-stand-in. A `Recording` is created over the session's roots and generations by
-the graphics owner, and every operation is refused with `RefusedNotOwner` on any
-other thread.
+`Hetoimasia.GPU.Vulkan.Native.Recording` is the small Vulkan-specific
+recording interface. A renderer never holds a native handle: it holds opaque
+managed handles, each naming one generation of one managed resource by the
+model's `ResourceId`, and records through a `Recorder` lent to one consumer
+action. Every native call goes through an open native layer, `RecordingOps`.
+A `Recording` is created by the graphics owner, and every operation is refused
+with `RefusedNotOwner` on any other thread.
 
 ### How the recording is built
 
-`Hetoimasia.GPU.Vulkan.Native.Recording` is the entry point and holds no code of
-its own: it re-exports, with unchanged names, signatures and constructor
-visibility, what seven private modules under
-`Hetoimasia.GPU.Vulkan.Native.Internal.Recording` implement. The split (#265)
-moved code and changed no behaviour; each module's Haddock states what it owns.
+The public module re-exports seven private modules under
+`Internal.Recording`: `Layer` (the native layer's shape and vocabulary),
+`State` (the `Recording` and its three maps: managed records, frame storages,
+batch records), `Construction`, `Batches`, `Recorder`, `Readback` and
+`Disposal`. Only `State` creates state, and `Internal.Commands` is the only
+home of the `unsafe` subset.
 
-| Module | Responsibility | Depends on |
-| --- | --- | --- |
-| `Layer` | The native layer's shape: `RecordingOps` and the command, layout and request vocabulary, the buffer and image kinds and what each fixes. No state, no call. | — |
-| `State` | The `Recording` and the three maps it holds; handles, refusals, failures and views; the owner check, the live-generation check, the model helpers and a generation's one native destruction. | `Layer` |
-| `Construction` | Creating, replacing, naming and releasing managed resources, each in one masked step. | `Layer`, `State` |
-| `Batches` | Discard, reset, submission evidence, and freeing a slot of completed batches: invalidate natively, then discharge. | `Layer`, `State` |
-| `Recorder` | `recordFrame`, the `Recorder` and its commands, retention before each native call, and label balancing. | `Layer`, `State`, `Batches` |
-| `Readback` | Host reads gated on completion evidence, host fills, and their flushes and invalidations through the allocator. | `Layer`, `State` |
-| `Disposal` | Destroying released generations child before parent, recording disposals, and retirement. | `State` |
+### The boundary
 
-The graph is acyclic, and no module adds state: the managed records, the frame
-storages and the batch records are the `Recording`'s three maps, created by
-`State`, and each module edits only the entries its own operation concerns, on
-the graphics owner's thread — the table in the public module's Haddock names
-which. A `Recorder`'s own references belong to the one `recordFrame` that made
-it. `Recording.Vulkan` and `Recording.Shaders` still import the public module,
-and no new module declares a foreign import, so `Internal.Commands` remains the
-only home of the `unsafe` subset.
+| Capability | Operations |
+| --- | --- |
+| Managed resources | `createPipelineLayout`, `createPipeline`, `replacePipeline`, `createFrameStorage`, `createReadback`, `createBuffer`, `createImage`, `releaseManaged` |
+| Checked frame | `recordFrame` takes a `FrameSlotId` the model holds acquired and resolves its image, view, extent and format through the owning generation |
+| Scoped recorder | image and resource transitions, `beginRendering`, `beginRenderingInto`, pipeline binds, viewport, scissor, draws, `endRendering`, copies to readback |
+| Recorded batch | `discardBatch`, `resetFrameRecorder`, `noteBatchSubmitted` |
+| Readback | `readReadback`, `fillReadback` |
+| Disposal | `disposeResources`, `retireRecording`, on the owner, only once the model reports every hold ended |
 
-### The boundary as delivered
+There is no raw command buffer, no callback escape hatch and no render graph.
+A command outside the supported vocabulary is `RefusedUnsupported`; one the
+recorder's state does not admit (a draw outside rendering, a transition inside
+rendering, a viewport or scissor that leaves the attachment) is
+`RefusedIllegal`. Either way nothing native happens.
 
-| Capability | Operation | What the backend keeps |
-| --- | --- | --- |
-| Managed rendering resources | `createPipelineLayout`; `createPipeline` over a layout, VK-9's embedded shaders and a color format; `replacePipeline`; `createFrameStorage` for a target's frame slot; `createReadback` of a byte size; `createBuffer` and `createImage` of an engine-defined kind ([Buffers and images](#buffers-and-images)); `releaseManaged` | The native objects, their accounting reserved with `beginAllocation` before each creation, and the exact generation each handle names |
-| Checked frame | `recordFrame` takes a `FrameSlotId` the model holds acquired, and resolves its image, view, extent and format through the generation that owns them | The frame's generation, retained by the batch |
-| Scoped recorder | `transitionImage`, `transitionResource` ([Ordering](#ordering-managed-resources)), `beginRendering`, `beginRenderingInto` ([Offscreen color targets](#offscreen-color-targets)), `bindPipeline`, `setViewport`, `setScissor`, `draw`, `endRendering`, `copyToReadback`, `copyTargetToReadback` | The slot's command storage, the batch's recorded references, and its managed resources' uses |
-| Recorded batch | `discardBatch`; `resetFrameRecorder`; `noteBatchSubmitted`, which VK-12's `submitFrames` calls | Sealed commands and references, whether or not the caller keeps the `BatchId` |
-| Readback | `readReadback`, `fillReadback` | The buffer's allocation, its mapping, and what last wrote it |
-| Disposal | `disposeResources`, `retireRecording` | Destruction on the owner, only once the model reports every hold ended |
-
-The supported vocabulary is exactly the triangle and its verification: dynamic
-rendering into the frame's one color view or a managed color target's
-([below](#offscreen-color-targets)), a graphics pipeline compatible with the
-attachment's format, dynamic viewport and scissor, whole-triangle draws —
-instanced, and indexed and instanced, from vertex, index and instance data bound
-from managed buffers and the session's shared ring, with push constants
-([Drawing from buffers](#drawing-from-buffers), GRS-4) — the four image
-transitions below, one bounded copy of the whole frame image or color target
-into a readback buffer, and GRS-3's checked transitions and boundary barriers of
-managed buffers and images. There is no raw command buffer, no callback escape
-hatch, no descriptor, no sampling of an image, and no render graph. A command outside that vocabulary — an
-unsupported transition, a draw that is not whole triangles, a transition into or
-out of the transfer-source layout or a copy of an image that is not a transfer
-source — is `RefusedUnsupported`; one the recorder's state
-does not admit — a draw outside rendering or before a pipeline, viewport and
-scissor, a transition inside rendering or from a layout the image is not in,
-rendering into an image that is not a color attachment, a viewport that is not
-finite or has no area, a viewport or scissor that leaves the attachment — is
-`RefusedIllegal`. Keeping both within the image keeps them within every
-device's viewport limits, which Vulkan requires to cover any image a
-framebuffer can hold, so no device limit is read.
-Either way nothing native happens.
-
-Construction is ordinary `IO` on the owner. A creation reserves its accounting
-first, so an exhausted budget is `RefusedBackpressure` before any native call;
-a creation that raised created nothing and gives the reservation back; one that
-returned is recorded as a managed generation in the same masked step. A frame
-slot has at most one storage — a command pool with one primary command buffer —
-and one outstanding batch; `createFrameStorage` refuses, before any native
-call, a target that is not this session's, not admitted or suspended, or a slot
-the frame budget cannot issue. A construction whose native layer raised after
-making part of its objects — a pool whose command buffer could not be
-allocated, a buffer whose memory could not be mapped — destroys that part before
-raising, so a creation that raised created nothing. A readback's creation may
-also refuse, having made nothing: `RefusedBackpressure` for device memory the
-budget cannot hold, `RefusedNoMemoryType` for a usage no memory type serves
-([Device memory](#device-memory)).
+A creation reserves its accounting first, so an exhausted budget is
+`RefusedBackpressure` before any native call. A creation that raised created
+nothing and gives the reservation back; one that returned is recorded in the
+same masked step. A frame slot has at most one storage (a command pool with
+one primary command buffer) and one outstanding batch.
 
 ### Retention
 
 Every recording operation, in order:
 
 1. checks the calling thread, that the recorder's consumer is still running
-   (`RefusedRecorderClosed` otherwise), each handle it names — this session's
-   (`ForeignIdentity`), still managed (`StaleIdentity`), not replaced
-   (`StaleIdentity`), not released (`WrongPhase`) — and the recorder's state;
-2. registers, in the model, the exact resource generations it references — its
-   own, and the transitive dependencies of the binding: a pipeline's layout
-   generation, fixed when the pipeline was built — as recorded references of the
-   batch (`extendBatch`), before the native call that could capture them;
+   (`RefusedRecorderClosed`), each handle it names (this session's, still
+   managed, not replaced, not released) and the recorder's state;
+2. registers in the model the exact resource generations it references,
+   including transitive dependencies such as a pipeline's layout, as recorded
+   references of the batch (`extendBatch`);
 3. makes the native call.
 
-Steps 2 and 3 are one masked step, so a cancellation lands only before the
-reference is taken or after the command is recorded; a refusal at step 1 or 2
-makes no native call. The union is taken per operation and the model keeps one
-reference per subject per batch, so binding the same pipeline twice, or two
-pipelines over one layout, retains each subject once and is not a duplicate. The
-batch itself is admitted by `recordBatch` against the acquired frame, which
-reserves its record — the only accounting a batch needs — and retains the frame's
-swapchain generation and the slot's storage; a budget that cannot reserve it
-refuses `recordFrame` before any command buffer is begun.
-
-A batch never resolves a resource again. `replacePipeline` publishes a new
-generation and releases the old one, whose handle then records nothing more;
-every batch that recorded the old generation keeps naming it, and it and its
-layout are destroyed only when those batches' references end. Releasing a handle
-denies new recordings through it and ends its CPU use, and leaves every batch
-that already recorded it untouched. In-place mutation of data a batch depends on
-is refused: `fillReadback` answers `RefusedInUse` while any batch or submission
-holds the buffer, and nothing else can write a managed resource.
+Steps 2 and 3 are one masked step. A batch never resolves a resource again:
+`replacePipeline` publishes a new generation and releases the old, and every
+batch that recorded the old one keeps naming it until its references end.
+In-place mutation of data a batch depends on is refused (`RefusedInUse`).
 
 ### Batches
 
-`recordFrame` runs its consumer exactly once. It seals the batch only if the
-consumer returned with rendering ended and no command's native call raised. A
-command whose call raised may or may not have reached the buffer: the batch is
-marked partial at that boundary, the recorder records nothing more, and a
-consumer that catches the exception and returns still gets `RefusedIllegal`
-rather than a sealed batch. A consumer that raised, a cancellation,
-or rendering left open leaves the batch **partial**: its commands and every
-reference it took stay owned, the slot's storage stays occupied, it can never be
-submitted, and the exception is re-raised (or `RefusedIllegal` answered for
-unbalanced rendering). A recorder kept past its scope refuses every command; no
-claim is made that Haskell's lexical scope prevents keeping one.
+`recordFrame` runs its consumer exactly once and seals the batch only if the
+consumer returned with rendering ended and no command's native call raised.
+Otherwise the batch is **partial**: its commands and references stay owned,
+the slot's storage stays occupied, and it can never be submitted. A recorder
+kept past its scope refuses every command.
 
 `discardBatch` and `resetFrameRecorder` end a batch. Each first resets the
-storage's pool — the native invalidation that makes future submission of its
-commands impossible — and only after that returns discharges, in the model,
-exactly that batch's references (`resetFrameRecorder`: every unsubmitted batch of
-the frame). Neither settles the frame's acquisition or presentation obligation.
-A batch still being recorded is refused, and so is one the model no longer
-holds, or a frame no longer acquired: a submitted batch's commands may be
-executing, and resetting its pool then would be invalid. An invalidation that
-raised is uncertain: the batch keeps every reference, is never invalidated
-again — neither `discardBatch` nor `resetFrameRecorder` of its frame retries
-it — the session fails with `CleanupFailed`, and `BatchInvalidationFailed` is
-raised. A batch record goes only with the model's discharge, so one the model
-refuses to discharge stays. Discarding one batch never releases another batch's reference to a
-shared resource.
+storage's pool, the native invalidation that makes submission of its commands
+impossible, and only then discharges that batch's references in the model.
+Neither settles the frame's acquisition or presentation obligation. An
+invalidation that raised is uncertain: the batch keeps every reference, is
+never invalidated again, the session fails with `CleanupFailed`, and
+`BatchInvalidationFailed` is raised.
 
-A submitted batch keeps its record, and its slot's storage, until the
-submission that carried it completes, since its commands may be executing
-until then. The next `recordFrame` for that slot then resets the storage —
-invalidating the executed commands so the buffer can be begun again — and drops
-the record, so a slot records frame after frame. The frame is checked first:
-a stale or foreign frame is refused before anything is done for the slot, and
-only a live storage is ever reset. A completed batch's record also goes when
-its storage is destroyed, since a storage is disposable only once nothing holds
-it.
-
-`skipUnsubmittedFrame` in the model also discharges a frame's batches, so
-VK-12's `skipFrame` resets the frame's recorder through this module first: the
-native invalidation always precedes the discharge.
+A submitted batch keeps its record and its slot's storage until its submission
+completes. The next `recordFrame` for that slot then resets the storage.
 
 ### Names and labels
 
-`Hetoimasia.GPU.Vulkan.Native.Naming` is the naming scheme as pure decisions.
-When the instance enabled `VK_EXT_debug_utils` — the profile always asks for it —
-and the device's own dispatch table resolved `vkSetDebugUtilsObjectNameEXT`,
-`vkCmdBeginDebugUtilsLabelEXT` and `vkCmdEndDebugUtilsLabelEXT`, the roots offer
-an `Instrumentation` (`readRootsInstrumentation`), and the backend names what it
-creates and labels what it records. Without it nothing is named or labelled,
-nothing fails, and recording and sealing are otherwise unchanged.
+When the instance enabled `VK_EXT_debug_utils` and the device resolved the
+naming and label entry points, the roots offer an `Instrumentation` and the
+backend names what it creates and labels what it records. Without it nothing
+is named and nothing fails.
 
-Every name is built from identities the backend already holds, by one function,
-`boundedName`, which caps it at 64 bytes (`maximumNameBytes`) and drops any NUL.
-No caller-supplied text reaches a name.
-
-| Object | Named | When |
-| --- | --- | --- |
-| The device | `hetoimasia device` | At the first admission, once the device exists |
-| Its one queue | `hetoimasia queue family <f> index 0` | The same; `vkGetDeviceQueue` is asked for it only to name it |
-| A target's surface | `target <n>.<incarnation> surface` | Before the target is admitted, under the `TargetId` the model is about to issue |
-| A generation's swapchain | `target <n>.<i> generation <g> swapchain` | Right after it is created, before the generation is published |
-| Each swapchain image | `… generation <g> image <index>` | Right after the images are enumerated |
-| Each image view | `… generation <g> view <index>` | Right after each is created |
-| A pipeline layout, a pipeline | `resource <n>.<generation> pipeline layout`, `… pipeline` | After the model issues the `ResourceId`, before the handle is returned |
-| A pipeline's vertex and fragment shader modules | `resource <n>.<g> pipeline vertex shader`, `… fragment shader` | Each right after it is created and before the pipeline is built from it, under the `ResourceId` the model is about to issue the pipeline; the modules are destroyed once it is built |
-| A frame storage's pool and command buffer | `resource <n>.<g> command pool target <t> slot <s>`, `… command buffer …` | The same |
-| A frame-less slot's fence | `frame-less slot <s> submission fence` | Right after it is created at the slot's first submission, before it is recorded |
-| A readback's buffer | `resource <n>.<g> readback buffer` | The same. Its allocation is named the same inside the allocator, through VMA, whether or not the device offers naming; the device memory it lies in, which other allocations share, is named nowhere |
-| A managed buffer | `resource <n>.<g> buffer` | The same, its allocation named the same inside the allocator, as a readback's is |
-| A managed image, and its owned view | `resource <n>.<g> image`, `… image view` | The same, the image's allocation named as the image inside the allocator |
-
-Every naming call runs on the graphics owner's thread through the roots' device
-loss classification, and one that raised is handled as a failure of what it was
-naming, by that thing's own rules. A surface whose name could not be set is not
-admitted, so its creator still owns it. A device or queue whose name could not
-be set stays recorded and owned, and is named again at the next admission. A
-generation whose swapchain, image or view could not be named fails its
-construction: it is retired unpublished and destroyed once its holds end. A
-pipeline whose shader module could not be named is not created: the native
-layer destroys the modules it made, and the reservation is given back. A
-managed resource whose objects could not be named is released — nothing can
-record it, and the owner's disposal destroys it — and its handle is never
-returned; a replacement whose new generation could not be named leaves neither
-generation recordable. Nothing is published as named that was not.
-
-Two objects are never named. **The instance**: naming requires external
-synchronization of the object named, and the surface bridge's lease lets the
-main thread use the instance while the owner runs. **The debug messenger**,
-on both profiles: the pinned loader answers its own wrapper for a messenger and
-forwards a naming call without translating it, and MoltenVK reads that wrapper
-as one of its own objects and crashes. Vulkan permits naming a messenger; the
-defect is the loader's and the driver's together, and the backend makes no
-naming call for one. The messenger's diagnostics stay the capture's own. The
-crash and its diagnosis are retained in
-[`docs/vulkan/macos-debug-utils-naming.md`](vulkan/macos-debug-utils-naming.md),
-which also shows that a surface is named safely on a device that enabled
-`VK_KHR_swapchain`, as the profile's device always does.
-
-A labelled batch's command buffer carries two kinds of region, each named from
-the batch's `BatchId` and its frame's target and generation:
-
-| Region | Label | Opens | Closes |
-| --- | --- | --- | --- |
-| The batch | `batch <b> target <t> generation <g>` | Right after `vkBeginCommandBuffer` | Right before `vkEndCommandBuffer` |
-| A dynamic-rendering pass | `pass batch <b> target <t> generation <g>` | Right before `vkCmdBeginRendering`, in the same masked step | Right after `vkCmdEndRendering`, in the same masked step |
-| A pass into a managed color target ([GRS-5](#offscreen-color-targets)), in a frame or frame-less batch | `pass batch <b> into resource <n>.<g>` | Right before `vkCmdBeginRendering`, after the target's entry barrier, in the same masked step | Right after `vkCmdEndRendering`, in the same masked step |
-
-The recorder counts the regions open, each from the moment its opening call
-returned. Whatever else happens — a consumer that raised, a cancellation,
-rendering left open, a command whose call raised — every region still open is
-closed, innermost first, before `recordFrame` returns or raises. A closing call
-that raised leaves the batch partial with the reason that its labels could not
-be balanced: it is never sealed, never submittable, and keeps its commands,
-storage and references until a discard or reset invalidates it; a label failure
-supplies no retirement evidence. The consumer's own failure, when there was one,
-is still the one raised. Label commands go through the native layer's
-`opsRecord`, like every other recorded command, and count as commands.
-
-### The checked frame
-
-`recordFrame` requires the frame to be acquired in the model, with its image's
-generation still recordable. Public acquisition is VK-12's `tryAcquireFrame`
-([below](#frames-acquisition-submission-and-abandonment)); the backend offers
-no way to fake one. VK-11's native case, which predates it, supplies its frame privately — it reserves a
-frame and records the acquisition of image 0 in the model alone, through the
-roots' model, making no native acquisition — and after the discard skips the
-frame and supplies its unpresented-frame settlement, which is everything that
-frame owes. That construction lives in the suite
-(`Test.GPU.Vulkan.Native.Recording`), not in the backend's interface.
+- Every name is built by `boundedName` from identities the backend already
+  holds, capped at 64 bytes. No caller-supplied text reaches a name. The
+  scheme is `Hetoimasia.GPU.Vulkan.Native.Naming`: for example
+  `target <n>.<incarnation> generation <g> swapchain` and
+  `resource <n>.<generation> pipeline`.
+- A naming call that raised is a failure of the thing being named, by that
+  thing's own rules: a surface is not admitted, a generation fails its
+  construction, a managed resource is released and its handle never returned.
+  Nothing is published as named that was not.
+- **Two objects are never named.** The instance, because naming requires
+  external synchronization and the main thread uses the instance through the
+  surface bridge's lease. The debug messenger, because the pinned loader
+  forwards the naming call untranslated and MoltenVK crashes on it.
+- A labelled batch's command buffer has a region for the batch
+  (`batch <b> target <t> generation <g>`) and one for each dynamic-rendering
+  pass. Every region still open is closed, innermost first, before
+  `recordFrame` returns or raises. A closing call that raised leaves the batch
+  partial; a label failure supplies no retirement evidence.
 
 ### Image transitions
 
-The recorder tracks the frame image's layout and records each transition as one
-`vkCmdPipelineBarrier2`, with these scopes:
+The recorder tracks the frame image's layout and records each transition as
+one `vkCmdPipelineBarrier2`:
 
 | From | To | Source stage, access | Destination stage, access |
 | --- | --- | --- | --- |
@@ -1120,3044 +491,971 @@ The recorder tracks the frame image's layout and records each transition as one
 | Color attachment | Present source | Color-attachment output, color-attachment write | All commands, none |
 | Transfer source | Present source | Copy, none | All commands, none |
 
-Entering rendering waits on the color-attachment stage, which is where an
-acquisition's semaphore wait is made. Leaving for presentation names every
-stage as its destination, with no access: the presentation engine's read needs
-no visibility operation, but the layout transition must be ordered before the
-render-finished semaphore's signal, which the frames make at every stage. With
-no destination stage the transition chained into nothing that followed it, and
-on Lavapipe synchronization validation reported every presentation as
-`SYNC-HAZARD-PRESENT-AFTER-WRITE` (VK-13). Retention proves lifetime only: these
-layout and synchronization rules are the supported operations' own explicit
-contract, not an automatic hazard resolver. They are a swapchain image's
-alone; managed buffers and images are ordered by
-[GRS-3's contract](#ordering-managed-resources).
+Leaving for presentation names every stage as its destination so the layout
+transition is ordered before the render-finished semaphore's signal; with no
+destination stage, synchronization validation reported every presentation as
+`SYNC-HAZARD-PRESENT-AFTER-WRITE`. These rules are a swapchain image's alone;
+managed resources are ordered by
+[their own contract](#ordering-managed-resources). Retention proves lifetime
+only, not hazard freedom.
 
 ### Readback memory
 
-A readback buffer is a transfer-destination buffer whose memory comes from the
-device's [allocator](#device-memory) under the readback usage — host-visible,
-cached where the device offers it — bound, and mapped for its lifetime. It is
-the allocator's first consumer. Its attempt reserves two objects, the buffer
-and its allocation, and no bytes of its own: the memory is charged as the
-allocator holds it, never as the buffer's size.
+A readback buffer is a transfer-destination buffer in the allocator's readback
+usage, mapped for its lifetime.
 
-- **The copy.** `copyToReadback` needs the frame's image in the transfer-source
-  layout, and an image its generation made a transfer source: only generations
-  built for a verification capture are
-  (`newGenerationsCapturing`, [below](#capture-usage)). The buffer must hold the
-  whole image, four bytes a pixel (`readbackBytesFor`), or the copy is
-  `RefusedOutOfBounds`. A buffer has one writer at a time: a copy into one that
-  any batch — an earlier copy in the same batch included — or any submission
-  still holds is `RefusedInUse`, since the two writes would be unordered and the
-  contents misattributed. After the copy the recorder records a buffer barrier from
-  the copy's transfer write to host reads; the transitions around it are the
-  renderer's explicit commands.
+- **The copy.** `copyToReadback` needs the frame's image in the
+  transfer-source layout, from a generation built for a verification capture.
+  The buffer must hold the whole image at four bytes a pixel
+  (`RefusedOutOfBounds`). A buffer has one writer at a time: a copy into one
+  any batch or submission still holds is `RefusedInUse`.
 - **Completion before exposure.** `readReadback` answers bytes only with
   positive completion evidence: the batch that recorded the copy was recorded
-  as submitted — `noteBatchSubmitted`, which VK-12's `submitFrames` calls once
-  the model has accepted the submission and before it completes, and which
-  requires the model's word that the outstanding submission consumed exactly
-  that batch (`submissionCarries`), so a batch reset in the model whose frame
-  was then submitted without it is refused — and the buffer owes no recorded
-  reference and no submitted use,
-  which the model discharges only on that submission's completion fact. The
-  evidence is kept on the buffer, so it outlives the batch's record. A batch
-  the model merely no longer holds proves nothing, since a skip or a reset in
-  the model removes one without submitting it. A fence is not a host-visibility barrier; the
-  recorded barrier is what makes the write visible, and the completion is what
-  makes reading it legal. With nothing submitted, a read is `RefusedNotWritten`,
-  so a recorded-and-discarded batch never claims a captured pixel.
-- **Non-coherent memory.** Before a read of non-coherent memory the bytes
-  asked for are invalidated, and after `fillReadback` writes the buffer it is
-  flushed, each as a range of the buffer's own allocation — an offset from its
-  start and a size — through the allocator, which translates it into the
-  device memory the allocation lies in and aligns it to the non-coherent atom.
-  Nothing rounds the range before VMA does, and no range reaches past the
-  allocation, so a neighbouring allocation in the same block is never flushed
-  or invalidated over by this one's maintenance. Bounds are checked first: a
-  read past the buffer is `RefusedOutOfBounds`. Coherent memory is read without
-  either, and an empty read reads nothing and invalidates nothing. `fillReadback` marks the bytes unreadable before its write changes
-  the first of them, and readable again only once the write and any flush have
-  returned, so a write or flush that raised part-way exposes nothing.
-- **Release.** Releasing a readback ends its CPU use: it is read no more.
+  as submitted (`noteBatchSubmitted`, which requires the model's
+  `submissionCarries`), and the buffer owes no recorded reference and no
+  submitted use. With nothing submitted a read is `RefusedNotWritten`. A fence
+  is not a host-visibility barrier; the recorded buffer barrier is.
+- **Non-coherent memory** is invalidated before a read and flushed after
+  `fillReadback`, as allocation-relative ranges through the allocator, so a
+  neighbouring allocation in the same block is never touched.
 
-### Capture usage
-
-P-15's profile never requires transfer usage of a surface. A verification
-capture needs its images to be transfer sources, so
-`planGenerationWith CaptureWhenOffered` adds that usage wherever the surface
-offers it — capture is never a gap. It also plans the swapchain unclipped
-(`planClipped = False`): the verification strategy reads every pixel, and a
-clipped swapchain's obscured pixels are undefined. Otherwise it plans exactly
-what `planGeneration` does, and every generation `planGeneration` plans is
-clipped. `newGenerationsCapturing` builds generations that way; no normal
-target does, and the controller does so only for a host composed with
-[verification capture](#verification-capture) on. VK-2 verified the
-transfer-source capture profile on both drivers.
+**Capture usage.** The profile never requires transfer usage of a surface.
+`planGenerationWith CaptureWhenOffered` adds it where offered and plans the
+swapchain unclipped, because the verification strategy reads every pixel. Only
+a host composed with [verification capture](#verification-capture) builds
+generations that way.
 
 ### Buffers and images
 
-GRS-2 (#334) adds two managed handles, `Buffer` and `Image`, opaque over the
-model's `ResourceId` like the others: no constructor and no native handle
-reaches a client. `createBuffer` and `createImage` make them on the graphics
-owner's thread; the window integration lends both, with `releaseConstructed`,
-through the host's `Construction` (`constructBuffer`, `constructImage`), to a
-renderer and to an owner-thread action alike, behind the same owner check,
-checkpoint and construction-failure handling as its pipelines. A batch orders
-and transitions them through GRS-3's checked operations
-([below](#ordering-managed-resources)), and binds vertex, index and instance
-buffers ([Drawing from buffers](#drawing-from-buffers), GRS-4); bytes reach a
-fresh texture, vertex buffer or index buffer through the session's uploads
-([Uploads](#uploads), GRS-6).
-
-**Kinds.** A creation names an engine-defined kind, never raw usage flags.
-Each kind fixes the resource's Vulkan usage flags and the memory usage its
-allocation is made under ([Usages and memory types](#usages-and-memory-types)):
+`createBuffer` and `createImage` make opaque managed handles on the owner's
+thread; the window integration lends them through the host's `Construction`
+(`constructBuffer`, `constructImage`, `releaseConstructed`). A creation names
+an engine-defined kind, never raw usage flags:
 
 | Buffer kind | Usage flags | Memory usage | For |
 | --- | --- | --- | --- |
 | `VertexBuffer` | vertex buffer, transfer destination | `UsageStaticGeometry` | static vertex data, staged |
 | `IndexBuffer` | index buffer, transfer destination | `UsageStaticGeometry` | static index data, staged |
-| `InstanceBuffer` | vertex buffer, index buffer, storage buffer | `UsageFrameRing` | per-frame instance data, or the shared ring (D-33), which the device reads directly, as vertex, index or instance data, or through the storage table's set 2 (R2D-15) |
-| `LookupBuffer` | storage buffer | `UsageFrameRing` | a per-frame lookup table (D-23, D-35) |
+| `InstanceBuffer` | vertex, index and storage buffer | `UsageFrameRing` | per-frame instance data and the shared ring |
+| `LookupBuffer` | storage buffer | `UsageFrameRing` | a per-frame lookup table |
 | `StagingBuffer` | transfer source | `UsageStaging` | host-written bytes the device copies from |
 
-| Image kind | Usage flags | Format features required | Memory usage | View aspect | Formats |
-| --- | --- | --- | --- | --- | --- |
-| `TextureImage` | sampled, transfer destination, transfer source | sampled image, transfer destination, transfer source | `UsageTexture` | color | RGBA8 and BC7, each sRGB and linear (D-21) |
-| `DepthTarget` | depth-stencil attachment | depth-stencil attachment | `UsageTexture` | depth | `D32_SFLOAT`, `X8_D24_UNORM_PACK32`, `D16_UNORM`: depth-only (D-36) |
-| `ColorTarget` | color attachment, transfer source | color attachment, transfer source | `UsageTexture` | color | RGBA8 and BGRA8, each sRGB and linear |
+| Image kind | Usage flags | Memory usage | Aspect | Formats |
+| --- | --- | --- | --- | --- |
+| `TextureImage` | sampled, transfer destination and source | `UsageTexture` | color | RGBA8 and BC7, each sRGB and linear |
+| `DepthTarget` | depth-stencil attachment | `UsageTexture` | depth | `D32_SFLOAT`, `X8_D24_UNORM_PACK32`, `D16_UNORM` |
+| `ColorTarget` | color attachment, transfer source | `UsageTexture` | color | RGBA8 and BGRA8, each sRGB and linear |
 
-`bufferKindUse`, `imageKindUse` and `kindFormats` state these as pure
-functions. A buffer's host-visible allocation is mapped for its lifetime; an
-image's never is.
+An image is two-dimensional, one layer, one sample, optimally tiled, created
+in the undefined layout, and owns exactly one view of its whole resource.
+Before anything native is created:
 
-**Descriptions.** A buffer is described by its kind and its size in bytes
-(`BufferDescription`); an image by its kind, format, extent and mip-level
-count (`ImageDescription`) — two-dimensional, one array layer, one sample,
-optimally tiled, exclusive to the session's queue family, created in the
-undefined layout. Before anything native is created:
+- a zero-size or oversized buffer, a zero extent or mip count, or more mips
+  than the full chain is `RefusedOutOfBounds`;
+- a format the kind does not take, a BC7 image on a device without
+  `textureCompressionBC` (the feature is enabled exactly when offered), or a
+  combination the device's format query does not support is
+  `RefusedImageUnsupported`.
 
-- a buffer of zero bytes, of more than a `VkDeviceSize` holds, or larger than
-  the device's `maxBufferSize` is `RefusedOutOfBounds`;
-- an image whose format its kind does not take is
-  `RefusedImageUnsupported`, naming both; a zero width, height or mip count is
-  `RefusedOutOfBounds`, and so is more mip levels than the extent's full chain
-  (`fullMipChain`);
-- a BC7 image on a device created without `textureCompressionBC` is
-  `RefusedImageUnsupported`. The profile enables that feature exactly when the
-  device offers it (`planTextureCompressionBC`); it is optional, so a device
-  without it is still selected, and only BC7 is refused on it;
-- the device is then asked, without creating anything, whether its optimal
-  tiling offers the kind's format features for the format, and what
-  `vkGetPhysicalDeviceImageFormatProperties` allows for the kind's usage: a
-  combination it does not support is `RefusedImageUnsupported`, and a width,
-  height or mip count beyond what it allows `RefusedOutOfBounds`. That query
-  is the only native call before the creation's reservation;
-- once the attempt is reserved, the image's memory requirements are asked of
-  the device, still creating nothing, and requirements beyond the device's
-  largest resource for that use (`maxResourceSize`) are `RefusedOutOfBounds`,
-  naming both sizes, with the reservation given back.
-
-**The owned view.** Each image owns exactly one view of its whole resource —
-two-dimensional, every mip level of its one layer, in its own format, over
-the aspect its kind fixes — created right after the image under the same
-`ResourceId`, named with it, and destroyed with it. Separate or partial views
-and samplers are GRS-7's.
-
-**Memory and accounting.** Each is placed through the allocator under its
-kind's memory usage ([Device memory](#device-memory)): its bytes are charged
-only as the blocks VMA holds, never as its own size. Its attempt reserves its
-objects and no bytes: two for a buffer (the buffer and its allocation), three
-for an image (the image, its allocation and its view), so the object budget
-refuses one with `RefusedBackpressure` before anything native is done.
-Allocation backpressure and `RefusedNoMemoryType` reach the caller as the
-allocator answers them, having opened nothing.
-
-**Failure.** A creation that raised before it was committed — at the
-requirements, the creation, the bind, a buffer's map, or an image's view —
-destroys what it made and frees its allocation, settling that, gives back its
-reservation, and returns no handle; VK-14's recovery applies to an
-out-of-memory failure as to any construction. If destroying the image whose
-view could not be created raises too, its effect is uncertain: the image and
-its allocation are retained — the allocator can then not be destroyed, so
-neither can the device — the session fails with `CleanupFailed`, and the view's
-failure is the one raised. A naming call that raised after the generation was
-committed follows the [naming contract](#names-and-labels): the generation is
-released, its handle never returned, and the owner's disposal destroys it and
-gives its objects back.
-
-**Release and disposal.** `releaseManaged` ends a buffer's or an image's
-logical and CPU use together, like any managed resource's. `disposeResources`
-destroys one only once the model reports every hold ended: an image's view,
-then the image, then its allocation (`vmaDestroyImage`); a buffer, unmapped
-first when mapped, then its allocation (`vmaDestroyBuffer`). The destruction
-and the record of what it did are one masked step, and the model records the
-disposal before `disposeResources` returns; a destruction that raised is
-uncertain, never retried, retains what it was made from and fails the session,
-as for every managed resource. `readManaged` reports each with its kind —
-`vertex buffer`, `index buffer`, `instance buffer`, `lookup buffer`,
-`staging buffer`, `texture`, `depth target`, `color target` — its standing,
-and its native handles: a buffer's and its allocation's, or an image's, its
-view's and its allocation's.
-
-| State | Owner | Readers and writers | Thread | Lifetime | Reset or disposal |
-| --- | --- | --- | --- | --- | --- |
-| A buffer's or an image's managed record | The recording's managed records (`State`) | `Construction` inserts it, and releases it — on release or on a naming failure; `Disposal` advances it to destroyed or uncertain and removes it; `readManaged` reads it | The graphics owner | From its creation's commit until the model records its disposal | Destroyed once every hold has ended — view, image or buffer, then allocation — and removed when the model records that; kept, never retried, if its destruction was uncertain |
-| Its native objects and allocation | The same record | Made by the allocation protocol and the native layer inside the creation's masked step; freed only by its disposal, or by a creation's own rollback | The graphics owner | The record's | Freed with the record's disposal; retained with an uncertain one |
+An attempt reserves its objects and no bytes: two for a buffer, three for an
+image. A creation that raised before it was committed destroys what it made
+and returns no handle. `releaseManaged` ends logical and CPU use together, and
+`disposeResources` destroys a resource only once the model reports every hold
+ended; a destruction that raised is uncertain, never retried, and fails the
+session. `readManaged` reports each resource with its kind, standing and
+native handles.
 
 ### Ordering managed resources
 
-GRS-3 (#335; resource services design D-18 and D-26) orders every access a
-batch makes to a managed buffer or image. The rules are the GPU model's pure
-ones ([the model contract](gpu_model.md#ordering-managed-resources)); the
-recorder applies them, maps their answers onto Vulkan, and records what they
-owe. Swapchain images keep their own path: `transitionImage` and
-`supportedTransition` are [unchanged](#image-transitions).
-
-**Resting states.** Every kind rests in one use between batches. Each use maps
-onto the stages and accesses it covers and, for an image, a layout
-(`useScope`, `useLayout`, over `bufferResourceKind` and `imageResourceKind`):
+The recorder applies the model's pure ordering rules
+([gpu_model.md](gpu_model.md#ordering-managed-resources)) to every access a
+batch makes to a managed buffer or image, and maps them onto Vulkan. Swapchain
+images keep [their own path](#image-transitions).
 
 | Kind | Resting use | Resting layout | Resting stages | Resting accesses |
 | --- | --- | --- | --- | --- |
 | `TextureImage` | `ShaderSampled` | shader-read-only | fragment shader | shader sampled read |
 | `DepthTarget` | `DepthAttachment` | depth attachment | early and late fragment tests | depth-stencil attachment read and write |
 | `ColorTarget` | `ColorAttachment` | color attachment | color-attachment output | color-attachment read and write |
-| `VertexBuffer` | `GeometryRead` | — | vertex input | vertex attribute read |
-| `IndexBuffer` | `GeometryRead` | — | vertex input | index read |
-| `InstanceBuffer` | `InstanceRead` | — | vertex input, vertex and fragment shaders | vertex attribute, index and shader read (which includes shader storage reads, R2D-15) |
-| `LookupBuffer` | `StorageRead` | — | vertex and fragment shaders | shader storage read |
-| `StagingBuffer` | `TransferRead` | — | transfer | transfer read |
+| `VertexBuffer`, `IndexBuffer` | `GeometryRead` | none | vertex input | vertex attribute or index read |
+| `InstanceBuffer` | `InstanceRead` | none | vertex input, vertex and fragment shaders | vertex attribute, index and shader read |
+| `LookupBuffer` | `StorageRead` | none | vertex and fragment shaders | shader storage read |
+| `StagingBuffer` | `TransferRead` | none | transfer | transfer read |
 
-The other legal uses are `TransferWrite` for a texture and for vertex and index
-buffers — the transfer stage's transfer write, in the transfer-destination
-layout for a texture — and `TransferRead` for a color target, in the
-transfer-source layout. Instance, lookup and staging buffers are host-written:
-the submission that follows a host write makes it visible to the device, so no
-scope names the host. That waives none of the boundary barriers below, none of
-a non-coherent allocation's flushing, and none of the protection a buffer
-retained by a batch or a submission has against being written in place; the
-mapped-memory safeguards of [readback memory](#readback-memory) stay as they
-are, and nothing writes a managed buffer from the host yet.
+Other legal uses: `TransferWrite` for a texture and for vertex and index
+buffers, and `TransferRead` for a color target. Instance, lookup and staging
+buffers are host-written; the submission after a host write makes it visible,
+so no scope names the host.
 
-**Transitions.** `transitionResource` moves a `Buffer` or an `Image` (the
-`Ordered` handles) within a batch, from the use the batch left it in
-(`FromUse`) or from undefined contents (`FromUndefined`, an image only), into
-another legal use of its kind, or into the same use, which orders the batch's
-earlier accesses in it before its later ones. Like every command it checks
-the owner's thread, the handle — this session's, still managed, live, a buffer
-or an image — the recorder, that rendering is not open, and the rules; it
-retains the exact generation in the model before its barrier; and only then
-records it. An illegal use is `RefusedUnsupported`; a move that does not start
-from the use the batch left the resource in, or one inside rendering, is
-`RefusedIllegal`; and each is refused with no native call and no retention.
-
-**Boundary barriers.** A batch's first touch of a resource finds it at rest,
-so its first transition must start from the resting use, or from undefined; it
-is recorded as the **entry barrier**, one barrier from the resting scope
-straight into its destination. When the consumer returns, with rendering
-ended and every touched resource back at rest, the recorder records an **exit
-barrier** for each — from the resting use back to it, a same-use barrier
-still owed — inside the batch's label, before its labels are balanced and its
-command buffer ends. Consumers never record either. On the one graphics queue
-a barrier's first scope covers every earlier submission, so each batch's entry
-barriers chain to earlier batches' exit barriers, ordering write-after-write,
-read-after-write and write-after-read between batches even when no layout
-changes. A barrier that discards leaves the undefined layout, and its first
-scope is still the resting one.
-
-**Sealing.** A batch whose consumer leaves a resource away from rest is
-refused, `RefusedIllegal` naming the resource, its kind and its use, and left
-partial, as one that leaves rendering open is: its exit barriers are never
-recorded, so they never stand in for the transition the consumer omitted, and
-only a discard or a reset ends it. A barrier that raised — an entry, a
-transition or an exit — leaves the batch partial like any command that raised,
-with every reference it took retained until a valid invalidation; an exit
-barrier's failure is raised once the batch's labels are balanced.
-
-**Initialization.** A new image awaits initialization: `createImage` marks it
-in the model as it commits. The first batch that touches it must initialize it,
-by a transition from undefined; any other first touch, and any touch by another
-batch before the initializing batch has been submitted, is
-`RefusedUninitialized`, with no native call. A color or depth target cleared
-every pass may transition from undefined every time, and still takes the entry
-barrier. Only a submission the queue accepted publishes the initialization —
-`submitFrames` records it with the submission, before anything has completed.
-Recording, sealing, a fence reset, a no-effect failure and an unknown effect
-never publish it, and a discarded batch, a reset recorder, a skipped frame and
-an uncertain submission leave what their batch was initializing uninitialized
-again. Nothing changes a resting state, which is the kind's.
-
-| State | Owner | Readers and writers | Thread | Lifetime | Reset or disposal |
-| --- | --- | --- | --- | --- | --- |
-| The batch's accesses, and each touched resource's native handle | The recorder (`Recorder`) | `transitionResource` advances them; `recordFrame`'s seal reads them for the exit barriers | The graphics owner | One consumer action | Dropped with the recorder |
-| An image's initialization | The model (`Internal.Initialization`) | `createImage` marks it; a first touch claims it; an accepted submission publishes it; a dropped batch or an unknown effect withdraws it | The graphics owner, through the roots' model | The generation's record | Leaves with the record |
+- **Transitions.** `transitionResource` moves a buffer or image within a
+  batch from the use the batch left it in (or from undefined, images only)
+  into another legal use. An illegal use is `RefusedUnsupported`; a move from
+  the wrong use or inside rendering is `RefusedIllegal`.
+- **Boundary barriers.** A batch's first touch finds the resource at rest and
+  is recorded as the entry barrier. When the consumer returns with every
+  touched resource back at rest, the recorder records an exit barrier for
+  each. Consumers never record either. On the one graphics queue each batch's
+  entry barriers chain to earlier batches' exit barriers, ordering accesses
+  between batches even when no layout changes.
+- **Sealing.** A batch whose consumer leaves a resource away from rest is
+  refused (`RefusedIllegal`) and left partial; exit barriers never stand in
+  for the transition the consumer omitted.
+- **Initialization.** A new image awaits initialization. The first batch that
+  touches it must initialize it by a transition from undefined; any other
+  first touch, and any touch by another batch before the initializing batch
+  is submitted, is `RefusedUninitialized`. Only a submission the queue
+  accepted publishes the initialization. A discard, reset, skipped frame or
+  uncertain submission leaves the image uninitialized again.
 
 ### Offscreen color targets
 
-GRS-5 (#338) renders into a managed `ColorTarget` image
-([Buffers and images](#buffers-and-images)) and reads it back, in a frame batch
-and a [frame-less batch](#frame-less-batches) alike. It obeys GRS-3's contract
-above: the target's uses are `ColorAttachment` at rest and `TransferRead` to
-copy it, every entry and exit barrier is the recorder's, and the consumer's own
-transitions are explicit.
+A managed `ColorTarget` can be rendered into and read back, in a frame batch
+and a [frame-less batch](#frame-less-batches) alike.
 
-**The pass.** `beginRenderingInto recorder image start clear` begins dynamic
-rendering with the target's owned view as the one color attachment, cleared to
-the color across the target's whole extent, which is the render area. It needs
-no swapchain image, so a frame-less batch records it. How the pass begins is
-the consumer's `PassStart`:
-
-- `ClearTarget` is a use of the target in its color-attachment use, keeping its
-  contents: the batch's first touch records the entry barrier, and a target
-  another touch in this batch moved elsewhere is `RefusedIllegal`. Its
-  contents must be initialized.
-- `ClearFromUndefined` is a transition from undefined into that use: its
-  barrier discards whatever the target held, and is the initialization a new
-  target awaits ([Initialization](#ordering-managed-resources)).
-
-Before any native call the handle must be this session's (otherwise
-`RefusedMisuse ForeignIdentity`), live (a released or stale one is
-`RefusedMisuse WrongPhase`), a `ColorTarget` (otherwise
-`RefusedWrongKind`), and of one mip level: a dynamic-rendering attachment's
-view must cover exactly one, and the target's owned view covers every level,
-so a target of more than one is `RefusedUnsupported`. Its extent, the
-render area, must lie within the device's `maxFramebufferWidth` and
-`maxFramebufferHeight`, which the recording reads once from the physical
-device: an image's own limits, which its creation checks, do not bound them,
-so a wider or taller target is `RefusedOutOfBounds`, naming its size and the
-limit. No pass may be open; and a `ClearTarget` pass into a
-target that awaits initialization, or into one another batch is still
-initializing, is `RefusedUninitialized`. The batch retains the target before
-its barrier and the pass are recorded. `endRendering` ends either kind of pass,
-and `beginRendering` keeps rendering into the frame's image exactly as before.
-
-**The attachment governs.** The open pass's attachment — the target's extent
-and format, or the frame image's — is what a pipeline, a viewport and a
-scissor are checked against; outside rendering a frame batch checks them
-against its frame's image, and a frame-less batch, which has no image to
-check them against, refuses them, `RefusedIllegal`. A draw checks the bound
-pipeline's format, the viewport and the scissor again against the pass it is
-drawn in, so state bound for one attachment never reaches another's draw: a
-pipeline built for another format is `RefusedIncompatible`, naming both
-formats, and a viewport or scissor beyond the target is `RefusedIllegal`.
-Either way nothing native happens.
-
-**Formats.** A color target is RGBA8 or BGRA8, each sRGB or linear
-(`R8G8B8A8_SRGB`, `R8G8B8A8_UNORM`, `B8G8R8A8_SRGB`, `B8G8R8A8_UNORM`); a
-pipeline renders into it only when built for that same format
-(`createPipeline … (formatCode format)`). An sRGB target encodes what the
-fragment shader writes on store, as Vulkan specifies, and a linear one stores
-it as it is.
-
-**The copy.** `copyTargetToReadback recorder image readback` copies the whole
-target, mip level 0 of its color aspect, into a readback buffer, then records
-the same buffer barrier from the copy's transfer write to host reads that
-`copyToReadback` does ([Readback memory](#readback-memory)). The target must be
-in its `TransferRead` use within the batch — the consumer's explicit
-`transitionResource image (FromUse ColorAttachment) TransferRead` — and the
-consumer returns it to rest after the copy, or the seal refuses the batch and
-leaves it partial. Before any native call the target is checked as for a pass
-and so is the buffer: this session's and live; recorded outside rendering
-(inside it is `RefusedIllegal`); large enough for four bytes a pixel of the whole target
-(`readbackBytesFor`, otherwise `RefusedOutOfBounds`); and written by no other
-copy any batch or submission still holds (`RefusedInUse`). A copy before the
-transition is `RefusedIllegal`, naming the use the target is in. The batch
-retains both before the copy is recorded.
-
-**The bytes.** A readback's bytes are the target's rows, top row first, each
-pixel four bytes in the target's own format's component order — R, G, B, A for
-RGBA8 and B, G, R, A for BGRA8 — tightly packed, with no padding between rows
-and no conversion: an sRGB target's bytes are its encoded values. They are
-exposed exactly as a frame image's are: only once the batch that recorded the
-copy was recorded as submitted and its submission has completed, and a copy
-discarded with its batch, or the completion of any other batch, exposes
-nothing. The window integration lends a readback buffer to an owner-thread
-action or a renderer with `constructReadback`, reads it with
-`readConstructedReadback`, and releases it with `releaseConstructed`.
-
-**Release.** A target or buffer released after its copy was recorded is held
-by its batch, and destroyed only once that batch's holds have ended.
-
-**Proof.** The stand-in suite (`Test.GPU.Vulkan.Native.Offscreen`) renders into
-a target and copies it in both batch kinds, checks pipeline, viewport and
-scissor state left from the frame's pass against a target of another format
-and extent, and covers every refusal above, a target of two mip levels and one its image
-limits allow beyond a lowered framebuffer limit included, the seal's refusal of a target left
-in its transfer-source use, a discarded copy and an unrelated completion
-exposing nothing, and initialization published only by submission. The
-surface-free native case `grs5-offscreen` clears an `R8G8B8A8_SRGB` target and
-an `R8G8B8A8_UNORM` one to blue from undefined in frame-less batches, draws a
-pipeline-only yellow triangle (`endpointShaders`, every channel 0 or 1, so
-exact in either encoding), copies each into a readback buffer, waits on its
-ticket, and reads exact bytes at probe points well inside and outside the
-triangle, with validation, synchronization validation included, reporting
-nothing. It writes each readback as a PNG to a temporary path its record
-prints; no reference image is committed.
-
-| State | Owner | Readers and writers | Thread | Lifetime | Reset or disposal |
-| --- | --- | --- | --- | --- | --- |
-| The open pass's attachment, and the bound pipeline's format, viewport and scissor | The recorder (`Recorder`) | `beginRendering` and `beginRenderingInto` set the attachment and `endRendering` clears it; `bindPipeline`, `setViewport` and `setScissor` set the rest; `draw` reads all of it | The graphics owner | One consumer action | Dropped with the recorder |
+- **The pass.** `beginRenderingInto recorder image start clear` begins dynamic
+  rendering with the target's owned view as the one color attachment, cleared
+  across its whole extent. `ClearTarget` keeps the contents and requires an
+  initialized target; `ClearFromUndefined` discards them and is the
+  initialization a new target awaits.
+- **Refusals before any native call:** a foreign handle
+  (`RefusedMisuse ForeignIdentity`), a released or stale one
+  (`RefusedMisuse WrongPhase`), a non-color-target (`RefusedWrongKind`), more
+  than one mip level (`RefusedUnsupported`), an extent beyond the device's
+  framebuffer limits (`RefusedOutOfBounds`), or a pass already open.
+- **The attachment governs.** A pipeline, viewport and scissor are checked
+  against the open pass's attachment, and a draw checks them again, so state
+  bound for one attachment never reaches another's draw. A pipeline built for
+  another format is `RefusedIncompatible`. Outside rendering a frame-less
+  batch refuses them.
+- **The copy.** `copyTargetToReadback` copies mip level 0 of the whole target
+  into a readback buffer. The target must be in its `TransferRead` use (the
+  consumer's explicit transition) and be returned to rest afterwards.
+- **The bytes** are the target's rows, top row first, four bytes a pixel in
+  the target's own component order, tightly packed, with no conversion: an
+  sRGB target's bytes are its encoded values. They are exposed exactly as a
+  frame image's are, only after the recording batch's submission completed.
+  The window integration lends a readback through `constructReadback`,
+  `readConstructedReadback` and `releaseConstructed`.
 
 ### Depth attachments
 
-GRS-10 (#349) lets a pass render with depth. A managed `DepthTarget` image
-([Buffers and images](#buffers-and-images)) is the depth attachment of a
-dynamic-rendering pass into a managed color target, in a frame batch and a
-[frame-less batch](#frame-less-batches) alike, and a pipeline declares the
-depth it renders with. It obeys GRS-3's contract
-([above](#ordering-managed-resources)): the target's one use is
-`DepthAttachment`, in which it rests, every entry and exit barrier is the
-recorder's, and a new target awaits an initializing pass. Windowed depth —
-a depth image that follows each swapchain generation, for a pass into the
-frame's own image — is [its own section](#windowed-depth): GRS-13's (#350).
+A managed `DepthTarget` can be the depth attachment of a pass into a managed
+color target, in either batch kind.
 
-**Conventions (D-36).** Coordinates follow Vulkan's, not OpenGL's: clip-space
-Y points down, and depth runs 0 at the near plane to 1 at the far plane. A
-depth attachment is depth-only, and no stencil format exists anywhere in the
-vocabulary. A pass clears depth to 1.0 unless it is given another value, and a
-pipeline compares less-or-equal unless it declares another operation. The
-backend takes the comparison and the clear value per use, so a renderer that
-reverses depth — clearing to 0 and comparing greater-or-equal — needs nothing
-more from it; nothing here makes that the default. A matrix that reaches these
-conventions comes from `hetoimasia-math`'s `perspective ZeroToOne YDown`
-([its contract](../packages/math/README.md)), which promises no byte layout:
-the renderer packs what it pushes itself.
+**Conventions.** Coordinates follow Vulkan's: clip-space Y points down and
+depth runs 0 at the near plane to 1 at the far plane. A depth attachment is
+depth-only; no stencil format exists in the vocabulary. A pass clears depth to
+1.0 unless given another value, and a pipeline compares less-or-equal unless
+it declares another operation, so a renderer that reverses depth needs nothing
+more. A matching projection is `hetoimasia-math`'s
+`perspective ZeroToOne YDown`.
 
-**The format of an image.** `imageFormatOf recording image`
-(`constructImageFormat` through the host's `Construction`) answers the format a
-live image of the session was made with, as the backend holds it, on the owner's
-thread with no native call; a released, replaced or foreign handle has the
-refusal every handle has, and a handle that is not an image `RefusedWrongKind`.
-The 2D renderer checks a depth image's declared format against it (R2D-9).
+- **The depth format.** `selectDepthFormat` (`constructDepthFormat` through
+  the host) answers the first of `D32_SFLOAT`, `X8_D24_UNORM_PACK32`,
+  `D16_UNORM` the device supports as a depth attachment, asking the device.
+  None is `RefusedImageUnsupported`. `imageFormatOf`
+  (`constructImageFormat`) answers a live image's format.
+- **Pipelines** declare depth with `createPipelineWithDepth` or
+  `createDepthCheckedPipeline`, given a `PipelineDepth`: the attachment
+  format, whether fragments are tested, whether they write (writing without
+  testing is `RefusedIllegal`), and the compare operation. `depthTested format`
+  is testing, writing, less-or-equal. Every other pipeline constructor, and
+  `replacePipeline`, declares no depth.
+- **Passes.** `beginRenderingWithDepth recorder color start clear depth` adds
+  a `DepthPass` (`clearedDepth target start` clears to 1.0). The color and
+  depth targets are entered and retained in one transaction. The depth target
+  must be this session's, live, a `DepthTarget`, of one mip level and of the
+  color target's extent (`RefusedIncompatible` otherwise), and the clear value
+  finite and within 0 to 1.
+- **Pipeline and pass agree.** A pipeline is drawn only in a pass whose depth
+  attachment has exactly the format it declares, and one that declares none
+  only in a pass that has none. This is checked when a pipeline is bound and
+  again by every draw (`RefusedIncompatible`).
+- **Clearing depth within a rectangle.** `clearDepthRect recorder rect value`
+  clears the open pass's depth attachment within `rect` (render-area pixels,
+  wholly inside the render area) and leaves the rest unchanged. It needs no
+  bound pipeline, viewport or scissor, is not narrowed by the scissor, and is
+  ordered with the pass's draws as a draw is. A world layer that clears its
+  own depth within its viewport uses it.
 
-**The depth format.** `selectDepthFormat` (`constructDepthFormat` through the
-host's `Construction`) answers the depth-only format the backend will use,
-asking the device and never assuming one: the first of `depthFormatPreference`
-that the device supports as a depth attachment.
-
-| Order | Format | Vulkan format |
-| --- | --- | --- |
-| 1 | `Depth32Float` | `D32_SFLOAT` |
-| 2 | `Depth24` | `X8_D24_UNORM_PACK32` |
-| 3 | `Depth16` | `D16_UNORM` |
-
-The question is `depthImageQuery`'s: the format, a depth/stencil-attachment
-usage and the depth/stencil-attachment format feature under optimal tiling —
-the very question a `DepthTarget`'s creation asks. A device that supports none
-is `RefusedImageUnsupported`, naming the first. Creating a depth target of a
-format the device does not support, or of any format that is not depth-only
-(`kindFormats DepthTarget` lists only the three above), is refused before
-anything is created, as any image's creation is.
-
-**Pipelines.** A pipeline declares depth with `createPipelineWithDepth`, or,
-from checked shaders, `createDepthCheckedPipeline` (`constructDepthCheckedPipeline`
-through the host), given a `PipelineDepth`:
-
-| Field | Meaning |
-| --- | --- |
-| `depthAttachmentFormat` | the depth-only format of the attachment it renders with |
-| `depthTest` | whether fragments are tested against the attachment |
-| `depthWrite` | whether passing fragments write it; Vulkan writes depth only for tested fragments, so writing without testing is `RefusedIllegal` |
-| `depthCompare` | the comparison a test makes, one of the eight Vulkan compare operations (`CompareOp`) |
-
-`depthTested format` is the usual declaration: testing, writing, less-or-equal.
-The declaration is checked before any pipeline is created: a format that is
-not depth-only is `RefusedImageUnsupported`, and so is one the device does not
-support as a depth attachment, which is asked of the device, never assumed.
-The native layer receives the format in the pipeline's rendering information
-and the test, write and comparison in its depth-stencil state, with depth
-bounds and stencil off. A pipeline that declares no depth — every pipeline
-that existed before depth, and each of `createPipeline`, `createPipelineWith`,
-`createCheckedPipeline` and `createBlendedCheckedPipeline` — declares none to
-the native layer, as before. `replacePipeline` and its variants build a pipeline
-that declares no depth, as they build one that declares no blend.
-
-**Passes.** `beginRenderingWithDepth recorder color start clear depth` is
-`beginRenderingInto` with a `DepthPass` — `DepthPass target start value`, or
-`clearedDepth target start` for `defaultDepthClear` (1.0) — as the pass's depth
-attachment: the depth target's owned view, cleared to the value, stored, in the
-depth-attachment layout. Under #335's rules the pass is a use of the depth
-target in its depth-attachment use, with its own `PassStart`:
-`ClearTarget` requires the target to be initialized and keeps its layout;
-`ClearFromUndefined` discards what it held, and initializes a new target once
-the pass's batch has been submitted. The color target and the depth target are
-entered, and retained, in one transaction: a refusal of either leaves neither
-touched. Before any native call the depth target must be this session's (otherwise
-`RefusedMisuse ForeignIdentity`), live (a released or stale one is `RefusedMisuse
-WrongPhase`), a `DepthTarget` (otherwise `RefusedWrongKind`), of one mip level
-(otherwise `RefusedUnsupported`) and of the color target's extent, which is the
-render area (otherwise `RefusedIncompatible`, naming both); and the clear value
-must be finite and between 0 and 1, as Vulkan requires without its
-unrestricted-range extension (otherwise `RefusedIllegal`). A `ClearTarget` pass
-over an uninitialized depth target, or one another batch is still
-initializing, is `RefusedUninitialized`. The initialization is published
-exactly as a color target's is: only by the submission of the batch that made
-it, never by recording, sealing, a discard or a reset, and a discarded
-initializing batch leaves the target awaiting initialization again. A released
-depth target is held by every batch that recorded a pass with it until that
-batch has completed or been discarded, and destroyed only then.
-
-**Pipeline and pass agree.** A pipeline is drawn only in a pass whose depth
-attachment has exactly the format it declares, and one that declares none only
-in a pass that has none — which is what Vulkan requires of dynamic rendering.
-The open pass's attachment, or the frame's image outside rendering — which has
-no depth attachment — is checked when a pipeline is bound and again by every
-draw, so a pipeline bound before its pass began, or retained across passes
-that change or omit the depth attachment, never reaches a draw it was not built
-for: `RefusedIncompatible`, naming what the pipeline declares and what the
-pass has, with no native call. `beginRendering` into the frame's image has no
-depth attachment, and a colour-only pass into a color target begins exactly as
-it did before depth.
-
-**Clearing depth within a rectangle.** `clearDepthRect recorder rect value`
-(R2D-17; render-2d D-10 and D-30) clears the open pass's depth attachment to
-`value` within `rect`, in render-area pixels, and leaves depth outside it
-unchanged. It is recorded as `vkCmdClearAttachments` over the depth aspect,
-with one attachment, one rectangle and one layer, and works in a pass begun by
-`beginRenderingWithDepth` (in a frame batch or a frame-less one) and in one
-begun by `beginFrameRenderingWithDepth` (in a frame batch; a frame-image pass
-is unsupported in a frame-less batch, as [Windowed depth](#windowed-depth)
-says). It is exported from `Hetoimasia.GPU.Vulkan.Native.Recording` and from
-`Hetoimasia.GPU.Vulkan.GLFW`, beside the depth passes. A world layer that
-clears its own depth within its viewport when it begins (D-10) uses it so the
-layers stay independent.
-
-- *The rectangle* is a `Rect`, the scissor's vocabulary: a nonnegative pixel
-  offset, a positive width and a positive height, with its half-open bounds
-  wholly within the open pass's render area. Touching the render area's edges
-  and covering all of it are valid. The far edges are summed as integers, so
-  no extent overflows.
-- *Refusals*, each with no native call and nothing recorded: no pass is open,
-  or the open pass has no depth attachment (`RefusedIllegal`); the rectangle
-  is empty, has a negative offset or does not lie wholly within the render
-  area (`RefusedIllegal`); the value is not finite or lies outside 0 to 1
-  (`RefusedIllegal`, as a pass's clear value is); the session has failed
-  (`RefusedSessionFailed`, or `RefusedDiagnosticPending`, before anything is
-  done, as every other new work is); and, as for every command, the recorder
-  is closed (`RefusedRecorderClosed`) or the caller is not the graphics
-  owner's thread (`RefusedNotOwner`).
-- *Draw state* is neither needed nor touched. The clear needs no bound
-  pipeline, viewport or scissor, it leaves every binding a draw uses as it
-  was, and it clears the whole requested rectangle whatever scissor is set,
-  because `vkCmdClearAttachments` is not narrowed by one.
-- *Ordering.* The clear is ordered with the pass's draws exactly as a draw is:
-  draws recorded before it see the old depth, and draws after it see the
-  cleared depth. It is a use of the depth target within the pass already
-  entered, so the target's barriers, its use and its retention are those of
-  the pass, and nothing is entered or retained by the clear itself.
-  Synchronization validation reports nothing.
-- *Depth only.* Colour clears within a rectangle are not added, and stencil
-  does not exist (above).
-
-**The native commands.** `CommandBeginRendering` carries the pass's optional
-`DepthClear`, and a pipeline request its optional `PipelineDepth`; the
-production layer builds the attachment (`depthAttachmentInfo`) and the
-depth-stencil state (`nativeDepthState`) from them, and the stand-in journals
-a declared depth (`DeclaredDepth`). `CommandClearDepthRect rect value` carries
-a rectangle clear; the production layer records it through
-`clearAttachmentsUnsafe` (one of the [audited](#the-ffi-audit) recording
-calls) and the stand-in journals it, with its rectangle and value, among the
-batch's other commands. The depth target's barriers are those of
-`DepthAttachment`: early and late fragment tests, depth-stencil attachment
-read and write, the depth-attachment layout, over the depth aspect.
-
-**Out of scope for depth.** `render-3d`, camera policy, lighting and
-materials; reversed-Z as a default; stencil; multisampling; and more than one
-color attachment. Windowed depth, a depth attachment for the frame's own image
-that follows swapchain generations, and the sample's windowed mode are
-[GRS-13's](#windowed-depth) (#350).
-
-**Proof.** The stand-in suite (`Test.GPU.Vulkan.Native.Depth`) chooses the
-depth format and falls back through the other two, refuses a depth target of an unsupported or
-non-depth format before the device creates anything, checks that a pipeline's
-declared test, write and comparison reach pipeline construction and that a
-colour-only pipeline declares none, and refuses a depth declaration the device
-cannot render with. It begins passes in both batch kinds with the depth
-attachment, its default and its given clear value, checks the depth target's
-entry barrier out of undefined and exit barrier back to rest around the
-pass, and covers every pass refusal above — extent, released, foreign, wrong-kind and
-multi-level targets and clear values outside zero to one — with nothing
-recorded and neither target entered. It checks initialization published only by submission and
-not by a discarded batch, a depth target released after its pass was recorded
-kept until its batch completes and destroyed at once after a discard, and the
-agreement between a pipeline and the pass it is drawn in for every ordering:
-a pipeline of another depth format, one declaring none in a depth pass, one
-declaring depth in a pass without, bound outside rendering in a frame batch
-and retained across passes. It also covers `clearDepthRect`: the clear in a
-pass into a color target, in a frame batch and a frame-less one, and in a pass
-into the frame's image with the generation's depth image, journalled with its
-rectangle and value; every refusal above with nothing recorded — an empty
-rectangle, negative offsets, overruns and extents large enough to overflow, a
-value outside 0 to 1 or not finite, no pass or none with depth, a session that
-failed with the pass still open, a closed recorder and another thread; the
-clear before any draw state is bound and under a smaller scissor, leaving a
-draw's bindings as they were; the clear between two draws, journalled in
-order; the pass's barriers unchanged by it; and the native layer's failure
-named `vkCmdClearAttachments`. `Test.GPU.Vulkan.Native.Checked` covers
-`createDepthCheckedPipeline` and checks `nativeDepthState` and
-`depthAttachmentInfo` field by field. The surface-free native case
-`grs10-scene3d` ([below](#the-native-suite)) draws two depth-tested cubes from
-two camera poses on the device and reads them back
-([samples/scene3d/README.md](../samples/scene3d/README.md)); its captures are
-retained in [`docs/evidence/gpu_3d/`](evidence/gpu_3d/README.md). Depth cannot
-be read back — a `DepthTarget`'s only usage is depth-stencil attachment — so
-the native case `r2d17-depth-rect` observes the rectangle clear through colour
-([below](#the-native-suite)).
-
-| State | Owner | Readers and writers | Thread | Lifetime | Reset or disposal |
-| --- | --- | --- | --- | --- | --- |
-| The open pass's depth-attachment format, beside its color attachment's | The recorder (`Recorder`) | `beginRenderingWithDepth` sets it, `beginRendering` and `beginRenderingInto` leave none, and `endRendering` clears it; `bindPipeline` and `draw` read it | The graphics owner | One consumer action | Dropped with the recorder |
-| A pipeline's declared depth | Its managed generation (`PipelineInterface`) | `createPipelineWithDepth` and `createDepthCheckedPipeline` set it; `bindPipeline` and `draw` read it | The graphics owner | The pipeline generation's | Dropped with its disposal |
+Out of scope: reversed-Z as a default, stencil, multisampling, and more than
+one color attachment. Depth cannot be read back.
 
 ### Windowed depth
 
-GRS-13 (#350) gives each swapchain generation of a window a managed depth
-image, so a renderer can draw into the window with a depth test (D-24). It
-builds on [Depth attachments](#depth-attachments) — the image is an ordinary
-managed `DepthTarget`, ordered by GRS-3's contract and D-26's boundary
-barriers — and follows the generations' own lifecycle
-([Swapchain generations](#swapchain-generations)): construction, resize and
-replacement, surface recovery (VK-14), failure and teardown.
+Each swapchain generation of a window can own a managed depth image, so a
+renderer can draw into the window with a depth test.
 
 **The setting.** `VulkanHostConfig`'s `vulkanWindowDepth` is `False` by
 default, and nothing then changes: no generation has a depth image, no
-`FrameRequest` names one (`requestDepth` is `Nothing`), the device is asked
-nothing about depth, and the triangle, the sprites and every renderer that
-draws without depth behave exactly as before. When it is `True`, the controller
-asks the generations for a depth image with every generation
-(`requireWindowDepth`), and **no generation is constructed** until the
-recording supplies what makes the images (`supplyRecordingWindowDepth`): the
-recording exists only once the device does, so the owner's step makes it
-before the generations' step ([The owner's
-step](#completion-and-the-owners-step)), and no generation is ever published
-without the depth it was configured for.
+`FrameRequest` names one (`requestDepth` is `Nothing`) and the device is asked
+nothing about depth. When it is `True`, the controller asks the generations
+for a depth image with every generation (`requireWindowDepth`), and **no
+generation is constructed** until the recording supplies what makes the images
+(`supplyRecordingWindowDepth`). The owner's step makes the recording before
+the generations' step, so no generation is ever published without the depth it
+was configured for.
 
 **One image per generation.** Each generation owns one depth image of its
-extent, in the depth-only format `selectDepthFormat` answers, with its one owned
-view, shared by every frame in flight of that generation. It is made last in
-the generation's construction — after its swapchain, images and views, so a
-swapchain that cannot be built, or an image count that is refused, spends none
-— as a managed image of the recording's (`createImage`): its memory is charged
-beneath the model's accounting by the allocation protocol (D-40), it awaits
+extent, in the format `selectDepthFormat` answers, with one owned view, shared
+by every frame in flight of that generation. It is made last in the
+generation's construction, as a managed image of the recording's
+(`createImage`): its memory is charged by the allocation protocol, it awaits
 initialization until the first pass that clears it from undefined has been
-submitted (D-26), and every batch that records a pass with it holds it until
-that batch has completed. The image and its allocation are named from the
-generation's identity (`windowDepthName`, `windowDepthViewName`: *the
-generation's name* and ` depth image` or ` depth view`), and the generation's
-record keeps it the moment it exists (`viewDepth` reads it). `windowDepthOf
-recording generation` answers the handle of a live one.
+submitted, and every batch that records a pass with it holds it until that
+batch has completed. It is named from the generation's identity, and
+`windowDepthOf recording generation` answers the handle of a live one.
 
 **The frame's pass.** A windowed frame's request names its generation's depth
-image (`requestDepth`), borrowed from the generation: the renderer neither makes
-nor keeps it past the frame, and cannot release it — `releaseManaged` of a
-generation's depth image is `RefusedIllegal`, because its generation releases it.
-`beginFrameRenderingWithDepth recorder clear depthPass` begins dynamic
-rendering into the frame's image with the depth image as the depth attachment,
-in a frame batch only (a frame-less batch has no swapchain image,
-`RefusedUnsupported`): the image cleared to the color, the depth image cleared to
-the pass's value (`clearedDepth image start` clears to 1.0) and stored, in the
-depth-attachment layout, across the whole extent. It is `beginRenderingWithDepth`
-for the frame's image, with the same rules and the same refusals — a depth image
-that is released, another session's, of the wrong kind or of more than one mip
-level, one of another extent than the frame's (`RefusedIncompatible`, naming
-both), a clear value outside 0 to 1 — each with no native call and neither image
-entered. While the pass is open a pipeline is drawn only if it declares the depth
-format of the attachment; the frame's pass without a depth image is as it was.
+image (`requestDepth`), borrowed from the generation: the renderer cannot
+release it (`releaseManaged` of it is `RefusedIllegal`).
+`beginFrameRenderingWithDepth recorder clear depthPass` begins rendering into
+the frame's image with the depth image as the depth attachment, in a frame
+batch only (`RefusedUnsupported` in a frame-less batch), under the same rules
+and refusals as `beginRenderingWithDepth`. Frames in flight of one generation
+share the image and are ordered by the boundary barriers, whether a pass
+clears from undefined each time or keeps the contents.
 
-The frames in flight of one generation share the image, and D-26's boundary
-barriers order them: each batch's entry barrier chains to the exit barrier of the
-earlier-submitted ones on the one graphics queue, whether a pass clears from
-undefined each time (`ClearFromUndefined`, which every frame may do) or keeps
-the contents of one before (`ClearTarget`). The first pass that clears it from
-undefined initializes it once its batch has been submitted: a first recording
-that was refused or abandoned publishes nothing, a `ClearTarget` pass over an
-image that still awaits initialization is `RefusedUninitialized`, and a later
-clearing pass initializes it.
-
-**Following the generation.** A resize or a replacement builds a new
-generation, which gets a depth image of its own, of its new extent; the old
-generation's is released when the generation is destroyed — whether it was
-replaced, retired by a lost surface or a close, or its construction failed — and
-that happens only once every hold on the generation has ended, its outstanding
-presentations included, which is the evidence that retires it, and after its
-swapchain and views; so nothing can begin a pass with the image again, and the
-model destroys it only once every batch that recorded it has completed, never
-before the generation itself could retire. A generation kept uncertain keeps its
-image too. Two
-generations that overlap, a replacement still building beside the active one or
-a retired one whose frames are in flight, each have an image of their own with
-their own extent. A lost surface (VK-14) retires its generation, and the depth
-image goes with it as above; the generation that [recovery](#replacing-a-lost-surface)
-builds on the replacement surface gets one of its own, and recovery attempts, a
-required target's escalation and an optional target's isolation treat depth as
-they treat the generation. Teardown retires the active generation as it retires
-any, so the image is released with it. The recording's own retirement releases
-what it still holds live, but not a generation's depth image: that is its
-generation's to release, so a recording retiring while the generation stands — a
-presentation not yet retired, or the generation kept uncertain — retains the
-image (`ResourcesRetained`), as it retains the generation. Under the device's
-loss every hold is let go of, and the retirement releases the image too, to be
-destroyed under the device-loss rule, with no completion evidence manufactured.
+**Following the generation.** A resize or replacement builds a new generation
+with a depth image of its own. The old generation's image is released when the
+generation is destroyed, which happens only once every hold on the generation
+has ended, and the model destroys the image only once every batch that
+recorded it has completed. Two overlapping generations each have their own
+image. A lost surface retires its generation and the image with it; the
+recovered generation gets a new one. The recording's own retirement does not
+release a generation's depth image: a recording retiring while the generation
+stands retains it (`ResourcesRetained`). Under device loss the image is
+released and destroyed under the device-loss rule.
 
 **Failure.** A depth image that cannot be made fails its generation's
-construction as any native call of it does: the candidate is retired and never
-published, its failure is the target's `ConstructionFailed` and a recovery
-attempt, and a depth image it had made is released with it. The image's creation
-is the recording's, so its allocation is charged and recovered as any other's: an
-out-of-memory result is recovered once, by one reclamation pass and one more
-attempt, when the pass freed something ([Allocation
-recovery](#allocation-recovery)); a byte or object budget that cannot hold it is
-a refusal, `RefusedBackpressure`; a device that supports no depth format, a view
-that could not be made — which destroys the image it made — or a naming call that
-raised fails it the same way, and everything charged is given back. A
-construction that fails after its depth image was made — the target closed
-meanwhile, so the model refuses to publish it — releases the image with the
-candidate once that is destroyed. A cancellation that interrupts the image's or
-its view's creation inside the call leaves unknown whether it made anything, as
-one inside a swapchain's creation does: the candidate is kept uncertain, the
-image and its allocation are retained — never destroyed or freed under a view
-that may exist, which holds for any managed image's creation — the session fails
-with `CleanupFailed`, and teardown neither destroys nor retries any of it. Nothing of this leaves a generation without the depth it was
-configured for, or an image owned by no generation.
-
-**State.**
-
-| State | Owner | Readers and writers | Thread | Lifetime | Reset or disposal |
-| --- | --- | --- | --- | --- | --- |
-| Whether generations carry a depth image, and what makes it | The generations (`Generations.State`) | The controller asks (`requireWindowDepth`) when it makes them; the recording supplies (`supplyRecordingWindowDepth`) when it is made; `Reconciliation` reads it before a construction and when it makes the image | Any, in `STM` | The session | Never reset; absent until asked for |
-| A generation's depth image | The generation's record (`genDepth`), over a managed image of the recording's | `Reconciliation` makes it and records it; `Observation` reads it (`viewDepth`); `Disposal` releases it when it destroys the generation | The owner | From its construction until the model records its disposal | Released with the generation, destroyed once every batch that recorded it has completed; kept, explicitly uncertain, if its destruction raised, as any managed image is |
-| The depth images generations own | The recording (`recordingWindowDepths`) | Its construction adds each; `releaseManaged` reads to refuse a release; the recording's disposal removes it with the image | The owner | As the image's managed record | Forgotten with its disposal |
-
-**Proof.** The stand-in suite (`Test.GPU.Vulkan.Native.WindowDepth`) drives the
-roots', recording's and frames' stand-ins as a whole: a depth image made with
-each generation, of its extent, in the format the device supports and named from
-the generation, and none made, asked about or charged when the session did not
-ask; no generation built before the recording supplies the depth, and one built
-after; every target's generation and every frame of one generation sharing its
-image; a replacement's image of its new extent beside the old, which is
-released only when its generation is destroyed — which a held use of it, or a
-presentation of it whose fence has not been signalled, withholds — and
-destroyed only once the batch that recorded it has completed; a lost
-surface's, an out-of-date generation's, a close's and the device's loss's
-handling; construction failures — no depth format, a view that could not be
-made, an out-of-memory result recovered once and one not recovered, a target
-closed after the image was made, a cancellation inside the image's creation —
-each leaving no active generation or leaked
-image and nothing charged; and the frame's pass: its commands and barriers, the
-frames in flight sharing the image with consecutive clearing passes, the
-initialization published only by submission and never by an abandoned or refused
-recording, and every refusal above. `Test.GPU.Vulkan.GLFW.Consumer` runs
-whole hosts over the GLFW seam: a host that did not ask names no depth image and
-makes none, and one that did names each frame's generation's image, the same one
-for its frames, gives a replacement its own, and destroys each with its
+construction (`ConstructionFailed`, a recovery attempt), and anything charged
+is given back. An out-of-memory result gets the one allocation recovery. A
+byte or object budget that cannot hold it is `RefusedBackpressure`. A
+cancellation inside the image's or view's creation leaves the candidate
+uncertain and fails the session with `CleanupFailed`. Nothing leaves a
+generation without the depth it was configured for, or an image owned by no
 generation.
-
-The native case `grs13-window-depth` ([below](#the-native-suite)) draws the
-scene3d sample's two cubes into a real window with its generation's depth
-image, resizes it, and checks the captured frames' pixels against the sample's
-independent oracle before and after, with synchronization validation enabled
-([samples/scene3d/README.md](../samples/scene3d/README.md)); its captures are
-retained in [`docs/evidence/gpu_3d_windowed/`](evidence/gpu_3d_windowed/README.md).
-The sample's `--windowed` mode is launched explicitly and never run by tests.
 
 ### Drawing from buffers
 
-GRS-4 (#340) draws from vertex, index and instance data with push constants,
-and gives each session one shared ring of host-visible memory that batches
-claim regions of (D-33). It obeys GRS-3's contract: a bind is a use of a
-buffer, its entry and exit barriers are the recorder's, and the consumer's own
-transitions are explicit. That a shader declares what its pipeline does is
-checked when it is compiled ([Checked shader interfaces](#checked-shader-interfaces),
-GRS-16).
+Batches draw from vertex, index and instance data with push constants, and
+each session has one shared ring of host-visible memory that batches claim
+regions of. A bind is a use of a buffer under the ordering contract above.
 
-**Push constants.** `createPipelineLayoutWith recording ranges` makes a layout
-with no descriptor sets and these `PushConstantRange`s, each naming the stages
-it is visible to — `PushVertex`, `PushFragment`, the two every pipeline has —
-and an offset and size in bytes; `createPipelineLayout` is the same with none.
-Before any native call each range must name at least one stage and none twice,
-have a size, have an offset and size that are multiples of four, and end within
-the device's `maxPushConstantsSize`; and no stage may be named by two ranges.
-A range past the limit is `RefusedOutOfBounds`, naming how far it reaches and
-the limit; anything else invalid is `RefusedIllegal`. `pushConstants recorder
-stages offset bytes` pushes into the bound pipeline's layout, inside a pass or
-outside one: a pipeline must be bound, the push must name a stage and have
-bytes, its offset and size must be multiples of four, every stage it names must
-have a range holding every byte pushed, and every range those bytes overlap
-must be pushed for all its stages, as Vulkan requires. A push beyond a named
-stage's range is `RefusedOutOfBounds`; anything else is `RefusedIllegal`. The
-batch retains the layout, which it already holds through the pipeline.
+- **Push constants.** `createPipelineLayoutWith recording ranges` makes a
+  layout with `PushConstantRange`s (stages, offset, size). Each range must
+  name a stage, have an offset and size that are multiples of four, and end
+  within `maxPushConstantsSize`; no stage may be named by two ranges.
+  `pushConstants` requires a bound pipeline, and every range the pushed bytes
+  overlap must be pushed for all its stages. Past a limit or range is
+  `RefusedOutOfBounds`; anything else invalid is `RefusedIllegal`.
+- **Vertex input.** `createPipelineWith ... input` takes a `VertexInput` of
+  bindings (number, stride, `PerVertex` or `PerInstance`) and attributes
+  (location, binding, format, offset), for triangle lists. It is checked
+  against the device's limits and Vulkan's rules before any native call.
+  Strides and offsets are multiples of four. The formats offered are ones
+  every device must support. A batch checks every push, bind and draw against
+  the pipeline bound now; a pipeline switch changes what is checked and leaves
+  bound data bound.
+- **The ring.** `createRing recording size` (`constructRing` through the
+  host) makes the session's one ring; a second is
+  `RefusedMisuse DuplicateSubject`. The size is validated, never clamped. The
+  configured size is the claimable size `R`; a ring with a storage-table
+  window is `R + W` bytes, and claims use only the first `R`.
+- **Claims.** `claimRegion recorder size alignment` claims a region for the
+  recording batch and `writeClaim` writes into it.
+  - On non-coherent memory a region starts on and is padded to the device's
+    `nonCoherentAtomSize`, so no two claims share an atom, and each write is
+    flushed at once.
+  - A claim that does not fit now is `RefusedBackpressure RingBudget`, after
+    reclaiming completed batches' regions. One larger than the whole ring is
+    `RefusedOutOfBounds`, permanently.
+  - A region is the batch's until its submission completes or the batch is
+    discarded or reset. An invalidation that raised, an unknown submission
+    effect and a device loss reclaim nothing.
+  - A claim number is never reissued. Writes are admitted only while the batch
+    records (`RefusedRecorderClosed` afterwards).
+  - The batch's first claim records the ring's entry barrier, so a first claim
+    inside a pass is `RefusedIllegal`.
+- **Binding and drawing.** `bindVertexBuffer` and `bindIndexBuffer` take a
+  `BufferSource`: `FromBuffer` a managed buffer or `FromClaim` a claimed
+  region. A wrong kind is `RefusedWrongKind`. A first touch inside a pass is
+  `RefusedIllegal`: bind before the pass. `draw` and `drawIndexed` require
+  every binding the bound pipeline declares to be bound with enough data, and
+  check each buffer again at draw time (still recordable, still in the use it
+  was bound in).
+- **Indexed reads.** For index data in a ring region the batch wrote, the
+  recording reads the indices when the draw is recorded, bounds every
+  per-vertex binding's reads by the largest index, and from then on refuses
+  any write of the batch into those bytes. A managed index buffer filled by a
+  completed upload bounds reads the same way. Index data the recording cannot
+  read cannot bound them, so an indexed draw through it that reads per-vertex
+  data is `RefusedUnsupported`.
 
-**Vertex input.** `createPipelineWith recording layout shaders format input`
-makes a pipeline that reads a `VertexInput`: `VertexBinding`s, each a number, a
-stride and an `InputRate` (`PerVertex` or `PerInstance`), and
-`VertexAttribute`s, each a location, the binding it reads, a `VertexFormat`
-and an offset, for triangle lists. `createPipeline` is the same with no vertex
-input, and such a pipeline works exactly as before. Before any native call the
-input is checked against the device's `maxVertexInputBindings`,
-`maxVertexInputAttributes`, `maxVertexInputBindingStride` and
-`maxVertexInputAttributeOffset` — a value past one is `RefusedOutOfBounds` —
-and against Vulkan's rules: binding numbers and locations each unique, every
-attribute reading a declared binding and fitting within its stride, strides
-positive and, like offsets, multiples of four, which every device's vertex
-fetch admits; any other violation is `RefusedIllegal`. The formats offered —
-one to four 32-bit floats, a 32-bit unsigned integer, and four normalized
-bytes — are ones Vulkan requires every device to support for vertex input, so
-none is asked of the device. The device's limits are read once, with the
-non-coherent atom, as `RecordingLimits`. A pipeline keeps what its layout and
-input declare with its generation, and a batch checks every push, bind and
-draw against the pipeline it has bound now: binding another pipeline changes
-what is checked, and leaves bound data bound, as Vulkan does.
-
-**The ring.** `validateRingSize` validates the application's configured ring
-size once: zero, negative and sizes no `VkDeviceSize` can hold are refused,
-never clamped. `createRing recording size` makes the session's one ring — a
-second is `RefusedMisuse DuplicateSubject` — as a buffer placed through the
-device's allocator under the instance buffer's usage, vertex, index and storage
-reads in the frame ring's host-visible memory, mapped for its lifetime and
-charged as the allocator holds it (D-40). A size beyond the device's
-`maxBufferSize` is `RefusedOutOfBounds` before anything is made, and a block the
-byte budget cannot hold is `RefusedBackpressure`. The ring is a managed
-generation the recording owns: no handle to it is returned, and it is released
-with every other live generation when the recording retires. The window
-integration makes it with `constructRing` in an owner-thread action.
-
-The configured size is the ring's **claimable** size, `R`: claims are placed in,
-padded within and bounded by the first `R` bytes. A ring made with a
-storage-table window ([Per-batch storage tables](#per-batch-storage-tables),
-below) is `R + W` bytes long, the last `W` bytes a tail no claim uses.
-Allocation, mapping, the byte budget's accounting and the `maxBufferSize`
-check are of the whole `R + W`; the claim arena, `RingView`'s size and the
-reclamation rules stay `R`'s.
-
-**Claims.** While a batch records, frame or frame-less alike,
-`claimRegion recorder size alignment` claims a region of the ring for it, and
-`writeClaim recorder claim offset bytes` writes into it — the backend's first
-CPU write path for drawing data:
-
-- A claim's alignment must be a power of two. On coherent memory the region
-  starts where asked; on non-coherent memory it also starts on the device's
-  `nonCoherentAtomSize` and is padded to a multiple of it, so no two claims
-  share an atom.
-- A claim that does not fit now is `RefusedBackpressure RingBudget`, once the
-  regions of batches whose submission has completed have been reclaimed to make
-  room. One larger than the whole ring, padded, can never fit and is
-  `RefusedOutOfBounds`, a distinct, permanent refusal. A claim of no bytes, an
-  alignment that is not a power of two and a session with no ring are
-  `RefusedIllegal`. The next region is tried where the last claim ended, then
-  from the ring's start, so claims wrap round.
-- A region is the batch's from its claim, bound or not, until the batch's
-  submission completes — observed through the model's completion fact — or the
-  batch is discarded or reset, its storage's invalidation having returned.
-  Nothing else reclaims it: an invalidation that raised, an unknown submission
-  effect and a device loss reclaim nothing, and a device loss reports no
-  completion.
-- A claim's number is never reissued: a claim whose region was reclaimed, and
-  perhaps handed to another, is `RefusedMisuse StaleIdentity`; another batch's
-  is `RefusedMisuse WrongParent`; another session's is
-  `RefusedMisuse ForeignIdentity`.
-- Writes are admitted only while the batch records: once its consumer returns
-  — sealed, partial or raised — its recorder is closed and a write is
-  `RefusedRecorderClosed`. A write past the bytes claimed is
-  `RefusedOutOfBounds`. The batch's submission makes its writes visible to the
-  device, as #335's resting use for host-written buffers records, so no barrier
-  is recorded; on non-coherent memory each write is flushed at once, over a
-  range aligned to the atom that never leaves its claim's padded region. A write
-  or flush that raised leaves the batch partial.
-- The batch's first claim is its first touch of the ring: it records the ring's
-  entry barrier, and the batch retains the ring's generation, which the barrier
-  names. A barrier cannot be recorded inside rendering, so a batch's first claim
-  inside a pass is `RefusedIllegal`; later claims may be made there.
-
-**Binding and drawing.** `bindVertexBuffer recorder binding source` binds vertex
-or instance data to a binding the bound pipeline declares, and
-`bindIndexBuffer recorder source indexType` binds 16-bit or 32-bit index data,
-each from a `BufferSource`: `FromBuffer` a managed buffer, or `FromClaim` a
-region the batch claimed, at an offset into it. Vertex input reads a
-`VertexBuffer` or an `IndexBuffer` in its `GeometryRead` use and an
-`InstanceBuffer` — the ring included — in its `InstanceRead` use; a vertex bind
-takes a vertex or instance buffer, an index bind an index or instance buffer,
-and any other kind is `RefusedWrongKind`. The bind touches the buffer in that
-use: the batch's first touch records its entry barrier, so a first touch
-inside a pass is `RefusedIllegal` — a consumer binds before the pass, or moves
-the buffer to its use before it — and a buffer this batch moved to another use
-is `RefusedIllegal`. `draw recorder vertices instances` draws instanced and
-`drawIndexed recorder indices instances` indexed and instanced, from the first
-vertex, index and instance, with `draw`'s existing checks; every binding the
-bound pipeline declares must be bound, a per-vertex one with data for every
-vertex `draw` reads and a per-instance one for every instance either reads, and
-an indexed draw needs index data holding every index it reads. A binding's
-offset must let every attribute reading it be read, each attribute's address a
-multiple of its format's component size, as Vulkan requires: a bind checks it
-against the pipeline bound then, and every draw again against the pipeline
-bound now, since a binding outlives a pipeline switch. Every draw also checks
-each buffer it reads again — the data bound to the bindings the pipeline bound
-now declares, and for an indexed draw the index data, nothing else bound: a managed buffer still recordable — not released,
-replaced or stale since its bind — and every buffer still in the use it was
-bound in, so a transition between passes that moved it elsewhere refuses the
-draw.
-
-**Indexed reads.** The vertices an index names are the index data's to say.
-For index data in a ring region the batch wrote, the recording reads the
-indices from the ring's mapping when the draw is recorded, bounds every
-per-vertex binding's reads by the largest index, and from then on refuses any
-write of the batch into the bytes it read (`RefusedIllegal`), so the indices
-the device reads are the ones checked. The indices are read only after the
-draw's thread is found to be the owner's and its recorder open, so no read
-reaches a region that may have been reclaimed or a mapping that may be
-gone. A managed index buffer an upload filled ([Uploads](#uploads)) bounds
-those reads the same way, by the indices its completed upload wrote, which the
-recording keeps until the buffer is forgotten. Index data the recording cannot
-read — a managed index buffer no upload has completed into — cannot bound
-them, so an indexed draw through it that reads per-vertex data is
-`RefusedUnsupported`; one whose bindings are all per-instance is not.
-
-Before any native call a bind, push or draw is refused, recording nothing, when
-it has no bound pipeline (`bindPipeline` itself needs none); when its buffer's
-kind does not fit the use; when a managed buffer is released or not this
-session's, or a claim was reclaimed or is another batch's — a managed buffer
-is the session's, and several batches may bind it; when its offset falls
-outside the buffer or the bytes claimed (`RefusedOutOfBounds`), or an index
-offset is not a multiple of the index's size; when a vertex source's offset is
-one its attributes cannot be read from; or when a draw needs a binding or index
-data that is not bound, more of either than is bound (`RefusedOutOfBounds`), a
-vertex an index names beyond what is bound (`RefusedOutOfBounds`), or a buffer
-released or moved out of its use since its bind. Every bind retains exactly what it references through
-the transitive retention above: the managed buffer's generation, or the ring's.
-Binding a binding again releases nothing an earlier command captured, and a
-resource or claim no command references gains no binding retention.
-
-**The commands.** The native layer records `CommandPushConstants`,
-`CommandBindVertexBuffer`, `CommandBindIndexBuffer` and `CommandDrawIndexed`
-through the audited unsafe subset ([The FFI audit](#the-ffi-audit)), and
-creates layouts with their ranges and pipelines with their vertex input. The
-window integration lends the layout and pipeline constructions as
+Every bind retains exactly what it references. The window integration lends
 `constructPipelineLayoutWith` and `constructPipelineWith`.
-
-**Proof.** The stand-in suite (`Test.GPU.Vulkan.Native.Drawing`) covers range
-and vertex-input validation, each refused with no native call; pushes inside
-and outside the ranges and their stage coverage; a pipeline switch changing
-what is checked while bindings stay bound; the ring's size validation, its one
-per session and a claim with none; claims reclaimed only on completion or
-discard, wrapping round, backpressure, and an oversized claim refused; regions
-kept through an invalidation that raised, a partial and a cancelled recording
-until their discard, and a submission whose effect is unknown, and released for
-batches a no-effect submission failure discarded; atom padding and flushes on
-non-coherent memory; claims distinct across reuse, another batch's refused, a
-write past a claim and one after recording refused; the first claim refused
-inside rendering; indexed and instanced draws from ring regions with 16-bit
-indices and from a managed vertex buffer with 32-bit indices, with how far each
-read reaches; 16-bit and 32-bit indices naming a vertex beyond the region
-bound, managed index data refused for per-vertex reads, and a write into
-indices a draw read refused; a vertex source its attributes cannot be read
-from, at its bind and after a pipeline switch; a draw through a buffer
-released or moved out of its use since its bind; a draw that is not indexed
-reading no index data, and a pipeline with no vertex input reading no binding;
-indices read only on the owner's thread and by an open recorder; binds
-retaining exactly their references; and every refusal above with no native call, no draw recorded. The surface-free native case `grs4-drawing` makes
-the ring, writes a quad's four vertices, its six 16-bit indices and two
-instance offsets into ring regions of a frame-less batch, pushes magenta as a
-fragment push constant, draws indexed and instanced into an `R8G8B8A8_SRGB`
-target cleared blue, copies it into a readback, waits on its ticket and reads
-exact bytes at probe points inside each instance's quad and outside both, with
-validation, synchronization validation included, reporting nothing. It writes
-the readback as a PNG to a temporary path its record prints.
-
-| State | Owner | Readers and writers | Thread | Lifetime | Reset or disposal |
-| --- | --- | --- | --- | --- | --- |
-| The shared ring: its generation, mapping, size, atom, next claim number and head | The recording (`Internal.Recording.State`) | `createRing` makes it; every claim reads it and advances the number and head | The graphics owner | From `createRing` until its buffer's disposal | Its generation released by `retireRecording` with every other live one; forgotten once the model records that disposal |
-| The ring's regions | The recording | `claimRegion` adds one for its batch and reclaims completed batches' to make room; a discard, reset or completed slot's invalidation, and a storage's disposal, release a dropped batch's | The graphics owner | From the claim until its batch's submission completes or its invalidation returns | Kept through an invalidation that raised, an unknown effect and a device loss; never reissued |
-| The bound pipeline's interface, and the vertex and index data bound | The recorder (`Recorder`) | `bindPipeline` sets the pipeline; `bindVertexBuffer` and `bindIndexBuffer` set the bindings; `pushConstants`, `draw` and `drawIndexed` read them | The graphics owner | One consumer action | Dropped with the recorder |
 
 ### Blending
 
-GRS-8 (#345) adds pipeline blending, with premultiplied alpha as its only mode.
-A `PipelineRequest` carries a `PipelineBlend`:
-
-- `BlendNone`: the output replaces the attachment's contents. Every pipeline
-  that declares nothing behaves this way, as before; `createPipeline`,
-  `createPipelineWith`, `createCheckedPipeline` and their replacements all
-  declare it.
-- `BlendPremultipliedAlpha`: additive blending of premultiplied colour, with
-  source factor `ONE`, destination factor `ONE_MINUS_SRC_ALPHA` and operation
-  `ADD`, for colour and alpha alike. The result is
-  `source + destination × (1 − source alpha)`.
-
-`createBlendedCheckedPipeline recording layout shaders format blend`, and the
-window integration's `constructBlendedCheckedPipeline`, make a pipeline from
-checked shaders with a declared blend. They are checked exactly as
-`createCheckedPipeline` is. The Vulkan layer builds the one colour attachment's
-blend state from the request (`colorBlendAttachment`): every channel is written
-in both modes, and only the premultiplied mode enables blending. No other blend
-mode exists; GRS-8 needs none.
-
-Proof:
-
-- The stand-in journals a pipeline's declared blend (`DeclaredBlend`). Its
-  examples check that the premultiplied mode reaches the native layer only for
-  a pipeline that asks for it, and that an unblended pipeline declares none.
-- `colorBlendAttachment` is checked for both modes, factor by factor.
-- The sprites sample's evidence (`grs8-sprites`, below) checks the composition
-  on the device. Red over blue and blue over red differ, and the expected
-  overlaps are computed from the blend equation.
+A `PipelineRequest` carries a `PipelineBlend`: `BlendNone` (the output
+replaces the attachment's contents; every pipeline that declares nothing) or
+`BlendPremultipliedAlpha` (source factor `ONE`, destination factor
+`ONE_MINUS_SRC_ALPHA`, operation `ADD`, for colour and alpha:
+`source + destination × (1 − source alpha)`). No other blend mode exists.
+`createBlendedCheckedPipeline` (`constructBlendedCheckedPipeline`) builds a
+pipeline from checked shaders with a declared blend.
 
 ### Checked shader interfaces
 
-GRS-16 (#341) checks every shader that reads anything from the host against a
-Haskell description of that interface while the package builds, with no native
-tool (D-19, D-34), and builds pipelines from the descriptions.
+Every shader that reads anything from the host is checked against a Haskell
+description of that interface while the package builds, with no native tool,
+and pipelines are built from the descriptions.
 
-**Descriptions.** A `ShaderInterface`
-(`Hetoimasia.GPU.Vulkan.Native.Shader.Interface`) names its stage
-(`VertexInterface` or `FragmentInterface`) and what the host supplies:
-
-- its push-constant block, as each member's offset and size in bytes
-  (`PushMember`), in declaration order — empty for a shader with none;
-- for a vertex shader, its vertex input as the pipeline binds it — the
-  `VertexInput` of [Drawing from buffers](#drawing-from-buffers). SPIR-V cannot
-  say whether a binding advances per vertex or per instance, its stride, or an
-  attribute's binding, byte offset or storage format, so those are the
-  description's, and only each attribute's location and the shader type its
-  format is read as are compared: one to four 32-bit floats for the float
-  formats and for four normalized bytes, a 32-bit unsigned integer for the
-  unsigned one;
-- its descriptor bindings (`DescriptorDeclaration`): set, binding, kind
-  (`CombinedImageSampler`, `SampledImage`, `StorageImage`, `Sampler`,
-  `UniformBuffer`, `StorageBuffer`) and count — `DescriptorCount n`, compared
-  exactly, or `RuntimeSized`, a runtime-sized array whose capacity is the
-  layout's and whose filled count the allocation's, neither of which a shader
-  states.
-
-A description is a value a splice runs, so it is defined in another module, or
-written whole in the splice's argument.
-
-**The reader.** `Hetoimasia.GPU.Vulkan.Native.Shader.Reflect`, in the private
-`shader-toolchain` library, reads a module's interface from its words: its one
-entry point and the global variables its interface lists — every global the
-shader uses, from SPIR-V 1.4 — through their storage classes, types and
-decorations. It reports the push-constant block's members, their sizes computed
-from scalars, vectors, matrices under their stride and majority, and arrays
-under their stride; a vertex shader's inputs that are not built-ins, by
-location and scalar or vector type; and each descriptor's set, binding, kind and
-count. A fragment shader's inputs and outputs and a vertex shader's outputs are
-varyings, which the validation layer checks at pipeline creation, and built-ins
-are the device's: it reports neither.
-
-**What the reader guarantees (owner amendment, 2026-10-03).** The reader's
-input is SPIR-V from the pinned compiler, which is what every splice hands it.
-Over that input it retains every structural check below, every regression that
-proves one, and the compile-time match of a shader's interface against its
-description. Exhaustive semantic validation of arbitrary SPIR-V — everything a
-validator such as spirv-val checks — is explicitly out of scope: that is a
-disclosed narrowing of the earlier guarantee that any malformed interface is
-refused. What the reader does check, it checks completely, and a module it
-does not support is refused with a diagnostic, never read as empty or matching.
-
-Before it reads anything, the reader checks every instruction it consumes
-against one explicit whitelist, the subset it supports:
-
-- the module's header bounds every id it declares, and its one entry point has
-  a model, a function, a name terminated and zero-padded within the
-  instruction, and no interface id listed twice;
-- every decoration of a kind it reads — Block, BufferBlock, RowMajor,
-  ColMajor, ArrayStride, MatrixStride, BuiltIn, Location, Component, Binding,
-  DescriptorSet, Offset — decorates a declared type, constant or variable, or a
-  member a declared struct has; carries exactly the literals its kind takes;
-  is not given twice to one target or member; has a positive stride where it is
-  one; is never RowMajor and ColMajor on one member; and is never BuiltIn
-  together with Location or Component, which is refused before any built-in is
-  left out of what the host declares. No missing literal stands for a default;
-- each interface variable's `OpVariable` has three operands, or four with an
-  initializer, which only Output and Private variables take, and which must be
-  a constant of the variable's own type, declared before it and naming a type
-  declared before itself: a boolean, a
-  scalar of as many words as its width, a null, or a composite of as many
-  constituents as its type has, each a constant of its constituent's type;
-- each variable's storage class is one it knows — UniformConstant, Input,
-  Uniform, Output, Workgroup, Private, PushConstant or StorageBuffer — and its
-  type is an `OpTypePointer` of that same storage class;
-- every id an instruction names resolves to a type or constant declared before
-  that instruction, so forward references, self-references and cycles are
-  refused, and no id is declared twice;
-- every id names the kind its position requires: a pointer's pointee is a type
-  other than void or a pointer; an array's or runtime array's element is a
-  sized or opaque type; a struct's members are sized types, with a runtime
-  array only as the last; a vector's component is a scalar; a matrix's column
-  is a float vector; an image's sampled type is a 32-bit float or a 32- or
-  64-bit integer; a sampled image's image is an image; and an array's length is
-  an `OpConstant` of a 32-bit integer type with a positive value;
-- every instruction has exactly the operands its opcode takes, with literals in
-  range: integer widths of 8, 16, 32 or 64 and signedness 0 or 1, float widths
-  of 16, 32 or 64, vectors of 2–4 components, matrices of 2–4 columns, image
-  operands within their enumerations, and a known pointer storage class;
-- nothing an Input, Output, Uniform, PushConstant or StorageBuffer variable
-  reaches is a boolean or an opaque type, unless the variable or the struct
-  member reaching it is a built-in — gl_FrontFacing and gl_HelperInvocation
-  are booleans the device supplies;
-- every Uniform, StorageBuffer and PushConstant block has the explicit layout
-  it requires, from its struct down through a descriptor array of blocks:
-  every struct member an Offset, every array and runtime-sized array an
-  ArrayStride, and every matrix member, or array of them, a MatrixStride and
-  RowMajor or ColMajor;
-- and those layout values obey the block layout matched to the device profile
-  the roots create, which enables Vulkan 1.1's relaxed block layout (always
-  on) and neither `scalarBlockLayout` nor `uniformBufferStandardLayout`: a
-  Uniform block is std140, and a StorageBuffer block, a Uniform `BufferBlock`
-  and a PushConstant block are std430. A vector member is aligned to its
-  scalar; every other member to its base alignment, or under std140 its
-  extended alignment (an array's, struct's or matrix's, rounded up to 16). A
-  vector of at most 16 bytes does not straddle a 16-byte boundary and a larger
-  one starts on one; an ArrayStride is a multiple of its array's alignment and
-  holds its element; a MatrixStride is a multiple of its matrix's alignment;
-  no member overlaps another; and none starts between the end of a struct,
-  array or matrix and the next multiple of that one's alignment. Enabling
-  either layout feature would be a new device requirement, and is not one.
-
-The first instruction that fails is an error naming it, the rule it breaks and
-the variable that reaches it. A module the reader cannot read, or a supported
-shape it does not read — a nested push-constant struct, a matrix or array
-vertex input, a texel buffer, an input attachment, a vertex input starting past
-its location's first component — is likewise an error naming it, never an
-empty or a matching interface. So are an interface naming an id the module
-defines no variable for, a descriptor variable lacking its `DescriptorSet` or
-`Binding`, a buffer whose struct is not decorated as its storage class
-requires, and a combined image sampler over an image that is not sampled or
-not of a supported dimension. Push-constant extents are computed without
-bound, so a member reaching beyond what 32 bits can hold is refused rather than
-wrapped, and `checkedRanges` refuses such members in a description the same way
-(`RefusedOutOfBounds`).
-
-**The checked splices.** `checkedVertexShader` and `checkedFragmentShader` take
-a description and source text, and `checkedVertexShaderFile` and
-`checkedFragmentShaderFile` a description and a file, compiling exactly as the
-other splices do. They read the SPIR-V's interface and compare it with the
-description in both directions: something declared but absent from the shader,
-something present but undeclared, and a stage, push-constant member offset or
-size, vertex input location or format, or descriptor set, binding, kind or
-count that disagrees each fail the build, naming the module, the splice's
-position, the stage and every mismatch. A shader that passes is a
-`CheckedShader`: its SPIR-V beside its description.
-
-**Unchecked splices.** `vertexShader`, `fragmentShader`, their file forms, and
-`compileShaderQ` and `compileShaderFileQ` for those stages compile only
-interface-free shaders: one declaring a push-constant block, a vertex input or a
-descriptor binding fails the build, naming each and the checked splice to use.
-Built-ins and varyings are no interface of the host's, so the triangle's
-shaders and the verification shaders compile unchanged. Compute shaders are out
-of scope and compile as before.
-
-**Pipelines.** `CheckedShaders` pairs a checked vertex and fragment shader.
-`checkedRanges` derives the push-constant ranges a pipeline over them needs:
-one for each stage that declares a block, one for both stages when both declare
-the same block, none for a stage that declares none; stages whose blocks
-disagree on any member's offset or size are `RefusedIncompatible`, a stage given
-the other stage's shader is too, and a shader declaring a descriptor binding is
-`RefusedUnsupported`, since no layout declares descriptor sets yet (GRS-7).
-`createPipelineLayoutFor` makes the layout with exactly those ranges.
-`createCheckedPipeline` and `replaceCheckedPipeline` build a pipeline whose
-vertex input is the vertex description's, and refuse a supplied layout that
-declares any other ranges, `RefusedIncompatible`, so the descriptions stay
-authoritative on creation and replacement alike; every refusal is made before
-any native call. The window integration lends them as
-`constructPipelineLayoutFor`, `constructCheckedPipeline` and
-`replaceConstructedCheckedPipeline`. The `quadShaders` of
-`Hetoimasia.GPU.Vulkan.Native.Recording.Shaders`, which `grs4-drawing` draws
-with, are checked shaders over the descriptions in
-`Hetoimasia.GPU.Vulkan.Native.Recording.ShaderInterfaces`.
-
-**Proof.** `shader-tests` reads committed SPIR-V fixtures
-(`test/fixtures/spirv/`, each beside its GLSL): a vertex shader's push-constant
-matrix, vector and array and its inputs, but not its built-in or varying; every
-descriptor kind with a fixed and a runtime-sized array; refusals of a nested
-push-constant struct, a matrix input, an input attachment, a push-constant
-member beyond 32 bits, an interface naming an undefined id, a component-offset
-vertex input, descriptors stripped of their set and binding, buffers stripped of
-their `Block`, and malformed modules; and, in `Test.Shader.Malformed`, one
-rejecting mutation of a valid fixture for every whitelist rule — types,
-constants, decorations, layout, variable declarations, the entry point and the
-id bound — with a too-many and a too-few operand count for every fixed-count
-opcode, and an Output variable with a null initializer of its own type read
-exactly as without one; a fixture holding std430 push constants beside a
-std140 uniform block and a std430 storage buffer, read as the compiler laid
-them out, and refused at each layout rule its mutations break — including a
-float array of stride 4 and an array at offset 132, which std430 takes and
-std140 does not; a fragment shader reading gl_FrontFacing and
-gl_HelperInvocation read as interface-free from its compiled fixture and
-through an unchecked splice; and no interface in
-the interface-free verification pair. Matching checked shaders in the source
-and file forms, with vertex and instance host layouts and fixed and
-runtime-sized arrays, compile with the suite. External clients, each compiled
-against the built package, fail their build naming a push-constant member's
-offset and size, a vertex input's location and format, a descriptor's set,
-binding number, type and count, a block declared but absent and one present but
-undeclared, and an unchecked splice over a shader with an interface. In
-`native-tests`, `Test.GPU.Vulkan.Native.Checked` derives layouts from checked
-shaders, takes the vertex input from the description, and refuses each
-disagreement above with no native call, through a replacement too.
+- **Descriptions.** A `ShaderInterface`
+  (`Hetoimasia.GPU.Vulkan.Native.Shader.Interface`) names its stage and what
+  the host supplies: the push-constant block's members (offset and size), for
+  a vertex shader its `VertexInput`, and its descriptor bindings (set,
+  binding, kind, and `DescriptorCount n` or `RuntimeSized`). SPIR-V cannot say
+  a binding's rate or stride or an attribute's binding, offset or storage
+  format, so those are the description's; only each attribute's location and
+  shader type are compared.
+- **The reader** (`Shader.Reflect`, in the private `shader-toolchain` library)
+  reads a module's entry point, push-constant block, non-built-in vertex
+  inputs and descriptors from its SPIR-V words. Its input is SPIR-V from the
+  pinned compiler. It checks every instruction it consumes against one
+  explicit whitelist (operand counts, declared-before-use ids, decoration
+  literals, storage classes, explicit block layouts obeying std140 for
+  Uniform blocks and std430 for StorageBuffer and PushConstant blocks) and
+  refuses a module or shape it does not support with a diagnostic, never
+  reading it as empty or matching. Exhaustive semantic validation of arbitrary
+  SPIR-V is out of scope (owner amendment, 2026-10-03). Enabling
+  `scalarBlockLayout` or `uniformBufferStandardLayout` would be a new device
+  requirement and is not one.
+- **The checked splices** (`checkedVertexShader`, `checkedFragmentShader` and
+  their file forms) compare the SPIR-V's interface with the description in
+  both directions and fail the build naming every mismatch. A shader that
+  passes is a `CheckedShader`.
+- **Unchecked splices** (`vertexShader`, `fragmentShader`, their file forms)
+  compile only interface-free shaders; one that declares a push-constant
+  block, vertex input or descriptor binding fails the build. Compute shaders
+  are out of scope.
+- **Pipelines.** `checkedRanges` derives the push-constant ranges a pipeline
+  over a `CheckedShaders` pair needs; stages whose blocks disagree are
+  `RefusedIncompatible`. `createPipelineLayoutFor`, `createCheckedPipeline`
+  and `replaceCheckedPipeline` keep the descriptions authoritative, refusing a
+  supplied layout with other ranges. The host lends
+  `constructPipelineLayoutFor`, `constructCheckedPipeline` and
+  `replaceConstructedCheckedPipeline`.
 
 ### Uploads
 
-GRS-6 (#342) moves bytes into a fresh texture, vertex buffer or index buffer.
-Its design is D-9, D-11, D-20, D-21 and D-30 of the
-[resource services design](archive/designs/gpu_resource_services_design.md). Bytes go
-through one bounded, host-visible staging buffer that the graphics owner holds.
-The owner records copies from it into frame-less batches
-([Batches](#batches), GRS-12), in chunks under a per-turn byte budget. Each
-upload has a ticket, which completes only when the batch carrying the upload's
-final copies completes. The private `Internal.Uploads` module owns the uploads'
-state; `Hetoimasia.GPU.Vulkan.Native.Uploads` is its public surface.
+Uploads move bytes into a fresh texture, vertex buffer or index buffer through
+one bounded, host-visible staging buffer the graphics owner holds. The owner
+records copies from it into frame-less batches in chunks under a per-turn byte
+budget. Each upload has a ticket, which completes only when the batch carrying
+its final copies completes. `Hetoimasia.GPU.Vulkan.Native.Uploads` is the
+public surface.
 
-**Configuration.** `validateUploadConfig staging budget queue` validates three
-values once, in that order, and never clamps them:
+**Configuration.** `validateUploadConfig staging budget queue` validates the
+staging size, the bytes recorded per turn and the number of unsettled uploads,
+and never clamps. The turn budget must hold one block row of the widest level
+any image may have (four bytes per texel of `maxImageDimension2D`), or
+`newUploads` is `RefusedOutOfBounds`. The window integration takes the
+configuration as `vulkanUploads` (default `Nothing`: no uploads) and makes the
+uploads in the first owner round in which the device exists.
 
-- the staging buffer's size in bytes;
-- the bytes the owner records into upload copies in one turn;
-- how many uploads may be unsettled at once.
+**Admission.** `submitUpload uploads request` runs on any thread
+(`submitVulkanUpload` through the host, gated on the owner's admission).
+`UploadImage image levels` carries every mip level, base first;
+`UploadBuffer buffer bytes` the whole buffer. One transaction decides, in this
+order:
 
-Zero, negative, larger than a `VkDeviceSize` holds, or (for the capacity) more
-than an `Int` counts is refused, naming the value. `newUploads` then checks the
-configuration against the device, on the owner's thread:
+1. the session is running (`UploadSessionFailed`) and admission open
+   (`UploadClosed`);
+2. the target is this session's and live (`UploadMisuse`);
+3. no other unsettled upload writes into it (`UploadAlreadyTargeted`);
+4. it is a texture, vertex buffer or index buffer (`UploadWrongKind`), and not
+   BC7 on a device without it (`UploadUnsupportedFormat`);
+5. it is fresh (`UploadNotFresh`): a texture still uninitialized, or a buffer
+   no upload was admitted into and no batch holds;
+6. the bytes initialize it exactly (`UploadMalformed`);
+7. the padded size fits the whole staging buffer (`UploadOversized`, a
+   permanent refusal);
+8. the queue and staging have room now (`UploadBackpressure`, as `QueueFull`
+   or `StagingFull`).
 
-- The turn budget must hold one block row of the widest level any image may
-  have: four bytes for each texel of `maxImageDimension2D` (read as
-  `limitImageDimension` in `RecordingLimits`, D-30). A smaller budget is
-  `RefusedOutOfBounds`, naming that row and the budget, and nothing is made.
-- The staging buffer is then made as a `StagingBuffer`-kind managed buffer of
-  the configured size (`createStaging`). It is placed through the allocator
-  like every other buffer, so its own refusals reach the caller as they are.
-  Following D-40, its memory is mapped by a separate `vmaMapMemory` after the
-  allocation, never inside the allocating call.
-
-`uploadsSupportBC7` reports whether the device takes BC7, as its
-`textureCompressionBC` feature says (D-21). Nothing assumes it: on a device
-without BC7, a BC7 texture is already refused when it is created
-([Buffers and images](#buffers-and-images)).
-
-The window integration takes the configuration as `vulkanUploads` in
-`VulkanHostConfig`. The default is `Nothing`, which takes no uploads. The
-owner's step makes the uploads the first round in which the device exists,
-before it runs any owner-thread action, so an action's uploads find them.
-
-**Admission.** `submitUpload uploads request` runs on any thread (D-20).
-`UploadImage image levels` carries every mip level of a texture, base level
-first, each tightly packed in its format's blocks. `UploadBuffer buffer bytes`
-carries the whole contents of a vertex or index buffer. One STM transaction
-decides the request, in this order:
-
-1. The session must be running (`UploadSessionFailed` with its primary
-   otherwise), and admission open (`UploadClosed` otherwise).
-2. The target must be this session's, still managed and not released
-   (`UploadMisuse`), and not a pending texture swap's replacement, which only
-   the upload the swap accepted fills (`UploadMisuse` `WrongPhase`; GRS-9).
-3. No other unsettled upload may write into it (`UploadAlreadyTargeted`).
-4. It must be a `TextureImage`, a `VertexBuffer` or an `IndexBuffer`
-   (`UploadWrongKind`). A BC7 texture on a device without BC7 is
-   `UploadUnsupportedFormat`.
-5. It must be fresh (`UploadNotFresh`):
-   - a texture the model still records as uninitialized, so neither one
-     already initialized nor one another batch is initializing;
-   - a buffer that no upload has been admitted into — through any uploads
-     over the recording, which keeps that set (`recordingFilled`) — and that
-     no recorded or submitted batch still holds.
-6. The bytes must initialize the target exactly (`UploadMalformed`, saying
-   what differs). A texture needs every level it declares, each the size its
-   format's blocks and that level's extent need (`levelBytes`). A buffer needs
-   its whole size.
-7. The upload's size, padded to the staging granule, must fit in the whole
-   staging buffer. Otherwise it is `UploadOversized`, naming the padded size
-   and the buffer's. This refusal is permanent: no amount of waiting admits it.
-8. The queue must have room, and the staging buffer a free region for the
-   padded size. Either missing is `UploadBackpressure`, as `QueueFull` or
-   `StagingFull`, distinct from the permanent refusal above, and answered at
-   once.
-
-The staging granule is the larger of 16 bytes and the device's non-coherent
-atom. So every region starts where any format's block and any flush can begin,
-and staging is charged for that alignment and padding. A region is the first
-free gap that holds it, searched from where the last region ended and then
-from the start, so regions wrap round the buffer.
-
-The same transaction reserves the target in the recording's upload-held set
-(`recordingUploading`), the queue place and the region, and makes the ticket.
-The caller's thread then copies the bytes into the region through the mapping,
-so the caller's bytes are free when admission returns. The copy runs
-interruptibly; if it raises or is cancelled, every reservation is given back
-and the exception is re-raised. If the owner's exit began during the copy, the
-reservations are given back too and the answer is `UploadClosed`. Otherwise the
-upload is queued. `submitUploadGated` reads a caller's gate in both
-transactions, the one that reserves and the one that queues: a refusal in
-either gives every reservation back. The window integration's
-`submitVulkanUpload` gates on the owner's own admission, so it refuses as an
-owner-thread action is refused — once the session has failed, with its
-primary, or once the owner's admission has closed — and no upload is queued
-after quiescence closes the owner. Its wake asks whether an upload is waiting
-(`uploadsWaiting`), so admission makes an idle owner runnable.
+The transaction reserves the target, the queue place and the staging region
+and makes the ticket. The caller's thread then copies the bytes into the
+region, so its bytes are free when admission returns. If the copy raises or is
+cancelled, every reservation is given back.
 
 **The exclusive target.** From admission until its upload settles, a target
-belongs to the upload alone. Every other batch's ordered use of it is
-`RefusedUninitialized` (`orderedSequence`). Disposal does not destroy it
-(`destroyableNow`). Releasing it is deferred: `releaseManaged` marks it
-released at once, so nothing more can use it, but the model's release and the
-end of its CPU use wait until the upload settles (`recordingReleaseDeferred`).
-A released target whose upload had not started is cancelled on the owner's
-next turn. One already started completes first; only then is the target
-released and later destroyed like any other.
+belongs to the upload alone: every other batch's use of it is
+`RefusedUninitialized`, disposal does not destroy it, and releasing it is
+deferred until the upload settles. A released target whose upload had not
+started is cancelled; one already started completes first.
 
-**Progress and chunking.** `progressUploads` runs on the owner's thread. The
-window integration calls it once per owner step, after the step's fence poll,
-so an upload whose final batch that poll observed complete settles in the same
-step. Each call:
+**Progress.** `progressUploads` runs once per owner step, after the fence
+poll. It settles uploads lost to a device loss, observes each batch in flight
+(complete, discarded so re-recorded from the same staging bytes, or lost),
+cancels unstarted uploads whose target was released, then records the next
+copies of each upload with no batch in flight, in admission order, into one
+frame-less batch, up to the turn's budget.
 
-1. After the device's loss, settles every unsettled upload as lost, except
-   one whose caller is still copying its bytes into staging: its region stays
-   that caller's until it finishes, and the upload is lost on a later turn.
-2. Observes each batch in flight:
-   - one complete moves its upload on, or completes the upload if it carried
-     the final copies;
-   - one discarded, and so never submitted, returns its upload to where those
-     copies began, to be recorded again from the same staging bytes;
-   - one lost loses its upload.
-3. Cancels each upload not yet started whose target was released.
-4. Records the next copies of every queued or uploading upload that has
-   copies left and no batch in flight. It takes them in admission order, into
-   one frame-less batch, up to the turn's budget, while admission is open and
-   the session is running. The transaction that plans the turn also claims
-   each planned upload, so no cancellation, close or release can settle it,
-   freeing its staging, while its copies are recorded and submitted. One
-   transaction after the submission publishes each carried upload's flight,
-   cursor and ticket as it releases that upload's claim, so a submitted copy's
-   staging is never left unheld in between; an upload whose copies no
-   submitted batch carries — the batch refused, discarded, or its recording
-   refused — releases its claim without a flight. A recording that raised
-   leaves its uploads claimed, their staging held until retirement:
-   - a texture's copies are whole block rows of one level at a time
-     (`CommandCopyBufferToImage`), so a BC7 level's last, partial block row
-     reaches the level's edge;
-   - a buffer's copies are byte ranges (`CommandCopyBuffer`);
-   - one upload may carry several levels in a turn while the budget lasts;
-   - the first upload whose next row or byte does not fit ends the turn's
-     plan.
+- A texture's copies are whole block rows of one level at a time; a buffer's
+  are byte ranges.
+- An upload has at most one batch in flight.
+- On its first chunk the target enters transfer write from undefined; between
+  chunks it rests in transfer write; after its final chunk it moves to its
+  kind's resting use.
+- A staging region is freed only when its upload settles.
+- If the batch cannot be opened now, nothing is recorded that turn and a stall
+  flag keeps the owner from spinning.
 
-An upload has at most one batch in flight: its next chunk waits for the last
-one's completion. On non-coherent memory, the bytes a turn's copies read are
-flushed before recording, aligned to the atom and never past the upload's own
-region. Each upload's copies are bracketed by the recorder's barriers:
+**Tickets** only advance: `UploadQueued`, `UploadUploading`, then one of the
+terminal `UploadComplete`, `UploadCancelled`, `UploadLost`.
+`awaitUploadTicket ticket duration` waits at most that long and cancels
+nothing; it is `RefusedOwnerWait` on the owner's thread. `cancelUpload` works
+only before the owner claims the upload (`CancelStarted` afterwards).
 
-- the staging buffer is read under transfer read;
-- on its first chunk, the target enters transfer write from its resting use,
-  from the undefined layout, discarding what it held;
-- between chunks it rests in transfer write, in the transfer-destination
-  layout;
-- after its final chunk it moves to its kind's resting use and layout.
+**Exit.** `closeUploads` closes admission before the drain and cancels
+unstarted uploads. `retireUploads` waits for any caller still copying into
+staging, then settles what remains as lost (after device loss) or cancelled.
 
-If the batch cannot be opened now (no frame-less slot, or its budget refused),
-nothing is recorded that turn. A stall flag then keeps `uploadsWaiting` from
-waking the owner, so it does not spin; the next step it runs for another
-reason, such as a fence poll that completes a batch, tries again. A batch the queue did not accept moves nothing on.
-
-**Staging lifetime.** A region is freed only when its upload settles: complete,
-cancelled or lost. It is never freed while the upload's copies are recorded or
-in flight, and a discarded batch frees nothing for its copies.
-
-**Tickets.** `UploadTicket` reads without a native call (`readUploadTicket`,
-STM). Its state only advances:
-
-- `UploadQueued`: admitted, with none of its copies recorded;
-- `UploadUploading`: its first copies are recorded;
-- `UploadComplete`: its final batch was observed complete, so its target is
-  initialized and at rest, and other batches may use it;
-- `UploadCancelled`;
-- `UploadLost`.
-
-The last three are terminal. `awaitUploadTicket ticket duration` waits at most
-that long and answers the state then, which may still be queued or uploading.
-The wait belongs to the caller alone: its expiry or cancellation cancels
-nothing and completes nothing. It is `RefusedOwnerWait` on the owner's thread,
-whose own progress the upload needs.
-
-**Cancellation.** `cancelUpload` runs on any thread, in STM, and works only
-before the owner claims an upload to record its first copies. It frees the
-staging region, answers `UploadCancelled`, and leaves the target as it was:
-uninitialized and free for another upload. Once the upload is claimed, it
-completes; cancelling then is `CancelStarted`. A settled upload is `CancelSettled`, and
-a ticket these uploads did not issue is `CancelUnknown`.
-
-**Exit.** At the owner's exit, `closeUploads` closes admission before the
-drain and cancels every upload not yet started. Uploads already started go on
-with the other frame-less work the drain waits for. After the drain,
-`retireUploads` first waits for every caller still copying its bytes into
-staging, each of which then finds admission closed and gives its reservations
-back, so the staging buffer is never unmapped under a writer; that wait is for
-copies into mapped memory already under way. It then observes the batches in
-flight once more, and settles each still
-unsettled upload as lost after a device loss, and otherwise as cancelled (left
-unfinished by the exit), its target released with the rest of the recording.
-The staging buffer is a managed buffer like any other, destroyed by
-`retireRecording` before the device.
-
-**What an upload leaves behind.**
-
-- **Index data.** A completed index-buffer upload stores the indices it wrote
-  in the recording (`recordingIndexData`). An indexed draw through that buffer
-  is then bounded by those indices, as it is for a ring region
-  ([Drawing from buffers](#drawing-from-buffers)). The data is forgotten with
-  the buffer.
-- **Level readback.** `copyLevelToReadback recorder image level readback`
-  copies one mip level of a texture into a readback buffer
-  (`CommandCopyImageLevelToBuffer`), tightly packed in its blocks. The texture
-  must be in its transfer-read use after a checked transition. To support this
-  copy, the texture kind's usage gains transfer source, required of the
-  format's features like the rest. Another kind is `RefusedWrongKind`; a level
-  the texture lacks is `RefusedOutOfBounds`, naming the level count; and a
-  readback too small for the level is `RefusedOutOfBounds`, naming the bytes
-  needed and the readback's size.
-  It lets a consumer compare what it uploaded.
-- **Observation.** `readUploads` shows each unsettled upload's number,
-  target, phase, staging region, and whether it has started, has a batch in
-  flight, has every copy recorded, or is claimed by the owner's recording. It also shows whether admission is
-  open, and the staging buffer's identity and size.
-
-**Proof.** The stand-in suite (`Test.GPU.Vulkan.Native.Uploads`) covers:
-
-- configuration refusals, never clamped;
-- a budget below one widest block row, and staging the device cannot make;
-- staging made as a staging-kind buffer, with BC7 support reported;
-- admission copying the caller's bytes before it returns;
-- every admission refusal, each reserving and copying nothing;
-- oversized refused distinctly from full-queue and full-staging backpressure;
-- targets not fresh or already targeted;
-- reservations given back when the caller's copy raised;
-- one winner of two uploads racing for one target;
-- a gate closed before admission, or closing while the bytes are copied,
-  refusing the upload with every reservation given back;
-- a buffer an upload filled refused as not fresh through a second uploads
-  over the same recording;
-- BC7 reported unsupported on a device without it;
-- copies at block-row boundaries under the budget, with the target resting
-  in transfer write between batches, completing on the final batch's fence;
-- a BC7 level's partial last row, and a buffer's byte ranges;
-- the target refused to every other batch until its upload completes;
-- staging freed only at settlement;
-- a discarded batch re-recorded from the same bytes;
-- non-coherent flushes aligned to the atom and kept within the region;
-- cancellation before and after the first copies, and a cancellation and a
-  rival admission inside the recording of an upload's first copies and inside
-  its batch's submission, refused and backpressured while its staging stays
-  held; the flight published as the claim is released; and a discarded
-  batch's claim released without a flight, the upload then cancellable;
-- tickets completing only on the final fence, a wait refused on the owner,
-  and a deadline that cancels nothing;
-- every unsettled upload lost after device loss, except one whose caller is
-  still copying, which keeps its region until it finishes and is lost then;
-- exit cancelling uploads not yet started and settling started ones;
-- retirement returning only after a caller still copying has finished;
-- a released target destroyed only after its upload settles;
-- an indexed draw bounded by uploaded indices;
-- level readback, with its refusals.
-
-The integration suite admits uploads from another thread into an idle owner
-with no target. It keeps them uploading past a wait's deadline while their
-batches are pending, and completes them on fence evidence.
-
-The surface-free native case `grs6-uploads` makes:
-
-- an RGBA8 texture of two levels, 256 by 256, whose 320 KiB need three turns
-  of a 128 KiB budget;
-- a BC7 texture of two levels where the device takes BC7 (reported
-  unsupported where it does not);
-- the quad's vertex, instance-offset and index buffers.
-
-It admits each upload from the main thread, not the owner's, and waits for
-each ticket with a deadline. Then, in one frame-less batch, it copies every
-level back with `copyLevelToReadback` and draws the quad from the uploaded
-buffers into a color target. It compares every level byte for byte and probes
-the drawing's pixels. Validation, synchronization validation included, reports
-nothing.
-
-| State | Owner | Readers and writers | Thread | Lifetime | Reset or disposal |
-| --- | --- | --- | --- | --- | --- |
-| The upload queue: each unsettled upload's entry, its phase, cursor, batch in flight and whether the owner has claimed it, the next upload number, the staging head, whether admission is open, and the stall flag | The uploads (`Internal.Uploads`) | `submitUpload` adds an entry; `progressUploads` claims, advances and settles them; `cancelUpload`, `closeUploads` and `retireUploads` settle them, never a claimed one or, but at retirement after its caller finishes, an admitting one | Admission and cancellation on any thread, in STM; everything else on the graphics owner's | From `newUploads` until `retireUploads` | Each entry removed when its upload settles; the numbers are never reissued |
-| The staging buffer and its regions | The uploads, over a managed buffer of the recording's | Admission reserves a region and its caller writes it; the owner flushes and copies from it | Writes on the admitting thread, into its own region only; copies on the owner's | Each region from admission until its upload settles; the buffer from `newUploads` until `retireRecording` | Regions freed at settlement only; the buffer destroyed with every other managed resource |
-| Each ticket's state | The uploads | The owner and cancellation advance it; any thread reads it | Any | From admission; kept by the caller after settlement | Never reset; terminal once settled |
-| The upload-held targets and their deferred releases | The recording (`recordingUploading`, `recordingReleaseDeferred`) | Admission adds a target; settlement removes it and performs a deferred release; `orderedSequence` and `destroyableNow` read it | Any, in STM | From admission until its upload settles | Emptied as uploads settle |
-| Uploaded index data | The recording (`recordingIndexData`) | A completed index-buffer upload stores it; indexed draws read it | The graphics owner | From completion until the buffer is forgotten | Deleted by `forget` |
-| The buffers uploads have filled | The recording (`recordingFilled`) | Admission adds a buffer and reads the set for freshness; a cancellation before any copy, and an admission given back, remove it | Any, in STM | From admission until the buffer is forgotten | Deleted by `forget` |
+**What an upload leaves behind.** A completed index-buffer upload keeps the
+indices it wrote, which bound indexed draws through that buffer.
+`copyLevelToReadback recorder image level readback` copies one mip level of a
+texture into a readback, so a consumer can compare what it uploaded.
+`readUploads` shows each unsettled upload.
 
 ### The texture table
 
-GRS-7 (#343) is the bindless texture table. Its design is D-1, D-11, D-22,
-D-23, D-27, D-31 and D-35 of the
-[resource services design](archive/designs/gpu_resource_services_design.md). A
-texture registered with the table gets a stable handle. Shaders resolve the
-handle through a lookup version that each batch freezes when it first binds
-the table, then sample one update-after-bind array of images with one of four
-shared samplers. The pure rules — handles, versions and slot reuse — live in
-`Hetoimasia.GPU.Model.TextureTable` and run without a device. The native
-table lives in the private `Internal.Recording.Table` and
-`Internal.Recording.Lookup` modules, and `Hetoimasia.GPU.Vulkan.Native.TextureTable`
-is its public surface.
+The bindless texture table gives a registered texture a stable handle. Shaders
+resolve the handle through a lookup version that each batch freezes when it
+first binds the table, then sample one update-after-bind array of images with
+one of four shared samplers. The pure rules (handles, versions, slot reuse)
+are `Hetoimasia.GPU.Model.TextureTable`; the public native surface is
+`Hetoimasia.GPU.Vulkan.Native.TextureTable`.
 
-**The profile.** The table needs six Vulkan 1.2 descriptor-indexing
-features:
+**The profile.** The table needs six Vulkan 1.2 descriptor-indexing features,
+which device selection requires and the roots enable:
+`runtimeDescriptorArray`, `descriptorBindingPartiallyBound`,
+`descriptorBindingSampledImageUpdateAfterBind`,
+`shaderSampledImageArrayNonUniformIndexing`,
+`descriptorBindingVariableDescriptorCount` and
+`descriptorBindingUpdateUnusedWhilePending`. A device missing any is refused
+with `DeviceFeatureMissing`. Non-uniform indexing is enabled, dynamic indexing
+is not.
 
-- `runtimeDescriptorArray`;
-- `descriptorBindingPartiallyBound`;
-- `descriptorBindingSampledImageUpdateAfterBind`;
-- `shaderSampledImageArrayNonUniformIndexing`;
-- `descriptorBindingVariableDescriptorCount`;
-- `descriptorBindingUpdateUnusedWhilePending`.
-
-The roots read them from `VkPhysicalDeviceVulkan12Features` (`BindlessFeatures`
-in `DeviceOffer`) and enable all six when they create the device. Device
-selection refuses a device missing any of them with `DeviceFeatureMissing`,
-naming each missing feature, so `NoCompatibleDevice` lists everything each
-candidate lacks. MoltenVK 1.4.2 on an Apple M3 Max offers all six, and an
-update-after-bind sampled-image limit of 1,000,000 per stage and per set.
-
-**Configuration.** `validateTableConfig capacity initial versions` validates
-three values once and never clamps them:
-
-- the cap: how many texture slots the layout declares;
-- the initial size: how many slots the set allocates, slot 0 included, so at
-  least two, and no more than the cap;
-- the length of the version ring, `defaultVersionCount` (8) unless the
-  application chooses otherwise.
-
-Zero, negative and unrepresentable values are refused, naming the value
-(`TableConfigRefused`). The table allocates its initial size, and grows
-toward the declared cap as registrations need slots
-([Growth](#the-texture-table), below).
+**Configuration.** `validateTableConfig capacity initial versions` validates,
+never clamping: the cap (slots the layout declares), the initial size (slots
+the set allocates, slot 0 included, at least two), and the version ring's
+length (`defaultVersionCount`, 8).
 
 **Making it.** `createTextureTable recording uploads config` makes the
-session's one table, on the owner's thread. A second is `RefusedMisuse`
-`DuplicateSubject`. Before anything is made, the table is checked against
-the device; each check that fails is `RefusedOutOfBounds`, naming what was
-asked for and the limit, and nothing is made:
+session's one table on the owner's thread, after checking the cap, samplers,
+pools, sets and ring against the device's limits (`RefusedOutOfBounds`). It
+makes, each as a managed generation:
 
-- the cap against `maxDescriptorSetUpdateAfterBindSampledImages`;
-- the four samplers against `maxDescriptorSetUpdateAfterBindSamplers`;
-- a stage's every table binding (the cap, four samplers and the lookup
-  buffer) against `maxPerStageUpdateAfterBindResources`;
-- set 0's pools against `maxUpdateAfterBindDescriptorsInAllPools`. That is
-  every generation's pool at once, from the initial size doubling to the cap,
-  each holding the four samplers and its set's images, since in the worst case
-  batches still hold every older generation's pool;
-- the two sets against `maxBoundDescriptorSets`;
-- one version's bytes, the cap's entries, against `maxStorageBufferRange`;
-- the last version's dynamic offset against what 32 bits hold;
-- the whole ring against the largest buffer the device makes.
+1. four immutable samplers, in index order: nearest/clamp-to-edge,
+   nearest/repeat, linear/clamp-to-edge, linear/repeat;
+2. set 0's layout: binding 0 the four samplers, binding 1 the sampled-image
+   array declared at the cap (update-after-bind, partially bound,
+   variable-count);
+3. set 1's layout: one dynamic storage buffer. An update-after-bind set may
+   not hold a dynamic buffer, which is why there are two sets;
+4. a pool and a set for each;
+5. the version ring: one host-visible lookup buffer. One version is the cap's
+   lookup entries of eight bytes each (little-endian slot, then generation).
+   Set 1 and the ring are sized for the cap and never rebuilt; only set 0
+   grows;
+6. one managed version generation per ring entry, which a batch that binds the
+   table at that entry retains;
+7. slot 0's placeholder: a 1×1 transparent-black RGBA8 texture, uploaded
+   through the session's uploads.
 
-Like all new work, making the table is refused once the session has failed.
+The table can be bound once the placeholder's upload has completed; until then
+binding is `RefusedNotWritten`.
 
-Then, in order, it makes the following. Each sampler, set layout and pool
-is a managed generation of its own, made by one creation that never rolls
-anything else back:
+**Handles.** `registerTexture recording image` takes a live texture of this
+session and answers a `TextureHandle`: a lookup index and a generation that is
+never zero and never persisted.
 
-1. **Four immutable samplers**, in index order: nearest/clamp-to-edge,
-   nearest/repeat, linear/clamp-to-edge and linear/repeat (`TableSampler`).
-   Linear samplers filter mips linearly; none is anisotropic.
-2. **Set 0's layout.** Binding 0 is the four samplers. Binding 1 is the
-   sampled-image array, declared at the cap and flagged update-after-bind,
-   partially bound, update-unused-while-pending and variable-count. It is the
-   highest binding, as Vulkan requires of a variable-count binding. The
-   layout is created with the update-after-bind pool flag.
-3. **Set 1's layout**: one dynamic storage buffer at binding 0. An
-   update-after-bind set may not hold a dynamic buffer
-   (`VUID-VkDescriptorSetLayoutCreateInfo-flags-03000`), which is D-35's
-   reason for a second set.
-4. **A pool for each set, then the set.** Set 0's pool is update-after-bind,
-   and its set is allocated with the initial size as its variable count.
-   Each set is allocated after its pool exists and is freed with it.
-5. **The version ring**: one host-visible lookup buffer, made and mapped as
-   the uploads' staging buffer is (`createMapped`). One version is the
-   **cap's** lookup entries of eight bytes each, a little-endian slot then
-   generation. Set 1 and the ring are sized for the cap from the start and
-   never rebuilt, so only set 0 grows (GRS-14); lookup indices span the
-   whole cap. Versions sit at a stride rounded up to both the device's
-   `minStorageBufferOffsetAlignment` and its non-coherent atom. Set 1's
-   descriptor is written once, over one version's range.
-6. **One managed version generation for each ring entry.** It owns no
-   native object; a batch that binds the table at that entry retains it.
-7. **Slot 0's placeholder**: a one-by-one transparent-black RGBA8 texture,
-   whose upload is admitted through the session's uploads.
+- Until the image's upload has completed, the handle resolves to slot 0.
+- From registration on the table holds the image: `releaseManaged` on it is
+  refused, and `releaseTexture` ends the handle instead.
+- Registration refuses a non-texture, an already registered image
+  (`DuplicateSubject`), and a full table at its cap
+  (`RefusedBackpressure TextureSlotBudget`).
+- A released, older-generation or never-issued handle is `RefusedStaleHandle`.
 
-If any step is refused or raises, every generation made so far is
-released, and the ordinary disposal destroys it. The construction runs
-masked from the first creation to the table's publication, so a
-cancellation lands only inside a step, after which the unwinding sees every
-generation made before, or once the table holds them all. A destruction that raises
-is retained, never retried, and fails the session with `CleanupFailed`, as
-for any managed resource. The table can be bound once the placeholder's upload has completed and its
-descriptor has been written; until then binding is `RefusedNotWritten`.
-
-**Handles.** `registerTexture recording image` takes a live `TextureImage`
-of this session and answers a `TextureHandle`: a lookup index and a
-generation, which is never zero and never persisted. It reserves a free
-index and a free slot. Slot 0 is never issued and counts against the
-table's size.
-
-- Until the image's upload has completed, the handle resolves to slot 0. A
-  texture counts as complete once the model holds it initialized and no
-  upload holds it any longer.
-- Its descriptor is written into its slot when the owner next brings the
-  table up to date. Versions published after that map the handle to its
-  slot.
-- From registration on, the table holds the image. `releaseManaged` on it is
-  refused; the handle is released instead.
-- Registration refreshes the table before it returns, which writes the
-  descriptor of a texture whose upload already completed. If that refresh
-  raises, is cancelled or refuses, the handle is never handed out, so the
-  registration is undone first (`unregisterTexture`): its index and slot are
-  free again, the image is the caller's again, and it may be registered
-  again. The undo is refused only when a version maps the handle itself (its
-  index at its generation), which a handle never handed out cannot be; a
-  version naming the slot for an earlier occupant is no obstacle. A refused
-  undo raises `RegistrationNotUndone`, which carries the live handle.
-
-`releaseTexture recording handle` ends a handle. Its index may be issued
-again at once under the next generation, and its slot retires. Its image
-stays held until no live version maps the slot, and is then released as any
-managed image is (deferred while an upload still holds it).
-
-`registerTexture` refuses:
-
-- an image that is not a live texture of this session;
-- an image already registered (`DuplicateSubject`);
-- a full table (`RefusedBackpressure` `TextureSlotBudget`), until a slot is
-  reclaimed.
-
-A handle released, of an older generation, or never issued is
-`RefusedStaleHandle` wherever it is used.
-
-**Versions.** A version is a whole-table copy: every lookup index's slot and
-generation. An index no live handle holds reads as slot 0 with generation 0.
-
-- A new version is published only when a mapping has changed since the
-  current one: a texture completed, a handle released, or a swap took
-  effect. It is written into
-  a ring entry that no batch holds and that is not the current version, then
-  flushed when its memory is not coherent. The submission that follows makes
-  the write visible to the device (D-26).
-- When nothing changed, every batch binds the current version, however many
-  entries are held.
-- When a new version is owed and every other entry is held, binding is
-  `RefusedBackpressure` `LookupVersionBudget`.
-- An entry is held while its version generation has a recorded reference or
-  a submitted use in the model. Those holds end when the batch completes, or
-  when it is discarded, as every managed resource's do.
+**Versions.** A version is a whole-table copy of every lookup index's slot and
+generation. A new one is published only when a mapping changed, into a ring
+entry no batch holds. When a new version is owed and every other entry is
+held, binding is `RefusedBackpressure LookupVersionBudget`.
 
 **Slot reuse.** A slot is reused, and its descriptor rewritten, only once no
-live version maps it. A version is live while a batch holds it, and the
-current version also while no mapping has changed since it was published,
-the only time a batch can still bind it. Descriptor writes therefore target
-only a slot that no recorded or pending batch can sample:
+live version maps it. So a batch recorded before a texture is released or
+replaced still samples the original image when it is submitted later, and the
+image stays held until that batch completes.
 
-- a slot just reserved for a registration, which was free;
-- a slot just reserved for a swap's replacement, which was free too;
-- slot 0 before the table is first bound.
+**Growth.** When registration finds no free slot, set 0 doubles (never past
+the cap): a new pool and set are made over the same layout, every written
+descriptor is copied across, and the new set becomes current for later
+batches. Pipelines and layouts built before the growth stay compatible.
+Handles, slots and versions are unchanged. A failed growth destroys its pool
+and leaves everything as it was. A native out-of-memory gets the one
+allocation recovery; unrecovered it raises `AllocationNotRecovered`.
 
-So a batch recorded before a texture is released or replaced still samples
-the original image when it is submitted later. The image, its view and its
-allocation stay held until that batch completes: its version keeps the slot
-retiring, and the batch itself retains every image its version maps
-([Binding and drawing](#the-texture-table)), so not even retirement destroys
-them while it is outstanding. A texture released before its
-upload completes was never written into a version, so its slot is reclaimed
-at once. Its image is released after that upload settles.
+**Swaps.** `swapTexture recording handle image` lets a live handle show a
+replacement texture (hot reload's GPU half) and answers a `SwapTicket`.
 
-**Growth.** GRS-14 (#344) lets set 0 grow, by D-22 and D-31's rule.
+- The swap reserves a slot and changes no mapping until the replacement's
+  upload completes; the handle keeps showing its current texture, never the
+  placeholder.
+- When it takes effect the ticket reads `SwapPublished`. Earlier batches keep
+  their version and the old texture, which is released at once in the model
+  and destroyed only when those batches have completed.
+- A second swap on the handle supersedes the first (`SwapSuperseded`);
+  releasing the handle abandons it (`SwapAbandoned`); a cancelled or lost
+  upload, or a failed session, fails it (`SwapFailed`). A ticket is settled
+  once, and a device loss is never reported as success.
+- Only the upload the swap accepted may fill its replacement.
 
-When `registerTexture` finds no free slot, the table grows at once, even
-while released slots are still retiring. The pure rule is `growTable`: it
-doubles the slots set 0 holds, never past the cap, so a cap that is no power
-of two is reached exactly. `growSet` then does the native work:
+**Bringing it up to date.** `refreshTable` writes newly complete textures,
+makes completed swaps take effect, ends failed ones, and reclaims retiring
+slots no live version maps. It runs before every binding, after every
+registration, and once per owner step. Once the session has failed it writes
+nothing but still reclaims.
 
-1. A descriptor pool of its own, for the four samplers and the new count of
-   images, is made as a managed generation.
-2. A set is allocated from it over the same set 0 layout, at the new
-   variable count. The layout declared the cap, so every pipeline layout and
-   pipeline built before the growth stays compatible and is not rebuilt, and
-   #341's interface check is unaffected.
-3. Every written slot's descriptor — each completed texture's, and slot 0's
-   placeholder once written (`writtenSlots`) — is copied into the new set at
-   the same element, with `vkCopyDescriptorSet` (`CopySampledImages`). The
-   immutable samplers belong to the layout, so nothing is copied into their
-   binding.
-4. In one transaction, the new set becomes current for every batch that
-   binds the table afterwards, and the old set's pool is released. A batch
-   that bound the old set retains its pool, so the old set and its pool are
-   destroyed together only once no live batch holds them. A batch discarded
-   unsubmitted lets its holds go the same way.
+**Pipelines.** A table pipeline layout holds both set layouts and exactly the
+checked shaders' push-constant ranges. Shaders may declare only the table's
+own bindings; set 0 is visible to the fragment stage alone. There are two
+kinds:
 
-Slots, handles and versions are unchanged by growth. The registration is
-then made in the larger set. At the cap with no free slot, registration is
-`RefusedBackpressure` `TextureSlotBudget` until a released slot is
-reclaimed, and a reclaimed slot at the cap is reused with no further growth.
+- *Pushed* (`createTablePipelineLayout recording shaders samplerOffset`): the
+  recorder pushes the sampler index at the declared offset with
+  `selectSampler`, so every draw samples with one sampler.
+- *Shader-sampled* (`createShaderSampledTablePipelineLayout`,
+  `constructShaderSampledTablePipelineLayout` through the host): the shaders
+  choose their samplers per instance from vertex input, and no push-constant
+  bytes are reserved. The 2D renderer uses this kind.
 
-The pool, the set and the copy are one creation, made with `constructOnce`,
-a construction with no recovery of its own, so the model knows the pool as
-a generation only once all three succeeded. A growth whose pool creation,
-set allocation or descriptor copy fails destroys the pool natively before
-the creation raises. It leaves the current set and the bookkeeping as they
-were, and no handle or slot changes. The rollback is therefore complete
-before any retry, and nothing the attempt made is left for a reclamation
-pass to find or miss. The grown set is named inside the creation too, under
-the identity the model is about to issue its pool. Naming the pool comes
-after the creation has committed it, and a failure there releases the pool
-for disposal rather than destroying it. So an out of memory there is raised
-as itself, with no recovery, and a retry never runs beside a pool not yet
-destroyed.
+**Binding and drawing.** `bindTable recorder` binds both sets with the dynamic
+offset of the batch's version. A batch's first binding pins the current set 0
+and version and retains everything the version maps; later bindings in the
+batch bind the same pair. A draw through the table needs the table bound under
+a compatible layout, every mapped image in its sampled use, and, under a
+pushed layout, a selected sampler (index 0 to 3). Binding a pipeline of the
+other kind, or one without the table, disturbs the binding and the selection.
 
-A native out of memory then enters #333's single reclamation pass and at
-most one retry of the whole growth; no step obtains a separate retry. A
-growth not recovered raises `AllocationNotRecovered`, which is what the
-registration answers with. As everywhere, the retry is permitted only after
-the pass disposed of something and while the session is healthy.
+**The shader's obligations under a shader-sampled layout.** The backend cannot
+see per-instance data, so the shader must:
 
-The doubling (`grownSlots`) is computed wider than 32 bits, both for the
-growth and for the pool-limit check's generations, so a count past 2^31
-reaches the cap rather than wrapping.
+- clamp the sampler index it reads to 3
+  (`samplers[nonuniformEXT(min(index, 3u))]`); an unclamped index past the
+  array is undefined behaviour the backend cannot refuse;
+- index with `nonuniformEXT`: the sampler index, the slot index and the
+  combined sampled image.
 
-**Swaps.** GRS-9 (#346) lets a live handle show a replacement texture
-without changing the handle, for hot reload's GPU half (D-1, D-5, D-23,
-D-27). `swapTexture recording handle image` names the replacement: an image
-whose upload (#342) is admitted and not yet settled, or one whose upload
-completed. It answers a `SwapTicket`; `readSwapTicket` reports, without a
-native call and from any thread, where the swap stands.
-
-- **Acceptance.** The swap reserves a free slot for the replacement and
-  changes no mapping, so it publishes no version. From then on the table
-  holds the replacement, as it holds a registered texture: releasing it
-  directly is refused, and the caller releases nothing. With no slot free
-  the table grows first, as for a registration; at the cap the request is
-  backpressure.
-- **Taking effect.** Until the replacement's upload completes, the handle
-  keeps resolving to what it showed. That is its own texture once that
-  completed, never the placeholder. The refresh after completion writes the
-  replacement's descriptor into its reserved slot, which no live version
-  maps. The first version published after that resolves the handle to the
-  replacement, and the ticket reads `SwapPublished`. The replacement may
-  differ from the old texture in format, extent and mip count, among the
-  formats uploads support; keeping texture coordinates right for a changed
-  layout is the application's concern.
-- **Earlier batches.** A batch that took an earlier version keeps it, so it
-  samples the old texture through submission and completion, even when it
-  was recorded before the swap and submitted after it.
-- **Retiring the old texture.** The handle owns whichever texture it shows.
-  When the swap takes effect, the old texture is released in the model at
-  once, in the transaction that publishes the change. It is destroyed only
-  once every batch that retained it — each one that bound a version mapping
-  it — has completed or been discarded. Its slot retires as a released
-  texture's does and is reused only once no live version maps it; the
-  refresh that reclaims it does not release it again.
-- **Supersession.** A second swap on a handle whose first is still pending
-  supersedes it. The first replacement's slot, never published and never
-  written, is free at once. The replacement is released at once and never
-  shown: an upload not yet started is cancelled, and one already copying
-  finishes first, its target destroyed once it settles. Its ticket reads
-  `SwapSuperseded`.
-- **Release.** Releasing the handle ends a pending swap the same way, and its
-  ticket reads `SwapAbandoned`. A later completion of the replacement's
-  upload publishes nothing, even once the handle's index is issued again
-  under a new generation. Versions earlier batches hold keep their mappings.
-- **Failure.** A replacement whose upload is cancelled or lost — it is no
-  longer uploading and was never initialized — ends the swap at the next
-  refresh. The handle keeps what it showed, the replacement is released,
-  and the ticket reads `SwapFailed`. A session that fails ends every pending
-  swap at once: a failed session writes no descriptor, so no swap can take
-  effect, and a pending swap's ticket reads `SwapFailed` from the moment the
-  failure is latched (`readSwapTicket` consults the session's terminal
-  report), and the read stores it. That is before any drain, wait or
-  teardown step, however long a target's drain waits on a fence, and a
-  device loss is never reported as success. A ticket is settled once: every
-  write of it goes through `settleSwap`, which writes only a pending ticket
-  and writes `SwapFailed` once the session has failed, so a release,
-  supersession or refresh after a failure never reports anything else, and a
-  published swap stays published. The refresh's publication checks the
-  session's terminal report in the transaction that commits it, so a failure
-  latched during the replacement's descriptor write publishes nothing and
-  releases nothing. Settling the ticket is separate from releasing images, which
-  still waits for completion evidence. The session's terminal behavior is
-  unchanged. For an exit that is not a failure, the host's teardown fails
-  every pending swap (`failPendingSwaps`, touching no native object) before
-  any step that may raise or retain, and again however it ends: the window
-  integration runs its owner's two teardown hooks, its retirement and its
-  destruction, under `settlingSwaps`, and `retireRecording` does the same
-  for hosts that retire the native layer themselves.
-- **One upload.** Only the upload the swap accepted fills its replacement:
-  admission refuses any further upload into a pending swap's replacement
-  (`UploadMisuse` `WrongPhase`). A cancelled upload therefore fails the swap,
-  however the image is later uploaded into.
-
-`swapTexture` refuses, changing nothing — the mapping, a swap already
-pending on the handle, and the image, which stays the caller's:
-
-- a stale handle (`RefusedStaleHandle`);
-- an image that is not a live texture of this session, as registration
-  refuses it;
-- an image the table already holds — a registered texture, or another
-  swap's replacement — (`DuplicateSubject`);
-- an image no upload fills: not uploading, and not initialized
-  (`RefusedNotWritten`);
-- a full table at its cap (`RefusedBackpressure` `TextureSlotBudget`), until
-  a released texture's slot is reclaimed.
-
-Like all new work, a swap is refused once the session has failed.
-
-**Bringing it up to date.** `refreshTable` writes the placeholder once its
-upload completes and writes each newly complete texture into its slot. It
-then makes every swap whose replacement's upload completed take effect,
-writing the replacement into its slot and releasing the texture it replaces
-in one transaction. It ends every swap whose replacement's upload ended without
-completing, releasing the replacement. It then reclaims every retiring slot
-no live version maps, releasing its image unless a swap already released it.
-The failed swaps, the reclamation, the images' removal from the table's
-holdings and their releases commit in one transaction. A cancellation therefore never strands
-an image the table let go of, and a refused release rolls the reclamation
-back for the next refresh. Once the session has failed, or while a diagnostic failure is pending, it
-writes nothing, since that is new work. Reclamation still runs, since that
-is cleanup. `registerTexture` and `createTablePipelineLayout` are refused
-then too, while `releaseTexture` is not.
-It runs:
-
-- before every binding;
-- after every registration;
-- once in every owner step of the window integration, after the step's
-  uploads (`refreshRenderingTable`), so a released texture's image goes even
-  when nothing binds the table again;
-- whenever the owner calls `refreshTextureTable`.
-
-**Pipelines.** `createTablePipelineLayout recording shaders samplerOffset`
-makes a pipeline layout holding both of the table's set layouts, from set 0
-on, and exactly the checked shaders' push-constant ranges. Its shaders may
-declare the table's own bindings (`textureTableDescriptors`): set 0's four
-samplers at binding 0 and runtime-sized image array at binding 1, and set
-1's storage buffer at binding 0. They may declare no other binding. Set 0
-is visible to the fragment stage alone, so a vertex shader declaring set 0's
-samplers or images is refused; set 1 is visible to both stages. A layout
-from `createPipelineLayoutFor` declares no set, so a shader declaring any
-descriptor binding is refused there. The sampler offset must be a multiple
-of four and lie whole within a fragment-stage range. Refused before any
-native call:
-
-- a session with no table;
-- an offset that is unaligned or outside every fragment range;
-- whatever the checked-range and push-range validation refuse.
-
-**Two layout kinds** (R2D-16; render-2d D-4). A layout is one of two kinds,
-by how its draws choose a sampler.
-
-- *Pushed* (`createTablePipelineLayout`): the recorder pushes the sampler
-  index at the declared offset, as above. Every draw samples with one
-  sampler, so mixed filtering takes one draw per filter.
-- *Shader-sampled* (`createShaderSampledTablePipelineLayout recording
-  shaders`): the layout declares no sampler offset and reserves no
-  push-constant bytes, and the shaders choose their samplers, per instance,
-  from vertex input. It makes the same layout and checks the shaders exactly
-  as the pushed kind does (the table's own bindings only, set 0 in the
-  fragment stage alone, the push ranges against the device's limit), and is
-  refused before any native call in a session with no table and wherever the
-  pushed kind's checks refuse. It checks no sampler offset, so shaders that
-  declare no push constants at all are valid and need no dummy fragment
-  range. The window integration's `constructShaderSampledTablePipelineLayout
-  construction shaders` is the confined equivalent, exported from
-  `Hetoimasia.GPU.Vulkan.GLFW` beside `constructTablePipelineLayout`; the
-  native package's facade `TextureTable` exports the first. Its consumer is
-  the 2D renderer's recorder
-  ([`hetoimasia-render-2d-vulkan`](../packages/render-2d-vulkan/README.md)),
-  whose shaders read each instance's sampler choice and index the table's
-  samplers `nonuniformEXT`.
-
-**Binding and drawing.** `bindTable recorder` binds both sets under the bound
-pipeline's layout, with the dynamic offset of the batch's version, through
-`vkCmdBindDescriptorSets`.
-
-- A batch's first binding pins the current set 0, its pool and the version,
-  a coherent pair; a later binding in the same batch, after any change or
-  growth, binds the same sets and version.
-- The first binding retains the version generation, the table's samplers,
-  set layouts, lookup pool and lookup buffer, the pinned set 0's pool, the
-  placeholder and every image its version maps. A later binding retains only
-  the layout it binds under, so a pool or an image released since the first
-  binding stays held but is never retained again.
-
-Any version published before a growth is valid in the larger set, which
-holds every slot it maps. `selectSampler recorder n`
-pushes `n` at the layout's declared sampler offset. Binding a pipeline whose
-layout does not hold the table disturbs the binding and the sampler, so the
-table's pipeline needs both again. Refused with no native call:
-
-- binding with no pipeline bound, under a pipeline whose layout does not
-  hold the table, or in a session with no table;
-- a sampler index above 3 (`RefusedOutOfBounds`), or a sampler selected
-  under a pipeline without the table;
-- `selectSampler` under a shader-sampled pipeline, naming that the layout's
-  shaders choose their samplers;
-- a push over the sampler index's four bytes, under a pushed layout;
-- a draw with a table pipeline before the table is bound under a compatible
-  layout, or, under a pushed layout, before a sampler is selected;
-- a draw through the table while the batch holds an image its version maps
-  in a use other than sampling, for example after moving a texture to a
-  transfer use, until the batch moves it back;
-- any binding once the session has failed.
-
-**The draw check under each kind.** A draw through a pushed layout needs the
-table bound under a compatible layout, a selected sampler, and every image
-the batch's version maps in its sampled use. A draw through a shader-sampled
-layout needs the first and the last and not the sampler: it needs no
-`selectSampler`. Every other refusal of a table draw is the same under both.
-Under a shader-sampled layout no sampler index is reserved, so an ordinary
-push may cover any bytes of the layout's ranges, offset 8 included; the
-ordinary push checks (alignment, size, stage coverage and range bounds) still
-apply. The pushed path is unchanged: `createTablePipelineLayout`,
-`selectSampler`, the pushed draw's requirement of a selected sampler and the
-refusal of a push over the sampler index behave as before.
-
-Binding a pipeline of the other kind disturbs the binding and the sampler
-selection, as binding any pipeline with different push ranges or table use
-does, even when the two layouts' push ranges are equal: the table's
-pipeline needs `bindTable` again, which binds the same sets and version the
-batch already took, and a return to a pushed pipeline needs a fresh
-`selectSampler`. Binding another pipeline of the same kind with equal ranges
-keeps both, as before.
-
-**The shaders.** `tableShaders` (in `Recording.Shaders`) are the reference
-pair the native case draws with. The vertex shader covers the render area
-with one triangle. The fragment shader resolves the pushed handle: an index
-past the version's `entries.length()`, or an entry whose generation differs
-from the handle's, resolves to slot 0 before any descriptor is read. It then
-samples that slot with the pushed sampler, clamped to 3. The profile
-enables non-uniform sampled-image indexing and not dynamic indexing, so both
-indices and the combined sampled image the sample consumes carry
-`nonuniformEXT`; the shader suite checks that the compiled SPIR-V decorates
-them `NonUniform`.
-Their interface descriptions are `tableVertexInterface` and
-`tableFragmentInterface`: the handle at push offset 0 and the sampler index
-at `tableSamplerOffset` (8).
-
-**The shader's obligations under a shader-sampled layout.** The backend
-cannot see per-instance data, so two obligations are the shader's:
-
-- *Clamp the index.* The table holds four samplers, so a shader must clamp
-  the sampler index it reads from instance data to 3, as
-  `samplers[nonuniformEXT(min(index, 3u))]`. An instance's index beyond 3
-  therefore samples with sampler 3. An unclamped index past the array is
-  undefined behavior that the backend cannot refuse.
-- *Index with `nonuniformEXT`.* The profile enables non-uniform sampled-image
-  indexing and not dynamic indexing, and the sampler index varies by
-  instance, so the sampler index, the slot index and the combined sampled
-  image the sample consumes are each `nonuniformEXT`.
-
-**The instance shaders.** `tableInstanceShaders` (in `Recording.Shaders`) are
-the reference pair for a shader-sampled layout, with interfaces
-`tableInstanceVertexInterface` and `tableInstanceFragmentInterface` (in
-`Recording.ShaderInterfaces`). The vertex shader draws one rectangle per
-instance from six vertices, two triangles generated from `gl_VertexIndex`,
-so a pipeline over them takes no per-vertex input. Its one per-instance
-binding, of `tableInstanceStride` (28) bytes, carries:
-
-| Location | Format | Offset | Content |
-| --- | --- | --- | --- |
-| 0 | four floats | 0 | the rectangle in clip space: left, top, right, bottom |
-| 1 | `VertexUint` | 16 | the texture handle's lookup index |
-| 2 | `VertexUint` | 20 | the handle's generation |
-| 3 | `VertexUint` | 24 | the sampler index |
-
-It passes the handle and the sampler index to the fragment stage as flat
-values. The fragment shader declares the table's bindings and no push
-constants. It resolves the handle as `tableShaders` do (slot 0 for an index
-past the version's entries or a stale generation) and samples with
-`samplers[nonuniformEXT(min(index, 3u))]`, the slot index and the combined
-image also `nonuniformEXT`. The shader suite checks that their SPIR-V
-declares exactly the table's bindings, matches the interfaces, and decorates
-the sampler index, the slot index and the combined image `NonUniform`.
-
-**The window integration.** An owner-thread action has:
-
-- `constructTextureTable`, over the session's uploads; the host must
-  configure `vulkanUploads`, or it is refused;
-- `constructTablePipelineLayout` and
-  `constructShaderSampledTablePipelineLayout`, and, for set 2, the options
-  form `constructTablePipelineLayoutWith`
-  ([Per-batch storage tables](#per-batch-storage-tables));
-- `registerConstructedTexture` and `releaseConstructedTexture`;
-- `readConstructedTable`.
-
-A renderer or a frame-less batch records `bindTable` and `selectSampler` as
-it records any command.
-
-**Observation.** `readTable` shows:
-
-- the mapping a version published now would hold;
-- the current version and the live ones;
-- the slots live versions map, the free slots and the retiring slots;
-- whether the placeholder is written;
-- the stride and each ring entry's version generation.
-
-**Proof.** The pure examples (`Test.GPU.Model.TextureTable`, in
-`gpu-model-tests`) cover:
-
-- configuration refusals;
-- the placeholder before completion and stale handles after release;
-- index reuse under a new generation;
-- versions published only on change, and the current one bindable while
-  every entry is held;
-- backpressure with no partial registration or version;
-- slots reused only once no live version maps them;
-- a released, never-bound texture's slot freed at once;
-- `resolveHandle`'s bounds and generation checks.
-
-The stand-in examples (`Test.GPU.Vulkan.Native.Table`, in `native-tests`)
-cover:
-
-- the table's native objects, and the sizes it asks for;
-- every device-limit refusal before anything is made;
-- the table's pipeline layouts and their refusals;
-- binding both sets with the version's offset, and the sampler push;
-- every recorder refusal with exactly one native call between them;
-- a batch's version kept through a later change and a rebind;
-- binding refused before the placeholder is written;
-- descriptor writes only into slots no live version maps;
-- versions held to completion, with backpressure;
-- each new version written whole into an entry no batch holds before the
-  batch that binds it records, and flushed to the atom on non-coherent
-  memory;
-- the current version bound while every entry is held;
-- stale handles;
-- a release before the upload completes;
-- a discarded batch's version freed;
-- the record-then-release case;
-- every image a batch's version maps kept through retirement, with the
-  batch recorded and with it submitted;
-- a draw refused while a mapped texture is in a transfer use;
-- a vertex shader declaring set 0 refused, and one declaring set 1
-  admitted;
-- the largest dynamic offset checked before anything is made;
-- new table work refused, and nothing written, after the session fails,
-  while a release still completes;
-- a construction failing part-way leaving only whole generations, whose
-  failed destruction is retained and fails the session;
-- a cancellation aimed at the owner during the first sampler's creation
-  leaving every generation released or held by the published table;
-- the total update-after-bind pool limit checked before anything is made;
-- a cancellation during the refresh that reclaims a slot leaving its image
-  released, or still retiring for the next refresh;
-- a registration whose descriptor write fails, or is cancelled, undone,
-  into a slot an earlier, bound and released texture left, with the texture
-  registered again afterwards.
-
-A mutation check that ignored version holds failed the three hold-dependent
-examples, and one that left the version's images out of the batch's
-references failed the retirement example, and one that ran the
-construction unmasked failed the cancellation example. The device-profile examples refuse a device missing any of the six
-features, by name. The shader suite checks that `tableShaders`' SPIR-V
-declares exactly the table's three bindings and matches its descriptions.
-
-The stand-in examples for the shader-sampled kind (`Test.GPU.Vulkan.Native.Table`)
-cover:
-
-- the layout made with its two set layouts and no range, and a checked
-  pipeline over shaders declaring no push constants, with the other kind's
-  shaders refused as incompatible with it;
-- the layout refused with no native call in a session with no table, for a
-  binding the table does not hold, for a vertex stage declaring set 0, and
-  for ranges past the device's limit;
-- a table draw admitted with no `selectSampler`, `selectSampler` refused with
-  no native call, a push over offset 8 admitted, and the ordinary push
-  checks still refusing a misaligned push, one beyond the range and one to a
-  stage the layout has no range for;
-- a draw refused before a compatible table binding, and while the batch holds
-  a mapped image outside sampling;
-- switches between a pushed and a shader-sampled pipeline of identical
-  ranges, in both directions, each disturbing the table binding and the
-  sampler selection, a rebind binding the batch's first set and version after
-  the table has grown, and a return to the pushed path requiring a fresh
-  `selectSampler`;
-- every pushed example unchanged, including the refusal of a draw before a
-  sampler is selected.
-
-The surface-free native case `r2d16-shader-samplers` makes a table, a
-shader-sampled layout over `tableInstanceShaders` and a two-texel texture, a
-red texel then a blue one. One batch binds the table and draws four
-instances in **one** draw call, with no `selectSampler`, each filling a
-quadrant of a 64-by-64 sRGB target, with sampler indices 0
-(nearest/clamp-to-edge), 2 (linear/clamp-to-edge), 7 and 3. The target is
-read back and probed. A pixel 12 across a 32-pixel quadrant reads 0.390625
-across the texture. The nearest instance's probe reads the red texel exactly.
-The linear one's reads the blend, 0.28125 of the blue texel, within one step
-of the sRGB encoding of that blend, so the two differ. The probes of index 7
-and index 3 sit 3 pixels in, where repeat addressing wraps the blue texel in
-from the left and clamping does not: both read the blend within one step,
-and a linear/clamp-to-edge probe at the same offset reads the red texel
-alone, so index 7 sampled as sampler 3, not as 2. Validation, with
-synchronization validation, reports nothing.
-
-The surface-free native case `grs7-texture-table` makes a table of sixteen
-slots, eight at first, over the session's uploads. It then draws four
-frame-less batches, each into a 64-by-64 RGBA8 target that is copied back
-and probed:
-
-1. a texture registered before its upload reads as transparent black, the
-   placeholder;
-2. after red, green and blue two-by-two textures upload, red and green are
-   drawn side by side with different samplers;
-3. a batch is recorded with red's handle. Before it is submitted (when its
-   action returns), the handle is released and blue is registered. The batch
-   still draws red; blue took a different slot, and red's slot is the only
-   one retiring;
-4. blue is drawn beside red's released handle, which the shader resolves to
-   the placeholder.
-
-Once every batch has completed, the owner's step reclaims red's slot. A
-second release of red's handle is `RefusedStaleHandle`. Validation, with
-synchronization validation, reports nothing.
-
-| State | Owner | Readers and writers | Thread | Lifetime | Reset or disposal |
-| --- | --- | --- | --- | --- | --- |
-| The table's book: handles, generations, the slot map, the current version, the free and retiring slots | The recording (`recordingTable`, `tableBook`) | Registration, release, completion, binding and reclamation, all through the pure rules | The graphics owner; observers read it in STM | From `createTextureTable` until the recording retires | Never reset; the recording's retirement releases what it holds |
-| The samplers, set layouts, set 1's pool and sets | The recording, as managed generations the table names | Made once; bound by batches, which retain them | The graphics owner | Until `retireRecording` | Destroyed with every other managed resource, pools before set layouts before samplers |
-| Pending swaps (GRS-9) | The table: each handle's replacement slot in the bookkeeping, the replacement among the images it holds, and its ticket (`tableSwapTickets`) | `swapTexture` accepts one; the refresh completes or fails it; a later swap supersedes it; `releaseTexture` abandons it | The graphics owner; any thread reads a ticket | From acceptance until it takes effect, is superseded, is abandoned or fails | The replacement is released at once unless the swap took effect, when the replaced texture is released instead; a ticket keeps its final state for whoever holds it |
-| Set 0's generations and their pools | The recording (`tableTexturePool`, the current one; each older one only through the batches that hold it) | Construction makes the first; each growth makes the next, copies into it, makes it current and releases the previous one; each batch's first bind pins and retains the current one | The graphics owner | A generation from its making until it is superseded and no batch holds it; the current one until `retireRecording` | A superseded pool is destroyed, freeing its set, once no live batch holds it; the current one with every other managed resource |
-| The version ring's buffer and mapping | The recording, as a managed lookup buffer | The owner writes a version into an entry no batch holds; the device reads the entry a batch bound | The graphics owner | Until `retireRecording` | Destroyed with every other managed resource |
-| Each ring entry's version generation | The recording | Batches retain it through the model's holds; `versionHeld` reads them | The graphics owner | Until `retireRecording` | Destroyed with every other managed resource |
-| The images the table holds | The recording (`tableTextures`) | Registration adds; reclamation removes and releases | The graphics owner | From registration until no live version maps the image's slot | Released then; destroyed once nothing holds it |
-| The storage table (R2D-15): set 2's layout, pool and set, and the ring's window | The recording (`recordingStorage`; the window in `recordingRing`) | `createRingWith` makes the ring and records its window; `createStorageTable` makes the table once; a batch's first bind retains its layout and pool, and its claims retain the ring | The graphics owner | Until `retireRecording` | Destroyed with every other managed resource |
+A handle resolves in the shader: an index past the version's entries, or an
+entry whose generation differs from the handle's, resolves to slot 0 before
+any descriptor is read. `tableShaders` and `tableInstanceShaders` (in
+`Recording.Shaders`) are the reference pairs.
 
 ### Per-batch storage tables
 
-R2D-15 (#427) lets a batch bind a table it wrote to the shared ring
-([The ring](#drawing-from-buffers)) as a storage buffer, beside the texture
-table. It is the backend half of the render-2d design's per-batch tables (P-5,
-D-11, D-25 and D-30 of the [render-2d design](designs/render_2d_design.md)):
-clip rectangles and material records are written into regions the batch claims
-and bound for that batch. Clip and material semantics are not part of it. It
-is `hetoimasia-gpu-vulkan-native` alone. `render-2d-vulkan` is its first client
-(R2D-12): it writes each batch's clip tables into one region, binds it as set 2
-and reads it in its fragment shaders; shaders still read instances from vertex
-input, not from storage.
+A batch can bind a table it wrote to the shared ring as a storage buffer
+(set 2), beside the texture table. `render-2d-vulkan` uses it for per-batch
+clip tables and material records; the semantics of what is written are the
+client's.
 
-**Storage usage.** The ring's buffer kind, `InstanceBuffer`, gains the storage
-buffer usage beside its vertex and index usage. The ring's `InstanceRead` use
-is unchanged: it already covers shader reads in the vertex and fragment stages
-(`SHADER_READ`, which includes `SHADER_STORAGE_READ`), so binding the ring as
-a storage buffer records no use of its own, and the batch's first claim still
-enters it.
-
-**The window.** The application configures a **storage-table window** of `W`
-bytes. `validateStorageWindow` refuses zero, negative and unrepresentable
-values, never clamping (`StorageWindowRefused`), and `createRingWith recording
-size (Just window)` — `constructRingWith` in the window integration — checks it
-against the device and the ring. It is refused, with nothing made, when:
-
-- the window exceeds the device's `maxStorageBufferRange`
-  (`RefusedLimit "maxStorageBufferRange"`);
-- the window exceeds the ring's claimable size `R` (`RefusedOutOfBounds`);
-- the whole buffer, `R + W`, is a total no `VkDeviceSize` can hold, or exceeds
-  `maxBufferSize` (`RefusedOutOfBounds`).
-
-The last refuses a ring that is valid on its own once its tail is added. The
-buffer is `R + W` bytes so a window that starts at any claimable offset stays
-inside it; claims never consume the tail. `createRing` makes the ring with no
-window, as before, and `RingView` shows the window (`ringViewWindow`) beside
-the claimable size.
-
-**Set 2.** `createStorageTable recording` (`constructStorageTable`) makes, once
-per session, an engine-owned set layout with one dynamic storage buffer at
-binding 0, visible to the vertex and fragment stages, its pool, and its one
-set, whose descriptor covers the ring from offset 0 over `W` bytes. Each is a
-managed generation of its own, as the texture table's are; the first bind of a
-batch retains the layout and the pool, and the recording releases them with the
-other live generations when it retires. It needs the ring made with a window and
-not the texture table: it may be made before the table or after, but only a
-layout that also holds the table holds it. A second is `RefusedMisuse
-DuplicateSubject`; a session with no ring, or a ring made with no window, is
-`RefusedIllegal`. Before anything is made the device's limits for the layouts
-that hold it are checked, and each refusal is a `RefusedLimit` naming the
-limit, what was asked for and what the device allows:
-
-- three bound sets, against `maxBoundDescriptorSets`;
-- two dynamic storage buffers across the layout, set 1's lookup buffer and
-  set 2's, against `maxDescriptorSetStorageBuffersDynamic`;
-- two storage buffers visible to each stage, against
-  `maxPerStageDescriptorStorageBuffers`.
-
-Both sets are ordinary descriptor-set layouts, so these are the ordinary
-limits; the update-after-bind counterparts are not read, since they may
-legally be zero on a device that does not support storage-buffer
-update-after-bind. A regression example (`Test.GPU.Vulkan.Native.Table`)
-converts a device with the ordinary limits sufficient and the counterparts
-zero.
-
-**Layouts that hold it.** `createTablePipelineLayoutWith recording shaders
-options` (`constructTablePipelineLayoutWith`) is the options form of the table's
-layout constructors. `TableLayoutOptions` names the sampler mode — pushed at an
-offset (`TablePushedSampler`), as `createTablePipelineLayout` declares, or
-chosen by the shaders (`TableShaderSampler`), as
-`createShaderSampledTablePipelineLayout` does — and whether the layout holds set
-2. `createTablePipelineLayout` and `createShaderSampledTablePipelineLayout`, and
-their window-integration equivalents, keep their signatures and behaviour: each
-is the options form without set 2, and every existing layout is unchanged. A
-layout that holds set 2 declares it after the table's two sets, so its layouts
-are, from set 0 on, the texture table's, the lookup buffer's and the storage
-table's. It is refused before any native call, in this order: in a session with
-no texture table; in a session with no storage table; for whatever the shaders'
-checks and the sampler choice refuse; for the push ranges the device's limit
-refuses; and then for the limits across the **whole** layout, set 1 included,
-each a `RefusedLimit` naming the limit:
-
-- three bound sets (`maxBoundDescriptorSets`);
-- two dynamic storage buffers (`maxDescriptorSetStorageBuffersDynamic`);
-- two storage buffers visible to each stage
-  (`maxPerStageDescriptorStorageBuffers`);
-- the table's cap, its four samplers and its two buffers — the cap plus six
-  resources in one stage — against `maxPerStageUpdateAfterBindResources`.
-
-**The shader interface.** Checked shaders under a layout that holds set 2 may
-declare its binding, `storageTableDescriptors`: set 2's one storage buffer at
-binding 0, which either stage may read, beside the table's own bindings under
-the rules that hold already (set 0 in the fragment stage alone). Under any other
-layout declaring it is refused with no native call: a layout holding the table
-alone refuses it as a binding the table does not hold (`RefusedIncompatible`),
-and a layout holding no table as before (`RefusedUnsupported`). The reference
-pair is `storageTableShaders` (in `Recording.Shaders`), with interfaces
-`storageTableVertexInterface` and `storageTableFragmentInterface`: both stages
-declare set 2's binding, the vertex stage draws a rectangle from the table's
-first four floats with no vertex input, and the fragment stage shows its next
-four as the colour. The shader suite checks that their SPIR-V declares exactly
-that binding and matches the interfaces.
-
-**Claiming and binding.** `claimTable recorder size` is `claimRegion` with the
-device's `minStorageBufferOffsetAlignment`, so the region's start is a valid
-dynamic offset; every refusal of a claim is its. The table is written with
-`writeClaim` as any claim is. `bindStorageTable recorder claim offset` binds set
-2 under the bound pipeline's layout, through `vkCmdBindDescriptorSets` for set 2
-alone, with a dynamic offset equal to the claim's region start plus `offset`.
-Sets 0 and 1 and the texture table's version offset stay as they stand. Refused
-with no native call:
-
-- a session that has failed, or a closed recorder;
-- no pipeline bound, or a pipeline whose layout does not hold set 2;
-- a claim that is stale (`StaleIdentity`), another batch's (`WrongParent`) or
-  another session's (`ForeignIdentity`);
-- an `offset` past the claim's end (`RefusedOutOfBounds`);
-- the bytes from `offset` to the claim's end beyond the window, since the shader
-  could not see the whole table — oversized (`RefusedOutOfBounds`, naming those
-  bytes and the window);
-- a resulting offset that is not a multiple of `minStorageBufferOffsetAlignment`
-  (`RefusedIllegal`);
-- a resulting offset greater than `UINT32_MAX`, computed without overflow and
-  refused before it is narrowed (`storageDynamicOffset`, `RefusedOutOfBounds`).
-  The byte budget keeps every ring below 2^32 bytes, so no bind of a claim
-  reaches this bound; the stand-in examples test the arithmetic where it is
-  made.
-
-The window is a descriptor window, not ownership of every byte it exposes. A
-shader's reads must stay within the bound claim's unpadded suffix, from the bound
-offset to the end of the bytes the claim asked for, and never reach a
-neighbouring claim or the unused tail; the backend cannot see them. Binding and
-drawing respect the ring's `InstanceRead` use, which the bind reads it in and a
-draw checks it is still in.
-
-**Drawing.** A draw with a pipeline whose layout holds set 2 — `draw` and
-`drawIndexed` alike — is refused with no native call unless set 2 is bound under
-a compatible layout, besides the texture table's checks. Binding another
-pipeline disturbs the binding as it does the texture table's: set 2 stays bound
-only under a pipeline whose layout holds it, with the same push-constant ranges
-and the same kind of sampler choice; any other pipeline disturbs it, and the next
-draw needs it bound again. Binding the texture table leaves a compatibly bound
-set 2, and binding set 2 leaves the table, in either order; a pipeline that
-disturbs one disturbs the other under the rules above. The batch's first claim
-retains the ring, so the retention of its claims covers what set 2 reads; the
-batch's first bind retains the layout and the pool of set 2, and a later bind
-retains only the layout it binds them under.
-
-**The window integration.** An owner-thread action has `constructRingWith`,
-`constructStorageTable` and `constructTablePipelineLayoutWith`, beside
-`constructRing` and the table's constructors, which are unchanged. A renderer or
-a frame-less batch records `claimTable` and `bindStorageTable` as it records any
-command.
-
-**Proof.** The stand-in examples (`Test.GPU.Vulkan.Native.Table`, in
-`native-tests`) cover:
-
-- the window validated once, the ring made `R + W` bytes long under storage
-  usage with claims that never consume the tail, and a plain ring unchanged;
-- a window refused for the device's range and for the ring, and an
-  otherwise-valid `R` refused when `R + W` exceeds the device's buffer size or
-  no size can hold it, each before anything is allocated;
-- the instance-read use covering both shader stages' reads;
-- set 2's creation: its layout, pool and set, and a descriptor over the ring
-  from offset zero for the window; a second refused; a missing ring or window
-  refused; each limit refused first, naming it, with nothing made; and a failing
-  step releasing what it made;
-- the options-form layouts without set 2 equal to the original constructors,
-  and with it declaring the three set layouts in order;
-- a shader declaring set 2's binding admitted under a layout that holds it and
-  refused under every other, with no native call;
-- each limit across the whole layout refused naming it before a layout is
-  created, and the original layouts still made under the same limits;
-- binding at a dynamic offset, two tables in one batch each drawn, and every
-  refusal of a bind — no pipeline, a layout without set 2, a stale or another
-  batch's claim, past the claim, oversized, misaligned, a closed recorder and a
-  failed session — each with no native call, the claim's end and a table that is
-  exactly the window admitted;
-- the 32-bit arithmetic above and at the boundary;
-- a draw and an indexed draw refused before set 2 is bound;
-- set 2 kept through the table's bind in either order and through a compatible
-  pipeline switch, and disturbed by a pipeline without it and by one of the
-  other sampler kind over equal ranges;
-- retention: the ring held by the first claim, set 2's generations by the first
-  bind, and neither changed by a later claim and a rebind.
-
-A mutation check that never disturbed set 2 on a pipeline switch, one that
-ignored the sampler kind, one that skipped the draw check, one that dropped
-each of the oversized, misaligned and past-the-end refusals, one that skipped
-the whole-layout limits, one that made the ring `R` bytes and one that
-retained set 2 at no bind each failed an example.
-
-The surface-free native case `r2d15-storage-tables` makes a table, a ring with a
-256-byte window, the storage table, and a shader-sampled layout that also holds
-set 2 over `storageTableShaders`. One batch claims two regions for per-batch
-tables with `claimTable` — each a rectangle in clip space and a colour — writes
-them, binds the texture table, and draws twice in one batch, binding each table
-at its own dynamic offset before its draw. The fragment shader reads its colour
-from the bound table, with no selected sampler. The target is a 64-by-64 RGBA8
-linear one, so a colour reads back as its own bytes: the left half reads
-(200, 100, 50, 255), the first table's, and the right half (30, 220, 120, 255),
-the second's, exactly. Validation, with synchronization validation, reports
-nothing.
+- **The window.** The application configures a storage-table window of `W`
+  bytes (`validateStorageWindow`, never clamped). `createRingWith recording
+  size (Just window)` (`constructRingWith`) refuses a window beyond
+  `maxStorageBufferRange` or beyond the ring's claimable size, and a total
+  `R + W` beyond `maxBufferSize`. The tail keeps a window that starts at any
+  claimable offset inside the buffer.
+- **Set 2.** `createStorageTable recording` (`constructStorageTable`) makes,
+  once per session, a set layout with one dynamic storage buffer visible to
+  the vertex and fragment stages, its pool and its set, covering the ring from
+  offset 0 over `W` bytes. It needs a ring made with a window. The device's
+  ordinary limits are checked first (`RefusedLimit`); the update-after-bind
+  counterparts are not read, since they may legally be zero.
+- **Layouts.** `createTablePipelineLayoutWith recording shaders options`
+  (`constructTablePipelineLayoutWith`) names the sampler mode and whether the
+  layout holds set 2, declared after the texture table's two sets. It needs
+  both the texture table and the storage table. Shaders under such a layout
+  may declare set 2's binding (`storageTableDescriptors`); under any other
+  layout declaring it is refused.
+- **Claiming and binding.** `claimTable recorder size` is `claimRegion` at
+  the device's `minStorageBufferOffsetAlignment`. `bindStorageTable recorder
+  claim offset` binds set 2 alone with a dynamic offset of the claim's start
+  plus `offset`. It is refused for a stale or foreign claim, an offset past
+  the claim's end, a table larger than the window, and a misaligned offset.
+- **The shader's obligation.** The window is a descriptor window, not
+  ownership of every byte it exposes. A shader's reads must stay within the
+  bound claim, from the bound offset to the end of the bytes claimed; the
+  backend cannot see them.
+- **Drawing.** A draw with a pipeline whose layout holds set 2 is refused
+  unless set 2 is bound under a compatible layout. A pipeline switch disturbs
+  it under the same rules as the texture table's binding.
 
 ### Destruction
 
-`disposeResources` destroys, on the owner, every released generation the model
-reports every hold of ended, and records each disposal with progress turns
-that answer for managed resources only. A turn does bounded work, so turns
-continue until every destruction that returned is recorded, and passes continue
-until one destroys nothing. A pipeline layout waits until every
-pipeline built over it is destroyed; a pass destroys pipelines first. A
-destruction that raised is uncertain, never retried, fails the session with
-`CleanupFailed` and raises `ResourceDestructionFailed`, and retains everything
-that depends on it. `retireRecording` releases every live handle, destroys what
-it can and raises `ResourcesRetained`, naming the rest, without manufacturing
-evidence; every managed resource must be gone before the device. A readback's
-destruction unmaps its allocation, destroys its buffer and then frees the
-allocation (VMA's `vmaDestroyBuffer`), and settles whatever device memory that
-freed; a sibling allocation's mapping and memory are untouched. A managed
-buffer's is the same; a managed image's destroys its owned view, then the
-image, then frees its allocation (`vmaDestroyImage`), settling that too.
+`disposeResources` destroys, on the owner, every released generation whose
+holds the model reports ended, and records each disposal. A pipeline layout
+waits until every pipeline built over it is destroyed. A destruction that
+raised is uncertain, never retried, fails the session with `CleanupFailed`,
+raises `ResourceDestructionFailed`, and retains everything that depends on it.
+`retireRecording` releases every live handle, destroys what it can and raises
+`ResourcesRetained` naming the rest, without manufacturing evidence. Every
+managed resource must be gone before the device.
 
 ### The FFI audit
 
-D-28's production split, as built. The binding is compiled with
-`+safe-foreign-calls`, so every import of its own is `safe`; the package's only
-genuine `unsafe` Vulkan imports are the twenty `dynamic` imports in the private
-`Hetoimasia.GPU.Vulkan.Native.Internal.Commands`, each calling the function
-pointer the binding's own device dispatch table (`DeviceCmds`) resolved for the
-command buffer's device, with structures marshalled by the binding's
-`withCStruct`. A Haskell wrapper around a `safe` import would not have changed
-its calling convention.
+The binding is compiled with `+safe-foreign-calls`, so every import of its own
+is `safe`. The package's only `unsafe` Vulkan imports are the twenty `dynamic`
+imports in the private `Internal.Commands`, each a command-recording call
+through the device dispatch table the binding resolved:
 
-| Entry point | Why it may be `unsafe` |
-| --- | --- |
-| `vkBeginCommandBuffer` | Puts a command buffer the owner alone holds into the recording state. No wait, no other thread's lock; its result is checked and raised as the binding raises it. |
-| `vkEndCommandBuffer` | Ends that recording state. The same. |
-| `vkCmdPipelineBarrier2` | Records a barrier; it does not execute one. |
-| `vkCmdBeginRendering` | Records the start of dynamic rendering. |
-| `vkCmdEndRendering` | Records its end. |
-| `vkCmdBindPipeline` | Records a binding of an already-created pipeline. |
-| `vkCmdSetViewport` | Records dynamic state. |
-| `vkCmdSetScissor` | Records dynamic state. |
-| `vkCmdDraw` | Records a draw. |
-| `vkCmdClearAttachments` | Records the clear of the open pass's depth attachment within one rectangle, one attachment and one layer; the structures are marshalled for the call and not kept (R2D-17). |
-| `vkCmdPushConstants` | Records push-constant bytes, which the recording has checked fit the bound layout's ranges; they are copied into the command buffer during the call and not kept (GRS-4). |
-| `vkCmdBindVertexBuffers` | Records one buffer, already created, bound to one vertex input binding at an offset (GRS-4). |
-| `vkCmdBindIndexBuffer` | Records an already-created buffer bound as index data at an offset (GRS-4). |
-| `vkCmdDrawIndexed` | Records an indexed draw (GRS-4). |
-| `vkCmdBindDescriptorSets` | Records a binding of the texture table's two already-written sets under an already-created layout, with one dynamic offset; the set and offset arrays are marshalled for the call and not kept (GRS-7). |
-| `vkCmdCopyImageToBuffer` | Records a copy; it does not perform one. |
-| `vkCmdCopyBuffer` | Records one region's copy from the staging buffer into a buffer; it does not perform one (GRS-6). |
-| `vkCmdCopyBufferToImage` | Records one band of whole block rows' copy from the staging buffer into a mip level; it does not perform one (GRS-6). |
-| `vkCmdBeginDebugUtilsLabelEXT` | Records the opening of a label region; the label's name is marshalled for the call and not kept. |
-| `vkCmdEndDebugUtilsLabelEXT` | Records its closing. |
+`vkBeginCommandBuffer`, `vkEndCommandBuffer`, `vkCmdPipelineBarrier2`,
+`vkCmdBeginRendering`, `vkCmdEndRendering`, `vkCmdBindPipeline`,
+`vkCmdSetViewport`, `vkCmdSetScissor`, `vkCmdDraw`, `vkCmdClearAttachments`,
+`vkCmdPushConstants`, `vkCmdBindVertexBuffers`, `vkCmdBindIndexBuffer`,
+`vkCmdDrawIndexed`, `vkCmdBindDescriptorSets`, `vkCmdCopyImageToBuffer`,
+`vkCmdCopyBuffer`, `vkCmdCopyBufferToImage`, `vkCmdBeginDebugUtilsLabelEXT`,
+`vkCmdEndDebugUtilsLabelEXT`.
 
-Each records into a command buffer the calling thread owns; none waits on the
-device, blocks on another thread, or can run long enough to matter. None can
-call back into Haskell: the package installs no Haskell callback, no allocation
-callback and no trampoline, so the only code a validation layer can reach from
-inside one is #217's C-only capture messenger
-(`hetoimasia_vulkan_capture_messenger`), which copies capped data into bounded
-storage and returns. Everything else stays `safe`, through the binding: waits,
-queue submission and presentation (VK-12 and VK-13), pipeline creation, every
-construction and destruction, the pool reset and mapped-memory maintenance.
-Masking, native-effect accounting and retention hold across the mix, because
-every unsafe call sits inside the same masked step as the retention before it
-and the count after it, and an unsafe call cannot be interrupted.
+Each may be `unsafe` for the same reasons: it records into a command buffer
+the calling thread owns; it does not execute, wait on the device or block on
+another thread; and it cannot call back into Haskell, because the package
+installs no Haskell callback, allocation callback or trampoline. The only code
+a validation layer can reach from inside one is the C-only capture messenger.
+Everything else stays `safe`: waits, queue submission, presentation, pipeline
+creation, every construction and destruction, pool resets and mapped-memory
+maintenance. Every unsafe call sits inside the same masked step as the
+retention before it and the count after it.
 
-GRS-11 adds the second set of `unsafe` imports: the allocator's VMA shim, in
-the private `Hetoimasia.GPU.Vulkan.Native.Internal.Vma`. Each is one C entry
-of the engine's own shim (`cbits/hetoimasia_vma.cpp`) taking scalars and one
-result record the allocator reuses, the shape #361 qualified
-([the VMA qualification record](archive/gpu_vma_qualification_record.md)). VMA's
-device-memory callbacks are C functions counting into the allocator's own
-state, so none of these calls can enter Haskell, and VMA's own Vulkan calls
-reach the capture's C messenger at most. They are made on the owner's thread
-alone, under the same masked steps as the accounting around them.
+The second set of `unsafe` imports is the allocator's VMA shim
+(`Internal.Vma`, over `cbits/hetoimasia_vma.cpp`). VMA's device-memory
+callbacks are C functions, so none of those calls can enter Haskell, and they
+are made on the owner's thread alone.
 
-`nativeFfiConfiguration` records the lists (`ffiUnsafeImports` and
-`ffiAllocatorImports`), the binding's flags, the allocator, and the C-only
-callback; the native case's record prints it, so it is part of the evidence
-identity beside the build's source digest. The headless suite reads the
-package's own import declarations and requires exactly those twenty `dynamic`
-imports and, besides them, only the capture callback's address import and the
-allocator shim's entries.
+`nativeFfiConfiguration` records both lists, the binding's flags and the
+C-only callback. The headless suite reads the package's own import
+declarations and requires exactly those imports, so adding an `unsafe` import
+means extending this audit and that list together.
 
 ## Frames: acquisition, submission and abandonment
 
-`Hetoimasia.GPU.Vulkan.Native.Frames` is VK-12
-([#225](https://github.com/coghex/hetoimasia/issues/225)): P-1's scheduling
-vocabulary — try to acquire, submit, skip, advance — over P-2's frame ownership
-table, with D-23's safe abandonment of unsubmitted frames and D-15–D-17's
-composable, finite, terminal-on-unknown contract. It sits above the recording: a
-`Frames` is made over a `Recording`, and so over its generations and roots, and
-every native call goes through an open native layer, `FrameOps`, whose
-production form is `Hetoimasia.GPU.Vulkan.Native.Frames.Vulkan`; the headless
-examples supply a stand-in. Every operation belongs to the graphics owner — the
-thread that owns the recording — and any other is refused with
-`RefusedNotOwner`. Refusals are the recording's `Refusal`.
-
-The model decides what every frame owes; this module makes the native calls
-and supplies the model the facts it observed, and nothing else. The GPU model's
-public surface is unchanged: every transition used here — `reserveFrame`,
-`acquireImage`, `resetSubmissionFence`, `submitFrames`, `skipUnsubmittedFrame`,
-`closeSubmittedFrame` and `recordCompletion` — was already
-[its contract](gpu_model.md#frame-ownership).
+`Hetoimasia.GPU.Vulkan.Native.Frames` sits above the recording, over an open
+native layer `FrameOps`. Every operation belongs to the graphics owner
+(`RefusedNotOwner` otherwise). The model decides what every frame owes
+([gpu_model.md](gpu_model.md#frame-ownership)); this module makes the native
+calls and supplies the facts it observed.
 
 ### The operations
 
-| Operation | What it does | What it answers |
-| --- | --- | --- |
-| `tryAcquireFrame target` | Reserves the frame in the model — its slot, the presentation-pool record and the submission record it may need — makes the slot's synchronization if it has none, and acquires one image with a zero timeout, recording the result in the same masked step | `AcquisitionOwned` an `OwnedFrame`, carrying its `FrameSlotId` and the exact `ImageId` and whether it was suboptimal; `AcquisitionPending` a reason; `AcquisitionSuspended`; `AcquisitionClosing`; `AcquisitionUnavailable`; or a misuse refusal |
-| `recordFrame` (the recording's) | Runs the consumer once and seals one batch for the frame | A `BatchId` |
-| `submitFrames batches` | Validates the whole non-empty request, then resets one fence, submits every batch in the caller's order as one `vkQueueSubmit2` on the session's one graphics queue, and records the result in the same masked step | `SubmittedAs` the one `SubmissionId` every frame of the request shares; `SubmittedNothing` for the specified no-effect failure; or a refusal before any native call |
-| `skipFrame frame` | Consumes an acquired, unsubmitted frame: invalidates its recording, skips it in the model, and makes a cleanup submission waiting on its acquisition semaphore | Acknowledgement of its admission to retirement, not its completion |
-| `closeUnpresentedFrame frame` | Closes a submitted frame that will never be presented, in the model alone | Acknowledgement; its settlement follows its actual rendering completion |
-| `presentFrame frame` | Validates a submitted frame, then resets its pool record's present fence and presents its image waiting on the record's render-finished semaphore, recording what the swapchain answered in the same masked step ([Presentation and retirement](#presentation-and-retirement)) | `PresentedAs` the `PresentationId` and what was enqueued; `PresentedNothing` for out of memory; or a refusal before any native call |
-| `closeTargetFrames target` | Skips every acquired frame of a target and closes every submitted one | What each frame answered |
-| `progressFrames now` | The owner's bounded step: observes pending fences — submission, present and cleanup — makes the cleanup submissions closed frames owe, and returns images | A `Progress`: completed submissions, retired presentations, settled frames, cleanups made, fences still pending |
-| `awaitFrames now timeout` | A finite protected-drain wait — at most `drainWaitLimit`, 10 ms — on one pending fence, then `progressFrames` | The step's `Progress`; the wait itself is never evidence |
-| `retireTargetFrames target` | Destroys a target's slot synchronization and presentation pool once nothing of it is live, presented and unretired, or pending — after the device's loss, once the loss has released them, whatever they were owed | Returns, or raises `FramesRetained` naming what remains |
-| `releaseFramesToDeviceLoss` | After the device's loss: skips every acquired frame without a cleanup submission, and lets go of every submission, presentation and frame the lost device alone could have discharged ([Teardown after device loss](#teardown-after-device-loss)) | The model's `DeviceLossRelease`; `RefusedIllegal` before any loss |
+| Operation | What it does |
+| --- | --- |
+| `tryAcquireFrame target` | Reserves the frame in the model (slot, presentation-pool record, submission record), makes the slot's synchronization if needed, and acquires one image with a zero timeout |
+| `recordFrame` | Runs the consumer once and seals one batch for the frame |
+| `submitFrames batches` | Validates the whole request, resets one fence, and submits every batch in order as one `vkQueueSubmit2` |
+| `skipFrame frame` | Consumes an acquired, unsubmitted frame: invalidates its recording, skips it in the model, and makes a cleanup submission |
+| `closeUnpresentedFrame frame` | Closes a submitted frame that will never be presented |
+| `presentFrame frame` | Resets the pool record's present fence and presents the image |
+| `closeTargetFrames target` | Skips every acquired frame of a target and closes every submitted one |
+| `progressFrames now` | The owner's bounded step: observes pending fences, makes owed cleanup submissions, returns images |
+| `awaitFrames now timeout` | A finite wait (at most `drainWaitLimit`, 10 ms) on one pending fence, then `progressFrames`. The wait is never evidence |
+| `retireTargetFrames target` | Destroys a target's synchronization once nothing of it is live or pending, or raises `FramesRetained` |
+| `releaseFramesToDeviceLoss` | After device loss: lets go of everything only the lost device could have discharged |
 
-Frame capacity is the model's: two slots per target by default, one supported
-(D-16). An acquisition refused for want of a slot, a presentation-pool record
-or accounting answers `AcquisitionPending (PendingBackpressure kind)` before any
-native call.
+Frame capacity is the model's: two slots per target by default. An
+acquisition refused for want of a slot, pool record or accounting answers
+`AcquisitionPending (PendingBackpressure kind)` before any native call.
 
 ### Slot synchronization
 
-Each frame slot owns three synchronization objects: an **acquisition
-semaphore**, the **submission fence** of a native submission it leads, and a
-**cleanup fence**. They are made together, named from the target and slot when the device offers
-naming (`slotObjectName`), the first time the slot is reserved and before its
-first acquisition; a creation or naming that raised destroys what was made
-before it and gives the reservation back. So an acquired frame always has the
-synchronization its abandonment needs, whatever the budgets say by then: the
-cleanup submission charges nothing, and the model reserved its bookkeeping with
-the frame. A slot is reused only once the model has freed it, and the
-acquisition checks its objects are idle — no semaphore owed a signal or waited
-on, no fence pending — and refuses otherwise.
-
-The **render-finished semaphore** a frame's rendering signals is not the
-slot's: a presentation waits on it for longer than the slot is held, so it
-belongs to the record of the target's presentation pool bound to the frame at
-its reservation ([The presentation pool](#the-presentation-pool)). The frame's
-submission signals it; its presentation, or the cleanup of a frame never
-presented, waits on it.
+Each frame slot owns an acquisition semaphore, a submission fence and a
+cleanup fence, made together the first time the slot is reserved. So an
+acquired frame always has the synchronization its abandonment needs. The
+render-finished semaphore is not the slot's: it belongs to the frame's
+presentation-pool record, because a presentation waits on it for longer than
+the slot is held.
 
 ### Acquisition
 
-A failed session refuses the acquisition before anything else, naming its
-primary failure (`RefusedSessionFailed`; [Checkpoints and
-refusals](#checkpoints-and-refusals)). The target must be this session's
-(`ForeignIdentity`, `StaleIdentity` or `UnknownIdentity` otherwise — misuse,
-never pending), and admitted: a suspended target answers
-`AcquisitionSuspended`, a retiring one `AcquisitionClosing`, and an unavailable
-one `AcquisitionUnavailable`. It acquires from the
-active generation while its generations are presenting, and also while a
-replacement is settling or backpressured, so a live resize keeps rendering
-(on MoltenVK the image is scaled to the layer until the replacement is built).
-A target with no active generation — still constructing, or after a failed
-construction — or waiting to recover answers
-`AcquisitionPending PendingGeneration`; a spent recovery or an unsupported
-surface answers `AcquisitionUnavailable`.
+A failed session refuses first (`RefusedSessionFailed`). A suspended target
+answers `AcquisitionSuspended`, a retiring one `AcquisitionClosing`, an
+unavailable one `AcquisitionUnavailable`. A target acquires from its active
+generation while it is presenting and also while a replacement is settling or
+backpressured, so a live resize keeps rendering.
 
 | The call answered | The model | The answer |
 | --- | --- | --- |
 | `VK_SUCCESS` | The frame owns the image | `AcquisitionOwned` |
-| `VK_SUBOPTIMAL_KHR` | The frame owns the image, and the target counts a replacement request | `AcquisitionOwned`, suboptimal; the generations are told (`SwapchainSuboptimal`), so the owner's next step reconciles |
-| `VK_NOT_READY`, `VK_TIMEOUT` | The reservation goes back whole, its pool record freed untouched, with no synchronization obligation | `AcquisitionPending PendingNoImage` |
-| `VK_ERROR_OUT_OF_DATE_KHR` | The reservation goes back, its pool record freed untouched, and a replacement is requested | `AcquisitionPending PendingReplacement`; the generations are told (`SwapchainOutOfDate`) |
-| `VK_ERROR_SURFACE_LOST_KHR` | The reservation goes back, its pool record freed untouched, and a replacement is requested | `AcquisitionPending PendingSurfaceLost`; the generations are told (`SwapchainSurfaceLost`), and the surface is [replaced](#replacing-a-lost-surface) |
-| It raised | The reservation goes back: an error result has no effect | The failure is re-raised; device loss latches as always |
+| `VK_SUBOPTIMAL_KHR` | The frame owns the image; a replacement is requested | `AcquisitionOwned`, suboptimal |
+| `VK_NOT_READY`, `VK_TIMEOUT` | The reservation goes back whole | `AcquisitionPending PendingNoImage` |
+| `VK_ERROR_OUT_OF_DATE_KHR` | The reservation goes back; a replacement is requested | `AcquisitionPending PendingReplacement` |
+| `VK_ERROR_SURFACE_LOST_KHR` | The reservation goes back; the surface is [replaced](#replacing-a-lost-surface) | `AcquisitionPending PendingSurfaceLost` |
+| It raised | The reservation goes back | The failure is re-raised |
 
-A successful acquisition whose result the model then refused to record — the
-native image is owned and nothing can settle it — is an uncertain effect: the
-slot is retained for ever, admission closes, the session fails with
-`CleanupFailed`, and `FrameEffectUncertain` is raised.
+A successful acquisition the model then refused to record is an uncertain
+effect: the slot is retained for ever, the session fails with `CleanupFailed`,
+and `FrameEffectUncertain` is raised.
 
-The slot's synchronization and a presentation-pool record are each built
-before they are published: a slot's acquisition semaphore, submission fence and
-cleanup fence, and a record's render-finished semaphore and present fence, each
-created and then named. A creation that ran out of memory created nothing and
-is recovered as an allocation, once ([Allocation recovery](#allocation-recovery)).
-Any other creation or naming that raises after something was made is rolled
-back:
-
-- every object made is destroyed exactly once, newest first — the dependency
-  order — and a destruction that raised does not stop the ones after it;
-- the construction's failure stays primary, and every destruction that raised
-  is retained beside it, in the order attempted, under the
-  `vulkan frame synchronization rollback` label, as
-  [the failure table](resources.md#the-failure-table) requires;
-- when every destruction returned, nothing is retained and nothing else
-  changes: the reservation goes back as for any acquisition that raised, the
-  session is not failed, and synchronization published before — the complete
-  slot a failed pool record was being built for — stays;
-- when one raised, the object it named may still exist. The slot or record is
-  published anyway, held by no frame, with each object standing as its
-  rollback left it: uncertain (`FenceUncertain`, `SemaphoreUncertain`) if its
-  destruction raised, `FenceDestroyed` or `SemaphoreDestroyed` if it returned,
-  and `FenceNeverCreated` or `SemaphoreNeverCreated` — its handle naming
-  nothing — if the construction never made it. Its `syncDestruction` or
-  `poolDestruction` records why. Admission closes and the session fails with
-  `CleanupFailed`, without replacing an earlier terminal primary, before the
-  failure is raised. Like a published record whose destruction raised, it is
-  never destroyed again under any rule, the device-loss rule included, so the
-  target's frame retirement keeps it and raises `FramesRetained` rather than
-  certifying anything.
+A synchronization construction that fails part-way destroys every object it
+made, newest first, with the construction's failure primary. If one of those
+destructions raised, the slot or record is published held by no frame, marked
+uncertain, never destroyed again, and the session fails with `CleanupFailed`.
 
 ### Submission
 
-`submitFrames` refuses before any native call: a batch of another session; a
-batch named twice (`DuplicateSubject BatchIdentity`); one already submitted,
-discarded or reset (`AlreadyConsumed BatchIdentity`); one still recording,
-partial or uncertain (`WrongPhase BatchIdentity`); a batch whose frame this
-owner did not acquire, or that is no longer acquired; two batches of one frame;
-synchronization that is not ready; and anything the model would refuse, which is
-asked of a copy it then discards. So the whole request is validated and its one
-submission record reserved — the frame reserved it — before any native effect.
+`submitFrames` refuses before any native call: a foreign, duplicated,
+consumed, partial or still-recording batch; a batch whose frame this owner did
+not acquire; two batches of one frame; and anything the model would refuse.
+Then, in one masked step, the first frame's slot fence is reset and the
+submission is made. Each batch waits on its frame's acquisition semaphore at
+the color-attachment-output stage and signals its pool record's
+render-finished semaphore.
 
-Then, in one masked step, the model notes each frame's fence reset, and the
-first frame's slot fence is reset, only now, immediately before the one
-submission it is passed to. Each batch waits on its frame's acquisition
-semaphore at the color-attachment-output stage — where the recorder's
-transition into rendering first touches the image — executes its command
-buffer, and signals the render-finished semaphore of its frame's pool record. What the call did is
-recorded before the step ends:
-
-- **It returned.** The model records one submission every frame of the request
-  shares, which retains every subject each batch recorded and every frame's
-  swapchain generation until it completes; each batch is recorded as submitted
-  with the recording (`noteBatchSubmitted`), which is the evidence its
-  readback needs; and the fence is pending. Separate calls are separate
-  submissions and settle independently; an explicitly shared request is never
-  split, and unrelated targets are never combined behind the caller's back.
-- **A specified no-effect failure** — out of host or device memory, which the
-  native layer identifies (`opsNoEffect`). Nothing is pending; the model clears
-  its fence-reset bookkeeping, and the native fence, reset and unsubmitted, is
-  never waited on. Every frame is still acquired with its batch sealed. That is
-  an allocation failure with no effect, [recovered once](#allocation-recovery):
-  a reclamation pass, and the same request — its batches sealed as they were,
-  no consumer run again — validated and submitted once more only if the pass
-  disposed of something. Otherwise, or when that fails again,
-  `SubmittedNothing` is answered, naming the original failure and the pass's
-  evidence, and every frame can still be submitted again or skipped.
-- **The fence reset raised.** Nothing was submitted and every frame is still
-  acquired, with its batch sealed; but the fence is now in doubt, so it is
-  marked uncertain and retained for ever with its slot, and since native
-  synchronization safety is unknown, admission closes and the session fails
-  with `CleanupFailed` before the failure is re-raised. The frames can still be
-  skipped: a skip uses the slot's cleanup fence.
-- **Anything else raised.** Whether anything was submitted is unknown. Each frame
-  enters the model's uncertain-effect state, which retains every parent for
-  ever and stops admission; the fence and both semaphores of each frame are
-  marked uncertain, the session fails, and `FrameEffectUncertain` is raised — or
-  the device loss itself, when that is what it was, so the loss is what the
-  caller sees first. Nothing is rolled back.
+- **It returned.** The model records one submission every frame of the
+  request shares, and each batch is recorded as submitted. Separate calls are
+  separate submissions; a shared request is never split.
+- **A specified no-effect failure** (out of memory). Nothing is pending and
+  every frame is still acquired with its batch sealed. It gets the one
+  [allocation recovery](#allocation-recovery); otherwise `SubmittedNothing`.
+- **The fence reset raised.** Nothing was submitted, but the fence is marked
+  uncertain and the session fails with `CleanupFailed`. The frames can still
+  be skipped.
+- **Anything else raised.** Whether anything was submitted is unknown. Each
+  frame enters the model's uncertain-effect state, the session fails, and
+  `FrameEffectUncertain` (or the device loss) is raised. Nothing is rolled
+  back.
 
 ### Abandonment
 
-**A skipped frame.** `skipFrame` is legal only for an acquired frame nothing of
-which has been submitted — a skip after any submission is `WrongPhase` — and is
-an ordinary outcome, not a failure. Its unsubmitted recording is invalidated
-natively through the recording's `resetFrameRecorder` and only then discharged;
-the model skips the frame, which consumes its capability; and a cleanup
-submission that runs no command and waits on the acquisition semaphore is made
-with the slot's cleanup fence. Once that fence has signalled, `progressFrames`
-returns the image through `vkReleaseSwapchainImagesEXT` and supplies the model
-the frame's settlement, which frees its slot and its pool record — the native
-record included, since nothing signalled its semaphore. The swapchain
-is not rebuilt, the target stays available, and later frames are admitted within
-the capacity that remains. Outstanding abandonment still holds its slot and its
-pool record until the evidence arrives.
-
-**A submitted frame never presented.** Close, cancellation or a refused
-presentation can leave a submitted frame unpresented; `closeUnpresentedFrame`
-marks it so in the model, keeping its submission and its image. It is never
-treated as an unsubmitted skip. `progressFrames` first waits for its actual
-rendering completion — its submission's fence — then settles the render-finished
-semaphore of its pool record, whose signal has no other consumer, through a
-tracked cleanup submission that waits on it, and only once that cleanup's fence
-has signalled returns the image and supplies the settlement. The semaphore is
-then unsignalled with no wait outstanding, the pool record is free, and the
-slot may be reused. A presentation that enqueued nothing leaves its frame
-submitted, and this is its exit too.
-
-A cleanup submission or a release that raised retains the frame, its image and
-its synchronization for ever — never retried, never fabricated as reusable —
-fails the session with `CleanupFailed`, and raises `FrameCleanupFailed`. This
-follows the precedent every other cleanup failure in the backend sets; isolating
-an optional target from it is not recovery's to do: a failed cleanup is never
-recoverable pressure, whatever the target's designation (P-14, VK-14). Both paths were proved on
-both drivers by VK-2 ([macOS](vulkan/macos.md#safe-abandonment),
-[Linux](vulkan/linux.md#safe-abandonment)); the KHR spelling of the release
-entry point resolves on neither, and the binding's call dispatches the EXT one.
+- **A skipped frame.** `skipFrame` is legal only for an acquired frame with
+  nothing submitted. Its recording is invalidated natively, then discharged;
+  a cleanup submission that runs no command waits on the acquisition
+  semaphore; once its fence has signalled, `progressFrames` returns the image
+  through `vkReleaseSwapchainImagesEXT` and supplies the frame's settlement.
+  The swapchain is not rebuilt.
+- **A submitted frame never presented.** `closeUnpresentedFrame` keeps its
+  submission and image. `progressFrames` waits for its submission's fence,
+  settles the render-finished semaphore through a tracked cleanup submission,
+  and only then returns the image.
+- A cleanup submission or release that raised retains the frame for ever,
+  never retried, fails the session with `CleanupFailed` and raises
+  `FrameCleanupFailed`. A failed cleanup is never recoverable pressure,
+  whatever the target's designation.
 
 ### Completion and the owner's step
 
 Only a fence a queue operation made pending is ever asked whether it has
 signalled, and only without waiting (`vkGetFenceStatus`), inside
 `progressFrames`. A signalled submission fence is the model's
-`SubmissionCompleted` fact: it discharges every hold the submission carried,
-unsignals the acquisition semaphores it waited on, and frees each slot that
-owes nothing else — but no presentation-pool record. A signalled present fence
-is the `PresentationRetired` fact ([Retirement
-evidence](#retirement-evidence)). A signalled cleanup fence, followed by a
-release that returned, is the `UnpresentedFrameSettled` fact. Nothing else —
-elapsed time, a returned call, a cancellation, a reset fence — ever becomes any
-of them. The completion is also appended, in that same transaction, to a log
-(`readCompletedSubmissions`, `takeCompletedSubmissions`) a consumer reads
-without depending on the step's return: a step that raises after recording one
-leaves it there, and a submission dropped as uncertain never enters it. A step makes
-at most the model's progress-action limit of native calls. Its work — each
-outstanding submission's fence, each cleanup owed, each cleanup fence — is one
-list that each step starts one place further along, so a budget smaller than
-the work still reaches every piece in turn and a fence that never signals
-cannot hold a later submission's completion, cleanup or release back; work the
-step itself creates is taken by a further pass while the budget lasts. A step
-runs whatever the target's phase — closing included — and raises only once it has recorded
-everything that returned: device loss first, then the first cleanup failure or
-uncertain effect. VK-12's native case polls it a millisecond apart and
-VK-13's drains through `awaitFrames`; the controller asks it only when the
-model's schedule says a poll is due or a frame is to be attempted
-([Polling completion](#polling-completion)).
+`SubmissionCompleted` fact; a signalled present fence is `PresentationRetired`;
+a signalled cleanup fence followed by a returned release is
+`UnpresentedFrameSettled`. Nothing else (elapsed time, a returned call, a
+cancellation, a reset fence) becomes any of them. Completions are also
+appended to a log (`readCompletedSubmissions`, `takeCompletedSubmissions`).
 
-### The protected handoff
+A step makes at most the model's progress-action limit of native calls and
+starts one place further along its work each time, so a fence that never
+signals cannot hold back a later one. It raises only after recording
+everything that returned: device loss first, then the first cleanup failure
+or uncertain effect.
 
-Each native effect and the bookkeeping of its result are one masked step:
-acquisition, the fence reset and the submission, the present fence's reset and
-the presentation, each cleanup submission, each fence observation, and each
-release. A cancellation is delivered only before the
-call or after its result is recorded, in the model and here, and it is then
-re-raised unchanged; it never undoes an effect or turns a pending fence into
-completion. No consumer code runs inside a handoff, and none is run again:
-recording is `recordFrame`'s, which runs its consumer exactly once, and a
-consumer that raised leaves its frame acquired and its batch partial, to be
-skipped. A step whose bookkeeping cannot commit enters the uncertain state and
-is never rolled back.
+**The protected handoff.** Each native effect and the bookkeeping of its
+result are one masked step. A cancellation is delivered only before the call
+or after its result is recorded; it never undoes an effect or turns a pending
+fence into completion. No consumer code runs inside a handoff.
 
 ### How the frames are built
 
-`Hetoimasia.GPU.Vulkan.Native.Frames` is the entry point and holds no code of
-its own: it re-exports what eight private modules under
-`Hetoimasia.GPU.Vulkan.Native.Internal.Frames` implement, as the recording's
-entry point does.
-
-| Module | Responsibility | Depends on |
-| --- | --- | --- |
-| `Layer` | The native layer's shape: `FrameOps`, what an acquisition and a presentation answer, a submission's batches and a presentation's request. No state, no call. | — |
-| `State` | The `Frames` and the five maps it holds; the answers, failures and views; and the uncertain-state step. | `Layer`, the recording's `State` |
-| `Acquisition` | `tryAcquireFrame`, the slot's synchronization, and binding the frame its presentation-pool record. | `Layer`, `State` |
-| `Submission` | `submitFrames`. | `Layer`, `State`, the recording's `Batches` |
-| `Presentation` | `presentFrame` and `classifyPresent`. | `Layer`, `State` |
-| `Abandonment` | `skipFrame`, `closeUnpresentedFrame`, `closeTargetFrames`, and the cleanup submission `Progress` also makes. | `Layer`, `State`, the recording's `Batches` |
-| `Loss` | `releaseFramesToDeviceLoss`. | `State`, `Abandonment` |
-| `Progress` | `progressFrames`, `awaitFrames` and `retireTargetFrames`. | `Layer`, `State`, `Abandonment`, `Loss` |
-
-`Frames.Vulkan` imports the public module. Every call it makes is the binding's
-own and `safe`: submission, acquisition, presentation, a fence's status, a
-finite fence wait and an image's release are driver-bound calls, not recording,
-so the audited `unsafe` subset is unchanged. The controller constructs no recording, and so no frames either:
-this module, like the recording, is driven on private roots by its native case,
-and the loop adapter that composes both into the controller's owner step is
-VK-16's.
+Eight private modules under `Internal.Frames`: `Layer`, `State`,
+`Acquisition`, `Submission`, `Presentation`, `Abandonment`, `Loss` and
+`Progress`. Every call the production layer makes is the binding's own and
+`safe`.
 
 ## Presentation and retirement
 
-VK-13 ([#227](https://github.com/coghex/hetoimasia/issues/227)) is
-presentation over the frames, and the retirement that follows from it: D-9's
-verified presentation-fence completion, D-15's bounded central lifetime
-enforcement, D-18's overlapping generations and D-23's separately settled
-abandonment, over P-2's frame ownership table, P-8's retirement beneath the
-attachment, P-14's classification by actual effect and P-15's budgets. The GPU
-model's public surface is unchanged: `enqueuePresentation`, its
-`PresentOutcome`s, the `PresentationRetired` fact and the derived pool capacity
-were already [its contract](gpu_model.md#frame-ownership), and this backend
-supplies the native evidence.
-
 ### Presentation
 
-`presentFrame frame` presents one submitted frame's image, one target image per
-native request, to the swapchain it was acquired from, on the session's one
-graphics queue. It refuses before any native call: another thread; a failed
-session, naming its primary failure (`RefusedSessionFailed`), which makes no
-new native effect — the frame's exit is its close; a frame this owner did not
-acquire, or that is not submitted, already presented
-or being abandoned (`WrongPhase FrameIdentity`); anything the model's
-`enqueuePresentation` would refuse, asked of a copy it then discards; and a pool
-record not bound to the frame, whose render-finished semaphore is not owed the
-submission's signal or whose present fence is pending. Nothing is made,
-reserved or waited for here: the pool record was reserved and bound with the
-frame, so presenting is never refused for capacity. The frame's rendering need
-not have completed — the presentation waits on the render-finished semaphore on
-the device, never on the host.
+`presentFrame frame` presents one submitted frame's image to the swapchain it
+was acquired from. It refuses before any native call on another thread, in a
+failed session, for a frame not submitted or already presented, and for
+anything the model would refuse. Presenting is never refused for capacity,
+because the pool record was reserved with the frame. The frame's rendering
+need not have completed: the presentation waits on the render-finished
+semaphore on the device.
 
-Then, in one masked step, the pool record's present fence is reset — only now,
-immediately before the one presentation it is passed to — and
-`vkQueuePresentKHR` presents the image waiting on the record's render-finished
-semaphore, with that fence chained through `VkSwapchainPresentFenceInfoEXT`
-(`VK_EXT_swapchain_maintenance1`), and what the call did is read and recorded
-before the step ends. A cancellation aimed at the owner is delivered only after
-that record exists. The call may block in the driver: the handoff promises a
-recorded outcome, never a prompt return, and it never interrupts the call
-(GUIDE-2, #211). Targets present independently: nothing about one target's
-presentation waits for, orders or refuses another's, and a presentation that is
-delayed — or never made — keeps its frame's obligations and pool record, and
-nothing else.
+In one masked step the pool record's present fence is reset and
+`vkQueuePresentKHR` presents the image with that fence chained through
+`VkSwapchainPresentFenceInfoEXT`. The call may block in the driver; the
+handoff promises a recorded outcome, never a prompt return. Targets present
+independently.
 
 ### What was enqueued
 
-The swapchain's own entry of `pResults` is the truth for the swapchain; the
-production layer starts it as `VK_RESULT_MAX_ENUM`, which no call writes, and
-reads it back — before re-raising anything the call raised — so an entry the
-call never wrote is read as unwritten, never as success. `classifyPresent`
-reads it with whether the call raised, and they must agree: a call that
-returned answers success or suboptimal for its one swapchain, and one that
-raised answers the error it raised with.
+The swapchain's own entry of `pResults` is the truth; the production layer
+starts it as `VK_RESULT_MAX_ENUM`, so an entry the call never wrote is read as
+unwritten, never as success.
 
-| The call | The swapchain's entry | What it means | What is recorded |
+| The call | The swapchain's entry | Meaning | Recorded |
 | --- | --- | --- | --- |
-| Returned | `VK_SUCCESS` | Enqueued | The model's presentation, `PresentationEnqueued`; the fence pending; the semaphore the presentation engine's |
-| Returned | `VK_SUBOPTIMAL_KHR` | Enqueued | The same, `PresentationEnqueuedSuboptimal`; a replacement coalesced in the model and reported to the generations (`SwapchainSuboptimal`), with none of the frame's synchronization reset |
-| Raised | `VK_ERROR_OUT_OF_DATE_KHR` | Enqueued: the specification keeps a rejected presentation's queue operations, and its semaphore waits happen | The same, `PresentationEnqueuedOutOfDate`; a replacement requested, reported as `SwapchainOutOfDate`, and rebuilt as [Replacement](#replacement) describes |
-| Raised | `VK_ERROR_SURFACE_LOST_KHR` | Enqueued, likewise | The same, `PresentationEnqueuedSurfaceLost`; a replacement requested in the model, reported as `SwapchainSurfaceLost`, and the surface [replaced](#replacing-a-lost-surface) once this presentation, and every other hold on its generation, has retired |
-| Raised out of memory | Out of memory, or unwritten | The specified no-effect case: nothing enqueued, and no present fence | Nothing but the fence, reset and never pending, and never waited on. The frame is still submitted, owning its image, semaphore and record. [Recovered once](#allocation-recovery): a reclamation pass, and the same frame presented once more only if the pass disposed of something; otherwise `PresentedNothing`, naming the original failure and the pass's evidence, and the frame can be presented again or closed |
-| Anything else | Unwritten, contradictory, device loss, or a result the profile does not classify | Unknown | The frame enters the uncertain state — retained for ever with its image, record and parents — admission stops, the session fails with `UnknownSubmissionEffect`, and `FrameEffectUncertain` is raised, or the device loss itself |
-
-A present fence whose reset raised presents nothing, but the fence is in doubt:
-it is retained for ever with its record, admission stops, the session fails with
-`CleanupFailed`, and the failure is re-raised; the frame can still be closed.
-The rows other than success and suboptimal are specification obligations, not
-behaviour VK-2 observed on both profiles — its record names them as
-specification rows — and the headless examples inject each one.
+| Returned | `VK_SUCCESS` | Enqueued | `PresentationEnqueued`; the fence pending |
+| Returned | `VK_SUBOPTIMAL_KHR` | Enqueued | `PresentationEnqueuedSuboptimal`; a replacement requested |
+| Raised | `VK_ERROR_OUT_OF_DATE_KHR` | Enqueued: a rejected presentation's queue operations still happen | `PresentationEnqueuedOutOfDate`; a replacement requested |
+| Raised | `VK_ERROR_SURFACE_LOST_KHR` | Enqueued, likewise | `PresentationEnqueuedSurfaceLost`; the surface replaced once every hold on its generation has retired |
+| Raised out of memory | Out of memory, or unwritten | Nothing enqueued | The frame is still submitted; one allocation recovery, otherwise `PresentedNothing` |
+| Anything else | Unwritten, contradictory, device loss, or unclassified | Unknown | The frame enters the uncertain state; the session fails with `UnknownSubmissionEffect` |
 
 ### The presentation pool
 
-Each target owns a presentation pool (P-2): records of a **render-finished
-semaphore** and a **present fence**, made together the first time the pool
-needs another record, named from the target and record (`poolObjectName`) when
-the device offers naming, and bound to a frame at its reservation — before its
-acquisition — so its rendering has a semaphore to signal and its presentation a
-fence to chain whatever the budgets say later. A record serves one owner at a
-time (`PoolHolder`): free, the frame reserved with it, and then the presentation
-enqueued with it. It is bound only while its semaphore is unsignalled with no
-wait outstanding and its fence is not pending, and it is freed only when the
-model lets go of the pool record it served: when its present fence signalled,
-or at the explicit settlement of a frame that was never presented — a skipped
-one, a closed one, or one whose presentation enqueued nothing — never because
-the frame's rendering completed, never by a timeout, and never because its image
-was acquired again. A reservation given back — not ready, a timeout, out of date
-— frees it untouched.
+Each target owns a pool of records, each a render-finished semaphore and a
+present fence, bound to a frame at its reservation. A record serves one owner
+at a time and is freed only when its present fence signalled or at the
+explicit settlement of a frame never presented. It is never freed because the
+frame's rendering completed, by a timeout, or because its image was acquired
+again.
 
-The pool's capacity is the model's derived `presentationPoolCapacity`, the
-overflow-checked sum of the image tracking limit and the frame-slot count — 18
-by default — validated with P-15's other budgets before a model exists. A
-target's retired generations' pending records count against the same capacity
-as its active generation's; no generation receives a pool of its own. An
-acquisition the pool cannot serve answers
-`AcquisitionPending (PendingBackpressure PresentationPoolBudget)` before any
-native call, and a retirement makes room without the pool growing. Cleanup
-never needs a record: a frame's abandonment uses the record it already holds.
-
-A new acquisition of an image whose older presentation is still pending takes a
-free record, with no host wait on the older present fence; the older record is
-neither retired, recycled nor discharged by it, and still names its own image.
-The new acquisition's own semaphore still orders the image's use on the device.
+The capacity is the model's derived `presentationPoolCapacity` (the image
+tracking limit plus the frame-slot count, 18 by default), shared by the
+target's active and retired generations. A new acquisition of an image whose
+older presentation is still pending takes a free record with no host wait on
+the older fence.
 
 ### Retirement evidence
 
-A presentation retires only when its own present fence is observed signalled:
-by a non-blocking `vkGetFenceStatus` in `progressFrames`, or after
-`awaitFrames`' finite drain wait, whose wait is not itself the evidence. That
-observation — and nothing else — is the model's `PresentationRetired` fact: it
-discharges the generation's presentation hold, frees the pool record, whose
-semaphore the presentation engine has finished with, and completes the
-presentation half of the target's retirement cycle, matched to it by identity.
-A status query that answers not ready is simply pending: what a fence answered
-before is never read into it, and no status is assumed, before or after a wait.
-A signalled render fence completes the submission and frees the frame's slot,
-and frees no presentation object. A present fence only proves the
-presentation's resource-retirement condition; it says nothing about when the
-image reached the screen.
+A presentation retires only when its own present fence is observed signalled,
+by a non-blocking status query or after `awaitFrames`' finite wait. That
+observation is the `PresentationRetired` fact: it discharges the generation's
+presentation hold and frees the pool record. A present fence proves the
+presentation's resource-retirement condition only; it says nothing about when
+the image reached the screen. A wait that timed out changes nothing.
 
-A status query that raised retains the presentation for ever — its record, its
-pool record and its generation's hold — fails the session with `CleanupFailed`,
-and raises `PresentationUncertain` once the step has recorded everything else;
-the presentation is never asked again.
-
-`awaitFrames now timeout` waits at most the timeout, and never longer than
-`drainWaitLimit` — P-15's 10 ms — for the first pending fence of the step's work
-(`vkWaitForFences` on that one fence), then runs `progressFrames`. It waits on
-nothing when nothing is pending, and a wait on a fence has no effect on it. A
-wait that timed out leaves every obligation, pool record and retirement exactly
-as it was: a timeout is a scheduling outcome. The owner may call it where a
-protected drain would otherwise spin.
+A status query that raised retains the presentation for ever, fails the
+session with `CleanupFailed`, and raises `PresentationUncertain`.
 
 ### Incremental retirement
 
-Retired generations retire incrementally, from verified fences alone. Once the
-model reports every hold on a retired generation ended — its presentations'
-among them — the owner's next generations step destroys its views and
-swapchain, bounded to the model's progress-action limit of generations a step
-and taken one of each target's in turn, starting one target further along each
-step, so no target's backlog delays another's. Nothing waits for the device to
-go idle.
-
-A closing window retires the same way. Its frames are closed
-(`closeTargetFrames`) — acquired ones skipped, submitted ones closed unpresented
-— and its presentations stay until their own present fences are observed.
-`retireTargetFrames` then destroys its slots' and its pool's synchronization,
-and raises `FramesRetained`, naming the frames, presentations and records that
-remain, until then; `retireTargetGenerations` raises `GenerationsRetained` while
-any generation's hold remains, which keeps the surface, and so the attachment's
-terminal retirement fact, withheld from the protected host through #219's
-controller path. Closing the first-created target retires only its own frames,
-presentations, generations and surface: the shared device, the instance and
-every other target stay live, and another target keeps presenting throughout.
-The controller meets exactly this order: its retirement of a target is owed
-until the evidence has arrived ([Retiring a target](#retiring-a-target)), so
-it withholds nothing by raising and retries nothing.
+Retired generations are destroyed incrementally, from verified fences alone,
+rotating across targets. Nothing waits for the device to go idle. A closing
+window retires the same way: its frames are closed, its presentations stay
+until their own fences are observed, `retireTargetFrames` raises
+`FramesRetained` and `retireTargetGenerations` raises `GenerationsRetained`
+until then, which withholds the attachment's terminal retirement fact. Closing
+the first-created target retires only its own frames, generations and surface.
 
 ## Recovery
 
-VK-14 ([#229](https://github.com/coghex/hetoimasia/issues/229)) acts on what the
-earlier slices only reported: a lost surface, an episode spent, and a native
-allocation that ran out of memory. It is D-18, D-22, D-24 and D-25 over P-14's
-operation table and P-15's budgets. Allocation reclamation and swapchain
-replacement live in the native package; surface replacement on the live
-window, which needs the main thread, is orchestrated by the controller. The GPU
-model's public surface gains one transition, `declareTargetUnrecoverable`
-([its contract](gpu_model.md#recovery)); everything else was already the
-model's.
+Recovery acts on a lost surface, a spent episode, and a native allocation that
+ran out of memory. Allocation reclamation and swapchain replacement live in
+the native package; surface replacement on the live window, which needs the
+main thread, is orchestrated by the controller.
 
-### The episode as delivered
+### The episode
 
 Every recovery a target makes spends its one episode, which the model owns
-([Recovery](gpu_model.md#recovery)): at most three construction attempts, the
-second 100 ms after the first failure and the third 500 ms after the second, on
-the owner's monotonic clock, with one attempt in flight at a time and
-exhaustion decided at the last failure. A deferred attempt is a deadline the
-generations name (`RecoveryWaiting`), so the owner takes the round it falls
-due in and never polls or loops hot.
+([gpu_model.md](gpu_model.md#recovery)): at most three attempts, 100 ms then
+500 ms apart, one in flight at a time. A deferred attempt is a deadline the
+generations name, so the owner never polls hot.
 
 | What happens | Is it an attempt? |
 | --- | --- |
-| An ordinary resize, however often the geometry moves | No: it is coalesced for 16 ms and built as a replacement ([Replacement](#replacement)) |
+| An ordinary resize | No: coalesced and built as a replacement |
 | An out-of-date or suboptimal result with unchanged geometry | Yes, each rebuild |
-| A construction after one that failed, a window still in use (`VK_ERROR_NATIVE_WINDOW_IN_USE_KHR`) included | Yes: the next attempt of the same episode, never a new one |
-| A lost surface's replacement, from asking for the surface to publishing a generation on it | Yes, one attempt; a construction on the new surface that fails spends the next |
-| Waiting for an unretired swapchain or a lost surface's generations to go | No: nothing is admitted until they have gone |
+| A construction after one that failed (`VK_ERROR_NATIVE_WINDOW_IN_USE_KHR` included) | Yes: the next attempt of the same episode |
+| A lost surface's replacement, from asking to publishing a generation on it | Yes, one attempt |
+| Waiting for an unretired swapchain or a lost surface's generations to go | No |
 | A zero-area or ineligible target | No: suspended |
-| An allocation's own retry after reclamation | No: it is inside the attempt that made the allocation, and reaches no episode accounting |
-
-Nothing replenishes the budget but what the model counts: a completed
-presentation-retirement cycle after a successful recovery, and a healthy second
-after that. A changed framebuffer observation, a nested retry, repeated loss,
-and an allocation's retry all count on from where the episode stands.
+| An allocation's own retry after reclamation | No |
 
 ### Replacing a lost surface
 
-A surface is lost when a swapchain call on the target's active generation
-answers `VK_ERROR_SURFACE_LOST_KHR` — an acquisition, which gives its
-reservation back, pool record included, or a presentation, which was enqueued
-all the same — reported as `SwapchainSurfaceLost`, which outranks every other
-result; or when the surface's capability query or a swapchain's creation
-raises it. The loss is the surface's, so it is taken from any generation the
-target still tracks — a late presentation on a generation already retired
-included — and, once the surface is being recovered, a late report about it
-changes nothing and never reaches the replacement. Then, on the owner's thread:
+A surface is lost when a swapchain call, the capability query or a swapchain
+creation answers `VK_ERROR_SURFACE_LOST_KHR`. Then, on the owner's thread:
 
-1. **Admission stops.** The reconciliation retires the active generation there
-   and then, and builds nothing on the surface again. Acquisition answers
-   `AcquisitionPending PendingSurfaceLost` without a native call; the target
-   stays admitted, and every other target, the device and the instance are
-   untouched.
-2. **Old dependents retire on their own evidence.** Acquired and submitted
-   frames settle and presentations retire through the frames, and the retired
-   generation is destroyed once its holds end, as any retired generation is.
-   Nothing is waited on and nothing is replayed.
-3. **The lost surface goes, then an attempt begins.** Once no generation of the
-   target remains, the roots destroy the lost surface and keep the target
-   (`releaseRootSurface`) — its identity, its designation and, above it, the
-   window's attachment, which is never released or reattached. Only then does
-   the episode admit an attempt (`SurfaceReplacing`); a deferred one waits for
-   its deadline, and a spent one is disposed of through the designation.
-4. **The main thread creates the replacement.** The step answers the targets
-   that now want a surface (`summarySurfacesWanted`); the controller asks the
-   main thread for each and wakes it. That holds for every step that can admit
-   an attempt: the owner's own, and the one another target's retirement runs
-   when its poll is due, which can release this target's lost surface too. An
-   attempt already outstanding asks nothing more. `replaceVulkanSurfaces`, on
-   the main thread, creates the surface through the bridge's admitted replacement
-   (`replaceWindowSurface`, [#216](https://github.com/coghex/hetoimasia/issues/216))
-   under that same attachment, and deposits what it created.
+1. **Admission stops.** The active generation is retired and nothing is built
+   on the surface again. Acquisition answers
+   `AcquisitionPending PendingSurfaceLost`. The target stays admitted; every
+   other target, the device and the instance are untouched.
+2. **Old dependents retire on their own evidence.** Nothing is waited on and
+   nothing is replayed.
+3. **The lost surface goes, then an attempt begins.** Once no generation of
+   the target remains, the roots destroy the lost surface and keep the target
+   and, above it, the window's attachment, which is never released or
+   reattached. Only then does the episode admit an attempt
+   (`SurfaceReplacing`).
+4. **The main thread creates the replacement.** The controller asks the main
+   thread, and `replaceVulkanSurfaces` creates the surface through the
+   bridge's `replaceWindowSurface` under the same attachment.
    `runVulkanOwnerLoop` runs it every turn; an application that drives its own
-   loop runs it, as it publishes observations.
-5. **Support is rechecked, then a fresh generation is built.** The owner's next
-   step offers the surface to the generations (`offerReplacementSurface`). The
-   roots ask `vkGetPhysicalDeviceSurfaceSupportKHR` of the session's one queue
-   family and install it (`installRootSurface`), and the next step builds a
-   fresh generation on it — handing nothing over — whose publication settles
-   the attempt as a success, or whose failure spends the next. A loss the
-   replacement's own query reports before then fails that attempt with it, so
-   the episode admits the next, or is spent.
+   loop runs it itself.
+5. **Support is rechecked, then a fresh generation is built** on it, handing
+   nothing over. Its publication settles the attempt as a success; its failure
+   spends the next.
 
 | What the replacement came to | What happens |
 | --- | --- |
-| Installed | `ReplacementInstalled`; the surface is the roots', and a step is owed at once |
-| The device's queue family cannot present to it | `ReplacementUnsupported`; the surface is destroyed on the owner's thread, the attempt fails, and the target is declared unrecoverable: [disposed of through its designation](#required-and-optional-dispositions). No second device or queue is made, and nothing migrates |
-| Installed, but it cannot serve the presentation profile | `PresentationUnsupported`, naming every gap; the attempt fails and the target is declared unrecoverable, disposed of through its designation, as one the device cannot present to is |
-| Created unusable, or not created | The attempt fails, the unusable surface is destroyed, and the episode schedules the next |
-| The bridge refused it | The window is closing, the attachment retiring or the lease releasing: close is coming, and the attempt is left for the target's retirement to settle. If the owner's view shows the target still eligible, the attempt fails instead, rather than waiting for a close that is not coming |
-| Its support query or naming raised | The surface is destroyed and the attempt fails; device loss and a cancellation stay the owner's |
+| Installed | `ReplacementInstalled`; a step is owed at once |
+| The queue family cannot present to it | `ReplacementUnsupported`; the surface is destroyed and the target is declared unrecoverable |
+| It cannot serve the presentation profile | `PresentationUnsupported`; the target is declared unrecoverable |
+| Created unusable, or not created | The attempt fails; the episode schedules the next |
+| The bridge refused it | Close is coming: the attempt is left for the target's retirement, unless the target is still eligible, in which case it fails |
+| Its support query or naming raised | The surface is destroyed and the attempt fails |
 
-**Close wins.** A target that has begun retiring asks for nothing and is offered
-nothing: a replacement that arrives after the close stays its creator's and is
-destroyed (`ReplacementNotWanted`), and the target's retirement settles an
-attempt still outstanding, whose failure then decides nothing. A replacement the
-main thread is creating at the moment the attachment retires is waited for —
-its native call is finite and owes the owner nothing — so its surface is on the
-lease before the retirement sweeps it. A construction completed after the close
-is retired rather than published, as [before](#failure-and-close).
-
-**Unproven rollback forbids the next attempt.** A lost surface whose
-destruction did not complete is retained, never attempted again, fails the
-session with `CleanupFailed`, and raises `SurfaceDestructionFailed`; so does a
-partial replacement whose candidate could not be destroyed
-(`GenerationDestructionFailed`). Either retains the target's parents, and no
-attempt is admitted in a failed session.
-
-### The retired chain
-
-A replacement that handed the active generation over as `oldSwapchain` retired
-it whatever the creation answered — `VK_ERROR_NATIVE_WINDOW_IN_USE_KHR` and out
-of memory included — and it is never named again. The next construction is a
-fresh one, with a null `oldSwapchain`, and it begins only once every swapchain
-of the target Vulkan still counts as unretired has been destroyed: the retired
-chain's images are finished or abandoned, it is destroyed, and only then is the
-fresh creation made. A window still in use at that fresh creation is an
-ordinary failed attempt of the same episode, never a reason to create before
-the destruction. The native rules are the proof record's
-([macOS](vulkan/macos.md), [Linux](vulkan/linux.md)); the headless examples
-inject them.
+Close wins: a retiring target asks for and is offered nothing, and a
+replacement that arrives after the close is destroyed
+(`ReplacementNotWanted`). A lost surface or partial replacement whose
+destruction did not complete is retained, never attempted again, and fails the
+session with `CleanupFailed` (`SurfaceDestructionFailed`,
+`GenerationDestructionFailed`).
 
 ### Required and optional dispositions
 
-A target whose episode is spent (`RecoverySpent`), or whose replacement surface
-the device cannot present to or that cannot serve the profile, is disposed of through the designation the
-application gave it (D-22):
+A target whose episode is spent, or whose replacement surface cannot be
+presented to or cannot serve the profile, is disposed of through its
+designation:
 
-- **Optional** — the model marks it unavailable and the session continues. Its
-  generations retire as their holds end, and every other target keeps
-  presenting on the same device. The controller reports it once, by
-  attachment: `readVulkanUnavailability` answers the target and why —
-  `UnavailableRecoverySpent`, `UnavailableSurfaceUnsupported` or
-  `UnavailablePresentationUnsupported` — and an
-  application waits on it in `STM`; the most recent 64 are kept. The native
-  window is not closed and its destruction is not authorized: the attachment
-  stays until the application releases it and its retirement is safe. A target
-  that holds nothing more once it is unavailable is forgotten by the model's
-  next progress turn, which is why the report is read from the model's
-  escalation and not from the target's phase.
-- **Required** — the model fails the graphics session
-  (`RequiredTargetUnrecoverable`), and the owner's step checkpoints the roots,
-  which latch it in the terminal report ([Terminal failure](#terminal-failure)).
-  When it is the primary, the step raises `VulkanRequiredTargetFailed` naming
-  each such target; when a diagnostic failure came first, that primary is
-  raised instead and the exhaustion joins the evidence behind it. Either ends
-  the owner's run and reaches the application's checkpoints like any other
-  owner failure ([VK-18](glfw.md#the-supervised-graphics-owner)). The ordinary
-  all-exit retirement follows.
+- **Optional.** The model marks it unavailable and the session continues;
+  every other target keeps presenting. `readVulkanUnavailability` answers the
+  target and why (`UnavailableRecoverySpent`, `UnavailableSurfaceUnsupported`,
+  `UnavailablePresentationUnsupported`); the latest 64 are kept. The native
+  window is not closed: the attachment stays until the application releases
+  it.
+- **Required.** The model fails the session (`RequiredTargetUnrecoverable`),
+  the roots latch it, and the step raises `VulkanRequiredTargetFailed` (or an
+  earlier diagnostic primary), which ends the owner's run.
 
 Device loss, a validation error, an unknown effect and a failed cleanup are
-never recoverable pressure: they escalate to the session whatever the target's
-designation, as they always have.
+never recoverable pressure, whatever the designation.
 
 ### Allocation recovery
 
-D-25's one bounded reclamation pass and at most one retry, only where retrying
-is proven safe — the operation-specific no-effect results, and constructions
-whose rollback is complete — and nowhere else:
+One bounded reclamation pass and at most one retry, only where retrying is
+proven safe:
 
-| Operation that ran out of memory | Why a retry is safe | What is retried |
-| --- | --- | --- |
-| `vkQueueSubmit2` | The specified no-effect result | The same request, its batches as sealed |
-| `vkQueuePresentKHR` | The specified no-effect result, read from the swapchain's entry | The same frame's presentation |
-| A managed resource's creation | A creation that raised created nothing; a composite one destroyed what it made before raising | The same creation, for the same allocation attempt |
-| A readback's allocating VMA call | VMA destroyed what the call made, and the call's effect was settled, its reservation returned | The whole allocation protocol once more: held memory first, then a fresh reservation ([Device memory](#recovery)) |
-| A swapchain's creation that handed nothing over, or an image view's | A creation call that raised created nothing | That call |
-| A frame slot's or a pool record's semaphore or fence | A creation call that raised created nothing; if its recovery does not succeed, the objects made before it are destroyed before the failure is raised | That call |
-| A swapchain's creation that handed a generation over | Never: that call retired the generation whatever it answered | Nothing; the construction fails into the episode's fresh construction |
+| Operation that ran out of memory | What is retried |
+| --- | --- |
+| `vkQueueSubmit2` (specified no-effect result) | The same request, its batches as sealed |
+| `vkQueuePresentKHR` (no-effect result read from the swapchain's entry) | The same frame's presentation |
+| A managed resource's creation | The same creation |
+| An allocating VMA call | The whole allocation protocol |
+| A swapchain creation that handed nothing over, an image view's, a semaphore's or fence's | That call |
+| A swapchain creation that handed a generation over | Nothing: that call retired the generation whatever it answered |
 
-Configured-capacity exhaustion is backpressure, answered before any native
-call, and starts no recovery. For each failure:
-
-1. **The attempt.** The operation's model allocation attempt — the managed
-   resource's own, or one accounted for the recovery's duration — records the
-   failure, and notes a generation the construction already retired as
-   `oldSwapchain`. When the object budget is full — exactly when reclaiming
-   matters — the recovery runs with no attempt to account, and its one retry
-   is judged by the same rules the model's attempt applies; a session that has
-   failed admits no recovery at all.
-2. **One pass.** The model's `reclaimPass` decides the window: at most the
-   configured number of generation and managed-resource records, ineligible
-   ones included, from a cursor it carries from pass to pass. The subjects
-   eligible in that window are offered to the layer that owns each — the
-   generations and the recording each register a disposer with the roots when
-   they are made — which destroys it natively, child before parent, each
-   destruction recorded in its own masked step, or declines when something
-   above it still stands. Then the pass records what each destruction did.
-   Nothing waits for unfinished work, and nothing but a destruction that
-   returned is progress.
-3. **At most one retry.** `retryAllocation` permits the attempt's one retry
-   only after a disposal completed since the failure, never after the
-   construction retired a generation as `oldSwapchain`, and never in a failed
-   session — so a disposal that failed, which escalates the session, forbids it
-   however much else the pass reclaimed. Each failed disposal is latched once,
-   as a cleanup failure naming its subject.
-
-No progress, a failed disposal, a refused retry or a second failure ends the
-recovery and reports the original failure with the pass's evidence — what it
-examined, disposed of and failed to dispose of, and how it ended: as
-`AllocationNotRecovered` from a construction, and in `SubmittedNothing` or
-`PresentedNothing` from a submission or a presentation. Every attempt, the
-retry included, runs through the roots' guard, so device loss latches wherever
-it is raised; and what the retry raised that means more than a failed retry —
-device loss, a cancellation, a lost surface, a window still in use — is
-re-raised as itself, so the construction acts on it as it would on a first
-failure.
+Configured-capacity exhaustion is backpressure and starts no recovery. The
+pass (`reclaimPass`) offers the eligible subjects in its window to the layer
+that owns each, which destroys them child before parent. Nothing waits for
+unfinished work. `retryAllocation` permits the one retry only after a disposal
+completed since the failure, never after the construction retired a generation
+as `oldSwapchain`, and never in a failed session. Otherwise the original
+failure is reported with the pass's evidence: `AllocationNotRecovered`,
+`SubmittedNothing` or `PresentedNothing`.
 
 ### What recovery never does
 
@@ -4165,2961 +1463,583 @@ It never replays a consumer callback or submitted work, evicts a live
 generation, takes another target's reservations or budget, retries a failed
 cleanup, recreates the device, migrates a target to another device, or changes
 resolution, quality or frame capacity. It never closes or destroys a window,
-and never releases or reattaches an attachment to reach the bridge.
-
-### How recovery is built
-
-| Module | Responsibility |
-| --- | --- |
-| `Internal.Generations.Reconciliation` | Reads a surface-lost result, and the surface loss the capability query or a creation raises, retiring the active generation; recovers a swapchain's and a view's creation that ran out of memory |
-| `Internal.Generations.Surface` | `releaseLostSurfaces`, run by `stepGenerations` after reconciliation; `offerReplacementSurface` and `replacementSurfaceFailed` |
-| `Internal.Generations.Disposal`, `Internal.Recording.Disposal` | Make the generations and the recording, registering each one's disposer with the roots |
-| `Internal.Reclamation` | `reclaimOnce`, `recoverAllocation` and `recoveringCreation`, over the roots' disposers and the model's allocation attempt |
-| `Roots` | `releaseRootSurface`, `installRootSurface`, the `NativeFailure` classifier and the disposer registry |
-| The controller | Asking for and settling replacements, `replaceVulkanSurfaces` on the main thread, the unavailability report and `VulkanRequiredTargetFailed` |
+and never releases or reattaches an attachment.
 
 ## The composed loop
 
-VK-16 ([#232](https://github.com/coghex/hetoimasia/issues/232)) composes the
-graphics owner's rendering with the main thread's scheduled owner loop, TIME's
-deadlines and LIFE's retirement. There is still one engine loop: the main
-thread runs the GLFW package's `runScheduledOwnerLoop`, and the graphics owner
-is the supervised worker [VK-18](glfw.md#the-supervised-graphics-owner) already
-runs. What VK-16 adds is what crosses between them every turn, and what the
-owner's step does with it.
+There is one engine loop: the main thread runs the GLFW package's
+`runScheduledOwnerLoop`, and the graphics owner is the supervised worker
+([glfw.md](glfw.md#the-supervised-graphics-owner)).
 
 ### The loop adapter
 
-`runVulkanOwnerLoop` is `runScheduledOwnerLoop` over the host's window host
-with the application's own `ScheduledHooks`, and one addition to every turn.
-Once the application's update opportunity has returned, the main thread:
+`runVulkanOwnerLoop` is `runScheduledOwnerLoop` with one addition to every
+turn. After the application's update, the main thread:
 
-1. **publishes observations** — for every window with an attachment, the
-   window's latest `WindowObservation` and the render eligibility the main
-   thread classified it as (`windowRenderEligibility`), whenever it is newer
-   than the one last published for that attachment;
-2. **publishes render demand** — it captures every such window's demand slot,
-   which is the acknowledgement the slot's publisher is owed, combines the
-   requests, and publishes them to the owner's demand snapshot. The snapshot
-   keeps only its latest value, so what was published and not yet taken into
-   an owner step (`readOwnerDemandTaken`) is kept and published again with
-   anything newer: a newer publication never replaces demand the owner has not
-   seen. Once taken, it is forgotten. A closed snapshot — the owner's admission
-   has ended — settles it, since nothing will render it;
-3. **creates replacement surfaces** the owner asked for
-   (`replaceVulkanSurfaces`, [Recovery](#recovery));
-4. **folds the owner's deadline** into the schedule the application's update
-   answered: the earliest absolute instant the owner last published, when it
-   is still ahead, bounds the turn's wait. It can shorten the main loop's wait
-   and never lengthen it: `NoUpdateDemand` becomes `UpdateBy` it, an earlier
-   `UpdateBy` stays, and `UpdateImmediately` stays. A deadline that has already
-   passed is left out: the owner schedules its own rounds, wakes the host after
-   each, and needs none of this to be read.
+1. **publishes observations**: each attached window's latest
+   `WindowObservation` and render eligibility, when newer than the last
+   published;
+2. **publishes render demand**: it captures every such window's demand slot,
+   combines the requests and publishes them to the owner's demand snapshot.
+   Demand published and not yet taken into an owner step is published again
+   with anything newer, so a newer publication never replaces demand the owner
+   has not seen;
+3. **creates replacement surfaces** the owner asked for;
+4. **folds the owner's deadline** into the schedule: it can shorten the main
+   loop's wait and never lengthen it.
 
-None of it waits: every handoff is a latest-value snapshot or a non-blocking
-capture, and the main thread performs no GPU work. An application that runs
-this loop leaves observation publication and window demand capture to it — an
-observation published by hand at a higher revision would make the adapter's
-stale, and a slot the application captured itself would never reach the
-owner. A scene may be published from any application thread with
-`publishVulkanScene`.
+None of it waits, and the main thread performs no GPU work. An application
+that runs this loop leaves observation publication and window demand capture
+to it. A scene may be published from any thread with `publishVulkanScene`.
 
 ### What asks for a frame
 
-The owner's step is handed the latest demand and scene with the revisions of
-their publications (`stepDemandRevision`, `stepSceneRevision`), so two equal
-publications are two requests. Each constructed target records the latest
-revisions a step has considered for it, so a publication made before a target
-could take it — a first redraw arriving with its handover, taken by a round
-that had no target constructed yet — is still its request once it is
-constructed. A target is asked for a frame — the model's `requestRender`, which
-is also what restarts the idle backoff, and which supersedes any retry pending
-for it — when
+Each step is handed the latest demand and scene with their publication
+revisions, so two equal publications are two requests. A target is asked for
+a frame (the model's `requestRender`) when:
 
-- a demand publication the owner has not acted on is due: immediate, or with a
-  deadline that has come; one still ahead is kept and asked for when it comes,
-  and the owner's deadline includes it. One publication can carry both parts —
-  two windows captured in one turn, one asking now and one by a later
-  deadline — and both are kept: the request now is served at once, and the
-  deadline when it comes. A held deadline that comes while no target is
-  constructed stays held until one is;
-- a scene publication the owner has not rendered arrives: the renderer renders
-  the latest scene, whichever application thread published it (D-31). In a
-  host with a scene for each window the publication is the target's own
-  window's, so it asks that window's target for a frame and no other's
-  ([A scene for each window](#a-scene-for-each-window)); or
+- a demand publication the owner has not acted on is due (immediate, or its
+  deadline has come);
+- a scene publication the owner has not rendered arrives (in a per-window
+  host, only that window's target);
 - a target that has presented before can no longer be showing the latest
-  scene: its active generation is not the one its last presentation went to,
-  or it has become eligible again after a suspension. A generation it moved to
-  is asked for once, however many rounds pass before a frame of it is
-  presented, so a frame refused meanwhile keeps its retry's pacing. And since
-  the step plans its frames before the generations' step, a replacement that
-  step publishes — a quiet target's, whose one allowed generation was disposed
-  of in that same step with nothing left owed — is asked for then and offered a
-  frame in the same step. A target already due in that step is offered its
-  frame on the replacement, and the replacement is recorded as asked for it
-  too.
+  scene: its active generation changed, or it became eligible again after a
+  suspension.
 
-Nothing else asks. A target nobody asked a frame of is never rendered to,
-however its generations change, so a host whose application publishes neither
-demand nor a scene presents nothing, exactly as before VK-16.
-
-Eligibility alone asks a target that has never presented for nothing: the
-"eligible again after a suspension" case above is only for a target that
-presented before. A target that has never presented is asked for its first
-frame by a fresh demand publication, a scene publication or a capture request,
-and only by one, and each of those supersedes a retry pending for it. A retry
-already scheduled for it stands unless such a request supersedes it. So when
-the owner takes the first demand of a target before it has folded the window's
-observation that makes the target eligible, the frame offered is refused
-(`AcquisitionSuspended`, see [Rendering a frame](#rendering-a-frame)), becoming
-eligible asks nothing, and the first frame waits for that retry, one backoff
-interval after the step's own instant. The interval (5 ms by default) is
-measured on the owner's clock from that instant, so it is not a guaranteed
-wall-clock delay: the owner's clock decides when the retry comes due.
+Nothing else asks. A host whose application publishes neither demand nor a
+scene presents nothing. A target that has never presented is asked for its
+first frame only by a demand publication, a scene publication or a capture
+request; eligibility alone asks nothing. If the owner takes a target's first
+demand before it has folded the observation that makes the target eligible,
+the frame is refused and the first frame waits for the retry, one backoff
+interval (5 ms by default) later on the owner's clock.
 
 ### A scene for each window
 
-R2D-14 ([#423](https://github.com/coghex/hetoimasia/issues/423); D-18, D-28 and
-D-30 of [the 2D renderer's design](designs/render_2d_design.md)) lets an
-application give each window a scene of its own. It is a generic extension of
-the window host and knows nothing of `render-2d`: what a snapshot references,
-and holding it, are the adapter's that renders it.
+An application can give each window a scene of its own. This is a generic
+extension of the window host: what a snapshot references, and holding it, are
+the rendering adapter's. The lifecycle, the barrier and the observation are
+keyed by `SceneTargetKey`, a window or a registered
+[offscreen target](#offscreen-scene-targets).
 
-A window is one kind of scene target. Since LFE-27 the lifecycle, the barrier and
-the observation are keyed by `SceneTargetKey`, a window or an offscreen target
-registered with the host ([Offscreen scene targets](#offscreen-scene-targets)); a
-host that registers no target behaves exactly as this section describes.
+**The mode.** `vulkanSceneMode` chooses once; `vulkanScene` is the initial
+scene either way.
 
-**The mode.** `vulkanSceneMode` chooses, once, how the owner carries the
-scene, and `vulkanScene` is the initial scene either way.
+- `SharedScene` (default): one latest-value snapshot serves every target, and
+  `publishVulkanScene` publishes it.
+- `PerWindowScenes`: one snapshot per window, keyed by `WindowId`, not by an
+  attachment. `publishVulkanScene` is refused (`SceneRefusedPerWindow`). Each
+  window starts with the initial scene at revision 0, and the renderer is
+  handed its window's scene and revision (`requestSceneRevision`).
 
-- `SharedScene`, the default, is the owner as it has always been. One
-  latest-value snapshot serves every target; `publishVulkanScene` publishes it
-  and a newer one is rendered to every eligible target. Nothing about a host
-  that does not ask changes.
-- `PerWindowScenes` carries one snapshot for each window, keyed by the window's
-  `WindowId` and not by an attachment. `publishVulkanScene` is refused
-  (`SceneRefusedPerWindow`) and publishes nothing. Each window starts with
-  `vulkanScene` at revision 0, and the renderer is handed the scene of the
-  window whose target it is rendering, with that window's revision as
-  `requestSceneRevision`.
+**Publishing.** `publishVulkanWindowScene host window scene` publishes from
+any thread, never waits, and replaces the window's publication if the owner
+has not taken it. Revisions count per window from 1. The publication survives
+the window's surface being recreated or reattached. It answers
+`WindowScenePublished`, `WindowSceneUnknown`, `WindowSceneClosed` or
+`WindowScenesNotEnabled`. A window's unrendered publication asks that window's
+target alone for a frame.
 
-**Publishing.** `publishVulkanWindowScene host window scene` publishes from any
-application thread as a latest-value snapshot for the window: it never waits,
-and it replaces that window's publication if the owner has not taken it. The
-window's first publication is revision 1 and each accepted one is the next, for
-that window alone. Because the snapshot is the window's, it survives the
-window's surface being recreated, and a window detached and attached again
-adopts the publication its predecessor held. The answer names the window
-(`WindowScenePublication`): `WindowScenePublished window revision`;
-`WindowSceneUnknown window` for a window the host does not hold — never
-created, or retired — which changes nothing; `WindowSceneClosed window` once
-the owner's publications have closed; and `WindowScenesNotEnabled window` in a
-shared host. The windows the host holds are read in the transaction that
-publishes, so a window that has ended is never accepted a scene afterwards. The
-owner forgets the publication of a window the host no longer holds at its next
-round, so the table is bounded by the host's windows.
+**Adoption.** A target adopts its window's scene in the owner's step, before
+anything else the step does and whether or not a frame is rendered, when the
+window's revision is newer than the one it holds or it holds none. Adopting
+asks for no frame. A revision replaced before a step takes it is never
+adopted, notified or released.
 
-**What asks for a frame.** A window's unrendered publication asks that window's
-target alone. Every other target's demand, pacing and generation-driven
-requests are unchanged, and a target created after a publication — a window
-reattached — is asked for a frame of the publication it never rendered, as a
-fresh target is in a shared host. An idle owner wakes for any window's
-publication.
-
-**Adoption.** A target *adopts* the scene of its window in the owner's step,
-before anything else the step does and whether or not a frame is rendered: a
-suspended or minimized window adopts what is published for it. It adopts when
-the window's revision is newer than the one the target holds, or when it holds
-none, which is how a window with no publication adopts the initial scene as
-revision 0 in the first step after its target is constructed. Adopting asks for
-no frame; only a publication does. A revision published and replaced before a
-step takes it is never adopted, so it is never notified and never released.
-Recovery of a lost surface keeps the attachment and its target and adopts
-nothing; reattaching the window makes a new target, which adopts again.
-
-**The lifecycle.** `vulkanSceneLifecycle` (default `noSceneLifecycle`, which
-does nothing, so existing renderers are unchanged) supplies two hooks, run on
-the owner's thread. Neither may raise or wait.
+**The lifecycle.** `vulkanSceneLifecycle` supplies two hooks, run on the
+owner's thread. Neither may raise or wait.
 
 - `sceneAdopted window revision scene` runs when a target adopts a revision,
-  with the exact scene the step took — which a later publication may already
-  have replaced, so it is not for the hook to read the latest — before the
-  window's adopted watermark moves. An adapter holds what the scene references
-  from here.
-- `sceneReleased window revision` runs once the revision is superseded (a newer
-  one adopted for the target) or its target has ended, **and** every frame
-  recorded with it has a use that is over.
+  with the exact scene the step took. An adapter holds what the scene
+  references from here.
+- `sceneReleased window revision` runs once the revision is superseded or its
+  target has ended, **and** every frame recorded with it has a use that is
+  over.
 
-Every adopted revision is released exactly once, in adoption order for each
-window, and a revision is removed from the ledger before its hook runs. The
-two hooks pair by window and revision; a revision adopted by two targets (a
-window reattached) is notified and released for each. A *use* ends on
-evidence that the frame's commands can no longer read what the scene
-references: its recording was discarded, or the submission that carried it
-completed. Both are read from the layer that owns the fact, never from the
-answer of a call that may have been cancelled. A *completion* is the entry the
-frames append to their completion log in the transaction that records the
-model's completion on the fence's evidence (`readCompletedSubmissions`,
-`takeCompletedSubmissions`), so a step that raised or was cancelled afterwards
-leaves it; a submission an uncertain fence query dropped, or the device's loss
-let go of, is never in it, whatever the outstanding set says. A *discard* is a
-recording that has ended — however it ended, including by a renderer's exception
-— and for which the recording holds no unsubmitted batch of its frame: the skip,
-which a target's teardown makes of every frame still acquired, reset the
-recorder and dropped the batch. After the device's loss a skip lets go of the
-unsubmitted recording without resetting anything, so no discard is evidenced.
-A submission is associated with its use in the same masked step that submits it,
-and a use is opened and the handler that marks its recording ended installed in
-one masked step. The log is off until a consumer enables it
-(`enableCompletionLog`, which the rendering does when it makes the frames), so
-a caller of the original progress API retains nothing however long it runs;
-enabled, the rendering takes it each time it reconciles, which bounds it by the
-submissions in flight.
-A frame abandoned after its submission, a presentation that was
-refused or enqueued nothing, a timeout, the target's retirement and the owner's
-retirement end nothing. A use whose discard or completion is not established —
-a recording that raised, a skip that was refused, a submission the device's
-loss let go of without completing — stays, and so does the revision it names:
-it remains awaiting release and is shown as such, and the revisions adopted
-after it for the same window wait behind it. After the device's loss nothing is
-completed and a skip resets nothing — it lets go of the unsubmitted recording
-under the loss rule — so no use ends and nothing is released on its account; the recording's teardown
-destroys the resources under the device-loss rules regardless. The adoption, the
-ledger's record, the hook and the watermark are one uninterruptible transition,
-and so are a release pass's removal of its records and its hooks: a cancellation
-of the owner lands before or after them, never between, so every recorded
-adoption has been notified and every notified one is on the ledger to be
-released, once. For that the hooks must return finitely.
+Every adopted revision is released exactly once, in adoption order per
+window. A use ends only on evidence that the frame's commands can no longer
+read what the scene references: its recording was discarded, or the submission
+that carried it completed (read from the frames' completion log). A frame
+abandoned after submission, a refused presentation, a timeout and a
+retirement end nothing. A use whose discard or completion is not established
+(a recording that raised, a submission a device loss let go of) stays, and so
+do the revision it names and the revisions adopted after it for that window.
+Adoption and its notification are one uninterruptible transition, so the hooks
+must return finitely.
 
-**Pressure.** A target holds a finite number of unreleased revisions —
-`2 × (frameSlotLimit + 1)`: the revisions frames in flight can reference, the
-current one, and as many again waiting behind them in adoption order. A target
-at its limit adopts nothing newer: the step renders nothing for it and asks
-nothing of it, so its demand and the window's newer publication are still owed,
-and when a release makes room the owner takes another round at once and the
-target adopts the window's latest. The publication never waits — the window's
-snapshot keeps the latest scene, replacing the last, however many are
-published behind one submission that has not completed. The ledger is thereby
-bounded by the targets, which the host's windows bound.
+**Pressure.** A target holds at most `2 × (frameSlotLimit + 1)` unreleased
+revisions. At the limit it adopts nothing newer and the step renders nothing
+for it; when a release makes room the owner takes another round at once. The
+publication never waits.
 
 **Release requests.** `requestVulkanRelease host action` queues an owner-thread
-action, lent the `Construction` as any other, that runs only once the owner has
-adopted what D-28 says before an application releases an object a snapshot
-references. It is admitted, bounded and settled exactly as `submitVulkanAction`
-is ([Owner-thread actions](#owner-thread-actions)): the same refusals
-(`ActionDeviceNotReady`, `ActionSessionFailed`, `ActionOwnerClosed`), the same
-queue, and a request still queued when the owner's exit begins is settled as
-refused and never run. What it does not share is the queue's bound. Release
-requests are admitted against `vulkanReleaseCapacity` alone, ordinary actions
-against `vulkanActionCapacity` alone, and each bounds only the queued entries of
-its own class: a release request admitted while the queue already holds that
-many release requests is refused at once with `ReleaseQueueFull`, and release
-requests never cause `submitVulkanAction` to be refused `ActionQueueFull`, nor
-actions a release request. A request counts from its admission until the owner
-takes it, whatever its barrier — an empty one, or one already met, takes a slot
-too — and one the owner is running no longer occupies a slot. A capacity of zero
-refuses its class at once; the session, owner and device refusals precede
-either capacity refusal. Without a bound of its own, requests that a window
-with no target holds could fill the shared queue and starve every ordinary
-action behind them.
+action that runs only once the owner has adopted what was published when the
+request was made, so an application can release an object a snapshot
+references.
 
-In the transaction that queues it, the request records a *barrier*: for every
-window the host holds, the latest revision published for it — revision 0, the
-initial scene, for a window with no publication, and the shared scene's
-revision for every window in a shared host. A window with no target yet is
-named like any other: a target attached to it later adopts the scene it holds,
-and must find what that scene references still there. The request runs when,
-for every window it names, the revision a live target of the window *holds* —
-the highest it has adopted and notified — has reached that revision, or the host
-no longer holds the window. A target that has ended holds nothing, whatever it
-adopted: a window whose adopting target was detached or released has no hold
-until another adopts, since the revision it published is one that target will
-take, so a request made meanwhile waits for it. Windows that appear later are not named and delay
-nothing.
+- It is admitted and settled as `submitVulkanAction` is, but against its own
+  bound: `vulkanReleaseCapacity`, refused with `ReleaseQueueFull`. Release
+  requests and ordinary actions never refuse each other.
+- In the queuing transaction the request records a barrier: for every window
+  the host holds, the latest revision published for it (revision 0 for a
+  window with no publication). It runs when, for every named window, a live
+  target of the window holds that revision or later, or the host no longer
+  holds the window. A target that has ended holds nothing.
+- Requests run in the order made. An action with no barrier is never held
+  back by one that has.
+- `vulkanInitialSceneHoldsNothing` (off by default; `render-2d`'s hosts turn
+  it on) declares that the initial scene references nothing a release could
+  free, so windows still at revision 0 are left out of the barrier.
+- **The case that remains.** A window that has published and has no live
+  target holds every later request until a target of it adopts that revision
+  or the host drops the window. Resolving it is the application's: attach a
+  target of the window, or close it.
 
-**The initial scene's declaration.** A host whose initial scene references
-nothing a release request releases can say so: `vulkanInitialSceneHoldsNothing`
-is off by default, and `render-2d`'s hosts (`samples/image2d` and the native
-`Image2d` case, whose initial scene is `blankScene`) turn it on. With it on, the
-barrier a request captures leaves out every window whose latest revision is 0 —
-in a per-window host a window with no publication, in a shared host every window
-while the shared scene is unpublished — because a target that later adopts the
-initial scene finds nothing there that a release could have freed. A window that
-has never published, untargeted or not, then holds no request, and a request
-made while only such windows exist runs in the next owner step. Only the
-barrier captured with the request is filtered: `readVulkanSceneState` still
-reports revision 0 as the window's published revision, and the omission is made
-for no other window. Every other window is named exactly as above, with or
-without a live target; publishing another blank scene is a publication, and
-creates revision 1, which a request then names. With the setting off the barrier
-is unchanged. The declaration is the host's to make true.
-
-**The case that remains.** A window that has published, and has no live target
-— never rendered, or after `VulkanHandoverRolledBack` or `Unavailable`, or its
-target released — cannot leave the barrier: a target attached later adopts that
-publication, and a released object's freed buffer would then be read. Such a
-window holds every later request until a target of it adopts the barrier's
-revision, or the host drops the window, so those requests stay queued and
-unrun (their memory not reclaimed) until then; each takes a slot of the release
-capacity, and a full release queue refuses further requests with
-`ReleaseQueueFull`, which no longer touches ordinary actions. It is observable:
-`readVulkanSceneState` shows the request's barrier naming the window, and the
-window's published revision above its adopted one (`windowAdopted` is `Nothing`
-for a window with no live target). Resolving it is the application's: attach a
-target of the window, or close it. The barrier,
-the publications and the order of requests are one coherent fact however
-publications and windows change around the request.
-
-Requests run in the order they were made: one starts only when its barrier is
-met and no earlier request is still queued. An action with no barrier is never
-held back by one that has; it runs as it always did, and a queue holding only
-requests that cannot start is not work, so it neither wakes an idle owner nor
-keeps one running. A request whose barrier is already met starts in the next
-owner step. The step adopts before it services the queue, so a request the
-step's adoption satisfies runs in that same step.
-
-**Observation.** `readVulkanSceneState` reads, in one transaction, each
-window's latest published revision (`windowPublished`, `Nothing` for a window
-the host no longer holds), its adopted watermark (`windowAdopted`, `Nothing`
-before any adoption — an unadopted initial scene is not an adopted revision 0)
-and the revisions awaiting release (`windowAwaitingRelease`), how many times a target's adoption was deferred at
-its retention limit (`windowDeferrals`), and the release
-requests still queued, in the order made, with the revision each awaits of each
-window (`sceneRequests`). Below it, `readGraphicsSceneRevisions` reads the
-window revisions published into the handoff
-([the owner's handoffs](glfw.md#a-scene-for-each-window)).
-
-The headless examples cover each promise over the scripted seam
-(`Test.GPU.Vulkan.GLFW.Scenes`): a publication asking only its window's
-target; adoption by a suspended window and of the initial scene as revision 0;
-a revision replaced before a step takes it never being notified; release only
-after the last frame recorded with a revision has completed, in adoption order
-with several in flight, and exactly once, at supersession, at a target's end
-and at the owner's retirement; a finite number of unreleased revisions held
-for a target behind one pending submission, however many are published, with
-the catching up in order once it completes; an adoption's and a release pass's
-notifications completed whatever cancels the thread running them meanwhile; a
-recording that raised discarded by the target's teardown, releasing its
-revision; a submitted frame whose presentation enqueued
-nothing keeping its revision; a window's publication across a surface's
-recovery and across a target's release and reattachment; and requests that wait
-for the revision current when they were made, are released by a window's end, name every window the host holds — a window
-with no target and none with no publication included, in a per-window host
-and in a shared one — are not delayed by a window created after them, run
-in the order made without holding back an action that has no barrier, are
-refused when the queue is full, before the device exists, after the session's
-failure and after the owner's exit, and wake an idle owner only when one can
-run. The native
-suite's `r2d14-window-scenes` runs the production host over two windows
-([The native suite](#the-native-suite)).
+`readVulkanSceneState` reads each window's published revision, adopted
+watermark, revisions awaiting release, deferral count, and the queued release
+requests with their barriers.
 
 ### Offscreen scene targets
 
-LFE-27 ([#576](https://github.com/coghex/hetoimasia/issues/576); owner decision
-2026-11-01, variant B) gives a scene target that has no window the protection a
-window has. It is the host's, with the host's one ownership policy: a surface-free
-scene target registered with the running host takes part in the same scene
-barrier, ledger identity and adopt/release lifecycle as a window, and no consumer
-needs a second key space or a second lifecycle.
+A scene target with no window (LFE-27) gets the same barrier, ledger identity
+and adopt/release lifecycle as a window.
 
-**One key.** The release barrier (`Barrier`), the scene lifecycle
-(`SceneLifecycle`'s `sceneAdopted` and `sceneReleased`), the observation
-(`VulkanSceneState`'s `sceneWindows` and `sceneRequests`) and a consumer's hold
-ledger are keyed by `SceneTargetKey`: `KeyWindow WindowId` or `KeyOffscreen
-OffscreenTargetId`. An offscreen target is never a window, and `WindowId` is
-neither widened nor minted: it stays the session-issued identity of a real window.
-An `OffscreenTargetId` is issued only by the host that registered the target, from
-the host's own identity and a registration incarnation that rises and is never
-reused, and the public interface exports it without its constructors, so a stale
-registration, a foreign host's identity and a forged one are never equal to a live
-one: none can publish to, unregister, or satisfy the barrier of another
-registration. The fields of the observation keep their names (`windowPublished`,
-`windowAdopted`, `windowDeferrals`, `windowAwaitingRelease`); for an offscreen
-target they read the same facts.
-
-**Registration.** `registerVulkanSceneTarget host` is one transaction that never
-waits. It needs no window and opens none. It issues the target's identity, starts
-it at the initial scene's revision 0 and registers it with the scene ledger, and is
-refused with a typed reason (`SceneTargetRefusal`) in this order: the session has
-failed (`TargetSessionFailed`, with its primary), the owner's exit has begun
-(`TargetOwnerClosed`), no device exists yet (`TargetDeviceNotReady` — a host that
-starts its device at the first window has none until one is admitted; a
-`DeviceSurfaceFree` host has one from its startup), or the host already accounts
-for `vulkanTargetCapacity` targets (`TargetCapacityReached`).
-`unregisterVulkanSceneTarget host target` answers whether the target was
-registered. From that transaction nothing can be published to it or recorded
-against it and no release request is held for it; the owner ends it in the ledger
-in its next step.
-
-**Capacity.** The host accounts for at most `vulkanTargetCapacity`
-(`defaultTargetCapacity`, 8) offscreen targets at once, and the count includes a
-target that was unregistered while a record of it is still unreleased, so
-repeated registration cannot grow the retained bookkeeping. It is apart from the
-windows' bound and never reduces it; a capacity of zero refuses every
-registration and leaves the windows as they were.
-
-**Publication.** `publishVulkanTargetScene host target scene` is one transaction
-that never waits for GPU work, adopted capacity or a displayed frame: the scene is
-the target's latest value at the next revision the host holds, replacing a scene
-the owner has not yet taken, in execution order. Because it is a transaction it
-composes with a consumer's own authority checks, so the target's liveness, the
-acceptance and the revision are one fact. A target the host does not hold is
-answered `TargetSceneUnknown`, naming it, and a host whose session has failed or
-whose owner's exit has begun `TargetSceneClosed`; neither changes anything. A
-window's publication is untouched.
-
-**Barrier.** A release request made after the target accepted revision R and
-before the target adopted it waits for R exactly as it waits for a window: its
-barrier names the target at R, it runs once the target has adopted R or a later
-revision, or the target is unregistered, in the same order and under the same
-bounded release queue (`ReleaseQueueFull`), and a host that declared its initial
-scene holds nothing leaves a target at revision 0 out of the barrier. A request
-still queued when the session fails or the owner's exit begins is refused, never
-run. A registered target with a publication and no adoption holds later requests
-until it is resolved, and `readVulkanSceneState` shows it.
-
-**Adoption and release.** The owner's step adopts for every registered target, in
-the same step and before any owner-thread action runs, exactly as for a window:
-the revision is newer than the one the target holds, or the target has adopted
-nothing (the initial scene, as revision 0, in the first step after registration).
-The ledger's record, the lifecycle's `sceneAdopted` with the exact scene, the
-exact scene recorded with the target, and the watermark are one uninterruptible
-transition. A target holds at most `retentionLimit` unreleased revisions (the
-window's limit, derived from the frame-slot budget); at the limit an adoption is
-deferred, noted once for that revision (`windowDeferrals`), the owner asks no
-further round for it until a release makes room, and the publication never waits.
-An adopted revision is released — `sceneReleased`, once, in adoption order — only
-after it is superseded or the target has ended and every batch recorded with it
-has been discarded or has completed *according to that batch's own ticket*.
-
-**The recording boundary.** `recordVulkanTargetBatch host target construction
-consumer`, inside an owner-thread action, records one frame-less batch that reads
-the scene the host adopted for the target: the consumer is handed that exact scene
-and revision. The batch's use of the revision is bound to the batch's own ticket
-in the step that admits the batch, before anything is recorded, so no failure or
-cancellation of the recording can leave a batch that read the scene untracked, and
-a cancellation before the ticket reaches the caller leaves the discarded batch's
-use ended by its discard. A use ends only on its ticket's evidence: complete
-(its submission's fence observed signalled and recorded with the model) or
-discarded. Submission, acceptance, a callback, a timeout, an abandoned wait and the
-scope's exit end nothing; a ticket settled as lost by the device's loss, and one
-still pending, end nothing either, so the use and the revision it names stay on
-the ledger, visible in the observation, and are not released on a guess; the
-consumer cannot discharge a use, several batches of one revision each keep it, and
-another batch's or another target's completion discharges nothing. A call for a
-target the host does not hold, unregistered since the action was admitted
-included, is refused (`TargetBatchUnknown`); one before the owner has adopted
-anything for it `TargetBatchNotAdopted`.
-
-**Teardown.** Unregistering at any point leaves the registration gone and no hold
-stranded without a real completion: before any publication; after acceptance and
-before adoption (the revision is never adopted, and a request held for it runs);
-after adoption with batches in flight (the records stay in the observation, are
-counted against the capacity, and are released as the batches complete); after
-supersession with a pending request. The session's failure, the owner's exit and a
-cancellation by asynchronous exception at each transition leave the same: the
-owner's retirement ends every target in the ledger in one transaction before it
-settles releases, refuses the queued requests, and retains what it could not
-verify. A device lost, or a completion never observed, does not manufacture a
-release and does not require an empty ledger at shutdown.
-
-| State | Owner | Readers and writers | Thread | Lifetime | Reset or disposal |
-| --- | --- | --- | --- | --- | --- |
-| The offscreen target registry: each target's latest scene and revision, the scene the owner adopted, the unregistered targets awaiting the owner | The host (`Internal.Targets`) | Any thread registers, publishes and unregisters; the owner's step records what it adopted and takes the retired | Any, in `STM` | The host's | A target is removed by its unregistration or the owner's retirement; the incarnation counter never resets |
-| The target uses: each batch recorded for a target, with its revision and its own ticket | Rendering (`Internal.Rendering`) | The owner's action opens a use when its batch is admitted; the scene ledger reads; settlement forgets | Owner | A batch's recording until its ticket is complete or discarded | Removed on that evidence; kept, uncertain, otherwise |
-
-The headless examples (`Test.GPU.Vulkan.GLFW.Targets`) cover registration and its
-refusals; the bound on targets; the barrier for an accepted-but-unadopted revision
-and its end by adoption, by unregistration, by the session's failure and by the
-owner's exit; release only on the batch's own ticket, with the completion
-withheld, with one batch of several completed, and with a discarded batch; the
-retention limit and the deferral; teardown after supersession, with batches in
-flight, at a device loss, at the owner's exit and under a cancellation before the
-ticket reached the caller; and a host with a window and a target. The native case
-(`an offscreen scene target on a real device (LFE-27)` in the Lua graphics
-adapter's native suite) holds the owner on a gate, accepts a scene naming a
-texture, releases the texture through the production lane before the owner has
-adopted it, draws and reads back the texture after that release, and frees it only
-after the recording completed, with no window and the diagnostic capture clean.
+- **One key.** Everything is keyed by `SceneTargetKey`: `KeyWindow WindowId`
+  or `KeyOffscreen OffscreenTargetId`. An `OffscreenTargetId` is issued only
+  by the host that registered the target, with an incarnation never reused,
+  and is exported without constructors, so a stale, foreign or forged identity
+  never equals a live one.
+- **Registration.** `registerVulkanSceneTarget host` is one transaction that
+  never waits and opens no window. It is refused, in order, as
+  `TargetSessionFailed`, `TargetOwnerClosed`, `TargetDeviceNotReady` or
+  `TargetCapacityReached` (`vulkanTargetCapacity`, 8 by default, counting
+  unregistered targets with unreleased records).
+  `unregisterVulkanSceneTarget` ends it.
+- **Publication.** `publishVulkanTargetScene host target scene` never waits;
+  it answers `TargetSceneUnknown` or `TargetSceneClosed` when it cannot
+  publish.
+- **Barrier, adoption and release** are a window's: a release request made
+  after the target accepted revision R waits until the target adopts R or is
+  unregistered; adoption happens in the owner's step before any action runs;
+  the retention limit and deferral are the same.
+- **The recording boundary.** `recordVulkanTargetBatch host target
+  construction consumer`, inside an owner-thread action, records one
+  frame-less batch that reads the scene the host adopted for the target. The
+  batch's use of the revision is bound to the batch's own ticket before
+  anything is recorded, and ends only on that ticket's evidence: complete or
+  discarded. A ticket lost to a device loss or still pending ends nothing. It
+  is refused as `TargetBatchUnknown` or `TargetBatchNotAdopted`.
+- **Teardown.** Unregistering at any point leaves no hold stranded without a
+  real completion. A lost device or an unobserved completion does not
+  manufacture a release and does not require an empty ledger at shutdown.
 
 ### Rendering a frame
 
-A target the model says wants a frame — render demand, admitted, and not
-suspended or closing — is offered **one** attempt per step, and the targets
-are served in an order whose lead rotates each step, so none waits behind a
-neighbour. The attempt is `tryAcquireFrame` with a zero timeout; the recording
-of the frame, inside `recordFrame`, as the transition into the
-color-attachment layout, the configuration's `VulkanRenderer`, and the
-transition to presentation; one `submitFrames`; and one `presentFrame`. The
-recording and the frames are made on the owner's thread the first time a frame
-is attempted once the device exists, and each target's frame storages — one per
-frame slot of the model's budget — the first time that target is.
+A target the model says wants a frame is offered one attempt per step, in an
+order whose lead rotates. The attempt is `tryAcquireFrame` with a zero
+timeout; `recordFrame` with the transition into the color-attachment layout,
+the configuration's `VulkanRenderer` and the transition to presentation; one
+`submitFrames`; and one `presentFrame`.
 
-- An acquisition the swapchain cannot answer yet — not ready, out of date, no
-  generation, backpressure — or that is refused because the target has no
-  usable extent now (`AcquisitionSuspended`) is retried at the first interval of
-  the model's backoff schedule (5 ms by default), anchored at the step's own
-  instant, so work the step did counts against it and nothing sleeps after it.
-  The interval is therefore not a guaranteed wall-clock delay. A target the
-  step offers a frame can still be refused as suspended: the step plans its
-  frames, from the targets whose render demand is admitted, before the
-  generations' step runs, and that step then suspends a target whose geometry
-  is not yet usable — one whose window observation the owner has not folded
-  has none — so the acquisition after it answers `AcquisitionSuspended`. The
-  refusal is silent and the retry stands until a fresh request for the target
-  supersedes it.
+- An acquisition the swapchain cannot answer yet, or one refused as
+  `AcquisitionSuspended`, is retried at the first interval of the model's
+  backoff (5 ms by default), anchored at the step's own instant.
 - A frame the renderer refused, whose recording was refused, or whose
-  submission had no effect is skipped (`skipFrame`); one whose presentation
-  enqueued nothing is closed unpresented (`closeUnpresentedFrame`). Each is
-  abandoned safely under VK-12's rules, never replayed. The target's render
-  demand stands, so its next frame is tried at the same first interval, as an
-  acquisition that could not be answered is: a renderer that refuses every
-  frame costs one attempt an interval, never one every owner round. A fresh
-  request for the target is an opportunity now, and supersedes that retry.
+  submission had no effect is skipped; one whose presentation enqueued nothing
+  is closed unpresented. Neither is replayed. The target's render demand
+  stands, so a renderer that refuses every frame costs one attempt an
+  interval, never one every round.
 - Enqueuing the presentation clears the model's render demand.
 
-The renderer is `∀`-typed over the native handles, so it records through the
-managed boundary alone; `clearRenderer` clears the frame to the colour it
-computes from the scene and the `FrameRequest` — the attachment, target,
-frame, image, the image's extent and color format, the scene revision and, for
-a host that asked for [windowed depth](#windowed-depth), its generation's depth
-image (`requestDepth`, `Nothing` otherwise) and, for the window the target
-presents to, the latest window observation the owner has published:
-`requestLogicalExtent`, the window's logical extent in window coordinates, and
-`requestContentScale`, its content scale per axis (R2D-8). Both are `Maybe`, and
-`Nothing` says the platform has not reported that attribute for this window,
-never a default: the owner's coherent observation keeps the last value each
-attribute reported, so one reported without the other does not erase it, and a
-renderer that needs a value it was not given declines the frame rather than
-invent one (the 2D adapter refuses it, and the host's backoff retries). They
-are independent of the image's own extent, which stays the framebuffer extent:
-the frame image's pixels, which the window's logical extent times its content
-scale describes but need not equal exactly. A renderer that does not read them
-is unchanged. The request is the frame's description, handed to the renderer
-before it records anything; the controller's own transitions around it are the
-only commands recorded first.
+The renderer records through the managed boundary alone. Its `FrameRequest`
+carries the attachment, target, frame, image, the image's extent and color
+format, the scene revision, the generation's depth image (`requestDepth`, with
+[windowed depth](#windowed-depth)), and the window's `requestLogicalExtent`
+and `requestContentScale`. Those last two are `Maybe`: `Nothing` means the
+platform has not reported the attribute, never a default, and a renderer that
+needs a value it was not given declines the frame. The image's own extent is
+the framebuffer extent.
 
 ### Consumer construction
 
-VK-19 ([#299](https://github.com/coghex/hetoimasia/issues/299)) gives the
-renderer the construction D-26 and P-1 assign the consumer. With each frame it
-is lent the session's `Construction`, and through it it builds
-(`constructPipelineLayout`, `constructPipeline`), replaces
-(`replaceConstructedPipeline`) and releases (`releaseConstructed`) pipeline
-layouts and graphics pipelines over #221's embedded shaders. They are the
-recording's [managed resources](#recording-through-managed-resources), beside
-the controller's own frame storages, so the consumer holds opaque handles and
-never a native one. A pipeline is built for one color format; the frame's
-`requestFormat` is the one its image has, and a pipeline built for another is
-refused at `bindPipeline` by the recorder's own check (`RefusedIncompatible`),
-before anything is recorded. Inside the frame, the renderer begins dynamic
-rendering, binds, sets the viewport and scissor, draws, and ends rendering;
-the controller owns the image-layout transitions on either side of it. The
-public module re-exports that recording vocabulary, so a consumer needs only
-the host's package and the shaders it embeds.
+With each frame the renderer is lent the session's `Construction`, through
+which it builds (`constructPipelineLayout`, `constructPipeline` and the other
+`construct*` operations), replaces (`replaceConstructedPipeline`) and releases
+(`releaseConstructed`) managed resources. The consumer holds opaque handles
+and never a native one. The public module re-exports the recording
+vocabulary, so a consumer needs only the host's package and the shaders it
+embeds. The triangle sample
+([`samples/triangle`](../samples/triangle/README.md)) is the consumer example.
 
 - **Thread.** Every construction and release belongs to the graphics owner's
-  thread, where the renderer runs; one made from any other thread is refused
-  (`RefusedNotOwner`) before anything native is done. So is one after the
-  session has failed or while a diagnostic failure is pending. The controller
-  still makes no GLFW call.
-- **Failure.** A construction that is refused answers its refusal, and the
-  renderer that answers it in turn skips its frame under the ordinary skip
-  rules — the renderer is not called again for that frame, the target's next
-  frame is tried at the backoff's first interval, and the session continues. A
-  construction that *raised* before committing any generation, with the
-  session still running, left nothing — its creation made nothing and gave its
-  reservation back — and is answered `RefusedConstructionFailed`, confined to
-  that frame the same way. Its allocation recovery
-  ([Recovery](#allocation-recovery)) retries a creation that ran out of memory
-  inside the construction, never by calling the renderer again. One that raised
-  after committing a generation is not confined: a replacement whose new
-  pipeline could not be named has released that generation and already
-  replaced the old one, so the renderer's handle is stale, and the failure is
-  raised as it was and ends the owner's run. So does a construction that raised
-  because the session failed — the device's loss, an uncertain effect, a failed
-  cleanup, which the call latched on its way out — with that primary through
-  the [terminal latch](#terminal-failure), and so does every cancellation. No
-  exception of the renderer's own is caught.
-- **Lifetime.** A handle outlives its frame; the consumer keeps it across
-  frames. A replacement publishes a new generation and releases the old one: a
-  batch that recorded the old pipeline keeps it, and its layout, until that
-  batch's references end, and only then is it destroyed. Whatever the renderer
-  released, and a replaced generation, is destroyed on the owner's thread in a
-  later step once nothing holds it (`reclaimReleased`, which takes a model turn
-  only when some released generation is eligible). Whatever it never released
-  is released and destroyed by the recording's retirement, before the device,
-  on the host's normal and terminal exits alike
-  ([Destruction order](#destruction-order)); what cannot be verifiably
-  destroyed — a destruction that raised, or holds that never ended — is
-  retained with its parents, and the terminal report says so.
-
-The triangle sample ([`samples/triangle`](../samples/triangle/README.md),
-VK-17) is the consumer example. Its drawing, `drawTriangle`, is written against
-the native recording vocabulary alone and takes the two constructions it needs
-as values; the sample's executable, and the native suite's required profile,
-hand it to the host in one line:
-
-```haskell
-triangleRenderer ∷ Triangle → VulkanRenderer scene
-triangleRenderer triangle = VulkanRenderer $ \_ request construction recorder →
-  drawTriangle triangle
-    (Builders (constructPipelineLayout construction) (constructPipeline construction))
-    (requestFormat request) (requestExtent request) recorder
-```
-
-It builds a layout and a pipeline the first time it meets a format, keeps them
-across frames, and leaves both to the session's teardown. A format's layout is
-built once: when the pipeline over it is refused, the frame is skipped and the
-layout is kept for the next frame's attempt, so a refusal that recurs never
-spends the session's object budget on another layout.
+  thread (`RefusedNotOwner` otherwise), and is refused once the session has
+  failed or while a diagnostic failure is pending.
+- **Failure.** A refused construction answers its refusal, and a renderer
+  that passes it on has its frame skipped; the session continues. A
+  construction that raised before committing any generation left nothing and
+  is answered `RefusedConstructionFailed`, confined to that frame. One that
+  raised after committing a generation (a replacement that could not be
+  named), one that raised because the session failed, and every cancellation
+  end the owner's run. No exception of the renderer's own is caught.
+- **Lifetime.** A handle outlives its frame. A replaced or released
+  generation is destroyed on the owner's thread in a later step once nothing
+  holds it (`reclaimReleased`). Whatever the renderer never released is
+  released and destroyed by the recording's retirement, before the device.
 
 ### Verification capture
 
-The verification strategy's capture — the pixels of a real, presented frame —
-is reachable through the host, and only by this package's own suites. A host
-composed with capture on builds every generation unclipped and, where its
-surface offers the usage, as a transfer source ([Capture usage](#capture-usage)).
-A host with it off — every other host — builds exactly what it did before
-VK-19: clipped swapchains with no transfer-source usage, and a target's
-compatibility never depends on capture. It refuses every request
-(`CaptureDisabled`).
+The capture of a real, presented frame's pixels is reachable only by this
+package's own suites. A host composed with capture on builds every generation
+unclipped and, where offered, as a transfer source. Every other host refuses
+every request (`CaptureDisabled`).
 
-- **Request.** `requestVulkanCapture` admits, from any thread, a request for
-  the next frame of an attachment's target and answers a `CaptureTicket`. It
-  is refused — `CaptureRefusal` — when the host does not capture, when the
-  owner holds no target for the attachment, when that target has begun
-  retiring (`CaptureTargetRetiring`: its retirement closes admission before it
-  settles the requests it has, so none is admitted after that settlement),
-  when the attachment already has a request outstanding, when 64 requests are
-  outstanding or settled and not yet taken (`CaptureBacklogFull`, which is
-  backpressure), and once the session has failed. Admission wakes the
-  owner, and its next step asks that target for a frame as render demand
-  would, so a verifier need publish nothing else. At most one request per
-  attachment is outstanding, and each capture's readback buffer is admitted
-  under the model's existing budgets like any managed resource.
-- **Association.** The next frame the owner acquires for the target is the
-  request's, whatever becomes of it: a failed capture is settled, never moved
-  to a later frame. The owner claims the request a frame will be for before it
-  asks for that frame, and associates only the one it claimed, so a request
-  admitted while an acquisition is under way is a later frame's; and a frame
-  is associated before its acquisition is reported to the frame observer, so a
-  request made from that report is a later frame's too. A frame whose generation is not a transfer source — its
-  surface offers no transfer-source usage, which never refuses the target
-  itself — settles the request `WithheldUnsupported`, and one for which no
-  readback buffer could be made settles it `WithheldNoReadback`; either frame
-  is then recorded, submitted and presented as any other.
-- **Recording.** Otherwise the frame is recorded, submitted and presented as
-  usual, and its batch ends, after the renderer's commands, with the image's
-  transition from the color attachment to the transfer source, the copy of the
-  whole image into the readback buffer made for it, the barrier from that
-  transfer write to host reads, and the transition to presentation. A frame
-  skipped, abandoned or closed unpresented settles the request
-  `WithheldFrameAbandoned`, naming why, and delivers no bytes.
-- **Delivery.** Once the batch's completion evidence exposes the bytes —
-  `readReadback`'s own rule: the batch recorded as submitted, and the buffer
-  owing no reference and no submitted use, which the model discharges only on
-  the submission's completion fact — the owner copies them out in the step
-  whose poll observed the completion and settles the request with a
-  `CapturedFrame`: the bytes, as a copy of their own that later reuse of the
-  readback memory cannot change; the extent and format; and the frame's
-  identities — target and attachment, generation, frame slot, image,
-  presentation — and scene revision, kept apart from any later reuse of the
-  slot or the generation. `takeVulkanCapture` answers a settled request once,
-  and keeps it until it is taken: since admission is what is bounded, no
-  admitted request's outcome is ever dropped. The readback buffer is
-  released at settlement and destroyed on the owner's thread once its batch no
-  longer holds it.
-- **Ending.** A request still outstanding when its target retires is settled
-  `WithheldTargetRetired` — after one last delivery attempt, since the
-  retirement's preparation waited for every frame of the target to end on its
-  own evidence — and one the session's end finds is settled
-  `WithheldSessionEnded`, with the primary failure if the session failed.
-  Nothing is read once the session has failed or the device has been lost: a
-  hold the loss let go of is not completion. The host's exit settles any
-  request its owner never reached the same way, so nothing waits on one for
-  ever. Readback buffers are released and destroyed under the same teardown
-  rules as the consumer's resources.
+- `requestVulkanCapture` admits, from any thread, a request for the next
+  frame of an attachment's target and answers a `CaptureTicket`. At most one
+  request per attachment is outstanding and at most 64 in total
+  (`CaptureBacklogFull`). Admission asks the target for a frame.
+- The next frame the owner acquires for the target is the request's, whatever
+  becomes of it: a failed capture is settled, never moved to a later frame. A
+  generation that is not a transfer source settles it `WithheldUnsupported`;
+  no readback buffer, `WithheldNoReadback`; an abandoned frame,
+  `WithheldFrameAbandoned`.
+- The frame's batch ends with the copy of the whole image into a readback
+  buffer. Once the batch's completion evidence exposes the bytes, the request
+  is settled with a `CapturedFrame`: the bytes (a copy of their own), extent,
+  format, the frame's identities and scene revision. `takeVulkanCapture`
+  answers a settled request once.
+- A request outstanding when its target retires is settled
+  `WithheldTargetRetired`; at the session's end, `WithheldSessionEnded`.
+  Nothing is read once the session has failed or the device is lost.
 
 ### Polling completion
 
-A fence is asked only when the model's own schedule says a poll is due, or
-when a frame is to be attempted this step and the slots it needs may be
-waiting on one. The schedule is the model's `progressDeadline`
-([GPU model](gpu_model.md#owner-progress)): the idle backoff over pending
-obligations and every recovery deadline, with render demand left out, because
-render demand says a frame is wanted, not that one can be acquired now. The
-generations are stepped — which is where the model's progress turn, and so the
-backoff's anchor, happens — when a target's observation moved, when their own
-deadline has come (a result to reconcile, a settling resize, a recovery
-attempt, the poll), or when a frame is to be attempted. A round something
-unrelated woke asks no fence and takes no model turn: it neither polls early
-nor moves the schedule on.
-
-Each generation step takes one model turn, and a second only when its
-reconciliation rescheduled an opportunity now: the backoff moves on once per
-poll, 5, 10, 20, 40, 80 and then 100 ms under unchanged conditions. New
-demand, a new obligation — a presentation enqueued — an observed completion or
-a close transition restarts it at once; an unrelated event changes none of
-those and restarts nothing.
+A fence is asked only when the model's schedule says a poll is due
+(`progressDeadline`, [gpu_model.md](gpu_model.md#owner-progress)) or when a
+frame is to be attempted this step. A round something unrelated woke asks no
+fence and takes no model turn. The backoff moves on once per poll: 5, 10, 20,
+40, 80 and then 100 ms. New demand, a new obligation, an observed completion
+or a close transition restarts it.
 
 ### Pacing, suspension and fairness
 
 The owner's `graphicsNextDeadline` is the earliest of the unannounced watch, a
-replacement it is waiting on, the generations' own deadline, and rendering's:
-a frame wanted now, an acquisition's retry, or a demand deadline still ahead.
-So a quiet scene rendered continuously — demand, or a new scene, each time the
-last frame was presented — keeps the owner on the first pending-work interval
-and never lets its schedule fall into the idle backoff; and a target with no
-demand and no progress backs off on absolute deadlines.
+replacement it is waiting on, the generations' deadline, and rendering's (a
+frame wanted now, an acquisition's retry, or a demand deadline ahead).
 
-A hidden, iconified, zero-area or closing target is **suspended**: its
-generations' reconciliation suspends it in the model from the main thread's
-classification of its window, it is offered no frame, and its render demand
-contributes no deadline. Its outstanding obligations — a presentation whose
-present fence has not been observed — keep a finite poll deadline on the
-backoff, so the owner neither forgets them nor spins on them. One suspended
-target, or one whose acquisitions cannot be answered, never pauses another:
-each is offered its own attempt, and a pending acquisition only reschedules
-that target's retry.
-
-A target resumed from an ineligibility suspension while a generation stood —
-its window hidden or minimized — is **replaced**, never resumed on that
-generation: the reconciliation that finds it eligible again builds a
-replacement at once, handing the old one over as `oldSwapchain`, with no
-settling period and no recovery attempt spent, and the target stays suspended
-in the model until the replacement is published. A compositor need not answer
-a presentation made for a surface it has since unmapped: on Wayland, Weston 13
-offers no `wp_fifo_v1`, so Mesa's FIFO present waits, with no timeout, for the
-frame callback its swapchain's previous presentation requested, and the old
-generation's next present would never return
-([#357](https://github.com/coghex/hetoimasia/issues/357)). It costs one
-swapchain creation per resume on every platform. The old generation is
-retired as any replaced one is: held until its presentations have retired on
-their own present fences, then destroyed.
-
-**Hiding a presenting window.** A hide's native call is itself the
-hazard, because the owner learns a window was hidden only from the observation
-published after it. So the host has the window's graphics owner withhold its
-presentation first ([glfw.md](glfw.md#hiding-an-attached-window)), whether the
-hide came through the host's command ports or was made directly on a window
-`withHostWindow` lends
-([#368](https://github.com/coghex/hetoimasia/issues/368)): the main
-thread waits while the owner's step in flight may present to the target, and
-every later step views the target as suspended until the hidden window's
-observation is folded. The step view's withdrawal count (`viewWithdrawals`)
-rises with every hold a step applies, and the controller then withdraws the
-target's active generation (`withdrawGeneration`) before any frame of that
-step, so even a hide and a show that both came between two steps resume the
-target on a replacement.
+- A hidden, iconified, zero-area or closing target is **suspended**: it is
+  offered no frame and its render demand contributes no deadline. Its
+  outstanding obligations keep a finite poll deadline. One suspended target
+  never pauses another.
+- A target resumed after its window was hidden or minimized is **replaced**,
+  never resumed on the old generation, with no settling period and no
+  recovery attempt. A compositor need not answer a presentation made for a
+  surface it has since unmapped (on Wayland with Weston 13, Mesa's FIFO
+  present then waits with no timeout). It costs one swapchain creation per
+  resume.
+- **Hiding a presenting window.** The host has the window's graphics owner
+  withhold its presentation before the hide's native call
+  ([glfw.md](glfw.md#hiding-an-attached-window)). The step view's withdrawal
+  count rises with every hold, and the controller then withdraws the target's
+  active generation (`withdrawGeneration`) before any frame of that step, so
+  even a hide and show between two steps resume on a replacement.
 
 ### Retiring a target
 
 A target's retirement is owed (`RetirementOwed`) until it can be performed.
 The first time the owner asks (`graphicsPrepareRetirement`), the controller
-closes the target in the model — which drops its render demand and restarts
-the schedule — and closes its frames (`closeTargetFrames`): acquired ones
-skipped, submitted ones closed unpresented. Each time it asks it polls when a
-poll is due, anchoring the schedule with one generation step, and answers
-ready once no frame and no presentation of the target remains, or once the
-device has been lost. Only then does the owner retire the target, once:
-`retireTargetFrames` destroys its slots' and pool's synchronization, its frame
-storages are released and destroyed, then its generations, then its surface.
-An owed retirement certifies nothing; the attachment's terminal record is
-written only by the retirement's own return, exactly as before.
+closes the target in the model and closes its frames. It answers ready once no
+frame and no presentation of the target remains, or once the device has been
+lost. Only then is the target retired, once: its frame synchronization, its
+frame storages, its generations, then its surface. An owed retirement
+certifies nothing.
 
 Whole-owner retirement refuses every owner-thread action still queued, then
-retires the recording — releasing and destroying every managed resource still
-live — before the device is destroyed.
+retires the recording before the device is destroyed.
 
-### Status
+### Status, stop and stalls
 
-Status reaches application services through the runtime's checkpoints and the
-attachment's observation, as it did: a latched terminal failure (VK-15) ends
-the owner's run at its next step and is raised by the application's next
-checkpoint through `superviseGraphicsOwner`; target unavailability (VK-14) is
-read with `readVulkanUnavailability`; retirement facts reach the attachment's
-observation through the host's completion publisher, with terminal records
-retaining what a full inbox could not carry. The owner's wake
-(`graphicsWake`) asks for a round while the capture's sink has failed and
-nothing is latched, **and** while a primary failure latched on another thread —
-a handover's checkpoint on the main thread — has not yet been taken by the
-owner's own step; without the second an idle owner kept running on a session
-the main thread already knew had failed.
+- **Status** reaches the application through the runtime's checkpoints
+  (`superviseGraphicsOwner`), `readVulkanUnavailability`, and the attachment's
+  observation. The owner's wake asks for a round while the capture's sink has
+  failed, and while a primary failure latched on another thread has not yet
+  been taken by the owner's step.
+- **Stop** follows the graphics owner's exit order
+  ([glfw.md](glfw.md#the-exit-which-is-d-33s)). A target whose retirement is
+  still owed when the drain begins is asked again on the model's poll
+  schedule. No timeout ends that wait; a cancellation leaves what is still
+  owed with the owner, unverified. Quiescence refuses every queued
+  owner-thread action that has not started, before ordinary workers drain, so
+  a worker awaiting one is answered.
+- **During a main-thread stall** the adapter publishes nothing, but the owner
+  keeps rendering the latest scene and last coherent observation on its own
+  deadlines, and a live resize keeps presenting from the active generation. A
+  presented frame and its signalled present fence do not prove the frame
+  became visible; that is a native measurement.
 
-### Stop and quiescence
-
-Stop follows D-33 through VK-18's machinery, unchanged: quiescence closes
-admission and the owner's publications; ordinary workers drain; the owner
-retires each target, then itself, then destroys itself; the main thread
-services bounded housekeeping and joins the owner before any window is
-released. A target whose retirement is still owed when the owner begins its
-exit drain is asked again between waits for the owner's own next deadline —
-the model's poll schedule — until it is retired or its retirement fails. A
-demand deadline counts toward that schedule only while an admitted target that
-is not closing could serve it: the drain takes no step, so no frame can, and a
-deadline left standing once it passed would be asked about again at once, for
-ever. For the same reason a target the model is retiring owes its generations'
-reconciliation nothing — a settling replacement, an unseen swapchain result or
-a deferred recovery attempt — since no step reconciles it again; its
-obligations keep the model's poll schedule. No
-timeout ends that wait, because a timeout is not evidence, and a cancellation
-ends it by leaving what is still owed with the owner, unverified, and naming it
-to whole-owner retirement. Nothing waits for a command from the ended loop: a
-window command submitted once the loop has ended is answered by the host's
-quiescence, never left waiting. Nor does anything wait for an owner-thread
-action the exit will never run: quiescence's closing of the owner's
-publications is also what refuses every queued action that has not started,
-before ordinary workers drain, so a worker awaiting one is answered and can
-drain ([Owner-thread actions](#owner-thread-actions)). That closing is part of
-the host's own quiescence transaction, which the application's pre-drain
-quiescence commits ([The exit, which is D-33's](glfw.md#the-exit-which-is-d-33s)),
-so the action gate, which follows the owner's lifetime port, closes there and
-not at the protected exit after the ordinary drain.
-
-### During a main-thread stall
-
-A platform modal loop inside the native event call stalls every step of the
-adapter: no observation, no demand and no replacement surface is published
-until the call returns, and window commands wait for the pump as they always
-did. The owner is not stalled by it. It keeps rendering what it holds — the
-latest scene any other thread published, the last coherent observation, and
-the extent the surface's capabilities supply (D-30), with acquisition
-suspended for unusable dimensions and replacement bounded by VK-10's budget —
-on its own deadlines. A live resize, which changes the surface faster than a
-replacement's period, keeps presenting from the active generation and is
-rebuilt from the newest extent once a period
-([Replacement](#replacement)); a headless example holds the native call while
-the stand-in surface changes every 8 ms and requires both.
-
-**What that does not mean.** A frame the owner presents during a stall proves
-that the request was admitted; its present fence, observed signalled, proves
-that the presentation engine finished with the image. Neither proves the frame
-became visible. Whether frames visibly advance during a Cocoa live resize or
-menu interaction is a native measurement: the graphics-owner interaction probe
-([The native suite](#the-native-suite)) records it, and
-[the graphics-owner interaction verdict](archive/graphics_owner_interaction_verdict.md)
-states what was measured and what was not.
-
-### How it is built
-
-| Module | Responsibility |
-| --- | --- |
-| `Hetoimasia.GPU.Vulkan.GLFW.Internal.Rendering` | The recording and the frames above the generations, what asks a target for a frame, one frame's attempt, completion polls, the rendering deadline, and a target's retirement readiness and rendering retirement |
-| `Hetoimasia.GPU.Vulkan.GLFW.Internal.Loop` | The adapter: one turn's handoffs, the deadline fold, and `runVulkanOwnerLoop` |
-| `Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller` | Wires both into the owner's step, its deadline, its wake and its retirements |
-| `Hetoimasia.GPU.Vulkan.GLFW.Internal.Actions` | The owner-thread actions' bounded queue, their tickets and standing, admission and start against the gate, and refusal of what is left |
+The controller's modules are `Internal.Rendering` (frames above the
+generations, what asks for a frame, completion polls, retirement readiness),
+`Internal.Loop` (the adapter), `Internal.Controller` (the owner's step,
+deadline, wake and retirements) and `Internal.Actions`.
 
 ## Surface-free sessions and owner-thread actions
 
-GRS-15 ([#336](https://github.com/coghex/hetoimasia/issues/336)) delivers
-[D-28](archive/designs/gpu_resource_services_design.md#d-28-the-device-can-start-without-a-window-inside-the-existing-owner):
-offscreen and upload work runs without a window inside the existing
-GLFW-hosted graphics owner, not a second, headless one. On Linux the host
-still runs under a display — the native suite's isolated X11 display — because
-GLFW's session needs one; running without a display server is out of scope.
+Offscreen and upload work runs without a window inside the existing
+GLFW-hosted graphics owner. On Linux the host still runs under a display,
+because GLFW's session needs one.
 
-### The setting
+`vulkanDeviceStart` says when the session's one device is created:
 
-`vulkanDeviceStart` in `VulkanHostConfig` says when the session's one device
-is created:
+- **`DeviceAtFirstSurface`** (default): selected against the first window
+  surface handed over.
+- **`DeviceSurfaceFree`**: created in the owner's startup against no surface.
+  `selectSurfaceFreeDevice` takes the first device satisfying the whole
+  profile except presentation, keeping every extension and feature a later
+  swapchain needs. No satisfying device is `NoCompatibleDevice`, fatal to the
+  owner. Every window handed over later is a later target, checked against
+  the chosen queue family.
 
-- **`DeviceAtFirstSurface`**, the default, is every windowed application's
-  selection, unchanged: the device is selected against the first window
-  surface handed over and created at its admission
-  ([Admitting targets](#admitting-targets)). The triangle sample keeps it.
-- **`DeviceSurfaceFree`** creates the device in the owner's startup, before any
-  window and against no surface.
+Either way it is the session's only device.
 
-Either way it is the session's only device. No setting creates a second one,
-and adapter preference among several compatible devices is not decided here
-(the first compatible device in enumeration order is taken, as before).
-
-### Surface-free bootstrap
-
-The owner's startup creates the instance and its explicit messenger as
-always, then — before it leases the instance to the surface bridge — the roots'
-`startRootsDevice`:
-
-1. every physical device is enumerated **with no surface-support query**
-   (`opsDeviceOffers` is given no bootstrap surface, and answers every queue
-   family as not presenting);
-2. `selectSurfaceFreeDevice` takes the first device satisfying the whole
-   profile except the presentation requirement: Vulkan 1.3,
-   `dynamicRendering`, `synchronization2`, the texture table's six
-   descriptor-indexing features, `VK_KHR_swapchain`,
-   `VK_EXT_swapchain_maintenance1` and its `swapchainMaintenance1` feature,
-   `VK_KHR_portability_subset` where advertised, and one queue family that
-   answers graphics. Dropping only presentation keeps every extension and
-   feature a later swapchain needs, so the device can still present once a
-   surface arrives;
-3. the device is created with that family's one queue, recorded in the same
-   masked step, and it and its queue are named, exactly as at a first
-   admission ([Names and labels](#names-and-labels)).
-
-No satisfying device is `NoCompatibleDevice`, naming every candidate and what
-each lacks — `DeviceNoGraphicsFamily` when no family answers graphics — a
-structured startup failure, fatal to the owner, having created no device; the
-owner's drain destroys the messenger and the instance. `readReadiness` then
-answers `RootsFailed`. A session whose failure was latched before the device
-could be created raises that primary instead of creating anything.
-
-### Later admission
-
-Once a surface-free start has created the device, every window handed over is
-a later target: its surface is checked against the chosen queue family with
-`vkGetPhysicalDeviceSurfaceSupportKHR`, admitted if that family presents to
-it, and otherwise rolled back with `TargetSurfaceUnsupported`, destroyed on
-the owner's thread, exactly as any later target is today. No second device
-and no second queue is ever created (D-7).
-
-### Zero-target progress
-
-A session with zero targets — one that never had a window, or whose windows
-have all closed — keeps making owner progress until the application ends it.
-The owner offers its step every round, whatever its targets, and a round comes
-when something wakes it or its own deadline does: the model's completion-poll
-schedule, a released resource's disposal, an admitted owner-thread action. In
-that step completion is polled when the model's schedule says a poll is due,
-and every released managed resource nothing still holds is destroyed
-(`reclaimReleased`). It records no frame and needs no render demand: nothing
-asks a frame of a session with no target. When nothing is owed it names no
-deadline and sleeps until woken; it never polls without cause.
-
-It retires through the same protected exit as a windowed session
-([Destruction order](#destruction-order)): with no target to retire,
-whole-owner retirement refuses what is still queued, disposes of every managed
-resource, and destroys the device, and whole-owner destruction then destroys
-the messenger and the instance, keeping the primary failure, if there was
-one, and the teardown evidence beside it.
+**Zero-target progress.** A session with no targets keeps making owner
+progress: completion is polled when the model's schedule says so, released
+resources are destroyed, and actions run. When nothing is owed it names no
+deadline and sleeps until woken. It retires through the same protected exit.
 
 ### Owner-thread actions
 
 `submitVulkanAction` hands the graphics owner a `VulkanAction`: bounded work,
-run once on the owner's thread and lent the session's `Construction` — the
-same one each frame's renderer is lent
-([Consumer construction](#consumer-construction)) — whose result the caller
-takes back from the `ActionTicket` it is given, with `readVulkanAction` or
-`awaitVulkanAction`. It works with or without targets. GRS-12 extends it with
-frame-less batch recording ([Frame-less batches](#frame-less-batches)).
+run once on the owner's thread and lent the session's `Construction`, whose
+result the caller takes from its `ActionTicket` (`readVulkanAction`,
+`awaitVulkanAction`). It works with or without targets.
 
-- **Admission** is one `STM` transaction that never waits. It refuses at
-  once, with the reason, when the session has failed (`ActionSessionFailed`,
-  with its primary), when the owner's admission has closed — its exit has
-  begun, or its run has ended (`ActionOwnerClosed`) — when no device exists
-  yet (`ActionDeviceNotReady`: under `DeviceAtFirstSurface`, until the first
-  window is admitted; nothing is created for it and it is never held until a
-  device exists), and when the queue already holds `vulkanActionCapacity`
-  actions (`ActionQueueFull`; release requests are not counted toward it, they
-  have `vulkanReleaseCapacity` of their own and `ReleaseQueueFull`, below).
-  Waiting for the outcome is the caller's
-  explicit choice. Admission wakes an idle owner without any window event or
-  render demand: the queue is part of the owner's wake, except while a
-  diagnostic failure is pending, when the owner looks again within its poll.
-- **Running.** The owner's step, after its checkpoint, runs the actions queued
-  when the step began before anything else it does, one at a time; the rest of
-  the step — completion polls, reclamation, frames — follows in the same round.
-  So an action never runs concurrently with a frame's rendering, and what it
-  releases is reclaimed by that same step when nothing holds it. An action
-  admitted meanwhile waits for the next round, which its admission asks for.
-- **Start and exit.** Each action is started in one transaction that asks the
-  same gate admission asks: once the session has failed or the owner's
+- **Admission** is one transaction that never waits. It refuses with
+  `ActionSessionFailed`, `ActionOwnerClosed`, `ActionDeviceNotReady` (under
+  `DeviceAtFirstSurface`, until the first window is admitted) or
+  `ActionQueueFull` (`vulkanActionCapacity`). Admission wakes an idle owner.
+- **Running.** The owner's step runs the actions queued when the step began,
+  one at a time, before anything else it does, so an action never runs beside
+  a frame's rendering.
+- **Start and exit.** Each action is started in a transaction that asks the
+  same gate as admission; once the session has failed or the owner's
   admission has closed, a queued action is refused (`ActionRefused`) and never
-  runs. A caller reading its ticket asks that gate too, and settles a queued
-  action the gate refuses there and then, so quiescence — which closes the
-  owner's admission before ordinary workers drain
-  ([Stop and quiescence](#stop-and-quiescence)) — answers every waiting worker
-  at once, without waiting for the owner. Exactly one of the two decides:
-  every admitted action receives a settled outcome or a refusal. An action
-  already running finishes, keeping what it borrowed until it returns.
-  Whole-owner retirement refuses whatever is still queued.
-- **Failure.** An action that raises answers `ActionRaised` with what it
-  raised, and the owner goes on; whatever it constructed before it raised is a
-  managed resource of the session, released and destroyed as the renderer's
-  are. It is never run again. What the owner's run must end with is raised on
-  after the ticket is settled: a cancellation of the owner; a failure setting
-  the construction up — making the recording, the first time one is needed —
-  which ends the run as it would a frame's; a construction whose failure
-  escaped it — one that committed a generation, or that raised because the
-  session latched a failure, such as the device's loss — which the
-  construction records as it raises, so it ends the run however the action
-  handled it, even caught and returned from, and the ticket then answers
-  `ActionRaised` with it unless the action raised its own; and a failure the
-  session latched meanwhile, raised as its primary as the step's own
-  checkpoint raises it. None clears the terminal latch. The ticket is marked
-  running, and settled, with asynchronous exceptions masked everywhere but
-  inside the construction's setup and the action itself, so nothing can end
-  the owner with a ticket left running.
-- **Cooperation.** An action is a cooperative, finite callback. The owner does
-  nothing else while it runs, so it must not wait for work that needs the same
-  owner — another action's outcome, a frame, a handover — which could only
-  come after it returns. `Construction` calls from any other thread are
-  refused (`RefusedNotOwner`), as they are for the renderer.
-
-A release request ([A scene for each window](#a-scene-for-each-window)) is an
-action that also waits for the scene revisions its barrier names, admitted and
-settled by exactly these rules and sharing the queue but not its bound: it is
-counted against `vulkanReleaseCapacity`, a capacity of its own, and one made when
-that is full is refused at once with `ReleaseQueueFull`. Neither class of
-admission can fill the other's bound, so a release request waiting on a barrier
-never causes `submitVulkanAction` to be refused.
-
-The headless examples cover each case over the scripted seam — surface-free
-startup and teardown order with no window, later admission and refusal, an
-action on the owner's thread returning its result, the default setting's
-device-not-ready refusal, the full queue's immediate refusal, the two bounds'
-independence (each class refused at its own capacity, an empty barrier still
-counted, slots reused, zero capacities, and device, session and owner refusals
-ahead of a full queue), a raising
-action's failure and its retained resources, a construction's device loss
-ending the owner — raised, or caught and returned from — a failure setting the
-construction up settling its ticket before it ends the owner, refusal after terminal failure and after exit begins
-(including one queued behind a running action), serialization with frames,
-zero-target disposal with no target and after the last target closes, and an
-idle session with no target naming no deadline until an action wakes it;
-the native suite's `grs15-surface-free` and `grs15-surface-free-window` run
-them against the device ([The native suite](#the-native-suite)).
+  runs. A caller reading its ticket asks the gate too. Every admitted action
+  receives a settled outcome or a refusal.
+- **Failure.** An action that raises answers `ActionRaised` and the owner
+  goes on; what it constructed stays a managed resource of the session. It is
+  never run again. A cancellation of the owner, a failure setting the
+  construction up, and a construction failure that escaped (a committed
+  generation, or a latched session failure) end the owner's run after the
+  ticket is settled.
+- **Cooperation.** An action is a finite callback. It must not wait for work
+  that needs the same owner: another action's outcome, a frame, a handover.
 
 ## Frame-less batches
 
-GRS-12 (#337; resource services design D-12) records batches that belong to
-no frame — offscreen rendering and uploads, which later issues build on —
-with their own submission and completion. The model's rules are
+Batches that belong to no frame (offscreen rendering and uploads) have their
+own submission and completion. The model's rules are
 [gpu_model.md's](gpu_model.md#frame-less-batches).
 
-**Recording.** Inside an owner-thread action, `constructFramelessBatch` lends
-a consumer a `Recorder` for one frame-less batch and answers its
-`BatchTicket`. The recorder is the frame's, with every check a frame's batch
-has — the owner's thread, the handles, retention before each native call,
-#335's transitions, boundary barriers and sealing rules — but no swapchain
-image: every command that needs one (`transitionImage`, `beginRendering`,
-`copyToReadback`) is `RefusedUnsupported` before anything native. It renders
-into a managed color target instead ([Offscreen color
-targets](#offscreen-color-targets)): `bindPipeline`, `setViewport` and
-`setScissor` are checked against the open pass's target, and outside a pass,
-with no image to check them against, are `RefusedIllegal`. The batch is recorded into the
-command storage of the lowest free frame-less slot: made the first time the
-slot is used — named, released and destroyed like a frame storage — and reused
-by later batches of the slot only after its batch was discarded or its
-submission's completion observed, its pool reset first. A renderer's frame
-records no frame-less batch: the construction it is lent refuses one.
-
-**Submission order.** When the action returns, its sealed frame-less batches
-are submitted in the order they were sealed, each as a `vkQueueSubmit2` of its
-own on the one graphics queue, with no wait and no signal but its slot's
-fence — before anything else the owner submits after the action, so before
-any later frame's submission. One the queue accepted stays accepted whatever
-follows. The first that is refused, or fails with no effect after its one
-reclamation and retry (VK-14), is discarded with every batch sealed after it;
-one whose effect is unknown fails the session with
-`FramelessEffectUncertain`, retaining what it held, and the rest are
-discarded. A batch left partial is never submitted and is discarded, as only a
-discard ends one. An action that raised, or was cancelled, submits nothing and
-discards every batch it opened; a discard whose storage reset raised keeps the
-batch, its references and its slot, uncertain, fails the session, and the
-action's own failure is still the one raised. The device's loss is asked again
-before each discard: once lost, every batch left is let go of under the
-device-loss rule instead, its ticket lost, with no native call.
-
-**Tickets.** A `BatchTicket` names one batch, whatever slot or storage later
-serves another. `readTicket` reads it from any thread without a native call:
-`TicketPending` until its submission's fence has been observed signalled and
-recorded with the model, then `TicketComplete`; `TicketDiscarded` once its
-batch was discarded; `TicketLost` if the device was lost while it was pending.
-Once terminal it never changes, after the slot's reuse and the session's end
-alike. `awaitTicket` waits for a terminal state at most the given duration and
-answers the state then; its expiry, or its cancellation, discards nothing,
-releases nothing and completes nothing. It is refused on the graphics owner's
-thread (`RefusedOwnerWait`), whose own return and progress the batch needs.
-
-**Progress.** The owner observes frame-less fences in its bounded progress
-step, among its other work and on the same rotation, so one that has not
-signalled never holds back another — in windowed and zero-target sessions
-alike, since a pending submission is owed work the model's poll schedule
-counts. A signalled fence is recorded as the submission's completion, which
-discharges its holds and frees its slot, and completes its ticket. A fence
-whose query raised without losing the device is uncertain: the session fails,
-the fence is never asked again, and the submission is kept with its ticket
-pending — retaining it and the device, and letting a later loss report it
-lost. A slot's fence is made at its first submission; one whose creation ran
-out of memory is recovered once, as a frame slot's are (VK-14), and one that
-is not recovered discards the batch without recording it again. Once made,
-the fence is named `frame-less slot <s> submission fence` when the device
-offers naming, before it is recorded and never again, and a naming that raised
-destroys it once: when that returns nothing is recorded and the rollback fails
-nothing itself — a loss the naming reported stays latched — the naming failure
-is raised, and the slot's next submission makes and names a new fence while
-the session runs; when that destruction raised too, the fence is kept,
-uncertain, and never passed to another native call, under the device-loss rule
-too, the session fails with `CleanupFailed`, and the destruction is retained
-beside the naming failure under the `vulkan frame synchronization rollback`
-label.
-
-**Device loss and retirement.** After the device's loss no fence is asked or
-waited on: the device-loss release lets go of every frame-less submission,
-completing none and settling each pending ticket as lost, and forgets every
-unsubmitted frame-less batch with no native call, discarding it in the model.
-At whole-owner retirement the owner waits, in the frames' finite drain steps
-and for at most a hundred of them, for each outstanding frame-less
-submission's fence, then destroys the frame-less fences. One still outstanding
-without device-loss evidence is retained (`FramelessRetained`), and so is the
-device: nothing is certified complete to finish the teardown.
-
-| State | Owner | Readers and writers | Thread | Lifetime | Reset or disposal |
-| --- | --- | --- | --- | --- | --- |
-| A frame-less slot's command storage | The recording's managed records and storages (`State`) | `Recorder`'s frame-less recording makes it through `Construction`, resets it before reuse through `Batches`; `Disposal` destroys it | The graphics owner | Its slot's first batch until the owner retires the recording | Destroyed once released and no batch holds it; kept, uncertain, if its reset or destruction raised |
-| A frame-less slot's fence | The frames (`Frames.State`) | `Frameless` makes it at its slot's first submission, resets it before each later one and destroys it at retirement; `Progress` and `Loss` advance it | The graphics owner | Its slot's first submission until the owner retires | Destroyed by `retireFrameless` once idle, or under the device-loss rule; kept, uncertain, otherwise |
-| A frame-less submission's record | The frames (`Frames.State`) | `Frameless` inserts it; `Progress` removes it on its fence's signal, `Loss` on the device's loss | The graphics owner | The submission until its completion is observed or the device is lost | Removed with its ticket settled |
-| A ticket's state | The ticket (a `TVar` in `Recording.State`) | The recording settles it on a discard, the frames on a completion or the device's loss; any thread reads it | Any, in STM | From the batch's opening for as long as the caller keeps the ticket | Only ever leaves pending, once |
-| An action's frame-less scope | `Frameless`'s `withFramelessScope` | The action's recording notes each batch it opens and seals; the scope submits and discards them when the action ends | The graphics owner | One owner-thread action | Ends with the action |
-
-The headless examples cover each case over the stand-in native layers — seal
-order before a later frame, swapchain commands refused, a partial batch
-discarded, an action raising after sealing, an accepted prefix kept when a
-later submission fails with no effect or an unknown effect, slot reuse only
-after completion or discard, a discard whose reset raised, tickets completed
-only on fence evidence, lost on device loss and waited for with a deadline,
-a ready submission observed behind one that has not signalled,
-initialization, and retirement — and the integration examples record
-frame-less batches inside owner-thread actions of a zero-target session; the
-native suite's `grs12-frameless` runs them against the device
-([The native suite](#the-native-suite)).
+- **Recording.** Inside an owner-thread action, `constructFramelessBatch`
+  lends a consumer a `Recorder` for one frame-less batch and answers its
+  `BatchTicket`. Every check a frame's batch has applies, but there is no
+  swapchain image: `transitionImage`, `beginRendering` and `copyToReadback`
+  are `RefusedUnsupported`. It renders into a managed color target. A
+  renderer's frame records no frame-less batch.
+- **Submission order.** When the action returns, its sealed frame-less
+  batches are submitted in the order sealed, each as its own
+  `vkQueueSubmit2`, before anything else the owner submits after the action.
+  One the queue accepted stays accepted. The first that is refused, or fails
+  with no effect after its one recovery, is discarded with every batch sealed
+  after it. An unknown effect fails the session
+  (`FramelessEffectUncertain`). An action that raised or was cancelled
+  submits nothing and discards every batch it opened.
+- **Tickets.** `readTicket` reads from any thread: `TicketPending`, then
+  `TicketComplete` (its fence observed signalled and recorded with the model),
+  `TicketDiscarded`, or `TicketLost` (the device was lost while pending).
+  `awaitTicket` waits at most the given duration and discards, releases and
+  completes nothing; it is `RefusedOwnerWait` on the owner's thread.
+- **Progress.** The owner observes frame-less fences in its bounded progress
+  step on the same rotation as its other work. A fence whose query raised
+  without losing the device is uncertain: the session fails and the
+  submission is kept with its ticket pending.
+- **Device loss and retirement.** After device loss every frame-less
+  submission is let go of, completing none, with each pending ticket settled
+  lost. At whole-owner retirement the owner waits, in finite drain steps (at
+  most a hundred), for each outstanding frame-less fence. One still
+  outstanding without device-loss evidence is retained (`FramelessRetained`),
+  and so is the device.
 
 ## Destruction order
 
 | Exit | What is destroyed, in order, on the owner's thread |
 | --- | --- |
-| A window closed or a target released | That target's swapchain generations — each one's image views, newest first, then its swapchain — and then its surface. The owner writes its terminal record only after the destructions returned, and the main thread then certifies the attachment's facts and releases the window. The device, the instance, the owner and every other target stay live, and nothing is joined. A generation still held retains the surface, and with it everything above. |
-| Whole-host exit (D-33), with or without targets | Every remaining target's surface, if any remains; then — whole-owner retirement — every surface the lease still owes that no target held (an attachment whose announcement never reached the owner), every owner-thread action still queued is refused, every frame-less submission still outstanding is waited for in the frames' finite drain steps and then every frame-less slot's fence destroyed (GRS-12), every managed resource the recording still holds — the consumer's pipelines before their layouts, whether its renderer or an owner-thread action built them, and any capture's readback buffer, each once no batch holds it (VK-19) — then the device's allocator, once no allocation made from it remains, and the device; then — whole-owner destruction — any surface a creation still in its native call left, the explicit messenger, and the instance, the last call that can reach the capture's callback. Only after that evidence is the owner joined, and only then are windows, the session and the capability released. |
+| A window closed or a target released | That target's swapchain generations (each one's image views, newest first, then its swapchain), then its surface. The owner writes its terminal record only after the destructions returned; the main thread then certifies the attachment's facts and releases the window. Everything else stays live. |
+| Whole-host exit | Every remaining target's surface; then, in whole-owner retirement: every surface the lease still owes, every queued owner-thread action refused, outstanding frame-less submissions waited for and their fences destroyed, every managed resource (pipelines before their layouts), the allocator once no allocation remains, and the device; then, in whole-owner destruction: any late surface, the explicit messenger, and the instance. Only after that evidence is the owner joined, and only then are windows, the session and the capability released. |
 
 Each step is refused rather than reordered when something that must go first
-has not verifiably gone. A destruction that raised is uncertain: it is recorded,
-never attempted again, and it retains every parent above it. Running a
-destruction and recording what it did are one masked step, so a destruction
-that returned always removes its record and one that raised — synchronously or
-with a cancellation of its own — always leaves it marked uncertain; a
-cancellation is re-raised only after that record exists. The failures are
-`SurfaceDestructionFailed`, `RootDestructionFailed` and `RootsRetained`, which
-name what was retained — `AllocationsRemain` and `AllocatorRemains` among them,
-for an allocator that still holds an allocation or whose destruction was
-uncertain, either of which retains the device. The owner then produces no evidence for what is retained, so the host
-keeps the window, the session and every parent, as VK-18's contract requires;
-only independent evidence ends that wait. The instance is destroyed only once
-the surface bridge's lease is releasable. No timeout, cancellation or cleanup
-failure is permission (D-33, LIFE D-4).
+has not verifiably gone. A destruction that raised is uncertain: it is
+recorded, never attempted again, and retains every parent above it
+(`SurfaceDestructionFailed`, `RootDestructionFailed`, `RootsRetained`,
+`AllocationsRemain`, `AllocatorRemains`). Running a destruction and recording
+what it did are one masked step. The host then keeps the window, the session
+and every parent until independent evidence arrives. No timeout, cancellation
+or cleanup failure is permission.
 
 ## Terminal failure
 
-VK-15 ([#231](https://github.com/coghex/hetoimasia/issues/231)) is the
-session's terminal failure and the teardown that follows it: D-17's device
-loss, D-19's and P-11's sink failure, D-20's validation error, D-22's required
-target, and D-33's all-exit drain, over P-2's ownership table and P-5's
-dependency order, with P-14's rule that a target's designation never supplies
-missing safety evidence.
-
 ### The latch
 
-The roots keep one terminal latch. Its first failure, from any of these
-sources, is the session's **primary**:
+The roots keep one terminal latch. Its first failure is the session's
+**primary**:
 
 | Source | Latched | As |
 | --- | --- | --- |
-| A queue or device call answered `VK_ERROR_DEVICE_LOST` | By the call's own guard, before the failure propagates | `TerminalDeviceLost`, naming the call |
-| An error-severity validation report | At the next checkpoint, which asks the capture's error latch — set before the report's detail is admitted, whatever the queue, the logger's filter or the sink did | `TerminalValidationError` |
-| The diagnostic sink failed | At the next checkpoint, which asks `captureAlarms` | `TerminalSinkFailed`, a terminal status of its own |
-| A native effect whose outcome is unknown | By the step that observed it: a submission, a presentation, a bookkeeping refusal | `TerminalUncertainEffect` |
-| A cleanup that raised | By the destruction or cleanup that raised: a surface — one created while the lease closed included — a root, a generation, a frame's cleanup submission or release, a slot's or pool record's objects, a managed resource | `TerminalCleanupFailed` |
-| A required target's recovery exhausted | The model escalates it; the next checkpoint, or any read of the latch, takes it | `TerminalRequiredTarget` |
+| A call answered `VK_ERROR_DEVICE_LOST` | By the call's own guard, before the failure propagates | `TerminalDeviceLost` |
+| An error-severity validation report | At the next checkpoint, from the capture's error latch | `TerminalValidationError` |
+| The diagnostic sink failed | At the next checkpoint | `TerminalSinkFailed` |
+| A native effect whose outcome is unknown | By the step that observed it | `TerminalUncertainEffect` |
+| A cleanup that raised | By the destruction or cleanup that raised | `TerminalCleanupFailed` |
+| A required target's recovery exhausted | At the next checkpoint or read of the latch | `TerminalRequiredTarget` |
 
-Reporting an error wakes no one. The error is latched at the owner's next
-checkpoint, and the owner takes a round only when something asks for one: a
-sink failure and a primary latched on another thread have wakes of their own,
-a validation error does not, and neither does a release request waiting on its
-barrier. An example that reports an error from its own thread therefore gives
-the owner a round afterwards, as an admitted action, a published demand or a
-published scene does, and the integration suite's examples do. One that only
-waited for the failure depended on the owner not yet having ended the round that
-took its last input, which a loaded Linux runner decided the other way in about
-two runs in a hundred (#438).
-
-Latching the primary is one transaction: it closes the roots' admission and
-fails the model's session with the matching cause (`DiagnosticSinkFailed` for
-a sink). Every cleanup failure is latched with its subject and what raised —
-the surface, root, generation, frame, slot, pool record, batch or resource —
-so several failures of one pass are each accounted for rather than collapsed
-into one. The controller's surface discharges — an unannounced or rejected
-attachment's, a retired target's remaining ones, the orphans the owner's
-retirement finds and the late ones its destruction finds — latch each
-destruction that raised by its surface's handle and attachment. A later pass
-that finds the same obligation still owed is refused by the bridge as
-`DischargeStillUncertain`, which is not latched again; what is recognised is
-the obligation's own identity, never the handle, which a later surface may
-reuse. A failure after it never displaces it: it joins the latch's evidence
-as `LaterFailure`, oldest first, the first 64 kept and the rest counted. A
-failure the model recorded by itself before anything was latched is the primary
-it stands for, and one that describes the same failure as the model's cause —
-an uncertain submission the model recorded and the step that says what it was —
-is one failure, with the step's detail.
-
-The first failure is first by one ordering point shared by every source: the
-diagnostic capture's first-failure cell. An error report claims it with a
-compare-and-swap before it sets the error latch, and the capture's worker
-claims it for its sink before it publishes the failure; a failure of the
-owner's own claims it too (`claimCaptureOrder`), inside the transaction that
-records it, wherever it comes from — a native call that answered the device's
-loss, a cleanup that failed, an effect whose outcome is unknown, and any
-transition the model makes that fails a running session by itself, such as a
-required target's exhausted recovery (`stateRootsModel` checks every transition
-for that before committing it, and only the owner changes the model). When a
-validation error or sink failure claimed the cell first, it is latched in that
-same transaction ahead of the owner's failure, which joins the evidence; a
-transition that would have failed the session is taken on the failed session
-instead, so a required target's recovery goes no further. A sink failure whose
-reason its worker has not yet published is waited for inside the transaction,
-which never blocks: a `retry` there would make the transaction interruptible
-even under `mask_`. The worker publishes right after its claim, in one masked
-step that calls nothing native, delivers nothing to the sink and waits on
-nothing, so the wait depends on that thread's CPU bookkeeping alone — never on
-a driver, the sink or the owner — and it promises no wall-clock bound. Nothing
-in it is interruptible and it masks nothing of its own: a masked record cannot
-be cancelled there, and an unmasked one can, as anywhere else in its
-transaction. The claim answers the same however often a transaction runs it.
-
-A claim holds first place only for the transaction attempt that made it, and
-it is a compare-and-swap in C that an abandoned attempt does not undo. Each
-claiming attempt therefore enters a token in the roots, held there only
-weakly, and writes it into its own transaction log: the attempt keeps it alive
-while it may still commit, and once GHC discards an abandoned attempt — rolled
-back by an exception, or run again — a collection finds the token gone,
-whatever the claiming thread goes on to do. Between the owner's claim and the
-commit of the transaction that records its failure, a checkpoint on another
-thread — a handover's, say — sees the claim (`CaptureOwnerClaimed`,
-`AlarmOwnerClaimed`) with nothing latched and its attempt's token alive, and
-answers `CheckpointPending`, latching nothing, so a later diagnostic failure
-cannot take the owner's place. A claim no live attempt holds is void: the
-checkpoint latches the alarms beside it as usual, so an abandoned transaction
-leaves no checkpoint pending and no settled checkpoint waiting. It runs a major
-collection to tell, and only while nothing is latched, a claim is visible and
-some token still answers.
-
-A diagnostic failure that arrives behind a claim loses its own claim, so the
-capture also records each one's arrival before it tries to claim, and which
-arrived first (`hetoimasia_capture_arrived_failures`). It answers those behind
-an owner's claim in the order they arrived, and one whose alarm is not yet
-readable as `CaptureAlarmPending` beside the claim. A checkpoint therefore
-answers pending, never clear, while a sink failure behind a void claim is
-unpublished. A later failure of the owner's own, whose claim the void one still
-answers first, takes the capture's arrivals, read right after its claim
-(`captureArrivals`, carried in `OwnerFirst`), as its order point: each
-diagnostic failure that had arrived by then is latched ahead of it once
-readable, in the order they arrived — a wait bounded as the sink's publication
-is — and one that arrives
-after comes after it, as it would behind a claim of its own.
-
-Every record of a failure of the owner's own made inside a masked step — an
-uncertain or failed presentation, an uncertain submission, a progress step's
-fence answer, a device loss — is therefore made whole or not started, whatever
-cancellation is aimed at the owner: its transaction never blocks, so the
-cancellation arrives after it. A device loss is latched with exceptions masked
-from the moment its call returns (`rootsCall`), and a progress step asks each
-fence and records its answer in one masked step.
-
-Roots given only a list
-of alarms (`watchRootsDiagnostics`, as headless examples use) latch them at
-checkpoints and order nothing; the controller installs the capture's order
-(`watchRootsDiagnosticsOrdered`). The
-device's loss is also kept apart
-from the primary (`reportDeviceLost`), whenever it is observed: a session that
-a validation error failed first and whose teardown then meets the loss keeps
-the validation error as its primary and switches that teardown to the
-device-loss rules. The model records the loss the same way, with `noteDeviceLoss`,
-beside its first cause. `readVulkanTerminal` reads the whole latch from any
-thread.
+- Latching the primary is one transaction that closes the roots' admission
+  and fails the model's session.
+- A later failure never displaces the primary: it joins the latch's evidence
+  as `LaterFailure`, oldest first, the first 64 kept and the rest counted.
+  Each cleanup failure is latched with its subject.
+- **Reporting a validation error wakes no one.** It is latched at the owner's
+  next checkpoint, and the owner takes a round only when something asks for
+  one. A sink failure and a primary latched on another thread have wakes of
+  their own. A test that reports an error from its own thread must give the
+  owner a round afterwards.
+- **Which failure was first** is decided by the diagnostic capture's
+  first-failure cell ([vulkan_diagnostics.md](vulkan_diagnostics.md#the-verdict)),
+  which the capture's callback, its worker and the owner's own failures all
+  claim. A checkpoint that sees a claim whose failure is not yet readable
+  answers `CheckpointPending`: it latches nothing and refuses new work, so
+  admission never reopens in between. A claim made by a transaction attempt
+  that was abandoned is void.
+- The device's loss is kept apart from the primary (`reportDeviceLost`): a
+  session a validation error failed first whose teardown then meets the loss
+  keeps the validation error as primary and switches teardown to the
+  device-loss rules.
+- `readVulkanTerminal` reads the whole latch from any thread.
 
 ### Checkpoints and refusals
 
-A checkpoint asks the capture for its alarms — the controller installs
-`captureAlarms`, the capture's error latch and sink failure, as the roots'
-diagnostic watch — latches them in the order they happened, and answers the
-primary. The capture's C callback and its worker claim one first-failure cell
-with a compare-and-swap before either sets its own latch, so a sink failure
-followed by a validation error before the next checkpoint stays the primary
-with the error beside it, and the other way round, whichever thread got there
-first. A checkpoint that looks after the first failure claimed the cell but
-before it set its own alarm is told only that a failure is pending
-(`CaptureAlarmPending`, `AlarmPending`): it answers `CheckpointPending`,
-latches nothing — neither the capture's alarms nor a failure the model recorded
-by itself, which might otherwise be taken ahead of the diagnostic failure that
-came first — and refuses new work, so the next checkpoint latches them in order
-and admission never reopens in between. It raises nothing, calls nothing native
-and waits for nothing. The owner's ordinary operations pass through one:
-
-- the controller's progress step raises the primary — the loss as
-  `GraphicsDeviceLost`, anything else as `GraphicsSessionFailed` — which ends
-  the owner's run: the owner machinery latches it, closes its admission, and
+- The controller's progress step raises the primary (`GraphicsDeviceLost` or
+  `GraphicsSessionFailed`), which ends the owner's run;
   `superviseGraphicsOwner` raises it at the application's checkpoint while
-  retirement is still running; while a failure is pending it does nothing new
-  that round and asks for another within the controller's poll;
+  retirement is still running.
 - `recordFrame`, `tryAcquireFrame`, `submitFrames` and `presentFrame` refuse
-  with `RefusedSessionFailed` naming the primary before anything native, or
-  with `RefusedDiagnosticPending` while a failure is pending;
-- `handOverVulkanTarget` answers `VulkanSessionFailed` naming the primary, or
-  `VulkanDiagnosticPending` while a failure is pending, and attaches nothing;
-- the owner's construction of a handed-over target, which a round runs before
-  its step, checks again (`checkpointRootsSettled`: it latches what the
-  capture holds, waiting out a pending alarm) before anything native, and
-  rejects with `RejectedSessionFailed` a target whose session failed after its
-  handover; it checks once more when admission's native calls return, and a
-  target a layer reported against during them is answered as a partial
-  construction, which the owner owns and retires, never as a usable one.
+  with `RefusedSessionFailed`, or `RefusedDiagnosticPending` while a failure
+  is pending.
+- `handOverVulkanTarget` answers `VulkanSessionFailed` or
+  `VulkanDiagnosticPending` and attaches nothing. The owner's construction of
+  a handed-over target checks again and rejects with `RejectedSessionFailed`.
 
-Retirement never passes through one. Closing and skipping frames, the
-progress step's observations, the finite drain wait, and every target's,
-generation's, root's and the owner's retirement keep running, because they run
-precisely because the session has failed. A validation error a layer reports
-from inside one of the owner's own calls is seen at that round's step. A sink
-failure arrives on the diagnostic worker's thread, so the controller asks the
-owner to wake for it (`graphicsWake`) while it is published and not yet
-latched: an owner with no round due takes one at once, and its step latches
-the failure.
-
-### The call that observed the failure
+**Retirement never passes through a checkpoint.** Closing and skipping
+frames, progress observations, the drain wait and every retirement keep
+running, because they run precisely because the session has failed.
 
 The native effect a failing call had is recorded in the same masked step as
 the call, before anything propagates, even when the call's own device loss
-failed the session in between: an acquisition that raised gives its reservation
-back, a submission that raised is recorded as an uncertain effect — the model
-records a failed call's outcome whenever it happened, and refuses only new
-work — a presentation that raised keeps what the swapchain's `pResults` entry
-says it enqueued, and a presentation or submission that returned keeps its
-obligations. The loss is what the caller sees first: a presentation whose call
-raised the loss while its entry answered out of date or surface lost is
-recorded as enqueued, and then the loss is raised.
+failed the session in between.
 
 ### Teardown after device loss
 
-Once the loss is recorded, the specification's device-loss rule governs what
-the lost device could have discharged — its objects may be destroyed without
-waiting for work that may never complete — and nothing else:
+Once the loss is recorded, the specification's rule applies to what the lost
+device could have discharged: its objects may be destroyed without waiting
+for work that may never complete.
 
-- no fence is asked or waited on again: `progressFrames` makes no call, and a
-  step whose own query lost the device asks nothing further; `awaitFrames`
-  waits for nothing;
-- a skipped frame makes no cleanup submission (`StageLost`), and no storage is
-  reset against the lost device: the unsubmitted recording's commands can
-  never execute, so its batch records go with the model's skip — one an
-  earlier reset left uncertain included — and the storage's destruction frees
-  them;
-- `releaseFramesToDeviceLoss` skips every frame still acquired, then has the
-  model release every submission, certain or uncertain, every enqueued
-  presentation, and every frame that had left acquisition
-  (`releaseToDeviceLoss`): their holds end, their pool records are free, each
-  pending fence becomes `FenceLost` and each owed semaphore `SemaphoreLost`.
-  None of it is recorded as completed or retired, no fence is marked signalled,
-  and no recovery cycle is credited;
-- `retireTargetFrames` releases first, then destroys every slot's and pool
-  record's objects whatever they were owed — except one whose destruction
-  already raised, which may already be gone and is destroyed under no rule;
-- the target's generations, whose holds the release ended, then its surface,
-  the device (`"… after its loss"`), the messenger and the instance go child
-  before parent. Nothing waits for the device to go idle, and nothing is
-  recreated or replayed.
-
-A fence wait, a status query or a device wait that answers the loss during
-teardown latches it — as the primary, or beside an earlier one — and settles
-nothing. Before any loss the release is refused: the frames answer
-`RefusedIllegal` and the model `WrongPhase` of the device.
+- No fence is asked or waited on again.
+- A skipped frame makes no cleanup submission, and no storage is reset.
+- `releaseFramesToDeviceLoss` skips every acquired frame, then has the model
+  release every submission, presentation and frame that had left acquisition.
+  None is recorded as completed or retired, and no recovery cycle is
+  credited.
+- Frames, generations, the surface, the device, the messenger and the
+  instance go child before parent. Nothing waits for the device to go idle,
+  and nothing is recreated or replayed.
+- An object whose destruction already raised is destroyed under no rule.
 
 ### Teardown under the ordinary rules
 
-After a validation error, a sink failure, a required target's exhaustion, an
-uncertain effect or a failed cleanup, obligations settle on their own evidence,
-as VK-12 and VK-13 settle them, within the drain's finite waits. What cannot be
-verified is retained: an uncertain effect keeps its frame, and with it its
-generation, surface, device and instance (`FramesRetained`,
-`GenerationsRetained`, `TargetGenerationsRemain`, `RootsRetained`); a
-destruction that raised is never attempted again. A gap in the proof's
-destruction evidence for a path blocks that path's release rather than
-authorizing it.
+After any other terminal failure, obligations settle on their own evidence
+within the drain's finite waits. What cannot be verified is retained: an
+uncertain effect keeps its frame, and with it its generation, surface, device
+and instance (`FramesRetained`, `GenerationsRetained`,
+`TargetGenerationsRemain`, `RootsRetained`).
 
-### Evidence and retention
-
-The primary is never displaced. Cleanup failures and later failures join the
-latch's evidence beside it. Validation errors delivered during teardown —
-inside `vkDestroyInstance` too — join the capture's verdict, which follows the
-last callback: retirement asks the latch nothing, so they reach the final
-report through the verdict rather than the latch. A sink failure never
-authorizes a release.
-
-Every retirement the controller runs that could not verify what it owns records
-what it retained in the latch (`RetainedUnverified`) before its failure goes to
-the owner, which keeps its evidence and manufactures no acknowledgement. The
-host then keeps the window, the session and every parent, and waits for
-independent evidence; process termination is the escape, and it is never
-orderly cleanup. Cancellation during the drain, once or repeatedly, follows
-VK-18's D-33 order and releases nothing early.
+Validation errors delivered during teardown reach the final report through
+the capture's verdict, not the latch. A sink failure never authorizes a
+release. Every retirement that could not verify what it owns records what it
+retained (`RetainedUnverified`). Process termination is the escape, and it is
+never orderly cleanup.
 
 ## State
 
-| State | Owner | Readers and writers | Thread | Lifetime | Reset or disposal |
-| --- | --- | --- | --- | --- | --- |
-| Each root's slot (instance, messenger, device, allocator) | The roots | Written by startup, admission and retirement; any thread reads | The owner | The session | Only advances: absent, live, then destroyed or uncertain |
-| Live allocations | The roots | The allocation protocol counts each allocation made and freed; retirement reads | The owner | The session | Counts down as each is freed; the allocator is destroyed only at zero ([Device memory](#state)) |
-| Target records | The roots | Admission inserts, retirement removes; recovery releases a lost surface and installs its replacement in place | The owner | Admission until destroyed | Removed only by a destruction that returned; a surface released by recovery leaves the record with none until a replacement is installed |
-| Disposers | The roots | The generations and the recording each register one when made; a reclamation pass reads them | The owner | The session | Never removed |
-| The GPU model | The roots | Admission, retirement, loss | The owner | The session | Never reset |
-| The loss latch | The roots | Set once; any thread reads | Any | The session | Never cleared |
-| The terminal latch | The roots | `latchTerminal` sets the primary once and appends evidence; any thread reads through `readRootsTerminal` | Any, in `STM` | The session | Never cleared; evidence bounded at 64 with the rest counted |
-| The diagnostic watch | The roots | Installed once by the controller; read by every checkpoint | The owner | The session | — |
-| The requested extensions | The controller | Written once by the session's entry | Main | The host | — |
-| The lease | The controller | Written by startup; read by handovers | Owner, main | Startup until destruction | Released before the instance is destroyed |
-| Deposits | The controller | Written by a construction step; taken by the owner's construction or retirement | Main, owner | Attachment until its construction or retirement | Cleared by whole-owner retirement |
-| Attachment to target | The controller | The owner alone | The owner | Admission until the target's surface is destroyed | Kept on an uncertain destruction |
-| Rejections | The controller | Written by the owner; any thread reads | Owner | The most recent 64 | Oldest dropped |
-| Replacements | The controller | The owner's step asks; `replaceVulkanSurfaces` on the main thread claims, creates and deposits; the owner's step, or the attachment's retirement, takes each | Owner, main | From an admitted attempt's request until its deposit is settled | Taken by the attachment's retirement, which waits for one being created |
-| Unavailability reports | The controller | Written by the owner's step; any thread reads | Owner | The most recent 64 | Oldest dropped |
-| Generation records | The generations' `Internal.Generations.State`, which defines them | `Reconciliation` builds and replaces, `Retirement` retires the active one, and `Disposal` destroys and removes, on the owner's step; any thread holds and ends a CPU use through `Uses`, in `STM` | The owner (uses: any) | From the construction that begins one until its destruction returned | Kept, explicitly uncertain, when a destruction raised; never retried |
-| Whether generations carry a depth image (GRS-13) | The generations' `Internal.Generations.State`, which defines it | The controller asks when it makes them; the recording supplies what makes the images when it is made; `Reconciliation` reads it | Any, in `STM` | The session | Never reset |
-| A generation's depth image (GRS-13) | The generation's record, over a managed image of the recording's | `Reconciliation` makes and records it; `Observation` reads it; `Disposal` releases it when it destroys the generation | The owner | From its construction until the model records its disposal | Released with the generation, destroyed once every batch that recorded it has completed |
-| Swapchain results | The generations' `Internal.Generations.State`, which defines them | The owner reports through `Uses`; `Reconciliation` consumes on its step | The owner | Until the active generation is replaced | Cleared by the publication that replaces it, or by the surface's loss |
-| A target's lost surface and outstanding attempt | The generations' `Internal.Generations.State`, which defines them | `Reconciliation` marks the loss; `Surface` releases, asks and installs; `Retirement` settles an attempt still outstanding | The owner | From the loss until a replacement is installed, or the target retires | Cleared by the installation, or by retirement |
-| Rendering: the recording and the frames | The controller's rendering | Made by the first frame attempted, or the first owner-thread action run, once the device exists; read by every step and retirement | The owner | From then until whole-owner retirement | Retired before the device is destroyed |
-| Rendering: the construction's escape record | The controller's rendering | The first failure a construction raised that must end the owner's run, set as it raises; read by the owner-thread action's runner on both its return and raise paths | The owner | The owner's run | Cleared each time the construction is lent to an action |
-| Owner-thread action queue | The controller's `Internal.Actions` | Any thread admits in `STM`; the owner's step takes and removes | Any, in `STM` | The session | Each entry removed when the owner takes it; emptied by whole-owner retirement, which refuses what is left |
-| An owner-thread action's standing | The controller's `Internal.Actions` | The owner starts and settles it; a reader of its ticket settles one the gate now refuses | Any, in `STM` | From admission until its reader drops the ticket | Only advances: queued, running, settled |
-| The owner's open admission, as actions read it | The controller | Installed once by the composition with the owner's own port state; read by every action's admission and start | Any, in `STM` | The host | Closes with the owner's publications, never reopened |
-| The device start | The controller | Configured; read by the owner's startup | The owner | The host | — |
-| Rendering: per-target records (frame storages, acquisition retry, last generation shown, eligibility, closing) | The controller's rendering | The owner's step, retirement readiness and retirement | The owner | From a target's first render request until its retirement | Removed by the target's retirement |
-| Rendering: the demand and scene revisions acted on, and a demand deadline ahead | The controller's rendering | The owner's step | The owner | The owner's run | Only rise |
-| The scene ledger: each target's adopted revision, the adopted revisions awaiting release, each window's adopted watermark | The controller ([A scene for each window](#a-scene-for-each-window)) | The owner's step adopts and releases; a target's preparation ends it and its retirement forgets it; any thread reads, and a release request's admission reads | Any, in `STM` | A target's admission until its retirement; a record until released | A record is removed, once, before its release hook runs; a window's watermark with the window |
-| The scene uses | The controller's rendering | Opened before a frame's renderer runs; the step ends them on a recording's discard or a submission's completion; the ledger reads | The owner | A frame's recording until the batch is discarded or its submission completed | Removed on that evidence; kept, uncertain, otherwise |
-| The scene source | The controller | Installed once by the composition with the owner: the mode, the host's windows and their published revisions; a barrier and the state read it | Any, in `STM` | The host | Never reset |
-| Observations reconciled | The controller | The owner's step: each target's observation revision and eligibility the generations were last stepped with | The owner | The owner's run | Replaced every step that reconciles |
-| The adapter's published revisions and untaken demand | `runVulkanOwnerLoop` | The main thread, every turn | Main | The loop's run | Bounded by the windows the host holds; untaken demand forgotten once the owner took it |
-| Deferred attachments | The controller | Written by a handover whose announcement the port refused; removed by `announceVulkanTarget` once admitted, or by the owner once it has destroyed the surface | Main, owner | Until announced or settled | Cleared by whole-owner retirement |
-| The depth images generations own (GRS-13) | The recording | A generation's construction adds each; `releaseManaged` reads to refuse a release; disposal removes it with the image | The owner | As the image's managed record | Forgotten with its disposal |
-| Managed records | The recording | Construction inserts; release, replacement and disposal advance each one's standing | The owner | From construction until the model records the disposal | Removed once the model records it; kept, explicitly uncertain, when a destruction raised; never retried |
-| Frame storages | The recording | Construction inserts one per target frame slot; disposal removes it | The owner | As its managed record | As its managed record |
-| Batch records | The recording | `recordFrame` inserts; a discard or reset removes one after the invalidation returned | The owner | From admission until invalidated | Kept, explicitly uncertain, when an invalidation raised; never retried |
-| The shared ring and its regions | The recording | `createRing` makes it; a recorder's claims add regions and reclaim completed batches'; a dropped batch's go with its record | The owner | From `createRing` until its buffer's disposal; each region until its batch completes or is invalidated | Released at retirement with every live generation; regions never reissued, kept through an invalidation that raised |
-| A recorder | Its `recordFrame` | The consumer action | The owner | One consumer action | Closed when the action returns or raises |
-| Slot synchronization | The frames | `Acquisition` creates a slot's three objects and marks its acquisition; `Submission`, `Abandonment` and `Progress` advance each object's state; `Loss` marks what was owed lost; `Progress` destroys them | The owner | From the slot's first reservation until the target's frames retire | Destroyed once idle, or after the device's loss whatever they were owed; kept, explicitly uncertain, when a call on them raised, and never destroyed again once a destruction raised |
-| Presentation pool | The frames | `Acquisition` creates a record and binds it to a frame; `Submission`, `Presentation`, `Abandonment` and `Progress` advance its semaphore and fence; `Presentation` rebinds it to its presentation; `Loss` frees what the loss released; `Progress` frees and destroys it | The owner | From the first reservation that needs it until the target's frames retire | Freed by the retirement or settlement the model recorded, or by the device-loss release; destroyed once free and idle; kept, explicitly uncertain, when a call on it raised |
-| Frame records | The frames | `Acquisition` inserts; `Submission`, `Abandonment` and `Progress` advance; `Presentation` removes on presentation and `Progress` on settlement | The owner | From acquisition until presented or until the model records the settlement | Kept, failed or uncertain, when a cleanup, a presentation or its bookkeeping did not complete |
-| Submission records | The frames | `Submission` inserts; `Progress` removes once the fence signalled | The owner | From the native submission until its fence signalled | Removed with the model's completion fact |
-| Presentation records | The frames | `Presentation` inserts; `Progress` removes once the present fence signalled | The owner | From the enqueued presentation until its present fence signalled | Removed with the model's retirement fact; kept, uncertain, when asking the fence raised |
+Each layer owns its state; all of it is written on the graphics owner's
+thread unless noted, and the owning modules' Haddock has the per-cell detail.
+
+| State | Owner | Notes |
+| --- | --- | --- |
+| Root slots (instance, messenger, device, allocator), target records, disposers, the GPU model | The roots | Slots only advance: absent, live, then destroyed or uncertain. Target records are removed only by a destruction that returned |
+| The loss latch and the terminal latch | The roots | Set once; read from any thread; never cleared. Evidence bounded at 64 |
+| The lease, deposits, deferred attachments, replacements, rejections and unavailability reports | The controller | Written by the main thread and the owner; reports keep the latest 64 |
+| Generation records, swapchain results, lost surfaces, window-depth setting | The generations (`Internal.Generations.State`) | A CPU use is held and ended from any thread. A record is kept, uncertain, when a destruction raised |
+| Managed records, frame storages, batch records, the ring and its regions, upload-held targets, texture table | The recording | Removed once the model records the disposal. Regions are never reissued |
+| A recorder | Its `recordFrame` | One consumer action |
+| Slot synchronization, the presentation pool, frame, submission and presentation records, frame-less fences | The frames | Removed on the model's completion, retirement or settlement fact, or by the device-loss release |
+| Per-target rendering records, revisions acted on, the scene ledger and uses, the offscreen target registry | The controller's rendering | The ledger is read from any thread; a record is removed once, before its release hook runs |
+| The owner-thread action queue and each action's standing | The controller's `Internal.Actions` | Admitted from any thread; standing only advances |
+| The adapter's published revisions and untaken demand | `runVulkanOwnerLoop` | The main thread, every turn |
 
 ## Evidence
 
 **Headless.** The group `test.vulkan-headless` builds and runs, through
-`bash tools/vulkan/run.sh test`, the native backend's shader contract
-(`shader-tests`) and:
+`bash tools/vulkan/run.sh test`, the shader contract (`shader-tests`), the
+native package's `native-tests` over stand-in native layers, and the window
+integration's headless suite over the GLFW seam
+(`withVulkanOwnerHostOver`). They need no device and no display. The
+stand-ins journal every native call, so examples assert order and refusals
+with no native call, never a time.
 
-- `hetoimasia-gpu-vulkan-native:native-tests` — the profile's decisions, and the
-  roots over a stand-in native layer: rollback of exactly what exists at every
-  failing creation step, the structured no-device failure, a cancellation at a
-  creation's handoff, targets keyed by model identity with their designations,
-  the incompatible-target rejection with no second device, the bootstrap
-  target owning nothing, the full destruction order, every refused step behind
-  an uncertain destruction without a retry — including a destruction that
-  raised outright and one a cancellation ended part-way — device loss closing
-  admission with the model failed while an unknown outcome is neither loss nor
-  success, and synchronization validation planned only through an enabled
-  layer that offers it; the presentation profile and D-30's extent as pure
-  decisions — concrete against application-chosen extents, zero area checked
-  before clamping, eligibility first, no invented geometry, every gap of an
-  unsupported surface named, no transfer usage required and no UNORM fallback,
-  image counts within the surface's limits and the tracking limit; and the
-  swapchain generations over the stand-in: construction from the surface's
-  extent and format, a stale observation, zero area suspending without an
-  attempt, a resize coalesced for 16 ms from its first move and built from the
-  newest geometry, a resize that never pauses rebuilt once a period, a move the
-  surface has not caught up with yet, a cancelled move not shortening a later
-  one's period, a newer observation joining the move at an unchanged surface
-  extent, a newer resize built from the newest extent under the one-generation
-  limit once there is room, capacity retiring and destroying first
-  and keeping the active generation presenting otherwise, the one-generation configuration, per-target
-  reservation isolation, an oversized and a zero returned image count refused
-  before any view, a failed replacement unable to reacquire from or hand over
-  the retired handle, a newer resize surviving an in-flight replacement,
-  repeated out-of-date and suboptimal results bounded by the recovery episode
-  without a hot loop, a reported result asking for a step at once until it is
-  reconciled, a closing target's settling replacement and unseen result owing
-  no step, its deadline left to the model's own schedule, a moved observation and a resize after a failed construction
-  each settling before the recovery rebuild, and a move cancelled while
-  recovery waits leaving a later move its full period, failures after the swapchain destroying exactly what they
-  left child before parent, a failed cleanup retained without a retry and
-  retaining the surface, a replacement cancelled before its creation never
-  handing the old swapchain over, a cancellation right after a candidate's
-  admission
-  and one at a creation's handoff, one
-  interrupting a swapchain's or a view's creation inside the call, and one
-  ending a destruction part-way, device loss, and close winning over retry and
-  publication;
-- `hetoimasia-gpu-vulkan-glfw:integration-tests` — whole graphics hosts over the
-  GLFW package's scripted seam, driven through the real owner machinery and
-  controller with a stand-in native layer and surface bridge, journalling every
-  native call with its thread: thread placement, the shared device, readiness,
-  incompatible, unusable and failed surfaces, a full owner port — a deferred
-  attachment released and its surface destroyed by the owner while the host
-  runs, one announced again and admitted, one whose destruction failed
-  reported at a checkpoint without a retry, and one whose answer a cancellation
-  lost after publication, recovered into the same watch, and one refused while
-  the owner drains its port and goes idle before the handover answers — rollback at every startup and
-  bootstrap step, a cancellation during the handoff's surface creation,
-  repeated cancellation during the exit, a first window's close, an individual
-  release, the exit order with the owner joined before any window goes, a
-  destruction still pending certifying nothing, and device loss reaching a
-  checkpoint while retirement is pending, staying primary over a failed
-  cleanup that is retained without a retry; and swapchain generations built on
-  the owner's thread from the geometry the owner folded, replaced after a resize
-  with the old one handed over and destroyed only once its hold ended, none for a
-  hidden target, and a closing window's views and swapchain destroyed before its
-  surface;
-- `hetoimasia-sample-triangle:triangle-tests` — the triangle sample's pipeline
-  cache over stand-in builders: a format's layout built once and handed to
-  every attempt while its pipeline is refused, each refusal answered as it
-  was, the built pipeline reused for every later frame of its format, nothing
-  held after a refused layout, and one layout and one pipeline per color format.
+**Native.** The groups `test.vulkan-native` and `test.vulkan-wayland` run the
+native suite below on a real device with the Khronos validation layer and
+synchronization validation. The retained platform records that tests read are
+under [`docs/vulkan/`](vulkan/) and
+[vulkan_compatibility_record.md](vulkan_compatibility_record.md).
 
-Every helper thread of the headless suites is an owned thread (#595,
-`Test.Support.Owned`): the stepper and killer of the generation examples, the
-producers and closers of the diagnostics lifetimes, the off-owner refusal checks
-(`onOtherThread`), and the integration suite's evidence suppliers, which publish what a
-run's exit needs in order to finish and so are started before the run and joined after
-its exit (`withRunHelper`), never inside the body that hands them their arguments. The
-cancellation thrown at the owner from inside a masked native step comes from a canceller
-the run owns (`withCanceller`), because a thread joined inside that step would wait for a
-delivery the step itself holds off. The one start not converted is the example bound's own,
-`Bound.hs`, audited in `tools/validation/owned_starts.json`.
-
-Every helper thread of the native suite `vulkan-native-tests` is an owned thread too (#596, `Test.Support.Owned`): the
-fixture's borrower, whose scope is the whole dispatch and whose release first fills the cell that ends every wait on the session;
-the interrupted-launch launcher; the interaction probe's scene thread, whose publication is masked so a stop lands in its pause
-between two scenes and never inside a publication; the retention case's watcher, whose scope is the whole case and not the
-application callback, because the watcher supplies the evidence the host's exit waits for and that exit never ends by itself (the
-case's one deliberate exit, `_exit` from the watcher, unwinds nothing, as before); the bridge case's discharger, an OS-bound thread
-(`withOwnedBoundThread`); and the construction and publication examples' workers and killers, pinned to one capability
-(`withOwnedThreadOn`) with the killer started alongside the worker and parked at a gate only the arm opens, so the cancellation it
-delivers stays pending until the worker has received it (`Test.Vulkan.Proof.PendingCancellation`).
-
-Every `integration-tests` example runs under a fixture-aware bound
-(`Test.GPU.Vulkan.GLFW.Bound`): a minute, or thirty seconds for those under
-`Vulkan controller`, for the whole example rather than for each rig run. A
-plain timeout cannot end a rig example: `runRig` runs its body on a bound thread
-through `runInBoundThread`, so an exception for the example's own thread waits
-for the whole run, and the owner's protected exit absorbs cancellation until it
-has destruction evidence that a scripted rig withholds. On expiry the bound
-starts a cleanup watchdog first, then rescues every rig the example made — from
-then on every fence answers signalled, every scripted hold already entered or
-entered later passes, no call is slowed, no frame refused and no event pump
-held, and every wait the owner arms on a scripted clock comes due at once and
-moves the clock to its deadline; an irreversible scripted failure stays, and
-nothing publishes destruction evidence the stand-ins did not produce — and only
-then cancels each rig run's bound thread and the example's own, and waits for
-the example to settle: its own thread, every rig run it started, and every
-cancellation's delivery. The owner's protected exit completes on the stand-ins' real destruction evidence, and the
-example fails as not having finished within its bound, even if it caught the
-cancellation. A synchronous failure, or that cancellation, escaping a rig's
-body rescues the rig before the protected teardown begins, so an example that
-fails before it releases its gates reports its own failure. The last resort: if
-the example has not settled ten seconds after rescue began, the suite
-prints the example's name on standard error and ends the test process with a
-failure status, unwinding nothing — operator termination is the protected
-exit's documented escape. The production teardown is unchanged; all of this is
-the fixture's. `the fixture-aware example bound` covers a blocked example, one
-that fails before releasing its gates, a hold the owner had already entered,
-the last resort — also while a rig run on a thread of the example's own outlives
-the example's thread — and a timer hook replaced while an earlier one runs,
-with bounds and a grace that expire only when the example says, and finds no
-thread of the example still running afterwards.
-
-VK-19's examples are in `integration-tests`, under `Vulkan consumer rendering
-and capture`, over the same stand-ins, extended to journal every command the
-recording layer is asked to record and every pipeline, layout and readback
-buffer it makes and destroys, to report each swapchain's image usage and
-whether it was created clipped, to offer a surface usage the example chooses,
-to raise once from a chosen creation, to offer naming that raises for a chosen
-kind of object, and to read every readback buffer back as
-one known byte. They cover: each frame's format and extent reaching the
-consumer, and its own layout and pipeline — built on the owner's thread for
-that format — bound and drawn between the controller's transitions inside the
-rendering it began; construction and release from the main thread refused
-`RefusedNotOwner` with nothing native done; a pipeline built for another format
-refused at its binding, with no bind recorded and nothing presented; a refused
-construction and one that raised having created nothing each skipping one frame,
-the renderer called once per acquired frame, the third frame presenting and the
-session running; a construction that lost the device failing the session with
-the loss primary and never reaching the renderer as a refusal; a replacement
-whose new pipeline could not be named, on a device offering naming, after the
-new generation was committed ending the owner's run with that failure — the
-renderer never answered, both pipelines still destroyed before the device; a replaced
-pipeline kept while the batch that bound it is in flight and destroyed only on
-its completion, the new one and the layout still standing; the consumer's
-pipeline destroyed before its layout, and both before the device, on the normal
-exit with a clean verdict and on a validation-error exit with that error
-primary; a host without capture building clipped swapchains with no
-transfer-source usage when the surface offers it, and refusing a request
-`CaptureDisabled`; a capturing host building them unclipped as transfer
-sources; a capture, asked for with nothing else published, whose frame's batch
-ends with the transfer-source transition, the copy, the host-read barrier and
-the transition to presentation, withheld while its fence answers not yet over
-further polls, delivered once after completion with its frame's identities and
-the whole image's bytes, and never again, its readback buffer destroyed before
-the device; a captured frame the renderer refused settled
-`WithheldFrameAbandoned` with no copy recorded and its buffer destroyed; a
-surface offering no transfer-source usage admitted, its frame presented and its
-capture settled `WithheldUnsupported` with no buffer made; a capture whose frame
-could never be acquired settled `WithheldTargetRetired` when its window closed;
-a request refused `CaptureTargetRetiring` once its target's retirement had
-begun, while that retirement was still owed and its surface stood, with the
-request it already had settled `WithheldTargetRetired` and a later one refused
-`CaptureNoTarget`; sixty-four requests admitted and settled without being
-taken, the sixty-fifth refused `CaptureBacklogFull`, every one of the
-sixty-four still there to take, and a request admitted again once they were;
-a request made from inside the frame observer's report of an acquisition
-captured from a later acquisition, never the one reported; a request admitted
-while an acquisition was held inside the native call captured from a later
-acquisition, never the one under way;
-and a presented capture whose batch completed only after a validation error
-ended the owner's run settled `WithheldSessionEnded` with that primary, and
-taken once.
-
-VK-16's examples are in `integration-tests`, under `Vulkan loop adapter`, over
-stand-in frame and recording layers — every swapchain three images, a
-submission's fence and a present fence pending until asked and then signalled
-if the example allows it, a present fence's image given back when it signals —
-and, where a schedule is asserted, a scripted clock the host and the owner
-share, whose owner timer expires once the clock reaches the deadline the owner
-gave it. They cover: the adapter publishing each window's observation and
-captured demand with nothing published by hand, and the owner presenting a
-frame of its own; the owner's deadline folded into the main loop's schedule —
-`NoUpdateDemand` and a later `UpdateBy` become it, an earlier one and
-`UpdateImmediately` stay, one already passed is left out — and the composed
-loop then waiting for it rather than for a five-second fallback; demand
-captured before the owner took it kept across a newer publication while the
-owner's step was held inside an acquisition, and a window closed meanwhile
-still retiring; two windows' demand captured in one turn — one now, one by a
-later deadline — served as two frames now, none while a still clock stays short
-of the deadline, and two more once it comes; a redraw the owner took while no
-target was constructed rendered once the window handed over afterwards is,
-with nothing published since; a quiet scene rendered continuously never arming the owner's
-timer beyond the first pending-work interval; the backoff through 5, 10, 20,
-40, 80, 100 and 100 ms from a presentation, an unrelated publication a
-millisecond before a poll moving neither the fence queries nor the deadline,
-and new demand, an observed completion and a close each restarting it at 5 ms;
-no fence asked on an unrelated early wake, and a poll whose work consumed the
-next interval followed by the next poll with no timer armed between them; the
-clock reaching the owner's published deadline inside its timer's arming, after
-the owner read the clock, and the owner still waking at that deadline to poll,
-and the same window in the exit drain's wait, the drain still waking and
-arming again — examples that fail with a timer that measures its interval from
-a reading of its own (#386); a
-suspended target keeping a finite deadline with its presentation pending, not
-spinning while the clock stands still, and polling when it comes; one target
-presenting five more frames while another's acquisitions all answer not ready;
-a window hidden while the owner's presentation to it holds, as Mesa's legacy
-FIFO present does, whose hide makes its native call only once that
-presentation returns, the other target presenting three frames and the hidden
-one none, its old swapchain kept while its presentations are unretired, and
-the shown window presenting on a replacement handed that swapchain and never on
-the old one — an example that fails with the hold or the replacement removed
-(#357); a window whose target is already suspended hidden again while the other
-target's presentation holds, whose hide makes its native call without waiting
-for that step; the same presentation hold with the hide and the show made
-directly, from the main thread's update opportunity, on the window
-`withHostWindow` lends, and a direct hide and show of a presenting window made
-in one update opportunity while no owner round completes, followed by a frame
-on a replacement handed the old swapchain and none on the old one — examples
-that fail without the lent window's hide guard (#368);
-a renderer refusing every frame, with the owner's deadline one backoff interval
-ahead of a still clock and no second attempt until the clock reaches it; a
-fresh request, made while such a retry is pending, rendered at once with the
-clock still; a frame of a new generation refused after a resize, with an
-unrelated wake making no second attempt before the retry's interval; with
-one live generation, a quiet target's resize whose replacement is rendered with
-nothing published; and a demand deadline coming at the instant a resize's
-replacement is due, whose frame on the replacement is refused once, with no
-second attempt before the retry's interval, an unrelated wake included;
-the owner presenting a scene published from another thread while the main
-thread is held inside its native event call, and a window command submitted
-then served only once the call returns; a live resize under the same held call,
-the stand-in surface changing every 8 ms and every swapchain built at another
-extent answering suboptimal, with the owner presenting throughout and building
-at least three replacements — the same example presents once and builds none
-under a rule that waits for quiet geometry; a presentation's device loss reaching
-the composed loop's checkpoint; and the exit drain waiting for owed
-presentations before retiring the target, the device, the messenger and the
-instance, with a window command submitted after the loop ended answered rather
-than left waiting; and that drain, with a presentation still owed and a demand
-deadline the owner took but never served, arming its timer again each time the
-clock moves past that deadline rather than asking at once, for ever, and the
-same once a resize has left the closing target's replacement settling past
-its instant. In
-`native-tests`' `Frames`, a closing pass cancelled from inside its first frame's
-cleanup submission leaves the second frame acquired; closing the target's frames
-again finishes the pass, a third finds nothing, and the target's slots retire. The `terminal failure` group's sink example now waits for
-the owner's own failure before its checkpoint, which the owner's wake for a
-failure latched on the main thread makes certain.
-
-VK-11's examples are in `native-tests` too, over a stand-in recording layer
-that journals every call and fails at a chosen step: a sealed batch retaining
-the frame's generation, its storage, the pipeline and — transitively — its
-layout, observed from inside the native bind; repeated and overlapping use
-retained once; a replacement not redirecting an earlier batch; foreign, stale,
-released, duplicate and consumed capabilities and a stranger's thread refused
-with no native call; a recorder kept past its scope and a consumer run exactly
-once; unsupported and illegal commands refused at the interface; a batch the
-object budget cannot reserve refused before any command buffer begins; a
-consumer that raised, one that was cancelled, one that left rendering open, and
-one that caught a failed command and returned, each leaving a partial batch
-owned and unsealed; invalidation observed to precede discharge,
-and a failed invalidation retaining everything; a discard and a reset each
-discharging only its own references; a submitted batch neither discarded nor
-reset; release preserving a sealed batch, a layout outliving its pipelines, and
-a failed destruction retained without a retry, every destruction recorded
-beyond one progress turn's action limit, and frame storage refused for a
-foreign target or an unissuable slot; the readback's allocation-relative ranges, bounds,
-transfer-source requirement, non-coherent invalidation and flush, completion
-before exposure, and no exposure after a skip or a reset in the model, after a
-reset followed by the frame's submission, or after a fill whose flush raised; a
-second writer refused; a slot reused for a second submitted frame once the
-first's submission completed, the first's stale frame and a released
-storage refused without a reset, and a destroyed storage taking its completed
-batch's record with it; invalid viewports and scissors refused; and the FFI audit held to the package's import
-declarations. The model's own suite adds `extendBatch`'s examples. The
-presentation examples add the capture usage, taken only where offered.
-
-VK-12's examples are in `native-tests` too, over a stand-in frames layer that
-models what Vulkan holds the application to — each fence unsignalled, pending
-or signalled, each binary semaphore idle, owed a signal or waited on, and each
-owned image — and records a violation whenever a call breaks a rule: asking a
-fence no submission made pending, resetting or destroying a pending fence,
-acquiring into or signalling a busy semaphore, waiting on one nothing will
-signal, or releasing an image whose acquisition was never waited on to
-completion. Every example requires there were none. They cover: reservation
-before the acquisition, the slot's synchronization made first, and the exact
-generation and image owned; not ready and a timeout giving the reservation back
-whole with no signal owed; a suboptimal acquisition keeping its index beside a
-replacement request; an out-of-date one giving the reservation back and asking
-for the target's replacement; a foreign target as misuse, a stranger's thread,
-a suspended, a closing and a failed target; an exhausted frame budget answered
-before any native call; an acquisition that raised giving the reservation back;
-the submitted batch waiting on the acquisition and signalling the
-render-finished semaphore with its fence reset just before; a two-frame request
-sharing one submission and retaining both frames' generation and storages until
-it completes, and two separate submissions settling independently; a duplicate,
-consumed, discarded and partial batch refused before any native call; a
-no-effect failure leaving no pending fence, never asked, and the frame
-resubmitted; a fence reset that raised retaining the fence, stopping admission
-and failing the session while the frame is still skipped safely; an uncertain submission retained for ever with admission stopped;
-a skip returning its image only after its cleanup completed, with nothing
-rebuilt; a skip after submission refused; a closed, never-presented frame
-settled only after its rendering and then its render-finished semaphore's
-cleanup completed; a closing target's frames abandoned, settled while it closes
-and its slots retired; abandonment after ordinary admission was exhausted,
-holding the slot and pool record until the evidence; a cleanup submission and a
-release that raised each retaining the frame and its image, failing the session
-and never settling; a consumer that raised run once and its frame skipped; the
-one-slot schedule through acquire, record, submit, close, settle and the slot's
-reuse, and the two-slot schedule with two frames in flight; a one-action step
-observing, cleaning up and releasing a later submission that completed first
-while an earlier one never does; and a cancellation
-at each native handoff — the acquisition, the submission, a skip's cleanup, a
-closed frame's cleanup and the release — each recorded before it is delivered.
-`Frames visibility across the package boundary` compiles external clients as
-the recording's does: every public frames name must compile, each
-`Internal.Frames` module must be refused as hidden, and the `Frames`
-constructor must be refused.
-
-VK-13's examples, `Frames presentation`, are in `native-tests` over the same
-stand-in, extended to model presentation: a presentation's semaphore wait, its
-present fence pending until the example completes it, and its image returned to
-the presentation engine, with a violation recorded for presenting an image the
-application does not own, waiting on a semaphore nothing will signal, or asking
-or waiting on a fence no queue operation made pending. They cover: the image
-presented to its swapchain, waiting on its pool record's semaphore, with the
-record's present fence reset immediately before; a presentation made before the
-rendering completed, whose signalled render fence frees the slot and no
-presentation object, retiring only on its own present fence; a present fence
-that has not signalled answering pending however often it is asked; an image
-reacquired while its older presentation is pending, through a second record,
-with no fence waited on or asked; a delayed presentation keeping its frame, its
-image, its slot and its record until it is presented; refusals before any native
-call; each per-swapchain answer by its effect — suboptimal and out of date
-reported to the generations with no synchronization reset, out of date and
-surface lost enqueued although the call raised, out of memory (written or not)
-enqueuing nothing and never asked, and an unwritten answer retained for ever
-with the session failed — and the classification's whole table, contradictions
-included; a cancellation at the presentation handoff, including an out-of-date
-error return with enqueued obligations, recorded before it is delivered; a
-present fence whose reset raised, and one whose status query raised; the finite
-drain wait capped at 10 ms, whose timeout keeps the record, the hold and the
-target's retirement — frames, generations and surface — withheld until the
-evidence arrives; skipped and never-presented frames settling through their own
-cleanup and freeing their records only then; the derived default pool of 18;
-pool exhaustion as backpressure before any native call, and a retirement making
-room without growth; a retired generation's pending records counted against the
-new generation's capacity; a resized target's old generation destroyed only
-after its presentation's retirement was observed; generations retired one a
-step, round-robin across two targets; and the first of two targets closed from
-verified fences — withheld while its presentation was pending — its surface
-destroyed and the device kept, while the second keeps presenting before and
-after, and the session then retired with every fence observed. VK-16 adds, under
-`while a replacement waits`, a frame acquired from and presented to the active
-generation while its replacement settles — the replacement then built and the
-old generation held by that presentation — and one acquired from it while the
-replacement waits for the generation count to have room.
-
-VK-14's examples are in `native-tests` and `integration-tests`, over the same
-stand-ins, extended to answer a native result recovery acts on
-(`NativeFailure`) at a chosen step, once or after a number of successes, and to
-run out of memory at a recording or frames step. `Generations`' group
-`surface recovery (VK-14)` covers: a lost surface's generation retired and held
-while a CPU use is, the surface destroyed only once every generation of it has
-gone, and a replacement installed on the same target — its support queried, a
-fresh generation handed nothing — as one attempt that is not given back; a loss
-raised by the capability query and by a swapchain's creation; nothing more
-asked, and no step owed, while an attempt waits for its surface; repeated loss
-spending one episode, three replacements and then the target spent; one
-episode carried across a failed replacement, a changed geometry and the
-construction's own retries; a partial replacement retried freshly only after
-its rollback was proven, and one whose rollback is unproven — its candidate or
-the lost surface itself not destroyed — forbidding every further attempt and
-failing the session; the retired chain destroyed before any fresh creation,
-with a window still in use charged to the same episode; close defeating a late
-replacement and settling its attempt; a failed replacement scheduling the next
-through the episode; exhaustion and an unsupported replacement each making an
-optional target unavailable while another keeps building, and failing the
-session for a required one, with no second device; and an ordinary resize
-spending nothing while a repeated failure at unchanged geometry spends the
-episode; a lost surface whose next attempt's delay the clock cannot express,
-at the very end of its range, released once and then left
-`RecoveryUnscheduled`, owing no step, and a failed construction at that same
-instant left the same way; a lost surface taken from a generation already retired, and a late
-report about it never reaching the replacement; and a creation's retry that
-raised device loss, latched and raised, or a lost surface, replaced, rather
-than either being read as a failed retry; an attempt in flight failed when the
-replacement surface's own query reports it lost, the next admitted after its
-delay; and a fresh construction kept waiting, charging nothing, while the chain
-a failed replacement handed over is still held, then created only after that
-chain's destruction; and a replacement that cannot serve the profile failing its
-attempt and making an optional target unavailable, or failing the session for a
-required one. `Allocation recovery`, over the
-frames' rig, covers: a creation that
-ran out of memory made once more after one pass reclaimed a retired
-generation; no retry without progress, the original failure reported with the
-pass's evidence and its accounting given back; a second failure ending the
-recovery; a disposal that failed escalating the session and permitting no
-retry despite what else the pass reclaimed; a bounded window that reaches an
-eligible generation beyond it only at a later pass, through the carried cursor;
-configured-capacity exhaustion as backpressure with no native call; a no-effect
-submission still reclaimed and submitted once more with the object budget full; a fresh
-swapchain creation retried after reclamation and one that handed a generation
-over never retried; a frame slot's synchronization recovered, and its
-reservation given back when nothing was; a no-effect submission submitted once
-more with its batch recorded once, and answered nothing, naming the pass, when
-nothing was reclaimed; a no-effect presentation presented once more; and a
-lost surface as the frames report it — an acquisition's reservation given back,
-its pool record freed and the target's frames retirable, nothing acquired until
-the surface is replaced, and a surface-lost presentation enqueued and holding
-its generation until its present fence retires. `Frames`' out-of-date
-acquisition, and a not-ready or timed-out one, now also free their pool
-record, and the target's frames retire after them. The model's suite adds
-`declareTargetUnrecoverable`'s examples. `Vulkan controller`'s group
-`recovering a lost surface (VK-14)` runs whole hosts: a lost surface replaced on
-the main thread under the same attachment, after its generation and then the
-lost surface went on the owner's thread, with the other target left alone; a
-close defeating a replacement still asked for; an optional target's spent
-episode reported unavailable while the other keeps its generation, and a
-required one's failing the session at a checkpoint; an unsupported replacement
-destroyed on the owner's thread with no second device, making an optional target
-unavailable and failing the session for a required one; and an ordinary resize
-spending no attempt while each out-of-date result at unchanged geometry spends
-one.
-
-VK-15's examples, `Terminal failure`, are in `native-tests` over the same
-stand-ins. The frames' stand-in can lose the device at any of its steps, and
-from then on holds the frames to the device-loss rules: destroying a fence or a
-semaphore whatever it was owed is no violation, and asking or waiting on a
-fence, resetting one, acquiring, submitting, presenting or releasing is. They
-cover device loss injected during acquisition — the reservation given back —
-during submission — the effect recorded uncertain — during presentation and
-during idle progress, each refusing further rendering naming the loss and each
-torn down with every pending fence released as lost rather than signalled,
-never asked or waited on again, and destroyed with every slot and pool object,
-the generation, the surface and the device after it; a validation error
-latched as the primary and a teardown wait that then reports the loss, keeping
-the validation error and switching that teardown to the device-loss rules; the
-loss surviving a cleanup failure during teardown, which joins the evidence and
-is never retried; each of two storage destructions that failed in one
-disposal pass named beside the loss; an unsubmitted recording whose pool reset
-reported the loss released without another reset; a presentation whose call
-raised the loss while its entry answered out of date, recorded as enqueued and
-the loss still raised; an uncertain effect with no loss retaining its
-frame, its generation, the surface and the roots through the whole teardown; a
-validation error from the capture's watch refusing the next rendering and
-acquisition with no native call, then settling what was owned under the
-ordinary rules; a pending diagnostic failure refusing rendering and
-acquisition with `RefusedDiagnosticPending`, latching nothing and leaving the
-model running, until the capture's alarms name the sink failure as the primary
-with the error beside it; a sink failure latched as a status of its own,
-authorizing no release, and a sink failure and a validation error after a loss joining the
-evidence behind it; a required target's exhausted recovery failing the
-session and refusing the other target, while an optional target's leaves the
-other rendering; a validation error in the capture before the step that would
-exhaust a required target kept as the primary, with recovery going no further,
-and one that follows the exhaustion kept behind it; a validation error only
-the capture's order knows of, and a sink failure whose reason its worker
-publishes late, each kept as the primary ahead of the exhaustion it preceded;
-a validation error reported during a call that then returns the device's loss
-kept as the primary with the loss beside it; a checkpoint that finds the
-owner's claim unrecorded refusing as pending with nothing latched, and the
-owner's loss then kept as the primary ahead of the later error; and a validation error
-reported inside a submission that then raised with an unknown effect kept as
-the primary, with the uncertain effect beside it. The model's own suite adds `Device loss`: the loss kept beside
-an earlier cause, the release refused before the loss, a submission and a
-presentation released without being completed or retired and their cycle
-dropped uncredited, an uncertain effect retained until the loss, an acquired
-frame left to be skipped first, a second release releasing nothing, and the
-outcome of the call that failed the session recorded while new work is
-refused. `integration-tests` adds `terminal failure`: a validation error a
-stand-in call reports into the session's real capture, through the production C
-callback, latched at the owner's next checkpoint and reaching the application's
-as `GraphicsSessionFailed`, the target it was reported against left unusable
-for the owner to retire, a later handover refused naming it, the
-teardown in order and the verdict carrying the error; the same error latched
-although a full capture dropped its record, since the latch is set before the
-record is admitted; a sink failure latched as
-its own status, with the verdict's consumer unsuccessful and no error latched;
-a sink failure latched although the owner was idle and nothing else was
-published, since its publication wakes the owner; a sink failure that came
-before a validation error, both arriving while the owner was inside a native
-call, kept as the primary with the error beside it; a handover while the
-capture's sink had claimed the order but not published its failure, with an
-error latched after it, refused as `VulkanDiagnosticPending` with nothing
-latched or attached, and the next handover, once the failure is published,
-refused naming the sink failure with the error beside it; a target whose
-surface was still being created when an error arrived, after its handover's
-checkpoint, rejected naming the error when its construction began, with no
-native call made for it;
-an exit whose surface destruction failed, reporting the cleanup failure as its
-primary and what it retained beside it; a surface still in its native call when
-the drain closed the lease, whose destruction then failed, latched as a cleanup
-failure beside the earlier primary with the instance retained; two deferred
-surfaces whose destruction both failed in the owner's orphan pass, each latched
-once by its handle with what its own destruction raised; two distinct
-surfaces that share a handle, both failing, each latched with its own
-attachment; and cancellation
-delivered three times
-while the drain that follows a loss holds, leaving the destruction order and the
-loss as they were. The diagnostics suite adds the sink failure observable while
-the lifetime still captures, `captureAlarms` answering a sink failure and an
-error in the order they happened, either way round, and answering only
-`CaptureAlarmPending` while a sink that claimed the order has not yet published
-its failure and an error has latched after it.
-
-#266's examples, `Generations visibility across the package boundary`, compile
-external clients the same way: one that imports every name the public
-generations module exports, with the constructors it exports, must compile;
-one per `Internal.Generations` module must be refused as a hidden module of
-this package (`GHC-87110`), never as a missing one; and one naming the
-constructor of each abstract type — `Generations`, `GenerationUse` — must be
-refused because the public module does not export it (`GHC-10237`).
-
-#265's examples, `Recording visibility across the package boundary`, compile
-external clients through the shared harness (`Test.Support.ExternalClient`)
-against the built package and the dependency store, typechecking only: one that
-imports every name the public recording module exports, with the constructors
-it exports, and the entry points of `Recording.Shaders` and `Recording.Vulkan`
-must compile; one per `Internal.Recording` module must be refused as a hidden
-module of this package (`GHC-87110`), never as a missing one; and one per
-abstract handle — `Recording`, `PipelineLayout`, `Pipeline`, `FrameStorage`,
-`Readback`, `Recorder` — naming its constructor must be refused because the
-public module does not export it (`GHC-10237`).
-
-#250's examples are there too, over the same stand-ins with naming turned on or
-left off: the naming scheme's object types held to the binding's and its bound;
-the device, its queue and every surface named from their identities once the
-device exists, and no naming call ever dispatched for the messenger; nothing
-named, and no queue asked for, when the device offers no naming; a surface
-whose naming raised left unadmitted and its creator's, and a device whose naming
-raised kept and named at the next admission; a generation's swapchain, images
-and views named as each is made, and a construction whose naming raised retired
-unpublished and destroyed child before parent; every managed resource's objects
-named before its handle is returned, and one whose naming raised released and
-destroyed by disposal; a batch and its pass bracketed in balanced labels naming
-the batch, target and generation, and no label without naming; every open label
-closed after a consumer that raised inside rendering, a cancellation, and a
-failed command; and a batch whose labels could not be balanced left partial and
-unsealed, keeping its storage and holds until a discard and keeping the
-consumer's own failure.
-
-**Native.** The group `test.vulkan-native` runs the native suite below. The
-retained per-slice records from the retired proof harness —
-[`docs/vulkan/linux-vk7.md`](vulkan/linux-vk7.md) for VK-7, and the VK-2, VK-5
-and VK-6 records beside it — stay as the historical evidence of the inputs
-they name. VK-10's native cases are retained as
-[`docs/vulkan/macos-vk10.md`](vulkan/macos-vk10.md), from the local Cocoa run,
-and [`docs/vulkan/linux-vk10.md`](vulkan/linux-vk10.md), from the Linux display
-worker. VK-11's are retained as [`docs/vulkan/macos-vk11.md`](vulkan/macos-vk11.md)
-and [`docs/vulkan/linux-vk11.md`](vulkan/linux-vk11.md). VK-12's are retained as
-[`docs/vulkan/macos-vk12.md`](vulkan/macos-vk12.md) and
-[`docs/vulkan/linux-vk12.md`](vulkan/linux-vk12.md). VK-13's are retained as
-[`docs/vulkan/macos-vk13.md`](vulkan/macos-vk13.md) and
-[`docs/vulkan/linux-vk13.md`](vulkan/linux-vk13.md). VK-14's are retained as
-[`docs/vulkan/macos-vk14.md`](vulkan/macos-vk14.md) and
-[`docs/vulkan/linux-vk14.md`](vulkan/linux-vk14.md). VK-15's are retained as
-[`docs/vulkan/macos-vk15.md`](vulkan/macos-vk15.md) and
-[`docs/vulkan/linux-vk15.md`](vulkan/linux-vk15.md). VK-17's are retained as
-[`docs/vulkan/macos-vk17.md`](vulkan/macos-vk17.md) and
-[`docs/vulkan/linux-vk17.md`](vulkan/linux-vk17.md), and the milestone they
-complete is [the Vulkan milestone verdict](archive/vulkan_milestone_verdict.md).
-VK-19's are retained as
-[`docs/vulkan/macos-vk19.md`](vulkan/macos-vk19.md) and
-[`docs/vulkan/linux-vk19.md`](vulkan/linux-vk19.md). #250's are retained as
-[`docs/vulkan/macos-vkr2.md`](vulkan/macos-vkr2.md) and
-[`docs/vulkan/linux-vkr2.md`](vulkan/linux-vkr2.md). #265's, taken again over
-the recording's split into private modules, are retained as
-[`docs/vulkan/macos-recording-split.md`](vulkan/macos-recording-split.md) and
-[`docs/vulkan/linux-recording-split.md`](vulkan/linux-recording-split.md).
-#266's, taken again over the generations' split into private modules, are
-retained as [`docs/vulkan/macos-generations-split.md`](vulkan/macos-generations-split.md)
-and [`docs/vulkan/linux-generations-split.md`](vulkan/linux-generations-split.md).
-The macOS evidence for the owner's standing desktop approval, taken again over
-the suites' consent wording, is retained as
-[`docs/vulkan/macos-standing-approval.md`](vulkan/macos-standing-approval.md);
-its Linux execution is CI's.
-#269's, taken again over the logging and failure modules' split into public
-facades over hidden modules, are retained as
-[`docs/vulkan/macos-log-failure-split.md`](vulkan/macos-log-failure-split.md);
-their Linux execution is CI's.
-#271's, taken again over the resource family's split into owning modules
-behind its package-private facade, are retained as
-[`docs/vulkan/macos-resource-split.md`](vulkan/macos-resource-split.md),
-with that run's `test.glfw-native` receipt beside them; their Linux execution
-is CI's.
-#280's, taken again over the native wake examples' Wayland settling barrier,
-are retained as
-[`docs/vulkan/macos-wayland-settle.md`](vulkan/macos-wayland-settle.md), with
-that run's `test.glfw-native` receipt beside them; their Linux execution is
-CI's.
-#272's, taken again over the worker group's split into owning modules behind
-its package-private facade, are retained as
-[`docs/vulkan/macos-worker-split.md`](vulkan/macos-worker-split.md), with that
-run's `test.glfw-native` receipt beside them; their Linux execution is CI's.
-#284's, taken again over the launcher regression's descendant check and its
-test-only unreaped-exit helper, are retained as
-[`docs/vulkan/macos-zombie-descendant.md`](vulkan/macos-zombie-descendant.md),
-with that run's `test.glfw-native` receipt beside them; their Linux execution
-is CI's.
-#273's, taken again over recovery's split into its public module and the
-hidden `Recovery.Types`, are retained as
-[`docs/vulkan/macos-recovery-split.md`](vulkan/macos-recovery-split.md), with
-that run's `test.glfw-native` receipt beside them; their Linux execution is
-CI's.
-#274's, taken again over time's split into its public module and the hidden
-`Time.Types` and `Time.Arithmetic`, are retained as
-[`docs/vulkan/macos-time-split.md`](vulkan/macos-time-split.md), with that
-run's `test.glfw-native` receipt beside them; their Linux execution is CI's.
-#275's, taken again over messaging's split into its public channel and
-snapshot modules and the hidden `Messaging.Channel.Types`,
-`Messaging.Snapshot.Types` and `Messaging.Component`, are retained as
-[`docs/vulkan/macos-messaging-split.md`](vulkan/macos-messaging-split.md), with
-that run's `test.glfw-native` receipt beside them; their Linux execution is
-CI's.
+A headless example proves the engine's handling of what the native layer
+reports; only a native case proves what a driver does. Rows of a result table
+that are specification obligations and were not observed on a driver are
+injected by headless examples and say so.
 
 ## The native suite
 
-`hetoimasia-gpu-vulkan-glfw:vulkan-native-tests`, in `packages/gpu-vulkan/glfw/native-test/`,
-is the package-native Vulkan fixture and the native cases of VK-2 and VK-5
-through VK-7 that it took over from the retired proof harness. It follows
-[the GLFW native suite's](glfw.md#the-native-suite) ownership rules — which it
-companions — and adds the Vulkan owner's:
+`hetoimasia-gpu-vulkan-glfw:vulkan-native-tests`, in
+`packages/gpu-vulkan/glfw/native-test/`, follows
+[the GLFW native suite's](glfw.md#the-native-suite) ownership rules and adds
+the Vulkan owner's:
 
 | Rule | How it holds |
 | --- | --- |
-| Main thread | Hspec runs on a thread of its own; the process main thread owns one shared production graphics session: `withLoaderIntegration`, then `runGraphicsOwnerApplication` over `withVulkanOwnerHost`, with the production native layer and surface bridge. An example that needs the main thread — to hand a window's surface over, which GLFW creates there, or to close a window — submits an operation (`onMain`); the main thread runs it between two turns of the host's owner loop and returns its result or rethrows its failure. Windows are created through the host's command port from the example's own thread, which the owner loop executes, as an application's worker would. |
-| Identities | Every dispatched operation is checked, before it runs, to be on the bound process main thread that entered the session — the Haskell thread, the bound flag, and the OS thread read through `pthread_self` — and a failed check fails the operation and the run. Every native call the session makes is recorded where it runs by a `NativeObserver`, so an example shows from the calls themselves that the instance, its messenger, the device and every surface's destruction ran on the graphics owner's thread and every surface's creation on the main thread — never from the name of an Hspec hook. |
-| Sharing | The roots — the instance, its explicit messenger, and the one device — are acquired lazily, by the first dispatched operation, at most once, and shared by every later example. Each example's windows and targets are its own and are closed inside it. |
-| Private roots | A case that must create, poison or destroy roots of its own runs in a child process of the same executable, started with `--private-roots <scenario>`, on the child's own main thread: `vk2-compatibility`, `vk6-capture`, `vk5-bridge`, `vk7-roots`, `vk11-recording`, `vk12-frames`, `vk13-presentation`, `vk14-recovery`, `vk15-validation-stop`, `vk15-retention`, `vk16-composed`, `vk17-one-slot`, `vk17-two-slots`, `vk19-capture`, `grs15-surface-free`, `grs15-surface-free-window`, `grs12-frameless`, `grs3-ordering`, `grs7-texture-table`, `grs8-sprites`, `grs9-swap`, `grs10-scene3d`, `grs13-window-depth`, `grs14-table-growth`, `r2d17-depth-rect`, `r2d18-animation`, `r2d14-window-scenes`, `r2d7-ordered-path`, `r2d9-cutout-depth`, `r2d12-clip`, `r2d10-retained`, `r2d8-image`, `synchronization-hazard`, `debug-names`, and, under the isolated compositor's consent only, `wayland-connection-loss`. The child asserts its migrated examples as the proof did — the whole spec, with Hspec's configuration reading left out, so an ambient `HSPEC_*` cannot narrow its verdict — and the parent's example passes only when every one ran and passed. The parent starts no child without consent; a child started directly without it refuses with exit status 3 before looking its scenario up, and an unknown scenario under consent exits 2. Each child runs in a process group of its own under an external 20-second deadline covering its exit and the end of its output; one still running at it is terminated with its group and fails its example as expired. The launcher reclaims what it owns whenever it returns or propagates: its two output readers are stopped where they block and awaited, never waited on for end of file (a writer that left the child's group may hold the output open and keep running, which the launcher neither follows nor waits for), its two parent-side pipe handles are closed, what was read is kept, and the failure that ended a launch propagates with its type, value and attached context, any cleanup failure retained beside it (a launch is one composite scope, `docs/resources.md`, and reads the child's identifier before anything waits on the child). Twelve examples of the suite's approval-free group, `a bounded child launcher`, prove it with no session or consent (the eight below, and four that hold the interrupted launch's own launcher thread to account, below): a child that exits with its output complete, a direct child that exits while a descendant in a session of its own holds both output pipes open (the partial output of both streams kept, the launch expired, both handles closed and both readers finished while the writer still runs), an interruption reaching a launch, two hundred short-lived children each returned with its status, an annotated failure that propagates with its annotation and still reclaims, and setup failing after the child starts, after its reaper does and after its readers do, each leaving both pipe handles closed (they are registered immediately after the child, before any step that can be interrupted). The launcher thread of the interruption example is an owned start (#596): a failure of the example, or its cancellation, while the launcher is parked at its sleeping child leaves the launcher ended and joined and the child reaped, and the same judgement made about the unowned start the example used before (the negative control) fails. The suite's other approval-free group member, `the shared fixture's borrower is owned (#596)`, drives the fixture's dispatch (`runSharedWith`, whose stand-in session replaces the native acquisition and whose borrower start can be exchanged for the unowned one) with the borrower parked: a cancellation while serving is idle, while the stand-in session is served, and after a session failure the dispatch caught (the wait for the borrower after a reported failure is bounded, `seamFailureBound`, production fifteen minutes, so a borrower parked where nothing ends it is stopped and joined by the scope's release and the dispatch raises, with no second cancellation), and a cancellation that escapes the session (which the dispatch raises as itself instead of reporting it as a failure of the session), each with its negative control. The controls' own stop-and-join is uninterruptible (a cancellation delivered while its kill blocks cannot abandon it), and `the negative controls' own cleanup (#596)` proves that with a control of its own. |
-| Selection | Building, listing and filtering the tree, a `--dry-run`, and a selection that dispatches nothing acquire nothing and start no child. A selection matching no example fails. `--complete`, which the catalog group passes, runs the whole tree with Hspec's configuration reading left out and then fails unless the shared session was acquired once and every private scenario the run's consent requires ran and passed — every one, except that `wayland-connection-loss` is required under the isolated compositor's consent and pending under any other — so no ambient setting can turn the group's receipt into a pass for a subset. The consent rules and the migrated proof's pure release, construction, publication and loader-selection examples need no session and run without consent. |
-| Consent | Read once, at startup, from `HETOIMASIA_NATIVE_SESSION`, with the GLFW suite's rules for `desktop`, `isolated-x11:<display>` and `isolated-wayland:<socket>`: the last only on Linux, only when `WAYLAND_DISPLAY` names that socket, and never beside a `DISPLAY`. Under the Wayland consent every session requests Wayland by name — the shared host, each child's host, the VK-5 bridge's loader-aware session, and the proof shim's raw initialization, which sets `GLFW_PLATFORM` and fails one that selected another platform — so no X11 or XWayland session stands in; under the others every session requests nothing, as before. The first shared example asserts the platform GLFW selected before any example renders. Without consent every native example is refused before its body, the session is never acquired, and the run ends with the refusal on stderr and a non-zero exit. |
-| Environment | Before any Vulkan call, the suite clears every ambient discovery override and every validation-layer setting it finds and records which, disables implicit layers, and points the layer's settings file at an empty one; a child inherits and re-establishes the same environment. |
-| Validation | Every validation-enabled instance, shared or private, enables the Khronos layer and its **synchronization validation** through the instance's own create info. The fixture refuses to run with a set other than the one the provisioned layer is pinned to (`HETOIMASIA_VULKAN_VALIDATION_FEATURES`), which is the one the receipt names. `synchronization-hazard` records two `vkCmdFillBuffer` writes to one buffer with no barrier between them, on an instance the production native layer planned from the same request, and passes only when the capture carries `SYNC-HAZARD-WRITE-AFTER-WRITE` from inside the second write, completely, and its post-teardown verdict fails for that latched error and nothing else — reported apart from the clean profile's verdict and never filtered out of it. |
-| After teardown | The shared session is released only once Hspec has finished: the loop finishes, the host retires every remaining target, and the owner destroys every surface, then the device, then the messenger, then the instance, which is the last native call. Only then does the run check that order, the owner's thread for each of them, and the capture's final verdict, which must be clean: any validation error or incomplete capture fails the run, and the run prints the error records. |
-| Report | The run prints the environment it established, the shared session's acquisitions, native calls, destruction order and verdict, each child's exit and seconds, and how long the process ran. Each child's output and record are written to the validation runner's evidence directory. |
-
-The initial required profile, over the shared roots: dispatched operations run
-on the bound main thread; the instance and its explicit messenger are created on
-the owner's thread; two windows are handed over as required targets on one
-shared device, each surface created on the main thread, and when the
-first-created closes, its surface is destroyed on the owner's thread while the
-device, the instance and the second target stay live; and a later example's
-target lands on the same device. VK-10's cases, over the same roots: a shown
-window's target builds a generation on the owner's thread from the surface's
-extent and the profile's format — the framebuffer's pixels, which the case
-prints beside the window's size and content scale, and which on macOS it
-requires to be the window's size times a scale above one — with a view of every
-image, and its close destroys the views and then the swapchain before the
-surface; and a window resized through the host's command port, which the main
-thread executes, is replaced at its new framebuffer extent with the old
-generation handed over, retired and still owned while a CPU use of it is held,
-and destroyed on the owner's thread once that use ends. After teardown the run
-also requires every image view and swapchain to have gone before the device,
-and every swapchain created to have been destroyed. The private cases carry the migrated
-assertions unchanged — VK-2's profile, completion, abandonment and capture,
-with the synchronization-validation finding added; VK-6's C-only capture;
-VK-5's bridge; VK-7's roots through the destruction order at the host's exit —
-and the synchronization control.
-
-The same profile runs on native Wayland as `test.vulkan-wayland` (WL-4, #327):
-`tools/display/wayland.sh` starts packaged Weston headless around the run and
-gives it the consent `isolated-wayland:<socket>`, and every session then
-requests Wayland by name, so the shared roots, every private case but one and
-VK-17's required profile are created, presented to and retired on Wayland
-surfaces through the VK-5 bridge on Lavapipe, under the same completion rules
-as on X11, VK-16's `vk16-composed` included. Weston 13 offers no
-`wp_fifo_v1`, so Mesa's Wayland WSI throttles FIFO with frame callbacks — each
-present waits, with no timeout, for the previous one's callback — and Weston
-fires none for an unmapped surface: hiding a window whose target is presenting
-would block the graphics owner in its next present to it, and showing it again
-would block its old swapchain's. The presentation hold and the replacement on
-resume ([Pacing, suspension and fairness](#pacing-suspension-and-fairness),
-[#357](https://github.com/coghex/hetoimasia/issues/357)) are what the case
-proves there; it was pending until they existed.
-Its one extra case, `wayland-connection-loss`, starts a Weston of its own and
-renders continuously to one window through the production host; once a
-presentation has been observed retiring on its own present fence it ends that
-compositor from the loop's update, never after an elapsed time. The next event
-processing raises `ConnectionFailed` ([glfw.md](glfw.md#wayland-connection-loss)),
-which ends the loop, and the host's protected exit retires the target, the
-device, the messenger and the instance. The case requires that the application
-end with that loss, a transport closure or protocol failure; that no surface be
-created after it; that every present-fence retirement and every submission
-completion recorded belong to a presentation or submission the owner made, so
-the loss is never recorded as a signalled fence, a completion or a device loss,
-while completion the driver genuinely reports is kept; and that every
-swapchain be destroyed, the roots in dependency order with the instance last,
-with a clean verdict. An expiry of its deadline fails it. Under X11 or desktop
-consent it is pending and asserts nothing.
-
-VK-11's case, `vk11-recording`, runs on private roots because it records
-against a generation of its own and destroys everything it made: the production
-native layer's roots, planned from the same request as every other case, admit
-one window's surface; a generation built for a verification capture gives it a
-real swapchain image; and the production recording layer constructs a pipeline
-layout, a pipeline over VK-9's embedded verification shaders in the generation's
-format, the frame slot's storage and a readback buffer for the generation's
-extent. Against the [fixture-private frame](#the-checked-frame) it records one
-batch of eleven commands — into rendering, the pipeline, viewport and scissor, a
-triangle, out of rendering, into the copy, the copy with its host-read barrier,
-and out to presentation — through the audited `unsafe` subset, inside the
-batch's label and, around the rendering, the pass's, which make fifteen; requires the
-model to hold all four resources for that batch, and the readback to refuse its
-bytes since nothing was submitted; discards the batch, after which none is held;
-settles the frame in the model; and releases and destroys every resource, then
-the generation, the surface, the device, the messenger and the instance. It
-passes only if no step received a validation error and the capture's verdict
-after the last teardown callback is clean. Its record prints the package's FFI
-configuration. No safe-versus-unsafe timing is measured, and none is asserted.
-
-VK-12's case, `vk12-frames`, runs on private roots for the same reason, over
-VK-11's roots, capture generation and resources, with the production frames
-layer. It acquires a frame through `tryAcquireFrame`; records the triangle and
-the copy of its image into a readback buffer the host filled with a sentinel;
-submits that batch through `submitFrames`; and steps `progressFrames` until the
-submission's fence has signalled — the readback refusing its bytes before that,
-and exposing bytes that are no longer the sentinel after. It then closes that
-never-presented frame and steps until its render-finished semaphore's cleanup
-submission has completed and its image has gone back through
-`vkReleaseSwapchainImagesEXT`; acquires and skips a second frame, stepping until
-its acquisition semaphore's cleanup has completed and its image has gone back;
-and acquires again, skipping each, until an image returned earlier is acquired
-once more, with the swapchain never rebuilt. Nothing is presented. It passes
-only if every frame settled, the rendered image went back only after its
-rendering and its cleanup completed, no step received a validation error — with
-synchronization validation on — and the capture's verdict after the last
-teardown callback is clean. Its record lists every native call the frames made,
-fence status queries aside. It asserts no pixel value: the triangle consumer's
-pixels are VK-17's.
-
-VK-13's case, `vk13-presentation`, runs on private roots too, over two windows'
-surfaces, each with a generation of its own, VK-11's resources and the
-production frames layer. It presents three triangle frames to each window back
-to back — each acquired, recorded, submitted and presented with its pool
-record's present fence — and drains through `awaitFrames` until every
-presentation's retirement has been observed through its own present fence. It
-then presents a frame to the first window and resizes that window through GLFW
-before any progress step has asked that fence, and steps the generations until
-the replacement is active: the old generation is retired and held by that one
-presentation, and three further generation steps leave it in place. Only once
-the present fence's retirement is observed does the next generation step
-destroy it, and the first window then presents twice on its new generation.
-Next it presents to the first window, leaves a second frame of it acquired, and
-closes that target's frames: its retirement is attempted while the second window
-presents, and withheld — naming the pending presentation, the skipped frame and
-the records — until the evidence arrives; its frames, generations and surface
-are then destroyed, and the second window presents three more frames on the same
-device. It drains until nothing is outstanding before the second target, the
-recording and the roots retire. It passes only if every presentation reset its
-fence immediately before, every retirement was observed, the old generation was
-held until its presentation's and destroyed at once after, the first window's
-retirement was withheld while the second presented, nothing was left
-unsettled, no step received a validation error — with synchronization
-validation on — and the capture's verdict after the last teardown callback is
-clean. Its record lists every native call the frames made, fence status queries
-and drain waits aside. It asserts no pixel value.
-
-VK-14's case, `vk14-recovery`, runs on private roots too, over two windows'
-surfaces and generations, VK-11's resources and the production frames layer,
-with two narrow injections and nothing else: the first window's next
-acquisition answers `VK_ERROR_SURFACE_LOST_KHR` without the call being made,
-and one readback buffer's creation raises `VK_ERROR_OUT_OF_DEVICE_MEMORY`
-without it. It presents three triangle frames to each window and drains every
-present fence; then injects the loss, whose acquisition gives its reservation
-back, and while the second window presents a frame on every step, the
-generations retire and destroy the first window's generation, then its lost
-surface, and the episode admits an attempt. A replacement surface is created on
-that same window, offered, checked against the one device and installed, and a
-fresh generation — handed nothing — is built on it, after which the first
-window presents three frames. It then resizes the second window and waits for
-the old generation's presentations to retire without a generation step, so the
-generation is eligible and nothing else destroys it; the readback's creation
-runs out of memory, one reclamation pass destroys that generation, and the
-creation is made once more and succeeds. It passes only if the loss was
-answered pending, the replacement was installed on the same target as one
-attempt, the lost surface's generation and then the lost surface went before
-the replacement's support query and a fresh creation on it, nothing was built
-on the lost surface again, the second window presented throughout, the
-allocation was recovered with exactly one retry and one generation destroyed,
-nothing was left unsettled, no step received a validation error — with
-synchronization validation on — and the capture's verdict after the last
-teardown callback is clean. The shared roots add the same replacement through
-the controller and the production bridge: two shown windows handed over, the
-first's loss reported as an acquisition on the owner's thread would, the
-replacement created by `replaceVulkanSurfaces` through `replaceWindowSurface`
-on the main thread under the same attachment and target, the lost surface
-destroyed on the owner's thread before it and the new surface's support
-checked and a swapchain built after it, there, while the second window's target
-and generation are untouched.
-
-VK-15's two cases run on private roots too. No device loss is induced
-natively: its teardown is the headless examples', and the specification's rows
-in the proof records.
-
-`vk15-validation-stop` is VK-13's arrangement over one window, with the roots
-watching the capture as the controller has them do. It presents two triangle
-frames and observes both present fences; acquires, records and submits a third;
-and then delivers one error-severity validation message through
-`vkSubmitDebugUtilsMessageEXT`, carrying the message identifier
-`VUID-hetoimasia-vk15-injected-validation-error`. The next checkpoint — the
-third frame's presentation — is refused naming `TerminalValidationError`, and
-so is a further acquisition, neither making a native call. The frame is closed
-unpresented and everything is torn down under the ordinary rules: the drain
-settles every obligation on its own evidence, and the frames, the generation,
-the surface, the resources, the device, the messenger and the instance retire
-without a failure. It passes only if the error is the session's primary with no
-device loss recorded; exactly one error reached the capture — the injected one,
-during its own step — and no other anywhere, with synchronization validation
-on; and the verdict after the last teardown callback fails for that latched
-error and nothing else, with nothing dropped, cut or undelivered and every
-report offered through `vkDestroyInstance` counted in it.
-
-`vk15-retention` runs the production composition, `withVulkanOwnerHost`, over
-one visible window whose target's generation it builds, holds a CPU use of
-that generation and never ends it, and lets the host exit. The owner's drain
-cannot verify the generation, so it retains it and every parent above it and
-records each retention in the latch; its run ends without destruction evidence
-and without the target's terminal record, so the host keeps the window and
-waits. The case passes only if the latch reports the retention with no primary
-failure and no loss, if no swapchain, surface, device, messenger or instance
-was destroyed, and if the host still holds the window. A watcher then writes the
-record and terminates the process — #220's destructive boundary, the escape the
-lifetime design leaves for what cannot be verified — and the record says so:
-the operating system, not the session, reclaims what was retained, and no
-diagnostic verdict follows, because the last callback was never reached.
-
-VK-16's case, `vk16-composed`, runs the production composition over two
-visible windows, driven by `runVulkanOwnerLoop` with nothing published by hand:
-the adapter publishes each window's observation and captured demand, and the
-application asks each window for a frame as soon as its last one was
-presented. Once each target has presented three frames, the first window is
-hidden through its command port. Once that command has settled as attempted,
-the window has been observed hidden and its target is suspended in the model,
-the second presents three more while the first presents none — none since the
-hide settled. The first is then shown again; once that command has settled as
-attempted and the window has been observed visible, the first presents again,
-on a replacement swapchain; and the loop finishes, so the host exits through
-D-33. On Wayland it is what shows that a hide never blocks the owner and that
-a shown window never presents on its old swapchain (#357). The case hides and
-shows through the command port; a hide made directly on a window
-`withHostWindow` lends takes the same hold (#368), and is covered by the
-headless `integration-tests` examples rather than by this case. It passes only if every Vulkan call ran on one thread, the graphics
-owner's, and every surface was created on the main thread; if every
-presentation's retirement was observed through its own present fence, no
-presentation was made after the device's destruction began, and both surfaces,
-the device, the messenger and the instance were destroyed in that order; and
-if the verdict after the last teardown callback has no issue and no error was
-reported.
-
-VK-17's required profile, `vk17-one-slot` and `vk17-two-slots`, runs the
-triangle sample's own drawing (`hetoimasia-sample-triangle`, which the suite
-depends on, so the sample is among the group's inputs) through the production
-host with verification capture on, over two mapped windows that request no
-focus, driven by `runVulkanOwnerLoop` — once with a frame budget of one slot
-and once with two, each in a child of its own. Each window's frame is
-captured; the first window is resized through its command port and, once its
-target's active generation is the one built at the new extent, captured again;
-the first-created window is closed and, once its target has retired, the
-second is captured again. It passes only if the model ran with the budget it
-was given; if every captured frame has the sample's clear, sRGB-encoded, at a
-point near its top-left corner and the sample's triangle at the triangle's
-centroid, each channel within 6 — never a whole-image hash; if the resized
-window's capture has its new generation's extent and not the old one; if the
-first window's target retired before the second's last capture was asked
-for; if each captured frame is one the case saw acquired, submitted,
-presented and retired on its own present fence; if every generation was an
-unclipped transfer source; if every Vulkan call ran on the graphics owner's
-thread and every surface was created on the main thread; and if the verdict
-after the last teardown callback has no issue and no error was reported. Both
-children run inside the group's one thirty-second watchdog, with the rest of
-the suite. The milestone they complete is recorded in
-[the Vulkan milestone verdict](archive/vulkan_milestone_verdict.md).
-
-VK-19's case, `vk19-capture`, runs the production composition with
-verification capture on — `withVulkanOwnerHostAs CaptureOn`, the private
-sublibrary's — over two mapped windows that request no focus, driven by
-`runVulkanOwnerLoop`, with a consumer renderer that builds a layout and a
-pipeline over the embedded verification shaders for each frame's format, clears
-to blue and draws one orange triangle. Each target is asked for a capture once
-it has an active generation, and nothing else asks for a frame. The loop turns
-until both captures have settled and every presentation made has retired on
-its own present fence, and the host then exits through D-33. It passes only if
-both captures were delivered, each with the whole image's bytes; if each has
-the clear's sRGB encoding at a point near its top-left corner and the
-triangle's at the triangle's centroid, each channel within 6 — two points,
-never a whole-image hash; if each captured frame is one the case saw acquired,
-submitted, presented and retired on its own present fence; if every generation
-of both targets was an unclipped transfer source; if every Vulkan call ran on
-the graphics owner's thread and every surface was created on the main thread;
-and if the verdict after the last teardown callback has no issue and no error
-was reported. It infers no cadence, vertical blank or pacing from any timing.
-
-GRS-15's two cases run the production composition with `DeviceSurfaceFree`,
-the validation layer and synchronization validation.
-`grs15-surface-free` opens no window at all: once the owner's startup has
-answered `RootsReady`, one owner-thread action builds a pipeline layout and a
-pipeline over the embedded verification shaders, and a second releases both;
-the case waits until the owner's own progress — with no target and no frame —
-has destroyed them, and the host then exits through D-33. It passes only if no
-window and no surface was created; if the calls after the instance and its
-messenger were `vkEnumeratePhysicalDevices` and `vkCreateDevice`, with no
-`vkGetPhysicalDeviceSurfaceSupportKHR` anywhere; if both actions returned
-and ran on the thread that created the device, which is not the main thread;
-if the pipeline and its layout were destroyed before the body returned and no
-frame event was reported; if the destructions ran pipeline layout, device,
-messenger, instance, in that order, with every Vulkan call on the owner's
-thread; and if the verdict after the last teardown callback has no issue and no
-error was reported. `grs15-surface-free-window` starts the same way over one
-mapped window that requests no focus, hands it over once the device exists,
-publishes a scene, and turns `runVulkanOwnerLoop` until that frame is presented
-and its presentation retires on its own present fence. It passes only if the
-device was created with no surface before the window's surface existed, and
-the surface was then checked with `vkGetPhysicalDeviceSurfaceSupportKHR`; if
-the target was admitted, with one device created in all; if a presentation
-retired; if the destructions ran surface, device, messenger, instance, with
-every Vulkan call on the owner's thread; and if the verdict is clean.
-
-GRS-3's case, `grs3-ordering`, runs VK-12's roots, generation, recording and
-frames with synchronization validation over one managed `D32_SFLOAT` depth
-target and one vertex buffer. A first frame batch initializes the depth target
-by a transition from undefined and moves the buffer into the copy's use and
-back, writing both; it is submitted and awaited, and its frame closed and
-settled. Then two frames are acquired, and each batch touches the same depth
-target and buffer with no layout change, writing both, the second submitted
-while the first is still outstanding. The writes are the issue's narrowly
-scoped test-only accesses, recorded straight into the batch's command buffer:
-a depth-only dynamic rendering pass that clears and stores the depth target,
-and a `vkCmdFillBuffer` of the buffer; no production attachment, binding or
-upload API is added for them. Between the two later batches' writes stand only
-the first's exit barriers and the second's entry barriers. It passes only if
-the depth target's initialization was published by its batch's submission; if
-each batch recorded exactly the expected entry, transition and exit barriers;
-if the third batch was submitted while the second's submission was
-outstanding; if nothing was left unsettled; and if no step reported a
-validation error and the verdict after the last teardown callback is clean. On
-the pinned layer, measured once by hand with every barrier of the two later
-batches dropped, submit-time synchronization validation reports the buffer's
-write-after-write at the third submission, but nothing for the depth target's
-load-op clear across submissions: for the depth target the case shows the
-barriers recorded and their layouts accepted, not a hazard the layer could
-have seen.
-
-GRS-13's case, `grs13-window-depth`, runs the production host with
-verification capture on over one mapped window that requests no focus, and with
-`vulkanWindowDepth` set. The renderer is the scene3d sample's windowed drawing
-([samples/scene3d/README.md](../samples/scene3d/README.md)) from the evidence's
-front camera, which does not orbit, so the sample's independent oracle applies
-at the window's framebuffer. Its steps:
-
-1. The window is asked for frames continuously until twelve have been presented,
-   so that frames overlap in flight and clear the generation's one depth image
-   one after another; a frame of it is then captured, and the front pose's
-   probes at its extent checked against the oracle.
-2. The window is resized through its command port. Once its target's active
-   generation is the one built at the new extent, the window is asked for twelve
-   frames of it, and a frame is captured and its probes checked at that extent.
-
-Each probe is the sample's own, scaled to the framebuffer and kept only where it
-is still well inside a face, checked within a tolerance of 6 per channel against
-what the oracle's colour reads as in the swapchain's sRGB encoding. It passes
-only if all of these hold:
-
-- every generation the target published owned a depth image of its own, and every
-  frame request named its generation's, the same one for all of its frames;
-- more than twenty frames were presented in all, most of them submitted while an
-  earlier one was in flight, each clearing a generation's shared depth image;
-- both captured frames' probes pass, the occlusion probes — where both cubes
-  are struck, and a depth test, not draw order, decides which shows — among
-  them, at two different extents;
-- each captured frame was acquired, submitted, presented and retired on its own
-  present fence;
-- every generation was an unclipped transfer source, and every Vulkan call ran
-  on the graphics owner's thread;
-- the captures were written as lossless PNGs, with a probe record, under the
-  validation runner's evidence directory; and
-- the verdict after the last teardown callback, with synchronization validation,
-  is clean, which includes no hazard of the depth image shared by frames in
-  flight and none of it across the resize, and a host that exited with no
-  allocation left.
-
-GRS-14's case, `grs14-table-growth`, runs the same surface-free composition
-with a table of five slots at most, two at first, and a pipeline built over
-it before any growth. Its steps:
-
-1. A batch is recorded with the first texture's handle.
-2. The second texture's registration then grows the table to four slots
-   before the batch is submitted.
-3. The third and fourth textures grow it to its cap of five, and a fifth is
-   backpressure.
-4. A second batch draws the first texture beside the fourth, with the
-   pipeline built before both growths.
-
-It passes only if all of these hold:
-
-- no window, surface or image acquisition was made, and the device came
-  first;
-- set 0 held 2, 4 and then 5 slots, in three distinct sets, from four
-  descriptor pools in all;
-- the fifth registration was `RefusedBackpressure` `TextureSlotBudget`;
-- one pipeline served every draw;
-- both readbacks probe exactly: the first batch the first texture, the second
-  batch both textures;
-- every pool was destroyed before the device, with every call on the owner's
-  thread;
-- the verdict, with synchronization validation, is clean.
-
-GRS-9's case, `grs9-swap`, runs the sprites sample's swap case
-([samples/sprites/README.md](../samples/sprites/README.md)) over the same
-surface-free composition and host. It draws the sample's scene three times,
-each into a target of its own read back after completion:
-
-1. a frame before the swap;
-2. a frame recorded before the swap and submitted after it. After its
-   recording bound the table, the atlas's handle is swapped to a replacement
-   whose upload completed, of the atlas's layout with each region's colour
-   rotated, and a texture is registered; then the frame is submitted;
-3. a frame after the delayed frame completed, from the same instance data.
-
-A second texture is registered once the delayed frame has completed. It
-passes only if all of these hold:
-
-- no window, surface or image acquisition was made, and the device came
-  first;
-- the before and delayed captures pass every probe of the oracle over the
-  original fixtures, and the after capture every probe of the oracle with
-  the replacement drawn for the atlas;
-- the instance data was the same bytes before and after the swap, the swap
-  took effect (`SwapPublished`), and the replacement has a slot of its own;
-- while the delayed frame held the old version, the atlas's slot was
-  retiring and the texture registered then took another; the texture
-  registered once that frame completed took the atlas's slot;
-- the three PNGs and the record were written;
-- every call ran on the owner's thread, and the verdict, with
-  synchronization validation, is clean.
-
-The PNGs and the record go beneath `HETOIMASIA_VALIDATION_EVIDENCE/swap/`
-when the runner names an evidence directory.
-
-R2D-14's case, `r2d14-window-scenes`, runs the production composition with
-`PerWindowScenes`, the validation layer and synchronization validation, over
-two mapped windows, driven by `runVulkanOwnerLoop`, with a test renderer that
-clears each frame to a colour taken from the scene its window was handed —
-scene 1 red, 2 green, 3 blue — and a lifecycle that logs each adoption and
-release. Nothing but a publication asks for a frame, and nothing is
-captured from the screen: every count is of the owner's own frame events. The
-case publishes scene 1 for the first window and requires its target to present
-one frame and the second's none, the owner round that made it allowed to end
-first; publishes scene 2 for the second window, which presents it; and then, in
-one transaction, publishes scene 3 for the second window and makes a release
-request while the second window shows revision 1. It passes only if the request
-ran after the owner adopted revision 2 of the second window; if each frame was
-cleared to its own window's scene; if every adoption was released, in order,
-by the host's exit; if every Vulkan call ran on the graphics owner's thread
-and every surface was created on the main thread; and if the verdict after the
-last teardown callback has no issue and no error was reported.
-
-R2D-18's case, `r2d18-animation`, runs the same composition, host and runner over
-the recorder's frame tables (render-2d D-4, D-32, P-4). The renderer is made as
-for `r2d12-clip`, and each batch writes the frame tables of the views that draw
-into the same region, after the clip tables and the material records, with the
-word each view's block begins at in a seventh push member, `frameBase`, at offset
-76 (the engine's part of the 128-byte block is now 80 bytes, and the application's
-begins where it did). The block is a directory and one record for each table: its
-current frame, which the recorder computes on the host in `Double` as
-`floor (t / duration) mod count` with an exact integer floor and writes as a whole
-number, its count and its rectangles. The vertex stage, which now declares the
-storage table's binding in its checked interface as the fragment stage does, reads
-the instance's index from the flags word's bits 4–15 and the rectangle of its
-table's current frame, in place of the instance's own; it does no time arithmetic.
-Like `r2d10-retained` the case needs `D32_SFLOAT` and otherwise reports the format
-and renders nothing, and it builds one retained chunk, with its upload admitted
-once, which no frame rebuilds. A strip of four opaque texels (red, green, blue,
-yellow) is the one texture, sampled nearest, and a table's frame shows one texel
-of it, so a pixel's colour names the frame. Nine frames are rendered, each into a
-32 × 32 `R8G8B8A8_UNORM` target with a depth image and read back as the ordered
-path's are; each shows its behaviours by named probes that must be determinate and
-differ from their contrast's, and whose colours are checked against the frames
-worked out by hand in the case's comments:
-
-1. six frames of one view holding a forward and a backward table of four frames of
-   0.5 s, at the times 0, 0.75, 1.0 (exactly on a boundary), 999999.75, 1000000
-   (exactly on a boundary, near 10⁶ seconds) and the double just below 10⁶,
-   each with an animated dynamic sprite, a non-animated instance in the same draw
-   showing its own rectangle, and the retained chunk's animated tile;
-2. *two-views*: the same chunk drawn in the left and the right half of the target,
-   each view with two tables of its own and its own time (0.75 and 999999.75),
-   which show different frames, with an animated and a non-animated dynamic
-   instance in the same draw;
-3. *counterexample-8192*: count 2, duration 8192 and time 991231.9998, which a
-   32-bit phase would round up to the next frame: frame 0;
-4. *huge-duration*: count 3, duration 2¹²⁷ and time 2.5 × 2¹²⁷, for which a 32-bit
-   phase has no value: frame 2.
-
-The pass criteria are the ordered path's, with the device's depth format reported
-as for `r2d9-cutout-depth` where it is not `D32_SFLOAT`; the PNGs and the probe
-record go beneath `HETOIMASIA_VALIDATION_EVIDENCE/animation/`.
-
-R2D-17's case, `r2d17-depth-rect`, runs the same surface-free composition
-and host, with no uploads, to prove `clearDepthRect`
-([Depth attachments](#depth-attachments)) on the device. Depth cannot be read
-back, so it observes depth through colour. An owner-thread action builds the
-ring, an RGBA8 target of 64 by 64, a `D32_SFLOAT` depth target of that extent
-(the case requires the backend's depth format to be that one), the scene3d
-sample's layout and depth-tested pipeline over its shaders, and a readback
-buffer. One frame-less batch then:
-
-1. begins a pass into the target and the depth target, clearing the colour to
-   blue and the depth to 0.0, so that a less-or-equal test passes nothing;
-2. sets a scissor of 4 by 4 and clears a rectangle touching none of the
-   target's edges (16 to 47 across, 20 to 43 down) to 1.0 with `clearDepthRect`,
-   which the scissor must not narrow;
-3. draws a quad covering the whole target at depth 0.5, in magenta, tested
-   less-or-equal, with an identity transform;
-4. ends the pass, copies the target into the readback after its transition and
-   returns it to rest.
-
-A second action reads the readback, which is written as a PNG to a temporary
-path the journal names. It passes only if all of these hold:
-
-- no window, surface or image acquisition was made, and the device came first;
-- the batch's ticket completed, and the actions ran on the owner's thread;
-- the readback shows the quad's magenta exactly inside the rectangle and the
-  pass's blue clear exactly outside it, probed at interior pixels on both sides
-  of each edge, two corners and two points well away from it, every channel an
-  endpoint and so exact;
-- the roots retired in order, with every Vulkan call on the owner's thread;
-- the verdict, with synchronization validation, is clean.
-
-R2D-7's case, `r2d7-ordered-path`, runs the same surface-free composition and
-host, with the session's uploads, to prove the 2D renderer's recorder
-([`hetoimasia-render-2d-vulkan`](../packages/render-2d-vulkan/README.md)) on the
-device against [`hetoimasia-render-2d-oracle`](../packages/render-2d-oracle/README.md).
-One owner-thread action makes the renderer through the recorder's `Builders`
-over the host's constructions — the ring, a table of 16 slots, the
-shader-sampled layout — and four textures: a 2 × 2 linear checker, a 2 × 2 sRGB
-grey, a 1 × 1 white and a 2 × 2 binary-alpha art texture. Their uploads are
-admitted off the owner's thread and waited for, the table's placeholder is
-awaited, and the textures are registered. Then, for each of eleven fixtures, an
-action makes the fixture's offscreen colour targets and readbacks, and one
-frame-less batch records the fixture's `render-2d` snapshot through
-`prepareSnapshot` — planned with no cutout marks, as the oracle is — and copies
-every target out after its transition and back to rest; its ticket is waited
-for, and the readbacks are read once it completed. The fixtures, each a
-snapshot with its own targets (an `R8G8B8A8_UNORM` one unless it says
-otherwise):
-
-1. *placement*: both zoom modes, each with pixel snap off and on, in four views
-   of one target, with sprite origins that make the camera's rounding and the
-   vertex shader's each move a column across a pixel centre;
-2. *samplers*: nearest, linear and default choices mixed in one draw, under a
-   nearest and a linear view default;
-3. *rotation*: a quarter-turn camera;
-4. *colour*: tint, brightness above and below 1, a half-transparent tint over a
-   non-black clear and an additive instance;
-5. *overlap*: translucent instances overlapping in key order, with equal keys in
-   submission order and a larger key over a later submission;
-6. *content-scale*: a UI layer in two passes into two targets, the second with
-   the metrics of a window of logical extent 16 × 16 at content scale 2,
-   supplied to the recorder and the oracle alike;
-7. *fractional-views*: two views with separate viewports in one pass, the second
-   starting at x = 16.5;
-8. *formats*: an `R8G8B8A8_SRGB` target and a UNORM one in two passes of one
-   frame, drawing the same sRGB texture;
-9. *cutout-art*: a depth-enabled world layer holding binary-alpha art, drawn
-   ordered because nothing is marked, into a target that has a `D32_SFLOAT` depth
-   image its pass begins with (R2D-9), so the case needs that format and
-   otherwise reports it and checks the recorder's refusal, as `r2d9-cutout-depth`
-   does;
-10. *placeholders*: a handle whose index no texture holds and one whose
-    generation is stale, beside a registered texture;
-11. *snap-boundary*: a snapping view whose sprite's origin is the largest
-    `Float` below one half, which rounds to 0 as `snapPixel` rounds it exactly
-    (a shader adding 0.5 in single precision would round it to 1).
-
-Every pixel of every target is probed. A probe the oracle gives a determinate
-expectation must read within its tolerance; one it cannot decide — within 1/16
-pixel of a fractional viewport edge, for instance — is listed with its reason in
-the record and counted for nothing. Each fixture must have determinate probes
-and **named** probes, each standing for one behaviour, each determinate and
-read back correctly and each *differing from its contrast*: the same question
-asked where the behaviour is absent, in another view, pass or instance of the
-same frame. So a fixture whose picture was only background would fail, and so
-would one whose probe read the same with the behaviour switched off. The case
-passes only if all of these hold:
-
-- no window, surface or image acquisition was made, and the device came first;
-- every fixture passed, as above;
-- the PNG of every target and the probe record exist where they are kept —
-  each fixture's targets with their formats, extents and metrics, the named
-  probes with their behaviour, expectation, tolerance, observed value, contrast
-  and verdict, the counts of what passed, failed and was indeterminate, and
-  every indeterminate probe with its reason;
-- the roots retired in order, with every Vulkan call on the owner's thread;
-- the verdict, with synchronization validation, is clean.
-
-The PNGs and the record go beneath `HETOIMASIA_VALIDATION_EVIDENCE/ordered-path/`
-when the runner names an evidence directory. The whole child runs under the
-suite's 20-second deadline; it takes well under a second.
-
-R2D-9's case, `r2d9-cutout-depth`, runs the same composition, host and runner
-over targets that each have a depth image of their extent, to prove the cutout
-path and the depth pass. The device chooses the depth format
-(`constructDepthFormat`); the case needs `D32_SFLOAT` (render-2d D-23). Where
-the device chooses another it renders nothing, reports the format it chose and
-checks that the recorder refuses a depth-enabled world layer over a depth image
-of it before recording; otherwise each of seven fixtures is rendered into
-`R8G8B8A8_UNORM` targets with a `D32_SFLOAT` depth image, through
-`prepareSnapshot` planned with the marks the fixture names — the same marks the
-oracle is planned with — and read back as the ordered path's are:
-
-1. *interleaved*: cutouts and translucent instances interleaved in one
-   depth-enabled world layer, a translucent instance nearer than a cutout
-   drawing over it and one farther hidden by it;
-2. *equal-keys*: both equal-key rules — among cutouts of an equal key the later
-   draw wins, and at an equal key a translucent instance, submitted first, is
-   drawn over a cutout;
-3. *discarded*: a nearer cutout, submitted first, whose discarded fragments
-   write no depth, so the farther cutout submitted after it shows through;
-4. *filtered-edge*: a linearly filtered cutout edge whose
-   `(0.6, 0.6, 0.6, 0.6)` sample writes white, not grey, and one below an alpha
-   of a half that is discarded;
-5. *minified*: a 4 × 4 cutout texture of three levels minified 2:1, whose level 1
-   is opaque while its level 0 alone would be discarded, beside the twin that
-   has level 0 only;
-6. *two-layers*: two depth-enabled world layers in one view, the second's keys
-   independent of the first's;
-7. *mixed-layers*: a UI layer and a world layer without depth in the same depth
-   pass as a depth-enabled layer, neither testing nor writing depth.
-
-The pass criteria are the ordered path's: every determinate probe within its
-tolerance, every named probe determinate and distinct from its contrast, the
-files kept, the roots retired in order, a clean verdict with synchronization
-validation. The probe record also names the depth format and, for every
-indeterminate probe, its reason; the PNGs and the record go beneath
-`HETOIMASIA_VALIDATION_EVIDENCE/cutout-depth/`. The case found that on MoltenVK a
-`clearDepthRect` recorded after a draw of the same pass leaves the descriptor
-bindings unusable by the draws after it; the recorder binds the texture table
-again after each depth clear in a pass that draws, and it binds the clip region
-again there too (R2D-12, below).
-
-R2D-12's case, `r2d12-clip`, runs the same composition, host and runner over the
-recorder's clip tables (render-2d D-11). The renderer is made with a ring that has
-a storage-table window of 16 KiB, the storage table and a shader-sampled layout
-that also holds set 2 (`TableLayoutOptions TableShaderSampler True`), and each
-batch writes the resolved clip tables of the views that draw into one region
-claimed with `claimTable` before any instance region, and binds it with
-`bindStorageTable` at offset 0 wherever the texture table is bound; a layer's
-push block names its table's first entry and the centre of its view's scissor,
-about whose layer-space point the table's edges are written, so that the
-fragment test never forms an absolute coordinate in the layer's space. Seven
-fixtures are rendered into
-`R8G8B8A8_UNORM` targets, one with a `D32_SFLOAT` depth image, and read back as the
-ordered path's are; each shows its behaviours by named probes that must be
-determinate and differ from their contrast's:
-
-1. *one-draw*: under a camera turned an eighth of a turn, one draw of three
-   instances covering the target: an unclipped one, one clipped to a world
-   square (a diamond on the target) and one under a nested clip that keeps the
-   square's half and is cut by its parent where its own rectangle reaches past;
-2. *own-tables*: two views of one target whose one clip index selects each
-   view's own rectangle, the second from its own viewport origin;
-3. *ui-scales*: a UI clip at content scale 2 in a viewport away from the target's
-   origin;
-4. *snapping*: a world clip under pixel snap and zoom 2, with the camera at a
-   fractional position, that is placed by the view's snapped translation and does
-   not follow a sprite whose origin the shader snaps 0.4 pixel;
-5. *far-camera*: a view of world coordinates near 65536 at a zoom of 100, where a
-   single-precision absolute coordinate is spaced most of a pixel apart: a clip
-   edge at 65536.1484375 stays 30.84375 on the target, the pixel 0.34 outside it
-   draws nothing, and the next draws;
-6. *cutouts*: a nearer cutout clipped away on half the target writes no depth, so
-   the farther cutout shows through there, and hides nothing where its clip holds;
-7. *empties*: an empty clip, and a clip under one whose own rectangle is the whole
-   target, clip everything, beside an unclipped instance that still draws.
-
-The pass criteria are the ordered path's, with the device's depth format reported
-as for `r2d9-cutout-depth` where it is not `D32_SFLOAT`; the PNGs and the probe
-record go beneath `HETOIMASIA_VALIDATION_EVIDENCE/clip/`.
-
-R2D-10's case, `r2d10-retained`, runs the same composition, host and runner over
-targets that each have a `D32_SFLOAT` depth image, to prove retained chunks over
-several frames (render-2d D-1, D-28, D-31). It needs `D32_SFLOAT` as
-`r2d9-cutout-depth` does and otherwise reports the format and renders nothing. The
-session also holds the registries the window host's adapter is made over and an
-adapter, whose holds the case drives as the owner does: it adopts a revision of a
-scene made from a validated snapshot before rendering it, and reports it released
-when its last recording is over; a release is requested through the integration's
-own `requestVulkanRelease`, and an upload is admitted for a ticket the registry
-polls (`submitVulkanUpload`). A windowed snapshot cannot be used, because
-publication refuses an offscreen pass and a window pass cannot be recorded without
-a window. Eleven frames are rendered, each into a 32 × 32 `R8G8B8A8_UNORM` target
-with a depth image, through `prepareSnapshot` planned with the registered marks, and
-read back as the ordered path's are:
-
-1. *interleaved* (3 frames): a world chunk with depth, built once, holding two
-   cutouts and a translucent instance, and a second chunk listed after it holding
-   one cutout, in a depth-enabled world layer beside dynamic cutouts, one of which
-   moves each frame and only which is republished: a dynamic cutout at an equal key
-   to a chunk cutout wins the tie as the later source, so does the later listed
-   chunk's cutout against the earlier's, and the first chunk's translucent
-   instance is hidden behind a nearer chunk cutout and blends over a farther one;
-   the chunks' three cutouts, 192 bytes in two uploads, are uploaded once and the
-   ring receives 192 bytes a frame (two dynamic cutouts and the one ordered
-   instance), never a chunk's cutouts;
-2. *ordered-kinds*: a world chunk without depth and a UI chunk, drawn wholly in the
-   ordered path beside dynamic content in the same layers and merged with it by key
-   and then source; a texel with an alpha under a half, registered with an explicit
-   cutout mark, is discarded by a depth chunk's cutout path and blended by the other
-   two kinds; these two kinds make no buffer and admit no upload;
-3. *swap* (3 frames): the texture a chunk's instance names swapped, under the
-   handle, to an image of the same computed mark shows through the same chunk and
-   snapshot without a rebuild; a swap to an image whose computed mark differs is
-   refused naming both marks, and the pixel keeps showing the accepted texture;
-4. *release* (3 frames): a chunk released while the adopted snapshot shows it keeps
-   its buffer — the request ran on the owner's thread with the revision holding the
-   chunk — and the snapshot's frame, rendered again, still draws it; a snapshot
-   without it is adopted and draws none of it; once the first revision's last
-   recording is over the buffer is released and the chunk forgotten, and a snapshot
-   that lists it is refused as unresolved;
-5. *culling*: a chunk drawn in one view of a pass and skipped in another, and a
-   chunk wholly outside both.
-
-The pass criteria are the ordered path's: every determinate probe within its
-tolerance, every named probe determinate and distinct from its contrast, the files
-kept, the roots retired in order, a clean verdict with synchronization validation;
-and each fixture also fails on a check the case makes beyond pixels (the uploads
-admitted, the holds, the registry, the culling rule). The PNGs, the probe record and
-`retained-measurements.json` — per frame, the bytes written to the ring, the chunk
-bytes uploaded so far and the uploads admitted so far — go beneath
-`HETOIMASIA_VALIDATION_EVIDENCE/retained/`. The case runs in well under a second of
-the suite's 20-second child deadline.
-
-R2D-8's case, `r2d8-image`, runs the [image2d sample](../samples/image2d/README.md)
-through the production composition — `withVulkanOwnerHost` over the loader
-integration, with the validation layer and synchronization validation —
-configured with `PerWindowScenes`, the 2D adapter's lifecycle hooks, the
-session's uploads, the surface-free device start and one test-owned window, in
-a child process of its own. Nothing is captured from the screen. It runs in two
-parts.
-
-*The evidence*, before the window is handed over, makes the sample's renderer
-and its textures — a 64 × 64 PNG decoded with `asset-image`, a 32 × 32 RGBA8
-KTX2 image, and a PNG of non-binary alpha — registers two of them with their
-default marks, and renders the sample's frame into an offscreen
-`R8G8B8A8_SRGB` target of logical extent 128 × 128 at content scale 2 through
-the recorder, reading it back after the batch's completion. Every pixel is
-judged against the oracle, planned with no cutout marks as the recorder is; 19
-named probes — the PNG's world copy, its UI copy at 48 logical pixels, the
-KTX2 copy and the clear background — are each read within one step of a colour
-stated by hand from the images' region tables, independent of the decoder, the
-oracle and the readback, with the oracle agreeing and a contrast of a different
-colour; and the swap rule is shown: a swap of the PNG's handle to the
-non-binary image is refused naming the marks `True` and `False`, changes
-nothing, and is accepted with the registered mark explicitly kept.
-
-*The lifecycle* then runs the actual adapter and the host's adoption callbacks
-in the window, driven by `runVulkanOwnerLoop`, with a renderer that logs every
-scene it is handed with its revision, and a release request wrapped to log, from
-the real table on the owner's thread, whether the KTX2 image's handle still
-resolves to its own slot after the release ran:
-
-1. a snapshot showing the PNG and the KTX2 image is published, adopted as
-   revision 1, and rendered;
-2. the KTX2 image's release is requested while revision 1 is adopted. The
-   adapter marks it released and asks the host; the release runs on the
-   owner's thread once the host's barrier is met, finds revision 1 holding the
-   texture, and the table still maps it; the window renders revision 1 again,
-   showing it, afterwards;
-3. a snapshot naming the released texture is offered and refused, naming it;
-4. a snapshot without it is published, adopted as revision 2, revision 1 is
-   released by the host, and only then does the release take effect — by an
-   action that waits for no barrier, since the request's was met in step 2: the
-   table no longer maps the handle, and nothing is left pending.
-
-It passes only if the evidence passed; every named probe held; the swap was
-refused and accepted as above; every release that ran before revision 1's
-release found the texture mapped, and one afterwards found it released, with
-revision 2 adopted before revision 1's release and that before the release's
-effect; the refusal named the texture and the snapshot without it was
-accepted; every Vulkan call ran on the graphics owner's thread and every
-surface was created on the main thread; and the verdict after the last
-teardown callback has no issue and no error was reported. The PNG and the
-probe record go beneath `HETOIMASIA_VALIDATION_EVIDENCE/image2d/` when the
-runner names an evidence directory. The windowed mode of the sample is the
-owner-visible path and no test launches it.
-
-GRS-10's case, `grs10-scene3d`, runs the scene3d sample's window-free evidence
-([samples/scene3d/README.md](../samples/scene3d/README.md)) over the same
-surface-free composition and host, with no uploads. It uses the sample's own
-scene, renderer, oracle, PNG writer and probe record, through a host record over
-this suite's session. The backend chooses the depth format; an owner-thread
-action builds the ring, the RGBA8 target, a depth target of that format, a
-readback buffer a pose, the layout and the depth-tested pipeline, and a
-frame-less batch a pose draws the two cubes — the nearer first — copies the
-target out and returns it to rest, the second pose's only after the first's
-batch has completed. The PNGs and the probe record go beneath
-`HETOIMASIA_VALIDATION_EVIDENCE/scene3d/` when the runner names an evidence
-directory, and into a kept temporary directory the journal names otherwise.
-
-It passes only if all of these hold:
-
-- no window, surface or image acquisition was made, and the device came first;
-- a depth-only format was chosen, and both poses were rendered and read back
-  whole after their batches completed;
-- every probe passed the independent oracle in both poses — the occlusion
-  probes, where the nearer cube drawn first showed over the farther, the
-  camera-moved probes, the face probes and the clear probes alike;
-- both PNGs and the record were written;
-- the roots retired in order, with every Vulkan call on the owner's thread;
-- the verdict, with synchronization validation, is clean.
-
-GRS-8's case, `grs8-sprites`, runs the sprites sample's window-free evidence
-([samples/sprites/README.md](../samples/sprites/README.md)) over the same
-surface-free composition, with the session's uploads configured. It uses the
-sample's own scene, renderer, oracle, PNG writer and probe record, through a
-host record over this suite's session. The PNG and the probe record go beneath
-`HETOIMASIA_VALIDATION_EVIDENCE/sprites/` when the runner names an evidence
-directory, so the receipt lists them, and into a kept temporary directory the
-journal names otherwise.
-
-It passes only if all of these hold:
-
-- no window, surface or image acquisition was made, and the device came first;
-- the scene was rendered and the whole target read back after its batch
-  completed;
-- every probe passed the independent oracle, the BC7 fixture's only where the
-  device takes BC7;
-- both files were written;
-- the roots retired in order, with every Vulkan call on the owner's thread;
-- the verdict, with synchronization validation, is clean.
-
-GRS-12's case, `grs12-frameless`, runs the same surface-free composition with
-no window, under a 2 GiB byte budget, as VK-11's case does. One owner-thread
-action builds a color target and a vertex buffer and records a frame-less
-batch that initializes the target and moves the buffer into a copy's use and
-back; a second records one that moves the target into a copy's source and back
-and the buffer again, with no wait for the first's completion. Each is
-submitted when its action returns. It passes only if no window, surface or
-image acquisition was made and the device came first; if both actions ran on
-the owner's thread, each beginning and ending one command buffer; if two
-submissions were made, two completions observed, and both tickets, waited for
-with a deadline from the main thread, answered complete; if the frame-less
-fences were destroyed before the device, then the messenger and the instance,
-with every Vulkan call on the owner's thread; and if the verdict after the
-last teardown callback has no issue and no error was reported. Recorded
-commands are not observed one by one there, so its barriers are the headless
-examples', and their synchronization the verdict's.
-
-#250's case, `debug-names`, is VK-11's on private roots of its own, with one
-destructive seam only the fixture holds: it wraps the production recording
-layer so the batch's copy into the readback buffer is recorded, through the
-binding's own call, four bytes into the buffer, where the whole image no longer
-fits. Core validation reports that while the command is recorded, as
-`VUID-vkCmdCopyImageToBuffer-pRegions-00183`; nothing is submitted, and no
-handle leaves the backend's interface, since the wrapper sees only what the
-backend hands its own native layer. The case passes only when that report, and
-no other error, reached the capture from the recording step; when the report's
-objects carry the readback buffer's handle with the name the backend gave it;
-when the report's command-buffer labels include the batch's, if the pinned
-layer reports command-buffer labels at all — which label arrays each layer
-populates, in what order, is recorded in the case's record, not assumed; and
-when the
-verdict after the last teardown callback fails for the latched error and
-nothing else, with nothing dropped, cut, refused or undelivered. The shared
-session also requires every naming call it made to have run on the owner's
-thread and returned.
-
-The **graphics-owner interaction probe** is the suite's last example, and
-the only one no routine run executes. It extends
-[RR-4's probe](glfw.md#the-interaction-probe) with the graphics owner and is
-gated exactly as that one is: it needs the run's native consent, and it is
-pending — opening no window — unless `HETOIMASIA_INTERACTION_PROBE_SECONDS`
-names the seconds each phase lasts. No validation group names it, so
-`test.vulkan-native` reports it pending on both platforms. Activated, it runs
-in a child of the suite with the parent's terminal, so the person sees each
-phase's instruction as it begins: the production composition over one
-640×480 window, with the validation layer, driven by `runVulkanOwnerLoop`,
-while a thread other than the main one publishes a new scene every 16 ms and
-the owner clears each frame to a colour that moves with the scene. The
-session's trace records the main thread's owner turns, the native event call's
-entry and exit and every callback delivered inside it; the frame observer
-records every acquisition, present request, present return and present fence
-observed signalled into the same trace from the owner's thread, in the same
-monotonic time domain. Through RR-4's four phases — an idle baseline, a window
-move, a live resize and a menu-bar interaction — it reports, per phase, the
-owner turns, the pumps, and the present requests, returns and completions
-overall and inside each pump that blocked for a quarter of a second or more;
-with `HETOIMASIA_INTERACTION_PROBE_OUTPUT` it writes every record with the
-platform, compiler, device, loader, driver and layer identities. It asserts
-that every phase measured something, lost nothing and faulted nothing, and
-that validation reported nothing — never whether a stall happened, and never
-that frames visibly advanced, which a present return and a present fence do not
-prove. [The graphics-owner interaction verdict](archive/graphics_owner_interaction_verdict.md)
-records its measurement.
-
-```bash
-HETOIMASIA_NATIVE_SESSION=desktop HETOIMASIA_INTERACTION_PROBE_SECONDS=15 \
-  HETOIMASIA_INTERACTION_PROBE_OUTPUT=/tmp/graphics-owner-probe.tsv \
-  bash tools/vulkan/run.sh native hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests -- --interaction-probe
-```
-
-The owner's standing approval for native runs does not reach it: it is
-interactive, no planner selects it, and a person must perform the interactions,
-so it runs when the owner asks for it, as RR-4's did.
+| Main thread | Hspec runs on its own thread; the process main thread owns one shared production graphics session. An example that needs the main thread submits an operation (`onMain`), run between two turns of the host's owner loop. Windows are created through the host's command port. |
+| Identities | Every dispatched operation is checked to be on the bound process main thread. Every native call is recorded where it runs by a `NativeObserver`, so examples show from the calls themselves which thread made each. |
+| Sharing | The instance, messenger and one device are acquired lazily, at most once, and shared. Each example's windows and targets are its own. |
+| Private roots | A case that must create, poison or destroy roots of its own runs in a child process of the same executable (`--private-roots <scenario>`), on the child's main thread. |
+| Selection | A dry run, a listing, or a selection that dispatches nothing acquires nothing and starts no child. A selection matching nothing fails. `--complete`, which the catalog group passes, runs the whole tree and fails unless the shared session was acquired once and every private scenario the run's consent requires ran and passed, so no ambient setting can turn the receipt into a pass for a subset. |
+| Consent | Read once from `HETOIMASIA_NATIVE_SESSION`, with the GLFW suite's rules. Under the Wayland consent every session requests Wayland by name. |
+| Environment | Before any Vulkan call the suite clears every ambient discovery override and validation-layer setting it finds, records which, and disables implicit layers. |
+| Validation | Every validation-enabled instance enables the Khronos layer and synchronization validation through its own create info. The `synchronization-hazard` case passes only when the capture carries `SYNC-HAZARD-WRITE-AFTER-WRITE`, which shows the validation is active: zero validation errors is a claim about coverage only when a hazard is shown to be caught. |
+| After teardown | The shared session is released only once Hspec has finished. The run then checks the destruction order, the owner's thread for each destruction, and that the capture's final verdict is clean. |
+| Report | The run prints the environment, the shared session's native calls, destruction order and verdict, and each child's exit and seconds. Each child's record is written to the validation runner's evidence directory. |
+
+`test.vulkan-wayland` runs the same profile under packaged headless Weston on
+Lavapipe. Its one extra case, `wayland-connection-loss`, ends the compositor
+from the loop's update once a presentation has retired and requires the
+application to end with `ConnectionFailed` and the protected exit to retire
+everything.
 
 Run the suite as the group does:
 
@@ -7128,27 +2048,44 @@ bash tools/vulkan/run.sh build hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tes
 bash tools/vulkan/run.sh native hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests -- --dry-run
 ```
 
-The second command builds nothing. It prints, and hands the suite to record, the revision and source digest that the first command
-recorded for the executable, and refuses, naming the build command, an executable that was built from another tree or has no record. After
-any change under the digest's roots, which include `tools/vulkan` and `tools/native`, run the first command again
+The second command builds nothing and refuses an executable built from
+another tree. After any change under the digest's roots, which include
+`tools/vulkan` and `tools/native`, run the first command again
 ([the build identity](validation.md#a-native-runs-build-identity)).
 
-On Linux the native mode starts an isolated X11 display for the run and needs
-no approval. `test.vulkan-wayland` runs the same profile on the isolated
-headless compositor instead, which needs no approval either:
+On Linux the native mode starts an isolated X11 display and needs no approval;
+the Wayland profile runs on the isolated headless compositor:
 
 ```bash
 bash tools/display/wayland.sh -- bash tools/vulkan/run.sh native hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests -- --complete
 ```
 
-On macOS the suite opens windows on the owner's desktop. The
-owner's standing approval covers a run an issue or pull request needs (see
-[the GLFW native suite](glfw.md#the-native-suite)), so the agent runs it
-without asking, with the consent on that one command:
+On macOS the suite opens windows on the desktop. The standing approval and its
+limits are in [AGENTS.md](../AGENTS.md); the consent goes on that one command:
 
 ```bash
 HETOIMASIA_NATIVE_SESSION=desktop bash tools/vulkan/run.sh native hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests -- --complete
 ```
 
 See [validation.md](validation.md#the-vulkan-groups-local-evidence) for the
-receipt that run leaves and what it is evidence of.
+receipt that run leaves.
+
+**The graphics-owner interaction probe** is the suite's last example and the
+only one no routine run executes. It extends
+[the GLFW interaction probe](glfw.md#the-interaction-probe) with the graphics
+owner and is gated the same way: it needs the run's consent and is pending
+unless `HETOIMASIA_INTERACTION_PROBE_SECONDS` is set. It records, in one time
+domain, the main thread's owner turns and native event calls and the owner's
+acquisitions, present requests, returns and present-fence completions,
+through an idle baseline, a window move, a live resize and a menu
+interaction. It asserts only that every phase measured something and that
+validation reported nothing; it never asserts that frames visibly advanced. On
+macOS it measured the owner still presenting during a live resize and a menu
+interaction. The standing approval does not reach it: a person must perform
+the interactions, so it runs when the owner asks.
+
+```bash
+HETOIMASIA_NATIVE_SESSION=desktop HETOIMASIA_INTERACTION_PROBE_SECONDS=15 \
+  HETOIMASIA_INTERACTION_PROBE_OUTPUT=/tmp/graphics-owner-probe.tsv \
+  bash tools/vulkan/run.sh native hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests -- --interaction-probe
+```

@@ -9,7 +9,7 @@ recorder, texture registry and per-window host adapter. It is the first thing
 that shows a decoded image in a window through the 2D renderer, and the sample
 on which that renderer's registration, swap rule, publication and release
 contracts are proved. The decision record is
-[the 2D renderer design](../../docs/designs/render_2d_design.md) (D-7, D-14,
+[the 2D renderer design](../../docs/removed_records.md) (D-7, D-14,
 D-18, D-19, D-27, D-28, D-29).
 
 It follows the [sprites sample](../sprites/README.md)'s pattern. There are two

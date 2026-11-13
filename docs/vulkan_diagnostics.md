@@ -1,124 +1,70 @@
 # Vulkan validation diagnostics
 
-Current behavior of the Vulkan backend's diagnostic capture: the header-free
-`Hetoimasia.GPU.Vulkan.Diagnostics` in `packages/gpu-vulkan/diagnostics`, and the
-debug-utils messengers the native backend package
-`Hetoimasia.GPU.Vulkan.Native.Diagnostics` in `packages/gpu-vulkan/native`
-installs. The accepted policy lives in
-[the Vulkan backend design](archive/vulkan_backend_design.md) — D-19, D-20, D-21, D-28,
-P-11 and the VK-6 slice — and in
-[runtime review finding RR-5](runtime_review_findings.md); this document says
-what the code does today.
+The contract of the Vulkan backend's diagnostic capture: the header-free
+`Hetoimasia.GPU.Vulkan.Diagnostics` in `packages/gpu-vulkan/diagnostics`, and
+the debug-utils messengers `Hetoimasia.GPU.Vulkan.Native.Diagnostics` installs.
 
-A Vulkan layer or driver reports from inside Vulkan calls, on whatever thread it
-is running, and under D-28 some of those calls will be audited `unsafe` imports
-that must not re-enter Haskell. So the callback is C, it only copies, and a
-Haskell worker delivers what it copied afterwards, outside the callback and
-outside the graphics critical path. Latched error and loss state lives in the
-C storage, so it is observable with the worker slow, blocked or gone.
+A Vulkan layer or driver reports from inside Vulkan calls, on whatever thread
+it is running, and some of those calls are audited `unsafe` imports that must
+not re-enter Haskell. So the callback is C and only copies, and a Haskell
+worker delivers what it copied afterwards, outside the graphics critical path.
+Latched error and loss state lives in the C storage, so it is observable with
+the worker slow, blocked or gone.
 
 ## The two packages
 
-| Package | Project files | Depends on | Owns |
-| --- | --- | --- | --- |
-| `hetoimasia-gpu-vulkan-diagnostics` | `cabal.project`, `cabal.project.cpu`, `cabal.project.vulkan` | `hetoimasia-foundation` only | The C capture storage and producer, the diagnostic lifetime, its drain worker and verdict |
-| `hetoimasia-gpu-vulkan-native` | `cabal.project.vulkan` only | the Vulkan binding, the diagnostics package, `hetoimasia-gpu-vulkan-model`, the foundation | The messenger callback, the messengers, and the package's FFI configuration record |
+| Package | Built by | Owns |
+| --- | --- | --- |
+| `hetoimasia-gpu-vulkan-diagnostics` | every project, with no Vulkan SDK; depends on the foundation only | The C capture storage and producer, the diagnostic lifetime, its drain worker and verdict |
+| `hetoimasia-gpu-vulkan-native` | `cabal.project.vulkan` only, through `tools/vulkan/run.sh` | The messenger callback, the messengers, and the FFI configuration record |
 
-The diagnostics package includes no Vulkan header and depends on no binding or
-loader, so `cabal build all` with either ordinary project builds it with no
-Vulkan SDK present, and its suite is the CPU validation group
-`test.vulkan-diagnostics`. The native package is built only by
-`tools/vulkan/run.sh`, which is what points Cabal at the provisioned loader and
-headers; its groups are `test.vulkan-headless` and `test.vulkan-native`.
-`tools/test/VulkanProof.hs` holds that boundary: neither ordinary project names
-the native package, no package they name depends on the binding, and the Vulkan
-project names exactly the native package, the window integration package, and
-their local closure.
+`tools/test/VulkanProof.hs` holds that boundary.
 
 ## The producer
 
-`hetoimasia_capture_callback` in
-`packages/gpu-vulkan/diagnostics/capture/cbits/hetoimasia_vulkan_capture.c` is
-the producer, and the native package's `hetoimasia_vulkan_capture_messenger` is
-the `PFN_vkDebugUtilsMessengerCallbackEXT` every capture messenger registers: a
-C function with Vulkan's exact type that passes its arguments straight to it.
-Nothing on that path is Haskell. For each report it:
+`hetoimasia_capture_callback` is the producer, and the native package's
+`hetoimasia_vulkan_capture_messenger` is the callback every capture messenger
+registers. Nothing on that path is Haskell. For each report it:
 
-1. announces itself in the storage's slot — its first memory operation — and
-   ignores the report if the user data names no slot or a slot now serving
-   another storage, since there is nowhere to record it;
+1. announces itself in the storage's slot, its first memory operation, and
+   ignores the report if the user data names no current slot;
 2. counts it as offered;
-3. **latches the error state if the severity has the error bit**, and counts
-   the error — before anything below can drop or refuse the report;
-4. refuses it as a capture failure, latching capture failure, if admission has
-   closed or the callback data is NULL;
+3. **latches the error state if the severity has the error bit**, before
+   anything below can drop or refuse the report;
+4. refuses it as a capture failure if admission has closed or the callback
+   data is NULL;
 5. claims a queue position with one compare-and-swap, or counts the report as
-   dropped and returns if the queue is full;
+   dropped if the queue is full;
 6. copies the record under its bounds, counts it as truncated if anything did
-   not fit, publishes it, and counts it as admitted;
-7. returns 0, `VK_FALSE`, the non-aborting answer the API asks for.
+   not fit, and publishes it;
+7. returns `VK_FALSE`.
 
-It never allocates — on the Haskell heap or the C heap: every record, object and
-label it can fill was allocated with the storage — and never waits for space,
-takes a lock, performs I/O, calls Vulkan or raises. The queue is a bounded multi-producer, single-consumer ring after
-Vyukov's bounded queue, with a sequence encoding that also works for a queue of
-one; a producer that loses a race retries only against the position that beat
-it.
+It never allocates, waits, locks, performs I/O, calls Vulkan or raises. The
+queue is a bounded multi-producer, single-consumer ring.
 
-The diagnostics package knows the callback data only through a layout mirror of
-`VkDebugUtilsMessengerCallbackDataEXT`, `VkDebugUtilsObjectNameInfoEXT` and
-`VkDebugUtilsLabelEXT` in its header. `packages/gpu-vulkan/native/cbits/hetoimasia_vulkan_native.c` is the
-one translation unit that sees both that header and the Vulkan headers, and it
-asserts at compile time that every mirrored field has the same offset and size,
-that all three structures have the same size — so both array strides agree too —
-and that the severity bits agree. A
-header whose layout differed would fail the native build rather than be read
-through the wrong offsets. The capture's C is compiled with
-`-fno-strict-aliasing` because it reads Vulkan's structures through that mirror.
+The diagnostics package knows the callback data only through a layout mirror
+of the three debug-utils structures. The native package's one translation unit
+that sees both headers asserts at compile time that every mirrored field has
+the same offset and size, so a differing header fails the build. The capture's
+C is compiled with `-fno-strict-aliasing` for that reason.
 
-### What one record holds
+**One record** holds the severity and type bits, the message id, and, under
+one shared text budget per record, the id name, message text, object names and
+label names. It keeps at most the object limit of object types and handles and
+at most the label limit of queue and command-buffer labels each, with the
+counts the callback carried. A record that had to be cut is admitted and
+counted as truncated once.
 
-| Field | Bound |
-| --- | --- |
-| Severity bits and message-type bits | copied |
-| Message id number | copied |
-| Message id name, message text, object names, queue label names, command-buffer label names | copied in that order under **one shared text budget per record**, 4 KiB by default; each string is copied byte by byte up to what the budget has left, never measured or decoded whole first |
-| Object type and handle | at most the object limit, 16 by default; the count the callback carried is kept beside them |
-| Queue labels, command-buffer labels | two separate fields, each at most the label limit, 4 by default, in the callback's order; each keeps the count the callback carried beside the ones copied, and a label whose name was NULL is kept without one |
+**Limits.** `CaptureConfig` defaults: queue capacity 1,024 records, text
+budget 4,096 bytes, 16 objects, 4 labels of each kind, poll interval 2,000
+microseconds. `validateCaptureConfig` runs before anything is allocated: every
+limit at least 1 and within 32 bits, the total allocation representable, a
+positive poll interval, and the threaded runtime.
 
-A record whose text ran out, whose objects or labels exceeded their limits, or
-whose callback data claimed objects or labels and passed no array, is admitted
-cut and counted as truncated — once per record, however many of those applied.
-A label's colour is not copied.
-
-### Limits
-
-`CaptureConfig` carries the queue capacity (1,024 records by default), the text
-budget (4,096 bytes), the object limit (16), the label limit (4 of each kind),
-and the worker's poll interval (2,000 microseconds). `validateCaptureConfig` checks them without performing IO
-and `withDiagnosticCapture` runs it first, so a rejected configuration raises
-`CaptureConfigError` before anything is allocated:
-
-- every limit must be at least 1 and at most what the storage counts in, an
-  unsigned 32-bit value — an `Int` is finite, so this is the whole of "positive
-  and finite";
-- the bytes the storage would allocate — capacity times the fixed record size,
-  the text budget, the object records, and two arrays of label records — are
-  computed exactly and must fit in both a C `size_t` and an `Int`
-  (`AllocationUnrepresentable` otherwise); the C constructor repeats that check
-  with overflow-checked multiplication, label records included;
-- the poll interval must be positive;
-- the process must run the threaded runtime.
-
-The default budget does not fit everything a driver routinely says. On macOS,
-MoltenVK's info report of its supported extensions during `vkCreateInstance`
-runs past 4 KiB, so a session at the default budget with info reports enabled
-records one truncation and a verdict that is not clean; Lavapipe's reports all
-fit. VK-6's native proof session runs with a 16 KiB budget for that reason, and
-so does VK-7's. The default is unchanged. VK-7's production composition
-([gpu_backend.md](gpu_backend.md)) takes its capture configuration from its
-caller rather than settling it; what the default should be, or whether routine
-commentary should count against a clean verdict, rests with VK-8.
+On macOS, MoltenVK's info report of its supported extensions exceeds 4 KiB, so
+a session at the default budget with info reports enabled records one
+truncation and a verdict that is not clean. The native proof sessions use a
+16 KiB budget for that reason.
 
 ## Latches and counters
 
@@ -126,394 +72,170 @@ commentary should count against a clean verdict, rests with VK-8.
 | --- | --- | --- |
 | Error latch | any error-severity report, before its admission is attempted | nothing |
 | Capture-failure latch | a report refused as a capture failure | nothing |
-| Offered, admitted, dropped, truncated, capture failures, errors | the producer, each saturating at `maxBound` | nothing |
+| Offered, admitted, dropped, truncated, capture failures, errors | the producer, each saturating | nothing |
 
-Every report the producer records is exactly one of admitted, dropped, or
-refused as a capture failure, so offered is their sum until a counter
-saturates. `captureStatus` reads all of them from the C storage at any time,
-from any thread, with no worker involved, before, during and after the
-release: they live in the storage's static slot, which is never freed, and
-once the slot serves another lifetime the query answers the snapshot taken just
-before the storage was freed. No delivery, flush or later
-report clears any of them, and the logger's filter never sees them: an error
-the logger filters out entirely is still latched.
+Every report is exactly one of admitted, dropped or refused. `captureStatus`
+reads all of this from the C storage at any time, from any thread, with no
+worker involved, before, during and after release. The logger's filter never
+sees the latches: a filtered-out error is still latched.
 
 ## The diagnostic lifetime
 
-```haskell
-withDiagnosticCapture
-  ∷ CaptureConfig → Logger → (DiagnosticCapture → IO (a, Quiesced)) → IO (a, DiagnosticVerdict)
-afterLastCallback ∷ DiagnosticCapture → IO () → IO Quiesced
-captureUserData ∷ DiagnosticCapture → Ptr ()
-captureCallback ∷ FunPtr CaptureCallback
-requestDrain    ∷ DiagnosticCapture → IO ()
-retainStorage   ∷ DiagnosticCapture → IO ()
-capturePhase    ∷ DiagnosticCapture → STM CapturePhase
-captureStatus   ∷ DiagnosticCapture → IO CaptureStatus
-deliveredCount  ∷ DiagnosticCapture → STM Word64
-captureSinkFailure ∷ DiagnosticCapture → STM (Maybe SinkFailure)
-captureAlarms   ∷ DiagnosticCapture → IO [CaptureAlarm]
-```
+`withDiagnosticCapture config logger body` is established before any messenger
+exists: it allocates the storage, starts the drain worker in a worker group of
+its own, and runs the body. The body enables messengers with
+`captureUserData`, does every Vulkan operation that could report, and finishes
+the last callback-producing destruction through `afterLastCallback`, which
+returns the `Quiesced` evidence the body hands back with its result. On every
+exit the lifetime:
 
-The lifetime is established before any messenger exists: it allocates the
-storage, starts the drain worker in a `withWorkerGroup` of its own, and runs the
-body. The body enables messengers with `captureUserData`, does every Vulkan
-operation that could report, and finishes the last callback-producing
-destruction — `vkDestroyInstance`, where the create-info messenger reports after
-the explicit messenger is gone — through `afterLastCallback`, which returns the
-`Quiesced` evidence the body must hand back with its result. On every exit the
-lifetime then:
-
-1. closes admission and waits for every producer that has announced itself
-   inside the callback — the wait is bounded by a producer's own copy, and is
-   the reason closing is a `safe` call;
-2. asks the worker for its final drain and waits for its completion explicitly,
-   never relying on the worker group's default drain;
-3. counts as undelivered every admitted record the worker did not deliver: the
-   ones it discarded after a sink failure, one it had taken and was delivering
-   when it was cancelled — the worker counts a record as taken in the same
-   masked step that takes it — and every one still queued;
-4. reads the latches and counters for the verdict, keeps them as the status
-   snapshot, and frees the storage — unless the body called `retainStorage`
-   because a native object that registered the callback may outlive it, in
-   which case it is left for process exit and the verdict says so;
+1. closes admission and waits for every producer that has announced itself;
+2. asks the worker for its final drain and waits for its completion;
+3. counts as undelivered every admitted record the worker did not deliver;
+4. reads the latches and counters for the verdict and frees the storage,
+   unless the body called `retainStorage` because a native object that
+   registered the callback may outlive it;
 5. returns the body's result with the verdict, or rethrows the body's failure
-   with its own type, value and context and the verdict attached to it. A body
-   failure — a body cancellation included — stays primary whatever
-   finalization observes: a cancellation delivered while the lifetime waits
-   for the worker, or a failure raised while its worker group closes, is kept
-   beside it as `FinalizationEvidence` rather than rethrown in its place.
+   with the verdict attached.
 
 | Phase | Meaning |
 | --- | --- |
-| `PhaseCapturing` | The body runs; producers report, and the worker drains when woken or polled. |
-| `PhaseClosed` | Admission is closed, every producer has left, and the final drain was requested. The storage and the logger are still borrowed. |
-| `PhaseJoined` | The worker is terminal and its outcome has been read. |
-| `PhaseReleased` | The storage is freed, or deliberately retained. |
+| `PhaseCapturing` | The body runs; producers report; the worker drains |
+| `PhaseClosed` | Admission is closed, every producer has left, the final drain was requested |
+| `PhaseJoined` | The worker is terminal and its outcome has been read |
+| `PhaseReleased` | The storage is freed, or deliberately retained |
 
 ### Quiescence is the owner's evidence
 
-Vulkan invokes a messenger's callback only from inside a Vulkan call. So once
-the last call that could invoke it — `vkDestroyInstance` — has returned, no
-invocation can be running or begin, and that return is what quiescence is. The
-capture cannot establish it on its own: an invocation that has entered the
-callback but not yet executed its first memory operation has touched nothing
-any barrier could see, and a barrier only moves that window to its own first
-instruction. Quiescence is therefore evidence the owner of the last
-callback-producing destruction supplies, and the lifetime demands it by type.
+Vulkan invokes a messenger's callback only from inside a Vulkan call, so once
+the last call that could invoke it (`vkDestroyInstance`) has returned, none
+can be running. The capture cannot establish that on its own, so the lifetime
+demands it by type. `afterLastCallback capture destruction` runs the
+destruction and, once it returns normally, records quiescence and returns an
+opaque `Quiesced`. The native package's `destroyInstanceQuiesced` is
+`vkDestroyInstance` through it. A verdict without that evidence reports
+`QuiescenceUnproven` and is not clean. A destruction that throws establishes
+nothing.
 
-`afterLastCallback capture destruction` runs the destruction and, once it has
-returned normally, records that the capture is quiescent and returns an opaque
-`Quiesced` naming this capture; it is the only way to make one. The native
-package's `destroyInstanceQuiesced` is `vkDestroyInstance` through it. The body
-returns the token with its result, and the record covers a destruction made
-while a failure unwinds, when there is no result to return it with. A verdict
-without that evidence — no record, and no returned token that names this
-capture — reports `QuiescenceUnproven` and is not clean, because a callback may
-still have been on its way when admission closed. A destruction that throws
-establishes nothing.
+A capture is two kinds of memory. The **storage** (queue, records, text) is on
+the C heap and is freed in step 4. Its **slot** (announcement count, closed
+flag, generation, latches, counters) is one entry of a fixed static table of
+64 and is never freed; a messenger's user data encodes the slot index and
+generation, not a pointer. A report that arrives after release therefore
+touches only static memory and counts itself as a capture failure in the slot.
+A sixty-fifth concurrent lifetime is refused with `StorageSlotsExhausted`.
 
-A capture is two kinds of memory. The **storage** — the queue, its object
-records and its text — is on the C heap, is the lifetime's, and is freed whole
-in step 4. Its **slot** — the announcement count, the closed flag, a
-generation, the latches and the counters — is one entry of a fixed static table
-of 64, so it is never freed. The user data a messenger carries encodes the
-slot's index and the storage's generation rather than pointing at anything.
+**Finalization and cancellation.** A cancellation delivered while the lifetime
+waits for the worker does not end the wait; the storage is released only after
+the worker is terminal.
 
-Announcing is the first thing the producer does, so every report that has
-begun is one closing waits for, and the verdict includes it: a report that
-announced itself before admission closed and was still copying when the body
-returned is admitted or refused before the verdict is read. The only report
-closing cannot see is one that has not begun at all — a Vulkan call still
-running after the body returned, which the lifetime's contract rules out.
-Because what such a report touches first is static, it is still memory-safe:
-it finds admission closed and counts itself as a capture failure in the slot,
-outside the verdict, where `captureStatus` shows it. A slot is claimed again
-only after its generation has moved on and every producer announced against it
-has left, so a straggler never counts against a later lifetime; its stale user
-data names nothing. Sixty-four storages may be live at once in one process, and
-a lifetime asking for a sixty-fifth is refused with `StorageSlotsExhausted`.
+| Body | Finalization observed | Rethrown |
+| --- | --- | --- |
+| failed or cancelled | anything | the body's failure with the verdict; a finalization cancellation and group-closing failure are kept beside it as `FinalizationEvidence` |
+| returned | a cancellation while waiting for the worker | that cancellation, with the verdict |
+| returned | a failure while the worker group closed | that failure, with the verdict |
+| returned | neither | nothing: the result and the verdict are returned |
 
-Draining may run while producers are still active: a record produced while an
-earlier one is being delivered is delivered after it. Final closure and release
-wait for producer quiescence, which the body establishes by finishing its last
-callback-producing destruction; a report that arrives after admission closed —
-a body that broke that contract — is refused as a capture failure while the
-storage is still there to count it, and makes the verdict not clean.
-
-A cancellation delivered while the lifetime waits for the worker does not end
-the wait. The first one is kept — later ones are not — the worker is asked to
-cancel, and the wait continues; the storage is released only after the worker
-is terminal. What is rethrown then follows one precedence:
-
-| Body | Finalization observed | Rethrown | Kept beside it |
-| --- | --- | --- | --- |
-| failed, or cancelled | anything | the body's failure, with its own type, value and context, and the verdict | the finalization cancellation and the group-closing failure, as `FinalizationEvidence` |
-| returned | a cancellation while waiting for the worker | that cancellation, with the verdict | nothing |
-| returned | a failure while its worker group closed | that failure, with the verdict | nothing |
-| returned | neither | nothing: the result and the verdict are returned | — |
-
-A cancellation after a body that returned is never turned into a successful
-return. A sink that blocks forever and cannot be interrupted keeps the lifetime
-in `PhaseClosed` with the storage and the logger borrowed: there is no deadline
-and no detach, and the process's external termination is the escape.
+A sink that blocks forever keeps the lifetime in `PhaseClosed`: there is no
+deadline and no detach.
 
 ### The drain worker
 
-The worker belongs to the lifetime's own worker group, not the application's,
-and performs no GPU retirement. It takes records from the storage — it is the
-storage's only consumer until it is terminal — and hands each to the caller's
-logger through `logEvent`, from a logger derived with the breadcrumb
-`vulkan-diagnostics`:
+The worker is the storage's only consumer. It hands each record to the
+caller's logger under the breadcrumb `vulkan-diagnostics`, component
+`gpu.vulkan.diagnostics`, constant message `Vulkan diagnostic`:
 
 | Record severity | Level |
 | --- | --- |
 | error | `Error` |
-| warning | `Warning` |
-| info, verbose | `Debug` — the loader's and the layers' running commentary is detail for someone investigating this component, not lifecycle `Info` |
-| no known bit | `Warning` |
+| warning, or no known bit | `Warning` |
+| info, verbose | `Debug` |
 
-Every record has the component `gpu.vulkan.diagnostics`, the constant message
-`Vulkan diagnostic`, and its variable parts in fields:
+Fields are `severity`, `types`, `message.id`, `message.number`, `text`,
+`objects`, `object.<n>`, `object.<n>.name` and `truncated`. A record's labels
+are its scoped context (`queue.labels`, `cmdbuf.labels`, `queue.label.<n>`,
+`cmdbuf.label.<n>`), on a logger derived for that record alone. The pinned
+validation layers were seen to list a batch's still-open label region twice.
 
-| Field | Value |
-| --- | --- |
-| `severity` | `error`, `warning`, `info`, `verbose`, or the bits in hex |
-| `types` | `general`, `validation`, `performance`, `device-address-binding`, comma-separated |
-| `message.id`, `message.number` | the message id name when present, and its number |
-| `text` | the message |
-| `objects` | how many objects the callback carried, when any |
-| `object.<n>`, `object.<n>.name` | each copied object's `type:0xhandle`, and its name when present |
-| `truncated` | `true` when the record was cut |
-
-A record's labels are its **scoped context**: the worker delivers each record
-through a logger derived for that record alone (`withFields`), carrying
-
-| Context field | Value |
-| --- | --- |
-| `queue.labels`, `cmdbuf.labels` | how many queue and command-buffer labels the callback carried, when any |
-| `queue.label.<n>`, `cmdbuf.label.<n>` | each copied label's name, numbered from 1 in the callback's order; a label with no name has no field |
-
-so a record's labels never reach another record's entry. The order, and which
-regions are listed, are the reporting layer's own: the pinned layers were seen
-to list a batch's still-open region twice, and Linux's to list a pass region
-that had already closed as well
-([macOS](vulkan/macos-vkr2.md), [Linux](vulkan/linux-vkr2.md)). The native
-package's recorder
-opens a label around every batch and every rendering pass
-([gpu_backend.md](gpu_backend.md#names-and-labels)); nothing opens queue labels
-yet.
-
-Delivering a record and counting it delivered are one masked step: the sink's
-own blocking stays interruptible, so a cancellation still reaches a stuck sink,
-but none can land between a write that completed and its count, and the
-verdict's delivered count is exactly what the sink received.
-
-A synchronous failure writing a record is the sink's. Delivery stops; the
-worker keeps taking records and counts them as undelivered, so the accounting
-stays complete; and the failure is kept only in the worker's report. It is never
-logged, because the sink that would carry it is the one that failed. Anything
-asynchronous ends the worker as a cancellation. The worker never flushes or
-closes the borrowed logger, and it finishes inside the lifetime, which must
-itself run inside the application's [logging lifetime](logging.md#logging-lifetime).
+Delivering a record and counting it delivered are one masked step. A
+synchronous sink failure stops delivery: the worker keeps taking records and
+counts them undelivered, and the failure is kept only in the worker's report,
+never logged through the sink that failed. The worker never flushes or closes
+the borrowed logger, and the lifetime must run inside the application's
+[logging lifetime](logging.md#logging-lifetime).
 
 ## The verdict
 
-`DiagnosticVerdict` carries the status after admission closed, the records
-delivered and undelivered, the worker's `ConsumerOutcome` — completed, sink
-failed, failed or cancelled — and whether the storage was retained.
-`verdictIssues` lists every reason it is not clean, in a fixed order:
+`DiagnosticVerdict` carries the status after admission closed, the delivered
+and undelivered counts, the worker's outcome and whether the storage was
+retained. `verdictIssues` lists every reason it is not clean:
 
 | Issue | When |
 | --- | --- |
 | `ErrorLatched` | an error-severity report arrived |
-| `CaptureFailureLatched` | a report could not be captured at all |
+| `CaptureFailureLatched` | a report could not be captured |
 | `RecordsDropped n` | the queue was full `n` times |
 | `RecordsTruncated n` | `n` admitted records were cut |
 | `CaptureFailures n` | `n` reports were refused |
 | `RecordsUndelivered n` | `n` admitted records never reached the logger |
-| `RecordsUnaccounted admitted accounted` | admitted differs from delivered plus undelivered |
-| `CounterSaturated` | a counter reached its ceiling, so no count can be trusted |
+| `RecordsUnaccounted` | admitted differs from delivered plus undelivered |
+| `CounterSaturated` | a counter reached its ceiling |
 | `ConsumerUnsuccessful` | the sink failed, or the worker failed or was cancelled |
-| `QuiescenceUnproven` | the owner never supplied `Quiesced` evidence for this capture |
-| `StorageRetained` | a registering native object may still report into the storage |
+| `QuiescenceUnproven` | the owner never supplied `Quiesced` evidence |
+| `StorageRetained` | a registering native object may still report |
 
-`verdictClean` holds only when the list is empty. Warnings are not issues: they
-are diagnostics. So a verdict is clean only when no error arrived, nothing was
-lost, cut or refused, every admitted record was delivered, and the worker
-completed — draining everything admitted is not enough on its own. A failed
-body's verdict is read with `diagnosticVerdict` from the exception it rethrows;
-a sink failure never replaces that failure and never authorizes an early
-release, and neither does a cancellation or a worker-group closing failure
-during finalization.
+Warnings are not issues. A failed body's verdict is read with
+`diagnosticVerdict` from the exception, and `finalizationEvidence` reads what
+finalization observed beside it. A sink failure never replaces the body's
+failure and never authorizes an early release.
 
-```haskell
-diagnosticVerdict             ∷ SomeException → Maybe DiagnosticVerdict
-diagnosticVerdictInContext    ∷ ExceptionContext → Maybe DiagnosticVerdict
-finalizationEvidence          ∷ SomeException → Maybe FinalizationEvidence
-finalizationEvidenceInContext ∷ ExceptionContext → Maybe FinalizationEvidence
+**Acting on the latch is the owner's.** This package exposes the latch and
+does nothing about it; the backend's controller installs it as the roots'
+diagnostic watch, so an error-severity report becomes the session's primary
+failure at the owner's next checkpoint
+([gpu_backend.md](gpu_backend.md#terminal-failure)).
 
-data FinalizationEvidence = FinalizationEvidence
-  { evidenceCancellation ∷ Maybe (ExceptionWithContext SomeException)
-  , evidenceGroupFailure ∷ Maybe (ExceptionWithContext SomeException)
-  }
-```
-
-`finalizationEvidence` reads what finalization observed beside a body failure
-it kept primary: at most the first cancellation delivered while the lifetime
-waited for its worker, and at most one failure raised while its worker group
-closed, each exactly as it was caught, so the group's own annotations stay
-reachable. It answers `Nothing` when finalization observed neither, and for an
-exception that is itself the finalization cancellation or group-closing
-failure, which the verdict already accompanies.
-
-Stopping graphics admission when the error latch is set is the owner's, at its
-checkpoints: this package exposes the latch and does nothing about it. VK-15's
-controller (#231) installs the latch as the roots' diagnostic watch, so the
-owner's next checkpoint makes an error-severity report the session's primary
-failure ([gpu_backend.md](gpu_backend.md#terminal-failure)).
-
-`captureSinkFailure` answers the same way for the consumer: the failure that
-stopped delivery (`sinkFailureReason`), from the moment the worker met it
-rather than only once the verdict is reached. It is set once and never
-cleared, it never touches the error latch, and the verdict still carries the
-failure itself as `ConsumerSinkFailed`.
-
-`captureAlarms` answers both at once, in the order they happened:
-`CaptureErrorLatched` and `CaptureSinkFailed` with its reason. The storage
-keeps one first-failure cell per lifetime. The C callback claims it for an
-error with a compare-and-swap before it sets the error latch, and the worker
-claims it for its sink before it publishes the failure. Whichever comes first
-owns the cell, and a later one changes nothing, so an owner that learns of
-both at one checkpoint reads which came first from the cell rather than from
-the moment it looked. A failure that has claimed the cell but not yet set its
-own alarm leaves, for that moment, only a later alarm readable; then
-`captureAlarms` answers `CaptureAlarmPending` alone — something failed, which
-came first is not yet readable, and admission should stay closed — and the next
-reading answers them in order, so it never answers a later failure first.
-
-The capture's owner claims the same cell for a failure of its own
-(`claimCaptureOrder`) before it records it. The answer is who holds first
-place: `OwnerFailedFirst`, when no diagnostic failure came before it — and any
-that comes afterwards is later — or `ErrorLatchedFirst` or `SinkFailedFirst`,
-when one did. It is the one compare-and-swap, so claiming again changes
-nothing, and a capture whose slot serves another lifetime answers
-`OwnerFailedFirst`. Once the owner holds first place, `captureAlarms` answers
-`CaptureOwnerClaimed` ahead of the alarms that came after it, which it answers
-in no particular order between themselves: recording the owner's failure is
-the owner's, and until it has, nothing should be taken ahead of it. The controller installs both as the roots' diagnostic
-watch, so a failed sink is a terminal status of its own at the owner's next
-checkpoint — never a replacement for an earlier failure, and never permission
-to release anything.
+**Which failure came first.** The storage keeps one first-failure cell per
+lifetime, claimed by compare-and-swap: by the C callback for an error before
+it sets the latch, by the worker for a sink failure, or by the owner for a
+failure of its own (`claimCaptureOrder`, answering `OwnerFailedFirst`,
+`ErrorLatchedFirst` or `SinkFailedFirst`). `captureAlarms` answers the alarms
+in the order they happened, or `CaptureAlarmPending` while the first claimant
+has not yet set its own alarm, so it never answers a later failure first.
+`captureSinkFailure` reads the sink failure from the moment the worker met it.
 
 ## Messengers on real objects
 
-`Hetoimasia.GPU.Vulkan.Native.Diagnostics` builds both messengers an instance
-can have from one capture:
-
 - `captureMessengerCreateInfo` goes in the `VkInstanceCreateInfo` chain. It is
-  the only messenger that hears `vkCreateInstance` and `vkDestroyInstance`, and
-  the extension uses it for nothing else.
-- `createCaptureMessenger`, or `withCaptureMessenger` in scope form, is the
-  explicit messenger. It must be created before the instance's first child and
-  destroyed after its last, immediately before the instance, so a device's own
-  destruction reports somewhere.
-- `destroyInstanceQuiesced` destroys the instance through `afterLastCallback`,
-  on the path that returns and on the one that unwinds, and yields the
-  `Quiesced` evidence the lifetime needs.
+  the only messenger that hears `vkCreateInstance` and `vkDestroyInstance`.
+- `createCaptureMessenger` (or `withCaptureMessenger`) is the explicit
+  messenger. It must be created before the instance's first child and
+  destroyed after its last, immediately before the instance.
+- `destroyInstanceQuiesced` destroys the instance through
+  `afterLastCallback`.
 
-Both register `captureMessengerCallback`, whose code is linked into the
-executable and so lives as long as the process, with the capture's storage as
-user data, which the lifetime keeps until the body has returned. The package
-installs no Haskell callback, no allocation callback and no trampoline.
-
-`nativeFfiConfiguration` records how the package calls Vulkan and what can call
-back: the binding at `vulkan-3.27` with `safe-foreign-calls` on and
-`darwin-lib-dirs` off, as `cabal.project.vulkan` constrains it and
-`tools/toolchain/binding.pin` records; the C-only capture callback; no Haskell
-callbacks; and, since VK-11, the audited recording subset — the package's only
-genuine `unsafe` imports, which [the FFI audit](gpu_backend.md#the-ffi-audit)
-lists entry point by entry point, and from which only this C-only callback is
-reachable. The proof record prints it beside the build's source digest, and the
-proof checks the binding flags against the pin.
+The package installs no Haskell callback, allocation callback or trampoline.
+The backend never names its debug messenger: doing so crashes the pinned macOS
+loader and MoltenVK. `nativeFfiConfiguration` records how the package calls
+Vulkan (the pinned binding with `safe-foreign-calls` on, the C-only capture
+callback, and the audited `unsafe` recording subset listed in
+[the FFI audit](gpu_backend.md#the-ffi-audit)).
 
 ## State
 
-| State | Owner | Writers | Readers | Thread | Lifetime and reset |
-| --- | --- | --- | --- | --- | --- |
-| C storage: queue, objects, labels, text | the lifetime | producers on any thread; the worker, consuming | the worker; the lifetime after it | any | allocated at entry, freed in step 4 unless retained |
-| C slot: announcements, close flag, generation, latches, first-failure cell, counters | the lifetime, then its slot's next claimant | producers on any thread; the worker, once, for its sink; the lifetime, closing | the lifetime; `captureStatus` | any | static; claimed at entry, reset only when claimed again |
-| Status snapshot | the lifetime | step 4, once, before the free | `captureStatus` once the slot serves another lifetime | the lifetime's | per lifetime |
-| Phase | the lifetime | the lifetime's thread | any thread | any | per lifetime; only advances |
-| Taken and delivered counts | the worker | the worker | any thread; the lifetime once the worker is terminal | the worker's | per lifetime; only grow |
-| Wake and final requests | the lifetime | `requestDrain`; the lifetime, once, for final | the worker | any | per lifetime |
-| Sink failure | the worker | the worker, once, when its sink first fails | any thread, through `captureSinkFailure` and `captureAlarms` | the worker's | per lifetime; never cleared |
+| State | Owner | Writers and readers | Lifetime |
+| --- | --- | --- | --- |
+| C storage: queue, objects, labels, text | the lifetime | producers on any thread; the worker consumes | allocated at entry, freed at release unless retained |
+| C slot: announcements, close flag, generation, latches, first-failure cell, counters | the lifetime, then the slot's next claimant | producers, the worker (once, for its sink), the lifetime; `captureStatus` reads | static; reset only when claimed again |
+| Phase, wake and final requests | the lifetime | the lifetime writes; any thread reads | per lifetime; the phase only advances |
+| Taken and delivered counts, sink failure | the worker | the worker writes; any thread reads | per lifetime; never cleared |
 
 ## Testing
 
-`diagnostics-tests`, the `Vulkan diagnostics` group, is registered as the
-non-optional CPU group `test.vulkan-diagnostics`, which runs through
-`cabal.project.cpu`, is selected when affected or requested, and is not in the
-floor:
-
-```
+```bash
 cabal test --project-file cabal.project.cpu hetoimasia-gpu-vulkan-diagnostics:diagnostics-tests --test-show-details=direct
 ```
 
-Its examples offer records through `hetoimasia_capture_offer`, a package-local
-producer entry that builds the callback data on a C frame and calls the
-production producer with it — the storage they exercise is the production C, not
-a Haskell stand-in. `Capture` drives the storage directly: bounded copying at
-each limit and one byte past it, the shared budget, both label arrays apart and
-in order with what each reported, each at its limit and one past it, a label
-count with no array, the budget's copy order through the labels, one truncation
-for a record cut twice, and label space reused cleanly, saturation and the drop
-counter with the error latch surviving it, error latching ahead of admission,
-truncation counting, contained producer failures, counters saturating at their
-ceilings, eight threads racing for positions while a consumer drains, closing
-waiting for a producer that has announced itself, a report that begins only
-after closing and freeing, slot reclamation beyond the table's size, and a
-stale user data naming nothing.
-`Lifetime` drives the whole lifetime with injected sinks: delivery and its
-fields, a record's labels in its own scoped context and no other's, the worker's own group, the verdict's issues, sink failure beside a
-preserved primary failure and observable while the lifetime still captures,
-with whether an error had latched before it, a record produced while draining, the final drain,
-a blocked sink holding the storage, cancellation during finalization — with the
-record in the worker's hands counted — and of the body, a failed body kept
-primary over a cancellation during finalization with that cancellation beside
-it, a body's own cancellation kept primary over a different one during
-finalization, status reads racing the
-release, a producer that announced itself before the body returned counted in
-the verdict, a report not yet begun counted outside it, quiescence evidence
-missing, established while a failure unwinds, issued by another capture, and
-not established by a destruction that threw, the verdict's delivered
-count matching what the sink received across 300 cancellations, and
-retention. Waits are explicit: a gated sink says when it is entered,
-the delivered count says what the worker has done, and the poll is replaced by
-one no example reaches.
-`Outcome` drives the lifetime's private precedence selection directly, because
-a failure while the worker group closes arrives after the worker is terminal,
-where no public coordination point exists: a failed body kept primary over a
-group-closing failure whose own context stays reachable, and every combination
-of body outcome, finalization cancellation and group-closing failure.
-
-The native cases are the Vulkan native suite's `vk6-capture` case, on an
-instance of its own in a child process; see
-[the Vulkan native suite](gpu_backend.md#the-native-suite). Their earlier records
-are retained as `docs/vulkan/linux-vk6.md` and `docs/vulkan/macos-vk6.md`. Every
-validation-enabled instance there, and the shared roots', also enables
-synchronization validation through its create info, and the suite's
-`synchronization-hazard` case proves the capture receives its reports. Both
-cases own their instance and explicit messenger through one failure-preserving
-scope (`Test.GPU.Vulkan.Native.InstanceScope`), keeping the failure table in
-[resources.md](resources.md#the-failure-table). When the body fails, its
-exception leaves the lifetime with its own type, value and context, and so
-supplies the stopped session's reason and verdict. That holds even when
-`vkDestroyInstance` then raises; the destruction's failure is kept beside it
-under the instance's label. A destruction that raised issues no `Quiesced`
-evidence. The suite's session-free examples, selected by `--match "instance
-scope"`, inject both failures into each case's own scope and the production
-lifetime. The
-`debug-names` case provokes one validation error on a named managed resource
-inside a labelled batch and requires the delivered record to carry that
-resource's name and, where the pinned layer reports them, the batch's label.
+This is the CPU group `test.vulkan-diagnostics`. The messengers on real
+objects are exercised by the Vulkan native suites
+([gpu_backend.md](gpu_backend.md#the-native-suite)).
