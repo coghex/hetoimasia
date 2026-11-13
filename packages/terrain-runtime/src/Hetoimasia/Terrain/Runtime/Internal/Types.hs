@@ -489,6 +489,12 @@ data Point
   | -- | An open's compilation was charged its peak to the compile account and is about to run its
     -- first quantum (the session's one compilation).
     PointCompiling !RequestId
+  | -- | A request's preparation is about to start (its gather, its staging, an open's task).
+    PointPreparing !RequestId
+  | -- | A request's pinned read has returned and is about to be given to it.
+    PointGathered !RequestId
+  | -- | A growth's or a pending extra's release's run in the slot has ended (the slot is free).
+    PointGrowthEnded !ArenaId
   deriving stock (Eq, Show)
 
 -- | An unexpected defect, kept with bounded context.
@@ -571,12 +577,12 @@ data CreatorBasis = CreatorBasis !Word64 !GrowthView
 creatorBasisOf ∷ Arena → CreatorBasis
 creatorBasisOf arena = CreatorBasis (StoreState.cfgAllowanceBytes (storeConfig (arenaStore arena))) (growthView (arenaStore arena))
 
--- | Whether staged work still stands on what its arena's store holds now (always, for work that
--- is not a creator command's).
 -- | A creator command: a growth or an explicit retry of the creator's arena.
 isCreatorCommand ∷ Req → Bool
 isCreatorCommand req = case reqCmd req of CGrow {} → True; CRetry → True; _ → False
 
+-- | Whether staged work still stands on what its arena's store holds now (always, for work that
+-- is not a creator command's).
 creatorFresh ∷ Arena → Staged → Bool
 creatorFresh arena sg = maybe True (== creatorBasisOf arena) (stagedBasis sg)
 
@@ -914,7 +920,7 @@ data ReadRun
   = RunsRead !Gather
   | KnowledgeRead !(Query.Query D.CellKnowledge)
   | -- | An explicit retry's re-read of the pages a pause recorded, with the conditions it would clear.
-    ProbeRead !Probe.PageProbe ![Condition]
+    ProbeRead !Probe.PageProbe ![Condition] !CreatorBasis
 
 -- | What the session's one mutating transaction is for.
 data SlotWork

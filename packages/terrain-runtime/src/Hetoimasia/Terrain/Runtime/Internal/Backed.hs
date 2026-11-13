@@ -425,7 +425,7 @@ data Gathered
   | -- | What is known of the cell, read from one committed version, with its content and knowledge revisions.
     GatheredKnowledge !D.CellKnowledge !Revision !Revision
   | -- | A retry's probe: the conditions it was for, and whether every recorded page read back as it must.
-    GatheredProbe ![Condition] !Bool
+    GatheredProbe ![Condition] !Bool !CreatorBasis
   | GatheredFailed !Handling
   | -- | Cancelled and drained: nothing to deliver.
     GatheredNothing
@@ -444,7 +444,8 @@ canStartGather cap st adm aid =
 data ReadWhat
   = ReadRuns ![Column]
   | ReadKnowledge !TileCoord
-  | ReadPages ![(PageNo, ReadMode)] ![Condition]
+  | -- | a retry's probe, with the allowance and growth state its preparation read
+    ReadPages ![(PageNo, ReadMode)] ![Condition] !CreatorBasis
 
 startGatherFor ∷ Service → GatherFor → ArenaId → ReadWhat → STM Bool
 startGatherFor svc key aid what = do
@@ -465,7 +466,7 @@ startGatherFor svc key aid what = do
     begin arena = case what of
       ReadRuns columns → fmap RunsRead <$> startGather (arenaStore arena) columns
       ReadKnowledge tile → fmap KnowledgeRead <$> startQuery (arenaStore arena) (\provider → D.queryCell (arenaEnv arena) provider tile)
-      ReadPages pages conds → Right (arenaStore arena, ProbeRead (startProbe pages) conds)
+      ReadPages pages conds basis → Right (arenaStore arena, ProbeRead (startProbe pages) conds basis)
 
 -- | One step of a pinned read. When it ends, its pin and credit are released in the transaction
 -- that removes it, and then its owner is given the result.
@@ -490,16 +491,16 @@ stepGatherTask svc key deliver = do
                 GFailed handling → Right (GatheredFailed handling)
                 GDrained → Right GatheredNothing
             )
-        ProbeRead pr conds → do
+        ProbeRead pr conds basis → do
           (pr', p) ← if wanted then stepProbe io closing (storeConfig store) pr else cancelProbe io pr
           pure
-            ( ProbeRead pr' conds
+            ( ProbeRead pr' conds basis
             , case p of
                 PMore → Left WakeNow
                 PBlocked wait → Left (WakeOn wait)
-                PPassed → Right (GatheredProbe conds True)
+                PPassed → Right (GatheredProbe conds True basis)
                 -- the cause persists: the retry answers it as remaining (it is not a new pause)
-                PFailedWith _ → Right (GatheredProbe conds False)
+                PFailedWith _ → Right (GatheredProbe conds False basis)
                 PDrained → Right GatheredNothing
             )
         KnowledgeRead q → do
@@ -528,7 +529,7 @@ stepGatherTask svc key deliver = do
     release' current = \case
       RunsRead g → endGather current g
       KnowledgeRead q → endQuery current q
-      ProbeRead _ _ → current
+      ProbeRead {} → current
     ownerAlive st = case key of
       GatherRequest rid → Map.member rid (stateRequests st)
       GatherJob jid → any (\j → R.jobId j == jid && R.jobPhase j == R.JobRunningPhase) (R.modelJobs (stateModel st))

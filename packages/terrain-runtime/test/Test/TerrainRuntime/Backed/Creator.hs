@@ -14,6 +14,7 @@ import Control.Concurrent.STM
 import Control.Exception (finally)
 import Control.Monad (forM_, when)
 import Data.Word (Word64)
+import Hetoimasia.Terrain.Residency (ArenaId (..), RequestId)
 import Hetoimasia.Terrain.Runtime
 import Hetoimasia.Terrain.Runtime.Settlement
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Native (NativeOp (..))
@@ -42,7 +43,9 @@ data Command = GrowEqual | GrowLarger | GrowSmaller | Retry
 mib ∷ Word64
 mib = 1024 * 1024
 
-isReserve, isSetLength ∷ NativeOp → Bool
+isReserve, isSetLength, isRead, isWrite ∷ NativeOp → Bool
+isRead = \case OpReadAt {} → True; _ → False
+isWrite = \case OpWriteAt {} → True; _ → False
 isReserve = \case OpReserveRange {} → True; _ → False
 isSetLength = \case OpSetFileLength {} → True; _ → False
 
@@ -56,10 +59,142 @@ basis = \case
   PendingExtra → (128 * mib, True)
 
 spec ∷ Spec
-spec = describe "The creator's commands against an arena's growth in flight" $
-  forM_ [minBound .. maxBound] $ \inFlight →
-    forM_ [minBound .. maxBound] $ \command →
-      it (show command <> " while " <> show inFlight) (creatorCase inFlight command)
+spec = do
+  describe "The creator's commands against an arena's growth in flight" $
+    forM_ [minBound .. maxBound] $ \inFlight →
+      forM_ [minBound .. maxBound] $ \command →
+        it (show command <> " while " <> show inFlight) (creatorCase inFlight command)
+  describe "A retry of an arena paused with a recorded page, its probe held at the seam" $ do
+    forM_ [minBound .. maxBound] $ \returns →
+      it ("is answered after the growth, its extra released and the condition cleared once, when the probe returns " <> show returns) (pausedRetry returns)
+    it "prepares the retry once and keeps serving later requests while its probe is held" probeHeld
+
+-- | What a first growth F of the arena is doing when the retry's probe returns.
+data ProbeReturns
+  = -- | F holds the slot, its reservation held at the seam
+    WhileFReserves
+  | -- | F holds the slot and is giving its extra back (its host withdrew); the release is held and
+    -- then fails
+    WhileFAbandons
+  | -- | F's run has ended with its extra pending
+    AfterFLeftItsExtraPending
+  deriving stock (Eq, Show, Enum, Bounded)
+
+-- | An arena grown to 128 MiB and then paused for I/O by one failed page write (the page recorded),
+-- beside a second arena; the service at rest. The owner's probe points are logged, newest first.
+withPausedArena ∷ (H.Probe → Service → TVar [Point] → ArenaLease → ArenaLease → IO ()) → IO ()
+withPausedArena body = do
+  probe ← H.newProbe
+  points ← newTVarIO []
+  let owner = Probe (\point → atomically (modifyTVar' points (point :)))
+  withServiceSeam quiet defaultConfig alwaysAdmitting owner (H.seamFor probe) $ \svc → do
+    (_, lease) ← openMain svc "main"
+    (_, otherLease) ← openMain svc "other"
+    grown ← growArena svc lease (toInteger (128 * mib)) >>= expectRight >>= await svc
+    fmap grownAllowance grown `shouldBe` Right (128 * mib)
+    H.addRule probe 1 isWrite (H.FailWith (Errno 5))
+    failed ← removeAt svc lease (tile 3 4 5) Nothing >>= expectRight >>= await svc
+    failed `shouldSatisfy` \case Left (Failed (StorageFailed (FaultIo _))) → True; _ → False
+    waitFor (backedAtRestSTM svc >>= check)
+    pausedOn svc lease `shouldReturn` [CondIo]
+    body probe svc points lease otherLease
+
+pausedOn ∷ Service → ArenaLease → IO [Condition]
+pausedOn svc lease = do
+  status ← arenaStatus svc lease >>= expectRight
+  pure $ case statusStorage status of
+    StoragePaused conditions → conditions
+    StorageReady → []
+
+-- | Submit a retry and return its request id (the next request the owner starts preparing: the
+-- service is at rest when it is called).
+submitRetry ∷ Service → TVar [Point] → ArenaLease → Host → IO RequestId
+submitRetry svc points lease host = do
+  atomically (writeTVar points [])
+  _ ← okOf (retryWith svc (hostEndpoint svc Nothing host) lease)
+  waitFor $ readTVar points >>= \ps → case [rid | PointPreparing rid ← reverse ps] of
+    rid : _ → pure rid
+    [] → retry
+
+seen ∷ TVar [Point] → Point → IO ()
+seen points point = waitFor (readTVar points >>= check . elem point)
+
+-- | The owner has finished the step it was in: a read of another arena admitted now is answered
+-- only after it.
+ownerMovedOn ∷ Service → ArenaLease → IO ()
+ownerMovedOn svc otherLease = () <$ readCell svc otherLease (tile 0 0 0)
+
+pausedRetry ∷ ProbeReturns → IO ()
+pausedRetry returns = withPausedArena $ \probe svc points lease otherLease → do
+  readGate ← H.addGateOnce probe isRead
+  reserveGate ← H.addGateOnce probe isReserve
+  releaseGate ← H.addGateAfter probe 1 isSetLength
+  -- F's own length is set first, then its release's: the release fails
+  H.addRuleAfter probe 1 1 isSetLength (H.FailWith (Errno 5))
+  rHost ← newHost True
+  fHost ← newHost True
+  let settled host = waitFor (readTVar (hostSettled host) >>= \s → if null s then retry else pure s)
+  f ← flip finally (mapM_ H.openGate [readGate, reserveGate, releaseGate]) $ do
+    when (returns /= WhileFAbandons) (H.openGate releaseGate)
+    rid ← submitRetry svc points lease rHost
+    H.awaitReached readGate 1
+    f ← okOf (growWith svc (hostEndpoint svc Nothing fHost) lease (toInteger (192 * mib)))
+    H.awaitReached reserveGate 1
+    when (returns /= WhileFReserves) $ do
+      atomically (writeTVar (hostEligible fHost) False)
+      H.openGate reserveGate
+    case returns of
+      WhileFReserves → pure ()
+      WhileFAbandons → H.awaitReached releaseGate 1
+      AfterFLeftItsExtraPending → seen points (PointGrowthEnded (ArenaId 0))
+    H.openGate readGate
+    seen points (PointGathered rid)
+    ownerMovedOn svc otherLease
+    -- the probe's result stood on a state the growth has moved: nothing was cleared or answered on it
+    when (returns /= AfterFLeftItsExtraPending) $ do
+      pausedOn svc lease `shouldReturn` [CondIo]
+      settledOf rHost `shouldReturn` []
+    pure f
+  outcome ← settled rHost
+  case outcome of
+    [Succeeded (ARetried a)] → (retriedCleared a, retriedRemaining a) `shouldBe` ([CondIo], [])
+    other → expectationFailure ("the retry settled " <> show other)
+  status ← waitFor (arenaStatusSTM svc lease >>= either (const retry) pure)
+  statusStorage status `shouldBe` StorageReady
+  statusPendingReservedBytes status `shouldBe` 0
+  case returns of
+    WhileFReserves → do
+      settled fHost >>= (`shouldSatisfy` \case [Succeeded (AGrown a)] → grownAllowance a == 192 * mib; _ → False)
+      statusReservedBytes status `shouldBe` 192 * mib
+    _ → do
+      statusReservedBytes status `shouldBe` 128 * mib
+      cancel svc f `shouldReturn` CancelWon
+  waitFor (backedAtRestSTM svc >>= check)
+  settleChecks svc
+
+probeHeld ∷ IO ()
+probeHeld = withPausedArena $ \probe svc points lease otherLease → do
+  readGate ← H.addGateOnce probe isRead
+  rHost ← newHost True
+  flip finally (H.openGate readGate) $ do
+    rid ← submitRetry svc points lease rHost
+    H.awaitReached readGate 1
+    -- a request admitted after the retry is prepared and answered while its probe is held (a later
+    -- request of the retry's own arena waits for it: an eligible command not yet staged holds up the
+    -- later ones of its arena), and the owner does not keep preparing the retry meanwhile
+    oHost ← newHost True
+    _ ← okOf (cellWith svc (hostEndpoint svc Nothing oHost) otherLease (tile 0 0 0))
+    let preparations = length . filter (== PointPreparing rid) <$> readTVar points
+        answered = readTVar (hostSettled oHost) >>= check . not . null
+        spinning = preparations >>= \n → check (n >= 1000) >> pure n
+    waitFor ((Nothing <$ answered) `orElse` (Just <$> spinning)) `shouldReturn` Nothing
+    -- and the retry was prepared once: its probe in flight is started work, not work to start
+    length . filter (== PointPreparing rid) <$> readTVarIO points `shouldReturn` 1
+  settled ← waitFor (readTVar (hostSettled rHost) >>= \s → if null s then retry else pure s)
+  case settled of
+    [Succeeded (ARetried a)] → retriedCleared a `shouldBe` [CondIo]
+    other → expectationFailure ("the retry settled " <> show other)
+  settleChecks svc
 
 creatorCase ∷ InFlight → Command → IO ()
 creatorCase inFlight command = do

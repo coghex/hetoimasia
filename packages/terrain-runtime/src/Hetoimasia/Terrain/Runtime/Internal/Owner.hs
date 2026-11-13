@@ -66,6 +66,7 @@ import Hetoimasia.Terrain.Runtime.Backed.Fault (StorageFault (..))
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Service (ReadMode (..))
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Service (PreparedGrowth)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Model (Condition (..), GrowthDecision (..), GrowthView (..), TxnId, clearCondition, conditions, growthView, oldestPin, proposeGrowth, storeConfig, storeHeader, storeRoots, storeVersion)
+import Hetoimasia.Terrain.Runtime.Store.Internal.Format (PageNo)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan (TxClass (..), availablePages)
 import Hetoimasia.Terrain.Runtime.Store.Internal.State (cfgAllowanceBytes, maxClaimPages)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan (Effects (..), Plan, plEffects)
@@ -285,7 +286,7 @@ backedWork st = (now, waits)
     readDraining = \case
       RunsRead g → gatherDraining g
       KnowledgeRead q → queryDraining q
-      ProbeRead pr _ → probeDraining pr
+      ProbeRead pr _ _ → probeDraining pr
     ownerAlive = \case
       GatherRequest rid → alive rid
       GatherJob jid → any (\j → R.jobId j == jid && R.jobPhase j == R.JobRunningPhase) (R.modelJobs (stateModel st))
@@ -390,19 +391,19 @@ pickRequestWork svc st adm holdReads = do
     -- a creator command (growth, retry) of an arena is not prepared while the slot runs a growth or a
     -- pending extra's release of that arena: what it reads (the allowance, the growth state) is still
     -- moving, and its answer must not depend on how far that run has got
-    behindGrowth req = isCreatorCommand req && case stateSlot st of
-      Just task → reqArena req == Just (slotArena task) && case slotWork task of
-        SlotGrowth _ → True
-        SlotRelease _ → True
-        _ → False
-      Nothing → False
+    behindGrowth req = isCreatorCommand req && maybe False (growthInSlot st) (reqArena req)
     -- an open has one preparation task; a read or a removal one gather at a time, started only
     -- when its arena has a pin to spare and the edit bank its credit
     notStarted rid req = case reqCmd req of
       COpen {} → not (Map.member rid (stateOpens st))
       CAttach {} → True
       CGrow {} → True
-      CRetry → True
+      -- a retry with its probe in flight is started work; one that must probe starts it as any read does
+      CRetry → not (Map.member (GatherRequest rid) (stateGathers st)) && case reqArena req >>= \aid → (,) aid <$> Map.lookup aid (stateArenas st) of
+        Just (aid, arena)
+          | not (gvReleasing (growthView (arenaStore arena))), (_ : _, _) ← retryProbe arena →
+              not holdReads && canStartGather (gathersPerArena (serviceConfig svc)) st adm aid
+        _ → True
       _ → not holdReads && not (Map.member (GatherRequest rid) (stateGathers st)) && maybe False (canStartGather (gathersPerArena (serviceConfig svc)) st adm) (reqArena req)
     satisfied rid req = case reqCmd req of
       COpen {} → True
@@ -646,7 +647,7 @@ finishJob svc jid result = do
 
 -- | What a finished gather gives its owner: a request's staging, or a load job's work.
 delivered ∷ Service → GatherFor → Gathered → IO ()
-delivered svc key gathered = case (key, gathered) of
+delivered svc key gathered = (case key of GatherRequest rid → probe svc (PointGathered rid); GatherJob _ → pure ()) >> case (key, gathered) of
   (_, GatheredNothing) → case key of
     GatherJob jid → atomically $ do
       -- a cancelled job's gather has drained: only now is its cancellation acknowledged
@@ -662,10 +663,10 @@ delivered svc key gathered = case (key, gathered) of
   (GatherRequest rid, GatheredKnowledge known content knowledge) → do
     st <- atomically (readSt svc)
     forM_ (Map.lookup rid (stateRequests st) >>= reqArena) $ \aid →
-      stageWith svc rid (Just aid) content knowledge (StagedAnswer (AKnowledge (KnowledgeAnswer aid content knowledge known)))
+      stageWith svc rid (Just aid) content knowledge Nothing (StagedAnswer (AKnowledge (KnowledgeAnswer aid content knowledge known)))
   (GatherJob jid, GatheredKnowledge {}) → failWith svc (OwnerDefect (Text.pack ("a load job's read answered knowledge: " <> show jid))) []
   (GatherJob jid, GatheredProbe {}) → failWith svc (OwnerDefect (Text.pack ("a load job's read answered a probe: " <> show jid))) []
-  (GatherRequest rid, GatheredProbe probed passed) → finishRetry svc rid (if passed then probed else [])
+  (GatherRequest rid, GatheredProbe probed passed basis) → finishRetry svc rid (if passed then probed else []) basis
   (GatherJob jid, GatheredRuns runs revision) → do
     st <- atomically (readSt svc)
     case Map.lookup jid (stateLoadJobs st) of
@@ -762,6 +763,7 @@ handleRequest svc rid = \case
 -- gather of the runs a read or a removal reads.
 prepareReq ∷ Service → RequestId → IO ()
 prepareReq svc rid = do
+  probe svc (PointPreparing rid)
   st <- atomically (readSt svc)
   forM_ (Map.lookup rid (stateRequests st)) $ \req → case reqCmd req of
     COpen _ source _ → atomically (beginOpen svc rid source)
@@ -770,25 +772,20 @@ prepareReq svc rid = do
       -- the store's pure proposal against the allowance as it is now: equal is an idempotent success,
       -- smaller is storage_size_not_increased, larger takes the slot when the host is eligible
       case proposeGrowth (arenaStore arena) (toInteger bytes) of
-        GrowthNoOp → stage svc rid (Just aid) (arenaRevision arena) (StagedAnswer (AGrown (GrowAnswer aid bytes False)))
+        GrowthNoOp → stageCreator svc rid aid arena (StagedAnswer (AGrown (GrowAnswer aid bytes False)))
         GrowthNotIncreased → atomically (terminate svc rid (Failed (StorageFailed (FaultSizeNotIncreased (cfgAllowanceBytes (storeConfig (arenaStore arena))) bytes))))
         GrowthInvalid why → atomically (terminate svc rid (Failed (HostFailure (Text.pack ("an admitted growth became invalid: " <> show why)))))
-        GrowthProposed proposal → stage svc rid (Just aid) (arenaRevision arena) (StagedGrowth proposal)
+        GrowthProposed proposal → stageCreator svc rid aid arena (StagedGrowth proposal)
     CRetry → forM_ (reqArena req >>= \aid → (,) aid <$> Map.lookup aid (stateArenas st)) $ \(aid, arena) →
      -- an extra an earlier growth left pending is released first, under the slot; the retry then goes on
      if gvReleasing (growthView (arenaStore arena))
-      then stage svc rid (Just aid) (arenaRevision arena) StagedRelease
-      else do
-      -- bounded revalidation of what paused the arena: the pages an I/O or integrity pause recorded
-      -- are read again (an integrity page must read back valid); a pause that recorded none cannot be
-      -- certified and stays. Capacity is checked when the retry finishes.
-      let store = arenaStore arena
-          probed = [(c, record) | c ← [CondIo, CondIntegrity], c `elem` conditions store, Just record ← [Map.lookup c (arenaFaults arena)], not (null (faultPages' record))]
-          pages = [(page, if c == CondIntegrity then ReadValidated else ReadProbe) | (c, record) ← probed, page ← faultPages' record]
-          faultPages' = faultRecorded
-      if null pages
-        then finishRetry svc rid []
-        else void (atomically (startGatherFor svc (GatherRequest rid) aid (ReadPages pages (map fst probed))))
+      then stageCreator svc rid aid arena StagedRelease
+      else
+      -- bounded revalidation of what paused the arena (the recorded pages read again); capacity is
+      -- checked when the retry finishes. The answer stands on the basis read here.
+      case retryProbe arena of
+        ([], _) → finishRetry svc rid [] (creatorBasisOf arena)
+        (pages, probed) → void (atomically (startGatherFor svc (GatherRequest rid) aid (ReadPages pages probed (creatorBasisOf arena))))
     CKnowledge tile → forM_ (reqArena req) $ \aid → void (atomically (startGatherFor svc (GatherRequest rid) aid (ReadKnowledge tile)))
     cmd → forM_ (reqArena req) $ \aid → void (atomically (startGatherFor svc (GatherRequest rid) aid (ReadRuns (commandColumns cmd))))
 
@@ -800,11 +797,18 @@ stage ∷ Service → RequestId → Maybe ArenaId → Revision → StagedWork �
 stage svc rid aid rev work = do
   st <- atomically (readSt svc)
   let knowledge = maybe (Revision 0) (D.authKnowledge . arenaAuthority) (aid >>= \a → Map.lookup a (stateArenas st))
-  stageWith svc rid aid rev knowledge work
+  stageWith svc rid aid rev knowledge Nothing work
 
--- | 'stage' with the knowledge revision the work was read at.
-stageWith ∷ Service → RequestId → Maybe ArenaId → Revision → Revision → StagedWork → IO ()
-stageWith svc rid aid rev knowledge work =
+-- | Stage a creator command's work (a growth, a retry) with the arena's allowance and growth state
+-- as its preparation read them, from the arena as it was then: published only if they still hold,
+-- and stale (prepared again) once either moves.
+stageCreator ∷ Service → RequestId → ArenaId → Arena → StagedWork → IO ()
+stageCreator svc rid aid arena = stageWith svc rid (Just aid) (arenaRevision arena) (D.authKnowledge (arenaAuthority arena)) (Just (creatorBasisOf arena))
+
+-- | 'stage' with the knowledge revision the work was read at and, for a creator command, the basis
+-- its preparation read.
+stageWith ∷ Service → RequestId → Maybe ArenaId → Revision → Revision → Maybe CreatorBasis → StagedWork → IO ()
+stageWith svc rid aid rev knowledge basis work =
   tryNonAsync (atomically publish') >>= \case
     Right () → pure ()
     Left failure → do
@@ -816,11 +820,8 @@ stageWith svc rid aid rev knowledge work =
           let arena = aid >>= \a → Map.lookup a (stateArenas st)
               fresh = case aid of
                 Nothing → True
-                Just _ → maybe False (\x → arenaRevision x == rev && D.authKnowledge (arenaAuthority x) == knowledge) arena
+                Just _ → maybe False (\x → arenaRevision x == rev && D.authKnowledge (arenaAuthority x) == knowledge && maybe True (== creatorBasisOf x) basis) arena
               pending = case reqPhase req of Done → False; _ → True
-              -- a creator command records the allowance and growth state it was prepared against
-              -- (read now: nothing on the owner thread ran since its preparation read them)
-              basis = if isCreatorCommand req then creatorBasisOf <$> arena else Nothing
           when (fresh && pending) $ do
             modifySt svc (\s → s {stateRequests = Map.insert rid req {reqPhase = StagedPhase (Staged aid rev knowledge basis work)} (stateRequests s)})
             -- A failing readiness callback abandons this transaction: the work stays
@@ -1150,7 +1151,7 @@ publishGrowth svc task prepared = do
 -- | A growth ended without being committed (its slot is already released): its request settles
 -- with the failure, or contends again when the owner gave it up for its host's eligibility.
 growthOver ∷ Service → SlotTask → Growth.GrowthEnd → IO ()
-growthOver svc task over = case slotWork task of
+growthOver svc task over = probe svc (PointGrowthEnded (slotArena task)) >> case slotWork task of
   SlotGrowth rid → case over of
     Growth.GrowthFailedWith handling → case handling of
       HandleDomain fault → atomically (terminate svc rid (Failed (StorageFailed fault)))
@@ -1177,12 +1178,18 @@ growthOver svc task over = case slotWork task of
 -- | Finish an explicit retry: clear the conditions its probe certified gone and, when the supported
 -- next transaction fits beside the protected reserve, the capacity pause; then answer what was cleared
 -- and what remains. One transaction (the owner is the store's only writer). Never re-runs a failed edit.
-finishRetry ∷ Service → RequestId → [Condition] → IO ()
-finishRetry svc rid certified = do
+--
+-- The answer stands on the allowance and growth state the retry's preparation read. A result that
+-- arrives while the slot runs a growth or release of the arena, or after either moved, is dropped:
+-- nothing is cleared, the request is still waiting, and it is prepared again (after that run).
+finishRetry ∷ Service → RequestId → [Condition] → CreatorBasis → IO ()
+finishRetry svc rid certified basis = do
   answer <- atomically $ do
     s <- readSt svc
     case Map.lookup rid (stateRequests s) >>= reqArena >>= \aid → (,) aid <$> Map.lookup aid (stateArenas s) of
       Nothing → pure Nothing
+      Just (aid, arena)
+        | growthInSlot s aid || creatorBasisOf arena /= basis → pure Nothing
       Just (aid, arena) → do
         let store = arenaStore arena
             fits = availablePages (storeConfig store) Ordinary (storeRoots store) >= fromIntegral maxClaimPages
@@ -1192,5 +1199,24 @@ finishRetry svc rid certified = do
         modifySt svc $ \x →
           x {stateArenas = Map.insert aid arena {arenaStore = store', arenaFaults = foldr Map.delete (arenaFaults arena) cleared} (stateArenas x)}
         when (not (null cleared)) (markFreed svc)
-        pure (Just (aid, arenaRevision arena, RetryAnswer aid cleared (conditions store')))
-  forM_ answer $ \(aid, revision, retried) → stage svc rid (Just aid) revision (StagedAnswer (ARetried retried))
+        pure (Just (aid, arena {arenaStore = store'}, RetryAnswer aid cleared (conditions store')))
+  forM_ answer $ \(aid, arena, retried) → stageCreator svc rid aid arena (StagedAnswer (ARetried retried))
+
+-- | Whether the slot runs a growth or a pending extra's release of the arena.
+growthInSlot ∷ St → ArenaId → Bool
+growthInSlot st aid = case stateSlot st of
+  Just task → slotArena task == aid && case slotWork task of
+    SlotGrowth _ → True
+    SlotRelease _ → True
+    _ → False
+  Nothing → False
+
+-- | What a retry of a paused arena reads again: the pages an I/O or integrity pause recorded (an
+-- integrity page must read back valid), and the conditions they would certify. A pause that recorded
+-- none cannot be certified and stays.
+retryProbe ∷ Arena → ([(PageNo, ReadMode)], [Condition])
+retryProbe arena = (pages, map fst probed)
+  where
+    store = arenaStore arena
+    probed = [(c, record) | c ← [CondIo, CondIntegrity], c `elem` conditions store, Just record ← [Map.lookup c (arenaFaults arena)], not (null (faultRecorded record))]
+    pages = [(page, if c == CondIntegrity then ReadValidated else ReadProbe) | (c, record) ← probed, page ← faultRecorded record]

@@ -356,7 +356,6 @@ isOpenCmd req = case reqCmd req of COpen {} → True; _ → False
 isAcquisition ∷ Req → Bool
 isAcquisition req = case reqCmd req of COpen {} → True; CAttach {} → True; _ → False
 
-
 isRemoval ∷ Req → Bool
 isRemoval req = case reqCmd req of CRemove {} → True; _ → False
 
