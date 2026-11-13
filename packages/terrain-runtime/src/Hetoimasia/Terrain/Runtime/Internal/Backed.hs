@@ -40,6 +40,7 @@ module Hetoimasia.Terrain.Runtime.Internal.Backed
   , Gathered (..)
   , ReadWhat (..)
   , canStartGather
+  , editBankReadsChecked
   , startGatherFor
   , stepGatherTask
 
@@ -100,6 +101,8 @@ import Hetoimasia.Terrain.Runtime.Storage.Internal.Service
   , Snapshot (..)
   , backingRecordBytes
   , keptEntryBytes
+  , resultPageBytes
+  , transferBufferBytes
   , OpenSpec (..)
   , PreparedGrowth
   , ReadMode
@@ -116,7 +119,7 @@ import qualified Hetoimasia.Terrain.Runtime.Store.Internal.Admission as A
 import Hetoimasia.Terrain.Runtime.Store.Internal.Admission (Admission)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Format (PageNo, StoreIdentity (..))
 import Hetoimasia.Terrain.Runtime.Store.Internal.Model (ActiveView (..), Condition (..), GrowthProposal, Store, activeView, storeConfig, TxnId, conditions, oldestPin, pauseFor, storeFromRoots, storeHeader, storeRoots, storeVersion)
-import Hetoimasia.Terrain.Runtime.Store.Internal.Plan (Plan)
+import Hetoimasia.Terrain.Runtime.Store.Internal.Plan (Plan, RamCharge (..))
 import Hetoimasia.Terrain.Runtime.Store.Internal.Protocol (discoveryPlanner, maintenancePlanner, removalPlanner)
 import Hetoimasia.Terrain.Runtime.Store.Internal.State (Roots (..), StoreConfig, emptyRoots, maxReaders)
 import Hetoimasia.Terrain.Source (Source)
@@ -124,9 +127,29 @@ import Hetoimasia.Terrain.Source (Source)
 -- ---------------------------------------------------------------------------
 -- Configuration
 
--- | The pinned reads one arena may have in flight: the readers its store may pin.
-gathersPerArena ∷ Int
-gathersPerArena = maxReaders
+-- | The pinned reads one arena may have in flight: the readers per arena the edit bank was
+-- validated for (at most the readers its store may pin), so the pins never pass what the bank's
+-- proof counts.
+gathersPerArena ∷ Config → Int
+gathersPerArena config = fromInteger (min (toInteger maxReaders) (A.ebsReadersPerArena (configEditBank config)))
+
+-- | The edit bank must also fund one read beside the worst transaction and every reader pin: the
+-- storage service charges a read's result page to the cache and its transfer buffer to staging when
+-- it dispatches the job (#663), beside what the transaction's grant and the pins already hold. Each
+-- holder (a gather, the slot's transaction, a query or a probe) has at most one one-page read in
+-- flight, so room for one read means some read can always be funded: a transaction and the pinned
+-- reads never wait on each other. A bank at #662's own minimum (the transaction beside every pin,
+-- nothing more) deadlocks the first time both read, so it is refused at construction.
+editBankReadsChecked ∷ A.EditBankSpec → Either ConfigError ()
+editBankReadsChecked spec
+  | cacheNeed > A.ebsCache spec = Left (ConfigEditBankReads "cache" cacheNeed (A.ebsCache spec))
+  | stagingNeed > A.ebsStaging spec = Left (ConfigEditBankReads "staging" stagingNeed (A.ebsStaging spec))
+  | otherwise = Right ()
+  where
+    w = A.worstTransactionCharge
+    pins = A.ebsArenas spec * min (toInteger maxReaders) (A.ebsReadersPerArena spec)
+    cacheNeed = toInteger (ramDecodedCopies w) + pins * toInteger A.readerPinnedCacheBytes + toInteger resultPageBytes
+    stagingNeed = toInteger (ramIoBuffers w + ramKeys w + ramScratch w) + toInteger (transferBufferBytes 1)
 
 -- | The fairness rule of the slot: while explicit work waits, internal work (discovery,
 -- reclamation) gets one grant after every 'internalTurn' explicit grants.
@@ -390,10 +413,10 @@ data Gathered
 
 -- | Whether a gather for an arena can start now: the arena is live, it has a pin to spare,
 -- and the edit bank grants the pin's credit.
-canStartGather ∷ St → Admission → ArenaId → Bool
-canStartGather st adm aid =
+canStartGather ∷ Int → St → Admission → ArenaId → Bool
+canStartGather cap st adm aid =
   Map.member aid (stateArenas st)
-    && length [() | t ← Map.elems (stateGathers st), gatherArena t == aid] < gathersPerArena
+    && length [() | t ← Map.elems (stateGathers st), gatherArena t == aid] < cap
     && either (const False) (const True) (A.reserve A.Foreground (pinCredits aid) adm)
 
 -- | Start a gather of some columns: the pin's credit is secured BEFORE the pin is taken; no
@@ -411,7 +434,7 @@ startGatherFor svc key aid what = do
   case Map.lookup aid (stateArenas st) of
     Just arena
       | not (Map.member key (stateGathers st))
-      , canStartGather st adm aid
+      , canStartGather (gathersPerArena (serviceConfig svc)) st adm aid
       , Right (grant, adm') ← A.reserve A.Foreground (pinCredits aid) adm
       , Right (store', run) ← begin arena → do
           writeTVar (serviceEditBank svc) adm'
@@ -507,14 +530,29 @@ data Contender
 contenders ∷ St → STM [Contender]
 contenders st = do
   explicit ← fmap concat . traverse eligibleRemoval $ sortOn (reqSeq . snd) (Map.toList (stateRequests st))
+  -- explicit work WAITS while an accepted removal of a live, unpaused arena has an eligible host,
+  -- even when none is ready to take the slot this instant: after every commit the others re-stage
+  -- against the new revision, and internal work must not take those gaps beyond its turn
+  waiting ← or <$> traverse waitingRemoval (Map.toList (stateRequests st))
   let internal = concatMap internalOf (Map.toList (stateArenas st))
+      turn = stateExplicitRun st >= internalTurn
   pure $ case (explicit, internal) of
+    ([], _) | waiting && not turn → []
     ([], _) → internal
     (_, []) → explicit
     (e : _, i : _)
-      | stateExplicitRun st >= internalTurn → [i, e]
+      | turn → [i, e]
       | otherwise → [e, i]
   where
+    waitingRemoval (_, req) = case (reqCmd req, reqPhase req, reqArena req >>= \aid → Map.lookup aid (stateArenas st)) of
+      (CRemove {}, phase, Just arena)
+        | notDone phase
+        , null (conditions (arenaStore arena)) →
+            endpointEligible (reqEndpoint req)
+      _ → pure False
+    notDone = \case
+      Done → False
+      _ → True
     eligibleRemoval (rid, req) = case (reqCmd req, reqPhase req, reqArena req >>= \aid → (,) aid <$> Map.lookup aid (stateArenas st)) of
       (CRemove tile _, StagedPhase sg, Just (aid, arena))
         | StagedRemoval prepared ← stagedWork sg
@@ -680,8 +718,9 @@ closeDrained svc aid = do
 --   active store transaction exists exactly when the session's slot runs one of it.
 -- * The compile account's use is the sum of what each arena, closing file and open holds, and
 --   never above the account.
--- * The storage service holds a backing for every live and closing arena and every reserved open,
---   and at most one more for each open whose reservation has finished untaken.
+-- * The storage service holds a backing for every live arena and every reserved open, and at most
+--   one more for each closing arena (its file closes in one bounded call, after which the owner
+--   forgets it) and each open whose reservation has finished untaken.
 -- * With no task of the owner and no job of the backend, the edit bank's cache and staging hold
 --   nothing, and its control holds exactly the storage service's own records: a backing record
 --   for each backing, charged closing record, held close and running open, and a kept-failure
@@ -745,8 +784,8 @@ backedInvariants st adm compileBank sn =
       OpenReserving _ _ _ n _ _ → n
       OpenPublishable _ _ n _ _ → n
       OpenUnwinding n _ _ → n
-    wanted = Map.size (stateArenas st) + Map.size (stateClosing st) + length [() | OpenPublishable {} ← map openPhase (Map.elems (stateOpens st))]
-    reserving = length [() | p ← map openPhase (Map.elems (stateOpens st)), isReserving p]
+    wanted = Map.size (stateArenas st) + length [() | OpenPublishable {} ← map openPhase (Map.elems (stateOpens st))]
+    reserving = Map.size (stateClosing st) + length [() | p ← map openPhase (Map.elems (stateOpens st)), isReserving p]
     isReserving = \case
       OpenReserving {} → True
       OpenUnwinding {} → True

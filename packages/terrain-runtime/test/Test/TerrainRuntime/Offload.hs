@@ -106,11 +106,19 @@ spec = describe "Offload and reload" $ do
       model <- inspectModel svc
       [(regionDirty r, regionHandoff r) | r ← modelRegions model, regionCoord r == held] `shouldBe` [(False, Nothing)]
       [arenaRetainedBytes a | a ← modelArenas model] `shouldBe` [0]
-      -- Pressure evicts the region; reading it again reconstructs the removal from the store.
-      forM_ [(16, 0, 0), (32, 0, 0), (-16, 0, 0), (0, 16, 0), (0, -16, 0), (16, 0, -32)] $ \(x, y, z) → readCell svc lease (tile x y z)
+      -- Pressure evicts the region; reading it again reconstructs the removal from the store. Nothing
+      -- of a removal is retained in RAM, so a region holds only what its reads covered: reads of
+      -- distinct regions continue until the bank must give it up (it is evicted within the bound).
+      let others = [(x, y, z) | z ← [0, -32, 64], y ← [0, 16, -16], x ← [16, 32, -16, 48, -32], (x, y, z) /= (0, 0, 32)]
+          press [] = pure False
+          press ((x, y, z) : rest) = do
+            _ <- readCell svc lease (tile x y z)
+            resident <- any ((== held) . regionCoord) . modelRegions <$> inspectModel svc
+            if resident then press rest else pure True
+      evicted <- press others
       -- (a failure shows the region's record: why it is still resident)
       pressured <- inspectModel svc
-      [r | r ← modelRegions pressured, regionCoord r == held] `shouldBe` []
+      (evicted, [r | r ← modelRegions pressured, regionCoord r == held]) `shouldBe` (True, [])
       found <- readCell svc lease (tile 0 0 33)
       cellIs found `shouldBe` True
       settleChecks svc

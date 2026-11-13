@@ -431,6 +431,9 @@ data ConfigError
     -- compilation's peak is below one arena's share), or its size is not representable: what the
     -- arenas need, and what the account would be.
     ConfigCompileBank !Integer !Integer
+  | -- | The edit bank cannot fund one read beside the worst transaction and every reader pin: the
+    -- account, what it needs and what it has.
+    ConfigEditBankReads !Text !Integer !Integer
   deriving stock (Show)
 
 instance Exception ConfigError

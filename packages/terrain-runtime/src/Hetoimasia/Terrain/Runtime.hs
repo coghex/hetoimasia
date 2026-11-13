@@ -207,7 +207,7 @@ import Hetoimasia.Terrain.Runtime.Internal.Types
 import Hetoimasia.Terrain.Runtime.Settlement
 import Hetoimasia.Terrain.Runtime.Backed.Port (StoragePort (..), storagePort)
 import Hetoimasia.Terrain.Runtime.Backed.Fault (FullWhy (..), IntegritySource (..), StorageFault (..), faultCode)
-import Hetoimasia.Terrain.Runtime.Internal.Backed (backedInvariants)
+import Hetoimasia.Terrain.Runtime.Internal.Backed (backedInvariants, editBankReadsChecked)
 import qualified Hetoimasia.Terrain.Runtime.Storage.Internal.Service as Storage
 import Hetoimasia.Terrain.Runtime.Store.Internal.Admission (EditBankSpec (..), Ledger (..), defaultEditBankSpec, ledgers, mkEditBankConfig, newAdmission)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Model (Condition (..), GrowthView (..), Usage (..), conditions, growthView, storeHeader, usage)
@@ -286,6 +286,7 @@ withTerrainService config ports body = do
   -- compile account beside them (owner decision 2026-11-13, option B).
   storeConfig <- either (throwIO . ConfigStore) pure (mkStoreConfig (configStore config))
   editBank <- either (throwIO . ConfigEditBank) pure (mkEditBankConfig (configEditBank config) {ebsArenas = toInteger (configMaxArenas config)})
+  either throwIO pure (editBankReadsChecked (configEditBank config) {ebsArenas = toInteger (configMaxArenas config)})
   limits <- either throwIO pure (modelLimitsChecked config)
   compileBank <- either throwIO pure (compileBankChecked (configMaxArenas config) (configConnectivity config))
   bank <- newTVarIO (newAdmission editBank)

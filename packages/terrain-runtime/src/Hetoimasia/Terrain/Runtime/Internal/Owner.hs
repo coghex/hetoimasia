@@ -200,7 +200,7 @@ nextWork svc token = do
                   -- aging decide among loads.
                   retryWork = if stateFreed st && retryUseful st then Just WRetry else Nothing
                   dispatchWork =
-                    if not (stateDispatchIdle st) && any ((== R.JobQueued) . R.jobPhase) (R.modelJobs model) && all (canStartGather st adm) (Map.keys (stateArenas st))
+                    if not (stateDispatchIdle st) && any ((== R.JobQueued) . R.jobPhase) (R.modelJobs model) && all (canStartGather (gathersPerArena (serviceConfig svc)) st adm) (Map.keys (stateArenas st))
                       then Just WDispatch
                       else Nothing
                   backedReady = listToMaybe (catMaybes [grantWork] <> backedNow)
@@ -305,7 +305,7 @@ needsResubmit req = isDataCmd (reqCmd req) && waitingReadmission req
 -- gather; an open its preparation), then commit the next eligible command of each arena in
 -- admission order. A removal that changes content is not committed here: it takes the slot.
 pickRequestWork ∷ Service → St → A.Admission → STM (Maybe Work, Maybe Work)
-pickRequestWork _ st adm = do
+pickRequestWork svc st adm = do
   candidates <- fmap catMaybes (forM (Map.elems groups) firstEligible)
   pure
     ( case filter needsPrepare ordered of (rid, _) : _ → Just (WPrepare rid); [] → Nothing
@@ -330,7 +330,7 @@ pickRequestWork _ st adm = do
       CAttach {} → True
       CGrow {} → True
       CRetry → True
-      _ → not (Map.member (GatherRequest rid) (stateGathers st)) && maybe False (canStartGather st adm) (reqArena req)
+      _ → not (Map.member (GatherRequest rid) (stateGathers st)) && maybe False (canStartGather (gathersPerArena (serviceConfig svc)) st adm) (reqArena req)
     satisfied rid req = case reqCmd req of
       COpen {} → True
       CAttach {} → True
@@ -505,24 +505,30 @@ releaseVictim svc key@(aid, region) = do
 -- job's work runs when they have been read.
 dispatchJob ∷ Service → IO ()
 dispatchJob svc = do
-  started <- atomically $ do
+  -- The job's record (made when the model admitted it) is marked running in the transaction that
+  -- dispatches it: it holds a load-job slot from now to its report. 'PointJob' is reported in
+  -- dispatch order, as the job is about to run; its pinned read of the store starts after it.
+  dispatched <- atomically $ do
     outcome <- applyEvent svc R.Dispatch
     case outcome of
       Right report
         | R.Dispatched jid (aid, region) cover <- R.reportDecision report → do
             startJobWork svc jid cover
             case realPieces region cover of
-              Left why → pure (Just (jid, Left why))
+              Left why → pure (Just (jid, aid, region, Left why))
               Right pieces → do
-                let columns = Set.toList (Set.fromList [c | (c, _) ← pieces])
                 modifySt svc (\st → st {stateLoadJobs = Map.insert jid (aid, region, cover) (stateLoadJobs st)})
-                ok <- startGatherFor svc (GatherJob jid) aid (ReadRuns columns)
-                pure (Just (jid, if ok then Right () else Left "no pin was available for a dispatched load"))
+                pure (Just (jid, aid, region, Right (Set.toList (Set.fromList [c | (c, _) ← pieces]))))
       _ → modifySt svc (\st → st {stateDispatchIdle = True}) >> pure Nothing
-  forM_ started $ \case
-    (_, Right ()) → pure ()
-    (jid, Left why) → do
-      defect <- atomically (finishJob svc jid (Left why))
+  forM_ dispatched $ \(jid, aid, region, planned) → do
+    probe svc (PointJob aid region)
+    started <- case planned of
+      Left why → pure (Left why)
+      Right columns → do
+        ok <- atomically (startGatherFor svc (GatherJob jid) aid (ReadRuns columns))
+        pure (if ok then Right () else Left "the arena of a dispatched load closed, or no pin was available")
+    forM_ (either Just (const Nothing) started) $ \why → do
+      defect <- atomically (forgetLoad svc jid >> finishJob svc jid (Left why))
       forM_ defect $ \text → failWith svc (AccountingDefect text) []
 
 forgetLoad ∷ Service → R.JobId → STM ()
@@ -606,7 +612,6 @@ delivered svc key gathered = case (key, gathered) of
               runJob (arenaSource arena) changes (arenaPalette arena) (arenaResident arena) region cover
           Nothing → pure (Left "arena closed while its load ran")
         _ <- pure revision
-        probe svc (PointJob aid region)
         defect <- atomically (finishJob svc jid result)
         forM_ defect $ \why → failWith svc (AccountingDefect why) []
   (GatherJob jid, GatheredFailed handling) → do

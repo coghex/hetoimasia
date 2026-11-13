@@ -21,7 +21,11 @@
 module Test.TerrainRuntime.Backed.Sweep (spec) where
 
 import Control.Concurrent.STM
-import Control.Monad (forM_, when)
+import Control.Exception (finally)
+import Control.Monad (forM_, void, when)
+import Data.Word (Word64)
+import qualified Hetoimasia.Terrain.Connectivity as C
+import Hetoimasia.Terrain.Source (defaultSourceLimits, mkSource)
 import Hetoimasia.Terrain.Runtime
 import Hetoimasia.Terrain.Runtime.Settlement
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Native (NativeOp (..))
@@ -51,9 +55,78 @@ oracle svc = do
   inspectBacked svc >>= (`shouldBe` [])
 
 spec ∷ Spec
-spec = describe "The backed removal's ending paths (sweep)" $
-  forM_ [minBound .. maxBound] $ \step → forM_ [minBound .. maxBound] $ \exit →
-    it ("held " <> show step <> ", ended " <> show exit) (sweepCase step exit)
+spec = do
+  describe "The backed removal's ending paths (sweep)" $
+    forM_ [minBound .. maxBound] $ \step → forM_ [minBound .. maxBound] $ \exit →
+      it ("held " <> show step <> ", ended " <> show exit) (sweepCase step exit)
+  describe "The backed open's ending paths (sweep)" $
+    forM_ [minBound .. maxBound] $ \step → forM_ [e | e ← [minBound .. maxBound], applies step e] $ \exit →
+      it ("held " <> show step <> ", ended " <> show exit) (openCase step exit)
+  where
+    -- nothing native runs while an open compiles: a native failure there is the reserving step's
+    applies OpenCompiling OpenByNativeFailure = False
+    applies _ _ = True
+
+-- | Where an open is held: its compilation charged and about to run (the owner held at
+-- 'PointCompiling'), or its file's reservation in flight (held at the native seam).
+data OpenStep = OpenCompiling | OpenReserving
+  deriving stock (Eq, Show, Enum, Bounded)
+
+data OpenExit = OpenByCancel | OpenByClientEnd | OpenByServiceClose | OpenByNativeFailure | OpenByComplete
+  deriving stock (Eq, Show, Enum, Bounded)
+
+isReserve ∷ NativeOp → Bool
+isReserve = \case OpReserveRange {} → True; _ → False
+
+-- | An open held at a step and ended by an exit: it settles once, nothing of it is left (no
+-- compile charge, no file, no bank credit: the oracle and the bank at rest), and unless the service
+-- closed, the name can be opened again.
+openCase ∷ OpenStep → OpenExit → IO ()
+openCase step exit = do
+  probe ← H.newProbe
+  reached ← newEmptyTMVarIO
+  release ← newEmptyTMVarIO
+  let owner = Probe $ \case
+        PointCompiling _ | step == OpenCompiling → atomically (putTMVar reached ()) >> atomically (readTMVar release)
+        _ → pure ()
+  withServiceSeam quiet defaultConfig alwaysAdmitting owner (H.seamFor probe) $ \svc → do
+    client ← okOf (registerClient svc)
+    gate ← case (step, exit) of
+      (OpenReserving, OpenByNativeFailure) → H.addRule probe 1 isReserve (H.FailWith (Errno 28)) >> pure Nothing
+      (OpenReserving, _) → Just <$> H.addGate probe isReserve
+      (OpenCompiling, _) → pure Nothing
+    let unhold = atomically (void (tryPutTMVar release ())) >> forM_ gate H.openGate
+    flip finally unhold $ do
+      opening ← okOf (openArena svc client "main" soilOverStone)
+      -- reach the step
+      case (step, gate) of
+        (OpenCompiling, _) → waitFor (readTMVar reached)
+        (_, Just g) → H.awaitReached g 1
+        (_, Nothing) → pure ()
+      -- the exit
+      case exit of
+        OpenByCancel → cancel svc (pendingRequest opening) `shouldReturn` CancelWon
+        OpenByClientEnd → endClient svc client
+        OpenByServiceClose → closeService svc
+        OpenByNativeFailure → pure ()
+        OpenByComplete → pure ()
+      unhold
+      outcome ← await svc opening
+      case exit of
+        OpenByComplete → outcome `shouldSatisfy` either (const False) (const True)
+        OpenByNativeFailure → outcome `shouldSatisfy` \case Left (Failed (StorageFailed (FaultReservation _))) → True; _ → False
+        OpenByCancel → outcome `shouldSatisfy` \case Left Cancelled → True; _ → False
+        _ → outcome `shouldSatisfy` either (const True) (const False)
+    bankAtRest svc
+    oracle svc
+    atomically (inspectCompileSTM svc) >>= \(use, _) → use `shouldBe` (if exit == OpenByComplete then perArenaUse else 0)
+    -- the name is free again (or still the completed arena's: a second open of it is refused)
+    when (exit `notElem` [OpenByClientEnd, OpenByServiceClose, OpenByComplete]) $ do
+      lease ← okOf (openArena svc client "main" soilOverStone) >>= await svc >>= expectSuccess
+      _ ← readCell svc lease (tile 0 0 0)
+      pure ()
+  where
+    perArenaUse = fixtureShare
 
 sweepCase ∷ Step → Exit → IO ()
 sweepCase step exit = do
@@ -106,3 +179,9 @@ sweepCase step exit = do
     when (exit /= ByLeaseRelease && exit /= ByServiceClose) $ do
       found ← readCell svc lease target
       cellIs found `shouldBe` committed
+
+-- | What the fixture arena keeps of the compile account: its compiled connectivity and member index.
+fixtureShare ∷ Word64
+fixtureShare = case mkSource defaultSourceLimits soilOverStone of
+  Left e → error ("the fixture source was refused: " <> show e)
+  Right src → either (error . show) (\(_, st) → fromInteger (C.workResultBytes st + 32 * C.workNodes st)) (C.prepareConnectivity C.defaultConnectivityLimits src)

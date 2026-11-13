@@ -9,7 +9,7 @@
 module Test.TerrainRuntime.Backed.Service (spec) where
 
 import Control.Concurrent.STM
-import Control.Exception (finally)
+import Control.Exception (finally, try)
 import Control.Monad (forM, forM_)
 import Hetoimasia.Terrain.Residency (ArenaId (..), Revision (..))
 import Hetoimasia.Terrain.Runtime
@@ -18,6 +18,7 @@ import Hetoimasia.Terrain.Runtime.Store.Admission (Ledger (..))
 import qualified Hetoimasia.Terrain.Runtime.Store.Internal.Admission as A
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan (RamCharge (..))
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Native (NativeOp (..))
+import Hetoimasia.Terrain.Runtime.Storage.Internal.Service (resultPageBytes)
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Types (Errno (..))
 import Hetoimasia.Terrain.Runtime.Store (StoreSpec (..), defaultStoreSpec, minAllowanceBytes)
 import Test.Hspec
@@ -50,11 +51,26 @@ spec = describe "The backed terrain service" $ do
       Right _ → pure ()
       Left refusal → expectationFailure ("the worst transaction does not fit beside every reader pin: " <> show refusal)
 
-  it "makes a grant wait for the cache a reader holds, and grants it when the reader's read returns (no circular wait)" $ do
-    -- the edit bank at the least its validation accepts for one arena and one reader: the worst transaction's
-    -- decoded copies beside one reader's pin, and nothing more
-    let need = toInteger (ramDecodedCopies A.worstTransactionCharge) + toInteger A.readerPinnedCacheBytes
-        bankSpec = A.defaultEditBankSpec {A.ebsCache = need, A.ebsArenas = 1, A.ebsReadersPerArena = 1}
+  it "refuses at construction an edit bank that cannot fund one read beside the worst transaction and every reader pin (a circular wait), and accepts one byte more" $ do
+    let atMinimum = toInteger (ramDecodedCopies A.worstTransactionCharge) + 2 * toInteger A.readerPinnedCacheBytes
+        spec' cache = A.defaultEditBankSpec {A.ebsCache = cache, A.ebsReadersPerArena = 2}
+        config cache = defaultConfig {configMaxArenas = 1, configEditBank = spec' cache}
+        need = atMinimum + toInteger resultPageBytes
+    -- #662's own minimum (the transaction beside every pin) leaves no room for a read's result
+    try (withService (config atMinimum) (\_ → pure ())) >>= \case
+      Left (ConfigEditBankReads "cache" needed have) → (needed, have) `shouldBe` (need, atMinimum)
+      Left other → expectationFailure ("expected the edit bank refused, got " <> show other)
+      Right () → expectationFailure "an edit bank that cannot fund a read was accepted"
+    try (withService (config (need - 1)) (\_ → pure ())) >>= \case
+      Left (ConfigEditBankReads "cache" _ _) → pure ()
+      other → expectationFailure ("expected the edit bank refused one byte short, got " <> either show (const "acceptance") other)
+    withService (config need) (\_ → pure ())
+
+  it "makes a grant wait for the cache readers' reads hold, and grants it when the reads return (no circular wait)" $ do
+    -- the edit bank at the least the service accepts for one arena and two readers: the worst
+    -- transaction's decoded copies, two reader pins and one read's result
+    let need = toInteger (ramDecodedCopies A.worstTransactionCharge) + 2 * toInteger A.readerPinnedCacheBytes + toInteger resultPageBytes
+        bankSpec = A.defaultEditBankSpec {A.ebsCache = need, A.ebsArenas = 1, A.ebsReadersPerArena = 2}
         config = defaultConfig {configMaxArenas = 1, configEditBank = bankSpec}
     granted ← newTVarIO (0 ∷ Int)
     probe ← H.newProbe
@@ -64,24 +80,28 @@ spec = describe "The backed terrain service" $ do
     withServiceSeam quiet config alwaysAdmitting owner (H.seamFor probe) $ \svc → do
       (_, lease) ← openMain svc "main"
       _ ← removeCell' svc lease (tile 3 4 9)
+      -- the removal's discovery is done: nothing internal wants the slot
+      waitFor $ arenaStatusSTM svc lease >>= \case
+        Right st → check (statusDiscovery st == DiscoveryIdle)
+        Left _ → retry
       grantsBefore ← readTVarIO granted
       -- a removal staged and waiting for its host
       host ← newHost False
       _ ← okOf (removeWith svc (hostEndpoint svc Nothing host) lease (tile 3 4 5) Nothing)
       waitFor (readTVar (hostReady host) >>= \n → check (n >= 1))
-      -- a read whose page read is held at the seam: its pin and the read's result hold the cache
+      -- two reads whose page reads are held at the seam: their pins and their results in flight
       gate ← H.addGate probe isRead
-      reader ← flip finally (H.openGate gate) $ do
-        reader ← okOf (cellAt svc lease (tile 8 8 8))
-        H.awaitReached gate 1
-        -- the removal becomes eligible: the grant does not fit beside the reader, so it waits
+      readers ← flip finally (H.openGate gate) $ do
+        readers ← mapM (\at → okOf (cellAt svc lease at)) [tile 8 8 8, tile 9 9 9]
+        H.awaitReached gate 2
+        -- the removal becomes eligible: the transaction does not fit beside both reads, so its grant waits
         grant host
         bank ← atomically (inspectEditBankSTM svc)
         lgStagingForeground bank `shouldBe` 0
         readTVarIO granted `shouldReturn` grantsBefore
-        pure reader
-      -- the reader's read returns (its gate opened), its pin is released, and the grant proceeds
-      _ ← await svc reader
+        pure readers
+      -- the reads return (the gate opened): their results and pins are released and the grant proceeds
+      mapM_ (await svc) readers
       _ ← waitFor (readTVar (hostSettled host) >>= \s' → if null s' then retry else pure s')
       settledOf host >>= (`shouldSatisfy` \case [Succeeded (ARemoved r)] → removeChangedFlag r; _ → False)
       readTVarIO granted >>= (`shouldSatisfy` (> grantsBefore))
@@ -242,9 +262,10 @@ spec = describe "The backed terrain service" $ do
         _ ← okOf (removeWith svc (hostEndpoint svc Nothing host) lease (tile 3 4 5) Nothing)
         H.awaitReached gate 1
         endClient svc client
-        -- the close settles the removal at once (the owner does it on its next step), with the write still held
+        -- the close settles the removal once (the owner does it on its next step), with the write still held:
+        -- as the arena's closure or as a cancellation of its in-flight transaction (the sweep's outcomes)
         _ ← waitFor (readTVar (hostSettled host) >>= \s' → if null s' then retry else pure s')
-        settledOf host `shouldReturn` [Failed ArenaClosed]
+        settledOf host >>= (`shouldSatisfy` (`elem` [[Failed ArenaClosed], [Cancelled]]))
       atRest svc
       inspectBacked svc >>= (`shouldBe` [])
       settleChecks svc
