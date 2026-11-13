@@ -356,9 +356,6 @@ isOpenCmd req = case reqCmd req of COpen {} → True; _ → False
 isAcquisition ∷ Req → Bool
 isAcquisition req = case reqCmd req of COpen {} → True; CAttach {} → True; _ → False
 
--- | A creator's growth or retry: no model record, a command slot held here until it settles.
-isCreatorCommand ∷ Req → Bool
-isCreatorCommand req = case reqCmd req of CGrow {} → True; CRetry → True; _ → False
 
 isRemoval ∷ Req → Bool
 isRemoval req = case reqCmd req of CRemove {} → True; _ → False

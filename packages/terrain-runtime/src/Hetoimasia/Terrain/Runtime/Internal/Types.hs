@@ -53,6 +53,10 @@ module Hetoimasia.Terrain.Runtime.Internal.Types
     -- * Commands and requests
   , Cmd (..)
   , Staged (..)
+  , CreatorBasis (..)
+  , creatorBasisOf
+  , creatorFresh
+  , isCreatorCommand
   , StagedWork (..)
   , ReqPhase (..)
   , Req (..)
@@ -172,7 +176,7 @@ import Hetoimasia.Terrain.Runtime.Internal.Content (Prepared)
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Service (Backing, StorageService, Ticket)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Admission (Admission, EditBankError, EditBankSpec, Grant)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Format (PageNo, StoreIdentity)
-import Hetoimasia.Terrain.Runtime.Store.Internal.Model (Condition, GrowthProposal, Store, storeHeader)
+import Hetoimasia.Terrain.Runtime.Store.Internal.Model (Condition, GrowthProposal, GrowthView, Store, growthView, storeConfig, storeHeader)
 import Hetoimasia.Terrain.Runtime.Store.Internal.State (StoreConfig, StoreSpec)
 import qualified Hetoimasia.Terrain.Runtime.Store.Internal.State as StoreState
 import Hetoimasia.Terrain.Source (Source, SourceError, SourceLimits)
@@ -552,8 +556,29 @@ data Staged = Staged
   , stagedRevision ∷ !Revision
   , -- | The knowledge revision the work was read at (a knowledge answer is current only while it holds).
     stagedKnowledge ∷ !Revision
+  , -- | For a creator command (growth, retry): the arena's allowance and growth state it was
+    -- prepared against. It is stale once either moves, and prepared again.
+    stagedBasis ∷ !(Maybe CreatorBasis)
   , stagedWork ∷ !StagedWork
   }
+
+-- | What a creator command's preparation reads of its arena's store: the allowance and the
+-- growth state. A growth's commit, its abandonment and a pending extra's release move it; a
+-- removal, discovery or reclamation does not.
+data CreatorBasis = CreatorBasis !Word64 !GrowthView
+  deriving stock (Eq, Show)
+
+creatorBasisOf ∷ Arena → CreatorBasis
+creatorBasisOf arena = CreatorBasis (StoreState.cfgAllowanceBytes (storeConfig (arenaStore arena))) (growthView (arenaStore arena))
+
+-- | Whether staged work still stands on what its arena's store holds now (always, for work that
+-- is not a creator command's).
+-- | A creator command: a growth or an explicit retry of the creator's arena.
+isCreatorCommand ∷ Req → Bool
+isCreatorCommand req = case reqCmd req of CGrow {} → True; CRetry → True; _ → False
+
+creatorFresh ∷ Arena → Staged → Bool
+creatorFresh arena sg = maybe True (== creatorBasisOf arena) (stagedBasis sg)
 
 data StagedWork
   = StagedAnswer !Answer

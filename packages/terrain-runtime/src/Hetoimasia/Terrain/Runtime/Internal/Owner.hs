@@ -374,7 +374,7 @@ pickRequestWork svc st adm holdReads = do
     live = [(rid, req) | (rid, req) <- ordered, not (isDoneReq req)]
     groups = Map.fromListWith (flip (<>)) [(reqArena req, [(rid, req)]) | (rid, req) <- live]
     isDoneReq req = case reqPhase req of Done → True; _ → False
-    needsPrepare (rid, req) = not (behindSlot req) && case reqPhase req of
+    needsPrepare (rid, req) = not (behindSlot req) && not (behindGrowth req) && case reqPhase req of
       Waiting → satisfied rid req && notStarted rid req
       StagedPhase sg → stale sg && notStarted rid req
       Done → False
@@ -387,6 +387,15 @@ pickRequestWork svc st adm holdReads = do
         , Just slotReq ← Map.lookup srid (stateRequests st) →
             reqArena req == Just (slotArena task) && reqSeq req > reqSeq slotReq && isDataCmd (reqCmd req)
       _ → False
+    -- a creator command (growth, retry) of an arena is not prepared while the slot runs a growth or a
+    -- pending extra's release of that arena: what it reads (the allowance, the growth state) is still
+    -- moving, and its answer must not depend on how far that run has got
+    behindGrowth req = isCreatorCommand req && case stateSlot st of
+      Just task → reqArena req == Just (slotArena task) && case slotWork task of
+        SlotGrowth _ → True
+        SlotRelease _ → True
+        _ → False
+      Nothing → False
     -- an open has one preparation task; a read or a removal one gather at a time, started only
     -- when its arena has a pin to spare and the edit bank its credit
     notStarted rid req = case reqCmd req of
@@ -411,7 +420,7 @@ pickRequestWork svc st adm holdReads = do
       _ → False
     stale sg = case stagedArena sg of
       Nothing → False
-      Just aid → maybe False (\a → arenaRevision a /= stagedRevision sg || knowledgeMoved a sg) (Map.lookup aid (stateArenas st))
+      Just aid → maybe False (\a → arenaRevision a /= stagedRevision sg || knowledgeMoved a sg || not (creatorFresh a sg)) (Map.lookup aid (stateArenas st))
     knowledgeMoved a sg = case stagedWork sg of
       StagedAnswer (AKnowledge _) → D.authKnowledge (arenaAuthority a) /= stagedKnowledge sg
       _ → False
@@ -804,12 +813,16 @@ stageWith svc rid aid rev knowledge work =
     publish' = do
         st <- readSt svc
         forM_ (Map.lookup rid (stateRequests st)) $ \req → do
-          let fresh = case aid of
+          let arena = aid >>= \a → Map.lookup a (stateArenas st)
+              fresh = case aid of
                 Nothing → True
-                Just a → maybe False (\x → arenaRevision x == rev && D.authKnowledge (arenaAuthority x) == knowledge) (Map.lookup a (stateArenas st))
+                Just _ → maybe False (\x → arenaRevision x == rev && D.authKnowledge (arenaAuthority x) == knowledge) arena
               pending = case reqPhase req of Done → False; _ → True
+              -- a creator command records the allowance and growth state it was prepared against
+              -- (read now: nothing on the owner thread ran since its preparation read them)
+              basis = if isCreatorCommand req then creatorBasisOf <$> arena else Nothing
           when (fresh && pending) $ do
-            modifySt svc (\s → s {stateRequests = Map.insert rid req {reqPhase = StagedPhase (Staged aid rev knowledge work)} (stateRequests s)})
+            modifySt svc (\s → s {stateRequests = Map.insert rid req {reqPhase = StagedPhase (Staged aid rev knowledge basis work)} (stateRequests s)})
             -- A failing readiness callback abandons this transaction: the work stays
             -- unstaged and cannot commit. The caller treats it as a provider defect.
             endpointReady (reqEndpoint req)
@@ -876,7 +889,7 @@ commitStaged svc st rid req sg = case (reqCmd req, stagedWork sg) of
     -- Staged work for a superseded revision is not offered: the owner computes
     -- it again against the current one.
     withFresh k = case stagedArena sg >>= \aid → (,) aid <$> Map.lookup aid (stateArenas st) of
-      Just (aid, arena) | arenaRevision arena == stagedRevision sg, knowledgeFresh arena → k aid arena
+      Just (aid, arena) | arenaRevision arena == stagedRevision sg, knowledgeFresh arena, creatorFresh arena sg → k aid arena
       _ → pure CommitWaiting
     -- a knowledge answer is current only while the knowledge revision it was read at holds
     knowledgeFresh arena = case stagedWork sg of

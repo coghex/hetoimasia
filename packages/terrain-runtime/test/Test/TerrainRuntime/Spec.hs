@@ -24,6 +24,7 @@ import qualified Test.TerrainRuntime.Storage.Opacity as StorageOpacity
 import qualified Test.TerrainRuntime.Storage.Open as StorageOpen
 import qualified Test.TerrainRuntime.Backed.Compile as BackedCompile
 import qualified Test.TerrainRuntime.Backed.Discovery as BackedDiscovery
+import qualified Test.TerrainRuntime.Backed.Creator as BackedCreator
 import qualified Test.TerrainRuntime.Backed.Fairness as BackedFairness
 import qualified Test.TerrainRuntime.Backed.Outcomes as BackedOutcomes
 import qualified Test.TerrainRuntime.Backed.Pause as BackedPause
@@ -86,6 +87,7 @@ spec = do
   BackedCompile.spec
   BackedDiscovery.spec
   BackedFairness.spec
+  BackedCreator.spec
   BackedService.spec
   BackedSweep.spec
   BackedTxn.spec

@@ -604,13 +604,15 @@ contenders st = do
             eligible ← endpointEligible (reqEndpoint req)
             pure [ContendRemoval rid aid tile | eligible]
       -- growth is admissible while paused: it is how a capacity pause is cleared (it changes no content)
-      (CGrow _, StagedPhase sg, Just (aid, _))
-        | StagedGrowth proposal ← stagedWork sg → do
+      (CGrow _, StagedPhase sg, Just (aid, arena))
+        | StagedGrowth proposal ← stagedWork sg
+        , creatorFresh arena sg → do
             eligible ← endpointEligible (reqEndpoint req)
             pure [ContendGrowth rid aid proposal | eligible]
       -- so is a retry's release of a pending extra
-      (CRetry, StagedPhase sg, Just (aid, _))
-        | StagedRelease ← stagedWork sg → do
+      (CRetry, StagedPhase sg, Just (aid, arena))
+        | StagedRelease ← stagedWork sg
+        , creatorFresh arena sg → do
             eligible ← endpointEligible (reqEndpoint req)
             pure [ContendRelease rid aid | eligible]
       _ → pure []
