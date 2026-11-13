@@ -118,3 +118,12 @@ still open are carried, condensed, in [deferred_work.md](deferred_work.md).
 | `renderer_foundation_findings.md` | Renderer foundation goals: FND-3 carried; FND-4 delivered by the 2D renderer |
 | `glfw_upgrade_findings.md` | GLFW-UP-1, carried |
 | `ci_validation_design.md` | Lean CI, test selection and reusable validation, CI-1 to CI-5; delivered as `validation.md`, CI-5 carried |
+
+## The 2D renderer design — last present at `b51dd60e` (removed 2026-11-13)
+
+`docs/designs/render_2d_design.md`: the independent 2D renderer over the shared
+GPU services (epic #413), decisions D-1 to D-32 and slices R2D-1 to R2D-18, all
+delivered except R2D-13, sampling an offscreen pass's target in later passes,
+which is the deferred #446 (its read-eligibility question is Q-10 there). The
+contracts are the `render-2d`, `render-2d-vulkan` and `render-2d-oracle`
+READMEs.
