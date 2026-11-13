@@ -1009,6 +1009,14 @@ slotOver svc task done = do
       HandleReplan → pure ()
       HandleWaitReclaim _ _ → atomically (modifySt svc (\s → s {stateNeedsMaintenance = Set.insert aid (stateNeedsMaintenance s)}))
       HandleClosing → pure ()
+      -- a revision or the store's version would wrap: the arena takes no further history. A removal
+      -- that passed admission settles as superseded; internal work of the arena stops (it is offered
+      -- again only when the committed version moves, which it can no longer do)
+      HandleExhausted → case removalOf work of
+        Just rid → atomically (terminate svc rid (Failed (Superseded "the arena's revisions are exhausted")))
+        Nothing → atomically $ modifySt svc $ \s → case Map.lookup aid (stateArenas s) of
+          Just arena → s {stateInternalIdle = foldr (\k → Map.insert (aid, k) (storeVersion (arenaStore arena), oldestPin (arenaStore arena))) (stateInternalIdle s) [False, True]}
+          Nothing → s
       HandleSerialize → failWith svc (OwnerDefect "the slot's transaction was refused for another transaction") []
       HandleDefect why → failWith svc (OwnerDefect why) []
     removalOf = \case

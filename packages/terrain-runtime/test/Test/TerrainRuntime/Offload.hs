@@ -43,12 +43,14 @@ spec = describe "Offload and reload" $ do
     withService (tightConfig (2, 1, 2) 2 4096) $ \svc → do
       client <- okOf (registerClient svc)
       lease <- okOf (openArena svc client "deep" terrainSpec) >>= await svc >>= expectSuccess
-      let checkColumn done revision (RegionCoord _ _ rz) (cx, cy) = do
-            let lo = toInteger rz * 32
-            found <- okOf (columnAt svc lease (column cx cy) (range lo (lo + 32))) >>= await svc >>= expectSuccess
+      -- every cell of 'localCells' of a region (the tight extent's cells), read as two columns of two levels
+      let checkRegion done revision (RegionCoord rx ry rz) = forM_ [toInteger rx * 16 + lx | lx ← [0, 1]] $ \cx → do
+            let cy = toInteger ry * 16
+                lo = toInteger rz * 32
+            found <- okOf (columnAt svc lease (column cx cy) (range lo (lo + 2))) >>= await svc >>= expectSuccess
             columnRevision found `shouldBe` Revision revision
             [ (cz, cellMaterial (runCell run)) | run ← columnAnswerRuns found, cz ← [zRangeLo (runRange run) .. zRangeHi (runRange run) - 1]]
-              `shouldBe` [(cz, expectedMaterial terrainSpec done (cx, cy, cz)) | cz ← [lo .. lo + 31]]
+              `shouldBe` [(cz, expectedMaterial terrainSpec done (cx, cy, cz)) | cz ← [lo, lo + 1]]
           removeAndCheck revision (n, at) = do
             let (x, y, z) = at
                 earlier = take n removals
@@ -58,16 +60,11 @@ spec = describe "Offload and reload" $ do
             -- Removing a cell that was air already (the authored gap) changes nothing.
             let revision' = if wasSolid then revision + 1 else revision
             (removeChangedFlag answer, removeRevision answer) `shouldBe` (wasSolid, Revision revision')
-            -- The removed cell's whole column in its region agrees with the independent model.
-            let (r, _) = decomposeTile (tile x y z)
-            checkColumn done revision' r (x, y)
+            -- Every cell of every touched region agrees with the independent model (as on the baseline;
+            -- every removal is one of these cells).
+            forM_ touched (checkRegion done revision')
             pure revision'
       foldM_ removeAndCheck 0 (zip [0 ..] removals)
-      -- After every removal and the evictions between them: every cell of every touched region agrees
-      -- with the independent model, read back one column at a time from the store.
-      let final = length [() | (n, at) ← zip [0 ..] removals, expectedMaterial terrainSpec (take n removals) at /= Nothing]
-      forM_ touched $ \r@(RegionCoord rx ry _) → forM_ [(toInteger rx * 16 + lx, toInteger ry * 16 + ly) | lx ← [0 .. 15], ly ← [0 .. 15]] $ \xy →
-        checkColumn removals (fromIntegral final) r xy
       model <- inspectModel svc
       -- Eviction happened: fewer regions are resident than were touched.
       length (modelRegions model) `shouldSatisfy` (< length touched)

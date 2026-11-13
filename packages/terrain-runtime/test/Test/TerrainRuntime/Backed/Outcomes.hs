@@ -11,6 +11,7 @@ module Test.TerrainRuntime.Backed.Outcomes (spec) where
 
 import qualified Data.ByteString.Char8 as BC
 import Data.Text (Text)
+import qualified Hetoimasia.Terrain.Discovery as D
 import Hetoimasia.Terrain.Runtime.Backed.Backend
 import Hetoimasia.Terrain.Runtime.Backed.Fault
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Service
@@ -51,6 +52,7 @@ data Expect
   | EReplan
   | EWait
   | EClosing
+  | EExhausted
   | EDefect
   deriving stock (Eq, Show)
 
@@ -64,6 +66,7 @@ expectOf = \case
   HandleReplan → EReplan
   HandleWaitReclaim _ _ → EWait
   HandleClosing → EClosing
+  HandleExhausted → EExhausted
   HandleDefect _ → EDefect
 
 -- | The kinds, in the order every row below lists its expectations.
@@ -235,6 +238,9 @@ spec = describe "table (B): every outcome of the storage backend and the store p
     mapM_ (\(label, refusal, expected) → (label, expectOf (classifyPlanRefusal refusal)) `shouldBe` (label, expected)) rows
     -- a refusal of the candidate itself is never a domain result on a valid store
     expectOf (classifyPlanRefusal (P.Invalid P.InconsistentRevisions)) `shouldBe` EDefect
+    -- except a revision, the version or #661's authority reaching its last value: exhaustion, never a wrap
+    map (expectOf . classifyPlanRefusal . P.Invalid) [P.RevisionArithmetic, P.VersionArithmetic, P.DiscoveryRefusal D.AuthorityOverflow]
+      `shouldBe` replicate 3 EExhausted
   it "decides every refusal to admit a planned transaction" $
     mapM_
       (\(label, refusal, expected) → (label, expectOf (classifyAdmitRefusal refusal)) `shouldBe` (label, expected))

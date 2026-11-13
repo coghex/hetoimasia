@@ -24,7 +24,6 @@ import Control.Concurrent.STM
 import Control.Monad (forM_, when)
 import Hetoimasia.Terrain.Runtime
 import Hetoimasia.Terrain.Runtime.Settlement
-import Hetoimasia.Terrain.Runtime.Store.Admission (Ledger (..))
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Native (NativeOp (..))
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Types (Errno (..))
 import Test.Hspec
@@ -41,11 +40,10 @@ isWrite, isRead ∷ NativeOp → Bool
 isWrite = \case OpWriteAt {} → True; _ → False
 isRead = \case OpReadAt {} → True; _ → False
 
--- | The edit bank holds nothing of the owner's: no pin, no transaction, no staging.
+-- | The edit bank holds nothing of the owner's (no pin, no transaction, no staging): only the
+-- storage service's own records, with no task of the owner and no job of the backend.
 bankAtRest ∷ Service → IO ()
-bankAtRest svc = waitFor $ do
-  bank ← inspectEditBankSTM svc
-  check (lgStagingForeground bank == 0 && lgControlReserved bank == 0 && lgCachePinned bank == 0)
+bankAtRest svc = waitFor (backedAtRestSTM svc >>= check)
 
 oracle ∷ Service → IO ()
 oracle svc = do

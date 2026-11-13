@@ -11,7 +11,7 @@ module Test.TerrainRuntime.Backed.Compile (spec) where
 
 import qualified Hetoimasia.Terrain.Connectivity as C
 import Hetoimasia.Terrain.Runtime
-import Hetoimasia.Terrain.Source (defaultSourceLimits, mkSource)
+import Hetoimasia.Terrain.Source (CellSpec (..), PatchSpec (..), SourceSpec (..), defaultSourceLimits, mkSource)
 import Test.Hspec
 import Test.TerrainRuntime.Fixtures
 
@@ -56,4 +56,19 @@ spec = describe "The compile account" $ do
           limit `shouldBe` fromInteger (exact - 1)
           needed `shouldSatisfy` (> limit)
         other → expectationFailure ("expected source_complexity, got " <> show other)
+      settleChecks svc
+
+  it "refuses the baseline's 2,048-level alternating column as source_complexity at the compiled-result bound (16,777,224 against 16,777,216), publishes nothing and releases the name" $
+    withService defaultConfig $ \svc → do
+      client ← okOf (registerClient svc)
+      -- the fixture the Lua column examples used before #665: 1,024 one-level soil patches two levels apart in air
+      let alternating = SourceSpec ["soil"] [] [PatchSpec 0 0 (2 * k) (2 * k + 1) (SpecSolid "soil" 0) | k ← [0 .. 1023]]
+      outcome ← okOf (openArena svc client "alt" alternating) >>= await svc
+      case outcome of
+        Left (Failed (StorageFailed (FaultComplexity resource needed limit))) →
+          (resource, needed, limit) `shouldBe` ("ResultBytes", 16777224, 16777216)
+        other → expectationFailure ("expected source_complexity, got " <> show other)
+      -- nothing was published, and the name is free again
+      lease ← okOf (openArena svc client "alt" soilOverStone) >>= await svc >>= expectSuccess
+      _ ← readCell svc lease (tile 0 0 0)
       settleChecks svc

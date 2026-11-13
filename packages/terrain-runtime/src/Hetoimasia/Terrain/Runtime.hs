@@ -115,6 +115,7 @@ module Hetoimasia.Terrain.Runtime
     -- * Inspection
   , inspectInvariants
   , inspectBacked
+  , backedAtRestSTM
   , inspectModel
   , inspectModelSTM
   , inspectDefects
@@ -181,6 +182,7 @@ import Control.Concurrent.STM
 import Control.Exception (Exception, ExceptionWithContext, SomeException, mask, rethrowIO, throwIO, try, tryWithContext)
 import Control.Monad (when)
 import qualified Data.Map.Strict as Map
+import Data.Maybe (isNothing)
 import Data.Text (Text)
 import Data.Unique (newUnique)
 import Hetoimasia.Foundation.Log (Logger)
@@ -551,11 +553,28 @@ inspectInvariants svc = invariants (serviceConfig svc) <$> readTVarIO (serviceSt
 -- edit bank): empty when they agree. Read-only, for verification; see
 -- 'Hetoimasia.Terrain.Runtime.Internal.Backed.backedInvariants'.
 inspectBacked ∷ Service → IO [String]
-inspectBacked svc = atomically $ do
+inspectBacked svc = atomically (inspectBackedSTM svc)
+
+-- | Whether the owner's backed work is at rest: no open, pinned read, mutating transaction or
+-- closing file of the owner's, no job of the storage service, and every row of 'inspectBacked'
+-- holds (so the edit bank holds only the storage service's own records). Read-only, for
+-- verification: a test waits on it instead of on a figure of the bank.
+backedAtRestSTM ∷ Service → STM Bool
+backedAtRestSTM svc = do
+  st <- readSt svc
+  sn <- Storage.snapshotOf (serviceStorage svc)
+  problems <- inspectBackedSTM svc
+  pure $
+    Map.null (stateOpens st) && Map.null (stateGathers st) && isNothing (stateSlot st) && Map.null (stateClosing st)
+      && null (Storage.snJobs sn)
+      && null problems
+
+inspectBackedSTM ∷ Service → STM [String]
+inspectBackedSTM svc = do
   st <- readSt svc
   adm <- readTVar (serviceEditBank svc)
-  view <- Storage.serviceView (serviceStorage svc)
-  pure (backedInvariants st adm (serviceCompileBank svc) (Storage.svBackings view) (Storage.svRecords view))
+  sn <- Storage.snapshotOf (serviceStorage svc)
+  pure (backedInvariants st adm (serviceCompileBank svc) sn)
 
 -- | Whether the removal this request has staged would change content: @Just True@ for a staged removal that will advance the
 -- arena's revision by one, @Just False@ for a staged removal of air, which commits as unchanged at the revision it finds, and

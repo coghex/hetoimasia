@@ -97,6 +97,9 @@ import Hetoimasia.Terrain.Runtime.Internal.Core
 import Hetoimasia.Terrain.Runtime.Internal.Types hiding (OwnerPhase (..))
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Service
   ( Backing
+  , Snapshot (..)
+  , backingRecordBytes
+  , keptEntryBytes
   , OpenSpec (..)
   , PreparedGrowth
   , ReadMode
@@ -347,6 +350,7 @@ stepOpen svc ops rid = do
       HandleSerialize → failOpen held "an open was serialised"
       HandleReplan → failOpen held "an open answered replan"
       HandleWaitReclaim _ _ → failOpen held "an open answered reclamation"
+      HandleExhausted → failOpen held "an open answered an exhausted revision"
 
 -- | End an open's task: its compile charge and the session's compilation return.
 dropOpen ∷ Service → RequestId → Word64 → STM ()
@@ -678,9 +682,12 @@ closeDrained svc aid = do
 --   never above the account.
 -- * The storage service holds a backing for every live and closing arena and every reserved open,
 --   and at most one more for each open whose reservation has finished untaken.
--- * With no task of the owner and no job of the backend, the edit bank holds nothing.
-backedInvariants ∷ St → Admission → Word64 → Int → Int → [String]
-backedInvariants st adm compileBank backings records =
+-- * With no task of the owner and no job of the backend, the edit bank's cache and staging hold
+--   nothing, and its control holds exactly the storage service's own records: a backing record
+--   for each backing, charged closing record, held close and running open, and a kept-failure
+--   entry for each kept failure (#663's accounting, read from its snapshot).
+backedInvariants ∷ St → Admission → Word64 → Snapshot → [String]
+backedInvariants st adm compileBank sn =
   [ "arena " <> show aid <> ": the model's revision " <> show (R.arenaRevision info) <> " is not the store's " <> show (arenaRevision arena)
   | (aid, arena) ← Map.toList (stateArenas st)
   , info ← R.modelArenas (stateModel st)
@@ -716,11 +723,12 @@ backedInvariants st adm compileBank backings records =
     <> [ "the storage service holds " <> show backings <> " backings for " <> show wanted <> " to " <> show (wanted + reserving)
        | backings < wanted || backings > wanted + reserving
        ]
-    <> [ "the edit bank holds " <> show (A.ledgers adm) <> " with no task and no job"
+    <> [ "the edit bank holds " <> show (A.ledgers adm) <> " with no task and no job; the storage service's records need " <> show storageControl <> " of control"
        | idle
-       , records == 0
+       , null (snJobs sn)
        , let lg = A.ledgers adm
-       , A.lgCacheBacked lg + A.lgCacheRamOnly lg + A.lgCachePinned lg + A.lgStagingForeground lg + A.lgStagingCamera lg + A.lgControlReserved lg /= 0
+       , A.lgCacheBacked lg + A.lgCacheRamOnly lg + A.lgCachePinned lg + A.lgStagingForeground lg + A.lgStagingCamera lg /= 0
+           || A.lgControlReserved lg /= storageControl
        ]
   where
     slotTxnId t = case slotRun t of
@@ -743,4 +751,8 @@ backedInvariants st adm compileBank backings records =
       OpenReserving {} → True
       OpenUnwinding {} → True
       _ → False
+    backings = length (snBackings sn)
+    storageControl =
+      fromIntegral (backings + snClosingCharged sn + length (snHeld sn) + length (snOpening sn)) * backingRecordBytes
+        + fromIntegral (snEvidence sn) * keptEntryBytes
     idle = Map.null (stateGathers st) && maybe True (const False) (stateSlot st) && Map.null (stateOpens st)

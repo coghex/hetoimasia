@@ -28,6 +28,8 @@
 -- |                     | and a maintenance transaction                         |
 -- | 'HandleClosing'     | the backing or service is going away: the work ends   |
 -- |                     | as an arena closure                                   |
+-- | 'HandleExhausted'   | a revision or the version would wrap: no further      |
+-- |                     | history for the arena, never a wrapped number         |
 -- | 'HandleDefect'      | an invariant, accounting, worker or provider failure: |
 -- |                     | a supervised host failure, never a domain result      |
 -- +---------------------+-------------------------------------------------------+
@@ -81,7 +83,9 @@ import Hetoimasia.Terrain.Runtime.Storage.Internal.Types
   )
 import Hetoimasia.Terrain.Runtime.Store.Internal.Format (PageNo)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Model (AdmitRefusal (..), Condition (..), WriteOutcome (..))
+import qualified Hetoimasia.Terrain.Discovery as D
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan (CapacityWhy (..), PlanRefusal (..))
+import qualified Hetoimasia.Terrain.Runtime.Store.Internal.Plan as Plan
 import Hetoimasia.Terrain.Runtime.Store.Internal.Protocol (Supply (..))
 
 -- | Whether the owner is retiring the arena or the service. A backing that is closed
@@ -107,6 +111,9 @@ data Handling
   | -- | The retirement entries and the retired pages outstanding.
     HandleWaitReclaim !Int !Int
   | HandleClosing
+  | -- | A revision or the store's version would wrap: the arena takes no further history (its
+    -- removals are refused at admission, its internal work stops); never a wrapped number.
+    HandleExhausted
   | HandleDefect !Text
   deriving stock (Eq, Show)
 
@@ -191,7 +198,15 @@ invalidRequest kind why = case why of
 classifyPlanRefusal ∷ PlanRefusal → Handling
 classifyPlanRefusal = \case
   Stale _ → HandleReplan
-  Invalid why → defect ("the planner refused a valid candidate: " <> show why)
+  Invalid why → case why of
+    Plan.RevisionArithmetic → HandleExhausted
+    Plan.VersionArithmetic → HandleExhausted
+    Plan.DiscoveryRefusal D.AuthorityOverflow → HandleExhausted
+    Plan.DiscoveryRefusal other → defect ("the planner refused a valid candidate: " <> show other)
+    Plan.ForeignArena → defect "the planner refused a valid candidate: ForeignArena"
+    Plan.InconsistentRevisions → defect "the planner refused a valid candidate: InconsistentRevisions"
+    Plan.TooManyUpdates n → defect ("the planner refused a valid candidate: TooManyUpdates " <> show n)
+    Plan.MalformedWrite key → defect ("the planner refused a valid candidate: MalformedWrite " <> show key)
   Capacity why → case why of
     DiskFull needed available protected → HandlePause CondCapacity (FaultFull (AllowanceExhausted needed available protected))
     TreeTooTall tree → HandlePause CondCapacity (FaultFull (TreeBeyondFormat tree))

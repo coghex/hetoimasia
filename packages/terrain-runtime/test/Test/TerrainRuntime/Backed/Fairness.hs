@@ -38,8 +38,11 @@ spec = describe "The mutation slot's fairness" $
         _ ← okOf (removeWith svc (hostEndpoint svc Nothing host) lease (tile x y z) Nothing)
         pure host
       forM_ hosts $ \host → waitFor (readTVar (hostReady host) >>= \n → check (n >= 1))
-      atomically (writeTVar grants [])
-      forM_ hosts grant
+      -- every host becomes eligible in ONE transaction: from then on all nine explicit removals wait at
+      -- once (granting them one by one would let internal work take the slot legitimately in between)
+      atomically $ do
+        writeTVar grants []
+        forM_ hosts $ \host → writeTVar (hostEligible host) True
       forM_ hosts $ \host → waitFor (readTVar (hostSettled host) >>= \s → check (not (null s)))
       order ← readTVarIO grants
       -- every removal changed content, in admission order: their committed revisions increase with it

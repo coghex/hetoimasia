@@ -107,6 +107,7 @@ import Hetoimasia.Terrain.Cell
 import Hetoimasia.Terrain.Changes (Changes, emptyChanges)
 import Hetoimasia.Terrain.Coordinate
 import qualified Hetoimasia.Terrain.Connectivity as C
+import qualified Hetoimasia.Terrain.Discovery as D
 import qualified Hetoimasia.Terrain.Query as Q
 import qualified Hetoimasia.Terrain.Runtime.Store.Internal.Admission as A
 import Hetoimasia.Terrain.Runtime.Store.Internal.Admission (Admission, Grant)
@@ -604,9 +605,12 @@ decide svc st rid = \case
     stale aid arena = \case
       Just (Precondition pa pr) → pa /= aid || pr /= arenaRevision arena
       Nothing → False
+    -- each pending removal can advance the content, knowledge and store revisions by one: a removal
+    -- that could need the last value of any of them is refused before any work
     revisionExhausted aid arena =
-      let Revision n = arenaRevision arena
-       in toInteger n + toInteger (pendingEdits aid st) + 1 >= toInteger (maxBound ∷ Word64)
+      let auth = arenaAuthority arena
+          near (Revision n) = toInteger n + toInteger (pendingEdits aid st) + 1 >= toInteger (maxBound ∷ Word64)
+       in near (D.authContent auth) || near (D.authKnowledge auth) || near (D.authStore auth)
     -- Growth and retry are the creator's: an owner lease of a live arena. Their size
     -- rules are the store's own pure proposal, decided here before anything is admitted.
     creatorCommand lease cmd = case liveArena lease of
