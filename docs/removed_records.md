@@ -10,6 +10,9 @@ Read a removed file with `git show <commit>:<path>`, for example
 
 ## `docs/archive/` — last present at `19bc8ade` (removed 2026-11-13)
 
+Comments in two Cabal files, `hetoimasia_vma.cpp` and a few Haskell sources still
+name some of these paths; they refer to the removed files.
+
 Designs, all delivered:
 
 | Path under `docs/archive/` | What it was |
@@ -54,3 +57,28 @@ Other history:
 | `history/memory_before_2026-09-17.md`, `history/memory_before_2026-10-21.md` | Earlier `MEMORY.md` snapshots |
 | `history/engine_foundation_design_before_2026-09-22.md` | Earlier foundation plan |
 | `history/native_test_approval_issue_draft.md` | The approved draft of #124 |
+
+## Project review — last present at `153d23c4` (removed 2026-11-13)
+
+`docs/project_review/` (the ledger and one report per reviewed pull request) and
+`docs/project_review_*.md` (the earlier batch reports and legacy cursor). The
+project-review workflow is retired; the guide (`docs/guide/`) replaced it.
+
+## Guide reports — last present at `a9731e06` (removed 2026-11-13)
+
+Every guide report and coverage file before `2026-11-01T234207Z-ef1b9ad`. The
+guide keeps only its newest report in the tree; what later runs need from the
+older ones is in [guide/earlier.md](guide/earlier.md).
+
+## Evidence of closed issues — last present at `f4e65f49` (removed 2026-11-13)
+
+| Path under `docs/evidence/` | Conclusion |
+| --- | --- |
+| `lfe13-session-teardown.md` | #527, PR #567: eleven review rounds of site audits and sweep tables for the session coordinator's teardown |
+| `lfe18-window-provider.md` | #533: the window provider's native runs on real windows |
+| `lfe20-native-retention-diagnosis.md` | #535, PR #572: the two native `scene retention` failures came from a stale test executable still carrying a negative-control mutation; the committed source never retired a held texture |
+| `lfe23-integrated-qualification.md` | #538: acceptance map of the headless integrated failure and two-instance ownership groups |
+| `latched-supervision-drain-diagnosis.md` | #599: after a latched supervision failure the backend drain cycle is test-side only; the shipped `run` command is not affected |
+| `issue-586-glfwinit-diagnosis.md` | #586, PR #591: GLFW 3.4's Cocoa init calls `[NSApp run]` while the application has not finished launching, and that notification is sent once per process, so a later `glfwInit` in the same process can block; diagnosis and batch runs |
+| `issue-632-ps-fallback-evidence.md` | #632, PR #633: runs of the ps-fallback no-kill cleanup example |
+| `content_native/qualification.md` | #518: native calls and flags of `packages/content`, local and Linux CI |
