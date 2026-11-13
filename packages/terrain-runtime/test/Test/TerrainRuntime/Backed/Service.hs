@@ -152,6 +152,10 @@ spec = describe "The backed terrain service" $ do
         forM_ [1 .. arrivals] $ \k → okOf (cellAt svc lease (tile (fromIntegral k) 12 3))
         let (far, _) = decomposeTile (tile 100 100 0)
         _ ← okOf (setViewDemand svc view lease [RegionDemand far (either (error . show) coverageTile (mkLocalCoord 0 0 0))])
+        -- an attach admitted after them is answered (it reads nothing, so it does not wait for the
+        -- grant): preparation goes in admission order, so a read that could start has started by now
+        other ← okOf (registerClient svc)
+        _ ← okOf (attachArena svc other "main") >>= await svc >>= expectSuccess
         -- none of them has started a read: only the two are at the seam
         atomically (readTVar (H.gReached gate)) `shouldReturn` 2
       -- the two reads return, and the grant comes before any new read starts
