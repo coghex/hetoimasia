@@ -10,6 +10,9 @@ Read a removed file with `git show <commit>:<path>`, for example
 
 ## `docs/archive/` — last present at `19bc8ade` (removed 2026-11-13)
 
+Comments in two Cabal files, `hetoimasia_vma.cpp` and a few Haskell sources still
+name some of these paths; they refer to the removed files.
+
 Designs, all delivered:
 
 | Path under `docs/archive/` | What it was |
@@ -54,3 +57,15 @@ Other history:
 | `history/memory_before_2026-09-17.md`, `history/memory_before_2026-10-21.md` | Earlier `MEMORY.md` snapshots |
 | `history/engine_foundation_design_before_2026-09-22.md` | Earlier foundation plan |
 | `history/native_test_approval_issue_draft.md` | The approved draft of #124 |
+
+## Project review — last present at `153d23c4` (removed 2026-11-13)
+
+`docs/project_review/` (the ledger and one report per reviewed pull request) and
+`docs/project_review_*.md` (the earlier batch reports and legacy cursor). The
+project-review workflow is retired; the guide (`docs/guide/`) replaced it.
+
+## Guide reports — last present at `a9731e06` (removed 2026-11-13)
+
+Every guide report and coverage file before `2026-11-01T234207Z-ef1b9ad`. The
+guide keeps only its newest report in the tree; what later runs need from the
+older ones is in [guide/earlier.md](guide/earlier.md).
