@@ -13,7 +13,7 @@ import Data.IORef (newIORef, readIORef, writeIORef)
 import Control.Concurrent.MVar
 import Control.Concurrent.STM
 import Control.Exception (ErrorCall (..), ExceptionWithContext (..), SomeAsyncException (..), SomeException, fromException, throwIO, toException, tryWithContext)
-import Control.Monad (forM_, void, when)
+import Control.Monad (forM_, unless, void, when)
 import qualified Data.ByteString.Char8 as BC
 import Data.List (intercalate, isInfixOf)
 import Data.Maybe (isJust, isNothing)
@@ -44,7 +44,36 @@ mib = 1024 * 1024
 h0 :: H
 h0 = newStoreH smallSpec
 
+-- | The stages of an open AFTER the allocation (the file exists, the reservation was attempted): the name, the rules that make the stage
+-- fail, whether it is a cancellation (the registration is refused), the bytes the open observed (0: none, or at most the allowance), and
+-- whether it is an exception (a defect of the job).
+openStages :: [(String, Probe -> IO (), Bool, Word64, Bool)]
+openStages =
+  [ ("the length cannot be established", \p -> addRule p 1 (== OpSetFileLength (payloadBytes (hCfg h0))) (FailWith eio), False, 0, False)
+  , ("the verification fails", \p -> addRuleAfter p 2 1 isStatOp (FailWith eio), False, 0, False)
+  , ("the headroom after the allocation is gone", \p -> addRule p 1 (== OpStatFilesystem) (FreeBytesAre (cfgAllowanceBytes (hCfg h0) + minHeadroomBytes)) >> addRuleAfter p 2 1 isStatOp (OverAllocated (budgetBytes (hCfg h0) + 4096)), False, 0, False)
+  , ("the allocation does not fit the allowance", \p -> addRuleAfter p 2 1 isStatOp (OverAllocated (budgetBytes (hCfg h0) + 1)), False, payloadBytes (hCfg h0) + budgetBytes (hCfg h0) + 1, False)
+  , ("the registration is cancelled", \_ -> pure (), True, payloadBytes (hCfg h0), False)
+  , ("an exception from the length", \p -> addRule p 1 (== OpSetFileLength (payloadBytes (hCfg h0))) Throw, False, 0, True)
+  ]
+  where isStatOp op = op == OpStatFile
+
+-- | The cleanup close that follows: the name, the rule, and whether the close is held under a fact (an errno where the platform has not
+-- established that the descriptor was released; any raise).
+openCloses :: [(String, Probe -> IO (), CloseFact -> Bool)]
+openCloses =
+  [ ("an errno", \p -> addRule p 1 (== OpCloseFile) (FailWith eio), \f -> f == CloseNotEstablished)
+  , ("a raise in the native call's wrapper", \p -> addRule p 1 (== OpCloseFile) Throw, const True)
+  , ("a raise in the before-hook", \p -> addBeforeRule p 1 (== OpCloseFile) Throw, const True)
+  ]
+
 data CloseInj = CInjErrno | CInjRaise | CInjBefore
+
+-- | THE PENDING CHARGE COVERS WHAT WAS OBSERVED (round 8): a growth whose allocation the platform reported 10 MiB over the new
+-- allowance's payload, and whose rollback then fails, leaves a pending charge of EVERYTHING the file holds beyond the committed
+-- reservation (not the nominal extra): the extra payload plus the 10 MiB, less the 64 MiB already committed.
+overPending :: Word64
+overPending = payloadBytes (hCfg h0) + 10 * mib
 
 eio :: Errno
 eio = let C.Errno c = C.eIO in Errno (fromIntegral c)
@@ -53,8 +82,8 @@ eio = let C.Errno c = C.eIO in Errno (fromIntegral c)
 -- The checker
 
 -- | Every way the state can be wrong, as text; empty when every invariant holds.
-invariantProblems :: Snapshot -> A.Ledger -> [Int] -> [String]
-invariantProblems sn ledger fds = concat
+invariantProblems :: Snapshot -> A.Ledger -> [Int] -> [(Int, Word64, Word64)] -> [String]
+invariantProblems sn ledger fds phys = concat
   [ [ "backing " <> show (bsId b) <> ": growth slot " <> show (bsSlot b) <> " but " <> show (length (liveOf b isGrow)) <> " live growth jobs"
     | b <- snBackings sn, (bsSlot b == SlotRunning) /= (length (liveOf b isGrow) == 1) || length (liveOf b isGrow) > 1 ]
   , [ "backing " <> show (bsId b) <> ": slot " <> show (bsSlot b) <> " but " <> show (length (liveOf b isRelease)) <> " live release jobs"
@@ -78,8 +107,17 @@ invariantProblems sn ledger fds = concat
   -- extra still held), and a volume's reserved figure is never less than what its files occupy
   , [ "backing " <> show (bsId b) <> " occupies " <> show (bsAllocated b) <> " but is reserved for " <> show (bsReserved b) <> " plus " <> show (maybe 0 id (bsPending b))
     | b <- snBackings sn <> snClosingRecs sn, bsAllocated b > bsReserved b + maybe 0 id (bsPending b) ]
-  , [ "volume " <> show v <> " is reserved " <> show r <> " but its files occupy " <> show phys
-    | (v, r) <- Map.toList (snReserved sn), let phys = sum [bsAllocated b | b <- snBackings sn <> snClosingRecs sn, bsVolume b == v], r < phys ]
+  , [ "volume " <> show v <> " is reserved " <> show r <> " but its files occupy " <> show onDisk
+    | (v, r) <- Map.toList (snReserved sn), let onDisk = sum [bsAllocated b | b <- snBackings sn <> snClosingRecs sn, bsVolume b == v], r < onDisk ]
+  -- THE ORACLE OF PHYSICAL TRUTH (round 8): the service never counts less than the descriptors it may hold, and every descriptor the
+  -- adapter still holds open is named by exactly ONE record. It is independent of the service's own bookkeeping: it reads what
+  -- the adapter physically holds and last reported. It applies when no worker is inside a step (a step in progress is the window
+  -- between an effect and the record that counts it, which the presecured charge and the opening record exist to close).
+  , [ "descriptor " <> show fd <> " is open and named by " <> show (length named) <> " records"
+    | snRunning sn == 0, (fd, _, _) <- phys, let named = [() | n <- liveFds, n == fd], let heldNames = [() | n <- map hsFd (snHeld sn), n == fd]
+    , not (length named == 1 || (null named && length heldNames == 1)) ]
+  , [ "volume " <> show v <> " counts " <> show (Map.findWithDefault 0 v (snReserved sn)) <> " but the descriptors open on it hold " <> show held
+    | snRunning sn == 0, v <- Map.keys (Map.fromList [(d, ()) | (_, d, _) <- phys]), let held = sum [h | (_, d, h) <- phys, d == v], Map.findWithDefault 0 v (snReserved sn) < held ]
   , [ "admission is open but " <> show (snWorkers sn) <> " workers are alive"
     | snAdmissionOpen sn, snWorkers sn /= 2 ]
   -- a running job is a worker's: more running jobs than workers alive (and so any running job with no worker) is a
@@ -114,7 +152,11 @@ invariantProblems sn ledger fds = concat
     -- EVERY closing record pays, whether its native close has returned or not: a reporting record keeps the grant of the
     -- backing it was until the transaction that deletes it
     -- (a held close's reporting record carries none: its grant is the held record's, charged to the service's end)
-    controlNeed = sum (map jsCharge (snJobs sn)) + fromIntegral (nBack + snClosingCharged sn + length (snHeld sn)) * backingRecordBytes + fromIntegral (snEvidence sn) * keptEntryBytes
+    controlNeed = sum (map jsCharge (snJobs sn)) + fromIntegral (nBack + snClosingCharged sn + length (snHeld sn) + length (snOpening sn)) * backingRecordBytes + fromIntegral (snEvidence sn) * keptEntryBytes
+    -- every record that names a descriptor: a backing, a closing record whose native close has not returned, a running open, a held close
+    -- (a held close's descriptor NUMBER may since have been reused by a later file, so a held record names a descriptor only when no live
+    -- record does)
+    liveFds = map bsFd (snBackings sn <> snClosingRecs sn) <> [f | (_, Just f) <- snOpening sn]
     stagingNeed = sum [transferBufferBytes n | j <- snJobs sn, jsPhase j == 1, KRead n <- [jsKind j]]
     cacheNeed = sum [fromIntegral n * resultPageBytes | j <- snJobs sn, KRead n <- [jsKind j], jsPhase j == 1 || jsHoldsResult j]
     nPhase p = length [() | j <- snJobs sn, jsPhase j == p]
@@ -130,7 +172,8 @@ checkInvariantsHolding :: Word64 -> Env -> IO ()
 checkInvariantsHolding held env = do
   (sn, ledger) <- atomically ((,) <$> snapshotOf (envSvc env) <*> (A.ledgers <$> readTVar (envAdmission env)))
   fds <- openFds (envProbe env)
-  invariantProblems sn ledger {A.lgControlReserved = A.lgControlReserved ledger - held} fds `shouldBe` []
+  phys <- physicalHoldings (envProbe env)
+  invariantProblems sn ledger {A.lgControlReserved = A.lgControlReserved ledger - held} fds phys `shouldBe` []
 
 -- ---------------------------------------------------------------------------
 -- The lifecycle matrix
@@ -467,7 +510,7 @@ spec = describe "Storage backend: the lifecycle matrix" $ do
         if holds
           then do
             -- the reservation is STILL COUNTED, in a record of its own, charged beside the evidence
-            snHeld sn `shouldBe` [HeldSnap bid0 vol allowance]
+            map (\h -> (hsId h, hsVolume h, hsBytes h)) (snHeld sn) `shouldBe` [(bid0, vol, allowance)]
             snReserved sn `shouldBe` Map.fromList [(vol, allowance)]
             controlNow `shouldReturn` (backingRecordBytes + keptEntryBytes)
           else do
@@ -525,7 +568,7 @@ spec = describe "Storage backend: the lifecycle matrix" $ do
           cycles k inner = do
             b <- openBacking env (identOf (fromIntegral k) (fromIntegral (50 + k))) (hCfg h0)
             withOwnedThreadOpening (atomically (writeTVar gate True)) (void (closeBacking svc b)) $ \_ _ -> do
-              bounded (atomically (do sn <- snapshotOf svc; check (snClosing sn == room - k + 1 && snEvidence sn == 0)))
+              bounded (atomically (do sn <- snapshotOf svc; check (snClosing sn == room - k + 1 && snEvidence sn == 0 && null (snClosingRecs sn))))
               cycles (k - 1) inner
       cycles room $ do
         sn <- atomically (snapshotOf svc)
@@ -609,6 +652,63 @@ spec = describe "Storage backend: the lifecycle matrix" $ do
       ctlBegin ctl
       ctlResult ctl >>= either (\(ExceptionWithContext ctx _) -> length (cleanupFailuresInContext ctx) `shouldBe` room) (\_ -> expectationFailure "the kept failures of the closes were lost")
       control `shouldReturn` 0
+
+  -- ---- round 8, finding 1: THE FAILED OPEN'S UNWIND MAKES THE SAME ONE CLASSIFIED CLOSE. A failed or cancelled open AFTER the allocation (each later
+  -- stage: the length, the verification, the headroom after the allocation, the fit, a registration cancelled, an exception) x a cleanup close
+  -- {an errno, a raise in the native call's wrapper, a raise in the seam's before-hook} x both platform facts. The charge was secured BEFORE the
+  -- allocation; where the close is held (an errno where it is not established, any raise) it moves to a held record with the volume and the
+  -- bytes the file may occupy, and stays, charged, after the failed outcome has been taken and its job charge released, to the service's end; one native
+  -- close only; labelled evidence; where it is not held, everything is released.
+  forM_ [(fact, stg, cl) | fact <- [CloseReleasesOnFailure, CloseNotEstablished], stg <- openStages, cl <- openCloses] $ \(fact, (stgName, stgSetup, stgCancels, stgBytes, _), (clName, clSetup, clHeldBy)) ->
+    it ("keeps a failed open's allocation counted when its cleanup close is held (" <> show fact <> "; " <> stgName <> "; the close: " <> clName <> ")") $ do
+      let cfg = hCfg h0
+          allowance = cfgAllowanceBytes cfg
+          holds = clHeldBy fact
+          oneOf = if holds then 1 else 0 :: Int
+      let body env = do
+            let svc = envSvc env
+                probe = envProbe env
+                controlNow = A.lgControlReserved . A.ledgers <$> readTVarIO (envAdmission env)
+            stgSetup probe
+            clSetup probe
+            gate <- if stgCancels then Just <$> addGateAfter probe 2 (\op -> op == OpStatFile) else pure Nothing
+            ticket <- submitOpen svc ExplicitWork (OpenSpec (BC.pack (envDir env)) ident cfg) >>= either (fail . show) pure
+            forM_ gate $ \g -> awaitReached g 1 >> void (cancelTicket svc ticket) >> openGate g
+            o <- awaitOutcome env ticket
+            case o of
+              Opened {} -> expectationFailure ("the open was expected to fail: " <> show o)
+              _ -> pure ()
+            -- the outcome has been TAKEN: the job's own charge is gone
+            sn <- atomically (snapshotOf svc)
+            (length (snBackings sn), null (snJobs sn), null (snOpening sn)) `shouldBe` (0, True, True)
+            length (snHeld sn) `shouldBe` oneOf
+            let observedBytes = max allowance stgBytes
+            if holds
+              then do
+                -- the reservation stays counted: the volume, the bytes the file may occupy, a control charge to the service's end
+                map hsBytes (snHeld sn) `shouldBe` [observedBytes]
+                sum (Map.elems (snReserved sn)) `shouldBe` observedBytes
+                controlNow `shouldReturn` (backingRecordBytes + keptEntryBytes)
+              else do
+                snReserved sn `shouldBe` Map.empty
+                controlNow `shouldReturn` 0
+            checkInvariants env
+            -- the close was made once and never retried
+            evs <- events probe
+            length [() | OpCloseFile <- evs] `shouldBe` 1
+            -- a before-hook raise never made the close: the descriptor is still open, named by the held record, and the example closes it
+            leftOpen <- openFds probe
+            when (holds && clName == "a raise in the before-hook") $ do
+              length leftOpen `shouldBe` 1
+              fdHandles probe >>= mapM_ (nativeClose posixNative) . take 1
+            unless (holds && clName == "a raise in the before-hook") (leftOpen `shouldBe` [])
+      -- a held close is kept as labelled evidence whoever takes the outcome: the scope ends with it, and the service's end releases the charge
+      -- and the volume's figure (the harness checks every account is back at zero)
+      if holds
+        then do
+          shown <- withEnvEndingWithKeptFailureWith defaultOptions {eoCloseFact = fact} body
+          ("reservation held" `isInfixOf` shown) `shouldBe` True
+        else withEnvWith defaultOptions {eoCloseFact = fact} body
 
   forM_ [("discardTicket of a finished open", \svc t _ -> discardTicket svc t), ("closeBacking", \svc _ b -> void (closeBacking svc b))] $ \(name, close) ->
     it ("keeps a failing close whose caller is cancelled while the native close is held (" <> name <> "): the cancellation is pending, delivered after, and the failure is kept") $
@@ -1100,7 +1200,11 @@ runCleanupCell kind phase = withControlledService $ \env ctl -> do
       if phase == PhBorrowed
         then do
           withOutcome svc t pure >>= (`shouldSatisfy` \r -> case r of Just (Failed _ notes) -> not (null notes); _ -> False)
-          finish >>= either (\(ExceptionWithContext _ e) -> expectationFailure ("a taken outcome left evidence at the end: " <> show (e :: SomeException))) pure
+          if kind == KindOpen
+            -- the open's cleanup close RAISED: a raise is a HELD close (round 8), kept by the service whoever takes the outcome: the
+            -- reservation stays counted and the service ends with the labelled failure
+            then finish >>= either (\(ExceptionWithContext ctx _) -> length (cleanupFailuresInContext ctx) `shouldSatisfy` (>= 1)) (\_ -> expectationFailure "a held close was kept as evidence and must end the scope with it")
+            else finish >>= either (\(ExceptionWithContext _ e) -> expectationFailure ("a taken outcome left evidence at the end: " <> show (e :: SomeException))) pure
         else do
           r <- finish
           case r of
@@ -1313,12 +1417,12 @@ chargeEvidence k = case k of
     addRuleAfter (envProbe env) 1 1 (== OpStatFile) (OverAllocated (10 * mib))
     addRule (envProbe env) 1 (== OpSetFileLength (payloadBytes (hCfg h0))) (FailWith eio)
     void (submitGrowth (envSvc env) b (64 * mib) (128 * mib) >>= either (fail . show) pure >>= awaitOutcome env)
-    reservedOf env `shouldReturn` (128 * mib)
+    reservedOf env `shouldReturn` (64 * mib + overPending)
     -- the retry's set-length is held: DURING it the extra is still counted
     g <- addGate (envProbe env) (== OpSetFileLength (payloadBytes (hCfg h0)))
     t <- submitReleasePending (envSvc env) b >>= either (fail . show) pure
     awaitReached g 1
-    reservedOf env `shouldReturn` (128 * mib)
+    reservedOf env `shouldReturn` (64 * mib + overPending)
     checkInvariants env
     openGate g
     void (awaitOutcome env t)

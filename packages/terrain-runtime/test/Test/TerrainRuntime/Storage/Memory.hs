@@ -235,7 +235,7 @@ bigWrite = bigWriteAt 0
 -- record whose native close has not returned; or a REPORTING closing record, which keeps nothing but the grant. Each
 -- instance with its volume's node in the reserved-figure ledger (one per instance: conservative, the service shares
 -- a volume's node) and the admission's entry for its grant.
-data HeldKind = HeldBacking | HeldNative | HeldReporting | HeldHeldClose
+data HeldKind = HeldBacking | HeldNative | HeldReporting | HeldHeldClose | HeldOpening
 
 closingRow ∷ Env → HeldKind → Int → IO Double
 closingRow env kind n = do
@@ -252,7 +252,9 @@ closingRow env kind n = do
     HeldReporting → holdLive (keyed (\g _ → CrReporting (Just g)), ledger, adm) (\(m, l, a) → Map.size m + Map.size l + fromIntegral (A.lgControlReserved (A.ledgers a)) + sum [case c of CrNative _ → 0; CrReporting _ → 1 | c ← Map.elems m])
     -- a HELD close (round 7), measured TOGETHER: its two records (the held record that carries the grant to the service's end, and
     -- the reporting record that carries none until the diagnostics return) and the volume-ledger node, against the ONE charge
-    HeldHeldClose → holdLive (keyed (\g i → Held (fromIntegral i) (fromIntegral i * 3) g), keyed (\_ _ → CrReporting Nothing) ∷ Map.Map Word64 ClosingRec, ledger, adm) (\(m, r, l, a) → Map.size m + Map.size r + Map.size l + fromIntegral (A.lgControlReserved (A.ledgers a)) + sum [fromIntegral (hBytes h) | h ← Map.elems m])
+    -- a RUNNING OPEN's presecured charge (round 8): its map node, the record and the one grant (bounded by the workers: at most two at once)
+    HeldOpening → holdLive (keyed (\g _ → OpenRec g (Just fd)) ∷ Map.Map Word64 OpenRec, ledger, adm) (\(m, l, a) → Map.size m + Map.size l + fromIntegral (A.lgControlReserved (A.ledgers a)))
+    HeldHeldClose → holdLive (keyed (\g i → Held (fromIntegral i) (fromIntegral i * 3) g fd), keyed (\_ _ → CrReporting Nothing) ∷ Map.Map Word64 ClosingRec, ledger, adm) (\(m, r, l, a) → Map.size m + Map.size r + Map.size l + fromIntegral (A.lgControlReserved (A.ledgers a)) + sum [fromIntegral (hBytes h) | h ← Map.elems m])
 
 -- ---------------------------------------------------------------------------
 -- The rows
@@ -506,6 +508,8 @@ spec3 = describe "Storage backend: every retained structure is charged and measu
       row "closing record, reporting (the carried grant, per record)" backingRecordBytes reporting
       heldClose ← sound "held close, both records" 200 (closingRow env HeldHeldClose)
       row "held close: the held record and the reporting record together (one grant, per backing)" backingRecordBytes heldClose
+      opening ← sound "running open's presecured charge" 200 (closingRow env HeldOpening)
+      row "running open: the presecured charge (record, map node and grant, per open)" backingRecordBytes opening
   where
     jobCharge' n = jobRecordBytes + fromIntegral n * writeEntryBytes + writeFailureBytes
     -- the service's end reports the kept failures: this example measures them and ignores that report

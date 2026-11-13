@@ -103,6 +103,7 @@ module Hetoimasia.Terrain.Runtime.Storage.Internal.Service
   , BackingSnap (..)
   , HeldSnap (..)
   , Held (..)
+  , OpenRec (..)
   , SlotTag (..)
   , snapshotOf
   , drainWaitsMessage
@@ -167,7 +168,7 @@ import Data.Foldable (toList)
 import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (fromMaybe, isJust)
+import Data.Maybe (catMaybes, fromMaybe, isJust)
 import Data.Sequence (Seq)
 import qualified Data.Sequence as Seq
 import Data.Set (Set)
@@ -599,6 +600,12 @@ data St = St
   -- possibly still held, with the control grant that paid for the backing's record, until the service ends (the seal releases
   -- them). Owner: the close core (inserts, once per backing); the seal (clears). Readers: the snapshot, the checker.
   -- Bounded by the control account like every record. Lifetime: the service.
+  , stOpening ∷ !(Map Word64 OpenRec)
+  -- ^ THE PRESECURED CHARGE OF A RUNNING OPEN, by job id (round 8). The backing-record grant is taken BEFORE anything is created or
+  -- allocated (a control account under pressure refuses the open before it touches the platform), and it is carried through every
+  -- exit: registered, it becomes the entry's grant; a clean unwind releases it; a HELD unwind (a close that is not established to
+  -- have released the descriptor) moves it to the held record. The job's own finish releases whatever is left (never a leak). The
+  -- record also names the descriptor the open owns, so every open descriptor is named by exactly one record.
   , stEvidence ∷ ![Kept]
   -- ^ Cleanup failures that nobody received (an outcome disposed of undelivered, a close nobody waited for), kept
   -- (at most 'maxKept') for the scope that ends the service.
@@ -633,7 +640,11 @@ data CloseFailure = CloseErrno !Errno | CloseRaised !Text
 
 -- | A close whose reservation stays counted: the volume it is counted on, the bytes (the backing's contribution at the
 -- close: its allowance and any pending extra), and the grant that is charged for the record.
-data Held = Held {hVolume ∷ !Word64, hBytes ∷ !Word64, hGrant ∷ !A.Grant}
+data Held = Held {hVolume ∷ !Word64, hBytes ∷ !Word64, hGrant ∷ !A.Grant, hFd ∷ !Fd}
+
+-- | An open between its start and its registration (or its unwinding): the charge secured for it, and the descriptor it owns once the
+-- native create has returned.
+data OpenRec = OpenRec !A.Grant !(Maybe Fd)
 
 data Kept = Kept !Text !KeptFailure !A.Grant
 
@@ -704,7 +715,7 @@ data StorageCleanupFailure
 instance Exception StorageCleanupFailure
 
 emptySt ∷ St
-emptySt = St Running 1 1 Map.empty Map.empty Map.empty Nothing 0 (Fair 0 0) Set.empty Map.empty Nothing Map.empty Map.empty [] 0 0 Nothing
+emptySt = St Running 1 1 Map.empty Map.empty Map.empty Nothing 0 (Fair 0 0) Set.empty Map.empty Nothing Map.empty Map.empty Map.empty [] 0 0 Nothing
 
 -- | Run a body with the service. The two workers are started in the group the
 -- caller owns; the body runs; then, in the protected boundary and whatever ended
@@ -1377,6 +1388,8 @@ cancelTicket svc t = atomically $ do
 -- transfer's staging, the mutation slot), its result stays until retired.
 finishJob ∷ StorageService → Word64 → Outcome → STM (Maybe Word64)
 finishJob svc jid outcome0 = do
+  -- a presecured open charge that no exit consumed is released with the job: never a leak
+  releaseOpening svc jid
   -- THE SERVICE RETAINS ONLY EVALUATED VALUES: an outcome is stored after a total walk of it (below), so a thunk built
   -- from what the job held (a lazily appended tail holding the staged pages' bytes, for one) is gone before the record
   -- is
@@ -1680,48 +1693,108 @@ data OpenStop = OpenCancelled | OpenFailed !StorageFailure
 -- (the one transaction that registers it), THIS function owns it, on every exit: a typed failure
 -- unwinds explicitly, and an exception (from any native step, the seam included) closes it too,
 -- keeping the cleanup failures beside the primary exception.
+--
+-- THE CHARGE IS SECURED FIRST (round 8): the backing record's control grant is taken before anything is created or allocated
+-- ('stOpening'), so a control account under pressure refuses the open before it touches the platform, and so that a failure
+-- AFTER the allocation always has the charge a HELD record needs. It is carried through every exit: registered, it is the
+-- entry's grant; a clean unwind releases it; a held unwind (the one classified close says the reservation may still be held) moves
+-- it, with the volume and the bytes the file may occupy (the larger of the allowance asked and what was observed), to a held record
+-- that lives to the service's end.
 execOpen ∷ StorageService → Word64 → OpenSpec → IO Outcome
 execOpen svc jid spec = do
   stop0 ← cancelled svc jid
   if stop0 then pure (Cancelled []) else do
-    unique ← atomically (stateTVar (svNames svc) (\n → (n, n + 1)))
-    -- the descriptor and its name are owned the instant the native create succeeds: 'createPrivate' records them in
-    -- this reference BEFORE the seam's after-hook runs, so the handler below finds them whatever the hook did
-    created ← newIORef Nothing
-    owned ← newIORef (0 ∷ Int)
-    r ← tryWithContext $ do
-      made ← createPrivate seam (osDirectory spec) unique (writeIORef created . Just)
-      case made of
-        Left f → pure (Failed (StorageIo f) [])
-        Right c → afterCreate c owned
-    case r of
-      Right o → pure o
-      Left ewc → do
-        state ← readIORef owned
-        mc ← readIORef created
-        -- an exception: the descriptor is closed here unless the table already owns it; the name is
-        -- unlinked again if it still exists (a second unlink finding none is not a failure)
-        -- 0: still ours; 1: the table owns it; 2: its close was already attempted (never repeated)
-        notes ← case mc of
-          Just c | state == 0 → unwind owned c True
-          _ → pure []
-        evidence ← sequence [(,) "open cleanup" <$> evidenceOf (OpenCleanupFailed op e) | CleanupNote op e ← notes, e /= Errno 2]
-        final ← composeCleanup (Just ewc) evidence
-        rethrowIO (fromMaybe ewc final)
+    secured ← atomically secureOpening
+    case secured of
+      Left f → pure (Failed f [])
+      Right () → do
+        unique ← atomically (stateTVar (svNames svc) (\n → (n, n + 1)))
+        -- the descriptor and its name are owned the instant the native create succeeds: 'createPrivate' records them in
+        -- this reference BEFORE the seam's after-hook runs, so the handler below finds them whatever the hook did
+        created ← newIORef Nothing
+        owned ← newIORef (0 ∷ Int)
+        -- what the open knows of the allocation: the volume, whether a reservation was attempted, the bytes observed
+        info ← newIORef (OpenInfo 0 False 0)
+        r ← tryWithContext $ do
+          made ← createPrivate seam (osDirectory spec) unique (\c → writeIORef created (Just c) >> atomically (nameOpeningFd c))
+          case made of
+            Left f → pure (Failed (StorageIo f) [])
+            Right c → afterCreate c owned info
+        case r of
+          Right o → do
+            -- whatever the exits above did not consume (no descriptor was ever made, a cancellation before the create) is released
+            atomically (releaseOpening svc jid)
+            pure o
+          Left ewc → do
+            state ← readIORef owned
+            mc ← readIORef created
+            -- an exception: the descriptor is closed here unless the table already owns it; the name is
+            -- unlinked again if it still exists (a second unlink finding none is not a failure)
+            -- 0: still ours; 1: the table owns it; 2: its close was already attempted (never repeated)
+            notes ← case mc of
+              Just c | state == 0 → unwind owned info c True
+              _ → pure []
+            atomically (releaseOpening svc jid)
+            evidence ← sequence [(,) "open cleanup" <$> evidenceOf (OpenCleanupFailed op e) | CleanupNote op e ← notes, e /= Errno 2]
+            final ← composeCleanup (Just ewc) evidence
+            rethrowIO (fromMaybe ewc final)
   where
     seam = svSeam svc
     cfg = osConfig spec
     allowance = cfgAllowanceBytes cfg
-    -- every failure after the file exists closes the descriptor (which releases
-    -- everything it obtained) and keeps what the cleanup could not do
+    secureOpening = do
+      s ← readTVar (svState svc)
+      if stPhase s /= Running
+        then pure (Left ServiceStopped)
+        else do
+          charged ← withAdmission svc (\a → A.reserve A.Foreground [A.ControlCredit backingRecordBytes] a)
+          case charged of
+            Left r → pure (Left (mapRefusal r))
+            Right g → do
+              modifyTVar' (svState svc) (\t → t {stOpening = Map.insert jid (OpenRec g Nothing) (stOpening t)})
+              pure (Right ())
+    nameOpeningFd c = modifyTVar' (svState svc) (\t → t {stOpening = Map.adjust (\(OpenRec g _) → OpenRec g (Just (crFd c))) jid (stOpening t)})
+    -- every failure after the file exists makes the ONE classified close (which releases everything the descriptor obtained,
+    -- unless the platform has not established that) and keeps what the cleanup could not do
     -- the cleanup steps run independently: each is attempted whatever the other does, an exception from one is a
     -- cleanup failure (errno -1) and never prevents the other, and the close is attempted exactly once
-    unwind owned c named = do
+    unwind owned info c named = do
       notes1 ← if named then step IoUnlink (retryUnlink c) else pure []
       -- recorded BEFORE the close is attempted, so an exception from it can never lead to a second close
+      -- THE COUNTED FIGURE COVERS WHAT WAS OBSERVED: once a reservation was attempted, a fresh report of the descriptor's allocation (while it is
+      -- still open) joins what the steps observed, so a held record counts at least what the file is known to hold
+      inf0 ← readIORef info
+      case inf0 of
+        OpenInfo dev True seen → do
+          fresh ← observedAllocationFd svc (crFd c)
+          writeIORef info (OpenInfo dev True (maybe seen (max seen) fresh))
+        _ → pure ()
       writeIORef owned 2
-      notes2 ← step IoClose (closeNote c)
+      co ← classifiedClose svc (crFd c)
+      l ← case clThrown co of
+        Just t → quietly (logWarning (svLogger svc) component "Open cleanup step raised" [("exception", t)])
+        Nothing → pure Nothing
+      let notes2 = [CleanupNote IoClose e | Just e ← [clErr co]] <> [CleanupNote IoClose (Errno (-1)) | Just _ ← [clThrown co]] <> [CleanupNote IoClose (Errno (-1)) | Just _ ← [l]]
+      inf ← readIORef info
+      atomically (settleUnwound co c inf)
       pure (notes1 <> notes2)
+    -- the presecured charge after the close: released (the allocation went with the descriptor), or HELD (it may not have)
+    settleUnwound co c (OpenInfo dev attempted observed) = do
+      s ← readTVar (svState svc)
+      case Map.lookup jid (stOpening s) of
+        Nothing → pure ()
+        Just (OpenRec g _)
+          | clHeld co → do
+              let bytes = if attempted then max allowance observed else 0
+                  hid = stNextBacking s
+              writeTVar (svState svc) s
+                { stOpening = Map.delete jid (stOpening s)
+                , stNextBacking = hid + 1
+                , stHeld = Map.insert hid (Held dev bytes g (crFd c)) (stHeld s)
+                , stReserved = if bytes > 0 then Map.insertWith (+) dev bytes (stReserved s) else stReserved s
+                }
+              keepEvidence svc "open cleanup: the close of an unregistered backing (reservation held: a failed close is not established to release)" [KeptNote (CleanupNote IoClose (fromMaybe (Errno (-1)) (clErr co)))]
+          | otherwise → releaseOpening svc jid
     step op act = do
       r ← tryWithContext act ∷ IO (Either (ExceptionWithContext SomeException) [CleanupNote])
       case r of
@@ -1734,51 +1807,54 @@ execOpen svc jid spec = do
     retryUnlink c = do
       r ← unlinkFile seam (osDirectory spec) (crName c)
       pure [CleanupNote IoUnlink e | Left e ← [r]]
-    closeNote c = do
-      r ← uninterruptibleMask_ (closeFile seam (crFd c))
-      pure [CleanupNote IoClose e | Left e ← [r]]
-    afterCreate c owned = do
+    afterCreate c owned info = do
       un ← unlinkFile seam (osDirectory spec) (crName c)
       case un of
         Left e → do
-          notes ← unwind owned c True
+          notes ← unwind owned info c True
           pure (Failed (StorageIo (IoFailure IoUnlink (IoErrno e) Nothing Nothing 0 0)) notes)
         Right () → do
           v ← verifyPrivate seam (crFd c)
           case v of
             Left f → do
-              notes ← unwind owned c False
+              notes ← unwind owned info c False
               pure (Failed (StorageIo f) notes)
             Right st → do
+              writeIORef info (OpenInfo (nsDevice st) False 0)
               stop ← cancelled svc jid
               if stop
-                then Cancelled <$> unwind owned c False
-                else withVolume svc (nsDevice st) (reserveAndRegister c owned st)
-    reserveAndRegister c owned st = do
+                then Cancelled <$> unwind owned info c False
+                else withVolume svc (nsDevice st) (reserveAndRegister c owned info st)
+    reserveAndRegister c owned info st = do
+      -- from here on an allocation may exist: the held record, should the close be held, counts at least the allowance asked
+      writeIORef info (OpenInfo (nsDevice st) True 0)
       -- the PAYLOAD is asked of the platform, never the whole allowance: the overhead must fit in what is left of it
       r ← reserveRange seam (svConfig svc) (cancelled svc jid) (crFd c) 0 (payloadOf allowance (cfgOverheadBytes cfg)) allowance
       case r of
-        Left (StoppedCancelled _) → Cancelled <$> unwind owned c False
+        Left (StoppedCancelled _) → Cancelled <$> unwind owned info c False
         Left (StoppedFailure f _) → do
-          notes ← unwind owned c False
+          notes ← unwind owned info c False
           pure (Failed f notes)
         Right rv
           | rvAllocated rv > allowance → do
-              -- the physical allocation does not fit the allowance: the overhead exceeded what the allowance leaves for it
-              notes ← unwind owned c False
+              -- the physical allocation does not fit the allowance: the overhead exceeded what the allowance leaves for it; what was
+              -- observed is what the held record would count
+              writeIORef info (OpenInfo (nsDevice st) True (rvAllocated rv))
+              notes ← unwind owned info c False
               pure (Failed (ReservationFailed (OverheadExceedsModel (rvOverhead rv) (budgetOf allowance (cfgOverheadBytes cfg)))) notes)
           | otherwise → do
+              writeIORef info (OpenInfo (nsDevice st) True (rvAllocated rv))
               registered ← atomically (register c st rv)
               case registered of
-                Left OpenCancelled → Cancelled <$> unwind owned c False
+                Left OpenCancelled → Cancelled <$> unwind owned info c False
                 Left (OpenFailed f) → do
-                  notes ← unwind owned c False
+                  notes ← unwind owned info c False
                   pure (Failed f notes)
                 Right (b, reservation) → do
                   -- the table owns the descriptor from the transaction above
                   writeIORef owned 1
                   pure (Opened b reservation)
-    -- cancellation is arbitrated in the transaction that publishes the backing
+    -- cancellation is arbitrated in the transaction that publishes the backing; the presecured grant becomes the entry's
     register c st rv = do
       s ← readTVar (svState svc)
       let cancelRequested = maybe False jCancel (Map.lookup jid (stJobs s))
@@ -1787,21 +1863,34 @@ execOpen svc jid spec = do
         else
           if cancelRequested
             then pure (Left OpenCancelled)
-            else do
-              charged ← withAdmission svc (\a → A.reserve A.Foreground [A.ControlCredit backingRecordBytes] a)
-              case charged of
-                Left r → pure (Left (OpenFailed (mapRefusal r)))
-                Right grant → do
-                  let bid = stNextBacking s
-                      ident = osIdentity spec
-                      entry = Entry (crFd c) ident (nsDevice st) allowance allowance (rvAllocated rv) (cfgOverheadBytes cfg) GIdle Nothing EOpen 0 (cfgOffsetLimit cfg) grant
-                      prof = rvProfile rv
-                  writeTVar (svState svc) s
-                    { stNextBacking = bid + 1
-                    , stBackings = Map.insert bid entry (stBackings s)
-                    , stReserved = Map.insertWith (+) (nsDevice st) allowance (stReserved s)
-                    }
-                  pure (Right (Backing (svId svc) bid ident, Reservation (rvAllocated rv) (rvLength rv) (rvOverhead rv) (vpFilesystem prof) (vpBlockSize prof) (nsDevice st)))
+            else case Map.lookup jid (stOpening s) of
+              Nothing → pure (Left (OpenFailed (HostFailure "the open's presecured charge is missing")))
+              Just (OpenRec grant _) → do
+                let bid = stNextBacking s
+                    ident = osIdentity spec
+                    entry = Entry (crFd c) ident (nsDevice st) allowance allowance (rvAllocated rv) (cfgOverheadBytes cfg) GIdle Nothing EOpen 0 (cfgOffsetLimit cfg) grant
+                    prof = rvProfile rv
+                writeTVar (svState svc) s
+                  { stNextBacking = bid + 1
+                  , stBackings = Map.insert bid entry (stBackings s)
+                  , stOpening = Map.delete jid (stOpening s)
+                  , stReserved = Map.insertWith (+) (nsDevice st) allowance (stReserved s)
+                  }
+                pure (Right (Backing (svId svc) bid ident, Reservation (rvAllocated rv) (rvLength rv) (rvOverhead rv) (vpFilesystem prof) (vpBlockSize prof) (nsDevice st)))
+
+-- | What an open knows of the allocation while it runs: the volume (known once the file is verified), whether a reservation was
+-- attempted (so an allocation may exist), and the bytes the platform reported.
+data OpenInfo = OpenInfo !Word64 !Bool !Word64
+
+-- | Release a job's presecured open charge, if it still holds one (registered or held, it holds none): idempotent.
+releaseOpening ∷ StorageService → Word64 → STM ()
+releaseOpening svc jid = do
+  s ← readTVar (svState svc)
+  case Map.lookup jid (stOpening s) of
+    Nothing → pure ()
+    Just (OpenRec g _) → do
+      releaseGrant svc g
+      modifyTVar' (svState svc) (\t → t {stOpening = Map.delete jid (stOpening t)})
 
 -- ---------------------------------------------------------------------------
 -- Growth
@@ -1822,16 +1911,16 @@ execGrow svc jid j from to = do
       r ← tryWithContext (reserveRange seam (svConfig svc) (cancelled svc jid) (eFd e) (payloadOf from (eOverheadModel e)) (payloadOf to (eOverheadModel e) - payloadOf from (eOverheadModel e)) (to - from))
       case r of
         Left ewc → do
-          notes ← giveBack bid e True
+          notes ← giveBack bid e True Nothing
           evidence ← sequence [(,) "growth release" <$> evidenceOf (OpenCleanupFailed op err) | CleanupNote op err ← notes]
           final ← composeCleanup (Just ewc) evidence
           rethrowIO (fromMaybe ewc final)
-        Right (Left (StoppedCancelled acquired)) → Cancelled <$> giveBack bid e acquired
-        Right (Left (StoppedFailure f acquired)) → (\notes → Failed f notes) <$> giveBack bid e acquired
+        Right (Left (StoppedCancelled acquired)) → Cancelled <$> giveBack bid e acquired Nothing
+        Right (Left (StoppedFailure f acquired)) → (\notes → Failed f notes) <$> giveBack bid e acquired Nothing
         Right (Right rv)
           | rvAllocated rv > to →
               -- the physical allocation does not fit the NEW allowance
-              (\notes → Failed (ReservationFailed (OverheadExceedsModel (rvOverhead rv) (budgetOf to (eOverheadModel e)))) notes) <$> giveBack bid e True
+              (\notes → Failed (ReservationFailed (OverheadExceedsModel (rvOverhead rv) (budgetOf to (eOverheadModel e)))) notes) <$> giveBack bid e True (Just (rvAllocated rv))
           | otherwise → do
               let p = PreparedGrowth (svId svc) jid bid from to (rvAllocated rv)
               published ← atomically $ do
@@ -1849,12 +1938,18 @@ execGrow svc jid j from to = do
                 then do
                   let prof = rvProfile rv
                   pure (GrowthPrepared p (Reservation (rvAllocated rv) (rvLength rv) (rvOverhead rv) (vpFilesystem prof) (vpBlockSize prof) (eVolume e)))
-                else Cancelled <$> giveBack bid e True
+                else Cancelled <$> giveBack bid e True (Just (rvAllocated rv))
   where
     seam = svSeam svc
     -- give the extra back and return the slot to idle; a release that fails leaves a bounded pending record
     -- that stays charged until an explicit retry or the close
-    giveBack bid e acquired
+    --
+    -- THE COUNTED FIGURE COVERS WHAT WAS OBSERVED (round 8): when the release fails, the pending charge is not the nominal request
+    -- (@to - from@) but everything the file is KNOWN to hold beyond the committed reservation: the allocation the reservation's own
+    -- verification observed (@seen@) and a fresh report, whichever is larger; 'eAllocated' is set to it. Where nothing can be
+    -- observed (no verification ran and the fresh report fails) there is no observed figure and no better bound exists than the
+    -- request itself (the fit rule bounds an allocation that was verified; an unverified one cannot be bounded): the nominal extra is used.
+    giveBack bid e acquired seen
       | not acquired = atomically (setSlot svc bid GIdle) >> pure []
       | otherwise = do
           -- an exception from the release is a release that failed: the extra is then kept as pending
@@ -1862,11 +1957,23 @@ execGrow svc jid j from to = do
           case either (const (Left (Errno (-1)))) id released of
             Right () → do
               allocated ← allocatedAfter svc e from
-              atomically (setSlot svc bid GIdle >> modifyTVar' (svState svc) (\s → s {stBackings = Map.adjust (\x → x {eAllocated = allocated}) bid (stBackings s)})) >> pure []
+              -- A RELEASE THAT SUCCEEDED, whose fresh report still shows the file holding more than the committed reservation, did not
+              -- free everything: the excess is a pending charge (a retry or the close releases it), never an unaccounted allocation
+              let excess = allocated - min allocated from
+              atomically $ do
+                setSlot svc bid GIdle
+                modifyTVar' (svState svc) $ \s →
+                  s { stBackings = Map.adjust (\x → x {eAllocated = allocated, ePending = if excess > 0 then Just excess else Nothing}) bid (stBackings s)
+                    , stReserved = if excess > 0 then Map.insertWith (+) (eVolume e) excess (stReserved s) else stReserved s
+                    }
+              pure []
             Left err → do
+              fresh ← observedAllocation svc e
+              let observed = case catMaybes [seen, fresh] of [] → Nothing; xs → Just (maximum xs)
+                  n = pendingCovering (eReserved e) (to - from) observed
               atomically $ modifyTVar' (svState svc) $ \s →
-                s { stBackings = Map.adjust (\x → x {ePending = let n = to - from in n `seq` Just n, eGrowth = GIdle}) bid (stBackings s)
-                  , stReserved = Map.insertWith (+) (eVolume e) (to - from) (stReserved s)
+                s { stBackings = Map.adjust (\x → x {ePending = n `seq` Just n, eGrowth = GIdle, eAllocated = maybe (eAllocated x) (max (eAllocated x)) observed}) bid (stBackings s)
+                  , stReserved = Map.insertWith (+) (eVolume e) n (stReserved s)
                   }
               pure [CleanupNote IoSetLength err]
 
@@ -1882,23 +1989,34 @@ execRelease svc j from to = do
       case released of
         Left ewc → do
           -- an exception: what the release did is unknown, so the extra stays accounted as pending
-          atomically (pendAgain bid)
+          pendAgain bid e
           rethrowIO ewc
         Right (Right ()) → do
           allocated ← allocatedAfter svc e from
+          -- (see giveBack: a release that succeeded but left the file holding more than the committed reservation leaves the excess pending)
+          let excess = allocated - min allocated from
           atomically $ modifyTVar' (svState svc) $ \s →
-            s { stBackings = Map.adjust (\x → x {eGrowth = GIdle, ePending = Nothing, eReserved = from, eAllocated = allocated}) bid (stBackings s)
-              , stReserved = subReserved (eVolume e) (to - from) (stReserved s)
+            s { stBackings = Map.adjust (\x → x {eGrowth = GIdle, ePending = if excess > 0 then Just excess else Nothing, eReserved = from, eAllocated = allocated}) bid (stBackings s)
+              , stReserved = (if excess > 0 then Map.insertWith (+) (eVolume e) excess else id) (subReserved (eVolume e) (to - from) (stReserved s))
               }
           pure Released
         Right (Left err) → do
-          atomically (pendAgain bid)
+          pendAgain bid e
           pure (Failed (StorageIo (IoFailure IoSetLength (IoErrno err) Nothing Nothing 0 0)) [CleanupNote IoSetLength err])
   where
-    pendAgain bid = modifyTVar' (svState svc) $ \s →
-      -- the extra is now the pending record's: the length is the committed size again, so a backing's
-      -- contribution to the volume's reserved figure is always its length plus its pending extra
-      s {stBackings = Map.adjust (\x → x {eGrowth = GIdle, ePending = let n = to - from in n `seq` Just n, eReserved = from}) bid (stBackings s)}
+    -- the extra is now the pending record's: the length is the committed size again, so a backing's contribution to the volume's
+    -- reserved figure is always its length plus its pending extra. THE PENDING CHARGE COVERS WHAT IS OBSERVED: a fresh report
+    -- of the file's allocation can show more than the nominal extra (an overhead the failed release left), and then the pending
+    -- charge, the volume's figure and 'eAllocated' all follow it (the figure only ever grows here: a release that fails frees nothing)
+    pendAgain bid e = do
+      fresh ← observedAllocation svc e
+      atomically $ modifyTVar' (svState svc) $ \s →
+        let n = pendingCovering from (to - from) fresh
+            counted = to - from
+            more = n - min n counted
+         in s { stBackings = Map.adjust (\x → x {eGrowth = GIdle, ePending = n `seq` Just n, eReserved = from, eAllocated = maybe (eAllocated x) (max (eAllocated x)) fresh}) bid (stBackings s)
+              , stReserved = if more > 0 then Map.insertWith (+) (eVolume e) more (stReserved s) else stReserved s
+              }
 
 -- ---------------------------------------------------------------------------
 -- Scoped use and closing
@@ -1970,6 +2088,33 @@ closeBackingId svc bid = do
 closeUnwaited ∷ StorageService → Word64 → IO (Maybe (ExceptionWithContext SomeException))
 closeUnwaited svc bid = fst <$> closeBackingCore svc bid
 
+-- | THE ONE CLASSIFIED CLOSE (round 8). There is exactly ONE place the service makes a native close: this function, used by the close of a
+-- registered backing ('closeBackingCore') and by the unwind of an open that failed after the file existed. It makes the close once
+-- (uninterruptibly, never retried), catches an exception from it, and classifies the outcome with the platform-fact table
+-- ('classifyHeld'): the answer says whether the reservation is HELD (an errno where a failed close is not established to have released the
+-- descriptor, or a raise on any platform) and nothing else in the service calls 'closeFile'.
+data CloseResult = CloseResult
+  { clErr ∷ !(Maybe Errno)
+  , clThrown ∷ !(Maybe Text)
+  -- ^ The bounded text of an exception the close raised.
+  , clHeld ∷ !Bool
+  }
+
+classifiedClose ∷ StorageService → Fd → IO CloseResult
+classifiedClose svc fd = do
+  r ← tryWithContext (uninterruptibleMask_ (closeFile (svSeam svc) fd)) ∷ IO (Either (ExceptionWithContext SomeException) (Either Errno ()))
+  let (err, thrown) = case r of
+        Right (Left en) → (Just en, Nothing)
+        Right (Right ()) → (Nothing, Nothing)
+        Left (ExceptionWithContext _ ex) → (Nothing, Just (T.copy (T.take maxHostFailureChars (T.pack (show ex)))))
+  pure (CloseResult err thrown (classifyHeld (nativeCloseFact (seamNative (svSeam svc))) err thrown))
+
+-- | The pure classification: an errno RETURNED BY close(2) follows the platform's row; a raise is not an error return of the call (it can
+-- come from the seam's before-hook, where the native close was never made and the descriptor is certainly still open), so it is
+-- "not established" on every platform.
+classifyHeld ∷ CloseFact → Maybe Errno → Maybe Text → Bool
+classifyHeld fact err thrown = isJust thrown || (isJust err && fact == CloseNotEstablished)
+
 -- | The close, returning an interruption it remembered instead of obeying, for the caller to deliver. THE CLOSE CORE
 -- OWNS EVERYTHING UNTIL IT RETURNS: the claim moves the entry into a closing record; the native close is made once;
 -- ONE transaction then releases the grant, subtracts the reservation, KEEPS a failing close as labelled evidence (the
@@ -1997,17 +2142,10 @@ closeBackingCore svc bid = mask_ $ do
       (late, claimed) ← protectedly (atomically (claim bid))
       case claimed of
         Just (Just e) → do
-          r ← tryWithContext (uninterruptibleMask_ (closeFile (svSeam svc) (eFd e))) ∷ IO (Either (ExceptionWithContext SomeException) (Either Errno ()))
-          let (err, thrown) = case r of
-                Right (Left en) → (Just en, Nothing)
-                Right (Right ()) → (Nothing, Nothing)
-                Left (ExceptionWithContext _ ex) → (Nothing, Just (T.pack (show ex)))
-              -- the typed failure of the close: the backing's id and the errno, or the (bounded) text of the exception
-              failing = [KeptClose bid (CloseErrno en) | Just en ← [err]] <> [KeptClose bid (CloseRaised (T.copy (T.take maxHostFailureChars t))) | Just t ← [thrown]]
-          -- an ERRNO RETURNED BY close(2) follows the platform's row; a RAISE is not an error return of the call (it can come
-          -- from the seam's before-hook, where the native close was never made and the descriptor is certainly still open,
-          -- with its space), so a raise is "not established" on EVERY platform
-          let held = isJust thrown || (isJust err && nativeCloseFact (seamNative (svSeam svc)) == CloseNotEstablished)
+          -- THE ONE CLASSIFIED CLOSE: made once, classified by the platform-fact table (an errno follows the row, a raise holds)
+          CloseResult err thrown held ← classifiedClose svc (eFd e)
+          let -- the typed failure of the close: the backing's id and the errno, or the (bounded) text of the exception
+              failing = [KeptClose bid (CloseErrno en) | Just en ← [err]] <> [KeptClose bid (CloseRaised t) | Just t ← [thrown]]
           atomically (finishClosing svc bid e held ("close of backing " <> T.pack (show bid) <> (if held then " (reservation held: a failed close is not established to release)" else "")) failing)
           -- the diagnostics, each remembered and not obeyed: the report is still made and the caller (the drain,
           -- which goes on to close the other backings) delivers a cancellation afterwards
@@ -2051,7 +2189,7 @@ finishClosing ∷ StorageService → Word64 → Entry → Bool → Text → [Kep
 finishClosing svc bid e held label failing = do
   modifyTVar' (svState svc) $ \t →
     if held
-      then t { stHeld = Map.insert bid (Held (eVolume e) (backingContribution e) (eGrant e)) (stHeld t)
+      then t { stHeld = Map.insert bid (Held (eVolume e) (backingContribution e) (eGrant e) (eFd e)) (stHeld t)
              , stClosingRecs = Map.insert bid (CrReporting Nothing) (stClosingRecs t)
              }
       else t { stReserved = subReserved (eVolume e) (backingContribution e) (stReserved t)
@@ -2073,6 +2211,23 @@ endClosing svc bid = do
 carriesGrant ∷ ClosingRec → Bool
 carriesGrant (CrNative _) = True
 carriesGrant (CrReporting g) = isJust g
+
+-- | The pending charge that covers what is observed: the nominal extra, or whatever the file is known to hold beyond the committed
+-- reservation, whichever is larger (allowance units).
+pendingCovering ∷ Word64 → Word64 → Maybe Word64 → Word64
+pendingCovering reserved nominal observed = case observed of
+  Nothing → nominal
+  Just o → max nominal (o - min o reserved)
+
+-- | A fresh report of the file's allocation by the adapter (read straight from it, not through the seam's hooks: it is
+-- bookkeeping, not a step of the work); 'Nothing' when it cannot be read.
+observedAllocation ∷ StorageService → Entry → IO (Maybe Word64)
+observedAllocation svc e = observedAllocationFd svc (eFd e)
+
+observedAllocationFd ∷ StorageService → Fd → IO (Maybe Word64)
+observedAllocationFd svc fd = do
+  r ← tryWithContext (nativeStat (seamNative (svSeam svc)) fd) ∷ IO (Either (ExceptionWithContext SomeException) (Either Errno NativeStat))
+  pure (case r of Right (Right st) → Just (nsAllocated st); _ → Nothing)
 
 -- | What the file occupies after a release, by a fresh report of the platform (read straight from the adapter, not
 -- through the seam's hooks: it is bookkeeping, not a step of the work); when it cannot be read, the allowance the backing
@@ -2175,7 +2330,7 @@ data JobSnap = JobSnap
   deriving stock (Eq, Show)
 
 -- | One tracked backing.
-data HeldSnap = HeldSnap {hsId ∷ !Word64, hsVolume ∷ !Word64, hsBytes ∷ !Word64}
+data HeldSnap = HeldSnap {hsId ∷ !Word64, hsVolume ∷ !Word64, hsBytes ∷ !Word64, hsFd ∷ !Int}
   deriving stock (Eq, Show)
 
 data BackingSnap = BackingSnap
@@ -2188,6 +2343,8 @@ data BackingSnap = BackingSnap
   , bsVolume ∷ !Word64
   , bsBorrows ∷ !Int
   , bsClosing ∷ !Bool
+  , bsFd ∷ !Int
+  -- ^ The descriptor number the record names (the checker's oracle matches it against the descriptors the adapter holds open).
   }
   deriving stock (Eq, Show)
 
@@ -2199,6 +2356,8 @@ data Snapshot = Snapshot
   , snClosingCharged ∷ !Int
   -- ^ How many closing records carry a control grant (every one but a held close's reporting record: its grant is the held record's).
   , snClosingRecs ∷ ![BackingSnap]
+  , snOpening ∷ ![(Word64, Maybe Int)]
+  -- ^ The running opens that hold a presecured charge: the job and the descriptor it owns, once the create has returned.
   , snHeld ∷ ![HeldSnap]
   -- ^ The held closes: a backing whose close failed where a failed close is not established to have released the
   -- descriptor, its volume and the bytes still counted on it.
@@ -2240,14 +2399,15 @@ snapshotOf svc = do
           , jsDelivered = jDelivered j
           }
       slotTag g = case g of GIdle → SlotIdle; GRunning → SlotRunning; GPrepared _ → SlotPrepared; GReleasing _ → SlotReleasing
-      backingSnap (bid, e) = BackingSnap bid (slotTag (eGrowth e)) (ePending e) (eReserved e) (eAllocated e) (eVolume e) (eBorrows e) (ePhase e /= EOpen)
+      backingSnap (bid, e) = BackingSnap bid (slotTag (eGrowth e)) (ePending e) (eReserved e) (eAllocated e) (eVolume e) (eBorrows e) (ePhase e /= EOpen) (fdNumber (eFd e))
   pure Snapshot
     { snJobs = map jobSnap (Map.toList (stJobs s))
     , snBackings = map backingSnap (Map.toList (stBackings s))
     , snClosing = Map.size (stClosingRecs s)
     , snClosingCharged = length [() | r ← Map.elems (stClosingRecs s), carriesGrant r]
     , snClosingRecs = [backingSnap (bid, e) | (bid, CrNative e) ← Map.toList (stClosingRecs s)]
-    , snHeld = [HeldSnap bid (hVolume h) (hBytes h) | (bid, h) ← Map.toList (stHeld s)]
+    , snOpening = [(jid, fdNumber <$> mfd) | (jid, OpenRec _ mfd) ← Map.toList (stOpening s)]
+    , snHeld = [HeldSnap bid (hVolume h) (hBytes h) (fdNumber (hFd h)) | (bid, h) ← Map.toList (stHeld s)]
     , snWorkers = stWorkers s
     , snAdmissionOpen = stPhase s == Running
     , snStopReason = stStopReason s

@@ -100,6 +100,12 @@ reportedMatchesPhysical env = do
 volumeLedgerClear :: Env -> IO ()
 volumeLedgerClear env = (Map.elems . svReserved <$> view env) >>= (`shouldSatisfy` all (== 0))
 
+-- | THE PENDING CHARGE COVERS WHAT WAS OBSERVED (round 8): a growth whose allocation the platform reported 10 MiB over the new
+-- allowance's payload, and whose rollback then fails, leaves a pending charge of EVERYTHING the file holds beyond the committed
+-- reservation (not the nominal extra): the extra payload plus the 10 MiB, less the 64 MiB already committed.
+overPending :: Word64
+overPending = payloadBytes (hCfg h0) + 10 * mib
+
 isReserve, isStat :: NativeOp -> Bool
 isReserve op = case op of OpReserveRange _ _ -> True; _ -> False
 isStat op = op == OpStatFile
@@ -346,8 +352,21 @@ preparedOn env b = do
 -- | The ways a native call is made to go wrong. The AFTER dimension (round 4): the native effect has HAPPENED and the
 -- seam's after-hook then raises, or raises an exception of the asynchronous type: nothing the effect obtained may be
 -- lost, whatever the call.
-data Injection = Typed | Thrown | Cancelled' | AfterThrown | AfterAsync
+data Injection = Typed | Thrown | Cancelled' | AfterThrown | AfterAsync | BeforeThrown | ErrnoAfter | NoFault
   deriving stock (Eq, Show, Enum, Bounded)
+
+-- | THE EXITS OF A NATIVE STEP (round 8): success ('NoFault'), an errno instead of the call ('Typed': the effect did not happen), an errno
+-- AFTER the effect ('ErrnoAfter': it happened, the caller is told it failed), a raise before the call ('BeforeThrown': the before-hook;
+-- and 'Thrown': the call's own wrapper, before the effect), a raise after the effect ('AfterThrown' and 'AfterAsync'), and a cancellation.
+
+-- | Whether a close that fails this way leaves the reservation HELD under a platform fact: a raise always does, an errno where the platform
+-- has not established that the descriptor was released.
+heldClose :: CloseFact -> Injection -> Bool
+heldClose fact inj = inj `elem` [Thrown, AfterThrown, AfterAsync, BeforeThrown] || (inj `elem` [Typed, ErrnoAfter] && fact == CloseNotEstablished)
+
+-- | Whether the close fails at all under this injection.
+closeFails :: Injection -> Bool
+closeFails inj = inj `elem` [Typed, Thrown, AfterThrown, AfterAsync, BeforeThrown, ErrnoAfter]
 
 data Stage = SOpen | SGrow | SRelease | SRead | SWrite | SClose
   deriving stock (Eq, Show)
@@ -370,7 +389,8 @@ matrix =
   , (SGrow, "reserve", isReserve, 0, none)
   , (SGrow, "set length", isLen, 0, none)
   , (SGrow, "stat (verify)", isStat, 1, none)
-  , (SGrow, "set length (rollback after a failure)", (== OpSetFileLength (payloadBytes (hCfg h0))), 0, \p -> addRuleAfter p 1 1 isStat (OverAllocated (10 * mib)))
+  , -- the adapter keeps reporting 10 MiB over from the verification on (a lie the service is told every time it asks: what it was told is what it must count)
+  (SGrow, "set length (rollback after a failure)", (== OpSetFileLength (payloadBytes (hCfg h0))), 0, \p -> addRuleAfter p 1 (-1) isStat (OverAllocated (10 * mib)))
   , (SRelease, "stat", isStat, 0, none)
   , (SRelease, "set length", (== OpSetFileLength (payloadBytes (hCfg h0))), 0, none)
   , (SRead, "pread", isRd, 0, none)
@@ -385,22 +405,27 @@ matrix =
 
 sweepClass :: Spec
 sweepClass = describe "(C) every native resource has an owner at every instant" $
-  it "keeps descriptors, tracking and allocation consistent for each native call at each stage under a typed failure, an exception and a cancellation" $ do
-    cases <- forM matrix $ \(stage, name, match, occurrence, prelude) ->
+  it "keeps descriptors, tracking and allocation consistent, and the service never counts less than the descriptors may hold, for each native call at each stage under every exit and both platform facts about a failed close" $ do
+    cases <- forM [CloseReleasesOnFailure, CloseNotEstablished] $ \fact -> forM matrix $ \(stage, name, match, occurrence, prelude) ->
       forM [minBound .. maxBound] $ \inj -> do
         baseline <- openFdCount
-        putStrLn ("  sweep case: " <> show stage <> " / " <> name <> " / " <> show inj) >> hFlush stdout
+        putStrLn ("  sweep case: " <> show fact <> " / " <> show stage <> " / " <> name <> " / " <> show inj) >> hFlush stdout
         -- a FAILING native close is kept by the service whoever asked for it: the scope ends with that labelled failure
-        (if stage == SClose && inj `elem` [Typed, Thrown, AfterThrown, AfterAsync] then withEnvEndingWithKeptFailure else withEnv) $ \env -> runCase env stage match occurrence prelude inj
+        -- the unwind of an open whose cleanup close fails in a way the fact does not establish is a HELD close (round 8): the reservation
+        -- stays counted to the service's end
+        let closeRow = stage == SOpen && name == "close (cleanup after a failure)"
+            heldOpen = closeRow && heldClose fact inj
+            ends = (stage == SClose && closeFails inj) || heldOpen
+        (if ends then withEnvEndingWithKeptFailureWith defaultOptions {eoCloseFact = fact} (\env -> runCase env fact stage match occurrence prelude inj heldOpen (name == "set length (rollback after a failure)")) >> pure () else withEnvWith defaultOptions {eoCloseFact = fact} $ \env -> runCase env fact stage match occurrence prelude inj heldOpen (name == "set length (rollback after a failure)"))
         fdsAfter <- openFdCount
-        ((show stage, name, show inj), fdsAfter) `shouldBe` ((show stage, name, show inj), baseline)
+        ((show fact, show stage, name, show inj), fdsAfter) `shouldBe` ((show fact, show stage, name, show inj), baseline)
         pure ()
-    length (concat cases) `shouldBe` length matrix * length [minBound .. maxBound :: Injection]
-    putStrLn ("sweep: " <> show (length matrix) <> " native calls at their stages x " <> show (length [minBound .. maxBound :: Injection]) <> " injections (typed, thrown, cancelled, and after the effect: thrown, async) = " <> show (length (concat cases)) <> " cases")
+    length (concat (concat cases)) `shouldBe` 2 * length matrix * length [minBound .. maxBound :: Injection]
+    putStrLn ("sweep: " <> show (length matrix) <> " native calls at their stages x " <> show (length [minBound .. maxBound :: Injection]) <> " exits (success, errno, errno after the effect, a raise before, a raise inside the call, after the effect: thrown, async, and a cancellation) x 2 platform facts = " <> show (length (concat (concat cases))) <> " cases")
   where
-    runCase :: Env -> Stage -> (NativeOp -> Bool) -> Int -> (Probe -> IO ()) -> Injection -> IO ()
-    runCase env stage match occurrence prelude inj
-      | stage == SClose = closeScenario env inj
+    runCase :: Env -> CloseFact -> Stage -> (NativeOp -> Bool) -> Int -> (Probe -> IO ()) -> Injection -> Bool -> Bool -> IO ()
+    runCase env fact stage match occurrence prelude inj heldOpen liar
+      | stage == SClose = closeScenario env fact inj
       | otherwise = do
           let probe = envProbe env
           openedRef <- newIORef []
@@ -435,6 +460,9 @@ sweepClass = describe "(C) every native resource has an owner at every instant" 
             AfterThrown -> addAfterRuleAfter probe occurrence 1 match Throw
             AfterAsync -> addAfterRuleAfter probe occurrence 1 match ThrowAsync
             Cancelled' -> pure ()
+            BeforeThrown -> addBeforeRuleAfter probe occurrence 1 match Throw
+            ErrnoAfter -> errnoAfterRuleAfter probe occurrence 1 match eio
+            NoFault -> pure ()
           t <- act >>= either (fail . ("submit refused: " <>) . show) pure
           forM_ gate $ \g -> do
             awaitReached g 1
@@ -445,20 +473,27 @@ sweepClass = describe "(C) every native resource has an owner at every instant" 
           show o `shouldSatisfy` (not . null)
           v <- view env
           fds <- openFds probe
-          length fds `shouldBe` svBackings v
+          -- a before-hook raise on the cleanup close never made the close: that descriptor is still open, named by the held record
+          length fds `shouldBe` svBackings v + (if heldOpen && inj == BeforeThrown then 1 else 0)
           -- after an after-hook raised, what the last native step did is UNKNOWN to the caller: the extra may be freed
           -- while the service still counts it, as a pending reservation a retry releases: never less than physical
-          when (stage `elem` [SGrow, SRelease]) (if inj `elem` [AfterThrown, AfterAsync] then reportedCoversPhysical env else reportedMatchesPhysical env)
+          when (stage `elem` [SGrow, SRelease]) (if inj `elem` [AfterThrown, AfterAsync, ErrnoAfter] || liar then reportedCoversPhysical env else reportedMatchesPhysical env)
           checkInvariants env
           -- close whatever the case left open: the volume's reserved figures are back to their start
           forM_ [b | Opened b _ <- [o]] (closeBacking (envSvc env))
           forM_ opened (closeBacking (envSvc env))
-          volumeLedgerClear env
+          if heldOpen
+            then do
+              (sum . svReserved <$> view env) >>= (`shouldBe` cfgAllowanceBytes (hCfg h0))
+              (length . snHeld <$> atomically (snapshotOf (envSvc env))) >>= (`shouldBe` 1)
+              -- the held close's descriptor, when the before-hook never let the close be made, is closed by the example itself
+              when (inj == BeforeThrown) (fdHandles probe >>= mapM_ (nativeClose posixNative) . take 1)
+            else volumeLedgerClear env
 
 -- | Closing a backing under each injection: a typed close error, an exception raised by the close and an
 -- interruption of the closing thread while it waits at the call.
-closeScenario :: Env -> Injection -> IO ()
-closeScenario env inj = do
+closeScenario :: Env -> CloseFact -> Injection -> IO ()
+closeScenario env fact inj = do
   b <- openBacking env ident (hCfg h0)
   let probe = envProbe env
   case inj of
@@ -474,6 +509,19 @@ closeScenario env inj = do
     -- as having raised and is never repeated
     AfterThrown -> afterClose b Throw
     AfterAsync -> afterClose b ThrowAsync
+    -- the before-hook raises: the native close was NEVER made, the descriptor is certainly still open (named by the held record)
+    BeforeThrown -> do
+      addBeforeRule probe 1 (== OpCloseFile) Throw
+      rep <- closeBacking (envSvc env) b
+      (crClosed rep, crCloseException rep == Nothing) `shouldBe` (True, False)
+    -- the close HAPPENED and the caller is told it failed
+    ErrnoAfter -> do
+      errnoAfterRuleAfter probe 0 1 (== OpCloseFile) eio
+      rep <- closeBacking (envSvc env) b
+      (crClosed rep, crCloseError rep) `shouldBe` (True, Just eio)
+    NoFault -> do
+      rep <- closeBacking (envSvc env) b
+      (crClosed rep, crCloseError rep, crCloseException rep) `shouldBe` (True, Nothing, Nothing)
     Cancelled' -> do
       -- the closing thread is interrupted while it waits for a held call: the interruption is remembered, the close
       -- still happens, and the interruption is delivered after it
@@ -489,12 +537,16 @@ closeScenario env inj = do
       r <- readMVar done
       (either (\e -> const True (e :: SomeException)) (const False) r) `shouldBe` True
   (svBackings <$> view env) >>= (`shouldBe` 0)
-  if inj `elem` [Thrown, AfterThrown, AfterAsync]
-    -- a RAISE is not an error return of close(2) (it is 'not established' on every platform): the reservation stays counted in
-    -- the held record, and the volume's figure is exactly the allowance the backing was reserved for
+  if heldClose fact inj
+    -- a RAISE is not an error return of close(2) (it is 'not established' on every platform), and an errno is not established to
+    -- have released the descriptor under the macOS fact: the reservation stays counted in the held record, and the volume's
+    -- figure is exactly the allowance the backing was reserved for
     then do
       (sum . svReserved <$> view env) >>= (`shouldBe` cfgAllowanceBytes (hCfg h0))
       (length . snHeld <$> atomically (snapshotOf (envSvc env))) >>= (`shouldBe` 1)
+      checkInvariants env
+      -- a before-hook raise never made the close: the descriptor is still open and the example closes it
+      when (inj == BeforeThrown) (fdHandles probe >>= mapM_ (nativeClose posixNative) . take 1)
     else volumeLedgerClear env
   where
     afterClose b act = do
@@ -631,7 +683,7 @@ chargeClass = describe "(D) every charge is released on every path" $ do
       addRuleAfter (envProbe env) 1 1 isStat (OverAllocated (10 * mib))
       addRule (envProbe env) 1 (== OpSetFileLength (payloadBytes (hCfg h0))) (FailWith eio)
       _ <- submitGrowth (envSvc env) b (64 * mib) (128 * mib) >>= either (fail . show) pure >>= awaitOutcome env
-      (sum . svReserved <$> view env) >>= (`shouldBe` 128 * mib)
+      (sum . svReserved <$> view env) >>= (`shouldBe` (64 * mib + overPending))
       _ <- closeBacking (envSvc env) b
       volumeLedgerClear env
 

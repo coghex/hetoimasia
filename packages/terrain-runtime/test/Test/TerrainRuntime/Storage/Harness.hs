@@ -49,6 +49,10 @@ module Test.TerrainRuntime.Storage.Harness
   , addRule
   , addRuleAfter
   , addBeforeRule
+  , addBeforeRuleAfter
+  , addErrnoAfterRule
+  , errnoAfterRuleAfter
+  , physicalHoldings
   , addGate
   , addGateAfter
   , events
@@ -81,10 +85,11 @@ module Test.TerrainRuntime.Storage.Harness
 import Control.Concurrent (ThreadId, myThreadId, yield)
 import Control.Concurrent.STM
 import Control.Exception (ErrorCall (..), ExceptionWithContext (..), SomeAsyncException (..), SomeException, finally, rethrowIO, throwIO, try, tryWithContext)
-import Control.Monad (forM_, unless, void)
+import Control.Monad (forM, forM_, unless, void)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BC
 import Data.IORef
+import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import qualified Data.Text as T
 import Data.Word (Word64)
@@ -181,10 +186,14 @@ data Probe = Probe
   -- ^ The threads the service's workers run on, noted as each starts (the seam's start hook runs on it).
   , pBeforeRules ∷ !(TVar [Rule])
   -- ^ Rules applied by the seam's BEFORE-hook: the native call has NOT been made when they fire.
+  , pReported ∷ !(TVar (Map.Map Int Word64))
+  -- ^ THE ORACLE'S RECORD: the allocation the adapter last REPORTED to the service for each descriptor (injected lies included).
+  , pErrnoAfter ∷ !(TVar [Rule])
+  -- ^ Rules that make the native call and then answer an errno instead of its result (the effect happened, the caller is told it failed).
   }
 
 newProbe ∷ IO Probe
-newProbe = Probe <$> newTVarIO [] <*> newTVarIO [] <*> newTVarIO [] <*> newTVarIO [] <*> newTVarIO Set.empty <*> newTVarIO [] <*> newTVarIO [] <*> newTVarIO [] <*> newTVarIO [] <*> newTVarIO []
+newProbe = Probe <$> newTVarIO [] <*> newTVarIO [] <*> newTVarIO [] <*> newTVarIO [] <*> newTVarIO Set.empty <*> newTVarIO [] <*> newTVarIO [] <*> newTVarIO [] <*> newTVarIO [] <*> newTVarIO [] <*> newTVarIO Map.empty <*> newTVarIO []
 
 -- | Apply a rule to the next @n@ matching calls (negative: all of them).
 addRule ∷ Probe → Int → (NativeOp → Bool) → Act → IO ()
@@ -199,10 +208,41 @@ addRuleAfter p skip n match act = do
 
 -- | Apply a rule to the BEFORE-hook of the next @n@ matching calls: the hook raises and the native call is never made.
 addBeforeRule ∷ Probe → Int → (NativeOp → Bool) → Act → IO ()
-addBeforeRule p n match act = do
-  sk ← newTVarIO 0
+addBeforeRule p = addBeforeRuleAfter p 0
+
+-- | 'addBeforeRule' after the first @skip@ matching calls have passed.
+addBeforeRuleAfter ∷ Probe → Int → Int → (NativeOp → Bool) → Act → IO ()
+addBeforeRuleAfter p skip n match act = do
+  sk ← newTVarIO skip
   uses ← newTVarIO n
   atomically (modifyTVar' (pBeforeRules p) (<> [Rule match act sk uses]))
+
+-- | Make the next @n@ matching calls and then answer the errno: the effect happened and the caller is told it failed.
+addErrnoAfterRule ∷ Probe → Int → (NativeOp → Bool) → Errno → IO ()
+addErrnoAfterRule p = errnoAfterRuleAfter p 0
+
+-- | 'addErrnoAfterRule' after the first @skip@ matching calls have passed.
+errnoAfterRuleAfter ∷ Probe → Int → Int → (NativeOp → Bool) → Errno → IO ()
+errnoAfterRuleAfter p skip n match e = do
+  sk ← newTVarIO skip
+  uses ← newTVarIO n
+  atomically (modifyTVar' (pErrnoAfter p) (<> [Rule match (FailWith e) sk uses]))
+
+-- | THE ORACLE OF PHYSICAL TRUTH (round 8): for every descriptor the adapter still holds open, its number, the volume it is on and
+-- what it holds: the larger of what the file really occupies (read by the production adapter, outside every rule) and the
+-- allocation the adapter last REPORTED to the service for it (an injected lie included: the service must count what it was told).
+physicalHoldings ∷ Probe → IO [(Int, Word64, Word64)]
+physicalHoldings p = do
+  open ← readTVarIO (pOpen p)
+  handles ← readTVarIO (pHandles p)
+  reported ← readTVarIO (pReported p)
+  -- a descriptor NUMBER is reused by a later file: the latest handle of a number is the one that can still be open
+  let latest = Map.elems (Map.fromList [(fdNumber fd, fd) | fd ← handles])
+  fmap concat $ forM [fd | fd ← latest, fdNumber fd `Set.member` open] $ \fd → do
+    st ← nativeStat posixNative fd
+    pure $ case st of
+      Right x → [(fdNumber fd, nsDevice x, max (nsAllocated x) (Map.findWithDefault 0 (fdNumber fd) reported))]
+      Left _ → []
 
 -- | Apply a rule to the AFTER-hook of the next @n@ matching calls: the native effect has happened, then the hook raises.
 addAfterRule ∷ Probe → Int → (NativeOp → Bool) → Act → IO ()
@@ -296,10 +336,9 @@ seamFor p = Seam wrapped before after
         OpWorkerStart _ → myThreadId >>= \tid → atomically (modifyTVar' (pWorkers p) (tid :)) >> takeRule p op >>= \r → case r of
           Just Throw → ioError (userError "injected worker start failure")
           _ → pure ()
-        OpCloseFile → takeRuleFrom (pBeforeRules p) op >>= \r → case r of
+        _ → takeRuleFrom (pBeforeRules p) op >>= \r → case r of
           Just Throw → ioError (userError "injected exception in a before-hook")
           _ → pure ()
-        _ → pure ()
       gates ← readTVarIO (pGates p)
       forM_ [(g, sk) | (m, g, sk) ← gates, m op] $ \(g, sk) → do
         skipped ← atomically (readTVar sk >>= \n → if n > 0 then writeTVar sk (n - 1) >> pure True else pure False)
@@ -353,11 +392,16 @@ seamFor p = Seam wrapped before after
         , nativeStat = \fd → do
             r ← nativeStat real fd
             a ← takeRule p OpStatFile
-            case (a, r) of
+            out ← case (a, r) of
               (Just (OverAllocated n), Right s) → pure (Right s {nsAllocated = nsAllocated s + n})
               (Just (FailWith e), _) → pure (Left e)
               (Just Throw, _) → ioError (userError "injected exception")
               _ → pure r
+            -- what the service was TOLD about this descriptor, lies included, is the oracle's reading of what it must count
+            case out of
+              Right st → atomically (modifyTVar' (pReported p) (Map.insert (fdNumber fd) (nsAllocated st)))
+              Left _ → pure ()
+            pure out
         , nativeStatFs = \fd → do
             r ← nativeStatFs real fd
             a ← takeRule p OpStatFilesystem
@@ -377,13 +421,13 @@ seamFor p = Seam wrapped before after
               Just (FailWith e) → pure (Left e)
               Just Throw → ioError (userError "injected exception")
               Just Lie → pure (Right len)
-              _ → nativeReserve real fd off len
+              _ → nativeReserve real fd off len >>= errnoAfter (OpReserveRange off len)
         , nativeSetLength = \fd len → do
             a ← takeRule p (OpSetFileLength len)
             case a of
               Just (FailWith e) → pure (Left e)
               Just Throw → ioError (userError "injected exception")
-              _ → nativeSetLength real fd len
+              _ → nativeSetLength real fd len >>= errnoAfter (OpSetFileLength len)
         , nativePread = \fd ptr n off → do
             a ← takeRule p (OpReadAt off n)
             case a of
@@ -408,8 +452,13 @@ seamFor p = Seam wrapped before after
               Just (FailWith e) → pure (Left e)
               -- the call was made and then the exception is raised, as a failing close does
               Just Throw → ioError (userError "injected exception")
-              _ → pure r
+              _ → errnoAfter OpCloseFile r
         }
+    -- the call HAS been made; a rule of the errno-after dimension then answers an errno in place of its result
+    errnoAfter ∷ NativeOp → Either Errno a → IO (Either Errno a)
+    errnoAfter op r = do
+      a ← takeRuleFrom (pErrnoAfter p) op
+      pure (case a of Just (FailWith e) → Left e; _ → r)
 
 -- ---------------------------------------------------------------------------
 -- The environment

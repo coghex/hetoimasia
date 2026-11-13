@@ -9,6 +9,7 @@ module Test.TerrainRuntime.Storage.Growth (spec) where
 
 import Control.Concurrent.STM (atomically)
 import Control.Monad (forM_)
+import Data.List (isInfixOf)
 import Data.Word (Word64)
 import qualified Foreign.C.Error as C
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Native
@@ -62,6 +63,13 @@ view env b = atomically (backingView (envSvc env) b) >>= maybe (fail "no backing
 
 readOk ∷ Env → Backing → H → Word64 → IO ()
 readOk env b h n = readPages env b (hCfg h) n 1 ReadProbe >>= (`shouldSatisfy` either (const False) ((== 1) . length))
+
+
+-- | THE PENDING CHARGE COVERS WHAT WAS OBSERVED (round 8): a growth whose allocation the platform reported 10 MiB over the new
+-- allowance's payload, and whose rollback then fails, leaves a pending charge of EVERYTHING the file holds beyond the committed
+-- reservation (not the nominal extra): the extra payload plus the 10 MiB, less the 64 MiB already committed.
+overPending ∷ Word64
+overPending = payloadBytes (hCfg h0) + 10 * mib
 
 spec ∷ Spec
 spec = describe "Storage backend: growth" $ do
@@ -152,10 +160,10 @@ spec = describe "Storage backend: growth" $ do
         Failed (ReservationFailed (OverheadExceedsModel _ _)) notes → notes `shouldBe` [CleanupNote IoSetLength (er C.eIO)]
         other → expectationFailure ("unexpected: " <> show other)
       v ← view env b
-      bvPendingReservation v `shouldBe` Just (64 * mib)
-      reservedTotal env >>= (`shouldBe` 128 * mib)
+      bvPendingReservation v `shouldBe` Just overPending
+      reservedTotal env >>= (`shouldBe` (64 * mib + overPending))
       -- growth is refused, nothing is deleted and nothing retries by itself
-      grow env b (64 * mib) (128 * mib) >>= (`shouldBeFailure` (== ReservationFailed (PendingReservationBlocks (64 * mib))))
+      grow env b (64 * mib) (128 * mib) >>= (`shouldBeFailure` (== ReservationFailed (PendingReservationBlocks overPending)))
       readOk env b h0 5
       -- an explicit retry succeeds and frees it
       t ← submitReleasePending (envSvc env) b >>= either (fail . show) pure
@@ -172,7 +180,7 @@ spec = describe "Storage backend: growth" $ do
       addRule (envProbe env) 1 (isSetLength (payloadBytes (hCfg h0))) (FailWith (er C.eIO))
       _ ← grow env b (64 * mib) (128 * mib)
       rep ← closeBacking (envSvc env) b
-      (crClosed rep, crPendingReservation rep) `shouldBe` (True, Just (64 * mib))
+      (crClosed rep, crPendingReservation rep) `shouldBe` (True, Just overPending)
 
   -- A CHECK USES WHAT WAS OBTAINED, NOT WHAT WAS ASKED (growth): exactly the extra range and the headroom are
   -- available, the native allocation occupies 4,096 bytes more, and the growth is refused and given back.
@@ -192,6 +200,62 @@ spec = describe "Storage backend: growth" $ do
       (bvGrowthPrepared v, bvPendingReservation v, bvReservedBytes v) `shouldBe` (False, Nothing, 64 * mib)
       allocatedOf env >>= (`shouldSatisfy` backTo held0)
       reservedTotal env >>= (`shouldBe` (64 * mib))
+
+  -- ---- round 8, finding 2: THE COUNTED FIGURE COVERS WHAT WAS OBSERVED. A growth whose allocation the platform reports ABOVE the new
+  -- allowance, and whose rollback then fails, keeps a pending charge that covers ALL of it (not the nominal extra), carried through a failed
+  -- retry, a held close and a successful retry.
+  it "keeps the observed allocation as the pending charge when the rollback fails, through a failed retry and a held close" $ do
+    shown <- withEnvEndingWithKeptFailureWith defaultOptions {eoCloseFact = CloseNotEstablished} $ \env → do
+      let probe = envProbe env
+          observed = 64 * mib + overPending
+      b ← openBacking env ident (hCfg h0)
+      addRuleAfter probe 1 1 (== OpStatFile) (OverAllocated (10 * mib))
+      addRule probe 1 (isSetLength (payloadBytes (hCfg h0))) (FailWith (er C.eIO))
+      o ← grow env b (64 * mib) (128 * mib)
+      o `shouldSatisfy` \x → case x of Failed (ReservationFailed (OverheadExceedsModel {})) [CleanupNote IoSetLength _] → True; _ → False
+      sn ← atomically (snapshotOf (envSvc env))
+      [(pend, alloc, res)] ← pure [(bsPending x, bsAllocated x, bsReserved x) | x ← snBackings sn]
+      -- the pending charge is everything the file is known to hold beyond the committed reservation; eAllocated is the observed figure
+      (pend, alloc, res) `shouldBe` (Just overPending, observed, 64 * mib)
+      sum (snReserved sn) `shouldBe` observed
+      -- a retry whose release fails again keeps it (a failed release frees nothing: the figure never shrinks)
+      addRule probe 1 (isSetLength (payloadBytes (hCfg h0))) (FailWith (er C.eIO))
+      t ← submitReleasePending (envSvc env) b >>= either (fail . show) pure
+      awaitOutcome env t >>= \x → case x of Failed _ [CleanupNote IoSetLength _] → pure (); other → expectationFailure ("the retry was expected to fail: " <> show other)
+      sn2 ← atomically (snapshotOf (envSvc env))
+      ([bsPending x | x ← snBackings sn2], sum (snReserved sn2)) `shouldBe` ([Just overPending], observed)
+      -- the close is held (an errno under the macOS fact): the held record counts the OBSERVED figure, not the nominal one
+      addRule probe 1 (== OpCloseFile) (FailWith (er C.eIO))
+      rep ← closeBacking (envSvc env) b
+      (crClosed rep, crReservationHeld rep) `shouldBe` (True, True)
+      sn3 ← atomically (snapshotOf (envSvc env))
+      (map hsBytes (snHeld sn3), sum (snReserved sn3)) `shouldBe` ([observed], observed)
+    ("reservation held" `isInfixOf` shown) `shouldBe` True
+
+  it "keeps the pending charge at the nominal extra when nothing can be observed, and still covers a reading it did make" $ do
+    withEnv $ \env → do
+      let probe = envProbe env
+      b ← openBacking env ident (hCfg h0)
+      -- the verification reports 10 MiB over, the rollback fails, and every later report fails: the figure the verification gave is the
+      -- observed one and the pending charge covers it
+      addRuleAfter probe 1 1 (== OpStatFile) (OverAllocated (10 * mib))
+      addRule probe 1 (isSetLength (payloadBytes (hCfg h0))) (FailWith (er C.eIO))
+      addRuleAfter probe 2 (-1) (== OpStatFile) (FailWith (er C.eIO))
+      _ ← grow env b (64 * mib) (128 * mib)
+      v ← view env b
+      bvPendingReservation v `shouldBe` Just overPending
+    withEnv $ \env → do
+      let probe = envProbe env
+      b ← openBacking env ident (hCfg h0)
+      -- an exception from the allocation itself: no verification ran, and every report fails: NO observed figure exists and no better bound
+      -- exists than the request (the nominal extra), which is what the pending charge is
+      addRule probe 1 isReserve (Throw)
+      addRule probe 1 (isSetLength (payloadBytes (hCfg h0))) (FailWith (er C.eIO))
+      addRuleAfter probe 1 (-1) (== OpStatFile) (FailWith (er C.eIO))
+      -- (the job's exception is a defect: it finishes as a host failure)
+      grow env b (64 * mib) (128 * mib) >>= \o → case o of Failed (HostFailure _) _ → pure (); other → expectationFailure ("an exception from the allocation was expected: " <> show other)
+      v ← view env b
+      bvPendingReservation v `shouldBe` Just (64 * mib)
 
   it "admits a growth that leaves exactly the headroom after the extra allowance, and refuses one byte less" $ do
     withEnv $ \env → do
