@@ -611,6 +611,48 @@ spec = describe "Accounting and lifetime hardening" $ do
       forM_ readers $ \h → waitFor (readTVar (hostSettled h) >>= \x → check (not (null x)))
       settleChecks svc
 
+  -- The window between a removal's eligibility and its grant (the baseline's own shape): the owner is
+  -- held in the middle of a read's preparation, the removal becomes eligible, and a stream of reads of
+  -- its arena arrives. From eligibility to the decision no further preparation runs, however many
+  -- arrive: while an eligible transaction can take the slot no new pinned read starts, and once it has
+  -- the slot nothing behind it is prepared.
+  forM_ [5, 20, 60 ∷ Int] $ \hits →
+   it ("prepares nothing between a removal's eligibility and its decision, however many requests keep arriving (" <> show hits <> ")") $ do
+    gate <- newDisarmedGate
+    counting <- newIORef False
+    captured <- newIORef (0 ∷ Int)
+    committedAfter <- newIORef (Nothing ∷ Maybe Int)
+    let holding = gatedProbe (\p → case p of PointCaptured {} → True; _ → False) gate
+        probe = Probe $ \point → do
+          active <- readIORef counting
+          when active $ case point of
+            PointCaptured {} → modifyIORef' captured (+ 1)
+            PointStaging _ → modifyIORef' captured (+ 1)
+            PointBeforeCommit _ → readIORef captured >>= \seen → modifyIORef' committedAfter (Just . maybe seen id)
+            _ → pure ()
+          probePoint holding point
+    withGatedServiceUsing probe gate $ \svc → do
+      (_, lease) <- openMain svc "main"
+      _ <- readCell svc lease (tile 1 1 1)
+      removal <- newHost False
+      _ <- okOf (removeWith svc (hostEndpoint svc Nothing removal) lease (tile 0 1 1) Nothing)
+      waitFor (readTVar (hostReady removal) >>= \n → check (n >= 1))
+      -- a read holds the owner in the middle of its preparation
+      armGate gate
+      first' <- newHost True
+      _ <- okOf (cellWith svc (hostEndpoint svc Nothing first') lease (tile 1 1 1))
+      awaitReached gate
+      -- from here: the removal is eligible, and the stream arrives
+      writeIORef counting True
+      grant removal
+      forM_ [1 .. hits] $ \_ → do
+        host <- newHost True
+        okOf (cellWith svc (hostEndpoint svc Nothing host) lease (tile 1 1 1))
+      openGate gate
+      waitFor (readTVar (hostSettled removal) >>= \x → check (not (null x)))
+      readIORef committedAfter `shouldReturn` Just 0
+      settleChecks svc
+
   -- The other direction (the manager's RP2 Q2 (b)): a stream of grants must not starve a read. A read
   -- admitted amid accepted removals commits before every removal admitted after it (per-arena admission
   -- order holds for the slot too), so its wait is the removals before it, whatever follows.

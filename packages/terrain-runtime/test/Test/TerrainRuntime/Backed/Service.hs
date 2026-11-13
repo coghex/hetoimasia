@@ -11,7 +11,9 @@ module Test.TerrainRuntime.Backed.Service (spec) where
 import Control.Concurrent.STM
 import Control.Exception (finally, try)
 import Control.Monad (forM, forM_)
-import Hetoimasia.Terrain.Residency (ArenaId (..), Revision (..))
+import Hetoimasia.Terrain.Coordinate (decomposeTile, mkLocalCoord)
+import Hetoimasia.Terrain.Cell (Cell (..))
+import Hetoimasia.Terrain.Residency (ArenaId (..), RegionDemand (..), RegionInfo (..), Revision (..), coverageTile, modelRegions)
 import Hetoimasia.Terrain.Runtime
 import Hetoimasia.Terrain.Runtime.Settlement
 import Hetoimasia.Terrain.Runtime.Store.Admission (Ledger (..))
@@ -113,6 +115,48 @@ spec = describe "The backed terrain service" $ do
       readTVarIO granted >>= (`shouldSatisfy` (> grantsBefore))
       settleChecks svc
 
+  -- A waiting grant is not starved by reads that keep starting: from the grant's refusal (two reads
+  -- in flight hold the cache it needs, on the bank the service's construction check accepts at its
+  -- least) to the grant, no new pinned read starts, however many are admitted meanwhile.
+  forM_ [5, 20, 60 ∷ Int] $ \arrivals →
+   it ("starts no new pinned read between a grant's refusal for want of cache and the grant, however many reads arrive (" <> show arrivals <> ")") $ do
+    let need = toInteger (ramDecodedCopies A.worstTransactionCharge) + 2 * toInteger A.readerPinnedCacheBytes + toInteger resultPageBytes
+        config = defaultConfig {configMaxArenas = 1, configEditBank = A.defaultEditBankSpec {A.ebsCache = need, A.ebsArenas = 1, A.ebsReadersPerArena = 2}}
+    probe ← H.newProbe
+    gateRef ← newTVarIO Nothing
+    readsAtGrant ← newTVarIO Nothing
+    let owner = Probe $ \case
+          PointGranted (Just _) _ → atomically $ readTVar gateRef >>= mapM_ (\g → readTVar (H.gReached g) >>= \n → writeTVar readsAtGrant (Just n))
+          _ → pure ()
+    withServiceSeam quiet config alwaysAdmitting owner (H.seamFor probe) $ \svc → do
+      (client, lease) ← openMain svc "main"
+      _ ← removeCell' svc lease (tile 3 4 9)
+      atRest svc
+      edit ← newHost False
+      _ ← okOf (removeWith svc (hostEndpoint svc Nothing edit) lease (tile 3 4 5) Nothing)
+      waitFor (readTVar (hostReady edit) >>= \n → check (n >= 1))
+      atRest svc
+      gate ← H.addGate probe isRead
+      atomically (writeTVar gateRef (Just gate))
+      view ← okOf (openView svc client)
+      flip finally (H.openGate gate) $ do
+        -- two reads hold their pins and their results: the grant will not fit beside them
+        _ ← mapM (\at → okOf (cellAt svc lease at)) [tile 8 8 8, tile 9 9 9]
+        H.awaitReached gate 2
+        grant edit
+        -- a stream of reads of the arena, and a load of another of its regions, arrive while it waits
+        forM_ [1 .. arrivals] $ \k → okOf (cellAt svc lease (tile (fromIntegral k) 12 3))
+        let (far, _) = decomposeTile (tile 100 100 0)
+        _ ← okOf (setViewDemand svc view lease [RegionDemand far (either (error . show) coverageTile (mkLocalCoord 0 0 0))])
+        -- none of them has started a read: only the two are at the seam
+        atomically (readTVar (H.gReached gate)) `shouldReturn` 2
+      -- the two reads return, and the grant comes before any new read starts
+      _ ← waitFor (readTVar (hostSettled edit) >>= \s' → if null s' then retry else pure s')
+      readTVarIO readsAtGrant `shouldReturn` Just 2
+      okOf (clearViewDemand svc view)
+      closeView svc view
+      settleChecks svc
+
   it "answers reads of another arena while a removal's write is held, and answers a later read of the removal's arena after it, in admission order" $
     withProbedService defaultConfig $ \probe svc → do
       (client, lease) ← openMain svc "main"
@@ -140,6 +184,38 @@ spec = describe "The backed terrain service" $ do
       settledOf remover >>= (`shouldSatisfy` \case [Succeeded (ARemoved r)] → removeChangedFlag r; _ → False)
       -- and sees it
       settledOf reader >>= (`shouldSatisfy` \case [Succeeded (ACell c)] → cellIs c; _ → False)
+      settleChecks svc
+
+  -- Of the removal's own arena, what continues while its write is outstanding: a borrowed snapshot stays
+  -- readable (the committed state it was taken at), and a load of another of its regions (a view's
+  -- demand) reads the store and becomes resident. Its data requests admitted after the removal wait for
+  -- it, in admission order (the example above).
+  it "keeps a borrowed snapshot readable and completes a load of the same arena while a removal's write is held" $
+    withProbedService defaultConfig $ \probe svc → do
+      (client, lease) ← openMain svc "main"
+      _ ← removeCell' svc lease (tile 3 4 9)
+      _ ← readCell svc lease (tile 3 4 5)
+      atRest svc
+      let (held, _) = decomposeTile (tile 3 4 5)
+          (far, _) = decomposeTile (tile 40 40 0)
+      view ← okOf (openView svc client)
+      gate ← H.addGate probe isWrite
+      remover ← newHost True
+      outcome ← flip finally (H.openGate gate) $ withSnapshot svc lease [held] $ \snapshot → do
+        _ ← okOf (removeWith svc (hostEndpoint svc Nothing remover) lease (tile 3 4 5) Nothing)
+        H.awaitReached gate 1
+        -- the removal's write is held at the seam
+        _ ← okOf (setViewDemand svc view lease [RegionDemand far (either (error . show) coverageTile (mkLocalCoord 0 0 0))])
+        waitFor $ inspectModelSTM svc >>= \m → check (far `elem` map regionCoord (modelRegions m))
+        -- the snapshot reads the committed state: the earlier removal is air, the held one still solid
+        snapshotCell snapshot (tile 3 4 9) `shouldSatisfy` \case Known c → c == Air; _ → False
+        snapshotCell snapshot (tile 3 4 5) `shouldSatisfy` \case Known c → c /= Air; _ → False
+        readTVarIO (hostSettled remover) `shouldReturn` []
+      either (\r → expectationFailure (show r)) pure outcome
+      _ ← waitFor (readTVar (hostSettled remover) >>= \s' → if null s' then retry else pure s')
+      settledOf remover >>= (`shouldSatisfy` \case [Succeeded (ARemoved r)] → removeChangedFlag r; _ → False)
+      okOf (clearViewDemand svc view)
+      closeView svc view
       settleChecks svc
 
   it "keeps a read pending while its authoritative page is delayed, and answers it from the store, never from the source" $

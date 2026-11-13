@@ -187,12 +187,18 @@ nextWork svc token = do
         []
           | closing && stateBorrowers st == 0 && stopping && backedIdle st → pure WStop
           | otherwise → do
-              (prepareWork, commitWork) <- pickRequestWork svc st adm
+              -- THE GRANT IS NOT STARVED BY READS THAT KEEP STARTING: while the slot is free and the first
+              -- contender is a transaction that fits now, or waits for credits that pinned reads in flight
+              -- hold, no new pinned read starts (no request's gather, no load's dispatch): the wait is bounded
+              -- by the reads already in flight, and the grant comes next once it fits. A refusal no read can
+              -- cure (nothing in flight) stalls nothing.
+              holdReads <- if closing || isJust (stateSlot st) then pure False else readsYieldToGrant st adm
+              (prepareWork, commitWork) <- pickRequestWork svc st adm holdReads
               grantWork <- if closing || isJust (stateSlot st) then pure Nothing else grantable st adm
               -- a load is dispatched when the job the model would pick next can start its pinned read
               -- (only that job's arena needs a pin to spare)
               dispatchFits <-
-                if not (stateDispatchIdle st) && any ((== R.JobQueued) . R.jobPhase) (R.modelJobs model)
+                if not holdReads && not (stateDispatchIdle st) && any ((== R.JobQueued) . R.jobPhase) (R.modelJobs model)
                   then nextDispatchFits svc st adm
                   else pure False
               let (backedNow, backedWaits) = backedWork st
@@ -296,6 +302,26 @@ backedWork st = (now, waits)
       SlotDiscovery → True
       SlotReclaim → True
 
+-- | Whether new pinned reads wait for the grant: the first contender is a store transaction (its
+-- worst-case credits come from the edit bank the reads share) that fits now, or does not fit while
+-- pinned reads are in flight (their cache is what it waits for, and it returns as they end).
+readsYieldToGrant ∷ St → A.Admission → STM Bool
+readsYieldToGrant st adm = do
+  candidates <- contenders st
+  pure $ case candidates of
+    c : _
+      | Just aid <- transactionArena c →
+          either (const False) (const True) (A.reserve A.Foreground (A.transactionCredits aid A.worstTransactionCharge) adm)
+            || not (Map.null (stateGathers st))
+    _ → False
+  where
+    transactionArena = \case
+      ContendRemoval _ a _ → Just a
+      ContendDiscovery a → Just a
+      ContendReclaim a → Just a
+      ContendGrowth {} → Nothing
+      ContendRelease {} → Nothing
+
 -- | The contender the slot is granted to next, when its credits are available now.
 grantable ∷ St → A.Admission → STM (Maybe Work)
 grantable st adm = do
@@ -333,8 +359,8 @@ needsResubmit req = isDataCmd (reqCmd req) && waitingReadmission req
 -- | Work for the request table: stage whatever has its data (a read or a removal starts its
 -- gather; an open its preparation), then commit the next eligible command of each arena in
 -- admission order. A removal that changes content is not committed here: it takes the slot.
-pickRequestWork ∷ Service → St → A.Admission → STM (Maybe Work, Maybe Work)
-pickRequestWork svc st adm = do
+pickRequestWork ∷ Service → St → A.Admission → Bool → STM (Maybe Work, Maybe Work)
+pickRequestWork svc st adm holdReads = do
   candidates <- fmap catMaybes (forM (Map.elems groups) firstEligible)
   pure
     ( case filter needsPrepare ordered of (rid, _) : _ → Just (WPrepare rid); [] → Nothing
@@ -368,7 +394,7 @@ pickRequestWork svc st adm = do
       CAttach {} → True
       CGrow {} → True
       CRetry → True
-      _ → not (Map.member (GatherRequest rid) (stateGathers st)) && maybe False (canStartGather (gathersPerArena (serviceConfig svc)) st adm) (reqArena req)
+      _ → not holdReads && not (Map.member (GatherRequest rid) (stateGathers st)) && maybe False (canStartGather (gathersPerArena (serviceConfig svc)) st adm) (reqArena req)
     satisfied rid req = case reqCmd req of
       COpen {} → True
       CAttach {} → True

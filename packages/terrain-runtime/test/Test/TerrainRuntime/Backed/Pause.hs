@@ -4,11 +4,12 @@
 -- worker meets a real failure.
 module Test.TerrainRuntime.Backed.Pause (spec) where
 
-import Control.Concurrent.STM (check)
+import Control.Concurrent.STM (check, readTVar, retry)
 import Control.Exception (finally)
 import Hetoimasia.Terrain.Coordinate (decomposeTile, mkLocalCoord)
 import Hetoimasia.Terrain.Residency (RegionDemand (..), coverageTile)
 import Hetoimasia.Terrain.Runtime
+import Hetoimasia.Terrain.Runtime.Settlement
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Native (NativeOp (..))
 import Test.Hspec
 import Test.TerrainRuntime.Fixtures
@@ -66,28 +67,39 @@ spec = describe "A paused arena" $ do
       gate ← H.addGateOnce probe isRead
       view ← okOf (openView svc client)
       let (far, _) = decomposeTile (tile 100 100 0)
-      flip finally (H.openGate gate) $ do
+      (refusedAt, refusedHost, againHost, againAt) ← flip finally (H.openGate gate) $ do
         _ ← okOf (setViewDemand svc view lease [RegionDemand far (either (error . show) coverageTile (mkLocalCoord 0 0 0))])
         H.awaitReached gate 1
         -- buried removals, one region's worth at most, until one is refused storage_full
         let cells = [(x, y, z) | z ← [-31 .. -1], y ← [0 .. 15], x ← [0 .. 15]]
             go [] n = pure (n, Nothing)
-            go ((x, y, z) : rest) n =
-              removeAt svc lease (tile x y z) Nothing >>= expectRight >>= await svc >>= \case
-                Right _ → go rest (n + 1)
-                Left settled → pure (n, Just ((x, y, z), settled))
+            go ((x, y, z) : rest) n = do
+              host ← newHost True
+              _ ← okOf (removeWith svc (hostEndpoint svc Nothing host) lease (tile x y z) Nothing)
+              settled ← waitFor (readTVar (hostSettled host) >>= \s' → if null s' then retry else pure s')
+              case settled of
+                [Succeeded _] → go rest (n + 1)
+                _ → pure (n, Just ((x, y, z), host, rest))
         (committed, refused) ← go cells (0 ∷ Int)
-        case refused of
-          Just (_, Failed (StorageFailed (FaultFull (AllowanceExhausted needed available protected)))) → do
-            -- the free pages could not take the transaction beside the protected reserve
-            (needed + protected > available) `shouldBe` True
-          other → expectationFailure ("expected storage_full after " <> show committed <> " removals, got " <> show other)
+        (refusedAt, refusedHost, untouched) ← case refused of
+          Just found@(_, host, _) → do
+            settledOf host >>= \case
+              [Failed (StorageFailed (FaultFull (AllowanceExhausted needed available protected)))] →
+                -- the free pages could not take the transaction beside the protected reserve
+                (needed + protected > available) `shouldBe` True
+              other → expectationFailure ("expected storage_full, got " <> show other)
+            pure found
+          Nothing → expectationFailure ("no removal was refused after " <> show committed) >> fail "unreachable"
         status ← arenaStatus svc lease >>= expectRight
         statusStorage status `shouldBe` StoragePaused [CondCapacity]
         -- what was committed stays readable; a new removal settles at once with the same fault
         (cellIs <$> readCell svc lease (tile 0 0 (-31))) `shouldReturn` True
-        again ← removeAt svc lease (tile 8 8 (-20)) Nothing >>= expectRight >>= await svc
-        again `shouldSatisfy` \case Left (Failed (StorageFailed (FaultFull _))) → True; _ → False
+        againHost ← newHost True
+        let (ax, ay, az) = case untouched of c : _ → c; [] → (15, 15, -1)
+        _ ← okOf (removeWith svc (hostEndpoint svc Nothing againHost) lease (tile ax ay az) Nothing)
+        _ ← waitFor (readTVar (hostSettled againHost) >>= \s' → if null s' then retry else pure s')
+        settledOf againHost >>= (`shouldSatisfy` \case [Failed (StorageFailed (FaultFull _))] → True; _ → False)
+        pure (refusedAt, refusedHost, againHost, (ax, ay, az))
       -- the load's read returns and its pin goes; growth clears the capacity pause (and nothing else),
       -- and edits commit again
       okOf (clearViewDemand svc view)
@@ -96,6 +108,14 @@ spec = describe "A paused arena" $ do
       fmap grownChanged grown `shouldBe` Right True
       cleared ← arenaStatus svc lease >>= expectRight
       statusStorage cleared `shouldBe` StorageReady
+      -- nothing refused is repeated after recovery: both refused cells are still solid, and each
+      -- refused removal settled exactly once
+      let (rx, ry, rz) = refusedAt
+          (ax, ay, az) = againAt
+      (cellIs <$> readCell svc lease (tile rx ry rz)) `shouldReturn` False
+      (cellIs <$> readCell svc lease (tile ax ay az)) `shouldReturn` False
+      (length <$> settledOf refusedHost) `shouldReturn` 1
+      (length <$> settledOf againHost) `shouldReturn` 1
       resumed ← removeCell' svc lease (tile 9 9 (-2))
       removeChangedFlag resumed `shouldBe` True
       settleChecks svc
