@@ -4,6 +4,9 @@
 -- worker meets a real failure.
 module Test.TerrainRuntime.Backed.Pause (spec) where
 
+import Control.Exception (finally)
+import Hetoimasia.Terrain.Coordinate (decomposeTile, mkLocalCoord)
+import Hetoimasia.Terrain.Residency (RegionDemand (..), coverageTile)
 import Hetoimasia.Terrain.Runtime
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Native (NativeOp (..))
 import Test.Hspec
@@ -14,7 +17,7 @@ isRead ∷ NativeOp → Bool
 isRead = \case OpReadAt {} → True; _ → False
 
 spec ∷ Spec
-spec = describe "A paused arena" $
+spec = describe "A paused arena" $ do
   it "pauses only the arena whose page read back short, keeps its committed terrain readable, and lets another arena commit" $ do
     probe ← H.newProbe
     withServiceSeam quiet defaultConfig alwaysAdmitting noProbe (H.seamFor probe) $ \svc → do
@@ -43,4 +46,52 @@ spec = describe "A paused arena" $
       -- a successful read since does not clear an integrity pause
       status ← arenaStatus svc first >>= expectRight
       statusStorage status `shouldBe` StoragePaused [CondIntegrity]
+      settleChecks svc
+
+  -- storage_full through the real path (requirement 8; the manager's Q3 (a)): a reader pins an old
+  -- version (its page read held at the seam, once), so the pages each later commit retires cannot be
+  -- reclaimed; buried removals then fill the 64 MiB allowance until the planner finds the transaction
+  -- no longer fits beside the protected reclamation reserve.
+  it "pauses the arena storage_full when its allowance cannot take the next transaction, keeps its terrain readable, and grows out of it" $ do
+    probe ← H.newProbe
+    withServiceSeam quiet defaultConfig alwaysAdmitting noProbe (H.seamFor probe) $ \svc → do
+      (client, lease) ← openMain svc "main"
+      _ ← removeCell' svc lease (tile 0 0 (-32))
+      -- the pin: a view's load job whose page read is held (only that one). A load is not a request,
+      -- so no removal waits for it in admission order; its region is far from the removals.
+      gate ← H.addGateOnce probe isRead
+      view ← okOf (openView svc client)
+      let (far, _) = decomposeTile (tile 100 100 0)
+      flip finally (H.openGate gate) $ do
+        _ ← okOf (setViewDemand svc view lease [RegionDemand far (either (error . show) coverageTile (mkLocalCoord 0 0 0))])
+        H.awaitReached gate 1
+        -- buried removals, one region's worth at most, until one is refused storage_full
+        let cells = [(x, y, z) | z ← [-31 .. -1], y ← [0 .. 15], x ← [0 .. 15]]
+            go [] n = pure (n, Nothing)
+            go ((x, y, z) : rest) n =
+              removeAt svc lease (tile x y z) Nothing >>= expectRight >>= await svc >>= \case
+                Right _ → go rest (n + 1)
+                Left settled → pure (n, Just ((x, y, z), settled))
+        (committed, refused) ← go cells (0 ∷ Int)
+        case refused of
+          Just (_, Failed (StorageFailed (FaultFull (AllowanceExhausted needed available protected)))) → do
+            -- the free pages could not take the transaction beside the protected reserve
+            (needed + protected > available) `shouldBe` True
+          other → expectationFailure ("expected storage_full after " <> show committed <> " removals, got " <> show other)
+        status ← arenaStatus svc lease >>= expectRight
+        statusStorage status `shouldBe` StoragePaused [CondCapacity]
+        -- what was committed stays readable; a new removal settles at once with the same fault
+        (cellIs <$> readCell svc lease (tile 0 0 (-31))) `shouldReturn` True
+        again ← removeAt svc lease (tile 8 8 (-20)) Nothing >>= expectRight >>= await svc
+        again `shouldSatisfy` \case Left (Failed (StorageFailed (FaultFull _))) → True; _ → False
+      -- the load's read returns and its pin goes; growth clears the capacity pause (and nothing else),
+      -- and edits commit again
+      okOf (clearViewDemand svc view)
+      closeView svc view
+      grown ← growArena svc lease (128 * 1024 * 1024) >>= expectRight >>= await svc
+      fmap grownChanged grown `shouldBe` Right True
+      cleared ← arenaStatus svc lease >>= expectRight
+      statusStorage cleared `shouldBe` StorageReady
+      resumed ← removeCell' svc lease (tile 9 9 (-2))
+      removeChangedFlag resumed `shouldBe` True
       settleChecks svc

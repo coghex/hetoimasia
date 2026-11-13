@@ -40,6 +40,8 @@ module Hetoimasia.Terrain.Runtime.Internal.Backed
   , Gathered (..)
   , ReadWhat (..)
   , canStartGather
+  , sameCommittedSTM
+  , CommittedMovedOutsideDecision (..)
   , editBankReadsChecked
   , startGatherFor
   , stepGatherTask
@@ -69,7 +71,7 @@ module Hetoimasia.Terrain.Runtime.Internal.Backed
   ) where
 
 import Control.Concurrent.STM
-import Control.Exception (evaluate)
+import Control.Exception (Exception, evaluate)
 import Control.Monad (foldM, forM_, void, when)
 import Data.Int (Int64)
 import Data.List (sortOn)
@@ -193,6 +195,22 @@ storeOfArena st aid = case Map.lookup aid (stateArenas st) of
   Nothing → (\c → (closingStore c, closingBacking c)) <$> Map.lookup aid (stateClosing st)
 
 -- | Write an arena's store, live or closing.
+-- | THE CHECK OF EVERY OTHER WRITER. Every write of an arena's store outside the publication
+-- decision (a gather's pin and its release, the slot's admit/abort and growth state, a pause, a
+-- retry's cleared conditions) keeps the committed roots and version: only 'decide' publishes (and an
+-- open's adoption makes a new arena's FIRST root). A write that would move them is a defect, thrown
+-- inside the owner's transaction before anything is written.
+sameCommittedSTM ∷ ArenaId → St → Store → STM ()
+sameCommittedSTM aid st new = forM_ (storeOfArena st aid) $ \(old, _) →
+  when (storeRoots old /= storeRoots new || storeVersion old /= storeVersion new) $
+    throwSTM (CommittedMovedOutsideDecision aid (storeVersion old) (storeVersion new))
+
+-- | A store write outside the decision that would have moved the committed roots or version.
+data CommittedMovedOutsideDecision = CommittedMovedOutsideDecision !ArenaId !Word64 !Word64
+  deriving stock (Show)
+
+instance Exception CommittedMovedOutsideDecision
+
 putStore ∷ ArenaId → Store → St → St
 putStore aid store st =
   st
@@ -220,6 +238,7 @@ pauseArena svc aid condition fault pages = do
   st ← readSt svc
   forM_ (Map.lookup aid (stateArenas st)) $ \arena → do
     let record = FaultRecord fault (take faultPagesKept (faultPages fault <> pages))
+    sameCommittedSTM aid st (pauseFor condition (arenaStore arena))
     modifySt svc $ \s →
       s
         { stateArenas =
@@ -437,6 +456,7 @@ startGatherFor svc key aid what = do
       , canStartGather (gathersPerArena (serviceConfig svc)) st adm aid
       , Right (grant, adm') ← A.reserve A.Foreground (pinCredits aid) adm
       , Right (store', run) ← begin arena → do
+          sameCommittedSTM aid st store'
           writeTVar (serviceEditBank svc) adm'
           writeTVar (serviceState svc) (putStore aid store' st) {stateGathers = Map.insert key (GatherTask aid run grant (arenaRevision arena) (D.authKnowledge (arenaAuthority arena)) WakeNow) (stateGathers st)}
           pure True
@@ -498,7 +518,8 @@ stepGatherTask svc key deliver = do
         Right result → do
           atomically $ do
             s ← readSt svc
-            forM_ (storeOfArena s aid) $ \(current, _) →
+            forM_ (storeOfArena s aid) $ \(current, _) → do
+              sameCommittedSTM aid s (release' current run)
               writeTVar (serviceState svc) (putStore aid (release' current run) s) {stateGathers = Map.delete key (stateGathers s)}
             modifyTVar' (serviceEditBank svc) (releaseCredit (gatherGrant task))
             markFreed svc
@@ -666,6 +687,7 @@ stepSlot svc = do
             wanted = Map.member aid (stateArenas st) && requestAlive st (slotWork task) && not (slotYield task)
             end store' task' result = do
               atomically $ do
+                readSt svc >>= \s0 → sameCommittedSTM aid s0 store'
                 modifySt svc (\s → (putStore aid store' s) {stateSlot = Nothing})
                 forM_ (slotCredit task) $ \g → modifyTVar' (serviceEditBank svc) (releaseCredit g)
                 markFreed svc
@@ -677,7 +699,7 @@ stepSlot svc = do
                 then Txn.advance io (closingOf st aid) store run
                 else Txn.cancel io store run
             let task' = task {slotRun = SlotTxn run'}
-                keep wake = atomically (modifySt svc (\s → (putStore aid store' s) {stateSlot = Just task' {slotWake = wake}}))
+                keep wake = atomically (readSt svc >>= \s0 → sameCommittedSTM aid s0 store' >> modifySt svc (\s → (putStore aid store' s) {stateSlot = Just task' {slotWake = wake}}))
             case progress of
               More → keep WakeNow >> pure SlotGoesOn
               Blocked wait → keep (WakeOn wait) >> pure SlotGoesOn
@@ -689,7 +711,7 @@ stepSlot svc = do
                 then Growth.advanceGrowth io (closingOf st aid) store run
                 else Growth.abandonGrowth io store run
             let task' = task {slotRun = SlotGrow run'}
-                keep wake = atomically (modifySt svc (\s → (putStore aid store' s) {stateSlot = Just task' {slotWake = wake}}))
+                keep wake = atomically (readSt svc >>= \s0 → sameCommittedSTM aid s0 store' >> modifySt svc (\s → (putStore aid store' s) {stateSlot = Just task' {slotWake = wake}}))
             case progress of
               Growth.GrowthMore → keep WakeNow >> pure SlotGoesOn
               Growth.GrowthBlocked wait → keep (WakeOn wait) >> pure SlotGoesOn

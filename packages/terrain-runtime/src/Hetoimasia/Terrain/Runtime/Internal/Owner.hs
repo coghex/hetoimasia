@@ -32,9 +32,6 @@ import Control.Concurrent.STM
 import Control.Exception (Exception, SomeAsyncException, SomeException, evaluate, fromException, mask, onException, rethrowIO, throwIO, try, tryWithContext, uninterruptibleMask_)
 import Control.Monad (forM, forM_, unless, void, when)
 import Data.Int (Int64)
-import System.Environment (lookupEnv)
-import GHC.Clock (getMonotonicTime)
-import System.IO (hPutStrLn, stderr)
 import Data.List (sortOn)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (catMaybes, isJust, listToMaybe)
@@ -67,7 +64,7 @@ import qualified Hetoimasia.Terrain.Runtime.Store.Internal.Admission as A
 import qualified Hetoimasia.Terrain.Runtime.Backed.Growth as Growth
 import Hetoimasia.Terrain.Runtime.Backed.Fault (StorageFault (..))
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Service (ReadMode (..))
-import Hetoimasia.Terrain.Runtime.Storage.Internal.Service (PreparedGrowth, ServiceView (..), serviceView)
+import Hetoimasia.Terrain.Runtime.Storage.Internal.Service (PreparedGrowth)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Model (Condition (..), GrowthDecision (..), GrowthView (..), TxnId, clearCondition, conditions, growthView, oldestPin, proposeGrowth, storeConfig, storeHeader, storeRoots, storeVersion)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan (TxClass (..), availablePages)
 import Hetoimasia.Terrain.Runtime.Store.Internal.State (cfgAllowanceBytes, maxClaimPages)
@@ -419,24 +416,7 @@ pickRequestWork svc st adm = do
 -- Performing work
 
 perform ∷ Service → Work → IO Bool
-perform svc w = traceWork svc w >> perform' svc w
-
-traceWork ∷ Service → Work → IO ()
-traceWork svc w = do
-  on <- lookupEnv "HETOIMASIA_TRACE_OWNER"
-  t <- getMonotonicTime
-  when (on == Just "1") $ do
-    lg <- A.ledgers <$> readTVarIO (serviceEditBank svc)
-    hPutStrLn stderr ("bank: cacheB=" <> show (A.lgCacheBacked lg) <> " cacheR=" <> show (A.lgCacheRamOnly lg) <> " pinned=" <> show (A.lgCachePinned lg) <> " stagF=" <> show (A.lgStagingForeground lg) <> " ctl=" <> show (A.lgControlReserved lg))
-    sv <- atomically (serviceView (serviceStorage svc))
-    hPutStrLn stderr ("storage: queued=" <> show (svQueued sv) <> " running=" <> show (svRunning sv) <> " records=" <> show (svRecords sv) <> " waitingForCache=" <> show (svWaitingForCache sv) <> " mutating=" <> show (svMutating sv))
-  when (on == Just "1") $ hPutStrLn stderr ("owner: " <> show (round (t * 1000000) :: Integer) <> " " <> case w of
-    WCloseSession → "close"; WStop → "stop"; WVictim k → "victim " <> show k; WAck j → "ack " <> show j
-    WPrepare r → "prepare " <> show r; WCommit r → "commit " <> show r; WRetry → "retry"; WDispatch → "dispatch"; WReport → "report"
-    WOpen r → "open " <> show r; WGather k → "gather " <> show k; WSlot → "slot"; WGrant c → "grant " <> show c; WDrain a → "drain " <> show a)
-
-perform' ∷ Service → Work → IO Bool
-perform' svc = \case
+perform svc = \case
   WStop → pure False
   WCloseSession → atomically (closeServiceSTM svc) >> pure True
   WVictim key → releaseVictim svc key >> pure True
@@ -1169,6 +1149,7 @@ finishRetry svc rid certified = do
             fits = availablePages (storeConfig store) Ordinary (storeRoots store) >= fromIntegral maxClaimPages
             cleared = [c | c ← conditions store, c `elem` certified || (c == CondCapacity && fits)]
             store' = foldr clearCondition store cleared
+        sameCommittedSTM aid s store'
         modifySt svc $ \x →
           x {stateArenas = Map.insert aid arena {arenaStore = store', arenaFaults = foldr Map.delete (arenaFaults arena) cleared} (stateArenas x)}
         when (not (null cleared)) (markFreed svc)

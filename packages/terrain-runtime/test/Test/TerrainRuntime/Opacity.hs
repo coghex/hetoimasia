@@ -101,7 +101,7 @@ spec = describe "Terrain runtime opacity across the package boundary" $ do
 withClient ∷ FilePath → String → ((Mode → IO Client) → IO ()) → IO ()
 withClient =
   withPackageClient
-    ["base", "text", "stm", "hetoimasia-foundation", "hetoimasia-runtime", "hetoimasia-terrain", "hetoimasia-terrain-runtime-0.1.0.0-inplace"]
+    ["base", "bytestring", "text", "stm", "hetoimasia-foundation", "hetoimasia-runtime", "hetoimasia-terrain", "hetoimasia-terrain-runtime-0.1.0.0-inplace"]
 
 hidden ∷ [String]
 hidden =
@@ -183,14 +183,20 @@ supportedClient =
     , "import Hetoimasia.Terrain.Coordinate"
     , "import Hetoimasia.Terrain.Residency (Revision (..))"
     , "import Hetoimasia.Terrain.Runtime"
+    , "import qualified Hetoimasia.Terrain.Runtime.Storage as Storage"
+    , "import Hetoimasia.Terrain.Runtime.Store (StoreSpec (..), defaultStoreSpec, minAllowanceBytes)"
     , "import Hetoimasia.Terrain.Source"
     , ""
     , "main :: IO ()"
     , "main = withWorkerGroup $ \\group -> do"
-    , "  let logger = mkLogger defaultLogFilter (callbackSink (\\_ -> pure ()))"
-    , "      ports = Ports alwaysAdmitting (standaloneSupervisor group) logger noProbe"
+    , "  -- the arenas' private files go in this directory (the client's own), on its qualified filesystem"
+    , "  Right name <- Storage.filesystemOf \".\""
+    , "  let Right storage = Storage.mkStorageConfig [name] Storage.minHeadroomBytes"
+    , "      logger = mkLogger defaultLogFilter (callbackSink (\\_ -> pure ()))"
+    , "      ports = Ports alwaysAdmitting (standaloneSupervisor group) logger noProbe (storagePort group storage \".\")"
+    , "      config = defaultConfig {configStore = defaultStoreSpec {specAllowanceBytes = toInteger minAllowanceBytes}}"
     , "      definition = SourceSpec [\"soil\"] [LayerSpec Nothing (Just 10) \"soil\" 0] []"
-    , "  withTerrainService defaultConfig ports $ \\svc -> do"
+    , "  withTerrainService config ports $ \\svc -> do"
     , "    Right client <- registerClient svc"
     , "    Right opened <- openArena svc client \"main\" definition"
     , "    Right lease <- await svc opened"

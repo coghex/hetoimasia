@@ -8,7 +8,7 @@ import Control.Concurrent.STM
 import Control.Exception (ErrorCall (..), ExceptionWithContext (..), Exception (..), SomeException, asyncExceptionFromException, asyncExceptionToException, catch, fromException, throwIO, try)
 import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (find)
-import Control.Monad (forM_, void, when)
+import Control.Monad (forM, forM_, void, when)
 import qualified Data.Text as T
 import Hetoimasia.Foundation.Log (LogEntry (..), callbackSink, defaultLogFilter, mkLogger)
 import Hetoimasia.Terrain.Cell (zRangeLo)
@@ -498,9 +498,10 @@ spec = describe "Accounting and lifetime hardening" $ do
       settleChecks svc
 
   it "keeps a request that waits to be admitted again charged until it is readmitted or ends" $ do
-    -- A borrowed snapshot keeps the edited region resident (the baseline kept it protected by
-    -- failing every transfer; a backed commit transfers nothing), and the bank holds about one
-    -- region, so a request that needs another cannot be admitted again.
+    -- A pending read of the edited region (its host not yet eligible, so it holds no removal back)
+    -- keeps that region resident (the baseline kept it protected by failing every transfer; a
+    -- backed commit transfers nothing), and the bank holds about one region, so a request that
+    -- needs another cannot be admitted again.
     withServiceUsing microConfig alwaysAdmitting noProbe $ \svc → do
       client <- okOf (registerClient svc)
       let definition = layered [(Just 0, Just 2, "soil", 0), (Just 32, Just 34, "stone", 0)] [] ∷ SourceSpec
@@ -508,8 +509,10 @@ spec = describe "Accounting and lifetime hardening" $ do
       surfaceHost <- newHost False
       _ <- okOf (surfaceWith svc (hostEndpoint svc Nothing surfaceHost) lease (column 0 0))
       waitFor (readTVar (hostReady surfaceHost) >>= \n → check (n >= 1))
-      let (edited, _) = decomposeTile (tile 0 0 33)
-      outcome <- withSnapshot svc lease [edited] $ \_ → do
+      keeper <- newHost False
+      _ <- okOf (cellWith svc (hostEndpoint svc Nothing keeper) lease (tile 1 0 33))
+      waitFor (readTVar (hostReady keeper) >>= \n → check (n >= 1))
+      do
         -- Two edits bring the column's top down into the other region.
         _ <- removeCell' svc lease (tile 0 0 33)
         _ <- removeCell' svc lease (tile 0 0 32)
@@ -522,7 +525,6 @@ spec = describe "Accounting and lifetime hardening" $ do
         void (cancelPending svc first')
         -- Ending the arena ends the request once and returns its charge.
         closeService svc
-      either (\r → expectationFailure (show r)) pure outcome
       settledOf surfaceHost `shouldReturn` [Failed ArenaClosed]
       inspectReadmissionWaits svc `shouldReturn` 0
       inspectInvariants svc >>= (`shouldBe` [])
@@ -566,41 +568,70 @@ spec = describe "Accounting and lifetime hardening" $ do
         evidence `shouldContain` "the sink failed"
       Right () → expectationFailure "the supervised run ended cleanly"
 
+  -- A granted removal is not overtaken by the requests that keep arriving behind it: while the slot
+  -- runs it, no later request of its arena is prepared (what it would stage goes stale at that commit,
+  -- and it could not commit first), so the removal waits only for the storage jobs already queued
+  -- ahead of its own (at most the eight descriptors). The bound is exact: zero preparations of later
+  -- requests before its decision, however many arrive (the baseline's '<= 3' was a property of
+  -- RAM-only reads; every read now reads the store).
   forM_ [5, 20, 60 ∷ Int] $ \hits →
-   it ("serves an eligible staged commit within a bounded number of preparations, however many requests keep arriving (" <> show hits <> ")") $ do
-    gate <- newDisarmedGate
+   it ("serves a granted removal before any request that arrives behind it is prepared, however many arrive (" <> show hits <> ")") $ do
     counting <- newIORef False
     captured <- newIORef (0 ∷ Int)
     committedAfter <- newIORef (Nothing ∷ Maybe Int)
-    let holding = gatedProbe (\p → case p of PointCaptured {} → True; _ → False) gate
-        probe = Probe $ \point → do
+    granted <- newTVarIO False
+    let probe = Probe $ \point → do
           active <- readIORef counting
           when active $ case point of
             PointCaptured {} → modifyIORef' captured (+ 1)
+            PointStaging _ → modifyIORef' captured (+ 1)
+            PointGranted (Just _) _ → atomically (writeTVar granted True)
             PointBeforeCommit _ → readIORef captured >>= \seen → modifyIORef' committedAfter (Just . maybe seen id)
             _ → pure ()
-          probePoint holding point
-    withGatedServiceUsing probe gate $ \svc → do
+    withServiceUsing defaultConfig alwaysAdmitting probe $ \svc → do
       (_, lease) <- openMain svc "main"
       _ <- readCell svc lease (tile 1 1 1)
       removal <- newHost False
       _ <- okOf (removeWith svc (hostEndpoint svc Nothing removal) lease (tile 0 1 1) Nothing)
       waitFor (readTVar (hostReady removal) >>= \n → check (n >= 1))
       writeIORef counting True
-      armGate gate
-      -- A cache hit holds the owner mid-preparation; behind it the removal is granted
-      -- and a long run of further cache hits arrives.
-      first' <- newHost True
-      _ <- okOf (cellWith svc (hostEndpoint svc Nothing first') lease (tile 1 1 1))
-      awaitReached gate
       grant removal
-      forM_ [1 .. hits] $ \_ → do
+      waitFor (readTVar granted >>= check)
+      -- behind the granted removal, a run of reads of its arena
+      readers <- forM [1 .. hits] $ \_ → do
         host <- newHost True
-        okOf (cellWith svc (hostEndpoint svc Nothing host) lease (tile 1 1 1))
-      openGate gate
+        _ <- okOf (cellWith svc (hostEndpoint svc Nothing host) lease (tile 1 1 1))
+        pure host
       waitFor (readTVar (hostSettled removal) >>= \x → check (not (null x)))
-      -- However long the run behind it, the commit came after at most a few preparations.
-      readIORef committedAfter >>= \c → c `shouldSatisfy` maybe False (<= 3)
+      readIORef committedAfter `shouldReturn` Just 0
+      -- and every read is answered after it, seeing it
+      forM_ readers $ \h → waitFor (readTVar (hostSettled h) >>= \x → check (not (null x)))
+      settleChecks svc
+
+  -- The other direction (the manager's RP2 Q2 (b)): a stream of grants must not starve a read. A read
+  -- admitted amid accepted removals commits before every removal admitted after it (per-arena admission
+  -- order holds for the slot too), so its wait is the removals before it, whatever follows.
+  forM_ [5, 20, 60 ∷ Int] $ \later →
+   it ("answers a read admitted amid a stream of removals before any removal admitted after it (" <> show later <> " after)") $
+    withService defaultConfig $ \svc → do
+      (_, lease) <- openMain svc "main"
+      order <- newTVarIO ([] ∷ [String])
+      let noting label = do
+            host <- newHost True
+            pure (host, (hostEndpoint svc Nothing host) {endpointSettle = \s → modifyTVar' order (label :) >> modifyTVar' (hostSettled host) (s :)})
+          removal label x = do
+            (host, ep) <- noting label
+            _ <- okOf (removeWith svc ep lease (tile x 4 3) Nothing)
+            pure host
+      before' <- forM [0, 1] (removal "earlier")
+      (reader, readEp) <- noting "read"
+      _ <- okOf (cellWith svc readEp lease (tile 0 9 3))
+      after' <- forM [2 .. fromIntegral later + 1] (removal "later")
+      forM_ (reader : before' <> after') $ \h → waitFor (readTVar (hostSettled h) >>= \x → check (not (null x)))
+      settledOrder <- reverse <$> readTVarIO order
+      -- the read settled before every later removal: what came before it is at most the two earlier ones
+      takeWhile (/= "read") settledOrder `shouldSatisfy` all (== "earlier")
+      length settledOrder `shouldBe` 3 + later
       settleChecks svc
 
   it "dispatches a queued load while every preparation is followed by a cancellation and a replacement, with a view registered" $ do
