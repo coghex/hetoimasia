@@ -1972,9 +1972,10 @@ created), where it used to be refused at the registration, after the allocation,
 it becomes the entry's grant in the same transaction that publishes the backing; a clean unwind releases it; a HELD unwind moves it,
 with the volume and the bytes the file may occupy, to a held record (`stHeld`, named by the descriptor, to the service's end,
 labelled evidence typed like a registered backing's close failure: `BackingCloseFailed` with the errno, `BackingCloseRaised` with the
-bounded text). The held bytes are the larger of the allowance asked and what was observed once a reservation was attempted (a fresh
-report of the descriptor is taken before the unwind's close, so what the held record counts is never less than what the adapter
-last told the service), and nothing if no reservation was attempted (the record still names the descriptor). The job's finish
+bounded text). The held bytes are the larger of the allowance asked and the HIGH-WATER of what the platform reported for the file during the open
+(the observation recorder, item 24: every allocation the open read is recorded the instant it is read, so the held record counts
+at least what the adapter ever told the service during the open, whichever exit the open took, and a fresh report of the descriptor
+taken before the unwind's close joins it), and nothing if no reservation was attempted (the record still names the descriptor). The job's finish
 releases whatever no exit consumed (never a leak), and a held close that finds no presecured record is a **defect** (`OpenChargeMissing`, thrown in the
 transaction), not a silent drop: it is unreachable by construction.
 
@@ -2004,7 +2005,7 @@ sweep, not only in a dedicated example (R8-O1: the unwind never holds, AND the s
 
 *The sweep* crosses every native step that changes an allocation (and every other native step) with every exit and BOTH platform
 facts about a failed close: 21 steps x 8 exits (success, an errno, an errno AFTER the effect, a raise in the call's wrapper, a raise in
-the seam's before-hook, a raise after the effect thrown or asynchronous, a cancellation) x 2 facts = **336 cases** (round 7: 105). The
+the seam's before-hook, a raise after the effect thrown or asynchronous, a cancellation) x 2 facts = **336 cases** in round 8 (round 7: 105; round 9 added rows and a compound family: item 24). The
 harness gained a before-hook raise for any operation and an errno-after-the-effect for the allocation, length and close calls, and the
 rollback row's over-report is persistent (the adapter keeps over-reporting from the verification on: what it is told is what it must count).
 The step x exit table:
@@ -2037,6 +2038,60 @@ The rule x path table (every rule of rounds 4 to 7 against every path that ends 
 | owned copies, by type | N | N | N | N | A (the directory and the configuration are copied at `submitOpen`) | A | N | N | N | N |
 | the resolvers (one per handle type) | A (`closeBacking`) | N (internal ids) | A (`resolveTicket`) | N | N (a job id) | N | A (`submitGrowth`) | A (`submitReleasePending`) | N | N |
 | the sealed phase | A (the keeper is a defect on a sealed service) | A (the seal joins the records, clears the held ones and releases their grants) | A | A | A (opens finish before the seal) | A | A (mutators refused) | A | A (`stopService`) | A (the join precedes the seal) |
+
+**24. An observation is recorded the instant it is made** (round 9). Round 8's rule was "the counted figure covers what was observed". Round 9's
+finding was the same rule with an observation that was MADE and then DROPPED: `reserveRange`'s verification had read the file's allocation and refused
+(the headroom after the allocation, the length, the coverage), and handed back only the failure and the acquired flag; the open's unwind, whose own re-read
+then failed, held only the allowance, and a growth passed no figure to its give-back on the same exits. The repair is one mechanism, the round 4 recorder
+(item 12) applied to observations, not a wider failure value.
+
+*The recorder.* `Seen` (`Native.hs`) is a high-water cell per EPISODE of work (an open, a growth, a release) that the CALLER owns; it only ever rises. Every place the
+service reads a file's allocation from the platform on a path that can change or account it hands the figure to it THE INSTANT it is read: `seenStat` runs a
+stat through `around` with `Acquires`, so the recorder runs before the after-hook can raise, and `reserveRange` (the profile's allocation-before and the
+verification's), `releaseExtra`'s stat and the service's own re-reads (`observedAllocationFd`, `allocatedAfter`) all record into the caller's cell. `execOpen`,
+`execGrow` and `execRelease` each own one, and EVERY exit reads it: a typed refusal after the stat, a cancellation, an exception, an after-hook raise. The held record of
+an unregistered open counts `max allowance (high-water)`; a growth's give-back and a release-pending retry cover `max (nominal, high-water - committed)`. Nothing
+reconstructs a figure from a returned value, and no exit passes "nothing" for a figure that was seen.
+
+*Where the high-water lives for a registered backing* (decided). The episode's cell lives in the job and is folded into the entry at EVERY exit of the episode: a
+failure exit sets the pending charge to cover the cell and raises `eAllocated` to it; a SUCCESSFUL free REPLACES `eAllocated` with the fresh report (the epoch ends: the
+earlier figure is obsolete because the file was truncated). So `eAllocated` is, by construction, the high-water of the current accounting epoch, and the invariant is
+`bsAllocated <= reserved + pending` for every backing (checked after every step), with the oracle's second reading below. **What a successful release whose
+re-read fails assumes, and why:** if the truncation was reported successful and the fresh report cannot be read, the service counts the committed reservation
+(`allocatedAfter`'s bound is the reservation it just restored). That assumes the truncation freed the extra: the platform answered success, so the file is at most the
+committed reservation plus the platform's own overhead (the fit rule bounded that overhead when the file was verified), the epoch has ended, and the earlier
+figures are obsolete; it does not assume anything about a release that FAILED (that keeps the pending charge over the whole high-water).
+
+*The oracle's second reading* (the harness and `invariantProblems`). The harness tracks per file (per incarnation, so a reused descriptor number cannot confuse it) the volume
+and the LARGEST allocation the adapter reported since its last successful allocation-changing call (a reserve or a set-length answered with success), lies included, and
+whether the file may still hold space (not cleanly released: a close that returned success, or an errno where the platform fact is established, releases it; a raise, or an errno
+where it is not established, does not). The checker asserts, per volume, that the service's counted figure is at least the sum of those figures for every file that may
+still hold space (a backing, a closing record, a running open or a held record each name one). It is independent of the service's own bookkeeping and complements the first
+reading (the descriptors' physical holdings, whose "last reported" figure now also resets on a successful allocation-changing call). With the recorder undone it fails in
+the sweep (control R9-A1; R9-A3 and R9-A4 too).
+
+*The sweeps.* The main sweep (item 23) is now 27 native steps x 8 exits x both close facts = **432 cases** (round 8: 336): new rows where the verification
+reports MORE than the allowance (the headroom after the allocation, the fit) and every later stat fails, crossed with the close's or the rollback's exits, and the verification stat itself
+with an after-hook raise. It crosses ONE injection at a time, so the COMPOUND FAMILY expresses what needs two: **114 examples, about 2 seconds**. OPEN: {a length the platform did not
+establish, a coverage it did not give, the headroom after the allocation, the fit, a raise after the stat} x {the cleanup's re-read fails | succeeds} x {the cleanup close: clean | an
+errno | a raise in the wrapper | a raise in the before-hook} x both facts = 80; GROWTH: the same five x {the re-read fails | succeeds} x {the rollback succeeds | fails | raises} = 30;
+RELEASE-PENDING: {its own stat reports 20 MiB more} x {the set-length fails | raises} x {the re-read fails | succeeds} = 4. **The reviewer's scenario** is the open row "the headroom after
+the allocation is gone; the cleanup's re-read FAILS; the close: a raise" (under either fact): a 64 MiB open observes 64 MiB + 4,096, is refused for headroom, the re-read fails and the close is
+uncertain, and the held record counts **67,112,960** bytes, asserted exactly (the allowance, which was all the service kept before the repair, plus the 4,096). The failed-open examples' headroom row changed from the allowance to
+that figure: the old expectation encoded the bug.
+
+*Every value the service reads from the platform*, where it is used, and whether a later decision on any exit could need it after the reader has returned or raised:
+
+| Read | Where | Used for | Needed after the reader returns or raises? | Now |
+| --- | --- | --- | --- | --- |
+| the profile's stat: device, allocation before | `reserveRange` (`profileOfSeen`) | qualification (the device), `obtained` (the bytes the file gained) | the allocation before is part of the episode's observed history | recorded in the cell (round 9; it was dropped) |
+| the profile's statfs: free bytes, block size, type | `reserveRange` | the headroom precheck and re-check, the qualified list | no: decisions inside the call; the profile is returned in `Reserved` | n/a |
+| `verifyPrivate`'s stat: device, links, mode, owner | `execOpen` | the volume key, the privacy checks (the allocation of a fresh empty file is 0) | the device only, which is returned | n/a |
+| the verification stat: size, allocation | `reserveRange` | length, coverage, headroom after, fit, `Reserved` | YES on every refusal after it: the cleanup and the rollback account what it showed | recorded through `around`'s `Acquires` (the review's finding: it was returned only on success) |
+| `releaseExtra`'s stat: size, allocation | `releaseExtra` | the decision to raise the length first; the allocation was ignored | YES: a retry whose stat shows more than the pending charge covers, then fails | recorded (round 9; it was dropped) |
+| `observedAllocation`, `observedAllocationFd` | the unwind, a give-back's failure, `pendAgain` | fresh re-reads | they are the observations | recorded in the same cell |
+| `allocatedAfter` | a give-back's and a release's success | `eAllocated` and the excess left pending | the success path replaces the figure (the free succeeded) | records into the cell too (harmless) |
+| `nativeCloexec` | `verifyPrivate` | the exec-leak check | no | n/a |
 
 Smaller rules that hold the same class:
 
@@ -2191,6 +2246,7 @@ run anywhere else. The storage examples hold the class of defect, not the instan
   after it available (admitted), one byte less headroom (refused before any native allocation), a seam that over-allocates by
   exactly the budget (admitted with allocated equal to the allowance) and by one byte more (refused and unwound), and, with the
   headroom kept after the allowance, a seam whose obtained bytes take part of it (refused).
+* **Round 9** (item 24; `Lifecycle`, `Classes`, `Harness`): the main sweep at 27 native steps x 8 exits x both close facts = 432 cases (round 8: 336), with rows where the verification over-reports and every later stat fails; the compound family of 114 examples (an open's five post-stat refusals x the re-read failing or succeeding x four close exits x both facts, a growth's five refusals x the re-read x the rollback succeeding, failing or raising, and a release-pending retry whose own stat observes more); the reviewer's scenario by name; the oracle's second reading.
 * **Round 8** (item 23; `Lifecycle`, `Classes`, `Growth`): the 36 failed-open examples (six stages after the allocation: the length, the verification, the headroom after the allocation, the fit, a registration cancelled, an exception, each with a cleanup close that is an errno, a raise in the wrapper or a raise in the before-hook, under both facts: the held record, the volume's figure, the control charge kept after the outcome is taken, one native close, the typed evidence with its text); the observed-pending examples (the failed rollback, a failed retry, a held close, a retry; the unobservable case and its bound); the 336-case sweep under the oracle; the pressure refusal before any allocation.
 * **The payload rule and the platform close-fact table** (item 22; `Open`, `Growth`, `Lifecycle`, `Classes`): the file's length is
   the model's usable pages; a tail page and a request whose configuration has the same allowance and a smaller overhead are
