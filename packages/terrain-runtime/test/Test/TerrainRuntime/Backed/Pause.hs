@@ -50,7 +50,7 @@ spec = describe "A paused arena" $ do
       statusStorage status `shouldBe` StoragePaused [CondIntegrity]
       settleChecks svc
 
-  -- storage_full through the real path (requirement 8; the manager's Q3 (a)): a reader pins an old
+  -- storage_full through the real path (requirement 8): a reader pins an old
   -- version (its page read held at the seam, once), so the pages each later commit retires cannot be
   -- reclaimed; buried removals then fill the 64 MiB allowance until the planner finds the transaction
   -- no longer fits beside the protected reclamation reserve.

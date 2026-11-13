@@ -653,7 +653,7 @@ spec = describe "Accounting and lifetime hardening" $ do
       readIORef committedAfter `shouldReturn` Just 0
       settleChecks svc
 
-  -- The other direction (the manager's RP2 Q2 (b)): a stream of grants must not starve a read. A read
+  -- The other direction: a stream of grants must not starve a read. A read
   -- admitted amid accepted removals commits before every removal admitted after it (per-arena admission
   -- order holds for the slot too), so its wait is the removals before it, whatever follows.
   forM_ [5, 20, 60 ∷ Int] $ \later →
