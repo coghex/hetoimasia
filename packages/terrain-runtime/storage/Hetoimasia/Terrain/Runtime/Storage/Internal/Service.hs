@@ -134,6 +134,7 @@ module Hetoimasia.Terrain.Runtime.Storage.Internal.Service
   , CloseFailure (..)
   , EvidenceDropped (..)
   , SealedMutation (..)
+  , OpenChargeMissing (..)
   , ClosingRec (..)
   , transferBufferBytes
   , resultPageBytes
@@ -655,6 +656,12 @@ keptEntryBytes = 2048
 
 -- | A mutator reached a sealed (drained) service: nothing may commit to it any more, and the one that cannot be
 -- refused is a defect.
+-- | A defect of the open's accounting: its presecured charge was gone when a held close was settled (unreachable by construction).
+newtype OpenChargeMissing = OpenChargeMissing Text
+  deriving stock (Show)
+
+instance Exception OpenChargeMissing
+
 newtype SealedMutation = SealedMutation Text
   deriving stock (Show)
 
@@ -1782,7 +1789,10 @@ execOpen svc jid spec = do
     settleUnwound co c (OpenInfo dev attempted observed) = do
       s ← readTVar (svState svc)
       case Map.lookup jid (stOpening s) of
-        Nothing → pure ()
+        -- UNREACHABLE BY CONSTRUCTION, and therefore LOUD: the open's charge is secured before anything exists and is consumed by exactly one
+        -- exit (the registration, this settlement, or the job's finish), and the unwind runs only before the registration. A held close that
+        -- found no presecured record would otherwise be dropped silently (no record, no bytes, no evidence): it is a defect instead.
+        Nothing → throwSTM (OpenChargeMissing "the open's presecured charge was gone when its close was settled")
         Just (OpenRec g _)
           | clHeld co → do
               let bytes = if attempted then max allowance observed else 0
@@ -1793,7 +1803,10 @@ execOpen svc jid spec = do
                 , stHeld = Map.insert hid (Held dev bytes g (crFd c)) (stHeld s)
                 , stReserved = if bytes > 0 then Map.insertWith (+) dev bytes (stReserved s) else stReserved s
                 }
-              keepEvidence svc "open cleanup: the close of an unregistered backing (reservation held: a failed close is not established to release)" [KeptNote (CleanupNote IoClose (fromMaybe (Errno (-1)) (clErr co)))]
+              -- kept TYPED like the close of a registered backing (round 4): the held record's id, and the errno or the (bounded) text the
+              -- close raised; the end reports it as BackingCloseFailed or BackingCloseRaised
+              keepEvidence svc ("open cleanup: the close of an unregistered backing " <> T.pack (show hid) <> " (reservation held: a failed close is not established to release)")
+                ([KeptClose hid (CloseErrno en) | Just en ← [clErr co]] <> [KeptClose hid (CloseRaised t) | Just t ← [clThrown co]])
           | otherwise → releaseOpening svc jid
     step op act = do
       r ← tryWithContext act ∷ IO (Either (ExceptionWithContext SomeException) [CleanupNote])

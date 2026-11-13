@@ -659,7 +659,7 @@ spec = describe "Storage backend: the lifecycle matrix" $ do
   -- allocation; where the close is held (an errno where it is not established, any raise) it moves to a held record with the volume and the
   -- bytes the file may occupy, and stays, charged, after the failed outcome has been taken and its job charge released, to the service's end; one native
   -- close only; labelled evidence; where it is not held, everything is released.
-  forM_ [(fact, stg, cl) | fact <- [CloseReleasesOnFailure, CloseNotEstablished], stg <- openStages, cl <- openCloses] $ \(fact, (stgName, stgSetup, stgCancels, stgBytes, _), (clName, clSetup, clHeldBy)) ->
+  forM_ [(fact, stg, cl) | fact <- [CloseReleasesOnFailure, CloseNotEstablished], stg <- openStages, cl <- openCloses] $ \(fact, (stgName, stgSetup, stgCancels, stgBytes, stgExc), (clName, clSetup, clHeldBy)) ->
     it ("keeps a failed open's allocation counted when its cleanup close is held (" <> show fact <> "; " <> stgName <> "; the close: " <> clName <> ")") $ do
       let cfg = hCfg h0
           allowance = cfgAllowanceBytes cfg
@@ -708,6 +708,13 @@ spec = describe "Storage backend: the lifecycle matrix" $ do
         then do
           shown <- withEnvEndingWithKeptFailureWith defaultOptions {eoCloseFact = fact} body
           ("reservation held" `isInfixOf` shown) `shouldBe` True
+          -- THE UNREGISTERED CLOSE KEEPS ITS IDENTITY, typed like the close of a registered backing: the errno, or the text the close raised
+          -- (never an errno of -1 with the text gone)
+          case clName of
+            "an errno" -> ("BackingCloseFailed" `isInfixOf` shown, "(Errno 5)" `isInfixOf` shown) `shouldBe` (True, True)
+            "a raise in the native call's wrapper" -> ("BackingCloseRaised" `isInfixOf` shown, "user error (injected exception)" `isInfixOf` shown) `shouldBe` (True, True)
+            _ -> ("BackingCloseRaised" `isInfixOf` shown, "injected exception in a before-hook" `isInfixOf` shown) `shouldBe` (True, True)
+          unless stgExc (("Errno (-1)" `isInfixOf` shown) `shouldBe` False)
         else withEnvWith defaultOptions {eoCloseFact = fact} body
 
   forM_ [("discardTicket of a finished open", \svc t _ -> discardTicket svc t), ("closeBacking", \svc _ b -> void (closeBacking svc b))] $ \(name, close) ->
