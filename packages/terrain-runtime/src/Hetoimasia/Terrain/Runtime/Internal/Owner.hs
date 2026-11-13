@@ -33,6 +33,7 @@ import Control.Exception (SomeAsyncException, SomeException, evaluate, fromExcep
 import Control.Monad (forM, forM_, unless, void, when)
 import Data.Int (Int64)
 import System.Environment (lookupEnv)
+import GHC.Clock (getMonotonicTime)
 import System.IO (hPutStrLn, stderr)
 import Data.List (sortOn)
 import qualified Data.Map.Strict as Map
@@ -376,12 +377,16 @@ pickRequestWork _ st adm = do
 -- Performing work
 
 perform ∷ Service → Work → IO Bool
-perform svc w = traceWork w >> perform' svc w
+perform svc w = traceWork svc w >> perform' svc w
 
-traceWork ∷ Work → IO ()
-traceWork w = do
+traceWork ∷ Service → Work → IO ()
+traceWork svc w = do
   on <- lookupEnv "HETOIMASIA_TRACE_OWNER"
-  when (on == Just "1") $ hPutStrLn stderr ("owner: " <> case w of
+  t <- getMonotonicTime
+  when (on == Just "1") $ do
+    lg <- A.ledgers <$> readTVarIO (serviceEditBank svc)
+    hPutStrLn stderr ("bank: cacheB=" <> show (A.lgCacheBacked lg) <> " cacheR=" <> show (A.lgCacheRamOnly lg) <> " pinned=" <> show (A.lgCachePinned lg) <> " stagF=" <> show (A.lgStagingForeground lg) <> " ctl=" <> show (A.lgControlReserved lg))
+  when (on == Just "1") $ hPutStrLn stderr ("owner: " <> show (round (t * 1000000) :: Integer) <> " " <> case w of
     WCloseSession → "close"; WStop → "stop"; WVictim k → "victim " <> show k; WAck j → "ack " <> show j
     WPrepare r → "prepare " <> show r; WCommit r → "commit " <> show r; WRetry → "retry"; WDispatch → "dispatch"; WReport → "report"
     WOpen r → "open " <> show r; WGather k → "gather " <> show k; WSlot → "slot"; WGrant c → "grant " <> show c; WDrain a → "drain " <> show a)

@@ -762,7 +762,9 @@ spec = describe "Terrain windows and banks" $ do
                 unless inInit $ untilPrinted world "opened" >> stopSpawned spawned
                 failure ← settledFailure spawned
                 failure `shouldSatisfy` isJust
-                limitHeld (rgService rig) "arenas" `shouldReturn` 0
+                -- an open the instance's end cancelled keeps its arena place until its reservation job has
+                -- drained and any file it made is closed (#665): then nothing is left
+                pumpUntil world ((== 0) <$> limitHeld (rgService rig) "arenas")
                 limitHeld (rgService rig) "leases" `shouldReturn` 0
                 -- the application forgets an instance it has observed end, as the session does: its terrain client ends with it
                 limitHeld (rgService rig) "clients" `shouldReturn` 1

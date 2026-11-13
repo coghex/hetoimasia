@@ -110,7 +110,7 @@ import Hetoimasia.Terrain.Runtime.Storage.Internal.Service
   )
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Types (WorkClass (..))
 import qualified Hetoimasia.Terrain.Runtime.Store.Internal.Admission as A
-import Hetoimasia.Terrain.Runtime.Store.Internal.Admission (Admission, Grant)
+import Hetoimasia.Terrain.Runtime.Store.Internal.Admission (Admission)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Format (PageNo, StoreIdentity (..))
 import Hetoimasia.Terrain.Runtime.Store.Internal.Model (ActiveView (..), Condition (..), GrowthProposal, Store, activeView, storeConfig, TxnId, conditions, oldestPin, pauseFor, storeFromRoots, storeHeader, storeRoots, storeVersion)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan (Plan)
@@ -148,12 +148,6 @@ data OwnerOps = OwnerOps
 -- is taken.
 pinCredits ∷ ArenaId → [A.Credit]
 pinCredits aid = [A.CacheCredit aid A.readerPinnedCacheBytes A.Backed True]
-
--- | Give a grant back: its staging and control, and its cache entries (unpinned, then dropped).
-releaseCredit ∷ Grant → Admission → Admission
-releaseCredit g adm0 = foldr dropOne (A.release g adm0) (A.grantEntries g)
-  where
-    dropOne entry adm = either (const (A.unpinEntry entry adm)) id (A.dropEntry entry (A.unpinEntry entry adm))
 
 -- ---------------------------------------------------------------------------
 -- Shared

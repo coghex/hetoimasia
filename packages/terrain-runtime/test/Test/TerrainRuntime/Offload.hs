@@ -4,7 +4,9 @@ module Test.TerrainRuntime.Offload (spec) where
 
 import Control.Monad (foldM_, forM_)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Model (Usage (..))
+import Hetoimasia.Terrain.Cell (zRangeHi, zRangeLo)
 import Hetoimasia.Terrain.Coordinate (RegionCoord (..), decomposeTile)
+import Hetoimasia.Terrain.Query (Run (..))
 import Hetoimasia.Terrain.Residency
 import Hetoimasia.Terrain.Runtime
 import Hetoimasia.Terrain.Source (CellSpec (..), PatchSpec (..), SourceSpec)
@@ -41,7 +43,13 @@ spec = describe "Offload and reload" $ do
     withService (tightConfig (2, 1, 2) 2 4096) $ \svc → do
       client <- okOf (registerClient svc)
       lease <- okOf (openArena svc client "deep" terrainSpec) >>= await svc >>= expectSuccess
-      let removeAndCheck revision (n, at) = do
+      let checkColumn done revision (RegionCoord _ _ rz) (cx, cy) = do
+            let lo = toInteger rz * 32
+            found <- okOf (columnAt svc lease (column cx cy) (range lo (lo + 32))) >>= await svc >>= expectSuccess
+            columnRevision found `shouldBe` Revision revision
+            [ (cz, cellMaterial (runCell run)) | run ← columnAnswerRuns found, cz ← [zRangeLo (runRange run) .. zRangeHi (runRange run) - 1]]
+              `shouldBe` [(cz, expectedMaterial terrainSpec done (cx, cy, cz)) | cz ← [lo .. lo + 31]]
+          removeAndCheck revision (n, at) = do
             let (x, y, z) = at
                 earlier = take n removals
                 done = take (n + 1) removals
@@ -50,14 +58,16 @@ spec = describe "Offload and reload" $ do
             -- Removing a cell that was air already (the authored gap) changes nothing.
             let revision' = if wasSolid then revision + 1 else revision
             (removeChangedFlag answer, removeRevision answer) `shouldBe` (wasSolid, Revision revision')
-            -- Every cell of every touched region agrees with the independent model.
-            forM_ touched $ \r → forM_ (localCells r) $ \place → do
-              let (cx, cy, cz) = place
-              found <- readCell svc lease (tile cx cy cz)
-              cellMaterial (cellValue found) `shouldBe` expectedMaterial terrainSpec done place
-              cellRevision found `shouldBe` Revision revision'
+            -- The removed cell's whole column in its region agrees with the independent model.
+            let (r, _) = decomposeTile (tile x y z)
+            checkColumn done revision' r (x, y)
             pure revision'
       foldM_ removeAndCheck 0 (zip [0 ..] removals)
+      -- After every removal and the evictions between them: every cell of every touched region agrees
+      -- with the independent model, read back one column at a time from the store.
+      let final = length [() | (n, at) ← zip [0 ..] removals, expectedMaterial terrainSpec (take n removals) at /= Nothing]
+      forM_ touched $ \r@(RegionCoord rx ry _) → forM_ [(toInteger rx * 16 + lx, toInteger ry * 16 + ly) | lx ← [0 .. 15], ly ← [0 .. 15]] $ \xy →
+        checkColumn removals (fromIntegral final) r xy
       model <- inspectModel svc
       -- Eviction happened: fewer regions are resident than were touched.
       length (modelRegions model) `shouldSatisfy` (< length touched)

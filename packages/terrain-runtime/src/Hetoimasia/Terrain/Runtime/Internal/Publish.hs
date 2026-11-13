@@ -75,7 +75,7 @@ import Hetoimasia.Terrain.Resident (Resident)
 import Hetoimasia.Terrain.Runtime.Internal.Core
 import Hetoimasia.Terrain.Runtime.Internal.Types
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Service (PreparedGrowth, commitBackingGrowthSTM)
-import Hetoimasia.Terrain.Runtime.Store.Internal.Admission (Grant, release)
+import Hetoimasia.Terrain.Runtime.Store.Internal.Admission (Grant)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Format (StoreIdentity)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Model
   ( ActiveView (..)
@@ -281,7 +281,7 @@ decide svc credit dec = do
           }
     -- the slot ends with the publication, and its credits return in the same transaction
     slotDone internal = do
-      forM_ credit $ \g → modifyTVar' (serviceEditBank svc) (release g)
+      forM_ credit $ \g → modifyTVar' (serviceEditBank svc) (releaseCredit g)
       modifySt svc $ \s →
         s
           { stateSlot = Nothing

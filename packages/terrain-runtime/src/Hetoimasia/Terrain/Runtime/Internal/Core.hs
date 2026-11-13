@@ -33,6 +33,7 @@ module Hetoimasia.Terrain.Runtime.Internal.Core
   , Submission (..)
   , pausedFault
   , readmitSTM
+  , releaseCredit
   , admitting
   , admit
   , readAnswer
@@ -107,6 +108,8 @@ import Hetoimasia.Terrain.Changes (Changes, emptyChanges)
 import Hetoimasia.Terrain.Coordinate
 import qualified Hetoimasia.Terrain.Connectivity as C
 import qualified Hetoimasia.Terrain.Query as Q
+import qualified Hetoimasia.Terrain.Runtime.Store.Internal.Admission as A
+import Hetoimasia.Terrain.Runtime.Store.Internal.Admission (Admission, Grant)
 import qualified Hetoimasia.Terrain.Residency as R
 import Hetoimasia.Terrain.Residency (ArenaId (..), HoldId (..), RegionDemand, RequestId (..), Revision (..), ViewId (..))
 import Hetoimasia.Terrain.Runtime.Internal.Content
@@ -1274,3 +1277,10 @@ readmitSTM svc rid = do
               R.ContractFailure why → do
                 recordDefect svc (AccountingDefect (Text.pack (show why)))
                 terminate svc rid (Failed (HostFailure (Text.pack ("resubmission: " <> show why))))
+
+-- | Give a grant back: its staging and control, and its cache entries (unpinned, then dropped).
+releaseCredit ∷ Grant → Admission → Admission
+releaseCredit g adm0 = foldr dropOne (A.release g adm0) (A.grantEntries g)
+  where
+    dropOne entry adm = either (const (A.unpinEntry entry adm)) id (A.dropEntry entry (A.unpinEntry entry adm))
+
