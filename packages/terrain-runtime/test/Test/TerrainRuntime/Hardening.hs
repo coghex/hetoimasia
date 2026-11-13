@@ -5,7 +5,7 @@ module Test.TerrainRuntime.Hardening (spec) where
 import Control.Concurrent (killThread, throwTo, yield)
 import Control.Concurrent.MVar
 import Control.Concurrent.STM
-import Control.Exception (ErrorCall (..), ExceptionWithContext (..), Exception (..), SomeException, asyncExceptionFromException, asyncExceptionToException, catch, fromException, throwIO, try)
+import Control.Exception (ErrorCall (..), ExceptionWithContext (..), Exception (..), SomeException, asyncExceptionFromException, asyncExceptionToException, catch, finally, fromException, throwIO, try)
 import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (find)
 import Control.Monad (forM, forM_, void, when)
@@ -26,7 +26,9 @@ import Hetoimasia.Terrain.Runtime.Settlement
 import Test.Hspec
 import Test.Support.Bounded (bounded)
 import Test.Support.Owned (withOwnedThread)
+import Hetoimasia.Terrain.Runtime.Storage.Internal.Native (NativeOp (..))
 import Test.TerrainRuntime.Fixtures
+import qualified Test.TerrainRuntime.Storage.Harness as H
 
 spec ∷ Spec
 spec = describe "Accounting and lifetime hardening" $ do
@@ -613,8 +615,9 @@ spec = describe "Accounting and lifetime hardening" $ do
   -- admitted amid accepted removals commits before every removal admitted after it (per-arena admission
   -- order holds for the slot too), so its wait is the removals before it, whatever follows.
   forM_ [5, 20, 60 ∷ Int] $ \later →
-   it ("answers a read admitted amid a stream of removals before any removal admitted after it (" <> show later <> " after)") $
-    withService defaultConfig $ \svc → do
+   it ("answers a read admitted amid a stream of removals before any removal admitted after it (" <> show later <> " after)") $ do
+    probe <- H.newProbe
+    withServiceSeam quiet defaultConfig alwaysAdmitting noProbe (H.seamFor probe) $ \svc → do
       (_, lease) <- openMain svc "main"
       order <- newTVarIO ([] ∷ [String])
       let noting label = do
@@ -625,12 +628,23 @@ spec = describe "Accounting and lifetime hardening" $ do
             _ <- okOf (removeWith svc ep lease (tile x 4 3) Nothing)
             pure host
       before' <- forM [0, 1] (removal "earlier")
+      forM_ before' $ \h → waitFor (readTVar (hostSettled h) >>= \x → check (not (null x)))
+      waitFor (backedAtRestSTM svc >>= check)
+      -- the read's page read is held, so it is still to commit while the later removals stage and
+      -- become eligible: none of them may take the slot before it
+      gate <- H.addGateOnce probe (\case OpReadAt {} → True; _ → False)
       (reader, readEp) <- noting "read"
-      _ <- okOf (cellWith svc readEp lease (tile 0 9 3))
-      after' <- forM [2 .. fromIntegral later + 1] (removal "later")
-      forM_ (reader : before' <> after') $ \h → waitFor (readTVar (hostSettled h) >>= \x → check (not (null x)))
+      after' <- flip finally (H.openGate gate) $ do
+        _ <- okOf (cellWith svc readEp lease (tile 0 9 3))
+        H.awaitReached gate 1
+        after' <- forM [2 .. fromIntegral later + 1] (removal "later")
+        forM_ after' $ \h → waitFor (readTVar (hostReady h) >>= \n → check (n >= 1))
+        -- staged and eligible, yet none has committed: the earlier read holds them in admission order
+        forM_ after' $ \h → readTVarIO (hostSettled h) `shouldReturn` []
+        pure after'
+      forM_ (reader : after') $ \h → waitFor (readTVar (hostSettled h) >>= \x → check (not (null x)))
       settledOrder <- reverse <$> readTVarIO order
-      -- the read settled before every later removal: what came before it is at most the two earlier ones
+      -- the read settled before every later removal
       takeWhile (/= "read") settledOrder `shouldSatisfy` all (== "earlier")
       length settledOrder `shouldBe` 3 + later
       settleChecks svc
