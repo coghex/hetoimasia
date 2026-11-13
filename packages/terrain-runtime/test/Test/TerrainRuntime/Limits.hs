@@ -5,19 +5,24 @@
 -- before it settles, a revoked lease until it is released.
 module Test.TerrainRuntime.Limits (spec) where
 
-import Control.Concurrent.STM (atomically, check, readTVar)
+import Control.Concurrent.STM (atomically, check, readTVar, retry)
 import Control.Exception (finally)
 import Control.Monad (forM_, void)
 import Hetoimasia.Terrain.Coordinate (decomposeTile)
 import Hetoimasia.Terrain.Query (QueryLimits (..), defaultQueryLimits)
 import Hetoimasia.Terrain.Source (SourceLimits (..), defaultSourceLimits)
 import Data.List (isInfixOf, nub)
-import Hetoimasia.Terrain.Residency (ArenaPhase (..), Event (..), JobPhase (..), Revision (..), arenaId, arenaPhase, arenaRetainedBytes, jobArena, jobId, jobPhase, jobRegion, modelArenas, modelJobs, modelLimits, modelRegions, newModel, regionHandoff, step)
+import Hetoimasia.Terrain.Residency (ArenaPhase (..), Event (..), JobPhase (..), Revision (..), arenaId, arenaPhase, arenaRetainedBytes, jobArena, jobId, jobPhase, jobRegion, modelArenas, modelJobs, modelLimits, newModel, step)
 import Hetoimasia.Terrain.Runtime
 import Hetoimasia.Terrain.Runtime.Settlement
 import Test.Hspec
 import Test.TerrainRuntime.Fixtures
+import Hetoimasia.Terrain.Runtime.Storage.Internal.Native (NativeOp (..))
 import Test.TerrainRuntime.Usage (Held (..), HeldArena (..), chargedOf, disagreements, heldOf, jobStartDisagreements, usageDisagreements, usageSTM)
+import qualified Test.TerrainRuntime.Storage.Harness as H
+
+isWrite ∷ NativeOp → Bool
+isWrite = \case OpWriteAt {} → True; _ → False
 
 -- | Every disagreement between the model's ledgers and what the service holds, read in
 -- one transaction.
@@ -134,24 +139,27 @@ spec = describe "Service-wide limits count every state that holds the resource" 
       retire svc request
       settleChecks svc
 
-  it "derives every bank from the entities while a transfer holds its duplicate, a removal holds its reservation and a snapshot is borrowed" $ do
-    gate <- newDisarmedGate
-    withGatedService defaultConfig alwaysAdmitting (\p → case p of PointHandoff {} → True; _ → False) gate $ \svc → (\act → act `finally` openGate gate) $ do
+  -- (the baseline's 'while a transfer holds its duplicate': a backed commit transfers nothing; the
+  -- work in flight is the slot's transaction, its write held at the native seam)
+  it "derives every bank from the entities while a transaction's write is in flight, a removal holds its reservation and a snapshot is borrowed" $ do
+    probe <- H.newProbe
+    withServiceSeam quiet defaultConfig alwaysAdmitting noProbe (H.seamFor probe) $ \svc → do
       (_, lease) <- openMain svc "main"
       _ <- readCell svc lease (tile 1 1 1)
+      waitFor (backedAtRestSTM svc >>= check)
       let (held, _) = decomposeTile (tile 1 1 1)
-      armGate gate
-      outcome <- withSnapshot svc lease [held] $ \_ → do
-        _ <- removeCell' svc lease (tile 1 1 1)
-        -- The owner is in the middle of the region's transfer: its duplicate is charged
-        -- to staging, beside the borrow's hold and the arena's retained edit.
-        awaitReached gate
-        model <- inspectModel svc
-        [d | Just d ← map regionHandoff (modelRegions model)] `shouldSatisfy` (not . null)
+      gate <- H.addGate probe isWrite
+      outcome <- flip finally (H.openGate gate) $ withSnapshot svc lease [held] $ \_ → do
+        removal <- newHost True
+        _ <- okOf (removeWith svc (hostEndpoint svc Nothing removal) lease (tile 1 1 1) Nothing)
+        -- The transaction is in the middle of its write: its credits, the removal's
+        -- reservation and the borrow's hold are all charged.
+        H.awaitReached gate 1
         usageOf svc `shouldReturn` []
         inspectInvariants svc >>= (`shouldBe` [])
-        openGate gate
-        waitFor $ inspectModelSTM svc >>= \m → check (all ((== Nothing) . regionHandoff) (modelRegions m))
+        inspectBacked svc >>= (`shouldBe` [])
+        H.openGate gate
+        void (waitFor (readTVar (hostSettled removal) >>= \x → if null x then retry else pure x))
         usageOf svc `shouldReturn` []
       either (\r → expectationFailure (show r)) pure outcome
       settleChecks svc
@@ -183,7 +191,9 @@ spec = describe "Service-wide limits count every state that holds the resource" 
             found = usageDisagreements census broken
             mentions needle = any (needle `isInfixOf`) found
         mentions "resident bytes of region" || mentions "no record of it" `shouldBe` True
-        mentions "edit bank occupied" `shouldBe` True
+        -- (the baseline also required 'edit bank occupied': the backed service retains no edit, so
+        -- that ledger is zero on both sides and has nothing to lose; that it is zero is checked)
+        sum (map censusRetainedBytes (censusArenas census)) `shouldBe` 0
         mentions "edit bank reserved" `shouldBe` True
         mentions "staging bank occupied" `shouldBe` True
         mentions "command slots" `shouldBe` True
@@ -192,9 +202,10 @@ spec = describe "Service-wide limits count every state that holds the resource" 
       openGate gate
       void (settledOf host)
 
-  -- The accounting rule is that nothing is under-charged, not that the charge is exact: the
-  -- model keeps a monotone, conservative retained charge when edits coalesce.
-  it "charges coalescing edits at least what the arena holds (remove levels 0, 2, then 1)" $
+  -- The accounting rule is that nothing is under-charged. (The baseline's 'charges coalescing edits
+  -- at least what the arena holds': the backed service retains no edit in RAM, so however edits
+  -- coalesce the arena holds nothing and the model charges nothing for it.)
+  it "keeps nothing of coalescing edits in RAM and charges nothing for them (remove levels 0, 2, then 1)" $
     withService defaultConfig $ \svc → do
       (_, lease) <- openMain svc "main"
       _ <- readCell svc lease (tile 1 1 0)
@@ -204,11 +215,9 @@ spec = describe "Service-wide limits count every state that holds the resource" 
       (model, census) <- atomically ((,) <$> inspectModelSTM svc <*> inspectCensusSTM svc)
       let charged = [arenaRetainedBytes info | info ← modelArenas model]
           held = map censusRetainedBytes (censusArenas census)
-      length charged `shouldBe` 1
-      -- Never under-charged; the coalesced interval may be charged more than it now holds.
-      zipWith (>=) charged held `shouldBe` [True]
-      -- (and here it is in fact charged more: exact equality would fail this sequence)
-      zipWith (>) charged held `shouldBe` [True]
+      (charged, held) `shouldBe` ([0], [0])
+      -- the three removals are in the store: read back, all air
+      forM_ [tile 1 1 0, tile 1 1 2, tile 1 1 1] $ \at → (cellIs <$> readCell svc lease at) `shouldReturn` True
       inspectInvariants svc >>= (`shouldBe` [])
       settleChecks svc
 
@@ -233,22 +242,21 @@ spec = describe "Service-wide limits count every state that holds the resource" 
       openGate gate
       void (settledOf host)
 
-  -- One arena's retained charge swapped with another's: neither total nor count changes,
-  -- but each arena must be charged at least what it holds.
-  it "notices retained charges swapped between two arenas" $
+  -- One arena's resident charge swapped with another's: neither total nor count changes, but each
+  -- arena must be charged at least what it holds. (The baseline swapped retained charges; the backed
+  -- service retains none, and the per-arena charge it still makes is each region's resident detail.)
+  it "notices resident charges swapped between two arenas" $
     withService defaultConfig $ \svc → do
       (client, first') <- openMain svc "first"
       second <- okOf (openArena svc client "second" soilOverStone) >>= await svc >>= expectSuccess
+      -- the first arena holds one region, the second three
       _ <- readCell svc first' (tile 1 1 0)
-      _ <- readCell svc second (tile 1 1 0)
-      -- One edit in the first arena, two (in separate columns) in the second.
-      _ <- removeCell' svc first' (tile 1 1 0)
-      forM_ [tile 1 1 0, tile 3 3 0] $ \at → readCell svc second at >> removeCell' svc second at
+      forM_ [tile 1 1 0, tile 20 1 0, tile 40 1 0] $ \at → readCell svc second at
       (model, census) <- atomically ((,) <$> inspectModelSTM svc <*> inspectCensusSTM svc)
       usageDisagreements census model `shouldBe` []
-      let held = map censusRetainedBytes (censusArenas census)
-      length (nub held) `shouldBe` 2
-      -- The same census with the two arenas' retained bytes exchanged.
       let heldNow = heldOf census
-          swapped = heldNow {heldArenas = zipWith (\a v → a {haRetained = v}) (heldArenas heldNow) (reverse held)}
-      disagreements swapped (chargedOf model) `shouldSatisfy` any ("retained bytes of arena" `isInfixOf`)
+          bytes = map haRegionBytes (heldArenas heldNow)
+      length (nub (map sum bytes)) `shouldBe` 2
+      -- The same census with the two arenas' resident detail exchanged.
+      let swapped = heldNow {heldArenas = zipWith (\a v → a {haRegionBytes = v}) (heldArenas heldNow) (reverse bytes)}
+      disagreements swapped (chargedOf model) `shouldSatisfy` (not . null)

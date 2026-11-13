@@ -8,7 +8,7 @@
 --   changes, live or retiring, taken from the detail itself; every request it holds,
 --   withdrawn ones included; its outstanding snapshots; and the read-only record the
 --   owner thread keeps of the work it is running (each load job with its reservation,
---   scratch and slot, the preparation, each handoff duplicate), written where that work
+--   scratch and slot, and the preparation), written where that work
 --   starts and ends (every accepted load job, with the reservation and scratch the model
 --   granted it at admission and the least its coverage can hold from the data layer's own
 --   sizes; the regions each outstanding borrow covers, from the snapshot handed out; the
@@ -27,7 +27,6 @@ module Test.TerrainRuntime.Usage
   , HeldRequest (..)
   , HeldJob (..)
   , HeldPreparation (..)
-  , HeldHandoff (..)
   , Charged (..)
   , ChargedJob (..)
   , ChargedRegion (..)
@@ -61,9 +60,6 @@ import Hetoimasia.Terrain.Runtime
   , censusRetiring
   , censusRunning
   , censusSettled
-  , handoffWorkArena
-  , handoffWorkDuplicate
-  , handoffWorkRegion
   , inspectCensusSTM
   , inspectModelSTM
   , inspectRetainedChargesSTM
@@ -79,7 +75,6 @@ import Hetoimasia.Terrain.Runtime
   , preparationRemoval
   , preparationRequest
   , preparationResident
-  , runningHandoffs
   , runningHolds
   , runningJobs
   , runningPreparation
@@ -153,19 +148,12 @@ data HeldPreparation = HeldPreparation
   , hpGrowth ∷ Word64
   }
 
-data HeldHandoff = HeldHandoff
-  { hhArena ∷ ArenaId
-  , hhRegion ∷ RegionCoord
-  , hhDuplicate ∷ Word64
-  }
-
 data Held = Held
   { heldArenas ∷ [HeldArena]
   , heldRequests ∷ [HeldRequest]
   , heldBorrows ∷ Int
   , heldJobs ∷ [HeldJob]
   , heldPreparation ∷ Maybe HeldPreparation
-  , heldHandoffs ∷ [HeldHandoff]
   , -- | Each outstanding borrow, the regions its snapshot covers and the accounted bytes it
     -- backs, both read from the snapshot value when it was handed out (never from the
     -- retained-bank ledger or the model's hold).
@@ -183,7 +171,6 @@ heldOf census =
     , heldBorrows = censusBorrows census
     , heldJobs = [HeldJob (jobWorkJob j) (jobWorkArena j) (jobWorkRegion j) (jobWorkGrantedResident j) (jobWorkGrantedScratch j) (jobWorkResident j) (jobWorkScratch j) (jobWorkSlots j) | j ← runningJobs running]
     , heldPreparation = (\p → HeldPreparation (preparationRequest p) (preparationRemoval p) (preparationResident p)) <$> runningPreparation running
-    , heldHandoffs = [HeldHandoff (handoffWorkArena h) (handoffWorkRegion h) (handoffWorkDuplicate h) | h ← runningHandoffs running]
     , heldHolds = runningHolds running
     , heldViews = runningViews running
     }
@@ -314,7 +301,12 @@ disagreements h c =
     <> concatMap jobDisagreements (heldJobs h)
     <> concatMap holdDisagreements (heldHolds h)
     <> concatMap viewDisagreements (heldViews h)
-    <> concatMap handoffDisagreements (heldHandoffs h)
+    -- the backed owner never transfers a region's changes (a commit retains nothing and confirms its
+    -- zero-byte handoff in its decision): the model may charge no duplicate for any region
+    <> [ "the model charges a handoff duplicate of " <> show d <> " bytes for " <> show (crArena r, crRegion r) <> " but the backed owner never transfers"
+       | r ← cRegions c
+       , Just d ← [crDuplicate r]
+       ]
     <> maybe [] preparationDisagreements (heldPreparation h)
   where
     -- ===== EXPECTED SIDE: built from `h` (what the service holds) and the design's prices only =====
@@ -326,13 +318,12 @@ disagreements h c =
     -- The jobs the owner runs hold at least what the coverage they load needs.
     jobsResident = sumW (map hjResident (heldJobs h))
     jobsScratch = sumW (map hjScratch (heldJobs h))
-    duplicates = sumW (map hhDuplicate (heldHandoffs h))
     -- Resident detail, region by region: what the arena's detail itself holds there (a region's
     -- fixed metadata, an index entry per column and each segment).
     serviceRegions = [((haArena a, region), bytes) | a ← heldArenas h, (region, bytes) ← Map.toList (haRegionBytes a)]
     -- The request table's command records and, for each held request, one interest for each region
     -- it demands; each outstanding borrow's hold, one record for each region its snapshot covers;
-    -- each view's description; and the owner's duplicates. A camera demand's interests exist only
+    -- and each view's description. A camera demand's interests exist only
     -- in the model's own records, so they are not claimed here.
     recordsHeld = sumW [commandRecord (fromIntegral (hrRegions r)) | r ← held']
     stagingHeld =
@@ -340,7 +331,6 @@ disagreements h c =
         + sumW [fromIntegral (hrRegions r) * interestRecord | r ← held']
         + sumW [n * holdRecord | (_, n, _) ← heldHolds h]
         + sumW [descriptionOf n | (_, n) ← heldViews h]
-        + duplicates
     expectResidentOccupied = sumW (map snd serviceRegions)
     expectResidentGrowth = removals * removalGrowthBound
     expectResidentReserved = jobsResident + removals * removalGrowthBound
@@ -389,10 +379,10 @@ disagreements h c =
         ("resident bank reserved (the running jobs' reservations and the removals' growth)", ledgerReserved (cResident c) + cResidentDeferred c, expectResidentReserved, AtLeast)
       , ("edit bank occupied (every arena's retained changes, retiring included)", ledgerOccupied (cEdit c), expectEditOccupied, AtLeast)
       , ("edit bank reserved by removals", ledgerReserved (cEdit c), expectEditReserved, Exact)
-      , ("staging bank occupied (request records and interests, borrows, view descriptions, duplicates, from the service)", ledgerOccupied (cStaging c), stagingHeld, AtLeast)
+      , ("staging bank occupied (request records and interests, borrows, view descriptions, from the service)", ledgerOccupied (cStaging c), stagingHeld, AtLeast)
       , -- The ledger against the model's own entity lists (interests, holds, views, camera interests
         -- included): consistency of the model with itself, not an independent expectation.
-        ("staging bank occupied (the ledger against the model's own entities)", ledgerOccupied (cStaging c), recordsHeld + cEntityStaging c + duplicates, Exact)
+        ("staging bank occupied (the ledger against the model's own entities)", ledgerOccupied (cStaging c), recordsHeld + cEntityStaging c, Exact)
       , ("staging bank reserved (each removal's staging reservation and the running jobs' scratch)", ledgerReserved (cStaging c), expectStagingReserved, AtLeast)
       , ("command slots (every request the service holds a model record for)", cCommandSlots c, expectCommandSlots, Exact)
       , ("load-job slots (every job the owner is running)", cLoadSlots c, expectLoadSlots, AtLeast)
@@ -444,14 +434,6 @@ disagreements h c =
       Just charged
         | charged < n → ["view " <> show vid <> ": the model's description names " <> show charged <> " regions but the accepted demand describes " <> show n]
         | otherwise → []
-    -- The duplicate the owner holds while it transfers a region is charged to staging.
-    handoffDisagreements d = case [r | r ← cRegions c, crArena r == hhArena d, crRegion r == hhRegion d] of
-      [] → ["the owner holds a duplicate for " <> show (hhArena d, hhRegion d) <> " but the model holds no such region"]
-      r : _ → case crDuplicate r of
-        Nothing → ["the owner holds a duplicate of " <> show (hhDuplicate d) <> " bytes for " <> show (hhArena d, hhRegion d) <> " but the model charges none"]
-        Just charged
-          | charged < hhDuplicate d → ["handoff duplicate of " <> show (hhArena d, hhRegion d) <> ": the model counts " <> show charged <> " but the service holds " <> show (hhDuplicate d)]
-          | otherwise → []
     -- While the owner prepares a request, the model still holds its record and credits.
     preparationDisagreements p = case [(removal, growth) | (rid, removal, growth) ← cRequests c, rid == hpRequest p] of
       [] → ["the owner is preparing request " <> show (hpRequest p) <> " but the model holds no record of it"]

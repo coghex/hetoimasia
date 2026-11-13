@@ -44,18 +44,12 @@ module Hetoimasia.Terrain.Runtime.Internal.Core
     -- * The read-only record of the owner's running work
   , startJobWork
   , endJobWork
-  , startHandoffWork
-  , endHandoffWork
 
     -- * Settlement
   , terminate
   , terminateWith
   , releaseReq
   , withdrawRecord
-  , rememberTried
-  , rememberBusy
-  , forgetRegionRetry
-  , forgetArenaRetry
   , beginRunning
   , safePointSTM
   , cancelRequest
@@ -134,7 +128,7 @@ modifySt svc = modifyTVar' (serviceState svc)
 
 -- | Something that may free capacity happened; the owner retries what waits.
 markFreed ∷ Service → STM ()
-markFreed svc = modifySt svc (\st → st {stateFreed = True, stateDispatchIdle = False, stateCapacityEpoch = stateCapacityEpoch st + 1})
+markFreed svc = modifySt svc (\st → st {stateFreed = True, stateDispatchIdle = False})
 
 -- | The regions a decision committed as victims, for the owner to discard.
 decisionVictims ∷ R.Decision → [R.RegionKey]
@@ -154,7 +148,7 @@ applyEvent svc event = do
     Left _ → pure outcome
     Right report → do
       writeTVar (serviceState svc) $
-        (if freesCapacity event then \x → x {stateFreed = True, stateDispatchIdle = False, stateCapacityEpoch = stateCapacityEpoch x + 1} else id)
+        (if freesCapacity event then \x → x {stateFreed = True, stateDispatchIdle = False} else id)
         st
           { stateModel = model
           , stateVictims = stateVictims st <> Seq.fromList (decisionVictims (R.reportDecision report))
@@ -651,41 +645,6 @@ releaseReq svc rid req = do
   when (reqModel req) (withdrawRecord svc rid req)
   markFreed svc
 
--- | Remember that a region's transfer was tried at a generation, or was refused for want
--- of capacity at an epoch. These two are the only places either is written, and they
--- write only for a region the model still holds in a live arena, so an arena or a
--- region that ended while a transfer was in flight is never given a memory it could not
--- be rid of.
-rememberTried ∷ R.RegionKey → Word64 → St → St
-rememberTried key generation st
-  | remembered st key = st {stateTransfers = Map.insert key generation (stateTransfers st)}
-  | otherwise = st
-
-rememberBusy ∷ R.RegionKey → St → St
-rememberBusy key st
-  | remembered st key = st {stateHandoffBusy = Map.insert key (stateCapacityEpoch st) (stateHandoffBusy st)}
-  | otherwise = st
-
-remembered ∷ St → R.RegionKey → Bool
-remembered st key@(aid, _) =
-  Map.member aid (stateArenas st) && key `elem` [(R.regionArena r, R.regionCoord r) | r <- R.modelRegions (stateModel st)]
-
--- | Forget everything the owner remembers about retrying one region's transfer: that
--- it was tried at some generation, and that it was refused for want of capacity at
--- some epoch. This and 'forgetArenaRetry' are the only places either is dropped, and
--- every place a region or an arena ends calls one of them, so the memory is bounded
--- by the regions the model holds.
-forgetRegionRetry ∷ St → R.RegionKey → St
-forgetRegionRetry st key = st {stateTransfers = Map.delete key (stateTransfers st), stateHandoffBusy = Map.delete key (stateHandoffBusy st)}
-
--- | The same for every region of an arena.
-forgetArenaRetry ∷ St → ArenaId → St
-forgetArenaRetry st aid =
-  st
-    { stateTransfers = Map.filterWithKey (\(owner, _) _ → owner /= aid) (stateTransfers st)
-    , stateHandoffBusy = Map.filterWithKey (\(owner, _) _ → owner /= aid) (stateHandoffBusy st)
-    }
-
 -- | THE ONLY PLACE a request's model record, and every credit it owns, is given back
 -- (R1). While the owner is running that request's preparation, which computes with
 -- values captured under those credits, the release waits: the request leaves the
@@ -763,15 +722,6 @@ startJobWork svc jid cover =
 -- transaction that reports it.
 endJobWork ∷ Service → R.JobId → STM ()
 endJobWork svc jid = modifySt svc (\st → st {stateWork = (stateWork st) {rwJobs = Map.delete jid (rwJobs (stateWork st))}})
-
--- | The owner holds the duplicate of a region's changes while it transfers them.
-startHandoffWork ∷ Service → ArenaId → RegionCoord → Word64 → STM ()
-startHandoffWork svc aid region duplicate =
-  modifySt svc $ \st →
-    st {stateWork = (stateWork st) {rwHandoffs = Map.insert (aid, region) (HandoffWork aid region duplicate) (rwHandoffs (stateWork st))}}
-
-endHandoffWork ∷ Service → ArenaId → RegionCoord → STM ()
-endHandoffWork svc aid region = modifySt svc (\st → st {stateWork = (stateWork st) {rwHandoffs = Map.delete (aid, region) (rwHandoffs (stateWork st))}})
 
 -- | The owner starts running a request's preparation, if the request is still
 -- there to prepare: from now until the safe point nothing it holds is released.
@@ -862,7 +812,6 @@ closeArena svc aid = do
             _ → stateNames cur
         , stateLeases = foldr (Map.adjust (\l → l {leaseLive = False})) (stateLeases cur) (Set.toList (arenaLeases arena))
         }
-        `forgetArenaRetry` aid
     retireArenaRecord svc aid
 
 -- | Release a lease. Idempotent. It cancels the requests made through it, and
@@ -1093,10 +1042,6 @@ invariants config st =
        | Just (rid, _) <- [stateRunning st]
        , rid `notElem` modelIds
        ]
-    <> [ "transfer-retry memory for " <> show key <> " outlives its region"
-       | key <- Map.keys (stateTransfers st) <> Map.keys (stateHandoffBusy st)
-       , key `notElem` [(R.regionArena r, R.regionCoord r) | r <- R.modelRegions model]
-       ]
     <> [ "a ghost or a deferred retirement exists while no preparation is running"
        | stateRunning st == Nothing
        , not (Map.null (stateGhosts st)) || not (Set.null (stateDeferredRetire st))
@@ -1222,35 +1167,30 @@ bumpGeneration ∷ Word64 → Word64
 bumpGeneration g = if g == maxBound then g else g + 1
 
 -- | Retire everything in flight, at the owner's terminal safe point and whatever
--- ended it: acknowledge each cancelling load, abandon each outstanding transfer,
--- and finish each committed victim's release. Non-blocking bookkeeping, safe under
+-- ended it: acknowledge each cancelling load and finish each committed victim's
+-- release. (A backed commit retains nothing and confirms its zero-byte handoff in the
+-- decision itself, so no transfer is ever outstanding here.) Non-blocking bookkeeping, safe under
 -- the uninterruptible mask. Idempotent. A hold that is still outstanding keeps its
 -- arena retiring until its borrower releases it.
 retireInFlightSTM ∷ Service → STM ()
 retireInFlightSTM svc = do
-  st <- readSt svc
-  let model = stateModel st
-  forM_ [(R.regionArena r, R.regionCoord r) | r <- R.modelRegions model, isJust (R.regionHandoff r)] $ \(aid, region) → do
-    void (applyEvent svc (R.HandoffFailed aid region))
-    endHandoffWork svc aid region
   victims <- stateVictims <$> readSt svc
-  forM_ victims $ \key@(aid, region) → do
+  forM_ victims $ \(aid, region) → do
     modifySt svc $ \cur →
       cur
         { stateArenas = Map.adjust (discardOf region) aid (stateArenas cur)
         , stateRetiring = Map.adjust (discardOf region) aid (stateRetiring cur)
         }
-        `forgetRegionRetry` key
     applyEvent svc (R.VictimReleased aid region)
   modifySt svc (\cur → cur {stateVictims = Seq.empty})
   after <- readSt svc
   forM_ [R.jobId j | j <- R.modelJobs (stateModel after), R.jobPhase j == R.JobCancellingPhase] $ \jid → do
     void (applyEvent svc (R.JobAcknowledged jid))
     endJobWork svc jid
-  -- No transfer is outstanding any more, and a job the model no longer holds has ended.
+  -- A job the model no longer holds has ended.
   final <- readSt svc
   let liveJobs = Set.fromList [R.jobId j | j <- R.modelJobs (stateModel final)]
-  modifySt svc (\cur → cur {stateWork = (stateWork cur) {rwHandoffs = Map.empty, rwJobs = Map.filterWithKey (\jid _ → Set.member jid liveJobs) (rwJobs (stateWork cur))}})
+  modifySt svc (\cur → cur {stateWork = (stateWork cur) {rwJobs = Map.filterWithKey (\jid _ → Set.member jid liveJobs) (rwJobs (stateWork cur))}})
   markFreed svc
   where
     discardOf region a = a {arenaResident = discardRegion region (arenaResident a), arenaGeneration = bumpGeneration (arenaGeneration a)}

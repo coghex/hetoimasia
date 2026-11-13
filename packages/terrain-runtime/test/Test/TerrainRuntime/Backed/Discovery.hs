@@ -8,6 +8,7 @@ module Test.TerrainRuntime.Backed.Discovery (spec) where
 
 import Control.Concurrent.STM
 import Control.Monad (foldM, forM, forM_)
+import Data.Maybe (listToMaybe)
 import qualified Hetoimasia.Terrain.Discovery as D
 import Hetoimasia.Terrain.Residency (ArenaId (..))
 import Hetoimasia.Terrain.Runtime
@@ -121,7 +122,10 @@ spec = describe "Discovery through the backed service" $ do
             a : rest@(b : _) | a == b → collapse rest
             a : rest → a : collapse rest
             [] → []
-      seen `shouldBe` collapse (map expectedAt states)
+          expected = collapse (map expectedAt states)
+          firstDifference = listToMaybe [i | (i, a, b) ← zip3 [0 ∷ Int ..] seen expected, a /= b]
+      -- (a failure names where the sequences part: their lengths, their remaining work, the first index)
+      (length seen, map snd seen, firstDifference) `shouldBe` (length expected, map snd expected, Nothing)
       settleChecks svc
   where
     row = [(x, 0, z) | x ← [0 .. 10], z ← [4 .. 8]]

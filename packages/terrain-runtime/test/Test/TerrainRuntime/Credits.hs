@@ -10,16 +10,19 @@
 module Test.TerrainRuntime.Credits (spec) where
 
 import Control.Concurrent.STM
-import Control.Exception (ErrorCall (..), finally, throwIO)
-import Control.Monad (forM, forM_, void)
-import Data.IORef (newIORef, readIORef, writeIORef)
+import Control.Exception (finally)
+import Control.Monad (forM_, void)
 import Data.Text (pack)
 import Hetoimasia.Terrain.Residency
 import Hetoimasia.Terrain.Runtime
 import Hetoimasia.Terrain.Runtime.Settlement
-import Hetoimasia.Terrain.Source (SourceSpec)
+import qualified Hetoimasia.Terrain.Runtime.Store.Internal.Admission as A
+import Hetoimasia.Terrain.Runtime.Store.Internal.Plan (RamCharge (..))
+import Hetoimasia.Terrain.Runtime.Storage.Internal.Native (NativeOp (..))
+import Hetoimasia.Terrain.Runtime.Storage.Internal.Service (resultPageBytes)
 import Test.Hspec
 import Test.TerrainRuntime.Fixtures
+import qualified Test.TerrainRuntime.Storage.Harness as H
 
 -- | What the model has reserved: its three banks and the command slots.
 reserved ∷ Service → IO ([Word], Word)
@@ -62,90 +65,74 @@ spec = describe "R1 and R2: credits are released at the safe point, capacity ref
           check (and [ledgerReserved (bankLedger model b) == 0 | b ← [ResidentBank, EditBank, StagingBank]] && slotInUse model CommandSlot == 0)
         settleChecks svc
 
-  it "reconsiders a transfer refused for want of capacity as soon as capacity is returned, and forgets it when the arena ends" $ do
-    exercised <- forM [2000, 2008 .. 2448] $ \headroom → do
-      gateRef <- newIORef =<< newDisarmedGate
-      busy <- newTVarIO False
-      let probe = Probe $ \point → do
-            case point of
-              PointHandoffBusy {} → atomically (writeTVar busy True)
-              _ → pure ()
-            gate <- readIORef gateRef
-            probePoint (gatedProbe (\p → case p of PointCommitted {} → True; _ → False) gate) point
-          definition = layered [(Just 0, Just 2, "soil", 0), (Just 32, Just 34, "stone", 0)] [] ∷ SourceSpec
-      withServiceUsing (microConfigWith 12 headroom) alwaysAdmitting probe $ \svc → do
-        client <- okOf (registerClient svc)
-        -- Several incarnations on one service: the retry memory must not accumulate.
-        saw <- forM [1 .. 3 ∷ Int] $ \cycle' → do
-          gate <- newDisarmedGate
-          writeIORef gateRef gate
-          lease <- okOf (openArena svc client (pack ("pressure" <> show cycle')) definition) >>= await svc >>= expectSuccess
-          _ <- readCell svc lease (tile 0 0 1)
-          armGate gate
-          edit <- newHost True
-          _ <- okOf (removeWith svc (hostEndpoint svc Nothing edit) lease (tile 0 0 1) Nothing)
-          awaitReached gate
-          -- Pending reads fill the staging bank while the owner is held after the edit.
-          reads' <- fillWithReads svc lease
-          openGate gate
-          sawBusy <-
-            waitFor $ do
-              model <- inspectModelSTM svc
-              b <- readTVar busy
-              let clean = not (any regionDirty (modelRegions model))
-              check (b || clean)
-              pure b
-          -- Capacity returns: the pending reads end. The transfer must then be done.
-          forM_ reads' (void . cancel svc)
-          waitFor $ do
-            model <- inspectModelSTM svc
-            check (not (any regionDirty (modelRegions model)))
-          settleChecks svc
-          -- The incarnation ends: nothing about it is remembered.
-          _ <- releaseLease svc lease
-          waitFor $ do
-            model <- inspectModelSTM svc
-            check (null (modelArenas model))
-          inspectRetryMemory svc `shouldReturn` 0
-          settleChecks svc
-          pure sawBusy
-        pure (or saw)
-    -- The scan found staging sizes at which the transfer really was refused.
-    length (filter id exercised) `shouldSatisfy` (>= 1)
+  -- (the baseline's 'reconsiders a transfer refused for want of capacity': a backed commit transfers
+  -- nothing; the work refused for want of capacity is the slot's grant, refused while readers' reads
+  -- hold the edit bank's cache, and reconsidered when they return it)
+  it "reconsiders a grant refused for want of capacity as soon as the readers return it, and keeps nothing when the arena ends, across incarnations" $ do
+    let need = toInteger (ramDecodedCopies A.worstTransactionCharge) + 2 * toInteger A.readerPinnedCacheBytes + toInteger resultPageBytes
+        config = defaultConfig {configMaxArenas = 1, configEditBank = A.defaultEditBankSpec {A.ebsCache = need, A.ebsArenas = 1, A.ebsReadersPerArena = 2}}
+    granted ← newTVarIO (0 ∷ Int)
+    probe ← H.newProbe
+    let owner = Probe $ \case
+          PointGranted (Just _) _ → atomically (modifyTVar' granted (+ 1))
+          _ → pure ()
+    withServiceSeam quiet config alwaysAdmitting owner (H.seamFor probe) $ \svc → do
+      client ← okOf (registerClient svc)
+      -- several incarnations on one service: nothing about a refused grant may accumulate
+      forM_ [1 .. 3 ∷ Int] $ \cycle' → do
+        lease ← okOf (openArena svc client (pack ("pressure" <> show cycle')) soilOverStone) >>= await svc >>= expectSuccess
+        _ ← removeCell' svc lease (tile 3 4 9)
+        backedAtRest svc
+        edit ← newHost False
+        _ ← okOf (removeWith svc (hostEndpoint svc Nothing edit) lease (tile 3 4 5) Nothing)
+        waitFor (readTVar (hostReady edit) >>= \n → check (n >= 1))
+        backedAtRest svc
+        grantsBefore ← readTVarIO granted
+        gate ← H.addGate probe isRead
+        readers ← flip finally (H.openGate gate) $ do
+          readers ← mapM (\at → okOf (cellAt svc lease at)) [tile 8 8 8, tile 9 9 9]
+          H.awaitReached gate 2
+          -- the edit becomes eligible: its grant is refused for want of the cache the reads hold
+          atomically (writeTVar (hostEligible edit) True)
+          readTVarIO granted `shouldReturn` grantsBefore
+          pure readers
+        -- the reads return the cache: the grant is reconsidered and the edit commits
+        mapM_ (await svc) readers
+        _ ← waitFor (readTVar (hostSettled edit) >>= \s' → if null s' then retry else pure s')
+        settledOf edit >>= (`shouldSatisfy` \case [Succeeded (ARemoved r)] → removeChangedFlag r; _ → False)
+        readTVarIO granted >>= (`shouldSatisfy` (> grantsBefore))
+        settleChecks svc
+        -- the incarnation ends: nothing of it remains
+        _ ← releaseLease svc lease
+        waitFor $ do
+          model ← inspectModelSTM svc
+          check (null (modelArenas model))
+        backedAtRest svc
+        settleChecks svc
 
-  it "remembers nothing about a transfer whose arena ended while it was in flight" $ do
-    gate <- newDisarmedGate
-    -- The transfer is held in flight and then fails, which is what leaves a memory
-    -- (a transfer that succeeds forgets its region).
-    let hold = gatedProbe (\p → case p of PointHandoff {} → True; _ → False) gate
-        probe = Probe $ \point → do
-          probePoint hold point
-          case point of
-            PointHandoff {} → throwIO (ErrorCall "the transfer fails")
-            _ → pure ()
-    withServiceUsing defaultConfig alwaysAdmitting probe $ \svc → (\act → act `finally` openGate gate) $ do
-      (_, lease) <- openMain svc "main"
-      _ <- readCell svc lease (tile 1 1 1)
-      armGate gate
-      _ <- removeCell' svc lease (tile 1 1 1)
-      -- The owner is in the middle of the region's transfer.
-      awaitReached gate
-      _ <- releaseLease svc lease
-      openGate gate
+  -- (the baseline's 'remembers nothing about a transfer whose arena ended while it was in flight')
+  it "remembers nothing about a transaction whose arena ended while its write was in flight" $ do
+    probe ← H.newProbe
+    withServiceSeam quiet defaultConfig alwaysAdmitting noProbe (H.seamFor probe) $ \svc → do
+      (_, lease) ← openMain svc "main"
+      _ ← readCell svc lease (tile 1 1 1)
+      backedAtRest svc
+      gate ← H.addGate probe isWrite
+      flip finally (H.openGate gate) $ do
+        _ ← okOf (removeAt svc lease (tile 1 1 1) Nothing)
+        -- the owner's transaction is in the middle of its write
+        H.awaitReached gate 1
+        _ ← releaseLease svc lease
+        pure ()
       waitFor $ do
-        model <- inspectModelSTM svc
+        model ← inspectModelSTM svc
         check (null (modelArenas model) && null (modelRegions model))
-      inspectRetryMemory svc `shouldReturn` 0
+      backedAtRest svc
+      inspectBacked svc `shouldReturn` []
       settleChecks svc
 
--- | Admit reads that cannot be prepared yet until the model refuses another.
-fillWithReads ∷ Service → ArenaLease → IO [Request]
-fillWithReads svc lease = go (0 ∷ Int) []
   where
-    go n acc
-      | n >= 40 = pure acc
-      | otherwise = do
-          host <- newHost False
-          cellWith svc (hostEndpoint svc Nothing host) lease (tile 0 0 1) >>= \case
-            Right request → go (n + 1) (request : acc)
-            Left _ → pure acc
+    isRead, isWrite ∷ NativeOp → Bool
+    isRead = \case OpReadAt {} → True; _ → False
+    isWrite = \case OpWriteAt {} → True; _ → False
+    backedAtRest svc = waitFor (backedAtRestSTM svc >>= check)

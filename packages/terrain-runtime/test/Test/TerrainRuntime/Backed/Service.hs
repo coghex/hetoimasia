@@ -113,26 +113,33 @@ spec = describe "The backed terrain service" $ do
       readTVarIO granted >>= (`shouldSatisfy` (> grantsBefore))
       settleChecks svc
 
-  it "answers reads, from the last committed state, while a removal's write is held" $
+  it "answers reads of another arena while a removal's write is held, and answers a later read of the removal's arena after it, in admission order" $
     withProbedService defaultConfig $ \probe svc → do
-      (_, lease) ← openMain svc "main"
+      (client, lease) ← openMain svc "main"
+      other ← okOf (openArena svc client "other" soilOverStone) >>= await svc >>= expectSuccess
       _ ← removeCell' svc lease (tile 3 4 9)
+      _ ← removeCell' svc other (tile 3 4 9)
+      -- nothing else holds the slot: the gate below holds the removal's own write
+      atRest svc
       gate ← H.addGate probe isWrite
-      host ← newHost True
+      remover ← newHost True
+      reader ← newHost True
       flip finally (H.openGate gate) $ do
-        _ ← okOf (removeWith svc (hostEndpoint svc Nothing host) lease (tile 3 4 5) Nothing)
+        _ ← okOf (removeWith svc (hostEndpoint svc Nothing remover) lease (tile 3 4 5) Nothing)
         H.awaitReached gate 1
-        -- the removal's write is held: reads of other columns and of its own cell still answer, from
-        -- the committed state (its cell is still solid; the earlier removal is air)
-        held ← readCell svc lease (tile 3 4 5)
-        cellIs held `shouldBe` False
-        earlier ← readCell svc lease (tile 3 4 9)
-        cellIs earlier `shouldBe` True
-        other ← readCell svc lease (tile 8 8 8)
-        cellRevision other `shouldBe` Revision 1
-        readTVarIO (hostSettled host) `shouldReturn` []
-      _ ← waitFor (readTVar (hostSettled host) >>= \s' → if null s' then retry else pure s')
-      (cellIs <$> readCell svc lease (tile 3 4 5)) `shouldReturn` True
+        -- the removal's write is held: reads of the other arena answer, from its committed state
+        (cellIs <$> readCell svc other (tile 3 4 9)) `shouldReturn` True
+        (cellIs <$> readCell svc other (tile 3 4 5)) `shouldReturn` False
+        found ← readCell svc other (tile 8 8 8)
+        cellRevision found `shouldBe` Revision 1
+        -- a read of the removal's arena admitted after it commits after it (#641's per-arena order)
+        _ ← okOf (cellWith svc (hostEndpoint svc Nothing reader) lease (tile 3 4 5))
+        readTVarIO (hostSettled remover) `shouldReturn` []
+        readTVarIO (hostSettled reader) `shouldReturn` []
+      _ ← waitFor (readTVar (hostSettled reader) >>= \s' → if null s' then retry else pure s')
+      settledOf remover >>= (`shouldSatisfy` \case [Succeeded (ARemoved r)] → removeChangedFlag r; _ → False)
+      -- and sees it
+      settledOf reader >>= (`shouldSatisfy` \case [Succeeded (ACell c)] → cellIs c; _ → False)
       settleChecks svc
 
   it "keeps a read pending while its authoritative page is delayed, and answers it from the store, never from the source" $

@@ -70,7 +70,7 @@ module Hetoimasia.Terrain.Runtime.Internal.Backed
 
 import Control.Concurrent.STM
 import Control.Exception (evaluate)
-import Control.Monad (forM_, void, when)
+import Control.Monad (foldM, forM_, void, when)
 import Data.Int (Int64)
 import Data.List (sortOn)
 import qualified Data.Map.Strict as Map
@@ -530,7 +530,11 @@ data Contender
 -- explicit removal's 'endpointEligible'. The fairness rule decides between the two lists.
 contenders ∷ St → STM [Contender]
 contenders st = do
-  explicit ← fmap concat . traverse eligibleRemoval $ sortOn (reqSeq . snd) (Map.toList (stateRequests st))
+  -- per-arena admission order: a removal takes the slot only when no earlier data request of its
+  -- arena, with an eligible host, is still to commit (a later removal never overtakes an earlier
+  -- read or removal, so a stream of later removals cannot keep making an earlier read stale)
+  firstPending ← foldM firstOf Map.empty (sortOn (reqSeq . snd) (Map.toList (stateRequests st)))
+  explicit ← fmap concat . traverse (eligibleRemoval firstPending) $ sortOn (reqSeq . snd) (Map.toList (stateRequests st))
   -- explicit work WAITS while an accepted removal of a live, unpaused arena has an eligible host,
   -- even when none is ready to take the slot this instant: after every commit the others re-stage
   -- against the new revision, and internal work must not take those gaps beyond its turn
@@ -554,15 +558,31 @@ contenders st = do
     notDone = \case
       Done → False
       _ → True
-    eligibleRemoval (rid, req) = case (reqCmd req, reqPhase req, reqArena req >>= \aid → (,) aid <$> Map.lookup aid (stateArenas st)) of
+    firstOf acc (rid, req) = case reqArena req of
+      Just aid
+        | not (Map.member aid acc)
+        , dataCmd (reqCmd req)
+        , notDone (reqPhase req) → do
+            eligible ← endpointEligible (reqEndpoint req)
+            pure (if eligible then Map.insert aid rid acc else acc)
+      _ → pure acc
+    dataCmd = \case
+      CCell {} → True
+      CColumn {} → True
+      CSurface {} → True
+      CRemove {} → True
+      CKnowledge {} → True
+      _ → False
+    eligibleRemoval firstPending (rid, req) = case (reqCmd req, reqPhase req, reqArena req >>= \aid → (,) aid <$> Map.lookup aid (stateArenas st)) of
       (CRemove tile _, StagedPhase sg, Just (aid, arena))
-        | StagedRemoval prepared ← stagedWork sg
+        | Map.lookup aid firstPending `elem` [Nothing, Just rid]
+        , StagedRemoval prepared ← stagedWork sg
         , preparedChanged prepared
         , stagedRevision sg == arenaRevision arena
         , null (conditions (arenaStore arena)) → do
             eligible ← endpointEligible (reqEndpoint req)
             pure [ContendRemoval rid aid tile | eligible]
-      -- growth is admissible while paused: it is how a capacity pause is cleared
+      -- growth is admissible while paused: it is how a capacity pause is cleared (it changes no content)
       (CGrow _, StagedPhase sg, Just (aid, _))
         | StagedGrowth proposal ← stagedWork sg → do
             eligible ← endpointEligible (reqEndpoint req)

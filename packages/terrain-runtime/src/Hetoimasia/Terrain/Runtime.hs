@@ -122,7 +122,6 @@ module Hetoimasia.Terrain.Runtime
   , inspectDefects
   , inspectSnapshotBytes
   , inspectRetainedChargesSTM
-  , inspectRetryMemory
   , inspectLimits
   , inspectConfig
   , LimitRow (..)
@@ -146,7 +145,6 @@ module Hetoimasia.Terrain.Runtime
   , RunningWork
   , runningJobs
   , runningPreparation
-  , runningHandoffs
   , runningHolds
   , runningViews
   , JobWork
@@ -166,10 +164,6 @@ module Hetoimasia.Terrain.Runtime
   , preparationResident
   , preparationStaging
   , preparationEdit
-  , HandoffWork
-  , handoffWorkArena
-  , handoffWorkRegion
-  , handoffWorkDuplicate
   , inspectReadmissionWaits
   , inspectReadmissionWaitsSTM
   , inspectArena
@@ -630,13 +624,6 @@ inspectReadmissionWaitsSTM svc = do
 
 -- | The accounted bytes the retained bank holds (outstanding snapshots' backing and
 -- untaken removal results), and the bank.
--- | How many regions the owner remembers a transfer attempt or a capacity refusal
--- for. It returns to zero when the regions and arenas involved end.
-inspectRetryMemory ∷ Service → IO Int
-inspectRetryMemory svc = do
-  st <- readTVarIO (serviceState svc)
-  pure (Map.size (stateTransfers st) + Map.size (stateHandoffBusy st))
-
 -- | The configuration the service was built with. A pure read of the service's own immutable field: a host that composes over a service
 -- asks it, rather than being told a configuration that might differ from the one the service enforces. It reads no state and changes no
 -- behaviour.

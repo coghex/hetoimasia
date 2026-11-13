@@ -64,15 +64,23 @@ spec = do
       -- how many pages the transaction writes, counted on an uninterrupted run
       writes ← do
         probe ← H.newProbe
-        withServiceSeam quiet defaultConfig alwaysAdmitting noProbe (H.seamFor probe) $ \svc → do
+        atDecision ← newTVarIO []
+        -- the writes made when the owner reaches each decision (a transaction's writes have all returned by then)
+        let owner = Probe $ \case
+              PointBeforeCommit _ → atomically (H.countEvents probe isWrite >>= \n → modifyTVar' atDecision (<> [n]))
+              _ → pure ()
+        withServiceSeam quiet defaultConfig alwaysAdmitting owner (H.seamFor probe) $ \svc → do
           (_, lease) ← openMain svc "main"
           _ ← removeCell' svc lease (tile 3 4 9)
           bankAtRest svc
           writesBefore ← atomically (H.countEvents probe isWrite)
+          decided ← length <$> readTVarIO atDecision
           _ ← removeCell' svc lease (tile 3 4 5)
-          bankAtRest svc
-          after' ← atomically (H.countEvents probe isWrite)
-          pure (after' - writesBefore)
+          -- the first decision after the earlier ones is this removal's
+          counts ← readTVarIO atDecision
+          case drop decided counts of
+            n : _ → pure (n - writesBefore)
+            [] → fail "the removal reached no decision"
       writes `shouldSatisfy` (>= 1)
       forM_ [1 .. writes] $ \k → do
         probe ← H.newProbe

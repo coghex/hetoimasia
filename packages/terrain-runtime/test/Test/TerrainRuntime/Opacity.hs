@@ -133,7 +133,6 @@ constructors =
   , ("RunningWork", ["import Hetoimasia.Terrain.Runtime (RunningWork (RunningWork))"])
   , ("JobWork", ["import Hetoimasia.Terrain.Runtime (JobWork (JobWork))"])
   , ("PreparationWork", ["import Hetoimasia.Terrain.Runtime (PreparationWork (PreparationWork))"])
-  , ("HandoffWork", ["import Hetoimasia.Terrain.Runtime (HandoffWork (HandoffWork))"])
   ]
 
 -- | An authority forged by applying a constructor the client never imported.
@@ -149,7 +148,6 @@ forged =
   , ("RunningWork", ["import Hetoimasia.Terrain.Runtime (RunningWork)"], ["forgedWork :: RunningWork", "forgedWork = RunningWork undefined Nothing undefined"])
   , ("JobWork", ["import Hetoimasia.Terrain.Runtime (JobWork)"], ["forgedJob :: JobWork", "forgedJob = JobWork undefined undefined 0 0 1"])
   , ("PreparationWork", ["import Hetoimasia.Terrain.Runtime (PreparationWork)"], ["forgedPreparation :: PreparationWork", "forgedPreparation = PreparationWork undefined Nothing True 0 0 0 0"])
-  , ("HandoffWork", ["import Hetoimasia.Terrain.Runtime (HandoffWork)"], ["forgedHandoff :: HandoffWork", "forgedHandoff = HandoffWork undefined undefined 0"])
   ]
 
 -- | A snapshot rewritten through an exported accessor used as a field label.
@@ -169,7 +167,6 @@ inspectionUpdates =
   , ("censusModelRecord", ["import Hetoimasia.Terrain.Runtime (RequestCensus, censusModelRecord)"], ["recordless :: RequestCensus -> RequestCensus", "recordless r = r {censusModelRecord = False}"])
   , ("jobWorkResident", ["import Hetoimasia.Terrain.Runtime (JobWork, jobWorkResident)"], ["cheaper :: JobWork -> JobWork", "cheaper j = j {jobWorkResident = 0}"])
   , ("preparationStaging", ["import Hetoimasia.Terrain.Runtime (PreparationWork, preparationStaging)"], ["lean :: PreparationWork -> PreparationWork", "lean p = p {preparationStaging = 0}"])
-  , ("handoffWorkDuplicate", ["import Hetoimasia.Terrain.Runtime (HandoffWork, handoffWorkDuplicate)"], ["smaller :: HandoffWork -> HandoffWork", "smaller h = h {handoffWorkDuplicate = 0}"])
   , ("runningJobs", ["import Hetoimasia.Terrain.Runtime (RunningWork, runningJobs)"], ["idle :: RunningWork -> RunningWork", "idle w = w {runningJobs = []}"])
   ]
 

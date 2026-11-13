@@ -67,7 +67,7 @@ import qualified Hetoimasia.Terrain.Runtime.Store.Internal.Admission as A
 import qualified Hetoimasia.Terrain.Runtime.Backed.Growth as Growth
 import Hetoimasia.Terrain.Runtime.Backed.Fault (StorageFault (..))
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Service (ReadMode (..))
-import Hetoimasia.Terrain.Runtime.Storage.Internal.Service (PreparedGrowth)
+import Hetoimasia.Terrain.Runtime.Storage.Internal.Service (PreparedGrowth, ServiceView (..), serviceView)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Model (Condition (..), GrowthDecision (..), GrowthView (..), TxnId, clearCondition, conditions, growthView, oldestPin, proposeGrowth, storeConfig, storeHeader, storeRoots, storeVersion)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan (TxClass (..), availablePages)
 import Hetoimasia.Terrain.Runtime.Store.Internal.State (cfgAllowanceBytes, maxClaimPages)
@@ -246,11 +246,16 @@ backedIdle st = Map.null (stateOpens st) && Map.null (stateGathers st) && not (i
 backedWork ∷ St → ([Work], [(STM (), Work)])
 backedWork st = (now, waits)
   where
+    -- the slot and the drains first (one each, bounded), then the opens, then the pinned reads in
+    -- turn after the one stepped last
     tasks =
-      [openStep rid task | (rid, task) ← Map.toList (stateOpens st)]
-        <> [gatherStep key task | (key, task) ← Map.toList (stateGathers st)]
-        <> [slotReady task | Just task ← [stateSlot st]]
+      [slotReady task | Just task ← [stateSlot st]]
         <> [Just (Left (WDrain aid)) | aid ← Map.keys (stateClosing st), drainReady st aid]
+        <> [openStep rid task | (rid, task) ← Map.toList (stateOpens st)]
+        <> [gatherStep key task | (key, task) ← inTurn (Map.toList (stateGathers st))]
+    inTurn gathers = case stateGatherCursor st of
+      Nothing → gathers
+      Just cursor → let (before, after) = span ((<= cursor) . fst) gathers in after <> before
     now = [w | Just (Left w) ← tasks]
     waits = [(stm, w) | Just (Right (stm, w)) ← tasks]
     wakeOr wake work = case wake of
@@ -346,10 +351,19 @@ pickRequestWork svc st adm = do
     live = [(rid, req) | (rid, req) <- ordered, not (isDoneReq req)]
     groups = Map.fromListWith (flip (<>)) [(reqArena req, [(rid, req)]) | (rid, req) <- live]
     isDoneReq req = case reqPhase req of Done → True; _ → False
-    needsPrepare (rid, req) = case reqPhase req of
+    needsPrepare (rid, req) = not (behindSlot req) && case reqPhase req of
       Waiting → satisfied rid req && notStarted rid req
       StagedPhase sg → stale sg && notStarted rid req
       Done → False
+    -- while the slot runs a removal, a data request of its arena admitted after it is not prepared:
+    -- it could not commit before that removal (per-arena admission order), and what it would stage
+    -- now goes stale at that removal's commit. Other arenas, and earlier requests, are unaffected.
+    behindSlot req = case stateSlot st of
+      Just task
+        | SlotRemoval srid ← slotWork task
+        , Just slotReq ← Map.lookup srid (stateRequests st) →
+            reqArena req == Just (slotArena task) && reqSeq req > reqSeq slotReq && isDataCmd (reqCmd req)
+      _ → False
     -- an open has one preparation task; a read or a removal one gather at a time, started only
     -- when its arena has a pin to spare and the edit bank its credit
     notStarted rid req = case reqCmd req of
@@ -414,6 +428,8 @@ traceWork svc w = do
   when (on == Just "1") $ do
     lg <- A.ledgers <$> readTVarIO (serviceEditBank svc)
     hPutStrLn stderr ("bank: cacheB=" <> show (A.lgCacheBacked lg) <> " cacheR=" <> show (A.lgCacheRamOnly lg) <> " pinned=" <> show (A.lgCachePinned lg) <> " stagF=" <> show (A.lgStagingForeground lg) <> " ctl=" <> show (A.lgControlReserved lg))
+    sv <- atomically (serviceView (serviceStorage svc))
+    hPutStrLn stderr ("storage: queued=" <> show (svQueued sv) <> " running=" <> show (svRunning sv) <> " records=" <> show (svRecords sv) <> " waitingForCache=" <> show (svWaitingForCache sv) <> " mutating=" <> show (svMutating sv))
   when (on == Just "1") $ hPutStrLn stderr ("owner: " <> show (round (t * 1000000) :: Integer) <> " " <> case w of
     WCloseSession → "close"; WStop → "stop"; WVictim k → "victim " <> show k; WAck j → "ack " <> show j
     WPrepare r → "prepare " <> show r; WCommit r → "commit " <> show r; WRetry → "retry"; WDispatch → "dispatch"; WReport → "report"
@@ -439,7 +455,11 @@ perform' svc = \case
     -- the session's one compilation was charged to the compile account and starts now
     when (before /= Just rid && after == Just rid) (probe svc (PointCompiling rid))
     pure True
-  WGather key → takeTurn svc TurnPrepare >> stepGatherTask svc key (delivered svc key) >> pure True
+  WGather key → do
+    takeTurn svc TurnPrepare
+    atomically (modifySt svc (\s → s {stateGatherCursor = Just key}))
+    stepGatherTask svc key (delivered svc key)
+    pure True
   WSlot → takeTurn svc TurnPrepare >> slotStep svc >> pure True
   WGrant contender → do
     takeTurn svc TurnPrepare

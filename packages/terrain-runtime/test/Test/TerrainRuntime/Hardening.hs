@@ -498,33 +498,31 @@ spec = describe "Accounting and lifetime hardening" $ do
       settleChecks svc
 
   it "keeps a request that waits to be admitted again charged until it is readmitted or ends" $ do
-    -- Every transfer fails, so an edited region stays protected; the bank holds about
-    -- one region, so a request that needs another cannot be admitted again.
-    let probe = Probe $ \point → case point of
-          PointHandoff _ _ → throwIO (ErrorCall "every transfer fails")
-          _ → pure ()
-    reported <- newTVarIO (0 ∷ Int)
-    withServiceUsing microConfig alwaysAdmitting (Probe (\p → probePoint probe p >> case p of PointHandoffReported {} → atomically (modifyTVar' reported (+ 1)); _ → pure ())) $ \svc → do
+    -- A borrowed snapshot keeps the edited region resident (the baseline kept it protected by
+    -- failing every transfer; a backed commit transfers nothing), and the bank holds about one
+    -- region, so a request that needs another cannot be admitted again.
+    withServiceUsing microConfig alwaysAdmitting noProbe $ \svc → do
       client <- okOf (registerClient svc)
       let definition = layered [(Just 0, Just 2, "soil", 0), (Just 32, Just 34, "stone", 0)] [] ∷ SourceSpec
       lease <- okOf (openArena svc client "waits" definition) >>= await svc >>= expectSuccess
       surfaceHost <- newHost False
       _ <- okOf (surfaceWith svc (hostEndpoint svc Nothing surfaceHost) lease (column 0 0))
       waitFor (readTVar (hostReady surfaceHost) >>= \n → check (n >= 1))
-      -- Two edits bring the column's top down into the other region.
-      _ <- removeCell' svc lease (tile 0 0 33)
-      waitFor (readTVar reported >>= \n → check (n >= 1))
-      _ <- removeCell' svc lease (tile 0 0 32)
-      waitFor (readTVar reported >>= \n → check (n >= 2))
-      waitFor (inspectReadmissionWaitsSTM svc >>= \n → check (n == 1))
-      -- It is charged: it holds a command slot, so only one more fits two, and the
-      -- state is coherent.
-      inspectInvariants svc >>= (`shouldBe` [])
-      first' <- okOf (cellAt svc lease (tile 0 0 32))
-      cellAt svc lease (tile 0 0 33) >>= \r → fmap isBusy (refusedWith r) `shouldBe` Just True
-      void (cancelPending svc first')
-      -- Ending the arena ends the request once and returns its charge.
-      closeService svc
+      let (edited, _) = decomposeTile (tile 0 0 33)
+      outcome <- withSnapshot svc lease [edited] $ \_ → do
+        -- Two edits bring the column's top down into the other region.
+        _ <- removeCell' svc lease (tile 0 0 33)
+        _ <- removeCell' svc lease (tile 0 0 32)
+        waitFor (inspectReadmissionWaitsSTM svc >>= \n → check (n == 1))
+        -- It is charged: it holds a command slot, so only one more fits two, and the
+        -- state is coherent.
+        inspectInvariants svc >>= (`shouldBe` [])
+        first' <- okOf (cellAt svc lease (tile 0 0 32))
+        cellAt svc lease (tile 0 0 33) >>= \r → fmap isBusy (refusedWith r) `shouldBe` Just True
+        void (cancelPending svc first')
+        -- Ending the arena ends the request once and returns its charge.
+        closeService svc
+      either (\r → expectationFailure (show r)) pure outcome
       settledOf surfaceHost `shouldReturn` [Failed ArenaClosed]
       inspectReadmissionWaits svc `shouldReturn` 0
       inspectInvariants svc >>= (`shouldBe` [])
@@ -533,10 +531,7 @@ spec = describe "Accounting and lifetime hardening" $ do
     -- The bank holds two records. The pending surface query holds one from admission and
     -- a removal the other, so a second removal is refused rather than admitted into
     -- room the waiting query will need.
-    let probe = Probe $ \point → case point of
-          PointHandoff _ _ → throwIO (ErrorCall "every transfer fails")
-          _ → pure ()
-    withServiceUsing ((microConfigSlots 6) {configRetainedBytes = 320}) alwaysAdmitting probe $ \svc → do
+    withServiceUsing ((microConfigSlots 6) {configRetainedBytes = 320}) alwaysAdmitting noProbe $ \svc → do
       client <- okOf (registerClient svc)
       let definition = layered [(Just 0, Just 2, "soil", 0), (Just 32, Just 34, "stone", 0)] [] ∷ SourceSpec
       lease <- okOf (openArena svc client "full" definition) >>= await svc >>= expectSuccess
@@ -811,7 +806,9 @@ spec = describe "Accounting and lifetime hardening" $ do
       , ("while it captures a read", \p → case p of PointCaptured {} → True; _ → False, \svc lease arm → arm >> void (cellAt svc lease (tile 1 0 1)) >> pure ())
       , ("while it stages an edit", \p → case p of PointStaging _ → True; _ → False, \svc lease arm → arm >> void (removeAt svc lease (tile 1 0 1) Nothing) >> pure ())
       , ("at the commit boundary", \p → case p of PointBeforeCommit _ → True; _ → False, \svc lease arm → arm >> void (removeAt svc lease (tile 1 0 1) Nothing) >> pure ())
-      , ("while a transfer runs", \p → case p of PointHandoff _ _ → True; _ → False, \svc lease arm → arm >> void (removeCell' svc lease (tile 1 0 1)))
+      -- (the baseline's 'while a transfer runs': a backed commit transfers nothing; the work in flight
+      -- that holds the most is the slot's transaction, just granted with its credits reserved)
+      , ("while it holds the mutation slot, its transaction's credits reserved", \p → case p of PointGranted (Just _) _ → True; _ → False, \svc lease arm → arm >> void (removeAt svc lease (tile 1 0 1) Nothing) >> pure ())
       , ( "while a victim is being released"
         , \p → case p of PointVictim _ _ → True; _ → False
         , \svc lease arm → do

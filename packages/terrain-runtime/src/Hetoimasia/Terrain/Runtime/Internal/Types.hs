@@ -77,13 +77,8 @@ module Hetoimasia.Terrain.Runtime.Internal.Types
   , preparationResident
   , preparationStaging
   , preparationEdit
-  , HandoffWork (..)
-  , handoffWorkArena
-  , handoffWorkRegion
-  , handoffWorkDuplicate
   , runningJobs
   , runningPreparation
-  , runningHandoffs
   , runningHolds
   , runningViews
   , Census (..)
@@ -482,12 +477,6 @@ data Point
     PointCommitted !RequestId !Revision
   | -- | A load job is about to run.
     PointJob !ArenaId !RegionCoord
-  | -- | A changed region's transfer is about to run; an exception is a failed transfer.
-    PointHandoff !ArenaId !RegionCoord
-  | -- | A transfer was refused for want of capacity (it will be reconsidered).
-    PointHandoffBusy !ArenaId !RegionCoord
-  | -- | A transfer ended and was reported: whether it succeeded.
-    PointHandoffReported !ArenaId !RegionCoord !Bool
   | -- | A victim's detail is about to be discarded.
     PointVictim !ArenaId !RegionCoord
   | -- | The session's mutating transaction was granted: to an explicit request (its id) or to
@@ -632,7 +621,6 @@ data Req = Req
 data RunningWork = RunningWork
   { rwJobs ∷ !(Map JobId JobWork)
   , rwPreparation ∷ !(Maybe PreparationWork)
-  , rwHandoffs ∷ !(Map RegionKey HandoffWork)
   , -- | Each outstanding borrow: the regions its snapshot covers and the accounted bytes
     -- the snapshot backs (its payload, its segment metadata and its column index entries),
     -- both read from the snapshot value handed out, at hand-out.
@@ -643,7 +631,7 @@ data RunningWork = RunningWork
   }
 
 noRunningWork ∷ RunningWork
-noRunningWork = RunningWork Map.empty Nothing Map.empty Map.empty Map.empty
+noRunningWork = RunningWork Map.empty Nothing Map.empty Map.empty
 
 -- | An accepted load job: its identity, where, the resident bytes and the scratch the
 -- model granted it at admission, the least the job holds once the owner runs it, from the
@@ -705,29 +693,12 @@ preparationStaging (PreparationWork _ _ _ _ _ n _) = n
 preparationEdit ∷ PreparationWork → Word64
 preparationEdit (PreparationWork _ _ _ _ _ _ n) = n
 
--- | The temporary duplicate of a region's changes the owner holds while it transfers
--- them: where, and how many bytes.
-data HandoffWork = HandoffWork !ArenaId !RegionCoord !Word64
-  deriving stock (Eq, Show)
-
-handoffWorkArena ∷ HandoffWork → ArenaId
-handoffWorkArena (HandoffWork a _ _) = a
-
-handoffWorkRegion ∷ HandoffWork → RegionCoord
-handoffWorkRegion (HandoffWork _ r _) = r
-
-handoffWorkDuplicate ∷ HandoffWork → Word64
-handoffWorkDuplicate (HandoffWork _ _ n) = n
-
--- | The jobs, the preparation and the handoff duplicates of a record, oldest first.
+-- | The jobs and the preparation of a record, oldest first.
 runningJobs ∷ RunningWork → [JobWork]
 runningJobs = Map.elems . rwJobs
 
 runningPreparation ∷ RunningWork → Maybe PreparationWork
 runningPreparation = rwPreparation
-
-runningHandoffs ∷ RunningWork → [HandoffWork]
-runningHandoffs = Map.elems . rwHandoffs
 
 -- | Each outstanding borrow, how many regions its snapshot covers and how many accounted
 -- bytes the snapshot backs.
@@ -1014,8 +985,6 @@ data St = St
     stateFreed ∷ !Bool
   , -- | A dispatch found nothing to run since the last time capacity freed.
     stateDispatchIdle ∷ !Bool
-  , -- | The generation each region's last transfer was tried at.
-    stateTransfers ∷ !(Map RegionKey Word64)
   , stateDefects ∷ ![DefectRecord]
   , stateDefectCount ∷ !Word64
   , -- | Whose quantum is next when several kinds of work are ready.
@@ -1031,12 +1000,6 @@ data St = St
   , -- | Arenas closed while a preparation of theirs was running: the model retires
     -- them at the safe point.
     stateDeferredRetire ∷ !(Set ArenaId)
-  , -- | Advances every time capacity may have been returned.
-    stateCapacityEpoch ∷ !Word64
-  , -- | The capacity epoch at which a region's transfer was refused for want of
-    -- capacity. That is not a failed transfer: the region is reconsidered as soon
-    -- as the epoch moves.
-    stateHandoffBusy ∷ !(Map RegionKey Word64)
   , -- | The read-only record of the work the owner is running (see 'RunningWork'):
     -- written by the owner where that work starts and ends, read by no decision.
     stateWork ∷ !RunningWork
@@ -1054,6 +1017,9 @@ data St = St
   , -- | Explicit grants since the last grant to internal work (discovery, reclamation):
     -- the fairness rule gives internal work one grant in every 'internalTurn'.
     stateExplicitRun ∷ !Int
+  , -- | The pinned read stepped last: ready reads are stepped in turn after it, so no arena's reads
+    -- (or a load's) are passed over by another's.
+    stateGatherCursor ∷ !(Maybe GatherFor)
   , -- | Internal work (keyed by arena and whether it is reclamation) that found nothing it
     -- could do, at the committed version and the oldest pinned version it found it at: not
     -- offered again until either moves (a commit, or a reader's release), so it never spins.
@@ -1095,15 +1061,12 @@ initialState config limits =
     , stateSnapshots = Map.empty
     , stateFreed = False
     , stateDispatchIdle = False
-    , stateTransfers = Map.empty
     , stateDefects = []
     , stateDefectCount = 0
     , stateTurn = TurnPrepare
     , stateRunning = Nothing
     , stateGhosts = Map.empty
     , stateDeferredRetire = Set.empty
-    , stateCapacityEpoch = 0
-    , stateHandoffBusy = Map.empty
     , stateWork = noRunningWork
     , stateOpens = Map.empty
     , stateCompiling = Nothing
@@ -1111,6 +1074,7 @@ initialState config limits =
     , stateGathers = Map.empty
     , stateSlot = Nothing
     , stateExplicitRun = 0
+    , stateGatherCursor = Nothing
     , stateInternalIdle = Map.empty
     , stateNeedsMaintenance = Set.empty
     , stateClosing = Map.empty
