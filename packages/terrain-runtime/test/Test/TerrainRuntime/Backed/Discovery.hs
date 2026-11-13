@@ -16,7 +16,7 @@ import Hetoimasia.Terrain.Runtime.Settlement
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Native (NativeOp (..))
 import Test.Hspec
 import Test.TerrainRuntime.Fixtures hiding (limitsWith)
-import Test.TerrainRuntime.Store.Scenes (Scene (..), envFor, limitsWith, openingA, openingB, twoOpenings)
+import Test.TerrainRuntime.Store.Scenes (Scene (..), envFor, limitsWith, openingA, openingB, sealedStack, twoOpenings)
 import qualified Test.TerrainRuntime.Storage.Harness as H
 
 isWrite ∷ NativeOp → Bool
@@ -24,9 +24,9 @@ isWrite = \case OpWriteAt {} → True; _ → False
 
 -- | The reference: #661's model over its own in-memory records, every removal applied with its
 -- obligation, then discovery stepped until no obligation remains.
-reference ∷ ArenaId → [(Integer, Integer, Integer)] → Either String D.Retained
-reference aid cells = do
-  let env = envFor (limitsWith 64) twoOpenings
+reference ∷ Scene → ArenaId → [(Integer, Integer, Integer)] → Either String D.Retained
+reference scene aid cells = do
+  let env = envFor (limitsWith 64) scene
       apply r cand = either (Left . show) Right (D.applyCandidate cand r)
   removed ← foldM
     ( \r (x, y, z) → case D.stageRemoval env (D.retainedHeader r) (D.retainedProvider r) (D.allowanceOf (D.envLimits env)) (tile x y z) of
@@ -44,17 +44,28 @@ reference aid cells = do
             other → Left ("reference discovery: " <> show other)
   drain 0 removed
 
+-- | The traces run through the backed service, each against #661's uninterrupted reference: the two
+-- openings in both orders, buried removals that change connectivity without revealing anything and
+-- then a real opening into them, and a stack opened from below the sky.
+traces ∷ [(String, Scene, [(Integer, Integer, Integer)])]
+traces =
+  [ ("two openings, A then B", twoOpenings, openingA <> openingB)
+  , ("two openings, B then A", twoOpenings, openingB <> openingA)
+  , ("buried removals in the cave's wall, then opening A", twoOpenings, [(5, 4, 5), (5, 5, 5), (6, 5, 5)] <> openingA)
+  , ("a sealed stack opened to the sky", sealedStack, [(3, 3, z) | z ← [2 .. 7]])
+  ]
+
 -- | The cells compared: the cavity, its walls and the shafts, around the sky.
 compared ∷ [(Integer, Integer, Integer)]
-compared = [(x, y, z) | x ← [0 .. 10], y ← [0 .. 4], z ← [4 .. 8]]
+compared = [(x, y, z) | x ← [0 .. 10], y ← [0 .. 5], z ← [2 .. 8]]
 
 spec ∷ Spec
 spec = describe "Discovery through the backed service" $ do
-  it "drains the obligations of two openings through the decision, and what the store knows is the reference's" $
+  forM_ traces $ \(label, scene, cells) →
+   it ("drains the obligations through the decision, and what the store knows is the reference's: " <> label) $
     withService defaultConfig {configDiscovery = limitsWith 1} $ \svc → do
       client ← okOf (registerClient svc)
-      lease ← okOf (openArena svc client "cave" (sceneSpec twoOpenings)) >>= await svc >>= expectSuccess
-      let cells = openingA <> openingB
+      lease ← okOf (openArena svc client "cave" (sceneSpec scene)) >>= await svc >>= expectSuccess
       forM_ cells $ \(x, y, z) → removeCell' svc lease (tile x y z)
       -- the owner drains discovery on its own: no request asks for it
       waitFor $ arenaStatusSTM svc lease >>= \case
@@ -62,8 +73,8 @@ spec = describe "Discovery through the backed service" $ do
         Left _ → retry
       answers ← forM compared $ \(x, y, z) → okOf (knowledgeAt svc lease (tile x y z)) >>= await svc >>= expectSuccess
       incarnation ← case answers of a : _ → pure (knowledgeIncarnation a); [] → fail "no answer"
-      expected ← either fail pure (reference incarnation cells)
-      let env = envFor (limitsWith 64) twoOpenings
+      expected ← either fail pure (reference scene incarnation cells)
+      let env = envFor (limitsWith 64) scene
       forM_ (zip compared answers) $ \((x, y, z), answer) →
         (((x, y, z), Right (knowledgeValue answer)) `shouldBe` ((x, y, z), D.observedValue (D.queryCell env (D.retainedProvider expected) (tile x y z))))
       status ← arenaStatus svc lease >>= expectRight
