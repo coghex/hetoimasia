@@ -53,6 +53,8 @@ module Test.TerrainRuntime.Storage.Harness
   , addErrnoAfterRule
   , errnoAfterRuleAfter
   , physicalHoldings
+  , mayHold
+  , Inc (..)
   , addGate
   , addGateAfter
   , events
@@ -147,6 +149,10 @@ data Act
     Lie
   | -- | Make the call and add this many bytes to the allocated size it reports.
     OverAllocated !Word64
+  | -- | Make the call and report this file size (a length the platform did not establish).
+    WrongSize !Word64
+  | -- | Make the call and report this allocated size instead of the real one (a coverage the platform did not give).
+    UnderAllocated !Word64
   | -- | Make the call and report this much free space.
     FreeBytesAre !Word64
   | -- | Report this much free space less what the files the backend holds open
@@ -171,6 +177,9 @@ data Rule = Rule
   -- ^ How many matching calls it still applies to; negative is unlimited.
   }
 
+-- | One file the adapter created, as the oracle tracks it.
+data Inc = Inc {incDev ∷ !Word64, incHigh ∷ !Word64, incLive ∷ !Bool}
+
 data Probe = Probe
   { pLog ∷ !(TVar [NativeOp])
   , pRules ∷ !(TVar [Rule])
@@ -188,12 +197,19 @@ data Probe = Probe
   -- ^ Rules applied by the seam's BEFORE-hook: the native call has NOT been made when they fire.
   , pReported ∷ !(TVar (Map.Map Int Word64))
   -- ^ THE ORACLE'S RECORD: the allocation the adapter last REPORTED to the service for each descriptor (injected lies included).
+  , pFact ∷ !(TVar CloseFact)
+  -- ^ The platform fact about a failed close the example runs under (the oracle needs it: an errno where the fact is established means released).
+  , pIncs ∷ !(TVar (Map.Map Int Inc))
+  -- ^ THE ORACLE'S INCARNATIONS: one per file the adapter created, with the volume it is on, the LARGEST allocation the adapter reported for it
+  -- since its last successful allocation-changing call (lies included), and whether it may still hold space (not cleanly released).
+  , pFdInc ∷ !(TVar (Map.Map Int Int))
+  -- ^ The incarnation a descriptor number currently names (a number is reused by a later file).
   , pErrnoAfter ∷ !(TVar [Rule])
   -- ^ Rules that make the native call and then answer an errno instead of its result (the effect happened, the caller is told it failed).
   }
 
 newProbe ∷ IO Probe
-newProbe = Probe <$> newTVarIO [] <*> newTVarIO [] <*> newTVarIO [] <*> newTVarIO [] <*> newTVarIO Set.empty <*> newTVarIO [] <*> newTVarIO [] <*> newTVarIO [] <*> newTVarIO [] <*> newTVarIO [] <*> newTVarIO Map.empty <*> newTVarIO []
+newProbe = Probe <$> newTVarIO [] <*> newTVarIO [] <*> newTVarIO [] <*> newTVarIO [] <*> newTVarIO Set.empty <*> newTVarIO [] <*> newTVarIO [] <*> newTVarIO [] <*> newTVarIO [] <*> newTVarIO [] <*> newTVarIO Map.empty <*> newTVarIO CloseReleasesOnFailure <*> newTVarIO Map.empty <*> newTVarIO Map.empty <*> newTVarIO []
 
 -- | Apply a rule to the next @n@ matching calls (negative: all of them).
 addRule ∷ Probe → Int → (NativeOp → Bool) → Act → IO ()
@@ -227,6 +243,36 @@ errnoAfterRuleAfter p skip n match e = do
   sk ← newTVarIO skip
   uses ← newTVarIO n
   atomically (modifyTVar' (pErrnoAfter p) (<> [Rule match (FailWith e) sk uses]))
+
+newIncarnation ∷ Probe → Int → STM ()
+newIncarnation p fd = do
+  n ← Map.size <$> readTVar (pIncs p)
+  modifyTVar' (pIncs p) (Map.insert n (Inc 0 0 True))
+  modifyTVar' (pFdInc p) (Map.insert fd n)
+
+reportToIncarnation ∷ Probe → Int → Word64 → Word64 → STM ()
+reportToIncarnation p fd dev alloc = do
+  m ← readTVar (pFdInc p)
+  forM_ (Map.lookup fd m) $ \n → modifyTVar' (pIncs p) (Map.adjust (\i → i {incDev = dev, incHigh = max (incHigh i) alloc}) n)
+
+resetIncarnation ∷ Probe → Int → STM ()
+resetIncarnation p fd = do
+  m ← readTVar (pFdInc p)
+  forM_ (Map.lookup fd m) $ \n → modifyTVar' (pIncs p) (Map.adjust (\i → i {incHigh = 0}) n)
+
+-- | The close returned (or raised): the file is cleanly released, or it may still hold space.
+closedIncarnation ∷ Probe → Int → Bool → STM ()
+closedIncarnation p fd released = do
+  m ← readTVar (pFdInc p)
+  forM_ (Map.lookup fd m) $ \n → modifyTVar' (pIncs p) (Map.adjust (\i → if released then i {incLive = False} else i) n)
+
+-- | THE SECOND READING OF THE ORACLE (round 9): for every file that may still hold space (one the adapter has not seen cleanly released), the volume and
+-- the LARGEST allocation the adapter reported for it since its last successful allocation-changing call, lies included. The service's counted figure
+-- for a volume must be at least the sum.
+mayHold ∷ Probe → IO [(Word64, Word64)]
+mayHold p = do
+  incs ← readTVarIO (pIncs p)
+  pure [(incDev i, incHigh i) | i ← Map.elems incs, incLive i, incHigh i > 0, incDev i /= 0]
 
 -- | THE ORACLE OF PHYSICAL TRUTH (round 8): for every descriptor the adapter still holds open, its number, the volume it is on and
 -- what it holds: the larger of what the file really occupies (read by the production adapter, outside every rule) and the
@@ -372,6 +418,9 @@ seamFor p = Seam wrapped before after
               _ → do
                 r ← nativeCreate real dir name
                 case r of
+                  Right fd → atomically (newIncarnation p (fdNumber fd)) >> pure ()
+                  Left _ → pure ()
+                case r of
                   Right fd → atomically (modifyTVar' (pCreated p) (fdNumber fd :) >> modifyTVar' (pOpen p) (Set.insert (fdNumber fd)) >> modifyTVar' (pHandles p) (<> [fd]))
                   Left _ → pure ()
                 pure r
@@ -394,12 +443,14 @@ seamFor p = Seam wrapped before after
             a ← takeRule p OpStatFile
             out ← case (a, r) of
               (Just (OverAllocated n), Right s) → pure (Right s {nsAllocated = nsAllocated s + n})
+              (Just (WrongSize n), Right s) → pure (Right s {nsSize = n})
+              (Just (UnderAllocated n), Right s) → pure (Right s {nsAllocated = n})
               (Just (FailWith e), _) → pure (Left e)
               (Just Throw, _) → ioError (userError "injected exception")
               _ → pure r
             -- what the service was TOLD about this descriptor, lies included, is the oracle's reading of what it must count
             case out of
-              Right st → atomically (modifyTVar' (pReported p) (Map.insert (fdNumber fd) (nsAllocated st)))
+              Right st → atomically (modifyTVar' (pReported p) (Map.insert (fdNumber fd) (nsAllocated st)) >> reportToIncarnation p (fdNumber fd) (nsDevice st) (nsAllocated st))
               Left _ → pure ()
             pure out
         , nativeStatFs = \fd → do
@@ -421,13 +472,13 @@ seamFor p = Seam wrapped before after
               Just (FailWith e) → pure (Left e)
               Just Throw → ioError (userError "injected exception")
               Just Lie → pure (Right len)
-              _ → nativeReserve real fd off len >>= errnoAfter (OpReserveRange off len)
+              _ → nativeReserve real fd off len >>= errnoAfter (OpReserveRange off len) >>= changed fd
         , nativeSetLength = \fd len → do
             a ← takeRule p (OpSetFileLength len)
             case a of
               Just (FailWith e) → pure (Left e)
               Just Throw → ioError (userError "injected exception")
-              _ → nativeSetLength real fd len >>= errnoAfter (OpSetFileLength len)
+              _ → nativeSetLength real fd len >>= errnoAfter (OpSetFileLength len) >>= changed fd
         , nativePread = \fd ptr n off → do
             a ← takeRule p (OpReadAt off n)
             case a of
@@ -448,12 +499,23 @@ seamFor p = Seam wrapped before after
             r ← nativeClose real fd
             atomically (modifyTVar' (pOpen p) (Set.delete (fdNumber fd)))
             a ← takeRule p OpCloseFile
+            fact ← readTVarIO (pFact p)
             case a of
-              Just (FailWith e) → pure (Left e)
-              -- the call was made and then the exception is raised, as a failing close does
+              Just (FailWith e) → atomically (closedIncarnation p (fdNumber fd) (fact == CloseReleasesOnFailure)) >> pure (Left e)
+              -- the call was made and then the exception is raised, as a failing close does: the reservation may still be held
               Just Throw → ioError (userError "injected exception")
-              _ → errnoAfter OpCloseFile r
+              _ → do
+                out ← errnoAfter OpCloseFile r
+                atomically (closedIncarnation p (fdNumber fd) (either (const (fact == CloseReleasesOnFailure)) (const True) out))
+                pure out
         }
+    -- an allocation-changing call that SUCCEEDED (as the service was told): what was reported before it no longer holds
+    changed ∷ Fd → Either Errno a → IO (Either Errno a)
+    changed fd r = do
+      case r of
+        Right _ → atomically (resetIncarnation p (fdNumber fd) >> modifyTVar' (pReported p) (Map.delete (fdNumber fd)))
+        Left _ → pure ()
+      pure r
     -- the call HAS been made; a rule of the errno-after dimension then answers an errno in place of its result
     errnoAfter ∷ NativeOp → Either Errno a → IO (Either Errno a)
     errnoAfter op r = do
@@ -520,6 +582,7 @@ withEnvIn ∷ FilePath → EnvOptions → (Env → IO a) → IO a
 withEnvIn dir opts body = do
     cfg ← testConfigFor dir opts
     probe ← newProbe
+    atomically (writeTVar (pFact probe) (eoCloseFact opts))
     bank ← either (\e → fail (show e)) pure (A.mkEditBankConfig A.defaultEditBankSpec)
     admission ← newTVarIO (A.newAdmission bank)
     result ← newIORef Nothing

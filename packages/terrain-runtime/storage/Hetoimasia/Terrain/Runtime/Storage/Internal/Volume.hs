@@ -9,6 +9,7 @@
 module Hetoimasia.Terrain.Runtime.Storage.Internal.Volume
   ( VolumeProfile (..)
   , profileOf
+  , profileOfSeen
   , linuxFilesystemName
   , parseMountInfo
   , decodeLinuxDevice
@@ -43,8 +44,12 @@ data VolumeProfile = VolumeProfile
 
 -- | Observe the descriptor's volume.
 profileOf ∷ Seam → Fd → IO (Either (IoOp, Errno) VolumeProfile)
-profileOf seam fd = do
-  st ← around seam OpStatFile NothingAcquired (nativeStat (seamNative seam) fd)
+profileOf seam fd = newSeen >>= \seen → profileOfSeen seam seen fd
+
+-- | 'profileOf', recording the file's allocation (the allocation BEFORE a reservation) in the caller's recorder the instant it is read.
+profileOfSeen ∷ Seam → Seen → Fd → IO (Either (IoOp, Errno) VolumeProfile)
+profileOfSeen seam seen fd = do
+  st ← seenStat seam seen fd
   case st of
     Left e → pure (Left (IoStat, e))
     Right s → do

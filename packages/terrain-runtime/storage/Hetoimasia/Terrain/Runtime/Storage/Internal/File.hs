@@ -160,9 +160,11 @@ data Stopped = StoppedFailure !StorageFailure !Bool | StoppedCancelled !Bool
 -- coordination for the whole call, so no other reservation spends the headroom
 -- observed here. The cancellation test is read between steps; a stop leaves
 -- whatever the native steps obtained for the caller to release.
-reserveRange ∷ Seam → StorageConfig → IO Bool → Fd → Word64 → Word64 → Word64 → IO (Either Stopped Reserved)
-reserveRange seam cfg cancelled fd off len keep = do
-  prof ← profileOf seam fd
+reserveRange ∷ Seam → StorageConfig → IO Bool → Fd → Seen → Word64 → Word64 → Word64 → IO (Either Stopped Reserved)
+reserveRange seam cfg cancelled fd seen off len keep = do
+  -- every allocation read here (before the request, and at the verification) goes to the CALLER's recorder the instant it is read, so a
+  -- refusal after the stat, a cancellation, an exception or an after-hook raise can never lose it
+  prof ← profileOfSeen seam seen fd
   case prof of
     Left (op, e) → pure (Left (StoppedFailure (StorageIo (ioFailure op e Nothing)) False))
     Right p
@@ -202,7 +204,7 @@ reserveRange seam cfg cancelled fd off len keep = do
             Left e → pure (stopAfter (ReservationFailed (LengthFailed e)))
             Right () → verify p
     verify p = do
-      st ← around seam OpStatFile NothingAcquired (nativeStat (seamNative seam) fd)
+      st ← seenStat seam seen fd
       pure $ case st of
         Left e → stopAfter (StorageIo (ioFailure IoStat e Nothing))
         Right s
@@ -224,9 +226,9 @@ reserveRange seam cfg cancelled fd off len keep = do
 -- has releases nothing that was preallocated beyond its end on APFS (measured in
 -- the qualification), so the length is raised first: the blocks beyond @from@ are
 -- then inside the file, and shortening it frees them on both targets.
-releaseExtra ∷ Seam → Fd → Word64 → Word64 → IO (Either T.Errno ())
-releaseExtra seam fd from to = do
-  st ← around seam OpStatFile NothingAcquired (nativeStat (seamNative seam) fd)
+releaseExtra ∷ Seam → Seen → Fd → Word64 → Word64 → IO (Either T.Errno ())
+releaseExtra seam seen fd from to = do
+  st ← seenStat seam seen fd
   case st of
     Left e → pure (Left e)
     Right s → do

@@ -20,7 +20,7 @@ import Data.Maybe (isJust)
 import qualified Data.Map.Strict as Map
 import qualified Data.ByteString.Char8 as BC
 import Data.IORef
-import Data.List (isInfixOf)
+import Data.List (isInfixOf, isPrefixOf)
 import Data.Word (Word64)
 import qualified Foreign.C.Error as C
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Native
@@ -384,6 +384,15 @@ matrix =
   , (SOpen, "set length", isLen, 0, none)
   , (SOpen, "stat (verify reservation)", isStat, 2, none)
   , (SOpen, "close (cleanup after a failure)", (== OpCloseFile), 0, \p -> addRule p 1 isReserve (FailWith (Errno 28)))
+  -- ROUND 9: THE COMPOUND ROWS. The verification reports MORE than the allowance (a lie the service is told once), refuses (the headroom after the
+  -- allocation, the fit), and every stat after it fails (the cleanup cannot re-read the allocation): what the cleanup's close or the rollback then does
+  -- under every exit and both facts must still leave the counted figure at least what was observed (the oracle's second reading).
+  , (SOpen, "close after a verification refused for headroom, the re-read failing", (== OpCloseFile), 0, \p -> addRule p 1 (== OpStatFilesystem) (FreeBytesAre (cfgAllowanceBytes (hCfg h0) + minHeadroomBytes)) >> addRuleAfter p 2 1 isStat (OverAllocated (budgetBytes (hCfg h0) + 4096)) >> addRuleAfter p 3 (-1) isStat (FailWith eio))
+  , (SOpen, "stat (verify reservation) over-reporting, the re-read failing", isStat, 2, \p -> addRuleAfter p 2 1 isStat (OverAllocated (budgetBytes (hCfg h0) + 4096)) >> addRuleAfter p 3 (-1) isStat (FailWith eio))
+  , (SGrow, "stat (verify) over-reporting, the re-read failing", isStat, 1, \p -> addRuleAfter p 1 1 isStat (OverAllocated (10 * mib)) >> addRuleAfter p 2 (-1) isStat (FailWith eio))
+  , (SOpen, "close after a fit refusal, the re-read failing", (== OpCloseFile), 0, \p -> addRuleAfter p 2 1 isStat (OverAllocated (budgetBytes (hCfg h0) + 1)) >> addRuleAfter p 3 (-1) isStat (FailWith eio))
+  , (SGrow, "rollback after a verification refused for headroom, the re-read failing", (== OpSetFileLength (payloadBytes (hCfg h0))), 0, \p -> addRule p 1 (== OpStatFilesystem) (FreeBytesAre (64 * mib + minHeadroomBytes)) >> addRuleAfter p 1 1 isStat (OverAllocated (budgetBytes (hCfg h0) + 4096)) >> addRuleAfter p 2 (-1) isStat (FailWith eio))
+  , (SGrow, "rollback after a fit refusal, the re-read failing", (== OpSetFileLength (payloadBytes (hCfg h0))), 0, \p -> addRuleAfter p 1 1 isStat (OverAllocated (10 * mib)) >> addRuleAfter p 2 (-1) isStat (FailWith eio))
   , (SGrow, "stat (profile)", isStat, 0, none)
   , (SGrow, "statfs", (== OpStatFilesystem), 0, none)
   , (SGrow, "reserve", isReserve, 0, none)
@@ -413,10 +422,10 @@ sweepClass = describe "(C) every native resource has an owner at every instant" 
         -- a FAILING native close is kept by the service whoever asked for it: the scope ends with that labelled failure
         -- the unwind of an open whose cleanup close fails in a way the fact does not establish is a HELD close (round 8): the reservation
         -- stays counted to the service's end
-        let closeRow = stage == SOpen && name == "close (cleanup after a failure)"
+        let closeRow = stage == SOpen && "close" `isPrefixOf` name
             heldOpen = closeRow && heldClose fact inj
             ends = (stage == SClose && closeFails inj) || heldOpen
-        (if ends then withEnvEndingWithKeptFailureWith defaultOptions {eoCloseFact = fact} (\env -> runCase env fact stage match occurrence prelude inj heldOpen (name == "set length (rollback after a failure)")) >> pure () else withEnvWith defaultOptions {eoCloseFact = fact} $ \env -> runCase env fact stage match occurrence prelude inj heldOpen (name == "set length (rollback after a failure)"))
+        (if ends then withEnvEndingWithKeptFailureWith defaultOptions {eoCloseFact = fact} (\env -> runCase env fact stage match occurrence prelude inj heldOpen (name == "set length (rollback after a failure)" || "rollback after" `isPrefixOf` name || "over-reporting" `isInfixOf` name)) >> pure () else withEnvWith defaultOptions {eoCloseFact = fact} $ \env -> runCase env fact stage match occurrence prelude inj heldOpen (name == "set length (rollback after a failure)" || "rollback after" `isPrefixOf` name || "over-reporting" `isInfixOf` name))
         fdsAfter <- openFdCount
         ((show fact, show stage, name, show inj), fdsAfter) `shouldBe` ((show fact, show stage, name, show inj), baseline)
         pure ()
@@ -484,7 +493,8 @@ sweepClass = describe "(C) every native resource has an owner at every instant" 
           forM_ opened (closeBacking (envSvc env))
           if heldOpen
             then do
-              (sum . svReserved <$> view env) >>= (`shouldBe` cfgAllowanceBytes (hCfg h0))
+              -- (at least the allowance; the compound rows observed more, which the held record counts)
+              (sum . svReserved <$> view env) >>= (`shouldSatisfy` (>= cfgAllowanceBytes (hCfg h0)))
               (length . snHeld <$> atomically (snapshotOf (envSvc env))) >>= (`shouldBe` 1)
               -- the held close's descriptor, when the before-hook never let the close be made, is closed by the example itself
               when (inj == BeforeThrown) (fdHandles probe >>= mapM_ (nativeClose posixNative) . take 1)

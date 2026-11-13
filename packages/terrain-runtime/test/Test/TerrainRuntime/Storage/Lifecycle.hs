@@ -51,7 +51,7 @@ openStages :: [(String, Probe -> IO (), Bool, Word64, Bool)]
 openStages =
   [ ("the length cannot be established", \p -> addRule p 1 (== OpSetFileLength (payloadBytes (hCfg h0))) (FailWith eio), False, 0, False)
   , ("the verification fails", \p -> addRuleAfter p 2 1 isStatOp (FailWith eio), False, 0, False)
-  , ("the headroom after the allocation is gone", \p -> addRule p 1 (== OpStatFilesystem) (FreeBytesAre (cfgAllowanceBytes (hCfg h0) + minHeadroomBytes)) >> addRuleAfter p 2 1 isStatOp (OverAllocated (budgetBytes (hCfg h0) + 4096)), False, 0, False)
+  , ("the headroom after the allocation is gone", \p -> addRule p 1 (== OpStatFilesystem) (FreeBytesAre (cfgAllowanceBytes (hCfg h0) + minHeadroomBytes)) >> addRuleAfter p 2 1 isStatOp (OverAllocated (budgetBytes (hCfg h0) + 4096)), False, payloadBytes (hCfg h0) + budgetBytes (hCfg h0) + 4096, False)
   , ("the allocation does not fit the allowance", \p -> addRuleAfter p 2 1 isStatOp (OverAllocated (budgetBytes (hCfg h0) + 1)), False, payloadBytes (hCfg h0) + budgetBytes (hCfg h0) + 1, False)
   , ("the registration is cancelled", \_ -> pure (), True, payloadBytes (hCfg h0), False)
   , ("an exception from the length", \p -> addRule p 1 (== OpSetFileLength (payloadBytes (hCfg h0))) Throw, False, 0, True)
@@ -65,6 +65,44 @@ openCloses =
   [ ("an errno", \p -> addRule p 1 (== OpCloseFile) (FailWith eio), \f -> f == CloseNotEstablished)
   , ("a raise in the native call's wrapper", \p -> addRule p 1 (== OpCloseFile) Throw, const True)
   , ("a raise in the before-hook", \p -> addBeforeRule p 1 (== OpCloseFile) Throw, const True)
+  ]
+
+-- | The verification refusals of an open AFTER its stat (round 9): the name, the rules, and the allocation the open observed (0: at most the
+-- allowance, which the held record counts anyway).
+compoundOpenStages :: [(String, Probe -> IO (), Word64)]
+compoundOpenStages =
+  [ ("a length the platform did not establish", \p -> addRuleAfter p 2 1 (== OpStatFile) (WrongSize 4096), 0)
+  , ("a coverage the platform did not give", \p -> addRuleAfter p 2 1 (== OpStatFile) (UnderAllocated 4096), 0)
+  , ("the headroom after the allocation is gone", \p -> addRule p 1 (== OpStatFilesystem) (FreeBytesAre (cfgAllowanceBytes (hCfg h0) + minHeadroomBytes)) >> addRuleAfter p 2 1 (== OpStatFile) (OverAllocated (budgetBytes (hCfg h0) + 4096)), payloadBytes (hCfg h0) + budgetBytes (hCfg h0) + 4096)
+  , ("the allocation does not fit the allowance", \p -> addRuleAfter p 2 1 (== OpStatFile) (OverAllocated (budgetBytes (hCfg h0) + 1)), payloadBytes (hCfg h0) + budgetBytes (hCfg h0) + 1)
+  , ("a raise after the stat", \p -> addRuleAfter p 2 1 (== OpStatFile) (OverAllocated (budgetBytes (hCfg h0) + 4096)) >> addAfterRuleAfter p 2 1 (== OpStatFile) Throw, payloadBytes (hCfg h0) + budgetBytes (hCfg h0) + 4096)
+  ]
+
+-- | The cleanup close of a compound open: clean, an errno, a raise (and whether it is held under a fact).
+compoundCloses :: [(String, Probe -> IO (), CloseFact -> Bool)]
+compoundCloses =
+  [ ("clean", \_ -> pure (), const False)
+  , ("an errno", \p -> addRule p 1 (== OpCloseFile) (FailWith eio), \f -> f == CloseNotEstablished)
+  , ("a raise in the native call's wrapper", \p -> addRule p 1 (== OpCloseFile) Throw, const True)
+  , ("a raise in the before-hook", \p -> addBeforeRule p 1 (== OpCloseFile) Throw, const True)
+  ]
+
+-- | The verification refusals of a growth AFTER its stat: the name, the rules, and the over-report beyond the target's payload (0: none).
+compoundGrowStages :: [(String, Probe -> IO (), Word64)]
+compoundGrowStages =
+  [ ("a length the platform did not establish", \p -> addRuleAfter p 1 1 (== OpStatFile) (WrongSize 4096), 0)
+  , ("a coverage the platform did not give", \p -> addRuleAfter p 1 1 (== OpStatFile) (UnderAllocated 4096), 0)
+  , ("the headroom after the allocation is gone", \p -> addRule p 1 (== OpStatFilesystem) (FreeBytesAre (64 * mib + minHeadroomBytes)) >> addRuleAfter p 1 1 (== OpStatFile) (OverAllocated (budgetBytes (hCfg h0) + 4096)), budgetBytes (hCfg h0) + 4096)
+  , ("the allocation does not fit the new allowance", \p -> addRuleAfter p 1 1 (== OpStatFile) (OverAllocated (10 * mib)), 10 * mib)
+  , ("a raise after the stat", \p -> addRuleAfter p 1 1 (== OpStatFile) (OverAllocated (10 * mib)) >> addAfterRuleAfter p 1 1 (== OpStatFile) Throw, 10 * mib)
+  ]
+
+-- | The rollback of a compound growth: succeeds (frees the extra), fails, raises.
+compoundRollbacks :: [(String, Probe -> IO (), Bool)]
+compoundRollbacks =
+  [ ("succeeds", \_ -> pure (), True)
+  , ("fails", \p -> addRule p 1 (== OpSetFileLength (payloadBytes (hCfg h0))) (FailWith eio), False)
+  , ("raises", \p -> addRule p 1 (== OpSetFileLength (payloadBytes (hCfg h0))) Throw, False)
   ]
 
 data CloseInj = CInjErrno | CInjRaise | CInjBefore
@@ -82,8 +120,8 @@ eio = let C.Errno c = C.eIO in Errno (fromIntegral c)
 -- The checker
 
 -- | Every way the state can be wrong, as text; empty when every invariant holds.
-invariantProblems :: Snapshot -> A.Ledger -> [Int] -> [(Int, Word64, Word64)] -> [String]
-invariantProblems sn ledger fds phys = concat
+invariantProblems :: Snapshot -> A.Ledger -> [Int] -> [(Int, Word64, Word64)] -> [(Word64, Word64)] -> [String]
+invariantProblems sn ledger fds phys may = concat
   [ [ "backing " <> show (bsId b) <> ": growth slot " <> show (bsSlot b) <> " but " <> show (length (liveOf b isGrow)) <> " live growth jobs"
     | b <- snBackings sn, (bsSlot b == SlotRunning) /= (length (liveOf b isGrow) == 1) || length (liveOf b isGrow) > 1 ]
   , [ "backing " <> show (bsId b) <> ": slot " <> show (bsSlot b) <> " but " <> show (length (liveOf b isRelease)) <> " live release jobs"
@@ -118,6 +156,11 @@ invariantProblems sn ledger fds phys = concat
     , not (length named == 1 || (null named && length heldNames == 1)) ]
   , [ "volume " <> show v <> " counts " <> show (Map.findWithDefault 0 v (snReserved sn)) <> " but the descriptors open on it hold " <> show held
     | snRunning sn == 0, v <- Map.keys (Map.fromList [(d, ()) | (_, d, _) <- phys]), let held = sum [h | (_, d, h) <- phys, d == v], Map.findWithDefault 0 v (snReserved sn) < held ]
+  -- THE SECOND READING (round 9): the service's counted figure for a volume is at least the LARGEST allocation the adapter ever reported (lies
+  -- included, since the file's last successful allocation-changing call) for every file that may still hold space: not cleanly released, so
+  -- named by a backing, a closing record, a running open or a held record. An observation the service made and then dropped would show here.
+  , [ "volume " <> show v <> " counts " <> show (Map.findWithDefault 0 v (snReserved sn)) <> " but the adapter reported up to " <> show high <> " for the files that may still hold space on it"
+    | snRunning sn == 0, v <- Map.keys (Map.fromList [(d, ()) | (d, _) <- may]), let high = sum [h | (d, h) <- may, d == v], Map.findWithDefault 0 v (snReserved sn) < high ]
   , [ "admission is open but " <> show (snWorkers sn) <> " workers are alive"
     | snAdmissionOpen sn, snWorkers sn /= 2 ]
   -- a running job is a worker's: more running jobs than workers alive (and so any running job with no worker) is a
@@ -173,7 +216,8 @@ checkInvariantsHolding held env = do
   (sn, ledger) <- atomically ((,) <$> snapshotOf (envSvc env) <*> (A.ledgers <$> readTVar (envAdmission env)))
   fds <- openFds (envProbe env)
   phys <- physicalHoldings (envProbe env)
-  invariantProblems sn ledger {A.lgControlReserved = A.lgControlReserved ledger - held} fds phys `shouldBe` []
+  may <- mayHold (envProbe env)
+  invariantProblems sn ledger {A.lgControlReserved = A.lgControlReserved ledger - held} fds phys may `shouldBe` []
 
 -- ---------------------------------------------------------------------------
 -- The lifecycle matrix
@@ -717,6 +761,96 @@ spec = describe "Storage backend: the lifecycle matrix" $ do
           unless stgExc (("Errno (-1)" `isInfixOf` shown) `shouldBe` False)
         else withEnvWith defaultOptions {eoCloseFact = fact} body
 
+  -- ---- round 9: AN OBSERVATION IS RECORDED THE INSTANT IT IS MADE, so every exit keeps it. COMPOUND EXITS where a figure is counted after a failure.
+  -- OPEN: {each verification refusal after the stat (a length the platform did not establish, a coverage it did not give, the headroom after the
+  -- allocation, the fit, a raise after the stat)} x {the cleanup's re-read fails | succeeds} x {the cleanup close: clean | an errno | a raise} x
+  -- both facts. The reviewer's own scenario is the row "the headroom after the allocation is gone, the re-read fails, a raise": a 64 MiB open
+  -- observes 64 MiB + 4,096, is refused for headroom, the cleanup's re-read fails and the close is uncertain: the held record must count the 4,096.
+  forM_ [(fact, stg, rr, cl) | fact <- [CloseReleasesOnFailure, CloseNotEstablished], stg <- compoundOpenStages, rr <- [True, False], cl <- compoundCloses] $ \(fact, (stgName, stgSetup, stgBytes), reread, (clName, clSetup, clHeldBy)) ->
+    it ("counts what a failed open observed (" <> show fact <> "; " <> stgName <> "; the cleanup's re-read " <> (if reread then "succeeds" else "FAILS") <> "; the close: " <> clName <> ")") $ do
+      let cfg = hCfg h0
+          allowance = cfgAllowanceBytes cfg
+          holds = clHeldBy fact
+          body env = do
+            let svc = envSvc env
+                probe = envProbe env
+            stgSetup probe
+            -- every stat after the verification fails: the cleanup cannot re-read the allocation
+            unless reread (addRuleAfter probe 3 (-1) (== OpStatFile) (FailWith eio))
+            clSetup probe
+            ticket <- submitOpen svc ExplicitWork (OpenSpec (BC.pack (envDir env)) ident cfg) >>= either (fail . show) pure
+            o <- awaitOutcome env ticket
+            case o of
+              Opened {} -> expectationFailure ("the open was expected to fail: " <> show o)
+              _ -> pure ()
+            sn <- atomically (snapshotOf svc)
+            length (snHeld sn) `shouldBe` (if holds then 1 else 0)
+            if holds
+              then do
+                -- the held record counts AT LEAST what was observed, however the cleanup's own re-read went
+                map hsBytes (snHeld sn) `shouldBe` [max allowance stgBytes]
+                sum (Map.elems (snReserved sn)) `shouldBe` max allowance stgBytes
+              else snReserved sn `shouldBe` Map.empty
+            checkInvariants env
+            leftOpen <- openFds probe
+            when (holds && clName == "a raise in the before-hook") $ do
+              length leftOpen `shouldBe` 1
+              fdHandles probe >>= mapM_ (nativeClose posixNative) . take 1
+            unless (holds && clName == "a raise in the before-hook") (leftOpen `shouldBe` [])
+      if holds
+        then void (withEnvEndingWithKeptFailureWith defaultOptions {eoCloseFact = fact} body)
+        else withEnvWith defaultOptions {eoCloseFact = fact} body
+
+  -- GROWTH: {each verification refusal after the stat, a raise after it} x {the re-read fails | succeeds} x {the rollback: succeeds | fails | raises}.
+  -- The counted figure covers the allocation the verification observed whenever the rollback does not free it.
+  forM_ [(stg, rr, rb) | stg <- compoundGrowStages, rr <- [True, False], rb <- compoundRollbacks] $ \((stgName, stgSetup, stgLie), reread, (rbName, rbSetup, rbFrees)) ->
+    it ("counts what a failed growth observed (" <> stgName <> "; the re-read " <> (if reread then "succeeds" else "FAILS") <> "; the rollback " <> rbName <> ")") $
+      withEnv $ \env -> do
+        let svc = envSvc env
+            probe = envProbe env
+            committed = 64 * mib
+        b <- openBacking env ident (hCfg h0)
+        stgSetup probe
+        unless reread (addRuleAfter probe 2 (-1) (== OpStatFile) (FailWith eio))
+        rbSetup probe
+        o <- submitGrowth svc b committed (128 * mib) >>= either (fail . show) pure >>= awaitOutcome env
+        case o of
+          GrowthPrepared {} -> expectationFailure "the growth was expected to fail"
+          _ -> pure ()
+        sn <- atomically (snapshotOf svc)
+        let counted = sum (Map.elems (snReserved sn))
+        if rbFrees
+          then do
+            -- the rollback freed the extra: the committed reservation, and nothing pending
+            ([bsPending x | x <- snBackings sn], counted) `shouldBe` ([Nothing], committed)
+          else do
+            -- it did not: the counted figure is at least the allocation the verification OBSERVED (the target's payload and the lie)
+            counted `shouldSatisfy` (>= payloadBytes (hCfg h0) + 64 * mib + stgLie)
+            [bsAllocated x | x <- snBackings sn] `shouldSatisfy` all (>= payloadBytes (hCfg h0) + 64 * mib + stgLie)
+        checkInvariants env
+
+  -- RELEASE-PENDING: its own stat observes MORE than the pending charge covers, then {the set-length fails | raises} x {the re-read fails}.
+  forM_ [(sl, rr) | sl <- [("fails", FailWith eio), ("raises", Throw)], rr <- [True, False]] $ \((slName, slAct), reread) ->
+    it ("counts what a release-pending retry observed (its stat reports 20 MiB more; the set-length " <> slName <> "; the re-read " <> (if reread then "succeeds" else "FAILS") <> ")") $
+      withEnv $ \env -> do
+        let svc = envSvc env
+            probe = envProbe env
+        b <- openBacking env ident (hCfg h0)
+        -- a failed growth leaves a pending charge (as the observed-pending examples)
+        addRuleAfter probe 1 1 (== OpStatFile) (OverAllocated (10 * mib))
+        addRule probe 1 (== OpSetFileLength (payloadBytes (hCfg h0))) (FailWith eio)
+        _ <- submitGrowth svc b (64 * mib) (128 * mib) >>= either (fail . show) pure >>= awaitOutcome env
+        -- the retry: its stat reports 20 MiB over; the release fails; the re-read fails or succeeds
+        addRule probe 1 (== OpStatFile) (OverAllocated (20 * mib))
+        addRule probe 1 (== OpSetFileLength (payloadBytes (hCfg h0))) slAct
+        unless reread (addRuleAfter probe 1 (-1) (== OpStatFile) (FailWith eio))
+        t <- submitReleasePending svc b >>= either (fail . show) pure
+        _ <- awaitOutcome env t
+        sn <- atomically (snapshotOf svc)
+        -- everything the retry's stat reported is counted: the target's payload and 20 MiB (never less than the nominal pending either)
+        sum (Map.elems (snReserved sn)) `shouldSatisfy` (>= payloadBytes (hCfg h0) + 64 * mib + 20 * mib)
+        checkInvariants env
+
   forM_ [("discardTicket of a finished open", \svc t _ -> discardTicket svc t), ("closeBacking", \svc _ b -> void (closeBacking svc b))] $ \(name, close) ->
     it ("keeps a failing close whose caller is cancelled while the native close is held (" <> name <> "): the cancellation is pending, delivered after, and the failure is kept") $
       withControlledService $ \env ctl -> do
@@ -952,6 +1086,7 @@ withControlledServiceFact fact logger body =
   withSystemTempDirectory "hetoimasia-terrain-lifecycle-cell" $ \dir -> do
     cfg <- testConfigFor dir defaultOptions
     probe <- newProbe
+    atomically (writeTVar (pFact probe) fact)
     bank <- either (fail . show) pure (A.mkEditBankConfig A.defaultEditBankSpec)
     admission <- newTVarIO (A.newAdmission bank)
     handoff <- newEmptyMVar

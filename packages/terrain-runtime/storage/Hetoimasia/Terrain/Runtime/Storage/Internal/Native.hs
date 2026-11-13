@@ -47,10 +47,16 @@ module Hetoimasia.Terrain.Runtime.Storage.Internal.Native
   , seamed
   , Owns (..)
   , around
+  , Seen
+  , newSeen
+  , noteSeen
+  , readSeen
+  , seenStat
   , errnoText
   ) where
 
 import Control.Exception (mask_)
+import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BC
@@ -205,6 +211,29 @@ data Owns a
   | -- | The effect obtained something: the recorder runs FIRST, before the after-hook, so the thing already has
     -- its owner when the hook runs.
     Acquires (a → IO ())
+
+-- | THE OBSERVATION RECORDER (round 9): the high-water of the allocations the platform has REPORTED for one descriptor during one episode of
+-- work (an open, a growth, a release). The caller owns it, and every read of a file's allocation on a path that can change or account it is
+-- handed to it THE INSTANT it is made ('seenStat' runs the recorder inside 'around', before the after-hook can raise), so every exit of the episode
+-- (a typed refusal after the stat, a cancellation, an exception, an after-hook raise) keeps the figure: nothing reconstructs an observation from
+-- a returned value. It only ever rises; an episode's accounting reads it ('readSeen') and the registered entry keeps the figure the counted amount
+-- was last set from ('eAllocated', by the exits).
+newtype Seen = Seen (IORef Word64)
+
+newSeen ∷ IO Seen
+newSeen = Seen <$> newIORef 0
+
+-- | Raise the high-water to at least the figure.
+noteSeen ∷ Seen → Word64 → IO ()
+noteSeen (Seen r) n = atomicModifyIORef' r (\m → (max m n, ()))
+
+readSeen ∷ Seen → IO Word64
+readSeen (Seen r) = readIORef r
+
+-- | A stat of the descriptor whose allocation is recorded the instant it is read.
+seenStat ∷ Seam → Seen → Fd → IO (Either Errno NativeStat)
+seenStat seam seen fd =
+  around seam OpStatFile (Acquires (\r → case r of Right st → noteSeen seen (nsAllocated st); Left _ → pure ())) (nativeStat (seamNative seam) fd)
 
 -- | THE ONE WAY a native effect runs between its hooks: the before-hook, the effect, the recorder of what it
 -- obtained, and only then the after-hook. Every site says what it acquires. It does NOT rely on its caller being
