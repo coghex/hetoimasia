@@ -116,12 +116,15 @@ spec = describe "The backed terrain service" $ do
       settleChecks svc
 
   -- A waiting grant is not starved by reads that keep starting: from the grant's refusal (two reads
-  -- in flight hold the cache it needs, on the bank the service's construction check accepts at its
-  -- least) to the grant, no new pinned read starts, however many are admitted meanwhile.
+  -- in flight hold the staging it needs, on the least staging the service's construction check
+  -- accepts) to the grant, no new pinned read starts, however many are admitted meanwhile. The arena
+  -- may pin three readers and the cache holds all three, so a third read could start: only the rule
+  -- that reads yield to a waiting grant keeps it from starting.
   forM_ [5, 20, 60 ∷ Int] $ \arrivals →
-   it ("starts no new pinned read between a grant's refusal for want of cache and the grant, however many reads arrive (" <> show arrivals <> ")") $ do
-    let need = toInteger (ramDecodedCopies A.worstTransactionCharge) + 2 * toInteger A.readerPinnedCacheBytes + toInteger resultPageBytes
-        config = defaultConfig {configMaxArenas = 1, configEditBank = A.defaultEditBankSpec {A.ebsCache = need, A.ebsArenas = 1, A.ebsReadersPerArena = 2}}
+   it ("starts no new pinned read between a grant's refusal for want of staging and the grant, however many reads arrive (" <> show arrivals <> ")") $ do
+    let w = A.worstTransactionCharge
+        staging = toInteger (ramIoBuffers w + ramKeys w + ramScratch w) + toInteger (transferBufferBytes 1)
+        config = defaultConfig {configMaxArenas = 1, configEditBank = A.defaultEditBankSpec {A.ebsStaging = staging, A.ebsProtectedStaging = min staging (A.ebsProtectedStaging A.defaultEditBankSpec), A.ebsArenas = 1, A.ebsReadersPerArena = 3}}
     probe ← H.newProbe
     gateRef ← newTVarIO Nothing
     readsAtGrant ← newTVarIO Nothing
@@ -140,11 +143,12 @@ spec = describe "The backed terrain service" $ do
       atomically (writeTVar gateRef (Just gate))
       view ← okOf (openView svc client)
       flip finally (H.openGate gate) $ do
-        -- two reads hold their pins and their results: the grant will not fit beside them
+        -- two reads hold their pins and their transfer buffers: the grant will not fit beside them
         _ ← mapM (\at → okOf (cellAt svc lease at)) [tile 8 8 8, tile 9 9 9]
         H.awaitReached gate 2
         grant edit
         -- a stream of reads of the arena, and a load of another of its regions, arrive while it waits
+        -- (a third pin and a third transfer buffer are free for them)
         forM_ [1 .. arrivals] $ \k → okOf (cellAt svc lease (tile (fromIntegral k) 12 3))
         let (far, _) = decomposeTile (tile 100 100 0)
         _ ← okOf (setViewDemand svc view lease [RegionDemand far (either (error . show) coverageTile (mkLocalCoord 0 0 0))])
