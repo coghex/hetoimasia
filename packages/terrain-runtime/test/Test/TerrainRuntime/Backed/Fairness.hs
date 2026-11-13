@@ -54,7 +54,8 @@ spec = describe "The mutation slot's fairness" $
       -- explicit ones, the internal ones the fairness rule let in between, and one already running
       let explicitAt = [i | (i, Just _) ← zip [0 ∷ Int ..] order]
       length explicitAt `shouldBe` length hosts
-      forM_ (zip [1 ∷ Int ..] explicitAt) $ \(k, i) → i `shouldSatisfy` (<= (k - 1) + (k + turn - 1) `div` turn + 1)
+      -- (a violation is reported with the whole order of grants: Just a request, Nothing internal work)
+      ([(k, i) | (k, i) ← zip [1 ∷ Int ..] explicitAt, i > (k - 1) + (k + turn - 1) `div` turn + 1], order) `shouldBe` ([], order)
       -- and discovery was not starved while they waited: it had grants among them
       length [() | Nothing ← take (maximum (0 : explicitAt)) order] `shouldSatisfy` (> 0)
       settleChecks svc

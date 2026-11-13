@@ -403,7 +403,14 @@ perform' svc = \case
   WCommit rid → takeTurn svc TurnRetry >> commitReq svc rid >> pure True
   WRetry → takeTurn svc TurnDispatch >> retryPass svc >> pure True
   WDispatch → takeTurn svc TurnBacked >> dispatchJob svc >> pure True
-  WOpen rid → takeTurn svc TurnPrepare >> stepOpen svc (ops svc) rid >> pure True
+  WOpen rid → do
+    takeTurn svc TurnPrepare
+    before <- stateCompiling <$> atomically (readSt svc)
+    stepOpen svc (ops svc) rid
+    after <- stateCompiling <$> atomically (readSt svc)
+    -- the session's one compilation was charged to the compile account and starts now
+    when (before /= Just rid && after == Just rid) (probe svc (PointCompiling rid))
+    pure True
   WGather key → takeTurn svc TurnPrepare >> stepGatherTask svc key (delivered svc key) >> pure True
   WSlot → takeTurn svc TurnPrepare >> slotStep svc >> pure True
   WGrant contender → do

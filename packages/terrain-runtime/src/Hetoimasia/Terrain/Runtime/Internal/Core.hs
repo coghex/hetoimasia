@@ -88,6 +88,7 @@ module Hetoimasia.Terrain.Runtime.Internal.Core
   , modelLimitsFor
   , modelLimitsChecked
   , compileBankFor
+  , compileBankChecked
   , perArenaShared
   , sharedCharge
   ) where
@@ -1163,6 +1164,18 @@ perArenaShared limits = sharedCharge (toInteger (C.limitResultBytes limits)) (to
 -- and the one compilation active in the session at its peak (which includes its result).
 compileBankFor ∷ Int → C.ConnectivityLimits → Word64
 compileBankFor arenas limits = fromIntegral (max 0 (arenas - 1)) * perArenaShared limits + fromIntegral (C.limitPeakBytes limits)
+
+-- | The compile account, checked: it must hold every arena the cap admits at its per-arena bound
+-- (a compilation's peak includes its result, so the active one never needs more than its peak;
+-- an open arena keeps its share), and be representable. Computed in 'Integer' first.
+compileBankChecked ∷ Int → C.ConnectivityLimits → Either ConfigError Word64
+compileBankChecked arenas limits
+  | needed > account || account > toInteger (maxBound ∷ Word64) = Left (ConfigCompileBank needed account)
+  | otherwise = Right (fromInteger account)
+  where
+    bound = toInteger (C.limitResultBytes limits) + memberIndexBytesPerNode * toInteger (C.limitNodes limits)
+    needed = toInteger (max 0 arenas) * bound
+    account = toInteger (max 0 (arenas - 1)) * bound + toInteger (C.limitPeakBytes limits)
 
 -- | The accounting model's limits, checked: the compile account must leave the resident
 -- bank something, and the model's own minimum budgets must hold.

@@ -108,8 +108,9 @@ spec = describe "Offload and reload" $ do
       [arenaRetainedBytes a | a ← modelArenas model] `shouldBe` [0]
       -- Pressure evicts the region; reading it again reconstructs the removal from the store.
       forM_ [(16, 0, 0), (32, 0, 0), (-16, 0, 0), (0, 16, 0), (0, -16, 0), (16, 0, -32)] $ \(x, y, z) → readCell svc lease (tile x y z)
-      regions <- map regionCoord . modelRegions <$> inspectModel svc
-      held `elem` regions `shouldBe` False
+      -- (a failure shows the region's record: why it is still resident)
+      pressured <- inspectModel svc
+      [r | r ← modelRegions pressured, regionCoord r == held] `shouldBe` []
       found <- readCell svc lease (tile 0 0 33)
       cellIs found `shouldBe` True
       settleChecks svc

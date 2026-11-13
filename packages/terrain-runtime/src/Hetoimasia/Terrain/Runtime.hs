@@ -115,6 +115,7 @@ module Hetoimasia.Terrain.Runtime
     -- * Inspection
   , inspectInvariants
   , inspectBacked
+  , inspectCompileSTM
   , backedAtRestSTM
   , inspectModel
   , inspectModelSTM
@@ -281,17 +282,18 @@ standaloneSupervisor group = Supervisor $ \definition →
 withTerrainService ∷ Config → Ports → (Service → IO a) → IO a
 withTerrainService config ports body = do
   -- Everything the configuration says is validated before anything starts: the store's
-  -- allowance, the edit bank's division (for the configured arenas) and the model's banks with
-  -- the snapshot and compile accounts carved out.
+  -- allowance, the edit bank's division (for the configured arenas), the model's banks, and the
+  -- compile account beside them (owner decision 2026-11-13, option B).
   storeConfig <- either (throwIO . ConfigStore) pure (mkStoreConfig (configStore config))
   editBank <- either (throwIO . ConfigEditBank) pure (mkEditBankConfig (configEditBank config) {ebsArenas = toInteger (configMaxArenas config)})
   limits <- either throwIO pure (modelLimitsChecked config)
+  compileBank <- either throwIO pure (compileBankChecked (configMaxArenas config) (configConnectivity config))
   bank <- newTVarIO (newAdmission editBank)
   -- The storage backend's scope encloses the service's: the owner drains and closes its
   -- arenas' files first, then the backend closes whatever is left, joins its workers and
   -- composes its kept failures into this scope's end.
   Storage.withStorageService (Storage.StoragePorts bank (spGroup sp) (portLogger ports) (spSeam sp) (spConfig sp)) $ \storage →
-   withResource (acquire limits storage bank storeConfig) (\svc → atomically (closeServiceSTM svc)) $ \svc →
+   withResource (acquire limits storage bank storeConfig compileBank) (\svc → atomically (closeServiceSTM svc)) $ \svc →
     -- Everything from the owner's start to the end of the drain is masked, so
     -- there is no window between a started owner and the drain that will join it:
     -- the start's own wait is interruptible, and the foundation's start drains a
@@ -313,10 +315,10 @@ withTerrainService config ports body = do
         Left primary → rethrowIO (primary ∷ ExceptionWithContext SomeException)
   where
     sp = portStorage ports
-    acquire limits storage bank storeConfig = do
+    acquire limits storage bank storeConfig compileBank = do
       tag <- newUnique
       var <- newTVarIO (initialState config limits)
-      pure (Service tag var config (portAdmission ports) (portLogger ports) (portProbe ports) storage bank (spDirectory sp) storeConfig (compileBankFor (configMaxArenas config) (configConnectivity config)))
+      pure (Service tag var config (portAdmission ports) (portLogger ports) (portProbe ports) storage bank (spDirectory sp) storeConfig compileBank)
     -- Close admission, ask the owner to stop, and wait for both proofs: the
     -- owner's worker has published its terminal outcome, and no borrower is
     -- outstanding. There is no deadline and no detach. Any exception received
@@ -487,6 +489,11 @@ perArenaBound = perArenaShared
 -- and one compilation's peak.
 compileAccountFor ∷ Int → C.ConnectivityLimits → Word64
 compileAccountFor = compileBankFor
+
+-- | The compile account: what the arenas, closing files and opens hold of it, and its size
+-- (read-only, for verification).
+inspectCompileSTM ∷ Service → STM (Word64, Word64)
+inspectCompileSTM svc = (\st -> (stateCompileUse st, serviceCompileBank svc)) <$> readSt svc
 
 -- | The edit bank's ledgers (read-only, for verification).
 inspectEditBankSTM ∷ Service → STM Ledger

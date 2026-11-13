@@ -427,8 +427,10 @@ data ConfigError
   = ConfigError !LimitError
   | ConfigStore !StoreState.ConfigError
   | ConfigEditBank !EditBankError
-  | -- | The compile account would take the whole resident bank.
-    ConfigCompileBank !Word64 !Word64
+  | -- | The compile account cannot hold every arena the cap admits at its per-arena bound (one
+    -- compilation's peak is below one arena's share), or its size is not representable: what the
+    -- arenas need, and what the account would be.
+    ConfigCompileBank !Integer !Integer
   deriving stock (Show)
 
 instance Exception ConfigError
@@ -488,6 +490,9 @@ data Point
   | -- | The session's mutating transaction was granted: to an explicit request (its id) or to
     -- internal work of an arena (discovery or reclamation).
     PointGranted !(Maybe RequestId) !ArenaId
+  | -- | An open's compilation was charged its peak to the compile account and is about to run its
+    -- first quantum (the session's one compilation).
+    PointCompiling !RequestId
   deriving stock (Eq, Show)
 
 -- | An unexpected defect, kept with bounded context.

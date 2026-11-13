@@ -9,7 +9,12 @@
 -- the figures at the approved default limits.
 module Test.TerrainRuntime.Backed.Compile (spec) where
 
+import Control.Concurrent.STM
+import Control.Exception (try)
+import Control.Monad (forM_)
+import Hetoimasia.Terrain.Cell (zRangeHi, zRangeLo)
 import qualified Hetoimasia.Terrain.Connectivity as C
+import Hetoimasia.Terrain.Query (Run (..))
 import Hetoimasia.Terrain.Runtime
 import Hetoimasia.Terrain.Source (CellSpec (..), PatchSpec (..), SourceSpec (..), defaultSourceLimits, mkSource)
 import Test.Hspec
@@ -23,13 +28,17 @@ fixtureStats = case mkSource defaultSourceLimits soilOverStone of
 
 -- | The default limits with the result bound set.
 withResult ∷ Integer → C.ConnectivityLimits
-withResult bytes =
+withResult bytes = limitsOf bytes (toInteger (C.limitPeakBytes C.defaultConnectivityLimits)) (toInteger (C.limitNodes C.defaultConnectivityLimits))
+
+-- | The default limits with the result, peak and node bounds set (validated).
+limitsOf ∷ Integer → Integer → Integer → C.ConnectivityLimits
+limitsOf bytes peak nodes =
   either (error . show) id $
     C.mkConnectivityLimits
       C.LimitsSpec
         { C.specResultBytes = bytes
-        , C.specPeakBytes = toInteger (C.limitPeakBytes C.defaultConnectivityLimits)
-        , C.specNodes = toInteger (C.limitNodes C.defaultConnectivityLimits)
+        , C.specPeakBytes = peak
+        , C.specNodes = nodes
         , C.specRelations = toInteger (C.limitRelations C.defaultConnectivityLimits)
         , C.specWorkSteps = toInteger (C.limitWorkSteps C.defaultConnectivityLimits)
         , C.specQuantumSteps = toInteger (C.limitQuantumSteps C.defaultConnectivityLimits)
@@ -71,4 +80,47 @@ spec = describe "The compile account" $ do
       -- nothing was published, and the name is free again
       lease ← okOf (openArena svc client "alt" soilOverStone) >>= await svc >>= expectSuccess
       _ ← readCell svc lease (tile 0 0 0)
+      settleChecks svc
+
+  it "constructs a service whose compile account holds every arena the cap admits at its bound exactly, and refuses one byte of peak less at construction" $ do
+    let result = 1024 * 1024
+        nodes = 1024
+        bound = result + 32 * nodes
+    -- the account is three arenas at their bound and one compilation's peak; with the peak at one
+    -- arena's bound it holds four arenas at their bound exactly
+    withService defaultConfig {configMaxArenas = 4, configConnectivity = limitsOf result bound nodes} $ \svc →
+      atomically (inspectCompileSTM svc) `shouldReturn` (0, fromInteger (4 * bound))
+    -- one byte of peak less: four open arenas would not fit, so the configuration is refused
+    try (withService defaultConfig {configMaxArenas = 4, configConnectivity = limitsOf result (bound - 1) nodes} (\_ → pure ())) >>= \case
+      Left (ConfigCompileBank needed account) → (needed, account) `shouldBe` (4 * bound, 4 * bound - 1)
+      Left other → expectationFailure ("expected the compile account refused, got " <> show other)
+      Right () → expectationFailure "a compile account that cannot hold the cap was accepted"
+
+  it "fits four arenas at their per-arena bound with the fourth compiling (the account exactly full), and still admits a maximal column query beside them" $ do
+    stats ← fixtureStats
+    -- limits at which the fixture is a maximal arena: its result and node figures are the bounds
+    let result = C.workResultBytes stats
+        nodes = C.workNodes stats
+        bound = result + 32 * nodes
+        peak = max bound (C.workPeakBytes stats)
+        account = 3 * bound + peak
+    service ← newTVarIO Nothing
+    seen ← newTVarIO []
+    -- at each compilation's start (its peak charged, no quantum run yet), what the account holds
+    let probe = Probe $ \case
+          PointCompiling _ → readTVarIO service >>= mapM_ (\svc → atomically (inspectCompileSTM svc >>= \u → modifyTVar' seen (<> [u])))
+          _ → pure ()
+    withServiceUsing defaultConfig {configMaxArenas = 4, configConnectivity = limitsOf result peak nodes} alwaysAdmitting probe $ \svc → do
+      atomically (writeTVar service (Just svc))
+      client ← okOf (registerClient svc)
+      leases ← mapM (\name → okOf (openArena svc client name soilOverStone) >>= await svc >>= expectSuccess) ["a", "b", "c", "d"]
+      -- the k-th compilation ran beside k arenas each holding exactly the per-arena bound; the fourth
+      -- filled the account exactly
+      readTVarIO seen `shouldReturn` [(fromInteger (k * bound + peak), fromInteger account) | k ← [0 .. 3]]
+      atomically (inspectCompileSTM svc) `shouldReturn` (fromInteger (4 * bound), fromInteger account)
+      -- a maximal column query: 8,192 levels across 257 regions, the residency model's largest request
+      -- (179,020,032 resident bytes at the approved limits), admitted with the four arenas open
+      forM_ (take 1 leases) $ \lease → do
+        answer ← okOf (columnAt svc lease (column 0 0) (range 16 (16 + 8192))) >>= await svc >>= expectSuccess
+        sum [zRangeHi (runRange r) - zRangeLo (runRange r) | r ← columnAnswerRuns answer] `shouldBe` 8192
       settleChecks svc

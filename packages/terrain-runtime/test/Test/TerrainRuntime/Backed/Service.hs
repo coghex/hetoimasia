@@ -9,6 +9,7 @@
 module Test.TerrainRuntime.Backed.Service (spec) where
 
 import Control.Concurrent.STM
+import Control.Exception (finally)
 import Control.Monad (forM, forM_)
 import Hetoimasia.Terrain.Residency (ArenaId (..), Revision (..))
 import Hetoimasia.Terrain.Runtime
@@ -70,15 +71,16 @@ spec = describe "The backed terrain service" $ do
       waitFor (readTVar (hostReady host) >>= \n → check (n >= 1))
       -- a read whose page read is held at the seam: its pin and the read's result hold the cache
       gate ← H.addGate probe isRead
-      reader ← okOf (cellAt svc lease (tile 8 8 8))
-      H.awaitReached gate 1
-      -- the removal becomes eligible: the grant does not fit beside the reader, so it waits
-      grant host
-      bank ← atomically (inspectEditBankSTM svc)
-      lgStagingForeground bank `shouldBe` 0
-      readTVarIO granted `shouldReturn` grantsBefore
-      -- the reader's read returns, its pin is released, and the grant proceeds
-      H.openGate gate
+      reader ← flip finally (H.openGate gate) $ do
+        reader ← okOf (cellAt svc lease (tile 8 8 8))
+        H.awaitReached gate 1
+        -- the removal becomes eligible: the grant does not fit beside the reader, so it waits
+        grant host
+        bank ← atomically (inspectEditBankSTM svc)
+        lgStagingForeground bank `shouldBe` 0
+        readTVarIO granted `shouldReturn` grantsBefore
+        pure reader
+      -- the reader's read returns (its gate opened), its pin is released, and the grant proceeds
       _ ← await svc reader
       _ ← waitFor (readTVar (hostSettled host) >>= \s' → if null s' then retry else pure s')
       settledOf host >>= (`shouldSatisfy` \case [Succeeded (ARemoved r)] → removeChangedFlag r; _ → False)
@@ -235,11 +237,14 @@ spec = describe "The backed terrain service" $ do
       (client, lease) ← openMain svc "main"
       gate ← H.addGate probe isWrite
       host ← newHost True
-      _ ← okOf (removeWith svc (hostEndpoint svc Nothing host) lease (tile 3 4 5) Nothing)
-      H.awaitReached gate 1
-      endClient svc client
-      settledOf host `shouldReturn` [Failed ArenaClosed]
-      H.openGate gate
+      -- the gate is opened whatever happens: a held write would otherwise keep the service's drain waiting
+      flip finally (H.openGate gate) $ do
+        _ ← okOf (removeWith svc (hostEndpoint svc Nothing host) lease (tile 3 4 5) Nothing)
+        H.awaitReached gate 1
+        endClient svc client
+        -- the close settles the removal at once (the owner does it on its next step), with the write still held
+        _ ← waitFor (readTVar (hostSettled host) >>= \s' → if null s' then retry else pure s')
+        settledOf host `shouldReturn` [Failed ArenaClosed]
       atRest svc
       inspectBacked svc >>= (`shouldBe` [])
       settleChecks svc
