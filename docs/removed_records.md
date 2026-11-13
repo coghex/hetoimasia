@@ -82,3 +82,25 @@ older ones is in [guide/earlier.md](guide/earlier.md).
 | `issue-586-glfwinit-diagnosis.md` | #586, PR #591: GLFW 3.4's Cocoa init calls `[NSApp run]` while the application has not finished launching, and that notification is sent once per process, so a later `glfwInit` in the same process can block; diagnosis and batch runs |
 | `issue-632-ps-fallback-evidence.md` | #632, PR #633: runs of the ps-fallback no-kill cleanup example |
 | `content_native/qualification.md` | #518: native calls and flags of `packages/content`, local and Linux CI |
+
+## Per-issue Vulkan records — last present at `18c3a659` (removed 2026-11-13)
+
+`docs/vulkan/` keeps the nine records `tools/test/VulkanProof.hs` reads. The
+177 other files were one local-evidence record per issue, each a receipt of
+the Vulkan groups passing at one commit, with copies of the per-scenario
+records beside it under `<name>/evidence/`:
+
+- `macos-vk8` to `macos-vk19`, `linux-vk8` to `linux-vk19`, `macos-vkr2`,
+  `linux-vkr2`: the VK and VKR slices of the first Vulkan backend. The VKR-2
+  records also show the pinned validation layers listing a batch's open label
+  region twice.
+- `macos-*-split`, `linux-*-split`, `macos-wayland-settle`,
+  `macos-zombie-descendant`, `macos-standing-approval`: later issues that
+  touched the Vulkan groups' inputs.
+- `macos-debug-utils-naming`: naming a `VkDebugUtilsMessengerEXT` segfaults on
+  the pinned macOS loader and MoltenVK, which is why the backend never names
+  its debug messenger.
+- `shader-rebuilds-macos`: one transcript of `tools/vulkan/shader-evidence.sh`.
+
+A pull request that affects the Vulkan groups now puts its receipt summary in
+the pull request body; no record is added under `docs/vulkan/`.

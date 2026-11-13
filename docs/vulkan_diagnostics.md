@@ -297,8 +297,7 @@ through a logger derived for that record alone (`withFields`), carrying
 so a record's labels never reach another record's entry. The order, and which
 regions are listed, are the reporting layer's own: the pinned layers were seen
 to list a batch's still-open region twice, and Linux's to list a pass region
-that had already closed as well
-([macOS](vulkan/macos-vkr2.md), [Linux](vulkan/linux-vkr2.md)). The native
+that had already closed as well. The native
 package's recorder
 opens a label around every batch and every rendering pass
 ([gpu_backend.md](gpu_backend.md#names-and-labels)); nothing opens queue labels
