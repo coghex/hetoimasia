@@ -33,6 +33,8 @@ import Control.Concurrent.STM (atomically)
 import Control.Exception (SomeException, evaluate, try)
 import Control.Monad (forM, forM_, replicateM, void, when)
 import qualified Data.ByteString as BS
+import qualified Data.ByteString.Internal as BSI
+import Foreign.Marshal.Utils (fillBytes)
 import qualified Data.Text as T
 import Hetoimasia.Terrain.Runtime.Store.Internal.Format (pageSize)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Model (admit)
@@ -204,7 +206,9 @@ rulesSpec = describe "Storage backend: a memory row cannot pass without measurin
     transient ← newIORef (Nothing ∷ Maybe BS.ByteString)
     base ← live
     -- the transient is live at the first valid reading and gone by the second: the readings disagree and the third settles WITHOUT it
-    atomicModifyIORef' transient (\_ → (Just (BS.replicate spike 7), ()))
+    -- built by an IO action at run time (a pure `BS.replicate` of a constant would be floated into a top-level constant that stays live for the whole process)
+    chunk ← BSI.create spike (\ptr → fillBytes ptr 7 spike)
+    atomicModifyIORef' transient (\_ → (Just chunk, ()))
     _ ← evaluate =<< (maybe 0 BS.length <$> readIORef transient)
     r ← liveWith (atomicModifyIORef' transient (\_ → (Nothing, ())))
     -- a reading that had taken the transient in would be at least `spike` above the base
