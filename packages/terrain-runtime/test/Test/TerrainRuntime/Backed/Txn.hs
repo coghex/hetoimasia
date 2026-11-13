@@ -100,7 +100,7 @@ plansAgain io store = do
 
 -- | Read the runs of columns from the committed version through the backend, as the owner does: every
 -- step masked, one blocking wait between steps. The pin is released on every exit.
-gatherRuns ∷ Io → Int → Store → [Column] → IO (Store, GProgressResult)
+gatherRuns ∷ Io → Int → Store → [Column] → IO (Store, GProgressResult, Int)
 gatherRuns io pin store0 columns = case startGatherWith pin store0 columns of
   Left refusal → fail ("no reader: " <> show refusal)
   Right (store1, g0) → do
@@ -111,7 +111,7 @@ gatherRuns io pin store0 columns = case startGatherWith pin store0 columns of
             GDone runs → pure (g', Right runs)
             GFailed handling → pure (g', Left handling)
     (g, result) ← loop g0
-    pure (endGather store1 g, result)
+    pure (endGather store1 g, result, gatherPeakWindow g)
 
 type GProgressResult = Either Handling [(Column, Int64, Int64)]
 
@@ -270,7 +270,7 @@ spec = describe "the owner's transaction runner, through the production storage 
           (store0, newRetained (ArenaId 1))
           tiles
         readsBefore ← atomically (countEvents (envProbe env) isRead)
-        (released, result) ← gatherRuns io gatherPinLimit store columns
+        (released, result, _) ← gatherRuns io gatherPinLimit store columns
         readsAfter ← atomically (countEvents (envProbe env) isRead)
         result `shouldBe` Right (refRuns ref columns)
         refRuns ref columns `shouldSatisfy` (not . null)
@@ -281,9 +281,9 @@ spec = describe "the owner's transaction runner, through the production storage 
         case acquireReader full of
           Left _ → pure ()
           Right _ → expectationFailure "more readers than the store allows were taken"
-    it "reads a runs tree of several pages through a window of exactly the pages it needs, and fails closed below that" $
+    it "restarts a read that fills a small window with fewer records, and fails closed below what one lookup needs" $
       withArena $ \_ io store0 → do
-        let tiles = [tileAt x 2 3 | x ← [0 .. 139]]
+        let tiles = [tileAt x 2 3 | x ← [0 .. 999]]
         (store, ref) ← foldM
           ( \(s, r) tile → do
               out ← removeAndPublish io s tile
@@ -292,22 +292,22 @@ spec = describe "the owner's transaction runner, through the production storage 
           )
           (store0, newRetained (ArenaId 1))
           tiles
-        let columns = [columnAt x 2 | x ← [0, 70, 139]]
-        (_, wide) ← gatherRuns io gatherPinLimit store columns
+        let columns = [columnAt x 2 | x ← [0, 400, 999]]
+        -- the pages a full-width ranged read touches when the reader may pin all it may
+        (_, wide, widePeak) ← gatherRuns io gatherPinLimit store columns
         wide `shouldBe` Right (refRuns ref columns)
-        -- the file holds many pages, and a window of the reader's limit reads a few of them
-        rHw (storeRoots store) `shouldSatisfy` (> 3)
-        -- the smallest window the read succeeds in, by search: below it the read ends as a defect (never a loop and
-        -- never an answer), at it the answer is the reference's, reached by restarting with fewer records
-        outcomes ← forM [1 .. gatherPinLimit] $ \pin → (,) pin . snd <$> gatherRuns io pin store columns
+        -- the smallest window the read succeeds in, by search: below it the read ends as a defect (never a loop
+        -- and never an answer); at it the answer is the reference's, reached by asking for fewer records, in
+        -- fewer pages than the full-width call touched
+        outcomes ← forM [1 .. gatherPinLimit] $ \pin → (\(_, r, _) → (pin, r)) <$> gatherRuns io pin store columns
         let works = [pin | (pin, Right runs) ← outcomes, runs == refRuns ref columns]
             fails = [pin | (pin, Left (HandleDefect _)) ← outcomes]
             others = [pin | (pin, r) ← outcomes, pin `notElem` works, pin `notElem` fails, isRight' r]
         others `shouldBe` []
         case works of
           smallest : _ → do
-            smallest `shouldSatisfy` (> 1)
             fails `shouldBe` [1 .. smallest - 1]
+            smallest `shouldSatisfy` (< widePeak)
           [] → expectationFailure "no window up to the reader's limit answered"
   where
     isRight' = either (const False) (const True)

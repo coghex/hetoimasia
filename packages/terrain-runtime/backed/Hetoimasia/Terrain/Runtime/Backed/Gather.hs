@@ -31,6 +31,7 @@ module Hetoimasia.Terrain.Runtime.Backed.Gather
   , endGather
   , GProgress (..)
   , gatherWindowPages
+  , gatherPeakWindow
   , gatherPinLimit
   ) where
 
@@ -88,6 +89,8 @@ data Gather = Gather
   -- ^ Records the next ranged read asks for; halved when a fresh window of 'gatherPinLimit' pages is not enough.
   , gStrikes ∷ !Int
   -- ^ Times in a row the window filled before the call could finish.
+  , gPeak ∷ !Int
+  -- ^ The most pages the window held when a ranged read answered.
   , gRuns ∷ ![(Column, Int64, Int64)]
   -- ^ Runs found, newest first.
   , gFetch ∷ !(Maybe (PageNo, Ticket))
@@ -96,6 +99,10 @@ data Gather = Gather
 -- | The window the gather holds, in pages (for the bound's example and the evidence).
 gatherWindowPages ∷ Gather → Int
 gatherWindowPages = windowSize . gWindow
+
+-- | The most pages the window held when a ranged read answered (the evidence of the window's bound).
+gatherPeakWindow ∷ Gather → Int
+gatherPeakWindow = gPeak
 
 -- | Where a step left the gather.
 data GProgress
@@ -116,9 +123,9 @@ startGatherWith ∷ Int → Store → [Column] → Either ReaderRefusal (Store, 
 startGatherWith pin store columns = do
   (token, pinned) ← acquireReader store
   case readerWindow pinned token of
-    Right window → Right (pinned, Gather token window columns Nothing pin maxRangeRecords 0 [] Nothing)
+    Right window → Right (pinned, Gather token window columns Nothing pin maxRangeRecords 0 0 [] Nothing)
     -- a pin the store has just handed out is live: nothing else can answer
-    Left _ → Right (snd (releaseReader token pinned), Gather token (error "unreachable: a fresh pin is live") [] Nothing pin 1 0 [] Nothing)
+    Left _ → Right (snd (releaseReader token pinned), Gather token (error "unreachable: a fresh pin is live") [] Nothing pin 1 0 0 [] Nothing)
 
 -- | End a gather: the pin is released (releasing twice changes nothing). Called on every exit.
 endGather ∷ Store → Gather → Store
@@ -148,7 +155,7 @@ stepGather io closing store g = case gFetch g of
                   next = case reverse records of
                     (key, _) : _ → Just (RangeAfter key)
                     [] → Nothing
-                  g' = g {gRuns = reverse mine <> gRuns g, gStrikes = 0}
+                  g' = g {gRuns = reverse mine <> gRuns g, gStrikes = 0, gPeak = max (gPeak g) (windowSize (gWindow g))}
                in if ended
                     then stepGather io closing store g' {gColumns = rest, gStart = Nothing, gLimit = maxRangeRecords}
                     else stepGather io closing store g' {gStart = next}
