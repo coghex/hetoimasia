@@ -64,6 +64,7 @@ settle ∷ Io → Store → Run → IO (Store, Run, Progress)
 settle io store run = do
   (store', run', progress) ← mask_ (advance io OwnerRunning store run)
   case progress of
+    More → settle io store' run'
     Blocked wait → atomically wait >> settle io store' run'
     ReadyToPublish {} → pure (store', run', progress)
     Finished _ → pure (store', run', progress)
@@ -87,6 +88,7 @@ removeAndPublish io store tile = do
       Left refusal → fail ("publish refused: " <> show refusal)
     Finished d → pure (Left d)
     Blocked _ → fail "settle returned a wait"
+    More → fail "settle returned a step"
 
 -- | The claims of an ended transaction are retired: the store takes the next transaction from the same
 -- committed root (a claim left behind would refuse it as busy).
@@ -97,6 +99,7 @@ plansAgain io store = do
     ReadyToPublish {} → pure ()
     Finished d → expectationFailure ("the next transaction was refused: " <> show d)
     Blocked _ → expectationFailure "settle returned a wait"
+    More → expectationFailure "settle returned a step"
 
 -- | Read the runs of columns from the committed version through the backend, as the owner does: every
 -- step masked, one blocking wait between steps. The pin is released on every exit.
@@ -213,6 +216,7 @@ spec = describe "the owner's transaction runner, through the production storage 
       (s1, run, progress) ← mask_ (advance io OwnerRunning store (start store (removalPlanner sceneEnv store (tileAt 2 2 3))))
       -- drive to the write, stopping at the first wait that is the write job (the reads before it run to completion)
       let toWrite s r p = case p of
+            More → mask_ (advance io OwnerRunning s r) >>= \(s', r', p') → toWrite s' r' p'
             Blocked wait | runPhaseName r /= "writing" → atomically wait >> mask_ (advance io OwnerRunning s r) >>= \(s', r', p') → toWrite s' r' p'
             _ → pure (s, r, p)
       (s2, run2, _) ← toWrite s1 run progress
@@ -223,6 +227,7 @@ spec = describe "the owner's transaction runner, through the production storage 
       runPhaseName run3 `shouldBe` "draining"
       case p3 of
         Blocked _ → pure ()
+        More → pure ()
         other → expectationFailure ("cancel did not wait for the running job: " <> show (finishedOf other))
       openGate gate
       (s4, _, p4) ← settle io s3 run3

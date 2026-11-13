@@ -69,6 +69,7 @@ import Hetoimasia.Terrain.Runtime.Store.Internal.Model
   )
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan (IntegrityWhy, RangeStart (..))
 import Hetoimasia.Terrain.Runtime.Store.Internal.State (StoreConfig, cfgTotalPages, windowPageBytes)
+import Hetoimasia.Terrain.Runtime.Store.Internal.Protocol (Supply (..))
 import Hetoimasia.Terrain.Runtime.Store.Internal.Tree (Window, windowInsert, windowSize)
 
 -- | The pages one reader may pin: its window never holds more.
@@ -186,7 +187,7 @@ stepGather io closing store g = case gFetch g of
 supplied ∷ Closing → StoreConfig → PageNo → Window → Outcome → Either Handling Window
 supplied closing cfg page window outcome = case reactTo closing JkRead outcome of
   GotPages [(p, bytes)]
-    | p == page → either (\err → Left (HandlePause CondIntegrity (FaultIntegrity (FromWindow page err)))) Right (windowInsert (cfgTotalPages cfg) page bytes window)
+    | p == page → either (\err → Left (classifySupply (PageRefusedByWindow page err))) Right (windowInsert (cfgTotalPages cfg) page bytes window)
   GotPages other → Left (HandleDefect (Text.pack ("a read of one page answered " <> show (map fst other))))
   GotFailure handling _ → Left handling
   GotCancelled _ → Left HandleClosing

@@ -28,6 +28,7 @@ import Hetoimasia.Terrain.Runtime.Store.Internal.Model (AdmitRefusal (..), Condi
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan (CapacityWhy (..), IntegrityWhy (..), PlanRefusal (..), Planned (..), StaleWhy (..), TxClass (..))
 import qualified Hetoimasia.Terrain.Runtime.Store.Internal.Plan as P
 import Hetoimasia.Terrain.Runtime.Store.Internal.State (ConfigError (..), OffsetError (..))
+import Hetoimasia.Terrain.Runtime.Store.Internal.Protocol (Stall (..), Supply (..))
 import Test.Hspec
 import Test.TerrainRuntime.Store.Harness (H (..), deltaFor, fillPlan, ident0, newH, runKey, runRec, smallSpec)
 
@@ -137,7 +138,7 @@ failureRows =
            , ("control pressure", AccountPressure (ControlPressure 1 0))
            ]
        ]
-    <> [ ("backing closed", BackingClosed, replicate 5 EClosing)
+    <> [ ("backing closed", BackingClosed, allDefect)
        , ("foreign handle", ForeignHandle, allDefect)
        , ("host failure", HostFailure "a defect", allDefect)
        ]
@@ -156,10 +157,18 @@ spec = describe "table (B): every outcome of the storage backend and the store p
           (label, got) `shouldBe` (label, expected)
       )
       failureRows
-  it "reads a closed backing as the owner's own closure, and a stopped service as one only while it is closing" $ do
-    [expectOf (classifyFailure OwnerClosing k ServiceStopped) | k ← kinds] `shouldBe` replicate 5 EClosing
-    [expectOf (classifyFailure OwnerRunning k ServiceStopped) | k ← kinds] `shouldBe` replicate 5 EDefect
-    [expectOf (classifyFailure OwnerClosing k BackingClosed) | k ← kinds] `shouldBe` replicate 5 EClosing
+  it "reads a closed backing and a stopped service as the owner's own closure only while it is closing, and a defect while it runs" $
+    mapM_
+      ( \failure → do
+          [expectOf (classifyFailure OwnerClosing k failure) | k ← kinds] `shouldBe` replicate 5 EClosing
+          [expectOf (classifyFailure OwnerRunning k failure) | k ← kinds] `shouldBe` replicate 5 EDefect
+      )
+      [ServiceStopped, BackingClosed]
+  it "reads a job cancelled by nobody the owner knows of as the closure while it closes and a defect while it runs, and a page the window refuses as an integrity pause" $ do
+    expectOf (classifyUnaskedCancel OwnerClosing) `shouldBe` EClosing
+    expectOf (classifyUnaskedCancel OwnerRunning) `shouldBe` EDefect
+    expectOf (classifySupply (PageRefusedByWindow (PageNo 3) BadMagic)) `shouldBe` EPause CondIntegrity "storage_integrity"
+    expectOf (classifySupply (ProtocolError (UnaskedPage (PageNo 3)))) `shouldBe` EDefect
   it "decides every other failure the same whether the owner runs or closes: closing hides no defect" $
     mapM_
       ( \(label, failure, _) → case failure of

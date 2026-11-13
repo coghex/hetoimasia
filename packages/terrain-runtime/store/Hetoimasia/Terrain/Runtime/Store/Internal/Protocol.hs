@@ -18,13 +18,13 @@
 -- | @BlockedByReader v o@                   | 'WaitsForReader': a reader's release unblocks it |
 -- | @Pending p@                             | 'NeedPages': read it, 'supplyPage', plan again   |
 -- | @PendingProbes ps@                      | 'NeedProbes': classify each, 'supplyProbe'       |
--- | @Checkpoint facts@                      | a fresh window of the same version keeps the     |
--- |                                         | facts ('windowCheckpoint'); the driver goes on   |
--- |                                         | by itself, with no I/O                           |
--- | @Refused (Capacity window-bound)@       | a fresh window with half the work ('reduceWork') |
+-- | @Checkpoint facts@                      | 'Continue': a fresh window of the same version   |
+-- |                                         | keeps the facts ('windowCheckpoint'); no I/O     |
+-- | @Refused (Capacity window-bound)@       | 'Continue' with a fresh window, half the work    |
+-- |                                         | ('reduceWork'), and a fresh checkpoint count     |
 -- | @Refused (Capacity LooseExceeded)@      | the same; at the smallest unit 'NeedMaintenance' |
 -- | @Refused (Stale _)@                     | 'Replan': the candidate is the caller's to remake|
--- | @Refused other@                         | 'Refuse', classified by 'classifyPlan'           |
+-- | @Refused other@ (each constructor named) | 'Refuse', classified by 'classifyPlan'           |
 -- +-----------------------------------------+--------------------------------------------------+
 --
 -- A driver that follows this protocol never ends in an @Invalid@, @Integrity@ or @Stale@
@@ -51,6 +51,7 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.Protocol
   , newDriverIn
   , Step (..)
   , Stall (..)
+  , Supply (..)
   , advance
   , supplyPage
   , supplyProbe
@@ -58,6 +59,7 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.Protocol
   , driverWindow
   , driverWindowWork
   , driverCheckpoints
+  , driverWindowCheckpoints
   , driverReductions
   , driverReadPeak
   , driverFactPeak
@@ -98,6 +100,8 @@ data Driver = Driver
   , dvPlanner ∷ !Planner
   , dvWindow ∷ !Window
   , dvCheckpoints ∷ !Int
+  -- ^ in the CURRENT window: a reduction starts a fresh window and a fresh count
+  , dvTotalCheckpoints ∷ !Int
   , dvReductions ∷ !Int
   , dvReadPeak ∷ !Int
   -- ^ the most pages a window held when a checkpoint was taken from it
@@ -110,8 +114,16 @@ data Driver = Driver
   }
 
 -- | Where a driver stopped, and what the caller does next.
+--
+-- 'advance' runs the planner EXACTLY ONCE. A step is therefore bounded by one planner run
+-- (the planner's own bounds: at most 4 MiB of RAM, at most 'worstEditReads' records read, at most
+-- 256 pages written), and the owner serves its cancellation, closure and other arenas between
+-- steps. A checkpoint and a window reduction cost no I/O but are steps of their own ('Continue').
 data Step
-  = -- | Pages the plan needs (the first of them; the plan is run again once given). The
+  = -- | The planner ran, and a checkpoint or a window reduction gave a fresh window: call
+    -- 'advance' again. No I/O is owed.
+    Continue
+  | -- | Pages the plan needs (the first of them; the plan is run again once given). The
     -- caller reads each from the backing and calls 'supplyPage'.
     NeedPages ![PageNo]
   | -- | Pages the plan must classify before it overwrites or frees them. The caller
@@ -136,7 +148,8 @@ data Step
   | -- | The protocol could not make progress. A defect, never a domain outcome.
     Stuck !Stall
 
--- | Why a driver could not make progress.
+-- | Why a driver could not make progress: the protocol's OWN errors, the caller's or the planner's
+-- defects. A page the backing returned that the window refuses is not one of them ('Supply').
 data Stall
   = -- | A refusal that the window is too small, at a window already at its smallest unit
     -- of work: the unit must fit, so this is a defect of the planner or of the bounds.
@@ -147,14 +160,25 @@ data Stall
     PlanRunBeforeSupply ![PageNo]
   | -- | A page the plan did not ask for was supplied.
     UnaskedPage !PageNo
-  | -- | More checkpoints than a plan can take: the bound is 'maxCheckpoints'.
+  | -- | More checkpoints in ONE window than a plan can take: the bound is 'maxCheckpoints'. A
+    -- reduction starts a fresh window and a fresh count (the facts are gone with the window).
     TooManyCheckpoints !Int
-  | -- | A page the backing returned failed validation. It is an integrity failure of the
-    -- backing, never absent history.
-    PageRefused !PageNo !PageError
   deriving stock (Show)
 
--- | The checkpoints one plan can take. A checkpoint always carries a new fact; a
+-- | Why a page could not be given to the driver. The two kinds are never confused: a page that
+-- is not the authoritative page it should be is the BACKING's integrity failure (the arena
+-- pauses for @storage_integrity@, never absent history, air or the source), and a protocol
+-- error is a defect of the caller.
+data Supply
+  = -- | The window refused the page the backing returned (checksum, format, identity, place).
+    -- The backend validates every page it reads against the same store, so it refuses it first
+    -- and this is reached only if the two validations ever disagree; either way it is the
+    -- same classification.
+    PageRefusedByWindow !PageNo !PageError
+  | ProtocolError !Stall
+  deriving stock (Show)
+
+-- | The checkpoints ONE window can take. A checkpoint always carries a new fact; a
 -- transaction takes at most as many as the pages it writes plus the pages it verifies
 -- consumed by an entry it frees, and a read phase one more for each record it reads.
 maxCheckpoints ∷ Int
@@ -167,7 +191,7 @@ newDriver store planner = newDriverIn store (storeWindow store) planner
 -- | Begin planning through a given window of the store's committed version (one that may
 -- carry a work limit or facts). A window of another version is refused by the planner.
 newDriverIn ∷ Store → Window → Planner → Driver
-newDriverIn store window planner = Driver store planner window 0 0 0 0 [] False
+newDriverIn store window planner = Driver store planner window 0 0 0 0 0 [] False
 
 driverStore ∷ Driver → Store
 driverStore = dvStore
@@ -180,22 +204,19 @@ driverWindow = dvWindow
 driverWindowWork ∷ Driver → Int
 driverWindowWork = windowWork . dvWindow
 
-driverCheckpoints, driverReductions, driverReadPeak, driverFactPeak ∷ Driver → Int
-driverCheckpoints = dvCheckpoints
+-- | Over the driver's whole life (every window it used).
+driverCheckpoints, driverWindowCheckpoints, driverReductions, driverReadPeak, driverFactPeak ∷ Driver → Int
+driverCheckpoints = dvTotalCheckpoints
+driverWindowCheckpoints = dvCheckpoints
 driverReductions = dvReductions
 driverReadPeak = dvReadPeak
 driverFactPeak = dvFactPeak
 
--- | The planner, run through the driver's window.
-runTask ∷ Driver → Planned
-runTask d = dvPlanner d (dvWindow d)
-
--- | Run the planner until it needs the caller. Checkpoints and window reductions are
--- the driver's own: they cost no I/O, so the owner's quantum does them in one step.
+-- | Run the planner ONCE and say what the caller owes.
 advance ∷ Driver → (Driver, Step)
 advance d
   | not (null (dvAsked d)) = (d, Stuck (PlanRunBeforeSupply (dvAsked d)))
-  | otherwise = case runTask d of
+  | otherwise = case dvPlanner d (dvWindow d) of
       Planned plan → (d, Ready plan)
       NoWork → (d, NothingToDo)
       BlockedByReader version oldest → (d, WaitsForReader version oldest)
@@ -206,69 +227,85 @@ advance d
       Checkpoint facts → checkpoint facts d
       Refused refusal → refused refusal d
 
+-- | A fresh window of the same version that keeps what the plan proved and read.
 checkpoint ∷ Facts → Driver → (Driver, Step)
 checkpoint facts d
   | dvCheckpoints d >= maxCheckpoints = (d, Stuck (TooManyCheckpoints (dvCheckpoints d)))
   | otherwise =
-      advance
-        d
-          { dvWindow = windowCheckpoint facts (dvWindow d)
-          , dvCheckpoints = dvCheckpoints d + 1
-          , dvReadPeak = max (dvReadPeak d) (windowSize (dvWindow d))
-          , dvFactPeak = max (dvFactPeak d) (windowReadFactCount (windowCheckpoint facts (dvWindow d)))
-          }
+      let next = windowCheckpoint facts (dvWindow d)
+       in ( d
+              { dvWindow = next
+              , dvCheckpoints = dvCheckpoints d + 1
+              , dvTotalCheckpoints = dvTotalCheckpoints d + 1
+              , dvReadPeak = max (dvReadPeak d) (windowSize (dvWindow d))
+              , dvFactPeak = max (dvFactPeak d) (windowReadFactCount next)
+              }
+          , Continue
+          )
 
--- | A refusal that says the window (or the loose list) was too big for the unit of work
--- it was given is retried through a fresh window of the same version with half the
--- work; the unit (one page, or the three writes of one connection) always fits. Every
--- other refusal is the caller's to classify.
+-- | Every refusal of the planner has a case. A refusal that says the window (or the loose list) was too
+-- big for the unit of work it was given is retried through a fresh window of the same version with half
+-- the work (the unit, one page or the three writes of one connection, always fits, and the work strictly
+-- halves, so there are at most six reductions); the fresh window has no facts, so its checkpoints count
+-- afresh. Every other refusal is the caller's to classify.
 refused ∷ PlanRefusal → Driver → (Driver, Step)
 refused refusal d = case refusal of
-  Capacity why
-    | windowBound why → shrink why
-    | LooseExceeded _ ← why → shrink why
   Stale _ → (d, Replan)
-  _ → (d, Refuse refusal (classifyPlan refusal))
+  Invalid _ → refuse
+  Integrity _ → refuse
+  Capacity why → case why of
+    WindowExceeded _ → shrink why
+    WindowBytesExceeded _ → shrink why
+    ProbesExceeded _ → shrink why
+    LooseExceeded _ → shrink why
+    DiskFull {} → refuse
+    TxnPagesExceeded _ → refuse
+    TxnRamExceeded _ → refuse
+    OverlayExceeded _ → refuse
+    TreeTooTall _ → refuse
+    ListTooLarge _ → refuse
+    RetirementBacklog _ _ → refuse
+    BookkeepingExceeded _ → refuse
   where
+    refuse = (d, Refuse refusal (classifyPlan refusal))
     shrink why
       | windowWork (dvWindow d) <= 1 = case why of
           LooseExceeded _ → (d, NeedMaintenance)
-          _ → (d, Stuck (UnitDidNotFit why))
+          WindowExceeded _ → (d, Stuck (UnitDidNotFit why))
+          WindowBytesExceeded _ → (d, Stuck (UnitDidNotFit why))
+          ProbesExceeded _ → (d, Stuck (UnitDidNotFit why))
+          DiskFull {} → (d, Stuck (UnitDidNotFit why))
+          TxnPagesExceeded _ → (d, Stuck (UnitDidNotFit why))
+          TxnRamExceeded _ → (d, Stuck (UnitDidNotFit why))
+          OverlayExceeded _ → (d, Stuck (UnitDidNotFit why))
+          TreeTooTall _ → (d, Stuck (UnitDidNotFit why))
+          ListTooLarge _ → (d, Stuck (UnitDidNotFit why))
+          RetirementBacklog _ _ → (d, Stuck (UnitDidNotFit why))
+          BookkeepingExceeded _ → (d, Stuck (UnitDidNotFit why))
       | otherwise =
-          advance
-            d
+          ( d
               { dvWindow = reduceWork (dvWindow d) (storeWindow (dvStore d))
               , dvReductions = dvReductions d + 1
+              , dvCheckpoints = 0
               }
-    windowBound = \case
-      WindowExceeded _ → True
-      WindowBytesExceeded _ → True
-      ProbesExceeded _ → True
-      DiskFull {} → False
-      TxnPagesExceeded _ → False
-      TxnRamExceeded _ → False
-      OverlayExceeded _ → False
-      TreeTooTall _ → False
-      ListTooLarge _ → False
-      RetirementBacklog _ _ → False
-      BookkeepingExceeded _ → False
-      LooseExceeded _ → False
+          , Continue
+          )
 
 -- | Give the driver a page it asked for. The page is validated against the store
 -- (arena, source, number, checksum, structure) by the window; a page that fails is the
 -- backing's integrity failure, never an empty index.
-supplyPage ∷ PageNo → ByteString → Driver → Either Stall Driver
+supplyPage ∷ PageNo → ByteString → Driver → Either Supply Driver
 supplyPage page bytes d
-  | dvProbing d || page `notElem` dvAsked d = Left (UnaskedPage page)
+  | dvProbing d || page `notElem` dvAsked d = Left (ProtocolError (UnaskedPage page))
   | otherwise = case windowInsert (cfgTotalPages (storeConfig (dvStore d))) page bytes (dvWindow d) of
-      Left err → Left (PageRefused page err)
+      Left err → Left (PageRefusedByWindow page err)
       Right w → Right d {dvWindow = w, dvAsked = filter (/= page) (dvAsked d)}
 
 -- | Give the driver the classification of a page it asked to have probed. A buffer
 -- that is not a page of this store is recorded as nothing, never refused.
-supplyProbe ∷ PageNo → ByteString → Driver → Either Stall Driver
+supplyProbe ∷ PageNo → ByteString → Driver → Either Supply Driver
 supplyProbe page bytes d
-  | not (dvProbing d) || page `notElem` dvAsked d = Left (UnaskedPage page)
+  | not (dvProbing d) || page `notElem` dvAsked d = Left (ProtocolError (UnaskedPage page))
   | otherwise =
       Right
         d

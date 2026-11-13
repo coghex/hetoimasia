@@ -41,6 +41,8 @@ module Hetoimasia.Terrain.Runtime.Backed.Backend
   , classifyFailure
   , classifyPlanRefusal
   , classifyAdmitRefusal
+  , classifySupply
+  , classifyUnaskedCancel
 
     -- * Outcomes
   , Reaction (..)
@@ -80,6 +82,7 @@ import Hetoimasia.Terrain.Runtime.Storage.Internal.Types
 import Hetoimasia.Terrain.Runtime.Store.Internal.Format (PageNo)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Model (AdmitRefusal (..), Condition (..), WriteOutcome (..))
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan (CapacityWhy (..), PlanRefusal (..))
+import Hetoimasia.Terrain.Runtime.Store.Internal.Protocol (Supply (..))
 
 -- | Whether the owner is retiring the arena or the service. A backing that is closed
 -- or a service that has stopped is the owner's own doing while it is closing, and a
@@ -147,7 +150,9 @@ classifyFailure closing kind = \case
     JkRelease → defect ("an integrity failure answered a release, which reads no page: " <> show why)
   InvalidRequest why → invalidRequest kind why
   BusyNow reason → HandleRetryLater reason
-  BackingClosed → HandleClosing
+  BackingClosed → case closing of
+    OwnerClosing → HandleClosing
+    OwnerRunning → defect "a backing was closed under a running terrain owner"
   ForeignHandle → defect "a handle of another storage service reached this one"
   ServiceStopped → case closing of
     OwnerClosing → HandleClosing
@@ -215,6 +220,23 @@ classifyAdmitRefusal = \case
   StalePlan → HandleReplan
   Paused condition → HandlePausedFor condition
   NoCapacity needed available → HandlePause CondCapacity (FaultFull (AllowanceExhausted needed available 0))
+
+-- | The decision for a page the backing returned and the protocol driver refused. One rule: a page that
+-- is not the authoritative page it should be is the backing's integrity failure (the arena pauses for
+-- @storage_integrity@, never absent history, air or the source); only the protocol's own errors are the
+-- caller's defects.
+classifySupply ∷ Supply → Handling
+classifySupply = \case
+  PageRefusedByWindow page err → HandlePause CondIntegrity (FaultIntegrity (FromWindow page err))
+  ProtocolError why → defect ("the planner protocol failed: " <> show why)
+
+-- | A job ended as cancelled that the owner did not ask to cancel. While the owner closes that is the
+-- closure (the backend withdrew its work); while it runs it is the backend stopping work under a
+-- running owner, a defect, exactly like a stopped service.
+classifyUnaskedCancel ∷ Closing → Handling
+classifyUnaskedCancel = \case
+  OwnerClosing → HandleClosing
+  OwnerRunning → defect "the backend cancelled a job nobody asked to cancel while the owner runs"
 
 -- | What an outcome of a job means to the owner.
 data Reaction
