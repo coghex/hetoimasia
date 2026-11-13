@@ -1,5185 +1,1653 @@
 # GLFW session and windows
 
-**Review status at `727f59a`:** the original GLFW implementation is merged. Of
-the four known defects that review recorded,
-[#115](https://github.com/coghex/hetoimasia/issues/115)
-(construction/rollback failure evidence) is repaired: a construction failure
-whose rollback's own release failed now propagates as the host's primary
-failure, interrupting the command and stopping the loop.
-[#116](https://github.com/coghex/hetoimasia/issues/116)
-(disconnect recovery across observations) is repaired: the recovery a settled
-mode owes to its monitor's identity survives ordinary observations of the
-platform's post-disconnect state, so the configured fallback runs however
-observation and reconciliation are ordered.
-[#117](https://github.com/coghex/hetoimasia/issues/117)
-(restoration after partial departure) is repaired: a departure from an applied
-windowed presentation retains the geometry it departs from as the saved
-placement, whether the attempt's steps all return, one reports partway, or the
-attempt is interrupted after a native step, so the configured fallback or a
-later windowed return restores where the user left the window.
-[#118](https://github.com/coghex/hetoimasia/issues/118)
-(fixture settlement under repeated cancellation) is repaired: once an owner
-failure or cancellation begins fixture settlement, further cancellation of the
-owner is absorbed by the wait for the borrower rather than ending it, the
-resource is still released only after the borrower finishes, and the run
-reports the failure that began the settlement with its retained cleanup
-evidence, including against a cancellation deferred through the
-uninterruptible release. All four recorded defects are now repaired; see the
-[completion review](project_review_114-101.md) for reproductions.
+`hetoimasia-glfw` owns the native binding to GLFW 3.4, the one
+process-main-thread session over it, the scoped windows created in that
+session, and the window host and owner loop that compose them with the
+runtime's application lifecycle. This is the contract of what the code does.
+Signatures are in the modules' export lists and Haddock; tested cases are in
+the suites named under [Build and check](#build-and-check).
 
-Current behavior of `hetoimasia-glfw`, the package that owns the native binding
-to upstream GLFW 3.4, the one process-main-thread session over it, the
-lexically scoped windows created in that session, and the window host and owner
-loop that compose them with the runtime's application lifecycle. The accepted
-direction and the later slices live in
-[the GLFW integration design](archive/glfw_integration_design.md) (P-1 to P-9, P-10's
-monitor identity rules, P-11, P-13, D-4 to D-9, D-11 to D-13, D-17, D-19); this document
-describes what the code does today.
-
-A session is entered, its asynchronous native error reports are read, its
-monitor inventory is published with disconnect-safe identities, windows are
-created in it, observed through read-only snapshots, asked for fresh
-observations and changed through bounded window command ports, and released
-when their scopes end, and the session ends. A window host owns those together as an
-application dependency, and its supervised owner loop processes native events,
-drains the ports, refreshes the monitor inventory when monitors change, and
-surfaces close requests to application policy. Ordinary controls — title, size,
-position, size constraints, visibility, focus and attention requests, and
-minimize, maximize, and restore — settle with honest outcomes. Each host window
-has a bounded, ordered input feed with an acknowledged reset after overflow or
-temporary suspension. Native key, character, button, cursor, enter, and scroll
-callbacks copy a fixed payload and return; the owner boundary publishes ordered
-events into that feed and coalesces cursor motion into the window observation.
-There is no default close policy or rendering operation.
+There is no default close policy and no rendering operation here. Nothing
+assumes a single or primary window or monitor.
 
 ## Package layout
 
 | Component | Visibility | Holds |
 |---|---|---|
-| `hetoimasia-glfw` | public | `Hetoimasia.GLFW.Session`, `Hetoimasia.GLFW.Monitor`, `Hetoimasia.GLFW.Window`, `Hetoimasia.GLFW.Command`, `Hetoimasia.GLFW.Demand`, and `Hetoimasia.GLFW.Input`, the supported interface |
-| `hetoimasia-glfw:model` | private | The session, monitor inventory, and window models over a table of native operations, bounded error capture, window controls with their validation and capability descriptions, the window command protocol, including execution and settlement, the notification policy over the session's wake capability and the bounded demand slots, the input feed model with its private producer, warning, resumption, and closure, bounded input staging at the window callbacks, and the backend-neutral window attachment model. The window model is `Hetoimasia.GLFW.Internal.Window`, a composition module over its private parts beneath it: `.Identity`, `.Config` and `.Observation`, a window's identity, configuration and observations; `.State`, the one window handle; `.Sample` and `.Callbacks`, attribute sampling and the contained callbacks; `.Reconcile` and `.Boundary`, the reconciliation protocol and the owner boundaries built on it; `.Controls`, `.ModeAttempt` and `.ModeTransition`, the native interpreters of the pure control rules and mode planner; and `.Construction`, the staged assembly and release. The input feed names a window through `.Identity`, so the graph has no boot file. Binds nothing. |
-| `hetoimasia-glfw:native` | private | The foreign imports, `native/cbits`, and the production native table. Native handles and ABI declarations stay here. |
-| `hetoimasia-glfw:runtime-glfw` | public | `Hetoimasia.Runtime.GLFW`: the window host with its dynamically created and independently closed windows, its supervised owner loop and fair command dispatch, the CPU-only render demand helper that composes the runtime's simulation demand with each window's, and the host's quiescence action. The one library that depends on `hetoimasia-runtime`. |
-| `hetoimasia-glfw:runtime-glfw-core` | private | `Hetoimasia.Runtime.GLFW.Internal`, the window host's composition module, with the test-only host hooks the dynamic window examples use to deliver a cancellation after a window's registration (and `ownerBoundary` and `ownerWorkerBoundary`, which the graphics-owner examples use to end a run at the boundaries of the owner's start and to hold its worker at two instants of its life), over its private parts beneath `Hetoimasia.Runtime.GLFW.Internal.Host`: `.Config`, what a host is built from; `.State` and `.Progress`, the one host handle and the retirement demand and graphics cells it publishes; `.Windows`, `.Commands`, `.Construction`, `.Wake` and `.Demand`, window registration and closing, command dispatch, construction and quiescence, the wake report and the demand slots; `.Turn`, `.Loop` and `.Pacing`, the one shared owner turn, both owner loops and the scheduled loop's pure pacing decisions; `.Application` and `.Lifetime`, the ordinary runner and the protected lifetime; and `.Seam` and `.Attachments`, the private attachment seam and the public attachment contract; `Hetoimasia.Runtime.GLFW.Internal.RenderDemand`, the pure render demand helper; `Hetoimasia.Runtime.GLFW.Internal.Owner`, the supervised graphics owner's composition module, over its private parts: `.Evidence`, `.Operations` and `.Config`, the injected backend contract; `.Handoff`, the cross-thread state it runs over; `.State`, `.Custody`, `.Observation` and `.Wake`, the one owner handle, its custody ledger, its read-only views and its authorized wake; `.Worker`, `.Targets`, `.Terminal`, `.Latch` and `.Drain`, worker progress on the owner thread; `.Handover`, `.Release`, `.Protocol`, `.Stranded` and `.Reservation`, the main thread's attachment path; and `.Start`, `.Lifetime` and `.Exit`, the owner's start, its protected-host composition and D-33's exit; and `Hetoimasia.Runtime.GLFW.Internal.Surface`, the Vulkan-free surface bridge over the protected attachment |
-| `hetoimasia-glfw:vulkan-interop` | public, flag-gated | `Hetoimasia.GLFW.Vulkan` and `Hetoimasia.GLFW.Vulkan.Provenance`: the loader integration capability made from the Vulkan binding's own loader entry point, the instance-extension query, and the surface bridge's production operations, over `vulkan-interop/cbits`, the one translation unit in the package that includes the Vulkan headers. Built only with the manual `vulkan-interop` flag, which only `cabal.project.vulkan` sets; see [Vulkan interop](#vulkan-interop). |
-| `hetoimasia-glfw:seam` | public, test-only | `Hetoimasia.GLFW.Seam`: the real models over a scripted native library, for CPU examples. Links no GLFW. Exports no window driver. |
-| `hetoimasia-glfw:seam-core` | private | `Hetoimasia.GLFW.Internal.Seam`: the seam's implementation, including the window drivers that deliver scripted callbacks, queue them for the next poll or wait, and change close intent, the monitor drivers that change the scripted monitors and deliver or queue monitor callbacks, and the private window command executor |
-| `glfw-tests` | test suite | The headless suite: the session, session wake, and admission-wake and demand examples over the seam, the window model, window command, window control, window host, dynamic window, monitor inventory, input feed, and window mode examples that use those drivers, that executor, the private input producer, and scripted input callbacks, the scheduled owner turn, render demand and visible follow-up examples over a scripted clock, the window attachment model examples, the supervised graphics owner examples over injected fake backend operations, the link-declaration check, and the external-client opacity examples, over the fixtures every component spec shares through the suite's own non-spec `Test.GLFW.Support`. Initializes no GLFW and needs no display. |
-| `glfw-native-tests` | test suite | The shared native fixture, and real session, thread, monitor inventory, window, window control, window host, and native input-callback examples on the platform it runs on, with the test-only Wayland synchronization helpers its own C source carries |
+| `hetoimasia-glfw` | public | `Hetoimasia.GLFW.Session`, `.Monitor`, `.Window`, `.Command`, `.Mode`, `.Demand`, `.Input` |
+| `:model` | private | Session, monitor and window models over a table of native operations; error capture; controls, modes and the command protocol; the notification policy and demand slots; the input feed; the window attachment model. Binds nothing. |
+| `:native` | private | Foreign imports, `native/cbits`, the production native table. Native handles and ABI declarations stay here. |
+| `:runtime-glfw` | public | `Hetoimasia.Runtime.GLFW`: the window host, both owner loops, the render demand helper, quiescence. The only library that depends on `hetoimasia-runtime`. |
+| `:runtime-glfw-core` | private | The host's implementation (`Hetoimasia.Runtime.GLFW.Internal.Host.*`), the pure render demand helper, the supervised graphics owner (`.Internal.Owner.*`) and the Vulkan-free surface bridge (`.Internal.Surface`), with the test-only host hooks. |
+| `:vulkan-interop` | public, flag-gated | `Hetoimasia.GLFW.Vulkan`, `.Vulkan.Provenance`. Built only with the manual `vulkan-interop` flag, which only `cabal.project.vulkan` sets. See [Vulkan interop](#vulkan-interop). |
+| `:seam`, `:seam-core` | test-only | The real models over a scripted native library, with window and monitor drivers. Links no GLFW. |
+| `glfw-tests` | suite | Headless: everything over the seam, a scripted clock and injected fake backend operations. Initializes no GLFW, needs no display. |
+| `glfw-native-tests` | suite | Real sessions, monitors, windows, controls, host and input callbacks on the platform it runs on. |
 
-The main library and the `model`, `native`, `seam`, and `seam-core`
-sublibraries depend on `hetoimasia-foundation` and not on `hetoimasia-runtime`.
-The `vulkan-interop` sublibrary is the only component that depends on the
-Vulkan binding, and with its flag off — everywhere but `cabal.project.vulkan` —
-it is not buildable and contributes no dependency at all.
-`runtime-glfw` depends on both, and no library depends on it; only the
-package's own `glfw-tests` and `glfw-native-tests` use it. The runtime integration therefore inverts no
-dependency. It is a sublibrary with its own source root rather than a separate
-package because the native suite must depend on it, and Cabal refuses that as a
-cycle between packages. The package's logging imports are `Component`, for
-failure identifiers, and `Logger` with `logWarning`, which only the input feed's
-private overflow warning uses through a logger its owner injects; nothing else
-takes a logger or writes to a sink.
+The main library and `model`, `native`, `seam`, `seam-core` depend on
+`hetoimasia-foundation` and not on `hetoimasia-runtime`. `vulkan-interop` is
+the only component that depends on the Vulkan binding; with its flag off it is
+not buildable and contributes no dependency. `runtime-glfw` is a sublibrary
+rather than a package because the native suite must depend on it and Cabal
+refuses that as a package cycle. The package creates no logger: its warnings
+(`glfw.input`, `glfw.wake`, `glfw.retirement`, `glfw.graphics-owner`) are
+written through a logger the application injects.
 
 ## Public interface
 
-```haskell
--- Hetoimasia.GLFW.Session
-data Session
-allocSession            ∷ SessionConfig → Scoped Session
-withSession             ∷ SessionConfig → (Session → IO r) → IO r
-sessionBackend          ∷ Session → Backend
-takeAsynchronousReports ∷ Session → IO Reports
+| Module | Gives |
+|---|---|
+| `GLFW.Session` | `allocSession`/`withSession`, `SessionConfig` (requested backend, optional initialization deadline), `Backend` (`X11`, `Cocoa`, `Wayland`), `takeAsynchronousReports`, the `Reports`/`NativeError` evidence types, the misuse and failure types, and the wake capability (`sessionWake`, `wakeSession`, `WakeOutcome`). |
+| `GLFW.Demand` | `DemandRequest` (a monoid: none, immediate, or a deadline), `DemandPublisher` and `publishDemand` (any thread), `CapturedDemand`, `DemandStatus`. |
+| `GLFW.Monitor` | `monitorInventory` (a `SnapshotReader`), `synchronizeMonitors`, `resolveMonitor`, `MonitorId`, `MonitorDescription` and its attribute readers. |
+| `GLFW.Window` | `allocWindow`/`withWindow`, `WindowConfig`, `WindowId`, `windowObservations`, `synchronizeWindow`, `WindowObservation` and its readers, `WindowPhase`, `CloseRequest`, `WindowCapabilities`. |
+| `GLFW.Command` | `WindowCommandHost`, `WindowCommandPort`, `submitWindowCommand`/`awaitSubmitWindowCommand`, the `WindowCommand` constructors, `CompletionTicket`, `Disposition` and its result, rejection and attempt types, `WindowClient`. |
+| `GLFW.Mode` | `WindowMode` (windowed, borderless, fullscreen), `VideoModePreference`, `ModeFallback`, `ModeRequest`, `StartupMode`, `ModeRecord`, `ModeOutcome` and its failure types. |
+| `GLFW.Input` | `InputReader` (`readInput`, `awaitInput`), `InputEvent` and payloads, `ResetToken` and `acknowledgeReset`, `InputControl` (`enableInput`, `suspendInput`), `inputStatistics`. |
+| `Runtime.GLFW` | `allocWindowHost`/`allocWindowHostIn`, `HostConfig`, the host's readers and close operations, `runOwnerLoop`, `runScheduledOwnerLoop`, the render demand helper (`renderTurn`, `acknowledgeRender`), `runWindowApplication`. |
 
-data SessionConfig = SessionConfig { requestedBackend ∷ Maybe Backend }
-defaultSessionConfig ∷ SessionConfig      -- the platform's own backend
-data Backend = X11 | Cocoa | Wayland
+Handles, identities, observations, commands, tickets, readers, publishers and
+tokens are exported without constructors and read through functions, so no
+client can build or rewrite one. No public type holds a native window or
+monitor pointer. Clients receive only read endpoints of snapshots. No public
+operation reaches the host's window collection, a release, or an input feed's
+channel, state or producer.
 
-data Reports     = Reports { reportedErrors ∷ [NativeError], reportsLost ∷ Natural, callbackFaults ∷ Natural }
-data NativeError = NativeError { nativeErrorCode ∷ Int, nativeErrorDescription ∷ Text
-                               , nativeErrorTruncated ∷ Bool, nativeErrorThread ∷ ReportingThread }
-data ReportingThread = ProcessMainThread | OtherThread
-errorEvidenceCapacity, errorDescriptionLimit ∷ Int   -- 16 reports, 1024 bytes
-
-data SessionMisuse = NotProcessMainThread | NotSessionOwner | SessionAlreadyActive
-                   | SessionPoisoned | SessionEnded
-data UnsupportedBackend  = UnsupportedBackend { unsupportedRequest ∷ Maybe Backend
-                                              , unsupportedPlatformBackend ∷ Maybe Backend }
-data BackendNotSelected  = BackendNotSelected { selectionRequested ∷ Backend, selectionReported ∷ Maybe Backend }
-data NativeOutcome       = NativeCallReturned | NativeCallFailed
-data NativeFailure       = NativeFailure { nativeOutcome ∷ NativeOutcome, nativeReports ∷ Reports }
-newtype AsynchronousErrorsUnobserved = AsynchronousErrorsUnobserved Reports
-glfwComponent ∷ Component                   -- "glfw"
-
-data SessionWake                            -- opaque; no native handle, no session
-sessionWake ∷ Session → SessionWake
-wakeSession ∷ SessionWake → IO WakeOutcome  -- any thread
-data WakeOutcome = WakePosted | WakeTerminal | WakeFailed Reports
-```
-
-```haskell
--- Hetoimasia.GLFW.Demand
-data DemandRequest                           -- Eq, Show, Semigroup, Monoid; built and read with:
-noDemand          ∷ DemandRequest
-immediateDemand   ∷ DemandRequest
-deadlineDemand    ∷ Instant → DemandRequest
-demandIsImmediate ∷ DemandRequest → Bool
-demandDeadline    ∷ DemandRequest → Maybe Instant
-demandRequested   ∷ DemandRequest → Bool
-
-data DemandPublisher                         -- opaque; publication only
-publishDemand ∷ DemandPublisher → DemandRequest → IO PublishResult   -- any thread
-data PublishResult = DemandPublished Natural | NoDemandPublished | DemandSlotClosed
-
-data CapturedDemand = CapturedDemand { capturedRevision ∷ Natural, capturedRequest ∷ DemandRequest }
-data DemandStatus   = DemandStatus { statusOpen ∷ Bool, statusRevision ∷ Natural
-                                   , statusPending ∷ Maybe DemandRequest }
-```
-
-```haskell
--- Hetoimasia.GLFW.Monitor
-monitorInventory    ∷ Session → SnapshotReader MonitorInventory
-synchronizeMonitors ∷ Session → IO MonitorInventory
-resolveMonitor      ∷ Session → MonitorId → IO (MonitorResult MonitorDescription)
-data MonitorResult a = MonitorAvailable a | MonitorDisconnected MonitorId
-
-data MonitorInventory                        -- Eq, Show, NFData; read with:
-inventoryRevision ∷ MonitorInventory → Natural
-inventoryPhase    ∷ MonitorInventory → InventoryPhase
-inventoryMonitors ∷ MonitorInventory → Attribute [MonitorDescription]
-data InventoryPhase = InventoryOpen | InventoryClosed
-
-data MonitorId                               -- Eq, Ord, Show
-monitorLocalIdentity ∷ MonitorId → Natural
-
-data MonitorDescription                      -- Eq, Show, NFData; read with:
-monitorIdentity     ∷ MonitorDescription → MonitorId
-monitorName         ∷ MonitorDescription → Attribute Text
-monitorPrimary      ∷ MonitorDescription → Attribute Bool
-monitorPosition     ∷ MonitorDescription → Attribute MonitorPosition
-monitorWorkArea     ∷ MonitorDescription → Attribute WorkArea
-monitorPhysicalSize ∷ MonitorDescription → Attribute PhysicalSize
-monitorContentScale ∷ MonitorDescription → Attribute ContentScale
-monitorCurrentMode  ∷ MonitorDescription → Attribute VideoMode
-monitorVideoModes   ∷ MonitorDescription → Attribute [VideoMode]
-data MonitorPosition = MonitorPosition { monitorX, monitorY ∷ Int }
-data WorkArea        = WorkArea { workAreaX, workAreaY, workAreaWidth, workAreaHeight ∷ Int }
-data PhysicalSize    = PhysicalSize { physicalWidth, physicalHeight ∷ Int }   -- millimetres
-data VideoMode       = VideoMode { modeWidth, modeHeight ∷ Int
-                                 , modeRedBits, modeGreenBits, modeBlueBits, modeRefreshRate ∷ Attribute Int }
--- Attribute and ContentScale are the ones Hetoimasia.GLFW.Window exports.
-```
-
-```haskell
--- Hetoimasia.GLFW.Window
-data Window
-allocWindow        ∷ Session → WindowConfig → Scoped Window
-withWindow         ∷ Session → WindowConfig → (Window → IO r) → IO r
-windowIdentity     ∷ Window → WindowId
-windowObservations ∷ Window → SnapshotReader WindowObservation
-windowEnded        ∷ Window → IO Bool
-synchronizeWindow  ∷ Window → IO (WindowResult WindowObservation)
-data WindowResult a = WindowAvailable a | WindowEnded WindowId
-
-data WindowConfig = WindowConfig { windowTitle ∷ Text, windowWidth, windowHeight ∷ Int
-                                 , windowVisible, windowFocused, windowFocusOnShow ∷ Bool
-                                 , windowStartupMode ∷ Maybe StartupMode }
-defaultWindowConfig, hiddenTestWindowConfig ∷ Text → Int → Int → WindowConfig
-validateWindowConfig ∷ WindowConfig → Either WindowConfigRejected ()
-data WindowConfigRejected = WindowExtentRejected { rejectedWidth, rejectedHeight ∷ Int }
-                          | WindowTitleRejected
-
-data WindowId                                -- Eq, Ord, Show
-windowLocalIdentity ∷ WindowId → Natural
-
-data WindowObservation                       -- Eq, Show, NFData; read with:
-observedWindow ∷ WindowObservation → WindowId
-observedRevision ∷ WindowObservation → Natural
-observedPhase ∷ WindowObservation → WindowPhase
-observedLogicalExtent, observedFramebufferExtent ∷ WindowObservation → Attribute Extent
-observedContentScale ∷ WindowObservation → Attribute ContentScale
-observedPlacement ∷ WindowObservation → Attribute Placement
-observedFocused, observedIconified, observedMaximized, observedVisible ∷ WindowObservation → Attribute Bool
-observedCloseRequest ∷ WindowObservation → Maybe CloseRequest
-observedDecorated ∷ WindowObservation → Attribute Bool
-observedFullscreenMonitor ∷ WindowObservation → Attribute (Maybe MonitorId)
-observedMode ∷ WindowObservation → ModeRecord
-observedCursorPosition ∷ WindowObservation → Maybe CursorPosition
-observedCursorInside ∷ WindowObservation → Maybe Bool
-
-data WindowPhase  = WindowOpen | WindowClosing | WindowReleased | WindowDisposalFailed | WindowReleaseUncertain
-data Attribute a  = Observed a | Unavailable
-data Extent       = Extent { extentWidth, extentHeight ∷ Int }
-data ContentScale = ContentScale { scaleX, scaleY ∷ Float }
-data Placement    = Placement { placementX, placementY ∷ Int }
-data CloseRequest                            -- Eq, Ord, Show
-closeRequestWindow ∷ CloseRequest → WindowId
-closeRequestNumber ∷ CloseRequest → Natural
-
-data WindowCapabilities                      -- Eq, Show; read with:
-sessionWindowCapabilities ∷ Session → WindowCapabilities
-backendWindowCapabilities ∷ Backend → WindowCapabilities
-unperformableOperations   ∷ WindowCapabilities → [(WindowOperation, Text)]
-unreportableAttributes    ∷ WindowCapabilities → [(WindowReport, Text)]
-data WindowOperation = SetTitleOperation | SetSizeOperation | SetPositionOperation | SetConstraintsOperation
-                     | ShowOperation | HideOperation | FocusOperation | AttentionOperation
-                     | MinimizeOperation | MaximizeOperation | RestoreOperation
-                     | BorderlessOperation | FullscreenOperation
-data WindowReport    = LogicalExtentReport | FramebufferExtentReport | ContentScaleReport | PlacementReport
-                     | FocusedReport | IconifiedReport | MaximizedReport | VisibleReport
-```
-
-```haskell
--- Hetoimasia.GLFW.Command
-data WindowCommandHost
-newWindowCommandHost ∷ HasCallStack ⇒ Session → Integer → IO WindowCommandHost
-windowCommandPort    ∷ WindowCommandHost → WindowCommandPort
-closeWindowCommands  ∷ WindowCommandHost → STM Natural
-commandStatistics    ∷ WindowCommandHost → STM CommandStatistics
-performWindowCommand ∷ WindowCommandHost → [Window] → WindowCommand → IO Disposition
-data CommandStatistics = CommandStatistics { commandsCapacity, commandsQueued, commandsActive, commandsPending ∷ Natural }
-
-data WindowCommandPort
-submitWindowCommand      ∷ HasCallStack ⇒ WindowCommandPort → [(Text, Text)] → WindowCommand → IO SubmitResult
-awaitSubmitWindowCommand ∷ HasCallStack ⇒ WindowCommandPort → [(Text, Text)] → WindowCommand → IO WaitedSubmission
-data SubmitResult     = SubmitAccepted CompletionTicket | SubmitFull | SubmitClosed
-data WaitedSubmission = WaitAccepted CompletionTicket | WaitClosed
-
-data WindowCommand                           -- Eq, Show, NFData
-observeWindowCommand ∷ WindowId → WindowCommand
-closeWindowCommand   ∷ WindowId → WindowCommand
-createWindowCommand  ∷ WindowConfig → WindowCommand
-commandWindow        ∷ WindowCommand → Maybe WindowId      -- Nothing for a creation
-
-setWindowTitleCommand     ∷ WindowId → Text → WindowCommand
-setWindowSizeCommand      ∷ WindowId → Extent → WindowCommand
-setWindowPositionCommand  ∷ WindowId → Placement → WindowCommand
-setSizeConstraintsCommand ∷ WindowId → SizeConstraints → WindowCommand
-showWindowCommand, hideWindowCommand, requestFocusCommand, requestAttentionCommand,
-  minimizeWindowCommand, maximizeWindowCommand, restoreWindowCommand ∷ WindowId → WindowCommand
-data SizeConstraints                         -- Eq, Show, NFData; built and read with:
-sizeConstraints       ∷ Extent → Extent → Maybe AspectRatio → SizeConstraints
-constraintMinimum, constraintMaximum ∷ SizeConstraints → Extent
-constraintAspectRatio ∷ SizeConstraints → Maybe AspectRatio
-data AspectRatio = AspectRatio { aspectNumerator, aspectDenominator ∷ Int }
-setWindowModeCommand ∷ WindowId → ModeRequest → WindowCommand
-
-data RequestId                               -- Eq, Ord, Show
-requestLocalIdentity ∷ RequestId → Natural
-data CommandOrigin                           -- Eq, Show, NFData; read with:
-submittedRequest ∷ CommandOrigin → RequestId
-submittedWindow  ∷ CommandOrigin → Maybe WindowId
-submittedAt      ∷ CommandOrigin → Maybe FailureSite
-submittedContext ∷ CommandOrigin → [(Text, Text)]
-
-data CompletionTicket                        -- Eq, Show
-ticketOrigin    ∷ CompletionTicket → CommandOrigin
-pollCompletion  ∷ CompletionTicket → STM (Maybe Disposition)
-awaitCompletion ∷ HasCallStack ⇒ CompletionTicket → IO Disposition
-
-data Disposition      = Performed CommandResult | Rejected CommandRejection | Unsupported UnsupportedControl
-                      | Attempted ControlAttempt | Transitioned ModeTransition | NotExecuted | Interrupted RequestId
-data CommandResult    = ObservationPublished { publishedWindow ∷ WindowId, publishedRevision ∷ Natural }
-                      | WindowCreated { createdWindow ∷ WindowId }
-                      | WindowCloseBegun { closingWindow ∷ WindowId }
-data CommandRejection = WindowNotServed WindowId | WindowAlreadyEnded WindowId
-                      | WindowNativeFailure { failedWindow ∷ WindowId, failedOperation ∷ Maybe Text
-                                            , failedOutcome ∷ NativeOutcome, failedReports ∷ Reports }
-                      | WindowIsClosing WindowId | CloseNotPermitted WindowId | CreationNotPermitted
-                      | WindowConfigInvalid WindowConfigRejected | WindowCapacityReached Int
-                      | WindowCreationPoisoned
-                      | WindowCreationFailed { creationOperation ∷ Maybe Text
-                                             , creationOutcome ∷ NativeOutcome, creationReports ∷ Reports }
-                      | ControlRejected WindowId ControlRejection | ModeRejected WindowId ModeRejection
-data ControlRejection = ControlExtentRejected Int Int | ControlPlacementRejected Int Int | ControlTitleRejected
-                      | SizeOutsideConstraints Extent SizeConstraints | ActiveConstraintsIndeterminate
-                      | ConstraintBoundRejected Extent Extent | ConstraintBoundsInverted Extent Extent
-                      | AspectRatioRejected Int Int | ConstraintsExcludeCurrentSize Extent SizeConstraints
-                      | CurrentSizeUnavailable | ModeTransitionInProgress
-                      | ControlIneligibleInMode PresentationKind | ControlModeIndeterminate
-data ModeTransition   = ModeTransition { transitionedWindow ∷ WindowId, transitionOutcome ∷ ModeOutcome
-                                       , transitionObservation ∷ PostCallObservation }
-data UnsupportedControl = UnsupportedControl { unsupportedWindow ∷ WindowId, unsupportedOperation ∷ WindowOperation
-                                             , unsupportedReason ∷ Text }
-data ControlAttempt   = ControlAttempt { attemptedWindow ∷ WindowId, attemptedOutcome ∷ ControlOutcome
-                                       , attemptedObservation ∷ PostCallObservation }
-data ControlOutcome   = ControlReturned
-                      | ControlNativeError { controlFailedOperation ∷ Text, controlReports ∷ Reports }
-                      | ConstraintUpdateFailed { constraintsReturned ∷ [ConstraintCall], constraintsFailed ∷ ConstraintCall
-                                               , constraintsUnattempted ∷ [ConstraintCall], constraintReports ∷ Reports }
-data ConstraintCall   = SizeLimitsCall | AspectRatioCall
-constraintCallOrder   ∷ [ConstraintCall]                     -- [SizeLimitsCall, AspectRatioCall]
-data PostCallObservation = PostCallRevision Natural
-                         | PostCallSampleFailed { sampleOutcome ∷ NativeOutcome, sampleReports ∷ Reports }
-data WindowCommandMisuse = OwnerThreadWouldWait
-
-data WindowClient                            -- Show; read with:
-clientWindow       ∷ WindowClient → WindowId
-clientCommandPort  ∷ WindowClient → WindowCommandPort
-clientObservations ∷ WindowClient → SnapshotReader WindowObservation
-clientInputReader  ∷ WindowClient → InputReader
-clientInputControl ∷ WindowClient → InputControl
-clientDemandPublisher ∷ WindowClient → DemandPublisher
-pollWindowClient   ∷ CompletionTicket → STM (Maybe WindowClient)
-```
-
-```haskell
--- Hetoimasia.GLFW.Mode
-data WindowMode                              -- Eq, Show, NFData; built and read with:
-windowedMode        ∷ WindowMode
-borderlessMode      ∷ MonitorId → WindowMode
-fullscreenMode      ∷ MonitorId → VideoModePreference → WindowMode
-modePresentation    ∷ WindowMode → PresentationKind
-modeMonitor         ∷ WindowMode → Maybe MonitorId
-modeVideoPreference ∷ WindowMode → Maybe VideoModePreference
-data PresentationKind = WindowedPresentation | BorderlessPresentation | FullscreenPresentation
-
-data VideoModePreference                     -- Eq, Show, NFData; built and read with:
-currentVideoMode   ∷ VideoModePreference
-exactVideoMode     ∷ Extent → Maybe Int → VideoModePreference
-preferredVideoMode ∷ VideoModePreference → Maybe (Extent, Maybe Int)
-
-data ModeFallback                            -- Eq, Show, NFData; built and read with:
-noModeFallback          ∷ ModeFallback
-windowedFallback        ∷ Int → ModeFallback  -- fallback attempts, 1 .. maximumFallbackAttempts
-fallbackAttempts        ∷ ModeFallback → Int
-maximumFallbackAttempts ∷ Int                 -- 4
-
-data ModeRequest                             -- Eq, Show, NFData; built and read with:
-modeRequest       ∷ WindowMode → ModeFallback → ModeRequest
-requestedMode     ∷ ModeRequest → WindowMode
-requestedFallback ∷ ModeRequest → ModeFallback
-
-data StartupMode                             -- Eq, Show, NFData; built and read with:
-startupMode        ∷ ModeRequest → ModeRequirement → StartupMode
-startupRequest     ∷ StartupMode → ModeRequest
-startupRequirement ∷ StartupMode → ModeRequirement
-data ModeRequirement = ModeRequired | ModeOptional
-
-data ModeRecord                              -- Eq, Show, NFData; read with:
-modeRequested      ∷ ModeRecord → WindowMode
-modeFallback       ∷ ModeRecord → ModeFallback
-modeApplied        ∷ ModeRecord → AppliedMode
-modeSavedPlacement ∷ ModeRecord → Maybe SavedPlacement
-modeLastOutcome    ∷ ModeRecord → Maybe ModeOutcome
-data AppliedMode = AppliedWindowed | AppliedBorderless MonitorId | AppliedFullscreen MonitorId | AppliedIndeterminate
-data SavedPlacement                          -- Eq, Show, NFData; read with:
-savedPosition ∷ SavedPlacement → Placement
-savedExtent   ∷ SavedPlacement → Extent
-
-data ModeRejection = TransitionAlreadyInProgress | FallbackAttemptsRejected Int
-                   | VideoModeRejected Int Int (Maybe Int) | ModeMonitorDisconnected MonitorId
-                   | MonitorBusy MonitorId | VideoModeUnavailable MonitorId VideoModePreference
-                   | WorkAreaUnavailable MonitorId | PlacementUnrepresentable Placement Extent
-                   | NoReachablePlacement | PlacementExcluded Extent SizeConstraints
-                   | WindowedConstraintsIndeterminate
-data ModeStep      = ClearSizeLimitsStep | ClearAspectRatioStep | DecorationStep Bool
-                   | PlacementStep Placement Extent | MonitorStep MonitorId Extent (Maybe Int)
-                   | SizeLimitsStep Extent Extent | AspectRatioStep (Maybe AspectRatio)
-data ModeAttemptKind    = TargetAttempt | WindowedFallbackAttempt
-data ModeFailure        = RefusedBeforeMutation ModeRejection | UnsupportedTarget Text
-                        | StoppedPartway { stoppedReturned ∷ [ModeStep], stoppedAt ∷ ModeStep
-                                         , stoppedUnattempted ∷ [ModeStep], stoppedReports ∷ Reports }
-data ModeAttemptFailure = ModeAttemptFailure { failedAttempt ∷ ModeAttemptKind, failedHow ∷ ModeFailure }
-data ModeOutcome        = ModeInert
-                        | ModeApplied { appliedBy ∷ ModeAttemptKind, appliedSteps ∷ [ModeStep]
-                                      , appliedAfter ∷ [ModeAttemptFailure] }
-                        | ModeFailed { failedAttempts ∷ [ModeAttemptFailure] }
-                        | ModeRecoveryStopped { stoppedAttempts ∷ [ModeAttemptFailure], stoppedCleanup ∷ Reports }
-```
-
-```haskell
--- Hetoimasia.GLFW.Input
-data InputReader                             -- no instances; read with:
-inputReaderWindow ∷ InputReader → WindowId
-readInput         ∷ InputReader → STM InputRead
-awaitInput        ∷ InputReader → STM InputRead   -- waits while empty or paused
-data InputRead = InputDelivered InputEvent | InputResetRequired ResetToken | InputPaused
-               | InputEmpty | InputClosed
-
-data InputEvent                              -- Eq, Show, NFData; read with:
-inputWindow  ∷ InputEvent → WindowId
-inputEpoch   ∷ InputEvent → InputEpoch
-inputPayload ∷ InputEvent → InputPayload
-data InputEpoch                              -- Eq, Ord, Show
-epochNumber  ∷ InputEpoch → Natural
-data InputPayload   = KeyInput KeyEvent | TextInput Char | ButtonInput ButtonEvent
-                    | ScrollInput ScrollEvent | FocusInput Bool
-data KeyEvent       = KeyEvent { keyCode, keyScancode ∷ Int, keyAction ∷ KeyAction, keyModifiers ∷ Modifiers }
-data KeyAction      = KeyPressed | KeyRepeated | KeyReleased
-data ButtonEvent    = ButtonEvent { buttonNumber ∷ Int, buttonAction ∷ ButtonAction
-                                  , buttonCursor ∷ Maybe CursorPosition, buttonModifiers ∷ Modifiers }
-data ButtonAction   = ButtonPressed | ButtonReleased
-data ScrollEvent    = ScrollEvent { scrollX, scrollY ∷ Double }
-data CursorPosition = CursorPosition { cursorX, cursorY ∷ Double }
-data Modifiers      = Modifiers { modifierShift, modifierControl, modifierAlt, modifierSuper
-                                , modifierCapsLock, modifierNumLock ∷ Bool }
-noModifiers ∷ Modifiers
-keyDomainLast, buttonDomainLast ∷ Int        -- 348 and 7
-
-data ResetToken                              -- Eq, Show; read with:
-resetWindow ∷ ResetToken → WindowId
-resetEpoch  ∷ ResetToken → InputEpoch        -- the epoch the reset reserved
-resetReason ∷ ResetToken → ResetReason
-data ResetReason     = InputOverflowed | AdmissionSuspended
-acknowledgeReset     ∷ InputReader → ResetToken → STM (Either InputMisuse Acknowledgement)
-data Acknowledgement = Acknowledged | AlreadyAcknowledged | StaleAcknowledgement | AcknowledgementClosed
-data InputMisuse     = ForeignResetToken { misuseTokenWindow, misuseFeedWindow ∷ WindowId }
-
-data InputControl                            -- no instances
-inputControlWindow ∷ InputControl → WindowId
-enableInput, suspendInput ∷ InputControl → STM AdmissionChange
-data AdmissionChange      = AdmissionOpened | AdmissionReset ResetToken | AdmissionClosedDuringReset
-                          | AdmissionUnchanged | AdmissionFeedClosed
-data ApplicationAdmission = AwaitingReadiness | InputEnabled | InputSuspended
-
-inputStatistics ∷ InputReader → STM InputStatistics
-data InputStatistics = InputStatistics
-  { statisticsFeedWindow ∷ WindowId, statisticsPhase ∷ InputPhase, statisticsEpoch ∷ InputEpoch
-  , statisticsAdmission ∷ ApplicationAdmission, statisticsFocused ∷ Bool
-  , statisticsCapacity, statisticsQueued, statisticsHeld, statisticsAdmitted, statisticsDelivered
-  , statisticsGated, statisticsUnpaired, statisticsSuppressed, statisticsOverflowed
-  , statisticsDiscardedByReset, statisticsDiscardedAtClose, statisticsResets, statisticsGenerations ∷ Natural
-  , statisticsLastReset ∷ Maybe ResetSummary }
-data InputPhase   = InputRunning | InputResetPending | InputResetAcknowledged | InputFeedClosed
-data ResetSummary = ResetSummary { summaryEpoch ∷ InputEpoch, summaryReason ∷ ResetReason
-                                 , summaryDiscarded, summaryUnadmitted, summarySuppressed ∷ Natural
-                                 , summaryWarning ∷ WarningState }
-data WarningState = NoWarningOwed | WarningOwed | WarningAttempting | WarningWritten
-                  | WarningFailed | WarningInterrupted
-```
-
-```haskell
--- Hetoimasia.Runtime.GLFW, in hetoimasia-glfw:runtime-glfw
-data WindowHost
-allocWindowHost       ∷ HasCallStack ⇒ HostConfig → Scoped WindowHost
-allocWindowHostIn     ∷ HasCallStack ⇒ Scoped Session → HostConfig → Scoped WindowHost
-hostMonitors          ∷ WindowHost → SnapshotReader MonitorInventory
-hostCommandPort       ∷ WindowHost → WindowCommandPort
-hostCommandStatistics ∷ WindowHost → STM CommandStatistics
-hostActivity          ∷ WindowHost → STM HostActivity
-quiesceWindowHost     ∷ WindowHost → STM ()
-hostWakePath          ∷ WindowHost → STM WakePath
-hostNotificationsInFlight ∷ WindowHost → STM Int
-reportHostWakeDegradation ∷ HasCallStack ⇒ Logger → WindowHost → IO DegradationAttempt  -- owner thread
-data WakePath = WakePathHealthy | WakePathDegraded Reports DegradationReport
-data DegradationReport = DegradationOwed | DegradationReporting | DegradationReported
-                       | DegradationReportFailed | DegradationReportInterrupted
-data DegradationAttempt = NoDegradationDue | DegradationReportAttempted
-hostDemandPublisher   ∷ WindowHost → DemandPublisher
-captureHostDemand     ∷ WindowHost → IO (Maybe CapturedDemand)          -- owner thread
-captureWindowDemand   ∷ WindowHost → WindowId → IO (Maybe CapturedDemand)  -- owner thread
-hostDemandStatus      ∷ WindowHost → STM DemandStatus
-windowDemandStatus    ∷ WindowHost → WindowId → STM (Maybe DemandStatus)
-data HostActivity = HostActivity { activityTurn ∷ Natural, activityWaiting ∷ Bool }
-hostWindowCapabilities ∷ WindowHost → WindowCapabilities
-
-hostWindowIdentities   ∷ WindowHost → STM [WindowId]
-hostWindowClient       ∷ WindowHost → WindowId → STM (Maybe WindowClient)
-withHostWindow         ∷ WindowHost → WindowId → (Window → IO r) → IO (WindowResult r)
-closeHostWindow        ∷ WindowHost → WindowId → IO CloseStart
-honourHostCloseRequest ∷ WindowHost → CloseRequest → IO CloseStart
-data CloseStart = CloseStarted | CloseAlreadyStarted | CloseNotServed | CloseRequestSuperseded
-hostBookkeeping        ∷ WindowHost → IO HostBookkeeping
-data HostBookkeeping = HostBookkeeping { bookkeepingWindows, bookkeepingClosing, bookkeepingMembers
-                                       , bookkeepingPorts ∷ Int, bookkeepingPendingCells ∷ Natural
-                                       , bookkeepingSurfaced, bookkeepingBorrowed ∷ Int }
-
-data HostConfig = HostConfig { hostSessionConfig ∷ SessionConfig, hostWindowConfigs ∷ [WindowConfig]
-                             , hostWindowLimit ∷ Int, hostCommandCapacity, hostInputCapacity ∷ Integer
-                             , hostCommandBudget, hostEventBudget, hostRetirementBudget ∷ Int
-                             , hostIdleWait ∷ Double
-                             , hostClock ∷ MonotonicSource }   -- Show omits the clock; there is no Eq
-defaultHostConfig  ∷ [WindowConfig] → HostConfig   -- 16 windows, capacities 64 and 256, command and event budgets 16,
-                                                   -- retirement budget 4, idle wait 0.1 s, and the process's monotonicSource
-validateHostConfig ∷ HostConfig → Either HostConfigRejected ()
-data HostConfigRejected = CommandBudgetRejected Int | EventBudgetRejected Int | RetirementBudgetRejected Int
-                        | IdleWaitRejected Double | WindowLimitRejected Int | InputCapacityRejected Integer
-hostComponent ∷ Component                   -- "glfw.runtime"
-
-runOwnerLoop ∷ WindowHost → RuntimeControl → LoopHooks a → IO a
-data LoopHooks a = LoopHooks { loopLogger ∷ Logger, loopEvent ∷ IO Bool, loopUpdate ∷ Turn → IO (TurnStep a) }
-noApplicationEvents ∷ IO Bool
-data Turn = Turn { turnNumber ∷ Natural, turnWaited ∷ Bool, turnCommands, turnEvents ∷ Int
-                 , turnCloseRequests ∷ [CloseRequest] }
-data TurnStep a = Continue | Finish a
-rejectHostCloseRequest ∷ WindowHost → CloseRequest → IO Bool
-
-runScheduledOwnerLoop ∷ WindowHost → RuntimeControl → ScheduledHooks a → IO a
-data ScheduledHooks a = ScheduledHooks { scheduledLogger ∷ Logger, scheduledReady, scheduledEvent ∷ IO Bool
-                                       , scheduledUpdate ∷ ScheduledTurn → IO (ScheduledStep a)
-                                       , scheduledStart ∷ UpdateSchedule }
-defaultScheduledHooks ∷ Logger → (ScheduledTurn → IO (ScheduledStep a)) → ScheduledHooks a
-noApplicationReadiness ∷ IO Bool
-data ScheduledTurn = ScheduledTurn { scheduledTurn ∷ Turn, scheduledNow ∷ Instant
-                                   , scheduledPacing ∷ TurnPacing, scheduledDemand ∷ Maybe CapturedDemand }
-data TurnPacing = PolledForWork | PolledForDeadline | WaitedForDeadline Duration | WaitedForFallback Duration
-data UpdateSchedule = NoUpdateDemand | UpdateImmediately | UpdateBy Instant
-data ScheduledStep a = ContinueWith UpdateSchedule | FinishWith a
-
-data RenderDemand                                 -- per-window scheduling state, keyed by WindowId
-noRenderDemand         ∷ RenderDemand
-renderDemandWindows    ∷ RenderDemand → [WindowId]
-windowRenderState      ∷ WindowId → RenderDemand → Maybe WindowRenderState
-forgetRenderWindow     ∷ WindowId → RenderDemand → RenderDemand
-data WindowRenderState = WindowRenderState { windowRedrawPending ∷ Bool
-                                           , windowDeadlinePending, windowFrameDue, windowFrameRequested ∷ Maybe Instant
-                                           , windowResumeDue ∷ Maybe Instant
-                                           , windowRevisionPending, windowRevisionServed ∷ Natural
-                                           , windowSuspended ∷ Bool }
-
-data RenderBudget                                 -- a validated, strictly positive opportunity budget
-renderBudget           ∷ Int → Either RenderBudgetRejected RenderBudget
-renderBudgetSize       ∷ RenderBudget → Int
-data RenderBudgetRejected = OpportunityBudgetNotPositive
-
-data RenderEligibility = RenderEligible | RenderSuspended | RenderDeferred | RenderExcluded
-windowRenderEligibility ∷ WindowObservation → RenderEligibility
-
-data WindowRender = WindowRender { renderedObservation ∷ WindowObservation
-                                 , renderedCapture ∷ Maybe CapturedDemand, renderedFrame ∷ Maybe Instant }
-data RenderTurn = RenderTurn { renderNow ∷ Instant, renderSimulation ∷ Demand, renderLive ∷ [WindowRender] }
-renderTurn             ∷ RenderBudget → RenderTurn → RenderDemand → (RenderResult, RenderDemand)
-data RenderResult = RenderResult { renderOffers ∷ [RenderOffer], renderSchedule ∷ UpdateSchedule }
-renderDeadline         ∷ RenderResult → Maybe Instant
-data RenderOffer = RenderOffer { offeredWindow ∷ WindowId, offeredRevision ∷ Natural
-                               , offeredFrame, offeredResume ∷ Maybe Instant }
-acknowledgeRender      ∷ RenderOffer → RenderDemand → RenderDemand
-
-runWindowApplication
-  ∷ HasCallStack
-  ⇒ (∀ r. (LoggingLifetime → IO r) → IO r) → Text → Scoped dependencies
-  → (dependencies → WindowHost)                     -- where the host is
-  → (dependencies → RuntimeControl → IO services)   -- startup
-  → (services → RuntimeControl → IO a)              -- the action
-  → IO a
-```
-
-`Session`, `MonitorInventory`, `MonitorDescription`, `MonitorId`, `Window`,
-`WindowObservation`, `WindowId`, `CloseRequest`, `WindowHost`, `WindowCommandHost`, `WindowCommandPort`, `CompletionTicket`,
-`CommandOrigin`, `RequestId`, `WindowCommand`, `SizeConstraints`, `WindowCapabilities`, `WindowClient`, `InputReader`,
-`InputControl`, `InputEvent`, `InputEpoch`, `DemandRequest`, `DemandPublisher`, `RenderDemand`, `RenderBudget`, and `ResetToken` are exported
-without their constructors, and their readers are functions rather than record
-fields, so no client can build or rewrite one. No public
-type holds a native window or monitor pointer, and no snapshot publisher is
-handed out: clients receive only read endpoints. No public operation reaches the
-host's window collection, a collection member, or a release, and none reaches an
-input feed's channel, state, or producer. Nothing assumes a
-single or primary window or monitor.
-
-Every failure is raised through `throwFailure` with the `glfw` component, the
-operation (`enter session`, `initialize`, `verify backend`, `terminate`,
-`detach error callback`, `take asynchronous reports`, `attach monitor callback`,
-`detach monitor callback`, `sample monitors`, `synchronize monitors`,
-`resolve monitor`, `reconcile monitor events`, `monitor callback`, `create window`,
-`sample window`, `attach window callbacks`, `synchronize window`,
-`begin window closing`, `detach window callbacks`, `destroy window`,
-`new window command host`, `submit window command`, `await window command`,
-`execute window command`, `perform window command`, `process window events`,
-`reconcile window events`, `reject close request`, `control window`), and identifiers such as
-`backend`, `title`, `monitor`, `window`, or `request`, so `failureEvidence` reads
-the origin back without a logger. The host's own failures are raised under the
-`glfw.runtime` component: a configuration rejection under
-`construct window host`, and an owner-thread refusal under `run owner loop`,
-`reject close request`, `borrow host window`, `close host window`,
-`honour close request`, `capture demand`, `report wake degradation`, or
-`read host bookkeeping`. The one
-diagnostic the host's own boundary writes, besides the input overflow warning,
-is the wake path's degradation warning, under `glfw.wake`.
+Every failure is raised through `throwFailure` with component `glfw` (the
+host's own under `glfw.runtime`), the operation name, and identifiers such as
+`backend`, `window`, `monitor` or `request`, so `failureEvidence` reads the
+origin back without a logger.
 
 ## Entry
 
-`allocSession` constructs the session as a staged composite. In order:
+`allocSession` builds the session as a staged composite, in this order:
 
-1. **Backend.** The request is resolved against what this platform admits.
-   Linux admits X11 and Wayland; macOS admits Cocoa. An absent request takes
-   the platform's own backend — X11 on Linux, Cocoa on macOS — so nothing
-   reaches Wayland unless a request names it, and Wayland is selected only on
-   explicit request. A request naming a backend the platform does not admit —
-   Cocoa on Linux, X11 or Wayland on macOS — is `UnsupportedBackend` before
-   anything else happens. No request is ever exchanged for the other backend:
-   resolution either answers the backend asked for or refuses, so no XWayland
-   run is presented as Wayland and no Wayland request is quietly served by
-   X11.
-2. **Thread.** The calling thread must be bound and must be the OS thread that
-   entered the process main function, or entry is `NotProcessMainThread`. A
-   bound worker thread is not enough: the OS identity comes from a C shim
-   (`pthread_main_np` on macOS, `gettid() == getpid()` on Linux). An unbound
-   thread is rejected even if it runs there, because it could migrate. The
-   threaded runtime is therefore required.
-3. **Exclusivity.** A process-wide guard is claimed. An active session, entered
-   from any thread, makes this `SessionAlreadyActive`; a poisoned guard makes it
-   `SessionPoisoned`.
+1. **Backend.** Linux admits X11 and Wayland; macOS admits Cocoa. No request
+   takes the platform's own backend (X11 on Linux), so Wayland is selected only
+   on explicit request. A backend the platform does not admit is
+   `UnsupportedBackend`. A request is never exchanged for another backend.
+2. **Thread.** The caller must be a bound thread and the OS thread that entered
+   the process main function (checked by a C shim), or entry is
+   `NotProcessMainThread`. The threaded runtime is required.
+3. **Exclusivity.** A process-wide guard is claimed: `SessionAlreadyActive` if
+   a session is active on any thread, `SessionPoisoned` if the guard is
+   poisoned.
 4. **Support.** `glfwPlatformSupported` must accept the backend, or entry is
-   `UnsupportedBackend` and the guard is released — still before any native
-   mutation. This answers only whether the prefix was built with that backend.
-   A supported answer is never a working connection: whether the display or
-   socket can actually be reached is settled one step later, by `glfwInit`.
+   `UnsupportedBackend` and the guard is released. This says only that the
+   prefix was built with the backend, not that a display is reachable.
 5. **Callback.** The error callback is installed.
-6. **Initialization.** The platform hint and `GLFW_COCOA_CHDIR_RESOURCES = false`
-   are set, so session configuration never changes the process working
-   directory, and `glfwInit` runs. A false return is a `NativeFailure` carrying
-   the reports GLFW made during the call. That is how an initialization error is
-   observed before any event is polled.
+6. **Initialization.** The platform hint and `GLFW_COCOA_CHDIR_RESOURCES =
+   false` are set (the session never changes the working directory) and
+   `glfwInit` runs. A false return is a `NativeFailure` carrying the reports
+   GLFW made during the call. An unreachable display is identified from those
+   reports by GLFW's own code and description, carried through unaltered: X11
+   reports `GLFW_PLATFORM_UNAVAILABLE`, Wayland `GLFW_PLATFORM_ERROR`.
+7. **Verification.** Reports from a successful initialization are raised now,
+   after termination is registered, and `glfwGetPlatform` must name the
+   selected backend, or entry is `BackendNotSelected`.
+8. **Connection probe.** A Wayland session resolves the private probe of
+   [Wayland connection loss](#wayland-connection-loss); a library that cannot
+   supply it refuses the session with `ConnectionProbeUnavailable`.
+9. **Monitor callback.** Its storage is allocated, its detach registered, and
+   it is attached. An attachment that raises poisons the guard.
+10. **Monitor inventory.** Monitors are enumerated and the prepared inventory
+    becomes revision zero of a fresh snapshot.
 
-   A display or socket that cannot be reached is identified from those reports,
-   by GLFW's own code and description, rather than by an outcome of its own. In
-   GLFW 3.4 an X11 display that will not open is `GLFW_PLATFORM_UNAVAILABLE`
-   (`0x0001000E`) with `X11: Failed to open display …` or `X11: The DISPLAY
-   environment variable is missing` (`src/x11_init.c:1290-1308`), while a
-   Wayland socket that will not connect is `GLFW_PLATFORM_ERROR` (`0x00010008`)
-   with `Wayland: Failed to connect to display` (`src/wl_init.c:544`). The two
-   backends do not agree on the code, so the description is part of the
-   evidence; the session carries both through unaltered rather than folding
-   them into one generic failure.
-
-   `glfwInit` is the one call of entry that can fail to return. On Cocoa the
-   process main thread can block inside it for good, and a blocked main thread
-   cannot be unwound from Haskell. Two things bound that, and neither alters
-   the contract above for a call that returns (see
-   [Initialization on Cocoa](#initialization-on-cocoa)):
-
-   - **Prevention.** Before `glfwInit`, a re-initialization in a process whose
-     launch already finished arms a stop for the launch wait GLFW would
-     otherwise enter and never leave. The first initialization of a process is
-     untouched, and the arming has no visible effect.
-   - **Deadline.** The application may put a process-level deadline on the call
-     (`SessionConfig.initializationDeadline`). When it passes, the application's
-     report runs for at most two seconds and the process ends with status 75,
-     without unwinding. The `run` command arms it on macOS with a bound of **ten
-     seconds**; nothing is armed by default, and Linux initialization is
-     unchanged. The deadline names an observed condition, that `glfwInit` had not
-     returned within the bound, and never a cause.
-7. **Verification.** Reports from a successful initialization are raised only
-   now, after termination has been registered, and `glfwGetPlatform` must name
-   the selected backend, or entry is `BackendNotSelected`. A Wayland hint that
-   GLFW answers with X11 fails here and terminates: the hint asked for Wayland,
-   so an X11 session is not presented as one.
-8. **Connection probe.** A Wayland session resolves the private
-   connection-status probe [Wayland connection loss](#wayland-connection-loss)
-   describes. A library that cannot supply it refuses the session with
-   `ConnectionProbeUnavailable`, attributed to `initialize`, and terminates:
-   without the probe a lost compositor connection could not be confirmed. X11
-   and Cocoa sessions resolve nothing and make no call here.
-9. **Monitor callback.** The monitor callback's storage is allocated, its detach
-   is registered, and it is attached with `glfwSetMonitorCallback`. An
-   attachment that raises poisons the guard.
-10. **Monitor inventory.** The monitors are enumerated and described, anything
-   the callback captured since attachment is folded in, and the prepared
-   inventory becomes revision zero of a fresh snapshot. See [Monitors](#monitors).
-
-Steps 1 to 3 change no native state, so every misuse and unsupported request is
-rejected before native mutation. A failure at any later step releases exactly
-what the earlier steps acquired, with the triggering failure primary and every
-cleanup failure retained, as [composite construction](resources.md#composite-construction)
-guarantees. Sequential sessions work after a complete, safe teardown.
+Steps 1 to 3 change no native state. A failure at a later step releases exactly
+what earlier steps acquired, with the triggering failure primary and every
+cleanup failure retained ([composite construction](resources.md#composite-construction)).
+Sequential sessions work after a complete, safe teardown.
 
 ### Initialization on Cocoa
 
-#### The cause (issue #586)
+`glfwInit` is the one call of entry that can fail to return. GLFW 3.4's Cocoa
+initialization calls `[NSApp run]` whenever the application reports that it has
+not finished launching, and that run returns only on a notification
+`NSApplication` sends once per process. In a process that already initialized
+GLFW once, a transiently false answer sends a later `glfwInit` into a run that
+nothing stops. Two things bound that:
 
-On the pinned macOS profile (GLFW 3.4, Cocoa) `glfwInit` intermittently never
-returned. GLFW 3.4's `_glfwInitCocoa` calls `[NSApp run]` whenever
-`-[NSRunningApplication isFinishedLaunching]` answers `NO`
-(`src/cocoa_init.m:633-635`). That run returns only when its delegate's
-`applicationDidFinishLaunching:` stops it (`:439-443`), and `NSApplication` sends
-that notification once per process, at its first launch. `isFinishedLaunching`
-is LaunchServices' view of the process, read once, at that instant. So in a
-process that has already initialized GLFW once, a *transiently false* answer
-sends a later `glfwInit` into a `[NSApp run]` that nothing can stop: the main
-thread waits in `nextEventMatchingMask:untilDate:inMode:dequeue:` for ever.
+- **Prevention.** The native shim wraps `glfwInit`. From the second
+  initialization of a process on, it queues a block on the main dispatch queue
+  before the call and closes it when the call returns. If `glfwInit` enters the
+  redundant run, the block stops it as GLFW's own delegate would. Otherwise the
+  block finds its generation closed and does nothing. There is no visible
+  effect, the first initialization is untouched, and Linux is unchanged.
+- **Deadline.** `SessionConfig.initializationDeadline` carries a bound in
+  microseconds and a report action over the application's own logger. The
+  guard brackets exactly the `glfwInit` call. If the bound passes while the
+  call is pending, the report runs on its own thread for at most two seconds
+  and the process ends with `_exit(75)`, without unwinding. One transaction
+  decides each call exactly once (retired or expired, never both), and the
+  timer thread is joined before the guard leaves on every other path. Nothing
+  is armed by default. The `run` command arms ten seconds on macOS only and
+  logs one `Error` record under `run.graphics` that names what was observed
+  (`glfwInit had not returned`), not a cause.
 
-Established, with a scratch probe that links the pinned static GLFW and sets the
-same two init hints as the session, creating no window (evidence: [docs/evidence/issue-586-glfwinit-diagnosis.md](evidence/issue-586-glfwinit-diagnosis.md)):
-
-- A bare second `[NSApp run]` after `glfwInit; glfwTerminate` blocks every time.
-  The flag after a first initialization is `true` and stays so.
-- In a quiet process the flag was `true` before all 2,999 later initializations
-  of a 3,000-cycle loop.
-- With three other processes repeatedly launching and ending a GLFW application,
-  the flag read `false` at a later initialization in 4 of 649 cycles in one run
-  and 3 of 231 in another, and `glfwInit` then never returned (cycle 649, cycle
-  231). A `sample` of the hung probe has the stack the issue recorded:
-  `glfwInit` → `_glfwInitCocoa` → `-[NSApplication run]` →
-  `nextEventMatchingMask:untilDate:inMode:dequeue:` → `mach_msg2_trap`.
-
-Not established: that the flag read `false` inside `run-native-tests` itself (the
-runner strips `DYLD_INSERT_LIBRARIES`, so the real suite cannot be instrumented
-without changing it; the match is by stack, by the repeated in-process
-initializations, and by the churn the suite's windowed product children
-produce), and why LaunchServices answers `false` at those instants. The first
-initialization of a process is not affected by this cause: its launch is real
-and its notification arrives.
-
-#### Prevention
-
-The native shim wraps `glfwInit` (`hetoimasia_glfw_init`). From the second
-initialization of a process on (an earlier one returned `GLFW_TRUE`), before
-`glfwInit` it queues a block on the main dispatch queue and closes it again when
-`glfwInit` returns. If `glfwInit` enters the redundant `[NSApp run]`, the run loop
-services the main queue and the block, still open for that call, stops the run
-and posts the application-defined event that wakes it, exactly what GLFW's own
-delegate does at a real launch. If `glfwInit` does not enter it, the main queue is
-not serviced during the call; a block that runs later finds its generation
-closed and does nothing. Verified against a flag forced to `NO` on every
-re-initialization: 499 of 499 completed, where the same loop without the stop
-blocks at the second.
-
-Visible effects: **none**. The activation policy, the menu bar and the Dock icon
-are GLFW's own, as before (`GLFW_COCOA_MENUBAR` stays at its default); no hint is
-added; the pinned prefix and GLFW are unchanged; the first initialization takes
-the same path. A re-initialization whose flag is `true` (the ordinary case)
-enters nothing and runs the same code as before. Linux and Wayland initialization
-are unchanged: the wrapper is `glfwInit` itself there.
-
-#### The deadline
-
-A prevention can be wrong, and a blocked main thread can only be answered by
-ending the process. The mechanism is the package's; the policy is the
-application's (vision V-3: engine packages gain no deadline policy, and the
-application chooses the deadline, what is reported and the flush).
-`SessionConfig.initializationDeadline` carries an `InitializationDeadline`: a
-bound in microseconds and a report action over the application's own logger, so
-the session stays logger-free and writes to no handle. The guard
-(`Hetoimasia.GLFW.Internal.Deadline`) brackets exactly one call, `glfwInit`
-(including the shim's arming above), and nothing else.
-
-| Phase of one guarded call | Entered by | Left by |
-| --- | --- | --- |
-| Pending | the guard, before the call | the call ending, or the bound passing |
-| Retired | the call returning, raising or being cancelled | never; its timer thread ends and is joined before the guard leaves |
-| Expired | the timer thread, once the bound has passed with the call Pending | never; the process ends |
-
-One transaction decides each call exactly once, so a call that returns just as
-the bound passes is either retired or expired, never both. A retired timer
-cannot end a later session: its thread has been joined, and a later call has a
-cell and a timer thread of its own, so each initialization of a process is
-protected. The timer thread is started under mask with its join registered in the
-same step, and is stopped and joined on a normal return, a `False` return, an
-exception and cancellation; it leaves no thread or timer behind.
-
-On expiry the timer thread runs the application's report on a thread of its own
-and waits for it for at most **two seconds**, then ends the process with
-`_exit(75)` through the session's `nativeExitProcess` (`EX_TEMPFAIL`, distinct
-from every status [the run command](run_command.md#exit-status) documents). It
-does not wait for GLFW, termination, cleanup or the main thread, and a report
-that blocks, throws or never returns cannot delay the exit: the total from the
-start of the call is the bound plus two seconds, at most **twelve seconds** in
-the `run` command. Nothing unwinds, no exit handler runs, and the operating
-system reclaims the process.
-
-**The bound.** The `run` command's is ten seconds, armed on macOS only. The
-slowest healthy `glfwInit` measured on this profile, among about 7,400
-initializations (3,000 in a quiet process, 648 and 230 under concurrent
-application launches, 500 and 3,000 with the prevention armed), took 0.094 s; a
-typical later initialization takes 0.4 ms and a first one about 60 ms. Ten
-seconds is more than a hundred times the slowest, so a slow but healthy start is
-not ended, and it sits well inside the 30-second budget of the complete native
-profile, whose healthy run takes 8 to 13 seconds.
-
-**The diagnostic.** One `Error` record of the command's logger, component
-`run.graphics`, message `native initialization exceeded its bound; ending the
-process`, fields `backend`, `bound_microseconds`, `exit_status` (75), `observed`
-(`glfwInit had not returned`) and `see` (this section), then a best-effort flush
-of the logger. It says what was observed and does not assert that the cause
-above explains it: a timeout is evidence that Cocoa initialization exceeded its
-bound, nothing more.
+The deadline is mechanism; the policy (bound, report, flush) is the
+application's.
 
 ## Owner, thread, and lifetime
 
 The owner is the thread that entered the session. `takeAsynchronousReports` and
 every window operation check, before any native call, that they run on the
-owner (`NotSessionOwner`) and that the session is still live (`SessionEnded`).
-The session lives until its enclosing `withScoped` continuation returns or
-throws. Like any scoped value, it must not escape that scope.
+owner (`NotSessionOwner`) and that the session is live (`SessionEnded`). The
+session lives until its enclosing scope ends and must not escape it.
 
 ### Waking the owner
 
-`sessionWake` lends the session's wake capability, and `wakeSession` posts
-GLFW's documented cross-thread empty event, so an owner blocked in a native
-event wait returns. It is the only native call this package makes off the owner
-thread: event pumping, timed waits, and every window and monitor operation stay
-owner-only. The capability is opaque. It exposes no native handle, no session
-representation, and no other authority, which the external-client opacity
-examples prove.
-
-A wake is a hint. It carries no message, may be coalesced with other wakes, and
-proves nothing about work: whatever state made the wake worthwhile stays
-authoritative. Any thread may call it — bound, unbound, or the owner itself. A
-call makes at most one empty-event post plus bounded, non-blocking bookkeeping:
-a never-retrying transaction to be admitted, one to leave, and the error
-capture's own updates. It invokes no caller-supplied IO and takes no lock that
-an owner operation or a callback could hold.
+`sessionWake` lends an opaque wake capability; `wakeSession` posts GLFW's
+cross-thread empty event so an owner blocked in a native event wait returns. It
+is the only native call the package makes off the owner thread. Any thread may
+call it. A wake is a hint: it carries no message, may coalesce, and proves
+nothing about work. A call makes at most one post plus bounded, non-blocking
+bookkeeping, invokes no caller IO, and takes no lock an owner operation or
+callback could hold.
 
 | Outcome | Meaning |
 |---|---|
-| `WakePosted` | The empty event was posted and nothing was reported during the call. |
+| `WakePosted` | The event was posted and nothing was reported during the call. |
 | `WakeTerminal` | The session has begun closing or has closed. GLFW was not entered. |
-| `WakeFailed reports` | An expected platform failure, with the evidence [attributed to this call](#native-error-evidence): every report recorded for the call is `GLFW_PLATFORM_ERROR`, none was lost or faulted, and the error the call left in its thread's GLFW error state is that code or none. |
+| `WakeFailed reports` | An expected platform failure: every report for the call is `GLFW_PLATFORM_ERROR`, none lost or faulted. |
 
-Any other evidence is not an ordinary outcome. It raises a `NativeFailure`
-attributed to `glfw` `wake session` and carrying the call's reports. That covers
-another code (such as `GLFW_NOT_INITIALIZED`, alone or beside a platform error),
-a report lost to the bound, a callback fault, and an error the call left that no
-report recorded, which is counted as a callback fault. These are programming or
-lifetime violations, or evidence that cannot be classified, so they keep the
-package's typed-failure semantics rather than becoming a failure a caller might
-recover from by degrading. A native table that raises is a programming failure
-too. Its exception propagates unchanged. Either way, the call's accounting has
-settled first. No outcome retries the wake,
-reclassifies other work, or chooses a degradation policy. That policy is the
-notifier's, described under [the degradation
-policy](#the-degradation-policy): what command admission and demand publication
-do with an expected failure, and the one warning it owes.
+Any other evidence (another code, a lost report, a callback fault, an
+unrecorded error) raises a `NativeFailure` under `wake session`. No outcome
+retries the wake or chooses a degradation policy; that is the notifier's
+([the degradation policy](#the-degradation-policy)).
 
 ### Wake lifetime
 
 Each session owns a wake gate: open, closing with a count of admitted calls, or
-closed. A wake is admitted by raising that count in the same transaction that
-finds the gate open, and leaves by lowering it once its native call returns.
-Admission, the call, and leaving run masked, so no asynchronous exception can
-separate the accounting from the call it accounts for. A cancelled waker, cancelled
-inside its native call or with a cancellation pending when the call completes,
-still leaves, and the cancellation stays observable.
-
-The session's first release closes the gate and then waits, uninterruptibly,
-until every admitted call has left (see
-[teardown](#teardown-poisoning-and-controlled-blocking)). A new wake from then
-on answers `WakeTerminal` without entering GLFW. So `glfwTerminate` never runs
-while a wake is inside GLFW, no wake enters GLFW once termination has begun, and
-no callback storage is freed while a wake could report through it. This is a
-real exclusion, not a flag read before the FFI call. A capability retained past
-its session is terminal forever. It cannot reach a later session, even one with
-the same backend, because that session has its own gate. A construction that
-rolls back never lends a capability.
+closed. A wake is admitted by raising the count in the transaction that finds
+the gate open and leaves by lowering it after its native call returns;
+admission, call and leaving run masked. The session's first release closes the
+gate and waits, uninterruptibly, until every admitted call has left. So
+`glfwTerminate` never runs while a wake is inside GLFW, no wake enters GLFW
+after termination begins, and a capability kept past its session is terminal
+forever and cannot reach a later session.
 
 ## Wayland
 
 ### The supported profile
 
-A session enters native Wayland only when its configuration requests
-`Wayland`, on Linux, with the pinned GLFW 3.4 prefix built with both backends;
-the platform's own default stays X11, and no request is served by the other
-backend. What that session supports is what WL-3 (#207) demonstrated under the
-pinned headless Weston `tools/display/wayland.sh` starts, recorded with its CI
-run in [the Wayland qualification record](archive/wayland_qualification_record.md):
+A session enters native Wayland only when its configuration requests it, on
+Linux, with the pinned GLFW 3.4 prefix built with both backends. What is
+supported is what was demonstrated under the pinned headless Weston that
+`tools/display/wayland.sh` starts:
 
-- entry selecting Wayland on the socket it was pointed at, and an unrequested
-  session still selecting X11;
-- windows created and closed independently, each closure retiring only its own
-  window while the session and the other window stay usable;
-- title, size, visibility, and size-limit commands, with size and visibility
-  observed as the native boundary reports them; size limits are command
-  delivery and engine-side constraint handling only, because `xdg_toplevel`
-  limits are not readable from the client and a compositor may disregard them;
-- framebuffer extent and content scale as observations, never requests, with
-  the framebuffer following a resize the application made;
-- global placement, focus, and borderless-over-monitor requests answered
-  unsupported, and placement and iconified observations unavailable, with none
-  of their native operations or getters invoked ([the audited Wayland
-  row](#the-audited-wayland-row));
-- the cross-thread wake ending a native wait the owner was blocked in;
-- sessions left and entered again in one process, and forced or injected
-  failures rolled back completely;
-- a lost compositor connection ending the session, as the next section
-  describes.
+- entry on the requested socket; windows created and closed independently;
+- title, size, visibility and size-limit commands. Size limits are command
+  delivery only: a client cannot read `xdg_toplevel` limits and a compositor
+  may disregard them;
+- framebuffer extent and content scale as observations;
+- global placement, focus and borderless-over-monitor answered unsupported,
+  and placement and iconified observations unavailable, with no native call
+  made ([capabilities](#capabilities-and-platform-restrictions));
+- the cross-thread wake, repeated sessions in one process, and complete
+  rollback of failed entry;
+- Vulkan rendering on packaged Weston and Lavapipe (`test.vulkan-wayland`),
+  including hiding a presenting window
+  ([Hiding an attached window](#hiding-an-attached-window)).
 
-The remaining gaps are stated rather than estimated:
-
-- **One compositor.** Only packaged Weston under its headless backend is
-  qualified. Desktop compositors, their decorations, and compositor-specific
-  behaviour are not; their probes stay optional and none exists.
-- **No hardware.** No GPU, display, input device, or output hotplug was
-  involved.
-- **Rendering is qualified on packaged Weston and Lavapipe only.** WL-4
-  (#327) established Vulkan rendering on this same headless Weston with the
-  pinned software stack — packaged Lavapipe, the pinned loader and the Khronos
-  validation layer with synchronization validation — as the group
-  `test.vulkan-wayland` ([gpu_backend.md](gpu_backend.md#the-native-suite)):
-  surfaces created through the VK-5 bridge on Wayland windows, presented to
-  with verified present-fence completion, and retired under the protected
-  boundary, and a compositor lost during rendering ending the session with no
-  completion recorded for work it interrupted. Its run is retained in
-  [the qualification record](archive/wayland_qualification_record.md#rendering).
-  Hiding a window whose target is presenting is qualified there too, since
-  [#357](https://github.com/coghex/hetoimasia/issues/357): Weston 13 offers
-  no `wp_fifo_v1`, so Mesa's FIFO waits for a frame callback the compositor
-  never sends an unmapped surface, and the host therefore has the window's
-  graphics owner withhold its presentation before the hide's native call
-  ([Hiding an attached window](#hiding-an-attached-window)), and the target
-  resumes on a replacement swapchain. VK-16's hide-and-show case runs and
-  passes under the group. It hides through the host's command port; the
-  direct route through a lent window takes the same hold
-  ([#368](https://github.com/coghex/hetoimasia/issues/368)), and is covered
-  by headless examples, not by a run under the group. Minimizing a presenting window on Wayland is not
-  covered by that hold and stays unqualified, as minimization does below.
-  Hardware drivers, desktop compositors and macOS stay unqualified for
-  rendering on Wayland: no hardware driver, no compositor but packaged
-  headless Weston, and no macOS path was exercised, and macOS has no Wayland.
-- **Close requests.** A compositor-generated close request has not been
-  demonstrated on Wayland: no client can make the compositor send one, and the
-  X11 close driver is unavailable there (D-9). The examples exercise close
-  handling with requests injected through the window's own close callback,
-  labelled as injected.
-- **Minimization, suspension, and occlusion.** Not established through the
-  pinned GLFW 3.4 integration, whose direct `xdg-shell` path binds protocol
-  version 1; nothing infers that a window is drawable from an unknown state.
-- **Reconnection.** A lost connection is terminal. Nothing reconnects or
-  recovers.
+Not qualified, and stated rather than estimated: any compositor but packaged
+headless Weston; any hardware (GPU, display, input device, hotplug); a
+compositor-generated close request (examples inject one through the window's
+close callback); minimization, suspension and occlusion, including minimizing a
+presenting window; reconnection, which does not exist.
 
 ### Wayland connection loss
 
-GLFW 3.4's Wayland event loop reports a lost compositor connection through no
-error at all: when its display flush fails it cancels the read, issues a close
-request for every window, and returns (`src/wl_window.c:1142-1160,1222-1250`).
-A close request is therefore neither necessary nor sufficient evidence of a
-loss, and an application may reject ordinary close requests. Under the Wayland
-qualification design's D-13 the production shim instead carries a private,
-read-only connection-status probe, and the session consults it.
+GLFW 3.4 reports a lost compositor connection through no error: it issues a
+close request for every window and returns. A close request is therefore
+neither necessary nor sufficient evidence of a loss. The production shim
+carries a private, read-only probe instead. On the owner thread it reads the
+display's latched error and polls the display's socket for hangup with a zero
+timeout. It never reads, dispatches, flushes, reconnects or closes the
+connection, and no pointer or descriptor leaves C.
 
-The probe runs on the owner thread and hands back only a status. It reads the
-display's latched error with `wl_display_get_error` and polls the display's
-socket, from `wl_display_get_fd`, with a zero timeout for hangup; it never
-reads or dispatches protocol messages, flushes, creates windows, reconnects, or
-closes GLFW's connection, which stays GLFW's. The two libwayland symbols are
-resolved once per process from the library GLFW itself loads, which is never
-closed. `wl_display_get_error` alone would not do: libwayland 1.22 latches
-nothing when a flush fails with `EPIPE`, which is exactly the path GLFW's
-disconnect handling takes, so the socket's own hangup is read too.
-
-`processWindowEvents` asks the probe immediately before and immediately after
-every native poll or wait, whether or not the session has windows. A status
-other than healthy fails that processing with `ConnectionFailed`, attributed to
-`process window events`, naming the cause and the boundary that found it:
+`processWindowEvents` asks the probe immediately before and after every native
+poll or wait. A status other than healthy fails that processing with
+`ConnectionFailed` under `process window events`:
 
 | Cause | When |
 | --- | --- |
-| `TransportClosed` | The display latched a transport error — `EPIPE` for a read that found the socket closed, with its `errno` — or the socket reported the peer gone with nothing latched. |
-| `ProtocolFailure` | The display latched `EPROTO`: the compositor reported a fatal protocol error. |
-| `ProbeFailure` | The probe could not establish the status at all — no display, no descriptor, a failed `poll` — and says why. This is reported as itself: the connection can no longer be vouched for, which is not a claim that it ended. |
+| `TransportClosed` | The display latched a transport error, or the socket reported the peer gone. |
+| `ProtocolFailure` | The display latched `EPROTO`. |
+| `ProbeFailure` | The probe could not establish the status. Reported as itself, not as a loss. |
 
-None is described as the compositor having crashed. A loss found before the
-call pumps nothing on the lost connection; one found after it fails the
-processing with that cause rather than with whatever GLFW reported during the
-call, and the failure keeps those reports beside the cause. Native errors the
-probe's own GLFW call might report are taken by the same capture as the
-processing's.
-
-The failure is terminal, as D-10 decides. The session latches it, and every
-later event processing raises the same failure with no probe and no native
-call; nothing reconnects. Other owner operations are unchanged and report
-whatever GLFW reports. In the window host the owner loop's processing raises
-it, which ends the loop, and the protected exit retires every attachment under
-the existing boundary before any window or the session is released: a loss
-that initiates the failure is primary, a loss the drain finds after an earlier
-failure is retained beside that primary, and a loss certifies no retirement
-fact, so an attachment still retires only on its own evidence. No completion
-is fabricated for work the compositor can no longer settle.
-
-The probe is not public, and no native pointer or descriptor is: an
-application observes only `ConnectionFailed`, and `ConnectionProbeUnavailable`
-at entry. X11 and Cocoa sessions resolve no probe and make no probe call.
+The failure is terminal. The session latches it and every later event
+processing raises the same failure with no probe and no native call. In the
+window host it ends the owner loop, and the protected exit retires every
+attachment before any window or the session is released. A loss certifies no
+retirement fact, and no completion is fabricated for work the compositor can
+no longer settle. X11 and Cocoa sessions resolve no probe.
 
 ## Native error evidence
 
-GLFW reports an error through one process-wide callback, possibly on another
-thread, with a description that is valid only during the call. The installed
-callback runs uninterruptibly and does only bounded work. It copies at most
-`errorDescriptionLimit` bytes, decodes them leniently as UTF-8, and records
-truncation. It stores one `NativeError` with a non-blocking `IORef` update and
-returns. It invokes no sink, takes no lock, and waits for nothing, so a callback
-made synchronously from inside an owner call cannot deadlock. No Haskell
-exception unwinds into C: a callback that cannot record its report adds to
-`callbackFaults` instead.
+GLFW reports errors through one process-wide callback, possibly on another
+thread. The installed callback runs uninterruptibly and does bounded work: it
+copies at most `errorDescriptionLimit` (1024) bytes, stores one `NativeError`
+with a non-blocking update, and returns. It calls no sink, takes no lock and
+lets no exception unwind into C; a report it cannot record adds to
+`callbackFaults`.
 
-Reports are sorted by facts about the reporting OS thread, never by Haskell
-thread identity (a callback runs in a Haskell thread of its own):
+Reports are attributed by facts about the reporting OS thread:
 
 - A report made during a wake call's native call, on the OS thread making it,
-  belongs to that wake call. The binding makes the post with the call's own
-  wake mark in that OS thread's thread-local storage. The callback reads the
-  mark on the thread GLFW invokes it on, so the post, the report, and the
-  attribution share one OS thread whichever Haskell thread called
-  `wakeSession`. Each call has its own bucket, removed when the call returns,
-  so two concurrent wakes each receive their own reports. Neither takes a
-  report from a concurrent owner operation or from the asynchronous reports,
-  and neither leaves one behind for `takeAsynchronousReports`,
-  `AsynchronousErrorsUnobserved`, or another operation to raise again.
-- Otherwise, a report made on the process main thread during an operation's
-  native call belongs to that operation. The operation takes it after the call
-  returns and fails with a `NativeFailure` naming whether the call itself
-  failed.
-- Any other report is asynchronous. It is never attributed to whichever
-  operation is running when it is observed. `takeAsynchronousReports` reads it.
-  A report whose wake mark could not be read, or that names a call whose bucket
-  has closed, cannot be attributed and is counted here as a callback fault.
+  belongs to that wake call (a thread-local mark set around the post). Each
+  call has its own bucket.
+- Otherwise a report made on the process main thread during an operation's
+  native call belongs to that operation, which fails with a `NativeFailure`.
+- Any other report is asynchronous and is read by `takeAsynchronousReports`.
+  It is never attributed to whichever operation is running.
 
-Each class, and each wake call, keeps its first `errorEvidenceCapacity` reports
-and counts later ones in `reportsLost`. A lost report or a callback fault still
-counts as reported, so full storage can never turn a native failure into
-success. The same C call that posts also clears the calling thread's GLFW error
-state before the post and reads it after. If the post left an error and the call
-has no evidence at all, the wake adds a callback fault. Lost or faulted evidence
-therefore never becomes `WakePosted`, and, being unclassifiable, is raised rather
-than answered as `WakeFailed` (see [Waking the owner](#waking-the-owner)).
+Each class keeps its first `errorEvidenceCapacity` (16) reports and counts
+later ones in `reportsLost`. A lost report or callback fault still counts as
+reported, so full storage never turns a native failure into success.
 
 ### The degradation policy
 
 Command admission and demand publication reach the owner through one notifier
-per session, which pairs the session's wake capability with the session's own
-wake-path state. Every host over that session shares it, including hosts that
-borrow the session in turn; a later session has a capability and a state of its
-own and starts healthy.
+per session, shared by every host over that session.
 
-The first `WakeFailed` — an expected platform failure, with the evidence
-attributed to that call alone — degrades that session's wake path and retains
-that evidence. Every later admission and publication in the session then skips
-the native call, and the owner's finite idle wait is the bounded polling that
-keeps work moving. Nothing is retried, no ticket or slot changes, and no
-admitted work is reclassified as rejected. A concurrent second failure changes
-nothing and keeps the first call's evidence. A programming or lifetime violation
-is not degraded around: `wakeSession` raises it, it propagates to whichever
-thread was notifying, and the work that thread had already committed stays
-committed and still settles.
-
-Degradation owes exactly one guarded diagnostic attempt. The owner loop claims
-it at a safe boundary — outside transactions, callbacks, releases, and the
-[wake lifetime](#wake-lifetime)'s native exclusion — and writes one structured
-warning through the `Logger` the application injects on `LoopHooks`, under the
-`glfw.wake` component, with the retained evidence's counts and first report. Every admission and every publication registers the notification it owes in the
-very transaction that commits it, and discharges it exactly once, recording what
-the wake left and leaving the obligation together. So an obligation is visible
-from the commit — before the committing thread has run another instruction — and
-no boundary can see it go without the degradation it caused beside it. A
-transaction that rolled back, or that admitted or published nothing, registers
-none, and `hostNotificationsInFlight` reads how many are outstanding.
-
-Every turn claims the report after reconciliation, and `runOwnerLoop` claims it
-once more as it ends, however it ends, so a degradation this turn's own work
-already caused is reported without waiting for shutdown. Neither of those claims
-waits for an obligation: admission and publication are still open there, and a
-worker may keep registering obligations until supervision stops it, so waiting
-would hold back the very result that reaches the quiescence which ends them.
-
-The boundary that waits is the one where waiting is bounded, and
-`runWindowApplication` installs it: after the finite quiescence transaction has
-closed admission, publication, and every feed, and after supervision has stopped
-and drained every worker, the host waits for the obligations that remain and
-makes the one guarded attempt, with every dependency and the application's
-logger still live. No new obligation can be registered by then, so the wait ends
-and nothing can outrun the attempt, and an application needs no reporting call of
-its own. `reportHostWakeDegradation` is that same boundary for an application
-that owns a different shutdown — call it after quiescence, since its wait is
-bounded only once admission and publication have closed — and `hostWakePath`
-reads whether an attempt is still owed.
-
-No boundary runs inside a release. Each holds the sequence from the work ending
-to the attempt being claimed under a mask, so nothing can be delivered in the
-handoff between them, and each writes through the injected logger as ordinary
-interruptible work on the owner thread, so a cancellation delivered while the
-attempt is writing reaches it and is recorded as one. The waiting boundary's
-wait is interruptible too, but a cancellation there may not abandon it: an
-obligation may be inside a failing post that has not yet recorded what it found,
-so the wait is completed uninterruptibly — bounded by one empty-event post each,
-with no new obligation possible after quiescence — and the attempt is spent
-before the cancellation is re-raised as the primary failure.
-`reportHostWakeDegradation` is that same sequence, so a custom shutdown's
-boundary behaves exactly as the runner's. A failing attempt after a successful run fails the run;
-after a failing or cancelled one the original failure stays primary and the
-attempt's failure is retained beside it as cleanup evidence. A host's shutdown
-closes its own admission, never the session's wake capability, so sequential
-hosts borrowing one session keep one degradation and one report between them
-and the session stays wakeable after each of them ends.
-
-The claim is spent whatever happens: an entry the logger filters out, a sink
-failure, and a cancellation each end the attempt and are recorded, and none is
-retried. A sink failure and a cancellation propagate as themselves, as every
-logging attempt does, and neither undoes the degradation.
-
-What a failed attempt means to the runtime is settled in `runtime-glfw-core`,
-which already owns the attempt and already depends on the runtime; the notifier
-itself belongs to the `model` component and gains no runtime dependency for it.
-Every boundary above — each turn's own attempt, the loop-end claim, the runner's
-boundary after quiescence, and `reportHostWakeDegradation` — marks a synchronous
-sink failure with the runtime's `DiagnosticFailure`, keeping the exception's
-type, value, and context and adding nothing else. So a failure that leaves the
-host as the run's own is one the terminal reporting in
-[the runtime design](archive/runtime_foundation_design.md) does not write through the
-sink that just failed, and the logging lifetime does not flush through either. A
-cancellation is left exactly as it arrived, unmarked.
-
-When an application failure is already primary that mark would be a lie, since
-no diagnostic raised it: the primary stays unmarked with the warning's own
-failure retained beside it under the `glfw wake degradation report` label, and
-`runWindowApplication` and `runProtectedWindowApplication` instead record the
-failed attempt on the logging lifetime, as the same `ReportFailed` outcome that
-lifetime already keeps for a runtime-managed report. The terminal report and the
-final flush are then skipped for that reason rather than for a mark, and the
-application's failure propagates unchanged. Runtime policy is untouched by any
-of this: the host only tells the lifetime what it already found.
+- The first `WakeFailed` degrades the session's wake path and retains its
+  evidence. Later admissions and publications skip the native call, and the
+  owner's finite idle wait is the bounded polling that keeps work moving.
+  Nothing is retried and no admitted work is reclassified.
+- A programming or lifetime violation is not degraded around: it propagates to
+  the notifying thread, and work that thread already committed still settles.
+- Every admission and publication registers the notification it owes in the
+  transaction that commits it and discharges it exactly once.
+  `hostNotificationsInFlight` reads how many are outstanding.
+- Degradation owes exactly one guarded diagnostic attempt: one structured
+  warning under `glfw.wake` through the logger injected on the loop hooks,
+  written on the owner thread outside transactions, callbacks and releases.
+  Each turn claims it after reconciliation and the loop claims it as it ends.
+  `runWindowApplication` waits for outstanding obligations after quiescence
+  and worker drain, then makes the attempt; `reportHostWakeDegradation` is the
+  same boundary for an application that owns its own shutdown.
+- The claim is spent whatever happens. A filtered entry, a sink failure and a
+  cancellation each end the attempt and none is retried.
+- A sink failure that becomes the run's own failure is marked with the
+  runtime's `DiagnosticFailure`. When an application failure is already
+  primary it stays unmarked, the warning's failure is retained beside it under
+  `glfw wake degradation report`, and the logging lifetime records the failed
+  attempt so the terminal report and final flush skip the failed sink.
 
 ## Teardown, poisoning, and controlled blocking
 
-The composite declares its release order:
+Release order of the session composite:
 
 | Release | What it does |
 |---|---|
-| `glfw wake gate` | Closes the wake gate to new calls, then waits uninterruptibly until every admitted wake call has returned from its native call and left. No native call. |
-| `glfw monitor inventory` | Ends every monitor identity, publishes the last descriptions as the `InventoryClosed` inventory, and closes the snapshot, in one transaction. No native call. |
-| `glfw monitor callback` | Takes any monitor callback fault latched since the last boundary, detaches the callback, then raises any report made during that call, and then the fault |
-| `glfw terminate` | Marks the session ended, calls `glfwTerminate`, then raises any report made during that call |
-| `glfw error callback` | Detaches the callback, frees its storage only if teardown has been safe so far, then raises any asynchronous report nobody read as `AsynchronousErrorsUnobserved` |
-| `glfw monitor callback storage` | Frees the monitor callback's storage, after the session's last native call, only if teardown has been safe so far |
-| `glfw session occupancy` | Vacates the guard after a safe teardown, or poisons it |
+| `glfw wake gate` | Closes the gate, then waits uninterruptibly for admitted wakes to leave. No native call. |
+| `glfw monitor inventory` | Ends every monitor identity, publishes the `InventoryClosed` inventory and closes the snapshot in one transaction. |
+| `glfw monitor callback` | Takes any latched callback fault, detaches the callback, raises any report from that call, then the fault. |
+| `glfw terminate` | Marks the session ended, calls `glfwTerminate`, raises any report from that call. |
+| `glfw error callback` | Detaches the callback, frees its storage only if teardown has been safe, raises unread asynchronous reports as `AsynchronousErrorsUnobserved`. |
+| `glfw monitor callback storage` | Freed after the last native call, only if teardown has been safe. |
+| `glfw session occupancy` | Vacates the guard after a safe teardown, or poisons it. |
 
-A release-time native error is checked after the native call returns, without
-logging or pumping events. It is retained through
-[the failure table](resources.md#the-failure-table): beside a failing body as a
-labelled cleanup failure, or as the scope's own failure after a successful body.
-It does not poison.
+A release-time native error is retained through
+[the failure table](resources.md#the-failure-table) and does not poison.
 
 Poisoning is the answer when teardown cannot establish that native ownership
-and callback registration ended safely. That is the case when termination or
-detaching either callback raises instead of returning, when initialization or attachment raises
-with the native state unknown, or when a release runs on a thread other than
-the owner. The callback storages are then deliberately leaked rather than freed
-while they might still be called. The guard stays occupied-and-poisoned, so every
-later entry fails with `SessionPoisoned` before any native call.
+and callback registration ended safely: termination or a detach raises instead
+of returning, initialization or attachment raises with native state unknown,
+or a release runs off the owner thread. Callback storage is then leaked rather
+than freed, and every later entry fails with `SessionPoisoned` before any
+native call.
 
-The storage is safe to free after a normal detach because of the owner-thread
-rules. This package makes every GLFW call on the owner thread, and GLFW reports
-errors from inside the failing call. Once the owner has detached the callback,
-GLFW can no longer invoke it.
-
-These releases satisfy [what a release may do](resources.md#what-a-release-may-do).
-Each native call is a bounded GLFW call on the owner thread that waits for no
-other thread and no event, and the bookkeeping is a non-blocking atomic `IORef`
-update. The wake gate's wait is the one wait on another thread, and it is
-bounded: it waits only for calls already admitted, each making one empty-event
-post and non-blocking bookkeeping, and no new call can be admitted once it has
-begun. No release contains a queue, fence, device wait, or logger. Closing the
-gate never changes teardown safety. A session whose teardown was otherwise safe
-is not poisoned by it, including when the owner is cancelled while the wait
-runs.
+Every release is a bounded GLFW call on the owner thread or non-blocking
+bookkeeping; the wake gate's wait is the one wait on another thread and is
+bounded by calls already admitted. No release contains a queue, fence, device
+wait or logger.
 
 ## The binding
 
-Only the operations the models use are bound: `glfwPlatformSupported`,
-`glfwSetErrorCallback`, `glfwInitHint`, `glfwInit`, `glfwGetPlatform`,
-`glfwTerminate`, `glfwSetMonitorCallback`, `glfwGetMonitors`,
-`glfwGetPrimaryMonitor`, `glfwGetMonitorName`, `glfwGetMonitorPos`,
-`glfwGetMonitorWorkarea`, `glfwGetMonitorPhysicalSize`,
-`glfwGetMonitorContentScale`, `glfwGetVideoMode`, `glfwGetVideoModes`,
-`glfwDefaultWindowHints`, `glfwWindowHint`, `glfwCreateWindow`,
-`glfwDestroyWindow`, `glfwGetWindowSize`, `glfwGetFramebufferSize`,
-`glfwGetWindowContentScale`, `glfwGetWindowPos`, `glfwGetWindowAttrib`, and the
-size, framebuffer size, content scale, position, focus, iconify, maximize,
-refresh, close, key, character, mouse button, cursor position, cursor enter,
-and scroll callback setters, the owner loop's `glfwPollEvents` and
-`glfwWaitEventsTimeout`, and the wake capability's `glfwPostEmptyEvent` with
-`glfwGetError`. `glfwSetWindowSize` is called for the native examples only, as
-is the progress note's own `glfwPostEmptyEvent`; no production path calls
-them. The native
-examples also invoke the registered input trampolines through
-`hetoimasia_glfw_inject_*_for_check`.
-
-- Imports go through `native/cbits/hetoimasia_glfw.h`, which includes the
-  installed `GLFW/glfw3.h` with `GLFW_INCLUDE_NONE`. The C compiler therefore
-  checks each CAPI declaration, and every constant comes from the header. The
-  exceptions are `glfwSetErrorCallback` and `glfwSetMonitorCallback`, `ccall`
-  imports, because CAPI cannot spell their function-pointer types.
-- `glfwGetMonitors`, `glfwGetMonitorName`, `glfwGetVideoMode`, and
-  `glfwGetVideoModes` are reached through shim accessors
-  (`hetoimasia_glfw_monitors` and its siblings) that only restate GLFW's `const`
-  return types as the generated wrappers declare them, keeping the C build
-  warning-clean. Each video mode is copied field by field through
-  `hetoimasia_glfw_video_mode_at`, which reads the header's own `GLFWvidmode`, so
-  no structure layout is assumed. Every array and string GLFW returns is copied
-  before the operation returns, and a negative count, or a positive count
-  beside a null array, is reported as inconsistent rather than read.
-- Every GLFW import is `safe`. Any of them may re-enter Haskell through the
-  error callback, and a safe call lets other Haskell threads run while it is in
-  C. The thread-identity and wake-mark shims call nothing and are `unsafe`.
-- The production wake is made through the shim's
-  `hetoimasia_glfw_post_empty_event`, a `safe` import callable from any thread.
-  In one C call on the calling OS thread it clears that thread's GLFW error
-  state with `glfwGetError`, sets the call's wake mark in C11 thread-local
-  storage, calls `glfwPostEmptyEvent`, clears the mark, and returns the code
-  `glfwGetError` then reads. The error callback reads the mark through the
-  `unsafe` `hetoimasia_glfw_current_wake_mark`. The shim also counts calls that
-  entered and returned from the post, and records the sequence number of the
-  wait in progress as it posts. Only the native examples read these records,
-  through `wakeCountsForCheck` and `takeLastWaitForCheck`.
-- The production finite wait is made through the shim's
-  `hetoimasia_glfw_wait_events_timeout`, a `safe` import that records the
-  waiting OS thread and gives each wait an odd sequence number, then calls
-  `glfwWaitEventsTimeout`. That observation is the shim's only state, and no
-  production path reads it: the native examples' progress note lands only when
-  the same wait's sequence number surrounds a kernel report that the waiting
-  thread is blocked — `TH_STATE_WAITING` on macOS, state `S` in
-  `/proc/self/task/<tid>/stat` on Linux — so it lands only inside GLFW's own
-  wait. `blockedWaitForCheck` makes the same observation and posts nothing, so
-  the wake examples can prove a wait was blocked without a test wake that would
-  confound the production one. As each wait returns, the shim records its
-  sequence number and whether a production wake named it. The shim holds no
+- Only the operations the models use are bound. Imports go through
+  `native/cbits/hetoimasia_glfw.h`, which includes the installed
+  `GLFW/glfw3.h`, so the C compiler checks each CAPI declaration and every
+  constant comes from the header. Callback setters are `ccall` imports because
+  CAPI cannot spell their function-pointer types.
+- Every GLFW import is `safe`: any may re-enter Haskell through the error
+  callback. The thread-identity and wake-mark shims call nothing and are
+  `unsafe`.
+- Every array and string GLFW returns is copied before the operation returns.
+  A negative count, or a positive count beside a null array, is reported as
+  inconsistent rather than read. No structure layout is assumed.
+- The shim holds the `glfwInit` wrapper, the wake post (clear error, set mark,
+  post, clear mark, read error, in one C call), the finite wait with the
+  observation the native examples read, and the Wayland probe. It holds no
   queue or game logic.
-- The Wayland connection-status probe of
-  [Wayland connection loss](#wayland-connection-loss) is production code in the
-  shim, `hetoimasia_glfw_wayland_probe_resolve` and
-  `hetoimasia_glfw_wayland_connection_status`, both `safe` imports because each
-  calls GLFW. They answer only ints — a status, a reason, and an `errno` — so
-  the display pointer and its descriptor never leave C. `glfwGetWaylandDisplay`
-  is declared there with an incomplete `struct wl_display`, as GLFW's own
-  header declares it, so the shim includes no Wayland client header; it is
-  called only after `glfwGetPlatform`, which reports no error, answers Wayland.
-  Only Linux carries a working probe; Cocoa and any other platform answer
-  unavailable.
-
-The window callback setters are `ccall` imports for the same reason. Each
-callback wrapper only drops the window pointer and calls the model's callback,
-which is already contained.
 
 ## Monitors
 
-`Hetoimasia.GLFW.Monitor` publishes the monitor inventory the session owns. Its
-model is `Hetoimasia.GLFW.Internal.Monitor`; the session performs its stages and
-wraps every operation in the owner-thread and liveness checks.
+The session constructs the monitor inventory at entry and ends it at teardown.
+A `MonitorInventory` is immutable, prepared to normal form, and published
+through a [latest-value snapshot](messaging.md#latest-value-snapshots) with a
+revision, a phase, and each connected monitor as a copied description (name,
+primary, position, work area, physical size, content scale, current mode and
+video modes), in GLFW's enumeration order.
 
-### Inventory ownership
+- Any thread may read `monitorInventory` (the host lends it as
+  `hostMonitors`). Only the owner refreshes: `synchronizeMonitors` always,
+  `resolveMonitor` before it answers, and the owner loop after native events
+  when the monitor callback captured a change.
+- A refresh publishes a new revision only when a description or identity
+  changed. GLFW's callback reports connection changes only, so a changed work
+  area, scale or mode on a connected monitor appears at the next
+  `synchronizeMonitors`.
+- An empty list is an ordinary observation. The primary designation is an
+  attribute; nothing selects a primary or assumes it sits at the origin.
 
-The session constructs the inventory at entry and ends it at teardown. A
-`MonitorInventory` is immutable and prepared to normal form before it is
-published through a [latest-value snapshot](messaging.md#latest-value-snapshots).
-It carries a revision equal to the snapshot's, a phase, and every connected
-monitor as a copied `MonitorDescription`, in the order GLFW enumerated them:
+**Identity.** A `MonitorId` is the session's identity plus a local number the
+session never reissues, issued once per connection. The native address is kept
+only as a comparison token between boundaries, never turned back into a
+pointer. At a refresh: a captured connection or disconnection ends the
+identity at that address (so a reconnect at the same address gets a fresh
+identity); a lost change ends every identity; an identity whose address is no
+longer enumerated ends. An ended identity, or one from another session, never
+resolves. `resolveMonitor` answers `MonitorAvailable` with a fresh description
+or `MonitorDisconnected` before any native operation targets the monitor.
 
-| Attribute | Source |
-|---|---|
-| Identity | Issued by the session, per connection |
-| Name | `glfwGetMonitorName` |
-| Primary | Whether `glfwGetPrimaryMonitor` names this monitor |
-| Position | `glfwGetMonitorPos`; desktop screen coordinates, negative or nonzero as reported |
-| Work area | `glfwGetMonitorWorkarea` |
-| Physical size | `glfwGetMonitorPhysicalSize`; millimetres |
-| Content scale | `glfwGetMonitorContentScale` |
-| Current mode, video modes | `glfwGetVideoMode`, `glfwGetVideoModes` |
+**Validation.** Every native number is checked before it becomes an observed
+value. An inconsistent report (bad count, null or repeated monitor, null name,
+negative work area, non-positive physical size, non-finite or non-positive
+scale, invalid mode) becomes `Unavailable`, never a fabricated value. A query
+that reports only `GLFW_FEATURE_UNAVAILABLE` is `Unavailable`; any other
+report fails the boundary with `NativeFailure` under `sample monitors`.
 
-An empty list is an ordinary observation of a desktop with no monitor. Any
-thread may read `monitorInventory`, and the window host lends the same endpoint
-as `hostMonitors`. Only the owner thread refreshes: `synchronizeMonitors` always
-does, `resolveMonitor` does before it answers, and the host's
-[owner loop](#the-owner-turn) does after native events whenever the monitor
-callback captured a change. A refresh enumerates the monitors, queries each, and
-publishes a new revision only when a description or an identity changed. GLFW's
-monitor callback reports connection changes only, so a change of work area,
-content scale, or mode on a monitor that stays connected appears at the next
-`synchronizeMonitors`. Nothing selects or assumes a primary monitor: the
-platform's designation is an attribute, and nothing assumes it starts at the
-desktop origin.
+**Callback.** The monitor callback runs uninterruptibly, records the address
+and event code into a latch of at most 64 changes with one non-blocking
+update, and returns. An overflow, an undefined event code or a callback fault
+is a lost change: the next refresh ends every identity, and a fault is
+rethrown after that refresh commits. A refresh clears what it folded only in
+the masked commit that publishes; a failure before the commit leaves every
+capture latched.
 
-### Identity lifetime
+**Completion.** When the session ends, every identity ends and the last
+descriptions are published as the `InventoryClosed` inventory in the
+transaction that closes the snapshot.
 
-A `MonitorId` is the session's identity and a local number starting at one that
-the session never reissues, issued once per connection. Between boundaries the
-session keeps each connection's native monitor address beside its identity as a
-private correlation token. A token is only compared; it is never turned back into
-a pointer, and no pointer is retained between owner boundaries. At a refresh:
-
-- a captured connection or disconnection for an address ends the identity that
-  address held, so a monitor disconnected and reconnected at the same address
-  before one boundary still receives a fresh identity, even though the final
-  enumeration is unchanged;
-- a lost change ends every identity, because which connection it concerned is
-  unknown (see [Callback containment](#callback-containment));
-- every enumerated monitor whose address still holds an identity keeps it,
-  wherever the enumeration now lists it, and every other one receives a fresh
-  identity;
-- an identity whose address is no longer enumerated ends.
-
-An ended identity never resolves again. An identity from another session —
-including a completed earlier session whose local numbers and native addresses
-repeat — never resolves either, because the session identity differs. A copied
-description stays readable, with its identity, after that identity ends.
-
-`resolveMonitor` re-resolves an identity at an owner boundary: it refreshes,
-which enumerates the monitors GLFW reports at that moment, and answers
-`MonitorAvailable` with the fresh description, or `MonitorDisconnected` before any
-native operation targets that monitor. Operations that need a live monitor, such
-as the mode transitions still to come, use the model's private
-`withResolvedMonitor`, which lends the pointer that same enumeration returned to
-one native step and keeps nothing.
-
-### Validation
-
-Every native number is checked before it becomes an observed value, and an
-inconsistent report becomes `Unavailable` rather than a fabricated value:
-
-| Report | Observation |
-|---|---|
-| An enumeration with an inconsistent count, a null monitor, or a repeated monitor | The inventory's monitors are `Unavailable`, and every identity ends |
-| A primary monitor that is not among those enumerated | Every monitor's primary attribute is `Unavailable`; no designated primary is `False` |
-| A null name | `Unavailable` |
-| A negative work area width or height | `Unavailable` |
-| A zero or negative physical width or height, as GLFW reports an unknown size | `Unavailable` |
-| A non-finite or non-positive content scale on either axis | `Unavailable`, checked before conversion |
-| A null current mode, or a mode with a non-positive width or height | `Unavailable` |
-| A video mode list with an inconsistent count, or holding an invalid mode | `Unavailable` |
-| A negative bit depth, or a zero or negative refresh rate | `Unavailable` within that mode |
-
-As for windows, a query that reports only `GLFW_FEATURE_UNAVAILABLE` is
-`Unavailable`, and any other report fails the boundary with `NativeFailure`
-under `sample monitors`.
-
-### Callback containment
-
-The monitor callback is a protected resource of the session. It runs
-uninterruptibly, copies the monitor's address and the event code, records them
-into the session's capture latch with one non-blocking `IORef` update, and
-returns. It calls no application code and no native function, waits for
-nothing, and lets no Haskell exception unwind into C. The latch keeps at most 64
-changes between boundaries. A change beyond that, an event code GLFW does not
-define, or a fault in the callback is a lost change: it is never dropped
-silently, and the next refresh ends every identity before any further monitor
-use. A fault is also latched with its context and rethrown, once that refresh
-has committed, with the `monitor callback` operation and the `callback` and
-`later-faults` identifiers.
-
-A refresh reads the latch without clearing it and clears what it folded only in
-the masked commit that publishes, and only if the callback recorded nothing
-since the read; otherwise it starts again. A cancellation or failure before the
-commit leaves every capture latched and the inventory unchanged.
-
-The callback's storage stays valid through the session's last native call. At
-teardown the inventory closes first; the callback is then detached before
-termination, taking any fault latched since the last boundary so no detach
-outcome can abandon it — raised on its own after a detach that succeeded, and
-retained as a `glfw monitor callback fault` cleanup failure beside one that
-failed — and its storage is freed after the error callback's detach, only if
-teardown stayed safe. A detach that raises, or runs off the owner thread, keeps
-the storage and poisons the guard, as for the error callback.
-
-### Session completion
-
-When the session ends, every identity ends, the last descriptions are published
-as the `InventoryClosed` inventory with the next revision, and the snapshot is
-closed in the same transaction, so waiting readers wake, receive that
-observation, and then `EndOfStream`. The closed inventory stays readable for as
-long as a reader holds the endpoint.
-
-### Platform restrictions
-
-- Monitors are observed on X11 and Cocoa, the backends a session selects.
-- GLFW 3.4 on X11 enumerates connected RandR outputs with active CRTCs, falling
-  back to one monitor for the screen when RandR is unusable. RandR 1.5 virtual
-  monitor objects are not GLFW monitors, so `xrandr --setmonitor` does not add
-  one. The isolated Xvfb display in CI exposes exactly one 1280 by 1024 monitor
-  at the origin and cannot simulate hotplug or a multi-monitor topology.
-- Empty inventories, several monitors at negative and nonzero origins,
-  disconnects, reconnects at a reused address, stale resolution, inconsistent
-  numbers, and lost changes are therefore proven by the CPU examples; real
-  attach and detach is local interactive evidence (see
-  [The native suite](#the-native-suite)).
-- A monitor's physical size may be unknown, which GLFW reports as zero, and a
-  refresh rate may be unknown; both are `Unavailable`.
+**Platforms.** On X11, GLFW enumerates connected RandR outputs with active
+CRTCs. Hotplug and multi-monitor topologies are covered by the headless
+examples; real attach and detach is local interactive evidence.
 
 ## Windows
 
-`allocWindow` creates a window as a lexical scoped resource, for the rest of the
-enclosing `withScoped` scope, and `withWindow` is that scope on its own. Any
-number may be live in one session. The window host creates windows dynamically
-and closes them in any order as members of a
-[scoped collection](resources.md#scoped-resource-collections), acquiring each
-from the same `Assembly` as one member; there is no second acquisition or cleanup
-path. See [Dynamic windows](#dynamic-windows).
+`allocWindow` creates a window as a scoped resource of the enclosing scope;
+any number may be live in one session. The window host creates and closes
+windows dynamically as members of a
+[scoped collection](resources.md#scoped-resource-collections), through the
+same assembly ([Dynamic windows](#dynamic-windows)).
 
-### Owner, thread, and lifetime
-
-The owner is the session's owner, the process main thread. Creation,
-`synchronizeWindow`, and every release run there and check, before any native
-call, that they do (`NotSessionOwner`) and that the session is live
-(`SessionEnded`). A window lives until its enclosing scope ends, which must be
-inside the session's. Its handle turns terminal as the first step of release,
-after every borrowing scope has ended: `windowEnded` answers `True`, and
-`synchronizeWindow` answers `WindowEnded` without a native call. The session
-survives a window's release and can create another window.
-
-A `WindowId` is the session's identity and a local number starting at one that
-the session never reissues, even for a creation that failed. A later window
-never answers to an ended handle.
+**Owner and lifetime.** Creation, `synchronizeWindow` and every release run on
+the session's owner thread and check that first. A window's scope must be
+inside the session's. Its handle turns terminal as the first step of release:
+`windowEnded` answers `True` and `synchronizeWindow` answers `WindowEnded`
+without a native call. A `WindowId` is the session's identity plus a local
+number the session never reissues, even for a failed creation.
 
 ### Creation
 
-`allocWindow` constructs the window as a staged composite. In order:
+A staged composite, in order:
 
-1. **Validation.** Both dimensions must lie in `1 .. 2147483647` and the title
-   must contain no NUL, or creation is `WindowConfigRejected` before any
-   conversion to C or native call. `validateWindowConfig` is the same check.
-2. **Owner.** The owner thread and liveness are checked. A session whose
-   teardown safety has been lost refuses with `SessionPoisoned`, the answer its
-   next entry would give. The local identity is issued.
-3. **Callback storage.** One wrapper per callback is allocated.
-4. **Native window.** Every hint is reset with `glfwDefaultWindowHints`, then
-   `GLFW_CLIENT_API = GLFW_NO_API`, `GLFW_VISIBLE`, `GLFW_FOCUSED`, and
-   `GLFW_FOCUS_ON_SHOW` are set explicitly from the configuration, so one
-   window's configuration cannot leak into the next. When `glfwCreateWindow`
-   returns a live pointer, its destruction is registered before any report
-   from the same call is raised.
-5. **Callbacks.** The callbacks' detach is registered, and then every callback
-   is attached. An attachment that reports an error, raises part-way, or is
-   interrupted is therefore detached before the window is destroyed.
-6. **Initial observation.** Every attribute is sampled at that owner boundary,
-   reconciled with anything captured since attachment, prepared, and published
-   as revision zero of a fresh snapshot.
+1. **Validation.** Both dimensions in `1 .. 2147483647` and no NUL in the
+   title, or `WindowConfigRejected` before any native call.
+2. **Owner.** Thread and liveness are checked; a session whose teardown safety
+   was lost refuses with `SessionPoisoned`. The identity is issued.
+3. **Callback storage.** One wrapper per callback.
+4. **Native window.** Hints are reset, then `GLFW_CLIENT_API = GLFW_NO_API`
+   and the visibility and focus hints are set from the configuration, so one
+   window's configuration cannot leak into the next. Destruction is registered
+   before any report from the creating call is raised.
+5. **Callbacks.** Their detach is registered, then each is attached.
+6. **Initial observation.** Every attribute is sampled, reconciled with
+   anything captured since attachment, and published as revision zero.
 
-A failure at any stage releases exactly what the earlier stages acquired, in the
-release order below, with the triggering failure primary.
-`hiddenTestWindowConfig` is hidden, unfocused, and not focused on show;
-`defaultWindowConfig` is shown and focused.
+A failure at any stage releases exactly what earlier stages acquired, with the
+triggering failure primary.
 
 ### Observations
 
-A `WindowObservation` is immutable and prepared to normal form in producer `IO`
-before it is published through the window's
-[latest-value snapshot](messaging.md#latest-value-snapshots). It carries the
-window's identity, a revision equal to the snapshot's, a phase, and the
-attributes:
+A `WindowObservation` is immutable, prepared to normal form, and published
+through the window's [latest-value snapshot](messaging.md#latest-value-snapshots).
+It carries the identity, a revision equal to the snapshot's, a phase, and:
 
 | Attribute | Source |
 |---|---|
-| Logical extent | `glfwGetWindowSize`, size callback; screen coordinates |
-| Framebuffer extent | `glfwGetFramebufferSize`, framebuffer size callback; pixels |
-| Content scale | `glfwGetWindowContentScale`, content scale callback |
-| Placement | `glfwGetWindowPos`, position callback; desktop screen coordinates |
-| Focused, iconified, maximized | `glfwGetWindowAttrib`, their callbacks |
-| Visible | `glfwGetWindowAttrib`; sampled only, and re-read after an iconify transition ([below](#visible-after-an-iconify-transition)) |
+| Logical extent, framebuffer extent, content scale, placement | getter and callback |
+| Focused, iconified, maximized | `glfwGetWindowAttrib` and callbacks |
+| Visible | sampled only (no callback) |
+| Decorated, fullscreen monitor | sampled; the mode record is derived from them |
 | Close request | close callback |
-| Cursor position | cursor position callback; coalesced, never sampled |
-| Cursor inside | cursor enter/leave callback; coalesced |
+| Cursor position, cursor inside | callbacks, coalesced, never sampled |
 
-Observed fields hold only sampled or called-back values, never the requested
-configuration; a sampled value may of course equal the request. Each query is
-bracketed by the error capture. A query that reports only
-`GLFW_FEATURE_UNAVAILABLE` is `Unavailable` rather than a fabricated value, and
-any other report fails the boundary with `NativeFailure`. A zero framebuffer
-extent, as an iconified window reports, is an ordinary nondrawable observation.
-
-Getters sampled together are an engine observation, not an atomic snapshot of
-the OS. Geometry and attributes coalesce to their latest values; a snapshot
-preserves no event history.
+- Observed fields hold only sampled or called-back values, never the requested
+  configuration.
+- A query that reports only `GLFW_FEATURE_UNAVAILABLE` is `Unavailable`; any
+  other report fails the boundary with `NativeFailure`.
+- A zero framebuffer extent is an ordinary nondrawable observation.
+- Getters sampled together are an engine observation, not an atomic snapshot
+  of the OS, and a snapshot keeps no event history.
 
 #### Visible after an iconify transition
 
-Visible has no GLFW callback, so the observation holds it only from a sample,
-and the samples are the window's construction, the post-call sample of a
-control, `synchronizeWindow` (and so `observeWindowCommand`), a mode attempt,
-the owner turn's mode recovery when it resamples an indeterminate applied mode
-or a lost monitor, and the follow-up described here. On Cocoa a restore
-completes asynchronously: the restore control's own sample can read
-iconified `True` and visible `False`, and `windowDidDeminiaturize` then reports
-the restore through the iconify callback, which only records into the capture
-latch. Nothing would read visible again, and
-[eligibility](#render-demand), which reads `Observed False` for visible as
-suspended, would keep the restored window undrawn (#581). The iconify
-callback therefore starts a follow-up of the visible attribute. It is owned by
-the window, written only on the owner thread, and runs identically for a
-restore made by `restoreWindowCommand` and one made by the user or the
-platform:
+Visible has no callback. On Cocoa a restore completes asynchronously, so the
+restore's own sample can read visible `False`, and nothing would read it
+again; [eligibility](#render-demand) would then keep the restored window
+undrawn. An iconify callback that reports a restore therefore starts a
+follow-up, owned by the window and run on the owner thread:
 
-- **Trigger.** An iconify transition: the callback's capture, folded at
-  whichever owner boundary consumes it (the turn's mode reconciliation can do
-  so before `reconcileWindowEvents`). A callback that iconifies the window
-  stops the follow-up; one that restores it starts the *quick phase* afresh.
-- **Quick re-reads.** On each following owner turn, after the turn's captures
-  are reconciled, visible is re-read once, until a read reports `Observed True`
-  or `visibleQuickReads` reads are spent. The bound is **eight reads**, one per
-  owner turn and never a time: on the default 0.1-second idle wait eight idle
-  turns span about 0.8 seconds, enough for a platform's restore to finish
-  reporting the window visible, while a window that really is hidden after the
-  restore costs at most eight native reads before the slow phase takes over.
-  Turns that find events pending are faster than idle ones, so the bound is
-  not a duration; recovery does not depend on it.
-- **Slow re-check.** A window still `Observed False` for visible after the
-  quick bound is re-read on the first owner turn whose `hostClock` reading is
-  at least one `hostIdleWait` after its previous re-read, for as long as it
-  stays open, not iconified, and suspended on that reading. It is at most one
-  re-read per window per turn, and it never shortens the loop's wait. While the
-  owner loop keeps running, a restored window is therefore recovered within
-  under two idle waits plus one turn's work after the platform reports it
-  visible: a re-read at instant `T` may read just before the change, the next
-  is allowed no earlier than `T + hostIdleWait`, and an early wake can land a
-  turn just short of it. The accepted cost is one native visibility query per
-  idle wait for each such window, including one that is genuinely hidden after
-  a restore; a window in no other state is ever re-read.
-- **Stops.** The re-reads stop when a read reports `Observed True` or the
-  field becomes `Unavailable` (which asserts nothing), when a hide control that
-  returned settles on the window, when the window is iconified again, and when
-  it begins closing or ends. The last sampled value then stands: no value is
-  forced or inferred, and a visible that reads `Observed False` genuinely stays
-  `Observed False` and suspended.
-- **Clock reads.** `runOwnerLoop` reads `hostClock` only for a window in the
-  slow phase, or one whose re-read spends the quick bound, at most once a turn
-  however many windows ask. `runScheduledOwnerLoop` still takes exactly two
-  readings a turn and reuses the post-native one. A host with no such window
-  reads exactly what it read before.
-- **Constraints.** Each re-read is one visible query, through the same
-  capability gate and error bracket as a full sample: an unavailable feature is
-  `Unavailable`, any other report fails the turn with `NativeFailure` and
-  publishes nothing, and the phase does not advance. A re-read that reads what
-  the observation already holds publishes no revision. The phase moves in the
-  same masked step as the capture clearing and the publication.
-
-Eligibility is unchanged: no rule reads native state behind the observation.
-
-The other attributes with no callback refresh as follows, and none needs the
-same guarantee. *Decorated* is the window's own flag, which GLFW changes only
-for a `glfwSetWindowAttrib` call, so only a command or a mode attempt can move
-it and every such path samples afterwards. *Monitor* is `window->monitor`,
-which GLFW changes only for `glfwSetWindowMonitor` or a monitor disconnect;
-the first is a command or mode attempt, which samples afterwards, and the
-second is the owner turn's mode recovery, which resamples. The *applied mode*
-is derived from those two and the placement at each sample, and a borderless
-window's is re-derived from the placement callback's value; a windowed or
-fullscreen mode depends on no placement, so a move cannot change it. A stale
-visible that reads `True` while the window is hidden by the platform, for
-example by an application-wide hide, only renders into an invisible window and
-suspends nothing.
+- **Quick phase.** On each following owner turn visible is re-read once, until
+  a read reports `Observed True` or eight reads are spent. The bound is a
+  count of turns, not a time.
+- **Slow phase.** A window still `Observed False` is re-read on the first turn
+  at least one `hostIdleWait` after its previous re-read, while it stays open,
+  not iconified and suspended. At most one re-read per window per turn; it
+  never shortens the loop's wait.
+- **Stops.** A read of `Observed True` or `Unavailable`, a hide control that
+  returned, another iconify, closing or ending. The last sampled value stands;
+  nothing is forced or inferred.
+- Each re-read goes through the same capability gate and error bracket as a
+  full sample, and a re-read that matches the observation publishes nothing.
 
 ### Callbacks and the reconciliation boundary
 
-The size, framebuffer size, content scale, position, focus, iconify, maximize,
-refresh, close, key, character, mouse button, cursor position, cursor enter,
-and scroll callbacks are contained at the trampoline. Each runs
-uninterruptibly, copies and forces its fixed payload, records it into the
-window's capture latch with one non-blocking `IORef` update, and returns. None
-calls application code, waits for capacity, joins a worker, polls, logs, or
-destroys a native object. Anything a callback raises is caught there with its
-context and latched rather than unwinding into C; the first is kept and later
-ones are counted. The focus callback is the one owner of focus: it coalesces
-the latest flag into the observation and stages an ordered focus event for the
-input feed. Cursor motion coalesces into the observation and the feed's cursor
-sample; it is not an input event. The latest cursor sample stays in the
-capture latch across boundaries, so a later turn's button still copies it. Key, character, button, scroll, and focus
-transitions are staged in a bounded buffer of `inputStagingCapacity` (256)
-events and are never coalesced. A button callback copies the latest cursor
-sample at that moment, so later motion does not move a click already staged.
-Overflow of that buffer sets a loss latch that remains set while the buffer is
-full. At the next owner boundary the latch is checked before any staged prefix
-is published: the ambiguous batch is discarded and the attached feed begins
-the same overflow reset a full channel would, with `unadmitted` equal to the
-discarded prefix plus every callback that arrived after the latch. Coalesced
-focus is applied in that same reset transaction, so resumption cannot reopen
-an unfocused window and the focus callback is not counted twice. A window with no feed attached discards staged input at that boundary
-without a reset. Publication of a captured batch is uninterruptible, so a
-cancellation cannot admit a prefix and drop the rest.
+Every window callback is contained at the trampoline: it runs uninterruptibly,
+copies its fixed payload into the window's capture latch with one non-blocking
+update, and returns. None calls application code, waits, logs or destroys a
+native object. Anything it raises is latched (the first kept, later ones
+counted) rather than unwinding into C.
 
-Captures are reconciled on the owner thread at an owner boundary: at creation
-after the initial sampling, at `synchronizeWindow` after it samples, and after
-any private owner step's native calls return, whether that call was a setter or
-a poll. An observation request executes through the same boundary, and so
-does the window host's [owner loop](#the-window-host-and-owner-loop), which
-reconciles every window after each poll or wait. In order, a boundary:
+- Geometry, attributes and cursor motion coalesce to their latest value.
+- Key, character, button, scroll and focus transitions are staged in a bounded
+  buffer of 256 events and never coalesced. A button copies the cursor sample
+  at that moment.
+- Overflow of the staging buffer sets a loss latch. At the next boundary the
+  ambiguous batch is discarded and the attached feed begins an overflow reset
+  ([Input feeds](#input-feeds)). A window with no feed discards staged input.
 
-1. runs its native work, taking the reports made during it;
-2. reads the capture latch without clearing it and folds it, then any fresh
+Captures are reconciled on the owner thread at an owner boundary: at creation,
+at `synchronizeWindow`, after any owner step's native calls, and after each
+poll or wait of the owner loop. A boundary:
+
+1. runs its native work and takes the reports made during it;
+2. reads the capture latch without clearing it and folds it, with any fresh
    sample, into the current observation;
-3. prepares a new revision if anything changed, or if a refresh or a close
-   request was captured, even when every attribute is unchanged;
-4. commits: clears the captures it folded, publishes the revision, and records
-   it as the owner's current observation, in one masked step with no
-   interruptible operation;
-5. takes and rethrows a latched callback fault in one masked step, with its
-   original type and context, annotated with the `window callback` operation
-   and the `window`, `callback`, and `later-faults` identifiers.
+3. prepares a new revision if anything changed, or if a refresh or close
+   request was captured;
+4. commits in one masked step: clears the folded captures, publishes the
+   revision, records it as the owner's current observation;
+5. takes and rethrows a latched callback fault, annotated with
+   `window callback`.
 
-A cancellation or failure before the commit leaves every capture, the fault
-included, latched for the next boundary, and the snapshot and owner state
-unchanged; nothing can land between the commit's three writes, so an
-observation's revision always equals its snapshot cursor's. If a callback
-recorded anything between the read and the commit, the fold starts again from
-the newer captures.
-
-An asynchronous exception is rethrown unannotated, so cancellation stays
-cancellation. If the native work itself fails, its failure propagates and the
-captures and fault stay latched for the next boundary. Preparation runs outside
-the trampoline and outside `STM`.
+A cancellation or failure before the commit leaves every capture and fault
+latched and the snapshot unchanged. An observation's revision always equals
+its snapshot cursor's.
 
 ### Close requests
 
-A native close request never destroys the window and never exits the process.
-It is latched and reconciled into `observedCloseRequest` as a `CloseRequest`
-naming the window and a number issued in increasing order per window; several
-requests before one boundary coalesce into the newest. The model's private
-rejection transition clears a request only while it is still the latest, so
-rejecting an older request never erases a newer one. What a request means is the
-application's decision: the window host
-[surfaces it to application policy](#close-requests-in-the-owner-loop), which may
-reject it or honour it by beginning that window's close protocol. There is no
-default close policy, and no request closes a window by itself.
+A native close request never destroys the window or exits the process. It is
+latched and reconciled into `observedCloseRequest` as a `CloseRequest` naming
+the window and an increasing per-window number; several before one boundary
+coalesce into the newest. Rejection clears a request only while it is still
+the latest. What a request means is application policy
+([Close requests in the owner loop](#close-requests-in-the-owner-loop)).
 
-#### Driving one in the native examples
-
-`requestCloseForCheck` and `sizeLimitsForCheck` exist for
-[the native suite](#the-native-suite) alone. Each reaches its window through
-the Cocoa or X11 handle GLFW exposes — `performClose:`, a `WM_DELETE_WINDOW`
-client message, `contentMinSize`/`contentMaxSize`, `WM_NORMAL_HINTS` — so each
-works only on a session whose backend exposes one.
-
-On any other backend, Wayland included, both answer unavailable. They check
-`glfwGetPlatform`, which reports no error, before asking for a handle, because
-GLFW 3.4 answers `glfwGetX11Display` on another platform with
-`GLFW_PLATFORM_UNAVAILABLE` (`src/x11_window.c:3294-3297`) and the session
-would capture that report as a native failure. The answer is observable rather
-than a silent no-op: the close driver returns whether it delivered the request,
-and the size-limit reader returns `Nothing`. On X11 the close driver reports
-delivery only when `XSendEvent` itself succeeded, so a send the server refused
-is never presented as a request that was made.
-
-[The native suite](#the-native-suite) proves both on a real Wayland session:
-each driver answers unavailable, and the session's asynchronous reports are
-empty afterwards, which is what shows neither reached for an X11 handle.
-
-What is unavailable is each helper, and nothing more. Window closure is GLFW's
-own on every backend and the close protocol above is unchanged; size
-constraints are held by GLFW on every backend, and `Nothing` from the reader is
-never evidence that a window has none. A compositor-generated close request has
-not been demonstrated on Wayland through this integration, and nothing here
-claims otherwise; automating one is not attempted.
-
-`injectCloseForCheck` is the one close driver every backend has: it invokes
-the window's registered close callback through its C function pointer, so the
-model latches a close request exactly as it would a platform's. It is an
-injected request and is labelled as one wherever the Wayland examples use it —
-for the healthy-connection control and for requests left pending across a
-connection loss — and it is never evidence of a request the compositor
-generated.
-
-#### Qualifying a genuine close from another package
-
-`requestCloseForCheck` lives in the private `native` sublibrary, so a suite in another package cannot reach it.
-`Hetoimasia.GLFW.NativeCheck`, the public sublibrary `native-check` (LFE-18, #533), is the one narrow, test-only way to
-make the platform deliver a genuine close to a window the host holds:
-
-```haskell
-requestNativeClose ∷ WindowHost → WindowId → IO NativeCloseAnswer
-data NativeCloseAnswer = NativeCloseDelivered | NativeCloseUnavailable | NativeCloseWindowEnded
-```
-
-It is addressed by `WindowId` through the host and runs on the session's owner (main) thread, like every lending of a
-host window: any other thread is refused with `NotSessionOwner` before the driver is reached. `NativeCloseDelivered` means
-the platform accepted the request (Cocoa `performClose:`, an X11 `WM_DELETE_WINDOW` message that `XSendEvent` accepted);
-the window's own close callback then latches it and numbers it in the window's observations exactly as a user's close is
-numbered. `NativeCloseUnavailable` is the driver answering that this backend exposes no handle for it (Wayland), and
-`NativeCloseWindowEnded` is a window the host does not hold. It exports no native handle and no ABI declaration, only
-test suites depend on it (no production library does), and `injectCloseForCheck` is still the injected one. The boundary
-is covered in `glfw-tests` over a counting driver (the private `native-check-core` sublibrary takes the driver as an
-argument, which is why its type names the native window pointer): it reaches the driver for a held window on the owner
-thread, reports what the driver answered, and reaches it for no unserved window and from no other thread.
+Test-only drivers: `requestCloseForCheck` and `sizeLimitsForCheck` reach the
+Cocoa or X11 handle and answer unavailable on any other backend, Wayland
+included, without asking GLFW for a handle. `injectCloseForCheck` invokes the
+registered close callback on every backend and is an injected request, never
+evidence of one the platform generated. `Hetoimasia.GLFW.NativeCheck`
+(sublibrary `native-check`, test suites only) exposes `requestNativeClose` by
+`WindowId` through the host, on the owner thread.
 
 ### Release
 
 | Order | Part | Release |
 |---|---|---|
-| 1 | `glfw window callbacks` | Marks the handle terminal, takes any callback fault latched since the last boundary, detaches every callback, then raises any report made during that call |
-| 2 | `glfw window` | Destroys the native window, then raises any report made during that call |
+| 1 | `glfw window callbacks` | Marks the handle terminal, takes any latched callback fault, detaches every callback, raises any report from that call |
+| 2 | `glfw window` | Destroys the native window, raises any report from that call |
 | 3 | `glfw window callback storage` | Frees the wrappers if release stayed certain; otherwise keeps them and poisons the session |
 | 4 | `glfw window observations` | Publishes the terminal observation and closes the snapshot in one transaction |
 
-Detaching before destruction, after every borrowing scope has ended, is the
-documented order. A callback fault nobody observed is taken before the detach,
-so no detach outcome can abandon it: after a detach that succeeded it is the
-release's own failure, and beside a detach that raised or reported an error it
-is retained as a `glfw window callback fault` cleanup failure while the detach's
-failure stays primary. A release-time native error whose call returned is checked after the call,
-without logging or pumping events, and retained through
-[the failure table](resources.md#the-failure-table). After a detach, release
-stays certain. After a destroy, the window's destruction was not established,
-so release becomes uncertain, as below.
-
-Release becomes uncertain when detaching or destroying raises instead of
-returning, when destroying reports an error, when a release runs off the owner thread or after the session ended,
-or when attaching the callbacks raised during creation. Callback reachability is
-then unknown, so the wrappers are kept rather than freed beneath native code,
-the session refuses further windows with `SessionPoisoned`, keeps its own error
-callback storage, and poisons its guard when it ends.
-
-The terminal observation keeps the last observed attributes without querying the
-destroyed window, advances the revision, and names the disposal's outcome:
-`WindowReleased` when every part succeeded, `WindowDisposalFailed` when a part
-failed while release stayed certain, and `WindowReleaseUncertain` when release
-became uncertain. The phase is computed from two flags the parts set, never from
-their exceptions: nothing is formatted or logged, and the failures stay on the
-release's failure path as cleanup evidence. This happens on exceptional teardown
-as on normal teardown. Readers holding the endpoint can still read it and
-receive `EndOfStream` after it, under the snapshot contract.
+Release becomes uncertain when a detach or destroy raises instead of
+returning, when destroying reports an error, when a release runs off the owner
+thread or after the session ended, or when attaching callbacks raised during
+creation. The wrappers are then kept, the session refuses further windows with
+`SessionPoisoned`, and it poisons its guard when it ends.
 
 ### Lifecycle phases
 
 | Phase | Published | Meaning |
 |---|---|---|
-| `WindowOpen` | At creation, revision zero | Live, not closing |
-| `WindowClosing` | When an owner begins the window's close protocol, as its own revision, in the transaction that closes the window's admission | Live, callbacks attached, admission closed; not yet released |
-| `WindowReleased` | By release, as the last revision | Disposed successfully |
-| `WindowDisposalFailed` | By release, as the last revision | Disposal failed; release stayed certain |
-| `WindowReleaseUncertain` | By release, as the last revision | Disposal failed; callback reachability unknown |
+| `WindowOpen` | At creation, revision zero | Live |
+| `WindowClosing` | When an owner begins the close protocol, in the transaction that closes the window's admission | Live, callbacks attached, admission closed |
+| `WindowReleased` | By release, last revision | Disposed |
+| `WindowDisposalFailed` | By release, last revision | A part failed; release stayed certain |
+| `WindowReleaseUncertain` | By release, last revision | Callback reachability unknown |
 
-Reconciliation keeps a closing window's phase while its callbacks are still
-attached. The terminal phase is always published before the snapshot closes, so
-a reader that skipped intermediate revisions still receives the disposal's
-outcome before `EndOfStream`. A lexically scoped window never passes through
-`WindowClosing`, and neither does a window the host disposes at shutdown
-without a close protocol having begun.
+The terminal phase is always published before the snapshot closes and keeps
+the last observed attributes without querying the destroyed window. A scoped
+window, or one the host disposes at shutdown, never passes through
+`WindowClosing`.
 
 ## Window commands
 
 `Hetoimasia.GLFW.Command` admits prepared window commands through a bounded
 port, gives each admitted command a persistent completion ticket, and settles
-every one of them exactly once. It composes
-[the bounded FIFO channel](messaging.md#bounded-fifo-channels) and
-[prepared payloads](messaging.md#evaluation-guarantees) and adds the per-request
-completion both deliberately leave out. It is a window-service protocol, not
-generic request/reply machinery. The window host's
-[owner loop](#the-window-host-and-owner-loop) is its only production executor;
-the test seam's private executor drives the same protocol in CPU examples.
+each exactly once. It is built on
+[the bounded FIFO channel](messaging.md#bounded-fifo-channels). The window
+host's owner loop is its only production executor.
 
-### Owner, thread, and lifetime
-
-`newWindowCommandHost` checks, before anything else, that it runs on the
-session's owner (`NotSessionOwner`) and that the session is live
-(`SessionEnded`), then creates the host's channel, refusing a capacity
-`newChannel` refuses. The owner keeps the `WindowCommandHost`: closure,
-statistics, and direct performance. Clients receive the `WindowCommandPort`,
-which can only submit, and the tickets their submissions return; any thread may
-hold either. Neither carries a native handle, destruction authority, a channel
-endpoint, or a completion cell. Queued commands are claimed and settled only on
-the owner thread. A host lives while referenced. The window host closes its own
-command host and every window's by quiescence, before the worker drain, a
-window's also when its close protocol begins, and all of them again when it is
-released; a command host created directly is closed by its application.
+**Ownership.** `newWindowCommandHost` runs on the session's owner. The owner
+keeps the `WindowCommandHost` (closure, statistics, direct performance).
+Clients hold the `WindowCommandPort`, which can only submit, and tickets; any
+thread may hold either. Neither carries a native handle, a channel endpoint or
+a completion cell. Commands are claimed and settled only on the owner thread.
 
 ### Admission
 
-A `WindowCommand` is an immutable value: a request to observe, control, or close
-one window, or to create a window from a `WindowConfig`. Submitting it
-issues a request identity, records a `CommandOrigin` beside it — the request,
-the window it addresses if any, the submission site, and the caller's diagnostic context — and
-prepares the message to normal form on the submitting thread. A failure raised
-while preparing propagates and admits nothing. The submission site is the
-outermost call-stack frame and the whole stack, under the failure module's
-[caller attribution](failures.md#caller-attribution) policy.
-
-`submitWindowCommand` never waits. It answers `SubmitAccepted` with a ticket,
-`SubmitFull` when capacity commands are queued, or `SubmitClosed` once admission
-has ended, and `SubmitClosed` takes precedence. `awaitSubmitWindowCommand` is
-the separate wait for capacity. Cancelling it with an asynchronous exception
-admits nothing, and closure ends it with `WaitClosed`.
-
-The message and its completion cell are added in one transaction: the message
-to the channel, and the cell, keyed by request, to the host's pending map. The
-cell is never inside the message. `SubmitFull`, `SubmitClosed`, a rolled-back
-admission, and a cancellation before that transaction commits leave neither. A
-cancellation after it commits withdraws nothing: the command stays queued and
-settles even if its caller never received the ticket. Request identities are
-never reissued, even for a submission that was not admitted. They identify
-requests and do not order them; order is the order admissions committed.
-
-**The wake an admission owes.** Once the transaction has committed — through
-either operation, on the host's port or a window's own — the admission wakes the
-session's owner, so a command submitted while the owner sits in its idle native
-wait ends that wait instead of waiting for it to run out. The command is
-recorded first and the hint posted after, never the reverse. `SubmitFull`,
-`SubmitClosed`, `WaitClosed`, and a rolled-back admission wake nothing, because
-they admitted nothing.
-
-The obligation is registered in the admitting transaction itself and held from
-that commit onward, with no gap: the commit and the wake run under a mask, and
-the wake itself runs uninterruptibly, so no asynchronous exception delivered to
-the submitting thread can drop it, and every boundary can see that a wake is
-owed from the instant the command was admitted. A
-cancellation before the commit admits nothing and wakes nothing. One requested
-after it takes effect only once the wake has been posted, and the command, whose
-caller may never have received its ticket, still executes and still settles
-exactly once.
-
-The waiting operation stays cancellable under that same protection, because its
-wait for capacity blocks in a transaction and a blocked transaction is an
-interruptible operation even under a mask. A cancellation delivered while it
-waits therefore aborts it and admits nothing, and nothing interruptible
-separates the commit that ends the wait from the wake it owes. Cancelling that
-waiter exactly as capacity frees is a race with two correct outcomes, and the
-host's own bookkeeping, not the caller's answer, says which happened: either
-nothing was admitted and nothing woke, or the command was admitted and its wake
-posted, whether or not its caller lived to receive the ticket.
-
-The submission's answer and its ticket never depend on the wake's outcome. A
-wake that fails as an expected platform failure degrades the session's wake path
-under [the degradation policy](#the-degradation-policy) and leaves the ticket
-untouched; one that raises a programming or lifetime violation propagates to the
-submitter with the command still admitted. Neither turns an accepted command
-into a rejection, and neither resubmits it.
+- A `WindowCommand` is an immutable request to observe, control or close one
+  window, or to create one. Submitting issues a request identity, records a
+  `CommandOrigin` (request, window, submission site, caller context) and
+  prepares the message on the submitting thread.
+- `submitWindowCommand` never waits: `SubmitAccepted` with a ticket,
+  `SubmitFull`, or `SubmitClosed` (which takes precedence).
+  `awaitSubmitWindowCommand` waits for capacity; cancelling it admits nothing
+  and closure ends it with `WaitClosed`.
+- The message and its completion cell are added in one transaction. A
+  cancellation after that commit withdraws nothing: the command settles even
+  if its caller never received the ticket.
+- Request identities are never reissued. Order is the order admissions
+  committed.
+- A committed admission wakes the session's owner. The obligation is
+  registered in the admitting transaction, and the commit and wake run masked,
+  so no asynchronous exception can drop the wake. The submission's answer
+  never depends on the wake's outcome
+  ([the degradation policy](#the-degradation-policy)).
 
 ### Dispositions
 
 | Disposition | When | Effects |
 |---|---|---|
-| `Performed result` | The command was performed or requested from the window system | Applied; `result` was prepared before settlement |
-| `Rejected reason` | The executor serves no such window (`WindowNotServed`), the window has ended (`WindowAlreadyEnded`) or is closing (`WindowIsClosing`), a native call failed first (`WindowNativeFailure`), the executor or port cannot close or create (`CloseNotPermitted`, `CreationNotPermitted`), or a creation was refused (`WindowConfigInvalid`, `WindowCapacityReached`, `WindowCreationPoisoned`) or failed during construction with a clean rollback (`WindowCreationFailed`) | None applied; a failed construction was rolled back |
-| `Rejected (ControlRejected window reason)` | A [window control](#window-controls) was refused by its mode transition or its validation | None applied |
-| `Unsupported control` | The platform cannot perform a window control | None applied |
-| `Attempted attempt` | A window control's native calls were made | Requested from the window system; its observations report what happened |
-| `NotExecuted` | Closure settled it while it was still queued | None |
-| `Interrupted request` | Its execution, or the preparation of its completion data, raised | May have been applied; nothing is replayed or rolled back |
+| `Performed result` | Performed or requested from the window system | Applied |
+| `Rejected reason` | No such window served, window ended or closing, a native call failed first, close or creation not permitted, creation refused or failed with a clean rollback, or a control or mode refused by validation | None applied |
+| `Unsupported control` | The platform cannot perform the control | None applied |
+| `Attempted attempt` | A control's native calls were made | Its observations report what happened |
+| `Transitioned transition` | A mode request ran | See [Window modes](#window-modes) |
+| `NotExecuted` | Closure settled it while queued | None |
+| `Interrupted request` | Execution or preparing its completion data raised | May have been applied; nothing is replayed or rolled back |
 
-A settled ticket never changes, and an admitted command never disappears. A
-native failure is carried as copied data: the operation that raised it, whether
-the call itself failed, and the reported codes and descriptions. An arbitrary
-Haskell exception is never serialized into a ticket. The ticket names only the
-interrupted request, and the exception propagates from the executor with its
-own type and context. A construction whose rollback's own release failed is
-never a `WindowCreationFailed` rejection — only a clean rollback is one: the
-construction failure carries the rollback failure as retained cleanup evidence
-and propagates, settling the command as `Interrupted` and ending the loop.
+A settled ticket never changes and an admitted command never disappears. A
+native failure is carried as copied data; a Haskell exception is never put in
+a ticket and propagates from the executor with its own type and context. A
+construction whose rollback itself failed is not a rejection: it propagates,
+settles the command as `Interrupted`, and ends the loop.
 
-### The creation handoff
+**Creation handoff.** A successful creation settles as
+`Performed (WindowCreated window)`. The new window's `WindowClient` (its own
+command port, observations, input reader and control, demand publisher) is
+written beside the disposition in the settling transaction and read with
+`pollWindowClient`. It carries no native handle and no release or creation
+authority.
 
-A creation that succeeds settles as `Performed (WindowCreated window)`: ordinary
-data, prepared like every other disposition. The new window's `WindowClient` —
-its own command port and its read-only observations — is not data. It is never
-prepared and never put inside a message; it is written beside the prepared
-disposition, in the settling transaction, and `pollWindowClient` reads it from
-the ticket as often as desired once the creation has settled. The executor hands
-it over only after the window was constructed, registered with its owner, and
-published its initial observation. A `WindowClient` carries no native handle and
-no release, retirement, or creation authority. A creation interrupted before
-settlement, even after registration, settles as `Interrupted` with no
-`WindowClient`, and its window's owner still owns it.
+**Port scope.** Each host window has a private command host whose port its
+`WindowClient` carries. Its executor settles a creation as
+`CreationNotPermitted` and a command for another window as `WindowNotServed`.
+Holding one window's port grants no authority over another.
 
-### Port scope
+**Tickets.** `pollCompletion` reads without waiting; `awaitCompletion` waits
+and may be repeated; dropping a ticket cancels nothing. On the owner thread,
+waiting on an unsettled ticket or for capacity fails with
+`OwnerThreadWouldWait`. The owner uses `performWindowCommand`, the direct
+checked execution with no queue or ticket.
 
-A host created with `newWindowCommandHost` serves every command. The window host
-also gives each of its windows a private command host of its own, whose port the
-window's `WindowClient` carries. That port can submit anything, but its executor
-settles a creation as `CreationNotPermitted` and a command addressed to another
-window as `WindowNotServed`, each without executing it, and each still costs its
-dispatch attempt. Holding one window's port therefore grants no authority over
-another window and none to create one.
+**Execution.** A claim receives the command and marks it active in one
+transaction, and protection begins with the claim. If anything raises, the
+command settles as `Interrupted` before the exception is rethrown; a
+synchronous failure gains the `execute window command` context with the
+request's origin.
 
-### Tickets and waiting
+**Observation request.** `observeWindowCommand` synchronizes the addressed
+window at an owner boundary and completes with `ObservationPublished` naming
+the committed revision; publication commits before settlement.
 
-`pollCompletion` reads a ticket in `STM` without waiting, as often as desired.
-`awaitCompletion` waits for settlement and may be repeated; cancelling the wait
-affects only the wait, and dropping a ticket cancels nothing. A ticket stays
-readable after its cell has left the host's bookkeeping, and after closure.
+**Lifetime commands.** Only an executor that owns window lifetimes (the owner
+loop) performs `closeWindowCommand` and `createWindowCommand`. Others settle
+them as `CloseNotPermitted`, `WindowNotServed` or `CreationNotPermitted`.
 
-The owner thread is the only thread that executes commands, so no public
-operation waits for one there. On the owner thread, `awaitCompletion` of an
-unsettled ticket and `awaitSubmitWindowCommand` on a full host fail with
-`OwnerThreadWouldWait` instead of blocking; a settled ticket answers at once.
-The owner uses `performWindowCommand`, the direct checked execution operation.
-It checks the owner and liveness, involves no queue, cell, or ticket, answers
-`NotExecuted` after closure, and lets a Haskell exception propagate unchanged.
-
-### Execution
-
-An executor claims queued commands in the order their admissions committed. A
-claim receives the command and marks it active in one transaction, and its
-protection begins with the claim, so no interruption can separate them. The
-whole claimed lifetime is protected, including the preparation of completion
-data. If anything raises, synchronous or asynchronous, the command settles as
-`Interrupted` with its request identity before the original exception is
-rethrown with its context. A synchronous failure gains the
-`execute window command` operation context with the `request`, `window`,
-`submitted-at`, and caller-context identifiers, so crossing the queue keeps
-where the request came from while the failure's origin stays at the operation
-that raised it. An asynchronous exception is rethrown unannotated. A settlement
-never replaces a disposition already settled.
-
-The executor protocol is private to the package. Its one production caller is
-the window host's owner loop. The test seam's private executor also drives it:
-it executes queued commands against the
-seam windows it is given, can deliver an interruption immediately after the
-claim, and can replace execution with a scripted step for simulated effects or
-completion data that fails to prepare. It is a test seam, not a second
-production executor.
-
-### The observation request
-
-`observeWindowCommand` asks for an observation. Executing it synchronizes the
-addressed window at an owner boundary, which samples and publishes under the
-[observation contract](#observations). It completes with
-`ObservationPublished`, naming the revision of the committed observation that
-followed the sample: a new revision if sampling changed anything, and otherwise
-the published observation the sample matched. Publication commits before
-settlement, so a reader that sees the disposition can already read that
-revision. It never samples another window. A window the executor was not given
-is `WindowNotServed`, an ended window is `WindowAlreadyEnded` without a native
-call, and a sampling failure is `WindowNativeFailure` with nothing published.
-A callback fault rethrown at that boundary is not a sampling failure: it
-interrupts the command and propagates.
-
-`closeWindowCommand` and `createWindowCommand` change which windows exist, so
-only an executor that owns window lifetimes performs them: the window host's
-owner loop, under [Dynamic windows](#dynamic-windows). Every other executor —
-`performWindowCommand` and the test seam's, over lexically scoped windows —
-settles a close of a window it was given as `CloseNotPermitted`, a close of any
-other as `WindowNotServed`, and a creation as `CreationNotPermitted`.
-
-### Bookkeeping and closure
-
-The pending map holds one cell per queued or active command and nothing else,
-so it never holds more than the capacity plus the commands being executed.
-Settlement writes a cell and removes it in one transaction, and a cell is always
-settled before it is removed. There is no result queue and no request history.
-`commandStatistics` reads the capacity and the queued, active, and pending
-counts in one transaction.
-
-`closeWindowCommands` ends admission and, in the same transaction, settles every
-command still queued at its commit as `NotExecuted` and removes it, returning how
-many it settled. No queued command runs afterwards, every waiter on those
-tickets wakes, blocked capacity waits end with `WaitClosed`, and later
-submissions answer `SubmitClosed`. A command already claimed is active work:
-closure neither waits for it nor reports it unexecuted, and it settles through
-its execution. Closure is finite, never retries, and is idempotent. A raw
-channel close alone would keep the backlog, and a raw abort would discard it
-without settling tickets; there is no abort.
+**Closure.** `closeWindowCommands` ends admission and, in the same
+transaction, settles every queued command as `NotExecuted`. A claimed command
+settles through its execution. Closure is finite and idempotent; there is no
+abort. The pending map holds one cell per queued or active command and nothing
+else.
 
 ## Window controls
 
-The control commands of `Hetoimasia.GLFW.Command` change an existing window:
-its title; its logical size; its desktop position; its size constraints, a
-minimum and a maximum logical size with an optional aspect ratio; showing and
-hiding it; requesting input focus or the user's attention; and minimizing,
-maximizing, and restoring it. Each is a prepared, immutable `WindowCommand`
-addressed to one `WindowId`, admitted like any other command, and executed on
-the owner thread: by the window host's [owner loop](#the-window-host-and-owner-loop)
-from the host's port or the window's own, or directly by `performWindowCommand`.
-None assumes a primary window. A control's representation lives in the private
-`Hetoimasia.GLFW.Internal.Control`, and `SizeConstraints` is exported without its
-constructor or fields, so a client builds a control only through the smart
-constructors, and nothing it holds reaches a native window. The smart
-constructors accept any values: validation happens when the command executes,
-against the window's state at that moment.
+Control commands change an existing window: title, logical size, position,
+size constraints (minimum, maximum, optional aspect ratio), show, hide, focus
+and attention requests, minimize, maximize, restore. The smart constructors
+accept any values; validation happens when the command executes, against the
+window's state then.
 
 ### Execution
 
-Executing a control makes no native call until each of these has passed, in
-order:
+No native call is made until each of these has passed, in order:
 
-1. **Addressing.** The window host answers `WindowNotServed` for a window it does
-   not hold, never held or already retired, and `WindowIsClosing` for one whose
-   close protocol has begun; a lexical executor answers `WindowNotServed` for a
-   window it was not given. An ended window is `WindowAlreadyEnded`. The model
-   also answers `WindowIsClosing` for a window whose observed phase is no longer
-   `WindowOpen`.
-2. **Reconciliation.** Pending callback captures are reconciled at the owner
-   boundary, so validation reads the owner's latest observation, never one a
-   client holds.
-3. **Mode transition.** A window whose mode transition marker is set is
+1. **Addressing.** `WindowNotServed`, `WindowIsClosing` or `WindowAlreadyEnded`.
+2. **Reconciliation.** Pending captures are reconciled, so validation reads
+   the owner's latest observation, never one a client holds.
+3. **Mode transition.** A window in a transition is
    `ControlRejected ModeTransitionInProgress`.
-4. **Presentation.** An operation the window's applied presentation does not
-   admit is `ControlRejected (ControlIneligibleInMode kind)`, or
-   `ControlRejected ControlModeIndeterminate` while the applied presentation is
-   indeterminate; see [Ordinary controls by presentation](#ordinary-controls-by-presentation).
-5. **Capability.** An operation the session's `WindowCapabilities` names as
-   unperformable is `Unsupported`, with the operation and a reason.
-6. **Validation**, below, refusing with `ControlRejected` and a typed
-   `ControlRejection`.
+4. **Presentation.** `ControlIneligibleInMode` or `ControlModeIndeterminate`
+   ([by presentation](#ordinary-controls-by-presentation)).
+5. **Capability.** An operation the backend cannot perform is `Unsupported`.
+6. **Validation**, refusing with a typed `ControlRejection`.
 
-Then the control's native calls are made, each bracketed by the error capture,
-and every attribute is sampled and published as a new revision, even when
-nothing changed. Settlements from the first six steps carry no revision,
-because nothing was called or sampled. A control never changes the window's
-applied mode.
+Then the native calls are made, each bracketed by the error capture, and every
+attribute is sampled and published as a new revision even when nothing
+changed. A control never changes the applied mode or the saved placement.
 
 ### Validation
 
-| Control | Refused when | `ControlRejection` |
-|---|---|---|
-| Title | It contains a NUL, which the native UTF-8 C string would truncate | `ControlTitleRejected` |
-| Size | A dimension is outside `1 .. 2147483647` | `ControlExtentRejected` |
-| Size | The active constraints are indeterminate | `ActiveConstraintsIndeterminate` |
-| Size | It lies outside the known minimum or maximum, or does not satisfy their aspect ratio exactly: width × denominator = height × numerator, compared without overflow | `SizeOutsideConstraints` |
-| Position | A coordinate is outside the native `int` range | `ControlPlacementRejected` |
-| Constraints | A minimum or maximum dimension is outside `1 .. 2147483647` | `ConstraintBoundRejected` |
-| Constraints | The minimum exceeds the maximum in either dimension | `ConstraintBoundsInverted` |
-| Constraints | An aspect ratio term is outside `1 .. 2147483647` | `AspectRatioRejected` |
-| Constraints | The window's logical size is `Unavailable` | `CurrentSizeUnavailable` |
-| Constraints | They do not admit the window's currently observed logical size, bounds and aspect ratio alike | `ConstraintsExcludeCurrentSize` |
-| Show, hide, focus, attention, minimize, maximize, restore | Only by addressing, a mode transition, presentation, or capability | — |
+| Control | Refused when |
+|---|---|
+| Title | It contains a NUL (`ControlTitleRejected`) |
+| Size | A dimension is outside `1 .. 2147483647`; the active constraints are indeterminate; or it lies outside the known bounds or does not satisfy the aspect ratio exactly |
+| Position | A coordinate is outside the native `int` range |
+| Constraints | A bound or ratio term is out of range; minimum exceeds maximum; the current size is unavailable; or they do not admit the currently observed size |
 
-The currently observed size is the owner's latest observation, reconciled when
-the command executes. A size is checked against the window's preserved windowed
-constraints only while the native constraints follow them; while a mode
-transition has suspended them, or a suspension or restoration stopped part-way,
-every size is `ActiveConstraintsIndeterminate`. A window starts in the fully
-known unconstrained state, in
-which a size needs only to be positive and representable. A size outside the
-constraints is refused; it is never sent for the platform to clamp, and a caller
-that wants tighter constraints resizes first. Every constraint set has both a
-minimum and a maximum.
+A size outside the constraints is refused, never sent for the platform to
+clamp. A window starts unconstrained and fully known.
 
-### Outcomes and observations
+### Outcomes
 
-An attempted control settles as `Attempted` with a `ControlAttempt`:
+An attempted control settles as `Attempted`:
 
 | `attemptedOutcome` | Meaning |
 |---|---|
 | `ControlReturned` | Every native call returned without a report |
-| `ControlNativeError` | The call returned but reported errors: the native operation's name and the copied reports |
-| `ConstraintUpdateFailed` | A constraint update stopped at a call that reported errors; see below |
+| `ControlNativeError` | A call returned but reported errors |
+| `ConstraintUpdateFailed` | A constraint update stopped at a call that reported errors |
 
-None of these says the window manager honoured the request. A native call that
-raises instead of returning, or a callback fault rethrown at the boundary,
-interrupts the command, which settles `Interrupted` while the exception
-propagates from the executor.
+None says the window manager honoured the request. `PostCallRevision` names
+the revision the post-call sample published; it proves the sample followed the
+call, not that the platform converged. A sample that reports errors publishes
+nothing and is `PostCallSampleFailed`. A native call that raises, or a
+callback fault rethrown at the boundary, settles the command as `Interrupted`.
 
-`attemptedObservation` is `PostCallRevision revision`: the revision the sample
-taken after the calls published. Because a new revision is published even when
-nothing changed, the revision proves that the sample followed the call. It does
-not promise that the window manager converged or that the requested state was
-reached. A sample that reports errors publishes nothing and is
-`PostCallSampleFailed` with the copied outcome and reports. Snapshots keep only
-their latest value, so a client may find the snapshot already beyond the named
-revision, and the named revision itself is not retrievable: compare revision
-order and read the latest sampled state.
-
-Reports made on the owner thread during a control's own native call belong to
-that control, and its ticket's origin names the request, window, submission
-site, and caller context. Reports from another thread, or from outside the call,
-stay asynchronous under [the error capture](#native-error-evidence) and are never
-attributed to whichever command is executing.
-
-### Constraint updates and recovery
-
-A constraint set is validated whole before its first call and applied in the
-documented order `constraintCallOrder`: `glfwSetWindowSizeLimits` with the
-minimum and maximum, then `glfwSetWindowAspectRatio` with the ratio, or
-`GLFW_DONT_CARE` for none. The owner marks the window's constraint state
-indeterminate before the first call, stops at the first call that reports an
-error, and marks the set known only once every call has returned without a
-report.
-
-A call that reports an error settles as `ConstraintUpdateFailed`:
-`constraintsReturned` lists the calls that returned before it, in order,
-`constraintsFailed` names the call that reported, `constraintsUnattempted` lists
-the calls not made, and `constraintReports` carries the reports. With calls
-returned before the failure, it is a partial update. Nothing is rolled back, and
-nothing claims the complete set was applied or that an earlier call was undone.
-A call that raises leaves the state indeterminate as well.
-
-While the state is indeterminate, every size control is refused with
-`ActiveConstraintsIndeterminate` and no native call. A constraint update stays
-admissible, and one that completes re-establishes a fully known state, after
-which valid sizes are admitted again.
+**Constraint updates.** A set is validated whole and applied as size limits
+then aspect ratio. The owner marks the constraint state indeterminate before
+the first call and known only once every call returned without a report. A
+failure names the calls returned, the call that failed and the calls not
+attempted; nothing is rolled back. While indeterminate, every size control is
+refused with `ActiveConstraintsIndeterminate`; a constraint update that
+completes re-establishes a known state.
 
 ### Capabilities and platform restrictions
 
-`sessionWindowCapabilities`, and the window host's `hostWindowCapabilities`,
-describe what windows cannot perform or report on the session's backend, each
-with a reason, as `backendWindowCapabilities` defines:
+`sessionWindowCapabilities` and `hostWindowCapabilities` name what the backend
+cannot perform or report, each with a reason:
 
 | Backend | Cannot perform | Cannot report |
 |---|---|---|
-| X11, Cocoa | — | — |
-| Wayland | `SetPositionOperation`: no global window position; `FocusOperation`: only the compositor moves input focus; `BorderlessOperation`: no global window position to place over a monitor | `PlacementReport`: no global window position; `IconifiedReport`: no iconified state; GLFW always answers false |
+| X11, Cocoa | nothing | nothing |
+| Wayland | `SetPositionOperation`, `FocusOperation`, `BorderlessOperation` | `PlacementReport`, `IconifiedReport` |
 
 An unperformable operation is `Unsupported`. An unreportable attribute is
-always `Unavailable`: it is not queried, and its callback records nothing, so
-no position, iconified state, or other value is fabricated. A query reporting
-`GLFW_FEATURE_UNAVAILABLE` is `Unavailable` under the
-[observation contract](#observations) as before.
+always `Unavailable`: it is not queried and its callback records nothing. The
+Wayland row was audited against the pinned GLFW 3.4 source over all thirteen
+operations and eight reports, and `Test.GLFW.Control` asserts the enumeration
+so an added operation cannot go unaudited. Position (set and report) is GLFW's
+own `GLFW_FEATURE_UNAVAILABLE`. The other three are the model's conservative
+restrictions: borderless needs the global position; GLFW always answers
+iconified `false`, which is not evidence; and GLFW never moves focus itself on
+Wayland. On Wayland restore unmaximizes but cannot undo a minimize.
 
-#### The audited Wayland row
-
-The Wayland row is audited against the pinned GLFW 3.4 source
-(`tools/native/glfw.pin`), entry by entry, over the whole vocabulary: all
-thirteen `WindowOperation`s and all eight `WindowReport`s. `Test.GLFW.Control`
-asserts that enumeration, so an operation or attribute added later cannot be
-left unaudited. Each row records what the pinned backend actually does, and the
-note after the tables separates the entries GLFW itself answers unavailable
-from the ones the model restricts conservatively on the strength of that
-behaviour.
-
-| Operation | Wayland | GLFW's answer |
-|---|---|---|
-| `SetTitleOperation` | performable | `xdg_toplevel_set_title`, or libdecor's (`src/wl_window.c:2219`) |
-| `SetSizeOperation` | performable | resizes the surface; video-mode setting, which Wayland has no protocol for, is not an ordinary control (`src/wl_window.c:2259`) |
-| `SetPositionOperation` | **unperformable** | `GLFW_FEATURE_UNAVAILABLE`, "The platform does not support setting the window position" (`src/wl_window.c:2243-2249`); `glfw3.h:3466` says there is no way for an application to set it |
-| `SetConstraintsOperation` | performable | `libdecor_frame_set_min/max_content_size`, else `updateXdgSizeLimits` (`src/wl_window.c:2283`). `glfw3.h:3541`: the limits apply only once the window is next resized |
-| `ShowOperation` | performable | creates the shell objects (`src/wl_window.c:2423`). `glfw3.h:3894`: the window becomes visible at the next framebuffer update, not inside the call |
-| `HideOperation` | performable | destroys the shell objects and attaches a null buffer (`src/wl_window.c:2433`) |
-| `FocusOperation` | **unperformable** | no error, but GLFW never moves focus itself: it asks for an xdg-activation token and returns having done nothing when the compositor exposes no activation manager (`src/wl_window.c:2463-2467`). `glfw3.h:3957`: the compositor will likely ignore the request. The model refuses it rather than reporting a focus change that may never happen |
-| `AttentionOperation` | performable | commits an xdg-activation token (`src/wl_window.c:2445`). Like every performable control, what the compositor then does is its own decision, and nothing here asserts otherwise |
-| `MinimizeOperation` | performable | `xdg_toplevel_set_minimized`, or libdecor's (`src/wl_window.c:2382`). It cannot be observed afterwards — see `IconifiedReport` |
-| `MaximizeOperation` | performable | `xdg_toplevel_set_maximized`, or libdecor's (`src/wl_window.c:2413`) |
-| `RestoreOperation` | performable | unmaximizes (`src/wl_window.c:2390`). It cannot undo a minimize: `glfw3.h:3809` states that once a window is iconified `glfwRestoreWindow` will not restore it, a design decision of xdg-shell. The operation is performable because unmaximizing is what it does; the model claims nothing about un-minimizing |
-| `BorderlessOperation` | **unperformable** | placing an undecorated window over a monitor's work area needs the global position `src/wl_window.c:2243-2249` refuses |
-| `FullscreenOperation` | performable | `xdg_toplevel_set_fullscreen` on the monitor's output, or libdecor's (`src/wl_window.c:501`). `glfw3.h:4060`: the desired position is ignored, which the model does not supply |
-
-| Report | Wayland | GLFW's answer |
-|---|---|---|
-| `LogicalExtentReport` | reportable | the size GLFW tracks for the surface (`src/wl_window.c:2251`) |
-| `FramebufferExtentReport` | reportable | `wl.fbWidth`/`wl.fbHeight` (`src/wl_window.c:2338`). An observation of what the compositor gave, as on every backend |
-| `ContentScaleReport` | reportable | the fractional scale, else the integer buffer scale (`src/wl_window.c:2363`). `glfw3.h:2715` notes monitors have no fractional scale yet. An observation, not a claim about rendering |
-| `PlacementReport` | **unreportable** | `GLFW_FEATURE_UNAVAILABLE`, "The platform does not provide the window position" (`src/wl_window.c:2234-2241`); `glfw3.h:3432`, and `glfw3.h:4221` adds that the position callback is never called |
-| `FocusedReport` | reportable | whether the window holds the keyboard focus (`src/wl_window.c:2522`) |
-| `IconifiedReport` | **unreportable** | always `GLFW_FALSE` (`src/wl_window.c:2527-2532`); `glfw3.h:4098` states the protocol provides no way to check it. A false answer is not evidence, so the model reports `Unavailable` rather than "not iconified" |
-| `MaximizedReport` | reportable | `wl.maximized` (`src/wl_window.c:2539`) |
-| `VisibleReport` | reportable | `wl.visible` (`src/wl_window.c:2534`) |
-
-The audit extends the row nowhere, but the five entries it confirms are not all
-the same kind of answer, and the row does not pretend they are:
-
-- **GLFW answers `GLFW_FEATURE_UNAVAILABLE` directly** for two of them:
-  `SetPositionOperation` (`src/wl_window.c:2243-2249`) and `PlacementReport`
-  (`src/wl_window.c:2234-2241`). These are GLFW's own refusals, quoted.
-- **The model restricts three more conservatively**, from what GLFW does rather
-  than from an error it reports. `BorderlessOperation` is a model-level
-  composition: placing an undecorated window over a monitor's work area needs
-  the global position GLFW has just refused, so the composition cannot be
-  performed even though there is no `BorderlessOperation` in GLFW to refuse.
-  `IconifiedReport` is unreportable because GLFW answers `GLFW_FALSE`
-  unconditionally (`src/wl_window.c:2527-2532`); that is an answer, not an
-  error, and a false that carries no information is not evidence, so the model
-  reports `Unavailable` rather than "not iconified". `FocusOperation` is
-  unperformable because GLFW never moves focus itself on Wayland — it asks the
-  compositor for an activation token and returns having done nothing when no
-  activation manager exists (`src/wl_window.c:2463-2467`) — so reporting the
-  control as performed would assert a focus change that may never happen.
-
-Only the first kind is GLFW answering unavailable. The second is the model
-declining to claim what the pinned backend does not establish, and each of the
-three is recorded above with the GLFW behaviour it rests on. Nothing is
-inferred from the Wayland protocol itself, and no restriction is invented for
-an operation GLFW performs.
-
-The remaining `GLFW_FEATURE_UNAVAILABLE` answers of the pinned Wayland
-backend — the window icon (`src/wl_window.c:2227`), floating
-(`src/wl_window.c:2599`), opacity (`src/wl_window.c:2622`), and the cursor
-position (`src/wl_window.c:2668`) — name no `WindowOperation` or
-`WindowReport`, so none of them is recorded here.
-
-Two things this row does not claim. Content scale and framebuffer extent above
-are observations of what the compositor supplied, not measurements of anything
-rendered. And compositor suspension and native drawability are **not
-established** through this integration: the scheduler may answer
-`RenderEligible` while visibility or minimization is unknown and a usable
-framebuffer extent is present, but that is a scheduling opportunity under the
-existing policy, not proof that the window is drawable or that the compositor
-is not suspending it. See [Render demand](#render-demand); nothing here infers
-a drawable window from an unknown state.
-
-Where a control is performable, the platform still decides its result. Focus is
-a request a window manager or compositor may decline, and attention may be a
-flash or a bounce. An X11 window manager applies size, position, visibility,
-and state asynchronously, so the post-call sample may not yet show them; a later
-observation will. Cocoa's content size limits bound only the user's resizing,
-so a programmatic resize there is not clamped. A hidden window may ignore
-minimize or maximize, and the Cocoa backend shows a window it is asked to
-focus. The observations report what
-happened.
-
-### Mode transitions
-
-Each window carries a private, owner-internal mode transition marker. A mode
-transition sets it for its interval, and the seam's private
-`seamSetModeTransition` sets it in the CPU examples; no public command does.
-While it is set, every control is `ControlRejected ModeTransitionInProgress`
-with no native call, and observation and close commands are unaffected. A
-control never changes the saved windowed placement. See
-[Window modes](#window-modes).
+Where a control is performable the platform still decides its result. An X11
+window manager applies changes asynchronously, Cocoa's size limits bound only
+user resizing, and focus is a request. Compositor suspension and native
+drawability are not established through this integration.
 
 ## Window modes
 
-`Hetoimasia.GLFW.Mode` and `setWindowModeCommand` move an existing window
-between windowed presentation, borderless placement over a selected monitor's
-work area, and fullscreen on a selected monitor. The model is the private
-`Hetoimasia.GLFW.Internal.Mode`, which is pure, and the window model's
-`transitionWindow`, which executes a request on the owner thread; the session
-holds the monitor claims. None of it assumes a primary window or a primary
-monitor at the desktop origin.
+`setWindowModeCommand` moves a window between windowed presentation,
+borderless placement over a monitor's work area, and fullscreen on a monitor.
+The planner (`Hetoimasia.GLFW.Internal.Mode`) is pure; the session holds the
+monitor claims.
 
-### Requests
-
-A `ModeRequest` is a `WindowMode` and a `ModeFallback`:
-
-| Value | Built with | Meaning |
-|---|---|---|
-| `WindowMode` | `windowedMode` | Decorated, at the window's saved windowed placement |
-| | `borderlessMode monitor` | Undecorated, placed over the monitor's work area, on no monitor |
-| | `fullscreenMode monitor preference` | On the monitor, at a video mode |
-| `VideoModePreference` | `currentVideoMode` | The monitor's current mode and refresh rate |
-| | `exactVideoMode extent refresh` | A mode of exactly that size, and of that refresh rate if one is given, which the monitor reports |
-| `ModeFallback` | `noModeFallback` | Settle with the failure |
-| | `windowedFallback attempts` | After a recognized failure, return to windowed presentation at a reachable placement, at most `attempts` times, `1 .. maximumFallbackAttempts` (4) |
-| `StartupMode` | `startupMode request requirement` | A request a window transitions to during creation, `ModeRequired` or `ModeOptional` |
-
-None exports a constructor, and neither does the `ModeRecord` or the
-`SavedPlacement` a window observation carries, so a client can neither build a
-request that skips validation nor set a saved placement. Every request is
-validated when it executes, against the window and the monitors reported then.
-
-### Owner, thread, and the transition interval
-
-A request executes at an owner boundary on the session's owner thread, from the
-host's port, the window's own port, or `performWindowCommand`, like a control.
-In order:
-
-1. Pending callback captures are reconciled. A window whose close protocol has
-   begun is `WindowIsClosing`, and an ended one `WindowAlreadyEnded`.
-2. A window whose mode transition marker is set refuses with
-   `ModeRejected TransitionAlreadyInProgress`.
-3. The request's fallback budget and video mode preference are checked.
-4. The marker is set, and stays set until the transition settles.
-5. The monitor inventory is refreshed, so no decision uses a monitor a
-   disconnection has since ended, and the window is sampled, and its applied
-   mode and monitor claims are reconciled with the sample.
-6. An inert request settles at once as `ModeInert`.
-7. Otherwise the target is attempted under `Hetoimasia.Foundation.Recovery`'s
-   `recover`, with a budget of one attempt plus the fallback's attempts; see
-   [Recovery and fallback](#recovery-and-fallback).
-8. The window is sampled again, the request and its outcome are recorded in
-   the window's mode record, a new revision is published, and the command
-   settles as `Transitioned`, naming that revision.
-
-A request refused before any native call with no fallback to take, or refused
-as `MonitorBusy`, which no fallback answers, settles as
-`Rejected (ModeRejected window rejection)`, and a target the platform cannot
-perform with no fallback as `Unsupported` with `BorderlessOperation` or
-`FullscreenOperation`; neither is recorded.
-
-The transition interval is steps 4 through 8, on the owner thread. Nothing else
-executes a command inside it: the owner executes one command at a time, and
-callbacks only record. The marker therefore guards owner work re-entered from
-inside a native step. The CPU examples drive exactly that from a scripted step:
-an ordinary control there is `ModeTransitionInProgress`, another mode request
-`TransitionAlreadyInProgress`, and a command for another window is served; once
-the transition settles, the window's controls are eligible again under its new
-presentation.
-
-A native call that raises instead of returning, a callback fault rethrown at a
-boundary, a native failure a monitor refresh raises, and cancellation propagate,
-and the command settles as `Interrupted`.
-
-### Validation
-
-Before any native call, a transition or one of its attempts refuses with a
-typed `ModeRejection`:
-
-| Refused when | `ModeRejection` |
+| Value | Meaning |
 |---|---|
-| The marker is set | `TransitionAlreadyInProgress` |
-| The fallback budget is outside `1 .. 4` | `FallbackAttemptsRejected` |
-| A preferred width, height, or refresh rate is outside `1 .. 2147483647` | `VideoModeRejected` |
-| The selected monitor's identity has ended, re-resolved immediately before use | `ModeMonitorDisconnected` |
-| Another window claims the fullscreen monitor | `MonitorBusy` |
-| The monitor does not report the preferred video mode | `VideoModeUnavailable` |
-| The monitor's work area is unavailable or empty | `WorkAreaUnavailable` |
-| A placement coordinate is outside the native `int` range, or a dimension outside `1 .. 2147483647` | `PlacementUnrepresentable` |
-| There is no saved placement, or no current monitor with a nonempty work area | `NoReachablePlacement` |
-| The preserved windowed constraints do not admit the windowed placement's size, bounds and aspect ratio alike | `PlacementExcluded` |
-| A borderless or fullscreen entry, or a windowed return or fallback, while a partial constraint update left the preserved windowed constraints indeterminate: no placement is made without proving the constraints admit it, and no window leaves windowed presentation it could not validly return to | `WindowedConstraintsIndeterminate` |
+| `windowedMode` | Decorated, at the saved windowed placement |
+| `borderlessMode monitor` | Undecorated, over the monitor's work area, on no monitor |
+| `fullscreenMode monitor preference` | On the monitor, at its current video mode or an exact one it reports |
+| `noModeFallback` / `windowedFallback n` | Settle with the failure, or return to windowed at a reachable placement at most `n` times (1 to 4) |
+| `startupMode request requirement` | A transition during creation, `ModeRequired` or `ModeOptional` |
 
-The monitor is re-resolved through the inventory's own resolution, and a
-fullscreen step receives the pointer that resolution's enumeration returned in
-the same boundary. Negative desktop coordinates are valid. A fullscreen monitor
-is reserved last, after every other check has passed.
+### The transition
 
-### Plans and native steps
+At an owner boundary, in order:
 
-| Target | Steps, in order |
-|---|---|
-| Windowed | `DecorationStep True` (`glfwSetWindowAttrib` `GLFW_DECORATED`); `PlacementStep` (`glfwSetWindowMonitor` with no monitor, at the placement); then, when the native constraints do not follow the preserved windowed set, `SizeLimitsStep` and `AspectRatioStep` restoring it, or the two clearing steps when it has none |
-| Borderless | `ClearSizeLimitsStep` and `ClearAspectRatioStep` (`GLFW_DONT_CARE`) unless there is nothing to suspend; `DecorationStep False`; `PlacementStep` at the work area's origin and size |
-| Fullscreen | `MonitorStep` (`glfwSetWindowMonitor` on the monitor at the selected mode's size, and its refresh rate or `GLFW_DONT_CARE`) |
+1. Captures are reconciled; a closing or ended window is refused.
+2. A window already in a transition refuses with `TransitionAlreadyInProgress`.
+3. The fallback budget and video mode preference are checked.
+4. The transition marker is set until the transition settles. While set, every
+   control on the window is refused; observation and close commands are not.
+5. The monitor inventory is refreshed and the window sampled; its applied mode
+   and claims are reconciled with the sample.
+6. An inert request settles as `ModeInert` with no native call.
+7. Otherwise the target is attempted under the foundation's `recover`, with a
+   budget of one attempt plus the fallback's.
+8. The window is sampled again, the request and outcome are recorded in the
+   mode record, a revision is published, and the command settles as
+   `Transitioned`.
 
-Decoration is set before placement because a platform may keep a window's frame
-and change its content area when decoration changes. GLFW stores decoration set
-on a fullscreen window and applies it when the window leaves the monitor, and
-it ignores size limits while a window is on a monitor, so a fullscreen plan
-leaves them installed. Each step is bracketed by the error capture and the plan
-stops at the first step that reports an error, which settles the attempt as
-`StoppedPartway` naming the steps that returned, the step that reported, the
-steps not attempted, and the copied reports. Nothing is rolled back.
+A request refused before any native call with no fallback settles as
+`Rejected (ModeRejected ...)`, and an unperformable target with no fallback as
+`Unsupported`; neither is recorded. A native call that raises, a callback
+fault, a refresh failure and cancellation propagate and settle `Interrupted`.
 
-### Saved placement and inert requests
+**Validation.** Before any native call an attempt refuses when: the selected
+monitor's identity has ended (`ModeMonitorDisconnected`); another window
+claims the fullscreen monitor (`MonitorBusy`); the monitor does not report the
+preferred mode; its work area is unavailable; a placement is unrepresentable
+or none is reachable; the preserved windowed constraints do not admit the
+windowed placement (`PlacementExcluded`); or those constraints are
+indeterminate (`WindowedConstraintsIndeterminate`). A fullscreen monitor is
+reserved last.
 
-A window's saved placement is its windowed content position and logical size:
+**Plans.** Windowed: decorate, place with no monitor, then restore the
+preserved constraints if the native ones do not follow them. Borderless: clear
+size limits and aspect ratio, undecorate, place at the work area. Fullscreen:
+one `glfwSetWindowMonitor`. The plan stops at the first step that reports an
+error and settles the attempt as `StoppedPartway`, naming the steps returned,
+the failing step and the steps not attempted. Nothing is rolled back.
 
-- seeded from the window's initial observation, before any startup transition;
-- cached from the observed placement when a transition leaves an applied
-  windowed presentation — the geometry the attempt departs from, retained
-  whether the attempt's native steps all return, one reports partway, or the
-  attempt is interrupted after a native step;
-- never overwritten by a return to windowed, a change between borderless and
-  fullscreen, a failed attempt's target placement, or a fallback's derived
-  placement.
+**Saved placement.** The windowed position and size: seeded from the initial
+observation, cached from the observed placement when a transition leaves an
+applied windowed presentation (whether the attempt completes, stops partway or
+is interrupted), and never overwritten by a return to windowed, a failed
+attempt's target or a fallback's derived placement.
 
-A request is inert only when it equals the recorded request completely — the
-monitor identity and the video mode preference included — its last outcome
-settled cleanly at the target, and the applied mode reconciled in step 5 against
-the refreshed inventory still matches it: windowed with its constraints applied,
-borderless exactly over that monitor's work area, or fullscreen on that monitor
-at the observed size the preference selects there, with the monitor's current
-video mode that size and, when the preference names one, that refresh rate. An inert request makes no
-native call, so it never restores stale geometry over a window the user moved.
-A request after a disconnect, a failure, or a fallback is never inert.
+**Inert requests.** A request is inert only when it equals the recorded
+request completely, its last outcome settled cleanly at the target, and the
+applied mode reconciled against the refreshed inventory still matches. A
+request after a disconnect, failure or fallback is never inert.
 
-### Applied mode and observations
-
-Every window sample now also reads the decoration GLFW holds for the window
-and the monitor GLFW reports a fullscreen window on. `observedDecorated` and
-`observedFullscreenMonitor` publish them; the monitor pointer is only compared
-with the inventory's current connections, never refreshed there, so a monitor
-no current identity names, or one whose change the callback captured but no
-refresh folded, is `Unavailable`.
-
-The applied mode is re-derived at every full sample: a synchronization, a
-control's post-call sample, and a transition's samples. Between samples, a
-position callback that moves a window applied borderless re-derives which
-monitor's work area it is over, from its latest sampled decoration and
-fullscreen monitor. A window manager that converges later is therefore
-reflected, and eligibility follows it.
-
-`observedMode` is the window's `ModeRecord`: `modeRequested` and `modeFallback`,
-the last request that executed; `modeApplied`, an `AppliedMode`; the
-`modeSavedPlacement`; and `modeLastOutcome`. The applied mode is derived from
-the sample and never copied from a request:
+**Applied mode.** Derived from each full sample, never copied from a request:
 
 | Sampled | `AppliedMode` |
 |---|---|
 | A fullscreen monitor | `AppliedFullscreen monitor` |
 | No fullscreen monitor, decorated | `AppliedWindowed` |
-| No fullscreen monitor, undecorated, content origin inside a current monitor's work area | `AppliedBorderless monitor`, the first such monitor |
+| Undecorated, content origin inside a current monitor's work area | `AppliedBorderless monitor` |
 | Anything else, or a sample that reported errors | `AppliedIndeterminate` |
-
-A `Transitioned` settlement's `PostCallRevision` names the revision its final
-sample published, which carries the applied mode and geometry actually sampled
-then. That records the boundary, not a window manager's eventual
-acknowledgement: an X11 window manager may apply placement later, and a later
-observation reports it. A final sample that reports errors is
-`PostCallSampleFailed`; the record's change is still published, without a
-sample. Snapshots keep only their latest value, so a client that must inspect the
-named revision itself reads the snapshot on the owner thread before any later
-boundary, as the native examples do.
-
-Minimize, temporary focus loss, and a zero framebuffer extent during or after a
-transition are ordinary observations, not failures.
 
 ### Recovery and fallback
 
-Each attempt is one complete owned operation under `recover`. The target attempt
-plans, reserves, runs its steps, and samples; a `windowedFallback` attempt does
-the same for a windowed return at a reachable placement, from whatever state the
-previous attempt left, reconciled by its sample. An attempt that does not
-complete fails with a `ModeAttemptFailure`, which the classifier recognizes — and
-answers with the windowed fallback, while the budget lasts — when it is a refusal
-other than `MonitorBusy` or `TransitionAlreadyInProgress`, an unsupported target,
-or a stopped step. Every other failure propagates.
+Each attempt is one owned operation under `recover`. A failed attempt is
+answered with the windowed fallback, while the budget lasts, when it is a
+refusal other than `MonitorBusy` or `TransitionAlreadyInProgress`, an
+unsupported target, or a stopped step. Every other failure propagates.
 
-The reachable placement is the documented deterministic policy: the saved
-placement as it is when its content origin lies inside a current monitor's work
-area; otherwise its size, centred — clamped to the work area's origin when larger
-— in the work area of the monitor the platform designates primary, or of the
-first enumerated monitor with a nonempty work area when none is. With no saved
-placement or no such monitor, including an empty or inconsistent inventory, no
-placement is reachable. The derived placement is never saved.
+The reachable placement is the saved placement if its origin lies inside a
+current monitor's work area; otherwise its size centred in the work area of
+the platform's primary monitor, or of the first enumerated monitor with a
+nonempty work area. With no saved placement or no such monitor, none is
+reachable. The derived placement is never saved.
 
-An attempt's cleanup restores the preserved windowed constraints of a window the
-attempt left windowed while its native constraints were suspended or
-indeterminate, and only when that attempt made a native step itself — so a
-windowed return that decorated the window but failed to place it still restores
-them, while an attempt refused before any native call runs no cleanup call,
-whatever state an earlier transition left. A restoration call that reports an error fails the cleanup, and,
-as the recovery contract requires, a failure carrying cleanup evidence is never
-retried: the transition settles as `ModeRecoveryStopped`, with every attempt and
-the cleanup's reports, and no further native call is made. A cleanup that raises
-instead of returning, or a cleanup failure beside a primary failure that is not a
-mode attempt's, is not representable as data: it propagates with its evidence,
-and the command settles as `Interrupted`.
+An attempt that made a native step restores the preserved windowed constraints
+of a window it left windowed. A restoration call that reports an error stops
+recovery: the transition settles as `ModeRecoveryStopped` and no further
+native call is made.
 
 | `ModeOutcome` | Meaning |
 |---|---|
-| `ModeInert` | The request matched the applied mode; no native call |
-| `ModeApplied by steps earlier` | Every step of the `TargetAttempt` or `WindowedFallbackAttempt` returned; `earlier` lists the attempts that failed before it |
-| `ModeFailed attempts` | No attempt completed: no fallback, or the budget was exhausted |
-| `ModeRecoveryStopped attempts reports` | An attempt's constraint restoration failed, so recovery stopped |
+| `ModeInert` | Matched the applied mode; no native call |
+| `ModeApplied` | The target or fallback attempt completed; earlier failed attempts are listed |
+| `ModeFailed` | No attempt completed |
+| `ModeRecoveryStopped` | A constraint restoration failed |
 
-A request through a command is optional: exhaustion is recorded and settled as
-data, and the application keeps running. An optional startup mode refused before
-any native call, or whose target the platform cannot perform, with no fallback,
-creates the window and records the refusal as a failed target attempt. A `ModeRequired` startup mode follows
-the required-service policy instead: exhaustion, an unrecognized failure, or a
-cleanup failure propagates the failure with its context and recovery history,
-and the window's creation rolls back.
+A request through a command is optional: exhaustion is data. A `ModeRequired`
+startup mode propagates its failure and the window's creation rolls back.
 
-After the owner loop refreshes the monitor inventory, it reconciles every window
-that is not closing. A window whose recovery obligation names an ended monitor
-identity takes its recorded windowed fallback at once, with no further command,
-attempting it at most its configured number of times, and its outcome is
-recorded; with no fallback it is only resampled, once — that resample answers
-the obligation, so later turns do not sample the window again. The obligation is the monitor
-identity the last settled request's own sample established the applied mode on —
-fullscreen or borderless — and it survives every ordinary observation: GLFW
-itself takes a fullscreen window off a disconnected monitor before the monitor
-callback's refresh ends the identity, so a synchronization, an observation
-command, or a control's post-call sample taken anywhere between the native
-disconnect and the reconciliation reports the platform's truth — windowed at the
-desktop origin, or indeterminate for a borderless window whose monitor's work
-area is gone — without erasing the unresolved recovery. A recovery that settles,
-applied or exhausted, is owed no longer; a later request that settles supersedes
-it, while a request refused before any native call leaves it pending. A window
-whose applied mode is indeterminate without an ended obligation is resampled. If
-no placement is reachable the fallback reports exhaustion and the saved
-placement is preserved.
+**Monitor disconnects.** After the owner loop refreshes the inventory it
+reconciles every window that is not closing. A window whose recovery
+obligation names an ended monitor takes its recorded windowed fallback at
+once, or with no fallback is resampled once. The obligation is the monitor the
+last settled request's sample established the mode on. It survives ordinary
+observations taken between the native disconnect and the reconciliation, and
+it follows a borderless window legitimately moved between two live monitors.
 
-A borderless window may legitimately be moved between two connected monitors —
-by the user, or by a window manager's late placement — and its observations
-follow it: a move callback or a full sample re-derives the applied mode as
-borderless over the monitor whose work area now contains its content origin.
-Its recovery obligation follows that move too, but only at the reconciliation
-after a monitor refresh, and only when that refreshed inventory finds both the
-monitor the recovery was owed to and the one the window now stands on live. The
-reconciliation that confirms the move records the new obligation and publishes
-the record, so disconnecting the window's current monitor afterwards triggers
-the configured fallback, or the single answering resample without one, while
-disconnecting the monitor it left does not: the window keeps its borderless
-presentation on its connected monitor with no fallback and no setter. That
-judgment tells legitimate movement apart from an observation made after a
-disconnect: a move observed after a monitor's native disconnect and before the
-refresh that ends its identity derives against the inventory the refresh has
-not yet corrected, so it never re-points the obligation to an ended monitor,
-and the recovery owed to that monitor still runs. An observation that derives
-indeterminate — over no live work area — or windowed never re-points or clears
-the obligation, and a fullscreen window's obligation stays on the monitor its
-settlement established. A request that settles afterwards replaces a followed
-obligation as it replaces any other.
-
-### Fullscreen claims
-
-The session holds at most one claim per monitor identity, recording the claiming
-window and whether the claim is reserved, held, or uncertain:
-
-- a fullscreen attempt reserves its monitor after every other check and before
-  its first native call; a monitor another window claims — reserved, held, or
-  uncertain — is `MonitorBusy`, and nothing is called;
-- after every full sample of a window — a synchronization, a control's
-  post-call sample, or a transition's sample — its claims are reconciled with its observed
-  fullscreen monitor: that monitor is held and the window's other claims are
-  released, because departure from them is confirmed or their reservation is
-  proven unused; no fullscreen monitor releases them all; an unavailable report
-  makes them all uncertain;
-- switching monitors therefore reserves the destination first, keeps the source
-  until the window is observed off it, and after a failed switch keeps whichever
-  claim is still observed, releasing only a destination observed unused;
-- iconifying a fullscreen window changes no claim;
-- an attempt interrupted by anything other than its own failure — a native call
-  that raises, a callback fault, or cancellation — releases a reservation it made
-  before any native step as proven unused; after a native step it makes every
-  claim of the window uncertain and its applied mode indeterminate, so the owner
-  loop's mode reconciliation resamples it and releases what the sample proves
-  unused; that protection is in place before the attempt plans, and a
-  reservation commits together with the attempt's record of it, so a cancellation
-  arriving at any point after the reservation, before the first native step
-  included, releases it;
-- a claim on an ended identity is dropped by every inventory refresh and
-  resolution — `synchronizeMonitors`, `resolveMonitor`, the owner loop's monitor
-  step — including one that commits and then rethrows a monitor callback fault,
-  and whenever claims are consulted, so a disconnect releases it at once
-  and the claims never outnumber the current monitors;
-- a window's release drops its claims only when its disposal succeeded; any other
-  release leaves them uncertain, and an uncertain claim is never available to
-  another window.
-
+**Fullscreen claims.** The session holds at most one claim per monitor
+identity: reserved, held or uncertain. A fullscreen attempt reserves before
+its first native call. After every full sample a window's claims are
+reconciled with its observed fullscreen monitor. An attempt interrupted after
+a native step makes the window's claims uncertain and its mode indeterminate,
+so the owner loop resamples it. A claim on an ended identity is dropped by
+every refresh. A window's release drops its claims only when disposal
+succeeded; an uncertain claim is never available to another window.
 Borderless windows claim nothing.
 
 ### Ordinary controls by presentation
 
-After a transition settles, which ordinary controls are attempted depends on the
-applied presentation:
-
-| Applied | Refused with `ControlIneligibleInMode` | Eligible where supported |
+| Applied | Refused | Eligible where supported |
 |---|---|---|
-| Windowed | — | Every control, validated as before |
+| Windowed | nothing | Every control |
 | Borderless | Size, position, constraints, maximize | Title, show, hide, focus, attention, minimize, restore |
 | Fullscreen | Size, position, constraints, show, hide, maximize | Title, focus, attention, minimize, restore |
-| Indeterminate | Everything above as `ControlModeIndeterminate` | Title, focus, attention, minimize, restore |
+| Indeterminate | The same, as `ControlModeIndeterminate` | Title, focus, attention, minimize, restore |
 
 A refused control makes no native call, so an ordinary resize never changes a
-fullscreen monitor's video mode; geometry and video mode changes in borderless
-or fullscreen presentation go through a mode request. Neither the requested mode
-nor the previous presentation establishes eligibility: an indeterminate window
-becomes eligible again once a later sample establishes its presentation.
-
-### Windowed constraints
-
-The window keeps its preserved windowed constraints apart from what the native
-constraints currently hold. Only a windowed ordinary constraint update changes
-the preserved set, under the controls' indeterminate-state rule. A borderless
-entry suspends the native limits and aspect ratio for its own geometry, and a
-windowed return restores the preserved set after placing the window, validated
-against the placement first. While a suspension or restoration is incomplete,
-sizes are refused as indeterminate, and a failed restoration is never reported as
-a restored configuration: its steps and reports are the outcome, and a later
-complete restoration or constraint update re-establishes known constraints.
-
-### Platform restrictions
-
-GLFW performs every transition on X11 and Cocoa. Wayland, which a session
-selects only on explicit request, gives clients no global position, so
-`backendWindowCapabilities Wayland`
-names `BorderlessOperation` unperformable: a borderless request settles as
-`Unsupported`, or takes its configured windowed fallback, and is never reported
-as fullscreen. On Cocoa and X11 alike, the platform decides what a request
-achieves: a window manager may place a borderless window differently or later,
-and the observations report what it did.
+fullscreen monitor's video mode.
 
 ## Input feeds
 
-`Hetoimasia.GLFW.Input` is the consumer's side of a window's ordered input. The
-implementation and its full contract are the private
-`Hetoimasia.GLFW.Internal.Input`; the window host creates one feed per window,
-and the native callbacks that will produce into it arrive with GLFW-12. Until
-then the only producer is the private one the CPU examples drive, which is the
-same admission, reset, warning, and resumption code a native producer will call.
+`Hetoimasia.GLFW.Input` is the consumer's side of a window's ordered input.
+The window host creates one feed per window. The feed belongs to the window's
+owner, which produces into it, attempts its warning, resumes and closes it.
+The one logical consumer holds an `InputReader`; the application holds an
+`InputControl`; both come through the `WindowClient`. Copies of a reader are
+the same consumer. The Lua engine's input adapter is that consumer for an
+input-enabled window
+([its contract](../packages/lua-engine-graphics/README.md#the-lua-input-adapter-tra-6)).
 
-### Ownership and capabilities
-
-A feed belongs to its window's owner, which creates it, produces into it,
-attempts its overflow warning, resumes it, and closes it. Its one logical
-consumer receives an `InputReader` — `readInput`, `awaitInput`,
-`acknowledgeReset`, and `inputStatistics` — and the application an
-`InputControl` — `enableInput` and `suspendInput` — both through the window's
-`WindowClient`. Neither exposes the channel, its endpoints, the feed's state, or
-production. Copies of a reader are the same consumer: they observe one reset and
-one acknowledgement. Concurrent handlers over one feed need the application's
-own coordination.
-
-### The Lua consumer
-
-The Lua engine's input adapter (`Hetoimasia.LuaEngine.Graphics.Input`, [its contract](../packages/lua-engine-graphics/README.md#the-lua-input-adapter-tra-6))
-is the one logical consumer of an input-enabled window's feed: not a second reader beside a background drain. It registers its
-consumer and enables the application's admission in one transaction at the instance's first `api.input.poll` of that window, and
-suspends admission in the transaction that removes the consumer when its instance ends, which is a reset of reason suspension and owes
-no warning. It reads a bounded prefix with `readInput` in one transaction together with the feed's statistics and the window's
-observation, and never calls `awaitInput`; it acknowledges with `acknowledgeReset` in a transaction of its own. The reader, the control
-and the observation reach it through the narrow `WindowInput` of the window host, never through the scene target. It adds no thread,
-no callback and no queue, and invokes no Lua from a native callback.
-
-### Events and epochs
-
-A delivered `InputEvent` carries its window, its `InputEpoch`, and one payload:
-a key transition with its key code and scancode, a Unicode character, a button
-transition, scroll offsets on both axes, or a focus transition. Epochs start at
-one, advance by one per reset, and never wrap. A button transition carries the
-cursor position and modifiers captured when it was produced — the producer's
-latest cursor sample, which coalesces — so later cursor motion does not move a
-click already produced. Scroll, text, key and button transitions, and focus
-history are never coalesced. Each event is prepared to normal form in the
-producer's `IO` before admission; no transaction here evaluates a payload, makes
-a native call, logs, or runs a handler.
-
-### Phases and gates
+**Events.** An `InputEvent` carries its window, its epoch and one payload: a
+key, character, button, scroll or focus transition. Epochs start at one and
+advance by one per reset. These are never coalesced. Each event is prepared in
+the producer's `IO` before admission.
 
 | Phase | Reads answer | Production | Leaves by |
 |---|---|---|---|
-| `InputRunning` | the next event, or `InputEmpty` | admitted through the gates below | overflow or suspension: `InputResetPending`; closure |
-| `InputResetPending` | `InputResetRequired token`, until acknowledged | suppressed and counted | acknowledgement: `InputResetAcknowledged`; closure |
-| `InputResetAcknowledged` | `InputPaused`; a wait keeps waiting | suppressed and counted | owner resumption into the reserved epoch: `InputRunning`; closure |
-| `InputFeedClosed` | `InputClosed`, at once | `ProductionClosed` | never |
+| `InputRunning` | the next event, or `InputEmpty` | admitted through the gates | overflow or suspension; closure |
+| `InputResetPending` | `InputResetRequired token` until acknowledged | suppressed and counted | acknowledgement; closure |
+| `InputResetAcknowledged` | `InputPaused` | suppressed and counted | owner resumption into the reserved epoch; closure |
+| `InputFeedClosed` | `InputClosed` | refused | never |
 
-The phase is independent of the application's admission and of focus.
-Admission starts `AwaitingReadiness`: input produced then is gated, and
-`suspendInput` before readiness changes nothing. `enableInput` opens it. While
-running, ordinary input is admitted only with admission enabled and the window
-focused, and is otherwise counted as gated. A focus transition is admitted
-whenever admission is enabled, so the focus loss that closes the focus gate is
-itself delivered; while a reset is in progress a focus transition still updates
-the gate and is counted as suppressed.
+**Gates.** Admission starts `AwaitingReadiness` and `enableInput` opens it.
+While running, ordinary input is admitted only with admission enabled and the
+window focused, and is otherwise counted as gated. A focus transition is
+admitted whenever admission is enabled.
 
-### Held state
+**Held state.** Only an admitted press establishes held state. A repeat or
+release of anything not held is suppressed as unpaired. An admitted focus
+loss, every reset and closure clear the baseline, so each epoch begins with
+nothing held.
 
-The producer keeps a held-state baseline over the native key domain
-`0 .. keyDomainLast` and button domain `0 .. buttonDomainLast`, never indexed by
-scancode. Only an admitted press establishes held state. A repeat or release of
-anything not held — a key outside the domain included — is suppressed as
-unpaired: a release never invents a press, and a repeat never becomes one. An
-admitted focus loss, every reset, and closure clear the baseline, so each epoch
-begins with nothing held and a key still down from before a reset produces
-nothing until it is pressed again. The consumer clears its own held keys,
-buttons, and gestures when it reads a focus loss, before acknowledging a reset,
-and at closure.
+**Reset.** An overflow (the channel full at admission, or native staging full)
+commits one transaction that aborts the channel, records what it discarded,
+reserves the next epoch, clears the held baseline and installs a reset with a
+token bound to the feed and that epoch. `suspendInput` while running makes the
+same transition with reason `AdmissionSuspended`. The consumer clears its
+derived state and acknowledges the exact token; the feed replays nothing and
+has no timeout that resumes it. `acknowledgeReset` answers
+`ForeignResetToken`, `AcknowledgementClosed`, `StaleAcknowledgement`,
+`Acknowledged` or `AlreadyAcknowledged`, in that order of precedence.
 
-### The reset
+**Warning.** An overflow episode owes one `Warning` under `glfw.input`,
+written by the owner at a safe boundary through the injected logger. A sink
+failure or cancellation is recorded and not retried. A suspension owes none.
 
-An overflow of a running generation — the channel full when an event, a focus
-transition included, is admitted, or native staging full when an ordered
-callback cannot be recorded — commits one transaction that aborts the
-channel, records the backlog it discarded from the channel's depth counter apart
-from the one overflowing event never admitted, reserves the next epoch, clears
-the held baseline, drops the aborted channel, and installs a reset with reason
-`InputOverflowed` and an opaque token bound to the feed and that epoch. Staging
-loss is checked before any captured prefix is published, so that prefix is
-never replayed as if the gap happened after it. The foundation channel's own
-statistics keep their meanings; staging's lost count is exact and is not
-reported as channel telemetry.
-
-`suspendInput` after readiness, while running, makes the same transition with
-reason `AdmissionSuspended` and no unadmitted event. During a reset,
-`enableInput` and `suspendInput` change only the application gate: they neither
-replace the token nor advance the epoch, and never erase an overflow warning the
-episode owes. Production during the reset allocates nothing, advances nothing,
-replaces nothing, and owes no further warning; it only adds to counters.
-
-Events dequeued before the reset's transaction are in flight. The consumer
-finishes or abandons their handlers, clears its derived state, and acknowledges
-the exact token; the feed undoes nothing and replays nothing. Reading the token
-neither consumes nor acknowledges it, so a stalled or cancelled consumer leaves
-the feed paused and closable, with no timeout that resumes it.
-
-`acknowledgeReset` never retries, needs no command capacity, and allocates and
-runs nothing. It answers, in order: `Left ForeignResetToken` for another feed's
-token, whatever this feed's state; `AcknowledgementClosed` once the feed has
-closed, even for the pending token; `StaleAcknowledgement` for an older reset's
-token; `Acknowledged` for the pending token; and `AlreadyAcknowledged`, changing
-nothing, for a reset already acknowledged or resumed.
-
-### The overflow warning
-
-An overflow episode owes one structured `Warning`, message
-`Input overflowed; the feed was reset`, under the `glfw.input` component with
-`window`, `epoch`, `discarded`, and `unadmitted` fields. The owner claims and
-writes it with the private `attemptOverflowWarning` at a safe owner boundary,
-outside callbacks, transactions, and release, through a logger it injects. The
-obligation lives in the episode, apart from the queue, so an early
-acknowledgement or further production cannot lose it. A sink failure propagates
-to the caller, as every logging failure does, and a cancellation propagates as
-itself; the episode records `WarningFailed` or `WarningInterrupted`, and the sink
-is not tried again. A closed feed claims nothing, so a warning shutdown prevented
-stays `WarningOwed` in the final statistics. A suspension owes no warning.
-
-### Resumption and closure
-
-The owner's private `resumeInput` allocates one fresh channel in `IO` and
-installs it in one transaction only if the same reset is still acknowledged, no
-warning is owed or in progress, the feed is open, admission is enabled, and the
-window is focused; that transaction makes the reserved epoch running. Otherwise
-the candidate is never published. The window's close protocol and host
-quiescence close the feed, so an open feed belongs to a live window and host, and
-a closure committed before the install always wins.
-
-Closure is idempotent, finite, and never retries. It aborts a running channel,
-counting its discards apart from reset discards, clears the held baseline, and
-ends every read and wait at once — even during a reset, without first delivering
-the obsolete reset, and without awaiting any acknowledgement. The phase, epoch,
-counters, and last-reset summary then stay as they were, apart from an attempt
-already in progress recording how it ended. Statistics keep only that summary and
-cumulative counts, never a history of events, epochs, or channels.
+**Resumption and closure.** The owner installs a fresh channel only if the
+same reset is still acknowledged, no warning is owed, the feed is open,
+admission is enabled and the window is focused. The window's close protocol
+and host quiescence close the feed. Closure is idempotent and ends every read
+and wait at once, even during a reset.
 
 ## The window host and owner loop
 
-`Hetoimasia.Runtime.GLFW`, in the public `runtime-glfw` sublibrary, which
-re-exports the private `runtime-glfw-core` implementation, composes a
-session, its windows, and their command bookkeeping with the runtime's
-[application lifecycle](resources.md#the-application-runner). It follows the
-[module authoring guide](logging.md#module-authoring-guide): it takes no logger
-of its own. The owner loop writes the input overflow warning through the
-`Logger` the application injects on `LoopHooks`, under `glfw.input`, at a safe
-boundary after callbacks have been reconciled. Configuration rejection is
-raised under `glfw.runtime` and `construct window host`; native failures under
-GLFW's own operations; supervised failures as the runtime delivers them. The
-runner makes the one terminal report.
+`Hetoimasia.Runtime.GLFW` composes a session, its windows and their command
+bookkeeping with the runtime's
+[application lifecycle](resources.md#the-application-runner). It takes no
+logger of its own; the loop writes its two warnings through the logger the
+application injects on the loop hooks.
 
 ### Construction and ownership
 
-A `WindowHost` is an application dependency, built by `allocWindowHost` as a
-`Scoped` value before supervision is entered, on the process main thread. It
-validates its `HostConfig` first — the command, event, and retirement budgets
-each at least one, an idle wait above
-zero and at most 60 seconds, so a NaN or infinite wait is refused, a
-live-window limit of at least one, at least the number of configured windows,
-and at most `maximumWindowLimit`, which is far above what any platform hosts at
-once and low enough that every count a host derives from that limit is an exact
-`Int` rather than a wrapped one, and an input capacity between one and the
-channel's maximum —
-then enters the session, allocates a
-[scoped collection](resources.md#scoped-resource-collections) with that limit,
-creates the host's command port, and creates each configured window in order as
-a collection member with its own port and its own input feed of
-`hostInputCapacity`, focused if its initial observation observed focus. A failure at any stage releases what the
-earlier stages acquired through ordinary scoped release, before any worker
-exists. The host is never a service the startup callback returns: startup
-receives it among the dependencies and hands workers only client capabilities —
-`hostCommandPort`, a window's `WindowClient` with its input reader and admission
-control, the monitor inventory's reader, and `hostActivity` — transferring no
-native ownership. At registration the host attaches the window's input feed so
-owner-boundary callbacks publish into it. `allocWindowHostIn` builds
-the same host over a session scope the caller supplies, such as a test seam's or
-a borrowed session; the host then owns the session only if that scope does.
+A `WindowHost` is an application dependency, built as a `Scoped` value on the
+process main thread before supervision is entered. `allocWindowHost`:
 
-`withProtectedWindowHost` and `withProtectedWindowHostIn` build exactly that
-host — same validated configuration, session, collection, port, configured
-windows, and admission-closing release — inside a dedicated IO continuation
-boundary, and additionally give it the retirement state of
-[window attachments](#window-attachments) under a host identity only they issue.
-They are the only constructors that do. A host built by `allocWindowHost`,
-`allocWindowHostIn`, or the private `allocWindowHostWith` is issued no identity,
-so it can never be the target of an attachment: `hostAttachmentIdentity` answers
-`Nothing` and a registration against it is refused before any effect. Its
-signatures, its behaviour, and every example over it are unchanged. See
-[the protected host lifetime](#the-protected-host-lifetime).
+1. validates its `HostConfig`: budgets at least one; an idle wait above zero
+   and at most 60 seconds; a window limit of at least one, at least the number
+   of configured windows and at most `maximumWindowLimit`; an input capacity
+   in the channel's range;
+2. enters the session and allocates a scoped collection with that limit;
+3. creates the host's command port;
+4. creates each configured window in order as a collection member, with its
+   own port, input feed and demand slot.
 
-`WindowHost` is exported without its constructor or fields. No session,
-collection, member, command host, native handle, executor, or release authority
-can be taken from it. The host holds its windows only through the collection:
-`withHostWindow` lends one to an owner-thread callback it must not escape, and
-the host's owner operations refuse other threads.
+A failure at any stage releases what earlier stages acquired, before any
+worker exists. Startup receives the host among the dependencies and hands
+workers only client capabilities (the host port, a window's `WindowClient`,
+the monitor reader, `hostActivity`); no native ownership is transferred.
+`allocWindowHostIn` builds the same host over a session scope the caller
+supplies, and the host then owns the session only if that scope does.
+
+No session, collection, member, command host, native handle or release
+authority can be taken from a `WindowHost`. `withHostWindow` lends one window
+to an owner-thread callback it must not escape.
+
+`withProtectedWindowHost` and `withProtectedWindowHostIn` build the same host
+and additionally give it window-attachment retirement state under a host
+identity only they issue
+([The protected host lifetime](#the-protected-host-lifetime)). A host built
+any other way can never be the target of an attachment.
 
 ### Dynamic windows
 
-The host's windows are created and closed while the application runs, in any
-order, with no primary window. The collection owns every window until it is
-retired or the host's scope ends, so a window's lifetime never escapes the host.
+Windows are created and closed while the application runs, in any order. The
+collection owns every window until it is retired or the host's scope ends.
 
-**Creation.** A `createWindowCommand` submitted through `hostCommandPort` — the
-one port with creation authority — is executed by the owner loop. Before any
-native effect it checks the configuration (`WindowConfigInvalid`), the live-window
-limit (`WindowCapacityReached`, a typed rejection rather than a wait), and whether
-a release failure has poisoned creation (`WindowCreationPoisoned`). The window is
-then acquired through the window's own `Assembly` as a collection member, and,
-with nothing interruptible in between, registered with the host beside a port of
-its own. A native failure during construction is `WindowCreationFailed` once the
-construction has rolled back exactly what it acquired: nothing is registered and
-no capacity is consumed. A construction failure carrying retained cleanup
-evidence — a rollback whose own release failed — is never downgraded to that
-rejection: the original construction failure propagates unchanged as the host's
-primary failure, the command's ticket settles as `Interrupted`, the owner loop
-stops at that failure, and commands still queued settle through the quiescence
-contract. The collection keeps the rollback failure as evidence through its
-final exit, where the propagated primary retains it exactly once, and the latch
-poisons any later creation. Anything else raised during construction — a
-cancellation, a callback fault, any other exception — interrupts the command and
-propagates with its cleanup evidence on the host's failure path. On success the ticket settles as
-`WindowCreated` and hands over the window's `WindowClient`, as
-[the creation handoff](#the-creation-handoff) describes.
+**Creation.** A `createWindowCommand` through `hostCommandPort`, the one port
+with creation authority, is executed by the owner loop. Before any native
+effect it checks the configuration (`WindowConfigInvalid`), the live-window
+limit (`WindowCapacityReached`, a rejection rather than a wait) and whether a
+release failure has poisoned creation (`WindowCreationPoisoned`). The window
+is acquired as a collection member and registered with nothing interruptible
+in between.
 
-A dropped or unawaited creation ticket neither destroys nor relinquishes its
-window. `hostWindowIdentities` enumerates every window the host holds, in
-registration order and bounded by the limit, and `hostWindowClient` returns the
-capabilities of any of them; the host disposes every remaining window at
-shutdown. Identities are never reissued within a session, so a retired window's
-identity never names a later window.
+- A native failure whose construction rolled back cleanly is
+  `WindowCreationFailed`: nothing is registered and no capacity is consumed.
+- A rollback whose own release failed is never downgraded to a rejection: the
+  construction failure propagates as the host's primary failure, the ticket
+  settles `Interrupted`, the loop stops, and the latch poisons later creation.
+- A dropped creation ticket neither destroys nor relinquishes its window.
+  `hostWindowIdentities` enumerates every held window and `hostWindowClient`
+  returns the capabilities of any of them.
 
-**The close protocol.** A `closeWindowCommand` executed by the loop, through the
-host's port or the window's own, `closeHostWindow` on the owner thread, and
-`honourHostCloseRequest` for a surfaced close request that is still its window's
+**The close protocol.** A `closeWindowCommand`, `closeHostWindow` on the owner
+thread, and `honourHostCloseRequest` for a request that is still its window's
 latest all begin the same protocol:
 
-1. the window's closing observation is prepared; nothing has changed yet, so a
-   cancellation here leaves the window open with its port admitting;
-2. in one transaction, the window is marked closing, its port's admission
-   closes, every command still queued there settles as `NotExecuted`, its
-   attachment — on a protected host, and only there — stops admitting new
-   graphics use and begins retiring, and its observations publish the
-   `WindowClosing` phase; that transaction and the owner's record of the new
-   observation run masked with nothing interruptible between them, so no
-   cancellation can close the port without publishing the phase, or publish the
-   phase without closing the port, and no new render use can begin after the
-   closing phase is observable;
-3. once no owner-thread borrow is in progress — and, on a protected host, once
-   the window's attachment has retired — the window is retired through the
-   collection: callbacks detached, the native window destroyed, storage freed,
-   and the terminal phase published before its snapshot closes.
+1. The closing observation is prepared. A cancellation here leaves the window
+   open.
+2. In one transaction the window is marked closing, its port's admission
+   closes, its queued commands settle as `NotExecuted`, its feed and demand
+   slot close, its attachment (on a protected host) stops admitting graphics
+   use and begins retiring, and its observations publish `WindowClosing`. The
+   transaction and the owner's record of the observation run masked.
+3. Once no owner-thread borrow is in progress and, on a protected host, the
+   attachment has retired, the window is retired through the collection.
 
-A close command settles as `WindowCloseBegun` once step 2 has committed; its disposal is
-reported by the window's observations, and by the window's graphics slot when
-it has one, never by the ticket, because closed admission alone proves nothing
-about native destruction. Accepting a close is not acknowledging a destruction,
-and the ticket's meaning is unchanged by attachments:
-[the public attachment contract](#the-public-attachment-contract) is where a
-consumer reads retirement and disposal instead of inferring them. Beginning the protocol
-again answers `CloseAlreadyStarted`, or `WindowIsClosing` for a command, and a
-window the host no longer holds answers `CloseNotServed` or `WindowNotServed`.
-Closing a window stops neither the session, the loop, nor any other window, and
-closing the last window creates nothing and ends nothing.
+A close command settles as `WindowCloseBegun` once step 2 commits. Disposal is
+reported by the window's observations, never by the ticket. Beginning the
+protocol again answers `CloseAlreadyStarted` (`WindowIsClosing` for a
+command); a window no longer held answers `CloseNotServed` or
+`WindowNotServed`. Closing a window stops neither the session, the loop, nor
+any other window.
 
-Retirement never waits. While `withHostWindow` lends the closing window, the
-collection answers the retirement as in use; while it lends another window, the
-host does not attempt it. Either way the window stays registered, still
-occupying its capacity, and every turn retries its retirement after native event
-processing, when no borrow is in progress. Retaining a client port is not a
-borrow and does not delay retirement. A retirement whose release fails is not
-retried, at shutdown or ever: the window is forgotten with its
-`WindowDisposalFailed` or `WindowReleaseUncertain` phase, and the collection
-latches the failure, poisoning creation and keeping the failure as evidence for
-its final exit. Unlike a construction rollback's failure — which propagates as
-the host's primary failure and stops the loop — a retirement failure stays
-non-fatal: the window was already built and serving when its release failed, so
-the failure is latched and reported rather than thrown into the turn that
-observed it.
+Retirement never waits: every turn retries it after native event processing
+when no borrow is in progress. Retaining a client port is not a borrow. A
+retirement whose release fails is not retried: the window is forgotten with
+its failed phase and the collection latches the failure, poisoning creation
+and keeping it as evidence for its final exit. Unlike a failed construction
+rollback, a retirement failure is non-fatal.
 
-**Retained handles.** Once a window has been retired, its port answers
-`SubmitClosed`, and `WaitClosed` to a waiting submission; `withHostWindow`
-answers `WindowEnded`; `closeHostWindow` answers `CloseNotServed`; a command for
-it through the host's port is `WindowNotServed`; and its observation reader keeps
-the terminal observation, then `EndOfStream`. None of these touches native state.
-
-**Bookkeeping.** The host keeps one registry entry, one port, and at most one
-surfaced close request per window it holds, plus one dispatch cursor.
-`hostBookkeeping` reads those counts, the collection's live members, the
-completion cells held across every port, and the windows borrowed, on the owner
-thread. Every count is proportional to the live windows, never to how many were
-ever created.
+After retirement, the window's port answers `SubmitClosed`, `withHostWindow`
+answers `WindowEnded`, and its observation reader keeps the terminal
+observation. All host bookkeeping is proportional to live windows
+(`hostBookkeeping`).
 
 ### The owner turn
 
-`runOwnerLoop` runs on the session's owner thread — the application's action
-calls it on the process main thread — and refuses any other thread with
-`NotSessionOwner` before anything runs. Every turn performs, in order:
+`runOwnerLoop` runs on the session's owner thread and refuses any other.
+Each turn, in order:
 
 1. `checkRuntime`;
-2. native event processing: `glfwPollEvents`, or on an idle turn
+2. native events: `glfwPollEvents`, or on an idle turn
    `glfwWaitEventsTimeout` with the configured bound;
-3. reconciliation at owner boundaries: the monitor inventory, refreshed only
-   when its callback captured a change, then the retirement of every closing
-   window no borrow defers, then every window's captured callbacks, collecting
-   the close requests not yet surfaced for windows that are not closing, then
-   the [visible follow-up](#visible-after-an-iconify-transition) of each window
-   that owes one, then each open feed's overflow warning claim and resumption;
+3. reconciliation: the monitor inventory if its callback captured a change;
+   retirement of every closing window no borrow defers; every window's
+   captured callbacks, collecting unsurfaced close requests; visible
+   follow-ups; each feed's overflow warning and resumption;
 4. `checkRuntime`;
-5. command work: at most `hostCommandBudget` queued commands claimed, executed,
-   and settled, across every port, then warning claim and resumption again,
-   because a setter can invoke callbacks;
+5. command work: at most `hostCommandBudget` commands across every port, then
+   warning and resumption again;
 6. `checkRuntime`;
-7. application event work: at most `hostEventBudget` calls of `loopEvent` that
-   dispatched something, ending at the first that found nothing ready;
+7. application events: at most `hostEventBudget` calls of `loopEvent` that
+   dispatched something;
 8. `checkRuntime`;
-9. the application's update opportunity, `loopUpdate`, which receives the turn's
-   `Turn` summary and answers `Continue` or `Finish`;
-10. `checkRuntime`, before a `Finish` result is returned or the next turn begins.
+9. `loopUpdate` with the turn's `Turn` summary, answering `Continue` or
+   `Finish`;
+10. `checkRuntime`.
 
-A supervised failure latched at any point is rethrown by the next check, so no
-dispatch begins once a check has seen it. A native failure, a callback fault
-rethrown at reconciliation, a command's rethrown interruption, or a hook's
-failure also ends the loop and propagates.
+A supervised failure latched at any point is rethrown by the next check. A
+native failure, a callback fault, a command's rethrown interruption or a
+hook's failure ends the loop and propagates.
 
-### Budgets
-
-Budgets count attempted dispatches, not time. A rejected command — addressed to
-a window the host does not serve, one that has ended, one outside its port's
-scope, or a refused creation — costs its attempt exactly as a performed one
-does. At most `max hostCommandBudget hostEventBudget`
-dispatch attempts separate two consecutive checks, however continuously the
-command queues and the application's event source are refilled. A budget does
-not bound one native call or one event handler; long work belongs in a worker.
+**Budgets** count attempted dispatches, not time. A rejected command costs its
+attempt. At most `max hostCommandBudget hostEventBudget` attempts separate two
+consecutive checks. Long work belongs in a worker.
 
 ### Fair dispatch
 
-Command work draws from several ports: the host's, and the port of every window
-the host holds that is not closing. They are ordered with the host's port first
-and then the windows' in registration order, and the host remembers the port
-its last attempt served. Each attempt claims the oldest command of the first
-port after that one, in cyclic order, that has a command queued. So:
+Command work draws from the host's port and the port of every window that is
+not closing, in cyclic order starting after the port served last.
 
-- **FIFO within a port.** A port's commands run in the order their admissions
-  committed. Nothing orders commands across ports.
-- **One budget.** A turn attempts at most `hostCommandBudget` commands across all
-  ports together, and a rejected attempt counts.
-- **No starvation.** No port is attempted twice while another port with a
-  command queued waits, however continuously the first is refilled.
-- **A service bound.** Let `P` be the most ports dispatched from while a command
-  waits, at most `1 + hostWindowLimit`, and `B` the budget. Each attempt on a
-  port is followed by at most `P - 1` attempts on other ports before that port's
-  next, so a command at position `k` of its port's queue when a turn's command
-  work begins — the oldest is position one — is attempted within `⌈k · P / B⌉`
-  turns' command work, counting that turn, assuming turns continue and every
-  dispatch returns. The oldest command of every port with one queued is
-  therefore attempted within `⌈P / B⌉` turns. A window created meanwhile takes
-  its place behind the host's port, which the creation just served, so it never
-  delays a port already waiting, and a closed window's port leaves the order.
-  This is a bound in turns, not a wall-clock deadline, and it is separate from
-  checkpoint reachability.
+- Commands of one port run in the order their admissions committed. Nothing
+  orders commands across ports.
+- No port is attempted twice while another port with a queued command waits.
+- With `P` ports and budget `B`, a command at position `k` of its port's queue
+  is attempted within `⌈k · P / B⌉` turns. This is a bound in turns, not a
+  deadline.
 
-The scheduler's only state is the cursor, so its bookkeeping stays bounded
-through creation, closure, and churn.
+The scheduler's only state is the cursor.
 
 ### Idle waits
 
-A turn is idle when the turn before it attempted no command and dispatched no
-application event, no command is queued at its entry, and no attachment
-retirement wants an immediate opportunity (see
-[progress and scheduling](#progress-and-scheduling)). Active turns poll.
-Idle turns wait at most `hostIdleWait` seconds, so a checkpoint follows even when
-no native input arrives. No wait is indefinite, a host with no windows waits on
-each idle turn instead of spinning, and the bound is a latency rather than a
-shutdown deadline.
+A turn is idle when the previous turn attempted no command and dispatched no
+application event, no command is queued, and no attachment retirement wants an
+immediate opportunity. Active turns poll. Idle turns wait at most
+`hostIdleWait` seconds; no wait is indefinite.
 
-A wait ends early when something wakes the owner: an
-[admission](#admission) that committed, or a
-[demand publication](#demand-slots). The turn that waited then goes on to its own
-command work and its update opportunity, so a command admitted during the wait
-is served by that same turn, subject to the budget and
-[fair dispatch](#fair-dispatch), and a request published during it is there for
-that turn's capture. A wake that arrives before the wait is entered ends the
-wait it precedes, because the post outlives the call that made it; one that
-arrives while the owner is consuming an earlier wake is seen by the next wait.
-Wakes may be coalesced and may be spurious, and neither repeats a command's
-execution or a capture: the queue and the slots are authoritative, and the wake
-is only the hint that they changed. `hostIdleWait` remains the fallback bound
-whatever happens to the wake — including after
-[the wake path has degraded](#the-degradation-policy), when nothing is posted at
-all and the bound alone keeps work moving.
-
-Native waits are safe foreign calls, so background workers
-run while the owner is inside one. `hostActivity` publishes the current turn and
-whether its owner has begun its finite wait; the flag is set immediately before
-the native call and cleared once it returns, so it signals a wait starting or in
-progress rather than proving the call was entered.
+A wait ends early when an admission or a demand publication wakes the owner,
+and that turn then serves it. Wakes may coalesce or be spurious; the queue and
+the slots are authoritative. `hostIdleWait` remains the fallback bound,
+including after the wake path has degraded. Native waits are safe foreign
+calls, so workers run meanwhile. `hostActivity` publishes the current turn and
+whether its wait has begun.
 
 ### The scheduled owner turn
 
-`runScheduledOwnerLoop` is the additive path for an application that paces
-itself by absolute deadlines. It is a second entry point beside `runOwnerLoop`,
-not a change to it: `runOwnerLoop`, `LoopHooks`, `Turn`, and `TurnStep` keep the
-behaviour [The owner turn](#the-owner-turn) and [Idle waits](#idle-waits)
-describe exactly, including that loop's initial poll, and an application that
-uses them sees nothing new. The one clock reading `runOwnerLoop` can make is the
-[visible follow-up's](#visible-after-an-iconify-transition) for a window in its
-slow phase or spending its quick bound; an application none of whose windows is
-iconified never reads one.
+`runScheduledOwnerLoop` is a second entry point for an application that paces
+itself by absolute deadlines; `runOwnerLoop` is unchanged by it. Time enters
+only through the injected `hostClock`. The loop reads no wall clock, starts no
+timer thread and never sleeps.
 
-Time enters only through the injected `MonotonicSource` on the host's
-`hostClock`. The loop reads no wall clock, starts no timer thread, and sleeps
-never; a seam example configures a `scriptedSource` and scripts every reading.
-Every deadline it is given — its own and a publisher's — is an absolute
-`Instant` in that source's clock domain.
-
-Each scheduled turn performs, in order:
+Each scheduled turn:
 
 1. `checkRuntime`;
-2. **the inspection**: one sample of `hostClock`, and, in one transaction, the
-   capture of the application's pending demand and the queued command count,
-   then the application's own `scheduledReady` query;
-3. **the choice**, from the stored schedule, the captured request, the queued
-   commands, and that readiness:
-   - anything ready — a command queued, an event ready, or immediate demand from
-     either the schedule or the captured request — polls, as `PolledForWork`;
-   - otherwise a deadline already reached at the sampled instant polls, as
-     `PolledForDeadline`, so no zero or negative timeout reaches GLFW;
-   - otherwise the turn waits the shorter of the time remaining to the earliest
-     deadline, as `WaitedForDeadline`, and the configured fallback bound
-     `hostIdleWait`, as `WaitedForFallback`. With no deadline at all the turn
-     waits that bound. A deadline can only shorten a wait, never extend it, and
-     a host with no windows waits rather than spins;
-4. the native step the choice named, publishing `hostActivity` around it exactly
-   as an unscheduled turn does;
-5. **the resample**: one more sample of `hostClock`, which is the instant the
-   turn's update opportunity is given;
-6. steps 3 through 8 of [the owner turn](#the-owner-turn), unchanged and in the
-   same order: reconciliation, the checkpoints, bounded command work and its
-   feed recovery, and bounded application event work;
-7. `scheduledUpdate`, once per turn, with the turn's `ScheduledTurn`;
-8. `checkRuntime`, before a `FinishWith` result is returned or the next turn
-   begins.
+2. **inspection**: one clock sample, then in one transaction the capture of
+   the application's pending demand and the queued command count, then
+   `scheduledReady`;
+3. **choice**: anything ready (a command, an event, immediate demand) polls;
+   otherwise a deadline already reached polls; otherwise the turn waits the
+   shorter of the time to the earliest deadline and `hostIdleWait`. A deadline
+   can only shorten a wait;
+4. the native step;
+5. **resample**: one more clock sample, which is the instant the update sees;
+6. steps 3 to 8 of the owner turn, unchanged;
+7. `scheduledUpdate`, once, with the `ScheduledTurn`;
+8. `checkRuntime`.
 
-A turn therefore reads the clock exactly twice, and the
-[visible follow-up](#visible-after-an-iconify-transition) of step 6 reuses the
-post-native reading rather than taking a third. The pre-native sample chooses
-the wait; the post-native sample is what the update sees, so a deadline the wait
-itself reached is due in that same turn rather than the one after. Deadlines
-stay absolute and the next turn samples again, so reconciliation, dispatch, and
-the update itself consume the interval: a deadline a turn's own work ate into is
-honoured by the next turn's shortened wait, never pushed out by a fresh full
-one.
-
-**The schedule and the captured request are separate.** The schedule is what
-`scheduledUpdate` last answered, and the loop stores it until the next answer
-replaces it: `NoUpdateDemand`, `UpdateImmediately`, `UpdateBy` an absolute
-instant, or `FinishWith`. It is never combined with an earlier answer, so
-finishing an update implies no immediate demand for another. The captured
-request is [a demand slot's](#demand-slots) coalesced request, taken with its
-revision by that turn's own inspection and consumed there, so an old request can
-never become permanent work. Both are weighed for the wait, and both reach the
-update: `scheduledDemand` carries the captured request and its revision, and an
-application that still wants a deadline an early wake delivered before it was
-due must retain it in the schedule it answers. `scheduledStart` is the schedule
-in force before the first update opportunity; `defaultScheduledHooks` leaves it
-`NoUpdateDemand`, and the ordinary ready-state and deadline rules apply to that
-first turn like any other.
-
-**Readiness is inspected, not dispatched.** `scheduledReady` answers whether an
-application event is ready without dispatching one. It runs once per turn,
-before the native step, decides only whether that turn polls, and spends none of
-`hostEventBudget`; the event opportunity itself is still only `scheduledEvent`,
-in the turn's own bounded event work. An arbitrary application queue is not
-connected to the loop by this: an event published after the inspection answered
-is not seen by that turn, and a worker that needs prompt service publishes
-demand, which wakes the owner.
-
-**Budgets and checkpoints are the unscheduled loop's.** The same finite command
-and event budgets end each batch, so between two consecutive update
-opportunities at most those bounded dispatch attempts occur and a due update is
-never starved by continuous traffic. Fair dispatch across ports, retirement,
-close-request surfacing, feed recovery, quiescence, shutdown order, supervised
-failure propagation, native failure, callback faults, and the owner-thread
-refusals are all the same code and behave identically.
-
-**Waking.** A publication or an admission that arrives between the inspection
-and the wait's entry, or during the wait, ends or pre-empts that wait through
-the [wake protocol](#idle-waits) already in place; the scheduled path adds no
-second notification mechanism. Because the capture is the turn's own inspection,
-what arrived after it is inspected by the next turn. A wake with nothing due and
-no expired deadline is an ordinary turn that recomputes its wait and offers its
-one update opportunity, no more: an event wake does not itself require a redraw.
-The fallback bound stays finite and strictly positive whatever happens to the
-wake, and it is an upper bound, so a configured `hostIdleWait` becomes the whole
-nanosecond at or below it rather than the nearest one: `1.6e-9` is a
-one-nanosecond bound, not a two-nanosecond one, and a wait under a whole
-nanosecond, which nearest-rounding would otherwise lengthen to one, is refused
-by `validateHostConfig` before anything is acquired, as an `IdleWaitRejected`.
-
-The conversion from a `Duration` to the seconds `glfwWaitEventsTimeout` takes
-lives here, in the GLFW layer, and is the only one; a wait is only ever entered
-for a positive duration, so the value it passes is finite, above zero, and never
-above the bound it came from.
+- A turn reads the clock exactly twice. Deadlines stay absolute, so time a
+  turn's own work consumed shortens the next wait.
+- The schedule is what `scheduledUpdate` last answered and is never combined
+  with an earlier answer. The captured request is consumed by the turn that
+  captured it, so an old request never becomes permanent work.
+- `scheduledReady` is inspected, not dispatched, and spends no event budget.
+  A worker that needs prompt service publishes demand.
+- Budgets, checkpoints, fair dispatch, retirement, close surfacing, feed
+  recovery, quiescence and failure propagation are the unscheduled loop's.
+- A wait under one whole nanosecond is refused by `validateHostConfig`.
 
 ### Render demand
 
-`renderTurn` composes the application's simulation demand with each window's own
-demand and decides two things: which windows are offered a render opportunity
-this turn, and what the loop should continue with. It is the only place where
-[a demand slot's](#demand-slots) captured request and [the scheduled owner
-turn's](#the-scheduled-owner-turn) `UpdateSchedule` meet.
+`renderTurn` is a pure function that composes the application's simulation
+demand with each window's demand and decides which windows are offered a
+render opportunity this turn and what schedule the loop continues with. The
+caller threads a `RenderDemand` value from turn to turn and passes the sampled
+instant in. It reads no clock, makes no native call, performs no drawing and
+infers no device readiness; a backend adds its own presentation accounting.
 
-It is a pure function of an explicit `RenderDemand` value the caller threads
-from one turn to the next, holding one `WindowRenderState` per window it has
-been shown, keyed by the opaque `WindowId`, and the rotation cursor that makes
-the opportunities fair — no window, no handle, no observation history. Nothing
-in it reads a clock, sleeps, starts a thread, or makes a native call: the caller
-samples `hostClock` itself and passes the instant in. Every operation's type
-says so; none of them is in `IO`.
+**Eligibility** reads one `WindowObservation`, in this precedence:
 
-**It knows nothing about a GPU.** It offers opportunities and performs no
-drawing, calls no graphics API, and infers no device readiness whatever. A
-rendering backend built on it must additionally account for presentation
-backpressure and frame completion; nothing here does. Retirement is not
-represented in it at all and is never gated by it: hiding or closing a window
-suppresses its rendering and nothing else, and [the owner turn](#the-owner-turn)
-retires closing windows exactly as it did before.
+1. `WindowClosing` or terminal: `RenderExcluded`, and its state is removed;
+2. a known suspending condition (`Observed False` visible, `Observed True`
+   iconified, or a zero framebuffer dimension): `RenderSuspended`;
+3. an `Unavailable` framebuffer extent: `RenderDeferred`;
+4. otherwise `RenderEligible`.
 
-**Eligibility is the observation, exactly.** `windowRenderEligibility` reads one
-`WindowObservation` and nothing else, in this precedence:
+An `Unavailable` visible or iconified field asserts nothing.
 
-1. a window whose [phase](#lifecycle-phases) is `WindowClosing` or terminal is
-   `RenderExcluded`, with no normal render demand at all, and the turn shown
-   that observation removes its scheduling state;
-2. otherwise a *known* suspending condition — `Observed False` for visible,
-   `Observed True` for iconified, or an `Observed` framebuffer extent with a zero
-   dimension — makes it `RenderSuspended`, even when another field is
-   `Unavailable`;
-3. otherwise an `Unavailable` framebuffer extent makes it `RenderDeferred`:
-   rendering waits until a usable extent is known, and the window is neither
-   offered an opportunity nor counted as suspended;
-4. otherwise it is `RenderEligible`.
+- A capture's immediate demand coalesces into one pending redraw, and its
+  deadline is kept as the earliest pending deadline. An absolute frame
+  deadline never implies a period.
+- A suspended or deferred window keeps its demand and contributes nothing to
+  the reported deadline. Leaving suspension owes exactly one current frame
+  (`windowResumeDue`), held apart from the caller's frame schedule; nothing
+  missed is replayed.
+- Simulation demand is carried independently. A focus or visibility change is
+  never a pause, and simulation demand never marks a window dirty.
+- At most `renderBudgetSize` offers per turn, each window at most once, in
+  identity order starting after the window served last. `n` eligible pending
+  windows with budget `b` are each offered within `⌈n / b⌉` turns.
+- `acknowledgeRender` records the revision an offer served. A newer
+  publication stays pending, and a frame obligation is cleared only when it is
+  still the one the offer carried.
+- A window left out of `renderLive`, or observed in any phase but
+  `WindowOpen`, is removed.
 
-An `Unavailable` visible or iconified field asserts nothing and leaves the
-decision to the other fields, so no observation the platform could not answer is
-invented. A zero framebuffer extent is an ordinary nondrawable observation, as
-[Observations](#observations) says, not a missing one.
-
-**A capture is transferred, not deferred.** Each `WindowRender` carries a
-window's latest observation, what that turn captured from its slot, and the
-absolute frame deadline the application currently wants for it. A capture's
-immediate demand coalesces into one pending redraw and its deadline is kept as
-the earliest pending published deadline, both bounded, both separate from the
-frame schedule the caller may replace on any turn. An absolute frame deadline is
-never enough to infer a period: a deadline already served is not recreated while
-the caller keeps supplying the same instant, a different instant is a new
-obligation, and supplying none removes the demand. Future cadence comes from the
-caller's own next deadline.
-
-**Suspension keeps demand and costs no wait.** A suspended window keeps its
-latest need to redraw, its pending published deadline, and its most recent frame
-request, and contributes nothing to the reported deadline — neither its expired
-deadlines, which would otherwise shorten every wait to nothing, nor its pending
-ones. A deferred window is the same, and keeps its demand until a usable extent
-arrives. Leaving suspension is a resume: it rebases the window's frame schedule
-at the resume instant and owes exactly one current frame, nothing missed is
-replayed, and no state grows with the missed frames. That obligation is held
-apart from the caller's own frame schedule, in `windowResumeDue` rather than
-`windowFrameDue`, precisely because the caller may replace its frame deadline on
-any turn — including while the window is still deferred — and doing so must not
-erase a resume frame nothing has served. A resume into a deferred observation
-therefore still owes its frame however often that schedule changes, and it is
-offered once the window is drawable. An offer names the two obligations
-separately, as `offeredFrame` and `offeredResume`, so an acknowledgement clears
-exactly what that opportunity covered.
-
-**Simulation is carried independently.** The turn's `Demand` is the
-application's own, from [`Hetoimasia.Runtime.UpdatePolicy`](scheduling.md). With
-every window suspended the reported deadline is still the simulation's; with no
-simulation demand and no eligible window work the helper reports
-`NoUpdateDemand`, so the loop waits its fallback bound. Simulation continues
-unless the application explicitly pauses it, a focus or visibility change is
-never a pause, finishing an opportunity never implies simulation demand, and
-simulation demand never marks a window dirty.
-
-**Fairness is a rotation.** At most `renderBudgetSize` opportunities are offered
-per turn, each window at most once, in identity order starting after the window
-served last. The rotation advances on the offers themselves rather than on
-whatever the caller did with them, so for a stable set of `n` continuously
-eligible pending windows and a budget of `b` every one of them is offered within
-`ceiling (n / b)` turns, and a window dirty on every turn cannot starve another.
-Rendering is the caller's; the helper only offers. Eligible due work left beyond
-the budget keeps the next schedule `UpdateImmediately`; work that was offered
-does not by itself, and neither does a deadline that offer already covers, so a
-caller that serves its offers returns to waiting rather than to a wake for work
-it has done. An offer covers the window's whole pending request, its deadline
-included; a frame deadline the offer did not serve, because it was not yet due,
-is still owed and is still reported.
-
-**Acknowledgement is by revision.** `acknowledgeRender` records the revision an
-opportunity served. A publication that arrived after it has been folded in under
-a newer revision and stays pending, so an acknowledgement can never erase a
-newer request, and it is offered again; repeated dirtiness between two
-opportunities coalesces into one, so no backlog of obsolete frames accumulates.
-A frame obligation is cleared only when it is still the one the offer carried.
-
-**Removal is the caller's list, and the window's own phase.** A window left out
-of a turn's `renderLive`, because the host no longer holds it, is removed, as is
-one whose observation reports any phase but `WindowOpen`. A window's
-[demand slot](#demand-slots) closes in the same transaction that publishes
-`WindowClosing`, so the first closing observation is the last thing the helper
-can learn about that window and its state goes then, rather than lingering until
-release. `forgetRenderWindow` removes one outright. The state therefore never
-holds an entry for a window whose slot has closed or that the host no longer
-holds, and a window's entry costs the same however many publications it
-coalesced.
-
-**The reference composition.** `Test.GLFW.Render`'s composition example is the
-worked one to copy: it runs `runScheduledOwnerLoop`, a fixed-step
-`FixedStepPolicy`, and two windows with independent frame cadences and their own
-dirtiness. Each turn's update reads no clock of its own — it takes
-`scheduledNow`, advances the simulation from it, captures each window's slot
-with `captureWindowDemand`, reads each window's observation, and hands
-`renderTurn` those three things plus the frame deadline it owns for each window.
-It then renders what it was offered, acknowledges those offers, rebases the next
-frame deadline of every window whose frame it consumed, and answers
-`ContinueWith (renderSchedule result)`. A future rendering backend replaces the
-rendering and adds its own presentation accounting; the scheduling above is
-already decided here.
+`Test.GLFW.Render`'s composition example is the reference composition.
 
 ### Demand slots
 
-A worker that wants a turn — now, or by a deadline — says so through a
-`DemandPublisher`: the application's, from `hostDemandPublisher`, or one
-window's, from `clientDemandPublisher` on its `WindowClient`. `publishDemand`
-combines the request into the slot, advances the slot's revision, and only then
-wakes the owner, so the state that matters is authoritative before the hint that
-announces it. The owner takes it with `captureHostDemand` or
-`captureWindowDemand`, on its own thread.
+A worker that wants a turn publishes a `DemandRequest` through a
+`DemandPublisher`: the application's (`hostDemandPublisher`) or a window's.
+`publishDemand` combines the request into the slot, advances its revision, and
+only then wakes the owner. There is one slot for the application and one per
+live window, never one per worker or request.
 
-There is one slot for the application and one per live window, created with the
-window and closed in its closing transaction. There is never a slot per worker,
-per request, or per deadline, so the notification state is bounded by the live
-windows however many publishers there are and however often they publish.
+- Requests combine as a monoid: immediate if any asked, and the earliest
+  deadline. A later request never postpones an earlier deadline, and
+  `noDemand` cancels nothing.
+- Capture (`captureHostDemand`, `captureWindowDemand`, owner thread) takes the
+  pending request with its revision and clears exactly what it took. A later
+  publication stays pending.
+- A slot holds a request, not a schedule.
+- A publication has the same cancellation protection as a command admission.
+- A closed slot answers `DemandSlotClosed` and makes no native call.
 
-- **Requests combine, they do not replace.** A `DemandRequest` states immediate
-  demand, an absolute `Instant` deadline, or both, and requests combine as a
-  monoid: immediate if any publisher asked for it, and the earliest deadline any
-  of them requested. A later request can never postpone an earlier pending
-  deadline, and one publisher's `noDemand` can never cancel another's request —
-  it changes nothing and answers `NoDemandPublished`.
-- **Capture is the acknowledgement.** `captureDemand` takes the pending request
-  with its revision and clears exactly what it took, in one transaction. A
-  publication that commits after that capture carries a newer revision and stays
-  pending for the next one, so no acknowledgement of an older revision can erase
-  a newer request and a continuously republishing worker cannot monopolize a
-  turn: its republications coalesce into the one request the next capture takes.
-- **Slots hold requests, not schedules.** An ongoing periodic schedule is the
-  owner's own state, so a captured request never becomes permanent work. What
-  the owner does with a captured request — including how it folds into the next
-  wait — is [the scheduled owner turn's](#the-scheduled-owner-turn);
-  `runOwnerLoop` captures nothing and leaves both to the application.
-- **The same protection as an admission.** A cancellation before the publishing
-  transaction commits publishes nothing. After it commits the request stays
-  pending and its wake is owed uninterruptibly, even if the publisher never
-  learns its own answer. The publishing transaction registers that obligation,
-  so a boundary sees it from the commit.
-- **Closure is terminal.** A closed slot answers `DemandSlotClosed`, records
-  nothing, and makes no native call, so a publisher retained after its window
-  ended or its host quiesced is safe and can resurrect neither.
-
-Deadlines are opaque `Instant` values in the publisher's own clock domain: this
-package compares and stores them, reads no clock, and infers nothing about what
-a deadline means.
+Deadlines are opaque `Instant` values in the publisher's clock domain.
 
 ### Close requests in the owner loop
 
-A close request is captured by the window's own callbacks and reconciled into
-its observation, as [Close requests](#close-requests) describes; the host adds no
-second callback owner. After reconciliation, a request the host has not surfaced
-before appears once in `turnCloseRequests`. The application decides:
-`rejectHostCloseRequest` clears it while it is still that window's latest;
-`honourHostCloseRequest` begins that window's
-[close protocol](#dynamic-windows) while it is still the latest, answering
-`CloseRequestSuperseded` otherwise; and leaving it latched is equally a decision.
-A closing window's requests are not surfaced. Honouring a request begins the
-same close protocol every other entry point begins, so on a protected host it
-also ends that window's graphics admission in the same transaction. The loop
-ends only when `loopUpdate` answers `Finish`, so a close request — the last
-window's included — ends neither the loop nor the runtime, and destroys nothing
-unless the application honours it. The host supplies no default that finishes
-on, or honours, a close request.
+After reconciliation, a close request the host has not surfaced appears once
+in `turnCloseRequests`. The application decides: `rejectHostCloseRequest`
+clears it while it is still the latest; `honourHostCloseRequest` begins the
+close protocol while it is still the latest (`CloseRequestSuperseded`
+otherwise); leaving it latched is also a decision. The loop ends only when the
+update answers `Finish`. The host supplies no default that finishes on or
+honours a close request.
 
 ### Quiescence and shutdown order
 
-`quiesceWindowHost` is the host's quiescence action for
-[`runScopedApplicationWithQuiescence`](resources.md#quiescence), and
-`runWindowApplication` is that runner with the action installed. In one finite,
-non-retrying transaction it closes the admission of the host's port and of every
-window's port, settles every command queued in any of them as `NotExecuted`,
-closes every window's input feed, ending its reads even while a reset waits for
-an acknowledgement, and closes the application's demand slot and every window's.
-On a protected host the same step also ends new graphics use: no later
-attachment is admitted, and every attachment still registering or active begins
-retiring. On a host composed with a graphics owner it then closes the owner's
-publications too ([The exit, which is D-33's](#the-exit-which-is-d-33s), step
-1). It destroys nothing, pumps nothing, makes no GPU call, waits on
-nothing, and repeating it changes nothing. A window's close protocol closes that window's feed and its demand slot
-in its closing transaction the same way.
+`quiesceWindowHost` is the host's quiescence action; `runWindowApplication`
+installs it. In one finite transaction it closes the admission of every port,
+settles every queued command as `NotExecuted`, closes every input feed and
+every demand slot, and on a protected host ends new graphics use and starts
+every attachment retiring. It destroys nothing, pumps nothing, waits on
+nothing, and is idempotent. Wake support stays usable.
 
-Quiescence does not disable wake support: the session's capability stays usable
-for the progress that still has to happen, and internal retirement keeps its own.
-What closes is admission and publication, so a retained port or publisher
-answers a typed rejection and makes no native call. A window whose creation was
-claimed before quiescence and finishes after it is registered already closed —
-its port, its feed, and its demand slot admit nothing, and the `WindowClient` its
-ticket hands over revives none of them — while the window itself is still
-disposed by the final exit. On every exit from the supervised region, the ordinary order is:
+On every exit from the supervised region:
 
-1. quiescence: every port's admission closes, queued callers settle as not
-   executed, and every input feed closes;
-2. supervision asks every live worker to stop and drains them, with every window
-   still registered — closing ones included — live;
-3. the wake path's one guarded reporting attempt, made by `runWindowApplication`
-   once every notification obligation outstanding at that point has been
-   discharged, with every dependency and the logger still live. A cancellation
-   delivered while it is still waiting completes that bounded wait
-   uninterruptibly and spends the attempt before it is re-raised;
-4. the dependency scope unwinds: the host closes every port's admission again, a
-   no-op after quiescence; the collection's final exit releases each remaining
-   window exactly once, newest registration first, keeping every cleanup failure
-   — its latched ones included — under
-   [the failure table](resources.md#the-failure-table); and then the session ends
-   if the host owns it;
+1. quiescence;
+2. supervision stops and drains every worker, with every window still live;
+3. the wake path's one guarded reporting attempt;
+4. the dependency scope unwinds: the collection's final exit releases each
+   remaining window exactly once, newest first, keeping every cleanup failure,
+   then the session ends if the host owns it;
 5. the terminal report, if the run failed, and the final flush.
 
-A close queued behind quiescence settles as `NotExecuted`, and its window is
-disposed once, by the final exit. A window whose earlier retirement failed is
-not released again.
-
-The runtime's two earlier orderings are unchanged: a fatal latch may request
-worker stops before quiescence, and a worker whose managed startup is abandoned
-or cancelled is drained before it. Quiescence neither precedes nor unblocks
-either.
+A window whose creation was claimed before quiescence and finished after it is
+registered already closed. A window whose earlier retirement failed is not
+released again.
 
 ### The protected host lifetime
 
-`withProtectedWindowHost` is the shape
-[`runManagedApplication`](resources.md#managed-dependency-lifetimes) accepts, and
-`runProtectedWindowApplication` is `runWindowApplication` over one of them. It
-invokes its consumer exactly once, synchronously on the calling thread, with
-every dependency it built live, and not at all when its own construction failed.
-Its exit handler is installed under masking before the scope is entered at all,
-so it covers the handoff out of construction and into the consumer — itself a
-point the scope restores at — as well as everything the consumer then does.
-It is the LIFE-3 slice of
-[the window and graphics lifetime design](archive/window_graphics_lifetime_design.md)
-(P-3, D-1 to D-4).
+`withProtectedWindowHost` has the shape
+[`runManagedApplication`](resources.md#managed-dependency-lifetimes) accepts,
+and `runProtectedWindowApplication` is `runWindowApplication` over it. It
+invokes its consumer exactly once, synchronously, with every dependency live.
+Its exit handler is installed under masking before the scope is entered, so it
+covers the handoff into the consumer as well as everything the consumer does.
 
-On **every** exit — a normal return, an action failure, a startup failure, a
-dependency construction failure after host setup, an owner-loop failure, a
-latched supervised failure, and cancellation — the boundary:
+On every exit (normal return, action, startup, construction or owner-loop
+failure, a latched supervised failure, cancellation) the boundary:
 
-1. runs the host's own `quiesceWindowHost` — every port's admission, every input
-   feed, every demand slot, and attachment admission with new graphics use —
-   idempotently and in one finite transaction. This is the host's own safeguard
-   and runs even when the application installed no quiescence hook or omitted
-   the host from one; it does not replace the runtime's ordering, which is what
-   keeps a worker from beginning a use the drain would then have to wait for.
-   Nothing can be admitted or published after it, so the report in step 3 cannot
-   be outrun by a late command or demand;
+1. runs `quiesceWindowHost`, even when the application installed no
+   quiescence hook;
 2. retires every remaining attachment on the owner thread, with every window,
-   the session, and every parent still live;
-3. makes the wake path's one guarded degradation report, now that nothing
-   further can be admitted or published;
-4. returns — and only then do the windows, the session, and the parents unwind
-   in dependency order, followed by the terminal report and the final flush.
+   the session and every parent still live;
+3. makes the wake path's one guarded degradation report;
+4. returns. Only then do windows, session and parents unwind in dependency
+   order, followed by the terminal report and final flush.
 
-Which regions were entered still decides what runs: a dependency construction
-that failed after host setup enters no supervision and installs no application
-quiescence, so steps 2 to 4 happen with no worker drain before them. The fatal
-latch's stop requests, the startup-local drain, and the whole cancellation,
-reporting, and flushing matrix are unchanged.
+**The retirement round.** Retirement runs on the owner thread and calls no
+application hook and no supervisor checkpoint. One round:
 
-#### The retirement progress path
+1. takes and folds every completion notice another thread published;
+2. gives every pending attachment that still has a progress path one bounded
+   opportunity, in registration order;
+3. offers retirement again to every window whose close protocol has begun;
+4. runs native event processing: a poll if the round made progress, otherwise
+   the host's finite wait.
 
-Retirement runs on the owner thread through a narrow path of its own. It calls
-no application event or update hook and no supervisor checkpoint. One round is:
+The round repeats until no attachment is pending. An attachment is pending
+until the model records every one of its retirement facts. No elapsed time,
+cancellation, failure or disposition substitutes for a fact.
 
-1. every completion notice another thread published is taken and folded,
-   revalidated exactly as an owner-thread report is;
-2. every pending attachment that still has a progress path is given one bounded
-   opportunity, in registration order, so a stalled attachment cannot starve one
-   that could still retire;
-3. every window whose close protocol has begun is offered retirement again —
-   in every round, not only one that made progress, so a chain that became safe
-   before the drain and had its destruction deferred is not held by a chain that
-   only awaits or stalls. A window whose own retirement failed is forgotten
-   rather than attempted again, so the retry replays no failed disposal;
-4. native event processing runs — a poll when the round made progress, otherwise
-   the host's configured finite bound — keeping both the events retirement needs
-   and the session's internal wake, which ends that wait, live.
+- Another thread publishes a certified fact as a bounded completion notice
+  with the same wake accounting as an admission. Publication closes in the
+  transaction that first finds nothing pending.
+- Only a fact that recorded new evidence counts as progress and revives a
+  withdrawn path. A refusal or duplicate establishes nothing.
+- A failed or interrupted step keeps its failure on the attachment, withdraws
+  that attachment's progress path, and never marks it safe. The step is not
+  run again.
 
-The round repeats until no registered attachment is pending. An attachment is
-pending until the model records every one of its retirement facts: no elapsed
-time, cancellation, failure, or disposition substitutes for one. A suspended or
-closing window still has retirement demand, because the path iterates
-attachments and never render eligibility.
+**Outcome.** The initiating outcome is recorded before any drain work. A body
+failure stays primary, and drain failures are retained beside it under
+`glfw protected retirement` in the order found, up to a bound beyond which
+they are counted. After a successful body the first drain failure becomes
+primary.
 
-Another thread publishes a certified fact as a bounded completion notice, which
-registers its notification obligation in the transaction that admitted it and
-discharges it with exactly one wake — the same accounting an admission uses — so
-a notice published during retirement really ends the owner's wait, and a wake
-that finds the session terminal enters GLFW not at all. Publication closes in the
-same transaction that first finds nothing pending, so a notice is either folded
-by the drain or refused outright: none can register an obligation after the one
-degradation report has passed.
+**Cancellation.** A cancellation delivered during the drain is deferred,
+establishes no fact, and is re-raised only once retirement is safe, never
+before a window, the session or a parent is released.
 
-Only a fact that recorded evidence the model did not already hold counts as
-progress and revives a withdrawn path — and that holds however the fact reached
-the owner thread. A notice the drain folds and a fact the integration certifies
-directly through `certifyGraphicsFact` on the owner thread obey one rule, so an
-owner-thread integration needs no notice queued to itself to earn the
-opportunity its own certification established. A refusal, and a duplicate of a
-fact already recorded, establish nothing, so neither can make a failed disposal
-run again on either transport. An interrupted step withdraws its path exactly as
-a failed one does: it may have disposed part of what it owns, and nothing knows
-whether running it again would be safe.
+**Stalls.** The [required and optional policy](recovery.md) decides the
+application's disposition only; no disposition authorizes destroying an unsafe
+dependent. As soon as any pending attachment has no path left, the boundary
+keeps the affected chain, writes one warning under `glfw.retirement` (stalled
+count, pending count, the wait bound) and keeps waiting. That diagnostic is
+claimed once and its own failure is retained with the runtime's
+`DiagnosticFailure` mark rather than raised. There is no retirement timeout;
+operator process termination is the escape.
 
-#### Outcome and cancellation
-
-The initiating outcome is recorded before any interruptible drain work. A body
-failure stays primary, and every drain, report, and deferred failure is retained
-beside it under the `glfw protected retirement` cleanup label, in the order the
-boundary found them. Every callback result the boundary depends on — a
-construction's, a rollback's, the stall diagnostic's, and a retirement step's —
-is forced inside the attempt that catches it, so a value that raises only when
-it is demanded is that attempt's failure rather than one escaping it. After a
-successful body the first drain failure becomes primary and later ones are
-retained; beyond a bounded number they are counted rather than kept, so a
-boundary waiting indefinitely cannot grow without bound. The one stall
-diagnostic a drain claims is kept past that bound rather than counted: the
-identity it carries is what keeps the runtime's reporting and the final flush
-off a sink that has already failed, and a drain with enough failed steps to fill
-the bound is exactly the one whose stall it reports. That is one entry beyond
-the bound, not a growing set.
-
-A cancellation delivered during the drain is deferred. It is counted against
-every pending attachment as that attachment's own evidence, establishes no fact,
-never replaces a recorded outcome, and is re-raised only once retirement is
-safe — never before a window, the session, or a parent is released. Repeated
-cancellation is retained the same way. The drain uses interruptible finite waits
-rather than one uninterruptible mask.
-
-#### Failed steps and the stall policy
-
-A failed retirement opportunity keeps its failure and evidence on the
-attachment, withdraws that attachment's progress path rather than replaying the
-step, and never marks it safe. The existing
-[required and optional policy](recovery.md) decides the application's
-disposition alone: a recognized failure under an optional disposition leaves
-that component unavailable, while a required failure, an unrecognized one, a
-cancellation, and one that retained cleanup evidence stay fatal. No disposition
-authorizes destroying an unsafe dependent. A withdrawn path resumes only through
-an explicit safe progress path — independent evidence for that attachment.
-
-As soon as any pending attachment has no path left — not only when every one of
-them has, because a chain beside it that is merely awaiting must not be able to
-keep the stall from being reported — the boundary retains the affected chain,
-ceases unsafe work, writes one warning under `glfw.retirement` naming how many
-of the attachments still pending are stalled, how many are pending at all, and
-the finite bound it waits, and keeps waiting. That diagnostic is claimed once
-whatever it records, and its own failure is retained
-rather than raised: a failing diagnostic may not unwind what the stall is
-holding. That failure carries the runtime's `DiagnosticFailure` mark, added
-around the whole attempt — the write and the forcing of its result — so whether
-the exit settles it as the run's own failure or retains it beside one the body
-already raised, the runtime makes no further write through the sink that just
-failed and the logging lifetime attempts no final flush through it, exactly as
-[a failed wake warning](#the-degradation-policy) does and by the same two
-mechanisms: the mark when the failure leaves as the run's own, and the
-`ReportFailed` outcome the runner records on the lifetime when an application
-failure stays primary. A cancellation delivered during the attempt is left
-unmarked and deferred as every other one is. No retirement timeout is
-configured; were one added it could only annotate that entry, never grant
-authority to destroy anything. Operator process termination is the escape.
-
-#### The private attachment seam
-
-`attachHostWindow`, `hostAttachmentIdentity`, `hostAttachmentView`, and
-`reportHostRetirementFact` stay in the private `runtime-glfw-core` sublibrary
-for this package's own examples.
-[The public attachment contract](#the-public-attachment-contract) below is what
-an application outside the package reaches, and it is this seam underneath: the
-same reservation, the same ordering, the same model. The seam is entered from
-the protected lifetime's own
-consumer path — the consumer it was given, or the private hook that runs just
-before it — never from the host's construction, which the exit handler does not
-yet cover. An attachment reserves its window, registers its protocol,
-constructs, and only then publishes — in that order and no other — so a
-cancellation at any handoff leaves the attachment registered and retiring rather
-than a constructed dependent outside registration, and nothing usable is
-published before construction and registration have both completed. A
-construction failure runs the integration's owned rollback and keeps its
-original failure with that rollback's outcome as the attachment's evidence; only
-a safe rollback retires it.
-
-Before any of that, the attach call demands the protocol's own declarations —
-`protocolCompletion` and `protocolDisposition` — inside its own exception
-boundary. They are values the boundary reads rather than callbacks it enters, so
-a lazy one that raises when it is demanded would otherwise raise wherever a
-later boundary happened to read it: on an ordinary owner turn, or inside
-`drainRetirement`, which owes the protected exit that it raises nothing.
-Demanded here, such a failure answers `AttachmentMetadataRejected` and has
-reserved no slot, registered no protocol, entered no construction, run no
-rollback, and acquired nothing; it names no attachment, because none was issued.
-A cancellation delivered while they are demanded is this thread's own and is
-re-raised, exactly as one delivered an instant earlier would be. The callbacks
-are not demanded there: each is entered inside a handler that already answers
-its own failure.
-
-Every later boundary that reads a declaration demands it the same way, inside a
-handler of its own, so containment does not rest on the preflight having run.
-A declaration that fails after acquisition — which an immutable, already
-evaluated value cannot do on its own, and which the package's own examples
-therefore reach through an after-acquisition test seam — is recorded as that
-attachment's evidence and withdraws its progress path. It is evidence and never
-a fact: it retires nothing and authorizes destroying nothing, so the attachment,
-its window, the session, and every parent stay until independent certified
-evidence retires it. In the drain it settles into the same `DrainOutcome` a
-failed step does, behind an existing body failure and with a cancellation still
-deferred until retirement is safe.
-
-The rollback is trusted but not infallible, and construction is settled whatever
-it does. A rollback that raises or is cancelled established no safety, so it is
-recorded as unsafe: the attachment is retained owing every fact rather than left
-with its construction pending, where no fact could ever be recorded and the
-drain could never finish. Its own failure is retained beside the construction
-failure the model keeps first, and a cancelled construction re-raises with it
-retained under `glfw attachment rollback`. A cancellation the rollback itself
-received is equally this thread's to answer: it is re-raised with the
-synchronous construction failure retained beside it, never traded for it. Because a safe rollback retires the
-attachment and removes its evidence with it, the answer carries the original
-construction failure and the rollback's own back to the integration that
-attached; this boundary raises neither.
-
-#### Examples
-
-The examples in `glfw-tests` (`--match "protected host"`) run whole applications
-over the seam and assert an order of flags, never a time: scripted graphics
-owners note each obligation they end, the seam's own destroy and terminate hooks
-note the native calls, and a scripted parent notes its release, so one list shows
-admission closing, each chain retiring, each window being destroyed, the session
-ending, and the parent being released in the order they happened. The seam's
-finite wait blocks until an empty event has been posted, so a round with nothing
-to do really waits and a completion published from another thread really ends
-it. They cover each exit path above with that order verified; an omitted
-quiescence hook with the host's own close still running; construction failure
-with safe and with unsafe rollback, and no consumer entered when the host's own
-setup fails; cancellation queued during construction, during the drain, and
-repeatedly; a latched supervised failure before the drain; two attachments where
-only one can retire, with the other's window, the session, and a scripted parent
-retained while the first retires and its closed window is destroyed; a window
-that became safe before the drain being destroyed in a round that made no
-progress at all; one completion notice per fact per window admitted at once; a
-rollback that itself fails, one that is cancelled, and one cancelled after a
-construction that failed synchronously, each retained rather than stranded in
-construction and each re-raising what it received; the window limit's bounds; a
-cancellation queued in the handoff out of construction, which reaches neither
-the consumer path nor startup and which the exit still settles; an attachment
-made on that consumer path which then fails or is cancelled, drained as the
-consumer's own are; a notice refused once retirement is complete; a command and
-a demand refused once the exit has closed the host; a stalled chain reported
-beside one that only ever awaits; a body failure kept as the exact primary
-exception with the drain's own retained beside it under `glfw protected
-retirement`, and two of them retained in the order they happened; a
-construction, a rollback, and a diagnostic sink whose results raise only when
-demanded, each caught inside its own attempt; an interrupted step
-withdrawn rather than run again; a duplicate and a refused notice reviving
-nothing; a cancellation queued while the window's own destruction is in flight,
-which defers until the session and a parent have outlived it; a stalled
-attachment finishing on later independent evidence, with the stall reported
-once; a stall diagnostic that itself fails, unwinding nothing; through a sink
-that counts its flushes, that same failing diagnostic settling as the run's own
-failure with the diagnostic-failure identity, no second write, and no flush,
-and settling beside an action failure that stays primary and unmarked with the
-diagnostic's retained under `glfw protected retirement`, and a cancellation at
-that sink deferred as a cancellation until retirement is safe, and that same
-failing diagnostic kept rather than elided where ten failed steps have already
-filled the retained bound, so the second write and the flush are still not
-made; the wake path's
-own warning failing at this exit's boundary through the same sink, alone and
-beside an action failure that stays primary, with the window and the session
-live when it was written and released only afterwards; a declaration
-that raises while the drain demands it, contained as that attachment's evidence
-with its step never entered, its window and the session retained until
-independent evidence retires it, and the failure settled only afterwards; required and
-recognized-optional retirement-step failures with their evidence retained and
-their dispositions applied; closing a privately attached window during the run,
-which destroys nothing until every fact is certified; and a host built by
-`allocWindowHost` refusing registration. The opacity examples compile external
-clients that ask the public sublibrary for the attachment seam and reach for the
-retirement boundary in the private implementation, and both are refused, while
-the accepted client builds and runs a protected host through the public
-interface. One `glfw-native-tests` scenario
-(`--match "protected host"`) repeats the lifetime in a child process of its own
-over a real session, proving the window's native destruction follows the
-scripted owner's completion and the termination follows that destruction, with
-no event, wake, or window call entering GLFW afterwards. It claims nothing about
-GPU synchronization: the owner is a script and its facts are CPU facts.
+**The private seam.** `attachHostWindow` and its siblings stay in
+`runtime-glfw-core` for the package's own examples; the public contract below
+is the same reservation, ordering and model. An attachment reserves its
+window, registers its protocol, constructs, and only then publishes, so a
+cancellation at any handoff leaves it registered and retiring. The protocol's
+declarations are demanded inside the attach call's own exception boundary
+(`AttachmentMetadataRejected`, with nothing acquired). A rollback that raises
+or is cancelled is recorded as unsafe: the attachment is retained owing every
+fact.
 
 ### The public attachment contract
 
-One window may have one exclusive graphics owner. `attachWindowGraphics` is the
-whole way in, and it exists only for a host built by the protected lifetime; a
-host built with `allocWindowHost` answers `GraphicsHostUnprotected` before any
-effect, because it was issued no identity an attachment could name. It is the
-LIFE-4 slice of
-[the window and graphics lifetime design](archive/window_graphics_lifetime_design.md)
-(P-1, P-2, D-1 to D-4).
+One window may have one exclusive graphics owner. `attachWindowGraphics` is
+the whole way in and exists only for a host built by the protected lifetime.
+Nothing here creates a surface, submits GPU work or waits on a device.
+Evidence that GPU work completed is the backend's own, supplied through the
+facts its owner certifies.
 
-Nothing here creates a surface, submits GPU work, or waits on a device.
-**Evidence that GPU work has completed is the backend's own**, supplied through
-the facts its owner certifies; which Vulkan mechanism proves it is the Vulkan
-design's open question (Q-3) and is not decided here.
+#### Attaching
 
-#### Attaching and the opaque service
-
-`attachWindowGraphics host window owner` runs on the owner thread and takes the
-caller's own `AttachmentProtocol`: how to construct the dependents, how to roll
-a failed construction back, one bounded retirement step, the `CompletionPolicy`
-those steps are offered under, how a failed step is classified, and what to do
-before the window is hidden (`protocolBeforeHide`). The boundary
-supplies the exclusivity, the ordering, and the retirement rule, and nothing
-else.
+`attachWindowGraphics host window owner` runs on the owner thread and takes
+the caller's `AttachmentProtocol`: how to construct the dependents, how to
+roll a failed construction back, one bounded retirement step, the
+`CompletionPolicy`, how a failed step is classified, and what to do before the
+window is hidden. The boundary supplies exclusivity, ordering and the
+retirement rule.
 
 Every callback runs on the owner thread, outside every transaction, native
-callback, and release. It may do finite, nonblocking native and backend work —
-constructing dependents, querying, handing work to the graphics owner, and safe
-disposal — and may not wait on a GPU, wait on a worker, or pump native events;
-`protocolStep` is one bounded opportunity that returns finitely. The one
-exception is `protocolBeforeHide`, which may wait for the graphics owner's step
-in flight to end, and no longer ([Hiding an attached window](#hiding-an-attached-window)). That work does
-not move the graphics owner's responsibilities into a callback: under the
-[lifetime design's D-6](archive/window_graphics_lifetime_design.md#d-6-the-graphics-owner-survives-worker-drain-and-retires-on-its-own-thread),
-GPU effects and graphics-owned disposal execute on the graphics owner, and a
-callback that creates a main-thread resource such as a surface hands it to that
-owner under the retained attachment, then requests or observes the owner's
-progress without waiting for it.
+callback and release. It may do finite, nonblocking native and backend work.
+It may not wait on a GPU or a worker or pump native events. The one exception
+is `protocolBeforeHide`, which may wait for the graphics owner's step in
+flight. GPU effects and graphics-owned disposal execute on the graphics owner,
+not in a callback.
 
-Every refusal is answered **before any acquisition effect**, so a refused
-attachment has constructed nothing:
+Every refusal is answered before any acquisition effect:
 
 | Answer | Meaning |
 |---|---|
 | `GraphicsRefused (GraphicsWindowClosing w)` | The window's close protocol has begun |
-| `GraphicsRefused (GraphicsWindowUnavailable w)` | This host holds no such open window: a window of another host of the same session, or one of its own that has ended |
-| `GraphicsRefused (GraphicsWindowOccupied a)` | Another owner holds the slot, and holds it until it has safely retired |
+| `GraphicsRefused (GraphicsWindowUnavailable w)` | This host holds no such open window |
+| `GraphicsRefused (GraphicsWindowOccupied a)` | Another owner holds the slot until it has safely retired |
 | `GraphicsRefused GraphicsForeignSession` | The window belongs to another session |
-| `GraphicsRefused GraphicsAdmissionEnded` | Attachment admission has closed; no new graphics use may begin |
-| `GraphicsMetadataRejected r` | A declaration the protocol carries raised when it was demanded |
-| `GraphicsHostUnprotected` | The host owns no retirement state at all |
+| `GraphicsRefused GraphicsAdmissionEnded` | Attachment admission has closed |
+| `GraphicsMetadataRejected r` | A declaration the protocol carries raised when demanded |
+| `GraphicsHostUnprotected` | The host owns no retirement state |
 
-`CompletionPolicy` and `Disposition` are declarations rather than calls, and the
-boundary reads them itself on every round it offers the owner. Both are
-therefore **demanded inside the attach call, before anything is reserved**. One
-that raises when it is demanded answers `GraphicsMetadataRejected`, carrying the
-failure with the context it propagated with and naming no attachment, because
-none was issued: no slot was reserved, no protocol registered, no construction
-entered, and no rollback run, so there is nothing to retire and the window's
-slot is left exactly as it was found. The other five fields are callbacks, each
-entered inside a handler that already answers its own failure, so none is
-demanded early.
+On success the application receives a `GraphicsService` and nothing else. It
+exposes the attachment's identity, incarnation, window identity and
+observation, and carries no native pointer and no authority to destroy,
+release or certify. It is published only after construction and registration
+have both completed.
 
-A window of another host of the same session and one of this host's own that has
-ended are deliberately one answer. Telling them apart would need a record of
-every window this host ever held, and nothing in this boundary grows with how
-many windows were ever made; a window of another *session* is named as such
-because the session identity is carried by the window itself. Either way the
-refusal comes before any acquisition effect, which is what the contract
-requires.
-
-On success the application is handed a `GraphicsService` and **nothing else**.
-Its representation is private: it exposes the attachment's identity, its
-incarnation, its window's identity, and its own observation, and it carries no
-native pointer, no window, no session, and no authority to destroy, release, or
-certify anything. It is published only once construction and registration have
-both completed, so a value of this type never names an attachment still being
-built.
-
-A construction that fails runs the caller's own rollback and answers
-`GraphicsRolledBack`. A rollback that established safety retires the attachment
-and frees the slot. One that could not — including a rollback that itself raised
-or was cancelled — **retains** the attachment: the controller keeps the window,
-the exclusive slot, and every dependency the construction left, with the
-original failure and the rollback's own as evidence, until each retirement fact
-is certified separately. Nothing usable is published either way, and no
-retirement is fabricated. A reservation that retirement has already begun on by the time its service would
-be published — a close, a detach, or quiescence overtook it, while the
-construction ran or in the handoff after it settled — answers
-`GraphicsSuperseded`: its dependents stay registered for retirement and nothing
-usable is published. The check and the publication commit together, so no
-service is ever handed back for an owner that may admit no use.
-
-One protected region covers the reservation, the construction, and the
-publication together. An interruption anywhere inside it leaves nothing
-admitting use that nobody can end: the reservation itself is what frees an
-earlier incarnation's bookkeeping, and an interruption after the attachment
-became active is counted as the model's own evidence and begins exactly the
-retirement a detach begins, so an owner turn retires it and frees the slot even
-though no service was ever handed over. The failure is re-raised unchanged and
-establishes no fact. A construction that was cancelled, and a rollback that
-could not establish safety, re-raise rather than answering, and they say the
-same thing to the schedule that an answered retirement does.
-
-One instant is beyond any handler: an interruption can reach the calling thread
-as the operation restores its masking state, with the attachment already active
-and its service already published. Nothing in Haskell can catch a value's
-delivery, so the contract promises something else instead — that such an
-attachment is never unreachable. `windowGraphicsService` hands the very same
-service back by window, so a caller that catches such an interruption and keeps
-running can detach exactly what it attached.
+- A failed construction runs the caller's rollback and answers
+  `GraphicsRolledBack`. A safe rollback retires the attachment and frees the
+  slot. One that could not establish safety retains the attachment, its window
+  and slot until each retirement fact is certified.
+- A reservation that retirement already began on before its service would be
+  published answers `GraphicsSuperseded`; its dependents stay registered for
+  retirement.
+- One protected region covers reservation, construction and publication. An
+  interruption after the attachment became active begins the retirement a
+  detach begins. `windowGraphicsService` hands the same service back by
+  window, so an attachment is never unreachable.
 
 #### Observing the slot
 
-`windowGraphicsStatus host window` reads a window's slot in one transaction,
-from any thread, and answers without inference: `GraphicsAbsent` when the host
-holds the window and no owner is attached, `GraphicsWindowUnknown` when it holds
-no such window, and `GraphicsPresent` with a `GraphicsObservation` otherwise.
-`readGraphicsService` reads the same observation from a retained service.
+`windowGraphicsStatus host window` reads a slot in one transaction from any
+thread: `GraphicsAbsent`, `GraphicsWindowUnknown`, or `GraphicsPresent` with
+an observation. `readGraphicsService` reads the same from a retained service.
+An observation names the incarnation, whether the slot is `SlotAttached`,
+`SlotRetiring` or `SlotFree`, which
+[retirement facts](#retirement-facts) are missing, and the window's native
+disposal: `DisposalPending`, `DisposalCompleted` or `DisposalFailed`.
 
-An observation names the incarnation that held the slot, whether it is
-`SlotAttached`, `SlotRetiring`, or `SlotFree`, which of
-[the retirement facts](#retirement-facts) are still missing, and whether the
-window's own native destruction has completed — `DisposalPending`,
-`DisposalCompleted`, or `DisposalFailed`. The disposal is deliberately distinct
-from the retirement: a retired attachment stops vetoing destruction, and the
-host's close protocol and its ordinary borrows still decide when it happens. A
-failed native release is never reported as a successful destruction; it is
-latched by the collection, never attempted again, and reported here as
-`DisposalFailed`.
+- Disposal is distinct from retirement. A retired attachment stops vetoing
+  destruction; the close protocol and borrows decide when it happens. A failed
+  native release is never reported as a destruction.
+- A close or quiescence is readable from the retained service in the
+  transaction that commits it.
+- A retained service keeps answering after the host forgot its window. The
+  host keeps at most one cell per held window, so repeated detach and reattach
+  grows no history.
 
-Every transition an owner's admission ends in is written to its retained service
-in the very transaction that ends it: a close, and a quiescence that ends
-attachment admission without closing any window, are both readable from the
-service the moment they commit, without waiting for an owner turn.
-
-A retained service keeps answering after the host has forgotten its window, and
-after the whole application has ended: the cell lives with the value that holds
-it. The host itself keeps at most one cell per window it still holds, and stops
-holding one in the very transaction that reserves a later incarnation of that
-window — so whatever becomes of that reservation, including one that rolls back,
-is superseded, or is cancelled without ever returning, repeated detaching and
-reattaching grows no incarnation history the host owns, and a disposal is never
-credited to an incarnation the slot has moved past. A service observes its
-window's native disposal when its own incarnation was that window's last; an
-earlier one keeps `SlotFree` with the disposal its own lifetime ended with.
-
-A disposal is recorded wherever the window is really released. A window the
-close protocol retired is recorded there; a window nobody ever closed is
-released by the collection's own exit instead, and the host's last release step
-runs after that exit and tells each cell it still holds what its member's
-settled status says — a destruction that happened, or a release that failed. It
-fills only a disposal still pending, so nothing already recorded is rewritten.
-
-`windowGraphicsService` answers a window's current owner's service, which is the
-one that attachment published — the same identity and the same retained cell, so
-it is equal to it and interchangeable with it. A free slot, a window the host no
-longer holds, and a reservation that never published answer `Nothing`. It builds
-no new capability: everything it names, the host already holds.
-
-`hostPendingAttachments` lists the attachments the host still holds, in
-registration order, bounded by the live-window limit.
+`hostPendingAttachments` lists the attachments the host still holds.
 
 #### Close and detach
 
-On an accepted close — through a close command, `closeHostWindow`, or
-`honourHostCloseRequest` — the same transaction that marks the window closing
-and closes its port ends the attachment's admission of new use and records its
-logical release, so no new render use can begin after the closing phase is
-observable. Retirement then proceeds through the owner's own protocol on owner
-turns, and native destruction happens only once the model records the attachment
-retired **and** the ordinary borrow rule is satisfied. The close ticket's
-`WindowCloseBegun`, the input closure, and the observation phases are exactly
-what they were.
+On an accepted close, the transaction that marks the window closing also ends
+the attachment's admission of new use. Native destruction happens only once
+the model records the attachment retired and the borrow rule is satisfied.
 
-`detachWindowGraphics host service` asks, on the owner thread, to retire the
-current owner while its window stays open. It uses the same retirement protocol
-a close uses, and the exclusive slot frees only after safe disposal. A later
-attachment then gets a **fresh incarnation**, against which the earlier owner's
-acknowledgement is refused and releases nothing. Detaching an owner that has
-already retired, or one that is already retiring, is a typed no-op —
-`DetachAbsent` or `DetachAlreadyRetiring` — not a failure. Swapping render
-modules inside one backend is not a detach and never reaches this boundary.
+`detachWindowGraphics host service` retires the current owner while its window
+stays open, through the same protocol. A later attachment gets a fresh
+incarnation, against which the earlier owner's acknowledgement is refused.
+Detaching a retired or retiring owner answers `DetachAbsent` or
+`DetachAlreadyRetiring`.
 
 #### Hiding an attached window
 
-A hide is the one window control that consults the window's attachment first
-([#357](https://github.com/coghex/hetoimasia/issues/357)). A hide's native
-call can unmap the window's surface, and a compositor need not answer a
-presentation made for a surface it no longer shows: on Wayland, Weston 13
-offers no `wp_fifo_v1`, so Mesa's FIFO present waits, with no timeout, for the
-frame callback its swapchain's previous presentation requested, and Weston
-sends none for an unmapped surface. The engine learns a window was hidden only
-from the observation published after the call, which is too late.
+A hide's native call can unmap the window's surface, and a compositor need not
+answer a presentation made for a surface it no longer shows (on Wayland with
+Weston 13, Mesa's FIFO present then waits with no timeout). So before a hide's
+native call the host runs `protocolBeforeHide` of the attachment holding the
+window's slot, whatever its phase. It returns once the owner will present to
+the window no more until an observation newer than the one already published
+arrives, and answers the action that lifts the hold.
 
-So before a hide command's native call, the host runs the protocol of the
-attachment holding the window's slot, whatever its phase:
-`protocolBeforeHide attachment` returns once the owner will present to the
-window no more until an observation newer than the one already published for
-it arrives, and answers the action that lifts that hold. The hidden window's
-own observation is newer, so a hide that made its native call keeps the hold
-until then — including one whose call reported an error, since its sample
-still publishes — and one that raised keeps it too. A hide that made no native
-call — refused, or unsupported by the platform — changed nothing, and the host
-lifts the hold at once. A window with no attachment, and every other control,
-is executed exactly as before.
-
-Two routes reach a host window's native hide, and both take that hold
-([#368](https://github.com/coghex/hetoimasia/issues/368)):
-
-- **Through the host's ports** — the host's command port or a window's own.
-  The host's command executor takes the hold before the command's checks run
-  and lifts it when no native call was made, as above.
-- **Directly, through a lent window.** `withHostWindow` lends a copy of the
-  window carrying a hide guard (`guardWindowHide`, in the model's
-  `Hetoimasia.GLFW.Internal.Window.State`), so a hide made on it — by
-  `performWindowCommand` with a command host the application built over the
-  session it gave `withGraphicsOwnerHostIn`, or by any other control route —
-  takes the hold through the same protocol. The guard runs after every check
-  has admitted the hide and immediately before its native call, so a hide
-  refused, unsupported or not attempted takes no hold, and one that was made
-  keeps it until the hidden window's observation is folded. The model package
-  learns nothing of attachments: the guard is an opaque owner-thread action
-  the host supplies.
-
-On both, the hold is asked of whichever attachment occupies the window's slot
-when it is taken, whatever its phase: an attachment that is retiring is still
-asked, a window whose slot has been freed hides as an unattached one does, and
-a window detached and reattached is protected by its new attachment alone.
-Neither route changes the command's owner, liveness, closure and scope checks
-or their answers. A window `withWindow` lends belongs to no host and can hold
-no attachment, so it is hidden exactly as before.
-
-The graphics owner's protocol implements it with a **presentation hold**
-(`Hetoimasia.Runtime.GLFW.Internal.Owner.Withhold`): the hold is recorded
-against the attachment, bound to the observation revision already published
-for it, and the main thread then waits while the owner's step in flight, if
-any, may present to that target: one that views it as constructed and
-`RenderEligible`, since a backend presents to no other target. A hide of a
-window whose target is suspended, deferred or not yet constructed therefore
-never waits, whatever another target's presentation is doing. The set of
-targets a step may present to is recorded with its inputs and cleared when it
-returns, under one mask, and again when the owner's run ends, so no
-cancellation leaves a hide waiting on a step that has gone. Every later step reads the hold in the
-transaction that reads its inputs, views the target as `RenderSuspended` until
-it has folded a newer observation, and carries the target's **withdrawal
-count** (`viewWithdrawals`), which rises with every hold a step applies. A
-backend that sees it rise must not present again to anything the target
-presented to before the hide — its last presentation may never be answered —
-even if a show followed so quickly that no view in between was suspended. A
-step must return finitely and the owner never waits for the main thread, so
-the main thread waits for one step at most, pumps nothing meanwhile, and never
-waits for an idle owner, one still starting, or one whose step cannot present
-to the window. Minimizing, and anything the platform does to a window on its
-own, is not held: the target is suspended from the observation that reports it,
-as before.
+- A hide that made its native call keeps the hold until the hidden window's
+  observation is folded. A hide that made no native call lifts it at once.
+- Both routes take the hold: the host's ports, and a window lent by
+  `withHostWindow`, which carries a hide guard that runs after every check and
+  immediately before the native call.
+- The graphics owner implements it as a presentation hold bound to the
+  published observation revision. The main thread waits only while a step in
+  flight may present to that target (one constructed and `RenderEligible`),
+  and for one step at most. Later steps view the target as `RenderSuspended`
+  until they fold a newer observation, and carry its withdrawal count
+  (`viewWithdrawals`). A backend that sees the count rise must not present
+  again to anything the target presented to before the hide.
+- Minimizing, and anything the platform does on its own, is not held.
 
 #### Progress and scheduling
 
 Retirement runs while the application runs. Each owner turn offers at most
-`hostRetirementBudget` opportunities, in rotating order across the attachments
-that have begun retiring, starting after the one the previous turn served last.
-One window's pending retirement therefore never blocks another window's
-commands, close, attachment, or retirement, and a stalled owner starves nobody.
-Rotation is what guarantees a first opportunity: a round whose single offer
-stalls must not let the next turn wait before the attachment beside it has ever
-been offered one.
-An attachment that has not begun retiring is offered nothing: the model refuses
-every fact before retirement has begun, so a step there could establish nothing.
+`hostRetirementBudget` opportunities, rotating across the attachments that
+have begun retiring. One window's pending retirement never blocks another
+window's commands, close, attachment or retirement.
 
-Each opportunity either advances finitely, keeps its path with
-`RetirementAwaiting`, keeps it and names the absolute instant at which progress
-may next be possible with `RetirementAwaitingUntil`, or withdraws it with
-`RetirementStalled`. A withdrawn path is never replayed; only independent
-evidence revives it.
-
-That rule is the evidence's, not the transport's. A retirement fact the model
-did not already hold revives the attachment's withdrawn path whether it was
-certified directly on the owner thread through `certifyGraphicsFact` or
-published from another thread and folded from a notice; the next owner turn, or
-the next drain round, then offers that attachment one bounded opportunity, still
-under the rotating budget and still refused outright if its owner declares a
-blocking step. Evidence that establishes nothing revives nothing, on either
-transport: a duplicate of a fact already recorded, an attachment that has
-already retired, and a refused report — a stale acknowledgement, a foreign or
-replaced incarnation, a retirement not yet begun — all leave the path withdrawn,
-so no failed or interrupted step is ever run again without fresh evidence. A
-fact that completes the retirement frees the window rather than earning another
-opportunity: the registration is forgotten in the same transaction.
-
-Each attachment's own latest answer is retained beside its registration, so the
-boundary can tell an attachment nobody has offered an opportunity to yet from
-one already inspected and known to be waiting. It is the latest answer and not a
-history: a later `RetirementAwaitingUntil` replaces the instant an earlier one
-named, a `RetirementAwaiting` clears that instant, and withdrawing the path or
-retiring the attachment removes its contribution altogether. New evidence
-invalidates it — the assessment was made against what the model held before that
-evidence arrived — so a revived attachment is owed another opportunity before
-any turn waits on it again, exactly as a newly begun retirement is. It is one
-small value per live registration, so the whole of it stays bounded by the
-window limit and needs no thread, timer, or larger budget.
-
-Where that is *said* differs by transport, because the two arrive at different
-moments. A notice is folded by the very round that reads the demand, so that
-round's own accounting already sees the attachment it revived, and the wake the
-notice registered is what ends the wait it was published into. A fact certified
-directly on the owner thread through `certifyGraphicsFact` has neither: it is
-recorded between two rounds, with no wake to ride. So recording one answers both
-of the demand's scheduling questions afresh in the same transaction, from what
-the registrations then say. Evidence that revives an attachment makes the turn
-after it immediate, so the attachment is offered the opportunity that evidence
-earned it rather than waiting the idle bound or an instant the same evidence has
-just outdated; evidence that *completes* a retirement does the opposite, taking
-the retired attachment's own instant and its claim on the next turn away with
-it, because it is waiting on nothing and is owed nothing. Neither answer loses
-anything the last round said: a retirement begun since then has never been
-offered an opportunity and is reported owed on its own, and an attachment a
-round advanced is either still pending and wanting another opportunity or has
-retired and released its window in that same turn. Only evidence the model did
-not already hold answers anything; a duplicate and a refusal establish nothing
-and leave the demand exactly as the last round published it.
-
-`hostRetirementDemand` publishes what the last round left owed: how many
-attachments are pending, how many are stalled, how many opportunities were
-refused, whether another opportunity is wanted at once, and the earliest instant
-any waiting attachment is waiting until — across every one of them, not only the
-ones that round reached, so a budgeted round never lengthens the wait past an
-instant an earlier round learned. Another opportunity is wanted at once when the
-round advanced something, or when some attachment is owed one it has not had: a
-retirement no round has yet offered one to, one whose path fresh evidence has
-just revived, or one whose latest opportunity advanced — and that stays true
-while later rounds leave it unserved. A transaction that *begins* a retirement —
-a close, a detach, quiescence, a superseded publication, a retained rollback, an
-interrupted handoff — says so there too, because that retirement has never been
-offered an opportunity and the turn after it must not wait its idle bound before
-giving it one. A host with nothing retiring, and every ordinary host, leave the
-demand empty.
-
-Attachments that have all been inspected and are waiting owe nothing, however
-many of them the budget leaves unserved. That is what keeps a set of waiting
-attachments larger than `hostRetirementBudget` an ordinary idle host rather than
-an unbounded stream of polling turns: the budget bounds how many opportunities a
-round offers, and never by itself decides whether the next turn may wait.
-[The scheduled owner loop](#the-scheduled-owner-turn) reads the demand in the
-same inspection that captures application demand, so a retirement instant
-shortens that turn's wait exactly as an application deadline does — never
-lengthens it — an instant already reached still polls the turn for it, and a
-round that advanced or left an attachment owed an opportunity makes the next
-turn poll. Otherwise the turn waits toward the earliest instant the waiting
-attachments named, bounded by `hostIdleWait`, and a turn with no other work does
-not poll. The unscheduled loop reads the same flag and does not wait when a
-retirement wants another opportunity now.
-
-No opportunity performs a blocking GPU wait. The boundary cannot inspect
-arbitrary backend `IO` to prove it returns — finite, nonblocking progress is the
-trusted backend's own contract, and budgets bound opportunities rather than
-wall-clock time in a native call. What it can refuse, it does: an owner whose
-`CompletionPolicy` is `BlockingCompletion` is refused every opportunity **before
-its step runs**, its path is withdrawn, and the refusal is counted in the demand
-the turn publishes. A backend that blocks inside a native call limits the
-latency this contract can claim, and must document that.
-
-Reading that declaration is itself protected. Every boundary that reads one —
-the running owner turn and the protected exit's own drain alike — demands
-`protocolCompletion` and `protocolDisposition` inside a handler of its own, so
-neither ever raises a declaration's failure out of ordinary progress or out of
-the drain, whose contract is that it raises nothing. Because both are demanded
-when the attachment is made, an evaluated, immutable declaration cannot begin
-failing afterwards; the containment is what the boundary owes a trusted input it
-re-reads, and the package's own examples reach that state through an
-after-acquisition test seam. When it does fire, the failure is recorded as that
-attachment's own evidence and its progress path is withdrawn, exactly as a
-failed step's is. It certifies nothing and **authorizes destroying nothing**:
-the attachment, its window, the session, and every parent are retained until
-independent certified evidence retires it, and in the drain the failure settles
-into the same outcome a failed step's does — behind an existing body failure,
-with a cancellation still deferred until retirement is safe.
-
-Progress runs on the main thread, outside every foundation finalizer, as a
-trusted narrow component operation. It runs no input, event, or game handler and
-no supervisor checkpoint.
+- Each opportunity advances, keeps its path (`RetirementAwaiting`, or
+  `RetirementAwaitingUntil` an absolute instant), or withdraws it
+  (`RetirementStalled`). A withdrawn path is never replayed; only new evidence
+  revives it, whether certified on the owner thread (`certifyGraphicsFact`) or
+  folded from a notice.
+- `hostRetirementDemand` publishes what the last round left owed: pending,
+  stalled and refused counts, whether another opportunity is wanted at once,
+  and the earliest instant any waiting attachment named.
+- Another opportunity is wanted at once when a round advanced something, or
+  an attachment is owed one it has not had (a retirement just begun, or a path
+  just revived). Attachments that have all been inspected and are waiting owe
+  nothing, so a set larger than the budget is an ordinary idle host.
+- The scheduled loop reads the demand in its inspection: a retirement instant
+  shortens the wait like an application deadline. The unscheduled loop does
+  not wait when a retirement wants an opportunity now.
+- An owner whose `CompletionPolicy` is `BlockingCompletion` is refused every
+  opportunity before its step runs, and its path is withdrawn. Finite,
+  nonblocking progress is otherwise the trusted backend's own contract.
+- A declaration that fails when re-read is recorded as that attachment's
+  evidence and withdraws its path. It certifies nothing and authorizes
+  destroying nothing.
 
 #### Authority and races
 
-Only the owner thread advances, completes, or removes an attachment.
-`attachWindowGraphics`, `detachWindowGraphics`, and `certifyGraphicsFact` refuse
-any other thread with `NotSessionOwner`. Other threads read state —
-`windowGraphicsStatus`, `readGraphicsService`, `hostRetirementDemand`,
-`hostPendingAttachments` — and publish bounded completion notices through
-`hostGraphicsPublisher`, which the owner folds. A notice carries no authority
-over the model: it is revalidated on the owner thread exactly as an owner-thread
-report is, it wakes the owner exactly as a command admission does, and the inbox
-holds one notice per fact per window the host may hold. Publication closes in
-the same transaction the exit boundary first finds nothing pending, so a notice
-is either folded or refused outright.
+Only the owner thread advances, completes or removes an attachment;
+`attachWindowGraphics`, `detachWindowGraphics` and `certifyGraphicsFact`
+refuse any other thread. Other threads read state and publish bounded
+completion notices through `hostGraphicsPublisher`. A notice carries no
+authority: it is revalidated on the owner thread, and the inbox holds one
+notice per fact per window.
 
-The application never receives a dependent's handle or a release action, and a
-worker scope ending cannot dispose a dependent: the controller owns them until
-retirement.
-
-Whatever the interleaving of a close, a detach, a published completion, and a
+Whatever the interleaving of a close, a detach, a published completion and a
 new attachment:
 
-- no new use begins after closing is observable, because admission ends in the
-  transaction that publishes the closing phase;
-- no second owner attaches before the slot is safely free, because the slot is
-  reserved from the reservation until the last fact retires the attachment;
-- no completion is credited to the wrong incarnation, because an acknowledgement
-  names one host, session, window, and incarnation, and a mismatch against a
-  current attachment is refused ahead of terminal idempotence;
+- no new use begins after closing is observable;
+- no second owner attaches before the slot is safely free;
+- no completion is credited to the wrong incarnation;
 - every construction begun is either registered or fully rolled back with its
-  evidence, and one whose rollback could not establish safety is retained rather
-  than released.
-
-#### Examples
-
-The examples in `glfw-tests` (`--match "attachments"`) run whole applications
-over the seam and assert an order of flags or an observed state, never a time.
-They cover every refusal above with no owner constructed — an ended window, a
-window of another host of the same session, a window of another session, an
-occupied slot, a closing window whose retirement a borrow defers, and closed
-admission; the service
-published only after registration, with the slot already reserved during
-construction; a construction superseded by another thread's quiescence, and one
-superseded in the handoff between its construction settling and its publication;
-safe and unsafe rollback, and a cancellation delivered before publication; a
-close and a destruction separately observable, with the destruction after the
-last fact; a close and a quiescence readable from a retained service in the
-transaction that ends its admission; a disposal never credited to an incarnation
-a later reservation moved past, even when that reservation published nothing and
-even when it was cancelled without returning at all; a service retained across a
-normal exit learning how the window it never closed was released, and learning
-when that release failed instead; one whose last facts a draining worker
-published between quiescence and the exit, so the drain's very first fold ends
-the retirement, reported free and owing nothing beside that disposal; a retained service answering after the host
-forgot its window; a failed native
-release kept distinct from the retirement that succeeded; detach then reattach
-with a fresh incarnation and the stale acknowledgement refused on the owner
-thread and through a published notice; a second owner refused while the first
-retires; the typed detach no-ops; three detach-and-reattach cycles leaving one
-window, one port, and no history; two windows where one keeps executing
-commands and admitting scripted render use, turn after turn, and completes its
-own close, retirement, and destruction while the other's retirement is pending —
-and admits no use once it has closed, while the pending one admits none at all
-and is advanced by none of it; a stalled owner's neighbour destroyed first and the
-stalled one finished on independent evidence; a budget of one rotating across
-three pending retirements and no longer asking for an immediate turn once every
-one of them has been offered an opportunity and is awaiting, and a budget of one
-counting the attachment it never reached as deferred work even when the one it
-served withdrew; a blocking owner
-refused without its step running; a declaration that raises when it is demanded,
-answered with nothing reserved, constructed, or rolled back and the slot left
-free for the next owner at the very first incarnation, for both declarations the
-boundary reads; one that raises after acquisition, contained on the owner turn
-with its step never entered and its window kept until independent evidence
-retires it; a completion published from another thread
-ending the owner's idle wait and folding into the next round;
-the scheduled loop polling the turn a detach begins,
-shortening the next wait to the instant that owner named, and polling again once
-a round advanced; more waiting owners than the budget settling into the
-configured fallback wait once the rotation has offered each of them one
-opportunity; a budgeted round waiting to an instant an earlier round learned,
-polling for that instant when it comes due while its owner is unserved, and
-clearing it when that owner next names none; an owner whose latest opportunity
-advanced keeping later turns immediate while rounds leave it unserved; a stalled
-owner's unserved neighbour keeping the turn immediate until it has been offered
-one, and the turns waiting beside the stalled owner afterwards; a retirement
-begun between two waiting turns, and evidence that outdates a waiting owner's
-assessment, each making a later turn immediate again; a fact certified on the
-owner thread between two waiting turns making the next one immediate while a
-duplicate of it makes nothing immediate; a retirement completed by certification
-on the owner thread taking its own instant and its claim on the next turn with
-it, including where that certification is the only thing between the two turns; a later instant replacing the one its
-owner named before rather than the nearest ever seen, and being dropped when
-that owner withdraws its path or retires; an attachment whose caller was interrupted in the handoff
-before its service arrived, left retiring and retired by ordinary turns with the
-slot freed for a fresh incarnation; a published service thrown away and
-recovered from the host by window, then detached with; a construction that
-closes its own window reentrantly, superseding its own publication and keeping
-what it built for retirement; a cancelled construction whose rollback could not
-establish safety asking for a turn at once; the whole application exit with owners attached; and an
-ordinary window-only application seeing no slot, no demand, and unchanged turns.
-The opacity examples compile external clients that name the service's data
-constructor and reach for its observation cell in the private implementation,
-both refused, beside an accepted client that uses the public contract.
-
-One `glfw-native-tests` scenario (`--match "public attachments"`) repeats two of
-these in a child process of its own over a real session: a real window destroyed
-only after its owner completes while a second real window, whose own owner is
-still retiring, stays live and answers a real resize through its own port with
-the size the platform then reports back through its callbacks; and a
-detach-and-reattach cycle on a real window that creates and destroys no native
-window. It claims nothing about GPU
-synchronization: the owners are scripts and their facts are CPU facts.
+  evidence.
 
 ### The supervised graphics owner
 
-`withGraphicsOwnerHost` is the additive protected-host constructor beside
-`withProtectedWindowHost`. It builds exactly the same session, host, windows
-and attachment model, and it additionally starts one supervised **graphics
-owner**: a foundation worker that owns a rendering backend's targets and its
-shared state, so rendering runs off the process main thread while GLFW stays on
-it. `withGraphicsOwnerHostIn` takes a session scope, and
-`runGraphicsOwnerApplication` is the runner over it. Every existing
-constructor, `runProtectedWindowApplication` and every window-only entry point
-keep their signatures and their behaviour; an application that never asks for
-an owner never has one, and an ordinary host still accepts no attachment at
-all.
+`withGraphicsOwnerHost` (and `withGraphicsOwnerHostIn`, with the runner
+`runGraphicsOwnerApplication`) builds the same protected host and additionally
+starts one supervised graphics owner: a foundation worker that owns a
+rendering backend's targets and shared state, so rendering runs off the
+process main thread while GLFW stays on it. A Cocoa live resize or menu
+interaction blocks the owner turn's native event call for as long as it lasts,
+so rendering from the owner turn would freeze the surface for the whole
+interaction. An application that never asks for an owner never has one. The
+Vulkan integration composes this with the scheduled owner turn
+([gpu_backend.md](gpu_backend.md#the-composed-loop)).
 
-The owner exists because of what RR-4 measured: a Cocoa live resize blocked the
-owner turn's native event call for 68.92 s and a menu interaction for 13.30 s,
-with no owner turn in either. Rendering from the owner turn therefore means a
-stale or stretched surface for the whole interaction. The owner is the
-[Vulkan design](archive/vulkan_backend_design.md)'s D-29 answer, and this section is
-its delivered contract. The Vulkan integration's `runVulkanOwnerLoop` composes
-it with the scheduled owner turn — observations, captured render demand and
-the owner's deadline crossing every turn — which is VK-16's, in
-[gpu_backend.md](gpu_backend.md#the-composed-loop); D-32 is why the backend operations are injected rather
-than built in, and D-33 is the exit order below.
-
-#### What the owner may and may not do
-
-The owner performs **no GLFW operation**. It enters no session, creates no
-window and no surface, processes no event, and issues no window command. Every
-one of those stays on the main thread, and it is the main thread's pump that
-serves them.
-
-The single thing it reaches across is the session's existing cross-thread wake,
-through `publishCompletion` and `wakeGraphicsHost`: one notification obligation
-registered in a transaction and discharged by one call, which is the same path
-a command admission takes and may post an empty event on the publishing thread.
-That is authorized publication, not a GLFW operation of the owner's. The
-examples assert the difference by reading the seam's own record of every native
-call and which thread made it: every call from the owner's thread is that wake
-and nothing else.
+**The owner performs no GLFW operation.** It enters no session, creates no
+window or surface, processes no event and issues no window command. The one
+thing it reaches across is the session's cross-thread wake, through
+`publishCompletion` and `wakeGraphicsHost`.
 
 #### The injected operations
 
-`GraphicsOperations` is the whole of what the owner can ask a backend to do:
+`GraphicsOperations` is everything the owner can ask a backend to do:
 
 | Operation | What it settles |
 |---|---|
-| `graphicsStartOwner` | Establish the owner's shared state, before any target exists. |
-| `graphicsConstructTarget` | Construct one attachment's target and settle its handoff. |
-| `graphicsStep` | One bounded progress step, which must return finitely, reporting whether further work is owed at once. |
-| `graphicsNextDeadline` | The earliest absolute instant the backend next wants a round, or no demand. |
-| `graphicsWake` | Whether something the backend watches on another thread asks for a round now; the waiting owner rereads it, and it must stay false once the round it asked for has answered it. |
-| `graphicsPrepareRetirement` | Begin retiring one target and say whether its retirement can be performed now (`RetirementReady`), or is owed until evidence the backend is waiting for arrives (`RetirementOwed`, with why). It is scheduling, never evidence, and must return finitely. |
-| `graphicsRetireTarget` | Retire one target, once its preparation answered ready. |
-| `graphicsRetireOwner` | Retire the owner itself, told whether startup ever returned and which targets could not be accounted for. |
-| `graphicsDestroyOwner` | Release the owner's shared state. |
+| `graphicsStartOwner` | Establish the owner's shared state, before any target exists |
+| `graphicsConstructTarget` | Construct one attachment's target |
+| `graphicsStep` | One bounded progress step that returns finitely and says whether more work is owed at once |
+| `graphicsNextDeadline` | The earliest instant the backend next wants a round, or none |
+| `graphicsWake` | Whether something the backend watches asks for a round now |
+| `graphicsPrepareRetirement` | Begin retiring one target: `RetirementReady` or `RetirementOwed`. Scheduling, never evidence |
+| `graphicsRetireTarget` | Retire one target, once preparation answered ready |
+| `graphicsRetireOwner` | Retire the owner itself |
+| `graphicsDestroyOwner` | Release the owner's shared state |
 
-Nothing in it resembles a recording, submission or resource API — there is no
-command buffer, no queue, no allocation and no handle — and nothing in it is a
-GLFW capability. A target is named by its `AttachmentId` and its `WindowId`,
-which are identities the host resolves and not handles the backend can reach a
-window through.
-
-Every operation returns **evidence**: an opaque record the owner stores, hands
-back and never interprets, and — the point — never constructs. That includes
-the startup's own: `ownerStartedEvidence` keeps exactly what
-`graphicsStartOwner` returned, readable through retirement and after the owner
-has ended, rather than reduced to whether the call happened. A record that
-exists is a record an injected operation returned. What it says is the
-backend's business; that there is one is the permission. VK-7 supplies the
-Vulkan operations to this same machinery rather than replacing it: the
-controller in `hetoimasia-gpu-vulkan-glfw`, whose contract is
-[gpu_backend.md](gpu_backend.md).
-
-What *draws* is never an operation here: it is the Vulkan host's renderer,
-which the backend calls inside its own step. The triangle sample
-([`samples/triangle`](../samples/triangle/README.md), VK-17) is the consumer
-example: its executable builds the host with `withVulkanOwnerHost`, hands each
-window over on the main thread with `handOverVulkanTarget`, runs
-`runVulkanOwnerLoop`, and gives the host a renderer that is its drawing plus
-one line —
-
-```haskell
-triangleRenderer ∷ Triangle → VulkanRenderer scene
-triangleRenderer triangle = VulkanRenderer $ \_ request construction recorder →
-  drawTriangle triangle
-    (Builders (constructPipelineLayout construction) (constructPipeline construction))
-    (requestFormat request) (requestExtent request) recorder
-```
-
-— so it chooses its pipeline and draw order through the backend's managed
-recording while this machinery keeps every GLFW call on the main thread and
-every Vulkan call on the owner's.
+There is no recording, submission or resource API in it and no GLFW
+capability. A target is named by its `AttachmentId` and `WindowId`. Every
+operation returns evidence: an opaque record the owner stores and hands back
+and never constructs or interprets. What draws is the backend's renderer,
+called inside its own step.
 
 #### The handoffs
 
 | What | Direction | Transport |
 |---|---|---|
 | Attachment lifetime | main → owner | one bounded port |
-| `WindowObservation` and render eligibility | main → owner | one latest-value snapshot per attached target |
+| `WindowObservation` and render eligibility | main → owner | one latest-value snapshot per target |
 | Render demand | main → owner | one latest-value snapshot |
-| Scene | any application thread → owner | one latest-value snapshot, or one for each window (`ownerSceneMode`) |
-| Progress and the next deadline | owner → main | one coalescing status cell |
-| Retirement facts | owner → main | the host's existing completion publisher, with the terminal record retaining what a refusal could not carry |
+| Scene | any application thread → owner | one snapshot, or one per window (`ownerSceneMode`) |
+| Progress and next deadline | owner → main | one coalescing status cell |
+| Retirement facts | owner → main | the host's completion publisher, with bounded per-target terminal records |
 
-The lifetime port is the only **ordinary** port, and it is bounded. A handover
-holds room on it before it reserves the window's slot, so a full port answers
-`HandoverPortFull` with nothing attached, reserved or constructed rather than
-leaving an attachment the owner was never told about. That refusal is
-backpressure reported to the publisher, never a dropped event. Nothing else
-rides that port, so a full one cannot keep the owner from being stopped, from
-publishing terminal evidence, or from making progress on what it already
-holds — those travel on the stop token, on the terminal cells, and on the
-snapshots.
+- A handover holds room on the lifetime port before it reserves the window's
+  slot, so a full port answers `HandoverPortFull` with nothing attached. Only
+  lifetime events ride that port, so a full one cannot keep the owner from
+  being stopped, publishing terminal evidence or progressing.
+- Every step from holding that room to spending it runs masked. A cancelled
+  handover whose attachment was established is still announced, so no
+  attachment exists that the owner never hears of.
+- Snapshots hold one value: a publisher never waits. A target's observation
+  revisions must strictly increase (`ObservationStale` otherwise), and a
+  publication for an incarnation the slot moved past answers
+  `ObservationUnknownTarget`.
+- Quiescence, and any failure that ends the owner's run, closes the port,
+  both snapshots and every observation slot together, so a retained endpoint
+  is refused rather than silently ignored.
 
-Every step from holding that room to spending it runs under a mask, and only
-the attachment itself — the one part that runs for an unbounded time — is
-restored. So no cancellation can land in the gap between reserving the port's
-room and spending it, between reserving the window's slot and telling the
-owner, or between beginning a detach and delivering its event. A cancellation
-delivered inside the attachment can still lose the caller's answer while the
-attachment is perfectly established; the handover finds it from the
-acknowledgement its own protocol recorded and announces it before the
-cancellation propagates, so no attachment is ever left that the owner never
-hears of. The one case where the main thread retires a target itself is an
-attachment the owner's admission closed under: the owner never received it,
-never entered its construction and owns nothing for it, so there is no backend
-work to have ended and leaving it retiring would retain its window against a
-retirement nothing was going to perform.
+`handOverGraphicsTarget` reserves a window's slot on the main thread,
+registers the attachment, tells the owner and answers the `GraphicsService`.
+`publishGraphicsObservation` publishes the target's observations and
+`releaseGraphicsTarget` retires it. A release answers `ReleaseBegun`,
+`ReleaseSettled` (the owner was never told; facts certified on the spot),
+`ReleaseOwnerRetires` (the owner owes it and its drain will produce the
+evidence), `ReleaseNoOp` or `ReleasePortFull`.
 
-Quiescence closes all of it together — the port, the demand and scene
-snapshots, and every observation slot — so a publisher holding an escaped
-endpoint after the owner has ended is told its publication was refused rather
-than left to believe it arrived. A failure that ends the owner's run closes
-exactly the same set, and for the same reason: an owner that has stopped reads
-none of them again. `targetEventsOpen` reports whether the lifetime port still
-admits, which is a read and takes nothing; spending the port's room is the
-reservation's, and no caller is given a way to spend it without one.
-
-A release says which of those happened rather than reporting success either
-way. `ReleaseBegun` is the ordinary case: the attachment is retiring and the
-owner has been told. `ReleaseSettled` means the owner was never told about
-this incarnation, so nothing of its own exists for it and the facts were
-certified on the spot. `ReleaseOwnerRetires` means the owner owes it — it was
-announced, or it holds the target — and the event could not be delivered, so
-the owner's own drain produces the evidence. `ReleaseNoOp` carries the
-host's own answer for an attachment there was nothing to release, and
-`ReleasePortFull` means nothing was detached at all and the caller may try
-again. A detach that raises gives the held room back instead of spending it
-on an event there is now nothing to send.
-
-Every snapshot holds one value, so a publisher never waits and a slow reader
-grows nothing. A target's observations carry their own revision, which must
-strictly increase: a delayed publication answers `ObservationStale` and changes
-nothing. A publication naming an incarnation the window's slot has moved past
-answers `ObservationUnknownTarget`, because a slot is keyed by the exact
-attachment and a later incarnation is a different key.
-
-The owner publishes back through the completion publisher and the TIME wake.
-The publisher carries **attachment retirement facts**; replaceable progress and
-the earliest next deadline go in the coalescing `OwnerStatus` cell beside it,
-and terminal facts are retained in bounded per-target `TerminalRecord` cells
-until they have been validated. The owner never waits for the main-thread
-consumer to read any of it.
-
-#### Handing a target over, and taking it back
-
-`handOverGraphicsTarget` reserves one open window's exclusive graphics slot on
-the main thread, registers the attachment, tells the owner, and answers the
-opaque `GraphicsService`. The order is the contract: the attachment — and so
-the window — is retained from the first instant, before the backend has built
-anything. `publishGraphicsObservation` publishes that target's observations,
-and `releaseGraphicsTarget` retires it.
-
-The owner never retires an attachment the main thread still holds. It retains
-ownership of what a construction left until one of exactly two things happens:
-the backend accepts the target, or the backend verifies its own rollback. A
-partial construction, and one that raised or was cancelled, is neither: the
-owner keeps what exists and **reports** the target as unusable through
-`readTargetStanding`, and the main thread releases it. Beginning an
-attachment's retirement stays the main thread's, because the attachment and the
-window's exclusive slot are the main thread's.
+The owner keeps what a construction left until the backend accepts the target
+or verifies its own rollback. A partial, failed or cancelled construction is
+reported unusable through `readTargetStanding`, and the main thread releases
+it. Beginning a retirement is always the main thread's. The owner also reads
+the host's model each round and marks every target whose attachment has begun
+retiring, so a window closed through its own port is retired without a
+detach.
 
 #### Who owes an attachment's settlement
 
-Every attachment the owner's protocol registers gets one ledger entry, and it
-is the single place that answers who owes that exact incarnation's retirement
-evidence. Before it, each path decided for itself and each decided from
-whether the owner happened to hold the target — which is a different question,
-and answers wrongly for an attachment the owner has been told about but has
-not yet taken.
+One ledger entry per registered attachment answers who owes that
+incarnation's retirement evidence:
 
 | Stage | Who owes it | Reached by |
 |---|---|---|
-| `CustodyRegistered` | The main thread | The attachment's protocol recording its acknowledgement, before anyone is told |
-| `CustodySettling` | The main thread | Claiming that settlement, for as long as it is being performed |
-| `CustodyAnnounced` | The owner | An announcement admitted to the lifetime port — from that instant, before the owner has consumed the event |
+| `CustodyRegistered` | The main thread | The protocol recording its acknowledgement |
+| `CustodySettling` | The main thread | Claiming the settlement, while it is performed |
+| `CustodyAnnounced` | The owner | An announcement admitted to the lifetime port |
 | `CustodyOwned` | The owner | The owner taking that event |
-| `CustodySettled` | Nobody | A terminal record the owner wrote, or facts the main thread certified because nothing was ever owned |
+| `CustodySettled` | Nobody | A terminal record the owner wrote, or facts the main thread certified |
 
-The stages advance, with one exception: a claim that could not complete
-returns `CustodySettling` to `CustodyRegistered`. Three invariants hold the
-ledger together.
+- The main thread may settle only from `CustodyRegistered`, and its claim
+  excludes an announcement. Absence from the owner's target table is never
+  consulted.
+- A claim that could not certify every fact returns to `CustodyRegistered`.
+- An announcement is admitted in one transaction that checks the stage,
+  confirms the host still holds that attachment pending, installs the
+  observation slot and queues the event.
+- `CustodySettled` is terminal.
 
-**The main thread may settle an attachment only from `CustodyRegistered`, and
-its claim is what excludes an announcement.** Settling means certifying the
-attachment's facts against the host, which is not a transaction and cannot be
-one, so the claim and the settlement do not commit together: the claim moves
-the stage to `CustodySettling` in one transaction, and that stage holds the
-exclusion for however long the certification takes. An announcement admitted
-before the claim commits leaves the stage at `CustodyAnnounced` and the claim
-answers nothing; one attempted while the claim is held is refused, as is one
-attempted after the settlement reached `CustodySettled`. Absence from the
-owner's target table is never consulted, because a queued announcement the
-owner has not yet taken looks exactly like an attachment it never received.
-
-**A claim is retryable; only recorded facts are terminal.** The move to
-`CustodySettled` happens when the facts really exist, and a settlement that
-could not certify them all puts the stage back at `CustodyRegistered` so a
-later opportunity can perform it. That is also what makes a settlement
-interrupted part-way safe: the incarnation is claimable again rather than
-stranded at a stage nothing will move.
-
-**An announcement is admitted in one transaction.** The stage is checked, the
-host is asked whether that exact attachment is still one of its own pending
-ones, the observation slot is installed, and the event is queued, all
-together. So a delayed announcement for an incarnation the slot has moved past
-cannot reopen anything, and neither can one racing the main thread's own
-settlement: whichever transaction commits first decides.
-
-**`CustodySettled` is terminal.** An incarnation that reaches it can never be
-announced again, and a settled entry is never reopened by a later claim.
-
-Every path routes through those transitions: the handover, a direct attach
-followed by `announceGraphicsTarget`, `releaseGraphicsTarget`, a window close,
-a supersession, a cancellation's recovery, and the exit. The ledger is bounded
-by the windows the host may hold live: a settled entry is forgotten once the
-host's own model no longer has that attachment pending, and an entry whose
-attach left nothing at all is forgotten by the handover's own settlement
-rather than waiting for an owner round.
-
-A release reads that ledger before it reserves anything. An incarnation still
-at `CustodyRegistered` needs no event — there is nobody to tell — so it is
-detached and certified on the spot and answers `ReleaseSettled`, and a full
-port is no obstacle to a release that needs no room. One the owner owes
-answers `ReleaseBegun` when its event is delivered and `ReleaseOwnerRetires`
-when it is not, because then the owner's own drain produces the evidence. A
-release whose owner has already closed its admission still detaches: an
-attachment's retirement has to begin before any evidence for it can be
-recorded, and withholding the detach would leave the release unperformed.
-
-Reserving room checks admission as well as capacity, and the two answers
-differ for a caller: a full port may have room in a moment, a closed one
-never will. So a handover to an owner whose admission has ended attaches
-nothing at all, rather than reserving a window's slot and settling it again
-on every attempt against an owner that will take no further round.
-
-The attachment protocol's own retirement step is the backstop. A retirement
-the main thread began without a release of its own — a window's close, the
-host's quiescence — reaches that step and nowhere else, so a still-registered
-incarnation is claimed and certified there. Settlement on the main thread
-forgets the entry in the same breath, because certifying every fact retires
-the attachment and the owner whose round would otherwise prune it may be one
-that never takes another.
-
-`releaseGraphicsTarget` is not the only way a target's retirement begins. A
-window's own close protocol begins it, and so does the host's quiescence, and
-neither passes through the lifetime port. The owner therefore **reads the
-host's model** rather than waiting to be told: each round it marks every
-target whose attachment has begun retiring, which is idempotent and puts no
-obligation on the application. Without it a closed window's target would
-never be retired, its evidence never produced, and the window never able to
-finish closing while the owner stayed live.
-
-A handover the host's admission closes under is the mirror case. Quiescence
-between the reservation and the publication leaves a registered, retiring
-attachment that the owner was never told about and owns nothing for, so
-`HandoverSuperseded` retires it on the spot; nothing else could produce its
-evidence, and the protected drain would otherwise wait for it. The same is
-true when a cancelled handover's recovery finds the attachment but the
-owner's admission has closed in that same moment — a terminal owner failure
-does that — and when a detach finds an attachment some other close already
-began retiring. Each settles the attachment rather than leaving it owed
-evidence nobody will produce.
-
-A released target's own attachment protocol does no owner work on the main
-thread. Its bounded opportunity reads what the owner published and waits,
-naming the owner's own deadline when it has one; when the owner has written
-that target's terminal record it transports the facts that record establishes,
-which establishes nothing the owner had not already established. An owner whose
-run has ended without a target's record leaves no progress path at all, so that
-opportunity stalls: the window, the session and every parent stay retained, and
-only independent evidence revives it.
+The ledger is bounded by the windows the host may hold live.
 
 #### A scene for each window
 
-`GraphicsOwnerConfig`'s `ownerSceneMode` chooses, once, whether the owner
-carries one scene for every target (`SharedScene`, the default, which is the
-owner as it has always been) or one for each window (`PerWindowScenes`,
-R2D-14). The initial scene `ownerScene` is the scene every window starts with,
-at revision 0.
-
-In `PerWindowScenes` the handoff holds one latest-value snapshot for each window
-that has had a publication, **keyed by the window's `WindowId`**, never by an
-attachment: a window's surface recreated under a new attachment incarnation
-leaves its publication where it was, and the new target takes it. A snapshot
-is its scene and its revision; the first publication is revision 1 and each
-accepted one is the next, for that window alone, so one window's revisions
-never move another's. `publishGraphicsWindowScene owner window scene` publishes
-from any application thread in one `STM` transaction that never waits and
-replaces the window's publication if the owner has not taken it. The windows
-the host holds (`hostWindowIdentities`) are read in the same transaction, so
-the answer is exact:
+`ownerSceneMode` chooses once between one scene for every target
+(`SharedScene`, the default) and one per window (`PerWindowScenes`). Per-window
+publications are keyed by `WindowId`, never by attachment, so a recreated
+surface takes the window's existing publication. `publishGraphicsWindowScene`
+publishes from any thread in one transaction that never waits:
 
 | Answer | Meaning |
 |---|---|
-| `WindowScenePublished window revision` | Accepted, at this revision. |
-| `WindowSceneUnknown window` | The host holds no such window — never created, or retired. Nothing changed. |
-| `WindowSceneClosed window` | The owner's publications have closed. Nothing changed. |
-| `WindowScenesNotEnabled window` | The handoff carries one scene for the whole owner. Nothing changed. |
+| `WindowScenePublished window revision` | Accepted, at this per-window revision |
+| `WindowSceneUnknown window` | The host holds no such window |
+| `WindowSceneClosed window` | The owner's publications have closed |
+| `WindowScenesNotEnabled window` | The owner carries one shared scene |
 
-`publishOwnerScene` is refused with `SceneRefusedPerWindow` in this mode, and
-publishes nothing. An accepted publication forgets the publication of every
-window the supplied list of held windows does not name, read in the same
-transaction, and the owner does the same each round, so the table is bounded by
-the host's windows (the window limit) whatever the owner is occupied with and
-however many windows come and go; quiescence closes it with the rest of the
-publications.
+`publishOwnerScene` is refused in per-window mode. The table is bounded by the
+host's windows. What a backend does with a window's scene is the backend's
+([gpu_backend.md](gpu_backend.md#a-scene-for-each-window)).
 
-Each step is handed `stepSceneMode` and, in `PerWindowScenes`,
-`stepWindowScenes`: the scene of the window of every target the owner holds —
-its latest publication, or the initial scene at revision 0 when it has had none
-— beside the revision, read in the same transaction as the rest of the step's
-inputs. The shared scene stays the initial scene at revision 0, as nothing can
-publish it. The owner's wait compares a count that rises with every accepted
-window publication, so an idle owner wakes for any window's. What a backend
-does with a window's scene — which target it asks for a frame, when it adopts
-and releases a revision — is the backend's
-([A scene for each window](gpu_backend.md#a-scene-for-each-window));
-`readGraphicsSceneRevisions` reads, for every window the host holds, the latest
-revision published for it (the shared scene's, for each, in `SharedScene`).
+#### Scheduling, stalls and extent
 
-#### The owner's own scheduling
-
-Each step is handed the latest demand and scene beside the revision of each
-one's publication (`stepDemandRevision`, `stepSceneRevision`): two
-publications of equal demand are two requests, which only the revision tells
-apart, and a backend acts on each once. `readOwnerDemandTaken` tells the
-demand's publisher, on any thread, whether the owner has taken its latest
-publication into a step — which is what lets a publisher that accumulates
-demand stop republishing what the owner has already seen, since a newer
-publication replaces an older one it never read.
-
-A released target's retirement is performed only once the backend's
-preparation answers ready. Until then it is asked again on each later round —
-at the backend's own next deadline, or when its wake asks — and nothing is
-recorded; a preparation that raised is a failed retirement, and is never
-offered again — except a cancellation, which the preparation's answer never
-reached: that ends the run like any other, and the drain asks again. The exit drain asks every owed retirement again between waits
-for the backend's own next deadline — no round runs then, and the backend's
-wake is not read — until each is retired or has failed. No timeout ends that
-wait, because a timeout is not evidence; a cancellation ends it, leaving what
-is still owed with the owner, unverified, and named to whole-owner retirement.
-
-The owner schedules its own waits from its own deadlines and its own demand, on
-the host's injected `hostClock` and an injected `OwnerTimer`. The timer is
-given the owner's absolute deadline: for every wait it arms — the owner's own
-and its exit drain's — the owner reads its clock once and hands the timer the
-deadline, an instant of that clock, beside the duration that remained until it
-at that reading. The drain's fallback, when the backend names no deadline, is
-the fallback interval after the drain's reading. A timer that reads a clock
-decides expiry by comparing that clock with the deadline; it never measures the
-duration again from a later reading, which would end after the owner's deadline
-whenever the clock moved in between. The process's `realtimeOwnerTimer` waits
-the remaining duration in real time, at least a microsecond. It wakes for a
-stop, a latched terminal failure, a lifetime event, a fresher observation, a
-newly published demand or scene, a record it may now forget, or its own
-deadline. Publications are in that list for a reason worth saying plainly: an
-owner with no deadline and no event of its own would otherwise sleep through a
-publisher asking for a frame *now*. Nothing here waits for the main thread to
-wake it: with the main loop's wake withheld entirely the owner still meets its
-deadlines and still makes progress on what it holds, and the deadline it
-publishes back is coordination for the main loop's idle bound and nothing
-more.
-
-#### During a main-thread stall
-
-While the main thread is inside a platform modal loop — a live resize, an open
-menu — it publishes no new observation and no new demand, and it serves no
-window command. The owner keeps rendering the latest scene and the last
-coherent observation it already holds.
-
-**What that does not mean.** Window commands and observations still wait for
-the pump: a resize, a title change, a close request and every fresh
-`WindowObservation` are the main thread's and are delayed exactly as long as
-the stall lasts. A rendered latest snapshot does not mean gameplay or input
-continued either; simulation is application-owned and thread-agnostic, and an
-application that drives it from the main loop is stalled with it. What the
-owner removes is the stale or stretched surface, not the stall.
-
-**The stated limit.** That the owner *keeps rendering* is a claim about its
-own thread: it keeps making requests and observing their completion while the
-main thread is blocked. Whether a frame it presents during a platform modal
-loop becomes visible is the platform's, and no headless example and no
-present call's return can show it; the Vulkan integration's
-[graphics-owner interaction probe](gpu_backend.md#the-native-suite) measures
-what happens on Cocoa, and
-[its verdict](archive/graphics_owner_interaction_verdict.md) says what was and was not
-established.
-
-#### The extent seam
-
-The owner holds the last coherent framebuffer observation and reported bounds
-per target. `chooseTargetExtent` is D-30's seam, and the order is this layer's
-decision: render eligibility first, then zero area, then the clamp — so
-clamping a zero framebuffer to a reported minimum can never resume a suspended
-target. A backend that supplies a concrete extent has it taken; one that
-reports that the application chooses falls back to the last coherent
-observation clamped to the reported bounds; with no observation at all the
-answer is `ExtentWithheld ExtentUnobserved`. The policy behind the seam — what
-a backend reports, and what a suspended target does next — is VK-10's, not
-this layer's; the Vulkan backend's is in
-[Swapchain generations](gpu_backend.md#swapchain-generations).
+- Each step is handed the latest demand and scene with each one's publication
+  revision; two publications of equal demand are two requests.
+  `readOwnerDemandTaken` tells a publisher whether the owner has taken its
+  latest.
+- The owner schedules its own waits on the injected `hostClock` and
+  `OwnerTimer`, handing the timer an absolute deadline. It wakes for a stop, a
+  terminal failure, a lifetime event, a fresher observation, new demand or
+  scene, or its deadline. It never depends on the main thread to wake it.
+- A released target's retirement is performed only once preparation answers
+  ready; until then it is asked again on later rounds and in the exit drain.
+  No timeout ends that wait, because a timeout is not evidence.
+- During a main-thread stall (a live resize, an open menu) the owner keeps
+  rendering the latest scene and last coherent observation. Window commands,
+  fresh observations and anything the application drives from the main loop
+  still wait for the pump. Whether a presented frame becomes visible during
+  the stall is the platform's.
+- `chooseTargetExtent` decides in this order: render eligibility, then zero
+  area, then the clamp to reported bounds, so clamping can never resume a
+  suspended target. With no observation the answer is
+  `ExtentWithheld ExtentUnobserved`.
 
 #### The exit, which is D-33's
 
-A whole-session exit runs in this order:
+1. Quiescence closes the host's admission and the owner's publications in one
+   transaction. It stops, retires and joins nothing.
+2. Ordinary application workers stop and drain. The owner's worker group is
+   separate, so that drain does not end it.
+3. The owner drains its lifetime port, retires each target it holds and then
+   itself through the injected operations, publishing each certified fact.
+4. The main-thread boundary services the host's bounded native housekeeping
+   while it awaits verified retirement, validating each attachment's terminal
+   evidence.
+5. Once the injected whole-owner destruction has returned its evidence, and
+   only then, the boundary joins the owner.
+6. The host's windows, session and parents unwind.
 
-1. quiescence closes the host's admission — commands, demand, input and new
-   graphics use — and then the owner's own publications: its lifetime port,
-   its demand and scene snapshots and every observation slot. Both close in the
-   host's one `quiesceWindowHost` transaction, the host's first, so an
-   attachment that got past admission always found the port open. That is the
-   transaction the application's pre-drain quiescence commits, so from it on
-   every escaped owner endpoint refuses, `targetEventsOpen` reads `False`, and
-   the gate a backend derives from it refuses, before any ordinary worker is
-   asked to stop and without waiting for the owner. It stops, retires and joins
-   nothing: the owner keeps running, events already queued on the port stay for
-   it to account for, completion evidence stays publishable, and the protected
-   exit's own close, in step 3's drain, finds the publications already closed
-   and only asks the owner to stop;
-2. ordinary application workers stop and drain, which is the runtime's own
-   ordering. The owner's worker group is the component's, separate from the
-   application's ordinary group and from the diagnostics worker, so the
-   ordinary drain does not end it and no automatic join can run before the
-   main thread has serviced retirement;
-3. the owner stays alive and retires each target it still holds and then
-   itself through its injected operations, publishing each certified fact
-   through the existing completion publisher. It drains its lifetime port
-   first, so a target announced between its last round and its stop is
-   accounted for rather than left with no path to evidence;
-4. the main-thread protected boundary services the host's own bounded native
-   housekeeping — the same poll, finite wait and window-retirement retry the
-   attachment drain is lent — while it awaits verified retirement. It offers
-   each attachment an opportunity that waits, performs no owner work, and
-   validates each exact attachment's terminal evidence rather than the owner's
-   completion;
-5. once the injected whole-owner destruction has returned its evidence, and
-   only then, the boundary joins the owner;
-6. the host's windows, session and parents unwind.
+Step 4's wait returns for the evidence and nothing else: not the owner's run
+ending, not an empty target set. An owner that ended without the evidence
+retains the windows, session and parents and says so once through
+`OwnerDestructionUnverified` under `glfw.graphics-owner`. After that only
+independent evidence (`publishOwnerDestruction`) or operator process
+termination ends the wait.
 
-Step 5's join absorbs cancellation until the group has drained, for the same
-reason step 4's wait does: escaping it would let the host unwind with the
-owner still live. It also reads the report it gets back, because the joined
-worker's own outcome is the only place a failure of its protected drain is
-recorded — a `graphicsRetireOwner` that failed while the destruction after it
-succeeded leaves no latch and no missing evidence, and an exit that discarded
-the report would call that run a success. A cancellation somebody asked for is
-not reported: the owner's drain deferred it, finished every operation it owed,
-and re-raised it in order, which is the contract kept rather than broken.
+The one owner not waited for is a start abandoned before its run action began:
+the starter withdraws it from the exit in one transaction that reads the
+worker terminal and `ownerEntered` unset. An owner whose run action began is
+never withdrawn.
 
-Step 4's wait returns for the evidence and for nothing else. Not for the
-owner's run ending, not for its worker becoming terminal, and not for an empty
-target set: none of those establishes that the owner's shared state was
-released, and returning on one would unwind the windows, the session and every
-borrowed parent behind it. An owner that ended without the evidence therefore
-retains them — exactly as a stalled attachment retains its window — and says
-so once, through `OwnerDestructionUnverified` under the
-`glfw.graphics-owner` component, which is a diagnostic and never an authority.
-Only independent evidence ends the wait after that: `publishOwnerDestruction`,
-from a thread that established it, which is the same shape the attachment
-model already has for a fact a thread other than the owner certified. Operator
-process termination remains the escape, and no timeout grants the authority,
-because a timeout is not evidence.
+Whole-owner retirement is independent of the attachment count: it runs for an
+owner that never held a target and after the last one detached. A single
+`releaseGraphicsTarget` retires one target and leaves the owner and every
+other target live.
 
-**The one owner that is not waited for: a start abandoned before the run began
-(#613, mechanism A).** If the thread that starts the owner fails or is
-cancelled after the owner's handle was published to the exit and before the
-owner's run action began, the foundation's start drains the worker before the
-failure leaves it, so the worker is terminal and its run action never ran. It
-owns nothing the backend must release — nothing driver-shaped is allocated
-before the action runs, and every acquisition and release the backend owns
-happens inside the action's own protected retirement — and the evidence that
-retirement records can never come. The starter therefore *withdraws* the owner
-from the protected exit: in one transaction it reads that the worker's
-completion is published and that `ownerEntered` is unset, and empties the
-cell the exit reads the owner from and closes the owner's publications, whether
-or not the host's quiescence has committed: quiescence that committed first
-had closed the published owner itself, and one that commits later cannot find
-a withdrawn owner, so the withdrawal closes it. The exit then finds no owner
-and settles exactly as it does for a host whose owner never started: it
-quiesces, drains, unwinds the windows and the session in the order above, and
-the start's failure or cancellation is raised as itself, with the
-abandoned-start evidence and the cleanup failures retained beside it. The same
-holds for a worker that ends before it acknowledges while the start's wait
-returns normally, with one difference: that start returns the owner to the
-application, so the wait observes the terminal worker and withdraws it in the
-one transaction that answers (no cancellation can fall between the two), and
-the owner it returns refuses every publication and handover instead of
-announcing a target to a worker that can never retire it.
+#### Failure and cancellation
 
-This does not relax the rule above. The exit's wait is unchanged, it has no
-new way to return, and nothing is ever published as destruction evidence:
-withdrawal is the exit no longer seeing an owner, not an owner whose
-destruction was established. An owner whose run action began is never
-withdrawn — `ownerEntered` is set in the action's first masked step, before the
-backend is asked for anything, and the drain that follows it always runs — so
-an owner whose run began, ended without the evidence and had its start
-abandoned afterwards is waited for, and reported through
-`OwnerDestructionUnverified`, exactly as any other. The flag, not the
-foundation's run-exit record, decides: a worker cancelled between its
-acknowledgement and the action's first instruction has a recorded run exit
-and an action that never ran, which `RunNotEntered` alone would leave waiting
-for ever. A worker that is not yet terminal is never withdrawn.
+- The owner is required: a terminal failure is latched at once, closes every
+  admission into the handoff in the same transaction, ends the run and enters
+  the protected drain. `superviseGraphicsOwner` registers a supervised service
+  that raises the latched failure at the application's checkpoint.
+- The latch is notification, not evidence. Failures the owner survived (a
+  target's construction or retirement) are kept in `readOwnerFailures`; a
+  failure that ended the run, its drain's failures and a failing final wake
+  are in the worker's outcome. Each failure is reported exactly once: the exit
+  leaves out the one entry the sentinel already delivered.
+- A failed target retirement is marked unverified and never offered again.
+- Cancellation is honoured at every owner wait and is not latched. The drain
+  defers it and re-raises it only after every owed operation has been offered:
+  every target, then the owner, then its destruction.
+- A cancellation that escapes an injected operation leaves its outcome
+  unknown: a construction settles unverified, a target retirement manufactures
+  no acknowledgement, a destruction establishes nothing.
+- Each injected operation is interruptible across the call and masked from
+  its answer through the state that answer settles.
 
-Each turn of that wait decides from one coherent snapshot: whether the
-destruction is verified, whether the owner's run has ended, and the `retired`
-and `unverified-targets` fields the diagnostic and `OwnerDestructionUnverified`
-report are all read in a single transaction over the owner's terminal record
-and its targets. The owner commits its evidence before its completion, so no
-such snapshot of a successful teardown shows the run ended without the
-evidence. Separate reads could: a teardown that committed both between them
-would be declared unverified, with a false warning and a failed exit, although
-it destroyed everything it held.
-
-An individual close or detach is not that. `releaseGraphicsTarget` retires one
-target, the owner publishes that target's exact evidence, the main thread
-acknowledges it and its window is released, and the owner and every other
-target stay live. Only a whole-host exit requires the final join.
-
-Whole-owner retirement is independent of the attachment count in both
-directions: the owner's shared state is acquired before any target exists and
-outlives the last one, so it is retired and destroyed for an owner that never
-held a target, and after the last one has detached. An empty attachment set is
-not evidence, and neither is the worker ending.
-
-#### Failure, cancellation and what is never permission
-
-This delivery's graphics owner is **required**: its terminal failure stops the
-run, and there is no owner-wide disposition to choose. An optional one would
-have to mean a recognized failure leaves the component unavailable while the
-run continues, and nothing here implements that — the owner would still latch,
-still retire, and the supervision sentinel would still classify its failure as
-unrecognized and so fatal. The per-target required/optional policy the Vulkan
-design accepts is a different question, about one target's recovery rather
-than the owner's, and it is VK-14's.
-
-A terminal owner failure is latched as soon as it is known, and that is
-terminal in full: the same transaction closes every admission into the
-handoff, the owner's run ends there rather than taking another round, and it
-goes into its own protected drain — so no further target is handed to an owner
-that is about to retire, and none is constructed by the round the failure
-interrupted. The latch stays for supervision, and the main thread is woken at
-once, so a checkpoint raises while retirement is still to come.
-
-**The latch is notification, not evidence.** It keeps the first failure,
-because that is what a sentinel can wait on. Where the rest are kept depends
-on which failure it is, and the split is deliberate:
-
-| Failure | Where it is kept | How the exit reports it |
-|---|---|---|
-| A target's construction or retirement, which the owner caught and carried on from | `readOwnerFailures`, with the context it propagated with | Retained beside whatever else the exit found |
-| The owner's own startup, step, or deadline, which ended its run | The worker's own outcome | Read back from the joined group's report |
-| Its whole-owner retirement or destruction, which its drain absorbed | The worker's own outcome, through the drain it settles into | Read back from the same report |
-| Its final wake — the one post-drain `wakeGraphicsHost` that tells the main thread its run has ended — when that raises rather than degrading | The worker's own outcome, folded into the drain's failures after them, in attempt order | Read back from the same report |
-
-The worker's outcome keeps a run failure primary and retains each distinct
-drain failure, and then the final wake's, beside it under the owner's
-retirement cleanup label. After a successful run the first of them in attempt
-order is primary, and a wake failure alone is reported as itself. The wake is
-attempted once and never retried, and its notification obligation is
-discharged before it can raise, so the exit never waits on it. A wake that
-degrades with the expected platform error raises nothing and is reported only
-by the host's own wake report, as before.
-
-A failure that ends the run is not put in the retained store, because the run
-ending is how it is already reported: the worker's outcome carries it, the
-exit reads that outcome back from the group report, and duplicating it would
-mean the same failure raised twice. `readOwnerFailures` is therefore the
-failures the owner *survived* — the ones that would otherwise be lost, since
-nothing else records them. Between the two, every failure is reported exactly
-once.
-
-The exit never raises the latch itself, for that reason. Every failure the
-latch can hold is already in exactly one of the two stores beside it — a
-target failure the owner caught is in the retained store, and one that ended
-its run is in the worker's own outcome — so raising it as well would report a
-single failed operation twice, once as the exit's primary and once as its
-retained cleanup, and invent a second failure that never happened.
-
-That is only half of it, because `superviseGraphicsOwner` raises the latched
-failure at the application's own checkpoint, where it becomes the
-composition's primary failure. The latch therefore records *where* its failure
-is also kept, the sentinel records that it delivered, and the exit leaves out
-the one store entry that is that same failure:
-
-| The latch came from | What the exit leaves out once the sentinel has delivered |
-|---|---|
-| A target failure the owner survived | The first entry of `readOwnerFailures`, which is that failure — `retainFailure` latches only when nothing is latched yet and appends in the same transaction. Every later retained failure is still reported. |
-| The failure that ended the run | The whole of the worker's outcome, which is that failure. Nothing distinct goes with it: whatever the drain found, and a failure of the final wake, is retained inside that same outcome, and the owner group's own scope — which closes after the exit, outside the protected host lifetime — reports it there. |
-
-Re-raising either would retain a second copy under a fresh identity that
-inspection cannot fold together with the first. A composition that registers
-no sentinel is unaffected: nothing else reports the latched failure, so the
-exit reports all of it.
-
-How many the store keeps is derived from the host's own window limit rather
-than chosen, since one retirement round can offer an operation for every
-window the host may hold live and every one of them can fail; a chosen number
-would silently discard evidence this contract promises stays readable. A
-target retirement that failed is marked explicitly unverified and that
-operation is never offered again — not by a later round and not by the drain,
-because an operation that failed once may have disposed part of what it owns
-and this design admits no blind retry. Only independent evidence settles it.
-
-Publications close on **every** run exit, not only a failing one. A normal
-`requestStop` through the public worker handle ends the run with no failure to
-latch, and the drain takes the lifetime port's backlog exactly once, so
-closing first is what makes that single take sound: nothing can be admitted
-after it, and so nothing can be admitted that the take will miss.
-
-The final join waits for a terminal group report and re-enters until it gets
-one, retaining every interruption and every failure rather than returning on
-either. An ordinary `IOException` delivered with `throwTo` is
-indistinguishable here from one the join itself raised — the exception's type
-says nothing about how it arrived — and returning on it would let the host
-unwind with the owner never proved terminal. Re-entering the documented
-idempotent join replays no backend disposal; that is the owner's own drain's.
-`superviseGraphicsOwner` registers one ordinary supervised service in the
-application's own group whose whole job is to wait on that latch and fail with
-what it holds; a separate worker group gives supervision no connection by
-itself, so the connection is explicit. The latch is durable, so a failure
-raised before the application reached its own startup callback is delivered the
-moment the sentinel is registered. This owner is required, so a latched
-failure stops the run; there is no owner-wide disposition that could make it
-mean anything else.
-
-Cancellation is honoured at every owner wait. It is not latched as a terminal
-failure — an owner asked to stop is entitled to receive one — and the owner's
-drain absorbs it, defers it, and re-raises it only after every operation the
-drain owed has been offered, in dependency order: every target, then the owner,
-then its destruction. Repeated cancellation cannot shorten that, and cannot
-release a borrowed parent early. The main thread's own wait for the owner
-absorbs cancellation the same way and re-raises it after the join.
-
-A cancellation that *escapes* an injected operation leaves that operation's
-outcome unknown, and each of the three is treated accordingly. A construction
-it ended settles as unverified: the owner must assume it owns whatever the
-call had built, reports the target unusable through `readTargetStanding`, and
-retires it in the drain's ordinary order. A target retirement it ended
-manufactures no acknowledgement and writes no terminal record — the target
-stays the owner's, explicitly unverified, and the operation is never offered
-again, by a later round or by the drain, because it may already have disposed
-part of what it owns. A destruction it ended establishes nothing, so the
-windows, the session and every borrowed parent stay retained until independent
-evidence arrives, exactly as a destruction that raised does.
-
-Each injected operation is interruptible across the call and masked from its
-answer through the state that answer settles. The call itself must stay
-interruptible — that is what lets a cancellation end a construction the owner
-then keeps as unverified — but a cancellation between a *successful* call and
-the record of what it returned would discard evidence the backend really
-established: a construction would stay pending and be built a second time, and
-a target retirement would be neither recorded nor marked, so the drain would
-offer it again and dispose a second time what the backend has already
-disposed. The owner's startup, its construction and its target retirement each
-close that window; the whole-owner retirement and destruction already sit
-inside the drain's own mask.
-
-The supervision sentinel closes the matching one on its own side: it records
-that it has taken the latch in the same transaction that takes it, and is
-masked from there through the raise. Were a cancellation able to land between
-them, the sentinel would end without ever publishing the failure while the
-exit, seeing the record, left it out — and the owner's failure would be
-reported by nobody. A sentinel cancelled while it waits has taken nothing,
-records nothing, and suppresses nothing.
-
-Nothing but the injected evidence is permission. The owner's completion is not;
-an empty target set is not; a cancellation, a timeout and a cleanup failure are
-not. A target is released only against the terminal record its own injected
-retirement returned, and a failed retirement preserves its evidence and
-manufactures no acknowledgement. The owner's borrowed parents are released only
-against the injected whole-owner destruction's evidence; an owner that ends
-without it answers `OwnerDestructionUnverified`, which retains that fact, writes
-one diagnostic under `glfw.graphics-owner`, and authorizes nothing — not a
-disposal, and not a replay of the work that failed. That the owner ended without
-it is decided from the same snapshot that found the evidence missing, never
-from a later read, so a completion recorded after successful destruction is
-never mistaken for one recorded without it.
-
-#### Examples
-
-The examples in `glfw-tests` (`--match "GLFW graphics owner"`) run whole
-applications over the seam with the backend operations injected as fakes. The
-fakes hold no GLFW capability at all, which is half the evidence that the owner
-makes no GLFW call; the other half is the seam's record of every native call
-and its thread. Every example asserts an order of recorded facts or an observed
-state, never a time, and coordinates threads with STM and `MVar`s; the owner's
-timer is injected so a deadline comes due when the example says so rather than
-when a clock does.
-
-They cover: the handoff order, with the attachment registered before the
-backend is asked for anything; observation revisions that must advance, and a
-publication for an incarnation the slot has moved past; a partial construction
-and an interrupted one, each retained and reported unusable and then retired
-with the backend told it was never constructed; a verified rollback certified
-without a retirement of the owner's own; the owner taking rounds with the main
-thread blocked, and the main thread's own port and turn still serving while the
-owner is blocked inside a step; progress with the main loop's wake withheld
-entirely, and a deadline met from the owner's own timer with nothing else
-waking it; a full lifetime port answered as backpressure with nothing attached,
-and a full one preventing neither the stop, nor terminal evidence, nor the exit;
-repeated cancellation absorbed by the drain with the target, the owner, its
-destruction, the window and the session still in that order; the D-33 exit
-order; one released target acknowledged while the owner and a second target
-stay live; a released target whose retirement is owed asked again on a later
-round with nothing retired or certified meanwhile, one still owed at the
-exit asked again in the drain after its deadline, retired before the owner, and
-one whose preparation a cancellation interrupted retired by the drain, once;
-each step handed the demand's and the scene's revisions, two equal demands as
-two, and the demand's publisher told when the owner took it; the main thread's
-bounded housekeeping during the wait, made on the
-main thread; whole-owner retirement with no target ever attached and after the
-last one detached; a failed startup drained through the same retirement and
-told that startup never returned; a failure raised before application
-supervision exists delivered at the first checkpoint; a fatal failure reaching a
-checkpoint while retirement is deliberately still pending; an owner that ended
-with no retirement evidence retaining its window, its slot and every owed fact,
-with independent evidence the only thing that retires it; terminal facts the
-completion publisher refused staying owed and transported at the next
-opportunity; every native call from the owner's thread being the authorized
-wake; the extent seam's four pure cases; a refused handover leaking no reservation
-and an attachment whose answer was lost still being announced; twenty
-cancelled handovers, each leaving either nothing attached or an attachment the
-owner knows of; four detach-and-reattach cycles leaving no retained cell
-behind; an idle owner woken by a published demand and by a newer scene; a
-required failure closing admission and entering retirement before the
-checkpoint; a failed whole-owner destruction retaining the windows and the
-session until independent evidence arrives, with the one diagnostic written
-once; a window closed through its own port having its target retired with no detach
-at all, while the owner and a second target stay live; a failed target
-retirement offered exactly once over the whole run and its drain, with its
-evidence retained; a join re-entered until it answers a terminal report
-although an ordinary `IOException` was delivered into it, releasing nothing
-meanwhile; the startup's own evidence readable through retirement; an ordinary
-public stop closing every publication and its drain still taking an
-announcement admitted just before it; a direct attachment whose announcement a
-full port refused settled by its release rather than reported as one the owner
-will retire, and another settled by its window's close with no release at all;
-a published attachment whose answer was lost while the owner's admission
-closed in the same instant — observed *active* at that moment, so the recovery
-had to begin its retirement itself — settled rather than marked settled with
-nothing recorded; a delayed announcement of an incarnation the slot has moved past
-refused, with no slot reopened, no ghost target and the replacement
-untouched; a handover attaching nothing once admission has ended; a
-cancellation delivered inside the backend's construction, its target
-retirement and its destruction in turn, absorbed by each and releasing
-nothing early, and the same three delivered so that it *escapes* each call —
-the construction settling unverified and retiring in order, the target
-retirement manufacturing no evidence and never being offered again, and the
-destruction retaining everything until independent evidence arrives; every injected operation's answer committed with no interruption point
-after it, observed from inside that window at each site that has one; a
-sentinel cancelled before it delivered suppressing nothing; a target
-retirement that returned still recorded and never offered again, however many
-cancellations arrive as it returns; a
-failure the owner retained while it ran, and one that escaped its run, each
-appearing exactly once across the exit's primary and every cleanup failure
-retained beside it, and the same two in the production composition — with
-`superviseGraphicsOwner` registered, so the sentinel raises the failure at a
-checkpoint first — still appearing once while a distinct drain failure beside
-them is not swallowed; a handover the host quiesces under, at exactly the
-handoff between construction and publication, answering `HandoverSuperseded`
-with its attachment retired and no acknowledgement kept; six handovers
-cancelled at that same handoff, leaving no attachment the owner lacks an
-acknowledgement for and none behind afterwards; every publication into the handoff refused after quiescence and again
-as soon as the owner's run has failed; a whole-owner retirement that failed reported
-even though the destruction after it did not; and twenty cancelled handovers
-leaving no acknowledgement behind.
-
-The opacity examples compile external clients that reach for the owner's
-implementation and its handoff in the private sublibrary, and that forge the
-evidence only an injected operation may produce, both refused, beside an
-accepted client that composes an owner — the operation record, its
-configuration, the constructor, the handover and the extent seam — through the
-public modules alone.
+Nothing but the injected evidence is permission: not the owner's completion,
+an empty target set, a cancellation, a timeout or a cleanup failure.
 
 ### What the owner and workers may wait on
 
-No public owner-thread operation blocks on work only the owner turn can do. On
-the owner thread, awaiting an unsettled ticket or capacity fails with
-`OwnerThreadWouldWait`, and `runOwnerLoop` and `rejectHostCloseRequest` refuse
-other threads. The owner may be starting or draining a worker instead of
-turning, so a worker's startup and cleanup — rollback and finalizers included —
-must not require a command's completion. A worker's acknowledged run action may
-submit commands while the loop runs, composing its wait with its stop request:
-
-```haskell
-awaitOrStop ∷ StopToken → CompletionTicket → IO (Maybe Disposition)
-awaitOrStop token ticket =
-  atomically $
-    (Just <$> (pollCompletion ticket >>= maybe retry pure))
-      `orElse` (Nothing <$ awaitStopRequest token)
-```
-
-A worker never waits to publish demand: `publishDemand` records and answers
-without blocking, whether the slot is open or closed.
-
-These are obligations on application and worker code; the runtime's guarantee
-is not broadened.
-
-### CPU examples
-
-The admission-wake, demand, and degradation examples (`--match "wake"`) drive
-the production admission, publication, and notification code over the seam,
-whose scripted platform counts an empty-event post as pending for the next
-finite wait. Without sleeps they prove: a wake after each of the twelve
-admissions the contract's matrix names — both admission operations, on the
-host's port and on a window's own, before the owner's wait, inside it, and
-outside one — each wait ending on the post that reached it and every ticket
-settling exactly once; full and closed admission waking nothing; cancellation before a
-commit admitting and waking nothing, and after one keeping the command, its
-wake, and its single settlement, for both the immediate and the waiting
-operation; publishers released together from one gate combining immediate demand and the
-earliest deadline; twenty republications coalescing into one captured request; a
-live publisher captured in both commit orders — a capture taken while half its
-revisions are still to come, the empty slot the capture left, and then every
-later revision taken in order with what fell between two captures coalesced into
-the earliest deadline it covered; twenty rounds of a waiter cancelled exactly as
-capacity frees, each leaving either no admission and no wake or an admitted
-command with its own; a request demanding nothing and a closed
-slot recording nothing; publication cancelled before and after its commit; an
-expected platform failure degrading the session's path once, keeping every
-ticket, and being skipped by a second host over the same session; two failures
-overlapping inside their own posts degrading once and keeping one call's
-evidence; the one
-report written, filtered, and failed, each spending the attempt without
-retrying or undoing the degradation; a lifetime violation staying a typed
-failure with the command still admitted; and a retained port and publisher
-answering a later session without a native call. Every example that admits a
-command ends by executing or closing its host and reading each ticket twice, so
-no example leaves a cell unsettled or lets a settled one be written again.
-
-The host's own examples add, over whole applications: an idle turn's wait ended
-by a worker's admitted command and served by that same turn; a wait ended by a
-publication the same turn's update captures; a window's demand slot closed by its
-close protocol and every slot by quiescence, with retained publishers rejected
-afterwards; a creation claimed before quiescence registering a window whose port
-and demand slot are already closed; the degradation warning written once through
-the loop's injected logger while the finite idle bound continues; a degradation
-caused by the final update reported before the loop it finishes returns; a
-notification held inside its failing post across the loop's exit, waited for and
-reported; a degradation reported as a failing loop ends, with the loop's own
-failure primary; one begun after the loop reported by the ordinary runner with
-no reporting call of its own, and one claimed explicitly after quiescence; a
-command and a demand publication each paused between their commit and their
-wake, waited for at the runner's boundary; the report made when startup fails,
-when the action fails, and when the run is cancelled; a reporting attempt
-cancelled at its sink, which only an attempt outside a release can be; a run
-cancelled at that boundary's own wait, whose notification was still inside its
-failing post, keeping the cancellation primary and still spending the attempt;
-ten rounds of a cancellation requested as the action returns, landing wherever
-the race puts it and never losing the report; the same cancellation at a custom
-shutdown's own `reportHostWakeDegradation` boundary;
-one
-degradation and one warning shared by sequential hosts borrowing one session,
-whose wake capability neither shutdown closed;
-and a construction that rolls back lending nothing and waking nothing.
-
-A further group runs a sink that records every entry, counts every flush, and
-fails for the warning's own component alone, through the real application and
-logging lifetimes, and asserts the whole sequence of writes rather than the
-warning alone: a warning whose sink fails at the runner's boundary after a
-successful run, and one whose sink fails in a turn's own attempt, each leaving
-as the exception the sink raised, with the mark it raised it with, carrying the
-diagnostic-failure identity and followed by no second write and no flush; the
-same failure beside an application failure that stays primary and unmarked, with
-the warning's own retained under `glfw wake degradation report` and still no
-second write and no flush; a cancellation at the sink propagating as a
-cancellation, unmarked; and a filtered warning and an accepted one each leaving
-the ordinary single write-and-flush path alone. Each also asserts that the
-window and the session were live when the warning was written and released only
-at the ordinary unwind.
-
-The scheduled owner turn's examples (`--match "scheduled"`) run whole
-applications over the same seam with a scripted clock, which a scheduled turn
-reads exactly twice, so a script of `2n` instants covers `n` turns and a reading
-past the end fails the example. No example sleeps or asserts elapsed
-wall-clock time: the waits asserted are the exact seconds the production code
-passed to the seam's `glfwWaitEventsTimeout`. They prove: a deadline nearer than
-the fallback bound waited for exactly, with the update seeing the instant that
-wait reached; a deadline beyond the bound waiting the bound instead, twice over,
-never extended; an expired deadline polling; the immediate schedule a caller
-supplied before the first update polling, and an answer of no demand returning
-to the bound; three turns with no demand at all, and no windows, each waiting
-the bound; a publisher's deadline taken when it is earlier than the
-application's schedule and the schedule kept when it is earlier than the
-publisher's; three turns whose own work consumes most of each interval, each
-next wait shortened by what the last one spent rather than started afresh; an
-already-ready application event polling with no schedule and nothing published,
-with the readiness query dispatching nothing and spending none of the event
-budget; four turns of a continuously refilled command queue and four of an
-always-ready event source, each batch ending at its budget with the due update
-still offered every turn; a publication during the wait ending it and inspected
-by the next turn, which polls for it; a publication during the wait whose
-deadline is not yet due ending it too, the next turn recomputing an ordinary
-bounded wait and offering one update and no more; a publication made during the
-update surviving that turn's consumption of an older revision and being captured
-by the next, after which bounded waiting resumes; the saturated-queue checkpoint
-matrix stopping the scheduled turn at the same three points as the unscheduled
-one, with the same dispositions; the loop returning its update's own result;
-a degradation the loop's own final update caused, after that turn's boundary had
-passed, whose warning the loop-end claim then writes into a failing sink,
-leaving the loop with the diagnostic-failure identity, one `glfw.wake` write, no
-`runtime` write, no flush, and the window and session released only at the
-ordinary unwind; and
-the fallback bound floored to a whole nanosecond rather than rounded up —
-`1e-9`, `1.6e-9`, `2.5e-9`, `0.25`, and `0.1` each waited for exactly, and
-`1e-12`, `0.5e-9`, `0.75e-9`, and `0.9e-9` each refused before anything is
-acquired.
-
-The render demand examples (`--match "render demand"`) apply
-[the helper](#render-demand) to observations real windows published, over a seam
-whose scripted platform reports exactly the framebuffer extent, visibility, and
-minimize state each example wants, including the unavailable errors that make a
-field `Unavailable`; none of them builds an observation by hand. They prove: all
-thirty-six combinations of the three fields the eligibility rules read,
-classified exactly; a closing window and each of the three terminal phases
-excluded; an opportunity budget of none refused; a suspended window keeping its
-dirtiness and its published deadline while its expired deadline reaches no wait;
-a resume offering exactly one frame rebased at the resume instant after nine of
-the window's periods elapsed, replaying none of them, and the wait after
-acknowledging it being the simulation's alone; an owed resume frame surviving an
-intervening deferred observation; a deferred window's captured demand retained
-and offered once a usable extent arrives; the simulation's deadline reported with
-every window suspended, and no deadline at all with nothing demanded anywhere; a
-frame deadline served once, an unchanged request recreating nothing, a new one
-taken and a withdrawn one removed; an occasionally dirty window offered beside an
-always dirty one against a budget of one; three eligible windows against a budget
-of two each offered within the two turns `ceiling (3 / 2)` allows, with the work
-beyond the budget keeping the schedule immediate; an acknowledgement of an older
-revision leaving the newer request pending and offering it again; four
-publications coalescing into one opportunity per turn with the window's state
-unchanged in size; every way an entry leaves the state — dropped from the
-caller's list, reported closing, reported terminal, and forgotten outright —
-each asserted as the deletion of an entry that state held, from windows of one
-session observed open first and beside an open window that keeps its own; an
-owed resume frame surviving three deferred turns whose frame schedule the caller
-replaces each time; and a deadline this turn's own offer covers left out of the
-schedule while an unserved frame deadline beside it is reported. Two of them run the production scheduled loop: the worked composition
-above, asserting its exact simulation steps, per-window opportunities, schedules,
-and waits, and a suspended window whose captured demand still leaves the next
-turn its whole fallback bound.
-
-The host's CPU examples run whole applications over the test seam in
-`glfw-tests`. The seam's native table scripts the poll and the finite
-wait — recorded as `PollEvents` and `WaitEvents`, with `scriptPollEvents` and
-`scriptWaitEvents` steps — and its private `seamQueueEvents` driver leaves
-callback events, such as a close request, for the next poll or wait to deliver
-from inside that call. They prove the turn order and the poll or wait choice,
-the checks after saturated command and event batches, worker progress during a
-wait, settlement through the loop, the owner-thread refusals, close-request
-surfacing, a monitor change queued for the next poll refreshing the inventory
-only on the turn that delivered it, quiescence, and the shutdown order on
-startup failure, action return, failure, and cancellation, a
-supervisor-detected failure, and an abandoned managed startup.
-
-The dynamic window examples prove, over the same seam: the creation handoff —
-prepared `WindowCreated` data, capabilities readable only after settlement and
-after the initial observation, and a window port refused creation and other
-windows; capacity and configuration rejections before any native call; a failed
-construction rolled back with its native evidence and no consumed capacity; a
-construction whose rollback's own release failed propagating its original
-native failure as the host's primary failure — the rollback failure retained
-exactly once as cleanup evidence, the failing command's ticket interrupted, the
-command queued behind it settled as not executed, and the loop stopped before
-that turn's update — with poisoning visible through that retained evidence; an
-unawaited creation's window enumerable, live through the drain, and disposed at
-shutdown; a cancellation delivered from another thread during construction
-rolling it back with no registry entry and its capacity reclaimed, and one
-pending across registration delivered before publication, leaving the window
-registered and disposed; the middle of three
-windows closed while the others observe and execute; close orders A-B-C and
-C-A-B each disposing every window with callbacks detached before destruction;
-retained ports, borrows, closes, and readers of a disposed window answering
-typed terminal results with no native call; queued callers on a closing window
-settled as not executed after its earlier commands ran; retirement deferred by a
-borrow of the window and of another, with the closing phase and then the
-disposal published, a slow reader receiving the disposal before `EndOfStream`; a
-failed release latched as disposal failed, never retried, poisoning creation,
-and primary at final exit, and retained beside a failing body's own failure;
-bookkeeping bounded and identities never reissued across forty cycles of
-creation and an honoured native close request; shutdown with a window closing
-and closes racing it, every port closed before the drain and every window
-released once after it; and fair dispatch with a replenished, partly rejected
-port beside a waiting window port holding two commands and a host request,
-through closure and creation, each command within its documented bound and
-every turn within the budget. A host example closes one window while the other's
-feed has a suspension reset pending: the closed window's reads end at once, the
-other still requires its reset, and quiescence then ends it without an
-acknowledgement.
-
-### Input feed examples
-
-The input feed examples in `glfw-tests` drive the feed model through
-its private producer and through scripted native callbacks, with window
-identities from a seam session and no GLFW.
-Threads are coordinated with `MVar`s and STM; a wait is observed through
-`orElse`. They prove: distinct, uncoalesced key, text, button, scroll, and focus
-events tagged with window and epoch, from the private producer and from
-scripted callbacks with cursor coalesced into the observation; gating before
-readiness and while unfocused, no reset for pre-readiness disablement, and a
-delivered focus loss that closes the focus gate; a click keeping its captured
-position after later cursor motion; staging overflow setting the loss latch
-while the buffer is full, beginning the same reset, and replaying no prefix;
-a callback release synthesizing no press; one window's staging overflow leaving
-another's feed running; focus loss and gain in native order, and a focus
-transition that cannot be admitted starting the reset; focus loss clearing held
-state; one stable token across twenty
-thousand suppressed events with exact, non-wrapping counters and no channel,
-epoch, or warning added; exact discard accounting apart from the unadmitted
-event and delivered events; no old backlog after reset detection and no
-new-epoch input before acknowledgement and resumption; foreign, duplicate,
-stale, and closed acknowledgements; a consumer cancelled before acknowledging
-leaving the feed paused and closable; closure during a pending or acknowledged
-reset ending reads without the reset; resumption losing to a closure committed
-after the candidate was allocated, publishing no channel; a key and button held
-at a reset producing nothing in the new epoch until pressed again; two windows
-overflowing independently; one warning per episode through the injected logger
-blocking resumption until its attempt completes, a failing sink retained as
-`WarningFailed` and never retried, and an attempt cancelled by shutdown retained
-as `WarningInterrupted`, or left `WarningOwed` when shutdown came first; and, for
-suspension, press → suspend → suppressed release → enable leaving no backlog or
-held state and needing acknowledgement, resumption, and a fresh press,
-acknowledgement before or after re-enabling, repeated toggles keeping one token
-and epoch, suspension during an overflow reset keeping its token and warning
-obligation, no warning for suspension alone, and closure winning every
-suspension and resumption race while a suspension or focus loss leaves a
-candidate unpublished.
+No public owner-thread operation blocks on work only the owner turn can do
+(`OwnerThreadWouldWait`). A worker's startup and cleanup must not require a
+command's completion, because the owner may be starting or draining that
+worker. A worker's run action may submit commands and compose the wait with
+its stop request (`pollCompletion` with `awaitStopRequest` in one
+transaction). `publishDemand` never blocks.
 
 ## Window attachments
 
-A graphics integration — a future surface and the work submitted through it —
-depends on a window for longer than a borrow. The private
-`Hetoimasia.GLFW.Internal.Attachment` module in the `model` sublibrary models
-that dependency: which window an integration has attached to, where the
-attachment is in its lifetime, what evidence retires it, and whether it still
-vetoes the window's destruction. It is the LIFE-1 slice of
-[the window and graphics lifetime design](archive/window_graphics_lifetime_design.md)
-(P-1, P-5, D-1, D-2, D-4).
+The private `Hetoimasia.GLFW.Internal.Attachment` models a graphics
+integration's dependency on a window: which window, where the attachment is in
+its lifetime, what evidence retires it, and whether it still vetoes the
+window's destruction. It is a pure state machine with bounded bookkeeping and
+one bounded notice inbox. It names no Vulkan, native or GPU type and is not
+public; [the public attachment contract](#the-public-attachment-contract) is
+this model under the protected host boundary.
 
-**The model itself is not public.** No module under `packages/glfw/src/` or
-`packages/glfw/runtime-glfw/` exports it or the retirement boundary that owns
-it, and an external client can import neither. The one boundary that owns an
-instance is [the protected host lifetime](#the-protected-host-lifetime)
-(LIFE-3), which reaches it through the private `runtime-glfw-core` sublibrary;
-a host built by `allocWindowHost` is issued no identity, so its close protocol,
-its retirement by borrow count, and every public module behave exactly as
-before. What an application reaches is
-[the public attachment contract](#the-public-attachment-contract) (LIFE-4),
-which is this model under that boundary: the phases, facts, acknowledgements,
-and bookkeeping below are what its answers mean. The model
-names no Vulkan, native, or GPU type, performs no native call, and owns no
-thread; it is a pure state machine with bounded bookkeeping and one bounded
-notice inbox.
-
-### Ownership and trusted inputs
-
-The host owns per-window registration and close state; the graphics integration
-owns its dependent resources, their retirement work, and the evidence that none
-can still use the window. The model does not establish its own premises; the
-owning boundary supplies them and is responsible for them:
-
-- the host identity is fresh, made from a `Unique` created for that host alone;
-- the session identity is the session issuing the host's windows, and windows
-  are registered in the order that session issued them;
-- every operation taking the owner's authority runs on the owner thread. A pure
-  transition cannot observe the executing OS thread, so the boundary checks it
-  first, as window operations check theirs.
-
-### Identities
-
-An attachment identity binds four identities: the host, the session, the
-`WindowId`, and an incarnation. A model issues incarnations from one, never
-reissuing one, and its host identity is fresh, so together they name one
-attachment in the process. Every operation carrying authority compares all four
-against its target, and a mismatch in any is typed misuse that changes nothing:
-a refused transition returns no model at all.
-
-### Phases and transitions
+**Identity.** An attachment identity binds the host, the session, the
+`WindowId` and an incarnation that is never reissued. Every operation carrying
+authority compares all four, and a mismatch is typed misuse that changes
+nothing.
 
 | From | To | By |
 |---|---|---|
 | none | registering | attaching reserves an open, unoccupied window of this host and session |
-| registering | active | construction succeeds; the only way a usable capability is represented |
+| registering | active | construction succeeds |
 | registering | retiring | detach, cancellation, the window beginning to close, or construction failing |
 | active | retiring | detach, cancellation, or the window beginning to close |
 | retiring | retired | the last missing retirement fact is recorded |
 
-No other transition exists. Attaching to a window recorded as closing or ended,
-to an unregistered window, to one already holding a live or retiring
-attachment, with another host's identity, or with a window of another session is
-refused before any incarnation is issued, so the boundary can refuse before any
-acquisition effect. Retirement once begun is never undone: a construction that
-succeeds afterwards publishes nothing, and its dependents stay registered for
-retirement. Construction is tracked beside the phase, and while it is pending no
-retirement fact is accepted, so a cancellation at any handoff — before
-construction, after it created dependents but before publication, or after
-publication — leaves no constructed dependent outside registration. A retired
-attachment is removed, freeing the window's slot; attaching again yields a fresh
-incarnation.
-
-Failure evidence is stored beside the phase, never as one. A failed construction
-records its original failure and its rollback outcome and moves the attachment
-to retiring. A safe rollback establishes every retirement fact, explicitly
-discharging obligations the construction never created, and retires the
-attachment. An unsafe rollback records no fact: the attachment keeps its window
-until each fact is certified. A failed disposal step is recorded without
-establishing anything. The first failure is kept and later ones are counted;
-cancellations are counted and establish nothing.
+Retirement once begun is never undone. While construction is pending no
+retirement fact is accepted. Failure evidence is stored beside the phase,
+never as one: the first failure is kept and later ones counted. A safe
+rollback establishes every fact; an unsafe one records none.
 
 ### Retirement facts
-
-Three facts stay distinct: logical release (the application stops wanting a
-frame), CPU-use retirement, and backend retirement. The model records the
-latter two as four independent facts, each certifying an obligation that has
-irrevocably ended:
 
 | Fact | Certifies |
 |---|---|
@@ -5188,385 +1656,129 @@ irrevocably ended:
 | Presentation ended | Presentation obligations have ended |
 | Dependents disposed | Dependent resources are disposed |
 
-None is accepted before retirement begins, while further use is still possible.
-An attachment is retired, and stops vetoing its window, only when all four are
-recorded; the model reports which are missing. No single fact, elapsed time,
-cancellation, body return, or failure stands in for another. A window with no
-attachment veto is not thereby destroyable: destruction still requires the
-host's close protocol and its ordinary CPU borrows.
+None is accepted before retirement begins. An attachment is retired, and stops
+vetoing its window, only when all four are recorded. No single fact, elapsed
+time, cancellation, body return or failure stands in for another. A window
+with no veto still needs the close protocol and no borrows to be destroyed.
 
-### Acknowledgements
+**Acknowledgements.** Attaching returns an acknowledgement bound to the
+incarnation, which every transition takes with the target identity. It
+prevents cross-window and cross-incarnation misuse; it is not proof a backend
+finished. A report for a replaced incarnation is misuse, ahead of terminal
+idempotence. A report for an absent (retired) target is accepted and changes
+nothing. Recording the same fact twice is idempotent.
 
-Attaching returns an acknowledgement bound to the new incarnation. It is the
-integration's completion authority, taken with the target identity by every
-attachment transition, and the two must name the same host, session, window, and
-incarnation. It prevents accidental cross-window and cross-incarnation misuse;
-it is not proof that a backend really finished, which the backend's own tested
-contract supplies. A target resolves in order:
+**Notices.** Another thread never changes the model. It offers a completion
+notice to a bounded inbox that never waits and answers admitted, coalesced or
+rejected. The owner folds notices, revalidating each as a direct report.
 
-1. An acknowledgement naming another host, session, window, or incarnation is
-   misuse.
-2. A target of another host or session is misuse, as is an incarnation the model
-   never issued.
-3. If the window holds an attachment of another incarnation, the target was
-   replaced, which is misuse. This identity mismatch takes precedence over
-   terminal idempotence, so a late report never alters a replacement.
-4. An absent target has retired, because an issued attachment leaves the
-   bookkeeping only by retiring. Any report for it is accepted and changes
-   nothing, and no entry is recreated.
-
-Recording the same fact twice for a live incarnation is accepted and idempotent.
-
-### The owner-thread rule and completion notices
-
-Every operation that registers, closes, forgets, attaches, constructs, retires,
-or removes takes the owner's authority value, which the model's creation
-returns; another model's authority is misuse. Observation — an attachment's
-status, a window's veto, and the counts — takes none.
-
-Another thread never changes the model. It offers a completion notice to a
-bounded inbox, which never waits and answers admitted, coalesced when an equal
-notice is already pending, or rejected when the inbox holds its capacity of
-distinct notices. An admitted notice stays pending until the owner takes the
-inbox's notices and folds them, revalidating each exactly as a direct report,
-so a notice queued for an attachment replaced before the fold is misuse and
-never touches the replacement.
-
-### Bookkeeping
-
-The model holds one record per registered, not yet forgotten window — at most
-the host's window limit — and at most one attachment per record. A window with
-a live or retiring attachment cannot be forgotten. Stale identities are rejected
-by comparing incarnations and local window numbers against the model's
-counters, never by remembering them: a window numbered at or below the highest
-registered with no record has ended. No set grows with the number of windows or
-attachments ever made.
-
-### Attachment model examples
-
-The examples in `glfw-tests` (`--match "attachment"`) script pure transitions
-over window identities from seam sessions, with no sleep. They prove every
-refused attachment — closing, ended, unregistered, occupied, and retiring
-windows, another host, another session, and another owner's authority — issuing
-no incarnation; issue-order registration and the window limit; the transition
-table, including closing during construction publishing nothing; the
-acknowledgement of another window, of an earlier incarnation, of another host
-or session, a replaced target, and an incarnation never issued, each changing
-nothing; each retirement fact alone keeping the window vetoed and the full set
-releasing it; cancellations and disposal failures releasing nothing while
-keeping the first failure; a scripted owner whose render thread publishes CPU
-retirement and submission completion through the inbox while presentation
-stays owed and the window stays vetoed; duplicate completion idempotent before
-and after retirement; failed construction with safe and with unsafe rollback;
-cancellation at each handoff; two windows where only one can retire;
-bookkeeping equal to the live count after five hundred attach-and-retire cycles
-and forty window cycles; inbox admission, coalescing, capacity rejection, and
-retention until taken; and a notice queued for a replaced attachment refused
-when folded. The opacity examples compile an external client that imports the
-model and is refused because its module belongs to a hidden private sublibrary.
+**Bookkeeping.** One record per registered window, at most one attachment per
+record. Stale identities are rejected by comparing against counters, never by
+remembering them.
 
 ## Vulkan interop
 
-The GLFW package's Vulkan-specific code is one separate component,
-`hetoimasia-glfw:vulkan-interop`, and a Vulkan-free half that the rest of the
-package owns: the session's loader capability in the `model` sublibrary and the
-surface bridge in `runtime-glfw-core`. It is VK-5 of
-[the Vulkan backend design](archive/vulkan_backend_design.md) (P-1's package boundary,
-P-7, D-5, D-7, D-14, D-29, D-33) and depends on no GPU package and no renderer.
-
-### The component and its build
-
-`vulkan-interop/cbits/hetoimasia_glfw_vulkan.c` includes `<vulkan/vulkan.h>`
-before `<GLFW/glfw3.h>` with `GLFW_INCLUDE_NONE`: GLFW 3.4 declares
-`glfwInitVulkanLoader`, `glfwGetInstanceProcAddress`, and
-`glfwCreateWindowSurface` only when `VK_VERSION_1_0` is defined. Its header
-names no Vulkan or GLFW type, so the Haskell imports see an instance as an
-untyped pointer, a window as the model's opaque `NativeWindow`, and a surface as
-a `Word64`; the source statically asserts that `VkSurfaceKHR` is 64 bits wide,
-the handle ABI the VK-2 proof established. Every import is `safe`, because a
-GLFW call that reaches the loader can reach its layers.
-
-The ordinary native library, `native/cbits`, keeps `GLFW_INCLUDE_NONE` and gains
-no Vulkan declaration, header, or link input. The component is gated by the
-package's manual `vulkan-interop` flag, off by default: `cabal build all` and
-`cabal build all --project-file cabal.project.cpu` build none of it, resolve no
-Vulkan binding, and link no loader, and every existing public module,
-`allocSession`, and every window-only constructor keep their signatures and
-behaviour. `cabal.project.vulkan` lists the package and sets the flag, and
-[`tools/vulkan/run.sh`](../tools/vulkan/run.sh) passes the
-provisioned prefix's Vulkan include and library directories on its command
-line; the workflow suite's Vulkan project boundary examples check that only that
-project turns the flag on and that, with it off, no ordinary package resolves
-the binding.
+`hetoimasia-glfw:vulkan-interop` is the only GLFW component that includes the
+Vulkan headers. Its header names no Vulkan or GLFW type: an instance is an
+untyped pointer and a surface a `Word64` (the source statically asserts
+`VkSurfaceKHR` is 64 bits). Every import is `safe`. The component is gated by
+the manual `vulkan-interop` flag, off by default; only `cabal.project.vulkan`
+sets it, and the workflow suite checks that. It depends on no GPU package.
 
 ### The loader integration capability
 
-`allocLoaderIntegration` builds a `LoaderIntegration`: an opaque, single-use
-capability made from the loader entry point the Vulkan binding already
-dispatches through — the binding's own linked `vkGetInstanceProcAddr`, asked for
-its own address — for the production GLFW library's guard. A session takes it
-through `Hetoimasia.GLFW.Session.allocIntegratedSession` (or the interop's
-`allocLoaderSession`), the additive constructor beside `allocSession`.
-`SessionConfig` is unchanged: it stays a pure `Eq`/`Show` window configuration,
-and the capability is a separate argument, never an action inside it.
+`allocLoaderIntegration` builds an opaque, single-use capability from the
+loader entry point the Vulkan binding dispatches through. A session takes it
+through `allocIntegratedSession`, the additive constructor beside
+`allocSession`. During session construction the capability is:
 
-In the session's construction the capability is:
+1. **admitted** after the guard is claimed and before the first native call:
+   `IntegrationStale`, `IntegrationForeign` or `IntegrationAlreadyUsed` refuse
+   before any native effect;
+2. **installed** after the init hints and before `glfwInit`, as GLFW's
+   pre-init loader hint;
+3. **reset** by its own release, after termination, to GLFW's default loader
+   search, on every path.
 
-1. **admitted** right after the guard is claimed and before the support query,
-   the first native call. A capability whose scope has ended is
-   `IntegrationStale`, one made for another native library's guard is
-   `IntegrationForeign`, and one another entry already took is
-   `IntegrationAlreadyUsed`; each is refused there, before any native effect,
-   leaves the capability as it was, and vacates the guard as any refusal before
-   initialization does;
-2. **installed** after `nativeSetInitHints` and before `nativeInitialize`, as
-   GLFW's pre-init loader hint. It is marked installed before the call, so
-   whatever the call does, the release below resets it; a capability whose
-   install raises leaves GLFW uninitialized, is reset, and vacates the guard;
-3. **reset** by its own release — rank four, after termination and before the
-   error callback's detach and the guard's settlement — to GLFW's default
-   loader search. That release runs after a normal termination, after a failed
-   initialization, and after an entry that failed before initialization, so the
-   default is always restored before the capability's own scope — the borrowed
-   loader ownership — can end.
+When the reset raises, or termination could not be established, the capability
+is retained as `IntegrationUncertain` and the guard is poisoned. A window-only
+session makes no loader call.
 
-When the reset raises, or termination already could not be established, what
-GLFW holds is unknown: the capability is retained as `IntegrationUncertain`,
-never ends, and the guard is poisoned, so no later session — window-only or not
-— initializes GLFW beside a loader setting nobody can vouch for. A capability's
-scope that ends while its session still holds it fails with
-`IntegrationStillInstalled` and keeps it until the session restores the default.
-A window-only session makes no loader call at all, so the header-free path makes
-no Vulkan-typed reset call; the loader setting it would find is always GLFW's
-default, because every interop session restores it before its guard is vacated.
-
-### Instance extensions
-
-`Hetoimasia.GLFW.Vulkan.requiredInstanceExtensions` answers the instance
-extensions GLFW requires for this platform's window surfaces. It is an owner
-operation: another thread is `NotSessionOwner` and an ended session
-`SessionEnded`, each before any native call. A window-only session is refused
-with `SessionNotLoaderAware` without asking GLFW, which would otherwise search
-for a loader of its own. GLFW is first asked whether it has a Vulkan loader at
-all — `VulkanUnsupported` carries what it reported if not — and then for the
-names, every one of which is copied whole into Haskell-owned storage and forced
-before the query returns, so none points into storage termination frees and
-none is cut to a fixed length.
+`requiredInstanceExtensions` is an owner operation. A window-only session is
+refused with `SessionNotLoaderAware`; no loader is `VulkanUnsupported`. Every
+name is copied into Haskell-owned storage before the query returns.
 
 ### The surface bridge
 
-`Hetoimasia.Runtime.GLFW.Internal.Surface` is the bridge, written over the
-capability's two surface operations, so the model and the seam stay header-free;
-`Hetoimasia.GLFW.Vulkan` is its public face.
+A surface may be created only through a `SurfaceAccess`, which is open only
+while one of two things runs on the owner thread: the construction step of an
+attachment made by `attachWindowGraphicsWithSurfaces`, or an admitted
+`replaceWindowSurface` on that attachment while it is active and its window is
+not closing. Every other request is a `SurfaceRefusal` before any native
+effect.
 
-**Where a surface may be created.** Only through a `SurfaceAccess`, which is
-open only while one of two things runs on the owner thread — and is closed by a
-masked release covering the whole step, so no cancellation, however it arrives,
-leaves one open: the construction
-step of an attachment made by `attachWindowGraphicsWithSurfaces` — which is
-`attachWindowGraphics`, unchanged in every answer, with the protocol built from
-the access — for exactly that attachment while it is registering; or an
-admitted replacement, `replaceWindowSurface`, on that same attachment while it
-is active and its window is not closing. A replacement decides nothing about
-when one is wanted, how the surface it replaces retires, or how often to retry;
-that is VK-14's policy. Every other request — a step that has returned, a
-retiring or replaced attachment, a closing or ended window, a session with no
-capability, an instance leased through another capability, an instance whose
-lease is releasing — is a `SurfaceRefusal` before any native effect.
-
-**The handoff record.** The instance's owner leases it to the bridge with
-`leaseSurfaceInstance`, as its dispatchable handle. Admission and the
-reservation are one transaction: it counts a hold on the exact attachment and a
-construction on the lease before the native call. The window's native pointer
-is borrowed inside the bridge, through the host's own window borrow, for that
-call alone, and never leaves it. The call is made with asynchronous exceptions
-held off, as a native call is uninterruptible anyway, and its result is always
-recorded:
+The instance's owner leases it with `leaseSurfaceInstance`. Admission and
+reservation are one transaction. The native call runs with asynchronous
+exceptions held off and its result is always recorded:
 
 | What the native call did | What the caller receives | Holds |
 |---|---|---|
-| Created a surface, nothing changed since admission, and GLFW reported nothing | `SurfaceCreated`: a live `WindowSurface` carrying its one `SurfaceObligation` | The obligation holds the attachment and the lease |
-| Created a surface, but the window began closing, the attachment began retiring, the step ended, GLFW reported errors, or the bridge raised after it | `SurfaceUnpublished`: the obligation alone, with the reason; the surface must not be used | The obligation holds both |
-| Returned a failing `VkResult` and created nothing | `SurfaceCreationFailed` with that `VkResult` and GLFW's reports | Released |
-| Raised before any native result existed | That exception, as itself — never a fabricated `VkResult` | Released |
+| Created a surface, nothing changed, nothing reported | `SurfaceCreated` with its one `SurfaceObligation` | Attachment and lease |
+| Created a surface, but the window began closing, the attachment began retiring, the step ended, or GLFW reported errors | `SurfaceUnpublished`: the obligation alone; the surface must not be used | Attachment and lease |
+| Returned a failing `VkResult` | `SurfaceCreationFailed` with it and GLFW's reports | Released |
+| Raised before any native result | That exception | Released |
 
-A cancellation that arrives during the call is delivered only after its result
-is recorded. A caller that loses the answer to it has not lost the surface:
-every obligation not yet confirmed destroyed stays listed on its lease
-(`leasedObligations`), still holding the attachment, so the owned rollback or the
-instance's owner can find and discharge it. A full ordinary command queue plays
-no part: surface creation is not a command.
+- A caller that loses the answer to a cancellation has not lost the surface:
+  every undischarged obligation stays listed on its lease
+  (`leasedObligations`).
+- `dischargeSurfaceObligation` destroys the surface through the capability's
+  `vkDestroySurfaceKHR`, from whichever thread holds the obligation, once. A
+  destruction that raised is `DestructionUncertain`, keeps both holds for
+  good, and is never retried.
+- While any surface construction or undischarged obligation holds an
+  attachment, the retirement boundary refuses its `DependentsDisposed` fact
+  and treats a `RollbackSafe` as unsafe.
+- `releaseSurfaceInstance` answers `InstanceReleasable` only when nothing is
+  in flight or owed; until then the instance must not be destroyed.
 
-**Obligations.** `dischargeSurfaceObligation` destroys the surface through the
-capability's `vkDestroySurfaceKHR`, resolved through the capability's own loader
-entry point — a Vulkan call, never a GLFW one — from whichever thread holds the
-obligation, and only once: a second discharge is `DischargeRefused
-AlreadyDischarged`. Only a destruction that returned releases the attachment and
-lease holds. One that raised is `DestructionUncertain`, keeps both holds for
-good, and is never retried.
-
-**Retirement and release wait for it.** While any surface construction or
-undischarged or uncertain obligation holds an attachment, the retirement
-boundary refuses its `DependentsDisposed` fact — certified on the owner thread
-or folded from a notice — and treats a failed construction's `RollbackSafe` as
-`RollbackUnsafe`. So no cancellation, timeout, or cleanup error can certify the
-attachment's terminal retirement while a surface of it may exist, and a second
-obligation or a replacement still in its native call keeps the attachment held
-after the first is discharged. A confirmed destruction revives the attachment's
-retirement path, and one confirmed on another thread while a retirement step is
-still running outranks that step's own answer: the step reads the registration's
-revival count before it runs and withdraws the path only if nothing revived it
-meanwhile, so a step that stalled on the surface it could not yet see destroyed
-cannot leave the attachment waiting with no further evidence to come.
-`releaseSurfaceInstance` closes the lease to new
-constructions and answers `InstanceReleasable` only when nothing is in flight or
-owed against it; until then it is `InstanceRetained`, and the instance must not
-be destroyed. The graphics owner that receives the surface, owns the instance,
-and discharges the obligation on its own thread is VK-7's
-([gpu_backend.md](gpu_backend.md)); this package's own examples discharge from a
-scripted owner.
-
-`Hetoimasia.GLFW.Vulkan.Provenance` answers what the native proof needs to hold
-the one-loader claim to addresses and images — the entry point a capability was
-made from, the value the shim last handed GLFW's loader hint (GLFW offers no way
-to read the hint back, and the shim is its only production writer), and what
-GLFW resolves a name to — and nothing an application needs.
-
-### Examples and native evidence
-
-`glfw-tests` covers the capability and the bridge headlessly through the seam's
-scripted capability (`seamIntegration`, `seamIntegratedSession`), which records
-each loader and surface call beside the native ones. The `GLFW loader
-integration` group holds the install's order between the hints and `glfwInit`;
-the refusal of a stale, foreign, or already-used capability before any native
-call; the reset after termination, after a failed initialization, and after a
-capability that fails; and the retained, poisoned outcome when the reset or
-termination is uncertain. `GLFW required instance extensions` holds the copied
-names past termination, the owner-thread and liveness refusals, and the
-diagnoses for a window-only session and for a platform with no loader or no
-extensions. `GLFW surface bridge` holds creation inside a construction step,
-refusal outside a running step and for a foreign or releasing instance, admitted
-and refused replacements, a native failure's `VkResult` and reports, an
-exception before a result, a cancellation that loses the answer with the
-obligation kept and the rollback's claim of safety refused, a rollback that
-discharges it, a window closing during creation, creation while the command
-queue is full, a double discharge, an uncertain destruction, and a second
-obligation or an in-flight construction keeping the attachment and the lease.
-
-The native evidence runs through the production capability and bridge in the
-Vulkan native suite's `vk5-bridge` case, with private roots in a child process;
-see [the Vulkan native suite](gpu_backend.md#the-native-suite).
+Native evidence is the Vulkan native suite's `vk5-bridge` case
+([gpu_backend.md](gpu_backend.md#the-native-suite)).
 
 ## State
 
-| State | Owner | Readers and writers | Thread | Lifetime | Reset or disposal |
-|---|---|---|---|---|---|
-| Guard occupancy and poison | The native library's table; process-wide in production | Entry claims it; the last release settles it | Any; atomic | The process | Vacant after a safe teardown; poisoned for the rest of the process otherwise |
-| Error capture buckets | The session | The callback writes; owner operations and releases take | Callback: any; takes: owner | Construction until the callback is detached | Unread asynchronous reports become cleanup evidence |
-| Callback storage | The session | Installed at entry; freed at teardown | Owner | Until detached | Freed after a safe detach; leaked when poisoned |
-| Teardown safety flag | The session | Releases clear it; the guard release reads it | Owner | The session | Read once |
-| Liveness | The session | Termination clears it; owner operations read it | Owner | The session | Never set again |
-| Wake gate and admitted count | The session | Wake calls enter and leave; the first release closes and drains it | Any; STM | Construction until the first release | Closed and never reopened; a retained capability stays terminal |
-| Wake path degradation | The session | The first expected platform failure of a notification degrades it; the owner's boundary claims and settles its one report | Any; STM | The session | Never healthy again; a later session has its own |
-| Notification obligations | The session | An admitting or publishing transaction registers one; the notifying thread discharges it in the transaction that records what its wake left; owner boundaries wait for zero | Any; STM | The session | Zero whenever every committed admission and publication has been notified |
-| Wake reports | The session's error capture | The callback writes on the wake call's OS thread; the call takes them | The wake call's OS thread | One wake call's native call | Removed when the call returns |
-| Connection probe and its latched failure | The session | Wayland entry resolves the probe; event processing runs it at both boundaries and latches the failure it confirms | Owner | The session | Latched once confirmed; never cleared, so event processing stays terminal |
-| Interaction trace | The session | An activated probe starts, takes, and stops it; the pump, the owner loop, and the window callbacks offer records | Owner, and callbacks inside its pump calls; atomic | Stopped unless a probe starts it | Emptied by each take; stopped storage holds nothing |
-| Monitor capture latch | The session | The monitor callback writes; refreshes fold and clear it | Callback: inside owner calls; folds: owner | The session | Cleared by each committed refresh; a fault is taken when rethrown |
-| Monitor identity counter | The session | Refreshes issue from it | Owner | The session | Never reissued |
-| Monitor connections and current inventory | The session | Committed refreshes write them; resolution reads them | Owner | The session | Emptied when the inventory closes |
-| Monitor inventory snapshot | The session | The owner publishes and closes; clients read | Publish: owner; read: any | While referenced | Closed first at teardown, holding the last descriptions; never reopened |
-| Monitor callback storage | The session | Installed at entry; detached before termination; freed at teardown | Owner | Through the session's last native call | Freed after a safe teardown; leaked when poisoned |
-| Window identity counter | The session | Window creation issues from it | Owner | The session | Never reissued |
-| Native window | The window | Its parts create and destroy it; owner boundaries query it | Owner | The window's scope | Destroyed at release |
-| Window callback storage | The window | Its parts allocate, attach, detach, and free it; GLFW invokes it | Owner | Through the window's final native use | Freed after a certain release; kept when uncertain |
-| Capture latch | The window | Callbacks write; boundaries and release take | Callbacks: inside owner calls; takes: owner | The window | Emptied at each boundary |
-| Input staging | The window | Input callbacks write; the owner boundary publishes or discards | Callbacks: inside owner calls; publish: owner | The window | Discarded on overflow or published, then emptied |
-| Attached input feed | The window | The host attaches it; the owner boundary publishes into it | Owner | From attachment until the window ends | Closed with the window |
-| Current observation and close counter | The window | Boundaries fold, then publish | Owner | The window | Final value retained in the closed snapshot |
-| Observation snapshot | The window | The owner publishes and closes; clients read | Publish: owner; read: any | While referenced | Closed at release; never reopened |
-| Window liveness | The window | Release clears it; every operation reads it | Owner; `windowEnded` any | The window | Never set again |
-| Window constraint state | The window | Constraint updates write it; size and constraint validation read it | Owner | The window | Known and unconstrained at creation; indeterminate from an update's first call until the update completes |
-| Mode transition marker | The window | A transition sets and clears it; controls and transitions read it | Owner | The window | Clear at creation; no public command sets it |
-| Preserved windowed and native constraint states | The window | Windowed constraint updates write the preserved set; transitions suspend and restore the native constraints; size validation reads both | Owner | The window | Known, unconstrained, and followed at creation |
-| Mode record | The window | Transitions, their samples, and mode reconciliation write it; observations publish it | Owner | The window | Seeded at creation; the final value retained in the closed snapshot |
-| Monitor claims | The session | Fullscreen attempts reserve; samples settle; window release disposes | Owner | The session | Claims of ended identities dropped when consulted; at most one per current monitor |
-| Release certainty | The window | Uncertain parts clear it; the storage and observation releases read it | Owner | The window | Read at release |
-| Command channel | The command host | Ports admit; the executor claims; closure drains | Admit: any; claim and close: owner | While referenced | Closed by closure with its backlog settled; never reopened |
-| Pending completion cells | The command host | Admission reserves; settlement and closure remove | Reserve: any; settle: owner | Admission until settlement | Removed at settlement |
-| Active command count | The command host | Claims raise it; settlements lower it | Owner | The host | Zero whenever nothing is executing |
-| Completion cell | Its tickets | Settled once; tickets read | Settle: owner; read: any | While a ticket references it | Never reset |
-| Admission flag | The command host | Closure sets it; direct performance reads it | Owner | The host | Never cleared |
-| Request counter | The command port | Submissions issue from it | Any; atomic | The host | Never reissued |
-| Demand slots: the application's and one per window | The window host | Publishers combine into them; the owner captures and clears; the close protocol and quiescence close | Publish: any; capture and close: owner | The host, and a window's until it is forgotten | Cleared by each capture; closed and never reopened |
-| Release failure | The window | A failing release part sets it; the observation release reads it | Owner | The window | Read at release |
-| Attachment model and its owner authority | The protected host lifetime | The owner thread writes; any thread may read the phases, facts, and evidence | Owner; STM | The host | Ends with the host, every attachment retired first |
-| Attachment admission | The protected host lifetime | Quiescence closes it, and the host's own exit closes it again | Any; STM | The host | Closed on every exit, idempotently; never reopened |
-| Completion publication | The protected host lifetime | Every offer reads it; the drain closes it | Any; STM | The host | Closed in the transaction that first finds nothing pending; never reopened |
-| Completion inbox | The protected host lifetime | Any thread offers a notice; the owner takes and folds them | Any; STM | The host | Emptied by each take; bounded by the window limit times the retirement facts |
-| Registered retirement protocols | The protected host lifetime | The owner registers, withdraws, revives, and prunes them | Owner; STM | Until the attachment retires | At most one per window the host may hold; removed as attachments retire |
-| The stall diagnostic | The protected host lifetime | The owner claims it | Owner | The host | Claimed once, whatever it records; never retried |
-| Attachment observation cells | The protected host lifetime, and each `GraphicsService` that retains one | The owner thread writes; any holder of the service reads | Write: owner; read: any | The service value that retains it | At most one per window the host holds; dropped in the transaction reserving a later incarnation, and finalized with its window's disposal by the close protocol or by the host's last release step after the collection's exit; never reopened |
-| Retirement rotation cursor | The window host | Each turn's round records the attachment it served last | Owner | The host | Never reset; an identity the pending list no longer holds leaves the order as it is |
-| Published retirement demand | The window host | Each turn's round writes it; the loops and any thread read it | Write: owner; read: any | The host | Replaced by each round; an ordinary host leaves it empty |
-| Host session and window collection | The window host | Construction creates them; creation acquires members; the close protocol retires them; the owner loop pumps and reconciles | Owner | The host's scope | Remaining windows released newest first by the collection's exit, then an owned session ended, when the scope unwinds |
-| Window registry | The window host | Registration inserts; the close protocol marks closing; a retirement that succeeded or failed removes; ports, clients, and dispatch read | Write: owner; read: any | Registration until retirement | Emptied as windows retire; the collection's exit releases what remains |
-| Per-window command hosts | The window host, for each window | The window's port admits; the loop executes; the close protocol and quiescence close | Admit: any; execute and close: owner | Registration until the window is forgotten | Closed at the close protocol or quiescence; never reopened |
-| Borrow counts | The window host | `withHostWindow` and the loop's borrows raise and lower them; retirement reads them | Owner | The host | Each borrow drops its count on every exit |
-| Dispatch cursor | The window host | Each dispatch attempt writes the port it served | Owner | The host | Never reset; may name a retired window's port |
-| Surfaced close requests | The window host | The owner loop records the latest request surfaced per window | Owner | The host | Replaced by a newer request; removed when the window is forgotten |
-| Host activity | The window host | The owner loop writes it around each event step; clients read it | Write: owner; read: any | While referenced | Left at the last turn |
-| Per-window input feeds | The window host, for each window | The owner produces, warns, resumes, and closes; the consumer reads and acknowledges; the application enables and suspends | Owner operations: owner; capabilities: any | Registration until the window is forgotten | Closed at the close protocol, quiescence, or host release; frozen, never reopened |
-| Input channel generation | The input feed | Production sends; reads receive; a reset or closure aborts and drops it; resumption installs the next | Produce and resume: owner; read: any | One generation | Aborted and dropped by a reset or closure |
-| Input phase, epoch, gates, held baseline, episode, and counters | The input feed | Production, admission changes, acknowledgement, warning, resumption, and closure write; statistics read | Any, through the owner operations and capabilities | The feed | Held baseline cleared by focus loss, reset, and closure; the rest frozen at closure; counters never reset |
-| Latest cursor sample | The input feed | The producer records it; button production copies it | Owner | The feed | Replaced by the next sample |
-| Window attachment records | The owning host boundary | Owner transitions write; any holder observes | Owner | The host | A record is removed when its window is forgotten, an attachment when it retires; counters never reissued |
-| Attachment completion inbox | The owning host boundary | Any thread offers; the owner takes and folds | Any; STM | While referenced | Emptied by each take |
-| Render demand: per-window scheduling state and the rotation cursor | Whichever caller threads the `RenderDemand` value | Each `renderTurn` folds the turn's captures and frame requests into it; `acknowledgeRender` clears what an offer served | Whatever thread the caller's turn runs on; no shared cell | The caller's own value | An entry is removed when a turn stops listing its window, when its phase is terminal, and by `forgetRenderWindow`; nothing here holds a window, a handle, or any state a driver could name |
-| Graphics owner lifetime port | The graphics owner's handoff | The main thread sends one attachment lifetime event; the owner receives | Any; STM | The owner worker | Closed by the exit before the join and drained by the owner's own retirement; bounded by its configured capacity |
-| Graphics target observation slots | The graphics owner's handoff | The main thread publishes; the owner reads | Any; STM | A target's attachment until the owner releases it | At most one per window the host may hold; removed when the owner releases the target, after which a publication for it answers unknown |
-| A window's scene snapshot (`PerWindowScenes`) | The graphics owner's handoff | Any application thread publishes (the host's windows read in the same transaction); the graphics owner reads and prunes | Any; STM | From the window's first publication until the host retires the window | Pruned by the owner's round once the host no longer holds the window; closed by the owner's quiescence |
-| Graphics render demand and scene snapshots | The graphics owner's handoff | The main thread publishes the demand; any application thread publishes the scene; the owner reads both | Any; STM | The owner worker | One value each, replaced by every publication; closed by the exit |
-| Graphics owner status | The graphics owner's handoff | The owner writes each round; any thread reads | Write: owner worker; read: any | The owner worker | Coalescing, replaced by every round; never evidence and never permission |
-| Graphics terminal records | The graphics owner's handoff | The owner writes one per target against what its injected retirement returned; the main thread validates and reads | Write: owner worker; read: any | Until the attachment it names has validated its facts and left the host's pending set | A record is written once and never replaced, and its facts stay owed until validated; it is forgotten only once the host's own model no longer holds that attachment, which is what keeps these bounded by the live windows rather than by incarnations |
-| Graphics owner target table and geometry | The graphics owner | The owner worker writes; any thread reads | Write: owner worker; read: any | The owner's run action | An entry leaves only against a terminal record, and the geometry — the last coherent framebuffer observation and reported bounds — leaves with its target |
-| The settlement ledger | The graphics owner composition | The main thread writes at registration and at its own settlements; the owner writes when it takes and when it settles; any thread reads | Any; STM | Until its attachment has validated its facts, or is gone without ever reaching the owner | One entry per incarnation the protocol registered, so at most one live per window the host may hold; a settled entry is forgotten once the host's model no longer has that attachment pending, and one whose attach left nothing is forgotten by the handover's own settlement — which is what bounds it for an owner that takes no rounds at all, held in its startup or its step |
-| Retained owner failures | The graphics owner composition | The owner writes; the exit and any thread read | Any; STM | The owner worker's lifetime | Oldest first and bounded, so a backend that fails every round cannot grow what it reports through; the latch beside it keeps only the first, for notification |
-| Graphics owner fatal latch | The graphics owner composition | The owner writes it once; the supervision sentinel and the exit read it | Any; STM | The owner worker | Never cleared; a cancellation is never latched in it |
-| Loader integration capability use | Its scope, lent to the one session that takes it | Entry admits and installs it; the session's release restores GLFW's default; its scope ends it | Owner; the scope's end on any thread | Its scope; one session's use in between | Ended once restored or unused; retained for good when uncertain, with the guard poisoned |
-| The interop shim's installed-loader record | The Vulkan interop component | The shim writes it with each loader hint it sets; the provenance query reads it | Write: owner; read: any; C11 atomic | The process | Null whenever GLFW's default search is in force |
-| Attachment surface holds | The protected host lifetime | Surface admission raises one; a failed construction or a confirmed destruction lowers it; certification, notice folding, and rollback read it | Any; STM | Until each held attachment's surfaces are confirmed destroyed | Removed at zero; an uncertain destruction's hold is never released |
-| Instance leases and their obligations | The instance's owner | Creation reserves and settles; discharge settles; release requests close admission and read what is outstanding | Any; STM | Until the owner takes the instance back | Releasable only with nothing in flight, owed, or uncertain |
-| Surface access phase | The attach or replacement that made the access | Opened and closed around its step; creation reads it | Owner | The access value | Closed when its step ends, however it ends |
-| Surface obligation state | Whoever holds the obligation | Creation makes it owed; one discharge settles it | Any; STM | Until discharged, or for good | Discharged once; uncertain is retained for good |
-| Graphics owner port reservations | The graphics owner composition | The main thread holds one across a handover and the send that spends it | Any; STM | The owner worker | Each is released by the send that spends it, or given back by a handover that reserved nothing else |
-| Graphics owner presentation holds and presenting set | The graphics owner composition | The main thread asks for a hold before a hide's native call and lifts one whose hide made no call; the owner's step prunes holds and writes the set of targets it may present to | Any; STM | A hold, from its hide until the owner folds a newer observation; the set, one step | The step prunes a hold once it is obsolete or names an attachment the owner has no custody of, so at most one stands per attachment; the set is emptied when the step returns |
+None of this is application state. Each owner constructs, mutates and tears
+down its own state; the owning modules' Haddock has the per-cell detail.
 
-The guard holds only occupancy and poison. None of this is application state.
+| State | Owner | Writers and readers | Lifetime and disposal |
+|---|---|---|---|
+| Guard occupancy and poison | The native table, process-wide | Entry claims; the last release settles | The process. Vacant after a safe teardown, poisoned otherwise |
+| Error capture, callback storage, teardown safety, liveness | The session | Callback writes (any thread); owner operations and releases take | Until the callback is detached. Storage leaked when poisoned |
+| Wake gate, wake-path degradation, notification obligations | The session | Any thread, in `STM` | Gate closed at first release and never reopened; degradation never healed within a session |
+| Connection probe and latched failure | The session | Owner, at event processing | Latched once; never cleared |
+| Monitor capture latch, identities, inventory snapshot, claims | The session | Callback writes inside owner calls; owner folds and publishes; any thread reads the snapshot | Snapshot closed first at teardown; identities never reissued |
+| Native window, callback storage, capture latch, input staging | The window | Callbacks write inside owner calls; owner boundaries take | The window's scope. Storage kept when release is uncertain |
+| Observation, close counter, mode record, constraint states, transition marker | The window | Owner boundaries write; any thread reads the snapshot | Final value retained in the closed snapshot |
+| Command channel, pending cells, request counter | The command host | Any thread admits; the owner claims, settles and closes | Closed with its backlog settled; never reopened |
+| Completion cell | Its tickets | Settled once by the owner; any thread reads | While a ticket references it |
+| Demand slots | The window host | Any thread publishes; the owner captures and closes | Cleared by each capture; closed with the window or at quiescence |
+| Window collection, registry, per-window command hosts, borrow counts, cursors, surfaced close requests | The window host | Owner writes; any thread reads the registry | Remaining windows released newest first when the scope unwinds |
+| Input feed: channel generation, phase, epoch, gates, held baseline, counters | The window host, per window | Owner produces, warns, resumes, closes; consumer reads and acknowledges | Closed at the close protocol or quiescence; counters never reset |
+| Attachment model, admission, completion inbox, retirement protocols, observation cells, surface holds | The protected host lifetime | Owner thread writes; any thread reads and offers notices | Ends with the host, every attachment retired first |
+| Retirement demand and rotation cursor | The window host | Each round writes; any thread reads | Replaced each round |
+| Render demand | The caller that threads the value | That caller only | The caller's own value |
+| Graphics owner handoff: lifetime port, observation slots, demand and scene snapshots, status, terminal records | The graphics owner's handoff | Main and application threads publish; the owner reads and writes records | Closed by quiescence or a run-ending failure; bounded by live windows |
+| Settlement ledger, retained failures, fatal latch, presentation holds | The graphics owner composition | Main thread and owner, in `STM` | The owner worker. The latch is never cleared |
+| Loader capability use, instance leases, surface obligations | Their scopes and holders | Owner admits and installs; any holder discharges | Uncertain outcomes are retained for good |
 
 ## Linking
 
-`hetoimasia-glfw:native` declares `pkgconfig-depends: glfw3 >=3.4 && <3.5`, the
-range form of `3.4.*` that Cabal's pkg-config grammar accepts. Cabal therefore
-resolves the private prefix that
-[the native recipe](validation.md#the-native-glfw-recipe) prepares, and a missing
-prefix is a configure failure. For an ordinary executable link, Cabal passes
-only the archive flags, so the platform requirements that `glfw3.pc` keeps in
-`Libs.private` are declared per operating system:
-
-```cabal
-if os(darwin)
-    frameworks: Cocoa IOKit CoreFoundation
-if os(linux)
-    extra-libraries: rt m dl
-```
-
-The `GLFW link declarations` examples in `glfw-tests` compare these, for the
-platform they run on, with the `libs_static` the native manifest recorded. Any
-drift fails the suite. No GLFW library-path override is needed on either
-platform. The [validation planner](validation.md#how-a-groups-inputs-are-derived)
-accepts these link-only conditionals and follows the `package:library`
-dependencies on the private sublibraries.
+`hetoimasia-glfw:native` declares `pkgconfig-depends: glfw3 >=3.4 && <3.5`, so
+Cabal resolves the private prefix
+[the native recipe](validation.md#the-native-recipe) prepares, and a
+missing prefix is a configure failure. The platform libraries `glfw3.pc` keeps
+in `Libs.private` are declared per operating system (`Cocoa IOKit
+CoreFoundation` on macOS; `rt m dl` on Linux), and `glfw-tests` compares them
+with the native manifest.
 
 ## Build and check
 
@@ -5579,8 +1791,7 @@ python3 tools/native/native.py build
 eval "$(python3 tools/native/native.py prepare)"
 ```
 
-Inside the Linux CI image, `PKG_CONFIG_PATH` already names the image's prefix.
-Then:
+Inside the Linux CI image `PKG_CONFIG_PATH` already names the prefix. Then:
 
 ```bash
 cabal build all
@@ -5588,600 +1799,50 @@ cabal test hetoimasia-glfw:glfw-tests --test-show-details=direct
 cabal test glfw-native-tests --test-show-details=direct --test-options='--dry-run'
 ```
 
-`cabal.project` sets `tests: True` for this package alone. `cabal build all`
-therefore compiles `glfw-tests` and `glfw-native-tests` from a clean
-configuration without running either, and the dry run lists the native examples
-without entering a session.
-Running the native examples themselves takes the per-run consent
-[the native suite](#the-native-suite) describes: the isolated display helper's
-own on Linux, or the desktop opt-in on a real desktop.
+`cabal.project` sets `tests: True` for this package, so `cabal build all`
+compiles both suites without running either.
 
-- **`glfw-tests`** is the package's headless suite, rooted at one `GLFW` group,
-  and initializes nothing, opens no window, and needs no display.
-  It proves the session model through the seam, checks the link declarations,
-  and compiles external clients against the package, including clients refused
-  for naming a command host's, port's, or ticket's constructor or reaching for
-  command execution, for constructing a monitor identity, description, or
-  inventory or reaching for a native monitor pointer, and for naming the monitor
-  drivers through the public seam, and for constructing a control command or its
-  size constraints through their constructors or reaching for the private
-  control representation, for naming a mode's, saved placement's, or mode
-  record's constructor or reaching for the private mode module, and a supported
-  client that submits and awaits a
-  command, performs every control command constructor, reads the capability
-  descriptions, requests modes and a startup mode, reads a mode record, and
-  resolves monitors.
-  The window model, command, control, host, dynamic window, monitor, input, and
-  mode examples below are registered in the same tree, under the group names
-  they always carried, so `--match "GLFW window modes"` or
-  `--match "across the package boundary"` selects them, and a selector that
-  matches nothing fails the suite. The supervised graphics owner's own group is
-  `GLFW graphics owner`, and it needs no display, no GPU and no surface: its
-  backend operations are injected fakes with no GLFW capability at all. Because the suite belongs to
-  `hetoimasia-glfw`, its own modules may import the private sublibraries; that
-  access is not boundary evidence, which comes only from the external clients.
-  The linking example reads `hetoimasia-glfw.cabal` from the package directory
-  Cabal runs the suite in, and the manifest through `pkg-config`. It runs in the
-  `test.glfw` validation group on the CPU worker.
-
-  A new example that needs no native session — a model, seam, host, or boundary
-  contract — belongs in `glfw-tests`, beside the component spec that owns it. A
-  helper thread an example needs is started through `Test.Support.Owned` (#593),
-  and in `glfw-native-tests` through `Test.GLFW.Native.Threads` (#594, below), and in `glfw-tests` through the helpers `Test.GLFW.Support` offers over it:
-  `onThread` and `onBoundThread` run an action on an owned thread and wait for its
-  outcome; `withMainThread` runs one on an owned bound thread designated as the
-  process main thread; `withDeferredThread` starts a thread that waits to be handed
-  the host, window or owner it acts on, so that an evidence supplier or an injector
-  started from a callback outlives the callback and is stopped and joined when the
-  example ends. An example that holds a thread at a gate only it can open registers
-  the gate's opening with the thread, so the join never waits for a gate the
-  failed example left closed. A rig fixture that scripts a failing or gated
-  backend arms it inside the body's first masked step, after the release that
-  undoes it is registered (`Rig.armedBody`, `armedFinally`), and the protected
-  fixtures' rescue is sticky once a cleanup has begun; both are exercised at each
-  cut by `Test.GLFW.Support.cutExamples`. The nine #593 left out are converted
-  or rescued by #612 (see `docs/test_suites.md`), and no baseline entry is left in `glfw-tests`.
-  The graphics owner's start offers the examples two more private hooks. `HostHooks.ownerBoundary`
-  runs on the starting thread and is called with `OwnerBeforePublication` at the start of the
-  preparation step (the worker is registered and forked, its handle not yet published), with
-  `OwnerPublished` at its end (the handle is published and the gate is still closed), with
-  `OwnerAwaitingStartup` once the gate is open and before the wait for the worker's startup, and
-  with `OwnerStarted` once the start has published the handle and is about to return it.
-  `HostHooks.ownerWorkerBoundary` runs on the worker's thread, unmasked, with `OwnerWorkerStarting`
-  in its startup before it acknowledges and `OwnerWorkerEntering` in the run closure after it
-  acknowledged and before the run action's first masked step; a hook that parks there holds the
-  worker where the starter's cancellation will find it. Production passes `noHostHooks`, whose
-  hooks do nothing. `Test.GLFW.Owner.Fixture.Cut` ends a rig run at each boundary of the start
-  through them, through the rig's startup callback (`ownedHostObserved`) and through the body's
-  entry, and cuts at `AwaitingStartup` and `AwaitingEntry` only after the worker is observed held.
-  The four boundaries before the run action begins are judged by what #613 settles: the exit
-  finishes without waiting for destruction evidence, the backend was asked for nothing, and the
-  failure carries the abandoned-start evidence of the worker that was drained. An
-  example that must initialize GLFW, open a real window, or observe the platform
-  belongs in `glfw-native-tests` and its shared fixture.
-- **The session wake examples** (`--match "GLFW session wake"`) use only the
-  public seam. The seam records each post as `PostEmptyEvent` and makes the
-  call's wake mark current on the posting thread while its scripted step runs.
-  A scripted platform counts posts as pending for the next finite wait. Without
-  sleeps, the examples prove: a wake before, during, and after the owner's wait,
-  from unbound, bound, and owner threads; a scripted platform failure answered as
-  that call's `WakeFailed`, posted once and not retried; `GLFW_NOT_INITIALIZED`,
-  alone or beside a platform error, raised as a `NativeFailure` from `wake session`
-  with the gate still admitting afterwards; two overlapping wakes each
-  attributed their own platform-error report, beside a concurrent owner operation's report and
-  an unrelated asynchronous one; one wake's reports bounded, truncated, and
-  counted as the capture bounds them, and a callback fault inside the wake
-  attributed to it, both raised as unclassifiable, with nothing left for a later
-  owner read, asynchronous read, or teardown; a report whose mark could not be
-  read raising from the error it left; an admitted wake finishing before scripted termination, which
-  observes none in flight, while wakes during the drain answer `WakeTerminal`; a
-  worker waking until terminal while the session closes, with every post
-  recorded before teardown and wakes issued from termination and the error
-  callback's detach answering `WakeTerminal`; a capability reused after close
-  and against a later session; a construction rollback that never lends one; a
-  waker cancelled inside its native call, and a wake completing with a
-  cancellation pending, both leaving the gate; and an owner cancelled while its
-  close drains an admitted wake, terminating only after the wake returns and
-  leaving the guard vacant.
-- **The window model examples** in the same suite use the seam's private
-  drivers: `seamDrive` delivers scripted callbacks from inside a setter- or poll-origin
-  owner step, `seamDriveCancelledBeforeCommit` delivers a cancellation at the
-  reconciliation's preparation point, and `seamRejectCloseRequest` is the
-  private close-request transition. None is a public command. They live in the
-  private `seam-core` sublibrary, which the public seam does not re-export, so
-  no package outside `hetoimasia-glfw` can name them; the `GLFW` opacity
-  examples compile clients proving it. Each driver also refuses, with
-  `ForeignSeamWindow`, a window its own seam did not create.
-- **The window command examples** in the same suite drive the private
-  command executor — `seamExecuteNext`, `seamExecuteNextInterrupted`, and
-  `seamExecuteNextScripted` — and the admission hooks of `submitWith`, both
-  also private to `seam-core`. Without sleeps, they prove immediate
-  `SubmitFull` and `SubmitClosed`; cancellable capacity waits; FIFO claim in
-  committed admission order; one disposition for repeated, cancelled, and
-  owner-thread reads, after removal from the bookkeeping; closure settling queued
-  commands and leaving a claimed one to its execution; interruptions after the
-  claim, after effects, in preparation, and by cancellation, none replayed;
-  bookkeeping bounded by capacity plus active work across repeated cycles;
-  admission rollback and cancellation on both sides of the commit; origin
-  metadata intact across the queue; a native failure as prepared data beside a
-  Haskell exception with its context; owner-thread waits refused rather than
-  blocking; and the observation request settling with a revision published
-  first, while unserved and ended windows are rejected.
-- **The window control examples** in the same suite submit the public
-  control commands to the private command executor and to the window host's
-  owner loop over seam sessions, whose native table records every control call
-  with its window key and arguments and runs a scripted `scriptWindowControl`
-  step. Without sleeps, they prove every invalid argument class — zero, negative,
-  and overflowing sizes, unrepresentable positions, a NUL title, non-positive,
-  overflowing, inverted, and degenerate constraints, constraints excluding the
-  current size, and sizes outside known constraints or their exact aspect ratio
-  — rejected with no native call and no revision; controls for unknown, closing,
-  and closed windows rejected without native effect; every control, attention
-  included, dispatched through the owner loop to its addressed window, each call
-  followed by a sample and a strictly later revision, while a second window
-  stays untouched, and a closed window's later control not served; controls
-  refused during a mode transition set by `seamSetModeTransition`; the modeled
-  Wayland capabilities settling position and focus as unsupported with a reason
-  and keeping placement and iconified state `Unavailable` even after callbacks;
-  a native error attributed to its own command and submission context while
-  another thread's report stays asynchronous; partial and first-call constraint
-  update failures naming their calls, refusing sizes while indeterminate, and a
-  complete update restoring known state; and post-call revisions ordered while
-  the latest snapshot moves beyond them.
-- **The window mode examples** in the same suite submit mode requests to the
-  private command executor and to the window host's owner loop over seam
-  sessions whose native table tracks each window's decoration, monitor, size, and
-  position, and takes windows off a disconnected monitor as GLFW does. Two
-  monitors are scripted, one at a negative desktop origin with a work area offset
-  from both origins. Without sleeps, they prove repeated requests inert with no
-  native call, never restoring stale placement over a moved window; the saved
-  placement kept across windowed, fullscreen, borderless, and windowed; seeding
-  before a startup transition straight into fullscreen; a long chain ending at
-  the original placement; a user's move and resize surviving a transition and
-  return; inertness only on complete equality with a cleanly applied target;
-  unrepresentable preferences, budgets, and placements and unreported video modes
-  refused before any setter, with negative coordinates accepted; a disconnected
-  selected monitor refused, or falling back to the windowed placement; a
-  disconnect after fullscreen was applied falling back through the owner loop
-  with no further command to a derived reachable placement while the off-screen
-  saved placement is kept; exhaustion with no monitor left; borderless placement
-  settling as unsupported on the modeled Wayland backend; a partial departure
-  naming its steps and retaining the pre-departure geometry — restored through
-  the configured fallback, a later explicit return, constraints admitting it
-  while excluding the stale size, and an interruption after a native step; a
-  failed constraint restoration stopping recovery; a required startup mode
-  failing and rolling the
-  window back while an optional one records its fallback; `MonitorBusy` for a
-  second window without native effect, including while the first is iconified;
-  independent claims released in both close orders; a claim invalidated by
-  disconnect; claims kept uncertain after an unobserved transition and a failed
-  disposal until reconciliation proves release; monitor switching reserving the
-  destination first and releasing the source only after departure; the operation
-  matrix after entering each mode with no setter for a refused control; controls
-  refused while the presentation is indeterminate until reconciliation; commands
-  refused inside a transition's interval, entered from a scripted native step,
-  while another window is served; windowed constraints suspended and restored
-  with a placement they exclude refused; and the named revision carrying the
-  applied mode and geometry.
-- **The window attachment model examples** in the same suite
-  (`--match "attachment"`) drive the private attachment model's pure
-  transitions over seam window identities; see
-  [the attachment model examples](#attachment-model-examples).
-- **The monitor inventory examples** in the same suite use the seam's
-  private monitor drivers — `seamSetMonitorTopology`, `seamDeliverMonitorEvents`,
-  and `seamQueueMonitorEvents` — over scripted monitors whose native pointers
-  stand for scripted addresses, and the seam raises if the model queries an
-  address its topology no longer lists. Without sleeps, they prove an empty
-  inventory published as an observation; several monitors at negative and
-  nonzero origins with the primary only an attribute; inconsistent numbers and
-  enumerations becoming `Unavailable`; `GLFW_FEATURE_UNAVAILABLE` and other
-  query reports; a disconnect ending an identity while its copied description
-  stays readable; a reconnect at a reused address receiving a fresh identity
-  within one boundary and across two, and reordering keeping identities; a stale
-  identity answered disconnected before any native operation targets it; an
-  identity from a completed session never resolving in a later one; a callback
-  fault rethrown with its context and lost changes ending every identity; a fault
-  latched after the last boundary raised from teardown; owner-thread refusals;
-  and the inventory closing, waking its waiters, before the callback is detached
-  ahead of termination and freed last.
-- **`glfw-native-tests`** needs a windowing session: Cocoa locally, or an
-  isolated X11 display, and per-run consent to enter it. It is not part of
-  `glfw-tests` or the console smoke; it is the `test.glfw-native`
-  validation group, which only the display worker runs. See
-  [The native suite](#the-native-suite).
+- **`glfw-tests`** is the headless suite, rooted at one `GLFW` group, in the
+  `test.glfw` validation group. It initializes nothing and needs no display.
+  A new example that needs no native session belongs here, beside the
+  component spec that owns it. Boundary evidence comes only from the external
+  clients it compiles against the package (`--match "across the package
+  boundary"`), never from the suite's own access to private sublibraries. A
+  selector that matches nothing fails the suite.
+- Helper threads in examples are started through `Test.Support.Owned`
+  (`Test.GLFW.Support` in `glfw-tests`, `Test.GLFW.Native.Threads` in the
+  native suite), so each is stopped and joined when its example ends.
+- Examples assert an order of recorded facts or an observed state, never a
+  time, and coordinate threads explicitly.
 
 ## The native suite
 
-The Vulkan window integration has a native suite of its own, built on these
-rules and adding the graphics owner's: see
-[the Vulkan native suite](gpu_backend.md#the-native-suite).
-
-GLFW requires the process main thread, and Hspec runs examples on threads of its
-own, so `glfw-native-tests` makes its process main thread the owner of one
-shared production session and runs Hspec on a worker thread. An example reaches
-the session through the test-only dispatcher in `Test.GLFW.Native.Fixture`: it
-submits an operation, the main thread runs that operation against the session,
-and the result or the original failure comes back to the example. This is a
-test adapter over the production session, not a second supervisor or a general
-test environment.
+GLFW requires the process main thread and Hspec runs examples on its own
+threads, so `glfw-native-tests` makes its main thread the owner of one shared
+production session and runs Hspec on a worker. Examples reach the session
+through the test-only dispatcher in `Test.GLFW.Native.Fixture`. The Vulkan
+window integration's native suite builds on the same rules
+([gpu_backend.md](gpu_backend.md#the-native-suite)).
 
 | Rule | How it holds |
 | --- | --- |
-| Selection | The Hspec tree is built, listed, and filtered before any example runs. A `--dry-run`, a listing, or a selection that never reaches a native operation acquires nothing, and a selection matching no example fails. |
-| Acquisition | Lazily, by the first dispatched operation, and at most once. The run's last line reports how many times the shared session was acquired, and the run fails if that is more than once. |
-| Windows | Every window example creates and releases its own private window inside one operation. No window is shared: no example yet demonstrates the reset and isolation a shared window would need. |
-| Private sessions | Sessions entered and left in sequence, a forced initialization failure and its rollback, a session over a faulting native table, and wakes racing termination cannot coexist with the shared session, so each scenario runs in a child process of the same executable, started with `--private-session <scenario>`. No example ends the shared session. The parent starts no child without consent, the child inherits the parent's consent and is not asked again, and a child started directly from a shell without consent refuses on stderr with exit status 3 before it looks up its scenario; an unknown scenario under consent still exits 2. The consent also chooses what a child's sessions request: Wayland under the isolated compositor's consent, the platform's own backend otherwise. Every child is bounded by a stated deadline of 120 seconds, in a process group of its own, and the deadline covers the end of its output as well as its exit, so a child that exits while a descendant still holds its output open is unfinished. One unfinished at the deadline is sent `SIGTERM` with its group, `SIGKILL` five seconds later, and is reaped either way; output still held open from outside the group after that is given up on, keeping what was read, and once the child is done its group is sent `SIGKILL`, so nothing it left running there keeps running. A launch owns its two output readers and the parent's two pipe handles only until it returns or propagates, by any path — a normal exit, an expiry, output given up on, a failure while acquiring, an interruption — and then owns none of them: each reader is stopped by an asynchronous exception where it blocks and awaited, never waited on for end of file, which a writer that left the group holds open and never supplies, and each handle is closed, with what was read kept and the escaped writer left running, since a process that left the group is not followed. A launch is one composite scope (`withComposite`, [docs/resources.md](resources.md)): the child's process group and identifier, its reaper, the two readers and the two pipe handles are each acquired with their release installed in the same protected step, so there is no interruptible gap (the two pipe handles are registered immediately after the child, before any step that can be interrupted), and the releases run under `uninterruptibleMask_` in a declared order (the group is killed and the child reaped, then the readers stopped, then the handles closed). The identifier is read before anything waits on the child, because the waiter that reaps it closes the handle the identifier is read from. The failure that ended the launch propagates with its type, value and attached context, with every cleanup failure retained beside it as evidence; a launch that completed but could not reclaim raises its first cleanup failure. Only the child is reaped: a descendant it orphaned is reaped by whatever adopts orphans, so it can still be a zombie when the launcher returns. An expired child fails its example whatever it printed, because expiry is decided before a line of its output is read. |
-| Thread identity | Checked with the native main-thread shim, `isCurrentThreadBound`, and the owner's `ThreadId` at setup, inside every dispatched operation, before release, and after release. A failed check fails its operation or release, and the run. |
-| Settlement | A waiting example also watches the owner, so an owner that fails wakes it with the owner's own failure. A cancelled example's queued operation is settled without running; one already running finishes and its reply is dropped. An acquisition failure answers every operation and is never retried. A failure crossing between the owner and an example is rethrown with the context it was raised with, so its failure evidence and retained cleanup failures survive. The session is released only once the Hspec run has finished, and a release failure beside a primary failure is kept as cleanup evidence. Once an owner failure or cancellation begins settlement, the owner's wait for the run stays interruptible but absorbs further owner cancellation — with or without a release failure — and the report keeps the failure that began the settlement as primary, including against a cancellation deferred through the uninterruptible release. |
-| Consent | No native operation runs and no child starts without the run's consent, read once from `HETOIMASIA_NATIVE_SESSION` at startup. `desktop` is the opt-in for this one run on the local desktop, given under the owner's standing approval for runs an issue or pull request needs; `isolated-x11:<display>` is what `tools/display/x11.sh` gives the command it runs, accepted only on Linux and only when it names the current `DISPLAY`; `isolated-wayland:<socket>` is what `tools/display/wayland.sh` gives its command, accepted only on Linux, only when `WAYLAND_DISPLAY` names exactly that socket, and only when `DISPLAY` is unset — a set `DISPLAY`, empty or not, could serve an X11 or XWayland session in the compositor's place, so it is refused. Each refusal names what disagreed: the socket against `WAYLAND_DISPLAY`, the `DISPLAY` that should not be there, or the platform. Anything else — the variable unset, empty, or another value, a bare `DISPLAY` or `WAYLAND_DISPLAY`, `CI` — refuses each example that uses the session or starts a child before its body runs, with `NativeSessionRefused`, so no body forks, waits, or dispatches without consent; any operation that still reaches the dispatcher is refused on the example's own thread before it is dispatched, and the owner's acquisition asks again before initializing GLFW. The session is never acquired and the report shows zero acquisitions. The run then ends with one line on stderr naming what was missing and the isolated alternative, and a non-zero exit, so its summary is never a pass. Building, listing, and filtering the tree, a dry run, and the examples that use only a scripted owner or a recorded launcher need no consent. |
-| Platform | The rule is the fixture's, not the session's, and it follows the run's consent. Under `desktop` or `isolated-x11` on Linux the session is entered only when `DISPLAY` names a display and `WAYLAND_DISPLAY` is absent, and it must select X11; on macOS it must select Cocoa. Under `isolated-wayland:<socket>` the session is entered only when `WAYLAND_DISPLAY` names exactly that socket and `DISPLAY` is unset, it requests Wayland by name — nothing selects Wayland otherwise — and it must select Wayland. Anything else fails every native example with `DisplayUnavailable`: no other platform is selected instead, and no request falls back to the other backend. |
+| Selection | The tree is built, listed and filtered before any example runs. A dry run or a selection that reaches no native operation acquires nothing; a selection matching nothing fails. |
+| Acquisition | Lazily, by the first dispatched operation, at most once. The run's last line reports the count and the run fails if it exceeds one. |
+| Windows | Every window example creates and releases its own window inside one operation. No window is shared. |
+| Private sessions | Scenarios that cannot coexist with the shared session run in a child process of the same executable (`--private-session <scenario>`). A child inherits the parent's consent; one started directly without consent refuses with exit status 3. |
+| Thread identity | Checked at setup, inside every dispatched operation, and before and after release. |
+| Settlement | A waiting example also watches the owner. A cancelled example's queued operation is settled without running. An acquisition failure answers every operation and is never retried. The session is released only after the Hspec run finishes. |
+| Consent | No native operation runs and no child starts without the run's consent, read once from `HETOIMASIA_NATIVE_SESSION`. |
+| Platform | Under `desktop` or `isolated-x11` on Linux the session must select X11 with `WAYLAND_DISPLAY` absent; on macOS it must select Cocoa. Under `isolated-wayland:<socket>` it requests and must select Wayland with `DISPLAY` unset. Anything else fails every native example with `DisplayUnavailable`. |
 
-The fixture's settlement rules are proven against a scripted owner that records
-its acquisition and release — lazy single acquisition, nothing acquired by a dry
-run or an empty selection, a deliberately failing nested example, a cancelled
-borrower with one operation in flight and one queued, an owner that fails while
-a borrower waits, an owner cancelled again while it settles the first
-cancellation, with the release succeeding and with it failing, an owner
-cancelled once more while its release still runs, an owner with a cancellation
-already pending at its acquisition's handoff to the borrower, cancelled again
-during the release, an owner cancelled while its acquisition is blocked, and
-an acquisition failure —
-and the failing and cancelled cases again against the real shared session.
-Every deliberate failure is inside a nested run or a forked borrower and is
-asserted as expected, so the suite itself passes.
-
-The consent gate is proven the same way, under `the native opt-in`, without a
-session, a display, or a child: how consent is read from an environment on
-each platform, including that a bare `DISPLAY`, `CI`, an empty value, an
-unrecognized value, an isolated authorization for another display, and an
-isolated authorization on macOS are each refused; that a valid isolated Wayland
-authorization is accepted while an empty or mismatched socket name, an absent
-`WAYLAND_DISPLAY`, any set `DISPLAY` including an empty one, a bare
-`WAYLAND_DISPLAY`, and the same authorization on macOS are each refused with a
-reason naming what disagreed; that an unapproved run's
-operations are refused before they are dispatched, so a scripted owner records
-no acquisition, while a dry run and an empty selection still acquire nothing
-and refuse nothing; that a consented example is refused before its body, so a
-body that forks an operation and waits on it never starts, while a consented
-run's body runs; that an approved run, under either consent, is served
-with one acquisition, the isolated Wayland consent included; that a refusal
-reaching the real shared owner fails its
-acquisition before the setup check, so before any native step; that the
-private-session parent starts no child without consent and starts one with
-it, through a recorded launcher; and that a directly invoked child refuses
-before its scenario is looked up, keeping the unknown-scenario exit for an
-approved one. Each refusal message names the variable, the desktop opt-in, the
-owner's standing approval, and the isolated alternative.
-
-Every thread the native suite starts is owned (#594): started through
-`Test.Support.Owned` in the one masked step that registers its stop-and-join,
-and stopped and joined on every way out of the scope that needed it, a
-cancellation delivered while it starts included. The helpers no longer take a
-fork primitive; a thread's boundness is a value (`Test.GLFW.Native.Threads`,
-`Unbound` or `Bound`, the latter on the facility's owned bound start of #593),
-so the four starts that were `forkOS` (the bound wakers of the private-session
-rounds and of the wake examples, and the session examples' bound worker) are
-still OS-bound and no example's thread identity changed. `onThread` is an owned
-start; `wokenWait` and `wokenWaitBy` own the worker that wakes the owner's wait,
-whose "owner is done" flag the scope also raises, so a cancellation before the
-owner's own `finally` cannot leave it spinning; the harness's `withForked` owns
-the threads its examples start, and `withForkedOpening` opens a gate only the
-scope can open before it joins; the launch-interruption example's launcher is
-owned, and with it the child, its readers and its handles. A worker that acts
-during a release, after the borrower returned, has a scope that encloses the
-whole run. `runOwned`'s borrower is owned too: its settlement is unchanged (it
-lets the borrower finish, absorbs a further cancellation in that wait, and holds
-the resource until the borrower has) and the scope closes the one interval it
-did not cover, a cancellation after the borrower started and before the
-settlement was installed. The private-session rounds' wakers outlive the session
-until their capability answers `WakeTerminal`, so their scopes enclose the
-session's, and the capability reaches them through a cell. The ownership
-regressions are `owns the threads its helpers start (#594)` under `the native
-opt-in`, so they run with no consent, session or display
-(`--match "owns the threads its helpers start"`): each ends the scope while the
-thread is parked, by a failing body and by a cancellation, and judges that it has
-ended and been joined, and each has a negative control through the deliberately
-unowned start of `Test.GLFW.Native.Unowned`, which must fail. A control's own
-registered stop-and-join is uninterruptible, and `the controls' own cleanup` holds
-that with a cancellation delivered while the kill blocks, and its own negative
-control (an interruptible cleanup is abandoned and leaves the worker). The helpers that
-need a session (`Private.hs`, the Wayland scenarios, the wake examples) are
-covered by their own examples in the display groups.
-
-The native examples cover:
-
-- the platform's backend selected explicitly, on an isolated X11 display under
-  Linux; pending instead on a run the isolated compositor authorized, which
-  selects the other backend;
-- under `on an isolated Wayland session`, the whole tree the group
-  `test.glfw-wayland` selects (`Test.GLFW.Native.Wayland`): every required case
-  of the Wayland qualification design's D-12 matrix. Each is listed on every
-  platform, so a dry run names them and a macOS run lists them without
-  acquiring anything, but each runs only under the isolated Wayland consent: an
-  X11 or Cocoa run reaches the hook and reports it pending rather than
-  asserting Wayland against the session it actually has. Under that consent
-  nothing is skipped, and a case that cannot run fails. The cases:
-  - **backend selection:** the shared session requesting Wayland selects it, on
-    the compositor's own socket with `DISPLAY` unset; in a child, a session
-    requesting nothing still resolves to X11 and fails `glfwInit` with GLFW's
-    `GLFW_PLATFORM_UNAVAILABLE` naming the missing `DISPLAY`, never
-    `UnsupportedBackend`; and a child run under `tools/display/x11.sh` from
-    inside the compositor's run, with its runtime directory an empty one of its
-    own, requests Wayland and fails `glfwInit` with `GLFW_PLATFORM_ERROR` for
-    the connection. Compiled-support rejection has no native form — a prefix
-    built with Wayland cannot be asked to lack it — and is proven over the seam
-    in `glfw-tests`;
-  - **independent window lifetimes:** two hidden windows created through a
-    worker's requests and closed in both orders through the real owner loop,
-    each closure releasing only its own window while the other still observes
-    and executes through its own port;
-  - **supported controls and observations:** a title and a size settled and
-    observed as `glfwGetWindowTitle` and `glfwGetWindowSize` report them;
-    showing and hiding reflected in visibility; size limits delivered and an
-    out-of-constraint size refused engine-side, with nothing read back; and
-    framebuffer extent and content scale sampled, the framebuffer following
-    the resize the example induced at the sampled scale, printed as evidence;
-  - **explicit unsupported outcomes:** in a child over a production table that
-    records every call of `glfwSetWindowPos`, `glfwGetWindowPos`,
-    `glfwFocusWindow`, `glfwSetWindowMonitor`, and
-    `glfwGetWindowAttrib(GLFW_ICONIFIED)`, placement, focus, and
-    borderless-over-monitor requests settle unsupported with reasons, placement
-    and iconified observations are `Unavailable`, and none of those calls is
-    made;
-  - **settling before a wait:** in the shared session, a hidden window shown,
-    observed shown, and released with its companion, the connection settled,
-    and one production wait that nothing wakes, bounded at 0.5 s, reaching its
-    bound unwoken with no progress note and the production wake counts
-    unchanged across the settling and the wait. Then the same, in the
-    `wayland-settle` child, against a compositor of the child's own that it
-    pauses with `SIGSTOP` before the settle and resumes with `SIGCONT` only
-    once a worker observes the owner blocked — inside the settle's
-    synchronization boundary or inside the production wait — so the
-    compositor's answer cannot arrive before the settle has polled. The
-    wake examples' settle reaches the wait's bound there; its coordinated
-    control, a settle that only processes pending events, never blocks, is
-    resumed inside the wait, and must see that wait end early and unwoken.
-    On Wayland the settle that begins every wake example crosses a
-    synchronization boundary with the compositor after processing pending
-    events. Releasing a window that was shown leaves requests GLFW has not
-    sent, and the compositor answers them by posting the release of the
-    buffer the window's fallback decorations held, which carries the
-    `delete_id` it queued for every destroyed object; arriving after a
-    pending-events poll, that answer ends the next wait. Releasing a window
-    that was never shown posts nothing. The boundary and its blocked
-    observation are test-only native helpers compiled into
-    `glfw-native-tests` alone (`native-tests/cbits/hetoimasia_glfw_test.c`),
-    since the production shim's only Wayland access is the read-only status
-    probe of the Wayland qualification design's D-13. Each check reports the
-    wait's sequence number, its time against the bound, where the compositor
-    was resumed, and the wake counts;
-  - **wake:** the session wake examples above, run again on Wayland, each
-    beginning from that settled connection;
-  - **shutdown:** the `session-lifecycle` child entering, leaving, and
-    re-entering Wayland sessions, after which the parent's shared session
-    still serves with one acquisition;
-  - **failure cleanup:** in a child, a Cocoa request forced past the model's
-    refusal, labelled injected, failing `glfwInit` with no cleanup failure,
-    freeing every error callback storage, and followed by a Wayland session;
-    and an injected failure sampling a real new window, beside an injected
-    failure releasing its already-freed callback storage, kept primary and
-    retained respectively, with every input callback cleared before the one
-    real window is destroyed and a later window created;
-  - **connection loss:** four children, each ending a compositor of its own —
-    packaged Weston, headless, in a private runtime directory — and never the
-    one the consent names. With injected close requests rejected and one left
-    pending, the compositor is ended and the next processing confirms
-    `TransportClosed` before it pumps anything; with no window, the next finite
-    wait does the same; with the owner observed blocked inside a 30-second
-    wait, the compositor is ended from another thread, the wait returns well
-    inside its bound, and the probe after it confirms the loss. Each then
-    raises the same failure again with no probe and no pump. The fourth, the
-    healthy control, keeps its compositor running: an injected close request
-    is rejected, the probe answers healthy at every boundary, and the session
-    stays live. It is not evidence of a compositor-generated close request.
-    A child that hangs fails at its deadline; a watchdog kill is never a pass;
-  - **test-check helpers:** both drivers answering unavailable on that
-    session — `requestCloseForCheck` `False`, `sizeLimitsForCheck` `Nothing` —
-    while `takeAsynchronousReports` returns no report, which is the evidence
-    that neither asked GLFW for the X11 handle it would have refused;
-- operations running on the bound process main thread that entered the session,
-  never on the Hspec worker, and a single acquisition;
-- nested entry on the owner thread, entry from a bound worker and from an
-  unbound thread, and owner-only use from the Hspec worker, each rejected while
-  the shared session keeps serving;
-- the monitor inventory the display server exposes, read from the owner and
-  from the Hspec worker, with exactly one primary monitor, and on the isolated
-  X11 display exactly one monitor at the origin in a 1280 by 1024 mode; the run
-  prints the exercised topology, which on Cocoa is its record of the local
-  displays;
-- every identity re-resolving to a live monitor on the owner thread, lending its
-  pointer to a native step there, and keeping its identity across refreshes;
-- a physical attach or detach observed as ended identities and a refreshed
-  inventory, which is pending as unexercised unless
-  `HETOIMASIA_MONITOR_HOTPLUG_SECONDS` asks a person to perform one during the
-  run: no automated run can, and Xvfb cannot simulate it;
-- a hidden non-focusing window's creation, nondegenerate initial framebuffer
-  observation, release, terminal observation, and terminal handle;
-- two live windows with a stray hint reset before the second's creation;
-- a second window after a window's release in the same session;
-- ordinary window controls on private hidden windows, performed on the owner
-  thread with `performWindowCommand` and checked against the test-only
-  owner-thread queries `windowSizeForCheck`, `windowPositionForCheck`,
-  `windowTitleForCheck`, `platformSizeLimits`, and `windowStateForCheck`, never
-  against public commands: a title, a valid size, a position, and constraints
-  applied to the addressed window while a second window stays unchanged;
-  showing and then hiding reflected in observations; after constraints are
-  installed, the platform holding exactly those limits for the addressed window
-  and not for the other, a public out-of-constraint size refused, and the
-  test-only native stimulus `setWindowSizeForCheck` resizing out of range, with
-  the observation reporting the platform's actual size — clamped into the limits
-  where the platform clamps programmatic resizes, or the unclamped request on
-  Cocoa, whose content limits bound only the user's resizing; minimize, maximize, and restore each followed by
-  an observation matching what the platform reports, each synchronized, so that
-  example samples for the very thing the window-host example below tests; focus and attention
-  requests settling by their native call outcome without asserting that either
-  was granted; and post-call revisions ordered while the latest snapshot has
-  advanced beyond them. Each example waits for native events between
-  observations, within 100 waits of at most 50 ms. On Cocoa, showing or focusing
-  a window makes it briefly visible. Interactive focus, attention, and minimize
-  behavior on a live desktop is optional evidence, not asserted;
-- window modes on private hidden windows over the display server's primary
-  monitor, performed on the owner thread with `performWindowCommand`: fullscreen
-  and back restoring the observed windowed placement; borderless over the
-  selected monitor's work area and back; fullscreen to borderless keeping the
-  saved placement; each completion's named revision read from the snapshot on
-  the owner thread before any event is processed, checked to be that revision,
-  and compared at that point with `windowFullscreenForCheck` and
-  `windowStateForCheck`'s decoration, which GLFW sets synchronously, while size
-  and position, which X11 applies asynchronously, are compared only once the
-  observation and the platform both reach the target within the event-wait
-  bound, an example failing rather than passing when they do not; and a second
-  window's
-  request for the claimed monitor refused as `MonitorBusy` with the first
-  window's fullscreen state, size, and the monitor's video mode unchanged, and an
-  ordinary resize of the fullscreen window refused before its setter. The run
-  prints the exercised monitor topology and records that no hotplug transition
-  was exercised;
-- a window host over the shared session running a whole application on the
-  process main thread: a supervised worker's observation request executed by
-  the real owner loop and settled with a published revision;
-- a restored window resuming through the production owner loop alone (#581):
-  a hidden test window shown, minimized and restored through the host's own
-  command port, after which nothing but native event processing and the owner
-  turn acts on it, with no `synchronizeWindow`, `observeWindowCommand`, control
-  or mode request. It runs until iconified `Observed False`, visible
-  `Observed True` agreeing with the platform's own answer, and `RenderEligible`
-  all hold, never stopping when iconified first reads false, within 300 turns
-  of the example's 0.1-second idle wait; the bound is the example's, not a
-  production deadline. It asserts no transient visible value, and prints how
-  many turns saw the restored window reading not visible, as evidence of
-  whether the platform showed the stale reading. It fails on the code before
-  #581 on Cocoa, and runs on the isolated X11 display;
-- the scheduled owner turn on that session, counted rather than timed: with the
-  window's input feed admitted before the loop, at least five update
-  opportunities paced by an absolute deadline 20 ms out, and no native input
-  event at all delivered to that feed over the measured interval, which begins
-  after the first turn so the window's own creation callbacks are outside it. At
-  least one of those turns entered and returned a real
-  `glfwWaitEventsTimeout`, as the shim's own wait sequence records, and the
-  turn that finally answers no demand still waits, for the configured fallback
-  bound. No command, application event, or close request reaches the loop in
-  that interval;
-- a worker's production wake, `wakeSession` on an unbound thread, ending a
-  production finite wait the owner thread entered and was blocked inside:
-  `blockedWaitForCheck` observes that wait's sequence number around the kernel
-  report, and the same wait returns woken before its 60-second bound;
-- a worker's admitted command ending such a wait through the production
-  admission path rather than a wake this example posts: the worker submits an
-  ordinary command through an ordinary port once it has observed the wait
-  blocked, the same wait returns woken before its bound, and closure then
-  settles the command it announced as `NotExecuted`, so no window is created in
-  the shared session;
-- three wakes from a bound worker returning that blocked wait once, then a
-  later wait that at most one spurious return precedes, blocking again until
-  one more wake ends it; and three wakes the owner posts while no wait is in
-  progress returning at most one wait early before the next wait blocks. Each
-  example prints an evidence line with the sequence numbers observed blocked
-  and returned woken, the spurious returns, and the time against the bound;
-- in a private process, twenty sessions closed while four workers, on bound
-  and unbound threads, wake them until each capability answers `WakeTerminal`.
-  Immediately before `glfwTerminate`, every admitted wake has returned from
-  `glfwPostEmptyEvent` (the calls entered equal those returned), and none
-  enters it afterwards. A capability retained from a closed session stays
-  terminal, entering nothing, during and after a later session. The run prints
-  the child's report of both checks;
-- a supervised worker progressing while the owner is blocked inside the
-  production `glfwWaitEventsTimeout`: the worker's progress note lands only
-  inside GLFW's own wait, as [the binding](#the-binding) describes, and wakes
-  it with `glfwPostEmptyEvent`, and the loop reads back that a note landed in
-  the wait it just returned from. On the suite's single capability, a wait that
-  kept its capability would let no note land;
-- a real close request — `performClose:` on Cocoa, a `WM_DELETE_WINDOW` client
-  message on X11, sent by a test-only shim driver, which answers whether it
-  delivered the request so that an example never waits for one nobody sent —
-  reaching application policy
-  without destroying the only window, the loop and a worker still running two
-  turns later, and the window released only after that worker drained, with the
-  run returning normally;
-- dynamic windows through the real owner loop: three hidden windows created by a
-  worker's requests and closed in the orders B-A-C and C-A-B, each window still
-  open observing and executing through its own port after every close; a window
-  closed while a worker holds its port, which then answers closed while another
-  window executes; a real close request honoured by application policy through
-  the close protocol, leaving the other window open; and every remaining window,
-  a created one included, still open through the drain and disposed after it,
-  with the run returning normally and so retaining no cleanup failure;
-- native input callbacks invoked through the registered C trampolines
-  (`hetoimasia_glfw_inject_*_for_check`), not the feed's private producer:
-  tagged key, character, button, and scroll events; cursor coalesced into the
-  observation; a button keeping captured coordinates after later motion; feed
-  and staging saturation starting the same reset, with a fresh press after
-  acknowledgement and no press for a key still held; one window's overflow
-  leaving a second window receiving input; a fault inside a real input
-  callback rethrown at the owner boundary; a close request visible while a
-  feed is full; and callbacks removed before destruction. Hidden windows do
-  not receive display-server events, so every scenario uses that fixture
-  owner-thread path, which the suite records;
-- in a private process, sessions entered and left in sequence, a real
-  `GLFW_PLATFORM_UNAVAILABLE` initialization failure before any polling followed
-  by a successful session, and a fault raised inside a real GLFW size callback,
-  driven by `glfwSetWindowSize` and `glfwPollEvents`, rethrown at the owner
-  boundary with its context. Cocoa calls that callback inside the resize, while
-  X11 delivers it after a round trip to the server, so later boundaries wait
-  for events with `glfwWaitEventsTimeout` — returning as soon as one arrives,
-  within a bound of 100 boundaries of at most 50 ms — until the fault is
-  rethrown;
-- a shell that exits at once while a `sleep` it started keeps its output
-  open, with no session and so no consent: the launcher still returns at its
-  one-second deadline, reports the child expired, and the `sleep` is no longer
-  running. The launcher kills it but does not reap it, and a zombie still
-  accepts signal 0, so the example reads its state with `ps -o stat= -p`:
-  unlisted or a zombie (`Z`) is gone, and any other state fails. A state is
-  read only as the platform's own `ps` documents it, one run-state letter and
-  that platform's modifiers, so a malformed state, like a `ps` that cannot be
-  started, misses a ten-second deadline, or answers anything else, fails the
-  example rather than counting as gone. That check is proven against
-  this process (running), a child held unreaped after its exit (a zombie), and
-  the same child once reaped (unlisted), and its reading of `ps`'s answers
-  against each outcome it accepts or refuses;
-- the launcher's ownership, with no session and no consent: a child that exits
-  with its output complete, a direct child that exits while a descendant in a
-  session of its own holds both output pipes open (it records its identifier,
-  says one line on each stream and blocks until killed), and an interruption
-  reaching a launch, two hundred short-lived children each returned with its
-  status (the identifier is read before anything waits on the child), a
-  failure carrying an annotation that propagates with it and still reclaims, and
-  setup failing after the child starts, after its reaper does and after its
-  readers do, each leaving both pipe handles closed.
-  The launcher's observer is shown the parent's pipe handles
-  and each reader's completion the moment they are acquired, and each example
-  reads them after the launch is over, so a closed handle and a finished reader
-  are the launcher's own, not a writer's end of file, a garbage collection or a
-  thread count. The escaped writer example waits, in the observer and before
-  the deadline starts, for the whole output of both streams to be captured, so
-  the output is the same on every run; it uses a 50-millisecond deadline and
-  grace; it checks the partial output of both streams is kept, the launch is
-  expired, both handles are closed and both readers finished, and the writer
-  still running, and only then kills the writer, which is killed on every way
-  the example can end, by the identifier it recorded. The interruption example
-  checks the interruption itself propagates and the child is gone. Each wait is
-  bounded, so a launcher that waited for end of file fails instead of hanging;
-- a deliberately non-exiting child, started with its own five-second deadline,
-  that prints its scenario's success line and then never exits: the launcher
-  reports it expired, it was terminated and reaped — no process answers to its
-  identifier afterwards — and the verdict every private example goes through
-  fails it despite the success line it printed;
-- in a private process, the real monitor callback detached while it is still the
-  callback GLFW holds, with none held afterwards, before `glfwTerminate`, and its
-  storage freed after the error callback's detach, with the closed inventory
-  readable after the session; and every identity from a completed real session
-  answered `MonitorDisconnected` in the next;
-- the owner-loop interaction probe, which is pending as unexercised unless
-  `HETOIMASIA_INTERACTION_PROBE_SECONDS` asks a person to perform the
-  interactions during the run: see [the interaction probe](#the-interaction-probe).
+**Consent values.** `desktop` is the opt-in for one run on the local desktop.
+`isolated-x11:<display>` is what `tools/display/x11.sh` gives the command it
+runs, accepted only on Linux and only when it names the current `DISPLAY`.
+`isolated-wayland:<socket>` is what `tools/display/wayland.sh` gives its
+command, accepted only on Linux when `WAYLAND_DISPLAY` names that socket.
 
 Without consent, these list the examples and run the ones that never enter a
-session, acquiring nothing and starting no child:
+session:
 
 ```bash
 cabal test glfw-native-tests --test-show-details=direct --test-options='--dry-run'
@@ -6189,112 +1850,55 @@ cabal test glfw-native-tests --test-show-details=direct --test-options='--match 
 cabal test glfw-native-tests --test-show-details=direct --test-options='--match "the native opt-in"'
 ```
 
-On Linux, run the native examples inside the display helper, exactly as the
-display worker does. The helper starts a private X11 display and gives the
-command, and only the command, the consent for that display, so this needs
-no approval and touches no desktop:
+On Linux, run the native examples inside the display helper. It starts a
+private display and gives its command the consent for that display alone, so
+it needs no approval and touches no desktop:
 
 ```bash
 bash tools/display/x11.sh -- cabal test glfw-native-tests --test-show-details=direct
-```
-
-The Wayland tree runs the same way under the headless compositor's helper,
-exactly as `test.glfw-wayland` does:
-
-```bash
 bash tools/display/wayland.sh -- cabal test glfw-native-tests --test-show-details=direct \
   --test-option=--match --test-option='/GLFW native/on an isolated Wayland session/'
 ```
 
-On a real desktop — Cocoa on macOS, or an X11 desktop of a person's own — the
-examples show, focus, resize, minimize, maximize, and take fullscreen windows
-there. The owner gave standing approval on 2026-09-26 for these sessions on the
-owner's machine when an issue or pull request needs them — the planner requires
-the group, or a request or acceptance command names it — so an agent runs them
-without asking and without waiting for a reply. The run carries the consent on
-its own command, and nowhere else:
+On a real desktop (Cocoa on macOS, or a person's own X11 desktop) the examples
+show, focus, resize, minimize, maximize and take fullscreen windows. The
+standing approval and its limits are in [AGENTS.md](../AGENTS.md). The run
+carries the consent on its own command and nowhere else:
 
 ```bash
 HETOIMASIA_NATIVE_SESSION=desktop cabal test glfw-native-tests --test-show-details=direct
 HETOIMASIA_NATIVE_SESSION=desktop cabal test glfw-native-tests --test-show-details=direct --test-options='--match "/GLFW native/the shared session/"'
 ```
 
-A quruntul `$flake` batch of never-measured tests is covered too (owner
-decision 2026-09-29): the lab runs one window-opening batch at a time and
-supplies the consent on each trial's own command. Other periodic testing and
-profiling are not covered: they use the desktop only when the owner asks for
-that run. The owner can withdraw the standing
-approval, and per-session asking then applies again. Never set the variable in
-a shell profile, a persistent environment, or a script that runs on its own: it
-is the guard that keeps every command that did not ask for a desktop from
-opening windows. Without it, the full command
-fails before initializing GLFW, with the refusal on stderr and zero
-acquisitions in its report, and `--private-session <scenario>` invoked
-directly refuses the same way. See
+Never set the variable in a shell profile, a persistent environment, or a
+script that runs on its own. Without it the full command fails before
+initializing GLFW, with zero acquisitions in its report. See
 [validation.md](validation.md#the-display-worker).
 
 ### The interaction probe
 
-GLFW documents that on some platforms a window move, a window resize, or a menu
-interaction runs a platform modal loop inside `glfwPollEvents` or
-`glfwWaitEventsTimeout`. An owner turn reconciles callbacks, dispatches
-commands, and offers the update hook only after that call returns, so a blocked
-call stalls that owner-driven work. Work the application runs on another thread
-is outside this measurement. `Test.GLFW.Native.Interaction` measures owner-loop
-progress; [the verdict](archive/owner_loop_interaction_verdict.md)
-records what the approved macOS sessions observed, and
-[the records](archive/owner_loop_interaction_evidence.md) retain every timestamped
-record those sessions produced.
+On some platforms a window move, resize or menu interaction runs a platform
+modal loop inside the native event call, which stalls every owner-driven step
+until it returns. `Test.GLFW.Native.Interaction` measures owner-loop progress
+during such interactions, using the session's bounded, record-only interaction
+trace (`Hetoimasia.Runtime.GLFW.Trace`): owner turns, the native call's entry
+and exit, each callback, and the update hook, stamped from one monotonic
+clock. The trace is stopped unless a probe starts it, keeps a bounded number
+of records, numbers the ones it drops, and marks evidence with any loss as
+incomplete.
 
-The probe runs the production owner loop over one ordinary shown window in the
-shared session, with the session's bounded interaction trace started
-(`Hetoimasia.GLFW.Internal.Trace`). Every record — an owner turn beginning, the
-native call's entry and exit with whether it polled or waited and the seconds it
-asked for, each window callback as it is delivered, and the update hook's entry
-and exit — is stamped from one monotonic clock, so a callback delivered from
-inside a blocked pump is ordered between that pump's entry and its exit. The
-trace is record-only and bounded, and reachable outside this package only
-through the public `Hetoimasia.Runtime.GLFW.Trace` — a host's `hostTrace`, the
-operations to start, take and stop it, and `recordTrace` with `Marked` for a
-probe's own records from any thread — which is how the Vulkan integration's
-[graphics-owner probe](gpu_backend.md#the-native-suite) extends this
-measurement. It keeps the first `defaultTraceCapacity`
-records, numbers the ones it drops so a gap is visible, counts a recording that
-could not be made as a fault rather than raising it inside a C frame, and marks
-evidence with either count above zero as incomplete. Every session owns one and
-it is stopped unless a probe starts it, so an ordinary run costs one `IORef`
-read at each recording point. What an owner turn offers it, and the bound and
-its loss reporting, are asserted headlessly over the test seam in
-`Test.GLFW.Trace`, which needs no desktop and no observed stall.
+Two gates keep the probe out of routine runs: the consent gate, and
+`HETOIMASIA_INTERACTION_PROBE_SECONDS`, without which it reports pending and
+opens no window. No validation group names it. An activated run works through
+an idle baseline, a move, a resize and a menu-bar interaction, printing what
+to do before each. It asserts only that each phase measured at least one owner
+turn and one complete pump and lost no records; whether a stall happened is
+the question, not an assertion. On macOS a live resize and a menu interaction
+were each measured blocking the owner turn for as long as the interaction
+lasted.
 
-Two separate gates keep it out of routine runs. The consent gate refuses it
-before its body like every other example that touches the session, so a run
-without `HETOIMASIA_NATIVE_SESSION` never reaches it. Independently of consent,
-it is inactive unless `HETOIMASIA_INTERACTION_PROBE_SECONDS` names the seconds
-each interaction should last, so the mandatory `test.glfw-native` group, which
-runs the whole suite on an isolated X11 display with its own consent, reports it
-pending and opens no window. No validation group names it and no CI runs it.
-What activates it, what a pending run says, and that it is refused before its
-body with or without activation are proven under `the native opt-in`, which
-needs no consent.
-
-An activated run works through an idle baseline, a window move, a window resize,
-and a menu-bar interaction, in that order, each lasting the seconds asked for.
-It prints what to do before each one and marks the phase in the trace; every
-line it prints is between measurement intervals, never inside one. It then
-prints, per phase, the owner turns, the update opportunities, the pumps by kind,
-the longest stretch with no update opportunity, the callbacks delivered and how
-many arrived from inside a pump, the longest pump intervals with what was
-delivered inside each, and whether the evidence is complete. It asserts that
-each phase measured at least one owner turn and one complete pump and that no
-phase lost records; it asserts nothing about whether a stall happened, because
-that is the question. `HETOIMASIA_INTERACTION_PROBE_OUTPUT` names a file every
-record is written to, which is how the timestamped evidence beside a verdict is
-retained.
-
-This disrupts the desktop more than the other native examples do, because it
-asks a person to keep interacting for the whole run. Describe it, ask, and wait
-for acceptance as for any other desktop session, then:
+It asks a person to keep interacting for the whole run, so describe it, ask,
+and wait for acceptance:
 
 ```bash
 HETOIMASIA_NATIVE_SESSION=desktop \
@@ -6302,11 +1906,4 @@ HETOIMASIA_INTERACTION_PROBE_SECONDS=20 \
 HETOIMASIA_INTERACTION_PROBE_OUTPUT=/tmp/owner-loop-interaction-trace.tsv \
   cabal test glfw-native-tests --test-show-details=direct \
   --test-options='--match "/GLFW native/owner-loop progress during window interactions/"'
-```
-
-Record native evidence with the manifest and compiler identities it ran under:
-
-```bash
-python3 tools/native/native.py toolchain
-ghc --numeric-version && cabal --numeric-version
 ```

@@ -168,11 +168,21 @@ this repository:
   ([the MEMORY.md rule](docs/validation.md#the-memorymd-rule)). Implementation docs
   describe current behavior; designs label proposals and unresolved choices.
   Update the relevant document with the change, without inventing completion.
-- `docs/archive/` is history: finished designs, evidence, verdicts and
-  records. Read it only when asked or when tracing why something was decided,
-  and never treat it as current behavior. `.ignore` hides it, and the records
-  tools read in place, from search (`rg --no-ignore` reaches them). Once a
-  design's work has merged, or a record's issue has closed, move it there with
-  `git mv` and land it with `docs-push`.
+- Git history is the archive; there is no `docs/archive/`. Once a design's
+  work has merged, or a record's issue has closed, delete the file and add one
+  line to [removed_records.md](docs/removed_records.md) (path, conclusion,
+  last commit), and land both with `docs-push`. Read a removed file with
+  `git show <commit>:<path>` only when asked or when tracing why something was
+  decided; it is never current behavior. `.ignore` hides from search the
+  records tools read in place (`rg --no-ignore` reaches them).
+- Keep documentation small. A contract states the interface, the ownership
+  and failure tables, and the invariants. It does not list tests, cite issue
+  numbers, narrate history, or restate what the code and its Haddock already
+  say, and a behavior change edits the sentence it changes instead of
+  appending one. Evidence is one short record per issue: the final numbers,
+  the command and the commit. Review-round answers go in the pull request
+  conversation. Never paste raw tool output, traces or logs into Markdown; a
+  pull request that affects the Vulkan groups puts its receipt summary in its
+  body and adds no record under `docs/vulkan/`.
 - Keep instructions short. Add subsystem contracts where the subsystem lives,
   rather than growing a central inventory of every field and function.
