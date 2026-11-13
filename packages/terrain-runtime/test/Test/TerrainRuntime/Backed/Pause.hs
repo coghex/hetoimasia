@@ -75,8 +75,10 @@ spec = describe "A paused arena" $ do
             go [] n = pure (n, Nothing)
             go ((x, y, z) : rest) n = do
               host ← newHost True
-              _ ← okOf (removeWith svc (hostEndpoint svc Nothing host) lease (tile x y z) Nothing)
+              request ← okOf (removeWith svc (hostEndpoint svc Nothing host) lease (tile x y z) Nothing)
               settled ← waitFor (readTVar (hostSettled host) >>= \s' → if null s' then retry else pure s')
+              -- the result is taken (its record retired), as a host does
+              retire svc request
               case settled of
                 [Succeeded _] → go rest (n + 1)
                 _ → pure (n, Just ((x, y, z), host, rest))

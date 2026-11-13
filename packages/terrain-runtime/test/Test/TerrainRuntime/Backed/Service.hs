@@ -439,6 +439,9 @@ spec = describe "The backed terrain service" $ do
       waitFor $ arenaStatusSTM svc lease >>= \case
         Right st → check (statusPendingReservedBytes st > 0)
         Left _ → retry
+      -- the growth's slot work has ended (its extra was given back and that failed): only then is the extra
+      -- pending for a retry to release (while the growth still holds it, it is reported pending too)
+      atRest svc
       retried ← retryArena svc lease >>= expectRight >>= await svc
       fmap retriedRemaining retried `shouldBe` Right []
       status ← arenaStatus svc lease >>= expectRight
