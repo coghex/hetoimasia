@@ -3,7 +3,7 @@
 `hetoimasia run [--vulkan-validation] GAME_ROOT` is the Lua-first engine's launcher (LFE-22, [#537](https://github.com/coghex/hetoimasia/issues/537);
 the option is LFE-28, [#579](https://github.com/coghex/hetoimasia/issues/579)).
 It knows how to assemble the engine's services, not what game or scene to run: everything a game is lives in the folder
-it is given. The design is [the Lua-first engine design](archive/designs/lua_first_engine_design.md) (P-71, P-73, P-74, D-74 to D-77
+it is given. The design is [the Lua-first engine design](removed_records.md) (P-71, P-73, P-74, D-74 to D-77
 and D-80); this document is what the command does today.
 
 ## Two builds of one executable
@@ -177,7 +177,7 @@ the layer active by capturing a deliberate hazard. Nothing in the repository rec
 the model has exactly one feature.
 
 **The messenger crash stays unreachable.** Naming a `VkDebugUtilsMessengerEXT` segfaults on the pinned loader and MoltenVK
-([the crash evidence](vulkan/macos-debug-utils-naming.md); [Names and labels](gpu_backend.md#names-and-labels)). The option adds no
+([the crash evidence](removed_records.md); [Names and labels](gpu_backend.md#names-and-labels)). The option adds no
 naming call and does not change the messenger's creation, ownership or its never-named rule on either profile; the messenger is
 always created, validation or not.
 
