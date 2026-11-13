@@ -34,7 +34,7 @@ spec ∷ Spec
 spec = describe "Terrain runtime opacity across the package boundary" $ do
   it "accepts and runs a client that composes the public service" $
     withClient "Main.hs" supportedClient $ \compile → do
-      outcome <- compile Link
+      outcome <- compile LinkThreaded
       case clientStatus outcome of
         ExitSuccess → pure ()
         status →
@@ -49,8 +49,7 @@ spec = describe "Terrain runtime opacity across the package boundary" $ do
           clientRunBound
           (proc (clientDirectory outcome </> "client") []) {cwd = Just (clientDirectory outcome)}
           ""
-      status `shouldBe` ExitSuccess
-      err `shouldBe` ""
+      (status, err) `shouldBe` (ExitSuccess, "")
       lines out `shouldBe` supportedOutput
 
   forM_ constructors $ \(name, imports) →

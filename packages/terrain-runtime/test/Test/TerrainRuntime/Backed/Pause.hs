@@ -4,6 +4,7 @@
 -- worker meets a real failure.
 module Test.TerrainRuntime.Backed.Pause (spec) where
 
+import Control.Concurrent.STM (check)
 import Control.Exception (finally)
 import Hetoimasia.Terrain.Coordinate (decomposeTile, mkLocalCoord)
 import Hetoimasia.Terrain.Residency (RegionDemand (..), coverageTile)
@@ -57,6 +58,9 @@ spec = describe "A paused arena" $ do
     withServiceSeam quiet defaultConfig alwaysAdmitting noProbe (H.seamFor probe) $ \svc → do
       (client, lease) ← openMain svc "main"
       _ ← removeCell' svc lease (tile 0 0 (-32))
+      -- nothing else reads now (internal work after that commit has finished), so the one held read is
+      -- the load's
+      waitFor (backedAtRestSTM svc >>= check)
       -- the pin: a view's load job whose page read is held (only that one). A load is not a request,
       -- so no removal waits for it in admission order; its region is far from the removals.
       gate ← H.addGateOnce probe isRead

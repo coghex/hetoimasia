@@ -501,8 +501,9 @@ spec = describe "Accounting and lifetime hardening" $ do
     -- A pending read of the edited region (its host not yet eligible, so it holds no removal back)
     -- keeps that region resident (the baseline kept it protected by failing every transfer; a
     -- backed commit transfers nothing), and the bank holds about one region, so a request that
-    -- needs another cannot be admitted again.
-    withServiceUsing microConfig alwaysAdmitting noProbe $ \svc → do
+    -- needs another cannot be admitted again. (Three command slots: the waiting request, the
+    -- keeper and one more read; the baseline's two had no keeper.)
+    withServiceUsing (microConfigSlots 3) alwaysAdmitting noProbe $ \svc → do
       client <- okOf (registerClient svc)
       let definition = layered [(Just 0, Just 2, "soil", 0), (Just 32, Just 34, "stone", 0)] [] ∷ SourceSpec
       lease <- okOf (openArena svc client "waits" definition) >>= await svc >>= expectSuccess
@@ -510,15 +511,15 @@ spec = describe "Accounting and lifetime hardening" $ do
       _ <- okOf (surfaceWith svc (hostEndpoint svc Nothing surfaceHost) lease (column 0 0))
       waitFor (readTVar (hostReady surfaceHost) >>= \n → check (n >= 1))
       keeper <- newHost False
-      _ <- okOf (cellWith svc (hostEndpoint svc Nothing keeper) lease (tile 1 0 33))
+      _ <- okOf (cellWith svc (hostEndpoint svc Nothing keeper) lease (tile 0 0 32))
       waitFor (readTVar (hostReady keeper) >>= \n → check (n >= 1))
       do
         -- Two edits bring the column's top down into the other region.
         _ <- removeCell' svc lease (tile 0 0 33)
         _ <- removeCell' svc lease (tile 0 0 32)
         waitFor (inspectReadmissionWaitsSTM svc >>= \n → check (n == 1))
-        -- It is charged: it holds a command slot, so only one more fits two, and the
-        -- state is coherent.
+        -- It is charged: it holds a command slot, so beside the keeper only one more fits
+        -- three, and the state is coherent.
         inspectInvariants svc >>= (`shouldBe` [])
         first' <- okOf (cellAt svc lease (tile 0 0 32))
         cellAt svc lease (tile 0 0 33) >>= \r → fmap isBusy (refusedWith r) `shouldBe` Just True

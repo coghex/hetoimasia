@@ -114,7 +114,7 @@ import Hetoimasia.Terrain.Resident (ResidentStats (..), columnIndexBytes, discar
 import Hetoimasia.Terrain.Segment (maxSegmentLevels)
 import Hetoimasia.Terrain.Runtime.Internal.Types
 import Hetoimasia.Terrain.Runtime.Backed.Fault (StorageFault)
-import Hetoimasia.Terrain.Runtime.Store.Internal.Model (GrowthDecision (..), proposeGrowth)
+import Hetoimasia.Terrain.Runtime.Store.Internal.Model (GrowthDecision (..), conditions, proposeGrowth)
 import Hetoimasia.Terrain.Source (Source, SourceError)
 
 -- ---------------------------------------------------------------------------
@@ -270,8 +270,9 @@ data Submission
 -- | The fault a paused arena recorded, the most serious first (integrity, then I/O, then
 -- capacity): what a new mutation of it settles with.
 pausedFault ∷ Arena → Maybe StorageFault
-pausedFault arena = case Map.toDescList (arenaFaults arena) of
-  (_, record) : _ → Just (faultOf record)
+pausedFault arena = case [record | (condition, record) ← Map.toDescList (arenaFaults arena), condition `elem` conditions (arenaStore arena)] of
+  -- only a fault whose condition still pauses the store: one that growth or a retry cleared settles nothing
+  record : _ → Just (faultOf record)
   [] → Nothing
 
 -- | How an admission ended short of a request in the table.
