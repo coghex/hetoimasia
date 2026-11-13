@@ -66,6 +66,7 @@ creatorCase inFlight command = do
   probe ← H.newProbe
   withServiceSeam quiet defaultConfig alwaysAdmitting noProbe (H.seamFor probe) $ \svc → do
     (_, lease) ← openMain svc "main"
+    (_, otherLease) ← openMain svc "other"
     first ← growArena svc lease (toInteger (128 * mib)) >>= expectRight >>= await svc
     fmap grownAllowance first `shouldBe` Right (128 * mib)
     waitFor (backedAtRestSTM svc >>= check)
@@ -81,6 +82,13 @@ creatorCase inFlight command = do
         submitC = case target of
           Just bytes → okOf (growWith svc (hostEndpoint svc Nothing cHost) lease (toInteger bytes))
           Nothing → okOf (retryWith svc (hostEndpoint svc Nothing cHost) lease)
+        -- while F holds the slot: a read of another arena admitted after C is answered, and C has
+        -- not been prepared (preparation and commits go in admission order, so C would have been
+        -- prepared, and a retry answered, before it)
+        notPreparedWhileHeld = do
+          _ ← readCell svc otherLease (tile 0 0 0)
+          readTVarIO (hostReady cHost) `shouldReturn` 0
+          readTVarIO (hostSettled cHost) `shouldReturn` []
         settled host = waitFor (readTVar (hostSettled host) >>= \s → if null s then retry else pure s)
     fRequest ← case inFlight of
       Nothing' → pure Nothing
@@ -98,6 +106,7 @@ creatorCase inFlight command = do
           f ← submitF
           H.awaitReached gate 1
           _ ← submitC
+          notPreparedWhileHeld
           pure f
         pure (Just f)
       Abandoning → do
@@ -113,6 +122,7 @@ creatorCase inFlight command = do
           H.awaitReached release 1
           -- F's run is giving its extra back, in the slot: C arrives now
           _ ← submitC
+          notPreparedWhileHeld
           pure (Just f)
       PendingExtra → do
         reserve ← H.addGateOnce probe isReserve
