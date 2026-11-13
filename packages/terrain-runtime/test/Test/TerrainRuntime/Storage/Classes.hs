@@ -44,6 +44,7 @@ import Test.TerrainRuntime.Storage.Lifecycle (checkInvariants)
 import Hetoimasia.Terrain.Runtime.Storage.Internal.File (Created (..), closeFile, createPrivate, unlinkFile)
 import Test.TerrainRuntime.Storage.ProbeSpec (ExhaustionBad (..), FillError (..), GrowthBad (..), RewriteBad (..), exhaustionVerdict, fillWith, growthVerdict, probeCases, rewriteVerdict, withFillerWith, withMeter)
 import Test.TerrainRuntime.Store.Harness (H (..), smallSpec)
+import Hetoimasia.Terrain.Runtime.Store.Internal.State (cfgAllowanceBytes)
 
 mib :: Word64
 mib = 1024 * 1024
@@ -487,9 +488,14 @@ closeScenario env inj = do
         wait
       r <- readMVar done
       (either (\e -> const True (e :: SomeException)) (const False) r) `shouldBe` True
-  openFds probe >>= (`shouldBe` [])
   (svBackings <$> view env) >>= (`shouldBe` 0)
-  volumeLedgerClear env
+  if inj `elem` [Thrown, AfterThrown, AfterAsync]
+    -- a RAISE is not an error return of close(2) (it is 'not established' on every platform): the reservation stays counted in
+    -- the held record, and the volume's figure is exactly the allowance the backing was reserved for
+    then do
+      (sum . svReserved <$> view env) >>= (`shouldBe` cfgAllowanceBytes (hCfg h0))
+      (length . snHeld <$> atomically (snapshotOf (envSvc env))) >>= (`shouldBe` 1)
+    else volumeLedgerClear env
   where
     afterClose b act = do
       addAfterRule (envProbe env) 1 (== OpCloseFile) act

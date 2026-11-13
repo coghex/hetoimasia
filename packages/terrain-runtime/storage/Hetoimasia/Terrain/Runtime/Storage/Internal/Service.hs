@@ -554,13 +554,13 @@ data Entry = Entry
   , eVolume ∷ !Word64
   , eCap ∷ !Word64
   -- ^ The committed allowance: the cap the model and the caller speak of. The file never occupies more than this.
-  , eLength ∷ !Word64
+  , eReserved ∷ !Word64
   -- ^ The allowance RESERVED for this backing (the committed one, or the prepared one while a growth is prepared), in
   -- the same units as 'eCap'. It is the backing's contribution to the volume's figure: never less than what the file
   -- physically occupies. The file's own length is 'payloadOf' this.
   , eAllocated ∷ !Word64
   -- ^ The bytes the filesystem reported the file occupies after the last step that changed it. THE INVARIANT: this
-  -- never exceeds 'eLength' plus a pending extra (the volume contribution), so the physical allocation fits the allowance.
+  -- never exceeds 'eReserved' plus a pending extra (the volume contribution), so the physical allocation fits the allowance.
   , eOverheadModel ∷ !Word64
   , eGrowth ∷ !GrowthSlot
   , ePending ∷ !(Maybe Word64)
@@ -615,6 +615,12 @@ data St = St
 -- live: a reporting record keeps the control grant of the backing it was (its measured size is under that charge),
 -- released by the transaction that deletes it, so the number of records a held logger can accumulate is bounded by the
 -- control account like every other record.
+--
+-- ONE GRANT, TWO RECORDS (a held close). The grant of the backing the record was is carried by exactly one record at a time:
+-- by 'CrNative' until the native close returns, then, for a close that is not held, by 'CrReporting' (@Just@) until the
+-- diagnostics return; for a HELD close it moves to the 'Held' record in 'stHeld' (to the service's end) and the reporting record
+-- carries @Nothing@. The one charge (a backing record, 'backingRecordBytes') therefore covers both records of a held close
+-- together: the Memory suite measures the Held record, the reporting record and their volume-ledger node TOGETHER against it.
 data ClosingRec = CrNative !Entry | CrReporting !(Maybe A.Grant)
 
 -- | A failure of a cleanup nobody received, with what it was.
@@ -922,7 +928,7 @@ disposeUndelivered svc jid = do
           -- the token that could commit or abandon it was never delivered: the preparation becomes an explicit
           -- pending reservation (length and extra unchanged in the volume's figure), recoverable by a release
           forM_ (Map.lookup (pgBacking p) (stBackings s)) $ \e → case eGrowth e of
-            GPrepared q | q == p → setEntry (pgBacking p) (\x → x {eGrowth = GIdle, ePending = let n = pgTo p - pgFrom p in n `seq` Just n, eLength = pgFrom p})
+            GPrepared q | q == p → setEntry (pgBacking p) (\x → x {eGrowth = GIdle, ePending = let n = pgTo p - pgFrom p in n `seq` Just n, eReserved = pgFrom p})
             GIdle → pure ()
             GRunning → pure ()
             GPrepared _ → pure ()
@@ -1104,7 +1110,8 @@ checkPages cfg ps = go Set.empty ps
        in bad : go (Set.insert p seen) rest
 
 -- | A request may not name an allowance the backing has not reserved and
--- committed: a prepared growth is not capacity.
+-- committed (a prepared growth is not capacity), nor usable pages beyond the payload the backing holds. THE ONE PLACE a
+-- request is validated against its backing.
 capRefusal ∷ StorageService → Backing → StoreConfig → STM (Maybe StorageFailure)
 capRefusal svc b cfg = do
   s ← readTVar (svState svc)
@@ -1112,7 +1119,16 @@ capRefusal svc b cfg = do
     Left f → Just f
     Right (_, _, e)
       | cfgAllowanceBytes cfg > eCap e → Just (InvalidRequest (BeyondCommittedCap (cfgAllowanceBytes cfg) (eCap e)))
+      -- THE BACKING'S OWN FIGURES ARE THE AUTHORITY, never the caller's configuration: a configuration with the same
+      -- allowance and a SMALLER overhead has more usable pages than the file holds, and a write to one of them would
+      -- extend the file past its payload and allocate beyond the cap. The request's usable range must lie inside the
+      -- payload the backing was opened with. (A growth cannot make the overheads differ: 'growConfig' keeps the
+      -- configuration's overhead, and the backing sizes every growth from the overhead it was opened with.)
+      | requestPayload > backingPayload → Just (InvalidRequest (PayloadBeyondBacking requestPayload backingPayload))
       | otherwise → Nothing
+      where
+        requestPayload = payloadOf (cfgAllowanceBytes cfg) (cfgOverheadBytes cfg)
+        backingPayload = payloadOf (eCap e) (eOverheadModel e)
 
 growthBlocks ∷ StorageService → Backing → STM (Maybe StorageFailure)
 growthBlocks svc b = do
@@ -1158,7 +1174,7 @@ growthSizeError e to
 -- | What a backing holds of its volume: the length of its file and any extra reservation still pending. The
 -- volume's reserved figure is the sum of these over its backings, and a close gives back exactly this.
 backingContribution ∷ Entry → Word64
-backingContribution e = eLength e + fromMaybe 0 (ePending e)
+backingContribution e = eReserved e + fromMaybe 0 (ePending e)
 
 -- | THE PAYLOAD RULE, in one place (round 7). An arena's file holds the model's usable pages and nothing else:
 -- @payload = usable pages x page@, with @usable pages = (allowance - overhead) / page@, which is the model's own
@@ -1824,7 +1840,7 @@ execGrow svc jid j from to = do
                 case Map.lookup bid (stBackings s) of
                   Just x | not cancelRequested, GRunning ← eGrowth x → do
                     writeTVar (svState svc) s
-                      { stBackings = Map.insert bid x {eGrowth = GPrepared p, eLength = to, eAllocated = rvAllocated rv} (stBackings s)
+                      { stBackings = Map.insert bid x {eGrowth = GPrepared p, eReserved = to, eAllocated = rvAllocated rv} (stBackings s)
                       , stReserved = Map.insertWith (+) (eVolume e) (to - from) (stReserved s)
                       }
                     pure True
@@ -1871,7 +1887,7 @@ execRelease svc j from to = do
         Right (Right ()) → do
           allocated ← allocatedAfter svc e from
           atomically $ modifyTVar' (svState svc) $ \s →
-            s { stBackings = Map.adjust (\x → x {eGrowth = GIdle, ePending = Nothing, eLength = from, eAllocated = allocated}) bid (stBackings s)
+            s { stBackings = Map.adjust (\x → x {eGrowth = GIdle, ePending = Nothing, eReserved = from, eAllocated = allocated}) bid (stBackings s)
               , stReserved = subReserved (eVolume e) (to - from) (stReserved s)
               }
           pure Released
@@ -1882,7 +1898,7 @@ execRelease svc j from to = do
     pendAgain bid = modifyTVar' (svState svc) $ \s →
       -- the extra is now the pending record's: the length is the committed size again, so a backing's
       -- contribution to the volume's reserved figure is always its length plus its pending extra
-      s {stBackings = Map.adjust (\x → x {eGrowth = GIdle, ePending = let n = to - from in n `seq` Just n, eLength = from}) bid (stBackings s)}
+      s {stBackings = Map.adjust (\x → x {eGrowth = GIdle, ePending = let n = to - from in n `seq` Just n, eReserved = from}) bid (stBackings s)}
 
 -- ---------------------------------------------------------------------------
 -- Scoped use and closing
@@ -1988,7 +2004,10 @@ closeBackingCore svc bid = mask_ $ do
                 Left (ExceptionWithContext _ ex) → (Nothing, Just (T.pack (show ex)))
               -- the typed failure of the close: the backing's id and the errno, or the (bounded) text of the exception
               failing = [KeptClose bid (CloseErrno en) | Just en ← [err]] <> [KeptClose bid (CloseRaised (T.copy (T.take maxHostFailureChars t))) | Just t ← [thrown]]
-          let held = (isJust err || isJust thrown) && nativeCloseFact (seamNative (svSeam svc)) == CloseNotEstablished
+          -- an ERRNO RETURNED BY close(2) follows the platform's row; a RAISE is not an error return of the call (it can come
+          -- from the seam's before-hook, where the native close was never made and the descriptor is certainly still open,
+          -- with its space), so a raise is "not established" on EVERY platform
+          let held = isJust thrown || (isJust err && nativeCloseFact (seamNative (svSeam svc)) == CloseNotEstablished)
           atomically (finishClosing svc bid e held ("close of backing " <> T.pack (show bid) <> (if held then " (reservation held: a failed close is not established to release)" else "")) failing)
           -- the diagnostics, each remembered and not obeyed: the report is still made and the caller (the drain,
           -- which goes on to close the other backings) delivers a cancellation afterwards
@@ -2074,7 +2093,9 @@ subReserved dev n = Map.update (\v → let r = v - min v n in if r == 0 then Not
 -- | What a backing reports of itself.
 data BackingView = BackingView
   { bvCommittedBytes ∷ !Word64
-  , bvLengthBytes ∷ !Word64
+  , bvReservedBytes ∷ !Word64
+  -- ^ The ALLOWANCE reserved for the backing: the committed one, or the prepared one while a growth is prepared. It is NOT the
+  -- file's length (the file holds the payload, the allowance less the model's overhead budget; see 'payloadOf').
   , bvPendingReservation ∷ !(Maybe Word64)
   , bvGrowthPrepared ∷ !Bool
   , bvBorrows ∷ !Int
@@ -2087,7 +2108,7 @@ backingView svc b = do
   s ← readTVar (svState svc)
   -- through the resolver: a handle of another service (or of one that ended) names nothing here
   pure $ flip fmap (either (const Nothing) (\(_, _, e) → Just e) (lookBacking svc b s)) $ \e →
-    BackingView (eCap e) (eLength e) (ePending e) (case eGrowth e of GIdle → False; _ → True) (eBorrows e) (ePhase e /= EOpen)
+    BackingView (eCap e) (eReserved e) (ePending e) (case eGrowth e of GIdle → False; _ → True) (eBorrows e) (ePhase e /= EOpen)
 
 -- | What the service reports of itself: the counts the contract bounds.
 data ServiceView = ServiceView
@@ -2161,9 +2182,9 @@ data BackingSnap = BackingSnap
   { bsId ∷ !Word64
   , bsSlot ∷ !SlotTag
   , bsPending ∷ !(Maybe Word64)
-  , bsLength ∷ !Word64
+  , bsReserved ∷ !Word64
   , bsAllocated ∷ !Word64
-  -- ^ What the file physically occupies (the last report): never more than 'bsLength' plus a pending extra.
+  -- ^ What the file physically occupies (the last report): never more than 'bsReserved' plus a pending extra.
   , bsVolume ∷ !Word64
   , bsBorrows ∷ !Int
   , bsClosing ∷ !Bool
@@ -2219,7 +2240,7 @@ snapshotOf svc = do
           , jsDelivered = jDelivered j
           }
       slotTag g = case g of GIdle → SlotIdle; GRunning → SlotRunning; GPrepared _ → SlotPrepared; GReleasing _ → SlotReleasing
-      backingSnap (bid, e) = BackingSnap bid (slotTag (eGrowth e)) (ePending e) (eLength e) (eAllocated e) (eVolume e) (eBorrows e) (ePhase e /= EOpen)
+      backingSnap (bid, e) = BackingSnap bid (slotTag (eGrowth e)) (ePending e) (eReserved e) (eAllocated e) (eVolume e) (eBorrows e) (ePhase e /= EOpen)
   pure Snapshot
     { snJobs = map jobSnap (Map.toList (stJobs s))
     , snBackings = map backingSnap (Map.toList (stBackings s))

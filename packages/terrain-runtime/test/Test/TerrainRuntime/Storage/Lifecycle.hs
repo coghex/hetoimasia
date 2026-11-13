@@ -44,6 +44,8 @@ mib = 1024 * 1024
 h0 :: H
 h0 = newStoreH smallSpec
 
+data CloseInj = CInjErrno | CInjRaise | CInjBefore
+
 eio :: Errno
 eio = let C.Errno c = C.eIO in Errno (fromIntegral c)
 
@@ -59,8 +61,8 @@ invariantProblems sn ledger fds = concat
     | b <- snBackings sn, (bsSlot b == SlotReleasing) /= (length (liveOf b isRelease) == 1) || length (liveOf b isRelease) > 1 ]
   , [ "backing " <> show (bsId b) <> ": an untaken preparation exists but the slot is " <> show (bsSlot b)
     | b <- snBackings sn, any ((== Just (bsId b)) . jsPrepared) (snJobs sn), bsSlot b /= SlotPrepared ]
-  , [ "descriptors open " <> show (length fds) <> " outside [" <> show nBack <> ", " <> show (nBack + snClosing sn + runningOpens) <> "]"
-    | length fds < nBack || length fds > nBack + snClosing sn + runningOpens ]
+  , [ "descriptors open " <> show (length fds) <> " outside [" <> show nBack <> ", " <> show (nBack + snClosing sn + length (snHeld sn) + runningOpens) <> "]"
+    | length fds < nBack || length fds > nBack + snClosing sn + length (snHeld sn) + runningOpens ]
   , [ "volume " <> show v <> " reserved " <> show r <> " but backings, closing records and held closes contribute " <> show (contribution v)
     | (v, r) <- Map.toList (snReserved sn), r /= contribution v ]
   , [ "volume " <> show v <> " has backings contributing " <> show c <> " but no reserved figure"
@@ -74,8 +76,8 @@ invariantProblems sn ledger fds = concat
   , [ show (snBusyVolumes sn) <> " volumes are held for a reservation by " <> show (snWorkers sn) <> " workers" | snBusyVolumes sn > snWorkers sn ]
   -- THE PHYSICAL INVARIANT (round 7): what a file occupies never exceeds the allowance it is reserved for (plus a pending
   -- extra still held), and a volume's reserved figure is never less than what its files occupy
-  , [ "backing " <> show (bsId b) <> " occupies " <> show (bsAllocated b) <> " but is reserved for " <> show (bsLength b) <> " plus " <> show (maybe 0 id (bsPending b))
-    | b <- snBackings sn <> snClosingRecs sn, bsAllocated b > bsLength b + maybe 0 id (bsPending b) ]
+  , [ "backing " <> show (bsId b) <> " occupies " <> show (bsAllocated b) <> " but is reserved for " <> show (bsReserved b) <> " plus " <> show (maybe 0 id (bsPending b))
+    | b <- snBackings sn <> snClosingRecs sn, bsAllocated b > bsReserved b + maybe 0 id (bsPending b) ]
   , [ "volume " <> show v <> " is reserved " <> show r <> " but its files occupy " <> show phys
     | (v, r) <- Map.toList (snReserved sn), let phys = sum [bsAllocated b | b <- snBackings sn <> snClosingRecs sn, bsVolume b == v], r < phys ]
   , [ "admission is open but " <> show (snWorkers sn) <> " workers are alive"
@@ -108,7 +110,7 @@ invariantProblems sn ledger fds = concat
     runningOpens = length [() | j <- snJobs sn, jsKind j == KOpen, jsPhase j == 1]
     -- a closing record still pays for everything its backing paid for, until its native close has returned
     -- and a HELD close keeps counting what its backing contributed until the service ends
-    contribution v = sum [bsLength b + maybe 0 id (bsPending b) | b <- snBackings sn <> snClosingRecs sn, bsVolume b == v] + sum [hsBytes h | h <- snHeld sn, hsVolume h == v]
+    contribution v = sum [bsReserved b + maybe 0 id (bsPending b) | b <- snBackings sn <> snClosingRecs sn, bsVolume b == v] + sum [hsBytes h | h <- snHeld sn, hsVolume h == v]
     -- EVERY closing record pays, whether its native close has returned or not: a reporting record keeps the grant of the
     -- backing it was until the transaction that deletes it
     -- (a held close's reporting record carries none: its grant is the held record's, charged to the service's end)
@@ -435,12 +437,17 @@ spec = describe "Storage backend: the lifecycle matrix" $ do
   -- Established (Linux): the failed close released the descriptor, so the reservation is released with it. Not
   -- established (macOS): the close is made once and never retried, the backing's reservation STAYS COUNTED in a charged
   -- record of its own until the service ends, and the failure is a labelled cleanup failure either way.
-  forM_ [(f, i) | f <- [CloseReleasesOnFailure, CloseNotEstablished], i <- [("an error return (EIO)", FailWith eio, True), ("a raised close", Throw, False)]] $ \(fact, (injName, inj, isErr)) ->
+  -- (the three injections: an errno the call returned, a raise inside the native call's wrapper, a raise in the seam's before-hook)
+  -- A RAISE IS NOT AN ERROR RETURN OF close(2): the table's row applies to an errno the call returned; an exception (the
+  -- native call's wrapper raising, or the seam's before-hook raising so that the native close was never made and the
+  -- descriptor is certainly still open) is "not established" on EVERY platform.
+  forM_ [(f, i) | f <- [CloseReleasesOnFailure, CloseNotEstablished], i <- [("an error return (EIO)", CInjErrno, False), ("a raised close", CInjRaise, True), ("a before-hook raise (the native close never made)", CInjBefore, True)]] $ \(fact, (injName, inj, raises)) ->
     it ("treats a failed close under " <> show fact <> " as the table says: " <> injName <> ", the volume's figure, the charge and the held record asserted") $ do
       shown <- withEnvEndingWithKeptFailureWith defaultOptions {eoCloseFact = fact} $ \env -> do
         let svc = envSvc env
             allowance = cfgAllowanceBytes (hCfg h0)
-            holds = fact == CloseNotEstablished
+            holds = raises || fact == CloseNotEstablished
+            isErr = not raises
             closeCalls = length . filter (== OpCloseFile) <$> events (envProbe env)
             controlNow = A.lgControlReserved . A.ledgers <$> readTVarIO (envAdmission env)
         b <- openBacking env ident (hCfg h0)
@@ -448,7 +455,10 @@ spec = describe "Storage backend: the lifecycle matrix" $ do
         (bid0, vol) <- case snBackings sn0 of [x] -> pure (bsId x, bsVolume x); xs -> fail ("expected one backing, got " <> show (length xs))
         snReserved sn0 `shouldBe` Map.fromList [(vol, allowance)]
         controlNow `shouldReturn` backingRecordBytes
-        addRule (envProbe env) 1 (== OpCloseFile) inj
+        case inj of
+          CInjErrno -> addRule (envProbe env) 1 (== OpCloseFile) (FailWith eio)
+          CInjRaise -> addRule (envProbe env) 1 (== OpCloseFile) Throw
+          CInjBefore -> addBeforeRule (envProbe env) 1 (== OpCloseFile) Throw
         rep <- closeBacking svc b
         (crClosed rep, crReservationHeld rep) `shouldBe` (True, holds)
         (isJust (crCloseError rep), isJust (crCloseException rep)) `shouldBe` (isErr, not isErr)
@@ -479,10 +489,18 @@ spec = describe "Storage backend: the lifecycle matrix" $ do
         snReserved sn3 `shouldBe` (if holds then Map.fromList [(vol, allowance)] else Map.empty)
         length (snHeld sn3) `shouldBe` (if holds then 1 else 0)
         checkInvariants env
-        openFds (envProbe env) >>= (`shouldBe` [])
+        -- a before-hook raise never made the native close: the descriptor is still open (with its space, which the held record
+        -- still counts); the example closes it itself
+        leftOpen <- openFds (envProbe env)
+        case inj of
+          CInjBefore -> do
+            length leftOpen `shouldBe` 1
+            fds <- fdHandles (envProbe env)
+            forM_ (take 1 fds) (nativeClose posixNative)
+          _ -> leftOpen `shouldBe` []
       -- the failure is a labelled cleanup failure of the service's end on both; the held reservation is released with it
       -- (the harness checks every ledger is back at zero after the end)
-      ("reservation held" `isInfixOf` shown) `shouldBe` (fact == CloseNotEstablished)
+      ("reservation held" `isInfixOf` shown) `shouldBe` (raises || fact == CloseNotEstablished)
 
   it "charges a closing record for as long as it lives: a logger held on the close's diagnostics cannot make the service accumulate records, and repeated open, take and close meets pressure" $ do
     gate <- newTVarIO False
@@ -535,6 +553,62 @@ spec = describe "Storage backend: the lifecycle matrix" $ do
         writeTVar (envAdmission env) (A.release holdGrant a)
       ctlBegin ctl
       ctlResult ctl >>= either (\_ -> expectationFailure "the service did not end normally") pure
+
+  -- ONE GRANT, TWO RECORDS (round 7): a held close keeps the backing's grant in its held record until the service ends and leaves a
+  -- reporting record that carries none; the one charge covers both. Repeated open + failing close on a platform where a failed
+  -- close is not established to release, with the logger held on the diagnostics, meets PRESSURE; and the held charges stay when
+  -- the logger returns (they live to the service's end), so the pressure stays too, until the service ends.
+  it "charges a held close once, for the service's lifetime: repeated open and failing close, with the logger held, meets pressure that outlives the logger" $ do
+    gate <- newTVarIO False
+    let sink e = when (entryMessage e == "Backing closed") (atomically (readTVar gate >>= check))
+        logger = mkLogger defaultLogFilter (callbackSink sink)
+        room = 3 :: Int
+        perHeld = backingRecordBytes + keptEntryBytes
+    withControlledServiceFact CloseNotEstablished logger $ \env ctl -> do
+      let svc = envSvc env
+      hold <- atomically $ do
+        a <- readTVar (envAdmission env)
+        let used = A.lgControlReserved (A.ledgers a)
+            want = fromInteger (A.ebsControl A.defaultEditBankSpec) - used - (fromIntegral room * perHeld + jobRecordBytes)
+        case A.reserve A.Foreground [A.ControlCredit want] a of
+          Left _ -> pure Nothing
+          Right (g, a') -> writeTVar (envAdmission env) a' >> pure (Just (g, want))
+      (holdGrant, held) <- maybe (fail "the control account could not be narrowed") pure hold
+      let control = A.lgControlReserved . A.ledgers <$> readTVarIO (envAdmission env)
+          cycles :: Int -> IO () -> IO ()
+          cycles 0 inner = inner
+          cycles k inner = do
+            b <- openBacking env (identOf (fromIntegral k) (fromIntegral (50 + k))) (hCfg h0)
+            addRule (envProbe env) 1 (== OpCloseFile) (FailWith eio)
+            withOwnedThreadOpening (atomically (writeTVar gate True)) (void (closeBacking svc b)) $ \_ _ -> do
+              bounded (atomically (do sn <- snapshotOf svc; check (snClosing sn == room - k + 1 && length (snHeld sn) == room - k + 1)))
+              cycles (k - 1) inner
+      cycles room $ do
+        sn <- atomically (snapshotOf svc)
+        -- every close is held in its diagnostics: a reporting record (no grant of its own) and a held record (the grant) each
+        (snClosing sn, snClosingCharged sn, length (snHeld sn), length (snBackings sn)) `shouldBe` (room, 0, room, 0)
+        control `shouldReturn` (held + fromIntegral room * perHeld)
+        checkInvariantsHolding held env
+        o <- openBackingAt env (envDir env) (identOf 77 77) (hCfg h0)
+        case o of
+          Failed (BusyNow (AccountPressure _)) _ -> pure ()
+          other -> expectationFailure ("the open beyond the control account was not refused for pressure: " <> show other)
+      -- the logger returns: the reporting records end, and the held ones STAY CHARGED: the pressure outlives the logger
+      atomically (writeTVar gate True)
+      bounded (atomically (do sn <- snapshotOf svc; check (snClosing sn == 0)))
+      sn2 <- atomically (snapshotOf svc)
+      (length (snHeld sn2), Map.size (snReserved sn2)) `shouldBe` (room, 1)
+      control `shouldReturn` (held + fromIntegral room * perHeld)
+      checkInvariantsHolding held env
+      o2 <- openBackingAt env (envDir env) (identOf 78 78) (hCfg h0)
+      case o2 of
+        Failed (BusyNow (AccountPressure _)) _ -> pure ()
+        other -> expectationFailure ("the held charges were released before the service ended: " <> show other)
+      -- the service ends: the held records and the evidence are released with it, and the account is the test's share alone
+      atomically (readTVar (envAdmission env) >>= \a -> writeTVar (envAdmission env) (A.release holdGrant a))
+      ctlBegin ctl
+      ctlResult ctl >>= either (\(ExceptionWithContext ctx _) -> length (cleanupFailuresInContext ctx) `shouldBe` room) (\_ -> expectationFailure "the kept failures of the closes were lost")
+      control `shouldReturn` 0
 
   forM_ [("discardTicket of a finished open", \svc t _ -> discardTicket svc t), ("closeBacking", \svc _ b -> void (closeBacking svc b))] $ \(name, close) ->
     it ("keeps a failing close whose caller is cancelled while the native close is held (" <> name <> "): the cancellation is pending, delivered after, and the failure is kept") $
@@ -763,7 +837,11 @@ withControlledService :: (Env -> Ctl -> IO a) -> IO a
 withControlledService = withControlledServiceWith quiet
 
 withControlledServiceWith :: Logger -> (Env -> Ctl -> IO a) -> IO a
-withControlledServiceWith logger body =
+withControlledServiceWith = withControlledServiceFact CloseReleasesOnFailure
+
+-- | The controlled service under a chosen platform fact about a failed close.
+withControlledServiceFact :: CloseFact -> Logger -> (Env -> Ctl -> IO a) -> IO a
+withControlledServiceFact fact logger body =
   withSystemTempDirectory "hetoimasia-terrain-lifecycle-cell" $ \dir -> do
     cfg <- testConfigFor dir defaultOptions
     probe <- newProbe
@@ -776,7 +854,7 @@ withControlledServiceWith logger body =
     out <- withWorkerGroup $ \group ->
       withOwnedThreadOpening (openAllGates probe >> void (tryPutMVar finish ()))
         ( myThreadId >>= putMVar serviceThread
-            >> (tryWithContext (withStorageService (StoragePorts admission group logger (seamFor probe) cfg) (\svc -> putMVar handoff (Env svc admission probe dir cfg) >> takeMVar finish)) >>= putMVar result)
+            >> (tryWithContext (withStorageService (StoragePorts admission group logger (withCloseFact fact (seamFor probe)) cfg) (\svc -> putMVar handoff (Env svc admission probe dir cfg) >> takeMVar finish)) >>= putMVar result)
         ) $ \_ waitService -> do
           env <- bounded (takeMVar handoff)
           tid <- readMVar serviceThread
@@ -1219,7 +1297,7 @@ chargeEvidence k = case k of
       sn <- atomically (snapshotOf (envSvc env))
       (length (snBackings sn), length (snClosingRecs sn)) `shouldBe` (0, 1)
       ledger env >>= \l -> A.lgControlReserved l `shouldBe` backingRecordBytes
-      snReserved sn `shouldBe` Map.fromList [(bsVolume r, bsLength r) | r <- snClosingRecs sn]
+      snReserved sn `shouldBe` Map.fromList [(bsVolume r, bsReserved r) | r <- snClosingRecs sn]
       length <$> openFds (envProbe env) >>= (`shouldBe` 1)
       checkInvariants env
       openGate g

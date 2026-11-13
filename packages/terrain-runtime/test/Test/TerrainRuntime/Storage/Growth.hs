@@ -125,7 +125,7 @@ spec = describe "Storage backend: growth" $ do
         -- whatever was obtained was released: the file occupies what it did, nothing is pending
         allocatedOf env >>= (`shouldSatisfy` backTo held0)
         v ← view env b
-        (name, bvCommittedBytes v, bvLengthBytes v, bvPendingReservation v) `shouldBe` (name, 64 * mib, 64 * mib, Nothing)
+        (name, bvCommittedBytes v, bvReservedBytes v, bvPendingReservation v) `shouldBe` (name, 64 * mib, 64 * mib, Nothing)
         readOk env b h0 5
 
   it "releases the extra space when the growth is cancelled after it was obtained" $
@@ -139,7 +139,7 @@ spec = describe "Storage backend: growth" $ do
       openGate g
       awaitOutcome env t >>= (`shouldBe` Cancelled [])
       allocatedOf env >>= (`shouldSatisfy` backTo held0)
-      (bvLengthBytes <$> view env b) >>= (`shouldBe` 64 * mib)
+      (bvReservedBytes <$> view env b) >>= (`shouldBe` 64 * mib)
 
   it "keeps a pending reservation, charged, when its release fails, and blocks growth until it is released" $
     withEnv $ \env → do
@@ -161,7 +161,7 @@ spec = describe "Storage backend: growth" $ do
       t ← submitReleasePending (envSvc env) b >>= either (fail . show) pure
       awaitOutcome env t >>= (`shouldBe` Released)
       v2 ← view env b
-      (bvPendingReservation v2, bvLengthBytes v2) `shouldBe` (Nothing, 64 * mib)
+      (bvPendingReservation v2, bvReservedBytes v2) `shouldBe` (Nothing, 64 * mib)
       allocatedOf env >>= (`shouldSatisfy` (< 65 * mib))
       grow env b (64 * mib) (128 * mib) >>= (`shouldSatisfy` \x → case x of GrowthPrepared {} → True; _ → False)
 
@@ -189,7 +189,7 @@ spec = describe "Storage backend: growth" $ do
       rulesConsumed (envProbe env) >>= (`shouldBe` True)
       -- given back: the slot is idle, nothing prepared or pending, the file is the size it was
       v ← view env b
-      (bvGrowthPrepared v, bvPendingReservation v, bvLengthBytes v) `shouldBe` (False, Nothing, 64 * mib)
+      (bvGrowthPrepared v, bvPendingReservation v, bvReservedBytes v) `shouldBe` (False, Nothing, 64 * mib)
       allocatedOf env >>= (`shouldSatisfy` backTo held0)
       reservedTotal env >>= (`shouldBe` (64 * mib))
 
@@ -232,7 +232,7 @@ spec = describe "Storage backend: growth" $ do
       o `shouldSatisfy` \x → case x of Failed (ReservationFailed (OverheadExceedsModel {})) [] → True; _ → False
       rulesConsumed (envProbe env) >>= (`shouldBe` True)
       v ← view env b
-      (bvGrowthPrepared v, bvPendingReservation v, bvLengthBytes v) `shouldBe` (False, Nothing, 64 * mib)
+      (bvGrowthPrepared v, bvPendingReservation v, bvReservedBytes v) `shouldBe` (False, Nothing, 64 * mib)
       allocatedOf env >>= (`shouldSatisfy` backTo held0)
 
   it "gives back a prepared growth that will not be committed" $
@@ -245,7 +245,7 @@ spec = describe "Storage backend: growth" $ do
       awaitOutcome env t >>= (`shouldBe` Released)
       allocatedOf env >>= (`shouldSatisfy` backTo held0)
       v ← view env b
-      (bvGrowthPrepared v, bvLengthBytes v) `shouldBe` (False, 64 * mib)
+      (bvGrowthPrepared v, bvReservedBytes v) `shouldBe` (False, 64 * mib)
   where
     stages =
       [ ("headroom", \p → addRule p 1 (== OpStatFilesystem) (FreeBytesAre (64 * mib + 255 * mib)), \f → case f of ReservationFailed (InsufficientHeadroom {}) → True; _ → False)

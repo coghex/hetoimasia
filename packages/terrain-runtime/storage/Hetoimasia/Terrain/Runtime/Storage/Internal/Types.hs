@@ -267,6 +267,10 @@ data InvalidWhy
   | -- | The request's configuration names an allowance the backing has not
     -- reserved and committed: allowance asked, committed.
     BeyondCommittedCap !Word64 !Word64
+  | -- | The request's configuration reaches past the backing's PAYLOAD: its usable pages (its allowance less ITS overhead)
+    -- cover more than the file the backing was opened with holds (the same allowance with a smaller overhead, say):
+    -- the request's payload in bytes, the backing's.
+    PayloadBeyondBacking !Word64 !Word64
   | IdentityMismatch
   | GrowthNotIncreasing !Word64 !Word64
   | GrowthStaleBase !Word64 !Word64

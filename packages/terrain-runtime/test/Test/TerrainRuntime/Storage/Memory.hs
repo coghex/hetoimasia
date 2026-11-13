@@ -247,12 +247,12 @@ closingRow env kind n = do
       keyed ∷ (A.Grant → Int → v) → Map.Map Word64 v
       keyed f = Map.fromList [(fromIntegral i ∷ Word64, f g i) | (i, g) ← zip [1 .. n] grants]
   heldAdded n $ case kind of
-    HeldBacking → holdLive (keyed entryFor, ledger, adm) (\(m, l, a) → Map.size m + Map.size l + fromIntegral (A.lgControlReserved (A.ledgers a)) + sum [fromIntegral (eLength e) | e ← Map.elems m])
-    HeldNative → holdLive (keyed (\g i → CrNative (entryFor g i)), ledger, adm) (\(m, l, a) → Map.size m + Map.size l + fromIntegral (A.lgControlReserved (A.ledgers a)) + sum [case c of CrNative e → fromIntegral (eLength e); CrReporting _ → 0 | c ← Map.elems m])
+    HeldBacking → holdLive (keyed entryFor, ledger, adm) (\(m, l, a) → Map.size m + Map.size l + fromIntegral (A.lgControlReserved (A.ledgers a)) + sum [fromIntegral (eReserved e) | e ← Map.elems m])
+    HeldNative → holdLive (keyed (\g i → CrNative (entryFor g i)), ledger, adm) (\(m, l, a) → Map.size m + Map.size l + fromIntegral (A.lgControlReserved (A.ledgers a)) + sum [case c of CrNative e → fromIntegral (eReserved e); CrReporting _ → 0 | c ← Map.elems m])
     HeldReporting → holdLive (keyed (\g _ → CrReporting (Just g)), ledger, adm) (\(m, l, a) → Map.size m + Map.size l + fromIntegral (A.lgControlReserved (A.ledgers a)) + sum [case c of CrNative _ → 0; CrReporting _ → 1 | c ← Map.elems m])
-    -- a HELD close (round 7): the record that keeps a failed close's reservation counted until the service ends: its map node, the three
-    -- words and the one grant it carries, with the volume's ledger node it keeps
-    HeldHeldClose → holdLive (keyed (\g i → Held (fromIntegral i) (fromIntegral i * 3) g), ledger, adm) (\(m, l, a) → Map.size m + Map.size l + fromIntegral (A.lgControlReserved (A.ledgers a)) + sum [fromIntegral (hBytes h) | h ← Map.elems m])
+    -- a HELD close (round 7), measured TOGETHER: its two records (the held record that carries the grant to the service's end, and
+    -- the reporting record that carries none until the diagnostics return) and the volume-ledger node, against the ONE charge
+    HeldHeldClose → holdLive (keyed (\g i → Held (fromIntegral i) (fromIntegral i * 3) g), keyed (\_ _ → CrReporting Nothing) ∷ Map.Map Word64 ClosingRec, ledger, adm) (\(m, r, l, a) → Map.size m + Map.size r + Map.size l + fromIntegral (A.lgControlReserved (A.ledgers a)) + sum [fromIntegral (hBytes h) | h ← Map.elems m])
 
 -- ---------------------------------------------------------------------------
 -- The rows
@@ -504,8 +504,8 @@ spec3 = describe "Storage backend: every retained structure is charged and measu
       row "closing record, native close pending (the entry moved, per backing)" backingRecordBytes native
       -- what a reporting record retains: its map node and the one grant it carries until the transaction that deletes it
       row "closing record, reporting (the carried grant, per record)" backingRecordBytes reporting
-      heldClose ← sound "held close record" 200 (closingRow env HeldHeldClose)
-      row "held close record (a failed close whose reservation stays counted, per record)" backingRecordBytes heldClose
+      heldClose ← sound "held close, both records" 200 (closingRow env HeldHeldClose)
+      row "held close: the held record and the reporting record together (one grant, per backing)" backingRecordBytes heldClose
   where
     jobCharge' n = jobRecordBytes + fromIntegral n * writeEntryBytes + writeFailureBytes
     -- the service's end reports the kept failures: this example measures them and ignores that report

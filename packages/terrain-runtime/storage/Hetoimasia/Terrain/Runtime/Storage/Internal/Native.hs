@@ -139,6 +139,10 @@ data Native = Native
 -- | any other| 'CloseNotEstablished'     | nothing is established.                                                      |
 -- +----------+---------------------------+------------------------------------------------------------------------------+
 --
+-- The row applies to an ERROR RETURNED BY the @close(2)@ call. An exception raised around the call (from the seam's
+-- before-hook, where the native close was never made and the descriptor is certainly still open) is not an error return of the
+-- call, so it is 'CloseNotEstablished' on EVERY platform, whatever this table says.
+--
 -- What the service does with the row: where a failed close is established to have released the descriptor, the
 -- backing's reservation is released with it (the space is free). Where it is NOT established, the close is never
 -- retried and the backing's reservation STAYS COUNTED, as possibly still held, in a charged record of its own until the

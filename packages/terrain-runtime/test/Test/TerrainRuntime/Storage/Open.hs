@@ -29,7 +29,7 @@ import Test.Support.Subprocess (runCaptured)
 import Test.Hspec
 import Test.Support.Bounded (bounded)
 import Test.TerrainRuntime.Storage.Harness
-import Test.TerrainRuntime.Store.Harness (H (..), smallSpec)
+import Test.TerrainRuntime.Store.Harness (H (..), smallSpec, specOf)
 
 -- | A platform errno as the backend's own.
 er ∷ C.Errno → Errno
@@ -176,6 +176,33 @@ spec = describe "Storage backend: opening a backing" $ do
       (nsSize st1, nsAllocated st1) `shouldBe` (nsSize st0, nsAllocated st0)
       evs ← events (envProbe env)
       length [() | OpWriteAt {} ← evs] `shouldBe` 0
+
+  -- THE BACKING'S OWN FIGURES ARE THE AUTHORITY, never the caller's configuration (round 7, manager's read): a configuration with
+  -- the SAME allowance and a SMALLER overhead has more usable pages than the file the backing holds. A read or a write of a page
+  -- in that tail is refused before any native call, with a typed failure, and the file's length and allocation are unchanged.
+  it "refuses a request whose configuration has the same allowance and a smaller overhead, for a page past the backing's payload" $
+    withEnv $ \env → do
+      let cfg = hCfg cfg64
+          smallerH = newStoreH (specOf (toInteger (cfgAllowanceBytes cfg)) (Just 4096))
+          loose = hCfg smallerH
+          tailPage = PageNo (cfgTotalPages cfg)
+          refused f = case f of InvalidRequest (PayloadBeyondBacking got has) → got == payloadBytes loose && has == payloadBytes cfg; _ → False
+      -- the control of the example: the looser configuration really has more usable pages than the backing's payload
+      (cfgAllowanceBytes loose, payloadBytes loose > payloadBytes cfg) `shouldBe` (cfgAllowanceBytes cfg, True)
+      o ← openBackingAt env (envDir env) ident cfg
+      b ← case o of Opened b _ → pure b; other → fail (show other)
+      [fd] ← fdHandles (envProbe env)
+      st0 ← either (fail . show) pure =<< nativeStat posixNative fd
+      readPages env b loose (cfgTotalPages cfg) 1 ReadProbe >>= (`shouldSatisfy` either refused (const False))
+      let plan = either error id (planFor smallerH 1)
+      (tid, s1) ← either (fail . show) pure (admit plan (hStore smallerH))
+      sw ← either (fail . show) pure (stageWrite s1 tid)
+      t ← submitWrite (envSvc env) b sw {swPages = [(tailPage, BS.replicate pageSize 7)]}
+      t `shouldSatisfy` either refused (const False)
+      st1 ← either (fail . show) pure =<< nativeStat posixNative fd
+      (nsSize st1, nsAllocated st1) `shouldBe` (nsSize st0, nsAllocated st0)
+      evs ← events (envProbe env)
+      (length [() | OpWriteAt {} ← evs], length [() | OpReadAt {} ← evs]) `shouldBe` (0, 0)
 
   -- THE PHYSICAL INVARIANT AT ITS BOUNDARY (round 7): the platform's own overhead must fit in what the allowance leaves
   -- for it, so that the file never occupies more than the allowance. A seam that over-allocates by EXACTLY that budget

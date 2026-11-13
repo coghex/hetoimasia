@@ -48,6 +48,7 @@ module Test.TerrainRuntime.Storage.Harness
   , rulesConsumed
   , addRule
   , addRuleAfter
+  , addBeforeRule
   , addGate
   , addGateAfter
   , events
@@ -178,10 +179,12 @@ data Probe = Probe
   -- ^ Gates the seam's after-hook blocks at, after the effect.
   , pWorkers ∷ !(TVar [ThreadId])
   -- ^ The threads the service's workers run on, noted as each starts (the seam's start hook runs on it).
+  , pBeforeRules ∷ !(TVar [Rule])
+  -- ^ Rules applied by the seam's BEFORE-hook: the native call has NOT been made when they fire.
   }
 
 newProbe ∷ IO Probe
-newProbe = Probe <$> newTVarIO [] <*> newTVarIO [] <*> newTVarIO [] <*> newTVarIO [] <*> newTVarIO Set.empty <*> newTVarIO [] <*> newTVarIO [] <*> newTVarIO [] <*> newTVarIO []
+newProbe = Probe <$> newTVarIO [] <*> newTVarIO [] <*> newTVarIO [] <*> newTVarIO [] <*> newTVarIO Set.empty <*> newTVarIO [] <*> newTVarIO [] <*> newTVarIO [] <*> newTVarIO [] <*> newTVarIO []
 
 -- | Apply a rule to the next @n@ matching calls (negative: all of them).
 addRule ∷ Probe → Int → (NativeOp → Bool) → Act → IO ()
@@ -193,6 +196,13 @@ addRuleAfter p skip n match act = do
   sk ← newTVarIO skip
   uses ← newTVarIO n
   atomically (modifyTVar' (pRules p) (<> [Rule match act sk uses]))
+
+-- | Apply a rule to the BEFORE-hook of the next @n@ matching calls: the hook raises and the native call is never made.
+addBeforeRule ∷ Probe → Int → (NativeOp → Bool) → Act → IO ()
+addBeforeRule p n match act = do
+  sk ← newTVarIO 0
+  uses ← newTVarIO n
+  atomically (modifyTVar' (pBeforeRules p) (<> [Rule match act sk uses]))
 
 -- | Apply a rule to the AFTER-hook of the next @n@ matching calls: the native effect has happened, then the hook raises.
 addAfterRule ∷ Probe → Int → (NativeOp → Bool) → Act → IO ()
@@ -285,6 +295,9 @@ seamFor p = Seam wrapped before after
       case op of
         OpWorkerStart _ → myThreadId >>= \tid → atomically (modifyTVar' (pWorkers p) (tid :)) >> takeRule p op >>= \r → case r of
           Just Throw → ioError (userError "injected worker start failure")
+          _ → pure ()
+        OpCloseFile → takeRuleFrom (pBeforeRules p) op >>= \r → case r of
+          Just Throw → ioError (userError "injected exception in a before-hook")
           _ → pure ()
         _ → pure ()
       gates ← readTVarIO (pGates p)
