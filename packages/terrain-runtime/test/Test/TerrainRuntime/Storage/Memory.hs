@@ -65,14 +65,16 @@ import Test.TerrainRuntime.Store.Harness (H (..), identOf, smallSpec)
 h0 ∷ H
 h0 = newStoreH smallSpec
 
--- | THE LIVE-HEAP READING (round 10; the CI runner showed a pair of readings with NOTHING between them differing by half a megabyte).
--- A reading is the live bytes of the LAST collection the runtime reports. Another thread of the process that allocates between our
--- 'performMajorGC' and our read of the statistics makes a MINOR collection the last one, and a minor collection's live bytes are the young
--- generation's, not the heap's: the "reading" is then an artifact of a collection that was not ours. So (1) a reading is VALID only when the
--- last collection reported was a major one (its generation is the oldest), else it is discarded and retaken; (2) a measurement's reading is
--- SETTLED: valid readings are taken until two consecutive ones agree within 'settleTolerance' (residue of earlier examples, finalizers that
--- run after a collection and threads still ending are gone by then), bounded; a heap that does not settle FAILS the example with its readings
--- in the message. 'discardedReadings' counts the artifacts seen (printed, so a runner's behaviour is visible).
+-- | THE LIVE-HEAP READING (round 10). The CI runner once showed a pair of readings with nothing between them that differed by half a megabyte (the
+-- noise-floor example at `2388b285`); the CAUSE IS NOT KNOWN: it did not reproduce on macOS or on the Linux VM with the same seed, and a process in which
+-- another thread allocates showed only a stack-chunk step (about 33 KB), never a reading whose last collection was a minor one. What this does, and
+-- does not, guarantee: (1) a reading is VALID only when the last collection the runtime reports was a major one (its generation is the oldest), else it
+-- is discarded and retaken, and the discards are counted and printed (zero so far on every host): a GUARD against a reading that is not the heap's;
+-- (2) a measurement's reading is SETTLED: valid readings are taken until two consecutive ones agree within 'settleTolerance', bounded, and a heap that
+-- does not settle FAILS the example with its readings in the message. Settling excludes a transient that lives for ONE collection only (a finalizer
+-- that runs after a collection, a thread still ending); a change that lasts longer than that is NOT excluded: it disturbs ONE sample, which the
+-- majority of a row's samples absorbs ('medianOf'), and a contaminated batch of the floor's measurement is absorbed by the median of batches
+-- ('noiseFloor'). 'discardedReadings' is printed so a runner's behaviour is visible.
 live ∷ IO Word64
 live = liveWith (pure ())
 
@@ -195,7 +197,7 @@ floorSpec = describe "Storage backend: the live-heap reading's noise floor" $ se
 rulesSpec ∷ Spec
 rulesSpec = describe "Storage backend: a memory row cannot pass without measuring something" $ settleFloor $ do
   let fails act = (try act ∷ IO (Either SomeException ())) >>= \r → either (const (pure ())) (const (expectationFailure "the row passed")) r
-      big = ceiling (signalMultiple * theFloor) ∷ Int
+      big = ceiling neededSignal ∷ Int
   it "fails a row that measured zero, or less than zero (a clamp or a least-of-N would have passed it)" $ do
     fails (checkSignal "measured nothing" big 0)
     fails (checkSignal "measured less than nothing" big (-2184))
@@ -210,6 +212,10 @@ rulesSpec = describe "Storage backend: a memory row cannot pass without measurin
     chunk ← BSI.create spike (\ptr → fillBytes ptr 7 spike)
     atomicModifyIORef' transient (\_ → (Just chunk, ()))
     _ ← evaluate =<< (maybe 0 BS.length <$> readIORef transient)
+    -- THE CONTROL IS ONLY AS GOOD AS ITS TRANSIENT: while it is held, one valid reading MUST contain it (else the control could pass without the
+    -- transient ever having been in a reading)
+    held ← validReading
+    (fromIntegral held - fromIntegral base ∷ Double) `shouldSatisfy` (>= 0.9 * fromIntegral spike)
     r ← liveWith (atomicModifyIORef' transient (\_ → (Nothing, ())))
     -- a reading that had taken the transient in would be at least `spike` above the base
     (fromIntegral r - fromIntegral base ∷ Double) `shouldSatisfy` (< 50000)
@@ -233,6 +239,13 @@ rulesSpec = describe "Storage backend: a memory row cannot pass without measurin
     value [calm, spike, calm + 100000 / fromIntegral n, calm, calm] `shouldBe` Just calm
     -- a single bad sample among seven never changes the figure, wherever it falls
     forM_ [0 .. 6] $ \i → value [if j == i then spike else calm | j ← [0 .. 6 ∷ Int]] `shouldBe` Just calm
+    -- the tie-break is not biased low: of five samples whose sorted totals are [0, 20K, 30K, 55K, far] both [0,20K,30K] and [20K,30K,55K] agree, and the
+    -- value is the median of ALL the samples (30K), not the lower window's (20K)
+    let fiveTotals = [0, 20000, 30000, 55000, 1000000] ∷ [Double]
+        five = [calm + t / fromIntegral n | t ← fiveTotals]
+    value five `shouldBe` Just (calm + 30000 / fromIntegral n)
+    -- an even count takes the UPPER middle (the conservative side of charge >= measured)
+    value [calm, calm + 10000 / fromIntegral n, calm + 20000 / fromIntegral n, calm + 30000 / fromIntegral n] `shouldBe` Just (calm + 20000 / fromIntegral n)
     -- three clusters cycling to the bound: no agreeing majority: UNSTABLE (a persistent disagreement)
     let cycle3 = take 7 (cycle [calm, calm + 100000 / fromIntegral n, calm + 300000 / fromIntegral n])
     value cycle3 `shouldBe` Nothing
@@ -250,6 +263,8 @@ rulesSpec = describe "Storage backend: a memory row cannot pass without measurin
     (try (medianOf "control: persistent disagreement" n cycling) ∷ IO (Either SomeException Double)) >>= \r → either (const (pure ())) (const (expectationFailure "a persistent three-way disagreement was established")) r
   it "fails a row whose signal is below the floor times the multiple, and passes one above it" $ do
     fails (checkSignal "signal too small" 10 1)
+    -- the signal a row needs is never less than a stack chunk, whatever the floor: 30,000 bytes at a floor of 16 FAIL
+    fails (checkSignal "signal below one stack chunk" 30000 1)
     checkSignal "signal far above" big 1.5
 
 -- | The live heap that a build adds, per instance: read before, build (forced; it hands back an action that touches
@@ -275,8 +290,8 @@ holdLive x size = do
 checkSignal ∷ String → Int → Double → Expectation
 checkSignal name n m = do
   let signal = m * fromIntegral n
-      need = signalMultiple * theFloor
-  putStrLn ("memory signal | " <> name <> " | instances " <> show n <> " | signal " <> show (round signal ∷ Integer) <> " | floor " <> show (round theFloor ∷ Integer))
+      need = neededSignal
+  putStrLn ("memory signal | " <> name <> " | instances " <> show n <> " | signal " <> show (round signal ∷ Integer) <> " | needed " <> show (round need ∷ Integer) <> " | floor " <> show (round theFloor ∷ Integer))
   m `shouldSatisfy` (> 0)
   signal `shouldSatisfy` (>= need)
 
@@ -294,14 +309,17 @@ stackChunkQuantum = 40000
 -- | A ROW'S VALUE IS ESTABLISHED BY A MAJORITY (round 10). One bad sample must never fail a row: the runner showed about one bad pair in 300 and a run
 -- takes about a hundred measurement windows, so a rule that fails on one disagreeing sample is the flake under another name. A sample is a
 -- per-instance figure (each its own settled readings and, for an in-service row, its own service). The value is ESTABLISHED when a MAJORITY of the
--- samples taken so far (more than half) agree within the row's tolerance (the largest total they may differ by); the row's value is the MEDIAN of
--- the agreeing majority (the largest agreeing group; not a minimum, not a maximum). A real retention shows in EVERY sample, so the majority agrees
+-- samples taken so far (more than half) agree within the row's tolerance (the largest total they may differ by); the row's value is the MEDIAN of ALL
+-- the samples taken (the upper middle for an even count), which lies in every agreeing group (not a minimum, not a maximum, not the median of one window). A real retention shows in EVERY sample, so the majority agrees
 -- on the larger figure and the row fails as over its charge: it is not hidden.
 establish ∷ Int → [Double] → Maybe (Double, [Double])
 establish n xs
   | k < 2 = Nothing
   | otherwise = case [w | size ← [k, k - 1 .. need], i ← [0 .. k - size], let w = take size (drop i sorted), agrees w] of
-      w : _ → Just (medianOfSorted w, w)
+      -- ESTABLISHED iff some majority window agrees; the VALUE is the median of ALL the samples (it lies in every majority window: a window of more
+      -- than half of the sorted samples contains the middle), the UPPER middle for an even count (the conservative side of charge >= measured): the
+      -- choice among agreeing windows never biases the value low
+      w : _ → Just (medianOfSorted sorted, w)
       [] → Nothing
   where
     k = length xs
@@ -311,6 +329,12 @@ establish n xs
 
 medianOfSorted ∷ [Double] → Double
 medianOfSorted w = w !! (length w `div` 2)
+
+-- | THE SIGNAL A ROW MUST HAVE (one definition, used by 'checkSignal' and by 'sound', which raises the instances until it is reached): the floor times
+-- the multiple, and never less than one stack chunk. The settled floor is tiny (16 bytes where readings agree), but one sample may step by a chunk
+-- and samples "agree" within 'stackChunkQuantum', so a signal smaller than that has not measured its figure.
+neededSignal ∷ Double
+neededSignal = max (signalMultiple * theFloor) stackChunkQuantum
 
 -- | The largest total by which samples of a row may differ and still agree: one stack chunk and a little, or 'unstableFraction' of the signal (the
 -- smallest signal a row may have is 'signalMultiple' times the floor).
@@ -349,7 +373,7 @@ medianOf name n sample = do
 sound ∷ String → Int → (Int → IO Double) → IO Double
 sound name n0 at = go n0 (0 ∷ Int)
   where
-    need = signalMultiple * theFloor
+    need = neededSignal
     go n tries = do
       m ← medianOf name n (at n)
       if m * fromIntegral n >= need || tries >= 4
@@ -731,7 +755,7 @@ spec4 = describe "Storage backend: what the service retains of what it is handed
       forM_ ts (awaitOutcome env)
       pure ((fromIntegral heapAfter - fromIntegral heapBefore) / fromIntegral k ∷ Double)
     putStrLn ("memory retention | finished untaken open, a 48-byte slice of a 2 MiB buffer, per job, " <> show k <> " held at once | " <> show (round perJobBytes ∷ Integer) <> " | charged " <> show jobRecordBytes)
-    perJobBytes `shouldSatisfy` (<= fromIntegral jobRecordBytes)
+    retention "finished untaken open" k perJobBytes (fromIntegral jobRecordBytes)
 
   it "a directory that is a short slice of a large buffer costs the copy and not the buffer: K queued opens" $ do
     let k = 8 ∷ Int
@@ -746,7 +770,7 @@ spec4 = describe "Storage backend: what the service retains of what it is handed
       forM_ (held <> ts) (awaitOutcome env)
       pure ((fromIntegral heapAfter - fromIntegral heapBefore) / fromIntegral k ∷ Double)
     putStrLn ("memory retention | queued open, a 48-byte slice of a 2 MiB buffer, per job, " <> show k <> " queued | " <> show (round perJobBytes ∷ Integer) <> " | charged " <> show jobRecordBytes)
-    perJobBytes `shouldSatisfy` (<= fromIntegral jobRecordBytes)
+    retention "queued open" k perJobBytes (fromIntegral jobRecordBytes)
 
   it "a qualified-filesystem name that is a short slice of a large buffer costs the copy: K configurations held at once" $ do
     let viewOf k = BS.take 4 (BC.pack (replicate (2 * 1024 * 1024) (toEnum (97 + k `mod` 20))))
@@ -760,7 +784,7 @@ spec4 = describe "Storage backend: what the service retains of what it is handed
       _ ← evaluate (sum (map (length . scQualified) cs))
       pure ((fromIntegral heapAfter - fromIntegral heapBefore) / fromIntegral k ∷ Double)
     putStrLn ("memory retention | storage configuration, two 4-byte names viewed from 2 MiB buffers, per configuration, " <> show k <> " held | " <> show (round perConfig ∷ Integer))
-    perConfig `shouldSatisfy` (<= 1024)
+    retention "configuration" k perConfig 1024
 
   it "a filesystem name that is a short slice of a large buffer (a mount table's text) costs the copy: K profiles held at once" $
     withSystemTempDirectory "hetoimasia-terrain-profile" $ \dir → do
@@ -780,9 +804,20 @@ spec4 = describe "Storage backend: what the service retains of what it is handed
         pure ((fromIntegral heapAfter - fromIntegral heapBefore) / fromIntegral k ∷ Double)
       putStrLn ("memory retention | volume profile, a 4-byte filesystem name viewed from a 2 MiB buffer, per profile, " <> show k <> " held | " <> show (round perProfile ∷ Integer))
       -- the copy of four bytes and the profile's own words: a few hundred bytes, never the buffer
-      perProfile `shouldSatisfy` (<= 1024)
+      retention "volume profile" k perProfile 1024
       _ ← unlinkFile productionSeam (BC.pack dir) (crName c)
       void (closeFile productionSeam (crFd c))
+
+-- | A RETENTION ROW (round 6, sampled in round 10): K held things add AT LEAST nothing never (a figure of zero or below measured nothing, which a floated
+-- constant or a lost reading would give) and at most the bound. Its signal is printed beside the signal a row needs: these rows are bounded by the
+-- service's own limits (32 job records; a profile or a configuration built from a 2 MiB buffer each), so their signal is below the needed one; what
+-- gives them their power is the control (with the copy undone the service retains megabytes a job, orders of magnitude above the bound), and the
+-- samples printed above this line.
+retention ∷ String → Int → Double → Double → Expectation
+retention name k perInstance bound = do
+  putStrLn ("memory retention signal | " <> name <> " | instances " <> show k <> " | signal " <> show (round (perInstance * fromIntegral k) ∷ Integer) <> " | needed by a sound row " <> show (round neededSignal ∷ Integer) <> " | bound per instance " <> show (round bound ∷ Integer))
+  perInstance `shouldSatisfy` (> 0)
+  perInstance `shouldSatisfy` (<= bound)
 
 -- | Wait until both workers are blocked in their wait for work (observed, no timer): nothing of a finished job is held by a
 -- worker's frame any more.
