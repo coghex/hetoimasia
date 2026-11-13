@@ -27,6 +27,8 @@ module Hetoimasia.Terrain.Runtime
   , ConfigError (..)
   , defaultConfig
   , Ports (..)
+  , StoragePort
+  , storagePort
   , SessionAdmission (..)
   , alwaysAdmitting
   , Supervisor (..)
@@ -166,7 +168,6 @@ import Hetoimasia.Foundation.Resource (withResource)
 import Hetoimasia.Foundation.Worker (StartOutcome (..), WorkerGroup, awaitCompletion, requestStop, startWorker)
 import Hetoimasia.Terrain.Cell (Column (..), ZRange)
 import qualified Data.Set as Set
-import Hetoimasia.Terrain.Changes (Changes, changesBytes)
 import Hetoimasia.Terrain.Coordinate (RegionCoord, TileCoord (..), decomposeTile)
 import Hetoimasia.Terrain.Query (defaultQueryLimits)
 import qualified Hetoimasia.Terrain.Residency as R
@@ -181,6 +182,14 @@ import Hetoimasia.Terrain.Runtime.Internal.Owner (ownerDefinition)
 import Hetoimasia.Terrain.Runtime.Internal.Snapshot
 import Hetoimasia.Terrain.Runtime.Internal.Types
 import Hetoimasia.Terrain.Runtime.Settlement
+import Hetoimasia.Terrain.Runtime.Backed.Port (StoragePort (..), storagePort)
+import qualified Hetoimasia.Terrain.Runtime.Storage.Internal.Service as Storage
+import Hetoimasia.Terrain.Runtime.Store.Internal.Admission (EditBankSpec (..), defaultEditBankSpec, mkEditBankConfig, newAdmission)
+import Hetoimasia.Terrain.Runtime.Store.Internal.Model (Condition (..), Usage (..), conditions, usage)
+import Hetoimasia.Terrain.Runtime.Store.Internal.State (defaultStoreSpec, mkStoreConfig)
+import Hetoimasia.Terrain.Connectivity (defaultConnectivityLimits)
+import qualified Hetoimasia.Terrain.Discovery as D
+import Hetoimasia.Terrain.Discovery (defaultDiscoveryLimits)
 import Hetoimasia.Terrain.Source (SourceSpec, defaultSourceLimits)
 
 -- | The approved host profile: four arenas, 64 leases and eight views, with
@@ -198,6 +207,10 @@ defaultConfig =
     , configFirstIdentity = 0
     , configFirstRevision = 0
     , configRetainedBytes = 16 * 1024 * 1024
+    , configStore = defaultStoreSpec
+    , configEditBank = defaultEditBankSpec
+    , configConnectivity = defaultConnectivityLimits
+    , configDiscovery = defaultDiscoveryLimits
     }
 
 -- | What the service borrows. Each is narrow: the parent session's admission as
@@ -208,6 +221,9 @@ data Ports = Ports
   , portSupervisor ∷ !Supervisor
   , portLogger ∷ !Logger
   , portProbe ∷ !Probe
+  , -- | Where and how the arenas' private files are kept: the storage backend runs inside
+    -- the service's own scope, its two workers in this port's group.
+    portStorage ∷ !StoragePort
   }
 
 -- | A session that is always open.
@@ -238,8 +254,19 @@ standaloneSupervisor group = Supervisor $ \definition →
 -- the body, outside any uninterruptible release, and it has no deadline: a
 -- borrower that never returns keeps the service, and so its dependencies, alive.
 withTerrainService ∷ Config → Ports → (Service → IO a) → IO a
-withTerrainService config ports body =
-  withResource acquire (\svc → atomically (closeServiceSTM svc)) $ \svc →
+withTerrainService config ports body = do
+  -- Everything the configuration says is validated before anything starts: the store's
+  -- allowance, the edit bank's division (for the configured arenas) and the model's banks with
+  -- the snapshot and compile accounts carved out.
+  storeConfig <- either (throwIO . ConfigStore) pure (mkStoreConfig (configStore config))
+  editBank <- either (throwIO . ConfigEditBank) pure (mkEditBankConfig (configEditBank config) {ebsArenas = toInteger (configMaxArenas config)})
+  limits <- either throwIO pure (modelLimitsChecked config)
+  bank <- newTVarIO (newAdmission editBank)
+  -- The storage backend's scope encloses the service's: the owner drains and closes its
+  -- arenas' files first, then the backend closes whatever is left, joins its workers and
+  -- composes its kept failures into this scope's end.
+  Storage.withStorageService (Storage.StoragePorts bank (spGroup sp) (portLogger ports) (spSeam sp) (spConfig sp)) $ \storage →
+   withResource (acquire limits storage bank storeConfig) (\svc → atomically (closeServiceSTM svc)) $ \svc →
     -- Everything from the owner's start to the end of the drain is masked, so
     -- there is no window between a started owner and the drain that will join it:
     -- the start's own wait is interruptible, and the foundation's start drains a
@@ -260,11 +287,11 @@ withTerrainService config ports body =
         Right result → maybe (pure result) rethrowIO late
         Left primary → rethrowIO (primary ∷ ExceptionWithContext SomeException)
   where
-    acquire = do
+    sp = portStorage ports
+    acquire limits storage bank storeConfig = do
       tag <- newUnique
-      limits <- either (throwIO . ConfigError) pure (modelLimitsFor config)
       var <- newTVarIO (initialState config limits)
-      pure (Service tag var config (portAdmission ports) (portLogger ports) (portProbe ports))
+      pure (Service tag var config (portAdmission ports) (portLogger ports) (portProbe ports) storage bank (spDirectory sp) storeConfig (compileBankFor (configMaxArenas config) (configConnectivity config)))
     -- Close admission, ask the owner to stop, and wait for both proofs: the
     -- owner's worker has published its terminal outcome, and no borrower is
     -- outstanding. There is no deadline and no detach. Any exception received
@@ -495,7 +522,7 @@ inspectCensusSTM ∷ Service → STM Census
 inspectCensusSTM svc = do
   st <- readSt svc
   let arenaRows retiring arenas =
-        [ ArenaCensus aid retiring (regionBytesOf (arenaResident a)) (fromIntegral (changesBytes (arenaChanges a)))
+        [ ArenaCensus aid retiring (regionBytesOf (arenaResident a)) 0
         | (aid, a) ← Map.toList arenas
         ]
       -- What the detail itself holds in each vertical region: the fixed metadata of a
@@ -542,18 +569,20 @@ inspectSnapshotBytes svc = do
   st <- readTVarIO (serviceState svc)
   pure (retainedBankUse st, configRetainedBytes (serviceConfig svc))
 
--- | A read-only view of an arena's contents.
+-- | A read-only view of an arena's contents: its committed authority (content, knowledge and
+-- store revisions), its residency generation, its resident detail and palette, and its store's
+-- usage. No history: every removal is in the arena's store, not in RAM.
 data ArenaView = ArenaView
   { viewIncarnation ∷ !ArenaId
   , viewRevision ∷ !Revision
+  , viewKnowledgeRevision ∷ !Revision
+  , viewStoreRevision ∷ !Revision
   , viewGeneration ∷ !Word
-  , viewChanges ∷ !Changes
   , viewResident ∷ !Resident
   , viewPalette ∷ !Palette
-  , -- | The retained store: changes whose transfer succeeded.
-    viewStore ∷ !Changes
-  , -- | The regions whose changes are committed but not yet transferred.
-    viewWorking ∷ ![RegionCoord]
+  , viewUsage ∷ !Usage
+  , -- | The conditions that pause the arena's new history.
+    viewPaused ∷ ![Condition]
   }
 
 inspectArena ∷ Service → ArenaLease → IO (Maybe ArenaView)
@@ -566,6 +595,6 @@ inspectArenaSTM svc lease = do
   st <- readSt svc
   pure $ case leaseOf svc lease st of
     Right (_, ls) →
-      (\a → ArenaView (leaseArena ls) (arenaRevision a) (fromIntegral (arenaGeneration a)) (arenaChanges a) (arenaResident a) (arenaPalette a) (arenaStore a) (Map.keys (arenaWorking a)))
+      (\a → let auth = arenaAuthority a in ArenaView (leaseArena ls) (D.authContent auth) (D.authKnowledge auth) (D.authStore auth) (fromIntegral (arenaGeneration a)) (arenaResident a) (arenaPalette a) (usage (arenaStore a)) (conditions (arenaStore a)))
         <$> Map.lookup (leaseArena ls) (stateArenas st)
     Left _ → Nothing

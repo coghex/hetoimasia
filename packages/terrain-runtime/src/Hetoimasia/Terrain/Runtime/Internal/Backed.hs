@@ -1,0 +1,588 @@
+-- | The terrain owner's backed work (TRA-22): opening an arena (compilation, reservation),
+-- pinned reads of removed runs (a request's staging, a load job's detail), the session's one
+-- mutating transaction and the drain and close of a closed arena's file.
+--
+-- == One step at a time
+--
+-- Every function here is ONE bounded step the owner takes between its waits, called MASKED:
+-- it reads the state in one transaction, performs at most one effect of the storage backend
+-- (a submission, the taking of an outcome, a cancellation, the one native close) or one pure
+-- quantum (a compilation quantum, a planner run), and records the result in the next
+-- transaction. Neither transaction blocks, so no asynchronous exception can arrive between an
+-- effect and its record. A step never waits: what it waits for is its task's 'Wake', which
+-- the owner composes with every other source in its one selection transaction.
+--
+-- == Ownership
+--
+-- Each task is a record in the service state ('OpenTask', 'GatherTask', 'SlotTask',
+-- 'Closing''). A task whose request or arena has ended is not dropped: it is drained (its job
+-- cancelled and waited for, its pin released, its credits returned, a backing an open made
+-- anyway closed) and only then removed, so nothing the backend holds for it is orphaned.
+module Hetoimasia.Terrain.Runtime.Internal.Backed
+  ( -- * Configuration
+    gathersPerArena
+  , internalTurn
+
+    -- * What the owner supplies
+  , OwnerOps (..)
+
+    -- * The edit bank
+  , pinCredits
+  , releaseCredit
+
+    -- * Opening
+  , beginOpen
+  , stepOpen
+  , openOrderAllows
+  , openReady
+
+    -- * Gathers
+  , Gathered (..)
+  , canStartGather
+  , startGatherFor
+  , stepGatherTask
+
+    -- * The slot
+  , Contender (..)
+  , contenders
+  , grantSlot
+  , stepSlot
+  , SlotEnd (..)
+
+    -- * Pause
+  , pauseArena
+
+    -- * Closing
+  , drainReady
+  , closeDrained
+
+    -- * Shared
+  , closingOf
+  , storeOfArena
+  , changeLimitsOf
+  , changesOfRuns
+  ) where
+
+import Control.Concurrent.STM
+import Control.Exception (evaluate)
+import Control.Monad (forM_, void, when)
+import Data.Int (Int64)
+import Data.List (sortOn)
+import qualified Data.Map.Strict as Map
+import qualified Data.Set as Set
+import Data.Text (Text)
+import qualified Data.Text as Text
+import Data.Word (Word64)
+import Hetoimasia.Terrain.Cell (Column (..), mkZRange)
+import Hetoimasia.Terrain.Changes (ChangeLimits (..), Changes, changesFromIntervals)
+import qualified Hetoimasia.Terrain.Connectivity as C
+import Hetoimasia.Terrain.Coordinate (TileCoord)
+import qualified Hetoimasia.Terrain.Discovery as D
+import qualified Hetoimasia.Terrain.Residency as R
+import Hetoimasia.Terrain.Residency (ArenaId (..), RequestId, Revision (..))
+import Hetoimasia.Terrain.Runtime.Backed.Backend
+import Hetoimasia.Terrain.Runtime.Backed.Fault
+import Hetoimasia.Terrain.Runtime.Backed.Gather
+import Hetoimasia.Terrain.Runtime.Backed.Txn (Done (..), Io (..), Progress (..))
+import qualified Hetoimasia.Terrain.Runtime.Backed.Txn as Txn
+import Hetoimasia.Terrain.Runtime.Internal.Content (Prepared (..))
+import Hetoimasia.Terrain.Runtime.Internal.Core
+import Hetoimasia.Terrain.Runtime.Internal.Types hiding (OwnerPhase (..))
+import Hetoimasia.Terrain.Runtime.Storage.Internal.Service
+  ( Backing
+  , OpenSpec (..)
+  , awaitTicket
+  , cancelTicket
+  , closeBacking
+  , discardTicket
+  , pollTicket
+  , submitOpen
+  , withOutcome
+  )
+import Hetoimasia.Terrain.Runtime.Storage.Internal.Types (WorkClass (..))
+import qualified Hetoimasia.Terrain.Runtime.Store.Internal.Admission as A
+import Hetoimasia.Terrain.Runtime.Store.Internal.Admission (Admission, Grant)
+import Hetoimasia.Terrain.Runtime.Store.Internal.Format (PageNo, StoreIdentity (..))
+import Hetoimasia.Terrain.Runtime.Store.Internal.Model (Condition (..), Store, TxnId, conditions, oldestPin, pauseFor, storeFromRoots, storeHeader, storeRoots, storeVersion)
+import Hetoimasia.Terrain.Runtime.Store.Internal.Plan (Plan)
+import Hetoimasia.Terrain.Runtime.Store.Internal.Protocol (discoveryPlanner, maintenancePlanner, removalPlanner)
+import Hetoimasia.Terrain.Runtime.Store.Internal.State (Roots (..), StoreConfig, emptyRoots, maxReaders)
+import Hetoimasia.Terrain.Source (Source)
+
+-- ---------------------------------------------------------------------------
+-- Configuration
+
+-- | The pinned reads one arena may have in flight: the readers its store may pin.
+gathersPerArena ∷ Int
+gathersPerArena = maxReaders
+
+-- | The fairness rule of the slot: while explicit work waits, internal work (discovery,
+-- reclamation) gets one grant after every 'internalTurn' explicit grants.
+internalTurn ∷ Int
+internalTurn = 3
+
+changeLimitsOf ∷ Config → ChangeLimits
+changeLimitsOf config =
+  ChangeLimits (fromInteger (min (toInteger (maxBound ∷ Int)) (toInteger (R.limitBytes (configLimits config) R.EditBank `div` 16))))
+
+-- | What the owner supplies to the steps here: its staging (which tells the host), and its end
+-- with a defect (which records it and reaches supervision).
+data OwnerOps = OwnerOps
+  { opsStage ∷ RequestId → Maybe ArenaId → Revision → StagedWork → IO ()
+  , opsDefect ∷ ∀ a. Defect → IO a
+  }
+
+-- ---------------------------------------------------------------------------
+-- The edit bank
+
+-- | A gather's pin: the pages one reader may pin, charged to the cache account before the pin
+-- is taken.
+pinCredits ∷ ArenaId → [A.Credit]
+pinCredits aid = [A.CacheCredit aid A.readerPinnedCacheBytes A.Backed True]
+
+-- | Give a grant back: its staging and control, and its cache entries (unpinned, then dropped).
+releaseCredit ∷ Grant → Admission → Admission
+releaseCredit g adm0 = foldr dropOne (A.release g adm0) (A.grantEntries g)
+  where
+    dropOne entry adm = either (const (A.unpinEntry entry adm)) id (A.dropEntry entry (A.unpinEntry entry adm))
+
+-- ---------------------------------------------------------------------------
+-- Shared
+
+-- | Whether the owner is closing an arena: a backing that closes or a service that stops is
+-- then the owner's own doing, and a defect otherwise.
+closingOf ∷ St → ArenaId → Closing
+closingOf st aid
+  | statePhase st == Closing = OwnerClosing
+  | Map.member aid (stateClosing st) = OwnerClosing
+  | otherwise = OwnerRunning
+
+-- | The store and backing of an arena, live or closing.
+storeOfArena ∷ St → ArenaId → Maybe (Store, Backing)
+storeOfArena st aid = case Map.lookup aid (stateArenas st) of
+  Just a → Just (arenaStore a, arenaBacking a)
+  Nothing → (\c → (closingStore c, closingBacking c)) <$> Map.lookup aid (stateClosing st)
+
+-- | Write an arena's store, live or closing.
+putStore ∷ ArenaId → Store → St → St
+putStore aid store st =
+  st
+    { stateArenas = Map.adjust (\a → a {arenaStore = store}) aid (stateArenas st)
+    , stateClosing = Map.adjust (\c → c {closingStore = store}) aid (stateClosing st)
+    }
+
+-- | The removals a gather read, as the pure terrain model's changes.
+changesOfRuns ∷ Config → [(Column, Int64, Int64)] → Either Text Changes
+changesOfRuns config runs = do
+  intervals ← traverse interval runs
+  either (Left . Text.pack . show) Right (changesFromIntervals (changeLimitsOf config) intervals)
+  where
+    interval (column, lo, hi) = either (Left . Text.pack . show) (\r → Right (column, r)) (mkZRange (toInteger lo) (toInteger hi))
+
+-- ---------------------------------------------------------------------------
+-- Pause
+
+-- | Record a pause of an arena (requirement 8): the store pauses new history for the
+-- condition, the fault is kept for the creator's retry, and every uncommitted user mutation
+-- of the arena settles once with the fault. The last committed roots, terrain, knowledge and
+-- frontier are untouched.
+pauseArena ∷ Service → ArenaId → Condition → StorageFault → [PageNo] → STM ()
+pauseArena svc aid condition fault pages = do
+  st ← readSt svc
+  forM_ (Map.lookup aid (stateArenas st)) $ \arena → do
+    let record = FaultRecord fault (take faultPagesKept pages)
+    modifySt svc $ \s →
+      s
+        { stateArenas =
+            Map.insert
+              aid
+              arena
+                { arenaStore = pauseFor condition (arenaStore arena)
+                , arenaFaults = Map.insertWith (\_ old → old) condition record (arenaFaults arena)
+                }
+              (stateArenas s)
+        }
+    forM_ [rid | (rid, req) ← Map.toList (stateRequests st), reqArena req == Just aid, isPendingRemoval req] $ \rid →
+      terminate svc rid (Failed (StorageFailed fault))
+  where
+    isPendingRemoval req = case (reqCmd req, reqPhase req) of
+      (CRemove {}, Done) → False
+      (CRemove {}, _) → True
+      _ → False
+
+-- ---------------------------------------------------------------------------
+-- Opening
+
+-- | Begin an open: it waits for the session's one compilation.
+beginOpen ∷ Service → RequestId → Source → STM ()
+beginOpen svc rid source =
+  modifySt svc (\st → if Map.member rid (stateOpens st) then st else st {stateOpens = Map.insert rid (OpenTask source OpenQueued) (stateOpens st)})
+
+-- | Opens publish in the order their incarnations were allocated (the accounting model's
+-- incarnations increase): an open waits while an earlier one is still being prepared.
+openOrderAllows ∷ St → ArenaId → Bool
+openOrderAllows st aid =
+  null
+    [ ()
+    | task ← Map.elems (stateOpens st)
+    , Just other ← [openArenaOf (openPhase task)]
+    , other < aid
+    ]
+  where
+    openArenaOf = \case
+      OpenReserving a _ _ _ _ _ → Just a
+      OpenPublishable a _ _ _ _ → Just a
+      OpenQueued → Nothing
+      OpenCompiling {} → Nothing
+      OpenUnwinding {} → Nothing
+
+-- | An open whose file is reserved and whose store is ready, waiting for its publication: what
+-- the open's commit installs.
+openReady ∷ St → RequestId → Maybe (ArenaId, D.Env, Word64, Backing, Store)
+openReady st rid = case openPhase <$> Map.lookup rid (stateOpens st) of
+  Just (OpenPublishable aid env shared backing store) → Just (aid, env, shared, backing, store)
+  _ → Nothing
+
+-- | One step of an open.
+stepOpen ∷ Service → OwnerOps → RequestId → IO ()
+stepOpen svc ops rid = do
+  st ← atomically (readSt svc)
+  let alive = Map.member rid (stateRequests st)
+      config = serviceConfig svc
+      limits = configConnectivity config
+      peak = fromIntegral (C.limitPeakBytes limits) ∷ Word64
+      setPhase task phase = modifySt svc (\s → s {stateOpens = Map.insert rid task {openPhase = phase} (stateOpens s)})
+  forM_ (Map.lookup rid (stateOpens st)) $ \task → case openPhase task of
+    OpenQueued
+      | not alive → atomically (dropOpen svc rid 0)
+      | stateCompiling st /= Nothing → pure ()
+      | otherwise → atomically $ do
+          modifySt svc (\s → s {stateCompiling = Just rid, stateCompileUse = stateCompileUse s + peak})
+          setPhase task (OpenCompiling (C.startPreparation limits (openSource task)) peak)
+    OpenCompiling preparation held
+      | not alive → atomically (dropOpen svc rid held)
+      | otherwise →
+          evaluate (C.resumePreparation (C.limitQuantumSteps limits) preparation) >>= \case
+            Left why → failOpen held (Text.pack ("a compilation quantum was refused: " <> show why))
+            Right (C.Pending next) → atomically (setPhase task (OpenCompiling next held))
+            Right (C.Refused (C.Complexity refusal) _) → do
+              let fault = FaultComplexity (Text.pack (show (C.refusedResource refusal))) (fromInteger (C.refusedNeeded refusal)) (fromInteger (C.refusedLimit refusal))
+              atomically (dropOpen svc rid held >> terminate svc rid (Failed (StorageFailed fault)))
+            Right (C.Refused other _) → failOpen held (Text.pack ("the source compiler refused a valid source: " <> show other))
+            Right (C.Complete conn _) → do
+              env ← evaluate (D.mkEnv (configDiscovery config) (openSource task) conn)
+              shared ← evaluate (fromInteger (D.envSharedBytes env) ∷ Word64)
+              if shared > perArenaShared limits
+                then failOpen held (Text.pack ("a compiled arena holds more than its account: " <> show shared))
+                else do
+                  (aid, ident) ← atomically $ do
+                    s ← readSt svc
+                    let aid = ArenaId (stateNextArena s)
+                    writeTVar (serviceState svc) s {stateNextArena = stateNextArena s + 1, stateNextSource = stateNextSource s + 1}
+                    pure (aid, StoreIdentity aid (stateNextSource s))
+                  submitOpen (serviceStorage svc) ExplicitWork (OpenSpec (serviceDirectory svc) ident (serviceStoreConfig svc)) >>= \case
+                    Left failure → finish held (classifyFailure OwnerRunning JkOpen failure)
+                    Right ticket → atomically $ do
+                      modifySt svc $ \s →
+                        s {stateCompiling = Nothing, stateCompileUse = stateCompileUse s - held + shared}
+                      setPhase task (OpenReserving aid ident env shared ticket (WakeOn (awaitTicket (serviceStorage svc) ticket)))
+    OpenReserving aid ident env shared ticket _
+      | not alive → do
+          _ ← cancelTicket (serviceStorage svc) ticket
+          atomically (setPhase task (OpenUnwinding shared (Just ticket) (WakeOn (awaitTicket (serviceStorage svc) ticket))))
+      | otherwise → do
+          finished ← atomically (pollTicket (serviceStorage svc) ticket)
+          when finished $
+            withOutcome (serviceStorage svc) ticket (\outcome → evaluate $! reactTo OwnerRunning JkOpen outcome) >>= \case
+              Just (GotBacking backing _) → do
+                store ← evaluate (initialStore config aid ident (serviceStoreConfig svc))
+                atomically (setPhase task (OpenPublishable aid env shared backing store))
+                -- the open is staged: the host is told, and its commit installs the arena
+                opsStage ops rid Nothing (Revision (configFirstRevision config)) StagedControl
+              Just (GotFailure handling _) → finish shared handling
+              Just (GotCancelled _) → finish shared (classifyUnaskedCancel OwnerRunning)
+              Just (GotMismatch why) → failOpen shared why
+              Just other → failOpen shared (Text.pack ("an open answered " <> show other))
+              Nothing → failOpen shared "a finished open named a ticket the service does not hold"
+    OpenPublishable _ _ shared backing _
+      | alive → pure ()
+      | otherwise → do
+          -- the request ended before its commit: the reserved file is closed, nothing is published
+          _ ← closeBacking (serviceStorage svc) backing
+          atomically (dropOpen svc rid shared)
+    OpenUnwinding shared ticket _ → case ticket of
+      Nothing → atomically (dropOpen svc rid shared)
+      Just t → do
+        finished ← atomically (pollTicket (serviceStorage svc) t)
+        when finished $ do
+          late ← withOutcome (serviceStorage svc) t (\outcome → evaluate $! reactTo OwnerClosing JkOpen outcome)
+          case late of
+            Just (GotBacking backing _) → void (closeBacking (serviceStorage svc) backing)
+            Just _ → pure ()
+            Nothing → discardTicket (serviceStorage svc) t
+          atomically (dropOpen svc rid shared)
+  where
+    failOpen held why = do
+      atomically (dropOpen svc rid held >> terminate svc rid (Failed (HostFailure why)))
+      opsDefect ops (OwnerDefect why)
+    finish held handling = case handling of
+      HandleDomain fault → atomically (dropOpen svc rid held >> terminate svc rid (Failed (StorageFailed fault)))
+      HandlePause _ fault → atomically (dropOpen svc rid held >> terminate svc rid (Failed (StorageFailed fault)))
+      HandleClosing → atomically (dropOpen svc rid held)
+      HandleDefect why → failOpen held why
+      HandlePausedFor _ → failOpen held "an open answered a pause"
+      HandleRetryLater busy → failOpen held (Text.pack ("an open was refused as busy: " <> show busy))
+      HandleSerialize → failOpen held "an open was serialised"
+      HandleReplan → failOpen held "an open answered replan"
+      HandleWaitReclaim _ _ → failOpen held "an open answered reclamation"
+
+-- | End an open's task: its compile charge and the session's compilation return.
+dropOpen ∷ Service → RequestId → Word64 → STM ()
+dropOpen svc rid held = do
+  modifySt svc $ \s →
+    s
+      { stateOpens = Map.delete rid (stateOpens s)
+      , stateCompiling = if stateCompiling s == Just rid then Nothing else stateCompiling s
+      , stateCompileUse = stateCompileUse s - min held (stateCompileUse s)
+      }
+  markFreed svc
+
+-- | A new arena's store: empty roots, its content, knowledge and store revisions starting at the
+-- configured first revision. The roots are the store's own empty roots with only the header's
+-- authority set ('storeFromRoots' checks nothing, and nothing here needs checking: no page exists).
+initialStore ∷ Config → ArenaId → StoreIdentity → StoreConfig → Store
+initialStore config aid ident cfg =
+  let first = Revision (configFirstRevision config)
+      roots = emptyRoots aid
+   in storeFromRoots cfg ident roots {rHeader = (rHeader roots) {D.hAuthority = D.Authority aid first first first}}
+
+-- ---------------------------------------------------------------------------
+-- Gathers
+
+-- | How a gather ended, for its owner. Its pin and credit are already released.
+data Gathered
+  = -- | Every run of the columns, read from one committed version, with that version's
+    -- content revision.
+    GatheredRuns ![(Column, Int64, Int64)] !Revision
+  | GatheredFailed !Handling
+  | -- | Cancelled and drained: nothing to deliver.
+    GatheredNothing
+
+-- | Whether a gather for an arena can start now: the arena is live, it has a pin to spare,
+-- and the edit bank grants the pin's credit.
+canStartGather ∷ St → Admission → ArenaId → Bool
+canStartGather st adm aid =
+  Map.member aid (stateArenas st)
+    && length [() | t ← Map.elems (stateGathers st), gatherArena t == aid] < gathersPerArena
+    && either (const False) (const True) (A.reserve A.Foreground (pinCredits aid) adm)
+
+-- | Start a gather of some columns: the pin's credit is secured BEFORE the pin is taken; no
+-- credit, no pin. False when nothing was started.
+startGatherFor ∷ Service → GatherFor → ArenaId → [Column] → STM Bool
+startGatherFor svc key aid columns = do
+  st ← readSt svc
+  adm ← readTVar (serviceEditBank svc)
+  case Map.lookup aid (stateArenas st) of
+    Just arena
+      | not (Map.member key (stateGathers st))
+      , canStartGather st adm aid
+      , Right (grant, adm') ← A.reserve A.Foreground (pinCredits aid) adm
+      , Right (store', g) ← startGather (arenaStore arena) columns → do
+          writeTVar (serviceEditBank svc) adm'
+          writeTVar (serviceState svc) (putStore aid store' st) {stateGathers = Map.insert key (GatherTask aid g grant WakeNow) (stateGathers st)}
+          pure True
+    _ → pure False
+
+-- | One step of a gather. When it ends, its pin and credit are released in the transaction that
+-- removes it, and then its owner is given the result.
+stepGatherTask ∷ Service → GatherFor → (Gathered → IO ()) → IO ()
+stepGatherTask svc key deliver = do
+  st ← atomically (readSt svc)
+  forM_ (Map.lookup key (stateGathers st)) $ \task →
+    forM_ (storeOfArena st (gatherArena task)) $ \(store, backing) → do
+      let aid = gatherArena task
+          io = Io (serviceStorage svc) backing ExplicitWork
+          wanted = ownerAlive st && Map.member aid (stateArenas st)
+      (g, progress) ←
+        if wanted
+          then stepGather io (closingOf st aid) store (gatherRun task)
+          else cancelGather io (gatherRun task)
+      let keep wake = atomically (modifySt svc (\s → s {stateGathers = Map.adjust (\t → t {gatherRun = g, gatherWake = wake}) key (stateGathers s)}))
+          end result = do
+            atomically $ do
+              s ← readSt svc
+              forM_ (storeOfArena s aid) $ \(current, _) →
+                writeTVar (serviceState svc) (putStore aid (endGather current g) s) {stateGathers = Map.delete key (stateGathers s)}
+              modifyTVar' (serviceEditBank svc) (releaseCredit (gatherGrant task))
+              markFreed svc
+            deliver result
+      case progress of
+        GMore → keep WakeNow
+        GBlocked wait → keep (WakeOn wait)
+        GDone runs → end (GatheredRuns runs (contentAt store g))
+        GFailed handling → end (GatheredFailed handling)
+        GDrained → end GatheredNothing
+  where
+    ownerAlive st = case key of
+      GatherRequest rid → Map.member rid (stateRequests st)
+      GatherJob jid → any (\j → R.jobId j == jid && R.jobPhase j == R.JobRunningPhase) (R.modelJobs (stateModel st))
+    -- the content revision of the version the gather pinned: the committed one, since a gather
+    -- that saw another commit is stale and its result is tagged with the version it read
+    contentAt store g
+      | gatherVersion g == storeVersion store = D.authContent (D.hAuthority (storeHeader store))
+      | otherwise = Revision maxBound
+
+-- ---------------------------------------------------------------------------
+-- The slot
+
+-- | Who may take the session's slot.
+data Contender
+  = ContendRemoval !RequestId !ArenaId !TileCoord
+  | ContendDiscovery !ArenaId
+  | ContendReclaim !ArenaId
+  deriving stock (Eq, Show)
+
+-- | The work that may take the slot now, in grant order: the eligible explicit removals (each
+-- staged as changing content, staged at the arena's current content revision) in admission
+-- order across every arena, and the internal work of every unpaused arena. Reads every
+-- explicit removal's 'endpointEligible'. The fairness rule decides between the two lists.
+contenders ∷ St → STM [Contender]
+contenders st = do
+  explicit ← fmap concat . traverse eligibleRemoval $ sortOn (reqSeq . snd) (Map.toList (stateRequests st))
+  let internal = concatMap internalOf (Map.toList (stateArenas st))
+  pure $ case (explicit, internal) of
+    ([], _) → internal
+    (_, []) → explicit
+    (e : _, i : _)
+      | stateExplicitRun st >= internalTurn → [i, e]
+      | otherwise → [e, i]
+  where
+    eligibleRemoval (rid, req) = case (reqCmd req, reqPhase req, reqArena req >>= \aid → (,) aid <$> Map.lookup aid (stateArenas st)) of
+      (CRemove tile _, StagedPhase sg, Just (aid, arena))
+        | StagedRemoval prepared ← stagedWork sg
+        , preparedChanged prepared
+        , stagedRevision sg == arenaRevision arena
+        , null (conditions (arenaStore arena)) → do
+            eligible ← endpointEligible (reqEndpoint req)
+            pure [ContendRemoval rid aid tile | eligible]
+      _ → pure []
+    internalOf (aid, arena)
+      | not (null (conditions (arenaStore arena))) = [ContendReclaim aid | reclaimWanted aid arena, not (integrityPaused arena)]
+      | otherwise = [ContendReclaim aid | reclaimWanted aid arena] <> [ContendDiscovery aid | discoveryWanted aid arena]
+    integrityPaused arena = CondIntegrity `elem` conditions (arenaStore arena)
+    store = arenaStore
+    reclaimWanted aid arena =
+      Set.member aid (stateNeedsMaintenance st)
+        || (rootsRetired (store arena) > 0 && not (idle (aid, True) arena))
+    discoveryWanted aid arena =
+      D.pendingObligations (storeHeader (store arena)) > 0 && not (idle (aid, False) arena)
+    idle key arena = Map.lookup key (stateInternalIdle st) == Just (storeVersion (store arena), oldestPin (store arena))
+    rootsRetired s = rRetiredPages (storeRoots s)
+
+-- | Grant the slot: the transaction's worst-case credits are reserved first (Foreground: the
+-- protected staging is its own; the cache it needs beside every reader pin is what the edit
+-- bank's configuration was validated for), then the run starts planning against the committed
+-- store. False when the credits are not available now: the grant waits for the cache the
+-- readers' pins hold, which never wait for the slot.
+grantSlot ∷ Service → Contender → STM Bool
+grantSlot svc contender = do
+  st ← readSt svc
+  adm ← readTVar (serviceEditBank svc)
+  let aid = case contender of
+        ContendRemoval _ a _ → a
+        ContendDiscovery a → a
+        ContendReclaim a → a
+  case (stateSlot st, Map.lookup aid (stateArenas st)) of
+    (Nothing, Just arena) → case A.reserve A.Foreground (A.transactionCredits aid A.worstTransactionCharge) adm of
+      Left _ → pure False
+      Right (grant, adm') → do
+        let env = arenaEnv arena
+            store = arenaStore arena
+            (work, planner) = case contender of
+              ContendRemoval rid _ tile → (SlotRemoval rid, removalPlanner env store tile)
+              ContendDiscovery _ → (SlotDiscovery, discoveryPlanner env store)
+              ContendReclaim _ → (SlotReclaim, maintenancePlanner store)
+        writeTVar (serviceEditBank svc) adm'
+        writeTVar (serviceState svc) st {stateSlot = Just (SlotTask aid work (Txn.start store planner) (Just grant) WakeNow False), stateNeedsMaintenance = Set.delete aid (stateNeedsMaintenance st)}
+        pure True
+    _ → pure False
+
+-- | Where a step left the slot's transaction, for the owner.
+data SlotEnd
+  = -- | Still running (the slot is recorded with its new wait).
+    SlotGoesOn
+  | -- | Every page is written: the owner prepares and makes the decision.
+    SlotEligible !SlotTask !TxnId !Plan
+  | -- | The transaction ended without publishing; its slot and credits are already released.
+    SlotOver !SlotTask !Done
+
+-- | One step of the slot's transaction: a step of its run, or, when its request or arena has
+-- ended, a step of its cancellation (nothing is released until the job in flight has returned).
+-- When it ends without publishing, the slot and its credits are released in the transaction that
+-- records the end.
+stepSlot ∷ Service → IO SlotEnd
+stepSlot svc = do
+  st ← atomically (readSt svc)
+  case stateSlot st of
+    Nothing → pure SlotGoesOn
+    Just task → case storeOfArena st (slotArena task) of
+      Nothing → pure SlotGoesOn
+      Just (store, backing) → do
+        let aid = slotArena task
+            io = Io (serviceStorage svc) backing (classOf (slotWork task))
+            wanted = Map.member aid (stateArenas st) && requestAlive st (slotWork task) && not (slotYield task)
+        (store', run', progress) ←
+          if wanted
+            then Txn.advance io (closingOf st aid) store (slotRun task)
+            else Txn.cancel io store (slotRun task)
+        let task' = task {slotRun = run'}
+            keep wake = atomically (modifySt svc (\s → (putStore aid store' s) {stateSlot = Just task' {slotWake = wake}}))
+        case progress of
+          More → keep WakeNow >> pure SlotGoesOn
+          Blocked wait → keep (WakeOn wait) >> pure SlotGoesOn
+          ReadyToPublish tid plan → keep WakeNow >> pure (SlotEligible task' tid plan)
+          Finished done → do
+            atomically $ do
+              modifySt svc (\s → (putStore aid store' s) {stateSlot = Nothing})
+              forM_ (slotCredit task) $ \g → modifyTVar' (serviceEditBank svc) (releaseCredit g)
+              markFreed svc
+            pure (SlotOver task' done)
+  where
+    requestAlive st = \case
+      SlotRemoval rid → Map.member rid (stateRequests st)
+      SlotGrowth rid → Map.member rid (stateRequests st)
+      SlotDiscovery → True
+      SlotReclaim → True
+    classOf = \case
+      SlotRemoval _ → ExplicitWork
+      SlotGrowth _ → ExplicitWork
+      SlotDiscovery → MaintenanceWork
+      SlotReclaim → MaintenanceWork
+
+-- ---------------------------------------------------------------------------
+-- Closing
+
+-- | A closed arena whose file can be closed now: nothing of it is in flight.
+drainReady ∷ St → ArenaId → Bool
+drainReady st aid =
+  maybe True ((/= aid) . slotArena) (stateSlot st)
+    && not (any ((== aid) . gatherArena) (Map.elems (stateGathers st)))
+
+-- | Close a drained arena's file (one bounded native call: nothing of it is in flight, so the
+-- close waits for nothing) and return its compile charge. A close that fails is kept by the
+-- storage service and reaches the service's end report; a held reservation stays counted on
+-- the volume until then.
+closeDrained ∷ Service → ArenaId → IO ()
+closeDrained svc aid = do
+  st ← atomically (readSt svc)
+  forM_ (Map.lookup aid (stateClosing st)) $ \c → do
+    _ ← closeBacking (serviceStorage svc) (closingBacking c)
+    atomically $ do
+      modifySt svc $ \s →
+        s
+          { stateClosing = Map.delete aid (stateClosing s)
+          , stateCompileUse = stateCompileUse s - min (closingShared c) (stateCompileUse s)
+          , stateInternalIdle = Map.filterWithKey (\(a, _) _ → a /= aid) (stateInternalIdle s)
+          , stateNeedsMaintenance = Set.delete aid (stateNeedsMaintenance s)
+          }
+      markFreed svc

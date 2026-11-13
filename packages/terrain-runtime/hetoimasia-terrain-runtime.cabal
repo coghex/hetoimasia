@@ -48,9 +48,11 @@ library
     -- The state, the transactions and the owner behind the public interface; a
     -- client cannot import them.
     other-modules:
+        Hetoimasia.Terrain.Runtime.Internal.Backed
         Hetoimasia.Terrain.Runtime.Internal.Content
         Hetoimasia.Terrain.Runtime.Internal.Core
         Hetoimasia.Terrain.Runtime.Internal.Owner
+        Hetoimasia.Terrain.Runtime.Internal.Publish
         Hetoimasia.Terrain.Runtime.Internal.Snapshot
         Hetoimasia.Terrain.Runtime.Internal.Types
     build-depends:
@@ -138,12 +140,14 @@ library backed
         Hetoimasia.Terrain.Runtime.Backed.Backend
         Hetoimasia.Terrain.Runtime.Backed.Fault
         Hetoimasia.Terrain.Runtime.Backed.Gather
+        Hetoimasia.Terrain.Runtime.Backed.Port
         Hetoimasia.Terrain.Runtime.Backed.Txn
     build-depends:
         base >=4.22 && <4.23,
         bytestring >=0.12 && <0.13,
         stm >=2.5.3 && <2.6,
         text >=2.1 && <2.2,
+        hetoimasia-foundation ==0.1.0.0,
         hetoimasia-terrain ==0.1.0.0,
         hetoimasia-terrain-runtime:storage,
         hetoimasia-terrain-runtime:store

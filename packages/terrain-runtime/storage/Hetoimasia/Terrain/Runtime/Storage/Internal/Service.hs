@@ -75,6 +75,7 @@ module Hetoimasia.Terrain.Runtime.Storage.Internal.Service
   , submitAbandon
   , submitReleasePending
   , commitBackingGrowth
+  , commitBackingGrowthSTM
 
     -- * Outcomes
   , Outcome (..)
@@ -1246,7 +1247,14 @@ submitReleasePending svc b = atomically $ do
 -- only now is the larger allowance spendable by this backend. The token must be the one this
 -- service's current preparation made.
 commitBackingGrowth ∷ StorageService → Backing → PreparedGrowth → IO (Either StorageFailure ())
-commitBackingGrowth svc b p = atomically $ do
+commitBackingGrowth svc b p = atomically (commitBackingGrowthSTM svc b p)
+
+-- | 'commitBackingGrowth' as the transaction it is, for the ONE caller that must commit the backend's
+-- cap in the same transaction as the store's cap and the creator's result: the terrain owner's
+-- publication decision (#665, requirement 9). It runs only inside that decision; every other caller
+-- uses 'commitBackingGrowth'. The body is unchanged: it was the body of 'commitBackingGrowth'.
+commitBackingGrowthSTM ∷ StorageService → Backing → PreparedGrowth → STM (Either StorageFailure ())
+commitBackingGrowthSTM svc b p = do
   s ← readTVar (svState svc)
   case lookBacking svc b s of
     Left f → pure (Left f)
