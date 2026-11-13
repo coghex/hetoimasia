@@ -3,7 +3,7 @@
 Design state: `exploring`
 
 This is the proposed contract for RTC-1 in the
-[runtime capability report](runtime_capabilities_findings.md#rtc-1-runtime-performance-evidence-lacks-a-correlated-engine-timeline).
+[deferred work list](deferred_work.md).
 The owner requested a documentation-only design discussion on 2026-09-23:
 no issue drafts, tracker changes, implementation, or delivery decomposition.
 The recommendations below are proposals, not approved behavior or delivered
@@ -249,7 +249,7 @@ RTC-1 remains unprocessed in the report; this proposal is not its completion.
 - [GHC 9.14.1 runtime eventlog options](https://downloads.haskell.org/ghc/9.14.1/docs/users_guide/runtime_control.html#rts-eventlog): event classes, timestamps, writer lifecycle and output configuration.
 - `Debug.Trace` in the locally installed GHC 9.14.1 / base 4.22.0.0 documentation: `traceEventIO` sequencing and `flushEventLog`. Exact installed HTML was inspected; no backend implementation has been qualified by this document.
 - [Perfetto supported external formats](https://perfetto.dev/docs/getting-started/other-formats): Chrome Trace Event JSON import.
-- [Current logging contract](logging.md), [time contract](time.md), and [runtime capability findings](runtime_capabilities_findings.md).
+- [Current logging contract](logging.md), [time contract](time.md), and [deferred work](deferred_work.md).
 
 
 ## Delivery plan

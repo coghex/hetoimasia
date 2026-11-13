@@ -104,3 +104,17 @@ records beside it under `<name>/evidence/`:
 
 A pull request that affects the Vulkan groups now puts its receipt summary in
 the pull request body; no record is added under `docs/vulkan/`.
+
+## Findings reports and the CI design — last present at `14d1f575` (removed 2026-11-13)
+
+Every processed finding became an issue that has since closed. The items
+still open are carried, condensed, in [deferred_work.md](deferred_work.md).
+
+| Path under `docs/` | What it was |
+| --- | --- |
+| `runtime_review_findings.md` | Low-level runtime review, 2026-09-20: RR-1 to RR-10; RR-8 and RR-9 carried |
+| `runtime_capabilities_findings.md` | Runtime capability review, 2026-09-22: RTC-1 to RTC-6; RTC-1, RTC-3, RTC-4, RTC-5 carried, RTC-6 folded into RR-9 |
+| `vulkan_backend_findings.md` | Vulkan backend capability review, 2026-09-22: VKR-1 to VKR-8; VKR-7 and VKR-8 carried |
+| `renderer_foundation_findings.md` | Renderer foundation goals: FND-3 carried; FND-4 delivered by the 2D renderer |
+| `glfw_upgrade_findings.md` | GLFW-UP-1, carried |
+| `ci_validation_design.md` | Lean CI, test selection and reusable validation, CI-1 to CI-5; delivered as `validation.md`, CI-5 carried |

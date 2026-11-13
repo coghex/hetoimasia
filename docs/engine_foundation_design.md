@@ -31,7 +31,7 @@ Unmerged implementation branches are not included as delivered capabilities.
 | GPU bookkeeping | [Pure GPU model](gpu_model.md): resource/generation holds, frame ownership, admission budgets and recovery accounting | Performs no Vulkan calls and cannot establish native completion; an owning backend must supply that evidence |
 | Vulkan qualification | The [Vulkan native suite](gpu_backend.md#the-native-suite), which carries the retired proof harness's cases, and retained [compatibility results](vulkan_compatibility_record.md) | Qualifies the [production backend](gpu_backend.md) delivered through #219–#232 rather than a separate harness; the multi-window triangle consumer and its final evidence remain in #233 |
 | Lua | [Private bridge behind an opaque public API](../packages/scripting-lua/README.md) for VM construction, chunks, calls and close, plus the pure task/protocol model | Public application capability registration, protected VM ownership and runtime scheduling/IPC are later slices; Linux and macOS confinement verdicts remain inconclusive |
-| Rendering contracts, 2D and 3D | Reserved component directories and ownership notes | No Cabal libraries or renderer implementations yet; see the [renderer findings](renderer_foundation_findings.md) |
+| Rendering contracts, 2D and 3D | Reserved component directories and ownership notes | No Cabal libraries or renderer implementations yet; see [deferred work](deferred_work.md), FND-3 |
 | Application | [Console entry point](../app/Main.hs) with logging and resource smoke paths | No graphical application or concrete game integration |
 
 The main [Cabal project](../cabal.project) includes the root package, foundation,
@@ -54,8 +54,8 @@ to these focused contracts and work queues:
 | --- | --- |
 | FND-1, CPU resource ownership | [Resource contract](resources.md), delivered through #22; no duplicate slice |
 | FND-2, Vulkan initialization and disposal | [Vulkan backend design](archive/vulkan_backend_design.md), epic #155; native proof #158 delivered; production instance, device and target ownership delivered by #219 ([contract](gpu_backend.md)) |
-| FND-3, minimal depth-tested 3D consumer | [Renderer foundation findings](renderer_foundation_findings.md), FND-3; needs focused refinement |
-| FND-4, independent textured 2D consumer | [Renderer foundation findings](renderer_foundation_findings.md), FND-4; needs focused refinement |
+| FND-3, minimal depth-tested 3D consumer | [Deferred work](deferred_work.md), FND-3; needs focused refinement |
+| FND-4, independent textured 2D consumer | Delivered by the 2D renderer, [render-2d](../packages/render-2d/README.md) |
 | FND-5, Lua hosting and application bindings | [Lua runtime design](archive/designs/lua_runtime_design.md), epic #145; binding and protocol model delivered, confinement inconclusive and further processing paused |
 
 ## Component boundaries
