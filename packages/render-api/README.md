@@ -2,7 +2,7 @@
 
 Backend-independent rendering contracts. Today the package holds one: the
 opaque texture handle that game code stores and a backend resolves. The
-decision record is [the 2D renderer design](../../docs/designs/render_2d_design.md)
+decision record is [the 2D renderer design](../../docs/removed_records.md)
 (D-12, R2D-1); the package's place among the others is
 [the foundation design](../../docs/engine_foundation_design.md).
 

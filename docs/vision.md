@@ -72,8 +72,8 @@ come before the production renderer. A multi-window triangle is an eventual
 integration milestone, not a reason to skip these boundaries. Lua can progress
 independently where its prerequisites are satisfied. Add abstractions and
 concurrency for a concrete consumer; defer bound-worker variants until a named
-consumer needs OS-thread affinity. See [runtime direction](archive/runtime_foundation_design.md)
-and [runtime review dispositions](runtime_review_findings.md).
+consumer needs OS-thread affinity. See [runtime direction](removed_records.md)
+and [runtime review dispositions](removed_records.md).
 
 ## Lifetime, failure and concurrency
 
@@ -97,7 +97,7 @@ holds each window alive until retirement is acknowledged. Closing the first
 window must not invalidate another. GPU submission completion, presentation
 retirement, CPU scope exit and logical asset release are distinct facts.
 See [resources](resources.md), [workers](workers.md), runtime D-13 and
-[window/graphics lifetime](archive/window_graphics_lifetime_design.md).
+[window/graphics lifetime](removed_records.md).
 
 ### V-4. Explicit failures and bounded safe recovery
 
@@ -106,7 +106,7 @@ requires proven safety and finite budgets; never replay arbitrary consumer
 effects. Distinguish optional-service rejection from required-service failure.
 Supervision uses checkpoints and supervised waits, without promising interruption
 of every blocking operation. Logging failures must not replace an earlier
-primary failure. See [runtime foundation](archive/runtime_foundation_design.md).
+primary failure. See [runtime foundation](removed_records.md).
 
 Lua-first M1 distinguishes pre-admission busy refusal with no work started,
 ordinary Lua validation/phase/ownership errors, accepted optional content
@@ -121,14 +121,14 @@ Use bounded FIFO commands/events and coherent latest-value snapshots. Prepare
 payloads deeply on the producer. Ordinary send reports full immediately;
 waiting is explicit. Close permits backlog drain, abort discards it, and
 in-flight effects are not automatically retried. Generic broadcast and
-request/reply are deferred. See [messaging](archive/messaging_design.md).
+request/reply are deferred. See [messaging](removed_records.md).
 
 The GLFW owner stays on the process main thread. Owned ports, snapshots and
 persistent command tickets connect services. Scheduling uses monotonic time,
 explicit deadlines and optional fixed steps with bounded catch-up. Render demand
 is per window; simulation pause policy belongs to the application. Expected
 native-wake failure preserves admitted commands and degrades to bounded polling
-with a diagnostic. See [scheduling](archive/runtime_scheduling_design.md) and [GLFW](glfw.md).
+with a diagnostic. See [scheduling](removed_records.md) and [GLFW](glfw.md).
 
 The approved production rendering design uses a separate supervised graphics
 owner, with bounded handoffs and explicit ownership of Vulkan roots. GLFW calls
@@ -139,7 +139,7 @@ handoffs before the final join. Rendering consumes published scene snapshots;
 the application chooses which thread produces them, and a simulation driver is
 deferred. This does not promise window-command progress during a Cocoa modal
 loop, or qualify rendering progress without the retained VK-16 native evidence.
-See [Vulkan decisions D-29–D-33](archive/vulkan_backend_design.md) and LIFE D-6.
+See [Vulkan decisions D-29–D-33](removed_records.md) and LIFE D-6.
 
 Lua-first M1 introduces a logical Lua tick driver, not a gameplay-state
 simulation/commit service. UI publishes copied latest scenes independently
@@ -162,7 +162,7 @@ replacement, allocation reclamation and explicit frame abandonment preserve
 ownership and finite recovery budgets. Device loss and validation errors stop
 the affected shared graphics session. Elapsed time and render fences do not
 prove presentation retirement. Platform timing assumptions are not correctness
-evidence. See [Vulkan decisions D-12–D-33](archive/vulkan_backend_design.md).
+evidence. See [Vulkan decisions D-12–D-33](removed_records.md).
 
 ### V-7. Optimize actual foreign-call and diagnostic boundaries
 
@@ -176,7 +176,7 @@ binding-wide flag is an optimization. See Vulkan D-28.
 Synchronous logging remains available. An optional bounded asynchronous runtime
 adapter protects latency-sensitive producers, with explicit saturation,
 truncation, flush, writer-failure and drain behavior. Its borrowed sink outlives
-the writer. See [runtime review RR-5/RR-6](runtime_review_findings.md).
+the writer. See [runtime review RR-5/RR-6](removed_records.md).
 
 ### V-8. Qualify platforms honestly and preserve native privacy
 
@@ -190,7 +190,7 @@ Private shims may implement approved native integrations without exposing
 ownership to applications. The Wayland connection-status exception is a
 read-only owner-thread probe, not permission to consume protocol messages or
 take over GLFW's connection. Keep the exception and required disconnect
-experiment in the [Wayland design](archive/wayland_qualification_design.md).
+experiment in the [Wayland design](removed_records.md).
 Compositor loss cannot manufacture GPU completion.
 
 ## Scripting, tests and delivery
@@ -228,7 +228,7 @@ unavailable state service ends the session. The Lua-first startup gate and
 one-role rules define the cases where no healthy UI can continue. Callback
 threads remain runtime machinery, not cancellation endpoints.
 
-Owner decision 2026-10-17 ([Lua D-23](archive/designs/lua_runtime_design.md#d-23-deterministic-simulation-is-a-design-requirement)):
+Owner decision 2026-10-17 ([Lua D-23](removed_records.md)):
 deterministic authoritative simulation is a design requirement. The initial
 qualification target is identical gameplay results for identical initial state,
 content, seed, tick-assigned inputs and scheduling configuration on the same
@@ -251,7 +251,7 @@ determinism. The existing lua-domains sample retains its own D-23/D-48
 qualification, including the limit on late independent failures. Its state
 transactions, replay and seeded streams are not M1 services.
 
-Owner decision 2026-10-17 ([Lua D-27](archive/designs/lua_runtime_design.md#d-27-engine-owned-cleanup-independent-of-script-correctness)):
+Owner decision 2026-10-17 ([Lua D-27](removed_records.md)):
 script authors must not be responsible for remembering which engine resources
 exist or making shutdown succeed to avoid leaks. Lua-exposed acquisitions have
 protected engine-owned scope/lease records; failed initialization, lost handles
@@ -279,7 +279,7 @@ covered too, one window-opening batch at a time, because every test is measured
 once and a stable test is not re-run.
 Isolated scripted displays are a separate approved path.
 Pure/model tests do not establish visual results, performance or confinement.
-See [validation](validation.md) and [test architecture](archive/test_architecture_design.md).
+See [validation](validation.md) and [test architecture](removed_records.md).
 
 ### V-11. Reproducible inputs and efficient solo delivery
 
@@ -295,7 +295,7 @@ may reuse compatible code evidence; SHA difference alone is not code change.
 Code and required docs/evidence ship in one PR; standalone docs use their own
 lane. `$guide` does not replace approval gates. Favor effectiveness first and
 efficiency second, without adding team-scale process for hypothetical needs.
-See [CI design](ci_validation_design.md), [workflow](workflow.md) and [toolchain](toolchain.md).
+See [CI design](removed_records.md), [workflow](workflow.md) and [toolchain](toolchain.md).
 
 ## Continuing after a context reset
 

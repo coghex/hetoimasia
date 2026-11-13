@@ -359,9 +359,9 @@ regenerated one recompiles nothing; that a removed or substituted wrapper is
 refused while a competing `glslangValidator` first on `PATH` never runs; and
 that the source distribution builds, from two extraction directories, to the
 same embedded bytes. Its retained transcript is
-[docs/vulkan/shader-rebuilds-macos.md](../../../docs/vulkan/shader-rebuilds-macos.md).
+[docs/vulkan/shader-rebuilds-macos.md](../../../docs/removed_records.md).
 The retired Linux proof route's run of the suite, with the compiler identity it
-named, is retained as [docs/vulkan/linux-vk9.md](../../../docs/vulkan/linux-vk9.md).
+named, is retained as [docs/vulkan/linux-vk9.md](../../../docs/removed_records.md).
 
 [`docs/vulkan_diagnostics.md`](../../../docs/vulkan_diagnostics.md) is the
 messengers' contract in prose, and [`docs/gpu_backend.md`](../../../docs/gpu_backend.md)
