@@ -13,6 +13,15 @@ import qualified Test.TerrainRuntime.Opacity as Opacity
 import qualified Test.TerrainRuntime.Oracle as Oracle
 import qualified Test.TerrainRuntime.Races as Races
 import qualified Test.TerrainRuntime.Revalidation as Revalidation
+import qualified Test.TerrainRuntime.Storage.Classes as StorageClasses
+import qualified Test.TerrainRuntime.Storage.Growth as StorageGrowth
+import qualified Test.TerrainRuntime.Storage.Io as StorageIo
+import qualified Test.TerrainRuntime.Storage.Lifecycle as StorageLifecycle
+import qualified Test.TerrainRuntime.Storage.Lifetime as StorageLifetime
+import qualified Test.TerrainRuntime.Storage.Boundary as StorageBoundary
+import qualified Test.TerrainRuntime.Storage.Memory as StorageMemory
+import qualified Test.TerrainRuntime.Storage.Opacity as StorageOpacity
+import qualified Test.TerrainRuntime.Storage.Open as StorageOpen
 import qualified Test.TerrainRuntime.Store.AdmissionSpec as StoreAdmission
 import qualified Test.TerrainRuntime.Store.Allowance as StoreAllowance
 import qualified Test.TerrainRuntime.Store.Boundary as StoreBoundary
@@ -74,3 +83,17 @@ spec = do
   StoreAdmission.spec
   StoreBounds.spec
   StoreBoundary.spec
+  StorageOpen.spec
+  StorageIo.spec
+  StorageLifetime.spec
+  StorageGrowth.spec
+  StorageMemory.floorSpec
+  StorageMemory.rulesSpec
+  StorageMemory.spec
+  StorageMemory.spec2
+  StorageMemory.spec3
+  StorageMemory.spec4
+  StorageBoundary.spec
+  StorageClasses.spec
+  StorageLifecycle.spec
+  StorageOpacity.spec

@@ -1,0 +1,772 @@
+-- | The storage backend's test harness: the production service on the production
+-- native adapter, wrapped in a seam that records every native operation, holds a
+-- chosen one at a gate, and replaces its result with a fault.
+--
+-- Nothing here substitutes a backend. The service the examples drive is the one an
+-- application starts: its two workers, its queue, its accounting against a real
+-- shared admission and its files on a real filesystem. The seam only observes and
+-- perturbs the native calls, the way "Test.Content" examples do, so an example
+-- can hold a worker inside a transfer with no sleep and assert exact offsets.
+--
+-- Every example runs in an 'Env' whose teardown checks that the service returned
+-- every credit it took: a leaked record or buffer fails the example that leaked.
+module Test.TerrainRuntime.Storage.Harness
+  ( -- * Environment
+    Env (..)
+  , withEnv
+  , withEnvWith
+  , withEnvIn
+  , EnvOptions (..)
+  , defaultOptions
+  , testConfigFor
+  , fsNameOf
+  , ident
+  , ident2
+  , payloadBytes
+  , budgetBytes
+
+    -- * The seam
+  , Probe (..)
+  , newProbe
+  , seamFor
+  , withCloseFact
+  , quiet
+  , Gate (..)
+  , Act (..)
+  , newGate
+  , openGate
+  , awaitReached
+  , awaitBlockedInStm
+  , awaitBlockedOnThrowTo
+  , addAfterRule
+  , addAfterRuleAfter
+  , addAfterGate
+  , withEnvEndingWithKeptFailure
+  , withEnvEndingWithKeptFailureWith
+  , workerThreads
+  , openAllGates
+  , rulesConsumed
+  , addRule
+  , addRuleAfter
+  , addBeforeRule
+  , addBeforeRuleAfter
+  , addErrnoAfterRule
+  , errnoAfterRuleAfter
+  , physicalHoldings
+  , mayHold
+  , Inc (..)
+  , addGate
+  , addGateAfter
+  , events
+  , countEvents
+  , clearEvents
+  , openFds
+  , fdsCreated
+  , fdHandles
+
+    -- * Driving the backend
+  , openBacking
+  , openBackingAt
+  , awaitOutcome
+  , outcomeOf
+  , readPages
+  , Txn (..)
+  , planFor
+  , newStoreH
+  , runTxn
+  , runTxnWith
+  , finishPublish
+  , finishAbort
+  , gridPages
+  , ledgerZero
+
+    -- * Assertions
+  , shouldBeFailure
+  ) where
+
+import Control.Concurrent (ThreadId, myThreadId, yield)
+import Control.Concurrent.STM
+import Control.Exception (ErrorCall (..), ExceptionWithContext (..), SomeAsyncException (..), SomeException, finally, rethrowIO, throwIO, try, tryWithContext)
+import Control.Monad (forM, forM_, unless, void)
+import qualified Data.ByteString as BS
+import qualified Data.ByteString.Char8 as BC
+import Data.IORef
+import qualified Data.Map.Strict as Map
+import qualified Data.Set as Set
+import qualified Data.Text as T
+import Data.Word (Word64)
+import GHC.Conc (BlockReason (..), ThreadStatus (..), threadStatus)
+import Hetoimasia.Foundation.Log (Logger, callbackSink, defaultLogFilter, mkLogger)
+import Hetoimasia.Foundation.Worker (withWorkerGroup)
+import Hetoimasia.Terrain.Runtime.Storage.Internal.File (Created (..), closeFile, createPrivate)
+import Hetoimasia.Terrain.Runtime.Storage.Internal.Native
+import Hetoimasia.Terrain.Runtime.Storage.Internal.Service
+import Hetoimasia.Terrain.Runtime.Storage.Internal.Types
+import Hetoimasia.Terrain.Runtime.Storage.Internal.Volume (VolumeProfile (..), profileOf)
+import qualified Hetoimasia.Terrain.Runtime.Store.Internal.Admission as A
+import Hetoimasia.Terrain.Runtime.Store.Internal.Format (PageNo (..), StoreIdentity)
+import Hetoimasia.Terrain.Runtime.Store.Internal.Model
+import Hetoimasia.Terrain.Runtime.Store.Internal.Plan (Plan (..), Planned (..), TxClass (..))
+import Hetoimasia.Terrain.Runtime.Store.Internal.Format (pageSize)
+import Hetoimasia.Terrain.Runtime.Store.Internal.State (StoreConfig, StoreSpec, cfgAllowanceBytes, cfgTotalPages)
+import System.IO.Temp (withSystemTempDirectory)
+import Hetoimasia.Foundation.Resource (cleanupFailuresInContext, displayCleanupFailure)
+import Test.Hspec (expectationFailure, shouldSatisfy)
+import Test.Support.Bounded (bounded)
+import Test.TerrainRuntime.Store.Harness (H (..), deltaFor, fillPlan, identOf, ident0, newH, runKey, runRec)
+
+-- | The default incarnation of the examples, and a second one.
+ident, ident2 ∷ StoreIdentity
+ident = ident0
+ident2 = identOf 2 9
+
+-- ---------------------------------------------------------------------------
+-- The seam
+
+-- | A gate: a worker that reaches a matching operation announces it and waits
+-- until the gate is opened.
+data Gate = Gate {gReached ∷ !(TVar Int), gOpen ∷ !(TVar Bool)}
+
+newGate ∷ IO Gate
+newGate = Gate <$> newTVarIO 0 <*> newTVarIO False
+
+openGate ∷ Gate → IO ()
+openGate g = atomically (writeTVar (gOpen g) True)
+
+-- | Wait until @n@ workers have reached the gate.
+awaitReached ∷ Gate → Int → IO ()
+awaitReached g n = bounded (atomically (readTVar (gReached g) >>= \r → check (r >= n)))
+
+-- | What a rule does to a native call that matches it.
+data Act
+  = -- | Fail the call with this errno, without making it.
+    FailWith !Errno
+  | -- | Make the call for at most this many bytes.
+    ShortTo !Int
+  | -- | Answer zero bytes without making the call.
+    ZeroBytes
+  | -- | Answer success without making the call (a lying reservation).
+    Lie
+  | -- | Make the call and add this many bytes to the allocated size it reports.
+    OverAllocated !Word64
+  | -- | Make the call and report this file size (a length the platform did not establish).
+    WrongSize !Word64
+  | -- | Make the call and report this allocated size instead of the real one (a coverage the platform did not give).
+    UnderAllocated !Word64
+  | -- | Make the call and report this much free space.
+    FreeBytesAre !Word64
+  | -- | Report this much free space less what the files the backend holds open
+    -- occupy (the real allocation), so a fixed baseline shrinks as reservations
+    -- are made, deterministically.
+    FreeAfterOwn !Word64
+  | -- | Make the call and report this filesystem name.
+    FilesystemIs !BC.ByteString
+  | -- | Make the call and report the descriptor as not close-on-exec.
+    NotCloexec
+  | -- | Raise an exception of the ASYNCHRONOUS type (a cancellation) where the hook or the call runs.
+    ThrowAsync
+  | -- | Raise an exception in the worker (a defect, not a storage result).
+    Throw
+
+data Rule = Rule
+  { rMatch ∷ NativeOp → Bool
+  , rAct ∷ Act
+  , rSkip ∷ !(TVar Int)
+  -- ^ How many matching calls pass before it applies.
+  , rUses ∷ !(TVar Int)
+  -- ^ How many matching calls it still applies to; negative is unlimited.
+  }
+
+-- | One file the adapter created, as the oracle tracks it.
+data Inc = Inc {incDev ∷ !Word64, incHigh ∷ !Word64, incLive ∷ !Bool}
+
+data Probe = Probe
+  { pLog ∷ !(TVar [NativeOp])
+  , pRules ∷ !(TVar [Rule])
+  , pGates ∷ !(TVar [(NativeOp → Bool, Gate, TVar Int)])
+  , pCreated ∷ !(TVar [Int])
+  , pOpen ∷ !(TVar (Set.Set Int))
+  , pHandles ∷ !(TVar [Fd])
+  , pAfterRules ∷ !(TVar [Rule])
+  -- ^ Rules applied by the seam's AFTER-hook: the effect has already happened when they fire.
+  , pAfterGates ∷ !(TVar [(NativeOp → Bool, Gate, TVar Int)])
+  -- ^ Gates the seam's after-hook blocks at, after the effect.
+  , pWorkers ∷ !(TVar [ThreadId])
+  -- ^ The threads the service's workers run on, noted as each starts (the seam's start hook runs on it).
+  , pBeforeRules ∷ !(TVar [Rule])
+  -- ^ Rules applied by the seam's BEFORE-hook: the native call has NOT been made when they fire.
+  , pReported ∷ !(TVar (Map.Map Int Word64))
+  -- ^ THE ORACLE'S RECORD: the allocation the adapter last REPORTED to the service for each descriptor (injected lies included).
+  , pFact ∷ !(TVar CloseFact)
+  -- ^ The platform fact about a failed close the example runs under (the oracle needs it: an errno where the fact is established means released).
+  , pIncs ∷ !(TVar (Map.Map Int Inc))
+  -- ^ THE ORACLE'S INCARNATIONS: one per file the adapter created, with the volume it is on, the LARGEST allocation the adapter reported for it
+  -- since its last successful allocation-changing call (lies included), and whether it may still hold space (not cleanly released).
+  , pFdInc ∷ !(TVar (Map.Map Int Int))
+  -- ^ The incarnation a descriptor number currently names (a number is reused by a later file).
+  , pErrnoAfter ∷ !(TVar [Rule])
+  -- ^ Rules that make the native call and then answer an errno instead of its result (the effect happened, the caller is told it failed).
+  }
+
+newProbe ∷ IO Probe
+newProbe = Probe <$> newTVarIO [] <*> newTVarIO [] <*> newTVarIO [] <*> newTVarIO [] <*> newTVarIO Set.empty <*> newTVarIO [] <*> newTVarIO [] <*> newTVarIO [] <*> newTVarIO [] <*> newTVarIO [] <*> newTVarIO Map.empty <*> newTVarIO CloseReleasesOnFailure <*> newTVarIO Map.empty <*> newTVarIO Map.empty <*> newTVarIO []
+
+-- | Apply a rule to the next @n@ matching calls (negative: all of them).
+addRule ∷ Probe → Int → (NativeOp → Bool) → Act → IO ()
+addRule p = addRuleAfter p 0
+
+-- | 'addRule' after the first @skip@ matching calls have passed.
+addRuleAfter ∷ Probe → Int → Int → (NativeOp → Bool) → Act → IO ()
+addRuleAfter p skip n match act = do
+  sk ← newTVarIO skip
+  uses ← newTVarIO n
+  atomically (modifyTVar' (pRules p) (<> [Rule match act sk uses]))
+
+-- | Apply a rule to the BEFORE-hook of the next @n@ matching calls: the hook raises and the native call is never made.
+addBeforeRule ∷ Probe → Int → (NativeOp → Bool) → Act → IO ()
+addBeforeRule p = addBeforeRuleAfter p 0
+
+-- | 'addBeforeRule' after the first @skip@ matching calls have passed.
+addBeforeRuleAfter ∷ Probe → Int → Int → (NativeOp → Bool) → Act → IO ()
+addBeforeRuleAfter p skip n match act = do
+  sk ← newTVarIO skip
+  uses ← newTVarIO n
+  atomically (modifyTVar' (pBeforeRules p) (<> [Rule match act sk uses]))
+
+-- | Make the next @n@ matching calls and then answer the errno: the effect happened and the caller is told it failed.
+addErrnoAfterRule ∷ Probe → Int → (NativeOp → Bool) → Errno → IO ()
+addErrnoAfterRule p = errnoAfterRuleAfter p 0
+
+-- | 'addErrnoAfterRule' after the first @skip@ matching calls have passed.
+errnoAfterRuleAfter ∷ Probe → Int → Int → (NativeOp → Bool) → Errno → IO ()
+errnoAfterRuleAfter p skip n match e = do
+  sk ← newTVarIO skip
+  uses ← newTVarIO n
+  atomically (modifyTVar' (pErrnoAfter p) (<> [Rule match (FailWith e) sk uses]))
+
+newIncarnation ∷ Probe → Int → STM ()
+newIncarnation p fd = do
+  n ← Map.size <$> readTVar (pIncs p)
+  modifyTVar' (pIncs p) (Map.insert n (Inc 0 0 True))
+  modifyTVar' (pFdInc p) (Map.insert fd n)
+
+reportToIncarnation ∷ Probe → Int → Word64 → Word64 → STM ()
+reportToIncarnation p fd dev alloc = do
+  m ← readTVar (pFdInc p)
+  forM_ (Map.lookup fd m) $ \n → modifyTVar' (pIncs p) (Map.adjust (\i → i {incDev = dev, incHigh = max (incHigh i) alloc}) n)
+
+resetIncarnation ∷ Probe → Int → STM ()
+resetIncarnation p fd = do
+  m ← readTVar (pFdInc p)
+  forM_ (Map.lookup fd m) $ \n → modifyTVar' (pIncs p) (Map.adjust (\i → i {incHigh = 0}) n)
+
+-- | The close returned (or raised): the file is cleanly released, or it may still hold space.
+closedIncarnation ∷ Probe → Int → Bool → STM ()
+closedIncarnation p fd released = do
+  m ← readTVar (pFdInc p)
+  forM_ (Map.lookup fd m) $ \n → modifyTVar' (pIncs p) (Map.adjust (\i → if released then i {incLive = False} else i) n)
+
+-- | THE SECOND READING OF THE ORACLE (round 9): for every file that may still hold space (one the adapter has not seen cleanly released), the volume and
+-- the LARGEST allocation the adapter reported for it since its last successful allocation-changing call, lies included. The service's counted figure
+-- for a volume must be at least the sum.
+mayHold ∷ Probe → IO [(Word64, Word64)]
+mayHold p = do
+  incs ← readTVarIO (pIncs p)
+  pure [(incDev i, incHigh i) | i ← Map.elems incs, incLive i, incHigh i > 0, incDev i /= 0]
+
+-- | THE ORACLE OF PHYSICAL TRUTH (round 8): for every descriptor the adapter still holds open, its number, the volume it is on and
+-- what it holds: the larger of what the file really occupies (read by the production adapter, outside every rule) and the
+-- allocation the adapter last REPORTED to the service for it (an injected lie included: the service must count what it was told).
+physicalHoldings ∷ Probe → IO [(Int, Word64, Word64)]
+physicalHoldings p = do
+  open ← readTVarIO (pOpen p)
+  handles ← readTVarIO (pHandles p)
+  reported ← readTVarIO (pReported p)
+  -- a descriptor NUMBER is reused by a later file: the latest handle of a number is the one that can still be open
+  let latest = Map.elems (Map.fromList [(fdNumber fd, fd) | fd ← handles])
+  fmap concat $ forM [fd | fd ← latest, fdNumber fd `Set.member` open] $ \fd → do
+    st ← nativeStat posixNative fd
+    pure $ case st of
+      Right x → [(fdNumber fd, nsDevice x, max (nsAllocated x) (Map.findWithDefault 0 (fdNumber fd) reported))]
+      Left _ → []
+
+-- | Apply a rule to the AFTER-hook of the next @n@ matching calls: the native effect has happened, then the hook raises.
+addAfterRule ∷ Probe → Int → (NativeOp → Bool) → Act → IO ()
+addAfterRule p = addAfterRuleAfter p 0
+
+addAfterRuleAfter ∷ Probe → Int → Int → (NativeOp → Bool) → Act → IO ()
+addAfterRuleAfter p skip n match act = do
+  sk ← newTVarIO skip
+  uses ← newTVarIO n
+  atomically (modifyTVar' (pAfterRules p) (<> [Rule match act sk uses]))
+
+-- | Hold every matching call at its AFTER-hook (the effect has happened) until the gate opens.
+addAfterGate ∷ Probe → (NativeOp → Bool) → IO Gate
+addAfterGate p match = do
+  g ← newGate
+  sk ← newTVarIO 0
+  atomically (modifyTVar' (pAfterGates p) ((match, g, sk) :))
+  pure g
+
+-- | Hold every matching call until the gate opens.
+addGate ∷ Probe → (NativeOp → Bool) → IO Gate
+addGate p = addGateAfter p 0
+
+-- | 'addGate' after the first @skip@ matching calls have passed.
+addGateAfter ∷ Probe → Int → (NativeOp → Bool) → IO Gate
+addGateAfter p skip match = do
+  g ← newGate
+  sk ← newTVarIO skip
+  atomically (modifyTVar' (pGates p) ((match, g, sk) :))
+  pure g
+
+-- | How many native operations so far satisfy a predicate (readable inside a
+-- transaction, so an example can wait for a count).
+countEvents ∷ Probe → (NativeOp → Bool) → STM Int
+countEvents p f = length . filter f <$> readTVar (pLog p)
+
+events ∷ Probe → IO [NativeOp]
+events p = reverse <$> readTVarIO (pLog p)
+
+clearEvents ∷ Probe → IO ()
+clearEvents p = atomically (writeTVar (pLog p) [])
+
+-- | Descriptors currently open, and every one ever created.
+openFds ∷ Probe → IO [Int]
+openFds p = Set.toList <$> readTVarIO (pOpen p)
+
+-- | The descriptors the backend created, for an example to examine with the native
+-- adapter itself.
+fdHandles ∷ Probe → IO [Fd]
+fdHandles p = readTVarIO (pHandles p)
+
+fdsCreated ∷ Probe → IO [Int]
+fdsCreated p = reverse <$> readTVarIO (pCreated p)
+
+-- | The first rule that matches the operation and has uses left, consumed.
+takeRule ∷ Probe → NativeOp → IO (Maybe Act)
+takeRule p = takeRuleFrom (pRules p)
+
+-- | The same over any rule list (the before side and the after side keep their own).
+takeRuleFrom ∷ TVar [Rule] → NativeOp → IO (Maybe Act)
+takeRuleFrom ref op = atomically $ do
+  rules ← readTVar ref
+  let go [] = pure Nothing
+      go (r : rest)
+        | rMatch r op = do
+            skip ← readTVar (rSkip r)
+            left ← readTVar (rUses r)
+            if skip > 0
+              then writeTVar (rSkip r) (skip - 1) >> go rest
+              else
+                if left == 0
+                  then go rest
+                  else do
+                    unless (left < 0) (writeTVar (rUses r) (left - 1))
+                    pure (Just (rAct r))
+        | otherwise = go rest
+  go rules
+
+-- | The same seam under another platform fact about a failed close.
+withCloseFact ∷ CloseFact → Seam → Seam
+withCloseFact f sm = sm {seamNative = (seamNative sm) {nativeCloseFact = f}}
+
+-- | The seam: production natives, perturbed by the probe's rules and gates.
+seamFor ∷ Probe → Seam
+seamFor p = Seam wrapped before after
+  where
+    real = posixNative
+    before op = do
+      atomically (modifyTVar' (pLog p) (op :))
+      case op of
+        OpWorkerStart _ → myThreadId >>= \tid → atomically (modifyTVar' (pWorkers p) (tid :)) >> takeRule p op >>= \r → case r of
+          Just Throw → ioError (userError "injected worker start failure")
+          _ → pure ()
+        _ → takeRuleFrom (pBeforeRules p) op >>= \r → case r of
+          Just Throw → ioError (userError "injected exception in a before-hook")
+          _ → pure ()
+      gates ← readTVarIO (pGates p)
+      forM_ [(g, sk) | (m, g, sk) ← gates, m op] $ \(g, sk) → do
+        skipped ← atomically (readTVar sk >>= \n → if n > 0 then writeTVar sk (n - 1) >> pure True else pure False)
+        unless skipped $ do
+          atomically (modifyTVar' (gReached g) (+ 1))
+          atomically (readTVar (gOpen g) >>= check)
+    after op = do
+      -- the AFTER side: the native effect has HAPPENED. Rules raise (synchronously, or of the asynchronous type),
+      -- gates block, and a cancellation is delivered to the blocked thread by the example
+      a ← takeRuleFrom (pAfterRules p) op
+      case a of
+        Just Throw → ioError (userError "injected exception in an after-hook")
+        Just ThrowAsync → throwIO (SomeAsyncException (ErrorCall "a cancellation in an after-hook"))
+        _ → pure ()
+      gates ← readTVarIO (pAfterGates p)
+      forM_ [(g, sk) | (m, g, sk) ← gates, m op] $ \(g, sk) → do
+        skipped ← atomically (readTVar sk >>= \n → if n > 0 then writeTVar sk (n - 1) >> pure True else pure False)
+        unless skipped $ do
+          atomically (modifyTVar' (gReached g) (+ 1))
+          atomically (readTVar (gOpen g) >>= check)
+    wrapped =
+      real
+        { -- THE HOST'S OWN FACT IS NOT THE EXAMPLES': every example runs against a fixed close fact (a failed close has
+          -- released the descriptor) unless it asks for the other, so no result depends on the platform it runs on
+          nativeCloseFact = CloseReleasesOnFailure
+        , nativeCreate = \dir name → do
+            a ← takeRule p OpCreateFile
+            case a of
+              Just (FailWith e) → pure (Left e)
+              Just Throw → ioError (userError "injected exception")
+              _ → do
+                r ← nativeCreate real dir name
+                case r of
+                  Right fd → atomically (newIncarnation p (fdNumber fd)) >> pure ()
+                  Left _ → pure ()
+                case r of
+                  Right fd → atomically (modifyTVar' (pCreated p) (fdNumber fd :) >> modifyTVar' (pOpen p) (Set.insert (fdNumber fd)) >> modifyTVar' (pHandles p) (<> [fd]))
+                  Left _ → pure ()
+                pure r
+        , nativeUnlink = \d n → do
+            a ← takeRule p OpUnlinkFile
+            case a of
+              Just (FailWith e) → pure (Left e)
+              Just Throw → ioError (userError "injected exception")
+              _ → nativeUnlink real d n
+        , nativeCloexec = \fd → do
+            r ← nativeCloexec real fd
+            a ← takeRule p OpCloexecFlag
+            case (a, r) of
+              (Just NotCloexec, Right _) → pure (Right False)
+              (Just Throw, _) → ioError (userError "injected exception")
+              (Just (FailWith e), _) → pure (Left e)
+              _ → pure r
+        , nativeStat = \fd → do
+            r ← nativeStat real fd
+            a ← takeRule p OpStatFile
+            out ← case (a, r) of
+              (Just (OverAllocated n), Right s) → pure (Right s {nsAllocated = nsAllocated s + n})
+              (Just (WrongSize n), Right s) → pure (Right s {nsSize = n})
+              (Just (UnderAllocated n), Right s) → pure (Right s {nsAllocated = n})
+              (Just (FailWith e), _) → pure (Left e)
+              (Just Throw, _) → ioError (userError "injected exception")
+              _ → pure r
+            -- what the service was TOLD about this descriptor, lies included, is the oracle's reading of what it must count
+            case out of
+              Right st → atomically (modifyTVar' (pReported p) (Map.insert (fdNumber fd) (nsAllocated st)) >> reportToIncarnation p (fdNumber fd) (nsDevice st) (nsAllocated st))
+              Left _ → pure ()
+            pure out
+        , nativeStatFs = \fd → do
+            r ← nativeStatFs real fd
+            a ← takeRule p OpStatFilesystem
+            case (a, r) of
+              (Just (FreeBytesAre n), Right f) → pure (Right f {nfAvailableBytes = n})
+              (Just (FreeAfterOwn n), Right f) → do
+                held ← atomically ((,) <$> readTVar (pHandles p) <*> readTVar (pOpen p))
+                sizes ← mapM (\h → either (const 0) nsAllocated <$> nativeStat real h) [h | h ← fst held, fdNumber h `Set.member` snd held]
+                pure (Right f {nfAvailableBytes = n - min n (sum sizes)})
+              (Just (FilesystemIs n), Right f) → pure (Right f {nfTypeName = n})
+              (Just (FailWith e), _) → pure (Left e)
+              (Just Throw, _) → ioError (userError "injected exception")
+              _ → pure r
+        , nativeReserve = \fd off len → do
+            a ← takeRule p (OpReserveRange off len)
+            case a of
+              Just (FailWith e) → pure (Left e)
+              Just Throw → ioError (userError "injected exception")
+              Just Lie → pure (Right len)
+              _ → nativeReserve real fd off len >>= errnoAfter (OpReserveRange off len) >>= changed fd
+        , nativeSetLength = \fd len → do
+            a ← takeRule p (OpSetFileLength len)
+            case a of
+              Just (FailWith e) → pure (Left e)
+              Just Throw → ioError (userError "injected exception")
+              _ → nativeSetLength real fd len >>= errnoAfter (OpSetFileLength len) >>= changed fd
+        , nativePread = \fd ptr n off → do
+            a ← takeRule p (OpReadAt off n)
+            case a of
+              Just (FailWith e) → pure (Left e)
+              Just ZeroBytes → pure (Right 0)
+              Just Throw → ioError (userError "injected defect")
+              Just (ShortTo k) → nativePread real fd ptr (min k n) off
+              _ → nativePread real fd ptr n off
+        , nativePwrite = \fd ptr n off → do
+            a ← takeRule p (OpWriteAt off n)
+            case a of
+              Just (FailWith e) → pure (Left e)
+              Just ZeroBytes → pure (Right 0)
+              Just Throw → ioError (userError "injected exception")
+              Just (ShortTo k) → nativePwrite real fd ptr (min k n) off
+              _ → nativePwrite real fd ptr n off
+        , nativeClose = \fd → do
+            r ← nativeClose real fd
+            atomically (modifyTVar' (pOpen p) (Set.delete (fdNumber fd)))
+            a ← takeRule p OpCloseFile
+            fact ← readTVarIO (pFact p)
+            case a of
+              Just (FailWith e) → atomically (closedIncarnation p (fdNumber fd) (fact == CloseReleasesOnFailure)) >> pure (Left e)
+              -- the call was made and then the exception is raised, as a failing close does: the reservation may still be held
+              Just Throw → ioError (userError "injected exception")
+              _ → do
+                out ← errnoAfter OpCloseFile r
+                atomically (closedIncarnation p (fdNumber fd) (either (const (fact == CloseReleasesOnFailure)) (const True) out))
+                pure out
+        }
+    -- an allocation-changing call that SUCCEEDED (as the service was told): what was reported before it no longer holds
+    changed ∷ Fd → Either Errno a → IO (Either Errno a)
+    changed fd r = do
+      case r of
+        Right _ → atomically (resetIncarnation p (fdNumber fd) >> modifyTVar' (pReported p) (Map.delete (fdNumber fd)))
+        Left _ → pure ()
+      pure r
+    -- the call HAS been made; a rule of the errno-after dimension then answers an errno in place of its result
+    errnoAfter ∷ NativeOp → Either Errno a → IO (Either Errno a)
+    errnoAfter op r = do
+      a ← takeRuleFrom (pErrnoAfter p) op
+      pure (case a of Just (FailWith e) → Left e; _ → r)
+
+-- ---------------------------------------------------------------------------
+-- The environment
+
+data Env = Env
+  { envSvc ∷ !StorageService
+  , envAdmission ∷ !(TVar A.Admission)
+  , envProbe ∷ !Probe
+  , envDir ∷ !FilePath
+  , envConfig ∷ !StorageConfig
+  }
+
+data EnvOptions = EnvOptions
+  { eoQualified ∷ !(Maybe [BC.ByteString])
+  -- ^ The qualified list; 'Nothing' qualifies the filesystem the examples run on.
+  , eoHeadroom ∷ !Word64
+  , eoUnbounded ∷ !Bool
+  -- ^ Whether the body runs without the routine suite's bound (a probe's heavy steps).
+  , eoCloseFact ∷ !CloseFact
+  -- ^ The platform fact about a failed close the service runs under (the table's two values).
+  }
+
+defaultOptions ∷ EnvOptions
+defaultOptions = EnvOptions Nothing minHeadroomBytes False CloseReleasesOnFailure
+
+quiet ∷ Logger
+quiet = mkLogger defaultLogFilter (callbackSink (\_ → pure ()))
+
+-- | The filesystem name of a directory, as the backend itself reads it.
+fsNameOf ∷ FilePath → IO BC.ByteString
+fsNameOf dir = do
+  made ← createPrivate productionSeam (BC.pack dir) 0 (const (pure ()))
+  case made of
+    Left f → fail ("cannot probe the test filesystem: " <> show f)
+    Right c → do
+      pr ← profileOf productionSeam (crFd c)
+      _ ← nativeUnlink posixNative (BC.pack dir) (crName c)
+      _ ← closeFile productionSeam (crFd c)
+      either (\e → fail ("cannot probe the test filesystem: " <> show e)) (pure . vpFilesystem) pr
+
+-- | A configuration that qualifies the filesystem the examples run on, so the
+-- routine suite exercises the production reservation on whatever volume a
+-- developer or CI machine has. The production list stays @apfs@ and @ext4@; the
+-- qualification itself is the probe's.
+testConfigFor ∷ FilePath → EnvOptions → IO StorageConfig
+testConfigFor dir opts = do
+  name ← fsNameOf dir
+  either (\e → fail (show e)) pure (mkStorageConfig (maybe [name] id (eoQualified opts)) (eoHeadroom opts))
+
+withEnv ∷ (Env → IO a) → IO a
+withEnv = withEnvWith defaultOptions
+
+withEnvWith ∷ EnvOptions → (Env → IO a) → IO a
+withEnvWith opts body = withSystemTempDirectory "hetoimasia-terrain-storage" $ \dir → withEnvIn dir opts body
+
+-- | An environment whose files are made in a given directory (the probe's disposable
+-- volume), with the same checks at its end.
+withEnvIn ∷ FilePath → EnvOptions → (Env → IO a) → IO a
+withEnvIn dir opts body = do
+    cfg ← testConfigFor dir opts
+    probe ← newProbe
+    atomically (writeTVar (pFact probe) (eoCloseFact opts))
+    bank ← either (\e → fail (show e)) pure (A.mkEditBankConfig A.defaultEditBankSpec)
+    admission ← newTVarIO (A.newAdmission bank)
+    result ← newIORef Nothing
+    -- the service's end is attempted whatever the body did, and the ledger check below runs even when the service's
+    -- own end reports a cleanup failure; that failure, with its context, is rethrown after it
+    ended ← tryWithContext $ withWorkerGroup $ \group →
+      withStorageService (StoragePorts admission group quiet (withCloseFact (eoCloseFact opts) (seamFor probe)) cfg) $ \svc →
+        ((if eoUnbounded opts then id else bounded) (body (Env svc admission probe dir cfg)) `finally` openAllGates probe) >>= writeIORef result . Just
+    leaked ← A.ledgers <$> readTVarIO admission
+    unless (ledgerZero leaked) (expectationFailure ("the service leaked accounting: " <> show leaked))
+    case ended of
+      Left (ewc ∷ ExceptionWithContext SomeException) → rethrowIO ewc
+      Right _ → pure ()
+    maybe (fail "the example produced no result") pure =<< readIORef result
+
+-- | Open every gate of the probe, so a worker held by a failed example can finish and the service can
+-- drain: a failing example is reported as a failure, never as a hang.
+openAllGates ∷ Probe → IO ()
+openAllGates p = readTVarIO (pGates p) >>= mapM_ (\(_, g, _) → openGate g)
+
+-- | Every account returned to zero.
+ledgerZero ∷ A.Ledger → Bool
+ledgerZero l = A.lgCacheBacked l + A.lgCacheRamOnly l + A.lgStagingForeground l + A.lgStagingCamera l + A.lgControlReserved l == 0
+
+-- ---------------------------------------------------------------------------
+-- Driving the backend
+
+-- | Wait for a job's outcome and take it (the record and bytes are retired).
+awaitOutcome ∷ Env → Ticket → IO Outcome
+awaitOutcome env t = do
+  bounded (atomically (awaitTicket (envSvc env) t))
+  r ← withOutcome (envSvc env) t pure
+  maybe (fail "the ticket had no outcome") pure r
+
+-- | A job's outcome, as the ticket of a submission.
+outcomeOf ∷ Env → Either StorageFailure Ticket → IO Outcome
+outcomeOf env r = case r of
+  Left f → pure (Failed f [])
+  Right t → awaitOutcome env t
+
+openBackingAt ∷ Env → FilePath → StoreIdentity → StoreConfig → IO Outcome
+openBackingAt env dir i cfg = submitOpen (envSvc env) ExplicitWork (OpenSpec (BC.pack dir) i cfg) >>= outcomeOf env
+
+-- | Open a backing in the example's directory; the example fails if it is refused.
+openBacking ∷ Env → StoreIdentity → StoreConfig → IO Backing
+openBacking env i cfg = do
+  o ← openBackingAt env (envDir env) i cfg
+  case o of
+    Opened b _ → pure b
+    other → fail ("expected an opened backing, got " <> show other)
+
+readPages ∷ Env → Backing → StoreConfig → Word64 → Int → ReadMode → IO (Either StorageFailure [(PageNo, BS.ByteString)])
+readPages env b cfg start n mode = do
+  o ← submitRead (envSvc env) b ExplicitWork cfg (PageNo start) n mode >>= outcomeOf env
+  pure $ case o of
+    Pages ps → Right ps
+    Failed f _ → Left f
+    other → Left (HostFailure (T.pack (show other)))
+
+-- | A store with a real transaction's pages: the harness's pure store.
+newStoreH ∷ StoreSpec → H
+newStoreH spec = newH spec ident
+
+-- | Plan the @k@th small edit against the harness's store.
+planFor ∷ H → Integer → Either String (Plan)
+planFor h k = do
+  p ← fillPlan h (deltaFor (hStore h) True False 1 [(runKey k k k, Just (runRec (k + 1)))]) Ordinary
+  case p of
+    Planned plan → Right plan
+    other → Left ("not planned: " <> show other)
+
+-- | One transaction driven through the backend: what the model did and what the
+-- worker reported.
+data Txn = Txn
+  { txStore ∷ !Store
+  , txTid ∷ !TxnId
+  , txPlan ∷ !Plan
+  , txReport ∷ !(Maybe WriteReport)
+  , txOutcome ∷ !Outcome
+  }
+
+-- | Admit a plan, stage it, write it through the backend, and report the
+-- worker's per-page outcomes to the model (the owner's part). It neither
+-- publishes nor aborts: the example decides.
+runTxn ∷ Env → Backing → Store → Plan → IO Txn
+runTxn env b store plan = runTxnWith env b store plan (\_ → pure ())
+
+-- | 'runTxn' with an action between the submission and the wait (to cancel, or
+-- to open a gate).
+runTxnWith ∷ Env → Backing → Store → Plan → (Ticket → IO ()) → IO Txn
+runTxnWith env b store plan between = do
+  (tid, s1) ← either (\e → fail ("admit: " <> show e)) pure (admit plan store)
+  sw ← either (\e → fail ("stage: " <> show e)) pure (stageWrite s1 tid)
+  let s2 = foldl (\s p → snd (dispatchWrite tid p s)) s1 (stagedPages sw)
+  t ← submitWrite (envSvc env) b sw >>= either (\f → fail ("submit: " <> show f)) pure
+  between t
+  o ← awaitOutcome env t
+  case o of
+    Written report →
+      let s3 = foldl (\s (p, out) → snd (completeWrite tid p out s)) s2 (writeOutcomes report)
+       in pure (Txn s3 tid plan (Just report) o)
+    _ → pure (Txn s2 tid plan Nothing o)
+
+finishPublish ∷ Txn → IO Store
+finishPublish t = either (\e → fail ("publish: " <> show e)) (pure . snd) (publish (txTid t) (txStore t))
+
+finishAbort ∷ Txn → IO Store
+finishAbort t = either (\e → fail ("abort: " <> show e)) pure (abortTransaction (txTid t) (txStore t))
+
+-- | The pages a plan writes, in order, with their bytes.
+gridPages ∷ Plan → [(PageNo, BS.ByteString)]
+gridPages = plPages
+
+shouldBeFailure ∷ Outcome → (StorageFailure → Bool) → IO ()
+shouldBeFailure o p = case o of
+  Failed f _ → unless (p f) (expectationFailure ("an unexpected failure: " <> show f))
+  other → expectationFailure ("expected a failure, got " <> show other)
+
+-- | Wait, with no timer, until the thread is blocked in a transaction (which is where a close waits for work still in
+-- flight and where a drain waits for a close). A thread that has finished or died instead fails the example at once:
+-- that is what a close or drain that does not wait looks like, so the negative is observed, not sampled early.
+awaitBlockedInStm ∷ ThreadId → IO ()
+awaitBlockedInStm tid = bounded loop
+  where
+    loop = do
+      st ← threadStatus tid
+      case st of
+        ThreadBlocked BlockedOnSTM → pure ()
+        ThreadFinished → expectationFailure "the thread finished: it did not wait"
+        ThreadDied → expectationFailure "the thread died: it did not wait"
+        _ → yield >> loop
+
+-- | Every rule the probe was given has been used up (a rule of unlimited use never is): an injected fault that never fired
+-- is not a fault that was handled.
+rulesConsumed ∷ Probe → IO Bool
+rulesConsumed p = do
+  rules ← readTVarIO (pRules p)
+  lefts ← mapM (readTVarIO . rUses) rules
+  pure (all (== 0) lefts)
+
+-- | The threads the service's workers run on.
+workerThreads ∷ Probe → IO [ThreadId]
+workerThreads p = readTVarIO (pWorkers p)
+
+-- | An example whose body makes a native close FAIL: the service always keeps a failing close as labelled evidence, so its
+-- scope ends with that failure (the report the caller received is a copy); a normal end is a failure of the example.
+withEnvEndingWithKeptFailure ∷ ∀ a. (Env → IO a) → IO ()
+withEnvEndingWithKeptFailure body = void (withEnvEndingWithKeptFailureWith defaultOptions body)
+
+-- | The same under chosen options, answering the kept failures as the scope's end shows them. THE BODY'S OWN FAILURE IS NOT
+-- MASKED: an expectation that fails inside the body is rethrown as it is, after the scope has ended (the scope's end also
+-- carries the kept failure, and an exception with a cleanup failure attached must never pass for the expected end).
+withEnvEndingWithKeptFailureWith ∷ ∀ a. EnvOptions → (Env → IO a) → IO String
+withEnvEndingWithKeptFailureWith opts body = do
+  inner ← newIORef (Nothing ∷ Maybe (Either SomeException ()))
+  r ← tryWithContext (withEnvWith opts (\env → try (body env) >>= writeIORef inner . Just . void)) ∷ IO (Either (ExceptionWithContext SomeException) ())
+  readIORef inner >>= \x → case x of
+    Just (Left (e ∷ SomeException)) → throwIO e
+    Just (Right ()) → pure ()
+    Nothing → expectationFailure "the example's body never ran"
+  case r of
+    Left (ExceptionWithContext ctx _) → do
+      length (cleanupFailuresInContext ctx) `shouldSatisfy` (>= 1)
+      pure (unwords (map displayCleanupFailure (cleanupFailuresInContext ctx)))
+    Right _ → expectationFailure "a failing close was kept by the service and must end its scope with the failure, but the scope ended normally" >> pure ""
+
+-- | Wait, with no timer, until a thread is blocked delivering an exception (@throwTo@ to a target that cannot take it
+-- yet: it is in an uninterruptible region). The cancellation is then PENDING against the target.
+awaitBlockedOnThrowTo ∷ ThreadId → IO ()
+awaitBlockedOnThrowTo tid = bounded loop
+  where
+    loop = do
+      st ← threadStatus tid
+      case st of
+        ThreadBlocked BlockedOnException → pure ()
+        ThreadFinished → expectationFailure "the sender finished: the cancellation was not pending"
+        ThreadDied → expectationFailure "the sender died"
+        _ → yield >> loop
+
+-- | The file length the service asks of the platform for a configuration: the model's usable pages and nothing else (the
+-- allowance less the model's overhead, on the page grid).
+payloadBytes ∷ StoreConfig → Word64
+payloadBytes cfg = cfgTotalPages cfg * fromIntegral pageSize
+
+-- | What the allowance leaves for the platform's own overhead: the physical allocation must fit it.
+budgetBytes ∷ StoreConfig → Word64
+budgetBytes cfg = cfgAllowanceBytes cfg - payloadBytes cfg
