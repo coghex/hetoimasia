@@ -22,6 +22,7 @@ import qualified Test.TerrainRuntime.Storage.Boundary as StorageBoundary
 import qualified Test.TerrainRuntime.Storage.Memory as StorageMemory
 import qualified Test.TerrainRuntime.Storage.Opacity as StorageOpacity
 import qualified Test.TerrainRuntime.Storage.Open as StorageOpen
+import qualified Test.TerrainRuntime.Backed.Outcomes as BackedOutcomes
 import qualified Test.TerrainRuntime.Store.AdmissionSpec as StoreAdmission
 import qualified Test.TerrainRuntime.Store.Allowance as StoreAllowance
 import qualified Test.TerrainRuntime.Store.Boundary as StoreBoundary
@@ -73,6 +74,7 @@ spec = do
   StoreFuzzTrees.spec
   StoreRebalance.spec
   StoreProtocol.spec
+  BackedOutcomes.spec
   StoreKeys.spec
   StoreMemory.spec
   StoreLarge.spec

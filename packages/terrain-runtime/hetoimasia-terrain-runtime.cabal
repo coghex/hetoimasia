@@ -62,6 +62,7 @@ library
         hetoimasia-foundation ==0.1.0.0,
         hetoimasia-runtime ==0.1.0.0,
         hetoimasia-terrain ==0.1.0.0,
+        hetoimasia-terrain-runtime:backed,
         hetoimasia-terrain-runtime:storage,
         hetoimasia-terrain-runtime:store
 
@@ -123,6 +124,26 @@ library storage
         hetoimasia-terrain ==0.1.0.0,
         hetoimasia-terrain-runtime:store
 
+-- The owner's decisions about the outcomes of the two private layers beneath it (#665): the
+-- typed storage faults of requirement 8, and one total decision for every outcome of the storage
+-- backend (#663) and of the store planner (#662). Pure: no STM, no thread, no I/O. It sits above
+-- `store` and `storage`, which it reads, and below the service, which performs what it decides;
+-- being private it is visible to no client, and this package's suite reaches it to enumerate every
+-- outcome.
+library backed
+    import: language
+    visibility: private
+    hs-source-dirs: backed
+    exposed-modules:
+        Hetoimasia.Terrain.Runtime.Backed.Backend
+        Hetoimasia.Terrain.Runtime.Backed.Fault
+    build-depends:
+        base >=4.22 && <4.23,
+        bytestring >=0.12 && <0.13,
+        text >=2.1 && <2.2,
+        hetoimasia-terrain-runtime:storage,
+        hetoimasia-terrain-runtime:store
+
 -- This package's own contracts, registered as the CPU validation group
 -- `test.terrain-runtime`. The suite drives the production service with
 -- controlled gates and no timing sleep; every thread it starts is owned through
@@ -136,6 +157,7 @@ test-suite terrain-runtime-tests
     -- when the program is started with -T.
     ghc-options: -threaded -rtsopts "-with-rtsopts=-T"
     other-modules:
+        Test.TerrainRuntime.Backed.Outcomes
         Test.TerrainRuntime.Basic
         Test.TerrainRuntime.Budgets
         Test.TerrainRuntime.Closure
@@ -206,6 +228,7 @@ test-suite terrain-runtime-tests
         hetoimasia-runtime ==0.1.0.0,
         hetoimasia-terrain ==0.1.0.0,
         hetoimasia-terrain-runtime ==0.1.0.0,
+        hetoimasia-terrain-runtime:backed,
         hetoimasia-terrain-runtime:storage,
         hetoimasia-terrain-runtime:store,
         hetoimasia-test-support ==0.1.0.0
