@@ -382,6 +382,10 @@ test-suite lua-engine-tests
     type: exitcode-stdio-1.0
     main-is: Main.hs
     hs-source-dirs: test
+    -- The terrain examples run the production backed service (#665), whose storage backend
+    -- refuses a runtime that is not threaded (a blocking native call must not stall the
+    -- capability the terrain owner runs on).
+    ghc-options: -threaded
     other-modules:
         Test.LuaEngine.Behavior
         Test.LuaEngine.Boot

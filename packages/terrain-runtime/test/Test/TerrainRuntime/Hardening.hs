@@ -12,7 +12,6 @@ import Control.Monad (forM_, void, when)
 import qualified Data.Text as T
 import Hetoimasia.Foundation.Log (LogEntry (..), callbackSink, defaultLogFilter, mkLogger)
 import Hetoimasia.Terrain.Cell (zRangeLo)
-import Hetoimasia.Terrain.Changes (changesBytes)
 import Hetoimasia.Terrain.Coordinate (RegionCoord (..), decomposeTile, mkLocalCoord)
 import Hetoimasia.Terrain.Residency
 import Hetoimasia.Terrain.Resident (residentCell)
@@ -31,16 +30,14 @@ import Test.TerrainRuntime.Fixtures
 
 spec ∷ Spec
 spec = describe "Accounting and lifetime hardening" $ do
-  it "accounts a coalescing removal that shrinks the retained changes without underflow" $
+  it "commits a coalescing removal to the store and retains nothing in RAM" $
     withService defaultConfig $ \svc → do
       (_, lease) <- openMain svc "main"
       -- Levels 0 and 2 are two intervals; removing 1 joins them into one.
       forM_ [0, 2, 1] $ \z → removeCell' svc lease (tile 0 0 z)
-      view <- inspectArena svc lease >>= maybe (fail "arena vanished") pure
-      changesBytes (viewChanges view) `shouldBe` 64
       model <- inspectModel svc
-      -- The model's retained account never decreases: the saving is not credited.
-      [arenaRetainedBytes a | a ← modelArenas model] `shouldBe` [80]
+      -- The model's retained account stays zero: every removal is the store's.
+      [arenaRetainedBytes a | a ← modelArenas model] `shouldBe` [0]
       answers <- mapM (\z → readCell svc lease (tile 0 0 z)) [0, 1, 2, 3]
       map cellIs answers `shouldBe` [True, True, True, False]
       settleChecks svc
@@ -271,7 +268,7 @@ spec = describe "Accounting and lifetime hardening" $ do
     let logger = mkLogger defaultLogFilter (callbackSink (\entry → if entryMessage entry == "terrain owner stopped" then note "owner log: stopped" else pure ()))
         served =
           withWorkerGroup $ \group →
-            ( withTerrainService defaultConfig (Ports alwaysAdmitting (signalling group started) logger noProbe) (\_ → atomically retry)
+            ( withStoragePort $ \port → withTerrainService (smallestStore defaultConfig) (Ports alwaysAdmitting (signalling group started) logger noProbe port) (\_ → atomically retry)
                 `catch` (\e → note "service returned" >> throwIO (e ∷ SomeException))
             )
     withOwnedThread served $ \thread waitServed → do
@@ -316,7 +313,7 @@ spec = describe "Accounting and lifetime hardening" $ do
     outcome <- try $
       withLoggingLifetime quiet $ \lifetime →
         withSupervision lifetime $ \control →
-          withTerrainService defaultConfig (Ports alwaysAdmitting (supervisedOwner control) quiet probe) $ \svc → do
+          withStoragePort $ \port → withTerrainService (smallestStore defaultConfig) (Ports alwaysAdmitting (supervisedOwner control) quiet probe port) $ \svc → do
             (_, lease) <- openMain svc "main"
             bad <- newHost False
             let failing = (hostEndpoint svc Nothing bad) {endpointSettle = \_ → throwSTM (ErrorCall "closure callback failed")}
@@ -451,7 +448,7 @@ spec = describe "Accounting and lifetime hardening" $ do
     outcome <- try $
       withLoggingLifetime quiet $ \lifetime →
         withSupervision lifetime $ \control →
-          withTerrainService defaultConfig (Ports alwaysAdmitting (supervisedOwner control) quiet (gatedProbe (\p → case p of PointStaging _ → True; _ → False) gate)) (\svc → (do
+          withStoragePort $ \port → withTerrainService (smallestStore defaultConfig) (Ports alwaysAdmitting (supervisedOwner control) quiet (gatedProbe (\p → case p of PointStaging _ → True; _ → False) gate) port) (\svc → (do
             (creatorA, leaseA) <- openMain svc "a"
             (_, leaseB) <- openMain svc "b"
             other <- okOf (registerClient svc)
@@ -560,7 +557,7 @@ spec = describe "Accounting and lifetime hardening" $ do
     outcome <- try $
       withLoggingLifetime quiet $ \lifetime →
         withSupervision lifetime $ \control →
-          withTerrainService defaultConfig (Ports alwaysAdmitting (supervisedOwner control) failingLogger noProbe) $ \svc → do
+          withStoragePort $ \port → withTerrainService (smallestStore defaultConfig) (Ports alwaysAdmitting (supervisedOwner control) failingLogger noProbe port) $ \svc → do
             (_, lease) <- openMain svc "main"
             host <- newHost True
             let failing = (hostEndpoint svc Nothing host) {endpointReady = throwSTM (ErrorCall "readiness callback failed")}
@@ -741,7 +738,7 @@ spec = describe "Accounting and lifetime hardening" $ do
     outcome <- try $
       withLoggingLifetime quiet $ \lifetime →
         withSupervision lifetime $ \control →
-          withTerrainService defaultConfig (Ports alwaysAdmitting (supervisedOwner control) quiet noProbe) $ \svc → do
+          withStoragePort $ \port → withTerrainService (smallestStore defaultConfig) (Ports alwaysAdmitting (supervisedOwner control) quiet noProbe port) $ \svc → do
             (creator, _) <- openMain svc "main"
             other <- okOf (registerClient svc)
             attached <- okOf (attachArena svc other "main") >>= await svc >>= expectSuccess

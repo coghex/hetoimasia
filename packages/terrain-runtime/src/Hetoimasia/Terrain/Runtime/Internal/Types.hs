@@ -23,6 +23,7 @@ module Hetoimasia.Terrain.Runtime.Internal.Types
   , Settlement (..)
   , Answer (..)
   , GrowAnswer (..)
+  , KnowledgeAnswer (..)
   , RetryAnswer (..)
   , CellAnswer (..)
   , ColumnAnswer (..)
@@ -113,8 +114,10 @@ module Hetoimasia.Terrain.Runtime.Internal.Types
   , OpenPhase (..)
   , GatherFor (..)
   , GatherTask (..)
+  , ReadRun (..)
   , SlotWork (..)
   , SlotTask (..)
+  , SlotRun (..)
   , Closing' (..)
   , LeaseRec (..)
   , ClientRec (..)
@@ -166,12 +169,14 @@ import qualified Hetoimasia.Terrain.Connectivity as C
 import qualified Hetoimasia.Terrain.Discovery as D
 import Hetoimasia.Terrain.Runtime.Backed.Fault (StorageFault)
 import Hetoimasia.Terrain.Runtime.Backed.Gather (Gather)
+import qualified Hetoimasia.Terrain.Runtime.Backed.Query as Query
+import qualified Hetoimasia.Terrain.Runtime.Backed.Growth as Growth
 import qualified Hetoimasia.Terrain.Runtime.Backed.Txn as Txn
 import Hetoimasia.Terrain.Runtime.Internal.Content (Prepared)
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Service (Backing, StorageService, Ticket)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Admission (Admission, EditBankError, EditBankSpec, Grant)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Format (PageNo, StoreIdentity)
-import Hetoimasia.Terrain.Runtime.Store.Internal.Model (Condition, Store, storeHeader)
+import Hetoimasia.Terrain.Runtime.Store.Internal.Model (Condition, GrowthProposal, Store, storeHeader)
 import Hetoimasia.Terrain.Runtime.Store.Internal.State (StoreConfig, StoreSpec)
 import qualified Hetoimasia.Terrain.Runtime.Store.Internal.State as StoreState
 import Hetoimasia.Terrain.Source (Source, SourceError, SourceLimits)
@@ -261,6 +266,16 @@ data Answer
   | -- | The creator's explicit retry: the conditions it verified gone and cleared, and
     -- those that remain (a persistent cause keeps its pause).
     ARetried !RetryAnswer
+  | -- | What is known of a cell (#661): its solid and its void, at one content and knowledge revision.
+    AKnowledge !KnowledgeAnswer
+  deriving stock (Eq, Show)
+
+data KnowledgeAnswer = KnowledgeAnswer
+  { knowledgeIncarnation ∷ !ArenaId
+  , knowledgeContent ∷ !Revision
+  , knowledgeRevision ∷ !Revision
+  , knowledgeValue ∷ !D.CellKnowledge
+  }
   deriving stock (Eq, Show)
 
 data GrowAnswer = GrowAnswer
@@ -347,7 +362,6 @@ data Refused
 -- | What 'Busy' names.
 data BusyWhy
   = BusyModel !BusyReason
-  | BusyRetainedEdits
   | BusyArenas
   | BusyLeases
   | BusyViews
@@ -524,6 +538,8 @@ data Cmd
   | CColumn !Column !ZRange
   | CSurface !Column
   | CRemove !TileCoord !(Maybe Precondition)
+  | -- | What is known of a cell.
+    CKnowledge !TileCoord
   | -- | The creator's growth to an allowance (bytes, validated at admission).
     CGrow !Word64
   | -- | The creator's explicit retry of a paused arena.
@@ -533,6 +549,8 @@ data Cmd
 data Staged = Staged
   { stagedArena ∷ !(Maybe ArenaId)
   , stagedRevision ∷ !Revision
+  , -- | The knowledge revision the work was read at (a knowledge answer is current only while it holds).
+    stagedKnowledge ∷ !Revision
   , stagedWork ∷ !StagedWork
   }
 
@@ -541,6 +559,9 @@ data StagedWork
   | StagedRemoval !Prepared
   | -- | An open or attach, decided in the arbitration itself.
     StagedControl
+  | -- | A creator's growth to a larger allowance, validated by the store's proposal: it takes
+    -- the session's slot when its host is eligible.
+    StagedGrowth !GrowthProposal
 
 data ReqPhase
   = Waiting
@@ -867,10 +888,19 @@ data GatherFor
 -- the cache credit its pin holds (secured before the pin was taken), and its wait.
 data GatherTask = GatherTask
   { gatherArena ∷ !ArenaId
-  , gatherRun ∷ !Gather
+  , gatherRun ∷ !ReadRun
   , gatherGrant ∷ !Grant
+  , -- | The committed content revision of the version the gather pinned: what its runs are
+    -- the removals of.
+    gatherRevision ∷ !Revision
+  , gatherKnowledge ∷ !Revision
   , gatherWake ∷ !Wake
   }
+
+-- | A pinned read: the removed runs of some columns, or a knowledge query of one cell.
+data ReadRun
+  = RunsRead !Gather
+  | KnowledgeRead !(Query.Query D.CellKnowledge)
 
 -- | What the session's one mutating transaction is for.
 data SlotWork
@@ -880,13 +910,18 @@ data SlotWork
   | SlotGrowth !RequestId
   deriving stock (Eq, Show)
 
+-- | What runs in the slot: a store transaction, or a creator's growth (serialised with mutation).
+data SlotRun
+  = SlotTxn !Txn.Run
+  | SlotGrow !Growth.GrowthRun
+
 -- | The session's ONE mutating store transaction (P-15): its arena, what it is for, the run
 -- that drives it, the edit-bank credits of its RAM (taken at the grant from the plan's own
 -- charge, released by the decision or once the run has drained) and its wait.
 data SlotTask = SlotTask
   { slotArena ∷ !ArenaId
   , slotWork ∷ !SlotWork
-  , slotRun ∷ !Txn.Run
+  , slotRun ∷ !SlotRun
   , slotCredit ∷ !(Maybe Grant)
   , slotWake ∷ !Wake
   , -- | The decision found the host not eligible, or the staging moved: the transaction is

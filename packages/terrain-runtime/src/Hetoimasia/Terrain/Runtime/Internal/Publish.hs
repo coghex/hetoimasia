@@ -53,6 +53,7 @@ module Hetoimasia.Terrain.Runtime.Internal.Publish
   , DecisionFor (..)
   , Verdict (..)
   , prepareDecision
+  , prepareGrowthDecision
   , checkedIncrements
   , decide
   ) where
@@ -82,21 +83,27 @@ import Hetoimasia.Terrain.Runtime.Store.Internal.Model
   , Store
   , TxnId
   , activeView
+  , commitGrowth
   , publish
+  , storeConfig
   , storeHeader
   , storeIdentity
   , storeVersion
   )
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan (Effects (..), Plan, plEffects, plIdentity, pidBaseVersion)
+import Hetoimasia.Terrain.Runtime.Store.Internal.State (cfgAllowanceBytes)
 
 -- | Everything a publication writes, prepared and forced before the decision.
 data Decision = Decision
   { decArena ∷ !ArenaId
   , decIdentity ∷ !StoreIdentity
   , decBase ∷ !Word64
-  , decTxn ∷ !TxnId
+  , -- | The transaction the publication ends ('Nothing' for a growth, which publishes no
+    -- roots: its decision commits the cap with nothing active in the store).
+    decTxn ∷ !(Maybe TxnId)
   , decNext ∷ !Store
-  , decEffects ∷ !Effects
+  , -- | The authority once published.
+    decAuthority ∷ !D.Authority
   , decFor ∷ !DecisionFor
   }
 
@@ -165,10 +172,26 @@ prepareDecision aid store tid plan for = do
       { decArena = aid
       , decIdentity = storeIdentity store
       , decBase = pidBaseVersion (plIdentity plan)
-      , decTxn = tid
+      , decTxn = Just tid
       , decNext = next
-      , decEffects = plEffects plan
+      , decAuthority = effAuthority (plEffects plan)
       , decFor = for
+      }
+
+-- | Build a growth's decision: the store with its larger allowance committed ('commitGrowth',
+-- which clears only a capacity pause), and its answer.
+prepareGrowthDecision ∷ ArenaId → Store → RequestId → PreparedGrowth → Either Text Decision
+prepareGrowthDecision aid store rid prepared = do
+  next ← either (Left . Text.pack . ("the store refused to commit an obtained growth: " <>) . show) Right (commitGrowth store)
+  Right
+    Decision
+      { decArena = aid
+      , decIdentity = storeIdentity store
+      , decBase = storeVersion store
+      , decTxn = Nothing
+      , decNext = next
+      , decAuthority = D.hAuthority (storeHeader store)
+      , decFor = ForGrowth rid prepared (GrowAnswer aid (cfgAllowanceBytes (storeConfig next)) True)
       }
 
 -- | THE decision. One transaction; see the module header for what it checks and writes.
@@ -183,14 +206,14 @@ decide svc credit dec = do
     Nothing → pure LostToEnd
     Just arena
       | storeIdentity (arenaStore arena) /= decIdentity dec → pure LostToEnd
-      | storeVersion (arenaStore arena) /= decBase dec || fmap avId (activeView (arenaStore arena)) /= Just (decTxn dec) →
+      | storeVersion (arenaStore arena) /= decBase dec || fmap avId (activeView (arenaStore arena)) /= decTxn dec →
           throwSTM (DecisionDefect "the committed store is not the base of the transaction the owner holds")
       | otherwise → case decFor dec of
           ForBatch → do
             commitStore arena []
             slotDone True
             markFreed svc
-            pure (Committed (effAuthority (decEffects dec)))
+            pure (Committed (decAuthority dec))
           ForRemoval rid tile precondition answer generation palette resident growth → case Map.lookup rid (stateRequests st) of
             Nothing → pure LostToEnd
             Just req
@@ -210,7 +233,7 @@ decide svc credit dec = do
                           let (region, _) = decomposeTile tile
                           unless (regionGeneration st aid region == Just generation) $
                             throwSTM (DecisionDefect "the cell's region changed between the rebuild and the decision")
-                          modelEvent (R.RemovalCommitted rid (D.authContent (effAuthority (decEffects dec))) 0 growth)
+                          modelEvent (R.RemovalCommitted rid (D.authContent (decAuthority dec)) 0 growth)
                           -- the commit is backed already: the region's detail is a cache again at once, with no
                           -- transfer and no duplicate (requirement 6: offload needs no new authoritative write)
                           modelEvent (R.BeginHandoff aid region 0)
@@ -221,7 +244,7 @@ decide svc credit dec = do
                           slotDone False
                           markFreed svc
                           endpointSettle (reqEndpoint req) (Succeeded (ARemoved answer))
-                          pure (Committed (effAuthority (decEffects dec)))
+                          pure (Committed (decAuthority dec))
           ForGrowth rid prepared answer → case Map.lookup rid (stateRequests st) of
             Nothing → pure LostToEnd
             Just req → do
@@ -237,7 +260,7 @@ decide svc credit dec = do
                   slotDone False
                   markFreed svc
                   endpointSettle (reqEndpoint req) (Succeeded (AGrown answer))
-                  pure (Committed (effAuthority (decEffects dec)))
+                  pure (Committed (decAuthority dec))
   where
     modelEvent event =
       applyEvent svc event >>= \case
@@ -281,7 +304,7 @@ decide svc credit dec = do
             , r /= rid
             , reqArena q == Just aid
             , case reqPhase q of Done → False; _ → True
-            , case reqCmd q of CRemove {} → True; CCell {} → True; CColumn {} → True; CSurface {} → True; _ → False
+            , case reqCmd q of CRemove {} → True; CCell {} → True; CColumn {} → True; CSurface {} → True; CKnowledge {} → True; _ → False
             ]
       forM_ others (readmitSTM svc)
     regionGeneration st aid region =

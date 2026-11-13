@@ -140,7 +140,9 @@ library backed
         Hetoimasia.Terrain.Runtime.Backed.Backend
         Hetoimasia.Terrain.Runtime.Backed.Fault
         Hetoimasia.Terrain.Runtime.Backed.Gather
+        Hetoimasia.Terrain.Runtime.Backed.Growth
         Hetoimasia.Terrain.Runtime.Backed.Port
+        Hetoimasia.Terrain.Runtime.Backed.Query
         Hetoimasia.Terrain.Runtime.Backed.Txn
     build-depends:
         base >=4.22 && <4.23,
@@ -165,7 +167,10 @@ test-suite terrain-runtime-tests
     -- when the program is started with -T.
     ghc-options: -threaded -rtsopts "-with-rtsopts=-T"
     other-modules:
+        Test.TerrainRuntime.Backed.Discovery
         Test.TerrainRuntime.Backed.Outcomes
+        Test.TerrainRuntime.Backed.Service
+        Test.TerrainRuntime.Backed.Sweep
         Test.TerrainRuntime.Backed.Txn
         Test.TerrainRuntime.Basic
         Test.TerrainRuntime.Budgets

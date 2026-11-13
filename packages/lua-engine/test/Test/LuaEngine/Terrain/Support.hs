@@ -47,6 +47,10 @@ module Test.LuaEngine.Terrain.Support
   ) where
 
 import Control.Concurrent.MVar (MVar, newEmptyMVar, takeMVar, tryPutMVar, tryTakeMVar)
+import qualified Data.ByteString.Char8 as BC
+import Hetoimasia.Terrain.Runtime.Storage (filesystemOf, minHeadroomBytes, mkStorageConfig)
+import Hetoimasia.Terrain.Runtime.Store (StoreSpec (..), defaultStoreSpec, minAllowanceBytes)
+import System.IO.Temp (withSystemTempDirectory)
 import Data.IORef (modifyIORef', newIORef, readIORef)
 import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, retry, writeTVar)
 import Control.Exception (onException)
@@ -93,6 +97,13 @@ data Rig = Rig
 quiet ∷ Logger
 quiet = mkLogger defaultLogFilter (callbackSink (\_ → pure ()))
 
+-- | The smallest allowance an arena may have (64 MiB), unless the configuration names its own: routine
+-- suites never reserve the 1 GiB default.
+smallestAllowance ∷ Config → Config
+smallestAllowance config
+  | configStore config == defaultStoreSpec = config {configStore = defaultStoreSpec {specAllowanceBytes = toInteger minAllowanceBytes}}
+  | otherwise = config
+
 -- | A rig over the default service configuration and no probe.
 withRig ∷ (Rig → IO a) → IO a
 withRig = withRigProbe defaultConfig noProbe
@@ -112,8 +123,16 @@ withRigProbe config probe = withRigHooks config probe noTerrainHooks
 -- | A rig whose adapter tells these hooks of the windows a race is decided in.
 withRigHooks ∷ Config → Probe → TerrainHooks → (Rig → IO a) → IO a
 withRigHooks config probe terrainHooks body =
-  withWorkerGroup $ \group →
-    withTerrainService config (Ports alwaysAdmitting (standaloneSupervisor group) quiet probe) $ \service → do
+  -- The arenas' private files are real reserved files in a temporary directory, through the production
+  -- adapter; the directory's filesystem is named the way the backend reads it and qualified for this run
+  -- (the production list is not widened), and an arena reserves the smallest allowance unless the
+  -- configuration names its own.
+  withSystemTempDirectory "hetoimasia-lua-terrain" $ \dir → do
+    let directory = BC.pack dir
+    name ← filesystemOf directory >>= either (\f → fail ("cannot name the test filesystem: " <> show f)) pure
+    storage ← either (\e → fail (show e)) pure (mkStorageConfig [name] minHeadroomBytes)
+    withWorkerGroup $ \group →
+     withTerrainService (smallestAllowance config) (Ports alwaysAdmitting (standaloneSupervisor group) quiet probe (storagePort group storage directory)) $ \service → do
       facade ← newTerrainFacade fixedM1Profile service
       session ← newUnique
       signals ← newTVarIO Set.empty

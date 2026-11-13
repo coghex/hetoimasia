@@ -56,6 +56,9 @@ module Hetoimasia.Terrain.Runtime.Internal.Backed
   , drainReady
   , closeDrained
 
+    -- * The oracle
+  , backedInvariants
+
     -- * Shared
   , closingOf
   , storeOfArena
@@ -83,6 +86,8 @@ import Hetoimasia.Terrain.Residency (ArenaId (..), RequestId, Revision (..))
 import Hetoimasia.Terrain.Runtime.Backed.Backend
 import Hetoimasia.Terrain.Runtime.Backed.Fault
 import Hetoimasia.Terrain.Runtime.Backed.Gather
+import Hetoimasia.Terrain.Runtime.Backed.Query
+import qualified Hetoimasia.Terrain.Runtime.Backed.Growth as Growth
 import Hetoimasia.Terrain.Runtime.Backed.Txn (Done (..), Io (..), Progress (..))
 import qualified Hetoimasia.Terrain.Runtime.Backed.Txn as Txn
 import Hetoimasia.Terrain.Runtime.Internal.Content (Prepared (..))
@@ -91,6 +96,7 @@ import Hetoimasia.Terrain.Runtime.Internal.Types hiding (OwnerPhase (..))
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Service
   ( Backing
   , OpenSpec (..)
+  , PreparedGrowth
   , awaitTicket
   , cancelTicket
   , closeBacking
@@ -103,7 +109,7 @@ import Hetoimasia.Terrain.Runtime.Storage.Internal.Types (WorkClass (..))
 import qualified Hetoimasia.Terrain.Runtime.Store.Internal.Admission as A
 import Hetoimasia.Terrain.Runtime.Store.Internal.Admission (Admission, Grant)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Format (PageNo, StoreIdentity (..))
-import Hetoimasia.Terrain.Runtime.Store.Internal.Model (Condition (..), Store, TxnId, conditions, oldestPin, pauseFor, storeFromRoots, storeHeader, storeRoots, storeVersion)
+import Hetoimasia.Terrain.Runtime.Store.Internal.Model (ActiveView (..), Condition (..), GrowthProposal, Store, activeView, TxnId, conditions, oldestPin, pauseFor, storeFromRoots, storeHeader, storeRoots, storeVersion)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan (Plan)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Protocol (discoveryPlanner, maintenancePlanner, removalPlanner)
 import Hetoimasia.Terrain.Runtime.Store.Internal.State (Roots (..), StoreConfig, emptyRoots, maxReaders)
@@ -256,6 +262,9 @@ stepOpen svc ops rid = do
     OpenQueued
       | not alive → atomically (dropOpen svc rid 0)
       | stateCompiling st /= Nothing → pure ()
+      | stateCompileUse st + peak > serviceCompileBank svc →
+          -- the account is sized so that valid work never exhausts it: a charge that does not fit is a defect
+          failOpen 0 (Text.pack ("the compile account cannot take a compilation's peak: " <> show (stateCompileUse st) <> " + " <> show peak <> " > " <> show (serviceCompileBank svc)))
       | otherwise → atomically $ do
           modifySt svc (\s → s {stateCompiling = Just rid, stateCompileUse = stateCompileUse s + peak})
           setPhase task (OpenCompiling (C.startPreparation limits (openSource task)) peak)
@@ -271,9 +280,15 @@ stepOpen svc ops rid = do
             Right (C.Refused other _) → failOpen held (Text.pack ("the source compiler refused a valid source: " <> show other))
             Right (C.Complete conn _) → do
               env ← evaluate (D.mkEnv (configDiscovery config) (openSource task) conn)
-              shared ← evaluate (fromInteger (D.envSharedBytes env) ∷ Word64)
-              if shared > perArenaShared limits
-                then failOpen held (Text.pack ("a compiled arena holds more than its account: " <> show shared))
+              let stats = C.connectivityStats conn
+              shared ← evaluate (sharedCharge (C.statResultBytes stats) (C.statNodes stats))
+              if toInteger shared /= D.envSharedBytes env
+                then failOpen held (Text.pack ("the compile account's charge disagrees with #661's: " <> show shared <> " against " <> show (D.envSharedBytes env)))
+              else if shared > perArenaShared limits
+                then
+                  -- what the arena would keep (its connectivity and every structure derived from it) passes
+                  -- the per-arena bound of the compile account: the expected source_complexity, naming it
+                  atomically (dropOpen svc rid held >> terminate svc rid (Failed (StorageFailed (FaultComplexity "compiled arena (connectivity and member index)" shared (perArenaShared limits)))))
                 else do
                   (aid, ident) ← atomically $ do
                     s ← readSt svc
@@ -364,6 +379,8 @@ data Gathered
   = -- | Every run of the columns, read from one committed version, with that version's
     -- content revision.
     GatheredRuns ![(Column, Int64, Int64)] !Revision
+  | -- | What is known of the cell, read from one committed version, with its content and knowledge revisions.
+    GatheredKnowledge !D.CellKnowledge !Revision !Revision
   | GatheredFailed !Handling
   | -- | Cancelled and drained: nothing to deliver.
     GatheredNothing
@@ -378,8 +395,8 @@ canStartGather st adm aid =
 
 -- | Start a gather of some columns: the pin's credit is secured BEFORE the pin is taken; no
 -- credit, no pin. False when nothing was started.
-startGatherFor ∷ Service → GatherFor → ArenaId → [Column] → STM Bool
-startGatherFor svc key aid columns = do
+startGatherFor ∷ Service → GatherFor → ArenaId → Either [Column] TileCoord → STM Bool
+startGatherFor svc key aid what = do
   st ← readSt svc
   adm ← readTVar (serviceEditBank svc)
   case Map.lookup aid (stateArenas st) of
@@ -387,14 +404,18 @@ startGatherFor svc key aid columns = do
       | not (Map.member key (stateGathers st))
       , canStartGather st adm aid
       , Right (grant, adm') ← A.reserve A.Foreground (pinCredits aid) adm
-      , Right (store', g) ← startGather (arenaStore arena) columns → do
+      , Right (store', run) ← begin arena → do
           writeTVar (serviceEditBank svc) adm'
-          writeTVar (serviceState svc) (putStore aid store' st) {stateGathers = Map.insert key (GatherTask aid g grant WakeNow) (stateGathers st)}
+          writeTVar (serviceState svc) (putStore aid store' st) {stateGathers = Map.insert key (GatherTask aid run grant (arenaRevision arena) (D.authKnowledge (arenaAuthority arena)) WakeNow) (stateGathers st)}
           pure True
     _ → pure False
+  where
+    begin arena = case what of
+      Left columns → fmap RunsRead <$> startGather (arenaStore arena) columns
+      Right tile → fmap KnowledgeRead <$> startQuery (arenaStore arena) (\provider → D.queryCell (arenaEnv arena) provider tile)
 
--- | One step of a gather. When it ends, its pin and credit are released in the transaction that
--- removes it, and then its owner is given the result.
+-- | One step of a pinned read. When it ends, its pin and credit are released in the transaction
+-- that removes it, and then its owner is given the result.
 stepGatherTask ∷ Service → GatherFor → (Gathered → IO ()) → IO ()
 stepGatherTask svc key deliver = do
   st ← atomically (readSt svc)
@@ -403,34 +424,47 @@ stepGatherTask svc key deliver = do
       let aid = gatherArena task
           io = Io (serviceStorage svc) backing ExplicitWork
           wanted = ownerAlive st && Map.member aid (stateArenas st)
-      (g, progress) ←
-        if wanted
-          then stepGather io (closingOf st aid) store (gatherRun task)
-          else cancelGather io (gatherRun task)
-      let keep wake = atomically (modifySt svc (\s → s {stateGathers = Map.adjust (\t → t {gatherRun = g, gatherWake = wake}) key (stateGathers s)}))
-          end result = do
-            atomically $ do
-              s ← readSt svc
-              forM_ (storeOfArena s aid) $ \(current, _) →
-                writeTVar (serviceState svc) (putStore aid (endGather current g) s) {stateGathers = Map.delete key (stateGathers s)}
-              modifyTVar' (serviceEditBank svc) (releaseCredit (gatherGrant task))
-              markFreed svc
-            deliver result
+          closing = closingOf st aid
+      (run, progress) ← case gatherRun task of
+        RunsRead g → do
+          (g', p) ← if wanted then stepGather io closing store g else cancelGather io g
+          pure
+            ( RunsRead g'
+            , case p of
+                GMore → Left WakeNow
+                GBlocked wait → Left (WakeOn wait)
+                GDone runs → Right (GatheredRuns runs (gatherRevision task))
+                GFailed handling → Right (GatheredFailed handling)
+                GDrained → Right GatheredNothing
+            )
+        KnowledgeRead q → do
+          (q', p) ← if wanted then stepQuery io closing store q else cancelQuery io q
+          pure
+            ( KnowledgeRead q'
+            , case p of
+                QMore → Left WakeNow
+                QBlocked wait → Left (WakeOn wait)
+                QDone known → Right (GatheredKnowledge known (gatherRevision task) (gatherKnowledge task))
+                QFailed handling → Right (GatheredFailed handling)
+                QDrained → Right GatheredNothing
+            )
       case progress of
-        GMore → keep WakeNow
-        GBlocked wait → keep (WakeOn wait)
-        GDone runs → end (GatheredRuns runs (contentAt store g))
-        GFailed handling → end (GatheredFailed handling)
-        GDrained → end GatheredNothing
+        Left wake → atomically (modifySt svc (\s → s {stateGathers = Map.adjust (\t → t {gatherRun = run, gatherWake = wake}) key (stateGathers s)}))
+        Right result → do
+          atomically $ do
+            s ← readSt svc
+            forM_ (storeOfArena s aid) $ \(current, _) →
+              writeTVar (serviceState svc) (putStore aid (release' current run) s) {stateGathers = Map.delete key (stateGathers s)}
+            modifyTVar' (serviceEditBank svc) (releaseCredit (gatherGrant task))
+            markFreed svc
+          deliver result
   where
+    release' current = \case
+      RunsRead g → endGather current g
+      KnowledgeRead q → endQuery current q
     ownerAlive st = case key of
       GatherRequest rid → Map.member rid (stateRequests st)
       GatherJob jid → any (\j → R.jobId j == jid && R.jobPhase j == R.JobRunningPhase) (R.modelJobs (stateModel st))
-    -- the content revision of the version the gather pinned: the committed one, since a gather
-    -- that saw another commit is stale and its result is tagged with the version it read
-    contentAt store g
-      | gatherVersion g == storeVersion store = D.authContent (D.hAuthority (storeHeader store))
-      | otherwise = Revision maxBound
 
 -- ---------------------------------------------------------------------------
 -- The slot
@@ -438,6 +472,7 @@ stepGatherTask svc key deliver = do
 -- | Who may take the session's slot.
 data Contender
   = ContendRemoval !RequestId !ArenaId !TileCoord
+  | ContendGrowth !RequestId !ArenaId !GrowthProposal
   | ContendDiscovery !ArenaId
   | ContendReclaim !ArenaId
   deriving stock (Eq, Show)
@@ -465,6 +500,11 @@ contenders st = do
         , null (conditions (arenaStore arena)) → do
             eligible ← endpointEligible (reqEndpoint req)
             pure [ContendRemoval rid aid tile | eligible]
+      -- growth is admissible while paused: it is how a capacity pause is cleared
+      (CGrow _, StagedPhase sg, Just (aid, _))
+        | StagedGrowth proposal ← stagedWork sg → do
+            eligible ← endpointEligible (reqEndpoint req)
+            pure [ContendGrowth rid aid proposal | eligible]
       _ → pure []
     internalOf (aid, arena)
       | not (null (conditions (arenaStore arena))) = [ContendReclaim aid | reclaimWanted aid arena, not (integrityPaused arena)]
@@ -488,24 +528,23 @@ grantSlot ∷ Service → Contender → STM Bool
 grantSlot svc contender = do
   st ← readSt svc
   adm ← readTVar (serviceEditBank svc)
-  let aid = case contender of
-        ContendRemoval _ a _ → a
-        ContendDiscovery a → a
-        ContendReclaim a → a
-  case (stateSlot st, Map.lookup aid (stateArenas st)) of
-    (Nothing, Just arena) → case A.reserve A.Foreground (A.transactionCredits aid A.worstTransactionCharge) adm of
-      Left _ → pure False
-      Right (grant, adm') → do
-        let env = arenaEnv arena
-            store = arenaStore arena
-            (work, planner) = case contender of
-              ContendRemoval rid _ tile → (SlotRemoval rid, removalPlanner env store tile)
-              ContendDiscovery _ → (SlotDiscovery, discoveryPlanner env store)
-              ContendReclaim _ → (SlotReclaim, maintenancePlanner store)
-        writeTVar (serviceEditBank svc) adm'
-        writeTVar (serviceState svc) st {stateSlot = Just (SlotTask aid work (Txn.start store planner) (Just grant) WakeNow False), stateNeedsMaintenance = Set.delete aid (stateNeedsMaintenance st)}
-        pure True
-    _ → pure False
+  let txn aid arena work planner = case A.reserve A.Foreground (A.transactionCredits aid A.worstTransactionCharge) adm of
+        Left _ → pure False
+        Right (grant, adm') → do
+          writeTVar (serviceEditBank svc) adm'
+          writeTVar (serviceState svc) st {stateSlot = Just (SlotTask aid work (SlotTxn (Txn.start (arenaStore arena) planner)) (Just grant) WakeNow False), stateNeedsMaintenance = Set.delete aid (stateNeedsMaintenance st)}
+          pure True
+      live aid k = case (stateSlot st, Map.lookup aid (stateArenas st)) of
+        (Nothing, Just arena) → k arena
+        _ → pure False
+  case contender of
+    -- a growth holds no transaction RAM: its extra is the backend's, charged there
+    ContendGrowth rid aid proposal → live aid $ \_ → do
+      writeTVar (serviceState svc) st {stateSlot = Just (SlotTask aid (SlotGrowth rid) (SlotGrow (Growth.startGrowth proposal)) Nothing WakeNow False)}
+      pure True
+    ContendRemoval rid aid tile → live aid $ \arena → txn aid arena (SlotRemoval rid) (removalPlanner (arenaEnv arena) (arenaStore arena) tile)
+    ContendDiscovery aid → live aid $ \arena → txn aid arena SlotDiscovery (discoveryPlanner (arenaEnv arena) (arenaStore arena))
+    ContendReclaim aid → live aid $ \arena → txn aid arena SlotReclaim (maintenancePlanner (arenaStore arena))
 
 -- | Where a step left the slot's transaction, for the owner.
 data SlotEnd
@@ -515,6 +554,10 @@ data SlotEnd
     SlotEligible !SlotTask !TxnId !Plan
   | -- | The transaction ended without publishing; its slot and credits are already released.
     SlotOver !SlotTask !Done
+  | -- | A growth obtained its extra: the owner makes the decision that commits it.
+    SlotGrowthReady !SlotTask !PreparedGrowth
+  | -- | A growth ended without being committed; its slot is already released.
+    SlotGrowthOver !SlotTask !Growth.GrowthEnd
 
 -- | One step of the slot's transaction: a step of its run, or, when its request or arena has
 -- ended, a step of its cancellation (nothing is released until the job in flight has returned).
@@ -531,22 +574,37 @@ stepSlot svc = do
         let aid = slotArena task
             io = Io (serviceStorage svc) backing (classOf (slotWork task))
             wanted = Map.member aid (stateArenas st) && requestAlive st (slotWork task) && not (slotYield task)
-        (store', run', progress) ←
-          if wanted
-            then Txn.advance io (closingOf st aid) store (slotRun task)
-            else Txn.cancel io store (slotRun task)
-        let task' = task {slotRun = run'}
-            keep wake = atomically (modifySt svc (\s → (putStore aid store' s) {stateSlot = Just task' {slotWake = wake}}))
-        case progress of
-          More → keep WakeNow >> pure SlotGoesOn
-          Blocked wait → keep (WakeOn wait) >> pure SlotGoesOn
-          ReadyToPublish tid plan → keep WakeNow >> pure (SlotEligible task' tid plan)
-          Finished done → do
-            atomically $ do
-              modifySt svc (\s → (putStore aid store' s) {stateSlot = Nothing})
-              forM_ (slotCredit task) $ \g → modifyTVar' (serviceEditBank svc) (releaseCredit g)
-              markFreed svc
-            pure (SlotOver task' done)
+            end store' task' result = do
+              atomically $ do
+                modifySt svc (\s → (putStore aid store' s) {stateSlot = Nothing})
+                forM_ (slotCredit task) $ \g → modifyTVar' (serviceEditBank svc) (releaseCredit g)
+                markFreed svc
+              pure (result task')
+        case slotRun task of
+          SlotTxn run → do
+            (store', run', progress) ←
+              if wanted
+                then Txn.advance io (closingOf st aid) store run
+                else Txn.cancel io store run
+            let task' = task {slotRun = SlotTxn run'}
+                keep wake = atomically (modifySt svc (\s → (putStore aid store' s) {stateSlot = Just task' {slotWake = wake}}))
+            case progress of
+              More → keep WakeNow >> pure SlotGoesOn
+              Blocked wait → keep (WakeOn wait) >> pure SlotGoesOn
+              ReadyToPublish tid plan → keep WakeNow >> pure (SlotEligible task' tid plan)
+              Finished done → end store' task' (\t → SlotOver t done)
+          SlotGrow run → do
+            (store', run', progress) ←
+              if wanted
+                then Growth.advanceGrowth io (closingOf st aid) store run
+                else Growth.abandonGrowth io store run
+            let task' = task {slotRun = SlotGrow run'}
+                keep wake = atomically (modifySt svc (\s → (putStore aid store' s) {stateSlot = Just task' {slotWake = wake}}))
+            case progress of
+              Growth.GrowthMore → keep WakeNow >> pure SlotGoesOn
+              Growth.GrowthBlocked wait → keep (WakeOn wait) >> pure SlotGoesOn
+              Growth.GrowthReady prepared → keep WakeNow >> pure (SlotGrowthReady task' prepared)
+              Growth.GrowthOver over → end store' task' (\t → SlotGrowthOver t over)
   where
     requestAlive st = \case
       SlotRemoval rid → Map.member rid (stateRequests st)
@@ -586,3 +644,85 @@ closeDrained svc aid = do
           , stateNeedsMaintenance = Set.delete aid (stateNeedsMaintenance s)
           }
       markFreed svc
+
+-- ---------------------------------------------------------------------------
+-- The oracle
+
+-- | The backed state's physical truth set beside what is counted, for the suite after every
+-- step: an empty list means they agree. It reads the service state, the edit bank and the
+-- storage service's own view, never one from the other.
+--
+-- * Every live arena: the accounting model's revision is the store's committed content revision,
+--   and the model retains nothing for it (no history in RAM).
+-- * Every arena (live or closing): a reader pin exists exactly when a gather of it does; an
+--   active store transaction exists exactly when the session's slot runs one of it.
+-- * The compile account's use is the sum of what each arena, closing file and open holds, and
+--   never above the account.
+-- * The storage service holds a backing for every live and closing arena and every reserved open,
+--   and at most one more for each open whose reservation has finished untaken.
+-- * With no task of the owner and no job of the backend, the edit bank holds nothing.
+backedInvariants ∷ St → Admission → Word64 → Int → Int → [String]
+backedInvariants st adm compileBank backings records =
+  [ "arena " <> show aid <> ": the model's revision " <> show (R.arenaRevision info) <> " is not the store's " <> show (arenaRevision arena)
+  | (aid, arena) ← Map.toList (stateArenas st)
+  , info ← R.modelArenas (stateModel st)
+  , R.arenaId info == aid
+  , R.arenaRevision info /= arenaRevision arena
+  ]
+    <> [ "arena " <> show (R.arenaId info) <> " retains " <> show (R.arenaRetainedBytes info) <> " bytes of history in RAM"
+       | info ← R.modelArenas (stateModel st)
+       , R.arenaRetainedBytes info /= 0
+       ]
+    <> [ "arena " <> show aid <> ": " <> show gathers <> " gathers but the oldest pin is " <> show pin
+       | (aid, store) ← stores
+       , let gathers = length [() | t ← Map.elems (stateGathers st), gatherArena t == aid]
+             pin = oldestPin store
+       , (gathers == 0) /= (pin == Nothing)
+       ]
+    <> [ "arena " <> show aid <> ": an active transaction " <> show (fmap avId (activeView store)) <> " that the slot does not run"
+       | (aid, store) ← stores
+       , activeView store /= Nothing
+       , maybe True (\t → slotArena t /= aid || slotTxnId t /= fmap avId (activeView store)) (stateSlot st)
+       ]
+    <> [ "the slot runs " <> show (slotTxnId t) <> " of arena " <> show (slotArena t) <> " but its store holds " <> show (fmap avId . activeView . fst =<< storeOfArena st (slotArena t))
+       | Just t ← [stateSlot st]
+       , Just tid ← [slotTxnId t]
+       , (fmap avId . activeView . fst =<< storeOfArena st (slotArena t)) /= Just tid
+       ]
+    <> [ "the compile account holds " <> show (stateCompileUse st) <> " but its holders hold " <> show held
+       | stateCompileUse st /= held
+       ]
+    <> [ "the compile account holds " <> show (stateCompileUse st) <> " of " <> show compileBank
+       | stateCompileUse st > compileBank
+       ]
+    <> [ "the storage service holds " <> show backings <> " backings for " <> show wanted <> " to " <> show (wanted + reserving)
+       | backings < wanted || backings > wanted + reserving
+       ]
+    <> [ "the edit bank holds " <> show (A.ledgers adm) <> " with no task and no job"
+       | idle
+       , records == 0
+       , let lg = A.ledgers adm
+       , A.lgCacheBacked lg + A.lgCacheRamOnly lg + A.lgCachePinned lg + A.lgStagingForeground lg + A.lgStagingCamera lg + A.lgControlReserved lg /= 0
+       ]
+  where
+    slotTxnId t = case slotRun t of
+      SlotTxn run → Txn.runTxnId run
+      SlotGrow _ → Nothing
+    stores = [(aid, arenaStore a) | (aid, a) ← Map.toList (stateArenas st)] <> [(aid, closingStore c) | (aid, c) ← Map.toList (stateClosing st)]
+    held =
+      sum (map arenaShared (Map.elems (stateArenas st)))
+        + sum (map closingShared (Map.elems (stateClosing st)))
+        + sum (map (openHeld . openPhase) (Map.elems (stateOpens st)))
+    openHeld = \case
+      OpenQueued → 0
+      OpenCompiling _ n → n
+      OpenReserving _ _ _ n _ _ → n
+      OpenPublishable _ _ n _ _ → n
+      OpenUnwinding n _ _ → n
+    wanted = Map.size (stateArenas st) + Map.size (stateClosing st) + length [() | OpenPublishable {} ← map openPhase (Map.elems (stateOpens st))]
+    reserving = length [() | p ← map openPhase (Map.elems (stateOpens st)), isReserving p]
+    isReserving = \case
+      OpenReserving {} → True
+      OpenUnwinding {} → True
+      _ → False
+    idle = Map.null (stateGathers st) && maybe True (const False) (stateSlot st) && Map.null (stateOpens st)

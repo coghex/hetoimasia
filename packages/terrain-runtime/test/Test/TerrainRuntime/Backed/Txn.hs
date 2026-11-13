@@ -110,9 +110,11 @@ gatherRuns io pin store0 columns = case startGatherWith pin store0 columns of
     let loop g = do
           (g', progress) ← mask_ (stepGather io OwnerRunning store1 g)
           case progress of
+            GMore → loop g'
             GBlocked wait → atomically wait >> loop g'
             GDone runs → pure (g', Right runs)
             GFailed handling → pure (g', Left handling)
+            GDrained → pure (g', Left HandleClosing)
     (g, result) ← loop g0
     pure (endGather store1 g, result, gatherPeakWindow g)
 

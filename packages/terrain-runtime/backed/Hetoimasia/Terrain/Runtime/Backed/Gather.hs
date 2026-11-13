@@ -37,6 +37,8 @@ module Hetoimasia.Terrain.Runtime.Backed.Gather
   , gatherWindowPages
   , gatherPeakWindow
   , gatherPinLimit
+  , lostTicket
+  , supplied
   ) where
 
 import Control.Concurrent.STM (STM, atomically)

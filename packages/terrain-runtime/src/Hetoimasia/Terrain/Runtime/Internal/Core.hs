@@ -88,6 +88,7 @@ module Hetoimasia.Terrain.Runtime.Internal.Core
   , modelLimitsChecked
   , compileBankFor
   , perArenaShared
+  , sharedCharge
   ) where
 
 import Control.Applicative ((<|>))
@@ -258,6 +259,7 @@ data Submission
   | SubColumn !ArenaLease !Column !ZRange
   | SubSurface !ArenaLease !Column
   | SubRemove !ArenaLease !TileCoord !(Maybe Precondition)
+  | SubKnowledge !ArenaLease !TileCoord
   | -- | The creator's growth of an arena's allowance to a size in bytes.
     SubGrow !ArenaLease !Integer
   | -- | The creator's explicit retry of a paused arena.
@@ -278,7 +280,9 @@ data Short
 busyWhy ∷ R.Refusal → Short
 busyWhy refusal = case refusal of
   R.Busy reason → ShortRefused (RefusedBusy (BusyModel reason))
-  R.RetainedEditsExhausted {} → ShortRefused (RefusedBusy BusyRetainedEdits)
+  -- the model's edit reservation is sized so that it never refuses (every command slot can hold
+  -- one removal's): a refusal is an accounting defect, never busy
+  R.RetainedEditsExhausted {} → ShortFailed (HostFailure "accounting: the model's edit reservation refused a removal")
   R.Invalid reason → ShortRefused (RefusedInvalid (Text.pack (show reason)))
   R.Stale _ → ShortFailed ArenaClosed
   R.ContractFailure reason → ShortFailed (HostFailure (Text.pack ("accounting: " <> show reason)))
@@ -299,6 +303,7 @@ demandFor source changes cmd = case cmd of
           tile <- either (Left . show) Right (tileCoord (toInteger (axisValue (columnX column))) (toInteger (axisValue (columnY column))) level)
           Right [tileDemand tile]
   CRemove tile _ → Right [tileDemand tile]
+  CKnowledge tile → Right [tileDemand tile]
   _ → Left "not a data command"
 
 -- | The columns a command's answer reads: the runs of these, gathered from one committed
@@ -309,6 +314,7 @@ commandColumns = \case
   CColumn column _ → [column]
   CSurface column → [column]
   CRemove (TileCoord x y _) _ → [Column x y]
+  CKnowledge _ → []
   COpen {} → []
   CAttach {} → []
   CGrow {} → []
@@ -397,8 +403,20 @@ pendingAcquisitions = countReqs (\req → isAcquisition req && not (isDone req))
 -- retiring because a snapshot of it is borrowed (its resident detail stays
 -- charged until the last borrower returns it). An arena leaves the count only when
 -- its retirement has completed.
+--
+-- A closed arena whose file is still draining or closing, and an open whose request ended while a
+-- job of it was in flight (it unwinds), also count: each still holds its share of the compile
+-- account, which is sized for at most this many arenas (so valid work can never exhaust it).
 arenaUse ∷ St → Int
-arenaUse st = Map.size (stateArenas st) + Map.size (stateRetiring st) + countReqs (\req → isOpenCmd req && not (isDone req)) st
+arenaUse st =
+  Map.size (stateArenas st)
+    + Set.size (Set.union (Map.keysSet (stateRetiring st)) (Map.keysSet (stateClosing st)))
+    + countReqs (\req → isOpenCmd req && not (isDone req)) st
+    + orphanOpens st
+
+-- | Opens whose request has ended while their task still drains a job or closes a file.
+orphanOpens ∷ St → Int
+orphanOpens st = Map.size (Map.filterWithKey (\rid _ → not (Map.member rid (stateRequests st)) && not (Map.member rid (stateGhosts st))) (stateOpens st))
 
 -- | Leases the service holds, for the lease limit: every lease record (live or
 -- revoked, until released) and every pending acquisition.
@@ -420,7 +438,7 @@ data LimitRow = LimitRow
 -- snapshots it handed out), never the accounting model or the retained-bank ledger.
 limitRows ∷ Config → St → [LimitRow]
 limitRows config st =
-  [ LimitRow "arenas" (w (configMaxArenas config)) (w (arenaUse st)) (w (Map.size (stateArenas st)) + w (length (Map.keys (stateRetiring st))) + w (length [() | ClaimPending _ ← Map.elems (stateNames st)]))
+  [ LimitRow "arenas" (w (configMaxArenas config)) (w (arenaUse st)) (w (Map.size (stateArenas st)) + w (length (Set.toList (Set.fromList (Map.keys (stateRetiring st) <> Map.keys (stateClosing st))))) + w (length [() | ClaimPending _ ← Map.elems (stateNames st)]) + w (orphanOpens st))
   , LimitRow "leases" (w (configMaxLeases config)) (w (leasesInUse st)) (sum [w (Set.size (clientLeases c)) | c ← Map.elems (stateClients st)] + w (length [() | req ← requestsAndGhosts, isAcquisition req, not (isDone req)]))
   , LimitRow "views" (w (configMaxViews config)) (w (Map.size (stateViews st))) (sum [w (Set.size (clientViews c)) | c ← Map.elems (stateClients st)])
   , LimitRow "clients" (w (configMaxClients config)) (w (Map.size (stateClients st))) (w (length (Map.keys (stateClients st))))
@@ -532,6 +550,7 @@ decide svc st rid = \case
         pure (Left (ShortRefused (RefusedInvalid "column range exceeds the level limit")))
     | otherwise → dataCommand lease (CColumn column range)
   SubSurface lease column → dataCommand lease (CSurface column)
+  SubKnowledge lease tile → dataCommand lease (CKnowledge tile)
   SubGrow lease bytes → case liveArena lease of
     Left short → pure (Left short)
     Right (_, _, _, arena) → case proposeGrowth (arenaStore arena) bytes of
@@ -1114,32 +1133,31 @@ invariants config st =
     modelIds = [R.requestId info | info <- R.modelRequests model]
     borrows = length [() | (_, _, R.Borrow, _) <- R.modelHolds model]
 
--- | What one arena's compiled connectivity can hold in the compile account at most: the
--- compiler's result bound and #661's member index over at most the node bound (the bytes
--- 'D.envSharedBytes' charges an environment; an environment charged more is refused as a
--- defect at its open, so the figure is checked, not trusted).
-perArenaShared ∷ C.ConnectivityLimits → Word64
-perArenaShared limits = fromIntegral (C.limitResultBytes limits) + memberIndexBytesPerNode * fromIntegral (C.limitNodes limits)
+-- | THE charge of what a compiled arena keeps for its life in the compile account (owner decision
+-- 2026-11-13, option B): its compiled connectivity's result bytes and #661's ordered member index
+-- over its nodes ('D.envSharedBytes' charges an environment exactly this; an open checks the two
+-- agree). One function: the account's size and the per-arena bound are this charge at the
+-- compiler's limits, and a real arena is charged this at its own figures.
+sharedCharge ∷ Integer → Integer → Word64
+sharedCharge resultBytes nodes = fromInteger (resultBytes + memberIndexBytesPerNode * nodes)
 
 -- | #661's per-node charge for the ordered member index ('D.envSharedBytes').
-memberIndexBytesPerNode ∷ Word64
+memberIndexBytesPerNode ∷ Integer
 memberIndexBytesPerNode = 32
 
--- | The compile account (P-15: 48 MiB peak and 16 MiB results, charged to the 256 MiB
--- resident bank): every other arena that may be open at once holds at most 'perArenaShared',
--- and the one compilation active in the session at most its peak (which includes its result).
+-- | The per-arena bound: 'sharedCharge' at the compiler's result and node limits.
+perArenaShared ∷ C.ConnectivityLimits → Word64
+perArenaShared limits = sharedCharge (toInteger (C.limitResultBytes limits)) (toInteger (C.limitNodes limits))
+
+-- | The compile account's size: every other arena that may be open at once at its per-arena bound,
+-- and the one compilation active in the session at its peak (which includes its result).
 compileBankFor ∷ Int → C.ConnectivityLimits → Word64
 compileBankFor arenas limits = fromIntegral (max 0 (arenas - 1)) * perArenaShared limits + fromIntegral (C.limitPeakBytes limits)
 
 -- | The accounting model's limits, checked: the compile account must leave the resident
 -- bank something, and the model's own minimum budgets must hold.
 modelLimitsChecked ∷ Config → Either ConfigError R.Limits
-modelLimitsChecked config
-  | compile >= resident = Left (ConfigCompileBank compile resident)
-  | otherwise = either (Left . ConfigError) Right (modelLimitsFor config)
-  where
-    compile = compileBankFor (configMaxArenas config) (configConnectivity config)
-    resident = R.limitBytes (configLimits config) R.ResidentBank
+modelLimitsChecked config = either (Left . ConfigError) Right (modelLimitsFor config)
 
 -- | The accounting model's limits: the configured profile with the snapshot bank taken out
 -- of its staging bank and the compile account (every arena's compiled connectivity and the
@@ -1154,7 +1172,8 @@ modelLimitsFor ∷ Config → Either R.LimitError R.Limits
 modelLimitsFor config =
   R.mkLimits
     R.LimitsSpec
-      { R.specResidentBytes = bytes R.ResidentBank - toInteger (compileBankFor (configMaxArenas config) (configConnectivity config))
+      -- the compile account is its own, beside the three banks (owner decision 2026-11-13, option B)
+      { R.specResidentBytes = bytes R.ResidentBank
       , R.specEditBytes = slot R.CommandSlot * toInteger R.removalRetainedBytes
       , R.specStagingBytes = bytes R.StagingBank - toInteger (configRetainedBytes config)
       , R.specLoadJobs = slot R.LoadJobSlot

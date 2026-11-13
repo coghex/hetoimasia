@@ -27,6 +27,9 @@ module Hetoimasia.Terrain.Runtime.Settlement
   , columnWith
   , surfaceWith
   , removeWith
+  , knowledgeWith
+  , growWith
+  , retryWith
 
     -- * Cancelling and retiring
   , cancel
@@ -74,6 +77,23 @@ surfaceWith svc ep lease column = atomically (admit svc ep (SubSurface lease col
 
 removeWith ∷ Service → Endpoint → ArenaLease → TileCoord → Maybe Precondition → IO (Either Refused Request)
 removeWith svc ep lease tile precondition = atomically (admit svc ep (SubRemove lease tile precondition))
+
+-- | What is known of a cell (#661's known solid and known void), read from the arena's store at one
+-- committed version and settled like any read: current while its content and knowledge revisions hold.
+knowledgeWith ∷ Service → Endpoint → ArenaLease → TileCoord → IO (Either Refused Request)
+knowledgeWith svc ep lease tile = atomically (admit svc ep (SubKnowledge lease tile))
+
+-- | The creator's growth of an arena's allowance to a size in bytes (requirement 9): equal is an
+-- idempotent success, smaller settles @storage_size_not_increased@, larger becomes spendable only
+-- when the storage backend has obtained it and the decision commits the cap with the result. A
+-- size that can never be granted is refused before admission; an attached lease has no authority.
+growWith ∷ Service → Endpoint → ArenaLease → Integer → IO (Either Refused Request)
+growWith svc ep lease bytes = atomically (admit svc ep (SubGrow lease bytes))
+
+-- | The creator's explicit retry of a paused arena: a bounded revalidation that clears only the
+-- cause it verified gone, and never repeats a failed edit. On a ready arena it succeeds idempotently.
+retryWith ∷ Service → Endpoint → ArenaLease → IO (Either Refused Request)
+retryWith svc ep lease = atomically (admit svc ep (SubRetry lease))
 
 -- | Cancel a request. If it has not settled, cancellation wins and nothing is
 -- committed; if its commit won, this answers 'AlreadySettled' and cannot undo it.

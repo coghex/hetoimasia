@@ -1,12 +1,9 @@
--- | Offload and reload: retained removals survive eviction and reconstruction,
--- a failed transfer loses nothing, and exhausted edit capacity refuses without
--- deleting what was kept.
+-- | Offload and reload: removals survive eviction and reconstruction from the arena's store,
+-- and an acknowledged removal leaves nothing of itself in RAM.
 module Test.TerrainRuntime.Offload (spec) where
 
-import Control.Concurrent.STM
-import Control.Exception (ErrorCall (..), throwIO)
 import Control.Monad (foldM_, forM_)
-import Hetoimasia.Terrain.Changes (changeIntervalCount, changesBytes)
+import Hetoimasia.Terrain.Runtime.Store.Internal.Model (Usage (..))
 import Hetoimasia.Terrain.Coordinate (RegionCoord (..), decomposeTile)
 import Hetoimasia.Terrain.Residency
 import Hetoimasia.Terrain.Runtime
@@ -64,10 +61,10 @@ spec = describe "Offload and reload" $ do
       model <- inspectModel svc
       -- Eviction happened: fewer regions are resident than were touched.
       length (modelRegions model) `shouldSatisfy` (< length touched)
-      -- The retained changes are exactly the removed solid cells.
+      -- The removals are in the arena's store and nothing of them is retained in RAM.
       view <- inspectArena svc lease >>= maybe (fail "arena vanished") pure
-      changeIntervalCount (viewChanges view) `shouldSatisfy` (> 0)
-      [arenaRetainedBytes a | a ← modelArenas model] `shouldBe` [fromIntegral (changesBytes (viewChanges view))]
+      usLiveBytes (viewUsage view) `shouldSatisfy` (> 0)
+      [arenaRetainedBytes a | a ← modelArenas model] `shouldBe` [0]
       settleChecks svc
 
   it "removes an air cell as a no-op and a slope as a whole cell, leaving neighbours alone" $
@@ -91,59 +88,21 @@ spec = describe "Offload and reload" $ do
       (removeChangedFlag again, removeRevision again) `shouldBe` (False, Revision 1)
       settleChecks svc
 
-  it "refuses a new edit with busy when the retained edits are full, keeping every earlier one" $
-    withService (tightConfig (2, 1, 2) 2 192) $ \svc → do
-      client <- okOf (registerClient svc)
-      lease <- okOf (openArena svc client "full" terrainSpec) >>= await svc >>= expectSuccess
-      -- Three removals in three columns fill 192 bytes.
-      forM_ [(0, 0, 33), (16, 0, 33), (0, 16, 33)] $ \(x, y, z) → removeCell' svc lease (tile x y z)
-      before' <- inspectModel svc
-      let requestsBefore = length (modelRequests before')
-          retainedBefore = [arenaRetainedBytes a | a ← modelArenas before']
-      removeAt svc lease (tile 1 0 33) Nothing >>= \r → refusedWith r `shouldBe` Just (RefusedBusy BusyRetainedEdits)
-      after' <- inspectModel svc
-      -- Busy created no request, no reservation and no edit; the revision stands.
-      (length (modelRequests after'), [arenaRetainedBytes a | a ← modelArenas after']) `shouldBe` (requestsBefore, retainedBefore)
-      -- Reads and navigation continue, and the earlier edits are intact.
-      forM_ [(0, 0, 33), (16, 0, 33), (0, 16, 33)] $ \(x, y, z) → do
-        found <- readCell svc lease (tile x y z)
-        (cellIs found, cellRevision found) `shouldBe` (True, Revision 3)
-      untouched <- readCell svc lease (tile 1 0 33)
-      cellIs untouched `shouldBe` False
-      settleChecks svc
-
-  it "retains changes through a failed transfer and transfers them after the region changes again" $ do
-    attempts <- newTVarIO (0 ∷ Int)
-    reported <- newTVarIO ([] ∷ [Bool])
-    let probe = Probe $ \point → case point of
-          PointHandoff _ _ → do
-            n <- atomically (stateTVar attempts (\k → (k, k + 1)))
-            if n == 0 then throwIO (ErrorCall "injected transfer failure") else pure ()
-          PointHandoffReported _ _ ok → atomically (modifyTVar' reported (<> [ok]))
-          _ → pure ()
-    withServiceUsing (tightConfig (2, 1, 2) 2 4096) alwaysAdmitting probe $ \svc → do
+  it "keeps nothing of an acknowledged removal in RAM: its region is a cache again at once, and eviction and reload reconstruct it from the store" $
+    withService (tightConfig (2, 1, 2) 2 4096) $ \svc → do
       client <- okOf (registerClient svc)
       lease <- okOf (openArena svc client "transfer" terrainSpec) >>= await svc >>= expectSuccess
       let (held, _) = decomposeTile (tile 0 0 33)
       _ <- removeCell' svc lease (tile 0 0 33)
-      waitFor (readTVar reported >>= \r → check (r == [False]))
-      -- The transfer failed: the region is still changed and protected, its
-      -- changes are retained, and nothing moved to the store.
+      -- The removal is backed when it is acknowledged: its region is not dirty and no transfer
+      -- is pending, so its detail can be evicted like any cache.
       model <- inspectModel svc
-      [(regionDirty r, regionHandoff r) | r ← modelRegions model, regionCoord r == held] `shouldBe` [(True, Nothing)]
-      view <- inspectArena svc lease >>= maybe (fail "arena vanished") pure
-      (viewWorking view, changeIntervalCount (viewStore view)) `shouldBe` ([held], 0)
-      found <- readCell svc lease (tile 0 0 33)
-      cellIs found `shouldBe` True
-      -- Pressure cannot evict the protected region.
+      [(regionDirty r, regionHandoff r) | r ← modelRegions model, regionCoord r == held] `shouldBe` [(False, Nothing)]
+      [arenaRetainedBytes a | a ← modelArenas model] `shouldBe` [0]
+      -- Pressure evicts the region; reading it again reconstructs the removal from the store.
       forM_ [(16, 0, 0), (32, 0, 0), (-16, 0, 0), (0, 16, 0), (0, -16, 0), (16, 0, -32)] $ \(x, y, z) → readCell svc lease (tile x y z)
       regions <- map regionCoord . modelRegions <$> inspectModel svc
-      held `elem` regions `shouldBe` True
-      -- The region changes again; the retried transfer succeeds and moves the changes.
-      _ <- removeCell' svc lease (tile 1 0 33)
-      waitFor (readTVar reported >>= \r → check (r == [False, True]))
-      stored <- inspectArena svc lease >>= maybe (fail "arena vanished") pure
-      (viewWorking stored, changeIntervalCount (viewStore stored) > 0) `shouldBe` ([], True)
-      both <- mapM (\x → readCell svc lease (tile x 0 33)) [0, 1]
-      map cellIs both `shouldBe` [True, True]
+      held `elem` regions `shouldBe` False
+      found <- readCell svc lease (tile 0 0 33)
+      cellIs found `shouldBe` True
       settleChecks svc

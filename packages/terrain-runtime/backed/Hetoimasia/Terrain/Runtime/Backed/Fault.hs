@@ -26,6 +26,7 @@ import Hetoimasia.Terrain.Runtime.Storage.Internal.Types
   , ReservationFailure
   , UnsupportedWhy
   )
+import Hetoimasia.Terrain.Discovery (Integrity)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Format (PageError, PageNo, TreeId)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Model (Condition (..))
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan (IntegrityWhy)
@@ -70,6 +71,8 @@ data IntegritySource
     FromStore !IntegrityWhy
   | -- | A page the backend returned and the window refused.
     FromWindow !PageNo !PageError
+  | -- | #661's records, read from validated pages, cannot be a legitimate state.
+    FromRecords !Integrity
   deriving stock (Eq, Show)
 
 -- | The stable code of a fault (design P-15's names).

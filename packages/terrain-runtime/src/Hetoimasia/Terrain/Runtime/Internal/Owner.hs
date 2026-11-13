@@ -32,6 +32,8 @@ import Control.Concurrent.STM
 import Control.Exception (SomeAsyncException, SomeException, evaluate, fromException, mask, rethrowIO, throwIO, try, tryWithContext, uninterruptibleMask_)
 import Control.Monad (forM, forM_, unless, void, when)
 import Data.Int (Int64)
+import System.Environment (lookupEnv)
+import System.IO (hPutStrLn, stderr)
 import Data.List (sortOn)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (catMaybes, isJust, listToMaybe)
@@ -57,7 +59,12 @@ import Hetoimasia.Terrain.Runtime.Internal.Core
 import Hetoimasia.Terrain.Runtime.Internal.Publish
 import Hetoimasia.Terrain.Runtime.Internal.Types
 import qualified Hetoimasia.Terrain.Runtime.Store.Internal.Admission as A
-import Hetoimasia.Terrain.Runtime.Store.Internal.Model (TxnId, oldestPin, storeHeader, storeVersion)
+import qualified Hetoimasia.Terrain.Runtime.Backed.Growth as Growth
+import Hetoimasia.Terrain.Runtime.Backed.Fault (StorageFault (..))
+import Hetoimasia.Terrain.Runtime.Storage.Internal.Service (PreparedGrowth)
+import Hetoimasia.Terrain.Runtime.Store.Internal.Model (Condition (..), GrowthDecision (..), TxnId, clearCondition, conditions, oldestPin, proposeGrowth, storeConfig, storeHeader, storeRoots, storeVersion)
+import Hetoimasia.Terrain.Runtime.Store.Internal.Plan (TxClass (..), availablePages)
+import Hetoimasia.Terrain.Runtime.Store.Internal.State (cfgAllowanceBytes, maxClaimPages)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan (Effects (..), Plan, plEffects)
 
 -- | The component every terrain service record is reported under.
@@ -259,6 +266,7 @@ grantable st adm = do
     fits c = either (const False) (const True) (A.reserve A.Foreground (A.transactionCredits (arenaOf c) A.worstTransactionCharge) adm)
     arenaOf = \case
       ContendRemoval _ a _ → a
+      ContendGrowth _ a _ → a
       ContendDiscovery a → a
       ContendReclaim a → a
 
@@ -273,6 +281,7 @@ isDataCmd = \case
   CColumn {} → True
   CSurface {} → True
   CRemove {} → True
+  CKnowledge {} → True
   _ → False
 
 needsResubmit ∷ Req → Bool
@@ -324,7 +333,10 @@ pickRequestWork _ st adm = do
       _ → False
     stale sg = case stagedArena sg of
       Nothing → False
-      Just aid → maybe False (\a → arenaRevision a /= stagedRevision sg) (Map.lookup aid (stateArenas st))
+      Just aid → maybe False (\a → arenaRevision a /= stagedRevision sg || knowledgeMoved a sg) (Map.lookup aid (stateArenas st))
+    knowledgeMoved a sg = case stagedWork sg of
+      StagedAnswer (AKnowledge _) → D.authKnowledge (arenaAuthority a) /= stagedKnowledge sg
+      _ → False
     firstEligible [] = pure Nothing
     firstEligible ((rid, req) : rest) = do
       eligible <- endpointEligible (reqEndpoint req)
@@ -339,7 +351,9 @@ pickRequestWork _ st adm = do
           _ → Nothing
     takesSlot sg = case stagedWork sg of
       StagedRemoval prepared → preparedChanged prepared
-      _ → False
+      StagedGrowth _ → True
+      StagedAnswer _ → False
+      StagedControl → False
     -- opens publish in the order their incarnations were allocated
     openMayCommit = \case
       COpen {} → True
@@ -349,7 +363,18 @@ pickRequestWork _ st adm = do
 -- Performing work
 
 perform ∷ Service → Work → IO Bool
-perform svc = \case
+perform svc w = traceWork w >> perform' svc w
+
+traceWork ∷ Work → IO ()
+traceWork w = do
+  on <- lookupEnv "HETOIMASIA_TRACE_OWNER"
+  when (on == Just "1") $ hPutStrLn stderr ("owner: " <> case w of
+    WCloseSession → "close"; WStop → "stop"; WVictim k → "victim " <> show k; WAck j → "ack " <> show j
+    WPrepare r → "prepare " <> show r; WCommit r → "commit " <> show r; WRetry → "retry"; WDispatch → "dispatch"; WReport → "report"
+    WOpen r → "open " <> show r; WGather k → "gather " <> show k; WSlot → "slot"; WGrant c → "grant " <> show c; WDrain a → "drain " <> show a)
+
+perform' ∷ Service → Work → IO Bool
+perform' svc = \case
   WStop → pure False
   WCloseSession → atomically (closeServiceSTM svc) >> pure True
   WVictim key → releaseVictim svc key >> pure True
@@ -458,7 +483,7 @@ dispatchJob svc = do
               Right pieces → do
                 let columns = Set.toList (Set.fromList [c | (c, _) ← pieces])
                 modifySt svc (\st → st {stateLoadJobs = Map.insert jid (aid, region, cover) (stateLoadJobs st)})
-                ok <- startGatherFor svc (GatherJob jid) aid columns
+                ok <- startGatherFor svc (GatherJob jid) aid (Left columns)
                 pure (Just (jid, if ok then Right () else Left "no pin was available for a dispatched load"))
       _ → modifySt svc (\st → st {stateDispatchIdle = True}) >> pure Nothing
   forM_ started $ \case
@@ -525,22 +550,27 @@ delivered svc key gathered = case (key, gathered) of
     GatherRequest _ → pure ()
   (GatherRequest rid, GatheredRuns runs revision) → stageFromRuns svc rid runs revision
   (GatherRequest rid, GatheredFailed handling) → handleRequest svc rid handling
+  (GatherRequest rid, GatheredKnowledge known content knowledge) → do
+    st <- atomically (readSt svc)
+    forM_ (Map.lookup rid (stateRequests st) >>= reqArena) $ \aid →
+      stageWith svc rid (Just aid) content knowledge (StagedAnswer (AKnowledge (KnowledgeAnswer aid content knowledge known)))
+  (GatherJob jid, GatheredKnowledge {}) → failWith svc (OwnerDefect (Text.pack ("a load job's read answered knowledge: " <> show jid))) []
   (GatherJob jid, GatheredRuns runs revision) → do
     st <- atomically (readSt svc)
     case Map.lookup jid (stateLoadJobs st) of
       Nothing → pure ()
       Just (aid, region, cover) → do
+        -- The runs are those of the version the gather pinned. A commit since then changed only
+        -- the columns of its own cell, and the model cancels a job of that cell's region (its
+        -- result is then discarded by 'finishJob'); a job of any other region read columns no
+        -- commit changed, which the model's restamp says too.
         result <- case Map.lookup aid (stateArenas st) of
-          Just arena
-            | arenaRevision arena == revision →
-                evaluate $ do
-                  changes <- either (Left . Text.unpack) Right (changesOfRuns (serviceConfig svc) runs)
-                  runJob (arenaSource arena) changes (arenaPalette arena) (arenaResident arena) region cover
-            -- the store moved while the job read: its result would not be the committed terrain,
-            -- so it fails and its owners are read again (the model restamps or cancels the job
-            -- itself for a commit in its region)
-            | otherwise → pure (Left "the committed terrain moved while the load read it")
+          Just arena →
+            evaluate $ do
+              changes <- either (Left . Text.unpack) Right (changesOfRuns (serviceConfig svc) runs)
+              runJob (arenaSource arena) changes (arenaPalette arena) (arenaResident arena) region cover
           Nothing → pure (Left "arena closed while its load ran")
+        _ <- pure revision
         probe svc (PointJob aid region)
         defect <- atomically (finishJob svc jid result)
         forM_ defect $ \why → failWith svc (AccountingDefect why) []
@@ -566,14 +596,19 @@ stageFromRuns svc rid runs revision = do
         case changesOfRuns config runs of
           Left why → atomically (terminate svc rid (Failed (HostFailure ("the removed runs a read gathered are not valid changes: " <> why))))
           Right changes → case reqCmd req of
-            CRemove tile _ →
-              evaluate (prepareRemoval (changeLimitsOf config) (arenaSource arena) changes tile) >>= \case
+            CRemove tile _ → do
+             probe svc (PointStaging rid)
+             evaluate (prepareRemoval (changeLimitsOf config) (arenaSource arena) changes tile) >>= \case
                 Left why → atomically (terminate svc rid (Failed (HostFailure (Text.pack ("preparation refused: " <> why)))))
                 Right prepared → stage svc rid (Just aid) revision (StagedRemoval prepared)
             cmd → case readAnswer config aid revision (arenaSource arena) changes cmd of
               Left failure → atomically (terminate svc rid (Failed failure))
               Right (answer, demands)
-                | demands /= reqDemand req → atomically (readmitSTM svc rid)
+                -- the demand this answer needs differs from the one admitted (a surface whose top the
+                -- removals lowered): the request is admitted again with the demand its gather found
+                | demands /= reqDemand req → atomically $ do
+                    modifySt svc (\s → s {stateRequests = Map.adjust (\q → q {reqDemand = demands}) rid (stateRequests s)})
+                    readmitSTM svc rid
                 | otherwise → do
                     probe svc (PointCaptured rid aid revision)
                     stage svc rid (Just aid) revision (StagedAnswer answer)
@@ -604,16 +639,48 @@ prepareReq svc rid = do
   forM_ (Map.lookup rid (stateRequests st)) $ \req → case reqCmd req of
     COpen _ source _ → atomically (beginOpen svc rid source)
     CAttach {} → stage svc rid Nothing (Revision 0) StagedControl
-    CGrow _ → atomically (terminate svc rid (Failed (HostFailure "growth is not implemented yet")))
-    CRetry → atomically (terminate svc rid (Failed (HostFailure "retry is not implemented yet")))
-    cmd → forM_ (reqArena req) $ \aid → void (atomically (startGatherFor svc (GatherRequest rid) aid (commandColumns cmd)))
+    CGrow bytes → forM_ (reqArena req >>= \aid → (,) aid <$> Map.lookup aid (stateArenas st)) $ \(aid, arena) →
+      -- the store's pure proposal against the allowance as it is now: equal is an idempotent success,
+      -- smaller is storage_size_not_increased, larger takes the slot when the host is eligible
+      case proposeGrowth (arenaStore arena) (toInteger bytes) of
+        GrowthNoOp → stage svc rid (Just aid) (arenaRevision arena) (StagedAnswer (AGrown (GrowAnswer aid bytes False)))
+        GrowthNotIncreased → atomically (terminate svc rid (Failed (StorageFailed (FaultSizeNotIncreased (cfgAllowanceBytes (storeConfig (arenaStore arena))) bytes))))
+        GrowthInvalid why → atomically (terminate svc rid (Failed (HostFailure (Text.pack ("an admitted growth became invalid: " <> show why)))))
+        GrowthProposed proposal → stage svc rid (Just aid) (arenaRevision arena) (StagedGrowth proposal)
+    CRetry → forM_ (reqArena req) $ \aid → do
+      -- bounded revalidation of what paused the arena, in one transaction (the owner is the
+      -- store's only writer): capacity clears only when the supported next transaction fits beside
+      -- the protected reserve; I/O and integrity keep their pause here (OPEN: their probes)
+      answer <- atomically $ do
+        s <- readSt svc
+        case Map.lookup aid (stateArenas s) of
+          Nothing → pure Nothing
+          Just arena → do
+            let store = arenaStore arena
+                fits = availablePages (storeConfig store) Ordinary (storeRoots store) >= fromIntegral maxClaimPages
+                cleared = [CondCapacity | CondCapacity `elem` conditions store, fits]
+                store' = foldr clearCondition store cleared
+            modifySt svc $ \x →
+              x {stateArenas = Map.insert aid arena {arenaStore = store', arenaFaults = foldr Map.delete (arenaFaults arena) cleared} (stateArenas x)}
+            when (not (null cleared)) (markFreed svc)
+            pure (Just (arenaRevision arena, RetryAnswer aid cleared (conditions store')))
+      forM_ answer $ \(revision, retried) → stage svc rid (Just aid) revision (StagedAnswer (ARetried retried))
+    CKnowledge tile → forM_ (reqArena req) $ \aid → void (atomically (startGatherFor svc (GatherRequest rid) aid (Right tile)))
+    cmd → forM_ (reqArena req) $ \aid → void (atomically (startGatherFor svc (GatherRequest rid) aid (Left (commandColumns cmd))))
 
 -- | Publish staged work and tell the host it is ready. Work whose arena has moved
 -- on since it was computed is dropped; the owner computes it again. A readiness
 -- callback that fails is a provider defect: nothing is staged, the defect is
 -- recorded, and the owner ends, settling every request once.
 stage ∷ Service → RequestId → Maybe ArenaId → Revision → StagedWork → IO ()
-stage svc rid aid rev work =
+stage svc rid aid rev work = do
+  st <- atomically (readSt svc)
+  let knowledge = maybe (Revision 0) (D.authKnowledge . arenaAuthority) (aid >>= \a → Map.lookup a (stateArenas st))
+  stageWith svc rid aid rev knowledge work
+
+-- | 'stage' with the knowledge revision the work was read at.
+stageWith ∷ Service → RequestId → Maybe ArenaId → Revision → Revision → StagedWork → IO ()
+stageWith svc rid aid rev knowledge work =
   tryNonAsync (atomically publish') >>= \case
     Right () → pure ()
     Left failure → do
@@ -624,10 +691,10 @@ stage svc rid aid rev work =
         forM_ (Map.lookup rid (stateRequests st)) $ \req → do
           let fresh = case aid of
                 Nothing → True
-                Just a → maybe False ((== rev) . arenaRevision) (Map.lookup a (stateArenas st))
+                Just a → maybe False (\x → arenaRevision x == rev && D.authKnowledge (arenaAuthority x) == knowledge) (Map.lookup a (stateArenas st))
               pending = case reqPhase req of Done → False; _ → True
           when (fresh && pending) $ do
-            modifySt svc (\s → s {stateRequests = Map.insert rid req {reqPhase = StagedPhase (Staged aid rev work)} (stateRequests s)})
+            modifySt svc (\s → s {stateRequests = Map.insert rid req {reqPhase = StagedPhase (Staged aid rev knowledge work)} (stateRequests s)})
             -- A failing readiness callback abandons this transaction: the work stays
             -- unstaged and cannot commit. The caller treats it as a provider defect.
             endpointReady (reqEndpoint req)
@@ -694,8 +761,12 @@ commitStaged svc st rid req sg = case (reqCmd req, stagedWork sg) of
     -- Staged work for a superseded revision is not offered: the owner computes
     -- it again against the current one.
     withFresh k = case stagedArena sg >>= \aid → (,) aid <$> Map.lookup aid (stateArenas st) of
-      Just (aid, arena) | arenaRevision arena == stagedRevision sg → k aid arena
+      Just (aid, arena) | arenaRevision arena == stagedRevision sg, knowledgeFresh arena → k aid arena
       _ → pure CommitWaiting
+    -- a knowledge answer is current only while the knowledge revision it was read at holds
+    knowledgeFresh arena = case stagedWork sg of
+      StagedAnswer (AKnowledge _) → D.authKnowledge (arenaAuthority arena) == stagedKnowledge sg
+      _ → True
     commitOpen name source cid = case (openReady st rid, internSourceMaterials source emptyPalette) of
       (_, Left why) → settleFailure (SourceFailure (Text.pack (show why)))
       (Nothing, _) → pure CommitWaiting
@@ -789,6 +860,8 @@ slotStep svc =
     SlotGoesOn → pure ()
     SlotEligible task tid plan → publishSlot svc task tid plan
     SlotOver task done → slotOver svc task done
+    SlotGrowthReady task prepared → publishGrowth svc task prepared
+    SlotGrowthOver task over → growthOver svc task over
 
 -- | Every page of the slot's transaction is written: prepare the decision outside any
 -- transaction, force it, and make it.
@@ -803,7 +876,7 @@ publishSlot svc task tid plan = do
       for <- case slotWork task of
         SlotDiscovery → pure (Just ForBatch)
         SlotReclaim → pure (Just ForBatch)
-        SlotGrowth _ → failWith svc (OwnerDefect "a growth reached a store publication") []
+        SlotGrowth _ → failWith svc (OwnerDefect "a growth reached a store transaction's publication") []
         SlotRemoval rid → case Map.lookup rid (stateRequests st) of
           Just req
             | CRemove tile precondition <- reqCmd req
@@ -829,6 +902,7 @@ publishSlot svc task tid plan = do
           Left why → failWith svc (OwnerDefect why) []
           Right decision → do
             _ <- evaluate (decNext decision)
+            forM_ (removalOf (slotWork task)) (probe svc . PointBeforeCommit)
             verdict <- tryNonAsync (atomically (decide svc (slotCredit task) decision))
             case verdict of
               Right (Committed authority) → do
@@ -904,3 +978,45 @@ slotOver svc task done = do
       SlotGrowth rid → Just rid
       SlotDiscovery → Nothing
       SlotReclaim → Nothing
+
+-- | A growth obtained its extra: the decision commits the store's cap, the backend's cap and the
+-- creator's answer in one transaction, or finds the request ended or no longer eligible (the
+-- extra is then given back by the next steps).
+publishGrowth ∷ Service → SlotTask → PreparedGrowth → IO ()
+publishGrowth svc task prepared = do
+  st <- atomically (readSt svc)
+  forM_ ((,) <$> growthRequest (slotWork task) <*> Map.lookup (slotArena task) (stateArenas st)) $ \(rid, arena) →
+    case prepareGrowthDecision (slotArena task) (arenaStore arena) rid prepared of
+      Left why → failWith svc (OwnerDefect why) []
+      Right decision → do
+        _ <- evaluate (decNext decision)
+        tryNonAsync (atomically (decide svc Nothing decision)) >>= \case
+          Right (Committed _) → pure ()
+          Right LostToEnd → pure ()
+          Right NotEligible → yield
+          Right StagingMoved → yield
+          Left failure → do
+            atomically $ do
+              s <- readSt svc
+              forM_ (Map.lookup rid (stateRequests s)) (releaseReq svc rid)
+            failWith svc (ProviderDefect (Text.pack ("the publication decision failed: " <> show failure))) []
+  where
+    growthRequest = \case
+      SlotGrowth rid → Just rid
+      _ → Nothing
+    yield = atomically (modifySt svc (\s → s {stateSlot = fmap (\t → t {slotYield = True}) (stateSlot s)}))
+
+-- | A growth ended without being committed (its slot is already released): its request settles
+-- with the failure, or contends again when the owner gave it up for its host's eligibility.
+growthOver ∷ Service → SlotTask → Growth.GrowthEnd → IO ()
+growthOver svc task over = case slotWork task of
+  SlotGrowth rid → case over of
+    Growth.GrowthFailedWith handling → case handling of
+      HandleDomain fault → atomically (terminate svc rid (Failed (StorageFailed fault)))
+      HandleReplan → atomically (modifySt svc (\s → s {stateRequests = Map.adjust (\q → q {reqPhase = Waiting}) rid (stateRequests s)}))
+      HandleClosing → pure ()
+      HandleDefect why → failWith svc (OwnerDefect why) []
+      other → failWith svc (OwnerDefect (Text.pack ("a growth ended unexpectedly: " <> show other))) []
+    Growth.GrowthWithdrawn → pure ()
+    Growth.GrowthLeftPending _ → pure ()
+  _ → failWith svc (OwnerDefect "a growth ended in a slot that was not a growth's") []

@@ -62,6 +62,12 @@ module Hetoimasia.Terrain.Runtime
   , ColumnAnswer (..)
   , SurfaceAnswer (..)
   , RemoveAnswer (..)
+  , GrowAnswer (..)
+  , RetryAnswer (..)
+  , StorageFault (..)
+  , FullWhy (..)
+  , IntegritySource (..)
+  , faultCode
   , Failure (..)
   , Refused (..)
   , BusyWhy (..)
@@ -73,6 +79,17 @@ module Hetoimasia.Terrain.Runtime
   , columnAt
   , surfaceAt
   , removeAt
+  , knowledgeAt
+  , KnowledgeAnswer (..)
+  , growArena
+  , retryArena
+  , arenaStatus
+  , arenaStatusSTM
+  , ArenaStatus (..)
+  , StorageState (..)
+  , DiscoveryState (..)
+  , inspectEditBankSTM
+  , Condition (..)
   , await
   , cancelPending
 
@@ -95,6 +112,7 @@ module Hetoimasia.Terrain.Runtime
 
     -- * Inspection
   , inspectInvariants
+  , inspectBacked
   , inspectModel
   , inspectModelSTM
   , inspectDefects
@@ -183,9 +201,11 @@ import Hetoimasia.Terrain.Runtime.Internal.Snapshot
 import Hetoimasia.Terrain.Runtime.Internal.Types
 import Hetoimasia.Terrain.Runtime.Settlement
 import Hetoimasia.Terrain.Runtime.Backed.Port (StoragePort (..), storagePort)
+import Hetoimasia.Terrain.Runtime.Backed.Fault (FullWhy (..), IntegritySource (..), StorageFault (..), faultCode)
+import Hetoimasia.Terrain.Runtime.Internal.Backed (backedInvariants)
 import qualified Hetoimasia.Terrain.Runtime.Storage.Internal.Service as Storage
-import Hetoimasia.Terrain.Runtime.Store.Internal.Admission (EditBankSpec (..), defaultEditBankSpec, mkEditBankConfig, newAdmission)
-import Hetoimasia.Terrain.Runtime.Store.Internal.Model (Condition (..), Usage (..), conditions, usage)
+import Hetoimasia.Terrain.Runtime.Store.Internal.Admission (EditBankSpec (..), Ledger (..), defaultEditBankSpec, ledgers, mkEditBankConfig, newAdmission)
+import Hetoimasia.Terrain.Runtime.Store.Internal.Model (Condition (..), GrowthView (..), Usage (..), conditions, growthView, storeHeader, usage)
 import Hetoimasia.Terrain.Runtime.Store.Internal.State (defaultStoreSpec, mkStoreConfig)
 import Hetoimasia.Terrain.Connectivity (defaultConnectivityLimits)
 import qualified Hetoimasia.Terrain.Discovery as D
@@ -379,6 +399,84 @@ surfaceAt svc lease column = arrival (\case ASurface a → Just a; _ → Nothing
 removeAt ∷ Service → ArenaLease → TileCoord → Maybe Precondition → IO (Either Refused (Pending RemoveAnswer))
 removeAt svc lease tile precondition = arrival (\case ARemoved a → Just a; _ → Nothing) (\ep → removeWith svc ep lease tile precondition)
 
+-- | What is known of a cell (a Haskell seam for later consumers; no Lua schema in this slice).
+knowledgeAt ∷ Service → ArenaLease → TileCoord → IO (Either Refused (Pending KnowledgeAnswer))
+knowledgeAt svc lease tile = arrival (\case AKnowledge a → Just a; _ → Nothing) (\ep → knowledgeWith svc ep lease tile)
+
+-- | The creator's growth of the arena's allowance (a Haskell seam; the Lua schema is TRA-23).
+growArena ∷ Service → ArenaLease → Integer → IO (Either Refused (Pending GrowAnswer))
+growArena svc lease bytes = arrival (\case AGrown a → Just a; _ → Nothing) (\ep → growWith svc ep lease bytes)
+
+-- | The creator's explicit retry of a paused arena (a Haskell seam; the Lua schema is TRA-23).
+retryArena ∷ Service → ArenaLease → IO (Either Refused (Pending RetryAnswer))
+retryArena svc lease = arrival (\case ARetried a → Just a; _ → Nothing) (\ep → retryWith svc ep lease)
+
+-- | Whether new history of an arena is ready or paused, and why.
+data StorageState = StorageReady | StoragePaused ![Condition]
+  deriving stock (Eq, Show)
+
+-- | Whether discovery of an arena has unfinished obligations, and whether it may advance.
+data DiscoveryState = DiscoveryIdle | DiscoveryPending | DiscoveryPaused
+  deriving stock (Eq, Show)
+
+-- | A bounded, coherent, advisory status of an arena (requirement 9), read in one transaction
+-- through any valid own lease. It enumerates no history and reserves nothing: every figure is
+-- the store's own counters. Used bytes are live, retired, loose and staged pages and overhead,
+-- never free preallocated capacity; pending reclaim (the retired pages) is a subset of used.
+-- Pending reserved bytes are the arena's own extra reservations not yet spendable: a growth
+-- prepared and not committed, and an extra whose release failed.
+data ArenaStatus = ArenaStatus
+  { statusStorage ∷ !StorageState
+  , statusReservedBytes ∷ !Word64
+  , statusUsedBytes ∷ !Word64
+  , statusPendingReclaimBytes ∷ !Word64
+  , statusPendingReservedBytes ∷ !Word64
+  , statusDiscovery ∷ !DiscoveryState
+  , statusPendingItems ∷ !Word64
+  , statusContentRevision ∷ !Revision
+  , statusKnowledgeRevision ∷ !Revision
+  }
+  deriving stock (Eq, Show)
+
+-- | The arena's status, through any of its live leases ('RefusedAuthority' otherwise).
+arenaStatus ∷ Service → ArenaLease → IO (Either Refused ArenaStatus)
+arenaStatus svc lease = atomically (arenaStatusSTM svc lease)
+
+-- | The same as a transaction, so a wait can be on the status itself.
+arenaStatusSTM ∷ Service → ArenaLease → STM (Either Refused ArenaStatus)
+arenaStatusSTM svc lease = do
+  st <- readSt svc
+  case leaseOf svc lease st of
+    Left refused → pure (Left refused)
+    Right (_, ls)
+      | not (leaseLive ls) → pure (Left RefusedAuthority)
+      | otherwise → case Map.lookup (leaseArena ls) (stateArenas st) of
+          Nothing → pure (Left RefusedAuthority)
+          Just arena → do
+            view <- Storage.backingView (serviceStorage svc) (arenaBacking arena)
+            let store = arenaStore arena
+                use = usage store
+                growth = growthView store
+                paused = conditions store
+                pending = D.pendingObligations (storeHeader store)
+                backend = maybe 0 id (view >>= Storage.bvPendingReservation)
+            pure . Right $
+              ArenaStatus
+                { statusStorage = if null paused then StorageReady else StoragePaused paused
+                , statusReservedBytes = usAllowanceBytes use
+                , statusUsedBytes = usUsedBytes use
+                , statusPendingReclaimBytes = usRetiredBytes use
+                , statusPendingReservedBytes = gvPendingBytes growth + backend
+                , statusDiscovery = if pending == 0 then DiscoveryIdle else if null paused then DiscoveryPending else DiscoveryPaused
+                , statusPendingItems = pending
+                , statusContentRevision = D.authContent (arenaAuthority arena)
+                , statusKnowledgeRevision = D.authKnowledge (arenaAuthority arena)
+                }
+
+-- | The edit bank's ledgers (read-only, for verification).
+inspectEditBankSTM ∷ Service → STM Ledger
+inspectEditBankSTM svc = ledgers <$> readTVar (serviceEditBank svc)
+
 -- | Wait for a request's terminal outcome and retire its result: the credits an
 -- accepted result holds return when it is taken.
 await ∷ Service → Pending a → IO (Either Settlement a)
@@ -434,6 +532,17 @@ withSnapshot svc lease regions body =
 -- holds to the accounting model; empty when coherent.
 inspectInvariants ∷ Service → IO [String]
 inspectInvariants svc = invariants (serviceConfig svc) <$> readTVarIO (serviceState svc)
+
+-- | The backed state's physical truth beside what the service counts (the owner's tasks, the
+-- stores' pins and transactions, the compile account, the storage service's backings and the
+-- edit bank): empty when they agree. Read-only, for verification; see
+-- 'Hetoimasia.Terrain.Runtime.Internal.Backed.backedInvariants'.
+inspectBacked ∷ Service → IO [String]
+inspectBacked svc = atomically $ do
+  st <- readSt svc
+  adm <- readTVar (serviceEditBank svc)
+  view <- Storage.serviceView (serviceStorage svc)
+  pure (backedInvariants st adm (serviceCompileBank svc) (Storage.svBackings view) (Storage.svRecords view))
 
 -- | Whether the removal this request has staged would change content: @Just True@ for a staged removal that will advance the
 -- arena's revision by one, @Just False@ for a staged removal of air, which commits as unchanged at the revision it finds, and
