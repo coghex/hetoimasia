@@ -16,13 +16,14 @@ module Hetoimasia.Terrain.Runtime.Backed.Fault
   , IntegritySource (..)
   , faultCode
   , faultCondition
+  , faultPages
   ) where
 
 import Data.Text (Text)
 import Data.Word (Word64)
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Types
-  ( IntegrityFailure
-  , IoFailure
+  ( IntegrityFailure (..)
+  , IoFailure (..)
   , ReservationFailure
   , UnsupportedWhy
   )
@@ -98,3 +99,18 @@ faultCondition = \case
   FaultIo _ → Just CondIo
   FaultIntegrity _ → Just CondIntegrity
   FaultSizeNotIncreased _ _ → Nothing
+
+-- | The pages a fault names: what an explicit retry reads again to see whether the cause is gone.
+faultPages ∷ StorageFault → [PageNo]
+faultPages = \case
+  FaultIo io → maybe [] pure (ioPage io)
+  FaultIntegrity (FromBackend (PageInvalid page _ _)) → [page]
+  FaultIntegrity (FromBackend (PageTruncated page _ _ _)) → [page]
+  FaultIntegrity (FromWindow page _) → [page]
+  FaultIntegrity (FromStore _) → []
+  FaultIntegrity (FromRecords _) → []
+  FaultComplexity {} → []
+  FaultUnsupported _ → []
+  FaultReservation _ → []
+  FaultFull _ → []
+  FaultSizeNotIncreased _ _ → []

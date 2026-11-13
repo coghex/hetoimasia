@@ -32,6 +32,7 @@ module Hetoimasia.Terrain.Runtime.Backed.Gather
   , cancelGather
   , endGather
   , gatherInFlight
+  , gatherDraining
   , gatherVersion
   , GProgress (..)
   , gatherWindowPages
@@ -162,6 +163,10 @@ startGatherWith pin store columns = case acquireReader store of
 endGather ∷ Store → Gather → Store
 endGather store g = snd (releaseReader (gToken g) store)
 
+-- | Whether the gather was cancelled and waits for its read to drain.
+gatherDraining ∷ Gather → Bool
+gatherDraining = gDraining
+
 -- | Whether a read job of the gather is in flight (submitted and not yet taken).
 gatherInFlight ∷ Gather → Bool
 gatherInFlight = maybe False (const True) . gFetch
@@ -234,7 +239,16 @@ stepGather io closing store g = case gFetch g of
 -- withdrawn if queued and stopped at its next safe point if running; nothing is released until it has
 -- returned. The owner calls it masked, then steps the gather until 'GDrained'.
 cancelGather ∷ Io → Gather → IO (Gather, GProgress)
-cancelGather io g = case gFetch g of
+cancelGather io g
+  -- already cancelled: wait for the job, then retire its outcome untaken
+  | gDraining g = case gFetch g of
+      Nothing → pure (g, GDrained)
+      Just (_, ticket) → do
+        finished ← atomically (pollTicket (ioService io) ticket)
+        if finished
+          then discardTicket (ioService io) ticket >> pure (g {gFetch = Nothing}, GDrained)
+          else pure (g, GBlocked (awaitTicket (ioService io) ticket))
+  | otherwise = case gFetch g of
   Nothing → pure (g {gDraining = True}, GDrained)
   Just (_, ticket) →
     cancelTicket (ioService io) ticket >>= \result → case reactToCancel result of

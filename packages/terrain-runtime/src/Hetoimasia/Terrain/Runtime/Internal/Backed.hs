@@ -38,6 +38,7 @@ module Hetoimasia.Terrain.Runtime.Internal.Backed
 
     -- * Gathers
   , Gathered (..)
+  , ReadWhat (..)
   , canStartGather
   , startGatherFor
   , stepGatherTask
@@ -87,6 +88,7 @@ import Hetoimasia.Terrain.Runtime.Backed.Backend
 import Hetoimasia.Terrain.Runtime.Backed.Fault
 import Hetoimasia.Terrain.Runtime.Backed.Gather
 import Hetoimasia.Terrain.Runtime.Backed.Query
+import Hetoimasia.Terrain.Runtime.Backed.Probe
 import qualified Hetoimasia.Terrain.Runtime.Backed.Growth as Growth
 import Hetoimasia.Terrain.Runtime.Backed.Txn (Done (..), Io (..), Progress (..))
 import qualified Hetoimasia.Terrain.Runtime.Backed.Txn as Txn
@@ -97,6 +99,7 @@ import Hetoimasia.Terrain.Runtime.Storage.Internal.Service
   ( Backing
   , OpenSpec (..)
   , PreparedGrowth
+  , ReadMode
   , awaitTicket
   , cancelTicket
   , closeBacking
@@ -109,7 +112,7 @@ import Hetoimasia.Terrain.Runtime.Storage.Internal.Types (WorkClass (..))
 import qualified Hetoimasia.Terrain.Runtime.Store.Internal.Admission as A
 import Hetoimasia.Terrain.Runtime.Store.Internal.Admission (Admission, Grant)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Format (PageNo, StoreIdentity (..))
-import Hetoimasia.Terrain.Runtime.Store.Internal.Model (ActiveView (..), Condition (..), GrowthProposal, Store, activeView, TxnId, conditions, oldestPin, pauseFor, storeFromRoots, storeHeader, storeRoots, storeVersion)
+import Hetoimasia.Terrain.Runtime.Store.Internal.Model (ActiveView (..), Condition (..), GrowthProposal, Store, activeView, storeConfig, TxnId, conditions, oldestPin, pauseFor, storeFromRoots, storeHeader, storeRoots, storeVersion)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan (Plan)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Protocol (discoveryPlanner, maintenancePlanner, removalPlanner)
 import Hetoimasia.Terrain.Runtime.Store.Internal.State (Roots (..), StoreConfig, emptyRoots, maxReaders)
@@ -196,7 +199,7 @@ pauseArena ∷ Service → ArenaId → Condition → StorageFault → [PageNo] �
 pauseArena svc aid condition fault pages = do
   st ← readSt svc
   forM_ (Map.lookup aid (stateArenas st)) $ \arena → do
-    let record = FaultRecord fault (take faultPagesKept pages)
+    let record = FaultRecord fault (take faultPagesKept (faultPages fault <> pages))
     modifySt svc $ \s →
       s
         { stateArenas =
@@ -381,6 +384,8 @@ data Gathered
     GatheredRuns ![(Column, Int64, Int64)] !Revision
   | -- | What is known of the cell, read from one committed version, with its content and knowledge revisions.
     GatheredKnowledge !D.CellKnowledge !Revision !Revision
+  | -- | A retry's probe: the conditions it was for, and whether every recorded page read back as it must.
+    GatheredProbe ![Condition] !Bool
   | GatheredFailed !Handling
   | -- | Cancelled and drained: nothing to deliver.
     GatheredNothing
@@ -395,7 +400,13 @@ canStartGather st adm aid =
 
 -- | Start a gather of some columns: the pin's credit is secured BEFORE the pin is taken; no
 -- credit, no pin. False when nothing was started.
-startGatherFor ∷ Service → GatherFor → ArenaId → Either [Column] TileCoord → STM Bool
+-- | What a pinned read reads.
+data ReadWhat
+  = ReadRuns ![Column]
+  | ReadKnowledge !TileCoord
+  | ReadPages ![(PageNo, ReadMode)] ![Condition]
+
+startGatherFor ∷ Service → GatherFor → ArenaId → ReadWhat → STM Bool
 startGatherFor svc key aid what = do
   st ← readSt svc
   adm ← readTVar (serviceEditBank svc)
@@ -411,8 +422,9 @@ startGatherFor svc key aid what = do
     _ → pure False
   where
     begin arena = case what of
-      Left columns → fmap RunsRead <$> startGather (arenaStore arena) columns
-      Right tile → fmap KnowledgeRead <$> startQuery (arenaStore arena) (\provider → D.queryCell (arenaEnv arena) provider tile)
+      ReadRuns columns → fmap RunsRead <$> startGather (arenaStore arena) columns
+      ReadKnowledge tile → fmap KnowledgeRead <$> startQuery (arenaStore arena) (\provider → D.queryCell (arenaEnv arena) provider tile)
+      ReadPages pages conds → Right (arenaStore arena, ProbeRead (startProbe pages) conds)
 
 -- | One step of a pinned read. When it ends, its pin and credit are released in the transaction
 -- that removes it, and then its owner is given the result.
@@ -436,6 +448,18 @@ stepGatherTask svc key deliver = do
                 GDone runs → Right (GatheredRuns runs (gatherRevision task))
                 GFailed handling → Right (GatheredFailed handling)
                 GDrained → Right GatheredNothing
+            )
+        ProbeRead pr conds → do
+          (pr', p) ← if wanted then stepProbe io closing (storeConfig store) pr else cancelProbe io pr
+          pure
+            ( ProbeRead pr' conds
+            , case p of
+                PMore → Left WakeNow
+                PBlocked wait → Left (WakeOn wait)
+                PPassed → Right (GatheredProbe conds True)
+                -- the cause persists: the retry answers it as remaining (it is not a new pause)
+                PFailedWith _ → Right (GatheredProbe conds False)
+                PDrained → Right GatheredNothing
             )
         KnowledgeRead q → do
           (q', p) ← if wanted then stepQuery io closing store q else cancelQuery io q
@@ -462,6 +486,7 @@ stepGatherTask svc key deliver = do
     release' current = \case
       RunsRead g → endGather current g
       KnowledgeRead q → endQuery current q
+      ProbeRead _ _ → current
     ownerAlive st = case key of
       GatherRequest rid → Map.member rid (stateRequests st)
       GatherJob jid → any (\j → R.jobId j == jid && R.jobPhase j == R.JobRunningPhase) (R.modelJobs (stateModel st))
@@ -639,7 +664,6 @@ closeDrained svc aid = do
       modifySt svc $ \s →
         s
           { stateClosing = Map.delete aid (stateClosing s)
-          , stateCompileUse = stateCompileUse s - min (closingShared c) (stateCompileUse s)
           , stateInternalIdle = Map.filterWithKey (\(a, _) _ → a /= aid) (stateInternalIdle s)
           , stateNeedsMaintenance = Set.delete aid (stateNeedsMaintenance s)
           }
@@ -711,7 +735,7 @@ backedInvariants st adm compileBank backings records =
     stores = [(aid, arenaStore a) | (aid, a) ← Map.toList (stateArenas st)] <> [(aid, closingStore c) | (aid, c) ← Map.toList (stateClosing st)]
     held =
       sum (map arenaShared (Map.elems (stateArenas st)))
-        + sum (map closingShared (Map.elems (stateClosing st)))
+        + sum (map arenaShared (Map.elems (stateRetiring st)))
         + sum (map (openHeld . openPhase) (Map.elems (stateOpens st)))
     openHeld = \case
       OpenQueued → 0

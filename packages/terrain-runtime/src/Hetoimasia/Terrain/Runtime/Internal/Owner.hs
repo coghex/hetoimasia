@@ -29,7 +29,7 @@ module Hetoimasia.Terrain.Runtime.Internal.Owner
   ) where
 
 import Control.Concurrent.STM
-import Control.Exception (SomeAsyncException, SomeException, evaluate, fromException, mask, rethrowIO, throwIO, try, tryWithContext, uninterruptibleMask_)
+import Control.Exception (SomeAsyncException, SomeException, evaluate, fromException, mask, onException, rethrowIO, throwIO, try, tryWithContext, uninterruptibleMask_)
 import Control.Monad (forM, forM_, unless, void, when)
 import Data.Int (Int64)
 import System.Environment (lookupEnv)
@@ -52,7 +52,11 @@ import qualified Hetoimasia.Terrain.Residency as R
 import Hetoimasia.Terrain.Residency (ArenaId (..), RequestId (..), Revision (..))
 import Hetoimasia.Terrain.Resident (Resident, discardRegion, emptyResident)
 import Hetoimasia.Terrain.Runtime.Backed.Backend (Handling (..))
-import Hetoimasia.Terrain.Runtime.Backed.Txn (Done (..))
+import Hetoimasia.Terrain.Runtime.Backed.Txn (Done (..), runDraining)
+import Hetoimasia.Terrain.Runtime.Backed.Gather (gatherDraining)
+import Hetoimasia.Terrain.Runtime.Backed.Query (queryDraining)
+import Hetoimasia.Terrain.Runtime.Backed.Probe (probeDraining)
+import Hetoimasia.Terrain.Runtime.Backed.Growth (growthDraining)
 import Hetoimasia.Terrain.Runtime.Internal.Backed
 import Hetoimasia.Terrain.Runtime.Internal.Content
 import Hetoimasia.Terrain.Runtime.Internal.Core
@@ -61,6 +65,7 @@ import Hetoimasia.Terrain.Runtime.Internal.Types
 import qualified Hetoimasia.Terrain.Runtime.Store.Internal.Admission as A
 import qualified Hetoimasia.Terrain.Runtime.Backed.Growth as Growth
 import Hetoimasia.Terrain.Runtime.Backed.Fault (StorageFault (..))
+import Hetoimasia.Terrain.Runtime.Storage.Internal.Service (ReadMode (..))
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Service (PreparedGrowth)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Model (Condition (..), GrowthDecision (..), TxnId, clearCondition, conditions, oldestPin, proposeGrowth, storeConfig, storeHeader, storeRoots, storeVersion)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan (TxClass (..), availablePages)
@@ -240,15 +245,23 @@ backedWork st = (now, waits)
         | not (alive rid) → Just (Left (WOpen rid))
         | otherwise → Nothing
       OpenUnwinding _ _ wake → wakeOr wake (WOpen rid)
+    -- a task whose owner ended is stepped at once to cancel it; once it drains it waits like any other
     gatherStep key task
-      | not (ownerAlive key) || not (Map.member (gatherArena task) (stateArenas st)) = Just (Left (WGather key))
+      | (not (ownerAlive key) || not (Map.member (gatherArena task) (stateArenas st))) && not (readDraining (gatherRun task)) = Just (Left (WGather key))
       | otherwise = wakeOr (gatherWake task) (WGather key)
+    readDraining = \case
+      RunsRead g → gatherDraining g
+      KnowledgeRead q → queryDraining q
+      ProbeRead pr _ → probeDraining pr
     ownerAlive = \case
       GatherRequest rid → alive rid
       GatherJob jid → any (\j → R.jobId j == jid && R.jobPhase j == R.JobRunningPhase) (R.modelJobs (stateModel st))
     slotReady task
-      | slotYield task || not (Map.member (slotArena task) (stateArenas st)) || not (slotAlive (slotWork task)) = Just (Left WSlot)
+      | (slotYield task || not (Map.member (slotArena task) (stateArenas st)) || not (slotAlive (slotWork task))) && not (slotDraining (slotRun task)) = Just (Left WSlot)
       | otherwise = wakeOr (slotWake task) WSlot
+    slotDraining = \case
+      SlotTxn run → runDraining run
+      SlotGrow run → growthDraining run
     slotAlive = \case
       SlotRemoval rid → alive rid
       SlotGrowth rid → alive rid
@@ -388,7 +401,15 @@ perform' svc = \case
   WOpen rid → takeTurn svc TurnPrepare >> stepOpen svc (ops svc) rid >> pure True
   WGather key → takeTurn svc TurnPrepare >> stepGatherTask svc key (delivered svc key) >> pure True
   WSlot → takeTurn svc TurnPrepare >> slotStep svc >> pure True
-  WGrant contender → takeTurn svc TurnPrepare >> void (atomically (grantSlot svc contender)) >> pure True
+  WGrant contender → do
+    takeTurn svc TurnPrepare
+    granted <- atomically (grantSlot svc contender)
+    when granted . probe svc $ case contender of
+      ContendRemoval rid aid _ → PointGranted (Just rid) aid
+      ContendGrowth rid aid _ → PointGranted (Just rid) aid
+      ContendDiscovery aid → PointGranted Nothing aid
+      ContendReclaim aid → PointGranted Nothing aid
+    pure True
   WDrain aid → takeTurn svc TurnPrepare >> closeDrained svc aid >> pure True
   WReport → do
     -- A defect was recorded where nothing could throw (a host callback that failed
@@ -483,7 +504,7 @@ dispatchJob svc = do
               Right pieces → do
                 let columns = Set.toList (Set.fromList [c | (c, _) ← pieces])
                 modifySt svc (\st → st {stateLoadJobs = Map.insert jid (aid, region, cover) (stateLoadJobs st)})
-                ok <- startGatherFor svc (GatherJob jid) aid (Left columns)
+                ok <- startGatherFor svc (GatherJob jid) aid (ReadRuns columns)
                 pure (Just (jid, if ok then Right () else Left "no pin was available for a dispatched load"))
       _ → modifySt svc (\st → st {stateDispatchIdle = True}) >> pure Nothing
   forM_ started $ \case
@@ -555,6 +576,8 @@ delivered svc key gathered = case (key, gathered) of
     forM_ (Map.lookup rid (stateRequests st) >>= reqArena) $ \aid →
       stageWith svc rid (Just aid) content knowledge (StagedAnswer (AKnowledge (KnowledgeAnswer aid content knowledge known)))
   (GatherJob jid, GatheredKnowledge {}) → failWith svc (OwnerDefect (Text.pack ("a load job's read answered knowledge: " <> show jid))) []
+  (GatherJob jid, GatheredProbe {}) → failWith svc (OwnerDefect (Text.pack ("a load job's read answered a probe: " <> show jid))) []
+  (GatherRequest rid, GatheredProbe probed passed) → finishRetry svc rid (if passed then probed else [])
   (GatherJob jid, GatheredRuns runs revision) → do
     st <- atomically (readSt svc)
     case Map.lookup jid (stateLoadJobs st) of
@@ -595,25 +618,42 @@ stageFromRuns svc rid runs revision = do
       when (arenaRevision arena == revision) $
         case changesOfRuns config runs of
           Left why → atomically (terminate svc rid (Failed (HostFailure ("the removed runs a read gathered are not valid changes: " <> why))))
+          -- The preparation runs under the request's credits (R1): from here to its safe point nothing the
+          -- request holds is released, whoever cancels it or closes its arena meanwhile.
           Right changes → case reqCmd req of
-            CRemove tile _ → do
-             probe svc (PointStaging rid)
-             evaluate (prepareRemoval (changeLimitsOf config) (arenaSource arena) changes tile) >>= \case
-                Left why → atomically (terminate svc rid (Failed (HostFailure (Text.pack ("preparation refused: " <> why)))))
-                Right prepared → stage svc rid (Just aid) revision (StagedRemoval prepared)
-            cmd → case readAnswer config aid revision (arenaSource arena) changes cmd of
-              Left failure → atomically (terminate svc rid (Failed failure))
-              Right (answer, demands)
-                -- the demand this answer needs differs from the one admitted (a surface whose top the
-                -- removals lowered): the request is admitted again with the demand its gather found
-                | demands /= reqDemand req → atomically $ do
-                    modifySt svc (\s → s {stateRequests = Map.adjust (\q → q {reqDemand = demands}) rid (stateRequests s)})
-                    readmitSTM svc rid
-                | otherwise → do
-                    probe svc (PointCaptured rid aid revision)
-                    stage svc rid (Just aid) revision (StagedAnswer answer)
+            CRemove tile _ →
+              running svc rid (tryNonAsync (probe svc (PointStaging rid) >> evaluate (prepareRemoval (changeLimitsOf config) (arenaSource arena) changes tile))) >>= \case
+                Nothing → pure ()
+                Just (Left failure) → atomically (terminate svc rid (Failed (HostFailure (Text.pack ("preparation failed: " <> show failure)))))
+                Just (Right (Left why)) → atomically (terminate svc rid (Failed (HostFailure (Text.pack ("preparation refused: " <> why)))))
+                Just (Right (Right prepared)) → stage svc rid (Just aid) revision (StagedRemoval prepared)
+            cmd →
+              running svc rid (probe svc (PointCaptured rid aid revision) >> evaluate (readAnswer config aid revision (arenaSource arena) changes cmd)) >>= \case
+                Nothing → pure ()
+                Just (Left failure) → atomically (terminate svc rid (Failed failure))
+                Just (Right (answer, demands))
+                  -- the demand this answer needs differs from the one admitted (a surface whose top the
+                  -- removals lowered): the request is admitted again with the demand its gather found
+                  | demands /= reqDemand req → atomically $ do
+                      modifySt svc (\s → s {stateRequests = Map.adjust (\q → q {reqDemand = demands}) rid (stateRequests s)})
+                      readmitSTM svc rid
+                  | otherwise → stage svc rid (Just aid) revision (StagedAnswer answer)
   where
     config = serviceConfig svc
+
+-- | Run one request's preparation under its credits (R1). From here to the safe point at its end,
+-- nothing the request holds is released, whoever cancels it, releases its lease or closes its arena
+-- meanwhile; those releases are deferred to the safe point, which is also reached when an exception
+-- ends the preparation. Nothing when the request was already gone.
+running ∷ Service → RequestId → IO a → IO (Maybe a)
+running svc rid work = do
+  began <- atomically (beginRunning svc rid)
+  if not began
+    then pure Nothing
+    else do
+      result <- work `onException` atomically (safePointSTM svc)
+      atomically (safePointSTM svc)
+      pure (Just result)
 
 -- | What a request's failed read means for it.
 handleRequest ∷ Service → RequestId → Handling → IO ()
@@ -647,26 +687,19 @@ prepareReq svc rid = do
         GrowthNotIncreased → atomically (terminate svc rid (Failed (StorageFailed (FaultSizeNotIncreased (cfgAllowanceBytes (storeConfig (arenaStore arena))) bytes))))
         GrowthInvalid why → atomically (terminate svc rid (Failed (HostFailure (Text.pack ("an admitted growth became invalid: " <> show why)))))
         GrowthProposed proposal → stage svc rid (Just aid) (arenaRevision arena) (StagedGrowth proposal)
-    CRetry → forM_ (reqArena req) $ \aid → do
-      -- bounded revalidation of what paused the arena, in one transaction (the owner is the
-      -- store's only writer): capacity clears only when the supported next transaction fits beside
-      -- the protected reserve; I/O and integrity keep their pause here (OPEN: their probes)
-      answer <- atomically $ do
-        s <- readSt svc
-        case Map.lookup aid (stateArenas s) of
-          Nothing → pure Nothing
-          Just arena → do
-            let store = arenaStore arena
-                fits = availablePages (storeConfig store) Ordinary (storeRoots store) >= fromIntegral maxClaimPages
-                cleared = [CondCapacity | CondCapacity `elem` conditions store, fits]
-                store' = foldr clearCondition store cleared
-            modifySt svc $ \x →
-              x {stateArenas = Map.insert aid arena {arenaStore = store', arenaFaults = foldr Map.delete (arenaFaults arena) cleared} (stateArenas x)}
-            when (not (null cleared)) (markFreed svc)
-            pure (Just (arenaRevision arena, RetryAnswer aid cleared (conditions store')))
-      forM_ answer $ \(revision, retried) → stage svc rid (Just aid) revision (StagedAnswer (ARetried retried))
-    CKnowledge tile → forM_ (reqArena req) $ \aid → void (atomically (startGatherFor svc (GatherRequest rid) aid (Right tile)))
-    cmd → forM_ (reqArena req) $ \aid → void (atomically (startGatherFor svc (GatherRequest rid) aid (Left (commandColumns cmd))))
+    CRetry → forM_ (reqArena req >>= \aid → (,) aid <$> Map.lookup aid (stateArenas st)) $ \(aid, arena) → do
+      -- bounded revalidation of what paused the arena: the pages an I/O or integrity pause recorded
+      -- are read again (an integrity page must read back valid); a pause that recorded none cannot be
+      -- certified and stays. Capacity is checked when the retry finishes.
+      let store = arenaStore arena
+          probed = [(c, record) | c ← [CondIo, CondIntegrity], c `elem` conditions store, Just record ← [Map.lookup c (arenaFaults arena)], not (null (faultPages' record))]
+          pages = [(page, if c == CondIntegrity then ReadValidated else ReadProbe) | (c, record) ← probed, page ← faultPages' record]
+          faultPages' = faultRecorded
+      if null pages
+        then finishRetry svc rid []
+        else void (atomically (startGatherFor svc (GatherRequest rid) aid (ReadPages pages (map fst probed))))
+    CKnowledge tile → forM_ (reqArena req) $ \aid → void (atomically (startGatherFor svc (GatherRequest rid) aid (ReadKnowledge tile)))
+    cmd → forM_ (reqArena req) $ \aid → void (atomically (startGatherFor svc (GatherRequest rid) aid (ReadRuns (commandColumns cmd))))
 
 -- | Publish staged work and tell the host it is ready. Work whose arena has moved
 -- on since it was computed is dropped; the owner computes it again. A readiness
@@ -1020,3 +1053,23 @@ growthOver svc task over = case slotWork task of
     Growth.GrowthWithdrawn → pure ()
     Growth.GrowthLeftPending _ → pure ()
   _ → failWith svc (OwnerDefect "a growth ended in a slot that was not a growth's") []
+
+-- | Finish an explicit retry: clear the conditions its probe certified gone and, when the supported
+-- next transaction fits beside the protected reserve, the capacity pause; then answer what was cleared
+-- and what remains. One transaction (the owner is the store's only writer). Never re-runs a failed edit.
+finishRetry ∷ Service → RequestId → [Condition] → IO ()
+finishRetry svc rid certified = do
+  answer <- atomically $ do
+    s <- readSt svc
+    case Map.lookup rid (stateRequests s) >>= reqArena >>= \aid → (,) aid <$> Map.lookup aid (stateArenas s) of
+      Nothing → pure Nothing
+      Just (aid, arena) → do
+        let store = arenaStore arena
+            fits = availablePages (storeConfig store) Ordinary (storeRoots store) >= fromIntegral maxClaimPages
+            cleared = [c | c ← conditions store, c `elem` certified || (c == CondCapacity && fits)]
+            store' = foldr clearCondition store cleared
+        modifySt svc $ \x →
+          x {stateArenas = Map.insert aid arena {arenaStore = store', arenaFaults = foldr Map.delete (arenaFaults arena) cleared} (stateArenas x)}
+        when (not (null cleared)) (markFreed svc)
+        pure (Just (aid, arenaRevision arena, RetryAnswer aid cleared (conditions store')))
+  forM_ answer $ \(aid, revision, retried) → stage svc rid (Just aid) revision (StagedAnswer (ARetried retried))

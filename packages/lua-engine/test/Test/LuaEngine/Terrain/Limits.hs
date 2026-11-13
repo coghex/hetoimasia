@@ -50,8 +50,10 @@ alternating =
     { scPrelude =
         terrainPrelude
           <> [ "local PATCHES = {}"
-             , "for k = 0, 1023 do PATCHES[#PATCHES + 1] = { x = 0, y = 0, z_min = 2 * k, z_max = 2 * k + 1, value = { material = 'soil', shape = 0 } } end"
-             , "local ALT = { materials = { 'soil' }, layers = {}, patches = PATCHES }"
+             -- 1,024 one-level runs of alternating materials in one column (the air-and-soil form of 2,048 levels
+             -- compiles to 8 bytes over #660's 16 MiB result bound, a source_complexity since #665)
+             , "for k = 0, 1023 do PATCHES[#PATCHES + 1] = { x = 0, y = 0, z_min = k, z_max = k + 1, value = { material = (k % 2 == 0) and 'soil' or 'stone', shape = 0 } } end"
+             , "local ALT = { materials = { 'soil', 'stone' }, layers = {}, patches = PATCHES }"
              ]
     , scInit = ["self.s = 0", "self.q = api.terrain.open('alt', ALT)"]
     , scUpdate =

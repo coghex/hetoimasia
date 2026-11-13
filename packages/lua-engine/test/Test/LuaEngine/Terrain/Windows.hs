@@ -535,17 +535,19 @@ tightReads =
     }
 
 -- | The approved limits with only this much room for retained edits.
-smallEdits ∷ Config
-smallEdits = defaultConfig {configLimits = either (error . show) id (mkLimits approved)}
+-- | A service whose request bank holds two accepted commands: a third is the same immediate busy
+-- (transient admission pressure: it clears when an earlier command settles and is taken).
+fewCommands ∷ Config
+fewCommands = defaultConfig {configLimits = either (error . show) id (mkLimits approved)}
   where
     mib = 1024 * 1024
     approved =
       LimitsSpec
         { specResidentBytes = 256 * mib
-        , specEditBytes = 1024
+        , specEditBytes = 64 * mib
         , specStagingBytes = 128 * mib
         , specLoadJobs = 128
-        , specQueuedCommands = 256
+        , specQueuedCommands = 2
         , specPinsPerView = 2
         , specAgingQuanta = 8
         , specQueryRegions = 257
@@ -556,34 +558,34 @@ smallEdits = defaultConfig {configLimits = either (error . show) id (mkLimits ap
         , specCameraRegions = 16384
         }
 
--- | Removals of one cell after another until the service has no room to retain another edit.
+-- | Removals of one cell after another, none taken, until the service's request bank is full; then the
+-- removals are taken, the first one's cell is read back and a read is served.
 exhausting ∷ Script
 exhausting =
   script
     { scPrelude = terrainPrelude
-    , scInit = ["self.s = 0", "self.i = 0", "self.q = api.terrain.open('main', DEF)"]
+    , scInit = ["self.s = 0", "self.i = 0", "self.qs = {}", "self.q = api.terrain.open('main', DEF)"]
     , scUpdate =
         [ "if self.s == 0 then"
         , "  local t = settle(api, self.q)"
         , "  if t then self.arena = t.value self.q = nil self.s = 1 end"
         , "elseif self.s == 1 then"
-        , "  if self.q then"
-        , "    local t = settle(api, self.q)"
-        , "    if t then self.q = nil end"
-        , "  end"
-        , "  if not self.q then"
-        , "    local res = table.pack(api.terrain.remove(self.arena, {x = self.i, y = 0, z = 0}))"
-        , "    if res[1] == nil then"
-        , "      print('busy', res.n, res[2].code)"
-        , "      self.q = api.terrain.cell(self.arena, {x = 0, y = 0, z = 0}) self.s = 2"
-        , "    else self.q = res[1] self.i = self.i + 1 end"
-        , "  end"
+        , "  local res = table.pack(api.terrain.remove(self.arena, {x = self.i, y = 0, z = 0}))"
+        , "  if res[1] == nil then"
+        , "    print('busy', res.n, res[2].code) self.s = 2"
+        , "  else self.qs[#self.qs + 1] = res[1] self.i = self.i + 1 end"
         , "elseif self.s == 2 then"
-        , "  local t = settle(api, self.q)"
-        , "  if t then print('first edit kept', t.value.air) self.q = api.terrain.cell(self.arena, {x = 0, y = 0, z = -5}) self.s = 3 end"
+        , "  local all = true"
+        , "  for k, q in pairs(self.qs) do"
+        , "    if q then local t = settle(api, q) if t then self.qs[k] = false else all = false end end"
+        , "  end"
+        , "  if all then self.q = api.terrain.cell(self.arena, {x = 0, y = 0, z = 0}) self.s = 3 end"
         , "elseif self.s == 3 then"
         , "  local t = settle(api, self.q)"
-        , "  if t then print('read still served', t.status, t.value.material) print('done') self.s = 4 end"
+        , "  if t then print('first edit kept', t.value.air) self.q = api.terrain.cell(self.arena, {x = 0, y = 0, z = -5}) self.s = 4 end"
+        , "elseif self.s == 4 then"
+        , "  local t = settle(api, self.q)"
+        , "  if t then print('read still served', t.status, t.value.material) print('done') self.s = 5 end"
         , "end"
         ]
     }
@@ -612,8 +614,8 @@ spec = describe "Terrain windows and banks" $ do
     readIORef reached `shouldReturn` True
     readIORef commits `shouldReturn` 0
 
-  it "answers retained-edit exhaustion as the same immediate busy, evicts no earlier edit and still serves a read" $
-    withRigConfig smallEdits $ \rig →
+  it "answers a full request bank as the same immediate busy, creates nothing, keeps every earlier edit and still serves a read" $
+    withRigConfig fewCommands $ \rig →
       withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource exhausting)]) $ \world _ runtime →
         withFvm world runtime (presentationOver rig) $ \fvm → do
           spawned ← spawn world fvm "modules-test" mainPath

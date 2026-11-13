@@ -28,6 +28,7 @@ module Hetoimasia.Terrain.Runtime.Backed.Growth
   , abandonGrowth
   , growthTicket
   , growthPhaseName
+  , growthDraining
   ) where
 
 import Control.Concurrent.STM (STM, atomically)
@@ -91,6 +92,16 @@ growthTicket (GrowthRun phase) = case phase of
   Begin _ → Nothing
   Prepared _ → Nothing
   Ended → Nothing
+
+-- | Whether the owner decided against the growth and it waits for its job.
+growthDraining ∷ GrowthRun → Bool
+growthDraining (GrowthRun phase) = case phase of
+  Withdrawing _ → True
+  Abandoning _ → True
+  Ended → True
+  Begin _ → False
+  Reserving _ → False
+  Prepared _ → False
 
 growthPhaseName ∷ GrowthRun → Text
 growthPhaseName (GrowthRun phase) = case phase of
@@ -189,5 +200,6 @@ abandonGrowth io store (GrowthRun phase) = case phase of
       Left failure → do
         s ← evaluate (growthReleaseFailed (growthFailed store))
         pure (s, GrowthRun Ended, GrowthOver (GrowthLeftPending (Just (classifyFailure OwnerClosing JkRelease failure))))
-  Withdrawing ticket → pure (store, GrowthRun phase, GrowthBlocked (awaitTicket (ioService io) ticket))
-  Abandoning ticket → pure (store, GrowthRun phase, GrowthBlocked (awaitTicket (ioService io) ticket))
+  -- already decided against: wait for its job and take the outcome, as 'advanceGrowth' does
+  Withdrawing _ → advanceGrowth io OwnerClosing store (GrowthRun phase)
+  Abandoning _ → advanceGrowth io OwnerClosing store (GrowthRun phase)

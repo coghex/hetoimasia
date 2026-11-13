@@ -97,10 +97,12 @@
 -- existing independent source limit; they are excluded from this compiler's
 -- result and peak figures, and this slice invents no resident-bank charge for
 -- them (any charge for the retained source is the arena-admission integration's
--- choice). Only the newly derived metadata is accounted: the compiled result is
--- charged once per arena to the resident terrain bank by the later service, and
--- the temporaries of the one compilation active per session are charged to the
--- same bank while they exist. This module creates no bank, service, semaphore or
+-- choice). Only the newly derived metadata is accounted: the terrain service
+-- (TRA-22) charges it to its own service-wide compile account, beside the
+-- resident, edit and render banks (owner decision of 2026-11-13 on #665): the
+-- temporaries of the one compilation active per session up to its peak while they
+-- exist, then the compiled result and the structures the arena derives from it
+-- for the arena's life. This module creates no bank, service, semaphore or
 -- session owner.
 --
 -- = Counted steps

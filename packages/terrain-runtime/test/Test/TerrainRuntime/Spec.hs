@@ -22,8 +22,11 @@ import qualified Test.TerrainRuntime.Storage.Boundary as StorageBoundary
 import qualified Test.TerrainRuntime.Storage.Memory as StorageMemory
 import qualified Test.TerrainRuntime.Storage.Opacity as StorageOpacity
 import qualified Test.TerrainRuntime.Storage.Open as StorageOpen
+import qualified Test.TerrainRuntime.Backed.Compile as BackedCompile
 import qualified Test.TerrainRuntime.Backed.Discovery as BackedDiscovery
+import qualified Test.TerrainRuntime.Backed.Fairness as BackedFairness
 import qualified Test.TerrainRuntime.Backed.Outcomes as BackedOutcomes
+import qualified Test.TerrainRuntime.Backed.Pause as BackedPause
 import qualified Test.TerrainRuntime.Backed.Service as BackedService
 import qualified Test.TerrainRuntime.Backed.Sweep as BackedSweep
 import qualified Test.TerrainRuntime.Backed.Txn as BackedTxn
@@ -79,7 +82,10 @@ spec = do
   StoreRebalance.spec
   StoreProtocol.spec
   BackedOutcomes.spec
+  BackedPause.spec
+  BackedCompile.spec
   BackedDiscovery.spec
+  BackedFairness.spec
   BackedService.spec
   BackedSweep.spec
   BackedTxn.spec

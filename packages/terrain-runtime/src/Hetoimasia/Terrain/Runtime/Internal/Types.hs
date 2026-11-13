@@ -169,6 +169,7 @@ import qualified Hetoimasia.Terrain.Connectivity as C
 import qualified Hetoimasia.Terrain.Discovery as D
 import Hetoimasia.Terrain.Runtime.Backed.Fault (StorageFault)
 import Hetoimasia.Terrain.Runtime.Backed.Gather (Gather)
+import qualified Hetoimasia.Terrain.Runtime.Backed.Probe as Probe
 import qualified Hetoimasia.Terrain.Runtime.Backed.Query as Query
 import qualified Hetoimasia.Terrain.Runtime.Backed.Growth as Growth
 import qualified Hetoimasia.Terrain.Runtime.Backed.Txn as Txn
@@ -484,6 +485,9 @@ data Point
     PointHandoffReported !ArenaId !RegionCoord !Bool
   | -- | A victim's detail is about to be discarded.
     PointVictim !ArenaId !RegionCoord
+  | -- | The session's mutating transaction was granted: to an explicit request (its id) or to
+    -- internal work of an arena (discovery or reclamation).
+    PointGranted !(Maybe RequestId) !ArenaId
   deriving stock (Eq, Show)
 
 -- | An unexpected defect, kept with bounded context.
@@ -831,7 +835,7 @@ arenaRevision = D.authContent . arenaAuthority
 -- operation that failed (at most 'faultPagesKept' pages, the first ones).
 data FaultRecord = FaultRecord
   { faultOf ∷ !StorageFault
-  , faultPages ∷ ![PageNo]
+  , faultRecorded ∷ ![PageNo]
   }
   deriving stock (Eq, Show)
 
@@ -901,6 +905,8 @@ data GatherTask = GatherTask
 data ReadRun
   = RunsRead !Gather
   | KnowledgeRead !(Query.Query D.CellKnowledge)
+  | -- | An explicit retry's re-read of the pages a pause recorded, with the conditions it would clear.
+    ProbeRead !Probe.PageProbe ![Condition]
 
 -- | What the session's one mutating transaction is for.
 data SlotWork
@@ -934,7 +940,6 @@ data SlotTask = SlotTask
 data Closing' = Closing'
   { closingStore ∷ !Store
   , closingBacking ∷ !Backing
-  , closingShared ∷ !Word64
   }
 
 data LeaseRec = LeaseRec

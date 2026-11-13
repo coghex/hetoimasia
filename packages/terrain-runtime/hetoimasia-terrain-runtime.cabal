@@ -3,19 +3,17 @@ name: hetoimasia-terrain-runtime
 version: 0.1.0.0
 synopsis: The scoped transactional terrain service for Hetoimasia
 description:
-    The terrain arena's service (TRA-4): one dedicated owner thread that is
-    the sole writer of arena contents, bounded asynchronous loading and eviction
-    that execute the residency model's decisions against real resident detail,
-    atomic whole-cell removal that commits its content, revision and successful
-    settlement in one arbitration with cancellation and the parent session's
-    admission, immutable borrowed snapshots, offload and reload from the
-    immutable source plus canonical retained removals, and an orderly close. It
-    also holds the pure model of the temporary store (TRA-20): the private page
-    codec, copy-on-write indexes, allocator and retirement work, staged
-    transaction planning, pinned readers, the allowance and the edit bank's
-    admission, with no file, thread or clock. It depends on the pure terrain
-    package and the foundation and runtime services; it has no Lua, window,
-    renderer, GPU, native or game dependency.
+    The terrain arena's service (TRA-4, backed since TRA-22): one dedicated owner
+    thread that is the sole writer of arena contents and the only publisher of
+    committed roots, revisions and request results; every acknowledged removal
+    written to the arena's private reserved file through the storage backend before
+    one publication decision makes it authoritative with its connection obligation;
+    bounded asynchronous loading and eviction of resident detail as a cache;
+    immutable borrowed snapshots; and an orderly close. It also holds the pure model
+    of the temporary store (TRA-20) and the storage backend (TRA-21). It depends on
+    the pure terrain package and the foundation and runtime services; its one native
+    dependency is the storage backend's C shim; it has no Lua, window, renderer, GPU
+    or game dependency.
 license: GPL-3.0-only
 license-file: LICENSE
 author: Vincent Coghlan
@@ -142,6 +140,7 @@ library backed
         Hetoimasia.Terrain.Runtime.Backed.Gather
         Hetoimasia.Terrain.Runtime.Backed.Growth
         Hetoimasia.Terrain.Runtime.Backed.Port
+        Hetoimasia.Terrain.Runtime.Backed.Probe
         Hetoimasia.Terrain.Runtime.Backed.Query
         Hetoimasia.Terrain.Runtime.Backed.Txn
     build-depends:
@@ -167,8 +166,11 @@ test-suite terrain-runtime-tests
     -- when the program is started with -T.
     ghc-options: -threaded -rtsopts "-with-rtsopts=-T"
     other-modules:
+        Test.TerrainRuntime.Backed.Compile
         Test.TerrainRuntime.Backed.Discovery
+        Test.TerrainRuntime.Backed.Fairness
         Test.TerrainRuntime.Backed.Outcomes
+        Test.TerrainRuntime.Backed.Pause
         Test.TerrainRuntime.Backed.Service
         Test.TerrainRuntime.Backed.Sweep
         Test.TerrainRuntime.Backed.Txn

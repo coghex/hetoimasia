@@ -154,6 +154,9 @@ applyEvent svc event = do
           { stateModel = model
           , stateVictims = stateVictims st <> Seq.fromList (decisionVictims (R.reportDecision report))
           , stateRetiring = foldr Map.delete (stateRetiring st) (R.reportSettled report)
+            -- a retiring arena's compiled connectivity is dropped with it: its share of the compile
+            -- account returns when its retirement completes, not before
+          , stateCompileUse = stateCompileUse st - min (stateCompileUse st) (sum [arenaShared a | aid ← R.reportSettled report, Just a ← [Map.lookup aid (stateRetiring st)]])
           , stateWork = syncWork model (stateWork st)
           }
       pure outcome
@@ -404,13 +407,13 @@ pendingAcquisitions = countReqs (\req → isAcquisition req && not (isDone req))
 -- charged until the last borrower returns it). An arena leaves the count only when
 -- its retirement has completed.
 --
--- A closed arena whose file is still draining or closing, and an open whose request ended while a
--- job of it was in flight (it unwinds), also count: each still holds its share of the compile
--- account, which is sized for at most this many arenas (so valid work can never exhaust it).
+-- An open whose request ended while a job of it was in flight (it unwinds) also counts, and so does a
+-- retiring arena: each still holds its share of the compile account, which is sized for at most this
+-- many arenas (so valid work can never exhaust it).
 arenaUse ∷ St → Int
 arenaUse st =
   Map.size (stateArenas st)
-    + Set.size (Set.union (Map.keysSet (stateRetiring st)) (Map.keysSet (stateClosing st)))
+    + Map.size (stateRetiring st)
     + countReqs (\req → isOpenCmd req && not (isDone req)) st
     + orphanOpens st
 
@@ -438,7 +441,7 @@ data LimitRow = LimitRow
 -- snapshots it handed out), never the accounting model or the retained-bank ledger.
 limitRows ∷ Config → St → [LimitRow]
 limitRows config st =
-  [ LimitRow "arenas" (w (configMaxArenas config)) (w (arenaUse st)) (w (Map.size (stateArenas st)) + w (length (Set.toList (Set.fromList (Map.keys (stateRetiring st) <> Map.keys (stateClosing st))))) + w (length [() | ClaimPending _ ← Map.elems (stateNames st)]) + w (orphanOpens st))
+  [ LimitRow "arenas" (w (configMaxArenas config)) (w (arenaUse st)) (w (Map.size (stateArenas st)) + w (length (Map.keys (stateRetiring st))) + w (length [() | ClaimPending _ ← Map.elems (stateNames st)]) + w (orphanOpens st))
   , LimitRow "leases" (w (configMaxLeases config)) (w (leasesInUse st)) (sum [w (Set.size (clientLeases c)) | c ← Map.elems (stateClients st)] + w (length [() | req ← requestsAndGhosts, isAcquisition req, not (isDone req)]))
   , LimitRow "views" (w (configMaxViews config)) (w (Map.size (stateViews st))) (sum [w (Set.size (clientViews c)) | c ← Map.elems (stateClients st)])
   , LimitRow "clients" (w (configMaxClients config)) (w (Map.size (stateClients st))) (w (length (Map.keys (stateClients st))))
@@ -844,7 +847,7 @@ closeArena svc aid = do
     modifySt svc $ \cur →
       cur
         { stateArenas = Map.delete aid (stateArenas cur)
-        , stateClosing = Map.insert aid (Closing' (arenaStore arena) (arenaBacking arena) (arenaShared arena)) (stateClosing cur)
+        , stateClosing = Map.insert aid (Closing' (arenaStore arena) (arenaBacking arena)) (stateClosing cur)
         , stateRetiring = Map.insert aid arena (stateRetiring cur)
         , stateNames = case Map.lookup (arenaName arena) (stateNames cur) of
             Just (ClaimLive claimed) | claimed == aid → Map.delete (arenaName arena) (stateNames cur)

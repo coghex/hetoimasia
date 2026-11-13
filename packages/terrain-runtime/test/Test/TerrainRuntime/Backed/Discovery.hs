@@ -12,7 +12,7 @@ import qualified Hetoimasia.Terrain.Discovery as D
 import Hetoimasia.Terrain.Residency (ArenaId (..))
 import Hetoimasia.Terrain.Runtime
 import Test.Hspec
-import Test.TerrainRuntime.Fixtures
+import Test.TerrainRuntime.Fixtures hiding (limitsWith)
 import Test.TerrainRuntime.Store.Scenes (Scene (..), envFor, limitsWith, openingA, openingB, twoOpenings)
 
 -- | The reference: #661's model over its own in-memory records, every removal applied with its
@@ -54,7 +54,8 @@ spec = describe "Discovery through the backed service" $
         Right st → check (statusDiscovery st == DiscoveryIdle)
         Left _ → retry
       answers ← forM compared $ \(x, y, z) → okOf (knowledgeAt svc lease (tile x y z)) >>= await svc >>= expectSuccess
-      expected ← either fail pure (reference (knowledgeIncarnation (head answers)) cells)
+      incarnation ← case answers of a : _ → pure (knowledgeIncarnation a); [] → fail "no answer"
+      expected ← either fail pure (reference incarnation cells)
       let env = envFor (limitsWith 64) twoOpenings
       forM_ (zip compared answers) $ \((x, y, z), answer) →
         (((x, y, z), Right (knowledgeValue answer)) `shouldBe` ((x, y, z), D.observedValue (D.queryCell env (D.retainedProvider expected) (tile x y z))))

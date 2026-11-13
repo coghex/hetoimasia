@@ -1,13 +1,13 @@
--- | What the temporary store (TRA-20) must not change in the baseline.
+-- | What the temporary store (TRA-20) must not change in #639's residency model.
 --
--- Until the terrain owner adopts the store (TRA-22) the RAM-only baseline keeps its
--- admission outcomes: the three service-wide banks of 256, 64 and 128 MiB, the
--- retained-edit charge that is funded at a removal and kept for the arena's life
--- (an offload or an eviction never credits it), the exhausted outcome that is neither
--- busy nor invalid, and reads that continue beside it. The store's own edit-bank
--- division (48 MiB caches, 8 MiB staging, 8 MiB control) lives in
--- @hetoimasia-terrain-runtime@ and never shrinks the baseline's retained capacity or
--- reclassifies its refusals. The one addition to this package for the store, the
+-- The model keeps its admission outcomes as a pure model: the three service-wide banks
+-- of 256, 64 and 128 MiB, the retained-edit charge that is funded at a removal and kept
+-- for the arena's life (an offload or an eviction never credits it), the exhausted
+-- outcome that is neither busy nor invalid, and reads that continue beside it. The
+-- backed terrain service (TRA-22) uses the model with nothing retained (every removal
+-- it acknowledges is in the arena's store, and it sizes the model's edit account so that
+-- it never refuses); the edit bank it enforces is the store's division (48 MiB caches,
+-- 8 MiB staging, 8 MiB control) in @hetoimasia-terrain-runtime@. The one addition to this package for the store, the
 -- inverse of a component key's origin and parameters, is checked here too.
 module Test.Terrain.StorageCompat (spec) where
 

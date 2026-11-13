@@ -18,6 +18,7 @@ module Hetoimasia.Terrain.Runtime.Backed.Query
   , cancelQuery
   , endQuery
   , queryVersion
+  , queryDraining
   , QProgress (..)
   ) where
 
@@ -79,6 +80,9 @@ startQuery store run = case acquireReader store of
     (Right window, Right version) → Right (pinned, Query token window version run Nothing False)
     _ → Left PinRefused
 
+queryDraining ∷ Query a → Bool
+queryDraining = qDraining
+
 queryVersion ∷ Query a → Word64
 queryVersion = qVersion
 
@@ -122,7 +126,15 @@ stepQuery io closing store q = case qFetch q of
 
 -- | The owner no longer wants the query: a read in flight is withdrawn or drained. Called masked.
 cancelQuery ∷ Io → Query a → IO (Query a, QProgress a)
-cancelQuery io q = case qFetch q of
+cancelQuery io q
+  | qDraining q = case qFetch q of
+      Nothing → pure (q, QDrained)
+      Just (_, ticket) → do
+        finished ← atomically (pollTicket (ioService io) ticket)
+        if finished
+          then discardTicket (ioService io) ticket >> pure (q {qFetch = Nothing}, QDrained)
+          else pure (q, QBlocked (awaitTicket (ioService io) ticket))
+  | otherwise = case qFetch q of
   Nothing → pure (q {qDraining = True}, QDrained)
   Just (_, ticket) →
     cancelTicket (ioService io) ticket >>= \result → case reactToCancel result of

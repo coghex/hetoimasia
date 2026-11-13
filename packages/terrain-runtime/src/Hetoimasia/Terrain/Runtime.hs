@@ -89,6 +89,8 @@ module Hetoimasia.Terrain.Runtime
   , StorageState (..)
   , DiscoveryState (..)
   , inspectEditBankSTM
+  , perArenaBound
+  , compileAccountFor
   , Condition (..)
   , await
   , cancelPending
@@ -208,6 +210,7 @@ import Hetoimasia.Terrain.Runtime.Store.Internal.Admission (EditBankSpec (..), L
 import Hetoimasia.Terrain.Runtime.Store.Internal.Model (Condition (..), GrowthView (..), Usage (..), conditions, growthView, storeHeader, usage)
 import Hetoimasia.Terrain.Runtime.Store.Internal.State (defaultStoreSpec, mkStoreConfig)
 import Hetoimasia.Terrain.Connectivity (defaultConnectivityLimits)
+import qualified Hetoimasia.Terrain.Connectivity as C
 import qualified Hetoimasia.Terrain.Discovery as D
 import Hetoimasia.Terrain.Discovery (defaultDiscoveryLimits)
 import Hetoimasia.Terrain.Source (SourceSpec, defaultSourceLimits)
@@ -472,6 +475,16 @@ arenaStatusSTM svc lease = do
                 , statusContentRevision = D.authContent (arenaAuthority arena)
                 , statusKnowledgeRevision = D.authKnowledge (arenaAuthority arena)
                 }
+
+-- | The per-arena bound of the compile account at given compiler limits: what one compiled arena
+-- may keep for its life (its connectivity's result bound and #661's member index over the node bound).
+perArenaBound ∷ C.ConnectivityLimits → Word64
+perArenaBound = perArenaShared
+
+-- | The compile account's size for an arena cap at given compiler limits: every other arena's bound
+-- and one compilation's peak.
+compileAccountFor ∷ Int → C.ConnectivityLimits → Word64
+compileAccountFor = compileBankFor
 
 -- | The edit bank's ledgers (read-only, for verification).
 inspectEditBankSTM ∷ Service → STM Ledger

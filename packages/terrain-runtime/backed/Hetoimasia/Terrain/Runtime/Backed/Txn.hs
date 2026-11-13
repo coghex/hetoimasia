@@ -51,6 +51,7 @@ module Hetoimasia.Terrain.Runtime.Backed.Txn
   , runTxnId
   , runPlan
   , runPhaseName
+  , runDraining
   , Progress (..)
   , Done (..)
   , advance
@@ -157,6 +158,16 @@ runPlan (Run phase) = case phase of
   Fetching {} → Nothing
   Draining Nothing _ _ → Nothing
   Over → Nothing
+
+-- | Whether the run has been cancelled and waits for its job to drain.
+runDraining ∷ Run → Bool
+runDraining (Run phase) = case phase of
+  Draining {} → True
+  Over → True
+  Planning _ → False
+  Fetching {} → False
+  Writing {} → False
+  Written {} → False
 
 -- | A phase's name, for diagnostics and for the suite.
 runPhaseName ∷ Run → Text
@@ -411,7 +422,8 @@ cancel io store (Run phase) = case phase of
         (Applied, s) → Right s
         (Duplicate, s) → Right s
         (Unknown, _) → Left (defect "requesting the cancellation of a transaction the store does not hold answered Unknown")
-  Draining admitted ticket cause → yield store (Draining admitted ticket cause) (Blocked (awaitTicket (ioService io) ticket))
+  -- already cancelled: the job is waited for and its outcome taken, as 'advance' does
+  Draining {} → advance io OwnerClosing store (Run phase)
   where
     -- a read nobody will use: withdrawn if queued, stopped at its next safe point if running
     withdrawRead ticket =
