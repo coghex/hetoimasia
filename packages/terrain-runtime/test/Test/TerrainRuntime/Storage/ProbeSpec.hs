@@ -190,17 +190,25 @@ probeCases =
           [fd] <- fdHandles (envProbe env)
           pattern' fd (payloadBytes cfg) 4
           -- THE RULE (round 8, finding 2): after a failed rollback the pending charge is what the file was OBSERVED to hold beyond the committed
-          -- reservation. The verification of the growth to the 128 MiB target reports the target's payload plus the injected over-report
-          -- (an allocation above the new allowance, which the fit rule refuses); the committed reservation is the 64 MiB allowance.
+          -- reservation: the allocation the growth's verification saw, which includes the injected over-report (an allocation above the new
+          -- allowance, which the fit rule refuses), less the committed reservation (the 64 MiB allowance).
           let target = hCfg (newStoreH (specOf (toInteger (128 * mib)) Nothing))
               injected = 10 * mib
-              observedAllocation = payloadBytes target + injected
               committed = cfgAllowanceBytes cfg
-              expectedPending = observedAllocation - committed
           addRuleAfter (envProbe env) 1 1 (== OpStatFile) (OverAllocated injected)
           addRule (envProbe env) 1 (== OpSetFileLength (payloadBytes (hCfg h64))) (FailWith (Errno (fromIntegral (let C.Errno c = C.eIO in c))))
           o <- submitGrowth (envSvc env) b (64 * mib) (128 * mib) >>= outcomeOf env
           o `shouldBeFailure` \f -> case f of ReservationFailed (OverheadExceedsModel _ _) -> True; _ -> False
+          -- THE GROUND IS THE PLATFORM'S OWN REPORT, read here because the failed rollback changed nothing (its set-length failed, so nothing
+          -- was released since the verification): it is the same figure the service's verification saw, before the injected over-report. It
+          -- is NOT computed from the payload: ext4 reports one 4,096-byte extent block beyond it here (the probe wrote the whole payload into
+          -- the preallocated file), APFS reports none, and the service counts whatever the platform reports.
+          real <- either (fail . show) (pure . nsAllocated) =<< nativeStat posixNative fd
+          record "release.pending.platform.allocation" (show real)
+          real `shouldSatisfy` (>= payloadBytes target)
+          real `shouldSatisfy` (<= cfgAllowanceBytes target)
+          let observedAllocation = real + injected
+              expectedPending = observedAllocation - committed
           v <- atomically (backingView (envSvc env) b)
           fmap bvPendingReservation v `shouldBe` Just (Just expectedPending)
           record "release.pending.charge" (show expectedPending)
