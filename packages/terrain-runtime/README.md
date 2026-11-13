@@ -1153,13 +1153,14 @@ transaction on them, so no credit is taken twice or released twice.
 | State | Owner and writers | Readers | Thread | Bound | Release |
 | --- | --- | --- | --- | --- | --- |
 | The descriptor of a backing | The backing entry, from the open job's success to `closeBacking`; only a worker touches it | The two workers | Workers | One per arena (four) | Closed once, by `closeBacking`, after its jobs and borrowers have retired; the entry MOVES into a closing record that keeps every charge it paid for until the native close has returned, and its control grant until the close's diagnostics are done (shutdown joins it); a failed close is reported, never retried |
-| The file | The backing; unlinked at creation, so it lives until the last close | Borrowers | Any | The allowance (64 MiB to the configured size, 1 GiB by default) | Reclaimed by the filesystem after the last close |
+| The file | The backing; unlinked at creation, so it lives until the last close | Borrowers | Any | Its length is the PAYLOAD (the model's usable pages) and what it occupies never exceeds the ALLOWANCE (64 MiB to the configured size, 1 GiB by default; item 22) | Reclaimed by the filesystem after the last close |
 | A job record (queued, running or finished) | `submit*` creates and charges it; the workers complete it; `withOutcome`, `discardTicket` or the close retires it | The submitter | Callers, workers | 8 queued, 2 running, 32 records in all | Credits released at retirement |
 | A read's transfer buffer and result | Charged at dispatch (staging for the buffer, the cache for the result copy); the service owns the bytes until retired | `withOutcome`'s body | Worker, caller | One page to 1 MiB per running read | Staging at the end of the transfer; the cache at retirement |
 | A write's pages | The transaction (already accounted); the job only references them | The worker | Worker | 256 pages, 1 MiB | With the transaction |
 | The volume's reservation coordination | The service; one holder at a time per volume | Workers | Workers | One per volume | Released on every exit of a reservation |
 | A prepared growth and a pending reservation | The backing entry | The owner | Worker, owner | One each | Committed or abandoned by the owner; the pending record until a retry or the close; a preparation nobody received becomes a pending reservation |
-| A closing record | The service, from the claim of a backing until its close has ended: the native close and then its diagnostics | Shutdown (joins it, and the seal waits for it) | Closing caller | One per backing being closed, bounded by the control account (it keeps the backing's grant: `backingRecordBytes`) | Charged for as long as it lives: once the native close has returned one transaction releases the volume's reservation and keeps a failing close, and the record (`CrReporting`) CARRIES the backing's grant through the diagnostics until the transaction that deletes it releases it |
+| A closing record | The service, from the claim of a backing until its close has ended: the native close and then its diagnostics | Shutdown (joins it, and the seal waits for it) | Closing caller | One per backing being closed, bounded by the control account (it keeps the backing's grant: `backingRecordBytes`) | Charged for as long as it lives: once the native close has returned one transaction releases the volume's reservation (unless the close is HELD, below) and keeps a failing close, and the record (`CrReporting`) CARRIES the backing's grant through the diagnostics until the transaction that deletes it releases it |
+| A held close (`stHeld`, round 7) | The close core: ONE record per backing whose close failed where a failed close is not established to have released the descriptor (an errno on macOS) or RAISED (anywhere); the seal clears them | The snapshot, the checker | The closing caller (insert), the drain (clear) | One per such backing, bounded by the control account: it holds THE backing's grant (`backingRecordBytes`), and the reporting record of the same close carries none (one grant, two records) | Counted on the volume's figure and charged until the SERVICE ENDS; the seal releases the grant and the volume's figure |
 | A kept failure (a cleanup nobody received, or a close that failed) | The service's evidence | The scope that ends the service | Any | At most 64, charged `keptEntryBytes` (2,048) each, a cleanup note or the typed failure of a close (the backing, and the errno or the bounded text of the exception); more are counted | Composed into the scope's failure at the end (a close as `BackingCloseFailed` or `BackingCloseRaised`), its charge released in the seal transaction |
 
 **Handles are opaque.** A `Backing` names no descriptor: the service resolves it, so a closed,
@@ -1195,34 +1196,40 @@ threaded runtime; the service refuses to start without it (`NotThreaded`).
 descriptor is on is on the qualified list (`apfs`, `ext4`; anything else, tmpfs, ramfs, network and
 copy-on-write configurations included, is `storage_unsupported` even if the native call would
 succeed); (2) the free space the unprivileged process sees leaves at least 256 MiB after the
-request (`f_bavail`, never root-reserved blocks), the check and the allocation being one step under
+ALLOWANCE the request is for (`f_bavail`, never root-reserved blocks; the file can occupy up to the allowance, so the
+headroom holds however the platform's overhead falls), the check and the allocation being one step under
 the volume's coordination so two arenas cannot spend the same observed headroom; (3) the native
 allocation, `F_PREALLOCATE` with `F_ALLOCATEALL` on macOS and `fallocate` mode 0 on Linux (never
 `posix_fallocate`, never a write loop), whose own count of allocated bytes must equal the request;
 (4) the checked file length; (5) the filesystem's own report of allocated bytes covers the whole
-length, so a sparse file of the right length fails. The physical overhead (allocated beyond the
-length) is reported to the model in `Reservation` and must not exceed the overhead the store
-configuration charges; a larger one refuses the open. **A check uses what was obtained, not what was
-asked:** the precheck (2) subtracts the requested length, but the allocation may occupy more (an extent
-block on ext4), so, after the allocation and under the same volume coordination, the headroom is
-verified again with the bytes the file actually gained (its allocated bytes after minus before); if it
+length, so a sparse file of the right length fails. **What is asked of the platform is the PAYLOAD, not the allowance
+(item 22):** the file holds the model's usable pages and nothing else, its length is the payload, and the platform's own
+overhead (allocated beyond the length: an extent block, a rounding) is reported in `Reservation` and must fit in what the
+allowance leaves for it, so that **the physical allocation never exceeds the allowance**: an allocation above the allowance
+refuses the open or the growth (`OverheadExceedsModel`, the overhead obtained and the budget) and gives it back. **A check
+uses what was obtained, not what was asked:** the precheck (2) is made after the allowance, but the allocation may occupy
+more than the payload (an extent block on ext4), so, after the allocation and under the same volume coordination, the
+headroom is verified again with the bytes the file actually gained (its allocated bytes after minus before); if it
 is no longer left the reservation is refused (`InsufficientHeadroom` with the available, obtained and
 required bytes) and given back, for an open and for a growth.
 
 | Where a size is used | Requested | Obtained | What counts |
 | --- | --- | --- | --- |
-| Headroom, precheck | the length | | the request (early refusal, kept) |
+| The request to the platform (open) | the PAYLOAD: `((allowance - overhead) div page) x page`, the model's usable pages | the count the platform reports | the request: a short allocation is refused |
+| The request to the platform (growth) | the extra payload `[payload(from), payload(to))` | the same | the request |
+| Headroom, precheck | the ALLOWANCE the request is for (a growth: `to - from`), never less than the payload | | the request (early refusal, kept) |
 | Headroom, after the allocation | | the file's allocated bytes after minus before, overhead included | **the obtained bytes** |
-| Allocation count | the length | the count the platform reports | the request: a short allocation is refused |
+| Length established | the end of the range (the payload) | `fstat` size | equal, else `LengthMismatch` |
 | Allocated coverage | the end of the range | the file's allocated bytes | the obtained bytes (a sparse file fails) |
-| Overhead | the model's charge (`cfgOverheadBytes`) | allocated minus the length | an obtained overhead above the model's refuses the open and the growth |
-| The volume's reserved figure | | | the length plus a pending extra; overhead is not in it, the model charged it |
-| A release | the range [from, to) | the freed extent (overhead included) | the request: the figure never held the overhead |
+| **The physical allocation fits the allowance** | the allowance (a growth: the new one) | the file's allocated bytes | **allocated <= allowance, else refused and unwound**: the overhead obtained above the budget (`allowance - payload`) refuses the open and the growth |
+| The volume's reserved figure | | | the ALLOWANCE (a growth: the new one once published, plus a pending extra in allowance units): the upper bound of what the file can occupy, so it is never less than the physical allocation; a held close (item 22) keeps counting |
+| A release, a give-back, a rollback | the payload range `[payload(from), payload(to))` | the freed extent (overhead included) | the request; the volume's figure leaves by `to - from` allowance units |
+| A read or a write of a page | the model's usable pages (`pageFileOffset`: page < usable pages) AND the backing's own payload | | refused before any native call when the request's configuration reaches past the BACKING's payload (`PayloadBeyondBacking`), whatever overhead the caller's configuration names |
 
 | Platform | Filesystem | Reservation | Rewrite inside the reservation, volume exhausted (measured, below) | Release |
 | --- | --- | --- | --- | --- |
-| macOS 26 (arm64) | APFS, 3 GiB disk image | exact (overhead 0) at 64 MiB, 256 MiB, 1 GiB | the backing's allocated bytes 67,108,864 before and after, 0 bytes of the volume's space consumed | Preallocation beyond the end of the file is released only by raising the length and shortening it; the last close reclaimed the space within the first observation |
-| Linux 6.8 (aarch64) | ext4, 3 GiB loop image | exact at 64 MiB and 256 MiB; 4,096 bytes over at 1 GiB (an extent block, inside the model overhead) | the same: 67,108,864 before and after, 0 consumed | one block of ext4 bookkeeping stays accounted after a release; the space returned at the last close |
+| macOS 26 (arm64) | APFS, 3 GiB disk image | the file's length is the payload (66,060,288 / 267,386,880 / 1,069,547,520 bytes at 64 MiB / 256 MiB / 1 GiB); allocated equals the payload (overhead 0), inside the allowance | the backing's allocated bytes 66,060,288 before and after, 0 bytes of the volume's space consumed | Preallocation beyond the end of the file is released only by raising the length and shortening it; the last close reclaimed the space within the first observation |
+| Linux 6.8 (aarch64) | ext4, 3 GiB loop image | the same payloads; allocated equals the payload at 64 MiB and 256 MiB; 4,096 bytes over at 1 GiB (an extent block, inside the budget the allowance leaves: 1,069,551,616 <= 1,073,741,824) | the same: 66,060,288 before and after, 0 consumed | one block of ext4 bookkeeping stays accounted after a release (66,064,384, inside the allowance); the space returned at the last close |
 
 The qualification is a probe, not a claim of universal support; the table is what was run, and the
 records, the commands and the run identifiers are in the evidence.
@@ -1312,6 +1319,7 @@ a closing record 0 (a `max 0` clamp), and all of them *passed* as "at most the c
 | A read's result until it is taken or discarded | cache, pinned, at dispatch | `resultPageBytes` 4,864 a page | n/a | a finished, untaken 256-page result with its record: 1,077,816 to 1,132,048 of 1,249,280 |
 | A backing's record (per arena) | control, from the open's success to `endClosing` (`register`, then the closing record) | `backingRecordBytes` 4,096 | the entry at its largest variant (`GReleasing (Just prepared)`, a pending reservation) with its backing-map node, its volume-ledger node and its grant's entry 388 to 505 | an observation only (one backing is below the floor) |
 | A closing record | control, the same grant | `backingRecordBytes` 4,096 | native close pending (the entry moved, per backing) 402 to 502; **reporting (the carried grant, per record) 217 to 275** | the pressure example (below) |
+| A held close (round 7: its two records, the held record and the reporting record that carries no grant, with the volume's ledger node) | control, the backing's grant, held to the service's end | `backingRecordBytes` 4,096 | the two records TOGETHER, per backing: **357 to 377 (macOS) and 354 to 358 (Linux)** | the pressure example (repeated open and failing close with the logger held; the pressure outlives the logger) |
 | A kept failure (a cleanup nobody received, or a close that failed) | control, while kept | `keptEntryBytes` 2,048 | the largest instance, a close that RAISED with a 256-character text of four-byte characters, with its list cell and its grant's entry: 1,517 (constant) | 64 asserted kept |
 | A write's pages | nothing while the job is queued or running: the transaction's own, already accounted in its reservation, referenced and never copied; **nothing once the job has finished** (`scrubWork`) | n/a | n/a | the finished-report row above |
 
@@ -1421,7 +1429,8 @@ charge; the others own nothing.
 **3. A charge ends when what it pays for is gone.** A backing claimed for close MOVES whole into a closing
 record (`stClosingRecs`): its grant, its volume contribution, its pending reservation and its descriptor, and
 nothing is released by the claim. One transaction after the native close has returned (`finishClosing`)
-subtracts the reservation and keeps a failing close, and the record (reporting) CARRIES the grant until the
+subtracts the reservation and keeps a failing close (a HELD close subtracts nothing and moves the grant to the held record:
+item 22), and the record (reporting) CARRIES the grant until the
 transaction that deletes it (`endClosing`) releases it; the drain joins the records. The same
 question was asked of every other release (below) and none releases before the native call that frees the
 thing has returned. The table is `Lifecycle.chargeRow` (total over `ChargeKind`) and the suite holds each
@@ -1433,7 +1442,7 @@ native call and asserts both ledgers *during* it:
 | DispatchStaging | a read's transfer buffer | finishJob, when the job ends | execute has returned: the native read is over and the buffer is released |
 | ResultBytes | a finished read's result copy (cache, pinned) | retireJob | the bytes are dropped with the record when the outcome is taken or discarded |
 | BackingRecord | a backing's entry, descriptor and file | endClosing, the one transaction that deletes the closing record, after the native close has returned and the close's diagnostics are done | the descriptor is closed and nothing of the close is left: the closing record, reporting or not, carried the grant until then |
-| VolumeReserved | the file's length and any pending extra on the volume | finishClosing (a close), execRelease (a release) | the native close, or the release's set-length, has returned |
+| VolumeReserved | the ALLOWANCE reserved for the backing and any pending extra on the volume (allowance units) | finishClosing (a close that is not held), the seal (a held close), execRelease (a release) | the native close, or the release's set-length, has returned; for a held close, the service has ended |
 | PendingReservation | an extra range a failed release left allocated | execRelease on success, finishClosing | the retried release's set-length has returned |
 | GrowthExtra | an abandoned or failed growth's extra range | execRelease and giveBack on success | the set-length that frees it has returned: until then the extra stays counted |
 
@@ -1445,7 +1454,7 @@ cleanup failure of that step and never an exit that skips the next:
 | `execOpen` unwind | unlink retry; the one close of the descriptor (recorded as attempted before it is made) | a cleanup note of the step (errno -1); the close is never repeated |
 | `giveBack` (a growth that did not publish) | the release of the extra range | a release that failed: the extra stays pending and charged |
 | `execRelease` | the release | the same; the exception propagates with its context after the pending record is made |
-| `closeBackingCore` | the claim (the entry moves into the closing record, `CrNative`); the one native close; `finishClosing` (ONE transaction: subtract the volume reservation, carry the grant on the reporting record, KEEP a failing close, mark the record `CrReporting`); three diagnostics; `endClosing` (ONE transaction deleting the record) | the close's exception is recorded, never retried, and kept like any failure; `finishClosing` precedes the diagnostics, and the record outlives them |
+| `closeBackingCore` | the claim (the entry moves into the closing record, `CrNative`); the one native close; `finishClosing` (ONE transaction: subtract the volume reservation and carry the grant on the reporting record, or, for a HELD close, keep the reservation and move the grant to the held record; KEEP a failing close; mark the record `CrReporting`); three diagnostics; `endClosing` (ONE transaction deleting the record) | the close's exception is recorded, never retried, and kept like any failure; `finishClosing` precedes the diagnostics, and the record outlives them |
 | `drainService` | closing admission; stopping the workers; joining them; closing every backing; joining the closing records (and saying so before it waits); disposing of every record; the SEAL (one transaction: every closing record has ended, the kept failures are read and their charges released, the phase becomes `Sealed`); composing the evidence | each wait is in the protected boundary; a cancellation is remembered (first wins) and delivered after the drain |
 | start sequence | stop every started worker; join every started worker | a cancellation of either is remembered; the primary failure propagates |
 
@@ -1552,16 +1561,14 @@ discipline, each with its proof:
 | The service cannot end, nor its logger be used, while a close is in its diagnostics, and the records a held logger can leave are bounded | the closing record lives through them (`CrReporting`) CARRYING the grant; the drain and the seal join it | "keeps a close tracked through its post-native diagnostics" (the diagnostic held, the drain observed waiting by its own log, then released); "charges a closing record for as long as it lives" (repeated open, take and close against a held logger meets pressure) |
 | Nothing commits to a service after its scope ended | the seal transaction and `SealedMutation` | the sealed-service example over every public mutator (the table in item 14) |
 
-**11. A real failure of `close` cannot be induced, and the policy that follows.** On the two qualified
-filesystems a `close` of a regular file does not fail in practice (no network or delayed-write filesystem is
-qualified), so only an injected `EIO` and an exception after the call are exercised; the exact limitation is
-kept and the decision is the owner's. What the platforms document: Linux `close(2)` documents that an error
-can be reported after the descriptor has been released and that retrying is the wrong thing to do, since it
-may close a descriptor another thread has been given (the issue quotes this and forbids generalising it to an
-unqualified native path); the macOS `close(2)` behaviour was not qualified here and nothing was observed.
-**The policy is the same on both and does not depend on what they document: the close is made once, a failure
-or an exception from it is kept and reported, and it is never retried** (nor is an `EINTR`: the close is a
-bounded call made uninterruptibly).
+**11. A real failure of `close` cannot be induced, and what the backend does about it** (owner decision, round 7). On the two
+qualified filesystems a `close` of a regular file cannot be made to fail inside the approved fixtures (no network or
+delayed-write filesystem is qualified), so the macOS close-error ownership is **not qualified**, by the owner's decision
+(option A: [the amendment](https://github.com/coghex/hetoimasia/issues/663#issuecomment-6838600845), marker `owner-decision:663-macos-close-error`, and the issue's re-approval at the
+amended spec, [https://github.com/coghex/hetoimasia/issues/663#issuecomment-6838757655](https://github.com/coghex/hetoimasia/issues/663#issuecomment-6838757655)); item 22 has the behaviour. **The backend assumes nothing a platform has
+not established:** the close is made once and never retried on every platform (nor is an `EINTR`: the close is a bounded
+call made uninterruptibly); a failure or an exception is kept and reported; and what happens to the backing's reservation
+follows the platform-fact table in `Native.hs` (item 22).
 
 **12. An effect is owned before its after-hook runs** (`around`, `Owns`; round 4, finding 1). A native effect runs
 through ONE function, `around seam op owns act`: the before-hook, the effect, **the recorder of what the effect
@@ -1870,6 +1877,79 @@ The exported types:
 | `CleanupNote` | a failure value | the service | n/a | scalars |
 | `Errno` | a failure value | the platform | n/a | a scalar |
 
+**22. The payload rule, the request checked against its backing, and the platform close-fact table** (round 7).
+
+*A. The physical allocation fits the allowance* (issue item 2: the native allocation and format overhead are accounted "within
+the allowance"). The first design asked the platform for the whole allowance and charged the model's overhead beside it, so
+the file could occupy the allowance plus the platform's overhead. **The rule, in one place (`payloadOf` and `budgetOf` in
+`Service.hs`, which every caller uses):**
+
+```
+payload(allowance, overhead) = ((allowance - overhead) div page) x page      -- the model's cfgUsablePages x page, the same expression
+budget(allowance, overhead)  = allowance - payload                           -- what the allowance leaves for the platform's overhead
+the file's length            = payload;   what it occupies = payload + the platform's overhead <= allowance, always
+```
+
+*Why no page lies beyond the payload.* The model hands out page `n` only when `n < cfgUsablePages` (`pageFileOffset`, which
+the backend uses unchanged: the model is not changed), so the end of any page is `(n + 1) x page <= usable pages x page =
+payload`. A test asserts that `payloadOf` equals the model's usable pages times the page size for every configuration the
+suite builds, and that a page in the tail between the payload and the allowance is refused before any native call, with the
+file's length and allocation unchanged (so a write can never extend the file past its payload). **The request is checked
+against the BACKING, not the caller's configuration:** `capRefusal`, the one place a request meets its backing, refuses a
+request whose configuration has more usable pages than the backing's payload (the same allowance with a smaller overhead, say)
+with `PayloadBeyondBacking` (the request's payload, the backing's); a growth cannot make the overheads differ, because
+`growConfig` keeps the configuration's overhead and the backing sizes every growth from the overhead it was opened with.
+
+The size table (every place a size is computed or compared, and which figure it uses) is the one in "The reservation, and what
+is proved" above. The unit of the volume's reserved figure is the ALLOWANCE (the upper bound of what the file can occupy), so
+"the reserved figure is never less than what the files occupy" holds by construction, and the checker asserts it (`bsAllocated`
+is the last admitted physical report of each backing; the invariants are `bsAllocated <= bsReserved + pending` for every backing
+and `reserved >= sum of bsAllocated` for every volume).
+
+*What changed for a reader.* The file's length is the payload, not the allowance. `Reservation`'s fields: `rsLength` is the
+payload, `rsAllocated` what the platform reports occupied (always at most the allowance), `rsOverhead = rsAllocated - rsLength`
+(at most the budget). The backing view's field that was `bvLengthBytes` is **`bvReservedBytes`**, the ALLOWANCE reserved for the
+backing (the committed one, or the prepared one while a growth is prepared), as are the internal `eReserved` and `bsReserved`:
+none is the file's length. A new typed refusal, `PayloadBeyondBacking`, and the refused overhead is reported as the overhead
+obtained against the budget. The probe's expectations follow the rule: the file's length is the payload, the allocation fits the
+allowance, the whole payload (every page the model can address) is written, read back and rewritten.
+
+*B. A failed close assumes nothing the platform has not established.* The table, next to the native adapter (`closeFactOf`,
+`nativeCloseFact` in `Native.hs`), is one row per supported platform with the ground it stands on:
+
+| Platform | Fact | Ground |
+| --- | --- | --- |
+| Linux | a failed `close` has RELEASED the descriptor (`CloseReleasesOnFailure`) | ESTABLISHED by its documentation, `close(2)` NOTES: "Retrying the close() after a failure return is the wrong thing to do, since this may cause a reused file descriptor from another thread to be closed. This can occur because the Linux kernel always releases the file descriptor early in the close operation, freeing it for reuse; the steps that may return an error, such as flushing data to the filesystem or device, occur only later in the close operation." |
+| macOS | NOT ESTABLISHED (`CloseNotEstablished`) | `close(2)` on macOS documents no such guarantee. Its open-source kernel (XNU) is cited to release the descriptor before it calls the file's close operation, but that is a reading of source, not a documented contract, and not demonstrated; **no claim rests on it**. Observed only: a SUCCESSFUL close releases the descriptor (the probe asks `fcntl` about the number afterwards and is answered `EBADF`; non-destructive) |
+| any other | NOT ESTABLISHED | nothing is established |
+
+*The row applies to an error returned by the `close(2)` call. A raise is not an error return of the call* (it can come from the
+seam's before-hook, where the native close was never made and the descriptor is certainly still open, with its space), so **a
+raise is "not established" on every platform**, whatever the table says. Where a failed close is established to have released
+the descriptor (an errno on Linux), the backing's reservation is released with it (as before). Where it is not established (an
+errno on macOS, a raise anywhere), the close is made once and never retried and the backing's reservation **stays counted, as
+possibly still held, in a charged record of its own (`stHeld`) until the service ends**: the volume's reserved figure keeps the
+backing's allowance and any pending extra, the record holds THE backing's control grant (**one grant, two records**: the
+reporting record of the same close, which lives until the diagnostics return, carries none, so the one charge
+`backingRecordBytes` covers both and the Memory suite measures them together), and the failure is reported as a labelled
+cleanup failure (`close of backing N (reservation held: a failed close is not established to release)`, a log attribute
+`reservation=held`, and `crReservationHeld` in the `CloseReport`) and shown in the snapshot (`snHeld`) and in the invariant
+equations (the volume's figure, the control equation, the descriptor bound). A SUCCESSFUL close is the same on both platforms.
+The seal releases the held grants and the volume's figure with the service. The two cases are covered through the seam under
+both table values, with an errno (`EIO`), a raise in the native wrapper and a raise in the seam's before-hook (where the
+descriptor is asserted still open), the figures asserted: the volume's reserved figure, the control charge, the held record, the
+evidence, one native close only, and a clean close beside it unchanged; and a pressure example (repeated open and failing close
+with the logger held meets pressure that outlives the logger).
+
+*Can a real close failure be induced inside our limits?* No, from platform knowledge: `close(2)` on a regular file of a local
+filesystem returns an error only for `EBADF` (not our descriptor), `EINTR` (a signal; a close of a regular file does not sleep)
+or an error from the filesystem's close or flush path, and neither APFS nor ext4 does write-back in close (data goes through the
+cache and fails at `fsync` or unmount, not at close); the filesystems where close reports a deferred error (NFS, SMB) are not on
+the qualified list, and a disk image's backing file cannot be made to fail without breaking the host volume. Sources: the Linux
+`close(2)` manual page (NOTES, "Dealing with error returns from close()"), the macOS `close(2)` manual page (which documents no
+post-release guarantee), and the XNU source (`close_internal_locked`, cited and not relied on). The owner accepted the limitation
+("a real failing close cannot be induced on APFS (nor on ext4) inside the approved bounded fixtures") and chose option A.
+
 Smaller rules that hold the same class:
 
 * **Open.** From the moment the file exists until the one transaction that registers it, `execOpen` owns the
@@ -2019,9 +2099,14 @@ run anywhere else. The storage examples hold the class of defect, not the instan
   the tables above, each with its examples: three exit rows with the service kept running; one example per charge
   kind with the native call held; a discarded open whose close fails, a close that receives a cancellation instead
   of its report (each with the failing close held and a cancellation pending), a close that raised and keeps its typed
-  identity, a close held in its diagnostics while the drain waits, and 64 kept failures plus a counted drop; open and growth with exactly the length and the headroom
-  available and a seam that over-allocates 4,096 bytes (refused and unwound), and with the overhead available
-  (admitted).
+  identity, a close held in its diagnostics while the drain waits, and 64 kept failures plus a counted drop; open and growth with exactly the allowance and the headroom
+  after it available (admitted), one byte less headroom (refused before any native allocation), a seam that over-allocates by
+  exactly the budget (admitted with allocated equal to the allowance) and by one byte more (refused and unwound), and, with the
+  headroom kept after the allowance, a seam whose obtained bytes take part of it (refused).
+* **The payload rule and the platform close-fact table** (item 22; `Open`, `Growth`, `Lifecycle`, `Classes`): the file's length is
+  the model's usable pages; a tail page and a request whose configuration has the same allowance and a smaller overhead are
+  refused before any native call with the file unchanged; both table values under an errno, a raise and a before-hook raise,
+  the held record, the volume's figure and the charge asserted; the pressure example for a held close.
 * **The probe's own checks** (`Classes`, "the probe's filler"): the filler ends only on out-of-space (six other
   errnos and a failing length each end it as a failure); a filler refused at once on a volume with plenty free fails
   with `ResidueTooLarge` before the action runs; a platform that would still grant one more block fails the
