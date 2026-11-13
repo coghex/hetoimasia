@@ -213,20 +213,41 @@ rulesSpec = describe "Storage backend: a memory row cannot pass without measurin
     r ← liveWith (atomicModifyIORef' transient (\_ → (Nothing, ())))
     -- a reading that had taken the transient in would be at least `spike` above the base
     (fromIntegral r - fromIntegral base ∷ Double) `shouldSatisfy` (< 50000)
-  it "takes the median of independent samples: one sample carrying a transient of that size leaves the median alone and is reported UNSTABLE, and a retention in every sample is not hidden" $ do
-    let spikeTotal = 497536 ∷ Double
-        n = 24 ∷ Int
+  -- THE CONTROLS OF THE MAJORITY RULE, on values (n = 24 instances; a spike is the runner's 497,536 bytes in total)
+  it "establishes a row's value by a majority of its samples: one bad sample never fails or moves it, a retention in every sample is not hidden, and a persistent disagreement is UNSTABLE" $ do
+    let n = 24 ∷ Int
         calm = 400 ∷ Double
-        spiked = calm + spikeTotal / fromIntegral n
-        (med, spread, allowed) = sampleStats n [calm, spiked, calm]
-    -- the row's VALUE is the median: the transient does not move it ...
-    med `shouldBe` calm
-    -- ... and the disagreement is a loud UNSTABLE failure of the row, never a changed figure
-    spread `shouldSatisfy` (> allowed)
-    -- a real retention (every sample carries it) IS the median and is stable: it is not hidden
-    let (med2, spread2, allowed2) = sampleStats n [spiked, spiked, spiked]
-    med2 `shouldBe` spiked
-    spread2 `shouldSatisfy` (<= allowed2)
+        spike = calm + 497536 / fromIntegral n
+        value xs = fst <$> establish n xs
+    -- [calm, spike, calm] establishes calm at once (three samples); [spike, calm, calm] and [calm, calm, spike] too
+    value [calm, spike, calm] `shouldBe` Just calm
+    value [spike, calm, calm] `shouldBe` Just calm
+    value [calm, calm, spike] `shouldBe` Just calm
+    -- [spike, spike, spike] establishes the spike: a real retention shows in every sample and is not hidden (the row then fails as over its charge)
+    value [spike, spike, spike] `shouldBe` Just spike
+    -- two disagreeing samples out of three, each different: no majority yet (a fourth is taken)
+    value [calm, spike, calm + 100000 / fromIntegral n] `shouldBe` Nothing
+    -- a fourth sample that agrees with only one of them is still no majority (3 of 4 are needed): more are taken
+    value [calm, spike, calm + 100000 / fromIntegral n, calm] `shouldBe` Nothing
+    -- a fifth that joins the calm ones does establish it (3 of 5)
+    value [calm, spike, calm + 100000 / fromIntegral n, calm, calm] `shouldBe` Just calm
+    -- a single bad sample among seven never changes the figure, wherever it falls
+    forM_ [0 .. 6] $ \i → value [if j == i then spike else calm | j ← [0 .. 6 ∷ Int]] `shouldBe` Just calm
+    -- three clusters cycling to the bound: no agreeing majority: UNSTABLE (a persistent disagreement)
+    let cycle3 = take 7 (cycle [calm, calm + 100000 / fromIntegral n, calm + 300000 / fromIntegral n])
+    value cycle3 `shouldBe` Nothing
+    -- and through the whole procedure: a sample that is bad exactly once is established without failing, a persistent three-way disagreement fails
+    calls ← newIORef (0 ∷ Int)
+    let once = do
+          c ← atomicModifyIORef' calls (\x → (x + 1, x))
+          pure (if c == 2 then spike else calm)
+    v ← medianOf "control: one bad sample" n once
+    v `shouldBe` calm
+    cyc ← newIORef (0 ∷ Int)
+    let cycling = do
+          c ← atomicModifyIORef' cyc (\x → (x + 1, x))
+          pure (cycle [calm, calm + 100000 / fromIntegral n, calm + 300000 / fromIntegral n] !! c)
+    (try (medianOf "control: persistent disagreement" n cycling) ∷ IO (Either SomeException Double)) >>= \r → either (const (pure ())) (const (expectationFailure "a persistent three-way disagreement was established")) r
   it "fails a row whose signal is below the floor times the multiple, and passes one above it" $ do
     fails (checkSignal "signal too small" 10 1)
     checkSignal "signal far above" big 1.5
@@ -259,10 +280,6 @@ checkSignal name n m = do
   m `shouldSatisfy` (> 0)
   signal `shouldSatisfy` (>= need)
 
--- | How many independent samples a row takes (odd: the median is one of them).
-sampleCount ∷ Int
-sampleCount = 3
-
 -- | The fraction of a row's signal by which its samples may disagree (largest minus smallest total) before the row is UNSTABLE.
 unstableFraction ∷ Double
 unstableFraction = 0.25
@@ -274,29 +291,59 @@ unstableFraction = 0.25
 stackChunkQuantum ∷ Double
 stackChunkQuantum = 40000
 
--- | ONE BAD READING CANNOT DECIDE A ROW (round 10): a discarded warm-up run, then an odd number of independent samples of the per-instance figure (each its own settled
--- readings and, for an in-service row, its own service); the MEDIAN is the row's value (not a minimum, not a maximum); the samples and their spread
--- are printed; and a row whose samples disagree by more than 'unstableFraction' of its signal (or of the smallest signal a row may have) fails
--- loudly as UNSTABLE, never as an over- or under-charge.
+-- | A ROW'S VALUE IS ESTABLISHED BY A MAJORITY (round 10). One bad sample must never fail a row: the runner showed about one bad pair in 300 and a run
+-- takes about a hundred measurement windows, so a rule that fails on one disagreeing sample is the flake under another name. A sample is a
+-- per-instance figure (each its own settled readings and, for an in-service row, its own service). The value is ESTABLISHED when a MAJORITY of the
+-- samples taken so far (more than half) agree within the row's tolerance (the largest total they may differ by); the row's value is the MEDIAN of
+-- the agreeing majority (the largest agreeing group; not a minimum, not a maximum). A real retention shows in EVERY sample, so the majority agrees
+-- on the larger figure and the row fails as over its charge: it is not hidden.
+establish ∷ Int → [Double] → Maybe (Double, [Double])
+establish n xs
+  | k < 2 = Nothing
+  | otherwise = case [w | size ← [k, k - 1 .. need], i ← [0 .. k - size], let w = take size (drop i sorted), agrees w] of
+      w : _ → Just (medianOfSorted w, w)
+      [] → Nothing
+  where
+    k = length xs
+    need = k `div` 2 + 1
+    sorted = Data.List.sort xs
+    agrees w = (maximum w - minimum w) * fromIntegral n <= allowedFor n (medianOfSorted w)
+
+medianOfSorted ∷ [Double] → Double
+medianOfSorted w = w !! (length w `div` 2)
+
+-- | The largest total by which samples of a row may differ and still agree: one stack chunk and a little, or 'unstableFraction' of the signal (the
+-- smallest signal a row may have is 'signalMultiple' times the floor).
+allowedFor ∷ Int → Double → Double
+allowedFor n med = max stackChunkQuantum (unstableFraction * max (abs med * fromIntegral n) (signalMultiple * theFloor))
+
+-- | The first samples taken for a row, and the most (more are taken one at a time until a majority agrees).
+minSamples, maxSamples ∷ Int
+minSamples = 3
+maxSamples = 7
+
+-- | A discarded warm-up run (the first run of a row in the process pays costs that are not the row's: a first-use initialization, a first evaluation of
+-- a shared constant), then samples until the value is established ('establish'); the samples, how many were needed and how many agree are PRINTED, so the
+-- evidence shows how often the runner disturbed a row. A row whose samples still have no agreeing majority at 'maxSamples' (a persistent
+-- disagreement, a real finding) fails as UNSTABLE with every sample in the message.
 medianOf ∷ String → Int → IO Double → IO Double
 medianOf name n sample = do
-  -- the first run of a row in the process pays costs that are not the row's (a first-use initialization, a first evaluation of a shared
-  -- constant): it is a WARM-UP and is discarded, like the noise floor's first samples; the samples after it are independent
   _ ← sample
-  xs ← replicateM sampleCount sample
-  let (med, spread, allowed) = sampleStats n xs
-  putStrLn ("memory samples | " <> name <> " | " <> show (map (round ∷ Double → Integer) xs) <> " | spread of the totals " <> show (round spread ∷ Integer) <> " of " <> show (round allowed ∷ Integer) <> " allowed | median " <> show (round med ∷ Integer))
-  when (spread > allowed) $
-    expectationFailure ("UNSTABLE: the samples of " <> name <> " disagree by " <> show (round spread ∷ Integer) <> " bytes in total (more than " <> show (round allowed ∷ Integer) <> "): " <> show xs)
-  pure med
-
--- | The median of the samples, the spread of their totals and the spread allowed (the pure part of 'medianOf').
-sampleStats ∷ Int → [Double] → (Double, Double, Double)
-sampleStats n xs = (med, spread, allowed)
+  go []
   where
-    med = Data.List.sort xs !! (length xs `div` 2)
-    spread = (maximum xs - minimum xs) * fromIntegral n
-    allowed = max stackChunkQuantum (unstableFraction * max (abs med * fromIntegral n) (signalMultiple * theFloor))
+    go xs = do
+      x ← sample
+      let xs' = xs <> [x]
+      case (if length xs' >= minSamples then establish n xs' else Nothing) of
+        Just (v, agreeing) → do
+          putStrLn ("memory samples | " <> name <> " | " <> show (map (round ∷ Double → Integer) xs') <> " | needed " <> show (length xs') <> " | agreeing " <> show (length agreeing) <> " | value " <> show (round v ∷ Integer))
+          pure v
+        Nothing
+          | length xs' >= maxSamples → do
+              putStrLn ("memory samples | " <> name <> " | " <> show (map (round ∷ Double → Integer) xs') <> " | needed " <> show (length xs') <> " | agreeing none | UNSTABLE")
+              expectationFailure ("UNSTABLE: the samples of " <> name <> " have no agreeing majority after " <> show (length xs') <> ": " <> show xs')
+              pure 0
+          | otherwise → go xs'
 
 -- | A standalone row: instances raised until the total added is at least 'signalMultiple' times the floor.
 sound ∷ String → Int → (Int → IO Double) → IO Double
