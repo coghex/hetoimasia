@@ -31,7 +31,6 @@ checks merged work and changed issues against it and resumes from
   [messaging](docs/messaging.md), [time](docs/time.md),
   [scheduling](docs/scheduling.md), [GLFW](docs/glfw.md), [logging](docs/logging.md),
   [failures](docs/failures.md), [recovery](docs/recovery.md).
-- Review coverage: the [project-review ledger](docs/removed_records.md).
 
 ## Owner decisions in force
 
