@@ -238,11 +238,15 @@ abandonGrowth io store (GrowthRun phase) = case phase of
   Reserving ticket → do
     _ ← cancelTicket (ioService io) ticket
     pure (store, GrowthRun (Withdrawing ticket), GrowthBlocked (awaitTicket (ioService io) ticket))
-  Prepared prepared →
+  -- the obtained extra did not commit: the store now holds it as being released (#662's
+  -- 'growthFailed'), so its release ends the growth ('growthReleased') and a failed one keeps it
+  -- pending ('growthReleaseFailed')
+  Prepared prepared → do
+    releasing ← evaluate (growthFailed store)
     submitAbandon (ioService io) (ioBacking io) prepared >>= \case
-      Right ticket → pure (store, GrowthRun (Abandoning ticket), GrowthBlocked (awaitTicket (ioService io) ticket))
+      Right ticket → pure (releasing, GrowthRun (Abandoning ticket), GrowthBlocked (awaitTicket (ioService io) ticket))
       Left failure → do
-        s ← evaluate (growthReleaseFailed (growthFailed store))
+        s ← evaluate (growthReleaseFailed releasing)
         pure (s, GrowthRun Ended, GrowthOver (GrowthLeftPending (Just (classifyFailure OwnerClosing JkRelease failure))))
   -- nothing submitted yet: the pending extra stays pending
   ReleaseFirst _ → pure (store, GrowthRun Ended, GrowthOver GrowthWithdrawn)

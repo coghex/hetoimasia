@@ -18,7 +18,7 @@ import Hetoimasia.Terrain.Runtime.Store.Admission (Ledger (..))
 import qualified Hetoimasia.Terrain.Runtime.Store.Internal.Admission as A
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan (RamCharge (..))
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Native (NativeOp (..))
-import Hetoimasia.Terrain.Runtime.Storage.Internal.Service (resultPageBytes)
+import Hetoimasia.Terrain.Runtime.Storage.Internal.Service (resultPageBytes, transferBufferBytes)
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Types (Errno (..))
 import Hetoimasia.Terrain.Runtime.Store (StoreSpec (..), defaultStoreSpec, minAllowanceBytes)
 import Test.Hspec
@@ -101,8 +101,9 @@ spec = describe "The backed terrain service" $ do
         H.awaitReached gate 2
         -- the removal becomes eligible: the transaction does not fit beside both reads, so its grant waits
         grant host
+        -- no transaction staging is reserved: only the two reads' transfer buffers
         bank ← atomically (inspectEditBankSTM svc)
-        lgStagingForeground bank `shouldBe` 0
+        lgStagingForeground bank `shouldBe` 2 * transferBufferBytes 1
         readTVarIO granted `shouldReturn` grantsBefore
         pure readers
       -- the reads return (the gate opened): their results and pins are released and the grant proceeds
@@ -110,6 +111,44 @@ spec = describe "The backed terrain service" $ do
       _ ← waitFor (readTVar (hostSettled host) >>= \s' → if null s' then retry else pure s')
       settledOf host >>= (`shouldSatisfy` \case [Succeeded (ARemoved r)] → removeChangedFlag r; _ → False)
       readTVarIO granted >>= (`shouldSatisfy` (> grantsBefore))
+      settleChecks svc
+
+  it "answers reads, from the last committed state, while a removal's write is held" $
+    withProbedService defaultConfig $ \probe svc → do
+      (_, lease) ← openMain svc "main"
+      _ ← removeCell' svc lease (tile 3 4 9)
+      gate ← H.addGate probe isWrite
+      host ← newHost True
+      flip finally (H.openGate gate) $ do
+        _ ← okOf (removeWith svc (hostEndpoint svc Nothing host) lease (tile 3 4 5) Nothing)
+        H.awaitReached gate 1
+        -- the removal's write is held: reads of other columns and of its own cell still answer, from
+        -- the committed state (its cell is still solid; the earlier removal is air)
+        held ← readCell svc lease (tile 3 4 5)
+        cellIs held `shouldBe` False
+        earlier ← readCell svc lease (tile 3 4 9)
+        cellIs earlier `shouldBe` True
+        other ← readCell svc lease (tile 8 8 8)
+        cellRevision other `shouldBe` Revision 1
+        readTVarIO (hostSettled host) `shouldReturn` []
+      _ ← waitFor (readTVar (hostSettled host) >>= \s' → if null s' then retry else pure s')
+      (cellIs <$> readCell svc lease (tile 3 4 5)) `shouldReturn` True
+      settleChecks svc
+
+  it "keeps a read pending while its authoritative page is delayed, and answers it from the store, never from the source" $
+    withProbedService defaultConfig $ \probe svc → do
+      (_, lease) ← openMain svc "main"
+      _ ← removeCell' svc lease (tile 3 4 9)
+      atRest svc
+      gate ← H.addGate probe isRead
+      host ← newHost True
+      flip finally (H.openGate gate) $ do
+        _ ← okOf (cellWith svc (hostEndpoint svc Nothing host) lease (tile 3 4 9))
+        H.awaitReached gate 1
+        -- the page is delayed: nothing is answered (the source would say solid; the store says air)
+        readTVarIO (hostSettled host) `shouldReturn` []
+      _ ← waitFor (readTVar (hostSettled host) >>= \s' → if null s' then retry else pure s')
+      settledOf host >>= (`shouldSatisfy` \case [Succeeded (ACell found)] → cellIs found; _ → False)
       settleChecks svc
 
   it "refuses a removal that could need the last value of a revision before any work, and stops internal work whose next commit would wrap, with no defect and nothing wrapped" $

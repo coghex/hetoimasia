@@ -29,7 +29,7 @@ module Hetoimasia.Terrain.Runtime.Internal.Owner
   ) where
 
 import Control.Concurrent.STM
-import Control.Exception (SomeAsyncException, SomeException, evaluate, fromException, mask, onException, rethrowIO, throwIO, try, tryWithContext, uninterruptibleMask_)
+import Control.Exception (Exception, SomeAsyncException, SomeException, evaluate, fromException, mask, onException, rethrowIO, throwIO, try, tryWithContext, uninterruptibleMask_)
 import Control.Monad (forM, forM_, unless, void, when)
 import Data.Int (Int64)
 import System.Environment (lookupEnv)
@@ -192,6 +192,12 @@ nextWork svc token = do
           | otherwise → do
               (prepareWork, commitWork) <- pickRequestWork svc st adm
               grantWork <- if closing || isJust (stateSlot st) then pure Nothing else grantable st adm
+              -- a load is dispatched when the job the model would pick next can start its pinned read
+              -- (only that job's arena needs a pin to spare)
+              dispatchFits <-
+                if not (stateDispatchIdle st) && any ((== R.JobQueued) . R.jobPhase) (R.modelJobs model)
+                  then nextDispatchFits svc st adm
+                  else pure False
               let (backedNow, backedWaits) = backedWork st
                   -- THE FAIRNESS RULE. Staging, commits, retries, load dispatches and the backed
                   -- steps take turns whenever two or more are ready: each ready kind gets one
@@ -199,10 +205,7 @@ nextWork svc token = do
                   -- per-arena admission order is unchanged, and the model's own round-robin and
                   -- aging decide among loads.
                   retryWork = if stateFreed st && retryUseful st then Just WRetry else Nothing
-                  dispatchWork =
-                    if not (stateDispatchIdle st) && any ((== R.JobQueued) . R.jobPhase) (R.modelJobs model) && all (canStartGather (gathersPerArena (serviceConfig svc)) st adm) (Map.keys (stateArenas st))
-                      then Just WDispatch
-                      else Nothing
+                  dispatchWork = if dispatchFits then Just WDispatch else Nothing
                   backedReady = listToMaybe (catMaybes [grantWork] <> backedNow)
                   inTurn = case stateTurn st of
                     TurnPrepare → [prepareWork, commitWork, retryWork, dispatchWork, backedReady]
@@ -213,6 +216,27 @@ nextWork svc token = do
               case listToMaybe (catMaybes inTurn) of
                 Just work → pure work
                 Nothing → foldr orElse retry [wait >> pure work | (wait, work) ← backedWaits]
+
+-- | Whether the job the model would dispatch next can start its pinned read: the dispatch is
+-- applied, its arena looked at, and everything it wrote rolled back (an exception caught inside
+-- the transaction discards the inner effects).
+nextDispatchFits ∷ Service → St → A.Admission → STM Bool
+nextDispatchFits svc st adm =
+  catchSTM
+    ( do
+        outcome <- applyEvent svc R.Dispatch
+        throwSTM . DispatchPeek $ case outcome of
+          Right report
+            | R.Dispatched _ (aid, _) _ <- R.reportDecision report → canStartGather (gathersPerArena (serviceConfig svc)) st adm aid
+          _ → False
+    )
+    (\(DispatchPeek fits) → pure fits)
+
+-- | The answer of 'nextDispatchFits', carried out of the transaction it rolls back.
+newtype DispatchPeek = DispatchPeek Bool
+  deriving stock (Show)
+
+instance Exception DispatchPeek
 
 -- | Nothing of the owner's backed work remains: no open, gather, transaction or closing file.
 backedIdle ∷ St → Bool
@@ -514,17 +538,23 @@ dispatchJob svc = do
   -- dispatches it: it holds a load-job slot from now to its report. 'PointJob' is reported in
   -- dispatch order, as the job is about to run; its pinned read of the store starts after it.
   dispatched <- atomically $ do
-    outcome <- applyEvent svc R.Dispatch
-    case outcome of
-      Right report
-        | R.Dispatched jid (aid, region) cover <- R.reportDecision report → do
-            startJobWork svc jid cover
-            case realPieces region cover of
-              Left why → pure (Just (jid, aid, region, Left why))
-              Right pieces → do
-                modifySt svc (\st → st {stateLoadJobs = Map.insert jid (aid, region, cover) (stateLoadJobs st)})
-                pure (Just (jid, aid, region, Right (Set.toList (Set.fromList [c | (c, _) ← pieces]))))
-      _ → modifySt svc (\st → st {stateDispatchIdle = True}) >> pure Nothing
+    st0 <- readSt svc
+    adm <- readTVar (serviceEditBank svc)
+    fits <- nextDispatchFits svc st0 adm
+    -- the job the model would pick cannot start its read now: nothing is dispatched (the next look
+    -- comes when a pin or a credit is returned)
+    if not fits then pure Nothing else do
+     outcome <- applyEvent svc R.Dispatch
+     case outcome of
+       Right report
+         | R.Dispatched jid (aid, region) cover <- R.reportDecision report → do
+             startJobWork svc jid cover
+             case realPieces region cover of
+               Left why → pure (Just (jid, aid, region, Left why))
+               Right pieces → do
+                 modifySt svc (\st → st {stateLoadJobs = Map.insert jid (aid, region, cover) (stateLoadJobs st)})
+                 pure (Just (jid, aid, region, Right (Set.toList (Set.fromList [c | (c, _) ← pieces]))))
+       _ → modifySt svc (\st → st {stateDispatchIdle = True}) >> pure Nothing
   forM_ dispatched $ \(jid, aid, region, planned) → do
     probe svc (PointJob aid region)
     started <- case planned of

@@ -59,17 +59,56 @@ spec = do
   describe "The backed removal's ending paths (sweep)" $
     forM_ [minBound .. maxBound] $ \step → forM_ [minBound .. maxBound] $ \exit →
       it ("held " <> show step <> ", ended " <> show exit) (sweepCase step exit)
+  describe "The backed removal's staged write prefixes (sweep)" $
+    it "fails each page write of a removal's transaction in turn: the arena pauses with storage_io, its committed terrain stays readable, nothing more is written, and the abort drains" $ do
+      -- how many pages the transaction writes, counted on an uninterrupted run
+      writes ← do
+        probe ← H.newProbe
+        withServiceSeam quiet defaultConfig alwaysAdmitting noProbe (H.seamFor probe) $ \svc → do
+          (_, lease) ← openMain svc "main"
+          _ ← removeCell' svc lease (tile 3 4 9)
+          bankAtRest svc
+          writesBefore ← atomically (H.countEvents probe isWrite)
+          _ ← removeCell' svc lease (tile 3 4 5)
+          bankAtRest svc
+          after' ← atomically (H.countEvents probe isWrite)
+          pure (after' - writesBefore)
+      writes `shouldSatisfy` (>= 1)
+      forM_ [1 .. writes] $ \k → do
+        probe ← H.newProbe
+        withServiceSeam quiet defaultConfig alwaysAdmitting noProbe (H.seamFor probe) $ \svc → do
+          (_, lease) ← openMain svc "main"
+          _ ← removeCell' svc lease (tile 3 4 9)
+          bankAtRest svc
+          -- the k-th page write fails: the first k - 1 were written, the rest never are
+          H.addRuleAfter probe (k - 1) 1 isWrite (H.FailWith (Errno 5))
+          writesBefore ← atomically (H.countEvents probe isWrite)
+          failed ← removeAt svc lease (tile 3 4 5) Nothing >>= expectRight >>= await svc
+          (k, failed) `shouldSatisfy` \case (_, Left (Failed (StorageFailed (FaultIo _)))) → True; _ → False
+          bankAtRest svc
+          oracle svc
+          after' ← atomically (H.countEvents probe isWrite)
+          (k, after' - writesBefore) `shouldBe` (k, k)
+          -- the committed terrain: the earlier removal is air, the failed one's cell is still solid
+          (cellIs <$> readCell svc lease (tile 3 4 9)) `shouldReturn` True
+          (cellIs <$> readCell svc lease (tile 3 4 5)) `shouldReturn` False
+          status ← arenaStatus svc lease >>= expectRight
+          statusStorage status `shouldBe` StoragePaused [CondIo]
   describe "The backed open's ending paths (sweep)" $
     forM_ [minBound .. maxBound] $ \step → forM_ [e | e ← [minBound .. maxBound], applies step e] $ \exit →
       it ("held " <> show step <> ", ended " <> show exit) (openCase step exit)
   where
-    -- nothing native runs while an open compiles: a native failure there is the reserving step's
+    -- nothing native runs while an open compiles or waits for its host: a native failure is the
+    -- reserving step's
     applies OpenCompiling OpenByNativeFailure = False
+    applies OpenDelayed OpenByNativeFailure = False
     applies _ _ = True
 
 -- | Where an open is held: its compilation charged and about to run (the owner held at
--- 'PointCompiling'), or its file's reservation in flight (held at the native seam).
-data OpenStep = OpenCompiling | OpenReserving
+-- 'PointCompiling'), its file's reservation in flight (held at the native seam), or prepared
+-- completely (compiled, its file reserved, its initial store made) and waiting for its host's
+-- eligibility to be published (the delayed logical open).
+data OpenStep = OpenCompiling | OpenReserving | OpenDelayed
   deriving stock (Eq, Show, Enum, Bounded)
 
 data OpenExit = OpenByCancel | OpenByClientEnd | OpenByServiceClose | OpenByNativeFailure | OpenByComplete
@@ -87,7 +126,10 @@ openCase step exit = do
   reached ← newEmptyTMVarIO
   release ← newEmptyTMVarIO
   let owner = Probe $ \case
-        PointCompiling _ | step == OpenCompiling → atomically (putTMVar reached ()) >> atomically (readTMVar release)
+        -- the first compilation is held (until the exit is made); a later one (the name opened again) is not
+        PointCompiling _ | step == OpenCompiling → do
+          first ← atomically (tryPutTMVar reached ())
+          when first (atomically (readTMVar release))
         _ → pure ()
   withServiceSeam quiet defaultConfig alwaysAdmitting owner (H.seamFor probe) $ \svc → do
     client ← okOf (registerClient svc)
@@ -95,28 +137,33 @@ openCase step exit = do
       (OpenReserving, OpenByNativeFailure) → H.addRule probe 1 isReserve (H.FailWith (Errno 28)) >> pure Nothing
       (OpenReserving, _) → Just <$> H.addGate probe isReserve
       (OpenCompiling, _) → pure Nothing
+      (OpenDelayed, _) → pure Nothing
     let unhold = atomically (void (tryPutTMVar release ())) >> forM_ gate H.openGate
+    host ← newHost (step /= OpenDelayed)
     flip finally unhold $ do
-      opening ← okOf (openArena svc client "main" soilOverStone)
+      request ← okOf (openArenaWith svc (hostEndpoint svc Nothing host) client "main" soilOverStone)
       -- reach the step
       case (step, gate) of
         (OpenCompiling, _) → waitFor (readTMVar reached)
+        (OpenDelayed, _) → waitFor (readTVar (hostReady host) >>= \n → check (n >= 1))
         (_, Just g) → H.awaitReached g 1
         (_, Nothing) → pure ()
       -- the exit
       case exit of
-        OpenByCancel → cancel svc (pendingRequest opening) `shouldReturn` CancelWon
+        OpenByCancel → cancel svc request `shouldReturn` CancelWon
         OpenByClientEnd → endClient svc client
         OpenByServiceClose → closeService svc
         OpenByNativeFailure → pure ()
-        OpenByComplete → pure ()
+        OpenByComplete → when (step == OpenDelayed) (grant host)
       unhold
-      outcome ← await svc opening
+      settled ← waitFor (readTVar (hostSettled host) >>= \s' → if null s' then retry else pure s')
+      -- it settles once
+      length settled `shouldBe` 1
       case exit of
-        OpenByComplete → outcome `shouldSatisfy` either (const False) (const True)
-        OpenByNativeFailure → outcome `shouldSatisfy` \case Left (Failed (StorageFailed (FaultReservation _))) → True; _ → False
-        OpenByCancel → outcome `shouldSatisfy` \case Left Cancelled → True; _ → False
-        _ → outcome `shouldSatisfy` either (const True) (const False)
+        OpenByComplete → settled `shouldSatisfy` \case [Succeeded (AOpened _)] → True; _ → False
+        OpenByNativeFailure → settled `shouldSatisfy` \case [Failed (StorageFailed (FaultReservation _))] → True; _ → False
+        OpenByCancel → settled `shouldBe` [Cancelled]
+        _ → settled `shouldSatisfy` \case [Succeeded _] → False; _ → True
     bankAtRest svc
     oracle svc
     atomically (inspectCompileSTM svc) >>= \(use, _) → use `shouldBe` (if exit == OpenByComplete then perArenaUse else 0)
