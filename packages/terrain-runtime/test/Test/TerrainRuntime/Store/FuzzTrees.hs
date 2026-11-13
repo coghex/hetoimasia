@@ -11,7 +11,7 @@
 -- ceiling, a ranged read and the reachability of a page) are judged against the independent
 -- traversal of the unchanged disk: each answer is the reference's or an integrity failure
 -- (an answer about a record of a changed leaf is excused as data). Fixed seeds, bounded.
-module Test.TerrainRuntime.Store.FuzzTrees (spec, richStore, referenceOf, through) where
+module Test.TerrainRuntime.Store.FuzzTrees (spec, fullSpec, richStore, referenceOf, through) where
 
 import Control.Monad (foldM, forM)
 import qualified Data.ByteString as BS
@@ -26,7 +26,9 @@ import Hetoimasia.Terrain.Runtime.Store.Internal.Page (Body (..), Child (..), Pa
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan
 import Hetoimasia.Terrain.Runtime.Store.Internal.State
 import Hetoimasia.Terrain.Runtime.Store.Internal.Tree
+import Test.TerrainRuntime.Output (printLine)
 import Test.Hspec
+import Test.TerrainRuntime.Store.Depth (Depth (..), atDepth, newFixture, readFixture)
 import Test.TerrainRuntime.Store.Harness
 import Test.TerrainRuntime.Store.Reference
 
@@ -191,12 +193,18 @@ judge h tree ref pagesOfTree page offset mutated = (tallyOf verdicts, ["page " <
         ++ concatMap judgeRange (take 14 probes)
         ++ judgeLive
 
-spec ∷ Spec
-spec = describe "a re-sealed byte of a live page, in each of the five trees" $ do
-  h ← runIO (must richStore)
+-- | The routine depth, and every family at its original depth (the optional full-depth probe).
+spec, fullSpec ∷ Spec
+spec = specAt Routine
+fullSpec = specAt Full
+
+specAt ∷ Depth → Spec
+specAt depth = describe "a re-sealed byte of a live page, in each of the five trees" $ do
+  fixture ← runIO (newFixture "FuzzTrees.richStore" (must richStore))
   it "has every tree several pages deep, with the retired-page index and many free extents" $ do
+    h ← readFixture fixture
     let sizes = [(t, length (snd (referenceOf h t))) | t ← [TreeRuns, TreeLinks, TreeTodo, TreeFree, TreeRetire]]
-    putStrLn ("FUZZTREES pages " <> show sizes)
+    printLine ("FUZZTREES pages " <> show sizes)
     forM_' sizes $ \(t, k) → (t, k) `shouldSatisfy` ((>= 4) . snd)
     let retireKeys = map fst (fst (referenceOf h TreeRetire))
     length [() | k ← retireKeys, BS.index k 0 == 0xFF] `shouldSatisfy` (> 50)
@@ -205,6 +213,7 @@ spec = describe "a re-sealed byte of a live page, in each of the five trees" $ d
     (all ((== 9) . BS.length) retireKeys) `shouldBe` True
     must (checkH h)
   it "refuses a pointer that names a stale valid page of the same tree and level, where it used to answer from the stale page" $ do
+    h ← readFixture fixture
     let total = cfgUsablePages (hCfg h)
         hw = rHw (storeRoots (hStore h))
         decodeAt p = either (const Nothing) Just . decodePage (hIdent h) total (PageNo p) =<< diskRead (hDisk h) (PageNo p)
@@ -246,13 +255,14 @@ spec = describe "a re-sealed byte of a live page, in each of the five trees" $ d
         stale `shouldBe` []
         pure (tree, ownCrc, isRoot, length differing, length [() | Left _ ← verdicts])
     let flat = concat results
-    putStrLn ("FUZZTREES stale pointers (tree, with the stale page's own checksum, parent is the root, records the stale page would have answered differently, integrity failures) " <> show flat)
+    printLine ("FUZZTREES stale pointers (tree, with the stale page's own checksum, parent is the root, records the stale page would have answered differently, integrity failures) " <> show flat)
     -- the retirement tree, whose pages are rewritten every commit, has such pages; the stale ones differ from the reference
     [d | (TreeRetire, _, _, d, _) ← flat] `shouldSatisfy` (any (> 0))
     [e | (_, _, _, _, e) ← flat] `shouldSatisfy` (any (> 0))
     -- the forgery that records the stale page's own checksum is refused where the forged page is itself the root: the root record tells
     [e | (_, True, True, _, e) ← flat] `shouldSatisfy` (any (> 0))
   it "refuses a re-sealed under-full non-root leaf and inner page when the store descends to it, in each tree kind, and answers the page it was" $ do
+    h ← readFixture fixture
     let total = cfgUsablePages (hCfg h)
         decodeAt q = either (const Nothing) Just . decodePage (hIdent h) total (PageNo q) =<< diskRead (hDisk h) (PageNo q)
     rows ← forM [TreeRuns, TreeLinks, TreeTodo, TreeFree, TreeRetire] $ \tree → do
@@ -273,13 +283,14 @@ spec = describe "a re-sealed byte of a live page, in each of the five trees" $ d
         ((q, lv, es@((k0, _) : _)) : _) → (\r → [("inner" ∷ String, r)]) <$> refused (Page tree lv (PageNo q) (Inner (take 2 es))) k0
         _ → pure []
       pure (tree, leafRes ++ innerRes)
-    putStrLn ("FUZZTREES under-full pages refused at descent: " <> show [(t, [(kind, either (take 60) (const "ANSWERED") r) | (kind, r) ← rs]) | (t, rs) ← rows])
+    printLine ("FUZZTREES under-full pages refused at descent: " <> show [(t, [(kind, either (take 60) (const "ANSWERED") r) | (kind, r) ← rs]) | (t, rs) ← rows])
     -- every tree kind has a non-root leaf, and the trees with a non-root inner page are refused there too
     [t | (t, rs) ← rows, null [() | ("leaf", _) ← rs]] `shouldBe` []
     [(t, k) | (t, rs) ← rows, (k, r) ← rs, either (not . ("UnderFull" `isInfixOf`)) (const True) r] `shouldBe` []
     length [() | (_, rs) ← rows, ("inner", _) ← rs] `shouldSatisfy` (>= 2)
   forM_' [TreeRuns, TreeLinks, TreeTodo, TreeFree, TreeRetire] $ \tree →
     it ("a mutated root record never changes what a read answers, " <> show tree) $ do
+      h ← readFixture fixture
       let roots = storeRoots (hStore h)
           (ref, treePages) = referenceOf h tree
           setRoot p r = r {rRuns = pick' TreeRuns (Just p) (rRuns r), rLinks = pick' TreeLinks (Just p) (rLinks r), rTodo = pick' TreeTodo (Just p) (rTodo r), rFree = pick' TreeFree (Just p) (rFree r), rRetire = pick' TreeRetire (Just p) (rRetire r)}
@@ -299,12 +310,13 @@ spec = describe "a re-sealed byte of a live page, in each of the five trees" $ d
                 wrong = [k | (k, Right got) ← zip keysToRead verdicts, got /= lookup k ref]
              in (what, length [() | Left _ ← verdicts], length [() | Right _ ← verdicts], wrong)
           results = map judgeVariant variants
-      putStrLn ("FUZZTREES root record " <> show tree <> " " <> show [(w, e, q) | (w, e, q, _) ← results])
+      printLine ("FUZZTREES root record " <> show tree <> " " <> show [(w, e, q) | (w, e, q, _) ← results])
       -- never another answer; and a root that names another page, or whose checksum was moved, is refused
       [w | (w, _, _, _ : _) ← results] `shouldBe` []
       [w | (w, e, _, _) ← results, e == 0] `shouldBe` []
   forM_' [TreeRuns, TreeLinks, TreeTodo, TreeFree, TreeRetire] $ \tree →
     it ("reads exactly as the reference or fails as corrupt, " <> show tree) $ do
+      h ← readFixture fixture
       let (ref, treePages) = referenceOf h tree
           parsedAt p = either (const Nothing) Just . decodePage (hIdent h) (cfgUsablePages (hCfg h)) (PageNo p) =<< diskRead (hDisk h) (PageNo p)
           inner = [p | p ← treePages, Just (Page _ lv _ (Inner _)) ← [parsedAt p], lv >= 1]
@@ -345,11 +357,12 @@ spec = describe "a re-sealed byte of a live page, in each of the five trees" $ d
                   _ → (offset, byteMutation)
             pure (judge h tree ref treePages page offset' mutated)
       treePages `shouldSatisfy` (not . null)
-      tallies ← mapM runSeed [11, 22, 33, 44, 55]
+      let seeds = atDepth depth [11] [11, 22, 33, 44, 55]
+      tallies ← mapM runSeed seeds
       let tally = mconcat (map fst (concat tallies))
           defects = concatMap snd (concat tallies)
-      putStrLn ("FUZZTREES " <> show tree <> " " <> show tally)
-      tMutations tally `shouldBe` 250
+      printLine ("FUZZTREES " <> show tree <> " " <> show tally)
+      tMutations tally `shouldBe` 50 * length seeds
       if null defects then pure () else expectationFailure (unlines (take 12 defects) <> show (length defects) <> " mutations with defects")
       tDefects tally `shouldBe` 0
       tIntegrity tally `shouldSatisfy` (> 0)

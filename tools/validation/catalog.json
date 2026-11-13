@@ -371,6 +371,28 @@
       "optional": false
     },
     {
+      "id": "test.terrain-runtime-full-depth",
+      "description": "Local-only optional full depth of the temporary store's exhaustive families: every family that `test.terrain-runtime` runs as a bounded representative, at its complete original parameters, and the TRA-20 evidence printer at the depth `docs/evidence/terrain/tra20/README.md` records. The routine suite keeps, for each protected family (random and adversarial histories over deep trees, large stores with thousands of retired pages, partially consumed retirement entries at every progress point, the facade's caller protocol from every starting work limit, the re-sealed-byte fuzz of every tree, the ownership history), a fixed, deterministic, strictly smaller set of its seeds, histories, limits, progress points and sizes that catches every recorded negative control; this group runs the rest of the original depth, in one selection. The routine run plus this run executes every example, seed, limit, progress point and fixture size the unreduced suite ran, with every assertion identical (a literal that only restates a fixture's scale is restated in the routine run and original here). A pure CPU model with no file, thread or clock; one example reads the runtime's allocation counters, so every example runs one at a time on one capability behind the routine suite's isolation guard. Never selected by an affected path or a routine suite command and never routed to CI; run it when a store family or its checker changes, or on request.",
+      "command": [
+        "cabal",
+        "test",
+        "--project-file",
+        "cabal.project.cpu",
+        "hetoimasia-terrain-runtime:terrain-runtime-full-depth-tests",
+        "--test-show-details=direct"
+      ],
+      "component": "hetoimasia-terrain-runtime:test:terrain-runtime-full-depth-tests",
+      "inputs": [
+        "cabal.project.common",
+        "cabal.project.cpu"
+      ],
+      "framework": "hspec",
+      "runner": "cpu",
+      "timeout_seconds": 3000,
+      "category": "probe",
+      "optional": true
+    },
+    {
       "id": "test.terrain-storage-qualification",
       "description": "Local-only optional real-platform qualification of the terrain storage backend (TRA-21, requirement 9): the production native backend on a bounded, disposable volume of the platform it runs on, macOS/APFS on Darwin and a named supported filesystem (ext4) on Linux. Records the platform, kernel, filesystem, mount options and native ABI; reserves the 64 MiB minimum, a middle and the 1 GiB default allowance natively and proves the allocation, reporting the physical overhead; writes and reads back every page of the reserved capacity; rewrites previously written pages across the whole reservation with the rest of the volume exhausted, which must need no new allocation; refuses and recovers growth under exhaustion, keeping the old data and size; retains a failed release as a pending reservation and frees it on an explicit retry; keeps an unlinked file for its borrowers and reclaims the space after the last close; refuses an unqualified filesystem (tmpfs where the platform has it) and fails a sparse file of the right length as a negative control. It fills a capped volume, so it runs only against the fixture the setup scripts under tools/terrain-storage/ make and name by a pointer file, verified distinct, owned and within its cap before any space is consumed; a missing or mismatched fixture fails the run, never skips or passes it. Never selected by an affected path or a routine suite command and never routed to CI. Opens no window.",
       "command": [

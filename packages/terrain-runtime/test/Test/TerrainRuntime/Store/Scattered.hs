@@ -9,7 +9,7 @@
 -- 69 bookkeeping pages against the reserve of 68. The plan used to number them from a supply of 68 and
 -- fail as 'BrokenInvariant'; it must now commit (taking a larger supply), and a batch that is too big must be
 -- shrinkable, and the halved batch must make progress.
-module Test.TerrainRuntime.Store.Scattered (spec, scattered, fragmented) where
+module Test.TerrainRuntime.Store.Scattered (spec, fullSpec, scattered, fragmented) where
 
 import qualified Data.ByteString as BS
 import Data.List (sortOn)
@@ -24,7 +24,9 @@ import Hetoimasia.Terrain.Runtime.Store.Internal.Plan
 import Hetoimasia.Terrain.Runtime.Store.Internal.Records (Retire (..), be64, encodeFree, encodeKey, encodeRetire, encodeValue, retiredKey)
 import Hetoimasia.Terrain.Runtime.Store.Internal.State
 import Hetoimasia.Terrain.Runtime.Store.Internal.Tree (Fact (..), Facts (..), limitWork, noReadFacts, windowCheckpoint, windowFactCount, windowFactsFor, windowKnows)
+import Test.TerrainRuntime.Output (printLine)
 import Test.Hspec
+import Test.TerrainRuntime.Store.Depth (Depth (..), atDepth)
 import Test.TerrainRuntime.Store.Harness
 import Hetoimasia.Terrain.Residency (ArenaId (..))
 import Test.TerrainRuntime.Store.Reference
@@ -174,11 +176,19 @@ dispersed firstKeys k =
       (x : _) → Just x
       [] → Nothing
 
+-- | The routine depth: the bounded representatives ('atDepth' names each beside its full parameters).
 spec ∷ Spec
-spec = specBoundary >> specFragmented >> specFinal >> specBound >> specForged >> specAtOnce >> specFingerprint >> specSparse >> specLoose
+spec = specAt Routine
 
-specBoundary ∷ Spec
-specBoundary = describe "the round-11 boundary at the real reserve: 64 dispersed link updates need more bookkeeping than 68" $ do
+-- | Every family at its complete original depth (the optional full-depth probe).
+fullSpec ∷ Spec
+fullSpec = specAt Full
+
+specAt ∷ Depth → Spec
+specAt depth = specBoundary depth >> specFragmented >> specFinal depth >> specBound depth >> specForged depth >> specAtOnce depth >> specFingerprint >> specSparse >> specLoose
+
+specBoundary ∷ Depth → Spec
+specBoundary depth = describe "the round-11 boundary at the real reserve: 64 dispersed link updates need more bookkeeping than 68" $ do
   let (h0, firstKeys, ref0) = scattered
       plan bounds ws = do
         (p, _, _) ← fillWith h0 (\w → planDeltaPinned bounds (hCfg h0) (hIdent h0) (storeRoots (hStore h0)) [] w Ordinary (deltaFor (hStore h0) True False 1 ws))
@@ -204,8 +214,8 @@ specBoundary = describe "the round-11 boundary at the real reserve: 64 dispersed
         must (compareRecords (Map.toList ref1) h1)
       other → expectationFailure ("64 dispersed updates were not planned: " <> take 300 (show other))
   it "never reports a batch of any size as corruption: committed or shrinkable, and the halved batch commits" $ do
-    outcomes ← must (mapM (\k → (\p → (k, p)) <$> plan standardBounds (dispersed firstKeys k)) [1, 2, 4, 8, 16, 32, 48, 64, 80, 100, 128, 200])
-    putStrLn ("SCATTERED outcomes: " <> show [(k, case p of Planned pl → "planned bk " <> show (mBookkeepingPages (plMeasure pl)); other → take 60 (show other)) | (k, p) ← outcomes])
+    outcomes ← must (mapM (\k → (\p → (k, p)) <$> plan standardBounds (dispersed firstKeys k)) (atDepth depth [64] [1, 2, 4, 8, 16, 32, 48, 64, 80, 100, 128, 200]))
+    printLine ("SCATTERED outcomes: " <> show [(k, case p of Planned pl → "planned bk " <> show (mBookkeepingPages (plMeasure pl)); other → take 60 (show other)) | (k, p) ← outcomes])
     [(k, why) | (k, Refused why@(Integrity _)) ← outcomes] `shouldBe` []
     [k | (k, Refused why) ← outcomes, not (shrinkable why)] `shouldBe` []
     [k | (k, Planned _) ← outcomes] `shouldSatisfy` (not . null)
@@ -224,7 +234,7 @@ specFragmented = describe "round 12: maintenance on a fragmented valid store who
         -- the 64-page chunk of the reviewer's layout (a window of 311 pages in one piece) is planned whole
         mFreed (plMeasure pl) `shouldBe` 64
         (mWindowPages (plMeasure pl) <= maxWindowBytes `div` windowPageBytes) `shouldBe` True
-        putStrLn ("SCATTERED fragmented chunk: window " <> show (mWindowPages (plMeasure pl)) <> ", " <> show checkpoints <> " checkpoints, " <> show steps <> " pages and probes fetched")
+        printLine ("SCATTERED fragmented chunk: window " <> show (mWindowPages (plMeasure pl)) <> ", " <> show checkpoints <> " checkpoints, " <> show steps <> " pages and probes fetched")
       other → expectationFailure ("the largest chunk was not planned: " <> take 200 (show other))
   it "makes progress through the public API with the real limits, and the store drains" $ do
     (p, _, _) ← must (fillRetry h0 (planMaintenance (hStore h0)))
@@ -249,7 +259,7 @@ specFragmented = describe "round 12: maintenance on a fragmented valid store who
                 NoWork → Right (h, n)
                 other → Left ("maintenance neither did work nor found nothing left: " <> take 200 (show other))
     (drained, passes) ← must (go h0 0)
-    putStrLn ("SCATTERED fragmented drain: " <> show passes <> " transactions")
+    printLine ("SCATTERED fragmented drain: " <> show passes <> " transactions")
     rRetiredPages (storeRoots (hStore drained)) `shouldBe` 0
     must (checkH drained)
 
@@ -257,8 +267,8 @@ specFragmented = describe "round 12: maintenance on a fragmented valid store who
 -- consumed are gone from the retirement index. That verification now covers the last 'maxReclaimPages' of them
 -- in every transaction, so a transaction's window depends on the tree heights and not on how much of the entry
 -- was consumed before.
-specFinal ∷ Spec
-specFinal = describe "round 13: a partially consumed entry at every progress point, with its consumed pages reused and retired again" $ do
+specFinal ∷ Depth → Spec
+specFinal depth = describe "round 13: a partially consumed entry at every progress point, with its consumed pages reused and retired again" $ do
   it "finishes the reviewer's entry (270 dispersed pages, all but the last consumed) inside the window, at work one too" $ do
     let (h0, _, _) = finalChunk 269
     must (checkH h0)
@@ -274,7 +284,7 @@ specFinal = describe "round 13: a partially consumed entry at every progress poi
       Planned pl → (mWindowPages (plMeasure pl) < 200) `shouldBe` True
       other → expectationFailure ("the final chunk at work one was not planned: " <> take 200 (show other))
   it "makes progress at every progress point of a long entry, at work one first, and drains" $
-    forM_ [0, 63, 64, 128, 269] $ \done → do
+    forM_ (atDepth depth [269] [0, 63, 64, 128, 269]) $ \done → do
       let (h0, _, _) = finalChunk done
       must (checkH h0)
       (first, _, _) ← must (fillFrom h0 (limitWork 1 (storeWindow (hStore h0))) (planMaintenance (hStore h0)))
@@ -298,10 +308,10 @@ specFinal = describe "round 13: a partially consumed entry at every progress poi
 -- | The window a maintenance transaction of one page holds, on every layout and progress point: inside the window's
 -- bound, and the transaction still makes progress when the window is cut to the at-once bound, the pages it edits
 -- and ONE proof ('workOneWindowPages'): every proof beyond one is a fact it carries through a checkpoint.
-specBound ∷ Spec
-specBound = describe "the window a unit of work of one can need, as a bound" $
+specBound ∷ Depth → Spec
+specBound depth = describe "the window a unit of work of one can need, as a bound" $
   it "stays inside the window's bound on every layout and every progress point, and proceeds when cut to the at-once bound" $ do
-    let layouts = [("fragmented", fst3 fragmented)] ++ [("final " <> show d, fst3 (finalChunk d)) | d ← [0, 64, 269]]
+    let layouts = [("fragmented", fst3 fragmented)] ++ [("final " <> show d, fst3 (finalChunk d)) | d ← atDepth depth [] [0, 64, 269]]
         fst3 (a, _, _) = a
         limit = maxWindowBytes `div` windowPageBytes
     rows ← forM layouts $ \(name, h0) → do
@@ -319,15 +329,15 @@ specBound = describe "the window a unit of work of one can need, as a bound" $
         (NoWork, NoWork) → pure (0, lim, 0, cps)
         other → expectationFailure (name <> ": " <> take 200 (show other)) >> fail "plan"
       pure (name, held)
-    putStrLn ("BOUND window pages at work one (held in the byte limit, at-once bound, held when cut to it, checkpoints): " <> show rows <> " against the byte limit " <> show limit)
+    printLine ("BOUND window pages at work one (held in the byte limit, at-once bound, held when cut to it, checkpoints): " <> show rows <> " against the byte limit " <> show limit)
     [name | (name, (n, _, _, _)) ← rows, n > limit] `shouldBe` []
 
 -- | The protection the span of every transaction keeps: a progress field forged forward past pages that are still
 -- indexed under the entry is refused by the first transaction after the forgery, whatever the length of the jump.
-specForged ∷ Spec
-specForged = describe "round 13: a progress field forged forward is refused by the next transaction, for every length of jump" $
+specForged ∷ Depth → Spec
+specForged depth = describe "round 13: a progress field forged forward is refused by the next transaction, for every length of jump" $
   it "refuses jumps shorter and longer than the span checked in every transaction" $
-    forM_ [1, 10, 63, 64, 65, 128, 200, 269] $ \done → do
+    forM_ (atDepth depth [65] [1, 10, 63, 64, 65, 128, 200, 269]) $ \done → do
       let (h0, _, _) = forgedProgress done
       (p, _, _) ← must (fillWith h0 (planMaintenance (hStore h0)))
       case p of
@@ -340,8 +350,8 @@ windowResult c = case c of
   WindowBytesExceeded _ → True
   _ → False
 
-specAtOnce ∷ Spec
-specAtOnce = describe "round 13: the window a unit of work holds at once, under checkpoints" $ do
+specAtOnce ∷ Depth → Spec
+specAtOnce depth = describe "round 13: the window a unit of work holds at once, under checkpoints" $ do
   let (hNo, firstKeys, _) = fragmentedNoTail
       limitBounds lim = standardBounds {bdWindowPages = lim, bdWindowBytes = lim * windowPageBytes}
   it "property: a unit of one page needs at most the byte limit for every tree height 1..8 and every number of pinned readers 0..maxReaders" $ do
@@ -359,16 +369,16 @@ specAtOnce = describe "round 13: the window a unit of work holds at once, under 
     -- most the claim and 'looseGrowthOrdinary' below that: neither can reach the cap
     [(hr, hf) | hr ← [1 .. maxLevel + 1], hf ← [1 .. maxLevel + 1], looseSoftCap + looseGrowthUnit hr hf > looseCap] `shouldBe` []
     [hf | hf ← [1 .. maxLevel + 1], maxClaimPages + looseGrowthOrdinary hf > looseCap] `shouldBe` []
-    putStrLn ("ATONCE loose list: soft " <> show looseSoftCap <> " + unit of one at (8,8) " <> show (looseGrowthUnit 8 8) <> " <= cap " <> show looseCap <> "; ordinary " <> show (maxClaimPages + looseGrowthOrdinary 8))
+    printLine ("ATONCE loose list: soft " <> show looseSoftCap <> " + unit of one at (8,8) " <> show (looseGrowthUnit 8 8) <> " <= cap " <> show looseCap <> "; ordinary " <> show (maxClaimPages + looseGrowthOrdinary 8))
     -- and the standalone removal, which cannot shrink, for every record and allocator height and pin count, with the
     -- retirement tree at the minimum fill the store enforces and the backlog bound it checks (at most 17 internal pages)
     let badRemoval = [(hf, hrec, pins) | hf ← [1 .. maxLevel + 1], hrec ← [1 .. maxLevel + 1], pins ← [0 .. maxReaders], removalWindowPages maxRetireInternals hf hrec pins * windowPageBytes + removalWorstProbes * probeBytes > maxWindowBytes]
     badRemoval `shouldBe` []
-    putStrLn ("ATONCE bounds: unit of one at (8,8,8,16) = " <> show (workOneWindowPages 8 8 8 16) <> " pages, removal at (8,8,16) = " <> show (removalWindowPages maxRetireInternals 8 8 16) <> " pages, limit " <> show (maxWindowBytes `div` windowPageBytes))
+    printLine ("ATONCE bounds: unit of one at (8,8,8,16) = " <> show (workOneWindowPages 8 8 8 16) <> " pages, removal at (8,8,16) = " <> show (removalWindowPages maxRetireInternals 8 8 16) <> " pages, limit " <> show (maxWindowBytes `div` windowPageBytes))
   it "makes progress at work one with a window of exactly the at-once bound, with 1 to 16 distinct pinned versions, on a store with no tail, and again after the readers release" $ do
     must (checkH hNo)
     (rFree (storeRoots (hStore hNo)) /= Nothing && rHw (storeRoots (hStore hNo)) == fromIntegral (cfgUsablePages (hCfg hNo)) ) `shouldBe` True
-    forM_ [1, 2, 4, 8, 16] $ \pins → do
+    forM_ (atDepth depth [16] [1, 2, 4, 8, 16]) $ \pins → do
       (hP, toks) ← must (withPins (\i → (firstKeys !! ((7 * i + 3) `mod` length firstKeys), childRec (srcNode (toInteger i + 20) 0 9))) pins hNo)
       let hr = heightOf hP TreeRetire
           hf = heightOf hP TreeFree
@@ -379,7 +389,7 @@ specAtOnce = describe "round 13: the window a unit of work holds at once, under 
       case p of
         Planned pl → do
           (mWindowPages (plMeasure pl) <= lim) `shouldBe` True
-          putStrLn ("ATONCE pins " <> show pins <> " heights " <> show (hr, hf, hrec) <> ": window bound " <> show lim <> ", window held " <> show (mWindowPages (plMeasure pl)) <> ", " <> show cps <> " checkpoints, freed " <> show (mFreed (plMeasure pl)))
+          printLine ("ATONCE pins " <> show pins <> " heights " <> show (hr, hf, hrec) <> ": window bound " <> show lim <> ", window held " <> show (mWindowPages (plMeasure pl)) <> ", " <> show cps <> " checkpoints, freed " <> show (mFreed (plMeasure pl)))
           h1 ← must (commitPlan hP pl)
           must (checkH h1)
         other → expectationFailure ("no progress with " <> show pins <> " pinned versions and a window of " <> show lim <> " pages: " <> take 300 (show other))
@@ -400,7 +410,7 @@ specAtOnce = describe "round 13: the window a unit of work holds at once, under 
         Planned _ → pure (lim, True, cps)
         Refused (Capacity c) | windowResult c → pure (lim, False, cps)
         other → expectationFailure ("window " <> show lim <> ": " <> take 200 (show other)) >> fail "plan"
-    putStrLn ("ATONCE window sizes (pages, planned, checkpoints): " <> show [(l, ok, c) | (l, ok, c) ← results, l `mod` 4 == 3])
+    printLine ("ATONCE window sizes (pages, planned, checkpoints): " <> show [(l, ok, c) | (l, ok, c) ← results, l `mod` 4 == 3])
     -- a window too small is refused as the typed result, and one big enough plans
     [l | (l, ok, _) ← results, l == 3, ok] `shouldBe` []
     [l | (l, ok, _) ← results, l == 40, not ok] `shouldBe` []
@@ -518,7 +528,7 @@ specLoose = describe "round 14: a loose list at exactly its cap" $
                 NoWork → Right (h, n)
                 other → Left ("maintenance neither did work nor found nothing left: " <> take 200 (show other))
     (drained, passes) ← must (go h1 0)
-    putStrLn ("LOOSE at the cap: " <> show passes <> " transactions to drain; loose list " <> show (length (rLoose (storeRoots (hStore drained)))))
+    printLine ("LOOSE at the cap: " <> show passes <> " transactions to drain; loose list " <> show (length (rLoose (storeRoots (hStore drained)))))
     rRetiredPages (storeRoots (hStore drained)) `shouldBe` 0
     (length (rLoose (storeRoots (hStore drained))) <= looseSoftCap) `shouldBe` True
     must (checkH drained)

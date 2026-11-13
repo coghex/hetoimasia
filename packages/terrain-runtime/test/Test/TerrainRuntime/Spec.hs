@@ -27,27 +27,27 @@ import qualified Test.TerrainRuntime.Store.Allowance as StoreAllowance
 import qualified Test.TerrainRuntime.Store.Boundary as StoreBoundary
 import qualified Test.TerrainRuntime.Store.Bounds as StoreBounds
 import qualified Test.TerrainRuntime.Store.Codec as StoreCodec
-import qualified Test.TerrainRuntime.Store.Cycles as StoreCycles
+import qualified Test.TerrainRuntime.Store.Depth as StoreDepth
 import qualified Test.TerrainRuntime.Store.Evidence as StoreEvidence
 import qualified Test.TerrainRuntime.Store.Faults as StoreFaults
-import qualified Test.TerrainRuntime.Store.Fuzz as StoreFuzz
-import qualified Test.TerrainRuntime.Store.FuzzTrees as StoreFuzzTrees
 import qualified Test.TerrainRuntime.Store.Keys as StoreKeys
 import qualified Test.TerrainRuntime.Store.Memory as StoreMemory
-import qualified Test.TerrainRuntime.Store.Protocol as StoreProtocol
-import qualified Test.TerrainRuntime.Store.Rebalance as StoreRebalance
-import qualified Test.TerrainRuntime.Store.Large as StoreLarge
-import qualified Test.TerrainRuntime.Store.Scattered as StoreScattered
-import qualified Test.TerrainRuntime.Store.History as StoreHistory
 import qualified Test.TerrainRuntime.Store.Identity as StoreIdentity
 import qualified Test.TerrainRuntime.Store.Ownership as StoreOwnership
 import qualified Test.TerrainRuntime.Store.Readers as StoreReaders
 import qualified Test.TerrainRuntime.Store.Replay as StoreReplay
-import qualified Test.TerrainRuntime.Store.Trees as StoreTrees
-import Test.Hspec (Spec)
+import Test.Hspec (Spec, before_)
+import qualified Test.TerrainRuntime.Isolation as Isolation
+import qualified Test.TerrainRuntime.Parallel as Parallel
 
+-- | The pure store families first, in parallel ("Test.TerrainRuntime.Parallel" names them and says why); then everything else
+-- one example at a time on one capability, each guarded against a parallel example still running.
 spec ∷ Spec
-spec = do
+spec = Parallel.spec >> before_ Isolation.sequentialGuard sequentialSpec
+
+sequentialSpec ∷ Spec
+sequentialSpec = do
+  Isolation.spec
   Basic.spec
   Races.spec
   Budgets.spec
@@ -62,23 +62,15 @@ spec = do
   Interleaving.spec
   Closure.spec
   StoreCodec.spec
-  StoreTrees.spec
   StoreReplay.spec
   StoreFaults.spec
   StoreIdentity.spec
   StoreReaders.spec
   StoreOwnership.spec
-  StoreHistory.spec
-  StoreFuzz.spec
-  StoreFuzzTrees.spec
-  StoreRebalance.spec
-  StoreProtocol.spec
   StoreKeys.spec
   StoreMemory.spec
-  StoreLarge.spec
-  StoreScattered.spec
-  StoreCycles.spec
-  StoreEvidence.spec
+  StoreDepth.spec
+  StoreEvidence.measuredSpec
   StoreAllowance.spec
   StoreAdmission.spec
   StoreBounds.spec

@@ -2,12 +2,13 @@
 --
 -- Each example checks a bound and prints @EVIDENCE@ lines naming the fixture, the seed
 -- and the figures, so the evidence document is the output of one command
--- (@cabal test ... --test-option=--match --test-option="TRA-20 evidence"@), not a
--- paraphrase. These are observations of the pure model and the codec: encoded page
+-- (@cabal test ... --test-option=--match --test-option="TRA-20 evidence"@ on
+-- @terrain-runtime-tests@ at the routine depth, on @terrain-runtime-full-depth-tests@ at the depth the TRA-20 record quotes),
+-- not a paraphrase. These are observations of the pure model and the codec: encoded page
 -- counts, total writes, peak RAM reservations and working copies, used, staged,
 -- retired, free and protected bytes, pinned roots and the most bounded read and
 -- planning steps; they are not physical filesystem, durability or latency figures.
-module Test.TerrainRuntime.Store.Evidence (spec) where
+module Test.TerrainRuntime.Store.Evidence (spec, fullSpec, pureSpec, measuredSpec) where
 
 import Control.Monad (forM_)
 import qualified Data.Map.Strict as Map
@@ -19,20 +20,22 @@ import Hetoimasia.Terrain.Runtime.Store.Internal.Format
 import Hetoimasia.Terrain.Runtime.Store.Internal.Model
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan
 import Hetoimasia.Terrain.Runtime.Store.Internal.State
+import Test.TerrainRuntime.Output (printLine)
 import Test.Hspec
-import Test.TerrainRuntime.Store.Bounds (allocationRatios, findExact256, wide)
-import Test.TerrainRuntime.Store.Cycles (CycleReport (..), runCycles)
+import Test.TerrainRuntime.Store.Bounds (allocationRatios, findExact256, wide20000)
+import Test.TerrainRuntime.Store.Cycles (CycleReport (..), cycleSeeds, runCycles)
+import Test.TerrainRuntime.Store.Depth (Depth (..), atDepth, readFixture)
 import Test.TerrainRuntime.Store.Harness
 import Test.TerrainRuntime.Store.Reference
 import Test.TerrainRuntime.Store.Scenes
-import Test.TerrainRuntime.Store.Trees (drive, growAndShrink)
+import Test.TerrainRuntime.Store.Trees (drive, growAndShrink, growSide)
 import Test.TerrainRuntime.Store.Workload
 
 must ∷ Either String a → IO a
 must = either (\e → expectationFailure e >> fail e) pure
 
 ev ∷ String → IO ()
-ev line = putStrLn ("EVIDENCE " <> line)
+ev line = printLine ("EVIDENCE " <> line)
 
 mibI ∷ Integer
 mibI = 1024 * 1024
@@ -52,10 +55,19 @@ usageLine u =
     <> " readers=" <> show (usReaders u)
     <> " pinnedVersions=" <> show (usPinnedVersions u)
 
-spec ∷ Spec
-spec = describe "TRA-20 evidence" $ do
+-- | The routine depth, and every family at its original depth (the optional full-depth probe, which prints the
+-- figures the TRA-20 evidence quotes). The examples that read no process-wide statistic are 'pureSpec' (they may run in
+-- parallel with other pure examples, see "Test.TerrainRuntime.Parallel"); the one that measures allocated bytes is
+-- 'measuredSpec' and runs alone.
+spec, fullSpec, pureSpec, measuredSpec ∷ Spec
+spec = pureSpec >> measuredSpec
+fullSpec = specPureAt Full >> measuredSpec
+pureSpec = specPureAt Routine
+
+specPureAt ∷ Depth → Spec
+specPureAt depth = describe "TRA-20 evidence" $ do
   it "reference comparison: generated histories against the independent traversal" $
-    forM_ [11, 29, 47 ∷ Word64] $ \seed → do
+    forM_ (atDepth depth [11] [11, 29, 47 ∷ Word64]) $ \seed → do
       (h, ref) ← must (drive seed 400 30 50)
       let m = hMaxes h
           ArenaId a = siArena (hIdent h)
@@ -70,11 +82,11 @@ spec = describe "TRA-20 evidence" $ do
       owViolations o `shouldBe` []
       mxRam m `shouldSatisfy` (<= txnRamLimit)
   it "grows to several levels and gives them back" $ do
-    (grown, shrunk) ← must (growAndShrink 5)
+    (grown, shrunk) ← must (growAndShrink (growSide depth) 5)
     ev ("growAndShrink seed=5 runsTreeHeightAtPeak=" <> show grown <> " rootAfterDeletingEverything=" <> (if shrunk == 0 then "empty" else "present"))
     grown `shouldSatisfy` (>= 3)
   it "transaction bounds: exactly 256 pages, one past refused, RAM and window" $ do
-    (h, keys) ← must (wide 20000)
+    (h, keys) ← readFixture wide20000
     (p, n) ← must (findExact256 h keys)
     let m = plMeasure p
     ev ("bounds history=20000runs exactPlan pages=" <> show (mPagesWritten m) <> " bytes=" <> show (mPagesWritten m * pageSize)
@@ -153,22 +165,25 @@ spec = describe "TRA-20 evidence" $ do
     ev ("exhaustion maxPagesPerTransaction=" <> show (mxPages (hMaxes hr)) <> " totalPagesFreed=" <> show (mxFreed (hMaxes hr)))
     usProtectedBytes (usage (hStore hf)) `shouldBe` 8 * fromIntegral mibI
   it "cycles" $
-    forM_ [101, 202, 303] $ \seed → do
+    forM_ (cycleSeeds depth) $ \seed → do
       (_, r) ← must (runCycles seed 450)
       ev ("cycles " <> show r)
       crMaxPages r `shouldSatisfy` (<= 256)
-  it "allocation: work independent of the history" $ do
-    (h, keys) ← must (wide 20000)
-    rows ← allocationRatios h keys
-    forM_ rows $ \(name, small, big) →
-      ev ("allocation " <> name <> " history500runs=" <> show small <> "B history20000runs=" <> show big <> "B ratio=" <> show (fromIntegral big / fromIntegral (max 1 small) ∷ Double))
-    length rows `shouldBe` 5
   where
     foldM' f z xs = go z xs
       where
         go acc [] = Right acc
         go acc (y : ys) = f acc y >>= \acc' → go acc' ys
     fmap' p = case p of Planned _ → "Planned"; NoWork → "NoWork"; Pending _ → "Pending"; PendingProbes _ → "Pending"; Checkpoint _ → "Checkpoint"; Refused r → "Refused " <> show r; BlockedByReader _ _ → "Blocked"
+
+-- | The observation of allocated bytes: process-wide, so valid only beside nothing else (a sequential example).
+measuredSpec = describe "TRA-20 evidence" $
+  it "allocation: work independent of the history" $ do
+    (h, keys) ← readFixture wide20000
+    rows ← allocationRatios h keys
+    forM_ rows $ \(name, small, big) →
+      ev ("allocation " <> name <> " history500runs=" <> show small <> "B history20000runs=" <> show big <> "B ratio=" <> show (fromIntegral big / fromIntegral (max 1 small) ∷ Double))
+    length rows `shouldBe` 5
 
 faultFixture ∷ IO (H, Map.Map RecordKey Record, Plan)
 faultFixture = do

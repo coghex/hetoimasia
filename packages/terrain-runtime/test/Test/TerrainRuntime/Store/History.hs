@@ -12,7 +12,7 @@
 -- must make progress whenever no reader holds the oldest entry: it is never refused, and
 -- when it plans work the retired pages go down. At the end every reader is released and
 -- reclamation drains to nothing.
-module Test.TerrainRuntime.Store.History (spec) where
+module Test.TerrainRuntime.Store.History (spec, fullSpec) where
 
 import Control.Monad (foldM, forM_, when)
 import qualified Data.ByteString as BS
@@ -26,6 +26,7 @@ import Hetoimasia.Terrain.Runtime.Store.Internal.Plan
 import Hetoimasia.Terrain.Runtime.Store.Internal.State
 import Test.Hspec
 import Test.TerrainRuntime.Store.Bounds (wide)
+import Test.TerrainRuntime.Store.Depth (Depth (..), atDepth, newFixture, readFixture)
 import Test.TerrainRuntime.Store.Harness
 import Test.TerrainRuntime.Store.Reference
 
@@ -131,12 +132,19 @@ retireLists h = mapM one entries
       Just pg | RefList _ ps ← rpBody pg → Right (ver, drop (fromIntegral done) ps)
       _ → Left "a retirement list is not readable"
 
-spec ∷ Spec
-spec = describe "randomized ownership history: plans, retirements, partial maintenance, reuse and pinned readers" $ do
-  (h0, keys) ← runIO (must (wide 12000))
-  let ref0 = Map.fromList [(k, runRec 20) | k ← keys]
-  it "keeps the ownership checker, the readers and maintenance in agreement through random histories" $
-    forM_ [1, 2, 3, 4, 5, 6 ∷ Word64] $ \seed → do
+-- | The routine depth, and every family at its original depth (the optional full-depth probe).
+spec, fullSpec ∷ Spec
+spec = specAt Routine
+fullSpec = specAt Full
+
+specAt ∷ Depth → Spec
+specAt depth = describe "randomized ownership history: plans, retirements, partial maintenance, reuse and pinned readers" $ do
+  fixture ← runIO (newFixture "History.wide 12000" (must (wide 12000)))
+  let refOf keys = Map.fromList [(k, runRec 20) | k ← keys]
+  it "keeps the ownership checker, the readers and maintenance in agreement through random histories" $ do
+   (h0, keys) ← readFixture fixture
+   let ref0 = refOf keys
+   forM_ (atDepth depth [1] [1, 2, 3, 4, 5, 6 ∷ Word64]) $ \seed → do
       let start = St h0 ref0 [] (mkRng (1000 + seed))
       end ← must (foldM (\st i → either (\e → Left ("seed " <> show seed <> ": " <> e)) Right (step keys st i)) start [1 .. 45])
       -- release every reader and drain: reclamation reaches nothing, whatever the history reused
@@ -146,6 +154,8 @@ spec = describe "randomized ownership history: plans, retirements, partial maint
       must (checkH drained)
       must (compareRecords (Map.toList (stRef end)) drained)
   it "finishes a retirement entry whose reclaimed prefix was reused and retired again under a newer version" $ do
+    (h0, keys) ← readFixture fixture
+    let ref0 = refOf keys
     -- one edit replaces more pages than a reclamation transaction frees (64)
     st1 ← must (commitEdit keys (St h0 ref0 [] (mkRng 7)) 0 97 100)
     lists1 ← must (retireLists (stH st1))
