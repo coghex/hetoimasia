@@ -152,6 +152,7 @@ data Stall
   | -- | A page the backing returned failed validation. It is an integrity failure of the
     -- backing, never absent history.
     PageRefused !PageNo !PageError
+  deriving stock (Show)
 
 -- | The checkpoints one plan can take. A checkpoint always carries a new fact; a
 -- transaction takes at most as many as the pages it writes plus the pages it verifies
