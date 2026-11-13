@@ -68,7 +68,7 @@ import qualified Hetoimasia.Terrain.Runtime.Backed.Growth as Growth
 import Hetoimasia.Terrain.Runtime.Backed.Fault (StorageFault (..))
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Service (ReadMode (..))
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Service (PreparedGrowth)
-import Hetoimasia.Terrain.Runtime.Store.Internal.Model (Condition (..), GrowthDecision (..), TxnId, clearCondition, conditions, oldestPin, proposeGrowth, storeConfig, storeHeader, storeRoots, storeVersion)
+import Hetoimasia.Terrain.Runtime.Store.Internal.Model (Condition (..), GrowthDecision (..), GrowthView (..), TxnId, clearCondition, conditions, growthView, oldestPin, proposeGrowth, storeConfig, storeHeader, storeRoots, storeVersion)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan (TxClass (..), availablePages)
 import Hetoimasia.Terrain.Runtime.Store.Internal.State (cfgAllowanceBytes, maxClaimPages)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan (Effects (..), Plan, plEffects)
@@ -266,6 +266,7 @@ backedWork st = (now, waits)
     slotAlive = \case
       SlotRemoval rid → alive rid
       SlotGrowth rid → alive rid
+      SlotRelease rid → alive rid
       SlotDiscovery → True
       SlotReclaim → True
 
@@ -277,12 +278,14 @@ grantable st adm = do
     c : _ | fits c → Just (WGrant c)
     _ → Nothing
   where
-    fits c = either (const False) (const True) (A.reserve A.Foreground (A.transactionCredits (arenaOf c) A.worstTransactionCharge) adm)
-    arenaOf = \case
-      ContendRemoval _ a _ → a
-      ContendGrowth _ a _ → a
-      ContendDiscovery a → a
-      ContendReclaim a → a
+    -- a growth or a release holds no transaction RAM (its extra is the backend's, charged there)
+    fits = \case
+      ContendGrowth {} → True
+      ContendRelease {} → True
+      ContendRemoval _ a _ → txnFits a
+      ContendDiscovery a → txnFits a
+      ContendReclaim a → txnFits a
+    txnFits a = either (const False) (const True) (A.reserve A.Foreground (A.transactionCredits a A.worstTransactionCharge) adm)
 
 retryUseful ∷ St → Bool
 retryUseful st =
@@ -366,6 +369,7 @@ pickRequestWork svc st adm = do
     takesSlot sg = case stagedWork sg of
       StagedRemoval prepared → preparedChanged prepared
       StagedGrowth _ → True
+      StagedRelease → True
       StagedAnswer _ → False
       StagedControl → False
     -- opens publish in the order their incarnations were allocated
@@ -419,6 +423,7 @@ perform' svc = \case
     when granted . probe svc $ case contender of
       ContendRemoval rid aid _ → PointGranted (Just rid) aid
       ContendGrowth rid aid _ → PointGranted (Just rid) aid
+      ContendRelease rid aid → PointGranted (Just rid) aid
       ContendDiscovery aid → PointGranted Nothing aid
       ContendReclaim aid → PointGranted Nothing aid
     pure True
@@ -704,7 +709,11 @@ prepareReq svc rid = do
         GrowthNotIncreased → atomically (terminate svc rid (Failed (StorageFailed (FaultSizeNotIncreased (cfgAllowanceBytes (storeConfig (arenaStore arena))) bytes))))
         GrowthInvalid why → atomically (terminate svc rid (Failed (HostFailure (Text.pack ("an admitted growth became invalid: " <> show why)))))
         GrowthProposed proposal → stage svc rid (Just aid) (arenaRevision arena) (StagedGrowth proposal)
-    CRetry → forM_ (reqArena req >>= \aid → (,) aid <$> Map.lookup aid (stateArenas st)) $ \(aid, arena) → do
+    CRetry → forM_ (reqArena req >>= \aid → (,) aid <$> Map.lookup aid (stateArenas st)) $ \(aid, arena) →
+     -- an extra an earlier growth left pending is released first, under the slot; the retry then goes on
+     if gvReleasing (growthView (arenaStore arena))
+      then stage svc rid (Just aid) (arenaRevision arena) StagedRelease
+      else do
       -- bounded revalidation of what paused the arena: the pages an I/O or integrity pause recorded
       -- are read again (an integrity page must read back valid); a pause that recorded none cannot be
       -- certified and stays. Capacity is checked when the retry finishes.
@@ -927,6 +936,7 @@ publishSlot svc task tid plan = do
         SlotDiscovery → pure (Just ForBatch)
         SlotReclaim → pure (Just ForBatch)
         SlotGrowth _ → failWith svc (OwnerDefect "a growth reached a store transaction's publication") []
+        SlotRelease _ → failWith svc (OwnerDefect "a release reached a store transaction's publication") []
         SlotRemoval rid → case Map.lookup rid (stateRequests st) of
           Just req
             | CRemove tile precondition <- reqCmd req
@@ -971,6 +981,7 @@ publishSlot svc task tid plan = do
     removalOf = \case
       SlotRemoval rid → Just rid
       SlotGrowth rid → Just rid
+      SlotRelease rid → Just rid
       SlotDiscovery → Nothing
       SlotReclaim → Nothing
     -- the holder gives the slot up: its transaction is aborted with no write by the next steps,
@@ -1004,6 +1015,7 @@ slotOver svc task done = do
       atomically (modifySt svc (\s → s {stateRequests = Map.adjust (\q → q {reqPhase = Waiting}) rid (stateRequests s)}))
     (SlotRemoval _, ReaderBlocks _ _) → failWith svc (OwnerDefect "a removal's plan waited for a reader") []
     (SlotGrowth _, _) → failWith svc (OwnerDefect "a growth reached a store transaction") []
+    (SlotRelease _, _) → failWith svc (OwnerDefect "a release reached a store transaction") []
     (SlotDiscovery, NothingToDo) → markIdle False
     (SlotDiscovery, ReaderBlocks _ _) → markIdle False
     (SlotReclaim, NothingToDo) → markIdle True
@@ -1034,6 +1046,7 @@ slotOver svc task done = do
     removalOf = \case
       SlotRemoval rid → Just rid
       SlotGrowth rid → Just rid
+      SlotRelease rid → Just rid
       SlotDiscovery → Nothing
       SlotReclaim → Nothing
 
@@ -1061,6 +1074,7 @@ publishGrowth svc task prepared = do
   where
     growthRequest = \case
       SlotGrowth rid → Just rid
+      SlotRelease rid → Just rid
       _ → Nothing
     yield = atomically (modifySt svc (\s → s {stateSlot = fmap (\t → t {slotYield = True}) (stateSlot s)}))
 
@@ -1075,6 +1089,18 @@ growthOver svc task over = case slotWork task of
       HandleClosing → pure ()
       HandleDefect why → failWith svc (OwnerDefect why) []
       other → failWith svc (OwnerDefect (Text.pack ("a growth ended unexpectedly: " <> show other))) []
+    Growth.GrowthWithdrawn → pure ()
+    Growth.GrowthLeftPending _ → pure ()
+    Growth.GrowthPendingReleased → failWith svc (OwnerDefect "a growth ended as a release-only run") []
+  -- a retry's release: released, the retry goes on (prepared again); failed, the retry settles with the
+  -- failure and the extra stays pending, charged and visible
+  SlotRelease rid → case over of
+    Growth.GrowthPendingReleased → atomically (modifySt svc (\s → s {stateRequests = Map.adjust (\q → q {reqPhase = Waiting}) rid (stateRequests s)}))
+    Growth.GrowthFailedWith handling → case handling of
+      HandleDomain fault → atomically (terminate svc rid (Failed (StorageFailed fault)))
+      HandleClosing → pure ()
+      HandleDefect why → failWith svc (OwnerDefect why) []
+      other → failWith svc (OwnerDefect (Text.pack ("a pending release ended unexpectedly: " <> show other))) []
     Growth.GrowthWithdrawn → pure ()
     Growth.GrowthLeftPending _ → pure ()
   _ → failWith svc (OwnerDefect "a growth ended in a slot that was not a growth's") []

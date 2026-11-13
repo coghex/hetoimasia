@@ -15,6 +15,11 @@
 -- growth until it is released by an explicit recovery or the close. A growth that fails before
 -- it obtains anything keeps the old cap, the roots and any pause.
 --
+-- A pending extra is released before anything else ('submitReleasePending'): a growth granted
+-- while one is pending releases it first and then begins; an explicit retry runs a release-only
+-- run ('startRelease') under the slot. A release that fails leaves the extra pending, and the
+-- growth or retry settles with that failure.
+--
 -- == One step at a time
 --
 -- As "Hetoimasia.Terrain.Runtime.Backed.Txn": ONE step per 'advanceGrowth' (one submission or
@@ -22,6 +27,7 @@
 module Hetoimasia.Terrain.Runtime.Backed.Growth
   ( GrowthRun
   , startGrowth
+  , startRelease
   , GrowthStep (..)
   , GrowthEnd (..)
   , advanceGrowth
@@ -47,6 +53,7 @@ import Hetoimasia.Terrain.Runtime.Storage.Internal.Service
   , pollTicket
   , submitAbandon
   , submitGrowth
+  , submitReleasePending
   , withOutcome
   )
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Types (StorageFailure (BackingClosed))
@@ -59,7 +66,9 @@ import Hetoimasia.Terrain.Runtime.Store.Internal.Model
   , growthReleaseFailed
   , growthReleased
   , growthReserved
+  , growthView
   , gpTo
+  , GrowthView (..)
   )
 
 -- | The continuation of one growth.
@@ -77,11 +86,20 @@ data Phase
     Withdrawing !Ticket
   | -- | The owner decided against an obtained extra: it is being given back.
     Abandoning !Ticket
+  | -- | An extra left pending by an earlier growth must be released first; then the growth (if
+    -- any) begins.
+    ReleaseFirst !(Maybe GrowthProposal)
+  | -- | That release is in flight.
+    ReleasingPending !(Maybe GrowthProposal) !Ticket
   | Ended
 
 -- | Begin a growth: the first 'advanceGrowth' begins it in the store and submits the reservation.
 startGrowth ∷ GrowthProposal → GrowthRun
 startGrowth = GrowthRun . Begin
+
+-- | Release an extra left pending by an earlier growth, and nothing more (an explicit retry's).
+startRelease ∷ GrowthRun
+startRelease = GrowthRun (ReleaseFirst Nothing)
 
 -- | The ticket a growth waits for, if any.
 growthTicket ∷ GrowthRun → Maybe Ticket
@@ -89,6 +107,8 @@ growthTicket (GrowthRun phase) = case phase of
   Reserving t → Just t
   Withdrawing t → Just t
   Abandoning t → Just t
+  ReleasingPending _ t → Just t
+  ReleaseFirst _ → Nothing
   Begin _ → Nothing
   Prepared _ → Nothing
   Ended → Nothing
@@ -102,6 +122,8 @@ growthDraining (GrowthRun phase) = case phase of
   Begin _ → False
   Reserving _ → False
   Prepared _ → False
+  ReleaseFirst _ → False
+  ReleasingPending _ _ → False
 
 growthPhaseName ∷ GrowthRun → Text
 growthPhaseName (GrowthRun phase) = case phase of
@@ -110,6 +132,8 @@ growthPhaseName (GrowthRun phase) = case phase of
   Prepared _ → "prepared"
   Withdrawing _ → "withdrawing"
   Abandoning _ → "abandoning"
+  ReleaseFirst _ → "release-first"
+  ReleasingPending _ _ → "releasing-pending"
   Ended → "ended"
 
 -- | Where a step left the growth.
@@ -129,6 +153,8 @@ data GrowthEnd
   | -- | The owner decided against it and giving the extra back failed: it is pending, charged and
     -- visible, and blocks another growth until it is released.
     GrowthLeftPending !(Maybe Handling)
+  | -- | A release-only run released the pending extra: the store's growth is idle again.
+    GrowthPendingReleased
   deriving stock (Eq, Show)
 
 -- | Take one step. The owner calls it masked.
@@ -136,6 +162,9 @@ advanceGrowth ∷ Io → Closing → Store → GrowthRun → IO (Store, GrowthRu
 advanceGrowth io closing store (GrowthRun phase) = case phase of
   Ended → pure (store, GrowthRun Ended, GrowthOver GrowthWithdrawn)
   Prepared prepared → pure (store, GrowthRun phase, GrowthReady prepared)
+  Begin proposal
+    -- an extra left pending by an earlier growth is released before another growth begins
+    | gvReleasing (growthView store) → yieldTo store (ReleaseFirst (Just proposal)) GrowthMore
   Begin proposal → case beginGrowth proposal store of
     Left refusal → over store (GrowthFailedWith (HandleDefect (Text.pack ("a granted growth could not begin: " <> show refusal))))
     Right begun →
@@ -154,6 +183,21 @@ advanceGrowth io closing store (GrowthRun phase) = case phase of
       Just (GotMismatch why) → over (growthFailed store) (GrowthFailedWith (HandleDefect why))
       Just other → over (growthFailed store) (GrowthFailedWith (HandleDefect (Text.pack ("a growth answered " <> show other))))
       Nothing → over (growthFailed store) . GrowthFailedWith =<< lost
+  ReleaseFirst next →
+    submitReleasePending (ioService io) (ioBacking io) >>= \case
+      Left failure → over store (GrowthFailedWith (classifyFailure closing JkRelease failure))
+      Right ticket → yieldTo store (ReleasingPending next ticket) (GrowthBlocked (awaitTicket (ioService io) ticket))
+  ReleasingPending next ticket → waitThen ticket $
+    withOutcome (ioService io) ticket (\outcome → evaluate $! reactTo closing JkRelease outcome) >>= \case
+      Just GotReleased → case next of
+        Just proposal → yieldTo (growthReleased store) (Begin proposal) GrowthMore
+        Nothing → over (growthReleased store) GrowthPendingReleased
+      -- the release failed: the extra stays pending, charged and visible; the store is unchanged
+      Just (GotFailure handling _) → over store (GrowthFailedWith handling)
+      Just (GotCancelled _) → over store (GrowthFailedWith (classifyUnaskedCancel closing))
+      Just (GotMismatch why) → over store (GrowthFailedWith (HandleDefect why))
+      Just other → over store (GrowthFailedWith (HandleDefect (Text.pack ("a pending release answered " <> show other))))
+      Nothing → over store . GrowthFailedWith =<< lost
   Withdrawing ticket → waitThen ticket $ do
     -- the running reservation stopped: the backend's own arbitration gave back an extra it had
     -- obtained, or kept it pending if that failed; the store follows what the backing reports
@@ -200,6 +244,15 @@ abandonGrowth io store (GrowthRun phase) = case phase of
       Left failure → do
         s ← evaluate (growthReleaseFailed (growthFailed store))
         pure (s, GrowthRun Ended, GrowthOver (GrowthLeftPending (Just (classifyFailure OwnerClosing JkRelease failure))))
+  -- nothing submitted yet: the pending extra stays pending
+  ReleaseFirst _ → pure (store, GrowthRun Ended, GrowthOver GrowthWithdrawn)
+  -- a release in flight is taken as it ends (released, or left pending), and nothing begins after it
+  ReleasingPending _ ticket → do
+    (s, r, step) ← advanceGrowth io OwnerClosing store (GrowthRun (ReleasingPending Nothing ticket))
+    pure (s, r, case step of
+      GrowthOver GrowthPendingReleased → GrowthOver GrowthWithdrawn
+      GrowthOver (GrowthFailedWith h) → GrowthOver (GrowthLeftPending (Just h))
+      other → other)
   -- already decided against: wait for its job and take the outcome, as 'advanceGrowth' does
   Withdrawing _ → advanceGrowth io OwnerClosing store (GrowthRun phase)
   Abandoning _ → advanceGrowth io OwnerClosing store (GrowthRun phase)

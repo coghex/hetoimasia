@@ -519,6 +519,7 @@ stepGatherTask svc key deliver = do
 data Contender
   = ContendRemoval !RequestId !ArenaId !TileCoord
   | ContendGrowth !RequestId !ArenaId !GrowthProposal
+  | ContendRelease !RequestId !ArenaId
   | ContendDiscovery !ArenaId
   | ContendReclaim !ArenaId
   deriving stock (Eq, Show)
@@ -566,6 +567,11 @@ contenders st = do
         | StagedGrowth proposal ← stagedWork sg → do
             eligible ← endpointEligible (reqEndpoint req)
             pure [ContendGrowth rid aid proposal | eligible]
+      -- so is a retry's release of a pending extra
+      (CRetry, StagedPhase sg, Just (aid, _))
+        | StagedRelease ← stagedWork sg → do
+            eligible ← endpointEligible (reqEndpoint req)
+            pure [ContendRelease rid aid | eligible]
       _ → pure []
     internalOf (aid, arena)
       | not (null (conditions (arenaStore arena))) = [ContendReclaim aid | reclaimWanted aid arena, not (integrityPaused arena)]
@@ -602,6 +608,9 @@ grantSlot svc contender = do
     -- a growth holds no transaction RAM: its extra is the backend's, charged there
     ContendGrowth rid aid proposal → live aid $ \_ → do
       writeTVar (serviceState svc) st {stateSlot = Just (SlotTask aid (SlotGrowth rid) (SlotGrow (Growth.startGrowth proposal)) Nothing WakeNow False)}
+      pure True
+    ContendRelease rid aid → live aid $ \_ → do
+      writeTVar (serviceState svc) st {stateSlot = Just (SlotTask aid (SlotRelease rid) (SlotGrow Growth.startRelease) Nothing WakeNow False)}
       pure True
     ContendRemoval rid aid tile → live aid $ \arena → txn aid arena (SlotRemoval rid) (removalPlanner (arenaEnv arena) (arenaStore arena) tile)
     ContendDiscovery aid → live aid $ \arena → txn aid arena SlotDiscovery (discoveryPlanner (arenaEnv arena) (arenaStore arena))
@@ -670,11 +679,13 @@ stepSlot svc = do
     requestAlive st = \case
       SlotRemoval rid → Map.member rid (stateRequests st)
       SlotGrowth rid → Map.member rid (stateRequests st)
+      SlotRelease rid → Map.member rid (stateRequests st)
       SlotDiscovery → True
       SlotReclaim → True
     classOf = \case
       SlotRemoval _ → ExplicitWork
       SlotGrowth _ → ExplicitWork
+      SlotRelease _ → ExplicitWork
       SlotDiscovery → MaintenanceWork
       SlotReclaim → MaintenanceWork
 

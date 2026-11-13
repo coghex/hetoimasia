@@ -31,9 +31,11 @@ withProbedService config body = do
   probe ← H.newProbe
   withServiceSeam quiet config alwaysAdmitting noProbe (H.seamFor probe) (body probe)
 
-isWrite, isRead ∷ NativeOp → Bool
+isWrite, isRead, isReserve, isSetLength ∷ NativeOp → Bool
 isWrite = \case OpWriteAt {} → True; _ → False
 isRead = \case OpReadAt {} → True; _ → False
+isReserve = \case OpReserveRange {} → True; _ → False
+isSetLength = \case OpSetFileLength {} → True; _ → False
 
 -- | The service is at rest: nothing of the owner's backed work is in flight, and the edit bank
 -- holds only the storage service's own records.
@@ -89,6 +91,9 @@ spec = describe "The backed terrain service" $ do
       host ← newHost False
       _ ← okOf (removeWith svc (hostEndpoint svc Nothing host) lease (tile 3 4 5) Nothing)
       waitFor (readTVar (hostReady host) >>= \n → check (n >= 1))
+      -- nothing else holds the slot or a pin (internal work, discovery or reclamation, has finished: it
+      -- is offered again only when the committed version moves)
+      atRest svc
       -- two reads whose page reads are held at the seam: their pins and their results in flight
       gate ← H.addGate probe isRead
       readers ← flip finally (H.openGate gate) $ do
@@ -136,7 +141,7 @@ spec = describe "The backed terrain service" $ do
 
   it "settles an open whose reservation fails as reservation_failed, publishes nothing and lets the name be opened again" $
     withProbedService defaultConfig $ \probe svc → do
-      H.addRule probe 1 (\case OpReserveRange {} → True; _ → False) (H.FailWith (Errno 28))
+      H.addRule probe 1 isReserve (H.FailWith (Errno 28))
       client ← okOf (registerClient svc)
       outcome ← okOf (openArena svc client "main" soilOverStone) >>= await svc
       outcome `shouldSatisfy` \case Left (Failed (StorageFailed (FaultReservation _))) → True; _ → False
@@ -238,6 +243,85 @@ spec = describe "The backed terrain service" $ do
       smaller `shouldSatisfy` \case Left (Failed (StorageFailed (FaultSizeNotIncreased _ _))) → True; _ → False
       status ← arenaStatus svc lease >>= expectRight
       (statusReservedBytes status, statusPendingReservedBytes status) `shouldBe` (128 * fromIntegral mib, 0)
+      atRest svc
+      settleChecks svc
+
+  it "settles a growth whose reservation is refused as reservation_failed, keeps the old cap, and grows on a later request" $
+    withProbedService defaultConfig $ \probe svc → do
+      (_, lease) ← openMain svc "main"
+      let mib = 1024 * 1024 ∷ Integer
+      H.addRule probe 1 isReserve (H.FailWith (Errno 28))
+      failed ← growArena svc lease (128 * mib) >>= expectRight >>= await svc
+      failed `shouldSatisfy` \case Left (Failed (StorageFailed (FaultReservation _))) → True; _ → False
+      kept ← arenaStatus svc lease >>= expectRight
+      (statusReservedBytes kept, statusPendingReservedBytes kept) `shouldBe` (minAllowanceBytes, 0)
+      atRest svc
+      grown ← growArena svc lease (128 * mib) >>= expectRight >>= await svc
+      fmap grownAllowance grown `shouldBe` Right (fromInteger (128 * mib))
+      settleChecks svc
+
+  it "cancels a growth while its reservation is held: it settles once, and the reservation's extra is given back when it returns" $
+    withProbedService defaultConfig $ \probe svc → do
+      (_, lease) ← openMain svc "main"
+      gate ← H.addGate probe isReserve
+      host ← newHost True
+      flip finally (H.openGate gate) $ do
+        request ← okOf (growWith svc (hostEndpoint svc Nothing host) lease (128 * 1024 * 1024))
+        H.awaitReached gate 1
+        cancel svc request `shouldReturn` CancelWon
+      _ ← waitFor (readTVar (hostSettled host) >>= \s' → if null s' then retry else pure s')
+      settledOf host `shouldReturn` [Cancelled]
+      atRest svc
+      status ← arenaStatus svc lease >>= expectRight
+      (statusReservedBytes status, statusPendingReservedBytes status) `shouldBe` (minAllowanceBytes, 0)
+      settleChecks svc
+
+  it "keeps an obtained extra pending, charged and visible when giving it back fails, and releases it before the growth goes on" $
+    withProbedService defaultConfig $ \probe svc → do
+      (_, lease) ← openMain svc "main"
+      let mib = 1024 * 1024 ∷ Integer
+      gate ← H.addGate probe isReserve
+      host ← newHost True
+      flip finally (H.openGate gate) $ do
+        _ ← okOf (growWith svc (hostEndpoint svc Nothing host) lease (128 * mib))
+        H.awaitReached gate 1
+        -- the host is no longer eligible when the decision comes: the obtained extra is given back,
+        -- and giving it back fails (the growth's own length is set first, then the release's)
+        atomically (writeTVar (hostEligible host) False)
+        H.addRuleAfter probe 1 1 isSetLength (H.FailWith (Errno 5))
+      waitFor $ arenaStatusSTM svc lease >>= \case
+        Right st → check (statusPendingReservedBytes st > 0)
+        Left _ → retry
+      held ← arenaStatus svc lease >>= expectRight
+      statusReservedBytes held `shouldBe` minAllowanceBytes
+      -- the host is eligible again: the growth contends again, releases the pending extra first, and grows
+      grant host
+      _ ← waitFor (readTVar (hostSettled host) >>= \s' → if null s' then retry else pure s')
+      settledOf host >>= (`shouldSatisfy` \case [Succeeded (AGrown a)] → grownAllowance a == fromInteger (128 * mib); _ → False)
+      grownStatus ← arenaStatus svc lease >>= expectRight
+      (statusReservedBytes grownStatus, statusPendingReservedBytes grownStatus) `shouldBe` (fromInteger (128 * mib), 0)
+      atRest svc
+      settleChecks svc
+
+  it "releases a pending extra on an explicit retry, under the slot, and answers it" $
+    withProbedService defaultConfig $ \probe svc → do
+      (_, lease) ← openMain svc "main"
+      gate ← H.addGate probe isReserve
+      host ← newHost True
+      growth ← flip finally (H.openGate gate) $ do
+        growth ← okOf (growWith svc (hostEndpoint svc Nothing host) lease (128 * 1024 * 1024))
+        H.awaitReached gate 1
+        atomically (writeTVar (hostEligible host) False)
+        H.addRuleAfter probe 1 1 isSetLength (H.FailWith (Errno 5))
+        pure growth
+      waitFor $ arenaStatusSTM svc lease >>= \case
+        Right st → check (statusPendingReservedBytes st > 0)
+        Left _ → retry
+      retried ← retryArena svc lease >>= expectRight >>= await svc
+      fmap retriedRemaining retried `shouldBe` Right []
+      status ← arenaStatus svc lease >>= expectRight
+      (statusReservedBytes status, statusPendingReservedBytes status) `shouldBe` (minAllowanceBytes, 0)
+      cancel svc growth `shouldReturn` CancelWon
       atRest svc
       settleChecks svc
 

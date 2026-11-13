@@ -574,6 +574,10 @@ data StagedWork
   | -- | A creator's growth to a larger allowance, validated by the store's proposal: it takes
     -- the session's slot when its host is eligible.
     StagedGrowth !GrowthProposal
+  | -- | An explicit retry of an arena whose earlier growth left an extra pending: the release takes
+    -- the session's slot (it is a mutation of the backing) when its host is eligible, then the retry
+    -- goes on.
+    StagedRelease
 
 data ReqPhase
   = Waiting
@@ -922,6 +926,8 @@ data SlotWork
   | SlotDiscovery
   | SlotReclaim
   | SlotGrowth !RequestId
+  | -- | A retry's release of a pending extra.
+    SlotRelease !RequestId
   deriving stock (Eq, Show)
 
 -- | What runs in the slot: a store transaction, or a creator's growth (serialised with mutation).
