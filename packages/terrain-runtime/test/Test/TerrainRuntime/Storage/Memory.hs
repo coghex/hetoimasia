@@ -235,9 +235,9 @@ bigWrite = bigWriteAt 0
 -- record whose native close has not returned; or a REPORTING closing record, which keeps nothing but the grant. Each
 -- instance with its volume's node in the reserved-figure ledger (one per instance: conservative, the service shares
 -- a volume's node) and the admission's entry for its grant.
-data Held = HeldBacking | HeldNative | HeldReporting
+data HeldKind = HeldBacking | HeldNative | HeldReporting | HeldHeldClose
 
-closingRow ∷ Env → Held → Int → IO Double
+closingRow ∷ Env → HeldKind → Int → IO Double
 closingRow env kind n = do
   fd ← (\fds → case fds of f : _ → f; [] → error "no descriptor") <$> fdHandles (envProbe env)
   u ← newUnique
@@ -250,6 +250,9 @@ closingRow env kind n = do
     HeldBacking → holdLive (keyed entryFor, ledger, adm) (\(m, l, a) → Map.size m + Map.size l + fromIntegral (A.lgControlReserved (A.ledgers a)) + sum [fromIntegral (eLength e) | e ← Map.elems m])
     HeldNative → holdLive (keyed (\g i → CrNative (entryFor g i)), ledger, adm) (\(m, l, a) → Map.size m + Map.size l + fromIntegral (A.lgControlReserved (A.ledgers a)) + sum [case c of CrNative e → fromIntegral (eLength e); CrReporting _ → 0 | c ← Map.elems m])
     HeldReporting → holdLive (keyed (\g _ → CrReporting (Just g)), ledger, adm) (\(m, l, a) → Map.size m + Map.size l + fromIntegral (A.lgControlReserved (A.ledgers a)) + sum [case c of CrNative _ → 0; CrReporting _ → 1 | c ← Map.elems m])
+    -- a HELD close (round 7): the record that keeps a failed close's reservation counted until the service ends: its map node, the three
+    -- words and the one grant it carries, with the volume's ledger node it keeps
+    HeldHeldClose → holdLive (keyed (\g i → Held (fromIntegral i) (fromIntegral i * 3) g), ledger, adm) (\(m, l, a) → Map.size m + Map.size l + fromIntegral (A.lgControlReserved (A.ledgers a)) + sum [fromIntegral (hBytes h) | h ← Map.elems m])
 
 -- ---------------------------------------------------------------------------
 -- The rows
@@ -501,6 +504,8 @@ spec3 = describe "Storage backend: every retained structure is charged and measu
       row "closing record, native close pending (the entry moved, per backing)" backingRecordBytes native
       -- what a reporting record retains: its map node and the one grant it carries until the transaction that deletes it
       row "closing record, reporting (the carried grant, per record)" backingRecordBytes reporting
+      heldClose ← sound "held close record" 200 (closingRow env HeldHeldClose)
+      row "held close record (a failed close whose reservation stays counted, per record)" backingRecordBytes heldClose
   where
     jobCharge' n = jobRecordBytes + fromIntegral n * writeEntryBytes + writeFailureBytes
     -- the service's end reports the kept failures: this example measures them and ignores that report

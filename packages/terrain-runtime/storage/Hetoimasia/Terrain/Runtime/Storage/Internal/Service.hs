@@ -102,6 +102,7 @@ module Hetoimasia.Terrain.Runtime.Storage.Internal.Service
   , JobKind (..)
   , BackingSnap (..)
   , HeldSnap (..)
+  , Held (..)
   , SlotTag (..)
   , snapshotOf
   , drainWaitsMessage
