@@ -84,6 +84,7 @@ library store
         Hetoimasia.Terrain.Runtime.Store.Internal.Model
         Hetoimasia.Terrain.Runtime.Store.Internal.Page
         Hetoimasia.Terrain.Runtime.Store.Internal.Plan
+        Hetoimasia.Terrain.Runtime.Store.Internal.Protocol
         Hetoimasia.Terrain.Runtime.Store.Internal.Records
         Hetoimasia.Terrain.Runtime.Store.Internal.State
         Hetoimasia.Terrain.Runtime.Store.Internal.Tree
