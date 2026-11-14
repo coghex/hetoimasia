@@ -89,6 +89,7 @@ module Hetoimasia.Terrain.Runtime
   , StorageState (..)
   , DiscoveryState (..)
   , inspectEditBankSTM
+  , inspectStorageQueuedSTM
   , perArenaBound
   , compileAccountFor
   , Condition (..)
@@ -561,6 +562,11 @@ inspectBacked svc = atomically (inspectBackedSTM svc)
 -- closing file of the owner's, no job of the storage service, and every row of 'inspectBacked'
 -- holds (so the edit bank holds only the storage service's own records). Read-only, for
 -- verification: a test waits on it instead of on a figure of the bank.
+-- | How many jobs wait in the storage service's queue (it takes at most eight). Read-only, for
+-- verification.
+inspectStorageQueuedSTM ∷ Service → STM Int
+inspectStorageQueuedSTM svc = Storage.snQueued <$> Storage.snapshotOf (serviceStorage svc)
+
 backedAtRestSTM ∷ Service → STM Bool
 backedAtRestSTM svc = do
   st <- readSt svc

@@ -21,6 +21,7 @@ import qualified Hetoimasia.Terrain.Runtime.Store.Internal.Admission as A
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan (RamCharge (..))
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Native (NativeOp (..))
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Service (resultPageBytes, transferBufferBytes)
+import Hetoimasia.Terrain.Runtime.Store.Internal.State (readerRecordBytes)
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Types (Errno (..))
 import Hetoimasia.Terrain.Runtime.Store (StoreSpec (..), defaultStoreSpec, minAllowanceBytes)
 import Test.Hspec
@@ -163,6 +164,75 @@ spec = describe "The backed terrain service" $ do
       readTVarIO readsAtGrant `shouldReturn` Just 2
       okOf (clearViewDemand svc view)
       closeView svc view
+      settleChecks svc
+
+  -- A grant refused for credits that no read holds holds no read. The control account is the least
+  -- the store's construction accepts for four arenas of two readers (the worst transaction, their
+  -- reader records and the queued descriptors); the first arena's backing record (the storage
+  -- service's own, 4,096 bytes) still leaves the transaction room, and one removal commits. A second
+  -- arena's backing record then takes what is left: a removal's grant never fits, whatever the reads
+  -- in flight return. A read held at the seam is in flight, and a later read still starts.
+  it "starts reads while a grant is refused for credits that no read holds" $ do
+    let w = A.worstTransactionCharge
+        readers = 4 * 2 ∷ Integer
+        control = toInteger (ramPagePins w + ramRootControl w + ramContinuation w) + readers * toInteger readerRecordBytes + toInteger A.maxQueuedDescriptors * toInteger A.descriptorRecordBytes
+        -- the cache at the least the service accepts, so reads go to the file rather than to copies
+        cache = toInteger (ramDecodedCopies w) + readers * toInteger A.readerPinnedCacheBytes + toInteger resultPageBytes
+        config = defaultConfig {configMaxArenas = 2, configEditBank = A.defaultEditBankSpec {A.ebsCache = cache, A.ebsControl = control, A.ebsArenas = 4, A.ebsReadersPerArena = 2}}
+    withProbedService config $ \probe svc → do
+      (_, lease) ← openMain svc "main"
+      _ ← removeCell' svc lease (tile 3 4 9)
+      atRest svc
+      _ ← openMain svc "other"
+      atRest svc
+      edit ← newHost True
+      request ← okOf (removeWith svc (hostEndpoint svc Nothing edit) lease (tile 3 4 5) Nothing)
+      waitFor (readTVar (hostReady edit) >>= \n → check (n >= 1))
+      gate ← H.addGate probe isRead
+      flip finally (H.openGate gate) $ do
+        _ ← okOf (cellAt svc lease (tile 8 8 8))
+        H.awaitReached gate 1
+        _ ← okOf (cellAt svc lease (tile 9 9 9))
+        H.awaitReached gate 2
+        -- the removal is eligible and staged, and has not been granted
+        readTVarIO (hostSettled edit) `shouldReturn` []
+      cancel svc request `shouldReturn` CancelWon
+      atRest svc
+      settleChecks svc
+
+  -- The storage service queues at most eight jobs. With every page read held at the seam, the
+  -- removals' reads fill its two workers and its queue; a load demanded meanwhile must not end the
+  -- owner: no pinned read starts while the queue is full, and a load whose read is refused for that
+  -- pressure keeps its job and reads again. When the reads are let go, everything completes.
+  it "keeps a load demanded while the storage queue is full, and completes it once the queue drains" $
+    withProbedService defaultConfig $ \probe svc → do
+      (client, lease) ← openMain svc "main"
+      forM_ [(3, 4, 9), (5, 4, 9)] $ \(x, y, z) → removeCell' svc lease (tile x y z)
+      atRest svc
+      gate ← H.addGate probe isRead
+      view ← okOf (openView svc client)
+      hosts ← flip finally (H.openGate gate) $ do
+        hosts ← forM [0 .. 13] $ \x → do
+          host ← newHost True
+          _ ← okOf (removeWith svc (hostEndpoint svc Nothing host) lease (tile x 4 3) Nothing)
+          pure host
+        -- two reads at the seam and eight in the queue: it is full
+        H.awaitReached gate 2
+        waitFor (inspectStorageQueuedSTM svc >>= check . (>= 8))
+        let (far, _) = decomposeTile (tile 100 100 0)
+        _ ← okOf (setViewDemand svc view lease [RegionDemand far (either (error . show) coverageTile (mkLocalCoord 0 0 0))])
+        -- an attach admitted after the demand is answered: the owner has acted on it
+        other ← okOf (registerClient svc)
+        _ ← okOf (attachArena svc other "main") >>= await svc >>= expectSuccess
+        inspectDefects svc `shouldReturn` []
+        pure hosts
+      forM_ hosts $ \h → waitFor (readTVar (hostSettled h) >>= \x → check (not (null x)))
+      mapM settledOf hosts >>= (`shouldSatisfy` all (\case [Succeeded (ARemoved r)] → removeChangedFlag r; _ → False))
+      -- the demanded region was loaded: a read of it answers
+      _ ← readCell svc lease (tile 100 100 0)
+      okOf (clearViewDemand svc view)
+      closeView svc view
+      inspectDefects svc `shouldReturn` []
       settleChecks svc
 
   it "answers reads of another arena while a removal's write is held, and answers a later read of the removal's arena after it, in admission order" $

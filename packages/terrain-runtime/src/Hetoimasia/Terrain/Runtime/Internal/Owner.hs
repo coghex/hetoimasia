@@ -201,8 +201,9 @@ nextWork svc token = do
               --
               -- And no pinned read starts while the storage service's queue is full: its first job would be
               -- refused for that pressure. Reading the queue here wakes the owner when a queued job is taken.
-              queueFull <- (>= maxQueuedJobs) . Storage.snQueued <$> Storage.snapshotOf (serviceStorage svc)
-              yieldToGrant <- if closing || isJust (stateSlot st) then pure False else readsYieldToGrant st adm
+              storage <- Storage.snapshotOf (serviceStorage svc)
+              let queueFull = Storage.snQueued storage >= maxQueuedJobs
+              yieldToGrant <- if closing || isJust (stateSlot st) then pure False else readsYieldToGrant st adm storage
               let holdReads = yieldToGrant || queueFull
               (prepareWork, commitWork) <- pickRequestWork svc st adm holdReads
               grantWork <- if closing || isJust (stateSlot st) then pure Nothing else grantable st adm
@@ -326,19 +327,33 @@ backedWork st = (now, waits)
       SlotDiscovery → True
       SlotReclaim → True
 
--- | Whether new pinned reads wait for the grant: the first contender is a store transaction (its
--- worst-case credits come from the edit bank the reads share) that fits now, or does not fit while
--- pinned reads are in flight (their cache is what it waits for, and it returns as they end).
-readsYieldToGrant ∷ St → A.Admission → STM Bool
-readsYieldToGrant st adm = do
+-- | Whether new pinned reads wait for the grant. The first contender (the one 'grantable' grants)
+-- is a store transaction, and either its worst-case credits fit now (the grant is made this turn),
+-- or they do not fit now but would once every pinned read in flight has returned what it holds: its
+-- pin, and its storage jobs' result pages, transfer buffers and records. A grant refused for any
+-- other reason (credits held by anything but reads, or no contender at all: an earlier request of
+-- its arena still to commit, internal work waiting its turn, a paused arena) holds no read.
+readsYieldToGrant ∷ St → A.Admission → Storage.Snapshot → STM Bool
+readsYieldToGrant st adm sn = do
   candidates <- contenders st
   pure $ case candidates of
     c : _
       | Just aid <- transactionArena c →
-          either (const False) (const True) (A.reserve A.Foreground (A.transactionCredits aid A.worstTransactionCharge) adm)
-            || not (Map.null (stateGathers st))
+          let credits = A.transactionCredits aid A.worstTransactionCharge
+           in fitsIn adm credits || (not (Map.null (stateGathers st)) && fitsIn withoutReads (lessReads credits))
     _ → False
   where
+    fitsIn a cs = either (const False) (const True) (A.reserve A.Foreground cs a)
+    -- the pins come back exactly; what the storage service charged for each read job is credited
+    withoutReads = foldr (releaseCredit . gatherGrant) adm (Map.elems (stateGathers st))
+    readJobs = [(n, j) | j <- Storage.snJobs sn, Storage.KRead n <- [Storage.jsKind j]]
+    resultBytes = sum [fromIntegral n * Storage.resultPageBytes | (n, j) <- readJobs, Storage.jsPhase j < 2 || Storage.jsHoldsResult j]
+    bufferBytes = sum [Storage.transferBufferBytes n | (n, j) <- readJobs, Storage.jsPhase j < 2]
+    recordBytes = sum [Storage.jsCharge j | (_, j) <- readJobs]
+    lessReads = map $ \case
+      A.CacheCredit a b k p → A.CacheCredit a (max A.minCacheEntryBytes (b - min b resultBytes)) k p
+      A.StagingCredit b → A.StagingCredit (max A.minGrantBytes (b - min b bufferBytes))
+      A.ControlCredit b → A.ControlCredit (max A.minGrantBytes (b - min b recordBytes))
     transactionArena = \case
       ContendRemoval _ a _ → Just a
       ContendDiscovery a → Just a
