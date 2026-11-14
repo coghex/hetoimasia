@@ -3,31 +3,30 @@
 The scoped, transactional terrain service (TRA-4 of epic #636). It executes the
 pure residency model of [`hetoimasia-terrain`](../terrain/README.md#residency-and-admission)
 against real owned data: one dedicated owner thread, bounded asynchronous loading
-and eviction, atomic whole-cell removal that commits together with its successful
-settlement, immutable borrowed snapshots, offload and reload from the immutable
-source plus canonical retained removals, and an orderly close.
+and eviction, atomic whole-cell removal that is written to the arena's private file and
+then commits together with its successful settlement, discovery of what removals reveal,
+immutable borrowed snapshots, reload of evicted regions from the arena's store, and an
+orderly close.
 
 It depends on `hetoimasia-terrain`, `hetoimasia-foundation` and
 `hetoimasia-runtime`. It has no Lua, GLFW, graphics or game dependency. Its one native
 dependency is the storage backend's small C shim (see
-[the storage backend](#the-storage-backend-tra-21)); the baseline service above uses
-none. It has no global registry and no universal environment: everything it borrows is
+[the storage backend](#the-storage-backend-tra-21)), through which the service writes and
+reads every arena. It has no global registry and no universal environment: everything it borrows is
 injected through `Ports` (the parent session's admission, a supervision
 capability, a logger and a diagnostics seam). The Lua request endpoint is TRA-5;
 this package supplies a Lua-independent settlement seam it can attach to.
 
-This is the **baseline** service of design P-16: it retains edits in RAM only. The
-temporary store of TRA-20–TRA-23 replaces that retention later. Its pure model
-(TRA-20) lives beside the service in this package and is described in
-[the temporary store](#the-temporary-store-tra-20); nothing in the service uses it
-until the terrain owner adopts it (TRA-22), so the service's behavior, admission
-outcomes and tests are unchanged.
+Every removal the service acknowledges is in the arena's store, written to its private file
+before the success is settled; nothing of it is kept in RAM. The store's pure model is
+[the temporary store](#the-temporary-store-tra-20) and its writer is
+[the storage backend](#the-storage-backend-tra-21).
 
 ## Using it
 
 ```haskell
 withWorkerGroup $ \group →
-  withTerrainService defaultConfig (Ports alwaysAdmitting (standaloneSupervisor group) logger noProbe) $ \svc → do
+  withTerrainService defaultConfig (Ports alwaysAdmitting (standaloneSupervisor group) logger noProbe (storagePort group storage directory)) $ \svc → do
     Right client ← registerClient svc
     Right opened ← openArena svc client "main" definition   -- a SourceSpec
     Right lease  ← await svc opened                          -- the creator's owner lease
@@ -37,6 +36,11 @@ withWorkerGroup $ \group →
     Right done   ← await svc edit                            -- RemoveAnswer: changed flag, committed revision
 ```
 
+The arenas' private files go in `directory`, on a filesystem `storage` qualifies
+(`mkStorageConfig`; `filesystemOf` names the one a directory is on, and qualifies nothing). Each
+arena reserves `configStore`'s allowance (1 GiB by default, 64 MiB at least). The storage
+workers need the threaded runtime. There is no default directory.
+
 An application supplies `supervisedOwner runtimeControl` (module
 `Hetoimasia.Terrain.Runtime.Supervised`) in place of `standaloneSupervisor`, so the
 owner is a required service of its supervised group. The control stays on the
@@ -44,8 +48,7 @@ application thread: the owner worker captures the service and nothing else.
 
 Admission never blocks. A request is admitted and returns a handle, or it is refused
 with a reason (`Refused`): `RefusedBusy` (temporary pressure: a bank or slot is
-full, the retained edits are full, four arenas, 64 leases or eight views are in
-use), `RefusedAuthority` (forged, foreign, released or wrong-service authority),
+full, four arenas, 64 leases or eight views are in use), `RefusedAuthority` (forged, foreign, released or wrong-service authority),
 `RefusedInvalid` (a request that can never succeed), `RefusedExhausted` (an
 identity would wrap) or `RefusedClosed` (the service or its parent session is
 closed). A refusal creates no request, no work and no reservation. An outcome
@@ -103,14 +106,16 @@ All mutable state is one record behind one `TVar`. Admission, cancellation, rele
 and closure run as transactions on the caller's thread and write only
 **bookkeeping**: the request table, leases, names, views and the accounting model.
 The owner thread is the **sole writer of arena contents**: the resident detail, the
-palette, the retained changes, the content revision and the residency generation.
+palette, the arena's store, the content revision and the residency generation.
 Snapshots are the only way another thread reads contents, and they are immutable
 values.
 
 | State | Owner and writers | Readers | Thread | Bound | Commit point and retirement |
 | --- | --- | --- | --- | --- | --- |
-| Arena contents: resident detail, palette, retained changes (store plus working), revision, generation | The owner thread alone | Any thread through STM or a snapshot; the owner's own pure computations | The owner | Resident and edit banks (#639: 256 MiB, 64 MiB) | Content and revision change only in a commit transaction; resident detail is discarded by the owner when the model commits a victim |
-| Accounting model (`Model`) | Port transactions (admission, cancel, release, close, holds, views) and the owner (job events, victims, transfers, commit) | The owner and inspection | Any, one transaction at a time | The three banks and three slots of #639 | Every credit is derived from the model's records, so none is freed twice |
+| Arena contents: resident detail, palette, the store (committed roots, reader pins, the active transaction, conditions, growth state), its backing, revisions, generation | The owner thread alone | Any thread through STM or a snapshot; the owner's own pure computations | The owner | Resident bank (256 MiB); the store's pages in the arena's allowance | Committed roots and revisions change only in the publication decision (and an open's first root at its adoption); every other write of the store is checked to keep them; resident detail is discarded by the owner when the model commits a victim |
+| The session's one mutating transaction (`stateSlot`) and the pinned reads (`stateGathers`) | The owner | Inspection | The owner | One transaction per session; the configured readers per arena | The slot's edit-bank credits are reserved at its grant and released by its decision, or by its abort once its job has drained; a read's pin and credit go in the transaction that removes it |
+| Compile account | The owner | Inspection | The owner | Every other arena's per-arena bound plus one compilation's peak | An open's peak is charged before its first quantum; an arena keeps its share until its retirement completes |
+| Accounting model (`Model`) | Port transactions (admission, cancel, release, close, holds, views) and the owner (job events, victims, commit) | The owner and inspection | Any, one transaction at a time | The three banks and three slots of #639 | Every credit is derived from the model's records, so none is freed twice |
 | Request table (`Req`) | The port inserts; whoever finds a request in the table removes and settles it | The owner, the port | Any | 256 accepted commands (model) | Removed in the transaction that settles it; a settled read stays until its result is taken |
 | Staged work (answer or prepared removal), tagged with incarnation and revision | The owner | The commit transaction | The owner | One per request | Published only if the arena still has the tagged revision; otherwise recomputed, never relabeled |
 | Leases, clients, names | The port | The port, the owner | Any | 64 leases, four arenas | Released by `releaseLease`, `endClient`, arena closure or service closure; names freed at arena closure or when a pending open ends |
@@ -118,7 +123,7 @@ values.
 | Snapshot holds and the borrower count | The port acquires and releases | The owner (for closure) | Any | `specHoldRegions` per hold | Released on every exit of `withSnapshot`; closure waits for the count to reach zero |
 | Victim queue | The port appends (from admission decisions); the owner drains | The owner | Port, owner | Bounded by the banks | Drained by the owner, which discards the detail and then reports the release |
 | Defect record | Any thread that detects one | Inspection | Any | The latest 16 | Kept for the life of the service |
-| Running-work record (`RunningWork`: every accepted load job as granted and as its coverage must hold it; the preparation; each handoff duplicate; each borrow's regions; each view description's regions) | The owner thread (running marks, preparation, handoffs, a job's end) and the port transactions that admit the work (a job's grant, a borrow, a view's demand), each in the transaction of the model event it mirrors | Inspection only (`inspectCensusSTM`); no production decision reads it | Owner and port | What the model bounds (jobs, holds, views) plus one preparation and one duplicate per changed region | Each entry ends with the work it describes (a job's report, the owner's safe point, a transfer's outcome, a borrow's release, a view's clearing); the owner's terminal step empties the owner's |
+| Running-work record (`RunningWork`: every accepted load job as granted and as its coverage must hold it; the preparation; each borrow's regions; each view description's regions) | The owner thread (running marks, preparation, a job's end) and the port transactions that admit the work (a job's grant, a borrow, a view's demand), each in the transaction of the model event it mirrors | Inspection only (`inspectCensusSTM`); no production decision reads it | Owner and port | What the model bounds (jobs, holds, views) plus one preparation | Each entry ends with the work it describes (a job's report, the owner's safe point, a borrow's release, a view's clearing); the owner's terminal step empties the owner's |
 
 The owner runs bounded quanta: one dispatched load job, one staged computation or
 one commit at a time. Waiting for a host's eligibility, for a load or for a caller is
@@ -132,31 +137,32 @@ on the owner. The owner never receives the runtime control.
 A removal is staged, then committed:
 
 1. **Admit** (port): validate authority, the incarnation and revision of an optional
-   content precondition, and identity headroom; the model reserves the request's
-   command, staging, retained-edit and resident-growth credits and its demand for
-   the cell, all or nothing.
-2. **Load** (owner): the model's job loads the cell's region from source plus all
-   retained removals.
-3. **Stage** (owner, pure): remove the whole cell (a slope included) from the
-   authority and prove the cell's resident segment can be rebuilt. Nothing is
-   published. The staged work carries only the content change, tagged with the
-   incarnation and revision it was built for, and the host is told it is ready.
-   (If that notification fails, nothing is staged: it is a provider defect.)
-4. **Commit** (owner, one transaction): read the parent session's admission, the
-   request's presence in the table (a cancellation removes it), the arena's
-   incarnation and revision, and the host's eligibility. Re-check a supplied
-   content precondition. If every check holds, rebuild the cell's resident segment
-   over the residency *as it is now* (loads and evictions may have changed it while
-   the commit waited for its grant, and none of that is overwritten), then apply the
-   content, the revision, the retained bytes and the model's `RemovalCommitted`, delete the request, admit
-   again at the new revision every other pending removal and every reader that lost
-   its work to the commit, and deliver the success settlement. Any failure before
-   the host callback leaves nothing written; a failing callback abandons the whole
-   transaction.
-
-Retained-edit bytes are accounted monotonically by the model: a removal that
-*coalesces* two retained intervals shrinks the real changes, but the saving is not
-credited (the added bytes are reported as zero), so the account stays an upper bound.
+   content precondition, and that no revision could pass its last value; the model
+   reserves the request's command, result and control credits and its demand for the
+   cell, all or nothing. Nothing of the transaction is reserved yet.
+2. **Read** (owner): pin one committed version of the arena's store and read the runs
+   of the cell's column through the backend.
+3. **Stage** (owner, pure): remove the whole cell (a slope included) from those runs
+   and prove the cell's resident segment can be rebuilt. Nothing is published. The
+   staged work is tagged with the incarnation and revision it was read at, and the host
+   is told it is ready. (If that notification fails, nothing is staged: it is a
+   provider defect.)
+4. **Write** (owner): once the host is eligible the session's one mutating transaction
+   is granted to it, reserving the worst transaction's edit-bank credits. It plans the
+   removal and its connection obligation against the committed root, the store claims
+   its pages, and the backend writes them to the arena's file. A transaction that ends
+   without publishing aborts with no write, once its job has returned.
+5. **Decide** (owner, one transaction, `Internal.Publish.decide`): read the parent
+   session's admission, the arena's identity, version and active transaction, the
+   request's presence (a cancellation removes it) and the currency of its staging, the
+   host's eligibility and a supplied content precondition. If every check holds,
+   publish the next committed root with its checked revisions, rebuild the cell's
+   resident segment over the residency *as it is now*, record `RemovalCommitted` with
+   nothing retained, delete the request, admit again at the new revision every reader
+   that lost its work to the commit, release the transaction's credits and the slot,
+   and deliver the success settlement last. Any failure before the host callback leaves
+   nothing written; a failing callback abandons the whole transaction. Discovery
+   batches, reclamation and growth publish through the same decision.
 
 Every record the service itself holds for a request is charged **from admission** to
 take, discard or cancellation, in the retained bank (160 accounted bytes each, a
@@ -179,26 +185,46 @@ air, with nothing changed.
 admission order. A command that is not yet eligible does not hold up the others; a
 command that is eligible but not yet staged holds up the later ones. The same
 ordered trace of eligible commands therefore yields the same terrain, results and
-content revisions however loads and evictions interleave. Pending opens and
+content revisions however loads and evictions interleave. The session's one mutating
+transaction follows the same order: a removal takes it only after every earlier eligible
+data request of its arena; while it holds it, nothing of its arena admitted after it is
+prepared, so a granted removal is decided after no further preparation and waits at most
+for the storage jobs already queued ahead of its own (eight descriptors). While the slot is
+free and its next transaction is granted now, or waits only for credits that pinned reads in
+flight hold, no new pinned read starts; for any other refusal reads go on. No pinned read starts
+while the storage queue is full. Temporary pressure from the storage service never settles a
+request or ends the owner: the refused caller keeps its place (a request stays waiting, a load
+keeps its job, a growth or retry waits again, an open keeps its compiled result), and no new
+storage work starts until what the storage service and the edit bank hold has changed. Internal work (discovery,
+reclamation) takes one grant in every `internalTurn` (3) explicit grants while an
+explicit removal waits. Reads of other arenas, loads and borrowed snapshots continue
+while a write is outstanding. Pending opens and
 attaches order among themselves the same way. An attach is decided in its own
 commit against the names that have settled, so a pending open is invisible to it.
 
 ## Offload and reload
 
-Resident detail is a cache; the authority is the immutable source plus the retained
-removals. A commit records its removed interval in the changed region's working set
-and in the authority. The model keeps the region protected until a **transfer** moves
-the working set into the retained store: the model reserves the temporary duplicate
-in staging, the owner merges, and the outcome is reported. A failed transfer keeps
-the working changes, the protection and every charge, and is not retried until the
-region changes again. Because the retained bytes were funded when the removal was
-admitted, a confirmed transfer needs no new edit capacity. An evicted region is
-loaded again from source plus all retained removals, so identical terrain is
-reconstructed across repeated cycles, buried edits, authored gaps and deep shafts
-included, without materializing the cells between.
+Resident detail is a cache; the authority is the immutable source plus the arena's
+store. A commit retains nothing in RAM: its region is a cache again at once. A load job
+pins one committed version and reads the runs of the region's columns through the
+backend, so an evicted region is loaded again from source plus the stored removals and
+identical terrain is reconstructed across repeated cycles, buried edits, authored gaps
+and deep shafts included, without materializing the cells between. A page that does not
+arrive keeps its read pending; one that arrives damaged is `storage_integrity`; neither is
+ever replaced with source, air or fog.
 
-At the configured retained-edit bound a new edit answers busy (`BusyRetainedEdits`)
-and creates nothing; earlier edits, reads and demand are untouched.
+`arenaStatus` answers the arena's storage (ready, or paused with its cause), its reserved,
+used, pending-reclaim and pending-reserved bytes, discovery (idle, pending with its items,
+or paused) and the content and knowledge revisions. While an arena is paused its reads
+continue where their pages validate, and reclamation continues while it is paused only for
+capacity. `growArena` (creator only) commits a larger cap through the publication decision,
+releasing any extra a failed growth left pending first, and clears only `storage_full`.
+`retryArena` (creator only) releases a pending extra under the slot, re-reads the recorded
+pages and clears each condition it verified; capacity clears when the next transaction fits
+beside the protected reserve. A growth or retry is prepared against the arena's allowance and
+growth state: it is not prepared while the slot runs a growth or release of its arena, and what
+it staged is prepared again if either moves before its grant, so equal, larger and smaller are
+decided against the allowance it is answered at.
 
 ## Snapshots
 
@@ -244,8 +270,7 @@ the stores only after the borrowers finish.
   obeyed, and delivered after the drain and the body's own failure, with its context, is the one
   that propagates. The owner's cleanup is installed before its first fallible step and, whatever
   ended the owner, retires every in-flight account at its terminal safe point:
-  each cancelling load is acknowledged, each outstanding transfer is abandoned and
-  each committed victim's release is finished, so no reservation outlives it (a
+  each cancelling load is acknowledged and each committed victim's release is finished, so no reservation outlives it (a
   hold still outstanding keeps only its own arena retiring until released).
 * Reporting is tracked **per defect**: a defect the owner is about to throw is marked
   reported, and every other unreported one is attached to it, so nothing hides behind
@@ -255,14 +280,16 @@ the stores only after the borrowers finish.
   attempted, and then it reaches supervision whatever the owner ended with: as the
   owner's failure when it would have returned, or attached to its failure as cleanup
   evidence (`composeCleanup`) when it had already failed.
-* **The fairness rule.** Staging, commits, retries and load dispatches take turns
-  whenever two or more are ready: each ready kind gets one quantum in every four,
+* **The fairness rule.** Staging, commits, retries, load dispatches and the backed steps
+  (opens, pinned reads, the slot's transaction, grants and file closes) take turns
+  whenever two or more are ready: each ready kind gets one quantum in every five,
   whatever the others are being fed (`stateTurn` hands the next choice to the kind after
   the one that just ran). A continuous stream of new, cancelled or replaced reads cannot
   starve an eligible commit or a queued load. A retry pass is run only when it can matter
   (a registered view has pending demand, or a request waits to be admitted again); a
-  freed credit alone does not make one. Within commits the per-arena admission order is
-  unchanged, and the model's round-robin and aging choose among loads.
+  freed credit alone does not make one. Within commits, and for the slot, the per-arena
+  admission order holds (see Ordering); ready pinned reads are stepped in turn; the
+  model's round-robin and aging choose among loads.
 * **The retained-bank reservation.** Every request reserves one result record
   (`resultRecordBytes`) in the retained bank when it is admitted, because every request can
   come to hold a record the model does not charge (a result not yet taken, a wait to be
@@ -272,11 +299,11 @@ the stores only after the borrowers finish.
 * **Readmission.** When a commit supersedes a pending request's revision it is admitted
   to the model again. Every refusal is classified: temporary pressure keeps the request
   waiting, and it stays charged (a command slot and a retained record) until it is
-  readmitted or ends; a permanent refusal (its demand left the configured extent, the
-  retained edits are full, its arena ended) ends it at once with a typed failure
+  readmitted or ends; a permanent refusal (its demand left the configured extent, its
+  arena ended) ends it at once with a typed failure
   (`Superseded`, or `ArenaClosed`). Nothing waits on a refusal that will not clear.
 * **R1: credits are released only at the owner's safe point.** A request's model record
-  owns its command slot, staging, retained-edit and growth credits, and the arena's
+  owns its command slot, staging and growth credits, and the arena's
   retirement gives back everything its requests hold. They are released through one
   function, `withdrawRecord` (and `retireArenaRecord` for an arena), and a release
   never touches credits that running work still uses. The owner runs a preparation
@@ -291,27 +318,15 @@ the stores only after the borrowers finish.
   replaces: `releaseReq` (every settlement: cancel, retire a result, lease release,
   client end, closure), the removal's `retainResult` at commit, `resubmitSTM`, and
   `closeArena`'s retirement. Releases that cannot overlap a preparation (victims,
-  job acknowledgements, transfer outcomes, holds, camera demand) run on the owner thread
+  job acknowledgements, holds, camera demand) run on the owner thread
   or touch no request's credits, and are unchanged.
 * **R2: a capacity refusal is never terminal.** A `Busy` refusal leaves the item pending,
-  reconsidered whenever capacity is returned (`stateCapacityEpoch` advances on every event
-  that can return a credit). The refusal sites: admission returns it to the caller and
-  creates nothing; a read superseded by a commit and refused on readmission waits,
-  charged, and the retry pass reconsiders it; a camera demand the model cannot yet
-  admit stays pending in the model and the retry pass reconsiders it; and a changed
-  region's transfer refused for want of staging capacity stays a candidate, suppressed
-  only until the epoch moves (`stateHandoffBusy`), where it was previously marked as tried
-  and never retried. Only a transfer that ran and failed is suppressed until the region
-  changes again, and only refusals that can never clear (the arena is gone, the demand left
-  the extent) end an item.
-* **Retry memory is bounded by the regions the model holds.** What the owner remembers
-  about retrying a region's transfer (tried at a generation; refused for want of capacity
-  at an epoch) is written only by `rememberTried` and `rememberBusy`, and only for a region
-  the model still holds in a live arena, so a transfer in flight when its arena ends leaves
-  nothing behind. It is dropped only by `forgetRegionRetry` (a completed transfer, a
-  released victim) and `forgetArenaRetry` (an arena's closure), and wholesale by the owner's
-  terminal step; an invariant checks that no memory outlives its region, and
-  `inspectRetryMemory` is zero once the regions and arenas have ended.
+  reconsidered whenever capacity is returned. The refusal sites: admission returns it to
+  the caller and creates nothing; a read superseded by a commit and refused on readmission
+  waits, charged, and the retry pass reconsiders it; a camera demand the model cannot yet
+  admit stays pending in the model and the retry pass reconsiders it; a grant that does not
+  fit waits for the cache reads in flight hold. Only refusals that can never clear (the
+  arena is gone, the demand left the extent) end an item.
 * **Diagnostics never decide.** A defect is thrown with a failing logger's failure attached
   as cleanup evidence, never replaced by it; a logger that fails on a routine record is
   itself recorded as a defect and the work goes on.
@@ -338,8 +353,11 @@ the stores only after the borrowers finish.
 | Column answer over 1,024 runs | `TooLarge` (settled), never truncated |
 | Column range over 8,192 levels (refused in constant time, before any region is enumerated), a name that is empty or over 256 characters, a borrow naming more regions than a hold may, coordinates outside the extent | `RefusedInvalid` before admission |
 | Forged, foreign, released or wrong-service authority | `RefusedAuthority` before admission |
-| Bank, slot, arena, lease or view cap; retained edits full | `RefusedBusy`, nothing created |
-| An identity or content revision that would wrap | `RefusedExhausted` before admission |
+| Bank, slot, arena, lease or view cap | `RefusedBusy`, nothing created |
+| An identity, or a content, knowledge or store revision, that would wrap | `RefusedExhausted` before admission; internal work whose next commit would wrap stops |
+| The arena's allowance cannot take the next transaction beside the protected reserve; a page write or read fails; a page reads back invalid | `storage_full` / `storage_io` / `storage_integrity`: the arena pauses for that cause, its uncommitted removals settle with it and new ones at once while it holds, its committed terrain stays readable, other arenas continue; growth clears only `storage_full`, an explicit retry re-reads the recorded pages and clears what it verified, and no failed removal is ever repeated |
+| An open on an unqualified filesystem; a reservation that fails; a source past a compile bound | `storage_unsupported` / `reservation_failed` / `source_complexity` (settled), nothing published, the name released |
+| A smaller growth | `storage_size_not_increased`; an equal one succeeds unchanged |
 | Preparation failure (unexpected) | `HostFailure` (settled); the previous state is kept |
 | Accounting defect after valid admission | `HostFailure`, a recorded `AccountingDefect`, and the owner ends |
 | Provider defect: a settlement, readiness or eligibility callback that throws | A recorded `ProviderDefect`, nothing committed or staged, every request settled once, and the owner ends |
@@ -351,7 +369,21 @@ bounded arena, request and revision context, never a per-cell stream.
 ## Bounds
 
 The banks are those of the residency model (`defaultLimits`: 256 MiB resident,
-64 MiB retained edits, 128 MiB CPU staging, 128 load jobs, 256 queued commands).
+128 MiB CPU staging, 128 load jobs, 256 queued commands; its edit bank charges only a
+pending removal's record, as nothing is retained). The store's edit bank (48 MiB cache,
+8 MiB staging, 8 MiB control) is validated at construction to hold the worst transaction
+beside every configured reader pin and one read's result page and transfer buffer, so some
+read is always funded, and its control account the store's minimum beside the storage
+service's own records at their most (every job record at its largest, one per backing up to
+the arena cap, every kept failure: `maxRecordControlBytes`). A closed arena does not count in the
+cap; its record is held only until its file is closed, which is work in flight. A held close (a failed close where it is not established to release
+the descriptor) keeps its record to the service's end and is not bounded: if held closes take the
+room, the next transaction that can never be funded, or a submission refused with nothing in
+flight, is a recorded defect, never a wait. The compile account is every other arena's per-arena bound (16 MiB
+of connectivity plus 32 bytes per node: 18 MiB) plus one compilation's 48 MiB peak, 102 MiB
+for four arenas, and a configuration it cannot hold is refused. A source the compiler
+accepted before can now be refused at that bound: a column of 1,024 one-level patches two
+levels apart compiles to 16,777,224 bytes and is `source_complexity`.
 The service adds the approved caps of four arenas, 64 arena leases and eight views,
 a snapshot backing bank carved from the staging bank (see Snapshots),
 and uses the source (256 KiB, 8,192 authored runs) and query (1,024 runs, 8,192
@@ -374,7 +406,7 @@ requires the two to agree and the count never to exceed the limit.
 | Clients (256) | registered clients, until `endClient` | `Map.size stateClients` |
 | Command slots | the model's accepted commands; untaken results; pending opens and attaches; reads and removals waiting to be admitted again; every ghost (a request withdrawn while its preparation runs) | `slotsHeldHere` with the model |
 | Retained bank | outstanding snapshots' backing; one result record per request, from admission to take, including ghosts | `retainedBankUse` |
-| Per-arena retained edits, resident, edit and staging banks, holds, jobs | the residency model's own accounting, whose records (live or retiring arenas, ghosts, running preparations) stay charged until released at the owner's safe point | the model's `chargeCheck` and invariants |
+| Resident, edit and staging banks, holds, jobs | the residency model's own accounting, whose records (live or retiring arenas, ghosts, running preparations) stay charged until released at the owner's safe point | the model's `chargeCheck` and invariants |
 
 The enumeration reads the model's arenas, each client's lease and view sets, and the
 request and ghost tables, so a state that one count forgot is a disagreement, not a
@@ -396,7 +428,9 @@ count against the entities that hold it (retiring arenas included).
 
 | Item | Admitted by | Held in | Released by | Exercised by |
 | --- | --- | --- | --- | --- |
-| Reservation (command slot, record, interest, staging, retained-edit and growth credits) | `SubmitQuery` / `SubmitRemoval` in the admission transaction | The model's request record | `Withdraw` on settlement, cancellation, closure or a read being taken; `RemovalCommitted` at a commit | Races, Closure ("returns every credit"), Offload |
+| Reservation (command slot, record, interest, staging and growth credits) | `SubmitQuery` / `SubmitRemoval` in the admission transaction | The model's request record | `Withdraw` on settlement, cancellation, closure or a read being taken; `RemovalCommitted` at a commit | Races, Closure ("returns every credit"), Offload |
+| Transaction (the slot and its edit-bank credits; the store's claim) | The grant; the store's admission of its plan | `stateSlot`, the store's active transaction | The decision, or an abort once its job has returned | the backed ending-path sweeps |
+| Pinned read (a pin and its credit) | A gather's start | `stateGathers`, the store's pin | The transaction that removes the gather, once its read has returned | the backed ending-path sweeps |
 | Pending open (arena slot, lease slot, name claim) | `admit` | The request table and the name map | Commit (becomes an arena, a lease and a live name) or termination (cancel, client end, closure, session end) | Closure ("pending open"), Races |
 | Arena and lease | The open commit | `stateArenas`, `stateLeases`, the client record | `releaseLease`, `endClient`, `closeArena`, `closeService` | Closure (names, leases and authority; limits) |
 | Queued command | `admit` | `stateRequests` (Waiting, then Staged) | Settled by commit or termination in one transaction; a read stays Done until taken | Races, Closure, Lifecycle |
@@ -404,7 +438,6 @@ count against the entities that hold it (retiring arenas included).
 | Load job | `Dispatch` | The model's job record and slot | `JobCompleted` (published or discarded), `JobFailed`, or `JobAcknowledged` after its interests are gone | Budgets ("safe point"), Closure |
 | Victim | An admission's eviction set | The victim queue and the model | The owner discards the detail, then `VictimReleased` | Offload, Budgets |
 | Snapshot hold | `AcquireHold` | The model's hold, the borrower count and the snapshot backing ledger | `ReleaseHold` on every exit of `withSnapshot`; closure waits for zero | Budgets (snapshot), Lifecycle (borrower) |
-| Handoff | `BeginHandoff` (reserves the duplicate in staging) | The region's handoff record | `HandoffConfirmed` or `HandoffFailed` | Offload |
 | Defect | Detection | The bounded defect record | Never; read by inspection | Races, Lifecycle |
 
 ## Tests
@@ -424,9 +457,8 @@ the parallel group (`Test.TerrainRuntime.Parallel`) only if it touches no file, 
 mutable state.
 
 `Test.TerrainRuntime.Hardening` includes an owner interrupted at each phase of
-its work (a load, a read's capture, staging, the commit boundary, a transfer, a
-victim's release), after which nothing may remain reserved, running, transferring or
-retiring.
+its work (a load, a read's capture, staging, the commit boundary, the slot's grant, a
+victim's release), after which nothing may remain reserved, running or retiring.
 
 `Test.TerrainRuntime.Interleaving` runs a randomized interleaving of submit, cancel,
 grant, release, end, edit, borrow and view demand (24 seeds of 300 steps each, the
@@ -442,9 +474,7 @@ retiring arenas. The model-backed banks are checked too, in every run, under the
 accounting rule: **nothing is ever under-charged**. The model must charge at least what the
 service holds, for every bank, slot and arena in every state, and exactly only where the
 issue states an exact charge (a request's record, a removal's reservations, the slots and
-holds); over-charging is allowed where the model is conservative by design (an edit that
-coalesces keeps its monotone retained charge: remove levels 0, 2, then 1 and the arena is
-charged 80 bytes where it holds 64). `Test.TerrainRuntime.Usage` states what each bank and
+holds); over-charging is allowed where the model is conservative by design. `Test.TerrainRuntime.Usage` states what each bank and
 slot must hold from **the service's own data**, never from the accounting model's fields.
 `inspectCensusSTM` (read-only, for verification, used by no production caller or decision; read in one
 transaction with the model) reports, from the service's own structures, the bytes each
@@ -467,9 +497,7 @@ transaction of the model event it mirrors, and no production decision reads it:
   dispatch, 0 while it waits: a waiting job holds only a promise, so it contributes no expectation). The
   owner marks a job it runs and ends it with its report, so a model that forgets a running job is seen;
 * the **preparation** the owner is running (a removal's resident growth, 62 bytes, staging, 512, and
-  retained edit, 64, and the command record it reads under), from its start to the owner's safe point;
-* each **handoff duplicate** (the bytes the owner copies, 64 for one removal), from the transfer's
-  admission to its outcome;
+  edit record, 64, and the command record it reads under), from its start to the owner's safe point;
 * each outstanding **borrow**, the regions the snapshot handed out covers and the **accounted bytes it backs**
   (its payload, segment metadata and column index entries, measured on the snapshot value at hand-out, never
   read from the retained-bank ledger), until its borrower releases it, whether its arena is live or closed and
@@ -477,13 +505,13 @@ transaction of the model event it mirrors, and no production decision reads it:
   (admitted and pending, from the receipt): the service's own account of what it lent and accepted.
 
 Every inspection type (`Census`, `ArenaCensus`, `RequestCensus`, `RunningWork`, `JobWork`,
-`PreparationWork`, `HandoffWork`) is abstract with read-only accessors that are functions, never field
+`PreparationWork`) is abstract with read-only accessors that are functions, never field
 labels: an external client cannot construct, forge or update one, and none carries an authority, a handle
 or a snapshot. Reading them takes no hold, interest or reservation and changes no residency, LRU order or
 scheduling. The check requires: each region charged at least what its detail
 holds, and no region held by the service with no model record (nor charged, unless
-evicting, when the service holds none); each arena (live or retiring) charged at least its
-own retained changes, and the edit bank at least their sum; a removal's resident growth at
+evicting, when the service holds none); the model charging no handoff duplicate for any region
+(nothing is transferred); a removal's resident growth at
 least the worst case of a segment (two bytes a cell for a dense segment, less the two bytes
 of a uniform one) and its edit and staging reservations as stated; the staging bank's
 request records exactly what the service's requests hold; the command slots exactly the
@@ -493,30 +521,28 @@ bank: every job the owner runs must be charged at least what its coverage needs,
 waiting, at least what the model granted it (a charge one byte short fails, as does a waiting job whose
 charge was released early); the load-job slots at least the jobs the owner runs; the resident bank's
 reservations (counting what still waits for victims) at least every job's plus the removals' growth;
-the staging bank's reservations at least the removals' staging plus the running jobs' scratch; the retained-snapshot bank at least the backing of every snapshot handed out and still borrowed (per snapshot and in total, live and retiring incarnations alike) plus one record for each request the service holds; the view pin slots zero (the service never pins a view's revision); the service-wide limits (arenas, leases, views, clients, command slots, the retained bank) against enumerations that read only the service's own structures; each handoff
-duplicate at least the bytes the owner copied; the model must still hold, with its growth, the request the
+the staging bank's reservations at least the removals' staging plus the running jobs' scratch; the retained-snapshot bank at least the backing of every snapshot handed out and still borrowed (per snapshot and in total, live and retiring incarnations alike) plus one record for each request the service holds; the view pin slots zero (the service never pins a view's revision); the service-wide limits (arenas, leases, views, clients, command slots, the retained bank) against enumerations that read only the service's own structures; the model must still hold, with its growth, the request the
 owner is preparing; each borrow's hold must name at least the regions of the snapshot handed out and
 each view's description at least the regions of the accepted demand; and the staging bank's
 occupied bytes at least what the service's own records need (the request records, one interest for each region
-each held request demands, one hold record for each region each borrow covers, each view's description and
-the duplicates). A camera demand's interests exist only in the model's own records, so they are not claimed;
+each held request demands, one hold record for each region each borrow covers and each view's description). A camera demand's interests exist only in the model's own records, so they are not claimed;
 the ledger is also compared exactly with the model's own entity lists (consistency of the model with itself,
 named as such, not an independent expectation). These comparisons
 run after every step of the property, inside every held borrow, at every job (where the record
 must also show the job running, with a slot and non-zero amounts) and, with releases
 injected, inside the preparation hook right after each cancellation, lease release or
 client end, before the owner resumes. The property ends with every bank, occupied as well as reserved,
-every slot and every arena at zero: no charge, a coalescing excess included, outlives its holder.
-`Test.TerrainRuntime.Oracle` pins the record's literal amounts at a gated job (running and waiting), handoff,
+every slot and every arena at zero: no charge outlives its holder.
+`Test.TerrainRuntime.Oracle` pins the record's literal amounts at a gated job (running and waiting),
 preparation, borrow and view, and holds the controls that must fail: a model that charges the running job
 1 byte of resident and 1 of scratch instead of 400 and 258 (and one byte short of each figure), a waiting job
 whose 400 and 258 were released while another job runs (and one byte short), a job the model forgot while it
-runs, a 64-byte handoff duplicate zeroed (or not charged at all), a preparation whose request the model dropped
+runs, a 64-byte handoff duplicate charged that the owner never holds, a preparation whose request the model dropped
 or for which it reserved no growth, a borrow's hold shortened from two regions to one (the staging charge with
 it) or dropped, a view's description shortened or dropped, a model rebuilt without the arena beside the
-service's real census (every bank disagrees), and two arenas' retained charges swapped. It also shows that
+service's real census (every bank it uses disagrees), and two arenas' resident charges swapped. It also shows that
 reading the census changes neither the model, its clock, its requests nor its limits, and that an arena with
-coalesced edits, charged more than it holds, returns every account when it retires.
+committed edits returns every account when it retires.
 `Test.TerrainRuntime.Budgets` pins D-42: a twelve-region camera demand over a resident bank of about two
 regions is admitted best effort with a pending remainder (asserted, so the example cannot pass
 without capacity pressure), and an explicit query and a removal are admitted and complete
@@ -524,8 +550,8 @@ while that demand stays registered and is never withdrawn.
 `Test.TerrainRuntime.Limits` pins the examples: with the default limits, four closed
 incarnations each held by a snapshot refuse a fifth admission; exactly one borrow is
 released, three stay outstanding, and a replacement is admitted (and a further one is
-refused again); and a transfer's duplicate, a removal's reservation and a borrow are
-all accounted while the owner is held mid-transfer.
+refused again); and a transaction's write in flight, a removal's reservation and a borrow
+are all accounted together.
 
 The examples drive the production service. A **gate** is an `MVar` the owner blocks
 on at a named point (`Probe`), so an example decides which side of a race wins by
@@ -549,8 +575,7 @@ D-43, D-52, D-59): the private page format, the copy-on-write indexes over it, t
 allocator and retirement work, staged transaction planning, pinned readers,
 reclamation, the allowance and its growth, and the edit bank's storage-aware
 admission. It performs **no file I/O, starts no thread, runs no STM and reads no
-clock**. The baseline service above is unchanged and still retains its edits in RAM
-until the terrain owner adopts the store (TRA-22); nothing here is wired into it.
+clock**. The service above drives it (one owner thread, the storage backend's workers).
 
 | Surface | What it is |
 | --- | --- |
@@ -1101,9 +1126,9 @@ foreground mutation's credits are protected from camera reads or reclaimable by
 evicting backed copies, and no request waits in a circle. The failure classes stay
 apart: temporary pressure (`RefusedBusy`), a request that can never fit
 (`RefusedInvalid`), disk exhaustion, integrity failure, a plan to redo and a pause an
-explicit recovery clears (`classifyPlan`, `classifyAdmit`). The baseline's 64 MiB
-edit bank, its lifetime retained-edit charge and its `RetainedEditsExhausted` outcome
-are unchanged until TRA-22 (checked in `terrain-tests`).
+explicit recovery clears (`classifyPlan`, `classifyAdmit`). The residency model's own
+edit bank charges only a pending removal's record: nothing is retained in RAM, and its
+`RetainedEditsExhausted` outcome is an accounting defect if it ever occurs.
 
 ### Ownership of the store's state
 
@@ -1120,9 +1145,9 @@ are unchanged until TRA-22 (checked in `terrain-tests`).
 TRA-21 (supplied; see [the storage backend](#the-storage-backend-tra-21)): the temporary
 file, its descriptor lifecycle, real preallocation and free-space checks, the I/O workers,
 short-write loops and filesystem overhead qualification.
-TRA-22: opening, the live owner's root publication, write-backed request settlement,
-discovery scheduling, pause and retry orchestration and close and reset. TRA-23: the
-Lua facade and status. No result of this model is proof of physical preallocation,
+TRA-22 (supplied: the service at the top of this document): opening, the live owner's root
+publication, write-backed request settlement, discovery scheduling, pause and retry and close.
+TRA-23: the Lua facade and status. No result of this model is proof of physical preallocation,
 durable writes, live settlement or crash recovery.
 
 ## The storage backend (TRA-21)
@@ -1148,8 +1173,10 @@ withStorage config admission group logger $ \svc → do      -- two workers star
 ```
 
 The storage location is an explicit input (`osDirectory`): the backend uses no implicit current
-directory and has no default; TRA-22 or application assembly chooses and documents the production
-default. Space and support are asked of the opened descriptor (`fstat`, `fstatfs`), never of a path.
+directory and has no default: the terrain service takes it as an input of its construction
+(`storagePort`), and application assembly supplies it. `filesystemOf` names the filesystem a
+directory is on as the backend itself reads it, and qualifies nothing. Space and support are
+asked of the opened descriptor (`fstat`, `fstatfs`), never of a path.
 
 ### State, owner, thread and lifetime
 
@@ -2340,7 +2367,7 @@ run anywhere else. The storage examples hold the class of defect, not the instan
 ## Consumers
 
 TRA-5 attaches the Lua request endpoint through the settlement seam. TRA-9 and the
-view adapters supply view demand and consume snapshots. The temporary store
-(TRA-20–TRA-23) replaces the RAM-only retention. Input, camera and picking
-implementation, GPU upload and retirement, arena artwork, disk persistence, general
-gameplay state and `api.state` are not part of this package.
+view adapters supply view demand and consume snapshots. The package owns each arena's
+session-only reserved store; cross-run saves, root recovery and a public save format are
+not part of it, nor are input, camera and picking implementation, GPU upload and
+retirement, arena artwork, general gameplay state and `api.state`.
