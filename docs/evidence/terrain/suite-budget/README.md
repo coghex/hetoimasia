@@ -2,7 +2,8 @@
 
 `terrain-runtime-tests` (group `test.terrain-runtime`) runs the temporary store's long families at a bounded, fixed
 representative of their parameters, builds every large fixture when the first example reads it, and runs its pure families in
-parallel; `terrain-runtime-full-depth-tests` (group `test.terrain-runtime-full-depth`, an optional probe) runs the same
+parallel, in one executable with one "Finished in" line; `terrain-runtime-full-depth-tests` (group `test.terrain-runtime-full-depth`, an optional probe)
+is the second test component, by the owner's decision (issue comment 6872272575), and runs the same
 families at their complete original parameters. Base `19bc8ade`, head `9a1b7ff5`, GHC 9.14.1 (PATH `$HOME/.cache/hetoimasia/toolchain/ghc-9.14.1/bin`),
 machine Apple M3 Max (16 cores). Every figure is a lab observation; CI figures are from the CI record.
 
@@ -108,9 +109,9 @@ Per module and per example of 1 s or more, Hspec `--times` of the single-job rou
 | 17.3 | 1.6 | `Store/Rebalance.hs:545` keeps the tree legal and complete through random histories o | reduced | protected family; height 3 reach kept: 1 seed of 2, 5,000 operations of 14,000 |
 | 14.1 | 3.8 | `Store/Large.hs:225` drains thousands of small retirement entries without the loo | reduced | protected family: 1,300 pinned commits of 3,000 |
 | 12.9 | 1.3 | `Store/Scattered.hs:329` refuses jumps shorter and longer than the span checked in ev | reduced | protected family: forged jump 65 of 8 |
-| 12.2 | 10.8 | `Store/Scattered.hs:498` drains by spilling first, then finishes an entry whose delet | kept | direct regression, requirement 3(a): titled round 14, one exact sequence with exact counts (270-page entry, list at exactly looseCap, 64 spills, 462 transactions), the closing of a finding that came from the manager's pre-check of 4d4146c2, not from the reviewer's input; unchanged |
+| 12.2 | 10.8 | `Store/Scattered.hs:498` drains by spilling first, then finishes an entry whose delet | kept | owner exception to requirement 4 (issue comment 6872272575): kept whole in both tiers; not a direct regression under 3(a), its input came from the manager's pre-check of 4d4146c2, not from the reviewer's; one exact sequence with exact counts (270-page entry, list at exactly looseCap, 64 spills, 462 transactions); unchanged |
 | 11.9 | 5.4 | `Store/Trees.hs:57` splits leaves, internal pages and the root, and merges them  | reduced | class `grown >= 3` kept: 33 by 33 columns of 41 by 41 (side 16 of 20; 14 does not reach it) |
-| 10.8 | 10.4 | `Storage/Memory.hs:783` a qualified-filesystem name that is a short slice of a large | kept | requirement 4 met by time: the 2 MiB inputs are filled in place (BC.replicate) instead of packed from a String; same bytes, K = 24, same rules; 10.4 s -> 8 ms |
+| 10.8 | 10.4 | `Storage/Memory.hs:783` a qualified-filesystem name that is a short slice of a large | kept | owner exception to requirement 4 (issue comment 6872272575): the two 2 MiB buffers are built with BC.replicate instead of packed from a String; same bytes, K = 24, same rules and controls; 10.4 s -> 8 ms |
 | 10.5 | 5.7 | `Store/Evidence.hs:72` grows to several levels and gives them back | reduced | class `grown >= 3` kept: side 16 of 20 |
 | 9.7 | 9.5 | `Store/Scattered.hs:229` makes progress through the public API with the real limits,  | kept | a single scenario with no parameter; protects the drain controls |
 | 9.5 | 1.6 | `Store/Fuzz.hs:235` reads every record exactly or fails as corrupt, over fixed s | reduced | protected family: 1 seed of 6 |
@@ -207,11 +208,11 @@ Requirement 6, the union: all 829 example titles of the base run appear in the r
 The direct regressions of requirement 3(a), all unchanged by the diff (head locations): `Rebalance.hs:86` (round 10), `:161`
 (the round-14 reproduction), `:273` (the round-15 sequence); `Protocol.hs:188` (the reviewer's repro at limits 1, 2, 3);
 `Scattered.hs:271` (the reviewer's entry: 270 dispersed pages, progress 269) and the round-11 boundary examples (64 dispersed
-updates against 68 bookkeeping pages); `History.hs:156` (round 8: a reclaimed prefix reused and retired again);
-`Scattered.hs:498` (round 14, a loose list at exactly its cap), on the basis of requirement 3(a)'s own parenthesis: it cites a
-review round, encodes one exact sequence with exact counts (the 270-page entry, the list at exactly `looseCap`, 64 spills,
-462 transactions), and the record files it under round 14 as the closing of a finding; that finding came from the manager's pre-check of
-`4d4146c2`, not from the reviewer's input, and the reviewer may read it otherwise. Reduced examples whose titles cite a round or a
+updates against 68 bookkeeping pages); `History.hs:156` (round 8: a reclaimed prefix reused and retired again). `Scattered.hs:498` (round 14, a loose list at exactly its
+cap) is not one of them: it is kept whole in both tiers by the owner's decision (issue comment 6872272575) as an exception to
+requirement 4, and its input came from the manager's pre-check of `4d4146c2`, not from the reviewer's. Its sequence is exact: the
+270-page entry, the list at exactly `looseCap`, 64 spills, 462 transactions.
+Reduced examples whose titles cite a round or a
 reviewer keep the exact sequence whole elsewhere: `Rebalance.hs:244` ("the reviewer's shape, many sizes") -> `:273`;
 `Scattered.hs:285` (round 13 progress points) -> point 269 is the reviewer's entry, run whole at `:271`; `:337` and `:353`
 (round 13) name no reviewer input, their routine jump 65 and 16 pins are members of the generated families; `Protocol.hs:274`
@@ -220,7 +221,8 @@ reviewer keep the exact sequence whole elsewhere: `Rebalance.hs:244` ("the revie
 Kept examples of 3 s or more: the memory rows (`Store/Memory.hs`, `Storage/Memory.hs`) measure the whole process with their own
 rules and run alone on one capability; the exact-256-page examples need 15,600 runs; `Scattered.hs:229` (9.7 s at base) is a single
 scenario with no parameter and under 10 s. `Storage/Memory.hs:783` took 10.8 s at base because its two 2 MiB inputs were
-packed from Strings (K and the rules were never the cost); they are filled in place, the same bytes, and it takes 8 ms, with
+packed from Strings (K and the rules were never the cost); by the owner's decision (issue comment 6872272575) they are built
+with `BC.replicate`, an exception to requirement 4: the same bytes, K = 24, the same rules, and it takes 8 ms instead of 10.4 s, with
 the three copy-undone controls (62, 63, 64) still failing their rows and the baseline passing.
 
 ## Safeguard of requirement 3(c)
