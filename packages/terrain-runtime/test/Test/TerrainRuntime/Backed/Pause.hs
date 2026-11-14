@@ -2,7 +2,7 @@
 -- terrain stays readable, its new removals settle at once with the recorded fault, and another
 -- arena of the same session keeps committing. Faults are injected at the native seam, so a real
 -- worker meets a real failure.
-module Test.TerrainRuntime.Backed.Pause (spec) where
+module Test.TerrainRuntime.Backed.Pause (spec, fullSpec) where
 
 import Control.Concurrent.STM (atomically, check, readTVar, retry)
 import Control.Exception (finally)
@@ -13,7 +13,11 @@ import Hetoimasia.Terrain.Runtime
 import Hetoimasia.Terrain.Runtime.Settlement
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Native (NativeOp (..))
 import Hetoimasia.Terrain.Runtime.Store.Admission (Ledger (..))
+import Hetoimasia.Terrain.Runtime.Store (StoreSpec (..))
+import Hetoimasia.Terrain.Runtime.Store.Internal.Format (pageSize)
+import Hetoimasia.Terrain.Runtime.Store.Internal.State (maxClaimPages, reservePages)
 import Test.TerrainRuntime.Output (printLine)
+import Test.TerrainRuntime.Store.Depth (Depth (..), atDepth)
 import Test.Hspec
 import Test.TerrainRuntime.Fixtures
 import qualified Test.TerrainRuntime.Storage.Harness as H
@@ -53,13 +57,29 @@ spec = describe "A paused arena" $ do
       statusStorage status `shouldBe` StoragePaused [CondIntegrity]
       settleChecks svc
 
-  -- storage_full through the real path (requirement 8): a reader pins an old
-  -- version (its page read held at the seam, once), so the pages each later commit retires cannot be
-  -- reclaimed; buried removals then fill the 64 MiB allowance until the planner finds the transaction
-  -- no longer fits beside the protected reclamation reserve.
+  storageFull Routine
+
+-- | The storage_full trace at its whole size: the default overhead, so buried removals fill the
+-- whole 64 MiB allowance (about 2,945 of them).
+fullSpec ∷ Spec
+fullSpec = describe "A paused arena (full depth)" (storageFull Full)
+
+-- | storage_full through the real path (requirement 8): a reader pins an old version (its page read
+-- held at the seam, once), so the pages each later commit retires cannot be reclaimed; buried
+-- removals then fill the arena's usable pages until the planner finds the transaction no longer fits
+-- beside the protected reclamation reserve. The routine suite runs the same trace on a store whose
+-- overhead leaves 128 pages beyond the least the store accepts (the reserve, one largest claim and
+-- one page), so it fills after a few dozen removals; the full depth fills the whole allowance at
+-- the default overhead. Every assertion is the same at both.
+storageFull ∷ Depth → Spec
+storageFull depth =
   it "pauses the arena storage_full when its allowance cannot take the next transaction, keeps its terrain readable, and grows out of it" $ do
     probe ← H.newProbe
-    withServiceSeam quiet defaultConfig alwaysAdmitting noProbe (H.seamFor probe) $ \svc → do
+    let allowance = 64 * 1024 * 1024 ∷ Integer
+        usable = toInteger reservePages + toInteger maxClaimPages + 1 + 128
+        overhead = atDepth depth (Just (allowance - usable * toInteger pageSize)) Nothing
+        config = defaultConfig {configStore = (configStore defaultConfig) {specAllowanceBytes = allowance, specOverheadBytes = overhead}}
+    withServiceSeam quiet config alwaysAdmitting noProbe (H.seamFor probe) $ \svc → do
       (client, lease) ← openMain svc "main"
       _ ← removeCell' svc lease (tile 0 0 (-32))
       -- nothing else reads now (internal work after that commit has finished), so the one held read is
