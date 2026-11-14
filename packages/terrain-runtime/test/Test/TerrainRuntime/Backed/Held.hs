@@ -27,7 +27,7 @@ import Hetoimasia.Terrain.Runtime.Storage.Internal.Native (NativeOp (..))
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Service (maxRecordControlBytes)
 import qualified Hetoimasia.Terrain.Runtime.Store.Internal.Admission as A
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan (RamCharge (..))
-import System.IO (hPutStrLn, stderr)
+import Test.TerrainRuntime.Output (printLine)
 import Test.Hspec
 import Test.Support.Bounded (bounded)
 import Test.TerrainRuntime.Fixtures
@@ -79,7 +79,7 @@ heldCase ending = do
         loop = freeControl >>= \free → if done free then pure free else cycleOnce >> loop
     free ← loop
     n ← readIORef cycles
-    hPutStrLn stderr ("held closes example (" <> show ending <> "): " <> show n <> " held closes, free control " <> show free <> " against a transaction's " <> show txnControl)
+    printLine ("held closes example (" <> show ending <> "): " <> show n <> " held closes, free control " <> show free <> " against a transaction's " <> show txnControl)
     case ending of
       RefusedWithNothingInFlight → (free >= txnControl) `shouldBe` True
       NeverFunded → pure ()

@@ -13,7 +13,7 @@ import Hetoimasia.Terrain.Runtime
 import Hetoimasia.Terrain.Runtime.Settlement
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Native (NativeOp (..))
 import Hetoimasia.Terrain.Runtime.Store.Admission (Ledger (..))
-import System.IO (hPutStrLn, stderr)
+import Test.TerrainRuntime.Output (printLine)
 import Test.Hspec
 import Test.TerrainRuntime.Fixtures
 import qualified Test.TerrainRuntime.Storage.Harness as H
@@ -107,7 +107,7 @@ spec = describe "A paused arena" $ do
         -- the record for the evidence: how many commits, and the edit bank's peaks among them
         limits ← atomically (inspectEditBankSTM svc)
         (peakCache, peakStaging, peakControl) ← readIORef peaks
-        hPutStrLn stderr ("storage_full trace: " <> show committed <> " removals committed; edit bank peaks after a commit (bytes): cache " <> show peakCache <> " of " <> show (lgCacheLimit limits) <> ", staging " <> show peakStaging <> " of " <> show (lgStagingLimit limits) <> ", control " <> show peakControl <> " of " <> show (lgControlLimit limits))
+        printLine ("storage_full trace: " <> show committed <> " removals committed; edit bank peaks after a commit (bytes): cache " <> show peakCache <> " of " <> show (lgCacheLimit limits) <> ", staging " <> show peakStaging <> " of " <> show (lgStagingLimit limits) <> ", control " <> show peakControl <> " of " <> show (lgControlLimit limits))
         status ← arenaStatus svc lease >>= expectRight
         statusStorage status `shouldBe` StoragePaused [CondCapacity]
         -- what was committed stays readable; a new removal settles at once with the same fault
