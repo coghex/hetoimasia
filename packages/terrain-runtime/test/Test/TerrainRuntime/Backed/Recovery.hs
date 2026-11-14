@@ -60,14 +60,21 @@ pausedOn svc lease = do
     StorageReady → []
 
 -- | A service whose backend's native calls pass a harness probe, with one arena whose store holds
--- history in many columns (so its tree has pages beyond the header, and a read of column (3, 4)
--- reads the header and then the tree's pages).
+-- history in 256 columns (so its tree has several pages, and a read of column (3, 4) reads more than
+-- one).
+withTree ∷ (H.Probe → Service → ArenaLease → IO ()) → IO ()
+withTree = withArenaOf [(x, y) | x ← [0 .. 15], y ← [0 .. 15]]
+
+-- | One removal at (3, 4, 5): a read of column (3, 4) reads the store's one page.
 withArena ∷ (H.Probe → Service → ArenaLease → IO ()) → IO ()
-withArena body = do
+withArena = withArenaOf [(3, 4)]
+
+withArenaOf ∷ [(Integer, Integer)] → (H.Probe → Service → ArenaLease → IO ()) → IO ()
+withArenaOf columns body = do
   probe ← H.newProbe
   withServiceSeam quiet defaultConfig alwaysAdmitting noProbe (H.seamFor probe) $ \svc → do
     (_, lease) ← openMain svc "main"
-    mapM_ (\(x, y) → removeCell' svc lease (tile x y 5)) [(x, y) | x ← [0 .. 15], y ← [0 .. 15]]
+    mapM_ (\(x, y) → removeCell' svc lease (tile x y 5)) columns
     waitFor (backedAtRestSTM svc >>= check)
     body probe svc lease
 
@@ -97,7 +104,7 @@ retryAnswer svc lease = retryArena svc lease >>= expectRight >>= bounded . await
 spec ∷ Spec
 spec = describe "Recovery decided like publication" $ do
   it "keeps both of two pages that failed, and does not certify the condition while either still fails" $
-    withArena $ \probe svc lease → do
+    withTree $ \probe svc lease → do
       -- the header page fails first, then (while paused, reads go on) another page of the tree
       pages ← pagesRead probe svc lease (tile 3 4 6)
       (first, lastPage) ← case pages of
@@ -138,7 +145,7 @@ spec = describe "Recovery decided like publication" $ do
       pure ()
 
   it "keeps no more than eight failures of a condition, and then answers it remaining until the arena is closed, never probing it" $
-    withArena $ \probe svc lease → do
+    withTree $ \probe svc lease → do
       -- a second run in every column: the tree has more leaves
       mapM_ (\(x, y) → removeCell' svc lease (tile x y 2)) [(x, y) | x ← [0 .. 15], y ← [0 .. 15]]
       waitFor (backedAtRestSTM svc >>= check)
@@ -238,7 +245,7 @@ spec = describe "Recovery decided like publication" $ do
       settledOf host >>= (`shouldSatisfy` \case [Succeeded (ARetried _)] → False; _ → True)
 
   it "drops a probe whose condition recorded a new failure while it was in flight, and answers on the record as it is then" $
-    withArena $ \probe svc lease → do
+    withTree $ \probe svc lease → do
       pages ← pagesRead probe svc lease (tile 3 4 6)
       (first, lastPage) ← case pages of
         a : rest@(_ : _) → pure (a, last rest)
