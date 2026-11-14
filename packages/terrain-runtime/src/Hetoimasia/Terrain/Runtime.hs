@@ -127,6 +127,7 @@ module Hetoimasia.Terrain.Runtime
   , inspectSnapshotBytes
   , inspectRetainedChargesSTM
   , inspectLimits
+  , inspectLimitsSTM
   , inspectConfig
   , LimitRow (..)
   , inspectCensusSTM
@@ -655,6 +656,10 @@ inspectConfig = serviceConfig
 -- is still borrowed counts against the arena limit until its retirement completes.
 inspectLimits ∷ Service → IO [LimitRow]
 inspectLimits svc = limitRows (serviceConfig svc) <$> readTVarIO (serviceState svc)
+
+-- | 'inspectLimits' in a transaction, so a caller can wait for a count (read-only).
+inspectLimitsSTM ∷ Service → STM [LimitRow]
+inspectLimitsSTM svc = limitRows (serviceConfig svc) <$> readTVar (serviceState svc)
 
 -- | What the service itself holds, read from its own data structures and not from the
 -- accounting model: for every arena it keeps (live, and retiring while a borrowed

@@ -5,7 +5,7 @@
 -- before it settles, a revoked lease until it is released.
 module Test.TerrainRuntime.Limits (spec) where
 
-import Control.Concurrent.STM (atomically, check, readTVar, retry)
+import Control.Concurrent.STM (STM, atomically, check, readTVar, retry)
 import Control.Exception (finally)
 import Control.Monad (forM_, void)
 import Hetoimasia.Terrain.Coordinate (decomposeTile)
@@ -34,6 +34,14 @@ arenasRow svc =
   inspectLimits svc >>= \rows → case filter ((== "arenas") . limitRowName) rows of
     row : _ → pure row
     [] → expectationFailure "no arena limit row" >> fail "no arena limit row"
+
+-- | The arena limit's count, in a transaction.
+arenasCountedSTM ∷ Service → STM Word
+arenasCountedSTM svc = maybe 0 (fromIntegral . limitRowCounted) . lookupRow <$> inspectLimitsSTM svc
+  where
+    lookupRow rows = case [r | r ← rows, limitRowName r == "arenas"] of
+      r : _ → Just r
+      [] → Nothing
 
 counted ∷ Service → IO (Word, Word)
 counted svc = (\r → (fromIntegral (limitRowCounted r), fromIntegral (limitRowMax r))) <$> arenasRow svc
@@ -65,8 +73,10 @@ spec = describe "Service-wide limits count every state that holds the resource" 
         refusedWith <$> openArena svc client "third" soilOverStone >>= (`shouldBe` Just (RefusedBusy BusyArenas))
         counted svc `shouldReturn` (2, 2)
       either (\r → expectationFailure (show r)) pure outcome
-      -- The borrow is returned, the retirement completes, and the place is free.
+      -- The borrow is returned, the retirement completes, the closed arena's file is closed (its
+      -- backing's record is charged until then), and the place is free.
       waitFor $ inspectModelSTM svc >>= \m → check (length (modelArenas m) == 1)
+      waitFor (arenasCountedSTM svc >>= check . (== 1))
       counted svc `shouldReturn` (1, 2)
       third <- okOf (openArena svc client "third" soilOverStone) >>= await svc >>= expectSuccess
       _ <- readCell svc third (tile 1 1 1)
@@ -99,6 +109,8 @@ spec = describe "Service-wide limits count every state that holds the resource" 
           -- Exactly one borrow was returned; three are outstanding.
           waitFor $ inspectModelSTM svc >>= \m → check (length (modelArenas m) == 3)
           retiring `shouldReturn` 3
+          -- and its file is closed: until then its backing's record is charged and the place counted
+          waitFor (arenasCountedSTM svc >>= check . (== 3))
           counted svc `shouldReturn` (3, 4)
           replacement <- okOf (openArena svc client "incarnation-5" soilOverStone) >>= await svc >>= expectSuccess
           counted svc `shouldReturn` (4, 4)
@@ -109,6 +121,7 @@ spec = describe "Service-wide limits count every state that holds the resource" 
         _ → expectationFailure "four leases expected" >> fail "four leases expected"
       flatten outcome
       waitFor $ inspectModelSTM svc >>= \m → check (null (modelArenas m))
+      waitFor (arenasCountedSTM svc >>= check . (== 0))
       counted svc `shouldReturn` (0, 4)
       settleChecks svc
 
