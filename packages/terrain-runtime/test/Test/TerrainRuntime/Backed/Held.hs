@@ -95,8 +95,10 @@ heldCase ending = do
         named = [t | OwnerDefect t ← defects, expected `isInfixOf` Text.unpack t, ("held closes: " <> show n) `isInfixOf` Text.unpack t]
     (defects, length named) `shouldSatisfy` ((>= 1) . snd)
     writeIORef bodyDone True
-  readIORef bodyDone `shouldReturn` True
+  finished ← readIORef bodyDone
   case ended of
-    Left (failure ∷ SomeException) | "BackingCloseRaised" `isInfixOf` show failure → pure ()
-    Left failure → throwIO failure
+    -- the body's own failure (a bounded wait that expired) is the one reported
+    Left (failure ∷ SomeException)
+      | finished, "BackingCloseRaised" `isInfixOf` show failure → pure ()
+      | otherwise → throwIO failure
     Right () → expectationFailure "the held closes were not reported when the storage service's scope ended"
