@@ -4,7 +4,7 @@
 representative of their parameters, builds every large fixture when the first example reads it, and runs its pure families in
 parallel, in one executable with one "Finished in" line; `terrain-runtime-full-depth-tests` (group `test.terrain-runtime-full-depth`, an optional probe)
 is the second test component, by the owner's decision (issue comment 6872272575), and runs the same
-families at their complete original parameters. Base `19bc8ade`, code head `7ec6fd45` (the acceptance record below; the earlier figures name their head), GHC 9.14.1 (PATH `$HOME/.cache/hetoimasia/toolchain/ghc-9.14.1/bin`),
+families at their complete original parameters. Base `19bc8ade`, code head `428a6625` (the acceptance record below; the earlier figures name their head), GHC 9.14.1 (PATH `$HOME/.cache/hetoimasia/toolchain/ghc-9.14.1/bin`),
 machine Apple M3 Max (16 cores). Every figure is a lab observation; CI figures are from the CI record.
 
 ```sh
@@ -14,16 +14,16 @@ cabal test --project-file cabal.project.cpu hetoimasia-terrain-runtime:terrain-r
 
 ## Results
 
-**Acceptance record, code head `7ec6fd45`** (the suite is 838 examples: the 828 of the earlier heads and the 10 of the oracle of the printed lines), 2026-11-14 06:23Z to 06:31Z, the built tree, nothing built in any run (no `Compiling` or `Linking` line), no other build or test of this repository running. `/usr/bin/time -p` around the literal acceptance command below; every run exited 0 with 0 failures, 8 jobs on 8 capabilities (`RUNNER jobs=8 capabilities=8`, `PHASE sequential: 1 capability`). The load is as observed, not quiet: a sampler recorded every 5 s any process over 50% CPU other than the suite and `fseventsd`, and any compiler of any project; another project's `cargo test` ran beside every run.
+**Acceptance record, code head `428a6625`** (the suite is 856 examples: the 828 of the earlier heads and the 28 of the oracle of the printed lines), 2026-11-14 07:09Z to 07:17Z, the built tree, nothing built in any run (no `Compiling` or `Linking` line), no other build or test of this repository running. `/usr/bin/time -p` around the literal acceptance command below; every run exited 0 with 0 failures, 8 jobs on 8 capabilities (`RUNNER jobs=8 capabilities=8`, `PHASE sequential: 1 capability`). The load is as observed, not quiet: a sampler recorded every 5 s any process over 50% CPU other than the suite and `fseventsd`, and any compiler of any project; another project's `cargo test` ran beside every routine run.
 
 | Run | Load before | Wall s | "Finished in" s | CPU user s | Samples | What the samples show |
 | --- | ---: | ---: | ---: | ---: | ---: | --- |
-| routine 1 | 13.73 | 145.58 | 143.37 | 270.9 | 94 | another project's `cargo test` and its test binaries, a `clang`, a `cargo build` |
-| routine 2 | 11.88 | 137.17 | 135.63 | 266.9 | 49 | another project's `cargo test` and its test binaries |
-| routine 3 | 7.91 | 144.43 | 142.94 | 273.5 | 53 | another project's `cargo test` |
-| no example selected | 11.37 | 1.79 | 0.0001 | 1.57 | 0 | |
+| routine 1 | 11.20 | 141.80 | 138.40 | 264.6 | 89 | another project's `cargo test` and its test binaries, `mds` |
+| routine 2 | 10.96 | 142.04 | 140.50 | 267.0 | 100 | another project's `cargo test` and its test binaries, `mds` |
+| routine 3 | 9.80 | 150.52 | 148.97 | 269.3 | 133 | another project's `cargo test` and its test binaries |
+| no example selected | 14.01 | 1.84 | 0.0001 | 1.58 | 1 | one other process |
 
-Each routine run is within the 240 s budget (the worst by 94.4 s) and the no-example run within 10 s. The full-depth probe, one run at this head beside other agents' test runs (load 5.6 to 11, not a budgeted run): 96 examples, 0 failures, "Finished in" 1004.86 s, wall 1004.88 s, CPU user 997.2 s. The documented selection `--match "TRA-20 evidence"` runs 8 examples with 0 failures in each executable, prints 23 `EVIDENCE` lines (routine) and 29 (full depth), and every one starts a line; the 29 of the full-depth executable equal the 29 `EVIDENCE` lines of `tra20/README.md` byte for byte except three allocation counters (`allocation a one-record edit plan`, `a pinned point read` and the control map), which moved by under 3 percent between runs. All `EVIDENCE`, `MEMORY` and `memory ...` records of the four runs and of the full-depth run start a line.
+Each routine run is within the 240 s budget (the worst by 89.5 s) and the no-example run within 10 s. The full-depth probe, one run at the code head `7ec6fd45` (the later changes touch the oracle and, only when progress text is reported, the line state; the probe does not run the oracle) beside other agents' test runs (load 5.6 to 11, not a budgeted run): 96 examples, 0 failures, "Finished in" 1004.86 s, wall 1004.88 s, CPU user 997.2 s. The documented selection `--match "TRA-20 evidence"` runs 8 examples with 0 failures in each executable, prints 23 `EVIDENCE` lines (routine) and 29 (full depth), and every one starts a line; the 29 of the full-depth executable equal the 29 `EVIDENCE` lines of `tra20/README.md` byte for byte except three allocation counters (`allocation a one-record edit plan`, `a pinned point read` and the control map), which moved by under 3 percent between runs. All `EVIDENCE`, `MEMORY` and `memory ...` records of the four runs above and of the full-depth run start a line.
 
 The earlier windows follow, at the heads they name (828 examples, before the oracle).
 
@@ -71,18 +71,19 @@ Window 2, 2026-11-14 01:30Z to 01:39Z, head `9a1b7ff5` (the suites' sources are 
 | q5 | 5.15 | 128.60 | 127.03 | 260.5 | 9 | a `cargo build` with a `clang` at one core |
 | q6 | 5.32 | 132.26 | 130.77 | 259.3 | 23 | python `unittest`, a python chat tool, a `pijul clone`, `mds` |
 
-All three sets of local runs agree to within about 10 percent (the executable boundary 121.0 to 123.3 s, the cabal boundary under load 127.4 to 135.6 s, the six sampled runs 128.6 to 132.8 s) and the loads differ by a factor of two; every one is 104 s or more under the 240 s budget. The six sampled runs are the acceptance figures of item 2 that the owner's decision of 2026-11-14 names (a daily-use machine cannot be made quiet; "if each run is under budget they pass"; issue comment 6870133533), at the head they were taken (828 examples): a run passes when it is within the budget, no quiet condition applies, and each run's load is stated as observed. After the suite gained the 10 examples of the oracle of the printed lines, the item was taken again at the code head `7ec6fd45` under the same rule, the three runs above; every run of both sets is within the budget. The executable-boundary and first cabal-boundary sets are observations.
+All three sets of local runs agree to within about 10 percent (the executable boundary 121.0 to 123.3 s, the cabal boundary under load 127.4 to 135.6 s, the six sampled runs 128.6 to 132.8 s) and the loads differ by a factor of two; every one is 104 s or more under the 240 s budget. The six sampled runs are the acceptance figures of item 2 that the owner's decision of 2026-11-14 names (a daily-use machine cannot be made quiet; "if each run is under budget they pass"; issue comment 6870133533), at the head they were taken (828 examples): a run passes when it is within the budget, no quiet condition applies, and each run's load is stated as observed. After the suite gained the examples of the oracle of the printed lines, the item was taken again at the final code head `428a6625` under the same rule, the three runs above (an intermediate head, `7ec6fd45` with 838 examples, gave 145.6, 137.2 and 144.4 s); every run of all these sets is within the budget. The executable-boundary and first cabal-boundary sets are observations.
 
-Budget (owner decision 2026-11-13): 240 s whole process locally, 300 s CI "Finished in", 10 s no-example. Headroom locally at the cabal boundary: 94 s in the worst of the three runs at the code head (145.6 s); at the earlier heads 104 s at 8 jobs under load (107 s in the six sampled runs) and 92 s at 4 jobs.
+Budget (owner decision 2026-11-13): 240 s whole process locally, 300 s CI "Finished in", 10 s no-example. Headroom locally at the cabal boundary: 89 s in the worst of the three runs at the code head (150.5 s); at the earlier heads 104 s at 8 jobs under load (107 s in the six sampled runs) and 92 s at 4 jobs.
 
-**CI** (acceptance item 9; the runner has 4 processors, so the default is 4 jobs, `RUNNER jobs=4 capabilities=4 (processors 4)`, then `PHASE sequential: 1 capability`). Two validation runs of this branch, on identical code (their heads differ by the one catalog line that fixed the workflow guard):
+**CI** (acceptance item 9; the runner has 4 processors, so the default is 4 jobs, `RUNNER jobs=4 capabilities=4 (processors 4)`, then `PHASE sequential: 1 capability`). Three validation runs of this branch (the first two on identical code, their heads differing by the one catalog line that fixed the workflow guard; the third at `12c29156`, with the oracle of the printed lines, which failed under CI's colour and was then repaired):
 
 | Run (head) | `terrain-runtime-tests` "Finished in" | `haskell-engine` job | Cache | `test.terrain` | `test.terrain-render-2d` |
 | --- | ---: | ---: | --- | ---: | ---: |
 | 43540991554 (`9a1b7ff5`), validation green | 128.13 s | 01:32:34Z to 01:40:25Z, 7 min 51 s | package store and build tree: hit on the exact key; no `Compiling` line in the job | 40.81 s | 66.54 s |
 | 43539809123 (`83f14cc9`), `haskell-workflow` red (the owned-start guard, fixed by `9a1b7ff5`), `haskell-engine` green | 227.84 s | 01:19:06Z to 01:31:58Z, 12 min 52 s | both: hit on a restore key (a partial match), 28 `Compiling` lines in the job | 72.74 s | 135.82 s |
+| 43567093134 (`12c29156`), `haskell-engine` red (the oracle's colour cases, repaired after it) | 244.18 s (838 examples, 7 failures) | 06:35:55Z to 06:48:33Z, 12 min 38 s | both: hit on a restore key, 17 `Compiling` lines in the job | 69.86 s | 134.85 s |
 
-The cache state does not explain the difference in the suite's own time, since compilation is outside "Finished in". What the logs show is a slower runner in the second run: the two groups this change does not touch ran 1.78 times and 2.04 times slower (`test.terrain` 40.81 to 72.74 s, `test.terrain-render-2d` 66.54 to 135.82 s), against 1.78 times for `terrain-runtime-tests`; the runner image and version are the same (20261103.629, 2.338.2). Both runs are under 300 s; CI headroom for the next suite additions is 300 minus the worse figure, 72 s. The two groups of acceptance item 8 (`terrain-tests`, 905 examples; `terrain-render-2d-tests`, 558) passed in both runs.
+The cache state does not explain the difference in the suite's own time, since compilation is outside "Finished in". What the logs show is a slower runner in the second and third runs: the two groups this change does not touch ran 1.78 and 2.04 times slower in the second (`test.terrain` 40.81 to 72.74 s, `test.terrain-render-2d` 66.54 to 135.82 s) and 1.71 and 2.03 times slower in the third (69.86 s, 134.85 s), against 1.78 and 1.91 times for `terrain-runtime-tests`; the runner version is the same in all three (2.338.2). All three are under 300 s; CI headroom for the next suite additions is 300 minus the worst figure, 244.18 s, which is 55.8 s. The two groups of acceptance item 8 (`terrain-tests`, 905 examples; `terrain-render-2d-tests`, 558) passed in all three runs.
 
 ## Where the time went, base to routine
 
@@ -346,23 +347,38 @@ the `progress` formatter writes a dot and no newline, so a line printed after it
 | started | one empty line | one empty line | nothing | nothing |
 | group started | the group's name and a newline | the same | nothing | nothing |
 | group done | nothing | nothing | nothing | nothing |
-| progress, item started | on a terminal only: transient text, then an erase-line that is buffered (the line is empty again) | on a terminal only: the transient count | nothing | nothing |
+| progress, item started | when progress is reported only: transient text, then an erase that is held back (a terminal shows an empty line) | when progress is reported only: the transient count | nothing | nothing |
 | item done | the requirement, the symbol and `]` with a newline; each info and pending line with a newline | the requirement with a newline; each info and pending line with a newline | nothing | nothing |
 | done | the failure report and the two footer lines, each with a newline | the same | the same | nothing |
 
+Progress is reported when colour is on and neither GitHub Actions nor Buildkite is detected (in practice on a terminal). Then the
+runner hides the cursor before the first event, and an item's start or progress leaves transient text and a held-back erase on the
+line; so after those the record says the line is open, and a line printed to a handle that is not a terminal begins with a newline
+(on a terminal, with the erase), which makes it start a line of the file. Where progress is not reported nothing changes: the
+catalog command's output is byte for byte what it was without the rule (compared on the oracle, `--match "TRA-20 evidence"` and
+the no-example selections, locally and under `GITHUB_ACTIONS=true`, apart from the time and the allocation counters).
+
 The oracle (`Test.TerrainRuntime.OutputSpec`, sequential, holding the output lock while it redirects standard output to a file)
-runs a parallel spec through `suiteConfig`, the configuration `Main` builds, at 8 jobs on 8 capabilities: 120 examples printing 20
-records each (2,400 records beside 120 item lines), once per formatter (default, `specdoc`, `progress`, `failed-examples`,
-`silent`). It asserts every record is a whole line at a line start and appears exactly once, every other line is one the
-formatter writes whole, the item lines are exactly 1 to 120 (the dots 120, the footer `120 examples, 0 failures`). A second case
-follows the group with 100 sequential examples in 25 pairs of nested describes, each writing 3 records directly with `putStrLn`,
-for the four boundary formatters: the same assertions; it passed in 6 runs of the whole oracle and in 3 runs at six times the
-size (600 sequential examples, 2,400 direct records). The checker itself is tested on a record joined to a partial formatter
-line, a cut record, a missing one, a repeated one, a stray fragment and a direct record joined to an item line.
+runs a parallel spec through the configuration of `Runner.pinnedConfig` (the suite's defaults with the formatter, colour, unicode
+and job count given), at 8 jobs on 8 capabilities: 120 examples printing 20 records each (2,400 records beside 120 item lines),
+once per formatter (default, `specdoc`, `progress`, `failed-examples`, `silent`) and in each of three modes: colour off; colour on
+as GitHub Actions sets it (no progress text); colour on with progress text, compared as a terminal shows it. It takes nothing from
+its environment: no `.hspec` file, no `HSPEC_*` variable, no command line, and `GITHUB_ACTIONS` and `BUILDKITE` pinned for the run
+(it passes under `GITHUB_ACTIONS=true`, `NO_COLOR`, `BUILDKITE`, `HSPEC_*`, `HSPEC_OPTIONS`, a `.hspec` file and `LANG=C`, which
+the outer run reads and the nested runs do not). It asserts every record is a whole line at a line start and appears exactly once
+(in the progress mode also on the raw bytes), every other line is one the formatter writes whole, the item lines are exactly 1 to
+120 (the dots 120, the footer `120 examples, 0 failures`), and that a colour sequence, recognized by its form, is reset before the
+newline, so an event ends at a line boundary. A second case follows a group of 40 parallel examples with 100 sequential examples
+in 25 pairs of nested describes, each writing 3 records directly with `putStrLn`, for the four boundary formatters in the three
+modes: the same assertions (the direct records on the rendered capture in the progress mode: a file keeps them after their item's
+transient text, and they are #663's unedited writes); it passed in 6 runs of the whole oracle and in 3 runs at six times the size
+(600 sequential examples, 2,400 direct records). The checker itself is tested on a record joined to a partial formatter line, a
+cut record, a missing one, a repeated one, a stray fragment, a direct record joined to an item line, a coloured output (good, joined,
+reset after the newline, colour left on) and a record after transient text.
 
 Control (the code before this change, the formatter's events not under the lock): in each of 3 runs three of the five formatters
 fail. Malformed records of 2,400, by run: default 38, 23, 33 (and 27, 18, 21 broken formatter lines); `specdoc` 44, 9, 20;
-`progress` 87, 98, 102; `failed-examples` and `silent` write nothing per item and pass.
+`progress` 87, 98, 102; `failed-examples` and `silent` write nothing per item and pass. With the formatter's events not under the lock, the oracle as it is now fails 15, 15 and 14 of its 28 examples in 3 runs under `GITHUB_ACTIONS=true`, in all three modes, and with the progress rule off it fails the five examples of the progress mode on the raw bytes.
 
 What was delivered: two of the 20 retained logs of the runs above had a record on a formatter line (the 1-job run and one 4-job run,
 neither an acceptance run); every record was whole in itself, and no figure in this record came from either line.
