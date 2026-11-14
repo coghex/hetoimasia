@@ -409,9 +409,7 @@ pendingAcquisitions = countReqs (\req → isAcquisition req && not (isDone req))
 arenaUse ∷ St → Int
 arenaUse st =
   Map.size (stateArenas st)
-    -- a closed arena counts until its model retirement has completed AND its file is closed: the
-    -- backing's record is charged until then (it bounds the storage service's backing records)
-    + Set.size (Set.union (Map.keysSet (stateRetiring st)) (Map.keysSet (stateClosing st)))
+    + Map.size (stateRetiring st)
     + countReqs (\req → isOpenCmd req && not (isDone req)) st
     + orphanOpens st
 
@@ -439,7 +437,7 @@ data LimitRow = LimitRow
 -- snapshots it handed out), never the accounting model or the retained-bank ledger.
 limitRows ∷ Config → St → [LimitRow]
 limitRows config st =
-  [ LimitRow "arenas" (w (configMaxArenas config)) (w (arenaUse st)) (w (Map.size (stateArenas st)) + w (length (Set.toList (Set.fromList (Map.keys (stateRetiring st) <> Map.keys (stateClosing st))))) + w (length [() | ClaimPending _ ← Map.elems (stateNames st)]) + w (orphanOpens st))
+  [ LimitRow "arenas" (w (configMaxArenas config)) (w (arenaUse st)) (w (Map.size (stateArenas st)) + w (length (Map.keys (stateRetiring st))) + w (length [() | ClaimPending _ ← Map.elems (stateNames st)]) + w (orphanOpens st))
   , LimitRow "leases" (w (configMaxLeases config)) (w (leasesInUse st)) (sum [w (Set.size (clientLeases c)) | c ← Map.elems (stateClients st)] + w (length [() | req ← requestsAndGhosts, isAcquisition req, not (isDone req)]))
   , LimitRow "views" (w (configMaxViews config)) (w (Map.size (stateViews st))) (sum [w (Set.size (clientViews c)) | c ← Map.elems (stateClients st)])
   , LimitRow "clients" (w (configMaxClients config)) (w (Map.size (stateClients st))) (w (length (Map.keys (stateClients st))))

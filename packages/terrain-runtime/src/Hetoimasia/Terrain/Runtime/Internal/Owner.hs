@@ -391,7 +391,7 @@ readsYieldToGrant st adm sn = do
 -- room for it: no pinned read, no job of the storage service (the slot is free when this is asked).
 grantStuck ∷ St → A.Admission → Storage.Snapshot → STM Bool
 grantStuck st adm sn
-  | not (Map.null (stateGathers st)) || not (null (Storage.snJobs sn)) = pure False
+  | not (Map.null (stateGathers st)) || not (null (Storage.snJobs sn)) || not (Map.null (stateClosing st)) = pure False
   | otherwise = do
       candidates <- contenders st
       pure $ case candidates of

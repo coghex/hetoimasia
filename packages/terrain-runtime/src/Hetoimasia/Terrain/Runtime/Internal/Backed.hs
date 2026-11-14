@@ -363,6 +363,8 @@ notePressure svc = do
           || not (Map.null (stateGathers st))
           || isJust (stateSlot st)
           || any (openWaits . openPhase) (Map.elems (stateOpens st))
+          -- a closed arena whose file is still to close releases its backing's record when it does
+          || not (Map.null (stateClosing st))
       openWaits = \case
         OpenReserving {} → True
         OpenUnwinding _ (Just _) _ → True
