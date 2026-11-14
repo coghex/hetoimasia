@@ -13,9 +13,12 @@ import Control.Concurrent.STM
 import Control.Exception (finally)
 import Control.Monad (forM, forM_, void, when)
 import Data.Word (Word64)
-import Hetoimasia.Terrain.Runtime
+import Hetoimasia.Terrain.Runtime hiding (Snapshot)
 import Hetoimasia.Terrain.Runtime.Settlement
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Native (NativeOp (..))
+import Hetoimasia.Terrain.Runtime.Storage.Internal.Service (BackingSnap (..), HeldSnap (..), JobKind (..), JobSnap (..), SlotTag (..), Snapshot (..))
+import Hetoimasia.Terrain.Runtime.Store.Admission (Ledger (..))
+import qualified Data.Map.Strict as Map
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Types (Errno (..))
 import Test.Hspec
 import Test.TerrainRuntime.Fixtures
@@ -42,9 +45,67 @@ isReserve = \case OpReserveRange {} → True; _ → False
 isSetLength = \case OpSetFileLength {} → True; _ → False
 
 spec ∷ Spec
-spec = describe "Temporary pressure from the storage service" $
-  forM_ [minBound .. maxBound] $ \caller →
-    it ("keeps a " <> show caller <> " refused because the storage queue is full in its place, grants nothing again until capacity changes, and completes it once the queue drains") (pressureCase caller)
+spec = do
+  describe "Temporary pressure from the storage service" $
+    forM_ [minBound .. maxBound] $ \caller →
+      it ("keeps a " <> show caller <> " refused because the storage queue is full in its place, grants nothing again until capacity changes, and completes it once the queue drains") (pressureCase caller)
+  describe "The storage pressure mark" $
+    it "holds every field a refusal for pressure reads: the cure of each reason alone changes it" $ do
+      let base = markOf snapshot ledger
+      markOf snapshot ledger `shouldBe` base
+      forM_ cures $ \(cure, sn, l) → (cure, markOf sn l /= base) `shouldBe` (cure, True)
+
+-- | A storage service under pressure: a read running and a write queued (the mutation), a backing
+-- growing with an extra pending, a closing record, a presecured open, a held close, kept failures,
+-- and an edit bank with pinned cache.
+snapshot ∷ Snapshot
+snapshot =
+  Snapshot
+    { snJobs = [readJob, writeJob]
+    , snBackings = [backing]
+    , snClosing = 1
+    , snClosingCharged = 1
+    , snClosingRecs = []
+    , snOpening = [(9, Nothing)]
+    , snHeld = [HeldSnap 2 1 0 4]
+    , snWorkers = 2
+    , snAdmissionOpen = True
+    , snStopReason = Nothing
+    , snEvidence = 3
+    , snEvidenceDropped = 0
+    , snReserved = Map.empty
+    , snQueued = 8
+    , snRunning = 2
+    , snMutation = Just 8
+    , snBusyVolumes = 0
+    }
+
+readJob, writeJob ∷ JobSnap
+readJob = JobSnap {jsId = 7, jsKind = KRead 1, jsPhase = 2, jsBacking = Just 1, jsBorrowed = 0, jsPrepared = Nothing, jsHoldsResult = True, jsCharge = 4096, jsDelivered = False}
+writeJob = readJob {jsId = 8, jsKind = KWrite, jsPhase = 0, jsHoldsResult = False, jsCharge = 4096 + 112 + 512}
+
+backing ∷ BackingSnap
+backing = BackingSnap {bsId = 1, bsSlot = SlotRunning, bsPending = Just (128 * 1024 * 1024), bsReserved = 64 * 1024 * 1024, bsAllocated = 64 * 1024 * 1024, bsVolume = 1, bsBorrows = 0, bsClosing = False, bsFd = 3}
+
+ledger ∷ Ledger
+ledger = Ledger {lgCacheLimit = 50331648, lgCacheBacked = 100000, lgCacheRamOnly = 20000, lgCachePinned = 60000, lgStagingLimit = 8388608, lgStagingForeground = 8320, lgStagingCamera = 0, lgControlLimit = 8388608, lgControlReserved = 24576}
+
+-- | Each reason's cure, alone.
+cures ∷ [(String, Snapshot, Ledger)]
+cures =
+  [ ("QueueFull: a queued job taken", snapshot {snQueued = 7}, ledger)
+  , ("RecordsFull: a job record collected", snapshot {snJobs = [readJob]}, ledger)
+  , ("RecordsFull: a finished job's result taken", snapshot {snJobs = [readJob {jsHoldsResult = False}, writeJob]}, ledger)
+  , ("MutationActive: the mutation ended", snapshot {snMutation = Nothing}, ledger)
+  , ("GrowthActive: the growth slot idle", snapshot {snBackings = [backing {bsSlot = SlotIdle}]}, ledger)
+  , ("GrowthActive: the pending extra released", snapshot {snBackings = [backing {bsPending = Nothing}]}, ledger)
+  , ("CachePressure: an unpin, the entry kept", snapshot, ledger {lgCachePinned = 0})
+  , ("CachePressure: an entry dropped", snapshot, ledger {lgCacheBacked = 95136})
+  , ("StagingPressure: a transfer buffer returned", snapshot, ledger {lgStagingForeground = 0})
+  , ("ControlPressure: a record's grant returned", snapshot, ledger {lgControlReserved = 20480})
+  , ("ControlPressure: a closing record ended", snapshot {snClosing = 0, snClosingCharged = 0}, ledger)
+  , ("ControlPressure: a presecured open settled", snapshot {snOpening = []}, ledger)
+  ]
 
 pressureCase ∷ Caller → IO ()
 pressureCase caller = do
@@ -96,13 +157,17 @@ pressureCase caller = do
       -- is answered (several turns of the owner, the grant's among them; an open's own attach would
       -- wait behind it, so an open is not followed by one)
       waitFor (inspectStoragePressedSTM svc >>= check)
-      when (caller /= Open) $ do
+      -- two attaches admitted after, one after the other, are answered: each is prepared and
+      -- committed, so the owner's turn order reaches its backed turn (where a grant would be made)
+      -- between them
+      when (caller /= Open) $ forM_ [1 ∷ Int, 2] $ \_ → do
         other ← okOf (registerClient svc)
         void (okOf (attachArena svc other "main") >>= await svc >>= expectSuccess)
       -- nothing of it settled, nothing ended the owner, and nothing was granted again at once
       readTVarIO (hostSettled host) `shouldReturn` []
       inspectDefects svc `shouldReturn` []
-      readTVarIO grants >>= (`shouldSatisfy` (<= 1))
+      -- exactly the one grant that met the full queue; an open is never granted
+      readTVarIO grants `shouldReturn` (if caller == Open then 0 else 1)
       pure fillers
     -- the reads are let go: the caller completes
     forM_ (host : fillers) $ \h → waitFor (readTVar (hostSettled h) >>= \s → check (not (null s)))

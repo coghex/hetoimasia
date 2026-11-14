@@ -91,6 +91,8 @@ module Hetoimasia.Terrain.Runtime
   , inspectEditBankSTM
   , inspectStorageQueuedSTM
   , inspectStoragePressedSTM
+  , markOf
+  , PressureMark
   , perArenaBound
   , compileAccountFor
   , Condition (..)
@@ -203,7 +205,7 @@ import Hetoimasia.Terrain.Runtime.Internal.Types
 import Hetoimasia.Terrain.Runtime.Settlement
 import Hetoimasia.Terrain.Runtime.Backed.Port (StoragePort (..), storagePort)
 import Hetoimasia.Terrain.Runtime.Backed.Fault (FullWhy (..), IntegritySource (..), StorageFault (..), faultCode)
-import Hetoimasia.Terrain.Runtime.Internal.Backed (backedInvariants, editBankChecked, pressureMark)
+import Hetoimasia.Terrain.Runtime.Internal.Backed (backedInvariants, editBankChecked, markOf, pressureMark)
 import qualified Hetoimasia.Terrain.Runtime.Storage.Internal.Service as Storage
 import Hetoimasia.Terrain.Runtime.Store.Internal.Admission (EditBankSpec (..), Ledger (..), defaultEditBankSpec, ledgers, mkEditBankConfig, newAdmission)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Model (Condition (..), GrowthView (..), Usage (..), conditions, growthView, storeHeader, usage)

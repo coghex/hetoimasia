@@ -44,6 +44,7 @@ module Hetoimasia.Terrain.Runtime.Internal.Backed
   , CommittedMovedOutsideDecision (..)
   , editBankChecked
   , pressureMark
+  , markOf
   , notePressure
   , pressureChanged
   , startGatherFor
@@ -81,6 +82,7 @@ import Data.List (sortOn)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import Data.Text (Text)
+import Data.Maybe (isJust)
 import qualified Data.Text as Text
 import Data.Word (Word64)
 import Hetoimasia.Terrain.Cell (Column (..), mkZRange)
@@ -313,18 +315,71 @@ openReady st rid = case openPhase <$> Map.lookup rid (stateOpens st) of
 -- | One step of an open.
 -- | What the storage service and the edit bank hold now (see 'PressureMark').
 pressureMark ∷ Service → STM PressureMark
-pressureMark svc = do
-  sn <- Storage.snapshotOf (serviceStorage svc)
-  l <- A.ledgers <$> readTVar (serviceEditBank svc)
-  pure . PressureMark $
-    fromIntegral (Storage.snQueued sn)
-      : concat [[Storage.jsId j, fromIntegral (Storage.jsPhase j), if Storage.jsHoldsResult j then 1 else 0] | j <- Storage.snJobs sn]
-      <> [A.lgCacheBacked l + A.lgCacheRamOnly l, A.lgStagingForeground l + A.lgStagingCamera l, A.lgControlReserved l]
+pressureMark svc = markOf <$> Storage.snapshotOf (serviceStorage svc) <*> (A.ledgers <$> readTVar (serviceEditBank svc))
+
+-- | Every field the storage service's refusals for pressure read, and the edit bank's accounts:
+--
+-- * 'QueueFull': the queue's length;
+-- * 'RecordsFull': the job records (each job's identity, kind, phase, untaken result and charge);
+-- * 'MutationActive': the mutation in flight;
+-- * 'GrowthActive': each backing's growth slot and pending extra;
+-- * 'AccountPressure': the cache's backed, RAM-only and pinned bytes (eviction takes backed,
+--   unpinned entries), staging's two classes and control, with every kind of record the service
+--   charges to control (closing records, presecured opens, held closes, kept failures).
+--
+-- Job and backing identities are never reused.
+markOf ∷ Storage.Snapshot → A.Ledger → PressureMark
+markOf sn l =
+  PressureMark $
+    [fromIntegral (Storage.snQueued sn), fromIntegral (Storage.snRunning sn), maybe 0 (+ 1) (Storage.snMutation sn)]
+      <> concat [[Storage.jsId j, kindCode (Storage.jsKind j), fromIntegral (Storage.jsPhase j), if Storage.jsHoldsResult j then 1 else 0, Storage.jsCharge j] | j <- Storage.snJobs sn]
+      <> concat [[Storage.bsId b, slotCode (Storage.bsSlot b), maybe 0 (+ 1) (Storage.bsPending b)] | b <- Storage.snBackings sn]
+      <> [fromIntegral (Storage.snClosing sn), fromIntegral (Storage.snClosingCharged sn), fromIntegral (length (Storage.snOpening sn)), fromIntegral (length (Storage.snHeld sn)), fromIntegral (Storage.snEvidence sn)]
+      <> [A.lgCacheBacked l, A.lgCacheRamOnly l, A.lgCachePinned l, A.lgStagingForeground l, A.lgStagingCamera l, A.lgControlReserved l]
+  where
+    kindCode = \case
+      Storage.KOpen → 0
+      Storage.KRead n → 1 + 8 * fromIntegral n
+      Storage.KWrite → 2
+      Storage.KGrow → 3
+      Storage.KGrowNoop → 4
+      Storage.KAbandon → 5
+      Storage.KReleasePending → 6
+    slotCode = \case
+      Storage.SlotIdle → 0
+      Storage.SlotRunning → 1
+      Storage.SlotPrepared → 2
+      Storage.SlotReleasing → 3
 
 -- | A caller was refused for the storage service's temporary pressure: no new storage work starts
--- until what the service and the edit bank hold has changed.
+-- until what the service and the edit bank hold has changed. Pressure is temporary only while
+-- something in flight can change that: a job of the storage service, a pinned read, the slot's work
+-- or an open's job (none of which the hold stops). With none, the refusal can never clear (the
+-- control account held for good, by held closes): that is not pressure, and it is recorded as a
+-- defect instead of holding the owner silently.
 notePressure ∷ Service → STM ()
-notePressure svc = pressureMark svc >>= \mark → modifySt svc (\s → s {stateStoragePressure = Just mark})
+notePressure svc = do
+  sn <- Storage.snapshotOf (serviceStorage svc)
+  l <- A.ledgers <$> readTVar (serviceEditBank svc)
+  st <- readSt svc
+  let inFlight =
+        not (null (Storage.snJobs sn))
+          || not (Map.null (stateGathers st))
+          || isJust (stateSlot st)
+          || any (openWaits . openPhase) (Map.elems (stateOpens st))
+      openWaits = \case
+        OpenReserving {} → True
+        OpenUnwinding _ (Just _) _ → True
+        _ → False
+  if inFlight
+    then pressureMark svc >>= \mark → modifySt svc (\s → s {stateStoragePressure = Just mark})
+    else
+      recordDefect svc . OwnerDefect . Text.pack $
+        "the storage service refused work for pressure that nothing in flight can relieve (held closes: "
+          <> show (length (Storage.snHeld sn))
+          <> ", control reserved: "
+          <> show (A.lgControlReserved l)
+          <> ")"
 
 -- | Wait until what the storage service and the edit bank hold differs from a mark.
 pressureChanged ∷ Service → PressureMark → STM ()
@@ -404,12 +459,6 @@ stepOpen svc ops rid = do
                 atomically (setPhase task (OpenPublishable aid env shared backing store))
                 -- the open is staged: the host is told, and its commit installs the arena
                 opsStage ops rid Nothing (Revision (configFirstRevision config)) StagedControl
-              -- a reservation refused for temporary pressure created nothing: the open submits again, with
-              -- the same identity, once the storage service's capacity has changed
-              Just (GotFailure (HandleRetryLater _) _) → atomically $ do
-                notePressure svc
-                mark ← pressureMark svc
-                setPhase task (OpenSubmitting aid ident env shared shared (WakeOn (pressureChanged svc mark)))
               Just (GotFailure handling _) → finish shared handling
               Just (GotCancelled _) → finish shared (classifyUnaskedCancel OwnerRunning)
               Just (GotMismatch why) → failOpen shared why
@@ -442,7 +491,8 @@ stepOpen svc ops rid = do
       HandleClosing → atomically (dropOpen svc rid held)
       HandleDefect why → failOpen held why
       HandlePausedFor _ → failOpen held "an open answered a pause"
-      HandleRetryLater busy → failOpen held (Text.pack ("an open was refused as busy: " <> show busy))
+      -- pressure is answered only at submission (OpenSubmitting); no job's outcome carries it
+      HandleRetryLater busy → failOpen held (Text.pack ("an open's job answered pressure, which only a submission can: " <> show busy))
       HandleSerialize → failOpen held "an open was serialised"
       HandleReplan → failOpen held "an open answered replan"
       HandleWaitReclaim _ _ → failOpen held "an open answered reclamation"

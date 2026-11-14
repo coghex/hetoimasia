@@ -206,10 +206,23 @@ nextWork svc token = do
               -- no new storage work starts (no read, load or grant; a pressured open waits on its own wake).
               -- Reading them here wakes the owner when any capacity is taken or returned.
               storage <- Storage.snapshotOf (serviceStorage svc)
+              -- a mark seen changed is cleared, so it can never match again
               pressed <- case stateStoragePressure st of
                 Nothing → pure False
-                Just mark → (== mark) <$> pressureMark svc
+                Just mark → do
+                  now <- pressureMark svc
+                  if now == mark then pure True else False <$ modifySt svc (\s → s {stateStoragePressure = Nothing})
               let queueFull = Storage.snQueued storage >= maxQueuedJobs
+              -- A GRANT NOTHING CAN EVER FUND IS LOUD, NEVER A WAIT: the first contender's transaction does
+              -- not fit and nothing is in flight that could return what it needs (no pinned read, no slot
+              -- work, no storage job). On a bank the service accepts only records nothing bounds (held
+              -- closes) can take that room.
+              stuck <- if closing || isJust (stateSlot st) || pressed then pure False else grantStuck st adm storage
+              when stuck $
+                recordDefect svc . OwnerDefect . Text.pack $
+                  "the next transaction can never be granted: the edit bank cannot fund it and nothing in flight can (held closes: "
+                    <> show (length (Storage.snHeld storage))
+                    <> ")"
               yieldToGrant <- if closing || isJust (stateSlot st) then pure False else readsYieldToGrant st adm storage
               let holdReads = yieldToGrant || queueFull || pressed
               (prepareWork, commitWork) <- pickRequestWork svc st adm holdReads
@@ -364,6 +377,26 @@ readsYieldToGrant st adm sn = do
       A.CacheCredit a b k p → A.CacheCredit a (max A.minCacheEntryBytes (b - min b resultBytes)) k p
       A.StagingCredit b → A.StagingCredit (max A.minGrantBytes (b - min b bufferBytes))
       A.ControlCredit b → A.ControlCredit (max A.minGrantBytes (b - min b recordBytes))
+    transactionArena = \case
+      ContendRemoval _ a _ → Just a
+      ContendDiscovery a → Just a
+      ContendReclaim a → Just a
+      ContendGrowth {} → Nothing
+      ContendRelease {} → Nothing
+
+-- | Whether the first contender is a transaction that cannot fit and nothing in flight could make
+-- room for it: no pinned read, no job of the storage service (the slot is free when this is asked).
+grantStuck ∷ St → A.Admission → Storage.Snapshot → STM Bool
+grantStuck st adm sn
+  | not (Map.null (stateGathers st)) || not (null (Storage.snJobs sn)) = pure False
+  | otherwise = do
+      candidates <- contenders st
+      pure $ case candidates of
+        c : _
+          | Just aid <- transactionArena c →
+              either (const True) (const False) (A.reserve A.Foreground (A.transactionCredits aid A.worstTransactionCharge) adm)
+        _ → False
+  where
     transactionArena = \case
       ContendRemoval _ a _ → Just a
       ContendDiscovery a → Just a
