@@ -103,7 +103,7 @@ import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Word (Word64)
 import Hetoimasia.Terrain.Cell
-import Hetoimasia.Terrain.Changes (Changes, emptyChanges)
+import Hetoimasia.Terrain.Changes (Changes, changeColumnBytes, changeIntervalBytes, emptyChanges)
 import Hetoimasia.Terrain.Coordinate
 import qualified Hetoimasia.Terrain.Connectivity as C
 import qualified Hetoimasia.Terrain.Discovery as D
@@ -738,14 +738,17 @@ jobWorkOfModel j = JobWork (R.jobId j) (R.jobArena j) (R.jobRegion j) (R.jobActi
 -- decision's value, which is also the input of the work itself) and the data layer's own
 -- sizes, not the model's cost functions: a column index entry is 'columnIndexBytes' (48), a
 -- segment is 32 bytes of metadata and at least two of payload (a uniform one), and the
--- scratch is a 256-byte frame and two bytes a cell.
+-- scratch is a 256-byte frame, two bytes a cell, and the removed runs the job reads of its
+-- columns (a column of l levels holds at most l / 2 + 1 runs: by "Hetoimasia.Terrain.Changes"'s
+-- figures, (cells / 2 + columns) intervals and an entry a column).
 startJobWork ∷ Service → R.JobId → R.Coverage → STM ()
 startJobWork svc jid cover =
   modifySt svc $ \st →
     st {stateWork = (stateWork st) {rwJobs = Map.adjust running jid (rwJobs (stateWork st))}}
   where
     running (JobWork a b c d e _ _ _) =
-      JobWork a b c d e (R.coverageColumns cover * fromIntegral columnIndexBytes + R.coverageSegments cover * (32 + 2)) (256 + 2 * R.coverageCells cover) 1
+      JobWork a b c d e (R.coverageColumns cover * fromIntegral columnIndexBytes + R.coverageSegments cover * (32 + 2)) (256 + 2 * R.coverageCells cover + runs) 1
+    runs = (R.coverageCells cover `div` 2 + R.coverageColumns cover) * fromIntegral changeIntervalBytes + R.coverageColumns cover * fromIntegral changeColumnBytes
 
 -- | The job's report (completed, failed or acknowledged) ends its record, in the
 -- transaction that reports it.
