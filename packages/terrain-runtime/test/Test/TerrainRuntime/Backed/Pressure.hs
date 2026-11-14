@@ -11,7 +11,7 @@ module Test.TerrainRuntime.Backed.Pressure (spec) where
 
 import Control.Concurrent.STM
 import Control.Exception (finally)
-import Control.Monad (forM, forM_, void)
+import Control.Monad (forM, forM_, void, when)
 import Data.Word (Word64)
 import Hetoimasia.Terrain.Runtime
 import Hetoimasia.Terrain.Runtime.Settlement
@@ -92,8 +92,13 @@ pressureCase caller = do
         Growth → void (okOf (growWith svc (hostEndpoint svc Nothing host) lease (toInteger (128 * mib))))
         Release → void (okOf (retryWith svc (hostEndpoint svc Nothing host) lease))
         Open → void (okOf (openArenaWith svc (hostEndpoint svc Nothing host) client "other" soilOverStone))
-      -- the caller was refused for the pressure, and the owner noted it
+      -- the caller was refused for the pressure, and the owner noted it; then an attach admitted after
+      -- is answered (several turns of the owner, the grant's among them; an open's own attach would
+      -- wait behind it, so an open is not followed by one)
       waitFor (inspectStoragePressedSTM svc >>= check)
+      when (caller /= Open) $ do
+        other ← okOf (registerClient svc)
+        void (okOf (attachArena svc other "main") >>= await svc >>= expectSuccess)
       -- nothing of it settled, nothing ended the owner, and nothing was granted again at once
       readTVarIO (hostSettled host) `shouldReturn` []
       inspectDefects svc `shouldReturn` []
