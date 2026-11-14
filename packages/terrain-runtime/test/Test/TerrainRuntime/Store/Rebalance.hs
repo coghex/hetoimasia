@@ -9,7 +9,7 @@
 -- The trees are built by hand, page by page, with the real checksums, so that they are as shallow in
 -- records and as dense in internal entries as a legitimate tree can be (a leaf just above half full under
 -- the minimum, internal nodes of 28 children against a 4,052-byte payload).
-module Test.TerrainRuntime.Store.Rebalance (spec) where
+module Test.TerrainRuntime.Store.Rebalance (spec, fullSpec) where
 
 import Control.Monad (foldM, forM_, when)
 import qualified Data.ByteString as BS
@@ -25,7 +25,9 @@ import Hetoimasia.Terrain.Runtime.Store.Internal.Plan
 import Hetoimasia.Terrain.Runtime.Store.Internal.Records (Retire (..), encodeKey, encodeRetire, encodeValue, retiredKey)
 import Hetoimasia.Terrain.Runtime.Store.Internal.State
 import Hetoimasia.Terrain.Runtime.Store.Internal.Tree
+import Test.TerrainRuntime.Output (printLine)
 import Test.Hspec
+import Test.TerrainRuntime.Store.Depth (Depth (..), atDepth)
 import Test.TerrainRuntime.Store.Harness
 import Test.TerrainRuntime.Store.Reference
 
@@ -68,11 +70,20 @@ commitWrites h ws = do
     Nothing' → Right h'
     Refusal' why → Left ("a legitimate operation was refused: " <> show why)
 
+-- | The routine depth: the bounded representatives of the long families ('atDepth' names each one beside its full
+-- parameters).
 spec ∷ Spec
-spec = specDeletion >> specChurn >> specAdversarial >> specTreeLevel
+spec = specAt Routine
 
-specDeletion ∷ Spec
-specDeletion = describe "deletion against trees deep enough to merge and redistribute internal nodes" $ do
+-- | Every family at its complete original depth (the optional full-depth probe).
+fullSpec ∷ Spec
+fullSpec = specAt Full
+
+specAt ∷ Depth → Spec
+specAt depth = specDeletion depth >> specChurn depth >> specAdversarial depth >> specTreeLevel depth
+
+specDeletion ∷ Depth → Spec
+specDeletion depth = describe "deletion against trees deep enough to merge and redistribute internal nodes" $ do
   it "redistributes two internal siblings whose combined entries do not fit one page (the round-10 case)" $ do
     let (h, ref, _) = deepStore 30 [28, 90]
         key0 = fst (Map.findMin ref)
@@ -90,7 +101,7 @@ specDeletion = describe "deletion against trees deep enough to merge and redistr
     must (compareRecords (Map.toList (Map.delete key0 ref)) h1)
     -- the publication is the committed version: a fresh read agrees
     rRuns (storeRoots (hStore h1)) `shouldSatisfy` (/= rRuns (storeRoots (hStore h)))
-  forM_ [(30 ∷ Int, [28, 90], 1 ∷ Word64), (30, [28, 28, 28, 28], 2), (30, [28, 90, 28, 60], 3), (40, [28, 90, 28, 100], 4)] $ \(perLeaf, counts, seed) →
+  forM_ (atDepth depth [(30 ∷ Int, [28, 90], 1 ∷ Word64)] [(30, [28, 90], 1), (30, [28, 28, 28, 28], 2), (30, [28, 90, 28, 60], 3), (40, [28, 90, 28, 100], 4)]) $ \(perLeaf, counts, seed) →
     it ("never refuses a legitimate deletion or reinsertion, and the checker agrees after every step (" <> show counts <> ", " <> show perLeaf <> " records a leaf)") $ do
       let (h0, ref0, _) = deepStore perLeaf counts
           original = ref0
@@ -130,8 +141,8 @@ specDeletion = describe "deletion against trees deep enough to merge and redistr
 -- payload. These examples replace values with shorter and longer ones, and insert keys of both lengths below the
 -- first separator, in the links tree (the only tree whose keys and values vary in length), with the independent
 -- checker and a full read after EVERY commit.
-specChurn ∷ Spec
-specChurn = describe "minimum fill under every write that can shrink a node" $ do
+specChurn ∷ Depth → Spec
+specChurn depth = describe "minimum fill under every write that can shrink a node" $ do
   let parentNode = srcNode 0 0 0
       runKeyOf ∷ Int → RecordKey
       runKeyOf j = linkKey (RunNode (columnAt (toInteger j) 0) 0)
@@ -165,7 +176,7 @@ specChurn = describe "minimum fill under every write that can shrink a node" $ d
     [xs | xs ← cases, Just (l, r) ← [splitEven id xs], any (< minNodeBytes) [sum l, sum r]] `shouldBe` []
     [xs | xs ← cases, Nothing ← [splitEven id xs]] `shouldBe` []
   it "keeps every page above the minimum through shortened and lengthened values and first separators, 300 commits, checked and read after each" $
-    forM_ [1, 2, 3 ∷ Word64] $ \seed → do
+    forM_ (atDepth depth [1] [1, 2, 3 ∷ Word64]) $ \seed → do
       let n = 1200 ∷ Int
           initial = [(runKeyOf (j + 100), Just (longVal j)) | j ← [0 .. n - 1]] ++ [(linkKey (srcNode (toInteger (j `mod` 100) - 50) (toInteger (j `div` 100) - 50) 0), Just (rootRec (fromIntegral (j + 1)) True)) | j ← [0 .. 300 ∷ Int]]
           chunks [] = []
@@ -191,8 +202,8 @@ specChurn = describe "minimum fill under every write that can shrink a node" $ d
 -- then shorter and longer values replaced in key order and in reverse, then a random mix, over keys on both sides of the
 -- SrcNode / RunNode boundary (52 and 25 bytes), the tree held at two and at three levels. After EVERY commit the independent
 -- checker (which refuses an under-full non-root page, an over-full page and a root with one child) and a read of every record.
-specAdversarial ∷ Spec
-specAdversarial = describe "adversarial histories over both key kinds, at two and three levels" $ do
+specAdversarial ∷ Depth → Spec
+specAdversarial depth = describe "adversarial histories over both key kinds, at two and three levels" $ do
   let srcKey ∷ Int → RecordKey
       srcKey j = linkKey (srcNode (toInteger (j `mod` 60) - 30) (toInteger (j `div` 60) - 30) 0)
       runKeyOf2 ∷ Int → RecordKey
@@ -227,20 +238,22 @@ specAdversarial = describe "adversarial histories over both key kinds, at two an
         (hEnd, _, n) ← foldM (\(h, ref, c) ws → (\(h', ref') → (h', ref', c + 1)) <$> commitCheck h ref ws) (h0, ref0, length (chunks 40 initial)) phases
         Right (heightOf h0 TreeLinks, heightOf hEnd TreeLinks, n ∷ Int)
   it "keeps the root and every page legal through 2-level histories (6 seeds), the checker and a full read after every commit" $ do
-    rows ← must (mapM (history 700 500) [1 .. 6])
-    putStrLn ("ADVERSARIAL two levels: (height at start, at end, commits) per seed " <> show rows <> "; commits " <> show (sum [c | (_, _, c) ← rows]))
+    let (nSrc, nRun) = atDepth depth (160, 100) (700, 500)
+    rows ← must (mapM (history nSrc nRun) (atDepth depth [1] [1 .. 6]))
+    printLine ("ADVERSARIAL two levels: (height at start, at end, commits) per seed " <> show rows <> "; commits " <> show (sum [c | (_, _, c) ← rows]))
     [r | r@(h0, _, _) ← rows, h0 /= 2] `shouldBe` []
   it "keeps the root legal through small histories whose root has two children that merge (the reviewer's shape, many sizes)" $ do
-    let sizes = [(a, b) | a ← [30, 40, 50, 60, 80, 100], b ← [20, 30, 40, 60]]
-    rows ← must (mapM (\(a, b, sd) → history a b sd) [(a, b, sd) | (a, b) ← sizes, sd ← [1, 2, 3, 4]])
+    let sizes = atDepth depth [(30, 30)] [(a, b) | a ← [30, 40, 50, 60, 80, 100], b ← [20, 30, 40, 60]]
+    rows ← must (mapM (\(a, b, sd) → history a b sd) [(a, b, sd) | (a, b) ← sizes, sd ← atDepth depth [1] [1, 2, 3, 4]])
     let twoLevel = [r | r@(h0, _, _) ← rows, h0 == 2]
         collapsed = [r | r@(h0, h1, _) ← rows, h1 < h0]
-    putStrLn ("ADVERSARIAL small: histories " <> show (length rows) <> ", starting at height 2: " <> show (length twoLevel) <> ", ending lower (root merged and collapsed): " <> show (length collapsed) <> ", commits " <> show (sum [c | (_, _, c) ← rows]))
+    printLine ("ADVERSARIAL small: histories " <> show (length rows) <> ", starting at height 2: " <> show (length twoLevel) <> ", ending lower (root merged and collapsed): " <> show (length collapsed) <> ", commits " <> show (sum [c | (_, _, c) ← rows]))
     -- the class is reached: some root really merged its only two children and collapsed
     null collapsed `shouldBe` False
   it "keeps the root and every page legal through 3-level histories (2 seeds), the checker and a full read after every commit" $ do
-    rows ← must (mapM (history 2800 900) [1, 2])
-    putStrLn ("ADVERSARIAL three levels: (height at start, at end, commits) per seed " <> show rows <> "; commits " <> show (sum [c | (_, _, c) ← rows]))
+    let (nSrc, nRun) = atDepth depth (1600, 100) (2800, 900)
+    rows ← must (mapM (history nSrc nRun) (atDepth depth [1] [1, 2]))
+    printLine ("ADVERSARIAL three levels: (height at start, at end, commits) per seed " <> show rows <> "; commits " <> show (sum [c | (_, _, c) ← rows]))
     [r | r@(h0, _, _) ← rows, h0 /= 3] `shouldBe` []
   it "a deletion's repack installs a longer separator (52 bytes for 25) in the parent: the pair is the full Src leaf and the LAST, minimum Run leaf" $ do
     -- the round-15 candidate. rebalanceChild pairs an under-full child with its RIGHT sibling when it has one, so a longer separator
@@ -318,7 +331,7 @@ specAdversarial = describe "adversarial histories over both key kinds, at two an
           viol ← shapeViolations TreeRetire root
           e ← getEditProbe
           pure (root, viol, editDeleteSplits e)
-        putStrLn ("RETIRE two key lengths: version key " <> show versionLen <> " B, page key " <> show pageLen <> " B; parent of " <> show a <> " version and " <> show b <> " page children = " <> show bytes0 <> " of " <> show pagePayloadBytes <> " B; delete splits: " <> show splits)
+        printLine ("RETIRE two key lengths: version key " <> show versionLen <> " B, page key " <> show pageLen <> " B; parent of " <> show a <> " version and " <> show b <> " page children = " <> show bytes0 <> " of " <> show pagePayloadBytes <> " B; delete splits: " <> show splits)
         viol `shouldBe` []
         (root /= Nothing, splits) `shouldBe` (True, 1)
   it "the exit every write shares: an over-full node is split into two legal halves, a fitting one rewritten, an emptied one dropped" $ do
@@ -402,8 +415,8 @@ runTree act = case runM act (newEdit maxBound (emptyWindow ident0 0)) of
   Right r → pure r
   Left e → expectationFailure ("the plan stopped: " <> show e) >> fail "plan"
 
-specTreeLevel ∷ Spec
-specTreeLevel = describe "the tree level: a write's exits, whatever the key and value sizes" $ do
+specTreeLevel ∷ Depth → Spec
+specTreeLevel depth = describe "the tree level: a write's exits, whatever the key and value sizes" $ do
   let longKey ∷ Int → BS.ByteString
       longKey i = BS.pack ([1, fromIntegral (i `div` 256), fromIntegral (i `mod` 256)] ++ replicate (maxKeyBytes - 3) 0)
       shortKey ∷ Int → BS.ByteString
@@ -532,25 +545,33 @@ specTreeLevel = describe "the tree level: a write's exits, whatever the key and 
         loop (root0, Map.fromList [(k, val8) | k ← startKeys], mkRng (seed + 4100), 0 ∷ Int, 0 ∷ Int) 1
       isJust' = maybe False (const True)
       family name results = do
-        putStrLn ("TREE FUZZ " <> name <> ": (seed, failure, operations, tallest tree, deletions that split a node) " <> show results)
+        printLine ("TREE FUZZ " <> name <> ": (seed, failure, operations, tallest tree, deletions that split a node) " <> show results)
         [(sd, f) | (sd, Just f, _, _, _) ← results] `shouldBe` []
         pure (sum [n | (_, _, n, _, _) ← results], maximum [t | (_, _, _, t, _) ← results], sum [sp | (_, _, _, _, sp) ← results])
       go name keyOf poolSize valueLo start startKeys seeds nOps = do
         rs ← mapM (\seed → runTree (run keyOf poolSize valueLo start startKeys seed nOps) >>= \((f, ops, tallest), e) → pure (seed, f, ops, tallest, editDeleteSplits e)) seeds
         family name rs
   it "keeps the tree legal and complete through random histories of keys and values of every length (mixed lengths)" $ do
-    (ops, tallest, _) ← go "mixed" mixedKey 2600 0 Nothing [] [1, 2] 8000
-    ops `shouldBe` 16000
+    let seeds = atDepth depth [1] [1, 2]
+        nOps = atDepth depth 2000 8000
+    (ops, tallest, _) ← go "mixed" mixedKey 2600 0 Nothing [] seeds nOps
+    ops `shouldBe` length seeds * nOps
     (tallest >= 2) `shouldBe` True
   it "keeps the tree legal and complete through random histories over long keys and long values, deep enough for three levels" $ do
-    (ops, tallest, _) ← go "long" (\i → BS.pack ([fromIntegral (i `div` 256), fromIntegral (i `mod` 256)] ++ replicate (maxKeyBytes - 2) (fromIntegral i))) 6000 40 Nothing [] [3, 4] 14000
-    ops `shouldBe` 28000
+    let seeds = atDepth depth [3] [3, 4]
+        nOps = atDepth depth 5000 14000
+    (ops, tallest, _) ← go "long" (\i → BS.pack ([fromIntegral (i `div` 256), fromIntegral (i `mod` 256)] ++ replicate (maxKeyBytes - 2) (fromIntegral i))) 6000 40 Nothing [] seeds nOps
+    ops `shouldBe` length seeds * nOps
     (tallest >= 3) `shouldBe` True
   it "keeps the tree legal and complete through random histories over alternating bands of long and short keys" $ do
-    (ops, _, _) ← go "banded" bandedKey 6000 0 Nothing [] [5, 6, 7, 8] 10000
-    ops `shouldBe` 40000
+    let seeds = atDepth depth [5] [5, 6, 7, 8]
+        nOps = atDepth depth 2500 10000
+    (ops, _, _) ← go "banded" bandedKey 6000 0 Nothing [] seeds nOps
+    ops `shouldBe` length seeds * nOps
   it "keeps the tree legal and complete through random histories that start at the edge: the near-full parent, where deletions split nodes" $ do
-    (ops, tallest, splits) ← go "edge" edgeKey 40400 0 (Just parentSpec) allKeys [9 .. 24] 1500
-    ops `shouldBe` 24000
-    putStrLn ("TREE FUZZ edge: deletions that split a node, all seeds: " <> show splits <> ", tallest tree " <> show tallest)
+    let seeds = atDepth depth [12] [9 .. 24]
+        nOps = 1500
+    (ops, tallest, splits) ← go "edge" edgeKey 40400 0 (Just parentSpec) allKeys seeds nOps
+    ops `shouldBe` length seeds * nOps
+    printLine ("TREE FUZZ edge: deletions that split a node, all seeds: " <> show splits <> ", tallest tree " <> show tallest)
     (splits > 0) `shouldBe` True

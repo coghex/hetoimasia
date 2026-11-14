@@ -7,7 +7,7 @@
 -- maintains, while the independent traversal of "Test.TerrainRuntime.Store.Reference"
 -- decides from the bytes that every tree is ordered, bounded, a quarter full and
 -- that the pages partition the page space. Every sequence names its seed.
-module Test.TerrainRuntime.Store.Trees (spec, drive, growAndShrink) where
+module Test.TerrainRuntime.Store.Trees (spec, fullSpec, drive, growAndShrink, growSide) where
 
 import Control.Monad (forM_, when)
 import qualified Data.Map.Strict as Map
@@ -19,6 +19,7 @@ import Hetoimasia.Terrain.Runtime.Store.Internal.Format
 import Hetoimasia.Terrain.Runtime.Store.Internal.Model
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan
 import Test.Hspec
+import Test.TerrainRuntime.Store.Depth (Depth (..), atDepth)
 import Test.TerrainRuntime.Store.Harness
 import Test.TerrainRuntime.Store.Reference
 import Test.TerrainRuntime.Store.Workload
@@ -45,9 +46,19 @@ drive seed steps perStep every = go (mkRng seed) (newH smallSpec ident0) Map.emp
       compareRecords (Map.toList ref) h
       Right (h, ref)
 
-spec ∷ Spec
-spec = describe "copy-on-write indexes against a reference map" $ do
-  forM_ [(11, 400), (29, 400), (47, 400)] $ \(seed, steps) →
+-- | The routine depth, and every family at its original depth (the optional full-depth probe).
+spec, fullSpec ∷ Spec
+spec = specAt Routine
+fullSpec = specAt Full
+
+-- | The half-width of the square of columns 'growAndShrink' fills: the records it builds are @(2 * side + 1)^2 * 7@ (the
+-- full depth is 20, 11,767 records).
+growSide ∷ Depth → Int
+growSide depth = atDepth depth 16 20
+
+specAt ∷ Depth → Spec
+specAt depth = describe "copy-on-write indexes against a reference map" $ do
+  forM_ (atDepth depth [(11, 400)] [(11, 400), (29, 400), (47, 400)]) $ \(seed, steps) →
     it ("agrees with the reference map and the independent traversal through inserts, replacements and deletions (seed " <> show seed <> ")") $
       case drive seed steps 30 50 of
         Left e → expectationFailure e
@@ -55,7 +66,7 @@ spec = describe "copy-on-write indexes against a reference map" $ do
           Map.size ref `shouldSatisfy` (> 200)
           mxPages (hMaxes h) `shouldSatisfy` (<= 256)
   it "splits leaves, internal pages and the root, and merges them back, as the traversal sees (seed 5)" $
-    case growAndShrink 5 of
+    case growAndShrink (growSide depth) 5 of
       Left e → expectationFailure e
       Right (grown, shrunk) → do
         grown `shouldSatisfy` (>= 3)
@@ -63,10 +74,10 @@ spec = describe "copy-on-write indexes against a reference map" $ do
 
 -- | Insert many records so a tree grows to several levels, then delete them all in
 -- a random order: the tree gives its levels back and ends empty.
-growAndShrink ∷ Word64 → Either String (Int, Int)
-growAndShrink seed = do
+growAndShrink ∷ Int → Word64 → Either String (Int, Int)
+growAndShrink side seed = do
   let h0 = newH smallSpec ident0
-      keys = [(runKey x y (100 * s), runRec (100 * s + 3)) | x ← [-20 .. 20], y ← [-20 .. 20], s ← [0 .. 6 ∷ Integer]]
+      keys = [(runKey x y (100 * s), runRec (100 * s + 3)) | x ← [-toInteger side .. toInteger side], y ← [-toInteger side .. toInteger side], s ← [0 .. 6 ∷ Integer]]
       chunks xs = case splitAt 40 xs of
         ([], _) → []
         (a, b) → a : chunks b

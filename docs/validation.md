@@ -166,6 +166,7 @@ the audited suite inventory, and which optional probes are local-only.
 | `test.wayland-helper` | `cabal test wayland-helper-tests --test-show-details=direct` | yes | no | any |
 | `test.lua-hazard` | `cabal test hetoimasia-scripting-lua:lua-hazard-probes --test-show-details=direct` | yes | no | any |
 | `test.terrain-storage-qualification` | `cabal test --project-file cabal.project.cpu hetoimasia-terrain-runtime:terrain-storage-probe --test-show-details=direct` | yes | no | `Darwin`, `Linux` |
+| `test.terrain-runtime-full-depth` | `cabal test --project-file cabal.project.cpu hetoimasia-terrain-runtime:terrain-runtime-full-depth-tests --test-show-details=direct` | yes | no | any |
 | `test.macos-confinement` | `cabal test hetoimasia-scripting-lua:macos-confinement-probe --test-show-details=direct` | yes | no | any (component Darwin-only) |
 | `test.glfw-native` | `cabal test glfw-native-tests --test-show-details=direct` | no | no | any |
 | `test.glfw-wayland` | `cabal test glfw-native-tests --test-show-details=direct --test-option=--match --test-option=/GLFW native/on an isolated Wayland session/` | no | no | any |
@@ -419,7 +420,9 @@ independent page-ownership traversal, #661's removals and discovery replayed thr
 pages, failure, cancellation and abort of a staged transaction, pinned readers and
 reclamation, the allowance with its protected reserve and growth, the transaction
 bounds exactly and one past, the edit bank's admission division and a separately
-compiled client of the public store interface. It is mandatory but outside the
+compiled client of the public store interface. The store's long families run at bounded
+representatives, the pure ones in parallel; their complete depth is the optional probe
+`test.terrain-runtime-full-depth` ([the rule and the budget](test_classification.md#the-suites-budget-and-its-parallel-group)). It is mandatory but outside the
 floor, like `test.terrain`, and runs through `cabal.project.cpu` on the
 `haskell-engine` worker, with a reusable receipt. Its package directory and Cabal file are inputs of
 `test.workflow` as well, because the owned-start guard scans every test suite of the
@@ -985,7 +988,8 @@ retained evidence of the run that promoted it is
 [the Wayland qualification record](archive/wayland_qualification_record.md).
 
 The local-only probes are `test.x11-helper`, `test.wayland-helper`,
-`test.lua-hazard`, `test.lua-confinement-linux`, and `test.macos-confinement`.
+`test.lua-hazard`, `test.lua-confinement-linux`, `test.macos-confinement`, and
+`test.terrain-runtime-full-depth`.
 Optional is a selection rule; it does not imply Python, a particular executor,
 or automatic eligibility for `$test`. See the
 [classification policy](test_classification.md) before adding a new group.

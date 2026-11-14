@@ -9,7 +9,7 @@
 -- value or key is a different record, which no structure can tell from an intended one);
 -- every other record must still read exactly. Fixed seeds, bounded: nothing here is
 -- timing-dependent.
-module Test.TerrainRuntime.Store.Fuzz (spec, fuzzOnce, judgeMutated, Finding (..), Tally (..)) where
+module Test.TerrainRuntime.Store.Fuzz (spec, fullSpec, fuzzOnce, judgeMutated, Finding (..), Tally (..)) where
 
 import Control.Monad (forM, forM_)
 import qualified Data.ByteString as BS
@@ -27,8 +27,10 @@ import Hetoimasia.Terrain.Runtime.Store.Internal.Plan (RangeStart (..))
 import Hetoimasia.Terrain.Runtime.Store.Internal.Records (decodeKey, encodeKey)
 import Hetoimasia.Terrain.Runtime.Store.Internal.State
 import Hetoimasia.Terrain.Runtime.Store.Internal.Tree
+import Test.TerrainRuntime.Output (printLine)
 import Test.Hspec
 import Test.TerrainRuntime.Store.Bounds (wide)
+import Test.TerrainRuntime.Store.Depth (Depth (..), atDepth, newFixture, readFixture)
 import Test.TerrainRuntime.Store.Harness
 import Test.TerrainRuntime.Store.Reference
 
@@ -218,21 +220,31 @@ judgeMutated h tok ref keys page offset newByte mutated = do
   let verdicts = concatMap judgeLookup sample ++ concatMap judgeFloor (take 12 sample) ++ concatMap judgeCeil nearBoundaries ++ concatMap judgeRange (every 3 nearBoundaries) ++ judgeLive ++ judgeScan
   Right ([Finding page offset newByte f | Defect f ← take 3 [v | v@(Defect _) ← verdicts]], tallyOf verdicts)
 
-spec ∷ Spec
-spec = describe "a re-sealed byte of a live page never changes what a read answers (except as data)" $ do
-  (h0, keys) ← runIO (must (wide 6000))
-  let ref = Map.fromList [(k, RecRun 20) | k ← keys]
-      ArenaId a = siArena (hIdent h0)
-      runsRoot = (\(PageNo p) → p) <$> committedRoot (hStore h0) TreeRuns
-      pages = sortOn id (twPages (walkTree a (siSource (hIdent h0)) (diskRead (hDisk h0)) runsRoot))
-  let parsedAt p = case diskRead (hDisk h0) (PageNo p) of
-        Just bs → either (const Nothing) Just (decodePage (hIdent h0) (cfgUsablePages (hCfg h0)) (PageNo p) bs)
-        Nothing → Nothing
-      innerPages = [p | p ← pages, Just (Page _ lvl _ (Inner _)) ← [parsedAt p], lvl >= 1]
-      leafPages = [p | p ← pages, Just (Page _ 0 _ (Leaf _)) ← [parsedAt p]]
+-- | The routine depth, and every family at its original depth (the optional full-depth probe).
+spec, fullSpec ∷ Spec
+spec = specAt Routine
+fullSpec = specAt Full
+
+specAt ∷ Depth → Spec
+specAt depth = describe "a re-sealed byte of a live page never changes what a read answers (except as data)" $ do
+  fixture ← runIO (newFixture "Fuzz.wide 6000" (must (wide 6000)))
+  -- the store, its reference and its pages: derived from the fixture by the example that reads it
+  let setup = do
+        (h0, keys) ← readFixture fixture
+        let ref = Map.fromList [(k, RecRun 20) | k ← keys]
+            ArenaId a = siArena (hIdent h0)
+            runsRoot = (\(PageNo p) → p) <$> committedRoot (hStore h0) TreeRuns
+            pages = sortOn id (twPages (walkTree a (siSource (hIdent h0)) (diskRead (hDisk h0)) runsRoot))
+            parsedAt p = case diskRead (hDisk h0) (PageNo p) of
+              Just bs → either (const Nothing) Just (decodePage (hIdent h0) (cfgUsablePages (hCfg h0)) (PageNo p) bs)
+              Nothing → Nothing
+            innerPages = [p | p ← pages, Just (Page _ lvl _ (Inner _)) ← [parsedAt p], lvl >= 1]
+            leafPages = [p | p ← pages, Just (Page _ 0 _ (Leaf _)) ← [parsedAt p]]
+        pure (h0, keys, ref, runsRoot, pages, innerPages, leafPages)
       -- the byte offsets of the first separators and children of an internal page, where the structure sits
       structural g = 40 + fromIntegral (g `mod` 120)
   it "reads every record exactly or fails as corrupt, over fixed seeds of one-byte mutations" $ do
+    (h0, keys, ref, _, pages, innerPages, leafPages) ← setup
     length pages `shouldSatisfy` (> 20)
     innerPages `shouldSatisfy` (not . null)
     (tok, s1) ← must (either (Left . show) Right (acquireReader (hStore h0)))
@@ -250,12 +262,13 @@ spec = describe "a re-sealed byte of a live page never changes what a read answe
                 offset = if w2 `mod` 2 == 0 then structural (w2 `div` 2) else 24 + fromIntegral (w2 `div` 2 `mod` 4000)
                 newByte = w3 `mod` 256
             pure (either (\e → ([Finding page offset newByte e], mempty)) id (fuzzOnce h tok ref keys page offset newByte))
-    results ← fmap concat (mapM runSeed [101, 202, 303, 404, 505, 606])
+    let seeds = atDepth depth [101] [101, 202, 303, 404, 505, 606]
+    results ← fmap concat (mapM runSeed seeds)
     let found = concatMap fst results
         tally = mconcat (map snd results)
     -- the counts the run is judged by: both outcomes happen, and nothing else
-    putStrLn ("FUZZ " <> show tally)
-    tMutations tally `shouldBe` 360
+    printLine ("FUZZ " <> show tally)
+    tMutations tally `shouldBe` 60 * length seeds
     tIntegrity tally `shouldSatisfy` (> 0)
     tEqual tally `shouldSatisfy` (> 0)
     case found of
@@ -263,6 +276,7 @@ spec = describe "a re-sealed byte of a live page never changes what a read answe
       fs → expectationFailure (unlines (map show (take 12 fs)) <> show (length fs) <> " findings")
 
   it "never reads a record that exists as absent when a separator is moved to another valid key, raised or lowered, the first or a later one" $ do
+    (h0, keys, ref, runsRoot, _, _, _) ← setup
     (tok, s1) ← must (either (Left . show) Right (acquireReader (hStore h0)))
     let h = h0 {hStore = s1}
         total = cfgUsablePages (hCfg h0)
@@ -295,7 +309,7 @@ spec = describe "a re-sealed byte of a live page never changes what a read answe
         Left e → expectationFailure (what <> ": " <> e)
         Right ([], tally) → do
           -- the reads of a moved separator are integrity failures or exactly the reference's answers
-          putStrLn ("FUZZ separator " <> what <> ": " <> show tally)
+          printLine ("FUZZ separator " <> what <> ": " <> show tally)
           tDefects tally `shouldBe` 0
         Right (fs, _) → expectationFailure (what <> ": " <> unlines (map show fs))
       -- and the records it hid are integrity failures, not answers: no read of the first leaf's first record succeeds

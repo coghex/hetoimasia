@@ -14,6 +14,7 @@
 -- variants with a stated margin.
 module Test.TerrainRuntime.Store.Memory (spec) where
 
+import Test.TerrainRuntime.Output (printLine)
 import Control.Exception (evaluate)
 import Control.Monad (forM_, unless)
 import qualified Data.ByteString as BS
@@ -43,10 +44,12 @@ import Hetoimasia.Terrain.Runtime.Store.Internal.State
 import Hetoimasia.Terrain.Runtime.Store.Internal.Tree
 import System.Mem (performMajorGC)
 import Test.Hspec
+import Test.TerrainRuntime.Isolation (assertSequential)
+import Test.TerrainRuntime.Store.Depth (lazily)
 import Test.TerrainRuntime.Store.Harness
 
 live ∷ IO Word64
-live = performMajorGC >> performMajorGC >> (gcdetails_live_bytes . gc <$> getRTSStats)
+live = assertSequential "a live-heap reading" >> performMajorGC >> performMajorGC >> (gcdetails_live_bytes . gc <$> getRTSStats)
 
 -- | The live heap one element of a structure retains: the structure is built from @n@ distinct inputs, forced, held across a major
 -- collection, and the growth of the live heap is divided by @n@. The inputs are built (and held) BEFORE the first reading, so what
@@ -167,7 +170,7 @@ spec = describe "the accounted-bytes constants against what is retained (forced 
       nFacts = maxReadFactBytes `div` recordFactBytes
   rows ← runIO $ do
     -- WINDOW PAGE: a validated 4,096-byte buffer; what the page says does not change what a window keeps
-    mPage ← sequence
+    mPage ← lazily "Memory.mPage" $ sequence
       [ do
           let pages = [(fromIntegral i, densePage tree inner sup (fromIntegral i)) | i ← ints 2000]
           v ← retainedPer 2000 pages (BS.length . snd) (\ps → pure (foldl' (\w (p, bs) → either (error . show) id (windowInsert total (PageNo p) bs w)) (emptyWindow ident0 0) ps)) (\w → evaluate (windowSize w + windowPayloadBytes w))
@@ -178,7 +181,7 @@ spec = describe "the accounted-bytes constants against what is retained (forced 
       ]
     -- PROBE: a map entry, the tag and level, and the first key of the page it classifies: the longest key a valid page holds is the
     -- links tree's 52 bytes, and the bound a page could carry at all is 'maxKeyBytes' (64), measured as well
-    mProbe ← sequence
+    mProbe ← lazily "Memory.mProbe" $ sequence
       [ do
           v ← retainedPer 5000 (ints 5000) id (\is → pure (Map.fromList [(PageNo (fromIntegral i), mk i) | i ← is])) (\m → evaluate (Map.size m + sum [case pr of ProbeTree _ l k → l + SBS.length k; ProbeList w → fromIntegral w; ProbeNone → 0 | pr ← Map.elems m]))
           pure (Variant nm v Nothing)
@@ -189,7 +192,7 @@ spec = describe "the accounted-bytes constants against what is retained (forced 
       ]
     -- READ FACT, PACKED: the encoded key and value in one map entry. The values a valid fact holds: a record of every kind, the floor
     -- answer (16 bytes), an absent answer (empty); and the bound itself: a 64-byte key with a 64-byte value, which no valid record reaches
-    mFact ← sequence $
+    mFact ← lazily "Memory.mFact" $ sequence $
       [ do
           v ← retainedPer nFacts (ints nFacts) id (\is → pure (windowCheckpoint (factsOf (Fingerprint ident0 1 [] []) [] (ReadSet [(kf i, Just (rf i)) | i ← is] [])) (emptyWindow ident0 1))) (\w → evaluate (windowReadFactCount w))
           -- each variant against ITS OWN charge: its key and value lengths and the fixed entry overhead
@@ -204,7 +207,7 @@ spec = describe "the accounted-bytes constants against what is retained (forced 
                pure (Variant "the bound: a 64-byte key with a 64-byte value (not reachable by a valid record)" v (Just (maxKeyBytes + maxValueBytes + readFactOverheadBytes)))
            ]
     -- PROOF FACT: a member of the window's set of proofs; every constructor, the largest carries a version and a page
-    mProof ← sequence
+    mProof ← lazily "Memory.mProof" $ sequence
       [ do
           v ← retainedPer 20000 (ints 20000) id (\is → pure (Set.fromList [mk i | i ← is])) (\st → evaluate (Set.foldl' (\acc f → acc + factWeight f) (0 ∷ Int) st))
           pure (Variant nm v Nothing)
@@ -217,7 +220,7 @@ spec = describe "the accounted-bytes constants against what is retained (forced 
           ]
       ]
     -- LISTS AND SETS OF PAGE NUMBERS: the replaced pages of an edit are a set, the supply and the loose pages are lists
-    mCell ← sequence
+    mCell ← lazily "Memory.mCell" $ sequence
       [ do
           v ← retainedPer 200000 (ints 200000) id (\is → pure (map (\i → PageNo (fromInteger (big i))) is)) (\ps → evaluate (foldl' (\acc (PageNo q) → acc + fromIntegral q) (0 ∷ Int) ps))
           pure (Variant "a list of page numbers (supply, loose pages)" v Nothing)
@@ -226,7 +229,7 @@ spec = describe "the accounted-bytes constants against what is retained (forced 
           pure (Variant "a set of page numbers (the replaced pages of an edit)" v Nothing)
       ]
     -- ROOT SET: every root present, the largest header, five checksums and the loose list at its cap (every cell a distinct number)
-    mRoots ← sequence
+    mRoots ← lazily "Memory.mRoots" $ sequence
       [ do
           v ← retainedPer 100 (ints 100) id (\is → pure [rootsOf full loose i | i ← is]) (\rs → evaluate (sum (map rootsWeight rs)))
           pure (Variant nm v Nothing)
@@ -237,7 +240,7 @@ spec = describe "the accounted-bytes constants against what is retained (forced 
           ]
       ]
     -- READER PIN: the entry of the map of readers (a key and the pins), every pinned root and checksum present
-    mPin ← sequence
+    mPin ← lazily "Memory.mPin" $ sequence
       [ do
           v ← retainedPer 1000 (ints 1000) id (\is → pure (Map.fromList [(fromIntegral (big i) ∷ Word64, pinRecord full i) | i ← is])) (\m → evaluate (sum [fromIntegral (pinVersion p) + length (pinCrcs p) + length [() | Just _ ← [pinRuns p, pinLinks p, pinTodo p]] | p ← Map.elems m]))
           pure (Variant nm v Nothing)
@@ -245,14 +248,14 @@ spec = describe "the accounted-bytes constants against what is retained (forced 
       ]
     -- TYPED WRITE: a plan holds the candidate's list, the map the planner builds to canonicalise it and the canonical list, all at once;
     -- every pairing of key and record it accepts is measured, and the populated source-node key and child is the largest
-    mWrite ← sequence
+    mWrite ← lazily "Memory.mWrite" $ sequence
       [ do
           v ← retainedPer 3000 (ints 3000) id (\is → pure (writesOf kf rf is)) (\(ws, m, canon) → evaluate (sum (map recordWeight canon) + Map.size m + length ws))
           pure (Variant nm v Nothing)
       | (nm, kf, rf) ← validPairs
       ]
     -- HOT NODE: a node parsed and held by an edit, the densest valid page of every tree and kind, leaf and internal
-    mHot ← sequence
+    mHot ← lazily "Memory.mHot" $ sequence
       [ do
           let sup' = take 400 sup
               bs0 = densePage tree inner sup' 1
@@ -264,7 +267,7 @@ spec = describe "the accounted-bytes constants against what is retained (forced 
       , tree /= TreeLinks || nm == "links, source keys, children" || not inner
       ]
     -- PAGE STATE: an entry of the active transaction's map; the states are nullary, so every one costs the same
-    mState ← sequence
+    mState ← lazily "Memory.mState" $ sequence
       [ do
           v ← retainedPer 25600 (ints 25600) id (\is → pure (Map.fromList [(PageNo (fromInteger (big i)), st) | i ← is])) (\m → evaluate (Map.size m))
           pure (Variant nm v Nothing)
@@ -272,7 +275,7 @@ spec = describe "the accounted-bytes constants against what is retained (forced 
       ]
     -- OVERLAY PAGE: a new page held packed, its payload plus what holds it (the two map entries, the packed record, the byte string);
     -- a leaf packs to its page payload, an internal page packs each entry one byte larger, so the shortest separator gives the most
-    mOverlay ← sequence
+    mOverlay ← lazily "Memory.mOverlay" $ sequence
       [ do
           let node = parsedNodeOf tree inner (take 400 sup)
               acc = packedBytes node
@@ -282,7 +285,7 @@ spec = describe "the accounted-bytes constants against what is retained (forced 
       , inner ← [False, True]
       ]
     -- WRITTEN PAGE: the plan's list of encoded pages, each a page number and a pinned 4,096-byte buffer; every kind of page it writes
-    mWritten ← sequence
+    mWritten ← lazily "Memory.mWritten" $ sequence
       [ do
           v ← retainedPer 3000 (ints 3000) id (\is → pure [(PageNo (fromIntegral i), mk i) | i ← is]) (\ps → evaluate (sum [BS.length b | (_, b) ← ps]))
           pure (Variant nm v Nothing)
@@ -294,7 +297,7 @@ spec = describe "the accounted-bytes constants against what is retained (forced 
       ]
     -- FACTS VALUE: what the caller holds between a Checkpoint and windowCheckpoint. The read facts are packed AT CREATION, so nothing typed
     -- is in it; the proof facts are a LIST there (not the window's Set); the fingerprint holds the roots and the pinned versions
-    mFacts ← sequence
+    mFacts ← lazily "Memory.mFacts" $ sequence
       [ do
           v ← retainedPer nFacts (ints nFacts) id (\is → pure (factsOf (Fingerprint ident0 1 [] []) [] (ReadSet [(KeyLink (SrcNode (compKey 3 i)), Just (RecChild (SrcNode (compKey 3 (i + 7))))) | i ← is] []))) (\fx → evaluate (factsRetainedBytes fx))
           pure (Variant "N packed read facts, the largest kind (a source key and a source child)" v (Just (BS.length (encodeKey (KeyLink (SrcNode (compKey 3 1)))) + BS.length (encodeValue (RecChild (SrcNode (compKey 3 8)))) + readFactOverheadBytes)))
@@ -307,7 +310,7 @@ spec = describe "the accounted-bytes constants against what is retained (forced 
       ]
     -- TYPED READ IN FLIGHT: what #661 holds while a read phase runs: the record read (as Haskell values), the map it keeps it in and the
     -- ascending list it is handed over as, all alive together
-    mTypedRead ← sequence $
+    mTypedRead ← lazily "Memory.mTypedRead" $ sequence $
       [ do
           v ← retainedPer 3000 (ints 3000) id (\is → pure (typedReadsOf kf rf is)) (\(m, l) → evaluate (sum (map recordWeight l) + Map.size m))
           pure (Variant nm v Nothing)
@@ -318,7 +321,7 @@ spec = describe "the accounted-bytes constants against what is retained (forced 
                pure (Variant "floor query (a column and a level) with its answer" v Nothing)
            ]
     -- DISCOVERY HEADER: the always-resident control record (an authority and three counters), every field at its largest
-    mHeader ← retainedPer 1000 (ints 1000) id (\is → pure [headerOf i | i ← is]) (\hs → evaluate (sum [fromIntegral (hHead h) + fromIntegral (hTail h) + hBytes h | h ← hs]))
+    mHeader ← lazily "Memory.mHeader" (retainedPer 1000 (ints 1000) id (\is → pure [headerOf i | i ← is]) (\hs → evaluate (sum [fromIntegral (hHead h) + fromIntegral (hTail h) + hBytes h | h ← hs])))
     pure
       [ Row "window page (buffer + map entry)" "a 4,096-byte validated buffer whatever the page says: every tree, leaf and internal, measured; they differ by no more than their map entry" Nothing windowPageBytes mPage
       , Row "probe (map entry + key)" "the longest key a valid page holds is 52 bytes (the links tree); the bound a page could carry is 64 (maxKeyBytes), measured too" (Just "key of 64 bytes") probeBytes mProbe
@@ -339,13 +342,13 @@ spec = describe "the accounted-bytes constants against what is retained (forced 
       ]
   it "TABLE: every accounted constant, its largest valid instance and why, every variant measured against the accounted figure" $ do
     forM_ rows $ \r → do
-      putStrLn ("MEMORY " <> rowName r <> " [accounted " <> show (rowAccounted r) <> " B]: largest valid instance: " <> rowLargest r)
-      forM_ (rowVariants r) $ \v → putStrLn ("MEMORY   variant " <> varName v <> ": " <> show (round (varMeasured v) ∷ Int) <> " B")
+      printLine ("MEMORY " <> rowName r <> " [accounted " <> show (rowAccounted r) <> " B]: largest valid instance: " <> rowLargest r)
+      forM_ (rowVariants r) $ \v → printLine ("MEMORY   variant " <> varName v <> ": " <> show (round (varMeasured v) ∷ Int) <> " B")
       let m = varMeasured (rowMax r)
           acc = fromIntegral (fromMaybe (rowAccounted r) (varBudget (rowMax r))) ∷ Double
-      putStrLn ("MEMORY   -> largest measured: " <> varName (rowMax r) <> " at " <> show (round m ∷ Int) <> " B of " <> show (round acc ∷ Int) <> " accounted (margin " <> show (round (acc - m) ∷ Int) <> " B, " <> show (round (100 * (acc - m) / m) ∷ Int) <> " %)")
+      printLine ("MEMORY   -> largest measured: " <> varName (rowMax r) <> " at " <> show (round m ∷ Int) <> " B of " <> show (round acc ∷ Int) <> " accounted (margin " <> show (round (acc - m) ∷ Int) <> " B, " <> show (round (100 * (acc - m) / m) ∷ Int) <> " %)")
     -- the constants that are LEDGER terms, not retained structures: no object of the store stands behind them
-    putStrLn "MEMORY ledger terms (no store heap structure): ramPagePins (16 per window page), ramContinuation (1,024 + 8 per window page), the 4,096-byte scratch, descriptorRecordBytes (queued I/O descriptors of the admission)"
+    printLine "MEMORY ledger terms (no store heap structure): ramPagePins (16 per window page), ramContinuation (1,024 + 8 per window page), the 4,096-byte scratch, descriptorRecordBytes (queued I/O descriptors of the admission)"
   forM_ rows $ \r → do
     it ("every variant retains no more than it is charged: " <> rowName r) $
       forM_ (rowVariants r) $ \v → (varName v, varMeasured v <= fromIntegral (fromMaybe (rowAccounted r) (varBudget v))) `shouldBe` (varName v, True)
@@ -405,11 +408,11 @@ spec = describe "the accounted-bytes constants against what is retained (forced 
         mkFacts salt = factsOf (fingerprintOf salt) [FactGone (fromInteger (big (i + salt))) (PageNo (fromInteger (big (i + salt + 1)))) | i ← [1 .. maxProofFacts]] (ReadSet [(KeyLink (SrcNode (compKey 3 (i + salt))), Just (RecChild (SrcNode (compKey 3 (i + salt + 7))))) | i ← ints nFacts] [])
     measured ← retainedPer 1 [()] (const 0) (\_ → pure (mkFacts 1)) (\fx → evaluate (factsRetainedBytes fx))
     let accounted = factsRetainedBytes (mkFacts 100000)
-    putStrLn ("MEMORY a Facts value of " <> show nFacts <> " read facts and " <> show maxProofFacts <> " proof facts: retains " <> show (round measured ∷ Int) <> " B, accounted " <> show accounted <> " B")
+    printLine ("MEMORY a Facts value of " <> show nFacts <> " read facts and " <> show maxProofFacts <> " proof facts: retains " <> show (round measured ∷ Int) <> " B, accounted " <> show accounted <> " B")
     (measured <= fromIntegral accounted, accounted <= maxReadFactBytes + maxProofFacts * factBytes + fingerprintBytes) `shouldBe` (True, True)
   it "the read facts at their ceiling retain no more than the ceiling: N of them, near maxReadFactBytes, in total" $ do
-    mTotal ← retainedPer 1 [()] (const 0) (\_ → pure (windowCheckpoint (factsOf (Fingerprint ident0 1 [] []) [] (ReadSet [(KeyLink (SrcNode (compKey 3 i)), Just (RecChild (SrcNode (compKey 3 (i + 7))))) | i ← ints nFacts] [])) (emptyWindow ident0 1))) (\w → evaluate (windowReadFactCount w))
-    putStrLn ("MEMORY read facts at the ceiling: " <> show nFacts <> " facts retain " <> show (round mTotal ∷ Int) <> " B of " <> show maxReadFactBytes)
+    mTotal ← lazily "Memory.mTotal" (retainedPer 1 [()] (const 0) (\_ → pure (windowCheckpoint (factsOf (Fingerprint ident0 1 [] []) [] (ReadSet [(KeyLink (SrcNode (compKey 3 i)), Just (RecChild (SrcNode (compKey 3 (i + 7))))) | i ← ints nFacts] [])) (emptyWindow ident0 1))) (\w → evaluate (windowReadFactCount w)))
+    printLine ("MEMORY read facts at the ceiling: " <> show nFacts <> " facts retain " <> show (round mTotal ∷ Int) <> " B of " <> show maxReadFactBytes)
     (mTotal <= fromIntegral maxReadFactBytes) `shouldBe` True
     unless (nFacts > 0) (expectationFailure "no facts")
   where

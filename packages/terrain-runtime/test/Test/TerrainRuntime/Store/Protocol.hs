@@ -7,7 +7,7 @@
 -- the facade documents, for EVERY starting work limit from 1 to 64, for discovery, a standalone removal and maintenance, under
 -- the standard bounds and under the tightest window the at-once bounds allow: pending work always drains, and no step
 -- ever answers 'Invalid', 'Integrity', 'Stale' or any capacity the protocol does not name.
-module Test.TerrainRuntime.Store.Protocol (spec) where
+module Test.TerrainRuntime.Store.Protocol (spec, fullSpec) where
 
 import Control.Monad (foldM, forM, forM_)
 import Data.Bifunctor (first)
@@ -23,7 +23,9 @@ import Hetoimasia.Terrain.Runtime.Store.Internal.State
 import Hetoimasia.Terrain.Runtime.Store.Internal.Tree
 import Hetoimasia.Terrain.Residency (ArenaId (..))
 import Hetoimasia.Terrain.Runtime.Store.Admission (Class (..), EditBankSpec (..), defaultEditBankSpec, mkEditBankConfig, newAdmission, reserve, transactionCredits)
+import Test.TerrainRuntime.Output (printLine)
 import Test.Hspec
+import Test.TerrainRuntime.Store.Depth (Depth (..), atDepth)
 import Test.TerrainRuntime.Store.Harness
 import Test.TerrainRuntime.Store.Reference
 import Test.TerrainRuntime.Store.Scattered (fragmented)
@@ -191,11 +193,16 @@ maintenanceUntil done boundsOf limit = go 0 noCounts
               go (n + 1) (addCounts c c') h2
             other → Left ("maintenance answered " <> take 200 (show other))
 
-spec ∷ Spec
-spec = readPhaseSpec >> protocolSpec
+-- | The routine depth, and every family at its original depth (the optional full-depth probe).
+spec, fullSpec ∷ Spec
+spec = specAt Routine
+fullSpec = specAt Full
 
-protocolSpec ∷ Spec
-protocolSpec = describe "the facade's caller protocol, followed exactly, for every starting work limit" $ do
+specAt ∷ Depth → Spec
+specAt depth = readPhaseSpec >> protocolSpec depth
+
+protocolSpec ∷ Depth → Spec
+protocolSpec depth = describe "the facade's caller protocol, followed exactly, for every starting work limit" $ do
   let limits = [1 .. 64 ∷ Int]
       withScene = do
         let run0 = newRun smallSpec twoOpenings 64
@@ -220,7 +227,7 @@ protocolSpec = describe "the facade's caller protocol, followed exactly, for eve
               || discoveryUnitWindowPages maxRetireInternals hf hrec pins * windowPageBytes + discoveryUnitWorstProbes * probeBytes > maxWindowBytes
           ]
     bad `shouldBe` []
-    putStrLn ("PROTOCOL bounds: unit of discovery (3 writes) at (8,8,16) = " <> show (discoveryUnitWindowPages maxRetireInternals 8 8 16) <> " pages, removal (7 writes) = " <> show (removalWindowPages maxRetireInternals 8 8 16) <> ", limit " <> show (maxWindowBytes `div` windowPageBytes))
+    printLine ("PROTOCOL bounds: unit of discovery (3 writes) at (8,8,16) = " <> show (discoveryUnitWindowPages maxRetireInternals 8 8 16) <> " pages, removal (7 writes) = " <> show (removalWindowPages maxRetireInternals 8 8 16) <> ", limit " <> show (maxWindowBytes `div` windowPageBytes))
   it "the reviewer's repro: after one batch through a work limit of one, the remaining discovery plans at limits 1, 2 and 3 (it was refused at 1 and 2)" $ do
     (_, r1) ← withScene
     forM_ [1, 2, 3 ∷ Int] $ \lim → do
@@ -250,7 +257,7 @@ protocolSpec = describe "the facade's caller protocol, followed exactly, for eve
       must (checkH (runH a))
       must (checkH (runH b))
       pure (lim, na, nb, maximum (0 : map (mWindowPages . plMeasure) (runPlans b)))
-    putStrLn ("PROTOCOL discovery: " <> show (length rows) <> " starting limits x 2 bounds (the tight window is " <> show (bdWindowPages tight) <> " pages); batches (standard, tight) at limits 1, 2, 3, 64: " <> show [(l, a, b) | (l, a, b, _) ← rows, l `elem` [1, 2, 3, 64]] <> "; total batches " <> show (sum [a + b | (_, a, b, _) ← rows]) <> "; the most pages a plan held in the tight window " <> show (maximum [m | (_, _, _, m) ← rows]) <> " of " <> show (bdWindowPages tight))
+    printLine ("PROTOCOL discovery: " <> show (length rows) <> " starting limits x 2 bounds (the tight window is " <> show (bdWindowPages tight) <> " pages); batches (standard, tight) at limits 1, 2, 3, 64: " <> show [(l, a, b) | (l, a, b, _) ← rows, l `elem` [1, 2, 3, 64]] <> "; total batches " <> show (sum [a + b | (_, a, b, _) ← rows]) <> "; the most pages a plan held in the tight window " <> show (maximum [m | (_, _, _, m) ← rows]) <> " of " <> show (bdWindowPages tight))
     -- the tight window is not slack for the unit: no plan held more than it allows, and the bound is reached
     (maximum [m | (_, _, _, m) ← rows] <= bdWindowPages tight) `shouldBe` True
   it "plans the smallest unit of discovery (one connection inspection) in a window of exactly its at-once bound, over deep trees, a free space with no tail and 16 pinned versions, from a starting limit of 3 and of 64" $ do
@@ -276,7 +283,7 @@ protocolSpec = describe "the facade's caller protocol, followed exactly, for eve
       case p of
         Planned pl → do
           (mWindowPages (plMeasure pl) <= lim) `shouldBe` True
-          putStrLn ("PROTOCOL discovery at once: heights " <> show (hrec, hf, retireInternalsOf hP) <> ", 16 pinned, start " <> show start <> ", bound " <> show lim <> ", held " <> show (mWindowPages (plMeasure pl)) <> ", " <> show (cCheckpoints c) <> " checkpoints, " <> show (cReductions c) <> " reductions")
+          printLine ("PROTOCOL discovery at once: heights " <> show (hrec, hf, retireInternalsOf hP) <> ", 16 pinned, start " <> show start <> ", bound " <> show lim <> ", held " <> show (mWindowPages (plMeasure pl)) <> ", " <> show (cCheckpoints c) <> " checkpoints, " <> show (cReductions c) <> " reductions")
         other → expectationFailure ("start " <> show start <> ": " <> take 300 (show other))
   it "plans a standalone removal through the protocol at every starting limit 1..64 as it does with no limit (it is atomic and reads none)" $ do
     let run0 = newRun smallSpec sealedStack 64
@@ -306,12 +313,12 @@ protocolSpec = describe "the facade's caller protocol, followed exactly, for eve
       rRetiredPages (storeRoots (hStore a)) `shouldBe` 0
       rRetiredPages (storeRoots (hStore b)) `shouldBe` 0
       pure (lim, na, nb)
-    putStrLn ("PROTOCOL maintenance: " <> show (length rows) <> " starting limits x 2 bounds, " <> show (rRetiredPages (storeRoots (hStore h0))) <> " retired pages each; transactions (standard, tight) at limits 1, 2, 3, 64: " <> show [r | r@(l, _, _) ← rows, l `elem` [1, 2, 3, 64]] <> "; total " <> show (sum [a + b | (_, a, b) ← rows]))
+    printLine ("PROTOCOL maintenance: " <> show (length rows) <> " starting limits x 2 bounds, " <> show (rRetiredPages (storeRoots (hStore h0))) <> " retired pages each; transactions (standard, tight) at limits 1, 2, 3, 64: " <> show [r | r@(l, _, _) ← rows, l `elem` [1, 2, 3, 64]] <> "; total " <> show (sum [a + b | (_, a, b) ← rows]))
   it "reclaims the oldest entry of the fragmented store (64 dispersed pages) through the protocol at the limits 1, 2, 3, 7, 8, 16, 33, 63 and 64, standard and tight" $ do
     let (hF, _, _) = fragmented
         retired0 = rRetiredPages (storeRoots (hStore hF))
         entryDone h = rRetiredPages (storeRoots (hStore h)) + 64 <= retired0
-    rows ← forM [1, 2, 3, 7, 8, 16, 33, 63, 64] $ \lim → do
+    rows ← forM (atDepth depth [8] [1, 2, 3, 7, 8, 16, 33, 63, 64]) $ \lim → do
       (a, na, _) ← must (maintenanceUntil entryDone (const standardBounds) lim hF)
       (b, nb, _) ← must (maintenanceUntil entryDone (const (maintenanceTight hF)) lim hF)
       must (checkH a)
@@ -319,7 +326,7 @@ protocolSpec = describe "the facade's caller protocol, followed exactly, for eve
       entryDone a `shouldBe` True
       entryDone b `shouldBe` True
       pure (lim, na, nb)
-    putStrLn ("PROTOCOL fragmented entry: transactions (standard, tight) per starting limit " <> show rows)
+    printLine ("PROTOCOL fragmented entry: transactions (standard, tight) per starting limit " <> show rows)
 
   it "drains discovery, a removal and maintenance from an UNLIMITED starting window, not only from the limits 1..64" $ do
     (_, r1) ← withScene
@@ -491,7 +498,7 @@ readPhaseSpec = describe "the read phase: records are facts, a window never hold
     ((removalWindowPages maxRetireInternals (maxLevel + 1) (maxLevel + 1) maxReaders + 1) * windowPageBytes + removalWorstProbes * probeBytes > maxWindowBytes) `shouldBe` True
     -- the facts of the worst removal and of a discovery unit are RAM the feasibility proofs count, and they fit
     (worstEditReads * recordFactBytes <= maxReadFactBytes, worstEdgeReads * recordFactBytes <= maxReadFactBytes) `shouldBe` (True, True)
-    putStrLn ("READPHASE bounds: residue " <> show readResiduePages <> " pages; promised removal at (8,8,16) = " <> show (removalWindowPages maxRetireInternals 8 8 16) <> ", discovery unit = " <> show (discoveryUnitWindowPages maxRetireInternals 8 8 16) <> ", one read at 8 levels = " <> show (readPathPages 8) <> "; facts: removal " <> show (worstEditReads * recordFactBytes) <> " B, discovery unit " <> show (worstEdgeReads * recordFactBytes) <> " B, ceiling " <> show maxReadFactBytes)
+    printLine ("READPHASE bounds: residue " <> show readResiduePages <> " pages; promised removal at (8,8,16) = " <> show (removalWindowPages maxRetireInternals 8 8 16) <> ", discovery unit = " <> show (discoveryUnitWindowPages maxRetireInternals 8 8 16) <> ", one read at 8 levels = " <> show (readPathPages 8) <> "; facts: removal " <> show (worstEditReads * recordFactBytes) <> " B, discovery unit " <> show (worstEdgeReads * recordFactBytes) <> " B, ceiling " <> show maxReadFactBytes)
   it "removes the cell between two runs whose chains are 12 and 64 links long at EXACTLY the promised bound, and plans what the standard bounds plan" $ do
     forM_ [12, 64] $ \hops → do
       (h, env, tile) ← must (chainStore hops 8192)
@@ -505,17 +512,17 @@ readPhaseSpec = describe "the read phase: records are facts, a window never hold
       -- the window the plan ends in holds no more than the promise, and the read phase peaked at exactly the bound it ran under
       (mWindowPages (plMeasure (runPlan tight)) <= promise) `shouldBe` True
       (cReadPeak (cOf tight) <= promise) `shouldBe` True
-      putStrLn ("READPHASE removal " <> show hops <> " hops: heights (records " <> show (recordHeight h) <> ", free " <> show (heightOf h TreeFree) <> "), promised " <> show promise <> ", read peak (tight " <> show (cReadPeak (cOf tight)) <> ", standard " <> show (cReadPeak (cOf std)) <> "), edit window " <> show (mWindowPages (plMeasure (runPlan tight))) <> ", checkpoints (tight " <> show (cCheckpoints (cOf tight)) <> ", standard " <> show (cCheckpoints (cOf std)) <> "), facts " <> show (cFacts (cOf tight)))
+      printLine ("READPHASE removal " <> show hops <> " hops: heights (records " <> show (recordHeight h) <> ", free " <> show (heightOf h TreeFree) <> "), promised " <> show promise <> ", read peak (tight " <> show (cReadPeak (cOf tight)) <> ", standard " <> show (cReadPeak (cOf std)) <> "), edit window " <> show (mWindowPages (plMeasure (runPlan tight))) <> ", checkpoints (tight " <> show (cCheckpoints (cOf tight)) <> ", standard " <> show (cCheckpoints (cOf std)) <> "), facts " <> show (cFacts (cOf tight)))
       -- the continuation was used: the reads do not fit the bound without it
       (cCheckpoints (cOf tight) > 0) `shouldBe` True
       -- how much of the promise the plan needs: the smallest bound it succeeds under, and one page less fails (the formula is an
       -- upper bound over every shape of tree and read; the edit phase of this fixture is far from it, the read phase is at it)
       bmin ← must (minimalBound h planner promise)
-      putStrLn ("READPHASE removal " <> show hops <> " hops: smallest bound the plan succeeds under " <> show bmin <> " of the promised " <> show promise)
+      printLine ("READPHASE removal " <> show hops <> " hops: smallest bound the plan succeeds under " <> show bmin <> " of the promised " <> show promise)
       (bmin <= promise, bmin >= readPathPages (recordHeight h)) `shouldBe` (True, True)
       -- the proof phase holds no more probes than the pages the removal writes, which 'removalWorstProbes' is derived from
       (cProbePeak (cOf tight) <= removalWorstProbes, cProbePeak (cOf std) <= removalWorstProbes) `shouldBe` (True, True)
-      putStrLn ("READPHASE removal " <> show hops <> " hops: most probes a window held " <> show (cProbePeak (cOf tight)) <> " (tight), " <> show (cProbePeak (cOf std)) <> " (standard) of " <> show removalWorstProbes)
+      printLine ("READPHASE removal " <> show hops <> " hops: most probes a window held " <> show (cProbePeak (cOf tight)) <> " (tight), " <> show (cProbePeak (cOf std)) <> " (standard) of " <> show removalWorstProbes)
   it "caps the reads of a read phase at what its typed set can hold, and the cap is never a refusal: a removal and a unit fit, a batch ends early" $ do
     -- the derived cap is above everything one removal or one inspection can read (so neither can be refused for it) and below what a
     -- default batch may ask for (so it is the cap that ends a long batch, not the allowance of #661)
@@ -542,7 +549,7 @@ readPhaseSpec = describe "the read phase: records are facts, a window never hold
       (hc, n, _) ← must (drainThrough hd 64 (batchPlanner cap))
       rc ← must (recordsOfStore hc)
       pure (n, rc == recStd, pendingObligations (storeHeader (hStore hc)))
-    putStrLn ("READPHASE read cap " <> show maxTypedReads <> " (removal needs at most " <> show worstEditReads <> ", an inspection " <> show worstEdgeReads <> "); updates in the first batch at caps " <> show caps <> " = " <> show updates <> " (standard bounds " <> show (mUpdates (plMeasure (runPlan stdBatch))) <> "); batches to drain " <> show (map (\(n, _, _) → n) drained) <> " (standard " <> show nStd <> ")")
+    printLine ("READPHASE read cap " <> show maxTypedReads <> " (removal needs at most " <> show worstEditReads <> ", an inspection " <> show worstEdgeReads <> "); updates in the first batch at caps " <> show caps <> " = " <> show updates <> " (standard bounds " <> show (mUpdates (plMeasure (runPlan stdBatch))) <> "); batches to drain " <> show (map (\(n, _, _) → n) drained) <> " (standard " <> show nStd <> ")")
     -- the cap at one inspection ends the batch after fewer updates than a cap that holds more; every cap drains to the same records
     -- (the fixture's batches read few records, so the caps above do not bite: every cap plans the same batch, which is the point of a
     -- cap that is never a refusal. The cut itself is shown at #661's step below.)
@@ -563,7 +570,7 @@ readPhaseSpec = describe "the read phase: records are facts, a window never hold
         oneUnit = stepWith full {allowWrites = worstEdgeWrites}
         whole = stepWith full
         cappedAtUnit = stepWith full {allowReads = readsOf oneUnit}
-    putStrLn ("READPHASE early end: one inspection reads " <> show (readsOf oneUnit) <> " and writes " <> show (updatesOf oneUnit) <> "; the whole batch reads " <> show (readsOf whole) <> " and writes " <> show (updatesOf whole) <> "; with the allowance at one inspection's reads: " <> show (readsOf cappedAtUnit) <> " reads, " <> show (updatesOf cappedAtUnit) <> " writes")
+    printLine ("READPHASE early end: one inspection reads " <> show (readsOf oneUnit) <> " and writes " <> show (updatesOf oneUnit) <> "; the whole batch reads " <> show (readsOf whole) <> " and writes " <> show (updatesOf whole) <> "; with the allowance at one inspection's reads: " <> show (readsOf cappedAtUnit) <> " reads, " <> show (updatesOf cappedAtUnit) <> " writes")
     -- the whole batch needs more reads than one inspection (so the cap bites), and capped at one inspection's reads it is PROGRESS with
     -- exactly the inspection that fits, within the allowance
     (readsOf whole > readsOf oneUnit, updatesOf whole > updatesOf oneUnit) `shouldBe` (True, True)
@@ -613,10 +620,10 @@ readPhaseSpec = describe "the read phase: records are facts, a window never hold
     samePlan (runPlan std64) (runPlan free64) `shouldBe` True
     (mWindowPages (plMeasure (runPlan tight)) <= promise, cReadPeak (cOf tight) <= promise, cCheckpoints (cOf tight) > 0) `shouldBe` (True, True, True)
     bminD ← must (minimalBound h planner promise)
-    putStrLn ("READPHASE discovery unit: smallest bound the plan succeeds under " <> show bminD <> " of the promised " <> show promise)
+    printLine ("READPHASE discovery unit: smallest bound the plan succeeds under " <> show bminD <> " of the promised " <> show promise)
     (bminD <= promise, bminD >= readPathPages (recordHeight h)) `shouldBe` (True, True)
     (cProbePeak (cOf tight) <= discoveryUnitWorstProbes, cProbePeak (cOf std) <= discoveryUnitWorstProbes) `shouldBe` (True, True)
-    putStrLn ("READPHASE discovery unit: most probes a window held " <> show (cProbePeak (cOf tight)) <> " (tight), " <> show (cProbePeak (cOf std)) <> " (standard) of " <> show discoveryUnitWorstProbes)
+    printLine ("READPHASE discovery unit: most probes a window held " <> show (cProbePeak (cOf tight)) <> " (tight), " <> show (cProbePeak (cOf std)) <> " (standard) of " <> show discoveryUnitWorstProbes)
     -- a 64-update batch: the batch is whatever the pages the window holds complete, so only the end state is the same: drained
     -- through tight and through standard bounds, the stores hold the same records
     (hStd, nStd, cStd) ← must (drainThrough h 64 (planner standardBounds))
@@ -626,7 +633,7 @@ readPhaseSpec = describe "the read phase: records are facts, a window never hold
     recTight `shouldBe` recStd
     pendingObligations (storeHeader (hStore hStd)) `shouldBe` 0
     pendingObligations (storeHeader (hStore hTight)) `shouldBe` 0
-    putStrLn ("READPHASE discovery 40 links: promised " <> show promise <> ", unit: read peak " <> show (cReadPeak (cOf tight)) <> ", edit window " <> show (mWindowPages (plMeasure (runPlan tight))) <> ", checkpoints " <> show (cCheckpoints (cOf tight)) <> ", facts " <> show (cFacts (cOf tight)) <> "; drained: standard " <> show nStd <> " batches / " <> show (cCheckpoints cStd) <> " checkpoints, tight " <> show nTight <> " batches / " <> show (cCheckpoints cTight) <> " checkpoints")
+    printLine ("READPHASE discovery 40 links: promised " <> show promise <> ", unit: read peak " <> show (cReadPeak (cOf tight)) <> ", edit window " <> show (mWindowPages (plMeasure (runPlan tight))) <> ", checkpoints " <> show (cCheckpoints (cOf tight)) <> ", facts " <> show (cFacts (cOf tight)) <> "; drained: standard " <> show nStd <> " batches / " <> show (cCheckpoints cStd) <> " checkpoints, tight " <> show nTight <> " batches / " <> show (cCheckpoints cTight) <> " checkpoints")
   it "counts the read facts a plan holds in its RAM, and the feasibility proofs count the most a removal and a discovery unit read" $ do
     (h, env, tile) ← must (chainStore 64 8192)
     pl ← must (runThrough h 64 (\hh w → planRemovalWith (tightBounds (removalPromise h)) env (hStore hh) w tile))
@@ -635,9 +642,9 @@ readPhaseSpec = describe "the read phase: records are facts, a window never hold
     let cont = ramContinuation (mRam (plMeasure (runPlan pl)))
     (cont >= cFacts (cOf pl) * readFactOverheadBytes, cont <= 1024 + maxWindowPages * 8 + cFacts (cOf pl) * recordFactBytes) `shouldBe` (True, True)
     -- the supported minimum removal and the smallest unit of discovery, with the facts of their most reads, fit the RAM bound
-    putStrLn ("READPHASE RAM honest: minimum removal " <> show minimumRemovalRam <> ", discovery unit " <> show minimumDiscoveryUnitRam <> ", limit " <> show txnRamLimit <> "; the worst components " <> show worstPlanCharge)
+    printLine ("READPHASE RAM honest: minimum removal " <> show minimumRemovalRam <> ", discovery unit " <> show minimumDiscoveryUnitRam <> ", limit " <> show txnRamLimit <> "; the worst components " <> show worstPlanCharge)
     (minimumRemovalRam <= txnRamLimit, minimumDiscoveryUnitRam <= txnRamLimit) `shouldBe` (True, True)
-    putStrLn ("READPHASE RAM: facts held " <> show (cFacts (cOf pl)) <> " x " <> show recordFactBytes <> " B; minimum removal " <> show minimumRemovalRam <> " B, discovery unit " <> show minimumDiscoveryUnitRam <> " B of " <> show txnRamLimit)
+    printLine ("READPHASE RAM: facts held " <> show (cFacts (cOf pl)) <> " x " <> show recordFactBytes <> " B; minimum removal " <> show minimumRemovalRam <> " B, discovery unit " <> show minimumDiscoveryUnitRam <> " B of " <> show txnRamLimit)
   it "facts are for one state only: facts a plan took are ignored by a plan at another version, which plans what a clean window plans" $ do
     (h, env, tile) ← must (chainStore 12 8192)
     let planner bounds hh w = planRemovalWith bounds env (hStore hh) w tile
@@ -700,4 +707,4 @@ readPhaseSpec = describe "the read phase: records are facts, a window never hold
     (c2, s2, ch2) ← tightest 4 (toInteger maxReaders)
     -- the default configuration holds the control account the worst case needs
     (c2 <= ebsControl defaultEditBankSpec, c1 <= c2) `shouldBe` (True, True)
-    putStrLn ("READPHASE funding: tightest accepted (control, protected staging, cache) at 1x1 = " <> show (c1, s1, ch1) <> ", at 4x" <> show maxReaders <> " = " <> show (c2, s2, ch2) <> "; default control " <> show (ebsControl defaultEditBankSpec) <> "; credits of the actual plans " <> show [(n, transactionCredits (ArenaId 1) (mRam (plMeasure p))) | (n, p) ← plans])
+    printLine ("READPHASE funding: tightest accepted (control, protected staging, cache) at 1x1 = " <> show (c1, s1, ch1) <> ", at 4x" <> show maxReaders <> " = " <> show (c2, s2, ch2) <> "; default control " <> show (ebsControl defaultEditBankSpec) <> "; credits of the actual plans " <> show [(n, transactionCredits (ArenaId 1) (mRam (plMeasure p))) | (n, p) ← plans])

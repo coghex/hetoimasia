@@ -114,6 +114,7 @@ import System.IO.Temp (withSystemTempDirectory)
 import Hetoimasia.Foundation.Resource (cleanupFailuresInContext, displayCleanupFailure)
 import Test.Hspec (expectationFailure, shouldSatisfy)
 import Test.Support.Bounded (bounded)
+import Test.TerrainRuntime.Isolation (assertSequential)
 import Test.TerrainRuntime.Store.Harness (H (..), deltaFor, fillPlan, identOf, ident0, newH, runKey, runRec)
 
 -- | The default incarnation of the examples, and a second one.
@@ -594,6 +595,7 @@ withEnvWith opts body = withSystemTempDirectory "hetoimasia-terrain-storage" $ \
 -- volume), with the same checks at its end.
 withEnvIn ∷ FilePath → EnvOptions → (Env → IO a) → IO a
 withEnvIn dir opts body = do
+    assertSequential "a storage example (files, workers)"
     cfg ← testConfigFor dir opts
     probe ← newProbe
     atomically (writeTVar (pFact probe) (eoCloseFact opts))

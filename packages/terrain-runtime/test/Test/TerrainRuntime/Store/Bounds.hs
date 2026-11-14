@@ -10,8 +10,9 @@
 -- allocation of an edit, a read, a reclamation step and a usage report is measured at
 -- two history sizes: a history-sized map or bitmap built behind the interface would
 -- make the larger history allocate proportionally more, and fails these.
-module Test.TerrainRuntime.Store.Bounds (spec, wide, findExact256, allocationRatios) where
+module Test.TerrainRuntime.Store.Bounds (spec, wide, wide20000, findExact256, allocationRatios) where
 
+import Test.TerrainRuntime.Output (printLine)
 import Control.Monad (foldM, forM_)
 import qualified Data.ByteString as BS
 import qualified Data.Map.Strict as Map
@@ -26,8 +27,11 @@ import Hetoimasia.Terrain.Runtime.Store.Internal.Records (encodeKey, encodeValue
 import Hetoimasia.Terrain.Runtime.Store.Internal.State
 import Hetoimasia.Terrain.Runtime.Store.Internal.Tree
 import Control.Exception (evaluate)
+import System.IO.Unsafe (unsafePerformIO)
 import System.Mem (performMajorGC)
 import Test.Hspec
+import Test.TerrainRuntime.Isolation (assertSequential)
+import Test.TerrainRuntime.Store.Depth (Fixture, newFixture, readFixture)
 import Test.TerrainRuntime.Store.Harness
 import Test.TerrainRuntime.Store.Reference
 import Test.TerrainRuntime.Store.Scenes
@@ -61,11 +65,12 @@ allocated = allocated_bytes <$> getRTSStats
 
 -- | The live heap after a major collection.
 liveBytes ∷ IO Word64
-liveBytes = performMajorGC >> (gcdetails_live_bytes . gc <$> getRTSStats)
+liveBytes = assertSequential "a live-heap reading" >> performMajorGC >> (gcdetails_live_bytes . gc <$> getRTSStats)
 
 -- | The bytes a forced computation allocates.
 measure ∷ IO a → IO Word64
 measure act = do
+  assertSequential "an allocation measurement"
   performMajorGC
   start ← allocated
   _ ← act
@@ -159,10 +164,18 @@ allocationRatios hBig keysBig = do
     , ("control: a map of every record key", m1, m2)
     ]
 
+-- | The 20,000-run store the exact-256-page plan and the allocation observations read (a plan reaches 256 pages only
+-- through writes spread one per leaf at a stride of 60 keys, so it cannot be smaller than 15,600 runs). Built by the
+-- first example of the process that reads it, once, whatever module reads it; the evidence examples share it.
+-- State: one cell, written by the first read and then only read; the process owns it and it is never reset.
+wide20000 ∷ Fixture (H, [RecordKey])
+wide20000 = unsafePerformIO (newFixture "Bounds.wide 20000" (must (wide 20000)))
+{-# NOINLINE wide20000 #-}
+
 spec ∷ Spec
 spec = describe "transaction bounds, exactly and one past, and work independent of history" $ do
-  (hBig, keysBig) ← runIO (must (wide 20000))
   it "writes at most 256 pages: met exactly, refused one past, with the RAM and window inside their bounds" $ do
+    (hBig, keysBig) ← readFixture wide20000
     length keysBig `shouldBe` 20000
     (p, n) ← must (findExact256 hBig keysBig)
     mPagesWritten (plMeasure p) `shouldBe` 256
@@ -326,7 +339,7 @@ spec = describe "transaction bounds, exactly and one past, and work independent 
     take 3 ladder `shouldBe` [64, 32, 16]
     windowWork (reduceWork (limitWork 1 (storeWindow (hStore h1))) (storeWindow (hStore h1))) `shouldBe` 1
     sizes ← mapM batchAt [64, 8, 4, 2]
-    putStrLn ("DISCOVERY batch updates at work 64, 8, 4, 2: " <> show sizes)
+    printLine ("DISCOVERY batch updates at work 64, 8, 4, 2: " <> show sizes)
     -- each smaller work plans a smaller batch than the full one, down to the least
     (sizes !! 3 < sizes !! 0) `shouldBe` True
     and (zipWith (>=) sizes (drop 1 sizes)) `shouldBe` True
@@ -357,11 +370,11 @@ spec = describe "transaction bounds, exactly and one past, and work independent 
     (p, wEnd, _, cps) ← must (fillCounting hP (storeWindow (hStore hP)) (\w → planRemovalWith bounds env (hStore hP) w tile))
     -- the proof phase of the removal on a store with no tail holds no more probes than the pages it writes (what 'removalWorstProbes' is)
     (windowProbeCount wEnd <= removalWorstProbes) `shouldBe` True
-    putStrLn ("REMOVAL at once: probes held " <> show (windowProbeCount wEnd) <> " of " <> show removalWorstProbes)
+    printLine ("REMOVAL at once: probes held " <> show (windowProbeCount wEnd) <> " of " <> show removalWorstProbes)
     case p of
       Planned pl → do
         (mWindowPages (plMeasure pl) <= lim) `shouldBe` True
-        putStrLn ("REMOVAL at once: heights " <> show (hrec, hf, internals) <> ", window bound " <> show lim <> ", held " <> show (mWindowPages (plMeasure pl)) <> ", " <> show cps <> " checkpoints, " <> show (mPagesWritten (plMeasure pl)) <> " pages written")
+        printLine ("REMOVAL at once: heights " <> show (hrec, hf, internals) <> ", window bound " <> show lim <> ", held " <> show (mWindowPages (plMeasure pl)) <> ", " <> show cps <> " checkpoints, " <> show (mPagesWritten (plMeasure pl)) <> " pages written")
       other → expectationFailure ("the removal did not fit its at-once bound of " <> show lim <> " pages: " <> take 300 (show other))
     -- and after the readers release, the same removal plans under the bound of no readers
     let released = hP {hStore = foldl (\st t → snd (releaseReader t st)) (hStore hP) toks}
@@ -427,6 +440,7 @@ spec = describe "transaction bounds, exactly and one past, and work independent 
   it "allocates no more for an edit, a read, a reclamation step or a usage report in a history forty times larger" $ do
     enabled ← getRTSStatsEnabled
     enabled `shouldBe` True
+    (hBig, keysBig) ← readFixture wide20000
     rows ← allocationRatios hBig keysBig
     forM_ rows $ \(name, small, big) → do
       let ratio = fromIntegral big / fromIntegral (max 1 small) ∷ Double

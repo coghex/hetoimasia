@@ -85,14 +85,58 @@ At baseline `da81087bb2c81e844588a0fc30197bd99201c6b9`, the local audit measured
 passing execution at approximately 13 seconds for
 foundation, 5 for runtime, 13 for headless GLFW, 8 for Lua (including the then
 embedded five-second hazard), 4 for the GPU model, and 0.5 for console. These
-exclude compilation and Cabal startup and are observations, not time budgets.
+exclude compilation and Cabal startup and are observations, not time budgets; the one stated budget is
+`terrain-runtime-tests`', in [Exhaustive CPU families](#exhaustive-cpu-families).
 External-client compiler checks explain much of the core suite time and protect
 real package boundaries; they remain required. Splitting probes does not solve
 an ordinary example hanging during protected cleanup.
 
+## Exhaustive CPU families
+
+A CPU family whose assertion is backed by a negative control, a mutation or an independent oracle, or that closes a class
+of defects, may keep a bounded representative in its routine suite while its exhaustive depth is an optional probe. The
+representative is a fixed, deterministic, strictly smaller set of the family's parameters (a proper subset of its seeds,
+limits, progress points and histories; a strictly smaller scalar with the same generator and seed for a history length or
+a fixture size), with every assertion of the original. It must catch every control recorded for the family, and keep every
+reach assertion (a class stated absolutely, such as a tree height or a collapsed root, is never rescaled; a literal that
+only restates a fixture's scale is restated beside the original). An example that encodes a reviewer's exact failing
+sequence stays routine at full strength, and so do the fast failure paths above. The full depth is one probe selection,
+so the routine run plus the probe run executes everything the unreduced suite did; no family leaves the routine suite.
+
+`terrain-runtime-tests` applies this to the temporary store's long families (random and adversarial tree histories, the
+large and scattered stores, the facade's caller protocol from every starting work limit, the ownership history, the
+re-sealed-byte fuzz, the evidence printer's histories and cycles); `terrain-runtime-full-depth-tests` runs them at their
+original parameters. [The evidence](evidence/terrain/suite-budget/README.md) lists each family's routine and full
+parameters and the controls each representative catches.
+
+### The suite's budget and its parallel group
+
+`terrain-runtime-tests` has a stated time budget; this document states none for any other suite, and a project-wide budget
+is the owner's. The whole process, from launch to exit and fixture construction included, takes at most 240 s on the
+machine that produced the baseline figures; the group's own "Finished in" line takes at most 300 s in CI; a run that
+selects no example takes at most 10 s. The figures were set against the neighbouring suites (`terrain-tests` 55.7 s and
+`terrain-render-2d-tests` 104.5 s locally; CI runs about 1.2 times local) and are fixed here, not renegotiated by a change.
+A large fixture is built by the first example that reads it and no construction work happens while the spec tree is built,
+which is what keeps a focused or empty selection cheap; each build prints one `FIXTURE built` line.
+
+To meet it, the pure store families run in parallel at the level of the test runner, each example on its own core. An
+example may run in parallel only if it touches no file, thread, clock, runtime statistic or shared mutable state (a fixture
+it reads is immutable and built once). Everything that measures the process or depends on scheduling runs sequentially, on
+exactly one capability, after the group and never beside a parallel example: the memory rows and every other heap or
+allocation measurement, every storage and service example, the examples that compile an external client. The parallel modules
+are named in one place, `Test.TerrainRuntime.Parallel`, with the reason each qualifies; nothing that measures the process or
+depends on scheduling may join them. The suite asserts the isolation itself (`Test.TerrainRuntime.Isolation`): every parallel
+example, its setup and its cleanup on every exit is counted, and every sequential example, and every lazily built
+measurement, fails if a parallel example is running or more than one capability is active. It stays one executable with one
+"Finished in" line and the unchanged catalog command; `Main` sets the runner's job count to the processor count up to eight
+(`--jobs N` replaces it) and the capability count to the job count for the group, and the guard returns the runtime to one
+capability before each sequential example; the run prints the counts it used. Seeds stay fixed and results deterministic;
+every printed line starts a line and ends whole: the parallel examples and the runner's formatter share one lock
+(`Test.TerrainRuntime.Output`), and the suite checks it with the formatters the runner can select.
+
 ## Local probe inventory
 
-All nine catalog groups below have `optional: true`, `category: probe`, and no
+All ten catalog groups below have `optional: true`, `category: probe`, and no
 CI worker assignment. They remain in the catalog so their commands, ownership,
 inputs, and platform constraints have one authority. They must not be named in
 a PR `validation-request` block; a hosted plan cannot route them. `all-hspec`
@@ -108,6 +152,7 @@ also includes them and must not be used in a PR request.
 | `probe:lua-confinement-linux` / `test.lua-confinement-linux` | `cabal test hetoimasia-scripting-lua:linux-confinement-probe --test-show-details=direct` | Linux only; confinement, limits, isolation, and lifetime feasibility; missing prerequisites can leave evidence unproven |
 | `probe:lua-confinement-macos` / `test.macos-confinement` | `cabal test hetoimasia-scripting-lua:macos-confinement-probe --test-show-details=direct` | Darwin only; confinement and resource-limit feasibility using unsupported interfaces |
 | `probe:terrain-storage-qualification` / `test.terrain-storage-qualification` | `cabal test --project-file cabal.project.cpu hetoimasia-terrain-runtime:terrain-storage-probe --test-show-details=direct` | Darwin and Linux; eight examples, a few seconds of work, but it needs a fixture first: a capped, disposable volume made by `tools/terrain-storage/macos-fixture.sh` (an APFS disk image) or `tools/terrain-storage/linux-fixture.sh` (a loop-mounted ext4 image; the one step that needs guest root), named by the pointer file the script writes. It fills that volume. Does the real filesystem honour the native reservation, the overhead it reports, writes and rewrites throughout the reserved range with the rest of the volume exhausted, growth and release failures, and reclamation after the last close? A missing or mismatched fixture fails the run. |
+| `probe:terrain-runtime-full-depth` / `test.terrain-runtime-full-depth` | `cabal test --project-file cabal.project.cpu hetoimasia-terrain-runtime:terrain-runtime-full-depth-tests --test-show-details=direct` | No file, thread or clock (one example reads the runtime's allocation counters, so it runs alone on one capability); about 16 minutes. Does every exhaustive family of the temporary store's routine suite still hold at its complete original parameters (seeds, histories, limits, progress points, fixture sizes), and does the TRA-20 evidence printer print the figures its record quotes? See [Exhaustive CPU families](#exhaustive-cpu-families). |
 | `probe:run-native-repeat` / `test.run-native-repeat` | `HETOIMASIA_NATIVE_SESSION=desktop cabal test hetoimasia:run-native-repeat-probe --test-show-details=direct` | Darwin only; the complete `run-native-tests` profile (`test.vulkan-run-native`) run N times (default 59; the profile's example count is `HETOIMASIA_REPEAT_EXAMPLES`, default 59), one at a time, windows on the desktop for the whole batch, about 12 s a run (an hour at most); a run that exceeds its 45-second bound is sampled once and stopped by pid with everything it started and counts as a hang, as does a run the initialization deadline ended; reports N, the detection confidence (1 - 0.95^N, 95.15% at 59, detection power and not proof), and how many runs passed, hung and failed, keeping every run's output and samples (#586). Device-free examples with `/bin/sh` children cover the machinery: classification, the sample bound, the stopping of everything a run, a sampler or a preparation started (found by process group, so a child a passing run left behind is stopped and counted), the stop of a batch that cannot reclaim, and the partial report of a cancelled batch. `HETOIMASIA_REPEAT_UNTIL_HANG=1` runs an unfixed revision until its first hang; the probe first builds the suite and the product executable of the checkout it runs (`HETOIMASIA_REPEAT_CHECKOUT`) and keeps that output, so a stale binary is never measured as the revision |
 
 Use `--project-file cabal.project.cpu` with the `cabal test` commands when the GLFW SDK
