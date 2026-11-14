@@ -425,8 +425,13 @@ spec = describe "the lines the suite prints and the runner's formatter's report"
         let positions = length positionLabels
             visible t = concat [l | l ← lines (render t), not (isRecordLine l), not ("Finished in " `isPrefixOf` l)]
             mine = [v | v@(variantName, _, _) ← driveVariants, (baseName <> ", ") `isPrefixOf` variantName || variantName == baseName]
+            -- Each position alone tests the transitions of the line state, which do not depend on what a toggle changes: so it runs on the
+            -- three bases, and on every variant outside the domain (where the conservative rule is what is proved). A toggle changes
+            -- what an event WRITES, and for every in-domain toggle that is checked per event by the model against the bytes, and the
+            -- records of the together-run and the unchanged text check the state it leaves: nothing is lost by not repeating each position.
+            aloneNeeded variantName intendedInDomain = variantName == baseName || not intendedInDomain
         problemsOf ← forM mine $ \(variantName, config, intendedInDomain) → do
-          results ← driveBatch (shapeFormat shape) config ([([], True), ([1 .. positions], False)] <> [([k], False) | k ← [1 .. positions]])
+          results ← driveBatch (shapeFormat shape) config ([([], True), ([1 .. positions], False)] <> [([k], False) | k ← [1 .. positions], aloneNeeded variantName intendedInDomain])
           (plainRun : togetherRun : alones) ← pure results
           let (plain, effects) = plainRun
               together = fst togetherRun

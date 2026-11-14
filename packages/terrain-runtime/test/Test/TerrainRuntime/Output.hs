@@ -26,14 +26,18 @@
 --     ("Test.TerrainRuntime.OutputSpec") shows the case: sequential examples nested in describes, after a parallel group,
 --     writing with @putStrLn@, are whole at a line start under every formatter but @progress@. The same cannot be said
 --     of the @progress@ formatter, whose dots leave the line open (a direct write then follows the dots), nor, when progress is
---     reported, of the bytes of a file: a direct write follows the transient text and its erase, whole as a terminal shows it.
+--     reported, of the bytes of a file (a direct write follows the transient text and its erase, whole as a terminal shows it), nor
+--     of any configuration outside 'modelDomain' (with html output, which wraps what a formatter writes in a span that closes after
+--     the newline, a direct write follows a closing tag; likewise after an external diff command or a diff context the model does
+--     not name): the line is left open there, and only what goes through 'printLine' begins at a line start.
 --
 -- A line longer than the buffer (8 KiB) could be split by the handle, and a line cut to fit would be a wrong record that looks
 -- right, so a line over 'maxLineChars' is never printed through 'printLine': it fails the example that tries (each family
 -- line is a few hundred bytes).
 --
--- State: the process's 'Output' (and any a test makes for itself) owns one lock and one flag, written only under the lock,
--- for the life of the process; nothing resets or disposes them.
+-- State: the process's 'Output' (and any a test makes for itself) owns one lock and one line state, written only under the lock,
+-- for the life of the process; nothing disposes them, and a formatter's creation resets the line state to what the runner has
+-- written by then (the hidden cursor).
 module Test.TerrainRuntime.Output
   ( Output
   , newOutput
