@@ -33,6 +33,7 @@ module Hetoimasia.Terrain.Internal.Residency.Coverage
   , commandRecordBytes
   , descriptionBytes
   , scratchBytes
+  , loadRunsBytes
   , removalRetainedBytes
   , removalStagingBytes
   , regionColumnReserveBytes
@@ -232,10 +233,19 @@ commandRecordBytes n = 128 + 32 * n
 descriptionBytes ∷ Word64 → Word64
 descriptionBytes n = 128 + 64 * n
 
--- | The scratch a load of @delta@ needs (staging): a fixed frame plus a full
--- extra copy of its cells at two bytes each.
+-- | The scratch a load of @delta@ needs (staging), for the load's whole life: a fixed frame, a full
+-- extra copy of its cells at two bytes each, and the removed runs the load reads of its columns
+-- ('loadRunsBytes').
 scratchBytes ∷ Coverage → Word64
-scratchBytes delta = 256 + 2 * coverageCells delta
+scratchBytes delta = 256 + 2 * coverageCells delta + loadRunsBytes (coverageColumns delta) (coverageCells delta)
+
+-- | The removed runs a load keeps of @columns@ columns holding @cells@ cells, at most, by the figures of
+-- "Hetoimasia.Terrain.Changes": a column of @l@ levels holds at most @l / 2 + 1@ separate runs (a run
+-- and the cell that separates it from the next), so all of them hold at most @cells / 2 + columns@ runs,
+-- each 'changeIntervalBytes', and a 'changeColumnBytes' entry a column (about ten bytes a cell for a
+-- region of 32 levels).
+loadRunsBytes ∷ Word64 → Word64 → Word64
+loadRunsBytes columns cells = (cells `div` 2 + columns) * fromIntegral changeIntervalBytes + columns * fromIntegral changeColumnBytes
 
 -- | The worst-case retained growth of one whole-cell removal: one new removed
 -- interval and one new column index entry (the figures of

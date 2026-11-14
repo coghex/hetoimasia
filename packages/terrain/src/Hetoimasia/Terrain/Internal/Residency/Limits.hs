@@ -44,6 +44,7 @@ import Hetoimasia.Terrain.Internal.Residency.Coverage
   , descriptionBytes
   , holdRecordBytes
   , interestRecordBytes
+  , loadRunsBytes
   , regionColumnReserveBytes
   , regionMetadataBytes
   , regionSegmentReserveBytes
@@ -272,7 +273,7 @@ explicitMinimumBytes spec bank = case bank of
     stored = regionStoredBytes x y z
     job = regionJobBytes x y z
     interest = toInteger interestRecordBytes
-    scratch = 256 + 2 * x * y * z
+    scratch = 256 + 2 * x * y * z + toInteger (loadRunsBytes (fromInteger (x * y)) (fromInteger (x * y * z)))
 
 -- | What each bank must hold. Every bank is partitioned into an explicit reserve (the
 -- explicit worst case, 'explicitMinimumBytes') and a camera share (the rest). Camera
@@ -350,7 +351,7 @@ limitQueryRegions = lQuery
 -- | The staging one camera region needs beyond its entry in a description: its interest
 -- and the scratch of a load of the whole extent.
 cameraRegionStagingBytes ∷ Integer → Integer → Integer → Integer
-cameraRegionStagingBytes x y z = toInteger interestRecordBytes + 256 + 2 * x * y * z
+cameraRegionStagingBytes x y z = toInteger interestRecordBytes + 256 + 2 * x * y * z + toInteger (loadRunsBytes (fromInteger (x * y)) (fromInteger (x * y * z)))
 
 -- | What a camera region needs of staging beyond its entry in a description (its
 -- interest and the scratch of a load of the whole extent). A description is bounded so
