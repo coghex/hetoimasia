@@ -19,6 +19,9 @@ cabal test --project-file cabal.project.cpu hetoimasia-terrain-runtime:terrain-r
 | lua-engine-tests | 1,382 | 0 | 47.3 s |
 | terrain-runtime-full-depth-tests (probe) | 99 | 0 | 1,065.9 s |
 
+At the final code head `583ad4a8`, with two examples' waits corrected (each atlas parent settled by its file; the late
+module's lines awaited), `lua-engine-tests` ran three times: 1,382 examples, 0 failures, 45.4 to 45.5 s each.
+
 Fixtures: each backed example opens its arenas in a fresh `withSystemTempDirectory` directory with a 64 MiB
 allowance, so no example fills the ordinary drive. `storage_full` is reached under a pinned old version: in the
 routine suite on a store whose overhead leaves 128 pages beyond the least the store accepts, and at full depth
