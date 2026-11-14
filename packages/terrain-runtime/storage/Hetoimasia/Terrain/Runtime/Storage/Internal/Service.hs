@@ -140,6 +140,7 @@ module Hetoimasia.Terrain.Runtime.Storage.Internal.Service
   , transferBufferBytes
   , resultPageBytes
   , backingRecordBytes
+  , maxRecordControlBytes
   , fairMaintenance
   , fairCamera
   ) where
@@ -266,6 +267,15 @@ jobCharge w = jobRecordBytes + case w of
 -- the suite.
 backingRecordBytes ∷ Word64
 backingRecordBytes = 4096
+
+-- | The most the service charges the edit bank's control account for its own records at once, given
+-- how many backings it can hold: every job record at its largest (a write of 'maxIoPages' pages that
+-- may fail), one record per backing, and every kept failure.
+maxRecordControlBytes ∷ Int → Word64
+maxRecordControlBytes backings =
+  fromIntegral maxJobRecords * (jobRecordBytes + fromIntegral maxIoPages * writeEntryBytes + writeFailureBytes)
+    + fromIntegral backings * backingRecordBytes
+    + fromIntegral maxKept * keptEntryBytes
 
 -- | Maintenance is served after at most this many explicit jobs while it waits.
 fairMaintenance ∷ Int

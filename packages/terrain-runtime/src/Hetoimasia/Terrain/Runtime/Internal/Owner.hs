@@ -199,14 +199,21 @@ nextWork svc token = do
               -- by the reads already in flight, and the grant comes next once it fits. A refusal no read can
               -- cure (nothing in flight) stalls nothing.
               --
-              -- And no pinned read starts while the storage service's queue is full: its first job would be
-              -- refused for that pressure. Reading the queue here wakes the owner when a queued job is taken.
+              -- TEMPORARY PRESSURE FROM THE STORAGE SERVICE NEVER SETTLES A REQUEST OR ENDS THE OWNER, AND IS
+              -- NEVER RETRIED AT ONCE. No pinned read starts while the storage service's queue is full (its
+              -- first job would be refused). A caller refused for pressure keeps its place and records the
+              -- mark ('notePressure'): while the storage service and the edit bank still hold exactly that,
+              -- no new storage work starts (no read, load or grant; a pressured open waits on its own wake).
+              -- Reading them here wakes the owner when any capacity is taken or returned.
               storage <- Storage.snapshotOf (serviceStorage svc)
+              pressed <- case stateStoragePressure st of
+                Nothing → pure False
+                Just mark → (== mark) <$> pressureMark svc
               let queueFull = Storage.snQueued storage >= maxQueuedJobs
               yieldToGrant <- if closing || isJust (stateSlot st) then pure False else readsYieldToGrant st adm storage
-              let holdReads = yieldToGrant || queueFull
+              let holdReads = yieldToGrant || queueFull || pressed
               (prepareWork, commitWork) <- pickRequestWork svc st adm holdReads
-              grantWork <- if closing || isJust (stateSlot st) then pure Nothing else grantable st adm
+              grantWork <- if closing || isJust (stateSlot st) || pressed then pure Nothing else grantable st adm
               -- a load is dispatched when the job the model would pick next can start its pinned read
               -- (only that job's arena needs a pin to spare)
               dispatchFits <-
@@ -296,6 +303,9 @@ backedWork st = (now, waits)
         | stateCompiling st == Nothing → Just (Left (WOpen rid))
         | otherwise → Nothing
       OpenCompiling {} → Just (Left (WOpen rid))
+      OpenSubmitting _ _ _ _ _ wake
+        | not (alive rid) → Just (Left (WOpen rid))
+        | otherwise → wakeOr wake (WOpen rid)
       OpenReserving _ _ _ _ _ wake
         | not (alive rid) → Just (Left (WOpen rid))
         | otherwise → wakeOr wake (WOpen rid)
@@ -748,9 +758,9 @@ delivered svc key gathered = (case key of GatherRequest rid → probe svc (Point
         forM_ aid $ \a → pauseArena svc a condition fault []
         void (finishJob svc jid (Left (show fault)))
       HandleClosing → void (atomically (finishJob svc jid (Left "arena closed while its load ran")))
-      -- temporary pressure (the storage queue full): the job keeps its slot and charges, and its read is
-      -- started again ('WRegather') when a pinned read can start
-      HandleRetryLater _ → pure ()
+      -- temporary pressure: the job keeps its slot and charges, and its read is started again
+      -- ('WRegather') once the storage service's capacity has changed
+      HandleRetryLater _ → atomically (notePressure svc)
       HandleDefect why → failWith svc (OwnerDefect why) []
       other → failWith svc (OwnerDefect (Text.pack ("a load's read ended unexpectedly: " <> show other))) []
 
@@ -810,7 +820,9 @@ handleRequest svc rid = \case
     terminate svc rid (Failed (StorageFailed fault))
   HandleDomain fault → atomically (terminate svc rid (Failed (StorageFailed fault)))
   HandleClosing → pure ()
-  HandleRetryLater _ → pure ()
+  -- temporary pressure: the request keeps its place (still waiting) and is prepared again once the
+  -- storage service's capacity has changed
+  HandleRetryLater _ → atomically (notePressure svc)
   HandleDefect why → failWith svc (OwnerDefect why) []
   other → failWith svc (OwnerDefect (Text.pack ("a request's read ended unexpectedly: " <> show other))) []
 
@@ -1157,7 +1169,10 @@ slotOver svc task done = do
           forM_ (Map.lookup aid (stateArenas s) >>= Map.lookup condition . arenaFaults) $ \record →
             terminate svc rid (Failed (StorageFailed (faultOf record)))
       HandleDomain fault → atomically (forM_ (removalOf work) $ \rid → terminate svc rid (Failed (StorageFailed fault)))
-      HandleRetryLater _ → pure ()
+      -- temporary pressure: the transaction ended with no write; its work keeps its place (a removal
+      -- stays staged and eligible) and is granted again only once the storage service's capacity has
+      -- changed, never at once
+      HandleRetryLater _ → atomically (notePressure svc)
       HandleReplan → pure ()
       HandleWaitReclaim _ _ → atomically (modifySt svc (\s → s {stateNeedsMaintenance = Set.insert aid (stateNeedsMaintenance s)}))
       HandleClosing → pure ()
@@ -1214,6 +1229,9 @@ growthOver svc task over = probe svc (PointGrowthEnded (slotArena task)) >> case
     Growth.GrowthFailedWith handling → case handling of
       HandleDomain fault → atomically (terminate svc rid (Failed (StorageFailed fault)))
       HandleReplan → atomically (modifySt svc (\s → s {stateRequests = Map.adjust (\q → q {reqPhase = Waiting}) rid (stateRequests s)}))
+      -- temporary pressure: the growth keeps its place (prepared again) once the storage service's
+      -- capacity has changed
+      HandleRetryLater _ → atomically (notePressure svc >> modifySt svc (\s → s {stateRequests = Map.adjust (\q → q {reqPhase = Waiting}) rid (stateRequests s)}))
       HandleClosing → pure ()
       HandleDefect why → failWith svc (OwnerDefect why) []
       other → failWith svc (OwnerDefect (Text.pack ("a growth ended unexpectedly: " <> show other))) []
@@ -1226,6 +1244,9 @@ growthOver svc task over = probe svc (PointGrowthEnded (slotArena task)) >> case
     Growth.GrowthPendingReleased → atomically (modifySt svc (\s → s {stateRequests = Map.adjust (\q → q {reqPhase = Waiting}) rid (stateRequests s)}))
     Growth.GrowthFailedWith handling → case handling of
       HandleDomain fault → atomically (terminate svc rid (Failed (StorageFailed fault)))
+      -- temporary pressure: the retry keeps its place (prepared again, so it releases again) once the
+      -- storage service's capacity has changed
+      HandleRetryLater _ → atomically (notePressure svc >> modifySt svc (\s → s {stateRequests = Map.adjust (\q → q {reqPhase = Waiting}) rid (stateRequests s)}))
       HandleClosing → pure ()
       HandleDefect why → failWith svc (OwnerDefect why) []
       other → failWith svc (OwnerDefect (Text.pack ("a pending release ended unexpectedly: " <> show other))) []

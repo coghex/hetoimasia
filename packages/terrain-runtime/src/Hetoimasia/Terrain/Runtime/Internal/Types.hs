@@ -109,6 +109,7 @@ module Hetoimasia.Terrain.Runtime.Internal.Types
   , FaultRecord (..)
   , faultPagesKept
   , Wake (..)
+  , PressureMark (..)
   , OpenTask (..)
   , OpenPhase (..)
   , GatherFor (..)
@@ -873,6 +874,12 @@ data Wake
   = WakeNow
   | WakeOn !(STM ())
 
+-- | What the storage service and the edit bank held when a caller was refused for temporary
+-- pressure: the queue's length, every job's identity and phase, and the edit bank's three accounts.
+-- Job identities are never reused, so the mark changes whenever any capacity is taken or returned.
+newtype PressureMark = PressureMark [Word64]
+  deriving stock (Eq, Show)
+
 -- | An open being prepared: the arena incarnation it will publish (allocated when the
 -- reservation is asked for, so the reserved file's pages carry it) and its phase.
 data OpenTask = OpenTask
@@ -885,6 +892,10 @@ data OpenPhase
     OpenQueued
   | -- | Compiling, at most one quantum per step; the account holds the peak (the charge).
     OpenCompiling !C.Preparation !Word64
+  | -- | Compiled; the reservation job is to be submitted. The incarnation and store identity are
+    -- allocated, and the compilation's peak is still held. A submission refused for the storage
+    -- service's temporary pressure waits here (its wake) for that service's capacity to change.
+    OpenSubmitting !ArenaId !StoreIdentity !D.Env !Word64 !Word64 !Wake
   | -- | Compiled; the reservation job runs. The incarnation and store identity were
     -- allocated for it (they are never reused), and the account holds the arena's share.
     OpenReserving !ArenaId !StoreIdentity !D.Env !Word64 !Ticket !Wake
@@ -1048,6 +1059,12 @@ data St = St
   , -- | Explicit grants since the last grant to internal work (discovery, reclamation):
     -- the fairness rule gives internal work one grant in every 'internalTurn'.
     stateExplicitRun ∷ !Int
+  , -- | Set by the owner when a caller of the storage service (a pinned read, a load, a retry's
+    -- probe, the slot's transaction, a growth or release, an open) is refused for temporary
+    -- pressure: while the service and the edit bank still hold exactly this, no new storage work
+    -- starts (no read, no load, no grant). Read by the owner's selection only; replaced at the next
+    -- refusal and never reset (a stale mark no longer matches). Lives with the service.
+    stateStoragePressure ∷ !(Maybe PressureMark)
   , -- | The pinned read stepped last: ready reads are stepped in turn after it, so no arena's reads
     -- (or a load's) are passed over by another's.
     stateGatherCursor ∷ !(Maybe GatherFor)
@@ -1106,6 +1123,7 @@ initialState config limits =
     , stateSlot = Nothing
     , stateExplicitRun = 0
     , stateGatherCursor = Nothing
+    , stateStoragePressure = Nothing
     , stateInternalIdle = Map.empty
     , stateNeedsMaintenance = Set.empty
     , stateClosing = Map.empty

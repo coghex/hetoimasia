@@ -42,7 +42,10 @@ module Hetoimasia.Terrain.Runtime.Internal.Backed
   , canStartGather
   , sameCommittedSTM
   , CommittedMovedOutsideDecision (..)
-  , editBankReadsChecked
+  , editBankChecked
+  , pressureMark
+  , notePressure
+  , pressureChanged
   , startGatherFor
   , stepGatherTask
 
@@ -103,6 +106,7 @@ import Hetoimasia.Terrain.Runtime.Storage.Internal.Service
   , Snapshot (..)
   , backingRecordBytes
   , keptEntryBytes
+  , maxRecordControlBytes
   , resultPageBytes
   , transferBufferBytes
   , OpenSpec (..)
@@ -116,6 +120,7 @@ import Hetoimasia.Terrain.Runtime.Storage.Internal.Service
   , submitOpen
   , withOutcome
   )
+import qualified Hetoimasia.Terrain.Runtime.Storage.Internal.Service as Storage
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Types (WorkClass (..))
 import qualified Hetoimasia.Terrain.Runtime.Store.Internal.Admission as A
 import Hetoimasia.Terrain.Runtime.Store.Internal.Admission (Admission)
@@ -123,7 +128,7 @@ import Hetoimasia.Terrain.Runtime.Store.Internal.Format (PageNo, StoreIdentity (
 import Hetoimasia.Terrain.Runtime.Store.Internal.Model (ActiveView (..), Condition (..), GrowthProposal, Store, activeView, storeConfig, TxnId, conditions, oldestPin, pauseFor, storeFromRoots, storeHeader, storeRoots, storeVersion)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan (Plan, RamCharge (..))
 import Hetoimasia.Terrain.Runtime.Store.Internal.Protocol (discoveryPlanner, maintenancePlanner, removalPlanner)
-import Hetoimasia.Terrain.Runtime.Store.Internal.State (Roots (..), StoreConfig, emptyRoots, maxReaders)
+import Hetoimasia.Terrain.Runtime.Store.Internal.State (Roots (..), StoreConfig, emptyRoots, maxReaders, readerRecordBytes)
 import Hetoimasia.Terrain.Source (Source)
 
 -- ---------------------------------------------------------------------------
@@ -142,14 +147,27 @@ gathersPerArena config = fromInteger (min (toInteger maxReaders) (A.ebsReadersPe
 -- flight, so room for one read means some read can always be funded: a transaction and the pinned
 -- reads never wait on each other. A bank at #662's own minimum (the transaction beside every pin,
 -- nothing more) deadlocks the first time both read, so it is refused at construction.
-editBankReadsChecked ∷ A.EditBankSpec → Either ConfigError ()
-editBankReadsChecked spec
+--
+-- The control account must also hold the storage service's own records at their most beside the
+-- store's minimum (the worst transaction's control records, every reader record, the queued
+-- descriptors): the service charges every job's record, every backing's and every kept failure to
+-- that account, and the store's minimum counts none of them. Without that room a granted
+-- transaction's write cannot be charged, or a removal is never granted. The spec's arenas are the
+-- service's arena cap, which bounds its backings.
+editBankChecked ∷ A.EditBankSpec → Either ConfigError ()
+editBankChecked spec
   | cacheNeed > A.ebsCache spec = Left (ConfigEditBankReads "cache" cacheNeed (A.ebsCache spec))
   | stagingNeed > A.ebsStaging spec = Left (ConfigEditBankReads "staging" stagingNeed (A.ebsStaging spec))
+  | controlNeed > A.ebsControl spec = Left (ConfigEditBankReads "control" controlNeed (A.ebsControl spec))
   | otherwise = Right ()
   where
     w = A.worstTransactionCharge
     pins = A.ebsArenas spec * min (toInteger maxReaders) (A.ebsReadersPerArena spec)
+    storeControl =
+      toInteger (ramPagePins w + ramRootControl w + ramContinuation w)
+        + A.ebsArenas spec * A.ebsReadersPerArena spec * toInteger readerRecordBytes
+        + toInteger A.maxQueuedDescriptors * toInteger A.descriptorRecordBytes
+    controlNeed = storeControl + toInteger (maxRecordControlBytes (fromInteger (A.ebsArenas spec)))
     cacheNeed = toInteger (ramDecodedCopies w) + pins * toInteger A.readerPinnedCacheBytes + toInteger resultPageBytes
     stagingNeed = toInteger (ramIoBuffers w + ramKeys w + ramScratch w) + toInteger (transferBufferBytes 1)
 
@@ -282,6 +300,7 @@ openOrderAllows st aid =
       OpenPublishable a _ _ _ _ → Just a
       OpenQueued → Nothing
       OpenCompiling {} → Nothing
+      OpenSubmitting a _ _ _ _ _ → Just a
       OpenUnwinding {} → Nothing
 
 -- | An open whose file is reserved and whose store is ready, waiting for its publication: what
@@ -292,6 +311,25 @@ openReady st rid = case openPhase <$> Map.lookup rid (stateOpens st) of
   _ → Nothing
 
 -- | One step of an open.
+-- | What the storage service and the edit bank hold now (see 'PressureMark').
+pressureMark ∷ Service → STM PressureMark
+pressureMark svc = do
+  sn <- Storage.snapshotOf (serviceStorage svc)
+  l <- A.ledgers <$> readTVar (serviceEditBank svc)
+  pure . PressureMark $
+    fromIntegral (Storage.snQueued sn)
+      : concat [[Storage.jsId j, fromIntegral (Storage.jsPhase j), if Storage.jsHoldsResult j then 1 else 0] | j <- Storage.snJobs sn]
+      <> [A.lgCacheBacked l + A.lgCacheRamOnly l, A.lgStagingForeground l + A.lgStagingCamera l, A.lgControlReserved l]
+
+-- | A caller was refused for the storage service's temporary pressure: no new storage work starts
+-- until what the service and the edit bank hold has changed.
+notePressure ∷ Service → STM ()
+notePressure svc = pressureMark svc >>= \mark → modifySt svc (\s → s {stateStoragePressure = Just mark})
+
+-- | Wait until what the storage service and the edit bank hold differs from a mark.
+pressureChanged ∷ Service → PressureMark → STM ()
+pressureChanged svc mark = pressureMark svc >>= \now → check (now /= mark)
+
 stepOpen ∷ Service → OwnerOps → RequestId → IO ()
 stepOpen svc ops rid = do
   st ← atomically (readSt svc)
@@ -331,18 +369,28 @@ stepOpen svc ops rid = do
                   -- what the arena would keep (its connectivity and every structure derived from it) passes
                   -- the per-arena bound of the compile account: the expected source_complexity, naming it
                   atomically (dropOpen svc rid held >> terminate svc rid (Failed (StorageFailed (FaultComplexity "compiled arena (connectivity and member index)" shared (perArenaShared limits)))))
-                else do
-                  (aid, ident) ← atomically $ do
-                    s ← readSt svc
-                    let aid = ArenaId (stateNextArena s)
-                    writeTVar (serviceState svc) s {stateNextArena = stateNextArena s + 1, stateNextSource = stateNextSource s + 1}
-                    pure (aid, StoreIdentity aid (stateNextSource s))
-                  submitOpen (serviceStorage svc) ExplicitWork (OpenSpec (serviceDirectory svc) ident (serviceStoreConfig svc)) >>= \case
-                    Left failure → finish held (classifyFailure OwnerRunning JkOpen failure)
-                    Right ticket → atomically $ do
-                      modifySt svc $ \s →
-                        s {stateCompiling = Nothing, stateCompileUse = stateCompileUse s - held + shared}
-                      setPhase task (OpenReserving aid ident env shared ticket (WakeOn (awaitTicket (serviceStorage svc) ticket)))
+                else atomically $ do
+                  s ← readSt svc
+                  let aid = ArenaId (stateNextArena s)
+                      ident = StoreIdentity aid (stateNextSource s)
+                  writeTVar (serviceState svc) s {stateNextArena = stateNextArena s + 1, stateNextSource = stateNextSource s + 1}
+                  setPhase task (OpenSubmitting aid ident env shared held WakeNow)
+    OpenSubmitting aid ident env shared held _
+      | not alive → atomically (dropOpen svc rid held)
+      | otherwise →
+          submitOpen (serviceStorage svc) ExplicitWork (OpenSpec (serviceDirectory svc) ident (serviceStoreConfig svc)) >>= \case
+            Left failure → case classifyFailure OwnerRunning JkOpen failure of
+              -- temporary pressure: the open keeps its place and its compiled result, and submits
+              -- again once the storage service's capacity has changed
+              HandleRetryLater _ → atomically $ do
+                notePressure svc
+                mark ← pressureMark svc
+                setPhase task (OpenSubmitting aid ident env shared held (WakeOn (pressureChanged svc mark)))
+              handling → finish held handling
+            Right ticket → atomically $ do
+              modifySt svc $ \s →
+                s {stateCompiling = if stateCompiling s == Just rid then Nothing else stateCompiling s, stateCompileUse = stateCompileUse s - held + shared}
+              setPhase task (OpenReserving aid ident env shared ticket (WakeOn (awaitTicket (serviceStorage svc) ticket)))
     OpenReserving aid ident env shared ticket _
       | not alive → do
           _ ← cancelTicket (serviceStorage svc) ticket
@@ -356,6 +404,12 @@ stepOpen svc ops rid = do
                 atomically (setPhase task (OpenPublishable aid env shared backing store))
                 -- the open is staged: the host is told, and its commit installs the arena
                 opsStage ops rid Nothing (Revision (configFirstRevision config)) StagedControl
+              -- a reservation refused for temporary pressure created nothing: the open submits again, with
+              -- the same identity, once the storage service's capacity has changed
+              Just (GotFailure (HandleRetryLater _) _) → atomically $ do
+                notePressure svc
+                mark ← pressureMark svc
+                setPhase task (OpenSubmitting aid ident env shared shared (WakeOn (pressureChanged svc mark)))
               Just (GotFailure handling _) → finish shared handling
               Just (GotCancelled _) → finish shared (classifyUnaskedCancel OwnerRunning)
               Just (GotMismatch why) → failOpen shared why
@@ -837,6 +891,7 @@ backedInvariants st adm compileBank sn =
     openHeld = \case
       OpenQueued → 0
       OpenCompiling _ n → n
+      OpenSubmitting _ _ _ _ n _ → n
       OpenReserving _ _ _ n _ _ → n
       OpenPublishable _ _ n _ _ → n
       OpenUnwinding n _ _ → n

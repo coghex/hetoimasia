@@ -90,6 +90,7 @@ module Hetoimasia.Terrain.Runtime
   , DiscoveryState (..)
   , inspectEditBankSTM
   , inspectStorageQueuedSTM
+  , inspectStoragePressedSTM
   , perArenaBound
   , compileAccountFor
   , Condition (..)
@@ -202,7 +203,7 @@ import Hetoimasia.Terrain.Runtime.Internal.Types
 import Hetoimasia.Terrain.Runtime.Settlement
 import Hetoimasia.Terrain.Runtime.Backed.Port (StoragePort (..), storagePort)
 import Hetoimasia.Terrain.Runtime.Backed.Fault (FullWhy (..), IntegritySource (..), StorageFault (..), faultCode)
-import Hetoimasia.Terrain.Runtime.Internal.Backed (backedInvariants, editBankReadsChecked)
+import Hetoimasia.Terrain.Runtime.Internal.Backed (backedInvariants, editBankChecked, pressureMark)
 import qualified Hetoimasia.Terrain.Runtime.Storage.Internal.Service as Storage
 import Hetoimasia.Terrain.Runtime.Store.Internal.Admission (EditBankSpec (..), Ledger (..), defaultEditBankSpec, ledgers, mkEditBankConfig, newAdmission)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Model (Condition (..), GrowthView (..), Usage (..), conditions, growthView, storeHeader, usage)
@@ -281,7 +282,7 @@ withTerrainService config ports body = do
   -- compile account beside them (owner decision 2026-11-13, option B).
   storeConfig <- either (throwIO . ConfigStore) pure (mkStoreConfig (configStore config))
   editBank <- either (throwIO . ConfigEditBank) pure (mkEditBankConfig (configEditBank config) {ebsArenas = toInteger (configMaxArenas config)})
-  either throwIO pure (editBankReadsChecked (configEditBank config) {ebsArenas = toInteger (configMaxArenas config)})
+  either throwIO pure (editBankChecked (configEditBank config) {ebsArenas = toInteger (configMaxArenas config)})
   limits <- either throwIO pure (modelLimitsChecked config)
   compileBank <- either throwIO pure (compileBankChecked (configMaxArenas config) (configConnectivity config))
   bank <- newTVarIO (newAdmission editBank)
@@ -566,6 +567,16 @@ inspectBacked svc = atomically (inspectBackedSTM svc)
 -- verification.
 inspectStorageQueuedSTM ∷ Service → STM Int
 inspectStorageQueuedSTM svc = Storage.snQueued <$> Storage.snapshotOf (serviceStorage svc)
+
+-- | Whether a caller of the storage service was refused for temporary pressure and nothing the
+-- service or the edit bank holds has changed since: the owner starts no new storage work until it
+-- does. Read-only, for verification.
+inspectStoragePressedSTM ∷ Service → STM Bool
+inspectStoragePressedSTM svc = do
+  st <- readSt svc
+  case stateStoragePressure st of
+    Nothing → pure False
+    Just mark → (== mark) <$> pressureMark svc
 
 backedAtRestSTM ∷ Service → STM Bool
 backedAtRestSTM svc = do

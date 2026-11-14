@@ -26,6 +26,7 @@ import qualified Test.TerrainRuntime.Backed.Compile as BackedCompile
 import qualified Test.TerrainRuntime.Backed.Discovery as BackedDiscovery
 import qualified Test.TerrainRuntime.Backed.Creator as BackedCreator
 import qualified Test.TerrainRuntime.Backed.Fairness as BackedFairness
+import qualified Test.TerrainRuntime.Backed.Pressure as BackedPressure
 import qualified Test.TerrainRuntime.Backed.Outcomes as BackedOutcomes
 import qualified Test.TerrainRuntime.Backed.Pause as BackedPause
 import qualified Test.TerrainRuntime.Backed.Service as BackedService
@@ -88,6 +89,7 @@ spec = do
   BackedDiscovery.spec
   BackedFairness.spec
   BackedCreator.spec
+  BackedPressure.spec
   BackedService.spec
   BackedSweep.spec
   BackedTxn.spec
