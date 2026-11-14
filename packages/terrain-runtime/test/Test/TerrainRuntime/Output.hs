@@ -10,7 +10,9 @@
 --     item's result, the final report) runs under the same lock, to its end (the format returns when the event has been
 --     written), and afterwards the record says the handle is at a line start for the formatters of 'boundaryFormatters', whose
 --     every event ends in a newline or writes nothing, and open for any other (the @progress@ formatter writes a dot and no
---     newline). So neither writer can run inside the other's write, whatever the thread or the buffering mode, and a printed
+--     newline). When progress is reported (colour forced on, no CI variable) the formatter also writes transient text and a
+--     held-back erase that a file keeps as bytes, so after an item's start or progress the record says so, and a line printed to a
+--     handle that is not a terminal then begins with a newline (on a terminal, with the erase). So neither writer can run inside the other's write, whatever the thread or the buffering mode, and a printed
 --     line starts at a line start; on a terminal it also clears the formatter's progress text on the line first.
 --   * Directly, with no lock: the sequential examples of the storage modules (@Test.TerrainRuntime.Storage.*@, #663's work), whose tests this change does not edit beyond placing them in the tiers. They are whole by the framework's
 --     order, not by a lock: a sequential item starts only after the reporting thread has written every earlier item's result
@@ -20,7 +22,8 @@
 --     ("Test.TerrainRuntime.Isolation") keeps every parallel example from running beside it. The oracle
 --     ("Test.TerrainRuntime.OutputSpec") shows the case: sequential examples nested in describes, after a parallel group,
 --     writing with @putStrLn@, are whole at a line start under every formatter of 'boundaryFormatters'. The same cannot be said
---     of the @progress@ formatter, whose dots leave the line open; a direct write then follows the dots.
+--     of the @progress@ formatter, whose dots leave the line open (a direct write then follows the dots), nor, when progress is
+--     reported, of the bytes of a file: a direct write follows the transient text and its erase, whole as a terminal shows it.
 --
 -- A line longer than the buffer (8 KiB) could be split by the handle, and a line cut to fit would be a wrong record that looks
 -- right, so a line over 'maxLineChars' is never printed through 'printLine': it fails the example that tries (each family
@@ -45,16 +48,23 @@ import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import System.IO (hFlush, hIsTerminalDevice, hPutStr, stdout)
 import System.IO.Unsafe (unsafePerformIO)
 import Test.Hspec (expectationFailure)
+import Test.Hspec.Core.Format (Event (..), Format, FormatConfig (..))
 import Test.Hspec.Runner (Config (..))
 
--- | The lock that serializes every write to standard output, and whether the handle is known to be at a line start.
+-- | Where the handle is, as far as the last write told: at a line start; after transient text (a formatter that reports progress
+-- writes the text of the item it is running and an erase of it that the handle holds back, which a terminal never shows and a file
+-- keeps as the bytes of a line); or mid-line after content (the @progress@ formatter's dots).
+data LineState = AtLineStart | AfterTransient | MidLine
+  deriving stock (Eq, Show)
+
+-- | The lock that serializes every write to standard output, and where the handle is.
 data Output = Output
   { outLock ∷ MVar ()
-  , outAtLineStart ∷ IORef Bool
+  , outLineState ∷ IORef LineState
   }
 
 newOutput ∷ IO Output
-newOutput = Output <$> newMVar () <*> newIORef True
+newOutput = Output <$> newMVar () <*> newIORef AtLineStart
 
 -- | The process's output: the one the suite's examples and the runner's formatter use.
 globalOutput ∷ Output
@@ -69,17 +79,24 @@ maxLineChars = 4096
 printLine ∷ String → IO ()
 printLine = printLineOn globalOutput
 
--- | Print a line as one write under the output's lock: at a line start (a newline first when the formatter left the handle
--- mid-line) and with its newline. A line over 'maxLineChars' fails the calling example and prints nothing.
+-- | Print a line as one write under the output's lock, at a line start of the bytes and with its newline: nothing before it when
+-- the handle is at a line start; after transient text, on a terminal the erase (the transient text is never shown) and on any
+-- other handle a newline (the bytes of the transient text and its erase are a line of the file); after content, a newline.
+-- A line over 'maxLineChars' fails the calling example and prints nothing.
 printLineOn ∷ Output → String → IO ()
 printLineOn out s
   | length s > maxLineChars = expectationFailure ("a printed line of " <> show (length s) <> " characters is over the " <> show maxLineChars <> " that one write may carry: " <> take 80 s)
   | otherwise = withMVar (outLock out) $ \_ → do
       tty ← hIsTerminalDevice stdout
-      atStart ← readIORef (outAtLineStart out)
-      hPutStr stdout ((if atStart then "" else "\n") <> (if tty then "\r\ESC[K" else "") <> s <> "\n")
+      state ← readIORef (outLineState out)
+      let erase = if tty then "\r\ESC[K" else ""
+          before = case state of
+            AtLineStart → erase
+            AfterTransient → if tty then erase else "\n"
+            MidLine → "\n" <> erase
+      hPutStr stdout (before <> s <> "\n")
       hFlush stdout
-      writeIORef (outAtLineStart out) True
+      writeIORef (outLineState out) AtLineStart
 
 -- | Run an action while no other writer of the output can write (a test that captures the handle holds it).
 withOutputLocked ∷ Output → IO a → IO a
@@ -91,9 +108,9 @@ boundaryFormatters ∷ [String]
 boundaryFormatters = ["checks", "specdoc", "failed-examples", "silent"]
 
 -- | The configuration with every selectable formatter, and the default (@checks@), wrapped so that each of its events runs
--- under the output's lock and leaves the output's line-start record true or false by what the formatter is known to do. The
--- wrapped format is what the runner calls for every event, from the reporting thread and, for progress, from the example
--- threads; it returns when the event has been written, so the lock covers all of it.
+-- under the output's lock and leaves the output's line state by what the formatter is known to do. The wrapped format is what
+-- the runner calls for every event, from the reporting thread and, for progress, from the example threads; it returns when the
+-- event has been written, so the lock covers all of it.
 guardFormatters ∷ Output → Config → Config
 guardFormatters out cfg =
   cfg
@@ -105,10 +122,26 @@ guardFormatters out cfg =
   where
     wrapped = [(name, guardFormat out (name `elem` boundaryFormatters) f) | (name, f) ← configAvailableFormatters cfg]
 
-guardFormat ∷ Output → Bool → (c → IO (e → IO ())) → c → IO (e → IO ())
+-- | One formatter, guarded. The runner hands it the configuration it built, which says whether progress is reported
+-- ('formatConfigReportProgress': colour on and neither GitHub Actions nor Buildkite): then the runner has already hidden the
+-- cursor (a control sequence, no newline) before the first event, and an item's start or progress is shown as transient text
+-- with a held-back erase, so after those the line state is 'AfterTransient'. Otherwise no transient text is written and
+-- nothing changes: every event of a boundary formatter leaves the handle at a line start, every event of another formatter
+-- 'MidLine'.
+guardFormat ∷ Output → Bool → (FormatConfig → IO Format) → FormatConfig → IO Format
 guardFormat out endsAtBoundary make config = do
   format ← make config
+  let progress = formatConfigReportProgress config
+      leavesTransient event = case event of
+        ItemStarted {} → progress
+        Progress {} → progress
+        _ → False
+      afterEvent event
+        | not endsAtBoundary = MidLine
+        | leavesTransient event = AfterTransient
+        | otherwise = AtLineStart
+  withMVar (outLock out) $ \_ → writeIORef (outLineState out) (if progress then AfterTransient else AtLineStart)
   pure $ \event → withMVar (outLock out) $ \_ → do
-    writeIORef (outAtLineStart out) False
+    writeIORef (outLineState out) MidLine
     format event
-    writeIORef (outAtLineStart out) endsAtBoundary
+    writeIORef (outLineState out) (afterEvent event)

@@ -127,7 +127,6 @@ problems shape n rows seqN raw =
     items = [it' | l ← others, Just it' ← [itemNumber l]]
     parallelItems = [k | ("example", k) ← items]
     sequentialItems = [k | ("sequential", k) ← items]
-    isRecordLine l = "EVIDENCE" `isInfixOf` l || "DIRECT" `isInfixOf` l
     dots = sum [length l | l ← others, not (null l), all (== '.') l]
     wholeFormatterLine l =
       null l || l == "stress" || isGroupTitle l || "Finished in " `isPrefixOf` l || l == show total <> " examples, 0 failures"
@@ -144,6 +143,18 @@ problems shape n rows seqN raw =
     firstJust xs = case [x | Just x ← xs] of
       x : _ → Just x
       [] → Nothing
+
+-- | The records among the bytes as written, whatever else is on the line: every line that holds a record must be that record and
+-- nothing else, so a record starts a line of the file even when the formatter wrote transient text and an erase before it.
+-- Direct writes of sequential examples are not asked for here: in a file they follow the transient text of their item.
+recordLineProblems ∷ Int → Int → Int → String → [String]
+recordLineProblems n rows seqN raw =
+  [ "a record does not start a line of the bytes: " <> show (take 70 l) | l ← lines raw, isRecordLine l, l `Set.notMember` expectedSet ]
+  where
+    expectedSet = Set.fromList ([record i j | i ← [1 .. n], j ← [1 .. rows]] <> [direct i j | i ← [1 .. seqN], j ← [1 .. directRows]])
+
+isRecordLine ∷ String → Bool
+isRecordLine l = "EVIDENCE" `isInfixOf` l || "DIRECT" `isInfixOf` l
 
 -- | The text without its colour sequences. A sequence is recognized by its form, not by a list of the ones seen: an escape, a
 -- bracket, parameter and intermediate bytes, one final byte from @ to ~.
@@ -204,8 +215,9 @@ modes =
   , Mode "colour on with progress, as a terminal shows it" True False True
   ]
 
--- | Run a nested spec through the pinned configuration with the process's output captured: its text and its failure count.
-runNested ∷ Shape → Mode → (Output → Spec) → IO (String, Int)
+-- | Run a nested spec through the pinned configuration with the process's output captured: its text (rendered as a terminal shows
+-- it in the mode that says so), the bytes as written, and its failure count.
+runNested ∷ Shape → Mode → (Output → Spec) → IO (String, String, Int)
 runNested shape mode nested = do
   out ← newOutput
   failures ← newIORef (-1 ∷ Int)
@@ -213,7 +225,7 @@ runNested shape mode nested = do
     config ← pinnedConfig out (shapeFormat shape) (modeColour mode) 8
     summary ← withArgs [] (runSpec (nested out) config)
     writeIORef failures (summaryFailures summary)
-  (,) (if modeRendered mode then render raw else raw) <$> readIORef failures
+  (\f → (if modeRendered mode then render raw else raw, raw, f)) <$> readIORef failures
 
 -- | The process's standard output while an action runs, as text. The caller holds the process's output lock.
 captured ∷ IO () → IO String
@@ -245,13 +257,14 @@ spec = describe "the lines the suite prints and the runner's formatter's report"
     let colourName = modeName mode
     forM_ shapes $ \shape →
       it ("prints every record whole at a line start, and the formatter's lines whole, beside eight examples (" <> shapeName shape <> ", " <> colourName <> ")") $ do
-        (text, failures) ← runNested shape mode (stress examples)
+        (text, raw, failures) ← runNested shape mode (stress examples)
         problems shape examples rowsPerExample 0 text `shouldBe` []
+        recordLineProblems examples rowsPerExample 0 raw `shouldBe` []
         failures `shouldBe` 0
         colourPresent shape mode text `shouldBe` True
     forM_ (filter shapeBoundary shapes) $ \shape →
       it ("writes whole, beside the formatter, the records that sequential examples write directly after the group (" <> shapeName shape <> ", " <> colourName <> ")") $ do
-        (text, failures) ← runNested shape mode mixed
+        (text, _, failures) ← runNested shape mode mixed
         problems shape mixedParallel rowsPerExample sequentialExamples text `shouldBe` []
         failures `shouldBe` 0
         colourPresent shape mode text `shouldBe` True
@@ -266,6 +279,9 @@ spec = describe "the lines the suite prints and the runner's formatter's report"
     check ("\nstress\n" <> record 1 1 <> "\n" <> record 1 1 <> "\n  example 1\n" <> record 2 1 <> "\n  example 2\n\nFinished in 0.0100 seconds\n2 examples, 0 failures\n") `shouldNotBe` []
     check ("\nstress\n" <> record 1 1 <> "\n  exam\n  example 1\n" <> record 2 1 <> "\n  example 2\n\nFinished in 0.0100 seconds\n2 examples, 0 failures\n") `shouldNotBe` []
     check (init good) `shouldNotBe` []
+    recordLineProblems 2 1 0 ("\n" <> record 1 1 <> "\n  example 1 [ ]\r\ESC[K\n" <> record 2 1 <> "\n") `shouldBe` []
+    recordLineProblems 2 1 0 ("\ESC[?25l" <> record 1 1 <> "\n") `shouldNotBe` []
+    recordLineProblems 2 1 0 ("\n  example 1 [ ]\r\ESC[K" <> record 2 1 <> "\n") `shouldNotBe` []
     let col t = "\ESC[32m" <> t <> "\ESC[0m"
         goodColour = "\n" <> col "stress" <> "\n" <> record 1 1 <> "\n" <> col "  example 1" <> "\n" <> record 2 1 <> "\n" <> col "  example 2" <> "\n\n" <> "Finished in 0.0100 seconds\n" <> col "2 examples, 0 failures" <> "\n"
         itemColour = "\nstress\n" <> record 1 1 <> "\n  example 1 [\ESC[32mv\ESC[0m]\n" <> record 2 1 <> "\n  example 2 [\ESC[32mv\ESC[0m]\n\nFinished in 0.0100 seconds\n2 examples, 0 failures\n"
