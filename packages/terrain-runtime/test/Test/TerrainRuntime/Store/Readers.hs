@@ -14,6 +14,7 @@ module Test.TerrainRuntime.Store.Readers (spec) where
 import Control.Monad (foldM, forM_, when)
 import qualified Data.ByteString as BS
 import qualified Data.Map.Strict as Map
+import Data.List (nub)
 import Data.Int (Int64)
 import Hetoimasia.Terrain.Discovery (Record (..), RecordKey (..))
 import Hetoimasia.Terrain.Residency (ArenaId (..))
@@ -151,6 +152,45 @@ spec = describe "pinned readers, retirement and reclamation" $ do
           KeyRun c lo → look (KeyRun c (lo + 1)) `shouldBe` Nothing
           _ → pure ()
       [] → expectationFailure "runs expected"
+  it "starts a ranged read at the greatest key at or below a floor: inside a run, at a run's first key, below a column's first key, in an empty column, and across leaves" $ do
+    (h, ref, _) ← must (foldM (\s _ → churn s 30) (newH smallSpec ident0, Map.empty, mkRng 63) [1 .. 120 ∷ Int])
+    (tok, s1) ← must (either (Left . show) Right (acquireReader (hStore h)))
+    let total = cfgUsablePages (hCfg h)
+        runs = [(k, v) | (k@(KeyRun _ _), v) ← Map.toAscList ref]
+        go ∷ Show a ⇒ Window → (Window → ReadOutcome a) → Either String a
+        go w act = case act w of
+          Read r → Right r
+          ReadNeeds p → case diskRead (hDisk h) p of
+            Just bs → either (Left . show) (\x → go x act) (windowInsert total p bs w)
+            Nothing → Left "missing page"
+          other → Left (show other)
+        win = either (const (error "stale")) id (readerWindow s1 tok)
+        range start n = either (\e → error e) id (go win (\w → readerRange s1 tok w TreeRuns start n))
+        -- the reference: from the greatest key at or below the floor, or from the first key above it
+        expected k n = case [key | (key, _) ← runs, key <= k] of
+          [] → take n (dropWhile ((< k) . fst) runs)
+          atOrBelow → take n (dropWhile ((< last atOrBelow) . fst) runs)
+    length runs `shouldSatisfy` (> 300)
+    -- at every run's own first key, and just inside every run (ten records on: reads that cross leaves)
+    forM_ runs $ \(k, _) → do
+      range (RangeFloor k) 10 `shouldBe` expected k 10
+      case k of
+        KeyRun c lo → range (RangeFloor (KeyRun c (lo + 1))) 10 `shouldBe` expected (KeyRun c (lo + 1)) 10
+        _ → pure ()
+    case runs of
+      (KeyRun c0 lo0, _) : _ → do
+        -- below the first key of the tree: from that first key
+        range (RangeFloor (KeyRun c0 (lo0 - 1))) 5 `shouldBe` take 5 runs
+      _ → expectationFailure "runs expected"
+    -- below a column's first key, and in a column with no run: from the greatest key below (another column's)
+    let runColumns = nub [c | (KeyRun c _, _) ← runs]
+    forM_ (take 40 runColumns) $ \c → do
+      let firstLo = minimum [lo | (KeyRun c' lo, _) ← runs, c' == c]
+      range (RangeFloor (KeyRun c (firstLo - 1))) 6 `shouldBe` expected (KeyRun c (firstLo - 1)) 6
+    let emptyColumn = case [columnAt x y | x ← [0 .. 4096], y ← [0 .. 3], columnAt x y `notElem` runColumns] of
+          c : _ → c
+          [] → columnAt 0 0
+    range (RangeFloor (KeyRun emptyColumn 0)) 6 `shouldBe` expected (KeyRun emptyColumn 0) 6
   it "refuses to free a page that is already free, loose or claimed by the same plan, however its retirement entry came to name it" $ do
     let st0 = (newH smallSpec ident0, Map.empty, mkRng 15)
     (h1, ref1, g1) ← must (foldM (\s _ → churn s 30) st0 [1 .. 30 ∷ Int])

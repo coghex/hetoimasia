@@ -1319,17 +1319,22 @@ floorRun win rootFor col z = do
       Just _ → Right Nothing
       Nothing → Left (Bad MalformedKey (PageNo 0))
 
--- | Where a ranged read starts: at a key, or strictly after it.
-data RangeStart = RangeFrom !RecordKey | RangeAfter !RecordKey
+-- | Where a ranged read starts: at a key, strictly after it, or at the greatest key at or below it
+-- ('RangeFloor': at the first key above it when there is none), so that a read of a range includes the
+-- record that begins below the range and may reach into it.
+data RangeStart = RangeFrom !RecordKey | RangeAfter !RecordKey | RangeFloor !RecordKey
   deriving stock (Eq, Show)
 
 -- | Up to @limit@ records of one tree in key order from a start.
 rangeRecords ∷ Window → (TreeId → Maybe PageNo) → TreeId → RangeStart → Int → Either Stop [(RecordKey, Record)]
 rangeRecords win rootFor tree start limit = do
-  let (strict, key) = case start of
-        RangeFrom k → (False, k)
-        RangeAfter k → (True, k)
-  (es, _) ← runM (rangeKeys tree (fmap Disk (rootFor tree)) strict (encodeKey key) Nothing limit) (newEdit 0 win)
+  (strict, from) ← case start of
+    RangeFrom k → pure (False, encodeKey k)
+    RangeAfter k → pure (True, encodeKey k)
+    RangeFloor k → do
+      (floorAt, _) ← runM (floorKey tree (fmap Disk (rootFor tree)) (encodeKey k)) (newEdit 0 win)
+      pure (False, maybe (encodeKey k) fst floorAt)
+  (es, _) ← runM (rangeKeys tree (fmap Disk (rootFor tree)) strict from Nothing limit) (newEdit 0 win)
   traverse decodeEntry es
   where
     decodeEntry (k, v) = case decodeKey tree k of
