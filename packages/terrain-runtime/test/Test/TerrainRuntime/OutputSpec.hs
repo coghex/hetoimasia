@@ -4,6 +4,15 @@
 -- be a whole line starting at a line start, every record must appear exactly once, and every line the formatter wrote must be
 -- one it would have written whole.
 --
+-- The text a formatter writes depends on its environment (colour, unicode, the formatter itself, the @.hspec@ files and the
+-- @HSPEC_*@ variables, GitHub Actions), so the nested run takes none of it: its configuration is
+-- "Test.TerrainRuntime.Runner.pinnedConfig" (the suite's defaults, no file, no variable, no command line; formatter, colour,
+-- unicode and jobs given), and the two variables the runner itself reads, @GITHUB_ACTIONS@ and @BUILDKITE@, are set for the
+-- run and restored. Every formatter is run with colour off and with colour on (what GitHub Actions does), and the checker
+-- recognizes a colour sequence by rule (an escape, @[@, parameters, a final byte) and checks that a colour is reset before
+-- the newline: the line start 'printLine' relies on is the end of the event's last line, which a reset after the newline would
+-- spoil.
+--
 -- The run is made at eight jobs on eight capabilities, so the examples really write while the formatter does: 120 examples
 -- print 20 records each (2,400 records against 120 item lines). A second case follows a parallel group with sequential
 -- examples nested in describes that write DIRECTLY (@putStrLn@, as the storage examples do, not through the output): the
@@ -18,19 +27,21 @@
 module Test.TerrainRuntime.OutputSpec (spec) where
 
 import Control.Concurrent (getNumCapabilities, setNumCapabilities)
-import Control.Exception (finally)
+import Control.Exception (bracket, finally)
 import Control.Monad (forM_)
 import Data.Char (isDigit)
 import Data.IORef (newIORef, readIORef, writeIORef)
-import Data.List (isInfixOf, isPrefixOf, nub, sort, stripPrefix, (\\))
+import Data.List (isInfixOf, isPrefixOf, sort, stripPrefix)
+import qualified Data.Map.Strict as Map
+import qualified Data.Set as Set
 import System.Directory (getTemporaryDirectory, removeFile)
-import System.Environment (withArgs)
+import System.Environment (lookupEnv, setEnv, unsetEnv, withArgs)
 import GHC.IO.Handle (hDuplicate, hDuplicateTo)
 import System.IO (IOMode (ReadMode), hClose, hFlush, hGetContents', hSetEncoding, openTempFile, stdout, utf8, withFile)
 import Test.Hspec
 import Test.Hspec.Runner (Summary (..), runSpec)
 import Test.TerrainRuntime.Output (Output, globalOutput, newOutput, printLineOn, withOutputLocked)
-import Test.TerrainRuntime.Runner (suiteConfig)
+import Test.TerrainRuntime.Runner (pinnedConfig)
 
 examples ∷ Int
 examples = 120
@@ -47,12 +58,13 @@ direct ∷ Int → Int → String
 direct i j = "DIRECT row=" <> show i <> "." <> show j <> " " <> replicate 40 'x'
 
 -- | The nested spec: every example prints its rows while the other seven do.
-stress ∷ Output → Spec
-stress out = parallel $ describe "stress" $ forM_ [1 .. examples] $ \i →
+stress ∷ Int → Output → Spec
+stress count out = parallel $ describe "stress" $ forM_ [1 .. count] $ \i →
   it ("example " <> show i) $ forM_ [1 .. rowsPerExample] $ \j → printLineOn out (record i j)
 
 -- | Sequential examples that follow the group, in nested describes, each writing directly to standard output.
-sequentialGroups, sequentialPerGroup, directRows ∷ Int
+sequentialGroups, sequentialPerGroup, directRows, mixedParallel ∷ Int
+mixedParallel = 40
 sequentialGroups = 25
 sequentialPerGroup = 4
 directRows = 3
@@ -62,7 +74,7 @@ sequentialExamples = sequentialGroups * sequentialPerGroup
 
 mixed ∷ Output → Spec
 mixed out = do
-  stress out
+  stress mixedParallel out
   forM_ [1 .. sequentialGroups] $ \g → describe ("group " <> show g) $ describe ("inner " <> show g) $
     forM_ [1 .. sequentialPerGroup] $ \k → do
       let i = (g - 1) * sequentialPerGroup + k
@@ -71,7 +83,7 @@ mixed out = do
 -- | What a formatter writes besides the records: item lines, or dots, and the footer.
 data Shape = Shape
   { shapeName ∷ String
-  , shapeArgs ∷ [String]
+  , shapeFormat ∷ String
   , shapeItems ∷ Bool
   , shapeDots ∷ Bool
   , shapeFooter ∷ Bool
@@ -80,32 +92,37 @@ data Shape = Shape
 
 shapes ∷ [Shape]
 shapes =
-  [ Shape "the default formatter (checks)" [] True False True True
-  , Shape "specdoc" ["--format=specdoc"] True False True True
-  , Shape "progress" ["--format=progress"] False True True False
-  , Shape "failed-examples" ["--format=failed-examples"] False False True True
-  , Shape "silent" ["--format=silent"] False False False True
+  [ Shape "checks, the default formatter" "checks" True False True True
+  , Shape "specdoc" "specdoc" True False True True
+  , Shape "progress" "progress" False True True False
+  , Shape "failed-examples" "failed-examples" False False True True
+  , Shape "silent" "silent" False False False True
   ]
 
 -- | Everything the output got wrong, empty when every record is whole at a line start and exactly once and every other line is
 -- one the formatter writes whole. The expected records are @examples@ x @rows@; @items@ and @dots@ say what the formatter
 -- writes for each example.
 problems ∷ Shape → Int → Int → Int → String → [String]
-problems shape n rows seqN out =
-  [ "the output does not end at a line end" | not (null out), last out /= '\n' ]
-    <> [ "a record is not whole at a line start: " <> show (take 70 l) | l ← ls, isRecordLine l, l `notElem` expected ]
-    <> [ "a record is missing: " <> r | r ← expected \\ records ]
-    <> [ "a record is repeated: " <> r | r ← nub records, length (filter (== r) records) > 1 ]
+problems shape n rows seqN raw =
+  [ "the output does not end at a line end" | not (null raw), last raw /= '\n' ]
+    <> [ "a colour sequence after the newline: " <> show (take 40 l) | l ← rawLines, not (null (sgrParams l)), null (stripSgr l) ]
+    <> [ "a colour is left on at the end of a line: " <> show (take 60 l) | l ← rawLines, p : _ ← [reverse (sgrParams l)], p `notElem` ["", "0"] ]
+    <> [ "a record is not whole at a line start: " <> show (take 70 l) | l ← ls, isRecordLine l, l `Set.notMember` expectedSet ]
+    <> [ "a record is missing: " <> r | r ← expected, r `Map.notMember` recordCounts ]
+    <> [ "a record is repeated: " <> r | (r, k) ← Map.toList recordCounts, k > 1 ]
     <> [ "a formatter line is not whole: " <> show (take 70 l) | l ← others, not (wholeFormatterLine l) ]
     <> [ "parallel item lines " <> show (sort parallelItems) <> " are not exactly 1.." <> show n | shapeItems shape, sort parallelItems /= [1 .. n] ]
     <> [ "sequential item lines " <> show (sort sequentialItems) <> " are not exactly 1.." <> show seqN | shapeItems shape, sort sequentialItems /= [1 .. seqN] ]
     <> [ show dots <> " progress dots, not " <> show (n + seqN) | shapeDots shape, dots /= n + seqN ]
     <> [ "the footer does not report " <> show total <> " examples, 0 failures" | shapeFooter shape, (show total <> " examples, 0 failures") `notElem` others ]
   where
+    out = stripSgr raw
+    rawLines = lines raw
     ls = lines out
     total = n + seqN
     expected = [record i j | i ← [1 .. n], j ← [1 .. rows]] <> [direct i j | i ← [1 .. seqN], j ← [1 .. directRows]]
-    records = [l | l ← ls, l `elem` expected]
+    expectedSet = Set.fromList expected
+    recordCounts = Map.fromListWith (+) [(l, 1 ∷ Int) | l ← ls, l `Set.member` expectedSet]
     others = [l | l ← ls, not (isRecordLine l)]
     items = [it' | l ← others, Just it' ← [itemNumber l]]
     parallelItems = [k | ("example", k) ← items]
@@ -128,6 +145,76 @@ problems shape n rows seqN out =
       x : _ → Just x
       [] → Nothing
 
+-- | The text without its colour sequences. A sequence is recognized by its form, not by a list of the ones seen: an escape, a
+-- bracket, parameter and intermediate bytes, one final byte from @ to ~.
+stripSgr ∷ String → String
+stripSgr ('\ESC' : '[' : rest) = stripSgr (drop 1 (dropWhile (not . isFinal) rest))
+stripSgr (c : rest) = c : stripSgr rest
+stripSgr [] = []
+
+-- | What a terminal would show: a carriage return moves to the line start, an erase-to-end-of-line (@ESC [ K@) cuts the line at the
+-- cursor, every other control sequence is dropped, a newline ends the line. A formatter that shows progress writes a transient
+-- text and a buffered erase before the next write, which a file keeps as bytes and a terminal never shows.
+render ∷ String → String
+render = go "" 0
+  where
+    go cur _ [] = cur
+    go cur _ ('\n' : rest) = cur <> "\n" <> go "" 0 rest
+    go cur _ ('\r' : rest) = go cur 0 rest
+    go cur pos ('\ESC' : '[' : rest) =
+      let (params, remainder) = break isFinal rest
+          cut = if take 1 remainder == "K" && params `elem` ["", "0"] then take pos cur else cur
+       in go cut pos (drop 1 remainder)
+    go cur pos (c : rest) = go (take pos cur <> [c] <> drop (pos + 1) cur) (pos + 1) rest
+
+isFinal ∷ Char → Bool
+isFinal c = c >= '@' && c <= '~'
+
+-- | The parameters of every colour (SGR) sequence of a line, in order (@""@ and @"0"@ reset); other sequences (the cursor
+-- and erase controls) are not colours.
+sgrParams ∷ String → [String]
+sgrParams ('\ESC' : '[' : rest) = let (params, remainder) = break isFinal rest in [params | take 1 remainder == "m"] <> sgrParams (drop 1 remainder)
+sgrParams (_ : rest) = sgrParams rest
+sgrParams [] = []
+
+-- | An action with the two variables the runner reads itself pinned: @GITHUB_ACTIONS@ set as GitHub Actions sets it (colour forced
+-- on does not report progress then) or unset (it does), and @BUILDKITE@ unset; both restored.
+withPinnedEnvironment ∷ Bool → IO a → IO a
+withPinnedEnvironment githubActions action = bracket save restore $ \_ → do
+  if githubActions then setEnv "GITHUB_ACTIONS" "true" else unsetEnv "GITHUB_ACTIONS"
+  unsetEnv "BUILDKITE"
+  action
+  where
+    save = (,) <$> lookupEnv "GITHUB_ACTIONS" <*> lookupEnv "BUILDKITE"
+    restore (gh, bk) = maybe (unsetEnv "GITHUB_ACTIONS") (setEnv "GITHUB_ACTIONS") gh >> maybe (unsetEnv "BUILDKITE") (setEnv "BUILDKITE") bk
+
+-- | How the nested run is made: its colour setting, whether it runs as GitHub Actions does, and whether the capture is what a terminal
+-- would show (the run reports progress, so the bytes carry the transient text and its erase).
+data Mode = Mode
+  { modeName ∷ String
+  , modeColour ∷ Bool
+  , modeGithub ∷ Bool
+  , modeRendered ∷ Bool
+  }
+
+modes ∷ [Mode]
+modes =
+  [ Mode "colour off" False True False
+  , Mode "colour on, as GitHub Actions" True True False
+  , Mode "colour on with progress, as a terminal shows it" True False True
+  ]
+
+-- | Run a nested spec through the pinned configuration with the process's output captured: its text and its failure count.
+runNested ∷ Shape → Mode → (Output → Spec) → IO (String, Int)
+runNested shape mode nested = do
+  out ← newOutput
+  failures ← newIORef (-1 ∷ Int)
+  raw ← withOutputLocked globalOutput $ withPinnedEnvironment (modeGithub mode) $ captured $ do
+    config ← pinnedConfig out (shapeFormat shape) (modeColour mode) 8
+    summary ← withArgs [] (runSpec (nested out) config)
+    writeIORef failures (summaryFailures summary)
+  (,) (if modeRendered mode then render raw else raw) <$> readIORef failures
+
 -- | The process's standard output while an action runs, as text. The caller holds the process's output lock.
 captured ∷ IO () → IO String
 captured action = do
@@ -143,30 +230,33 @@ captured action = do
   removeFile path
   pure text
 
+-- | The run did what its mode says: no escape at all with colour off (and none in a rendered capture), and with colour on one
+-- wherever the formatter writes anything but records (the silent formatter writes none).
+colourPresent ∷ Shape → Mode → String → Bool
+colourPresent shape mode text
+  | not (modeColour mode) = '\ESC' `notElem` text
+  | modeRendered mode = '\ESC' `notElem` text
+  | shapeName shape == "silent" = '\ESC' `notElem` text
+  | otherwise = "\ESC[" `isInfixOf` text
+
 spec ∷ Spec
 spec = describe "the lines the suite prints and the runner's formatter's report" $ do
-  forM_ shapes $ \shape →
-    it ("prints every record whole at a line start, and the formatter's lines whole, beside eight examples (" <> shapeName shape <> ")") $ do
-      out ← newOutput
-      failures ← newIORef (-1 ∷ Int)
-      text ← withOutputLocked globalOutput $ captured $ do
-        config ← suiteConfig out (shapeArgs shape <> ["--jobs=8"])
-        summary ← withArgs [] (runSpec (stress out) config)
-        writeIORef failures (summaryFailures summary)
-      problems shape examples rowsPerExample 0 text `shouldBe` []
-      readIORef failures >>= (`shouldBe` 0)
-  forM_ (filter shapeBoundary shapes) $ \shape →
-    it ("writes whole, beside the formatter, the records that sequential examples write directly after the group (" <> shapeName shape <> ")") $ do
-      out ← newOutput
-      failures ← newIORef (-1 ∷ Int)
-      text ← withOutputLocked globalOutput $ captured $ do
-        config ← suiteConfig out (shapeArgs shape <> ["--jobs=8"])
-        summary ← withArgs [] (runSpec (mixed out) config)
-        writeIORef failures (summaryFailures summary)
-      problems shape examples rowsPerExample sequentialExamples text `shouldBe` []
-      readIORef failures >>= (`shouldBe` 0)
+  forM_ modes $ \mode → do
+    let colourName = modeName mode
+    forM_ shapes $ \shape →
+      it ("prints every record whole at a line start, and the formatter's lines whole, beside eight examples (" <> shapeName shape <> ", " <> colourName <> ")") $ do
+        (text, failures) ← runNested shape mode (stress examples)
+        problems shape examples rowsPerExample 0 text `shouldBe` []
+        failures `shouldBe` 0
+        colourPresent shape mode text `shouldBe` True
+    forM_ (filter shapeBoundary shapes) $ \shape →
+      it ("writes whole, beside the formatter, the records that sequential examples write directly after the group (" <> shapeName shape <> ", " <> colourName <> ")") $ do
+        (text, failures) ← runNested shape mode mixed
+        problems shape mixedParallel rowsPerExample sequentialExamples text `shouldBe` []
+        failures `shouldBe` 0
+        colourPresent shape mode text `shouldBe` True
   it "the check refuses a record joined to a partial formatter line, a cut record, a missing, a repeated record and a stray fragment" $ do
-    let shape = Shape "specdoc" [] True False True True
+    let shape = Shape "specdoc" "specdoc" True False True True
         good = "\nstress\n" <> record 1 1 <> "\n  example 1\n" <> record 2 1 <> "\n  example 2\n\nFinished in 0.0100 seconds\n2 examples, 0 failures\n"
         check = problems shape 2 1 0
     check good `shouldBe` []
@@ -176,6 +266,14 @@ spec = describe "the lines the suite prints and the runner's formatter's report"
     check ("\nstress\n" <> record 1 1 <> "\n" <> record 1 1 <> "\n  example 1\n" <> record 2 1 <> "\n  example 2\n\nFinished in 0.0100 seconds\n2 examples, 0 failures\n") `shouldNotBe` []
     check ("\nstress\n" <> record 1 1 <> "\n  exam\n  example 1\n" <> record 2 1 <> "\n  example 2\n\nFinished in 0.0100 seconds\n2 examples, 0 failures\n") `shouldNotBe` []
     check (init good) `shouldNotBe` []
+    let col t = "\ESC[32m" <> t <> "\ESC[0m"
+        goodColour = "\n" <> col "stress" <> "\n" <> record 1 1 <> "\n" <> col "  example 1" <> "\n" <> record 2 1 <> "\n" <> col "  example 2" <> "\n\n" <> "Finished in 0.0100 seconds\n" <> col "2 examples, 0 failures" <> "\n"
+        itemColour = "\nstress\n" <> record 1 1 <> "\n  example 1 [\ESC[32mv\ESC[0m]\n" <> record 2 1 <> "\n  example 2 [\ESC[32mv\ESC[0m]\n\nFinished in 0.0100 seconds\n2 examples, 0 failures\n"
+    check goodColour `shouldBe` []
+    check itemColour `shouldBe` []
+    check ("\nstress\n" <> record 1 1 <> "\n" <> col "  example 1" <> record 2 1 <> "\n" <> col "  example 2" <> "\n\nFinished in 0.0100 seconds\n" <> col "2 examples, 0 failures" <> "\n") `shouldNotBe` []
+    check ("\nstress\n" <> record 1 1 <> "\n\ESC[32m  example 1\n\ESC[0m" <> record 2 1 <> "\n" <> col "  example 2" <> "\n\nFinished in 0.0100 seconds\n" <> col "2 examples, 0 failures" <> "\n") `shouldNotBe` []
+    check ("\nstress\n" <> record 1 1 <> "\n\ESC[32m  example 1\n" <> record 2 1 <> "\n" <> col "  example 2" <> "\n\nFinished in 0.0100 seconds\n" <> col "2 examples, 0 failures" <> "\n") `shouldNotBe` []
     let directs i = concatMap (\j → direct i j <> "\n") [1 .. directRows]
         tailOf = "\nFinished in 0.0100 seconds\n2 examples, 0 failures\n"
         groups = "\ngroup 1\n  inner 1\n" <> directs 1 <> "    sequential 1\n" <> "group 2\n  inner 2\n" <> directs 2 <> "    sequential 2\n" <> tailOf
