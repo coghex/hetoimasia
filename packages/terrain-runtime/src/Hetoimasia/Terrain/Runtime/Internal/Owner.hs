@@ -28,6 +28,7 @@ module Hetoimasia.Terrain.Runtime.Internal.Owner
   , terrainComponent
   ) where
 
+import Control.Applicative ((<|>))
 import Control.Concurrent.STM
 import Control.Exception (Exception, SomeAsyncException, SomeException, evaluate, fromException, mask, onException, rethrowIO, throwIO, try, tryWithContext, uninterruptibleMask_)
 import Control.Monad (forM, forM_, unless, void, when)
@@ -65,6 +66,8 @@ import qualified Hetoimasia.Terrain.Runtime.Backed.Growth as Growth
 import Hetoimasia.Terrain.Runtime.Backed.Fault (StorageFault (..))
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Service (ReadMode (..))
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Service (PreparedGrowth)
+import qualified Hetoimasia.Terrain.Runtime.Storage.Internal.Service as Storage
+import Hetoimasia.Terrain.Runtime.Storage.Internal.Types (maxQueuedJobs)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Model (Condition (..), GrowthDecision (..), GrowthView (..), TxnId, clearCondition, conditions, growthView, oldestPin, proposeGrowth, storeConfig, storeHeader, storeRoots, storeVersion)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Format (PageNo)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan (TxClass (..), availablePages)
@@ -158,6 +161,8 @@ data Work
   | WCommit !RequestId
   | WRetry
   | WDispatch
+  | -- | Start again the read of a dispatched load whose read was refused for temporary pressure.
+    WRegather !R.JobId
   | WReport
   | WOpen !RequestId
   | WGather !GatherFor
@@ -193,7 +198,12 @@ nextWork svc token = do
               -- hold, no new pinned read starts (no request's gather, no load's dispatch): the wait is bounded
               -- by the reads already in flight, and the grant comes next once it fits. A refusal no read can
               -- cure (nothing in flight) stalls nothing.
-              holdReads <- if closing || isJust (stateSlot st) then pure False else readsYieldToGrant st adm
+              --
+              -- And no pinned read starts while the storage service's queue is full: its first job would be
+              -- refused for that pressure. Reading the queue here wakes the owner when a queued job is taken.
+              queueFull <- (>= maxQueuedJobs) . Storage.snQueued <$> Storage.snapshotOf (serviceStorage svc)
+              yieldToGrant <- if closing || isJust (stateSlot st) then pure False else readsYieldToGrant st adm
+              let holdReads = yieldToGrant || queueFull
               (prepareWork, commitWork) <- pickRequestWork svc st adm holdReads
               grantWork <- if closing || isJust (stateSlot st) then pure Nothing else grantable st adm
               -- a load is dispatched when the job the model would pick next can start its pinned read
@@ -209,7 +219,20 @@ nextWork svc token = do
                   -- per-arena admission order is unchanged, and the model's own round-robin and
                   -- aging decide among loads.
                   retryWork = if stateFreed st && retryUseful st then Just WRetry else Nothing
-                  dispatchWork = if dispatchFits then Just WDispatch else Nothing
+                  -- a dispatched load whose read was refused for temporary pressure keeps its job: its read is
+                  -- started again, as a dispatch, when a pinned read of its arena can start
+                  regatherWork =
+                    listToMaybe
+                      [ WRegather jid
+                      | not holdReads
+                      , j <- R.modelJobs model
+                      , R.jobPhase j == R.JobRunningPhase
+                      , let jid = R.jobId j
+                      , not (Set.member jid gathering)
+                      , Just (aid, _, _) <- [Map.lookup jid (stateLoadJobs st)]
+                      , canStartGather (gathersPerArena (serviceConfig svc)) st adm aid
+                      ]
+                  dispatchWork = regatherWork <|> (if dispatchFits then Just WDispatch else Nothing)
                   backedReady = listToMaybe (catMaybes [grantWork] <> backedNow)
                   inTurn = case stateTurn st of
                     TurnPrepare → [prepareWork, commitWork, retryWork, dispatchWork, backedReady]
@@ -463,6 +486,7 @@ perform svc = \case
   WCommit rid → takeTurn svc TurnRetry >> commitReq svc rid >> pure True
   WRetry → takeTurn svc TurnDispatch >> retryPass svc >> pure True
   WDispatch → takeTurn svc TurnBacked >> dispatchJob svc >> pure True
+  WRegather jid → takeTurn svc TurnBacked >> regatherJob svc jid >> pure True
   WOpen rid → do
     takeTurn svc TurnPrepare
     before <- stateCompiling <$> atomically (readSt svc)
@@ -602,6 +626,22 @@ dispatchJob svc = do
       defect <- atomically (forgetLoad svc jid >> finishJob svc jid (Left why))
       forM_ defect $ \text → failWith svc (AccountingDefect text) []
 
+-- | Start again the pinned read of a dispatched load whose read was refused for temporary pressure
+-- (the job kept its load-job slot and its charges); a read that cannot start ends the job as a
+-- dispatch that could not start does.
+regatherJob ∷ Service → R.JobId → IO ()
+regatherJob svc jid = do
+  st <- atomically (readSt svc)
+  forM_ (Map.lookup jid (stateLoadJobs st)) $ \(aid, region, cover) → do
+    started <- case realPieces region cover of
+      Left why → pure (Left why)
+      Right pieces → do
+        ok <- atomically (startGatherFor svc (GatherJob jid) aid (ReadRuns (Set.toList (Set.fromList [c | (c, _) ← pieces]))))
+        pure (if ok then Right () else Left "the arena of a dispatched load closed, or no pin was available")
+    forM_ (either Just (const Nothing) started) $ \why → do
+      defect <- atomically (forgetLoad svc jid >> finishJob svc jid (Left why))
+      forM_ defect $ \text → failWith svc (AccountingDefect text) []
+
 forgetLoad ∷ Service → R.JobId → STM ()
 forgetLoad svc jid = modifySt svc (\st → st {stateLoadJobs = Map.delete jid (stateLoadJobs st)})
 
@@ -693,6 +733,9 @@ delivered svc key gathered = (case key of GatherRequest rid → probe svc (Point
         forM_ aid $ \a → pauseArena svc a condition fault []
         void (finishJob svc jid (Left (show fault)))
       HandleClosing → void (atomically (finishJob svc jid (Left "arena closed while its load ran")))
+      -- temporary pressure (the storage queue full): the job keeps its slot and charges, and its read is
+      -- started again ('WRegather') when a pinned read can start
+      HandleRetryLater _ → pure ()
       HandleDefect why → failWith svc (OwnerDefect why) []
       other → failWith svc (OwnerDefect (Text.pack ("a load's read ended unexpectedly: " <> show other))) []
 
