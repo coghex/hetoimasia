@@ -1326,8 +1326,15 @@ slotOver svc task done = do
     (SlotRelease _, _) → failWith svc (OwnerDefect "a release reached a store transaction") []
     (SlotDiscovery, NothingToDo) → markIdle False
     (SlotDiscovery, ReaderBlocks _ _) → markIdle False
-    -- maintenance another transaction needs first, with nothing to do: nothing could ever let that
-    -- transaction plan, so the arena would wait forever. Loud, never a wait
+    -- maintenance another transaction needs first, with nothing to do, is an INCONSISTENCY, never a wait.
+    -- 'MaintenanceFirst' comes only from the protocol's NeedMaintenance (an ordinary plan whose loose list
+    -- would pass looseCap at the smallest unit) and 'HandleWaitReclaim' only from RetirementBacklog (an
+    -- ordinary plan whose retired pages would pass maxRetiredPages); while the arena is marked nothing
+    -- else of it takes the slot, so only its own maintenance can lower either figure, and maintenance then
+    -- either drains a loose list past its soft cap first (which always plans) or meets a non-empty
+    -- retirement tree, whose oldest entry it reclaims or finds held by a reader (ReaderBlocks).
+    -- NothingToDo needs no retirement entry and a loose list within its soft cap: the contradiction of
+    -- the answer that marked the arena.
     (SlotReclaim, NothingToDo) → do
       marked <- Set.member aid . stateNeedsMaintenance <$> atomically (readSt svc)
       if marked
