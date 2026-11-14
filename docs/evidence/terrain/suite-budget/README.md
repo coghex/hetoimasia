@@ -4,7 +4,7 @@
 representative of their parameters, builds every large fixture when the first example reads it, and runs its pure families in
 parallel, in one executable with one "Finished in" line; `terrain-runtime-full-depth-tests` (group `test.terrain-runtime-full-depth`, an optional probe)
 is the second test component, by the owner's decision (issue comment 6872272575), and runs the same
-families at their complete original parameters. Base `19bc8ade`, code head `5899ee11` (the acceptance record below; the earlier figures name their head), GHC 9.14.1 (PATH `$HOME/.cache/hetoimasia/toolchain/ghc-9.14.1/bin`),
+families at their complete original parameters. Base `19bc8ade`, code head `fb77525c` (the acceptance record below; the earlier figures name their head), GHC 9.14.1 (PATH `$HOME/.cache/hetoimasia/toolchain/ghc-9.14.1/bin`),
 machine Apple M3 Max (16 cores). Every figure is a lab observation; CI figures are from the CI record.
 
 ```sh
@@ -14,16 +14,16 @@ cabal test --project-file cabal.project.cpu hetoimasia-terrain-runtime:terrain-r
 
 ## Results
 
-**Acceptance record, code head `5899ee11`** (the suite is 886 examples: the 828 of the earlier heads and the 58 of the oracle of the printed lines), 2026-11-14 08:34Z to 08:41Z, the built tree, nothing built in any run (no `Compiling` or `Linking` line), no other build or test of this repository running. `/usr/bin/time -p` around the literal acceptance command below; every run exited 0 with 0 failures, 8 jobs on 8 capabilities (`RUNNER jobs=8 capabilities=8`, `PHASE sequential: 1 capability`). The load is as observed: a sampler recorded every 5 s any process over 50% CPU other than the suite's binary and `fseventsd`, and any compiler of any project; it does not exclude the suite's own children, and the `ghc` it saw once in each run, about 96 s in, is one: the sequential examples of `Store/Boundary` ("the store's public interface across the package boundary") compile an external client with the `ghc` on `PATH`. This window was nearly quiet.
+**Acceptance record, code head `fb77525c`** (the suite is 882 examples: the 828 of the earlier heads and the 54 of the oracle of the printed lines), 2026-11-14 13:28Z to 13:35Z, the built tree, nothing built in any run (no `Compiling` or `Linking` line), no other build or test of this repository running. `/usr/bin/time -p` around the literal acceptance command below; every run exited 0 with 0 failures, 8 jobs on 8 capabilities (`RUNNER jobs=8 capabilities=8`, `PHASE sequential: 1 capability`). The load is as observed: a sampler recorded every 5 s any process over 50% CPU other than the suite's binary and `fseventsd`, and any compiler of any project; it does not exclude the suite's own children (the sequential examples of `Store/Boundary` compile an external client with the `ghc` on `PATH`). Other projects' builds and tests ran beside the routine runs.
 
 | Run | Load before | Wall s | "Finished in" s | CPU user s | Samples | What the samples show |
 | --- | ---: | ---: | ---: | ---: | ---: | --- |
-| routine 1 | 7.20 | 128.29 | 126.59 | 257.8 | 3 | `cmux` and `XprotectService` once each, the suite's own `ghc` child |
-| routine 2 | 3.94 | 129.90 | 128.43 | 258.7 | 2 | `cmux` once, the suite's own `ghc` child |
-| routine 3 | 5.58 | 128.76 | 127.30 | 257.5 | 1 | the suite's own `ghc` child |
-| no example selected | 5.50 | 1.78 | 0.0001 | 1.52 | 0 | |
+| routine 1 | 12.88 | 142.26 | 139.87 | 268.3 | 13 | another project's `cargo build` and `clang`, `cmux`, `searchpartyd` |
+| routine 2 | 10.81 | 137.71 | 136.18 | 267.2 | 9 | another project's `python -m unittest`, `pijul`, `cmux` |
+| routine 3 | 7.94 | 133.43 | 131.92 | 266.3 | 3 | `XprotectService`, a chat tool |
+| no example selected | 6.26 | 1.78 | 0.0001 | 1.55 | 0 | |
 
-Each routine run is within the 240 s budget (the worst by 110.1 s) and the no-example run within 10 s. The full-depth probe, one run at the code head `7ec6fd45` (the later changes touch the oracle and the line state, which only matters when a printed line follows an event; the probe does not run the oracle) beside other agents' test runs (load 5.6 to 11, not a budgeted run): 96 examples, 0 failures, "Finished in" 1004.86 s, wall 1004.88 s, CPU user 997.2 s. The documented selection `--match "TRA-20 evidence"` runs 8 examples with 0 failures in each executable, prints 23 `EVIDENCE` lines (routine) and 29 (full depth), and every one starts a line; the 29 of the full-depth executable equal the 29 `EVIDENCE` lines of `tra20/README.md` byte for byte except three allocation counters (`allocation a one-record edit plan`, `a pinned point read` and the control map), which moved by under 3 percent between runs. All `EVIDENCE`, `MEMORY` and `memory ...` records of the four runs above and of the full-depth run start a line.
+Each routine run is within the 240 s budget (the worst by 97.7 s) and the no-example run within 10 s. The full-depth probe, one run at the code head `7ec6fd45` (the later changes touch the oracle and the line state, which only matters when a printed line follows an event; the probe does not run the oracle) beside other agents' test runs (load 5.6 to 11, not a budgeted run): 96 examples, 0 failures, "Finished in" 1004.86 s, wall 1004.88 s, CPU user 997.2 s. The documented selection `--match "TRA-20 evidence"` runs 8 examples with 0 failures in each executable, prints 23 `EVIDENCE` lines (routine) and 29 (full depth), and every one starts a line; the 29 of the full-depth executable equal the 29 `EVIDENCE` lines of `tra20/README.md` byte for byte except three allocation counters (`allocation a one-record edit plan`, `a pinned point read` and the control map), which moved by under 3 percent between runs. All `EVIDENCE`, `MEMORY` and `memory ...` records of the four runs above and of the full-depth run start a line.
 
 The earlier windows follow, at the heads they name (828 examples, before the oracle).
 
@@ -71,9 +71,9 @@ Window 2, 2026-11-14 01:30Z to 01:39Z, head `9a1b7ff5` (the suites' sources are 
 | q5 | 5.15 | 128.60 | 127.03 | 260.5 | 9 | a `cargo build` with a `clang` at one core |
 | q6 | 5.32 | 132.26 | 130.77 | 259.3 | 23 | python `unittest`, a python chat tool, a `pijul clone`, `mds` |
 
-All three sets of local runs agree to within about 10 percent (the executable boundary 121.0 to 123.3 s, the cabal boundary under load 127.4 to 135.6 s, the six sampled runs 128.6 to 132.8 s) and the loads differ by a factor of two; every one is 104 s or more under the 240 s budget. The six sampled runs are the acceptance figures of item 2 that the owner's decision of 2026-11-14 names (a daily-use machine cannot be made quiet; "if each run is under budget they pass"; issue comment 6870133533), at the head they were taken (828 examples): a run passes when it is within the budget, no quiet condition applies, and each run's load is stated as observed. After the suite gained the examples of the oracle of the printed lines, the item was taken again at the final code head `5899ee11` under the same rule, the three runs above (intermediate heads gave 145.6, 137.2, 144.4 s at `7ec6fd45`, 838 examples, 141.8, 142.0, 150.5 s at `428a6625`, 856 examples, and 149.0, 137.0, 138.3 s at `4000e2fb`, 876 examples, under heavier load); every run of all these sets is within the budget. The executable-boundary and first cabal-boundary sets are observations.
+All three sets of local runs agree to within about 10 percent (the executable boundary 121.0 to 123.3 s, the cabal boundary under load 127.4 to 135.6 s, the six sampled runs 128.6 to 132.8 s) and the loads differ by a factor of two; every one is 104 s or more under the 240 s budget. The six sampled runs are the acceptance figures of item 2 that the owner's decision of 2026-11-14 names (a daily-use machine cannot be made quiet; "if each run is under budget they pass"; issue comment 6870133533), at the head they were taken (828 examples): a run passes when it is within the budget, no quiet condition applies, and each run's load is stated as observed. After the suite gained the examples of the oracle of the printed lines, the item was taken again at the final code head `fb77525c` under the same rule, the three runs above (intermediate heads gave 145.6, 137.2, 144.4 s at `7ec6fd45`, 838 examples, 141.8, 142.0, 150.5 s at `428a6625`, 856 examples, 149.0, 137.0, 138.3 s at `4000e2fb`, 876 examples, and 128.3, 129.9, 128.8 s at `5899ee11`, 886 examples, nearly quiet); every run of all these sets is within the budget. The executable-boundary and first cabal-boundary sets are observations.
 
-Budget (owner decision 2026-11-13): 240 s whole process locally, 300 s CI "Finished in", 10 s no-example. Headroom locally at the cabal boundary: 110 s in the worst of the three runs at the code head (129.9 s); at the earlier heads 104 s at 8 jobs under load (107 s in the six sampled runs) and 92 s at 4 jobs.
+Budget (owner decision 2026-11-13): 240 s whole process locally, 300 s CI "Finished in", 10 s no-example. Headroom locally at the cabal boundary: 98 s in the worst of the three runs at the code head (142.3 s); at the earlier heads 104 s at 8 jobs under load (107 s in the six sampled runs) and 92 s at 4 jobs.
 
 **CI** (acceptance item 9; the runner has 4 processors, so the default is 4 jobs, `RUNNER jobs=4 capabilities=4 (processors 4)`, then `PHASE sequential: 1 capability`). Three validation runs of this branch (the first two on identical code, their heads differing by the one catalog line that fixed the workflow guard; the third at `12c29156`, with the oracle of the printed lines, which failed under CI's colour and was then repaired):
 
@@ -393,7 +393,7 @@ formatters swept; any other name open), `--color`, `--unicode`, `--diff`, `--pre
 (standard error), `-a/--qc-max-success`, `--qc-max-discard`, `--qc-max-size`, `--qc-max-shrinks`, `--depth` (the text of an
 item's info and failure reason, swept as payloads; no direct output), and the undocumented `--html` (outside the domain).
 
-The oracle (`Test.TerrainRuntime.OutputSpec`, sequential, 58 examples, holding the output lock while it redirects standard output to
+The oracle (`Test.TerrainRuntime.OutputSpec`, sequential, 54 examples, holding the output lock while it redirects standard output to
 a file) has two halves. It drives each guarded formatter directly, with no scheduling in it: built as the runner builds it (the same
 `guardFormatters`, a real format configuration, the cursor hidden first when progress is reported) and fed the complete event
 sequence of a small run (a start, a group, ten items whose payloads cover every kind of result and failure reason, with info lines,
@@ -406,22 +406,24 @@ line start, the formatter's own text unchanged, and inside the domain the bytes 
 alone on the three bases and on every variant outside the domain (the transitions of the state do not depend on what a setting
 changes, and for every in-domain setting the model against the bytes verifies what an event writes). The reviewer's cases are kept by
 name: a run through `runSpec` that holds the first item's start until an example has printed after the run's start; and, with html
-output, a successful item followed by an example that prints, through `suiteConfig` with `--format=NAME --html --no-color` and through
-the pinned configuration, for each formatter. The other half runs a parallel spec of 120 examples printing 20 records each (2,400
+output, a successful item followed by an example that prints, on the pinned configuration with the html field set, for each formatter. The other half runs a parallel spec of 120 examples printing 20 records each (2,400
 records beside 120 item lines) through `Runner.pinnedConfig` (the suite's defaults with the formatter, colour, unicode and job count
 given), at 8 jobs on 8 capabilities, per formatter and mode, and a group of 40 parallel examples followed by 100 sequential examples
 in nested describes writing 3 records each directly with `putStrLn`: every record a whole line at a line start and once (on the raw
 bytes in the progress mode), every other line one the formatter writes whole, a colour sequence recognized by its form and reset
-before the newline. The nested runs take nothing from their environment: no `.hspec` file, no `HSPEC_*` variable, no command line,
-`GITHUB_ACTIONS` and `BUILDKITE` pinned; the oracle passes under `GITHUB_ACTIONS=true`, `NO_COLOR`, `BUILDKITE`, `HSPEC_*`,
-`HSPEC_OPTIONS`, a `.hspec` file and `LANG=C`, which the outer run reads and the nested runs do not.
+before the newline. Every nested run is built by `Runner.pinnedConfig`, which calls no `readConfig`, so it reads no `.hspec` file, no `HSPEC_*`
+variable and no command line (`GITHUB_ACTIONS` and `BUILDKITE` are pinned, colour and unicode explicit); one example sets
+`HSPEC_MATCH`, `HSPEC_SKIP`, `HSPEC_OPTIONS` and the variables of the format options for its duration and checks that the nested html
+case still runs both its examples with its record whole, and built by `suiteConfig` it fails (expected 2 examples, got 0); the
+oracle passes under `GITHUB_ACTIONS=true`, `NO_COLOR`, `BUILDKITE`, `HSPEC_*`, `HSPEC_OPTIONS`, a `.hspec` file and `LANG=C`, which the
+outer run reads and the nested runs do not.
 
 Controls, each run against the oracle: with the formatter's events not under the lock, three of the five formatters fail in each of
 3 runs (malformed records of 2,400: default 38, 23, 33; `specdoc` 44, 9, 20; `progress` 87, 98, 102); with a state rule that
 decides by the kind of event and not by what it wrote, `failed-examples` and `silent` fail with progress reported at 6 and 7 of the
 positions and in the reviewer's case (4 examples, 15 positions); with the state after the run not marked open, the five formatters
 fail with progress reported at the position after the run (5 examples); with the model as it was before its domain (no domain),
-17 of the 58 examples fail: the fifteen direct-drive cells and the reviewer's html case for `specdoc` through both configurations,
+17 of the 54 examples fail: the fifteen direct-drive cells and the reviewer's html case for `specdoc` (on the pinned configuration and in the ambient-settings example),
 in exactly the html variants (a record behind a closing tag, and the model's "ends a line" for events that end with a closing tag), and
 no other setting of the sweep fails; with the domain check removed from the new code the same 17.
 
