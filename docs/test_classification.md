@@ -131,7 +131,8 @@ measurement, fails if a parallel example is running or more than one capability 
 "Finished in" line and the unchanged catalog command; `Main` sets the runner's job count to the processor count up to eight
 (`--jobs N` replaces it) and the capability count to the job count for the group, and the guard returns the runtime to one
 capability before each sequential example; the run prints the counts it used. Seeds stay fixed and results deterministic;
-output of parallel examples may interleave by line, each printed line whole.
+every printed line starts a line and ends whole: the parallel examples and the runner's formatter share one lock
+(`Test.TerrainRuntime.Output`), and the suite checks it with the formatters the runner can select.
 
 ## Local probe inventory
 
