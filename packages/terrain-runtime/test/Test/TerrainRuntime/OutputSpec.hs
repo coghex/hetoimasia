@@ -1,6 +1,7 @@
 {-# OPTIONS_GHC -Wno-deprecations #-}
 -- | The oracle of the printed lines ("Test.TerrainRuntime.Output"): a small parallel spec is run through the configuration the
--- suite itself runs with ("Test.TerrainRuntime.Runner.suiteConfig": the same job default, the same guarded formatters), once
+-- suite's runner builds from the same defaults ("Test.TerrainRuntime.Runner.pinnedConfig": the same job default, the same guarded
+-- formatters, and no @readConfig@: nothing ambient is read), once
 -- per formatter the runner can select, with the process's standard output captured to a file; then every printed record must
 -- be a whole line starting at a line start, every record must appear exactly once, and every line the formatter wrote must be
 -- one it would have written whole.
@@ -22,8 +23,10 @@
 -- record at each position of the run, alone and with the others, on the raw bytes, the formatter's own text unchanged, and inside
 -- the domain the model equal to the bytes each event wrote. Configurations outside the domain (html output, an external diff
 -- command, a diff context that is none of the swept ones) are driven the same way: every record still whole at a line start,
--- which is the conservative rule proving itself. The reviewer's html case runs through "Test.TerrainRuntime.Runner.suiteConfig"
--- (which reads the environment, so it names its arguments) and through the pinned configuration.
+-- which is the conservative rule proving itself. The reviewer's html case sets the field that @--html@ sets on the pinned
+-- configuration, and one example keeps it independent of the ambient selection and format settings (@HSPEC_MATCH@, @HSPEC_SKIP@,
+-- @HSPEC_OPTIONS@ and the rest), which only a configuration that reads nothing can be: every nested run of this module is built by
+-- 'pinnedConfig'.
 --
 -- The run is made at eight jobs on eight capabilities, so the examples really write while the formatter does: 120 examples
 -- print 20 records each (2,400 records against 120 item lines). A second case follows a parallel group with sequential
@@ -55,7 +58,6 @@ import Test.Hspec
 import Test.Hspec.Core.Format (Event (..), FailureReason (..), FormatConfig (..), Item (..), Location (..), Result (..), Seconds (..), defaultFormatConfig)
 import Test.Hspec.Runner (Config (..), Summary (..), defaultConfig, runSpec)
 import Test.TerrainRuntime.Output (Effect (..), Output, eventEffect, globalOutput, guardFormatters, modelDomain, newOutput, printLineOn, withOutputLocked)
-import Test.TerrainRuntime.Runner (suiteConfig)
 import Test.TerrainRuntime.Runner (pinnedConfig)
 
 examples ∷ Int
@@ -213,6 +215,30 @@ withPinnedEnvironment githubActions action = bracket save restore $ \_ → do
   where
     save = (,) <$> lookupEnv "GITHUB_ACTIONS" <*> lookupEnv "BUILDKITE"
     restore (gh, bk) = maybe (unsetEnv "GITHUB_ACTIONS") (setEnv "GITHUB_ACTIONS") gh >> maybe (unsetEnv "BUILDKITE") (setEnv "BUILDKITE") bk
+
+-- | An action with the ambient selection and format settings of Hspec set to values that would break any nested run that read
+-- them: a match pattern that matches none of the nested examples, a skip pattern that matches all of them (@--match@ and @--skip@
+-- are command-line options, which Hspec refuses in @HSPEC_OPTIONS@, so they are set through their own variables), options that
+-- select another formatter, colour, a dry run, fail-fast and times, and the variables of the same options; every variable
+-- restored on every exit. The nested runs of this module are built by 'pinnedConfig', which reads none of it.
+withAmbientSettings ∷ IO a → IO a
+withAmbientSettings action = bracket save restore $ \_ → do
+  mapM_ (uncurry setEnv) settings
+  action
+  where
+    settings =
+      [ ("HSPEC_MATCH", "matches none of the nested examples")
+      , ("HSPEC_SKIP", "html")
+      , ("HSPEC_OPTIONS", "--format=progress --color --dry-run --jobs=1 --fail-fast --times")
+      , ("HSPEC_FORMAT", "progress")
+      , ("HSPEC_COLOR", "yes")
+      , ("HSPEC_DRY_RUN", "yes")
+      , ("HSPEC_HTML", "no")
+      , ("HSPEC_FAIL_FAST", "yes")
+      , ("HSPEC_JOBS", "1")
+      ]
+    save = mapM (\(name, _) → (,) name <$> lookupEnv name) settings
+    restore saved = mapM_ (\(name, old) → maybe (unsetEnv name) (setEnv name) old) saved
 
 -- | How the nested run is made: its colour setting, whether it runs as GitHub Actions does, and whether the capture is what a terminal
 -- would show (the run reports progress, so the bytes carry the transient text and its erase).
@@ -449,21 +475,32 @@ spec = describe "the lines the suite prints and the runner's formatter's report"
           pure problemList
         concat problemsOf `shouldBe` []
   forM_ shapes $ \shape →
-    forM_ [("through suiteConfig, --format=" <> shapeFormat shape <> " --html --no-color", True), ("through pinnedConfig with html output set", False)] $ \(how, viaSuite) →
-      it ("keeps a record printed by an example that follows a successful item whole at a line start with html output, the reviewer's case (" <> shapeName shape <> ", " <> how <> ")") $ do
-        out ← newOutput
-        let nested = describe "html" $ do
-              it "a successful item" (pure () ∷ IO ())
-              it "an item that prints" $ printLineOn out (record 1 1)
-        raw ← withOutputLocked globalOutput $ withPinnedEnvironment True $ captured $ do
-          config ←
-            if viaSuite
-              then suiteConfig out ["--format=" <> shapeFormat shape, "--html", "--no-color"]
-              else (\c → c {configHtmlOutput = True}) <$> pinnedConfig out (shapeFormat shape) False 8
-          summary ← withArgs [] (runSpec nested config)
-          summaryFailures summary `shouldBe` 0
-        recordLineProblems 1 1 0 raw `shouldBe` []
-        length [l | l ← lines raw, isRecordLine l] `shouldBe` 1
+    it ("keeps a record printed by an example that follows a successful item whole at a line start with html output, the reviewer's case, on the pinned configuration with html output set (" <> shapeName shape <> ")") $ do
+      out ← newOutput
+      let nested = describe "html" $ do
+            it "a successful item" (pure () ∷ IO ())
+            it "an item that prints" $ printLineOn out (record 1 1)
+      raw ← withOutputLocked globalOutput $ withPinnedEnvironment True $ captured $ do
+        config ← (\c → c {configHtmlOutput = True}) <$> pinnedConfig out (shapeFormat shape) False 8
+        summary ← withArgs [] (runSpec nested config)
+        summaryFailures summary `shouldBe` 0
+      recordLineProblems 1 1 0 raw `shouldBe` []
+      length [l | l ← lines raw, isRecordLine l] `shouldBe` 1
+  it "keeps the reviewer's html case independent of every ambient selection and format setting: both nested examples run and the record is whole" $ do
+    outs ← forM shapes $ \shape → do
+      out ← newOutput
+      ran ← newIORef (0 ∷ Int)
+      let nested = describe "html" $ do
+            it "a successful item" (modifyIORef ran (+ 1))
+            it "an item that prints" $ modifyIORef ran (+ 1) >> printLineOn out (record 1 1)
+      raw ← withOutputLocked globalOutput $ withPinnedEnvironment True $ withAmbientSettings $ captured $ do
+        config ← (\c → c {configHtmlOutput = True}) <$> pinnedConfig out (shapeFormat shape) False 8
+        summary ← withArgs [] (runSpec nested config)
+        summaryFailures summary `shouldBe` 0
+        summaryExamples summary `shouldBe` 2
+      count ← readIORef ran
+      pure (shapeName shape, count, recordLineProblems 1 1 0 raw, length [l | l ← lines raw, isRecordLine l])
+    [(name, count, problemList, records) | (name, count, problemList, records) ← outs, count /= 2 || not (null problemList) || records /= 1] `shouldBe` []
   forM_ shapes $ \shape →
     it ("keeps the record printed between the start of the run and the first item's start whole, through the runner with the two events held in that order (" <> shapeName shape <> ", progress reported)") $ do
       out ← newOutput
