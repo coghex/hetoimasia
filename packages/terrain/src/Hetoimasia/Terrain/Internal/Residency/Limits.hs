@@ -262,7 +262,7 @@ explicitMinimumBytes spec bank = case bank of
   StagingBank →
     maximum
       [ toInteger (commandRecordBytes 0) + 32 * queryN + interest * queryN + queryN * scratch
-      , toInteger (commandRecordBytes 1) + toInteger removalStagingBytes + interest + 256 + 2
+      , toInteger (commandRecordBytes 1) + toInteger removalStagingBytes + interest + 256 + 2 + toInteger (loadRunsBytes 1 1)
       , stored
       ]
   where
