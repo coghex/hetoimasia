@@ -125,6 +125,7 @@ module Hetoimasia.Terrain.Runtime
   , inspectStorageJobsSTM
   , inspectMaintenanceFirstSTM
   , inspectPendingExtraSTM
+  , inspectStagedOverlaySTM
   , inspectModel
   , inspectModelSTM
   , inspectDefects
@@ -202,6 +203,7 @@ import Hetoimasia.Terrain.Palette (Palette)
 import Hetoimasia.Terrain.Resident (Resident, columnIndexBytes, residentColumns, residentSegments)
 import Hetoimasia.Terrain.Segment (segmentMetadataBytes, segmentPayloadBytes, segmentStart)
 import Hetoimasia.Terrain.Runtime.Internal.Content (Prepared (..))
+import Hetoimasia.Terrain.Changes (changesBytes)
 import Hetoimasia.Terrain.Runtime.Internal.Core
 import Hetoimasia.Terrain.Runtime.Internal.Owner (ownerDefinition)
 import Hetoimasia.Terrain.Runtime.Internal.Snapshot
@@ -209,7 +211,7 @@ import Hetoimasia.Terrain.Runtime.Internal.Types
 import Hetoimasia.Terrain.Runtime.Settlement
 import Hetoimasia.Terrain.Runtime.Backed.Port (StoragePort (..), storagePort)
 import Hetoimasia.Terrain.Runtime.Backed.Fault (FullWhy (..), IntegritySource (..), StorageFault (..), faultCode)
-import Hetoimasia.Terrain.Runtime.Internal.Backed (backedInvariants, editBankChecked, markOf, pressureMark)
+import Hetoimasia.Terrain.Runtime.Internal.Backed (backedInvariants, editBankChecked, markOf, pressureMark, removalStagingChecked)
 import qualified Hetoimasia.Terrain.Runtime.Storage.Internal.Service as Storage
 import Hetoimasia.Terrain.Runtime.Store.Internal.Admission (EditBankSpec (..), Ledger (..), defaultEditBankSpec, ledgers, mkEditBankConfig, newAdmission)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Model (Condition (..), GrowthView (..), Usage (..), conditions, growthView, storeHeader, usage)
@@ -289,6 +291,7 @@ withTerrainService config ports body = do
   storeConfig <- either (throwIO . ConfigStore) pure (mkStoreConfig (configStore config))
   editBank <- either (throwIO . ConfigEditBank) pure (mkEditBankConfig (configEditBank config) {ebsArenas = toInteger (configMaxArenas config)})
   either throwIO pure (editBankChecked (configEditBank config) {ebsArenas = toInteger (configMaxArenas config)})
+  either throwIO pure removalStagingChecked
   limits <- either throwIO pure (modelLimitsChecked config)
   compileBank <- either throwIO pure (compileBankChecked (configMaxArenas config) (configConnectivity config))
   bank <- newTVarIO (newAdmission editBank)
@@ -588,6 +591,19 @@ inspectPendingExtraSTM svc (ArenaLease tag lid)
 -- work answered that maintenance must run first). Read-only, for verification.
 inspectMaintenanceFirstSTM ∷ Service → STM Int
 inspectMaintenanceFirstSTM svc = Set.size . stateNeedsMaintenance <$> readSt svc
+
+-- | Each staged removal's overlay: what its preparation keeps until it commits or settles (its
+-- changes and its working interval), in bytes by the figures of "Hetoimasia.Terrain.Changes".
+-- Read-only, for verification.
+inspectStagedOverlaySTM ∷ Service → STM [(R.RequestId, Int)]
+inspectStagedOverlaySTM svc = do
+  st <- readSt svc
+  pure
+    [ (rid, changesBytes (preparedChanges prepared) + changesBytes (preparedWorking prepared))
+    | (rid, req) ← Map.toList (stateRequests st)
+    , StagedPhase sg ← [reqPhase req]
+    , StagedRemoval prepared ← [stagedWork sg]
+    ]
 
 -- | How many jobs the storage service holds (queued, running, or finished and not yet taken).
 -- Read-only, for verification.

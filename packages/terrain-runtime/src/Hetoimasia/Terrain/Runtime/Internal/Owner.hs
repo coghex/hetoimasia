@@ -824,7 +824,7 @@ delivered svc key gathered = (case key of GatherRequest rid → probe svc (Point
         forgetLoad svc jid
         markFreed svc
     GatherRequest _ → pure ()
-  (GatherRequest rid, GatheredRuns runs revision) → stageFromRuns svc rid runs revision
+  (GatherRequest rid, GatheredRuns runs revision) → probe svc (PointGatheredRuns rid (length runs)) >> stageFromRuns svc rid runs revision
   (GatherRequest rid, GatheredFailed handling) → handleRequest svc rid handling
   (GatherRequest rid, GatheredKnowledge known content knowledge) → do
     st <- atomically (readSt svc)

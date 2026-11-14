@@ -43,6 +43,8 @@ module Hetoimasia.Terrain.Runtime.Internal.Backed
   , sameCommittedSTM
   , CommittedMovedOutsideDecision (..)
   , editBankChecked
+  , removalStagingParts
+  , removalStagingChecked
   , pressureMark
   , markOf
   , notePressure
@@ -86,7 +88,8 @@ import Data.Maybe (isJust)
 import qualified Data.Text as Text
 import Data.Word (Word64)
 import Hetoimasia.Terrain.Cell (Column (..), mkZRange)
-import Hetoimasia.Terrain.Changes (ChangeLimits (..), Changes, changesFromIntervals)
+import Hetoimasia.Terrain.Changes (ChangeLimits (..), Changes, changeColumnBytes, changeIntervalBytes, changesFromIntervals)
+import Hetoimasia.Terrain.Segment (maxSegmentLevels)
 import qualified Hetoimasia.Terrain.Connectivity as C
 import Hetoimasia.Terrain.Coordinate (TileCoord)
 import qualified Hetoimasia.Terrain.Discovery as D
@@ -157,6 +160,32 @@ gathersPerArena config = fromInteger (min (toInteger maxReaders) (A.ebsReadersPe
 -- that account, and the store's minimum counts none of them. Without that room a granted
 -- transaction's write cannot be charged, or a removal is never granted. The spec's arenas are the
 -- service's arena cap, which bounds its backings.
+-- | What the staging a removal reserves for its whole life ('R.removalStagingBytes') holds, each part
+-- at its bound: the decoded segment of its cell's column in its region (two bytes a cell over a
+-- segment's levels), its rebuilt copy, the staged overlay (what its preparation keeps: the changes
+-- read over the cell and its two neighbours, at most four runs of one column, and the working
+-- interval, one run) and the result settlement (a settled result's record).
+removalStagingParts ∷ [(Text, Integer)]
+removalStagingParts =
+  [ ("decoded segment", segment)
+  , ("rebuilt copy", segment)
+  , ("staged overlay", column + 4 * interval + column + interval)
+  , ("result settlement", toInteger resultRecordBytes)
+  ]
+  where
+    segment = 2 * toInteger maxSegmentLevels
+    column = toInteger changeColumnBytes
+    interval = toInteger changeIntervalBytes
+
+-- | The parts of a removal's staging fit the staging it reserves: refused at construction otherwise,
+-- so the constant cannot drift below what it holds.
+removalStagingChecked ∷ Either ConfigError ()
+removalStagingChecked
+  | need > toInteger R.removalStagingBytes = Left (ConfigRemovalStaging need (toInteger R.removalStagingBytes))
+  | otherwise = Right ()
+  where
+    need = sum (map snd removalStagingParts)
+
 editBankChecked ∷ A.EditBankSpec → Either ConfigError ()
 editBankChecked spec
   | cacheNeed > A.ebsCache spec = Left (ConfigEditBankReads "cache" cacheNeed (A.ebsCache spec))

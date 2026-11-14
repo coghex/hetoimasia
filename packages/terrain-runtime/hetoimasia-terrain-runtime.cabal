@@ -175,6 +175,7 @@ test-suite terrain-runtime-tests
         Test.TerrainRuntime.Backed.Held
         Test.TerrainRuntime.Backed.Loop
         Test.TerrainRuntime.Backed.Recovery
+        Test.TerrainRuntime.Backed.Ranges
         Test.TerrainRuntime.Store.WriteProbe
         Test.TerrainRuntime.Storage.Filesystem
         Test.TerrainRuntime.Backed.Outcomes

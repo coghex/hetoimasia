@@ -30,6 +30,7 @@ import qualified Test.TerrainRuntime.Backed.Pressure as BackedPressure
 import qualified Test.TerrainRuntime.Backed.Held as BackedHeld
 import qualified Test.TerrainRuntime.Backed.Loop as BackedLoop
 import qualified Test.TerrainRuntime.Backed.Recovery as BackedRecovery
+import qualified Test.TerrainRuntime.Backed.Ranges as BackedRanges
 import qualified Test.TerrainRuntime.Store.WriteProbe as StoreWriteProbe
 import qualified Test.TerrainRuntime.Storage.Filesystem as StorageFilesystem
 import qualified Test.TerrainRuntime.Backed.Outcomes as BackedOutcomes
@@ -96,6 +97,7 @@ sequentialSpec = do
   BackedHeld.spec
   BackedLoop.spec
   BackedRecovery.spec
+  BackedRanges.spec
   BackedService.spec
   BackedSweep.spec
   BackedTxn.spec

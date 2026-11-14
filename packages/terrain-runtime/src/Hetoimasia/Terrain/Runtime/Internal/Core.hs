@@ -40,6 +40,7 @@ module Hetoimasia.Terrain.Runtime.Internal.Core
   , readAnswer
   , demandFor
   , commandRanges
+  , resultRecordBytes
   , surfaceWindowLevels
   , pendingEdits
 

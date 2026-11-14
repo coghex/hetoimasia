@@ -442,6 +442,9 @@ data ConfigError
   | -- | The edit bank cannot fund one read beside the worst transaction and every reader pin: the
     -- account, what it needs and what it has.
     ConfigEditBankReads !Text !Integer !Integer
+  | -- | The staging a removal reserves for its whole life ('R.removalStagingBytes') is less than
+    -- its parts ('removalStagingParts'): what they need and what it is.
+    ConfigRemovalStaging !Integer !Integer
   deriving stock (Show)
 
 instance Exception ConfigError
@@ -512,6 +515,8 @@ data Point
     PointDiscoveryGranted !ArenaId
   | -- | A discovery transaction of the arena published.
     PointDiscoveryCommitted !ArenaId
+  | -- | A request's pinned read delivered this many removed runs (what it kept of its columns).
+    PointGatheredRuns !RequestId !Int
   deriving stock (Eq, Show)
 
 -- | An unexpected defect, kept with bounded context.
