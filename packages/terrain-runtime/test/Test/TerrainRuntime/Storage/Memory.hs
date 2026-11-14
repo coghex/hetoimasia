@@ -53,6 +53,7 @@ import Hetoimasia.Terrain.Runtime.Store.Internal.Format (PageNo (..))
 import System.IO.Unsafe (unsafePerformIO)
 import System.Mem (performMajorGC)
 import Test.Hspec
+import Test.TerrainRuntime.Isolation (assertSequential)
 import Test.TerrainRuntime.Storage.Harness
 import Test.TerrainRuntime.Storage.Lifecycle (withControlledService, Ctl (..))
 import qualified Data.Map.Strict as Map
@@ -94,7 +95,7 @@ liveWith afterReading = settle (0 ∷ Int) []
 
 -- | One VALID reading: after a major collection whose details are the major collection's.
 validReading ∷ IO Word64
-validReading = go (0 ∷ Int)
+validReading = assertSequential "a live-heap reading" >> go (0 ∷ Int)
   where
     go k = do
       performMajorGC
@@ -781,7 +782,9 @@ spec4 = describe "Storage backend: what the service retains of what it is handed
     retention "queued open" k perJobBytes (fromIntegral jobRecordBytes)
 
   it "a qualified-filesystem name that is a short slice of a large buffer costs the copy: K configurations held at once" $ do
-    let viewOf k = BS.take 4 (BC.pack (replicate (2 * 1024 * 1024) (toEnum (97 + k `mod` 20))))
+    -- the two-megabyte buffer each name is a view of: filled in place (the same bytes as packing a list of them, which took
+    -- nearly all of this example's time)
+    let viewOf k = BS.take 4 (BC.replicate (2 * 1024 * 1024) (toEnum (97 + k `mod` 20)))
         config k = either (error . show) id (mkStorageConfig [viewOf k, viewOf (k + 1)] minHeadroomBytes)
     _ ← evaluate (length (scQualified (config 0)))
     let k = 24 ∷ Int

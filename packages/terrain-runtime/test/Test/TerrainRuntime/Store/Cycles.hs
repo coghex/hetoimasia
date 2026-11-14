@@ -10,7 +10,7 @@
 -- the pages still partition the page space and the records equal the reference map.
 -- At the end every reader is released, reclamation drains, nothing remains retired and
 -- the same committed version reads back from pages alone.
-module Test.TerrainRuntime.Store.Cycles (spec, runCycles, CycleReport (..)) where
+module Test.TerrainRuntime.Store.Cycles (spec, fullSpec, cycleSeeds, runCycles, CycleReport (..)) where
 
 import Control.Monad (foldM, forM_)
 import qualified Data.ByteString as BS
@@ -21,6 +21,7 @@ import Hetoimasia.Terrain.Runtime.Store.Internal.Model
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan
 import Hetoimasia.Terrain.Runtime.Store.Internal.State
 import Test.Hspec
+import Test.TerrainRuntime.Store.Depth (Depth (..), atDepth)
 import Test.TerrainRuntime.Store.Harness
 import Test.TerrainRuntime.Store.Reference
 import Test.TerrainRuntime.Store.Workload
@@ -196,9 +197,18 @@ finish st = do
   let rep = (stRep st) {crHighWater = rHw (storeRoots (hStore h2)), crRecords = Map.size (stRef st)}
   Right (st {stH = h2, stReaders = []}, rep)
 
-spec ∷ Spec
-spec = describe "repeated update, abort, publish, read and reclaim cycles" $
-  forM_ [101, 202, 303] $ \seed →
+-- | The seeds of the cycles: one at the routine depth, the three of the original at the full depth.
+cycleSeeds ∷ Depth → [Word64]
+cycleSeeds depth = atDepth depth [202] [101, 202, 303]
+
+-- | The routine depth, and every family at its original depth (the optional full-depth probe).
+spec, fullSpec ∷ Spec
+spec = specAt Routine
+fullSpec = specAt Full
+
+specAt ∷ Depth → Spec
+specAt depth = describe "repeated update, abort, publish, read and reclaim cycles" $
+  forM_ (cycleSeeds depth) $ \seed →
     it ("keeps every pinned version, the partition and the reference through the cycles (seed " <> show seed <> ")") $
       case runCycles seed 450 of
         Left e → expectationFailure e

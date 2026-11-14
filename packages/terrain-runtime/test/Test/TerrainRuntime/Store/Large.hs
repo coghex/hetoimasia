@@ -11,7 +11,7 @@
 -- or clustered, of every size around the bounds, must end committed or with a shrinkable capacity
 -- refusal that a smaller batch gets past, never an integrity result, and the independent checker must
 -- agree after every commit. Maintenance drains the same store without an integrity result.
-module Test.TerrainRuntime.Store.Large (spec) where
+module Test.TerrainRuntime.Store.Large (spec, fullSpec) where
 
 import Control.Monad (foldM, forM_, when)
 import qualified Data.Map.Strict as Map
@@ -20,9 +20,11 @@ import Hetoimasia.Terrain.Discovery (Record, RecordKey)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Model
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan
 import Hetoimasia.Terrain.Runtime.Store.Internal.State
+import Test.TerrainRuntime.Output (printLine)
 import Test.Hspec
 import Test.TerrainRuntime.Store.Harness
 import Test.TerrainRuntime.Store.Bounds (wide)
+import Test.TerrainRuntime.Store.Depth (Depth (..), atDepth, newFixture, readFixture)
 import Test.TerrainRuntime.Store.Reference
 
 must ∷ Either String a → IO a
@@ -39,10 +41,11 @@ linkOf i =
 commitW ∷ H → [(RecordKey, Maybe Record)] → Either String (H, Outcome)
 commitW h ws = commitDelta h Ordinary (deltaFor (hStore h) True False 1 ws)
 
--- | A store whose links tree has three levels and whose retirement tree holds many thousands of retired
--- pages, built by committing, never maintained.
-largeStore ∷ Int → Either String (H, Map.Map RecordKey Record, Int)
-largeStore n = do
+-- | A store of @n@ links whose retirement tree holds @target@ retired pages, built by committing: @recycling@ rounds with
+-- maintenance, then rounds without it until the target is reached. At the full depth it has three levels in the links
+-- tree and in the retirement tree (12,000 links, 14,100 retired pages, 150 recycling rounds).
+largeStore ∷ Int → Int → Int → Either String (H, Map.Map RecordKey Record, Int)
+largeStore n target recycling = do
   let linkOf' = linkOf
       initial = [(k, Just a) | i ← [0 .. n - 1], let (k, a, _) = linkOf' i]
       chunks [] = []
@@ -67,10 +70,10 @@ largeStore n = do
         case p of
           Planned plan → commitPlan h plan >>= maintainSteps (k - 1)
           _ → Right h
-      recycle st@(_, _, r) | r >= 150 = Right st
+      recycle st@(_, _, r) | r >= recycling = Right st
                            | otherwise = round' True st >>= recycle
       go st@(h, _, _)
-        | rRetiredPages (storeRoots (hStore h)) >= 14100 = Right st
+        | rRetiredPages (storeRoots (hStore h)) >= fromIntegral target = Right st
         | otherwise = round' False st >>= go
   (h, ref, r) ← recycle (h0, ref0, 0) >>= go
   Right (h, ref, r)
@@ -111,9 +114,9 @@ drainChecked = go 0 0
             Refused r → Left ("maintenance was refused: " <> show r)
             other → Left ("unexpected " <> take 100 (show other))
 
--- | A store whose runs tree holds 3,000 runs, for the long drains.
-wideStore ∷ Either String (H, [RecordKey])
-wideStore = wide 3000
+-- | A store whose runs tree holds @n@ runs, for the long drains.
+wideStore ∷ Int → Either String (H, [RecordKey])
+wideStore = wide
 
 -- | A batch of @k@ replacements of live links, dispersed (a stride that divides none of the keys) or clustered.
 batchOf ∷ Map.Map RecordKey Record → Int → Int → Bool → [(RecordKey, Maybe Record)]
@@ -141,22 +144,36 @@ settleBatch h ref ws = go h ref ws (0 ∷ Int)
           | shrinkable why && length batch > 3 → go hh rr (take (max 3 (length batch `div` 2)) batch) (shrinks + 1)
           | otherwise → Left ("a legitimate batch of " <> show (length batch) <> " writes came to " <> show why)
 
-spec ∷ Spec
-spec = describe "planning on large valid stores (deep trees, thousands of retired pages)" $ do
-  (h0, ref0, rounds) ← runIO (must (largeStore 12000))
-  runIO (putStrLn ("LARGE loose list of the built store: " <> show (length (rLoose (storeRoots (hStore h0))))))
+-- | The routine depth (the bounded store and histories) and the full depth (the original sizes).
+spec, fullSpec ∷ Spec
+spec = specAt Routine
+fullSpec = specAt Full
+
+specAt ∷ Depth → Spec
+specAt depth = describe "planning on large valid stores (deep trees, thousands of retired pages)" $ do
+  -- the sizes of the store the examples share: links, retired pages the retirement tree holds, recycling rounds; the
+  -- literals the first example asserts restate them (the originals are 12,000, 14,100 and 150)
+  let (links, target, recycling) = atDepth depth (3500, 2400, 20) (12000, 14100, 150)
+      -- the commits a reader stays pinned through in the drain of small entries (3,000 at the full depth)
+      smallEntries = atDepth depth 1300 3000 ∷ Int
+  fixture ← runIO $ newFixture ("Large.largeStore " <> show (links, target, recycling)) $ do
+    built@(h, _, _) ← must (largeStore links target recycling)
+    printLine ("LARGE loose list of the built store: " <> show (length (rLoose (storeRoots (hStore h)))))
+    pure built
   it "builds a store that is deep, full of retirement and valid" $ do
+    (h0, _, rounds) ← readFixture fixture
     must (checkH h0)
-    rRetiredPages (storeRoots (hStore h0)) `shouldSatisfy` (>= 14100)
-    rounds `shouldSatisfy` (> 150)
+    rRetiredPages (storeRoots (hStore h0)) `shouldSatisfy` (>= fromIntegral target)
+    rounds `shouldSatisfy` (> recycling)
   it "plans every batch size across the bounds, dispersed and clustered: committed or shrunk, never an integrity result" $ do
-    let sizes = [1, 2, 3, 5, 8, 13, 21, 34, 40, 48, 52, 56, 58, 60, 62, 63, 64, 66, 70, 80, 100, 150, 220, 300]
-    fates ← must $ mapM (\(k, d) → (\(_, _, f) → (k, d, f)) <$> settleBatch h0 ref0 (batchOf ref0 12000 k d)) [(k, d) | k ← sizes, d ← [True, False]]
-    putStrLn ("LARGE batch fates (writes, dispersed, fate): " <> show fates)
+    (h0, ref0, _) ← readFixture fixture
+    let sizes = atDepth depth [64, 300] [1, 2, 3, 5, 8, 13, 21, 34, 40, 48, 52, 56, 58, 60, 62, 63, 64, 66, 70, 80, 100, 150, 220, 300]
+    fates ← must $ mapM (\(k, d) → (\(_, _, f) → (k, d, f)) <$> settleBatch h0 ref0 (batchOf ref0 links k d)) [(k, d) | k ← sizes, d ← [True, False]]
+    printLine ("LARGE batch fates (writes, dispersed, fate): " <> show fates)
     -- how close each batch came to the bookkeeping reserve, and what refused the ones that were refused
-    forM_ [(k, d) | k ← [40, 56, 64, 80, 100, 150, 220, 300], d ← [True, False]] $ \(k, d) → do
-      p ← must (fillPlan h0 (deltaFor (hStore h0) True False 1 (batchOf ref0 12000 k d)) Ordinary)
-      putStrLn ("LARGE plan " <> show (k, d) <> ": " <> case p of
+    forM_ [(k, d) | k ← atDepth depth [64, 300] [40, 56, 64, 80, 100, 150, 220, 300], d ← [True, False]] $ \(k, d) → do
+      p ← must (fillPlan h0 (deltaFor (hStore h0) True False 1 (batchOf ref0 links k d)) Ordinary)
+      printLine ("LARGE plan " <> show (k, d) <> ": " <> case p of
         Planned pl → "bookkeeping " <> show (mBookkeepingPages (plMeasure pl)) <> " record pages " <> show (mRecordPages (plMeasure pl)) <> " replaced " <> show (mReplacedRecord (plMeasure pl))
         other → take 120 (show other))
     [x | x@(_, _, Defect _) ← fates] `shouldBe` []
@@ -165,11 +182,12 @@ spec = describe "planning on large valid stores (deep trees, thousands of retire
   -- 'bdReserveMax'), which these examples set: a batch whose bookkeeping outgrows the reserve is answered by a larger
   -- supply when the bound allows it and otherwise by the shrinkable result, and never by an integrity result.
   it "answers a bookkeeping need past the reserve with a larger supply, or a shrinkable result, never an integrity result" $ do
+    (h0, ref0, _) ← readFixture fixture
     let withBounds rsv rsvMax h ws = do
           let bounds = standardBounds {bdReserve = rsv, bdReserveMax = rsvMax}
           (p, _, _) ← fillWith h (\w → planDeltaPinned bounds (hCfg h) (hIdent h) (storeRoots (hStore h)) [] w Ordinary (deltaFor (hStore h) True False 1 ws))
           pure p
-        ws64 = batchOf ref0 12000 64 True
+        ws64 = batchOf ref0 links 64 True
     -- a larger supply when the bound allows: planned, with more bookkeeping pages than the reserve
     allowed ← must (withBounds 3 64 h0 ws64)
     case allowed of
@@ -189,15 +207,16 @@ spec = describe "planning on large valid stores (deep trees, thousands of retire
       other → expectationFailure ("a bookkeeping need past the bound was not refused as capacity: " <> take 200 (show other))
     -- halved as discovery does, the batch makes progress: some size commits under the same bounds
     let sizes = takeWhile (>= 1) (iterate (`div` 2) 64)
-    outcomes ← must (mapM (\k → (\p → (k, p)) <$> withBounds 3 3 h0 (batchOf ref0 12000 k True)) sizes)
+    outcomes ← must (mapM (\k → (\p → (k, p)) <$> withBounds 3 3 h0 (batchOf ref0 links k True)) sizes)
     let planned = [k | (k, Planned _) ← outcomes]
         integrity = [(k, why) | (k, Refused why@(Integrity _)) ← outcomes]
     integrity `shouldBe` []
     planned `shouldSatisfy` (not . null)
   -- the same boundary for maintenance: a chunk of reclaimed pages whose bookkeeping outgrows its supply is a
   -- shrinkable result and the chunk is halved; never an integrity result
-  it "reclaims under a reserve too small for the larger chunks by halving them, never with an integrity result" $
-    forM_ [0, 8 ∷ Int] $ \rsv → do
+  it "reclaims under a reserve too small for the larger chunks by halving them, never with an integrity result" $ do
+   (h0, _, _) ← readFixture fixture
+   forM_ [0, 8 ∷ Int] $ \rsv → do
       let bounds = standardBounds {bdReserve = rsv, bdReserveMax = rsv}
           pass h = do
             (p, _, _) ← fillWith h (\w → planReclaimPinned bounds (hCfg h) (hIdent h) (storeRoots (hStore h)) [] w)
@@ -214,7 +233,7 @@ spec = describe "planning on large valid stores (deep trees, thousands of retire
                 Right (Just (h', f)) → go h' (n + 1) (f : freedSizes)
                 Left why → (h, reverse freedSizes, why)
           (h1, freed, stop) = go h0 0 []
-      putStrLn ("LARGE reclaim under reserve " <> show rsv <> ": pages freed * 1000 + bookkeeping pages used per transaction " <> show freed <> " " <> stop)
+      printLine ("LARGE reclaim under reserve " <> show rsv <> ": pages freed * 1000 + bookkeeping pages used per transaction " <> show freed <> " " <> stop)
       -- a refusal is only ever the typed capacity result; and the store stays valid
       (take 17 stop == "INTEGRITY-OR-OTHE") `shouldBe` False
       must (checkH h1)
@@ -223,7 +242,7 @@ spec = describe "planning on large valid stores (deep trees, thousands of retire
   -- thousands of small entries (a reader pinned through thousands of commits, then released) used to grow the
   -- loose list past the cap and be refused as corruption
   it "drains thousands of small retirement entries without the loose list outgrowing its cap, never an integrity result" $ do
-    let (hw0, keys0) = case wideStore of
+    let (hw0, keys0) = case wideStore smallEntries of
           Right x → x
           Left e → error e
         single h i = do
@@ -234,30 +253,31 @@ spec = describe "planning on large valid stores (deep trees, thousands of retire
             other → Left ("history was not built: " <> show other)
     -- a reader pinned through 3,000 commits keeps every retired page: 3,000 entries
     (tok, s1) ← either (\e → expectationFailure (show e) >> fail "reader") pure (acquireReader (hStore hw0))
-    hBuilt ← must (foldM single hw0 {hStore = s1} [1 .. 3000])
+    hBuilt ← must (foldM single hw0 {hStore = s1} [1 .. smallEntries])
     let released = hBuilt {hStore = snd (releaseReader tok (hStore hBuilt))}
     must (checkH released)
     (drained, passes, longest) ← must (drainChecked released)
-    putStrLn ("LARGE small entries: " <> show passes <> " maintenance transactions, the longest loose list " <> show longest)
+    printLine ("LARGE small entries: " <> show passes <> " maintenance transactions, the longest loose list " <> show longest)
     must (checkH drained)
     rRetiredPages (storeRoots (hStore drained)) `shouldBe` 0
-  it "keeps committing random batches, the checker agreeing after every commit, and maintenance drains the store" $
-    forM_ [1, 2, 3 ∷ Word64] $ \seed → do
+  it "keeps committing random batches, the checker agreeing after every commit, and maintenance drains the store" $ do
+   (h0, ref0, _) ← readFixture fixture
+   forM_ (atDepth depth [1] [1, 2, 3 ∷ Word64]) $ \seed → do
       let step (h, ref, g, shrunk) i = do
             let (sz, g1) = below 120 g
                 (dispersed, g2) = below 2 g1
                 k = 1 + fromIntegral sz
-                ws = batchOf ref 12000 k (dispersed == 1)
+                ws = batchOf ref links k (dispersed == 1)
             (h', ref', fate) ← either (\e → Left ("step " <> show (i ∷ Int) <> ": " <> e)) Right (settleBatch h ref ws)
             -- the loose list stays within the pages one plan claims, after every step
             either (\e → Left ("step " <> show i <> ": " <> e)) Right (() <$ looseWithin h')
             when (i `mod` 4 == 0) $ either (\e → Left ("step " <> show i <> ": " <> e)) Right (checkH h')
             Right (h', ref', g2, shrunk + (case fate of Shrank _ → 1; _ → 0 ∷ Int))
       (h1, ref1, _, shrunk) ← must (foldM step (h0, ref0, mkRng (900 + seed), 0) [1 .. 24])
-      putStrLn ("LARGE random history seed " <> show seed <> ": batches that shrank " <> show shrunk <> " of 24, loose list " <> show (length (rLoose (storeRoots (hStore h1)))))
+      printLine ("LARGE random history seed " <> show seed <> ": batches that shrank " <> show shrunk <> " of 24, loose list " <> show (length (rLoose (storeRoots (hStore h1)))))
       must (checkH h1)
       (drained, passes, longest) ← must (drainChecked h1)
-      putStrLn ("LARGE drain seed " <> show seed <> ": " <> show passes <> " maintenance transactions, the longest loose list " <> show longest <> " pages (bound " <> show looseBound <> ")")
+      printLine ("LARGE drain seed " <> show seed <> ": " <> show passes <> " maintenance transactions, the longest loose list " <> show longest <> " pages (bound " <> show looseBound <> ")")
       rRetiredPages (storeRoots (hStore drained)) `shouldBe` 0
       must (checkH drained)
       must (compareRecords (Map.toList ref1) drained)

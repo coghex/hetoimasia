@@ -146,7 +146,12 @@ test-suite terrain-runtime-tests
         Test.TerrainRuntime.Limits
         Test.TerrainRuntime.Offload
         Test.TerrainRuntime.Opacity
+        Test.TerrainRuntime.Isolation
         Test.TerrainRuntime.Oracle
+        Test.TerrainRuntime.Output
+        Test.TerrainRuntime.OutputSpec
+        Test.TerrainRuntime.Parallel
+        Test.TerrainRuntime.Runner
         Test.TerrainRuntime.Races
         Test.TerrainRuntime.Revalidation
         Test.TerrainRuntime.Usage
@@ -157,6 +162,7 @@ test-suite terrain-runtime-tests
         Test.TerrainRuntime.Store.Bounds
         Test.TerrainRuntime.Store.Codec
         Test.TerrainRuntime.Store.Cycles
+        Test.TerrainRuntime.Store.Depth
         Test.TerrainRuntime.Store.Evidence
         Test.TerrainRuntime.Store.Faults
         Test.TerrainRuntime.Store.Fuzz
@@ -196,6 +202,7 @@ test-suite terrain-runtime-tests
         directory >=1.3 && <1.4,
         filepath >=1.5 && <1.6,
         hspec >=2.11 && <3,
+        hspec-core >=2.11 && <3,
         process >=1.6 && <1.7,
         stm >=2.5.3 && <2.6,
         temporary >=1.3 && <1.4,
@@ -222,6 +229,8 @@ test-suite terrain-storage-probe
     hs-source-dirs: probe, test
     ghc-options: -threaded -rtsopts "-with-rtsopts=-T"
     other-modules:
+        Test.TerrainRuntime.Isolation
+        Test.TerrainRuntime.Output
         Test.TerrainRuntime.Storage.Fixture
         Test.TerrainRuntime.Storage.Harness
         Test.TerrainRuntime.Storage.ProbeSpec
@@ -233,6 +242,57 @@ test-suite terrain-storage-probe
         containers >=0.8 && <0.9,
         directory >=1.3 && <1.4,
         hspec >=2.11 && <3,
+        hspec-core >=2.11 && <3,
+        stm >=2.5.3 && <2.6,
+        temporary >=1.3 && <1.4,
+        text >=2.1 && <2.2,
+        unix >=2.8 && <2.9,
+        hetoimasia-foundation ==0.1.0.0,
+        hetoimasia-runtime ==0.1.0.0,
+        hetoimasia-terrain ==0.1.0.0,
+        hetoimasia-terrain-runtime ==0.1.0.0,
+        hetoimasia-terrain-runtime:storage,
+        hetoimasia-terrain-runtime:store,
+        hetoimasia-test-support ==0.1.0.0
+
+-- The full depth of the store families the routine suite bounds: every reduced or moved family at its
+-- complete original parameters. An explicit local probe (validation group `test.terrain-runtime-full-depth`,
+-- optional, category probe, no CI route): it takes about a quarter of an hour, so it is never selected by an affected
+-- path or by a routine suite command. A pure model: no file, thread or clock; one example reads the runtime's allocation
+-- counters, so every example runs alone on one capability behind the routine suite's isolation guard.
+test-suite terrain-runtime-full-depth-tests
+    import: language
+    type: exitcode-stdio-1.0
+    main-is: FullMain.hs
+    hs-source-dirs: full, test
+    ghc-options: -threaded -rtsopts "-with-rtsopts=-T"
+    other-modules:
+        Test.TerrainRuntime.Output
+        Test.TerrainRuntime.Isolation
+        Test.TerrainRuntime.Runner
+        Test.TerrainRuntime.Store.Bounds
+        Test.TerrainRuntime.Store.Cycles
+        Test.TerrainRuntime.Store.Depth
+        Test.TerrainRuntime.Store.Evidence
+        Test.TerrainRuntime.Store.Fuzz
+        Test.TerrainRuntime.Store.FuzzTrees
+        Test.TerrainRuntime.Store.Harness
+        Test.TerrainRuntime.Store.History
+        Test.TerrainRuntime.Store.Large
+        Test.TerrainRuntime.Store.Protocol
+        Test.TerrainRuntime.Store.Rebalance
+        Test.TerrainRuntime.Store.Reference
+        Test.TerrainRuntime.Store.Scattered
+        Test.TerrainRuntime.Store.Scenes
+        Test.TerrainRuntime.Store.Trees
+        Test.TerrainRuntime.Store.Workload
+    build-depends:
+        base >=4.22 && <4.23,
+        bytestring >=0.12 && <0.13,
+        containers >=0.8 && <0.9,
+        directory >=1.3 && <1.4,
+        hspec >=2.11 && <3,
+        hspec-core >=2.11 && <3,
         stm >=2.5.3 && <2.6,
         temporary >=1.3 && <1.4,
         text >=2.1 && <2.2,
