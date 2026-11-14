@@ -43,9 +43,8 @@ data Command = GrowEqual | GrowLarger | GrowSmaller | Retry
 mib ∷ Word64
 mib = 1024 * 1024
 
-isReserve, isSetLength, isRead, isWrite ∷ NativeOp → Bool
+isReserve, isSetLength, isRead ∷ NativeOp → Bool
 isRead = \case OpReadAt {} → True; _ → False
-isWrite = \case OpWriteAt {} → True; _ → False
 isReserve = \case OpReserveRange {} → True; _ → False
 isSetLength = \case OpSetFileLength {} → True; _ → False
 
@@ -80,8 +79,8 @@ data ProbeReturns
     AfterFLeftItsExtraPending
   deriving stock (Eq, Show, Enum, Bounded)
 
--- | An arena grown to 128 MiB and then paused for I/O by one failed page write (the page recorded),
--- beside a second arena; the service at rest. The owner's probe points are logged, newest first.
+-- | An arena grown to 128 MiB and then paused for I/O by one failed page READ (the read and its page
+-- recorded: a read probe re-tests it), beside a second arena; the service at rest. The owner's probe points are logged, newest first.
 withPausedArena ∷ (H.Probe → Service → TVar [Point] → ArenaLease → ArenaLease → IO ()) → IO ()
 withPausedArena body = do
   probe ← H.newProbe
@@ -92,8 +91,11 @@ withPausedArena body = do
     (_, otherLease) ← openMain svc "other"
     grown ← growArena svc lease (toInteger (128 * mib)) >>= expectRight >>= await svc
     fmap grownAllowance grown `shouldBe` Right (128 * mib)
-    H.addRule probe 1 isWrite (H.FailWith (Errno 5))
-    failed ← removeAt svc lease (tile 3 4 5) Nothing >>= expectRight >>= await svc
+    -- the column has history in the store, so a read of it reads a page
+    _ ← removeCell' svc lease (tile 3 4 5)
+    waitFor (backedAtRestSTM svc >>= check)
+    H.addRule probe 1 isRead (H.FailWith (Errno 5))
+    failed ← cellAt svc lease (tile 3 4 6) >>= expectRight >>= await svc
     failed `shouldSatisfy` \case Left (Failed (StorageFailed (FaultIo _))) → True; _ → False
     waitFor (backedAtRestSTM svc >>= check)
     pausedOn svc lease `shouldReturn` [CondIo]

@@ -141,6 +141,7 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.Model
   , growthFailed
   , growthReleased
   , growthReleaseFailed
+  , growthReconciled
   , GrowthView (..)
   , growthView
 
@@ -975,6 +976,13 @@ growthReleased s = case sGrowth s of
 -- | The release itself failed: the pending reservation stays accounted and reported.
 growthReleaseFailed ∷ Store → Store
 growthReleaseFailed = id
+
+-- | A growth's or a pending extra's release has ended, however it ended: the store's growth state
+-- follows what the backend holds, which is the ONE owner of an extra reservation. An extra the
+-- backend keeps pending (its bytes as the backend counts them, which may exceed the nominal
+-- delta) is being released; nothing pending is idle.
+growthReconciled ∷ Maybe Word64 → Store → Store
+growthReconciled pending s = s {sGrowth = maybe GrowthIdle GrowthReleasing pending}
 
 -- | What a status request may report of growth.
 data GrowthView = GrowthView

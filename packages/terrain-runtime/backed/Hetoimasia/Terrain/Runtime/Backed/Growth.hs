@@ -63,6 +63,7 @@ import Hetoimasia.Terrain.Runtime.Store.Internal.Model
   , beginGrowth
   , growthFailed
   , gpFrom
+  , growthReconciled
   , growthReleaseFailed
   , growthReleased
   , growthReserved
@@ -143,6 +144,9 @@ data GrowthStep
   | -- | The extra is obtained: the owner's decision commits it (or abandons it).
     GrowthReady !PreparedGrowth
   | GrowthOver !GrowthEnd
+  | -- | Refused for temporary pressure: the run keeps its state (and what the backend holds for
+    -- it), and steps again once the storage service's capacity has changed.
+    GrowthPressed
 
 -- | How a growth ended without being committed. The store reflects it already.
 data GrowthEnd
@@ -218,7 +222,7 @@ advanceGrowth io closing store (GrowthRun phase) = case phase of
     yieldTo s next step = do
       s' ← evaluate s
       pure (s', GrowthRun next, step)
-    over s end = yieldTo s Ended (GrowthOver end)
+    over s end = ended io s end
     waitThen ticket action = do
       finished ← atomically (pollTicket (ioService io) ticket)
       if finished then action else pure (store, GrowthRun phase, GrowthBlocked (awaitTicket (ioService io) ticket))
@@ -228,13 +232,22 @@ advanceGrowth io closing store (GrowthRun phase) = case phase of
         Just v | not (bvClosing v) → HandleDefect "a finished growth job named a ticket the service does not hold"
         _ → classifyFailure closing JkGrowth BackingClosed
 
+-- | End a run: the store's growth state is reconciled with what the backend holds now (its pending
+-- extra, or nothing), so the store never says idle while the backend keeps an extra, nor releasing
+-- while it keeps none, and the status reports the backend's figure once.
+ended ∷ Io → Store → GrowthEnd → IO (Store, GrowthRun, GrowthStep)
+ended io s end = do
+  view ← atomically (backingView (ioService io) (ioBacking io))
+  s' ← evaluate (growthReconciled (view >>= bvPendingReservation) s)
+  pure (s', GrowthRun Ended, GrowthOver end)
+
 -- | The owner decided against the growth (a cancellation, a close, the host no longer eligible):
 -- a running reservation is stopped and drained, an obtained extra is given back. Nothing is
 -- released until the job in flight has returned. Called masked.
 abandonGrowth ∷ Io → Store → GrowthRun → IO (Store, GrowthRun, GrowthStep)
 abandonGrowth io store (GrowthRun phase) = case phase of
   Ended → pure (store, GrowthRun Ended, GrowthOver GrowthWithdrawn)
-  Begin _ → pure (store, GrowthRun Ended, GrowthOver GrowthWithdrawn)
+  Begin _ → ended io store GrowthWithdrawn
   Reserving ticket → do
     _ ← cancelTicket (ioService io) ticket
     pure (store, GrowthRun (Withdrawing ticket), GrowthBlocked (awaitTicket (ioService io) ticket))
@@ -245,11 +258,13 @@ abandonGrowth io store (GrowthRun phase) = case phase of
     releasing ← evaluate (growthFailed store)
     submitAbandon (ioService io) (ioBacking io) prepared >>= \case
       Right ticket → pure (releasing, GrowthRun (Abandoning ticket), GrowthBlocked (awaitTicket (ioService io) ticket))
-      Left failure → do
-        s ← evaluate (growthReleaseFailed releasing)
-        pure (s, GrowthRun Ended, GrowthOver (GrowthLeftPending (Just (classifyFailure OwnerClosing JkRelease failure))))
+      Left failure → case classifyFailure OwnerClosing JkRelease failure of
+        -- refused for temporary pressure: the backend still holds the prepared extra in its growth slot,
+        -- and only this run can give it back. It keeps it, and abandons it again once capacity moves
+        HandleRetryLater _ → pure (store, GrowthRun phase, GrowthPressed)
+        handling → ended io (growthReleaseFailed releasing) (GrowthLeftPending (Just handling))
   -- nothing submitted yet: the pending extra stays pending
-  ReleaseFirst _ → pure (store, GrowthRun Ended, GrowthOver GrowthWithdrawn)
+  ReleaseFirst _ → ended io store GrowthWithdrawn
   -- a release in flight is taken as it ends (released, or left pending), and nothing begins after it
   ReleasingPending _ ticket → do
     (s, r, step) ← advanceGrowth io OwnerClosing store (GrowthRun (ReleasingPending Nothing ticket))

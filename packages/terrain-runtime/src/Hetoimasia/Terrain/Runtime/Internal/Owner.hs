@@ -726,7 +726,7 @@ dispatchJob svc = do
         ok <- atomically (startGatherFor svc (GatherJob jid) aid (ReadRuns columns))
         pure (if ok then Right () else Left "the arena of a dispatched load closed, or no pin was available")
     forM_ (either Just (const Nothing) started) $ \why → do
-      defect <- atomically (forgetLoad svc jid >> finishJob svc jid (Left why))
+      defect <- atomically (forgetLoad svc jid >> finishJob svc jid (Left (SourceFailure (Text.pack why))))
       forM_ defect $ \text → failWith svc (AccountingDefect text) []
   idleAfter <- stateDispatchIdle <$> atomically (readSt svc)
   pure (isJust dispatched || idleAfter /= idleBefore)
@@ -744,7 +744,7 @@ regatherJob svc jid = do
         ok <- atomically (startGatherFor svc (GatherJob jid) aid (ReadRuns (Set.toList (Set.fromList [c | (c, _) ← pieces]))))
         pure (if ok then Right () else Left "the arena of a dispatched load closed, or no pin was available")
     forM_ (either Just (const Nothing) started) $ \why → do
-      defect <- atomically (forgetLoad svc jid >> finishJob svc jid (Left why))
+      defect <- atomically (forgetLoad svc jid >> finishJob svc jid (Left (SourceFailure (Text.pack why))))
       forM_ defect $ \text → failWith svc (AccountingDefect text) []
 
 forgetLoad ∷ Service → R.JobId → STM ()
@@ -752,7 +752,10 @@ forgetLoad svc jid = modifySt svc (\st → st {stateLoadJobs = Map.delete jid (s
 
 -- | Report a job's outcome and keep its detail if it was published. Returns an
 -- accounting defect when the model refuses what a valid job reported.
-finishJob ∷ Service → R.JobId → Either String (Palette, Resident, R.Cost) → STM (Maybe Text)
+-- | Report a job's outcome and keep its detail if it was published; a failed job settles the
+-- requests it serves with its failure, as typed (a storage pause is the storage fault, never a
+-- source failure). Returns an accounting defect when the model refuses what a valid job reported.
+finishJob ∷ Service → R.JobId → Either Failure (Palette, Resident, R.Cost) → STM (Maybe Text)
 finishJob svc jid result = do
   -- The job's report ends its record, in the same transaction as the report.
   endJobWork svc jid
@@ -768,7 +771,7 @@ finishJob svc jid result = do
           applyEvent svc (R.JobFailed jid) >>= \case
             Right report | R.JobFailedFor _ owners _ _ <- R.reportDecision report →
               forM_ [rid | R.OwnerRequest rid <- owners] $ \rid →
-                terminate svc rid (Failed (SourceFailure (Text.pack why)))
+                terminate svc rid (Failed why)
             _ → pure ()
           pure Nothing
         Right (palette, resident, cost) →
@@ -828,16 +831,16 @@ delivered svc key gathered = (case key of GatherRequest rid → probe svc (Point
               runJob (arenaSource arena) changes (arenaPalette arena) (arenaResident arena) region cover
           Nothing → pure (Left "arena closed while its load ran")
         _ <- pure revision
-        defect <- atomically (finishJob svc jid result)
+        defect <- atomically (finishJob svc jid (either (Left . SourceFailure . Text.pack) Right result))
         forM_ defect $ \why → failWith svc (AccountingDefect why) []
   (GatherJob jid, GatheredFailed handling) → do
     st <- atomically (readSt svc)
     let aid = (\(a, _, _) → a) <$> Map.lookup jid (stateLoadJobs st)
     case handling of
       HandlePause condition fault → atomically $ do
-        forM_ aid $ \a → pauseArena svc a condition fault []
-        void (finishJob svc jid (Left (show fault)))
-      HandleClosing → void (atomically (finishJob svc jid (Left "arena closed while its load ran")))
+        forM_ aid $ \a → pauseArena svc a condition fault
+        void (finishJob svc jid (Left (StorageFailed fault)))
+      HandleClosing → void (atomically (finishJob svc jid (Left (SourceFailure "arena closed while its load ran"))))
       -- temporary pressure: the job keeps its slot and charges, and its read is started again
       -- ('WRegather') once the storage service's capacity has changed
       HandleRetryLater _ → atomically (notePressure svc)
@@ -896,8 +899,11 @@ handleRequest ∷ Service → RequestId → Handling → IO ()
 handleRequest svc rid = \case
   HandlePause condition fault → atomically $ do
     st <- readSt svc
-    forM_ (Map.lookup rid (stateRequests st) >>= reqArena) $ \aid → pauseArena svc aid condition fault []
-    terminate svc rid (Failed (StorageFailed fault))
+    forM_ (Map.lookup rid (stateRequests st)) $ \req → do
+      forM_ (reqArena req) $ \aid → pauseArena svc aid condition fault
+      -- a retry's probe that met a failure of another cause recorded it as that cause's pause: the
+      -- retry's basis has moved, and it is prepared again against what is recorded now
+      unless (isCreatorCommand req) (terminate svc rid (Failed (StorageFailed fault)))
   HandleDomain fault → atomically (terminate svc rid (Failed (StorageFailed fault)))
   HandleClosing → pure ()
   -- temporary pressure: the request keeps its place (still waiting) and is prepared again once the
@@ -1046,6 +1052,7 @@ commitWaits st open rid req sg
       -- a removal that changes content takes the slot; one of air commits here
       (CRemove {}, StagedRemoval prepared) → preparedChanged prepared || not fresh
       (_, StagedAnswer _) → not fresh
+      (CRetry, StagedRetry _) → not fresh
       -- a growth or a release takes the slot
       _ → True
   where
@@ -1067,6 +1074,7 @@ commitStaged svc st rid req sg = case (reqCmd req, stagedWork sg) of
     modifySt svc (\s → s {stateRequests = Map.insert rid req {reqPhase = Done} (stateRequests s)})
     endpointSettle ep (Succeeded answer)
     pure (CommitDone (Just aid) Nothing)
+  (CRetry, StagedRetry certified) → withFresh (commitRetry certified)
   _ → pure CommitWaiting
   where
     ep = reqEndpoint req
@@ -1152,6 +1160,24 @@ commitStaged svc st rid req sg = case (reqCmd req, stagedWork sg) of
     staleView aid arena = \case
       Just (Precondition pa pr) → pa /= aid || pr /= arenaRevision arena
       Nothing → False
+    -- RECOVERY IS DECIDED LIKE PUBLICATION: the conditions the probe certified, and the capacity pause
+    -- when the supported next transaction fits beside the protected reserve, are cleared HERE, in the
+    -- arbitration that settles the retry (its host eligible, its basis and every fault's generation
+    -- unchanged since the probe started); a failing settlement abandons the clearing with it
+    commitRetry certified aid arena = do
+      let store = arenaStore arena
+          fits = availablePages (storeConfig store) Ordinary (storeRoots store) >= fromIntegral maxClaimPages
+          cleared = [c | c ← conditions store, c `elem` certified || (c == CondCapacity && fits)]
+          store' = foldr clearCondition store cleared
+      sameCommittedSTM aid st store'
+      modifySt svc $ \x →
+        x
+          { stateArenas = Map.insert aid arena {arenaStore = store', arenaFaults = foldr Map.delete (arenaFaults arena) cleared} (stateArenas x)
+          , stateRequests = Map.insert rid req {reqPhase = Done} (stateRequests x)
+          }
+      when (not (null cleared)) (markFreed svc)
+      endpointSettle ep (Succeeded (ARetried (RetryAnswer aid cleared (conditions store'))))
+      pure (CommitDone (Just aid) Nothing)
 
 -- | Retry what waits for capacity: pending camera demand, then requests that
 -- are waiting to be admitted again, in admission order.
@@ -1223,6 +1249,7 @@ publishSlot svc task tid plan = do
                 forM_ (removalOf (slotWork task)) $ \rid → probe svc (PointCommitted rid (D.authContent authority))
               Right LostToEnd → pure ()
               Right NotEligible → yieldSlot Nothing
+              Right PausedFirst → yieldSlot Nothing
               Right StagingMoved → yieldSlot (removalOf (slotWork task))
               Left failure → do
                 -- a host callback failed inside the decision, or the model refused an event the
@@ -1282,7 +1309,7 @@ slotOver svc task done = do
     (SlotReclaim, ReaderBlocks _ _) → markIdle True
   where
     aborted aid work = \case
-      HandlePause condition fault → atomically (pauseArena svc aid condition fault [])
+      HandlePause condition fault → atomically (pauseArena svc aid condition fault)
       HandlePausedFor condition → atomically $ do
         s <- readSt svc
         forM_ (removalOf work) $ \rid →
@@ -1329,6 +1356,8 @@ publishGrowth svc task prepared = do
           Right LostToEnd → pure ()
           Right NotEligible → yield
           Right StagingMoved → yield
+          -- a growth publishes while its arena is paused (it is how capacity is cleared)
+          Right PausedFirst → failWith svc (OwnerDefect "a growth's decision answered that its arena is paused") []
           Left failure → do
             atomically $ do
               s <- readSt svc
@@ -1374,32 +1403,22 @@ growthOver svc task over = probe svc (PointGrowthEnded (slotArena task)) >> case
     Growth.GrowthLeftPending _ → pure ()
   _ → failWith svc (OwnerDefect "a growth ended in a slot that was not a growth's") []
 
--- | Finish an explicit retry: clear the conditions its probe certified gone and, when the supported
--- next transaction fits beside the protected reserve, the capacity pause; then answer what was cleared
--- and what remains. One transaction (the owner is the store's only writer). Never re-runs a failed edit.
+-- | Finish an explicit retry's preparation: stage the conditions its probe certified gone. NOTHING IS
+-- CLEARED HERE: recovery is decided like publication, by the retry's arbitration ('commitRetry'), in
+-- the transaction that settles it. Never re-runs a failed edit.
 --
--- The answer stands on the allowance and growth state the retry's preparation read. A result that
--- arrives while the slot runs a growth or release of the arena, or after either moved, is dropped:
--- nothing is cleared, the request is still waiting, and it is prepared again (after that run).
+-- The proposal stands on the allowance, the growth state and every recorded fault's generation the
+-- retry's preparation read. A result that arrives while the slot runs a growth or release of the
+-- arena, or after any of them moved, is dropped: the request is still waiting, and it is prepared
+-- again (after that run, against what is recorded then).
 finishRetry ∷ Service → RequestId → [Condition] → CreatorBasis → IO ()
 finishRetry svc rid certified basis = do
-  answer <- atomically $ do
+  current <- atomically $ do
     s <- readSt svc
-    case Map.lookup rid (stateRequests s) >>= reqArena >>= \aid → (,) aid <$> Map.lookup aid (stateArenas s) of
-      Nothing → pure Nothing
-      Just (aid, arena)
-        | growthInSlot s aid || creatorBasisOf arena /= basis → pure Nothing
-      Just (aid, arena) → do
-        let store = arenaStore arena
-            fits = availablePages (storeConfig store) Ordinary (storeRoots store) >= fromIntegral maxClaimPages
-            cleared = [c | c ← conditions store, c `elem` certified || (c == CondCapacity && fits)]
-            store' = foldr clearCondition store cleared
-        sameCommittedSTM aid s store'
-        modifySt svc $ \x →
-          x {stateArenas = Map.insert aid arena {arenaStore = store', arenaFaults = foldr Map.delete (arenaFaults arena) cleared} (stateArenas x)}
-        when (not (null cleared)) (markFreed svc)
-        pure (Just (aid, arena {arenaStore = store'}, RetryAnswer aid cleared (conditions store')))
-  forM_ answer $ \(aid, arena, retried) → stageCreator svc rid aid arena (StagedAnswer (ARetried retried))
+    pure $ case Map.lookup rid (stateRequests s) >>= reqArena >>= \aid → (,) aid <$> Map.lookup aid (stateArenas s) of
+      Just (aid, arena) | not (growthInSlot s aid), creatorBasisOf arena == basis → Just (aid, arena)
+      _ → Nothing
+  forM_ current $ \(aid, arena) → stageCreator svc rid aid arena (StagedRetry certified)
 
 -- | Whether the slot runs a growth or a pending extra's release of the arena.
 growthInSlot ∷ St → ArenaId → Bool
@@ -1413,9 +1432,21 @@ growthInSlot st aid = case stateSlot st of
 -- | What a retry of a paused arena reads again: the pages an I/O or integrity pause recorded (an
 -- integrity page must read back valid), and the conditions they would certify. A pause that recorded
 -- none cannot be certified and stays.
+--
+-- A condition is probed only when its record is complete (every failure kept) and every failure in
+-- it is a read: a write that failed is not re-tested by a read, so a condition with a failed write
+-- is never certified by this probe and stays.
 retryProbe ∷ Arena → ([(PageNo, ReadMode)], [Condition])
 retryProbe arena = (pages, map fst probed)
   where
     store = arenaStore arena
-    probed = [(c, record) | c ← [CondIo, CondIntegrity], c `elem` conditions store, Just record ← [Map.lookup c (arenaFaults arena)], not (null (faultRecorded record))]
-    pages = [(page, if c == CondIntegrity then ReadValidated else ReadProbe) | (c, record) ← probed, page ← faultRecorded record]
+    probed =
+      [ (c, record)
+      | c ← [CondIo, CondIntegrity]
+      , c `elem` conditions store
+      , Just record ← [Map.lookup c (arenaFaults arena)]
+      , not (faultIncomplete record)
+      , not (null (faultEntries record))
+      , and [op == FaultRead | FaultEntry op _ ← faultEntries record]
+      ]
+    pages = [(page, if c == CondIntegrity then ReadValidated else ReadProbe) | (c, record) ← probed, FaultEntry _ page ← faultEntries record]

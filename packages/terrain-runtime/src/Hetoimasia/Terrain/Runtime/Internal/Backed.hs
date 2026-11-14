@@ -123,7 +123,7 @@ import Hetoimasia.Terrain.Runtime.Storage.Internal.Service
   , withOutcome
   )
 import qualified Hetoimasia.Terrain.Runtime.Storage.Internal.Service as Storage
-import Hetoimasia.Terrain.Runtime.Storage.Internal.Types (WorkClass (..))
+import Hetoimasia.Terrain.Runtime.Storage.Internal.Types (IoFailure (..), IoOp (..), WorkClass (..))
 import qualified Hetoimasia.Terrain.Runtime.Store.Internal.Admission as A
 import Hetoimasia.Terrain.Runtime.Store.Internal.Admission (Admission)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Format (PageNo, StoreIdentity (..))
@@ -246,14 +246,27 @@ changesOfRuns config runs = do
 -- Pause
 
 -- | Record a pause of an arena (requirement 8): the store pauses new history for the
--- condition, the fault is kept for the creator's retry, and every uncommitted user mutation
--- of the arena settles once with the fault. The last committed roots, terrain, knowledge and
--- frontier are untouched.
-pauseArena ∷ Service → ArenaId → Condition → StorageFault → [PageNo] → STM ()
-pauseArena svc aid condition fault pages = do
+-- condition, the failure is ADDED to the condition's record for the creator's retry (every failing
+-- operation and page, bounded; see 'FaultRecord'), and every uncommitted user mutation of the
+-- arena settles once with the fault. The last committed roots, terrain, knowledge and frontier are
+-- untouched. A failure the record already holds adds nothing and moves no generation.
+pauseArena ∷ Service → ArenaId → Condition → StorageFault → STM ()
+pauseArena svc aid condition fault = do
   st ← readSt svc
   forM_ (Map.lookup aid (stateArenas st)) $ \arena → do
-    let record = FaultRecord fault (take faultPagesKept (faultPages fault <> pages))
+    let entries = faultEntriesOf fault
+        old = Map.lookup condition (arenaFaults arena)
+        kept = maybe [] faultEntries old
+        fresh = [e | e ← entries, e `notElem` kept]
+        merged = take faultPagesKept (kept <> fresh)
+        -- a failure with no page, or one past the bound, cannot be re-tested
+        incomplete = maybe False faultIncomplete old || null entries || length (kept <> fresh) > faultPagesKept
+        added = maybe True (\r → not (null fresh) || (incomplete && not (faultIncomplete r))) old
+        epoch = stateFaultEpoch st + 1
+        record = case old of
+          Just r | not added → r
+          Just r → r {faultEntries = merged, faultIncomplete = incomplete, faultGeneration = epoch}
+          Nothing → FaultRecord fault merged incomplete epoch
     sameCommittedSTM aid st (pauseFor condition (arenaStore arena))
     modifySt svc $ \s →
       s
@@ -262,13 +275,22 @@ pauseArena svc aid condition fault pages = do
               aid
               arena
                 { arenaStore = pauseFor condition (arenaStore arena)
-                , arenaFaults = Map.insertWith (\_ old → old) condition record (arenaFaults arena)
+                , arenaFaults = Map.insert condition record (arenaFaults arena)
                 }
               (stateArenas s)
+        , stateFaultEpoch = if added then epoch else stateFaultEpoch s
         }
     forM_ [rid | (rid, req) ← Map.toList (stateRequests st), reqArena req == Just aid, isPendingRemoval req] $ \rid →
       terminate svc rid (Failed (StorageFailed fault))
   where
+    -- what failed where: an I/O failure names its operation, an integrity failure is a read
+    faultEntriesOf = \case
+      FaultIo io → [FaultEntry op page | Just page ← [ioPage io], Just op ← [opOf (ioOp io)]]
+      other → [FaultEntry FaultRead page | page ← faultPages other]
+    opOf = \case
+      IoRead → Just FaultRead
+      IoWrite → Just FaultWrite
+      _ → Nothing
     isPendingRemoval req = case (reqCmd req, reqPhase req) of
       (CRemove {}, Done) → False
       (CRemove {}, _) → True
@@ -605,8 +627,12 @@ stepGatherTask svc key deliver = do
                 PMore → Left WakeNow
                 PBlocked wait → Left (WakeOn wait)
                 PPassed → Right (GatheredProbe conds True basis)
-                -- the cause persists: the retry answers it as remaining (it is not a new pause)
-                PFailedWith _ → Right (GatheredProbe conds False basis)
+                -- the cause the probe re-tests persists: the retry answers it as remaining (nothing new is
+                -- recorded). Anything else keeps its own classification: temporary pressure, a defect,
+                -- a closure, or a failure of another cause, which is recorded as its own pause
+                PFailedWith handling
+                  | persists conds handling → Right (GatheredProbe conds False basis)
+                  | otherwise → Right (GatheredFailed handling)
                 PDrained → Right GatheredNothing
             )
         KnowledgeRead q → do
@@ -632,6 +658,10 @@ stepGatherTask svc key deliver = do
             markFreed svc
           deliver result
   where
+    persists conds = \case
+      HandlePause c _ → c `elem` conds
+      HandlePausedFor c → c `elem` conds
+      _ → False
     release' current = \case
       RunsRead g → endGather current g
       KnowledgeRead q → endQuery current q
@@ -807,7 +837,10 @@ stepSlot svc = do
       Just (store, backing) → do
         let aid = slotArena task
             io = Io (serviceStorage svc) backing (classOf (slotWork task))
-            wanted = Map.member aid (stateArenas st) && requestAlive st (slotWork task) && not (slotYield task)
+            -- ONCE ITS ARENA PAUSES, ORDINARY WORK IN FLIGHT STOPS: a removal's or discovery's transaction
+            -- is cancelled and drains; reclamation goes on unless the pause is for integrity; a growth or
+            -- a pending extra's release goes on (it is how a pause is cleared)
+            wanted = Map.member aid (stateArenas st) && requestAlive st (slotWork task) && not (slotYield task) && maybe False (permittedWhilePaused (slotWork task)) (Map.lookup aid (stateArenas st))
             end store' task' result = do
               atomically $ do
                 readSt svc >>= \s0 → sameCommittedSTM aid s0 store'
@@ -841,6 +874,11 @@ stepSlot svc = do
               Growth.GrowthBlocked wait → keep (WakeOn wait) >> pure SlotGoesOn
               Growth.GrowthReady prepared → keep WakeNow >> pure (SlotGrowthReady task' prepared)
               Growth.GrowthOver over → end store' task' (\t → SlotGrowthOver t over)
+              -- refused for temporary pressure: the run keeps its place and what the backend holds for it,
+              -- and steps again once the storage service's capacity has changed, never at once
+              Growth.GrowthPressed → do
+                mark ← atomically (notePressure svc >> pressureMark svc)
+                keep (WakeOn (pressureChanged svc mark)) >> pure SlotGoesOn
   where
     requestAlive st = \case
       SlotRemoval rid → Map.member rid (stateRequests st)

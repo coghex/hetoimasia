@@ -29,6 +29,7 @@ import qualified Test.TerrainRuntime.Backed.Fairness as BackedFairness
 import qualified Test.TerrainRuntime.Backed.Pressure as BackedPressure
 import qualified Test.TerrainRuntime.Backed.Held as BackedHeld
 import qualified Test.TerrainRuntime.Backed.Loop as BackedLoop
+import qualified Test.TerrainRuntime.Backed.Recovery as BackedRecovery
 import qualified Test.TerrainRuntime.Backed.Outcomes as BackedOutcomes
 import qualified Test.TerrainRuntime.Backed.Pause as BackedPause
 import qualified Test.TerrainRuntime.Backed.Service as BackedService
@@ -90,6 +91,7 @@ sequentialSpec = do
   BackedPressure.spec
   BackedHeld.spec
   BackedLoop.spec
+  BackedRecovery.spec
   BackedService.spec
   BackedSweep.spec
   BackedTxn.spec

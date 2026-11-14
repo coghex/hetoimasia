@@ -85,6 +85,7 @@ import Hetoimasia.Terrain.Runtime.Store.Internal.Model
   , TxnId
   , activeView
   , commitGrowth
+  , conditions
   , publish
   , storeConfig
   , storeHeader
@@ -133,6 +134,9 @@ data Verdict
   | -- | The request's staging no longer holds (the content moved): nothing was written;
     -- the holder aborts and the request is staged again.
     StagingMoved
+  | -- | The arena paused while the transaction ran, and its kind of work does not publish while it
+    -- is paused (see 'permittedWhilePaused'): nothing was written; the holder aborts.
+    PausedFirst
   deriving stock (Eq, Show)
 
 -- | A defect found inside the decision: the accounting model refused an event the checks
@@ -209,6 +213,11 @@ decide svc credit dec = do
       | storeIdentity (arenaStore arena) /= decIdentity dec → pure LostToEnd
       | storeVersion (arenaStore arena) /= decBase dec || fmap avId (activeView (arenaStore arena)) /= decTxn dec →
           throwSTM (DecisionDefect "the committed store is not the base of the transaction the owner holds")
+      -- EVERY PUBLICATION OF A PAUSED ARENA IS CHECKED HERE: ordinary history never publishes after
+      -- a pause, whatever was in flight when it was recorded
+      | Just task ← stateSlot st
+      , not (permittedWhilePaused (slotWork task) arena) →
+          pure PausedFirst
       | otherwise → case decFor dec of
           ForBatch → do
             commitStore arena []
@@ -270,16 +279,19 @@ decide svc credit dec = do
       applyEvent svc event >>= \case
         Left refusal → throwSTM (DecisionDefect (Text.pack ("the accounting model refused " <> show event <> ": " <> show refusal)))
         Right _ → pure ()
-    -- the new store, and for a removal the rebuilt detail, in one write
+    -- the new store, and for a removal the rebuilt detail, in one write; a fault record is kept only
+    -- while its condition still pauses the new store (a growth's commit clears capacity)
     commitStore arena rebuilt =
       modifySt svc $ \s →
         s
           { stateArenas =
               Map.insert
                 (decArena dec)
-                ( case rebuilt of
-                    [(_, palette, resident)] → arena {arenaStore = decNext dec, arenaPalette = palette, arenaResident = resident, arenaGeneration = bumpGeneration (arenaGeneration arena)}
-                    _ → arena {arenaStore = decNext dec}
+                ( ( case rebuilt of
+                      [(_, palette, resident)] → arena {arenaStore = decNext dec, arenaPalette = palette, arenaResident = resident, arenaGeneration = bumpGeneration (arenaGeneration arena)}
+                      _ → arena {arenaStore = decNext dec}
+                  )
+                    {arenaFaults = Map.filterWithKey (\c _ → c `elem` conditions (decNext dec)) (arenaFaults arena)}
                 )
                 (stateArenas s)
           }

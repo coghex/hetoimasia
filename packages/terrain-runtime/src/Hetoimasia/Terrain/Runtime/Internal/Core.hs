@@ -32,6 +32,7 @@ module Hetoimasia.Terrain.Runtime.Internal.Core
     -- * Admission
   , Submission (..)
   , pausedFault
+  , permittedWhilePaused
   , readmitSTM
   , releaseCredit
   , admitting
@@ -114,7 +115,7 @@ import Hetoimasia.Terrain.Resident (ResidentStats (..), columnIndexBytes, discar
 import Hetoimasia.Terrain.Segment (maxSegmentLevels)
 import Hetoimasia.Terrain.Runtime.Internal.Types
 import Hetoimasia.Terrain.Runtime.Backed.Fault (StorageFault)
-import Hetoimasia.Terrain.Runtime.Store.Internal.Model (GrowthDecision (..), conditions, proposeGrowth)
+import Hetoimasia.Terrain.Runtime.Store.Internal.Model (Condition (..), GrowthDecision (..), conditions, proposeGrowth)
 import Hetoimasia.Terrain.Source (Source, SourceError)
 
 -- ---------------------------------------------------------------------------
@@ -266,6 +267,19 @@ data Submission
     SubGrow !ArenaLease !Integer
   | -- | The creator's explicit retry of a paused arena.
     SubRetry !ArenaLease
+
+-- | Whether slot work of this kind may go on (or publish) in the arena as it is: anything while it
+-- is not paused; while it is, a growth or a release (they clear capacity), and reclamation unless
+-- the pause is for integrity.
+permittedWhilePaused ∷ SlotWork → Arena → Bool
+permittedWhilePaused work arena = case conditions (arenaStore arena) of
+  [] → True
+  conds → case work of
+    SlotGrowth _ → True
+    SlotRelease _ → True
+    SlotReclaim → CondIntegrity `notElem` conds
+    SlotRemoval _ → False
+    SlotDiscovery → False
 
 -- | The fault a paused arena recorded, the most serious first (integrity, then I/O, then
 -- capacity): what a new mutation of it settles with.

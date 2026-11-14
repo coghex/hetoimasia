@@ -107,6 +107,8 @@ module Hetoimasia.Terrain.Runtime.Internal.Types
   , arenaAuthority
   , arenaRevision
   , FaultRecord (..)
+  , FaultEntry (..)
+  , FaultOp (..)
   , faultPagesKept
   , Wake (..)
   , PressureMark (..)
@@ -576,11 +578,17 @@ data Staged = Staged
 -- | What a creator command's preparation reads of its arena's store: the allowance and the
 -- growth state. A growth's commit, its abandonment and a pending extra's release move it; a
 -- removal, discovery or reclamation does not.
-data CreatorBasis = CreatorBasis !Word64 !GrowthView
+-- | What a creator command's preparation read of its arena: the allowance, the growth state, and
+-- each recorded fault's generation (a failure recorded since makes the work stale).
+data CreatorBasis = CreatorBasis !Word64 !GrowthView ![(Condition, Word64)]
   deriving stock (Eq, Show)
 
 creatorBasisOf ∷ Arena → CreatorBasis
-creatorBasisOf arena = CreatorBasis (StoreState.cfgAllowanceBytes (storeConfig (arenaStore arena))) (growthView (arenaStore arena))
+creatorBasisOf arena =
+  CreatorBasis
+    (StoreState.cfgAllowanceBytes (storeConfig (arenaStore arena)))
+    (growthView (arenaStore arena))
+    [(c, faultGeneration r) | (c, r) ← Map.toList (arenaFaults arena)]
 
 -- | A creator command: a growth or an explicit retry of the creator's arena.
 isCreatorCommand ∷ Req → Bool
@@ -603,6 +611,11 @@ data StagedWork
     -- the session's slot (it is a mutation of the backing) when its host is eligible, then the retry
     -- goes on.
     StagedRelease
+  | -- | An explicit retry whose probe certified these conditions gone: its arbitration clears them
+    -- (and the capacity pause, when the next transaction fits) in the transaction that settles it,
+    -- with the host's eligibility, so a retry that is cancelled, not eligible or whose settlement
+    -- fails clears nothing.
+    StagedRetry ![Condition]
 
 data ReqPhase
   = Waiting
@@ -850,11 +863,31 @@ arenaAuthority = D.hAuthority . storeHeader . arenaStore
 arenaRevision ∷ Arena → Revision
 arenaRevision = D.authContent . arenaAuthority
 
--- | What a pause recorded: the typed fault and, for an explicit retry, the pages or the
--- operation that failed (at most 'faultPagesKept' pages, the first ones).
+-- | The operation that failed at a page.
+data FaultOp = FaultRead | FaultWrite
+  deriving stock (Eq, Ord, Show)
+
+-- | One failure kept for an explicit retry: what failed, and where.
+data FaultEntry = FaultEntry !FaultOp !PageNo
+  deriving stock (Eq, Ord, Show)
+
+-- | What a condition's pause recorded, for every failure that caused it while it holds:
+--
+-- * 'faultOf': the first fault, what a mutation of the paused arena settles with;
+-- * 'faultEntries': every failing operation and page, each once, at most 'faultPagesKept';
+-- * 'faultIncomplete': a failure was not kept (past the bound, or with no page): the condition
+--   can never be certified gone by a probe, and stays;
+-- * 'faultGeneration': the service's fault epoch at the last failure that added to the record. A
+--   retry's basis carries it, so a failure recorded while its probe is in flight makes the probe's
+--   result stale. A failure already recorded adds nothing and moves nothing.
+--
+-- Owned and written by the terrain owner ('pauseArena' adds, the retry's arbitration deletes);
+-- read by the owner. Lives as long as the condition pauses the arena.
 data FaultRecord = FaultRecord
   { faultOf ∷ !StorageFault
-  , faultRecorded ∷ ![PageNo]
+  , faultEntries ∷ ![FaultEntry]
+  , faultIncomplete ∷ !Bool
+  , faultGeneration ∷ !Word64
   }
   deriving stock (Eq, Show)
 
@@ -1086,6 +1119,9 @@ data St = St
     -- would change something, so the suite's oracle requires this to stay empty. Written by the owner
     -- loop only; never reset.
     stateIdleRepeats ∷ ![Text]
+  , -- | The fault epoch: moved by every failure a pause adds to its record ('faultGeneration').
+    -- Written by the owner only; never reset.
+    stateFaultEpoch ∷ !Word64
   , -- | Closed arenas whose backing is still draining or closing.
     stateClosing ∷ !(Map ArenaId Closing')
   , -- | The region and coverage of each load job the owner is running (its gather reads the
@@ -1139,6 +1175,7 @@ initialState config limits =
     , stateInternalIdle = Map.empty
     , stateNeedsMaintenance = Set.empty
     , stateIdleRepeats = []
+    , stateFaultEpoch = 0
     , stateClosing = Map.empty
     , stateLoadJobs = Map.empty
     , stateNextSource = 1

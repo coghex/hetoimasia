@@ -124,6 +124,7 @@ module Hetoimasia.Terrain.Runtime
   , inspectIdleRepeatsSTM
   , inspectStorageJobsSTM
   , inspectMaintenanceFirstSTM
+  , inspectPendingExtraSTM
   , inspectModel
   , inspectModelSTM
   , inspectDefects
@@ -475,7 +476,10 @@ arenaStatusSTM svc lease = do
                 , statusReservedBytes = usAllowanceBytes use
                 , statusUsedBytes = usUsedBytes use
                 , statusPendingReclaimBytes = usRetiredBytes use
-                , statusPendingReservedBytes = gvPendingBytes growth + backend
+                -- ONE OWNER OF A PENDING EXTRA: the backend's pending reservation, counted once (the store
+                -- mirrors it once a run has ended); a growth still executing adds the extra it obtained
+                -- and has not committed, which the backend holds in its growth slot, not as pending
+                , statusPendingReservedBytes = backend + (if gvExecuting growth then gvPendingBytes growth else 0)
                 , statusDiscovery = if pending == 0 then DiscoveryIdle else if null paused then DiscoveryPending else DiscoveryPaused
                 , statusPendingItems = pending
                 , statusContentRevision = D.authContent (arenaAuthority arena)
@@ -568,6 +572,17 @@ inspectBacked svc = atomically (inspectBackedSTM svc)
 -- verification.
 inspectStorageQueuedSTM ∷ Service → STM Int
 inspectStorageQueuedSTM svc = Storage.snQueued <$> Storage.snapshotOf (serviceStorage svc)
+
+-- | The extra reservation the storage backend keeps pending for this arena's file, as the backend
+-- counts it (it may exceed the nominal extra). Read-only, for verification.
+inspectPendingExtraSTM ∷ Service → ArenaLease → STM (Maybe Word64)
+inspectPendingExtraSTM svc (ArenaLease tag lid)
+  | tag /= serviceTag svc = pure Nothing
+  | otherwise = do
+      st <- readSt svc
+      case Map.lookup lid (stateLeases st) >>= \ls → Map.lookup (leaseArena ls) (stateArenas st) of
+        Nothing → pure Nothing
+        Just arena → (>>= Storage.bvPendingReservation) <$> Storage.backingView (serviceStorage svc) (arenaBacking arena)
 
 -- | How many arenas wait for a maintenance transaction before any other slot work of theirs (their
 -- work answered that maintenance must run first). Read-only, for verification.
