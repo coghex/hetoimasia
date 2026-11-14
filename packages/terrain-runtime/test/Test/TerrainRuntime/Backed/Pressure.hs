@@ -51,11 +51,82 @@ spec = do
   describe "Temporary pressure from the storage service" $
     forM_ [minBound .. maxBound] $ \caller →
       it ("keeps a " <> show caller <> " refused because the storage queue is full in its place, grants nothing again until capacity changes, and completes it once the queue drains") (pressureCase caller)
+  describe "An explicit retry behind internal work" $
+    it "waits its turn while internal work holds the slot with its read queued, nothing refused, and completes after it" internalAhead
   describe "The storage pressure mark" $
     it "holds every field a refusal for pressure reads: the cure of each reason alone changes it" $ do
       let base = markOf snapshot ledger
       markOf snapshot ledger `shouldBe` base
       forM_ cures $ \(cure, sn, l) → (cure, markOf sn l /= base) `shouldBe` (cure, True)
+
+-- | The state the pressure examples' setup excludes, made on purpose: a commit leaves internal work
+-- owed (reclamation of the retired pages, discovery of its obligations); the owner is held at its
+-- first internal grant while every page read is gated, so internal work's read waits at the seam
+-- with the slot taken; the queue then fills and a retry that must release a pending extra arrives.
+-- The product: internal work's read waits in the queue like any read and the slot is released
+-- when it returns; the explicit retry waits its turn behind it, nothing is refused, and it
+-- completes once the reads are let go.
+internalAhead ∷ IO ()
+internalAhead = do
+  probe ← H.newProbe
+  grants ← newTVarIO (0 ∷ Int)
+  internal ← newTVarIO (0 ∷ Int)
+  armed ← newTVarIO False
+  holdOwner ← newTVarIO False
+  let owner = Probe $ \case
+        PointGranted (Just _) _ → atomically (modifyTVar' grants (+ 1))
+        PointGranted Nothing _ → do
+          -- the first internal grant while armed holds the owner until the test lets it go
+          atomically (modifyTVar' internal (+ 1))
+          first ← atomically $ readTVar armed >>= \a → if a then writeTVar armed False >> writeTVar holdOwner True >> pure True else pure False
+          when first (atomically (readTVar holdOwner >>= check . not))
+        _ → pure ()
+  withServiceSeam quiet defaultConfig alwaysAdmitting owner (H.seamFor probe) $ \svc → do
+    (_, lease) ← openMain svc "main"
+    -- an extra left pending, as in the Release case
+    reserve ← H.addGateOnce probe isReserve
+    H.addRuleAfter probe 1 1 isSetLength (H.FailWith (Errno 5))
+    grower ← newHost True
+    g ← flip finally (H.openGate reserve) $ do
+      g ← okOf (growWith svc (hostEndpoint svc Nothing grower) lease (toInteger (128 * mib)))
+      waitFor (readTVar (H.gReached reserve) >>= check . (>= 1))
+      atomically (writeTVar (hostEligible grower) False)
+      pure g
+    waitFor (arenaStatusSTM svc lease >>= either (const retry) (check . (> 0) . statusPendingReservedBytes))
+    waitFor (backedAtRestSTM svc >>= check)
+    -- a commit leaves internal work owed; the owner is held at its first internal grant
+    atomically (writeTVar armed True)
+    _ ← removeCell' svc lease (tile 3 4 9)
+    waitFor (readTVar holdOwner >>= check)
+    gate ← H.addGate probe isRead
+    host ← newHost True
+    fillers ← flip finally (H.openGate gate) $ do
+      atomically (writeTVar holdOwner False)
+      -- internal work's read at the seam: the slot is taken
+      waitFor (readTVar (H.gReached gate) >>= check . (>= 1))
+      fillers ← forM [0 .. 13] $ \x → do
+        h ← newHost True
+        _ ← okOf (removeWith svc (hostEndpoint svc Nothing h) lease (tile x 4 3) Nothing)
+        pure h
+      waitFor (inspectStorageQueuedSTM svc >>= check . (>= 8))
+      atomically (writeTVar grants 0)
+      _ ← okOf (retryWith svc (hostEndpoint svc Nothing host) lease)
+      forM_ [1 ∷ Int, 2] $ \_ → do
+        other ← okOf (registerClient svc)
+        void (okOf (attachArena svc other "main") >>= await svc >>= expectSuccess)
+      -- the signature: the retry not granted, nothing refused, internal work holding the slot
+      (,,,) <$> readTVarIO grants <*> atomically (inspectStoragePressedSTM svc) <*> readTVarIO internal <*> readTVarIO (hostSettled host)
+        >>= (`shouldSatisfy` \(granted, pressed, internals, settled) → granted == 0 && not pressed && internals >= 1 && null settled)
+      inspectDefects svc `shouldReturn` []
+      pure fillers
+    forM_ (host : fillers) $ \h → waitFor (readTVar (hostSettled h) >>= \x → check (not (null x)))
+    settledOf host >>= (`shouldSatisfy` \case [Succeeded (ARetried a)] → null (retriedRemaining a); _ → False)
+    cancel svc g `shouldReturn` CancelWon
+    status ← arenaStatus svc lease >>= expectRight
+    statusPendingReservedBytes status `shouldBe` 0
+    inspectDefects svc `shouldReturn` []
+    waitFor (backedAtRestSTM svc >>= check)
+    settleChecks svc
 
 -- | A storage service under pressure: a read running and a write queued (the mutation), a backing
 -- growing with an extra pending, a closing record, a presecured open, a held close, kept failures,
