@@ -16,7 +16,8 @@
 module Test.TerrainRuntime.Backed.Held (spec) where
 
 import Control.Concurrent.STM
-import Data.IORef (modifyIORef', newIORef, readIORef)
+import Control.Exception (SomeException, throwIO, try)
+import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (isInfixOf)
 import qualified Data.Text as Text
 import Data.Word (Word64)
@@ -28,6 +29,7 @@ import qualified Hetoimasia.Terrain.Runtime.Store.Internal.Admission as A
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan (RamCharge (..))
 import System.IO (hPutStrLn, stderr)
 import Test.Hspec
+import Test.Support.Bounded (bounded)
 import Test.TerrainRuntime.Fixtures
 import qualified Test.TerrainRuntime.Storage.Harness as H
 
@@ -60,7 +62,10 @@ heldCase ending = do
       done free = case ending of
         NeverFunded → free < txnControl
         RefusedWithNothingInFlight → free < txnControl + 4096
-  withServiceSeam quiet config alwaysAdmitting noProbe (H.seamFor probe) $ \svc → do
+  bodyDone ← newIORef False
+  -- the storage service reports every kept close failure when its scope ends: the held closes are
+  -- reported there, after the body has passed
+  ended ← try $ withServiceSeam quiet config alwaysAdmitting noProbe (H.seamFor probe) $ \svc → do
     (client, lease) ← openMain svc "main"
     waitFor (backedAtRestSTM svc >>= check)
     H.addRule probe (-1) isClose H.Throw
@@ -81,7 +86,7 @@ heldCase ending = do
     host ← newHost True
     _ ← okOf (removeWith svc (hostEndpoint svc Nothing host) lease (tile 3 4 5) Nothing)
     -- the owner ends, and its end settles the removal: nothing waits
-    awaitOwnerStopped svc
+    bounded (awaitOwnerStopped svc)
     _ ← waitFor (readTVar (hostSettled host) >>= \s → if null s then retry else pure s)
     defects ← inspectDefects svc
     let expected = case ending of
@@ -89,3 +94,9 @@ heldCase ending = do
           RefusedWithNothingInFlight → "refused work for pressure that nothing in flight can relieve"
         named = [t | OwnerDefect t ← defects, expected `isInfixOf` Text.unpack t, ("held closes: " <> show n) `isInfixOf` Text.unpack t]
     (defects, length named) `shouldSatisfy` ((>= 1) . snd)
+    writeIORef bodyDone True
+  readIORef bodyDone `shouldReturn` True
+  case ended of
+    Left (failure ∷ SomeException) | "BackingCloseRaised" `isInfixOf` show failure → pure ()
+    Left failure → throwIO failure
+    Right () → expectationFailure "the held closes were not reported when the storage service's scope ended"

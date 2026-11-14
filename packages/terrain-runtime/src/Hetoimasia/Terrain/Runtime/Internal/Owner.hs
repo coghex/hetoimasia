@@ -263,7 +263,10 @@ nextWork svc token = do
                     TurnBacked → [backedReady, prepareWork, commitWork, retryWork, dispatchWork]
               case listToMaybe (catMaybes inTurn) of
                 Just work → pure work
-                Nothing → foldr orElse retry [wait >> pure work | (wait, work) ← backedWaits]
+                -- a stuck grant's defect must commit: report it rather than wait (a retry would undo it)
+                Nothing
+                  | stuck → pure WReport
+                  | otherwise → foldr orElse retry [wait >> pure work | (wait, work) ← backedWaits]
 
 -- | Whether the job the model would dispatch next can start its pinned read: the dispatch is
 -- applied, its arena looked at, and everything it wrote rolled back (an exception caught inside
