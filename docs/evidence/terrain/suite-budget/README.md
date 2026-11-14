@@ -4,7 +4,7 @@
 representative of their parameters, builds every large fixture when the first example reads it, and runs its pure families in
 parallel, in one executable with one "Finished in" line; `terrain-runtime-full-depth-tests` (group `test.terrain-runtime-full-depth`, an optional probe)
 is the second test component, by the owner's decision (issue comment 6872272575), and runs the same
-families at their complete original parameters. Base `19bc8ade`, code head `4000e2fb` (the acceptance record below; the earlier figures name their head), GHC 9.14.1 (PATH `$HOME/.cache/hetoimasia/toolchain/ghc-9.14.1/bin`),
+families at their complete original parameters. Base `19bc8ade`, code head `5899ee11` (the acceptance record below; the earlier figures name their head), GHC 9.14.1 (PATH `$HOME/.cache/hetoimasia/toolchain/ghc-9.14.1/bin`),
 machine Apple M3 Max (16 cores). Every figure is a lab observation; CI figures are from the CI record.
 
 ```sh
@@ -14,16 +14,16 @@ cabal test --project-file cabal.project.cpu hetoimasia-terrain-runtime:terrain-r
 
 ## Results
 
-**Acceptance record, code head `4000e2fb`** (the suite is 876 examples: the 828 of the earlier heads and the 48 of the oracle of the printed lines), 2026-11-14 07:53Z to 08:00Z, the built tree, nothing built in any run (no `Compiling` or `Linking` line), no other build or test of this repository running. `/usr/bin/time -p` around the literal acceptance command below; every run exited 0 with 0 failures, 8 jobs on 8 capabilities (`RUNNER jobs=8 capabilities=8`, `PHASE sequential: 1 capability`). The load is as observed, not quiet: a sampler recorded every 5 s any process over 50% CPU other than the suite and `fseventsd`, and any compiler of any project; other projects' `cargo test` ran beside the routine runs.
+**Acceptance record, code head `5899ee11`** (the suite is 886 examples: the 828 of the earlier heads and the 58 of the oracle of the printed lines), 2026-11-14 08:34Z to 08:41Z, the built tree, nothing built in any run (no `Compiling` or `Linking` line), no other build or test of this repository running. `/usr/bin/time -p` around the literal acceptance command below; every run exited 0 with 0 failures, 8 jobs on 8 capabilities (`RUNNER jobs=8 capabilities=8`, `PHASE sequential: 1 capability`). The load is as observed: a sampler recorded every 5 s any process over 50% CPU other than the suite's binary and `fseventsd`, and any compiler of any project; it does not exclude the suite's own children, and the `ghc` it saw once in each run, about 96 s in, is one: the sequential examples of `Store/Boundary` ("the store's public interface across the package boundary") compile an external client with the `ghc` on `PATH`. This window was nearly quiet.
 
 | Run | Load before | Wall s | "Finished in" s | CPU user s | Samples | What the samples show |
 | --- | ---: | ---: | ---: | ---: | ---: | --- |
-| routine 1 | 5.46 | 149.04 | 146.20 | 269.9 | 139 | other projects' `cargo test` and test binaries, a `clang`, `mds` |
-| routine 2 | 14.61 | 137.02 | 135.47 | 261.8 | 63 | another project's `cargo test`, `mds` |
-| routine 3 | 9.15 | 138.26 | 136.52 | 263.7 | 23 | light processes (`pijul status`, a compiler's check) |
-| no example selected | 7.40 | 1.87 | 0.0001 | 1.54 | 2 | two other processes |
+| routine 1 | 7.20 | 128.29 | 126.59 | 257.8 | 3 | `cmux` and `XprotectService` once each, the suite's own `ghc` child |
+| routine 2 | 3.94 | 129.90 | 128.43 | 258.7 | 2 | `cmux` once, the suite's own `ghc` child |
+| routine 3 | 5.58 | 128.76 | 127.30 | 257.5 | 1 | the suite's own `ghc` child |
+| no example selected | 5.50 | 1.78 | 0.0001 | 1.52 | 0 | |
 
-Each routine run is within the 240 s budget (the worst by 91.0 s) and the no-example run within 10 s. The full-depth probe, one run at the code head `7ec6fd45` (the later changes touch the oracle and, only when progress is reported, the line state; the probe does not run the oracle) beside other agents' test runs (load 5.6 to 11, not a budgeted run): 96 examples, 0 failures, "Finished in" 1004.86 s, wall 1004.88 s, CPU user 997.2 s. The documented selection `--match "TRA-20 evidence"` runs 8 examples with 0 failures in each executable, prints 23 `EVIDENCE` lines (routine) and 29 (full depth), and every one starts a line; the 29 of the full-depth executable equal the 29 `EVIDENCE` lines of `tra20/README.md` byte for byte except three allocation counters (`allocation a one-record edit plan`, `a pinned point read` and the control map), which moved by under 3 percent between runs. All `EVIDENCE`, `MEMORY` and `memory ...` records of the four runs above and of the full-depth run start a line.
+Each routine run is within the 240 s budget (the worst by 110.1 s) and the no-example run within 10 s. The full-depth probe, one run at the code head `7ec6fd45` (the later changes touch the oracle and the line state, which only matters when a printed line follows an event; the probe does not run the oracle) beside other agents' test runs (load 5.6 to 11, not a budgeted run): 96 examples, 0 failures, "Finished in" 1004.86 s, wall 1004.88 s, CPU user 997.2 s. The documented selection `--match "TRA-20 evidence"` runs 8 examples with 0 failures in each executable, prints 23 `EVIDENCE` lines (routine) and 29 (full depth), and every one starts a line; the 29 of the full-depth executable equal the 29 `EVIDENCE` lines of `tra20/README.md` byte for byte except three allocation counters (`allocation a one-record edit plan`, `a pinned point read` and the control map), which moved by under 3 percent between runs. All `EVIDENCE`, `MEMORY` and `memory ...` records of the four runs above and of the full-depth run start a line.
 
 The earlier windows follow, at the heads they name (828 examples, before the oracle).
 
@@ -71,9 +71,9 @@ Window 2, 2026-11-14 01:30Z to 01:39Z, head `9a1b7ff5` (the suites' sources are 
 | q5 | 5.15 | 128.60 | 127.03 | 260.5 | 9 | a `cargo build` with a `clang` at one core |
 | q6 | 5.32 | 132.26 | 130.77 | 259.3 | 23 | python `unittest`, a python chat tool, a `pijul clone`, `mds` |
 
-All three sets of local runs agree to within about 10 percent (the executable boundary 121.0 to 123.3 s, the cabal boundary under load 127.4 to 135.6 s, the six sampled runs 128.6 to 132.8 s) and the loads differ by a factor of two; every one is 104 s or more under the 240 s budget. The six sampled runs are the acceptance figures of item 2 that the owner's decision of 2026-11-14 names (a daily-use machine cannot be made quiet; "if each run is under budget they pass"; issue comment 6870133533), at the head they were taken (828 examples): a run passes when it is within the budget, no quiet condition applies, and each run's load is stated as observed. After the suite gained the examples of the oracle of the printed lines, the item was taken again at the final code head `4000e2fb` under the same rule, the three runs above (intermediate heads gave 145.6, 137.2, 144.4 s at `7ec6fd45`, 838 examples, and 141.8, 142.0, 150.5 s at `428a6625`, 856 examples); every run of all these sets is within the budget. The executable-boundary and first cabal-boundary sets are observations.
+All three sets of local runs agree to within about 10 percent (the executable boundary 121.0 to 123.3 s, the cabal boundary under load 127.4 to 135.6 s, the six sampled runs 128.6 to 132.8 s) and the loads differ by a factor of two; every one is 104 s or more under the 240 s budget. The six sampled runs are the acceptance figures of item 2 that the owner's decision of 2026-11-14 names (a daily-use machine cannot be made quiet; "if each run is under budget they pass"; issue comment 6870133533), at the head they were taken (828 examples): a run passes when it is within the budget, no quiet condition applies, and each run's load is stated as observed. After the suite gained the examples of the oracle of the printed lines, the item was taken again at the final code head `5899ee11` under the same rule, the three runs above (intermediate heads gave 145.6, 137.2, 144.4 s at `7ec6fd45`, 838 examples, 141.8, 142.0, 150.5 s at `428a6625`, 856 examples, and 149.0, 137.0, 138.3 s at `4000e2fb`, 876 examples, under heavier load); every run of all these sets is within the budget. The executable-boundary and first cabal-boundary sets are observations.
 
-Budget (owner decision 2026-11-13): 240 s whole process locally, 300 s CI "Finished in", 10 s no-example. Headroom locally at the cabal boundary: 91 s in the worst of the three runs at the code head (149.0 s); at the earlier heads 104 s at 8 jobs under load (107 s in the six sampled runs) and 92 s at 4 jobs.
+Budget (owner decision 2026-11-13): 240 s whole process locally, 300 s CI "Finished in", 10 s no-example. Headroom locally at the cabal boundary: 110 s in the worst of the three runs at the code head (129.9 s); at the earlier heads 104 s at 8 jobs under load (107 s in the six sampled runs) and 92 s at 4 jobs.
 
 **CI** (acceptance item 9; the runner has 4 processors, so the default is 4 jobs, `RUNNER jobs=4 capabilities=4 (processors 4)`, then `PHASE sequential: 1 capability`). Three validation runs of this branch (the first two on identical code, their heads differing by the one catalog line that fixed the workflow guard; the third at `12c29156`, with the oracle of the printed lines, which failed under CI's colour and was then repaired):
 
@@ -337,13 +337,17 @@ that record, and every formatter the runner can select is wrapped so that each o
 it: every example of the parallel group, the suite's own sequential lines and the formatter. Written directly, with no lock: the
 sequential examples of `Storage/*` (#663's, unedited); a sequential item starts only after the reporting thread has written every
 earlier event and its own start, and the formatter is idle until the item ends (`Runner.JobQueue.runSequentially`,
-`Runner.Eval.reportItem`, `Format.monadic`), and the isolation guard keeps every parallel example away.
+`Runner.Eval.reportItem`, `Format.monadic`), and the isolation guard keeps every parallel example away. Not claimed for those direct
+writes: the `progress` formatter (its dots leave the line open), the progress-reporting mode on a file (a direct write follows the
+transient text and its erase), and every configuration outside the model's domain below (with html output a direct write follows a
+closing tag; likewise after an external diff command or a diff context the model does not name): the line is left open there, and
+only what goes through `printLine` begins at a line start.
 
 What each kind of event leaves on the line, for each formatter, as the oracle observed it (the bytes of each event, compared with
-the model `eventEffect` for a success, a pending and a failing item with info lines, in all three modes below). "Nothing" leaves
-the record as it was; "ends a line" makes it a line start; "transient" (an item's start or progress, only when progress is
-reported) writes text and an erase that the handle holds back, so the record says the line is open (a line printed to a handle that
-is not a terminal begins with a newline, on a terminal with the erase); "dot" is content with no newline.
+the model `eventEffect` for every kind of result and failure, inside the domain). "Nothing" leaves the record as it was; "ends a
+line" makes it a line start; "transient" (an item's start or progress, only when progress is reported) writes text and an erase that
+the handle holds back, so the record says the line is open (a line printed to a handle that is not a terminal begins with a
+newline, on a terminal with the erase); "dot" is content with no newline.
 
 | Event | `checks` (the default) | `specdoc` | `progress` | `failed-examples` | `silent` |
 | --- | --- | --- | --- | --- | --- |
@@ -355,41 +359,71 @@ is not a terminal begins with a newline, on a terminal with the erase); "dot" is
 | item done (success, pending, failure) | ends a line | ends a line | dot | nothing | nothing |
 | done | ends a line | ends a line | ends a line | ends a line | nothing |
 
-A formatter the model does not name leaves every event open: where the model is not certain the record is the one that costs a
-newline, never a damaged record. Progress is reported when colour is on and neither GitHub Actions nor Buildkite is detected (in
-practice on a terminal). The runner then hides the cursor before the first event and shows it again right after the last, with no
-newline: these two are the only bytes it writes to standard output outside a formatter's events (`Runner.withHiddenCursor`; the
-usage text of `--help` is written before the suite prints anything and ends the process), so the record is "after transient text"
-at the start and after the run. Where progress is not reported nothing changes: the catalog command's output is byte for byte what
-it was without the model (compared on `--match "TRA-20 evidence"`, a fixture and isolation selection and the no-example selection,
-locally and under `GITHUB_ACTIONS=true`, apart from the time and the allocation counters).
+What a formatter writes is a function of the whole format configuration and of each event's payload, so the model names its domain
+(`Output.modelDomain`, a pattern over all fifteen fields of `FormatConfig`, so a field a later Hspec adds does not compile), and every
+event of a formatter configured outside it, or not named in the model, leaves the line open: a newline before the next printed line,
+never a damaged record. The fifteen fields:
 
-The oracle (`Test.TerrainRuntime.OutputSpec`, sequential, 48 examples, holding the output lock while it redirects standard output
-to a file) has two halves. It drives each guarded formatter directly, with no scheduling in it: built as the runner builds it (the
-same `guardFormatters`, a real format configuration, the cursor hidden first when progress is reported) and fed the complete event
-sequence of a small run (a start, a group, three items whose results are a success, a pending and a failure with info lines,
-progress, the end of the group and of the run, the cursor shown), in each of fifteen cells (five formatters, three modes: colour
-off; colour on as GitHub Actions sets it; colour on with progress). A record is printed through the same output at each of the 12
-positions (before the first event, after each event but the last, after the run), all together and each alone, and on the raw
-bytes each is a whole line at a line start; the formatter's own text is unchanged by the records; and the bytes each event wrote
-by itself equal the model. The reviewer's case is kept by name: a run through `runSpec` that holds the first item's start until an
-example has printed after the run's start, for each formatter with progress reported. The other half runs a parallel spec of 120
-examples printing 20 records each (2,400 records beside 120 item lines) through `Runner.pinnedConfig` (the suite's defaults with
-the formatter, colour, unicode and job count given), at 8 jobs on 8 capabilities, per formatter and mode, and a group of 40 parallel
-examples followed by 100 sequential examples in nested describes writing 3 records each directly with `putStrLn`: every record a
-whole line at a line start and once (on the raw bytes in the progress mode), every other line one the formatter writes whole, a
-colour sequence recognized by its form and reset before the newline. The nested runs take nothing from their environment: no
-`.hspec` file, no `HSPEC_*` variable, no command line, `GITHUB_ACTIONS` and `BUILDKITE` pinned; the oracle passes under
-`GITHUB_ACTIONS=true`, `NO_COLOR`, `BUILDKITE`, `HSPEC_*`, `HSPEC_OPTIONS`, a `.hspec` file and `LANG=C`, which the outer run reads
-and the nested runs do not. In the progress mode the direct records of #663's examples are checked on the rendered capture only
-(a file keeps them after their item's transient text).
+| Field | Status |
+| --- | --- |
+| `UseColor`, `ReportProgress`, `OutputUnicode`, `UseDiff`, `PrintTimes`, `PrintCpuTime`, `ExpertMode` | swept, both values |
+| `DiffContext` | pinned to none, 0 and 3 (the default); any other value is outside |
+| `ExternalDiff` | pinned to none: an external command writes what it likes; outside otherwise |
+| `HtmlOutput` | swept; outside when set: every coloured write is wrapped in a span that closes after the newline, so an event ends with a closing tag, and Hspec's own transient text is off |
+| `PrettyPrintFunction` (set by default), `FormatException` | functions, so not enumerable: their results are only text inside the failure report, written line by line with a newline after each, inside the last event whose last write is the footer line; swept with empty and several-line results |
+| `UsedSeed` | read only inside two lines written with a newline; swept with two values |
+| `PrettyPrint` (the flag), `ExpectedTotalCount` | read by no formatter; swept anyway |
 
-Controls, each run against the oracle: with the formatter's events not under the lock, three of the five formatters fail in each
-of 3 runs (malformed records of 2,400: default 38, 23, 33; `specdoc` 44, 9, 20; `progress` 87, 98, 102) and 15, 15 and 14 of the
-28 examples then in it fail under `GITHUB_ACTIONS=true`; with a state rule that decides by the kind of event and not by what it
-wrote, `failed-examples` and `silent` fail with progress reported at 6 and 7 of the positions and in the reviewer's case (4
-examples, 15 positions); with the state after the run not marked open, the five formatters fail with progress reported at the
-position after the run (5 examples).
+Progress is reported when colour is on and neither GitHub Actions nor Buildkite is detected (in practice on a terminal). The runner
+then hides the cursor before the first event and shows it again right after the last, with no newline: these two are the only bytes
+it writes to standard output outside a formatter's events (`Runner.withHiddenCursor`; the usage text of `--help` is written before
+the suite prints anything and ends the process), so the record is "after transient text" at the start and after the run. Where
+progress is not reported nothing changes: the catalog command's output is byte for byte what it was without the model (compared on
+`--match "TRA-20 evidence"`, a fixture and isolation selection and the no-example selection, locally and under
+`GITHUB_ACTIONS=true`, apart from the time and the allocation counters, and identical with `--diff-context=3`, `--no-pretty`,
+`--times`, `--expert`, `--format=specdoc` and `--format=progress`); outside the domain (`--html`, `--diff-command`,
+`--diff-context=N` for N other than full, 0 and 3) one blank line precedes each printed line that follows an event.
+
+Every option of the suite's `--help`, and what it reaches: `--help` (usage to standard output inside `readConfig`, then exit, before
+the suite prints), `--ignore-dot-hspec`, `-m/--match`, `--skip`, `--dry-run`, `--focused-only`, `--fail-on`, `--strict`,
+`--fail-fast`, `--randomize`, `-r/--rerun`, `--failure-report`, `--rerun-all-on-success`, `-j/--jobs` (which events occur, in which
+order and beside which prints; a further run builds its formatter afresh), `--seed` (`UsedSeed`), `-f/--format` (the five
+formatters swept; any other name open), `--color`, `--unicode`, `--diff`, `--pretty`, `--show-exceptions`, `--display-exceptions`,
+`--times`, `--print-cpu-time`, `--expert` (the swept fields), `--diff-context` and `--diff-command` (pinned), `-p/--print-slow-items`
+(standard error), `-a/--qc-max-success`, `--qc-max-discard`, `--qc-max-size`, `--qc-max-shrinks`, `--depth` (the text of an
+item's info and failure reason, swept as payloads; no direct output), and the undocumented `--html` (outside the domain).
+
+The oracle (`Test.TerrainRuntime.OutputSpec`, sequential, 58 examples, holding the output lock while it redirects standard output to
+a file) has two halves. It drives each guarded formatter directly, with no scheduling in it: built as the runner builds it (the same
+`guardFormatters`, a real format configuration, the cursor hidden first when progress is reported) and fed the complete event
+sequence of a small run (a start, a group, ten items whose payloads cover every kind of result and failure reason, with info lines,
+a location and a duration, progress, the end of the group and of the run, the cursor shown). Each of 19 settings of the
+configuration (the swept fields, the pinned ones at a value inside and outside the domain, html) is turned on, one at a time, on each
+of three bases (colour off; colour on as GitHub Actions sets it; colour on with progress), and with every in-domain setting on at
+once: 22 variants per base, for each of five formatters. A record is printed through the same output at each of 27 positions
+(before the first event, after each event but the last, after the run): all together, on the raw bytes, each a whole line at a
+line start, the formatter's own text unchanged, and inside the domain the bytes each event wrote equal to the model; and each position
+alone on the three bases and on every variant outside the domain (the transitions of the state do not depend on what a setting
+changes, and for every in-domain setting the model against the bytes verifies what an event writes). The reviewer's cases are kept by
+name: a run through `runSpec` that holds the first item's start until an example has printed after the run's start; and, with html
+output, a successful item followed by an example that prints, through `suiteConfig` with `--format=NAME --html --no-color` and through
+the pinned configuration, for each formatter. The other half runs a parallel spec of 120 examples printing 20 records each (2,400
+records beside 120 item lines) through `Runner.pinnedConfig` (the suite's defaults with the formatter, colour, unicode and job count
+given), at 8 jobs on 8 capabilities, per formatter and mode, and a group of 40 parallel examples followed by 100 sequential examples
+in nested describes writing 3 records each directly with `putStrLn`: every record a whole line at a line start and once (on the raw
+bytes in the progress mode), every other line one the formatter writes whole, a colour sequence recognized by its form and reset
+before the newline. The nested runs take nothing from their environment: no `.hspec` file, no `HSPEC_*` variable, no command line,
+`GITHUB_ACTIONS` and `BUILDKITE` pinned; the oracle passes under `GITHUB_ACTIONS=true`, `NO_COLOR`, `BUILDKITE`, `HSPEC_*`,
+`HSPEC_OPTIONS`, a `.hspec` file and `LANG=C`, which the outer run reads and the nested runs do not.
+
+Controls, each run against the oracle: with the formatter's events not under the lock, three of the five formatters fail in each of
+3 runs (malformed records of 2,400: default 38, 23, 33; `specdoc` 44, 9, 20; `progress` 87, 98, 102); with a state rule that
+decides by the kind of event and not by what it wrote, `failed-examples` and `silent` fail with progress reported at 6 and 7 of the
+positions and in the reviewer's case (4 examples, 15 positions); with the state after the run not marked open, the five formatters
+fail with progress reported at the position after the run (5 examples); with the model as it was before its domain (no domain),
+17 of the 58 examples fail: the fifteen direct-drive cells and the reviewer's html case for `specdoc` through both configurations,
+in exactly the html variants (a record behind a closing tag, and the model's "ends a line" for events that end with a closing tag), and
+no other setting of the sweep fails; with the domain check removed from the new code the same 17.
 
 What was delivered: two of the 20 retained logs of the runs above had a record on a formatter line (the 1-job run and one 4-job run,
 neither an acceptance run); every record was whole in itself, and no figure in this record came from either line.
