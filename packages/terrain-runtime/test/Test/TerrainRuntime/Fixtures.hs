@@ -8,6 +8,9 @@ module Test.TerrainRuntime.Fixtures
     withService
   , withServiceUsing
   , withServiceLogged
+  , withServiceSeam
+  , smallestStore
+  , withStoragePort
   , quiet
   , soilOverStone
   , tile
@@ -78,7 +81,14 @@ import Hetoimasia.Terrain.Residency (BusyReason (..), Limits, LimitsSpec (..), R
 import Hetoimasia.Terrain.Runtime
 import Hetoimasia.Terrain.Runtime.Settlement
 import Hetoimasia.Terrain.Source (CellSpec (..), LayerSpec (..), PatchSpec (..), SourceSpec (..))
+import qualified Data.ByteString.Char8 as BC
+import Hetoimasia.Terrain.Runtime.Backed.Port (StoragePort (..))
+import Hetoimasia.Terrain.Runtime.Storage.Internal.Native (Seam, productionSeam)
+import Hetoimasia.Terrain.Runtime.Storage.Internal.Types (minHeadroomBytes, mkStorageConfig)
+import Hetoimasia.Terrain.Runtime.Store.Internal.State (StoreSpec (..), defaultStoreSpec, minAllowanceBytes)
+import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec (HasCallStack, expectationFailure, shouldBe)
+import Test.TerrainRuntime.Storage.Harness (fsNameOf)
 import Test.Support.Bounded (bounded)
 
 quiet ∷ Logger
@@ -92,9 +102,38 @@ withServiceUsing ∷ Config → SessionAdmission → Probe → (Service → IO a
 withServiceUsing = withServiceLogged quiet
 
 -- | A service whose logger is the given one.
+--
+-- Its arenas' private files are real reserved files in a temporary directory, on whatever
+-- filesystem that directory is on (qualified for the run, as the storage backend's own suite
+-- does), through the production native adapter. A configuration that keeps the default 1 GiB
+-- allowance is given the smallest one (64 MiB): every open really reserves its file.
 withServiceLogged ∷ Logger → Config → SessionAdmission → Probe → (Service → IO a) → IO a
 withServiceLogged logger config admission probe body =
-  withWorkerGroup $ \group → withTerrainService config (Ports admission (standaloneSupervisor group) logger probe) body
+  withServiceSeam logger config admission probe productionSeam body
+
+-- | 'withServiceLogged' with a native seam (the storage backend's harness injects faults there).
+withServiceSeam ∷ Logger → Config → SessionAdmission → Probe → Seam → (Service → IO a) → IO a
+withServiceSeam logger config admission probe seam body =
+  withSystemTempDirectory "hetoimasia-terrain-arenas" $ \dir → do
+    name ← fsNameOf dir
+    storage ← either (fail . show) pure (mkStorageConfig [name] minHeadroomBytes)
+    withWorkerGroup $ \group →
+      withTerrainService (smallestStore config) (Ports admission (standaloneSupervisor group) logger probe (StoragePort group storage (BC.pack dir) seam)) body
+
+-- | A storage port for a service an example builds itself: a temporary directory on a qualified
+-- filesystem and a worker group of its own for the backend's workers.
+withStoragePort ∷ (StoragePort → IO a) → IO a
+withStoragePort body =
+  withSystemTempDirectory "hetoimasia-terrain-arenas" $ \dir → do
+    name ← fsNameOf dir
+    storage ← either (fail . show) pure (mkStorageConfig [name] minHeadroomBytes)
+    withWorkerGroup $ \group → body (StoragePort group storage (BC.pack dir) productionSeam)
+
+-- | The smallest allowance an arena may have, unless the configuration names its own.
+smallestStore ∷ Config → Config
+smallestStore config
+  | configStore config == defaultStoreSpec = config {configStore = defaultStoreSpec {specAllowanceBytes = toInteger minAllowanceBytes}}
+  | otherwise = config
 
 -- | Stone below level -3, soil from -3 to 40: cells of the first two vertical
 -- regions are solid, the rest air.
@@ -388,6 +427,7 @@ configWith change = defaultConfig {configLimits = limitsWith change}
 settleChecks ∷ Service → IO ()
 settleChecks svc = do
   inspectInvariants svc >>= (`shouldBe` [])
+  inspectBacked svc >>= (`shouldBe` [])
   inspectDefects svc >>= (`shouldBe` [])
 
 -- ---------------------------------------------------------------------------

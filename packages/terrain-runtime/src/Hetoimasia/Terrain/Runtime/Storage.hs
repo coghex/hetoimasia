@@ -62,6 +62,7 @@ module Hetoimasia.Terrain.Runtime.Storage
   , minHeadroomBytes
   , maxQualifiedNames
   , maxQualifiedNameBytes
+  , filesystemOf
 
     -- * Handles
   , Backing
@@ -141,6 +142,12 @@ module Hetoimasia.Terrain.Runtime.Storage
   ) where
 
 import Control.Concurrent.STM (TVar)
+import Control.Exception (SomeException, mask, throwIO, try)
+import Data.ByteString (ByteString)
+import qualified Data.ByteString as BS
+import Hetoimasia.Terrain.Runtime.Storage.Internal.File (Created (..), closeFile, createPrivate)
+import Hetoimasia.Terrain.Runtime.Storage.Internal.Native (Native (..), posixNative)
+import Hetoimasia.Terrain.Runtime.Storage.Internal.Volume (VolumeProfile (..), profileOf)
 import Hetoimasia.Foundation.Log (Logger)
 import Hetoimasia.Foundation.Worker (WorkerGroup)
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Native (productionSeam)
@@ -157,3 +164,31 @@ import Hetoimasia.Terrain.Runtime.Store.Internal.Admission (Admission)
 withStorage ∷ StorageConfig → TVar Admission → WorkerGroup → Logger → (StorageService → IO a) → IO a
 withStorage config admission group logger =
   withStorageService (StoragePorts admission group logger productionSeam config)
+
+-- | The name of the filesystem a directory is on, as THE BACKEND ITSELF reads it: a private file is
+-- created in the directory exactly as an arena's is, the volume is profiled from that descriptor by the
+-- same code an open's qualification runs, and the file is unlinked and closed on every exit. A suite
+-- outside this package names the volume it runs on with it, so that ITS 'StorageConfig' can qualify that
+-- volume the way this package's own harness does.
+--
+-- It qualifies nothing: whether a name is qualified stays the caller's configuration ('mkStorageConfig'),
+-- and 'defaultQualified' is not widened by it. The answer is the service's own copy of the name, bounded
+-- by 'maxQualifiedNameBytes' (a longer name is refused as invalid, never truncated).
+filesystemOf ∷ ByteString → IO (Either StorageFailure ByteString)
+filesystemOf dir
+  | BS.null dir || BS.length dir > maxDirectoryBytes || BS.elem 0 dir = pure (Left (InvalidRequest DirectoryInvalid))
+  | otherwise = mask $ \restore → do
+      made ← createPrivate productionSeam dir 0 (const (pure ()))
+      case made of
+        Left failure → pure (Left (StorageIo failure))
+        Right created → do
+          profiled ← try @SomeException (restore (profileOf productionSeam (crFd created)))
+          _ ← nativeUnlink posixNative dir (crName created)
+          _ ← closeFile productionSeam (crFd created)
+          case profiled of
+            Left e → throwIO e
+            Right (Left (op, errno)) → pure (Left (StorageIo (IoFailure op (IoErrno errno) Nothing Nothing 0 0)))
+            Right (Right profile)
+              | BS.length (vpFilesystem profile) > maxQualifiedNameBytes || BS.null (vpFilesystem profile) →
+                  pure (Left (InvalidRequest DirectoryInvalid))
+              | otherwise → pure (Right (BS.copy (vpFilesystem profile)))

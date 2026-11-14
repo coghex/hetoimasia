@@ -3,19 +3,17 @@ name: hetoimasia-terrain-runtime
 version: 0.1.0.0
 synopsis: The scoped transactional terrain service for Hetoimasia
 description:
-    The terrain arena's service (TRA-4): one dedicated owner thread that is
-    the sole writer of arena contents, bounded asynchronous loading and eviction
-    that execute the residency model's decisions against real resident detail,
-    atomic whole-cell removal that commits its content, revision and successful
-    settlement in one arbitration with cancellation and the parent session's
-    admission, immutable borrowed snapshots, offload and reload from the
-    immutable source plus canonical retained removals, and an orderly close. It
-    also holds the pure model of the temporary store (TRA-20): the private page
-    codec, copy-on-write indexes, allocator and retirement work, staged
-    transaction planning, pinned readers, the allowance and the edit bank's
-    admission, with no file, thread or clock. It depends on the pure terrain
-    package and the foundation and runtime services; it has no Lua, window,
-    renderer, GPU, native or game dependency.
+    The terrain arena's service (TRA-4, backed since TRA-22): one dedicated owner
+    thread that is the sole writer of arena contents and the only publisher of
+    committed roots, revisions and request results; every acknowledged removal
+    written to the arena's private reserved file through the storage backend before
+    one publication decision makes it authoritative with its connection obligation;
+    bounded asynchronous loading and eviction of resident detail as a cache;
+    immutable borrowed snapshots; and an orderly close. It also holds the pure model
+    of the temporary store (TRA-20) and the storage backend (TRA-21). It depends on
+    the pure terrain package and the foundation and runtime services; its one native
+    dependency is the storage backend's C shim; it has no Lua, window, renderer, GPU
+    or game dependency.
 license: GPL-3.0-only
 license-file: LICENSE
 author: Vincent Coghlan
@@ -48,9 +46,11 @@ library
     -- The state, the transactions and the owner behind the public interface; a
     -- client cannot import them.
     other-modules:
+        Hetoimasia.Terrain.Runtime.Internal.Backed
         Hetoimasia.Terrain.Runtime.Internal.Content
         Hetoimasia.Terrain.Runtime.Internal.Core
         Hetoimasia.Terrain.Runtime.Internal.Owner
+        Hetoimasia.Terrain.Runtime.Internal.Publish
         Hetoimasia.Terrain.Runtime.Internal.Snapshot
         Hetoimasia.Terrain.Runtime.Internal.Types
     build-depends:
@@ -62,6 +62,7 @@ library
         hetoimasia-foundation ==0.1.0.0,
         hetoimasia-runtime ==0.1.0.0,
         hetoimasia-terrain ==0.1.0.0,
+        hetoimasia-terrain-runtime:backed,
         hetoimasia-terrain-runtime:storage,
         hetoimasia-terrain-runtime:store
 
@@ -84,6 +85,7 @@ library store
         Hetoimasia.Terrain.Runtime.Store.Internal.Model
         Hetoimasia.Terrain.Runtime.Store.Internal.Page
         Hetoimasia.Terrain.Runtime.Store.Internal.Plan
+        Hetoimasia.Terrain.Runtime.Store.Internal.Protocol
         Hetoimasia.Terrain.Runtime.Store.Internal.Records
         Hetoimasia.Terrain.Runtime.Store.Internal.State
         Hetoimasia.Terrain.Runtime.Store.Internal.Tree
@@ -122,6 +124,35 @@ library storage
         hetoimasia-terrain ==0.1.0.0,
         hetoimasia-terrain-runtime:store
 
+-- The owner's decisions about the outcomes of the two private layers beneath it (#665): the
+-- typed storage faults of requirement 8, and one total decision for every outcome of the storage
+-- backend (#663) and of the store planner (#662). Pure: no STM, no thread, no I/O. It sits above
+-- `store` and `storage`, which it reads, and below the service, which performs what it decides;
+-- being private it is visible to no client, and this package's suite reaches it to enumerate every
+-- outcome.
+library backed
+    import: language
+    visibility: private
+    hs-source-dirs: backed
+    exposed-modules:
+        Hetoimasia.Terrain.Runtime.Backed.Backend
+        Hetoimasia.Terrain.Runtime.Backed.Fault
+        Hetoimasia.Terrain.Runtime.Backed.Gather
+        Hetoimasia.Terrain.Runtime.Backed.Growth
+        Hetoimasia.Terrain.Runtime.Backed.Port
+        Hetoimasia.Terrain.Runtime.Backed.Probe
+        Hetoimasia.Terrain.Runtime.Backed.Query
+        Hetoimasia.Terrain.Runtime.Backed.Txn
+    build-depends:
+        base >=4.22 && <4.23,
+        bytestring >=0.12 && <0.13,
+        stm >=2.5.3 && <2.6,
+        text >=2.1 && <2.2,
+        hetoimasia-foundation ==0.1.0.0,
+        hetoimasia-terrain ==0.1.0.0,
+        hetoimasia-terrain-runtime:storage,
+        hetoimasia-terrain-runtime:store
+
 -- This package's own contracts, registered as the CPU validation group
 -- `test.terrain-runtime`. The suite drives the production service with
 -- controlled gates and no timing sleep; every thread it starts is owned through
@@ -135,6 +166,17 @@ test-suite terrain-runtime-tests
     -- when the program is started with -T.
     ghc-options: -threaded -rtsopts "-with-rtsopts=-T"
     other-modules:
+        Test.TerrainRuntime.Backed.Compile
+        Test.TerrainRuntime.Backed.Discovery
+        Test.TerrainRuntime.Backed.Creator
+        Test.TerrainRuntime.Backed.Fairness
+        Test.TerrainRuntime.Backed.Pressure
+        Test.TerrainRuntime.Backed.Held
+        Test.TerrainRuntime.Backed.Outcomes
+        Test.TerrainRuntime.Backed.Pause
+        Test.TerrainRuntime.Backed.Service
+        Test.TerrainRuntime.Backed.Sweep
+        Test.TerrainRuntime.Backed.Txn
         Test.TerrainRuntime.Basic
         Test.TerrainRuntime.Budgets
         Test.TerrainRuntime.Closure
@@ -212,6 +254,7 @@ test-suite terrain-runtime-tests
         hetoimasia-runtime ==0.1.0.0,
         hetoimasia-terrain ==0.1.0.0,
         hetoimasia-terrain-runtime ==0.1.0.0,
+        hetoimasia-terrain-runtime:backed,
         hetoimasia-terrain-runtime:storage,
         hetoimasia-terrain-runtime:store,
         hetoimasia-test-support ==0.1.0.0
@@ -258,7 +301,8 @@ test-suite terrain-storage-probe
 -- The full depth of the store families the routine suite bounds: every reduced or moved family at its
 -- complete original parameters. An explicit local probe (validation group `test.terrain-runtime-full-depth`,
 -- optional, category probe, no CI route): it takes about a quarter of an hour, so it is never selected by an affected
--- path or by a routine suite command. A pure model: no file, thread or clock; one example reads the runtime's allocation
+-- path or by a routine suite command. The store families are a pure model (no file, thread or clock); the backed
+-- service's storage_full trace runs the production service on a real file; one example reads the runtime's allocation
 -- counters, so every example runs alone on one capability behind the routine suite's isolation guard.
 test-suite terrain-runtime-full-depth-tests
     import: language
@@ -270,6 +314,9 @@ test-suite terrain-runtime-full-depth-tests
         Test.TerrainRuntime.Output
         Test.TerrainRuntime.Isolation
         Test.TerrainRuntime.Runner
+        Test.TerrainRuntime.Backed.Pause
+        Test.TerrainRuntime.Fixtures
+        Test.TerrainRuntime.Storage.Harness
         Test.TerrainRuntime.Store.Bounds
         Test.TerrainRuntime.Store.Cycles
         Test.TerrainRuntime.Store.Depth
@@ -301,6 +348,7 @@ test-suite terrain-runtime-full-depth-tests
         hetoimasia-runtime ==0.1.0.0,
         hetoimasia-terrain ==0.1.0.0,
         hetoimasia-terrain-runtime ==0.1.0.0,
+        hetoimasia-terrain-runtime:backed,
         hetoimasia-terrain-runtime:storage,
         hetoimasia-terrain-runtime:store,
         hetoimasia-test-support ==0.1.0.0

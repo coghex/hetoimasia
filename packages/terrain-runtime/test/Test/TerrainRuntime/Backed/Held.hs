@@ -1,0 +1,125 @@
+-- | Held closes take the control account's room for good: a close that raises is held on every
+-- platform (it is not established to have released the descriptor), and its record lives to the
+-- service's end. Nothing bounds how many there are, so when they have taken the room the owner must
+-- end loudly, never wait: a recorded defect that names them, and every request settled by the
+-- owner's end.
+--
+-- On the least control account the service accepts (two arenas of two readers), an arena stays open
+-- while a second one is opened and closed with every close raising, until the free control is
+--
+-- * below one worst-case transaction: the next removal can never be granted ('grantStuck'), or
+-- * within one job record above it: the removal is granted, its first job's record cannot be
+--   charged, its transaction ends and nothing is in flight ('notePressure').
+--
+-- After the first 64 kept failures every held close takes exactly one backing record (4,096 bytes),
+-- less than a job's record, so the free control cannot step over the second window.
+module Test.TerrainRuntime.Backed.Held (spec) where
+
+import Control.Concurrent.STM
+import Control.Exception (SomeException, finally, throwIO, try)
+import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
+import Data.List (isInfixOf)
+import qualified Data.Text as Text
+import Data.Word (Word64)
+import Hetoimasia.Terrain.Runtime
+import Hetoimasia.Terrain.Runtime.Settlement
+import Hetoimasia.Terrain.Runtime.Storage.Internal.Native (NativeOp (..))
+import Hetoimasia.Terrain.Runtime.Storage.Internal.Service (maxRecordControlBytes)
+import qualified Hetoimasia.Terrain.Runtime.Store.Internal.Admission as A
+import Hetoimasia.Terrain.Runtime.Store.Internal.Plan (RamCharge (..))
+import Test.TerrainRuntime.Output (printLine)
+import Test.Hspec
+import Test.Support.Bounded (bounded)
+import Test.TerrainRuntime.Fixtures
+import qualified Test.TerrainRuntime.Storage.Harness as H
+
+data Ending
+  = -- | the next transaction can never be funded
+    NeverFunded
+  | -- | a granted transaction's job is refused for pressure with nothing in flight
+    RefusedWithNothingInFlight
+  deriving stock (Eq, Show, Enum, Bounded)
+
+isClose ∷ NativeOp → Bool
+isClose = \case OpCloseFile {} → True; _ → False
+
+spec ∷ Spec
+spec = describe "Held closes that take the control account's room" $
+  forM_' [minBound .. maxBound] $ \ending →
+    it ("end the owner with a recorded defect naming them, never a wait (" <> show ending <> ")") (heldCase ending)
+  where
+    forM_' xs f = mapM_ f xs
+
+heldCase ∷ Ending → IO ()
+heldCase ending = do
+  probe ← H.newProbe
+  let arenas = 2 ∷ Int
+      readers = 2 ∷ Integer
+      w = A.worstTransactionCharge
+      txnControl = fromIntegral (ramPagePins w + ramRootControl w + ramContinuation w) ∷ Word64
+      need = A.controlNeedOf A.defaultEditBankSpec {A.ebsArenas = toInteger arenas, A.ebsReadersPerArena = readers} + toInteger (maxRecordControlBytes arenas)
+      config = defaultConfig {configMaxArenas = arenas, configEditBank = A.defaultEditBankSpec {A.ebsControl = need, A.ebsReadersPerArena = readers}}
+      -- the free control the last arena's open must leave: below one transaction, or within one
+      -- job's record above it
+      low = case ending of
+        NeverFunded → 0
+        RefusedWithNothingInFlight → txnControl
+      high = case ending of
+        NeverFunded → txnControl
+        RefusedWithNothingInFlight → txnControl + 4096
+  bodyDone ← newIORef False
+  -- the storage service reports every kept close failure when its scope ends: the held closes are
+  -- reported there, after the body has passed
+  ended ← try $ withServiceSeam quiet config alwaysAdmitting noProbe (H.seamFor probe) $ \svc → do
+    (client, lease) ← openMain svc "main"
+    waitFor (backedAtRestSTM svc >>= check)
+    -- the removal is staged first, while there is room, and waits for its host
+    host ← newHost False
+    _ ← okOf (removeWith svc (hostEndpoint svc Nothing host) lease (tile 3 4 5) Nothing)
+    waitFor (readTVar (hostReady host) >>= \n → check (n >= 1))
+    waitFor (backedAtRestSTM svc >>= check)
+    H.addRule probe (-1) isClose H.Throw
+    cycles ← newIORef (0 ∷ Int)
+    let freeControl = (\l → A.lgControlLimit l - A.lgControlReserved l) <$> atomically (inspectEditBankSTM svc)
+        openOther = okOf (openArena svc client "other" soilOverStone) >>= await svc >>= expectSuccess
+        cycleOnce = do
+          other ← openOther
+          okOf (releaseLease svc other)
+          waitFor (backedAtRestSTM svc >>= check)
+          modifyIORef' cycles (+ 1)
+        -- every held close takes one backing's record (4,096 bytes) for good: cycle while the last
+        -- arena's open would still leave the window's top or more
+        loop = freeControl >>= \free → if free < high + 4096 then pure () else cycleOnce >> loop
+    loop
+    n ← readIORef cycles
+    -- the last arena: its open takes the room; then its lease is released and the removal's host
+    -- made eligible in ONE transaction, so the owner's next choice sees a contender while that
+    -- arena's file is still to close; its close is held at the seam
+    closeGate ← H.addGateOnce probe isClose
+    other ← openOther
+    free ← freeControl
+    printLine ("held closes example (" <> show ending <> "): " <> show n <> " held closes and one closing, free control " <> show free <> " against a transaction's " <> show txnControl)
+    (free >= low && free < high) `shouldBe` True
+    flip finally (H.openGate closeGate) $ do
+      atomically (releaseArenaLeaseSTM svc other >>= either (error . show) pure >> writeTVar (hostEligible host) True)
+      waitFor (readTVar (H.gReached closeGate) >>= check . (>= 1))
+      -- the closing arena's record may still be released: nothing ends the owner, nothing settles
+      inspectDefects svc `shouldReturn` []
+      readTVarIO (hostSettled host) `shouldReturn` []
+    -- the close has ended (held): only now does the owner end, and its end settles the removal
+    bounded (awaitOwnerStopped svc)
+    _ ← waitFor (readTVar (hostSettled host) >>= \s → if null s then retry else pure s)
+    defects ← inspectDefects svc
+    let expected = case ending of
+          NeverFunded → "the next transaction can never be granted"
+          RefusedWithNothingInFlight → "refused work for pressure that nothing in flight can relieve"
+        named = [t | OwnerDefect t ← defects, expected `isInfixOf` Text.unpack t, ("held closes: " <> show (n + 1)) `isInfixOf` Text.unpack t]
+    (defects, length named) `shouldSatisfy` ((>= 1) . snd)
+    writeIORef bodyDone True
+  finished ← readIORef bodyDone
+  case ended of
+    -- the body's own failure (a bounded wait that expired) is the one reported
+    Left (failure ∷ SomeException)
+      | finished, "BackingCloseRaised" `isInfixOf` show failure → pure ()
+      | otherwise → throwIO failure
+    Right () → expectationFailure "the held closes were not reported when the storage service's scope ended"

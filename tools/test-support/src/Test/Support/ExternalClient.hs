@@ -49,8 +49,10 @@ data Client = Client
   , clientDirectory ∷ FilePath
   }
 
--- | Whether the client is only typechecked or also linked into an executable.
-data Mode = Typecheck | Link
+-- | Whether the client is only typechecked or also linked into an executable, and whether that
+-- executable runs on the threaded runtime (a client that starts the backed terrain service needs it:
+-- its storage workers refuse any other, which a 'Link' client can show).
+data Mode = Typecheck | Link | LinkThreaded
 
 -- | Assert that the compiler rejected the client, and that it rejected it for
 -- the stated reason rather than for a reason about the environment.
@@ -182,6 +184,7 @@ arguments packages mode databases name =
     <> case mode of
       Typecheck → ["-fno-code", name]
       Link → [name, "-o", "client"]
+      LinkThreaded → [name, "-threaded", "-o", "client"]
   where
     exposing package
       | "-inplace" `isInfixOf` package = ["-package-id", package]

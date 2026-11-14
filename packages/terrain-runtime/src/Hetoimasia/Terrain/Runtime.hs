@@ -27,6 +27,8 @@ module Hetoimasia.Terrain.Runtime
   , ConfigError (..)
   , defaultConfig
   , Ports (..)
+  , StoragePort
+  , storagePort
   , SessionAdmission (..)
   , alwaysAdmitting
   , Supervisor (..)
@@ -60,6 +62,12 @@ module Hetoimasia.Terrain.Runtime
   , ColumnAnswer (..)
   , SurfaceAnswer (..)
   , RemoveAnswer (..)
+  , GrowAnswer (..)
+  , RetryAnswer (..)
+  , StorageFault (..)
+  , FullWhy (..)
+  , IntegritySource (..)
+  , faultCode
   , Failure (..)
   , Refused (..)
   , BusyWhy (..)
@@ -71,6 +79,23 @@ module Hetoimasia.Terrain.Runtime
   , columnAt
   , surfaceAt
   , removeAt
+  , knowledgeAt
+  , KnowledgeAnswer (..)
+  , growArena
+  , retryArena
+  , arenaStatus
+  , arenaStatusSTM
+  , ArenaStatus (..)
+  , StorageState (..)
+  , DiscoveryState (..)
+  , inspectEditBankSTM
+  , inspectStorageQueuedSTM
+  , inspectStoragePressedSTM
+  , markOf
+  , PressureMark
+  , perArenaBound
+  , compileAccountFor
+  , Condition (..)
   , await
   , cancelPending
 
@@ -93,12 +118,14 @@ module Hetoimasia.Terrain.Runtime
 
     -- * Inspection
   , inspectInvariants
+  , inspectBacked
+  , inspectCompileSTM
+  , backedAtRestSTM
   , inspectModel
   , inspectModelSTM
   , inspectDefects
   , inspectSnapshotBytes
   , inspectRetainedChargesSTM
-  , inspectRetryMemory
   , inspectLimits
   , inspectConfig
   , LimitRow (..)
@@ -122,7 +149,6 @@ module Hetoimasia.Terrain.Runtime
   , RunningWork
   , runningJobs
   , runningPreparation
-  , runningHandoffs
   , runningHolds
   , runningViews
   , JobWork
@@ -142,10 +168,6 @@ module Hetoimasia.Terrain.Runtime
   , preparationResident
   , preparationStaging
   , preparationEdit
-  , HandoffWork
-  , handoffWorkArena
-  , handoffWorkRegion
-  , handoffWorkDuplicate
   , inspectReadmissionWaits
   , inspectReadmissionWaitsSTM
   , inspectArena
@@ -159,6 +181,7 @@ import Control.Concurrent.STM
 import Control.Exception (Exception, ExceptionWithContext, SomeException, mask, rethrowIO, throwIO, try, tryWithContext)
 import Control.Monad (when)
 import qualified Data.Map.Strict as Map
+import Data.Maybe (isNothing)
 import Data.Text (Text)
 import Data.Unique (newUnique)
 import Hetoimasia.Foundation.Log (Logger)
@@ -166,7 +189,6 @@ import Hetoimasia.Foundation.Resource (withResource)
 import Hetoimasia.Foundation.Worker (StartOutcome (..), WorkerGroup, awaitCompletion, requestStop, startWorker)
 import Hetoimasia.Terrain.Cell (Column (..), ZRange)
 import qualified Data.Set as Set
-import Hetoimasia.Terrain.Changes (Changes, changesBytes)
 import Hetoimasia.Terrain.Coordinate (RegionCoord, TileCoord (..), decomposeTile)
 import Hetoimasia.Terrain.Query (defaultQueryLimits)
 import qualified Hetoimasia.Terrain.Residency as R
@@ -181,6 +203,17 @@ import Hetoimasia.Terrain.Runtime.Internal.Owner (ownerDefinition)
 import Hetoimasia.Terrain.Runtime.Internal.Snapshot
 import Hetoimasia.Terrain.Runtime.Internal.Types
 import Hetoimasia.Terrain.Runtime.Settlement
+import Hetoimasia.Terrain.Runtime.Backed.Port (StoragePort (..), storagePort)
+import Hetoimasia.Terrain.Runtime.Backed.Fault (FullWhy (..), IntegritySource (..), StorageFault (..), faultCode)
+import Hetoimasia.Terrain.Runtime.Internal.Backed (backedInvariants, editBankChecked, markOf, pressureMark)
+import qualified Hetoimasia.Terrain.Runtime.Storage.Internal.Service as Storage
+import Hetoimasia.Terrain.Runtime.Store.Internal.Admission (EditBankSpec (..), Ledger (..), defaultEditBankSpec, ledgers, mkEditBankConfig, newAdmission)
+import Hetoimasia.Terrain.Runtime.Store.Internal.Model (Condition (..), GrowthView (..), Usage (..), conditions, growthView, storeHeader, usage)
+import Hetoimasia.Terrain.Runtime.Store.Internal.State (defaultStoreSpec, mkStoreConfig)
+import Hetoimasia.Terrain.Connectivity (defaultConnectivityLimits)
+import qualified Hetoimasia.Terrain.Connectivity as C
+import qualified Hetoimasia.Terrain.Discovery as D
+import Hetoimasia.Terrain.Discovery (defaultDiscoveryLimits)
 import Hetoimasia.Terrain.Source (SourceSpec, defaultSourceLimits)
 
 -- | The approved host profile: four arenas, 64 leases and eight views, with
@@ -198,6 +231,10 @@ defaultConfig =
     , configFirstIdentity = 0
     , configFirstRevision = 0
     , configRetainedBytes = 16 * 1024 * 1024
+    , configStore = defaultStoreSpec
+    , configEditBank = defaultEditBankSpec
+    , configConnectivity = defaultConnectivityLimits
+    , configDiscovery = defaultDiscoveryLimits
     }
 
 -- | What the service borrows. Each is narrow: the parent session's admission as
@@ -208,6 +245,9 @@ data Ports = Ports
   , portSupervisor ∷ !Supervisor
   , portLogger ∷ !Logger
   , portProbe ∷ !Probe
+  , -- | Where and how the arenas' private files are kept: the storage backend runs inside
+    -- the service's own scope, its two workers in this port's group.
+    portStorage ∷ !StoragePort
   }
 
 -- | A session that is always open.
@@ -238,8 +278,21 @@ standaloneSupervisor group = Supervisor $ \definition →
 -- the body, outside any uninterruptible release, and it has no deadline: a
 -- borrower that never returns keeps the service, and so its dependencies, alive.
 withTerrainService ∷ Config → Ports → (Service → IO a) → IO a
-withTerrainService config ports body =
-  withResource acquire (\svc → atomically (closeServiceSTM svc)) $ \svc →
+withTerrainService config ports body = do
+  -- Everything the configuration says is validated before anything starts: the store's
+  -- allowance, the edit bank's division (for the configured arenas), the model's banks, and the
+  -- compile account beside them (owner decision 2026-11-13, option B).
+  storeConfig <- either (throwIO . ConfigStore) pure (mkStoreConfig (configStore config))
+  editBank <- either (throwIO . ConfigEditBank) pure (mkEditBankConfig (configEditBank config) {ebsArenas = toInteger (configMaxArenas config)})
+  either throwIO pure (editBankChecked (configEditBank config) {ebsArenas = toInteger (configMaxArenas config)})
+  limits <- either throwIO pure (modelLimitsChecked config)
+  compileBank <- either throwIO pure (compileBankChecked (configMaxArenas config) (configConnectivity config))
+  bank <- newTVarIO (newAdmission editBank)
+  -- The storage backend's scope encloses the service's: the owner drains and closes its
+  -- arenas' files first, then the backend closes whatever is left, joins its workers and
+  -- composes its kept failures into this scope's end.
+  Storage.withStorageService (Storage.StoragePorts bank (spGroup sp) (portLogger ports) (spSeam sp) (spConfig sp)) $ \storage →
+   withResource (acquire limits storage bank storeConfig compileBank) (\svc → atomically (closeServiceSTM svc)) $ \svc →
     -- Everything from the owner's start to the end of the drain is masked, so
     -- there is no window between a started owner and the drain that will join it:
     -- the start's own wait is interruptible, and the foundation's start drains a
@@ -260,11 +313,11 @@ withTerrainService config ports body =
         Right result → maybe (pure result) rethrowIO late
         Left primary → rethrowIO (primary ∷ ExceptionWithContext SomeException)
   where
-    acquire = do
+    sp = portStorage ports
+    acquire limits storage bank storeConfig compileBank = do
       tag <- newUnique
-      limits <- either (throwIO . ConfigError) pure (modelLimitsFor config)
       var <- newTVarIO (initialState config limits)
-      pure (Service tag var config (portAdmission ports) (portLogger ports) (portProbe ports))
+      pure (Service tag var config (portAdmission ports) (portLogger ports) (portProbe ports) storage bank (spDirectory sp) storeConfig compileBank)
     -- Close admission, ask the owner to stop, and wait for both proofs: the
     -- owner's worker has published its terminal outcome, and no borrower is
     -- outstanding. There is no deadline and no detach. Any exception received
@@ -352,6 +405,99 @@ surfaceAt svc lease column = arrival (\case ASurface a → Just a; _ → Nothing
 removeAt ∷ Service → ArenaLease → TileCoord → Maybe Precondition → IO (Either Refused (Pending RemoveAnswer))
 removeAt svc lease tile precondition = arrival (\case ARemoved a → Just a; _ → Nothing) (\ep → removeWith svc ep lease tile precondition)
 
+-- | What is known of a cell (a Haskell seam for later consumers; no Lua schema in this slice).
+knowledgeAt ∷ Service → ArenaLease → TileCoord → IO (Either Refused (Pending KnowledgeAnswer))
+knowledgeAt svc lease tile = arrival (\case AKnowledge a → Just a; _ → Nothing) (\ep → knowledgeWith svc ep lease tile)
+
+-- | The creator's growth of the arena's allowance (a Haskell seam; the Lua schema is TRA-23).
+growArena ∷ Service → ArenaLease → Integer → IO (Either Refused (Pending GrowAnswer))
+growArena svc lease bytes = arrival (\case AGrown a → Just a; _ → Nothing) (\ep → growWith svc ep lease bytes)
+
+-- | The creator's explicit retry of a paused arena (a Haskell seam; the Lua schema is TRA-23).
+retryArena ∷ Service → ArenaLease → IO (Either Refused (Pending RetryAnswer))
+retryArena svc lease = arrival (\case ARetried a → Just a; _ → Nothing) (\ep → retryWith svc ep lease)
+
+-- | Whether new history of an arena is ready or paused, and why.
+data StorageState = StorageReady | StoragePaused ![Condition]
+  deriving stock (Eq, Show)
+
+-- | Whether discovery of an arena has unfinished obligations, and whether it may advance.
+data DiscoveryState = DiscoveryIdle | DiscoveryPending | DiscoveryPaused
+  deriving stock (Eq, Show)
+
+-- | A bounded, coherent, advisory status of an arena (requirement 9), read in one transaction
+-- through any valid own lease. It enumerates no history and reserves nothing: every figure is
+-- the store's own counters. Used bytes are live, retired, loose and staged pages and overhead,
+-- never free preallocated capacity; pending reclaim (the retired pages) is a subset of used.
+-- Pending reserved bytes are the arena's own extra reservations not yet spendable: a growth
+-- prepared and not committed, and an extra whose release failed.
+data ArenaStatus = ArenaStatus
+  { statusStorage ∷ !StorageState
+  , statusReservedBytes ∷ !Word64
+  , statusUsedBytes ∷ !Word64
+  , statusPendingReclaimBytes ∷ !Word64
+  , statusPendingReservedBytes ∷ !Word64
+  , statusDiscovery ∷ !DiscoveryState
+  , statusPendingItems ∷ !Word64
+  , statusContentRevision ∷ !Revision
+  , statusKnowledgeRevision ∷ !Revision
+  }
+  deriving stock (Eq, Show)
+
+-- | The arena's status, through any of its live leases ('RefusedAuthority' otherwise).
+arenaStatus ∷ Service → ArenaLease → IO (Either Refused ArenaStatus)
+arenaStatus svc lease = atomically (arenaStatusSTM svc lease)
+
+-- | The same as a transaction, so a wait can be on the status itself.
+arenaStatusSTM ∷ Service → ArenaLease → STM (Either Refused ArenaStatus)
+arenaStatusSTM svc lease = do
+  st <- readSt svc
+  case leaseOf svc lease st of
+    Left refused → pure (Left refused)
+    Right (_, ls)
+      | not (leaseLive ls) → pure (Left RefusedAuthority)
+      | otherwise → case Map.lookup (leaseArena ls) (stateArenas st) of
+          Nothing → pure (Left RefusedAuthority)
+          Just arena → do
+            view <- Storage.backingView (serviceStorage svc) (arenaBacking arena)
+            let store = arenaStore arena
+                use = usage store
+                growth = growthView store
+                paused = conditions store
+                pending = D.pendingObligations (storeHeader store)
+                backend = maybe 0 id (view >>= Storage.bvPendingReservation)
+            pure . Right $
+              ArenaStatus
+                { statusStorage = if null paused then StorageReady else StoragePaused paused
+                , statusReservedBytes = usAllowanceBytes use
+                , statusUsedBytes = usUsedBytes use
+                , statusPendingReclaimBytes = usRetiredBytes use
+                , statusPendingReservedBytes = gvPendingBytes growth + backend
+                , statusDiscovery = if pending == 0 then DiscoveryIdle else if null paused then DiscoveryPending else DiscoveryPaused
+                , statusPendingItems = pending
+                , statusContentRevision = D.authContent (arenaAuthority arena)
+                , statusKnowledgeRevision = D.authKnowledge (arenaAuthority arena)
+                }
+
+-- | The per-arena bound of the compile account at given compiler limits: what one compiled arena
+-- may keep for its life (its connectivity's result bound and #661's member index over the node bound).
+perArenaBound ∷ C.ConnectivityLimits → Word64
+perArenaBound = perArenaShared
+
+-- | The compile account's size for an arena cap at given compiler limits: every other arena's bound
+-- and one compilation's peak.
+compileAccountFor ∷ Int → C.ConnectivityLimits → Word64
+compileAccountFor = compileBankFor
+
+-- | The compile account: what the arenas, closing files and opens hold of it, and its size
+-- (read-only, for verification).
+inspectCompileSTM ∷ Service → STM (Word64, Word64)
+inspectCompileSTM svc = (\st -> (stateCompileUse st, serviceCompileBank svc)) <$> readSt svc
+
+-- | The edit bank's ledgers (read-only, for verification).
+inspectEditBankSTM ∷ Service → STM Ledger
+inspectEditBankSTM svc = ledgers <$> readTVar (serviceEditBank svc)
+
 -- | Wait for a request's terminal outcome and retire its result: the credits an
 -- accepted result holds return when it is taken.
 await ∷ Service → Pending a → IO (Either Settlement a)
@@ -408,6 +554,49 @@ withSnapshot svc lease regions body =
 inspectInvariants ∷ Service → IO [String]
 inspectInvariants svc = invariants (serviceConfig svc) <$> readTVarIO (serviceState svc)
 
+-- | The backed state's physical truth beside what the service counts (the owner's tasks, the
+-- stores' pins and transactions, the compile account, the storage service's backings and the
+-- edit bank): empty when they agree. Read-only, for verification; see
+-- 'Hetoimasia.Terrain.Runtime.Internal.Backed.backedInvariants'.
+inspectBacked ∷ Service → IO [String]
+inspectBacked svc = atomically (inspectBackedSTM svc)
+
+-- | Whether the owner's backed work is at rest: no open, pinned read, mutating transaction or
+-- closing file of the owner's, no job of the storage service, and every row of 'inspectBacked'
+-- holds (so the edit bank holds only the storage service's own records). Read-only, for
+-- verification: a test waits on it instead of on a figure of the bank.
+-- | How many jobs wait in the storage service's queue (it takes at most eight). Read-only, for
+-- verification.
+inspectStorageQueuedSTM ∷ Service → STM Int
+inspectStorageQueuedSTM svc = Storage.snQueued <$> Storage.snapshotOf (serviceStorage svc)
+
+-- | Whether a caller of the storage service was refused for temporary pressure and nothing the
+-- service or the edit bank holds has changed since: the owner starts no new storage work until it
+-- does. Read-only, for verification.
+inspectStoragePressedSTM ∷ Service → STM Bool
+inspectStoragePressedSTM svc = do
+  st <- readSt svc
+  case stateStoragePressure st of
+    Nothing → pure False
+    Just mark → (== mark) <$> pressureMark svc
+
+backedAtRestSTM ∷ Service → STM Bool
+backedAtRestSTM svc = do
+  st <- readSt svc
+  sn <- Storage.snapshotOf (serviceStorage svc)
+  problems <- inspectBackedSTM svc
+  pure $
+    Map.null (stateOpens st) && Map.null (stateGathers st) && isNothing (stateSlot st) && Map.null (stateClosing st)
+      && null (Storage.snJobs sn)
+      && null problems
+
+inspectBackedSTM ∷ Service → STM [String]
+inspectBackedSTM svc = do
+  st <- readSt svc
+  adm <- readTVar (serviceEditBank svc)
+  sn <- Storage.snapshotOf (serviceStorage svc)
+  pure (backedInvariants st adm (serviceCompileBank svc) sn)
+
 -- | Whether the removal this request has staged would change content: @Just True@ for a staged removal that will advance the
 -- arena's revision by one, @Just False@ for a staged removal of air, which commits as unchanged at the revision it finds, and
 -- @Nothing@ for a request that has staged no removal (a read, an open, an attach, one not yet staged, one settled, or another
@@ -454,13 +643,6 @@ inspectReadmissionWaitsSTM svc = do
 
 -- | The accounted bytes the retained bank holds (outstanding snapshots' backing and
 -- untaken removal results), and the bank.
--- | How many regions the owner remembers a transfer attempt or a capacity refusal
--- for. It returns to zero when the regions and arenas involved end.
-inspectRetryMemory ∷ Service → IO Int
-inspectRetryMemory svc = do
-  st <- readTVarIO (serviceState svc)
-  pure (Map.size (stateTransfers st) + Map.size (stateHandoffBusy st))
-
 -- | The configuration the service was built with. A pure read of the service's own immutable field: a host that composes over a service
 -- asks it, rather than being told a configuration that might differ from the one the service enforces. It reads no state and changes no
 -- behaviour.
@@ -495,7 +677,7 @@ inspectCensusSTM ∷ Service → STM Census
 inspectCensusSTM svc = do
   st <- readSt svc
   let arenaRows retiring arenas =
-        [ ArenaCensus aid retiring (regionBytesOf (arenaResident a)) (fromIntegral (changesBytes (arenaChanges a)))
+        [ ArenaCensus aid retiring (regionBytesOf (arenaResident a)) 0
         | (aid, a) ← Map.toList arenas
         ]
       -- What the detail itself holds in each vertical region: the fixed metadata of a
@@ -542,18 +724,20 @@ inspectSnapshotBytes svc = do
   st <- readTVarIO (serviceState svc)
   pure (retainedBankUse st, configRetainedBytes (serviceConfig svc))
 
--- | A read-only view of an arena's contents.
+-- | A read-only view of an arena's contents: its committed authority (content, knowledge and
+-- store revisions), its residency generation, its resident detail and palette, and its store's
+-- usage. No history: every removal is in the arena's store, not in RAM.
 data ArenaView = ArenaView
   { viewIncarnation ∷ !ArenaId
   , viewRevision ∷ !Revision
+  , viewKnowledgeRevision ∷ !Revision
+  , viewStoreRevision ∷ !Revision
   , viewGeneration ∷ !Word
-  , viewChanges ∷ !Changes
   , viewResident ∷ !Resident
   , viewPalette ∷ !Palette
-  , -- | The retained store: changes whose transfer succeeded.
-    viewStore ∷ !Changes
-  , -- | The regions whose changes are committed but not yet transferred.
-    viewWorking ∷ ![RegionCoord]
+  , viewUsage ∷ !Usage
+  , -- | The conditions that pause the arena's new history.
+    viewPaused ∷ ![Condition]
   }
 
 inspectArena ∷ Service → ArenaLease → IO (Maybe ArenaView)
@@ -566,6 +750,6 @@ inspectArenaSTM svc lease = do
   st <- readSt svc
   pure $ case leaseOf svc lease st of
     Right (_, ls) →
-      (\a → ArenaView (leaseArena ls) (arenaRevision a) (fromIntegral (arenaGeneration a)) (arenaChanges a) (arenaResident a) (arenaPalette a) (arenaStore a) (Map.keys (arenaWorking a)))
+      (\a → let auth = arenaAuthority a in ArenaView (leaseArena ls) (D.authContent auth) (D.authKnowledge auth) (D.authStore auth) (fromIntegral (arenaGeneration a)) (arenaResident a) (arenaPalette a) (usage (arenaStore a)) (conditions (arenaStore a)))
         <$> Map.lookup (leaseArena ls) (stateArenas st)
     Left _ → Nothing

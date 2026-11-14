@@ -34,7 +34,7 @@ spec ∷ Spec
 spec = describe "Terrain runtime opacity across the package boundary" $ do
   it "accepts and runs a client that composes the public service" $
     withClient "Main.hs" supportedClient $ \compile → do
-      outcome <- compile Link
+      outcome <- compile LinkThreaded
       case clientStatus outcome of
         ExitSuccess → pure ()
         status →
@@ -49,8 +49,7 @@ spec = describe "Terrain runtime opacity across the package boundary" $ do
           clientRunBound
           (proc (clientDirectory outcome </> "client") []) {cwd = Just (clientDirectory outcome)}
           ""
-      status `shouldBe` ExitSuccess
-      err `shouldBe` ""
+      (status, err) `shouldBe` (ExitSuccess, "")
       lines out `shouldBe` supportedOutput
 
   forM_ constructors $ \(name, imports) →
@@ -101,7 +100,7 @@ spec = describe "Terrain runtime opacity across the package boundary" $ do
 withClient ∷ FilePath → String → ((Mode → IO Client) → IO ()) → IO ()
 withClient =
   withPackageClient
-    ["base", "text", "stm", "hetoimasia-foundation", "hetoimasia-runtime", "hetoimasia-terrain", "hetoimasia-terrain-runtime-0.1.0.0-inplace"]
+    ["base", "bytestring", "text", "stm", "hetoimasia-foundation", "hetoimasia-runtime", "hetoimasia-terrain", "hetoimasia-terrain-runtime-0.1.0.0-inplace"]
 
 hidden ∷ [String]
 hidden =
@@ -133,7 +132,6 @@ constructors =
   , ("RunningWork", ["import Hetoimasia.Terrain.Runtime (RunningWork (RunningWork))"])
   , ("JobWork", ["import Hetoimasia.Terrain.Runtime (JobWork (JobWork))"])
   , ("PreparationWork", ["import Hetoimasia.Terrain.Runtime (PreparationWork (PreparationWork))"])
-  , ("HandoffWork", ["import Hetoimasia.Terrain.Runtime (HandoffWork (HandoffWork))"])
   ]
 
 -- | An authority forged by applying a constructor the client never imported.
@@ -149,7 +147,6 @@ forged =
   , ("RunningWork", ["import Hetoimasia.Terrain.Runtime (RunningWork)"], ["forgedWork :: RunningWork", "forgedWork = RunningWork undefined Nothing undefined"])
   , ("JobWork", ["import Hetoimasia.Terrain.Runtime (JobWork)"], ["forgedJob :: JobWork", "forgedJob = JobWork undefined undefined 0 0 1"])
   , ("PreparationWork", ["import Hetoimasia.Terrain.Runtime (PreparationWork)"], ["forgedPreparation :: PreparationWork", "forgedPreparation = PreparationWork undefined Nothing True 0 0 0 0"])
-  , ("HandoffWork", ["import Hetoimasia.Terrain.Runtime (HandoffWork)"], ["forgedHandoff :: HandoffWork", "forgedHandoff = HandoffWork undefined undefined 0"])
   ]
 
 -- | A snapshot rewritten through an exported accessor used as a field label.
@@ -169,7 +166,6 @@ inspectionUpdates =
   , ("censusModelRecord", ["import Hetoimasia.Terrain.Runtime (RequestCensus, censusModelRecord)"], ["recordless :: RequestCensus -> RequestCensus", "recordless r = r {censusModelRecord = False}"])
   , ("jobWorkResident", ["import Hetoimasia.Terrain.Runtime (JobWork, jobWorkResident)"], ["cheaper :: JobWork -> JobWork", "cheaper j = j {jobWorkResident = 0}"])
   , ("preparationStaging", ["import Hetoimasia.Terrain.Runtime (PreparationWork, preparationStaging)"], ["lean :: PreparationWork -> PreparationWork", "lean p = p {preparationStaging = 0}"])
-  , ("handoffWorkDuplicate", ["import Hetoimasia.Terrain.Runtime (HandoffWork, handoffWorkDuplicate)"], ["smaller :: HandoffWork -> HandoffWork", "smaller h = h {handoffWorkDuplicate = 0}"])
   , ("runningJobs", ["import Hetoimasia.Terrain.Runtime (RunningWork, runningJobs)"], ["idle :: RunningWork -> RunningWork", "idle w = w {runningJobs = []}"])
   ]
 
@@ -186,14 +182,20 @@ supportedClient =
     , "import Hetoimasia.Terrain.Coordinate"
     , "import Hetoimasia.Terrain.Residency (Revision (..))"
     , "import Hetoimasia.Terrain.Runtime"
+    , "import qualified Hetoimasia.Terrain.Runtime.Storage as Storage"
+    , "import Hetoimasia.Terrain.Runtime.Store (StoreSpec (..), defaultStoreSpec, minAllowanceBytes)"
     , "import Hetoimasia.Terrain.Source"
     , ""
     , "main :: IO ()"
     , "main = withWorkerGroup $ \\group -> do"
-    , "  let logger = mkLogger defaultLogFilter (callbackSink (\\_ -> pure ()))"
-    , "      ports = Ports alwaysAdmitting (standaloneSupervisor group) logger noProbe"
+    , "  -- the arenas' private files go in this directory (the client's own), on its qualified filesystem"
+    , "  Right name <- Storage.filesystemOf \".\""
+    , "  let Right storage = Storage.mkStorageConfig [name] Storage.minHeadroomBytes"
+    , "      logger = mkLogger defaultLogFilter (callbackSink (\\_ -> pure ()))"
+    , "      ports = Ports alwaysAdmitting (standaloneSupervisor group) logger noProbe (storagePort group storage \".\")"
+    , "      config = defaultConfig {configStore = defaultStoreSpec {specAllowanceBytes = toInteger minAllowanceBytes}}"
     , "      definition = SourceSpec [\"soil\"] [LayerSpec Nothing (Just 10) \"soil\" 0] []"
-    , "  withTerrainService defaultConfig ports $ \\svc -> do"
+    , "  withTerrainService config ports $ \\svc -> do"
     , "    Right client <- registerClient svc"
     , "    Right opened <- openArena svc client \"main\" definition"
     , "    Right lease <- await svc opened"

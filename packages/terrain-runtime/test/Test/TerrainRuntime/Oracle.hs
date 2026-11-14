@@ -136,40 +136,33 @@ spec = describe "The accounting oracle and its controls" $ do
         waitFor (inspectCensusSTM svc >>= \census → check (null (runningJobs (censusRunning census))))
         usageOf svc `shouldReturn` []
 
-  -- A handoff: after a removal commits, the owner copies the region's retained changes
-  -- (one removed interval, 16 bytes, and one column entry, 48 bytes) to transfer them.
-  describe "a handoff duplicate" $ do
-    let atHandoff act = do
-          gate <- newDisarmedGate
-          withGatedService defaultConfig alwaysAdmitting (\p → case p of PointHandoff {} → True; _ → False) gate $ \svc → (\a → a `finally` openGate gate) $ do
-            (_, lease) <- openMain svc "main"
-            _ <- readCell svc lease (tile 1 1 1)
-            armGate gate
-            _ <- removeCell' svc lease (tile 1 1 1)
-            awaitReached gate
-            void (act svc)
-            openGate gate
-            waitFor (inspectCensusSTM svc >>= \census → check (null (runningHandoffs (censusRunning census))))
-            usageOf svc `shouldReturn` []
-    it "is recorded while the transfer runs, and the honest model charges it" $
-      atHandoff $ \svc → do
+  -- (the baseline's 'a handoff duplicate': after a removal commits the owner used to copy the
+  -- region's retained changes, 64 bytes, to transfer them. A backed commit retains nothing and
+  -- confirms its zero-byte handoff in its decision, so the property the oracle now holds is that no
+  -- duplicate exists, and its control is a model that charges one.)
+  describe "no handoff duplicate" $ do
+    let afterCommit act = withService defaultConfig $ \svc → do
+          (_, lease) <- openMain svc "main"
+          _ <- readCell svc lease (tile 1 1 1)
+          _ <- removeCell' svc lease (tile 1 1 1)
+          void (act svc)
+          usageOf svc `shouldReturn` []
+    it "is held after a committed removal, and the honest model charges none" $
+      afterCommit $ \svc → do
         (_, held, charged) <- look svc
-        map hhDuplicate (heldHandoffs held) `shouldBe` [64]
-        [d | r ← cRegions charged, Just d ← [crDuplicate r]] `shouldBe` [64]
+        [d | r ← cRegions charged, Just d ← [crDuplicate r]] `shouldBe` []
         disagreements held charged `shouldBe` []
-    it "fails the comparison when the model's 64-byte duplicate is zeroed" $
-      atHandoff $ \svc → do
+    it "fails the comparison when the model charges a 64-byte duplicate the owner never holds" $
+      afterCommit $ \svc → do
         (_, held, charged) <- look svc
-        let zeroed =
+        let duplicated =
               charged
-                { cRegions = [r {crDuplicate = fmap (const 0) (crDuplicate r)} | r ← cRegions charged]
-                , cStaging = lessOccupied 64 (cStaging charged)
+                { cRegions = [r {crDuplicate = Just 64} | r ← cRegions charged]
+                , cStaging = (cStaging charged) {ledgerOccupied = ledgerOccupied (cStaging charged) + 64}
                 }
-            found = disagreements held zeroed
-        mentions "handoff duplicate" found `shouldBe` True
+            found = disagreements held duplicated
+        mentions "never transfers" found `shouldBe` True
         mentions "staging bank occupied" found `shouldBe` True
-        -- and when the model charges none at all
-        mentions "charges none" (disagreements held charged {cRegions = [r {crDuplicate = Nothing} | r ← cRegions charged]}) `shouldBe` True
 
   -- A preparation: the owner stages a removal; the request's record and reservations must
   -- be in the model for as long as it runs.
@@ -354,17 +347,16 @@ spec = describe "The accounting oracle and its controls" $ do
       later `shouldBe` earlier
       settleChecks svc
 
-  -- The accounting rule does not relax release: whatever conservative excess an arena was
-  -- charged (coalescing edits are charged more than they hold) is returned when the arena
-  -- retires, and no charge outlives its holder.
-  it "returns every account of an arena with coalesced edits when the arena retires" $
+  -- The accounting rule does not relax release: no charge outlives its holder. (The baseline's
+  -- 'with coalesced edits' also required the live arena to be charged more than it held; the backed
+  -- service retains no edit, so the live arena is charged nothing and holds nothing for them.)
+  it "returns every account of an arena with committed edits when the arena retires" $
     withService defaultConfig $ \svc → do
       (_, lease) <- openMain svc "main"
       _ <- readCell svc lease (tile 1 1 0)
       forM_ [tile 1 1 0, tile 1 1 2, tile 1 1 1] (void . removeCell' svc lease)
       (model, census) <- snap svc
-      -- charged more than held while the arena lives (the monotone, conservative charge) ...
-      zipWith (>) [arenaRetainedBytes a | a ← modelArenas model] (map censusRetainedBytes (censusArenas census)) `shouldBe` [True]
+      ([arenaRetainedBytes a | a ← modelArenas model], map censusRetainedBytes (censusArenas census)) `shouldBe` ([0], [0])
       releaseLease svc lease >>= (`shouldBe` Right ())
       -- ... and all of it returned when the arena has retired.
       waitFor $ do
@@ -372,7 +364,7 @@ spec = describe "The accounting oracle and its controls" $ do
         check (null (modelArenas m) && and [ledgerOccupied (bankLedger m b) == 0 && ledgerReserved (bankLedger m b) == 0 | b ← [ResidentBank, EditBank, StagingBank]])
       (m, census') <- snap svc
       [slotInUse m s | s ← allSlots] `shouldBe` map (const 0) allSlots
-      (length (censusArenas census'), null (runningJobs (censusRunning census')), null (runningHandoffs (censusRunning census'))) `shouldBe` (0, True, True)
+      (length (censusArenas census'), null (runningJobs (censusRunning census'))) `shouldBe` (0, True)
       usageDisagreements census' m `shouldBe` []
       settleChecks svc
   where
