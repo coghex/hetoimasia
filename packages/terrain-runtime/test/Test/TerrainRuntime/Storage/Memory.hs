@@ -29,7 +29,6 @@
 -- ledger's node (an entry and a closing record), the list cell and the grant (a kept failure).
 module Test.TerrainRuntime.Storage.Memory (spec, spec2, spec3, spec4, floorSpec, rulesSpec, noiseFloor, signalMultiple) where
 
-import Test.TerrainRuntime.Output (printLine)
 import Control.Concurrent.STM (atomically)
 import Control.Exception (SomeException, evaluate, try)
 import Control.Monad (forM, forM_, replicateM, void, when)
@@ -189,10 +188,10 @@ floorSpec = describe "Storage backend: the live-heap reading's noise floor" $ se
         _ ← closeBacking (envSvc env) b
         c ← live
         pure (fromIntegral c - fromIntegral a ∷ Double)
-      printLine ("memory floor | two settled readings, nothing between | median of batch maxima " <> show (round aaMedian ∷ Integer))
-      printLine ("memory floor | the floor of this measurement (the larger of the two series' medians of batch maxima) " <> show (round fl ∷ Integer) <> " | the LARGEST single difference of any sample " <> show (round worst ∷ Integer) <> " | readings discarded as artifacts of a minor collection " <> show discarded)
-      printLine ("memory floor | around an open and close (observation: it leaves garbage a later collection frees) | min " <> show (round (minimum oc) ∷ Integer) <> " max " <> show (round (maximum oc) ∷ Integer))
-      printLine ("memory floor | the floor every asserted row must beat " <> show (round signalMultiple ∷ Integer) <> " times | " <> show (round theFloor ∷ Integer))
+      putStrLn ("memory floor | two settled readings, nothing between | median of batch maxima " <> show (round aaMedian ∷ Integer))
+      putStrLn ("memory floor | the floor of this measurement (the larger of the two series' medians of batch maxima) " <> show (round fl ∷ Integer) <> " | the LARGEST single difference of any sample " <> show (round worst ∷ Integer) <> " | readings discarded as artifacts of a minor collection " <> show discarded)
+      putStrLn ("memory floor | around an open and close (observation: it leaves garbage a later collection frees) | min " <> show (round (minimum oc) ∷ Integer) <> " max " <> show (round (maximum oc) ∷ Integer))
+      putStrLn ("memory floor | the floor every asserted row must beat " <> show (round signalMultiple ∷ Integer) <> " times | " <> show (round theFloor ∷ Integer))
 
 -- | The rule that no row passes vacuously, shown on values: a measurement of zero or below, and a signal below
 -- 'signalMultiple' times the floor, each FAIL the row.
@@ -301,7 +300,7 @@ checkSignal ∷ String → Int → Double → Expectation
 checkSignal name n m = do
   let signal = m * fromIntegral n
       need = neededSignal
-  printLine ("memory signal | " <> name <> " | instances " <> show n <> " | signal " <> show (round signal ∷ Integer) <> " | needed " <> show (round need ∷ Integer) <> " | floor " <> show (round theFloor ∷ Integer))
+  putStrLn ("memory signal | " <> name <> " | instances " <> show n <> " | signal " <> show (round signal ∷ Integer) <> " | needed " <> show (round need ∷ Integer) <> " | floor " <> show (round theFloor ∷ Integer))
   m `shouldSatisfy` (> 0)
   signal `shouldSatisfy` (>= need)
 
@@ -370,11 +369,11 @@ medianOf name n sample = do
       let xs' = xs <> [x]
       case (if length xs' >= minSamples then establish n xs' else Nothing) of
         Just (v, agreeing) → do
-          printLine ("memory samples | " <> name <> " | " <> show (map (round ∷ Double → Integer) xs') <> " | needed " <> show (length xs') <> " | agreeing " <> show (length agreeing) <> " | value " <> show (round v ∷ Integer))
+          putStrLn ("memory samples | " <> name <> " | " <> show (map (round ∷ Double → Integer) xs') <> " | needed " <> show (length xs') <> " | agreeing " <> show (length agreeing) <> " | value " <> show (round v ∷ Integer))
           pure v
         Nothing
           | length xs' >= maxSamples → do
-              printLine ("memory samples | " <> name <> " | " <> show (map (round ∷ Double → Integer) xs') <> " | needed " <> show (length xs') <> " | agreeing none | UNSTABLE")
+              putStrLn ("memory samples | " <> name <> " | " <> show (map (round ∷ Double → Integer) xs') <> " | needed " <> show (length xs') <> " | agreeing none | UNSTABLE")
               expectationFailure ("UNSTABLE: the samples of " <> name <> " have no agreeing majority after " <> show (length xs') <> ": " <> show xs')
               pure 0
           | otherwise → go xs'
@@ -393,7 +392,7 @@ sound name n0 at = go n0 (0 ∷ Int)
 -- | One row of the table: what is retained, the charge that pays for it, the measured bytes, asserted within it.
 row ∷ String → Word64 → Double → Expectation
 row name charge measured = do
-  printLine ("memory row | " <> name <> " | measured " <> show (round measured ∷ Integer) <> " | charged " <> show charge)
+  putStrLn ("memory row | " <> name <> " | measured " <> show (round measured ∷ Integer) <> " | charged " <> show charge)
   measured `shouldSatisfy` (<= fromIntegral charge)
 
 -- ---------------------------------------------------------------------------
@@ -519,7 +518,7 @@ spec = describe "Storage backend: the accounted job record is measured" $ settle
       held ← forM [1, 2] (\i → submitRead (envSvc env) b ExplicitWork (hCfg h0) (PageNo i) 1 ReadProbe >>= either (fail . show) pure)
       awaitReached g 2
       (readCost, ts) ← perJob 8 (\i → submitRead (envSvc env) b ExplicitWork (hCfg h0) (PageNo (fromIntegral (1000 + i * 300))) 256 ReadValidated)
-      printLine ("memory observation | eight queued reads in the service, per record | " <> show (round readCost ∷ Integer) <> " | not asserted: signal below the floor")
+      putStrLn ("memory observation | eight queued reads in the service, per record | " <> show (round readCost ∷ Integer) <> " | not asserted: signal below the floor")
       openGate g
       forM_ (held <> ts) (awaitOutcome env)
 
@@ -532,7 +531,7 @@ spec = describe "Storage backend: the accounted job record is measured" $ settle
       held ← forM [1, 2 ∷ Int] (\i → submitOpen (envSvc env) ExplicitWork (spec' i) >>= either (fail . show) pure)
       awaitReached g 2
       (opens, ts) ← perJob 8 (\i → submitOpen (envSvc env) ExplicitWork (spec' (i + 2)))
-      printLine ("memory observation | eight queued opens in the service, per record | " <> show (round opens ∷ Integer) <> " | not asserted: signal below the floor")
+      putStrLn ("memory observation | eight queued opens in the service, per record | " <> show (round opens ∷ Integer) <> " | not asserted: signal below the floor")
       openGate g
       forM_ (held <> ts) (awaitOutcome env)
 
@@ -589,7 +588,7 @@ spec2 = describe "Storage backend: every other accounted figure is measured" $ s
         _ ← closeBacking (envSvc env) b
         pure (fromIntegral heapOpen - fromIntegral heapBefore ∷ Double)
       _ ← closeBacking (envSvc env) warm
-      printLine ("memory observation | an open backing in the service, fifteen samples | min " <> show (round (minimum samples) ∷ Integer) <> " max " <> show (round (maximum samples) ∷ Integer) <> " | not asserted: the signal of one backing is below the floor")
+      putStrLn ("memory observation | an open backing in the service, fifteen samples | min " <> show (round (minimum samples) ∷ Integer) <> " max " <> show (round (maximum samples) ∷ Integer) <> " | not asserted: the signal of one backing is below the floor")
 
 spec3 ∷ Spec
 spec3 = describe "Storage backend: every retained structure is charged and measured at its largest" $ settleFloor $ do
@@ -681,7 +680,7 @@ spec3 = describe "Storage backend: every retained structure is charged and measu
       let modelled = recordModel + report
       checkSignal ("service: " <> label) k perJobBytes
       row ("service, finished untaken write report (" <> label <> "), per job, " <> show k <> " held at once, the test's own pages dropped") (jobCharge' maxIoPages) perJobBytes
-      printLine ("memory model | write report (" <> label <> ") | service " <> show (round perJobBytes ∷ Integer) <> " | standalone record + report " <> show (round modelled ∷ Integer))
+      putStrLn ("memory model | write report (" <> label <> ") | service " <> show (round perJobBytes ∷ Integer) <> " | standalone record + report " <> show (round modelled ∷ Integer))
       -- the model must not drift from the service: within 15 percent either way
       perJobBytes `shouldSatisfy` (<= modelled * 1.15)
       perJobBytes `shouldSatisfy` (>= modelled * 0.85)
@@ -707,15 +706,15 @@ spec3 = describe "Storage backend: every retained structure is charged and measu
       atFirst ← replicateM 20 (heldAtPage 0)
       let sorted xs = Data.List.sort xs
           med xs = sorted xs !! (length xs `div` 2)
-      printLine ("memory observation | running write held at its first page (the record and the worker, no results), 20 readings | min " <> show (round (minimum atFirst) ∷ Integer) <> " median " <> show (round (med atFirst) ∷ Integer) <> " max " <> show (round (maximum atFirst) ∷ Integer))
-      printLine ("memory observation | running write held at its last page (the record, the worker and 255 results), 20 readings | min " <> show (round (minimum atLast) ∷ Integer) <> " median " <> show (round (med atLast) ∷ Integer) <> " max " <> show (round (maximum atLast) ∷ Integer))
+      putStrLn ("memory observation | running write held at its first page (the record and the worker, no results), 20 readings | min " <> show (round (minimum atFirst) ∷ Integer) <> " median " <> show (round (med atFirst) ∷ Integer) <> " max " <> show (round (maximum atFirst) ∷ Integer))
+      putStrLn ("memory observation | running write held at its last page (the record, the worker and 255 results), 20 readings | min " <> show (round (minimum atLast) ∷ Integer) <> " median " <> show (round (med atLast) ∷ Integer) <> " max " <> show (round (maximum atLast) ∷ Integer))
       -- WHAT THE WORKER HOLDS THAT THE MODEL DOES NOT: the harness's own log of native calls (the probe records every one:
       -- 255 writes by the last page). Its per-entry cost is measured as a standalone value and taken off the difference.
       perLogEntry ← sound "the probe's log entry (a native write)" 200 (\n → heldAdded n (holdLive [OpWriteAt (fromIntegral i * 4096) 4096 | i ← [1 .. n]] length))
       let resultsByDifference = maximum atLast - maximum atFirst
           logShare = perLogEntry * fromIntegral (maxIoPages - 1)
-      printLine ("memory observation | the 255 results by difference " <> show (round resultsByDifference ∷ Integer) <> " | less the probe's own log of the 255 native writes " <> show (round logShare ∷ Integer) <> " | leaves " <> show (round (resultsByDifference - logShare) ∷ Integer) <> " | the standalone model of the results " <> show (round (fromIntegral (length (resultsOf 1)) * (64 ∷ Double)) ∷ Integer))
-      printLine ("memory observation | the model of the 255 results (standalone, signal above the floor) | " <> show (round (fromIntegral (length (resultsOf 1)) * (64 ∷ Double)) ∷ Integer) <> " | the spread of the in-service readings of one state is " <> show (round (maximum atLast - minimum atLast) ∷ Integer) <> ": not a measurement of the results")
+      putStrLn ("memory observation | the 255 results by difference " <> show (round resultsByDifference ∷ Integer) <> " | less the probe's own log of the 255 native writes " <> show (round logShare ∷ Integer) <> " | leaves " <> show (round (resultsByDifference - logShare) ∷ Integer) <> " | the standalone model of the results " <> show (round (fromIntegral (length (resultsOf 1)) * (64 ∷ Double)) ∷ Integer))
+      putStrLn ("memory observation | the model of the 255 results (standalone, signal above the floor) | " <> show (round (fromIntegral (length (resultsOf 1)) * (64 ∷ Double)) ∷ Integer) <> " | the spread of the in-service readings of one state is " <> show (round (maximum atLast - minimum atLast) ∷ Integer) <> ": not a measurement of the results")
       -- an OBSERVATION: nothing here is asserted (the readings of one state step by about one 32 KiB stack chunk from one
       -- repeat to the next: see the distribution in the repeat runs)
 
@@ -764,7 +763,7 @@ spec4 = describe "Storage backend: what the service retains of what it is handed
       heapAfter ← live
       forM_ ts (awaitOutcome env)
       pure ((fromIntegral heapAfter - fromIntegral heapBefore) / fromIntegral k ∷ Double)
-    printLine ("memory retention | finished untaken open, a 48-byte slice of a 2 MiB buffer, per job, " <> show k <> " held at once | " <> show (round perJobBytes ∷ Integer) <> " | charged " <> show jobRecordBytes)
+    putStrLn ("memory retention | finished untaken open, a 48-byte slice of a 2 MiB buffer, per job, " <> show k <> " held at once | " <> show (round perJobBytes ∷ Integer) <> " | charged " <> show jobRecordBytes)
     retention "finished untaken open" k perJobBytes (fromIntegral jobRecordBytes)
 
   it "a directory that is a short slice of a large buffer costs the copy and not the buffer: K queued opens" $ do
@@ -779,7 +778,7 @@ spec4 = describe "Storage backend: what the service retains of what it is handed
       openGate g
       forM_ (held <> ts) (awaitOutcome env)
       pure ((fromIntegral heapAfter - fromIntegral heapBefore) / fromIntegral k ∷ Double)
-    printLine ("memory retention | queued open, a 48-byte slice of a 2 MiB buffer, per job, " <> show k <> " queued | " <> show (round perJobBytes ∷ Integer) <> " | charged " <> show jobRecordBytes)
+    putStrLn ("memory retention | queued open, a 48-byte slice of a 2 MiB buffer, per job, " <> show k <> " queued | " <> show (round perJobBytes ∷ Integer) <> " | charged " <> show jobRecordBytes)
     retention "queued open" k perJobBytes (fromIntegral jobRecordBytes)
 
   it "a qualified-filesystem name that is a short slice of a large buffer costs the copy: K configurations held at once" $ do
@@ -795,7 +794,7 @@ spec4 = describe "Storage backend: what the service retains of what it is handed
       heapAfter ← live
       _ ← evaluate (sum (map (length . scQualified) cs))
       pure ((fromIntegral heapAfter - fromIntegral heapBefore) / fromIntegral k ∷ Double)
-    printLine ("memory retention | storage configuration, two 4-byte names viewed from 2 MiB buffers, per configuration, " <> show k <> " held | " <> show (round perConfig ∷ Integer))
+    putStrLn ("memory retention | storage configuration, two 4-byte names viewed from 2 MiB buffers, per configuration, " <> show k <> " held | " <> show (round perConfig ∷ Integer))
     retention "configuration" k perConfig 1024
 
   it "a filesystem name that is a short slice of a large buffer (a mount table's text) costs the copy: K profiles held at once" $
@@ -814,7 +813,7 @@ spec4 = describe "Storage backend: what the service retains of what it is handed
         heapAfter ← live
         _ ← evaluate (sum (map (BS.length . vpFilesystem) ps))
         pure ((fromIntegral heapAfter - fromIntegral heapBefore) / fromIntegral k ∷ Double)
-      printLine ("memory retention | volume profile, a 4-byte filesystem name viewed from a 2 MiB buffer, per profile, " <> show k <> " held | " <> show (round perProfile ∷ Integer))
+      putStrLn ("memory retention | volume profile, a 4-byte filesystem name viewed from a 2 MiB buffer, per profile, " <> show k <> " held | " <> show (round perProfile ∷ Integer))
       -- the copy of four bytes and the profile's own words: a few hundred bytes, never the buffer
       retention "volume profile" k perProfile 1024
       _ ← unlinkFile productionSeam (BC.pack dir) (crName c)
@@ -835,7 +834,7 @@ smallestCopiedByteString = 64
 -- magnitude above the bound, and a 40,000-byte disagreement cannot hide megabytes), and the minimum above is what shows they measured at all.
 retention ∷ String → Int → Double → Double → Expectation
 retention name k perInstance bound = do
-  printLine ("memory retention signal | " <> name <> " | instances " <> show k <> " | signal " <> show (round (perInstance * fromIntegral k) ∷ Integer) <> " | needed by a sound row " <> show (round neededSignal ∷ Integer) <> " | minimum per instance " <> show (round smallestCopiedByteString ∷ Integer) <> " | bound per instance " <> show (round bound ∷ Integer))
+  putStrLn ("memory retention signal | " <> name <> " | instances " <> show k <> " | signal " <> show (round (perInstance * fromIntegral k) ∷ Integer) <> " | needed by a sound row " <> show (round neededSignal ∷ Integer) <> " | minimum per instance " <> show (round smallestCopiedByteString ∷ Integer) <> " | bound per instance " <> show (round bound ∷ Integer))
   perInstance `shouldSatisfy` (>= smallestCopiedByteString)
   perInstance `shouldSatisfy` (<= bound)
 

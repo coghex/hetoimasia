@@ -1,22 +1,30 @@
--- | Everything this package's test executables write to standard output goes through one 'Output': the records the examples
--- print and the report the runner's formatter writes.
+-- | The lines this package's routine and full-depth suites print to standard output, and the runner's formatter's report.
 --
--- Two writers share the handle: the examples ('printLine', from any thread, the parallel group's eight included) and the
--- runner's formatter, whose events run on its own thread and write an item's text and its newline as separate writes. A
--- guarantee about a shared handle has to hold against both, so there is one lock and one record of whether the handle is at a
--- line start:
+-- Two kinds of writer share the handle, and they are guarded differently.
 --
---   * 'printLine' writes its line, with its newline, as one write under the lock;
---   * 'guardFormatters' wraps every formatter the runner can select, so each formatter EVENT (a group header, an item's
---     result, the final report) runs under the same lock, to its end, and the event's formatter is known to end its events at a
---     line boundary ('boundaryFormatters', each event of which is shown in @docs/evidence/terrain/suite-budget/README.md@).
---     A formatter that is not known to (the @progress@ formatter writes a dot and no newline) leaves the handle mid-line
---     after an event, which the lock-held state records, and the next 'printLine' begins with a newline.
+--   * Through one 'Output' (a lock and a record of whether the handle is at a line start): every example of the parallel
+--     group, which runs beside the formatter and beside seven other examples, the suite's own sequential lines (the
+--     @RUNNER@, @PHASE@, @FIXTURE@, @MEMORY@, @DISCOVERY@, @REMOVAL@ and @KEYS@ lines), and the runner's formatter.
+--     'printLine' writes its line with its newline as one write under the lock, preceded by a newline when the formatter left
+--     the line open. 'guardFormatters' wraps every formatter the runner can select, so each formatter EVENT (a group header, an
+--     item's result, the final report) runs under the same lock, to its end (the format returns when the event has been
+--     written), and afterwards the record says the handle is at a line start for the formatters of 'boundaryFormatters', whose
+--     every event ends in a newline or writes nothing, and open for any other (the @progress@ formatter writes a dot and no
+--     newline). So neither writer can run inside the other's write, whatever the thread or the buffering mode, and a printed
+--     line starts at a line start; on a terminal it also clears the formatter's progress text on the line first.
+--   * Directly, with no lock: the sequential examples of the storage modules (@Test.TerrainRuntime.Storage.*@, #663's work), whose tests this change does not edit beyond placing them in the tiers. They are whole by the framework's
+--     order, not by a lock: a sequential item starts only after the reporting thread has written every earlier item's result
+--     ('Test.Hspec.Core.Runner.JobQueue.runSequentially' waits on a barrier that 'Test.Hspec.Core.Runner.Eval.reportItem'
+--     signals after the item's own start has been reported, and each event is synchronous: 'Test.Hspec.Core.Format.monadic'
+--     returns when the formatter has written it), so the formatter is idle until the item ends, and the isolation guard
+--     ("Test.TerrainRuntime.Isolation") keeps every parallel example from running beside it. The oracle
+--     ("Test.TerrainRuntime.OutputSpec") shows the case: sequential examples nested in describes, after a parallel group,
+--     writing with @putStrLn@, are whole at a line start under every formatter of 'boundaryFormatters'. The same cannot be said
+--     of the @progress@ formatter, whose dots leave the line open; a direct write then follows the dots.
 --
--- So a printed line starts at a line start and ends whole whatever the formatter, the buffering mode or the thread; on a
--- terminal it also clears the formatter's progress text on the line first. A line longer than the buffer (8 KiB) could be split
--- by the handle, and a line cut to fit would be a wrong record that looks right, so a line over 'maxLineChars' is never
--- printed: it fails the example that tries (each family line is a few hundred bytes).
+-- A line longer than the buffer (8 KiB) could be split by the handle, and a line cut to fit would be a wrong record that looks
+-- right, so a line over 'maxLineChars' is never printed through 'printLine': it fails the example that tries (each family
+-- line is a few hundred bytes).
 --
 -- State: the process's 'Output' (and any a test makes for itself) owns one lock and one flag, written only under the lock,
 -- for the life of the process; nothing resets or disposes them.

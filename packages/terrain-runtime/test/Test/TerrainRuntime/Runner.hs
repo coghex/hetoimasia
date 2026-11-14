@@ -1,7 +1,8 @@
 -- | The runner configuration every executable of this package runs its spec with: Hspec's own, with the processor-count job
 -- default ("Test.TerrainRuntime.Parallel") and every formatter guarded by the output lock
--- ("Test.TerrainRuntime.Output"). 'Main', the full-depth probe, the storage probe and the oracle of the printed lines
--- ("Test.TerrainRuntime.OutputSpec") all build their configuration here, so what the oracle runs is what the suite runs.
+-- ("Test.TerrainRuntime.Output"). 'Main', the full-depth probe and the oracle of the printed lines
+-- ("Test.TerrainRuntime.OutputSpec") all build their configuration here, so what the oracle runs is what the suite runs. The
+-- storage probe, a separate local probe of #663's work, keeps its own plain runner.
 module Test.TerrainRuntime.Runner
   ( suiteConfig
   , runSuite

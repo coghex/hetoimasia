@@ -230,7 +230,6 @@ test-suite terrain-storage-probe
     other-modules:
         Test.TerrainRuntime.Isolation
         Test.TerrainRuntime.Output
-        Test.TerrainRuntime.Runner
         Test.TerrainRuntime.Storage.Fixture
         Test.TerrainRuntime.Storage.Harness
         Test.TerrainRuntime.Storage.ProbeSpec
