@@ -100,6 +100,7 @@ import Hetoimasia.Terrain.Runtime.Backed.Probe
 import qualified Hetoimasia.Terrain.Runtime.Backed.Growth as Growth
 import Hetoimasia.Terrain.Runtime.Backed.Txn (Done (..), Io (..), Progress (..))
 import qualified Hetoimasia.Terrain.Runtime.Backed.Txn as Txn
+import qualified Hetoimasia.Terrain.Runtime.Backed.WriteProbe as WriteProbe
 import Hetoimasia.Terrain.Runtime.Internal.Content (Prepared (..))
 import Hetoimasia.Terrain.Runtime.Internal.Core
 import Hetoimasia.Terrain.Runtime.Internal.Types hiding (OwnerPhase (..))
@@ -680,6 +681,7 @@ data Contender
   | ContendRelease !RequestId !ArenaId
   | ContendDiscovery !ArenaId
   | ContendReclaim !ArenaId
+  | ContendWriteProbe !RequestId !ArenaId ![PageNo]
   deriving stock (Eq, Show)
 
 -- | The work that may take the slot now, in grant order: the eligible explicit removals (each
@@ -766,6 +768,13 @@ contenders st = do
         , creatorFresh arena sg → do
             eligible ← endpointEligible (reqEndpoint req)
             pure [ContendRelease rid aid | eligible]
+      -- and a retry's write probe (a maintenance-class transaction), unless the pause is for integrity
+      (CRetry, StagedPhase sg, Just (aid, arena))
+        | StagedWriteProbe pages ← stagedWork sg
+        , creatorFresh arena sg
+        , CondIntegrity `notElem` conditions (arenaStore arena) → do
+            eligible ← endpointEligible (reqEndpoint req)
+            pure [ContendWriteProbe rid aid pages | eligible]
       _ → pure []
     internalOf (aid, arena)
       -- an arena whose maintenance is a prerequisite offers it above and nothing else
@@ -809,6 +818,13 @@ grantSlot svc contender = do
     ContendRemoval rid aid tile → live aid $ \arena → txn aid arena (SlotRemoval rid) (removalPlanner (arenaEnv arena) (arenaStore arena) tile)
     ContendDiscovery aid → live aid $ \arena → txn aid arena SlotDiscovery (discoveryPlanner (arenaEnv arena) (arenaStore arena))
     ContendReclaim aid → live aid $ \arena → txn aid arena SlotReclaim (maintenancePlanner (arenaStore arena))
+    -- a write probe is a transaction: its worst-case credits are reserved like any other's
+    ContendWriteProbe rid aid pages → live aid $ \arena → case A.reserve A.Foreground (A.transactionCredits aid A.worstTransactionCharge) adm of
+      Left _ → pure False
+      Right (grant, adm') → do
+        writeTVar (serviceEditBank svc) adm'
+        writeTVar (serviceState svc) st {stateSlot = Just (SlotTask aid (SlotWriteProbe rid) (SlotProbe (WriteProbe.startWriteProbe (arenaStore arena) pages)) (Just grant) WakeNow False)}
+        pure True
 
 -- | Where a step left the slot's transaction, for the owner.
 data SlotEnd
@@ -822,6 +838,8 @@ data SlotEnd
     SlotGrowthReady !SlotTask !PreparedGrowth
   | -- | A growth ended without being committed; its slot is already released.
     SlotGrowthOver !SlotTask !Growth.GrowthEnd
+  | -- | A retry's write probe ended (its transaction abandoned); its slot and credits are already released.
+    SlotWriteProbeOver !SlotTask !WriteProbe.WriteResult
 
 -- | One step of the slot's transaction: a step of its run, or, when its request or arena has
 -- ended, a step of its cancellation (nothing is released until the job in flight has returned).
@@ -879,17 +897,30 @@ stepSlot svc = do
               Growth.GrowthPressed → do
                 mark ← atomically (notePressure svc >> pressureMark svc)
                 keep (WakeOn (pressureChanged svc mark)) >> pure SlotGoesOn
+          SlotProbe run → do
+            (store', run', progress) ←
+              if wanted
+                then WriteProbe.advanceWriteProbe io (closingOf st aid) store run
+                else WriteProbe.cancelWriteProbe io store run
+            let task' = task {slotRun = SlotProbe run'}
+                keep wake = atomically (readSt svc >>= \s0 → sameCommittedSTM aid s0 store' >> modifySt svc (\s → (putStore aid store' s) {stateSlot = Just task' {slotWake = wake}}))
+            case progress of
+              WriteProbe.WMore → keep WakeNow >> pure SlotGoesOn
+              WriteProbe.WBlocked wait → keep (WakeOn wait) >> pure SlotGoesOn
+              WriteProbe.WOver result → end store' task' (\t → SlotWriteProbeOver t result)
   where
     requestAlive st = \case
       SlotRemoval rid → Map.member rid (stateRequests st)
       SlotGrowth rid → Map.member rid (stateRequests st)
       SlotRelease rid → Map.member rid (stateRequests st)
+      SlotWriteProbe rid → Map.member rid (stateRequests st)
       SlotDiscovery → True
       SlotReclaim → True
     classOf = \case
       SlotRemoval _ → ExplicitWork
       SlotGrowth _ → ExplicitWork
       SlotRelease _ → ExplicitWork
+      SlotWriteProbe _ → ExplicitWork
       SlotDiscovery → MaintenanceWork
       SlotReclaim → MaintenanceWork
 
@@ -991,6 +1022,7 @@ backedInvariants st adm compileBank sn =
     slotTxnId t = case slotRun t of
       SlotTxn run → Txn.runTxnId run
       SlotGrow _ → Nothing
+      SlotProbe run → WriteProbe.writeProbeTxnId run
     stores = [(aid, arenaStore a) | (aid, a) ← Map.toList (stateArenas st)] <> [(aid, closingStore c) | (aid, c) ← Map.toList (stateClosing st)]
     held =
       sum (map arenaShared (Map.elems (stateArenas st)))

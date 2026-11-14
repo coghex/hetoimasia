@@ -143,6 +143,7 @@ library backed
         Hetoimasia.Terrain.Runtime.Backed.Probe
         Hetoimasia.Terrain.Runtime.Backed.Query
         Hetoimasia.Terrain.Runtime.Backed.Txn
+        Hetoimasia.Terrain.Runtime.Backed.WriteProbe
     build-depends:
         base >=4.22 && <4.23,
         bytestring >=0.12 && <0.13,
@@ -174,6 +175,7 @@ test-suite terrain-runtime-tests
         Test.TerrainRuntime.Backed.Held
         Test.TerrainRuntime.Backed.Loop
         Test.TerrainRuntime.Backed.Recovery
+        Test.TerrainRuntime.Store.WriteProbe
         Test.TerrainRuntime.Backed.Outcomes
         Test.TerrainRuntime.Backed.Pause
         Test.TerrainRuntime.Backed.Service

@@ -79,6 +79,7 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.Model
   , planDiscoveryWith
   , planMaintenanceWith
   , planMaintenance
+  , planWriteProbeFor
   , WindowRefusal (..)
   , storeWindow
   , providerAt
@@ -405,6 +406,11 @@ planEditWith bounds s win = planDeltaPinned bounds (sCfg s) (sIdent s) (sRoots s
 -- | Plan the reclamation of the oldest retired pages the readers no longer hold.
 planMaintenance ∷ Store → Window → Planned
 planMaintenance = planMaintenanceWith standardBounds
+
+-- | Plan an explicit retry's write probe of the pages whose write failed (see "Plan"'s
+-- 'planWriteProbe'): never published.
+planWriteProbeFor ∷ Store → [PageNo] → Window → Planned
+planWriteProbeFor s = planWriteProbe standardBounds (sCfg s) (sIdent s) (sRoots s) (pinnedRoots s)
 
 -- | 'planMaintenance' under given bounds.
 planMaintenanceWith ∷ Bounds → Store → Window → Planned

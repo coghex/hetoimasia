@@ -21,7 +21,7 @@ import Hetoimasia.Terrain.Coordinate (TileCoord)
 import Hetoimasia.Terrain.Runtime
 import Hetoimasia.Terrain.Runtime.Settlement
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Native (NativeOp (..))
-import Hetoimasia.Terrain.Runtime.Storage.Internal.Types (Errno (..))
+import Hetoimasia.Terrain.Runtime.Storage.Internal.Types (Errno (..), IoFailure (..))
 import Test.Hspec
 import Test.Support.Bounded (bounded)
 import Test.TerrainRuntime.Fixtures hiding (limitsWith)
@@ -71,6 +71,20 @@ withArena body = do
     waitFor (backedAtRestSTM svc >>= check)
     body probe svc lease
 
+-- | A write of this page's offset.
+writeAt ∷ Word64 → NativeOp → Bool
+writeAt off = \case OpWriteAt o _ → o == off; _ → False
+
+-- | A removal whose first page write fails, pausing the arena storage_io: the failing write's offset.
+failWrite ∷ H.Probe → Service → ArenaLease → IO Word64
+failWrite probe svc lease = do
+  H.addRule probe 1 isWrite (H.FailWith (Errno 5))
+  failed ← removeAt svc lease (tile 3 4 4) Nothing >>= expectRight >>= bounded . await svc
+  pausedOn svc lease `shouldReturn` [CondIo]
+  case failed of
+    Left (Failed (StorageFailed (FaultIo io))) | Just off ← ioOffset io → pure off
+    other → expectationFailure ("expected a write's storage_io, got " <> show other) >> fail "unreachable"
+
 -- | A read of the column that fails, pausing the arena storage_io.
 failRead ∷ Service → ArenaLease → IO ()
 failRead svc lease = do
@@ -101,15 +115,61 @@ spec = describe "Recovery decided like publication" $ do
       fmap (\a → (retriedCleared a, retriedRemaining a)) answer `shouldBe` Right ([], [CondIo])
       pausedOn svc lease `shouldReturn` [CondIo]
 
-  it "never certifies a failed write by reading its page back: the condition stays while reads succeed" $
+  it "re-tests a failed write by writing its page again: the condition stays while that page's write keeps failing, though reads succeed" $
     withArena $ \probe svc lease → do
-      H.addRule probe 1 isWrite (H.FailWith (Errno 5))
-      failed ← removeAt svc lease (tile 3 4 4) Nothing >>= expectRight >>= bounded . await svc
-      failed `shouldSatisfy` \case Left (Failed (StorageFailed (FaultIo _))) → True; _ → False
-      pausedOn svc lease `shouldReturn` [CondIo]
+      offset ← failWrite probe svc lease
+      -- every later write of that page fails too
+      H.addRule probe (-1) (writeAt offset) (H.FailWith (Errno 5))
       answer ← retryAnswer svc lease
       fmap (\a → (retriedCleared a, retriedRemaining a)) answer `shouldBe` Right ([], [CondIo])
       pausedOn svc lease `shouldReturn` [CondIo]
+
+  it "certifies a failed write once its page takes a write again, writing and reading it back without publishing anything, and edits commit again" $
+    withArena $ \probe svc lease → do
+      offset ← failWrite probe svc lease
+      H.clearEvents probe
+      answer ← retryAnswer svc lease
+      fmap (\a → (retriedCleared a, retriedRemaining a)) answer `shouldBe` Right ([CondIo], [])
+      -- the probe wrote the page and read it back
+      ops ← H.events probe
+      ([() | OpWriteAt o _ ← ops, o == offset], [() | OpReadAt o _ ← ops, o == offset]) `shouldSatisfy` (\(w, r) → not (null w) && not (null r))
+      pausedOn svc lease `shouldReturn` []
+      _ ← removeCell' svc lease (tile 3 4 3)
+      pure ()
+
+  it "keeps no more than eight failures of a condition, and then answers it remaining until the arena is closed, never probing it" $
+    withArena $ \probe svc lease → do
+      -- a second run in every column: the tree has more leaves
+      mapM_ (\(x, y) → removeCell' svc lease (tile x y 2)) [(x, y) | x ← [0 .. 15], y ← [0 .. 15]]
+      waitFor (backedAtRestSTM svc >>= check)
+      -- nine distinct pages, each one a column's read reads
+      paths ← mapM (\(x, y) → fmap (\ps → [(o, (x, y)) | o ← ps]) (pagesRead probe svc lease (tile x y 6))) [(x, y) | x ← [0, 3 .. 15], y ← [0, 3 .. 15]]
+      let distinct = take 9 (foldl (\acc (o, x) → if any ((== o) . fst) acc then acc else acc <> [(o, x)]) [] (concat paths))
+      length distinct `shouldBe` 9
+      mapM_ (\(o, x) → do
+                H.addRule probe 1 (readAt o) (H.FailWith (Errno 5))
+                failed ← cellAt svc lease (tile (fst x) (snd x) 6) >>= expectRight >>= bounded . await svc
+                failed `shouldSatisfy` \case Left (Failed (StorageFailed (FaultIo _))) → True; _ → False)
+        distinct
+      H.clearEvents probe
+      answer ← retryAnswer svc lease
+      fmap (\a → (retriedCleared a, retriedRemaining a, retriedUntilClosed a)) answer `shouldBe` Right ([], [CondIo], [CondIo])
+      -- nothing was probed
+      ops ← H.events probe
+      [o | OpReadAt o _ ← ops, o `elem` map fst distinct] `shouldBe` []
+      -- the arena stays readable
+      _ ← readCell svc lease (tile 9 9 9)
+      pausedOn svc lease `shouldReturn` [CondIo]
+
+  it "ends the owner with a defect when a retry's write probe meets a worker failure" $
+    withArena $ \probe svc lease → do
+      offset ← failWrite probe svc lease
+      H.addRule probe 1 (writeAt offset) H.Throw
+      host ← newHost True
+      _ ← okOf (retryWith svc (hostEndpoint svc Nothing host) lease)
+      bounded (awaitOwnerStopped svc)
+      inspectDefects svc >>= (`shouldSatisfy` (not . null))
+      settledOf host >>= (`shouldSatisfy` \case [Succeeded (ARetried _)] → False; _ → True)
 
   it "clears nothing for a retry whose host is not eligible, nor for one that is cancelled, and clears once one is answered" $
     withArena $ \probe svc lease → do

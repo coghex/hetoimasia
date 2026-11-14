@@ -175,6 +175,7 @@ import qualified Hetoimasia.Terrain.Runtime.Backed.Probe as Probe
 import qualified Hetoimasia.Terrain.Runtime.Backed.Query as Query
 import qualified Hetoimasia.Terrain.Runtime.Backed.Growth as Growth
 import qualified Hetoimasia.Terrain.Runtime.Backed.Txn as Txn
+import qualified Hetoimasia.Terrain.Runtime.Backed.WriteProbe as WriteProbe
 import Hetoimasia.Terrain.Runtime.Internal.Content (Prepared)
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Service (Backing, StorageService, Ticket)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Admission (Admission, EditBankError, EditBankSpec, Grant)
@@ -292,6 +293,10 @@ data RetryAnswer = RetryAnswer
   { retriedIncarnation ∷ !ArenaId
   , retriedCleared ∷ ![Condition]
   , retriedRemaining ∷ ![Condition]
+  , -- | The remaining conditions no retry can clear: a failure that caused one was not kept (past the
+    -- bound of kept failures, or with no page), so it cannot be re-tested. The arena stays paused,
+    -- and readable, until it is closed.
+    retriedUntilClosed ∷ ![Condition]
   }
   deriving stock (Eq, Show)
 
@@ -620,6 +625,10 @@ data StagedWork
     -- with the host's eligibility, so a retry that is cancelled, not eligible or whose settlement
     -- fails clears nothing.
     StagedRetry ![Condition]
+  | -- | An explicit retry whose recorded failures include writes: its write probe of those pages takes
+    -- the session's slot (it is a transaction, never published) when its host is eligible; the retry
+    -- is prepared again on the probe's result.
+    StagedWriteProbe ![PageNo]
 
 data ReqPhase
   = Waiting
@@ -982,12 +991,15 @@ data SlotWork
   | SlotGrowth !RequestId
   | -- | A retry's release of a pending extra.
     SlotRelease !RequestId
+  | -- | A retry's write probe of the pages whose write failed (a probe-only transaction, never published).
+    SlotWriteProbe !RequestId
   deriving stock (Eq, Show)
 
 -- | What runs in the slot: a store transaction, or a creator's growth (serialised with mutation).
 data SlotRun
   = SlotTxn !Txn.Run
   | SlotGrow !Growth.GrowthRun
+  | SlotProbe !WriteProbe.WriteRun
 
 -- | The session's ONE mutating store transaction (P-15): its arena, what it is for, the run
 -- that drives it, the edit-bank credits of its RAM (taken at the grant from the plan's own
@@ -1123,6 +1135,10 @@ data St = St
     -- would change something, so the suite's oracle requires this to stay empty. Written by the owner
     -- loop only; never reset.
     stateIdleRepeats ∷ ![Text]
+  , -- | Each explicit retry's write-probe result, with the basis it was prepared on: True when every
+    -- page it probed took the write. Written by the owner when the probe ends; read (and only while the
+    -- basis still holds) when the retry is prepared again; deleted when the retry finishes.
+    stateWriteProbed ∷ !(Map RequestId (CreatorBasis, Bool))
   , -- | The fault epoch: moved by every failure a pause adds to its record ('faultGeneration').
     -- Written by the owner only; never reset.
     stateFaultEpoch ∷ !Word64
@@ -1180,6 +1196,7 @@ initialState config limits =
     , stateNeedsMaintenance = Set.empty
     , stateIdleRepeats = []
     , stateFaultEpoch = 0
+    , stateWriteProbed = Map.empty
     , stateClosing = Map.empty
     , stateLoadJobs = Map.empty
     , stateNextSource = 1

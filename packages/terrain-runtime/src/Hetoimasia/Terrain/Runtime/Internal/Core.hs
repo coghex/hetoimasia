@@ -278,6 +278,8 @@ permittedWhilePaused work arena = case conditions (arenaStore arena) of
     SlotGrowth _ → True
     SlotRelease _ → True
     SlotReclaim → CondIntegrity `notElem` conds
+    -- a write probe is a maintenance-class transaction: it re-tests what paused the arena for I/O
+    SlotWriteProbe _ → CondIntegrity `notElem` conds
     SlotRemoval _ → False
     SlotDiscovery → False
 

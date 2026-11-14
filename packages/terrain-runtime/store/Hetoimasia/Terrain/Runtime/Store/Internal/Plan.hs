@@ -93,6 +93,8 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.Plan
   , planDeltaPinned
   , planReclaimWith
   , planReclaimPinned
+  , planWriteProbe
+  , writeProbePattern
   , planReclaim
   , freePool
   , availablePages
@@ -110,7 +112,7 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.Plan
 import Data.ByteString (ByteString)
 import Data.ByteString.Short (fromShort)
 import qualified Data.ByteString as BS
-import Control.Monad (foldM)
+import Control.Monad (filterM, foldM)
 import Data.Int (Int64)
 import Data.List (nub, sort)
 import Data.Maybe (fromMaybe, isJust, isNothing)
@@ -153,7 +155,12 @@ import Hetoimasia.Terrain.Runtime.Store.Internal.Tree
 data TxClass = Ordinary | Maintenance
   deriving stock (Eq, Show)
 
-data PlanKind = KindCandidate | KindReclaim
+data PlanKind
+  = KindCandidate
+  | KindReclaim
+  | -- | An explicit retry's write probe: it writes 'writeProbePattern' to pages the committed roots
+    -- hold free and is never published (see 'planWriteProbe').
+    KindWriteProbe
   deriving stock (Eq, Show)
 
 -- | What a plan was made against: the store, the committed version and the
@@ -1388,3 +1395,62 @@ refusalToPlan ∷ Refusal → PlanRefusal
 refusalToPlan r = case r of
   Corrupt i → Integrity (DiscoveryCorrupt i)
   other → Invalid (DiscoveryRefusal other)
+
+-- ---------------------------------------------------------------------------
+-- Write probe
+
+-- | What a write probe writes to a page: a pattern no store page begins with, naming the page, so a
+-- read-back proves the page took THIS write.
+writeProbePattern ∷ PageNo → ByteString
+writeProbePattern (PageNo n) = BS.take pageSize (BS.concat (replicate (pageSize `div` 16 + 1) (BS.append (BS.pack [0x48, 0x54, 0x57, 0x50, 0x52, 0x4f, 0x42, 0x45]) (be64 n))))
+
+-- | Plan an explicit retry's WRITE PROBE of pages whose write failed (requirement 9's "write probe as
+-- applicable"): of the pages asked about, those the committed roots still hold FREE (a loose page, a
+-- page inside a free extent of the allocator tree, or a page of the untouched tail), proven owned by
+-- nobody but the allocator (no pinned version reaches them, none is retired, none is free twice), each
+-- written 'writeProbePattern'. A maintenance-class plan (allowed while the arena is paused for I/O),
+-- serialized with every mutation by the slot, that the owner reads back and then ABORTS: it is never
+-- published, and its pages stay free.
+--
+-- A page asked about that is no longer free has been claimed and committed since: a write of it
+-- succeeded after the failure (a failed one records a new failure, which makes the probe stale), so
+-- it needs no probe. 'NoWork' when no page asked about is free.
+planWriteProbe ∷ Bounds → StoreConfig → StoreIdentity → Roots → [Pins] → [PageNo] → Window → Planned
+planWriteProbe bounds cfg ident roots pins pages win0 = settle $ do
+  checkWindow bounds ident roots win
+  checkCounters roots
+  let candidates = [pg | pg ← nub pages, not (Set.member pg looseSet), not (inTail pg)]
+  (inExtents, _) ← phase (newEdit overlayBudgetBookkeeping win) (filterM inExtent candidates)
+  let fromLoose = [pg | pg ← nub pages, Set.member pg looseSet]
+      fromExtents = [pg | pg ← candidates, pg `elem` inExtents]
+      fromTail = [pg | pg ← nub pages, not (Set.member pg looseSet), inTail pg]
+      proven = fromLoose ++ fromExtents
+      free = proven ++ fromTail
+  if null free
+    then pure Nothing
+    else do
+      -- a tail page was never numbered: no version can reach it
+      _ ← if null proven then pure (newEdit overlayBudgetBookkeeping win) else provenFree bounds fp cfg roots pins win (Set.fromList fromLoose) proven (newEdit overlayBudgetBookkeeping win)
+      let n = length free
+          claimed = n - length fromLoose
+          measure = Measure n 0 0 0 0 0 0 claimed (length fromLoose) 0 0 (RamCharge 0 0 0 0 0 0 0) 0 0 0
+          authority = hAuthority (rHeader roots)
+      pure . Just $
+        Plan
+          { plIdentity = PlanIdentity ident (rVersion roots) authority
+          , plClass = Maintenance
+          , plKind = KindWriteProbe
+          , plPages = [(pg, writeProbePattern pg) | pg ← free]
+          , plNext = roots
+          , plEffects = Effects False False False authority (rVersion roots)
+          , plMeasure = measure
+          }
+  where
+    fp = fingerprintOf ident roots pins
+    win = windowFactsFor fp (windowTrust (rootTrust roots ++ concatMap pinTrust pins) (windowBelow (rHw roots) win0))
+    looseSet = Set.fromList (rLoose roots)
+    inTail (PageNo n) = n >= rHw roots && n < cfgUsablePages cfg
+    inExtent (PageNo n) = do
+      ext ← floorKey TreeFree (fmap Disk (rFree roots)) (be64 n) >>= neighbour
+      pure (maybe False (\(st, l) → st <= n && n < st + l) ext)
+

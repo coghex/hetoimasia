@@ -44,6 +44,7 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.Protocol
   , removalPlanner
   , discoveryPlanner
   , maintenancePlanner
+  , writeProbePlanner
 
     -- * The driver
   , Driver
@@ -72,7 +73,7 @@ import Hetoimasia.Terrain.Coordinate (TileCoord)
 import Hetoimasia.Terrain.Discovery (Env, worstEditReads)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Admission (Failure, classifyPlan)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Format (PageError, PageNo, maxTxnPages)
-import Hetoimasia.Terrain.Runtime.Store.Internal.Model (Store, planDiscovery, planMaintenance, planRemoval, storeConfig, storeWindow)
+import Hetoimasia.Terrain.Runtime.Store.Internal.Model (Store, planDiscovery, planMaintenance, planRemoval, planWriteProbeFor, storeConfig, storeWindow)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan (CapacityWhy (..), Plan, PlanRefusal (..), Planned (..))
 import Hetoimasia.Terrain.Runtime.Store.Internal.State (cfgTotalPages, maxReclaimPages)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Tree (Facts, Window, reduceWork, windowCheckpoint, windowInsert, windowPageNumbers, windowProbe, windowReadFactCount, windowSize, windowWork)
@@ -93,6 +94,10 @@ discoveryPlanner env store window = planDiscovery env store window
 -- | One reclamation transaction.
 maintenancePlanner ∷ Store → Planner
 maintenancePlanner store window = planMaintenance store window
+
+-- | An explicit retry's write probe of the pages whose write failed (never published).
+writeProbePlanner ∷ Store → [PageNo] → Planner
+writeProbePlanner store pages window = planWriteProbeFor store pages window
 
 -- | One planning attempt against one committed version of one store.
 data Driver = Driver

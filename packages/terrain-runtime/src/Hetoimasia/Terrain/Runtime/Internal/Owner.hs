@@ -64,6 +64,7 @@ import Hetoimasia.Terrain.Runtime.Internal.Publish
 import Hetoimasia.Terrain.Runtime.Internal.Types
 import qualified Hetoimasia.Terrain.Runtime.Store.Internal.Admission as A
 import qualified Hetoimasia.Terrain.Runtime.Backed.Growth as Growth
+import qualified Hetoimasia.Terrain.Runtime.Backed.WriteProbe as WriteProbe
 import Hetoimasia.Terrain.Runtime.Backed.Fault (StorageFault (..))
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Service (ReadMode (..))
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Service (PreparedGrowth)
@@ -175,6 +176,7 @@ slotHoldsJob ∷ SlotRun → Bool
 slotHoldsJob = \case
   SlotTxn run → isJust (runTicket run)
   SlotGrow run → isJust (Growth.growthTicket run)
+  SlotProbe run → isJust (WriteProbe.writeProbeTicket run)
 
 -- | What a step did: whether the owner goes on, and whether it changed anything.
 data Step = Step !Bool !Bool
@@ -381,10 +383,12 @@ backedTasks st = [t | Just t ← tasks]
     slotDraining = \case
       SlotTxn run → runDraining run
       SlotGrow run → growthDraining run
+      SlotProbe run → WriteProbe.writeProbeDraining run
     slotAlive = \case
       SlotRemoval rid → alive rid
       SlotGrowth rid → alive rid
       SlotRelease rid → alive rid
+      SlotWriteProbe rid → alive rid
       SlotDiscovery → True
       SlotReclaim → True
 
@@ -419,6 +423,7 @@ readsYieldToGrant st adm sn = do
       ContendRemoval _ a _ → Just a
       ContendDiscovery a → Just a
       ContendReclaim a → Just a
+      ContendWriteProbe _ a _ → Just a
       ContendGrowth {} → Nothing
       ContendRelease {} → Nothing
 
@@ -439,6 +444,7 @@ grantStuck st adm sn
       ContendRemoval _ a _ → Just a
       ContendDiscovery a → Just a
       ContendReclaim a → Just a
+      ContendWriteProbe _ a _ → Just a
       ContendGrowth {} → Nothing
       ContendRelease {} → Nothing
 
@@ -457,6 +463,7 @@ grantable st adm = do
       ContendRemoval _ a _ → txnFits a
       ContendDiscovery a → txnFits a
       ContendReclaim a → txnFits a
+      ContendWriteProbe _ a _ → txnFits a
     txnFits a = either (const False) (const True) (A.reserve A.Foreground (A.transactionCredits a A.worstTransactionCharge) adm)
 
 retryUseful ∷ St → Bool
@@ -520,7 +527,7 @@ pickRequestWork svc st adm open holdReads = do
       -- a retry with its probe in flight is started work; one that must probe starts it as any read does
       CRetry → not (Map.member (GatherRequest rid) (stateGathers st)) && case reqArena req >>= \aid → (,) aid <$> Map.lookup aid (stateArenas st) of
         Just (aid, arena)
-          | not (gvReleasing (growthView (arenaStore arena))), (_ : _, _) ← retryProbe arena →
+          | not (gvReleasing (growthView (arenaStore arena))), (probed, _) ← retryProbe arena, any (\(_, _, ps) → not (null ps)) probed →
               not holdReads && canStartGather (gathersPerArena (serviceConfig svc)) st adm aid
         _ → True
       _ → not holdReads && not (Map.member (GatherRequest rid) (stateGathers st)) && maybe False (canStartGather (gathersPerArena (serviceConfig svc)) st adm) (reqArena req)
@@ -606,6 +613,7 @@ perform svc = \case
       ContendRelease rid aid → PointGranted (Just rid) aid
       ContendDiscovery aid → PointGranted Nothing aid
       ContendReclaim aid → PointGranted Nothing aid
+      ContendWriteProbe rid aid _ → PointGranted (Just rid) aid
     case contender of
       ContendDiscovery aid | granted → probe svc (PointDiscoveryGranted aid)
       _ → pure ()
@@ -946,11 +954,21 @@ prepareReq svc rid = do
      if gvReleasing (growthView (arenaStore arena))
       then stageCreator svc rid aid arena StagedRelease
       else
-      -- bounded revalidation of what paused the arena (the recorded pages read again); capacity is
-      -- checked when the retry finishes. The answer stands on the basis read here.
-      case retryProbe arena of
-        ([], _) → True <$ finishRetry svc rid [] (creatorBasisOf arena)
-        (pages, probed) → started aid (ReadPages pages probed (creatorBasisOf arena))
+      -- bounded revalidation of what paused the arena: the recorded writes are written again first (a
+      -- write probe under the slot), then the recorded reads read again; capacity is checked when the
+      -- retry is arbitrated. The answer stands on the basis read here.
+      let basis = creatorBasisOf arena
+          (probed, writes) = retryProbe arena
+          written = Map.lookup rid (stateWriteProbed st) >>= \(b, ok) → if b == basis then Just ok else Nothing
+       in case (writes, written) of
+            (_ : _, Nothing) → stageCreator svc rid aid arena (StagedWriteProbe writes)
+            _ →
+              -- a condition with a write is certifiable only when its write probe passed
+              let certifiable = [c | (c, hasWrite, _) ← probed, not hasWrite || written == Just True]
+                  pages = [page | (c, _, ps) ← probed, c `elem` certifiable, page ← ps]
+               in case pages of
+                    [] → True <$ finishRetry svc rid certifiable basis
+                    _ → started aid (ReadPages pages certifiable basis)
     CKnowledge tile → maybe (pure False) (\aid → started aid (ReadKnowledge tile)) (reqArena req)
     cmd → maybe (pure False) (\aid → started aid (ReadRuns (commandColumns cmd))) (reqArena req)
 
@@ -1179,7 +1197,8 @@ commitStaged svc st rid req sg = case (reqCmd req, stagedWork sg) of
           , stateRequests = Map.insert rid req {reqPhase = Done} (stateRequests x)
           }
       when (not (null cleared)) (markFreed svc)
-      endpointSettle ep (Succeeded (ARetried (RetryAnswer aid cleared (conditions store'))))
+      let untilClosed = [c | c ← conditions store', Just r ← [Map.lookup c (arenaFaults arena)], faultIncomplete r]
+      endpointSettle ep (Succeeded (ARetried (RetryAnswer aid cleared (conditions store') untilClosed)))
       pure (CommitDone (Just aid) Nothing)
 
 -- | Retry what waits for capacity: pending camera demand, then requests that
@@ -1204,6 +1223,7 @@ slotStep svc =
     SlotOver task done → slotOver svc task done
     SlotGrowthReady task prepared → publishGrowth svc task prepared
     SlotGrowthOver task over → growthOver svc task over
+    SlotWriteProbeOver task result → writeProbeOver svc task result
 
 -- | Every page of the slot's transaction is written: prepare the decision outside any
 -- transaction, force it, and make it.
@@ -1220,6 +1240,7 @@ publishSlot svc task tid plan = do
         SlotReclaim → pure (Just ForBatch)
         SlotGrowth _ → failWith svc (OwnerDefect "a growth reached a store transaction's publication") []
         SlotRelease _ → failWith svc (OwnerDefect "a release reached a store transaction's publication") []
+        SlotWriteProbe _ → failWith svc (OwnerDefect "a write probe reached a store transaction's publication") []
         SlotRemoval rid → case Map.lookup rid (stateRequests st) of
           Just req
             | CRemove tile precondition <- reqCmd req
@@ -1267,6 +1288,7 @@ publishSlot svc task tid plan = do
       SlotRemoval rid → Just rid
       SlotGrowth rid → Just rid
       SlotRelease rid → Just rid
+      SlotWriteProbe _ → Nothing
       SlotDiscovery → Nothing
       SlotReclaim → Nothing
     -- the holder gives the slot up: its transaction is aborted with no write by the next steps,
@@ -1291,6 +1313,7 @@ slotOver svc task done = do
           Nothing → s
       needsMaintenance = atomically (modifySt svc (\s → s {stateNeedsMaintenance = Set.insert aid (stateNeedsMaintenance s)}))
   case (slotWork task, done) of
+    (SlotWriteProbe _, _) → failWith svc (OwnerDefect "a write probe reached a store transaction's end") []
     (_, Drained) → pure ()
     (_, Remake) → pure ()
     (_, MaintenanceFirst) → needsMaintenance
@@ -1343,6 +1366,34 @@ slotOver svc task done = do
       SlotRelease rid → Just rid
       SlotDiscovery → Nothing
       SlotReclaim → Nothing
+      SlotWriteProbe _ → Nothing
+
+-- | A retry's write probe ended (its transaction abandoned, its slot and credits released). Its result
+-- is kept for the retry against the basis the retry was staged on, and the retry is prepared again;
+-- the probe's own failure is classified as any transaction's (temporary pressure waits for capacity, a
+-- defect reaches supervision, a closure ends it, a failure of another cause is recorded as its pause).
+writeProbeOver ∷ Service → SlotTask → WriteProbe.WriteResult → IO ()
+writeProbeOver svc task result = case slotWork task of
+  SlotWriteProbe rid → do
+    let aid = slotArena task
+        again = modifySt svc (\s → s {stateRequests = Map.adjust (\q → q {reqPhase = Waiting}) rid (stateRequests s)})
+    case result of
+      WriteProbe.WriteRefused handling → case handling of
+        HandleRetryLater _ → atomically (notePressure svc >> again)
+        HandleDefect why → failWith svc (OwnerDefect why) []
+        HandleClosing → pure ()
+        HandlePause condition fault → atomically (pauseArena svc aid condition fault >> again)
+        HandleDomain fault → atomically (terminate svc rid (Failed (StorageFailed fault)))
+        other → failWith svc (OwnerDefect (Text.pack ("a write probe ended " <> show other))) []
+      _ → atomically $ do
+        s <- readSt svc
+        forM_ (Map.lookup rid (stateRequests s)) $ \req → case reqPhase req of
+          StagedPhase sg
+            | Just basis <- stagedBasis sg →
+                modifySt svc (\x → x {stateWriteProbed = Map.insert rid (basis, result == WriteProbe.WriteCertified) (stateWriteProbed x)})
+          _ → pure ()
+        again
+  _ → failWith svc (OwnerDefect "a write probe ended in a slot that was not a write probe's") []
 
 -- | A growth obtained its extra: the decision commits the store's cap, the backend's cap and the
 -- creator's answer in one transaction, or finds the request ended or no longer eligible (the
@@ -1422,6 +1473,7 @@ finishRetry svc rid certified basis = do
     pure $ case Map.lookup rid (stateRequests s) >>= reqArena >>= \aid → (,) aid <$> Map.lookup aid (stateArenas s) of
       Just (aid, arena) | not (growthInSlot s aid), creatorBasisOf arena == basis → Just (aid, arena)
       _ → Nothing
+  atomically (modifySt svc (\s → s {stateWriteProbed = Map.delete rid (stateWriteProbed s)}))
   forM_ current $ \(aid, arena) → stageCreator svc rid aid arena (StagedRetry certified)
 
 -- | Whether the slot runs a growth or a pending extra's release of the arena.
@@ -1440,17 +1492,21 @@ growthInSlot st aid = case stateSlot st of
 -- A condition is probed only when its record is complete (every failure kept) and every failure in
 -- it is a read: a write that failed is not re-tested by a read, so a condition with a failed write
 -- is never certified by this probe and stays.
-retryProbe ∷ Arena → ([(PageNo, ReadMode)], [Condition])
-retryProbe arena = (pages, map fst probed)
+retryProbe ∷ Arena → ([(Condition, Bool, [(PageNo, ReadMode)])], [PageNo])
+retryProbe arena = (probed, writes)
   where
     store = arenaStore arena
-    probed =
+    complete =
       [ (c, record)
       | c ← [CondIo, CondIntegrity]
       , c `elem` conditions store
       , Just record ← [Map.lookup c (arenaFaults arena)]
       , not (faultIncomplete record)
       , not (null (faultEntries record))
-      , and [op == FaultRead | FaultEntry op _ ← faultEntries record]
       ]
-    pages = [(page, if c == CondIntegrity then ReadValidated else ReadProbe) | (c, record) ← probed, FaultEntry _ page ← faultEntries record]
+    -- each certifiable condition: whether a write of it failed, and the pages to read again
+    probed =
+      [ (c, not (null [() | FaultEntry FaultWrite _ ← faultEntries record]), [(page, if c == CondIntegrity then ReadValidated else ReadProbe) | FaultEntry FaultRead page ← faultEntries record])
+      | (c, record) ← complete
+      ]
+    writes = [page | (_, record) ← complete, FaultEntry FaultWrite page ← faultEntries record]
