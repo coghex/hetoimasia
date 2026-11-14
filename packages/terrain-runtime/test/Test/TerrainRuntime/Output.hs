@@ -8,7 +8,7 @@
 --     'printLine' writes its line with its newline as one write under the lock. 'guardFormatters' wraps every formatter the
 --     runner can select, so each formatter EVENT (a group header, an item's result, the final report) runs under the same lock,
 --     to its end (the format returns when the event has been written). The line state is the model of what the events wrote:
---     'eventEffect' says, for each formatter, whether progress is reported and each kind of event, whether the event writes
+--     'eventEffect' says, for each formatter, the configuration it was built with and each kind of event, whether the event writes
 --     nothing (the state does not move), ends a line, leaves transient text and a held-back erase (when progress is reported, which
 --     a file keeps as bytes), or leaves content open (the @progress@ formatter's dot). A line printed at a line start has nothing
 --     before it; after transient text, on a terminal the erase and on any other handle a newline; after open content a newline.
@@ -44,11 +44,13 @@ module Test.TerrainRuntime.Output
   , guardFormatters
   , Effect (..)
   , eventEffect
+  , modelDomain
   , maxLineChars
   ) where
 
 import Control.Concurrent.MVar (MVar, newMVar, withMVar)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
+import Data.Maybe (isNothing)
 import System.IO (hFlush, hIsTerminalDevice, hPutStr, stdout)
 import System.IO.Unsafe (unsafePerformIO)
 import Test.Hspec (expectationFailure)
@@ -114,40 +116,88 @@ data Effect
   | LeavesOpen -- ^ it ends with content and no newline (a dot of the @progress@ formatter)
   deriving stock (Eq, Show)
 
--- | The model: for a formatter by the name @--format@ gives it, whether the runner reports progress and an event, what the event
--- leaves on the line. It is checked against the bytes each event of each formatter writes
+-- | The configurations the model answers for. What a formatter writes is a function of the whole 'FormatConfig' and of each
+-- event's payload, so the model names its domain, and OUTSIDE IT EVERY EVENT LEAVES THE LINE OPEN (a newline before the next
+-- printed line, never a damaged record). The pattern names all fifteen fields by position, so a field a later Hspec adds does
+-- not compile unnoticed. For each field, one of three statuses (the oracle varies every field marked swept, with payloads for
+-- every kind of result and failure, and compares the model with the bytes each event wrote):
+--
+--   1. @formatConfigUseColor@: swept, both values (colour sequences, reset before the newline).
+--   2. @formatConfigReportProgress@: swept, both values (transient text; the runner's cursor pair).
+--   3. @formatConfigOutputUnicode@: swept, both values (the symbol of a result, the same place).
+--   4. @formatConfigUseDiff@: swept, both values (text of a failure report, inside the end of the run).
+--   5. @formatConfigDiffContext@: pinned to the values swept, @Nothing@, @Just 0@ and @Just 3@ (the default); any other value is outside.
+--   6. @formatConfigExternalDiff@: pinned to @Nothing@: an external command writes to standard output whatever it likes.
+--   7. @formatConfigPrettyPrint@: read by no formatter ('Test.Hspec.Core.Formatters.V2' reads the function, not this flag); swept anyway.
+--   8. @formatConfigPrettyPrintFunction@: a function, so not enumerable; its result is only text inside the failure report, written
+--      by @writeChunks@ with a newline after every chunk (V2.hs, the failure formatter), inside the end of the run, whose last
+--      write is the footer line; swept with functions whose results are empty and several lines long, and @Nothing@.
+--   9. @formatConfigFormatException@: likewise a function; its result is written by @indent@ (V2.hs, the failure formatter), one
+--      line at a time with a newline each; swept with an empty and a several-line result.
+--  10. @formatConfigPrintTimes@: swept, both values (text before the newline of the same line).
+--  11. @formatConfigHtmlOutput@: swept, and OUTSIDE the domain when set: every coloured write is wrapped in a span that closes
+--      after the newline ('Test.Hspec.Core.Formatters.Internal.htmlSpan'), so an event ends with a closing tag and no newline;
+--      hspec's own transient text is then off, too. Not modelled, so every event is open.
+--  12. @formatConfigPrintCpuTime@: swept, both values (text of the footer line).
+--  13. @formatConfigUsedSeed@: read only inside two lines written with a newline (V2.hs: the seed line of the failure report); swept with two values.
+--  14. @formatConfigExpectedTotalCount@: read by no formatter of the five ('getExpectedTotalCount' is exported and unused); set to the real count in the sweep.
+--  15. @formatConfigExpertMode@: swept, both values (it omits lines of the failure report).
+modelDomain ∷ FormatConfig → Bool
+modelDomain
+  ( FormatConfig
+      _useColor
+      _reportProgress
+      _outputUnicode
+      _useDiff
+      diffContext
+      externalDiff
+      _prettyPrint
+      _prettyPrintFunction
+      _formatException
+      _printTimes
+      htmlOutput
+      _printCpuTime
+      _usedSeed
+      _expectedTotalCount
+      _expertMode
+    ) = not htmlOutput && isNothing externalDiff && diffContext `elem` [Nothing, Just 0, Just 3]
+
+-- | The model: for a formatter by the name @--format@ gives it, the format configuration it was built with and an event, what the
+-- event leaves on the line. Inside 'modelDomain' it is checked against the bytes each event of each formatter writes
 -- ("Test.TerrainRuntime.OutputSpec" drives every formatter through every kind of event and compares). A formatter that is not
--- named here leaves every event 'LeavesOpen': where the model is not certain, the line is taken to be open, which costs a
--- newline and never a damaged record.
-eventEffect ∷ String → Bool → Event → Effect
-eventEffect formatter progress event = case formatter of
-  "checks" → case event of
-    Started → EndsLine
-    GroupStarted {} → EndsLine
-    GroupDone {} → Silent
-    Progress {} → transient
-    ItemStarted {} → transient
-    ItemDone {} → EndsLine
-    Done {} → EndsLine
-  "specdoc" → case event of
-    Started → EndsLine
-    GroupStarted {} → EndsLine
-    GroupDone {} → Silent
-    Progress {} → transient
-    ItemStarted {} → Silent
-    ItemDone {} → EndsLine
-    Done {} → EndsLine
-  "progress" → case event of
-    ItemDone {} → LeavesOpen
-    Done {} → EndsLine
-    _ → Silent
-  "failed-examples" → case event of
-    Done {} → EndsLine
-    _ → Silent
-  "silent" → Silent
-  _ → LeavesOpen
+-- named here, and every configuration outside the domain, leaves every event 'LeavesOpen': where the model is not certain, the
+-- line is taken to be open, which costs a newline and never a damaged record.
+eventEffect ∷ String → FormatConfig → Event → Effect
+eventEffect formatter config event
+  | not (modelDomain config) = LeavesOpen
+  | otherwise = case formatter of
+      "checks" → case event of
+        Started → EndsLine
+        GroupStarted {} → EndsLine
+        GroupDone {} → Silent
+        Progress {} → transient
+        ItemStarted {} → transient
+        ItemDone {} → EndsLine
+        Done {} → EndsLine
+      "specdoc" → case event of
+        Started → EndsLine
+        GroupStarted {} → EndsLine
+        GroupDone {} → Silent
+        Progress {} → transient
+        ItemStarted {} → Silent
+        ItemDone {} → EndsLine
+        Done {} → EndsLine
+      "progress" → case event of
+        ItemDone {} → LeavesOpen
+        Done {} → EndsLine
+        _ → Silent
+      "failed-examples" → case event of
+        Done {} → EndsLine
+        _ → Silent
+      "silent" → Silent
+      _ → LeavesOpen
   where
-    transient = if progress then LeavesTransient else Silent
+    transient = if formatConfigReportProgress config then LeavesTransient else Silent
 
 -- | The line state after an event of the given effect; an event that writes nothing leaves the state it found.
 afterEffect ∷ Effect → LineState → LineState
@@ -182,11 +232,12 @@ guardFormat ∷ Output → String → (FormatConfig → IO Format) → FormatCon
 guardFormat out name make config = do
   format ← make config
   let progress = formatConfigReportProgress config
+      known = modelDomain config
   withMVar (outLock out) $ \_ → writeIORef (outLineState out) (if progress then AfterTransient else AtLineStart)
   pure $ \event → withMVar (outLock out) $ \_ → do
     before ← readIORef (outLineState out)
     writeIORef (outLineState out) MidLine
     format event
     writeIORef (outLineState out) (case event of
-      Done {} | progress → AfterTransient
-      _ → afterEffect (eventEffect name progress event) before)
+      Done {} | progress, known → AfterTransient
+      _ → afterEffect (eventEffect name config event) before)
