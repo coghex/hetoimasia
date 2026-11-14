@@ -11,6 +11,7 @@
 --     submit, cancel, discard, take, close and shutdown with the shared admission back to its starting figures.
 module Test.TerrainRuntime.Storage.Classes (spec) where
 
+import Test.TerrainRuntime.Output (printLine)
 import Control.Concurrent (throwTo)
 import Control.Concurrent.MVar
 import Control.Concurrent.STM
@@ -33,7 +34,6 @@ import Hetoimasia.Terrain.Runtime.Store.Internal.Format (PageNo (..), StoreIdent
 import Hetoimasia.Terrain.Runtime.Store.Internal.Model (admit)
 import System.Directory (doesDirectoryExist, listDirectory)
 import System.FilePath ((</>))
-import System.IO (hFlush, stdout)
 import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec
 import Test.Support.Bounded (bounded)
@@ -418,7 +418,7 @@ sweepClass = describe "(C) every native resource has an owner at every instant" 
     cases <- forM [CloseReleasesOnFailure, CloseNotEstablished] $ \fact -> forM matrix $ \(stage, name, match, occurrence, prelude) ->
       forM [minBound .. maxBound] $ \inj -> do
         baseline <- openFdCount
-        putStrLn ("  sweep case: " <> show fact <> " / " <> show stage <> " / " <> name <> " / " <> show inj) >> hFlush stdout
+        printLine ("  sweep case: " <> show fact <> " / " <> show stage <> " / " <> name <> " / " <> show inj)
         -- a FAILING native close is kept by the service whoever asked for it: the scope ends with that labelled failure
         -- the unwind of an open whose cleanup close fails in a way the fact does not establish is a HELD close (round 8): the reservation
         -- stays counted to the service's end
@@ -430,7 +430,7 @@ sweepClass = describe "(C) every native resource has an owner at every instant" 
         ((show fact, show stage, name, show inj), fdsAfter) `shouldBe` ((show fact, show stage, name, show inj), baseline)
         pure ()
     length (concat (concat cases)) `shouldBe` 2 * length matrix * length [minBound .. maxBound :: Injection]
-    putStrLn ("sweep: " <> show (length matrix) <> " native calls at their stages x " <> show (length [minBound .. maxBound :: Injection]) <> " exits (success, errno, errno after the effect, a raise before, a raise inside the call, after the effect: thrown, async, and a cancellation) x 2 platform facts = " <> show (length (concat (concat cases))) <> " cases")
+    printLine ("sweep: " <> show (length matrix) <> " native calls at their stages x " <> show (length [minBound .. maxBound :: Injection]) <> " exits (success, errno, errno after the effect, a raise before, a raise inside the call, after the effect: thrown, async, and a cancellation) x 2 platform facts = " <> show (length (concat (concat cases))) <> " cases")
   where
     runCase :: Env -> CloseFact -> Stage -> (NativeOp -> Bool) -> Int -> (Probe -> IO ()) -> Injection -> Bool -> Bool -> IO ()
     runCase env fact stage match occurrence prelude inj heldOpen liar
@@ -704,7 +704,7 @@ chargeClass = describe "(D) every charge is released on every path" $ do
       readIORef done
     -- every sequence ran its steps, and each environment's end asserted the admission back at zero
     sum counts `shouldBe` 40 * 36
-    putStrLn ("random sequences: 40 seeds, " <> show (sum counts) <> " operations")
+    printLine ("random sequences: 40 seeds, " <> show (sum counts) <> " operations")
 
 -- | A deterministic pseudo-random sequence of operations against one environment.
 randomSequence :: Env -> Int -> IORef Int -> IO ()

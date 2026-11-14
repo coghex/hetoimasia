@@ -68,7 +68,7 @@ sequentialGuard = do
       setNumCapabilities 1
       assertSequential "a sequential example"
       first ← atomicModifyIORef' phasePrinted (\p → (True, not p))
-      if first then putStrLn "PHASE sequential: 1 capability, no parallel example running" else pure ()
+      if first then printLine "PHASE sequential: 1 capability, no parallel example running" else pure ()
 
 spec ∷ Spec
 spec = describe "the isolation of the parallel group" $ do

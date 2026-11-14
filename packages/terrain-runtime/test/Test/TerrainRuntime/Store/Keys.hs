@@ -7,6 +7,7 @@
 -- (@0x00@ a version, @0xFF@ a page): one key length, disjoint kinds, each ordered by its number.
 module Test.TerrainRuntime.Store.Keys (spec) where
 
+import Test.TerrainRuntime.Output (printLine)
 import Control.Monad (foldM, forM_)
 import qualified Data.ByteString as BS
 import Data.List (nub, sort)
@@ -56,7 +57,7 @@ spec = describe "the keys of every tree: kinds, lengths, namespaces, and the who
           , ("retire", "retired page", [retiredKey (PageNo p) | p ← edges])
           ]
         table = [(t, k, nub (map BS.length ks), nub (map (BS.take 1) ks)) | (t, k, ks) ← kinds]
-    putStrLn ("KEYS table (tree, kind, lengths, first bytes): " <> show table)
+    printLine ("KEYS table (tree, kind, lengths, first bytes): " <> show table)
     -- one key length per tree, except the links tree (source node 52 bytes, run node 25)
     let lengthsOf t = nub (concat [ls | (t', _, ls, _) ← table, t' == t])
     [(t, lengthsOf t) | t ← ["runs", "todo", "free", "retire"], length (lengthsOf t) /= 1] `shouldBe` []

@@ -38,6 +38,7 @@ import qualified Test.TerrainRuntime.Store.Readers as StoreReaders
 import qualified Test.TerrainRuntime.Store.Replay as StoreReplay
 import Test.Hspec (Spec, before_)
 import qualified Test.TerrainRuntime.Isolation as Isolation
+import qualified Test.TerrainRuntime.OutputSpec as OutputSpec
 import qualified Test.TerrainRuntime.Parallel as Parallel
 
 -- | The pure store families first, in parallel ("Test.TerrainRuntime.Parallel" names them and says why); then everything else
@@ -48,6 +49,7 @@ spec = Parallel.spec >> before_ Isolation.sequentialGuard sequentialSpec
 sequentialSpec ∷ Spec
 sequentialSpec = do
   Isolation.spec
+  OutputSpec.spec
   Basic.spec
   Races.spec
   Budgets.spec

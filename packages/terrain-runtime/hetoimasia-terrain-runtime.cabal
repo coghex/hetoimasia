@@ -149,7 +149,9 @@ test-suite terrain-runtime-tests
         Test.TerrainRuntime.Isolation
         Test.TerrainRuntime.Oracle
         Test.TerrainRuntime.Output
+        Test.TerrainRuntime.OutputSpec
         Test.TerrainRuntime.Parallel
+        Test.TerrainRuntime.Runner
         Test.TerrainRuntime.Races
         Test.TerrainRuntime.Revalidation
         Test.TerrainRuntime.Usage
@@ -228,6 +230,7 @@ test-suite terrain-storage-probe
     other-modules:
         Test.TerrainRuntime.Isolation
         Test.TerrainRuntime.Output
+        Test.TerrainRuntime.Runner
         Test.TerrainRuntime.Storage.Fixture
         Test.TerrainRuntime.Storage.Harness
         Test.TerrainRuntime.Storage.ProbeSpec
@@ -265,6 +268,7 @@ test-suite terrain-runtime-full-depth-tests
     other-modules:
         Test.TerrainRuntime.Output
         Test.TerrainRuntime.Isolation
+        Test.TerrainRuntime.Runner
         Test.TerrainRuntime.Store.Bounds
         Test.TerrainRuntime.Store.Cycles
         Test.TerrainRuntime.Store.Depth

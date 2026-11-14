@@ -12,11 +12,12 @@ module Main (main) where
 import Control.Monad (forM_)
 import System.Info (arch, compilerVersion, os)
 import Test.Hspec
+import Test.TerrainRuntime.Runner (runSuite)
 import Test.TerrainRuntime.Storage.Fixture (pointerFixture)
 import Test.TerrainRuntime.Storage.ProbeSpec (probeCases)
 
 main :: IO ()
-main = hspec $ describe "Terrain storage qualification on this platform" $ do
+main = runSuite $ describe "Terrain storage qualification on this platform" $ do
   forM_ probeCases $ \(name, run) -> it name (run pointerFixture)
   where
     _platform = (os, arch, compilerVersion)

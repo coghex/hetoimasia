@@ -12,6 +12,7 @@
 -- make the larger history allocate proportionally more, and fails these.
 module Test.TerrainRuntime.Store.Bounds (spec, wide, wide20000, findExact256, allocationRatios) where
 
+import Test.TerrainRuntime.Output (printLine)
 import Control.Monad (foldM, forM_)
 import qualified Data.ByteString as BS
 import qualified Data.Map.Strict as Map
@@ -338,7 +339,7 @@ spec = describe "transaction bounds, exactly and one past, and work independent 
     take 3 ladder `shouldBe` [64, 32, 16]
     windowWork (reduceWork (limitWork 1 (storeWindow (hStore h1))) (storeWindow (hStore h1))) `shouldBe` 1
     sizes ← mapM batchAt [64, 8, 4, 2]
-    putStrLn ("DISCOVERY batch updates at work 64, 8, 4, 2: " <> show sizes)
+    printLine ("DISCOVERY batch updates at work 64, 8, 4, 2: " <> show sizes)
     -- each smaller work plans a smaller batch than the full one, down to the least
     (sizes !! 3 < sizes !! 0) `shouldBe` True
     and (zipWith (>=) sizes (drop 1 sizes)) `shouldBe` True
@@ -369,11 +370,11 @@ spec = describe "transaction bounds, exactly and one past, and work independent 
     (p, wEnd, _, cps) ← must (fillCounting hP (storeWindow (hStore hP)) (\w → planRemovalWith bounds env (hStore hP) w tile))
     -- the proof phase of the removal on a store with no tail holds no more probes than the pages it writes (what 'removalWorstProbes' is)
     (windowProbeCount wEnd <= removalWorstProbes) `shouldBe` True
-    putStrLn ("REMOVAL at once: probes held " <> show (windowProbeCount wEnd) <> " of " <> show removalWorstProbes)
+    printLine ("REMOVAL at once: probes held " <> show (windowProbeCount wEnd) <> " of " <> show removalWorstProbes)
     case p of
       Planned pl → do
         (mWindowPages (plMeasure pl) <= lim) `shouldBe` True
-        putStrLn ("REMOVAL at once: heights " <> show (hrec, hf, internals) <> ", window bound " <> show lim <> ", held " <> show (mWindowPages (plMeasure pl)) <> ", " <> show cps <> " checkpoints, " <> show (mPagesWritten (plMeasure pl)) <> " pages written")
+        printLine ("REMOVAL at once: heights " <> show (hrec, hf, internals) <> ", window bound " <> show lim <> ", held " <> show (mWindowPages (plMeasure pl)) <> ", " <> show cps <> " checkpoints, " <> show (mPagesWritten (plMeasure pl)) <> " pages written")
       other → expectationFailure ("the removal did not fit its at-once bound of " <> show lim <> " pages: " <> take 300 (show other))
     -- and after the readers release, the same removal plans under the bound of no readers
     let released = hP {hStore = foldl (\st t → snd (releaseReader t st)) (hStore hP) toks}

@@ -14,6 +14,7 @@
 -- variants with a stated margin.
 module Test.TerrainRuntime.Store.Memory (spec) where
 
+import Test.TerrainRuntime.Output (printLine)
 import Control.Exception (evaluate)
 import Control.Monad (forM_, unless)
 import qualified Data.ByteString as BS
@@ -341,13 +342,13 @@ spec = describe "the accounted-bytes constants against what is retained (forced 
       ]
   it "TABLE: every accounted constant, its largest valid instance and why, every variant measured against the accounted figure" $ do
     forM_ rows $ \r → do
-      putStrLn ("MEMORY " <> rowName r <> " [accounted " <> show (rowAccounted r) <> " B]: largest valid instance: " <> rowLargest r)
-      forM_ (rowVariants r) $ \v → putStrLn ("MEMORY   variant " <> varName v <> ": " <> show (round (varMeasured v) ∷ Int) <> " B")
+      printLine ("MEMORY " <> rowName r <> " [accounted " <> show (rowAccounted r) <> " B]: largest valid instance: " <> rowLargest r)
+      forM_ (rowVariants r) $ \v → printLine ("MEMORY   variant " <> varName v <> ": " <> show (round (varMeasured v) ∷ Int) <> " B")
       let m = varMeasured (rowMax r)
           acc = fromIntegral (fromMaybe (rowAccounted r) (varBudget (rowMax r))) ∷ Double
-      putStrLn ("MEMORY   -> largest measured: " <> varName (rowMax r) <> " at " <> show (round m ∷ Int) <> " B of " <> show (round acc ∷ Int) <> " accounted (margin " <> show (round (acc - m) ∷ Int) <> " B, " <> show (round (100 * (acc - m) / m) ∷ Int) <> " %)")
+      printLine ("MEMORY   -> largest measured: " <> varName (rowMax r) <> " at " <> show (round m ∷ Int) <> " B of " <> show (round acc ∷ Int) <> " accounted (margin " <> show (round (acc - m) ∷ Int) <> " B, " <> show (round (100 * (acc - m) / m) ∷ Int) <> " %)")
     -- the constants that are LEDGER terms, not retained structures: no object of the store stands behind them
-    putStrLn "MEMORY ledger terms (no store heap structure): ramPagePins (16 per window page), ramContinuation (1,024 + 8 per window page), the 4,096-byte scratch, descriptorRecordBytes (queued I/O descriptors of the admission)"
+    printLine "MEMORY ledger terms (no store heap structure): ramPagePins (16 per window page), ramContinuation (1,024 + 8 per window page), the 4,096-byte scratch, descriptorRecordBytes (queued I/O descriptors of the admission)"
   forM_ rows $ \r → do
     it ("every variant retains no more than it is charged: " <> rowName r) $
       forM_ (rowVariants r) $ \v → (varName v, varMeasured v <= fromIntegral (fromMaybe (rowAccounted r) (varBudget v))) `shouldBe` (varName v, True)
@@ -407,11 +408,11 @@ spec = describe "the accounted-bytes constants against what is retained (forced 
         mkFacts salt = factsOf (fingerprintOf salt) [FactGone (fromInteger (big (i + salt))) (PageNo (fromInteger (big (i + salt + 1)))) | i ← [1 .. maxProofFacts]] (ReadSet [(KeyLink (SrcNode (compKey 3 (i + salt))), Just (RecChild (SrcNode (compKey 3 (i + salt + 7))))) | i ← ints nFacts] [])
     measured ← retainedPer 1 [()] (const 0) (\_ → pure (mkFacts 1)) (\fx → evaluate (factsRetainedBytes fx))
     let accounted = factsRetainedBytes (mkFacts 100000)
-    putStrLn ("MEMORY a Facts value of " <> show nFacts <> " read facts and " <> show maxProofFacts <> " proof facts: retains " <> show (round measured ∷ Int) <> " B, accounted " <> show accounted <> " B")
+    printLine ("MEMORY a Facts value of " <> show nFacts <> " read facts and " <> show maxProofFacts <> " proof facts: retains " <> show (round measured ∷ Int) <> " B, accounted " <> show accounted <> " B")
     (measured <= fromIntegral accounted, accounted <= maxReadFactBytes + maxProofFacts * factBytes + fingerprintBytes) `shouldBe` (True, True)
   it "the read facts at their ceiling retain no more than the ceiling: N of them, near maxReadFactBytes, in total" $ do
     mTotal ← lazily "Memory.mTotal" (retainedPer 1 [()] (const 0) (\_ → pure (windowCheckpoint (factsOf (Fingerprint ident0 1 [] []) [] (ReadSet [(KeyLink (SrcNode (compKey 3 i)), Just (RecChild (SrcNode (compKey 3 (i + 7))))) | i ← ints nFacts] [])) (emptyWindow ident0 1))) (\w → evaluate (windowReadFactCount w)))
-    putStrLn ("MEMORY read facts at the ceiling: " <> show nFacts <> " facts retain " <> show (round mTotal ∷ Int) <> " B of " <> show maxReadFactBytes)
+    printLine ("MEMORY read facts at the ceiling: " <> show nFacts <> " facts retain " <> show (round mTotal ∷ Int) <> " B of " <> show maxReadFactBytes)
     (mTotal <= fromIntegral maxReadFactBytes) `shouldBe` True
     unless (nFacts > 0) (expectationFailure "no facts")
   where

@@ -11,6 +11,7 @@ module Test.TerrainRuntime.Storage.ProbeSpec
   , ExhaustionBad (..), exhaustionVerdict, RewriteBad (..), rewriteVerdict, GrowthBad (..), growthVerdict
   ) where
 
+import Test.TerrainRuntime.Output (printLine)
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.STM (atomically)
 import Control.Exception (bracket, onException)
@@ -32,7 +33,6 @@ import Hetoimasia.Terrain.Runtime.Store.Internal.Format (pageSize)
 import Hetoimasia.Terrain.Runtime.Store.Internal.State (cfgAllowanceBytes)
 import System.Directory (doesDirectoryExist, listDirectory)
 import System.Info (arch, compilerVersion, os)
-import System.IO (hFlush, stdout)
 import Test.Hspec
 import Test.TerrainRuntime.Storage.Fixture
 import Test.TerrainRuntime.Storage.Harness
@@ -42,7 +42,7 @@ mib :: Word64
 mib = 1024 * 1024
 
 record :: String -> String -> IO ()
-record k v = putStrLn ("PROBE " <> k <> "=" <> v) >> hFlush stdout
+record k v = printLine ("PROBE " <> k <> "=" <> v)
 
 timed :: String -> IO a -> IO a
 timed label act = do

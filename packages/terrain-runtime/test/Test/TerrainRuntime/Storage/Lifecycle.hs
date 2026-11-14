@@ -8,6 +8,7 @@
 -- after every step; a state that breaks one fails the example that reached it.
 module Test.TerrainRuntime.Storage.Lifecycle (spec, checkInvariants, invariantProblems, withControlledService, Ctl (..)) where
 
+import Test.TerrainRuntime.Output (printLine)
 import Control.Concurrent (ThreadId, myThreadId, throwTo)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import Control.Concurrent.MVar
@@ -243,10 +244,10 @@ spec = describe "Storage backend: the lifecycle matrix" $ do
       (applic, _) -> if ev == EvCleanupException then runCleanupCell k ph else runCell k ph ev applic
     let (e, r, n) = tally
     e + r + n `shouldBe` length allCells
-    mapM_ putStrLn matrixTable
-    mapM_ putStrLn chargeTable
-    mapM_ putStrLn sealedTable
-    putStrLn ("lifecycle matrix: " <> show (length allCells) <> " cells (6 kinds x 4 phases x " <> show (length [minBound .. maxBound :: Event]) <> " events): " <> show e <> " with an effect, " <> show r <> " refusals, " <> show n <> " not applicable (not run)")
+    mapM_ printLine matrixTable
+    mapM_ printLine chargeTable
+    mapM_ printLine sealedTable
+    printLine ("lifecycle matrix: " <> show (length allCells) <> " cells (6 kinds x 4 phases x " <> show (length [minBound .. maxBound :: Event]) <> " events): " <> show e <> " with an effect, " <> show r <> " refusals, " <> show n <> " not applicable (not run)")
 
   it "attempts the descriptor's close even when the unlink cleanup throws (twice), and keeps the evidence" $ do
     withEnv $ \env -> do
