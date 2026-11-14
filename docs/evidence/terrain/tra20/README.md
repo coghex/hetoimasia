@@ -13,6 +13,8 @@ cabal test --project-file cabal.project.cpu hetoimasia-terrain:terrain-tests --t
 cabal test --project-file cabal.project.cpu hetoimasia-terrain-render-2d:terrain-render-2d-tests --test-show-details=direct
 # this document's tables: the evidence printer alone
 $(cabal list-bin --project-file cabal.project.cpu hetoimasia-terrain-runtime:terrain-runtime-tests) --match "TRA-20 evidence"
+# the routine suite now bounds these families; the figures below are the full-depth printer's:
+$(cabal list-bin --project-file cabal.project.cpu hetoimasia-terrain-runtime:terrain-runtime-full-depth-tests) --match "TRA-20 evidence"
 ```
 
 Results at `f129732f` (the Measurements block below is the printer's output at that head; earlier rounds' sections quote the output of their own heads): `terrain-runtime-tests` 536 examples, 0 failures; `terrain-tests` 905/0; `terrain-render-2d-tests` 558/0; `workflow-tests` 965/0.

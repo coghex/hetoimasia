@@ -20,6 +20,7 @@ cabal test --project-file cabal.project.cpu hetoimasia-math:math-tests --test-sh
 cabal test --project-file cabal.project.cpu hetoimasia-terrain:terrain-tests --test-show-details=direct
 cabal test --project-file cabal.project.cpu hetoimasia-terrain-render-2d:terrain-render-2d-tests --test-show-details=direct
 cabal test --project-file cabal.project.cpu hetoimasia-terrain-runtime:terrain-runtime-tests --test-show-details=direct
+cabal test --project-file cabal.project.cpu hetoimasia-terrain-runtime:terrain-runtime-full-depth-tests --test-show-details=direct   # optional probe: the store families at full depth
 cabal test --project-file cabal.project.cpu hetoimasia-content:content-tests --test-show-details=direct
 cabal test --project-file cabal.project.cpu hetoimasia-asset-image:asset-image-tests --test-show-details=direct
 cabal test --project-file cabal.project.cpu hetoimasia-render-api:render-api-tests --test-show-details=direct
@@ -110,7 +111,10 @@ cabal test hetoimasia-tests --test-show-details=direct
   transaction bounds exactly and one past, the edit bank's admission division,
   seeded update/abort/publish/read/reclaim cycles, forced-result allocation, a
   separately compiled client of the public store interface, and the evidence printer
-  (`--match "TRA-20 evidence"`). The store's implementation is a private library of the
+  (`--match "TRA-20 evidence"`: at the routine depth here, at the depth the TRA-20 record quotes in
+  `terrain-runtime-full-depth-tests`). The store's long families run at bounded representatives, the pure ones in
+  parallel, with fixtures built on first read; their rule, budget and full depth are in
+  [the classification policy](test_classification.md#the-suites-budget-and-its-parallel-group). The store's implementation is a private library of the
   package, reached by the suite alone. The storage backend (TRA-21,
   `Test.TerrainRuntime.Storage.*`) is in the same suite and owns the deterministic safety
   cases of the reserved backing files and the two I/O workers, against real files on the
@@ -129,6 +133,15 @@ cabal test hetoimasia-tests --test-show-details=direct
   the CPU group `test.terrain-runtime`, mandatory and outside the floor, on the
   `haskell-engine` worker with a reusable receipt. See
   [the package's contract](../packages/terrain-runtime/README.md).
+- `terrain-runtime-full-depth-tests` (`packages/terrain-runtime/full/`) owns the complete original
+  parameters of the store families that the routine suite bounds: `Test.TerrainRuntime.Store.Rebalance`,
+  `Scattered`, `Large`, `Protocol`, `History`, `Trees`, `Evidence`, `Fuzz`, `FuzzTrees` and `Cycles`, each module's
+  `fullSpec`, in one selection (it re-runs the examples of those modules that the routine suite keeps unchanged,
+  so base-equivalent coverage is the routine run plus this run). It is the optional probe group
+  `test.terrain-runtime-full-depth` (`category: probe`, no CI worker route, never selected by an affected
+  path, a routine suite command or a pull-request request); a new family bounded in the routine suite
+  adds its `fullSpec` here. It prints the figures `evidence/terrain/tra20/README.md` quotes with
+  `--test-option=--match --test-option="TRA-20 evidence"`.
 - `terrain-storage-probe` (`packages/terrain-runtime/probe/`, TRA-21) owns the real-platform
   qualification of that backend: the production native backend on a capped, disposable
   volume, macOS/APFS on Darwin and ext4 on Linux, with the minimum, a middle and the default
