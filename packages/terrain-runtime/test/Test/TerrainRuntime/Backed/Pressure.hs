@@ -113,9 +113,13 @@ pressureCase ∷ Caller → IO ()
 pressureCase caller = do
   probe ← H.newProbe
   grants ← newTVarIO (0 ∷ Int)
-  let owner = Probe $ \case
-        PointGranted (Just _) _ → atomically (modifyTVar' grants (+ 1))
-        _ → pure ()
+  -- every point the owner reports, counted by kind, for a wait that names itself
+  points ← newTVarIO (Map.empty ∷ Map.Map String Int)
+  let owner = Probe $ \point → atomically $ do
+        modifyTVar' points (Map.insertWith (+) (takeWhile (/= ' ') (show point)) 1)
+        case point of
+          PointGranted (Just _) _ → modifyTVar' grants (+ 1)
+          _ → pure ()
   withServiceSeam quiet defaultConfig alwaysAdmitting owner (H.seamFor probe) $ \svc → do
     (client, lease) ← openMain svc "main"
     forM_ [(3, 4, 9), (5, 4, 9)] $ \(x, y, z) → removeCell' svc lease (tile x y z)
@@ -132,7 +136,9 @@ pressureCase caller = do
           own ← settledOf host
           rest ← readTVarIO others >>= mapM settledOf
           defects ← inspectDefects svc
-          pure ("queued " <> show queued <> ", pressed " <> show pressed <> ", grants " <> show granted <> ", pending bytes " <> show pendingBytes <> ", the caller settled " <> show own <> ", the others settled " <> show rest <> ", defects " <> show defects)
+          seen ← readTVarIO points
+          problems ← inspectBacked svc
+          pure ("points " <> show (Map.toList seen) <> ", backed oracle " <> show problems <> ", queued " <> show queued <> ", pressed " <> show pressed <> ", grants " <> show granted <> ", pending bytes " <> show pendingBytes <> ", the caller settled " <> show own <> ", the others settled " <> show rest <> ", defects " <> show defects)
         named ∷ String → STM a → IO a
         named what stm = timeout boundMicroseconds (atomically stm) >>= \case
           Just a → pure a
