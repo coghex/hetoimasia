@@ -606,6 +606,9 @@ perform svc = \case
       ContendRelease rid aid → PointGranted (Just rid) aid
       ContendDiscovery aid → PointGranted Nothing aid
       ContendReclaim aid → PointGranted Nothing aid
+    case contender of
+      ContendDiscovery aid | granted → probe svc (PointDiscoveryGranted aid)
+      _ → pure ()
     pure (Step True granted)
   WDrain aid → do
     takeTurn svc TurnPrepare

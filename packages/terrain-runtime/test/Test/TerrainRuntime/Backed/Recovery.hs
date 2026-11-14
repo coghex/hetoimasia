@@ -128,12 +128,12 @@ spec = describe "Recovery decided like publication" $ do
 
   it "does not publish discovery that was in flight when its arena paused" $ do
     probe ← H.newProbe
-    -- once armed, the next internal grant (discovery's: one unit of it per transaction) installs a gate
-    -- on every write, so that transaction's write is held at the seam
+    -- once armed, the next grant to discovery (one unit of it per transaction) installs a gate on every
+    -- write, so that transaction's write is held at the seam
     armed ← newTVarIO False
     gateVar ← newEmptyTMVarIO
     let owner = Probe $ \case
-          PointGranted Nothing _ → do
+          PointDiscoveryGranted _ → do
             now ← atomically ((&&) <$> readTVar armed <*> isEmptyTMVar gateVar)
             if now then H.addGate probe isWrite >>= atomically . putTMVar gateVar else pure ()
           _ → pure ()

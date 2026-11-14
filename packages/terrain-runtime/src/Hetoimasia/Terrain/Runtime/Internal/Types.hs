@@ -502,6 +502,8 @@ data Point
     -- to record it. Reported under an uninterruptible mask: an exception sent to the owner while a
     -- test holds this point arrives after the point, which is between the step's effect and its record.
     PointSlotStepped !ArenaId !Text
+  | -- | The slot was granted to discovery of the arena (reported after its 'PointGranted').
+    PointDiscoveryGranted !ArenaId
   deriving stock (Eq, Show)
 
 -- | An unexpected defect, kept with bounded context.
