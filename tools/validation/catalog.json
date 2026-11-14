@@ -920,6 +920,7 @@
         "packages/terrain-render-2d/fixtures/",
         "packages/terrain-render-2d/test/",
         "packages/terrain-render-2d-vulkan/test/",
+        "packages/terrain-runtime/full/",
         "packages/terrain-runtime/probe/",
         "packages/terrain-runtime/test/",
         "probe/",
