@@ -5,15 +5,18 @@
 --   * Through one 'Output' (a lock and a record of whether the handle is at a line start): every example of the parallel
 --     group, which runs beside the formatter and beside seven other examples, the suite's own sequential lines (the
 --     @RUNNER@, @PHASE@, @FIXTURE@, @MEMORY@, @DISCOVERY@, @REMOVAL@ and @KEYS@ lines), and the runner's formatter.
---     'printLine' writes its line with its newline as one write under the lock, preceded by a newline when the formatter left
---     the line open. 'guardFormatters' wraps every formatter the runner can select, so each formatter EVENT (a group header, an
---     item's result, the final report) runs under the same lock, to its end (the format returns when the event has been
---     written), and afterwards the record says the handle is at a line start for the formatters of 'boundaryFormatters', whose
---     every event ends in a newline or writes nothing, and open for any other (the @progress@ formatter writes a dot and no
---     newline). When progress is reported (colour forced on, no CI variable) the formatter also writes transient text and a
---     held-back erase that a file keeps as bytes, so after an item's start or progress the record says so, and a line printed to a
---     handle that is not a terminal then begins with a newline (on a terminal, with the erase). So neither writer can run inside the other's write, whatever the thread or the buffering mode, and a printed
---     line starts at a line start; on a terminal it also clears the formatter's progress text on the line first.
+--     'printLine' writes its line with its newline as one write under the lock. 'guardFormatters' wraps every formatter the
+--     runner can select, so each formatter EVENT (a group header, an item's result, the final report) runs under the same lock,
+--     to its end (the format returns when the event has been written). The line state is the model of what the events wrote:
+--     'eventEffect' says, for each formatter, whether progress is reported and each kind of event, whether the event writes
+--     nothing (the state does not move), ends a line, leaves transient text and a held-back erase (when progress is reported, which
+--     a file keeps as bytes), or leaves content open (the @progress@ formatter's dot). A line printed at a line start has nothing
+--     before it; after transient text, on a terminal the erase and on any other handle a newline; after open content a newline.
+--     The model is not trusted: "Test.TerrainRuntime.OutputSpec" drives every formatter through every kind of event, observes the
+--     bytes each writes and compares them with the model, and prints a record at every position of the sequence. A formatter the
+--     model does not name is taken to leave every event open, which costs a newline and never a damaged record. So neither writer
+--     can run inside the other's write, whatever the thread or the buffering mode, and a printed line starts a line of the
+--     bytes; on a terminal it also clears the formatter's progress text on the line first.
 --   * Directly, with no lock: the sequential examples of the storage modules (@Test.TerrainRuntime.Storage.*@, #663's work), whose tests this change does not edit beyond placing them in the tiers. They are whole by the framework's
 --     order, not by a lock: a sequential item starts only after the reporting thread has written every earlier item's result
 --     ('Test.Hspec.Core.Runner.JobQueue.runSequentially' waits on a barrier that 'Test.Hspec.Core.Runner.Eval.reportItem'
@@ -21,7 +24,7 @@
 --     returns when the formatter has written it), so the formatter is idle until the item ends, and the isolation guard
 --     ("Test.TerrainRuntime.Isolation") keeps every parallel example from running beside it. The oracle
 --     ("Test.TerrainRuntime.OutputSpec") shows the case: sequential examples nested in describes, after a parallel group,
---     writing with @putStrLn@, are whole at a line start under every formatter of 'boundaryFormatters'. The same cannot be said
+--     writing with @putStrLn@, are whole at a line start under every formatter but @progress@. The same cannot be said
 --     of the @progress@ formatter, whose dots leave the line open (a direct write then follows the dots), nor, when progress is
 --     reported, of the bytes of a file: a direct write follows the transient text and its erase, whole as a terminal shows it.
 --
@@ -39,7 +42,8 @@ module Test.TerrainRuntime.Output
   , printLineOn
   , withOutputLocked
   , guardFormatters
-  , boundaryFormatters
+  , Effect (..)
+  , eventEffect
   , maxLineChars
   ) where
 
@@ -102,46 +106,83 @@ printLineOn out s
 withOutputLocked ∷ Output → IO a → IO a
 withOutputLocked out = withMVar (outLock out) . const
 
--- | The formatters whose every event ends at a line boundary, by the name @--format@ gives them. A formatter that is not
--- named here is treated as one that may leave a line open.
-boundaryFormatters ∷ [String]
-boundaryFormatters = ["checks", "specdoc", "failed-examples", "silent"]
+-- | What an event of a formatter leaves on the line the handle is at.
+data Effect
+  = Silent -- ^ it writes nothing: the line is as it was
+  | EndsLine -- ^ it ends with a newline: the next write starts a line
+  | LeavesTransient -- ^ it ends with transient text and a held-back erase of it (progress reporting)
+  | LeavesOpen -- ^ it ends with content and no newline (a dot of the @progress@ formatter)
+  deriving stock (Eq, Show)
+
+-- | The model: for a formatter by the name @--format@ gives it, whether the runner reports progress and an event, what the event
+-- leaves on the line. It is checked against the bytes each event of each formatter writes
+-- ("Test.TerrainRuntime.OutputSpec" drives every formatter through every kind of event and compares). A formatter that is not
+-- named here leaves every event 'LeavesOpen': where the model is not certain, the line is taken to be open, which costs a
+-- newline and never a damaged record.
+eventEffect ∷ String → Bool → Event → Effect
+eventEffect formatter progress event = case formatter of
+  "checks" → case event of
+    Started → EndsLine
+    GroupStarted {} → EndsLine
+    GroupDone {} → Silent
+    Progress {} → transient
+    ItemStarted {} → transient
+    ItemDone {} → EndsLine
+    Done {} → EndsLine
+  "specdoc" → case event of
+    Started → EndsLine
+    GroupStarted {} → EndsLine
+    GroupDone {} → Silent
+    Progress {} → transient
+    ItemStarted {} → Silent
+    ItemDone {} → EndsLine
+    Done {} → EndsLine
+  "progress" → case event of
+    ItemDone {} → LeavesOpen
+    Done {} → EndsLine
+    _ → Silent
+  "failed-examples" → case event of
+    Done {} → EndsLine
+    _ → Silent
+  "silent" → Silent
+  _ → LeavesOpen
+  where
+    transient = if progress then LeavesTransient else Silent
+
+-- | The line state after an event of the given effect; an event that writes nothing leaves the state it found.
+afterEffect ∷ Effect → LineState → LineState
+afterEffect effect before = case effect of
+  Silent → before
+  EndsLine → AtLineStart
+  LeavesTransient → AfterTransient
+  LeavesOpen → MidLine
 
 -- | The configuration with every selectable formatter, and the default (@checks@), wrapped so that each of its events runs
--- under the output's lock and leaves the output's line state by what the formatter is known to do. The wrapped format is what
--- the runner calls for every event, from the reporting thread and, for progress, from the example threads; it returns when the
--- event has been written, so the lock covers all of it.
+-- under the output's lock and leaves the output's line state by the model of what the formatter writes ('eventEffect'). The
+-- wrapped format is what the runner calls for every event, from the reporting thread and, for progress, from the example
+-- threads; it returns when the event has been written, so the lock covers all of it.
 guardFormatters ∷ Output → Config → Config
 guardFormatters out cfg =
   cfg
     { configAvailableFormatters = wrapped
     , configFormat = case configFormat cfg of
-        Just f → Just (guardFormat out False f)
+        Just f → Just (guardFormat out "" f)
         Nothing → lookup "checks" wrapped
     }
   where
-    wrapped = [(name, guardFormat out (name `elem` boundaryFormatters) f) | (name, f) ← configAvailableFormatters cfg]
+    wrapped = [(name, guardFormat out name f) | (name, f) ← configAvailableFormatters cfg]
 
 -- | One formatter, guarded. The runner hands it the configuration it built, which says whether progress is reported
 -- ('formatConfigReportProgress': colour on and neither GitHub Actions nor Buildkite): then the runner has already hidden the
--- cursor (a control sequence, no newline) before the first event, and an item's start or progress is shown as transient text
--- with a held-back erase, so after those the line state is 'AfterTransient'. Otherwise no transient text is written and
--- nothing changes: every event of a boundary formatter leaves the handle at a line start, every event of another formatter
--- 'MidLine'.
-guardFormat ∷ Output → Bool → (FormatConfig → IO Format) → FormatConfig → IO Format
-guardFormat out endsAtBoundary make config = do
+-- cursor (a control sequence, no newline) before the first event, so the line starts 'AfterTransient' and stays so until an
+-- event that writes something moves it.
+guardFormat ∷ Output → String → (FormatConfig → IO Format) → FormatConfig → IO Format
+guardFormat out name make config = do
   format ← make config
   let progress = formatConfigReportProgress config
-      leavesTransient event = case event of
-        ItemStarted {} → progress
-        Progress {} → progress
-        _ → False
-      afterEvent event
-        | not endsAtBoundary = MidLine
-        | leavesTransient event = AfterTransient
-        | otherwise = AtLineStart
   withMVar (outLock out) $ \_ → writeIORef (outLineState out) (if progress then AfterTransient else AtLineStart)
   pure $ \event → withMVar (outLock out) $ \_ → do
+    before ← readIORef (outLineState out)
     writeIORef (outLineState out) MidLine
     format event
-    writeIORef (outLineState out) (afterEvent event)
+    writeIORef (outLineState out) (afterEffect (eventEffect name progress event) before)

@@ -27,20 +27,22 @@
 module Test.TerrainRuntime.OutputSpec (spec) where
 
 import Control.Concurrent (getNumCapabilities, setNumCapabilities)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar)
 import Control.Exception (bracket, finally)
 import Control.Monad (forM_)
 import Data.Char (isDigit)
-import Data.IORef (newIORef, readIORef, writeIORef)
-import Data.List (isInfixOf, isPrefixOf, sort, stripPrefix)
+import Data.IORef (modifyIORef, newIORef, readIORef, writeIORef)
+import Data.List (isInfixOf, isPrefixOf, isSuffixOf, sort, stripPrefix)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import System.Directory (getTemporaryDirectory, removeFile)
 import System.Environment (lookupEnv, setEnv, unsetEnv, withArgs)
 import GHC.IO.Handle (hDuplicate, hDuplicateTo)
-import System.IO (IOMode (ReadMode), hClose, hFlush, hGetContents', hSetEncoding, openTempFile, stdout, utf8, withFile)
+import System.IO (IOMode (ReadMode), hClose, hFileSize, hFlush, hPutStr, hGetContents', hSetEncoding, openTempFile, stdout, utf8, withFile)
 import Test.Hspec
-import Test.Hspec.Runner (Summary (..), runSpec)
-import Test.TerrainRuntime.Output (Output, globalOutput, newOutput, printLineOn, withOutputLocked)
+import Test.Hspec.Core.Format (Event (..), FailureReason (..), FormatConfig (..), Item (..), Result (..), Seconds (..), defaultFormatConfig)
+import Test.Hspec.Runner (Config (..), Summary (..), defaultConfig, runSpec)
+import Test.TerrainRuntime.Output (Effect (..), Output, eventEffect, globalOutput, guardFormatters, newOutput, printLineOn, withOutputLocked)
 import Test.TerrainRuntime.Runner (pinnedConfig)
 
 examples ∷ Int
@@ -229,7 +231,11 @@ runNested shape mode nested = do
 
 -- | The process's standard output while an action runs, as text. The caller holds the process's output lock.
 captured ∷ IO () → IO String
-captured action = do
+captured action = capturedWith (const action)
+
+-- | The same, handing the action a way to read how many bytes the capture holds so far (after flushing the handle).
+capturedWith ∷ (IO Int → IO ()) → IO String
+capturedWith action = do
   hFlush stdout
   tmp ← getTemporaryDirectory
   (path, h) ← openTempFile tmp "terrain-runtime-output-oracle.txt"
@@ -237,10 +243,73 @@ captured action = do
   hDuplicateTo h stdout
   caps ← getNumCapabilities
   setNumCapabilities 8
-  action `finally` (setNumCapabilities caps >> hFlush stdout >> hDuplicateTo saved stdout >> hClose saved >> hClose h)
+  action (hFlush stdout >> fromIntegral <$> hFileSize h) `finally` (setNumCapabilities caps >> hFlush stdout >> hDuplicateTo saved stdout >> hClose saved >> hClose h)
   text ← withFile path ReadMode $ \r → hSetEncoding r utf8 >> hGetContents' r
   removeFile path
   pure text
+
+-- | The complete event sequence of a small run, as the runner emits it: a start, a group, three items (one succeeding, one pending,
+-- one failing, each with info lines), progress, the end of the group and the end of the run.
+eventSequence ∷ [(String, Event)]
+eventSequence =
+  [ ("started", Started)
+  , ("group started", GroupStarted group)
+  , ("item 1 started", ItemStarted item1)
+  , ("item 1 progress", Progress item1 (1, 2))
+  , ("item 1 done (success)", ItemDone item1 (finished Success))
+  , ("item 2 started", ItemStarted item2)
+  , ("item 2 done (pending)", ItemDone item2 (finished (Pending Nothing (Just "not yet"))))
+  , ("item 3 started", ItemStarted item3)
+  , ("item 3 done (failure)", ItemDone item3 (finished (Failure Nothing (Reason "it failed"))))
+  , ("group done", GroupDone group)
+  , ("done", Done [(item1, finished Success), (item2, finished (Pending Nothing (Just "not yet"))), (item3, finished (Failure Nothing (Reason "it failed")))])
+  ]
+  where
+    group = ([], "group")
+    item1 = (["group"], "item 1")
+    item2 = (["group"], "item 2")
+    item3 = (["group"], "item 3")
+    finished result = Item Nothing (Seconds 0) "an info line\nand a second one" result
+
+-- | Where a record is printed in the sequence: before the first event, after each event.
+positionLabels ∷ [String]
+positionLabels = "before the first event" : ["after " <> label | (label, _) ← eventSequence]
+
+-- | What an event wrote, by its bytes: nothing; a newline last; an erase last (transient text); content with no newline.
+observedEffect ∷ String → Effect
+observedEffect written
+  | null written = Silent
+  | last written == '\n' = EndsLine
+  | "\ESC[K" `isSuffixOf` written = LeavesTransient
+  | otherwise = LeavesOpen
+
+-- | Drive one formatter, guarded the way the runner guards it and built the way the runner builds it (a real format configuration,
+-- the cursor hidden first when progress is reported), through 'eventSequence' directly, with no scheduling in it: with a record
+-- printed through the same output at the given positions (1 is before the first event, k + 1 after the k-th event). The bytes
+-- written, and what each event wrote by itself.
+driveSequence ∷ String → Bool → Bool → [Int] → IO (String, [(String, Effect)])
+driveSequence name colour progress recordAt = do
+  out ← newOutput
+  observed ← newIORef []
+  raw ← withOutputLocked globalOutput $ capturedWith $ \position → do
+    if progress then hPutStr stdout "\ESC[?25l" else pure ()
+    make ← maybe (fail ("no formatter " <> name)) pure (lookup name (configAvailableFormatters (guardFormatters out defaultConfig)))
+    format ← make defaultFormatConfig {formatConfigUseColor = colour, formatConfigReportProgress = progress, formatConfigExpectedTotalCount = 3}
+    let record' k = if k `elem` recordAt then printLineOn out (record k 1) else pure ()
+    record' 1
+    forM_ (zip [2 ..] eventSequence) $ \(k, (label, event)) → do
+      from ← position
+      format event
+      to ← position
+      modifyIORef observed ((label, (from, to)) :)
+      record' k
+    if progress then hPutStr stdout "\ESC[?25h" else pure ()
+  spans ← reverse <$> readIORef observed
+  pure (raw, [(label, observedEffect (take (to - from) (drop from raw))) | (label, (from, to)) ← spans])
+
+-- | The modes of the direct drive: colour, and whether the runner reports progress (it does only with colour).
+driveModes ∷ [(String, Bool, Bool)]
+driveModes = [("colour off", False, False), ("colour on as GitHub Actions", True, False), ("colour on with progress", True, True)]
 
 -- | The run did what its mode says: no escape at all with colour off (and none in a rendered capture), and with colour on one
 -- wherever the formatter writes anything but records (the silent formatter writes none).
@@ -268,6 +337,45 @@ spec = describe "the lines the suite prints and the runner's formatter's report"
         problems shape mixedParallel rowsPerExample sequentialExamples text `shouldBe` []
         failures `shouldBe` 0
         colourPresent shape mode text `shouldBe` True
+  forM_ shapes $ \shape →
+    forM_ driveModes $ \(modeLabel, colour, progress) →
+      it ("keeps a record whole at a line start at every position of a complete event sequence, alone and with the others, driven directly, and its model of what each event writes is what it writes (" <> shapeName shape <> ", " <> modeLabel <> ")") $ do
+        let positions = length positionLabels
+            visible t = concat [l | l ← lines (render t), not (isRecordLine l), not ("Finished in " `isPrefixOf` l)]
+        (raw, effects) ← driveSequence (shapeFormat shape) colour progress [1 .. positions]
+        (plain, _) ← driveSequence (shapeFormat shape) colour progress []
+        singles ← mapM (\k → (,) k . fst <$> driveSequence (shapeFormat shape) colour progress [k]) [1 .. positions]
+        let badPositions = [label | (k, label) ← zip [1 ..] positionLabels, record k 1 `notElem` lines raw]
+            -- a record printed alone, at one position: the first record the line state is asked about after the events before it
+            badAlone = [label | ((k, text), label) ← zip singles positionLabels, record k 1 `notElem` lines text || length [l | l ← lines text, isRecordLine l] /= 1 || visible text /= visible plain]
+            modelMisses = [label <> ": wrote " <> show seen <> ", the model says " <> show (eventEffect (shapeFormat shape) progress event) | ((label, seen), (_, event)) ← zip effects eventSequence, seen /= eventEffect (shapeFormat shape) progress event]
+        badAlone `shouldBe` []
+        badPositions `shouldBe` []
+        recordLineProblems positions 1 0 raw `shouldBe` []
+        length [l | l ← lines raw, isRecordLine l] `shouldBe` positions
+        modelMisses `shouldBe` []
+        visible raw `shouldBe` visible plain
+  forM_ shapes $ \shape →
+    it ("keeps the record printed between the start of the run and the first item's start whole, through the runner with the two events held in that order (" <> shapeName shape <> ", progress reported)") $ do
+      out ← newOutput
+      started ← newEmptyMVar
+      printed ← newEmptyMVar
+      let nested = parallel $ describe "barrier" $ it "prints between the start of the run and the first item's start" $ do
+            readMVar started
+            printLineOn out (record 1 1)
+            putMVar printed ()
+          observe make config' = do
+            format ← make config'
+            pure $ \event → case event of
+              Started → format event >> putMVar started ()
+              ItemStarted {} → readMVar printed >> format event
+              _ → format event
+      raw ← withOutputLocked globalOutput $ withPinnedEnvironment False $ captured $ do
+        config ← pinnedConfig out (shapeFormat shape) True 8
+        summary ← withArgs [] (runSpec nested config {configFormat = observe <$> configFormat config})
+        summaryFailures summary `shouldBe` 0
+      recordLineProblems 1 1 0 raw `shouldBe` []
+      length [l | l ← lines raw, isRecordLine l] `shouldBe` 1
   it "the check refuses a record joined to a partial formatter line, a cut record, a missing, a repeated record and a stray fragment" $ do
     let shape = Shape "specdoc" "specdoc" True False True True
         good = "\nstress\n" <> record 1 1 <> "\n  example 1\n" <> record 2 1 <> "\n  example 2\n\nFinished in 0.0100 seconds\n2 examples, 0 failures\n"
