@@ -10,6 +10,7 @@ import qualified Data.Map.Strict as Map
 import Hetoimasia.Terrain.Changes (changeColumnBytes, changeIntervalBytes)
 import Hetoimasia.Terrain.Coordinate (axisValue)
 import Hetoimasia.Terrain.Query (Occupied (..))
+import Hetoimasia.Terrain.Source (LayerSpec (..), SourceSpec (..))
 import Hetoimasia.Terrain.Runtime
 import Hetoimasia.Terrain.Runtime.Settlement
 import Test.Hspec
@@ -46,10 +47,23 @@ spec = describe "What a request keeps of a column" $ do
       grant host
       waitFor (readTVar (hostSettled host) >>= \s → check (not (null s)))
 
-  it "answers a surface dug out below its first window at its true top, reading further down" $
+  it "answers a surface whose column was dug out below the first window it reads at its true top, reading further down" $
     withService defaultConfig $ \svc → do
-      (_, lease) ← openMain svc "main"
-      -- soil reaches level 40: remove 40 down to 0, one run longer than the first window
-      mapM_ (\z → removeCell' svc lease (tile 7 7 z)) [40, 39 .. 0]
+      client ← okOf (registerClient svc)
+      -- stone below -10, air from -10 to 0, soil from 0 to 40
+      lease ← okOf (openArena svc client "caved" caved) >>= await svc >>= expectSuccess
+      -- the soil is removed (one run from 0, reaching into the first window), and the stone from -20 to -11
+      -- (another run, below the air: no window that ends at the first run's floor reaches it)
+      mapM_ (\z → removeCell' svc lease (tile 7 7 z)) ([0 .. 39] <> [-20 .. -11])
       answer ← okOf (surfaceAt svc lease (column 7 7)) >>= bounded . await svc >>= expectSuccess
-      fmap (axisValue . occupiedLevel) (surfaceTop answer) `shouldBe` Just (-1)
+      fmap (axisValue . occupiedLevel) (surfaceTop answer) `shouldBe` Just (-21)
+  where
+    caved =
+      SourceSpec
+        { specMaterials = ["soil", "stone"]
+        , specLayers =
+            [ LayerSpec {layerMin = Nothing, layerMax = Just (-10), layerMaterial = "stone", layerShape = 0}
+            , LayerSpec {layerMin = Just 0, layerMax = Just 40, layerMaterial = "soil", layerShape = 0}
+            ]
+        , specPatches = []
+        }
