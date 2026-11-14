@@ -1,5 +1,6 @@
 module Main (main) where
 
+import qualified Test.TerrainRuntime.Backed.Loop as BackedLoop
 import qualified Test.TerrainRuntime.Backed.Pause as BackedPause
 import qualified Test.TerrainRuntime.Store.Rebalance as StoreRebalance
 import qualified Test.TerrainRuntime.Store.Scattered as StoreScattered
@@ -34,3 +35,4 @@ fullDepth = do
   StoreFuzzTrees.fullSpec
   StoreCycles.fullSpec
   BackedPause.fullSpec
+  BackedLoop.fullSpec

@@ -315,6 +315,7 @@ test-suite terrain-runtime-full-depth-tests
         Test.TerrainRuntime.Output
         Test.TerrainRuntime.Isolation
         Test.TerrainRuntime.Runner
+        Test.TerrainRuntime.Backed.Loop
         Test.TerrainRuntime.Backed.Pause
         Test.TerrainRuntime.Fixtures
         Test.TerrainRuntime.Storage.Harness

@@ -13,12 +13,18 @@
 --   submission and the record of its ticket ('PointSlotStepped', taken uninterruptibly) arrives after
 --   the record: the owner ends with the job recorded, and the slot's credit (which covers the page
 --   images the job holds) stays reserved while the job is in flight.
-module Test.TerrainRuntime.Backed.Loop (spec) where
+module Test.TerrainRuntime.Backed.Loop (spec, fullSpec) where
 
 import Control.Concurrent (forkIO, myThreadId, throwTo)
 import Control.Concurrent.STM
-import Control.Exception (Exception, SomeException, finally, fromException, try)
+import Control.Exception (Exception, SomeException, fromException, try)
+import Control.Exception (finally)
 import Control.Monad (void)
+import Data.IORef (newIORef, readIORef, writeIORef)
+import Hetoimasia.Terrain.Coordinate (decomposeTile, mkLocalCoord)
+import Hetoimasia.Terrain.Residency (RegionDemand (..), coverageTile)
+import Hetoimasia.Terrain.Runtime.Store (StoreSpec (..))
+import Test.TerrainRuntime.Output (printLine)
 import qualified Data.Text as Text
 import Hetoimasia.Terrain.Runtime
 import Hetoimasia.Terrain.Runtime.Settlement
@@ -37,6 +43,57 @@ instance Exception Sent
 
 isWrite ∷ NativeOp → Bool
 isWrite = \case OpWriteAt {} → True; _ → False
+
+isRead ∷ NativeOp → Bool
+isRead = \case OpReadAt {} → True; _ → False
+
+fullSpec ∷ Spec
+fullSpec = describe "The owner's loop (full depth)" $
+  it "runs the maintenance a removal needs first ahead of it, once the pin that held the retirement backlog is released, and the removal then publishes" $ do
+    probe ← H.newProbe
+    -- the retirement backlog (16,384 pages) is reached before the allowance is
+    let config = defaultConfig {configStore = (configStore defaultConfig) {specAllowanceBytes = 192 * 1024 * 1024}}
+    withServiceSeam quiet config alwaysAdmitting noProbe (H.seamFor probe) $ \svc → do
+      (client, lease) ← openMain svc "main"
+      _ ← removeCell' svc lease (tile 0 0 (-32))
+      waitFor (backedAtRestSTM svc >>= check)
+      -- the pin: a view's load job whose page read is held, far from the removals
+      gate ← H.addGateOnce probe isRead
+      view ← okOf (openView svc client)
+      let (far, _) = decomposeTile (tile 100 100 0)
+      waiting ← newIORef Nothing
+      flip finally (H.openGate gate) $ do
+        _ ← okOf (setViewDemand svc view lease [RegionDemand far (either (error . show) coverageTile (mkLocalCoord 0 0 0))])
+        H.awaitReached gate 1
+        let cells = [(x, y, z) | z ← [-31 .. -1], y ← [0 .. 15], x ← [0 .. 15]]
+            go [] n = pure n
+            go ((x, y, z) : rest) n = do
+              host ← newHost True
+              request ← okOf (removeWith svc (hostEndpoint svc Nothing host) lease (tile x y z) Nothing)
+              -- each removal settles, or its arena is held for the maintenance it needs first
+              held ← waitFor $ readTVar (hostSettled host) >>= \case
+                _ : _ → pure False
+                [] → inspectMaintenanceFirstSTM svc >>= \k → if k > 0 then pure True else retry
+              if held
+                then n <$ writeIORef waiting (Just (host, request))
+                else do
+                  settledOf host >>= (`shouldSatisfy` \case [Succeeded _] → True; _ → False)
+                  retire svc request
+                  go rest (n + 1)
+        committed ← go cells (0 ∷ Int)
+        printLine ("maintenance-first trace: " <> show committed <> " removals committed before one needed maintenance first")
+        readIORef waiting >>= \case
+          Nothing → expectationFailure ("no removal needed maintenance first after " <> show committed)
+          Just (host, _) → settledOf host `shouldReturn` []
+      -- the load's read returns and its pin goes: maintenance runs first, then the removal publishes
+      okOf (clearViewDemand svc view)
+      closeView svc view
+      readIORef waiting >>= \case
+        Nothing → pure ()
+        Just (host, _) → do
+          _ ← waitFor (readTVar (hostSettled host) >>= \s' → if null s' then retry else pure s')
+          settledOf host >>= (`shouldSatisfy` \case [Succeeded (ARemoved r)] → removeChangedFlag r; _ → False)
+          atomically (inspectMaintenanceFirstSTM svc) `shouldReturn` 0
 
 spec ∷ Spec
 spec = describe "The owner's loop" $ do

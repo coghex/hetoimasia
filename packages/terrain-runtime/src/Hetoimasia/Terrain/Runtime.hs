@@ -123,6 +123,7 @@ module Hetoimasia.Terrain.Runtime
   , backedAtRestSTM
   , inspectIdleRepeatsSTM
   , inspectStorageJobsSTM
+  , inspectMaintenanceFirstSTM
   , inspectModel
   , inspectModelSTM
   , inspectDefects
@@ -567,6 +568,11 @@ inspectBacked svc = atomically (inspectBackedSTM svc)
 -- verification.
 inspectStorageQueuedSTM ∷ Service → STM Int
 inspectStorageQueuedSTM svc = Storage.snQueued <$> Storage.snapshotOf (serviceStorage svc)
+
+-- | How many arenas wait for a maintenance transaction before any other slot work of theirs (their
+-- work answered that maintenance must run first). Read-only, for verification.
+inspectMaintenanceFirstSTM ∷ Service → STM Int
+inspectMaintenanceFirstSTM svc = Set.size . stateNeedsMaintenance <$> readSt svc
 
 -- | How many jobs the storage service holds (queued, running, or finished and not yet taken).
 -- Read-only, for verification.
