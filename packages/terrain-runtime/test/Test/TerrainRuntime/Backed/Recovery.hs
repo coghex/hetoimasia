@@ -158,7 +158,9 @@ spec = describe "Recovery decided like publication" $ do
         H.openGate held
         waitFor (backedAtRestSTM svc >>= check)
         statusAfter ← arenaStatus svc lease >>= expectRight
-        (statusKnowledgeRevision statusAfter, statusDiscovery statusAfter) `shouldBe` (statusKnowledgeRevision statusBefore, DiscoveryPaused)
+        -- nothing of discovery published: its obligations and the knowledge are what they were
+        (statusPendingItems statusAfter, statusKnowledgeRevision statusAfter, statusDiscovery statusAfter)
+          `shouldBe` (statusPendingItems statusBefore, statusKnowledgeRevision statusBefore, DiscoveryPaused)
 
   it "ends the owner with a defect when a retry's probe meets a worker failure, never answering it as remaining" $
     withArena $ \probe svc lease → do
