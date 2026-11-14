@@ -165,7 +165,14 @@ pressureCase caller = do
           atomically (writeTVar (hostEligible grower) False)
         named "the growth's extra left pending" (arenaStatusSTM svc lease >>= either (const retry) (check . (> 0) . statusPendingReservedBytes))
       _ → pure ()
-    named "rest before the queue fills" (backedAtRestSTM svc >>= check)
+    -- internal work the setup left (discovery of the committed removals, reclamation of their retired
+    -- pages) is finished before the queue fills: otherwise it can take the slot just after, its read
+    -- queued behind the held reads, and hold it until they are let go
+    named "internal work finished and rest before the queue fills" $ do
+      backedAtRestSTM svc >>= check
+      arenaStatusSTM svc lease >>= \case
+        Right st → check (statusDiscovery st == DiscoveryIdle && statusPendingReclaimBytes st == 0)
+        Left _ → retry
     gate ← H.addGate probe isRead
     fillers ← flip finally (H.openGate gate) $ do
       fillers ← forM [0 .. 13] $ \x → do
