@@ -75,7 +75,7 @@ module Hetoimasia.Terrain.Runtime.Internal.Backed
   ) where
 
 import Control.Concurrent.STM
-import Control.Exception (Exception, evaluate)
+import Control.Exception (Exception, evaluate, uninterruptibleMask_)
 import Control.Monad (foldM, forM_, void, when)
 import Data.Int (Int64)
 import Data.List (sortOn)
@@ -669,7 +669,18 @@ contenders st = do
   waiting ← or <$> traverse waitingRemoval (Map.toList (stateRequests st))
   let internal = concatMap internalOf (Map.toList (stateArenas st))
       turn = stateExplicitRun st >= internalTurn
-  pure $ case (explicit, internal) of
+      -- MAINTENANCE THAT ANOTHER TRANSACTION NEEDS FIRST IS ITS PREREQUISITE, NOT A TURN: an arena whose
+      -- work answered that maintenance must run first ('MaintenanceFirst', 'HandleWaitReclaim') offers no
+      -- other slot work until its maintenance has published, and that maintenance is offered ahead of
+      -- every fairness choice
+      prerequisite =
+        [ ContendReclaim aid
+        | (aid, arena) ← Map.toList (stateArenas st)
+        , needsMaintenance aid
+        , not (integrityPaused arena)
+        , not (idle (aid, True) arena)
+        ]
+  pure . (prerequisite <>) $ case (explicit, internal) of
     ([], _) | waiting && not turn → []
     ([], _) → internal
     (_, []) → explicit
@@ -677,10 +688,12 @@ contenders st = do
       | turn → [i, e]
       | otherwise → [e, i]
   where
+    needsMaintenance aid = Set.member aid (stateNeedsMaintenance st)
     waitingRemoval (_, req) = case (reqCmd req, reqPhase req, reqArena req >>= \aid → Map.lookup aid (stateArenas st)) of
       (CRemove {}, phase, Just arena)
         | notDone phase
-        , null (conditions (arenaStore arena)) →
+        , null (conditions (arenaStore arena))
+        , maybe True (not . needsMaintenance) (reqArena req) →
             endpointEligible (reqEndpoint req)
       _ → pure False
     notDone = \case
@@ -707,7 +720,8 @@ contenders st = do
         , StagedRemoval prepared ← stagedWork sg
         , preparedChanged prepared
         , stagedRevision sg == arenaRevision arena
-        , null (conditions (arenaStore arena)) → do
+        , null (conditions (arenaStore arena))
+        , not (needsMaintenance aid) → do
             eligible ← endpointEligible (reqEndpoint req)
             pure [ContendRemoval rid aid tile | eligible]
       -- growth is admissible while paused: it is how a capacity pause is cleared (it changes no content)
@@ -724,13 +738,13 @@ contenders st = do
             pure [ContendRelease rid aid | eligible]
       _ → pure []
     internalOf (aid, arena)
+      -- an arena whose maintenance is a prerequisite offers it above and nothing else
+      | needsMaintenance aid = []
       | not (null (conditions (arenaStore arena))) = [ContendReclaim aid | reclaimWanted aid arena, not (integrityPaused arena)]
       | otherwise = [ContendReclaim aid | reclaimWanted aid arena] <> [ContendDiscovery aid | discoveryWanted aid arena]
     integrityPaused arena = CondIntegrity `elem` conditions (arenaStore arena)
     store = arenaStore
-    reclaimWanted aid arena =
-      Set.member aid (stateNeedsMaintenance st)
-        || (rootsRetired (store arena) > 0 && not (idle (aid, True) arena))
+    reclaimWanted aid arena = rootsRetired (store arena) > 0 && not (idle (aid, True) arena)
     discoveryWanted aid arena =
       D.pendingObligations (storeHeader (store arena)) > 0 && not (idle (aid, False) arena)
     idle key arena = Map.lookup key (stateInternalIdle st) == Just (storeVersion (store arena), oldestPin (store arena))
@@ -749,7 +763,7 @@ grantSlot svc contender = do
         Left _ → pure False
         Right (grant, adm') → do
           writeTVar (serviceEditBank svc) adm'
-          writeTVar (serviceState svc) st {stateSlot = Just (SlotTask aid work (SlotTxn (Txn.start (arenaStore arena) planner)) (Just grant) WakeNow False), stateNeedsMaintenance = Set.delete aid (stateNeedsMaintenance st)}
+          writeTVar (serviceState svc) st {stateSlot = Just (SlotTask aid work (SlotTxn (Txn.start (arenaStore arena) planner)) (Just grant) WakeNow False)}
           pure True
       live aid k = case (stateSlot st, Map.lookup aid (stateArenas st)) of
         (Nothing, Just arena) → k arena
@@ -807,6 +821,7 @@ stepSlot svc = do
               if wanted
                 then Txn.advance io (closingOf st aid) store run
                 else Txn.cancel io store run
+            uninterruptibleMask_ (probePoint (serviceProbe svc) (PointSlotStepped aid (Txn.runPhaseName run')))
             let task' = task {slotRun = SlotTxn run'}
                 keep wake = atomically (readSt svc >>= \s0 → sameCommittedSTM aid s0 store' >> modifySt svc (\s → (putStore aid store' s) {stateSlot = Just task' {slotWake = wake}}))
             case progress of
@@ -923,6 +938,9 @@ backedInvariants st adm compileBank sn =
        ]
     <> [ "the storage service holds " <> show backings <> " backings for " <> show wanted <> " to " <> show (wanted + reserving)
        | backings < wanted || backings > wanted + reserving
+       ]
+    <> [ "the owner chose " <> Text.unpack w <> " again with nothing changed"
+       | w ← stateIdleRepeats st
        ]
     <> [ "the edit bank holds " <> show (A.ledgers adm) <> " with no task and no job; the storage service's records need " <> show storageControl <> " of control"
        | idle

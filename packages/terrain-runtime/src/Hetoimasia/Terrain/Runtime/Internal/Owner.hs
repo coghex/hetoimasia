@@ -30,12 +30,13 @@ module Hetoimasia.Terrain.Runtime.Internal.Owner
 
 import Control.Applicative ((<|>))
 import Control.Concurrent.STM
-import Control.Exception (Exception, SomeAsyncException, SomeException, evaluate, fromException, mask, onException, rethrowIO, throwIO, try, tryWithContext, uninterruptibleMask_)
+import Control.Exception (Exception, SomeAsyncException, SomeException, evaluate, fromException, mask_, onException, rethrowIO, throwIO, try, tryWithContext, uninterruptibleMask_)
 import Control.Monad (forM, forM_, unless, void, when)
 import Data.Int (Int64)
 import Data.List (sortOn)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (catMaybes, isJust, listToMaybe)
+import Data.IORef (newIORef, readIORef, writeIORef)
+import Data.Maybe (catMaybes, fromMaybe, isJust, listToMaybe)
 import qualified Data.Sequence as Seq
 import qualified Data.Set as Set
 import Data.Text (Text)
@@ -51,7 +52,7 @@ import qualified Hetoimasia.Terrain.Residency as R
 import Hetoimasia.Terrain.Residency (ArenaId (..), RequestId (..), Revision (..))
 import Hetoimasia.Terrain.Resident (Resident, discardRegion, emptyResident)
 import Hetoimasia.Terrain.Runtime.Backed.Backend (Handling (..))
-import Hetoimasia.Terrain.Runtime.Backed.Txn (Done (..), runDraining)
+import Hetoimasia.Terrain.Runtime.Backed.Txn (Done (..), runDraining, runTicket)
 import Hetoimasia.Terrain.Runtime.Backed.Gather (gatherDraining)
 import Hetoimasia.Terrain.Runtime.Backed.Query (queryDraining)
 import Hetoimasia.Terrain.Runtime.Backed.Probe (probeDraining)
@@ -88,15 +89,20 @@ ownerDefinition svc =
   workerDefinition "terrain.runtime.owner" (\_ → pure () ∷ Scoped ()) $ \token () → ownerMain svc token
 
 ownerMain ∷ Service → StopToken → IO ()
-ownerMain svc token = mask $ \restore → do
+ownerMain svc token = mask_ $ do
   -- The cleanup covers the owner's whole execution, startup logging included, and
   -- is the last thing it does: nothing of the owner runs after it publishes that
   -- it stopped, so a logger is never used after the service has returned.
+  -- THE WHOLE LOOP RUNS MASKED. A storage effect and the record of its ticket, claim or grant are
+  -- one step with no interruptible operation between them, so an asynchronous exception reaches
+  -- the owner only where it deliberately waits: in 'nextWork''s blocking transaction (and at a test
+  -- probe's gate), never between an effect and its record.
+  lastIdle <- newIORef Nothing
   outcome <-
-    tryWithContext @SomeException . restore $ do
+    tryWithContext @SomeException $ do
       atomically (modifySt svc (\st → st {stateOwner = OwnerRunning}))
       logInfo logger terrainComponent "terrain owner started" []
-      loop
+      loop lastIdle
       logInfo logger terrainComponent "terrain owner stopped" []
   uninterruptibleMask_ (atomically terminal)
   -- Whatever the owner ended with, any defect the cleanup recorded (a host
@@ -112,17 +118,26 @@ ownerMain svc token = mask $ \restore → do
   forM_ combined rethrowIO
   where
     logger = serviceLogger svc
-    -- every step of work is taken masked: a storage effect and its record have no
-    -- interruptible instruction between them (neither transaction blocks)
-    loop = do
+    loop lastIdle = do
       work <- tryNonAsync (atomically (nextWork svc token)) >>= \case
         Right chosen → pure chosen
         Left failure → do
           -- Choosing work reads every host's eligibility: a callback that throws
           -- is a provider defect, recorded, and the owner ends.
           failWith svc (ProviderDefect (Text.pack ("eligibility callback failed: " <> show failure))) []
-      continue <- perform svc work
-      when continue loop
+      Step continue progressed <- perform svc work
+      -- NOTHING READY IS STARVED BY WORK THAT CANNOT PROGRESS: the chooser offers a kind of work only
+      -- when the step it chooses would change something. A step that changed nothing and is chosen
+      -- again next, with nothing performed between, is a chooser that disagrees with its step: it is
+      -- kept for the suite's oracle ('stateIdleRepeats').
+      previous <- readIORef lastIdle
+      if progressed
+        then writeIORef lastIdle Nothing
+        else do
+          when (previous == Just work) $
+            atomically (modifySt svc (\s → s {stateIdleRepeats = take 8 (Text.pack (show work) : stateIdleRepeats s)}))
+          writeIORef lastIdle (Just work)
+      when continue (loop lastIdle)
     -- Whatever ended the loop, every accepted request leaves the table settled exactly once,
     -- the owner's tasks give their edit-bank credits back and the owner is marked stopped.
     -- Non-blocking bookkeeping, so it is safe under the uninterruptible mask. A job a task
@@ -136,20 +151,33 @@ ownerMain svc token = mask $ \restore → do
       modifySt svc (\st → st {stateOwner = OwnerStopped})
 
 -- | The owner's tasks at its terminal step: their credits return to the edit bank and the
--- tasks are forgotten (their windows die with the owner).
+-- tasks are forgotten (their windows die with the owner). A gather's credit is its pin (what its
+-- read job holds the storage service charged at dispatch). The slot's credit also covers the page
+-- images a write job holds: while its run still holds a job, the slot and its credit are KEPT (the
+-- storage service drains that job at the end of its own scope, which outlives the owner).
 retireBackedSTM ∷ Service → STM ()
 retireBackedSTM svc = do
   st <- readSt svc
   forM_ (Map.elems (stateGathers st)) $ \task → modifyTVar' (serviceEditBank svc) (releaseCredit (gatherGrant task))
-  forM_ (stateSlot st >>= slotCredit) $ \g → modifyTVar' (serviceEditBank svc) (releaseCredit g)
+  let holdsJob = maybe False (slotHoldsJob . slotRun) (stateSlot st)
+  unless holdsJob $ forM_ (stateSlot st >>= slotCredit) $ \g → modifyTVar' (serviceEditBank svc) (releaseCredit g)
   modifySt svc $ \s →
     s
       { stateGathers = Map.empty
-      , stateSlot = Nothing
+      , stateSlot = if holdsJob then stateSlot s else Nothing
       , stateOpens = Map.empty
       , stateCompiling = Nothing
       , stateLoadJobs = Map.empty
       }
+
+-- | Whether a slot's run holds a job of the storage service (submitted and not yet taken).
+slotHoldsJob ∷ SlotRun → Bool
+slotHoldsJob = \case
+  SlotTxn run → isJust (runTicket run)
+  SlotGrow run → isJust (Growth.growthTicket run)
+
+-- | What a step did: whether the owner goes on, and whether it changed anything.
+data Step = Step !Bool !Bool
 
 -- | One piece of owner work.
 data Work
@@ -169,6 +197,7 @@ data Work
   | WSlot
   | WGrant !Contender
   | WDrain !ArenaId
+  deriving stock (Eq, Show)
 
 -- | Choose the next quantum, or wait until there is one. A transaction that retries wakes
 -- when any state it read changes: a new command, a cancellation, a host's eligibility grant,
@@ -225,7 +254,7 @@ nextWork svc token = do
                     <> ")"
               yieldToGrant <- if closing || isJust (stateSlot st) then pure False else readsYieldToGrant st adm storage
               let holdReads = yieldToGrant || queueFull || pressed
-              (prepareWork, commitWork) <- pickRequestWork svc st adm holdReads
+              (prepareWork, commitWork) <- pickRequestWork svc st adm open holdReads
               grantWork <- if closing || isJust (stateSlot st) || pressed then pure Nothing else grantable st adm
               -- a load is dispatched when the job the model would pick next can start its pinned read
               -- (only that job's arena needs a pin to spare)
@@ -233,7 +262,15 @@ nextWork svc token = do
                 if not holdReads && not (stateDispatchIdle st) && any ((== R.JobQueued) . R.jobPhase) (R.modelJobs model)
                   then nextDispatchFits svc st adm
                   else pure False
-              let (backedNow, backedWaits) = backedWork st
+              -- A WAIT THAT IS SATISFIED IS READY WORK: each backed task is taken in its turn whether it
+              -- was ready at once or its wait has been met (a finished job is never left untaken behind
+              -- other work); only when nothing at all is ready does the owner block on the waits
+              let tasks = backedTasks st
+              readyTasks <- forM tasks $ \case
+                Left w → pure (Just w)
+                Right (wait, w) → (Just w <$ wait) `orElse` pure Nothing
+              let backedNow = catMaybes readyTasks
+                  backedWaits = [(wait, w) | Right (wait, w) ← tasks]
                   -- THE FAIRNESS RULE. Staging, commits, retries, load dispatches and the backed
                   -- steps take turns whenever two or more are ready: each ready kind gets one
                   -- quantum in every five, whatever the others are being fed. Within commits the
@@ -293,9 +330,9 @@ instance Exception DispatchPeek
 backedIdle ∷ St → Bool
 backedIdle st = Map.null (stateOpens st) && Map.null (stateGathers st) && not (isJust (stateSlot st)) && Map.null (stateClosing st)
 
--- | The backed steps that can be taken now, and those that wait for a job.
-backedWork ∷ St → ([Work], [(STM (), Work)])
-backedWork st = (now, waits)
+-- | The backed steps, in the order they take turns: each ready now ('Left') or once its wait is met.
+backedTasks ∷ St → [Either Work (STM (), Work)]
+backedTasks st = [t | Just t ← tasks]
   where
     -- the slot and the drains first (one each, bounded), then the opens, then the pinned reads in
     -- turn after the one stepped last
@@ -307,8 +344,6 @@ backedWork st = (now, waits)
     inTurn gathers = case stateGatherCursor st of
       Nothing → gathers
       Just cursor → let (before, after) = span ((<= cursor) . fst) gathers in after <> before
-    now = [w | Just (Left w) ← tasks]
-    waits = [(stm, w) | Just (Right (stm, w)) ← tasks]
     wakeOr wake work = case wake of
       WakeNow → Just (Left work)
       WakeOn stm → Just (Right (stm, work))
@@ -444,8 +479,8 @@ needsResubmit req = isDataCmd (reqCmd req) && waitingReadmission req
 -- | Work for the request table: stage whatever has its data (a read or a removal starts its
 -- gather; an open its preparation), then commit the next eligible command of each arena in
 -- admission order. A removal that changes content is not committed here: it takes the slot.
-pickRequestWork ∷ Service → St → A.Admission → Bool → STM (Maybe Work, Maybe Work)
-pickRequestWork svc st adm holdReads = do
+pickRequestWork ∷ Service → St → A.Admission → Bool → Bool → STM (Maybe Work, Maybe Work)
+pickRequestWork svc st adm open holdReads = do
   candidates <- fmap catMaybes (forM (Map.elems groups) firstEligible)
   pure
     ( case filter needsPrepare ordered of (rid, _) : _ → Just (WPrepare rid); [] → Nothing
@@ -515,53 +550,53 @@ pickRequestWork svc st adm holdReads = do
       if not eligible
         then firstEligible rest
         else pure $ case reqPhase req of
-          StagedPhase sg
-            | not (stale sg)
-            , not (takesSlot sg)
-            , openMayCommit (reqCmd req) →
-                Just (reqSeq req, rid)
+          -- a commit is offered only when its arbitration would decide something
+          StagedPhase sg | not (commitWaits st open rid req sg) → Just (reqSeq req, rid)
           _ → Nothing
-    takesSlot sg = case stagedWork sg of
-      StagedRemoval prepared → preparedChanged prepared
-      StagedGrowth _ → True
-      StagedRelease → True
-      StagedAnswer _ → False
-      StagedControl → False
-    -- opens publish in the order their incarnations were allocated
-    openMayCommit = \case
-      COpen {} → True
-      _ → True
 
 -- ---------------------------------------------------------------------------
 -- Performing work
 
-perform ∷ Service → Work → IO Bool
+-- | Take one piece of work. Every step says whether it changed anything: a step chosen by the same
+-- predicate its work decides by can be idle only when something it reads outside the owner (a host's
+-- eligibility) changed between the choice and the step.
+perform ∷ Service → Work → IO Step
 perform svc = \case
-  WStop → pure False
-  WCloseSession → atomically (closeServiceSTM svc) >> pure True
-  WVictim key → releaseVictim svc key >> pure True
+  WStop → pure (Step False True)
+  WCloseSession → atomically (closeServiceSTM svc) >> done
+  WVictim key → releaseVictim svc key >> done
   WAck jid → do
-    atomically (void (applyEvent svc (R.JobAcknowledged jid)) >> endJobWork svc jid >> forgetLoad svc jid >> markFreed svc)
-    pure True
-  WPrepare rid → takeTurn svc TurnCommit >> prepareReq svc rid >> pure True
-  WCommit rid → takeTurn svc TurnRetry >> commitReq svc rid >> pure True
-  WRetry → takeTurn svc TurnDispatch >> retryPass svc >> pure True
-  WDispatch → takeTurn svc TurnBacked >> dispatchJob svc >> pure True
-  WRegather jid → takeTurn svc TurnBacked >> regatherJob svc jid >> pure True
+    acknowledged <- atomically $ applyEvent svc (R.JobAcknowledged jid) >>= \case
+      Right _ → True <$ (endJobWork svc jid >> forgetLoad svc jid >> markFreed svc)
+      -- the chooser offers only a job the model has in its cancelling phase: a refusal is the model's
+      -- defect, and acknowledging again could never change it
+      Left refusal → False <$ recordDefect svc (AccountingDefect (Text.pack ("the model refused a cancelled job's acknowledgement: " <> show refusal)))
+    pure (Step True acknowledged)
+  WPrepare rid → takeTurn svc TurnCommit >> Step True <$> prepareReq svc rid
+  WCommit rid → takeTurn svc TurnRetry >> Step True <$> commitReq svc rid
+  WRetry → takeTurn svc TurnDispatch >> retryPass svc >> done
+  WDispatch → takeTurn svc TurnBacked >> Step True <$> dispatchJob svc
+  WRegather jid → takeTurn svc TurnBacked >> regatherJob svc jid >> done
   WOpen rid → do
     takeTurn svc TurnPrepare
-    before <- stateCompiling <$> atomically (readSt svc)
+    before <- atomically (readSt svc)
     stepOpen svc (ops svc) rid
     after <- stateCompiling <$> atomically (readSt svc)
     -- the session's one compilation was charged to the compile account and starts now
-    when (before /= Just rid && after == Just rid) (probe svc (PointCompiling rid))
-    pure True
+    when (stateCompiling before /= Just rid && after == Just rid) (probe svc (PointCompiling rid))
+    pure (Step True (Map.member rid (stateOpens before)))
   WGather key → do
     takeTurn svc TurnPrepare
-    atomically (modifySt svc (\s → s {stateGatherCursor = Just key}))
+    present <- atomically $ do
+      modifySt svc (\s → s {stateGatherCursor = Just key})
+      Map.member key . stateGathers <$> readSt svc
     stepGatherTask svc key (delivered svc key)
-    pure True
-  WSlot → takeTurn svc TurnPrepare >> slotStep svc >> pure True
+    pure (Step True present)
+  WSlot → do
+    takeTurn svc TurnPrepare
+    present <- isJust . stateSlot <$> atomically (readSt svc)
+    slotStep svc
+    pure (Step True present)
   WGrant contender → do
     takeTurn svc TurnPrepare
     granted <- atomically (grantSlot svc contender)
@@ -571,8 +606,12 @@ perform svc = \case
       ContendRelease rid aid → PointGranted (Just rid) aid
       ContendDiscovery aid → PointGranted Nothing aid
       ContendReclaim aid → PointGranted Nothing aid
-    pure True
-  WDrain aid → takeTurn svc TurnPrepare >> closeDrained svc aid >> pure True
+    pure (Step True granted)
+  WDrain aid → do
+    takeTurn svc TurnPrepare
+    present <- Map.member aid . stateClosing <$> atomically (readSt svc)
+    closeDrained svc aid
+    pure (Step True present)
   WReport → do
     -- A defect was recorded where nothing could throw (a host callback that failed
     -- inside a closing transaction). The cleanup is committed; now the owner ends
@@ -584,13 +623,15 @@ perform svc = \case
         Right () → throwIO (OwnerDefect "a defect was not thrown")
     combined <- composeCleanup Nothing evidence
     forM_ combined rethrowIO
-    pure True
+    done
+  where
+    done = pure (Step True True)
 
 -- | What the backed steps need of the owner.
 ops ∷ Service → OwnerOps
 ops svc =
   OwnerOps
-    { opsStage = stage svc
+    { opsStage = \rid aid rev work → void (stage svc rid aid rev work)
     , opsDefect = \defect → failWith svc defect []
     }
 
@@ -653,8 +694,9 @@ releaseVictim svc key@(aid, region) = do
 -- | Start the next queued load job: the model dispatches it (it holds a load-job slot from
 -- now to its report) and its region's columns are gathered from the committed store; the
 -- job's work runs when they have been read.
-dispatchJob ∷ Service → IO ()
+dispatchJob ∷ Service → IO Bool
 dispatchJob svc = do
+  idleBefore <- stateDispatchIdle <$> atomically (readSt svc)
   -- The job's record (made when the model admitted it) is marked running in the transaction that
   -- dispatches it: it holds a load-job slot from now to its report. 'PointJob' is reported in
   -- dispatch order, as the job is about to run; its pinned read of the store starts after it.
@@ -686,6 +728,8 @@ dispatchJob svc = do
     forM_ (either Just (const Nothing) started) $ \why → do
       defect <- atomically (forgetLoad svc jid >> finishJob svc jid (Left why))
       forM_ defect $ \text → failWith svc (AccountingDefect text) []
+  idleAfter <- stateDispatchIdle <$> atomically (readSt svc)
+  pure (isJust dispatched || idleAfter /= idleBefore)
 
 -- | Start again the pinned read of a dispatched load whose read was refused for temporary pressure
 -- (the job kept its load-job slot and its charges); a read that cannot start ends the job as a
@@ -764,7 +808,7 @@ delivered svc key gathered = (case key of GatherRequest rid → probe svc (Point
   (GatherRequest rid, GatheredKnowledge known content knowledge) → do
     st <- atomically (readSt svc)
     forM_ (Map.lookup rid (stateRequests st) >>= reqArena) $ \aid →
-      stageWith svc rid (Just aid) content knowledge Nothing (StagedAnswer (AKnowledge (KnowledgeAnswer aid content knowledge known)))
+      void $ stageWith svc rid (Just aid) content knowledge Nothing (StagedAnswer (AKnowledge (KnowledgeAnswer aid content knowledge known)))
   (GatherJob jid, GatheredKnowledge {}) → failWith svc (OwnerDefect (Text.pack ("a load job's read answered knowledge: " <> show jid))) []
   (GatherJob jid, GatheredProbe {}) → failWith svc (OwnerDefect (Text.pack ("a load job's read answered a probe: " <> show jid))) []
   (GatherRequest rid, GatheredProbe probed passed basis) → finishRetry svc rid (if passed then probed else []) basis
@@ -818,7 +862,7 @@ stageFromRuns svc rid runs revision = do
                 Nothing → pure ()
                 Just (Left failure) → atomically (terminate svc rid (Failed (HostFailure (Text.pack ("preparation failed: " <> show failure)))))
                 Just (Right (Left why)) → atomically (terminate svc rid (Failed (HostFailure (Text.pack ("preparation refused: " <> why)))))
-                Just (Right (Right prepared)) → stage svc rid (Just aid) revision (StagedRemoval prepared)
+                Just (Right (Right prepared)) → void $ stage svc rid (Just aid) revision (StagedRemoval prepared)
             cmd →
               running svc rid (probe svc (PointCaptured rid aid revision) >> evaluate (readAnswer config aid revision (arenaSource arena) changes cmd)) >>= \case
                 Nothing → pure ()
@@ -829,7 +873,7 @@ stageFromRuns svc rid runs revision = do
                   | demands /= reqDemand req → atomically $ do
                       modifySt svc (\s → s {stateRequests = Map.adjust (\q → q {reqDemand = demands}) rid (stateRequests s)})
                       readmitSTM svc rid
-                  | otherwise → stage svc rid (Just aid) revision (StagedAnswer answer)
+                  | otherwise → void $ stage svc rid (Just aid) revision (StagedAnswer answer)
   where
     config = serviceConfig svc
 
@@ -867,22 +911,28 @@ handleRequest svc rid = \case
 
 -- | Start the staging of a request: an open's preparation, an attach's arbitration, or the
 -- gather of the runs a read or a removal reads.
-prepareReq ∷ Service → RequestId → IO ()
+-- | Prepare a request: stage what it needs no read for, or start its read. Answers whether anything
+-- was staged, settled or started.
+prepareReq ∷ Service → RequestId → IO Bool
 prepareReq svc rid = do
   probe svc (PointPreparing rid)
   st <- atomically (readSt svc)
-  forM_ (Map.lookup rid (stateRequests st)) $ \req → case reqCmd req of
-    COpen _ source _ → atomically (beginOpen svc rid source)
+  let withArena req k = maybe (pure False) k (reqArena req >>= \aid → (,) aid <$> Map.lookup aid (stateArenas st))
+      started aid what = atomically (startGatherFor svc (GatherRequest rid) aid what)
+  case Map.lookup rid (stateRequests st) of
+   Nothing → pure False
+   Just req → case reqCmd req of
+    COpen _ source _ → not (Map.member rid (stateOpens st)) <$ atomically (beginOpen svc rid source)
     CAttach {} → stage svc rid Nothing (Revision 0) StagedControl
-    CGrow bytes → forM_ (reqArena req >>= \aid → (,) aid <$> Map.lookup aid (stateArenas st)) $ \(aid, arena) →
+    CGrow bytes → withArena req $ \(aid, arena) →
       -- the store's pure proposal against the allowance as it is now: equal is an idempotent success,
       -- smaller is storage_size_not_increased, larger takes the slot when the host is eligible
       case proposeGrowth (arenaStore arena) (toInteger bytes) of
         GrowthNoOp → stageCreator svc rid aid arena (StagedAnswer (AGrown (GrowAnswer aid bytes False)))
-        GrowthNotIncreased → atomically (terminate svc rid (Failed (StorageFailed (FaultSizeNotIncreased (cfgAllowanceBytes (storeConfig (arenaStore arena))) bytes))))
-        GrowthInvalid why → atomically (terminate svc rid (Failed (HostFailure (Text.pack ("an admitted growth became invalid: " <> show why)))))
+        GrowthNotIncreased → True <$ atomically (terminate svc rid (Failed (StorageFailed (FaultSizeNotIncreased (cfgAllowanceBytes (storeConfig (arenaStore arena))) bytes))))
+        GrowthInvalid why → True <$ atomically (terminate svc rid (Failed (HostFailure (Text.pack ("an admitted growth became invalid: " <> show why)))))
         GrowthProposed proposal → stageCreator svc rid aid arena (StagedGrowth proposal)
-    CRetry → forM_ (reqArena req >>= \aid → (,) aid <$> Map.lookup aid (stateArenas st)) $ \(aid, arena) →
+    CRetry → withArena req $ \(aid, arena) →
      -- an extra an earlier growth left pending is released first, under the slot; the retry then goes on
      if gvReleasing (growthView (arenaStore arena))
       then stageCreator svc rid aid arena StagedRelease
@@ -890,16 +940,16 @@ prepareReq svc rid = do
       -- bounded revalidation of what paused the arena (the recorded pages read again); capacity is
       -- checked when the retry finishes. The answer stands on the basis read here.
       case retryProbe arena of
-        ([], _) → finishRetry svc rid [] (creatorBasisOf arena)
-        (pages, probed) → void (atomically (startGatherFor svc (GatherRequest rid) aid (ReadPages pages probed (creatorBasisOf arena))))
-    CKnowledge tile → forM_ (reqArena req) $ \aid → void (atomically (startGatherFor svc (GatherRequest rid) aid (ReadKnowledge tile)))
-    cmd → forM_ (reqArena req) $ \aid → void (atomically (startGatherFor svc (GatherRequest rid) aid (ReadRuns (commandColumns cmd))))
+        ([], _) → True <$ finishRetry svc rid [] (creatorBasisOf arena)
+        (pages, probed) → started aid (ReadPages pages probed (creatorBasisOf arena))
+    CKnowledge tile → maybe (pure False) (\aid → started aid (ReadKnowledge tile)) (reqArena req)
+    cmd → maybe (pure False) (\aid → started aid (ReadRuns (commandColumns cmd))) (reqArena req)
 
 -- | Publish staged work and tell the host it is ready. Work whose arena has moved
 -- on since it was computed is dropped; the owner computes it again. A readiness
 -- callback that fails is a provider defect: nothing is staged, the defect is
 -- recorded, and the owner ends, settling every request once.
-stage ∷ Service → RequestId → Maybe ArenaId → Revision → StagedWork → IO ()
+stage ∷ Service → RequestId → Maybe ArenaId → Revision → StagedWork → IO Bool
 stage svc rid aid rev work = do
   st <- atomically (readSt svc)
   let knowledge = maybe (Revision 0) (D.authKnowledge . arenaAuthority) (aid >>= \a → Map.lookup a (stateArenas st))
@@ -908,21 +958,21 @@ stage svc rid aid rev work = do
 -- | Stage a creator command's work (a growth, a retry) with the arena's allowance and growth state
 -- as its preparation read them, from the arena as it was then: published only if they still hold,
 -- and stale (prepared again) once either moves.
-stageCreator ∷ Service → RequestId → ArenaId → Arena → StagedWork → IO ()
+stageCreator ∷ Service → RequestId → ArenaId → Arena → StagedWork → IO Bool
 stageCreator svc rid aid arena = stageWith svc rid (Just aid) (arenaRevision arena) (D.authKnowledge (arenaAuthority arena)) (Just (creatorBasisOf arena))
 
 -- | 'stage' with the knowledge revision the work was read at and, for a creator command, the basis
 -- its preparation read.
-stageWith ∷ Service → RequestId → Maybe ArenaId → Revision → Revision → Maybe CreatorBasis → StagedWork → IO ()
+stageWith ∷ Service → RequestId → Maybe ArenaId → Revision → Revision → Maybe CreatorBasis → StagedWork → IO Bool
 stageWith svc rid aid rev knowledge basis work =
   tryNonAsync (atomically publish') >>= \case
-    Right () → pure ()
+    Right staged → pure staged
     Left failure → do
       failWith svc (ProviderDefect (Text.pack ("readiness callback failed: " <> show failure))) [("request", Text.pack (show rid))]
   where
     publish' = do
         st <- readSt svc
-        forM_ (Map.lookup rid (stateRequests st)) $ \req → do
+        fmap (fromMaybe False) . forM (Map.lookup rid (stateRequests st)) $ \req → do
           let arena = aid >>= \a → Map.lookup a (stateArenas st)
               fresh = case aid of
                 Nothing → True
@@ -933,9 +983,10 @@ stageWith svc rid aid rev knowledge basis work =
             -- A failing readiness callback abandons this transaction: the work stays
             -- unstaged and cannot commit. The caller treats it as a provider defect.
             endpointReady (reqEndpoint req)
+          pure (fresh && pending)
 
 -- | Offer staged work to the arbitration.
-commitReq ∷ Service → RequestId → IO ()
+commitReq ∷ Service → RequestId → IO Bool
 commitReq svc rid = do
   probe svc (PointBeforeCommit rid)
   attempt <- tryNonAsync (atomically (commitTx svc rid))
@@ -943,10 +994,11 @@ commitReq svc rid = do
     Right (CommitDone aid rev) → do
       forM_ rev (probe svc . PointCommitted rid)
       forM_ aid $ \a → safeLog svc (logInfo (serviceLogger svc) terrainComponent "arena opened" [("arena", Text.pack (show a))])
+      pure True
     Right (CommitDefect why) → do
       atomically (terminate svc rid (Failed (HostFailure why)))
       failWith svc (AccountingDefect why) [("request", Text.pack (show rid))]
-    Right CommitWaiting → pure ()
+    Right CommitWaiting → pure False
     Left failure → do
       -- A host callback failed inside the arbitration. Nothing was committed
       -- (the transaction was abandoned); the request ends without a second
@@ -971,12 +1023,38 @@ commitTx svc rid = do
   st <- readSt svc
   case Map.lookup rid (stateRequests st) of
     Just req | StagedPhase sg <- reqPhase req →
-      if statePhase st /= Running || not open
+      if commitWaits st open rid req sg
         then pure CommitWaiting
         else do
           eligible <- endpointEligible (reqEndpoint req)
           if eligible then commitStaged svc st rid req sg else pure CommitWaiting
     _ → pure CommitWaiting
+
+-- | Whether the arbitration of this staged request would wait, its host's eligibility apart. The
+-- chooser ('pickRequestWork') and the arbitration ('commitTx') ask this same question, so a commit
+-- is chosen only when its arbitration decides something: it settles, fails, or installs.
+commitWaits ∷ St → Bool → RequestId → Req → Staged → Bool
+commitWaits st open rid req sg
+  | statePhase st /= Running || not open = True
+  | otherwise = case (reqCmd req, stagedWork sg) of
+      -- a source that fails to intern settles at once; otherwise the open waits for its preparation,
+      -- and opens publish in the order their incarnations were allocated
+      (COpen _ source _, StagedControl)
+        | Left _ <- internSourceMaterials source emptyPalette → False
+        | otherwise → maybe True (\(aid, _, _, _, _) → not (openOrderAllows st aid)) (openReady st rid)
+      (CAttach {}, StagedControl) → False
+      -- a removal that changes content takes the slot; one of air commits here
+      (CRemove {}, StagedRemoval prepared) → preparedChanged prepared || not fresh
+      (_, StagedAnswer _) → not fresh
+      -- a growth or a release takes the slot
+      _ → True
+  where
+    fresh = case stagedArena sg >>= \aid → Map.lookup aid (stateArenas st) of
+      Just arena → arenaRevision arena == stagedRevision sg && knowledgeFresh arena && creatorFresh arena sg
+      Nothing → False
+    knowledgeFresh arena = case stagedWork sg of
+      StagedAnswer (AKnowledge _) → D.authKnowledge (arenaAuthority arena) == stagedKnowledge sg
+      _ → True
 
 commitStaged ∷ Service → St → RequestId → Req → Staged → STM CommitResult
 commitStaged svc st rid req sg = case (reqCmd req, stagedWork sg) of
@@ -1194,7 +1272,13 @@ slotOver svc task done = do
     (SlotRelease _, _) → failWith svc (OwnerDefect "a release reached a store transaction") []
     (SlotDiscovery, NothingToDo) → markIdle False
     (SlotDiscovery, ReaderBlocks _ _) → markIdle False
-    (SlotReclaim, NothingToDo) → markIdle True
+    -- maintenance another transaction needs first, with nothing to do: nothing could ever let that
+    -- transaction plan, so the arena would wait forever. Loud, never a wait
+    (SlotReclaim, NothingToDo) → do
+      marked <- Set.member aid . stateNeedsMaintenance <$> atomically (readSt svc)
+      if marked
+        then failWith svc (OwnerDefect "maintenance another transaction needs first had nothing to do") [("arena", Text.pack (show aid))]
+        else markIdle True
     (SlotReclaim, ReaderBlocks _ _) → markIdle True
   where
     aborted aid work = \case

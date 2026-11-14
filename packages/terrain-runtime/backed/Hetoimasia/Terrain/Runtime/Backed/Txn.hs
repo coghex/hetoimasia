@@ -52,6 +52,7 @@ module Hetoimasia.Terrain.Runtime.Backed.Txn
   , runPlan
   , runPhaseName
   , runDraining
+  , runTicket
   , Progress (..)
   , Done (..)
   , advance
@@ -157,6 +158,16 @@ runPlan (Run phase) = case phase of
   Planning _ → Nothing
   Fetching {} → Nothing
   Draining Nothing _ _ → Nothing
+  Over → Nothing
+
+-- | The job of the storage service the run holds (submitted and not yet taken), if any.
+runTicket ∷ Run → Maybe Ticket
+runTicket (Run phase) = case phase of
+  Fetching _ _ _ ticket → ticket
+  Writing _ _ ticket → Just ticket
+  Draining _ ticket _ → Just ticket
+  Planning _ → Nothing
+  Written {} → Nothing
   Over → Nothing
 
 -- | Whether the run has been cancelled and waits for its job to drain.

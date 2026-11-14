@@ -496,6 +496,10 @@ data Point
     PointGathered !RequestId
   | -- | A growth's or a pending extra's release's run in the slot has ended (the slot is free).
     PointGrowthEnded !ArenaId
+  | -- | The slot's transaction took a step (named by the phase it is now in) and the owner is about
+    -- to record it. Reported under an uninterruptible mask: an exception sent to the owner while a
+    -- test holds this point arrives after the point, which is between the step's effect and its record.
+    PointSlotStepped !ArenaId !Text
   deriving stock (Eq, Show)
 
 -- | An unexpected defect, kept with bounded context.
@@ -1072,8 +1076,16 @@ data St = St
     -- could do, at the committed version and the oldest pinned version it found it at: not
     -- offered again until either moves (a commit, or a reader's release), so it never spins.
     stateInternalIdle ∷ !(Map (ArenaId, Bool) (Word64, Maybe Word64))
-  , -- | Arenas whose loose list needs a maintenance transaction before anything else.
+  , -- | Arenas whose work answered that maintenance must run first ('MaintenanceFirst',
+    -- 'HandleWaitReclaim'): nothing else of the arena takes the slot until a maintenance transaction
+    -- of it has published. Set by the owner when such an answer ends a transaction; cleared by that
+    -- publication, and when the arena closes.
     stateNeedsMaintenance ∷ !(Set ArenaId)
+  , -- | The owner's work that was chosen again, with nothing performed between, after a step of it
+    -- that changed nothing (at most eight, newest first). The chooser offers work only when its step
+    -- would change something, so the suite's oracle requires this to stay empty. Written by the owner
+    -- loop only; never reset.
+    stateIdleRepeats ∷ ![Text]
   , -- | Closed arenas whose backing is still draining or closing.
     stateClosing ∷ !(Map ArenaId Closing')
   , -- | The region and coverage of each load job the owner is running (its gather reads the
@@ -1126,6 +1138,7 @@ initialState config limits =
     , stateStoragePressure = Nothing
     , stateInternalIdle = Map.empty
     , stateNeedsMaintenance = Set.empty
+    , stateIdleRepeats = []
     , stateClosing = Map.empty
     , stateLoadJobs = Map.empty
     , stateNextSource = 1

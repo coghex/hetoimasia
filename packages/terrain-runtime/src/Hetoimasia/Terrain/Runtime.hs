@@ -121,6 +121,8 @@ module Hetoimasia.Terrain.Runtime
   , inspectBacked
   , inspectCompileSTM
   , backedAtRestSTM
+  , inspectIdleRepeatsSTM
+  , inspectStorageJobsSTM
   , inspectModel
   , inspectModelSTM
   , inspectDefects
@@ -561,14 +563,15 @@ inspectInvariants svc = invariants (serviceConfig svc) <$> readTVarIO (serviceSt
 inspectBacked ∷ Service → IO [String]
 inspectBacked svc = atomically (inspectBackedSTM svc)
 
--- | Whether the owner's backed work is at rest: no open, pinned read, mutating transaction or
--- closing file of the owner's, no job of the storage service, and every row of 'inspectBacked'
--- holds (so the edit bank holds only the storage service's own records). Read-only, for
--- verification: a test waits on it instead of on a figure of the bank.
 -- | How many jobs wait in the storage service's queue (it takes at most eight). Read-only, for
 -- verification.
 inspectStorageQueuedSTM ∷ Service → STM Int
 inspectStorageQueuedSTM svc = Storage.snQueued <$> Storage.snapshotOf (serviceStorage svc)
+
+-- | How many jobs the storage service holds (queued, running, or finished and not yet taken).
+-- Read-only, for verification.
+inspectStorageJobsSTM ∷ Service → STM Int
+inspectStorageJobsSTM svc = length . Storage.snJobs <$> Storage.snapshotOf (serviceStorage svc)
 
 -- | Whether a caller of the storage service was refused for temporary pressure and nothing the
 -- service or the edit bank holds has changed since: the owner starts no new storage work until it
@@ -580,6 +583,10 @@ inspectStoragePressedSTM svc = do
     Nothing → pure False
     Just mark → (== mark) <$> pressureMark svc
 
+-- | Whether the owner's backed work is at rest: no open, pinned read, mutating transaction or
+-- closing file of the owner's, no job of the storage service, and every row of 'inspectBacked'
+-- holds (so the edit bank holds only the storage service's own records). Read-only, for
+-- verification: a test waits on it instead of on a figure of the bank.
 backedAtRestSTM ∷ Service → STM Bool
 backedAtRestSTM svc = do
   st <- readSt svc
@@ -589,6 +596,12 @@ backedAtRestSTM svc = do
     Map.null (stateOpens st) && Map.null (stateGathers st) && isNothing (stateSlot st) && Map.null (stateClosing st)
       && null (Storage.snJobs sn)
       && null problems
+
+-- | The owner's work that was chosen again, with nothing performed between, after a step of it that
+-- changed nothing (newest first; empty while the chooser and every step agree). Read-only, for
+-- verification.
+inspectIdleRepeatsSTM ∷ Service → STM [Text]
+inspectIdleRepeatsSTM svc = stateIdleRepeats <$> readSt svc
 
 inspectBackedSTM ∷ Service → STM [String]
 inspectBackedSTM svc = do

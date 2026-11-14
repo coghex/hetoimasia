@@ -63,6 +63,7 @@ import Control.Exception (Exception)
 import Control.Monad (forM_, unless, when)
 import Data.List (sortOn)
 import qualified Data.Map.Strict as Map
+import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Word (Word64)
@@ -211,6 +212,9 @@ decide svc credit dec = do
       | otherwise → case decFor dec of
           ForBatch → do
             commitStore arena []
+            -- a published maintenance transaction is the prerequisite its arena's other work waited for
+            when (fmap slotWork (stateSlot st) == Just SlotReclaim) $
+              modifySt svc (\s → s {stateNeedsMaintenance = Set.delete aid (stateNeedsMaintenance s)})
             slotDone True
             markFreed svc
             pure (Committed (decAuthority dec))

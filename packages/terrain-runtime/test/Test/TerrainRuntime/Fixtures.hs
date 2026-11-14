@@ -118,7 +118,12 @@ withServiceSeam logger config admission probe seam body =
     name ← fsNameOf dir
     storage ← either (fail . show) pure (mkStorageConfig [name] minHeadroomBytes)
     withWorkerGroup $ \group →
-      withTerrainService (smallestStore config) (Ports admission (standaloneSupervisor group) logger probe (StoragePort group storage (BC.pack dir) seam)) body
+      withTerrainService (smallestStore config) (Ports admission (standaloneSupervisor group) logger probe (StoragePort group storage (BC.pack dir) seam)) $ \svc → do
+        result ← body svc
+        -- every example: the owner never chose a piece of work again, with nothing performed
+        -- between, after a step of it that changed nothing
+        atomically (inspectIdleRepeatsSTM svc) >>= (`shouldBe` [])
+        pure result
 
 -- | A storage port for a service an example builds itself: a temporary directory on a qualified
 -- filesystem and a worker group of its own for the backend's workers.
