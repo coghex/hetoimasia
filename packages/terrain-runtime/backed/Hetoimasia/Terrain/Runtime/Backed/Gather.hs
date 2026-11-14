@@ -28,6 +28,7 @@ module Hetoimasia.Terrain.Runtime.Backed.Gather
   , GatherRefusal (..)
   , startGather
   , startGatherWith
+  , startGatherCapped
   , stepGather
   , cancelGather
   , endGather
@@ -37,6 +38,7 @@ module Hetoimasia.Terrain.Runtime.Backed.Gather
   , GProgress (..)
   , gatherWindowPages
   , gatherPeakWindow
+  , gatherPin
   , gatherPinLimit
   , lostTicket
   , supplied
@@ -109,6 +111,8 @@ data Gather = Gather
   -- ^ The most pages the window held when a ranged read answered.
   , gRuns ∷ ![(Column, Int64, Int64)]
   -- ^ Runs found, newest first.
+  , gCap ∷ !Int
+  -- ^ The most runs the gather keeps: past it, it stops (what its request answers is then too large).
   , gFetch ∷ !(Maybe (PageNo, Ticket))
   , gVersion ∷ !Word64
   -- ^ The committed version the pin holds.
@@ -123,6 +127,10 @@ gatherWindowPages = windowSize . gWindow
 -- | The most pages the window held when a ranged read answered (the evidence of the window's bound).
 gatherPeakWindow ∷ Gather → Int
 gatherPeakWindow = gPeak
+
+-- | The pages the gather's window may pin.
+gatherPin ∷ Gather → Int
+gatherPin = gPin
 
 -- | Where a step left the gather.
 data GProgress
@@ -153,10 +161,15 @@ startGather = startGatherWith gatherPinLimit
 -- | 'startGather' with a smaller number of pinned pages, so a suite can reach the window's limit with a
 -- small store. The production bound is 'gatherPinLimit'.
 startGatherWith ∷ Int → Store → [(Column, Int64, Int64)] → Either GatherRefusal (Store, Gather)
-startGatherWith pin store columns = case acquireReader store of
+startGatherWith pin = startGatherCapped pin maxBound
+
+-- | 'startGatherWith' keeping at most @cap@ runs: the reader's window then pins at most @pin@ pages, the
+-- reader's pin credit less what the kept runs may hold, so the two together never pass the credit.
+startGatherCapped ∷ Int → Int → Store → [(Column, Int64, Int64)] → Either GatherRefusal (Store, Gather)
+startGatherCapped pin cap store columns = case acquireReader store of
   Left refusal → Left (NoPin refusal)
   Right (token, pinned) → case (readerWindow pinned token, readerVersion pinned token) of
-    (Right window, Right version) → Right (pinned, Gather token window columns Nothing pin maxRangeRecords 0 0 [] Nothing version False)
+    (Right window, Right version) → Right (pinned, Gather token window columns Nothing pin maxRangeRecords 0 0 [] cap Nothing version False)
     _ → Left PinRefused
 
 -- | End a gather: the pin is released (releasing twice changes nothing). Called on every exit, and only
@@ -197,6 +210,7 @@ stepGather io closing store g = case gFetch g of
   Nothing
     | gDraining g → pure (g, GDrained)
     | otherwise → case gColumns g of
+        _ | length (gRuns g) > gCap g → pure (g, GDone (reverse (gRuns g)))
         [] → pure (g, GDone (reverse (gRuns g)))
         (column, from, to) : rest →
           -- A COLUMN IS READ ONLY OVER THE LEVELS ITS REQUEST NEEDS: from the run at or below the range's

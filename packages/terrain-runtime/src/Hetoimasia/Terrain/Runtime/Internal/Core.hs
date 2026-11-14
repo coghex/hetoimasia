@@ -42,6 +42,7 @@ module Hetoimasia.Terrain.Runtime.Internal.Core
   , commandRanges
   , resultRecordBytes
   , surfaceWindowLevels
+  , keepCap
   , pendingEdits
 
     -- * The read-only record of the owner's running work
@@ -350,6 +351,21 @@ commandRanges source surfaceFloor = \case
   CAttach {} → []
   CGrow {} → []
   CRetry → []
+
+-- | The most runs a read of these ranges keeps, by its kind: a cell one, a removal two (its neighbours,
+-- which it coalesces with), a column query the runs its range can hold or one more than its answer may
+-- return (past that the answer is too large, so nothing more is kept), a surface one more than an
+-- answer may return likewise. The others keep nothing ('maxBound': a load keeps its runs in its job's
+-- scratch, never in its pin).
+keepCap ∷ Q.QueryLimits → [(Column, Int64, Int64)] → Cmd → Int
+keepCap limits ranges = \case
+  CCell {} → 1
+  CRemove {} → 2
+  CColumn {} → min (sum [fromIntegral ((hi - lo) `div` 2 + 1) | (_, lo, hi) ← ranges]) answerCap
+  CSurface {} → answerCap
+  _ → maxBound
+  where
+    answerCap = Q.limitReturnedRuns limits + 1
 
 -- | The first window a surface reads, down from its source's top: one region's height.
 surfaceWindowLevels ∷ Int64

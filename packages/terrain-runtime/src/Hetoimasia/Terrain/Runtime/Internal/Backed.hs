@@ -45,6 +45,8 @@ module Hetoimasia.Terrain.Runtime.Internal.Backed
   , editBankChecked
   , removalStagingParts
   , removalStagingChecked
+  , queryKeepChecked
+  , keptPinLimit
   , pressureMark
   , markOf
   , notePressure
@@ -89,6 +91,7 @@ import qualified Data.Text as Text
 import Data.Word (Word64)
 import Hetoimasia.Terrain.Cell (Column (..), mkZRange)
 import Hetoimasia.Terrain.Changes (ChangeLimits (..), Changes, changeColumnBytes, changeIntervalBytes, changesFromIntervals)
+import qualified Hetoimasia.Terrain.Query as Q
 import Hetoimasia.Terrain.Segment (maxSegmentLevels)
 import qualified Hetoimasia.Terrain.Connectivity as C
 import Hetoimasia.Terrain.Coordinate (TileCoord)
@@ -130,11 +133,11 @@ import qualified Hetoimasia.Terrain.Runtime.Storage.Internal.Service as Storage
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Types (IoFailure (..), IoOp (..), WorkClass (..))
 import qualified Hetoimasia.Terrain.Runtime.Store.Internal.Admission as A
 import Hetoimasia.Terrain.Runtime.Store.Internal.Admission (Admission)
-import Hetoimasia.Terrain.Runtime.Store.Internal.Format (PageNo, StoreIdentity (..))
+import Hetoimasia.Terrain.Runtime.Store.Internal.Format (PageNo, StoreIdentity (..), maxLevel)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Model (ActiveView (..), Condition (..), GrowthProposal, Store, activeView, storeConfig, TxnId, conditions, oldestPin, pauseFor, storeFromRoots, storeHeader, storeRoots, storeVersion)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan (Plan, RamCharge (..))
 import Hetoimasia.Terrain.Runtime.Store.Internal.Protocol (discoveryPlanner, maintenancePlanner, removalPlanner)
-import Hetoimasia.Terrain.Runtime.Store.Internal.State (Roots (..), StoreConfig, emptyRoots, maxReaders)
+import Hetoimasia.Terrain.Runtime.Store.Internal.State (Roots (..), StoreConfig, emptyRoots, maxReaders, windowPageBytes)
 import Hetoimasia.Terrain.Source (Source)
 
 -- ---------------------------------------------------------------------------
@@ -579,7 +582,7 @@ initialStore config aid ident cfg =
 data Gathered
   = -- | Every run of the columns, read from one committed version, with that version's
     -- content revision.
-    GatheredRuns ![(Column, Int64, Int64)] !Revision
+    GatheredRuns ![(Column, Int64, Int64)] !Revision !(Int, Int)
   | -- | What is known of the cell, read from one committed version, with its content and knowledge revisions.
     GatheredKnowledge !D.CellKnowledge !Revision !Revision
   | -- | A retry's probe: the conditions it was for, and whether every recorded page read back as it must.
@@ -600,7 +603,8 @@ canStartGather cap st adm aid =
 -- credit, no pin. False when nothing was started.
 -- | What a pinned read reads.
 data ReadWhat
-  = ReadRuns ![(Column, Int64, Int64)]
+  = -- | The columns' runs over their ranges, keeping at most this many (a load: 'maxBound').
+    ReadRuns ![(Column, Int64, Int64)] !Int
   | ReadKnowledge !TileCoord
   | -- | a retry's probe, with the allowance and growth state its preparation read
     ReadPages ![(PageNo, ReadMode)] ![Condition] !CreatorBasis
@@ -622,9 +626,38 @@ startGatherFor svc key aid what = do
     _ → pure False
   where
     begin arena = case what of
-      ReadRuns columns → fmap RunsRead <$> startGather (arenaStore arena) columns
+      ReadRuns columns cap → fmap RunsRead <$> startGatherCapped (keptPinLimit cap (length columns)) cap (arenaStore arena) columns
       ReadKnowledge tile → fmap KnowledgeRead <$> startQuery (arenaStore arena) (\provider → D.queryCell (arenaEnv arena) provider tile)
       ReadPages pages conds basis → Right (arenaStore arena, ProbeRead (startProbe pages) conds basis)
+
+-- | WHAT A READ KEEPS IS CONTAINED IN ITS PIN CREDIT: a gather that may keep @cap@ runs of @columns@
+-- columns pins at most the reader's pin credit less those runs' bytes (by "Hetoimasia.Terrain.Changes"'s
+-- figures), in window pages, so its pinned pages and its kept runs never pass the one credit it holds
+-- for its whole life. A load ('maxBound') keeps its runs in the scratch its job reserves: it pins the
+-- whole credit.
+keptPinLimit ∷ Int → Int → Int
+keptPinLimit cap columns
+  | cap == maxBound = gatherPinLimit
+  | otherwise = (fromIntegral A.readerPinnedCacheBytes - keptRunsBytes cap columns) `div` windowPageBytes
+
+-- | The bytes @cap@ runs of @columns@ columns hold, at most.
+keptRunsBytes ∷ Int → Int → Int
+keptRunsBytes cap columns = cap * changeIntervalBytes + columns * changeColumnBytes
+
+-- | The pages one step of a ranged read needs in its window: a path from the root to a leaf (the tree is
+-- at most 'maxLevel' + 1 levels) and the next leaf, when the range crosses into it.
+readStepPages ∷ Int
+readStepPages = maxLevel + 2
+
+-- | The query limits leave every read kind the pages one read step needs beside what it keeps: the
+-- worst kind (a column query or a surface, at most the returned-run limit and one more) is refused at
+-- construction otherwise.
+queryKeepChecked ∷ Config → Either ConfigError ()
+queryKeepChecked config
+  | keptPinLimit worst 1 < readStepPages = Left (ConfigQueryKeep (toInteger (keptRunsBytes worst 1)) (toInteger (fromIntegral A.readerPinnedCacheBytes - readStepPages * windowPageBytes)))
+  | otherwise = Right ()
+  where
+    worst = Q.limitReturnedRuns (configQueryLimits config) + 1
 
 -- | One step of a pinned read. When it ends, its pin and credit are released in the transaction
 -- that removes it, and then its owner is given the result.
@@ -645,7 +678,7 @@ stepGatherTask svc key deliver = do
             , case p of
                 GMore → Left WakeNow
                 GBlocked wait → Left (WakeOn wait)
-                GDone runs → Right (GatheredRuns runs (gatherRevision task))
+                GDone runs → Right (GatheredRuns runs (gatherRevision task) (gatherPeakWindow g', gatherPin g'))
                 GFailed handling → Right (GatheredFailed handling)
                 GDrained → Right GatheredNothing
             )

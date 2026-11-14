@@ -211,7 +211,7 @@ import Hetoimasia.Terrain.Runtime.Internal.Types
 import Hetoimasia.Terrain.Runtime.Settlement
 import Hetoimasia.Terrain.Runtime.Backed.Port (StoragePort (..), storagePort)
 import Hetoimasia.Terrain.Runtime.Backed.Fault (FullWhy (..), IntegritySource (..), StorageFault (..), faultCode)
-import Hetoimasia.Terrain.Runtime.Internal.Backed (backedInvariants, editBankChecked, markOf, pressureMark, removalStagingChecked)
+import Hetoimasia.Terrain.Runtime.Internal.Backed (backedInvariants, editBankChecked, markOf, pressureMark, removalStagingChecked, queryKeepChecked)
 import qualified Hetoimasia.Terrain.Runtime.Storage.Internal.Service as Storage
 import Hetoimasia.Terrain.Runtime.Store.Internal.Admission (EditBankSpec (..), Ledger (..), defaultEditBankSpec, ledgers, mkEditBankConfig, newAdmission)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Model (Condition (..), GrowthView (..), Usage (..), conditions, growthView, storeHeader, usage)
@@ -292,6 +292,7 @@ withTerrainService config ports body = do
   editBank <- either (throwIO . ConfigEditBank) pure (mkEditBankConfig (configEditBank config) {ebsArenas = toInteger (configMaxArenas config)})
   either throwIO pure (editBankChecked (configEditBank config) {ebsArenas = toInteger (configMaxArenas config)})
   either throwIO pure removalStagingChecked
+  either throwIO pure (queryKeepChecked config)
   limits <- either throwIO pure (modelLimitsChecked config)
   compileBank <- either throwIO pure (compileBankChecked (configMaxArenas config) (configConnectivity config))
   bank <- newTVarIO (newAdmission editBank)

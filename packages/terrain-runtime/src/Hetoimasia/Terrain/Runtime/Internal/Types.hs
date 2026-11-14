@@ -445,6 +445,9 @@ data ConfigError
   | -- | The staging a removal reserves for its whole life ('R.removalStagingBytes') is less than
     -- its parts ('removalStagingParts'): what they need and what it is.
     ConfigRemovalStaging !Integer !Integer
+  | -- | The query limits let a read keep more runs than its pin credit can hold beside the pages one read
+    -- step needs: what the worst read keeps, and what the credit leaves for it.
+    ConfigQueryKeep !Integer !Integer
   deriving stock (Show)
 
 instance Exception ConfigError
@@ -517,6 +520,8 @@ data Point
     PointDiscoveryCommitted !ArenaId
   | -- | A request's pinned read delivered this many removed runs (what it kept of its columns).
     PointGatheredRuns !RequestId !Int
+  | -- | A request's pinned read ended: the most pages its window held, and the pages it may pin.
+    PointGatherWindow !RequestId !Int !Int
   deriving stock (Eq, Show)
 
 -- | An unexpected defect, kept with bounded context.

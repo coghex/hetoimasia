@@ -12,6 +12,7 @@ import Hetoimasia.Terrain.Coordinate (axisValue)
 import Hetoimasia.Terrain.Query (Occupied (..))
 import Hetoimasia.Terrain.Source (LayerSpec (..), SourceSpec (..))
 import Hetoimasia.Terrain.Runtime
+import Hetoimasia.Terrain.Runtime.Backed.Gather (gatherPinLimit)
 import Hetoimasia.Terrain.Runtime.Settlement
 import Test.Hspec
 import Test.Support.Bounded (bounded)
@@ -21,8 +22,10 @@ spec ∷ Spec
 spec = describe "What a request keeps of a column" $ do
   it "keeps at most one run for a cell, at most three for a removal, and a staged removal's overlay within its part, in a column of sixty runs" $ do
     gathered ← newTVarIO Map.empty
+    windows ← newTVarIO []
     let probe = Probe $ \case
           PointGatheredRuns rid n → atomically (modifyTVar' gathered (Map.insertWith max rid n))
+          PointGatherWindow _ peak pin → atomically (modifyTVar' windows ((peak, pin) :))
           _ → pure ()
     withServiceUsing defaultConfig alwaysAdmitting probe $ \svc → do
       (_, lease) ← openMain svc "main"
@@ -32,6 +35,10 @@ spec = describe "What a request keeps of a column" $ do
       _ ← bounded (readCell svc lease (tile 5 5 (-99)))
       cellRuns ← Map.elems <$> readTVarIO gathered
       cellRuns `shouldSatisfy` (\ns → not (null ns) && all (<= 1) ns)
+      -- what the read pins plus what it keeps stay within the one pin credit: its window may pin fewer
+      -- pages than a load's, and it pinned no more than that
+      ws ← readTVarIO windows
+      ws `shouldSatisfy` (\xs → not (null xs) && all (\(peak, pin) → peak <= pin && pin < gatherPinLimit) xs)
       -- a removal between two runs: it reads them and coalesces with both; its host is not eligible yet,
       -- so it stays staged
       atomically (writeTVar gathered Map.empty)

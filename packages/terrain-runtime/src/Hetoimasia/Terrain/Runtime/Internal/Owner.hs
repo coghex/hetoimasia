@@ -735,7 +735,7 @@ dispatchJob svc = do
     started <- case planned of
       Left why → pure (Left why)
       Right columns → do
-        ok <- atomically (startGatherFor svc (GatherJob jid) aid (ReadRuns columns))
+        ok <- atomically (startGatherFor svc (GatherJob jid) aid (ReadRuns columns maxBound))
         pure (if ok then Right () else Left "the arena of a dispatched load closed, or no pin was available")
     forM_ (either Just (const Nothing) started) $ \why → do
       defect <- atomically (forgetLoad svc jid >> finishJob svc jid (Left (SourceFailure (Text.pack why))))
@@ -753,7 +753,7 @@ regatherJob svc jid = do
     started <- case realPieces region cover of
       Left why → pure (Left why)
       Right pieces → do
-        ok <- atomically (startGatherFor svc (GatherJob jid) aid (ReadRuns (regionRanges region [c | (c, _) ← pieces])))
+        ok <- atomically (startGatherFor svc (GatherJob jid) aid (ReadRuns (regionRanges region [c | (c, _) ← pieces]) maxBound))
         pure (if ok then Right () else Left "the arena of a dispatched load closed, or no pin was available")
     forM_ (either Just (const Nothing) started) $ \why → do
       defect <- atomically (forgetLoad svc jid >> finishJob svc jid (Left (SourceFailure (Text.pack why))))
@@ -824,7 +824,7 @@ delivered svc key gathered = (case key of GatherRequest rid → probe svc (Point
         forgetLoad svc jid
         markFreed svc
     GatherRequest _ → pure ()
-  (GatherRequest rid, GatheredRuns runs revision) → probe svc (PointGatheredRuns rid (length runs)) >> stageFromRuns svc rid runs revision
+  (GatherRequest rid, GatheredRuns runs revision (peak, pin)) → probe svc (PointGatherWindow rid peak pin) >> probe svc (PointGatheredRuns rid (length runs)) >> stageFromRuns svc rid runs revision
   (GatherRequest rid, GatheredFailed handling) → handleRequest svc rid handling
   (GatherRequest rid, GatheredKnowledge known content knowledge) → do
     st <- atomically (readSt svc)
@@ -833,7 +833,7 @@ delivered svc key gathered = (case key of GatherRequest rid → probe svc (Point
   (GatherJob jid, GatheredKnowledge {}) → failWith svc (OwnerDefect (Text.pack ("a load job's read answered knowledge: " <> show jid))) []
   (GatherJob jid, GatheredProbe {}) → failWith svc (OwnerDefect (Text.pack ("a load job's read answered a probe: " <> show jid))) []
   (GatherRequest rid, GatheredProbe probed passed basis) → finishRetry svc rid (if passed then probed else []) basis
-  (GatherJob jid, GatheredRuns runs revision) → do
+  (GatherJob jid, GatheredRuns runs revision _) → do
     st <- atomically (readSt svc)
     case Map.lookup jid (stateLoadJobs st) of
       Nothing → pure ()
@@ -887,6 +887,10 @@ stageFromRuns svc rid runs revision = do
             -- A SURFACE IS ANSWERED ONLY ON WHAT WAS READ: the highest solid cell is found inside the levels
             -- the gather read, or the next read reaches twice as far down (cells below what was read look
             -- untouched, so an answer below them is not yet known)
+            -- a surface that keeps more runs than an answer may return is too large, as a column query is
+            CSurface _
+              | length runs > Q.limitReturnedRuns (configQueryLimits config) →
+                  atomically (terminate svc rid (Failed (TooLarge (Q.TooManyRuns (Q.limitReturnedRuns (configQueryLimits config))))))
             CSurface column
               | Just (floorRead, _) ← surfaceWindow st (arenaSource arena) column
               , Just found ← Q.highestOccupied (arenaSource arena) changes column
@@ -995,7 +999,9 @@ prepareReq svc rid = do
                     [] → True <$ finishRetry svc rid certifiable basis
                     _ → started aid (ReadPages pages certifiable basis)
     CKnowledge tile → maybe (pure False) (\aid → started aid (ReadKnowledge tile)) (reqArena req)
-    cmd → withArena req $ \(aid, arena) → started aid (ReadRuns (commandRanges (arenaSource arena) (Map.lookup rid (stateSurfaceFloor st)) cmd))
+    cmd → withArena req $ \(aid, arena) →
+      let ranges = commandRanges (arenaSource arena) (Map.lookup rid (stateSurfaceFloor st)) cmd
+       in started aid (ReadRuns ranges (keepCap (configQueryLimits (serviceConfig svc)) ranges cmd))
 
 -- | Publish staged work and tell the host it is ready. Work whose arena has moved
 -- on since it was computed is dropped; the owner computes it again. A readiness
