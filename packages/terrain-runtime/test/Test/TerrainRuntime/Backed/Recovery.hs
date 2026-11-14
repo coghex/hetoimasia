@@ -132,7 +132,9 @@ spec = describe "Recovery decided like publication" $ do
     -- write, so that transaction's write is held at the seam
     armed ← newTVarIO False
     gateVar ← newEmptyTMVarIO
+    published ← newTVarIO (0 ∷ Int)
     let owner = Probe $ \case
+          PointDiscoveryCommitted _ → atomically (modifyTVar' published (+ 1))
           PointDiscoveryGranted _ → do
             now ← atomically ((&&) <$> readTVar armed <*> isEmptyTMVar gateVar)
             if now then H.addGate probe isWrite >>= atomically . putTMVar gateVar else pure ()
@@ -149,6 +151,7 @@ spec = describe "Recovery decided like publication" $ do
       flip finally (H.openGate held) $ do
         H.awaitReached held 1
         statusBefore ← arenaStatus svc lease >>= expectRight
+        publishedBefore ← readTVarIO published
         -- a read of the arena fails: it pauses while discovery's write is in flight
         H.addRule probe 1 isRead (H.FailWith (Errno 5))
         let (ox, oy, oz) = case openingA of c : _ → c; [] → (0, 0, 0)
@@ -158,9 +161,9 @@ spec = describe "Recovery decided like publication" $ do
         H.openGate held
         waitFor (backedAtRestSTM svc >>= check)
         statusAfter ← arenaStatus svc lease >>= expectRight
-        -- nothing of discovery published: its obligations and the knowledge are what they were
-        (statusPendingItems statusAfter, statusKnowledgeRevision statusAfter, statusDiscovery statusAfter)
-          `shouldBe` (statusPendingItems statusBefore, statusKnowledgeRevision statusBefore, DiscoveryPaused)
+        -- no discovery transaction published after the pause: not the held one, nor any other
+        readTVarIO published `shouldReturn` publishedBefore
+        (statusKnowledgeRevision statusAfter, statusDiscovery statusAfter) `shouldBe` (statusKnowledgeRevision statusBefore, DiscoveryPaused)
 
   it "ends the owner with a defect when a retry's probe meets a worker failure, never answering it as remaining" $
     withArena $ \probe svc lease → do

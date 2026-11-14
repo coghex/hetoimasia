@@ -1250,6 +1250,7 @@ publishSlot svc task tid plan = do
             case verdict of
               Right (Committed authority) → do
                 forM_ (removalOf (slotWork task)) $ \rid → probe svc (PointCommitted rid (D.authContent authority))
+                when (slotWork task == SlotDiscovery) (probe svc (PointDiscoveryCommitted (slotArena task)))
               Right LostToEnd → pure ()
               Right NotEligible → yieldSlot Nothing
               Right PausedFirst → yieldSlot Nothing

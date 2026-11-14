@@ -504,6 +504,8 @@ data Point
     PointSlotStepped !ArenaId !Text
   | -- | The slot was granted to discovery of the arena (reported after its 'PointGranted').
     PointDiscoveryGranted !ArenaId
+  | -- | A discovery transaction of the arena published.
+    PointDiscoveryCommitted !ArenaId
   deriving stock (Eq, Show)
 
 -- | An unexpected defect, kept with bounded context.
