@@ -416,6 +416,13 @@ count against the entities that hold it (retiring arenas included).
 cabal test --project-file cabal.project.cpu hetoimasia-terrain-runtime:terrain-runtime-tests --test-show-details=direct
 ```
 
+The store's long families run at bounded representatives, the pure ones in parallel, and a large fixture is built by the
+first example that reads it; the rule, the time budget and the optional full-depth probe
+(`hetoimasia-terrain-runtime:terrain-runtime-full-depth-tests`, group `test.terrain-runtime-full-depth`) are in
+[the classification policy](../../docs/test_classification.md#the-suites-budget-and-its-parallel-group). A new example joins
+the parallel group (`Test.TerrainRuntime.Parallel`) only if it touches no file, thread, clock, runtime statistic or shared
+mutable state.
+
 `Test.TerrainRuntime.Hardening` includes an owner interrupted at each phase of
 its work (a load, a read's capture, staging, the commit boundary, a transfer, a
 victim's release), after which nothing may remain reserved, running, transferring or
