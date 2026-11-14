@@ -520,6 +520,8 @@ data Point
     PointDiscoveryCommitted !ArenaId
   | -- | A request's pinned read delivered this many removed runs (what it kept of its columns).
     PointGatheredRuns !RequestId !Int
+  | -- | A request's pinned read submitted the read of this page of its store.
+    PointGatherPage !RequestId !PageNo
   | -- | A request's pinned read ended: the most pages its window held, and the pages it may pin.
     PointGatherWindow !RequestId !Int !Int
   deriving stock (Eq, Show)

@@ -22,6 +22,7 @@ import Hetoimasia.Terrain.Runtime
 import Hetoimasia.Terrain.Runtime.Settlement
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Native (NativeOp (..))
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Types (Errno (..), IoFailure (..))
+import Hetoimasia.Terrain.Runtime.Store.Internal.Format (PageNo (..), pageSizeW)
 import Test.Hspec
 import Test.Support.Bounded (bounded)
 import Test.TerrainRuntime.Fixtures hiding (limitsWith)
@@ -43,13 +44,17 @@ readAt off = \case OpReadAt o _ → o == off; _ → False
 
 -- | The offsets of the pages a read of this cell reads from the file, in the order it reads them
 -- (each once): the pages a failure can be injected at.
-pagesRead ∷ H.Probe → Service → ArenaLease → TileCoord → IO [Word64]
-pagesRead probe svc lease at = do
-  H.clearEvents probe
+pagesRead ∷ Paths → Service → ArenaLease → TileCoord → IO [Word64]
+pagesRead (Paths ref) svc lease at = do
+  atomically (writeTVar ref [])
   _ ← readCell svc lease at
-  ops ← H.events probe
-  pure (dedupe [o | OpReadAt o _ ← ops])
+  seen ← reverse <$> readTVarIO ref
+  -- only the cell read's own pages: another job of the service may read pages meanwhile
+  case dedupe [rid | PointGatherPage rid _ ← seen] of
+    [_] → pure (dedupe [n * pageSizeW | PointGatherPage _ (PageNo n) ← seen])
+    rids → expectationFailure ("expected the pages of one request, got the pages of " <> show rids) >> fail "unreachable"
   where
+    dedupe ∷ Eq a ⇒ [a] → [a]
     dedupe = foldr (\x acc → x : filter (/= x) acc) []
 
 pausedOn ∷ Service → ArenaLease → IO [Condition]
@@ -62,21 +67,31 @@ pausedOn svc lease = do
 -- | A service whose backend's native calls pass a harness probe, with one arena whose store holds
 -- history in 256 columns (so its tree has several pages, and a read of column (3, 4) reads more than
 -- one).
-withTree ∷ (H.Probe → Service → ArenaLease → IO ()) → IO ()
-withTree = withArenaOf [(x, y) | x ← [0 .. 15], y ← [0 .. 15]]
+withTree ∷ (H.Probe → Paths → Service → ArenaLease → IO ()) → IO ()
+withTree = withArenaPaths [(x, y) | x ← [0 .. 15], y ← [0 .. 15]]
+
+-- | The pages each request's pinned read submitted, newest first ('PointGatherPage').
+newtype Paths = Paths (TVar [Point])
 
 -- | One removal at (3, 4, 5): a read of column (3, 4) reads the store's one page.
 withArena ∷ (H.Probe → Service → ArenaLease → IO ()) → IO ()
 withArena = withArenaOf [(3, 4)]
 
 withArenaOf ∷ [(Integer, Integer)] → (H.Probe → Service → ArenaLease → IO ()) → IO ()
-withArenaOf columns body = do
+withArenaOf columns body = withArenaPaths columns (\probe _ → body probe)
+
+withArenaPaths ∷ [(Integer, Integer)] → (H.Probe → Paths → Service → ArenaLease → IO ()) → IO ()
+withArenaPaths columns body = do
   probe ← H.newProbe
-  withServiceSeam quiet defaultConfig alwaysAdmitting noProbe (H.seamFor probe) $ \svc → do
+  ref ← newTVarIO []
+  let points = Probe $ \case
+        point@PointGatherPage {} → atomically (modifyTVar' ref (point :))
+        _ → pure ()
+  withServiceSeam quiet defaultConfig alwaysAdmitting points (H.seamFor probe) $ \svc → do
     (_, lease) ← openMain svc "main"
     mapM_ (\(x, y) → removeCell' svc lease (tile x y 5)) columns
     waitFor (backedAtRestSTM svc >>= check)
-    body probe svc lease
+    body probe (Paths ref) svc lease
 
 -- | A write of this page's offset.
 writeAt ∷ Word64 → NativeOp → Bool
@@ -104,9 +119,9 @@ retryAnswer svc lease = retryArena svc lease >>= expectRight >>= bounded . await
 spec ∷ Spec
 spec = describe "Recovery decided like publication" $ do
   it "keeps both of two pages that failed, and does not certify the condition while either still fails" $
-    withTree $ \probe svc lease → do
+    withTree $ \probe recorded svc lease → do
       -- the header page fails first, then (while paused, reads go on) another page of the tree
-      pages ← pagesRead probe svc lease (tile 3 4 6)
+      pages ← pagesRead recorded svc lease (tile 3 4 6)
       (first, lastPage) ← case pages of
         a : rest@(_ : _) → pure (a, last rest)
         _ → expectationFailure ("a read of the column reads fewer than two pages: " <> show pages) >> fail "unreachable"
@@ -145,12 +160,12 @@ spec = describe "Recovery decided like publication" $ do
       pure ()
 
   it "keeps no more than eight failures of a condition, and then answers it remaining until the arena is closed, never probing it" $
-    withTree $ \probe svc lease → do
+    withTree $ \probe recorded svc lease → do
       -- a second run in every column: the tree has more leaves
       mapM_ (\(x, y) → removeCell' svc lease (tile x y 2)) [(x, y) | x ← [0 .. 15], y ← [0 .. 15]]
       waitFor (backedAtRestSTM svc >>= check)
       -- nine distinct pages, each one a column's read reads
-      paths ← mapM (\(x, y) → fmap (\ps → [(o, (x, y)) | o ← ps]) (pagesRead probe svc lease (tile x y 6))) [(x, y) | x ← [0, 3 .. 15], y ← [0, 3 .. 15]]
+      paths ← mapM (\(x, y) → fmap (\ps → [(o, (x, y)) | o ← ps]) (pagesRead recorded svc lease (tile x y 6))) [(x, y) | x ← [0, 3 .. 15], y ← [0, 3 .. 15]]
       let distinct = take 9 (foldl (\acc (o, x) → if any ((== o) . fst) acc then acc else acc <> [(o, x)]) [] (concat paths))
       length distinct `shouldBe` 9
       mapM_ (\(o, x) → do
@@ -245,8 +260,8 @@ spec = describe "Recovery decided like publication" $ do
       settledOf host >>= (`shouldSatisfy` \case [Succeeded (ARetried _)] → False; _ → True)
 
   it "drops a probe whose condition recorded a new failure while it was in flight, and answers on the record as it is then" $
-    withTree $ \probe svc lease → do
-      pages ← pagesRead probe svc lease (tile 3 4 6)
+    withTree $ \probe recorded svc lease → do
+      pages ← pagesRead recorded svc lease (tile 3 4 6)
       (first, lastPage) ← case pages of
         a : rest@(_ : _) → pure (a, last rest)
         _ → expectationFailure ("a read of the column reads fewer than two pages: " <> show pages) >> fail "unreachable"

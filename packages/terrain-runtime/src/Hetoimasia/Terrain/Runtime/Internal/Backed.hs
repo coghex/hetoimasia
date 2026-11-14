@@ -673,6 +673,9 @@ stepGatherTask svc key deliver = do
       (run, progress) ← case gatherRun task of
         RunsRead g → do
           (g', p) ← if wanted then stepGather io closing store g else cancelGather io g
+          case (key, gatherFetching g') of
+            (GatherRequest rid, Just page) | gatherFetching g /= Just page → probePoint (serviceProbe svc) (PointGatherPage rid page)
+            _ → pure ()
           pure
             ( RunsRead g'
             , case p of

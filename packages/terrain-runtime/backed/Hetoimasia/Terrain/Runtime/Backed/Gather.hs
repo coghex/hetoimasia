@@ -39,6 +39,7 @@ module Hetoimasia.Terrain.Runtime.Backed.Gather
   , gatherWindowPages
   , gatherPeakWindow
   , gatherPin
+  , gatherFetching
   , gatherPinLimit
   , lostTicket
   , supplied
@@ -127,6 +128,10 @@ gatherWindowPages = windowSize . gWindow
 -- | The most pages the window held when a ranged read answered (the evidence of the window's bound).
 gatherPeakWindow ∷ Gather → Int
 gatherPeakWindow = gPeak
+
+-- | The page whose read the gather has submitted and not yet taken, if any.
+gatherFetching ∷ Gather → Maybe PageNo
+gatherFetching = fmap fst . gFetch
 
 -- | The pages the gather's window may pin.
 gatherPin ∷ Gather → Int
