@@ -21,7 +21,6 @@ import qualified Hetoimasia.Terrain.Runtime.Store.Internal.Admission as A
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan (RamCharge (..))
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Native (NativeOp (..))
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Service (maxRecordControlBytes, resultPageBytes, transferBufferBytes)
-import Hetoimasia.Terrain.Runtime.Store.Internal.State (readerRecordBytes)
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Types (Errno (..))
 import Hetoimasia.Terrain.Runtime.Store (StoreSpec (..), defaultStoreSpec, minAllowanceBytes)
 import Test.Hspec
@@ -75,14 +74,9 @@ spec = describe "The backed terrain service" $ do
   -- records, every reader record, the queued descriptors), the storage service's records at their
   -- most (every job record at its largest, one backing record per arena, every kept failure).
   it "accepts the least control account that holds the storage service's records beside the store's minimum, and completes a removal with every arena's backing record held; one byte less is refused at construction" $ do
-    let w = A.worstTransactionCharge
-        arenas = 2 ∷ Int
+    let arenas = 2 ∷ Int
         readers = 2 ∷ Integer
-        need =
-          toInteger (ramPagePins w + ramRootControl w + ramContinuation w)
-            + toInteger arenas * readers * toInteger readerRecordBytes
-            + toInteger A.maxQueuedDescriptors * toInteger A.descriptorRecordBytes
-            + toInteger (maxRecordControlBytes arenas)
+        need = A.controlNeedOf A.defaultEditBankSpec {A.ebsArenas = toInteger arenas, A.ebsReadersPerArena = readers} + toInteger (maxRecordControlBytes arenas)
         config control = defaultConfig {configMaxArenas = arenas, configEditBank = A.defaultEditBankSpec {A.ebsControl = control, A.ebsReadersPerArena = readers}}
     try (withService (config (need - 1)) (\_ → pure ())) >>= \case
       Left (ConfigEditBankReads "control" needed have) → (needed, have) `shouldBe` (need, need - 1)

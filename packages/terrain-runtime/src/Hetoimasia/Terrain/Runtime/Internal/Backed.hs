@@ -130,7 +130,7 @@ import Hetoimasia.Terrain.Runtime.Store.Internal.Format (PageNo, StoreIdentity (
 import Hetoimasia.Terrain.Runtime.Store.Internal.Model (ActiveView (..), Condition (..), GrowthProposal, Store, activeView, storeConfig, TxnId, conditions, oldestPin, pauseFor, storeFromRoots, storeHeader, storeRoots, storeVersion)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan (Plan, RamCharge (..))
 import Hetoimasia.Terrain.Runtime.Store.Internal.Protocol (discoveryPlanner, maintenancePlanner, removalPlanner)
-import Hetoimasia.Terrain.Runtime.Store.Internal.State (Roots (..), StoreConfig, emptyRoots, maxReaders, readerRecordBytes)
+import Hetoimasia.Terrain.Runtime.Store.Internal.State (Roots (..), StoreConfig, emptyRoots, maxReaders)
 import Hetoimasia.Terrain.Source (Source)
 
 -- ---------------------------------------------------------------------------
@@ -165,11 +165,7 @@ editBankChecked spec
   where
     w = A.worstTransactionCharge
     pins = A.ebsArenas spec * min (toInteger maxReaders) (A.ebsReadersPerArena spec)
-    storeControl =
-      toInteger (ramPagePins w + ramRootControl w + ramContinuation w)
-        + A.ebsArenas spec * A.ebsReadersPerArena spec * toInteger readerRecordBytes
-        + toInteger A.maxQueuedDescriptors * toInteger A.descriptorRecordBytes
-    controlNeed = storeControl + toInteger (maxRecordControlBytes (fromInteger (A.ebsArenas spec)))
+    controlNeed = A.controlNeedOf spec + toInteger (maxRecordControlBytes (fromInteger (A.ebsArenas spec)))
     cacheNeed = toInteger (ramDecodedCopies w) + pins * toInteger A.readerPinnedCacheBytes + toInteger resultPageBytes
     stagingNeed = toInteger (ramIoBuffers w + ramKeys w + ramScratch w) + toInteger (transferBufferBytes 1)
 
@@ -491,8 +487,12 @@ stepOpen svc ops rid = do
       HandleClosing → atomically (dropOpen svc rid held)
       HandleDefect why → failOpen held why
       HandlePausedFor _ → failOpen held "an open answered a pause"
-      -- pressure is answered only at submission (OpenSubmitting); no job's outcome carries it
-      HandleRetryLater busy → failOpen held (Text.pack ("an open's job answered pressure, which only a submission can: " <> show busy))
+      -- an open's job secures its backing's record while it runs, so its outcome can carry pressure
+      -- for the control account. On a bank the service accepts that needs held closes to have taken
+      -- the room (nothing in flight returns it): a recorded defect, naming them, never a wait
+      HandleRetryLater busy → do
+        heldCloses ← length . Storage.snHeld <$> atomically (Storage.snapshotOf (serviceStorage svc))
+        failOpen held (Text.pack ("an open's job was refused for pressure while it ran (" <> show busy <> "), which only held closes can cause (held closes: " <> show heldCloses <> ")"))
       HandleSerialize → failOpen held "an open was serialised"
       HandleReplan → failOpen held "an open answered replan"
       HandleWaitReclaim _ _ → failOpen held "an open answered reclamation"

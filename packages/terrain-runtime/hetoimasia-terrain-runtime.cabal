@@ -171,6 +171,7 @@ test-suite terrain-runtime-tests
         Test.TerrainRuntime.Backed.Creator
         Test.TerrainRuntime.Backed.Fairness
         Test.TerrainRuntime.Backed.Pressure
+        Test.TerrainRuntime.Backed.Held
         Test.TerrainRuntime.Backed.Outcomes
         Test.TerrainRuntime.Backed.Pause
         Test.TerrainRuntime.Backed.Service
