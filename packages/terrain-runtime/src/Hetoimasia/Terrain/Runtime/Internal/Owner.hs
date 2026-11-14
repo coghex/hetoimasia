@@ -45,7 +45,8 @@ import Hetoimasia.Foundation.Log (Component, logError, logInfo, unsafeComponent)
 import Hetoimasia.Foundation.Resource (Scoped, composeCleanup)
 import Hetoimasia.Foundation.Worker (StopToken, WorkerDefinition, stopRequested, workerDefinition)
 import Hetoimasia.Terrain.Cell (Column (..))
-import Hetoimasia.Terrain.Coordinate (decomposeTile)
+import Hetoimasia.Terrain.Coordinate (RegionCoord (..), axisValue, decomposeTile, regionLevels)
+import qualified Hetoimasia.Terrain.Query as Q
 import qualified Hetoimasia.Terrain.Discovery as D
 import Hetoimasia.Terrain.Palette (Palette, emptyPalette, internSourceMaterials)
 import qualified Hetoimasia.Terrain.Residency as R
@@ -727,7 +728,7 @@ dispatchJob svc = do
                Left why → pure (Just (jid, aid, region, Left why))
                Right pieces → do
                  modifySt svc (\st → st {stateLoadJobs = Map.insert jid (aid, region, cover) (stateLoadJobs st)})
-                 pure (Just (jid, aid, region, Right (Set.toList (Set.fromList [c | (c, _) ← pieces]))))
+                 pure (Just (jid, aid, region, Right (regionRanges region [c | (c, _) ← pieces])))
        _ → modifySt svc (\st → st {stateDispatchIdle = True}) >> pure Nothing
   forM_ dispatched $ \(jid, aid, region, planned) → do
     probe svc (PointJob aid region)
@@ -752,11 +753,17 @@ regatherJob svc jid = do
     started <- case realPieces region cover of
       Left why → pure (Left why)
       Right pieces → do
-        ok <- atomically (startGatherFor svc (GatherJob jid) aid (ReadRuns (Set.toList (Set.fromList [c | (c, _) ← pieces]))))
+        ok <- atomically (startGatherFor svc (GatherJob jid) aid (ReadRuns (regionRanges region [c | (c, _) ← pieces])))
         pure (if ok then Right () else Left "the arena of a dispatched load closed, or no pin was available")
     forM_ (either Just (const Nothing) started) $ \why → do
       defect <- atomically (forgetLoad svc jid >> finishJob svc jid (Left (SourceFailure (Text.pack why))))
       forM_ defect $ \text → failWith svc (AccountingDefect text) []
+
+-- | What a load job reads of its region's columns: the region's levels only.
+regionRanges ∷ RegionCoord → [Column] → [(Column, Int64, Int64)]
+regionRanges region columns =
+  let lo = fromIntegral (regionZ region) * fromIntegral regionLevels
+   in [(c, lo, lo + fromIntegral regionLevels) | c ← Set.toList (Set.fromList columns)]
 
 forgetLoad ∷ Service → R.JobId → STM ()
 forgetLoad svc jid = modifySt svc (\st → st {stateLoadJobs = Map.delete jid (stateLoadJobs st)})
@@ -877,8 +884,22 @@ stageFromRuns svc rid runs revision = do
                 Just (Left failure) → atomically (terminate svc rid (Failed (HostFailure (Text.pack ("preparation failed: " <> show failure)))))
                 Just (Right (Left why)) → atomically (terminate svc rid (Failed (HostFailure (Text.pack ("preparation refused: " <> why)))))
                 Just (Right (Right prepared)) → void $ stage svc rid (Just aid) revision (StagedRemoval prepared)
+            -- A SURFACE IS ANSWERED ONLY ON WHAT WAS READ: the highest solid cell is found inside the levels
+            -- the gather read, or the next read reaches twice as far down (cells below what was read look
+            -- untouched, so an answer below them is not yet known)
+            CSurface column
+              | Just (floorRead, _) ← surfaceWindow st (arenaSource arena) column
+              , Just found ← Q.highestOccupied (arenaSource arena) changes column
+              , axisValue (Q.occupiedLevel found) < floorRead →
+                  atomically $ modifySt svc $ \s → case surfaceWindow s (arenaSource arena) column of
+                    Just (lo, hi) →
+                      s
+                        { stateSurfaceFloor = Map.insert rid (lo - 2 * (hi - lo)) (stateSurfaceFloor s)
+                        , stateRequests = Map.adjust (\q → q {reqPhase = Waiting}) rid (stateRequests s)
+                        }
+                    Nothing → s
             cmd →
-              running svc rid (probe svc (PointCaptured rid aid revision) >> evaluate (readAnswer config aid revision (arenaSource arena) changes cmd)) >>= \case
+              running svc rid (atomically (modifySt svc (\s → s {stateSurfaceFloor = Map.delete rid (stateSurfaceFloor s)})) >> probe svc (PointCaptured rid aid revision) >> evaluate (readAnswer config aid revision (arenaSource arena) changes cmd)) >>= \case
                 Nothing → pure ()
                 Just (Left failure) → atomically (terminate svc rid (Failed failure))
                 Just (Right (answer, demands))
@@ -890,6 +911,10 @@ stageFromRuns svc rid runs revision = do
                   | otherwise → void $ stage svc rid (Just aid) revision (StagedAnswer answer)
   where
     config = serviceConfig svc
+    -- the levels a surface read reads now: [lo, hi)
+    surfaceWindow s source column = case commandRanges source (Map.lookup rid (stateSurfaceFloor s)) (CSurface column) of
+      [(_, lo, hi)] → Just (lo, hi)
+      _ → Nothing
 
 -- | Run one request's preparation under its credits (R1). From here to the safe point at its end,
 -- nothing the request holds is released, whoever cancels it, releases its lease or closes its arena
@@ -970,7 +995,7 @@ prepareReq svc rid = do
                     [] → True <$ finishRetry svc rid certifiable basis
                     _ → started aid (ReadPages pages certifiable basis)
     CKnowledge tile → maybe (pure False) (\aid → started aid (ReadKnowledge tile)) (reqArena req)
-    cmd → maybe (pure False) (\aid → started aid (ReadRuns (commandColumns cmd))) (reqArena req)
+    cmd → withArena req $ \(aid, arena) → started aid (ReadRuns (commandRanges (arenaSource arena) (Map.lookup rid (stateSurfaceFloor st)) cmd))
 
 -- | Publish staged work and tell the host it is ready. Work whose arena has moved
 -- on since it was computed is dropped; the owner computes it again. A readiness

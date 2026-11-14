@@ -104,7 +104,7 @@ plansAgain io store = do
 -- | Read the runs of columns from the committed version through the backend, as the owner does: every
 -- step masked, one blocking wait between steps. The pin is released on every exit.
 gatherRuns ∷ Io → Int → Store → [Column] → IO (Store, GProgressResult, Int)
-gatherRuns io pin store0 columns = case startGatherWith pin store0 columns of
+gatherRuns io pin store0 columns = case startGatherWith pin store0 [(c, minBound, maxBound) | c ← columns] of
   Left refusal → fail ("no reader: " <> show refusal)
   Right (store1, g0) → do
     let loop g = do

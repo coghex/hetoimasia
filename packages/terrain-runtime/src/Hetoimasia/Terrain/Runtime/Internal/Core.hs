@@ -39,7 +39,8 @@ module Hetoimasia.Terrain.Runtime.Internal.Core
   , admit
   , readAnswer
   , demandFor
-  , commandColumns
+  , commandRanges
+  , surfaceWindowLevels
   , pendingEdits
 
     -- * The read-only record of the owner's running work
@@ -93,6 +94,7 @@ import Control.Concurrent.STM
 import Control.Exception (SomeException)
 import Control.Monad (forM_, unless, when, void)
 import qualified Data.Map.Strict as Map
+import Data.Int (Int64)
 import Data.Maybe (fromMaybe, isJust)
 import qualified Data.Sequence as Seq
 import qualified Data.Set as Set
@@ -327,17 +329,30 @@ demandFor source changes cmd = case cmd of
 
 -- | The columns a command's answer reads: the runs of these, gathered from one committed
 -- version of the arena's store, are all the removals the answer depends on.
-commandColumns ∷ Cmd → [Column]
-commandColumns = \case
-  CCell (TileCoord x y _) → [Column x y]
-  CColumn column _ → [column]
-  CSurface column → [column]
-  CRemove (TileCoord x y _) _ → [Column x y]
+-- | WHAT A REQUEST READS OF A COLUMN: only the levels it needs, @[lo, hi)@, never the column's whole
+-- history. A cell: its level. A removal: its level and the two beside it (the runs it coalesces with). A
+-- column query: its range (bounded by the query limits). A surface: a window from the source's top down
+-- ('surfaceWindowLevels', or lower once its answer was found below what was read: see 'stageFromRuns'),
+-- nothing for a column whose source is empty. The others read no column.
+commandRanges ∷ Source → Maybe Int64 → Cmd → [(Column, Int64, Int64)]
+commandRanges source surfaceFloor = \case
+  CCell (TileCoord x y z) → [(Column x y, axisValue z, axisValue z + 1)]
+  CColumn column range → [(column, fromInteger (zRangeLo range), fromInteger (zRangeHi range))]
+  CSurface column → case Q.highestOccupied source emptyChanges column of
+    Nothing → []
+    Just top →
+      let t = axisValue (Q.occupiedLevel top)
+       in [(column, fromMaybe (t + 1 - surfaceWindowLevels) surfaceFloor, t + 1)]
+  CRemove (TileCoord x y z) _ → [(Column x y, axisValue z - 1, axisValue z + 2)]
   CKnowledge _ → []
   COpen {} → []
   CAttach {} → []
   CGrow {} → []
   CRetry → []
+
+-- | The first window a surface reads, down from its source's top: one region's height.
+surfaceWindowLevels ∷ Int64
+surfaceWindowLevels = fromIntegral regionLevels
 
 -- | The answer of a read from an arena's source and the removals of the columns it reads
 -- (gathered from one committed version), with the demand that answer needs resident. It is

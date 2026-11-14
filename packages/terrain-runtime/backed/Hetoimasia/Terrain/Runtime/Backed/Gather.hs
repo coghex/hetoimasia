@@ -94,8 +94,9 @@ gatherPinLimit = fromIntegral (readerPinnedCacheBytes `div` fromIntegral windowP
 data Gather = Gather
   { gToken ∷ !ReaderToken
   , gWindow ∷ !Window
-  , gColumns ∷ ![Column]
-  -- ^ Columns still to read (the one in progress first).
+  , gColumns ∷ ![(Column, Int64, Int64)]
+  -- ^ Columns still to read (the one in progress first), each with the levels its request needs,
+  -- @[lo, hi)@: only the runs that meet them are read on to and kept.
   , gStart ∷ !(Maybe RangeStart)
   -- ^ Where the column in progress resumes; 'Nothing' before its first call.
   , gPin ∷ !Int
@@ -145,13 +146,13 @@ data GatherRefusal
     PinRefused
   deriving stock (Eq, Show)
 
--- | Pin the committed version and begin reading the runs of the columns.
-startGather ∷ Store → [Column] → Either GatherRefusal (Store, Gather)
+-- | Pin the committed version and begin reading the runs of the columns that meet their ranges.
+startGather ∷ Store → [(Column, Int64, Int64)] → Either GatherRefusal (Store, Gather)
 startGather = startGatherWith gatherPinLimit
 
 -- | 'startGather' with a smaller number of pinned pages, so a suite can reach the window's limit with a
 -- small store. The production bound is 'gatherPinLimit'.
-startGatherWith ∷ Int → Store → [Column] → Either GatherRefusal (Store, Gather)
+startGatherWith ∷ Int → Store → [(Column, Int64, Int64)] → Either GatherRefusal (Store, Gather)
 startGatherWith pin store columns = case acquireReader store of
   Left refusal → Left (NoPin refusal)
   Right (token, pinned) → case (readerWindow pinned token, readerVersion pinned token) of
@@ -197,13 +198,21 @@ stepGather io closing store g = case gFetch g of
     | gDraining g → pure (g, GDrained)
     | otherwise → case gColumns g of
         [] → pure (g, GDone (reverse (gRuns g)))
-        column : rest →
-          let start = maybe (RangeFrom (KeyRun column minBound)) id (gStart g)
+        (column, from, to) : rest →
+          -- A COLUMN IS READ ONLY OVER THE LEVELS ITS REQUEST NEEDS: from the run at or below the range's
+          -- floor (a run that began below it may reach into it), up to the first run that starts at or past
+          -- its top; only the runs that meet the range are kept
+          let start = maybe (RangeFloor (KeyRun column from)) id (gStart g)
            in case readerRange store (gToken g) (gWindow g) TreeRuns start (gLimit g) of
                 Read records →
-                  let mine = [(col, lo, hi) | (KeyRun col lo, RecRun hi) ← records, col == column]
-                      -- the column ends at the first record of another column, or when the tree ends
-                      ended = length mine < length records || length records < gLimit g
+                  let ours = \case (KeyRun col _, _) → col == column; _ → False
+                      -- the floor may land on an earlier column's last run: it is passed over
+                      fromOurs = dropWhile (not . ours) records
+                      column' = [(col, lo, hi) | (KeyRun col lo, RecRun hi) ← takeWhile ours fromOurs]
+                      mine = [(col, lo, hi) | (col, lo, hi) ← column', hi > from, lo < to]
+                      -- the column ends at the first record of another column after it, at a run past its range,
+                      -- or when the tree ends
+                      ended = length column' < length fromOurs || any (\(_, lo, _) → lo >= to) column' || length records < gLimit g
                       next = case reverse records of
                         (key, _) : _ → Just (RangeAfter key)
                         [] → Nothing

@@ -571,7 +571,7 @@ canStartGather cap st adm aid =
 -- credit, no pin. False when nothing was started.
 -- | What a pinned read reads.
 data ReadWhat
-  = ReadRuns ![Column]
+  = ReadRuns ![(Column, Int64, Int64)]
   | ReadKnowledge !TileCoord
   | -- | a retry's probe, with the allowance and growth state its preparation read
     ReadPages ![(PageNo, ReadMode)] ![Condition] !CreatorBasis

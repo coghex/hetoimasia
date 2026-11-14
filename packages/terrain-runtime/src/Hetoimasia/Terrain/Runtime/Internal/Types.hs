@@ -143,6 +143,7 @@ import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Text (Text)
 import Data.Unique (Unique)
+import Data.Int (Int64)
 import Data.Word (Word64)
 import Hetoimasia.Foundation.Log (Logger)
 import Hetoimasia.Foundation.Worker (WorkerDefinition)
@@ -1139,6 +1140,9 @@ data St = St
     -- page it probed took the write. Written by the owner when the probe ends; read (and only while the
     -- basis still holds) when the retry is prepared again; deleted when the retry finishes.
     stateWriteProbed ∷ !(Map RequestId (CreatorBasis, Bool))
+  , -- | A surface read's lower bound, once a read found its answer below what it had read (the next
+    -- read reaches lower). Written and deleted by the owner's staging of the read.
+    stateSurfaceFloor ∷ !(Map RequestId Int64)
   , -- | The fault epoch: moved by every failure a pause adds to its record ('faultGeneration').
     -- Written by the owner only; never reset.
     stateFaultEpoch ∷ !Word64
@@ -1197,6 +1201,7 @@ initialState config limits =
     , stateIdleRepeats = []
     , stateFaultEpoch = 0
     , stateWriteProbed = Map.empty
+    , stateSurfaceFloor = Map.empty
     , stateClosing = Map.empty
     , stateLoadJobs = Map.empty
     , stateNextSource = 1
