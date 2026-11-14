@@ -271,9 +271,14 @@ eventSequence =
     item3 = (["group"], "item 3")
     finished result = Item Nothing (Seconds 0) "an info line\nand a second one" result
 
--- | Where a record is printed in the sequence: before the first event, after each event.
+-- | Where a record is printed in the sequence: before the first event, after each event but the last, and after the run. The
+-- runner shows the cursor again (when it reports progress) the moment the last event returns and nothing prints between: every
+-- example has finished before that event, so the position after the last event is the one after the cursor is shown.
 positionLabels ∷ [String]
-positionLabels = "before the first event" : ["after " <> label | (label, _) ← eventSequence]
+positionLabels = "before the first event" : ["after " <> label | (label, _) ← eventSequence, label /= lastLabel] <> ["after the run (the cursor shown)"]
+
+lastLabel ∷ String
+lastLabel = "done"
 
 -- | What an event wrote, by its bytes: nothing; a newline last; an erase last (transient text); content with no newline.
 observedEffect ∷ String → Effect
@@ -285,8 +290,8 @@ observedEffect written
 
 -- | Drive one formatter, guarded the way the runner guards it and built the way the runner builds it (a real format configuration,
 -- the cursor hidden first when progress is reported), through 'eventSequence' directly, with no scheduling in it: with a record
--- printed through the same output at the given positions (1 is before the first event, k + 1 after the k-th event). The bytes
--- written, and what each event wrote by itself.
+-- printed through the same output at the given positions (1 is before the first event, k + 1 after the k-th event, the last after
+-- the cursor is shown again; none between the last event and the cursor). The bytes written, and what each event wrote by itself.
 driveSequence ∷ String → Bool → Bool → [Int] → IO (String, [(String, Effect)])
 driveSequence name colour progress recordAt = do
   out ← newOutput
@@ -302,8 +307,9 @@ driveSequence name colour progress recordAt = do
       format event
       to ← position
       modifyIORef observed ((label, (from, to)) :)
-      record' k
+      if label == lastLabel then pure () else record' k
     if progress then hPutStr stdout "\ESC[?25h" else pure ()
+    record' (length eventSequence + 1)
   spans ← reverse <$> readIORef observed
   pure (raw, [(label, observedEffect (take (to - from) (drop from raw))) | (label, (from, to)) ← spans])
 

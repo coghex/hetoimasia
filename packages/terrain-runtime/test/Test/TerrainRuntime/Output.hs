@@ -175,7 +175,9 @@ guardFormatters out cfg =
 -- | One formatter, guarded. The runner hands it the configuration it built, which says whether progress is reported
 -- ('formatConfigReportProgress': colour on and neither GitHub Actions nor Buildkite): then the runner has already hidden the
 -- cursor (a control sequence, no newline) before the first event, so the line starts 'AfterTransient' and stays so until an
--- event that writes something moves it.
+-- event that writes something moves it; and it shows the cursor again after the last ('Done') event, so the line is
+-- 'AfterTransient' after the run whatever the formatter wrote. These two are the only bytes the runner writes to standard output
+-- outside a formatter's events ('Test.Hspec.Core.Runner.withHiddenCursor').
 guardFormat ∷ Output → String → (FormatConfig → IO Format) → FormatConfig → IO Format
 guardFormat out name make config = do
   format ← make config
@@ -185,4 +187,6 @@ guardFormat out name make config = do
     before ← readIORef (outLineState out)
     writeIORef (outLineState out) MidLine
     format event
-    writeIORef (outLineState out) (afterEffect (eventEffect name progress event) before)
+    writeIORef (outLineState out) (case event of
+      Done {} | progress → AfterTransient
+      _ → afterEffect (eventEffect name progress event) before)
