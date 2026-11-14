@@ -21,6 +21,8 @@ import Hetoimasia.Terrain.Runtime.Store.Admission (Ledger (..))
 import qualified Data.Map.Strict as Map
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Types (Errno (..))
 import Test.Hspec
+import System.Timeout (timeout)
+import Test.Support.Bounded (boundMicroseconds)
 import Test.TerrainRuntime.Fixtures
 import qualified Test.TerrainRuntime.Storage.Harness as H
 
@@ -120,32 +122,53 @@ pressureCase caller = do
     waitFor (backedAtRestSTM svc >>= check)
     host ← newHost (caller /= Transaction)
     pendingGrowth ← newTVarIO Nothing
+    others ← newTVarIO ([] ∷ [Host])
+    -- every wait names itself when its bound is hit, with what the storage service and the owner hold
+    let diagnosis = do
+          queued ← atomically (inspectStorageQueuedSTM svc)
+          pressed ← atomically (inspectStoragePressedSTM svc)
+          granted ← readTVarIO grants
+          pendingBytes ← either (const Nothing) (Just . statusPendingReservedBytes) <$> atomically (arenaStatusSTM svc lease)
+          own ← settledOf host
+          rest ← readTVarIO others >>= mapM settledOf
+          defects ← inspectDefects svc
+          pure ("queued " <> show queued <> ", pressed " <> show pressed <> ", grants " <> show granted <> ", pending bytes " <> show pendingBytes <> ", the caller settled " <> show own <> ", the others settled " <> show rest <> ", defects " <> show defects)
+        named ∷ String → STM a → IO a
+        named what stm = timeout boundMicroseconds (atomically stm) >>= \case
+          Just a → pure a
+          Nothing → diagnosis >>= \d → fail ("the wait for " <> what <> " was not satisfied within its bound: " <> d)
+        answered ∷ String → IO b → IO b
+        answered what action = timeout boundMicroseconds action >>= \case
+          Just b → pure b
+          Nothing → diagnosis >>= \d → fail ("the wait for " <> what <> " was not satisfied within its bound: " <> d)
     -- what must exist before the queue fills: a removal staged and waiting for its host, or an extra
     -- left pending by a growth whose host withdrew and whose release failed
     case caller of
       Transaction → do
         _ ← okOf (removeWith svc (hostEndpoint svc Nothing host) lease (tile 7 7 7) Nothing)
-        waitFor (readTVar (hostReady host) >>= \n → check (n >= 1))
+        named "the removal staged" (readTVar (hostReady host) >>= \n → check (n >= 1))
       Release → do
         reserve ← H.addGateOnce probe isReserve
         H.addRuleAfter probe 1 1 isSetLength (H.FailWith (Errno 5))
         grower ← newHost True
+        atomically (modifyTVar' others (grower :))
         flip finally (H.openGate reserve) $ do
           g ← okOf (growWith svc (hostEndpoint svc Nothing grower) lease (toInteger (128 * mib)))
           atomically (writeTVar pendingGrowth (Just g))
-          H.awaitReached reserve 1
+          named "the growth's reservation at the seam" (readTVar (H.gReached reserve) >>= check . (>= 1))
           atomically (writeTVar (hostEligible grower) False)
-        waitFor (arenaStatusSTM svc lease >>= either (const retry) (check . (> 0) . statusPendingReservedBytes))
+        named "the growth's extra left pending" (arenaStatusSTM svc lease >>= either (const retry) (check . (> 0) . statusPendingReservedBytes))
       _ → pure ()
-    waitFor (backedAtRestSTM svc >>= check)
+    named "rest before the queue fills" (backedAtRestSTM svc >>= check)
     gate ← H.addGate probe isRead
     fillers ← flip finally (H.openGate gate) $ do
       fillers ← forM [0 .. 13] $ \x → do
         h ← newHost True
         _ ← okOf (removeWith svc (hostEndpoint svc Nothing h) lease (tile x 4 3) Nothing)
+        atomically (modifyTVar' others (h :))
         pure h
-      H.awaitReached gate 2
-      waitFor (inspectStorageQueuedSTM svc >>= check . (>= 8))
+      named "two reads at the seam" (readTVar (H.gReached gate) >>= check . (>= 2))
+      named "the queue full" (inspectStorageQueuedSTM svc >>= check . (>= 8))
       atomically (writeTVar grants 0)
       -- the caller acts while the queue is full
       case caller of
@@ -156,13 +179,13 @@ pressureCase caller = do
       -- the caller was refused for the pressure, and the owner noted it; then an attach admitted after
       -- is answered (several turns of the owner, the grant's among them; an open's own attach would
       -- wait behind it, so an open is not followed by one)
-      waitFor (inspectStoragePressedSTM svc >>= check)
+      named "the refusal noted" (inspectStoragePressedSTM svc >>= check)
       -- two attaches admitted after, one after the other, are answered: each is prepared and
       -- committed, so the owner's turn order reaches its backed turn (where a grant would be made)
       -- between them
       when (caller /= Open) $ forM_ [1 ∷ Int, 2] $ \_ → do
         other ← okOf (registerClient svc)
-        void (okOf (attachArena svc other "main") >>= await svc >>= expectSuccess)
+        void (answered "an attach answered" (okOf (attachArena svc other "main") >>= await svc) >>= expectSuccess)
       -- nothing of it settled, nothing ended the owner, and nothing was granted again at once
       readTVarIO (hostSettled host) `shouldReturn` []
       inspectDefects svc `shouldReturn` []
@@ -170,7 +193,7 @@ pressureCase caller = do
       readTVarIO grants `shouldReturn` (if caller == Open then 0 else 1)
       pure fillers
     -- the reads are let go: the caller completes
-    forM_ (host : fillers) $ \h → waitFor (readTVar (hostSettled h) >>= \s → check (not (null s)))
+    forM_ (host : fillers) $ \h → named "every caller settled once the reads are let go" (readTVar (hostSettled h) >>= \s → check (not (null s)))
     settledOf host >>= \outcome → case (caller, outcome) of
       (Transaction, [Succeeded (ARemoved r)]) → removeChangedFlag r `shouldBe` True
       (Growth, [Succeeded (AGrown a)]) → grownAllowance a `shouldBe` 128 * mib
@@ -182,5 +205,5 @@ pressureCase caller = do
     status ← arenaStatus svc lease >>= expectRight
     statusPendingReservedBytes status `shouldBe` 0
     inspectDefects svc `shouldReturn` []
-    waitFor (backedAtRestSTM svc >>= check)
+    named "rest at the end" (backedAtRestSTM svc >>= check)
     settleChecks svc

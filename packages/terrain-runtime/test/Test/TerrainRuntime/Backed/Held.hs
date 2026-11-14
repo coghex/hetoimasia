@@ -61,13 +61,13 @@ heldCase ending = do
         NeverFunded → free < txnControl
         RefusedWithNothingInFlight → free < txnControl + 4096
   withServiceSeam quiet config alwaysAdmitting noProbe (H.seamFor probe) $ \svc → do
-    (_, lease) ← openMain svc "main"
+    (client, lease) ← openMain svc "main"
     waitFor (backedAtRestSTM svc >>= check)
     H.addRule probe (-1) isClose H.Throw
     cycles ← newIORef (0 ∷ Int)
     let freeControl = (\l → A.lgControlLimit l - A.lgControlReserved l) <$> atomically (inspectEditBankSTM svc)
         cycleOnce = do
-          (_, other) ← openMain svc "other"
+          other ← okOf (openArena svc client "other" soilOverStone) >>= await svc >>= expectSuccess
           okOf (releaseLease svc other)
           waitFor (backedAtRestSTM svc >>= check)
           modifyIORef' cycles (+ 1)
