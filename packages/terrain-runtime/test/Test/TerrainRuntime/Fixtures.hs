@@ -40,6 +40,7 @@ module Test.TerrainRuntime.Fixtures
 
     -- * Budgets and the independent model
   , tightConfig
+  , tightConfigStaging
   , microConfig
   , microConfigSlots
   , microConfigWith
@@ -269,10 +270,15 @@ seenAtSettle host = reverse <$> readTVarIO (hostSeen host)
 
 -- | Validated tight limits for a small extent: the smallest resident bank the
 -- approved minimum-budget rule accepts, plus room for @spare@ one-cell regions,
--- and a staging bank twice its minimum. The edit bank is a parameter. Queries
--- name at most four regions, holds two and camera descriptions four.
+-- and a staging bank three times its minimum (rounded up to a thousand). The edit
+-- bank is a parameter. Queries name at most four regions, holds two and camera
+-- descriptions four.
 tightConfig ∷ (Integer, Integer, Integer) → Integer → Integer → Config
-tightConfig (ex, ey, ez) spare edit = defaultConfig {configLimits = limits, configRetainedBytes = fromInteger (stagingFor residentBank)}
+tightConfig = tightConfigStaging 3
+
+-- | 'tightConfig' with a staging bank of the given multiple of its minimum.
+tightConfigStaging ∷ Integer → (Integer, Integer, Integer) → Integer → Integer → Config
+tightConfigStaging factor (ex, ey, ez) spare edit = defaultConfig {configLimits = limits, configRetainedBytes = fromInteger (stagingFor residentBank)}
   where
     spec bytes staging =
       LimitsSpec
@@ -294,7 +300,7 @@ tightConfig (ex, ey, ez) spare edit = defaultConfig {configLimits = limits, conf
     smallest = fromMaybe (error "no resident bank satisfies the minimum budgets") (listToMaybe [r | r <- [100, 200 .. 4000000], Just _ <- [valid r 1000000]])
     stagingFor bytes = fromMaybe (error "no staging bank satisfies the minimum budgets") (listToMaybe [t | t <- [1000, 2000 .. 4000000], Just _ <- [valid bytes t]])
     residentBank = smallest + spare * 400
-    limits = fromMaybe (error "tight limits are invalid") (valid residentBank (3 * stagingFor residentBank))
+    limits = fromMaybe (error "tight limits are invalid") (valid residentBank (factor * stagingFor residentBank))
 
 -- | The smallest validated limits for a single-cell-wide extent of two levels, one
 -- region per query, two commands and no holds or camera: a resident bank that

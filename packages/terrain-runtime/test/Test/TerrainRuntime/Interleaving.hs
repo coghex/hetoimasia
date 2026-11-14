@@ -80,6 +80,8 @@ spec = describe "A randomized interleaving over the service" $ do
       runSeed (microConfigSlots 3) True (seed + 100) >>= \(n, _, _) → modifyIORef' pressed (+ n)
   covers "the runs under capacity pressure" pressed
   -- And under tight service-wide limits (two arenas, a handful of leases and views),
+  -- with staging four times its minimum (since a load's scratch counts the runs it
+  -- reads, these seeds reach no retiring arena at three times),
   -- where a closed arena whose snapshot is borrowed is routinely retiring while an
   -- open is admitted or refused. After every step each limit's count must equal the
   -- entities holding the resource of every state, retiring included, and no
@@ -88,7 +90,7 @@ spec = describe "A randomized interleaving over the service" $ do
   retiringSeen <- runIO (newIORef (0 ∷ Int))
   forM_ [1 .. 24 ∷ Word64] $ \seed →
     it ("counts every resource-holding entity against every limit (seed " <> show seed <> ")") $
-      runSeed ((tightConfig (2, 1, 2) 3 4096) {configMaxArenas = 2, configMaxLeases = 5, configMaxViews = 2, configMaxClients = 3}) True (seed + 200) >>= \(n, r, _) → modifyIORef' limited (+ n) >> modifyIORef' retiringSeen (+ r)
+      runSeed ((tightConfigStaging 4 (2, 1, 2) 3 4096) {configMaxArenas = 2, configMaxLeases = 5, configMaxViews = 2, configMaxClients = 3}) True (seed + 200) >>= \(n, r, _) → modifyIORef' limited (+ n) >> modifyIORef' retiringSeen (+ r)
   covers "the runs under tight service limits" limited
   it "has steps where a closed arena was still retiring across the runs under tight service limits" $ readIORef retiringSeen >>= \n → n `shouldSatisfy` (> 0)
   where

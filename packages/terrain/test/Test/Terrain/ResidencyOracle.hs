@@ -93,7 +93,9 @@ oracle m arena demands removal
             Just o → (if absent && isNothing new then metadata else 0) + 48 * toInteger (coverageColumns o) + 34 * toInteger (coverageSegments o)
           scratch = case new of
             Nothing → 0
-            Just nw → 256 + 2 * toInteger (coverageCells nw)
+            -- a frame, two bytes a cell, and the runs the load reads: a column of z levels holds at most
+            -- z / 2 + 1 runs of 16 bytes, and each column a 48-byte entry
+            Just nw → 256 + 2 * toInteger (coverageCells nw) + (toInteger (coverageCells nw) `div` 2 + toInteger (coverageColumns nw)) * 16 + 48 * toInteger (coverageColumns nw)
        in (maybe 0 (toInteger . regionBytes) res, reserve, promisedLeast, scratch, isJust new)
     promisedCover d = case [jobCoverage j | j ← modelJobs m, jobArena j == arena, jobRegion j == demandRegion d, jobPhase j /= JobCancellingPhase] of
       [] → Nothing
