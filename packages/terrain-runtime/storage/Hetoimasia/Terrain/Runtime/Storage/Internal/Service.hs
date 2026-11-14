@@ -47,6 +47,8 @@
 module Hetoimasia.Terrain.Runtime.Storage.Internal.Service
   ( -- * The service
     StorageService
+  , OpenCleanupFailed (..)
+  , evidenceOf
   , StoragePorts (..)
   , StartFailure (..)
   , withStorageService
