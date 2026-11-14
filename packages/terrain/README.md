@@ -577,10 +577,10 @@ excluded from this compiler's result and peak figures (declaring a thousand more
 materials changes none of them, and a test pins that), and this slice invents no
 resident-bank charge for them: any charge for the retained source itself is the
 arena-admission integration's choice. Only newly derived metadata is accounted:
-the compiled result is charged once per arena to the 256 MiB resident terrain bank
-by the later service, and the temporaries of the one compilation active per
-session are charged to the same bank while they exist. This module creates no
-bank, service, semaphore or session owner.
+the terrain service charges its own compile account, beside the resident, edit and
+render banks: the temporaries of the one compilation active per session up to its peak
+while they exist, then the compiled result and what the arena derives from it for the
+arena's life. This module creates no bank, service, semaphore or session owner.
 
 ### State, owner and lifetime
 
@@ -1147,12 +1147,11 @@ Checks run in a fixed order and the first failure is reported:
    specified, and its storage-aware admission decisions exist as a pure model in
    [`hetoimasia-terrain-runtime`](../terrain-runtime/README.md#the-temporary-store-tra-20)
    (TRA-20: a 48 MiB cache, 8 MiB staging and 8 MiB control division of this same
-   64 MiB edit bank, backed-only eviction and a per-arena disk allowance). Until the
-   terrain owner adopts them (TRA-22) this baseline keeps its RAM-only behavior
-   exactly: its 64 MiB retained capacity, its lifetime charge (an offload or an
-   eviction never credits it, because the baseline holds the only copy) and this
-   refusal are unchanged and pinned by `Test.Terrain.StorageCompat`. The bound is
-   still not the arena's final total-history contract.
+   64 MiB edit bank, backed-only eviction and a per-arena disk allowance). The model
+   keeps this rule as stated, pinned by `Test.Terrain.StorageCompat`. The terrain
+   service uses it with nothing retained: every removal it acknowledges is in the
+   arena's store and commits with zero retained bytes, so this refusal does not arise
+   there, and disk exhaustion is the `storage_full` pause.
 3. **Busy**: the command slot, the staging bank, the edit bank (other
    reservations outstanding) and last the resident bank, whose refusal names the
    shortfall, the bytes of eligible victims and how many regions each condition
@@ -1273,9 +1272,8 @@ results for the incarnation are stale. The owner still performs the real close.
 
 TRA-4 supplies identities, sequencing, the real cells of each job, the measured cost
 of each completed job, the real edit and its commit revision, and the discard of each
-victim. TRA-22 replaces the lifetime retained-edit charge with the storage-aware
-decisions of TRA-20 only when it adopts the store, and only for edits that have a
-real backing copy. TRA-5 maps refusals to the Lua `busy`. Native memory, GPU ownership and
+victim. The terrain service charges edits through the store's storage-aware decisions
+(every edit has a backing copy before it is acknowledged). TRA-5 maps refusals to the Lua `busy`. Native memory, GPU ownership and
 retirement, and every GPU limit belong to their render and graphics slices.
 
 Retained trace evidence (separate resident, edit and staging ledgers around

@@ -1399,7 +1399,9 @@ wrong-kind or forged handle, is an ordinary error; ownership is positive and per
 handles it was issued, and another instance's handle is refused however many have been issued since and whether or not its issuer
 still lives). Any other outcome of the service (an unknown code, a revision that is not a Lua
 integer (above the VM's validated profile ceiling, not only Int64's), an answer over the declared ceilings) is a provider defect and fails the owner; it is never given a code, never busy and
-never air.
+never air. The service's storage outcomes (`source_complexity`, `storage_unsupported`, `reservation_failed`,
+`storage_full`, `storage_io`, `storage_integrity`, `storage_size_not_increased`) have no declared Lua code, so they take
+this same path; none is presented as success, `busy`, another code or air.
 
 **Who may call, and when.** An instance of the facade, in `init` and in an update, while the session's admission is open; refused (an
 ordinary error, never busy) at a module's top level (through a captured facade or an import that a hook started included), in
@@ -1419,8 +1421,8 @@ and the drain carry on.
 admission; the terrain service's own admission is the next step of the same masked hand-off, and when it is busy (arenas, leases,
 retained edits, any bank) the hand-off declines (`SubmissionDeclined`) and the host takes the whole admission back: no handle, no
 lease, no credit, no name claim, no edit, and `nil, busy`. A permanent fact that changed since the argument check is declined the
-same way and read as an ordinary error. Exhausted retained-edit capacity is therefore the same immediate busy, never a final
-refusal, and nothing already retained is evicted. Permanent validation, ownership and stop refusals are decided before any bank.
+same way and read as an ordinary error. A full request bank is therefore the same immediate busy, never a final refusal, and
+nothing already committed is evicted; a full disk allowance is the service's `storage_full`, which takes the path above. Permanent validation, ownership and stop refusals are decided before any bank.
 
 **The commit point.** The service's `Endpoint` is attached to the host's `Settling` seam: the service reads the request's
 eligibility, commits the edit and delivers the settlement in one transaction that also decides cancellation, the parent session's
