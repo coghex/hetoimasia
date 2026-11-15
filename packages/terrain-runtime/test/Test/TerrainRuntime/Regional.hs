@@ -32,11 +32,21 @@ import Hetoimasia.Terrain.Runtime.Storage.Internal.Native (NativeOp (..))
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Types (Errno (..))
 import Hetoimasia.Terrain.Runtime.Store.Internal.State (minAllowanceBytes)
 import Hetoimasia.Terrain.Source (CellSpec (..), LayerSpec (..), PatchSpec (..), SourceSpec (..))
+import Hetoimasia.Terrain.Runtime.Backed.Backend (Closing (..))
+import Hetoimasia.Terrain.Runtime.Backed.RegionCopy (RegionCopy (..))
+import Hetoimasia.Terrain.Runtime.Backed.Regional (BProgress (..), Build, buildDraining, buildVersion, endBuild, startBuild, stepBuild)
+import Hetoimasia.Terrain.Runtime.Backed.Txn (Io (..))
+import qualified Hetoimasia.Terrain.Runtime.Storage.Internal.Service as Storage
+import Hetoimasia.Terrain.Runtime.Storage.Internal.Types (WorkClass (..))
+import Hetoimasia.Terrain.Runtime.Store.Internal.Format (PageNo (..))
+import Hetoimasia.Terrain.Runtime.Store.Internal.Model (Store)
 import Test.Hspec hiding (after, before, pending)
 import Test.Support.Bounded (bounded)
 import Test.Support.Owned (withOwnedThread)
 import Test.TerrainRuntime.Fixtures
 import qualified Test.TerrainRuntime.Storage.Harness as H
+import Test.TerrainRuntime.Store.Harness (H (..), smallSpec)
+import qualified Test.TerrainRuntime.Store.Scenes as Scenes
 
 -- | The routine examples: a representative every-cell oracle over the two regions that hold every fixture
 -- shape side by side, and every other contract.
@@ -51,6 +61,7 @@ spec = describe "Regional snapshots" $ do
   fairnessSpec
   pendingSpec
   pressureSpec
+  buildPressureSpec
   failureSpec
   ownershipSpec
   admissionSpec
@@ -822,6 +833,75 @@ pressureSpec =
         Succeeded (ARemoved _) → pure ()
         other → expectationFailure ("a filler: " <> show other)
       settleChecks svc
+
+-- | A build's read refused for pressure in the middle of the build (the storage service's queue full), driven
+-- directly: the build is stepped by hand against a real store on a real file, so no storage worker can take a
+-- queued job between the moment the queue is full and the build's next read. Through the service a worker
+-- that finishes the build's held read takes the next queued job at once, so that moment cannot be held.
+buildPressureSpec ∷ Spec
+buildPressureSpec =
+  it "keeps a build whose read is refused for pressure mid-build on its pin, and resumes it to an uninterrupted build's result once the storage service drains" $
+    H.withEnv $ \env → do
+      let h0 = H.newStoreH smallSpec
+          cfg = hCfg h0
+          denv = Scenes.envFor (Scenes.limitsWith 64) Scenes.twoOpenings
+          regions = [region 0 0 0]
+      backing ← H.openBacking env (hIdent h0) cfg
+      -- a committed run record in the region's columns, written to the file: a build must read its page
+      plan ← either fail pure (H.planFor h0 1)
+      store ← H.runTxn env backing (hStore h0) plan >>= H.finishPublish
+      let io = Io (H.envSvc env) backing ExplicitWork
+          toEnd ∷ Store → Build → IO (Build, Either String [(RegionCoord, RegionCopy)])
+          toEnd st b = do
+            (b', p) ← stepBuild io OwnerRunning st b
+            case p of
+              BMore → toEnd st b'
+              BNoted h → pure (b', Left ("noted " <> show h))
+              BBlocked wait → atomically wait >> toEnd st b'
+              BDone copies → pure (b', Right copies)
+              BPressed busy → pure (b', Left ("pressed " <> show busy))
+              BFailed h → pure (b', Left ("failed " <> show h))
+              BDrained → pure (b', Left "drained")
+          parts copies = [(r, rcTerrain c, rcKnowledge c, rcWork c) | (r, c) ← copies]
+      -- the uninterrupted build
+      (pinned1, b1) ← either (fail . show) pure (startBuild store denv regions)
+      (b1', done1) ← toEnd pinned1 b1
+      uninterrupted ← either fail (pure . parts) done1
+      _ ← pure (endBuild pinned1 b1')
+      -- the same build with every storage worker held and the queue full before its first read
+      (pinned2, b2) ← either (fail . show) pure (startBuild store denv regions)
+      held ← H.addGate (H.envProbe env) isRead
+      let submit = Storage.submitRead (H.envSvc env) backing ExplicitWork cfg (PageNo 1) 1 Storage.ReadValidated
+          fill acc = submit >>= \case
+            Right t → fill (t : acc)
+            Left _ → pure acc
+      -- both workers take a read and are held at the seam; then reads are queued until the queue refuses one
+      first ← fmap concat . forM [1, 2 ∷ Int] $ \_ → either (const []) pure <$> submit
+      H.awaitReached held 2
+      queued ← fill []
+      let tickets = first <> queued
+      atomically (Storage.snQueued <$> Storage.snapshotOf (H.envSvc env)) >>= (`shouldBe` 8)
+      (b2', refused) ← stepBuild io OwnerRunning pinned2 b2
+      case refused of
+        BPressed _ → pure ()
+        other → expectationFailure ("the build's read under a full queue: " <> showProgress other)
+      -- still on its pin, not draining, nothing copied yet
+      (buildVersion b2', buildDraining b2') `shouldBe` (buildVersion b2, False)
+      H.openGate held
+      forM_ tickets $ \t → atomically (Storage.awaitTicket (H.envSvc env) t) >> Storage.discardTicket (H.envSvc env) t
+      (b2'', done2) ← toEnd pinned2 b2'
+      resumed ← either fail (pure . parts) done2
+      _ ← pure (endBuild pinned2 b2'')
+      resumed `shouldBe` uninterrupted
+  where
+    showProgress = \case
+      BMore → "more"
+      BNoted h → "noted " <> show h
+      BBlocked _ → "blocked"
+      BPressed b → "pressed " <> show b
+      BDone _ → "done"
+      BFailed h → "failed " <> show h
+      BDrained → "drained"
 
 failureSpec ∷ Spec
 failureSpec =
