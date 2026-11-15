@@ -44,6 +44,7 @@ module Hetoimasia.Terrain.Runtime.Internal.Core
   , surfaceWindowLevels
   , keepCap
   , rangeKeep
+  , extentLevels
   , surfaceKnown
   , pendingEdits
 
@@ -106,7 +107,7 @@ import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Word (Word64)
 import Hetoimasia.Terrain.Cell
-import Hetoimasia.Terrain.Changes (Changes, changeColumnBytes, changeIntervalBytes, emptyChanges)
+import Hetoimasia.Terrain.Changes (Changes, changeColumnBytes, changeIntervalBytes, emptyChanges, runsMeetingLevels)
 import Hetoimasia.Terrain.Coordinate
 import qualified Hetoimasia.Terrain.Connectivity as C
 import qualified Hetoimasia.Terrain.Discovery as D
@@ -376,7 +377,12 @@ keepCap ranges = \case
 -- | The most removed runs that meet the levels @[lo, hi)@ of one column: runs are coalesced, so two of
 -- them are a level apart at least.
 rangeKeep ∷ Int64 → Int64 → Int
-rangeKeep lo hi = fromIntegral (max 0 (hi - lo) `div` 2 + 1)
+rangeKeep lo hi = fromIntegral (runsMeetingLevels (hi - lo))
+
+-- | The levels of a region a load may make resident (the configured extent's height), which a load
+-- reads of every column it touches.
+extentLevels ∷ Integral a ⇒ Config → a
+extentLevels config = let (_, _, z) = R.limitExtent (configLimits config) in fromIntegral z
 
 -- | What a surface's read knows of its column: the runs its window @[lo, hi)@ read, and, above the
 -- window up to the source's top, that no cell is occupied (every window above it was read and held
@@ -789,7 +795,8 @@ startJobWork svc jid cover =
   where
     running (JobWork a b c d e _ _ _) =
       JobWork a b c d e (R.coverageColumns cover * fromIntegral columnIndexBytes + R.coverageSegments cover * (32 + 2)) (256 + 2 * R.coverageCells cover + runs) 1
-    runs = (R.coverageCells cover `div` 2 + R.coverageColumns cover) * fromIntegral changeIntervalBytes + R.coverageColumns cover * fromIntegral changeColumnBytes
+    -- every column the job touches, over the region's loadable extent (what the job reads)
+    runs = R.coverageColumns cover * (runsMeetingLevels (extentLevels (serviceConfig svc)) * fromIntegral changeIntervalBytes + fromIntegral changeColumnBytes)
 
 -- | The job's report (completed, failed or acknowledged) ends its record, in the
 -- transaction that reports it.

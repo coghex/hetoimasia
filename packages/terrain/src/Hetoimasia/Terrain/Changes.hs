@@ -28,6 +28,7 @@ module Hetoimasia.Terrain.Changes
   , changesBytes
   , changeColumnBytes
   , changeIntervalBytes
+  , runsMeetingLevels
 
     -- * Removal
   , ChangeLimits (..)
@@ -71,6 +72,11 @@ changeColumnCount = Map.size . changeColumns
 -- | Conservative accounted bytes of one retained interval: two endpoints.
 changeIntervalBytes ∷ Int
 changeIntervalBytes = 16
+
+-- | The most retained intervals of one column that can meet a range of @levels@ levels: intervals
+-- are coalesced, so two of them are a level apart, and @levels / 2 + 1@ of them can meet it.
+runsMeetingLevels ∷ Integral a ⇒ a → a
+runsMeetingLevels levels = max 0 levels `div` 2 + 1
 
 -- | Conservative accounted bytes of one column's index entry: the key, the
 -- set header and a pointer.

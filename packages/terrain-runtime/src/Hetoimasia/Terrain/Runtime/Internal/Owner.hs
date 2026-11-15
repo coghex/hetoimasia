@@ -728,7 +728,7 @@ dispatchJob svc = do
                Left why → pure (Just (jid, aid, region, Left why))
                Right pieces → do
                  modifySt svc (\st → st {stateLoadJobs = Map.insert jid (aid, region, cover) (stateLoadJobs st)})
-                 pure (Just (jid, aid, region, Right (regionRanges region [c | (c, _) ← pieces])))
+                 pure (Just (jid, aid, region, Right (regionRanges (extentLevels (serviceConfig svc)) region [c | (c, _) ← pieces])))
        _ → modifySt svc (\st → st {stateDispatchIdle = True}) >> pure Nothing
   forM_ dispatched $ \(jid, aid, region, planned) → do
     probe svc (PointJob aid region)
@@ -753,17 +753,20 @@ regatherJob svc jid = do
     started <- case realPieces region cover of
       Left why → pure (Left why)
       Right pieces → do
-        ok <- atomically (startGatherFor svc (GatherJob jid) aid (ReadRuns (regionRanges region [c | (c, _) ← pieces]) maxBound))
+        ok <- atomically (startGatherFor svc (GatherJob jid) aid (ReadRuns (regionRanges (extentLevels (serviceConfig svc)) region [c | (c, _) ← pieces]) maxBound))
         pure (if ok then Right () else Left "the arena of a dispatched load closed, or no pin was available")
     forM_ (either Just (const Nothing) started) $ \why → do
       defect <- atomically (forgetLoad svc jid >> finishJob svc jid (Left (SourceFailure (Text.pack why))))
       forM_ defect $ \text → failWith svc (AccountingDefect text) []
 
--- | What a load job reads of its region's columns: the region's levels only.
-regionRanges ∷ RegionCoord → [Column] → [(Column, Int64, Int64)]
-regionRanges region columns =
+-- | What a load job reads of its region's columns: every column it touches over the region's loadable
+-- extent (@levels@ of the region's levels from its floor), not only its cells: what it makes resident
+-- merges with the column's resident segments in the region, which are rebuilt with it, and those lie
+-- only where something was loaded.
+regionRanges ∷ Int64 → RegionCoord → [Column] → [(Column, Int64, Int64)]
+regionRanges levels region columns =
   let lo = fromIntegral (regionZ region) * fromIntegral regionLevels
-   in [(c, lo, lo + fromIntegral regionLevels) | c ← Set.toList (Set.fromList columns)]
+   in [(c, lo, lo + min levels (fromIntegral regionLevels)) | c ← Set.toList (Set.fromList columns)]
 
 forgetLoad ∷ Service → R.JobId → STM ()
 forgetLoad svc jid = modifySt svc (\st → st {stateLoadJobs = Map.delete jid (stateLoadJobs st)})
