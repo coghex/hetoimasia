@@ -11,7 +11,7 @@ module Test.TerrainRuntime.Regional (spec, fullSpec) where
 
 import Control.Concurrent.MVar
 import Control.Concurrent.STM
-import Control.Exception (ErrorCall (..), finally, throwIO, try)
+import Control.Exception (ErrorCall (..), evaluate, finally, throwIO, try)
 import Control.Monad (foldM, forM, forM_, when)
 import Data.IORef
 import Data.List (sort)
@@ -521,9 +521,9 @@ compressionSpec = describe "compression" $ do
       borrow ← borrowOf taken lease [below, above]
       residencyOf svc lease >>= (`shouldBe` before)
       let snapshot = regionBorrowSnapshot borrow
-      -- the record (128) and, for each region, its entry (200), an empty terrain part (16) and a
-      -- knowledge part of one class of one run (5 bytes: 24)
-      regionSnapshotFootprint snapshot `shouldBe` 128 + 2 * (200 + 16 + 24)
+      -- the record (128) and, for each region, its entry (200), an empty terrain part (its boxed array and
+      -- the array's header: 32) and a knowledge part of one class of one run (5 bytes: 40)
+      regionSnapshotFootprint snapshot `shouldBe` 128 + 2 * (200 + 32 + 40)
       regionTerrain snapshot below `shouldBe` PartReady []
       fmap D.regionKnowledgeUniform (regionKnowledge snapshot below) `shouldBe` PartReady (Just (D.CellKnowledge D.SolidUnknown D.NoVoidHere))
       fmap D.regionKnowledgeUniform (regionKnowledge snapshot above) `shouldBe` PartReady (Just (D.CellKnowledge D.NoSolid D.VoidKnown))
@@ -538,14 +538,14 @@ compressionSpec = describe "compression" $ do
       (_, lease) ← openWith svc (ground []) []
       let below = region 5 5 (-1)
       pristine ← borrowOf taken lease [below]
-      regionSnapshotFootprint (regionBorrowSnapshot pristine) `shouldBe` 128 + 200 + 16 + 24
+      regionSnapshotFootprint (regionBorrowSnapshot pristine) `shouldBe` 128 + 200 + 32 + 40
       _ ← removeCell' svc lease (tile 88 88 (-16))
       settled svc lease
       one ← borrowOf taken lease [below]
       let snapshot = regionBorrowSnapshot one
-      -- terrain: one column, one interval (4 bytes: 24); knowledge: two classes (the removed column's three
-      -- runs and everyone else's one) and the column map (268 bytes: 288)
-      regionSnapshotFootprint snapshot `shouldBe` 128 + 200 + 24 + 288
+      -- terrain: one column, one interval (4 bytes: 40); knowledge: two classes (the removed column's three
+      -- runs and everyone else's one) and the column map (268 bytes: 304)
+      regionSnapshotFootprint snapshot `shouldBe` 128 + 200 + 40 + 304
       regionSnapshotFootprint snapshot - regionSnapshotFootprint (regionBorrowSnapshot pristine) `shouldBe` 272
       regionTerrain snapshot below `shouldBe` PartReady [(column 88 88, range (-16) (-15))]
       fmap (length . D.regionKnowledgeClasses) (regionKnowledge snapshot below) `shouldBe` PartReady 2
@@ -1006,6 +1006,33 @@ retentionSpec = describe "what a regional build retains" $ do
         -- coordinate per region, and its own record, pin and remaining regions
         (n, bytes <= fromIntegral footprint + 64 * n + 512) `shouldBe` (n, True)
         (n, fromIntegral bytes <= regionSnapshotReservation (length regions)) `shouldBe` (n, True)
+  it "charges a delivered snapshot at least what it retains on the heap, and reserves at least that: one region, sixteen, and a region of many removals and many knowledge classes" $
+    withService defaultConfig $ \svc → guarded svc $ \taken → do
+      -- a worn region: shafts from the sky of eight depths in 32 of its columns and a buried removal in 32
+      -- others, apart: its terrain is an interval in each of those 64 columns, its knowledge many classes
+      -- (each depth of shaft, the columns beside each, the buried and undiscovered)
+      let worn = region 0 0 0
+          sixteen = [region x 0 z | x ← [2 .. 9], z ← [-1, 0]]
+          shafts = [(x, y, z) | x ← [0, 2 .. 14], y ← [0, 2 .. 14], (x + y) `mod` 4 == 0, z ← [7, 6 .. 7 - (x `div` 2 + y `div` 4) `mod` 8]]
+          buried' = [(x, y, 3) | x ← [1, 3 .. 15], y ← [1, 3 .. 15], (x + y) `mod` 4 == 2]
+      (_, lease) ← openWith svc (ground []) (shafts <> buried')
+      one ← borrowOf taken lease [region 5 5 (-1)]
+      many ← borrowOf taken lease sixteen
+      worst ← borrowOf taken lease [worn]
+      let worstSnapshot = regionBorrowSnapshot worst
+      fmap length (regionTerrain worstSnapshot worn) `shouldBe` PartReady 64
+      fmap (length . D.regionKnowledgeClasses) (regionKnowledge worstSnapshot worn) `shouldSatisfy` \case
+        PartReady classes → classes > 4
+        _ → False
+      rows ← forM [("one region" ∷ String, one), ("sixteen regions", many), ("a worn region", worst)] $ \(label, borrow) → do
+        -- the evaluated value as delivered, walked whole but for the incarnation's shared source
+        snapshot ← evaluate (regionBorrowSnapshot borrow)
+        retained ← retainedBy ["Source"] [] snapshot
+        pure (label, retThunks retained, fromIntegral (retBytes retained), regionSnapshotFootprint snapshot, regionSnapshotReservation (length (regionSnapshotRegions snapshot)))
+      -- (label, thunks, bytes retained, footprint, reservation)
+      rows `shouldSatisfy` all (\(_, thunks, measured, charged, reserved) → thunks == 0 && measured <= charged && charged <= reserved)
+      mapM_ (releaseRegionBorrow svc) [one, many, worst]
+      settleChecks svc
   it "drops the window a read replaces when it starts afresh inside a region: a build never holds more pages than a reader may pin" $
     H.withEnv $ \env → do
       -- runs dense enough that one region's reads need more pages than one window holds

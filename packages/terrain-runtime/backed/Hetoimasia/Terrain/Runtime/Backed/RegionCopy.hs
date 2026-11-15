@@ -17,9 +17,9 @@
 -- unavailable part is never air, fog, undiscovered or the pristine source, and other regions are
 -- unaffected. A region the snapshot does not hold is 'PartNotHeld'.
 --
--- Both parts are kept packed in one short byte string each, so what a snapshot holds is measured
--- exactly ('snapshotFootprint') and grows with the region's intervals and knowledge runs, never with
--- its 8,192 cells.
+-- Both parts are kept packed in one short byte string each, so what a snapshot holds is accounted
+-- object by object ('snapshotFootprint', an upper bound of its heap) and grows with the region's
+-- intervals and knowledge runs, never with its 8,192 cells.
 --
 -- State, ownership and lifetime: none here; the value is immutable. The service owns a snapshot's
 -- charge and its release (see "Hetoimasia.Terrain.Runtime").
@@ -288,23 +288,43 @@ decode c
 
 -- | The accounted bytes a snapshot holds: its record and, for each held region, its entry and its
 -- packed parts. The source is the incarnation's, shared, and not counted.
+--
+-- The figure names every heap object of the copied value as GHC 9.14.1 lays it out on a 64-bit
+-- machine, optimised as every local package is built (strict fields of one word unpacked): an object
+-- is a one-word header and its payload, a word for each pointer or unpacked word, and a byte array's
+-- payload is rounded up to a word. It is an upper bound of what a walk of the evaluated value's heap
+-- measures, the source left out: a part that is unavailable is charged as a ready one's box, and the
+-- identity fields are charged as boxes of their own as well as the record's words.
 snapshotFootprint ∷ RegionSnapshot → Word64
 snapshotFootprint snapshot =
   snapshotHeaderBytes
     + sum [regionEntryBytes + maybe 0 (shortBytes . SBS.length) (rcTerrain c) + maybe 0 (shortBytes . SBS.length) (rcKnowledge c) | c ← Map.elems (rsRegions snapshot)]
 
--- | The snapshot's record: a header and six fields, and the boxed identities (16 bytes each).
+-- | One word.
+wordBytes ∷ Word64
+wordBytes = 8
+
+-- | A heap object: its header word and its payload of @n@ words.
+objectBytes ∷ Word64 → Word64
+objectBytes n = wordBytes * (1 + n)
+
+-- | The snapshot's own objects: its record (the arena, the two revisions and the generation as a word
+-- each, the source and the region map as pointers: 56), each of the four identities as a box of its
+-- own (16 each: 64) and the map's empty leaf, a static object of a header alone (8).
 snapshotHeaderBytes ∷ Word64
-snapshotHeaderBytes = 128
+snapshotHeaderBytes = objectBytes 6 + 4 * objectBytes 1 + objectBytes 0
 
--- | One held region's entry: its node in the map (48), its key (32), its copy record (32), the two
--- 'Just' boxes of its parts (16 each) and its work record (56).
+-- | One held region's entry, its parts' contents apart: its node in the map (the size as a word, the
+-- key, the value and the two subtrees: 48), its key (three coordinates as a word each: 32), its copy
+-- record (two parts and the work record as pointers: 32), the 'Just' box of each part (16 each: 32)
+-- and its work record (six counts as a word each: 56).
 regionEntryBytes ∷ Word64
-regionEntryBytes = 200
+regionEntryBytes = objectBytes 5 + objectBytes 3 + objectBytes 3 + 2 * objectBytes 1 + objectBytes 6
 
--- | A short byte string of @n@ bytes: a two-word header and the payload rounded up to a word.
+-- | A packed part of @n@ bytes: the short byte string's boxed array (a pointer: 16) and the array
+-- itself, a header and its size (16) and the payload rounded up to a word.
 shortBytes ∷ Int → Word64
-shortBytes n = 16 + 8 * ((fromIntegral n + 7) `div` 8)
+shortBytes n = objectBytes 1 + objectBytes 1 + wordBytes * ((fromIntegral n + 7) `div` 8)
 
 -- | The most one held region can hold: its entry, a terrain part of 256 columns each with the most
 -- intervals 32 levels can hold (16: removed runs are coalesced, so two are a level apart), and a
