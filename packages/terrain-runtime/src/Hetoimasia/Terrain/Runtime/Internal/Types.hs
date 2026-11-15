@@ -20,6 +20,8 @@ module Hetoimasia.Terrain.Runtime.Internal.Types
 
     -- * Settlement seam
   , Endpoint (..)
+  , OpenOptions (..)
+  , defaultOpenOptions
   , Settlement (..)
   , Answer (..)
   , GrowAnswer (..)
@@ -258,6 +260,17 @@ data Settlement
   | Failed !Failure
   | Cancelled
   deriving stock (Eq, Show)
+
+-- | What an open may name beyond its name and its source.
+newtype OpenOptions = OpenOptions
+  { openAllowanceBytes ∷ Maybe Integer
+  -- ^ The arena's allowance in bytes; 'Nothing' is the service's own ('configStore', 1 GiB by default).
+  }
+  deriving stock (Eq, Show)
+
+-- | No option: the service's own allowance.
+defaultOpenOptions ∷ OpenOptions
+defaultOpenOptions = OpenOptions Nothing
 
 -- | A successful answer.
 data Answer
@@ -577,7 +590,9 @@ data Service = Service
 
 -- | A command, with the authority and validated inputs it needs.
 data Cmd
-  = COpen !Text !Source !Word64
+  = -- | An open: the name, the validated source, the creating client, and the allowance of the arena's store
+    -- (the service's own, or the one the open named, validated by the same rules at admission).
+    COpen !Text !Source !Word64 !StoreConfig
   | CAttach !Text !Word64
   | CCell !TileCoord
   | CColumn !Column !ZRange
@@ -973,6 +988,8 @@ newtype PressureMark = PressureMark [Word64]
 -- reservation is asked for, so the reserved file's pages carry it) and its phase.
 data OpenTask = OpenTask
   { openSource ∷ !Source
+  , -- | The arena's store configuration: what its reservation asks for and its first store is built with.
+    openStore ∷ !StoreConfig
   , openPhase ∷ !OpenPhase
   }
 

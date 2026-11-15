@@ -989,7 +989,7 @@ prepareReq svc rid = do
   case Map.lookup rid (stateRequests st) of
    Nothing → pure False
    Just req → case reqCmd req of
-    COpen _ source _ → not (Map.member rid (stateOpens st)) <$ atomically (beginOpen svc rid source)
+    COpen _ source _ store → not (Map.member rid (stateOpens st)) <$ atomically (beginOpen svc rid source store)
     CAttach {} → stage svc rid Nothing (Revision 0) StagedControl
     CGrow bytes → withArena req $ \(aid, arena) →
       -- the store's pure proposal against the allowance as it is now: equal is an idempotent success,
@@ -1131,7 +1131,7 @@ commitWaits st open rid req sg
   | otherwise = case (reqCmd req, stagedWork sg) of
       -- a source that fails to intern settles at once; otherwise the open waits for its preparation,
       -- and opens publish in the order their incarnations were allocated
-      (COpen _ source _, StagedControl)
+      (COpen _ source _ _, StagedControl)
         | Left _ <- internSourceMaterials source emptyPalette → False
         | otherwise → maybe True (\(aid, _, _, _, _) → not (openOrderAllows st aid)) (openReady st rid)
       (CAttach {}, StagedControl) → False
@@ -1151,7 +1151,7 @@ commitWaits st open rid req sg
 
 commitStaged ∷ Service → St → RequestId → Req → Staged → STM CommitResult
 commitStaged svc st rid req sg = case (reqCmd req, stagedWork sg) of
-  (COpen name source cid, StagedControl) → commitOpen name source cid
+  (COpen name source cid _, StagedControl) → commitOpen name source cid
   (CAttach name cid, StagedControl) → commitAttach name cid
   (CRemove _ precondition, StagedRemoval prepared)
     | not (preparedChanged prepared) → withFresh $ \aid arena → commitAir aid arena precondition
