@@ -41,9 +41,14 @@ storagePrelude =
 
 -- | Wait until every request the service holds has settled, then until its backed work is at rest.
 quiescent ∷ Service → IO ()
-quiescent svc = bounded $ do
-  atomically (inspectCensusSTM svc >>= check . all censusSettled . censusRequests)
-  atomically (backedAtRestSTM svc >>= check)
+quiescent svc =
+  bounded (atomically (inspectCensusSTM svc >>= check . all censusSettled . censusRequests) >> atomically (backedAtRestSTM svc >>= check))
+    `onException` do
+      census ← atomically (inspectCensusSTM svc)
+      problems ← inspectBacked svc
+      defects ← inspectDefects svc
+      jobs ← atomically (inspectStorageJobsSTM svc)
+      putStrLn ("not quiescent: settled " <> show (map censusSettled (censusRequests census)) <> "; backed " <> show problems <> "; defects " <> show defects <> "; storage jobs " <> show jobs)
 
 -- | Drive the world until the condition holds, testing it before each drive: a script held at @TEST_WAIT@ is never driven again.
 driveUntil ∷ World → IO () → IO Bool → IO ()
