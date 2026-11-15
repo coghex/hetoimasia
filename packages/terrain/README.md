@@ -1059,9 +1059,9 @@ exact integer arithmetic):
 
 Their worst cases (computed in the tests): a region stores at most 291,072 bytes at
 that extent and its largest job reserves 405,504 more, so a 257-region query needs
-179,020,032 of the 268,435,456 resident bytes and 4,301,280 of the 134,217,728
-staging bytes (command 128 + 32 x 257, an interest each, and 16,640 of scratch per
-region), which camera work and holds leave free, plus 16,896 for one camera region or
+179,020,032 of the 268,435,456 resident bytes and 25,354,720 of the 134,217,728
+staging bytes (command 128 + 32 x 257, an interest each, and 98,560 of scratch per
+region), which camera work and holds leave free, plus 98,816 for one camera region or
 16,384 for the records of the largest hold (256 regions), and 74,514,432 resident bytes
 for the held regions at their stored maximum (larger than one region's camera job,
 696,576): 253,534,464 of the 268,435,456 in all; a removal needs 64 edit bytes of 67,108,864; a query needs one
@@ -1085,7 +1085,7 @@ Each cost category is assigned to exactly one bank or slot:
 | Packed detail payload | Resident | the encoded bytes stored; reserved at the dense bound, 64 per interval |
 | A removal's rebuilt segment (its payload is between 2 and 64 bytes) | Resident | 62 reserved; the growth actually stored is charged at the commit |
 | Retained removals | Edit | 16 per interval and 48 per column entry (worst case for one removal: 64) |
-| Load scratch | Staging | 256 + 2 per cell |
+| Load scratch | Staging | 256 + 2 per cell, and the removed runs its columns can hold: (cells / 2 + columns) runs of 16 and 48 a column (81,920 for a default region) |
 | Interest records | Staging | 64 each |
 | Hold records (borrowers and publication pins) | Staging | 64 per region held |
 | Accepted command records | Staging | 128 + 32 per region |

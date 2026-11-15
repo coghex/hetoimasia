@@ -107,7 +107,12 @@ so the routine run plus the probe run executes everything the unreduced suite di
 large and scattered stores, the facade's caller protocol from every starting work limit, the ownership history, the
 re-sealed-byte fuzz, the evidence printer's histories and cycles); `terrain-runtime-full-depth-tests` runs them at their
 original parameters. [The evidence](evidence/terrain/suite-budget/README.md) lists each family's routine and full
-parameters and the controls each representative catches.
+parameters and the controls each representative catches. One example is an exception to both rules above, "no family
+leaves the routine suite" and "an example that encodes a reviewer's exact failing sequence stays routine": the owner's loop
+running the maintenance a removal needs first, ahead of it (in `terrain-runtime-full-depth-tests`), whose trigger is a fixed
+store bound (the retirement backlog or the loose list) that only about 64 MiB of retired history reaches, so no smaller store
+has it, has no routine representative by the owner's decision, and the routine suite keeps instead the suite-wide check that
+the owner never chooses the same work again with nothing changed.
 
 ### The suite's budget and its parallel group
 

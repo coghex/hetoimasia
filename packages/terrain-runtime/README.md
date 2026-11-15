@@ -207,21 +207,50 @@ commit against the names that have settled, so a pending open is invisible to it
 Resident detail is a cache; the authority is the immutable source plus the arena's
 store. A commit retains nothing in RAM: its region is a cache again at once. A load job
 pins one committed version and reads the runs of the region's columns through the
-backend, so an evicted region is loaded again from source plus the stored removals and
+backend (its scratch counts the removed runs those columns can hold), so an evicted region is loaded again from source plus the stored removals and
 identical terrain is reconstructed across repeated cycles, buried edits, authored gaps
 and deep shafts included, without materializing the cells between. A page that does not
 arrive keeps its read pending; one that arrives damaged is `storage_integrity`; neither is
 ever replaced with source, air or fog.
+
+A request's pinned read reads only the levels it needs, from the run at or below their floor (the
+store reader's `RangeFloor`), never a column's whole history: a cell its level; a removal its level
+and the two beside it (the runs it coalesces with); a column query its range; a surface one window at
+a time, first the 32 levels down from the source's top (`limitRangeLevels` when smaller), then, while the
+levels read hold no occupied cell, the window below, twice as deep and at most `limitRangeLevels`,
+keeping nothing of the one above (no cell above it is occupied, and since a source never changes and
+a change only removes, that stays true). A read keeps at most what its levels can hold, half of them
+and one more a column (removed runs are coalesced, so two are a level apart): it never cuts an answer
+short, and keeping more is a defect. Its window pins only what the reader's pin credit (32 pages)
+leaves beside those runs, so the two never pass the one credit, and construction refuses query limits
+whose widest read would leave fewer than the 9 pages one read step needs (`ConfigQueryKeep`:
+`limitRangeLevels` at most 12,321). A staged removal's overlay is one of the four parts of its
+512-byte staging reservation (the decoded segment 64, its rebuilt copy 64, the overlay 176, the
+settlement's record 160), which construction checks against the constant (`ConfigRemovalStaging`).
 
 `arenaStatus` answers the arena's storage (ready, or paused with its cause), its reserved,
 used, pending-reclaim and pending-reserved bytes, discovery (idle, pending with its items,
 or paused) and the content and knowledge revisions. While an arena is paused its reads
 continue where their pages validate, and reclamation continues while it is paused only for
 capacity. `growArena` (creator only) commits a larger cap through the publication decision,
-releasing any extra a failed growth left pending first, and clears only `storage_full`.
-`retryArena` (creator only) releases a pending extra under the slot, re-reads the recorded
-pages and clears each condition it verified; capacity clears when the next transaction fits
-beside the protected reserve. A growth or retry is prepared against the arena's allowance and
+releasing any extra a failed growth left pending first, and clears only `storage_full`. An extra
+that a growth or release could not give back has one owner, the backend's pending reservation:
+every end of a growth or release run sets the arena's growth state from it (releasing those bytes,
+or idle), and `statusPendingReservedBytes` counts it once (the backend's pending figure, plus the
+extra a growth still executing holds and has not committed).
+`retryArena` (creator only) releases a pending extra under the slot and re-tests the evidence each
+condition recorded (every failing operation and page, each once, at most 8): a page whose read
+failed or read back invalid is read again, validated; a page whose write failed is written again by
+a probe-only transaction under the slot, which writes a known pattern, reads it back while it still
+holds the page and is then abandoned, never published (a page committed since was written after the
+failure and needs no probe). A condition clears only at the retry's own publication decision, while
+what it was prepared on still holds: a failure recorded meanwhile makes it stale and it is prepared
+again on the record as it then is, and a retry that is cancelled, not eligible or whose settlement
+fails clears nothing. The probe's own failure is decided as any transaction's (pressure waits, a
+defect ends the owner, a closure ends it, a failure of another cause pauses for that cause). A
+condition whose evidence passed the bound, or holds a failure with no page, cannot be re-tested: the
+retry answers it remaining and `retriedUntilClosed`, and the arena then stays paused, readable, until
+it is closed. Capacity clears when the next transaction fits beside the protected reserve. A growth or retry is prepared against the arena's allowance and
 growth state: it is not prepared while the slot runs a growth or release of its arena, and what
 it staged is prepared again if either moves before its grant, so equal, larger and smaller are
 decided against the allowance it is answered at.
@@ -252,6 +281,13 @@ the stores only after the borrowers finish.
 * The parent session's admission dominates every gate. It is read at admission and
   inside the commit arbitration; when it closes the owner closes the service and
   every accepted request ends with one terminal outcome.
+* **Effect and record are not separated by an asynchronous exception.** The owner's loop
+  runs masked; only its deliberate wait for work is interruptible. Each storage effect (a
+  job submitted, cancelled or taken, a backing opened or closed) and its record in the
+  owner's state are made with no interruptible point between them, so an owner that ends
+  has recorded every job it started; while its slot's run holds a job in flight (a write
+  holds page images under the transaction's staging credit) the slot and its credit stay
+  reserved.
 * Releasing a lease cancels the requests made through it. Releasing the creator's
   final owner lease, or ending the creator, closes the arena even if attached leases
   remain: other clients' requests settle `arena_closed` and their leases answer
@@ -280,6 +316,14 @@ the stores only after the borrowers finish.
   attempted, and then it reaches supervision whatever the owner ended with: as the
   owner's failure when it would have returned, or attached to its failure as cleanup
   evidence (`composeCleanup`) when it had already failed.
+* **Nothing ready is starved by work that cannot progress.** The chooser offers a piece of
+  work only when its step would change something: a commit's arbitration and the chooser ask
+  one question (`commitWaits`), so an older open whose host is not eligible holds a younger
+  one back without either being chosen in vain, and a storage wait that is met is ready work
+  in its turn. An arena whose removal needs maintenance first (its loose list or its
+  retirement backlog past its bound) offers only its reclaim, ahead of every fairness choice,
+  and its other removals and discovery wait until that reclaim publishes; a reclaim that finds
+  nothing to do while so marked is a defect.
 * **The fairness rule.** Staging, commits, retries, load dispatches and the backed steps
   (opens, pinned reads, the slot's transaction, grants and file closes) take turns
   whenever two or more are ready: each ready kind gets one quantum in every five,
@@ -355,7 +399,7 @@ the stores only after the borrowers finish.
 | Forged, foreign, released or wrong-service authority | `RefusedAuthority` before admission |
 | Bank, slot, arena, lease or view cap | `RefusedBusy`, nothing created |
 | An identity, or a content, knowledge or store revision, that would wrap | `RefusedExhausted` before admission; internal work whose next commit would wrap stops |
-| The arena's allowance cannot take the next transaction beside the protected reserve; a page write or read fails; a page reads back invalid | `storage_full` / `storage_io` / `storage_integrity`: the arena pauses for that cause, its uncommitted removals settle with it and new ones at once while it holds, its committed terrain stays readable, other arenas continue; growth clears only `storage_full`, an explicit retry re-reads the recorded pages and clears what it verified, and no failed removal is ever repeated |
+| The arena's allowance cannot take the next transaction beside the protected reserve; a page write or read fails; a page reads back invalid | `storage_full` / `storage_io` / `storage_integrity`: the arena pauses for that cause, its uncommitted removals settle with it and new ones at once while it holds, its committed terrain stays readable, other arenas continue; growth clears only `storage_full`, an explicit retry re-tests the recorded pages (a read again, a write by a probe it abandons) and clears, at its own publication, what it verified, and no failed removal is ever repeated |
 | An open on an unqualified filesystem; a reservation that fails; a source past a compile bound | `storage_unsupported` / `reservation_failed` / `source_complexity` (settled), nothing published, the name released |
 | A smaller growth | `storage_size_not_increased`; an equal one succeeds unchanged |
 | Preparation failure (unexpected) | `HostFailure` (settled); the previous state is kept |
@@ -488,12 +532,13 @@ transaction of the model event it mirrors, and no production decision reads it:
 
 * **every accepted load job**, from its admission to its report (completed, failed or acknowledged),
   whether it is running, queued or waiting for victims: the resident reservation and the scratch the
-  model **granted** it at that moment (400 and 258 for a one-cell read in a fresh region), so a later
+  model **granted** it at that moment (400 and 322 for a one-cell read in a fresh region), so a later
   reduction while the job still holds them is seen (a stability check of the model against its own grant,
   not an expectation); and, once the owner **runs** it, the **least the job holds**, worked out from the
   coverage the owner is given to load and the data layer's own sizes and not from the model's cost
   functions (a column index entry is 48 bytes, a segment 32 of metadata and at least 2 of payload, the
-  scratch a 256-byte frame and two bytes a cell: 82 and 258) together with the load-job slot (1 from its
+  scratch a 256-byte frame, two bytes a cell and the removed runs its columns can hold, a run of 16 and
+  a column entry of 48 for one cell: 82 and 322) together with the load-job slot (1 from its
   dispatch, 0 while it waits: a waiting job holds only a promise, so it contributes no expectation). The
   owner marks a job it runs and ends it with its report, so a model that forgets a running job is seen;
 * the **preparation** the owner is running (a removal's resident growth, 62 bytes, staging, 512, and
@@ -535,8 +580,8 @@ client end, before the owner resumes. The property ends with every bank, occupie
 every slot and every arena at zero: no charge outlives its holder.
 `Test.TerrainRuntime.Oracle` pins the record's literal amounts at a gated job (running and waiting),
 preparation, borrow and view, and holds the controls that must fail: a model that charges the running job
-1 byte of resident and 1 of scratch instead of 400 and 258 (and one byte short of each figure), a waiting job
-whose 400 and 258 were released while another job runs (and one byte short), a job the model forgot while it
+1 byte of resident and 1 of scratch instead of 400 and 322 (and one byte short of each figure), a waiting job
+whose 400 and 322 were released while another job runs (and one byte short), a job the model forgot while it
 runs, a 64-byte handoff duplicate charged that the owner never holds, a preparation whose request the model dropped
 or for which it reserved no growth, a borrow's hold shortened from two regions to one (the staging charge with
 it) or dropped, a view's description shortened or dropped, a model rebuilt without the arena beside the
@@ -1175,7 +1220,10 @@ withStorage config admission group logger $ \svc → do      -- two workers star
 The storage location is an explicit input (`osDirectory`): the backend uses no implicit current
 directory and has no default: the terrain service takes it as an input of its construction
 (`storagePort`), and application assembly supplies it. `filesystemOf` names the filesystem a
-directory is on as the backend itself reads it, and qualifies nothing. Space and support are
+directory is on as the backend itself reads it, and qualifies nothing; it profiles a private file it
+creates there and owns it through a scope: its unlink and its close are attempted on every exit, and a
+cleanup that fails is never dropped (a profiling failure stays primary, each cleanup failure is
+retained beside it). Space and support are
 asked of the opened descriptor (`fstat`, `fstatfs`), never of a path.
 
 ### State, owner, thread and lifetime
