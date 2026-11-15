@@ -735,6 +735,34 @@ lookup as well as the page (no accepted configuration refuses every query), and 
 the whole description (in box-identity order). A removal's effect on a boundary is read cell by cell. A chunk reloaded later resolves
 the same answers from the retained records alone.
 
+### Regions
+
+What `queryCell` answers for every cell of one 16 × 16 × 32 region, compressed, for a consumer that
+copies a region's knowledge (the terrain service's regional snapshot). It is a pure, read-only
+addition: no semantics, record, codec or obligation changes.
+
+* `planRegionKnowledge env region runs` takes the removed runs of the region's 256 columns and the 64
+  columns beside it (`regionColumns`, `regionHaloColumns`) over its levels and one beyond each end
+  (`regionReadLevels`), read by the caller from one committed version. It reads no record.
+* The plan partitions the columns into **classes** whose inputs are identical (the same lattice
+  intervals for the column and its four side neighbours, no removed run in any of the five, and the
+  column's coordinate wherever a box there keeps it as a component parameter; a column with a removal
+  in or beside it is a class of its own), and each class's levels into **pieces** bounded by the
+  lattice's Z cuts and the ends of those runs. In a piece every cell but the first and last has the same
+  inputs, its up and down neighbours included, so a piece is evaluated at its first, one interior and
+  its last cell. A box whose components keep the level as a parameter (stacked non-flat cells, a
+  component per level) is evaluated at every level of the piece, counted apart
+  (`planPerLevelTiles`).
+* The caller evaluates `queryCell` at `planTiles`, in order, against the same committed version;
+  `assembleRegionKnowledge` coalesces each class's runs and keeps one copy of each distinct column
+  (`RegionKnowledge`: its classes, each a run list covering the region's 32 levels, and the class of
+  each column, empty when there is one class). A region whose answer is uniform is one class of one
+  run. `mkRegionKnowledge` rebuilds a value from those parts and refuses parts that do not cover the
+  region.
+
+The plan's size grows with the lattice cuts, the removals and the parameterised boxes inside the
+region, never with its 8,192 cells otherwise. State, ownership and lifetime: none.
+
 ### Missing data and replay
 
 An operation reads through a `Provider`, a bounded window, never the whole history:
@@ -1233,8 +1261,17 @@ less `limitExplicitResidentBytes`, together with the camera's jobs in flight; a 
 beyond either is busy, so a view that keeps releasing and re-acquiring pins can never
 take the room an explicit request needs, and a pinned region that grows cannot either.
 
+A **copied** hold (`Copied`) is a borrow of data copied out of the arena's store (the terrain
+service's regional snapshot). It names whole regions of supported tiles, at most `specHoldRegions`,
+distinct and at least one (`EmptyDemand`, `DuplicateRegion`, `UnsupportedRegion`, `DemandTooLarge`
+otherwise), and charges its hold records on the camera's share of staging like any hold, but it
+needs none of its regions resident, never protects resident detail from eviction, never touches
+recency and is not charged at the stored maximum. The configured extent bounds what a request may
+touch, not what a copy may describe, so a copied hold is taken under any extent. Like any hold it
+keeps its arena retiring until it is released.
+
 A resident region may be chosen as a victim only when it has no interest, no hold
-(borrower or publication pin), no job, no unsettled changes and no handoff in
+(borrower or publication pin; a copied hold protects nothing), no job, no unsettled changes and no handoff in
 flight, and its arena is live. The one exception is for explicit requests: a region
 only a camera view has an interest in may be taken (the interest is dropped and the
 view's demand for it is pending again), because camera work is best effort. Candidates are taken in least-recently-used order of

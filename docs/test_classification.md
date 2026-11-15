@@ -105,7 +105,8 @@ so the routine run plus the probe run executes everything the unreduced suite di
 
 `terrain-runtime-tests` applies this to the temporary store's long families (random and adversarial tree histories, the
 large and scattered stores, the facade's caller protocol from every starting work limit, the ownership history, the
-re-sealed-byte fuzz, the evidence printer's histories and cycles); `terrain-runtime-full-depth-tests` runs them at their
+re-sealed-byte fuzz, the evidence printer's histories and cycles, and the regional snapshots' every-cell oracle, routine over
+one region that holds every fixture's shape); `terrain-runtime-full-depth-tests` runs them at their
 original parameters. [The evidence](evidence/terrain/suite-budget/README.md) lists each family's routine and full
 parameters and the controls each representative catches. One example is an exception to both rules above, "no family
 leaves the routine suite" and "an example that encodes a reviewer's exact failing sequence stays routine": the owner's loop
