@@ -88,7 +88,8 @@ openHeld (Held ref) = readIORef ref >>= mapM_ openSeamGate
 releasing ∷ IO () → IO a → IO a
 releasing release body = body `finally` release
 
--- | Say what the scripts printed and where they waited, when an example fails.
+-- | Say what the scripts printed and where they waited, when an example fails, and let every script go on from the wait it is held at, so
+-- that the VM's teardown does not wait for a script the failed example would have released: the example's own failure is the one reported.
 explained ∷ Rig → World → IO a → IO a
 explained rig world body =
   body `onException` do
@@ -98,6 +99,7 @@ explained rig world body =
     putStrLn ("warned: " <> show warned)
     putStrLn ("printed: " <> show printed)
     putStrLn ("trace: " <> show (reverse trace))
+    mapM_ (signalRig rig) [name | entry ← trace, Just name ← [Text.stripPrefix "entered " entry]]
 
 -- | Every new expected code, read and unread, through one creator: the three of an open, the three of a paused arena and its
 -- recovery, with the status after each, and nothing failed repeated.
