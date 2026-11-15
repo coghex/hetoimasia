@@ -50,3 +50,10 @@ second pass). The regional examples' routine share, focused under load 11.7: 5.5
 
 Admission reserves `regionSnapshotReservation n` = 128 + 25,840 n + 747,520 bytes (773,488 for one region) and the
 charge becomes the footprint in the settlement transaction.
+
+## Round 1 repairs
+
+Code head `c045c615` (merged with master as `9c487af6`), 2026-11-15: the routine regional examples, focused
+(`--match "Regional snapshots"`), 29 examples, 0 failures, 7.2 s; the heap measurements are in the examples
+under "what a regional build retains". Functional runs at `9c487af6` (during another issue's lab window, so
+not timings): terrain-runtime-tests 1,085/0, terrain-tests 920/0, lua-engine-tests 1,401/0.
