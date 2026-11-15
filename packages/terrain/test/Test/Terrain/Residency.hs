@@ -901,7 +901,7 @@ cameraSpec = describe "camera demand is latest-value state" $ do
     reportDecision committed `shouldBe` Committed (Revision 1) 0 [OwnerView (ViewId 1)] [] [JobId 0]
     map jobPhase (modelJobs m4) `shouldBe` [JobCancellingPhase]
     -- (Staging holds the view's 192-byte description and its 64-byte interest.)
-    ledgersOf m4 `shouldBe` Ledgers (338, 400) (64, 0) (256, 322)
+    ledgersOf m4 `shouldBe` Ledgers (338, 400) (64, 0) (256, 338)
     (m5, acked) ← stepOk m4 (JobAcknowledged (JobId 0))
     reportDecision acked `shouldBe` Discarded (JobId 0)
     modelJobs m5 `shouldBe` []
@@ -1450,12 +1450,14 @@ cameraSpec = describe "camera demand is latest-value state" $ do
     map (map demandRegion . viewDemand) (modelViews m3) `shouldBe` [[reg 0 0 0], [reg 0 0 0]]
     map viewPending (modelViews m3) `shouldBe` [[], []]
   it "keeps a second view's demand for coverage a running load will publish pending, and admits it with no job once the load completes" $ do
-    -- 1,548 resident and 1,846 staging bytes, extent 1 x 1 x 2, one-region holds. View 1's
+    -- 1,548 resident and 1,862 staging bytes, extent 1 x 1 x 2, one-region holds (1,862 = 1,846 + 16:
+    -- the explicit reserve's removal term reads its one cell's column over the extent's two levels,
+    -- 48 + 2 x 16 = 80 bytes of runs where one cell counted 64, so the camera share is as before). View 1's
     -- load of both cells is running. View 2 names the same coverage: its description fits
     -- beside the running job, its interest does not yet (the job's scratch is charged), so
     -- it stays, pending, and nothing is predicted about it. When the job completes the
     -- coverage is resident, and Service admits view 2 without a load.
-    let limits = limitsWith $ \x → x {specResidentBytes = 1548, specStagingBytes = 1846, specExtentZ = 2, specHoldRegions = 1, specCameraRegions = 64}
+    let limits = limitsWith $ \x → x {specResidentBytes = 1548, specStagingBytes = 1862, specExtentZ = 2, specHoldRegions = 1, specCameraRegions = 64}
         both = [demand (reg 0 0 0) (box 0 1 0 1 0 2)]
     m0 ← opened limits
     m1 ← stepsOk m0 [SetCameraDemand (ViewId 1) a1 both, Dispatch]
@@ -1583,7 +1585,7 @@ editSpec = describe "retained edits" $ do
     admissionJobs (admission accepted) `shouldBe` [(JobId 1, reg 0 0 0)]
     -- The region is resident, so the job needs no metadata: a column entry (48),
     -- a segment (32) and the payload bound (64), plus the growth (62).
-    ledgersOf m2 `shouldBe` Ledgers (338, 144 + 62) (64, 64) (224, 322 + 512)
+    ledgersOf m2 `shouldBe` Ledgers (338, 144 + 62) (64, 64) (224, 338 + 512)
     -- The cell above is in the same removed interval: no retained growth, so the
     -- whole 64-byte reservation returns.
     -- (The adjacent cell joins the existing segment: two payload bytes, no new segment.)

@@ -847,10 +847,11 @@ minimumBudgetsAreEnforced (resident, edit, staging, jobs) (query, x, y, z) =
       intervals = columns * ((z + 1) `div` 2)
       stored = 256 + 48 * columns + 34 * columns * z
       job = 48 * columns + 96 * intervals
-      -- a frame, two bytes a cell, and the runs a load reads: a column of z levels holds at most z / 2 + 1
-      scratch = 256 + 2 * columns * z + (columns * z `div` 2 + columns) * 16 + columns * 48
+      -- a frame, two bytes a cell, and the runs a load reads of every column it touches over the
+      -- extent's z levels: at most z / 2 + 1 of 16 bytes, and a 48-byte entry, a column
+      scratch = 256 + 2 * columns * z + columns * ((z `div` 2 + 1) * 16 + 48)
       needResident = maximum [4 * stored, stored + job] + maximum [query * (stored + job), stored + 48 + 96 + 62]
-      needStaging = maximum [64 * 4, 192 + 64 + scratch] + maximum [128 + 32 * query + 64 * query + query * scratch, 160 + 512 + 64 + 258 + 64, stored]
+      needStaging = maximum [64 * 4, 192 + 64 + scratch] + maximum [128 + 32 * query + 64 * query + query * scratch, 160 + 512 + 64 + 258 + (z `div` 2 + 1) * 16 + 48, stored]
       expected
         | resident < needResident = Just (BankBelowMinimum ResidentBank needResident resident)
         | edit < 64 = Just (BankBelowMinimum EditBank 64 edit)
