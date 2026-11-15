@@ -84,7 +84,7 @@ storageFull depth =
       _ ← removeCell' svc lease (tile 0 0 (-32))
       -- nothing else reads now (internal work after that commit has finished), so the one held read is
       -- the load's
-      waitFor (backedAtRestSTM svc >>= check)
+      waitFor (backedQuiescentSTM svc >>= check)
       -- the pin: a view's load job whose page read is held (only that one). A load is not a request,
       -- so no removal waits for it in admission order; its region is far from the removals.
       gate ← H.addGateOnce probe isRead

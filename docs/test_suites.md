@@ -94,7 +94,9 @@ cabal test hetoimasia-tests --test-show-details=direct
   cell-quad path belongs there; the device's raster, depth and sampling agreement is TRA-17's.
 - `terrain-runtime-tests` (`packages/terrain-runtime/test/`, TRA-4) owns the
   scoped transactional terrain service, composed by
-  `Test.TerrainRuntime.Spec`: the cancel, stage and commit races in the arrival and
+  `Test.TerrainRuntime.Spec` (its concurrent examples run a second time, last, on 2
+  capabilities: [the pass](test_classification.md#the-multi-capability-pass); the by-hand
+  control is `terrain-runtime-tests --capability-control +RTS -N<K> -RTS`): the cancel, stage and commit races in the arrival and
   delayed-eligibility host fixtures, closure against pending work and the parent
   session's admission, the arena, lease and view limits and identity exhaustion,
   bounded budgets against real resident detail, offload and reload against an

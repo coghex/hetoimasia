@@ -671,7 +671,7 @@ spec = describe "Accounting and lifetime hardening" $ do
             pure host
       before' <- forM [0, 1] (removal "earlier")
       forM_ before' $ \h → waitFor (readTVar (hostSettled h) >>= \x → check (not (null x)))
-      waitFor (backedAtRestSTM svc >>= check)
+      waitFor (backedQuiescentSTM svc >>= check)
       -- the read's page read is held, so it is still to commit while the later removals stage and
       -- become eligible: none of them may take the slot before it
       gate <- H.addGateOnce probe (\case OpReadAt {} → True; _ → False)

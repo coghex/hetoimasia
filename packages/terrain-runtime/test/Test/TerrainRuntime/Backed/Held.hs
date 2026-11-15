@@ -72,12 +72,12 @@ heldCase ending = do
   -- reported there, after the body has passed
   ended ← try $ withServiceSeam quiet config alwaysAdmitting noProbe (H.seamFor probe) $ \svc → do
     (client, lease) ← openMain svc "main"
-    waitFor (backedAtRestSTM svc >>= check)
+    waitFor (backedQuiescentSTM svc >>= check)
     -- the removal is staged first, while there is room, and waits for its host
     host ← newHost False
     _ ← okOf (removeWith svc (hostEndpoint svc Nothing host) lease (tile 3 4 5) Nothing)
     waitFor (readTVar (hostReady host) >>= \n → check (n >= 1))
-    waitFor (backedAtRestSTM svc >>= check)
+    waitFor (backedQuiescentSTM svc >>= check)
     H.addRule probe (-1) isClose H.Throw
     cycles ← newIORef (0 ∷ Int)
     let freeControl = (\l → A.lgControlLimit l - A.lgControlReserved l) <$> atomically (inspectEditBankSTM svc)
@@ -85,7 +85,7 @@ heldCase ending = do
         cycleOnce = do
           other ← openOther
           okOf (releaseLease svc other)
-          waitFor (backedAtRestSTM svc >>= check)
+          waitFor (backedQuiescentSTM svc >>= check)
           modifyIORef' cycles (+ 1)
         -- every held close takes one backing's record (4,096 bytes) for good: cycle while the last
         -- arena's open would still leave the window's top or more

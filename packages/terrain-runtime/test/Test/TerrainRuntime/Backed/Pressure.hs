@@ -93,7 +93,7 @@ internalAhead = do
       atomically (writeTVar (hostEligible grower) False)
       pure g
     waitFor (arenaStatusSTM svc lease >>= either (const retry) (check . (> 0) . statusPendingReservedBytes))
-    waitFor (backedAtRestSTM svc >>= check)
+    waitFor (backedQuiescentSTM svc >>= check)
     -- a commit leaves internal work owed; the owner is held at its first internal grant
     atomically (writeTVar armed True)
     _ ← removeCell' svc lease (tile 3 4 9)
@@ -125,7 +125,7 @@ internalAhead = do
     status ← arenaStatus svc lease >>= expectRight
     statusPendingReservedBytes status `shouldBe` 0
     inspectDefects svc `shouldReturn` []
-    waitFor (backedAtRestSTM svc >>= check)
+    waitFor (backedQuiescentSTM svc >>= check)
     settleChecks svc
 
 -- | A storage service under pressure: a read running and a write queued (the mutation), a backing
@@ -194,7 +194,7 @@ pressureCase caller = do
   withServiceSeam quiet defaultConfig alwaysAdmitting owner (H.seamFor probe) $ \svc → do
     (client, lease) ← openMain svc "main"
     forM_ [(3, 4, 9), (5, 4, 9)] $ \(x, y, z) → removeCell' svc lease (tile x y z)
-    waitFor (backedAtRestSTM svc >>= check)
+    waitFor (backedQuiescentSTM svc >>= check)
     host ← newHost (caller /= Transaction)
     pendingGrowth ← newTVarIO Nothing
     others ← newTVarIO ([] ∷ [Host])

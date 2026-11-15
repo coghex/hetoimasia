@@ -223,7 +223,7 @@ spec = describe "What a request keeps of a column" $ do
                 else releaseLease svc lease >>= (`shouldBe` Right ())
               holdRelease hold
               waitFor (readTVar (hostSettled host) >>= \s → check (not (null s)))
-              waitFor (backedAtRestSTM svc >>= check)
+              waitFor (backedQuiescentSTM svc >>= check)
               atomically (inspectRequestScratchSTM svc) `shouldReturn` ([], [])
       )
       ["cancelled", "its arena closed" ∷ String]

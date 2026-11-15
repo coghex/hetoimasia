@@ -700,8 +700,10 @@ on at a named point (`Probe`), so an example decides which side of a race wins b
 what it does, not by how long it waits; no example sleeps. Every thread an example
 starts is owned through `Test.Support.Owned`, and every wait is bounded
 (`Test.Support.Bounded`). Expected cell values come from an independent model that
-shares no code with the library. The suite is built `-threaded` and is run at more
-than one capability count. `Test.TerrainRuntime.Opacity` compiles clients outside the
+shares no code with the library. The suite is built `-threaded` and runs its concurrent examples
+(`Test.TerrainRuntime.Concurrent` names them) twice: on one capability, in place, and once more, last, on two (the
+pass's count, [one setting](../../docs/test_classification.md#the-multi-capability-pass)); nothing else runs on
+more than one capability except the pure parallel group. `Test.TerrainRuntime.Opacity` compiles clients outside the
 package through `Test.Support.ExternalClient`: one composes the public service, and
 every attempt to name an authority, snapshot, service or inspection-type constructor, forge
 one, rewrite a snapshot or an inspection value (the census, its arenas and requests, the
