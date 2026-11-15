@@ -66,12 +66,7 @@ module Test.LuaEngine.Facade.Support
   , explainSteps
   , outLinesSTM
   , timerBackend
-  , timerOwner
-  , Parking
-  , newParking
-  , parkedWhile
-  , timerOwnerInstance
-  , forgetTimerOwner
+  , VmClock
 
     -- * VMs
   , Fvm (..)
@@ -117,7 +112,7 @@ module Test.LuaEngine.Facade.Support
   , module Hetoimasia.LuaEngine.Facade
   ) where
 
-import Control.Concurrent (ThreadId, myThreadId, yield)
+import Control.Concurrent (ThreadId, yield)
 import GHC.Conc (BlockReason (BlockedOnSTM), ThreadStatus (ThreadBlocked, ThreadDied, ThreadFinished), threadStatus)
 import Control.Concurrent.STM
   ( STM
@@ -130,13 +125,10 @@ import Control.Concurrent.STM
   , retry
   , writeTVar
   )
-import Control.Exception (Exception, ExceptionWithContext (ExceptionWithContext), SomeException, bracket_, catch, finally, fromException, onException, throwIO, tryWithContext)
+import Control.Exception (Exception, ExceptionWithContext (ExceptionWithContext), SomeException, catch, finally, fromException, onException, throwIO, tryWithContext)
 import Control.Monad (filterM, forM, forM_, join, replicateM_, unless, void, when)
 import Data.ByteString (ByteString)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
-import Data.List (sortOn)
-import qualified Data.Map.Strict as Map
-import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Text
@@ -395,14 +387,22 @@ clockDuration world = do
   when (step /= 0) (atomicModifyIORef' (wClock world) (\current → (current + step, ())))
   either (\refused → assertFailure ("the clock is not a duration: " <> show refused)) pure (durationFromNanoseconds AllowZero (toInteger now))
 
--- | The injected clock as the facade reads it: the owner's reading less the lag, so that an example can have the
--- facade check a wait against an earlier moment than the scheduler places it at.
-laggingDuration ∷ World → IO Duration
-laggingDuration world = do
-  now ← clockDuration world
+-- | A VM's reading of the injected clock as its facade reads it: the owner's reading less the lag, so that an example can have
+-- the facade check a wait against an earlier moment than the scheduler places it at.
+laggingFrom ∷ World → IO Duration → IO Duration
+laggingFrom world reading = do
+  now ← reading
   lag ← readIORef (wFacadeLag world)
   let behind = max 0 (toInteger (durationNanoseconds now) - toInteger lag)
   either (\refused → assertFailure ("the lagging clock is not a duration: " <> show refused)) pure (durationFromNanoseconds AllowZero behind)
+
+-- | One VM's reading of the injected clock: the world's, plus how far the step has moved this VM on ('VmClock'). Zero, and so
+-- exactly the world's clock, for every VM the step never woke.
+vmDuration ∷ World → VmClock → IO Duration
+vmDuration world (VmClock ahead) = do
+  now ← clockDuration world
+  extra ← readIORef ahead
+  either (\refused → assertFailure ("the VM's clock is not a duration: " <> show refused)) pure (durationFromNanoseconds AllowZero (toInteger (durationNanoseconds now) + toInteger extra))
 
 -- | From now on the injected boundary for engine failures raises after it has recorded one.
 failReports ∷ World → IO ()
@@ -416,103 +416,54 @@ setFacadeLag world = writeIORef (wFacadeLag world)
 worldClock ∷ World → MonotonicSource
 worldClock world = scriptedSource (scriptedInstant <$> clockDuration world)
 
--- | The world's fake timer as the backend a session is configured with: its registrations belong to no owner the step
--- ('stepNext') follows.
+-- | The world's fake timer as the backend a session is configured with: its registrations belong to no VM, and a step that wakes
+-- one moves the world's clock.
 worldTimer ∷ World → TimerBackend
 worldTimer world = timerBackend world Nothing
 
--- Parking ------------------------------------------------------------------------------------------
-
--- | The owner threads an example's own hold points have parked on purpose (a gate an adapter hook waits at, a fixture's wait),
--- while they are parked. Written only by 'parkedWhile'; read by the step, which does not wait for a parked owner's turn to end.
-newtype Parking = Parking (TVar (Set.Set ThreadId))
-
-newParking ∷ IO Parking
-newParking = Parking <$> newTVarIO Set.empty
-
--- | Run a hold point's wait with the calling thread marked parked, and unmarked however the wait ends.
-parkedWhile ∷ Parking → IO a → IO a
-parkedWhile (Parking held) wait = do
-  thread ← myThreadId
-  bracket_ (atomically (modifyTVar' held (Set.insert thread))) (atomically (modifyTVar' held (Set.delete thread))) wait
-
 -- The fake timer -----------------------------------------------------------------------------------
+
+-- | How far the step has moved one VM's clock ahead of the world's ('vmDuration'): owned by the step, which moves it only when it
+-- wakes that VM's own registration; read by the VM's owner and its facade. Zero for a VM the step never woke.
+newtype VmClock = VmClock (IORef Word64)
 
 -- | A timer that fires only when the example says.
 --
--- What it holds: the live registrations, in arming order, each with the owner that armed it (one 'withFvm' made; none for
--- 'worldTimer'), its length and its deadline (the injected clock when it was armed, plus its length); how many were armed in
--- all; the owners 'withFvm' made, by a label, with whether the step waits for their turns and their admitted instances; and the
--- owners the step woke whose turn has not ended. A registration is dropped once it is no longer live, when the next one is
--- armed. The owners write the registrations (arming, and a cancellation clearing the live flag); the step owns the flags it
--- clears when it claims and the in-turn marks.
+-- What it holds: the live registrations, in arming order, each with the VM that armed it (its label and clock; none for
+-- 'worldTimer'), its length and its deadline on that VM's clock (its reading when it armed, plus its length); and how many were
+-- armed in all. A registration is dropped once it is no longer live, when the next one is armed. The owners write the
+-- registrations (arming, and a cancellation clearing the live flag); the step owns the flags it clears when it claims.
 data FakeTimer = FakeTimer
   { ftRegistrations ∷ !(TVar [Registration])
   , ftArmed ∷ !(TVar Int)
-  , ftOwners ∷ !(TVar (Map.Map Unique TimerOwner))
-  , ftInTurn ∷ !(TVar (Set.Set Unique))
   }
 
 -- | One registration an owner armed.
 data Registration = Registration
-  { regOwner ∷ !(Maybe Unique)
+  { regVm ∷ !(Maybe (Text, VmClock))
   , regMicros ∷ !Int
   , regDeadline ∷ !Word64
-  -- ^ In nanoseconds of the injected clock: when it was armed, plus its length.
+  -- ^ In nanoseconds of the arming VM's clock (of the world's, for no VM): its reading when it armed, plus its length.
   , regWake ∷ IO ()
   , regLive ∷ !(TVar Bool)
   }
 
--- | An owner of the world's timer, as the step knows it.
-data TimerOwner = TimerOwner
-  { toLabel ∷ !Text
-  , toThread ∷ !(Maybe ThreadId)
-  -- ^ The owner's thread, recorded when it first arms (an owner arms only on its own thread).
-  , toParking ∷ !(Maybe Parking)
-  , toTracked ∷ !Bool
-  -- ^ Whether the step waits for the end of a turn it started: an owner whose instances run on elapsed time (a presentation
-  -- VM) arms its next registration at the end of every turn in which one of them is initializing or serving.
-  , toInstances ∷ ![STM Bool]
-  -- ^ For each instance admitted to it, whether it is initializing or serving.
-  }
-
 newFakeTimer ∷ IO FakeTimer
-newFakeTimer = FakeTimer <$> newTVarIO [] <*> newTVarIO 0 <*> newTVarIO Map.empty <*> newTVarIO Set.empty
+newFakeTimer = FakeTimer <$> newTVarIO [] <*> newTVarIO 0
 
--- | The backend an owner is configured with: each registration is armed as this owner's (or no owner's), at the injected
--- clock's reading plus its length, and arming ends the owner's turn as far as the step is concerned.
-timerBackend ∷ World → Maybe Unique → TimerBackend
-timerBackend world owner = TimerBackend $ \microseconds wake → do
+-- | The backend an owner is configured with: each registration is armed as this VM's (or no VM's), at that VM's reading of the
+-- clock plus its length.
+timerBackend ∷ World → Maybe (Text, VmClock) → TimerBackend
+timerBackend world vm = TimerBackend $ \microseconds wake → do
   let timer = wTimer world
-  now ← readIORef (wClock world)
-  thread ← myThreadId
+  base ← readIORef (wClock world)
+  extra ← maybe (pure 0) (\(_, VmClock ahead) → readIORef ahead) vm
   live ← newTVarIO True
   atomically $ do
-    forM_ owner $ \key → modifyTVar' (ftOwners timer) (Map.adjust (\known → known {toThread = Just thread}) key)
     kept ← filterM (readTVar . regLive) =<< readTVar (ftRegistrations timer)
-    writeTVar (ftRegistrations timer) (kept <> [Registration owner microseconds (now + fromIntegral microseconds * 1000) wake live])
+    writeTVar (ftRegistrations timer) (kept <> [Registration vm microseconds (base + extra + fromIntegral microseconds * 1000) wake live])
     modifyTVar' (ftArmed timer) (+ 1)
-    forM_ owner (modifyTVar' (ftInTurn timer) . Set.delete)
   pure (atomically (writeTVar live False))
-
--- | Make an owner of the world's timer known to the step, by this label, with where its parking is marked, followed or not:
--- answers its key.
-timerOwner ∷ World → Text → Maybe Parking → Bool → IO Unique
-timerOwner world label parking tracked = do
-  key ← newUnique
-  atomically (modifyTVar' (ftOwners (wTimer world)) (Map.insert key (TimerOwner (label <> "#" <> Text.pack (show (hashUnique key))) Nothing parking tracked [])))
-  pure key
-
--- | An instance admitted to this owner: whether it is initializing or serving.
-timerOwnerInstance ∷ World → Unique → STM Bool → IO ()
-timerOwnerInstance world key serving =
-  atomically (modifyTVar' (ftOwners (wTimer world)) (Map.adjust (\owner → owner {toInstances = serving : toInstances owner}) key))
-
--- | The owner is gone: the step no longer waits for it.
-forgetTimerOwner ∷ World → Unique → IO ()
-forgetTimerOwner world key = atomically $ do
-  modifyTVar' (ftOwners (wTimer world)) (Map.delete key)
-  modifyTVar' (ftInTurn (wTimer world)) (Set.delete key)
 
 -- | The live registrations, oldest first.
 liveList ∷ FakeTimer → STM [Registration]
@@ -567,35 +518,31 @@ awaitWaiting fvm wanted = bounded . atomically $ do
 
 -- | ONE STEP TO THE NEXT REGISTRATION, for an example that waits for an update's effect and must never wake a later update
 -- (#692). In one transaction: when the stop condition holds, claim nothing and answer 'True'; otherwise wait (retry, no sleep)
--- while an owner this step's predecessor woke is still in that turn, and while no registration is live; then claim the live
--- registration with the earliest deadline (the oldest among equals). Outside it, move the injected clock to exactly that deadline
--- (never back, never beyond) and wake it, once; answer 'False'.
+-- until a registration is live and claim the oldest. Outside it, move the clock of the VM that armed it to exactly its deadline
+-- (never back, never beyond; the world's clock, for a registration of no VM) and wake it, once; answer 'False'.
 --
--- THE INVARIANT: an owner is woken only after the turn the previous wake started has ended and the stop condition was decided
--- after it, in the transaction that claims the wake; the clock moves only there. What the step owns: the live flags it clears
--- (a claimed registration is never fired again) and the in-turn marks.
+-- THE INVARIANT, per VM: a VM runs an elapsed update only when a step woke its registration, and every step decides the stop
+-- condition, in the transaction that claims, before it wakes anything. What the step owns: the live flags it clears (a claimed
+-- registration is never fired again) and the VMs' clocks ('VmClock').
 --
--- WHY. An owner arms its next elapsed point when it serves one, before the update runs, and syncs its timer only at the end of
--- the turn, reading the clock again: when the clock has passed the deadline by then it raises its own wake and registers
--- nothing ("Hetoimasia.Scripting.Lua.Scheduler.Timer"), so a clock moved while an owner is in a turn runs its next update with
--- nothing fired. A @print@ is in the sink when the call returns ("Hetoimasia.LuaEngine.Facade.Output"), inside the update and
--- so before the end of its turn: the registration that ends a turn is never visible without the lines the turn printed. One capability is no ordering: the Lua binding's calls are
+-- WHY A VM'S OWN CLOCK. An owner arms its next elapsed point when it serves one, before the update runs, and syncs its timer only
+-- at the end of the turn, reading its clock again: when the clock has passed the deadline by then it raises its own wake and
+-- registers nothing ("Hetoimasia.Scripting.Lua.Scheduler.Timer"), so a clock moved while an owner is in a turn runs its next
+-- update with nothing fired. A VM's clock moves only when its own registration is woken, and it registers again only at the end
+-- of that turn, so no step can move it while it is in a turn: its sync never finds a later point passed, whether the turn is
+-- running, waiting on the service, or held by the example at a gate. One capability is no ordering: the Lua binding's calls are
 -- safe foreign calls, which let another thread run, so this holds on any number of capabilities by coordination alone.
 --
--- A TURN ENDS, for an owner whose turns are followed (a presentation VM), when it arms again, or when none of its admitted
--- instances is initializing or serving (nothing will arm). An owner the example parks on purpose in the middle of a turn (at a
--- gate an adapter hook waits at, at a fixture's wait: 'parkedWhile') does not hold the step while it is parked, so the example can
--- step the other VMs; any other owner in a turn does, and the bound around the pumping operation names it ('explainSteps').
---
--- THE RESIDUAL, accepted and stated: while one owner is parked, the steps for the others move the clock. When it is let go, its
--- own sync at the end of that turn can find its next point already passed and raise its own wake: ONE update of that owner that no
--- step woke. Only an owner the example itself parked and released can do this.
+-- ACROSS VMs it promises less, on purpose: a step may wake one VM while an update another step woke is still running (an example
+-- that holds one VM's turn at a gate, or holds the service it waits on, steps the others); that update's effect is seen by the
+-- next step's stop condition, and that VM's own next update still waits for a step. An example's own 'advanceClock' or 'setClock'
+-- moves every VM's clock, as it always did.
 stepNext ∷ World → STM Bool → IO Bool
 stepNext world stop = (== StepStopped) <$> stepWith True world stop
 
 -- | What one step did.
 data Stepped
-  = -- | The stop condition held: nothing was claimed and the clock did not move.
+  = -- | The stop condition held: nothing was claimed and no clock moved.
     StepStopped
   | -- | A registration was claimed and woken.
     StepWoke
@@ -615,40 +562,21 @@ stepWith waitForOne world stop = do
     stopped ← stop
     if stopped
       then pure (Left StepStopped)
-      else do
-        busy ← ownersInTurn timer
-        unless (null busy) retry
-        live ← liveList timer
-        case sortOn regDeadline live of
+      else
+        liveList timer >>= \case
           []
             | waitForOne → retry
             | otherwise → pure (Left StepNothingLive)
-          next : _ → do
-            writeTVar (regLive next) False
-            owners ← readTVar (ftOwners timer)
-            forM_ (regOwner next) $ \key →
-              when (maybe False toTracked (Map.lookup key owners)) (modifyTVar' (ftInTurn timer) (Set.insert key))
-            pure (Right next)
+          next : _ → Right next <$ writeTVar (regLive next) False
   case claimed of
     Left stepped → pure stepped
     Right next → do
-      atomicModifyIORef' (wClock world) (\now → (max now (regDeadline next), ()))
+      base ← readIORef (wClock world)
+      case regVm next of
+        Just (_, VmClock ahead) → atomicModifyIORef' ahead (\extra → (if regDeadline next > base + extra then regDeadline next - base else extra, ()))
+        Nothing → atomicModifyIORef' (wClock world) (\now → (max now (regDeadline next), ()))
       regWake next
       pure StepWoke
-
--- | The labels of the owners a step woke whose turn has not ended.
-ownersInTurn ∷ FakeTimer → STM [Text]
-ownersInTurn timer = do
-  marked ← Set.toList <$> readTVar (ftInTurn timer)
-  owners ← readTVar (ftOwners timer)
-  fmap concat . forM marked $ \key → case Map.lookup key owners of
-    Nothing → pure []
-    Just owner → do
-      serving ← or <$> sequence (toInstances owner)
-      parked ← case (toThread owner, toParking owner) of
-        (Just thread, Just (Parking held)) → Set.member thread <$> readTVar held
-        _ → pure False
-      pure [toLabel owner | serving, not parked]
 
 -- | Step until the stop condition holds: one bound ('bounded') over the whole operation, not one per step.
 stepUntil ∷ World → STM Bool → IO ()
@@ -660,7 +588,7 @@ stepUntilWithin bound world stop = bound loop `onException` explainSteps world
   where
     loop = stepNext world stop >>= \stopped → unless stopped loop
 
--- | Wake the next registration, whenever it appears (after the turn the previous step started has ended), once.
+-- | Wake the next registration, whenever it appears, once.
 stepOnce ∷ World → IO ()
 stepOnce world = bounded (void (stepNext world (pure False))) `onException` explainSteps world
 
@@ -702,18 +630,16 @@ tickAndStepUntil fvm world stop = bounded loop `onException` explainSteps world
           StepStopped → pure ()
           _ → loop
 
--- | What the step was waiting for, when a pumping operation did not end: the clock, the live registrations and the owners in a
--- turn.
+-- | What the step was waiting for, when a pumping operation did not end: the world's clock and the live registrations, each with
+-- its VM, its length, its deadline on that VM's clock and how far ahead of the world that clock is.
 explainSteps ∷ World → IO ()
 explainSteps world = do
-  let timer = wTimer world
   now ← readIORef (wClock world)
-  (live, busy, owners) ← atomically ((,,) <$> liveList timer <*> ownersInTurn timer <*> readTVar (ftOwners timer))
-  let name registration = maybe "no owner" (\key → maybe "a forgotten owner" (Text.unpack . toLabel) (Map.lookup key owners)) (regOwner registration)
-  putStrLn
-    ( "the step: clock " <> show now <> " ns; live registrations " <> show [(name r, regMicros r, regDeadline r) | r ← live]
-        <> "; owners still in the turn a step started (the step waits for them to arm again) " <> show busy
-    )
+  live ← atomically (liveList (wTimer world))
+  described ← forM live $ \r → case regVm r of
+    Nothing → pure ("no VM", regMicros r, regDeadline r, 0)
+    Just (label, VmClock ahead) → (\extra → (Text.unpack label, regMicros r, regDeadline r, extra)) <$> readIORef ahead
+  putStrLn ("the step: world clock " <> show now <> " ns; live registrations (VM, length us, deadline ns, VM clock ahead ns) " <> show described)
 
 -- | Fire the live registrations until the condition holds. Firing is idempotent for the owner, which
 -- looks at its clock at each wake, so how often it happens is not what an example depends on.
@@ -740,8 +666,6 @@ data VmShape = VmShape
   , shInitialChunks ∷ ![Text]
   -- ^ Lua a VM runs before the facade's own chunk, which still sees the hidden namespace of bindings: how a fixture hands a script a
   -- host-made value.
-  , shParking ∷ !(Maybe Parking)
-  -- ^ Where the example's own hold points mark the owner threads they park ('parkedWhile'), for the step.
   , shTerrain ∷ !(Maybe (TerrainInjection, Unique))
   -- ^ The terrain a composition injects into the VM, if any (TRA-5), with the identity of the session it belongs to: the
   -- same for every VM of one session, so that both roles share a namespace and a second session does not.
@@ -749,11 +673,11 @@ data VmShape = VmShape
 
 -- | A gameplay VM whose tick is a millisecond, enabling the session's root.
 gameplayShape ∷ VmShape
-gameplayShape = VmShape Gameplay 1000000 ["modules-test"] Nothing (pure True) [] Nothing Nothing
+gameplayShape = VmShape Gameplay 1000000 ["modules-test"] Nothing (pure True) [] Nothing
 
 -- | A presentation VM enabling the session's root.
 presentationShape ∷ VmShape
-presentationShape = VmShape Presentation 0 ["modules-test"] Nothing (pure True) [] Nothing Nothing
+presentationShape = VmShape Presentation 0 ["modules-test"] Nothing (pure True) [] Nothing
 
 -- | One VM: its owner, coordinator, facade and loader endpoint.
 data Fvm = Fvm
@@ -762,8 +686,6 @@ data Fvm = Fvm
   , fvFacade ∷ !Facade
   , fvLoader ∷ !LoaderEndpoint
   , fvRole ∷ !Role
-  , fvTimerOwner ∷ !Unique
-  -- ^ The owner's key in the world's timer ('timerOwner').
   }
 
 requiredPolicy ∷ WorkerPolicy
@@ -794,7 +716,8 @@ withFvmRefusing world runtime shape body = do
   requests ← either (\refused → assertFailure ("the profile was refused: " <> show refused)) pure (m1Requests profile handles)
   phase ← newModulePhase
   tickRef ← newIORef (pure 0 ∷ IO Word64)
-  timerKey ← timerOwner world ("facade-" <> roleText) (shParking shape) (shRole shape == Presentation)
+  vmClock ← VmClock <$> newIORef 0
+  vmLabel ← (\key → "facade-" <> roleText <> "#" <> Text.pack (show (hashUnique key))) <$> newUnique
   let moduleSpec =
         ModuleSpec
           { specRequests = requests
@@ -820,7 +743,7 @@ withFvmRefusing world runtime shape body = do
                 atomically (modifyTVar' (wFailures world) (<> [failure]))
                 raising ← readIORef (wReportFails world)
                 when raising (throwIO (userError "the report of the failure failed"))
-            , endpointClock = scriptedSource (scriptedInstant <$> laggingDuration world)
+            , endpointClock = scriptedSource (scriptedInstant <$> laggingFrom world (vmDuration world vmClock))
             , endpointTick = readIORef (wTickOverride world) >>= maybe (join (readIORef tickRef)) pure
             }
         -- The injected session: a status an example sets, a counter of the quits and a log of the terminal latches.
@@ -880,8 +803,8 @@ withFvmRefusing world runtime shape body = do
               scheduledMemberLimit = maximum (defaultMemberLimit : [8 * capacity | Just (_, _, capacity) ← [scope]])
             , scheduledRequests = Just grant
             , scheduledLoader = Just (coordinatorPlan coordinator)
-            , scheduledClock = scriptedSource (scriptedInstant <$> clockDuration world)
-            , scheduledTimer = timerBackend world (Just timerKey)
+            , scheduledClock = scriptedSource (scriptedInstant <$> vmDuration world vmClock)
+            , scheduledTimer = timerBackend world (Just (vmLabel, vmClock))
             , scheduledRefusedWait = facadeRefusedWait facade
             }
     started ← startScheduledOwner runtime spec
@@ -895,7 +818,7 @@ withFvmRefusing world runtime shape body = do
     writeIORef tickRef (atomically (scheduledTick (scheduledEndpoint owner)))
     -- The owner stops before the coordinator and the output close: a hook that runs while it retires
     -- (a @shutdown@ that prints) still finds both.
-    body (Fvm owner coordinator facade endpoint (shRole shape) timerKey) `finally` (retireAndAwait (wControl world) owner >> forgetTimerOwner world timerKey)
+    body (Fvm owner coordinator facade endpoint (shRole shape)) `finally` retireAndAwait (wControl world) owner
   where
     session = wSession world
     profile = wProfile world
@@ -965,10 +888,7 @@ admitWith world fvm content entry between = do
   let request = behaviorRequest (fvRole fvm) (moduleIdentity key) (Text.decodeUtf8 entry) (declaredFacade declared) (Just (declaredId declared)) OrdinaryClass
   admitted ← admitBehaviorInstance (scheduledEndpoint (fvOwner fvm)) request
   case admitted of
-    InstanceAccepted identity instanceTicket → do
-      timerOwnerInstance world (fvTimerOwner fvm) $
-        maybe False ((`elem` [Initializing, Active]) . snapshotPhase) <$> inspectInstance (scheduledEndpoint (fvOwner fvm)) identity
-      pure (Spawned (declaredId declared) identity instanceTicket fvm)
+    InstanceAccepted identity instanceTicket → pure (Spawned (declaredId declared) identity instanceTicket fvm)
     other → assertFailure ("expected the instance accepted, found " <> take 100 (show other))
 
 -- | Boot the module at this path in the VM (the loader evaluates it with no waiter and no tick) and wait

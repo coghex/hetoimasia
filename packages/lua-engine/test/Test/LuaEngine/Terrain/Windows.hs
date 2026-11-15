@@ -643,7 +643,7 @@ spec = describe "Terrain windows and banks" $ do
 
   it "answers an attach to an open the service committed but the host has not adopted as not_found at once, in every VM, and finds it after" $ do
     gate ← newGate
-    withRigHolding defaultConfigForRaces noProbeForRaces (\parking → noTerrainHooks {hookAdopting = holdAt parking gate}) $ \rig →
+    withRigHooks defaultConfigForRaces noProbeForRaces noTerrainHooks {hookAdopting = holdAt gate} $ \rig →
       withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource opener), ("lua/attach.lua", scriptSource attacher)]) $ \world _ runtime →
         withFvm world runtime (presentationOver rig) $ \creatorVm →
           withFvm world runtime (presentationOver rig) $ \otherVm → do
@@ -663,7 +663,7 @@ spec = describe "Terrain windows and banks" $ do
 
   it "settles arena_closed, and publishes no lease, for an attach whose arena closed between its commit and its adoption" $ do
     gate ← newGate
-    withRigHolding defaultConfigForRaces noProbeForRaces (\parking → noTerrainHooks {hookAdopted = holdAt parking gate}) $ \rig → do
+    withRigHooks defaultConfigForRaces noProbeForRaces noTerrainHooks {hookAdopted = holdAt gate} $ \rig → do
       Right client ← registerClient (rgService rig)
       Right opening ← openArena (rgService rig) client (arenaName rig "modules-test" "shared") soilOverStoneSpec
       Right ownerLease ← await (rgService rig) opening
@@ -710,7 +710,7 @@ spec = describe "Terrain windows and banks" $ do
   it "frees a cancelled open's name at the host's settlement, while the service has not yet been told" $ do
     tellGate ← newGate
     (`finally` openGate tellGate) $
-     withRigHolding defaultConfigForRaces noProbeForRaces (\parking → noTerrainHooks {hookCancelling = holdAt parking tellGate}) $ \rig →
+     withRigHooks defaultConfigForRaces noProbeForRaces noTerrainHooks {hookCancelling = holdAt tellGate} $ \rig →
       withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource cancelledOpen)]) $ \world _ runtime →
         withFvm world runtime (gameplayOver rig) $ \logical →
           withFvm world runtime (presentationOver rig) $ \shown → do
@@ -776,7 +776,7 @@ spec = describe "Terrain windows and banks" $ do
   it "frees a cancelled open's name while the service has not been told, also when its lease was already offered" $ do
     tellGate ← newGate
     (`finally` openGate tellGate) $
-      withRigHolding defaultConfigForRaces noProbeForRaces (\parking → noTerrainHooks {hookCancelling = holdAt parking tellGate}) $ \rig →
+      withRigHooks defaultConfigForRaces noProbeForRaces noTerrainHooks {hookCancelling = holdAt tellGate} $ \rig →
         withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource cancelAfterOffer), ("lua/second.lua", scriptSource reopens)]) $ \world _ runtime →
           withFvm world runtime (presentationOver rig) $ \first →
             withFvm world runtime (presentationOver rig) $ \second → do
@@ -851,7 +851,7 @@ spec = describe "Terrain windows and banks" $ do
   it "keeps an arena attachable-never and its name held while the lease of a cancelled open is being revoked, and lets another opener finish the revocation" $ do
     releaseGate ← newGate
     (`finally` openGate releaseGate) $
-      withRigHolding defaultConfigForRaces noProbeForRaces (\parking → noTerrainHooks {hookReleasing = holdAt parking releaseGate}) $ \rig →
+      withRigHooks defaultConfigForRaces noProbeForRaces noTerrainHooks {hookReleasing = holdAt releaseGate} $ \rig →
         withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource cancelAfterOffer), ("lua/second.lua", scriptSource attachThenOpen)]) $ \world _ runtime →
           withFvm world runtime (presentationOver rig) $ \first →
             withFvm world runtime (presentationOver rig) $ \second → do
@@ -961,10 +961,10 @@ spec = describe "Terrain windows and banks" $ do
     adoptGate ← newGate
     armed ← newIORef False
     let -- the first adoption after the example arms it is held, and none after
-        holdFirstAdoption parking = do
+        holdFirstAdoption = do
           go ← atomicModifyIORef' armed (\a → (False, a))
-          when go (holdAt parking adoptGate)
-    withRigHolding defaultConfigForRaces noProbeForRaces (\parking → noTerrainHooks {hookRevoked = holdAt parking releaseGate, hookAdopting = holdFirstAdoption parking}) $ \rig →
+          when go (holdAt adoptGate)
+    withRigHooks defaultConfigForRaces noProbeForRaces noTerrainHooks {hookRevoked = holdAt releaseGate, hookAdopting = holdFirstAdoption} $ \rig →
         withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource opensThenReleases), ("lua/second.lua", scriptSource reopens), ("lua/observer.lua", scriptSource observer)]) $ \world _ runtime →
           withFvm world runtime (presentationOver rig) $ \first →
             withFvm world runtime (presentationOver rig) $ \second →
@@ -1009,10 +1009,10 @@ spec = describe "Terrain windows and banks" $ do
   it "answers a service that closed after the host's precheck as the same permanent refusal, with nothing reserved, and a closed service before it the same way" $ do
     gate ← newGate
     armed ← newIORef False
-    let holdFirst parking = do
+    let holdFirst = do
           go ← atomicModifyIORef' armed (\a → (False, a))
-          when go (holdAt parking gate)
-    withRigHolding defaultConfigForRaces noProbeForRaces (\parking → noTerrainHooks {hookSubmitting = holdFirst parking}) $ \rig →
+          when go (holdAt gate)
+    withRigHooks defaultConfigForRaces noProbeForRaces noTerrainHooks {hookSubmitting = holdFirst} $ \rig →
       withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource closesBetween)]) $ \world _ runtime →
         withFvm world runtime (presentationOver rig) $ \fvm → do
           _ ← spawn world fvm "modules-test" mainPath
@@ -1034,7 +1034,7 @@ spec = describe "Terrain windows and banks" $ do
 
   it "releases at once the lease an open built, when its instance stops between the build and the settlement, and leaves no arena or lease" $ do
     gate ← newGate
-    withRigHolding defaultConfigForRaces noProbeForRaces (\parking → noTerrainHooks {hookAdopted = holdAt parking gate}) $ \rig →
+    withRigHooks defaultConfigForRaces noProbeForRaces noTerrainHooks {hookAdopted = holdAt gate} $ \rig →
       withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource opener)]) $ \world _ runtime →
         withFvm world runtime (presentationOver rig) $ \fvm → (`finally` openGate gate) $ do
           spawned ← admitOnly world fvm "modules-test" mainPath
@@ -1050,7 +1050,7 @@ spec = describe "Terrain windows and banks" $ do
 
   it "releases at once the lease an attach built, when its instance stops between the build and the settlement, leaving only the creator's lease" $ do
     gate ← newGate
-    withRigHolding defaultConfigForRaces noProbeForRaces (\parking → noTerrainHooks {hookAdopted = holdAt parking gate}) $ \rig → do
+    withRigHooks defaultConfigForRaces noProbeForRaces noTerrainHooks {hookAdopted = holdAt gate} $ \rig → do
       Right client ← registerClient (rgService rig)
       Right opening ← openArena (rgService rig) client (arenaName rig "modules-test" "shared") soilOverStoneSpec
       Right _ ← await (rgService rig) opening
@@ -1070,10 +1070,10 @@ spec = describe "Terrain windows and banks" $ do
     gate ← newGate
     armed ← newIORef True
     let -- only the first open's adoption is held, where its lease is built and not published; the second's goes through
-        holdFirst parking = do
+        holdFirst = do
           go ← atomicModifyIORef' armed (\a → (False, a))
-          when go (holdAt parking gate)
-    withRigHolding defaultConfigForRaces noProbeForRaces (\parking → noTerrainHooks {hookAdopted = holdFirst parking}) $ \rig →
+          when go (holdAt gate)
+    withRigHooks defaultConfigForRaces noProbeForRaces noTerrainHooks {hookAdopted = holdFirst} $ \rig →
       withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource opener)]) $ \world _ runtime →
         withFvm world runtime (presentationOver rig) $ \first →
           withFvm world runtime (presentationOver rig) $ \second → (`finally` openGate gate) $ do
@@ -1139,11 +1139,11 @@ spec = describe "Terrain windows and banks" $ do
     armed ← newIORef False
     events ← newIORef ([] ∷ [String])
     let note event = modifyIORef' events (event :)
-        holdFirst parking = do
+        holdFirst = do
           note "checked"
           go ← atomicModifyIORef' armed (\a → (False, a))
-          when go (holdAt parking gate)
-    withRigHolding defaultConfigForRaces noProbeForRaces (\parking → noTerrainHooks {hookArriving = note "arriving", hookChecked = holdFirst parking, hookSubmitting = note "submitting"}) $ \rig → do
+          when go (holdAt gate)
+    withRigHooks defaultConfigForRaces noProbeForRaces noTerrainHooks {hookArriving = note "arriving", hookChecked = holdFirst, hookSubmitting = note "submitting"} $ \rig → do
       let facade = rgFacade rig
           svc = rgService rig
       hostSettled ← newTVarIO False
@@ -1199,7 +1199,7 @@ spec = describe "Terrain windows and banks" $ do
           -- the host has settled the open as cancelled, and the service is told by whoever finds it so
           admitFirst = do
             admitted ← openArenaWith svc firstEndpoint first "held" soilOverStoneSpec
-            holdThere gate
+            holdAt gate
             forM_ (either (const Nothing) Just admitted) $ \request →
               atomically (registerClaim (fst (namesOf facade)) "held" (Claim (readTVar cancelled) (readTVar told) (void (cancel svc request) >> atomically (writeTVar told True))))
             pure admitted

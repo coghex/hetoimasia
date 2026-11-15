@@ -14,10 +14,8 @@ module Test.LuaEngine.Terrain.Support
   , sendCommand
   , withRigProbe
   , withRigHooks
-  , withRigHolding
   , withRigPort
   , holdAt
-  , holdThere
   , defaultConfigForRaces
   , noProbeForRaces
   , presentationOver
@@ -84,7 +82,7 @@ import Hetoimasia.Terrain.Runtime
 import Test.Hspec (Expectation, expectationFailure, shouldThrow)
 import Hetoimasia.Scripting.Lua.Instance (InstanceFailure (failureMessage))
 import qualified Hetoimasia.Scripting.Lua.Instance as Instance
-import Test.LuaEngine.Facade.Support (Parking, Script (..), Spawned, VmShape (..), World, errLines, gameplayShape, newParking, outLines, outLinesSTM, parkedWhile, phaseOf, presentationShape, script, settledFailure, stepUntil)
+import Test.LuaEngine.Facade.Support (Script (..), Spawned, VmShape (..), World, errLines, gameplayShape, outLines, outLinesSTM, phaseOf, presentationShape, script, settledFailure, stepUntil)
 import Test.Support.Bounded (bounded)
 
 -- | The real service and the adapter over it.
@@ -99,8 +97,6 @@ data Rig = Rig
   -- ^ The commands an example has queued for a scripted instance, by the instance's label: @TEST_CMD(label)@ answers the next, or @none@.
   , rgSignals ∷ !(TVar (Set.Set Text))
   -- ^ The names an example has signalled: @TEST_WAIT(name)@ returns once its name is among them.
-  , rgParking ∷ !Parking
-  -- ^ Where the fixtures' waits and the hooks' gates ('holdAt') mark the owner threads they park, for the step ('stepNext').
   }
 
 quiet ∷ Logger
@@ -131,22 +127,12 @@ withRigProbe config probe = withRigHooks config probe noTerrainHooks
 
 -- | A rig whose adapter tells these hooks of the windows a race is decided in.
 withRigHooks ∷ Config → Probe → TerrainHooks → (Rig → IO a) → IO a
-withRigHooks config probe terrainHooks = withRigHolding config probe (const terrainHooks)
-
--- | 'withRigHooks' for hooks that hold an owner at a gate ('holdAt'): they are made with the rig's parking, so that the step
--- ('stepNext') steps the other VMs while an owner is held there.
-withRigHolding ∷ Config → Probe → (Parking → TerrainHooks) → (Rig → IO a) → IO a
-withRigHolding config probe hooksWith body = do
-  parking ← newParking
-  withRigParked parking config probe (hooksWith parking) storagePort body
+withRigHooks config probe terrainHooks = withRigPort config probe terrainHooks storagePort
 
 -- | A rig whose storage port this makes from the worker group, the qualified storage configuration and the directory: the production
 -- port, or one with a test seam ("Hetoimasia.Terrain.Runtime.Testing").
 withRigPort ∷ Config → Probe → TerrainHooks → (WorkerGroup → StorageConfig → ByteString → StoragePort) → (Rig → IO a) → IO a
-withRigPort config probe terrainHooks port body = newParking >>= \parking → withRigParked parking config probe terrainHooks port body
-
-withRigParked ∷ Parking → Config → Probe → TerrainHooks → (WorkerGroup → StorageConfig → ByteString → StoragePort) → (Rig → IO a) → IO a
-withRigParked parking config probe terrainHooks port body =
+withRigPort config probe terrainHooks port body =
   -- The arenas' private files are real reserved files in a temporary directory, through the production
   -- adapter; the directory's filesystem is named the way the backend reads it and qualified for this run
   -- (the production list is not widened), and an arena reserves the smallest allowance unless the
@@ -165,18 +151,17 @@ withRigParked parking config probe terrainHooks port body =
       body
         Rig
           { rgService = service
-          , rgFacade = facade {tfHooks = terrainHooks, tfExtraBindings = [pickFixture, awaitOfferFixture parking facade, waitFixture parking signals trace, awaitSettledFixture parking service, commandFixture commands]}
+          , rgFacade = facade {tfHooks = terrainHooks, tfExtraBindings = [pickFixture, awaitOfferFixture facade, waitFixture signals trace, awaitSettledFixture service, commandFixture commands]}
           , rgSession = session
           , rgPicks = tfPicks facade
           , rgSignals = signals
           , rgTrace = trace
           , rgCommands = commands
-          , rgParking = parking
           }
 
 presentationOver, gameplayOver ∷ Rig → VmShape
-presentationOver rig = presentationShape {shTerrain = Just (terrainInjection (rgFacade rig), rgSession rig), shInitialChunks = pickChunk, shParking = Just (rgParking rig)}
-gameplayOver rig = gameplayShape {shTerrain = Just (terrainInjection (rgFacade rig), rgSession rig), shInitialChunks = pickChunk, shParking = Just (rgParking rig)}
+presentationOver rig = presentationShape {shTerrain = Just (terrainInjection (rgFacade rig), rgSession rig), shInitialChunks = pickChunk}
+gameplayOver rig = gameplayShape {shTerrain = Just (terrainInjection (rgFacade rig), rgSession rig), shInitialChunks = pickChunk}
 
 -- | The same VM of another session over the same service: its names are its own.
 presentationOverSession ∷ Rig → Unique → VmShape
@@ -195,12 +180,12 @@ pickFixture =
 
 -- | How a fixture holds a script until the example says so: @TEST_WAIT(name)@ returns once the example has signalled that name
 -- ('signalRig'). It runs on the script's own thread and waits on the rig's own state and nothing else; a real script has no such function.
-waitFixture ∷ Parking → TVar (Set.Set Text) → TVar [Text] → Binding
-waitFixture parking signals trace =
+waitFixture ∷ TVar (Set.Set Text) → TVar [Text] → Binding
+waitFixture signals trace =
   asynchronousNativeRequestIn "terrain_test_wait" [SText] [] $ \_ values → case values of
     [VText name] → do
       atomically (modifyTVar' trace ("entered " <> name :))
-      parkedWhile parking (bounded (atomically (readTVar signals >>= \seen → if Set.member name seen then pure () else retry)))
+      bounded (atomically (readTVar signals >>= \seen → if Set.member name seen then pure () else retry))
       atomically (modifyTVar' trace ("released " <> name :))
       pure []
     _ → pure []
@@ -209,10 +194,10 @@ waitFixture parking signals trace =
 -- then. The host's record of a request the service settles is settled in the same transaction, so a script may take it at once, within
 -- the invocation it was started in, before the owner's next boundary can account its work. It runs on the script's own thread, waits on
 -- the service's own state and nothing else, and a real script has no such function.
-awaitSettledFixture ∷ Parking → Service → Binding
-awaitSettledFixture parking service =
+awaitSettledFixture ∷ Service → Binding
+awaitSettledFixture service =
   asynchronousNativeRequestIn "terrain_test_await_settled" [] [] $ \_ _ →
-    [] <$ parkedWhile parking (bounded (atomically (inspectCensusSTM service >>= \census → let requests = censusRequests census in if not (null requests) && all censusSettled requests then pure () else retry)))
+    [] <$ bounded (atomically (inspectCensusSTM service >>= \census → let requests = censusRequests census in if not (null requests) && all censusSettled requests then pure () else retry))
 
 -- | How a fixture hands a scripted instance the next command an example queued for it: @TEST_CMD(label)@ answers it, or the text @none@. It
 -- never waits, and a real script has no such function.
@@ -237,11 +222,11 @@ signalRig rig name = atomically (modifyTVar' (rgSignals rig) (Set.insert name))
 -- | How a fixture holds a script where an offer of the service's open is already made and the host has not adopted it:
 -- @TEST_AWAIT_OFFER(name)@ returns once the service holds an offered lease for the open of that name. It runs on the script's own
 -- thread, waits on the adapter's own state and nothing else, and a real script has no such function.
-awaitOfferFixture ∷ Parking → TerrainFacade → Binding
-awaitOfferFixture parking facade =
+awaitOfferFixture ∷ TerrainFacade → Binding
+awaitOfferFixture facade =
   asynchronousNativeRequestIn "terrain_test_await_offer" [SText] [] $ \_ values → case values of
     [VText name] →
-      [] <$ parkedWhile parking (bounded (atomically (readTVar (tfOffered facade) >>= \held → if any (Text.isSuffixOf ("/" <> name)) (Map.keys held) then pure () else retry)))
+      [] <$ bounded (atomically (readTVar (tfOffered facade) >>= \held → if any (Text.isSuffixOf ("/" <> name)) (Map.keys held) then pure () else retry))
     _ → pure []
 
 -- | Lua for the soil-over-stone definition the examples share: stone below level -3, four soil levels from -3 to 1.
@@ -484,18 +469,9 @@ untilPrintedBy world spawned marker =
       Just Instance.Failed → settledFailure spawned >>= \failure → putStrLn ("the instance failed: " <> show (failureMessage <$> failure))
       other → putStrLn ("the instance is " <> show other)
 
--- | The action that holds whoever runs it at the gate until it is opened: for a hook of the adapter ('withRigHolding'). The thread
--- is marked parked while it is held, so the step goes on with the other VMs.
-holdAt ∷ Parking → Gate → IO ()
-holdAt parking gate = do
-  armed ← readTVarIO (gateArmed gate)
-  when armed $ do
-    arrive gate
-    parkedWhile parking (takeMVar (gateOpen gate))
-
--- | 'holdAt' for a thread that is no Lua owner (the terrain service's owner in a probe, an example's own thread): nothing to mark.
-holdThere ∷ Gate → IO ()
-holdThere gate = do
+-- | The action that holds whoever runs it at the gate until it is opened: for a hook of the adapter.
+holdAt ∷ Gate → IO ()
+holdAt gate = do
   armed ← readTVarIO (gateArmed gate)
   when armed $ do
     arrive gate

@@ -290,7 +290,7 @@ windowsSpec = describe "Terrain cancel windows" $ do
           PointJob _ region
             | region == RegionCoord 1 0 0 → do
                 go ← atomicModifyIORef' armed (\a → (False, a))
-                when go (holdThere gate)
+                when go (holdAt gate)
           PointStaging rid → modifyIORef' stagings (show rid :)
           PointCommitted rid _ → modifyIORef' commits (show rid :)
           _ → pure ()
@@ -467,7 +467,7 @@ arbitration = describe "Terrain arbitration" $
     commitGate ← newGate
     tellGate ← newGate
     probe ← removalProbe commitGate
-    withRigHolding defaultConfigForRaces probe (\parking → noTerrainHooks {hookCancelling = holdAt parking tellGate}) $ \rig →
+    withRigHooks defaultConfigForRaces probe noTerrainHooks {hookCancelling = holdAt tellGate} $ \rig →
       withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource cancelling)]) $ \world _ runtime →
         withFvm world runtime (presentationOver rig) $ \fvm → do
           _ ← spawn world fvm "modules-test" mainPath

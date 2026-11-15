@@ -102,10 +102,10 @@ spec = describe "Terrain lifecycle model" $
       gate ← newGate
       armed ← newIORef False
       window ← newIORef False
-      let hold parking = do
+      let hold = do
             go ← atomicModifyIORef' armed (\a → (False, a))
-            when go (holdAt parking gate)
-      (`finally` openGate gate) $ withRigHolding defaultConfig {configMaxClients = 8, configMaxLeases = 6, configMaxArenas = 2} noProbeForRaces (\parking → noTerrainHooks {hookAdopting = hold parking}) $ \rig →
+            when go (holdAt gate)
+      (`finally` openGate gate) $ withRigHooks defaultConfig {configMaxClients = 8, configMaxLeases = 6, configMaxArenas = 2} noProbeForRaces noTerrainHooks {hookAdopting = hold} $ \rig →
         withWorld (counts [(RequestsPerInstance, 3), (RequestsPerVm, 5)]) (Layout [("lua/p.lua", scriptSource (scripted "p")), ("lua/g.lua", scriptSource (scripted "g"))]) $ \world control runtime →
           withFvm world runtime (presentationOver rig) $ \pv →
             withFvm world runtime (gameplayOver rig) $ \gv → do
