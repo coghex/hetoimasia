@@ -199,7 +199,9 @@ request or ends the owner: the refused caller keeps its place (a request stays w
 keeps its job, a growth or retry waits again, an open keeps its compiled result), and no new
 storage work starts until what the storage service and the edit bank hold has changed. Internal work (discovery,
 reclamation) takes one grant in every `internalTurn` (3) explicit grants while an
-explicit removal waits. Reads of other arenas, loads and borrowed snapshots continue
+explicit removal waits, and its turns rotate over each arena's reclamation and discovery, starting after
+the one granted last, so neither kind nor any arena keeps another from its turns (maintenance another
+transaction needs first goes ahead of every choice). Reads of other arenas, loads and borrowed snapshots continue
 while a write is outstanding. Pending opens and
 attaches order among themselves the same way. An attach is decided in its own
 commit against the names that have settled, so a pending open is invisible to it.
@@ -221,9 +223,11 @@ A request's pinned read reads only the levels it needs, from the run at or below
 store reader's `RangeFloor`), never a column's whole history: a cell its level; a removal its level
 and the two beside it (the runs it coalesces with); a column query its range; a surface one window at
 a time, first the 32 levels down from the source's top (`limitRangeLevels` when smaller), then, while the
-levels read hold no occupied cell, the window below, twice as deep and at most `limitRangeLevels`,
-keeping nothing of the one above (no cell above it is occupied, and since a source never changes and
-a change only removes, that stays true). A read keeps at most what its levels can hold, half of them
+levels read hold no occupied cell, the window ending at the next level the source occupies below
+them (every level between is empty in the source, and a change only removes), twice as deep and at
+most `limitRangeLevels`, keeping nothing of the one above (no cell above it is occupied, and since a
+source never changes and a change only removes, that stays true): its reads grow with the removed
+occupied cells it meets, never with the width of an empty gap. A read keeps at most what its levels can hold, half of them
 and one more a column (removed runs are coalesced, so two are a level apart): it never cuts an answer
 short, and keeping more is a defect. Its window pins only what the reader's pin credit (32 pages)
 leaves beside those runs, so the two never pass the one credit, and construction refuses query limits
