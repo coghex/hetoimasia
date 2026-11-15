@@ -1340,7 +1340,7 @@ window, with the consumer registered first; input produced earlier is gated by t
 polls never enables its window's input, so it never overflows. A packet that cannot be delivered after its batch was taken is the
 engine's failure, not an empty poll.
 
-### The terrain calls (TRA-5)
+### The terrain calls (TRA-5, TRA-23)
 
 `api.terrain` exists only when the composition injected terrain (`sxTerrain`); a facade without it has no `terrain` field, no
 terrain handle type and no terrain `api.request` operation, and its namespace, request kinds and behavior are exactly what they
@@ -1351,17 +1351,21 @@ module. Every call is a dot call with exactly its declared arguments; a request-
 
 | Call | Contract |
 | --- | --- |
-| `api.terrain.open(name, definition)` | request a session- and content-root-local named arena. The result is this instance's **owner** lease, the arena's only owner lease |
+| `api.terrain.open(name, definition [, options])` | request a session- and content-root-local named arena. The result is this instance's **owner** lease, the arena's only owner lease, settled only after the source is prepared, its file reserved and its first roots written. `options` is omitted, `nil` or a record whose only field is an optional `storage_bytes`: the arena's allowance (see [storage](#storage-status-growth-and-recovery-tra-23)) |
 | `api.terrain.attach(name)` | request this instance's **attachment** lease to an existing arena of the same session and content root, including when the instance is the creator. A missing arena and a pending open answer `not_found`, without waiting |
 | `api.terrain.cell(arena, {x=, y=, z=})` | the content revision, and air or an authored material and shape |
 | `api.terrain.column(arena, {x=, y=, z_min=, z_max=})` | the complete coalesced runs, air included, of the half-open range `[z_min, z_max)` at one revision; more than 1,024 runs settles `too_large`, never a truncated answer |
 | `api.terrain.surface(arena, {x=, y=})` | the highest occupied cell after edits, explicitly absent for an empty column |
 | `api.terrain.remove(arena, {x=, y=, z=} [, pick])` | remove one whole cell, a buried cell or a slope included; air is a no-op; an optional `pick` carries displayed-snapshot consistency |
+| `api.terrain.status(arena)` | a bounded, copied, advisory snapshot of the arena's storage and discovery, through any of this instance's leases of it |
+| `api.terrain.grow_storage(arena, new_bytes)` | creator lease only: commit a larger allowance; the size already committed is an idempotent success, a smaller one settles `storage_size_not_increased`; never a shrink |
+| `api.terrain.retry_storage(arena)` | creator lease only: one explicit, bounded re-test of what paused the arena; a ready arena is an idempotent success |
 | `api.terrain.release(arena)` | non-waiting release of this instance's lease through the host's release path: `done`, `retiring` or `already_released`, repeatable |
 
 **Results** (`api.request.take`, `{status = "success", value = V}`; a failure is `{status = "failure", error = {code, message}}`;
-the kinds are `terrain_arena`, `terrain_cell`, `terrain_column`, `terrain_surface` and `terrain_remove`, each with its own handle
-type, so `ready`, `take`, `cancel` and `wait` dispatch by kind as for every other request):
+the kinds are `terrain_arena`, `terrain_cell`, `terrain_column`, `terrain_surface`, `terrain_remove`, `terrain_status`,
+`terrain_grow` and `terrain_retry`, each with its own handle type, so `ready`, `take`, `cancel` and `wait` dispatch by kind as for every
+other request):
 
 | Kind | `value` |
 | --- | --- |
@@ -1370,6 +1374,9 @@ type, so `ready`, `take`, `cancel` and `wait` dispatch by kind as for every othe
 | column | `{revision = INT, runs = {{z_min = INT, z_max = INT, air = BOOL, material = TEXT?, shape = INT?}, ...}}` |
 | surface | `{revision = INT, occupied = BOOL, z = INT?, material = TEXT?, shape = INT?}` |
 | remove | `{changed = BOOL, revision = INT}` |
+| status | `{storage = {state = "ready"\|"paused", reason = TEXT?, reserved_bytes = INT, used_bytes = INT, pending_reclaim_bytes = INT, pending_reserved_bytes = INT}, discovery = {state = "idle"\|"pending"\|"paused", pending_items = INT}, content_revision = INT, knowledge_revision = INT}` |
+| grow | `{changed = BOOL, reserved_bytes = INT, storage = {state = TEXT, reason = TEXT?}}` |
+| retry | `{changed = BOOL, cleared = {TEXT...}, remaining = {TEXT...}, until_closed = {TEXT...}, storage = {state = TEXT, reason = TEXT?}, discovery = {state = TEXT}}` |
 
 Records are fresh copies; material identifiers are the authored text and shapes are the authored identities 0 to 15 (0 and 15
 distinct). A content revision that does not fit a Lua integer is a host defect, never a wrapped value.
@@ -1385,13 +1392,30 @@ supported extreme (the last supported cell is covered by an omitted upper end). 
   the float subtype (an integral float included), invalid UTF-8, an arena name that is empty or over 128 characters, a material
   identifier that is empty or over 64 UTF-8 bytes, a cell coordinate outside `[-2^62, 2^62 - 1]`, a lower interval end outside it,
   an upper end above `2^62`, a shape outside 0 to 15, a `column` range that is empty or inverted, a handle of another kind or another
-  instance, and a copy over the bounds (`argumentLimits`: 2 MiB of encoding beside the profile's depth and element limits, the
+  instance, open's options that are not `nil` or a record of at most `storage_bytes`, an allowance (`storage_bytes`, `new_bytes`) that
+  is not a Lua integer, is below 64 MiB, is not a whole number of MiB or is above [the largest](#storage-status-growth-and-recovery-tra-23),
+  a growth or a retry through a lease that is not the arena's creator lease, and a copy over the bounds (`argumentLimits`: 2 MiB of encoding beside the profile's depth and element limits, the
   tighter of each applies).
 * *The validator* (`hetoimasia-terrain`'s `mkSource`) refuses a definition that decoded completely as the expected `definition`
   failure: an empty or inverted interval, overlapping or unordered layers, overlapping patches, an unknown material, a duplicate
   material identifier, a material identifier with a control character, and a definition over 256 KiB or 8,192 authored runs.
 
-**Expected failures** are `not_found`, `arena_closed`, `stale_view`, `definition`, `source_failure`, `too_large` and `name_in_use`.
+**Expected failures** are `not_found`, `arena_closed`, `stale_view`, `definition`, `source_failure`, `too_large` and `name_in_use`, and
+the storage codes `source_complexity`, `storage_unsupported`, `reservation_failed`, `storage_full`, `storage_io`, `storage_integrity` and
+`storage_size_not_increased`. Each request declares only the storage codes the service's classification of its command can settle it
+with (`terrainCodesFor`); one it does not declare is a defect there:
+
+| Request | Storage codes it declares |
+| --- | --- |
+| open | `source_complexity`, `storage_unsupported`, `reservation_failed`, `storage_io` |
+| attach | none |
+| cell, column, surface | `storage_io`, `storage_integrity` |
+| remove | `storage_full`, `storage_io`, `storage_integrity` |
+| status | none (its only expected failure is `arena_closed`) |
+| grow_storage | `storage_unsupported`, `reservation_failed`, `storage_io`, `storage_size_not_increased` (and `arena_closed`) |
+| retry_storage | `storage_io`, an earlier extra's failed release (and `arena_closed`) |
+
+The seven earlier codes are declared as before by the calls that had them.
 Terrain requests are `OptionalRequest`s: these settle as structured results and do not fail the instance, read or unread. A lease
 whose arena was closed by someone else (the creator released its owner lease or ended) is not a retired handle: its new requests are
 admitted and its in-flight ones settle `arena_closed`; releasing it stays safe. Only the caller's own released lease, and a foreign,
@@ -1399,13 +1423,12 @@ wrong-kind or forged handle, is an ordinary error; ownership is positive and per
 handles it was issued, and another instance's handle is refused however many have been issued since and whether or not its issuer
 still lives). Any other outcome of the service (an unknown code, a revision that is not a Lua
 integer (above the VM's validated profile ceiling, not only Int64's), an answer over the declared ceilings) is a provider defect and fails the owner; it is never given a code, never busy and
-never air. The service's storage outcomes (`source_complexity`, `storage_unsupported`, `reservation_failed`,
-`storage_full`, `storage_io`, `storage_integrity`, `storage_size_not_increased`) have no declared Lua code, so they take
-this same path; none is presented as success, `busy`, another code or air.
+never air. A storage outcome carries its code and a fixed message: the service's detail (pages, offsets, operations, figures) is its
+diagnostics and never reaches a script.
 
 **Who may call, and when.** An instance of the facade, in `init` and in an update, while the session's admission is open; refused (an
 ordinary error, never busy) at a module's top level (through a captured facade or an import that a hook started included), in
-`shutdown` and after a stop. `release` and `cancel` are finite-hook cleanup and are available in `shutdown` and after a stop;
+`shutdown` and after a stop; the storage calls likewise. `release` and `cancel` are finite-hook cleanup and are available in `shutdown` and after a stop;
 `request.wait` is update-only and cooperative.
 
 **Time.** A presentation instance's requests settle on arrival. A gameplay instance's request is due at the next logical tick
@@ -1419,10 +1442,42 @@ and the drain carry on.
 
 **Admission.** The host reserves request places, the result lease (open and attach) and the session's gate in its one atomic
 admission; the terrain service's own admission is the next step of the same masked hand-off, and when it is busy (arenas, leases,
-retained edits, any bank) the hand-off declines (`SubmissionDeclined`) and the host takes the whole admission back: no handle, no
+clients, any bank) the hand-off declines (`SubmissionDeclined`) and the host takes the whole admission back: no handle, no
 lease, no credit, no name claim, no edit, and `nil, busy`. A permanent fact that changed since the argument check is declined the
 same way and read as an ordinary error. A full request bank is therefore the same immediate busy, never a final refusal, and
-nothing already committed is evicted; a full disk allowance is the service's `storage_full`, which takes the path above. Permanent validation, ownership and stop refusals are decided before any bank.
+nothing already committed is evicted. On the backed service no total-history RAM credit makes a mutation busy: an arena whose allowance
+cannot take the next transaction, or whose storage failed, settles its accepted and new removals `storage_full`, `storage_io` or
+`storage_integrity` at once while it is paused, and a status, a growth or a retry is still admitted when its places fit. Permanent
+validation, ownership and stop refusals are decided before any bank.
+
+#### Storage, status, growth and recovery (TRA-23)
+
+**The allowance.** `open`'s `storage_bytes` names the arena's allowance: a Lua integer of at least 64 MiB and a whole number of MiB. An
+omitted, `nil` or empty options record, or an absent or `nil` `storage_bytes`, is the service's own allowance (`configStore`, 1 GiB in the
+production configuration). The largest a script may name, for `open` and for `grow_storage`, is the service's configured offset limit or
+the VM's integer ceiling, whichever is smaller, rounded down to a whole MiB: 2^63 − 2^20 on the M1 profile. Larger is an ordinary error, as
+is an open's allowance the service's store rules refuse beside its other figures. Whether a growth is larger than the arena's allowance is
+decided when it executes, never at the call. The options are copied at the call: changing the table afterwards changes nothing.
+
+**Status** is no work of the service's: one transaction reads the arena's coherent status, through any of the caller's live leases of
+it, at the call, and the host settles the request with that copied record (on logical time it holds it for the request's position, like
+any answer). `storage.state` is `ready` or `paused`; `reason` is present exactly while it is paused: the most severe recorded condition,
+`storage_integrity` before `storage_io` before `storage_full`. `reserved_bytes` is the committed allowance; `used_bytes` counts live,
+staged and retired pages and overhead, never free preallocated space; `pending_reclaim_bytes` (retired, not yet reclaimed) is part of
+it; `pending_reserved_bytes` is extra reservation not yet spendable (a growth executing, or an extra whose give-back failed).
+`discovery.state` is `idle`, `pending` (obligations left) or `paused` (obligations left while storage is paused); `pending_items` counts
+them. It holds no history, coordinates or file authority and promises nothing later; it discovers nothing and clears no pause. A status
+whose arena's allowance is above the VM's integer ceiling is refused before any bank; a count or revision above it is a host defect.
+
+**Growth and retry** are the service's creator commands, attached to the same settlement arbitration as a removal: the service reserves
+a growth's extra only once the request is eligible (on logical time, at its position), and commits the larger cap and the success in
+one transaction; until then the old allowance stands and a cancel wins. After the commit a cancel answers `already_settled`. Two growths
+are decided in order against the cap as it is then, so the second of two larger sizes may settle `storage_size_not_increased`. An extra
+a cancelled growth reserved is given back; one whose give-back failed stays charged and visible in `pending_reserved_bytes`, and the next
+creator command releases it first. `changed` says whether a growth committed a larger allowance. A retry re-tests every recorded failure
+of each condition (a read again, a write by a probe it abandons) and clears, in its own settlement, what it verified gone: `cleared`,
+`remaining` and `until_closed` (conditions no retry can clear) list codes most severe first, and `changed` says whether it cleared
+anything. Growth clears only `storage_full`; neither repeats a failed removal, resets the arena or replays anything.
 
 **The commit point.** The service's `Endpoint` is attached to the host's `Settling` seam: the service reads the request's
 eligibility, commits the edit and delivers the settlement in one transaction that also decides cancellation, the parent session's
@@ -1659,8 +1714,10 @@ two-word elapsed wait and the shared bounded output.
 facade's abstract terrain operations over the terrain service: `terrainInjection` builds the `TerrainInjection` a session is composed
 with from a `TerrainFacade` (the profile, the assembly's `Service` and the `Config` it was made with, the pick authorities, the test
 hooks). It depends on the facade, the request adapter, the host's public runtime modules and the two terrain packages, imports no
-game, window, GPU or console package, and neither terrain package imports Lua. See [the terrain calls](#the-terrain-calls-tra-5) for
-what a script sees and what the adapter does for each request.
+game, window, GPU or console package, and neither terrain package imports Lua. See [the terrain calls](#the-terrain-calls-tra-5-tra-23)
+for what a script sees and what the adapter does for each request. Its examples run the production backed service; the storage faults
+and causal gates are injected through the terrain service's test-only library (`hetoimasia-terrain-runtime:testing`), which only the
+test suite depends on.
 
 ## The session coordinator (LFE-13)
 

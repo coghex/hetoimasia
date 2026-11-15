@@ -38,7 +38,10 @@ withWorkerGroup $ \group →
 
 The arenas' private files go in `directory`, on a filesystem `storage` qualifies
 (`mkStorageConfig`; `filesystemOf` names the one a directory is on, and qualifies nothing). Each
-arena reserves `configStore`'s allowance (1 GiB by default, 64 MiB at least). The storage
+arena reserves its allowance: the service's own (`configStore`, 1 GiB by default), or one its open names
+(`openArenaOptions`, `openArenaWithOptions` with `OpenOptions`), validated by the same store rules beside `configStore`'s other figures
+(at least 64 MiB, a whole number of MiB, within the configured offset limit) and refused before admission (`RefusedInvalid`) when it can
+never be granted. The storage
 workers need the threaded runtime. There is no default directory.
 
 An application supplies `supervisedOwner runtimeControl` (module
@@ -75,6 +78,10 @@ ordinary IO completion after a commit and call that atomic. A callback that thro
 is a provider defect: the transaction is abandoned with nothing committed, the
 request ends without a second call into the host, and the defect reaches
 supervision (the owner ends).
+
+An open may name its arena's allowance: `openArenaWithOptions` takes `OpenOptions`, and `openArenaWith` is it with
+`defaultOpenOptions`, the service's own allowance. The allowance feeds the arena's reservation and its first store, as the service's own
+does; nothing else of an open changes.
 
 ### Three read-only reads for a host's composition and precheck, and two transactional forms
 
@@ -2421,6 +2428,14 @@ run anywhere else. The storage examples hold the class of defect, not the instan
   timers in the storage examples are the two bounded polls (50 ms, at most 200) in the probe's `ProbeSpec` for
   APFS's lazy reclamation of freed space, a positive wait for a volume figure; the probe reads free space only
   through a descriptor it opened before anything was allocated, never by creating a file.
+
+## The test seam library
+
+`library testing` (`Hetoimasia.Terrain.Runtime.Testing`, public, for test suites only) builds a `StoragePort` with a seam of a test's
+own (`storagePortWithSeam`): hooks the storage workers run immediately before and after each native call, over an adapter whose answers
+a test may replace. The service, its owner and the storage backend are the production ones; an application uses `storagePort`. Only
+`lua-engine-tests` depends on it (TRA-23's Lua examples inject faults and causal gates through it); this package's own suite reaches
+the seam directly.
 
 ## Consumers
 
