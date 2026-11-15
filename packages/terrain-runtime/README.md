@@ -38,7 +38,10 @@ withWorkerGroup $ \group →
 
 The arenas' private files go in `directory`, on a filesystem `storage` qualifies
 (`mkStorageConfig`; `filesystemOf` names the one a directory is on, and qualifies nothing). Each
-arena reserves `configStore`'s allowance (1 GiB by default, 64 MiB at least). The storage
+arena reserves its allowance: the service's own (`configStore`, 1 GiB by default), or one its open names
+(`openArenaOptions`, `openArenaWithOptions` with `OpenOptions`), validated by the same store rules beside `configStore`'s other figures
+(at least 64 MiB, a whole number of MiB, within the configured offset limit) and refused before admission (`RefusedInvalid`) when it can
+never be granted. The storage
 workers need the threaded runtime. There is no default directory.
 
 An application supplies `supervisedOwner runtimeControl` (module
@@ -75,6 +78,10 @@ ordinary IO completion after a commit and call that atomic. A callback that thro
 is a provider defect: the transaction is abandoned with nothing committed, the
 request ends without a second call into the host, and the defect reaches
 supervision (the owner ends).
+
+An open may name its arena's allowance: `openArenaWithOptions` takes `OpenOptions`, and `openArenaWith` is it with
+`defaultOpenOptions`, the service's own allowance. The allowance feeds the arena's reservation and its first store, as the service's own
+does; nothing else of an open changes.
 
 ### Three read-only reads for a host's composition and precheck, and two transactional forms
 
@@ -121,6 +128,7 @@ values.
 | Leases, clients, names | The port | The port, the owner | Any | 64 leases, four arenas | Released by `releaseLease`, `endClient`, arena closure or service closure; names freed at arena closure or when a pending open ends |
 | View demand registrations | The port | The owner (`Service` quantum) | Any | Eight views; latest-value descriptions | Cleared by `closeView`, `endClient`, arena or service closure |
 | Snapshot holds and the borrower count | The port acquires and releases | The owner (for closure) | Any | `specHoldRegions` per hold | Released on every exit of `withSnapshot`; closure waits for the count to reach zero |
+| Regional snapshot borrows (`stateRegional`): a copied hold, a retained-bank charge and a borrower each | The port admits, takes and releases; the owner settles (the charge becomes the footprint) and releases a borrow orphaned by its build | Inspection; the owner (closure) | Any | `specHoldRegions` regions each; the retained bank | Released exactly once, by whoever owns it then (see [Regional snapshots](#regional-snapshots)); closure waits for the borrower count |
 | Victim queue | The port appends (from admission decisions); the owner drains | The owner | Port, owner | Bounded by the banks | Drained by the owner, which discards the detail and then reports the release |
 | Defect record | Any thread that detects one | Inspection | Any | The latest 16 | Kept for the life of the service |
 | Running-work record (`RunningWork`: every accepted load job as granted and as its coverage must hold it; the preparation; each borrow's regions; each view description's regions) | The owner thread (running marks, preparation, a job's end) and the port transactions that admit the work (a job's grant, a borrow, a view's demand), each in the transaction of the model event it mirrors | Inspection only (`inspectCensusSTM`); no production decision reads it | Owner and port | What the model bounds (jobs, holds, views) plus one preparation | Each entry ends with the work it describes (a job's report, the owner's safe point, a borrow's release, a view's clearing); the owner's terminal step empties the owner's |
@@ -282,6 +290,69 @@ arena's closure until released, and grants no authority: it cannot make a reques
 publish. Unknown detail is distinct from air (`NotHeld`, `Unloaded`, `Known`). The
 borrow is released on every exit.
 
+### Regional snapshots
+
+`requestRegionSnapshot svc lease regions` (`regionsWith` on the settlement seam) asks for an immutable
+terrain-and-knowledge copy of at most `specHoldRegions` whole regions (16 × 16 × 32), resident or not.
+It is admitted at once or refused, creating nothing: `RefusedInvalid` for an empty set, a duplicate
+region, a region of unsupported coordinates or more than `specHoldRegions` regions; `RefusedBusy
+BusyRetained` when the retained bank cannot make its reservation; the usual authority and closure
+refusals. The configured extent bounds what a request may touch, not what a copy describes: under a
+reduced extent the copy still answers every cell, and a cell outside the extent holds the source (no
+removal can land there).
+
+**The value** (`RegionSnapshot`, abstract, accessors only): the arena incarnation; the content and
+knowledge revisions of the one committed version it was read from; the residency generation read in the
+transaction that pinned that version; the incarnation's immutable source (shared, never copied: the
+incarnation is its identity); and for each held region two parts, each `PartReady` or `PartUnavailable`
+(`PartNotHeld` for a region not held):
+
+* terrain (`regionTerrain`): the removed intervals of its 256 columns, clipped to its 32 levels. With the
+  source they answer every cell, as `cellAt` does at the copy's content revision, and
+  `changesFromIntervals` turns them into `Changes`;
+* knowledge (`regionKnowledge`): what #661 knows of every cell (`queryCell`, as `knowledgeAt` answers at
+  the copy's knowledge revision) as compressed column runs; a uniform region is one class of one run.
+
+`regionCell` and `regionCellKnowledge` answer one cell. Both parts are packed, so what a copy holds grows
+with a region's intervals and knowledge runs, never with its cells (`regionSnapshotFootprint`: a 128-byte
+record and, per region, a 200-byte entry and each part's short byte string, 16 bytes and the payload
+rounded to a word). A copy holds no store reader, pin, page or window, and grants no authority: no
+request, removal, precondition or settlement accepts it.
+
+**The build** (owner) is a pinned read like any other: the gather table, a reader pin and its credit,
+the per-arena reader cap, the fairness kind, the storage-queue and grant-yield rules. It keeps ONE pin
+for the whole build; the revisions and the generation it is labelled with are taken in the transaction
+that pins it. Region by region, each from a fresh window on that pin, it reads the runs of the region's
+256 columns and of the 64 beside it over its levels and one beyond each end, plans with the discovery
+package's region query, evaluates `queryCell` at the plan's tiles and assembles the runs; only the
+requested regions are copied. A quantum is at most 16 steps (a ranged read or an evaluation) and ends at
+any wait and at the end of a region; the owner then serves its other ready work. The copy settles
+labelled with the pinned version's identities and is never recomputed: a version committed during the
+build is wholly excluded, and staleness is the consumer's to judge. A page that has not arrived keeps the
+request pending. A page that fails or reads back invalid makes unavailable every part that needed it, is
+recorded as any failed read's pause (`storage_io`, `storage_integrity`) and is never read again by the
+build, so every part that depends on it is unavailable and parts established without it stay usable; the
+request still settles with the copy. Pressure keeps the build and starts the interrupted read again once
+it has changed. A copy discovers nothing, materializes nothing and changes no residency, recency or
+revision.
+
+**Its charge**, from admission: a command slot and the request's record (160 bytes), like any request; a
+copied hold in the model (`Copied`: hold records on the camera's share of staging; no residency,
+protection or recency); and, in the snapshot backing bank (`configRetainedBytes`), a reservation of the
+most the result can hold (`regionSnapshotReservation`: the record, 25,840 bytes a region, and one
+region's build scratch, 747,520 bytes). In the settlement transaction the charge becomes the copy's exact
+footprint, kept until the release. The borrow counts among the borrowers service closure waits for.
+`inspectRegionalSTM` reports each borrow's reservation and footprint apart.
+
+| State of the borrow | Its owner | Released by |
+| --- | --- | --- |
+| Pending: admitted, building or staged | its request | the request's end (cancellation, lease release, client end, arena or service closure): at once, or, while its build has a read in flight, once the build has drained; the outcome is decided at once |
+| Settled, not taken | the service | `retire`, the client's end, the arena's or the service's closure (a holder's `releaseRegionBorrow` takes and releases it) |
+| Taken (`await`, `takeSTM`, `withRegionSnapshot`) | the holder | `releaseRegionBorrow` or the scope's exit, only: no retirement, client end or closure releases it, and its arena stays retiring until then |
+
+A release is idempotent: the borrow is found and released once, in one place (`releaseRegionalSTM`),
+whichever path finds it first.
+
 ## Closure and shutdown
 
 Closure order: close admission first, withdraw demand, settle or cancel pending
@@ -406,6 +477,8 @@ the stores only after the borrowers finish.
 | Invalid source definition | `Definition` (settled), no name claimed |
 | Column answer over 1,024 runs | `TooLarge` (settled), never truncated |
 | Column range over 8,192 levels (refused in constant time, before any region is enumerated), a name that is empty or over 256 characters, a borrow naming more regions than a hold may, coordinates outside the extent | `RefusedInvalid` before admission |
+| A regional snapshot naming no region, a region twice, a region of unsupported coordinates or more regions than a hold may | `RefusedInvalid` before admission |
+| A page a regional snapshot's build needs fails or reads back invalid | The parts that needed it `PartUnavailable` (never air, fog or the source), the arena paused for the cause as for any read, the snapshot settled; other regions unaffected |
 | Forged, foreign, released or wrong-service authority | `RefusedAuthority` before admission |
 | Bank, slot, arena, lease or view cap | `RefusedBusy`, nothing created |
 | An identity, or a content, knowledge or store revision, that would wrap | `RefusedExhausted` before admission; internal work whose next commit would wrap stops |
@@ -439,7 +512,8 @@ for four arenas, and a configuration it cannot hold is refused. A source the com
 accepted before can now be refused at that bound: a column of 1,024 one-level patches two
 levels apart compiles to 16,777,224 bytes and is `source_complexity`.
 The service adds the approved caps of four arenas, 64 arena leases and eight views,
-a snapshot backing bank carved from the staging bank (see Snapshots),
+a snapshot backing bank carved from the staging bank (see Snapshots; a regional snapshot names at most
+`specHoldRegions` regions and is charged there too),
 and uses the source (256 KiB, 8,192 authored runs) and query (1,024 runs, 8,192
 levels) limits of `hetoimasia-terrain`. All are configurable through `Config`
 within the model's minimum-budget rule.
@@ -458,8 +532,8 @@ requires the two to agree and the count never to exceed the limit.
 | Arena leases (64) | every lease record, live or revoked, until it is released; pending opens and attaches | `leasesInUse` |
 | Views (eight) | open views, until closed or their client ends | `Map.size stateViews` |
 | Clients (256) | registered clients, until `endClient` | `Map.size stateClients` |
-| Command slots | the model's accepted commands; untaken results; pending opens and attaches; reads and removals waiting to be admitted again; every ghost (a request withdrawn while its preparation runs) | `slotsHeldHere` with the model |
-| Retained bank | outstanding snapshots' backing; one result record per request, from admission to take, including ghosts | `retainedBankUse` |
+| Command slots | the model's accepted commands; untaken results; pending opens and attaches; pending regional snapshots; reads and removals waiting to be admitted again; every ghost (a request withdrawn while its preparation runs) | `slotsHeldHere` with the model |
+| Retained bank | outstanding snapshots' backing; regional snapshots' reservations, then footprints, to their release; one result record per request, from admission to take, including ghosts | `retainedBankUse` |
 | Resident, edit and staging banks, holds, jobs | the residency model's own accounting, whose records (live or retiring arenas, ghosts, running preparations) stay charged until released at the owner's safe point | the model's `chargeCheck` and invariants |
 
 The enumeration reads the model's arenas, each client's lease and view sets, and the
@@ -492,6 +566,7 @@ count against the entities that hold it (retiring arenas included).
 | Load job | `Dispatch` | The model's job record and slot | `JobCompleted` (published or discarded), `JobFailed`, or `JobAcknowledged` after its interests are gone | Budgets ("safe point"), Closure |
 | Victim | An admission's eviction set | The victim queue and the model | The owner discards the detail, then `VictimReleased` | Offload, Budgets |
 | Snapshot hold | `AcquireHold` | The model's hold, the borrower count and the snapshot backing ledger | `ReleaseHold` on every exit of `withSnapshot`; closure waits for zero | Budgets (snapshot), Lifecycle (borrower) |
+| Regional borrow (copied hold, reservation then footprint, borrower) | `SubRegions` in the admission transaction | The model's copied hold, `stateRegional`, the borrower count | `releaseRegionalSTM`, by the owner of the moment (see [Regional snapshots](#regional-snapshots)); closure waits for zero | Regional |
 | Defect | Detection | The bounded defect record | Never; read by inspection | Races, Lifecycle |
 
 ## Tests
@@ -2421,6 +2496,14 @@ run anywhere else. The storage examples hold the class of defect, not the instan
   timers in the storage examples are the two bounded polls (50 ms, at most 200) in the probe's `ProbeSpec` for
   APFS's lazy reclamation of freed space, a positive wait for a volume figure; the probe reads free space only
   through a descriptor it opened before anything was allocated, never by creating a file.
+
+## The test seam library
+
+`library testing` (`Hetoimasia.Terrain.Runtime.Testing`, public, for test suites only) builds a `StoragePort` with a seam of a test's
+own (`storagePortWithSeam`): hooks the storage workers run immediately before and after each native call, over an adapter whose answers
+a test may replace. The service, its owner and the storage backend are the production ones; an application uses `storagePort`. Only
+`lua-engine-tests` depends on it (TRA-23's Lua examples inject faults and causal gates through it); this package's own suite reaches
+the seam directly.
 
 ## Consumers
 

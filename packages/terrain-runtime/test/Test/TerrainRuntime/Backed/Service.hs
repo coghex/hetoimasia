@@ -617,6 +617,38 @@ spec = describe "The backed terrain service" $ do
       inspectBacked svc >>= (`shouldBe` [])
       settleChecks svc
 
+  describe "an open's own allowance (openArenaWithOptions)" $ do
+    let mib = 1024 * 1024 ∷ Integer
+        openWith svc client name bytes = openArenaOptions svc client name soilOverStone (OpenOptions bytes)
+    it "takes the service's own allowance when none is named, and reserves a named minimum or larger one exactly" $
+      withProbedService defaultConfig $ \probe svc → do
+        -- the production configuration's own allowance is the 1 GiB default; this service's is its configured 64 MiB
+        specAllowanceBytes (configStore defaultConfig) `shouldBe` 1024 * mib
+        client ← okOf (registerClient svc)
+        forM_ [("own", Nothing, 64 * mib), ("minimum", Just (64 * mib), 64 * mib), ("larger", Just (96 * mib), 96 * mib)] $ \(name, asked, expected) → do
+          H.clearEvents probe
+          lease ← okOf (openWith svc client name asked) >>= await svc >>= expectSuccess
+          status ← arenaStatus svc lease >>= expectRight
+          toInteger (statusReservedBytes status) `shouldBe` expected
+          -- the reservation the backend made is the arena's allowance and nothing else
+          reserved ← (\seen → [len | OpReserveRange _ len ← seen]) <$> H.events probe
+          toInteger (sum reserved) `shouldSatisfy` (\n → n > 0 && n <= expected)
+          releaseLease svc lease >>= (`shouldBe` Right ())
+        settleChecks svc
+
+    it "refuses an allowance below the minimum, not a whole number of MiB, or past the offset limit before admission, with nothing opened or claimed" $
+      withProbedService defaultConfig {configStore = (configStore defaultConfig) {specAllowanceBytes = 64 * mib, specOffsetLimit = 128 * mib}} $ \probe svc → do
+        client ← okOf (registerClient svc)
+        H.clearEvents probe
+        forM_ [63 * mib, 64 * mib + 1, 64 * mib + 4096, 129 * mib, 2 ^ (63 ∷ Int), 0, -1] $ \bytes → do
+          refused ← openWith svc client "main" (Just bytes)
+          refusedWith refused `shouldSatisfy` \case Just (RefusedInvalid _) → True; _ → False
+        -- no request, no name claim, no file: the name is free, and the backend made no native call
+        H.events probe >>= (`shouldBe` [])
+        (fmap censusRequests . atomically . inspectCensusSTM) svc >>= (`shouldSatisfy` null)
+        _ ← okOf (openWith svc client "main" (Just (128 * mib))) >>= await svc >>= expectSuccess
+        settleChecks svc
+
   it "opens an arena of a configured larger allowance and reserves it" $
     withProbedService defaultConfig {configStore = defaultStoreSpec {specAllowanceBytes = 2 * toInteger minAllowanceBytes}} $ \_ svc → do
       (_, lease) ← openMain svc "main"

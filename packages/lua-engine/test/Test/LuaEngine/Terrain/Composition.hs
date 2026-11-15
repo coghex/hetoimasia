@@ -110,8 +110,34 @@ both =
         ]
     }
 
+-- | What a VM's facade offers of terrain, including the storage calls (TRA-23).
+namespace ∷ Script
+namespace =
+  script
+    { scInit =
+        [ "local t = api.terrain"
+        , "print('terrain', t ~= nil, t ~= nil and type(t.status), t ~= nil and type(t.grow_storage), t ~= nil and type(t.retry_storage), t ~= nil and type(t.open))"
+        ]
+    }
+
 coexist ∷ Spec
-coexist = describe "Terrain with graphics in one VM" $
+coexist = describe "Terrain with graphics in one VM" $ do
+  it "offers the storage calls exactly when terrain is injected: none without terrain or with graphics alone, all with terrain alone or beside graphics" $ do
+    let without = "terrain\tfalse\tfalse\tfalse\tfalse\tfalse"
+        with = "terrain\ttrue\tfunction\tfunction\tfunction\tfunction"
+    withOne Presentation fixedM1Profile namespace $ \world _ _ _ → outLines world `shouldReturn` [without]
+    gx ← newGfx
+    withOneGraphics (injection gx) Presentation namespace [] (\world _ _ _ → outLines world `shouldReturn` [without]) `finally` finishAll gx
+    withRig $ \rig →
+      withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource namespace)]) $ \world _ runtime →
+        withFvm world runtime (presentationOver rig) $ \fvm → spawn world fvm "modules-test" mainPath >> (outLines world `shouldReturn` [with])
+    gx' ← newGfx
+    ( withRig $ \rig →
+        withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource namespace)]) $ \world _ runtime →
+          withFvm world runtime ((presentationOver rig) {shGraphics = Just (injection gx')}) $ \fvm → spawn world fvm "modules-test" mainPath >> (outLines world `shouldReturn` [with])
+      )
+      `finally` finishAll gx'
+
   it "holds a texture and an arena in the one shared scope, and releases each without disturbing the other" $
     withRig $ \rig → do
       gx ← newGfx

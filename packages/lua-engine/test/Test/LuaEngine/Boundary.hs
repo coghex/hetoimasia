@@ -474,6 +474,8 @@ spec = describe "the package and import boundary" $ do
                  , "Hetoimasia.Terrain.Residency"
                  , "Hetoimasia.Terrain.Runtime"
                  , "Hetoimasia.Terrain.Runtime.Settlement"
+                 , -- the store's public allowance rules, which an open's and a growth's sizes are checked by (TRA-23)
+                   "Hetoimasia.Terrain.Runtime.Store"
                  , "Hetoimasia.LuaEngine.Terrain.Internal.Arbitration"
                  , "Hetoimasia.Terrain.Shape"
                  , "Hetoimasia.Terrain.Source"
@@ -592,6 +594,8 @@ spec = describe "the package and import boundary" $ do
                -- allowance (#665's explicit storage inputs)
                , "Hetoimasia.Terrain.Runtime.Storage"
                , "Hetoimasia.Terrain.Runtime.Store"
+               , -- the terrain runtime's test-only seam library: the storage examples (TRA-23) inject native faults through it
+                 "Hetoimasia.Terrain.Runtime.Testing"
                , "Hetoimasia.LuaEngine.Terrain.Internal.Arbitration"
                , "Hetoimasia.Terrain.Source"
                , "Hetoimasia.Asset.Image"
