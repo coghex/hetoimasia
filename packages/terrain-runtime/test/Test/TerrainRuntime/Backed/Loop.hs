@@ -15,7 +15,7 @@
 --   images the job holds) stays reserved while the job is in flight.
 module Test.TerrainRuntime.Backed.Loop (spec, fullSpec) where
 
-import Control.Concurrent (forkIO, myThreadId, throwTo)
+import Control.Concurrent (myThreadId, throwTo)
 import Control.Concurrent.STM
 import Control.Exception (Exception, SomeException, fromException, try)
 import Control.Exception (finally)
@@ -32,6 +32,7 @@ import Hetoimasia.Terrain.Runtime.Storage.Internal.Native (NativeOp (..))
 import qualified Hetoimasia.Terrain.Runtime.Store.Internal.Admission as A
 import Test.Hspec
 import Test.Support.Bounded (bounded)
+import Test.Support.Owned (withOwnedThread)
 import Test.TerrainRuntime.Fixtures
 import qualified Test.TerrainRuntime.Storage.Harness as H
 
@@ -147,20 +148,21 @@ spec = describe "The owner's loop" $ do
        -- the owner is between the write's submission and the record of its ticket
        waitFor (takeTMVar atStep)
        tid ← atomically (readTMVar owner)
-       sent ← newEmptyTMVarIO
-       void (forkIO (throwTo tid Sent >> atomically (putTMVar sent ())))
-       atomically (putTMVar release ())
-       bounded (awaitOwnerStopped svc)
-       atomically (takeTMVar sent)
-       -- the owner ended with the write's job recorded: its slot and the slot's credit are kept while
-       -- the job is in flight
-       ledger ← atomically (inspectEditBankSTM svc)
-       A.lgStagingForeground ledger `shouldSatisfy` (> 0)
-       jobs ← atomically (inspectStorageJobsSTM svc)
-       jobs `shouldSatisfy` (> 0)
-       -- the request settled once, by the owner's end
-       waitFor (readTVar (hostSettled host) >>= \s → check (not (null s)))
-       length <$> settledOf host `shouldReturn` 1
+       -- the exception is sent from a thread of the example's own: throwTo waits until the owner can take
+       -- it, and every exit of the scope stops and joins that thread
+       withOwnedThread (throwTo tid Sent) $ \_ sent → do
+        atomically (putTMVar release ())
+        bounded (awaitOwnerStopped svc)
+        bounded sent
+        -- the owner ended with the write's job recorded: its slot and the slot's credit are kept while
+        -- the job is in flight
+        ledger ← atomically (inspectEditBankSTM svc)
+        A.lgStagingForeground ledger `shouldSatisfy` (> 0)
+        jobs ← atomically (inspectStorageJobsSTM svc)
+        jobs `shouldSatisfy` (> 0)
+        -- the request settled once, by the owner's end
+        waitFor (readTVar (hostSettled host) >>= \s → check (not (null s)))
+        length <$> settledOf host `shouldReturn` 1
     case ended of
       Left (failure ∷ SomeException)
         | Just Sent <- fromException failure → pure ()
