@@ -62,6 +62,7 @@ module Hetoimasia.Terrain.Runtime.Internal.Core
   , cancelRequest
   , retireRequest
   , takeRequest
+  , TakeOutcome (..)
 
     -- * Closure
   , closeArena
@@ -783,15 +784,16 @@ releaseReq svc rid req = do
   markFreed svc
 
 -- | A regional snapshot's request has left the table. A borrow its request still owns (pending, or a
--- result nobody took) is the service's to release: now, or, while its build still holds what it read,
--- when the build drains. A borrow its holder took is the holder's, and nothing here releases it.
+-- result nobody took) is the service's to release: now, or, while its build still holds what it read or
+-- the owner is turning its copies into a snapshot, at the owner's safe point (the build drained, the
+-- delivery ended). A borrow its holder took is the holder's, and nothing here releases it.
 regionalRequestEnded ∷ Service → RequestId → HoldId → STM ()
 regionalRequestEnded svc rid hid = do
   st <- readSt svc
   forM_ (Map.lookup hid (stateRegional st)) $ \rec → case regionalOwner rec of
     OwnedByRequest owner
       | owner == rid →
-          if Map.member (GatherRequest rid) (stateGathers st)
+          if Map.member (GatherRequest rid) (stateGathers st) || Set.member rid (stateDelivering st)
             then modifySt svc (\s → s {stateRegional = Map.insert hid rec {regionalOwner = Orphaned rid} (stateRegional s)})
             else releaseRegionalSTM svc hid
     _ → pure ()
@@ -830,7 +832,8 @@ releaseRegionBorrowSTM svc (RegionBorrow tag hid _)
               releaseReq svc rid req
         _ → pure ()
 
--- | A request's build has drained: a borrow whose request ended while it ran is released now.
+-- | A request's build has drained, or its delivery ended: a borrow whose request ended while either ran
+-- is released now.
 releaseOrphanedSTM ∷ Service → RequestId → STM ()
 releaseOrphanedSTM svc rid = do
   st <- readSt svc
@@ -990,26 +993,45 @@ cancelRequest svc (Request tag rid)
 -- | Retire a settled request's accepted result: its credits return. A regional snapshot nobody took is
 -- the service's, and is released with it.
 retireRequest ∷ Service → Request → STM ()
-retireRequest = retireWith False
 
--- | Retire a settled request's accepted result and take what it hands over: a regional snapshot's
--- borrow moves from the service to the holder in this one transaction, and from then on only the holder
--- releases it (no retirement, client end or closure can release it behind the holder). For any other
--- result it is 'retireRequest'.
-takeRequest ∷ Service → Request → STM ()
-takeRequest = retireWith True
-
-retireWith ∷ Bool → Service → Request → STM ()
-retireWith taking svc (Request tag rid)
+retireRequest svc (Request tag rid)
   | tag /= serviceTag svc = pure ()
   | otherwise = do
       st <- readSt svc
-      forM_ (Map.lookup rid (stateRequests st)) $ \req → when (isDone req) $ do
-        case reqCmd req of
-          CRegions _ hid
-            | taking → modifySt svc (\s → s {stateRegional = Map.adjust (\r → if regionalOwner r == OwnedByRequest rid then r {regionalOwner = OwnedByHolder} else r) hid (stateRegional s)})
-          _ → pure ()
-        releaseReq svc rid req
+      forM_ (Map.lookup rid (stateRequests st)) $ \req → when (isDone req) (releaseReq svc rid req)
+
+-- | What a take handed over.
+data TakeOutcome
+  = -- | The request was settled and still the service's: its result is retired, and what it hands over (a
+    -- regional snapshot's borrow) is the taker's from this transaction on.
+    Taken
+  | -- | Nothing was handed over: the request is not settled, or no longer the service's (taken already,
+    -- retired, or released with its lease, its client, its arena or the service).
+    TakeReleased
+  deriving stock (Eq, Show)
+
+-- | Retire a settled request's accepted result and take what it hands over, checking in this one
+-- transaction that the request still owns it: a regional snapshot's borrow moves from the service to the
+-- holder only while the request owns it, and from then on only the holder releases it (no retirement,
+-- client end or closure can release it behind the holder). A borrow already released is never handed
+-- over ('TakeReleased'). For any other settled result it is 'retireRequest' and answers 'Taken'.
+takeRequest ∷ Service → Request → STM TakeOutcome
+takeRequest svc (Request tag rid)
+  | tag /= serviceTag svc = pure TakeReleased
+  | otherwise = do
+      st <- readSt svc
+      case Map.lookup rid (stateRequests st) of
+        Just req | isDone req → do
+          outcome <- case reqCmd req of
+            CRegions _ hid → case Map.lookup hid (stateRegional st) of
+              Just r | regionalOwner r == OwnedByRequest rid → do
+                modifySt svc (\s → s {stateRegional = Map.insert hid r {regionalOwner = OwnedByHolder} (stateRegional s)})
+                pure Taken
+              _ → pure TakeReleased
+            _ → pure Taken
+          releaseReq svc rid req
+          pure outcome
+        _ → pure TakeReleased
 
 -- ---------------------------------------------------------------------------
 -- Closure
@@ -1322,7 +1344,7 @@ invariants config st =
        | (hid, rec) <- Map.toList (stateRegional st)
        , case regionalOwner rec of
            OwnedByRequest rid → maybe True (\req → case reqCmd req of CRegions _ h → h /= hid; _ → True) (Map.lookup rid (stateRequests st))
-           Orphaned rid → Map.member rid (stateRequests st) || not (Map.member (GatherRequest rid) (stateGathers st))
+           Orphaned rid → Map.member rid (stateRequests st) || not (Map.member (GatherRequest rid) (stateGathers st) || Set.member rid (stateDelivering st))
            OwnedByHolder → isNothing (regionalFootprint rec)
        ]
   where

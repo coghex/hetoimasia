@@ -70,6 +70,9 @@ spec = describe "Regional snapshots" $ do
   pressureSpec
   buildPressureSpec
   retentionSpec
+  settlementChargeSpec
+  takeSpec
+  deliverySpec
   failureSpec
   ownershipSpec
   admissionSpec
@@ -182,20 +185,20 @@ settled svc lease = waitFor $ do
 -- | The borrows an example has taken: each is released when the example exits, however it exits (a
 -- release is idempotent), so a failed expectation fails its example instead of leaving a borrow that
 -- keeps its service's drain waiting. Each example has its own.
-data Taken = Taken !Service !(IORef [RegionBorrow])
+data Borrows = Borrows !Service !(IORef [RegionBorrow])
 
-guarded ∷ Service → (Taken → IO a) → IO a
+guarded ∷ Service → (Borrows → IO a) → IO a
 guarded svc body = do
   ref ← newIORef []
-  body (Taken svc ref) `finally` (readIORef ref >>= mapM_ (releaseRegionBorrow svc))
+  body (Borrows svc ref) `finally` (readIORef ref >>= mapM_ (releaseRegionBorrow svc))
 
 -- | Record a borrow the example has taken.
-keep ∷ Taken → RegionBorrow → IO RegionBorrow
-keep (Taken _ ref) borrow = borrow <$ atomicModifyIORef' ref (\bs → (borrow : bs, ()))
+keep ∷ Borrows → RegionBorrow → IO RegionBorrow
+keep (Borrows _ ref) borrow = borrow <$ atomicModifyIORef' ref (\bs → (borrow : bs, ()))
 
 -- | Request a snapshot, wait for it and take its borrow.
-borrowOf ∷ Taken → ArenaLease → [RegionCoord] → IO RegionBorrow
-borrowOf taken@(Taken svc _) lease regions = okOf (requestRegionSnapshot svc lease regions) >>= await svc >>= expectSuccess >>= keep taken
+borrowOf ∷ Borrows → ArenaLease → [RegionCoord] → IO RegionBorrow
+borrowOf taken@(Borrows svc _) lease regions = okOf (requestRegionSnapshot svc lease regions) >>= await svc >>= expectSuccess >>= keep taken
 
 -- | A host's one settlement, once it has one.
 settlementOf ∷ Host → IO Settlement
@@ -630,7 +633,7 @@ coherenceSpec = describe "coherence" $ do
       (content > pinnedContent, knowledge > pinnedKnowledge) `shouldBe` (True, True)
       grant host
       borrow ← settlementOf host >>= borrowIn >>= keep taken
-      atomically (takeSTM svc request)
+      atomically (takeSTM svc request) >>= (`shouldBe` Taken)
       let snapshot = regionBorrowSnapshot borrow
       (regionSnapshotContentRevision snapshot, regionSnapshotKnowledgeRevision snapshot, regionSnapshotGeneration snapshot)
         `shouldBe` (pinnedContent, pinnedKnowledge, fromIntegral pinnedGeneration)
@@ -753,7 +756,7 @@ fairnessSpec =
         -- the snapshot's host is eligible only now: the removal committed before it settled
         grant snapshotHost
         borrow ← settlementOf snapshotHost >>= borrowIn >>= keep taken
-        atomically (takeSTM svc request)
+        atomically (takeSTM svc request) >>= (`shouldBe` Taken)
         points ← reverse <$> readIORef logged
         let afterHeld = drop heldAt points
             isGrant = \case PointGranted (Just _) _ → True; _ → False
@@ -783,7 +786,7 @@ pendingSpec = describe "a page that has not arrived" $ do
         map regionalChargeFootprint <$> atomically (inspectRegionalSTM svc) >>= (`shouldBe` [Nothing])
         H.openGate held'
         borrow ← settlementOf host >>= borrowIn >>= keep taken
-        atomically (takeSTM svc request)
+        atomically (takeSTM svc request) >>= (`shouldBe` Taken)
         expectationMismatches (ground []) [(88, 88, -16)] (regionBorrowSnapshot borrow) `shouldBe` []
         releaseRegionBorrow svc borrow
       settleChecks svc
@@ -833,7 +836,7 @@ pressureSpec =
         inspectDefects svc >>= (`shouldBe` [])
         H.openGate gate
         borrow ← settlementOf host >>= borrowIn >>= keep taken
-        atomically (takeSTM svc request)
+        atomically (takeSTM svc request) >>= (`shouldBe` Taken)
         expectationMismatches (ground []) [(88, 88, -16)] (regionBorrowSnapshot borrow) `shouldBe` []
         releaseRegionBorrow svc borrow
         pure fillers
@@ -1221,6 +1224,135 @@ ownershipSpec = describe "ownership" $ do
       refused ← requestRegionSnapshot svc lease [region 5 5 (-1)]
       refusedWith refused `shouldBe` Just (RefusedBusy BusyRetained)
       accountsOf svc >>= (`shouldBe` before)
+      settleChecks svc
+
+-- | The charge a settled result holds while nobody has taken it: its exact footprint, apart from its
+-- request's record, so the headroom the reservation gave back admits another request at once.
+settlementChargeSpec ∷ Spec
+settlementChargeSpec =
+  it "charges a settled result nobody took its exact footprint and its request's record apart, and the headroom it gave back admits another" $ do
+    let record = 160
+        reservation = regionSnapshotReservation 1
+    -- what an arena over the definition holds of the retained bank, measured on a service of its own
+    base ← withService defaultConfig $ \svc → do
+      _ ← openWith svc (ground []) []
+      (\(use, _, _, _) → use) <$> accountsOf svc
+    -- room for one reservation and its record beside one settled result, never for two reservations
+    withService defaultConfig {configRetainedBytes = base + 2 * (reservation + record) - 1} $ \svc → guarded svc $ \taken → do
+      (_, lease) ← openWith svc (ground []) []
+      accountsOf svc >>= \(use, _, _, _) → use `shouldBe` base
+      host ← newHost True
+      first ← okOf (regionsWith svc (hostEndpoint svc Nothing host) lease [region 5 5 (-1)])
+      -- while the first is built, a second reservation does not fit
+      refusedWith <$> requestRegionSnapshot svc lease [region 5 5 (-1)] >>= (`shouldBe` Just (RefusedBusy BusyRetained))
+      -- settled and NOT taken: its footprint and its request's record, each counted once
+      borrow ← settlementOf host >>= borrowIn
+      let footprint = regionSnapshotFootprint (regionBorrowSnapshot borrow)
+      footprint `shouldSatisfy` (< reservation)
+      map (\c → (regionalChargeFootprint c, regionalChargeTaken c)) <$> atomically (inspectRegionalSTM svc) >>= (`shouldBe` [(Just footprint, False)])
+      accountsOf svc >>= \(use, _, rows, _) → do
+        use `shouldBe` base + footprint + record
+        [(counted, held') | (name, counted, held') ← rows, name == "retained bank"] `shouldBe` [(use, use)]
+      -- the headroom the reservation gave back admits a second request at once
+      second ← okOf (requestRegionSnapshot svc lease [region 5 5 (-1)])
+      accountsOf svc >>= \(use, _, _, _) → use `shouldBe` base + footprint + record + reservation + record
+      -- the first is taken: its record returns, its footprint moves to its holder
+      atomically (takeSTM svc first) >>= (`shouldBe` Taken)
+      _ ← keep taken borrow
+      map (\c → (regionalChargeFootprint c, regionalChargeTaken c)) . take 1 <$> atomically (inspectRegionalSTM svc) >>= (`shouldBe` [(Just footprint, True)])
+      other ← await svc second >>= expectSuccess >>= keep taken
+      let footprint' = regionSnapshotFootprint (regionBorrowSnapshot other)
+      accountsOf svc >>= \(use, _, _, _) → use `shouldBe` base + footprint + footprint'
+      -- each is released exactly once
+      releaseRegionBorrow svc borrow
+      releaseRegionBorrow svc borrow
+      accountsOf svc >>= \(use, _, _, _) → use `shouldBe` base + footprint'
+      releaseRegionBorrow svc other
+      accountsOf svc >>= \(use, regional, _, holds) → (use, regional, holds) `shouldBe` (base, [], 0)
+      settleChecks svc
+
+-- | The take moves a borrow to its holder only while the request owns it, in one transaction.
+takeSpec ∷ Spec
+takeSpec = describe "the take" $ do
+  it "answers Cancelled, never a released borrow, when the result was given up before the take" $
+    withService defaultConfig $ \svc → guarded svc $ \_ → do
+      let settledUntaken lease = do
+            pending ← okOf (requestRegionSnapshot svc lease [region 5 5 (-1)])
+            waitFor (map regionalChargeFootprint <$> inspectRegionalSTM svc >>= check . all isJust)
+            map regionalChargeTaken <$> atomically (inspectRegionalSTM svc) >>= (`shouldBe` [False])
+            pure pending
+          givenUp = do
+            atomically (inspectRegionalSTM svc) >>= (`shouldBe` [])
+            accountsOf svc >>= \(_, regional, _, holds) → (regional, holds) `shouldBe` ([], 0)
+      -- retired
+      (_, lease) ← openWith svc (ground []) []
+      retired ← settledUntaken lease
+      retire svc (pendingRequest retired)
+      givenUp
+      await svc retired >>= (`shouldBe` Left Cancelled)
+      -- its arena closed (the creator's last lease released)
+      closed ← settledUntaken lease
+      _ ← releaseLease svc lease
+      givenUp
+      await svc closed >>= (`shouldBe` Left Cancelled)
+      -- its client ended
+      (client, lease') ← openWith svc (ground []) []
+      ended ← settledUntaken lease'
+      endClient svc client
+      givenUp
+      await svc ended >>= (`shouldBe` Left Cancelled)
+      givenUp
+      settleChecks svc
+
+  it "takes the borrow or nothing when the arena closes in the take's own transaction" $
+    withService defaultConfig $ \svc → guarded svc $ \taken → do
+      let settled' lease = do
+            host ← newHost True
+            request ← okOf (regionsWith svc (hostEndpoint svc Nothing host) lease [region 5 5 (-1)])
+            borrow ← settlementOf host >>= borrowIn
+            pure (request, borrow)
+      -- the closure first: nothing is handed over, and the borrow is released once
+      (_, before) ← openWith svc (ground []) []
+      (request, _) ← settled' before
+      atomically (releaseArenaLeaseSTM svc before >>= either (error . show) pure >> takeSTM svc request) >>= (`shouldBe` TakeReleased)
+      atomically (inspectRegionalSTM svc) >>= (`shouldBe` [])
+      atomically (takeSTM svc request) >>= (`shouldBe` TakeReleased)
+      -- the take first: the borrow is the holder's, and the closure in the same transaction leaves it charged
+      (_, after) ← openWith svc (ground []) []
+      (request', borrow') ← settled' after
+      atomically (takeSTM svc request' <* (releaseArenaLeaseSTM svc after >>= either (error . show) pure)) >>= (`shouldBe` Taken)
+      _ ← keep taken borrow'
+      map regionalChargeTaken <$> atomically (inspectRegionalSTM svc) >>= (`shouldBe` [True])
+      releaseRegionBorrow svc borrow'
+      atomically (inspectRegionalSTM svc) >>= (`shouldBe` [])
+      settleChecks svc
+
+-- | A request that ends while the owner turns its build's copies into a snapshot leaves its borrow charged
+-- until the owner's safe point.
+deliverySpec ∷ Spec
+deliverySpec =
+  it "keeps the reservation of a request cancelled while its copies are delivered until the delivery ends" $ do
+    gate ← newDisarmedGate
+    let delivering = \case PointGathered {} → True; _ → False
+    withGatedServiceUsing (gatedProbe delivering gate) gate $ \svc → guarded svc $ \_ → do
+      (_, lease) ← openWith svc (ground []) []
+      (base, _, _, _) ← accountsOf svc
+      armGate gate
+      pending ← okOf (requestRegionSnapshot svc lease [region 5 5 (-1)])
+      -- the build has ended and the owner holds its copies, before it builds the snapshot
+      awaitReached gate
+      cancelPending svc pending >>= (`shouldBe` CancelWon)
+      -- the owner still holds the copies: the reservation stays charged, the request's record does not
+      map (\c → (regionalChargeReserved c, regionalChargeFootprint c, regionalChargeTaken c)) <$> atomically (inspectRegionalSTM svc)
+        >>= (`shouldBe` [(regionSnapshotReservation 1, Nothing, False)])
+      accountsOf svc >>= \(use, _, _, _) → use `shouldBe` base + regionSnapshotReservation 1
+      inspectInvariants svc >>= (`shouldBe` [])
+      disarmGate gate
+      openGate gate
+      await svc pending >>= (`shouldBe` Left Cancelled)
+      -- the delivery has ended: released once, nothing staged for the cancelled request
+      waitFor (null <$> inspectRegionalSTM svc >>= check)
+      accountsOf svc >>= \(use, regional, _, holds) → (use, regional, holds) `shouldBe` (base, [], 0)
       settleChecks svc
 
 -- ---------------------------------------------------------------------------

@@ -80,7 +80,7 @@ module Hetoimasia.Terrain.Runtime.Internal.Backed
   ) where
 
 import Control.Concurrent.STM
-import Control.Exception (Exception, evaluate, uninterruptibleMask_)
+import Control.Exception (Exception, evaluate, finally, uninterruptibleMask_)
 import Control.Monad (foldM, forM_, void, when)
 import Data.Int (Int64)
 import Data.List (sortOn)
@@ -750,19 +750,31 @@ stepGatherTask svc key deliver = do
       case progress of
         Left wake → atomically (modifySt svc (\s → s {stateGathers = Map.adjust (\t → t {gatherRun = run, gatherWake = wake}) key (stateGathers s)}))
         Right result → do
+          -- a build's copies stay the request's until their delivery ends: the owner still holds and computes
+          -- with them while it builds the snapshot, so a request that ends meanwhile leaves its borrow charged
+          -- until then
+          let delivering = case (key, result) of
+                (GatherRequest rid, GatheredRegions {}) → Just rid
+                _ → Nothing
           atomically $ do
             s ← readSt svc
             forM_ (storeOfArena s aid) $ \(current, _) → do
               sameCommittedSTM aid s (release' current run)
               writeTVar (serviceState svc) (putStore aid (release' current run) s) {stateGathers = Map.delete key (stateGathers s)}
             modifyTVar' (serviceEditBank svc) (releaseCredit (gatherGrant task))
-            -- a regional borrow whose request ended while this build ran is released now it has drained
-            case key of
-              GatherRequest rid → releaseOrphanedSTM svc rid
-              GatherJob _ → pure ()
+            -- a regional borrow whose request ended while this build ran is released now it has drained, or
+            -- once its delivery ends
+            case (key, delivering) of
+              (_, Just rid) → modifySt svc (\s' → s' {stateDelivering = Set.insert rid (stateDelivering s')})
+              (GatherRequest rid, Nothing) → releaseOrphanedSTM svc rid
+              (GatherJob _, Nothing) → pure ()
             markFreed svc
-          deliver result
+          deliver result `finally` forM_ delivering (\rid → atomically (endDelivery rid))
   where
+    endDelivery rid = do
+      modifySt svc (\s → s {stateDelivering = Set.delete rid (stateDelivering s)})
+      releaseOrphanedSTM svc rid
+      markFreed svc
     persists conds = \case
       HandlePause c _ → c `elem` conds
       HandlePausedFor c → c `elem` conds

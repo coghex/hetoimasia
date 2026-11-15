@@ -1173,6 +1173,11 @@ data St = St
     stateSnapshots ∷ !(Map HoldId Word64)
   , -- | Each regional snapshot's borrow (#690), from its admission to its release.
     stateRegional ∷ !(Map HoldId RegionalRec)
+  , -- | The regional requests whose copies the owner is turning into a snapshot: from the transaction that
+    -- ends the build to the end of its delivery (the snapshot staged or dropped). Written by the owner
+    -- thread only; read by whatever ends the request (cancellation, retirement, a client's end, a
+    -- closure), which leaves the borrow to the owner while it is here. Emptied when the owner ends.
+    stateDelivering ∷ !(Set RequestId)
   , -- | Something that may free capacity happened since the last retry pass.
     stateFreed ∷ !Bool
   , -- | A dispatch found nothing to run since the last time capacity freed.
@@ -1282,6 +1287,7 @@ initialState config limits =
     , stateBorrowers = 0
     , stateSnapshots = Map.empty
     , stateRegional = Map.empty
+    , stateDelivering = Set.empty
     , stateFreed = False
     , stateDispatchIdle = False
     , stateDefects = []

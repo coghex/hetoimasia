@@ -223,7 +223,7 @@ module Hetoimasia.Terrain.Runtime
 
 import Control.Concurrent.STM
 import Control.Exception (Exception, ExceptionWithContext, SomeException, mask, rethrowIO, throwIO, try, tryWithContext)
-import Control.Monad (when)
+import Control.Monad (void, when)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (isNothing)
 import Data.Text (Text)
@@ -573,13 +573,21 @@ inspectEditBankSTM ∷ Service → STM Ledger
 inspectEditBankSTM svc = ledgers <$> readTVar (serviceEditBank svc)
 
 -- | Wait for a request's terminal outcome and retire its result: the credits an
--- accepted result holds return when it is taken. A regional snapshot's borrow is taken: it is the
--- caller's from then on, charged until 'releaseRegionBorrow'.
+-- accepted result holds return when it is taken. A regional snapshot's borrow is taken in the same
+-- transaction that reads the settlement: it is the caller's from then on, charged until
+-- 'releaseRegionBorrow'. A regional result given up before it was taken (retired, its lease or client
+-- ended, its arena or the service closed) answers 'Cancelled': its borrow was released and is never
+-- returned.
 await ∷ Service → Pending a → IO (Either Settlement a)
-await svc (Pending request box project) = do
-  settlement <- atomically (readTMVar box)
-  atomically (takeSTM svc request)
+await svc pending = atomically (awaitTake svc pending)
+
+-- | The settlement and the take in one transaction (it waits until the request settles).
+awaitTake ∷ Service → Pending a → STM (Either Settlement a)
+awaitTake svc (Pending request box project) = do
+  settlement <- readTMVar box
+  outcome <- takeSTM svc request
   pure $ case settlement of
+    Succeeded (ARegions _) | outcome == TakeReleased → Left Cancelled
     Succeeded answer → maybe (Left (Failed (HostFailure "answer of an unexpected kind"))) Right (project answer)
     other → Left other
 
@@ -646,13 +654,15 @@ releaseRegionBorrow svc borrow = atomically (releaseRegionBorrowSTM svc borrow)
 -- | Borrow a regional snapshot for the body: the request is admitted, its settlement awaited, the borrow
 -- taken and, on every exit of the body, released. An exit while the settlement is awaited cancels the
 -- request, so nothing is left reserved behind it. The body is given the snapshot, or the settlement
--- the request ended with instead.
+-- the request ended with instead ('Cancelled' for a result given up before it was taken, as 'await').
 withRegionSnapshot ∷ Service → ArenaLease → [RegionCoord] → (Either Settlement RegionSnapshot → IO a) → IO (Either Refused a)
 withRegionSnapshot svc lease regions body = mask $ \restore →
   requestRegionSnapshot svc lease regions >>= \case
     Left refused → pure (Left refused)
     Right pending@(Pending request box _) → do
-      settled ← tryWithContext (restore (atomically (readTMVar box)))
+      -- the wait is interruptible; the take is not: it re-reads the settlement and checks that the request
+      -- still owns the borrow in the one masked transaction that moves it to this scope
+      settled ← tryWithContext (restore (atomically (void (readTMVar box))))
       case settled of
         Left (interruption ∷ ExceptionWithContext SomeException) → do
           -- cancellation wins if the request is still unsettled; a result already settled is retired,
@@ -660,16 +670,13 @@ withRegionSnapshot svc lease regions body = mask $ \restore →
           _ ← cancelPending svc pending
           atomically (retireSTM svc request)
           rethrowIO interruption
-        Right settlement → do
-          -- the take: retiring the result moves the borrow to this scope in one transaction
-          atomically (takeSTM svc request)
-          case settlement of
-            Succeeded (ARegions borrow) → do
+        Right () →
+          atomically (awaitTake svc pending) >>= \case
+            Right borrow → do
               outcome ← tryWithContext (restore (body (Right (regionBorrowSnapshot borrow))))
               releaseRegionBorrow svc borrow
               either (\(failure ∷ ExceptionWithContext SomeException) → rethrowIO failure) (pure . Right) outcome
-            Succeeded _ → Right <$> restore (body (Left (Failed (HostFailure "answer of an unexpected kind"))))
-            other → Right <$> restore (body (Left other))
+            Left other → Right <$> restore (body (Left other))
 
 -- | What admission reserves for a regional snapshot of this many regions: its record, the most each
 -- region can hold and one region's build scratch. The charge becomes the snapshot's exact footprint at

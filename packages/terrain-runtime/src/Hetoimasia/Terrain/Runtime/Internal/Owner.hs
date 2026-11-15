@@ -172,8 +172,10 @@ retireBackedSTM svc = do
       , stateOpens = Map.empty
       , stateCompiling = Nothing
       , stateLoadJobs = Map.empty
+      , stateDelivering = Set.empty
       }
-  -- the builds are forgotten: a regional borrow whose request ended while its build ran is released
+  -- the builds and deliveries are forgotten: a regional borrow whose request ended while either ran is
+  -- released
   releaseAllOrphansSTM svc
 
 -- | Whether a slot's run holds a job of the storage service (submitted and not yet taken).

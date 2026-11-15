@@ -37,6 +37,7 @@ module Hetoimasia.Terrain.Runtime.Settlement
   , retire
   , retireSTM
   , takeSTM
+  , TakeOutcome (..)
   , releaseArenaLeaseSTM
   ) where
 
@@ -122,9 +123,13 @@ retireSTM = retireRequest
 
 -- | Retire a settled request's accepted result and take what it hands over, in one transaction: a
 -- regional snapshot's borrow ('Hetoimasia.Terrain.Runtime.requestRegionSnapshot') becomes the host's,
--- charged until the host releases it ('Hetoimasia.Terrain.Runtime.releaseRegionBorrow'). Plain
--- 'retireSTM' releases a borrow nobody took instead. For any other result the two are the same.
-takeSTM ∷ Service → Request → STM ()
+-- charged until the host releases it ('Hetoimasia.Terrain.Runtime.releaseRegionBorrow'), but only while
+-- the request still owns it: a borrow released before the take (the request retired, its lease or client
+-- ended, its arena or the service closed) is never handed over, and the take answers 'TakeReleased'. A host
+-- uses a regional answer only on 'Taken', in the transaction that took it. Plain 'retireSTM' releases a
+-- borrow nobody took instead. For any other settled result the two are the same and the take answers
+-- 'Taken'.
+takeSTM ∷ Service → Request → STM TakeOutcome
 takeSTM = takeRequest
 
 -- | 'Hetoimasia.Terrain.Runtime.releaseLease' as a transaction, for a host that gives a lease back from inside one (the Lua host does, for a
