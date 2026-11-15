@@ -156,8 +156,10 @@ A removal is staged, then committed:
    session's admission, the arena's identity, version and active transaction, the
    request's presence (a cancellation removes it) and the currency of its staging, the
    host's eligibility and a supplied content precondition. If every check holds,
-   publish the next committed root with its checked revisions, rebuild the cell's
-   resident segment over the residency *as it is now*, record `RemovalCommitted` with
+   publish the next committed root with its checked revisions, patch the resident
+   segment holding the cell over the residency *as it is now* (that one cell becomes
+   air, every other cell stays as it was: nothing is re-derived from the runs the
+   removal read, which are only those around its cell), record `RemovalCommitted` with
    nothing retained, delete the request, admit again at the new revision every reader
    that lost its work to the commit, release the transaction's credits and the slot,
    and deliver the success settlement last. Any failure before the host callback leaves
@@ -206,8 +208,10 @@ commit against the names that have settled, so a pending open is invisible to it
 
 Resident detail is a cache; the authority is the immutable source plus the arena's
 store. A commit retains nothing in RAM: its region is a cache again at once. A load job
-pins one committed version and reads the runs of the region's columns through the
-backend (its scratch counts the removed runs those columns can hold), so an evicted region is loaded again from source plus the stored removals and
+pins one committed version and reads the runs of every column it touches over the
+region's loadable extent through the backend, not only its cells (what it makes resident
+merges with the column's resident segments there, which are rebuilt with it); its scratch
+charges what those columns can hold, 320 bytes a column at 32 levels, so an evicted region is loaded again from source plus the stored removals and
 identical terrain is reconstructed across repeated cycles, buried edits, authored gaps
 and deep shafts included, without materializing the cells between. A page that does not
 arrive keeps its read pending; one that arrives damaged is `storage_integrity`; neither is
@@ -532,13 +536,13 @@ transaction of the model event it mirrors, and no production decision reads it:
 
 * **every accepted load job**, from its admission to its report (completed, failed or acknowledged),
   whether it is running, queued or waiting for victims: the resident reservation and the scratch the
-  model **granted** it at that moment (400 and 322 for a one-cell read in a fresh region), so a later
+  model **granted** it at that moment (400 and 578 for a one-cell read in a fresh region), so a later
   reduction while the job still holds them is seen (a stability check of the model against its own grant,
   not an expectation); and, once the owner **runs** it, the **least the job holds**, worked out from the
   coverage the owner is given to load and the data layer's own sizes and not from the model's cost
   functions (a column index entry is 48 bytes, a segment 32 of metadata and at least 2 of payload, the
-  scratch a 256-byte frame, two bytes a cell and the removed runs its columns can hold, a run of 16 and
-  a column entry of 48 for one cell: 82 and 322) together with the load-job slot (1 from its
+  scratch a 256-byte frame, two bytes a cell and the removed runs of every column it touches over the
+  region's 32 levels, 17 runs of 16 and a column entry of 48 for one cell: 82 and 578) together with the load-job slot (1 from its
   dispatch, 0 while it waits: a waiting job holds only a promise, so it contributes no expectation). The
   owner marks a job it runs and ends it with its report, so a model that forgets a running job is seen;
 * the **preparation** the owner is running (a removal's resident growth, 62 bytes, staging, 512, and
@@ -580,8 +584,8 @@ client end, before the owner resumes. The property ends with every bank, occupie
 every slot and every arena at zero: no charge outlives its holder.
 `Test.TerrainRuntime.Oracle` pins the record's literal amounts at a gated job (running and waiting),
 preparation, borrow and view, and holds the controls that must fail: a model that charges the running job
-1 byte of resident and 1 of scratch instead of 400 and 322 (and one byte short of each figure), a waiting job
-whose 400 and 322 were released while another job runs (and one byte short), a job the model forgot while it
+1 byte of resident and 1 of scratch instead of 400 and 578 (and one byte short of each figure), a waiting job
+whose 400 and 578 were released while another job runs (and one byte short), a job the model forgot while it
 runs, a 64-byte handoff duplicate charged that the owner never holds, a preparation whose request the model dropped
 or for which it reserved no growth, a borrow's hold shortened from two regions to one (the staging charge with
 it) or dropped, a view's description shortened or dropped, a model rebuilt without the arena beside the
