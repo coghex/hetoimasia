@@ -575,6 +575,9 @@ waitingReadmission req = case (reqCmd req, reqPhase req) of
   (CAttach {}, _) → False
   (CGrow {}, _) → False
   (CRetry, _) → False
+  -- a regional snapshot is never admitted again: its slot is counted once, as a pending regional request
+  -- ('slotsHeldHere'), from its admission to its settlement
+  (CRegions {}, _) → False
   (_, Waiting) → not (reqModel req)
   _ → False
 

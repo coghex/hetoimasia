@@ -25,7 +25,7 @@ import Hetoimasia.Terrain.Changes (ChangeLimits (..), changesFromIntervals)
 import Hetoimasia.Terrain.Coordinate (RegionCoord (..), axisValue)
 import qualified Hetoimasia.Terrain.Discovery as D
 import qualified Hetoimasia.Terrain.Query as Q
-import Hetoimasia.Terrain.Residency (LimitsSpec (..), Revision (..), mkLimits, modelHolds, modelRegions, regionCoord, regionLastUse)
+import Hetoimasia.Terrain.Residency (BusyReason (..), LimitsSpec (..), Revision (..), Slot (..), mkLimits, modelHolds, modelRegions, regionCoord, regionLastUse)
 import Hetoimasia.Terrain.Runtime
 import Hetoimasia.Terrain.Runtime.Settlement
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Native (NativeOp (..))
@@ -71,6 +71,7 @@ spec = describe "Regional snapshots" $ do
   buildPressureSpec
   retentionSpec
   settlementChargeSpec
+  slotSpec
   takeSpec
   deliverySpec
   failureSpec
@@ -1280,6 +1281,39 @@ settlementChargeSpec =
       accountsOf svc >>= \(use, _, _, _) → use `shouldBe` base + footprint'
       releaseRegionBorrow svc other
       accountsOf svc >>= \(use, regional, _, holds) → (use, regional, holds) `shouldBe` (base, [], 0)
+      settleChecks svc
+
+-- | A pending regional request holds one command slot, counted once, from its admission to its settlement.
+slotSpec ∷ Spec
+slotSpec =
+  it "counts a building request's command slot once: the last free slot admits it and the next is refused" $ do
+    let slots svc = (\(_, _, rows, _) → [(counted, held') | (name, counted, held') ← rows, name == "command slots"]) <$> accountsOf svc
+    -- the slots an open arena's service holds at rest, measured on a service of its own
+    atRest ← withService defaultConfig $ \svc → do
+      _ ← openWith svc (ground []) []
+      slots svc
+    rest ← case atRest of
+      [(counted, held')] | counted == held' → pure counted
+      other → fail ("the command-slot row at rest: " <> show other)
+    gate ← newDisarmedGate
+    -- room for exactly two pending requests beside what the service holds at rest
+    withServiceUsing (configWith (\s → s {specQueuedCommands = fromIntegral rest + 2})) alwaysAdmitting (gatedProbe isStep gate) $ \svc → flip finally (openGate gate) . guarded svc $ \taken → do
+      (_, lease) ← openWith svc (ground []) []
+      armGate gate
+      first ← okOf (requestRegionSnapshot svc lease [region 5 5 (-1)])
+      -- building, not staged: the owner is held at the build's step
+      awaitReached gate
+      slots svc >>= (`shouldBe` [(rest + 1, rest + 1)])
+      inspectInvariants svc >>= (`shouldBe` [])
+      -- the last free slot admits a second request, and the next is refused for want of a slot
+      second ← okOf (requestRegionSnapshot svc lease [region 5 5 (-1)])
+      slots svc >>= (`shouldBe` [(rest + 2, rest + 2)])
+      inspectInvariants svc >>= (`shouldBe` [])
+      refusedWith <$> requestRegionSnapshot svc lease [region 5 5 (-1)] >>= (`shouldBe` Just (RefusedBusy (BusyModel (SlotFull CommandSlot (fromIntegral rest + 2) (fromIntegral rest + 2) 1))))
+      disarmGate gate
+      openGate gate
+      forM_ [first, second] $ \pending → await svc pending >>= expectSuccess >>= keep taken >>= releaseRegionBorrow svc
+      slots svc >>= (`shouldBe` [(rest, rest)])
       settleChecks svc
 
 -- | The take moves a borrow to its holder only while the request owns it, in one transaction.
