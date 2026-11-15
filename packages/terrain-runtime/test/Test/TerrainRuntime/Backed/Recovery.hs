@@ -202,7 +202,8 @@ spec = describe "Recovery decided like publication" $ do
       -- no write probe while integrity was recorded: the failed page was not written
       ops ← H.events probe
       [() | OpWriteAt o _ ← ops, o == offset] `shouldBe` []
-      pausedOn svc lease `shouldReturn` [CondIo]
+      status ← pausedOn svc lease
+      fmap retriedRemaining first `shouldBe` Right status
       second ← retryAnswer svc lease
       fmap (\a → (retriedCleared a, retriedRemaining a)) second `shouldBe` Right ([CondIo], [])
       pausedOn svc lease `shouldReturn` []
@@ -220,7 +221,9 @@ spec = describe "Recovery decided like publication" $ do
       fmap (\a → (retriedCleared a, retriedRemaining a)) answer `shouldBe` Right ([], [CondIo, CondIntegrity])
       ops ← H.events probe
       [() | OpWriteAt o _ ← ops, o == offset] `shouldBe` []
-      pausedOn svc lease >>= (`shouldMatchList` [CondIo, CondIntegrity])
+      -- the answer names what remains exactly as the status reports it
+      status ← pausedOn svc lease
+      fmap retriedRemaining answer `shouldBe` Right status
 
   it "ends the owner with a defect when a retry's write probe meets a worker failure" $
     withArena $ \probe svc lease → do
