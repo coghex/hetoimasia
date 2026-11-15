@@ -47,7 +47,7 @@ isRead = \case OpReadAt {} → True; _ → False
 -- | The edit bank holds nothing of the owner's (no pin, no transaction, no staging): only the
 -- storage service's own records, with no task of the owner and no job of the backend.
 bankAtRest ∷ Service → IO ()
-bankAtRest svc = waitFor (backedAtRestSTM svc >>= check)
+bankAtRest svc = waitFor (backedQuiescentSTM svc >>= check)
 
 oracle ∷ Service → IO ()
 oracle svc = do

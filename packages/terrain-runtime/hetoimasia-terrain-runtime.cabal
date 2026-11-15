@@ -202,7 +202,10 @@ test-suite terrain-runtime-tests
         Test.TerrainRuntime.Backed.Txn
         Test.TerrainRuntime.Basic
         Test.TerrainRuntime.Budgets
+        Test.TerrainRuntime.Capabilities
+        Test.TerrainRuntime.CapabilityControl
         Test.TerrainRuntime.Closure
+        Test.TerrainRuntime.Concurrent
         Test.TerrainRuntime.Credits
         Test.TerrainRuntime.Fixtures
         Test.TerrainRuntime.Hardening
@@ -216,6 +219,7 @@ test-suite terrain-runtime-tests
         Test.TerrainRuntime.Output
         Test.TerrainRuntime.OutputSpec
         Test.TerrainRuntime.Parallel
+        Test.TerrainRuntime.Pass
         Test.TerrainRuntime.Runner
         Test.TerrainRuntime.Races
         Test.TerrainRuntime.Revalidation
@@ -295,6 +299,7 @@ test-suite terrain-storage-probe
     hs-source-dirs: probe, test
     ghc-options: -threaded -rtsopts "-with-rtsopts=-T"
     other-modules:
+        Test.TerrainRuntime.Capabilities
         Test.TerrainRuntime.Isolation
         Test.TerrainRuntime.Output
         Test.TerrainRuntime.Storage.Fixture
@@ -335,6 +340,7 @@ test-suite terrain-runtime-full-depth-tests
     ghc-options: -threaded -rtsopts "-with-rtsopts=-T"
     other-modules:
         Test.TerrainRuntime.Output
+        Test.TerrainRuntime.Capabilities
         Test.TerrainRuntime.Isolation
         Test.TerrainRuntime.Runner
         Test.TerrainRuntime.Backed.Loop

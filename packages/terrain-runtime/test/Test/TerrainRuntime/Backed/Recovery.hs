@@ -90,7 +90,7 @@ withArenaPaths columns body = do
   withServiceSeam quiet defaultConfig alwaysAdmitting points (H.seamFor probe) $ \svc → do
     (_, lease) ← openMain svc "main"
     mapM_ (\(x, y) → removeCell' svc lease (tile x y 5)) columns
-    waitFor (backedAtRestSTM svc >>= check)
+    waitFor (backedQuiescentSTM svc >>= check)
     body probe (Paths ref) svc lease
 
 -- | A write of this page's offset.
@@ -171,12 +171,14 @@ spec = describe "Recovery decided like publication" $ do
     withTree $ \probe recorded svc lease → do
       -- a second run in every column: the tree has more leaves
       mapM_ (\(x, y) → removeCell' svc lease (tile x y 2)) [(x, y) | x ← [0 .. 15], y ← [0 .. 15]]
-      waitFor (backedAtRestSTM svc >>= check)
+      waitFor (backedQuiescentSTM svc >>= check)
       -- nine distinct pages, each one a column's read reads
       paths ← mapM (\(x, y) → fmap (\ps → [(o, (x, y)) | o ← ps]) (pagesRead recorded svc lease (tile x y 6))) [(x, y) | x ← [0, 3 .. 15], y ← [0, 3 .. 15]]
       let distinct = take 9 (foldl (\acc (o, x) → if any ((== o) . fst) acc then acc else acc <> [(o, x)]) [] (concat paths))
       length distinct `shouldBe` 9
       mapM_ (\(o, x) → do
+                -- nothing of the owner's choosing (a settled request's trailing reads, reclamation, discovery) may meet the rule
+                waitFor (backedQuiescentSTM svc >>= check)
                 H.addRule probe 1 (readAt o) (H.FailWith (Errno 5))
                 failed ← cellAt svc lease (tile (fst x) (snd x) 6) >>= expectRight >>= bounded . await svc
                 failed `shouldSatisfy` \case Left (Failed (StorageFailed (FaultIo _))) → True; _ → False)
@@ -257,7 +259,7 @@ spec = describe "Recovery decided like publication" $ do
       holdService hold svc
       (_, lease) ← openMain svc "main"
       _ ← removeCell' svc lease (tile 3 4 5)
-      waitFor (backedAtRestSTM svc >>= check)
+      waitFor (backedQuiescentSTM svc >>= check)
       _ ← failWrite probe svc lease
       host ← newHost True
       _ ← okOf (retryWith svc (hostEndpoint svc Nothing host) lease)
@@ -270,7 +272,7 @@ spec = describe "Recovery decided like publication" $ do
         waitFor (readTVar (hostSettled host) >>= \s → check (not (null s)))
         -- releasing the creator's lease cancels its requests, then closes the arena
         settledOf host `shouldReturn` [Cancelled]
-        waitFor (backedAtRestSTM svc >>= check)
+        waitFor (backedQuiescentSTM svc >>= check)
         atomically (inspectRequestScratchSTM svc) `shouldReturn` ([], [])
 
   -- the store's one page: every read of column (3, 4) reads it
@@ -346,7 +348,7 @@ spec = describe "Recovery decided like publication" $ do
         failed `shouldSatisfy` \case Left (Failed (StorageFailed _)) → True; _ → False
         pausedOn svc lease `shouldReturn` [CondIo]
         H.openGate held
-        waitFor (backedAtRestSTM svc >>= check)
+        waitFor (backedQuiescentSTM svc >>= check)
         statusAfter ← arenaStatus svc lease >>= expectRight
         -- no discovery transaction published after the pause: not the held one, nor any other
         readTVarIO published `shouldReturn` publishedBefore
@@ -398,7 +400,7 @@ spec = describe "Recovery decided like publication" $ do
           -- the give-back is the next length set: it fails
           H.addRule probe 1 isSetLength (H.FailWith (Errno 5))
           pure growth
-        waitFor (backedAtRestSTM svc >>= check)
+        waitFor (backedQuiescentSTM svc >>= check)
         pendingExtra ← atomically (inspectPendingExtraSTM svc lease)
         pendingExtra `shouldSatisfy` maybe False (> 0)
         status ← arenaStatus svc lease >>= expectRight

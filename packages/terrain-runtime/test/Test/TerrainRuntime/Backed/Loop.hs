@@ -57,7 +57,7 @@ fullSpec = describe "The owner's loop (full depth)" $
     withServiceSeam quiet config alwaysAdmitting noProbe (H.seamFor probe) $ \svc → do
       (client, lease) ← openMain svc "main"
       _ ← removeCell' svc lease (tile 0 0 (-32))
-      waitFor (backedAtRestSTM svc >>= check)
+      waitFor (backedQuiescentSTM svc >>= check)
       -- the pin: a view's load job whose page read is held, far from the removals
       gate ← H.addGateOnce probe isRead
       view ← okOf (openView svc client)
@@ -138,7 +138,7 @@ spec = describe "The owner's loop" $ do
     ended ← try $ withServiceSeam quiet defaultConfig alwaysAdmitting points (H.seamFor probe) $ \svc → do
       client ← okOf (registerClient svc)
       lease ← okOf (openArena svc client "main" soilOverStone) >>= await svc >>= expectSuccess
-      waitFor (backedAtRestSTM svc >>= check)
+      waitFor (backedQuiescentSTM svc >>= check)
       -- the write's native call is held: once submitted, the job stays in flight
       writes ← H.addGate probe isWrite
       -- every exit lets the write go (a failing assertion must not leave the scope's drain waiting)

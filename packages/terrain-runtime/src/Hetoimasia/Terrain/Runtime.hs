@@ -124,6 +124,7 @@ module Hetoimasia.Terrain.Runtime
   , inspectBacked
   , inspectCompileSTM
   , backedAtRestSTM
+  , backedQuiescentSTM
   , inspectIdleRepeatsSTM
   , inspectRequestScratchSTM
   , inspectStorageJobsSTM
@@ -215,7 +216,7 @@ import Hetoimasia.Terrain.Runtime.Internal.Types
 import Hetoimasia.Terrain.Runtime.Settlement
 import Hetoimasia.Terrain.Runtime.Backed.Port (StoragePort (..), storagePort)
 import Hetoimasia.Terrain.Runtime.Backed.Fault (FullWhy (..), IntegritySource (..), StorageFault (..), faultCode)
-import Hetoimasia.Terrain.Runtime.Internal.Backed (backedInvariants, editBankChecked, markOf, pressureMark, removalStagingChecked, queryKeepChecked)
+import Hetoimasia.Terrain.Runtime.Internal.Backed (contenders, backedInvariants, editBankChecked, markOf, pressureMark, removalStagingChecked, queryKeepChecked)
 import qualified Hetoimasia.Terrain.Runtime.Storage.Internal.Service as Storage
 import Hetoimasia.Terrain.Runtime.Store.Internal.Admission (EditBankSpec (..), Ledger (..), defaultEditBankSpec, ledgers, mkEditBankConfig, newAdmission)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Model (Condition (..), GrowthView (..), Usage (..), conditions, growthView, storeHeader, usage)
@@ -642,6 +643,36 @@ backedAtRestSTM svc = do
     Map.null (stateOpens st) && Map.null (stateGathers st) && isNothing (stateSlot st) && Map.null (stateClosing st)
       && null (Storage.snJobs sn)
       && null problems
+
+-- | Whether the owner is quiescent: at rest ('backedAtRestSTM') and holding nothing it could still choose. At rest is
+-- only momentary idleness: between two steps the owner may have an internal transaction (reclamation of retired
+-- pages, discovery), an eligible explicit removal, a growth or a retry's probe still to be granted the slot, and a
+-- native call of that work reads or writes a page the moment it is granted. This is true only when the owner's own
+-- chooser ('contenders', the one the slot's grants are made from) offers no work, read in the same snapshot as the
+-- at-rest predicate, whose meaning is unchanged.
+--
+-- A SNAPSHOT, NOT A BARRIER. It says nothing about work admitted afterwards: a request, a growth or a retry made by a caller,
+-- or a host whose eligibility changes (the owner reads eligibility dynamically). A caller that arms a fault or counts native
+-- operations after it must itself hold every other producer of work (no request in flight, hosts' eligibility fixed), so that
+-- nothing can start between its wait and what it arms.
+--
+-- READ-ONLY, FOR VERIFICATION. It commits nothing: the reading is made inside 'catchSTM', whose rollback discards any write
+-- made on the way, and the chooser's one callback is a host's 'endpointEligible'. An exception of the chooser or of that
+-- callback propagates to the caller; it is never read as quiescence.
+backedQuiescentSTM ∷ Service → STM Bool
+backedQuiescentSTM svc = (reading >>= throwSTM . QuiescenceReading) `catchSTM` \(QuiescenceReading quiescent) → pure quiescent
+  where
+    reading = do
+      rest <- backedAtRestSTM svc
+      st <- readSt svc
+      offered <- contenders st
+      pure (rest && null offered)
+
+-- | The reading of 'backedQuiescentSTM', thrown to roll the transaction that made it back.
+newtype QuiescenceReading = QuiescenceReading Bool
+  deriving stock (Show)
+
+instance Exception QuiescenceReading
 
 -- | The owner's work that was chosen again, with nothing performed between, after a step of it that
 -- changed nothing (newest first; empty while the chooser and every step agree). Read-only, for

@@ -93,11 +93,11 @@ withPausedArena body = do
     fmap grownAllowance grown `shouldBe` Right (128 * mib)
     -- the column has history in the store, so a read of it reads a page
     _ ← removeCell' svc lease (tile 3 4 5)
-    waitFor (backedAtRestSTM svc >>= check)
+    waitFor (backedQuiescentSTM svc >>= check)
     H.addRule probe 1 isRead (H.FailWith (Errno 5))
     failed ← cellAt svc lease (tile 3 4 6) >>= expectRight >>= await svc
     failed `shouldSatisfy` \case Left (Failed (StorageFailed (FaultIo _))) → True; _ → False
-    waitFor (backedAtRestSTM svc >>= check)
+    waitFor (backedQuiescentSTM svc >>= check)
     pausedOn svc lease `shouldReturn` [CondIo]
     body probe svc points lease otherLease
 
@@ -171,7 +171,7 @@ pausedRetry returns = withPausedArena $ \probe svc points lease otherLease → d
     _ → do
       statusReservedBytes status `shouldBe` 128 * mib
       cancel svc f `shouldReturn` CancelWon
-  waitFor (backedAtRestSTM svc >>= check)
+  waitFor (backedQuiescentSTM svc >>= check)
   settleChecks svc
 
 probeHeld ∷ IO ()
@@ -206,7 +206,7 @@ creatorCase inFlight command = do
     (_, otherLease) ← openMain svc "other"
     first ← growArena svc lease (toInteger (128 * mib)) >>= expectRight >>= await svc
     fmap grownAllowance first `shouldBe` Right (128 * mib)
-    waitFor (backedAtRestSTM svc >>= check)
+    waitFor (backedQuiescentSTM svc >>= check)
     let (base, extraPending) = basis inFlight
         target = case command of
           GrowEqual → Just base
@@ -271,7 +271,7 @@ creatorCase inFlight command = do
           pure f
         -- F's run has ended: its extra is pending, and nothing is in the slot
         waitFor (arenaStatusSTM svc lease >>= either (const retry) (check . (> 0) . statusPendingReservedBytes))
-        waitFor (backedAtRestSTM svc >>= check)
+        waitFor (backedQuiescentSTM svc >>= check)
         _ ← submitC
         pure (Just f)
     when (inFlight == Nothing') (() <$ submitC)
@@ -312,5 +312,5 @@ creatorCase inFlight command = do
     final ← waitFor (arenaStatusSTM svc lease >>= either (const retry) pure)
     statusPendingReservedBytes final `shouldBe` 0
     (statusReservedBytes final >= reserved) `shouldBe` True
-    waitFor (backedAtRestSTM svc >>= check)
+    waitFor (backedQuiescentSTM svc >>= check)
     settleChecks svc
