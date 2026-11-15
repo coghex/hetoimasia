@@ -706,9 +706,10 @@ decide svc st rid = \case
       | null regions = Just "a regional snapshot names no region"
       | length (take (fromIntegral cap + 1) regions) > fromIntegral cap = Just "a regional snapshot names more regions than a hold may"
       | Set.size (Set.fromList regions) /= length regions = Just "a regional snapshot names a region twice"
-      -- the arena's coordinate range, not the configured extent (which bounds what a request may touch;
-      -- a copy of a whole region describes its every cell, and nothing can be removed outside the extent)
       | not (all wholeRegion regions) = Just "a regional snapshot names a region outside the supported coordinates"
+      -- a copy covers whole regions, and a request naming a cell outside the configured extent is invalid
+      -- from every state ('R.limitExtent'): under an extent smaller than a region, every region set is
+      | R.limitExtent (R.modelLimits (stateModel st)) /= (16, 16, 32) = Just "a regional snapshot covers whole regions, beyond the configured extent"
       | otherwise = Nothing
       where
         cap = R.limitHoldRegions (R.modelLimits (stateModel st))

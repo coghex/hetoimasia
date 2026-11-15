@@ -387,11 +387,10 @@ fullSpec = describe "Regional snapshots (full depth): every cell of every region
     releaseRegionBorrow svc borrow
     settleChecks svc
 
--- | A configuration whose extent covers two columns, one row and two levels of each region, whose
--- resident bank holds about two regions (so reads of other regions evict one), and whose retained bank
--- has room for a regional snapshot's reservation.
-reducedConfig ∷ Config
-reducedConfig = defaultConfig {configLimits = limits, configRetainedBytes = retained}
+-- | A configuration whose resident bank holds about two regions of the given extent (so reads of other
+-- regions evict one), and whose retained bank has room for a regional snapshot's reservation.
+pressedConfig ∷ (Integer, Integer, Integer) → Config
+pressedConfig (ex, ey, ez) = defaultConfig {configLimits = limits, configRetainedBytes = retained}
   where
     retained = 2 * 1024 * 1024
     spec' resident staging =
@@ -404,37 +403,38 @@ reducedConfig = defaultConfig {configLimits = limits, configRetainedBytes = reta
         , specPinsPerView = 2
         , specAgingQuanta = 3
         , specQueryRegions = 4
-        , specExtentX = 2
-        , specExtentY = 1
-        , specExtentZ = 2
+        , specExtentX = ex
+        , specExtentY = ey
+        , specExtentZ = ez
         , specHoldRegions = 2
         , specCameraRegions = 4
         }
     valid resident staging = either (const Nothing) Just (mkLimits (spec' resident staging))
-    first' = fromMaybe (error "no valid reduced limits") . listToMaybe
+    first' = fromMaybe (error "no valid pressed limits") . listToMaybe
     smallest = first' [r | r ← [100, 200 .. 4000000], Just _ ← [valid r 1000000]]
     stagingFor resident = first' [t | t ← [1000, 2000 .. 4000000], Just _ ← [valid resident t]]
     resident' = smallest + 2 * 400
-    limits = fromMaybe (error "reduced limits are invalid") (valid resident' (3 * stagingFor resident' + toInteger retained))
+    limits = fromMaybe (error "pressed limits are invalid") (valid resident' (3 * stagingFor resident' + toInteger retained))
 
 reducedExtentSpec ∷ Spec
 reducedExtentSpec =
-  it "answers every cell of a region under an extent smaller than it: inside the extent as cellAt and knowledgeAt do, outside it as the definition alone, and widens no request's reach" $
-    withService reducedConfig $ \svc → guarded svc $ \taken → do
-      let definition = ground (caveRow 0 5 2 6)
-          removed = [(1, 0, 1), (1, 0, 0)]
-      (_, lease) ← openWith svc definition removed
-      borrow ← borrowOf taken lease [region 0 0 0]
-      let snapshot = regionBorrowSnapshot borrow
-      expectationMismatches definition removed snapshot `shouldBe` []
-      -- the cells inside the extent: the region's first two columns of its first row, two levels each
-      readMismatches svc lease snapshot [(x, 0, z) | x ← [0, 1], z ← [0, 1]] >>= (`shouldBe` [])
-      -- a cell outside it is still refused to every request
+  it "refuses a region set under an extent smaller than a region: a copy covers whole regions, beyond what a request may touch, leaving every account as it was" $
+    -- the extent covers two columns, one row and two levels of each region
+    withService (pressedConfig (2, 1, 2)) $ \svc → guarded svc $ \_ → do
+      (_, lease) ← openWith svc (ground (caveRow 0 5 2 6)) [(1, 0, 1), (1, 0, 0)]
+      before ← accountsOf svc
+      forM_ [[region 0 0 0], [region 0 0 0, region 1 0 0]] $ \regions → do
+        refused ← requestRegionSnapshot svc lease regions
+        case refusedWith refused of
+          Just (RefusedInvalid _) → pure ()
+          other → expectationFailure (show regions <> ": " <> show other)
+        accountsOf svc >>= (`shouldBe` before)
+      -- the cells inside the extent are still read as before, and one outside it is refused
+      cellIs <$> readCell svc lease (tile 1 0 1) >>= (`shouldBe` True)
       outside ← cellAt svc lease (tile 5 5 5)
       case refusedWith outside of
         Just (RefusedInvalid _) → pure ()
         other → expectationFailure ("a read outside the extent: " <> show other)
-      releaseRegionBorrow svc borrow
       settleChecks svc
 
 -- ---------------------------------------------------------------------------
@@ -686,7 +686,8 @@ coherenceSpec = describe "coherence" $ do
       settleChecks svc
 
   it "keeps a settled snapshot's every answer through the eviction and the reload of its region" $
-    withService reducedConfig $ \svc → guarded svc $ \taken → do
+    -- the whole extent, and a resident bank of about two regions: reads of other regions evict the held one
+    withService (pressedConfig (16, 16, 32)) $ \svc → guarded svc $ \taken → do
       let definition = ground []
           removed = [(1, 0, 1)]
           held' = region 0 0 0
