@@ -83,6 +83,11 @@ holdIn (Held ref) gate = modifyIORef' ref (gate :)
 openHeld ∷ Held → IO ()
 openHeld (Held ref) = readIORef ref >>= mapM_ openSeamGate
 
+-- | Release what an example holds (its gates and held native calls) when its body ends, however it ends: inside the VM's and the
+-- service's scopes, so that their teardown never waits for a worker the example still holds.
+releasing ∷ IO () → IO a → IO a
+releasing release body = body `finally` release
+
 -- | Say what the scripts printed and where they waited, when an example fails.
 explained ∷ Rig → World → IO a → IO a
 explained rig world body =
@@ -218,7 +223,7 @@ growthScript =
     ]
 
 spec ∷ Spec
-spec = outcomesSpec >> lifecycleSpec
+spec = outcomesSpec >> lifecycleSpec >> retrySpec
 
 outcomesSpec ∷ Spec
 outcomesSpec = describe "Terrain storage outcomes" $ do
@@ -255,51 +260,58 @@ outcomesSpec = describe "Terrain storage outcomes" $ do
       , ("gameplay", gameplayOver, \_ _ fvm → grantTick fvm)
       ]
 
-  it "settles a removal storage_full, read and unread, while a reader pins old history, reports the pause, and grows out of it while paused" $ do
-    faults ← newFaults
-    let usable = toInteger reservePages + toInteger maxClaimPages + 1 + 128
-        config = defaultConfig {configStore = (configStore defaultConfig) {specAllowanceBytes = mib 64, specOverheadBytes = Just (mib 64 - usable * toInteger pageSize)}}
-    withRigPort config noProbe noTerrainHooks (seamPort faults) $ \rig →
-      withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource fullScript)]) $ \world _ runtime →
-        withFvm world runtime (presentationOver rig) $ \fvm → explained rig world $ do
-          _ ← spawn world fvm "modules-test" mainPath
-          let svc = rgService rig
-              go = advanceClock world 2000000000
-          observer ← either (fail . show) pure =<< registerClient svc
-          held ← newHeld
-          (`finally` openHeld held) $ do
-            -- the pin: a view's load job whose page read is held, in a region far from the removals (armed once the service is at
-            -- rest, so the one read it holds is the load's)
-            atWait rig world go "pin" $ do
-              gate ← addSeamGateOnce faults isRead
-              holdIn held gate
-              lease ← attachArena svc observer (arenaName rig "modules-test" "main") >>= either (fail . show) pure >>= await svc >>= either (fail . show) pure
-              view ← openView svc observer >>= either (fail . show) pure
-              let (far, _) = decomposeTile (either (error . show) id (tileCoord 100 100 0))
-              _ ← setViewDemand svc view lease [RegionDemand far (either (error . show) coverageTile (mkLocalCoord 0 0 0))] >>= either (fail . show) pure
-              awaitSeamGate gate
-            driveUntil world go (elem "full\tstorage_full" <$> outLines world)
-            driveUntil world go (any ("status\t" `Text.isPrefixOf`) <$> outLines world)
-            -- the pin goes, and growth clears the capacity pause
-            openHeld held
-            atWait rig world go "unpin" (endClient svc observer)
-          atWait rig world go "end" (pure ())
-          driveUntil world go (elem "done" <$> outLines world)
-          printed ← outLines world
-          -- discovery is paused with the storage exactly when it has obligations left, and idle otherwise
-          let discovery = if "discovery\tpaused\ttrue" `elem` printed then "discovery\tpaused\ttrue" else "discovery\tidle\tfalse"
-          printed
-            `shouldBe` [ "full\tstorage_full"
-                       , "again\tfailure\tstorage_full"
-                       , "status\tpaused\tstorage_full\t" <> Text.pack (show (mib 64))
-                       , discovery
-                       , "grown\tsuccess\ttrue\t" <> Text.pack (show (mib 128)) <> "\tready"
-                       , "refused cell\tfalse"
-                       , "resumed\tsuccess\ttrue"
-                       , "committed before the pause\ttrue"
-                       , "final\tready\tidle\t0"
-                       , "done"
-                       ]
+  describe "storage_full under a pinned reader" $
+    mapM_
+      ( \(role, over, drive) →
+      it ("settles a removal storage_full, read and unread, while a reader pins old history, reports the pause, and grows out of it while paused, from a " <> role <> " creator") $ do
+        faults ← newFaults
+        let usable = toInteger reservePages + toInteger maxClaimPages + 1 + 128
+            config = defaultConfig {configStore = (configStore defaultConfig) {specAllowanceBytes = mib 64, specOverheadBytes = Just (mib 64 - usable * toInteger pageSize)}}
+        withRigPort config noProbe noTerrainHooks (seamPort faults) $ \rig →
+          withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource fullScript)]) $ \world control runtime →
+            withFvm world runtime (over rig) $ \fvm → explained rig world $ do
+              _ ← spawn world fvm "modules-test" mainPath
+              let svc = rgService rig
+                  go = drive world control fvm
+              observer ← either (fail . show) pure =<< registerClient svc
+              held ← newHeld
+              (`finally` openHeld held) $ do
+                -- the pin: a view's load job whose page read is held, in a region far from the removals (armed once the service is at
+                -- rest, so the one read it holds is the load's)
+                atWait rig world go "pin" $ do
+                  gate ← addSeamGateOnce faults isRead
+                  holdIn held gate
+                  lease ← attachArena svc observer (arenaName rig "modules-test" "main") >>= either (fail . show) pure >>= await svc >>= either (fail . show) pure
+                  view ← openView svc observer >>= either (fail . show) pure
+                  let (far, _) = decomposeTile (either (error . show) id (tileCoord 100 100 0))
+                  _ ← setViewDemand svc view lease [RegionDemand far (either (error . show) coverageTile (mkLocalCoord 0 0 0))] >>= either (fail . show) pure
+                  awaitSeamGate gate
+                -- the script prints what it met and waits to grow: its lines are read once it has finished
+                driveUntil world go (elem "entered unpin" <$> readTVarIO (rgTrace rig))
+                -- the pin goes, and growth clears the capacity pause
+                openHeld held
+                atWait rig world go "unpin" (endClient svc observer)
+              atWait rig world go "end" (pure ())
+              driveUntil world go (elem "done" <$> outLines world)
+              printed ← outLines world
+              -- discovery is paused with the storage exactly when it has obligations left, and idle otherwise
+              let discovery = if "discovery\tpaused\ttrue" `elem` printed then "discovery\tpaused\ttrue" else "discovery\tidle\tfalse"
+              printed
+                `shouldBe` [ "full\tstorage_full"
+                           , "again\tfailure\tstorage_full"
+                           , "status\tpaused\tstorage_full\t" <> Text.pack (show (mib 64))
+                           , discovery
+                           , "grown\tsuccess\ttrue\t" <> Text.pack (show (mib 128)) <> "\tready"
+                           , "refused cell\tfalse"
+                           , "resumed\tsuccess\ttrue"
+                           , "committed before the pause\ttrue"
+                           , "final\tready\tidle\t0"
+                           , "done"
+                           ]
+      )
+      [ ("presentation", presentationOver, \world _ _ → advanceClock world 2000000000)
+      , ("gameplay", gameplayOver, \_ _ fvm → grantTick fvm)
+      ]
 
   it "keeps the old allowance while a growth is held at its reservation and after it is cancelled, keeps an extra whose give-back failed charged and visible, and refuses the largest allowance's reservation" $ do
     faults ← newFaults
@@ -464,10 +476,9 @@ lifecycleSpec = describe "Terrain storage status and lifetimes" $ do
     disarmGate discoveryGate
     let selects = \case PointDiscoveryGranted {} → True; _ → False
     pinned ← newHeld
-    (`finally` (openGate discoveryGate >> openHeld pinned)) $
-      withRigPort defaultConfig (gatedProbe selects discoveryGate) noTerrainHooks (seamPort faults) $ \rig →
+    withRigPort defaultConfig (gatedProbe selects discoveryGate) noTerrainHooks (seamPort faults) $ \rig →
         withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource statusSteps)]) $ \world _ runtime →
-          withFvm world runtime (presentationOver rig) $ \fvm → explained rig world $ do
+          withFvm world runtime (presentationOver rig) $ \fvm → releasing (openGate discoveryGate >> openHeld pinned) . explained rig world $ do
             _ ← spawn world fvm "modules-test" mainPath
             let svc = rgService rig
                 go = advanceClock world 2000000000
@@ -569,10 +580,9 @@ lifecycleSpec = describe "Terrain storage status and lifetimes" $ do
   it "retires a growth held at its reservation when its creator's instance ends: the arena closes, the extra is given back, and nothing is left" $ do
     faults ← newFaults
     held ← newHeld
-    (`finally` openHeld held) $
-      withRigPort defaultConfig noProbe noTerrainHooks (seamPort faults) $ \rig →
+    withRigPort defaultConfig noProbe noTerrainHooks (seamPort faults) $ \rig →
         withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource growthAtEnd)]) $ \world _ runtime →
-          withFvm world runtime (presentationOver rig) $ \fvm → explained rig world $ do
+          withFvm world runtime (presentationOver rig) $ \fvm → releasing (openHeld held) . explained rig world $ do
             spawned ← spawn world fvm "modules-test" mainPath
             let go = advanceClock world 2000000000
                 svc = rgService rig
@@ -590,3 +600,114 @@ lifecycleSpec = describe "Terrain storage status and lifetimes" $ do
             limitHeld svc "leases" `shouldReturn` 0
             inspectBacked svc `shouldReturn` []
             inspectInvariants svc `shouldReturn` []
+
+-- | A gameplay creator whose arena is paused storage_io: a retry cancelled before its position keeps the pause; a retry asked while the
+-- example holds the owner's update clears nothing until its tick, and clears at it; a cancel after a retry committed answers that it
+-- came too late.
+logicalRetry ∷ Script
+logicalRetry =
+  stepsScript
+    "DEF"
+    storagePrelude
+    [ Step "history" "return api.terrain.remove(A, {x = 3, y = 4, z = 0})" "return tostring(v.changed)"
+    , Step "io" "TEST_WAIT('io') return api.terrain.remove(A, {x = 3, y = 4, z = -1})" "return 'ok'"
+    , Step "cancelled before its position" "local r = api.terrain.retry_storage(A) print('cancel before its position', api.request.cancel(r)) return api.terrain.status(A)" "return v.storage.state .. ' ' .. tostring(v.storage.reason)"
+    , Step "retry at its position" "local r = api.terrain.retry_storage(A) TEST_WAIT('asked retry') return r" "return tostring(v.changed) .. ' ' .. codes(v.cleared) .. ' ' .. v.storage.state"
+    , Step "cancel after the commit" "local r = api.terrain.retry_storage(A) api.request.wait(r) print('cancel after the commit', api.request.cancel(r)) return r" "return tostring(v.changed) .. ' ' .. v.storage.state"
+    ]
+
+-- | A presentation creator whose arena is paused storage_io: a retry whose write probe the example holds is cancelled (the pause stays),
+-- and a second one is held while the creator's instance ends.
+heldRetry ∷ Script
+heldRetry =
+  script
+    { scPrelude = terrainPrelude <> storagePrelude
+    , scInit = ["self.s = 0", "self.q = api.terrain.open('main', DEF)"]
+    , scUpdate =
+        [ "if self.s == 0 then"
+        , "  local t = settle(api, self.q)"
+        , "  if t then self.a = t.value self.q = api.terrain.remove(self.a, {x = 3, y = 4, z = 0}) self.s = 1 end"
+        , "elseif self.s == 1 then"
+        , "  if settle(api, self.q) then TEST_WAIT('io') self.q = api.terrain.remove(self.a, {x = 3, y = 4, z = -1}) self.s = 2 end"
+        , "elseif self.s == 2 then"
+        , "  local t = settle(api, self.q)"
+        , "  if t then print('io', t.error and t.error.code) TEST_WAIT('arm') self.r = api.terrain.retry_storage(self.a) TEST_WAIT('probe held') print('cancel while revalidating', api.request.cancel(self.r)) TEST_WAIT('released') self.q = api.terrain.status(self.a) self.s = 3 end"
+        , "elseif self.s == 3 then"
+        , "  local t = settle(api, self.q)"
+        , "  if t then print('after the cancel', t.value.storage.state, t.value.storage.reason) TEST_WAIT('arm again') self.r = api.terrain.retry_storage(self.a) TEST_WAIT('held again') print('held') self.s = 4 end"
+        , "end"
+        ]
+    }
+
+retrySpec ∷ Spec
+retrySpec = describe "Terrain storage retry windows" $ do
+  it "keeps a gameplay creator's pause through a retry cancelled before its position, clears it only at the retry's tick, and answers a cancel after the commit already_settled" $ do
+    faults ← newFaults
+    withRigPort defaultConfig noProbe noTerrainHooks (seamPort faults) $ \rig →
+      withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource logicalRetry)]) $ \world _ runtime →
+        withFvm world runtime (gameplayOver rig) $ \fvm → explained rig world $ do
+          _ ← spawn world fvm "modules-test" mainPath
+          let svc = rgService rig
+              go = grantTick fvm
+          atWait rig world go "io" (addRule faults 1 isWrite (FailWith 5))
+          -- the retry is asked and the owner's update is held: its position (the next tick) cannot come, so nothing clears, however
+          -- long the service has to prepare it
+          driveUntil world go (elem "entered asked retry" <$> readTVarIO (rgTrace rig))
+          observer ← either (fail . show) pure =<< registerClient svc
+          lease ← attachArena svc observer (arenaName rig "modules-test" "main") >>= either (fail . show) pure >>= await svc >>= either (fail . show) pure
+          bounded (atomically (backedAtRestSTM svc >>= check))
+          paused ← arenaStatus svc lease >>= either (fail . show) pure
+          statusStorage paused `shouldBe` StoragePaused [CondIo]
+          (any (not . censusSettled) . censusRequests <$> atomically (inspectCensusSTM svc)) `shouldReturn` True
+          signalRig rig "asked retry"
+          driveUntil world go (elem "done" <$> outLines world)
+          printed ← outLines world
+          [l | l ← printed, not ("history" `Text.isPrefixOf` l)]
+            `shouldBe` [ "io\tfailure\tstorage_io"
+                       , "cancel before its position\tcancelled"
+                       , "cancelled before its position\tsuccess\tpaused storage_io"
+                       , "retry at its position\tsuccess\ttrue {storage_io} ready"
+                       , "cancel after the commit\talready_settled"
+                       , "cancel after the commit\tsuccess\tfalse ready"
+                       , "done"
+                       ]
+          quiescent svc
+          inspectInvariants svc `shouldReturn` []
+
+  it "keeps the pause when a retry is cancelled while its revalidation is held, and retires everything when the creator ends while another is held" $ do
+    faults ← newFaults
+    held ← newHeld
+    withRigPort defaultConfig noProbe noTerrainHooks (seamPort faults) $ \rig →
+      withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource heldRetry)]) $ \world _ runtime →
+        withFvm world runtime (presentationOver rig) $ \fvm → releasing (openHeld held) . explained rig world $ do
+          spawned ← spawn world fvm "modules-test" mainPath
+          let svc = rgService rig
+              go = advanceClock world 2000000000
+          atWait rig world go "io" (addRule faults 1 isWrite (FailWith 5))
+          -- the retry's revalidation of the failed write is a write probe: held at the seam, then cancelled
+          probe ← atWaitGate rig world go "arm" (addSeamGateOnce faults isWrite)
+          holdIn held probe
+          driveUntil world go (elem "entered probe held" <$> readTVarIO (rgTrace rig))
+          awaitSeamGate probe
+          signalRig rig "probe held"
+          driveUntil world go (elem "entered released" <$> readTVarIO (rgTrace rig))
+          openSeamGate probe
+          quiescent svc
+          signalRig rig "released"
+          -- a second retry held at its probe while the creator's instance ends
+          again ← atWaitGate rig world go "arm again" (addSeamGateOnce faults isWrite)
+          holdIn held again
+          driveUntil world go (elem "entered held again" <$> readTVarIO (rgTrace rig))
+          awaitSeamGate again
+          signalRig rig "held again"
+          driveUntil world go (elem "held" <$> outLines world)
+          stopSpawned spawned
+          driveUntil world go ((== Just Instance.Stopped) <$> phaseOf spawned)
+          openSeamGate again
+          driveUntil world go ((== 0) <$> limitHeld svc "arenas")
+          quiescent svc
+          printed ← outLines world
+          printed `shouldBe` ["io\tstorage_io", "cancel while revalidating\tcancelled", "after the cancel\tpaused\tstorage_io", "held"]
+          limitHeld svc "leases" `shouldReturn` 0
+          inspectBacked svc `shouldReturn` []
+          inspectInvariants svc `shouldReturn` []
