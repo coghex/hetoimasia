@@ -51,6 +51,7 @@ module Hetoimasia.LuaEngine.Terrain
   , terrainLeaseCapacity
   , TerrainCompositionRefused (..)
   , terrainCodes
+  , terrainCodesFor
   , terrainFailureReply
     -- * Pick authorities (the seam TRA-10 fills)
   , TerrainPicks
@@ -343,9 +344,8 @@ newtype SettlementRejected = SettlementRejected Text
 instance Exception SettlementRejected
 
 -- | The expected failure codes the terrain requests supply (D-19, the manager's two authorizations, and TRA-23's seven storage
--- codes): the only codes a terrain reply may carry. Any other outcome of the service is a defect of the host. Every terrain request
--- declares all of them: which storage outcome a request can meet is the service's to decide (a read of a paused arena's history can
--- fail its I/O, a growth can be refused its reservation), and a narrower declaration would turn an expected outcome into a defect.
+-- codes): the only codes a terrain reply may carry. Any other outcome of the service is a defect of the host. Each endpoint declares
+-- the subset it can settle with ('terrainCodesFor').
 terrainCodes ∷ [Text]
 terrainCodes =
   [ "not_found"
@@ -363,6 +363,26 @@ terrainCodes =
   , "storage_integrity"
   , "storage_size_not_increased"
   ]
+
+-- | The expected codes of one terrain endpoint (by its name): the seven of TRA-5 for the calls that had them, and the storage codes
+-- the service's own classification ("Hetoimasia.Terrain.Runtime.Backed.Backend") can settle that command with. An open meets a
+-- complex source, an unsupported or unreservable file and an I/O failure of its open; a read meets the I/O and integrity failures of
+-- the pages it reads; a removal meets every pause (and settles at once with it while the arena holds); a growth meets its
+-- reservation's refusals, an I/O failure (its allocation, or the release of an earlier extra) and a smaller size; a retry meets the
+-- I/O failure of an extra's release (its probes' failures are recorded as pauses, never its settlement). An attach meets none, and a
+-- status, which the adapter settles itself, only its arena's closure. A storage code an endpoint does not declare is a defect there.
+terrainCodesFor ∷ Text → [Text]
+terrainCodesFor name
+  | name == openName = base <> ["source_complexity", "storage_unsupported", "reservation_failed", "storage_io"]
+  | name == attachName = base
+  | name == removeName = base <> ["storage_full", "storage_io", "storage_integrity"]
+  | name `elem` [cellName, columnName, surfaceName] = base <> ["storage_io", "storage_integrity"]
+  | name == statusName = ["arena_closed"]
+  | name == growName = ["arena_closed", "storage_unsupported", "reservation_failed", "storage_io", "storage_size_not_increased"]
+  | name == retryName = ["arena_closed", "storage_io"]
+  | otherwise = []
+  where
+    base = take 7 terrainCodes
 
 -- | The lease capacity one instance needs in the VM's shared scope for terrain: every lease the service can hold at once (its
 -- cap is service-wide, so one instance may hold them all, pending, live and retiring), the places its requests can reserve a
@@ -566,7 +586,7 @@ services env =
     , tsRemoveCheck = \identity key cell pick owner values →
         firstRefusal
           [ pickCheck env identity pick
-          , leaseCheck env identity key readAsk owner values
+          , leaseCheck env identity key removeAsk owner values
           , answerCheck env terrainRemoveValueSchema LargestRemove owner values
           , pure (either Just (extentRefusal env . cellPlaces) (tileOf cell))
           ]
@@ -574,27 +594,27 @@ services env =
         precondition ← pickPrecondition env identity pick
         case precondition of
           Left why → pure (TerrainRefused why)
-          Right found → startOr cell (\tile → start env context removeName readAsk (AskRemove lease tile found))
+          Right found → startOr cell (\tile → start env context removeName removeAsk (AskRemove lease tile found))
     , tsStatusCheck = \identity key owner values →
         firstRefusal
-          [ leaseCheck env identity key readAsk owner values
+          [ leaseCheck env identity key statusAsk owner values
           , statusFigureRefusal env key
-          , m1ReplyCheck (tvRequests (envVm env)) readAsk terrainStatusValueSchema (largestReply env LargestStatus) owner values
+          , m1ReplyCheck (tvRequests (envVm env)) statusAsk terrainStatusValueSchema (largestReply env LargestStatus) owner values
           ]
-    , tsStatusStart = \_ key context → withArena env key $ \lease → start env context statusName readAsk (AskStatus lease)
+    , tsStatusStart = \_ key context → withArena env key $ \lease → start env context statusName statusAsk (AskStatus lease)
     , tsGrowCheck = \identity key bytes owner values →
         firstRefusal
-          [ creatorCheck env identity key "grow its storage" owner values
+          [ creatorCheck env identity key growAsk "grow its storage" owner values
           , pure (growAllowanceRefusal env bytes)
-          , m1ReplyCheck (tvRequests (envVm env)) readAsk terrainGrowValueSchema (largestReply env LargestGrow) owner values
+          , m1ReplyCheck (tvRequests (envVm env)) growAsk terrainGrowValueSchema (largestReply env LargestGrow) owner values
           ]
-    , tsGrowStart = \_ key bytes context → withArena env key $ \lease → start env context growName readAsk (AskGrow lease (toInteger bytes))
+    , tsGrowStart = \_ key bytes context → withArena env key $ \lease → start env context growName growAsk (AskGrow lease (toInteger bytes))
     , tsRetryCheck = \identity key owner values →
         firstRefusal
-          [ creatorCheck env identity key "retry its storage" owner values
-          , m1ReplyCheck (tvRequests (envVm env)) readAsk terrainRetryValueSchema (largestReply env LargestRetry) owner values
+          [ creatorCheck env identity key retryAsk "retry its storage" owner values
+          , m1ReplyCheck (tvRequests (envVm env)) retryAsk terrainRetryValueSchema (largestReply env LargestRetry) owner values
           ]
-    , tsRetryStart = \_ key context → withArena env key $ \lease → start env context retryName readAsk (AskRetry lease)
+    , tsRetryStart = \_ key context → withArena env key $ \lease → start env context retryName retryAsk (AskRetry lease)
     , tsReleaseCheck = releaseCheck env
     , tsRelease = \key → releaseWord <$> releaseLease leases key
     , tsIssued = \identity key → atomically (modifyTVar' (envIssued env) (Map.insertWith Set.union identity (Set.singleton key)))
@@ -699,15 +719,20 @@ drainRetired env = atomically (pruneClaims (names (envFacade env)) >> pruneFaile
 
 -- The asks ------------------------------------------------------------------------------------------------------
 
-openAsk, attachAsk, readAsk ∷ M1Ask
-openAsk = leaseAsk "terrain open"
-attachAsk = leaseAsk "terrain attach"
-readAsk = (m1Ask OptionalRequest "terrain read") {askCodes = terrainCodes}
+-- | Each request's ask, declaring exactly the expected codes its endpoint can settle with ('terrainCodesFor').
+openAsk, attachAsk, readAsk, removeAsk, statusAsk, growAsk, retryAsk ∷ M1Ask
+openAsk = leaseAsk "terrain open" (terrainCodesFor openName)
+attachAsk = leaseAsk "terrain attach" (terrainCodesFor attachName)
+readAsk = (m1Ask OptionalRequest "terrain read") {askCodes = terrainCodesFor cellName}
+removeAsk = (m1Ask OptionalRequest "terrain removal") {askCodes = terrainCodesFor removeName}
+statusAsk = (m1Ask OptionalRequest "terrain status") {askCodes = terrainCodesFor statusName}
+growAsk = (m1Ask OptionalRequest "terrain storage growth") {askCodes = terrainCodesFor growName}
+retryAsk = (m1Ask OptionalRequest "terrain storage retry") {askCodes = terrainCodesFor retryName}
 
-leaseAsk ∷ Text → M1Ask
-leaseAsk source =
+leaseAsk ∷ Text → [Text] → M1Ask
+leaseAsk source codes =
   (m1Ask OptionalRequest source)
-    { askCodes = terrainCodes
+    { askCodes = codes
     , askLease = Just (InstanceOwned, \_ key → VCapability (capability terrainArenaType key))
     }
 
@@ -800,8 +825,8 @@ leaseCheck env identity key ask owner values = do
 -- | A creator command's check: the handle is the caller's own, it is the arena's creator lease (an attachment, the creator's own
 -- included, has no authority over the arena's storage), and the host's own permanent facts follow. Decided before any bank, so a
 -- full request bank never hides it.
-creatorCheck ∷ Env → Text → Word64 → Text → ArgumentCheck
-creatorCheck env identity key what owner values = do
+creatorCheck ∷ Env → Text → Word64 → M1Ask → Text → ArgumentCheck
+creatorCheck env identity key ask what owner values = do
   mine ← ownedBy env identity key
   if not mine
     then pure (Just "the arena belongs to another instance")
@@ -812,7 +837,7 @@ creatorCheck env identity key what owner values = do
         (\why → pure (Just why))
         ( \resource →
             if resourceCreator resource
-              then permanent env (const readAsk) owner values
+              then permanent env (const ask) owner values
               else pure (Just ("only the arena's creator lease may " <> what))
         )
 

@@ -10,7 +10,8 @@ import Data.Text (Text)
 import qualified Data.Text as Text
 import Hetoimasia.LuaEngine.Profile (CountLimit (RequestsPerInstance, RequestsPerVm), fixedM1Profile)
 import Hetoimasia.LuaEngine.Terrain (noTerrainHooks)
-import Hetoimasia.Terrain.Runtime (defaultConfig, noProbe)
+import Hetoimasia.Terrain.Residency (modelRegions)
+import Hetoimasia.Terrain.Runtime (defaultConfig, inspectModel, noProbe)
 import Test.Hspec
 import Test.LuaEngine.Facade.Support
 import Test.LuaEngine.Request.Profiles (counts)
@@ -294,8 +295,52 @@ storageUnderPressure =
         ]
     }
 
+-- | Removals in eighteen regions of a service whose resident bank holds only a few (the history exceeds what is resident), a status
+-- after each six: always the same fields of the same types, whatever the history.
+boundedStatus ∷ Script
+boundedStatus =
+  stepsScript
+    "DEF"
+    ( storagePrelude
+        <> [ "local function shape(v, prefix)"
+           , "  local out = {}"
+           , "  local keys = {}"
+           , "  for k in pairs(v) do keys[#keys + 1] = k end"
+           , "  table.sort(keys)"
+           , "  for _, k in ipairs(keys) do"
+           , "    local x = v[k]"
+           , "    if type(x) == 'table' then out[#out + 1] = shape(x, prefix .. k .. '.')"
+           , "    else out[#out + 1] = prefix .. k .. ':' .. (math.type(x) or type(x)) end"
+           , "  end"
+           , "  return table.concat(out, ',')"
+           , "end"
+           ]
+    )
+    ( concat
+        [ [Step ("removal " <> n) ("return api.terrain.remove(A, " <> place <> ")") "return tostring(v.changed)"]
+            <> [Step ("status " <> n) "return api.terrain.status(A)" "return shape(v, '') .. ' ' .. v.content_revision" | i `mod` 6 == 0]
+        | (i, place) ← zip [1 ∷ Int ..] places
+        , let n = Text.pack (show i)
+        ]
+    )
+  where
+    places = ["{x = " <> c x <> ", y = " <> c y <> ", z = " <> c z <> "}" | x ← [-1 .. 1 ∷ Int], y ← [-1 .. 1 ∷ Int], z ← [0, -32 ∷ Int], let c v = Text.pack (show (if v == 0 || v == -32 then v else 16 * v))]
+
 spec ∷ Spec
 spec = describe "Terrain storage calls" $ do
+  it "hands the same bounded status record, field for field, as retained history exceeds what is resident" $
+    withRigConfig tightRigConfig $ \rig →
+      withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource boundedStatus)]) $ \world _ runtime →
+        withFvm world runtime (presentationOver rig) $ \fvm → do
+          spawned ← spawn world fvm "modules-test" mainPath
+          untilPrintedBy world spawned "done"
+          printed ← outLines world
+          let fields = "content_revision:integer,discovery.pending_items:integer,discovery.state:string,knowledge_revision:integer,storage.pending_reclaim_bytes:integer,storage.pending_reserved_bytes:integer,storage.reserved_bytes:integer,storage.state:string,storage.used_bytes:integer"
+          mapM_ (\n → printed `shouldContain` ["status " <> Text.pack (show n) <> "\tsuccess\t" <> fields <> " " <> Text.pack (show n)]) [6, 12, 18 ∷ Int]
+          -- the history really exceeded what is resident: fewer regions are resident than the removals touched
+          model ← inspectModel (rgService rig)
+          length (modelRegions model) `shouldSatisfy` (< 18)
+
   it "refuses every malformed storage argument, option, arity and authority as an ordinary error before admission, with no request, name, credit or native work" $ do
     faults ← newFaults
     withRigPort defaultConfig noProbe noTerrainHooks (seamPort faults) $ \rig →

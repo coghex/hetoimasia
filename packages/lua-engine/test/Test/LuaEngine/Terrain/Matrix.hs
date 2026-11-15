@@ -16,7 +16,7 @@ import Hetoimasia.Scripting.Lua.Scheduled (scheduledEndpoint)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Hetoimasia.LuaEngine.Profile (CountLimit (CopiedValueDepth, RequestsPerInstance, RequestsPerVm, SceneDepth), fixedM1Profile)
-import Hetoimasia.LuaEngine.Terrain (issuePick, terrainCodes, terrainFailureReply)
+import Hetoimasia.LuaEngine.Terrain (issuePick, terrainCodes, terrainCodesFor, terrainFailureReply)
 import Hetoimasia.Scripting.Lua.Admission (ExpectedFailure (expectedCode))
 import Hetoimasia.Scripting.Lua.Provider (ProviderReply (..))
 import Hetoimasia.Terrain.Query (QueryError (TooManyRuns), QueryLimits (..), defaultQueryLimits)
@@ -548,6 +548,19 @@ spec = describe "Terrain matrices" $ do
       $ \(fault, code) → case terrainFailureReply (StorageFailed fault) of
         ProviderExpected found → expectedCode found `shouldBe` code
         other → expectationFailure (show fault <> " was not an expected failure: " <> take 80 (show other))
+    -- each endpoint declares the storage codes the service can settle it with, and only those
+    let storage = filter (`notElem` take 7 terrainCodes) . terrainCodesFor
+    map (\e → (e, storage e)) ["terrain_open", "terrain_attach", "terrain_cell", "terrain_column", "terrain_surface", "terrain_remove", "terrain_status", "terrain_grow_storage", "terrain_retry_storage"]
+      `shouldBe` [ ("terrain_open", ["source_complexity", "storage_unsupported", "reservation_failed", "storage_io"])
+                 , ("terrain_attach", [])
+                 , ("terrain_cell", ["storage_io", "storage_integrity"])
+                 , ("terrain_column", ["storage_io", "storage_integrity"])
+                 , ("terrain_surface", ["storage_io", "storage_integrity"])
+                 , ("terrain_remove", ["storage_full", "storage_io", "storage_integrity"])
+                 , ("terrain_status", [])
+                 , ("terrain_grow_storage", ["storage_unsupported", "reservation_failed", "storage_io", "storage_size_not_increased"])
+                 , ("terrain_retry_storage", ["storage_io"])
+                 ]
     -- the fourteen codes are exactly the seven the failures above map to and the seven storage codes
     terrainCodes
       `shouldMatchList` [ "not_found", "arena_closed", "stale_view", "definition", "source_failure", "too_large", "name_in_use"
