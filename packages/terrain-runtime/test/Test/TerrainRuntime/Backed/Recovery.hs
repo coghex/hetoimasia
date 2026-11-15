@@ -113,6 +113,14 @@ failRead svc lease = do
   failed ← cellAt svc lease (tile 3 4 6) >>= expectRight >>= bounded . await svc
   failed `shouldSatisfy` \case Left (Failed (StorageFailed (FaultIo _))) → True; _ → False
 
+-- | A read of the column whose page comes back short, recording storage_integrity beside what is
+-- recorded already.
+invalidRead ∷ H.Probe → Service → ArenaLease → IO ()
+invalidRead probe svc lease = do
+  H.addRule probe 1 isRead H.ZeroBytes
+  failed ← cellAt svc lease (tile 3 4 6) >>= expectRight >>= bounded . await svc
+  failed `shouldSatisfy` \case Left (Failed (StorageFailed (FaultIntegrity _))) → True; _ → False
+
 retryAnswer ∷ Service → ArenaLease → IO (Either Settlement RetryAnswer)
 retryAnswer svc lease = retryArena svc lease >>= expectRight >>= bounded . await svc
 
@@ -182,6 +190,37 @@ spec = describe "Recovery decided like publication" $ do
       -- the arena stays readable
       _ ← readCell svc lease (tile 9 9 9)
       pausedOn svc lease `shouldReturn` [CondIo]
+
+  it "re-reads an invalid page before any write probe when a failed write and an invalid page are both recorded: the first retry clears integrity and answers the write's condition remaining, the next probes the write and clears it" $
+    withArena $ \probe svc lease → do
+      offset ← failWrite probe svc lease
+      invalidRead probe svc lease
+      pausedOn svc lease >>= (`shouldMatchList` [CondIo, CondIntegrity])
+      H.clearEvents probe
+      first ← retryAnswer svc lease
+      fmap (\a → (retriedCleared a, retriedRemaining a)) first `shouldBe` Right ([CondIntegrity], [CondIo])
+      -- no write probe while integrity was recorded: the failed page was not written
+      ops ← H.events probe
+      [() | OpWriteAt o _ ← ops, o == offset] `shouldBe` []
+      pausedOn svc lease `shouldReturn` [CondIo]
+      second ← retryAnswer svc lease
+      fmap (\a → (retriedCleared a, retriedRemaining a)) second `shouldBe` Right ([CondIo], [])
+      pausedOn svc lease `shouldReturn` []
+      _ ← removeCell' svc lease (tile 3 4 3)
+      pure ()
+
+  it "settles a retry while an invalid page persists beside a failed write: both remain, and no write probe is submitted" $
+    withArena $ \probe svc lease → do
+      offset ← failWrite probe svc lease
+      invalidRead probe svc lease
+      -- every read from now on comes back short
+      H.addRule probe (-1) isRead H.ZeroBytes
+      H.clearEvents probe
+      answer ← retryAnswer svc lease
+      fmap (\a → (retriedCleared a, retriedRemaining a)) answer `shouldBe` Right ([], [CondIo, CondIntegrity])
+      ops ← H.events probe
+      [() | OpWriteAt o _ ← ops, o == offset] `shouldBe` []
+      pausedOn svc lease >>= (`shouldMatchList` [CondIo, CondIntegrity])
 
   it "ends the owner with a defect when a retry's write probe meets a worker failure" $
     withArena $ \probe svc lease → do

@@ -994,11 +994,19 @@ prepareReq svc rid = do
       -- bounded revalidation of what paused the arena: the recorded writes are written again first (a
       -- write probe under the slot), then the recorded reads read again; capacity is checked when the
       -- retry is arbitrated. The answer stands on the basis read here.
+      --
+      -- NO WRITE PROBE WHILE INTEGRITY IS RECORDED (a store that read back invalid takes no write): the
+      -- retry re-reads what it can certify without one (integrity's pages, the read-only conditions'),
+      -- and SETTLES naming what remains; a condition with a write is probed by a later retry, once
+      -- integrity has cleared. A failure recorded after a write probe was staged moves a generation of
+      -- the basis, so that staging is stale and the retry is prepared again under this rule. So every
+      -- retry settles: it stages a release, a write probe the slot can take, a re-read, or its answer.
       let basis = creatorBasisOf arena
           (probed, writes) = retryProbe arena
           written = Map.lookup rid (stateWriteProbed st) >>= \(b, ok) → if b == basis then Just ok else Nothing
+          integrityHeld = CondIntegrity `elem` conditions (arenaStore arena)
        in case (writes, written) of
-            (_ : _, Nothing) → stageCreator svc rid aid arena (StagedWriteProbe writes)
+            (_ : _, Nothing) | not integrityHeld → stageCreator svc rid aid arena (StagedWriteProbe writes)
             _ →
               -- a condition with a write is certifiable only when its write probe passed
               let certifiable = [c | (c, hasWrite, _) ← probed, not hasWrite || written == Just True]
