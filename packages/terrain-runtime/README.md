@@ -252,8 +252,10 @@ failed or read back invalid is read again, validated; a page whose write failed 
 a probe-only transaction under the slot, which writes a known pattern, reads it back while it still
 holds the page and is then abandoned, never published (a page committed since was written after the
 failure and needs no probe). A condition clears only at the retry's own publication decision, while
-what it was prepared on still holds: a failure recorded meanwhile makes it stale and it is prepared
-again on the record as it then is, and a retry that is cancelled, not eligible or whose settlement
+what it was prepared on still holds: any failure recorded meanwhile, a repeat on a page already
+recorded included, makes its certification stale and it is prepared again on the record as it then
+is (a growth's or a release's preparation is made stale only by a failure that adds evidence, so a
+stream of repeat failures cannot keep it from its turn), and a retry that is cancelled, not eligible or whose settlement
 fails clears nothing. The probe's own failure is decided as any transaction's (pressure waits, a
 defect ends the owner, a closure ends it, a failure of another cause pauses for that cause). A
 condition whose evidence passed the bound, or holds a failure with no page, cannot be re-tested: the

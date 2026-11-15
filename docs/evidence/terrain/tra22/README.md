@@ -1,9 +1,9 @@
 # TRA-22 evidence: edits and discovery committed through the temporary store
 
-Code head `091c8e05`, run on 2026-11-15 from 08:43 to 09:09 UTC on macOS (arm64, 16 processors), with qualified
+Code head `221ce323`, run on 2026-11-15 from 09:43 to 10:09 UTC on macOS (arm64, 16 processors), with qualified
 GHC 9.14.1 and Cabal 3.18.1.0 on `PATH`, after removing the build directories of `hetoimasia-terrain`,
 `hetoimasia-terrain-runtime` and `hetoimasia-lua-engine`. Each suite ran once and nothing was rerun. Other projects
-loaded the machine (load average 3.6 to 5.1); nothing else of this repository ran. Contract:
+loaded the machine (load average 3.7 to 4.8); nothing else of this repository ran. Contract:
 `packages/terrain-runtime/README.md`.
 
 ## Commands
@@ -18,13 +18,13 @@ cabal test --project-file cabal.project.cpu hetoimasia-terrain-runtime:terrain-r
 
 | Suite | Examples | Failures | "Finished in" |
 | --- | --- | --- | --- |
-| terrain-tests | 905 | 0 | 48.1 s |
-| terrain-runtime-tests (8 jobs) | 1,041 | 0 | 157.0 s |
-| lua-engine-tests | 1,382 | 0 | 44.9 s |
-| terrain-runtime-full-depth-tests (probe) | 100 | 0 | 1,023.2 s |
+| terrain-tests | 905 | 0 | 46.6 s |
+| terrain-runtime-tests (8 jobs) | 1,043 | 0 | 156.6 s |
+| lua-engine-tests | 1,382 | 0 | 41.9 s |
+| terrain-runtime-full-depth-tests (probe) | 100 | 0 | 1,019.9 s |
 
-The build was warning-free under `-Werror`. The timed run, `terrain-runtime-tests` alone after the others (load 3.6
-before, 4.5 after): 1,041 examples, 0 failures, "Finished in" 156.2 s, 158.2 s for the whole process (budget 240 s).
+The build was warning-free under `-Werror`. The timed run, `terrain-runtime-tests` alone after the others (load 3.7
+before, 4.2 after): 1,043 examples, 0 failures, "Finished in" 156.6 s, 158.7 s for the whole process (budget 240 s).
 
 Fixtures: each backed example opens its arenas in a fresh `withSystemTempDirectory` directory with a 64 MiB
 allowance, so no example fills the ordinary drive. `storage_full` is reached under a pinned old version: in the
