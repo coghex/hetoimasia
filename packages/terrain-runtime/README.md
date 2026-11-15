@@ -315,9 +315,10 @@ incarnation is its identity); and for each held region two parts, each `PartRead
   the copy's knowledge revision) as compressed column runs; a uniform region is one class of one run.
 
 `regionCell` and `regionCellKnowledge` answer one cell. Both parts are packed, so what a copy holds grows
-with a region's intervals and knowledge runs, never with its cells (`regionSnapshotFootprint`: a 128-byte
-record and, per region, a 200-byte entry and each part's short byte string, 16 bytes and the payload
-rounded to a word). A copy holds no store reader, pin, page or window, and grants no authority: no
+with a region's intervals and knowledge runs, never with its cells (`regionSnapshotFootprint`, every heap
+object of the copy counted, an upper bound of a walk of its heap without the shared source: a 128-byte
+record and, per region, a 200-byte entry and each part's short byte string, 32 bytes (its boxed array and
+the array's header) and the payload rounded to a word). A copy holds no store reader, pin, page or window, and grants no authority: no
 request, removal, precondition or settlement accepts it.
 
 **The build** (owner) is a pinned read like any other: the gather table, a reader pin and its credit,
@@ -344,8 +345,8 @@ revision.
 **Its charge**, from admission: a command slot and the request's record (160 bytes), like any request; a
 copied hold in the model (`Copied`: hold records on the camera's share of staging; no residency,
 protection or recency); and, in the snapshot backing bank (`configRetainedBytes`), a reservation of the
-most the result can hold (`regionSnapshotReservation`: the record, 25,840 bytes a region, and one
-region's build scratch, 747,520 bytes). In the settlement transaction the charge becomes the copy's exact
+most the result can hold (`regionSnapshotReservation`: the record, 25,872 bytes a region, and one
+region's build scratch, 747,520 bytes). In the settlement transaction the charge becomes the copy's
 footprint, kept until the release. The borrow counts among the borrowers service closure waits for.
 `inspectRegionalSTM` reports each borrow's reservation and footprint apart.
 
