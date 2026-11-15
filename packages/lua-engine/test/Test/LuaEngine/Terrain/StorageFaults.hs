@@ -15,7 +15,7 @@ import qualified Data.Text as Text
 import Hetoimasia.LuaEngine.Profile (fixedM1Profile)
 import Hetoimasia.LuaEngine.Terrain (noTerrainHooks)
 import Hetoimasia.Terrain.Coordinate (decomposeTile, mkLocalCoord, tileCoord)
-import Hetoimasia.Terrain.Residency (RegionDemand (..), coverageTile)
+import Hetoimasia.Terrain.Residency (RegionDemand (..), Revision (..), coverageTile)
 import Hetoimasia.Terrain.Runtime
 import Hetoimasia.Terrain.Runtime.Store (StoreSpec (..), maxClaimPages, pageSize, reservePages)
 import qualified Hetoimasia.Scripting.Lua.Instance as Instance
@@ -84,6 +84,8 @@ explained rig world body =
   body `onException` do
     printed ← outLines world
     trace ← readTVarIO (rgTrace rig)
+    warned ← errLines world
+    putStrLn ("warned: " <> show warned)
     putStrLn ("printed: " <> show printed)
     putStrLn ("trace: " <> show (reverse trace))
 
@@ -206,7 +208,10 @@ growthScript =
     ]
 
 spec ∷ Spec
-spec = describe "Terrain storage outcomes" $ do
+spec = outcomesSpec >> lifecycleSpec
+
+outcomesSpec ∷ Spec
+outcomesSpec = describe "Terrain storage outcomes" $ do
   describe "every new expected code, read and unread, and an explicit recovery that repeats nothing" $
     mapM_
       ( \(role, over, drive) →
@@ -339,3 +344,237 @@ spec = describe "Terrain storage outcomes" $ do
                        , "after the largest\tsuccess\t" <> bytes 112 <> " 0 ready"
                        , "grown at last\tsuccess\ttrue " <> bytes 160
                        ]
+
+-- | A status in the form the scripts print it ('show' of the copied record): what the service's own status says, rendered by the
+-- example, to compare with what the script was handed at the same moment.
+rendered ∷ ArenaStatus → Text
+rendered s =
+  "{content_revision="
+    <> revision (statusContentRevision s)
+    <> ",discovery={pending_items="
+    <> figure (statusPendingItems s)
+    <> ",state="
+    <> discovery
+    <> "},knowledge_revision="
+    <> revision (statusKnowledgeRevision s)
+    <> ",storage={pending_reclaim_bytes="
+    <> figure (statusPendingReclaimBytes s)
+    <> ",pending_reserved_bytes="
+    <> figure (statusPendingReservedBytes s)
+    <> reason
+    <> ",reserved_bytes="
+    <> figure (statusReservedBytes s)
+    <> ",state="
+    <> state
+    <> ",used_bytes="
+    <> figure (statusUsedBytes s)
+    <> "}}"
+  where
+    figure = Text.pack . show
+    revision (Revision w) = figure w
+    discovery = case statusDiscovery s of
+      DiscoveryIdle → "idle"
+      DiscoveryPending → "pending"
+      DiscoveryPaused → "paused"
+    (state, reason) = case statusStorage s of
+      StorageReady → ("ready", "")
+      StoragePaused conds → ("paused", ",reason=" <> worst conds)
+    worst conds
+      | CondIntegrity `elem` conds = "storage_integrity"
+      | CondIo `elem` conds = "storage_io"
+      | otherwise = "storage_full"
+
+-- | Each status the script takes, printed under its label, at a moment the example holds still: fresh, after an edit, while discovery
+-- of the edit is held, while a reader pins retired history, once the pin has gone, and after its own copy was changed.
+statusSteps ∷ Script
+statusSteps =
+  stepsScript
+    "DEF"
+    storagePrelude
+    [ Step "fresh" "TEST_WAIT('fresh') return api.terrain.status(A)" "return show(v)"
+    , Step "edit" "TEST_WAIT('edit') return api.terrain.remove(A, {x = 0, y = 0, z = 0})" "return 'ok'"
+    , Step "after the edit" "TEST_WAIT('after the edit') return api.terrain.status(A)" "return show(v)"
+    , Step "edit held" "TEST_WAIT('arm discovery') return api.terrain.remove(A, {x = 1, y = 0, z = 0})" "return 'ok'"
+    , Step "discovery held" "TEST_WAIT('discovery held') return api.terrain.status(A)" "return show(v)"
+    , Step "pinned edits" "TEST_WAIT('pin') for i = 2, 9 do api.terrain.remove(A, {x = i, y = 0, z = 0}) end return api.terrain.remove(A, {x = 10, y = 0, z = 0})" "return 'ok'"
+    , Step "pinned" "TEST_WAIT('pinned') return api.terrain.status(A)" "return v.storage.pending_reclaim_bytes .. ' ' .. v.storage.used_bytes"
+    , Step "unpinned" "TEST_WAIT('unpinned') return api.terrain.status(A)" "return show(v)"
+    , Step "copy changed" "return api.terrain.status(A)" "v.storage.reserved_bytes = 1 v.storage.state = 'changed' v.extra = true return 'changed'"
+    , Step "copy again" "return api.terrain.status(A)" "return show(v)"
+    ]
+
+-- | A gameplay creator whose growth is prepared before its position and committed at it, and another cancelled before it; beside it, a
+-- presentation instance that runs while the gameplay owner waits.
+logicalGrowth ∷ Script
+logicalGrowth =
+  script
+    { scPrelude = terrainPrelude <> storagePrelude
+    , scInit = ["self.s = 0", "if api.role == 'gameplay' then self.q = api.terrain.open('main', DEF) end", "self.n = 0"]
+    , scUpdate =
+        [ "if api.role == 'presentation' then self.n = self.n + 1 print('presentation', self.n) return end"
+        , "if self.s == 0 then"
+        , "  local t = settle(api, self.q)"
+        , "  if t then self.a = t.value self.q = api.terrain.grow_storage(self.a, 96 * MIB) print('asked') self.s = 1 end"
+        , "elseif self.s == 1 then"
+        , "  local t = settle(api, self.q)"
+        , "  if t then"
+        , "    print('grown', t.status, t.value.changed, t.value.reserved_bytes)"
+        , "    local r = api.terrain.grow_storage(self.a, 128 * MIB)"
+        , "    print('cancel before its position', api.request.cancel(r))"
+        , "    self.q = api.terrain.status(self.a) self.s = 2"
+        , "  end"
+        , "elseif self.s == 2 then"
+        , "  local t = settle(api, self.q)"
+        , "  if t then print('after the cancel', t.value.storage.reserved_bytes) print('done') self.s = 3 end"
+        , "end"
+        ]
+    }
+
+-- | A creator whose growth is held at its reservation when its instance is stopped.
+growthAtEnd ∷ Script
+growthAtEnd =
+  script
+    { scPrelude = terrainPrelude <> storagePrelude
+    , scInit = ["self.s = 0", "self.q = api.terrain.open('main', DEF)"]
+    , scUpdate =
+        [ "if self.s == 0 then"
+        , "  local t = settle(api, self.q)"
+        , "  if t then self.a = t.value TEST_WAIT('arm') self.g = api.terrain.grow_storage(self.a, 128 * MIB) TEST_WAIT('held') print('held') self.s = 1 end"
+        , "end"
+        ]
+    }
+
+lifecycleSpec ∷ Spec
+lifecycleSpec = describe "Terrain storage status and lifetimes" $ do
+  it "hands a script the service's own coherent status: fresh, after an edit, while discovery is pending, while a reader pins retired history and after, and a copy whose change changes nothing" $ do
+    faults ← newFaults
+    discoveryGate ← newGate
+    disarmGate discoveryGate
+    let selects = \case PointDiscoveryGranted {} → True; _ → False
+    pinned ← newHeld
+    (`finally` (openGate discoveryGate >> openHeld pinned)) $
+      withRigPort defaultConfig (gatedProbe selects discoveryGate) noTerrainHooks (seamPort faults) $ \rig →
+        withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource statusSteps)]) $ \world _ runtime →
+          withFvm world runtime (presentationOver rig) $ \fvm → explained rig world $ do
+            _ ← spawn world fvm "modules-test" mainPath
+            let svc = rgService rig
+                go = advanceClock world 2000000000
+                -- the script reaches its next wait in the very update it printed the status it took: what it printed is published when
+                -- that update returns, so each status is compared at the end, with the service's own status read while the script waited
+                reached name = driveUntil world go (elem ("entered " <> name) <$> readTVarIO (rgTrace rig))
+            observer ← either (fail . show) pure =<< registerClient svc
+            lease ← attachArena svc observer (arenaName rig "modules-test" "main") >>= either (fail . show) pure >>= await svc >>= either (fail . show) pure
+            let ownStatus = arenaStatus svc lease >>= either (fail . show) pure
+            atWait rig world go "fresh" (pure ())
+            reached "edit"
+            fresh ← ownStatus
+            signalRig rig "edit"
+            atWait rig world go "after the edit" (pure ())
+            reached "arm discovery"
+            edited ← ownStatus
+            (statusContentRevision edited, statusUsedBytes edited > statusUsedBytes fresh) `shouldBe` (Revision 1, True)
+            -- discovery of the next edit is held at its grant: its obligations are pending, and the status says so without waiting for it
+            armGate discoveryGate
+            signalRig rig "arm discovery"
+            reached "discovery held"
+            awaitReached discoveryGate
+            signalRig rig "discovery held"
+            reached "pin"
+            discovering ← ownStatus
+            (statusDiscovery discovering, statusPendingItems discovering > 0) `shouldBe` (DiscoveryPending, True)
+            openGate discoveryGate
+            quiescent svc
+            -- a reader pins an old version (a view's load, its page read held): what later edits retire cannot be reclaimed
+            gate ← addSeamGateOnce faults isRead
+            holdIn pinned gate
+            view ← openView svc observer >>= either (fail . show) pure
+            let (far, _) = decomposeTile (either (error . show) id (tileCoord 100 100 0))
+            _ ← setViewDemand svc view lease [RegionDemand far (either (error . show) coverageTile (mkLocalCoord 0 0 0))] >>= either (fail . show) pure
+            awaitSeamGate gate
+            signalRig rig "pin"
+            reached "pinned"
+            bounded (atomically (inspectCensusSTM svc >>= check . all censusSettled . censusRequests))
+            signalRig rig "pinned"
+            reached "unpinned"
+            held ← ownStatus
+            statusPendingReclaimBytes held `shouldSatisfy` (> 0)
+            -- the pin goes: the view closes, its held read returns, and the service reclaims what was retired
+            clearViewDemand svc view >>= either (fail . show) pure
+            closeView svc view
+            openHeld pinned
+            quiescent svc
+            released ← ownStatus
+            statusPendingReclaimBytes released `shouldSatisfy` (< statusPendingReclaimBytes held)
+            signalRig rig "unpinned"
+            driveUntil world go (elem "done" <$> outLines world)
+            printed ← outLines world
+            printed
+              `shouldContain` [ "fresh\tsuccess\t" <> rendered fresh
+                              , "edit\tsuccess\tok"
+                              , "after the edit\tsuccess\t" <> rendered edited
+                              , "edit held\tsuccess\tok"
+                              , "discovery held\tsuccess\t" <> rendered discovering
+                              ]
+            -- the reading under the pin: retired history waiting to be reclaimed, a part of what is used
+            case [Text.words (Text.drop (Text.length "pinned\tsuccess\t") l) | l ← printed, "pinned\tsuccess\t" `Text.isPrefixOf` l] of
+              [[reclaim, used]] → (read (Text.unpack reclaim) > (0 ∷ Integer), read (Text.unpack reclaim) <= (read (Text.unpack used) ∷ Integer)) `shouldBe` (True, True)
+              other → expectationFailure ("the pinned status printed " <> show other)
+            printed `shouldContain` ["unpinned\tsuccess\t" <> rendered released, "copy changed\tsuccess\tchanged", "copy again\tsuccess\t" <> rendered released, "done"]
+
+  it "holds a gameplay growth unreserved and uncommitted before its position, commits it at its tick, keeps the allowance a growth cancelled before its position would change, and lets presentation run" $ do
+    faults ← newFaults
+    withRigPort defaultConfig noProbe noTerrainHooks (seamPort faults) $ \rig →
+      withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource logicalGrowth)]) $ \world control runtime →
+        withFvm world runtime (gameplayOver rig) $ \logical →
+          withFvm world runtime (presentationOver rig) $ \presentation → explained rig world $ do
+            _ ← spawn world logical "modules-test" mainPath
+            _ ← spawn world presentation "modules-test" mainPath
+            let svc = rgService rig
+            driveUntil world (tickBy control logical 1) (elem "asked" <$> outLines world)
+            observer ← either (fail . show) pure =<< registerClient svc
+            lease ← attachArena svc observer (arenaName rig "modules-test" "main") >>= either (fail . show) pure >>= await svc >>= either (fail . show) pure
+            -- no tick is granted: the growth neither reserves nor commits before its position (#665 grants a growth the slot only once
+            -- its host is eligible), its request is unsettled, and the presentation instance runs
+            ((\s → (statusReservedBytes s, statusPendingReservedBytes s)) <$> (arenaStatus svc lease >>= either (fail . show) pure)) `shouldReturn` (fromInteger (mib 64), 0)
+            (any (not . censusSettled) . censusRequests <$> atomically (inspectCensusSTM svc)) `shouldReturn` True
+            earlier ← length . filter ("presentation\t" `Text.isPrefixOf`) <$> outLines world
+            driveUntil world (advanceClock world 2000000000) ((> earlier + 2) . length . filter ("presentation\t" `Text.isPrefixOf`) <$> outLines world)
+            outLines world >>= (`shouldNotSatisfy` any ("grown\t" `Text.isPrefixOf`))
+            -- the tick: the growth commits, and the next is cancelled before its position
+            driveUntil world (tickBy control logical 1) (elem "done" <$> outLines world)
+            printed ← outLines world
+            [l | l ← printed, not ("presentation\t" `Text.isPrefixOf` l)]
+              `shouldBe` [ "asked"
+                         , "grown\tsuccess\ttrue\t" <> Text.pack (show (mib 96))
+                         , "cancel before its position\tcancelled"
+                         , "after the cancel\t" <> Text.pack (show (mib 96))
+                         , "done"
+                         ]
+            quiescent svc
+            s ← arenaStatus svc lease >>= either (fail . show) pure
+            (statusReservedBytes s, statusPendingReservedBytes s) `shouldBe` (fromInteger (mib 96), 0)
+
+  it "retires a growth held at its reservation when its creator's instance ends: the arena closes, the extra is given back, and nothing is left" $ do
+    faults ← newFaults
+    held ← newHeld
+    (`finally` openHeld held) $
+      withRigPort defaultConfig noProbe noTerrainHooks (seamPort faults) $ \rig →
+        withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource growthAtEnd)]) $ \world _ runtime →
+          withFvm world runtime (presentationOver rig) $ \fvm → explained rig world $ do
+            spawned ← spawn world fvm "modules-test" mainPath
+            let go = advanceClock world 2000000000
+                svc = rgService rig
+            gate ← atWaitGate rig world go "arm" (addSeamGate faults isReserve)
+            holdIn held gate
+            driveUntil world go (elem "entered held" <$> readTVarIO (rgTrace rig))
+            awaitSeamGate gate
+            signalRig rig "held"
+            driveUntil world go (elem "held" <$> outLines world)
+            stopSpawned spawned
+            driveUntil world go ((== Just Instance.Stopped) <$> phaseOf spawned)
+            openHeld held
+            driveUntil world go ((== 0) <$> limitHeld svc "arenas")
+            quiescent svc
+            limitHeld svc "leases" `shouldReturn` 0
+            inspectBacked svc `shouldReturn` []
+            inspectInvariants svc `shouldReturn` []
