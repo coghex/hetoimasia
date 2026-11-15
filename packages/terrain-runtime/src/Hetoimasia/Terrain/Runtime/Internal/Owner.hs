@@ -1292,13 +1292,13 @@ publishSlot svc task tid plan = do
           Just req
             | CRemove tile precondition <- reqCmd req
             , StagedPhase sg <- reqPhase req
-            , StagedRemoval prepared <- stagedWork sg → do
+            , StagedRemoval _ <- stagedWork sg → do
                 let newContent = D.authContent (effAuthority (plEffects plan))
                     (region, _) = decomposeTile tile
                     generation = regionGenerationOf st aid region
                 unless (effTerrain (plEffects plan)) $
                   failWith svc (OwnerDefect "a removal staged as a change planned no change of terrain") []
-                rebuilt <- evaluate (rebuildCell (arenaSource arena) (preparedChanges prepared) (arenaPalette arena) (arenaResident arena) tile)
+                rebuilt <- evaluate (rebuildCell (arenaPalette arena) (arenaResident arena) tile)
                 case (rebuilt, generation) of
                   (Right (palette, resident, growth), Just g) → do
                     _ <- evaluate palette

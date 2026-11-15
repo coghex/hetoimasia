@@ -18,7 +18,8 @@ import Control.Exception (finally)
 import Data.List (nub)
 import qualified Data.Map.Strict as Map
 import Hetoimasia.Terrain.Changes (changeColumnBytes, changeIntervalBytes)
-import Hetoimasia.Terrain.Coordinate (axisValue)
+import Hetoimasia.Terrain.Cell (Cell (..))
+import Hetoimasia.Terrain.Coordinate (axisValue, decomposeTile)
 import Hetoimasia.Terrain.Cell (zRangeHi, zRangeLo)
 import Hetoimasia.Terrain.Query (Occupied (..), QueryLimits (..), Run (..), defaultQueryLimits)
 import Hetoimasia.Terrain.Source (CellSpec (..), LayerSpec (..), PatchSpec (..), SourceSpec (..))
@@ -116,6 +117,21 @@ spec = describe "What a request keeps of a column" $ do
       [kept | (_, _, kept, _, _) ← read'] `shouldSatisfy` all (<= 5)
       [cap | (_, _, _, cap, _) ← read'] `shouldSatisfy` all (== 5)
       mapM_ (\(_, pin, _, cap, levels) → contained pin cap (length levels)) read'
+
+  -- column (3, 4) resident over two vertical regions, one segment each: two removals in the first, a
+  -- third in the second
+  it "patches resident detail at the removed cell only: after removals in two segments of one column, every cell of both segments is what the store answers" $
+    withService defaultConfig $ \svc → do
+      (_, lease) ← openMain svc "main"
+      _ ← okOf (columnAt svc lease (column 3 4) (range 0 64)) >>= await svc >>= expectSuccess
+      mapM_ (\z → removeCell' svc lease (tile 3 4 z)) [9, 5, 35]
+      let levels = [0 .. 63]
+          regions = nub [fst (decomposeTile (tile 3 4 z)) | z ← levels]
+      authority ← mapM (\z → cellValue <$> readCell svc lease (tile 3 4 z)) levels
+      detail ← withSnapshot svc lease regions $ \snapshot → pure [snapshotCell snapshot (tile 3 4 z) | z ← levels]
+      -- every level known, and each the store's cell (the three removed ones air)
+      detail `shouldBe` Right (map Known authority)
+      [z | (z, Air) ← zip levels authority] `shouldBe` [5, 9, 35] <> [40 .. 63]
 
   -- the same dug column: the surface's window slides, and the request ends as its next read is prepared
   it "keeps no window for a surface cancelled after its window slid, nor for one whose arena closed" $

@@ -37,6 +37,7 @@ module Hetoimasia.Terrain.Resident
   , emptyResident
   , ResidentError (..)
   , materialize
+  , removeResidentCell
   , discardRange
   , discardRegion
   , discardColumn
@@ -114,6 +115,22 @@ materialize maxLevels source changes palette0 (Resident columns) column range@(Z
       built ← either (Left . ResidentSegment) Right (buildSegment (AxisCoord start) cells)
       pure (palette', Map.insert start built (Map.difference segments touching))
     segStart = (\(AxisCoord z) → z) . segmentStart
+
+-- | One cell of a column made air in the detail that is resident, as a removal of a whole cell makes
+-- it: the segment holding the level is rebuilt from ITS OWN cells with that one cell air, every other
+-- cell as it was (the source and the changes are not read, so nothing outside the cell is re-derived).
+-- A level no segment holds changes nothing: a later 'materialize' makes it known from the source and
+-- the complete changes. Bounded by one segment; on a refusal nothing is returned.
+removeResidentCell ∷ Resident → Column → Int64 → Either ResidentError Resident
+removeResidentCell (Resident columns) column level = case Map.lookup column columns of
+  Nothing → Right (Resident columns)
+  Just segments → case Map.lookupLE level segments of
+    Just (start, segment)
+      | toInteger level < segmentEnd segment → do
+          let cells = [if start + offset == level then packedAir else cell | (offset, cell) ← zip [0 ..] (segmentCells segment)]
+          built ← either (Left . ResidentSegment) Right (buildSegment (AxisCoord start) cells)
+          Right (Resident (Map.insert column (Map.insert start built segments) columns))
+    _ → Right (Resident columns)
 
 foldlM' ∷ (b → a → Either e b) → b → [a] → Either e b
 foldlM' _ acc [] = Right acc
