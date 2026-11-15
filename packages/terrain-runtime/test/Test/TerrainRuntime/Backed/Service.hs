@@ -71,17 +71,18 @@ spec = describe "The backed terrain service" $ do
       other → expectationFailure ("expected the edit bank refused one byte short, got " <> either show (const "acceptance") other)
     withService (config need) (\_ → pure ())
 
-  -- A column query or a surface keeps at most one run more than an answer may return, inside the
-  -- reader's pin credit (32 pages of 4,288 bytes, 137,216): what it keeps must leave the 9 pages one
-  -- read step needs (a root-to-leaf path of at most 8 levels, and the next leaf). At 6,160 returned
-  -- runs it keeps 6,161 x 16 + 48 = 98,624 and leaves 38,592, 9 pages exactly; at 6,161 it would keep
-  -- 98,640 where at most 137,216 - 9 x 4,288 = 98,624 may be kept.
+  -- A column query, or a surface's window, of at most the range limit keeps at most what that many
+  -- levels can hold (levels / 2 + 1 coalesced runs), inside the reader's pin credit (32 pages of 4,288
+  -- bytes, 137,216): what it keeps must leave the 9 pages one read step needs (a root-to-leaf path of at
+  -- most 8 levels, and the next leaf). At 12,321 levels it keeps 6,161 x 16 + 48 = 98,624 and leaves
+  -- 38,592, 9 pages exactly; at 12,322 it would keep 98,640 where at most 137,216 - 9 x 4,288 = 98,624
+  -- may be kept.
   it "refuses at construction query limits under which a read keeps more runs than its pin credit holds beside one read step's pages, and accepts the largest that leaves them" $ do
-    let config n = defaultConfig {configQueryLimits = defaultQueryLimits {limitReturnedRuns = n}}
-    try (withService (config 6161) (\_ → pure ())) >>= \case
+    let config n = defaultConfig {configQueryLimits = defaultQueryLimits {limitRangeLevels = n}}
+    try (withService (config 12322) (\_ → pure ())) >>= \case
       Left (ConfigQueryKeep kept allowed) → (kept, allowed) `shouldBe` (98640, 98624)
       other → expectationFailure ("expected the query limits refused, got " <> either show (const "acceptance") other)
-    withService (config 6160) (\_ → pure ())
+    withService (config 12321) (\_ → pure ())
 
   -- The control account must hold, beside the store's own minimum (the worst transaction's control
   -- records, every reader record, the queued descriptors), the storage service's records at their

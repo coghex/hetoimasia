@@ -824,7 +824,7 @@ delivered svc key gathered = (case key of GatherRequest rid → probe svc (Point
         forgetLoad svc jid
         markFreed svc
     GatherRequest _ → pure ()
-  (GatherRequest rid, GatheredRuns runs revision (peak, pin)) → probe svc (PointGatherWindow rid peak pin) >> probe svc (PointGatheredRuns rid (length runs)) >> stageFromRuns svc rid runs revision
+  (GatherRequest rid, GatheredRuns runs revision (peak, pin, cap, asked)) → probe svc (PointGatherWindow rid peak pin (length runs) cap [(lo, hi) | (_, lo, hi) ← asked]) >> probe svc (PointGatheredRuns rid (length runs)) >> stageFromRuns svc rid runs revision
   (GatherRequest rid, GatheredFailed handling) → handleRequest svc rid handling
   (GatherRequest rid, GatheredKnowledge known content knowledge) → do
     st <- atomically (readSt svc)
@@ -872,8 +872,16 @@ stageFromRuns svc rid runs revision = do
   forM_ (Map.lookup rid (stateRequests st)) $ \req →
     forM_ (reqArena req >>= \aid → (,) aid <$> Map.lookup aid (stateArenas st)) $ \(aid, arena) →
       -- runs read at a version the arena has moved past are read again
-      when (arenaRevision arena == revision) $
-        case changesOfRuns config runs of
+      when (arenaRevision arena == revision) $ do
+       let source = arenaSource arena
+           window = case reqCmd req of
+             CSurface column → surfaceWindow st source column
+             _ → Nothing
+           -- a surface knows too that no cell above its window is occupied
+           known = case (reqCmd req, window) of
+             (CSurface column, Just (_, hi)) → surfaceKnown source column hi runs
+             _ → runs
+       case changesOfRuns config known of
           Left why → atomically (terminate svc rid (Failed (HostFailure ("the removed runs a read gathered are not valid changes: " <> why))))
           -- The preparation runs under the request's credits (R1): from here to its safe point nothing the
           -- request holds is released, whoever cancels it or closes its arena meanwhile.
@@ -884,26 +892,25 @@ stageFromRuns svc rid runs revision = do
                 Just (Left failure) → atomically (terminate svc rid (Failed (HostFailure (Text.pack ("preparation failed: " <> show failure)))))
                 Just (Right (Left why)) → atomically (terminate svc rid (Failed (HostFailure (Text.pack ("preparation refused: " <> why)))))
                 Just (Right (Right prepared)) → void $ stage svc rid (Just aid) revision (StagedRemoval prepared)
-            -- A SURFACE IS ANSWERED ONLY ON WHAT WAS READ: the highest solid cell is found inside the levels
-            -- the gather read, or the next read reaches twice as far down (cells below what was read look
-            -- untouched, so an answer below them is not yet known)
-            -- a surface that keeps more runs than an answer may return is too large, as a column query is
-            CSurface _
-              | length runs > Q.limitReturnedRuns (configQueryLimits config) →
-                  atomically (terminate svc rid (Failed (TooLarge (Q.TooManyRuns (Q.limitReturnedRuns (configQueryLimits config))))))
+            -- A SURFACE IS ANSWERED ONLY ON WHAT WAS READ: the highest solid cell is found inside the window
+            -- the gather read (nothing above it is occupied: 'surfaceKnown'), or THE WINDOW SLIDES: the next
+            -- read is the window below this one, twice as deep and at most 'limitRangeLevels', and keeps
+            -- nothing of this one (cells below what was read look untouched, so an answer below them is not
+            -- yet known; a run reaching up from below is found again by the next read's floor)
             CSurface column
-              | Just (floorRead, _) ← surfaceWindow st (arenaSource arena) column
-              , Just found ← Q.highestOccupied (arenaSource arena) changes column
-              , axisValue (Q.occupiedLevel found) < floorRead →
-                  atomically $ modifySt svc $ \s → case surfaceWindow s (arenaSource arena) column of
-                    Just (lo, hi) →
-                      s
-                        { stateSurfaceFloor = Map.insert rid (lo - 2 * (hi - lo)) (stateSurfaceFloor s)
-                        , stateRequests = Map.adjust (\q → q {reqPhase = Waiting}) rid (stateRequests s)
-                        }
+              | Just (lo, _) ← window
+              , Just found ← Q.highestOccupied source changes column
+              , axisValue (Q.occupiedLevel found) < lo →
+                  atomically $ modifySt svc $ \s → case surfaceWindow s source column of
+                    Just (lo', hi') →
+                      let deeper = max 1 (min (fromIntegral (Q.limitRangeLevels (configQueryLimits config))) (2 * (hi' - lo')))
+                       in s
+                            { stateSurfaceWindow = Map.insert rid (lo' - deeper, lo') (stateSurfaceWindow s)
+                            , stateRequests = Map.adjust (\q → q {reqPhase = Waiting}) rid (stateRequests s)
+                            }
                     Nothing → s
             cmd →
-              running svc rid (atomically (modifySt svc (\s → s {stateSurfaceFloor = Map.delete rid (stateSurfaceFloor s)})) >> probe svc (PointCaptured rid aid revision) >> evaluate (readAnswer config aid revision (arenaSource arena) changes cmd)) >>= \case
+              running svc rid (atomically (modifySt svc (\s → s {stateSurfaceWindow = Map.delete rid (stateSurfaceWindow s)})) >> probe svc (PointCaptured rid aid revision) >> evaluate (readAnswer config aid revision source changes cmd)) >>= \case
                 Nothing → pure ()
                 Just (Left failure) → atomically (terminate svc rid (Failed failure))
                 Just (Right (answer, demands))
@@ -916,7 +923,7 @@ stageFromRuns svc rid runs revision = do
   where
     config = serviceConfig svc
     -- the levels a surface read reads now: [lo, hi)
-    surfaceWindow s source column = case commandRanges source (Map.lookup rid (stateSurfaceFloor s)) (CSurface column) of
+    surfaceWindow s source column = case commandRanges (configQueryLimits config) source (Map.lookup rid (stateSurfaceWindow s)) (CSurface column) of
       [(_, lo, hi)] → Just (lo, hi)
       _ → Nothing
 
@@ -1000,8 +1007,8 @@ prepareReq svc rid = do
                     _ → started aid (ReadPages pages certifiable basis)
     CKnowledge tile → maybe (pure False) (\aid → started aid (ReadKnowledge tile)) (reqArena req)
     cmd → withArena req $ \(aid, arena) →
-      let ranges = commandRanges (arenaSource arena) (Map.lookup rid (stateSurfaceFloor st)) cmd
-       in started aid (ReadRuns ranges (keepCap (configQueryLimits (serviceConfig svc)) ranges cmd))
+      let ranges = commandRanges (configQueryLimits (serviceConfig svc)) (arenaSource arena) (Map.lookup rid (stateSurfaceWindow st)) cmd
+       in started aid (ReadRuns ranges (keepCap ranges cmd))
 
 -- | Publish staged work and tell the host it is ready. Work whose arena has moved
 -- on since it was computed is dropped; the owner computes it again. A readiness

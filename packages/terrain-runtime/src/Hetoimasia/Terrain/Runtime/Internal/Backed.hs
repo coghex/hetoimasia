@@ -582,7 +582,7 @@ initialStore config aid ident cfg =
 data Gathered
   = -- | Every run of the columns, read from one committed version, with that version's
     -- content revision.
-    GatheredRuns ![(Column, Int64, Int64)] !Revision !(Int, Int)
+    GatheredRuns ![(Column, Int64, Int64)] !Revision !(Int, Int, Int, [(Column, Int64, Int64)])
   | -- | What is known of the cell, read from one committed version, with its content and knowledge revisions.
     GatheredKnowledge !D.CellKnowledge !Revision !Revision
   | -- | A retry's probe: the conditions it was for, and whether every recorded page read back as it must.
@@ -650,14 +650,14 @@ readStepPages ∷ Int
 readStepPages = maxLevel + 2
 
 -- | The query limits leave every read kind the pages one read step needs beside what it keeps: the
--- worst kind (a column query or a surface, at most the returned-run limit and one more) is refused at
--- construction otherwise.
+-- worst kind (a column query, or a surface's window, over the range limit: 'rangeKeep' of it) is
+-- refused at construction otherwise.
 queryKeepChecked ∷ Config → Either ConfigError ()
 queryKeepChecked config
   | keptPinLimit worst 1 < readStepPages = Left (ConfigQueryKeep (toInteger (keptRunsBytes worst 1)) (toInteger (fromIntegral A.readerPinnedCacheBytes - readStepPages * windowPageBytes)))
   | otherwise = Right ()
   where
-    worst = Q.limitReturnedRuns (configQueryLimits config) + 1
+    worst = rangeKeep 0 (fromIntegral (Q.limitRangeLevels (configQueryLimits config)))
 
 -- | One step of a pinned read. When it ends, its pin and credit are released in the transaction
 -- that removes it, and then its owner is given the result.
@@ -681,7 +681,7 @@ stepGatherTask svc key deliver = do
             , case p of
                 GMore → Left WakeNow
                 GBlocked wait → Left (WakeOn wait)
-                GDone runs → Right (GatheredRuns runs (gatherRevision task) (gatherPeakWindow g', gatherPin g'))
+                GDone runs → Right (GatheredRuns runs (gatherRevision task) (gatherPeakWindow g', gatherPin g', gatherCap g', gatherAsked g'))
                 GFailed handling → Right (GatheredFailed handling)
                 GDrained → Right GatheredNothing
             )

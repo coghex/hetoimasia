@@ -522,8 +522,9 @@ data Point
     PointGatheredRuns !RequestId !Int
   | -- | A request's pinned read submitted the read of this page of its store.
     PointGatherPage !RequestId !PageNo
-  | -- | A request's pinned read ended: the most pages its window held, and the pages it may pin.
-    PointGatherWindow !RequestId !Int !Int
+  | -- | A request's pinned read ended: the most pages its window held, the pages it may pin, the runs it
+    -- kept and the most it could keep (its cap), and the levels it read, @[lo, hi)@ of each column.
+    PointGatherWindow !RequestId !Int !Int !Int !Int ![(Int64, Int64)]
   deriving stock (Eq, Show)
 
 -- | An unexpected defect, kept with bounded context.
@@ -1152,9 +1153,9 @@ data St = St
     -- page it probed took the write. Written by the owner when the probe ends; read (and only while the
     -- basis still holds) when the retry is prepared again; deleted when the retry finishes.
     stateWriteProbed ∷ !(Map RequestId (CreatorBasis, Bool))
-  , -- | A surface read's lower bound, once a read found its answer below what it had read (the next
-    -- read reaches lower). Written and deleted by the owner's staging of the read.
-    stateSurfaceFloor ∷ !(Map RequestId Int64)
+  , -- | A surface read's window, @[lo, hi)@, once the levels it had read held no occupied cell (the
+    -- next read is the window below). Written and deleted by the owner's staging of the read.
+    stateSurfaceWindow ∷ !(Map RequestId (Int64, Int64))
   , -- | The fault epoch: moved by every failure a pause adds to its record ('faultGeneration').
     -- Written by the owner only; never reset.
     stateFaultEpoch ∷ !Word64
@@ -1213,7 +1214,7 @@ initialState config limits =
     , stateIdleRepeats = []
     , stateFaultEpoch = 0
     , stateWriteProbed = Map.empty
-    , stateSurfaceFloor = Map.empty
+    , stateSurfaceWindow = Map.empty
     , stateClosing = Map.empty
     , stateLoadJobs = Map.empty
     , stateNextSource = 1

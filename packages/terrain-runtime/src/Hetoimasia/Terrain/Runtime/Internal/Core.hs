@@ -43,6 +43,8 @@ module Hetoimasia.Terrain.Runtime.Internal.Core
   , resultRecordBytes
   , surfaceWindowLevels
   , keepCap
+  , rangeKeep
+  , surfaceKnown
   , pendingEdits
 
     -- * The read-only record of the owner's running work
@@ -333,18 +335,21 @@ demandFor source changes cmd = case cmd of
 -- version of the arena's store, are all the removals the answer depends on.
 -- | WHAT A REQUEST READS OF A COLUMN: only the levels it needs, @[lo, hi)@, never the column's whole
 -- history. A cell: its level. A removal: its level and the two beside it (the runs it coalesces with). A
--- column query: its range (bounded by the query limits). A surface: a window from the source's top down
--- ('surfaceWindowLevels', or lower once its answer was found below what was read: see 'stageFromRuns'),
--- nothing for a column whose source is empty. The others read no column.
-commandRanges ∷ Source → Maybe Int64 → Cmd → [(Column, Int64, Int64)]
-commandRanges source surfaceFloor = \case
+-- column query: its range (bounded by the query limits). A surface: a WINDOW of at most
+-- 'limitRangeLevels' levels, first the 'surfaceWindowLevels' below the source's top, then, while the
+-- levels read hold no occupied cell, the window below the last one (see 'stageFromRuns'); nothing for a
+-- column whose source is empty. The others read no column.
+commandRanges ∷ Q.QueryLimits → Source → Maybe (Int64, Int64) → Cmd → [(Column, Int64, Int64)]
+commandRanges limits source surfaceWindow = \case
   CCell (TileCoord x y z) → [(Column x y, axisValue z, axisValue z + 1)]
   CColumn column range → [(column, fromInteger (zRangeLo range), fromInteger (zRangeHi range))]
   CSurface column → case Q.highestOccupied source emptyChanges column of
     Nothing → []
     Just top →
       let t = axisValue (Q.occupiedLevel top)
-       in [(column, fromMaybe (t + 1 - surfaceWindowLevels) surfaceFloor, t + 1)]
+          first = min surfaceWindowLevels (max 1 (fromIntegral (Q.limitRangeLevels limits)))
+          (lo, hi) = fromMaybe (t + 1 - first, t + 1) surfaceWindow
+       in [(column, lo, hi)]
   CRemove (TileCoord x y z) _ → [(Column x y, axisValue z - 1, axisValue z + 2)]
   CKnowledge _ → []
   COpen {} → []
@@ -352,20 +357,36 @@ commandRanges source surfaceFloor = \case
   CGrow {} → []
   CRetry → []
 
--- | The most runs a read of these ranges keeps, by its kind: a cell one, a removal two (its neighbours,
--- which it coalesces with), a column query the runs its range can hold or one more than its answer may
--- return (past that the answer is too large, so nothing more is kept), a surface one more than an
--- answer may return likewise. The others keep nothing ('maxBound': a load keeps its runs in its job's
--- scratch, never in its pin).
-keepCap ∷ Q.QueryLimits → [(Column, Int64, Int64)] → Cmd → Int
-keepCap limits ranges = \case
-  CCell {} → 1
-  CRemove {} → 2
-  CColumn {} → min (sum [fromIntegral ((hi - lo) `div` 2 + 1) | (_, lo, hi) ← ranges]) answerCap
-  CSurface {} → answerCap
+-- | The most runs a read of these ranges keeps, by its kind: what its ranges can hold ('rangeKeep'), so
+-- the cap never cuts a read short. A cell one, a removal two (its neighbours, which it coalesces with),
+-- a column query up to 'limitRangeLevels' / 2 + 1, a surface's window likewise. NOT the returned-run
+-- limit: removed runs that meet source air merge with it, so an answer may be far shorter than what its
+-- read keeps. The others keep nothing ('maxBound': a load keeps its runs in its job's scratch, never in
+-- its pin).
+keepCap ∷ [(Column, Int64, Int64)] → Cmd → Int
+keepCap ranges = \case
+  CCell {} → held
+  CRemove {} → held
+  CColumn {} → held
+  CSurface {} → held
   _ → maxBound
   where
-    answerCap = Q.limitReturnedRuns limits + 1
+    held = sum [rangeKeep lo hi | (_, lo, hi) ← ranges]
+
+-- | The most removed runs that meet the levels @[lo, hi)@ of one column: runs are coalesced, so two of
+-- them are a level apart at least.
+rangeKeep ∷ Int64 → Int64 → Int
+rangeKeep lo hi = fromIntegral (max 0 (hi - lo) `div` 2 + 1)
+
+-- | What a surface's read knows of its column: the runs its window @[lo, hi)@ read, and, above the
+-- window up to the source's top, that no cell is occupied (every window above it was read and held
+-- none). That stays true at any later revision: a source never changes and a change only removes. The
+-- levels above are given as one removed interval, so the highest occupied cell of the result is the
+-- surface's answer when it lies in the window.
+surfaceKnown ∷ Source → Column → Int64 → [(Column, Int64, Int64)] → [(Column, Int64, Int64)]
+surfaceKnown source column hi runs = case Q.highestOccupied source emptyChanges column of
+  Just top | t ← axisValue (Q.occupiedLevel top) + 1, hi < t → (column, hi, t) : runs
+  _ → runs
 
 -- | The first window a surface reads, down from its source's top: one region's height.
 surfaceWindowLevels ∷ Int64

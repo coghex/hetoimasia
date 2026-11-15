@@ -38,6 +38,8 @@ module Hetoimasia.Terrain.Runtime.Backed.Gather
   , GProgress (..)
   , gatherWindowPages
   , gatherPeakWindow
+  , gatherCap
+  , gatherAsked
   , gatherPin
   , gatherFetching
   , gatherPinLimit
@@ -113,7 +115,12 @@ data Gather = Gather
   , gRuns ∷ ![(Column, Int64, Int64)]
   -- ^ Runs found, newest first.
   , gCap ∷ !Int
-  -- ^ The most runs the gather keeps: past it, it stops (what its request answers is then too large).
+  -- ^ The most runs the gather may keep: what the ranges it reads can hold ('maxBound' for a load).
+  -- Keeping more is a defect, checked at every step.
+  , gKept ∷ !Int
+  -- ^ How many runs 'gRuns' holds.
+  , gAsked ∷ ![(Column, Int64, Int64)]
+  -- ^ The columns and levels the gather was asked to read (for the evidence of its cap).
   , gFetch ∷ !(Maybe (PageNo, Ticket))
   , gVersion ∷ !Word64
   -- ^ The committed version the pin holds.
@@ -136,6 +143,14 @@ gatherFetching = fmap fst . gFetch
 -- | The pages the gather's window may pin.
 gatherPin ∷ Gather → Int
 gatherPin = gPin
+
+-- | The most runs the gather may keep.
+gatherCap ∷ Gather → Int
+gatherCap = gCap
+
+-- | The columns and levels the gather was asked to read.
+gatherAsked ∷ Gather → [(Column, Int64, Int64)]
+gatherAsked = gAsked
 
 -- | Where a step left the gather.
 data GProgress
@@ -169,12 +184,14 @@ startGatherWith ∷ Int → Store → [(Column, Int64, Int64)] → Either Gather
 startGatherWith pin = startGatherCapped pin maxBound
 
 -- | 'startGatherWith' keeping at most @cap@ runs: the reader's window then pins at most @pin@ pages, the
--- reader's pin credit less what the kept runs may hold, so the two together never pass the credit.
+-- reader's pin credit less what the kept runs may hold, so the two together never pass the credit. The
+-- cap is what the ranges read can hold, so it never cuts an answer short: a step that would keep more is
+-- a defect ('GFailed', 'HandleDefect'), never a truncation.
 startGatherCapped ∷ Int → Int → Store → [(Column, Int64, Int64)] → Either GatherRefusal (Store, Gather)
 startGatherCapped pin cap store columns = case acquireReader store of
   Left refusal → Left (NoPin refusal)
   Right (token, pinned) → case (readerWindow pinned token, readerVersion pinned token) of
-    (Right window, Right version) → Right (pinned, Gather token window columns Nothing pin maxRangeRecords 0 0 [] cap Nothing version False)
+    (Right window, Right version) → Right (pinned, Gather token window columns Nothing pin maxRangeRecords 0 0 [] cap 0 columns Nothing version False)
     _ → Left PinRefused
 
 -- | End a gather: the pin is released (releasing twice changes nothing). Called on every exit, and only
@@ -215,7 +232,6 @@ stepGather io closing store g = case gFetch g of
   Nothing
     | gDraining g → pure (g, GDrained)
     | otherwise → case gColumns g of
-        _ | length (gRuns g) > gCap g → pure (g, GDone (reverse (gRuns g)))
         [] → pure (g, GDone (reverse (gRuns g)))
         (column, from, to) : rest →
           -- A COLUMN IS READ ONLY OVER THE LEVELS ITS REQUEST NEEDS: from the run at or below the range's
@@ -235,11 +251,16 @@ stepGather io closing store g = case gFetch g of
                       next = case reverse records of
                         (key, _) : _ → Just (RangeAfter key)
                         [] → Nothing
-                      g' = g {gRuns = reverse mine <> gRuns g, gStrikes = 0, gPeak = max (gPeak g) (windowSize (gWindow g))}
+                      g' = g {gRuns = reverse mine <> gRuns g, gKept = gKept g + length mine, gStrikes = 0, gPeak = max (gPeak g) (windowSize (gWindow g))}
                    in pure $
-                        if ended
-                          then (g' {gColumns = rest, gStart = Nothing, gLimit = maxRangeRecords}, GMore)
-                          else (g' {gStart = next}, GMore)
+                        -- WHAT IS KEPT NEVER PASSES THE CAP, at any step: the cap is what the ranges can hold
+                        -- (coalesced runs, a level apart at least), so passing it is a defect
+                        if gKept g' > gCap g
+                          then (g, GFailed (HandleDefect (Text.pack ("a read kept " <> show (gKept g') <> " runs, more than the " <> show (gCap g) <> " its ranges can hold"))))
+                          else
+                            if ended
+                              then (g' {gColumns = rest, gStart = Nothing, gLimit = maxRangeRecords}, GMore)
+                              else (g' {gStart = next}, GMore)
                 ReadNeeds page
                   | windowSize (gWindow g) >= gPin g →
                       -- the pin holds no more pages. A fresh window first; if the same call fills a fresh
