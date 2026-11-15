@@ -119,7 +119,7 @@ the owner never chooses the same work again with nothing changed.
 
 `terrain-runtime-tests` has a stated time budget; this document states none for any other suite, and a project-wide budget
 is the owner's. The whole process, from launch to exit and fixture construction included, takes at most 240 s on the
-machine that produced the baseline figures; the group's own "Finished in" line takes at most 300 s in CI; a run that
+machine that produced the baseline figures; the group's own "Finished in" line takes at most 360 s in CI (300 s until the multi-capability pass below was added; the owner's decision of 2026-11-15 on #685, which keeps both passes); a run that
 selects no example takes at most 10 s. The figures were set against the neighbouring suites (`terrain-tests` 55.7 s and
 `terrain-render-2d-tests` 104.5 s locally; CI runs about 1.2 times local) and are fixed here, not renegotiated by a change.
 A large fixture is built by the first example that reads it and no construction work happens while the spec tree is built,
@@ -139,6 +139,29 @@ measurement, fails if a parallel example is running or more than one capability 
 capability before each sequential example; the run prints the counts it used. Seeds stay fixed and results deterministic;
 every printed line starts a line and ends whole: the parallel examples and the runner's formatter share one lock
 (`Test.TerrainRuntime.Output`), and the suite checks it with the formatters the runner can select.
+
+### The multi-capability pass
+
+The concurrent examples of `terrain-runtime-tests` ran on one capability, where their threads interleave and never execute at the
+same instant. A routine run now runs them a second time, last, on **2 capabilities** (the repository's `-N2` convention), beside
+nothing and after every other example, under the label `The multi-capability pass`: the same examples, the same assertions, no
+manual step, and in the same executable, so the lab selects them by exact path and the one-capability pass keeps its gated orders
+unchanged. The set is named in one place, `Test.TerrainRuntime.Concurrent`, with the reason each module is in it or out of it: an
+example is in when it starts a thread, drives the production service (its owner thread) or the storage workers, or waits on a
+gate. **Nothing that measures the process may join it** (a live-heap, allocation or runtime-statistic reading is valid on one
+capability only, and asserts it), and the pure families (no thread; the parallel group) and the examples that compile an external
+client stay out. The suite fails by itself if fewer capabilities are in force than the pass claims.
+
+The pass's capability count is one setting: `HETOIMASIA_CONCURRENT_PASS_CAPABILITIES` when set, else the count the process started
+with when it is 2 or more, else 2. A count below 2, or not a whole number, ends the run with status 2 before any example. The
+lab's `quruntul flake --target ... --rts-capabilities K` passes `+RTS -NK`, which therefore sets the pass's count and nothing else:
+the parallel group, the sequential examples and the measurements still run at their own counts (`RUNNER`, `PHASE sequential: 1
+capability`), and the run prints `PASS multi-capability: requested=K (+RTS -N) effective=K`. An explicit `-N1` cannot be told from
+the runtime default and selects 2. A count above the machine's cores is time-sliced, not simultaneous.
+
+What the pass can see and one capability cannot is shown by hand, once, by the control: `terrain-runtime-tests
+--capability-control +RTS -N<K> -RTS` runs two owned threads that must each be inside a region at the same instant on different
+capabilities. It completes at `-N2` and `-N4` and fails by its own read bound at `-N1`. It is in no routine group.
 
 ## Local probe inventory
 

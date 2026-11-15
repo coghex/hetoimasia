@@ -96,6 +96,15 @@ round-by-round record of one pull request; the contracts are the `terrain`,
 | `tra18/README.md` | #660, PR #670: the bounded symbolic source-connectivity compiler against independent references, with growth, yielding and refusal rows; the oracle found extents such as `2^62 - (-2^62)` overflowing `Int64`, fixed |
 | `tra19/README.md` | #661, PR #671: the pure model of compressed knowledge and resumable discovery after removal against an independent oracle; the oracle found a removed cell reported unknown although its void had been known, fixed |
 
+Removed later the same day, last present at `5e536270`:
+
+| Path under `docs/evidence/terrain/` | Conclusion |
+| --- | --- |
+| `tra2/storage_measurements.md` | #638: payload, metadata and allocation of the layered source and packed resident detail on four fixtures; unrequested depth holds no resident payload; one run, no speed claim |
+| `tra3/residency_evidence.md` | #639: gated traces of the pure residency and admission model (shared jobs, pins, vertical turnover under fixed caps, retained-edit handoff, aging) with negative controls; conservative accounted bytes, not process memory |
+| `tra4/service_evidence.md`, `tra4/rounds_1_12_followups.md` | #640, PR #664: gated traces and before-and-after accounting of the transactional terrain service, and the families sixteen review rounds found and swept |
+| `tra7/q13_cpu_evidence.md` | #643: the per-face planner found no ordering counterexample and every sampled pick matched the oracle; superseded by the cell-quad planner of #658 |
+
 Condensed in place on the same day, with the full write-up at the same commit:
 `tra20/README.md` (#662, twenty review rounds of the temporary store's pure
 model) and `tra21/README.md` (#663, ten review rounds of the storage backend).

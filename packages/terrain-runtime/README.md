@@ -129,6 +129,7 @@ values.
 | View demand registrations | The port | The owner (`Service` quantum) | Any | Eight views; latest-value descriptions | Cleared by `closeView`, `endClient`, arena or service closure |
 | Snapshot holds and the borrower count | The port acquires and releases | The owner (for closure) | Any | `specHoldRegions` per hold | Released on every exit of `withSnapshot`; closure waits for the count to reach zero |
 | Regional snapshot borrows (`stateRegional`): a copied hold, a retained-bank charge and a borrower each | The port admits, takes and releases; the owner settles (the charge becomes the footprint) and releases a borrow orphaned by its build | Inspection; the owner (closure) | Any | `specHoldRegions` regions each; the retained bank | Released exactly once, by whoever owns it then (see [Regional snapshots](#regional-snapshots)); closure waits for the borrower count |
+| Regional deliveries (`stateDelivering`): the requests whose copies the owner is turning into a snapshot | The owner (from the transaction that ends the build to the end of the delivery) | Whatever ends the request (it leaves the borrow to the owner) | Owner | One per regional build | Emptied when the owner ends; an orphaned borrow is released at the delivery's end |
 | Victim queue | The port appends (from admission decisions); the owner drains | The owner | Port, owner | Bounded by the banks | Drained by the owner, which discards the detail and then reports the release |
 | Defect record | Any thread that detects one | Inspection | Any | The latest 16 | Kept for the life of the service |
 | Running-work record (`RunningWork`: every accepted load job as granted and as its coverage must hold it; the preparation; each borrow's regions; each view description's regions) | The owner thread (running marks, preparation, a job's end) and the port transactions that admit the work (a job's grant, a borrow, a view's demand), each in the transaction of the model event it mirrors | Inspection only (`inspectCensusSTM`); no production decision reads it | Owner and port | What the model bounds (jobs, holds, views) plus one preparation | Each entry ends with the work it describes (a job's report, the owner's safe point, a borrow's release, a view's clearing); the owner's terminal step empties the owner's |
@@ -325,7 +326,11 @@ for the whole build; the revisions and the generation it is labelled with are ta
 that pins it. Region by region, each from a fresh window on that pin, it reads the runs of the region's
 256 columns and of the 64 beside it over its levels and one beyond each end, plans with the discovery
 package's region query, evaluates `queryCell` at the plan's tiles and assembles the runs; only the
-requested regions are copied. A quantum is at most 16 steps (a ranged read or an evaluation) and ends at
+requested regions are copied. The window has one owner at a time (the read in progress, or the step about
+to start the next), so a read that starts a fresh window drops the one it replaced and a build never holds
+more pages than a reader may pin. A region's copy is evaluated in full at the region's end, failures
+included: between regions a build keeps its packed copies alone, nothing of their reads, plans or answers.
+A quantum is at most 16 steps (a ranged read or an evaluation) and ends at
 any wait and at the end of a region; the owner then serves its other ready work. The copy settles
 labelled with the pinned version's identities and is never recomputed: a version committed during the
 build is wholly excluded, and staleness is the consumer's to judge. A page that has not arrived keeps the
@@ -346,9 +351,16 @@ footprint, kept until the release. The borrow counts among the borrowers service
 
 | State of the borrow | Its owner | Released by |
 | --- | --- | --- |
-| Pending: admitted, building or staged | its request | the request's end (cancellation, lease release, client end, arena or service closure): at once, or, while its build has a read in flight, once the build has drained; the outcome is decided at once |
+| Pending: admitted, building, delivered or staged | its request | the request's end (cancellation, lease release, client end, arena or service closure): at once, or, while its build has a read in flight or the owner is turning its copies into the snapshot, at the owner's safe point (the build drained, the delivery ended); the outcome is decided at once |
 | Settled, not taken | the service | `retire`, the client's end, the arena's or the service's closure (a holder's `releaseRegionBorrow` takes and releases it) |
 | Taken (`await`, `takeSTM`, `withRegionSnapshot`) | the holder | `releaseRegionBorrow` or the scope's exit, only: no retirement, client end or closure releases it, and its arena stays retiring until then |
+
+**The take** moves the borrow in the transaction that checks the request still owns it: `takeSTM` answers
+`Taken` (the borrow is the caller's) or `TakeReleased` (nothing handed over: the request is not settled, or
+was taken, retired or released with its lease, client, arena or the service). `await` and
+`withRegionSnapshot` take in the transaction that reads the settlement; a regional result given up before
+it was taken answers `Cancelled`, and its released borrow is never returned. A host that settles through
+the seam uses a regional answer only on `Taken`.
 
 A release is idempotent: the borrow is found and released once, in one place (`releaseRegionalSTM`),
 whichever path finds it first.
@@ -688,15 +700,17 @@ on at a named point (`Probe`), so an example decides which side of a race wins b
 what it does, not by how long it waits; no example sleeps. Every thread an example
 starts is owned through `Test.Support.Owned`, and every wait is bounded
 (`Test.Support.Bounded`). Expected cell values come from an independent model that
-shares no code with the library. The suite is built `-threaded` and is run at more
-than one capability count. `Test.TerrainRuntime.Opacity` compiles clients outside the
+shares no code with the library. The suite is built `-threaded` and runs its concurrent examples
+(`Test.TerrainRuntime.Concurrent` names them) twice: on one capability, in place, and once more, last, on two (the
+pass's count, [one setting](../../docs/test_classification.md#the-multi-capability-pass)); nothing else runs on
+more than one capability except the pure parallel group. `Test.TerrainRuntime.Opacity` compiles clients outside the
 package through `Test.Support.ExternalClient`: one composes the public service, and
 every attempt to name an authority, snapshot, service or inspection-type constructor, forge
 one, rewrite a snapshot or an inspection value (the census, its arenas and requests, the
 record of the owner's running work) with record-update syntax or import a private module is
 refused for the specific diagnostic that names the cause. Retained gated traces with before and after
 accounting are in
-[the TRA-4 evidence](../../docs/evidence/terrain/tra4/service_evidence.md).
+[the TRA-4 evidence](../../docs/removed_records.md).
 
 ## The temporary store (TRA-20)
 
