@@ -901,14 +901,15 @@ stageFromRuns svc rid runs revision = do
               | Just (lo, _) ← window
               , Just found ← Q.highestOccupied source changes column
               , axisValue (Q.occupiedLevel found) < lo →
-                  atomically $ modifySt svc $ \s → case surfaceWindow s source column of
-                    Just (lo', hi') →
+                  -- only for a request still live: one cancelled or ended meanwhile keeps nothing
+                  atomically $ modifySt svc $ \s → case (Map.lookup rid (stateRequests s), surfaceWindow s source column) of
+                    (Just q, Just (lo', hi')) | (case reqPhase q of Done → False; _ → True) →
                       let deeper = max 1 (min (fromIntegral (Q.limitRangeLevels (configQueryLimits config))) (2 * (hi' - lo')))
                        in s
                             { stateSurfaceWindow = Map.insert rid (lo' - deeper, lo') (stateSurfaceWindow s)
-                            , stateRequests = Map.adjust (\q → q {reqPhase = Waiting}) rid (stateRequests s)
+                            , stateRequests = Map.adjust (\q' → q' {reqPhase = Waiting}) rid (stateRequests s)
                             }
-                    Nothing → s
+                    _ → s
             cmd →
               running svc rid (atomically (modifySt svc (\s → s {stateSurfaceWindow = Map.delete rid (stateSurfaceWindow s)})) >> probe svc (PointCaptured rid aid revision) >> evaluate (readAnswer config aid revision source changes cmd)) >>= \case
                 Nothing → pure ()

@@ -14,6 +14,7 @@
 module Test.TerrainRuntime.Backed.Ranges (spec) where
 
 import Control.Concurrent.STM
+import Control.Exception (finally)
 import Data.List (nub)
 import qualified Data.Map.Strict as Map
 import Hetoimasia.Terrain.Changes (changeColumnBytes, changeIntervalBytes)
@@ -115,6 +116,34 @@ spec = describe "What a request keeps of a column" $ do
       [kept | (_, _, kept, _, _) ← read'] `shouldSatisfy` all (<= 5)
       [cap | (_, _, _, cap, _) ← read'] `shouldSatisfy` all (== 5)
       mapM_ (\(_, pin, _, cap, levels) → contained pin cap (length levels)) read'
+
+  -- the same dug column: the surface's window slides, and the request ends as its next read is prepared
+  it "keeps no window for a surface cancelled after its window slid, nor for one whose arena closed" $
+    mapM_
+      ( \ending → do
+          hold ← preparationHold fst
+          let config = defaultConfig {configQueryLimits = defaultQueryLimits {limitRangeLevels = 8}}
+              source = layered [(Just 0, Just 48, "stone", 0)] [PatchSpec 4 4 (2 * k + 1) (2 * k + 2) SpecAir | k ← [0 .. 23]]
+          withServiceUsing config alwaysAdmitting (holdProbe hold) $ \svc → do
+            holdService hold svc
+            client ← okOf (registerClient svc)
+            lease ← okOf (openArena svc client "dug" source) >>= await svc >>= expectSuccess
+            mapM_ (\z → removeCell' svc lease (tile 4 4 z)) [8, 10 .. 46]
+            host ← newHost True
+            request ← okOf (surfaceWith svc (hostEndpoint svc Nothing host) lease (column 4 4))
+            flip finally (holdRelease hold) $ do
+              -- held as the read after the first slide is prepared: the window is kept for it
+              holdReached hold
+              length . fst <$> atomically (inspectRequestScratchSTM svc) `shouldReturn` 1
+              if ending == "cancelled"
+                then cancel svc request `shouldReturn` CancelWon
+                else releaseLease svc lease >>= (`shouldBe` Right ())
+              holdRelease hold
+              waitFor (readTVar (hostSettled host) >>= \s → check (not (null s)))
+              waitFor (backedAtRestSTM svc >>= check)
+              atomically (inspectRequestScratchSTM svc) `shouldReturn` ([], [])
+      )
+      ["cancelled", "its arena closed" ∷ String]
   where
     recordWindows windows = Probe $ \case
       PointGatherWindow _ peak pin kept cap levels → atomically (modifyTVar' windows ((peak, pin, kept, cap, levels) :))

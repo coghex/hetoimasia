@@ -122,6 +122,7 @@ module Hetoimasia.Terrain.Runtime
   , inspectCompileSTM
   , backedAtRestSTM
   , inspectIdleRepeatsSTM
+  , inspectRequestScratchSTM
   , inspectStorageJobsSTM
   , inspectMaintenanceFirstSTM
   , inspectPendingExtraSTM
@@ -640,6 +641,11 @@ backedAtRestSTM svc = do
 -- verification.
 inspectIdleRepeatsSTM ∷ Service → STM [Text]
 inspectIdleRepeatsSTM svc = stateIdleRepeats <$> readSt svc
+
+-- | What the owner keeps for requests between their reads: the requests with a surface window, and
+-- those with a write-probe result. Read-only, for verification.
+inspectRequestScratchSTM ∷ Service → STM ([R.RequestId], [R.RequestId])
+inspectRequestScratchSTM svc = (\st → (Map.keys (stateSurfaceWindow st), Map.keys (stateWriteProbed st))) <$> readSt svc
 
 inspectBackedSTM ∷ Service → STM [String]
 inspectBackedSTM svc = do

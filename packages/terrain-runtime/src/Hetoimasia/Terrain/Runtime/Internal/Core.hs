@@ -698,12 +698,16 @@ decide svc st rid = \case
 -- Settlement
 
 -- | Remove a request from the table and give back what it holds: its name
--- claim and its model record with every credit that record owns.
+-- claim, its model record with every credit that record owns, and what the owner
+-- keeps for it between reads (a surface's window, a retry's write-probe result).
+-- Every terminal path of a request that can hold those passes here.
 releaseReq ∷ Service → RequestId → Req → STM ()
 releaseReq svc rid req = do
   modifySt svc $ \st →
     st
       { stateRequests = Map.delete rid (stateRequests st)
+      , stateSurfaceWindow = Map.delete rid (stateSurfaceWindow st)
+      , stateWriteProbed = Map.delete rid (stateWriteProbed st)
       , stateNames = case reqCmd req of
           COpen name _ _ | Just (ClaimPending claimed) <- Map.lookup name (stateNames st), claimed == rid → Map.delete name (stateNames st)
           _ → stateNames st

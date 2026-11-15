@@ -208,6 +208,29 @@ spec = describe "Recovery decided like publication" $ do
       fmap (\a → (retriedCleared a, retriedRemaining a)) answer `shouldBe` Right ([CondIo], [])
       pausedOn svc lease `shouldReturn` []
 
+  it "keeps no write-probe result for a retry whose arena was closed, by its lease's release, after its write probe ran" $ do
+    probe ← H.newProbe
+    hold ← preparationHold snd
+    withServiceSeam quiet defaultConfig alwaysAdmitting (holdProbe hold) (H.seamFor probe) $ \svc → do
+      holdService hold svc
+      (_, lease) ← openMain svc "main"
+      _ ← removeCell' svc lease (tile 3 4 5)
+      waitFor (backedAtRestSTM svc >>= check)
+      _ ← failWrite probe svc lease
+      host ← newHost True
+      _ ← okOf (retryWith svc (hostEndpoint svc Nothing host) lease)
+      flip finally (holdRelease hold) $ do
+        -- held as the retry is prepared again after its write probe: the probe's result is kept for it
+        holdReached hold
+        length . snd <$> atomically (inspectRequestScratchSTM svc) `shouldReturn` 1
+        releaseLease svc lease >>= (`shouldBe` Right ())
+        holdRelease hold
+        waitFor (readTVar (hostSettled host) >>= \s → check (not (null s)))
+        -- releasing the creator's lease cancels its requests, then closes the arena
+        settledOf host `shouldReturn` [Cancelled]
+        waitFor (backedAtRestSTM svc >>= check)
+        atomically (inspectRequestScratchSTM svc) `shouldReturn` ([], [])
+
   it "does not publish discovery that was in flight when its arena paused" $ do
     probe ← H.newProbe
     -- once armed, the next grant to discovery (one unit of it per transaction) installs a gate on every

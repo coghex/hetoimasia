@@ -60,6 +60,10 @@ module Test.TerrainRuntime.Fixtures
   , configWith
   , settleChecks
 
+    -- * Holding the owner
+  , PreparationHold (..)
+  , preparationHold
+
     -- * Waiting
   , waitFor
   , expectRight
@@ -78,7 +82,8 @@ import Data.Text (Text)
 import Hetoimasia.Terrain.Cell (Cell (..), Column, ZRange, mkColumn, mkZRange, materialIdString)
 import Hetoimasia.Terrain.Shape (shapeIdValue)
 import Hetoimasia.Terrain.Coordinate (RegionCoord (..), TileCoord, tileCoord)
-import Hetoimasia.Terrain.Residency (BusyReason (..), Limits, LimitsSpec (..), Revision (..), mkLimits)
+import Control.Monad (forM_, void, when)
+import Hetoimasia.Terrain.Residency (BusyReason (..), Limits, LimitsSpec (..), RequestId, Revision (..), mkLimits)
 import Hetoimasia.Terrain.Runtime
 import Hetoimasia.Terrain.Runtime.Settlement
 import Hetoimasia.Terrain.Source (CellSpec (..), LayerSpec (..), PatchSpec (..), SourceSpec (..))
@@ -457,3 +462,37 @@ expectSuccess = either (\e → expectationFailure ("expected success, got " <> s
 
 okOf ∷ (HasCallStack, Show e) ⇒ IO (Either e a) → IO a
 okOf action = action >>= expectRight
+
+-- | A hold of the owner, once, as it begins preparing a request for which the service keeps something
+-- between reads (picked from 'inspectRequestScratchSTM' by the selector given): a surface after its
+-- window slid, a retry after its write probe. The service is named once built.
+data PreparationHold = PreparationHold
+  { holdProbe ∷ Probe
+  -- ^ The probe to build the service with.
+  , holdService ∷ Service → IO ()
+  -- ^ Name the service the probe inspects.
+  , holdReached ∷ IO ()
+  -- ^ Wait (bounded) until the owner is held.
+  , holdRelease ∷ IO ()
+  -- ^ Let the owner go on (idempotent).
+  }
+
+preparationHold ∷ (([RequestId], [RequestId]) → [RequestId]) → IO PreparationHold
+preparationHold select = do
+  named ← newTVarIO Nothing
+  held ← newEmptyTMVarIO
+  release ← newEmptyTMVarIO
+  let probe = Probe $ \case
+        PointPreparing rid → readTVarIO named >>= \service → forM_ service $ \svc → do
+          scratch ← atomically (inspectRequestScratchSTM svc)
+          when (rid `elem` select scratch) $ do
+            first ← atomically (tryPutTMVar held ())
+            when first (atomically (readTMVar release))
+        _ → pure ()
+  pure
+    PreparationHold
+      { holdProbe = probe
+      , holdService = atomically . writeTVar named . Just
+      , holdReached = bounded (atomically (readTMVar held))
+      , holdRelease = atomically (void (tryPutTMVar release ()))
+      }
