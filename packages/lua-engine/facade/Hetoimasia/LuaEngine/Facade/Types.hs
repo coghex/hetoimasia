@@ -75,11 +75,19 @@ module Hetoimasia.LuaEngine.Facade.Types
   , terrainColumnRequestType
   , terrainSurfaceRequestType
   , terrainRemoveRequestType
+  , terrainStatusRequestType
+  , terrainGrowRequestType
+  , terrainRetryRequestType
   , terrainArenaValueSchema
   , terrainCellValueSchema
   , terrainColumnValueSchema
   , terrainSurfaceValueSchema
   , terrainRemoveValueSchema
+  , terrainStatusValueSchema
+  , terrainGrowValueSchema
+  , terrainRetryValueSchema
+  , terrainStorageMinimum
+  , terrainStorageUnit
   , terrainNameLimit
   , terrainMaterialBytesLimit
   , terrainCellLow
@@ -478,6 +486,12 @@ terrainColumnRequestType = "terrain_column_request"
 terrainSurfaceRequestType = "terrain_surface_request"
 terrainRemoveRequestType = "terrain_remove_request"
 
+-- | The request handle types of the storage calls (TRA-23): @api.terrain.status@, @grow_storage@ and @retry_storage@.
+terrainStatusRequestType, terrainGrowRequestType, terrainRetryRequestType ∷ Text
+terrainStatusRequestType = "terrain_status_request"
+terrainGrowRequestType = "terrain_grow_request"
+terrainRetryRequestType = "terrain_retry_request"
+
 -- | What @take@ hands as the success value of an open or an attach: the arena handle itself.
 terrainArenaValueSchema ∷ Schema
 terrainArenaValueSchema = SCapability terrainArenaType
@@ -505,6 +519,55 @@ terrainSurfaceValueSchema = SRecord [("revision", SInteger), ("occupied", SBoole
 -- | A removal: whether anything changed and the committed content revision. @{changed = BOOLEAN, revision = INTEGER}@.
 terrainRemoveValueSchema ∷ Schema
 terrainRemoveValueSchema = SRecord [("changed", SBoolean), ("revision", SInteger)]
+
+-- | What a status is (@api.terrain.status@): one coherent snapshot of the arena's storage and discovery. @storage.state@ is
+-- @"ready"@ or @"paused"@, and @storage.reason@ is present exactly while it is paused: the code of its most severe recorded
+-- condition, @"storage_integrity"@ before @"storage_io"@ before @"storage_full"@. @discovery.state@ is @"idle"@, @"pending"@ or
+-- @"paused"@. Every byte, count and revision is a Lua integer.
+terrainStatusValueSchema ∷ Schema
+terrainStatusValueSchema =
+  SRecord
+    [ ("storage", terrainStorageSchema)
+    , ("discovery", SRecord [("state", SText), ("pending_items", SInteger)])
+    , ("content_revision", SInteger)
+    , ("knowledge_revision", SInteger)
+    ]
+
+terrainStorageSchema ∷ Schema
+terrainStorageSchema =
+  SRecord
+    [ ("state", SText)
+    , ("reason", SOptional SText)
+    , ("reserved_bytes", SInteger)
+    , ("used_bytes", SInteger)
+    , ("pending_reclaim_bytes", SInteger)
+    , ("pending_reserved_bytes", SInteger)
+    ]
+
+-- | What a growth's success is (@api.terrain.grow_storage@): whether it committed a larger allowance (@false@ for the idempotent
+-- success of the size already committed), the allowance committed now, and the arena's storage state after it.
+terrainGrowValueSchema ∷ Schema
+terrainGrowValueSchema = SRecord [("changed", SBoolean), ("reserved_bytes", SInteger), ("storage", SRecord [("state", SText), ("reason", SOptional SText)])]
+
+-- | What a retry's success is (@api.terrain.retry_storage@): whether it cleared anything (@false@ for the idempotent success on a
+-- ready arena, or a retry that verified nothing gone), the conditions it cleared, the conditions that remain, and of those the ones
+-- no retry can clear (the arena stays paused until it is closed), each a list of codes in the order of their severity, and the
+-- arena's storage and discovery states after it.
+terrainRetryValueSchema ∷ Schema
+terrainRetryValueSchema =
+  SRecord
+    [ ("changed", SBoolean)
+    , ("cleared", SList SText)
+    , ("remaining", SList SText)
+    , ("until_closed", SList SText)
+    , ("storage", SRecord [("state", SText), ("reason", SOptional SText)])
+    , ("discovery", SRecord [("state", SText)])
+    ]
+
+-- | The smallest arena allowance a script may name (64 MiB), and the unit every allowance is a whole number of (1 MiB).
+terrainStorageMinimum, terrainStorageUnit ∷ Int64
+terrainStorageMinimum = 64 * 1024 * 1024
+terrainStorageUnit = 1024 * 1024
 
 -- | The longest arena name, in characters. The terrain service accepts 256; the adapter prefixes the content root, which is at
 -- most 64 characters, and the namespace's separator, so a name is bounded below what is left of that.
@@ -617,9 +680,11 @@ data TerrainServices = TerrainServices
   -- ^ An instance was declared, with its content root: make its client.
   , tsForget ∷ Text → IO ()
   -- ^ An instance was forgotten, once its settlement was observed: end its client.
-  , tsOpenCheck ∷ Text → Text → Text → TerrainDefinition → ArgumentCheck
-  -- ^ Instance, root, name, definition: whether the open is refused for good (an ended owner), as an ordinary error.
-  , tsOpenStart ∷ Text → Text → Text → TerrainDefinition → RequestContext → IO TerrainStart
+  , tsOpenCheck ∷ Text → Text → Text → TerrainDefinition → Maybe Int64 → ArgumentCheck
+  -- ^ Instance, root, name, definition, the allowance in bytes the options named (one the facade has checked is at least
+  -- 'terrainStorageMinimum' and a whole number of 'terrainStorageUnit'): whether the open is refused for good (an ended owner, an
+  -- allowance past what the service can ever grant), as an ordinary error.
+  , tsOpenStart ∷ Text → Text → Text → TerrainDefinition → Maybe Int64 → RequestContext → IO TerrainStart
   , tsAttachCheck ∷ Text → Text → Text → ArgumentCheck
   , tsAttachStart ∷ Text → Text → Text → RequestContext → IO TerrainStart
   , tsCellCheck ∷ Text → Word64 → TerrainCell → ArgumentCheck
@@ -634,6 +699,17 @@ data TerrainServices = TerrainServices
   , tsRemoveCheck ∷ Text → Word64 → TerrainCell → Maybe Word64 → ArgumentCheck
   -- ^ Instance, arena handle key, cell, the optional pick authority's key.
   , tsRemoveStart ∷ Text → Word64 → TerrainCell → Maybe Word64 → RequestContext → IO TerrainStart
+  , tsStatusCheck ∷ Text → Word64 → ArgumentCheck
+  -- ^ Instance, arena handle key: whether the status is refused (the handle is not one of the caller's own live leases, creator or
+  -- attachment). Nothing is reserved.
+  , tsStatusStart ∷ Text → Word64 → RequestContext → IO TerrainStart
+  , tsGrowCheck ∷ Text → Word64 → Int64 → ArgumentCheck
+  -- ^ Instance, arena handle key, the new allowance in bytes (checked by the facade as for an open): whether the growth is refused
+  -- (not the caller's creator lease, an allowance past what the service can ever grant).
+  , tsGrowStart ∷ Text → Word64 → Int64 → RequestContext → IO TerrainStart
+  , tsRetryCheck ∷ Text → Word64 → ArgumentCheck
+  -- ^ Instance, arena handle key: whether the retry is refused (not the caller's creator lease).
+  , tsRetryStart ∷ Text → Word64 → RequestContext → IO TerrainStart
   , tsReleaseCheck ∷ Text → Word64 → IO (Maybe Text)
   -- ^ Whether this instance may release this arena handle: refused before any provider is asked for a handle another instance
   -- was issued (alive, retiring or completely retired) and a lease of another kind. A lease of the calling instance that has

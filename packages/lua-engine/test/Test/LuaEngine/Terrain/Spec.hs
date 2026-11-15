@@ -13,6 +13,8 @@ import qualified Test.LuaEngine.Terrain.Names as Names
 import qualified Test.LuaEngine.Terrain.Ownership as Ownership
 import qualified Test.LuaEngine.Terrain.Picks as Picks
 import qualified Test.LuaEngine.Terrain.Races as Races
+import qualified Test.LuaEngine.Terrain.Storage as Storage
+import qualified Test.LuaEngine.Terrain.StorageFaults as StorageFaults
 import qualified Test.LuaEngine.Terrain.Validation as Validation
 import qualified Test.LuaEngine.Terrain.Windows as Windows
 import Test.Hspec (Spec, describe)
@@ -33,3 +35,5 @@ spec = describe "Terrain" $ do
   Windows.spec
   Matrix.spec
   Model.spec
+  Storage.spec
+  StorageFaults.spec

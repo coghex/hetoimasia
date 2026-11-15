@@ -119,11 +119,19 @@ module Hetoimasia.LuaEngine.Facade
   , terrainColumnRequestType
   , terrainSurfaceRequestType
   , terrainRemoveRequestType
+  , terrainStatusRequestType
+  , terrainGrowRequestType
+  , terrainRetryRequestType
   , terrainArenaValueSchema
   , terrainCellValueSchema
   , terrainColumnValueSchema
   , terrainSurfaceValueSchema
   , terrainRemoveValueSchema
+  , terrainStatusValueSchema
+  , terrainGrowValueSchema
+  , terrainRetryValueSchema
+  , terrainStorageMinimum
+  , terrainStorageUnit
   , terrainNameLimit
   , terrainMaterialBytesLimit
   , graphicsInputResetType
