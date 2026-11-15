@@ -12,6 +12,7 @@ import qualified Test.LuaEngine.Terrain.Model as Model
 import qualified Test.LuaEngine.Terrain.Names as Names
 import qualified Test.LuaEngine.Terrain.Ownership as Ownership
 import qualified Test.LuaEngine.Terrain.Picks as Picks
+import qualified Test.LuaEngine.Terrain.Pump as Pump
 import qualified Test.LuaEngine.Terrain.Races as Races
 import qualified Test.LuaEngine.Terrain.Storage as Storage
 import qualified Test.LuaEngine.Terrain.StorageFaults as StorageFaults
@@ -21,6 +22,7 @@ import Test.Hspec (Spec, describe)
 
 spec ∷ Spec
 spec = describe "Terrain" $ do
+  Pump.spec
   Basics.spec
   Fixture.spec
   Composition.spec
