@@ -29,6 +29,7 @@ module Hetoimasia.Terrain.Internal.Discovery.Core
   , mkEnv
   , envLimits
   , envSharedBytes
+  , envConnectivity
 
     -- * Failures
   , Integrity (..)
@@ -155,6 +156,11 @@ data Env = Env
 -- | Pair a source with its compiled connectivity and validated limits.
 mkEnv ∷ DiscoveryLimits → Source → Connectivity → Env
 mkEnv limits source conn = Env source conn limits (memberIndex conn)
+
+-- | The compiled connectivity the environment pairs with its source (for the package's own
+-- region-level queries).
+envConnectivity ∷ Env → Connectivity
+envConnectivity = envConn
 
 -- | The environment's limits.
 envLimits ∷ Env → DiscoveryLimits

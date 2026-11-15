@@ -783,6 +783,74 @@ holdSpec = describe "borrowed data and pinned view revisions" $ do
     m1 ← loadCell m0 1 (reg 0 0 0) (cell 0 0 0)
     m2 ← fst <$> stepOk m1 (AcquireHold (HoldId 1) a1 Borrow [reg 0 0 0])
     stepRefused m2 (AcquireHold (HoldId 1) a1 Borrow [reg 0 0 0]) `shouldReturn` Invalid (DuplicateHold (HoldId 1))
+  copiedSpec
+
+-- | A copied borrow (#690): a hold for data copied out of the store. It holds the arena and charges
+-- its records, but needs no region resident, never protects one from eviction and never touches
+-- recency; a borrow of resident data does all three.
+copiedSpec ∷ Spec
+copiedSpec = describe "a copied borrow" $ do
+  it "is taken of regions nobody loaded and charges its hold records on the camera's share of staging" $ do
+    m0 ← opened wholeRegions
+    (m1, acquired) ← stepOk m0 (AcquireHold (HoldId 1) a1 Copied [reg 7 0 0, reg 8 0 0])
+    reportDecision acquired `shouldBe` HoldAcquired
+    modelHolds m1 `shouldBe` [(HoldId 1, a1, Copied, [reg 7 0 0, reg 8 0 0])]
+    staging (ledgersOf m1) `shouldBe` (2 * 64, 0)
+    modelRegions m1 `shouldBe` []
+    (m2, _) ← stepOk m1 (ReleaseHold (HoldId 1))
+    ledgersOf m2 `shouldBe` Ledgers (0, 0) (0, 0) (0, 0)
+  it "refuses an empty set, a duplicate region, a region of unsupported cells, a set over the cap and an extent that cannot hold a whole region, creating nothing" $ do
+    m0 ← opened wholeRegions
+    let refusedWith m event why = do
+          stepRefused m event `shouldReturn` why
+          modelHolds m `shouldBe` []
+    refusedWith m0 (AcquireHold (HoldId 1) a1 Copied []) (Invalid EmptyDemand)
+    refusedWith m0 (AcquireHold (HoldId 1) a1 Copied [reg 1 0 0, reg 1 0 0]) (Invalid (DuplicateRegion (reg 1 0 0)))
+    refusedWith m0 (AcquireHold (HoldId 1) a1 Copied [RegionCoord maxBound 0 0]) (Invalid (UnsupportedRegion (RegionCoord maxBound 0 0)))
+    refusedWith m0 (AcquireHold (HoldId 1) a1 Copied [reg i 0 0 | i ← [0 .. 2]]) (Invalid (DemandTooLarge 3 2))
+    small ← opened roomy
+    refusedWith small (AcquireHold (HoldId 1) a1 Copied [reg 0 0 0]) (Invalid (OutsideExtent (reg 0 0 0)))
+  it "never protects a resident region from eviction and never touches its recency" $ do
+    -- whole regions loaded one after another, each released, until the next needs a victim: the
+    -- least recently used, region 0
+    m0 ← opened wholeRegions
+    (filled, next, victims) ← fillUntilEviction m0 0
+    victims `shouldBe` [(a1, reg 0 0 0)]
+    let lastUse m = [regionLastUse r | r ← modelRegions m, regionCoord r == reg 0 0 0]
+    (copied, _) ← stepOk filled (AcquireHold (HoldId 1) a1 Copied [reg 0 0 0])
+    lastUse copied `shouldBe` lastUse filled
+    (_, admitted) ← stepOk copied (q 100 (reg next 0 0) whole)
+    admissionVictims (admission admitted) `shouldBe` [(a1, reg 0 0 0)]
+    -- the control: a borrow of resident data protects the same region, so another is taken
+    (borrowed, _) ← stepOk filled (AcquireHold (HoldId 1) a1 Borrow [reg 0 0 0])
+    lastUse borrowed `shouldNotBe` lastUse filled
+    (_, admitted') ← stepOk borrowed (q 100 (reg next 0 0) whole)
+    admissionVictims (admission admitted') `shouldNotBe` [(a1, reg 0 0 0)]
+  it "keeps its arena retiring until it is released" $ do
+    m0 ← opened wholeRegions
+    (m1, _) ← stepOk m0 (AcquireHold (HoldId 1) a1 Copied [reg 3 0 0])
+    (m2, retiring) ← stepOk m1 (RetireArena a1)
+    reportSettled retiring `shouldBe` []
+    (_, released) ← stepOk m2 (ReleaseHold (HoldId 1))
+    reportSettled released `shouldBe` [a1]
+  where
+    whole = box 0 16 0 16 0 32
+    -- the full extent of a region, so a copied borrow may name whole regions
+    wholeRegions = limitsWith $ \x → x {specExtentX = 16, specExtentY = 16, specExtentZ = 32, specResidentBytes = 2000000, specStagingBytes = 4000000, specLoadJobs = 4, specQueryRegions = 1, specQueuedCommands = 8, specHoldRegions = 2}
+    -- load whole regions 0, 1, ... (each published with a large footprint and released) until the
+    -- next one's admission needs a victim: the model before that admission, its region, the victims
+    fillUntilEviction m i
+      | i > 200 = expectationFailure "no eviction within 200 regions" >> pure (m, i, [])
+      | otherwise = do
+          (m1, accepted) ← stepOk m (q (i + 1) (reg i 0 0) whole)
+          case admissionVictims (admission accepted) of
+            [] → do
+              j ← onlyJob accepted
+              (m2, _) ← stepOk m1 Dispatch
+              (m3, _) ← stepOk m2 (JobCompleted j (Cost {costColumns = 256, costSegments = 256, costPayloadBytes = 16384}))
+              m4 ← withdraw m3 (i + 1)
+              fillUntilEviction m4 (i + 1)
+            victims → pure (m, i, victims)
 
 -- ---------------------------------------------------------------------------
 
