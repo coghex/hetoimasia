@@ -1241,11 +1241,17 @@ settlementChargeSpec =
     withService defaultConfig {configRetainedBytes = base + 2 * (reservation + record) - 1} $ \svc → guarded svc $ \taken → do
       (_, lease) ← openWith svc (ground []) []
       accountsOf svc >>= \(use, _, _, _) → use `shouldBe` base
-      host ← newHost True
+      -- each request is held built and staged, its reservation charged, until the example lets it settle
+      let staged host = waitFor (readTVar (hostReady host) >>= check . (>= 1))
+      host ← newHost False
       first ← okOf (regionsWith svc (hostEndpoint svc Nothing host) lease [region 5 5 (-1)])
-      -- while the first is built, a second reservation does not fit
+      staged host
+      settledOf host >>= (`shouldBe` [])
+      accountsOf svc >>= \(use, _, _, _) → use `shouldBe` base + reservation + record
+      -- while the first holds its reservation, a second does not fit
       refusedWith <$> requestRegionSnapshot svc lease [region 5 5 (-1)] >>= (`shouldBe` Just (RefusedBusy BusyRetained))
       -- settled and NOT taken: its footprint and its request's record, each counted once
+      grant host
       borrow ← settlementOf host >>= borrowIn
       let footprint = regionSnapshotFootprint (regionBorrowSnapshot borrow)
       footprint `shouldSatisfy` (< reservation)
@@ -1253,14 +1259,19 @@ settlementChargeSpec =
       accountsOf svc >>= \(use, _, rows, _) → do
         use `shouldBe` base + footprint + record
         [(counted, held') | (name, counted, held') ← rows, name == "retained bank"] `shouldBe` [(use, use)]
-      -- the headroom the reservation gave back admits a second request at once
-      second ← okOf (requestRegionSnapshot svc lease [region 5 5 (-1)])
+      -- the headroom the reservation gave back admits a second request at once, held staged in turn
+      host' ← newHost False
+      second ← okOf (regionsWith svc (hostEndpoint svc Nothing host') lease [region 5 5 (-1)])
+      staged host'
+      settledOf host' >>= (`shouldBe` [])
       accountsOf svc >>= \(use, _, _, _) → use `shouldBe` base + footprint + record + reservation + record
       -- the first is taken: its record returns, its footprint moves to its holder
       atomically (takeSTM svc first) >>= (`shouldBe` Taken)
       _ ← keep taken borrow
       map (\c → (regionalChargeFootprint c, regionalChargeTaken c)) . take 1 <$> atomically (inspectRegionalSTM svc) >>= (`shouldBe` [(Just footprint, True)])
-      other ← await svc second >>= expectSuccess >>= keep taken
+      grant host'
+      other ← settlementOf host' >>= borrowIn >>= keep taken
+      atomically (takeSTM svc second) >>= (`shouldBe` Taken)
       let footprint' = regionSnapshotFootprint (regionBorrowSnapshot other)
       accountsOf svc >>= \(use, _, _, _) → use `shouldBe` base + footprint + footprint'
       -- each is released exactly once
