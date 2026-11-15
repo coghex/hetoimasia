@@ -146,7 +146,7 @@ spec = describe "Service-wide limits count every state that holds the resource" 
     withServiceSeam quiet defaultConfig alwaysAdmitting noProbe (H.seamFor probe) $ \svc → do
       (_, lease) <- openMain svc "main"
       _ <- readCell svc lease (tile 1 1 1)
-      waitFor (backedAtRestSTM svc >>= check)
+      waitFor (backedQuiescentSTM svc >>= check)
       let (held, _) = decomposeTile (tile 1 1 1)
       gate <- H.addGate probe isWrite
       outcome <- flip finally (H.openGate gate) $ withSnapshot svc lease [held] $ \_ → do

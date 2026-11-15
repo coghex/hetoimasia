@@ -10,7 +10,8 @@ module Test.TerrainRuntime.Backed.Service (spec) where
 
 import Control.Concurrent.STM
 import Control.Exception (finally, try)
-import Control.Monad (forM, forM_)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, takeMVar, tryPutMVar)
+import Control.Monad (forM, forM_, replicateM_, void, when)
 import Hetoimasia.Terrain.Coordinate (decomposeTile, mkLocalCoord)
 import Hetoimasia.Terrain.Query (QueryLimits (..), defaultQueryLimits)
 import Hetoimasia.Terrain.Cell (Cell (..))
@@ -25,6 +26,7 @@ import Hetoimasia.Terrain.Runtime.Storage.Internal.Service (maxRecordControlByte
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Types (Errno (..))
 import Hetoimasia.Terrain.Runtime.Store (StoreSpec (..), defaultStoreSpec, minAllowanceBytes)
 import Test.Hspec
+import Test.Support.Bounded (bounded)
 import Test.TerrainRuntime.Fixtures
 import qualified Test.TerrainRuntime.Storage.Harness as H
 
@@ -43,7 +45,7 @@ isSetLength = \case OpSetFileLength {} → True; _ → False
 -- | The service is at rest: nothing of the owner's backed work is in flight, and the edit bank
 -- holds only the storage service's own records.
 atRest ∷ Service → IO ()
-atRest svc = waitFor (backedAtRestSTM svc >>= check)
+atRest svc = waitFor (backedQuiescentSTM svc >>= check)
 
 spec ∷ Spec
 spec = describe "The backed terrain service" $ do
@@ -55,6 +57,66 @@ spec = describe "The backed terrain service" $ do
     case A.reserve A.Foreground (A.transactionCredits (ArenaId 0) A.worstTransactionCharge) pinned of
       Right _ → pure ()
       Left refusal → expectationFailure ("the worst transaction does not fit beside every reader pin: " <> show refusal)
+
+  describe "The quiescence read" $ do
+    it "tells quiescence from momentary rest: at rest with reclamation selectable it is false, and true once that work has drained; reading it changes nothing" $ do
+      probe ← H.newProbe
+      reached ← newEmptyMVar
+      release ← newEmptyMVar
+      holding ← newTVarIO True
+      -- the owner is held where a removal's commit has just been published: the slot is free and nothing is in flight, and the
+      -- retired pages of the commit are still to be reclaimed
+      let owner = Probe $ \case
+            PointCommitted {} → readTVarIO holding >>= \h → when h (void (tryPutMVar reached ()) >> readMVar release)
+            _ → pure ()
+      withServiceSeam quiet defaultConfig alwaysAdmitting owner (H.seamFor probe) $ \svc → flip finally (atomically (writeTVar holding False) >> void (tryPutMVar release ())) $ do
+        (_, lease) ← openMain svc "main"
+        waitFor (backedQuiescentSTM svc >>= check)
+        let observed = do
+              backed ← inspectBacked svc
+              invariants ← inspectInvariants svc
+              repeats ← atomically (inspectIdleRepeatsSTM svc)
+              status ← arenaStatus svc lease >>= expectRight
+              limits ← inspectLimits svc
+              pure (show (backed, invariants, repeats, status, limits))
+        _ ← removeCell' svc lease (tile 3 4 5)
+        bounded (takeMVar reached)
+        -- (a) momentary rest, with work the owner can still choose
+        atomically (backedAtRestSTM svc) `shouldReturn` True
+        atomically (backedQuiescentSTM svc) `shouldReturn` False
+        held ← arenaStatus svc lease >>= expectRight
+        (statusPendingReclaimBytes held > 0 || statusDiscovery held /= DiscoveryIdle) `shouldBe` True
+        -- (d) a reading, however often made, leaves everything the service shows as it was
+        shown ← observed
+        replicateM_ 5 (atomically (backedQuiescentSTM svc))
+        observed `shouldReturn` shown
+        -- (c) the work drains once the owner is let go
+        atomically (writeTVar holding False)
+        putMVar release ()
+        waitFor (backedQuiescentSTM svc >>= check)
+        drained ← arenaStatus svc lease >>= expectRight
+        (statusDiscovery drained, statusPendingReclaimBytes drained) `shouldBe` (DiscoveryIdle, 0)
+        quietBefore ← observed
+        atomically (backedQuiescentSTM svc) `shouldReturn` True
+        observed `shouldReturn` quietBefore
+        inspectBacked svc `shouldReturn` []
+
+    it "is false while a storage job is outstanding and true again when it has ended" $
+      withProbedService defaultConfig $ \probe svc → do
+        (_, lease) ← openMain svc "main"
+        _ ← removeCell' svc lease (tile 3 4 5)
+        waitFor (backedQuiescentSTM svc >>= check)
+        gate ← H.addGateOnce probe isRead
+        readRequest ← okOf (cellAt svc lease (tile 3 4 6))
+        H.awaitReached gate 1
+        -- (b) a read of the backend is held at the seam: backed work is outstanding
+        atomically (backedAtRestSTM svc) `shouldReturn` False
+        atomically (backedQuiescentSTM svc) `shouldReturn` False
+        H.openGate gate
+        _ ← await svc readRequest >>= expectSuccess
+        waitFor (backedQuiescentSTM svc >>= check)
+        atomically (backedAtRestSTM svc) `shouldReturn` True
+        inspectBacked svc `shouldReturn` []
 
   it "refuses at construction an edit bank that cannot fund one read beside the worst transaction and every reader pin (a circular wait), and accepts one byte more" $ do
     let atMinimum = toInteger (ramDecodedCopies A.worstTransactionCharge) + 2 * toInteger A.readerPinnedCacheBytes

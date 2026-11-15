@@ -135,4 +135,4 @@ spec = describe "R1 and R2: credits are released at the safe point, capacity ref
     isRead, isWrite ∷ NativeOp → Bool
     isRead = \case OpReadAt {} → True; _ → False
     isWrite = \case OpWriteAt {} → True; _ → False
-    backedAtRest svc = waitFor (backedAtRestSTM svc >>= check)
+    backedAtRest svc = waitFor (backedQuiescentSTM svc >>= check)

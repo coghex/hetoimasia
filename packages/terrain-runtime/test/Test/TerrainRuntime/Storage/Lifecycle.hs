@@ -35,7 +35,7 @@ import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec
 import Test.Support.Bounded (bounded)
 import Test.Support.Owned (withOwnedThread, withOwnedThreadOpening)
-import Test.TerrainRuntime.Isolation (assertSequential)
+import Test.TerrainRuntime.Isolation (assertAlone)
 import Test.TerrainRuntime.Storage.Harness
 import Test.TerrainRuntime.Store.Harness (H (..), identOf, smallSpec)
 
@@ -1083,7 +1083,7 @@ withControlledServiceWith = withControlledServiceFact CloseReleasesOnFailure
 
 -- | The controlled service under a chosen platform fact about a failed close.
 withControlledServiceFact :: CloseFact -> Logger -> (Env -> Ctl -> IO a) -> IO a
-withControlledServiceFact fact logger body = assertSequential "a service example (files, workers)" >> withControlledServiceFact' fact logger body
+withControlledServiceFact fact logger body = assertAlone "a service example (files, workers)" >> withControlledServiceFact' fact logger body
 
 withControlledServiceFact' :: CloseFact -> Logger -> (Env -> Ctl -> IO a) -> IO a
 withControlledServiceFact' fact logger body =
