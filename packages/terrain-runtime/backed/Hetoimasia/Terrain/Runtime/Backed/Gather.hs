@@ -50,6 +50,7 @@ module Hetoimasia.Terrain.Runtime.Backed.Gather
 import Control.Concurrent.STM (STM, atomically)
 import Data.Int (Int64)
 import Data.Word (Word64)
+import qualified Data.ByteString as BS
 import qualified Data.Text as Text
 import Hetoimasia.Terrain.Cell (Column)
 import Hetoimasia.Terrain.Discovery (Record (..), RecordKey (..))
@@ -87,6 +88,7 @@ import Hetoimasia.Terrain.Runtime.Store.Internal.Model
   , storeConfig
   )
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan (IntegrityWhy, RangeStart (..))
+import Hetoimasia.Terrain.Runtime.Store.Internal.Records (encodeKey)
 import Hetoimasia.Terrain.Runtime.Store.Internal.State (StoreConfig, cfgTotalPages, windowPageBytes)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Protocol (Supply (..))
 import Hetoimasia.Terrain.Runtime.Store.Internal.Tree (Window, windowInsert, windowSize)
@@ -241,8 +243,11 @@ stepGather io closing store g = case gFetch g of
            in case readerRange store (gToken g) (gWindow g) TreeRuns start (gLimit g) of
                 Read records →
                   let ours = \case (KeyRun col _, _) → col == column; _ → False
-                      -- the floor may land on an earlier column's last run: it is passed over
-                      fromOurs = dropWhile (not . ours) records
+                      -- the floor may land on an earlier column's last run: it is passed over. ONLY keys
+                      -- below the column are (the tree orders keys by their bytes, the column's first):
+                      -- the first key of a later column ends the column, read or not
+                      below = \case (KeyRun col _, _) → columnKey col < columnKey column; _ → False
+                      fromOurs = dropWhile below records
                       column' = [(col, lo, hi) | (KeyRun col lo, RecRun hi) ← takeWhile ours fromOurs]
                       mine = [(col, lo, hi) | (col, lo, hi) ← column', hi > from, lo < to]
                       -- the column ends at the first record of another column after it, at a run past its range,
@@ -281,6 +286,8 @@ stepGather io closing store g = case gFetch g of
                 ReadWrongWindow why → pure (g, GFailed (HandleDefect (Text.pack ("a reader's window was refused: " <> show why))))
   where
     restart x = either (const x) (\w → x {gWindow = w}) (readerWindow store (gToken x))
+    -- a column's place in the runs tree's key order: the leading bytes of its keys
+    columnKey col = BS.take 16 (encodeKey (KeyRun col 0))
     corrupt ∷ IntegrityWhy → Handling
     corrupt why = HandlePause CondIntegrity (FaultIntegrity (FromStore why))
 

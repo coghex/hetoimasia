@@ -316,6 +316,28 @@ spec = describe "the owner's transaction runner, through the production storage 
             fails `shouldBe` [1 .. smallest - 1]
             smallest `shouldSatisfy` (< widePeak)
           [] → expectationFailure "no window up to the reader's limit answered"
+    -- 520 runs, one a column, more than two full batches of 256 records: column (100, 1) has none and lies
+    -- between (99, 2) and (100, 2) in the tree's key order
+    it "ends a column with no runs at the first key of a later column: the read keeps nothing and reads no more pages than a read of that later column" $
+      withArena $ \env io store0 → do
+        store ← foldM
+          ( \s tile → removeAndPublish io s tile >>= either (\d → fail ("a removal ended without publishing: " <> show d)) pure
+          )
+          store0
+          [tileAt x 2 3 | x ← [0 .. 519]]
+        let readCount = atomically (countEvents (envProbe env) isRead)
+            pagesOf columns = do
+              readsBefore ← readCount
+              (_, result, _) ← gatherRuns io gatherPinLimit store columns
+              readsAfter ← readCount
+              pure (result, readsAfter - readsBefore)
+        -- the floor lands on (99, 2)'s run, below the column: passed over; (100, 2)'s run ends the column
+        (absent, absentPages) ← pagesOf [columnAt 100 1]
+        absent `shouldBe` Right []
+        -- the later column's own read takes the same first batch from the same floor
+        (later, laterPages) ← pagesOf [columnAt 100 2]
+        later `shouldBe` Right [(columnAt 100 2, 3, 4)]
+        (absentPages, laterPages) `shouldSatisfy` \(a, b) → a > 0 && a <= b
   where
     isRight' = either (const False) (const True)
     isWrite op = case op of OpWriteAt _ _ → True; _ → False
