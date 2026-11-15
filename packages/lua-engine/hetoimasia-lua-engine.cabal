@@ -501,6 +501,7 @@ test-suite lua-engine-tests
         Test.LuaEngine.Terrain.Support
         Test.LuaEngine.Terrain.Validation
         Test.LuaEngine.Terrain.Windows
+        Test.LuaEngine.TerrainPass
         Test.LuaEngine.Texture.Spec
         Test.LuaEngine.Texture.Stages
         Test.LuaEngine.Texture.Teardown
@@ -542,6 +543,7 @@ test-suite lua-engine-tests
         hetoimasia-terrain-runtime:testing,
         hetoimasia-test-support ==0.1.0.0,
         hspec >=2.11 && <3,
+        hspec-core >=2.11 && <3,
         QuickCheck >=2.15 && <2.19,
         HUnit >=1.6 && <1.7,
         process >=1.6 && <1.7,

@@ -1,4 +1,5 @@
--- | The Lua engine package's component specs, composed under one @LuaEngine@ group.
+-- | The Lua engine package's component specs, composed under one @LuaEngine@ group, and then, last, the terrain set's
+-- multi-capability pass under its own label ("Test.LuaEngine.Terrain.Spec"): nothing runs beside it or after it.
 module Test.LuaEngine.Spec (spec) where
 
 import qualified Test.LuaEngine.Behavior as Behavior
@@ -19,27 +20,32 @@ import qualified Test.LuaEngine.Request.Spec as Requests
 import qualified Test.LuaEngine.Scene.Spec as Scene
 import qualified Test.LuaEngine.Session.Spec as Session
 import qualified Test.LuaEngine.Terrain.Spec as Terrain
+import qualified Test.LuaEngine.TerrainPass as TerrainPass
 import qualified Test.LuaEngine.Texture.Spec as Texture
 import Test.Hspec (Spec, describe)
+import Test.Support.Capabilities (PassSetting)
 
-spec ∷ Spec
-spec = describe "LuaEngine" $ do
-  Examples.spec
-  Syntax.spec
-  Schema.spec
-  Tick.spec
-  Profile.spec
-  Requests.spec
-  Data.spec
-  Modules.spec
-  Texture.spec
-  Terrain.spec
-  Scene.spec
-  Facade.spec
-  Session.spec
-  Behavior.spec
-  Boot.spec
-  Loader.spec
-  Boundary.spec
-  Integrated.spec
-  Owned.spec
+spec ∷ PassSetting → Spec
+spec pass = do
+  describe "LuaEngine" $ do
+    Examples.spec
+    Syntax.spec
+    Schema.spec
+    Tick.spec
+    Profile.spec
+    Requests.spec
+    Data.spec
+    Modules.spec
+    Texture.spec
+    Terrain.spec
+    Scene.spec
+    Facade.spec
+    Session.spec
+    Behavior.spec
+    Boot.spec
+    Loader.spec
+    Boundary.spec
+    Integrated.spec
+    Owned.spec
+    TerrainPass.spec
+  Terrain.passSpec pass

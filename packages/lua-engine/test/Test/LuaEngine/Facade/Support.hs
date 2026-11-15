@@ -112,7 +112,7 @@ module Test.LuaEngine.Facade.Support
   , module Hetoimasia.LuaEngine.Facade
   ) where
 
-import Control.Concurrent (ThreadId, yield)
+import Control.Concurrent (ThreadId, myThreadId, yield)
 import GHC.Conc (BlockReason (BlockedOnSTM), ThreadStatus (ThreadBlocked, ThreadDied, ThreadFinished), threadStatus)
 import Control.Concurrent.STM
   ( STM
@@ -427,6 +427,15 @@ worldTimer world = timerBackend world Nothing
 -- wakes that VM's own registration; read by the VM's owner and its facade. Zero for a VM the step never woke.
 newtype VmClock = VmClock (IORef Word64)
 
+-- | A VM the world's timer knows, for 'explainSteps': its label, its clock, and the thread its owner arms on (recorded at its
+-- first registration; an owner arms only on its own thread) with the owner's scheduler.
+data TimerVm = TimerVm
+  { tvLabel ∷ !Text
+  , tvClock ∷ !VmClock
+  , tvThread ∷ !(IORef (Maybe ThreadId))
+  , tvEndpoint ∷ !(Maybe ScheduledEndpoint)
+  }
+
 -- | A timer that fires only when the example says.
 --
 -- What it holds: the live registrations, in arming order, each with the VM that armed it (its label and clock; none for
@@ -436,6 +445,8 @@ newtype VmClock = VmClock (IORef Word64)
 data FakeTimer = FakeTimer
   { ftRegistrations ∷ !(TVar [Registration])
   , ftArmed ∷ !(TVar Int)
+  , ftVms ∷ !(TVar [TimerVm])
+  -- ^ The VMs 'withFvm' made, for 'explainSteps' alone.
   }
 
 -- | One registration an owner armed.
@@ -449,13 +460,16 @@ data Registration = Registration
   }
 
 newFakeTimer ∷ IO FakeTimer
-newFakeTimer = FakeTimer <$> newTVarIO [] <*> newTVarIO 0
+newFakeTimer = FakeTimer <$> newTVarIO [] <*> newTVarIO 0 <*> newTVarIO []
 
 -- | The backend an owner is configured with: each registration is armed as this VM's (or no VM's), at that VM's reading of the
 -- clock plus its length.
 timerBackend ∷ World → Maybe (Text, VmClock) → TimerBackend
 timerBackend world vm = TimerBackend $ \microseconds wake → do
   let timer = wTimer world
+  forM_ vm $ \(label, _) → do
+    known ← readTVarIO (ftVms timer)
+    forM_ [t | t ← known, tvLabel t == label] $ \t → readIORef (tvThread t) >>= maybe (myThreadId >>= writeIORef (tvThread t) . Just) (const (pure ()))
   base ← readIORef (wClock world)
   extra ← maybe (pure 0) (\(_, VmClock ahead) → readIORef ahead) vm
   live ← newTVarIO True
@@ -640,6 +654,17 @@ explainSteps world = do
     Nothing → pure ("no VM", regMicros r, regDeadline r, 0)
     Just (label, VmClock ahead) → (\extra → (Text.unpack label, regMicros r, regDeadline r, extra)) <$> readIORef ahead
   putStrLn ("the step: world clock " <> show now <> " ns; live registrations (VM, length us, deadline ns, VM clock ahead ns) " <> show described)
+  vms ← readTVarIO (ftVms (wTimer world))
+  forM_ vms $ \vm → do
+    let VmClock ahead = tvClock vm
+    extra ← readIORef ahead
+    thread ← readIORef (tvThread vm)
+    status ← traverse threadStatus thread
+    counts ← traverse (atomically . scheduledDiagnostics) (tvEndpoint vm)
+    putStrLn
+      ( "  VM " <> Text.unpack (tvLabel vm) <> ": clock ahead " <> show extra <> " ns; owner thread " <> show status
+          <> maybe "" (\d → "; segments completed " <> show (diagCompleted d) <> ", yielded " <> show (diagYielded d) <> ", waiting " <> show (diagWaiting d) <> ", failed " <> show (diagFailed d) <> ", overruns " <> show (diagOverruns d)) counts
+      )
 
 -- | Fire the live registrations until the condition holds. Firing is idempotent for the owner, which
 -- looks at its clock at each wake, so how often it happens is not what an example depends on.
@@ -816,6 +841,8 @@ withFvmRefusing world runtime shape body = do
     endpoint ← maybe (assertFailure "the owner has no loader endpoint") pure (scheduledLoaderEndpoint owner)
     attachLoader coordinator endpoint
     writeIORef tickRef (atomically (scheduledTick (scheduledEndpoint owner)))
+    vmThread ← newIORef Nothing
+    atomically (modifyTVar' (ftVms (wTimer world)) (<> [TimerVm vmLabel vmClock vmThread (Just (scheduledEndpoint owner))]))
     -- The owner stops before the coordinator and the output close: a hook that runs while it retires
     -- (a @shutdown@ that prints) still finds both.
     body (Fvm owner coordinator facade endpoint (shRole shape)) `finally` retireAndAwait (wControl world) owner
