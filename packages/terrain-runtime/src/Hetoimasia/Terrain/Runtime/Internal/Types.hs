@@ -29,6 +29,7 @@ module Hetoimasia.Terrain.Runtime.Internal.Types
   , ColumnAnswer (..)
   , SurfaceAnswer (..)
   , RemoveAnswer (..)
+  , RegionBorrow (..)
   , Failure (..)
   , Refused (..)
   , BusyWhy (..)
@@ -87,6 +88,7 @@ module Hetoimasia.Terrain.Runtime.Internal.Types
   , runningPreparation
   , runningHolds
   , runningViews
+  , runningRegional
   , Census (..)
   , ArenaCensus (..)
   , RequestCensus (..)
@@ -119,6 +121,8 @@ module Hetoimasia.Terrain.Runtime.Internal.Types
   , GatherFor (..)
   , GatherTask (..)
   , ReadRun (..)
+  , RegionalRec (..)
+  , RegionalOwner (..)
   , SlotWork (..)
   , SlotTask (..)
   , SlotRun (..)
@@ -174,6 +178,8 @@ import qualified Hetoimasia.Terrain.Connectivity as C
 import qualified Hetoimasia.Terrain.Discovery as D
 import Hetoimasia.Terrain.Runtime.Backed.Fault (StorageFault)
 import Hetoimasia.Terrain.Runtime.Backed.Gather (Gather)
+import Hetoimasia.Terrain.Runtime.Backed.RegionCopy (RegionSnapshot)
+import Hetoimasia.Terrain.Runtime.Backed.Regional (Build)
 import qualified Hetoimasia.Terrain.Runtime.Backed.Probe as Probe
 import qualified Hetoimasia.Terrain.Runtime.Backed.Query as Query
 import qualified Hetoimasia.Terrain.Runtime.Backed.Growth as Growth
@@ -275,7 +281,20 @@ data Answer
     ARetried !RetryAnswer
   | -- | What is known of a cell (#661): its solid and its void, at one content and knowledge revision.
     AKnowledge !KnowledgeAnswer
+  | -- | A regional terrain-and-knowledge snapshot (#690), owned by the service until its holder takes
+    -- it ('Hetoimasia.Terrain.Runtime.await', 'retire'), then by the holder until it releases it.
+    ARegions !RegionBorrow
   deriving stock (Eq, Show)
+
+-- | A regional snapshot and the identity of the charge its holder releases. It grants no authority:
+-- no request, removal, precondition or settlement accepts it. The constructor is private.
+data RegionBorrow = RegionBorrow !Unique !HoldId !RegionSnapshot
+
+instance Eq RegionBorrow where
+  RegionBorrow a h _ == RegionBorrow b g _ = a == b && h == g
+
+instance Show RegionBorrow where
+  show (RegionBorrow _ h _) = "RegionBorrow " <> show h
 
 data KnowledgeAnswer = KnowledgeAnswer
   { knowledgeIncarnation ∷ !ArenaId
@@ -529,6 +548,8 @@ data Point
   | -- | A request's pinned read ended: the most pages its window held, the pages it may pin, the runs it
     -- kept and the most it could keep (its cap), and the levels it read, @[lo, hi)@ of each column.
     PointGatherWindow !RequestId !Int !Int !Int !Int ![(Int64, Int64)]
+  | -- | A regional snapshot's build is about to take a quantum, with the regions it has finished.
+    PointRegionStep !RequestId !Int
   deriving stock (Eq, Show)
 
 -- | An unexpected defect, kept with bounded context.
@@ -585,6 +606,8 @@ data Cmd
   | CRemove !TileCoord !(Maybe Precondition)
   | -- | What is known of a cell.
     CKnowledge !TileCoord
+  | -- | A regional snapshot of these regions, charged to this hold from admission to release.
+    CRegions ![RegionCoord] !HoldId
   | -- | The creator's growth to an allowance (bytes, validated at admission).
     CGrow !Word64
   | -- | The creator's explicit retry of a paused arena.
@@ -724,10 +747,14 @@ data RunningWork = RunningWork
   , -- | The regions each registered view's latest accepted demand describes, from the
     -- receipt the service gave for it.
     rwViews ∷ !(Map ViewId Word64)
+  , -- | Each regional snapshot's borrow: the regions it names and what it holds, the bytes its
+    -- admission reserved while it is built, then the footprint measured on the snapshot value it settled
+    -- with, until it is released.
+    rwRegional ∷ !(Map HoldId (Word64, Word64))
   }
 
 noRunningWork ∷ RunningWork
-noRunningWork = RunningWork Map.empty Nothing Map.empty Map.empty
+noRunningWork = RunningWork Map.empty Nothing Map.empty Map.empty Map.empty
 
 -- | An accepted load job: its identity, where, the resident bytes and the scratch the
 -- model granted it at admission, the least the job holds once the owner runs it, from the
@@ -804,6 +831,11 @@ runningHolds work = [(hid, regions, bytes) | (hid, (regions, bytes)) ← Map.toL
 -- | Each view with an accepted demand and how many regions that demand describes.
 runningViews ∷ RunningWork → [(ViewId, Word64)]
 runningViews = Map.toList . rwViews
+
+-- | Each regional snapshot's borrow: its hold, the regions it names, and what it holds (its reservation
+-- while it is built, then the footprint of the snapshot it settled with).
+runningRegional ∷ RunningWork → [(HoldId, Word64, Word64)]
+runningRegional work = [(hid, regions, bytes) | (hid, (regions, bytes)) ← Map.toList (rwRegional work)]
 
 -- | One arena as the service holds it: whether it is retiring, the accounted bytes its
 -- resident detail holds in each vertical region (from the detail itself), and the
@@ -1012,6 +1044,8 @@ data GatherTask = GatherTask
     -- the removals of.
     gatherRevision ∷ !Revision
   , gatherKnowledge ∷ !Revision
+  , -- | The arena's residency generation, read in the transaction that took the pin.
+    gatherGeneration ∷ !Word64
   , gatherWake ∷ !Wake
   }
 
@@ -1021,7 +1055,29 @@ data ReadRun
   | KnowledgeRead !(Query.Query D.CellKnowledge)
   | -- | An explicit retry's re-read of the pages a pause recorded, with the conditions it would clear.
     ProbeRead !Probe.PageProbe ![Condition] !CreatorBasis
+  | -- | A regional snapshot's build, on one pin.
+    RegionalRead !Build
 
+-- | What the service holds for a regional snapshot's borrow, from its admission to its release.
+data RegionalRec = RegionalRec
+  { regionalArena ∷ !ArenaId
+  , regionalRegions ∷ !Int
+  , -- | What admission reserved: the most the result can hold, and one region's build scratch.
+    regionalReserved ∷ !Word64
+  , -- | The settled snapshot's footprint, measured on the value: once known, the charge.
+    regionalFootprint ∷ !(Maybe Word64)
+  , regionalOwner ∷ !RegionalOwner
+  }
+
+-- | Who releases a regional borrow.
+data RegionalOwner
+  = -- | Its request: an untaken result is the service's, released on the request's end.
+    OwnedByRequest !RequestId
+  | -- | Its holder, who took it: released only by the holder (or its scope's exit).
+    OwnedByHolder
+  | -- | Its request ended while its build still holds what it read: released when the build drains.
+    Orphaned !RequestId
+  deriving stock (Eq, Show)
 -- | What the session's one mutating transaction is for.
 data SlotWork
   = SlotRemoval !RequestId
@@ -1115,6 +1171,8 @@ data St = St
   , stateBorrowers ∷ !Int
   , -- | The accounted backing bytes each outstanding snapshot holds.
     stateSnapshots ∷ !(Map HoldId Word64)
+  , -- | Each regional snapshot's borrow (#690), from its admission to its release.
+    stateRegional ∷ !(Map HoldId RegionalRec)
   , -- | Something that may free capacity happened since the last retry pass.
     stateFreed ∷ !Bool
   , -- | A dispatch found nothing to run since the last time capacity freed.
@@ -1223,6 +1281,7 @@ initialState config limits =
     , stateViews = Map.empty
     , stateBorrowers = 0
     , stateSnapshots = Map.empty
+    , stateRegional = Map.empty
     , stateFreed = False
     , stateDispatchIdle = False
     , stateDefects = []

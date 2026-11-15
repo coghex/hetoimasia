@@ -12,6 +12,7 @@ import qualified Test.TerrainRuntime.Offload as Offload
 import qualified Test.TerrainRuntime.Opacity as Opacity
 import qualified Test.TerrainRuntime.Oracle as Oracle
 import qualified Test.TerrainRuntime.Races as Races
+import qualified Test.TerrainRuntime.Regional as Regional
 import qualified Test.TerrainRuntime.Revalidation as Revalidation
 import qualified Test.TerrainRuntime.Storage.Classes as StorageClasses
 import qualified Test.TerrainRuntime.Storage.Growth as StorageGrowth
@@ -101,6 +102,7 @@ sequentialSpec = do
   BackedService.spec
   BackedSweep.spec
   BackedTxn.spec
+  Regional.spec
   StoreKeys.spec
   StoreMemory.spec
   StoreDepth.spec

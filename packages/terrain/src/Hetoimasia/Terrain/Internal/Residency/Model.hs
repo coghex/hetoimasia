@@ -1492,16 +1492,13 @@ acquireHold m h a kind regions = do
     (r : _) → Left (Invalid (DuplicateRegion r))
     [] → Right ()
   case kind of
-    -- A copied borrow names whole regions of the configured extent and needs none of
-    -- them resident: its data is copied out of the store, not borrowed from residency.
-    Copied → do
+    -- A copied borrow names whole regions of supported tiles and needs none of them
+    -- resident: its data is copied out of the store, not borrowed from residency. The
+    -- configured extent bounds what a request may touch, not what a copy may describe.
+    Copied →
       case filter (not . supportedRegion) regions of
         (r : _) → Left (Invalid (UnsupportedRegion r))
         [] → Right ()
-      let (ex, ey, ez) = limitExtent (mLimits m)
-      case regions of
-        (r : _) | ex < 16 || ey < 16 || ez < 32 → Left (Invalid (OutsideExtent r))
-        _ → Right ()
     _ →
       mapM_
         ( \r → case Map.lookup (a, r) (mTargets m) of

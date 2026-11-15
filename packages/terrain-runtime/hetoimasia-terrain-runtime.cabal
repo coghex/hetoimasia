@@ -142,11 +142,14 @@ library backed
         Hetoimasia.Terrain.Runtime.Backed.Port
         Hetoimasia.Terrain.Runtime.Backed.Probe
         Hetoimasia.Terrain.Runtime.Backed.Query
+        Hetoimasia.Terrain.Runtime.Backed.RegionCopy
+        Hetoimasia.Terrain.Runtime.Backed.Regional
         Hetoimasia.Terrain.Runtime.Backed.Txn
         Hetoimasia.Terrain.Runtime.Backed.WriteProbe
     build-depends:
         base >=4.22 && <4.23,
         bytestring >=0.12 && <0.13,
+        containers >=0.8 && <0.9,
         stm >=2.5.3 && <2.6,
         text >=2.1 && <2.2,
         hetoimasia-foundation ==0.1.0.0,
@@ -201,6 +204,7 @@ test-suite terrain-runtime-tests
         Test.TerrainRuntime.Parallel
         Test.TerrainRuntime.Runner
         Test.TerrainRuntime.Races
+        Test.TerrainRuntime.Regional
         Test.TerrainRuntime.Revalidation
         Test.TerrainRuntime.Usage
         Test.TerrainRuntime.Spec

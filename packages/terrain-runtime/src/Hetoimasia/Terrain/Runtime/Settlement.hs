@@ -28,6 +28,7 @@ module Hetoimasia.Terrain.Runtime.Settlement
   , surfaceWith
   , removeWith
   , knowledgeWith
+  , regionsWith
   , growWith
   , retryWith
 
@@ -35,6 +36,7 @@ module Hetoimasia.Terrain.Runtime.Settlement
   , cancel
   , retire
   , retireSTM
+  , takeSTM
   , releaseArenaLeaseSTM
   ) where
 
@@ -42,7 +44,7 @@ import Control.Concurrent.STM
 import Control.Monad (void)
 import Data.Text (Text)
 import Hetoimasia.Terrain.Cell (Column, ZRange)
-import Hetoimasia.Terrain.Coordinate (TileCoord)
+import Hetoimasia.Terrain.Coordinate (RegionCoord, TileCoord)
 import Hetoimasia.Terrain.Runtime.Internal.Core
 import Hetoimasia.Terrain.Runtime.Internal.Types
 import Hetoimasia.Terrain.Source (SourceSpec, mkSource)
@@ -83,6 +85,13 @@ removeWith svc ep lease tile precondition = atomically (admit svc ep (SubRemove 
 knowledgeWith ∷ Service → Endpoint → ArenaLease → TileCoord → IO (Either Refused Request)
 knowledgeWith svc ep lease tile = atomically (admit svc ep (SubKnowledge lease tile))
 
+-- | A regional terrain-and-knowledge snapshot of some regions (#690), built from one committed version
+-- and settled labelled with its identities. Its borrow is the service's until the host takes it
+-- ('retire' or 'retireSTM', which take it in the transaction that retires the result), then the host's
+-- until it releases it ('Hetoimasia.Terrain.Runtime.releaseRegionBorrow').
+regionsWith ∷ Service → Endpoint → ArenaLease → [RegionCoord] → IO (Either Refused Request)
+regionsWith svc ep lease regions = atomically (admit svc ep (SubRegions lease regions))
+
 -- | The creator's growth of an arena's allowance to a size in bytes (requirement 9): equal is an
 -- idempotent success, smaller settles @storage_size_not_increased@, larger becomes spendable only
 -- when the storage backend has obtained it and the decision commits the cap with the result. A
@@ -110,6 +119,13 @@ retire svc request = atomically (retireRequest svc request)
 -- left queued for a later call. The same function, writing the same state; it does nothing for a request that is not settled.
 retireSTM ∷ Service → Request → STM ()
 retireSTM = retireRequest
+
+-- | Retire a settled request's accepted result and take what it hands over, in one transaction: a
+-- regional snapshot's borrow ('Hetoimasia.Terrain.Runtime.requestRegionSnapshot') becomes the host's,
+-- charged until the host releases it ('Hetoimasia.Terrain.Runtime.releaseRegionBorrow'). Plain
+-- 'retireSTM' releases a borrow nobody took instead. For any other result the two are the same.
+takeSTM ∷ Service → Request → STM ()
+takeSTM = takeRequest
 
 -- | 'Hetoimasia.Terrain.Runtime.releaseLease' as a transaction, for a host that gives a lease back from inside one (the Lua host does, for a
 -- lease the service made for an open it then settled instead of publishing): the lease is released in that transaction and never left

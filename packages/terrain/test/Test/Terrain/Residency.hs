@@ -799,7 +799,7 @@ copiedSpec = describe "a copied borrow" $ do
     modelRegions m1 `shouldBe` []
     (m2, _) ← stepOk m1 (ReleaseHold (HoldId 1))
     ledgersOf m2 `shouldBe` Ledgers (0, 0) (0, 0) (0, 0)
-  it "refuses an empty set, a duplicate region, a region of unsupported cells, a set over the cap and an extent that cannot hold a whole region, creating nothing" $ do
+  it "refuses an empty set, a duplicate region, a region of unsupported cells and a set over the cap, creating nothing, and is taken under an extent smaller than a region" $ do
     m0 ← opened wholeRegions
     let refusedWith m event why = do
           stepRefused m event `shouldReturn` why
@@ -808,8 +808,10 @@ copiedSpec = describe "a copied borrow" $ do
     refusedWith m0 (AcquireHold (HoldId 1) a1 Copied [reg 1 0 0, reg 1 0 0]) (Invalid (DuplicateRegion (reg 1 0 0)))
     refusedWith m0 (AcquireHold (HoldId 1) a1 Copied [RegionCoord maxBound 0 0]) (Invalid (UnsupportedRegion (RegionCoord maxBound 0 0)))
     refusedWith m0 (AcquireHold (HoldId 1) a1 Copied [reg i 0 0 | i ← [0 .. 2]]) (Invalid (DemandTooLarge 3 2))
+    -- the configured extent bounds what a request may touch, not what a copy may describe
     small ← opened roomy
-    refusedWith small (AcquireHold (HoldId 1) a1 Copied [reg 0 0 0]) (Invalid (OutsideExtent (reg 0 0 0)))
+    (taken, _) ← stepOk small (AcquireHold (HoldId 1) a1 Copied [reg 0 0 0])
+    modelHolds taken `shouldBe` [(HoldId 1, a1, Copied, [reg 0 0 0])]
   it "never protects a resident region from eviction and never touches its recency" $ do
     -- whole regions loaded one after another, each released, until the next needs a victim: the
     -- least recently used, region 0

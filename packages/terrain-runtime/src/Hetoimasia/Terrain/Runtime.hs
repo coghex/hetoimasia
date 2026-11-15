@@ -116,6 +116,36 @@ module Hetoimasia.Terrain.Runtime
   , snapshotGeneration
   , withSnapshot
 
+    -- * Regional snapshots
+  , RegionBorrow
+  , RegionSnapshot
+  , RegionPart (..)
+  , requestRegionSnapshot
+  , regionBorrowSnapshot
+  , releaseRegionBorrow
+  , releaseRegionBorrowSTM
+  , withRegionSnapshot
+  , regionSnapshotIncarnation
+  , regionSnapshotContentRevision
+  , regionSnapshotKnowledgeRevision
+  , regionSnapshotGeneration
+  , regionSnapshotSource
+  , regionSnapshotRegions
+  , regionTerrain
+  , regionKnowledge
+  , regionCell
+  , regionCellKnowledge
+  , regionSnapshotFootprint
+  , regionSnapshotReservation
+  , RegionWork
+  , regionSnapshotWork
+  , workColumnsRead
+  , workRunsRead
+  , workClasses
+  , workPieces
+  , workEvaluations
+  , workPerLevelEvaluations
+
     -- * Inspection
   , inspectInvariants
   , inspectBacked
@@ -132,6 +162,13 @@ module Hetoimasia.Terrain.Runtime
   , inspectDefects
   , inspectSnapshotBytes
   , inspectRetainedChargesSTM
+  , inspectRegionalSTM
+  , RegionalCharge
+  , regionalChargeHold
+  , regionalChargeRegions
+  , regionalChargeReserved
+  , regionalChargeFootprint
+  , regionalChargeTaken
   , inspectLimits
   , inspectConfig
   , LimitRow (..)
@@ -157,6 +194,7 @@ module Hetoimasia.Terrain.Runtime
   , runningPreparation
   , runningHolds
   , runningViews
+  , runningRegional
   , JobWork
   , jobWorkJob
   , jobWorkArena
@@ -212,6 +250,30 @@ import Hetoimasia.Terrain.Runtime.Internal.Types
 import Hetoimasia.Terrain.Runtime.Settlement
 import Hetoimasia.Terrain.Runtime.Backed.Port (StoragePort (..), storagePort)
 import Hetoimasia.Terrain.Runtime.Backed.Fault (FullWhy (..), IntegritySource (..), StorageFault (..), faultCode)
+import Hetoimasia.Terrain.Runtime.Backed.RegionCopy
+  ( RegionPart (..)
+  , RegionSnapshot
+  , RegionWork
+  , regionCell
+  , regionCellKnowledge
+  , regionKnowledge
+  , regionReservation
+  , regionSnapshotContentRevision
+  , regionSnapshotGeneration
+  , regionSnapshotIncarnation
+  , regionSnapshotKnowledgeRevision
+  , regionSnapshotRegions
+  , regionSnapshotSource
+  , regionSnapshotWork
+  , regionTerrain
+  , snapshotFootprint
+  , workClasses
+  , workColumnsRead
+  , workEvaluations
+  , workPerLevelEvaluations
+  , workPieces
+  , workRunsRead
+  )
 import Hetoimasia.Terrain.Runtime.Internal.Backed (backedInvariants, editBankChecked, markOf, pressureMark, removalStagingChecked, queryKeepChecked)
 import qualified Hetoimasia.Terrain.Runtime.Storage.Internal.Service as Storage
 import Hetoimasia.Terrain.Runtime.Store.Internal.Admission (EditBankSpec (..), Ledger (..), defaultEditBankSpec, ledgers, mkEditBankConfig, newAdmission)
@@ -511,11 +573,12 @@ inspectEditBankSTM ∷ Service → STM Ledger
 inspectEditBankSTM svc = ledgers <$> readTVar (serviceEditBank svc)
 
 -- | Wait for a request's terminal outcome and retire its result: the credits an
--- accepted result holds return when it is taken.
+-- accepted result holds return when it is taken. A regional snapshot's borrow is taken: it is the
+-- caller's from then on, charged until 'releaseRegionBorrow'.
 await ∷ Service → Pending a → IO (Either Settlement a)
 await svc (Pending request box project) = do
   settlement <- atomically (readTMVar box)
-  retire svc request
+  atomically (takeSTM svc request)
   pure $ case settlement of
     Succeeded answer → maybe (Left (Failed (HostFailure "answer of an unexpected kind"))) Right (project answer)
     other → Left other
@@ -557,6 +620,97 @@ withSnapshot svc lease regions body =
     release = \case
       Left _ → pure ()
       Right (hid, _) → atomically (releaseSnapshotSTM svc hid)
+
+-- ---------------------------------------------------------------------------
+-- Regional snapshots
+
+-- | Request an immutable terrain-and-knowledge snapshot of some regions (#690): admitted at once or
+-- refused, never blocked. An empty set, a duplicate region, a region outside the supported coordinates
+-- or the configured extent, or more regions than a hold may name ('R.limitHoldRegions') is
+-- 'RefusedInvalid'; a reservation the retained bank cannot make is 'RefusedBusy'; nothing is created by
+-- a refusal. The request settles once: with the borrow, a typed failure, or cancelled. 'await' takes the
+-- borrow: from then on it is the caller's, charged until 'releaseRegionBorrow'.
+requestRegionSnapshot ∷ Service → ArenaLease → [RegionCoord] → IO (Either Refused (Pending RegionBorrow))
+requestRegionSnapshot svc lease regions = arrival (\case ARegions b → Just b; _ → Nothing) (\ep → regionsWith svc ep lease regions)
+
+-- | The snapshot a borrow holds.
+regionBorrowSnapshot ∷ RegionBorrow → RegionSnapshot
+regionBorrowSnapshot (RegionBorrow _ _ snapshot) = snapshot
+
+-- | Release a borrow: its charge returns. Idempotent; each borrow is released exactly once, whichever
+-- path finds it first. A borrow released here can still be read (it is an immutable value) but is no
+-- longer charged, so a caller releases it only after its last use.
+releaseRegionBorrow ∷ Service → RegionBorrow → IO ()
+releaseRegionBorrow svc borrow = atomically (releaseRegionBorrowSTM svc borrow)
+
+-- | Borrow a regional snapshot for the body: the request is admitted, its settlement awaited, the borrow
+-- taken and, on every exit of the body, released. An exit while the settlement is awaited cancels the
+-- request, so nothing is left reserved behind it. The body is given the snapshot, or the settlement
+-- the request ended with instead.
+withRegionSnapshot ∷ Service → ArenaLease → [RegionCoord] → (Either Settlement RegionSnapshot → IO a) → IO (Either Refused a)
+withRegionSnapshot svc lease regions body = mask $ \restore →
+  requestRegionSnapshot svc lease regions >>= \case
+    Left refused → pure (Left refused)
+    Right pending@(Pending request box _) → do
+      settled ← tryWithContext (restore (atomically (readTMVar box)))
+      case settled of
+        Left (interruption ∷ ExceptionWithContext SomeException) → do
+          -- cancellation wins if the request is still unsettled; a result already settled is retired,
+          -- which releases a borrow nobody took
+          _ ← cancelPending svc pending
+          atomically (retireSTM svc request)
+          rethrowIO interruption
+        Right settlement → do
+          -- the take: retiring the result moves the borrow to this scope in one transaction
+          atomically (takeSTM svc request)
+          case settlement of
+            Succeeded (ARegions borrow) → do
+              outcome ← tryWithContext (restore (body (Right (regionBorrowSnapshot borrow))))
+              releaseRegionBorrow svc borrow
+              either (\(failure ∷ ExceptionWithContext SomeException) → rethrowIO failure) (pure . Right) outcome
+            Succeeded _ → Right <$> restore (body (Left (Failed (HostFailure "answer of an unexpected kind"))))
+            other → Right <$> restore (body (Left other))
+
+-- | What admission reserves for a regional snapshot of this many regions: its record, the most each
+-- region can hold and one region's build scratch. The charge becomes the snapshot's exact footprint at
+-- settlement.
+regionSnapshotReservation ∷ Int → Word64
+regionSnapshotReservation = regionReservation
+
+-- | The accounted bytes a regional snapshot holds, measured on the value: its charge from its settlement
+-- to its release.
+regionSnapshotFootprint ∷ RegionSnapshot → Word64
+regionSnapshotFootprint = snapshotFootprint
+
+-- | One regional borrow's charge as the service holds it (read-only, for verification): its hold, its
+-- regions, what its admission reserved, the footprint it settled with, and whether its holder took it.
+data RegionalCharge = RegionalCharge !R.HoldId !Int !Word64 !(Maybe Word64) !Bool
+  deriving stock (Eq, Show)
+
+regionalChargeHold ∷ RegionalCharge → R.HoldId
+regionalChargeHold (RegionalCharge h _ _ _ _) = h
+
+regionalChargeRegions ∷ RegionalCharge → Int
+regionalChargeRegions (RegionalCharge _ n _ _ _) = n
+
+regionalChargeReserved ∷ RegionalCharge → Word64
+regionalChargeReserved (RegionalCharge _ _ n _ _) = n
+
+regionalChargeFootprint ∷ RegionalCharge → Maybe Word64
+regionalChargeFootprint (RegionalCharge _ _ _ n _) = n
+
+regionalChargeTaken ∷ RegionalCharge → Bool
+regionalChargeTaken (RegionalCharge _ _ _ _ t) = t
+
+-- | Every regional borrow the service holds, from its admission to its release (read-only, for
+-- verification): its reservation and its actual footprint, reported apart.
+inspectRegionalSTM ∷ Service → STM [RegionalCharge]
+inspectRegionalSTM svc = do
+  st <- readSt svc
+  pure
+    [ RegionalCharge hid (regionalRegions rec) (regionalReserved rec) (regionalFootprint rec) (regionalOwner rec == OwnedByHolder)
+    | (hid, rec) ← Map.toList (stateRegional st)
+    ]
 
 -- ---------------------------------------------------------------------------
 -- Inspection

@@ -14,6 +14,9 @@
 module Hetoimasia.Terrain.Runtime.Backed.Query
   ( Query
   , startQuery
+  , queryOnPin
+  , queryWindow
+  , queryFetching
   , stepQuery
   , cancelQuery
   , endQuery
@@ -23,6 +26,8 @@ module Hetoimasia.Terrain.Runtime.Backed.Query
   ) where
 
 import Control.Concurrent.STM (STM, atomically)
+import Data.Map.Strict (Map)
+import qualified Data.Map.Strict as Map
 import qualified Data.Text as Text
 import Data.Word (Word64)
 import Hetoimasia.Terrain.Discovery (Observed (..), Provider, Unresolved (..))
@@ -63,6 +68,13 @@ data Query a = Query
   , qRun ∷ Provider → Observed a
   , qFetch ∷ !(Maybe (PageNo, Ticket))
   , qDraining ∷ !Bool
+  , qFresh ∷ !Bool
+  -- ^ The window holds only what this query read: one that fills it then needs more than a reader may
+  -- pin. A query begun on a window an earlier read on the same pin filled starts again on an empty
+  -- window once, instead.
+  , qRefused ∷ !(Map PageNo Condition)
+  -- ^ Pages a regional build already failed to read, with their cause: a query that needs one fails
+  -- with 'HandlePausedFor' that cause and never reads it again. Empty for every other query.
   }
 
 data QProgress a
@@ -77,8 +89,22 @@ startQuery ∷ Store → (Provider → Observed a) → Either GatherRefusal (Sto
 startQuery store run = case acquireReader store of
   Left refusal → Left (NoPin refusal)
   Right (token, pinned) → case (readerWindow pinned token, readerVersion pinned token) of
-    (Right window, Right version) → Right (pinned, Query token window version run Nothing False)
+    (Right window, Right version) → Right (pinned, Query token window version run Nothing False True Map.empty)
     _ → Left PinRefused
+
+-- | A query on a pin its caller already holds and keeps (a regional build's one committed version),
+-- through the window an earlier read on that pin left: the caller takes it back with 'queryWindow',
+-- and releases the pin itself ('endQuery' is not called on this query).
+queryOnPin ∷ ReaderToken → Word64 → Window → Map PageNo Condition → (Provider → Observed a) → Query a
+queryOnPin token version window refused run = Query token window version run Nothing False False refused
+
+-- | The window the query reads through, for the next read on the same pin.
+queryWindow ∷ Query a → Window
+queryWindow = qWindow
+
+-- | The page whose read the query has submitted and not yet taken, if any.
+queryFetching ∷ Query a → Maybe PageNo
+queryFetching = fmap fst . qFetch
 
 queryDraining ∷ Query a → Bool
 queryDraining = qDraining
@@ -118,6 +144,11 @@ stepQuery io closing store q = case qFetch q of
             Right (Left why) → pure (q, QFailed (HandlePause CondIntegrity (FaultIntegrity (FromStore why))))
             Right (Right Nothing) → pure (q, QFailed (HandleDefect "a record was missing with no page to read"))
             Right (Right (Just page))
+              | Just cause ← Map.lookup page (qRefused q) → pure (q, QFailed (HandlePausedFor cause))
+              | windowSize (qWindow q) >= gatherPinLimit, not (qFresh q) →
+                  pure $ case readerWindow store (qToken q) of
+                    Right fresh → (q {qWindow = fresh, qFresh = True}, QMore)
+                    Left why → (q, QFailed (HandleDefect (Text.pack ("a query's own pin was refused: " <> show why))))
               | windowSize (qWindow q) >= gatherPinLimit → pure (q, QFailed (HandleDefect "a query needed more pages than a reader may pin"))
               | otherwise →
                   submitRead (ioService io) (ioBacking io) (ioClass io) (storeConfig store) page 1 ReadValidated >>= \case

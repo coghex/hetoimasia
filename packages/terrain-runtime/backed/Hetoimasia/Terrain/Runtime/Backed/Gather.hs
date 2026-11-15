@@ -29,6 +29,8 @@ module Hetoimasia.Terrain.Runtime.Backed.Gather
   , startGather
   , startGatherWith
   , startGatherCapped
+  , gatherOnPin
+  , gatherWindow
   , stepGather
   , cancelGather
   , endGather
@@ -49,6 +51,8 @@ module Hetoimasia.Terrain.Runtime.Backed.Gather
 
 import Control.Concurrent.STM (STM, atomically)
 import Data.Int (Int64)
+import Data.Map.Strict (Map)
+import qualified Data.Map.Strict as Map
 import Data.Word (Word64)
 import qualified Data.ByteString as BS
 import qualified Data.Text as Text
@@ -128,6 +132,9 @@ data Gather = Gather
   -- ^ The committed version the pin holds.
   , gDraining ∷ !Bool
   -- ^ The owner cancelled the gather: a read in flight is drained, never taken.
+  , gRefused ∷ !(Map PageNo Condition)
+  -- ^ Pages a regional build already failed to read, with the cause it recorded: a step that needs
+  -- one answers 'HandlePausedFor' that cause instead of reading it again. Empty for every other read.
   }
 
 -- | The window the gather holds, in pages (for the bound's example and the evidence).
@@ -193,8 +200,20 @@ startGatherCapped ∷ Int → Int → Store → [(Column, Int64, Int64)] → Eit
 startGatherCapped pin cap store columns = case acquireReader store of
   Left refusal → Left (NoPin refusal)
   Right (token, pinned) → case (readerWindow pinned token, readerVersion pinned token) of
-    (Right window, Right version) → Right (pinned, Gather token window columns Nothing pin maxRangeRecords 0 0 [] cap 0 columns Nothing version False)
+    (Right window, Right version) → Right (pinned, Gather token window columns Nothing pin maxRangeRecords 0 0 [] cap 0 columns Nothing version False Map.empty)
     _ → Left PinRefused
+
+-- | A gather on a pin its caller already holds and keeps (a regional build's one committed version):
+-- it reads through the window it is given, refuses the pages the caller already failed to read, and
+-- never releases the pin ('endGather' is the caller's own, once, for the pin as a whole). The caller
+-- takes the window back with 'gatherWindow' for its next read on the same pin. Its window may pin the
+-- reader's whole credit: what it keeps is charged to its caller's reservation, as a load's is.
+gatherOnPin ∷ ReaderToken → Word64 → Window → Map PageNo Condition → Int → [(Column, Int64, Int64)] → Gather
+gatherOnPin token version window refused cap columns = Gather token window columns Nothing gatherPinLimit maxRangeRecords 0 0 [] cap 0 columns Nothing version False refused
+
+-- | The window the gather reads through, for the next read on the same pin.
+gatherWindow ∷ Gather → Window
+gatherWindow = gWindow
 
 -- | End a gather: the pin is released (releasing twice changes nothing). Called on every exit, and only
 -- once no read of it is in flight ('GDone', 'GFailed' or 'GDrained').
@@ -267,6 +286,7 @@ stepGather io closing store g = case gFetch g of
                               then (g' {gColumns = rest, gStart = Nothing, gLimit = maxRangeRecords}, GMore)
                               else (g' {gStart = next}, GMore)
                 ReadNeeds page
+                  | Just cause ← Map.lookup page (gRefused g) → pure (g, GFailed (HandlePausedFor cause))
                   | windowSize (gWindow g) >= gPin g →
                       -- the pin holds no more pages. A fresh window first; if the same call fills a fresh
                       -- window too, it asks for fewer records
