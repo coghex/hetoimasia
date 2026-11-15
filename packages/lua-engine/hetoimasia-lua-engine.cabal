@@ -384,8 +384,9 @@ test-suite lua-engine-tests
     hs-source-dirs: test
     -- The terrain examples run the production backed service (#665), whose storage backend
     -- refuses a runtime that is not threaded (a blocking native call must not stall the
-    -- capability the terrain owner runs on).
-    ghc-options: -threaded
+    -- capability the terrain owner runs on). -rtsopts lets the lab run it at +RTS -N<k>: the started
+    -- count sets the terrain set's multi-capability pass (Test.Support.Capabilities).
+    ghc-options: -threaded -rtsopts
     other-modules:
         Test.LuaEngine.Behavior
         Test.LuaEngine.Boot
