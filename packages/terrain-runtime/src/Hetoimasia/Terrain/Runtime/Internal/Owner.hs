@@ -841,6 +841,7 @@ delivered svc key gathered = (case key of GatherRequest rid → probe svc (Point
     case Map.lookup jid (stateLoadJobs st) of
       Nothing → pure ()
       Just (aid, region, cover) → do
+        probe svc (PointLoadGathered aid region (length runs) (fromIntegral (R.coverageColumns cover)))
         -- The runs are those of the version the gather pinned. A commit since then changed only
         -- the columns of its own cell, and the model cancels a job of that cell's region (its
         -- result is then discarded by 'finishJob'); a job of any other region read columns no

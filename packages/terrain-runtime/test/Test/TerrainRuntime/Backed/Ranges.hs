@@ -15,6 +15,7 @@ module Test.TerrainRuntime.Backed.Ranges (spec) where
 
 import Control.Concurrent.STM
 import Control.Exception (finally)
+import Control.Monad (forM_)
 import Data.List (nub)
 import qualified Data.Map.Strict as Map
 import Hetoimasia.Terrain.Changes (changeColumnBytes, changeIntervalBytes)
@@ -22,6 +23,7 @@ import Hetoimasia.Terrain.Cell (Cell (..))
 import Hetoimasia.Terrain.Coordinate (axisValue, decomposeTile)
 import Hetoimasia.Terrain.Cell (zRangeHi, zRangeLo)
 import Hetoimasia.Terrain.Query (Occupied (..), QueryLimits (..), Run (..), defaultQueryLimits)
+import Hetoimasia.Terrain.Residency (JobInfo (..), RegionDemand (..), coverageBox, coverageCells, coverageUnion, modelJobs)
 import Hetoimasia.Terrain.Source (CellSpec (..), LayerSpec (..), PatchSpec (..), SourceSpec (..))
 import Hetoimasia.Terrain.Runtime
 import Hetoimasia.Terrain.Runtime.Backed.Gather (gatherPinLimit)
@@ -132,6 +134,46 @@ spec = describe "What a request keeps of a column" $ do
       -- every level known, and each the store's cell (the three removed ones air)
       detail `shouldBe` Right (map Known authority)
       [z | (z, Air) ← zip levels authority] `shouldBe` [5, 9, 35] <> [40 .. 63]
+
+  -- column (3, 4): sixteen separate removed runs, at the even levels 0 to 30 of its region; a load reads
+  -- every column it touches over the region's 32 levels, whatever it covers of it
+  it "keeps no more of a load's column than its scratch charges: a one-cell load beside sixteen separate removals, and a fragmented cover of the same column" $ do
+    named ← newTVarIO Nothing
+    loads ← newTVarIO []
+    let points = Probe $ \case
+          PointLoadGathered aid at runs columns → readTVarIO named >>= mapM_ (\svc → do
+            model ← atomically (inspectModelSTM svc)
+            let charged = [(jobScratch j, coverageCells (jobCoverage j)) | j ← modelJobs model, jobArena j == aid, jobRegion j == at]
+            atomically (modifyTVar' loads ((runs, columns, charged) :)))
+          _ → pure ()
+    withServiceUsing defaultConfig alwaysAdmitting points $ \svc → do
+      atomically (writeTVar named (Just svc))
+      (client, lease) ← openMain svc "main"
+      mapM_ (\z → removeCell' svc lease (tile 3 4 z)) [0, 2 .. 30]
+      -- a one-cell load: (3, 4, 1) was never loaded
+      atomically (writeTVar loads [])
+      _ ← readCell svc lease (tile 3 4 1)
+      oneCell ← readTVarIO loads
+      -- a fragmented cover of the same column, levels 9 and 21 (never loaded), as one view's demand
+      atomically (writeTVar loads [])
+      view ← okOf (openView svc client)
+      let (home, _) = decomposeTile (tile 3 4 0)
+          cell z = either (error . show) id (coverageBox 3 4 4 5 z (z + 1))
+      _ ← okOf (setViewDemand svc view lease [RegionDemand home (coverageUnion (cell 9) (cell 21))])
+      waitFor (readTVar loads >>= check . not . null)
+      fragmented ← readTVarIO loads
+      okOf (clearViewDemand svc view)
+      closeView svc view
+      forM_ [oneCell, fragmented] $ \recorded → do
+        length recorded `shouldBe` 1
+        forM_ recorded $ \(runs, columns, charged) → do
+          -- it kept the column's sixteen runs: 16 x 16 + 48 = 304, within what one column over 32 levels
+          -- can hold, 48 + 17 x 16 = 320
+          (runs, columns) `shouldBe` (16, 1)
+          let kept = toInteger (runs * 16 + columns * 48)
+          kept `shouldSatisfy` (<= 48 + 17 * 16)
+          -- and the model's scratch for the job charges at least that beside its frame and two bytes a cell
+          map (\(scratch, cells) → toInteger scratch - 256 - 2 * toInteger cells) charged `shouldSatisfy` \rest → not (null rest) && all (>= kept) rest
 
   -- the same dug column: the surface's window slides, and the request ends as its next read is prepared
   it "keeps no window for a surface cancelled after its window slid, nor for one whose arena closed" $

@@ -520,6 +520,8 @@ data Point
     PointDiscoveryCommitted !ArenaId
   | -- | A request's pinned read delivered this many removed runs (what it kept of its columns).
     PointGatheredRuns !RequestId !Int
+  | -- | A load job's pinned read of its region returned: the runs it kept and the columns it read.
+    PointLoadGathered !ArenaId !RegionCoord !Int !Int
   | -- | A request's pinned read submitted the read of this page of its store.
     PointGatherPage !RequestId !PageNo
   | -- | A request's pinned read ended: the most pages its window held, the pages it may pin, the runs it
