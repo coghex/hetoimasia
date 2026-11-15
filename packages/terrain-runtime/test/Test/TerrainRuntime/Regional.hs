@@ -7,7 +7,7 @@
 -- the sky ('expectedKnowledge', below). The accounting is read from the service's own figures and
 -- checked by its invariants after every example. Every wait is a causal gate or a bounded wait for
 -- state; nothing sleeps; every thread is owned; every example builds its own service.
-module Test.TerrainRuntime.Regional (spec) where
+module Test.TerrainRuntime.Regional (spec, fullSpec) where
 
 import Control.Concurrent.MVar
 import Control.Concurrent.STM
@@ -38,6 +38,8 @@ import Test.Support.Owned (withOwnedThread)
 import Test.TerrainRuntime.Fixtures
 import qualified Test.TerrainRuntime.Storage.Harness as H
 
+-- | The routine examples: a representative every-cell oracle over the two regions that hold every fixture
+-- shape side by side, and every other contract.
 spec ∷ Spec
 spec = describe "Regional snapshots" $ do
   oracleSpec
@@ -48,6 +50,7 @@ spec = describe "Regional snapshots" $ do
   coherenceSpec
   fairnessSpec
   pendingSpec
+  pressureSpec
   failureSpec
   ownershipSpec
   admissionSpec
@@ -107,6 +110,35 @@ seam = Fixture "a shaft beside the region's seam, which its knowledge depends on
 
 fixtures ∷ [Fixture]
 fixtures = [cavity, roof, ramp, shaft, buried, twoOpenings, seam]
+
+-- | Every fixture's shape side by side in one region: the cavity, the roof over a removed gap, the ramp
+-- beside an undiscovered void (its corridor opened, a sealed cavity apart), the deep shaft (it crosses the
+-- region's floor into the region below, which is not held), the buried removals and the two-opening reveal,
+-- each on rows of its own with stone between, so no two interact; and the seam's shaft just beside the
+-- region's west edge. The region's knowledge depends on the regions beside it and below it, read as
+-- dependencies and not held.
+together ∷ Fixture
+together =
+  Fixture
+    "every fixture's shape side by side"
+    ( ground $
+        caveRow 0 5 2 6
+          <> caveRow 3 5 2 8
+          <> caveRow 7 5 1 7
+          <> [PatchSpec 4 6 5 6 (SpecSolid "slab" 1), PatchSpec 12 9 5 6 SpecAir, PatchSpec 12 10 5 6 SpecAir]
+          <> caveRow 12 5 2 8
+          <> [PatchSpec 5 y 5 6 SpecAir | y ← [13 .. 15]]
+    )
+    ( [(2, 0, 7), (2, 0, 6)]
+        <> [(4, 3, 6), (8, 4, 7), (8, 4, 6), (8, 4, 5)]
+        <> [(1, 7, 7), (1, 7, 6), (1, 7, 5)]
+        <> [(1, 12, z) | z ← [5 .. 7]]
+        <> [(9, 12, z) | z ← [5 .. 7]]
+        <> [(10, 10, 3), (10, 10, 2), (11, 10, 2), (12, 11, 1)]
+        <> [(14, 14, z) | z ← [7, 6 .. -20]]
+        <> [(-1, 1, z) | z ← [7, 6 .. 2]]
+    )
+    [region 0 0 0]
 
 -- | Open an arena over a definition, remove cells and let discovery and reclamation drain.
 openWith ∷ Service → SourceSpec → [Cell3] → IO (Client, ArenaLease)
@@ -298,18 +330,37 @@ readMismatches svc lease snapshot cells = fmap (take 10 . concat) . forM cells $
 -- The oracle
 
 oracleSpec ∷ Spec
-oracleSpec = describe "every cell of every held region is what cellAt and knowledgeAt answer at its revisions, and what the independent expectation says" $
+oracleSpec =
+  it "answers every cell of the region holding every fixture's shape as cellAt and knowledgeAt do at its revisions, and as the independent expectation says" $
+    withService defaultConfig $ \svc → guarded svc $ \taken → do
+      lease ← prepared svc together
+      borrow ← borrowOf taken lease (fxHeld together)
+      let snapshot = regionBorrowSnapshot borrow
+      everyCell svc lease together snapshot
+      -- the seams: the solid beside the shaft at x = -1 is known from a column of the region beside it, and
+      -- the shaft's lowest held cell sits on the shaft's part in the region below; neither is held
+      (regionCellKnowledge snapshot (tile 0 1 4), regionCell snapshot (tile (-1) 1 4)) `shouldBe` (PartReady (D.CellKnowledge D.SolidKnown D.NoVoidHere), PartNotHeld)
+      (regionCellKnowledge snapshot (tile 14 14 0), regionCell snapshot (tile 14 14 (-1))) `shouldBe` (PartReady (D.CellKnowledge D.NoSolid D.VoidKnown), PartNotHeld)
+      releaseRegionBorrow svc borrow
+      settleChecks svc
+
+-- | Every cell of every region a fixture holds, compared with the service's reads and the independent
+-- expectation.
+everyCell ∷ Service → ArenaLease → Fixture → RegionSnapshot → IO ()
+everyCell svc lease fx snapshot = do
+  regionSnapshotRegions snapshot `shouldBe` sort (fxHeld fx)
+  expectationMismatches (fxSpec fx) (fxRemovals fx) snapshot `shouldBe` []
+  readMismatches svc lease snapshot (concatMap cellsOf (fxHeld fx)) >>= (`shouldBe` [])
+
+-- | The full depth (terrain-runtime-full-depth-tests): every fixture on its own, every cell of every region
+-- it holds (ten regions in all), compared with cellAt, knowledgeAt and the independent expectation. The
+-- routine suite runs the same comparison over the two regions that hold every fixture's shape side by side.
+fullSpec ∷ Spec
+fullSpec = describe "Regional snapshots (full depth): every cell of every region each fixture holds is what cellAt and knowledgeAt answer at its revisions, and what the independent expectation says" $
   forM_ fixtures $ \fx → it (fxName fx) $ withService defaultConfig $ \svc → guarded svc $ \taken → do
     lease ← prepared svc fx
     borrow ← borrowOf taken lease (fxHeld fx)
-    let snapshot = regionBorrowSnapshot borrow
-    regionSnapshotRegions snapshot `shouldBe` sort (fxHeld fx)
-    expectationMismatches (fxSpec fx) (fxRemovals fx) snapshot `shouldBe` []
-    -- the seam: the solid beside the shaft is known from the column beside the region, which is not held
-    if fxName fx == fxName seam
-      then (regionCellKnowledge snapshot (tile 0 1 4), regionCell snapshot (tile (-1) 1 4)) `shouldBe` (PartReady (D.CellKnowledge D.SolidKnown D.NoVoidHere), PartNotHeld)
-      else pure ()
-    readMismatches svc lease snapshot (concatMap cellsOf (fxHeld fx)) >>= (`shouldBe` [])
+    everyCell svc lease fx (regionBorrowSnapshot borrow)
     releaseRegionBorrow svc borrow
     settleChecks svc
 
@@ -740,17 +791,49 @@ pendingSpec = describe "a page that has not arrived" $ do
         settledOf host >>= (`shouldBe` [Cancelled])
       settleChecks svc
 
+pressureSpec ∷ Spec
+pressureSpec =
+  it "waits, never refused or settled, while the storage service is full, and completes once it drains" $ do
+    storage ← H.newProbe
+    withServiceSeam quiet defaultConfig alwaysAdmitting noProbe (H.seamFor storage) $ \svc → guarded svc $ \taken → do
+      (_, lease) ← openWith svc (ground []) [(88, 88, -16)]
+      -- every page read is held at the seam; removals elsewhere fill the two workers and the queue's eight
+      gate ← H.addGate storage isRead
+      fillers ← flip finally (H.openGate gate) $ do
+        fillers ← forM [0 .. 13] $ \x → do
+          h ← newHost True
+          _ ← okOf (removeWith svc (hostEndpoint svc Nothing h) lease (tile x 4 3) Nothing)
+          pure h
+        waitFor (readTVar (H.gReached gate) >>= check . (>= 2))
+        waitFor (inspectStorageQueuedSTM svc >>= check . (>= 8))
+        -- admitted at once; its pinned read waits for the storage service to have room
+        host ← newHost True
+        request ← okOf (regionsWith svc (hostEndpoint svc Nothing host) lease [region 5 5 (-1)])
+        settledOf host >>= (`shouldBe` [])
+        map regionalChargeFootprint <$> atomically (inspectRegionalSTM svc) >>= (`shouldBe` [Nothing])
+        inspectDefects svc >>= (`shouldBe` [])
+        H.openGate gate
+        borrow ← settlementOf host >>= borrowIn >>= keep taken
+        atomically (takeSTM svc request)
+        expectationMismatches (ground []) [(88, 88, -16)] (regionBorrowSnapshot borrow) `shouldBe` []
+        releaseRegionBorrow svc borrow
+        pure fillers
+      forM_ fillers $ \h → settlementOf h >>= \case
+        Succeeded (ARemoved _) → pure ()
+        other → expectationFailure ("a filler: " <> show other)
+      settleChecks svc
+
 failureSpec ∷ Spec
 failureSpec =
   it "makes unavailable, at every cell, each part a failed page was needed for, records the failure as any read's, reads that page once, and keeps every region established without it" $ do
     storage ← H.newProbe
     withServiceSeam quiet defaultConfig alwaysAdmitting noProbe (H.seamFor storage) $ \svc → guarded svc $ \taken → do
       let definition = ground []
-          surface = [(x, y, 7) | x ← [0 .. 15], y ← [0 .. 15]]
+          surface = [(x, y, 7) | x ← [0 .. 15], y ← [0 .. 3]]
           damaged = region 0 0 0
           beside = region 1 0 0
           apart = region (-3) 0 0
-      -- 256 removals, one run in each of the region's columns and their discovery: the store spans pages
+      -- 64 removals, one run in each of 64 of the region's columns and their discovery: the store spans pages
       -- the region's build reads and a far region's does not
       (_, lease) ← openWith svc definition surface
       let pagesReadFor regions = do

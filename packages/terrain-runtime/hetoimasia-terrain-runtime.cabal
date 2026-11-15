@@ -309,7 +309,8 @@ test-suite terrain-storage-probe
         hetoimasia-test-support ==0.1.0.0
 
 -- The full depth of the store families the routine suite bounds: every reduced or moved family at its
--- complete original parameters. An explicit local probe (validation group `test.terrain-runtime-full-depth`,
+-- complete original parameters, and the regional snapshots' every-cell oracle over every fixture on its own.
+-- An explicit local probe (validation group `test.terrain-runtime-full-depth`,
 -- optional, category probe, no CI route): it takes about a quarter of an hour, so it is never selected by an affected
 -- path or by a routine suite command. The store families are a pure model (no file, thread or clock); the backed
 -- service's storage_full trace runs the production service on a real file; one example reads the runtime's allocation
@@ -327,6 +328,7 @@ test-suite terrain-runtime-full-depth-tests
         Test.TerrainRuntime.Backed.Loop
         Test.TerrainRuntime.Backed.Pause
         Test.TerrainRuntime.Fixtures
+        Test.TerrainRuntime.Regional
         Test.TerrainRuntime.Storage.Harness
         Test.TerrainRuntime.Store.Bounds
         Test.TerrainRuntime.Store.Cycles
