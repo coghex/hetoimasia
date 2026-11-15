@@ -22,6 +22,9 @@ module Hetoimasia.Terrain.Runtime.Settlement
 
     -- * Admitting with an endpoint
   , openArenaWith
+  , OpenOptions (..)
+  , defaultOpenOptions
+  , openArenaWithOptions
   , attachArenaWith
   , cellWith
   , columnWith
@@ -46,6 +49,8 @@ import Hetoimasia.Terrain.Coordinate (TileCoord)
 import Hetoimasia.Terrain.Runtime.Internal.Core
 import Hetoimasia.Terrain.Runtime.Internal.Types
 import Hetoimasia.Terrain.Source (SourceSpec, mkSource)
+import qualified Data.Text as Text
+import Hetoimasia.Terrain.Runtime.Store.Internal.State (StoreConfig, StoreSpec (..), mkStoreConfig)
 
 -- | The ordinary endpoint: always eligible, and settled into a box the caller
 -- waits on. A second settlement is ignored.
@@ -54,13 +59,32 @@ arrivalEndpoint = do
   box <- newEmptyTMVarIO
   pure (Endpoint (pure ()) (pure True) (void . tryPutTMVar box), box)
 
--- | Create a named arena: the request settles with the creator's lease.
+-- | Create a named arena with the service's own allowance ('configStore'): the request settles with the creator's lease. It is
+-- 'openArenaWithOptions' with 'defaultOpenOptions'.
 openArenaWith ∷ Service → Endpoint → Client → Text → SourceSpec → IO (Either Refused Request)
-openArenaWith svc ep client name spec =
-  atomically . admit svc ep $
-    case mkSource (configSourceLimits (serviceConfig svc)) spec of
-      Left err → SubOpenInvalid client err
-      Right source → SubOpen client name source
+openArenaWith svc ep client name spec = openArenaWithOptions svc ep client name spec defaultOpenOptions
+
+-- | Create a named arena with what the options name. An allowance the options name is validated by the rules of the service's
+-- own ('mkStoreConfig': at least 64 MiB, a whole number of MiB, within the configured offset limit, with room for the protected
+-- reserve beside the configured overhead), with the service's other store figures; one that can never be granted is refused
+-- here, before admission ('RefusedInvalid'), so no request, name claim, credit or reservation exists. A valid one is the arena's
+-- allowance from its reservation on, exactly as the service's own would be.
+openArenaWithOptions ∷ Service → Endpoint → Client → Text → SourceSpec → OpenOptions → IO (Either Refused Request)
+openArenaWithOptions svc ep client name spec options = case openStoreConfig svc options of
+  Left why → pure (Left (RefusedInvalid why))
+  Right store →
+    atomically . admit svc ep $
+      case mkSource (configSourceLimits (serviceConfig svc)) spec of
+        Left err → SubOpenInvalid client err
+        Right source → SubOpen client name source store
+
+-- | The store configuration an open's options give its arena: the service's own when they name no allowance.
+openStoreConfig ∷ Service → OpenOptions → Either Text StoreConfig
+openStoreConfig svc options = case openAllowanceBytes options of
+  Nothing → Right (serviceStoreConfig svc)
+  Just bytes → case mkStoreConfig (configStore (serviceConfig svc)) {specAllowanceBytes = bytes} of
+    Left err → Left (Text.pack ("an allowance that can never be granted: " <> show err))
+    Right store → Right store
 
 -- | Obtain a lease on an existing arena of the same service, by name.
 attachArenaWith ∷ Service → Endpoint → Client → Text → IO (Either Refused Request)

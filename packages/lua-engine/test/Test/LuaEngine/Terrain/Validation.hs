@@ -22,9 +22,9 @@ layer fields = "{ materials = { 'soil' }, layers = { { " <> fields <> " } } }"
 decodeCases ∷ [Case]
 decodeCases =
   [ Case "colon call" "api.terrain:open('a', DEF)" (Refused ["terrain_open"])
-  , Case "no arguments" "api.terrain.open()" (Refused ["expected 2 values, found 0"])
-  , Case "one argument" "api.terrain.open('a')" (Refused ["expected 2 values, found 1"])
-  , Case "three arguments" "api.terrain.open('a', DEF, nil)" (Refused ["expected 2 values, found 3"])
+  , Case "no arguments" "api.terrain.open()" (Refused ["expected 3 values, found 0"])
+  , Case "one argument" "api.terrain.open('a')" (Refused ["expected 3 values, found 1"])
+  , Case "four arguments" "api.terrain.open('a', DEF, nil, nil)" (Refused ["expected 3 values, found 4"])
   , Case "name a number" "api.terrain.open(5, DEF)" (Refused ["expected"])
   , Case "empty name" "api.terrain.open('', DEF)" (Refused ["name is empty"])
   , Case "name over the limit" "api.terrain.open(string.rep('n', 129), DEF)" (Refused ["longer than 128"])

@@ -492,7 +492,10 @@ test-suite lua-engine-tests
         Test.LuaEngine.Terrain.Ownership
         Test.LuaEngine.Terrain.Picks
         Test.LuaEngine.Terrain.Races
+        Test.LuaEngine.Terrain.Seam
         Test.LuaEngine.Terrain.Spec
+        Test.LuaEngine.Terrain.Storage
+        Test.LuaEngine.Terrain.StorageFaults
         Test.LuaEngine.Terrain.Support
         Test.LuaEngine.Terrain.Validation
         Test.LuaEngine.Terrain.Windows
@@ -534,6 +537,7 @@ test-suite lua-engine-tests
         hetoimasia-scripting-lua:runtime-lua,
         hetoimasia-terrain ==0.1.0.0,
         hetoimasia-terrain-runtime ==0.1.0.0,
+        hetoimasia-terrain-runtime:testing,
         hetoimasia-test-support ==0.1.0.0,
         hspec >=2.11 && <3,
         QuickCheck >=2.15 && <2.19,
