@@ -22,6 +22,7 @@ module Hetoimasia.Terrain.Runtime.Internal.Backed
   ( -- * Configuration
     gathersPerArena
   , internalTurn
+  , internalPlace
 
     -- * What the owner supplies
   , OwnerOps (..)
@@ -749,6 +750,14 @@ data Contender
   | ContendWriteProbe !RequestId !ArenaId ![PageNo]
   deriving stock (Eq, Show)
 
+-- | A piece of internal work's place in the internal rotation: its arena, then reclamation (0) before
+-- discovery (1); explicit work has none.
+internalPlace ∷ Contender → Maybe (ArenaId, Int)
+internalPlace = \case
+  ContendReclaim aid → Just (aid, 0)
+  ContendDiscovery aid → Just (aid, 1)
+  _ → Nothing
+
 -- | The work that may take the slot now, in grant order: the eligible explicit removals (each
 -- staged as changing content, staged at the arena's current content revision) in admission
 -- order across every arena, and the internal work of every unpaused arena. Reads every
@@ -764,7 +773,13 @@ contenders st = do
   -- even when none is ready to take the slot this instant: after every commit the others re-stage
   -- against the new revision, and internal work must not take those gaps beyond its turn
   waiting ← or <$> traverse waitingRemoval (Map.toList (stateRequests st))
-  let internal = concatMap internalOf (Map.toList (stateArenas st))
+  -- INTERNAL WORK TAKES ITS TURNS IN ROTATION: over (arena, kind) pairs in a fixed order, starting
+  -- after the pair granted last, so reclamation that is always wanted (a stream of removals retires
+  -- pages at every commit) cannot keep discovery from its turns, nor one arena's backlog another's
+  let ordered = concatMap internalOf (Map.toList (stateArenas st))
+      internal = case stateInternalLast st of
+        Nothing → ordered
+        Just lastPlace → [c | c ← ordered, internalPlace c > Just lastPlace] <> [c | c ← ordered, internalPlace c <= Just lastPlace]
       turn = stateExplicitRun st >= internalTurn
       -- MAINTENANCE THAT ANOTHER TRANSACTION NEEDS FIRST IS ITS PREREQUISITE, NOT A TURN: an arena whose
       -- work answered that maintenance must run first ('MaintenanceFirst', 'HandleWaitReclaim') offers no

@@ -1141,6 +1141,12 @@ data St = St
     -- could do, at the committed version and the oldest pinned version it found it at: not
     -- offered again until either moves (a commit, or a reader's release), so it never spins.
     stateInternalIdle ∷ !(Map (ArenaId, Bool) (Word64, Maybe Word64))
+  , -- | The internal work granted last, as its place in the internal rotation (its arena, and 0
+    -- for reclamation or 1 for discovery): the next internal turn goes to the first wanted pair
+    -- after it, so kinds alternate within an arena and every arena with internal work gets a turn
+    -- within one rotation. Written by the owner at each internal grant; read by the contenders;
+    -- one value, never reset (a closed arena's place only orders the rotation).
+    stateInternalLast ∷ !(Maybe (ArenaId, Int))
   , -- | Arenas whose work answered that maintenance must run first ('MaintenanceFirst',
     -- 'HandleWaitReclaim'): nothing else of the arena takes the slot until a maintenance transaction
     -- of it has published. Set by the owner when such an answer ends a transaction; cleared by that
@@ -1212,6 +1218,7 @@ initialState config limits =
     , stateGatherCursor = Nothing
     , stateStoragePressure = Nothing
     , stateInternalIdle = Map.empty
+    , stateInternalLast = Nothing
     , stateNeedsMaintenance = Set.empty
     , stateIdleRepeats = []
     , stateFaultEpoch = 0

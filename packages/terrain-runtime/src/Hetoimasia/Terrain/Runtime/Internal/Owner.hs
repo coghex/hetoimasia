@@ -607,7 +607,11 @@ perform svc = \case
     pure (Step True present)
   WGrant contender → do
     takeTurn svc TurnPrepare
-    granted <- atomically (grantSlot svc contender)
+    -- an internal grant moves the rotation on, in the grant's own transaction
+    granted <- atomically $ do
+      g <- grantSlot svc contender
+      forM_ (if g then internalPlace contender else Nothing) $ \place → modifySt svc (\s → s {stateInternalLast = Just place})
+      pure g
     when granted . probe svc $ case contender of
       ContendRemoval rid aid _ → PointGranted (Just rid) aid
       ContendGrowth rid aid _ → PointGranted (Just rid) aid
