@@ -136,7 +136,8 @@ cabal test hetoimasia-tests --test-show-details=direct
 - `terrain-runtime-full-depth-tests` (`packages/terrain-runtime/full/`) owns the complete original
   parameters of the store families that the routine suite bounds: `Test.TerrainRuntime.Store.Rebalance`,
   `Scattered`, `Large`, `Protocol`, `History`, `Trees`, `Evidence`, `Fuzz`, `FuzzTrees` and `Cycles`, each module's
-  `fullSpec`, in one selection (it re-runs the examples of those modules that the routine suite keeps unchanged,
+  `fullSpec`, and the regional snapshots' every-cell oracle over every fixture on its own
+  (`Test.TerrainRuntime.Regional.fullSpec`; the routine suite compares one region that holds every fixture's shape), in one selection (it re-runs the examples of those modules that the routine suite keeps unchanged,
   so base-equivalent coverage is the routine run plus this run). It is the optional probe group
   `test.terrain-runtime-full-depth` (`category: probe`, no CI worker route, never selected by an affected
   path, a routine suite command or a pull-request request); a new family bounded in the routine suite
