@@ -83,6 +83,23 @@ older ones is in [guide/earlier.md](guide/earlier.md).
 | `issue-632-ps-fallback-evidence.md` | #632, PR #633: runs of the ps-fallback no-kill cleanup example |
 | `content_native/qualification.md` | #518: native calls and flags of `packages/content`, local and Linux CI |
 
+## Terrain evidence of closed slices — last present at `21e527cc` (removed 2026-11-15)
+
+Evidence write-ups of the terrain epic's closed children (#636). Each was the
+round-by-round record of one pull request; the contracts are the `terrain`,
+`terrain-render-2d` and `terrain-runtime` READMEs.
+
+| Path under `docs/evidence/terrain/` | Conclusion |
+| --- | --- |
+| `tra13/README.md` | #655, PR #667: the corrected catalog of 16 canonical shapes and their exact openings in all four orientations, in exact CPU arithmetic; review found `openingContains` counting the solid's own boundary as air, fixed |
+| `tra16/README.md` | #658, PR #674: the pure cell-quad planner and coverage picker agree with independent references on fixed scenes, and under instance pressure a column is admitted whole or not at all; CPU only |
+| `tra18/README.md` | #660, PR #670: the bounded symbolic source-connectivity compiler against independent references, with growth, yielding and refusal rows; the oracle found extents such as `2^62 - (-2^62)` overflowing `Int64`, fixed |
+| `tra19/README.md` | #661, PR #671: the pure model of compressed knowledge and resumable discovery after removal against an independent oracle; the oracle found a removed cell reported unknown although its void had been known, fixed |
+
+Condensed in place on the same day, with the full write-up at the same commit:
+`tra20/README.md` (#662, twenty review rounds of the temporary store's pure
+model) and `tra21/README.md` (#663, ten review rounds of the storage backend).
+
 ## Per-issue Vulkan records — last present at `18c3a659` (removed 2026-11-13)
 
 `docs/vulkan/` keeps the nine records `tools/test/VulkanProof.hs` reads. The

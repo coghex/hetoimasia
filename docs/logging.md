@@ -1,229 +1,149 @@
 # Logging
 
-Current behavior of `Hetoimasia.Foundation.Log`, the public logging facade.
-The approved contract and its alternatives live in
-[the logging design](archive/logging_design.md) (P-1 and P-2); this document describes
-what the code does today.
-
-Scope: the logger model, validated components, filtering, startup
-configuration, scoped context, injectable metadata, the record layout, the two
-sink kinds, flushing, the ownership and failure contract, and the authoring
-conventions new subsystems follow. The logging arc is complete; queues,
-rotation, telemetry, JSON output, live reload, and a logging monad are not part
-of it.
+Contract of `Hetoimasia.Foundation.Log`, the public logging facade, and of the
+runtime modules built on it: the logging lifetime, the asynchronous adapter and
+the reporting adapter. Not provided: rotation, owned log files, telemetry, JSON
+output, live reconfiguration, a logging monad.
 
 ## Module structure
 
 `Hetoimasia.Foundation.Log` is the only logging module a client imports. It
-defines the logger operations — construction, scoped context, flushing,
-emission, and call-site extraction — and re-exports everything else from hidden
-modules of the foundation's main library, each owning one responsibility:
+defines the logger operations and re-exports the rest from hidden modules of the
+foundation's main library. A client that imports a hidden module is refused, and
+`Component`, `LogSink` and `Logger` stay abstract through the facade.
 
 | Module | Owns |
 | --- | --- |
-| `Log.Base` | `LogLevel`, `SourceLocation`, and the small option records `FormatOptions` and `LogVariables` |
-| `Log.Component` | The validated `Component`, its constructors and operations, and the quoting every diagnostic and record shares |
-| `Log.Types` | The filter, entry, sink, metadata-provider, and logger records |
+| `Log.Base` | `LogLevel`, `SourceLocation`, the option records `FormatOptions` and `LogVariables` |
+| `Log.Component` | The validated `Component` and the quoting every diagnostic and record shares |
+| `Log.Types` | The filter, entry, sink, metadata-provider and logger records |
 | `Log.Filter` | Startup configuration parsing and the admission predicate |
 | `Log.Format` | The record layout and its bare-or-quoted rule |
-| `Log.Sink` | Handle and callback sinks, their serialized writes, and forwarding to a sink |
+| `Log.Sink` | Handle and callback sinks, their serialized writes, forwarding to a sink |
 
 Dependencies run one way: `Log.Types` imports `Log.Base` and `Log.Component`;
-the filter, format, and sink modules consume those; the facade composes them.
-`Log.Base` and `Log.Component` sit below everything else, which is what lets
+filter, format and sink consume those; the facade composes them. `Log.Base` and
+`Log.Component` sit below everything else, which lets
 [failure attribution](failures.md#module-structure) import `Component` and
-`SourceLocation` without the logger, filter, format, or sink.
+`SourceLocation` without the logger.
 
-A client that imports one of the hidden modules is refused, and `Component`,
-`LogSink`, and `Logger` stay abstract through the facade. The external-client
-examples in
-[`packages/foundation/test/Test/Foundation/Logging/Opacity.hs`](../packages/foundation/test/Test/Foundation/Logging/Opacity.hs)
-check both boundaries for the logging and failure families, selected by
-`--test-options='--match "Logging and failure opacity"'` on
-`hetoimasia-foundation:foundation-tests`.
+The opacity of both families is checked by external-client examples:
+`cabal test hetoimasia-foundation:foundation-tests --test-option=--match "--test-option=Logging and failure opacity"`.
 
 ## Public interface
 
-A `Logger` is an opaque value. `mkLoggerWith` is its only constructor:
-
-```haskell
-mkLoggerWith ∷ LogFilter → MetadataProviders → LogSink → Logger
-mkLogger     ∷ LogFilter → LogSink → Logger              -- systemMetadata
-handleLogger ∷ LogFilter → Handle → IO Logger            -- mkLogger + newHandleSink
-```
-
-`mkLogger` is the production constructor: it supplies the real clock and thread
-providers. `handleLogger` adds the borrowed-handle sink, and is in `IO` because
-that sink owns the state serializing every logger that shares it. There is no
-global or shared mutable logging state; a subsystem or worker receives its own
-logger explicitly, as a plain argument.
-
-Emission goes through one path, `logEvent`, with per-level helpers on top:
-
-```haskell
-logEvent ∷ HasCallStack ⇒ Logger → LogLevel → Component → Text → [(Text, Text)] → IO ()
-logDebug, logInfo, logWarning, logError
-         ∷ HasCallStack ⇒ Logger → Component → Text → [(Text, Text)] → IO ()
-```
-
-The last argument holds the event's own fields. An emitted `LogEntry` carries
-the level, component, message, `Map Text Text` fields, the breadcrumb list, a
-UTC timestamp, thread identity, and an optional `SourceLocation`.
-
-A `LogSink` is a write and a flush. Emission is synchronous on the calling
-thread, and a sink exception propagates to the caller — logging at `Error`
-raises nothing by itself. The caller owns the sink's resources and its
-concurrency policy. The two kinds and their ownership rules are below.
+- A `Logger` is opaque. `mkLoggerWith filter providers sink` is its only
+  constructor; `mkLogger` supplies the real clock and thread providers;
+  `handleLogger filter handle` adds a borrowed-handle sink and is in `IO`
+  because that sink owns the state serializing every logger that shares it.
+- There is no global or shared mutable logging state. A subsystem or worker
+  receives its logger as a plain argument.
+- Emission goes through `logEvent logger level component message fields`, with
+  `logDebug`, `logInfo`, `logWarning` and `logError` on top. All take
+  `HasCallStack`. An emitted `LogEntry` carries the level, component, message,
+  a `Map Text Text` of fields, the breadcrumbs, a UTC timestamp, the thread
+  identity and an optional `SourceLocation`.
+- Emission is synchronous on the calling thread, and a sink exception
+  propagates to the caller. Logging at `Error` raises nothing by itself.
+- A `LogSink` is a write and a flush. The caller owns its resources and its
+  concurrency policy ([Sinks](#sinks)).
 
 ## Component names
 
-A `Component` is a validated value, not raw text. A name is one or more
-nonempty segments matching `[a-z][a-z0-9_-]*` joined by `.`, for example
-`gpu.vulkan`, `game.world`, or `lua`.
+A `Component` is a validated value: one or more segments matching
+`[a-z][a-z0-9_-]*` joined by `.`, such as `gpu.vulkan` or `lua`.
 
-```haskell
-mkComponent     ∷ Text → Either Text Component   -- validating
-unsafeComponent ∷ HasCallStack ⇒ Text → Component -- source literals only
-componentText   ∷ Component → Text
-```
-
-`mkComponent` rejects an invalid name with a message quoting it rather than
-normalizing it. `unsafeComponent` is for names written as literals in the
-source — it fails loudly with the same message — so configuration, files, and
-user input go through `mkComponent`.
-
-Rejected: `Gpu.Vulkan` (uppercase), `gpu..vulkan` and `gpu.` (empty segment),
-`1gpu` (leading digit), ` gpu` (leading space), the empty name, and the
-standalone names `all` and `none`, which are reserved Debug selectors.
-
-Matching is exact everywhere — in configuration and in output. There is no
-hierarchy, registry, or central enum, so `gpu` and `gpu.vulkan` are unrelated
-names and a threshold on one says nothing about the other.
+- `mkComponent` validates and rejects an invalid name with a message quoting
+  it; it never normalizes. Configuration, files and user input go through it.
+- `unsafeComponent` is for source literals only and fails loudly with the same
+  message. `componentText` reads the name back.
+- Rejected: uppercase (`Gpu.Vulkan`), an empty segment (`gpu..vulkan`, `gpu.`),
+  a leading digit or space, the empty name, and the standalone names `all` and
+  `none`, which are reserved Debug selectors.
+- **Matching is exact everywhere.** There is no hierarchy, registry or central
+  enum: `gpu` and `gpu.vulkan` are unrelated names.
 
 ## Filtering
 
-`LogFilter` is a pure configuration value that a logger applies; it is never
-reconfigured in place.
+`LogFilter` is a pure configuration value; it is never reconfigured in place.
+`defaultLogFilter` is the defaults column.
 
 | Field | Meaning | Default |
-|---|---|---|
+| --- | --- | --- |
 | `filterEnabled` | Master switch | `True` |
 | `filterGlobalLevel` | Threshold for components without an override | `Info` |
 | `filterComponentLevels` | Exact per-component thresholds | empty |
-| `filterDebug` | Which components may emit `Debug` | `DebugNone` |
+| `filterDebug` | Which components may emit `Debug`: `DebugNone`, `DebugAll` or `DebugComponents` | `DebugNone` |
 | `filterSource` | Whether an entry records its call site | `True` |
-
-`defaultLogFilter` is exactly that row of defaults.
 
 Decisions, in order:
 
-1. `filterEnabled = False` suppresses everything, whatever else is set.
-2. A `Debug` entry is emitted only when `filterDebug` is `DebugAll` or a
-   `DebugComponents` set containing its component. A threshold never enables
-   `Debug`: with `filterComponentLevels` mapping `gpu.vulkan` to `Debug` and
-   `filterDebug = DebugNone`, a `Debug` entry for `gpu.vulkan` is still
-   suppressed while its `Info` entries are emitted.
-3. Any other level is emitted when it meets its component's own threshold, or
-   `filterGlobalLevel` when that component has no override.
-4. `filterSource = False` yields `entrySource = Nothing`.
+1. `filterEnabled = False` suppresses everything.
+2. A `Debug` entry is emitted only when `filterDebug` selects its component.
+   **A threshold never enables `Debug`**: a component level of `Debug` under
+   `DebugNone` still suppresses that component's `Debug` entries.
+3. Any other level is emitted when it meets its component's threshold, or the
+   global one when the component has no override.
+4. `filterSource = False` yields no source location.
 
-Under the defaults, `Info`, `Warning`, and `Error` are emitted for every
-component, `Debug` for none, and every emitted entry carries a source location.
-
-Filtering happens before the message or the fields are forced and before either
-metadata provider runs. A suppressed entry whose payload would throw when
-forced does not throw, and it costs no timestamp or thread lookup. No
-allocation or throughput claim is made here beyond that ordering.
+Filtering happens before the message or fields are forced and before either
+metadata provider runs: a suppressed entry whose payload would throw does not
+throw, and costs no timestamp or thread lookup.
 
 ## Startup configuration
 
-A `LogFilter` is a value, so configuration is resolved once at startup and never
-reconfigured in place. The foundation supplies pure parsers for the three
-configurable parts of one, plus an assembly over a caller-supplied lookup:
+Configuration is resolved once at startup. The foundation supplies pure parsers
+(`parseLogLevel`, `parseComponentLevels`, `parseDebugSelection`) and
+`resolveLogFilter variables lookup base`, which assembles a filter over a
+caller-supplied lookup. The parsers take values, never variable names, and the
+names (`LogVariables`) and the lookup are arguments: the spelling of the
+variables and the environment access belong to the application, and a test
+supplies a pure lookup.
 
-```haskell
-parseLogLevel        ∷ Text → Either Text LogLevel
-parseComponentLevels ∷ Text → Either Text (Map Component LogLevel)
-parseDebugSelection  ∷ Text → Either Text DebugSelection
-
-data LogVariables = LogVariables
-  { variableGlobalLevel     ∷ Text
-  , variableComponentLevels ∷ Text
-  , variableDebug           ∷ Text
-  }
-
-resolveLogFilter
-  ∷ Monad m
-  ⇒ LogVariables → (Text → m (Maybe Text)) → LogFilter → m (Either Text LogFilter)
-```
-
-The parsers take values and never the name of a variable, and `resolveLogFilter`
-takes the names and the lookup as arguments, so both the spelling of the
-variables and the environment access belong to the application. Another
-application over this library is free to use another prefix for the same
-contract, and a test supplies a pure or counting lookup instead of the
-environment.
-
-The console executable chooses these three:
+The console executable chooses these:
 
 | Variable | Configures | Accepted form | Default |
-|---|---|---|---|
-| `HETOIMASIA_LOG_LEVEL` | `filterGlobalLevel` | `debug`, `info`, `warn`, `warning`, or `error`, case-insensitively | `info` |
+| --- | --- | --- | --- |
+| `HETOIMASIA_LOG_LEVEL` | `filterGlobalLevel` | `debug`, `info`, `warn`, `warning` or `error`, case-insensitively | `info` |
 | `HETOIMASIA_LOG_LEVELS` | `filterComponentLevels` | comma-separated `component=level` pairs, such as `gpu.vulkan=warn,lua=info` | no overrides |
-| `HETOIMASIA_DEBUG` | `filterDebug` | exactly `none`, exactly `all`, or a comma-separated component list such as `gpu.vulkan,lua` | `none` |
+| `HETOIMASIA_DEBUG` | `filterDebug` | exactly `none`, exactly `all`, or a comma-separated component list | `none` |
 
-`filterEnabled` and `filterSource` stay programmatic. No variable controls
-them, and `resolveLogFilter` carries whatever the base configuration set for
-them through untouched.
+`filterEnabled` and `filterSource` stay programmatic; `resolveLogFilter` carries
+the base's values through. Surrounding whitespace is trimmed from a value, each
+list entry and each side of a pair; whitespace inside a name is not accepted. A
+repeated component in `HETOIMASIA_DEBUG` collapses to one.
 
-Surrounding whitespace is trimmed from a value, from each list entry, and from
-each side of a pair, so ` info ` and ` gpu.vulkan = warn ` are accepted.
-Whitespace *inside* a name is not: a component name still has to satisfy
-[`mkComponent`](#component-names). A repeated component in `HETOIMASIA_DEBUG`
-collapses to one selection.
+An absent variable keeps its default. **An empty or malformed value is an
+error, never a default:**
 
-An absent variable keeps its default; an empty or malformed value is an error
-rather than a default:
-
-| Rejected value | Reason |
-|---|---|
+| Rejected | Reason |
+| --- | --- |
 | `HETOIMASIA_LOG_LEVEL=verbose`, `=warnings`, `=` | not one of the five spellings, or empty |
 | `HETOIMASIA_LOG_LEVELS=gpu.vulkan` | no `=` in the entry |
-| `HETOIMASIA_LOG_LEVELS=gpu.vulkan=warn,gpu.vulkan=info` | the same component key twice |
-| `HETOIMASIA_LOG_LEVELS=Gpu.Vulkan=warn`, `=gpu vulkan=warn` | `mkComponent` rejects the name |
+| `HETOIMASIA_LOG_LEVELS=gpu.vulkan=warn,gpu.vulkan=info` | the same component twice |
+| `HETOIMASIA_LOG_LEVELS=Gpu.Vulkan=warn` | `mkComponent` rejects the name |
 | `HETOIMASIA_LOG_LEVELS=gpu.vulkan=warn,` | an empty entry |
-| `HETOIMASIA_DEBUG=NONE`, `=All` | the selectors are spelled in lowercase |
-| `HETOIMASIA_DEBUG=all,gpu.vulkan` | a selector combined with component names |
+| `HETOIMASIA_DEBUG=NONE`, `=All` | the selectors are lowercase |
+| `HETOIMASIA_DEBUG=all,gpu.vulkan` | a selector combined with names |
 
 ### Failure behavior
 
-The application reads the environment exactly once, consulting each variable a
-single time before any value is parsed, and it does so before either supported
-command-line path runs. A present but invalid value fails startup: one line
-naming the variable and the reason goes to stderr and the process exits
-non-zero, before any entry is emitted and before the application action runs.
+The application reads the environment once, each variable a single time, before
+any value is parsed and before either command-line path runs. A present but
+invalid value fails startup: one line naming the variable and the reason goes to
+stderr and the process exits non-zero, before any entry is emitted and before
+the application action runs. `--help` validates the same configuration and
+fails the same way.
 
 ```text
 $ HETOIMASIA_LOG_LEVEL=bogus hetoimasia --smoke
 HETOIMASIA_LOG_LEVEL: invalid level "bogus": expected debug, info, warn, warning, or error
-$ echo $?
-1
 ```
 
-That diagnostic is always one line. A rejected value is quoted and escaped by the
-same rule the record layout applies to text (see
-[Quoting and escaping](#quoting-and-escaping)), so a value carrying a newline, a
-quote, or any other control character cannot split the message or forge a second
-line of output:
-
-```text
-$ HETOIMASIA_LOG_LEVEL=$'bad\nforged' hetoimasia --smoke
-HETOIMASIA_LOG_LEVEL: invalid level "bad\nforged": expected debug, info, warn, warning, or error
-```
-
-`--help` validates the same configuration and fails the same way. Help text
-itself is ordinary application output on stdout rather than a diagnostic, so it
-stays visible at any threshold; diagnostics go through the configured logger.
+The diagnostic is always one line: a rejected value is quoted and escaped by
+[the record layout's rule](#quoting-and-escaping), so a value carrying a
+newline cannot forge a second line. Help text is application output on stdout,
+visible at any threshold.
 
 ```sh
 hetoimasia --smoke                                    # three records: runtime, console, runtime
@@ -234,293 +154,160 @@ HETOIMASIA_DEBUG=gpu.vulkan,lua hetoimasia --smoke    # those two components may
 
 ## Record layout
 
-`formatEntry` renders one entry as exactly one line of text and returns no
-terminating newline; a sink adds its own record terminator. Segments are
-separated by single spaces, and an optional segment is omitted entirely rather
-than left empty:
+`formatEntry` renders one entry as exactly one line with no terminating newline;
+a sink adds its own terminator. Segments are separated by single spaces, and an
+optional segment is omitted rather than left empty:
 
 ```text
 <time> <LEVEL> <component> thread=<n> [src=<file>:<line>] [crumbs=<a>><b>] msg=<message> [<key>=<value> ...]
 ```
 
 | Segment | Content |
-|---|---|
-| `<time>` | UTC as ISO 8601 with exactly three fractional digits and a `Z` suffix |
-| `<LEVEL>` | `DEBUG`, `INFO`, `WARN`, or `ERROR` |
+| --- | --- |
+| `<time>` | UTC, ISO 8601, exactly three fractional digits, `Z` suffix; sub-millisecond digits are truncated, not rounded |
+| `<LEVEL>` | `DEBUG`, `INFO`, `WARN` or `ERROR` |
 | `<component>` | The validated name, never quoted |
 | `thread=` | The numeric GHC thread identity; omitted when `formatThread` is off |
-| `src=` | Present only when the entry carries a source location |
-| `crumbs=` | Present only when there is at least one breadcrumb, joined by `>` |
+| `src=` | Only when the entry carries a source location |
+| `crumbs=` | Only with at least one breadcrumb, joined by `>` |
 | `msg=` | Always present |
 | fields | After the message, sorted by key |
 
-Sub-millisecond precision is truncated rather than rounded, so a timestamp never
-depends on digits the layout does not show. `2026-09-10T12:34:56.789999Z`
-renders as `2026-09-10T12:34:56.789Z`, and a whole second renders as `.000`.
-
 ### Quoting and escaping
 
-Every piece of text in a record — message, breadcrumb, field key, field value,
-source filename, and thread — goes through one rule, so nothing a caller
-supplies can split a record or forge a segment. Text is written bare when it is
-nonempty and holds only printable non-space characters other than the four the
-layout reserves:
-
-```text
-" \ = >
-```
-
-Anything else is wrapped in double quotes, with `\"`, `\\`, `\n`, `\r`, and
-`\t` escapes and every other control character written as `\uXXXX` with
-uppercase hex digits. Empty text renders as `""`.
-
-A component name is validated by `mkComponent` before it can reach an entry, so
-it is always bare. A field key is not validated — `withFields` and the emission
-helpers take raw `Text` — so it follows the same rule as everything else:
-ordinary keys such as `attempt` or `gpu.device-id` are bare, and only a key that
-would otherwise disturb the layout is quoted.
-
-Quoting applies to the filename in `src=<file>:<line>` as well, so an unusual
-path cannot split a record across lines; the line number stays outside the
-quotes. Non-ASCII text is printable and passes through unchanged, quoted only
-if it also holds a space or a reserved character.
-
-With fixed metadata, these are the exact rendered lines:
+Every piece of text in a record (message, breadcrumb, field key, field value,
+source filename, thread) goes through one rule, so nothing a caller supplies
+can split a record or forge a segment. Text is written bare when it is nonempty
+and holds only printable non-space characters other than the four reserved
+ones, `"`, `\`, `=` and `>`. Anything else is wrapped in double quotes with
+`\"`, `\\`, `\n`, `\r` and `\t` escapes and every other control character as
+`\uXXXX` in uppercase hex. Empty text renders as `""`. Non-ASCII text is
+printable. Field keys are not validated and follow the same rule. In
+`src=<file>:<line>` the filename is quoted and the line number stays outside
+the quotes.
 
 ```text
 2026-09-10T12:34:56.789Z INFO runtime thread=3 msg="Starting hetoimasia"
 2026-09-10T12:34:56.790Z WARN gpu.vulkan thread=7 src=app/Main.hs:42 crumbs=runtime>gpu msg="Device lost\nretrying" attempt=2 device="Radeon RX"
 ```
 
-`FormatOptions` carries the two output choices; `defaultFormatOptions` enables
-both:
-
-| Field | Meaning | Default |
-|---|---|---|
-| `formatThread` | Whether the `thread=` segment is emitted | `True` |
-| `formatFlush` | Whether the sink flushes after every record | `True` |
-
-There is no separate thread-logging API: `formatThread` is the control.
+`FormatOptions` holds `formatThread` (emit the `thread=` segment) and
+`formatFlush` (flush after every record); `defaultFormatOptions` enables both.
 
 ## Sinks
 
-```haskell
-newHandleSink     ∷ Handle → IO LogSink                     -- defaultFormatOptions
-newHandleSinkWith ∷ FormatOptions → Handle → IO LogSink
-callbackSink      ∷ (LogEntry → IO ()) → LogSink            -- no-op flush
-callbackSinkWith  ∷ (LogEntry → IO ()) → IO () → LogSink
-flushLogger       ∷ Logger → IO ()
+| Sink | Constructor | Behaviour |
+| --- | --- | --- |
+| Handle | `newHandleSink`, `newHandleSinkWith options` | Borrows the caller's handle. Writes each record as one whole line and serializes every write and flush across all loggers sharing the sink: no interleaving within a line, each producer's order kept, order between threads unspecified. |
+| Callback | `callbackSink`, `callbackSinkWith write flush` | Wraps a caller's `LogEntry → IO ()` and a flush (a no-op by default). The callback may be called concurrently and supplies its own synchronization; it must not emit to the same sink recursively. |
 
-writeEntry        ∷ LogSink → LogEntry → IO ()
-flushSink         ∷ LogSink → IO ()
-```
-
-A handle sink borrows a caller-supplied handle. It writes each record as one
-whole line, and it serializes every write and flush across all the loggers
-sharing it, so concurrent producers never interleave within a line and each
-producer's own order is preserved. Ordering *between* threads is unspecified.
-
-That guarantee belongs to the sink value, not to the handle. Two roots writing
-to one handle must share one sink:
-
-```haskell
-sink ← newHandleSink handle
-let runtime = mkLogger defaultLogFilter sink
-    tools   = mkLogger quieter          sink   -- same sink, its own filter
-```
-
-Constructing two handle sinks over one handle is unsupported: they serialize
-against each other's records not at all. Derived loggers share their root's
-sink automatically, so `withFields` and `withBreadcrumb` need no care here.
-
-A callback sink wraps a caller-supplied `LogEntry → IO ()` and a flush action,
-which defaults to a no-op for a callback with no flushable state. Callbacks may
-receive concurrent calls and supply their own synchronization; a callback must
-not emit to the same sink recursively.
-
-`flushLogger` flushes a logger's sink on demand whether or not `formatFlush` is
-enabled, and because derived loggers share their root's sink, flushing any one
-of them flushes what all of them wrote.
-
-`writeEntry` and `flushSink` are the whole of what a caller holding a `LogSink`
-rather than a logger over it can do. `writeEntry` forwards an already-prepared
-`LogEntry` exactly as `logEvent` forwards the one it built: no filter is
-applied and no metadata provider runs, so an entry carried across a thread
-boundary keeps the level, component, context, timestamp, thread identity, and
-source attribution it was built with — rebuilding it through `logEvent` would
-replace that attribution with the forwarding call site. `flushSink` is
-`flushLogger` without a logger. Neither exposes the sink's construction or its
-internals, and both keep the sink's own synchronous write, flush, and exception
-semantics. The [asynchronous adapter](#asynchronous-adapter) is what they exist
-for.
+- **The serialization belongs to the sink value, not the handle.** Two roots
+  writing to one handle must share one sink; two handle sinks over one handle
+  are unsupported. Derived loggers share their root's sink automatically.
+- `flushLogger` flushes a logger's sink whether or not `formatFlush` is set;
+  flushing any derived logger flushes what all of them wrote.
+- `writeEntry sink entry` and `flushSink sink` are all a caller holding a sink
+  without a logger can do. `writeEntry` forwards a prepared entry unchanged: no
+  filter is applied and no metadata provider runs, so an entry carried across a
+  thread boundary keeps its timestamp, thread and source attribution. Both keep
+  the sink's synchronous write, flush and exception semantics. They exist for
+  the [asynchronous adapter](#asynchronous-adapter).
 
 ## Ownership and failures
 
 The handle stays the caller's. A handle sink never closes it, never changes its
-buffering, and leaves it open and usable after every logger over it is
-discarded. Set the buffering you want before constructing the sink.
+buffering, and leaves it usable after every logger over it is discarded; set
+the buffering before constructing the sink. A derived logger is an immutable
+value and holding one is no claim on the handle.
 
 The application's logging scope outlives every subsystem or worker borrowing
 its sink. Shut down in this order:
 
-1. Stop and join the producers, so nothing is still emitting.
+1. Stop and join the producers.
 2. Finish subsystem cleanup, which may itself emit diagnostics.
 3. Make the terminal report, once, through the boundary chosen to own it.
 4. Make the final flush. The [logging lifetime](#logging-lifetime) owns this
-   step and enforces its place: after the callback holding steps 1 to 3 has
-   returned or thrown, and outside every controlled resource release.
+   step: after the callback holding steps 1 to 3 has returned or thrown, and
+   outside every controlled resource release.
 5. Close any handle the application owns, after the lifetime has returned.
 
-Deriving a logger extends no handle lifetime by itself: a derived logger is an
-immutable value sharing its root's sink, and holding one is not a claim on the
-handle behind it. These are caller obligations, not a file-owning logging
-service; the borrowed `stderr` of the console smoke stays the process's.
+Failures:
 
-Sink failures propagate to the caller of the logging operation, for both sink
-kinds and for `flushLogger`. Logging at `Error` does not itself throw — the
-level is a severity, not an exception — and asynchronous cancellation is never
-swallowed. After a sink exception, or an interruption during a write, the
-handle sink releases its serialization state before the exception leaves, so
-the next logging call on any sharing logger proceeds rather than deadlocking.
-
-A failed write may leave a partial record: no transactional file write is
-promised. A sink failure is never reported back through the failing sink, and
-an error-reporting or cleanup boundary must preserve its own primary failure
-when the diagnostic it tried to emit fails too.
-
-Generic resource-scope primitives stay out of this module; see
-[the resource ownership design](archive/resource_ownership_design.md). A scope must run
-its cleanup and expose its outcome with no logger at all, or with a broken one.
-Composing the two is the application's obligation, and
-[Application lifecycle](resources.md#application-lifecycle) in the resource
-contract is where that composition is written down: where a logger call may and
-may not go around a scope, why a release collects a bounded lifecycle entry
-instead of writing to a sink, how a boundary reports a resource failure once and
-still hands the structured outcome to its caller, and how it tells a resource
-failure apart from a failure of the diagnostic itself — which is never reported,
-because the sink that would carry the report is the one that just failed.
+- A sink failure propagates to the caller of the logging operation, for both
+  sink kinds and for `flushLogger`. Asynchronous cancellation is never
+  swallowed.
+- After a sink exception or an interruption during a write, the handle sink
+  releases its serialization state before the exception leaves, so the next
+  call on any sharing logger proceeds.
+- A failed write may leave a partial record.
+- **A sink failure is never reported back through the failing sink**, and an
+  error-reporting or cleanup boundary preserves its own primary failure when
+  the diagnostic it tried to emit fails too.
+- Resource scopes run their cleanup and expose their outcome with no logger, or
+  a broken one. How a logger call composes with a scope is in
+  [Application lifecycle](resources.md#application-lifecycle).
 
 ### Logging lifetime
 
-```haskell
-data LoggingLifetime
-withLoggingLifetime       ∷ Logger → (LoggingLifetime → IO a) → IO a
-withHandleLoggingLifetime ∷ LogFilter → Handle → (LoggingLifetime → IO a) → IO a
-lifetimeLogger            ∷ LoggingLifetime → Logger
+`Hetoimasia.Runtime.Logging` makes step 4 a boundary. `withLoggingLifetime
+logger callback` is an explicit `IO` callback, outside the `Scoped` runner: it
+borrows a logger the caller built, lends it through a `LoggingLifetime` handle
+and makes the final flush once the callback has finished.
+`withHandleLoggingLifetime filter handle` builds one `handleLogger` first; the
+console runs both smoke paths through it over `stderr`.
 
-recordReport    ∷ LoggingLifetime → ReportResult → IO ()
-recordedReports ∷ LoggingLifetime → IO [ReportResult]
+- **The handle lends and records, nothing else.** `lifetimeLogger` is the
+  borrowed logger. `recordReport` records what became of one runtime-managed
+  reporting attempt: pass it as the recorder of `reportTerminalFailureWith`, or
+  give it the `ReportResult` of `reportOutcome`. `recordedReports` reads them
+  back. The handle owns no handle, changes no buffering and does not change
+  ordinary logging calls. It is not an application environment.
+- **The callback owes:** every producer stopped and every component scope
+  unwound before it returns, and the one terminal report made inside it. The
+  lifetime reports nothing itself.
+- **The final flush:** at most one attempt per lifetime, through `flushLogger`,
+  with the caller's masking state and ordinary interruptibility. No bounded
+  duration is promised. **Never enter a lifetime from a release callback**: a
+  release runs under `uninterruptibleMask_`.
 
-flushFailures ∷ SomeException → [ExceptionWithContext SomeException]
-failedReports ∷ SomeException → [ExceptionWithContext SomeException]
-```
-
-`Hetoimasia.Runtime.Logging` turns step 4 of the shutdown order from a caller
-obligation into a boundary. `withLoggingLifetime` is an explicit `IO` callback,
-outside the `Scoped` runner, that borrows a logger the caller already built,
-lends it to the callback through a `LoggingLifetime` handle, and makes the final
-flush once the callback has finished. `withHandleLoggingLifetime` builds one
-`handleLogger` over a borrowed handle first; the console runs both of its smoke
-paths through it over the process's `stderr`, and every logger derived from the
-lent one shares that sink.
-
-**What the handle lends and records.** `lifetimeLogger` is the borrowed logger.
-`recordReport` records what became of one runtime-managed reporting attempt:
-pass it as the recorder of `reportTerminalFailureWith`, or hand it the
-`ReportResult` that `reportOutcome` returned. That is all. The handle looks up
-no other service, owns no handle, changes no buffering, creates no output
-backend, and changes nothing about ordinary logging calls: a direct `logInfo`
-whose sink fails still throws to its caller. It is not an application
-environment.
-
-**What the callback owes.** Every producer has stopped and every component
-scope inside the callback has unwound before it returns, and the chosen
-terminal-report owner has made its one report inside it. The lifetime reports
-nothing itself: an arbitrary callback failure never becomes a record here.
-
-**The final flush.** At most one attempt per lifetime, through `flushLogger`,
-after the callback has returned or thrown. The flush runs with the caller's
-masking state and keeps its ordinary interruptibility: no bounded duration is
-promised, and no successful flush during cancellation. Never enter a lifetime
-from a release callback — a release runs under `uninterruptibleMask_`, and a
-flush has no controlled blocking duration.
-
-**Finalization follows the settled outcome.**
+Finalization follows the settled outcome:
 
 | Outcome entering finalization | What the lifetime does |
-|---|---|
+| --- | --- |
 | The callback returned; diagnostics usable | Flush once. Return the result only if the flush succeeds; a synchronous flush failure fails the run with the flush's own exception, marked `DiagnosticFailure`. |
-| The callback threw synchronously; diagnostics usable | Flush once, then rethrow the callback's failure with its type, value, and context. A synchronous flush failure rides on that context as secondary evidence `flushFailures` reads back, with its own type, value, and context. No `CleanupFailure` is forged for it. |
-| A managed reporting attempt already failed | No flush and no new attempt through that path. Return the result, or rethrow the failure with every failed attempt attached as evidence `failedReports` reads back. `recordedReports` holds them either way. |
-| The callback threw a failure marked `DiagnosticFailure` | No flush: the sink that failed is the one a flush would use. The failure propagates unchanged. |
+| The callback threw synchronously; diagnostics usable | Flush once, then rethrow the callback's failure with its type, value and context. A synchronous flush failure rides on that context as secondary evidence that `flushFailures` reads back. No `CleanupFailure` is forged. |
+| A managed reporting attempt already failed | No flush and no new attempt. Return the result, or rethrow the failure with every failed attempt attached as evidence that `failedReports` reads back. |
+| The callback threw a failure marked `DiagnosticFailure` | No flush: the failed sink is the one a flush would use. The failure propagates unchanged. |
 | The callback is being cancelled | Propagate the cancellation with its context. No report, no flush. |
-| A cancellation arrives during the flush | Propagate it as itself, with its own context, in place of the settled outcome. It is never turned into a logger failure, and the flush is not retried. |
+| A cancellation arrives during the flush | Propagate it as itself in place of the settled outcome. The flush is not retried. |
 
 Diagnostic usability comes from explicit provenance only: the
-`DiagnosticFailure` mark on what the callback threw, or a `ReportFailed` outcome
-recorded on the handle. An exception's type is never consulted, and there is no
-global sink-health registry. Reading either kind of evidence needs no logger,
-and neither changes the primary's typed catch behavior, its origin, or its
-cleanup evidence.
+`DiagnosticFailure` mark on what the callback threw, or a `ReportFailed`
+recorded on the handle. An exception's type is never consulted and there is no
+sink-health registry.
 
-**What the lifetime does not own.** The handle behind the sink, its buffering,
-and its closing stay the caller's; closing it is step 5, after the lifetime has
-returned. Owned log files and a file-close policy are not part of it.
-Configuration parsing and logger construction happen before it, so a failure
-there propagates as its own typed failure with no promise of a record: no
-managed logger exists yet. `runApplication` stays the thin supplied-logger
-runner, and `resourceSmoke` keeps its public entry point and its one terminal
-report. The console's resource-smoke path runs `managedResourceSmoke`, the
-same run with that report's outcome recorded on the lifetime, so a report that
-failed and was discarded in favour of the original failure still reaches the
-lifetime owner.
-
-**The lifetime's state.**
+Not owned: the handle behind the sink, its buffering and its closing (step 5).
+Configuration parsing and logger construction happen before the lifetime, so a
+failure there propagates as its own typed failure with no promise of a record.
+The console's resource-smoke path runs `managedResourceSmoke`, which records
+its report's outcome on the lifetime.
 
 | State | Owner | Writers | Readers | Thread | Lifetime and reset |
-|---|---|---|---|---|---|
-| Recorded reporting-attempt outcomes | The `withLoggingLifetime` call that created the handle | `recordReport`, atomically; nothing is ever removed | `recordedReports`; finalization, once | Any thread holding the handle; finalization on the calling thread | Created empty per call, never shared or reset. A record made after finalization has read it is kept and has no effect. |
-| The final flush attempt | Finalization | Finalization, at most once | None: its outcome is the lifetime's result or evidence on its failure | The thread that called `withLoggingLifetime` | Not stored; decided and made once per call. |
+| --- | --- | --- | --- | --- | --- |
+| Recorded reporting-attempt outcomes | The `withLoggingLifetime` call | `recordReport`, atomically; nothing is removed | `recordedReports`; finalization, once | Any thread holding the handle | Created empty per call, never shared or reset. A record made after finalization read it is kept and has no effect. |
+| The final flush attempt | Finalization | Finalization, at most once | None: its outcome is the lifetime's result or evidence on its failure | The thread that called `withLoggingLifetime` | Not stored. |
 
-The `Logging lifetime` group in
-[`packages/runtime/test/Test/Runtime/Lifetime.hs`](../packages/runtime/test/Test/Runtime/Lifetime.hs),
-in `hetoimasia-runtime:runtime-tests` and selected by `--match 'Logging lifetime'`, drives each row above with injected sinks,
-release traces, and a temporary borrowed handle.
+Tests: `cabal test hetoimasia-runtime:runtime-tests --test-option=--match "--test-option=Logging lifetime"`.
 
 ### Asynchronous adapter
 
-Everything above is synchronous: a write and a flush run on the emitting thread,
-and a blocked handle blocks whatever turn emitted the record. The runtime's
-`Hetoimasia.Runtime.AsyncLog` is an **optional** adapter that takes that I/O off
-the producers. It changes nothing here: every sink, logger, and caller keeps the
-semantics this document describes, and an application opts in by injecting a
-logger built over the adapter's sink instead of over the borrowed one.
+`Hetoimasia.Runtime.AsyncLog` is an **optional** adapter that takes sink I/O off
+the producers. An application opts in by injecting a logger built over
+`adapterSink`; nothing else in this document changes. It is not the Vulkan
+capture path ([below](#vulkan-validation-capture)).
 
-It is not the Vulkan native-capture path. That capture is C-only, owned by the
-graphics backend, and never reached through this adapter; see
-[Vulkan validation capture](#vulkan-validation-capture) below.
-
-```haskell
-data AsyncLogConfig = AsyncLogConfig
-  { asyncQueueCapacity   ∷ !Int   -- 1024 by default, at least 1
-  , asyncTextBudget      ∷ !Int   -- 4096 by default, 256 to 65536
-  , asyncControlCapacity ∷ !Int   -- 16 by default, at least 1
-  }
-
-defaultAsyncLogConfig  ∷ AsyncLogConfig
-validateAsyncLogConfig ∷ AsyncLogConfig → Either AsyncLogConfigError AsyncLogConfig
-
-data AsyncLogAdapter
-withAsyncLogAdapter ∷ AsyncLogConfig → LogSink → (AsyncLogAdapter → IO a) → IO a
-adapterSink         ∷ AsyncLogAdapter → LogSink
-
-flushAdapter     ∷ AsyncLogAdapter → IO FlushOutcome
-adapterStatus    ∷ AsyncLogAdapter → IO AsyncLogStatus
-adapterStatusSTM ∷ AsyncLogAdapter → STM AsyncLogStatus
-```
-
-**Opting in.** The adapter lifetime *encloses* the logging lifetime, so it
-outlives every producer, graphics teardown, and terminal report:
+The adapter lifetime **encloses** the logging lifetime, so it outlives every
+producer, graphics teardown and the terminal report:
 
 ```haskell
 sink ← newHandleSink stderr                      -- the caller's, throughout
@@ -529,359 +316,185 @@ withAsyncLogAdapter defaultAsyncLogConfig sink $ \adapter →
     application (lifetimeLogger lifetime)
 ```
 
-`validateAsyncLogConfig` checks every bound without IO, and
-`withAsyncLogAdapter` runs it first: an out-of-range value is raised
-synchronously to this caller, before a writer exists, and is never a latched
-writer failure.
+| `AsyncLogConfig` field | Default | Range |
+| --- | --- | --- |
+| `asyncQueueCapacity` | 1024 | at least 1 |
+| `asyncTextBudget` | 4096 | 256 to 65536 |
+| `asyncControlCapacity` | 16 | at least 1 |
 
-**Admission never waits.** The adapter sink's write prepares a bounded copy of
-the entry on the producer thread and enqueues it in one non-blocking
-transaction. It never waits for queue space and never falls back to writing
-through the borrowed sink itself, so a normal return from `logInfo` over an
-adapter logger proves neither admission nor delivery. `adapterStatus` is the
-only account of what happened to a record.
+`validateAsyncLogConfig` checks the bounds without IO and `withAsyncLogAdapter`
+runs it first: an out-of-range value is raised synchronously, before a writer
+exists.
 
-**What a queued record retains.** Every textual member the adapter keeps —
-message, component, field keys and values, breadcrumbs, thread, and source text
-— is copied at admission, so a short slice cannot hold an oversized producer
-buffer alive, and the copy is completed and forced before the record reaches the
-queue. Their UTF-8 byte lengths, plus the truncation marker when there is one,
-are summed against **one per-record total**, `asyncTextBudget`. That is a bound
-on retained text; it claims nothing about Haskell object overhead. A record also
-keeps at most `maxRetainedFields` (64) field entries and
-`maxRetainedBreadcrumbs` (32) breadcrumbs, counting entries with empty text. On
-a truncated record the adapter's own marker is one of those field entries, so
-one fewer producer field survives there and the total never exceeds the bound.
+- **Admission never waits.** The sink's write prepares a bounded copy of the
+  entry on the producer thread and enqueues it in one non-blocking transaction.
+  It never waits for space and never falls back to the borrowed sink, so a
+  normal return from `logInfo` proves neither admission nor delivery.
+  `adapterStatus` (and `adapterStatusSTM`) is the only account of a record.
+- **What a queued record retains.** Every textual member is copied and forced
+  at admission. Their UTF-8 byte lengths, plus the truncation marker, are
+  summed against one per-record total, `asyncTextBudget`. A record keeps at
+  most `maxRetainedFields` (64) fields and `maxRetainedBreadcrumbs` (32)
+  breadcrumbs.
+- **Truncation never rejects a record.** A record over a bound is admitted with
+  what fits and carries the reserved field `log.truncated`, whose value names
+  the affected categories and dropped counts (`msg,fields=36`); the marker
+  takes one of the field entries and its maximum size is reserved inside the
+  budget. An oversized component becomes the component `log.truncated`. What
+  fits is decided in order: component, thread, source, fields, breadcrumbs,
+  then the message, which may shrink to empty. A field or breadcrumb that does
+  not fit is dropped whole and counted. A producer field named `log.truncated`
+  is removed and counted as dropped.
+- **Loss is counted, never hidden.** A record arriving at a full queue is
+  discarded and counted by severity. Records still queued when the writer is
+  gone are counted as unattempted-abandoned. A record whose write failed or
+  was interrupted is counted as that and never replayed.
+- **The writer** dequeues in admission order, formats and writes through the
+  borrowed sink; no formatting or sink I/O runs on a producer. A synchronous
+  write or flush failure latches and terminates the writer: nothing after it is
+  attempted, a later failure never replaces the first, and it is never reported
+  through the writer.
+- **Flushing is a precise barrier.** `flushAdapter` returns a typed
+  `FlushOutcome`: every record admitted before the request is written before
+  the borrowed sink's flush is attempted, and later records do not extend it. A
+  waiter observes writer termination rather than waiting forever. The adapter
+  sink's own flush is the same barrier and raises `AsyncLogFlushFailure` on an
+  unsuccessful result, so the logging lifetime's final flush keeps its
+  precedence. Control requests are bounded by `asyncControlCapacity`, counting
+  a request the writer has taken and not settled: an excess request returns
+  `FlushRejected` without waiting, and cancelling a waiter releases its slot.
+- **Shutdown.** When the callback returns or throws, admission stops, the
+  writer drains and the adapter joins it before ending its borrow. It never
+  closes the borrowed sink, adds no second final flush and never retries a
+  failed one. A latched failure is visible through `adapterStatus` and the
+  barrier; the adapter never raises it itself and never replaces an application
+  failure.
+- **Cancellation.** The adapter requests the writer's cancellation, then
+  performs a protected drain with the borrowed sink still live, as
+  [the worker contract](workers.md) drains a group. The original outcome
+  propagates unchanged; the backlog is counted as unattempted-abandoned.
+  **An uncancellable sink, such as a foreign call, can hold the lifetime open
+  indefinitely**: the writer is never detached and there is no deadline.
 
-**Truncation never rejects a record.** A record over a bound is admitted with
-what fits and carries the reserved `truncationField` (`log.truncated`) marker,
-whose value names the affected categories and the dropped counts, for example
-`msg,fields=36`. An oversized component becomes the valid `truncationComponent`
-(`log.truncated`). The marker's own maximum size is reserved inside the budget,
-so even at the 256-byte minimum a record is admitted carrying it. What fits is
-decided in attribution order — component, thread, source, fields, breadcrumbs,
-and last the message, which is reduced as far as empty text rather than costing
-the record its context. A field entry or breadcrumb that does not fit is dropped
-whole and counted rather than half-kept. A producer field named `log.truncated`
-is removed, and its removal is itself counted as a dropped field.
+Pure record preparation (the budget, the limits, the marker, the detached copy)
+is in the private `Hetoimasia.Runtime.AsyncLog.Entry`; admission evaluates it on
+the producer thread.
 
-**Where preparation lives.** The budget, the collection limits, the marker, and
-the bounded, detached copy are pure record preparation in the runtime library's
-private `Hetoimasia.Runtime.AsyncLog.Entry` module. `Hetoimasia.Runtime.AsyncLog`
-re-exports its public constants and keeps every piece of state the table below
-lists. Being pure does not move the work: admission evaluates the prepared
-record on the producer thread before its enqueueing transaction, so the writer
-never completes a producer's copy.
+| State | Owner | Writers | Readers | Lifetime and reset |
+| --- | --- | --- | --- | --- |
+| Record queue and admission flag | The `withAsyncLogAdapter` call | Admission (any producer thread) while open; the writer, dequeuing; shutdown | The writer; `adapterStatus` as counters | Created empty per call. Closed when the callback returns or throws. |
+| Control requests and waiter cells | The call | `flushAdapter`, registering or releasing; the writer, taking and settling | The waiting caller; `statusControlPending` | Bounded by `asyncControlCapacity`. Every registration is released by its waiter, by settlement or by writer termination. |
+| Latched writer failure and terminal state | The writer | The writer, once each | `adapterStatus`; every barrier | Never reset. Published however the writer ends. |
+| Counters | The call | Admission and the writer, atomically; shutdown | `adapterStatus` | Zero per call, cumulative: nothing resets one. |
 
-**Loss is counted, never hidden.** A record arriving at a full queue is
-discarded and counted by severity. Records still queued when the writer is gone
-are counted as unattempted-abandoned. A record whose write failed, or was
-interrupted in flight, is counted as exactly that: it is never replayed, and
-never reported as definitely undelivered, because a partial write is permitted.
-
-**The writer.** It dequeues in admission order, formats, and writes through the
-borrowed sink — no formatting and no sink I/O ever runs on a producer. A
-synchronous failure of a write, or of a flush, latches on the adapter and
-terminates the writer: nothing after it is attempted, a later failure never
-replaces the first, and the failure is never reported back through the writer
-itself. A failed or interrupted flush fails its barrier without inventing an
-in-flight record and without reclassifying a completed write.
-
-**Flushing is a precise barrier.** `flushAdapter` reports a typed
-`FlushOutcome`: every record admitted before the request is written before the
-borrowed sink's flush is attempted, and records admitted after it do not extend
-it. A waiter observes writer termination rather than waiting forever, and a
-successful barrier resets no counter. The adapter sink's own flush is that same
-barrier, raising `AsyncLogFlushFailure` for an unsuccessful result — so
-`flushLogger` over an adapter logger fails like a flush of any other sink, and
-the logging lifetime's final flush keeps the precedence the matrix above
-describes. Control requests and their waiter registrations share the
-`asyncControlCapacity` bound, pending requests included: an excess request
-returns `FlushRejected` without waiting for record-queue space, and cancelling a
-waiter releases its registration. The bound covers a request the writer has
-taken and not yet settled as well as one still waiting, so a barrier held inside
-a blocked borrowed flush does not free its slot; `statusControlPending` accounts
-for both.
-
-**Shutdown.** Once the callback returns or throws, admission stops, the writer
-drains what is left, and the adapter joins it before ending its borrow. The
-borrowed sink's resources stay the caller's: the adapter never closes them, and
-step 5 of [the shutdown order](#ownership-and-failures) still belongs to the
-caller. Adapter shutdown adds no second final flush and never retries a failed
-one. A latched writer failure is observable through `adapterStatus` and through
-the barrier; the adapter never raises it on its own account and never replaces
-an application failure.
-
-Under cancellation the adapter requests the writer's cancellation and then
-performs a protected drain with the borrowed sink still live, as
-[the worker contract](workers.md) drains a group: a further asynchronous
-exception does not end that drain and does not release the borrow early, and the
-original outcome propagates unchanged. Cancellation need not flush, and the
-backlog is accounted as unattempted-abandoned. A write blocked in an
-interruptible operation ends promptly once cancellation is delivered; an
-uncancellable sink, such as a foreign call, can hold the lifetime open
-indefinitely. The writer is never detached, no competing write or flush is run
-to force progress, there is no deadline, and no sink I/O runs in an
-uninterruptible release.
-
-**The adapter's state.**
-
-| State | Owner | Writers | Readers | Thread | Lifetime and reset |
-|---|---|---|---|---|---|
-| Record queue and its admission flag | The `withAsyncLogAdapter` call | Admission, atomically, while open; the writer, dequeuing; shutdown, closing admission and abandoning the backlog | The writer; `adapterStatus`, as counters | Any producer thread; the writer's own thread | Created empty per call, never shared or reset. Closed to admission when the callback returns or throws. |
-| Control requests and their waiter cells | The `withAsyncLogAdapter` call | `flushAdapter`, registering or releasing one; the writer, taking and settling one | The waiting caller; `adapterStatus`, as `statusControlPending` | Any thread holding the handle; the writer's own thread | Created empty per call. Bounded by `asyncControlCapacity`, counting a taken-but-unsettled request; every registration is released by its waiter, by the writer settling it, or by writer termination. |
-| The latched writer failure and terminal state | The writer | The writer, once each; a later failure never replaces the first | `adapterStatus`; every flush barrier | The writer's own thread | Created empty per call, never reset. Published however the writer ends. |
-| Counters | The `withAsyncLogAdapter` call | Admission and the writer, atomically; shutdown, for the abandoned backlog | `adapterStatus` | Any thread | Created at zero per call. Cumulative: no barrier or status read resets one. |
-
-The `Asynchronous logging adapter` group in
-[`packages/runtime/test/Test/Runtime/AsyncLog.hs`](../packages/runtime/test/Test/Runtime/AsyncLog.hs),
-in `hetoimasia-runtime:runtime-tests` and selected by
-`--test-options='--match=Asynchronous'`, drives each row above with a probed
-borrowed sink, latch-coordinated blocked writes, and cancellation held in an
-uncancellable region. The forwarding operations have their own examples in the
-`Forwarding to a sink` group of
-[`packages/foundation/test/Test/Foundation/Logging/Sink.hs`](../packages/foundation/test/Test/Foundation/Logging/Sink.hs),
-in `hetoimasia-foundation:foundation-tests` and selected by
-`--test-options='--match=Forwarding'`.
+Tests: `cabal test hetoimasia-runtime:runtime-tests --test-options='--match=Asynchronous'`;
+the forwarding operations, `cabal test hetoimasia-foundation:foundation-tests --test-options='--match=Forwarding'`.
 
 ### Vulkan validation capture
 
-The Vulkan backend's validation diagnostics reach the logger by a different
-path, beside this adapter rather than through it, because their producer is not
-a Haskell thread. A debug-utils messenger reports from inside Vulkan calls —
-under the backend's audited `unsafe` recording imports, from calls that must not
-re-enter Haskell — so its callback is C. It copies a capped record into bounded
-storage the diagnostic lifetime owns and returns; it never waits, writes to a
-sink, or runs Haskell. A drain worker in that lifetime's own worker group then
-hands each record to the logger the backend was given, as an ordinary
-`logEvent` under the component `gpu.vulkan.diagnostics`, with a breadcrumb of
-its own and the record's details in fields.
-
-It follows the module authoring guide like any subsystem: the logger is
-borrowed and injected, never flushed or closed by the capture, and the worker is
-joined inside the application's [logging lifetime](#logging-lifetime). Info and
-verbose reports arrive at `Debug`, warnings at `Warning`, errors at `Error`.
-Whether validation failed does not depend on the logger at all: an error latches
-in the capture storage before its record is admitted, whatever the logger's
-filter, and a sink failure is the worker's own terminal status rather than a
-record written through the sink that failed. Either logger configuration works
-with it, synchronous or through this adapter; the capture itself never touches
-the adapter's queue. [Vulkan validation diagnostics](vulkan_diagnostics.md) is
-the contract.
+The Vulkan backend's validation diagnostics reach the logger beside the
+adapter, not through it. The debug-utils callback is C: it copies a capped
+record into bounded storage and returns, never running Haskell. A drain worker
+then emits each record as an ordinary `logEvent` under
+`gpu.vulkan.diagnostics` (info and verbose at `Debug`, warnings at `Warning`,
+errors at `Error`), through a borrowed logger it never flushes, and is joined
+inside the [logging lifetime](#logging-lifetime). Whether validation failed
+never depends on the logger's filter. The contract is
+[Vulkan validation diagnostics](vulkan_diagnostics.md).
 
 ## Context and precedence
 
-A derived logger adds immutable context to a parent and shares the parent's
-filter, providers, and sink. Deriving never mutates the parent.
+`withFields` and `withBreadcrumb` derive a logger that adds immutable context
+and shares its parent's filter, providers and sink. Deriving never mutates the
+parent.
 
-```haskell
-withFields     ∷ [(Text, Text)] → Logger → Logger
-withBreadcrumb ∷ Text → Logger → Logger
-```
-
-Precedence, narrowest first: an event's own fields override the logger's
-context fields, and an inner derived logger's fields override those it
-inherited. Within a single `withFields` list, a later pair overrides an earlier
-one with the same key. Breadcrumbs accumulate in derivation order, outermost
-first.
-
-```haskell
-let outer = withBreadcrumb "startup" (withFields [("service", "engine"), ("scope", "outer")] root)
-    inner = withBreadcrumb "worker"  (withFields [("scope", "inner")] outer)
-
-logInfo inner component "inherited"  []                  -- scope=inner, breadcrumbs [startup, worker]
-logInfo inner component "overridden" [("scope", "event")] -- scope=event
-logInfo outer component "parent"     []                  -- scope=outer, breadcrumbs [startup]
-```
-
-Give each worker thread its own derived logger rather than sharing one mutable
-context: context lives in the immutable `Logger` value, so two workers cannot
-observe each other's fields. Entries from different threads reach a shared sink
-in an unspecified relative order, but each worker's own entries keep theirs and
-no record interleaves with another (see [Sinks](#sinks)).
+- An event's own fields override the logger's context fields; an inner derived
+  logger's fields override inherited ones; within one `withFields` list a later
+  pair overrides an earlier one with the same key.
+- Breadcrumbs accumulate in derivation order, outermost first.
+- Give each worker its own derived logger: context lives in the immutable
+  value, so two workers cannot observe each other's fields.
 
 ## Source attribution
 
-An emitted entry records the outermost call-stack frame — the call site outside
-every function that declared `HasCallStack`. A wrapper that declares the
-constraint is therefore attributed to *its* caller, not to the line inside it:
-
-```haskell
-emitStartup ∷ HasCallStack ⇒ Logger → IO ()
-emitStartup logger = logInfo logger component "starting" []
-```
-
-An entry from `emitStartup` reports the site where `emitStartup` was called.
-`SourceLocation` holds the file, the line, and the name of the function whose
-call produced that site.
+An emitted entry records the outermost call-stack frame: the call site outside
+every function that declared `HasCallStack`. A wrapper declaring the constraint
+is attributed to its caller. `SourceLocation` holds the file, the line and the
+name of the function whose call produced that site.
 
 That site is where the entry was reported. Where a failure was raised is a
-different fact: `Hetoimasia.Foundation.Failure` attributes a failure's origin
-with the same outermost-frame policy and carries it on the exception, with no
-logger involved. See [failures.md](failures.md#origin-is-not-the-log-entrys-source).
+different fact, carried on the exception with no logger involved; see
+[failures.md](failures.md#origin-is-not-the-log-entrys-source).
 
 ## Metadata injection for tests
 
 `MetadataProviders` holds the two values an entry cannot derive from its call:
-
-```haskell
-data MetadataProviders = MetadataProviders
-  { metadataClock  ∷ IO UTCTime
-  , metadataThread ∷ IO Text
-  }
-```
-
-`systemMetadata` supplies the real UTC clock and this thread's numeric GHC
-identity — the number the `thread=` segment shows, not its `Show` spelling —
-and `mkLogger` uses it. A test builds its logger with `mkLoggerWith` and passes
-fixed or counting providers instead, which makes both the entry metadata and
-the gating observable: an emitted entry carries exactly the values the
-providers returned, and a suppressed one invokes neither.
-
-```haskell
-fixedMetadata ∷ MetadataProviders
-fixedMetadata = MetadataProviders (pure fixedTime) (pure "3")
-```
-
-The Hspec suite in [`test/Main.hs`](../test/Main.hs) uses this for the
-filtering matrix, payload and provider gating, field precedence, concurrent
-context isolation, source attribution through a wrapper, component validation,
-and every fixed-metadata record in [Record layout](#record-layout).
-
-The sink checks in the same suite use temporary files and a pipe rather than
-fixed providers: intact records and per-producer order across four coordinated
-workers, per-entry and explicit flushing against a caller-configured block
-buffer, an untouched borrowed handle, propagated write, flush, and callback
-failures, and serialization state released after both a failed write and an
-interruption mid-write. They coordinate with `MVar`s and use timeouts only to
-bound a stuck test.
-
-The `Worker reporting boundary` group runs the guide's own worker body from
-[Usage](#usage) against substituted work and sinks: a success diagnostic, a
-single error diagnostic for an ordinary failure, an escaping cancellation
-delivered to blocked work with no diagnostic at all, a synchronous reporting
-failure that preserves the work's exception after one reporting attempt, a
-cancellation delivered while the reporting sink is blocked, and a failing
-success diagnostic that still propagates. Its two cancellation cases signal
-entry through an `MVar` and then block on one the test never fills, so
-`killThread` lands at an interruptible point without a sleep.
-
-The startup cases inject a lookup rather than an environment: a recording lookup
-shows all three variables consulted exactly once and in order, before any value
-is parsed and with nothing consulted afterwards, and the same injection covers
-the defaults, the assembled filter, each variable being invalid alone, and the
-programmatic master and source switches. The console cases run the built
-executable as a child process with all three variables stripped from the
-inherited environment and only the one under test set, which is what makes exit
-status, the stderr diagnostic, an absent record, and the `--help` path
-observable.
+`metadataClock ∷ IO UTCTime` and `metadataThread ∷ IO Text`. `systemMetadata`
+supplies the real clock and the numeric thread identity. A test passes fixed or
+counting providers to `mkLoggerWith`: an emitted entry carries exactly what
+they returned, and a suppressed one invokes neither.
 
 ## Module authoring guide
 
-These are the conventions a new subsystem follows. They are the reason the
-interface looks the way it does, so a module that ignores them gets less out of
-it than one that does not.
+The conventions a new subsystem follows.
 
-**Take a logger, never reach for one.** A subsystem receives a `Logger` as a
-plain argument and holds it in its own state if it needs to. There is no ambient
-logger, no global to initialize, and no service locator to ask: a module that
-cannot be given a logger does not log. This is what makes a subsystem testable
-with a callback sink and what keeps two subsystems from sharing mutable context.
+- **Take a logger, never reach for one.** A subsystem receives a `Logger` as a
+  plain argument. There is no ambient logger or service locator: a module that
+  cannot be given a logger does not log.
+- **One stable component name per subsystem**, a source literal through
+  `unsafeComponent`. Matching is exact, and a renamed component breaks every
+  threshold and Debug selection that named it.
+- **Add context at subsystem boundaries.** Derive with `withFields` or
+  `withBreadcrumb` where a scope begins (entering a subsystem, accepting a
+  request, starting a worker) and pass the derived value inward.
+- **Identifiers and values go in fields, not the message.** The message stays
+  the same text across occurrences:
+  `logWarning logger component "Device lost" [("device", name), ("attempt", "2")]`.
+- **Mean one thing by each level.**
 
-**Choose one stable component name per subsystem.** Pick it when the subsystem
-is written, spell it as a source literal through `unsafeComponent`, and keep it.
-Matching is exact, so `gpu` and `gpu.vulkan` are unrelated names and a reader
-filtering on one will not see the other. A name that changes between releases
-breaks every threshold and Debug selection that mentioned it.
+  | Level | What belongs at it |
+  | --- | --- |
+  | `Debug` | Optional detail for someone investigating this component. Off unless selected. |
+  | `Info` | Meaningful lifecycle activity: started, finished, connected, loaded. |
+  | `Warning` | Degraded or recoverable behavior: work continued, but not as intended. |
+  | `Error` | Failed work. Logging it raises nothing; the failure is reported by returning or throwing. |
 
-**Add context at subsystem boundaries.** Derive a logger with `withFields` or
-`withBreadcrumb` where a scope begins — entering a subsystem, accepting a
-request, starting a worker — and pass the derived value inward. Entries then
-carry the scope they happened in without every call site repeating it, and the
-parent keeps its own context.
-
-**Put identifiers and values in fields, not in the message.** The message says
-what happened and stays the same text across occurrences; the varying parts go
-in fields, where they are quoted, sorted, and machine-readable. Write
-`logWarning logger component "Device lost" [("device", name), ("attempt", "2")]`
-rather than interpolating `name` into the message. Fields survive grepping and
-future structured output; interpolated text does not.
-
-**Mean one thing by each level.**
-
-| Level | What belongs at it |
-|---|---|
-| `Debug` | Optional detail for someone already investigating this component. Off unless selected. |
-| `Info` | Meaningful lifecycle activity: something started, finished, connected, or loaded. |
-| `Warning` | Degraded or recoverable behavior — work continued, but not as intended. |
-| `Error` | Failed work. Logging it raises nothing; the failure itself is reported by returning or throwing. |
-
-No routine per-frame `Info` output. A per-frame or per-entity diagnostic is
-`Debug`, behind its own component, or it is a counter summarized at a boundary.
-An `Info` record that appears sixty times a second makes the level useless for
-everything else.
-
-**Report a propagated failure once, at the boundary that handles it.** A
-subsystem that returns or rethrows has not handled anything yet, so it should
-not also log an `Error` about it: the handling boundary — the one that retries,
-degrades, or fails the operation — logs it, with the context it has. Logging at
-every frame of the propagation turns one failure into a pile of records that
-look like several. A boundary that recovers, degrades, or ends work through
-`Hetoimasia.Foundation.Recovery` reports through the runtime adapter described
-in [Recovery and terminal reports](#recovery-and-terminal-reports) rather than
-calling `logWarning` or `logError` itself.
-
-**Engine libraries log; applications print.** A library reports diagnostics
-through its injected logger and writes to no handle of its own. Command-line
-help, results, and anything the user asked to see are application output on
-stdout, which is why they stay visible at any threshold. The console
-executable's `--help` text is application output; the records its smoke path
-emits are diagnostics.
-
-**Construct through one scoped constructor and an opaque handle.** A
-subsystem that owns resources exposes one constructor in `Scoped`, takes a
-pure configuration value the application validated before any acquisition,
-keeps its private state behind an opaque handle, and documents every state in
-one table in its module. When it offers alternatives, the application decides
-whether it is required. [The component convention](resources.md#the-component-convention)
-spells these out beside `allocComponent`, the constructor that selects among
-alternatives.
-
-**Produce inside the logging lifetime.** A subsystem, worker, or thread that
-emits diagnostics is stopped and joined inside the application's
-[logging lifetime](#logging-lifetime) callback, never after it: the final flush
-is the last thing that happens to the sink, and a record written after it may
-never reach the handle. A subsystem does not flush the shared sink itself on
-shutdown, and does not enter a lifetime of its own over a logger it was lent.
-
-**Compose an application through the runner.** A new application enters its
-logging lifetime, constructs its dependencies, supervises its workers, reports,
-and flushes through `Hetoimasia.Runtime.Application.runScopedApplication`, declaring its own
-dependencies and services types. It does not assemble that order by hand, and
-it does not log the run's terminal failure itself: the runner makes that one
-report. See [the application runner](resources.md#the-application-runner) for
-the composition example.
-
-**Supervise workers at checkpoints, not with a monitor.** A subsystem that
-starts owned workers does so through
-[`Hetoimasia.Runtime.Supervision`](supervision.md), declaring each worker's
-role, required or optional disposition, and the classifier for its own
-failures. Place `checkRuntime` before and after starting a worker, at each loop
-iteration, and before accepting a final result, and block only in
-`awaitSupervised`. An optional worker's `Warning` is emitted through the
-logging lifetime by supervision itself; the subsystem does not log it again.
-See [where checkpoints go](supervision.md#checkpoints-and-supervised-waits).
-
-**Logging imposes no error type.** Nothing here asks a game or engine module to
-adopt a shared exception or result type. `logError` is a severity on a record,
-not a way to fail, and a failing sink is the only exception this module raises
-(see [Ownership and failures](#ownership-and-failures)).
+  **No routine per-frame `Info` output.** A per-frame or per-entity diagnostic
+  is `Debug` behind its own component, or a counter summarized at a boundary.
+- **Report a propagated failure once, at the boundary that handles it.** A
+  subsystem that returns or rethrows has handled nothing and logs no `Error`.
+  A boundary that recovers, degrades or ends work through
+  `Hetoimasia.Foundation.Recovery` reports through
+  [the reporting adapter](#recovery-and-terminal-reports) rather than calling
+  `logWarning` or `logError`.
+- **Engine libraries log; applications print.** A library writes to no handle
+  of its own. Help, results and anything the user asked to see are application
+  output on stdout.
+- **Construct through one scoped constructor and an opaque handle.** A
+  subsystem that owns resources exposes one constructor in `Scoped`, takes a
+  pure configuration the application validated before any acquisition, and
+  documents every state in one table in its module. See
+  [the component convention](resources.md#the-component-convention).
+- **Produce inside the logging lifetime.** Anything that emits is stopped and
+  joined inside the [logging lifetime](#logging-lifetime) callback. A subsystem
+  never flushes the shared sink on shutdown and never enters a lifetime of its
+  own over a lent logger.
+- **Compose an application through the runner.**
+  `Hetoimasia.Runtime.Application.runScopedApplication` enters the lifetime,
+  constructs dependencies, supervises, reports and flushes; the application
+  does not assemble that order or log the run's terminal failure itself. See
+  [the application runner](resources.md#the-application-runner).
+- **Supervise workers at checkpoints, not with a monitor.** Start owned workers
+  through [`Hetoimasia.Runtime.Supervision`](supervision.md), declaring each
+  one's role, disposition and failure classifier. Supervision emits an optional
+  worker's `Warning` itself. See
+  [where checkpoints go](supervision.md#checkpoints-and-supervised-waits).
+- **Logging imposes no error type.** A failing sink is the only exception this
+  module raises.
 
 ### Usage
 
-A root logger is built once, where the application assembles its services, from
-the configuration resolved at startup and a sink over a handle the application
-borrows, inside the logging lifetime that makes its final flush:
+A root logger is built once, where the application assembles its services:
 
 ```haskell
 main ∷ IO ()
@@ -893,7 +506,7 @@ main = do
     runApplication root "hetoimasia" (application root)
 ```
 
-A subsystem takes that logger, derives its own scope once, and uses its own
+A subsystem takes that logger, derives its scope once and uses its own
 component for every entry:
 
 ```haskell
@@ -909,11 +522,9 @@ startRenderer logger device = do
   pure renderer { rendererLogger = scoped }
 ```
 
-A worker gets its own derived logger rather than sharing one mutable context, so
-two workers cannot observe each other's fields while their records still reach
-the one sink in each worker's own order. Its handling is a named action with the
-work injected rather than a lambda inside `forkIO`, so the body a reader sees
-here is the body the suite runs:
+A worker gets its own derived logger. Its handling is a named action with the
+work injected, and `packages/foundation/test/Test/Foundation/Logging/Worker.hs`
+mirrors this body:
 
 ```haskell
 uploadComponent ∷ Component
@@ -947,167 +558,108 @@ reportAbandoned scoped failure = do
 -- UserInterrupt, and the exception a timeout delivers are classified alike.
 isCancellation ∷ SomeException → Bool
 isCancellation failure = isJust (fromException failure ∷ Maybe SomeAsyncException)
-```
 
-The spawn site supplies the work and nothing else:
-
-```haskell
 spawnUploader ∷ Logger → Int → IO ThreadId
 spawnUploader logger worker =
   forkIO (uploaderWorker logger worker drainUploadQueue)
 ```
 
-`uploaderWorker` is a terminal reporting boundary: the point where an ordinary
-failure stops being propagated and becomes a diagnostic instead. With a working
-sink such a failure produces exactly one `Error` record and the worker ends —
-nothing rethrows it, because no caller is left to interpret it.
+`uploaderWorker` is a terminal reporting boundary:
 
-Cancellation never reaches that boundary. An asynchronous exception from the
-work escapes unchanged and unreported — no `Error`, no `Info` — because a
-diagnostic emitted while cancelling is one more place the cancellation could be
-lost, which [Ownership and failures](#ownership-and-failures) forbids. For a
-`forkIO`-spawned worker, escaping means escaping the worker action: with no
-supervisor in scope it reaches GHC's uncaught-exception handler, and giving the
-spawner a way to observe it belongs to
-[the resource ownership design](archive/resource_ownership_design.md), not here.
-
-The reporting attempt is guarded, and only it. A synchronous failure from
-`logError` is discarded in favour of the work's own exception, which is rethrown
-with its type and payload intact: a sink failure is never reported back through
-the failing sink, and the boundary keeps its primary failure. A cancellation
-arriving during that same attempt escapes as itself rather than being displaced
-by the earlier work failure. The success path is deliberately unguarded — a
-failing `Info` propagates its sink exception like any other logging call.
-
-The `Worker reporting boundary` group in [`test/Main.hs`](../test/Main.hs) runs
-this body verbatim for each of those outcomes.
+| Outcome of the work | Result |
+| --- | --- |
+| Success | One `Info`. This path is unguarded: a failing `Info` propagates its sink exception. |
+| Ordinary failure, working sink | Exactly one `Error`; the worker ends and nothing rethrows. |
+| Ordinary failure, `logError` fails synchronously | The work's own exception is rethrown intact after the one attempt. |
+| Cancellation from the work | Escapes unchanged and unreported. With `forkIO` and no supervisor it reaches GHC's uncaught-exception handler. |
+| Cancellation during the reporting attempt | Escapes as itself, not displaced by the earlier work failure. |
 
 ### Recovery and terminal reports
 
-`Hetoimasia.Runtime.Reporting` explains the outcomes of
-[recovery](recovery.md) and the evidence of [failures](failures.md) through an
-injected logger. Neither of those modules takes a logger; this adapter lives in
-the runtime package so that the foundation never needs one.
+`Hetoimasia.Runtime.Reporting` explains the outcomes of [recovery](recovery.md)
+and the evidence of [failures](failures.md) through an injected logger. It lives
+in the runtime package so that the foundation never needs a logger.
 
-```haskell
-reportOutcome
-  ∷ HasCallStack ⇒ Logger → Component → Operation → Outcome a → IO ReportResult
+- `reportOutcome logger component operation outcome` returns a `ReportResult`:
+  `NoReport`, `ReportAccepted` or `ReportFailed` with the failure.
+- `reportTerminalFailure logger component message fields work` runs the work
+  and reports a failure that reaches it. `reportTerminalFailureWith recorder`
+  is the same boundary with a recorder called between the attempt and the
+  rethrow: it receives `ReportAccepted` or `ReportFailed` exactly when an
+  attempt was made. The recorder must neither block nor throw; a
+  [logging lifetime](#logging-lifetime) supplies `recordReport`.
+- `markDiagnostic`, `raisedByDiagnostic` and `terminalReportAttempted` set and
+  read the marks below.
 
-reportTerminalFailure
-  ∷ HasCallStack ⇒ Logger → Component → Text → IO [(Text, Text)] → IO a → IO a
+Rules:
 
-reportTerminalFailureWith
-  ∷ HasCallStack
-  ⇒ (ReportResult → IO ()) → Logger → Component → Text → IO [(Text, Text)] → IO a → IO a
+- **The boundary that chooses the disposition owns the report**: the code that
+  called `recover` and decides what to do with its outcome, or the code that
+  stops a failure from propagating. A helper that returns an outcome or
+  rethrows reports nothing.
+- **Record the outcome before the diagnostic.** Store the availability the
+  outcome selects, then call `reportOutcome`. A failed report comes back as
+  `ReportFailed` instead of being thrown, so it cannot undo the decision.
 
-data ReportResult = NoReport | ReportAccepted | ReportFailed (ExceptionWithContext SomeException)
+  ```haskell
+  outcome ← recover loadAudio audioPolicy openAudio
+  writeIORef audioAvailability (availability outcome)   -- the decision, first
+  _ ← reportOutcome logger audioComponent loadAudio outcome
+  ```
 
-markDiagnostic          ∷ IO a → IO a
-raisedByDiagnostic      ∷ ExceptionContext → Bool
-terminalReportAttempted ∷ SomeException → Bool
-```
+- **Levels follow what happened, never the exception's type.**
 
-**The boundary that chooses the disposition owns the report.** That is the code
-that called `recover` and decides what the application does with its outcome,
-or the code that stops a failure from propagating any further. A helper that
-returns an outcome or rethrows a failure has chosen nothing and reports nothing.
+  | What happened | Report |
+  | --- | --- |
+  | The first attempt succeeded | None: `NoReport`. |
+  | A retry or fallback succeeded | One `Warning`, `Operation recovered`. |
+  | Optional work is `Unavailable` | One `Warning`, `Operation unavailable`. |
+  | A failure reached the boundary that handles it | One `Error`, with the caller's message. |
 
-**Record the outcome before the diagnostic.** `recover` hands the caller its
-`Outcome` before any report exists. Store the availability it selects — mark
-the optional service unavailable, keep the fallback result — and only then call
-`reportOutcome`. A warning never stands in for that state change, and nothing
-the report does can undo it: a failed report comes back as `ReportFailed`
-instead of being thrown.
+- **Report once.** A recovery report summarizes every failed attempt in one
+  record. `reportTerminalFailure` makes one guarded attempt, then rethrows the
+  failure preservingly with a mark, so an enclosing `reportTerminalFailure`
+  rethrows without a second `Error`. A failed attempt is not retried and
+  filtering is never bypassed.
+- **Diagnostics are best effort here, and only here.** A synchronous failure
+  while computing the fields, formatting or writing never replaces the failure
+  being reported, never changes an outcome and never reruns the operation.
+  Direct `logInfo` or `logError` calls elsewhere still propagate sink failures.
+- **A diagnostic's own failure is never reported.** Every emission the adapter
+  makes is marked `DiagnosticFailure`. Wrap a boundary's own lifecycle records
+  in `markDiagnostic`; `reportTerminalFailure` rethrows a failure raised by one
+  without an attempt. The mark is added to synchronous failures only.
+- **Cancellation is never reported or displaced.** Anything thrown as
+  asynchronous escapes unreported with its context unchanged, including one
+  that arrives during a report.
+- **Never inside a release, never before protection.** Do not call either
+  function from a release callback or between an acquisition and the
+  installation of its release; see
+  [Application lifecycle](resources.md#application-lifecycle).
 
-```haskell
-outcome ← recover loadAudio audioPolicy openAudio
-writeIORef audioAvailability (availability outcome)   -- the decision, first
-_ ← reportOutcome logger audioComponent loadAudio outcome
-```
-
-**Levels follow what happened, never the exception's type.**
-
-| What happened | Report |
-|---|---|
-| The first attempt succeeded | None: `NoReport`. |
-| A retry or fallback succeeded | One `Warning`, `Operation recovered`. |
-| Optional work is `Unavailable` | One `Warning`, `Operation unavailable`. |
-| A failure reached the boundary that handles it | One `Error`, with the caller's message. |
-
-**Report once, bounded by the real attempts.** A recovery report summarizes
-every failed attempt in one record. `reportTerminalFailure` makes one guarded
-attempt for an ordinary failure, then rethrows it preservingly with a mark, so
-an enclosing `reportTerminalFailure` rethrows it without a second `Error`. A
-failed attempt is not retried, and filtering is never bypassed to force a
-record out.
-
-**Origin is not the reporting site.** The entry's `SourceLocation` is where the
-boundary was called. Where the failure was raised goes in fields:
+The entry's `SourceLocation` is where the boundary was called. Where the
+failure was raised goes in fields:
 
 | Field | Value |
-|---|---|
-| `disposition` | `recovered`, `unavailable`, or `propagated`. |
-| `availability` | `available` or `unavailable`. |
-| `operation` | The recovered or unavailable operation; for a terminal failure, the one whose recorded recovery ended in it. |
-| `attempts`, `attempts.failed` | On a recovered or unavailable outcome: the total attempt count and every failed attempt as `number:kind`, oldest first. |
-| `recovery` | On a terminal failure: `recorded` when `recover` attached a history, otherwise `unrecorded`. |
-| `attempts.earlier`, `attempts.terminal` | On a terminal failure: the earlier failed attempts as `number:kind` (`none` when unrecorded), and the propagated attempt's number. |
-| `recovered.by` | `retry` or `fallback "name"`, on a recovered outcome. |
-| `reason` | The latest failure's `displayException` text. |
-| `cleanup.failures`, `cleanup.labels` | Retained cleanup evidence, on a terminal failure. |
-| `origin` | `engine` when `throwFailure` recorded one, otherwise `unrecorded`. |
-| `origin.component`, `origin.operation`, `origin.identifiers` | The recorded origin. |
-| `origin.site`, `origin.function` | Where it was raised; `origin.site=unknown` when no site was recorded. |
-| `observed.*` | The innermost `withOperationContext` boundary, if any: where the failure was seen, never where it was thrown. |
+| --- | --- |
+| `disposition` | `recovered`, `unavailable` or `propagated` |
+| `availability` | `available` or `unavailable` |
+| `operation` | The recovered or unavailable operation; for a terminal failure, the one whose recorded recovery ended in it |
+| `attempts`, `attempts.failed` | Recovered or unavailable: the total attempt count and every failed attempt as `number:kind`, oldest first |
+| `recovery` | Terminal: `recorded` when `recover` attached a history, otherwise `unrecorded` |
+| `attempts.earlier`, `attempts.terminal` | Terminal: the earlier failed attempts as `number:kind` (`none` when unrecorded), and the propagated attempt's number |
+| `recovered.by` | `retry` or `fallback "name"` |
+| `reason` | The latest failure's `displayException` text |
+| `cleanup.failures`, `cleanup.labels` | Retained cleanup evidence, on a terminal failure |
+| `origin` | `engine` when `throwFailure` recorded one, otherwise `unrecorded` |
+| `origin.component`, `origin.operation`, `origin.identifiers` | The recorded origin |
+| `origin.site`, `origin.function` | Where it was raised; `origin.site=unknown` when no site was recorded |
+| `observed.*` | The innermost `withOperationContext` boundary: where the failure was seen, never where it was thrown |
 
-A terminal failure carries only what `recover` recorded on it. Its history lists
-the earlier attempts, so the propagated attempt is named by number alone:
-whether it was a retry or a fallback is not recorded. A failure of a recovery's
-first attempt carries no history and cannot be told apart from one that never
-passed through `recover`, so its report says `recovery=unrecorded` and
-`attempts.earlier=none` and gives no operation or attempt count. A caller that
-knows the operation can add it as an extra field.
+A failure of a recovery's first attempt carries no history and cannot be told
+apart from one that never passed through `recover`: its report says
+`recovery=unrecorded` and `attempts.earlier=none`. A terminal report's extra
+fields win over these on a shared key and are computed inside the guarded
+attempt, after the work's scopes have unwound.
 
-A terminal report's extra fields, such as the resources a scope released, win
-over these on a shared key. They are computed inside the guarded attempt, after
-the work's scopes have unwound.
-
-**Diagnostics are best effort here, and only here.** A synchronous failure while
-computing the fields, formatting the record, or writing it never replaces the
-failure being reported, never changes an outcome, and never runs the operation
-again: the report runs after the operation and its cleanup have finished. Direct
-`logInfo` or `logError` calls elsewhere keep their contract, and their sink
-failures still propagate.
-
-**A diagnostic's own failure is never reported.** Every emission the adapter
-makes is marked with `DiagnosticFailure`. Wrap a boundary's own lifecycle records
-in `markDiagnostic`, and `reportTerminalFailure` rethrows a failure raised by one
-without an attempt, because the sink it would write to is the one that just
-failed. The mark is added to synchronous failures only.
-
-**Cancellation is never reported or displaced.** Anything thrown as
-asynchronous escapes `reportTerminalFailure` unreported with its context
-unchanged. A cancellation arriving during either kind of report escapes as
-itself, with its own context and cleanup evidence, in place of the failure being
-reported.
-
-**Never inside a release, never before protection.** Both functions report after
-the work they are given has returned or thrown. Do not call either from a
-release callback or between an acquisition and the installation of its
-release; see [Application lifecycle](resources.md#application-lifecycle).
-
-The `Outcome reporting` group in
-[`packages/runtime/test/Test/Runtime/Reporting.hs`](../packages/runtime/test/Test/Runtime/Reporting.hs),
-in `hetoimasia-runtime:runtime-tests` and selected by `--match 'Outcome reporting'`, drives each rule above with an injected sink.
-`resourceSmoke` is the adapter's existing runtime consumer.
-
-**A terminal report's outcome can be handed on.** `reportTerminalFailure`
-discards what became of its attempt, because the failure it rethrows is the
-outcome that matters to its caller. `reportTerminalFailureWith` is the same
-boundary with a recorder called between the attempt and the rethrow: it receives
-`ReportAccepted` or `ReportFailed` exactly when an attempt was made — including
-one that failed while the original failure is rethrown in its place — and is not
-called otherwise. The recorder must neither block nor throw. A
-[logging lifetime](#logging-lifetime) supplies `recordReport` as that recorder,
-which is how it learns that a path's diagnostics have already failed without
-guessing from the failure it later receives.
+Tests: `cabal test hetoimasia-runtime:runtime-tests --test-option=--match "--test-option=Outcome reporting"`.
