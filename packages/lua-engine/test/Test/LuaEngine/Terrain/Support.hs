@@ -14,6 +14,7 @@ module Test.LuaEngine.Terrain.Support
   , sendCommand
   , withRigProbe
   , withRigHooks
+  , withRigPort
   , holdAt
   , defaultConfigForRaces
   , noProbeForRaces
@@ -49,7 +50,9 @@ module Test.LuaEngine.Terrain.Support
 
 import Control.Concurrent.MVar (MVar, newEmptyMVar, takeMVar, tryPutMVar, tryTakeMVar)
 import qualified Data.ByteString.Char8 as BC
-import Hetoimasia.Terrain.Runtime.Storage (filesystemOf, minHeadroomBytes, mkStorageConfig)
+import Data.ByteString (ByteString)
+import Hetoimasia.Foundation.Worker (WorkerGroup)
+import Hetoimasia.Terrain.Runtime.Storage (StorageConfig, filesystemOf, minHeadroomBytes, mkStorageConfig)
 import Hetoimasia.Terrain.Runtime.Store (StoreSpec (..), defaultStoreSpec, minAllowanceBytes)
 import System.IO.Temp (withSystemTempDirectory)
 import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
@@ -123,7 +126,12 @@ withRigProbe config probe = withRigHooks config probe noTerrainHooks
 
 -- | A rig whose adapter tells these hooks of the windows a race is decided in.
 withRigHooks ∷ Config → Probe → TerrainHooks → (Rig → IO a) → IO a
-withRigHooks config probe terrainHooks body =
+withRigHooks config probe terrainHooks = withRigPort config probe terrainHooks storagePort
+
+-- | A rig whose storage port this makes from the worker group, the qualified storage configuration and the directory: the production
+-- port, or one with a test seam ("Hetoimasia.Terrain.Runtime.Testing").
+withRigPort ∷ Config → Probe → TerrainHooks → (WorkerGroup → StorageConfig → ByteString → StoragePort) → (Rig → IO a) → IO a
+withRigPort config probe terrainHooks port body =
   -- The arenas' private files are real reserved files in a temporary directory, through the production
   -- adapter; the directory's filesystem is named the way the backend reads it and qualified for this run
   -- (the production list is not widened), and an arena reserves the smallest allowance unless the
@@ -133,7 +141,7 @@ withRigHooks config probe terrainHooks body =
     name ← filesystemOf directory >>= either (\f → fail ("cannot name the test filesystem: " <> show f)) pure
     storage ← either (\e → fail (show e)) pure (mkStorageConfig [name] minHeadroomBytes)
     withWorkerGroup $ \group →
-     withTerrainService (smallestAllowance config) (Ports alwaysAdmitting (standaloneSupervisor group) quiet probe (storagePort group storage directory)) $ \service → do
+     withTerrainService (smallestAllowance config) (Ports alwaysAdmitting (standaloneSupervisor group) quiet probe (port group storage directory)) $ \service → do
       facade ← newTerrainFacade fixedM1Profile service
       session ← newUnique
       signals ← newTVarIO Set.empty

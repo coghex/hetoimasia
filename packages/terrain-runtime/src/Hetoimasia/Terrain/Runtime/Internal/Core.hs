@@ -134,6 +134,7 @@ import Hetoimasia.Terrain.Runtime.Internal.Types
 import Hetoimasia.Terrain.Runtime.Backed.Fault (StorageFault)
 import Hetoimasia.Terrain.Runtime.Backed.RegionCopy (regionReservation)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Model (Condition (..), GrowthDecision (..), conditions, proposeGrowth)
+import Hetoimasia.Terrain.Runtime.Store.Internal.State (StoreConfig)
 import Hetoimasia.Terrain.Source (Source, SourceError)
 
 -- ---------------------------------------------------------------------------
@@ -273,7 +274,8 @@ registerClientSTM svc =
 
 -- | What a caller asks to admit.
 data Submission
-  = SubOpen !Client !Text !Source
+  = -- | An open, with the store configuration of its arena (validated before admission).
+    SubOpen !Client !Text !Source !StoreConfig
   | SubOpenInvalid !Client !SourceError
   | SubAttach !Client !Text
   | SubCell !ArenaLease !TileCoord
@@ -614,14 +616,14 @@ admit svc ep sub =
 
 decide ∷ Service → St → RequestId → Submission → STM (Either Short Insertion)
 decide svc st rid = \case
-  SubOpen client name source → pure $ do
+  SubOpen client name source store → pure $ do
     cid <- first' ShortRefused (clientOf svc client st)
     checkName name
     when (Map.member name (stateNames st)) (Left (ShortFailed NameInUse))
     when (arenaUse st >= configMaxArenas config) (Left (ShortRefused (RefusedBusy BusyArenas)))
     when (leaseUse >= configMaxLeases config) (Left (ShortRefused (RefusedBusy BusyLeases)))
     forM_ (capacityRefusal config st True) (Left . busyWhy)
-    Right (Insertion (COpen name source cid) Nothing cid Nothing False [] (Just name))
+    Right (Insertion (COpen name source cid store) Nothing cid Nothing False [] (Just name))
   SubOpenInvalid client err → pure $ do
     _ <- first' ShortRefused (clientOf svc client st)
     Left (ShortFailed (Definition err))
@@ -774,7 +776,7 @@ releaseReq svc rid req = do
       , stateSurfaceWindow = Map.delete rid (stateSurfaceWindow st)
       , stateWriteProbed = Map.delete rid (stateWriteProbed st)
       , stateNames = case reqCmd req of
-          COpen name _ _ | Just (ClaimPending claimed) <- Map.lookup name (stateNames st), claimed == rid → Map.delete name (stateNames st)
+          COpen name _ _ _ | Just (ClaimPending claimed) <- Map.lookup name (stateNames st), claimed == rid → Map.delete name (stateNames st)
           _ → stateNames st
       }
   when (reqModel req) (withdrawRecord svc rid req)

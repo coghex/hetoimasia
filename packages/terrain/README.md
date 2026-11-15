@@ -1316,7 +1316,7 @@ retirement, and every GPU limit belong to their render and graphics slices.
 Retained trace evidence (separate resident, edit and staging ledgers around
 reservation, cancellation, completion and handoff, vertical turnover, a failed
 handoff, aging, and the negative controls) is in
-[the TRA-3 evidence](../../docs/evidence/terrain/tra3/residency_evidence.md).
+[the TRA-3 evidence](../../docs/removed_records.md).
 
 ## Reference mapping
 

@@ -74,6 +74,9 @@ module Hetoimasia.Terrain.Runtime
   , Precondition (..)
   , CancelResult (..)
   , openArena
+  , OpenOptions (..)
+  , defaultOpenOptions
+  , openArenaOptions
   , attachArena
   , cellAt
   , columnAt
@@ -460,6 +463,10 @@ arrival project submit = do
 
 openArena ∷ Service → Client → Text → SourceSpec → IO (Either Refused (Pending ArenaLease))
 openArena svc client name spec = arrival (\case AOpened lease → Just lease; _ → Nothing) (\ep → openArenaWith svc ep client name spec)
+
+-- | 'openArena' with options: an allowance of the arena's own, validated by the service's rules before admission.
+openArenaOptions ∷ Service → Client → Text → SourceSpec → OpenOptions → IO (Either Refused (Pending ArenaLease))
+openArenaOptions svc client name spec options = arrival (\case AOpened lease → Just lease; _ → Nothing) (\ep → openArenaWithOptions svc ep client name spec options)
 
 attachArena ∷ Service → Client → Text → IO (Either Refused (Pending ArenaLease))
 attachArena svc client name = arrival (\case AAttached lease → Just lease; _ → Nothing) (\ep → attachArenaWith svc ep client name)

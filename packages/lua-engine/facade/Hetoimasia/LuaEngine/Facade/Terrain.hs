@@ -1,7 +1,8 @@
 {-# LANGUAGE OverloadedStrings #-}
 
--- | @api.terrain.open@, @attach@, @cell@, @column@, @surface@, @remove@ and @release@: the terrain calls of the M1 facade
--- (TRA-5), bound over the terrain operations a composition injects ('TerrainServices').
+-- | @api.terrain.open@, @attach@, @cell@, @column@, @surface@, @remove@, @status@, @grow_storage@, @retry_storage@ and
+-- @release@: the terrain calls of the M1 facade (TRA-5, TRA-23), bound over the terrain operations a composition injects
+-- ('TerrainServices').
 --
 -- = What this module decides, and what it leaves to the service
 --
@@ -20,8 +21,9 @@
 -- ordinary error raised before admission, with no request, arena or credit left behind. They are: wrong arity or fields, a
 -- sparse list, a metatable, a cycle, a function, a value of the wrong type or of the float subtype, an invalid UTF-8 string, an
 -- arena name that is empty or over 128 characters, a material identifier that is empty or over 64 bytes, a cell coordinate outside
--- @[-2^62, 2^62 - 1]@, a lower interval endpoint outside it, an upper endpoint above @2^62@, a shape outside @0..15@, and a copy
--- over the bounds of 'argumentLimits'. What is left to the terrain validator, and is the expected @definition@ failure when it
+-- @[-2^62, 2^62 - 1]@, a lower interval endpoint outside it, an upper endpoint above @2^62@, a shape outside @0..15@, an open's
+-- options that are not @nil@ or a record of at most @storage_bytes@, an allowance (@storage_bytes@, @grow_storage@'s @new_bytes@)
+-- below 64 MiB or not a whole number of MiB, and a copy over the bounds of 'argumentLimits'. What is left to the terrain validator, and is the expected @definition@ failure when it
 -- refuses a definition that decoded completely: an empty or inverted interval, overlapping or unordered layers, overlapping
 -- patches, a material no layer declares, a duplicate material identifier, a material identifier with a control character, and a
 -- definition over the validator's 256 KiB or 8,192 authored runs.
@@ -71,6 +73,9 @@ terrainHandleTypes facade =
       , terrainColumnRequestType
       , terrainSurfaceRequestType
       , terrainRemoveRequestType
+      , terrainStatusRequestType
+      , terrainGrowRequestType
+      , terrainRetryRequestType
       ]
   ]
 
@@ -168,6 +173,27 @@ arenaName = \case
     | otherwise → Right found
   _ → Left "an arena name must be text"
 
+-- | An allowance in bytes, as a script names it: a Lua integer (never a float, a numeric string or anything converted through one)
+-- of at least 64 MiB and a whole number of MiB. How large one the service can ever grant (its offset domain, the VM's integer
+-- ceiling) is the composition's permanent fact, decided by its check before any bank.
+storageBytes ∷ Text → Value → Either Text Int64
+storageBytes name value = do
+  found ← integer name value
+  if found < terrainStorageMinimum
+    then Left (name <> " is below the 64 MiB minimum")
+    else
+      if found `mod` terrainStorageUnit /= 0
+        then Left (name <> " is not a whole number of MiB")
+        else Right found
+
+-- | An open's options: omitted or nil, an empty record, or a record whose only field is an optional @storage_bytes@ (the host's
+-- copy has refused any other field). An absent or nil @storage_bytes@ is the service's own allowance.
+decodeOpenOptions ∷ Value → Either Text (Maybe Int64)
+decodeOpenOptions = \case
+  VNil → Right Nothing
+  VRecord fields → traverse (storageBytes "storage_bytes") (optionalField "storage_bytes" fields)
+  _ → Left "the open's options must be a table"
+
 -- | The definition a copied value is, or the first reason it is not.
 decodeDefinition ∷ Value → Either Text TerrainDefinition
 decodeDefinition = \case
@@ -258,7 +284,7 @@ decodeSurface = \case
 terrainBindings ∷ Facade → TerrainServices → [Binding]
 terrainBindings facade services =
   [ withArgumentLimits argumentLimits . withArgumentCheck openCheck $
-      asynchronousNativeRequestIn "terrain_open" [SText, definitionSchema] (m1StartSchemas terrainArenaRequestType) openAct
+      asynchronousNativeRequestIn "terrain_open" [SText, definitionSchema, SOptional openOptionsSchema] (m1StartSchemas terrainArenaRequestType) openAct
   , withArgumentCheck attachCheck $
       asynchronousNativeRequestIn "terrain_attach" [SText] (m1StartSchemas terrainArenaRequestType) attachAct
   , withArgumentCheck cellCheck $
@@ -269,6 +295,12 @@ terrainBindings facade services =
       asynchronousNativeRequestIn "terrain_surface" [arena, surfaceSchema] (m1StartSchemas terrainSurfaceRequestType) surfaceAct
   , withArgumentCheck removeCheck $
       asynchronousNativeRequestIn "terrain_remove" [arena, cellSchema, SOptional (SCapability terrainPickType)] (m1StartSchemas terrainRemoveRequestType) removeAct
+  , withArgumentCheck statusCheck $
+      asynchronousNativeRequestIn "terrain_status" [arena] (m1StartSchemas terrainStatusRequestType) statusAct
+  , withArgumentCheck growCheck $
+      asynchronousNativeRequestIn "terrain_grow_storage" [arena, SInteger] (m1StartSchemas terrainGrowRequestType) growAct
+  , withArgumentCheck retryCheck $
+      asynchronousNativeRequestIn "terrain_retry_storage" [arena] (m1StartSchemas terrainRetryRequestType) retryAct
   , -- A release is allowed wherever an instance's finite hook runs, shutdown and after a quit included, so the session's
     -- admission is deliberately not read. It never waits and it is never a module's top-level service.
     withPrecondition instanceOnly $
@@ -278,6 +310,7 @@ terrainBindings facade services =
     <> tsExtraBindings services
   where
     arena = SCapability terrainArenaType
+    openOptionsSchema = SRecord [("storage_bytes", SOptional SInteger)]
 
     instanceOnly owner = do
       calling ← whoIsCalling facade owner
@@ -327,10 +360,10 @@ terrainBindings facade services =
 
     -- open ----------------------------------------------------------------------------------------------
     openTarget = \case
-      [name, definition] → (,) <$> arenaName name <*> decodeDefinition definition
-      _ → Left "an arena name and a definition are required"
-    openCheck = checked "a terrain open" openTarget $ \caller (name, definition) → tsOpenCheck services (identityOf caller) (rootOf caller) name definition
-    openAct = starting "a terrain open" terrainArenaRequestType openTarget $ \caller (name, definition) → tsOpenStart services (identityOf caller) (rootOf caller) name definition
+      [name, definition, options] → (,,) <$> arenaName name <*> decodeDefinition definition <*> decodeOpenOptions options
+      _ → Left "an arena name, a definition and optional options are required"
+    openCheck = checked "a terrain open" openTarget $ \caller (name, definition, bytes) → tsOpenCheck services (identityOf caller) (rootOf caller) name definition bytes
+    openAct = starting "a terrain open" terrainArenaRequestType openTarget $ \caller (name, definition, bytes) → tsOpenStart services (identityOf caller) (rootOf caller) name definition bytes
 
     -- attach --------------------------------------------------------------------------------------------
     attachTarget = \case
@@ -370,6 +403,22 @@ terrainBindings facade services =
       _ → Left "an arena, a cell and an optional pick are required"
     removeCheck = checked "a terrain removal" removeTarget $ \caller (key, cell, pick) → tsRemoveCheck services (identityOf caller) key cell pick
     removeAct = starting "a terrain removal" terrainRemoveRequestType removeTarget $ \caller (key, cell, pick) → tsRemoveStart services (identityOf caller) key cell pick
+
+    -- status, grow_storage and retry_storage ------------------------------------------------------------------
+    arenaTarget = \case
+      [VCapability handle] → Right (capabilityKey handle)
+      _ → Left "an arena is required"
+    statusCheck = checked "a terrain status" arenaTarget $ \caller key → tsStatusCheck services (identityOf caller) key
+    statusAct = starting "a terrain status" terrainStatusRequestType arenaTarget $ \caller key → tsStatusStart services (identityOf caller) key
+
+    growTarget = \case
+      [VCapability handle, bytes] → (,) (capabilityKey handle) <$> storageBytes "new_bytes" bytes
+      _ → Left "an arena and the new allowance in bytes are required"
+    growCheck = checked "a terrain storage growth" growTarget $ \caller (key, bytes) → tsGrowCheck services (identityOf caller) key bytes
+    growAct = starting "a terrain storage growth" terrainGrowRequestType growTarget $ \caller (key, bytes) → tsGrowStart services (identityOf caller) key bytes
+
+    retryCheck = checked "a terrain storage retry" arenaTarget $ \caller key → tsRetryCheck services (identityOf caller) key
+    retryAct = starting "a terrain storage retry" terrainRetryRequestType arenaTarget $ \caller key → tsRetryStart services (identityOf caller) key
 
     -- release -------------------------------------------------------------------------------------------
     -- Another instance's handle and a handle of another kind are ordinary errors before any service is asked; a handle that

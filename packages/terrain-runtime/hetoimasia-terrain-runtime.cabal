@@ -157,6 +157,23 @@ library backed
         hetoimasia-terrain-runtime:storage,
         hetoimasia-terrain-runtime:store
 
+-- FOR TEST SUITES ONLY: the production service built with an injected storage seam (#666), so that a suite outside
+-- this package (lua-engine-tests) can hold the storage workers at causal gates and fail a reservation, a read or a write
+-- as the platform would, through this package's public service. It adds no behaviour and changes no production path:
+-- an application builds its port with `storagePort`. Only test suites depend on it.
+library testing
+    import: language
+    visibility: public
+    hs-source-dirs: testing
+    exposed-modules:
+        Hetoimasia.Terrain.Runtime.Testing
+    build-depends:
+        base >=4.22 && <4.23,
+        bytestring >=0.12 && <0.13,
+        hetoimasia-foundation ==0.1.0.0,
+        hetoimasia-terrain-runtime:backed,
+        hetoimasia-terrain-runtime:storage
+
 -- This package's own contracts, registered as the CPU validation group
 -- `test.terrain-runtime`. The suite drives the production service with
 -- controlled gates and no timing sleep; every thread it starts is owned through

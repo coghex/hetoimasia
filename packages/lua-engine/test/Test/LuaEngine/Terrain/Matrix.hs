@@ -16,12 +16,12 @@ import Hetoimasia.Scripting.Lua.Scheduled (scheduledEndpoint)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Hetoimasia.LuaEngine.Profile (CountLimit (CopiedValueDepth, RequestsPerInstance, RequestsPerVm, SceneDepth), fixedM1Profile)
-import Hetoimasia.LuaEngine.Terrain (issuePick, terrainCodes, terrainFailureReply)
+import Hetoimasia.LuaEngine.Terrain (issuePick, terrainCodes, terrainCodesFor, terrainFailureReply)
 import Hetoimasia.Scripting.Lua.Admission (ExpectedFailure (expectedCode))
 import Hetoimasia.Scripting.Lua.Provider (ProviderReply (..))
 import Hetoimasia.Terrain.Query (QueryError (TooManyRuns), QueryLimits (..), defaultQueryLimits)
 import Hetoimasia.Terrain.Residency (ArenaId (..), LimitsSpec (..), Revision (..), mkLimits)
-import Hetoimasia.Terrain.Runtime (Config (..), Failure (..), Point (PointCaptured), Precondition (..), Probe (..), censusRequests, closeService, defaultConfig, inspectCensusSTM)
+import Hetoimasia.Terrain.Runtime (Config (..), Failure (..), FullWhy (..), StorageFault (..), Point (PointCaptured), Precondition (..), Probe (..), censusRequests, closeService, defaultConfig, inspectCensusSTM)
 import Hetoimasia.Terrain.Source (SourceError (TooManyMaterials), SourceLimits (..), defaultSourceLimits, definitionHeaderBytes, materialRecordBytes)
 import Test.Hspec
 import Test.LuaEngine.Facade.Support
@@ -539,8 +539,33 @@ spec = describe "Terrain matrices" $ do
       case terrainFailureReply failure of
         ProviderExpected found → expectedCode found `shouldSatisfy` (`elem` terrainCodes)
         other → expectationFailure (show failure <> " was not an expected failure: " <> take 80 (show other))
-    -- the seven codes are exactly the ones the failures above map to
-    terrainCodes `shouldMatchList` ["not_found", "arena_closed", "stale_view", "definition", "source_failure", "too_large", "name_in_use"]
+    -- the storage outcomes (TRA-23) map to their own codes, never to a defect, busy or another code
+    forM_
+      [ (FaultComplexity "compiled arena" 2 1, "source_complexity")
+      , (FaultFull (AllowanceExhausted 3 2 1), "storage_full")
+      , (FaultSizeNotIncreased 128 64, "storage_size_not_increased")
+      ]
+      $ \(fault, code) → case terrainFailureReply (StorageFailed fault) of
+        ProviderExpected found → expectedCode found `shouldBe` code
+        other → expectationFailure (show fault <> " was not an expected failure: " <> take 80 (show other))
+    -- each endpoint declares the storage codes the service can settle it with, and only those
+    let storage = filter (`notElem` take 7 terrainCodes) . terrainCodesFor
+    map (\e → (e, storage e)) ["terrain_open", "terrain_attach", "terrain_cell", "terrain_column", "terrain_surface", "terrain_remove", "terrain_status", "terrain_grow_storage", "terrain_retry_storage"]
+      `shouldBe` [ ("terrain_open", ["source_complexity", "storage_unsupported", "reservation_failed", "storage_io"])
+                 , ("terrain_attach", [])
+                 , ("terrain_cell", ["storage_io", "storage_integrity"])
+                 , ("terrain_column", ["storage_io", "storage_integrity"])
+                 , ("terrain_surface", ["storage_io", "storage_integrity"])
+                 , ("terrain_remove", ["storage_full", "storage_io", "storage_integrity"])
+                 , ("terrain_status", [])
+                 , ("terrain_grow_storage", ["storage_unsupported", "reservation_failed", "storage_io", "storage_size_not_increased"])
+                 , ("terrain_retry_storage", ["storage_io"])
+                 ]
+    -- the fourteen codes are exactly the seven the failures above map to and the seven storage codes
+    terrainCodes
+      `shouldMatchList` [ "not_found", "arena_closed", "stale_view", "definition", "source_failure", "too_large", "name_in_use"
+                        , "source_complexity", "storage_unsupported", "reservation_failed", "storage_full", "storage_io", "storage_integrity", "storage_size_not_increased"
+                        ]
     -- what the service never declared to a script is the host's defect, never a code
     forM_ [Superseded "overtaken", HostFailure "an accounting defect"] $ \failure →
       case terrainFailureReply failure of

@@ -696,7 +696,7 @@ one, rewrite a snapshot or an inspection value (the census, its arenas and reque
 record of the owner's running work) with record-update syntax or import a private module is
 refused for the specific diagnostic that names the cause. Retained gated traces with before and after
 accounting are in
-[the TRA-4 evidence](../../docs/evidence/terrain/tra4/service_evidence.md).
+[the TRA-4 evidence](../../docs/removed_records.md).
 
 ## The temporary store (TRA-20)
 

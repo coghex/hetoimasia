@@ -336,9 +336,9 @@ pauseArena svc aid condition fault = do
 -- Opening
 
 -- | Begin an open: it waits for the session's one compilation.
-beginOpen ∷ Service → RequestId → Source → STM ()
-beginOpen svc rid source =
-  modifySt svc (\st → if Map.member rid (stateOpens st) then st else st {stateOpens = Map.insert rid (OpenTask source OpenQueued) (stateOpens st)})
+beginOpen ∷ Service → RequestId → Source → StoreConfig → STM ()
+beginOpen svc rid source store =
+  modifySt svc (\st → if Map.member rid (stateOpens st) then st else st {stateOpens = Map.insert rid (OpenTask source store OpenQueued) (stateOpens st)})
 
 -- | Opens publish in the order their incarnations were allocated (the accounting model's
 -- incarnations increase): an open waits while an earlier one is still being prepared.
@@ -489,7 +489,7 @@ stepOpen svc ops rid = do
     OpenSubmitting aid ident env shared held _
       | not alive → atomically (dropOpen svc rid held)
       | otherwise →
-          submitOpen (serviceStorage svc) ExplicitWork (OpenSpec (serviceDirectory svc) ident (serviceStoreConfig svc)) >>= \case
+          submitOpen (serviceStorage svc) ExplicitWork (OpenSpec (serviceDirectory svc) ident (openStore task)) >>= \case
             Left failure → case classifyFailure OwnerRunning JkOpen failure of
               -- temporary pressure: the open keeps its place and its compiled result, and submits
               -- again once the storage service's capacity has changed
@@ -511,7 +511,7 @@ stepOpen svc ops rid = do
           when finished $
             withOutcome (serviceStorage svc) ticket (\outcome → evaluate $! reactTo OwnerRunning JkOpen outcome) >>= \case
               Just (GotBacking backing _) → do
-                store ← evaluate (initialStore config aid ident (serviceStoreConfig svc))
+                store ← evaluate (initialStore config aid ident (openStore task))
                 atomically (setPhase task (OpenPublishable aid env shared backing store))
                 -- the open is staged: the host is told, and its commit installs the arena
                 opsStage ops rid Nothing (Revision (configFirstRevision config)) StagedControl

@@ -115,9 +115,10 @@ engineChunk graphics input terrain limit = Text.encodeUtf8 (Text.unlines (prelud
     inputMembers
       | input = ["    input = { poll = guard(input_poll), acknowledgeReset = guard(input_acknowledge_reset) },"]
       | otherwise = []
-    -- The terrain layout (TRA-5): present only when the composition injected terrain, and then the same in either role. Every
-    -- call but the optional pick of @remove@ takes exactly its declared arguments and passes them unchanged, so the host's arity
-    -- is the call's; @remove@ passes an omitted pick as an explicit nil, which is how the host counts it.
+    -- The terrain layout (TRA-5, TRA-23): present only when the composition injected terrain, and then the same in either role.
+    -- Every call but the optional options of @open@ and the optional pick of @remove@ takes exactly its declared arguments and
+    -- passes them unchanged, so the host's arity is the call's; @open@ and @remove@ pass an omitted last argument as an explicit
+    -- nil, which is how the host counts it.
     terrainLocals ∷ [Text]
     terrainLocals
       | terrain =
@@ -128,13 +129,23 @@ engineChunk graphics input terrain limit = Text.encodeUtf8 (Text.unlines (prelud
           , "local terrain_column_ops = { ready = E.ready_terrain_column, take = E.take_terrain_column, cancel = E.cancel_terrain_column, wait = E.wait_terrain_column }"
           , "local terrain_surface_ops = { ready = E.ready_terrain_surface, take = E.take_terrain_surface, cancel = E.cancel_terrain_surface, wait = E.wait_terrain_surface }"
           , "local terrain_remove_ops = { ready = E.ready_terrain_remove, take = E.take_terrain_remove, cancel = E.cancel_terrain_remove, wait = E.wait_terrain_remove }"
+          , "local terrain_status, terrain_grow_storage, terrain_retry_storage = E.terrain_status, E.terrain_grow_storage, E.terrain_retry_storage"
+          , "local terrain_status_ops = { ready = E.ready_terrain_status, take = E.take_terrain_status, cancel = E.cancel_terrain_status, wait = E.wait_terrain_status }"
+          , "local terrain_grow_ops = { ready = E.ready_terrain_grow, take = E.take_terrain_grow, cancel = E.cancel_terrain_grow, wait = E.wait_terrain_grow }"
+          , "local terrain_retry_ops = { ready = E.ready_terrain_retry, take = E.take_terrain_retry, cancel = E.cancel_terrain_retry, wait = E.wait_terrain_retry }"
           ]
       | otherwise = []
     terrainMembers ∷ [Text]
     terrainMembers
       | terrain =
           [ "    terrain = {"
-          , "      open = starter1(terrain_open, terrain_arena_ops),"
+          , "      open = function(...)"
+          , "        check(id)"
+          , "        local request, refusal"
+          , "        if select('#', ...) == 2 then request, refusal = terrain_open((...), (select(2, ...)), nil) else request, refusal = terrain_open(...) end"
+          , "        if request ~= nil then kinds[request] = terrain_arena_ops end"
+          , "        return request, refusal"
+          , "      end,"
           , "      attach = starter1(terrain_attach, terrain_arena_ops),"
           , "      cell = starter1(terrain_cell, terrain_cell_ops),"
           , "      column = starter1(terrain_column, terrain_column_ops),"
@@ -146,6 +157,9 @@ engineChunk graphics input terrain limit = Text.encodeUtf8 (Text.unlines (prelud
           , "        if request ~= nil then kinds[request] = terrain_remove_ops end"
           , "        return request, refusal"
           , "      end,"
+          , "      status = starter1(terrain_status, terrain_status_ops),"
+          , "      grow_storage = starter1(terrain_grow_storage, terrain_grow_ops),"
+          , "      retry_storage = starter1(terrain_retry_storage, terrain_retry_ops),"
           , "      release = guard(terrain_release),"
           , "    },"
           ]

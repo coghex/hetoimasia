@@ -51,6 +51,7 @@ module Hetoimasia.LuaEngine.Terrain
   , terrainLeaseCapacity
   , TerrainCompositionRefused (..)
   , terrainCodes
+  , terrainCodesFor
   , terrainFailureReply
     -- * Pick authorities (the seam TRA-10 fills)
   , TerrainPicks
@@ -67,7 +68,9 @@ import Control.Concurrent.STM
 import Control.Exception (Exception, finally, mask, mask_, onException, throwIO)
 import Control.Applicative ((<|>))
 import Control.Monad (forM_, unless, void, when)
+import Data.Functor ((<&>))
 import Data.Int (Int64)
+import Data.List (sortOn)
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
 import Data.Maybe (fromMaybe, isJust)
@@ -94,6 +97,11 @@ import Hetoimasia.LuaEngine.Facade
   , terrainColumnValueSchema
   , terrainPickType
   , terrainRemoveValueSchema
+  , terrainRetryValueSchema
+  , terrainGrowValueSchema
+  , terrainStatusValueSchema
+  , terrainStorageMinimum
+  , terrainStorageUnit
   , terrainSurfaceValueSchema
   )
 import Hetoimasia.LuaEngine.Profile (Count (Count), CountLimit (RequestsPerInstance), Profile, countLimit)
@@ -143,10 +151,17 @@ import Hetoimasia.LuaEngine.Terrain.Internal.Arbitration
 import Hetoimasia.Terrain.Runtime
   ( Answer (..)
   , ArenaLease
+  , ArenaStatus (..)
+  , Condition (..)
+  , DiscoveryState (..)
+  , GrowAnswer (..)
+  , OpenOptions (..)
+  , RetryAnswer (..)
+  , StorageState (..)
   , CellAnswer (..)
   , Client
   , ColumnAnswer (..)
-  , Config (configLimits, configMaxLeases, configQueryLimits, configSourceLimits)
+  , Config (configLimits, configMaxLeases, configQueryLimits, configSourceLimits, configStore)
   , Failure (..)
   , Precondition (..)
   , RemoveAnswer (..)
@@ -166,14 +181,17 @@ import Hetoimasia.Terrain.Runtime.Settlement
   , cancel
   , cellWith
   , columnWith
-  , openArenaWith
+  , growWith
+  , openArenaWithOptions
   , removeWith
+  , retryWith
   , releaseArenaLeaseSTM
   , retireSTM
   , surfaceWith
   )
 import Hetoimasia.Terrain.Shape (shapeIdValue)
 import Hetoimasia.Terrain.Source (CellSpec (..), LayerSpec (..), PatchSpec (..), SourceLimits (..), SourceSpec (..), defaultSourceLimits)
+import Hetoimasia.Terrain.Runtime.Store (StoreSpec (..), allowanceUnitBytes, minAllowanceBytes, mkStoreConfig)
 
 -- The composition -------------------------------------------------------------------------------------
 
@@ -271,6 +289,9 @@ newTerrainFacade profile svc = do
   case incompatibleLimits config of
     [] → pure ()
     over → throwIO (TerrainCompositionRefused ("the terrain service's configuration exceeds the limits Lua is promised: " <> Text.intercalate "; " over))
+  -- the allowance rules a script is promised are the service's own: its smallest allowance and its unit
+  unless (toInteger minAllowanceBytes == toInteger terrainStorageMinimum && toInteger allowanceUnitBytes == toInteger terrainStorageUnit) $
+    throwIO (TerrainCompositionRefused "the terrain service's allowance rules are not the 64 MiB minimum and the 1 MiB unit Lua is promised")
   picks ← newTerrainPicks
   claims ← newTVarIO Map.empty
   offered ← newTVarIO Map.empty
@@ -322,10 +343,46 @@ newtype SettlementRejected = SettlementRejected Text
 
 instance Exception SettlementRejected
 
--- | The expected failure codes the terrain requests supply (D-19 and the manager's two authorizations): the only codes a
--- terrain reply may carry. Any other outcome of the service is a defect of the host.
+-- | The expected failure codes the terrain requests supply (D-19, the manager's two authorizations, and TRA-23's seven storage
+-- codes): the only codes a terrain reply may carry. Any other outcome of the service is a defect of the host. Each endpoint declares
+-- the subset it can settle with ('terrainCodesFor').
 terrainCodes ∷ [Text]
-terrainCodes = ["not_found", "arena_closed", "stale_view", "definition", "source_failure", "too_large", "name_in_use"]
+terrainCodes =
+  [ "not_found"
+  , "arena_closed"
+  , "stale_view"
+  , "definition"
+  , "source_failure"
+  , "too_large"
+  , "name_in_use"
+  , "source_complexity"
+  , "storage_unsupported"
+  , "reservation_failed"
+  , "storage_full"
+  , "storage_io"
+  , "storage_integrity"
+  , "storage_size_not_increased"
+  ]
+
+-- | The expected codes of one terrain endpoint (by its name): the seven of TRA-5 for the calls that had them, and the storage codes
+-- the service's own classification ("Hetoimasia.Terrain.Runtime.Backed.Backend") can settle that command with. An open meets a
+-- complex source, an unsupported or unreservable file and an I/O failure of its open; a read meets the I/O and integrity failures of
+-- the pages it reads; a removal meets every pause (and settles at once with it while the arena holds); a growth meets its
+-- reservation's refusals, an I/O failure (its allocation, or the release of an earlier extra) and a smaller size; a retry meets the
+-- I/O failure of an extra's release (its probes' failures are recorded as pauses, never its settlement). An attach meets none, and a
+-- status, which the adapter settles itself, only its arena's closure. A storage code an endpoint does not declare is a defect there.
+terrainCodesFor ∷ Text → [Text]
+terrainCodesFor name
+  | name == openName = base <> ["source_complexity", "storage_unsupported", "reservation_failed", "storage_io"]
+  | name == attachName = base
+  | name == removeName = base <> ["storage_full", "storage_io", "storage_integrity"]
+  | name `elem` [cellName, columnName, surfaceName] = base <> ["storage_io", "storage_integrity"]
+  | name == statusName = ["arena_closed"]
+  | name == growName = ["arena_closed", "storage_unsupported", "reservation_failed", "storage_io", "storage_size_not_increased"]
+  | name == retryName = ["arena_closed", "storage_io"]
+  | otherwise = []
+  where
+    base = take 7 terrainCodes
 
 -- | The lease capacity one instance needs in the VM's shared scope for terrain: every lease the service can hold at once (its
 -- cap is service-wide, so one instance may hold them all, pending, live and retiring), the places its requests can reserve a
@@ -362,7 +419,11 @@ pickValue key = VCapability (capability terrainPickType key)
 
 -- | What the host's lease holds: the service's own lease, or nothing when the request that was to own it ended between the
 -- offer and the build (its offered lease was already released by this adapter).
-newtype TerrainResource = TerrainResource {resourceLease ∷ Maybe ArenaLease}
+data TerrainResource = TerrainResource
+  { resourceLease ∷ !(Maybe ArenaLease)
+  , resourceCreator ∷ !Bool
+  -- ^ Whether the lease is the arena's creator lease (built for an open), the only one with authority over its storage.
+  }
 
 -- | A request's offered lease: offered by the commit, built by the host (adopting) and published by the successful settlement
 -- (adopted), or disposed of by this adapter when the host withdrew its interest first. Cancellation authority is kept through every
@@ -398,18 +459,25 @@ data Link = Link
   -- the transaction that gives the request's credit back, when the service has recorded them.
   , lkId ∷ !Unique
   -- ^ The identity of this request's incarnation of the name it opens: what it holds in 'tfOffered', and all it ever lets go of.
+  , lkArena ∷ !(Maybe ArenaLease)
+  -- ^ The creator lease a growth or a retry names: its success reports the arena's storage state as its commit left it, read in the
+  -- transaction that settles it.
   }
 
 -- The per-VM state ----------------------------------------------------------------------------------------
 
 -- | One typed request, held between the binding's start and the service's hand-off.
 data Ask
-  = AskOpen !Client !Text !SourceSpec
+  = AskOpen !Client !Text !SourceSpec !OpenOptions
   | AskAttach !Client !Text
   | AskCell !ArenaLease !TileCoord
   | AskColumn !ArenaLease !Column !ZRange
   | AskSurface !ArenaLease !Column
   | AskRemove !ArenaLease !TileCoord !(Maybe Precondition)
+  | -- | A status: no work of the service, a coherent read of its own state, settled at the hand-off.
+    AskStatus !ArenaLease
+  | AskGrow !ArenaLease !Integer
+  | AskRetry !ArenaLease
 
 -- | An instance's two terrain clients. The service makes the lease of an attach by the arena's own creator an /owner/ lease, but
 -- an attach always yields a nonowner attachment (the lease of the open is the arena's only owner lease, and releasing it closes
@@ -464,10 +532,14 @@ services env =
     , tsEndpoints = endpoints
     , tsDeclare = declare env
     , tsForget = forget env
-    , tsOpenCheck = \_ _ _ _ owner values → permanent env (const openAsk) owner values
-    , tsOpenStart = \identity root name definition context → do
+    , tsOpenCheck = \_ _ _ _ bytes owner values →
+        firstRefusal
+          [ pure (bytes >>= openAllowanceRefusal env)
+          , permanent env (const openAsk) owner values
+          ]
+    , tsOpenStart = \identity root name definition bytes context → do
         client ← clientOf env identity
-        start env context openName openAsk (AskOpen client (nameKey env root name) (sourceSpec definition))
+        start env context openName openAsk (AskOpen client (nameKey env root name) (sourceSpec definition) (OpenOptions (toInteger <$> bytes)))
     , tsAttachCheck = \_ _ _ owner values → permanent env (const attachAsk) owner values
     , tsAttachStart = \identity root name context → do
         attachClientOf env identity >>= \case
@@ -514,7 +586,7 @@ services env =
     , tsRemoveCheck = \identity key cell pick owner values →
         firstRefusal
           [ pickCheck env identity pick
-          , leaseCheck env identity key readAsk owner values
+          , leaseCheck env identity key removeAsk owner values
           , answerCheck env terrainRemoveValueSchema LargestRemove owner values
           , pure (either Just (extentRefusal env . cellPlaces) (tileOf cell))
           ]
@@ -522,7 +594,27 @@ services env =
         precondition ← pickPrecondition env identity pick
         case precondition of
           Left why → pure (TerrainRefused why)
-          Right found → startOr cell (\tile → start env context removeName readAsk (AskRemove lease tile found))
+          Right found → startOr cell (\tile → start env context removeName removeAsk (AskRemove lease tile found))
+    , tsStatusCheck = \identity key owner values →
+        firstRefusal
+          [ leaseCheck env identity key statusAsk owner values
+          , statusFigureRefusal env key
+          , m1ReplyCheck (tvRequests (envVm env)) statusAsk terrainStatusValueSchema (largestReply env LargestStatus) owner values
+          ]
+    , tsStatusStart = \_ key context → withArena env key $ \lease → start env context statusName statusAsk (AskStatus lease)
+    , tsGrowCheck = \identity key bytes owner values →
+        firstRefusal
+          [ creatorCheck env identity key growAsk "grow its storage" owner values
+          , pure (growAllowanceRefusal env bytes)
+          , m1ReplyCheck (tvRequests (envVm env)) growAsk terrainGrowValueSchema (largestReply env LargestGrow) owner values
+          ]
+    , tsGrowStart = \_ key bytes context → withArena env key $ \lease → start env context growName growAsk (AskGrow lease (toInteger bytes))
+    , tsRetryCheck = \identity key owner values →
+        firstRefusal
+          [ creatorCheck env identity key retryAsk "retry its storage" owner values
+          , m1ReplyCheck (tvRequests (envVm env)) retryAsk terrainRetryValueSchema (largestReply env LargestRetry) owner values
+          ]
+    , tsRetryStart = \_ key context → withArena env key $ \lease → start env context retryName retryAsk (AskRetry lease)
     , tsReleaseCheck = releaseCheck env
     , tsRelease = \key → releaseWord <$> releaseLease leases key
     , tsIssued = \identity key → atomically (modifyTVar' (envIssued env) (Map.insertWith Set.union identity (Set.singleton key)))
@@ -543,6 +635,9 @@ services env =
       , endpoint env columnName terrainColumnValueSchema
       , endpoint env surfaceName terrainSurfaceValueSchema
       , endpoint env removeName terrainRemoveValueSchema
+      , endpoint env statusName terrainStatusValueSchema
+      , endpoint env growName terrainGrowValueSchema
+      , endpoint env retryName terrainRetryValueSchema
       ]
     releaseWord = \case
       Released → "done"
@@ -550,13 +645,16 @@ services env =
       AlreadyReleased → "already_released"
 
 -- | The endpoint names of the requests.
-openName, attachName, cellName, columnName, surfaceName, removeName ∷ Text
+openName, attachName, cellName, columnName, surfaceName, removeName, statusName, growName, retryName ∷ Text
 openName = "terrain_open"
 attachName = "terrain_attach"
 cellName = "terrain_cell"
 columnName = "terrain_column"
 surfaceName = "terrain_surface"
 removeName = "terrain_remove"
+statusName = "terrain_status"
+growName = "terrain_grow_storage"
+retryName = "terrain_retry_storage"
 
 -- Declaring ---------------------------------------------------------------------------------------------------
 
@@ -621,15 +719,20 @@ drainRetired env = atomically (pruneClaims (names (envFacade env)) >> pruneFaile
 
 -- The asks ------------------------------------------------------------------------------------------------------
 
-openAsk, attachAsk, readAsk ∷ M1Ask
-openAsk = leaseAsk "terrain open"
-attachAsk = leaseAsk "terrain attach"
-readAsk = (m1Ask OptionalRequest "terrain read") {askCodes = terrainCodes}
+-- | Each request's ask, declaring exactly the expected codes its endpoint can settle with ('terrainCodesFor').
+openAsk, attachAsk, readAsk, removeAsk, statusAsk, growAsk, retryAsk ∷ M1Ask
+openAsk = leaseAsk "terrain open" (terrainCodesFor openName)
+attachAsk = leaseAsk "terrain attach" (terrainCodesFor attachName)
+readAsk = (m1Ask OptionalRequest "terrain read") {askCodes = terrainCodesFor cellName}
+removeAsk = (m1Ask OptionalRequest "terrain removal") {askCodes = terrainCodesFor removeName}
+statusAsk = (m1Ask OptionalRequest "terrain status") {askCodes = terrainCodesFor statusName}
+growAsk = (m1Ask OptionalRequest "terrain storage growth") {askCodes = terrainCodesFor growName}
+retryAsk = (m1Ask OptionalRequest "terrain storage retry") {askCodes = terrainCodesFor retryName}
 
-leaseAsk ∷ Text → M1Ask
-leaseAsk source =
+leaseAsk ∷ Text → [Text] → M1Ask
+leaseAsk source codes =
   (m1Ask OptionalRequest source)
-    { askCodes = terrainCodes
+    { askCodes = codes
     , askLease = Just (InstanceOwned, \_ key → VCapability (capability terrainArenaType key))
     }
 
@@ -640,7 +743,7 @@ firstRefusal = \case
   decide : more → decide >>= maybe (firstRefusal more) (pure . Just)
 
 -- | The shape of the largest answer a call can have.
-data Largest = LargestCell | LargestColumn !Int | LargestSurface | LargestRemove
+data Largest = LargestCell | LargestColumn !Int | LargestSurface | LargestRemove | LargestStatus | LargestGrow | LargestRetry
 
 -- | The levels a column ask spans.
 levelsOf ∷ TerrainColumnAsk → Int
@@ -718,6 +821,63 @@ leaseCheck env identity key ask owner values = do
         key
         (\why → pure (Just why))
         (\(_ ∷ TerrainResource) → permanent env (const ask) owner values)
+
+-- | A creator command's check: the handle is the caller's own, it is the arena's creator lease (an attachment, the creator's own
+-- included, has no authority over the arena's storage), and the host's own permanent facts follow. Decided before any bank, so a
+-- full request bank never hides it.
+creatorCheck ∷ Env → Text → Word64 → M1Ask → Text → ArgumentCheck
+creatorCheck env identity key ask what owner values = do
+  mine ← ownedBy env identity key
+  if not mine
+    then pure (Just "the arena belongs to another instance")
+    else
+      withLeaseOr
+        (tvLeases (envVm env))
+        key
+        (\why → pure (Just why))
+        ( \resource →
+            if resourceCreator resource
+              then permanent env (const ask) owner values
+              else pure (Just ("only the arena's creator lease may " <> what))
+        )
+
+-- | The largest allowance a script may name: the service's offset domain and the VM's integer ceiling, whichever is smaller,
+-- rounded down to a whole number of MiB. A larger one could never be granted or reported, so it is refused before any work.
+largestAllowance ∷ Env → Integer
+largestAllowance env = (bound `div` unit) * unit
+  where
+    unit = toInteger terrainStorageUnit
+    bound = minimum [specOffsetLimit (configStore (tfConfig (envFacade env))), toInteger (tvIntegerCeiling (envVm env)), toInteger (maxBound ∷ Int64)]
+
+-- | Whether an open's allowance is refused: past the largest a script may name, or refused by the service's own rule for an
+-- arena's store with its other figures ('mkStoreConfig', the rule the service applies at the open). Never busy.
+openAllowanceRefusal ∷ Env → Int64 → Maybe Text
+openAllowanceRefusal env bytes
+  | toInteger bytes > largestAllowance env = Just ("storage_bytes is above the largest allowance this service can grant (" <> Text.pack (show (largestAllowance env)) <> ")")
+  | otherwise = case mkStoreConfig (configStore (tfConfig (envFacade env))) {specAllowanceBytes = toInteger bytes} of
+      Left err → Just (Text.take 200 ("storage_bytes can never be granted: " <> Text.pack (show err)))
+      Right _ → Nothing
+
+-- | Whether a status is refused because its byte figures are predictably not Lua integers for this VM: the arena's allowance and a
+-- pending extra bound every byte figure, and above the VM's integer ceiling they could never be handed to the script. Decided before
+-- any bank. (A revision or a count above the ceiling is not predictable: it is a host defect, as for every terrain answer.)
+statusFigureRefusal ∷ Env → Word64 → IO (Maybe Text)
+statusFigureRefusal env key =
+  withLeaseOr (tvLeases (envVm env)) key (\_ → pure Nothing) $ \resource → case resourceLease resource of
+    Nothing → pure Nothing
+    Just lease →
+      Terrain.arenaStatus (service env) lease <&> \case
+        Right status
+          | toInteger (statusReservedBytes status) + toInteger (statusPendingReservedBytes status) > toInteger (tvIntegerCeiling (envVm env)) →
+              Just "the arena's allowance is above the largest integer this VM hands a script"
+        _ → Nothing
+
+-- | Whether a growth's allowance is refused: past the largest a script may name. Whether it is larger than the arena's current
+-- allowance is decided by the service when the growth executes (@storage_size_not_increased@), never here.
+growAllowanceRefusal ∷ Env → Int64 → Maybe Text
+growAllowanceRefusal env bytes
+  | toInteger bytes > largestAllowance env = Just ("new_bytes is above the largest allowance this service can grant (" <> Text.pack (show (largestAllowance env)) <> ")")
+  | otherwise = Nothing
 
 -- | Whether this instance was issued this handle.
 ownedBy ∷ Env → Text → Word64 → IO Bool
@@ -812,12 +972,116 @@ failureReply = \case
   NameInUse → expected "name_in_use" "an arena of this name is open or being opened in this content root"
   Superseded why → ProviderFailure ("terrain: a request was overtaken and cannot be admitted again: " <> Text.take 200 why)
   HostFailure why → ProviderFailure ("terrain: " <> Text.take 200 why)
-  -- INTERIM until TRA-23 maps them: the typed storage outcomes (and source_complexity) have no declared Lua code, so they
-  -- take the contract's existing path for an outcome the service never declared, a defect of the host. 'terrainCodes' is
-  -- unchanged, and none is ever presented as success, busy, another code or air.
-  StorageFailed fault → ProviderFailure ("terrain: a storage outcome with no Lua code before TRA-23: " <> Terrain.faultCode fault)
+  -- The typed storage outcomes (TRA-23): each is its service's stable code with a fixed message. The fault's own detail (pages,
+  -- offsets, operations, figures) is the service's diagnostics and never reaches a script; a code the contract does not declare
+  -- is a defect, as for any other outcome.
+  StorageFailed fault → case Terrain.faultCode fault of
+    code
+      | code `elem` terrainCodes → expected code (storageMessage code)
+      | otherwise → ProviderFailure ("terrain: an undeclared storage outcome: " <> Text.take 100 code)
   where
     expected code message = ProviderExpected (ExpectedFailure code message Nothing Nothing)
+
+-- | The fixed message of each storage code.
+storageMessage ∷ Text → Text
+storageMessage = \case
+  "source_complexity" → "the definition is valid but too complex to prepare within the arena's bounds"
+  "storage_unsupported" → "the arena's storage is not supported where the engine keeps it"
+  "reservation_failed" → "the arena's storage could not be reserved"
+  "storage_full" → "the arena's allowance cannot take this change: the arena is paused until it grows or a retry finds room"
+  "storage_io" → "the arena's storage failed to read or write: the arena is paused until a retry succeeds"
+  "storage_integrity" → "the arena's stored history did not read back intact: the arena is paused until a retry succeeds"
+  "storage_size_not_increased" → "the allowance asked for is smaller than the one committed; storage never shrinks"
+  _ → "the arena's storage refused the request"
+
+-- | The code of a pause condition.
+conditionCode ∷ Condition → Text
+conditionCode = \case
+  CondIntegrity → "storage_integrity"
+  CondIo → "storage_io"
+  CondCapacity → "storage_full"
+
+-- | Conditions in the order of their severity, the most severe first: integrity, then I/O, then capacity. A status's @reason@ is
+-- the first; a retry's lists are in this order.
+bySeverity ∷ [Condition] → [Condition]
+bySeverity = sortOn rank
+  where
+    rank = \case
+      CondIntegrity → 0 ∷ Int
+      CondIo → 1
+      CondCapacity → 2
+
+-- | The @state@ and, while paused, the @reason@ of an arena's storage.
+storageFields ∷ StorageState → Maybe [(Text, Value)]
+storageFields = \case
+  StorageReady → Just [("state", VText "ready")]
+  StoragePaused conds → case bySeverity conds of
+    worst : _ → Just [("state", VText "paused"), ("reason", VText (conditionCode worst))]
+    [] → Nothing
+
+discoveryText ∷ DiscoveryState → Text
+discoveryText = \case
+  DiscoveryIdle → "idle"
+  DiscoveryPending → "pending"
+  DiscoveryPaused → "paused"
+
+-- | A figure as a Lua integer, when it is one: within the VM's profile ceiling and Int64.
+figureOf ∷ Word64 → Word64 → Maybe Value
+figureOf ceiling' w
+  | w <= min ceiling' (fromIntegral (maxBound ∷ Int64)) = Just (VInteger (fromIntegral w))
+  | otherwise = Nothing
+
+-- | A status as the reply the host takes: a fresh record of copied integers and text, or a defect when one of its figures is not a
+-- Lua integer (composition bounds every byte figure by an allowance at most the VM's ceiling, so that is impossible after a valid
+-- admission).
+statusReply ∷ Word64 → ArenaStatus → ProviderReply
+statusReply ceiling' status = maybe (ProviderFailure "terrain: a status figure is not a Lua integer") ProviderResult $ do
+  storage ← storageFields (statusStorage status)
+  bytes ←
+    traverse
+      (\(field, w) → (,) field <$> figureOf ceiling' w)
+      [ ("reserved_bytes", statusReservedBytes status)
+      , ("used_bytes", statusUsedBytes status)
+      , ("pending_reclaim_bytes", statusPendingReclaimBytes status)
+      , ("pending_reserved_bytes", statusPendingReservedBytes status)
+      ]
+  items ← figureOf ceiling' (statusPendingItems status)
+  content ← revisionValue (statusContentRevision status)
+  knowledge ← revisionValue (statusKnowledgeRevision status)
+  Just
+    ( VRecord
+        [ ("storage", VRecord (storage <> bytes))
+        , ("discovery", VRecord [("state", VText (discoveryText (statusDiscovery status))), ("pending_items", items)])
+        , ("content_revision", content)
+        , ("knowledge_revision", knowledge)
+        ]
+    )
+  where
+    revisionValue (Revision w) = figureOf ceiling' w
+
+-- | A growth's success: whether it changed the allowance, the allowance committed now, and the storage state its commit left.
+growReply ∷ Word64 → GrowAnswer → ArenaStatus → ProviderReply
+growReply ceiling' grown status = maybe (ProviderFailure "terrain: a growth's figures are not Lua integers") ProviderResult $ do
+  storage ← storageFields (statusStorage status)
+  reserved ← figureOf ceiling' (grownAllowance grown)
+  Just (VRecord [("changed", VBoolean (grownChanged grown)), ("reserved_bytes", reserved), ("storage", VRecord storage)])
+
+-- | A retry's success: what it cleared, what remains and what no retry can clear, and the states its commit left.
+retryReply ∷ Word64 → RetryAnswer → ArenaStatus → ProviderReply
+retryReply _ retried status = maybe (ProviderFailure "terrain: a retry's storage state is not one Lua is promised") ProviderResult $ do
+  storage ← storageFields (statusStorage status)
+  Just
+    ( VRecord
+        [ ("changed", VBoolean (not (null (retriedCleared retried))))
+        , ("cleared", codes (retriedCleared retried))
+        , ("remaining", codes (retriedRemaining retried))
+        , ("until_closed", codes (retriedUntilClosed retried))
+        , ("storage", VRecord storage)
+        , ("discovery", VRecord [("state", VText (discoveryText (statusDiscovery status)))])
+        ]
+    )
+  where
+    codes = VList . map (VText . conditionCode) . bySeverity
 
 -- | The expected failure of a lease whose arena has closed.
 closedFailure ∷ ExpectedFailure
@@ -858,8 +1122,8 @@ answerReply ceiling' = \case
         ]
   ARemoved answer → withRevision (removeRevision answer) $ \revision → VRecord [("changed", VBoolean (removeChangedFlag answer)), ("revision", VInteger revision)]
   AOpened _ → ProviderFailure "terrain: a lease answer reached the value conversion"
-  AGrown _ → ProviderFailure "terrain: a creator's growth answer reached the value conversion (no Lua schema before TRA-23)"
-  ARetried _ → ProviderFailure "terrain: a creator's retry answer reached the value conversion (no Lua schema before TRA-23)"
+  AGrown _ → ProviderFailure "terrain: a growth answer reached the value conversion without its arena's status"
+  ARetried _ → ProviderFailure "terrain: a retry answer reached the value conversion without its arena's status"
   AKnowledge _ → ProviderFailure "terrain: a knowledge answer reached the value conversion (no Lua schema in this slice)"
   ARegions _ → ProviderFailure "terrain: a regional snapshot reached the value conversion (no Lua schema in this slice)"
   AAttached _ → ProviderFailure "terrain: a lease answer reached the value conversion"
@@ -892,16 +1156,42 @@ submit env submission = mask_ $ do
   forM_ (worstReply env (pdAsk found)) $ \reply →
     unless (settlingJudge settling reply) $
       throwIO (DeclinedRefused "the VM's copied-value limits cannot carry the answer of this call: narrow the range")
+  case pdAsk found of
+    AskStatus lease → submitStatus env settling lease
+    _ → submitToService env submission found settling
+
+-- | A status is no work of the service's: one coherent read of the arena's own state, in one transaction, settled at the hand-off
+-- (on logical time the host holds it for the request's position, as it holds any answer). It reserves nothing of the service, does
+-- not discover terrain and clears no pause. A lease whose arena has closed since the check settles @arena_closed@.
+submitStatus ∷ Env → Settling → ArenaLease → IO ProviderWork
+submitStatus env settling lease = do
+  atomically $ do
+    reply ←
+      Terrain.inspectArenaSTM (service env) lease >>= \case
+        Nothing → pure (ProviderExpected closedFailure)
+        Just _ →
+          Terrain.arenaStatusSTM (service env) lease <&> \case
+            Right status → statusReply (tvIntegerCeiling (envVm env)) status
+            -- the lease is this adapter's own, so its only refusal is that its arena has ended
+            Left RefusedAuthority → ProviderExpected closedFailure
+            Left other → ProviderFailure ("terrain: a status was refused: " <> Text.take 200 (Text.pack (show other)))
+    void (settlingSettle settling reply)
+  pure ProviderWork {workCancel = pure (), workRetirement = pure ProviderComplete}
+
+-- | Hand a request that is the service's work to it.
+submitToService ∷ Env → Submission → Pending → Settling → IO ProviderWork
+submitToService env submission found settling = do
   link ←
     Link
       (case pdAsk found of AskAttach _ name → Just name; _ → Nothing)
-      (case pdAsk found of AskOpen _ name _ → Just name; _ → Nothing)
+      (case pdAsk found of AskOpen _ name _ _ → Just name; _ → Nothing)
       settling
       <$> newTVarIO NoLease
       <*> newTVarIO False
       <*> pure (submissionSettled submission)
       <*> pure (pdDropped found)
       <*> newUnique
+      <*> pure (case pdAsk found of AskGrow lease _ → Just lease; AskRetry lease → Just lease; _ → Nothing)
   noted ← newTVarIO False
   let -- What decides a commit, read in the transaction that makes it: the session still takes new work, the request is still
       -- waiting (and its tick granted, on logical time), and a read or removal does not need a revision no Lua integer holds.
@@ -913,6 +1203,9 @@ submit env submission = mask_ $ do
           else case pdAsk found of
             AskAttach {} → pure True
             AskOpen {} → pure True
+            -- a growth or a retry hands no revision to Lua
+            AskGrow {} → pure True
+            AskRetry {} → pure True
             _ → fromMaybe False <$> representableNow
       -- Whether the revision this request will hand to Lua is one a Lua integer holds, from the arena as the service has it. A read hands
       -- the arena's revision; a removal hands the next one when it changes content and the same one when it removes air, which only the
@@ -955,18 +1248,22 @@ submit env submission = mask_ $ do
           , endpointSettle = settleInto env link
           }
   let admitAsk = case pdAsk found of
-        AskOpen client name spec → openArenaWith (service env) ep client name spec
+        AskOpen client name spec options → openArenaWithOptions (service env) ep client name spec options
         AskAttach client name → attachArenaWith (service env) ep client name
         AskCell lease tile → cellWith (service env) ep lease tile
         AskColumn lease column range → columnWith (service env) ep lease column range
         AskSurface lease column → surfaceWith (service env) ep lease column
         AskRemove lease tile precondition → removeWith (service env) ep lease tile precondition
+        AskGrow lease bytes → growWith (service env) ep lease bytes
+        AskRetry lease → retryWith (service env) ep lease
+        -- settled at the hand-off ('submitStatus'), never the service's
+        AskStatus _ → throwIO (TerrainCompositionRefused "a status reached the service's admission")
       -- What follows the service's admission of a request: the host's record of it, and for an open the claim of its name, which is found
       -- stale if the host settles the open as cancelled before the service is told.
       afterAdmission request = do
         atomically (writeTVar (pdRequest found) (Just request) >> note)
         case pdAsk found of
-          AskOpen _ name _ →
+          AskOpen _ name _ _ →
             atomically (registerClaim (names (envFacade env)) name (Claim (stale link (submissionSettled submission)) (done link) (tellCancelled env link request)))
           _ → pure ()
         hookSubmitted (hooks env)
@@ -978,7 +1275,7 @@ submit env submission = mask_ $ do
   -- the registration of the open's claim are one critical section of the facade's opens, so no open is admitted between another's
   -- consultation and its registration, whatever the VM. (A non-Lua client opening names on the same service directly is outside it.)
   outcome ← case pdAsk found of
-    AskOpen _ name _ → arbitrateOpen (names (envFacade env)) (arbitrationHooks (envFacade env)) name admitted
+    AskOpen _ name _ _ → arbitrateOpen (names (envFacade env)) (arbitrationHooks (envFacade env)) name admitted
     _ → do
       hookSubmitting (hooks env)
       Just <$> admitted
@@ -1007,7 +1304,30 @@ largestReply env = \case
      in ProviderResult (VRecord [("revision", greatest), ("runs", VList (replicate runs (VRecord ([("z_min", greatest), ("z_max", greatest)] <> solid))))])
   LargestSurface → ProviderResult (VRecord [("revision", greatest), ("occupied", VBoolean True), ("z", greatest), ("material", longest), ("shape", greatest)])
   LargestRemove → ProviderResult (VRecord [("changed", VBoolean True), ("revision", greatest)])
+  LargestStatus →
+    ProviderResult
+      ( VRecord
+          [ ("storage", VRecord (pausedFields <> [(field, greatest) | field ← ["reserved_bytes", "used_bytes", "pending_reclaim_bytes", "pending_reserved_bytes"]]))
+          , ("discovery", VRecord [("state", VText "pending"), ("pending_items", greatest)])
+          , ("content_revision", greatest)
+          , ("knowledge_revision", greatest)
+          ]
+      )
+  LargestGrow → ProviderResult (VRecord [("changed", VBoolean True), ("reserved_bytes", greatest), ("storage", VRecord pausedFields)])
+  LargestRetry →
+    ProviderResult
+      ( VRecord
+          [ ("changed", VBoolean True)
+          , ("cleared", every)
+          , ("remaining", every)
+          , ("until_closed", every)
+          , ("storage", VRecord pausedFields)
+          , ("discovery", VRecord [("state", VText "pending")])
+          ]
+      )
   where
+    pausedFields = [("state", VText "paused"), ("reason", VText "storage_integrity")]
+    every = VList [VText (conditionCode c) | c ← [minBound .. maxBound]]
     greatest = VInteger maxBound
     longest = VText (Text.replicate maxMaterialIdBytes "m")
     solid = [("air", VBoolean False), ("material", longest), ("shape", greatest)]
@@ -1020,6 +1340,9 @@ worstReply env = \case
   AskColumn _ _ range → Just (largestReply env (LargestColumn (fromIntegral (toInteger (zRangeHi range) - toInteger (zRangeLo range)))))
   AskSurface {} → Just (largestReply env LargestSurface)
   AskRemove {} → Just (largestReply env LargestRemove)
+  AskStatus {} → Just (largestReply env LargestStatus)
+  AskGrow {} → Just (largestReply env LargestGrow)
+  AskRetry {} → Just (largestReply env LargestRetry)
   _ → Nothing
 
 -- | The host has settled the request without the service's telling, and the offered lease (if any) was not adopted.
@@ -1084,6 +1407,8 @@ settleInto env link = \case
           _ ← settlingSettle (lkSettling link) (failureReply NotFound)
           writeTVar (lkTerminal link) True
         else offer lease
+    AGrown grown → creatorSettled (\status → growReply ceiling' grown status)
+    ARetried retried → creatorSettled (\status → retryReply ceiling' retried status)
     other → do
       settled ← settlingSettle (lkSettling link) (answerReply (tvIntegerCeiling (envVm env)) other)
       -- A reply the host rejects abandons the very transaction that is committing a change: nothing of it is written. The prechecks
@@ -1092,9 +1417,18 @@ settleInto env link = \case
       when (isRemoved other && settled `elem` [ReplyDefective, ReplyRefusedValue]) (throwSTM (SettlementRejected (Text.pack (show settled))))
       writeTVar (lkTerminal link) True
   where
+    ceiling' = tvIntegerCeiling (envVm env)
     isRemoved = \case
       ARemoved _ → True
       _ → False
+    -- A growth's or a retry's success, with the arena's storage state as its commit left it: the service settles it last in the
+    -- transaction that commits it, so the status read here is the committed one. A reply the host rejects would abandon that commit:
+    -- the prechecks ('worstReply') make it unreachable, so it is this adapter's defect, as for a removal.
+    creatorSettled build = do
+      found ← maybe (pure Nothing) (fmap (either (const Nothing) Just) . Terrain.arenaStatusSTM (service env)) (lkArena link)
+      settled ← settlingSettle (lkSettling link) (maybe (ProviderFailure "terrain: a creator command's arena has no status at its commit") build found)
+      when (settled `elem` [ReplyDefective, ReplyRefusedValue]) (throwSTM (SettlementRejected (Text.pack (show settled))))
+      writeTVar (lkTerminal link) True
     -- The service's lease is offered to the request, and the host is told it is a resource reply: it builds the lease at its next
     -- boundary and settles then. Whatever the host answers, the lease stays offered until it is adopted or disposed of.
     offer lease = do
@@ -1130,13 +1464,14 @@ adoptionFor env link =
           hookAdopting (hooks env)
           built ← atomically $
             readTVar (lkLease link) >>= \case
-              Offered lease → TerrainResource (Just lease) <$ writeTVar (lkLease link) (Adopting lease)
-              _ → pure (TerrainResource Nothing)
+              Offered lease → TerrainResource (Just lease) creator <$ writeTVar (lkLease link) (Adopting lease)
+              _ → pure (TerrainResource Nothing creator)
           hookAdopted (hooks env)
           pure built
       )
       releaseResource
   where
+    creator = isJust (lkName link)
     -- The service's lease is released through its non-waiting release: the creator's final owner lease closes the arena, an
     -- attachment ends its client's interest only. It waits for no borrower and for nothing of the owner.
     releaseResource resource = forM_ (resourceLease resource) $ \lease → do
