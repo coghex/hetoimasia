@@ -110,6 +110,7 @@ faultSteps =
     , Step "integrity" "TEST_WAIT('integrity') return api.terrain.cell(A, {x = 3, y = 4, z = -2})" "return 'ok'"
     , Step "integrity unread" "TEST_WAIT('integrity again') api.terrain.cell(A, {x = 3, y = 4, z = -3}) return nil" "return 'ok'"
     , Step "status both" "TEST_WAIT('both settled') return api.terrain.status(A)" "return brief(v)"
+    , Step "grow while paused" "return api.terrain.grow_storage(A, 96 * MIB)" "return tostring(v.changed) .. ' ' .. v.reserved_bytes .. ' ' .. v.storage.state .. ' ' .. tostring(v.storage.reason)"
     , Step "retry persistent" "TEST_WAIT('persist') return api.terrain.retry_storage(A)" "return tostring(v.changed) .. ' ' .. codes(v.cleared) .. ' ' .. codes(v.remaining) .. ' ' .. v.storage.state .. ' ' .. tostring(v.storage.reason)"
     , Step "retry integrity" "TEST_WAIT('heal') return api.terrain.retry_storage(A)" "return tostring(v.changed) .. ' ' .. codes(v.cleared) .. ' ' .. codes(v.remaining) .. ' ' .. v.storage.state .. ' ' .. tostring(v.storage.reason)"
     , Step "retry io" "return api.terrain.retry_storage(A)" "return tostring(v.changed) .. ' ' .. codes(v.cleared) .. ' ' .. codes(v.remaining) .. ' ' .. v.storage.state .. ' ' .. tostring(v.storage.reason)"
@@ -132,6 +133,7 @@ faultExpected =
   , "status io\tsuccess\tpaused storage_io idle"
   , "integrity\tfailure\tstorage_integrity"
   , "status both\tsuccess\tpaused storage_integrity idle"
+  , "grow while paused\tsuccess\ttrue 100663296 paused storage_integrity"
   , "retry persistent\tsuccess\tfalse {} {storage_integrity,storage_io} paused storage_integrity"
   , "retry integrity\tsuccess\ttrue {storage_integrity} {storage_io} paused storage_io"
   , "retry io\tsuccess\ttrue {storage_io} {} ready nil"
@@ -180,7 +182,10 @@ fullScript =
         , "  if t then print('refused cell', t.value.air) self.q = api.terrain.remove(self.a, {x = 9, y = 9, z = -2}) self.s = 8 end"
         , "elseif self.s == 8 then"
         , "  local t = settle(api, self.q)"
-        , "  if t then print('resumed', t.status, t.value.changed) print('committed before the pause', self.n > 0) print('done') self.s = 9 end"
+        , "  if t then print('resumed', t.status, t.value.changed) print('committed before the pause', self.n > 0) TEST_WAIT('end') self.q = api.terrain.status(self.a) self.s = 9 end"
+        , "elseif self.s == 9 then"
+        , "  local t = settle(api, self.q)"
+        , "  if t then print('final', t.value.storage.state, t.value.discovery.state, t.value.discovery.pending_items) print('done') self.s = 10 end"
         , "end"
         ]
     }
@@ -273,6 +278,7 @@ outcomesSpec = describe "Terrain storage outcomes" $ do
             -- the pin goes, and growth clears the capacity pause
             openHeld held
             atWait rig world go "unpin" (endClient svc observer)
+          atWait rig world go "end" (pure ())
           driveUntil world go (elem "done" <$> outLines world)
           printed ← outLines world
           -- discovery is paused with the storage exactly when it has obligations left, and idle otherwise
@@ -286,6 +292,7 @@ outcomesSpec = describe "Terrain storage outcomes" $ do
                        , "refused cell\tfalse"
                        , "resumed\tsuccess\ttrue"
                        , "committed before the pause\ttrue"
+                       , "final\tready\tidle\t0"
                        , "done"
                        ]
 
