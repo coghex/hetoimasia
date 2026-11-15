@@ -107,16 +107,18 @@ spec = describe "The backed terrain service" $ do
         _ ← removeCell' svc lease (tile 3 4 5)
         waitFor (backedQuiescentSTM svc >>= check)
         gate ← H.addGateOnce probe isRead
-        readRequest ← okOf (cellAt svc lease (tile 3 4 6))
-        H.awaitReached gate 1
-        -- (b) a read of the backend is held at the seam: backed work is outstanding
-        atomically (backedAtRestSTM svc) `shouldReturn` False
-        atomically (backedQuiescentSTM svc) `shouldReturn` False
-        H.openGate gate
-        _ ← await svc readRequest >>= expectSuccess
-        waitFor (backedQuiescentSTM svc >>= check)
-        atomically (backedAtRestSTM svc) `shouldReturn` True
-        inspectBacked svc `shouldReturn` []
+        -- every exit lets the read go: a failing assertion below must not leave the scope's drain waiting for the held job
+        flip finally (H.openGate gate) $ do
+          readRequest ← okOf (cellAt svc lease (tile 3 4 6))
+          H.awaitReached gate 1
+          -- (b) a read of the backend is held at the seam: backed work is outstanding
+          atomically (backedAtRestSTM svc) `shouldReturn` False
+          atomically (backedQuiescentSTM svc) `shouldReturn` False
+          H.openGate gate
+          _ ← await svc readRequest >>= expectSuccess
+          waitFor (backedQuiescentSTM svc >>= check)
+          atomically (backedAtRestSTM svc) `shouldReturn` True
+          inspectBacked svc `shouldReturn` []
 
   it "refuses at construction an edit bank that cannot fund one read beside the worst transaction and every reader pin (a circular wait), and accepts one byte more" $ do
     let atMinimum = toInteger (ramDecodedCopies A.worstTransactionCharge) + 2 * toInteger A.readerPinnedCacheBytes
