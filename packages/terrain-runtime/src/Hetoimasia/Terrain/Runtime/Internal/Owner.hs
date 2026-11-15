@@ -897,10 +897,14 @@ stageFromRuns svc rid runs revision = do
                 Just (Right (Left why)) → atomically (terminate svc rid (Failed (HostFailure (Text.pack ("preparation refused: " <> why)))))
                 Just (Right (Right prepared)) → void $ stage svc rid (Just aid) revision (StagedRemoval prepared)
             -- A SURFACE IS ANSWERED ONLY ON WHAT WAS READ: the highest solid cell is found inside the window
-            -- the gather read (nothing above it is occupied: 'surfaceKnown'), or THE WINDOW SLIDES: the next
-            -- read is the window below this one, twice as deep and at most 'limitRangeLevels', and keeps
-            -- nothing of this one (cells below what was read look untouched, so an answer below them is not
-            -- yet known; a run reaching up from below is found again by the next read's floor)
+            -- the gather read (nothing above it is occupied: 'surfaceKnown'), or THE WINDOW MOVES DOWN: the
+            -- next read is a window twice as deep, at most 'limitRangeLevels', and keeps nothing of this one.
+            -- IT ENDS AT THE NEXT POSSIBLE OCCUPIED LEVEL: 'found' is then the source's highest occupied cell
+            -- below the window (cells below what was read look untouched), so every level from found + 1 up to
+            -- the window's floor is unoccupied in the source, and a change only removes: the next window ends
+            -- at found + 1 (or at the floor, if nearer), and the removals at 'found' are read by it (a run
+            -- reaching up from below is found again by its floor). So the reads grow with the removed
+            -- occupied cells met, never with the width of an empty gap.
             CSurface column
               | Just (lo, _) ← window
               , Just found ← Q.highestOccupied source changes column
@@ -909,8 +913,9 @@ stageFromRuns svc rid runs revision = do
                   atomically $ modifySt svc $ \s → case (Map.lookup rid (stateRequests s), surfaceWindow s source column) of
                     (Just q, Just (lo', hi')) | (case reqPhase q of Done → False; _ → True) →
                       let deeper = max 1 (min (fromIntegral (Q.limitRangeLevels (configQueryLimits config))) (2 * (hi' - lo')))
+                          top = min lo' (axisValue (Q.occupiedLevel found) + 1)
                        in s
-                            { stateSurfaceWindow = Map.insert rid (lo' - deeper, lo') (stateSurfaceWindow s)
+                            { stateSurfaceWindow = Map.insert rid (top - deeper, top) (stateSurfaceWindow s)
                             , stateRequests = Map.adjust (\q' → q' {reqPhase = Waiting}) rid (stateRequests s)
                             }
                     _ → s

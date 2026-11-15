@@ -120,6 +120,31 @@ spec = describe "What a request keeps of a column" $ do
       [cap | (_, _, _, cap, _) ← read'] `shouldSatisfy` all (== 5)
       mapM_ (\(_, pin, _, cap, levels) → contained pin cap (length levels)) read'
 
+  -- stone at level 0 of every column, and in column (4, 4) solid patches far above it, removed: the
+  -- surface reads down to 0 across the empty gap below them
+  it "answers a surface across an empty gap below removed cells in as many reads whatever the gap's width, and goes on below a removed cell the gap ends at" $ do
+    let readsFor patches = do
+          windows ← newTVarIO []
+          let source = layered [(Just 0, Just 1, "stone", 0)] [PatchSpec 4 4 z (z + 1) (SpecSolid "stone" 0) | z ← patches]
+          withServiceUsing defaultConfig alwaysAdmitting (recordWindows windows) $ \svc → do
+            client ← okOf (registerClient svc)
+            lease ← okOf (openArena svc client "far" source) >>= await svc >>= expectSuccess
+            mapM_ (\z → removeCell' svc lease (tile 4 4 z)) patches
+            atomically (writeTVar windows [])
+            answer ← okOf (surfaceAt svc lease (column 4 4)) >>= bounded . await svc >>= expectSuccess
+            recorded ← readTVarIO windows
+            pure (fmap (axisValue . occupiedLevel) (surfaceTop answer), nub [levels | (_, _, _, _, levels) ← reverse recorded])
+        far = 10 ^ (12 ∷ Int)
+    -- a gap of a thousand levels: the window holding the removed patch, then the one ending at 0 + 1
+    (near, nearWindows) ← readsFor [1000]
+    (near, nearWindows) `shouldBe` (Just 0, [[(969, 1001)], [(-63, 1)]])
+    -- a gap of 10^12 levels: as many reads
+    (atFar, farWindows) ← readsFor [far]
+    (atFar, length farWindows) `shouldBe` (Just 0, length nearWindows)
+    -- the gap ends at a removed cell (100): the next window lands on it and goes on below
+    (below, windows) ← readsFor [100, far]
+    (below, windows) `shouldBe` (Just 0, [[(fromInteger far + 1 - 32, fromInteger far + 1)], [(37, 101)], [(-127, 1)]])
+
   -- column (3, 4) resident over two vertical regions, one segment each: two removals in the first, a
   -- third in the second
   it "patches resident detail at the removed cell only: after removals in two segments of one column, every cell of both segments is what the store answers" $
