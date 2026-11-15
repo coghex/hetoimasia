@@ -72,4 +72,14 @@ stopped by hand when master's TRA-23 merge changed `terrain-runtime`'s source, s
 
 ## CI
 
-PR #693, head `d67965fe`, validation run 43730908344, the 4-vCPU runner: `terrain-runtime-tests` "Finished in" **309.43 s** (budget 360 s), 0 failures, every job green. From the job log: the parallel group 107.9 s (`RUNNER jobs=4 capabilities=4`), the one-capability sequential phase 167.0 s (`PHASE sequential: 1 capability`), the multi-capability pass 34.5 s (`PASS multi-capability: requested=2 (default) effective=2 (at start 1, processors 4)`). Without the pass the group took 274.9 s on that runner. Another pull request's run of the same group on the same kind of runner at that time (validation run 43733779062, master plus an unrelated change, no pass) took 187.5 s in total: its parallel group, which this change does not touch, took 76.6 s against this run's 107.9 s (1.41 times), and its one-capability phase 110.9 s against 167.0 s (1.51 times). The runner was slower in this run; the figures across runs of the same part vary by that much.
+PR #693, the 4-vCPU runner, `terrain-runtime-tests` "Finished in" (budget 360 s), 0 failures, every job green, the pass printing
+`PASS multi-capability: requested=2 (default) effective=2 (at start 1, processors 4)`:
+
+| Head | Validation run | "Finished in" | Parallel group | One-capability phase | The pass |
+| --- | --- | ---: | ---: | ---: | ---: |
+| `d67965fe` | 43730908344 | 309.43 s | 107.9 s | 167.0 s | 34.5 s |
+| `5ece2fed` (the same code) | 43753171955 | 210.66 s | 75.2 s | 113.4 s | 22.1 s |
+
+The two runs of the same code differ by 100 s: the parallel group, which this change does not touch, took 107.9 s in the first and
+75.2 s in the second (another pull request's run at the first run's time took 76.6 s and 110.9 s for its parallel group and
+one-capability phase). The runner's speed varies by that much, so the pass costs 22 to 35 s of a figure that moves by 100 s.
