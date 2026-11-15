@@ -1014,12 +1014,12 @@ prepareReq svc rid = do
       -- integrity has cleared. A failure recorded after a write probe was staged moves a generation of
       -- the basis, so that staging is stale and the retry is prepared again under this rule. So every
       -- retry settles: it stages a release, a write probe the slot can take, a re-read, or its answer.
-      let basis = creatorBasisOf arena
+      let basis = retryBasisOf arena
           (probed, writes) = retryProbe arena
           written = Map.lookup rid (stateWriteProbed st) >>= \(b, ok) → if b == basis then Just ok else Nothing
           integrityHeld = CondIntegrity `elem` conditions (arenaStore arena)
        in case (writes, written) of
-            (_ : _, Nothing) | not integrityHeld → stageCreator svc rid aid arena (StagedWriteProbe writes)
+            (_ : _, Nothing) | not integrityHeld → stageRetry svc rid aid arena (StagedWriteProbe writes)
             _ →
               -- a condition with a write is certifiable only when its write probe passed
               let certifiable = [c | (c, hasWrite, _) ← probed, not hasWrite || written == Just True]
@@ -1048,6 +1048,11 @@ stage svc rid aid rev work = do
 stageCreator ∷ Service → RequestId → ArenaId → Arena → StagedWork → IO Bool
 stageCreator svc rid aid arena = stageWith svc rid (Just aid) (arenaRevision arena) (D.authKnowledge (arenaAuthority arena)) (Just (creatorBasisOf arena))
 
+-- | Stage a retry's certifying work (its write probe, its answer) on its certification's basis
+-- ('retryBasisOf'): any failure recorded since makes it stale.
+stageRetry ∷ Service → RequestId → ArenaId → Arena → StagedWork → IO Bool
+stageRetry svc rid aid arena = stageWith svc rid (Just aid) (arenaRevision arena) (D.authKnowledge (arenaAuthority arena)) (Just (retryBasisOf arena))
+
 -- | 'stage' with the knowledge revision the work was read at and, for a creator command, the basis
 -- its preparation read.
 stageWith ∷ Service → RequestId → Maybe ArenaId → Revision → Revision → Maybe CreatorBasis → StagedWork → IO Bool
@@ -1063,7 +1068,7 @@ stageWith svc rid aid rev knowledge basis work =
           let arena = aid >>= \a → Map.lookup a (stateArenas st)
               fresh = case aid of
                 Nothing → True
-                Just _ → maybe False (\x → arenaRevision x == rev && D.authKnowledge (arenaAuthority x) == knowledge && maybe True (== creatorBasisOf x) basis) arena
+                Just _ → maybe False (\x → arenaRevision x == rev && D.authKnowledge (arenaAuthority x) == knowledge && maybe True (basisFresh x) basis) arena
               pending = case reqPhase req of Done → False; _ → True
           when (fresh && pending) $ do
             modifySt svc (\s → s {stateRequests = Map.insert rid req {reqPhase = StagedPhase (Staged aid rev knowledge basis work)} (stateRequests s)})
@@ -1538,10 +1543,10 @@ finishRetry svc rid certified basis = do
   current <- atomically $ do
     s <- readSt svc
     pure $ case Map.lookup rid (stateRequests s) >>= reqArena >>= \aid → (,) aid <$> Map.lookup aid (stateArenas s) of
-      Just (aid, arena) | not (growthInSlot s aid), creatorBasisOf arena == basis → Just (aid, arena)
+      Just (aid, arena) | not (growthInSlot s aid), basisFresh arena basis → Just (aid, arena)
       _ → Nothing
   atomically (modifySt svc (\s → s {stateWriteProbed = Map.delete rid (stateWriteProbed s)}))
-  forM_ current $ \(aid, arena) → stageCreator svc rid aid arena (StagedRetry certified)
+  forM_ current $ \(aid, arena) → stageRetry svc rid aid arena (StagedRetry certified)
 
 -- | Whether the slot runs a growth or a pending extra's release of the arena.
 growthInSlot ∷ St → ArenaId → Bool

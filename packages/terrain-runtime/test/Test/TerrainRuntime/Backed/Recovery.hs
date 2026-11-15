@@ -273,6 +273,46 @@ spec = describe "Recovery decided like publication" $ do
         waitFor (backedAtRestSTM svc >>= check)
         atomically (inspectRequestScratchSTM svc) `shouldReturn` ([], [])
 
+  -- the store's one page: every read of column (3, 4) reads it
+  it "does not clear a condition on a certification that a newer failure of the same page made stale, and clears it once a retry certifies it again" $
+    withArenaPaths [(3, 4)] $ \probe recorded svc lease → do
+      pages ← pagesRead recorded svc lease (tile 3 4 6)
+      let onThePage op = any (\o → readAt o op) pages
+          failsOnce = H.addRule probe 1 onThePage (H.FailWith (Errno 5))
+      failsOnce >> failRead svc lease
+      -- a retry whose host is not eligible: its probe passes and its answer is staged
+      host ← newHost False
+      _ ← okOf (retryWith svc (hostEndpoint svc Nothing host) lease)
+      waitFor (readTVar (hostReady host) >>= \n → check (n >= 1))
+      -- the page fails again, for its next two reads: an ordinary read's (no new evidence: the page is
+      -- recorded already), which must make the staged certification stale, and the probe of the retry
+      -- prepared again
+      H.addRule probe 2 onThePage (H.FailWith (Errno 5))
+      failRead svc lease
+      pausedOn svc lease `shouldReturn` [CondIo]
+      grant host
+      waitFor (readTVar (hostSettled host) >>= \s → check (not (null s)))
+      settledOf host >>= (`shouldSatisfy` \case [Succeeded (ARetried a)] → (retriedCleared a, retriedRemaining a) == ([], [CondIo]); _ → False)
+      pausedOn svc lease `shouldReturn` [CondIo]
+      -- the page reads back now: a later retry certifies it again and clears the condition
+      answer ← retryAnswer svc lease
+      fmap (\a → (retriedCleared a, retriedRemaining a)) answer `shouldBe` Right ([CondIo], [])
+      pausedOn svc lease `shouldReturn` []
+
+  it "commits a staged growth while repeat failures arrive on a page its arena's io pause recorded" $
+    withArenaPaths [(3, 4)] $ \probe recorded svc lease → do
+      pages ← pagesRead recorded svc lease (tile 3 4 6)
+      let failsOnce = H.addRule probe 1 (\op → any (\o → readAt o op) pages) (H.FailWith (Errno 5))
+      failsOnce >> failRead svc lease
+      host ← newHost False
+      _ ← okOf (growWith svc (hostEndpoint svc Nothing host) lease (toInteger (128 * mib)))
+      waitFor (readTVar (hostReady host) >>= \n → check (n >= 1))
+      -- clients keep reading, and the recorded page keeps failing
+      mapM_ (const (failsOnce >> failRead svc lease)) [1 .. 3 ∷ Int]
+      grant host
+      waitFor (readTVar (hostSettled host) >>= \s → check (not (null s)))
+      settledOf host >>= (`shouldSatisfy` \case [Succeeded (AGrown _)] → True; _ → False)
+
   it "does not publish discovery that was in flight when its arena paused" $ do
     probe ← H.newProbe
     -- once armed, the next grant to discovery (one unit of it per transaction) installs a gate on every

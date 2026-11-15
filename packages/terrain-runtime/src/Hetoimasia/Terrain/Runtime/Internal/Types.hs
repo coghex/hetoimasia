@@ -55,6 +55,8 @@ module Hetoimasia.Terrain.Runtime.Internal.Types
   , Staged (..)
   , CreatorBasis (..)
   , creatorBasisOf
+  , retryBasisOf
+  , basisFresh
   , creatorFresh
   , isCreatorCommand
   , StagedWork (..)
@@ -603,17 +605,33 @@ data Staged = Staged
 -- | What a creator command's preparation reads of its arena's store: the allowance and the
 -- growth state. A growth's commit, its abandonment and a pending extra's release move it; a
 -- removal, discovery or reclamation does not.
--- | What a creator command's preparation read of its arena: the allowance, the growth state, and
--- each recorded fault's generation (a failure recorded since makes the work stale).
-data CreatorBasis = CreatorBasis !Word64 !GrowthView ![(Condition, Word64)]
+-- | What a creator command's preparation read of its arena: the allowance, the growth state, each
+-- recorded fault's generation (a failure that added evidence since makes the work stale), and, for
+-- a retry's certification only, each condition's count of failure events.
+data CreatorBasis = CreatorBasis !Word64 !GrowthView ![(Condition, Word64)] !(Maybe [(Condition, Word64)])
   deriving stock (Eq, Show)
 
+-- | The basis of a growth, a release, or a retry's release of a pending extra: a repeat failure on a
+-- page already recorded does not move it, so a stream of such failures cannot keep it stale.
 creatorBasisOf ∷ Arena → CreatorBasis
 creatorBasisOf arena =
   CreatorBasis
     (StoreState.cfgAllowanceBytes (storeConfig (arenaStore arena)))
     (growthView (arenaStore arena))
     [(c, faultGeneration r) | (c, r) ← Map.toList (arenaFaults arena)]
+    Nothing
+
+-- | THE BASIS OF A RETRY'S CERTIFICATION (its write probe's result, its re-read, its staged answer):
+-- 'creatorBasisOf' and every condition's count of failure events, so EVERY failure recorded since,
+-- a repeat on a page already recorded included, makes what certifies its condition stale.
+retryBasisOf ∷ Arena → CreatorBasis
+retryBasisOf arena = case creatorBasisOf arena of
+  CreatorBasis allowance growth generations _ → CreatorBasis allowance growth generations (Just [(c, faultEvents r) | (c, r) ← Map.toList (arenaFaults arena)])
+
+-- | Whether a basis still holds: compared with the arena's own basis of the same kind.
+basisFresh ∷ Arena → CreatorBasis → Bool
+basisFresh arena basis@(CreatorBasis _ _ _ certification) =
+  basis == maybe (creatorBasisOf arena) (const (retryBasisOf arena)) certification
 
 -- | A creator command: a growth or an explicit retry of the creator's arena.
 isCreatorCommand ∷ Req → Bool
@@ -622,7 +640,7 @@ isCreatorCommand req = case reqCmd req of CGrow {} → True; CRetry → True; _ 
 -- | Whether staged work still stands on what its arena's store holds now (always, for work that
 -- is not a creator command's).
 creatorFresh ∷ Arena → Staged → Bool
-creatorFresh arena sg = maybe True (== creatorBasisOf arena) (stagedBasis sg)
+creatorFresh arena sg = maybe True (basisFresh arena) (stagedBasis sg)
 
 data StagedWork
   = StagedAnswer !Answer
@@ -907,8 +925,12 @@ data FaultEntry = FaultEntry !FaultOp !PageNo
 -- * 'faultIncomplete': a failure was not kept (past the bound, or with no page): the condition
 --   can never be certified gone by a probe, and stays;
 -- * 'faultGeneration': the service's fault epoch at the last failure that added to the record. A
---   retry's basis carries it, so a failure recorded while its probe is in flight makes the probe's
---   result stale. A failure already recorded adds nothing and moves nothing.
+--   creator command's basis carries it, so a failure that added evidence while its work was
+--   prepared makes that work stale. A failure already recorded adds nothing and moves it not.
+-- * 'faultEvents': how many failures were recorded, every one counted, a repeat on a page already
+--   recorded included. Only a retry's certification carries it ('retryBasisOf'): any failure
+--   recorded after a retry certified its condition makes that certification stale, while a growth or
+--   a release is not kept stale by a stream of repeat failures.
 --
 -- Owned and written by the terrain owner ('pauseArena' adds, the retry's arbitration deletes);
 -- read by the owner. Lives as long as the condition pauses the arena.
@@ -917,6 +939,7 @@ data FaultRecord = FaultRecord
   , faultEntries ∷ ![FaultEntry]
   , faultIncomplete ∷ !Bool
   , faultGeneration ∷ !Word64
+  , faultEvents ∷ !Word64
   }
   deriving stock (Eq, Show)
 

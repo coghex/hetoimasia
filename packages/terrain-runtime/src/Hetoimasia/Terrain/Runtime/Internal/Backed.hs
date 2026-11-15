@@ -298,9 +298,9 @@ pauseArena svc aid condition fault = do
         added = maybe True (\r → not (null fresh) || (incomplete && not (faultIncomplete r))) old
         epoch = stateFaultEpoch st + 1
         record = case old of
-          Just r | not added → r
-          Just r → r {faultEntries = merged, faultIncomplete = incomplete, faultGeneration = epoch}
-          Nothing → FaultRecord fault merged incomplete epoch
+          Just r | not added → r {faultEvents = faultEvents r + 1}
+          Just r → r {faultEntries = merged, faultIncomplete = incomplete, faultGeneration = epoch, faultEvents = faultEvents r + 1}
+          Nothing → FaultRecord fault merged incomplete epoch 1
     sameCommittedSTM aid st (pauseFor condition (arenaStore arena))
     modifySt svc $ \s →
       s
