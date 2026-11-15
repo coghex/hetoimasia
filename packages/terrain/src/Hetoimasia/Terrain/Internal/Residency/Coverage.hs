@@ -33,6 +33,7 @@ module Hetoimasia.Terrain.Internal.Residency.Coverage
   , commandRecordBytes
   , descriptionBytes
   , scratchBytes
+  , loadRunsBytes
   , removalRetainedBytes
   , removalStagingBytes
   , regionColumnReserveBytes
@@ -47,7 +48,7 @@ import qualified Data.Map.Strict as Map
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Word (Word64)
-import Hetoimasia.Terrain.Changes (changeColumnBytes, changeIntervalBytes)
+import Hetoimasia.Terrain.Changes (changeColumnBytes, changeIntervalBytes, runsMeetingLevels)
 import Hetoimasia.Terrain.Coordinate (LocalCoord, localX, localY, localZ)
 import Hetoimasia.Terrain.Resident (columnIndexBytes)
 
@@ -232,10 +233,20 @@ commandRecordBytes n = 128 + 32 * n
 descriptionBytes ∷ Word64 → Word64
 descriptionBytes n = 128 + 64 * n
 
--- | The scratch a load of @delta@ needs (staging): a fixed frame plus a full
--- extra copy of its cells at two bytes each.
-scratchBytes ∷ Coverage → Word64
-scratchBytes delta = 256 + 2 * coverageCells delta
+-- | The scratch a load of @delta@ needs (staging), for the load's whole life, in a region whose
+-- loadable extent is @levels@ high: a fixed frame, a full extra copy of its cells at two bytes each,
+-- and the removed runs the load reads of the columns it touches ('loadRunsBytes').
+scratchBytes ∷ Word64 → Coverage → Word64
+scratchBytes levels delta = 256 + 2 * coverageCells delta + loadRunsBytes levels (coverageColumns delta)
+
+-- | The removed runs a load keeps of @columns@ columns, at most, by the figures of
+-- "Hetoimasia.Terrain.Changes". A load reads EVERY COLUMN IT TOUCHES OVER THE REGION'S LOADABLE
+-- EXTENT, @levels@ high, not only its cells: what it makes resident merges with the resident segments
+-- of the column it touches, and those are rebuilt with it. So each column keeps at most
+-- 'runsMeetingLevels' runs of 'changeIntervalBytes' and a 'changeColumnBytes' entry (320 bytes at 32
+-- levels; a whole region's columns hold the same as its cells' worth, 81,920 bytes for 16 x 16 x 32).
+loadRunsBytes ∷ Word64 → Word64 → Word64
+loadRunsBytes levels columns = columns * (runsMeetingLevels levels * fromIntegral changeIntervalBytes + fromIntegral changeColumnBytes)
 
 -- | The worst-case retained growth of one whole-cell removal: one new removed
 -- interval and one new column index entry (the figures of

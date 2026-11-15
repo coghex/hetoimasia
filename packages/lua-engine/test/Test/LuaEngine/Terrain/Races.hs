@@ -15,7 +15,10 @@ import Hetoimasia.Terrain.Coordinate (RegionCoord (..))
 import Hetoimasia.LuaEngine.Terrain (TerrainHooks (..), noTerrainHooks)
 import Hetoimasia.Scripting.Lua.Provider (advanceRequestEpoch)
 import Hetoimasia.Scripting.Lua.Scheduled (scheduledEndpoint)
-import Hetoimasia.Terrain.Runtime (Point (..), Probe (..))
+import Hetoimasia.Terrain.Residency (Revision (..))
+import Hetoimasia.Terrain.Runtime (ArenaStatus (..), GrowAnswer (..), Point (..), Probe (..), RetryAnswer (..), StorageState (..), arenaStatus, await, backedAtRestSTM, growArena, openArena, registerClient, retryArena)
+import Hetoimasia.Terrain.Source (LayerSpec (..), SourceSpec (..))
+import Control.Concurrent.STM (atomically)
 import Test.Hspec
 import Test.LuaEngine.Facade.Support
 import Test.LuaEngine.Terrain.Support
@@ -47,6 +50,33 @@ cancelling =
         , "elseif self.s == 2 then"
         , "  local t = settle(api, self.q)"
         , "  if t then print('cell', t.value.air, t.value.revision) print('done') self.s = 3 end"
+        , "end"
+        ]
+    }
+
+-- | A presentation instance that attaches to an arena another client created, removes three cells one after
+-- another and reads each back.
+sharedEditor ∷ Script
+sharedEditor =
+  script
+    { scPrelude = terrainPrelude
+    , scInit = ["self.s = 0", "self.q = api.terrain.attach('shared')"]
+    , scUpdate =
+        [ "if self.s == 0 then"
+        , "  local t = settle(api, self.q)"
+        , "  if t then self.arena = t.value self.i = 0 self.s = 1 print('attached') end"
+        , "elseif self.s == 1 then"
+        , "  self.r = api.terrain.remove(self.arena, {x = self.i, y = 0, z = 0}) self.s = 2"
+        , "elseif self.s == 2 then"
+        , "  local t = settle(api, self.r)"
+        , "  if t then print('removed', self.i, t.status, t.value.changed) self.q = api.terrain.cell(self.arena, {x = self.i, y = 0, z = 0}) self.s = 3 end"
+        , "elseif self.s == 3 then"
+        , "  local t = settle(api, self.q)"
+        , "  if t then"
+        , "    print('cell', self.i, t.value.air)"
+        , "    self.i = self.i + 1"
+        , "    if self.i < 3 then self.s = 1 else print('done') self.s = 4 end"
+        , "  end"
         , "end"
         ]
     }
@@ -290,21 +320,80 @@ windowsSpec = describe "Terrain cancel windows" $ do
 
   it "cancels a staged removal when the owner's request epoch changes, and commits nothing" $ do
     gate ← newGate
-    probe ← removalProbe gate
+    (probe, heldInSlot) ← removalProbeIn gate
     withRigProbe defaultConfigForRaces probe $ \rig →
       withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource remover)]) $ \world _ runtime →
         withFvm world runtime (presentationOver rig) $ \fvm → (`finally` openGate gate) $ do
           _ ← spawn world fvm "modules-test" mainPath
           untilPrinted world "issued"
           awaitReached gate
-          -- the owner stands at the commit of the staged removal; the owner's requests move to a new epoch
+          -- the owner stands at the commit (the publication decision) of the staged removal, which holds the session's
+          -- mutating transaction: its writes are done and its credits are reserved; the owner's requests move to a new epoch
+          heldInSlot `shouldReturn` True
           void (advanceRequestEpoch (scheduledEndpoint (fvOwner fvm)))
           pumpUntil world (advanceClock world 2000000000 >> (pure True))
           openGate gate
           observeCell rig (arenaName rig "modules-test" "main") (0, 0, 0) `shouldReturn` (0, Just "soil")
+          -- the transaction was aborted with no publication: the slot and its credits are returned
+          pumpUntil world (atomically (backedAtRestSTM (rgService rig)))
 
 racesSpec ∷ Spec
 racesSpec = describe "Terrain races" $ do
+  it "commits nothing when the removal's instance ends while its transaction holds the slot, and returns the slot and its credits" $ do
+    gate ← newGate
+    (held, heldInSlot) ← removalProbeIn gate
+    committed ← newIORef ([] ∷ [Revision])
+    let probe = Probe $ \point → do
+          case point of
+            PointCommitted _ revision → modifyIORef' committed (revision :)
+            _ → pure ()
+          probePoint held point
+    withRigProbe defaultConfigForRaces probe $ \rig →
+      withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource remover)]) $ \world _ runtime →
+        withFvm world runtime (presentationOver rig) $ \fvm → (`finally` openGate gate) $ do
+          spawned ← admitOnly world fvm "modules-test" mainPath
+          pumpUntilReached world gate
+          -- the removal's transaction holds the slot at its decision; its instance ends there
+          heldInSlot `shouldReturn` True
+          stopSpawned spawned
+          -- the instance's end reaches the service: its removal is cancelled (its command slot freed) while the
+          -- decision is still held
+          pumpUntil world ((== 0) <$> limitHeld (rgService rig) "command slots")
+          openGate gate
+          -- the arena went with its instance, and nothing advanced it past its opening revision: the decision found
+          -- the removal's request gone and committed nothing
+          pumpUntil world ((== 0) <$> limitHeld (rgService rig) "arenas")
+          readIORef committed >>= (`shouldSatisfy` all (== Revision 0))
+          pumpUntil world (atomically (backedAtRestSTM (rgService rig)))
+
+  it "edits and reads from a Lua client while the host asks the arena's status, grows its allowance and retries it, on the same arena" $
+    withRig $ \rig → do
+      let service = rgService rig
+          mib = 1024 * 1024 ∷ Integer
+      -- the host creates the arena (the creator's authority is what grows and retries it); the Lua client attaches
+      Right client ← registerClient service
+      Right opening ← openArena service client (arenaName rig "modules-test" "shared") (SourceSpec ["soil"] [LayerSpec Nothing (Just 10) "soil" 0] [])
+      Right lease ← await service opening
+      withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource sharedEditor)]) $ \world _ runtime →
+        withFvm world runtime (presentationOver rig) $ \fvm → do
+          _ ← spawn world fvm "modules-test" mainPath
+          untilPrinted world "attached"
+          -- the host's storage operations, on the arena the Lua client is editing and reading
+          Right status ← arenaStatus service lease
+          statusStorage status `shouldBe` StorageReady
+          Right growing ← growArena service lease (128 * mib)
+          grown ← await service growing
+          fmap grownAllowance grown `shouldBe` Right (fromInteger (128 * mib))
+          Right retrying ← retryArena service lease
+          retried ← await service retrying
+          fmap retriedRemaining retried `shouldBe` Right []
+          untilPrinted world "done"
+          printed ← outLines world
+          printed `shouldContain` [line | i ← ["0", "1", "2"], line ← ["removed\t" <> i <> "\tsuccess\ttrue", "cell\t" <> i <> "\ttrue"]]
+          Right final ← arenaStatus service lease
+          (statusStorage final, statusReservedBytes final, statusContentRevision final) `shouldBe` (StorageReady, fromInteger (128 * mib), Revision 3)
+          pumpUntil world (atomically (backedAtRestSTM service))
+
   it "holds a late removal's tick while the presentation VM keeps reading, changes nothing before the position, and releases the tick when it commits" $ do
     gate ← newGate
     probe ← removalProbe gate
@@ -341,20 +430,23 @@ racesSpec = describe "Terrain races" $ do
 
   it "leaves no edit when the script's cancel wins before the commit, and answers already_settled when the commit won" $ do
     gate ← newGate
-    probe ← removalProbe gate
+    (probe, heldInSlot) ← removalProbeIn gate
     withRigProbe defaultConfigForRaces probe $ \rig → do
       withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource cancelling)]) $ \world _ runtime →
         withFvm world runtime (presentationOver rig) $ \fvm → do
           _ ← spawn world fvm "modules-test" mainPath
           untilPrinted world "issued"
-          -- the removal is staged and the owner holds it at the commit; the script's cancel is next
+          -- the removal is staged and the owner holds it at the commit, inside its transaction (slot granted, writes
+          -- done, credits reserved); the script's cancel is next
           awaitReached gate
+          heldInSlot `shouldReturn` True
           untilPrinted world "cancel\tcancelled"
           openGate gate
           untilPrinted world "done"
           printed ← outLines world
-          -- the cancel won: nothing was edited, and the cell is as it was
+          -- the cancel won: nothing was edited, and the cell is as it was; the slot and its credits are returned
           printed `shouldContain` ["take\tcancelled", "cell\tfalse\t0"]
+          pumpUntil world (atomically (backedAtRestSTM (rgService rig)))
     -- and with the owner not held, the commit wins the race
     disarmGate gate
     withRigProbe defaultConfigForRaces noProbeForRaces $ \rig →

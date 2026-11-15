@@ -47,6 +47,7 @@ oracle m arena demands removal
   | otherwise = Admit
   where
     limits = modelLimits m
+    extentLevels = let (_, _, z) = limitExtent limits in toInteger z
     lim b = toInteger (limitBytes limits b)
     slot s = toInteger (limitSlot limits s)
     n = toInteger (length demands)
@@ -93,7 +94,9 @@ oracle m arena demands removal
             Just o → (if absent && isNothing new then metadata else 0) + 48 * toInteger (coverageColumns o) + 34 * toInteger (coverageSegments o)
           scratch = case new of
             Nothing → 0
-            Just nw → 256 + 2 * toInteger (coverageCells nw)
+            -- a frame, two bytes a cell, and the runs the load reads of every column it touches over the
+            -- extent's levels: at most levels / 2 + 1 runs of 16 bytes, and each column a 48-byte entry
+            Just nw → 256 + 2 * toInteger (coverageCells nw) + toInteger (coverageColumns nw) * ((extentLevels `div` 2 + 1) * 16 + 48)
        in (maybe 0 (toInteger . regionBytes) res, reserve, promisedLeast, scratch, isJust new)
     promisedCover d = case [jobCoverage j | j ← modelJobs m, jobArena j == arena, jobRegion j == demandRegion d, jobPhase j /= JobCancellingPhase] of
       [] → Nothing

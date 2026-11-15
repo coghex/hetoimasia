@@ -121,7 +121,7 @@ spec = describe "Superseded work and ordering" $ do
           view <- inspectArena svc lease >>= maybe (fail "arena vanished") pure
           model <- inspectModel svc
           settleChecks svc
-          pure (seen, viewChanges view, viewRevision view, map regionCoord (modelRegionsOf model))
+          pure (seen, viewKnowledgeRevision view, viewRevision view, map regionCoord (modelRegionsOf model))
     (roomySeen, roomyChanges, roomyRevision, roomyList) <- settle (tightConfig' 400)
     (tightSeen, tightChanges, tightRevision, tightList) <- settle (tightConfig' 0)
     tightSeen `shouldBe` roomySeen

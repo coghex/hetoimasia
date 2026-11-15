@@ -51,8 +51,8 @@ spec = describe "a terrain's two atlas parents through the texture pipeline" $ d
       -- physical parent however many regions and quads will read it.
       openGate (ssProbe session) "colour.png"
       openGate (ssProbe session) "normal.png"
-      settle session vm 0 "colour"
-      settle session vm 1 "normal"
+      settle session vm "colour.png" "colour"
+      settle session vm "normal.png" "normal"
       ownerNow vm "i" >>= (\reading → (ownerTexturesHeld reading, ownerNominalHeld reading) `shouldBe` (2, colourBytes + normalBytes))
       sessionNow session `shouldReturn` colourBytes + normalBytes
       -- The original leases are released while the backend still holds the textures: the bytes stay charged
@@ -76,8 +76,8 @@ spec = describe "a terrain's two atlas parents through the texture pipeline" $ d
       -- A prior terrain's two parents are live (decoded size each).
       loadAs session vm "i" "priorColour" "colour.png" >>= (`shouldBe` "i start priorColour started")
       loadAs session vm "i" "priorNormal" "normal.png" >>= (`shouldBe` "i start priorNormal started")
-      settle session vm 0 "priorColour"
-      settle session vm 1 "priorNormal"
+      settle session vm "colour.png" "priorColour"
+      settle session vm "normal.png" "priorNormal"
       ownerNow vm "i" >>= (\reading → (ownerTexturesHeld reading, ownerNominalHeld reading) `shouldBe` (2, colourBytes + normalBytes))
       -- A new terrain: its colour parent's reservation fits beside the prior pair and is held while its read waits.
       closeGate (ssProbe session) "colour.png"
@@ -111,10 +111,11 @@ spec = describe "a terrain's two atlas parents through the texture pipeline" $ d
     colourBytes, normalBytes ∷ Word64
     colourBytes = 288 * 64 * 4
     normalBytes = 768 * 384 * 4
-    -- Let one decode finish, then its upload, and take the texture.
-    settle session vm upload key = do
-      awaitUploads (ssFake session) (upload + 1)
-      void (uploadN (ssFake session) upload >>= finishUpload (ssFake session))
+    -- Let this file's decode finish, then its upload, and take the texture. The two parents' reads run on
+    -- two readers at once, so their uploads arrive in the order the workers finish: the upload is found by
+    -- its file, never by its arrival index.
+    settle session vm path key = do
+      void (uploadFor (ssFake session) path >>= finishUpload (ssFake session))
       command session vm "i" "wait_take" key
       taken ← lineStarting session ("i wait_take " <> key <> " ")
       taken `shouldSatisfy` Text.isInfixOf "status=success"

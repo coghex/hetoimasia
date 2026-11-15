@@ -31,27 +31,32 @@ module Hetoimasia.Terrain.Runtime.Internal.Core
 
     -- * Admission
   , Submission (..)
+  , pausedFault
+  , permittedWhilePaused
+  , readmitSTM
+  , releaseCredit
   , admitting
   , admit
   , readAnswer
   , demandFor
+  , commandRanges
+  , resultRecordBytes
+  , surfaceWindowLevels
+  , keepCap
+  , rangeKeep
+  , extentLevels
+  , surfaceKnown
   , pendingEdits
 
     -- * The read-only record of the owner's running work
   , startJobWork
   , endJobWork
-  , startHandoffWork
-  , endHandoffWork
 
     -- * Settlement
   , terminate
   , terminateWith
   , releaseReq
   , withdrawRecord
-  , rememberTried
-  , rememberBusy
-  , forgetRegionRetry
-  , forgetArenaRetry
   , beginRunning
   , safePointSTM
   , cancelRequest
@@ -82,6 +87,11 @@ module Hetoimasia.Terrain.Runtime.Internal.Core
   , retainedBankUse
   , retireInFlightSTM
   , modelLimitsFor
+  , modelLimitsChecked
+  , compileBankFor
+  , compileBankChecked
+  , perArenaShared
+  , sharedCharge
   ) where
 
 import Control.Applicative ((<|>))
@@ -89,6 +99,7 @@ import Control.Concurrent.STM
 import Control.Exception (SomeException)
 import Control.Monad (forM_, unless, when, void)
 import qualified Data.Map.Strict as Map
+import Data.Int (Int64)
 import Data.Maybe (fromMaybe, isJust)
 import qualified Data.Sequence as Seq
 import qualified Data.Set as Set
@@ -96,8 +107,13 @@ import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Word (Word64)
 import Hetoimasia.Terrain.Cell
+import Hetoimasia.Terrain.Changes (Changes, changeColumnBytes, changeIntervalBytes, emptyChanges, runsMeetingLevels)
 import Hetoimasia.Terrain.Coordinate
+import qualified Hetoimasia.Terrain.Connectivity as C
+import qualified Hetoimasia.Terrain.Discovery as D
 import qualified Hetoimasia.Terrain.Query as Q
+import qualified Hetoimasia.Terrain.Runtime.Store.Internal.Admission as A
+import Hetoimasia.Terrain.Runtime.Store.Internal.Admission (Admission, Grant)
 import qualified Hetoimasia.Terrain.Residency as R
 import Hetoimasia.Terrain.Residency (ArenaId (..), HoldId (..), RegionDemand, RequestId (..), Revision (..), ViewId (..))
 import Hetoimasia.Terrain.Runtime.Internal.Content
@@ -105,6 +121,8 @@ import Hetoimasia.Terrain.Runtime.Internal.Snapshot
 import Hetoimasia.Terrain.Resident (ResidentStats (..), columnIndexBytes, discardRegion, residentStats)
 import Hetoimasia.Terrain.Segment (maxSegmentLevels)
 import Hetoimasia.Terrain.Runtime.Internal.Types
+import Hetoimasia.Terrain.Runtime.Backed.Fault (StorageFault)
+import Hetoimasia.Terrain.Runtime.Store.Internal.Model (Condition (..), GrowthDecision (..), conditions, proposeGrowth)
 import Hetoimasia.Terrain.Source (Source, SourceError)
 
 -- ---------------------------------------------------------------------------
@@ -118,7 +136,7 @@ modifySt svc = modifyTVar' (serviceState svc)
 
 -- | Something that may free capacity happened; the owner retries what waits.
 markFreed ∷ Service → STM ()
-markFreed svc = modifySt svc (\st → st {stateFreed = True, stateDispatchIdle = False, stateCapacityEpoch = stateCapacityEpoch st + 1})
+markFreed svc = modifySt svc (\st → st {stateFreed = True, stateDispatchIdle = False})
 
 -- | The regions a decision committed as victims, for the owner to discard.
 decisionVictims ∷ R.Decision → [R.RegionKey]
@@ -138,11 +156,14 @@ applyEvent svc event = do
     Left _ → pure outcome
     Right report → do
       writeTVar (serviceState svc) $
-        (if freesCapacity event then \x → x {stateFreed = True, stateDispatchIdle = False, stateCapacityEpoch = stateCapacityEpoch x + 1} else id)
+        (if freesCapacity event then \x → x {stateFreed = True, stateDispatchIdle = False} else id)
         st
           { stateModel = model
           , stateVictims = stateVictims st <> Seq.fromList (decisionVictims (R.reportDecision report))
           , stateRetiring = foldr Map.delete (stateRetiring st) (R.reportSettled report)
+            -- a retiring arena's compiled connectivity is dropped with it: its share of the compile
+            -- account returns when its retirement completes, not before
+          , stateCompileUse = stateCompileUse st - min (stateCompileUse st) (sum [arenaShared a | aid ← R.reportSettled report, Just a ← [Map.lookup aid (stateRetiring st)]])
           , stateWork = syncWork model (stateWork st)
           }
       pure outcome
@@ -248,6 +269,34 @@ data Submission
   | SubColumn !ArenaLease !Column !ZRange
   | SubSurface !ArenaLease !Column
   | SubRemove !ArenaLease !TileCoord !(Maybe Precondition)
+  | SubKnowledge !ArenaLease !TileCoord
+  | -- | The creator's growth of an arena's allowance to a size in bytes.
+    SubGrow !ArenaLease !Integer
+  | -- | The creator's explicit retry of a paused arena.
+    SubRetry !ArenaLease
+
+-- | Whether slot work of this kind may go on (or publish) in the arena as it is: anything while it
+-- is not paused; while it is, a growth or a release (they clear capacity), and reclamation unless
+-- the pause is for integrity.
+permittedWhilePaused ∷ SlotWork → Arena → Bool
+permittedWhilePaused work arena = case conditions (arenaStore arena) of
+  [] → True
+  conds → case work of
+    SlotGrowth _ → True
+    SlotRelease _ → True
+    SlotReclaim → CondIntegrity `notElem` conds
+    -- a write probe is a maintenance-class transaction: it re-tests what paused the arena for I/O
+    SlotWriteProbe _ → CondIntegrity `notElem` conds
+    SlotRemoval _ → False
+    SlotDiscovery → False
+
+-- | The fault a paused arena recorded, the most serious first (integrity, then I/O, then
+-- capacity): what a new mutation of it settles with.
+pausedFault ∷ Arena → Maybe StorageFault
+pausedFault arena = case [record | (condition, record) ← Map.toDescList (arenaFaults arena), condition `elem` conditions (arenaStore arena)] of
+  -- only a fault whose condition still pauses the store: one that growth or a retry cleared settles nothing
+  record : _ → Just (faultOf record)
+  [] → Nothing
 
 -- | How an admission ended short of a request in the table.
 data Short
@@ -257,32 +306,103 @@ data Short
 busyWhy ∷ R.Refusal → Short
 busyWhy refusal = case refusal of
   R.Busy reason → ShortRefused (RefusedBusy (BusyModel reason))
-  R.RetainedEditsExhausted {} → ShortRefused (RefusedBusy BusyRetainedEdits)
+  -- the model's edit reservation is sized so that it never refuses (every command slot can hold
+  -- one removal's): a refusal is an accounting defect, never busy
+  R.RetainedEditsExhausted {} → ShortFailed (HostFailure "accounting: the model's edit reservation refused a removal")
   R.Invalid reason → ShortRefused (RefusedInvalid (Text.pack (show reason)))
   R.Stale _ → ShortFailed ArenaClosed
   R.ContractFailure reason → ShortFailed (HostFailure (Text.pack ("accounting: " <> show reason)))
 
--- | The demand a read puts on the model for the arena as it is now. It is cheap
--- and bounded: a cell, the regions of a bounded range, or the cell holding a
--- column's top.
-demandFor ∷ Arena → Cmd → Either String [RegionDemand]
-demandFor arena cmd = case cmd of
+-- | The demand a read puts on the model, from a source and the removals known for the
+-- column (at admission none are read: removals only lower a column's top, so the
+-- source's top is where a surface read demands detail until its staging gather says
+-- otherwise). Cheap and bounded: a cell, the regions of a bounded range, or the cell
+-- holding a column's top.
+demandFor ∷ Source → Changes → Cmd → Either String [RegionDemand]
+demandFor source changes cmd = case cmd of
   CCell tile → Right [tileDemand tile]
   CColumn column range → columnDemands column range
   CSurface column →
-    let top = Q.highestOccupied (arenaSource arena) (arenaChanges arena) column
+    let top = Q.highestOccupied source changes column
         level = maybe 0 (toInteger . axisValue . Q.occupiedLevel) top
      in do
           tile <- either (Left . show) Right (tileCoord (toInteger (axisValue (columnX column))) (toInteger (axisValue (columnY column))) level)
           Right [tileDemand tile]
   CRemove tile _ → Right [tileDemand tile]
+  CKnowledge tile → Right [tileDemand tile]
   _ → Left "not a data command"
 
--- | The answer of a read from an arena's source and overlay, with the demand
--- that answer needs resident. It is pure and is recomputed whenever the
--- revision it was computed at is superseded.
-readAnswer ∷ Config → ArenaId → Revision → Arena → Cmd → Either Failure (Answer, [RegionDemand])
-readAnswer config aid rev arena cmd = case cmd of
+-- | The columns a command's answer reads: the runs of these, gathered from one committed
+-- version of the arena's store, are all the removals the answer depends on.
+-- | WHAT A REQUEST READS OF A COLUMN: only the levels it needs, @[lo, hi)@, never the column's whole
+-- history. A cell: its level. A removal: its level and the two beside it (the runs it coalesces with). A
+-- column query: its range (bounded by the query limits). A surface: a WINDOW of at most
+-- 'limitRangeLevels' levels, first the 'surfaceWindowLevels' below the source's top, then, while the
+-- levels read hold no occupied cell, the window below the last one (see 'stageFromRuns'); nothing for a
+-- column whose source is empty. The others read no column.
+commandRanges ∷ Q.QueryLimits → Source → Maybe (Int64, Int64) → Cmd → [(Column, Int64, Int64)]
+commandRanges limits source surfaceWindow = \case
+  CCell (TileCoord x y z) → [(Column x y, axisValue z, axisValue z + 1)]
+  CColumn column range → [(column, fromInteger (zRangeLo range), fromInteger (zRangeHi range))]
+  CSurface column → case Q.highestOccupied source emptyChanges column of
+    Nothing → []
+    Just top →
+      let t = axisValue (Q.occupiedLevel top)
+          first = min surfaceWindowLevels (max 1 (fromIntegral (Q.limitRangeLevels limits)))
+          (lo, hi) = fromMaybe (t + 1 - first, t + 1) surfaceWindow
+       in [(column, lo, hi)]
+  CRemove (TileCoord x y z) _ → [(Column x y, axisValue z - 1, axisValue z + 2)]
+  CKnowledge _ → []
+  COpen {} → []
+  CAttach {} → []
+  CGrow {} → []
+  CRetry → []
+
+-- | The most runs a read of these ranges keeps, by its kind: what its ranges can hold ('rangeKeep'), so
+-- the cap never cuts a read short. A cell one, a removal two (its neighbours, which it coalesces with),
+-- a column query up to 'limitRangeLevels' / 2 + 1, a surface's window likewise. NOT the returned-run
+-- limit: removed runs that meet source air merge with it, so an answer may be far shorter than what its
+-- read keeps. The others keep nothing ('maxBound': a load keeps its runs in its job's scratch, never in
+-- its pin).
+keepCap ∷ [(Column, Int64, Int64)] → Cmd → Int
+keepCap ranges = \case
+  CCell {} → held
+  CRemove {} → held
+  CColumn {} → held
+  CSurface {} → held
+  _ → maxBound
+  where
+    held = sum [rangeKeep lo hi | (_, lo, hi) ← ranges]
+
+-- | The most removed runs that meet the levels @[lo, hi)@ of one column: runs are coalesced, so two of
+-- them are a level apart at least.
+rangeKeep ∷ Int64 → Int64 → Int
+rangeKeep lo hi = fromIntegral (runsMeetingLevels (hi - lo))
+
+-- | The levels of a region a load may make resident (the configured extent's height), which a load
+-- reads of every column it touches.
+extentLevels ∷ Integral a ⇒ Config → a
+extentLevels config = let (_, _, z) = R.limitExtent (configLimits config) in fromIntegral z
+
+-- | What a surface's read knows of its column: the runs its window @[lo, hi)@ read, and, above the
+-- window up to the source's top, that no cell is occupied (every window above it was read and held
+-- none). That stays true at any later revision: a source never changes and a change only removes. The
+-- levels above are given as one removed interval, so the highest occupied cell of the result is the
+-- surface's answer when it lies in the window.
+surfaceKnown ∷ Source → Column → Int64 → [(Column, Int64, Int64)] → [(Column, Int64, Int64)]
+surfaceKnown source column hi runs = case Q.highestOccupied source emptyChanges column of
+  Just top | t ← axisValue (Q.occupiedLevel top) + 1, hi < t → (column, hi, t) : runs
+  _ → runs
+
+-- | The first window a surface reads, down from its source's top: one region's height.
+surfaceWindowLevels ∷ Int64
+surfaceWindowLevels = fromIntegral regionLevels
+
+-- | The answer of a read from an arena's source and the removals of the columns it reads
+-- (gathered from one committed version), with the demand that answer needs resident. It is
+-- pure and is recomputed whenever the content revision it was computed at is superseded.
+readAnswer ∷ Config → ArenaId → Revision → Source → Changes → Cmd → Either Failure (Answer, [RegionDemand])
+readAnswer config aid rev source changes cmd = case cmd of
   CCell tile → Right (ACell (CellAnswer aid rev (Q.cellAt source changes tile)), [tileDemand tile])
   CColumn column range → case Q.columnRuns (configQueryLimits config) source changes column range of
     Left err → Left (TooLarge err)
@@ -290,12 +410,9 @@ readAnswer config aid rev arena cmd = case cmd of
       demands <- either (Left . SourceFailure . Text.pack) Right (columnDemands column range)
       Right (AColumn (ColumnAnswer aid rev runs), demands)
   CSurface column → do
-    demands <- either (Left . SourceFailure . Text.pack) Right (demandFor arena cmd)
+    demands <- either (Left . SourceFailure . Text.pack) Right (demandFor source changes cmd)
     Right (ASurface (SurfaceAnswer aid rev (Q.highestOccupied source changes column)), demands)
   _ → Left (HostFailure "not a read")
-  where
-    source = arenaSource arena
-    changes = arenaChanges arena
 
 -- | Where an admitted command goes in the request table.
 data Insertion = Insertion
@@ -347,7 +464,7 @@ retainedRecords = countReqs (\req → not (isDone req && reqModel req))
 -- | Command slots the service holds for requests the model has no record of: a
 -- settled result not yet taken, and a pending open or attach.
 slotsHeldHere ∷ St → Int
-slotsHeldHere st = retainedResults st + pendingAcquisitions st + countReqs waitingReadmission st
+slotsHeldHere st = retainedResults st + pendingAcquisitions st + countReqs waitingReadmission st + countReqs (\req → isCreatorCommand req && not (isDone req)) st
 
 -- | Opens and attaches admitted and not yet settled. A settled one holds no
 -- acquisition: it either made its arena and lease (and left the table) or failed
@@ -360,8 +477,20 @@ pendingAcquisitions = countReqs (\req → isAcquisition req && not (isDone req))
 -- retiring because a snapshot of it is borrowed (its resident detail stays
 -- charged until the last borrower returns it). An arena leaves the count only when
 -- its retirement has completed.
+--
+-- An open whose request ended while a job of it was in flight (it unwinds) also counts, and so does a
+-- retiring arena: each still holds its share of the compile account, which is sized for at most this
+-- many arenas (so valid work can never exhaust it).
 arenaUse ∷ St → Int
-arenaUse st = Map.size (stateArenas st) + Map.size (stateRetiring st) + countReqs (\req → isOpenCmd req && not (isDone req)) st
+arenaUse st =
+  Map.size (stateArenas st)
+    + Map.size (stateRetiring st)
+    + countReqs (\req → isOpenCmd req && not (isDone req)) st
+    + orphanOpens st
+
+-- | Opens whose request has ended while their task still drains a job or closes a file.
+orphanOpens ∷ St → Int
+orphanOpens st = Map.size (Map.filterWithKey (\rid _ → not (Map.member rid (stateRequests st)) && not (Map.member rid (stateGhosts st))) (stateOpens st))
 
 -- | Leases the service holds, for the lease limit: every lease record (live or
 -- revoked, until released) and every pending acquisition.
@@ -383,7 +512,7 @@ data LimitRow = LimitRow
 -- snapshots it handed out), never the accounting model or the retained-bank ledger.
 limitRows ∷ Config → St → [LimitRow]
 limitRows config st =
-  [ LimitRow "arenas" (w (configMaxArenas config)) (w (arenaUse st)) (w (Map.size (stateArenas st)) + w (length (Map.keys (stateRetiring st))) + w (length [() | ClaimPending _ ← Map.elems (stateNames st)]))
+  [ LimitRow "arenas" (w (configMaxArenas config)) (w (arenaUse st)) (w (Map.size (stateArenas st)) + w (length (Map.keys (stateRetiring st))) + w (length [() | ClaimPending _ ← Map.elems (stateNames st)]) + w (orphanOpens st))
   , LimitRow "leases" (w (configMaxLeases config)) (w (leasesInUse st)) (sum [w (Set.size (clientLeases c)) | c ← Map.elems (stateClients st)] + w (length [() | req ← requestsAndGhosts, isAcquisition req, not (isDone req)]))
   , LimitRow "views" (w (configMaxViews config)) (w (Map.size (stateViews st))) (sum [w (Set.size (clientViews c)) | c ← Map.elems (stateClients st)])
   , LimitRow "clients" (w (configMaxClients config)) (w (Map.size (stateClients st))) (w (length (Map.keys (stateClients st))))
@@ -401,6 +530,7 @@ limitRows config st =
     slotOf req
       | isDone req = if reqModel req then 0 else 1
       | isAcquisition req = 1
+      | isCreatorCommand req = 1
       | waitingReadmission req = 1
       | otherwise = 0
     recordOf req = if isDone req && reqModel req then 0 else resultRecordBytes
@@ -426,6 +556,8 @@ waitingReadmission ∷ Req → Bool
 waitingReadmission req = case (reqCmd req, reqPhase req) of
   (COpen {}, _) → False
   (CAttach {}, _) → False
+  (CGrow {}, _) → False
+  (CRetry, _) → False
   (_, Waiting) → not (reqModel req)
   _ → False
 
@@ -492,10 +624,22 @@ decide svc st rid = \case
         pure (Left (ShortRefused (RefusedInvalid "column range exceeds the level limit")))
     | otherwise → dataCommand lease (CColumn column range)
   SubSurface lease column → dataCommand lease (CSurface column)
+  SubKnowledge lease tile → dataCommand lease (CKnowledge tile)
+  SubGrow lease bytes → case liveArena lease of
+    Left short → pure (Left short)
+    Right (_, _, _, arena) → case proposeGrowth (arenaStore arena) bytes of
+      GrowthInvalid why → pure (Left (ShortRefused (RefusedInvalid (Text.pack ("an allowance that can never be granted: " <> show why)))))
+      GrowthNoOp → creatorCommand lease (CGrow (fromInteger bytes))
+      GrowthNotIncreased → creatorCommand lease (CGrow (fromInteger bytes))
+      GrowthProposed _ → creatorCommand lease (CGrow (fromInteger bytes))
+  SubRetry lease → creatorCommand lease CRetry
   SubRemove lease tile precondition → case liveArena lease of
     Left short → pure (Left short)
     Right (lid, ls, aid, arena)
       | stale aid arena precondition → pure (Left (ShortFailed StaleView))
+      -- A paused arena takes no new history: the removal settles at once with the fault its
+      -- pause recorded (requirement 8), never left hanging and never repeated after recovery.
+      | Just fault ← pausedFault arena → pure (Left (ShortFailed (StorageFailed fault)))
       | revisionExhausted aid arena → pure (Left (ShortRefused RefusedExhausted))
       | otherwise → do
           let cmd = CRemove tile precondition
@@ -528,12 +672,25 @@ decide svc st rid = \case
     stale aid arena = \case
       Just (Precondition pa pr) → pa /= aid || pr /= arenaRevision arena
       Nothing → False
+    -- each pending removal can advance the content, knowledge and store revisions by one: a removal
+    -- that could need the last value of any of them is refused before any work
     revisionExhausted aid arena =
-      let Revision n = arenaRevision arena
-       in toInteger n + toInteger (pendingEdits aid st) + 1 >= toInteger (maxBound ∷ Word64)
+      let auth = arenaAuthority arena
+          near (Revision n) = toInteger n + toInteger (pendingEdits aid st) + 1 >= toInteger (maxBound ∷ Word64)
+       in near (D.authContent auth) || near (D.authKnowledge auth) || near (D.authStore auth)
+    -- Growth and retry are the creator's: an owner lease of a live arena. Their size
+    -- rules are the store's own pure proposal, decided here before anything is admitted.
+    creatorCommand lease cmd = case liveArena lease of
+      Left short → pure (Left short)
+      Right (lid, ls, aid, _)
+        | not (leaseOwner ls) → pure (Left (ShortRefused RefusedAuthority))
+        | otherwise →
+            pure $ case capacityRefusal config st True of
+              Just refusal → Left (busyWhy refusal)
+              Nothing → Right (Insertion cmd (Just lid) (leaseClient ls) (Just aid) False [] Nothing)
     dataCommand lease cmd = case liveArena lease of
       Left short → pure (Left short)
-      Right (lid, ls, aid, arena) → case demandFor arena cmd of
+      Right (lid, ls, aid, arena) → case demandFor (arenaSource arena) emptyChanges cmd of
         Left why → pure (Left (ShortFailed (SourceFailure (Text.pack why))))
         Right demands → do
           outcome <- slotRefusal True >>= \case
@@ -547,53 +704,22 @@ decide svc st rid = \case
 -- Settlement
 
 -- | Remove a request from the table and give back what it holds: its name
--- claim and its model record with every credit that record owns.
+-- claim, its model record with every credit that record owns, and what the owner
+-- keeps for it between reads (a surface's window, a retry's write-probe result).
+-- Every terminal path of a request that can hold those passes here.
 releaseReq ∷ Service → RequestId → Req → STM ()
 releaseReq svc rid req = do
   modifySt svc $ \st →
     st
       { stateRequests = Map.delete rid (stateRequests st)
+      , stateSurfaceWindow = Map.delete rid (stateSurfaceWindow st)
+      , stateWriteProbed = Map.delete rid (stateWriteProbed st)
       , stateNames = case reqCmd req of
           COpen name _ _ | Just (ClaimPending claimed) <- Map.lookup name (stateNames st), claimed == rid → Map.delete name (stateNames st)
           _ → stateNames st
       }
   when (reqModel req) (withdrawRecord svc rid req)
   markFreed svc
-
--- | Remember that a region's transfer was tried at a generation, or was refused for want
--- of capacity at an epoch. These two are the only places either is written, and they
--- write only for a region the model still holds in a live arena, so an arena or a
--- region that ended while a transfer was in flight is never given a memory it could not
--- be rid of.
-rememberTried ∷ R.RegionKey → Word64 → St → St
-rememberTried key generation st
-  | remembered st key = st {stateTransfers = Map.insert key generation (stateTransfers st)}
-  | otherwise = st
-
-rememberBusy ∷ R.RegionKey → St → St
-rememberBusy key st
-  | remembered st key = st {stateHandoffBusy = Map.insert key (stateCapacityEpoch st) (stateHandoffBusy st)}
-  | otherwise = st
-
-remembered ∷ St → R.RegionKey → Bool
-remembered st key@(aid, _) =
-  Map.member aid (stateArenas st) && key `elem` [(R.regionArena r, R.regionCoord r) | r <- R.modelRegions (stateModel st)]
-
--- | Forget everything the owner remembers about retrying one region's transfer: that
--- it was tried at some generation, and that it was refused for want of capacity at
--- some epoch. This and 'forgetArenaRetry' are the only places either is dropped, and
--- every place a region or an arena ends calls one of them, so the memory is bounded
--- by the regions the model holds.
-forgetRegionRetry ∷ St → R.RegionKey → St
-forgetRegionRetry st key = st {stateTransfers = Map.delete key (stateTransfers st), stateHandoffBusy = Map.delete key (stateHandoffBusy st)}
-
--- | The same for every region of an arena.
-forgetArenaRetry ∷ St → ArenaId → St
-forgetArenaRetry st aid =
-  st
-    { stateTransfers = Map.filterWithKey (\(owner, _) _ → owner /= aid) (stateTransfers st)
-    , stateHandoffBusy = Map.filterWithKey (\(owner, _) _ → owner /= aid) (stateHandoffBusy st)
-    }
 
 -- | THE ONLY PLACE a request's model record, and every credit it owns, is given back
 -- (R1). While the owner is running that request's preparation, which computes with
@@ -659,28 +785,23 @@ jobWorkOfModel j = JobWork (R.jobId j) (R.jobArena j) (R.jobRegion j) (R.jobActi
 -- decision's value, which is also the input of the work itself) and the data layer's own
 -- sizes, not the model's cost functions: a column index entry is 'columnIndexBytes' (48), a
 -- segment is 32 bytes of metadata and at least two of payload (a uniform one), and the
--- scratch is a 256-byte frame and two bytes a cell.
+-- scratch is a 256-byte frame, two bytes a cell, and the removed runs the job reads of its
+-- columns (a column of l levels holds at most l / 2 + 1 runs: by "Hetoimasia.Terrain.Changes"'s
+-- figures, (cells / 2 + columns) intervals and an entry a column).
 startJobWork ∷ Service → R.JobId → R.Coverage → STM ()
 startJobWork svc jid cover =
   modifySt svc $ \st →
     st {stateWork = (stateWork st) {rwJobs = Map.adjust running jid (rwJobs (stateWork st))}}
   where
     running (JobWork a b c d e _ _ _) =
-      JobWork a b c d e (R.coverageColumns cover * fromIntegral columnIndexBytes + R.coverageSegments cover * (32 + 2)) (256 + 2 * R.coverageCells cover) 1
+      JobWork a b c d e (R.coverageColumns cover * fromIntegral columnIndexBytes + R.coverageSegments cover * (32 + 2)) (256 + 2 * R.coverageCells cover + runs) 1
+    -- every column the job touches, over the region's loadable extent (what the job reads)
+    runs = R.coverageColumns cover * (runsMeetingLevels (extentLevels (serviceConfig svc)) * fromIntegral changeIntervalBytes + fromIntegral changeColumnBytes)
 
 -- | The job's report (completed, failed or acknowledged) ends its record, in the
 -- transaction that reports it.
 endJobWork ∷ Service → R.JobId → STM ()
 endJobWork svc jid = modifySt svc (\st → st {stateWork = (stateWork st) {rwJobs = Map.delete jid (rwJobs (stateWork st))}})
-
--- | The owner holds the duplicate of a region's changes while it transfers them.
-startHandoffWork ∷ Service → ArenaId → RegionCoord → Word64 → STM ()
-startHandoffWork svc aid region duplicate =
-  modifySt svc $ \st →
-    st {stateWork = (stateWork st) {rwHandoffs = Map.insert (aid, region) (HandoffWork aid region duplicate) (rwHandoffs (stateWork st))}}
-
-endHandoffWork ∷ Service → ArenaId → RegionCoord → STM ()
-endHandoffWork svc aid region = modifySt svc (\st → st {stateWork = (stateWork st) {rwHandoffs = Map.delete (aid, region) (rwHandoffs (stateWork st))}})
 
 -- | The owner starts running a request's preparation, if the request is still
 -- there to prepare: from now until the safe point nothing it holds is released.
@@ -749,6 +870,12 @@ retireRequest svc (Request tag rid)
 -- | End an arena incarnation: settle every request of it, revoke its leases,
 -- free its name and hand it to the model to retire. Its resident detail stays
 -- charged, and stays in the retiring set, until the model reports it released.
+--
+-- Its store and backing move to the closing set in the same transaction: from now on
+-- nothing can publish into this incarnation (the decision finds no live arena), and the
+-- owner drains what of it is in flight (its transaction, its gathers) and then closes its
+-- file ('Closing''). The retiring copy keeps the resident detail only: its store field is
+-- never read again.
 closeArena ∷ Service → ArenaId → STM ()
 closeArena svc aid = do
   st <- readSt svc
@@ -758,13 +885,13 @@ closeArena svc aid = do
     modifySt svc $ \cur →
       cur
         { stateArenas = Map.delete aid (stateArenas cur)
+        , stateClosing = Map.insert aid (Closing' (arenaStore arena) (arenaBacking arena)) (stateClosing cur)
         , stateRetiring = Map.insert aid arena (stateRetiring cur)
         , stateNames = case Map.lookup (arenaName arena) (stateNames cur) of
             Just (ClaimLive claimed) | claimed == aid → Map.delete (arenaName arena) (stateNames cur)
             _ → stateNames cur
         , stateLeases = foldr (Map.adjust (\l → l {leaseLive = False})) (stateLeases cur) (Set.toList (arenaLeases arena))
         }
-        `forgetArenaRetry` aid
     retireArenaRecord svc aid
 
 -- | Release a lease. Idempotent. It cancels the requests made through it, and
@@ -995,10 +1122,6 @@ invariants config st =
        | Just (rid, _) <- [stateRunning st]
        , rid `notElem` modelIds
        ]
-    <> [ "transfer-retry memory for " <> show key <> " outlives its region"
-       | key <- Map.keys (stateTransfers st) <> Map.keys (stateHandoffBusy st)
-       , key `notElem` [(R.regionArena r, R.regionCoord r) | r <- R.modelRegions model]
-       ]
     <> [ "a ghost or a deferred retirement exists while no preparation is running"
        | stateRunning st == Nothing
        , not (Map.null (stateGhosts st)) || not (Set.null (stateDeferredRetire st))
@@ -1046,16 +1169,60 @@ invariants config st =
     modelIds = [R.requestId info | info <- R.modelRequests model]
     borrows = length [() | (_, _, R.Borrow, _) <- R.modelHolds model]
 
--- | The accounting model's limits: the configured profile with the snapshot
--- bank taken out of its staging bank. Rebuilt through the validating
--- constructor, so a carve-out that leaves staging below the minimum budgets is a
--- typed configuration error.
+-- | THE charge of what a compiled arena keeps for its life in the compile account (owner decision
+-- 2026-11-13, option B): its compiled connectivity's result bytes and #661's ordered member index
+-- over its nodes ('D.envSharedBytes' charges an environment exactly this; an open checks the two
+-- agree). One function: the account's size and the per-arena bound are this charge at the
+-- compiler's limits, and a real arena is charged this at its own figures.
+sharedCharge ∷ Integer → Integer → Word64
+sharedCharge resultBytes nodes = fromInteger (resultBytes + memberIndexBytesPerNode * nodes)
+
+-- | #661's per-node charge for the ordered member index ('D.envSharedBytes').
+memberIndexBytesPerNode ∷ Integer
+memberIndexBytesPerNode = 32
+
+-- | The per-arena bound: 'sharedCharge' at the compiler's result and node limits.
+perArenaShared ∷ C.ConnectivityLimits → Word64
+perArenaShared limits = sharedCharge (toInteger (C.limitResultBytes limits)) (toInteger (C.limitNodes limits))
+
+-- | The compile account's size: every other arena that may be open at once at its per-arena bound,
+-- and the one compilation active in the session at its peak (which includes its result).
+compileBankFor ∷ Int → C.ConnectivityLimits → Word64
+compileBankFor arenas limits = fromIntegral (max 0 (arenas - 1)) * perArenaShared limits + fromIntegral (C.limitPeakBytes limits)
+
+-- | The compile account, checked: it must hold every arena the cap admits at its per-arena bound
+-- (a compilation's peak includes its result, so the active one never needs more than its peak;
+-- an open arena keeps its share), and be representable. Computed in 'Integer' first.
+compileBankChecked ∷ Int → C.ConnectivityLimits → Either ConfigError Word64
+compileBankChecked arenas limits
+  | needed > account || account > toInteger (maxBound ∷ Word64) = Left (ConfigCompileBank needed account)
+  | otherwise = Right (fromInteger account)
+  where
+    bound = toInteger (C.limitResultBytes limits) + memberIndexBytesPerNode * toInteger (C.limitNodes limits)
+    needed = toInteger (max 0 arenas) * bound
+    account = toInteger (max 0 (arenas - 1)) * bound + toInteger (C.limitPeakBytes limits)
+
+-- | The accounting model's limits, checked: the compile account must leave the resident
+-- bank something, and the model's own minimum budgets must hold.
+modelLimitsChecked ∷ Config → Either ConfigError R.Limits
+modelLimitsChecked config = either (Left . ConfigError) Right (modelLimitsFor config)
+
+-- | The accounting model's limits: the configured profile with the snapshot bank taken out
+-- of its staging bank and the compile account (every arena's compiled connectivity and the
+-- one active compilation's peak, P-15) out of its resident bank, so the two can never overbook
+-- the approved banks. The model's edit bank is NOT a second edit bank: it is sized so that every
+-- command slot can hold one removal's reservation and never refuse one, and its retained
+-- balance is zero at every step (a backed removal commits with nothing retained in RAM; the
+-- 64 MiB edit bank is the store's, 'Hetoimasia.Terrain.Runtime.Store.Admission'). Rebuilt
+-- through the validating constructor, so a carve-out that leaves a bank below the minimum
+-- budgets is a typed configuration error.
 modelLimitsFor ∷ Config → Either R.LimitError R.Limits
 modelLimitsFor config =
   R.mkLimits
     R.LimitsSpec
+      -- the compile account is its own, beside the three banks (owner decision 2026-11-13, option B)
       { R.specResidentBytes = bytes R.ResidentBank
-      , R.specEditBytes = bytes R.EditBank
+      , R.specEditBytes = slot R.CommandSlot * toInteger R.removalRetainedBytes
       , R.specStagingBytes = bytes R.StagingBank - toInteger (configRetainedBytes config)
       , R.specLoadJobs = slot R.LoadJobSlot
       , R.specQueuedCommands = slot R.CommandSlot
@@ -1080,35 +1247,77 @@ bumpGeneration ∷ Word64 → Word64
 bumpGeneration g = if g == maxBound then g else g + 1
 
 -- | Retire everything in flight, at the owner's terminal safe point and whatever
--- ended it: acknowledge each cancelling load, abandon each outstanding transfer,
--- and finish each committed victim's release. Non-blocking bookkeeping, safe under
+-- ended it: acknowledge each cancelling load and finish each committed victim's
+-- release. (A backed commit retains nothing and confirms its zero-byte handoff in the
+-- decision itself, so no transfer is ever outstanding here.) Non-blocking bookkeeping, safe under
 -- the uninterruptible mask. Idempotent. A hold that is still outstanding keeps its
 -- arena retiring until its borrower releases it.
 retireInFlightSTM ∷ Service → STM ()
 retireInFlightSTM svc = do
-  st <- readSt svc
-  let model = stateModel st
-  forM_ [(R.regionArena r, R.regionCoord r) | r <- R.modelRegions model, isJust (R.regionHandoff r)] $ \(aid, region) → do
-    void (applyEvent svc (R.HandoffFailed aid region))
-    endHandoffWork svc aid region
   victims <- stateVictims <$> readSt svc
-  forM_ victims $ \key@(aid, region) → do
+  forM_ victims $ \(aid, region) → do
     modifySt svc $ \cur →
       cur
         { stateArenas = Map.adjust (discardOf region) aid (stateArenas cur)
         , stateRetiring = Map.adjust (discardOf region) aid (stateRetiring cur)
         }
-        `forgetRegionRetry` key
     applyEvent svc (R.VictimReleased aid region)
   modifySt svc (\cur → cur {stateVictims = Seq.empty})
   after <- readSt svc
   forM_ [R.jobId j | j <- R.modelJobs (stateModel after), R.jobPhase j == R.JobCancellingPhase] $ \jid → do
     void (applyEvent svc (R.JobAcknowledged jid))
     endJobWork svc jid
-  -- No transfer is outstanding any more, and a job the model no longer holds has ended.
+  -- A job the model no longer holds has ended.
   final <- readSt svc
   let liveJobs = Set.fromList [R.jobId j | j <- R.modelJobs (stateModel final)]
-  modifySt svc (\cur → cur {stateWork = (stateWork cur) {rwHandoffs = Map.empty, rwJobs = Map.filterWithKey (\jid _ → Set.member jid liveJobs) (rwJobs (stateWork cur))}})
+  modifySt svc (\cur → cur {stateWork = (stateWork cur) {rwJobs = Map.filterWithKey (\jid _ → Set.member jid liveJobs) (rwJobs (stateWork cur))}})
   markFreed svc
   where
     discardOf region a = a {arenaResident = discardRegion region (arenaResident a), arenaGeneration = bumpGeneration (arenaGeneration a)}
+
+-- | Admit a request's demand to the model again, at the arena's current revision: the
+-- request's record is withdrawn and a fresh one made in the same transaction. If the model
+-- is busy the request waits, holding nothing, until capacity frees; it is never failed for
+-- capacity. Its staging is dropped: it is read again at the new revision.
+readmitSTM ∷ Service → RequestId → STM ()
+readmitSTM svc rid = do
+  st <- readSt svc
+  forM_ (Map.lookup rid (stateRequests st)) $ \req →
+    forM_ (reqArena req >>= \aid → (,) aid <$> Map.lookup aid (stateArenas st)) $ \(aid, arena) → do
+      when (reqModel req) (withdrawRecord svc rid req)
+      case demandFor (arenaSource arena) emptyChanges (reqCmd req) of
+        Left why → terminate svc rid (Failed (SourceFailure (Text.pack why)))
+        Right demands → do
+          let demands' = case reqCmd req of
+                -- a surface keeps the demand its gather found; a fresh gather corrects it
+                CSurface {} → if null (reqDemand req) then demands else reqDemand req
+                _ → demands
+              event = case reqCmd req of
+                CRemove tile _ → R.SubmitRemoval rid aid (arenaRevision arena) tile
+                _ → R.SubmitQuery rid aid (arenaRevision arena) demands'
+          outcome <- applyEvent svc event
+          let admitted = either (const False) (const True) outcome
+          modifySt svc $ \s →
+            s {stateRequests = Map.insert rid req {reqModel = admitted, reqDemand = demands', reqPhase = Waiting} (stateRequests s)}
+          -- Every refusal is either temporary pressure, which keeps the request
+          -- waiting (charged) to be admitted again, or permanent, which ends it
+          -- with a typed failure; nothing can wait on a refusal that will not clear.
+          case outcome of
+            Right _ → pure ()
+            Left refusal → case refusal of
+              R.Busy _ → pure ()
+              R.RetainedEditsExhausted {} → do
+                recordDefect svc (AccountingDefect "the model's edit reservation refused a removal: it is sized never to")
+                terminate svc rid (Failed (HostFailure "the model's edit reservation refused a removal"))
+              R.Invalid reason → terminate svc rid (Failed (Superseded (Text.pack ("no longer admissible: " <> show reason))))
+              R.Stale _ → terminate svc rid (Failed ArenaClosed)
+              R.ContractFailure why → do
+                recordDefect svc (AccountingDefect (Text.pack (show why)))
+                terminate svc rid (Failed (HostFailure (Text.pack ("resubmission: " <> show why))))
+
+-- | Give a grant back: its staging and control, and its cache entries (unpinned, then dropped).
+releaseCredit ∷ Grant → Admission → Admission
+releaseCredit g adm0 = foldr dropOne (A.release g adm0) (A.grantEntries g)
+  where
+    dropOne entry adm = either (const (A.unpinEntry entry adm)) id (A.dropEntry entry (A.unpinEntry entry adm))
+

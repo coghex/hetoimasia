@@ -147,22 +147,20 @@ prepareRemoval limits source changes tile = do
           , preparedRetained = if after > before then fromIntegral (after - before) else 0
           }
 
--- | Rebuild the resident detail of a removed cell's column from the new
--- authority, over the residency as it is now, and measure what the rebuilt
--- segment accounts beyond the old one. Bounded (one cell, at most one vertical
--- region) and pure.
-rebuildCell ∷ Source → Changes → Palette → Resident → TileCoord → Either String (Palette, Resident, Word64)
-rebuildCell source changes' palette resident tile = do
+-- | THE RESIDENT DETAIL OF A REMOVED CELL IS PATCHED, NEVER RE-DERIVED: the segment holding the cell
+-- keeps every other cell as it was and the cell becomes air ('removeResidentCell'), over the residency
+-- as it is now. A re-derivation would rebuild the whole segment from the runs the removal read, which
+-- are only those around its cell. Measures what the patched segment accounts beyond the old one (a
+-- removal adds no material: the palette is unchanged). Bounded (one segment) and pure.
+rebuildCell ∷ Palette → Resident → TileCoord → Either String (Palette, Resident, Word64)
+rebuildCell palette resident tile = do
   let TileCoord x y z = tile
       column = Column x y
-      level = toInteger (axisValue z)
       bytesOf r = let (_, payload, metadata) = columnsSegmentStats r [column] in payload + metadata
-  range ← either (Left . show) Right (mkZRange level (level + 1))
-  (palette', resident') ←
-    either (Left . show) Right (materialize (fromInteger regionLevelsInteger) source changes' palette resident column range)
+  resident' ← either (Left . show) Right (removeResidentCell resident column (axisValue z))
   let before = bytesOf resident
       after = bytesOf resident'
-  Right (palette', resident', if after > before then after - before else 0)
+  Right (palette, resident', if after > before then after - before else 0)
 
 -- | Keep only the resident detail inside the given regions. The result shares no
 -- unaccounted detail with the original: a snapshot built from it holds exactly

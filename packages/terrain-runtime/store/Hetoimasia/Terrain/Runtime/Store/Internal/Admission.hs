@@ -59,6 +59,7 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.Admission
   , EditBankConfig
   , EditBankError (..)
   , mkEditBankConfig
+  , controlNeedOf
   , defaultEditBankSpec
   , ebCacheBytes
   , ebStagingBytes
@@ -197,6 +198,16 @@ worstTransactionCharge = worstPlanCharge
 -- copies fit the cache beside the most the readers can pin, so that the credits the
 -- minimum explicit removal needs are either protected from camera reads or
 -- reclaimable by evicting backed, unpinned copies.
+-- | The least control account a spec needs: one worst-case transaction's control records, every
+-- reader's record and the queued descriptors' records.
+controlNeedOf ∷ EditBankSpec → Integer
+controlNeedOf spec =
+  toInteger (ramPagePins w + ramRootControl w + ramContinuation w)
+    + ebsArenas spec * ebsReadersPerArena spec * toInteger readerRecordBytes
+    + toInteger (fromIntegral maxQueuedDescriptors * descriptorRecordBytes)
+  where
+    w = worstTransactionCharge
+
 mkEditBankConfig ∷ EditBankSpec → Either EditBankError EditBankConfig
 mkEditBankConfig spec = do
   let fields =
@@ -215,7 +226,7 @@ mkEditBankConfig spec = do
   let w = worstTransactionCharge
       stagingNeed = toInteger (ramIoBuffers w + ramKeys w + ramScratch w)
       pins = ebsArenas spec * ebsReadersPerArena spec
-      controlNeed = toInteger (ramPagePins w + ramRootControl w + ramContinuation w) + pins * toInteger readerRecordBytes + toInteger (fromIntegral maxQueuedDescriptors * descriptorRecordBytes)
+      controlNeed = controlNeedOf spec
       pinnedMax = pins * toInteger readerPinnedCacheBytes
       cacheNeed = toInteger (ramDecodedCopies w) + pinnedMax
   if stagingNeed > ebsProtectedStaging spec then Left (ProtectedBelowForeground stagingNeed (ebsProtectedStaging spec)) else Right ()

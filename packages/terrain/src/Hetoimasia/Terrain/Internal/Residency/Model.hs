@@ -903,7 +903,7 @@ planUnit m arena owner d@(RegionDemand region cover) = do
       else do
         bytes ← maybe (Left (Invalid CostArithmetic)) Right (costBytes (reserveCost delta))
         need ← maybe (Left (Invalid CostArithmetic)) Right (checkedAdd bytes (if isNothing resident then regionMetadataBytes else 0))
-        Right (Just (NewJob delta need (scratchBytes delta)))
+        Right (Just (NewJob delta need (scratchBytes (let (_, _, z) = limitExtent (mLimits m) in fromIntegral z) delta)))
   pure (UnitPlan d (maybe True (not . Map.member owner . tgInterests) target) job)
 
 -- | The units, the funding of each new job (active bytes, deferred bytes and the

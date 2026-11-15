@@ -588,6 +588,10 @@ spec = describe "the package and import boundary" $ do
                , "Hetoimasia.Terrain.Residency"
                , "Hetoimasia.Terrain.Runtime"
                , "Hetoimasia.Terrain.Runtime.Settlement"
+               -- the terrain runtime's public storage inputs: the rig names its volume and sizes its
+               -- allowance (#665's explicit storage inputs)
+               , "Hetoimasia.Terrain.Runtime.Storage"
+               , "Hetoimasia.Terrain.Runtime.Store"
                , "Hetoimasia.LuaEngine.Terrain.Internal.Arbitration"
                , "Hetoimasia.Terrain.Source"
                , "Hetoimasia.Asset.Image"

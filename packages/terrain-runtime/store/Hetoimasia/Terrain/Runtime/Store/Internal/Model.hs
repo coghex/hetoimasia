@@ -79,6 +79,7 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.Model
   , planDiscoveryWith
   , planMaintenanceWith
   , planMaintenance
+  , planWriteProbeFor
   , WindowRefusal (..)
   , storeWindow
   , providerAt
@@ -141,6 +142,7 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.Model
   , growthFailed
   , growthReleased
   , growthReleaseFailed
+  , growthReconciled
   , GrowthView (..)
   , growthView
 
@@ -404,6 +406,11 @@ planEditWith bounds s win = planDeltaPinned bounds (sCfg s) (sIdent s) (sRoots s
 -- | Plan the reclamation of the oldest retired pages the readers no longer hold.
 planMaintenance ∷ Store → Window → Planned
 planMaintenance = planMaintenanceWith standardBounds
+
+-- | Plan an explicit retry's write probe of the pages whose write failed (see "Plan"'s
+-- 'planWriteProbe'): never published.
+planWriteProbeFor ∷ Store → [PageNo] → Window → Planned
+planWriteProbeFor s = planWriteProbe standardBounds (sCfg s) (sIdent s) (sRoots s) (pinnedRoots s)
 
 -- | 'planMaintenance' under given bounds.
 planMaintenanceWith ∷ Bounds → Store → Window → Planned
@@ -975,6 +982,13 @@ growthReleased s = case sGrowth s of
 -- | The release itself failed: the pending reservation stays accounted and reported.
 growthReleaseFailed ∷ Store → Store
 growthReleaseFailed = id
+
+-- | A growth's or a pending extra's release has ended, however it ended: the store's growth state
+-- follows what the backend holds, which is the ONE owner of an extra reservation. An extra the
+-- backend keeps pending (its bytes as the backend counts them, which may exceed the nominal
+-- delta) is being released; nothing pending is idle.
+growthReconciled ∷ Maybe Word64 → Store → Store
+growthReconciled pending s = s {sGrowth = maybe GrowthIdle GrowthReleasing pending}
 
 -- | What a status request may report of growth.
 data GrowthView = GrowthView

@@ -301,12 +301,19 @@ roomyPressure =
       }
 
 -- | The pressure configuration with its resident and staging banks as given, which must
--- meet the minimum budgets (4,384 and 1,530 here: the explicit reserve plus a camera
--- share that holds one camera unit).
+-- meet the minimum budgets ('nearMinimum': the explicit reserve plus a camera share that
+-- holds one camera unit).
 limitsNear ∷ Integer → Integer → Maybe Limits
-limitsNear resident staging =
-  either (const Nothing) Just . mkLimits $
-    LimitsSpec
+limitsNear resident staging = either (const Nothing) Just (mkLimits (nearSpec resident staging))
+
+-- | The minimum the model computes for a bank of 'limitsNear''s specification: the properties that
+-- run at and above the minimum start there, and move with it.
+nearMinimum ∷ Bank → Integer
+nearMinimum = minimumBytes (nearSpec 0 0)
+
+nearSpec ∷ Integer → Integer → LimitsSpec
+nearSpec resident staging =
+  LimitsSpec
       { specResidentBytes = resident
       , specEditBytes = 640
       , specStagingBytes = staging
@@ -612,7 +619,7 @@ explicitWithCameraPresent seeds picks =
 -- staging, a non-empty description that is retained has its first region admitted at
 -- once (an interest or a job), so the camera never sits pending with nothing in flight.
 cameraStartsWhatItKeeps ∷ Integer → [(Int, Int)] → Property
-cameraStartsWhatItKeeps staging picks = case limitsNear 4384 staging of
+cameraStartsWhatItKeeps staging picks = case limitsNear (nearMinimum ResidentBank) staging of
   Nothing → counterexample ("a configuration at the minimum was refused: " <> show staging) False
   Just limits →
     let start = fst (step (newModel limits) (OpenArena (ArenaId 1) (Revision 0)))
@@ -639,7 +646,7 @@ cameraStartsWhatItKeeps staging picks = case limitsNear 4384 staging of
 data FirstWork = Settled | Queued | Running deriving stock (Eq, Show)
 
 cameraReplacementStarts ∷ FirstWork → Integer → [(Int, Int)] → [(Int, Int)] → Property
-cameraReplacementStarts firstWork staging firstPicks nextPicks = case limitsNear 4384 staging of
+cameraReplacementStarts firstWork staging firstPicks nextPicks = case limitsNear (nearMinimum ResidentBank) staging of
   Nothing → counterexample ("a configuration at the minimum was refused: " <> show staging) False
   Just limits →
     let start = fst (step (newModel limits) (OpenArena (ArenaId 1) (Revision 0)))
@@ -840,9 +847,11 @@ minimumBudgetsAreEnforced (resident, edit, staging, jobs) (query, x, y, z) =
       intervals = columns * ((z + 1) `div` 2)
       stored = 256 + 48 * columns + 34 * columns * z
       job = 48 * columns + 96 * intervals
-      scratch = 256 + 2 * columns * z
+      -- a frame, two bytes a cell, and the runs a load reads of every column it touches over the
+      -- extent's z levels: at most z / 2 + 1 of 16 bytes, and a 48-byte entry, a column
+      scratch = 256 + 2 * columns * z + columns * ((z `div` 2 + 1) * 16 + 48)
       needResident = maximum [4 * stored, stored + job] + maximum [query * (stored + job), stored + 48 + 96 + 62]
-      needStaging = maximum [64 * 4, 192 + 64 + scratch] + maximum [128 + 32 * query + 64 * query + query * scratch, 160 + 512 + 64 + 258, stored]
+      needStaging = maximum [64 * 4, 192 + 64 + scratch] + maximum [128 + 32 * query + 64 * query + query * scratch, 160 + 512 + 64 + 258 + (z `div` 2 + 1) * 16 + 48, stored]
       expected
         | resident < needResident = Just (BankBelowMinimum ResidentBank needResident resident)
         | edit < 64 = Just (BankBelowMinimum EditBank 64 edit)
@@ -880,14 +889,14 @@ spec = describe "Residency model properties" $ do
       forAll seedsOf $ \seeds → forAll (vectorOf 3 pair) $ \picks → busyEndsWhenReleased seeds picks
   it "keeps every charge rule across load, complete, pin, unpin, camera expansion, withdraw, removal, handoff and eviction under budgets at and just above the minimum" $
     withNumTests 300 $
-      forAll ((,) <$> chooseInteger (4384, 6400) <*> chooseInteger (1530, 3600)) $ \(resident, staging) →
+      forAll ((,) <$> chooseInteger (nearMinimum ResidentBank, nearMinimum ResidentBank + 2016) <*> chooseInteger (nearMinimum StagingBank, nearMinimum StagingBank + 2070)) $ \(resident, staging) →
         forAll seedsOf $ \seeds → case limitsNear resident staging of
           Nothing → counterexample ("a configuration at or above the minimum was refused: " <> show (resident, staging)) False
           Just limits → case runSequenceWith limits seeds of
             (Left why, _) → counterexample why False
             (Right _, _) → property True
   it "keeps every charge rule over a long sequence at exactly the minimum budgets" $ do
-    case limitsNear 4384 1530 of
+    case limitsNear (nearMinimum ResidentBank) (nearMinimum StagingBank) of
       Nothing → expectationFailure "the minimum configuration was refused"
       Just limits → do
         let (outcome, stats) = runSequenceWith limits (lcg 21 12000)
@@ -895,25 +904,25 @@ spec = describe "Residency model properties" $ do
         accepted stats `shouldSatisfy` (> 1000)
   it "starts the first region of every camera description it retains, at any staging from the minimum" $
     withNumTests 2000 $
-      forAll (chooseInteger (1530, 4000)) $ \staging → forAll (vectorOf 5 pair) $ \picks → cameraStartsWhatItKeeps staging picks
+      forAll (chooseInteger (nearMinimum StagingBank, nearMinimum StagingBank + 2470)) $ \staging → forAll (vectorOf 5 pair) $ \picks → cameraStartsWhatItKeeps staging picks
   it "starts the first region of every replacement of a settled camera description, at any staging from the minimum" $
     withNumTests 2000 $
-      forAll (chooseInteger (1530, 4000)) $ \staging → forAll (vectorOf 5 pair) $ \a → forAll (vectorOf 5 pair) $ \b → cameraReplacementStarts Settled staging a b
+      forAll (chooseInteger (nearMinimum StagingBank, nearMinimum StagingBank + 2470)) $ \staging → forAll (vectorOf 5 pair) $ \a → forAll (vectorOf 5 pair) $ \b → cameraReplacementStarts Settled staging a b
   it "starts the first region of every replacement of a camera description whose work is still queued, at any staging from the minimum" $
     withNumTests 2000 $
-      forAll (chooseInteger (1530, 4000)) $ \staging → forAll (vectorOf 5 pair) $ \a → forAll (vectorOf 5 pair) $ \b → cameraReplacementStarts Queued staging a b
+      forAll (chooseInteger (nearMinimum StagingBank, nearMinimum StagingBank + 2470)) $ \staging → forAll (vectorOf 5 pair) $ \a → forAll (vectorOf 5 pair) $ \b → cameraReplacementStarts Queued staging a b
   it "keeps and completes every replacement of a camera description whose load is running, at any staging from the minimum" $
     withNumTests 2000 $
-      forAll (chooseInteger (1530, 4000)) $ \staging → forAll (vectorOf 5 pair) $ \a → forAll (vectorOf 5 pair) $ \b → cameraReplacementStarts Running staging a b
+      forAll (chooseInteger (nearMinimum StagingBank, nearMinimum StagingBank + 2470)) $ \staging → forAll (vectorOf 5 pair) $ \a → forAll (vectorOf 5 pair) $ \b → cameraReplacementStarts Running staging a b
   it "replaces a view's demand exactly as a withdrawal followed by a fresh demand, at every state random sequences reach" $
     withNumTests 300 $
-      forAll ((,) <$> chooseInteger (4384, 6400) <*> chooseInteger (1530, 3600)) $ \(resident, staging) →
+      forAll ((,) <$> chooseInteger (nearMinimum ResidentBank, nearMinimum ResidentBank + 2016) <*> chooseInteger (nearMinimum StagingBank, nearMinimum StagingBank + 2070)) $ \(resident, staging) →
         forAll seedsOf $ \seeds → case limitsNear resident staging of
           Nothing → counterexample ("a configuration at or above the minimum was refused: " <> show (resident, staging)) False
           Just limits → replacementIsWithdrawThenAdmit limits seeds
   it "keeps the prefix of a camera description that the ordinary admission leaves, region by region, at every state random sequences reach" $
     withNumTests 300 $
-      forAll ((,) <$> chooseInteger (4384, 6400) <*> chooseInteger (1530, 3600)) $ \(resident, staging) →
+      forAll ((,) <$> chooseInteger (nearMinimum ResidentBank, nearMinimum ResidentBank + 2016) <*> chooseInteger (nearMinimum StagingBank, nearMinimum StagingBank + 2070)) $ \(resident, staging) →
         forAll seedsOf $ \seeds → case limitsNear resident staging of
           Nothing → counterexample ("a configuration at or above the minimum was refused: " <> show (resident, staging)) False
           Just limits → keptPrefixIsOrdinary limits seeds

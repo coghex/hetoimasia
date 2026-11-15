@@ -812,6 +812,10 @@ failureReply = \case
   NameInUse → expected "name_in_use" "an arena of this name is open or being opened in this content root"
   Superseded why → ProviderFailure ("terrain: a request was overtaken and cannot be admitted again: " <> Text.take 200 why)
   HostFailure why → ProviderFailure ("terrain: " <> Text.take 200 why)
+  -- INTERIM until TRA-23 maps them: the typed storage outcomes (and source_complexity) have no declared Lua code, so they
+  -- take the contract's existing path for an outcome the service never declared, a defect of the host. 'terrainCodes' is
+  -- unchanged, and none is ever presented as success, busy, another code or air.
+  StorageFailed fault → ProviderFailure ("terrain: a storage outcome with no Lua code before TRA-23: " <> Terrain.faultCode fault)
   where
     expected code message = ProviderExpected (ExpectedFailure code message Nothing Nothing)
 
@@ -854,6 +858,9 @@ answerReply ceiling' = \case
         ]
   ARemoved answer → withRevision (removeRevision answer) $ \revision → VRecord [("changed", VBoolean (removeChangedFlag answer)), ("revision", VInteger revision)]
   AOpened _ → ProviderFailure "terrain: a lease answer reached the value conversion"
+  AGrown _ → ProviderFailure "terrain: a creator's growth answer reached the value conversion (no Lua schema before TRA-23)"
+  ARetried _ → ProviderFailure "terrain: a creator's retry answer reached the value conversion (no Lua schema before TRA-23)"
+  AKnowledge _ → ProviderFailure "terrain: a knowledge answer reached the value conversion (no Lua schema in this slice)"
   AAttached _ → ProviderFailure "terrain: a lease answer reached the value conversion"
   where
     withRevision revision build = case revisionOf ceiling' revision of
@@ -1040,7 +1047,6 @@ declination = \case
   where
     bankName = \case
       Terrain.BusyModel _ → "bank"
-      Terrain.BusyRetainedEdits → "retained edits"
       Terrain.BusyArenas → "arenas"
       Terrain.BusyLeases → "leases"
       Terrain.BusyViews → "views"

@@ -57,6 +57,7 @@ module Test.TerrainRuntime.Storage.Harness
   , Inc (..)
   , addGate
   , addGateAfter
+  , addGateOnce
   , events
   , countEvents
   , clearEvents
@@ -313,6 +314,14 @@ addAfterGate p match = do
 addGate ∷ Probe → (NativeOp → Bool) → IO Gate
 addGate p = addGateAfter p 0
 
+-- | Hold only the first matching call, until the gate opens; every later one passes.
+addGateOnce ∷ Probe → (NativeOp → Bool) → IO Gate
+addGateOnce p match = do
+  g ← newGate
+  sk ← newTVarIO minBound
+  atomically (modifyTVar' (pGates p) ((match, g, sk) :))
+  pure g
+
 -- | 'addGate' after the first @skip@ matching calls have passed.
 addGateAfter ∷ Probe → Int → (NativeOp → Bool) → IO Gate
 addGateAfter p skip match = do
@@ -388,7 +397,12 @@ seamFor p = Seam wrapped before after
           _ → pure ()
       gates ← readTVarIO (pGates p)
       forM_ [(g, sk) | (m, g, sk) ← gates, m op] $ \(g, sk) → do
-        skipped ← atomically (readTVar sk >>= \n → if n > 0 then writeTVar sk (n - 1) >> pure True else pure False)
+        -- a once-only gate ('addGateOnce', marked minBound) holds the first call it meets and lets
+        -- every later one pass
+        skipped ← atomically $ readTVar sk >>= \n →
+          if n == minBound then writeTVar sk maxBound >> pure False
+          else if n > 0 then writeTVar sk (n - 1) >> pure True
+          else pure False
         unless skipped $ do
           atomically (modifyTVar' (gReached g) (+ 1))
           atomically (readTVar (gOpen g) >>= check)

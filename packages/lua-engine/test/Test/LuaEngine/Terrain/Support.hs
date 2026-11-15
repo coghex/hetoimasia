@@ -39,6 +39,7 @@ module Test.LuaEngine.Terrain.Support
   , newGate
   , gatedProbe
   , removalProbe
+  , removalProbeIn
   , awaitReached
   , pumpUntilReached
   , openGate
@@ -47,7 +48,11 @@ module Test.LuaEngine.Terrain.Support
   ) where
 
 import Control.Concurrent.MVar (MVar, newEmptyMVar, takeMVar, tryPutMVar, tryTakeMVar)
-import Data.IORef (modifyIORef', newIORef, readIORef)
+import qualified Data.ByteString.Char8 as BC
+import Hetoimasia.Terrain.Runtime.Storage (filesystemOf, minHeadroomBytes, mkStorageConfig)
+import Hetoimasia.Terrain.Runtime.Store (StoreSpec (..), defaultStoreSpec, minAllowanceBytes)
+import System.IO.Temp (withSystemTempDirectory)
+import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
 import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, retry, writeTVar)
 import Control.Exception (onException)
 import Control.Monad (void, when)
@@ -67,7 +72,7 @@ import Hetoimasia.Scripting.Lua.Value (Schema (SCapability, SInteger, SText), Va
 import Hetoimasia.LuaEngine.Terrain
 import Hetoimasia.Terrain.Cell (Cell (..), materialIdString)
 import Hetoimasia.Terrain.Coordinate (tileCoord)
-import Hetoimasia.Terrain.Residency (LimitsSpec (..), Revision (..), mkLimits)
+import Hetoimasia.Terrain.Residency (LimitsSpec (..), Revision (..), mkLimits, RequestId)
 import Data.Maybe (fromMaybe, listToMaybe)
 import Hetoimasia.Terrain.Runtime
 import Test.Hspec (Expectation, expectationFailure, shouldThrow)
@@ -93,6 +98,13 @@ data Rig = Rig
 quiet ∷ Logger
 quiet = mkLogger defaultLogFilter (callbackSink (\_ → pure ()))
 
+-- | The smallest allowance an arena may have (64 MiB), unless the configuration names its own: routine
+-- suites never reserve the 1 GiB default.
+smallestAllowance ∷ Config → Config
+smallestAllowance config
+  | configStore config == defaultStoreSpec = config {configStore = defaultStoreSpec {specAllowanceBytes = toInteger minAllowanceBytes}}
+  | otherwise = config
+
 -- | A rig over the default service configuration and no probe.
 withRig ∷ (Rig → IO a) → IO a
 withRig = withRigProbe defaultConfig noProbe
@@ -112,8 +124,16 @@ withRigProbe config probe = withRigHooks config probe noTerrainHooks
 -- | A rig whose adapter tells these hooks of the windows a race is decided in.
 withRigHooks ∷ Config → Probe → TerrainHooks → (Rig → IO a) → IO a
 withRigHooks config probe terrainHooks body =
-  withWorkerGroup $ \group →
-    withTerrainService config (Ports alwaysAdmitting (standaloneSupervisor group) quiet probe) $ \service → do
+  -- The arenas' private files are real reserved files in a temporary directory, through the production
+  -- adapter; the directory's filesystem is named the way the backend reads it and qualified for this run
+  -- (the production list is not widened), and an arena reserves the smallest allowance unless the
+  -- configuration names its own.
+  withSystemTempDirectory "hetoimasia-lua-terrain" $ \dir → do
+    let directory = BC.pack dir
+    name ← filesystemOf directory >>= either (\f → fail ("cannot name the test filesystem: " <> show f)) pure
+    storage ← either (\e → fail (show e)) pure (mkStorageConfig [name] minHeadroomBytes)
+    withWorkerGroup $ \group →
+     withTerrainService (smallestAllowance config) (Ports alwaysAdmitting (standaloneSupervisor group) quiet probe (storagePort group storage directory)) $ \service → do
       facade ← newTerrainFacade fixedM1Profile service
       session ← newUnique
       signals ← newTVarIO Set.empty
@@ -380,18 +400,31 @@ untilPrinted world marker =
 -- found at its staging (only a removal is staged through that point), and the gate holds it where it is about to be offered to the
 -- arbitration, which for a request on logical time is only once its position has been reached.
 removalProbe ∷ Gate → IO Probe
-removalProbe gate = do
+removalProbe gate = fst <$> removalProbeIn gate
+
+-- | 'removalProbe', and whether the held removal holds the session's mutating transaction while it is held: the
+-- service's own report that the slot was granted to it ('PointGranted') came before the hold. On the backed service
+-- the commit point is the publication decision, after the grant and the writes, so a removal held there holds the
+-- slot and its transaction's credits; this is how an example proves it is inside that window rather than asserting
+-- it.
+removalProbeIn ∷ Gate → IO (Probe, IO Bool)
+removalProbeIn gate = do
   removal ← newIORef Nothing
-  pure . Probe $ \point → case point of
-    PointStaging rid → modifyIORef' removal (\held → maybe (Just rid) Just held)
-    PointBeforeCommit rid → do
-      mine ← readIORef removal
-      when (mine == Just rid) $ do
-        armed ← readTVarIO (gateArmed gate)
-        when armed $ do
-          _ ← tryPutMVar (gateArrived gate) ()
-          takeMVar (gateOpen gate)
-    _ → pure ()
+  granted ← newIORef ([] ∷ [RequestId])
+  heldInSlot ← newIORef False
+  let probe = Probe $ \point → case point of
+        PointStaging rid → modifyIORef' removal (\held → maybe (Just rid) Just held)
+        PointGranted (Just rid) _ → modifyIORef' granted (rid :)
+        PointBeforeCommit rid → do
+          mine ← readIORef removal
+          when (mine == Just rid) $ do
+            armed ← readTVarIO (gateArmed gate)
+            when armed $ do
+              readIORef granted >>= writeIORef heldInSlot . elem rid
+              _ ← tryPutMVar (gateArrived gate) ()
+              takeMVar (gateOpen gate)
+        _ → pure ()
+  pure (probe, readIORef heldInSlot)
 
 -- | The service's default configuration, and no probe: what an example that holds nothing runs over.
 defaultConfigForRaces ∷ Config

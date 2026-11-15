@@ -911,7 +911,10 @@ inputSpec = describe "input calls" $ do
         withFvm world runtime (presentationShape {shGraphics = Just (injectionOpt True gx)}) $ \fvm → do
           _ ← spawn world fvm "modules-test" mainPath
           _ ← spawn world fvm "modules-test" mainPath
-          pumpUntil world (advanceClock world 2000000000 >> (elem "ran" <$> outLines world))
+          -- The late module is a content request of the first instance, evaluated when its read completes:
+          -- nothing orders it before the second instance's update, so the wait is for both of their lines.
+          let lateLines = filter ("late " `Text.isPrefixOf`)
+          pumpUntil world (advanceClock world 2000000000 >> outLines world >>= \out → pure (elem "ran" out && length (lateLines out) >= 2))
           printed ← outLines world
           let named prefix = [line | line ← printed, prefix `Text.isPrefixOf` line]
           named "late poll => " `shouldSatisfy` all (\line → "false ; " `Text.isPrefixOf` Text.drop 13 line || "services are not available while a module is evaluated" `Text.isInfixOf` line)

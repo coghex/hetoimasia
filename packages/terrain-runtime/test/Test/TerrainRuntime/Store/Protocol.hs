@@ -10,12 +10,15 @@
 module Test.TerrainRuntime.Store.Protocol (spec, fullSpec) where
 
 import Control.Monad (foldM, forM, forM_)
+import Data.Bifunctor (first)
 import qualified Data.ByteString as BS
 import Hetoimasia.Terrain.Coordinate (TileCoord)
 import Hetoimasia.Terrain.Discovery (Allowance (..), Env, Node (..), ReadSet (..), Record (..), RecordKey (..), Root (..), allowanceOf, envLimits, maxBatchUpdates, Step (..), candidateReport, reportWrites, pendingObligations, retainedHeader, retainedProvider, stepDiscoveryTraced, worstEdgeReads, worstEdgeWrites, worstEditReads, worstEditWrites)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Format
 import Hetoimasia.Terrain.Runtime.Store.Internal.Model
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan
+import Hetoimasia.Terrain.Runtime.Store.Internal.Protocol
+import qualified Hetoimasia.Terrain.Runtime.Store.Internal.Protocol as P
 import Hetoimasia.Terrain.Runtime.Store.Internal.State
 import Hetoimasia.Terrain.Runtime.Store.Internal.Tree
 import Hetoimasia.Terrain.Residency (ArenaId (..))
@@ -40,13 +43,6 @@ noCounts = Counts 0 0 0 0 0 0 0
 addCounts ∷ Counts → Counts → Counts
 addCounts (Counts a b c d e f g) (Counts a' b' c' d' e' f' g') = Counts (a + a') (b + b') (c + c') (d + d') (max e e') (max f f') (max g g')
 
-windowResult ∷ CapacityWhy → Bool
-windowResult c = case c of
-  WindowExceeded _ → True
-  WindowBytesExceeded _ → True
-  ProbesExceeded _ → True
-  _ → False
-
 -- | One plan, driven as the facade documents: 'Pending' and 'PendingProbes' fetch, 'Checkpoint' builds a fresh window with the
 -- facts, a window result builds a fresh window with the work halved ('reduceWork'), 'LooseExceeded' shrinks like any other
 -- batch and, at the smallest unit, runs maintenance and plans again; anything else that is refused is a failure. Starts at the
@@ -61,38 +57,84 @@ drive h0 limit = driveFrom h0 (limitWork limit (storeWindow (hStore h0)))
 maxProtocolSteps ∷ Int
 maxProtocolSteps = (worstEditReads + 1) * (maxWindowPages + 1) + 1000
 
--- | 'drive' from a given window (one that may carry facts).
+-- | 'drive' from a given window (one that may carry facts). The caller is the PRODUCTION driver
+-- ("Hetoimasia.Terrain.Runtime.Store.Internal.Protocol"), which the terrain owner runs: this loop only supplies the pages it
+-- asks for from the disk and commits the maintenance it asks for, so every limit this suite checks is checked on the code
+-- that ships, and a copy of the protocol cannot drift from it.
 driveFrom ∷ H → Window → (H → Window → Planned) → Either String (H, Planned, Counts)
-driveFrom h0 w0 planner = loop h0 w0 noCounts (0 ∷ Int)
+driveFrom h0 w0 planner = loop h0 (newDriverIn (hStore h0) w0 (planner h0)) noCounts (0 ∷ Int)
   where
-    loop h w c0 n
+    loop h d c0 n
       | n > maxProtocolSteps = Left ("the protocol did not settle in " <> show maxProtocolSteps <> " steps")
-      | otherwise = let c = c0 {cProbePeak = max (cProbePeak c0) (windowProbeCount w)} in case planner h w of
-          Pending p → case diskRead (hDisk h) p of
-            Nothing → Left ("pending page not on disk: " <> show p)
-            Just bs → case windowInsert (cfgUsablePages (hCfg h)) p bs w of
-              Left e → Left ("page " <> show p <> " refused: " <> show e)
-              Right w' → loop h w' c {cPages = cPages c + 1} (n + 1)
-          PendingProbes ps → loop h (foldl (\w' p → windowProbe (cfgUsablePages (hCfg h)) p (maybe BS.empty id (diskRead (hDisk h) p)) w') w ps) c {cPages = cPages c + 1} (n + 1)
-          Checkpoint fs → let w' = windowCheckpoint fs w in loop h w' c {cCheckpoints = cCheckpoints c + 1, cReadPeak = max (cReadPeak c) (windowSize w), cFacts = max (cFacts c) (windowReadFactCount w')} (n + 1)
-          Refused (Capacity why)
-            | windowResult why →
-                if windowWork w <= 1
-                  then Left ("a window result at the smallest work limit, which must fit: " <> show why)
-                  else loop h (reduceWork w (storeWindow (hStore h))) c {cReductions = cReductions c + 1} (n + 1)
-            | LooseExceeded _ ← why →
-                if windowWork w > 1
-                  then loop h (reduceWork w (storeWindow (hStore h))) c {cReductions = cReductions c + 1} (n + 1)
-                  else do
-                    -- the smallest unit: run maintenance, then plan again
-                    (h', m, c') ← drive h 1 (\hh ww → planMaintenance (hStore hh) ww)
-                    case m of
-                      Planned plan → do
-                        h'' ← commitPlan h' plan
-                        loop h'' (limitWork 1 (storeWindow (hStore h''))) (addCounts c c') {cMaintenance = cMaintenance c + 1} (n + 1)
-                      other → Left ("the loose list is over its bound and maintenance answered " <> take 120 (show other))
-          Refused why → Left ("the protocol met a refusal it does not name: " <> take 300 (show why))
-          other → Right (h, other, c)
+      | otherwise =
+          let c = c0 {cProbePeak = max (cProbePeak c0) (windowProbeCount (driverWindow d))}
+              (d', step) = advance d
+              -- a reduction starts a fresh window, and a fresh checkpoint count
+              resetOk = driverReductions d' == driverReductions d || driverWindowCheckpoints d' == 0
+              counted =
+                c
+                  { cCheckpoints = cCheckpoints c + driverCheckpoints d' - driverCheckpoints d
+                  , cReductions = cReductions c + driverReductions d' - driverReductions d
+                  , cReadPeak = max (cReadPeak c) (driverReadPeak d')
+                  , cFacts = max (cFacts c) (driverFactPeak d')
+                  }
+           in if not resetOk then Left "a window reduction kept the old window's checkpoint count" else case step of
+                Continue → loop h d' counted (n + 1)
+                NeedPages ps → feed False h d' counted n ps
+                NeedProbes ps → feed True h d' counted n ps
+                Ready plan → Right (h, Planned plan, counted)
+                NothingToDo → Right (h, NoWork, counted)
+                WaitsForReader a b → Right (h, BlockedByReader a b, counted)
+                NeedMaintenance → do
+                  -- the smallest unit: run maintenance, then plan again
+                  (h', m, c') ← drive h 1 (\hh ww → planMaintenance (hStore hh) ww)
+                  case m of
+                    Planned plan → do
+                      h'' ← commitPlan h' plan
+                      loop h'' (newDriverIn (hStore h'') (limitWork 1 (storeWindow (hStore h''))) (planner h'')) (addCounts counted c') {cMaintenance = cMaintenance counted + 1} (n + 1)
+                    other → Left ("the loose list is over its bound and maintenance answered " <> take 120 (show other))
+                Replan → Left "the protocol answered Replan on a valid store"
+                Refuse why failure → Left ("the protocol met a refusal it does not name: " <> take 300 (show (why, failure)))
+                Stuck why → Left ("the protocol stalled: " <> stallText why)
+    -- the pages a step asks for, read from the disk (a page never written is nothing to a probe, and absent history to a plan)
+    feed isProbe h d c n ps = do
+      d' ← foldM (give isProbe h) d ps
+      loop h d' c {cPages = cPages c + 1} (n + 1)
+    give isProbe h d p = case diskRead (hDisk h) p of
+      Nothing | isProbe → first supplyText (supplyProbe p BS.empty d)
+      Nothing → Left ("pending page not on disk: " <> show p)
+      Just bs → first supplyText ((if isProbe then supplyProbe else supplyPage) p bs d)
+
+runPlanOnce ∷ H → Env → TileCoord → Window → Planned
+runPlanOnce h env tile = planRemovalWith removalBounds env (hStore h) `flip` tile
+  where
+    removalBounds = removalTight h
+
+stepName ∷ P.Step → String
+stepName = \case
+  Continue → "Continue"
+  NeedPages _ → "NeedPages"
+  NeedProbes _ → "NeedProbes"
+  Ready _ → "Ready"
+  NothingToDo → "NothingToDo"
+  WaitsForReader _ _ → "WaitsForReader"
+  NeedMaintenance → "NeedMaintenance"
+  Replan → "Replan"
+  Refuse _ _ → "Refuse"
+  Stuck _ → "Stuck"
+
+supplyText ∷ Supply → String
+supplyText = \case
+  PageRefusedByWindow p e → "page " <> show p <> " refused: " <> show e
+  ProtocolError why → stallText why
+
+stallText ∷ Stall → String
+stallText = \case
+  UnitDidNotFit why → "a window result at the smallest work limit, which must fit: " <> show why
+  PageAlreadyHeld p → "the plan named a page its window already holds: " <> show p
+  PlanRunBeforeSupply ps → "the plan was run before the pages it named were supplied: " <> show ps
+  UnaskedPage p → "a page that was not asked for was supplied: " <> show p
+  TooManyCheckpoints n → "more checkpoints than a plan can take: " <> show n
 
 -- | The window bounds that are exactly the at-once bound of a unit of discovery (one connection inspection) for the heights of
 -- the store's trees: the tightest window the bounds allow it.
@@ -285,6 +327,47 @@ protocolSpec depth = describe "the facade's caller protocol, followed exactly, f
       entryDone b `shouldBe` True
       pure (lim, na, nb)
     printLine ("PROTOCOL fragmented entry: transactions (standard, tight) per starting limit " <> show rows)
+
+  it "drains discovery, a removal and maintenance from an UNLIMITED starting window, not only from the limits 1..64" $ do
+    (_, r1) ← withScene
+    -- a window nobody limited carries 'maxBound' work: the first batch is the widest one, and every reduction below it is the driver's
+    let unlimited hh = driveFrom hh (storeWindow (hStore hh))
+        step run = batchStepWith (\hh env → (\(hh', p, _) → (hh', p)) <$> unlimited hh (\h2 w → planDiscovery env (hStore h2) w)) run
+        go n run
+          | n > (4000 ∷ Int) = Left "discovery did not drain"
+          | otherwise = do
+              (run', progressed) ← step run
+              if progressed then go (n + 1) run' else Right (run', n)
+    (rDone, batches) ← must (go 0 r1)
+    pendingObligations (storeHeader (hStore (runH rDone))) `shouldBe` 0
+    must (checkH (runH rDone))
+    batches `shouldSatisfy` (> 0)
+    let run0 = newRun smallSpec sealedStack 64
+    (_, planned, _) ← must (unlimited (runH run0) (\hh w → planRemovalWith standardBounds (runEnv run0) (hStore hh) w (tileAt 2 2 3)))
+    case planned of
+      Planned _ → pure ()
+      other → expectationFailure ("the removal from an unlimited window was " <> take 200 (show other))
+  it "ends a plan that checkpoints without end in the one typed stall, after exactly the bound, and never loops" $ do
+    -- a planner that always answers a checkpoint (the facts of a real plan's first one) is a defect of the planner: the driver
+    -- ends it at the bound of ONE window, as a stall, never as an Invalid refusal and never by looping
+    (hc, envc, tilec) ← must (chainStore 64 300)
+    let total = cfgUsablePages (hCfg hc)
+        firstCheckpoint w n
+          | n > (400 ∷ Int) = Left "no checkpoint was reached"
+          | otherwise = case runPlanOnce hc envc tilec w of
+              Pending p → case diskRead (hDisk hc) p of
+                Nothing → Left ("pending page not on disk: " <> show p)
+                Just bs → either (Left . show) (\w' → firstCheckpoint w' (n + 1)) (windowInsert total p bs w)
+              PendingProbes ps → firstCheckpoint (foldl (\w' p → windowProbe total p (maybe BS.empty id (diskRead (hDisk hc) p)) w') w ps) (n + 1)
+              Checkpoint f → Right f
+              other → Left ("no checkpoint to repeat: " <> take 120 (show other))
+    facts ← must (firstCheckpoint (limitWork 64 (storeWindow (hStore hc))) 0)
+    let d0 = newDriver (hStore hc) (\_ → Checkpoint facts)
+        run d n = case advance d of
+          (d', Continue) → run d' (n + 1 ∷ Int)
+          (_, Stuck (TooManyCheckpoints k)) → (n, k)
+          (_, other) → error ("unexpected " <> take 80 (stepName other))
+    run d0 0 `shouldBe` (maxCheckpoints, maxCheckpoints)
 
 -- ---------------------------------------------------------------------------
 -- The read phase

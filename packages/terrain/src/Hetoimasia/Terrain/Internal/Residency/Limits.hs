@@ -44,6 +44,7 @@ import Hetoimasia.Terrain.Internal.Residency.Coverage
   , descriptionBytes
   , holdRecordBytes
   , interestRecordBytes
+  , loadRunsBytes
   , regionColumnReserveBytes
   , regionMetadataBytes
   , regionSegmentReserveBytes
@@ -261,7 +262,7 @@ explicitMinimumBytes spec bank = case bank of
   StagingBank →
     maximum
       [ toInteger (commandRecordBytes 0) + 32 * queryN + interest * queryN + queryN * scratch
-      , toInteger (commandRecordBytes 1) + toInteger removalStagingBytes + interest + 256 + 2
+      , toInteger (commandRecordBytes 1) + toInteger removalStagingBytes + interest + 256 + 2 + toInteger (loadRunsBytes (fromInteger z) 1)
       , stored
       ]
   where
@@ -272,7 +273,7 @@ explicitMinimumBytes spec bank = case bank of
     stored = regionStoredBytes x y z
     job = regionJobBytes x y z
     interest = toInteger interestRecordBytes
-    scratch = 256 + 2 * x * y * z
+    scratch = 256 + 2 * x * y * z + toInteger (loadRunsBytes (fromInteger z) (fromInteger (x * y)))
 
 -- | What each bank must hold. Every bank is partitioned into an explicit reserve (the
 -- explicit worst case, 'explicitMinimumBytes') and a camera share (the rest). Camera
@@ -325,7 +326,7 @@ defaultLimits =
     , lAging = 8
     , lQuery = 257
     , lExtent = (16, 16, 32)
-    , lExplicitStaging = 4301280
+    , lExplicitStaging = 25354720
     , lExplicitResident = 179020032
     , lHold = 256
     , lCamera = 16384
@@ -350,7 +351,7 @@ limitQueryRegions = lQuery
 -- | The staging one camera region needs beyond its entry in a description: its interest
 -- and the scratch of a load of the whole extent.
 cameraRegionStagingBytes ∷ Integer → Integer → Integer → Integer
-cameraRegionStagingBytes x y z = toInteger interestRecordBytes + 256 + 2 * x * y * z
+cameraRegionStagingBytes x y z = toInteger interestRecordBytes + 256 + 2 * x * y * z + toInteger (loadRunsBytes (fromInteger z) (fromInteger (x * y)))
 
 -- | What a camera region needs of staging beyond its entry in a description (its
 -- interest and the scratch of a load of the whole extent). A description is bounded so

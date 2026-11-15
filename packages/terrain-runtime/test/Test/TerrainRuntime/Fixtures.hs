@@ -8,6 +8,9 @@ module Test.TerrainRuntime.Fixtures
     withService
   , withServiceUsing
   , withServiceLogged
+  , withServiceSeam
+  , smallestStore
+  , withStoragePort
   , quiet
   , soilOverStone
   , tile
@@ -37,6 +40,7 @@ module Test.TerrainRuntime.Fixtures
 
     -- * Budgets and the independent model
   , tightConfig
+  , tightConfigStaging
   , microConfig
   , microConfigSlots
   , microConfigWith
@@ -56,6 +60,10 @@ module Test.TerrainRuntime.Fixtures
   , configWith
   , settleChecks
 
+    -- * Holding the owner
+  , PreparationHold (..)
+  , preparationHold
+
     -- * Waiting
   , waitFor
   , expectRight
@@ -74,11 +82,19 @@ import Data.Text (Text)
 import Hetoimasia.Terrain.Cell (Cell (..), Column, ZRange, mkColumn, mkZRange, materialIdString)
 import Hetoimasia.Terrain.Shape (shapeIdValue)
 import Hetoimasia.Terrain.Coordinate (RegionCoord (..), TileCoord, tileCoord)
-import Hetoimasia.Terrain.Residency (BusyReason (..), Limits, LimitsSpec (..), Revision (..), mkLimits)
+import Control.Monad (forM_, void, when)
+import Hetoimasia.Terrain.Residency (BusyReason (..), Limits, LimitsSpec (..), RequestId, Revision (..), mkLimits)
 import Hetoimasia.Terrain.Runtime
 import Hetoimasia.Terrain.Runtime.Settlement
 import Hetoimasia.Terrain.Source (CellSpec (..), LayerSpec (..), PatchSpec (..), SourceSpec (..))
+import qualified Data.ByteString.Char8 as BC
+import Hetoimasia.Terrain.Runtime.Backed.Port (StoragePort (..))
+import Hetoimasia.Terrain.Runtime.Storage.Internal.Native (Seam, productionSeam)
+import Hetoimasia.Terrain.Runtime.Storage.Internal.Types (minHeadroomBytes, mkStorageConfig)
+import Hetoimasia.Terrain.Runtime.Store.Internal.State (StoreSpec (..), defaultStoreSpec, minAllowanceBytes)
+import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec (HasCallStack, expectationFailure, shouldBe)
+import Test.TerrainRuntime.Storage.Harness (fsNameOf)
 import Test.Support.Bounded (bounded)
 
 quiet ∷ Logger
@@ -92,9 +108,43 @@ withServiceUsing ∷ Config → SessionAdmission → Probe → (Service → IO a
 withServiceUsing = withServiceLogged quiet
 
 -- | A service whose logger is the given one.
+--
+-- Its arenas' private files are real reserved files in a temporary directory, on whatever
+-- filesystem that directory is on (qualified for the run, as the storage backend's own suite
+-- does), through the production native adapter. A configuration that keeps the default 1 GiB
+-- allowance is given the smallest one (64 MiB): every open really reserves its file.
 withServiceLogged ∷ Logger → Config → SessionAdmission → Probe → (Service → IO a) → IO a
 withServiceLogged logger config admission probe body =
-  withWorkerGroup $ \group → withTerrainService config (Ports admission (standaloneSupervisor group) logger probe) body
+  withServiceSeam logger config admission probe productionSeam body
+
+-- | 'withServiceLogged' with a native seam (the storage backend's harness injects faults there).
+withServiceSeam ∷ Logger → Config → SessionAdmission → Probe → Seam → (Service → IO a) → IO a
+withServiceSeam logger config admission probe seam body =
+  withSystemTempDirectory "hetoimasia-terrain-arenas" $ \dir → do
+    name ← fsNameOf dir
+    storage ← either (fail . show) pure (mkStorageConfig [name] minHeadroomBytes)
+    withWorkerGroup $ \group →
+      withTerrainService (smallestStore config) (Ports admission (standaloneSupervisor group) logger probe (StoragePort group storage (BC.pack dir) seam)) $ \svc → do
+        result ← body svc
+        -- every example: the owner never chose a piece of work again, with nothing performed
+        -- between, after a step of it that changed nothing
+        atomically (inspectIdleRepeatsSTM svc) >>= (`shouldBe` [])
+        pure result
+
+-- | A storage port for a service an example builds itself: a temporary directory on a qualified
+-- filesystem and a worker group of its own for the backend's workers.
+withStoragePort ∷ (StoragePort → IO a) → IO a
+withStoragePort body =
+  withSystemTempDirectory "hetoimasia-terrain-arenas" $ \dir → do
+    name ← fsNameOf dir
+    storage ← either (fail . show) pure (mkStorageConfig [name] minHeadroomBytes)
+    withWorkerGroup $ \group → body (StoragePort group storage (BC.pack dir) productionSeam)
+
+-- | The smallest allowance an arena may have, unless the configuration names its own.
+smallestStore ∷ Config → Config
+smallestStore config
+  | configStore config == defaultStoreSpec = config {configStore = defaultStoreSpec {specAllowanceBytes = toInteger minAllowanceBytes}}
+  | otherwise = config
 
 -- | Stone below level -3, soil from -3 to 40: cells of the first two vertical
 -- regions are solid, the rest air.
@@ -225,10 +275,15 @@ seenAtSettle host = reverse <$> readTVarIO (hostSeen host)
 
 -- | Validated tight limits for a small extent: the smallest resident bank the
 -- approved minimum-budget rule accepts, plus room for @spare@ one-cell regions,
--- and a staging bank twice its minimum. The edit bank is a parameter. Queries
--- name at most four regions, holds two and camera descriptions four.
+-- and a staging bank three times its minimum (rounded up to a thousand). The edit
+-- bank is a parameter. Queries name at most four regions, holds two and camera
+-- descriptions four.
 tightConfig ∷ (Integer, Integer, Integer) → Integer → Integer → Config
-tightConfig (ex, ey, ez) spare edit = defaultConfig {configLimits = limits, configRetainedBytes = fromInteger (stagingFor residentBank)}
+tightConfig = tightConfigStaging 3
+
+-- | 'tightConfig' with a staging bank of the given multiple of its minimum.
+tightConfigStaging ∷ Integer → (Integer, Integer, Integer) → Integer → Integer → Config
+tightConfigStaging factor (ex, ey, ez) spare edit = defaultConfig {configLimits = limits, configRetainedBytes = fromInteger (stagingFor residentBank)}
   where
     spec bytes staging =
       LimitsSpec
@@ -250,7 +305,7 @@ tightConfig (ex, ey, ez) spare edit = defaultConfig {configLimits = limits, conf
     smallest = fromMaybe (error "no resident bank satisfies the minimum budgets") (listToMaybe [r | r <- [100, 200 .. 4000000], Just _ <- [valid r 1000000]])
     stagingFor bytes = fromMaybe (error "no staging bank satisfies the minimum budgets") (listToMaybe [t | t <- [1000, 2000 .. 4000000], Just _ <- [valid bytes t]])
     residentBank = smallest + spare * 400
-    limits = fromMaybe (error "tight limits are invalid") (valid residentBank (3 * stagingFor residentBank))
+    limits = fromMaybe (error "tight limits are invalid") (valid residentBank (factor * stagingFor residentBank))
 
 -- | The smallest validated limits for a single-cell-wide extent of two levels, one
 -- region per query, two commands and no holds or camera: a resident bank that
@@ -388,6 +443,7 @@ configWith change = defaultConfig {configLimits = limitsWith change}
 settleChecks ∷ Service → IO ()
 settleChecks svc = do
   inspectInvariants svc >>= (`shouldBe` [])
+  inspectBacked svc >>= (`shouldBe` [])
   inspectDefects svc >>= (`shouldBe` [])
 
 -- ---------------------------------------------------------------------------
@@ -406,3 +462,37 @@ expectSuccess = either (\e → expectationFailure ("expected success, got " <> s
 
 okOf ∷ (HasCallStack, Show e) ⇒ IO (Either e a) → IO a
 okOf action = action >>= expectRight
+
+-- | A hold of the owner, once, as it begins preparing a request for which the service keeps something
+-- between reads (picked from 'inspectRequestScratchSTM' by the selector given): a surface after its
+-- window slid, a retry after its write probe. The service is named once built.
+data PreparationHold = PreparationHold
+  { holdProbe ∷ Probe
+  -- ^ The probe to build the service with.
+  , holdService ∷ Service → IO ()
+  -- ^ Name the service the probe inspects.
+  , holdReached ∷ IO ()
+  -- ^ Wait (bounded) until the owner is held.
+  , holdRelease ∷ IO ()
+  -- ^ Let the owner go on (idempotent).
+  }
+
+preparationHold ∷ (([RequestId], [RequestId]) → [RequestId]) → IO PreparationHold
+preparationHold select = do
+  named ← newTVarIO Nothing
+  held ← newEmptyTMVarIO
+  release ← newEmptyTMVarIO
+  let probe = Probe $ \case
+        PointPreparing rid → readTVarIO named >>= \service → forM_ service $ \svc → do
+          scratch ← atomically (inspectRequestScratchSTM svc)
+          when (rid `elem` select scratch) $ do
+            first ← atomically (tryPutTMVar held ())
+            when first (atomically (readTMVar release))
+        _ → pure ()
+  pure
+    PreparationHold
+      { holdProbe = probe
+      , holdService = atomically . writeTVar named . Just
+      , holdReached = bounded (atomically (readTMVar held))
+      , holdRelease = atomically (void (tryPutTMVar release ()))
+      }

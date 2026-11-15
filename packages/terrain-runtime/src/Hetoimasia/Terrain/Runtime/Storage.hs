@@ -62,6 +62,8 @@ module Hetoimasia.Terrain.Runtime.Storage
   , minHeadroomBytes
   , maxQualifiedNames
   , maxQualifiedNameBytes
+  , filesystemOf
+  , filesystemOfWith
 
     -- * Handles
   , Backing
@@ -141,6 +143,14 @@ module Hetoimasia.Terrain.Runtime.Storage
   ) where
 
 import Control.Concurrent.STM (TVar)
+import Control.Exception (Exception, ExceptionWithContext (..), SomeException, fromException, rethrowIO, throwIO, tryWithContext)
+import Data.Maybe (fromMaybe)
+import Hetoimasia.Foundation.Resource (cleanupFailuresInContext, composeCleanup, withResourceLabelled)
+import Data.ByteString (ByteString)
+import qualified Data.ByteString as BS
+import Hetoimasia.Terrain.Runtime.Storage.Internal.File (Created (..), closeFile, createPrivate)
+import Hetoimasia.Terrain.Runtime.Storage.Internal.Native (Native (..), Seam (..))
+import Hetoimasia.Terrain.Runtime.Storage.Internal.Volume (VolumeProfile (..), profileOf)
 import Hetoimasia.Foundation.Log (Logger)
 import Hetoimasia.Foundation.Worker (WorkerGroup)
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Native (productionSeam)
@@ -157,3 +167,74 @@ import Hetoimasia.Terrain.Runtime.Store.Internal.Admission (Admission)
 withStorage ∷ StorageConfig → TVar Admission → WorkerGroup → Logger → (StorageService → IO a) → IO a
 withStorage config admission group logger =
   withStorageService (StoragePorts admission group logger productionSeam config)
+
+-- | The name of the filesystem a directory is on, as THE BACKEND ITSELF reads it: a private file is
+-- created in the directory exactly as an arena's is, the volume is profiled from that descriptor by the
+-- same code an open's qualification runs, and the file is unlinked and closed on every exit. A suite
+-- outside this package names the volume it runs on with it, so that ITS 'StorageConfig' can qualify that
+-- volume the way this package's own harness does.
+--
+-- It qualifies nothing: whether a name is qualified stays the caller's configuration ('mkStorageConfig'),
+-- and 'defaultQualified' is not widened by it. The answer is the service's own copy of the name, bounded
+-- by 'maxQualifiedNameBytes' (a longer name is refused as invalid, never truncated).
+filesystemOf ∷ ByteString → IO (Either StorageFailure ByteString)
+filesystemOf = filesystemOfWith productionSeam
+
+-- | 'filesystemOf' through a given seam. THE FILE IT CREATES IS OWNED BY A SCOPE ('withResourceLabelled'):
+-- its unlink and its close are both attempted on every exit, and a cleanup that fails is never dropped.
+--
+-- * Profiling succeeded, cleanup succeeded: the name (or 'InvalidRequest' for a name out of bounds).
+-- * Profiling failed, cleanup succeeded: 'Left' with the profiling failure, as before.
+-- * Cleanup failed: the call throws, the profiling failure (when there is one) primary and every cleanup
+--   failure retained beside it ('cleanupFailures' reads them), never a 'Right' that left a file or a
+--   descriptor behind.
+filesystemOfWith ∷ Seam → ByteString → IO (Either StorageFailure ByteString)
+filesystemOfWith seam dir
+  | BS.null dir || BS.length dir > maxDirectoryBytes || BS.elem 0 dir = pure (Left (InvalidRequest DirectoryInvalid))
+  | otherwise = do
+      outcome ← tryWithContext @SomeException $
+        withResourceLabelled "filesystemOf: the profiling file" acquire release $ \created →
+          profileOf seam (crFd created) >>= \case
+            Left (op, errno) → throwIO (ProfileFailed op errno)
+            Right profile → pure profile
+      case outcome of
+        Right profile
+          | BS.length (vpFilesystem profile) > maxQualifiedNameBytes || BS.null (vpFilesystem profile) →
+              pure (Left (InvalidRequest DirectoryInvalid))
+          | otherwise → pure (Right (BS.copy (vpFilesystem profile)))
+        Left caught@(ExceptionWithContext context e)
+          | Just (NotCreated failure) ← fromException e → pure (Left (StorageIo failure))
+          | Just (ProfileFailed op errno) ← fromException e
+          , null (cleanupFailuresInContext context) →
+              pure (Left (StorageIo (IoFailure op (IoErrno errno) Nothing Nothing 0 0)))
+          | otherwise → rethrowIO caught
+  where
+    acquire = createPrivate seam dir 0 (const (pure ())) >>= either (throwIO . NotCreated) pure
+    -- both are attempted, whatever the first did: the first failure is raised, the other retained beside it
+    release created = do
+      unlinked ← tryWithContext @SomeException (nativeUnlink (seamNative seam) dir (crName created))
+      closed ← tryWithContext @SomeException (closeFile seam (crFd created))
+      evidence ← fmap concat . sequence $
+        [ outcomeOf "unlink" IoUnlink unlinked
+        , outcomeOf "close" IoClose closed
+        ]
+      case evidence of
+        [] → pure ()
+        (_, first) : rest → composeCleanup (Just first) rest >>= rethrowIO . fromMaybe first
+    outcomeOf label op = \case
+      Right (Right ()) → pure []
+      Right (Left errno) → (\ewc → [(label, ewc)]) <$> evidenceOf (OpenCleanupFailed op errno)
+      Left ewc → pure [(label, ewc)]
+
+-- | The profiling file could not be created: nothing to clean up.
+newtype NotCreated = NotCreated IoFailure
+  deriving stock (Show)
+
+instance Exception NotCreated
+
+-- | Profiling the file's volume failed: raised inside the scope so it stays primary beside any cleanup
+-- failure.
+data ProfileFailed = ProfileFailed !IoOp !Errno
+  deriving stock (Show)
+
+instance Exception ProfileFailed

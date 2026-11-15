@@ -5,14 +5,13 @@ module Test.TerrainRuntime.Hardening (spec) where
 import Control.Concurrent (killThread, throwTo, yield)
 import Control.Concurrent.MVar
 import Control.Concurrent.STM
-import Control.Exception (ErrorCall (..), ExceptionWithContext (..), Exception (..), SomeException, asyncExceptionFromException, asyncExceptionToException, catch, fromException, throwIO, try)
+import Control.Exception (ErrorCall (..), ExceptionWithContext (..), Exception (..), SomeException, asyncExceptionFromException, asyncExceptionToException, catch, finally, fromException, throwIO, try)
 import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (find)
-import Control.Monad (forM_, void, when)
+import Control.Monad (forM, forM_, void, when)
 import qualified Data.Text as T
 import Hetoimasia.Foundation.Log (LogEntry (..), callbackSink, defaultLogFilter, mkLogger)
 import Hetoimasia.Terrain.Cell (zRangeLo)
-import Hetoimasia.Terrain.Changes (changesBytes)
 import Hetoimasia.Terrain.Coordinate (RegionCoord (..), decomposeTile, mkLocalCoord)
 import Hetoimasia.Terrain.Residency
 import Hetoimasia.Terrain.Resident (residentCell)
@@ -27,20 +26,20 @@ import Hetoimasia.Terrain.Runtime.Settlement
 import Test.Hspec
 import Test.Support.Bounded (bounded)
 import Test.Support.Owned (withOwnedThread)
+import Hetoimasia.Terrain.Runtime.Storage.Internal.Native (NativeOp (..))
 import Test.TerrainRuntime.Fixtures
+import qualified Test.TerrainRuntime.Storage.Harness as H
 
 spec ∷ Spec
 spec = describe "Accounting and lifetime hardening" $ do
-  it "accounts a coalescing removal that shrinks the retained changes without underflow" $
+  it "commits a coalescing removal to the store and retains nothing in RAM" $
     withService defaultConfig $ \svc → do
       (_, lease) <- openMain svc "main"
       -- Levels 0 and 2 are two intervals; removing 1 joins them into one.
       forM_ [0, 2, 1] $ \z → removeCell' svc lease (tile 0 0 z)
-      view <- inspectArena svc lease >>= maybe (fail "arena vanished") pure
-      changesBytes (viewChanges view) `shouldBe` 64
       model <- inspectModel svc
-      -- The model's retained account never decreases: the saving is not credited.
-      [arenaRetainedBytes a | a ← modelArenas model] `shouldBe` [80]
+      -- The model's retained account stays zero: every removal is the store's.
+      [arenaRetainedBytes a | a ← modelArenas model] `shouldBe` [0]
       answers <- mapM (\z → readCell svc lease (tile 0 0 z)) [0, 1, 2, 3]
       map cellIs answers `shouldBe` [True, True, True, False]
       settleChecks svc
@@ -271,7 +270,7 @@ spec = describe "Accounting and lifetime hardening" $ do
     let logger = mkLogger defaultLogFilter (callbackSink (\entry → if entryMessage entry == "terrain owner stopped" then note "owner log: stopped" else pure ()))
         served =
           withWorkerGroup $ \group →
-            ( withTerrainService defaultConfig (Ports alwaysAdmitting (signalling group started) logger noProbe) (\_ → atomically retry)
+            ( withStoragePort $ \port → withTerrainService (smallestStore defaultConfig) (Ports alwaysAdmitting (signalling group started) logger noProbe port) (\_ → atomically retry)
                 `catch` (\e → note "service returned" >> throwIO (e ∷ SomeException))
             )
     withOwnedThread served $ \thread waitServed → do
@@ -316,7 +315,7 @@ spec = describe "Accounting and lifetime hardening" $ do
     outcome <- try $
       withLoggingLifetime quiet $ \lifetime →
         withSupervision lifetime $ \control →
-          withTerrainService defaultConfig (Ports alwaysAdmitting (supervisedOwner control) quiet probe) $ \svc → do
+          withStoragePort $ \port → withTerrainService (smallestStore defaultConfig) (Ports alwaysAdmitting (supervisedOwner control) quiet probe port) $ \svc → do
             (_, lease) <- openMain svc "main"
             bad <- newHost False
             let failing = (hostEndpoint svc Nothing bad) {endpointSettle = \_ → throwSTM (ErrorCall "closure callback failed")}
@@ -451,7 +450,7 @@ spec = describe "Accounting and lifetime hardening" $ do
     outcome <- try $
       withLoggingLifetime quiet $ \lifetime →
         withSupervision lifetime $ \control →
-          withTerrainService defaultConfig (Ports alwaysAdmitting (supervisedOwner control) quiet (gatedProbe (\p → case p of PointStaging _ → True; _ → False) gate)) (\svc → (do
+          withStoragePort $ \port → withTerrainService (smallestStore defaultConfig) (Ports alwaysAdmitting (supervisedOwner control) quiet (gatedProbe (\p → case p of PointStaging _ → True; _ → False) gate) port) (\svc → (do
             (creatorA, leaseA) <- openMain svc "a"
             (_, leaseB) <- openMain svc "b"
             other <- okOf (registerClient svc)
@@ -501,33 +500,34 @@ spec = describe "Accounting and lifetime hardening" $ do
       settleChecks svc
 
   it "keeps a request that waits to be admitted again charged until it is readmitted or ends" $ do
-    -- Every transfer fails, so an edited region stays protected; the bank holds about
-    -- one region, so a request that needs another cannot be admitted again.
-    let probe = Probe $ \point → case point of
-          PointHandoff _ _ → throwIO (ErrorCall "every transfer fails")
-          _ → pure ()
-    reported <- newTVarIO (0 ∷ Int)
-    withServiceUsing microConfig alwaysAdmitting (Probe (\p → probePoint probe p >> case p of PointHandoffReported {} → atomically (modifyTVar' reported (+ 1)); _ → pure ())) $ \svc → do
+    -- A pending read of the edited region (its host not yet eligible, so it holds no removal back)
+    -- keeps that region resident (the baseline kept it protected by failing every transfer; a
+    -- backed commit transfers nothing), and the bank holds about one region, so a request that
+    -- needs another cannot be admitted again. (Three command slots: the waiting request, the
+    -- keeper and one more read; the baseline's two had no keeper.)
+    withServiceUsing (microConfigSlots 3) alwaysAdmitting noProbe $ \svc → do
       client <- okOf (registerClient svc)
       let definition = layered [(Just 0, Just 2, "soil", 0), (Just 32, Just 34, "stone", 0)] [] ∷ SourceSpec
       lease <- okOf (openArena svc client "waits" definition) >>= await svc >>= expectSuccess
       surfaceHost <- newHost False
       _ <- okOf (surfaceWith svc (hostEndpoint svc Nothing surfaceHost) lease (column 0 0))
       waitFor (readTVar (hostReady surfaceHost) >>= \n → check (n >= 1))
-      -- Two edits bring the column's top down into the other region.
-      _ <- removeCell' svc lease (tile 0 0 33)
-      waitFor (readTVar reported >>= \n → check (n >= 1))
-      _ <- removeCell' svc lease (tile 0 0 32)
-      waitFor (readTVar reported >>= \n → check (n >= 2))
-      waitFor (inspectReadmissionWaitsSTM svc >>= \n → check (n == 1))
-      -- It is charged: it holds a command slot, so only one more fits two, and the
-      -- state is coherent.
-      inspectInvariants svc >>= (`shouldBe` [])
-      first' <- okOf (cellAt svc lease (tile 0 0 32))
-      cellAt svc lease (tile 0 0 33) >>= \r → fmap isBusy (refusedWith r) `shouldBe` Just True
-      void (cancelPending svc first')
-      -- Ending the arena ends the request once and returns its charge.
-      closeService svc
+      keeper <- newHost False
+      _ <- okOf (cellWith svc (hostEndpoint svc Nothing keeper) lease (tile 0 0 32))
+      waitFor (readTVar (hostReady keeper) >>= \n → check (n >= 1))
+      do
+        -- Two edits bring the column's top down into the other region.
+        _ <- removeCell' svc lease (tile 0 0 33)
+        _ <- removeCell' svc lease (tile 0 0 32)
+        waitFor (inspectReadmissionWaitsSTM svc >>= \n → check (n == 1))
+        -- It is charged: it holds a command slot, so beside the keeper only one more fits
+        -- three, and the state is coherent.
+        inspectInvariants svc >>= (`shouldBe` [])
+        first' <- okOf (cellAt svc lease (tile 0 0 32))
+        cellAt svc lease (tile 0 0 33) >>= \r → fmap isBusy (refusedWith r) `shouldBe` Just True
+        void (cancelPending svc first')
+        -- Ending the arena ends the request once and returns its charge.
+        closeService svc
       settledOf surfaceHost `shouldReturn` [Failed ArenaClosed]
       inspectReadmissionWaits svc `shouldReturn` 0
       inspectInvariants svc >>= (`shouldBe` [])
@@ -536,10 +536,7 @@ spec = describe "Accounting and lifetime hardening" $ do
     -- The bank holds two records. The pending surface query holds one from admission and
     -- a removal the other, so a second removal is refused rather than admitted into
     -- room the waiting query will need.
-    let probe = Probe $ \point → case point of
-          PointHandoff _ _ → throwIO (ErrorCall "every transfer fails")
-          _ → pure ()
-    withServiceUsing ((microConfigSlots 6) {configRetainedBytes = 320}) alwaysAdmitting probe $ \svc → do
+    withServiceUsing ((microConfigSlots 6) {configRetainedBytes = 320}) alwaysAdmitting noProbe $ \svc → do
       client <- okOf (registerClient svc)
       let definition = layered [(Just 0, Just 2, "soil", 0), (Just 32, Just 34, "stone", 0)] [] ∷ SourceSpec
       lease <- okOf (openArena svc client "full" definition) >>= await svc >>= expectSuccess
@@ -560,7 +557,7 @@ spec = describe "Accounting and lifetime hardening" $ do
     outcome <- try $
       withLoggingLifetime quiet $ \lifetime →
         withSupervision lifetime $ \control →
-          withTerrainService defaultConfig (Ports alwaysAdmitting (supervisedOwner control) failingLogger noProbe) $ \svc → do
+          withStoragePort $ \port → withTerrainService (smallestStore defaultConfig) (Ports alwaysAdmitting (supervisedOwner control) failingLogger noProbe port) $ \svc → do
             (_, lease) <- openMain svc "main"
             host <- newHost True
             let failing = (hostEndpoint svc Nothing host) {endpointReady = throwSTM (ErrorCall "readiness callback failed")}
@@ -574,8 +571,53 @@ spec = describe "Accounting and lifetime hardening" $ do
         evidence `shouldContain` "the sink failed"
       Right () → expectationFailure "the supervised run ended cleanly"
 
+  -- A granted removal is not overtaken by the requests that keep arriving behind it: while the slot
+  -- runs it, no later request of its arena is prepared (what it would stage goes stale at that commit,
+  -- and it could not commit first), so the removal waits only for the storage jobs already queued
+  -- ahead of its own (at most the eight descriptors). The bound is exact: zero preparations of later
+  -- requests before its decision, however many arrive (the baseline's '<= 3' was a property of
+  -- RAM-only reads; every read now reads the store).
   forM_ [5, 20, 60 ∷ Int] $ \hits →
-   it ("serves an eligible staged commit within a bounded number of preparations, however many requests keep arriving (" <> show hits <> ")") $ do
+   it ("serves a granted removal before any request that arrives behind it is prepared, however many arrive (" <> show hits <> ")") $ do
+    counting <- newIORef False
+    captured <- newIORef (0 ∷ Int)
+    committedAfter <- newIORef (Nothing ∷ Maybe Int)
+    granted <- newTVarIO False
+    let probe = Probe $ \point → do
+          active <- readIORef counting
+          when active $ case point of
+            PointCaptured {} → modifyIORef' captured (+ 1)
+            PointStaging _ → modifyIORef' captured (+ 1)
+            PointGranted (Just _) _ → atomically (writeTVar granted True)
+            PointBeforeCommit _ → readIORef captured >>= \seen → modifyIORef' committedAfter (Just . maybe seen id)
+            _ → pure ()
+    withServiceUsing defaultConfig alwaysAdmitting probe $ \svc → do
+      (_, lease) <- openMain svc "main"
+      _ <- readCell svc lease (tile 1 1 1)
+      removal <- newHost False
+      _ <- okOf (removeWith svc (hostEndpoint svc Nothing removal) lease (tile 0 1 1) Nothing)
+      waitFor (readTVar (hostReady removal) >>= \n → check (n >= 1))
+      writeIORef counting True
+      grant removal
+      waitFor (readTVar granted >>= check)
+      -- behind the granted removal, a run of reads of its arena
+      readers <- forM [1 .. hits] $ \_ → do
+        host <- newHost True
+        _ <- okOf (cellWith svc (hostEndpoint svc Nothing host) lease (tile 1 1 1))
+        pure host
+      waitFor (readTVar (hostSettled removal) >>= \x → check (not (null x)))
+      readIORef committedAfter `shouldReturn` Just 0
+      -- and every read is answered after it, seeing it
+      forM_ readers $ \h → waitFor (readTVar (hostSettled h) >>= \x → check (not (null x)))
+      settleChecks svc
+
+  -- The window between a removal's eligibility and its grant (the baseline's own shape): the owner is
+  -- held in the middle of a read's preparation, the removal becomes eligible, and a stream of reads of
+  -- its arena arrives. From eligibility to the decision no further preparation runs, however many
+  -- arrive: while an eligible transaction can take the slot no new pinned read starts, and once it has
+  -- the slot nothing behind it is prepared.
+  forM_ [5, 20, 60 ∷ Int] $ \hits →
+   it ("prepares nothing between a removal's eligibility and its decision, however many requests keep arriving (" <> show hits <> ")") $ do
     gate <- newDisarmedGate
     counting <- newIORef False
     captured <- newIORef (0 ∷ Int)
@@ -585,6 +627,7 @@ spec = describe "Accounting and lifetime hardening" $ do
           active <- readIORef counting
           when active $ case point of
             PointCaptured {} → modifyIORef' captured (+ 1)
+            PointStaging _ → modifyIORef' captured (+ 1)
             PointBeforeCommit _ → readIORef captured >>= \seen → modifyIORef' committedAfter (Just . maybe seen id)
             _ → pure ()
           probePoint holding point
@@ -594,21 +637,58 @@ spec = describe "Accounting and lifetime hardening" $ do
       removal <- newHost False
       _ <- okOf (removeWith svc (hostEndpoint svc Nothing removal) lease (tile 0 1 1) Nothing)
       waitFor (readTVar (hostReady removal) >>= \n → check (n >= 1))
-      writeIORef counting True
+      -- a read holds the owner in the middle of its preparation
       armGate gate
-      -- A cache hit holds the owner mid-preparation; behind it the removal is granted
-      -- and a long run of further cache hits arrives.
       first' <- newHost True
       _ <- okOf (cellWith svc (hostEndpoint svc Nothing first') lease (tile 1 1 1))
       awaitReached gate
+      -- from here: the removal is eligible, and the stream arrives
+      writeIORef counting True
       grant removal
       forM_ [1 .. hits] $ \_ → do
         host <- newHost True
         okOf (cellWith svc (hostEndpoint svc Nothing host) lease (tile 1 1 1))
       openGate gate
       waitFor (readTVar (hostSettled removal) >>= \x → check (not (null x)))
-      -- However long the run behind it, the commit came after at most a few preparations.
-      readIORef committedAfter >>= \c → c `shouldSatisfy` maybe False (<= 3)
+      readIORef committedAfter `shouldReturn` Just 0
+      settleChecks svc
+
+  -- The other direction: a stream of grants must not starve a read. A read
+  -- admitted amid accepted removals commits before every removal admitted after it (per-arena admission
+  -- order holds for the slot too), so its wait is the removals before it, whatever follows.
+  forM_ [5, 20, 60 ∷ Int] $ \later →
+   it ("answers a read admitted amid a stream of removals before any removal admitted after it (" <> show later <> " after)") $ do
+    probe <- H.newProbe
+    withServiceSeam quiet defaultConfig alwaysAdmitting noProbe (H.seamFor probe) $ \svc → do
+      (_, lease) <- openMain svc "main"
+      order <- newTVarIO ([] ∷ [String])
+      let noting label = do
+            host <- newHost True
+            pure (host, (hostEndpoint svc Nothing host) {endpointSettle = \s → modifyTVar' order (label :) >> modifyTVar' (hostSettled host) (s :)})
+          removal label x = do
+            (host, ep) <- noting label
+            _ <- okOf (removeWith svc ep lease (tile x 4 3) Nothing)
+            pure host
+      before' <- forM [0, 1] (removal "earlier")
+      forM_ before' $ \h → waitFor (readTVar (hostSettled h) >>= \x → check (not (null x)))
+      waitFor (backedAtRestSTM svc >>= check)
+      -- the read's page read is held, so it is still to commit while the later removals stage and
+      -- become eligible: none of them may take the slot before it
+      gate <- H.addGateOnce probe (\case OpReadAt {} → True; _ → False)
+      (reader, readEp) <- noting "read"
+      after' <- flip finally (H.openGate gate) $ do
+        _ <- okOf (cellWith svc readEp lease (tile 0 9 3))
+        H.awaitReached gate 1
+        after' <- forM [2 .. fromIntegral later + 1] (removal "later")
+        forM_ after' $ \h → waitFor (readTVar (hostReady h) >>= \n → check (n >= 1))
+        -- staged and eligible, yet none has committed: the earlier read holds them in admission order
+        forM_ after' $ \h → readTVarIO (hostSettled h) `shouldReturn` []
+        pure after'
+      forM_ (reader : after') $ \h → waitFor (readTVar (hostSettled h) >>= \x → check (not (null x)))
+      settledOrder <- reverse <$> readTVarIO order
+      -- the read settled before every later removal
+      takeWhile (/= "read") settledOrder `shouldSatisfy` all (== "earlier")
+      length settledOrder `shouldBe` 3 + later
       settleChecks svc
 
   it "dispatches a queued load while every preparation is followed by a cancellation and a replacement, with a view registered" $ do
@@ -741,7 +821,7 @@ spec = describe "Accounting and lifetime hardening" $ do
     outcome <- try $
       withLoggingLifetime quiet $ \lifetime →
         withSupervision lifetime $ \control →
-          withTerrainService defaultConfig (Ports alwaysAdmitting (supervisedOwner control) quiet noProbe) $ \svc → do
+          withStoragePort $ \port → withTerrainService (smallestStore defaultConfig) (Ports alwaysAdmitting (supervisedOwner control) quiet noProbe port) $ \svc → do
             (creator, _) <- openMain svc "main"
             other <- okOf (registerClient svc)
             attached <- okOf (attachArena svc other "main") >>= await svc >>= expectSuccess
@@ -814,7 +894,9 @@ spec = describe "Accounting and lifetime hardening" $ do
       , ("while it captures a read", \p → case p of PointCaptured {} → True; _ → False, \svc lease arm → arm >> void (cellAt svc lease (tile 1 0 1)) >> pure ())
       , ("while it stages an edit", \p → case p of PointStaging _ → True; _ → False, \svc lease arm → arm >> void (removeAt svc lease (tile 1 0 1) Nothing) >> pure ())
       , ("at the commit boundary", \p → case p of PointBeforeCommit _ → True; _ → False, \svc lease arm → arm >> void (removeAt svc lease (tile 1 0 1) Nothing) >> pure ())
-      , ("while a transfer runs", \p → case p of PointHandoff _ _ → True; _ → False, \svc lease arm → arm >> void (removeCell' svc lease (tile 1 0 1)))
+      -- (the baseline's 'while a transfer runs': a backed commit transfers nothing; the work in flight
+      -- that holds the most is the slot's transaction, just granted with its credits reserved)
+      , ("while it holds the mutation slot, its transaction's credits reserved", \p → case p of PointGranted (Just _) _ → True; _ → False, \svc lease arm → arm >> void (removeAt svc lease (tile 1 0 1) Nothing) >> pure ())
       , ( "while a victim is being released"
         , \p → case p of PointVictim _ _ → True; _ → False
         , \svc lease arm → do

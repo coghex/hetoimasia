@@ -26,7 +26,7 @@ spec = describe "Lifecycle" $ do
   it "reports a failed owner start and runs no body" $ do
     ran <- newIORef False
     let failing = Supervisor (\_ → throwIO (ErrorCall "no owner could start"))
-    outcome <- try (withTerrainService defaultConfig (Ports alwaysAdmitting failing quiet noProbe) (\_ → writeIORef ran True))
+    outcome <- try (withStoragePort $ \port → withTerrainService (smallestStore defaultConfig) (Ports alwaysAdmitting failing quiet noProbe port) (\_ → writeIORef ran True))
     outcome `shouldBe` (Left (ErrorCall "no owner could start") ∷ Either ErrorCall ())
     readIORef ran `shouldReturn` False
 
@@ -101,7 +101,7 @@ spec = describe "Lifecycle" $ do
   it "runs under the application's supervision and ends cleanly" $
     withLoggingLifetime quiet $ \lifetime →
       withSupervision lifetime $ \control → do
-        withTerrainService defaultConfig (Ports alwaysAdmitting (supervisedOwner control) quiet noProbe) $ \svc → do
+        withStoragePort $ \port → withTerrainService (smallestStore defaultConfig) (Ports alwaysAdmitting (supervisedOwner control) quiet noProbe port) $ \svc → do
           (_, lease) <- openMain svc "main"
           answer <- readCell svc lease (tile 3 4 5)
           cellRevision answer `shouldBe` Revision 0
@@ -112,7 +112,7 @@ spec = describe "Lifecycle" $ do
     outcome <- try $
       withLoggingLifetime quiet $ \lifetime →
         withSupervision lifetime $ \control →
-          withTerrainService defaultConfig (Ports alwaysAdmitting (supervisedOwner control) quiet noProbe) $ \svc → do
+          withStoragePort $ \port → withTerrainService (smallestStore defaultConfig) (Ports alwaysAdmitting (supervisedOwner control) quiet noProbe port) $ \svc → do
             (_, lease) <- openMain svc "main"
             host <- newHost True
             let failing = (hostEndpoint svc Nothing host) {endpointSettle = \_ → throwSTM (ErrorCall "host defect")}

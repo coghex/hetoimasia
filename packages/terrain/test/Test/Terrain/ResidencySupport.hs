@@ -68,9 +68,10 @@ oneCellStored = 256 + 48 + 32 + 2
 removalGrowth ∷ Word
 removalGrowth = 62
 
--- | Scratch of a one-cell load: a 256-byte frame and two bytes per cell.
+-- | Scratch of a one-cell load: a 256-byte frame, two bytes per cell, and the removed runs of its
+-- one column (at most one run of 16 bytes, and a 48-byte column entry).
 oneCellScratch ∷ Word
-oneCellScratch = 256 + 2
+oneCellScratch = 256 + 2 + (0 + 1) * 16 + 48
 
 interestBytes ∷ Word
 interestBytes = 64

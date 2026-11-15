@@ -33,8 +33,10 @@ import Test.LuaEngine.Terrain.Support
 altPrelude ∷ [Text]
 altPrelude =
   [ "local PATCHES = {}"
-  , "for k = 0, 1023 do PATCHES[#PATCHES + 1] = { x = 0, y = 0, z_min = 2 * k, z_max = 2 * k + 1, value = { material = 'soil', shape = 0 } } end"
-  , "local ALT = { materials = { 'soil' }, layers = {}, patches = PATCHES }"
+  -- 1,024 one-level runs of alternating materials (the air-and-soil form of 2,048 levels compiles to 8 bytes over
+  -- #660's 16 MiB result bound, a source_complexity since #665)
+  , "for k = 0, 1023 do PATCHES[#PATCHES + 1] = { x = 0, y = 0, z_min = k, z_max = k + 1, value = { material = (k % 2 == 0) and 'soil' or 'stone', shape = 0 } } end"
+  , "local ALT = { materials = { 'soil', 'stone' }, layers = {}, patches = PATCHES }"
   ]
 
 -- | Every expected failure a script can reach, read and then the same call unread, each followed by the next step: the instance runs on.
@@ -856,7 +858,9 @@ spec = describe "Terrain matrices" $ do
 
   it "refuses at composition a service configured above 256 KiB of definition, and above 8,192 levels of range, so that no larger definition or range can be accepted" $ do
     refusesComposition defaultConfig {configSourceLimits = defaultSourceLimits {limitDefinitionBytes = 512 * 1024}} "limitDefinitionBytes"
-    refusesComposition defaultConfig {configQueryLimits = defaultQueryLimits {limitRangeLevels = 16384}} "limitRangeLevels"
+    -- (past 12,321 levels the service itself refuses the configuration: a read of that range would keep
+    -- more runs than its pin credit holds beside one read step)
+    refusesComposition defaultConfig {configQueryLimits = defaultQueryLimits {limitRangeLevels = 12288}} "limitRangeLevels"
 
   it "enforces a service's smaller definition limit through Lua: a definition within 256 KiB but over the service's limit is a definition failure" $
     withRigConfig defaultConfig {configSourceLimits = defaultSourceLimits {limitDefinitionBytes = 128 * 1024}} $ \rig →
