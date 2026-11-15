@@ -1085,7 +1085,7 @@ Each cost category is assigned to exactly one bank or slot:
 | Packed detail payload | Resident | the encoded bytes stored; reserved at the dense bound, 64 per interval |
 | A removal's rebuilt segment (its payload is between 2 and 64 bytes) | Resident | 62 reserved; the growth actually stored is charged at the commit |
 | Retained removals | Edit | 16 per interval and 48 per column entry (worst case for one removal: 64) |
-| Load scratch | Staging | 256 + 2 per cell, and the removed runs its columns can hold: (cells / 2 + columns) runs of 16 and 48 a column (81,920 for a default region) |
+| Load scratch | Staging | 256 + 2 per cell, and the removed runs of every column it touches over the extent's height h: h / 2 + 1 runs of 16 and 48 a column (320 a column at 32 levels; 81,920 for a default region) |
 | Interest records | Staging | 64 each |
 | Hold records (borrowers and publication pins) | Staging | 64 per region held |
 | Accepted command records | Staging | 128 + 32 per region |
