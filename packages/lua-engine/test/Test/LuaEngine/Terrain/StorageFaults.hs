@@ -7,7 +7,7 @@
 -- arranges the next fault, so every outcome is decided by what the example does and never by time.
 module Test.LuaEngine.Terrain.StorageFaults (spec) where
 
-import Control.Concurrent.STM (atomically, check, readTVarIO)
+import Control.Concurrent.STM (STM, atomically, check, readTVar, readTVarIO)
 import Control.Exception (finally, onException)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
 import Data.Text (Text)
@@ -39,10 +39,12 @@ storagePrelude =
   , "local function brief(v) return v.storage.state .. ' ' .. tostring(v.storage.reason) .. ' ' .. v.discovery.state end"
   ]
 
--- | Wait until every request the service holds has settled, then until its backed work is at rest.
+-- | Wait until every request the service holds has settled and the owner is quiescent, in one transaction: at rest AND offering no
+-- work of its own ('backedQuiescentSTM'). At rest alone is momentary idleness: the reclamation of retired pages and discovery may
+-- still be chosen, and a gate armed or a status read after it would meet that work.
 quiescent ∷ Service → IO ()
 quiescent svc =
-  bounded (atomically (inspectCensusSTM svc >>= check . all censusSettled . censusRequests) >> atomically (backedAtRestSTM svc >>= check))
+  bounded (atomically ((&&) <$> (all censusSettled . censusRequests <$> inspectCensusSTM svc) <*> backedQuiescentSTM svc >>= check))
     `onException` do
       census ← atomically (inspectCensusSTM svc)
       problems ← inspectBacked svc
@@ -50,22 +52,22 @@ quiescent svc =
       jobs ← atomically (inspectStorageJobsSTM svc)
       putStrLn ("not quiescent: settled " <> show (map censusSettled (censusRequests census)) <> "; backed " <> show problems <> "; defects " <> show defects <> "; storage jobs " <> show jobs)
 
--- | Drive the world until the condition holds, testing it before each drive: a script held at @TEST_WAIT@ is never driven again.
-driveUntil ∷ World → IO () → IO Bool → IO ()
-driveUntil world drive condition = pumpUntil world (condition >>= \done → if done then pure True else drive >> condition)
+-- | How an example moves its VM until a condition holds: 'stepUntil' for a presentation VM, 'tickUntil' for a gameplay one. Both
+-- decide the condition before each update they wake, so a script held at @TEST_WAIT@ is never driven again.
+type Drive = STM Bool → IO ()
 
 -- | When the script reaches @TEST_WAIT(name)@: the service quiescent, this done, and the script let go.
-atWait ∷ Rig → World → IO () → Text → IO () → IO ()
-atWait rig world drive name action = do
-  driveUntil world drive (elem ("entered " <> name) <$> readTVarIO (rgTrace rig))
+atWait ∷ Rig → Drive → Text → IO () → IO ()
+atWait rig drive name action = do
+  drive (elem ("entered " <> name) <$> readTVar (rgTrace rig))
   quiescent (rgService rig)
   action
   signalRig rig name
 
 -- | 'atWait', answering what the action made.
-atWaitGate ∷ Rig → World → IO () → Text → IO a → IO a
-atWaitGate rig world drive name action = do
-  driveUntil world drive (elem ("entered " <> name) <$> readTVarIO (rgTrace rig))
+atWaitGate ∷ Rig → Drive → Text → IO a → IO a
+atWaitGate rig drive name action = do
+  drive (elem ("entered " <> name) <$> readTVar (rgTrace rig))
   quiescent (rgService rig)
   made ← action
   signalRig rig name
@@ -239,7 +241,7 @@ outcomesSpec = describe "Terrain storage outcomes" $ do
                 withFvm world runtime (over rig) $ \fvm → explained rig world $ do
                   spawned ← spawn world fvm "modules-test" mainPath
                   let go = drive world control fvm
-                      wait = atWait rig world go
+                      wait = atWait rig go
                   wait "unsupported" (addRule faults (-1) isStatFs (FilesystemIs "unqualified"))
                   wait "reservation" (clearRules faults >> addRule faults (-1) isReserve (FailWith 28))
                   wait "clear" (clearRules faults)
@@ -251,15 +253,15 @@ outcomesSpec = describe "Terrain storage outcomes" $ do
                   wait "persist" (addRule faults (-1) isRead ZeroBytes)
                   wait "heal" (clearRules faults)
                   wait "end" (pure ())
-                  driveUntil world go (elem "done" <$> outLines world)
+                  go (elem "done" <$> outLinesSTM world)
                   printed ← outLines world
                   [l | l ← printed, not ("unread" `Text.isInfixOf` l)] `shouldBe` faultExpected
                   -- nothing failed the instance: it is still running, and only its one arena is open
                   phaseOf spawned >>= (`shouldNotBe` Just Instance.Failed)
                   limitHeld (rgService rig) "arenas" `shouldReturn` 1
       )
-      [ ("presentation", presentationOver, \world _ _ → advanceClock world 2000000000)
-      , ("gameplay", gameplayOver, \_ _ fvm → grantTick fvm)
+      [ ("presentation", presentationOver, \world _ _ → stepUntil world)
+      , ("gameplay", gameplayOver, \_ _ fvm → tickUntil fvm)
       ]
 
   describe "storage_full under a pinned reader" $
@@ -280,7 +282,7 @@ outcomesSpec = describe "Terrain storage outcomes" $ do
               (`finally` openHeld held) $ do
                 -- the pin: a view's load job whose page read is held, in a region far from the removals (armed once the service is at
                 -- rest, so the one read it holds is the load's)
-                atWait rig world go "pin" $ do
+                atWait rig go "pin" $ do
                   gate ← addSeamGateOnce faults isRead
                   holdIn held gate
                   lease ← attachArena svc observer (arenaName rig "modules-test" "main") >>= either (fail . show) pure >>= await svc >>= either (fail . show) pure
@@ -289,12 +291,12 @@ outcomesSpec = describe "Terrain storage outcomes" $ do
                   _ ← setViewDemand svc view lease [RegionDemand far (either (error . show) coverageTile (mkLocalCoord 0 0 0))] >>= either (fail . show) pure
                   awaitSeamGate gate
                 -- the script prints what it met and waits to grow: its lines are read once it has finished
-                driveUntil world go (elem "entered unpin" <$> readTVarIO (rgTrace rig))
+                go (elem "entered unpin" <$> readTVar (rgTrace rig))
                 -- the pin goes, and growth clears the capacity pause
                 openHeld held
-                atWait rig world go "unpin" (endClient svc observer)
-              atWait rig world go "end" (pure ())
-              driveUntil world go (elem "done" <$> outLines world)
+                atWait rig go "unpin" (endClient svc observer)
+              atWait rig go "end" (pure ())
+              go (elem "done" <$> outLinesSTM world)
               printed ← outLines world
               -- discovery is paused with the storage exactly when it has obligations left, and idle otherwise
               let discovery = if "discovery\tpaused\ttrue" `elem` printed then "discovery\tpaused\ttrue" else "discovery\tidle\tfalse"
@@ -311,8 +313,8 @@ outcomesSpec = describe "Terrain storage outcomes" $ do
                            , "done"
                            ]
       )
-      [ ("presentation", presentationOver, \world _ _ → advanceClock world 2000000000)
-      , ("gameplay", gameplayOver, \_ _ fvm → grantTick fvm)
+      [ ("presentation", presentationOver, \world _ _ → stepUntil world)
+      , ("gameplay", gameplayOver, \_ _ fvm → tickUntil fvm)
       ]
 
   it "keeps the old allowance while a growth is held at its reservation and after it is cancelled, keeps an extra whose give-back failed charged and visible, and refuses the largest allowance's reservation" $ do
@@ -321,37 +323,37 @@ outcomesSpec = describe "Terrain storage outcomes" $ do
       withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource growthScript)]) $ \world _ runtime →
         withFvm world runtime (presentationOver rig) $ \fvm → explained rig world $ do
           _ ← spawn world fvm "modules-test" mainPath
-          let go = advanceClock world 2000000000
+          let go = stepUntil world
               svc = rgService rig
           held ← newHeld
           (`finally` openHeld held) $ do
-            reserve ← atWaitGate rig world go "ready" (addSeamGate faults isReserve)
+            reserve ← atWaitGate rig go "ready" (addSeamGate faults isReserve)
             holdIn held reserve
-            driveUntil world go (elem "entered held" <$> readTVarIO (rgTrace rig))
+            go (elem "entered held" <$> readTVar (rgTrace rig))
             awaitSeamGate reserve
             signalRig rig "held"
-            driveUntil world go (elem "entered released" <$> readTVarIO (rgTrace rig))
+            go (elem "entered released" <$> readTVar (rgTrace rig))
             openSeamGate reserve
             quiescent svc
             signalRig rig "released"
           kept ← newHeld
           (`finally` openHeld kept) $ do
-            allocated ← atWaitGate rig world go "arm" (addSeamGateAfter faults isReserve)
+            allocated ← atWaitGate rig go "arm" (addSeamGateAfter faults isReserve)
             holdIn kept allocated
-            driveUntil world go (elem "entered allocated" <$> readTVarIO (rgTrace rig))
+            go (elem "entered allocated" <$> readTVar (rgTrace rig))
             awaitSeamGate allocated
             signalRig rig "allocated"
             -- the give-back is the next length set: it fails
-            driveUntil world go (any ("cancel allocated" `Text.isPrefixOf`) <$> outLines world)
+            go (any ("cancel allocated" `Text.isPrefixOf`) <$> outLinesSTM world)
             addRule faults 1 isSetLength (FailWith 5)
             openSeamGate allocated
-            driveUntil world go (elem "entered give-back failed" <$> readTVarIO (rgTrace rig))
+            go (elem "entered give-back failed" <$> readTVar (rgTrace rig))
             quiescent svc
             signalRig rig "give-back failed"
-          atWait rig world go "extra released" (pure ())
-          atWait rig world go "largest" (addRule faults (-1) isReserve (FailWith 28) >> addRule faults (-1) isSetLength (FailWith 27))
-          atWait rig world go "cleared" (clearRules faults)
-          driveUntil world go (any ("grown at last\t" `Text.isPrefixOf`) <$> outLines world)
+          atWait rig go "extra released" (pure ())
+          atWait rig go "largest" (addRule faults (-1) isReserve (FailWith 28) >> addRule faults (-1) isSetLength (FailWith 27))
+          atWait rig go "cleared" (clearRules faults)
+          go (any ("grown at last\t" `Text.isPrefixOf`) <$> outLinesSTM world)
           printed ← outLines world
           let bytes = Text.pack . show . mib
           printed
@@ -483,18 +485,18 @@ lifecycleSpec = describe "Terrain storage status and lifetimes" $ do
           withFvm world runtime (presentationOver rig) $ \fvm → releasing (openGate discoveryGate >> openHeld pinned) . explained rig world $ do
             _ ← spawn world fvm "modules-test" mainPath
             let svc = rgService rig
-                go = advanceClock world 2000000000
+                go = stepUntil world
                 -- the script reaches its next wait in the very update it printed the status it took: what it printed is published when
                 -- that update returns, so each status is compared at the end, with the service's own status read while the script waited
-                reached name = driveUntil world go (elem ("entered " <> name) <$> readTVarIO (rgTrace rig))
+                reached name = go (elem ("entered " <> name) <$> readTVar (rgTrace rig))
             observer ← either (fail . show) pure =<< registerClient svc
             lease ← attachArena svc observer (arenaName rig "modules-test" "main") >>= either (fail . show) pure >>= await svc >>= either (fail . show) pure
             let ownStatus = arenaStatus svc lease >>= either (fail . show) pure
-            atWait rig world go "fresh" (pure ())
+            atWait rig go "fresh" (pure ())
             reached "edit"
             fresh ← ownStatus
             signalRig rig "edit"
-            atWait rig world go "after the edit" (pure ())
+            atWait rig go "after the edit" (pure ())
             reached "arm discovery"
             edited ← ownStatus
             (statusContentRevision edited, statusUsedBytes edited > statusUsedBytes fresh) `shouldBe` (Revision 1, True)
@@ -531,7 +533,7 @@ lifecycleSpec = describe "Terrain storage status and lifetimes" $ do
             released ← ownStatus
             statusPendingReclaimBytes released `shouldSatisfy` (< statusPendingReclaimBytes held)
             signalRig rig "unpinned"
-            driveUntil world go (elem "done" <$> outLines world)
+            go (elem "done" <$> outLinesSTM world)
             printed ← outLines world
             printed
               `shouldContain` [ "fresh\tsuccess\t" <> rendered fresh
@@ -549,13 +551,13 @@ lifecycleSpec = describe "Terrain storage status and lifetimes" $ do
   it "holds a gameplay growth unreserved and uncommitted before its position, commits it at its tick, keeps the allowance a growth cancelled before its position would change, and lets presentation run" $ do
     faults ← newFaults
     withRigPort defaultConfig noProbe noTerrainHooks (seamPort faults) $ \rig →
-      withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource logicalGrowth)]) $ \world control runtime →
+      withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource logicalGrowth)]) $ \world _ runtime →
         withFvm world runtime (gameplayOver rig) $ \logical →
           withFvm world runtime (presentationOver rig) $ \presentation → explained rig world $ do
             _ ← spawn world logical "modules-test" mainPath
             _ ← spawn world presentation "modules-test" mainPath
             let svc = rgService rig
-            driveUntil world (tickBy control logical 1) (elem "asked" <$> outLines world)
+            tickUntil logical (elem "asked" <$> outLinesSTM world)
             observer ← either (fail . show) pure =<< registerClient svc
             lease ← attachArena svc observer (arenaName rig "modules-test" "main") >>= either (fail . show) pure >>= await svc >>= either (fail . show) pure
             -- no tick is granted: the growth neither reserves nor commits before its position (#665 grants a growth the slot only once
@@ -563,10 +565,10 @@ lifecycleSpec = describe "Terrain storage status and lifetimes" $ do
             ((\s → (statusReservedBytes s, statusPendingReservedBytes s)) <$> (arenaStatus svc lease >>= either (fail . show) pure)) `shouldReturn` (fromInteger (mib 64), 0)
             (any (not . censusSettled) . censusRequests <$> atomically (inspectCensusSTM svc)) `shouldReturn` True
             earlier ← length . filter ("presentation\t" `Text.isPrefixOf`) <$> outLines world
-            driveUntil world (advanceClock world 2000000000) ((> earlier + 2) . length . filter ("presentation\t" `Text.isPrefixOf`) <$> outLines world)
+            stepUntil world ((> earlier + 2) . length . filter ("presentation\t" `Text.isPrefixOf`) <$> outLinesSTM world)
             outLines world >>= (`shouldNotSatisfy` any ("grown\t" `Text.isPrefixOf`))
             -- the tick: the growth commits, and the next is cancelled before its position
-            driveUntil world (tickBy control logical 1) (elem "done" <$> outLines world)
+            tickUntil logical (elem "done" <$> outLinesSTM world)
             printed ← outLines world
             [l | l ← printed, not ("presentation\t" `Text.isPrefixOf` l)]
               `shouldBe` [ "asked"
@@ -586,18 +588,18 @@ lifecycleSpec = describe "Terrain storage status and lifetimes" $ do
         withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource growthAtEnd)]) $ \world _ runtime →
           withFvm world runtime (presentationOver rig) $ \fvm → releasing (openHeld held) . explained rig world $ do
             spawned ← spawn world fvm "modules-test" mainPath
-            let go = advanceClock world 2000000000
+            let go = stepUntil world
                 svc = rgService rig
-            gate ← atWaitGate rig world go "arm" (addSeamGate faults isReserve)
+            gate ← atWaitGate rig go "arm" (addSeamGate faults isReserve)
             holdIn held gate
-            driveUntil world go (elem "entered held" <$> readTVarIO (rgTrace rig))
+            go (elem "entered held" <$> readTVar (rgTrace rig))
             awaitSeamGate gate
             signalRig rig "held"
-            driveUntil world go (elem "held" <$> outLines world)
+            go (elem "held" <$> outLinesSTM world)
             stopSpawned spawned
-            driveUntil world go ((== Just Instance.Stopped) <$> phaseOf spawned)
+            go ((== Just Instance.Stopped) <$> phaseOfSTM spawned)
             openHeld held
-            driveUntil world go ((== 0) <$> limitHeld svc "arenas")
+            waitUntil ((== 0) <$> limitHeld svc "arenas")
             quiescent svc
             limitHeld svc "leases" `shouldReturn` 0
             inspectBacked svc `shouldReturn` []
@@ -650,11 +652,11 @@ retrySpec = describe "Terrain storage retry windows" $ do
         withFvm world runtime (gameplayOver rig) $ \fvm → explained rig world $ do
           _ ← spawn world fvm "modules-test" mainPath
           let svc = rgService rig
-              go = grantTick fvm
-          atWait rig world go "io" (addRule faults 1 isWrite (FailWith 5))
+              go = tickUntil fvm
+          atWait rig go "io" (addRule faults 1 isWrite (FailWith 5))
           -- the retry is asked and the owner's update is held: its position (the next tick) cannot come, so nothing clears, however
           -- long the service has to prepare it
-          driveUntil world go (elem "entered asked retry" <$> readTVarIO (rgTrace rig))
+          go (elem "entered asked retry" <$> readTVar (rgTrace rig))
           observer ← either (fail . show) pure =<< registerClient svc
           lease ← attachArena svc observer (arenaName rig "modules-test" "main") >>= either (fail . show) pure >>= await svc >>= either (fail . show) pure
           bounded (atomically (backedAtRestSTM svc >>= check))
@@ -662,7 +664,7 @@ retrySpec = describe "Terrain storage retry windows" $ do
           statusStorage paused `shouldBe` StoragePaused [CondIo]
           (any (not . censusSettled) . censusRequests <$> atomically (inspectCensusSTM svc)) `shouldReturn` True
           signalRig rig "asked retry"
-          driveUntil world go (elem "done" <$> outLines world)
+          go (elem "done" <$> outLinesSTM world)
           printed ← outLines world
           [l | l ← printed, not ("history" `Text.isPrefixOf` l)]
             `shouldBe` [ "io\tfailure\tstorage_io"
@@ -684,29 +686,29 @@ retrySpec = describe "Terrain storage retry windows" $ do
         withFvm world runtime (presentationOver rig) $ \fvm → releasing (openHeld held) . explained rig world $ do
           spawned ← spawn world fvm "modules-test" mainPath
           let svc = rgService rig
-              go = advanceClock world 2000000000
-          atWait rig world go "io" (addRule faults 1 isWrite (FailWith 5))
+              go = stepUntil world
+          atWait rig go "io" (addRule faults 1 isWrite (FailWith 5))
           -- the retry's revalidation of the failed write is a write probe: held at the seam, then cancelled
-          probe ← atWaitGate rig world go "arm" (addSeamGateOnce faults isWrite)
+          probe ← atWaitGate rig go "arm" (addSeamGateOnce faults isWrite)
           holdIn held probe
-          driveUntil world go (elem "entered probe held" <$> readTVarIO (rgTrace rig))
+          go (elem "entered probe held" <$> readTVar (rgTrace rig))
           awaitSeamGate probe
           signalRig rig "probe held"
-          driveUntil world go (elem "entered released" <$> readTVarIO (rgTrace rig))
+          go (elem "entered released" <$> readTVar (rgTrace rig))
           openSeamGate probe
           quiescent svc
           signalRig rig "released"
           -- a second retry held at its probe while the creator's instance ends
-          again ← atWaitGate rig world go "arm again" (addSeamGateOnce faults isWrite)
+          again ← atWaitGate rig go "arm again" (addSeamGateOnce faults isWrite)
           holdIn held again
-          driveUntil world go (elem "entered held again" <$> readTVarIO (rgTrace rig))
+          go (elem "entered held again" <$> readTVar (rgTrace rig))
           awaitSeamGate again
           signalRig rig "held again"
-          driveUntil world go (elem "held" <$> outLines world)
+          go (elem "held" <$> outLinesSTM world)
           stopSpawned spawned
-          driveUntil world go ((== Just Instance.Stopped) <$> phaseOf spawned)
+          go ((== Just Instance.Stopped) <$> phaseOfSTM spawned)
           openSeamGate again
-          driveUntil world go ((== 0) <$> limitHeld svc "arenas")
+          waitUntil ((== 0) <$> limitHeld svc "arenas")
           quiescent svc
           printed ← outLines world
           printed `shouldBe` ["io\tstorage_io", "cancel while revalidating\tcancelled", "after the cancel\tpaused\tstorage_io", "held"]

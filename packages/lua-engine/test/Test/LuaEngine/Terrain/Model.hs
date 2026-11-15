@@ -102,10 +102,10 @@ spec = describe "Terrain lifecycle model" $
       gate ← newGate
       armed ← newIORef False
       window ← newIORef False
-      let hold = do
+      let hold parking = do
             go ← atomicModifyIORef' armed (\a → (False, a))
-            when go (holdAt gate)
-      (`finally` openGate gate) $ withRigHooks defaultConfig {configMaxClients = 8, configMaxLeases = 6, configMaxArenas = 2} noProbeForRaces noTerrainHooks {hookAdopting = hold} $ \rig →
+            when go (holdAt parking gate)
+      (`finally` openGate gate) $ withRigHolding defaultConfig {configMaxClients = 8, configMaxLeases = 6, configMaxArenas = 2} noProbeForRaces (\parking → noTerrainHooks {hookAdopting = hold parking}) $ \rig →
         withWorld (counts [(RequestsPerInstance, 3), (RequestsPerVm, 5)]) (Layout [("lua/p.lua", scriptSource (scripted "p")), ("lua/g.lua", scriptSource (scripted "g"))]) $ \world control runtime →
           withFvm world runtime (presentationOver rig) $ \pv →
             withFvm world runtime (gameplayOver rig) $ \gv → do
@@ -115,16 +115,16 @@ spec = describe "Terrain lifecycle model" $
               clientBaseline ← newIORef (-1 ∷ Integer)
               p ← Side <$> newIORef False <*> newIORef 0
               g ← Side <$> newIORef False <*> newIORef 0
-              let advance = tickBy control gv 1 >> advanceClock world 2000000000
-                  settleAll = replicateM_ 6 (advance >> yield')
-                  yield' = pure ()
+              -- one gameplay tick, then one presentation step, until the condition holds: both VMs move, one update at a time
+              let advance = tickAndStepUntil gv world
+                  settleAll = replicateM_ 6 (tickBy control gv 1)
                   -- Queue a command for a label, and wait for the instance's answer to it.
                   command label text = do
                     n ← atomicModifyIORef'' serial
                     modifyIORef' tally (Text.takeWhile (/= ' ') text :)
                     sendCommand rig label (Text.pack (show n) <> " " <> text)
                     let wanted = "ack\t" <> Text.pack (show n) <> "\t"
-                    pumpUntil world (advance >> any (Text.isPrefixOf wanted) <$> outLines world)
+                    advance (any (Text.isPrefixOf wanted) <$> outLinesSTM world)
                     printed ← outLines world
                     pure (maybe "" (Text.drop (Text.length wanted)) (find (Text.isPrefixOf wanted) printed))
                   sideOf label = if label == "p" then p else g
@@ -176,7 +176,7 @@ spec = describe "Terrain lifecycle model" $
                         -- the gameplay instance ends and is replaced: everything it held goes with it, and the new instance attaches again
                         Just old ← readIORef gSpawnRef
                         stopSpawned old
-                        pumpUntil world (advance >> ((== Just Instance.Stopped) <$> phaseOf old))
+                        advance ((== Just Instance.Stopped) <$> phaseOfSTM old)
                         forgetInstance (fvFacade gv) (spId old)
                         writeIORef (sdHandle g) False
                         writeIORef (sdReads g) 0
@@ -190,7 +190,7 @@ spec = describe "Terrain lifecycle model" $
                         writeIORef gSpawnRef (Just fresh)
                         opened ← length . filter (== "opened\tg\tsuccess") <$> outLines world
                         void (command "g" "attach")
-                        pumpUntil world (advance >> ((> opened) . length . filter (== "opened\tg\tsuccess") <$> outLines world))
+                        advance ((> opened) . length . filter (== "opened\tg\tsuccess") <$> outLinesSTM world)
                         writeIORef (sdHandle g) True
                       _ → void (command label "idle")
                     check (label <> " op " <> Text.pack (show choice))
@@ -207,13 +207,13 @@ spec = describe "Terrain lifecycle model" $
                 awaitReached gate
                 writeIORef window True
                 void (command "g" "attach")
-                pumpUntil world (advance >> ((>= 1) . length . filter (Text.isPrefixOf "opened\tg\t") <$> outLines world))
+                advance ((>= 1) . length . filter (Text.isPrefixOf "opened\tg\t") <$> outLinesSTM world)
                 check "after an attach to an open the host has not published"
                 outLines world >>= \printed → printed `shouldContain` ["opened\tg\tfailure"]
                 writeIORef window False
                 openGate gate
               when (odd seed && not gated) (void (command "g" "attach"))
-              pumpUntil world (advance >> elem "opened\tp\tsuccess" <$> outLines world)
+              advance (elem "opened\tp\tsuccess" <$> outLinesSTM world)
               writeIORef (sdHandle p) True
               early ← length . filter (Text.isPrefixOf "opened\tg\t") <$> outLines world
               firstSuccess ← elem "opened\tg\tsuccess" <$> outLines world
@@ -221,7 +221,7 @@ spec = describe "Terrain lifecycle model" $
               when (early > 0) (check "after an attach before the open was published")
               when (not firstSuccess) $ do
                 void (command "g" "attach")
-                pumpUntil world (advance >> elem "opened\tg\tsuccess" <$> outLines world)
+                advance (elem "opened\tg\tsuccess" <$> outLinesSTM world)
                 writeIORef (sdHandle g) True
               -- the instances' clients are what they are while the instances live: nothing a sequence does adds or ends one
               limitHeld (rgService rig) "clients" >>= writeIORef clientBaseline
@@ -262,8 +262,8 @@ spec = describe "Terrain lifecycle model" $
               stopSpawned pSpawn
               Just gSpawn ← readIORef gSpawnRef
               stopSpawned gSpawn
-              pumpUntil world (advance >> ((== Just Instance.Stopped) <$> phaseOf pSpawn))
-              pumpUntil world (advance >> ((== Just Instance.Stopped) <$> phaseOf gSpawn))
+              advance ((== Just Instance.Stopped) <$> phaseOfSTM pSpawn)
+              advance ((== Just Instance.Stopped) <$> phaseOfSTM gSpawn)
               settleAll
               -- the facade forgets an ended instance (the session does so in the host), and its clients go with it
               forgetInstance (fvFacade pv) (spId pSpawn)

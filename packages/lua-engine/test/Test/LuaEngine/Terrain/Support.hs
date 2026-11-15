@@ -14,8 +14,10 @@ module Test.LuaEngine.Terrain.Support
   , sendCommand
   , withRigProbe
   , withRigHooks
+  , withRigHolding
   , withRigPort
   , holdAt
+  , holdThere
   , defaultConfigForRaces
   , noProbeForRaces
   , presentationOver
@@ -43,12 +45,14 @@ module Test.LuaEngine.Terrain.Support
   , removalProbeIn
   , awaitReached
   , pumpUntilReached
+  , waitUntil
   , openGate
   , armGate
   , disarmGate
   ) where
 
-import Control.Concurrent.MVar (MVar, newEmptyMVar, takeMVar, tryPutMVar, tryTakeMVar)
+import Control.Concurrent (yield)
+import Control.Concurrent.MVar (MVar, newEmptyMVar, takeMVar, tryPutMVar)
 import qualified Data.ByteString.Char8 as BC
 import Data.ByteString (ByteString)
 import Hetoimasia.Foundation.Worker (WorkerGroup)
@@ -56,11 +60,10 @@ import Hetoimasia.Terrain.Runtime.Storage (StorageConfig, filesystemOf, minHeadr
 import Hetoimasia.Terrain.Runtime.Store (StoreSpec (..), defaultStoreSpec, minAllowanceBytes)
 import System.IO.Temp (withSystemTempDirectory)
 import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
-import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, retry, writeTVar)
+import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, retry, writeTVar)
 import Control.Exception (onException)
 import Control.Monad (void, when)
 import Data.List (find)
-import Data.Maybe (isJust)
 import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as Text
@@ -81,7 +84,7 @@ import Hetoimasia.Terrain.Runtime
 import Test.Hspec (Expectation, expectationFailure, shouldThrow)
 import Hetoimasia.Scripting.Lua.Instance (InstanceFailure (failureMessage))
 import qualified Hetoimasia.Scripting.Lua.Instance as Instance
-import Test.LuaEngine.Facade.Support (Script (..), Spawned, VmShape (..), World, advanceClock, errLines, gameplayShape, outLines, phaseOf, presentationShape, pumpUntil, script, settledFailure)
+import Test.LuaEngine.Facade.Support (Parking, Script (..), Spawned, VmShape (..), World, errLines, gameplayShape, newParking, outLines, outLinesSTM, parkedWhile, phaseOf, presentationShape, script, settledFailure, stepUntil)
 import Test.Support.Bounded (bounded)
 
 -- | The real service and the adapter over it.
@@ -96,6 +99,8 @@ data Rig = Rig
   -- ^ The commands an example has queued for a scripted instance, by the instance's label: @TEST_CMD(label)@ answers the next, or @none@.
   , rgSignals ∷ !(TVar (Set.Set Text))
   -- ^ The names an example has signalled: @TEST_WAIT(name)@ returns once its name is among them.
+  , rgParking ∷ !Parking
+  -- ^ Where the fixtures' waits and the hooks' gates ('holdAt') mark the owner threads they park, for the step ('stepNext').
   }
 
 quiet ∷ Logger
@@ -126,12 +131,22 @@ withRigProbe config probe = withRigHooks config probe noTerrainHooks
 
 -- | A rig whose adapter tells these hooks of the windows a race is decided in.
 withRigHooks ∷ Config → Probe → TerrainHooks → (Rig → IO a) → IO a
-withRigHooks config probe terrainHooks = withRigPort config probe terrainHooks storagePort
+withRigHooks config probe terrainHooks = withRigHolding config probe (const terrainHooks)
+
+-- | 'withRigHooks' for hooks that hold an owner at a gate ('holdAt'): they are made with the rig's parking, so that the step
+-- ('stepNext') steps the other VMs while an owner is held there.
+withRigHolding ∷ Config → Probe → (Parking → TerrainHooks) → (Rig → IO a) → IO a
+withRigHolding config probe hooksWith body = do
+  parking ← newParking
+  withRigParked parking config probe (hooksWith parking) storagePort body
 
 -- | A rig whose storage port this makes from the worker group, the qualified storage configuration and the directory: the production
 -- port, or one with a test seam ("Hetoimasia.Terrain.Runtime.Testing").
 withRigPort ∷ Config → Probe → TerrainHooks → (WorkerGroup → StorageConfig → ByteString → StoragePort) → (Rig → IO a) → IO a
-withRigPort config probe terrainHooks port body =
+withRigPort config probe terrainHooks port body = newParking >>= \parking → withRigParked parking config probe terrainHooks port body
+
+withRigParked ∷ Parking → Config → Probe → TerrainHooks → (WorkerGroup → StorageConfig → ByteString → StoragePort) → (Rig → IO a) → IO a
+withRigParked parking config probe terrainHooks port body =
   -- The arenas' private files are real reserved files in a temporary directory, through the production
   -- adapter; the directory's filesystem is named the way the backend reads it and qualified for this run
   -- (the production list is not widened), and an arena reserves the smallest allowance unless the
@@ -150,17 +165,18 @@ withRigPort config probe terrainHooks port body =
       body
         Rig
           { rgService = service
-          , rgFacade = facade {tfHooks = terrainHooks, tfExtraBindings = [pickFixture, awaitOfferFixture facade, waitFixture signals trace, awaitSettledFixture service, commandFixture commands]}
+          , rgFacade = facade {tfHooks = terrainHooks, tfExtraBindings = [pickFixture, awaitOfferFixture parking facade, waitFixture parking signals trace, awaitSettledFixture parking service, commandFixture commands]}
           , rgSession = session
           , rgPicks = tfPicks facade
           , rgSignals = signals
           , rgTrace = trace
           , rgCommands = commands
+          , rgParking = parking
           }
 
 presentationOver, gameplayOver ∷ Rig → VmShape
-presentationOver rig = presentationShape {shTerrain = Just (terrainInjection (rgFacade rig), rgSession rig), shInitialChunks = pickChunk}
-gameplayOver rig = gameplayShape {shTerrain = Just (terrainInjection (rgFacade rig), rgSession rig), shInitialChunks = pickChunk}
+presentationOver rig = presentationShape {shTerrain = Just (terrainInjection (rgFacade rig), rgSession rig), shInitialChunks = pickChunk, shParking = Just (rgParking rig)}
+gameplayOver rig = gameplayShape {shTerrain = Just (terrainInjection (rgFacade rig), rgSession rig), shInitialChunks = pickChunk, shParking = Just (rgParking rig)}
 
 -- | The same VM of another session over the same service: its names are its own.
 presentationOverSession ∷ Rig → Unique → VmShape
@@ -179,12 +195,12 @@ pickFixture =
 
 -- | How a fixture holds a script until the example says so: @TEST_WAIT(name)@ returns once the example has signalled that name
 -- ('signalRig'). It runs on the script's own thread and waits on the rig's own state and nothing else; a real script has no such function.
-waitFixture ∷ TVar (Set.Set Text) → TVar [Text] → Binding
-waitFixture signals trace =
+waitFixture ∷ Parking → TVar (Set.Set Text) → TVar [Text] → Binding
+waitFixture parking signals trace =
   asynchronousNativeRequestIn "terrain_test_wait" [SText] [] $ \_ values → case values of
     [VText name] → do
       atomically (modifyTVar' trace ("entered " <> name :))
-      bounded (atomically (readTVar signals >>= \seen → if Set.member name seen then pure () else retry))
+      parkedWhile parking (bounded (atomically (readTVar signals >>= \seen → if Set.member name seen then pure () else retry)))
       atomically (modifyTVar' trace ("released " <> name :))
       pure []
     _ → pure []
@@ -193,10 +209,10 @@ waitFixture signals trace =
 -- then. The host's record of a request the service settles is settled in the same transaction, so a script may take it at once, within
 -- the invocation it was started in, before the owner's next boundary can account its work. It runs on the script's own thread, waits on
 -- the service's own state and nothing else, and a real script has no such function.
-awaitSettledFixture ∷ Service → Binding
-awaitSettledFixture service =
+awaitSettledFixture ∷ Parking → Service → Binding
+awaitSettledFixture parking service =
   asynchronousNativeRequestIn "terrain_test_await_settled" [] [] $ \_ _ →
-    [] <$ bounded (atomically (inspectCensusSTM service >>= \census → let requests = censusRequests census in if not (null requests) && all censusSettled requests then pure () else retry))
+    [] <$ parkedWhile parking (bounded (atomically (inspectCensusSTM service >>= \census → let requests = censusRequests census in if not (null requests) && all censusSettled requests then pure () else retry)))
 
 -- | How a fixture hands a scripted instance the next command an example queued for it: @TEST_CMD(label)@ answers it, or the text @none@. It
 -- never waits, and a real script has no such function.
@@ -221,11 +237,11 @@ signalRig rig name = atomically (modifyTVar' (rgSignals rig) (Set.insert name))
 -- | How a fixture holds a script where an offer of the service's open is already made and the host has not adopted it:
 -- @TEST_AWAIT_OFFER(name)@ returns once the service holds an offered lease for the open of that name. It runs on the script's own
 -- thread, waits on the adapter's own state and nothing else, and a real script has no such function.
-awaitOfferFixture ∷ TerrainFacade → Binding
-awaitOfferFixture facade =
+awaitOfferFixture ∷ Parking → TerrainFacade → Binding
+awaitOfferFixture parking facade =
   asynchronousNativeRequestIn "terrain_test_await_offer" [SText] [] $ \_ values → case values of
     [VText name] →
-      [] <$ bounded (atomically (readTVar (tfOffered facade) >>= \held → if any (Text.isSuffixOf ("/" <> name)) (Map.keys held) then pure () else retry))
+      [] <$ parkedWhile parking (bounded (atomically (readTVar (tfOffered facade) >>= \held → if any (Text.isSuffixOf ("/" <> name)) (Map.keys held) then pure () else retry)))
     _ → pure []
 
 -- | Lua for the soil-over-stone definition the examples share: stone below level -3, four soil levels from -3 to 1.
@@ -319,15 +335,24 @@ tightRigConfig = defaultConfig {configLimits = limits, configRetainedBytes = fro
 
 -- Gates -----------------------------------------------------------------------------------------------------
 
--- | A point the terrain owner can be held at, with a signal that it arrived.
+-- | A point the terrain owner can be held at, with a signal that it arrived: a flag, raised by an arrival and taken by the wait for
+-- it, so that a pump can decide to stop on it in the transaction that would otherwise claim the next update.
 data Gate = Gate
-  { gateArrived ∷ MVar ()
+  { gateArrived ∷ TVar Bool
   , gateOpen ∷ MVar ()
   , gateArmed ∷ TVar Bool
   }
 
 newGate ∷ IO Gate
-newGate = Gate <$> newEmptyMVar <*> newEmptyMVar <*> newTVarIO True
+newGate = Gate <$> newTVarIO False <*> newEmptyMVar <*> newTVarIO True
+
+-- | An arrival: raise the flag (an arrival before the last was taken is the same signal).
+arrive ∷ Gate → IO ()
+arrive gate = atomically (writeTVar (gateArrived gate) True)
+
+-- | Whether an arrival is waiting, taking it when one is.
+takeArrival ∷ Gate → STM Bool
+takeArrival gate = readTVar (gateArrived gate) >>= \arrived → arrived <$ when arrived (writeTVar (gateArrived gate) False)
 
 armGate, disarmGate ∷ Gate → IO ()
 armGate gate = atomically (writeTVar (gateArmed gate) True)
@@ -339,17 +364,24 @@ gatedProbe selects gate = Probe $ \point →
   when (selects point) $ do
     armed ← readTVarIO (gateArmed gate)
     when armed $ do
-      _ ← tryPutMVar (gateArrived gate) ()
+      arrive gate
       takeMVar (gateOpen gate)
 
--- | Wait, bounded, until the owner has arrived at the gate.
+-- | Wait, bounded, until the owner has arrived at the gate, taking the arrival.
 awaitReached ∷ Gate → IO ()
-awaitReached gate = bounded (takeMVar (gateArrived gate))
+awaitReached gate = bounded (atomically (takeArrival gate >>= \arrived → if arrived then pure () else retry))
 
--- | Drive the world's clock, bounded, until the owner has arrived at the gate: for an owner that only reaches it at a boundary a
--- clock tick brings.
+-- | Step the presentation VMs, one update at a time, until the owner has arrived at the gate, the arrival taken in the transaction
+-- that decides to stop ('stepUntil'): for an owner that only reaches it at a boundary an update brings.
 pumpUntilReached ∷ World → Gate → IO ()
-pumpUntilReached world gate = pumpUntil world (advanceClock world 2000000000 >> (isJust <$> tryTakeMVar (gateArrived gate)))
+pumpUntilReached world gate = stepUntil world (takeArrival gate)
+
+-- | Wait, bounded, until a reading the service offers only outside a transaction holds. It wakes nothing: what it waits for is
+-- the service's or an owner's own work (a control, a settlement), never an update.
+waitUntil ∷ IO Bool → IO ()
+waitUntil reading = bounded loop
+  where
+    loop = reading >>= \done → if done then pure () else yield >> loop
 
 -- | Let a held owner go, and every later arrival through. Idempotent, so a scope can open it as part of its stop.
 openGate ∷ Gate → IO ()
@@ -395,10 +427,12 @@ limitHeld service name = do
   rows ← inspectLimits service
   pure (maybe (-1) (toInteger . limitRowHeld) (find ((== name) . limitRowName) rows))
 
--- | Advance the presentation clock until the instance has printed this line, and when it does not in time say what it did print.
+-- | Step the presentation VMs, one update at a time, until the instance has printed this line, decided in the transaction that
+-- would claim the next update ('stepUntil'), so the update after the one that printed it never runs; when it does not come in
+-- time, say what was printed.
 untilPrinted ∷ World → Text → IO ()
 untilPrinted world marker =
-  pumpUntil world (advanceClock world 2000000000 >> (elem marker <$> outLines world))
+  stepUntil world (elem marker <$> outLinesSTM world)
     `onException` do
       printed ← outLines world
       warned ← errLines world
@@ -429,7 +463,7 @@ removalProbeIn gate = do
             armed ← readTVarIO (gateArmed gate)
             when armed $ do
               readIORef granted >>= writeIORef heldInSlot . elem rid
-              _ ← tryPutMVar (gateArrived gate) ()
+              arrive gate
               takeMVar (gateOpen gate)
         _ → pure ()
   pure (probe, readIORef heldInSlot)
@@ -450,12 +484,21 @@ untilPrintedBy world spawned marker =
       Just Instance.Failed → settledFailure spawned >>= \failure → putStrLn ("the instance failed: " <> show (failureMessage <$> failure))
       other → putStrLn ("the instance is " <> show other)
 
--- | The action that holds whoever runs it at the gate until it is opened: for a hook of the adapter.
-holdAt ∷ Gate → IO ()
-holdAt gate = do
+-- | The action that holds whoever runs it at the gate until it is opened: for a hook of the adapter ('withRigHolding'). The thread
+-- is marked parked while it is held, so the step goes on with the other VMs.
+holdAt ∷ Parking → Gate → IO ()
+holdAt parking gate = do
   armed ← readTVarIO (gateArmed gate)
   when armed $ do
-    _ ← tryPutMVar (gateArrived gate) ()
+    arrive gate
+    parkedWhile parking (takeMVar (gateOpen gate))
+
+-- | 'holdAt' for a thread that is no Lua owner (the terrain service's owner in a probe, an example's own thread): nothing to mark.
+holdThere ∷ Gate → IO ()
+holdThere gate = do
+  armed ← readTVarIO (gateArmed gate)
+  when armed $ do
+    arrive gate
     takeMVar (gateOpen gate)
 
 -- | The name the service holds for an arena a Lua instance of this rig's session opened under this content root.

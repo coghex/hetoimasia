@@ -8,6 +8,7 @@ import Hetoimasia.LuaEngine.Profile (fixedM1Profile)
 import Hetoimasia.Terrain.Query (QueryLimits (..), defaultQueryLimits)
 import Hetoimasia.Terrain.Runtime (Config (..), defaultConfig)
 import Test.Hspec
+import Control.Concurrent.STM (readTVar)
 import Test.LuaEngine.Facade.Support
 import Test.LuaEngine.Terrain.Support
 
@@ -160,4 +161,4 @@ spec = describe "Terrain limits" $ do
           printed ← outLines world
           printed `shouldContain` ["remove air\tsuccess\tfalse\t0"]
           -- the guard latches the whole session's terminal failure, even after a successful terrain call
-          pumpUntil world (advanceClock world 2000000000 >> (not . null <$> terminalsSeen world))
+          stepUntil world (not . null <$> readTVar (wTerminals world))

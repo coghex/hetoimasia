@@ -55,7 +55,7 @@ spec = describe "Terrain domain failures" $ do
       withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource semantic)]) $ \world _ runtime →
         withFvm world runtime (presentationOver rig) $ \fvm → do
           _ ← spawn world fvm "modules-test" mainPath
-          pumpUntil world (advanceClock world 2000000000 >> (elem "done" <$> outLines world))
+          stepUntil world (elem "done" <$> outLinesSTM world)
           printed ← outLines world
           mapM_ (\(label, _) → printed `shouldContain` [label <> "\tfailure\tdefinition"]) semanticCases
           limitHeld (rgService rig) "arenas" `shouldReturn` 0
