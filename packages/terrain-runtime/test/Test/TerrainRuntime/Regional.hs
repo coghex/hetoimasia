@@ -12,11 +12,11 @@ module Test.TerrainRuntime.Regional (spec, fullSpec) where
 import Control.Concurrent.MVar
 import Control.Concurrent.STM
 import Control.Exception (ErrorCall (..), finally, throwIO, try)
-import Control.Monad (forM, forM_)
+import Control.Monad (foldM, forM, forM_, when)
 import Data.IORef
 import Data.List (sort)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (fromMaybe, listToMaybe, mapMaybe)
+import Data.Maybe (fromMaybe, isJust, listToMaybe, mapMaybe)
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Word (Word64)
@@ -34,7 +34,14 @@ import Hetoimasia.Terrain.Runtime.Store.Internal.State (minAllowanceBytes)
 import Hetoimasia.Terrain.Source (CellSpec (..), LayerSpec (..), PatchSpec (..), SourceSpec (..))
 import Hetoimasia.Terrain.Runtime.Backed.Backend (Closing (..))
 import Hetoimasia.Terrain.Runtime.Backed.RegionCopy (RegionCopy (..))
-import Hetoimasia.Terrain.Runtime.Backed.Regional (BProgress (..), Build, buildDraining, buildVersion, endBuild, startBuild, stepBuild)
+import Hetoimasia.Terrain.Connectivity (defaultConnectivityLimits, prepareConnectivity)
+import Hetoimasia.Terrain.Runtime.Backed.Gather (gatherPinLimit)
+import Hetoimasia.Terrain.Runtime.Backed.RegionCopy (regionEntryBytes, shortBytes)
+import Hetoimasia.Terrain.Runtime.Backed.Regional (BProgress (..), Build, buildCopies, buildDraining, buildRegionsDone, buildVersion, endBuild, startBuild, stepBuild)
+import Hetoimasia.Terrain.Runtime.Store.Internal.Plan (Planned (..), TxClass (..))
+import Hetoimasia.Terrain.Source (defaultSourceLimits, mkSource)
+import qualified Data.ByteString.Short as SBS
+import Test.TerrainRuntime.Heap (Retained (..), retainedBy)
 import Hetoimasia.Terrain.Runtime.Backed.Txn (Io (..))
 import qualified Hetoimasia.Terrain.Runtime.Storage.Internal.Service as Storage
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Types (WorkClass (..))
@@ -45,7 +52,7 @@ import Test.Support.Bounded (bounded)
 import Test.Support.Owned (withOwnedThread)
 import Test.TerrainRuntime.Fixtures
 import qualified Test.TerrainRuntime.Storage.Harness as H
-import Test.TerrainRuntime.Store.Harness (H (..), smallSpec)
+import Test.TerrainRuntime.Store.Harness (H (..), deltaFor, fillPlan, runKey, runPlanned, runRec, smallSpec)
 import qualified Test.TerrainRuntime.Store.Scenes as Scenes
 
 -- | The routine examples: a representative every-cell oracle over the two regions that hold every fixture
@@ -62,6 +69,7 @@ spec = describe "Regional snapshots" $ do
   pendingSpec
   pressureSpec
   buildPressureSpec
+  retentionSpec
   failureSpec
   ownershipSpec
   admissionSpec
@@ -902,6 +910,125 @@ buildPressureSpec =
       BDone _ → "done"
       BFailed h → "failed " <> show h
       BDrained → "drained"
+
+-- | A store on a real file with these removed cells committed as runs, on the storage harness's service:
+-- what a build driven directly reads. The runs are committed in transactions of at most 64 records, each
+-- planned against the harness's model of the same store and written through the real backend.
+directStore ∷ H.Env → [Cell3] → IO (Store, Io)
+directStore env removed = do
+  let h0 = H.newStoreH smallSpec
+  backing ← H.openBacking env (hIdent h0) (hCfg h0)
+  let commit (h, store) records = do
+        plan ← case fillPlan h (deltaFor (hStore h) True False 1 records) Ordinary of
+          Right (Planned p) → pure p
+          other → fail ("the runs were not planned: " <> either id (\case Planned _ → "planned"; o → show o) other)
+        txn ← H.runTxn env backing store plan
+        store' ← H.finishPublish txn
+        h' ← either fail (pure . fst) (runPlanned h (Planned plan))
+        pure (h', store')
+  (_, store) ← foldM commit (h0, hStore h0) (chunks (runRecords removed))
+  pure (store, Io (H.envSvc env) backing ExplicitWork)
+  where
+    runRecords cells =
+      -- a run record names its first level and the level after its last
+      [ (runKey x y lo, Just (runRec (hi + 1)))
+      | ((x, y), zs) ← Map.toList (Map.fromListWith (<>) [((x, y), [z]) | (x, y, z) ← cells])
+      , (lo, hi) ← coalesce (sort zs)
+      ]
+    coalesce = \case
+      [] → []
+      z : zs → go z z zs
+    go lo hi = \case
+      z : zs | z == hi + 1 → go lo z zs
+      z : zs → (lo, hi) : go z z zs
+      [] → [(lo, hi)]
+    chunks = \case
+      [] → []
+      xs → let (now, later) = splitAt 64 xs in now : chunks later
+
+-- | A definition's discovery environment.
+envOf ∷ SourceSpec → D.Env
+envOf definition = case mkSource defaultSourceLimits definition of
+  Left e → error ("source refused: " <> show e)
+  Right src → case prepareConnectivity defaultConnectivityLimits src of
+    Left e → error ("compilation refused: " <> show e)
+    Right (conn, _) → D.mkEnv (Scenes.limitsWith 64) src conn
+
+-- | Step a build to its end, looking at it after every quantum (and whether the quantum ended waiting for a
+-- page).
+driveBuild ∷ Io → Store → Build → (Bool → Build → IO ()) → IO (Build, Either String [(RegionCoord, RegionCopy)])
+driveBuild io st b0 look = go b0
+  where
+    go b = do
+      (b', p) ← stepBuild io OwnerRunning st b
+      look (case p of BBlocked _ → True; _ → False) b'
+      case p of
+        BMore → go b'
+        BNoted _ → go b'
+        BBlocked wait → atomically wait >> go b'
+        BDone copies → pure (b', Right copies)
+        BPressed busy → pure (b', Left ("pressed " <> show busy))
+        BFailed h → pure (b', Left ("failed " <> show h))
+        BDrained → pure (b', Left "drained")
+
+-- | What a build retains, measured on the heap: between regions its packed copies alone, evaluated in full;
+-- at any moment never more pages than a reader may pin, whatever window a read starts afresh.
+retentionSpec ∷ Spec
+retentionSpec = describe "what a regional build retains" $ do
+  it "keeps nothing of a finished region but its evaluated copy: between regions a build retains its packed copies alone" $
+    H.withEnv $ \env → do
+      -- the complex region of every fixture's shape, the region below it its shaft crosses into, and a
+      -- pristine one
+      (store, io) ← directStore env (fxRemovals together)
+      let regions = [region 0 0 0, region 0 0 (-1), region 1 0 0]
+      (pinned, b) ← either (fail . show) pure (startBuild store (envOf (fxSpec together)) regions)
+      seen ← newIORef []
+      (b', done) ← driveBuild io pinned b $ \_ now → do
+        before ← length <$> readIORef seen
+        when (buildRegionsDone now > before) $ do
+          copies ← retainedBy ["Env"] [] (buildCopies now)
+          whole ← retainedBy ["Env"] [] now
+          modifyIORef' seen ((buildRegionsDone now, retThunks copies, retThunks whole, retBytes whole, sum [accounted c | (_, c) ← buildCopies now]) :)
+      _ ← pure (endBuild pinned b')
+      copied ← either fail pure done
+      boundaries ← reverse <$> readIORef seen
+      -- the first region is the complex one: its plan and answers are what a lazy copy would keep
+      fmap (\(_, c) → workOf (rcWork c)) (listToMaybe copied) `shouldSatisfy` maybe False (\(_, _, classes, _, evaluations, _) → classes > 1 && evaluations > 100)
+      map (\(n, _, _, _, _) → n) boundaries `shouldBe` [1, 2, 3]
+      forM_ boundaries $ \(n, copyThunks, buildThunks, bytes, footprint) → do
+        -- nothing unevaluated: no part, counter or plan waits behind a thunk
+        (n, copyThunks, buildThunks) `shouldBe` (n, 0, 0)
+        -- what the build keeps between regions is its copies' accounted footprint, a list cell and a
+        -- coordinate per region, and its own record, pin and remaining regions
+        (n, bytes <= fromIntegral footprint + 64 * n + 512) `shouldBe` (n, True)
+        (n, fromIntegral bytes <= regionSnapshotReservation (length regions)) `shouldBe` (n, True)
+  it "drops the window a read replaces when it starts afresh inside a region: a build never holds more pages than a reader may pin" $
+    H.withEnv $ \env → do
+      -- runs dense enough that one region's reads need more pages than one window holds
+      let dense = [(x, y, z) | x ← [-1 .. 16], y ← [-1 .. 16], z ← [0, 6 .. 30]]
+      (store, io) ← directStore env dense
+      (pinned, b) ← either (fail . show) pure (startBuild store (envOf (fxSpec together)) [region 0 0 0])
+      waits ← newIORef (0 ∷ Int)
+      counts ← newIORef []
+      (b', done) ← driveBuild io pinned b $ \waiting now → when waiting $ do
+        -- every fortieth page the build waits for (not a multiple of a window's pages, so the samples fall at
+        -- every phase of one): a replaced window kept would be held for the whole of the read that replaced
+        -- it, many waits long (what holds no page is not entered: the plan's pieces, the answers, the runs'
+        -- coordinates)
+        n ← atomicModifyIORef' waits (\w → (w + 1, w))
+        when (n `mod` 40 == 0) $ do
+          r ← retainedBy ["Env", "CellKnowledge", "Span", "Own", "Node", "Column", "I64#", "I#"] ["VPage"] now
+          modifyIORef' counts (Map.findWithDefault 0 "VPage" (retConstructors r) :)
+      _ ← pure (endBuild pinned b')
+      copied ← either fail pure done
+      held ← reverse <$> readIORef counts
+      -- windows were started afresh inside the region (the pages held fell while it was read) ...
+      or (zipWith (>) held (drop 1 held)) `shouldBe` True
+      -- ... and the build never held more pages than one window's
+      maximum held `shouldSatisfy` (<= gatherPinLimit)
+      [(r, isJust (rcTerrain c), isJust (rcKnowledge c)) | (r, c) ← copied] `shouldBe` [(region 0 0 0, True, True)]
+  where
+    accounted c = regionEntryBytes + maybe 0 (shortBytes . SBS.length) (rcTerrain c) + maybe 0 (shortBytes . SBS.length) (rcKnowledge c)
 
 failureSpec ∷ Spec
 failureSpec =

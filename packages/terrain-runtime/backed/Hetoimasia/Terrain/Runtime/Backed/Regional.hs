@@ -11,8 +11,13 @@
 --
 -- Every read runs on the same pin, through a window carried from read to read within a region, started
 -- afresh for each region and whenever a read would need more than a reader may pin, so the build retains
--- ONE root identity however many windows it uses, and nothing it reads can come from another version. Only the requested regions are
--- copied; the columns beside them are read as dependencies and kept only while their region is built.
+-- ONE root identity however many windows it uses, and nothing it reads can come from another version. The
+-- window has ONE owner at a time: the read in progress, or the evaluation step waiting to start the next
+-- read; a read that starts afresh drops the window it replaced, so a build never holds more than one
+-- window. Only the requested regions are copied; the columns beside them are read as dependencies and
+-- kept only while their region is built. A finished region is evaluated in full at its end ('settledCopy'):
+-- nothing of its reads, plan or answers survives it, so what a build retains between regions is its
+-- packed copies alone.
 --
 -- == Failures
 --
@@ -41,10 +46,13 @@ module Hetoimasia.Terrain.Runtime.Backed.Regional
   , buildDraining
   , buildVersion
   , buildRegionsDone
+  , buildCopies
+  , settledCopy
   , BProgress (..)
   ) where
 
 import Control.Concurrent.STM (STM)
+import Control.Exception (evaluate)
 import Data.ByteString.Short (ShortByteString)
 import Data.Int (Int64)
 import Data.Map.Strict (Map)
@@ -69,19 +77,18 @@ import Hetoimasia.Terrain.Runtime.Store.Internal.Tree (Window)
 data Build = Build
   { bToken ∷ !ReaderToken
   , bVersion ∷ !Word64
-  , bWindow ∷ !Window
-  -- ^ The window the next read on the pin starts from (its pages are copies of the pinned version's).
   , bEnv ∷ !D.Env
   , bTodo ∷ ![RegionCoord]
   , bUnit ∷ !Unit
   , bDone ∷ ![(RegionCoord, RegionCopy)]
-  -- ^ The regions copied so far, newest first.
+  -- ^ The regions copied so far, newest first, each evaluated in full ('settledCopy').
   , bRefused ∷ !(Map PageNo Condition)
   -- ^ Pages this build failed to read, with their cause.
   , bDraining ∷ !Bool
   }
 
--- | The read a build is in.
+-- | The read a build is in. The window the build reads through is held in exactly one place: the read in
+-- progress, or ('Idle') the evaluation step about to start the next read; 'Between' holds none.
 data Unit
   = Between
   | -- | A region's own columns.
@@ -89,8 +96,14 @@ data Unit
   | -- | The columns beside a region, with its own columns' runs.
     HaloRuns !RegionCoord ![(Column, Int64, Int64)] !Gather
   | -- | A region's knowledge: its packed terrain, its plan, the tiles still to evaluate, the answers so
-    -- far (newest first) and the evaluation in progress.
-    Evaluate !RegionCoord !ShortByteString !Int !Int !D.KnowledgePlan ![TileCoord] ![D.CellKnowledge] !(Maybe (Query D.CellKnowledge))
+    -- far (newest first) and the evaluation in progress or the window the next one starts from.
+    Evaluate !RegionCoord !ShortByteString !Int !Int !D.KnowledgePlan ![TileCoord] ![D.CellKnowledge] !Step
+
+-- | Where a region's evaluation is: between two evaluations (holding the window the next starts from), or
+-- in one (whose query owns the window).
+data Step
+  = Idle !Window
+  | Running !(Query D.CellKnowledge)
 
 -- | Where a step left the build.
 data BProgress
@@ -116,7 +129,7 @@ startBuild ∷ Store → D.Env → [RegionCoord] → Either GatherRefusal (Store
 startBuild store env regions = case acquireReader store of
   Left refusal → Left (NoPin refusal)
   Right (token, pinned) → case (readerWindow pinned token, readerVersion pinned token) of
-    (Right window, Right version) → Right (pinned, Build token version window env regions Between [] Map.empty False)
+    (Right _, Right version) → Right (pinned, Build token version env regions Between [] Map.empty False)
     _ → Left PinRefused
 
 -- | Release the build's pin (releasing twice changes nothing). Called once no read of it is in flight.
@@ -133,6 +146,17 @@ buildVersion = bVersion
 -- | How many regions the build has finished.
 buildRegionsDone ∷ Build → Int
 buildRegionsDone = length . bDone
+
+-- | The regions the build has finished, newest first (for verification: each is evaluated in full).
+buildCopies ∷ Build → [(RegionCoord, RegionCopy)]
+buildCopies = bDone
+
+-- | A copy evaluated in full: its packed parts and its work counters, so it keeps nothing of the build that
+-- made it (a part left unevaluated would keep its region's reads, plan and answers).
+settledCopy ∷ RegionCopy → RegionCopy
+settledCopy c@(RegionCopy terrain knowledge work) = part terrain `seq` part knowledge `seq` work `seq` c
+  where
+    part = maybe () (`seq` ())
 
 -- | The most steps that need no wait one call of 'stepBuild' takes: a quantum is bounded by this many
 -- ranged reads or evaluations, and ends early at any wait.
@@ -159,15 +183,16 @@ stepOnce io closing store b = case bUnit b of
     -- window never holds more than one reader may pin whatever the build spans, and every window reads
     -- the one version the build pinned
     region : rest → case readerWindow store (bToken b) of
-      Right fresh → let b' = b {bWindow = fresh} in pure (b' {bTodo = rest, bUnit = OwnRuns region (ownGatherOf b' region)}, BMore)
+      Right fresh → region `seq` pure (b {bTodo = rest, bUnit = OwnRuns region (ownGatherOf b fresh region)}, BMore)
       Left why → pure (b, BFailed (HandleDefect (Text.pack ("a build's own pin was refused: " <> show why))))
   OwnRuns region g → do
     (g', p) ← stepGather io closing store g
     case p of
       GMore → pure (b {bUnit = OwnRuns region g'}, BMore)
       GBlocked wait → pure (b {bUnit = OwnRuns region g'}, BBlocked wait)
-      GDone own → pure (b {bWindow = gatherWindow g', bUnit = HaloRuns region own (haloGather (gatherWindow g') region)}, BMore)
-      GFailed handling → failed handling (gatherFetching g) (gatherWindow g') (RegionCopy Nothing Nothing (RegionWork 256 0 0 0 0 0)) region (OwnRuns region (ownGather region))
+      -- the gather's window passes to the next read; the gather is dropped with its runs
+      GDone own → pure (b {bUnit = HaloRuns region own (haloGather (gatherWindow g') region)}, BMore)
+      GFailed handling → failed handling (gatherFetching g) (gatherWindow g') (RegionCopy Nothing Nothing (RegionWork 256 0 0 0 0 0)) region (\w → OwnRuns region (ownGatherOf b w region))
       GDrained → pure (b {bUnit = Between}, BDrained)
   HaloRuns region own g → do
     (g', p) ← stepGather io closing store g
@@ -177,33 +202,38 @@ stepOnce io closing store b = case bUnit b of
       GDone halo →
         let plan = D.planRegionKnowledge (bEnv b) region (runsByColumn (own <> halo))
             columns = 256 + length (D.regionHaloColumns region)
-         in pure
-              ( b {bWindow = gatherWindow g', bUnit = Evaluate region (packTerrain region own) columns (length own + length halo) plan (D.planTiles plan) [] Nothing}
-              , BMore
-              )
-      GFailed handling → failed handling (gatherFetching g) (gatherWindow g') (RegionCopy (Just (packTerrain region own)) Nothing (RegionWork (256 + length (D.regionHaloColumns region)) (length own) 0 0 0 0)) region (HaloRuns region own (haloGather (gatherWindow g') region))
+            terrain = packTerrain region own
+         in terrain `seq`
+              pure
+                ( b {bUnit = Evaluate region terrain columns (length own + length halo) plan (D.planTiles plan) [] (Idle (gatherWindow g'))}
+                , BMore
+                )
+      GFailed handling → failed handling (gatherFetching g) (gatherWindow g') (RegionCopy (Just (packTerrain region own)) Nothing (RegionWork (256 + length (D.regionHaloColumns region)) (length own) 0 0 0 0)) region (\w → HaloRuns region own (haloGather w region))
       GDrained → pure (b {bUnit = Between}, BDrained)
-  Evaluate region terrain columns runs plan tiles answers current → case current of
-    Nothing → case tiles of
+  Evaluate region terrain columns runs plan tiles answers step → case step of
+    Idle window → case tiles of
       [] → case D.assembleRegionKnowledge plan (reverse answers) of
         Nothing → pure (b, BFailed (HandleDefect "a region's answers did not match its plan"))
-        Just rk → pure (b {bUnit = Between, bDone = (region, RegionCopy (Just terrain) (Just (packKnowledge rk)) (workOf columns runs plan)) : bDone b}, BMore)
-      tile : _ → pure (b {bUnit = Evaluate region terrain columns runs plan tiles answers (Just (evaluation (bWindow b) tile))}, BMore)
-    Just q → do
+        -- THE REGION'S END: its copy is evaluated in full before it is kept, and the window, the plan and
+        -- the answers are dropped with the unit
+        Just rk → do
+          copy ← evaluate (settledCopy (RegionCopy (Just terrain) (Just (packKnowledge rk)) (workOf columns runs plan)))
+          pure (b {bUnit = Between, bDone = (region, copy) : bDone b}, BMore)
+      tile : _ → pure (b {bUnit = Evaluate region terrain columns runs plan tiles answers (Running (evaluation window tile))}, BMore)
+    Running q → do
       (q', p) ← stepQuery io closing store q
       let continue = Evaluate region terrain columns runs plan tiles answers
       case p of
-        QMore → pure (b {bUnit = continue (Just q')}, BMore)
-        QBlocked wait → pure (b {bUnit = continue (Just q')}, BBlocked wait)
-        QDone known → pure (b {bWindow = queryWindow q', bUnit = Evaluate region terrain columns runs plan (drop 1 tiles) (known : answers) Nothing}, BMore)
+        QMore → pure (b {bUnit = continue (Running q')}, BMore)
+        QBlocked wait → pure (b {bUnit = continue (Running q')}, BBlocked wait)
+        QDone known → pure (b {bUnit = Evaluate region terrain columns runs plan (drop 1 tiles) (known : answers) (Idle (queryWindow q'))}, BMore)
         QFailed handling →
-          let restart = continue (fmap (evaluation (queryWindow q')) (take1 tiles))
+          let restart w = continue (maybe (Idle w) (Running . evaluation w) (take1 tiles))
            in failed handling (queryFetching q) (queryWindow q') (RegionCopy (Just terrain) Nothing (workOf columns runs plan)) region restart
         QDrained → pure (b {bUnit = Between}, BDrained)
   where
     -- what a read of these columns can keep: the runs the region's levels and one beyond each end hold
     keep columns = columns * runsMeetingLevels (34 ∷ Int)
-    ownGather = ownGatherOf b
     haloGather window region = let cols = ranged region (D.regionHaloColumns region) in gatherOnPin (bToken b) (bVersion b) window (bRefused b) (keep (length cols)) cols
     ranged region columns = let (lo, hi) = D.regionReadLevels region in [(c, lo, hi) | c ← columns]
     evaluation window tile = queryOnPin (bToken b) (bVersion b) window (bRefused b) (\provider → D.queryCell (bEnv b) provider tile)
@@ -212,20 +242,21 @@ stepOnce io closing store b = case bUnit b of
       [] → Nothing
     workOf columns runs plan = RegionWork columns runs (D.planClasses plan) (D.planPieces plan) (length (D.planTiles plan)) (D.planPerLevelTiles plan)
     -- A read of the region failed: unavailable parts and the page remembered; pressure keeps the read to
-    -- start again; anything else ends the build.
+    -- start again from the failed read's window; anything else ends the build. The failed read is dropped
+    -- either way, so only the restarted read holds a window.
     failed handling page window copy region restart = case handling of
-      HandleRetryLater busy → pure (b {bWindow = window, bUnit = restart}, BPressed busy)
+      HandleRetryLater busy → pure (b {bUnit = restart window}, BPressed busy)
       HandlePause cause _ → unavailable cause
       HandlePausedFor cause → unavailable cause
       HandleDomain _ → unavailable CondIo
       other → pure (b, BFailed other)
       where
-        unavailable cause =
+        unavailable cause = do
+          settled ← evaluate (settledCopy copy)
           pure
             ( b
-                { bWindow = window
-                , bUnit = Between
-                , bDone = (region, copy) : bDone b
+                { bUnit = Between
+                , bDone = (region, settled) : bDone b
                 , bRefused = maybe (bRefused b) (\p → Map.insert p cause (bRefused b)) page
                 }
             , BNoted handling
@@ -238,9 +269,9 @@ cancelBuild ∷ Io → Build → IO (Build, BProgress)
 cancelBuild io b = case bUnit b of
   OwnRuns region g → onGather (OwnRuns region) =<< cancelGather io g
   HaloRuns region own g → onGather (HaloRuns region own) =<< cancelGather io g
-  Evaluate region terrain columns runs plan tiles answers (Just q) → cancelQuery io q >>= \(q', p) → case p of
+  Evaluate region terrain columns runs plan tiles answers (Running q) → cancelQuery io q >>= \(q', p) → case p of
     QDrained → pure (b {bDraining = True, bUnit = Between}, BDrained)
-    QBlocked wait → pure (b {bDraining = True, bUnit = Evaluate region terrain columns runs plan tiles answers (Just q')}, BBlocked wait)
+    QBlocked wait → pure (b {bDraining = True, bUnit = Evaluate region terrain columns runs plan tiles answers (Running q')}, BBlocked wait)
     QFailed handling → pure (b {bDraining = True, bUnit = Between}, BFailed handling)
     _ → pure (b {bDraining = True, bUnit = Between}, BDrained)
   _ → pure (b {bDraining = True, bUnit = Between}, BDrained)
@@ -251,12 +282,12 @@ cancelBuild io b = case bUnit b of
       GFailed handling → pure (b {bDraining = True, bUnit = Between}, BFailed handling)
       _ → pure (b {bDraining = True, bUnit = Between}, BDrained)
 
--- | The read of a region's own columns, on the build's pin and from its current window.
-ownGatherOf ∷ Build → RegionCoord → Gather
-ownGatherOf b region =
+-- | The read of a region's own columns, on the build's pin and from this window.
+ownGatherOf ∷ Build → Window → RegionCoord → Gather
+ownGatherOf b window region =
   let (lo, hi) = D.regionReadLevels region
       cols = [(c, lo, hi) | c ← D.regionColumns region]
-   in gatherOnPin (bToken b) (bVersion b) (bWindow b) (bRefused b) (length cols * runsMeetingLevels (34 ∷ Int)) cols
+   in gatherOnPin (bToken b) (bVersion b) window (bRefused b) (length cols * runsMeetingLevels (34 ∷ Int)) cols
 
 -- | The runs of each column, for a plan.
 runsByColumn ∷ [(Column, Int64, Int64)] → Map Column [(Int64, Int64)]
