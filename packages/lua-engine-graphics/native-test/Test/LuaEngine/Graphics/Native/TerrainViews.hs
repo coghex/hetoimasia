@@ -94,7 +94,7 @@ import Hetoimasia.Render.TwoD.Validation (Location (..), validateSnapshotWith)
 import Hetoimasia.Render.TwoD.Vulkan.Chunks (RetainedView (..), retainedChunks, retainedViewSTM)
 import Hetoimasia.Render.TwoD.Vulkan.Textures (registeredMarks)
 import Hetoimasia.Terrain.Coordinate (RegionCoord (..), axisFromInteger, tileCoord)
-import Hetoimasia.Terrain.Residency (RegionDemand (..), RegionInfo (..), coverageBox, modelRegions)
+import Hetoimasia.Terrain.Residency (RegionDemand (..), RegionInfo (..), coverageBox, modelJobs, modelRegions)
 import System.Timeout (timeout)
 import Hetoimasia.Terrain.Render2D.AtlasFixtures (AtlasStyle, findSampleDirectory, loadAtlasStyle)
 import qualified Hetoimasia.Terrain.Render2D.AtlasFixtures as Fixtures
@@ -164,7 +164,7 @@ fullSpec env = describe "terrain views (full)" $ do
         atomically (updateCamera view (CameraIntent [Camera.SetFacing facing])) `shouldReturn` Right ()
         _ ← awaitAdopted rig (n + 1)
         rendered ← renderJudged rig ("facing " <> Text.pack (show facing))
-        pickAgreement view rendered >>= notePicks
+        pickAgreement rig view rendered >>= notePicks
         closeView view
   forM_ [0.125, 0.5, 2, 8] $ \zoom →
     it ("draws a zoom exactly, the endpoints included: " <> show zoom) $
@@ -174,7 +174,7 @@ fullSpec env = describe "terrain views (full)" $ do
         atomically (updateCamera view (CameraIntent [Camera.SetZoom zoom])) `shouldReturn` Right ()
         _ ← awaitAdopted rig (n + 1)
         rendered ← renderJudged rig ("zoom " <> Text.pack (show zoom))
-        pickAgreement view rendered >>= notePicks
+        pickAgreement rig view rendered >>= notePicks
         closeView view
   it "draws a portrait target exactly, and a pick over the clear background finds nothing" $
     within 60 . withRig env $ \rig → do
@@ -183,7 +183,7 @@ fullSpec env = describe "terrain views (full)" $ do
       rendered ← renderJudged rig "portrait"
       clearPicks ← forM (take 64 (rwClear rendered)) $ \(x, y) → atomically (pickView view (fromIntegral x + 0.5, fromIntegral y + 0.5))
       [p | p@(PickHit _) ← clearPicks] `shouldBe` []
-      pickAgreement view rendered >>= notePicks
+      pickAgreement rig view rendered >>= notePicks
       closeView view
   it "draws an adopted view again after its target is resized, at the new metrics, and picks what it draws" $
     within 60 . withRig env $ \rig → do
@@ -192,8 +192,10 @@ fullSpec env = describe "terrain views (full)" $ do
       _ ← renderJudged rig "before the resize"
       atomically (writeTVar (rgMetrics rig) (metricsOf 96 128))
       _ ← awaitAdopted rig (n + 1)
+      -- the new metrics' demand loads settle first, so the revision drawn is the one the picks answer from
+      settleBackground rig view
       rendered ← renderJudged rig "after the resize"
-      pickAgreement view rendered >>= notePicks
+      pickAgreement rig view rendered >>= notePicks
       closeView view
   it "draws a lower background far outside the camera's radius exactly" $
     within 60 . withRigOn pillarOverPlain (\c → c {tvCellConfig = (tvCellConfig c) {ccDepth = 250}}) env $ \rig → do
@@ -202,7 +204,7 @@ fullSpec env = describe "terrain views (full)" $ do
       Just (visible, _) ← atomically (viewDemand view)
       [r | r ← visible, abs (regionX r) > 1 || abs (regionY r) > 1] `shouldSatisfy` (not . null)
       rendered ← renderJudged rig "background"
-      pickAgreement view rendered >>= notePicks
+      pickAgreement rig view rendered >>= notePicks
       closeView view
   it "draws a revealed cavity's ordinary, fog and mixed cells exactly" $
     within 60 . withRigOn cavitySource id env $ \rig → do
@@ -226,7 +228,7 @@ fullSpec env = describe "terrain views (full)" $ do
         if Set.fromList [PartFog, PartKnown, PartOrdinary] `Set.isSubsetOf` found then pure found else retry
       Set.size parts `shouldBe` 3
       rendered ← renderJudged rig "mixed"
-      pickAgreement view rendered >>= notePicks
+      pickAgreement rig view rendered >>= notePicks
       closeView view
   it "keeps the adopted image when a replacement is refused as stale, then draws the replacement once it is made again" $ do
     stage ← newTVarIO (Nothing ∷ Maybe (Text.Text, TVar Bool))
@@ -234,7 +236,9 @@ fullSpec env = describe "terrain views (full)" $ do
     -- every gate opens when the example ends, however it ends, so the views' worker is never left parked in the hook
     -- and a failure is reported rather than hanging the teardown
     released ← newTVarIO False
+    trail ← newTVarIO ([] ∷ [Text.Text])
     let hook _ entered = do
+          atomically (modifyTVar' trail (entered :))
           wait ← atomically $ readTVar stage >>= \case
             Just (wanted, opened) | wanted == entered → Just opened <$ (writeTVar stage Nothing >> writeTVar held True)
             _ → pure Nothing
@@ -249,25 +253,34 @@ fullSpec env = describe "terrain views (full)" $ do
       -- view below moves the residency generation, and the view is idle with what it published adopted
       settleBackground rig view
       n ← publishedOf rig
-      before' ← renderJudged rig "the adopted image"
-      -- the replacement is held as its uploads end, the arena's residency moves under it, and its publication is
-      -- refused as stale; the next preparation is held as it starts copying again
-      uploaded ← newTVarIO False
-      atomically (writeTVar stage (Just ("uploading", uploaded)))
-      atomically (updateCamera view (CameraIntent [Camera.ZoomBy 2])) `shouldReturn` Right ()
-      awaitHeld "the replacement's uploading stage"
-      moveResidency rig
-      again ← newTVarIO False
-      atomically (writeTVar held False >> writeTVar stage (Just ("copying", again)) >> writeTVar uploaded True)
-      awaitHeld "the copying stage of the preparation after the stale refusal"
-      publishedOf rig `shouldReturn` n
-      kept ← renderJudged rig "kept after the stale replacement"
-      worldTag (rwWorld kept) `shouldBe` worldTag (rwWorld before')
-      atomically (writeTVar again True)
-      _ ← awaitAdopted rig (n + 1)
-      rendered ← renderJudged rig "the replacement"
-      zoomOf (rwWorld rendered) `shouldBe` 2
-      closeView view
+      let generationNow = fmap Runtime.viewGeneration <$> Runtime.inspectArenaSTM (rgTerrain rig) (rgArena rig)
+          diagnose = do
+            entries ← reverse <$> readTVarIO trail
+            generation ← atomically generationNow
+            published ← publishedOf rig
+            world ← adoptedScene rig
+            reading ← atomically (readView view)
+            Text.putStrLn ("DIAG stale: n=" <> Text.pack (show n) <> " published=" <> Text.pack (show published) <> " generation=" <> Text.pack (show generation) <> " stages=" <> Text.intercalate "," entries <> " adopted-zoom=" <> Text.pack (show (zoomOf <$> (world >>= graphicsWorld))) <> " adopted-tag=" <> Text.pack (show (worldTag <$> (world >>= graphicsWorld))) <> " restarts=" <> Text.pack (show (readingRestarts reading)) <> " steps=" <> Text.pack (show (readingSteps reading)))
+      (`onException` diagnose) $ do
+       before' ← renderJudged rig "the adopted image"
+       -- the replacement is held as its uploads end, the arena's residency moves under it, and its publication is
+       -- refused as stale; the next preparation is held as it starts copying again
+       uploaded ← newTVarIO False
+       atomically (writeTVar stage (Just ("uploading", uploaded)))
+       atomically (updateCamera view (CameraIntent [Camera.ZoomBy 2])) `shouldReturn` Right ()
+       awaitHeld "the replacement's uploading stage"
+       moveResidency rig
+       again ← newTVarIO False
+       atomically (writeTVar held False >> writeTVar stage (Just ("copying", again)) >> writeTVar uploaded True)
+       awaitHeld "the copying stage of the preparation after the stale refusal"
+       publishedOf rig `shouldReturn` n
+       kept ← renderJudged rig "kept after the stale replacement"
+       worldTag (rwWorld kept) `shouldBe` worldTag (rwWorld before')
+       atomically (writeTVar again True)
+       _ ← awaitAdopted rig (n + 1)
+       rendered ← renderJudged rig "the replacement"
+       zoomOf (rwWorld rendered) `shouldBe` 2
+       closeView view
 
 
 -- | The asserted overlap witness (owner decision S, #645 comment 6924532805), on a host whose test-only completion hold
@@ -607,8 +620,12 @@ act host action =
 -- as only the clear colour, no hit. A control is in the example itself: a picker that answered the rearmost quad
 -- containing the pixel would fail at the pixels counted as rear-differing (at least one). Answers how many pixels were
 -- judged and how many of them a rear-picking picker would have got wrong.
-pickAgreement ∷ TerrainView SceneTargetKey → RenderedWorld → IO (Int, Int)
-pickAgreement view rendered = do
+pickAgreement ∷ Rig → TerrainView SceneTargetKey → RenderedWorld → IO (Int, Int)
+pickAgreement rig view rendered = do
+  -- the picks are judged against the plan that was drawn: the revision the host has adopted now, which the view's
+  -- picks answer from, is the one rendered
+  adopted ← adoptedScene rig
+  fmap worldTag (adopted >>= graphicsWorld) `shouldBe` Just (worldTag (rwWorld rendered))
   plan ← atomically (adoptedPlan view) >>= maybe (assertFailure "no adopted plan") pure
   let regionQuads = Map.elems (Map.fromListWith (flip (<>)) [(regionOf (quadKey quad), [quad]) | quad ← cellPlanQuads plan])
       regionOf (CellKey _ _ vx vy _) = (vx `div` 16, vy `div` 16)
@@ -657,18 +674,21 @@ adoptedWorld rig = do
     Just scene | Just world ← graphicsWorld scene → pure (revision, world)
     _ → assertFailure "the adopted scene holds no world"
 
--- Wait until the view's whole visible demand is resident and the view is idle with what it published adopted.
+-- Wait until the view's whole demand, visible and prefetch, is resident, the terrain service has no load in hand, and the
+-- view is idle with what it published adopted: nothing then moves the residency generation but what the example does.
 settleBackground ∷ Rig → TerrainView SceneTargetKey → IO ()
 settleBackground rig view = within 30 . atomically $ do
   demand ← viewDemand view
   model ← Runtime.inspectModelSTM (rgTerrain rig)
+  let loading = not (null (modelJobs model))
   reading ← readView view
   standing ← standingOf rig
   let resident = Set.fromList (map regionCoord (modelRegions model))
       hostSettled = maybe False (\st → isJust (windowAdopted st) && windowAdopted st == windowPublished st) standing
   case demand of
-    Just (visible, _)
-      | Set.fromList visible `Set.isSubsetOf` resident
+    Just (visible, prefetch)
+      | Set.fromList (visible <> prefetch) `Set.isSubsetOf` resident
+      , not loading
       , readingStagedBytes reading == 0
       , isJust (readingPublished reading)
       , hostSettled →
