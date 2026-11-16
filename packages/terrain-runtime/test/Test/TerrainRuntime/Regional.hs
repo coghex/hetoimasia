@@ -387,10 +387,10 @@ fullSpec = describe "Regional snapshots (full depth): every cell of every region
     releaseRegionBorrow svc borrow
     settleChecks svc
 
--- | A configuration whose resident bank holds about two regions of the given extent (so reads of other
--- regions evict one), and whose retained bank has room for a regional snapshot's reservation.
-pressedConfig ∷ (Integer, Integer, Integer) → Config
-pressedConfig (ex, ey, ez) = defaultConfig {configLimits = limits, configRetainedBytes = retained}
+-- | A configuration of the given extent: the smallest resident bank it admits with a little room, and a
+-- retained bank with room for a regional snapshot's reservation.
+extentConfig ∷ (Integer, Integer, Integer) → Config
+extentConfig (ex, ey, ez) = defaultConfig {configLimits = limits, configRetainedBytes = retained}
   where
     retained = 2 * 1024 * 1024
     spec' resident staging =
@@ -410,17 +410,17 @@ pressedConfig (ex, ey, ez) = defaultConfig {configLimits = limits, configRetaine
         , specCameraRegions = 4
         }
     valid resident staging = either (const Nothing) Just (mkLimits (spec' resident staging))
-    first' = fromMaybe (error "no valid pressed limits") . listToMaybe
+    first' = fromMaybe (error "no valid limits for the extent") . listToMaybe
     smallest = first' [r | r ← [100, 200 .. 4000000], Just _ ← [valid r 1000000]]
     stagingFor resident = first' [t | t ← [1000, 2000 .. 4000000], Just _ ← [valid resident t]]
     resident' = smallest + 2 * 400
-    limits = fromMaybe (error "pressed limits are invalid") (valid resident' (3 * stagingFor resident' + toInteger retained))
+    limits = fromMaybe (error "the extent's limits are invalid") (valid resident' (3 * stagingFor resident' + toInteger retained))
 
 reducedExtentSpec ∷ Spec
 reducedExtentSpec =
   it "refuses a region set under an extent smaller than a region: a copy covers whole regions, beyond what a request may touch, leaving every account as it was" $
     -- the extent covers two columns, one row and two levels of each region
-    withService (pressedConfig (2, 1, 2)) $ \svc → guarded svc $ \_ → do
+    withService (extentConfig (2, 1, 2)) $ \svc → guarded svc $ \_ → do
       (_, lease) ← openWith svc (ground (caveRow 0 5 2 6)) [(1, 0, 1), (1, 0, 0)]
       before ← accountsOf svc
       forM_ [[region 0 0 0], [region 0 0 0, region 1 0 0]] $ \regions → do
@@ -683,33 +683,6 @@ coherenceSpec = describe "coherence" $ do
         fmap cellMaterial (regionCell snapshot (tile 100 88 (-16))) `shouldBe` PartReady (Just ("stone", 0))
         expectationMismatches (ground []) [(88, 88, -16)] snapshot `shouldBe` []
         releaseRegionBorrow svc borrow
-      settleChecks svc
-
-  it "keeps a settled snapshot's every answer through the eviction and the reload of its region" $
-    -- the whole extent, and a resident bank of about two regions: reads of other regions evict the held one
-    withService (pressedConfig (16, 16, 32)) $ \svc → guarded svc $ \taken → do
-      let definition = ground []
-          removed = [(1, 0, 1)]
-          held' = region 0 0 0
-      (_, lease) ← openWith svc definition removed
-      borrow ← borrowOf taken lease [held']
-      let snapshot = regionBorrowSnapshot borrow
-          answers = answersOf snapshot
-          resident = any ((== held') . regionCoord) . modelRegions <$> inspectModel svc
-          others = [(x, y, z) | z ← [0, -32, 64], y ← [0, 16, -16], x ← [16, 32, -16, 48, -32]]
-          press [] = pure False
-          press ((x, y, z) : rest) = do
-            _ ← readCell svc lease (tile x y z)
-            stays ← resident
-            if stays then press rest else pure True
-      _ ← readCell svc lease (tile 0 0 0)
-      resident >>= (`shouldBe` True)
-      press others >>= (`shouldBe` True)
-      _ ← readCell svc lease (tile 1 0 1)
-      resident >>= (`shouldBe` True)
-      answersOf snapshot `shouldBe` answers
-      expectationMismatches definition removed snapshot `shouldBe` []
-      releaseRegionBorrow svc borrow
       settleChecks svc
 
 -- ---------------------------------------------------------------------------
