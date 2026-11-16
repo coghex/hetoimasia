@@ -261,12 +261,12 @@ data ViewReading = ViewReading
   , readingGpuBytes ∷ !Word64
   , readingPins ∷ !Int
   , readingWaiting ∷ !Bool
+    -- ^ The last preparation stopped on pressure (a bank, the shared account, the copies, the pins) and waits for
+    -- something to be released or adopted.
   , readingStagedBytes ∷ !Word64
     -- ^ What the view's preparation holds of the account now: copies taken, inputs, the plan's growth, the adaptation.
   , readingRestarts ∷ !Int
     -- ^ Times the view's copies started again because copies of different committed versions met.
-    -- ^ The last preparation stopped on pressure (a bank, the shared account, the copies, the pins) and waits for
-    -- something to be released or adopted.
   }
   deriving (Eq, Show)
 
