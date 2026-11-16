@@ -4,6 +4,8 @@ module Test.TerrainRuntime.Revalidation (spec) where
 import Control.Concurrent.STM
 import Control.Concurrent (yield)
 import Control.Monad (forM, forM_)
+import Data.Word (Word64)
+import Hetoimasia.Foundation.Worker (withWorkerGroup)
 import Hetoimasia.Terrain.Residency (ArenaId (..), Revision (..), modelRegions, regionCoord)
 import Hetoimasia.Terrain.Runtime
 import Hetoimasia.Terrain.Runtime.Settlement
@@ -91,6 +93,69 @@ spec = describe "Superseded work and ordering" $ do
       removed <- okOf (removeAt svc lease (tile 1 1 1) (Just current)) >>= await svc >>= expectSuccess
       removed `shouldBe` RemoveAnswer (removeIncarnation first') (Revision 2) True
       settleChecks svc
+
+  it "answers stale_view for a stale knowledge revision in a view precondition, and removes under the current one" $
+    withService defaultConfig $ \svc → do
+      (_, lease) <- openMain svc "main"
+      first' <- removeCell' svc lease (tile 3 4 5)
+      status <- okOf (arenaStatus svc lease)
+      let knowledge = statusKnowledgeRevision status
+          withKnowledge k = PreconditionWith (removeIncarnation first') (removeRevision first') (Just k) Nothing
+      okOf (removeAt svc lease (tile 1 1 1) (Just (withKnowledge (Revision 999)))) >>= await svc >>= (`shouldBe` Left (Failed StaleView))
+      (cellIs <$> readCell svc lease (tile 1 1 1)) `shouldReturn` False
+      removed <- okOf (removeAt svc lease (tile 1 1 1) (Just (withKnowledge knowledge))) >>= await svc >>= expectSuccess
+      removeChangedFlag removed `shouldBe` True
+      settleChecks svc
+
+  it "reads a precondition's guard in the arbitration: one that does not hold, or retries, answers stale_view and changes nothing" $
+    withService defaultConfig $ \svc → do
+      (_, lease) <- openMain svc "main"
+      first' <- removeCell' svc lease (tile 3 4 5)
+      let guarded identity holds = Just (PreconditionWith (removeIncarnation first') (removeRevision first') Nothing (Just (PreconditionGuard identity holds)))
+      okOf (removeAt svc lease (tile 1 1 1) (guarded 1 (pure False))) >>= await svc >>= (`shouldBe` Left (Failed StaleView))
+      okOf (removeAt svc lease (tile 1 1 1) (guarded 2 retry)) >>= await svc >>= (`shouldBe` Left (Failed StaleView))
+      -- A guard over air is read as well: the no-op removal of a cell already air is stale too.
+      okOf (removeAt svc lease (tile 3 4 5) (guarded 3 (pure False))) >>= await svc >>= (`shouldBe` Left (Failed StaleView))
+      (cellIs <$> readCell svc lease (tile 1 1 1)) `shouldReturn` False
+      removed <- okOf (removeAt svc lease (tile 1 1 1) (guarded 4 (pure True))) >>= await svc >>= expectSuccess
+      removeChangedFlag removed `shouldBe` True
+      settleChecks svc
+
+  it "refuses a removal whose guard held at admission and staging but not at the arbitration, and commits nothing" $
+    withService defaultConfig $ \svc → do
+      (_, lease) <- openMain svc "main"
+      holds <- newTVarIO True
+      host <- newHost False
+      let precondition = Just (PreconditionWith (ArenaId 0) (Revision 0) Nothing (Just (PreconditionGuard 7 (readTVar holds))))
+      _ <- okOf (removeWith svc (hostEndpoint svc Nothing host) lease (tile 1 1 1) precondition)
+      -- Staged and waiting for its host's eligibility, with the guard still holding.
+      waitFor (readTVar (hostReady host) >>= \n → check (n >= 1))
+      atomically (writeTVar holds False)
+      grant host
+      settled <- waitFor (readTVar (hostSettled host) >>= \s → if null s then retry else pure s)
+      settled `shouldBe` [Failed StaleView]
+      (cellIs <$> readCell svc lease (tile 1 1 1)) `shouldReturn` False
+      settleChecks svc
+
+  it "funds the staging bank from an outside account: refused with nothing started when it cannot, returned after the drain" $ do
+    let config = smallestStore defaultConfig
+        bytes = stagingBankBytes config
+    held <- newTVarIO (0 ∷ Word64)
+    let accountOf limit =
+          StagingAccount
+            { stagingAccountReserve = \wanted → readTVar held >>= \now → if wanted > limit - now then pure False else True <$ writeTVar held (now + wanted)
+            , stagingAccountRelease = \returned → modifyTVar' held (subtract returned)
+            }
+    withStoragePort $ \port → withWorkerGroup $ \group → do
+      let ports = Ports alwaysAdmitting (standaloneSupervisor group) quiet noProbe port
+      withTerrainServiceIn (accountOf (bytes - 1)) config ports (\_ → pure ()) `shouldThrow` \(StagingAccountRefused asked) → asked == bytes
+      readTVarIO held `shouldReturn` 0
+      inside <- withTerrainServiceIn (accountOf bytes) config ports $ \svc → do
+        (_, lease) <- openMain svc "main"
+        _ <- removeCell' svc lease (tile 1 1 1)
+        readTVarIO held
+      inside `shouldBe` bytes
+      readTVarIO held `shouldReturn` 0
 
   it "re-prepares an edit that another edit overtook and commits both in admission order" $
     withService defaultConfig $ \svc → do
