@@ -9,7 +9,8 @@
 -- passing through it, whether that failure was raised by 'throwFailure' or by a
 -- native or library call. 'failureEvidence' reads both back.
 -- 'throwFailureSTM' raises the same failure, with the same evidence, inside a
--- transaction.
+-- transaction, and 'catchSTMRestarting' catches one there without the nested
+-- rerun a bare 'catchSTM' can fall into.
 --
 -- Nothing here wraps the exception. Its type, its value, and every annotation
 -- already attached to it are kept, so a caller's @catch@, @try@, or
@@ -64,6 +65,9 @@ module Hetoimasia.Foundation.Failure
   , throwFailure
   , throwFailureSTM
 
+    -- * Catching inside a transaction
+  , catchSTMRestarting
+
     -- * Operation boundaries
   , withOperationContext
 
@@ -99,7 +103,7 @@ import Control.Exception.Context
   , getExceptionAnnotations
   )
 import Control.Monad.IO.Class (MonadIO (liftIO))
-import Control.Monad.STM (STM, throwSTM)
+import Control.Monad.STM (STM, catchSTM, orElse, retry, throwSTM)
 import Data.List (sortOn)
 import Data.Maybe (isJust)
 import Data.Text (Text)
@@ -201,6 +205,33 @@ throwFailureSTM component operationName identifiers cause = do
     if isAsynchronous raised
       then ExceptionWithContext context raised
       else ExceptionWithContext (attach (`OriginEntry` origin) context) raised
+
+-- | 'catchSTM', except that a guarded action whose part of the transaction no
+-- longer holds is never run again against it: the whole transaction restarts.
+--
+-- 'catchSTM' runs its action as a nested transaction. When that nested commit
+-- finds a value it read changed by another thread, GHC runs the action again,
+-- and only the action, inside the same enclosing transaction, which nothing
+-- revalidates. A value the enclosing transaction had already read stays stale
+-- in every rerun, so every rerun fails again. Only the scheduler ends that
+-- loop, and it looks only at a heap check: an action that allocates nothing on
+-- that path reruns forever, and holds up every garbage-collection sync, so
+-- every other thread stops too. 'orElse' does not behave this way: a failed
+-- commit of its nested branch restarts the whole transaction. This runs the
+-- action as ``action `orElse` retry`` under 'catchSTM', so a failed nested
+-- commit always reaches that restart.
+--
+-- Nothing else changes, exactly as by 'catchSTM': the action's result and
+-- writes commit with the transaction; an exception the handler matches is given
+-- to it with the action's writes discarded and earlier writes kept; an
+-- exception it does not match, or one the handler raises, propagates; and a
+-- 'retry' in the action never runs the handler, so an enclosing 'orElse' may
+-- take its alternative, or the transaction waits. Use this wherever a
+-- 'catchSTM' guards an action that commits (does not always end in 'throwSTM'),
+-- has no 'orElse' of its own around it, and may run without allocating, such as
+-- a release that finds nothing to release.
+catchSTMRestarting ∷ Exception e ⇒ STM a → (e → STM a) → STM a
+catchSTMRestarting action = catchSTM (action `orElse` retry)
 
 -- | Run an operation, adding its context to a synchronous failure that passes
 -- through.
