@@ -579,33 +579,51 @@ stages = describe "stages and the owner" $ do
     toInteger charged `shouldSatisfy` (>= sum kept)
 
   it "publishes a coherent partial plan when another consumer leaves the account room for a plan over only some of its regions, sleeps there, and admits more once the room returns" $ do
-    let config = testConfig {tvAccountGranule = 64, tvCopyRegions = 1}
+    -- The squeeze is made at one exact point, as the preparation asks for its second copy batch (the transfer seam), so
+    -- the terrain service's own staging, settled before, does not decide what the view can admit.
+    armed ← newTVarIO False
+    requests ← newTVarIO (0 ∷ Int)
+    squeezeVar ← newTVarIO (pure ())
+    takenVar ← newTVarIO 0
+    let hook _ name = when (name == "requested") $ do
+          fire ← atomically $ do
+            on ← readTVar armed
+            if not on
+              then pure False
+              else do
+                modifyTVar' requests (+ 1)
+                (== 2) <$> readTVar requests
+          when fire (join (readTVarIO squeezeVar))
+        config = testConfig {tvAccountGranule = 64, tvCopyRegions = 1, tvOnTransfer = hook}
     withViewsConfig config $ \v → do
-      atomically (writeTVar (vMetrics v) (TargetMetrics (PixelExtent 640 480) (PixelExtent 640 480) 1 1))
       view ← attached v 1
       first' ← awaitPublished v 1
       quiescent v
+      demandResident v view
+      bounded (atomically (Runtime.inspectModelSTM (_vTerrain v) >>= check . null . modelJobs))
       adoptNow (vModel v) 1 `shouldReturn` Adopted first'
+      _ ← releasePass (vModel v)
       full ← atomically (readView view)
       readingUnadmitted full `shouldBe` 0
-      -- another consumer takes the account but for room for a preparation over about half the demand: the view is charged
-      -- a copy's footprint (not the terrain service's reservation for it), each region's inputs and the first quantum
-      let half = max 2 (readingAdmitted full `div` 2)
-          halfCost = preparationCost config half - Runtime.regionSnapshotReservation half + 512 * fromIntegral half
-      readingAdmitted full `shouldSatisfy` (>= 6)
-      taken ← atomically $ do
+      readingAdmitted full `shouldSatisfy` (>= 4)
+      -- another consumer takes the account but for room for a preparation over two regions: the view is charged a copy's
+      -- footprint (not the terrain service's reservation for it), each region's inputs and the first quantum
+      let twoRegions = preparationCost config 2 - Runtime.regionSnapshotReservation 2 + 4096
+      atomically $ writeTVar squeezeVar $ atomically $ do
         held ← accountCharged (_vAccount v)
-        let room = accountLimit (_vAccount v) - held - halfCost
+        let room = accountLimit (_vAccount v) - held - twoRegions
         ok ← accountReserve (_vAccount v) room
-        if ok then pure room else retry
+        when ok (writeTVar takenVar room)
+      atomically (writeTVar armed True)
       atomically (updateCamera view (CameraIntent [Camera.Pan 16 0])) `shouldReturn` Right ()
       partial ← bounded . atomically $ readView view >>= \r → if readingPublished r > readingPublished full && readingStagedBytes r == 0 && readingWaiting r then pure r else retry
+      readTVarIO takenVar >>= (`shouldSatisfy` (> 0))
       -- a coherent partial plan: published, some of its visible demand unadmitted and pending, picks there loading
       readingUnadmitted partial `shouldSatisfy` (> 0)
       readingAdmitted partial `shouldSatisfy` (< readingAdmitted full)
       readingPendingRegions partial `shouldSatisfy` (> 0)
-      picks ← atomically (mapM (pickView view) [(x + 0.5, y + 0.5) | y ← [0, 32 .. 479], x ← [0, 32 .. 639]])
-      [() | PickLoading ← picks] `shouldSatisfy` (not . null)
+      picks ← atomically (picksOver view)
+      [() | Left "loading" ← picks] `shouldSatisfy` (not . null)
       -- it sleeps: once what it retired is released, its unchanged world takes none of its steps
       _ ← adoptNow (vModel v) 1
       _ ← releasePass (vModel v)
@@ -614,7 +632,7 @@ stages = describe "stages and the owner" $ do
       _ ← releasePass (vModel v)
       readingSteps <$> resting `shouldReturn` steps
       -- the room returns: it wakes on the account and admits more
-      atomically (accountRelease (_vAccount v) taken)
+      readTVarIO takenVar >>= atomically . accountRelease (_vAccount v)
       more ← bounded . atomically $ readView view >>= \r → if readingAdmitted r > readingAdmitted partial && readingStagedBytes r == 0 then pure r else retry
       readingUnadmitted more `shouldSatisfy` (< readingUnadmitted partial)
       closeView view
