@@ -28,7 +28,7 @@ import qualified Data.ByteString as ByteString
 import qualified Data.ByteString.Char8 as BC
 import Data.IORef (newIORef, readIORef, writeIORef)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (isJust)
+import Data.Maybe (isJust, listToMaybe)
 import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as Text
@@ -85,12 +85,12 @@ import Hetoimasia.LuaEngine.Profile
   , validateProfile
   )
 import Hetoimasia.Render.TwoD.Metrics (PixelExtent (..), TargetMetrics (..))
-import Hetoimasia.Render.TwoD.Oracle (OracleInput (..), Probe (..), TargetSpec (..), Verdict (..), judgeReadback, newOracleWith)
+import Hetoimasia.Render.TwoD.Oracle (OracleInput (..), Probe (..), TargetSpec (..), Verdict (..), judgeReadback, newOracleWith, probeSources)
 import Hetoimasia.Render.TwoD.Oracle.Colour (ColourFormat (R8G8B8A8Srgb))
 import Hetoimasia.Render.TwoD.Chunk (ChunkRef)
 import Hetoimasia.Render.TwoD.Snapshot (Camera (..), ClearColour (..), Pass (..), Snapshot (..), Target (OffscreenTarget), View (..))
 import Hetoimasia.Render.TwoD.Target.Backend (targetRef)
-import Hetoimasia.Render.TwoD.Validation (validateSnapshotWith)
+import Hetoimasia.Render.TwoD.Validation (Location (..), validateSnapshotWith)
 import Hetoimasia.Render.TwoD.Vulkan.Chunks (RetainedView (..), retainedChunks, retainedViewSTM)
 import Hetoimasia.Render.TwoD.Vulkan.Textures (registeredMarks)
 import Hetoimasia.Terrain.Coordinate (RegionCoord (..), axisFromInteger, tileCoord)
@@ -99,7 +99,7 @@ import System.Timeout (timeout)
 import Hetoimasia.Terrain.Render2D.AtlasFixtures (AtlasStyle, findSampleDirectory, loadAtlasStyle)
 import qualified Hetoimasia.Terrain.Render2D.AtlasFixtures as Fixtures
 import qualified Hetoimasia.Terrain.Render2D.Camera as Camera
-import Hetoimasia.Terrain.Render2D.Cells (CellConfig (..), PartKind (..), TargetRect (..), cellPlanQuads, quadCell, quadPart, quadTarget)
+import Hetoimasia.Terrain.Render2D.Cells (CellConfig (..), CellKey (..), PartKind (..), TargetRect (..), cellPlanQuads, quadCell, quadKey, quadPart, quadTarget)
 import Hetoimasia.Terrain.Render2D.Material (terrainModel)
 import Hetoimasia.Terrain.Render2D.Presentation (defaultLightInput)
 import qualified Hetoimasia.Terrain.Runtime as Runtime
@@ -437,8 +437,9 @@ data RenderedWorld = RenderedWorld
   , rwWorld ∷ !SceneWorld
   , rwClear ∷ ![(Int, Int)]
     -- ^ The pixels the oracle determined show only the clear colour.
-  , rwDrawn ∷ ![(Int, Int)]
-    -- ^ The pixels the oracle judged that show terrain.
+  , rwSources ∷ !(Map.Map (Int, Int) [Location])
+    -- ^ At each pixel the oracle decides, the instances that draw there in drawing order, the frontmost last
+    -- ('probeSources'): the oracle's own pipeline, apart from its colour judgement and from the picker.
   }
 
 -- | Record the adopted world into a fresh colour target and depth image through the host's recording boundary, wait for
@@ -580,7 +581,8 @@ renderSubmitWith rig holding name = do
      length passedPixels `shouldSatisfy` (> (width * height) `div` 4)
      -- the world is drawn: some judged pixel shows terrain, not the clear colour
      length clear `shouldSatisfy` (< length passedPixels)
-     pure (RenderedWorld revision world clear [p | p ← passedPixels, p `notElem` clear])
+     let sources = Map.fromList [((x, y), drawn) | y ← [0 .. height - 1], x ← [0 .. width - 1], Right drawn ← [probeSources oracle (Probe 0 x y)]]
+     pure (RenderedWorld revision world clear sources)
 
 inOrder ∷ [IO (Either Refusal ())] → IO (Either Refusal ())
 inOrder = \case
@@ -597,39 +599,55 @@ act host action =
         ActionReturned (Left refusal) → pure (Left (Text.pack (show refusal)))
         _ → pure (Left "the action raised or was refused")
 
--- The picks judged against the adopted plan (the oracle names colours, not the quad that wins a pixel). At every
--- judged terrain pixel whose containing quads in the plan are all known parts, the pick is a hit, and its cell is the
--- cell of one of those quads: the frontmost, unless that quad's texel is a cutout there and a rearward one shows. Answers
--- how many pixels were judged (at least one) and how many named the frontmost quad's cell.
+-- The picks judged exactly against the oracle. At every pixel the oracle decides, it names the instances that draw
+-- there, the frontmost last ('probeSources', its own pipeline: depth, each cutout's rule, holes included). That
+-- instance is a chunk's, at a position in the world's layer and an index in the chunk; through the adopted plan's quads
+-- grouped by render region (the adapter's chunks, in the layer's order) it is one quad, with its part and cell. The pick
+-- must be exactly that: a hit of that cell and part for a known part, and no hit for fog; and a pixel the oracle shows
+-- as only the clear colour, no hit. A control is in the example itself: a picker that answered the rearmost quad
+-- containing the pixel would fail at the pixels counted as rear-differing (at least one). Answers how many pixels were
+-- judged and how many of them a rear-picking picker would have got wrong.
 pickAgreement ∷ TerrainView SceneTargetKey → RenderedWorld → IO (Int, Int)
 pickAgreement view rendered = do
   plan ← atomically (adoptedPlan view) >>= maybe (assertFailure "no adopted plan") pure
-  -- nearest first, the order the pick examines them in
-  let nearestFirst = reverse (cellPlanQuads plan)
+  let regionQuads = Map.elems (Map.fromListWith (flip (<>)) [(regionOf (quadKey quad), [quad]) | quad ← cellPlanQuads plan])
+      regionOf (CellKey _ _ vx vy _) = (vx `div` 16, vy `div` 16)
+      quadAt position index = case drop position regionQuads of
+        quads : _ → listToMaybe (drop index quads)
+        [] → Nothing
+      winner p = case Map.lookup p (rwSources rendered) of
+        Just drawn@(_ : _) → case last drawn of
+          AtChunkInstance _ _ _ position index → Right (quadAt position index)
+          other → Left ("a non-chunk instance draws there: " <> show other)
+        _ → Right Nothing
       contains (x, y) quad =
         let TargetRect l t r b = quadTarget quad
             px = fromIntegral x + 1 / 2 ∷ Double
             py = fromIntegral y + 1 / 2 ∷ Double
          in realToFrac l <= px && px < realToFrac r && realToFrac t <= py && py < realToFrac b
-      judged =
-        [ (p, cells)
-        | p ← rwDrawn rendered
-        , let containing = filter (contains p) nearestFirst
-        , not (null containing)
-        , all ((/= PartFog) . quadPart) containing
-        , Just cells ← [mapM quadCell containing]
+  judged ← forM (Map.keys (rwSources rendered)) $ \p@(x, y) → do
+    answer ← atomically (pickView view (fromIntegral x + 0.5, fromIntegral y + 0.5))
+    expected ← either assertFailure pure (winner p)
+    let rear = listToMaybe (filter (contains p) (cellPlanQuads plan))
+    pure (p, expected, answer, rear)
+  let wrong =
+        [ (p, fmap (\q → (quadCell q, quadPart q)) expected, answer)
+        | (p, expected, answer, _) ← judged
+        , not (agrees expected answer)
         ]
-  answers ← forM judged $ \(p@(x, y), cells) → (,,) p cells <$> atomically (pickView view (fromIntegral x + 0.5, fromIntegral y + 0.5))
-  [(p, take 3 cells, answer) | (p, cells, answer) ← answers, not (hitAmong cells answer)] `shouldBe` []
+      agrees expected answer = case (expected, answer) of
+        (Nothing, PickNoHit) → True
+        (Just quad, PickNoHit) → quadPart quad == PartFog
+        (Just quad, PickHit ref) → quadPart quad /= PartFog && Just (pickRefCell ref) == quadCell quad && pickRefPart ref == quadPart quad
+        _ → False
+      rearWrong = length [() | (_, Just quad, _, Just rear) ← judged, quadCell rear /= quadCell quad || quadPart rear /= quadPart quad]
+  take 4 wrong `shouldBe` []
   length judged `shouldSatisfy` (> 0)
-  pure (length judged, length [() | (_, front : _, PickHit ref) ← answers, pickRefCell ref == front])
-  where
-    hitAmong cells = \case
-      PickHit ref → pickRefCell ref `elem` cells
-      _ → False
+  rearWrong `shouldSatisfy` (> 0)
+  pure (length judged, rearWrong)
 
 notePicks ∷ (Int, Int) → IO ()
-notePicks (judged, front) = evidenceNote ("picks judged from the adopted plan: " <> Text.pack (show judged) <> " pixels, " <> Text.pack (show front) <> " naming the frontmost quad's cell")
+notePicks (judged, rear) = evidenceNote ("picks judged exactly against the oracle's winning instance: " <> Text.pack (show judged) <> " pixels; a rear-picking picker would fail " <> Text.pack (show rear) <> " of them")
 
 -- The adopted scene's world.
 adoptedWorld ∷ Rig → IO (Natural, SceneWorld)
