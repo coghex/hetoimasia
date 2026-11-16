@@ -215,6 +215,7 @@ depthHostSpec env = describe "M1 output on the terrain-enabled host" $
       vulkanWindowDepth (envHostConfig env) `shouldBe` True
       admitScene comp vm "a"
       window ← openWindow env comp vm "a"
+      noteWindows env 1
       loadTexture comp vm "a" "a" "a.png"
       earlier ← frameLogMark <$> readTVarIO (envFrames env)
       _ ← run comp vm "a" "publish" "a" (Just "a")
