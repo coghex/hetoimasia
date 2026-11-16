@@ -4,7 +4,16 @@
 -- take, and at its next boundary when a provider's thread completed the retirement.
 module Test.LuaRuntime.Admission.Release (spec) where
 
-import Control.Exception (ExceptionWithContext (ExceptionWithContext), toException)
+import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, takeMVar)
+import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVarIO, readTVar, throwSTM)
+import Control.Exception (Exception, ExceptionWithContext (ExceptionWithContext), finally, toException)
+import Control.Monad (when)
+import Data.IORef (IORef, newIORef, readIORef, writeIORef)
+import Foreign.Marshal.Alloc (free, malloc)
+import Foreign.Ptr (Ptr)
+import Foreign.Storable (peek, poke)
+import GHC.Conc (unsafeIOToSTM)
+import Hetoimasia.Scripting.Lua.Admission (Credit (..))
 import Hetoimasia.Scripting.Lua.Instance
 import Hetoimasia.Scripting.Lua.Lease (Ownership (..))
 import Hetoimasia.Scripting.Lua.Provider
@@ -12,6 +21,7 @@ import Hetoimasia.Scripting.Lua.Runtime (LuaRuntime)
 import Hetoimasia.Scripting.Lua.Scheduled
 import Control.Exception (throwIO)
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
+import Test.Support.Owned (withOwnedThread)
 import Test.LuaRuntime.Admission.Support
 import Test.LuaRuntime.Instance.Support (awaitSettled, expectControl, sf)
 import Test.LuaRuntime.Request.Support (answerResult, awaitCancelled, awaitDiagnostic, diagnostics, failWorkWith, finishWork, onSubmit, submissions)
@@ -104,6 +114,39 @@ spec = describe "release points" $ do
         awaitNote fixture "cmd block g unblocked"
         awaitDiagnostic owner ((== 0) . rdHeld)
 
+  describe "a release made stale by another thread" $ do
+    it "restarts the whole release, never reruns one credit's release against what another thread changed" $ bounded $ do
+      fixture ← newAFix 4
+      shared ← newTVarIO (0 ∷ Int)
+      shot ← newIORef True
+      go ← newEmptyMVar
+      written ← newEmptyMVar
+      firstRuns ← malloc
+      secondRuns ← malloc
+      flip finally (free firstRuns >> free secondRuns) $ do
+        poke firstRuns 0
+        poke secondRuns 0
+        -- Both credits are given back in the one transaction of the take. The first reads the shared state, so the
+        -- transaction holds that read; the second has another thread change it, then reads it too.
+        setPolicy fixture (\held → held {polPerInstance = 1, polCredits = [readingCredit shared firstRuns, staleCredit shared shot go written secondRuns]})
+        withOwnedThread (takeMVar go >> atomically (modifyTVar' shared (+ 1)) >> putMVar written ()) $ \_ joined → do
+          withBoundary $ \_ runtime → settleAll fixture $ do
+            owner ← arrival fixture 8 runtime "stale release"
+            admitAdmitter fixture owner "i" "admitter"
+            acommand fixture owner "i" "start" "a"
+            awaitNote fixture "cmd start a started"
+            answerResult (afFake fixture) 0 1 >>= (`shouldBe` ReplySettled)
+            awaitDiagnostic owner ((== 0) . rdWorkPending)
+            acommand fixture owner "i" "take" "a"
+            awaitNote fixture "cmd take a {status=success,value={v=1}}"
+            awaitDiagnostic owner ((== 0) . rdHeld)
+          joined
+        firstCount ← peek firstRuns
+        secondCount ← peek secondRuns
+        -- The write made the transaction stale once, so it ran again; each credit's release ran once in each run.
+        firstCount `shouldSatisfy` (>= 2)
+        secondCount `shouldBe` firstCount
+
   describe "losing a Lua reference" $ do
     it "does not give a place back: the handle is the instance's until its result is taken" $ bounded $ do
       fixture ← newAFix 4
@@ -194,3 +237,54 @@ spec = describe "release points" $ do
       submissions (afFake fixture) >>= (`shouldBe` 0)
   where
     awaitSettled' fixture name = awaitSettled (afBase fixture) name >>= \settlement → settlement `seq` pure ()
+
+-- | A release that went on being run again inside one transaction, which the stale credit raises at
+-- 'rerunCap' rather than run without end.
+data ReranAgainstStale = ReranAgainstStale
+  deriving stock (Show)
+
+instance Exception ReranAgainstStale
+
+-- | How many runs of one release inside one transaction count as running again without end.
+rerunCap ∷ Int
+rerunCap = 10000
+
+-- | Count a run, without allocating: a release counted this way still allocates nothing.
+countRun ∷ Ptr Int → STM Int
+countRun runs = unsafeIOToSTM $ do
+  n ← peek runs
+  poke runs (n + 1)
+  pure (n + 1)
+
+-- | A credit whose release reads the shared state and counts its runs.
+readingCredit ∷ TVar Int → Ptr Int → Credit
+readingCredit shared runs =
+  Credit
+    { creditName = "reading"
+    , creditReserve = pure True
+    , creditRelease = \_ → readTVar shared >>= \seen → seen `seq` () <$ countRun runs
+    , creditTransfers = False
+    }
+
+-- | A credit whose release, the first time it runs, asks another thread to change the shared state that an
+-- earlier release in the same transaction read, then reads it and counts its runs. Past the first run
+-- it allocates nothing, so if its run were repeated against the stale transaction it would never end:
+-- it raises at 'rerunCap' instead.
+staleCredit ∷ TVar Int → IORef Bool → MVar () → MVar () → Ptr Int → Credit
+staleCredit shared shot go written runs =
+  Credit
+    { creditName = "stale"
+    , creditReserve = pure True
+    , creditRelease = \_ → do
+        unsafeIOToSTM $ do
+          first ← readIORef shot
+          when first $ do
+            writeIORef shot False
+            putMVar go ()
+            takeMVar written
+        seen ← readTVar shared
+        n ← countRun runs
+        when (n >= rerunCap) (throwSTM ReranAgainstStale)
+        seen `seq` pure ()
+    , creditTransfers = False
+    }
