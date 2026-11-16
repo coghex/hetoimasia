@@ -102,7 +102,11 @@ import Hetoimasia.Terrain.Runtime.Store (StoreSpec (..), defaultStoreSpec, minAl
 import Hetoimasia.Terrain.Shape (ViewFacing (..))
 import Hetoimasia.Terrain.Source (LayerSpec (..), SourceSpec (..))
 import Numeric.Natural (Natural)
+import System.Directory (createDirectoryIfMissing)
+import System.Environment (lookupEnv)
 import System.FilePath ((</>))
+import qualified Data.Text.IO as Text
+import qualified Test.LuaEngine.Graphics.Png as Png
 import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec
 import Test.HUnit.Lang (assertFailure)
@@ -117,7 +121,7 @@ spec env = describe "terrain views" $
     within 60 . withRig env $ \rig → do
       view ← attach rig (metricsOf 128 96)
       first' ← awaitAdopted rig 1
-      a ← renderJudged rig
+      a ← renderJudged rig "required A"
       worldTag (rwWorld a) `shouldBe` WorldTag (viewIncarnation view) 1
       chunksA ← pure (worldChunks (rwWorld a))
       -- The original handles go; the view keeps drawing under its own interests.
@@ -127,7 +131,7 @@ spec env = describe "terrain views" $
       -- An edit is prepared, published and adopted as B; A's regions that B does not list retire after A's batches.
       removeAt rig (8, 8, 3)
       _ ← awaitAdopted rig (first' + 1)
-      b ← renderJudged rig
+      b ← renderJudged rig "required B"
       rwRevision b `shouldSatisfy` (> rwRevision a)
       let gone = chunksA `Set.difference` worldChunks (rwWorld b)
       within 20 . atomically' $ do
@@ -151,7 +155,7 @@ fullSpec env = describe "terrain views (full)" $ do
         n ← awaitAdopted rig 1
         atomically (updateCamera view (CameraIntent [Camera.SetFacing facing])) `shouldReturn` Right ()
         _ ← awaitAdopted rig (n + 1)
-        void (renderJudged rig)
+        void (renderJudged rig ("facing " <> Text.pack (show facing)))
         closeView view
   forM_ [0.5, 2] $ \zoom →
     it ("draws a zoom exactly: " <> show zoom) $
@@ -160,13 +164,13 @@ fullSpec env = describe "terrain views (full)" $ do
         n ← awaitAdopted rig 1
         atomically (updateCamera view (CameraIntent [Camera.SetZoom zoom])) `shouldReturn` Right ()
         _ ← awaitAdopted rig (n + 1)
-        void (renderJudged rig)
+        void (renderJudged rig ("zoom " <> Text.pack (show zoom)))
         closeView view
   it "draws a portrait target exactly, and a pick over the clear background finds nothing" $
     within 60 . withRig env $ \rig → do
       view ← attach rig (metricsOf 64 128)
       _ ← awaitAdopted rig 1
-      rendered ← renderJudged rig
+      rendered ← renderJudged rig "portrait"
       forM_ (rwClear rendered) $ \(x, y) →
         atomically (pickView view (fromIntegral x + 0.5, fromIntegral y + 0.5)) >>= (`shouldSatisfy` (/= PickLoading)) >> pure ()
       clearPicks ← forM (take 64 (rwClear rendered)) $ \(x, y) → atomically (pickView view (fromIntegral x + 0.5, fromIntegral y + 0.5))
@@ -302,8 +306,8 @@ data RenderedWorld = RenderedWorld
 
 -- | Record the adopted world into a fresh colour target and depth image through the host's recording boundary, wait for
 -- the batch's own completion, read the colour back and judge every pixel with the independent oracle.
-renderJudged ∷ Rig → IO RenderedWorld
-renderJudged rig = do
+renderJudged ∷ Rig → Text → IO RenderedWorld
+renderJudged rig name = do
   let env = rgEnv rig
       host = envHost env
       graphics = envGraphics env
@@ -371,6 +375,31 @@ renderJudged rig = do
         clearBytes = map (\c → round (c * 255) ∷ Int) [cr, cg, cb, ca]
         pixelBytes (x, y) = [fromIntegral (ByteString.index bytes ((y * width + x) * 4 + k)) | k ← [0 .. 3]]
         clear = [p | p ← passedPixels, pixelBytes p == clearBytes]
+    -- The evidence: the lossless readback and the machine-readable comparison, under the run's evidence directory.
+    let indeterminate = length [() | (_, ProbeIndeterminate _) ← verdicts]
+        byteAt x y k = fromIntegral (ByteString.index bytes ((y * width + x) * 4 + k))
+        png = Png.rgba8 width height (\x y → (byteAt x y 0, byteAt x y 1, byteAt x y 2, byteAt x y 3))
+        record =
+          Text.unlines
+            [ "{"
+            , "  \"name\": \"" <> name <> "\","
+            , "  \"revision\": " <> Text.pack (show revision) <> ","
+            , "  \"view\": " <> Text.pack (show (tagView (worldTag world))) <> ", \"plan\": " <> Text.pack (show (tagRevision (worldTag world))) <> ","
+            , "  \"framebuffer\": [" <> Text.pack (show width) <> ", " <> Text.pack (show height) <> "],"
+            , "  \"chunks\": " <> Text.pack (show (Set.size (worldChunks world))) <> ","
+            , "  \"pixels\": " <> Text.pack (show (width * height)) <> ", \"passed\": " <> Text.pack (show (length passedPixels)) <> ", \"failed\": " <> Text.pack (show (length failed)) <> ", \"indeterminate\": " <> Text.pack (show indeterminate) <> ","
+            , "  \"clear_pixels\": " <> Text.pack (show (length clear)) <> ","
+            , "  \"judge\": \"render-2d oracle with terrainModel and the decoded parents\","
+            , "  \"completion\": \"the batch's own ticket reported complete before the readback was read\""
+            , "}"
+            ]
+    directory ← lookupEnv "HETOIMASIA_VALIDATION_EVIDENCE"
+    forM_ directory $ \place → do
+      let folder = place </> "terrain-views"
+          stem = Text.unpack (Text.map (\c → if c `elem` (['a' .. 'z'] <> ['0' .. '9']) then c else '-') (Text.toLower name))
+      createDirectoryIfMissing True folder
+      ByteString.writeFile (folder </> stem <> ".png") png
+      Text.writeFile (folder </> stem <> ".json") record
     take 4 failed `shouldBe` []
     -- enough of the image is decided for the judgement to speak: a minified view leaves more texel boundaries to the
     -- oracle's refusal, so the floor is a quarter of the pixels, not half
