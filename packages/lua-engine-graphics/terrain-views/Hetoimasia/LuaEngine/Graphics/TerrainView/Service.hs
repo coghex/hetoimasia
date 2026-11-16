@@ -305,7 +305,7 @@ withTerrainViews config ports body = do
   done ← newEmptyMVar
   mask_ $ do
     _ ← forkIOWithUnmask $ \unmask → (unmask (worker service) `catch` \(failure ∷ SomeException) → recordFailure service ("the worker failed: " <> Text.pack (displayException failure))) `finally` putMVar done ()
-    (body service `finally` (atomically (writeTVar (svOpen service) False) >> readMVar done))
+    (body service `finally` (atomically (writeTVar (svOpen service) False) >> tvStopping config >> readMVar done))
 
 recordFailure ∷ (Ord k, Show k) ⇒ TerrainViews k → Text → IO ()
 recordFailure service why = atomically (modifyTVar' (svFailures service) (take 64 . (why :)))

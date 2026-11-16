@@ -77,6 +77,9 @@ data TerrainViewsConfig = TerrainViewsConfig
     -- ^ What a terrain frame clears to before its quads.
   , tvCopyRegions ∷ !Int
     -- ^ Regions one regional copy asks for: at most the terrain service's per-hold region bound.
+  , tvStopping ∷ IO ()
+    -- ^ Run by the scope's end once the service takes no new work and before it waits for the worker: a test seam (to
+    -- let an owner action the test holds go at exactly that point). Production runs nothing.
   , tvAccountGranule ∷ !Word64
     -- ^ The unit a view's CPU charge takes from the session's account (1 MiB): a need is covered by whole granules,
     -- reserved as it grows and returned only when a whole granule is free, so a need that moves within one leaves the
@@ -101,6 +104,7 @@ defaultTerrainViewsConfig =
     , tvClear = ClearColour 0 0 0 1
     , tvCopyRegions = 256
     , tvAccountGranule = 1024 * 1024
+    , tvStopping = pure ()
     }
 
 -- | The narrow capability of one target incarnation: its key in the host's one key space, whether it is still the

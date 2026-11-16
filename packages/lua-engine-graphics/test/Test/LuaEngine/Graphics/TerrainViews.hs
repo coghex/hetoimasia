@@ -537,6 +537,23 @@ lifecycle = describe "close orders and limits" $ do
       atomically besideTerrain `shouldReturn` before'
       closeView view
 
+  it "settles an attachment still queued at the service's end as stopped, releasing what it retained, while the view being built is discarded" $ do
+    gateRef ← newTVarIO Nothing
+    let releaseGate = readTVarIO gateRef >>= mapM_ (\gate → atomically (writeTVar gate True))
+    queued ← newTVarIO Nothing
+    withViewsConfig testConfig {tvStopping = releaseGate} $ \v → do
+      atomically (writeTVar gateRef (Just (foGate (vOwner v))))
+      atomically (writeTVar (foGate (vOwner v)) False)
+      first' ← inInstance (vComp v) (vVm v) "i" (attachView (vViews v) (requestFor v (target v 1))) >>= either (fail . show) pure
+      _ ← bounded (awaitAttach first')
+      bounded (atomically (readTVar (foWaiting (vOwner v)) >>= check . (> 0)))
+      modelWindow (vModel v) 2
+      second ← inInstance (vComp v) (vVm v) "i" (attachView (vViews v) (requestFor v (target v 2))) >>= either (fail . show) pure
+      atomically (writeTVar queued (Just second))
+    -- the scope has ended: the queued attachment settled once, as stopped
+    Just second ← readTVarIO queued
+    atomically (attachSettled second) `shouldReturn` Just (SettledRefused AttachStopped)
+
   it "refuses an attachment beyond the service's views, before taking anything" $
     withViewsConfig testConfig {tvMaxViews = 1} $ \v → do
       _ ← attached v 1
