@@ -100,7 +100,7 @@ library internal
         text >=2.1 && <2.2,
         hetoimasia-asset ==0.1.0.0,
         hetoimasia-foundation ==0.1.0.0,
-        hetoimasia-lua-engine:texture
+        hetoimasia-lua-engine:texture ==0.1.0.0
 
 -- The terrain-view adapter (TRA-9): a terrain view's attachment, preparation, retained regions, publication, picking
 -- and close over the graphics owner this package composes and the terrain service it is lent. A public sub-library of
