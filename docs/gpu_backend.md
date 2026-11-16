@@ -689,7 +689,10 @@ renderer can draw into the window with a depth test.
 **The setting.** `VulkanHostConfig`'s `vulkanWindowDepth` is `False` by
 default, and nothing then changes: no generation has a depth image, no
 `FrameRequest` names one (`requestDepth` is `Nothing`) and the device is asked
-nothing about depth. When it is `True`, the controller asks the generations
+nothing about depth. A terrain-enabled composition of the Lua-first engine sets
+it host-wide (`configureWorldDepth`, TRA-9): every window on that host gets the
+image its terrain views draw with, and its M1 scenes, which name no
+depth-enabled layer, draw as before. When it is `True`, the controller asks the generations
 for a depth image with every generation (`requireWindowDepth`), and **no
 generation is constructed** until the recording supplies what makes the images
 (`supplyRecordingWindowDepth`). The owner's step makes the recording before
