@@ -100,6 +100,7 @@ module Hetoimasia.Render.TwoD.Oracle
   , Failure (..)
   , ImageFault (..)
   , expect
+  , probeSources
 
     -- * Verdicts
   , Verdict (..)
@@ -117,7 +118,7 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
-import Data.Maybe (listToMaybe, mapMaybe)
+import Data.Maybe (listToMaybe)
 import Data.Word (Word32, Word8)
 import Hetoimasia.Render.TwoD.Chunk (Chunk, ChunkRef, chunkCutoutPositions, chunkInstanceAt, chunkRecords)
 import Hetoimasia.Render.TwoD.Material (MaterialData (..), MaterialRecord (..), MaterialRef, defaultMaterial)
@@ -574,10 +575,28 @@ combine spec pass fragments =
             Left channel → Indeterminate (RoundingNotBounded channel)
             Right (value, tolerance) → Expected value tolerance
 
+-- | TEST INFRASTRUCTURE, apart from the colour judgement: the instances that draw at a probe's pixel, by location, in
+-- drawing order, after the depth test and each cutout's rule, the frontmost last. The same fragments 'expect' blends,
+-- so an indeterminate or unevaluable probe answers its reason and names no instance. 'expect' does not use it.
+probeSources ∷ Oracle → Probe → Either Expectation [Location]
+probeSources oracle probe@(Probe passIndex x y) =
+  case probeTarget oracle probe >>= \spec → fmap ((,) spec) (passAt oracle passIndex) of
+    Left failure → Left (Unevaluable failure)
+    Right (spec, pass) →
+      let tagged = concatMap (viewFragmentsTagged oracle spec x y) (opViews pass)
+       in case ([failure | (_, Bad failure) ← tagged], [why | (_, Unsure why) ← tagged]) of
+            (failure : _, _) → Left (Unevaluable failure)
+            ([], why : _) → Left (Indeterminate why)
+            ([], []) → Right [location | (Just location, Draws _) ← tagged]
+
 viewFragments ∷ Oracle → TargetSpec → Int → Int → OracleView → [Fragment]
-viewFragments oracle spec x y view
+viewFragments oracle spec x y view = map snd (viewFragmentsTagged oracle spec x y view)
+
+-- | A view's fragments at a pixel, each with the instance that gave it ('Nothing' for the view's own edge).
+viewFragmentsTagged ∷ Oracle → TargetSpec → Int → Int → OracleView → [(Maybe Location, Fragment)]
+viewFragmentsTagged oracle spec x y view
   | viewportIsEmpty viewport = []
-  | near = Unsure (NearViewportEdge (ovLocation view)) : body
+  | near = (Nothing, Unsure (NearViewportEdge (ovLocation view))) : body
   | contains = body
   | otherwise = []
   where
@@ -589,7 +608,7 @@ viewFragments oracle spec x y view
     body = case ovMapping view of
       -- A mapping is needed by an instance that has area: a singular quad is
       -- known to cover nothing from its own transform.
-      Nothing → [Bad (MappingNotRepresentable (ovLocation view)) | any needsMapping (concatMap olInstances (ovLayers view))]
+      Nothing → [(Nothing, Bad (MappingNotRepresentable (ovLocation view))) | any needsMapping (concatMap olInstances (ovLayers view))]
       Just mapping →
         concatMap (layerFragments oracle spec x y view mapping) (ovLayers view)
 
@@ -599,15 +618,19 @@ viewFragments oracle spec x y view
 -- not asked), then runs its cutouts, which are tested less-or-equal and written,
 -- and its ordered instances, which are tested and not written; the plan's
 -- order puts every cutout first.
-layerFragments ∷ Oracle → TargetSpec → Int → Int → OracleView → ViewMapping → OracleLayer → [Fragment]
+layerFragments ∷ Oracle → TargetSpec → Int → Int → OracleView → ViewMapping → OracleLayer → [(Maybe Location, Fragment)]
 layerFragments oracle spec x y view mapping layer
   | olDepth layer =
       depthTested
-        [ (path, nearness (instanceDepthKey instanceValue), fragment)
-        | drawn@(Drawn _ instanceValue path _ _) ← olInstances layer
+        [ (path, nearness (instanceDepthKey instanceValue), (Just location, fragment))
+        | drawn@(Drawn location instanceValue path _ _) ← olInstances layer
         , Just fragment ← [instanceFragment oracle spec x y view mapping (olSpace layer) drawn]
         ]
-  | otherwise = mapMaybe (instanceFragment oracle spec x y view mapping (olSpace layer)) (olInstances layer)
+  | otherwise =
+      [ (Just location, fragment)
+      | drawn@(Drawn location _ _ _ _) ← olInstances layer
+      , Just fragment ← [instanceFragment oracle spec x y view mapping (olSpace layer) drawn]
+      ]
 
 -- | A depth key's depth, @(2²⁴ − 1 − k) / 2²⁴@ (design D-23): exact in a 32-bit
 -- float, and a larger key is nearer.
@@ -618,16 +641,16 @@ nearness key = (16777215 - toRational key) / 16777216
 -- 1.0 its clear leaves: each is compared less-or-equal against the depth held,
 -- and a cutout fragment that passes writes its own. A discarded fragment writes
 -- nothing, and one that is indeterminate or refused is kept for its reason.
-depthTested ∷ [(DrawPath, Rational, Fragment)] → [Fragment]
+depthTested ∷ [(DrawPath, Rational, (tag, Fragment))] → [(tag, Fragment)]
 depthTested = go 1
   where
     go _ [] = []
-    go held ((path, depth, fragment) : rest) = case fragment of
+    go held ((path, depth, tagged@(_, fragment)) : rest) = case fragment of
       Draws _
-        | depth <= held → fragment : go (if path == Cutout then depth else held) rest
+        | depth <= held → tagged : go (if path == Cutout then depth else held) rest
         | otherwise → go held rest
       Discards → go held rest
-      _ → fragment : go held rest
+      _ → tagged : go held rest
 
 -- | Whether an instance has area, so that drawing it needs the view's mapping.
 needsMapping ∷ Drawn → Bool
