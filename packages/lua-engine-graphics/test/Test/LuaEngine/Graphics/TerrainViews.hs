@@ -45,6 +45,7 @@ import Hetoimasia.LuaEngine.Texture (RenderAccount)
 import Hetoimasia.Render.TwoD.Chunk (ChunkRef)
 import Hetoimasia.Render.TwoD.Chunk.Backend (chunkRef)
 import Hetoimasia.Render.TwoD.Metrics (PixelExtent (..), TargetMetrics (..))
+import Hetoimasia.Render.TwoD.Snapshot (Camera (..), View (..))
 import Hetoimasia.Render.TwoD.Vulkan.Chunks (ChunkStanding (..))
 import Hetoimasia.GPU.Vulkan.GLFW (TextureHandle (..))
 import Hetoimasia.Render.TwoD.Vulkan.Textures (toBackendHandle)
@@ -242,6 +243,13 @@ currentHit v view = bounded go
           awaitRevision (vModel v) 1 (now + 1)
           go
 
+-- The zoom a world's view draws with, and the zoom of the first plan (the camera's default, 1).
+zoomOf ∷ SceneWorld → Float
+zoomOf = cameraZoom . viewCamera . worldView
+
+zoomOfFirst ∷ Float
+zoomOfFirst = 1
+
 -- Wait until the arena's discovery has nothing pending, so its revisions stay where they are.
 quiescent ∷ Views → IO ()
 quiescent v = bounded . atomically $
@@ -305,6 +313,23 @@ races = describe "attachment and intent" $ do
       _ ← bounded (awaitAttach first')
       bounded (awaitAttach second) `shouldReturn` SettledCancelled
       atomically (claimOf (vClaims v) 2) `shouldReturn` Nothing
+
+  it "discards a plan whose intent was superseded while its regions were being built, and publishes the newer intent's plan instead" $
+    withViews $ \v → do
+      view ← attached v 1
+      first' ← awaitPublished v 1
+      -- Hold the next build inside the owner, change the intent meanwhile, then let the build finish.
+      -- (a zoom moves every quad, so its regions are built anew)
+      atomically (writeTVar (foGate (vOwner v)) False)
+      atomically (updateCamera view (CameraIntent [Camera.ZoomBy 2])) `shouldReturn` Right ()
+      bounded (atomically (readTVar (foWaiting (vOwner v)) >>= check . (> 0)))
+      atomically (updateCamera view (CameraIntent [Camera.ZoomBy 2])) `shouldReturn` Right ()
+      atomically (writeTVar (foGate (vOwner v)) True)
+      -- The next publication is the newer intent's: zoom 4, never the superseded zoom 2.
+      awaitRevision' v 1 (first' + 1)
+      world ← latestWorld v 1
+      zoomOf world `shouldBe` 4 * zoomOfFirst
+      closeView view
 
   it "applies camera and presentation updates all or nothing: an invalid update changes nothing and publishes nothing" $
     withViews $ \v → do

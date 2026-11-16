@@ -907,7 +907,7 @@ prepareFor service state intent metrics = do
               else do
                 setDemand service state visible prefetch
                 atomically (writeTVar (vsPending state) (length (cellPlanPending plan)))
-                Done <$> publishPlan service state metrics copies plan adapted
+                Done <$> publishPlan service state intent metrics copies plan adapted
       case step of
         More missing → grow (regions <> missing) (rounds - 1)
         Done outcome → pure outcome
@@ -1088,8 +1088,8 @@ regionGroups material adapted =
        in (instances, records)
 
 -- Build what changed, publish the whole revision, then retire what it no longer lists.
-publishPlan ∷ (Ord k, Show k) ⇒ TerrainViews k → ViewState k → TargetMetrics → CopySet → CellPlan → Adapted → IO Prepared'
-publishPlan service state metrics copies plan adapted = do
+publishPlan ∷ (Ord k, Show k) ⇒ TerrainViews k → ViewState k → Word64 → TargetMetrics → CopySet → CellPlan → Adapted → IO Prepared'
+publishPlan service state intent metrics copies plan adapted = do
   let ports = svPorts service
       material = svMaterial service
       groups = regionGroups material adapted
@@ -1146,8 +1146,19 @@ publishPlan service state metrics copies plan adapted = do
                     taking ← portTaking ports
                     claim ← claimOf (portClaims ports) (vtKey (vsTarget state))
                     usable ← vtUsable (vsTarget state)
+                    -- Every identity the plan was made from is revalidated here, with the publication: a newer intent
+                    -- (camera, presentation, jump), other metrics, or a content or knowledge revision the arena has since
+                    -- committed make this plan obsolete. It is discarded, never relabelled current; the newer state is
+                    -- prepared next.
+                    current ← readTVar (vsIntent state)
+                    nowMetrics ← vtMetrics (vsTarget state)
+                    status ← Runtime.arenaStatusSTM (portTerrain ports) (vsArena state)
                     let mine = fmap claimView claim == Just (vsId state)
-                    if closing || not open || not taking || not mine || not usable
+                        coherent =
+                          current == intent
+                            && nowMetrics == Just metrics
+                            && either (const False) (\s → Runtime.statusContentRevision s == copyContent copies && Runtime.statusKnowledgeRevision s == copyKnowledge copies) status
+                    if closing || not open || not taking || not mine || not usable || not coherent
                       then pure False
                       else do
                         accepted ← vtPublish (vsTarget state) scene
