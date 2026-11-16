@@ -116,6 +116,7 @@ import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Word (Word64)
+import Hetoimasia.Foundation.Failure (catchSTMRestarting)
 import Hetoimasia.Terrain.Cell
 import Hetoimasia.Terrain.Changes (Changes, changeColumnBytes, changeIntervalBytes, emptyChanges, runsMeetingLevels)
 import Hetoimasia.Terrain.Coordinate
@@ -972,7 +973,10 @@ terminate = terminateWith True
 
 -- | 'terminate', with a host settlement callback that fails either kept as a
 -- defect (closure paths must reach every request) or let propagate, abandoning
--- the transaction (an explicit cancellation, whose caller owns the host).
+-- the transaction (an explicit cancellation, whose caller owns the host). The
+-- kept callback is guarded by 'catchSTMRestarting': it is the host's code, which
+-- may allocate nothing, inside a transaction that has already read the
+-- service's state, and a bare 'catchSTM' could rerun it without end.
 terminateWith ∷ Bool → Service → RequestId → Settlement → STM ()
 terminateWith guarded svc rid outcome = do
   st <- readSt svc
@@ -981,7 +985,7 @@ terminateWith guarded svc rid outcome = do
     unless (isDone req) $
       if guarded
         then
-          endpointSettle (reqEndpoint req) outcome `catchSTM` \(failure ∷ SomeException) →
+          endpointSettle (reqEndpoint req) outcome `catchSTMRestarting` \(failure ∷ SomeException) →
             recordDefect svc (ProviderDefect (Text.pack ("settlement callback failed: " <> show failure)))
         else endpointSettle (reqEndpoint req) outcome
 

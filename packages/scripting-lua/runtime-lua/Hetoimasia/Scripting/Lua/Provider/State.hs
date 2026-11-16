@@ -155,7 +155,7 @@ import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Encoding
 import Data.Word (Word64)
 import GHC.Stack (HasCallStack)
-import Hetoimasia.Foundation.Failure (operation, throwFailure)
+import Hetoimasia.Foundation.Failure (catchSTMRestarting, operation, throwFailure)
 import Hetoimasia.Scripting.Lua.Instance.Types
   ( ICell (icId, icState)
   , IState (isDispatchQueued, isPhase, isRequestFailure, isStopped)
@@ -669,9 +669,11 @@ withdrawAdmission service identity = do
 
 -- | Give a credit back, once: what the provider's release raises is answered and not raised, with
 -- what the release wrote undone, so one provider's failure never keeps another's credit, a lease or a
--- place charged.
+-- place charged. The release is guarded by 'catchSTMRestarting', not a bare 'catchSTM': a release
+-- that finds nothing to give back (a terrain request already retired) allocates nothing, and run
+-- again under 'catchSTM' against a transaction another thread has made stale it would never end.
 releaseCredit ∷ Credit → CreditEnd → STM (Maybe SomeException)
-releaseCredit credit end = (Nothing <$ creditRelease credit end) `catchSTM` (pure . Just)
+releaseCredit credit end = (Nothing <$ creditRelease credit end) `catchSTMRestarting` (pure . Just)
 
 -- The opt-in admission ----------------------------------------------------------------
 
