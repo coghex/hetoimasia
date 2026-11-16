@@ -15,6 +15,7 @@ module Test.LuaEngine.Graphics.Native.Session
   , noteWindows
   , runSession
   , HostVariant (..)
+  , runSessionOnHolding
   , runSessionOn
   , usageNow
   , awaitUsage
@@ -52,7 +53,8 @@ import Hetoimasia.GPU.Vulkan.Native.Roots (RootsView (..))
 import Test.LuaEngine.Graphics.FrameLog (FrameLog, emptyFrameLog, recordEvent)
 import Test.LuaEngine.Graphics.Served (serveProfile, withProfileBeyond)
 import Hetoimasia.GPU.Vulkan.GLFW
-  ( FrameEvent (..)
+  ( CompletionHold
+  , FrameEvent (..)
   , NativeObserver (..)
   , Readiness (..)
   , ValidationFeature
@@ -167,7 +169,12 @@ runSession ∷ Bool → Maybe Backend → [ValidationFeature] → TextureGraphic
 runSession = runSessionOn TerrainDisabledHost
 
 runSessionOn ∷ HostVariant → Bool → Maybe Backend → [ValidationFeature] → TextureGraphicsConfiguration → (Env → Spec) → IO Facts
-runSessionOn variant complete backend features configuration examples = do
+runSessionOn variant = runSessionOnHolding variant Nothing
+
+-- | 'runSessionOn' on a host whose test-only completion hold is set: only the overlap witness's session (#645, owner
+-- decision S) uses one; every other session's host has none.
+runSessionOnHolding ∷ HostVariant → Maybe CompletionHold → Bool → Maybe Backend → [ValidationFeature] → TextureGraphicsConfiguration → (Env → Spec) → IO Facts
+runSessionOnHolding variant hold complete backend features configuration examples = do
   mainThread ← myThreadId
   recorded ← newIORef []
   verdictCell ← newIORef Nothing
@@ -186,6 +193,7 @@ runSessionOn variant complete backend features configuration examples = do
           , vulkanLayers = ["VK_LAYER_KHRONOS_validation"]
           , vulkanValidationFeatures = features
           , vulkanObserver = const (observer recorded)
+          , vulkanCompletionHold = hold
           }
   done ← newEmptyMVar
   let -- The profile is the session thread's, as in the shipped launcher (@Hetoimasia.Run.Serve@): it owns the texture adapter's scope

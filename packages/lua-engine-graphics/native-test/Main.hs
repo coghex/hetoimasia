@@ -40,7 +40,7 @@ import Test.Hspec.Runner (Config (..), defaultConfig, readConfig)
 import Test.LuaEngine.Graphics.Native.Consent (Consent, consentBackend, describeConsent, readConsent, refusalMessage)
 import Test.LuaEngine.Graphics.Native.Environment (checkValidationFeatures, establishEnvironment, validationFeatures)
 import Test.LuaEngine.Graphics.Native.Loader (checkLoader)
-import Test.LuaEngine.Graphics.Native.Session (Facts (..), HostVariant (..), runSession, runSessionOn)
+import Test.LuaEngine.Graphics.Native.Session (Facts (..), HostVariant (..), runSession, runSessionOn, runSessionOnHolding)
 import qualified Test.LuaEngine.Graphics.Native.Spec as Native
 import qualified Test.LuaEngine.Graphics.Native.Facade as Facade
 import qualified Test.LuaEngine.Graphics.Native.DataTextures as DataTextures
@@ -88,10 +88,18 @@ main = do
     if not depthSelected
       then pure Nothing
       else Just <$> runSessionOn TerrainEnabledHost (arguments == [completeFlag]) (consentBackend consent) validationFeatures configuration (\env → Scenes.depthHostSpec env >> Pixels.depthHostPixels env)
+  -- The overlap witness runs on its own host, whose test-only completion hold is set; no other example's host has one.
+  overlapFacts ←
+    if not terrainFull
+      then pure Nothing
+      else do
+        (holding, hold) ← TerrainViews.newHolding
+        Just <$> runSessionOnHolding TerrainDisabledHost (Just hold) True (consentBackend consent) validationFeatures configuration (TerrainViews.overlapSpec holding)
   finished ← getCurrentTime
   let problems =
         (if probing then probeChecks expectedFailure facts else checks facts)
           <> maybe [] (map ("the terrain-enabled host: " <>) . checks) depthFacts
+          <> maybe [] (map ("the overlap witness's host: " <>) . checks) overlapFacts
       seconds = realToFrac (diffUTCTime finished started) ∷ Double
   record ← evidenceRecord consent loader configuration facts problems seconds
   Text.putStrLn record

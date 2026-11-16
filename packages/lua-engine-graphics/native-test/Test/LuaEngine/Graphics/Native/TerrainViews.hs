@@ -18,11 +18,12 @@
 -- 'spec' is the bounded required witness, part of the complete profile and of @--match 'terrain views'@. 'fullSpec' is
 -- the broader matrix that @--terrain-views-full@ runs alone: every facing, both zoom endpoints the band allows and a
 -- portrait resize, each judged the same way.
-module Test.LuaEngine.Graphics.Native.TerrainViews (spec, fullSpec) where
+module Test.LuaEngine.Graphics.Native.TerrainViews (spec, fullSpec, overlapSpec, Holding, newHolding) where
 
 import Control.Concurrent.STM
 import Control.Exception (finally, onException)
-import Control.Monad (forM, forM_, unless, void, when)
+import Control.Monad (forM, forM_, unless, void)
+import Data.Foldable (for_)
 import qualified Data.ByteString as ByteString
 import qualified Data.ByteString.Char8 as BC
 import Data.IORef (newIORef, readIORef, writeIORef)
@@ -65,6 +66,9 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , unregisterVulkanSceneTarget
   )
 import Hetoimasia.LuaEngine.Graphics.Scene
+import Hetoimasia.GPU.Model.Identity (BatchId)
+import Hetoimasia.GPU.Vulkan.Native.Frames (CompletionHold (..))
+import Hetoimasia.GPU.Vulkan.Native.Recording (ticketBatch)
 import Hetoimasia.LuaEngine.Graphics.TerrainView
 import Hetoimasia.LuaEngine.Graphics.Texture (TextureGraphics (..), textureHandleOf)
 import Hetoimasia.LuaEngine.Graphics.Texture.Host (hostBuilders)
@@ -222,21 +226,41 @@ fullSpec env = describe "terrain views (full)" $ do
       rendered ← renderJudged rig "mixed"
       pickAgreement view rendered >>= notePicks
       closeView view
-  it "keeps a superseded revision's regions while its batch is in flight, and draws it whole after a newer one is adopted" $
-    within 60 . withRig env $ \rig → do
+
+-- | The asserted overlap witness (owner decision S, #645 comment 6924532805), on a host whose test-only completion hold
+-- is set: A's batch is held from its recording, B is adopted, A's own chunks stay held by the production ledger and the
+-- terrain GPU bank while a step has observed A's batch pending since B's adoption; the hold lets go, A's batch
+-- completes on its fence, and A's own chunks retire. Both images are judged. Every hold is let go on every exit.
+overlapSpec ∷ Holding → Env → Spec
+overlapSpec holding env = describe "terrain views (full)" $
+  it "keeps a superseded revision's own chunks held while its batch is held in GPU use after a newer one is adopted, and retires them once the batch completes" $
+    (`finally` atomically (writeTVar (holdingSet holding) Set.empty)) . within 60 . withRig env $ \rig → do
       view ← attach rig (metricsOf 128 96)
       n ← awaitAdopted rig 1
-      inFlight ← renderSubmit rig "a revision in flight"
-      chunksA ← worldChunks . snd <$> (adoptedWorld rig)
-      -- a newer revision is made and adopted while the first one's batch may still be running
+      chunksA ← worldChunks . snd <$> adoptedWorld rig
+      heldA ← renderSubmitWith rig (Just holding) "A, held in GPU use"
+      -- B: an edit's rebuild, adopted on the target
       removeAt rig (8, 8, 3)
       _ ← awaitAdopted rig (n + 1)
-      (overlapped, live) ← atomically ((,) <$> prInFlight inFlight <*> liveChunksSTM rig)
-      -- while the first batch is in flight, every chunk it drew with is still held, the newer adoption notwithstanding
-      when overlapped (chunksA `Set.isSubsetOf` live `shouldBe` True)
-      a ← renderFinish inFlight
+      seenAtB ← readTVarIO (holdingSeen holding)
+      -- a step has observed A's batch pending since B's adoption
+      within 20 (atomically (readTVar (holdingSeen holding) >>= check . (> seenAtB)))
+      chunksB ← worldChunks . snd <$> adoptedWorld rig
+      let onlyA = chunksA `Set.difference` chunksB
+      onlyA `shouldSatisfy` (not . Set.null)
+      (stillPending, live, held, gpu) ← atomically $
+        (,,,) <$> prInFlight heldA <*> liveChunksSTM rig <*> (and <$> mapM (ledgerChunkHeld (scenesLedger (envScenes (rgEnv rig)))) (Set.toList onlyA)) <*> terrainViewsGpuCharged (rgViews rig)
+      stillPending `shouldBe` True
+      onlyA `Set.isSubsetOf` live `shouldBe` True
+      held `shouldBe` True
+      gpu `shouldSatisfy` (> 0)
+      -- the hold lets go: A's batch completes on its fence, its image is judged, and its own chunks retire
+      atomically (writeTVar (holdingSet holding) Set.empty)
+      a ← renderFinish heldA
       worldChunks (rwWorld a) `shouldBe` chunksA
-      evidenceNote ("terrain views (full): the newer revision was adopted " <> (if overlapped then "while" else "after") <> " the first one's batch was in flight; its readback was judged whole")
+      within 20 . atomically $ liveChunksSTM rig >>= check . Set.null . Set.intersection onlyA
+      _ ← renderJudged rig "B, after A's batch"
+      evidenceNote ("terrain views (overlap): " <> Text.pack (show (Set.size onlyA)) <> " chunks of A held through B's adoption while A's batch was held; retired after its completion")
       closeView view
 
 -- ---------------------------------------------------------------------------
@@ -390,7 +414,25 @@ renderFinish = prFinish
 
 -- | Record the adopted world into a fresh colour target and depth image and submit the batch, without waiting for it.
 renderSubmit ∷ Rig → Text → IO PendingRender
-renderSubmit rig name = do
+renderSubmit rig = renderSubmitWith rig Nothing
+
+-- A completion hold over a set of batch ids (the host's test-only 'CompletionHold'), counting each owner step that
+-- observed a held batch.
+data Holding = Holding
+  { holdingSet ∷ !(TVar (Set.Set BatchId))
+  , holdingSeen ∷ !(TVar Int)
+  }
+
+newHolding ∷ IO (Holding, CompletionHold)
+newHolding = do
+  held ← newTVarIO Set.empty
+  seen ← newTVarIO 0
+  pure (Holding held seen, CompletionHold (\batch → Set.member batch <$> readTVar held) (\_ → modifyTVar' seen (+ 1)))
+
+-- | 'renderSubmit', with the batch held from inside the action that records it (so no owner step can observe it
+-- before it is held) when a hold is given.
+renderSubmitWith ∷ Rig → Maybe Holding → Text → IO PendingRender
+renderSubmitWith rig holding name = do
   let env = rgEnv rig
       host = envHost env
       graphics = envGraphics env
@@ -426,8 +468,9 @@ renderSubmit rig name = do
                     Right () → pure (Right ()))
         >>= \case
           Left refusal → pure (Left (RefusedIllegal (Text.pack (show refusal))))
-          Right (batch, Left failure) → pure (Right (batch, Just failure))
-          Right (batch, Right ()) → pure (Right (batch, Nothing))
+          Right (batch, outcome) → do
+            for_ holding $ \h → atomically (modifyTVar' (holdingSet h) (Set.insert (ticketBatch batch)))
+            pure (Right (batch, either Just (const Nothing) outcome))
     (batch, failure) ← either (assertFailure . Text.unpack) pure ticket
     -- the registry as the batch was recorded: the world is judged against what it drew with, whatever is released
     -- after its batch completes
