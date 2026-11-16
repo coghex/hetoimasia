@@ -13,7 +13,7 @@ module Test.LuaEngine.Graphics.TerrainViews (spec) where
 import Control.Concurrent (forkIO)
 import Control.Concurrent.STM
 import Control.Exception (finally)
-import Control.Monad (unless)
+import Control.Monad (unless, void)
 import qualified Data.ByteString as ByteString
 import qualified Data.ByteString.Char8 as BC
 import Data.Map.Strict (Map)
@@ -46,8 +46,12 @@ import Hetoimasia.Render.TwoD.Chunk (ChunkRef)
 import Hetoimasia.Render.TwoD.Chunk.Backend (chunkRef)
 import Hetoimasia.Render.TwoD.Metrics (PixelExtent (..), TargetMetrics (..))
 import Hetoimasia.Render.TwoD.Vulkan.Chunks (ChunkStanding (..))
+import Hetoimasia.GPU.Vulkan.GLFW (TextureHandle (..))
+import Hetoimasia.Render.TwoD.Vulkan.Textures (toBackendHandle)
+import Hetoimasia.LuaEngine.Graphics.Texture.Port (TextureRef (..))
 import Hetoimasia.Render.TwoD.Material (MaterialRef, defaultMaterial)
-import Hetoimasia.Terrain.Coordinate (axisFromInteger)
+import Hetoimasia.Terrain.Coordinate (TileCoord, axisFromInteger, tileCoord)
+import qualified Hetoimasia.Terrain.Render2D.Camera as Camera
 import Hetoimasia.Terrain.Render2D.AtlasFixtures (AtlasStyle, findSampleDirectory, loadAtlasStyle)
 import qualified Hetoimasia.Terrain.Render2D.AtlasFixtures as Fixtures
 import Hetoimasia.Terrain.Render2D.Cells (CellConfig (..), defaultCellConfig)
@@ -71,6 +75,7 @@ import Hetoimasia.Terrain.Runtime.Storage (filesystemOf, minHeadroomBytes, mkSto
 import Hetoimasia.Terrain.Runtime.Store (StoreSpec (..), defaultStoreSpec, minAllowanceBytes)
 import Hetoimasia.Terrain.Source (LayerSpec (..), SourceSpec (..))
 import System.FilePath ((</>))
+
 import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec
 import Test.LuaEngine.Graphics.Composition
@@ -98,6 +103,8 @@ data Views = Views
 
 spec ∷ Spec
 spec = describe "terrain views" $ do
+  pickConsistency
+  races
   it "attaches under the target's claim, publishes a whole world revision, and picks only from the revision the host adopted" $
     withViews $ \v → do
       view ← attached v 1
@@ -172,6 +179,135 @@ spec = describe "terrain views" $ do
       closeView view
 
 -- ---------------------------------------------------------------------------
+-- Picks and their consistency
+
+pickConsistency ∷ Spec
+pickConsistency = describe "a pick's consistency reference" $ do
+  it "removes through a hit's precondition at the atomic settlement, and refuses it stale after another edit or a newer adoption" $
+    withViews $ \v → do
+      view ← attached v 1
+      _ ← awaitPublished v 1
+      _ ← adoptNow (vModel v) 1
+      -- Reveal some known terrain: a removal at the anchor's surface discovers its neighbours.
+      revealAt v (8, 8, 3)
+      known ← currentHit v view
+      -- A valid reference reaches the settlement and removes.
+      removed ← removeWith v (pickRefCell known) (Just (pickPrecondition view known))
+      removed `shouldBe` Right True
+      -- That edit made the reference stale: the same precondition is refused, and nothing changes.
+      again ← currentHit v view
+      _ ← removeWith v (pickRefCell again) Nothing
+      removeWith v (pickRefCell again) (Just (pickPrecondition view again)) >>= (`shouldBe` Left Runtime.StaleView)
+      -- A reference picked from a revision the host has since replaced is stale even with the content unchanged.
+      fresh ← currentHit v view
+      atomically (updatePresentation view noPresentationUpdate {updateAmbient = Just 0.4}) `shouldReturn` Right ()
+      newer ← publishedRevision (vModel v) 1 >>= \now → awaitPublished' v 1 (now + 1)
+      adoptNow (vModel v) 1 `shouldReturn` Adopted newer
+      removeWith v (pickRefCell fresh) (Just (pickPrecondition view fresh)) >>= (`shouldBe` Left Runtime.StaleView)
+      closeView view
+
+-- The first visible known part of the adopted frame, scanning the target's pixel centres.
+adoptedHit ∷ Views → TerrainView Int → IO (PickRef Int)
+adoptedHit _ view = do
+  found ← atomically $ do
+    answers ← mapM (pickView view) [(x + 0.5, y + 0.5) | y ← [0, 4 .. 92], x ← [0, 4 .. 124]]
+    case [ref | PickHit ref ← answers] of
+      ref : _ → pure ref
+      [] → retry
+  pure found
+
+-- A hit from a revision planned at the arena's current content and knowledge, adopted: discovery commits after an edit,
+-- so the first plan after one can already be a knowledge revision behind, and the view prepares again.
+currentHit ∷ Views → TerrainView Int → IO (PickRef Int)
+currentHit v view = bounded go
+  where
+    go = do
+      _ ← adoptNow (vModel v) 1
+      _ ← releasePass (vModel v)
+      hit ← adoptedHit v view
+      status ← Runtime.arenaStatus (_vTerrain v) (vArena v) >>= either (fail . show) pure
+      let precondition = pickPrecondition view hit
+      if Runtime.preconditionContent precondition == Runtime.statusContentRevision status
+        && Runtime.preconditionKnowledge precondition == Just (Runtime.statusKnowledgeRevision status)
+        then pure hit
+        else do
+          now ← publishedRevision (vModel v) 1
+          awaitRevision (vModel v) 1 (now + 1)
+          go
+
+revealAt ∷ Views → (Integer, Integer, Integer) → IO ()
+revealAt v (x, y, z) = do
+  now ← publishedRevision (vModel v) 1
+  _ ← removeWith v (tileAt x y z) Nothing
+  -- the edit makes the view prepare and publish again; the host adopts it
+  newer ← awaitPublished' v 1 (now + 1)
+  adoptNow (vModel v) 1 `shouldReturn` Adopted newer
+  void (releasePass (vModel v))
+
+-- Remove a cell through the terrain service with an optional precondition: whether it changed, or the failure.
+removeWith ∷ Views → TileCoord → Maybe Runtime.Precondition → IO (Either Runtime.Failure Bool)
+removeWith v at precondition = do
+  removal ← Runtime.removeAt (_vTerrain v) (vArena v) at precondition >>= either (fail . show) pure
+  Runtime.await (_vTerrain v) removal >>= \case
+    Right answer → pure (Right (Runtime.removeChangedFlag answer))
+    Left (Runtime.Failed why) → pure (Left why)
+    Left other → fail (show other)
+
+tileAt ∷ Integer → Integer → Integer → TileCoord
+tileAt x y z = either (error . show) id (tileCoord x y z)
+
+-- ---------------------------------------------------------------------------
+-- Attachment races and intent
+
+races ∷ Spec
+races = describe "attachment and intent" $ do
+  it "refuses an attachment whose parent was released between its retention and the commit, taking no claim and no interest" $
+    withViews $ \v → do
+      -- Hold the worker inside the owner while the first view builds, then queue a second view.
+      atomically (writeTVar (foGate (vOwner v)) False)
+      first' ← inInstance (vComp v) (vVm v) "i" (attachView (vViews v) (requestFor v (target v 1))) >>= either (fail . show) pure
+      bounded (atomically (readTVar (foWaiting (vOwner v)) >>= check . (> 0)))
+      modelWindow (vModel v) 2
+      second ← inInstance (vComp v) (vVm v) "i" (attachView (vViews v) (requestFor v (target v 2))) >>= either (fail . show) pure
+      -- The instance releases the colour parent before the worker reaches the second commit.
+      command (vComp v) (vVm v) "i" "release" "colour"
+      _ ← awaitNoteContaining (vComp v) "i release colour"
+      bounded (atomically (readFake (vFake v) >>= check . not . Set.null . readingMarkedNow))
+      atomically (writeTVar (foGate (vOwner v)) True)
+      _ ← bounded (awaitAttach first')
+      bounded (awaitAttach second) `shouldReturn` SettledRefused AttachParentReleased
+      atomically (claimOf (vClaims v) 2) `shouldReturn` Nothing
+
+  it "cancels a queued attachment: it settles cancelled once, takes no claim, and a late cancel changes nothing" $
+    withViews $ \v → do
+      atomically (writeTVar (foGate (vOwner v)) False)
+      first' ← inInstance (vComp v) (vVm v) "i" (attachView (vViews v) (requestFor v (target v 1))) >>= either (fail . show) pure
+      bounded (atomically (readTVar (foWaiting (vOwner v)) >>= check . (> 0)))
+      modelWindow (vModel v) 2
+      second ← inInstance (vComp v) (vVm v) "i" (attachView (vViews v) (requestFor v (target v 2))) >>= either (fail . show) pure
+      cancelAttach (vViews v) second `shouldReturn` True
+      cancelAttach (vViews v) second `shouldReturn` False
+      atomically (writeTVar (foGate (vOwner v)) True)
+      _ ← bounded (awaitAttach first')
+      bounded (awaitAttach second) `shouldReturn` SettledCancelled
+      atomically (claimOf (vClaims v) 2) `shouldReturn` Nothing
+
+  it "applies camera and presentation updates all or nothing: an invalid update changes nothing and publishes nothing" $
+    withViews $ \v → do
+      view ← attached v 1
+      published ← awaitPublished v 1
+      atomically (updatePresentation view noPresentationUpdate {updateAmbient = Just 0.5, updateHaze = Just 2}) >>= (`shouldSatisfy` isInvalid)
+      atomically (updateCamera view (CameraIntent [Camera.ZoomBy 2, Camera.ZoomBy (0 / 0)])) >>= (`shouldSatisfy` isInvalid)
+      atomically (readView view) >>= (`shouldBe` Just published) . fmap fromIntegral . readingPublished
+      -- a valid update is recorded intent: it publishes a new revision later
+      atomically (updateCamera view (CameraIntent [Camera.ZoomBy 2])) `shouldReturn` Right ()
+      _ ← awaitPublished' v 1 (published + 1)
+      -- nothing is adopted, so the superseded regions wait behind the barrier: that delays no close
+      closeView view
+  where
+    isInvalid = \case Left (IntentInvalid _) → True; _ → False
+
+-- ---------------------------------------------------------------------------
 -- The rig
 
 withViews ∷ (Views → IO a) → IO a
@@ -201,7 +337,9 @@ withViews body = do
           let ports =
                 TerrainViewsPorts
                   { portOwner = fakeViewOwner owner
-                  , portReleased = \_ → pure False
+                  , portReleased = \handle →
+                      let TextureHandle index generation = toBackendHandle handle
+                       in Set.member (TextureRef index generation) . readingMarkedNow <$> readFake fake
                   , portLedger = fakeLedger fake
                   , portClaims = claims
                   , portInitial = initial
@@ -382,17 +520,25 @@ data FakeOwner = FakeOwner
   , foStanding ∷ !(TVar (Map ChunkRef ChunkStanding))
   , foReleased ∷ !(TVar [ChunkRef])
   , foBuilt ∷ !(TVar Int)
+  , foGate ∷ !(TVar Bool)
+    -- ^ While closed, a build waits: the adapter's worker is held inside the owner's action.
+  , foWaiting ∷ !(TVar Int)
+    -- ^ Builds waiting at the closed gate.
   }
 
 newFakeOwner ∷ Model → IO FakeOwner
-newFakeOwner model = FakeOwner model <$> newTVarIO 1 <*> newTVarIO Map.empty <*> newTVarIO [] <*> newTVarIO 0
+newFakeOwner model = FakeOwner model <$> newTVarIO 1 <*> newTVarIO Map.empty <*> newTVarIO [] <*> newTVarIO 0 <*> newTVarIO True <*> newTVarIO 0
 
 fakeViewOwner ∷ FakeOwner → ViewOwner
 fakeViewOwner owner =
   ViewOwner
     { ownerMaterial = material
     , ownerDepthQualified = True
-    , ownerBuild = \regions → atomically $ do
+    , ownerBuild = \regions → do
+       atomically (modifyTVar' (foWaiting owner) (+ 1))
+       atomically (readTVar (foGate owner) >>= check)
+       atomically $ do
+        modifyTVar' (foWaiting owner) (subtract 1)
         start ← readTVar (foNext owner)
         let refs = [chunkRef index 1 | index ← take (length regions) [start ..]]
         writeTVar (foNext owner) (start + fromIntegral (length regions))
@@ -404,9 +550,8 @@ fakeViewOwner owner =
         modifyTVar' (foReleased owner) (<> chunks)
         pure (Just (map (const (Right ())) chunks))
     , ownerBarrier = \_ → do
-        met ← atomically (modelCapture (foModel owner))
-        atomically (met >>= check)
-        pure True
+        met ← modelCapture (foModel owner)
+        pure (Right ((\done → if done then Just True else Nothing) <$> met))
     , ownerStanding = \chunk → Map.lookup chunk <$> readTVar (foStanding owner)
     }
   where

@@ -189,8 +189,17 @@ data Request k
 data Retiring = Retiring
   { rtChunk ∷ !ChunkRef
   , rtBytes ∷ !Word64
-  , rtBarrierMet ∷ !Bool
+  , rtBarrier ∷ !Barrier
   }
+
+-- | Where a retiring chunk stands against the host's release barrier.
+data Barrier
+  = -- | Not asked yet (or the lane was full when it was).
+    BarrierUnasked
+  | -- | Asked: the reading answers once it is met or will never be.
+    BarrierWaiting !(STM (Maybe Bool))
+  | -- | Met: the chunk is released once no adoption lists it.
+    BarrierMet
 
 -- | A view, as callers hold it.
 data TerrainView k = TerrainView !(TerrainViews k) !(ViewState k)
@@ -637,7 +646,7 @@ runClose service state = do
     forM_ (Set.toList (styleIdentities (vsStyle state))) (ledgerDropInterest (portLedger ports))
     regions ← readTVar (vsRegions state)
     writeTVar (vsRegions state) Map.empty
-    modifyTVar' (svRetiring service) (<> [Retiring (rgChunk region) (rgBytes region) False | region ← Map.elems regions])
+    modifyTVar' (svRetiring service) (<> [Retiring (rgChunk region) (rgBytes region) BarrierUnasked | region ← Map.elems regions])
     pins ← readTVar (vsPins state)
     writeTVar (vsPins state) Map.empty
     let bytes = sum (map pinBytes (Map.elems pins))
@@ -773,37 +782,51 @@ shutdown service = do
             atomically (retirable service >>= check)
             drain
 
--- Whether some retiring chunk can move: its barrier not yet asked for, or asked for and no adoption lists it.
+-- Whether some retiring chunk can move: its barrier not yet asked for, its barrier's answer arrived, or the barrier met
+-- and no adoption lists it. Nothing here waits for the barrier itself, so a target that adopts nothing delays only its
+-- own retirements, never a close, an attachment or another view.
 retirable ∷ (Ord k, Show k) ⇒ TerrainViews k → STM Bool
 retirable service = do
   retiring ← readTVar (svRetiring service)
   let ledger = portLedger (svPorts service)
-  candidates ← forM retiring $ \r → if not (rtBarrierMet r) then pure True else not <$> ledgerChunkHeld ledger (rtChunk r)
+  candidates ← forM retiring $ \r → case rtBarrier r of
+    BarrierUnasked → pure True
+    BarrierWaiting reading → isJust <$> reading
+    BarrierMet → not <$> ledgerChunkHeld ledger (rtChunk r)
   pure (or candidates)
 
 -- One retirement step: ask the host's release barrier for every chunk not yet behind one (the barrier covers every
 -- revision published before the request, so one that lists the chunk is adopted, and so recorded in the ledger, before
--- the release can run), then release on the owner every chunk no adoption lists, returning its GPU bytes only once the
--- owner reports it released. 'False' when the owner takes no more actions.
+-- it is met), take every barrier's answer that arrived, then release on the owner every chunk whose barrier is met and
+-- that no adoption lists, returning its GPU bytes only once the owner reports it released. 'False' when the owner will
+-- never meet a barrier or takes no more actions.
 retireStep ∷ (Ord k, Show k) ⇒ TerrainViews k → IO Bool
 retireStep service = do
   let ports = svPorts service
       owner = portOwner ports
-  retiring ← readTVarIO (svRetiring service)
-  let unmet = [rtChunk r | r ← retiring, not (rtBarrierMet r)]
-  barrier ←
-    if null unmet
-      then pure True
-      else do
-        met ← ownerBarrier owner unmet
-        when met (atomically (modifyTVar' (svRetiring service) (map (\r → if rtChunk r `elem` unmet then r {rtBarrierMet = True} else r))))
-        pure met
-  if not barrier
+  -- ask, and take the answers that arrived, in one transaction
+  gone ← atomically $ do
+    retiring ← readTVar (svRetiring service)
+    let unasked = [rtChunk r | r ← retiring, BarrierUnasked ← [rtBarrier r]]
+    asked ← if null unasked then pure (Right Nothing) else fmap Just <$> ownerBarrier owner unasked
+    stepped ← forM retiring $ \r → case rtBarrier r of
+      BarrierUnasked → pure $ case asked of
+        Right (Just reading) → (r {rtBarrier = BarrierWaiting reading}, False)
+        _ → (r, False)
+      BarrierWaiting reading →
+        reading >>= \case
+          Just True → pure (r {rtBarrier = BarrierMet}, False)
+          Just False → pure (r, True)
+          Nothing → pure (r, False)
+      BarrierMet → pure (r, False)
+    writeTVar (svRetiring service) (map fst stepped)
+    pure (any snd stepped)
+  if gone
     then pure False
     else do
       eligible ← atomically $ do
         now ← readTVar (svRetiring service)
-        filterM' (\r → if rtBarrierMet r then not <$> ledgerChunkHeld (portLedger ports) (rtChunk r) else pure False) now
+        filterM' (\r → case rtBarrier r of BarrierMet → not <$> ledgerChunkHeld (portLedger ports) (rtChunk r); _ → pure False) now
       if null eligible
         then pure True
         else
@@ -1136,7 +1159,7 @@ publishPlan service state metrics copies plan adapted = do
                           -- What the new revision no longer lists starts its retirement; the host's barrier and the
                           -- adoptions still protect it wherever an earlier revision may be drawn.
                           let superseded = Map.difference existing reused
-                          modifyTVar' (svRetiring service) (<> [Retiring (rgChunk r) (rgBytes r) False | r ← Map.elems superseded])
+                          modifyTVar' (svRetiring service) (<> [Retiring (rgChunk r) (rgBytes r) BarrierUnasked | r ← Map.elems superseded])
                         pure accepted
                   if committed
                     then pure (Published' revision)

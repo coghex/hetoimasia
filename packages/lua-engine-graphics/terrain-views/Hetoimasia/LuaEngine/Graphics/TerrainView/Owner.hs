@@ -17,7 +17,7 @@ import Control.Monad (forM, forM_, void)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as Text
-import Hetoimasia.GPU.Vulkan.GLFW (ActionOutcome (..), ImageFormat (Depth32Float), VulkanAction (..), VulkanHost, awaitVulkanAction, requestVulkanRelease, submitVulkanAction)
+import Hetoimasia.GPU.Vulkan.GLFW (ActionOutcome (..), ActionRefusal (..), ImageFormat (Depth32Float), VulkanAction (..), VulkanHost, awaitVulkanAction, readVulkanAction, requestVulkanRelease, submitVulkanAction)
 import Hetoimasia.LuaEngine.Graphics.Scene.Ledger (GraphicsScene)
 import Hetoimasia.LuaEngine.Graphics.Texture (TextureGraphics (..))
 import Hetoimasia.LuaEngine.Graphics.Texture.Host (hostBuilders)
@@ -48,9 +48,11 @@ data ViewOwner = ViewOwner
   , ownerRelease ∷ [ChunkRef] → IO (Maybe [Either Text ()])
     -- ^ Release these chunks' buffers on the owner, now: only for chunks no revision lists or ever listed, or that no
     -- adoption holds behind a met barrier. 'Nothing' when the owner takes no more actions.
-  , ownerBarrier ∷ [ChunkRef] → IO Bool
-    -- ^ Mark these chunks released for publication's check, then wait for the host's release barrier: every revision
-    -- published before the request adopted. 'False' when the owner takes no more actions.
+  , ownerBarrier ∷ [ChunkRef] → STM (Either () (STM (Maybe Bool)))
+    -- ^ Mark these chunks released for publication's check and ask the host's release barrier, in one transaction that
+    -- never waits: every revision published before the request must be adopted before it is met. The answer is a
+    -- reading of the barrier ('Nothing' while it waits, 'Just True' once met, 'Just False' when the owner will never
+    -- meet it), or 'Left' when the request could not be queued now (a full lane: asked again later).
   , ownerStanding ∷ ChunkRef → STM (Maybe ChunkStanding)
     -- ^ A chunk's upload: uploading, ready or failed; 'Nothing' for one never built or since released.
   }
@@ -76,15 +78,17 @@ productionViewOwner host graphics = do
           go [] regions
       , ownerRelease = \chunks → act host $ VulkanAction $ \construction → forM chunks (\chunk → either (Left . Text.pack . show) Right <$> releaseChunkNow (hostBuilders host construction) retained chunk)
       , ownerBarrier = \chunks → do
-          submitted ← atomically $ do
-            forM_ chunks (void . markChunkReleasedSTM retained)
-            requestVulkanRelease host (VulkanAction (\_ → pure ()))
-          case submitted of
-            Left _ → pure False
+          forM_ chunks (void . markChunkReleasedSTM retained)
+          requestVulkanRelease host (VulkanAction (\_ → pure ())) >>= \case
+            Left ActionQueueFull → pure (Left ())
+            Left ReleaseQueueFull → pure (Left ())
+            Left _ → pure (Right (pure (Just False)))
             Right ticket →
-              atomically (awaitVulkanAction ticket) >>= \case
-                ActionReturned () → pure True
-                _ → pure False
+              pure . Right $
+                readVulkanAction ticket >>= \case
+                  Nothing → pure Nothing
+                  Just (ActionReturned ()) → pure (Just True)
+                  Just _ → pure (Just False)
       , ownerStanding = chunkStandingSTM retained
       }
   where
