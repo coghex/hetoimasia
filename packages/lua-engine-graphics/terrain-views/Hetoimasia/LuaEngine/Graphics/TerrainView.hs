@@ -16,6 +16,7 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView
   , TerrainViews
   , withTerrainViews
   , terrainViewsFailures
+  , renderStagingAccount
 
     -- * The graphics owner
   , ViewOwner (..)

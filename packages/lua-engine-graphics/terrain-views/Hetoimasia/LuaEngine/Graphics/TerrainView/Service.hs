@@ -43,6 +43,7 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView.Service
   , TerrainViewsPorts (..)
   , withTerrainViews
   , terrainViewsFailures
+  , renderStagingAccount
 
     -- * Views
   , TerrainView
@@ -95,7 +96,7 @@ import Hetoimasia.LuaEngine.Graphics.TerrainView.Inputs (CopySet, combineCopies,
 import Hetoimasia.LuaEngine.Graphics.TerrainView.Style
 import Hetoimasia.LuaEngine.Graphics.TerrainView.Types
 import Hetoimasia.LuaEngine.Graphics.TerrainView.Owner (RegionBuild (..), ViewOwner (..))
-import Hetoimasia.LuaEngine.Texture (RenderAccount, accountRelease, accountReserve)
+import Hetoimasia.LuaEngine.Texture (RenderAccount, accountCharged, accountRelease, accountReserve)
 import Hetoimasia.Math.Vector (V2 (..))
 import Hetoimasia.Render.TwoD.Chunk (ChunkRef)
 import Hetoimasia.Render.TwoD.Material (MaterialData (..), MaterialRecord, MaterialRef)
@@ -227,12 +228,16 @@ data ViewState = ViewState
   , vsClosing ∷ !(TVar Bool)
   , vsClosed ∷ !(TVar Bool)
   , vsJumps ∷ !(TVar (Map Word64 (TVar (Maybe (Settled JumpOutcome)))))
-  , vsRetry ∷ !(TVar (Maybe (Word64, Maybe Natural)))
+  , vsRetry ∷ !(TVar (Maybe (Word64, Maybe Natural, Word64)))
     -- ^ A preparation left work it can complete once something is released or adopted (copies refused busy, a pin
     -- or a bank full): the service's release count and the target's newest adopted revision when it stopped. It runs
     -- again when either has moved.
   , vsExtraDemand ∷ !(TVar [RegionCoord])
     -- ^ Regions a pending jump or an unavailable followed surface needs beyond the viewport.
+  , vsDemand ∷ !(TVar (Maybe ([RegionCoord], [RegionCoord])))
+    -- ^ The latest camera demand, visible then prefetch: kept, so that a busy refusal loses nothing.
+  , vsDemandBusy ∷ !(TVar (Maybe (Word64, Maybe Natural, Word64)))
+    -- ^ The latest demand was refused busy: the retry mark when it was. It is sent again when the mark moves.
   }
 
 -- | A published plan kept for picking, with its identity and its CPU charge.
@@ -252,6 +257,17 @@ data Region = Region
   , rgRecords ∷ ![MaterialRecord]
   , rgBytes ∷ !Word64
   }
+
+-- | The session's CPU render/staging account as the terrain service's outside staging account
+-- ('Runtime.configStagingAccount'): a terrain-enabled composition gives the service this, so the terrain service's
+-- staging, the coverage planes and the views' payloads all draw on the one allowance.
+renderStagingAccount ∷ RenderAccount → Runtime.StagingAccount
+renderStagingAccount account =
+  Runtime.StagingAccount
+    { Runtime.stagingAccountReserve = accountReserve account
+    , Runtime.stagingAccountRelease = accountRelease account
+    , Runtime.stagingAccountCharged = accountCharged account
+    }
 
 -- | Failures the service retained as terminal evidence: provider, host or ownership defects, and retirements it could
 -- not prove.
@@ -421,6 +437,8 @@ newViewState service request style runtimeView camera light = do
     <*> newTVarIO Map.empty
     <*> newTVarIO Nothing
     <*> newTVarIO []
+    <*> newTVarIO Nothing
+    <*> newTVarIO Nothing
 
 -- ---------------------------------------------------------------------------
 -- Intent
@@ -620,6 +638,7 @@ data Work
   | WorkClose !ViewState
   | WorkRetire
   | WorkPrepare !ViewState
+  | WorkDemand !ViewState
 
 worker ∷ TerrainViews → IO ()
 worker service = loop
@@ -631,6 +650,7 @@ worker service = loop
         WorkClose state → guarded (runClose service state) >> loop
         WorkRetire → guarded (retireStep service >>= \progressed → unless progressed (abandonRetirements service)) >> loop
         WorkPrepare state → guarded (prepareView service state) >> loop
+        WorkDemand state → guarded (resendDemand service state) >> loop
     guarded action =
       try action >>= \case
         Left (failure ∷ SomeException) → recordFailure service (Text.pack (displayException failure))
@@ -645,6 +665,7 @@ nextWork service = do
       requests
         `orElse` closes
         `orElse` retirements
+        `orElse` demands
         `orElse` preparations
   where
     requests =
@@ -658,6 +679,12 @@ nextWork service = do
         state : _ → pure (WorkClose state)
         [] → retry
     retirements = retirable service >>= check >> pure WorkRetire
+    demands = do
+      views ← Map.elems <$> readTVar (svViews service)
+      waiting ← filterM' (\state → readTVar (vsDemandBusy state) >>= maybe (pure False) (\mark → (/= mark) <$> retryMark service state)) views
+      case waiting of
+        state : _ → pure (WorkDemand state)
+        [] → retry
     preparations = do
       views ← Map.toList <$> readTVar (svViews service)
       cursor ← readTVar (svCursor service)
@@ -682,12 +709,14 @@ viewDirty service state = do
   let current = either (const Nothing) (\s → Just (Runtime.statusContentRevision s, Runtime.statusKnowledgeRevision s)) status
   pure (intent /= prepared || current /= revisions || now /= metrics || maybe False (/= mark) retryAt)
 
--- What a waiting preparation watches: the service's releases and the target's newest adoption.
-retryMark ∷ TerrainViews → ViewState → STM (Word64, Maybe Natural)
+-- What a waiting preparation watches: the service's releases, the target's newest adoption and the shared account's
+-- charge (moved by any of its consumers: coverage, view payloads or the terrain service's own staging).
+retryMark ∷ TerrainViews → ViewState → STM (Word64, Maybe Natural, Word64)
 retryMark service state = do
   releases ← readTVar (svReleases service)
   newest ← ledgerNewestAdopted (portLedger (svPorts service)) (vtKey (vsTarget state))
-  pure (releases, fst <$> newest)
+  charged ← accountCharged (portAccount (svPorts service))
+  pure (releases, fst <$> newest, charged)
 
 -- The graphics owner takes no more actions, so the retirements left cannot be proved: they are kept as terminal
 -- evidence, and their GPU bytes stay charged.
@@ -900,18 +929,36 @@ regionsOf ∷ Demand → [RegionCoord]
 regionsOf (Demand chunks) = [RegionCoord cx cy (fromInteger level) | ChunkDemand (ChunkKey cx cy) _ levels ← chunks, level ← levels]
 
 -- The view's camera interests: its visible regions before its prefetch, latest value only. More regions than the
--- service's camera share takes are asked again with the visible ones alone; pressure is the runtime's to coalesce. The
--- copies the view plans from do not depend on residency, so a refused demand delays nothing it draws.
+-- service's camera share takes are asked again with the visible ones alone. The latest demand is kept: a busy refusal
+-- (the terrain service's own banks, or the shared account another consumer fills) is sent again once something is
+-- released ('resendDemand'), so it loses nothing. The copies the view plans from do not depend on residency, so a
+-- refused demand delays nothing it draws.
 setDemand ∷ TerrainViews → ViewState → [RegionCoord] → [RegionCoord] → IO ()
-setDemand service state visible prefetch = ask (visible <> prefetch) (Just visible)
+setDemand service state visible prefetch = do
+  atomically (writeTVar (vsDemand state) (Just (visible, prefetch)))
+  sendDemand service state
+
+sendDemand ∷ TerrainViews → ViewState → IO ()
+sendDemand service state =
+  readTVarIO (vsDemand state) >>= \case
+    Nothing → pure ()
+    Just (visible, prefetch) → do
+      mark ← atomically (retryMark service state)
+      busy ← ask (visible <> prefetch) (Just visible)
+      atomically (writeTVar (vsDemandBusy state) (if busy then Just mark else Nothing))
   where
     ask regions fallback = case traverse demandOf regions of
-      Left _ → pure ()
+      Left _ → pure False
       Right demands →
         Runtime.setViewDemand (portTerrain (svPorts service)) (vsRuntimeView state) (vsArena state) demands >>= \case
           Left (Runtime.RefusedInvalid _) | Just smaller ← fallback, length smaller < length regions → ask smaller Nothing
-          _ → pure ()
+          Left (Runtime.RefusedBusy _) → pure True
+          _ → pure False
     demandOf region = RegionDemand region <$> coverageBox 0 16 0 16 0 32
+
+-- Send the kept demand again after a busy refusal.
+resendDemand ∷ TerrainViews → ViewState → IO ()
+resendDemand = sendDemand
 
 -- The view's setup for these metrics: the whole framebuffer.
 setupFor ∷ TargetMetrics → ViewSetup
