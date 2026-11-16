@@ -224,6 +224,7 @@ test-suite terrain-runtime-tests
         Test.TerrainRuntime.Parallel
         Test.TerrainRuntime.Heap
         Test.TerrainRuntime.Pass
+        Test.TerrainRuntime.Preparation
         Test.TerrainRuntime.Runner
         Test.TerrainRuntime.Races
         Test.TerrainRuntime.Regional
