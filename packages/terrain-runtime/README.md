@@ -74,7 +74,13 @@ neither is a settlement. There is **one** winner. The success settlement is
 delivered in the same transaction that applies the content change and advances the
 revision, and that same transaction is the only place cancellation, the parent
 session's admission and the arena's closure are decided against it. Do not run an
-ordinary IO completion after a commit and call that atomic. A callback that throws
+ordinary IO completion after a commit and call that atomic. What does not depend on the
+race is prepared before it, outside every transaction, so the commit's transaction does not grow
+with a definition or an answer: the owner interns an open's materials into its palette before it
+stages the open, and, for a host that prepares a staged answer's settlement (`endpointPrepare`, a
+pure function of the answer and of what the host fixed at admission, never of state that can
+change before the commit), evaluates it before staging the answer, so the arbitration runs the
+prepared transaction in place of `endpointSettle`. A callback that throws
 is a provider defect: the transaction is abandoned with nothing committed, the
 request ends without a second call into the host, and the defect reaches
 supervision (the owner ends).

@@ -257,6 +257,7 @@ hostEndpoint svc watch host =
           Nothing → pure Nothing
           Just lease → fmap (\v → (revisionNumber (viewRevision v), False)) <$> inspectArenaSTM svc lease
         modifyTVar' (hostSeen host) (seen :)
+    , endpointPrepare = Nothing
     }
   where
     revisionNumber (Revision n) = toInteger n

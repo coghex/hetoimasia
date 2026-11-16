@@ -1,6 +1,6 @@
 {
   "name": "required B",
-  "revision": 3,
+  "revision": 2,
   "view": 1, "plan": 3,
   "framebuffer": [128, 96],
   "chunks": 4,

@@ -187,6 +187,7 @@ startAdmitted context ask name arguments afterCompletion = do
                 , settlingSettleFinal = \final → settleWithFinal service ask (endpointResult endpoint) final (admittedIdentity found)
                 , settlingSettle = settleWith service ask (endpointResult endpoint) (admittedIdentity found)
                 , settlingSettleKeeping = settleKeeping service ask (endpointResult endpoint) (admittedIdentity found)
+                , settlingPrepare = prepareReply service ask (endpointResult endpoint) (admittedIdentity found)
                 , settlingJudge = replyDeliverable (psLimits service) (endpointResult endpoint) ask
                 , settlingCancel = void (cancelOf service (admittedRequester found) (admittedNumber found))
                 }

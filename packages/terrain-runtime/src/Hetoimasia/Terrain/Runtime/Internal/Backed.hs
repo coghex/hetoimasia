@@ -36,6 +36,7 @@ module Hetoimasia.Terrain.Runtime.Internal.Backed
   , stepOpen
   , openOrderAllows
   , openReady
+  , preparePalette
 
     -- * Gathers
   , Gathered (..)
@@ -110,6 +111,7 @@ import qualified Hetoimasia.Terrain.Runtime.Backed.Growth as Growth
 import Hetoimasia.Terrain.Runtime.Backed.Txn (Done (..), Io (..), Progress (..))
 import qualified Hetoimasia.Terrain.Runtime.Backed.Txn as Txn
 import qualified Hetoimasia.Terrain.Runtime.Backed.WriteProbe as WriteProbe
+import Hetoimasia.Terrain.Palette (Palette, PaletteError, emptyPalette, internSourceMaterials)
 import Hetoimasia.Terrain.Runtime.Internal.Content (Prepared (..))
 import Hetoimasia.Terrain.Runtime.Internal.Core
 import Hetoimasia.Terrain.Runtime.Internal.Types hiding (OwnerPhase (..))
@@ -366,6 +368,17 @@ openReady st rid = case openPhase <$> Map.lookup rid (stateOpens st) of
   Just (OpenPublishable aid env shared backing store) → Just (aid, env, shared, backing, store)
   _ → Nothing
 
+-- | AN OPEN'S PALETTE IS PREPARED OUTSIDE EVERY TRANSACTION: the source's materials interned in
+-- authored order, fully evaluated (a palette's fields are strict maps, so its weak head normal form is
+-- the whole palette) on the owner, before the open is staged. The chooser and the arbitration read the
+-- prepared value and intern nothing, so the commit's transaction does not grow with the definition and
+-- cannot be kept restarting by a host whose own transactions outpace a long one. A source whose
+-- materials do not fit a palette is prepared as that refusal, which the arbitration settles.
+preparePalette ∷ Service → Source → IO (Either PaletteError Palette)
+preparePalette svc source = do
+  prepared ← evaluate (probeInterning (serviceProbe svc) (internSourceMaterials source emptyPalette))
+  either (\_ → pure prepared) (\palette → prepared <$ evaluate palette) prepared
+
 -- | One step of an open.
 -- | What the storage service and the edit bank hold now (see 'PressureMark').
 pressureMark ∷ Service → STM PressureMark
@@ -512,9 +525,12 @@ stepOpen svc ops rid = do
             withOutcome (serviceStorage svc) ticket (\outcome → evaluate $! reactTo OwnerRunning JkOpen outcome) >>= \case
               Just (GotBacking backing _) → do
                 store ← evaluate (initialStore config aid ident (openStore task))
+                -- the arena's palette is interned here, before the open is staged: its commit only installs it
+                palette ← preparePalette svc (openSource task)
                 atomically (setPhase task (OpenPublishable aid env shared backing store))
+                probePoint (serviceProbe svc) (PointPrepared rid)
                 -- the open is staged: the host is told, and its commit installs the arena
-                opsStage ops rid Nothing (Revision (configFirstRevision config)) StagedControl
+                opsStage ops rid Nothing (Revision (configFirstRevision config)) (StagedOpen palette)
               Just (GotFailure handling _) → finish shared handling
               Just (GotCancelled _) → finish shared (classifyUnaskedCancel OwnerRunning)
               Just (GotMismatch why) → failOpen shared why
