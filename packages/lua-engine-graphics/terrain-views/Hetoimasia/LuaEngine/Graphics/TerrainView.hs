@@ -68,6 +68,7 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView
   , ViewPhase (..)
   , ViewReading (..)
   , readView
+  , viewDemand
 
     -- * Picking
   , PickResult (..)

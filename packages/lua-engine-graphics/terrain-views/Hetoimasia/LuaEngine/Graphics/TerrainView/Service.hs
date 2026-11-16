@@ -66,6 +66,7 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView.Service
 
     -- * Observation
   , readView
+  , viewDemand
 
     -- * Picking
   , pickView
@@ -603,6 +604,10 @@ readView (TerrainView service state) = do
       , readingWaiting = waiting
       }
 
+-- | The view's latest camera demand: its visible regions, then its prefetch. 'Nothing' before its first preparation.
+viewDemand ∷ TerrainView k → STM (Maybe ([RegionCoord], [RegionCoord]))
+viewDemand (TerrainView _ state) = readTVar (vsDemand state)
+
 -- The newest revision the host adopted for the view's target, when it is this view's world.
 adoptedRevision ∷ (Ord k, Show k) ⇒ TerrainViews k → ViewState k → STM (Maybe (Natural, WorldTag))
 adoptedRevision service state = do
@@ -908,7 +913,9 @@ prepareFor service state intent metrics = do
             if not (Set.null missing) && rounds > 1
               then pure (More missing)
               else do
-                setDemand service state visible prefetch
+                -- The camera's interests cover every region the plan was drawn from, not only what is still pending:
+                -- the regions it shows, background far from the camera included, stay protected from eviction.
+                setDemand service state (Set.toList (regions <> Set.fromList visible)) prefetch
                 atomically (writeTVar (vsPending state) (length (cellPlanPending plan)))
                 Done <$> publishPlan service state intent metrics copies plan adapted
       case step of

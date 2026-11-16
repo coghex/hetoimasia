@@ -51,7 +51,7 @@ import Hetoimasia.GPU.Vulkan.GLFW (TextureHandle (..))
 import Hetoimasia.Render.TwoD.Vulkan.Textures (toBackendHandle)
 import Hetoimasia.LuaEngine.Graphics.Texture.Port (TextureRef (..))
 import Hetoimasia.Render.TwoD.Material (MaterialRef, defaultMaterial)
-import Hetoimasia.Terrain.Coordinate (TileCoord, axisFromInteger, tileCoord)
+import Hetoimasia.Terrain.Coordinate (RegionCoord (..), TileCoord, axisFromInteger, tileCoord)
 import qualified Hetoimasia.Terrain.Render2D.Camera as Camera
 import Hetoimasia.Terrain.Render2D.AtlasFixtures (AtlasStyle, findSampleDirectory, loadAtlasStyle)
 import qualified Hetoimasia.Terrain.Render2D.AtlasFixtures as Fixtures
@@ -74,7 +74,7 @@ import Hetoimasia.Terrain.Runtime
 import qualified Hetoimasia.Terrain.Runtime as Runtime
 import Hetoimasia.Terrain.Runtime.Storage (filesystemOf, minHeadroomBytes, mkStorageConfig)
 import Hetoimasia.Terrain.Runtime.Store (StoreSpec (..), defaultStoreSpec, minAllowanceBytes)
-import Hetoimasia.Terrain.Source (LayerSpec (..), SourceSpec (..))
+import Hetoimasia.Terrain.Source (CellSpec (..), LayerSpec (..), PatchSpec (..), SourceSpec (..))
 import System.FilePath ((</>))
 
 import System.IO.Temp (withSystemTempDirectory)
@@ -450,6 +450,23 @@ lifecycle = describe "close orders and limits" $ do
       bounded (atomically (readTVar (foReleased (vOwner v)) >>= \done → unless (onlyA `Set.isSubsetOf` Set.fromList done) retry))
       closeView view
 
+  it "demands, retains and draws a lower background far outside the camera's radius but inside the projected viewport" $
+    withViewsOn pillarOverPlain testConfig {tvCellConfig = defaultCellConfig {ccDepth = 250}} $ \v → do
+      view ← attached v 1
+      _ ← awaitPublished v 1
+      Just (visible, _) ← atomically (viewDemand view)
+      -- The camera follows the pillar's top at (8, 8); the plain 100 levels below shows about two chunks behind it.
+      let anchorChunk = (0, 0)
+          outsideRadius region = abs (regionX region - fst anchorChunk) > 1 || abs (regionY region - snd anchorChunk) > 1
+          far = filter outsideRadius visible
+      far `shouldSatisfy` (not . null)
+      -- They were copied and planned: the published plan has nothing pending, which a demand bounded by the camera's
+      -- radius cannot reach (the plain in view would stay pending, as loading).
+      reading ← atomically (readView view)
+      readingPendingRegions reading `shouldBe` 0
+      readingRetainedRegions reading `shouldSatisfy` (> 0)
+      closeView view
+
   it "refuses an attachment beyond the service's views, before taking anything" $
     withViewsConfig testConfig {tvMaxViews = 1} $ \v → do
       _ ← attached v 1
@@ -521,7 +538,10 @@ withViews ∷ (Views → IO a) → IO a
 withViews = withViewsConfig testConfig
 
 withViewsConfig ∷ TerrainViewsConfig → (Views → IO a) → IO a
-withViewsConfig config body = do
+withViewsConfig = withViewsOn loamOverGranite
+
+withViewsOn ∷ SourceSpec → TerrainViewsConfig → (Views → IO a) → IO a
+withViewsOn source config body = do
   style ← loadAtlasStyle 5 [("loam", "colour.loam"), ("granite", "colour.granite")]
   sample ← findSampleDirectory
   let atlas = sample </> "content" </> "textures" </> "terrain-atlas"
@@ -540,7 +560,7 @@ withViewsConfig config body = do
         loadParent comp vm "normal" ["data", "coverage", "normal"]
         colourKey ← leaseKey comp vm "colour"
         normalKey ← leaseKey comp vm "normal"
-        withTerrain (cpAccount comp) $ \terrain client arena → do
+        withTerrain source (cpAccount comp) $ \terrain client arena → do
           claims ← newSceneClaims
           owner ← newFakeOwner model
           initial ← prepare initialGraphicsScene
@@ -688,8 +708,8 @@ terrainProfile = case validateProfile changed of
 
 -- The real service over private files in a temporary directory, its staging charged to the session's account, with one
 -- arena of loam over granite.
-withTerrain ∷ RenderAccount → (Service → Runtime.Client → ArenaLease → IO a) → IO a
-withTerrain account body =
+withTerrain ∷ SourceSpec → RenderAccount → (Service → Runtime.Client → ArenaLease → IO a) → IO a
+withTerrain source account body =
   withSystemTempDirectory "hetoimasia-terrain-views" $ \dir → do
     let directory = BC.pack dir
     name ← filesystemOf directory >>= either (\f → fail ("cannot name the test filesystem: " <> show f)) pure
@@ -702,7 +722,7 @@ withTerrain account body =
               }
       withTerrainService config (Ports alwaysAdmitting (standaloneSupervisor group) quiet noProbe (storagePort group storage directory)) $ \terrain → do
         client ← Runtime.registerClient terrain >>= either (fail . show) pure
-        arena ← openArena terrain client "views" loamOverGranite >>= either (fail . show) pure >>= await terrain >>= either (fail . show) pure
+        arena ← openArena terrain client "views" source >>= either (fail . show) pure >>= await terrain >>= either (fail . show) pure
         body terrain client arena
 
 loamOverGranite ∷ SourceSpec
@@ -714,6 +734,16 @@ loamOverGranite =
         , LayerSpec {layerMin = Just (-3), layerMax = Just 4, layerMaterial = "loam", layerShape = 0}
         ]
     , specPatches = []
+    }
+
+-- A plain of loam whose top is level -1, and one pillar of granite rising to level 99 at the camera's column: a
+-- camera following the pillar's top looks down on the plain a hundred levels below, far behind the pillar.
+pillarOverPlain ∷ SourceSpec
+pillarOverPlain =
+  SourceSpec
+    { specMaterials = ["loam", "granite"]
+    , specLayers = [LayerSpec {layerMin = Nothing, layerMax = Just 0, layerMaterial = "loam", layerShape = 0}]
+    , specPatches = [PatchSpec {patchX = 8, patchY = 8, patchMin = 0, patchMax = 100, patchValue = SpecSolid "granite" 0}]
     }
 
 quiet ∷ Logger
