@@ -12,10 +12,14 @@
 -- work, 'endpointEligible' is the host's grant, and 'endpointSettle' is the
 -- terminal delivery, run inside the arbitrating transaction so it is atomic
 -- with the commit. Do not run an ordinary IO completion after a commit and call
--- that atomic.
+-- that atomic. A host may prepare a staged answer's success ('endpointPrepare'):
+-- the owner evaluates the host's pure work on it before the answer is staged,
+-- and only the prepared settlement runs in the arbitrating transaction.
 module Hetoimasia.Terrain.Runtime.Settlement
   ( -- * The seam
     Endpoint (..)
+  , PreparedSettlement (..)
+  , preparedSettle
   , Settlement (..)
   , CancelResult (..)
   , arrivalEndpoint
@@ -60,7 +64,7 @@ import Hetoimasia.Terrain.Runtime.Store.Internal.State (StoreConfig, StoreSpec (
 arrivalEndpoint ∷ IO (Endpoint, TMVar Settlement)
 arrivalEndpoint = do
   box <- newEmptyTMVarIO
-  pure (Endpoint (pure ()) (pure True) (void . tryPutTMVar box), box)
+  pure (Endpoint (pure ()) (pure True) (void . tryPutTMVar box) Nothing, box)
 
 -- | Create a named arena with the service's own allowance ('configStore'): the request settles with the creator's lease. It is
 -- 'openArenaWithOptions' with 'defaultOpenOptions'.

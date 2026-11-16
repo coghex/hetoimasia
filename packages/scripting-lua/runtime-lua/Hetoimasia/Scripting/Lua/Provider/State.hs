@@ -77,6 +77,7 @@ module Hetoimasia.Scripting.Lua.Provider.State
   , eligibleOf
   , settleWith
   , settleWithFinal
+  , prepareReply
   , settleKeeping
   , replyTo
   , settlementFields
@@ -1568,9 +1569,20 @@ settleKeeping service ask schema identity reply = do
 -- transaction that settles the request once the owner has built the resource. A resource reply made when the request is eligible is
 -- settled at that point, never held for its tick.
 settleWithFinal ∷ ProviderState → Admission → Schema → STM (Maybe ExpectedFailure) → RequestId → ProviderReply → STM ReplyAnswer
-settleWithFinal service ask schema final identity reply = do
+settleWithFinal service ask schema final identity reply = settleChecked service final identity (checkReplyPure (psLimits service) schema ask reply)
+
+-- | 'settleWith' judged outside any transaction ('settlingPrepare'): the reply is judged when the result is evaluated, and the
+-- transaction it carries settles with that verdict exactly as 'settleWith' does. The judgement reads only the owner's limits, the
+-- schema and the admission, none of which changes.
+prepareReply ∷ ProviderState → Admission → Schema → RequestId → ProviderReply → PreparedReply
+prepareReply service ask schema identity reply =
+  PreparedReply (checkReplyPure (psLimits service) schema ask reply) (settleChecked service (pure Nothing) identity)
+
+-- | The settlement of a judged reply, in the caller's transaction: what 'settleWithFinal' decides after its judgement.
+settleChecked ∷ ProviderState → STM (Maybe ExpectedFailure) → RequestId → Checked → STM ReplyAnswer
+settleChecked service final identity verdict = do
   eligible ← eligibleOf service identity
-  case checkReplyPure (psLimits service) schema ask reply of
+  case verdict of
     checked@(CheckedDefect _) → replyTo service identity checked
     checked@(CheckedResource {}) → replyToAs service (ReplyMode False (Just final) eligible) identity checked
     checked → do
