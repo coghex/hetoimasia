@@ -61,6 +61,8 @@ module Hetoimasia.Terrain.Runtime.Internal.Core
   , safePointSTM
   , cancelRequest
   , retireRequest
+  , takeRequest
+  , TakeOutcome (..)
 
     -- * Closure
   , closeArena
@@ -77,6 +79,14 @@ module Hetoimasia.Terrain.Runtime.Internal.Core
   , acquireSnapshotSTM
   , releaseSnapshotSTM
   , DemandReceipt (..)
+
+    -- * Regional snapshots
+  , releaseRegionalSTM
+  , releaseRegionBorrowSTM
+  , releaseOrphanedSTM
+  , releaseAllOrphansSTM
+  , regionalCharge
+  , isRegionalReq
 
     -- * Invariants
   , invariants
@@ -100,7 +110,7 @@ import Control.Exception (SomeException)
 import Control.Monad (forM_, unless, when, void)
 import qualified Data.Map.Strict as Map
 import Data.Int (Int64)
-import Data.Maybe (fromMaybe, isJust)
+import Data.Maybe (fromMaybe, isJust, isNothing)
 import qualified Data.Sequence as Seq
 import qualified Data.Set as Set
 import Data.Text (Text)
@@ -122,6 +132,7 @@ import Hetoimasia.Terrain.Resident (ResidentStats (..), columnIndexBytes, discar
 import Hetoimasia.Terrain.Segment (maxSegmentLevels)
 import Hetoimasia.Terrain.Runtime.Internal.Types
 import Hetoimasia.Terrain.Runtime.Backed.Fault (StorageFault)
+import Hetoimasia.Terrain.Runtime.Backed.RegionCopy (regionReservation)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Model (Condition (..), GrowthDecision (..), conditions, proposeGrowth)
 import Hetoimasia.Terrain.Runtime.Store.Internal.State (StoreConfig)
 import Hetoimasia.Terrain.Source (Source, SourceError)
@@ -276,6 +287,8 @@ data Submission
     SubGrow !ArenaLease !Integer
   | -- | The creator's explicit retry of a paused arena.
     SubRetry !ArenaLease
+  | -- | A regional snapshot of some regions (#690).
+    SubRegions !ArenaLease ![RegionCoord]
 
 -- | Whether slot work of this kind may go on (or publish) in the arena as it is: anything while it
 -- is not paused; while it is, a growth or a release (they clear capacity), and reclamation unless
@@ -355,6 +368,7 @@ commandRanges limits source surfaceWindow = \case
        in [(column, lo, hi)]
   CRemove (TileCoord x y z) _ → [(Column x y, axisValue z - 1, axisValue z + 2)]
   CKnowledge _ → []
+  CRegions {} → []
   COpen {} → []
   CAttach {} → []
   CGrow {} → []
@@ -452,7 +466,7 @@ resultRecordBytes = 160
 -- | Bytes the retained bank holds: outstanding snapshots' backing and untaken
 -- results.
 retainedBankUse ∷ St → Word64
-retainedBankUse st = sum (Map.elems (stateSnapshots st)) + resultRecordBytes * fromIntegral (retainedRecords st)
+retainedBankUse st = sum (Map.elems (stateSnapshots st)) + sum (map regionalCharge (Map.elems (stateRegional st))) + resultRecordBytes * fromIntegral (retainedRecords st)
 
 -- | The records the service itself holds for a request, each charged
 -- 'resultRecordBytes' in the retained bank from admission to take, discard or
@@ -466,7 +480,7 @@ retainedRecords = countReqs (\req → not (isDone req && reqModel req))
 -- | Command slots the service holds for requests the model has no record of: a
 -- settled result not yet taken, and a pending open or attach.
 slotsHeldHere ∷ St → Int
-slotsHeldHere st = retainedResults st + pendingAcquisitions st + countReqs waitingReadmission st + countReqs (\req → isCreatorCommand req && not (isDone req)) st
+slotsHeldHere st = retainedResults st + pendingAcquisitions st + countReqs waitingReadmission st + countReqs (\req → (isCreatorCommand req || isRegionalReq req) && not (isDone req)) st
 
 -- | Opens and attaches admitted and not yet settled. A settled one holds no
 -- acquisition: it either made its arena and lease (and left the table) or failed
@@ -519,7 +533,7 @@ limitRows config st =
   , LimitRow "views" (w (configMaxViews config)) (w (Map.size (stateViews st))) (sum [w (Set.size (clientViews c)) | c ← Map.elems (stateClients st)])
   , LimitRow "clients" (w (configMaxClients config)) (w (Map.size (stateClients st))) (w (length (Map.keys (stateClients st))))
   , LimitRow "command slots" slotLimit (fromIntegral (R.slotInUse model R.CommandSlot) + w (slotsHeldHere st)) (w (length [() | req ← requestsAndGhosts, reqModel req]) + sum (map slotOf requestsAndGhosts))
-  , LimitRow "retained bank" (configRetainedBytes config) (retainedBankUse st) (sum [bytes | (_, bytes) ← Map.elems (rwHolds (stateWork st))] + sum (map recordOf requestsAndGhosts))
+  , LimitRow "retained bank" (configRetainedBytes config) (retainedBankUse st) (sum [bytes | (_, bytes) ← Map.elems (rwHolds (stateWork st))] + sum [bytes | (_, bytes) ← Map.elems (rwRegional (stateWork st))] + sum (map recordOf requestsAndGhosts))
   ]
   where
     model = stateModel st
@@ -533,6 +547,7 @@ limitRows config st =
       | isDone req = if reqModel req then 0 else 1
       | isAcquisition req = 1
       | isCreatorCommand req = 1
+      | isRegionalReq req = 1
       | waitingReadmission req = 1
       | otherwise = 0
     recordOf req = if isDone req && reqModel req then 0 else resultRecordBytes
@@ -560,6 +575,9 @@ waitingReadmission req = case (reqCmd req, reqPhase req) of
   (CAttach {}, _) → False
   (CGrow {}, _) → False
   (CRetry, _) → False
+  -- a regional snapshot is never admitted again: its slot is counted once, as a pending regional request
+  -- ('slotsHeldHere'), from its admission to its settlement
+  (CRegions {}, _) → False
   (_, Waiting) → not (reqModel req)
   _ → False
 
@@ -635,6 +653,35 @@ decide svc st rid = \case
       GrowthNotIncreased → creatorCommand lease (CGrow (fromInteger bytes))
       GrowthProposed _ → creatorCommand lease (CGrow (fromInteger bytes))
   SubRetry lease → creatorCommand lease CRetry
+  -- A REGIONAL SNAPSHOT is admitted or refused at once and never blocks: an invalid set is refused before
+  -- anything is reserved; then the request's slot and record, and the reservation of everything its
+  -- result can hold, in the retained bank; then the model's copied borrow of its regions (a hold that
+  -- needs none of them resident). All of it is charged from here until the borrow's release.
+  SubRegions lease regions → case liveArena lease of
+    Left short → pure (Left short)
+    Right (lid, ls, aid, _) → case regionsInvalid regions of
+      Just why → pure (Left (ShortRefused (RefusedInvalid why)))
+      Nothing → case allocate (stateNextHold st) of
+        Left refused → pure (Left (ShortRefused refused))
+        Right hid → case capacityRefusal config st True of
+          Just refusal → pure (Left (busyWhy refusal))
+          Nothing
+            | retainedBankUse st + resultRecordBytes + reservation > configRetainedBytes config →
+                pure (Left (ShortRefused (RefusedBusy BusyRetained)))
+            | otherwise →
+                applyEvent svc (R.AcquireHold (HoldId hid) aid R.Copied regions) >>= \case
+                  Left refusal → pure (Left (busyWhy refusal))
+                  Right _ → do
+                    modifySt svc $ \cur →
+                      cur
+                        { stateNextHold = hid + 1
+                        , stateBorrowers = stateBorrowers cur + 1
+                        , stateRegional = Map.insert (HoldId hid) (RegionalRec aid (length regions) reservation Nothing (OwnedByRequest rid)) (stateRegional cur)
+                        , stateWork = (stateWork cur) {rwRegional = Map.insert (HoldId hid) (fromIntegral (length regions), reservation) (rwRegional (stateWork cur))}
+                        }
+                    pure (Right (Insertion (CRegions regions (HoldId hid)) (Just lid) (leaseClient ls) (Just aid) False [] Nothing))
+      where
+        reservation = regionReservation (length regions)
   SubRemove lease tile precondition → case liveArena lease of
     Left short → pure (Left short)
     Right (lid, ls, aid, arena)
@@ -653,6 +700,22 @@ decide svc st rid = \case
             Right _ → Right (Insertion cmd (Just lid) (leaseClient ls) (Just aid) True [tileDemand tile] Nothing)
   where
     config = serviceConfig svc
+    -- Whether a region set can never be a snapshot: decided before any region is enumerated beyond the
+    -- hold's cap, from the request and the configuration alone.
+    regionsInvalid regions
+      | null regions = Just "a regional snapshot names no region"
+      | length (take (fromIntegral cap + 1) regions) > fromIntegral cap = Just "a regional snapshot names more regions than a hold may"
+      | Set.size (Set.fromList regions) /= length regions = Just "a regional snapshot names a region twice"
+      | not (all wholeRegion regions) = Just "a regional snapshot names a region outside the supported coordinates"
+      -- a copy covers whole regions, and a request naming a cell outside the configured extent is invalid
+      -- from every state ('R.limitExtent'): under an extent smaller than a region, every region set is
+      | R.limitExtent (R.modelLimits (stateModel st)) /= (16, 16, 32) = Just "a regional snapshot covers whole regions, beyond the configured extent"
+      | otherwise = Nothing
+      where
+        cap = R.limitHoldRegions (R.modelLimits (stateModel st))
+        wholeRegion region = case (mkLocalCoord 0 0 0, mkLocalCoord 15 15 31) of
+          (Right low, Right high) → either (const False) (const True) (composeTile region low) && either (const False) (const True) (composeTile region high)
+          _ → False
     -- A settled result that has not been taken occupies a command slot until it is
     -- (a removal's result no longer has a model record, so it is counted here):
     -- admission is busy once accepted commands and untaken results fill the slots.
@@ -721,7 +784,82 @@ releaseReq svc rid req = do
           _ → stateNames st
       }
   when (reqModel req) (withdrawRecord svc rid req)
+  case reqCmd req of
+    CRegions _ hid → regionalRequestEnded svc rid hid
+    _ → pure ()
   markFreed svc
+
+-- | A regional snapshot's request has left the table. A borrow its request still owns (pending, or a
+-- result nobody took) is the service's to release: now, or, while its build still holds what it read or
+-- the owner is turning its copies into a snapshot, at the owner's safe point (the build drained, the
+-- delivery ended). A borrow its holder took is the holder's, and nothing here releases it.
+regionalRequestEnded ∷ Service → RequestId → HoldId → STM ()
+regionalRequestEnded svc rid hid = do
+  st <- readSt svc
+  forM_ (Map.lookup hid (stateRegional st)) $ \rec → case regionalOwner rec of
+    OwnedByRequest owner
+      | owner == rid →
+          if Map.member (GatherRequest rid) (stateGathers st) || Set.member rid (stateDelivering st)
+            then modifySt svc (\s → s {stateRegional = Map.insert hid rec {regionalOwner = Orphaned rid} (stateRegional s)})
+            else releaseRegionalSTM svc hid
+    _ → pure ()
+
+-- | Release a regional borrow: its model hold, its charge in the retained bank and its count among the
+-- borrowers. The one place a regional borrow is released; whoever finds it owes its release calls it,
+-- and a borrow already released is not found, so each is released exactly once.
+releaseRegionalSTM ∷ Service → HoldId → STM ()
+releaseRegionalSTM svc hid = do
+  st <- readSt svc
+  forM_ (Map.lookup hid (stateRegional st)) $ \_ → do
+    applyEvent svc (R.ReleaseHold hid) >>= \case
+      Right _ → pure ()
+      Left refusal → recordDefect svc (AccountingDefect (Text.pack ("a regional borrow's hold was refused its release: " <> show refusal)))
+    modifySt svc $ \s →
+      s
+        { stateRegional = Map.delete hid (stateRegional s)
+        , stateBorrowers = stateBorrowers s - 1
+        , stateWork = (stateWork s) {rwRegional = Map.delete hid (rwRegional (stateWork s))}
+        }
+    markFreed svc
+
+-- | The holder's release of a regional borrow. Idempotent: a borrow already released, or another
+-- service's, is left alone. A result its holder has not taken yet (a host that read the settlement
+-- and releases it at once) is taken and released in the same transaction.
+releaseRegionBorrowSTM ∷ Service → RegionBorrow → STM ()
+releaseRegionBorrowSTM svc (RegionBorrow tag hid _)
+  | tag /= serviceTag svc = pure ()
+  | otherwise = do
+      st <- readSt svc
+      forM_ (Map.lookup hid (stateRegional st)) $ \rec → case regionalOwner rec of
+        OwnedByHolder → releaseRegionalSTM svc hid
+        OwnedByRequest rid
+          | Just req ← Map.lookup rid (stateRequests st)
+          , isDone req →
+              releaseReq svc rid req
+        _ → pure ()
+
+-- | A request's build has drained, or its delivery ended: a borrow whose request ended while either ran
+-- is released now.
+releaseOrphanedSTM ∷ Service → RequestId → STM ()
+releaseOrphanedSTM svc rid = do
+  st <- readSt svc
+  forM_ [hid | (hid, rec) ← Map.toList (stateRegional st), regionalOwner rec == Orphaned rid] (releaseRegionalSTM svc)
+
+-- | Every borrow whose request ended while its build ran, once the owner has forgotten its builds (its
+-- terminal step).
+releaseAllOrphansSTM ∷ Service → STM ()
+releaseAllOrphansSTM svc = do
+  st <- readSt svc
+  forM_ [hid | (hid, rec) ← Map.toList (stateRegional st), Orphaned _ ← [regionalOwner rec]] (releaseRegionalSTM svc)
+
+-- | What a regional borrow is charged in the retained bank: its reservation while it is built, then
+-- its snapshot's exact footprint.
+regionalCharge ∷ RegionalRec → Word64
+regionalCharge rec = fromMaybe (regionalReserved rec) (regionalFootprint rec)
+
+-- | A regional snapshot's request.
+isRegionalReq ∷ Req → Bool
+isRegionalReq req = case reqCmd req of CRegions {} → True; _ → False
 
 -- | THE ONLY PLACE a request's model record, and every credit it owns, is given back
 -- (R1). While the owner is running that request's preparation, which computes with
@@ -858,13 +996,48 @@ cancelRequest svc (Request tag rid)
         Just req | not (isDone req) → terminateWith False svc rid Cancelled >> pure CancelWon
         _ → pure AlreadySettled
 
--- | Retire a settled request's accepted result: its credits return.
+-- | Retire a settled request's accepted result: its credits return. A regional snapshot nobody took is
+-- the service's, and is released with it.
 retireRequest ∷ Service → Request → STM ()
+
 retireRequest svc (Request tag rid)
   | tag /= serviceTag svc = pure ()
   | otherwise = do
       st <- readSt svc
       forM_ (Map.lookup rid (stateRequests st)) $ \req → when (isDone req) (releaseReq svc rid req)
+
+-- | What a take handed over.
+data TakeOutcome
+  = -- | The request was settled and still the service's: its result is retired, and what it hands over (a
+    -- regional snapshot's borrow) is the taker's from this transaction on.
+    Taken
+  | -- | Nothing was handed over: the request is not settled, or no longer the service's (taken already,
+    -- retired, or released with its lease, its client, its arena or the service).
+    TakeReleased
+  deriving stock (Eq, Show)
+
+-- | Retire a settled request's accepted result and take what it hands over, checking in this one
+-- transaction that the request still owns it: a regional snapshot's borrow moves from the service to the
+-- holder only while the request owns it, and from then on only the holder releases it (no retirement,
+-- client end or closure can release it behind the holder). A borrow already released is never handed
+-- over ('TakeReleased'). For any other settled result it is 'retireRequest' and answers 'Taken'.
+takeRequest ∷ Service → Request → STM TakeOutcome
+takeRequest svc (Request tag rid)
+  | tag /= serviceTag svc = pure TakeReleased
+  | otherwise = do
+      st <- readSt svc
+      case Map.lookup rid (stateRequests st) of
+        Just req | isDone req → do
+          outcome <- case reqCmd req of
+            CRegions _ hid → case Map.lookup hid (stateRegional st) of
+              Just r | regionalOwner r == OwnedByRequest rid → do
+                modifySt svc (\s → s {stateRegional = Map.insert hid r {regionalOwner = OwnedByHolder} (stateRegional s)})
+                pure Taken
+              _ → pure TakeReleased
+            _ → pure Taken
+          releaseReq svc rid req
+          pure outcome
+        _ → pure TakeReleased
 
 -- ---------------------------------------------------------------------------
 -- Closure
@@ -1165,11 +1338,26 @@ invariants config st =
     <> [ "borrowers " <> show (stateBorrowers st) <> " but the model holds " <> show borrows
        | stateBorrowers st /= borrows
        ]
+    <> [ "regional ledger " <> show (Map.keys (stateRegional st)) <> " disagrees with the model's copied borrows"
+       | Set.fromList (Map.keys (stateRegional st)) /= Set.fromList [h | (h, _, R.Copied, _) <- R.modelHolds model]
+       ]
+    <> [ "regional borrow " <> show hid <> " is charged its footprint " <> show fp <> " beyond its reservation " <> show (regionalReserved rec)
+       | (hid, rec) <- Map.toList (stateRegional st)
+       , Just fp <- [regionalFootprint rec]
+       , fp > regionalReserved rec
+       ]
+    <> [ "regional borrow " <> show hid <> " names a request that does not hold it: " <> show (regionalOwner rec)
+       | (hid, rec) <- Map.toList (stateRegional st)
+       , case regionalOwner rec of
+           OwnedByRequest rid → maybe True (\req → case reqCmd req of CRegions _ h → h /= hid; _ → True) (Map.lookup rid (stateRequests st))
+           Orphaned rid → Map.member rid (stateRequests st) || not (Map.member (GatherRequest rid) (stateGathers st) || Set.member rid (stateDelivering st))
+           OwnedByHolder → isNothing (regionalFootprint rec)
+       ]
   where
     snapshotBank = configRetainedBytes config
     model = stateModel st
     modelIds = [R.requestId info | info <- R.modelRequests model]
-    borrows = length [() | (_, _, R.Borrow, _) <- R.modelHolds model]
+    borrows = length [() | (_, _, kind, _) <- R.modelHolds model, kind == R.Borrow || kind == R.Copied]
 
 -- | THE charge of what a compiled arena keeps for its life in the compile account (owner decision
 -- 2026-11-13, option B): its compiled connectivity's result bytes and #661's ordered member index

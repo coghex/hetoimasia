@@ -41,6 +41,8 @@ import qualified Test.TerrainRuntime.Offload as Offload
 import qualified Test.TerrainRuntime.Opacity as Opacity
 import qualified Test.TerrainRuntime.Oracle as Oracle
 import qualified Test.TerrainRuntime.Races as Races
+import qualified Test.TerrainRuntime.Preparation as Preparation
+import qualified Test.TerrainRuntime.Regional as Regional
 import qualified Test.TerrainRuntime.Revalidation as Revalidation
 import qualified Test.TerrainRuntime.Storage.Classes as StorageClasses
 import qualified Test.TerrainRuntime.Storage.Growth as StorageGrowth
@@ -107,6 +109,7 @@ entries =
   , Entry "Budgets" (Concurrent "concurrent admissions and credits on owned threads") Budgets.spec
   , Entry "Offload" (Concurrent "the service across repeated eviction and reload") Offload.spec
   , Entry "Revalidation" (Concurrent "staged work revalidated by the owner after a committed edit") Revalidation.spec
+  , Entry "Preparation" (Concurrent "an open's palette and an answer's settlement prepared on the owner before staging, and the arbitration's races around it, ordered by eligibility and gates") Preparation.spec
   , Entry "Opacity" (Alone "compiles an external client with ghc; measures and races nothing") Opacity.spec
   , Entry "Lifecycle" (Concurrent "startup, body cancellation and an unexpected owner exit, on owned threads") Lifecycle.spec
   , Entry "Hardening" (Concurrent "forged and released authority, and closure under load, on owned threads and gates") Hardening.spec
@@ -137,6 +140,7 @@ entries =
   , Entry "Backed.Service" (Concurrent "the backed service end to end: owner, workers and gates") BackedService.spec
   , Entry "Backed.Sweep" (Concurrent "a physical-truth sweep after every step of a removal, on the service") BackedSweep.spec
   , Entry "Backed.Txn" (Concurrent "the session's one mutating transaction, on the service") BackedTxn.spec
+  , Entry "Regional" (Concurrent "regional snapshots admitted, built, settled, taken and delivered through the owner and the workers, ordered by gates; its retention examples walk a build's own value, not the process's heap") Regional.spec
   , Entry "Store.Keys" (Alone pureStore) StoreKeys.spec
   , Entry "Store.Memory" (Alone measures) StoreMemory.spec
   , Entry "Store.Depth" (Alone measures) StoreDepth.spec

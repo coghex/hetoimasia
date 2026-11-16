@@ -36,6 +36,7 @@ module Hetoimasia.Terrain.Runtime.Internal.Backed
   , stepOpen
   , openOrderAllows
   , openReady
+  , preparePalette
 
     -- * Gathers
   , Gathered (..)
@@ -80,7 +81,7 @@ module Hetoimasia.Terrain.Runtime.Internal.Backed
   ) where
 
 import Control.Concurrent.STM
-import Control.Exception (Exception, evaluate, uninterruptibleMask_)
+import Control.Exception (Exception, evaluate, finally, uninterruptibleMask_)
 import Control.Monad (foldM, forM_, void, when)
 import Data.Int (Int64)
 import Data.List (sortOn)
@@ -95,7 +96,7 @@ import Hetoimasia.Terrain.Changes (ChangeLimits (..), Changes, changeColumnBytes
 import qualified Hetoimasia.Terrain.Query as Q
 import Hetoimasia.Terrain.Segment (maxSegmentLevels)
 import qualified Hetoimasia.Terrain.Connectivity as C
-import Hetoimasia.Terrain.Coordinate (TileCoord)
+import Hetoimasia.Terrain.Coordinate (RegionCoord, TileCoord)
 import qualified Hetoimasia.Terrain.Discovery as D
 import qualified Hetoimasia.Terrain.Residency as R
 import Hetoimasia.Terrain.Residency (ArenaId (..), RequestId, Revision (..))
@@ -104,10 +105,13 @@ import Hetoimasia.Terrain.Runtime.Backed.Fault
 import Hetoimasia.Terrain.Runtime.Backed.Gather
 import Hetoimasia.Terrain.Runtime.Backed.Query
 import Hetoimasia.Terrain.Runtime.Backed.Probe
+import Hetoimasia.Terrain.Runtime.Backed.RegionCopy (RegionCopy)
+import Hetoimasia.Terrain.Runtime.Backed.Regional (BProgress (..), buildDraining, buildRegionsDone, cancelBuild, endBuild, startBuild, stepBuild)
 import qualified Hetoimasia.Terrain.Runtime.Backed.Growth as Growth
 import Hetoimasia.Terrain.Runtime.Backed.Txn (Done (..), Io (..), Progress (..))
 import qualified Hetoimasia.Terrain.Runtime.Backed.Txn as Txn
 import qualified Hetoimasia.Terrain.Runtime.Backed.WriteProbe as WriteProbe
+import Hetoimasia.Terrain.Palette (Palette, PaletteError, emptyPalette, internSourceMaterials)
 import Hetoimasia.Terrain.Runtime.Internal.Content (Prepared (..))
 import Hetoimasia.Terrain.Runtime.Internal.Core
 import Hetoimasia.Terrain.Runtime.Internal.Types hiding (OwnerPhase (..))
@@ -364,6 +368,17 @@ openReady st rid = case openPhase <$> Map.lookup rid (stateOpens st) of
   Just (OpenPublishable aid env shared backing store) → Just (aid, env, shared, backing, store)
   _ → Nothing
 
+-- | AN OPEN'S PALETTE IS PREPARED OUTSIDE EVERY TRANSACTION: the source's materials interned in
+-- authored order, fully evaluated (a palette's fields are strict maps, so its weak head normal form is
+-- the whole palette) on the owner, before the open is staged. The chooser and the arbitration read the
+-- prepared value and intern nothing, so the commit's transaction does not grow with the definition and
+-- cannot be kept restarting by a host whose own transactions outpace a long one. A source whose
+-- materials do not fit a palette is prepared as that refusal, which the arbitration settles.
+preparePalette ∷ Service → Source → IO (Either PaletteError Palette)
+preparePalette svc source = do
+  prepared ← evaluate (probeInterning (serviceProbe svc) (internSourceMaterials source emptyPalette))
+  either (\_ → pure prepared) (\palette → prepared <$ evaluate palette) prepared
+
 -- | One step of an open.
 -- | What the storage service and the edit bank hold now (see 'PressureMark').
 pressureMark ∷ Service → STM PressureMark
@@ -510,9 +525,12 @@ stepOpen svc ops rid = do
             withOutcome (serviceStorage svc) ticket (\outcome → evaluate $! reactTo OwnerRunning JkOpen outcome) >>= \case
               Just (GotBacking backing _) → do
                 store ← evaluate (initialStore config aid ident (openStore task))
+                -- the arena's palette is interned here, before the open is staged: its commit only installs it
+                palette ← preparePalette svc (openSource task)
                 atomically (setPhase task (OpenPublishable aid env shared backing store))
+                probePoint (serviceProbe svc) (PointPrepared rid)
                 -- the open is staged: the host is told, and its commit installs the arena
-                opsStage ops rid Nothing (Revision (configFirstRevision config)) StagedControl
+                opsStage ops rid Nothing (Revision (configFirstRevision config)) (StagedOpen palette)
               Just (GotFailure handling _) → finish shared handling
               Just (GotCancelled _) → finish shared (classifyUnaskedCancel OwnerRunning)
               Just (GotMismatch why) → failOpen shared why
@@ -588,6 +606,9 @@ data Gathered
     GatheredKnowledge !D.CellKnowledge !Revision !Revision
   | -- | A retry's probe: the conditions it was for, and whether every recorded page read back as it must.
     GatheredProbe ![Condition] !Bool !CreatorBasis
+  | -- | A regional snapshot's copied regions, read from one committed version, with that version's content
+    -- and knowledge revisions and the residency generation read when it was pinned.
+    GatheredRegions ![(RegionCoord, RegionCopy)] !Revision !Revision !Word64
   | GatheredFailed !Handling
   | -- | Cancelled and drained: nothing to deliver.
     GatheredNothing
@@ -609,6 +630,8 @@ data ReadWhat
   | ReadKnowledge !TileCoord
   | -- | a retry's probe, with the allowance and growth state its preparation read
     ReadPages ![(PageNo, ReadMode)] ![Condition] !CreatorBasis
+  | -- | a regional snapshot's build of these regions
+    ReadRegions ![RegionCoord]
 
 startGatherFor ∷ Service → GatherFor → ArenaId → ReadWhat → STM Bool
 startGatherFor svc key aid what = do
@@ -622,7 +645,7 @@ startGatherFor svc key aid what = do
       , Right (store', run) ← begin arena → do
           sameCommittedSTM aid st store'
           writeTVar (serviceEditBank svc) adm'
-          writeTVar (serviceState svc) (putStore aid store' st) {stateGathers = Map.insert key (GatherTask aid run grant (arenaRevision arena) (D.authKnowledge (arenaAuthority arena)) WakeNow) (stateGathers st)}
+          writeTVar (serviceState svc) (putStore aid store' st) {stateGathers = Map.insert key (GatherTask aid run grant (arenaRevision arena) (D.authKnowledge (arenaAuthority arena)) (arenaGeneration arena) WakeNow) (stateGathers st)}
           pure True
     _ → pure False
   where
@@ -630,6 +653,9 @@ startGatherFor svc key aid what = do
       ReadRuns columns cap → fmap RunsRead <$> startGatherCapped (keptPinLimit cap (length columns)) cap (arenaStore arena) columns
       ReadKnowledge tile → fmap KnowledgeRead <$> startQuery (arenaStore arena) (\provider → D.queryCell (arenaEnv arena) provider tile)
       ReadPages pages conds basis → Right (arenaStore arena, ProbeRead (startProbe pages) conds basis)
+      -- ONE ROOT: the build's pin, and the revisions and the generation its snapshot is labelled with, are
+      -- taken in this one transaction
+      ReadRegions regions → fmap RegionalRead <$> startBuild (arenaStore arena) (arenaEnv arena) regions
 
 -- | WHAT A READ KEEPS IS CONTAINED IN ITS PIN CREDIT: a gather that may keep @cap@ runs of @columns@
 -- columns pins at most the reader's pin credit less those runs' bytes (by "Hetoimasia.Terrain.Changes"'s
@@ -702,6 +728,30 @@ stepGatherTask svc key deliver = do
                   | otherwise → Right (GatheredFailed handling)
                 PDrained → Right GatheredNothing
             )
+        RegionalRead b → do
+          case key of
+            GatherRequest rid | wanted, not (buildDraining b) → probePoint (serviceProbe svc) (PointRegionStep rid (buildRegionsDone b))
+            _ → pure ()
+          (b', p) ← if wanted then stepBuild io closing store b else cancelBuild io b
+          progress ← case p of
+            BMore → pure (Left WakeNow)
+            -- a page the build could not read: its parts are unavailable, and the arena records the failure
+            -- exactly as any failed read's (a pause for its cause); the build goes on
+            BNoted handling → do
+              case handling of
+                HandlePause condition fault → atomically (pauseArena svc aid condition fault)
+                _ → pure ()
+              pure (Left WakeNow)
+            BBlocked wait → pure (Left (WakeOn wait))
+            -- temporary pressure keeps the build; its interrupted read starts again once what the storage
+            -- service and the edit bank hold has changed
+            BPressed _ → do
+              mark ← atomically (notePressure svc >> stateStoragePressure <$> readSt svc)
+              pure (Left (WakeOn (maybe (pure ()) (pressureChanged svc) mark)))
+            BDone copies → pure (Right (GatheredRegions copies (gatherRevision task) (gatherKnowledge task) (gatherGeneration task)))
+            BFailed handling → pure (Right (GatheredFailed handling))
+            BDrained → pure (Right GatheredNothing)
+          pure (RegionalRead b', progress)
         KnowledgeRead q → do
           (q', p) ← if wanted then stepQuery io closing store q else cancelQuery io q
           pure
@@ -716,15 +766,31 @@ stepGatherTask svc key deliver = do
       case progress of
         Left wake → atomically (modifySt svc (\s → s {stateGathers = Map.adjust (\t → t {gatherRun = run, gatherWake = wake}) key (stateGathers s)}))
         Right result → do
+          -- a build's copies stay the request's until their delivery ends: the owner still holds and computes
+          -- with them while it builds the snapshot, so a request that ends meanwhile leaves its borrow charged
+          -- until then
+          let delivering = case (key, result) of
+                (GatherRequest rid, GatheredRegions {}) → Just rid
+                _ → Nothing
           atomically $ do
             s ← readSt svc
             forM_ (storeOfArena s aid) $ \(current, _) → do
               sameCommittedSTM aid s (release' current run)
               writeTVar (serviceState svc) (putStore aid (release' current run) s) {stateGathers = Map.delete key (stateGathers s)}
             modifyTVar' (serviceEditBank svc) (releaseCredit (gatherGrant task))
+            -- a regional borrow whose request ended while this build ran is released now it has drained, or
+            -- once its delivery ends
+            case (key, delivering) of
+              (_, Just rid) → modifySt svc (\s' → s' {stateDelivering = Set.insert rid (stateDelivering s')})
+              (GatherRequest rid, Nothing) → releaseOrphanedSTM svc rid
+              (GatherJob _, Nothing) → pure ()
             markFreed svc
-          deliver result
+          deliver result `finally` forM_ delivering (\rid → atomically (endDelivery rid))
   where
+    endDelivery rid = do
+      modifySt svc (\s → s {stateDelivering = Set.delete rid (stateDelivering s)})
+      releaseOrphanedSTM svc rid
+      markFreed svc
     persists conds = \case
       HandlePause c _ → c `elem` conds
       HandlePausedFor c → c `elem` conds
@@ -732,6 +798,7 @@ stepGatherTask svc key deliver = do
     release' current = \case
       RunsRead g → endGather current g
       KnowledgeRead q → endQuery current q
+      RegionalRead b → endBuild current b
       ProbeRead {} → current
     ownerAlive st = case key of
       GatherRequest rid → Map.member rid (stateRequests st)

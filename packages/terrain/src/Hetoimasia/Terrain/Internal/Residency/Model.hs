@@ -96,6 +96,11 @@ data HoldKind
     Borrow
   | -- | A pinned CPU view revision or reserved publication dependency of a view.
     Pin !ViewId
+  | -- | A borrow of data copied out of the arena's store (a regional snapshot): it
+    -- holds the arena incarnation and charges its hold records, but it holds no
+    -- residency. Its regions need not be resident, it never protects resident detail
+    -- from eviction and it never touches recency.
+    Copied
   deriving stock (Eq, Ord, Show)
 
 -- | A bounded demand: part of one region.
@@ -990,7 +995,7 @@ fundByEviction m explicit exclude parts shortfall =
             )
         )
   where
-    held = Set.fromList [(hdArena h, r) | h ← Map.elems (mHolds m), r ← hdRegions h]
+    held = heldKeys m
     jobKeys = Set.fromList [(jbArena j, jbRegion j) | j ← Map.elems (mJobs m)]
     candidates =
       map (\(k, _, b) → (k, b)) . sortOn (\(k, u, _) → (u, k)) $
@@ -1369,7 +1374,12 @@ commitRemoval m rid newRev actual growth = do
 
 -- | The regions any hold protects.
 heldKeys ∷ Model → Set RegionKey
-heldKeys m = Set.fromList [(hdArena h, r) | h ← Map.elems (mHolds m), r ← hdRegions h]
+heldKeys m = Set.fromList [(hdArena h, r) | h ← Map.elems (mHolds m), protects h, r ← hdRegions h]
+
+-- | Whether a hold protects its regions' resident detail: every kind but a copied
+-- borrow, which holds none.
+protects ∷ Hold → Bool
+protects h = hdKind h /= Copied
 
 -- ---------------------------------------------------------------------------
 -- The charge function
@@ -1481,12 +1491,22 @@ acquireHold m h a kind regions = do
   case [r | (r, n) ← Map.toList (Map.fromListWith (+) [(r', 1 ∷ Int) | r' ← regions]), n > 1] of
     (r : _) → Left (Invalid (DuplicateRegion r))
     [] → Right ()
-  mapM_
-    ( \r → case Map.lookup (a, r) (mTargets m) of
-        Just Target {tgResident = Just res} | not (rsEvicting res) → Right ()
-        _ → Left (Stale (NotResident r))
-    )
-    regions
+  case kind of
+    -- A copied borrow names whole regions of supported tiles and needs none of them
+    -- resident: its data is copied out of the store, not borrowed from residency. No
+    -- extent is checked here: the terrain service refuses a regional snapshot under an
+    -- extent smaller than a region before it takes the hold.
+    Copied →
+      case filter (not . supportedRegion) regions of
+        (r : _) → Left (Invalid (UnsupportedRegion r))
+        [] → Right ()
+    _ →
+      mapM_
+        ( \r → case Map.lookup (a, r) (mTargets m) of
+            Just Target {tgResident = Just res} | not (rsEvicting res) → Right ()
+            _ → Left (Stale (NotResident r))
+        )
+        regions
   -- A hold is bounded by a static region cap, a typed refusal when exceeded; its
   -- records and the bytes it pins draw on what camera work may use, never on the
   -- headroom kept for explicit requests.
@@ -1500,7 +1520,8 @@ acquireHold m h a kind regions = do
   -- A held region can grow while it is pinned, so it is charged at its stored maximum
   -- from the moment it is held, together with the camera's jobs in flight: pins can
   -- never take the room an explicit request may need, however they are re-acquired.
-  case [v | v@(CameraResidentOverShare _ _) ← admissionCheck mHeld] of
+  -- A copied borrow pins no resident detail, so this does not apply to it.
+  case [v | protects held', v@(CameraResidentOverShare _ _) ← admissionCheck mHeld] of
     (CameraResidentOverShare used cap : _) → Left (Busy (BankFull ResidentBank cap before (used - min used before)))
     _ → Right ()
   case kind of
@@ -1509,11 +1530,13 @@ acquireHold m h a kind regions = do
           used = viewPins m v
       if used + 1 > total then Left (Busy (SlotFull ViewPinSlot total used 1)) else Right ()
     Borrow → Right ()
+    Copied → Right ()
   if bytes > cameraFree m then Left (Busy (BankFull StagingBank (ledgerLimit staging) (ledgerOccupied staging + ledgerReserved staging) bytes)) else Right ()
+  -- A copied borrow never touches recency: it uses no resident detail.
   let touch key mm = case Map.lookup key (mTargets mm) of
         Just t@Target {tgResident = Just r} → mm {mTargets = Map.insert key t {tgResident = Just r {rsLastUse = mClock mm}} (mTargets mm)}
         _ → mm
-      m1 = foldr (\r → touch (a, r)) m regions
+      m1 = if protects held' then foldr (\r → touch (a, r)) m regions else m
   Right (m1 {mHolds = Map.insert h (Hold a kind regions) (mHolds m1)}, HoldAcquired)
 
 beginHandoff ∷ Model → ArenaId → RegionCoord → Word64 → Run
@@ -1580,7 +1603,7 @@ modelInvariants m =
       | (k@(a, r), Target (Just res) interests) ← Map.toList (mTargets m)
       , rsEvicting res
       , not (Map.null interests) || isJust (rsHandoff res) || rsDirty res
-          || any (\h → hdArena h == a && r `elem` hdRegions h) (Map.elems (mHolds m))
+          || any (\h → protects h && hdArena h == a && r `elem` hdRegions h) (Map.elems (mHolds m))
           || any (\j → jbArena j == a && jbRegion j == r) (Map.elems (mJobs m))
       ]
     , ["handoff pending on a clean region " <> show k | (k, Target (Just res) _) ← Map.toList (mTargets m), isJust (rsHandoff res), not (rsDirty res)]
@@ -1597,6 +1620,7 @@ modelInvariants m =
     , ["hold " <> show h <> " has no arena" | (h, x) ← Map.toList (mHolds m), not (Map.member (hdArena x) (mArenas m))]
     , [ "a hold protects a region that is not resident: " <> show r
       | x ← Map.elems (mHolds m)
+      , protects x
       , r ← hdRegions x
       , isNothing (Map.lookup (hdArena x, r) (mTargets m) >>= tgResident)
       ]

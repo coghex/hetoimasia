@@ -107,7 +107,10 @@ Removed later the same day, last present at `5e536270`:
 
 Condensed in place on the same day, with the full write-up at the same commit:
 `tra20/README.md` (#662, twenty review rounds of the temporary store's pure
-model) and `tra21/README.md` (#663, ten review rounds of the storage backend).
+model) and `tra21/README.md` (#663, ten review rounds of the storage backend). `suite-budget/README.md`
+(#681, the terrain-runtime suite's time budget: every measurement window, the
+per-example times and all 64 store controls) was condensed the same way; its
+full write-up is at `218ba408`.
 
 ## Per-issue Vulkan records — last present at `18c3a659` (removed 2026-11-13)
 

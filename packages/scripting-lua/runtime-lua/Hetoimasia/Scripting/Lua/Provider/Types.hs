@@ -66,6 +66,8 @@ module Hetoimasia.Scripting.Lua.Provider.Types
   , ProviderWork (..)
   , Completion (..)
   , Settling (..)
+  , PreparedReply (..)
+  , settlePrepared
   , SubmissionDeclined (..)
   , ProviderReply (..)
   , ReplyAnswer (..)
@@ -332,6 +334,13 @@ data Settling = Settling
     -- 'settlingSettle' does, but does not prove the provider's work over, so the request's retirement obligation ('workRetirement')
     -- stays until the provider reports its work complete, and the request's places are not returned before. For a reply that is not a
     -- resource.
+  , settlingPrepare ∷ ProviderReply → PreparedReply
+    -- ^ 'settlingSettle' with its pure part done first, outside any transaction: the reply is judged ('settlingJudge''s judgement)
+    -- when the result is evaluated to weak head normal form, and the prepared reply's transaction ('PreparedReply') settles the
+    -- request with that verdict, deciding everything else (eligibility, a duplicate, the request's state) as 'settlingSettle' does.
+    -- What is prepared depends only on the reply and on what the request's admission fixed (the owner's limits, the endpoint's
+    -- schema, the admission), never on state that can change before the settlement. A provider whose answer is large prepares it
+    -- before the transaction that commits it, so that transaction does not grow with the answer. For a reply that is not a resource.
   , settlingJudge ∷ ProviderReply → Bool
     -- ^ Whether the host would take this reply as the request's settlement: the very judgement 'settlingSettle' passes, as a pure
     -- function that writes nothing. A provider uses it before it commits anything, on the largest reply it can make, to refuse a request
@@ -389,6 +398,16 @@ data ProviderReply
 
 -- | What became of an answer. Never an error: a duplicate, late or stale answer is evidence
 -- about the provider and is counted, and it still retires the provider's work.
+-- | A reply judged outside any transaction ('settlingPrepare'): the verdict, in a strict field (evaluating the prepared reply makes
+-- the judgement), and the settlement that applies it. Settling it ('settlePrepared') is 'settlingSettle' of the same reply, with the
+-- judgement already made. The verdict is a value, never inside an 'STM' action: the compiler may move work bound outside a function
+-- into its body.
+data PreparedReply = ∀ v. PreparedReply !v (v → STM ReplyAnswer)
+
+-- | Settle a request with its prepared reply, in the caller's transaction.
+settlePrepared ∷ PreparedReply → STM ReplyAnswer
+settlePrepared (PreparedReply verdict settle) = settle verdict
+
 data ReplyAnswer
   = -- | It settled the request.
     ReplySettled

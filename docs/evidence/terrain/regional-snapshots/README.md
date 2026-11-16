@@ -44,12 +44,14 @@ second pass). The regional examples' routine share, focused under load 11.7: 5.5
 
 | Snapshot | Footprint (accounted bytes) | Knowledge classes | Work (columns, runs, classes, pieces, evaluations, per level) |
 | --- | ---: | ---: | --- |
-| two pristine regions, buried and sky | 608 | 1 each | (320, 0, 1, 1, 3, 0) each |
-| one pristine buried region | 368 | 1 | (320, 0, 1, 1, 3, 0) |
-| the same region with one removal | 640 (+272) | 2 | (320, 1, 6, 16, 38, 0) |
+| two pristine regions, buried and sky | 672 | 1 each | (320, 0, 1, 1, 3, 0) each |
+| one pristine buried region | 400 | 1 | (320, 0, 1, 1, 3, 0) |
+| the same region with one removal | 672 (+272) | 2 | (320, 1, 6, 16, 38, 0) |
 
-Admission reserves `regionSnapshotReservation n` = 128 + 25,840 n + 747,520 bytes (773,488 for one region) and the
-charge becomes the footprint in the settlement transaction.
+Admission reserves `regionSnapshotReservation n` = 128 + 25,872 n + 747,520 bytes (773,520 for one region) and the
+charge becomes the footprint in the settlement transaction. The footprint is an upper bound of a heap walk of the
+delivered value without its source: one region 344 bytes walked (footprint 400), sixteen 4,488 (4,544), a region of
+32 shafts and 32 buried removals 968 (1,024).
 
 ## Round 1 repairs
 

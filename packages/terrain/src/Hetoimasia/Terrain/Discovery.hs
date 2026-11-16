@@ -104,6 +104,14 @@
 -- before it is built. A chunk reloaded later resolves the same answer from the
 -- retained records alone, with no per-chunk marker.
 --
+-- = Regions
+--
+-- 'planRegionKnowledge' and 'assembleRegionKnowledge' give what 'queryCell'
+-- answers for every cell of one region as compressed column runs, evaluating
+-- 'queryCell' only where the answer can vary (see
+-- "Hetoimasia.Terrain.Internal.Discovery.Region"): a pure, read-only addition
+-- that changes no semantics, record or obligation.
+--
 -- = Records, windows and missing data
 --
 -- All retained state is plain data in "Records"-style keys: removed runs, forest
@@ -269,8 +277,30 @@ module Hetoimasia.Terrain.Discovery
   , queryNodeClass
   , ObligationState (..)
   , queryObligation
+
+    -- * Regions
+  , regionColumns
+  , regionHaloColumns
+  , regionReadLevels
+  , KnowledgePlan
+  , planRegionKnowledge
+  , planRegion
+  , planTiles
+  , planClasses
+  , planPieces
+  , planPerLevelTiles
+  , RegionKnowledge
+  , assembleRegionKnowledge
+  , mkRegionKnowledge
+  , regionKnowledgeRegion
+  , regionKnowledgeClasses
+  , regionKnowledgeColumns
+  , regionKnowledgeAt
+  , regionKnowledgeColumn
+  , regionKnowledgeUniform
   ) where
 
 import Hetoimasia.Terrain.Internal.Discovery.Core
 import Hetoimasia.Terrain.Internal.Discovery.Limits
 import Hetoimasia.Terrain.Internal.Discovery.Records
+import Hetoimasia.Terrain.Internal.Discovery.Region

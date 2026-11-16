@@ -1151,7 +1151,7 @@ spec = describe "Terrain windows and banks" $ do
       second ← registerClient svc >>= either (\refused → expectationFailure (show refused) >> fail "no client") pure
       -- the first open's definition is invalid: the service fails it at admission, and the adapter holds its name until the host settles it
       let invalid = SourceSpec {specMaterials = ["a", "a"], specLayers = [], specPatches = []}
-          failedEndpoint = Endpoint (pure ()) (pure True) (\settled → case settled of Failed _ → holdFailedUntil (fst (namesOf facade)) "dup" (readTVar hostSettled); _ → pure ())
+          failedEndpoint = Endpoint (pure ()) (pure True) (\settled → case settled of Failed _ → holdFailedUntil (fst (namesOf facade)) "dup" (readTVar hostSettled); _ → pure ()) Nothing
       (validEndpoint, validBox) ← arrivalEndpoint
       firstDone ← newEmptyMVar
       secondDone ← newEmptyMVar
@@ -1194,7 +1194,7 @@ spec = describe "Terrain windows and banks" $ do
       -- the first open is never eligible to commit in the example (the service holds it, and its name, while it is parked): what frees the name
       -- is the service's being told
       (secondEndpoint, secondBox) ← arrivalEndpoint
-      let firstEndpoint = Endpoint (pure ()) (pure False) (\_ → pure ())
+      let firstEndpoint = Endpoint (pure ()) (pure False) (\_ → pure ()) Nothing
           -- the admission, held between the service's and the registration of the open's claim (the window), then its claim: found stale once
           -- the host has settled the open as cancelled, and the service is told by whoever finds it so
           admitFirst = do

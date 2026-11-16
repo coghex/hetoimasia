@@ -4,9 +4,13 @@
 -- removal, an expected failure nobody reads, and the unavailable-state guard after a terrain call.
 module Test.LuaEngine.Terrain.Limits (spec) where
 
+import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
+import qualified Data.Map.Strict as Map
 import Hetoimasia.LuaEngine.Profile (fixedM1Profile)
 import Hetoimasia.Terrain.Query (QueryLimits (..), defaultQueryLimits)
-import Hetoimasia.Terrain.Runtime (Config (..), defaultConfig)
+import Hetoimasia.Terrain.Residency (RequestId)
+import Hetoimasia.Terrain.Runtime (Answer (..), ColumnAnswer (..), Config (..), Point (..), Probe (..), defaultConfig)
+import System.IO.Unsafe (unsafePerformIO)
 import Test.Hspec
 import Control.Concurrent.STM (readTVar)
 import Test.LuaEngine.Facade.Support
@@ -104,6 +108,18 @@ quiet =
         ]
     }
 
+-- | One tick of a counter, when the value it returns is evaluated. NOINLINE so that each application is its own thunk.
+{-# NOINLINE ticked #-}
+ticked ∷ IORef Int → a → a
+ticked counter value = unsafePerformIO (atomicModifyIORef' counter (\n → (n + 1, ())) >> pure value)
+
+-- | A column answer whose every run ticks the counter when it is evaluated; any other answer unchanged. Nothing of the runs is
+-- evaluated here: the list is mapped lazily.
+countingRuns ∷ IORef Int → Answer → Answer
+countingRuns counter = \case
+  AColumn answer → AColumn answer {columnAnswerRuns = map (ticked counter) (columnAnswerRuns answer)}
+  other → other
+
 spec ∷ Spec
 spec = describe "Terrain limits" $ do
   it "answers a full request bank with exactly nil and the busy record, and a taken bank with room again" $
@@ -132,6 +148,33 @@ spec = describe "Terrain limits" $ do
                        , "range over 8192 levels\tfalse"
                        , "done"
                        ]
+
+  -- THE COLUMN'S LUA WORK IS DONE BEFORE IT IS STAGED: lua-engine's preparation of a read (its conversion of the answer into the Lua
+  -- reply, 'answerReply', and the host's judgement of that reply, 'checkReplyPure' over the whole list) is evaluated by the service's
+  -- owner outside every transaction. Observed, not timed: every run of a staged column ticks a counter when it is evaluated, and the
+  -- counter is read at the owner's points. By 'PointPrepared' of a column every one of its runs has been evaluated; at each of its
+  -- arbitrations ('PointBeforeCommit') the count is the same, so none was left for the arbitration's transaction.
+  it "converts and judges a 1,024-run column's reply before it is staged, so its arbitration evaluates none of the runs" $ do
+    counter ← newIORef 0
+    seen ← newIORef (Map.empty ∷ Map.Map RequestId ([Int], [Int]))
+    let note rid f = readIORef counter >>= \n → atomicModifyIORef' seen (\m → (Map.alter (Just . f n . maybe ([], []) id) rid m, ()))
+        point = \case
+          PointPrepared rid → note rid (\n (p, b) → (p <> [n], b))
+          PointBeforeCommit rid → note rid (\n (p, b) → (p, b <> [n]))
+          _ → pure ()
+    withRigProbe defaultConfig (ProbeWith point id (countingRuns counter)) $ \rig →
+      withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource alternating)]) $ \world _ runtime →
+        withFvm world runtime (presentationOver rig) $ \fvm → do
+          spawned ← spawn world fvm "modules-test" mainPath
+          untilPrintedBy world spawned "done"
+          printed ← outLines world
+          take 1 printed `shouldBe` ["exactly 1024\t1024"]
+          points ← Map.elems <$> readIORef seen
+          -- the open (no runs), the 1,024-run column, the 100-run column: each request's count when it was prepared ...
+          map fst points `shouldBe` [[0], [1024], [1124]]
+          -- ... and the same count at every arbitration of it
+          [b | (_, bs) ← points, b ← bs] `shouldBe` concat [replicate (length bs) p | ([p], bs) ← points]
+          readIORef counter `shouldReturn` 1124
 
   it "refuses at composition a service configured above 1,024 returned runs, so that no column of more runs can be answered" $
     refusesComposition defaultConfig {configQueryLimits = defaultQueryLimits {limitReturnedRuns = 2048}} "limitReturnedRuns"

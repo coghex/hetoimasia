@@ -6,6 +6,7 @@ import qualified Test.Terrain.Connectivity as Connectivity
 import qualified Test.Terrain.ConnectivityBounds as ConnectivityBounds
 import qualified Test.Terrain.Coordinate as Coordinate
 import qualified Test.Terrain.Discovery as Discovery
+import qualified Test.Terrain.DiscoveryRegion as DiscoveryRegion
 import qualified Test.Terrain.Geometry as Geometry
 import qualified Test.Terrain.Growth as Growth
 import qualified Test.Terrain.Opacity as Opacity
@@ -34,6 +35,7 @@ spec = describe "Terrain" $ do
   Connectivity.spec
   ConnectivityBounds.spec
   Discovery.spec
+  DiscoveryRegion.spec
   Resident.spec
   Residency.spec
   ResidencyCycle.spec

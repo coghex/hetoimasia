@@ -130,6 +130,7 @@ import Hetoimasia.Scripting.Lua.Provider
   , RetirementState (..)
   , Settling (..)
   , Submission (..)
+  , settlePrepared
   , SubmissionDeclined (..)
   )
 import Hetoimasia.Scripting.Lua.Registration (ArgumentCheck, Binding, RequestContext, capabilityType)
@@ -177,6 +178,7 @@ import Hetoimasia.Terrain.Runtime
 import qualified Hetoimasia.Terrain.Runtime as Terrain
 import Hetoimasia.Terrain.Runtime.Settlement
   ( Endpoint (..)
+  , PreparedSettlement (..)
   , attachArenaWith
   , cancel
   , cellWith
@@ -1125,6 +1127,7 @@ answerReply ceiling' = \case
   AGrown _ → ProviderFailure "terrain: a growth answer reached the value conversion without its arena's status"
   ARetried _ → ProviderFailure "terrain: a retry answer reached the value conversion without its arena's status"
   AKnowledge _ → ProviderFailure "terrain: a knowledge answer reached the value conversion (no Lua schema in this slice)"
+  ARegions _ → ProviderFailure "terrain: a regional snapshot reached the value conversion (no Lua schema in this slice)"
   AAttached _ → ProviderFailure "terrain: a lease answer reached the value conversion"
   where
     withRevision revision build = case revisionOf ceiling' revision of
@@ -1245,6 +1248,7 @@ submitToService env submission found settling = do
           { endpointReady = note
           , endpointEligible = eligible
           , endpointSettle = settleInto env link
+          , endpointPrepare = Just (prepareInto env link)
           }
   let admitAsk = case pdAsk found of
         AskOpen client name spec options → openArenaWithOptions (service env) ep client name spec options
@@ -1375,6 +1379,21 @@ declination = \case
       Terrain.BusyViews → "views"
       Terrain.BusyClients → "clients"
       Terrain.BusyRetained → "retained results"
+
+-- | THE SUCCESS OF A READ IS PREPARED OUTSIDE ANY TRANSACTION: the service evaluates this before it stages the answer, so the
+-- conversion of the answer into its Lua value and the host's judgement of that reply ('settlingPrepare') are done once, and the
+-- arbitration's transaction only settles the judged reply ('settleInto' decides the same, unprepared). Both read only the answer
+-- and what the request's admission fixed (the VM's integer ceiling, the owner's limits, the schema). Every other answer (a lease,
+-- a growth's or a retry's, which read the arena's status at their commit) prepares nothing and is settled as 'settleInto' settles it.
+prepareInto ∷ Env → Link → Answer → PreparedSettlement
+prepareInto env link answer = case answer of
+  ACell _ → prepared
+  AColumn _ → prepared
+  ASurface _ → prepared
+  _ → PreparedSettlement () (\() → settleInto env link (Succeeded answer))
+  where
+    prepared = PreparedSettlement (settlingPrepare (lkSettling link) (answerReply (tvIntegerCeiling (envVm env)) answer)) $ \reply →
+      settlePrepared reply >> writeTVar (lkTerminal link) True
 
 -- | The service's terminal outcome of a request, in the very transaction that decides it: the host's seam is read and written
 -- in it, and nothing else is.

@@ -48,7 +48,7 @@ import Hetoimasia.Terrain.Cell (Column (..))
 import Hetoimasia.Terrain.Coordinate (RegionCoord (..), axisValue, decomposeTile, regionLevels)
 import qualified Hetoimasia.Terrain.Query as Q
 import qualified Hetoimasia.Terrain.Discovery as D
-import Hetoimasia.Terrain.Palette (Palette, emptyPalette, internSourceMaterials)
+import Hetoimasia.Terrain.Palette (Palette)
 import qualified Hetoimasia.Terrain.Residency as R
 import Hetoimasia.Terrain.Residency (ArenaId (..), RequestId (..), Revision (..))
 import Hetoimasia.Terrain.Resident (Resident, discardRegion, emptyResident)
@@ -58,6 +58,8 @@ import Hetoimasia.Terrain.Runtime.Backed.Gather (gatherDraining)
 import Hetoimasia.Terrain.Runtime.Backed.Query (queryDraining)
 import Hetoimasia.Terrain.Runtime.Backed.Probe (probeDraining)
 import Hetoimasia.Terrain.Runtime.Backed.Growth (growthDraining)
+import Hetoimasia.Terrain.Runtime.Backed.RegionCopy (RegionSnapshot (..), snapshotFootprint)
+import Hetoimasia.Terrain.Runtime.Backed.Regional (buildDraining)
 import Hetoimasia.Terrain.Runtime.Internal.Backed
 import Hetoimasia.Terrain.Runtime.Internal.Content
 import Hetoimasia.Terrain.Runtime.Internal.Core
@@ -170,7 +172,11 @@ retireBackedSTM svc = do
       , stateOpens = Map.empty
       , stateCompiling = Nothing
       , stateLoadJobs = Map.empty
+      , stateDelivering = Set.empty
       }
+  -- the builds and deliveries are forgotten: a regional borrow whose request ended while either ran is
+  -- released
+  releaseAllOrphansSTM svc
 
 -- | Whether a slot's run holds a job of the storage service (submitted and not yet taken).
 slotHoldsJob ∷ SlotRun → Bool
@@ -375,6 +381,7 @@ backedTasks st = [t | Just t ← tasks]
       RunsRead g → gatherDraining g
       KnowledgeRead q → queryDraining q
       ProbeRead pr _ _ → probeDraining pr
+      RegionalRead b → buildDraining b
     ownerAlive = \case
       GatherRequest rid → alive rid
       GatherJob jid → any (\j → R.jobId j == jid && R.jobPhase j == R.JobRunningPhase) (R.modelJobs (stateModel st))
@@ -500,7 +507,9 @@ pickRequestWork svc st adm open holdReads = do
     reqInfo = Map.fromList [(R.requestId i, i) | i <- R.modelRequests model]
     ordered = sortOn (reqSeq . snd) (Map.toList (stateRequests st))
     live = [(rid, req) | (rid, req) <- ordered, not (isDoneReq req)]
-    groups = Map.fromListWith (flip (<>)) [(reqArena req, [(rid, req)]) | (rid, req) <- live]
+    -- per-arena admission order for the commands whose answers depend on the arena's revision; a regional
+    -- snapshot is labelled with the version it pinned and orders against nothing: each is its own group
+    groups = Map.fromListWith (flip (<>)) [(if isRegionalReq req then Left rid else Right (reqArena req), [(rid, req)]) | (rid, req) <- live]
     isDoneReq req = case reqPhase req of Done → True; _ → False
     needsPrepare (rid, req) = not (behindSlot req) && not (behindGrowth req) && case reqPhase req of
       Waiting → satisfied rid req && notStarted rid req
@@ -537,6 +546,7 @@ pickRequestWork svc st adm open holdReads = do
       CAttach {} → True
       CGrow {} → True
       CRetry → True
+      CRegions {} → True
       cmd →
         reqModel req
           && maybe False (\aid → all (regionOk aid) (reqDemand req)) (reqArena req)
@@ -546,7 +556,7 @@ pickRequestWork svc st adm open holdReads = do
     regionOk aid d = case Map.lookup (aid, R.demandRegion d) regionCov of
       Just (cover, False) → R.coverageSubset (R.demandCoverage d) cover
       _ → False
-    stale sg = case stagedArena sg of
+    stale sg = not (regionalWork sg) && case stagedArena sg of
       Nothing → False
       Just aid → maybe False (\a → arenaRevision a /= stagedRevision sg || knowledgeMoved a sg || not (creatorFresh a sg)) (Map.lookup aid (stateArenas st))
     knowledgeMoved a sg = case stagedWork sg of
@@ -838,6 +848,26 @@ delivered svc key gathered = (case key of GatherRequest rid → probe svc (Point
     forM_ (Map.lookup rid (stateRequests st) >>= reqArena) $ \aid →
       void $ stageWith svc rid (Just aid) content knowledge Nothing (StagedAnswer (AKnowledge (KnowledgeAnswer aid content knowledge known)))
   (GatherJob jid, GatheredKnowledge {}) → failWith svc (OwnerDefect (Text.pack ("a load job's read answered knowledge: " <> show jid))) []
+  -- A REGIONAL SNAPSHOT'S BUILD HAS DRAINED its pin (released in the transaction that removed it): the
+  -- copied value, fully evaluated so it keeps no page, window or reader alive, is staged labelled with
+  -- the identities of the version it read. It is never recomputed: a root committed since it was pinned
+  -- is wholly excluded, and staleness is its consumer's to judge.
+  (GatherRequest rid, GatheredRegions copies content knowledge generation) → do
+    st <- atomically (readSt svc)
+    forM_ (Map.lookup rid (stateRequests st)) $ \req → case (reqCmd req, reqArena req >>= \aid → (,) aid <$> Map.lookup aid (stateArenas st)) of
+      (CRegions _ hid, Just (aid, arena)) → do
+        let snapshot = RegionSnapshot aid content knowledge generation (arenaSource arena) (Map.fromList copies)
+        footprint <- evaluate (snapshotFootprint snapshot)
+        case Map.lookup hid (stateRegional st) of
+          Just rec
+            | footprint <= regionalReserved rec →
+                void $ stageWith svc rid (Just aid) content knowledge Nothing (StagedAnswer (ARegions (RegionBorrow (serviceTag svc) hid snapshot)))
+          other → do
+            let why = Text.pack ("a regional snapshot holds " <> show footprint <> " bytes beyond its reservation " <> show (fmap regionalReserved other))
+            atomically (terminate svc rid (Failed (HostFailure why)))
+            failWith svc (AccountingDefect why) [("request", Text.pack (show rid))]
+      _ → pure ()
+  (GatherJob jid, GatheredRegions {}) → failWith svc (OwnerDefect (Text.pack ("a load job's read answered a regional snapshot: " <> show jid))) []
   (GatherJob jid, GatheredProbe {}) → failWith svc (OwnerDefect (Text.pack ("a load job's read answered a probe: " <> show jid))) []
   (GatherRequest rid, GatheredProbe probed passed basis) → finishRetry svc rid (if passed then probed else []) basis
   (GatherJob jid, GatheredRuns runs revision _) → do
@@ -1028,6 +1058,7 @@ prepareReq svc rid = do
                     [] → True <$ finishRetry svc rid certifiable basis
                     _ → started aid (ReadPages pages certifiable basis)
     CKnowledge tile → maybe (pure False) (\aid → started aid (ReadKnowledge tile)) (reqArena req)
+    CRegions regions _ → maybe (pure False) (\aid → started aid (ReadRegions regions)) (reqArena req)
     cmd → withArena req $ \(aid, arena) →
       let ranges = commandRanges (configQueryLimits (serviceConfig svc)) (arenaSource arena) (Map.lookup rid (stateSurfaceWindow st)) cmd
        in started aid (ReadRuns ranges (keepCap ranges cmd))
@@ -1056,22 +1087,43 @@ stageRetry svc rid aid arena = stageWith svc rid (Just aid) (arenaRevision arena
 -- | 'stage' with the knowledge revision the work was read at and, for a creator command, the basis
 -- its preparation read.
 stageWith ∷ Service → RequestId → Maybe ArenaId → Revision → Revision → Maybe CreatorBasis → StagedWork → IO Bool
-stageWith svc rid aid rev knowledge basis work =
-  tryNonAsync (atomically publish') >>= \case
-    Right staged → pure staged
-    Left failure → do
-      failWith svc (ProviderDefect (Text.pack ("readiness callback failed: " <> show failure))) [("request", Text.pack (show rid))]
+stageWith svc rid aid rev knowledge basis work0 =
+  tryNonAsync prepare >>= \case
+    Left failure →
+      failWith svc (ProviderDefect (Text.pack ("settlement preparation failed: " <> show failure))) [("request", Text.pack (show rid))]
+    Right settlement → do
+      when (isJust settlement) (probe svc (PointPrepared rid))
+      tryNonAsync (atomically (publish' settlement)) >>= \case
+        Right staged → pure staged
+        Left failure → do
+          failWith svc (ProviderDefect (Text.pack ("readiness callback failed: " <> show failure))) [("request", Text.pack (show rid))]
   where
-    publish' = do
+    -- the answer staged, through the test seam on answers ('probeAnswer', the identity in production)
+    work = case work0 of
+      StagedAnswer answer → StagedAnswer (probeAnswer (serviceProbe svc) answer)
+      other → other
+    -- AN ANSWER'S SETTLEMENT IS PREPARED HERE, OUTSIDE EVERY TRANSACTION: a host's preparation of the
+    -- answer ('endpointPrepare') is evaluated before the answer is staged, so the arbitration's transaction
+    -- runs only the prepared settlement and never the host's pure work on the answer. A preparation that
+    -- throws is a provider defect, as a readiness callback that throws is. The endpoint is the request's
+    -- own and never changes; a request that has ended meanwhile is not staged.
+    prepare = case work of
+      StagedAnswer answer → do
+        st <- atomically (readSt svc)
+        pure (Map.lookup rid (stateRequests st) >>= endpointPrepare . reqEndpoint) >>= traverse (\settle → evaluate (settle answer))
+      _ → pure Nothing
+    publish' settlement = do
         st <- readSt svc
         fmap (fromMaybe False) . forM (Map.lookup rid (stateRequests st)) $ \req → do
           let arena = aid >>= \a → Map.lookup a (stateArenas st)
               fresh = case aid of
                 Nothing → True
+                -- a regional snapshot is labelled with the version it read: it needs only its arena live
+                Just _ | regionalWork' work → isJust arena
                 Just _ → maybe False (\x → arenaRevision x == rev && D.authKnowledge (arenaAuthority x) == knowledge && maybe True (basisFresh x) basis) arena
               pending = case reqPhase req of Done → False; _ → True
           when (fresh && pending) $ do
-            modifySt svc (\s → s {stateRequests = Map.insert rid req {reqPhase = StagedPhase (Staged aid rev knowledge basis work)} (stateRequests s)})
+            modifySt svc (\s → s {stateRequests = Map.insert rid req {reqPhase = StagedPhase (Staged aid rev knowledge basis work settlement)} (stateRequests s)})
             -- A failing readiness callback abandons this transaction: the work stays
             -- unstaged and cannot commit. The caller treats it as a provider defect.
             endpointReady (reqEndpoint req)
@@ -1129,12 +1181,14 @@ commitWaits ∷ St → Bool → RequestId → Req → Staged → Bool
 commitWaits st open rid req sg
   | statePhase st /= Running || not open = True
   | otherwise = case (reqCmd req, stagedWork sg) of
-      -- a source that fails to intern settles at once; otherwise the open waits for its preparation,
-      -- and opens publish in the order their incarnations were allocated
-      (COpen _ source _ _, StagedControl)
-        | Left _ <- internSourceMaterials source emptyPalette → False
+      -- a source that failed to intern (its preparation, before it was staged) settles at once; otherwise
+      -- the open waits for its preparation, and opens publish in the order their incarnations were allocated
+      (COpen {}, StagedOpen prepared)
+        | Left _ <- prepared → False
         | otherwise → maybe True (\(aid, _, _, _, _) → not (openOrderAllows st aid)) (openReady st rid)
       (CAttach {}, StagedControl) → False
+      -- a regional snapshot settles with the version it read, whatever has committed since
+      (CRegions {}, StagedAnswer _) → False
       -- a removal that changes content takes the slot; one of air commits here
       (CRemove {}, StagedRemoval prepared) → preparedChanged prepared || not fresh
       (_, StagedAnswer _) → not fresh
@@ -1151,20 +1205,37 @@ commitWaits st open rid req sg
 
 commitStaged ∷ Service → St → RequestId → Req → Staged → STM CommitResult
 commitStaged svc st rid req sg = case (reqCmd req, stagedWork sg) of
-  (COpen name source cid _, StagedControl) → commitOpen name source cid
+  (COpen name source cid _, StagedOpen prepared) → commitOpen name source cid prepared
   (CAttach name cid, StagedControl) → commitAttach name cid
   (CRemove _ precondition, StagedRemoval prepared)
     | not (preparedChanged prepared) → withFresh $ \aid arena → commitAir aid arena precondition
     | otherwise → pure CommitWaiting
+  -- THE SETTLEMENT OF A REGIONAL SNAPSHOT: in this one transaction the result becomes the service's
+  -- untaken result and its charge shrinks from the admission's reservation to the exact footprint of the
+  -- copied value (never less), which it keeps until its release
+  (CRegions _ hid, StagedAnswer answer@(ARegions (RegionBorrow _ _ snapshot))) → do
+    let footprint = snapshotFootprint snapshot
+    modifySt svc $ \s →
+      s
+        { stateRequests = Map.insert rid req {reqPhase = Done} (stateRequests s)
+        , stateRegional = Map.adjust (\r → r {regionalFootprint = Just footprint}) hid (stateRegional s)
+        , stateWork = (stateWork s) {rwRegional = Map.adjust (\(n, _) → (n, footprint)) hid (rwRegional (stateWork s))}
+        }
+    markFreed svc
+    settleAnswer answer
+    pure (CommitDone Nothing Nothing)
   (_, StagedAnswer answer) → withFresh $ \aid _ → do
     modifySt svc (\s → s {stateRequests = Map.insert rid req {reqPhase = Done} (stateRequests s)})
-    endpointSettle ep (Succeeded answer)
+    settleAnswer answer
     pure (CommitDone (Just aid) Nothing)
   (CRetry, StagedRetry certified) → withFresh (commitRetry certified)
   _ → pure CommitWaiting
   where
     ep = reqEndpoint req
     tag = serviceTag svc
+    -- AN ANSWER'S SETTLEMENT, IF ITS HOST PREPARES ONE, WAS PREPARED BEFORE IT WAS STAGED ('stageWith'): the
+    -- host's pure work on the answer is done, and the arbitration runs only the prepared transaction
+    settleAnswer answer = maybe (endpointSettle ep (Succeeded answer)) preparedSettle (stagedSettlement sg)
     -- Staged work for a superseded revision is not offered: the owner computes
     -- it again against the current one.
     withFresh k = case stagedArena sg >>= \aid → (,) aid <$> Map.lookup aid (stateArenas st) of
@@ -1174,7 +1245,8 @@ commitStaged svc st rid req sg = case (reqCmd req, stagedWork sg) of
     knowledgeFresh arena = case stagedWork sg of
       StagedAnswer (AKnowledge _) → D.authKnowledge (arenaAuthority arena) == stagedKnowledge sg
       _ → True
-    commitOpen name source cid = case (openReady st rid, internSourceMaterials source emptyPalette) of
+    -- the palette was interned and evaluated before the open was staged ('preparePalette'): installed here
+    commitOpen name source cid prepared = case (openReady st rid, prepared) of
       (_, Left why) → settleFailure (SourceFailure (Text.pack (show why)))
       (Nothing, _) → pure CommitWaiting
       (Just (aid, env, shared, backing, store), Right palette)
@@ -1582,3 +1654,12 @@ retryProbe arena = (probed, writes)
       | (c, record) ← complete
       ]
     writes = [page | (_, record) ← complete, FaultEntry FaultWrite page ← faultEntries record]
+
+-- | Whether staged work is a regional snapshot's answer.
+regionalWork ∷ Staged → Bool
+regionalWork = regionalWork' . stagedWork
+
+regionalWork' ∷ StagedWork → Bool
+regionalWork' = \case
+  StagedAnswer (ARegions _) → True
+  _ → False

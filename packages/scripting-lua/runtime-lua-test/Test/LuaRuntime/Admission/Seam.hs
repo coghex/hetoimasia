@@ -5,18 +5,20 @@ module Test.LuaRuntime.Admission.Seam (spec) where
 
 import Control.Concurrent.STM (atomically, newTVarIO, readTVar, retry, writeTVar)
 import Control.Exception (ExceptionWithContext (ExceptionWithContext), fromException)
-import Control.Exception (throwIO)
+import Control.Exception (evaluate, throwIO)
 import Data.Text (Text)
 import qualified Data.Text as Text
-import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
+import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
 import Control.Monad (forM_, unless, void, when)
+import GHC.Conc (unsafeIOToSTM)
 import Hetoimasia.Scripting.Lua.Admission
 import Hetoimasia.Scripting.Lua.Instance
 import Hetoimasia.Scripting.Lua.Lease (Ownership (..))
 import Hetoimasia.Scripting.Lua.Provider
 import Hetoimasia.Scripting.Lua.Scheduled (grantScheduledStep, scheduledEndpoint)
 import Hetoimasia.Scripting.Lua.Value (Value (VInteger, VText))
-import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
+import System.IO.Unsafe (unsafePerformIO)
+import Test.Hspec (Spec, describe, it, shouldBe, shouldReturn, shouldSatisfy)
 import Test.LuaRuntime.Admission.Support
 import Test.LuaRuntime.Instance.Support (awaitSettled, expectControl, failureOf', grantOne)
 import Test.LuaRuntime.Request.Support (awaitDiagnostic, diagnostics, finishWork, onSubmit, submissions)
@@ -35,6 +37,11 @@ requestFailure settlement = do
   case failureError failure of
     ErrorRequest endpoint why → Just (endpoint, why)
     _ → Nothing
+
+-- | A value that ticks a counter when it is evaluated. NOINLINE so that each application is its own thunk.
+{-# NOINLINE ticked #-}
+ticked ∷ IORef Int → a → a
+ticked counter value = unsafePerformIO (atomicModifyIORef' counter (\n → (n + 1, ())) >> pure value)
 
 spec ∷ Spec
 spec = describe "the settlement seam and the declining hand-off" $ do
@@ -101,6 +108,45 @@ spec = describe "the settlement seam and the declining hand-off" $ do
       d ← diagnostics owner
       rdDefects d `shouldBe` 0
       atomically (settlingSettle settling (ProviderResult (VInteger 7))) >>= (`shouldBe` ReplySettled)
+
+  it "judges a prepared reply when it is evaluated, outside any transaction, and settles it in the caller's transaction without judging it again" $ bounded $ do
+    fixture ← newAFix 4
+    withBoundary $ \_ runtime → settleAll fixture $ do
+      owner ← startAdmitting fixture runtime "prepares" [admitter] aConfig (admissionGrant fixture 8 SettleOnArrival) requiredPolicy
+      admitAdmitter fixture owner "i" "admitter"
+      seam ← newIORef Nothing
+      onSubmit (afFake fixture) (captured seam)
+      acommand fixture owner "i" "start" "a"
+      awaitNote fixture "cmd start a started"
+      Just settling ← readIORef seam
+      judged ← newIORef 0
+      -- the judgement evaluates the reply's value: it is done when the prepared reply is evaluated, here, in no transaction
+      prepared ← evaluate (settlingPrepare settling (ProviderResult (ticked judged (VInteger 7))))
+      readIORef judged `shouldReturn` 1
+      -- the settlement applies that verdict: nothing of the reply is evaluated inside the transaction
+      atomically (do answer ← settlePrepared prepared; seen ← unsafeIOToSTM (readIORef judged); pure (answer, seen)) >>= (`shouldBe` (ReplySettled, 1))
+      readIORef judged `shouldReturn` 1
+      acommand fixture owner "i" "take" "a"
+      awaitNote fixture "cmd take a {status=success,value={v=7}}"
+      -- the control: the unprepared settlement judges the reply inside its transaction
+      onSubmit (afFake fixture) (captured seam)
+      acommand fixture owner "i" "start" "b"
+      awaitNote fixture "cmd start b started"
+      Just second ← readIORef seam
+      inside ← newIORef 0
+      atomically (do before' ← unsafeIOToSTM (readIORef inside); answer ← settlingSettle second (ProviderResult (ticked inside (VInteger 8))); after ← unsafeIOToSTM (readIORef inside); pure (before', answer, after)) >>= (`shouldBe` (0, ReplySettled, 1))
+      -- a prepared reply decides what the unprepared one does: a request the script cancelled first answers the same to both
+      onSubmit (afFake fixture) (captured seam)
+      acommand fixture owner "i" "start" "c"
+      awaitNote fixture "cmd start c started"
+      Just third ← readIORef seam
+      late ← evaluate (settlingPrepare third (ProviderResult (VInteger 9)))
+      acommand fixture owner "i" "cancel" "c"
+      awaitNote fixture "cmd cancel c cancelled"
+      viaPrepared ← atomically (settlePrepared late)
+      viaSettle ← atomically (settlingSettle third (ProviderResult (VInteger 9)))
+      viaPrepared `shouldBe` viaSettle
+      viaPrepared `shouldSatisfy` (/= ReplySettled)
 
   it "settles a request without proving the provider's work over, so that its places return only when the provider's retirement says so" $ bounded $ do
     fixture ← newAFix 4

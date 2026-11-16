@@ -91,7 +91,9 @@
 --
 -- A resident region is a victim candidate only when it has no interest, no
 -- hold (borrower or publication pin), no job, no pending changes and no
--- handoff in flight. Candidates are taken in least-recently-used order of the
+-- handoff in flight. A copied borrow ('Copied': data copied out of the store)
+-- needs no region resident, protects none and never touches recency; it keeps
+-- its arena retiring until released, like any hold. Candidates are taken in least-recently-used order of the
 -- logical clock, ties by arena and region. Retained edits are never a victim.
 -- A removal's committed changes stay protected ('regionDirty') until a handoff
 -- transfers them: the transfer reserves its temporary duplicate in staging,
