@@ -8,7 +8,7 @@
 module Test.LuaEngine.Terrain.Pump (spec) where
 
 import Control.Concurrent.STM (atomically, newTVarIO, readTVar, readTVarIO, writeTVar)
-import Control.Exception (ErrorCall (ErrorCall), throwIO, try)
+import Control.Exception (ErrorCall (ErrorCall), finally, throwIO, try)
 import Data.Either (isLeft)
 import Data.IORef (readIORef)
 import Data.Text (Text)
@@ -116,7 +116,8 @@ spec = describe "The Lua test pump" $ do
   it "steps one VM while a peer is held in its update: the peer's clock stays at the deadline that woke it, and no step waits for it" $
     withRig $ \rig →
       withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource counter), ("lua/held.lua", scriptSource held)]) $ \world _ runtime →
-        withFvm world runtime (presentationOver rig) $ \peer → withFvm world runtime presentationShape $ \fvm → do
+        -- however the example ends, the peer is let go before its owner is retired
+        withFvm world runtime (presentationOver rig) $ \peer → (`finally` signalRig rig "hold") $ withFvm world runtime presentationShape $ \fvm → do
           -- a VM's reading of the clock: the world's, plus how far the step moved that VM on
           let reading vm = (+) <$> readIORef (wClock world) <*> vmAhead vm
           _ ← spawn world peer "modules-test" "lua/held.lua"
