@@ -11,12 +11,17 @@
 -- THE RULE. Nothing that measures the process may join the set: a live-heap, allocation or runtime-statistic reading is valid on
 -- one capability only, beside nothing. No member reads one, compiles an external client or times anything.
 --
+-- WHAT IS HELD OUT of the pass is named in 'heldOut', each with its reason and the issue whose fix returns it; it still runs in
+-- its place on one capability, and the pass prints it before its first example.
+--
 -- The set runs twice: first in its place in the suite, each example on one capability with the count put back after it ('spec'),
 -- so the lab's @+RTS -N<k>@ reaches nothing of the set there; then last, after every other example of the suite, under its own
 -- label on the pass's count ('passSpec', "Test.Support.Capabilities"), so selection by exact path stays unambiguous.
 module Test.LuaEngine.Terrain.Spec
   ( Entry (..)
   , entries
+  , HeldOut (..)
+  , heldOut
   , spec
   , passSpec
   , passLabel
@@ -25,7 +30,9 @@ module Test.LuaEngine.Terrain.Spec
 import Control.Concurrent (getNumCapabilities, setNumCapabilities)
 import Control.Exception (finally)
 import Control.Monad (forM_)
+import Data.List (intercalate)
 import Test.Hspec (Spec, around_, beforeAll_, describe, runIO)
+import Test.Hspec.Core.Spec (Item (itemRequirement), filterForestWithLabels, mapSpecForest)
 import Test.Support.Capabilities (PassSetting, enterPass, inPass, passLine)
 import qualified Test.LuaEngine.Terrain.Basics as Basics
 import qualified Test.LuaEngine.Terrain.Composition as Composition
@@ -76,6 +83,24 @@ entries =
   where
     rig = "real Lua owners over the production service (withRig)"
 
+-- | An example of the set the pass leaves out: its path below the set's \"Terrain\" group, why, and what returns it.
+data HeldOut = HeldOut
+  { heldPath ∷ [String]
+  , heldReason ∷ String
+  }
+
+-- | The examples the pass leaves out (owner decision on #692, 2026-11-16: carry). Each still runs in its place.
+heldOut ∷ [HeldOut]
+heldOut =
+  [ HeldOut
+      [ "Terrain matrices"
+      , "accepts a definition of exactly the validator's 256 KiB and settles one byte-accounted past it as a definition failure"
+      ]
+      "on two or more capabilities the open's commit transaction, which interns the whole definition, is restarted by the Lua \
+      \host's STM writes for as long as the script keeps updating, and never commits: a terrain-runtime defect, #695, whose \
+      \fix returns this example to the pass"
+  ]
+
 -- | The set in its place: every example on one capability, the started count put back after it.
 spec ∷ Spec
 spec = describe "Terrain" $ do
@@ -92,6 +117,9 @@ passLabel = "The multi-capability pass"
 passSpec ∷ PassSetting → Spec
 passSpec setting =
   describe passLabel
-    $ beforeAll_ (enterPass setting >> passLine setting >>= putStrLn)
+    $ beforeAll_ (enterPass setting >> passLine setting >>= putStrLn >> forM_ heldOut (putStrLn . heldLine))
     $ around_ (inPass setting)
-    $ describe "Terrain" (forM_ entries entrySpec)
+    $ describe "Terrain" (mapSpecForest (filterForestWithLabels kept) (forM_ entries entrySpec))
+  where
+    kept groups item = (groups <> [itemRequirement item]) `notElem` map heldPath heldOut
+    heldLine held = "held out of the pass: " <> intercalate " / " (heldPath held) <> ": " <> heldReason held
