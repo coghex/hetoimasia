@@ -199,6 +199,9 @@ data TerrainViews k = TerrainViews
   , svRetiringCpu ∷ !(TVar Word64)
     -- ^ What the service holds of the account for retiring regions' CPU descriptions and builds left in flight, moved
     -- from their views' charges; returned as each release is answered, and at the service's end.
+  , svKeptCpu ∷ !(TVar Word64)
+    -- ^ Of 'svRetiringCpu', what failed releases keep: their descriptions stay in the renderer's registry, so their CPU
+    -- stays charged after the service's end, reported as evidence.
   , svAbandonedCopies ∷ !(TVar [Runtime.Pending Runtime.RegionBorrow])
     -- ^ Copy requests an abandoned stage left in flight, handed here in the transaction that ended the stage: the worker
     -- (or the service's end) takes each settled one and releases it, or cancels it.
@@ -284,6 +287,9 @@ data ViewState k = ViewState
   , vsStageCharge ∷ !(TVar Word64)
     -- ^ What the stage holds of the account: the copies taken so far, then the candidate's CPU bytes.
   , vsRestarts ∷ !(TVar Int)
+  , vsFactsCharge ∷ !(TVar Word64)
+    -- ^ What the facts kept for the camera ('vsFacts') hold of the account: charged with the inputs they were made
+    -- from, kept while they are kept, replaced by the next facts' charge and returned at close.
   }
 
 -- | A published plan kept for picking, with its identity and its CPU charge.
@@ -356,6 +362,7 @@ withTerrainViews config ports body = do
       <*> newTVarIO 0
       <*> newTVarIO False
       <*> newTVarIO []
+      <*> newTVarIO 0
       <*> newTVarIO 0
       <*> newTVarIO []
   done ← newEmptyMVar
@@ -572,6 +579,7 @@ newViewState service request style runtimeView camera light = do
     <*> newTVarIO StageIdle
     <*> newTVarIO 0
     <*> newTVarIO 0
+    <*> newTVarIO 0
 
 -- ---------------------------------------------------------------------------
 -- Intent
@@ -704,6 +712,8 @@ readView (TerrainView service state) = do
   let waiting = stopped || staged
   restarts ← readTVar (vsRestarts state)
   staged' ← readTVar (vsStageCharge state)
+  factsBytes ← readTVar (vsFactsCharge state)
+  demandBytes' ← demandNeed state
   held ← readTVar (vsAccountHeld state)
   pure
     ViewReading
@@ -718,6 +728,8 @@ readView (TerrainView service state) = do
       , readingWaiting = waiting
       , readingRestarts = restarts
       , readingStagedBytes = staged'
+      , readingFactsBytes = factsBytes
+      , readingDemandBytes = demandBytes'
       }
 
 -- | The view's latest camera demand: its visible regions, then its prefetch. 'Nothing' before its first preparation.
@@ -779,6 +791,8 @@ runClose service state = do
     modifyTVar' (svRetiring service) (<> [Retiring (rgChunk region) (rgBytes region) (regionCpu region) RetireUnasked | region ← Map.elems regions])
     moveToService service state (sum (map regionCpu (Map.elems regions)))
     writeTVar (vsPins state) Map.empty
+    writeTVar (vsFacts state) Nothing
+    writeTVar (vsFactsCharge state) 0
     held ← readTVar (vsAccountHeld state)
     when (held > 0) (accountRelease (portAccount ports) held)
     writeTVar (vsAccountHeld state) 0
@@ -913,10 +927,14 @@ shutdown service = do
   settleQueued queued
   disposeAbandonedCopies service
   drain
-  -- what the service still holds for retiring regions (kept as evidence, or left by an owner that ended) returns now that
-  -- nothing can use it
+  -- what the service still holds for retiring regions left by an owner that ended returns now that nothing can use it;
+  -- a failed release's description is still in the renderer's registry, so its CPU stays charged, reported here
   atomically $ do
-    returnFromService service maxBound
+    kept ← readTVar (svKeptCpu service)
+    held ← readTVar (svRetiringCpu service)
+    returnFromService service (held - min held kept)
+    when (kept > 0) $
+      recordFailureSTM service ("failed releases keep " <> Text.pack (show kept) <> " bytes of their descriptions charged: they are still in the renderer's registry")
     writeTVar (svShutDown service) True
   where
     drain = do
@@ -1023,6 +1041,7 @@ retireStep service = do
           Right () : _ → pure Released
           Left why : _ → do
             recordFailureSTM service ("a retained region's release failed: " <> Text.pack (show (rtChunk r)) <> ": " <> why)
+            modifyTVar' (svKeptCpu service) (+ rtCpu r)
             pure Kept
           [] → pure Kept
   if any isGone stepped
@@ -1107,7 +1126,7 @@ data Planning = Planning
   , plInputs ∷ !CellInputs
   , plPrep ∷ !CellPrep
   , plBase ∷ !Word64
-    -- ^ The stage's charge before planning: the copies and the inputs made from them.
+    -- ^ The stage's charge before planning: the copies (the inputs made from them are the kept facts' charge).
   , plWait ∷ !(Maybe Mark)
     -- ^ The account could not hold the next quantum's growth: it is asked again once something is released.
   }
@@ -1416,7 +1435,8 @@ toPlanning service state prep copies = do
     else case planInputs (tvChangeLimits (svConfig service)) copies of
       Left why → failed ("the view's inputs could not be made: " <> Text.pack (show why))
       Right (facts, knowledge) → do
-        camera ← settleCamera service state facts
+        camera ← settleCamera service state facts inputs
+        void (atomically (recharge service state))
         let cellInputs = CellInputs (CellRequest (factsVersions facts) camera (setupFor (prpMetrics prep)) (tvCellConfig (svConfig service))) facts knowledge (styleAssets (vsStyle state))
         base ← readTVarIO (vsStageCharge state)
         case startCells cellInputs of
@@ -1476,27 +1496,30 @@ stepPlanning service state prep planning = case cellPrepProgress (plPrep plannin
         then do
           -- the next round keeps the copies taken and makes the inputs again; the plan made here is dropped
           atomically $ do
-            writeTVar (vsStageCharge state) (plBase planning - min (plBase planning) (inputsPerRegion * fromIntegral (Set.size (prpRegions prep))))
+            writeTVar (vsStageCharge state) (plBase planning)
             void (recharge service state)
           enter service state . StageCopying prep {prpRegions = prpRegions prep <> missing, prpRounds = prpRounds prep - 1} $
             Copying (copySnapshots (plCopies planning)) (batchesOf service (Set.toList missing)) Nothing Nothing
         else do
-          -- The camera's interests cover every region the plan was drawn from, not only what is still pending: the
-          -- regions it shows, background far from the camera included, stay protected from eviction.
-          setDemand service state (Set.toList (prpRegions prep <> Set.fromList visible)) prefetch
+          let demanded = Set.toList (prpRegions prep <> Set.fromList visible)
           atomically (writeTVar (vsPending state) (length (cellPlanPending plan)))
           -- the plan's own size, then the adaptation, the regions' instances and records and the renderer's copies of
-          -- them, all charged before they are made
+          -- them, all charged before they are made; and the demand about to be kept, beyond what the kept demand holds
           let quads = length (cellPlanQuads plan)
               held = planHeld quads (length (cellPlanPending plan))
               adaptation = fromIntegral quads * (adaptedPerQuad + 2 * instanceBytes)
+              demandGrowth kept = demandBytes * fromIntegral (length demanded + length prefetch) - min (demandBytes * fromIntegral (length demanded + length prefetch)) kept
           charged ← atomically $ do
             writeTVar (vsStageCharge state) (plBase planning + held)
             void (recharge service state)
-            growStage service state adaptation
+            kept ← maybe 0 (\(v', p') → demandBytes * fromIntegral (length v' + length p')) <$> readTVar (vsDemand state)
+            growStage service state (adaptation + demandGrowth kept)
           if not charged
             then abandonStage service state >> finish service state Retry' (Just prep)
             else do
+              -- The camera's interests cover every region the plan was drawn from, not only what is still pending: the
+              -- regions it shows, background far from the camera included, stay protected from eviction.
+              setDemand service state demanded prefetch
               light ← readTVarIO (vsLight state)
               let style = vsStyle state
               case adaptCells (styleTextures style) light (styleAssets style) plan of
@@ -1676,9 +1699,12 @@ setupFor metrics =
 
 -- Give the camera the new facts: a followed surface they supply is adopted, and a pending jump they allow lands. Only
 -- if the intent did not change meanwhile; otherwise the newer intent is prepared next.
-settleCamera ∷ (Ord k, Show k) ⇒ TerrainViews k → ViewState k → TerrainFacts → IO CameraState
-settleCamera service state facts = atomically $ do
+settleCamera ∷ (Ord k, Show k) ⇒ TerrainViews k → ViewState k → TerrainFacts → Word64 → IO CameraState
+settleCamera service state facts charge = atomically $ do
+  -- the facts are kept beyond the stage, so their charge moves from the stage's to theirs, replacing the facts before
   writeTVar (vsFacts state) (Just facts)
+  modifyTVar' (vsStageCharge state) (\c → c - min c charge)
+  writeTVar (vsFactsCharge state) charge
   camera ← readTVar (vsCamera state)
   let config = tvCameraConfig (svConfig service)
       followed = either (const camera) stepCamera (refollow config facts camera)
@@ -1800,7 +1826,17 @@ recharge service state = do
   pinned ← pinnedNeed state
   listed ← sum . map regionCpu . Map.elems <$> readTVar (vsRegions state)
   staged ← readTVar (vsStageCharge state)
-  coverNeed service state (pinned + listed + staged)
+  facts ← readTVar (vsFactsCharge state)
+  demand ← demandNeed state
+  coverNeed service state (pinned + listed + staged + facts + demand)
+
+-- What the view's kept demand holds: its latest camera demand and a pending jump's or followed surface's regions, each
+-- coordinate at most 'demandBytes'.
+demandNeed ∷ ViewState k → STM Word64
+demandNeed state = do
+  kept ← maybe 0 (\(visible, prefetch) → length visible + length prefetch) <$> readTVar (vsDemand state)
+  extra ← length <$> readTVar (vsExtraDemand state)
+  pure (demandBytes * fromIntegral (kept + extra))
 
 -- Move bytes the view holds in the account to the service's charge for retiring regions: a transfer of what is already
 -- reserved, never a new reservation, so it cannot be refused.
@@ -1831,13 +1867,14 @@ wantedCpu instances records = 2 * instanceBytes * fromIntegral (length instances
 -- What the account is charged for each piece, conservatively: a planned quad and its key, a pending span, a copied
 -- region's facts and knowledge as the inputs hold them (the copy's own per-region record), an adapted quad, an encoded
 -- instance and a material record.
-quadBytes, pendingBytes, inputsPerRegion, adaptedPerQuad, instanceBytes, recordBytes ∷ Word64
+quadBytes, pendingBytes, inputsPerRegion, adaptedPerQuad, instanceBytes, recordBytes, demandBytes ∷ Word64
 quadBytes = 384
 pendingBytes = 64
 inputsPerRegion = 25872
 adaptedPerQuad = 128
 instanceBytes = 64
 recordBytes = 128
+demandBytes = 32
 
 -- What a plan holds: its quads and its pending spans.
 planHeld ∷ Int → Int → Word64

@@ -273,6 +273,10 @@ data ViewReading = ViewReading
     -- ^ What the view's preparation holds of the account now: copies taken, inputs, the plan's growth, the adaptation.
   , readingRestarts ∷ !Int
     -- ^ Times the view's copies started again because copies of different committed versions met.
+  , readingFactsBytes ∷ !Word64
+    -- ^ What the facts the view keeps for its camera hold of the account.
+  , readingDemandBytes ∷ !Word64
+    -- ^ What the view's kept demand holds of the account.
   }
   deriving (Eq, Show)
 

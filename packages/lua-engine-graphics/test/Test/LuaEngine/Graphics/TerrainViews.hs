@@ -530,6 +530,52 @@ stages = describe "stages and the owner" $ do
       atomically (terrainViewsGpuCharged (vViews v)) >>= (`shouldSatisfy` (> 0))
       closeView other
 
+  it "charges the facts it keeps for its camera and its kept demand for as long as it keeps them, after publication and after an abandoned preparation" $
+    withViews $ \v → do
+      view ← attached v 1
+      _ ← awaitPublished v 1
+      quiescent v
+      let covered = do
+            reading ← readView view
+            demand ← viewDemand view
+            pure (reading, maybe 0 (\(visible, prefetch) → length visible + length prefetch) demand)
+      (published, demanded) ← atomically covered
+      -- the facts are charged at their inputs' bytes, and the demand at its coordinates
+      readingFactsBytes published `shouldSatisfy` (> 0)
+      readingFactsBytes published `mod` 25872 `shouldBe` 0
+      readingDemandBytes published `shouldSatisfy` (>= 32 * fromIntegral demanded)
+      readingCpuBytes published `shouldSatisfy` (>= readingFactsBytes published + readingDemandBytes published)
+      -- a superseded preparation held at the owner is abandoned: the facts it settled are still kept, and charged
+      atomically (writeTVar (foGate (vOwner v)) False)
+      atomically (updateCamera view (CameraIntent [Camera.ZoomBy 2])) `shouldReturn` Right ()
+      bounded (atomically (readTVar (foWaiting (vOwner v)) >>= check . (> 0)))
+      atomically (updateCamera view (CameraIntent [Camera.ZoomBy 2])) `shouldReturn` Right ()
+      bounded (atomically (readView view >>= check . (== 0) . readingStagedBytes))
+      abandoned ← atomically (readView view)
+      readingFactsBytes abandoned `shouldSatisfy` (> 0)
+      readingCpuBytes abandoned `shouldSatisfy` (>= readingFactsBytes abandoned + readingDemandBytes abandoned)
+      atomically (writeTVar (foGate (vOwner v)) True)
+      closeView view
+
+  it "keeps a failed release's description charged after the service's end, and says how much" $ do
+    result ← newTVarIO Nothing
+    withViews $ \v → do
+      view ← attached v 1
+      first' ← awaitPublished v 1
+      adoptNow (vModel v) 1 `shouldReturn` Adopted first'
+      atomically (writeTVar (foReleaseFailure (vOwner v)) (Just "injected: the buffer could not be freed"))
+      closeView view
+      _ ← adoptNow (vModel v) 1
+      _ ← releasePass (vModel v)
+      bounded (atomically (terrainViewsFailures (vViews v) >>= check . any ("injected" `Text.isInfixOf`)))
+      atomically (writeTVar result (Just (vViews v, _vAccount v)))
+    Just (views, account) ← readTVarIO result
+    failures ← atomically (terrainViewsFailures views)
+    let kept = [read (Text.unpack (Text.takeWhile (/= ' ') (Text.drop (Text.length "failed releases keep ") f))) ∷ Integer | f ← failures, "failed releases keep " `Text.isPrefixOf` f]
+    kept `shouldSatisfy` (\k → length k == 1 && all (> 0) k)
+    charged ← atomically (accountCharged account)
+    toInteger charged `shouldSatisfy` (>= sum kept)
+
   it "keeps an unpublished region's GPU bytes charged until its upload has ended and its release is answered" $
     withViews $ \v → do
       atomically (writeTVar (foHoldUploads (vOwner v)) True)
@@ -731,7 +777,7 @@ stages = describe "stages and the owner" $ do
       _ ← awaitPublished v 1
       closeView long
 
-  it "charges a preparation's inputs before it plans: at its first quantum the stage already holds them" $ do
+  it "charges a preparation's inputs before it plans: at its first quantum the view already holds them, as the facts it keeps" $ do
     seam ← newStageSeam
     opened ← newTVarIO False
     withViewsConfig testConfig {tvOnStage = seamHook seam, tvStopping = atomically (writeTVar opened True)} $ \v → do
@@ -739,9 +785,9 @@ stages = describe "stages and the owner" $ do
       view ← attached v 1
       awaitSeamFired seam
       reading ← atomically (readView view)
-      -- the copies taken and at least one region's inputs, before the planner has made anything
-      readingStagedBytes reading `shouldSatisfy` (>= 25872)
-      readingCpuBytes reading `shouldSatisfy` (>= readingStagedBytes reading)
+      -- at least one region's inputs, held as the kept facts' charge, before the planner has made anything
+      readingFactsBytes reading `shouldSatisfy` (>= 25872)
+      readingCpuBytes reading `shouldSatisfy` (>= readingStagedBytes reading + readingFactsBytes reading)
       atomically (writeTVar opened True)
       _ ← awaitPublished v 1
       closeView view
