@@ -388,6 +388,25 @@ lifecycle = describe "close orders and limits" $ do
       _ ← awaitPublished v 1
       closeView view
 
+  it "holds at most two pinned revisions: a third waits for the newest to be adopted, then publishes with no new intent" $
+    withViews $ \v → do
+      view ← attached v 1
+      first' ← awaitPublished v 1
+      adoptNow (vModel v) 1 `shouldReturn` Adopted first'
+      -- A second revision is published and not adopted: the adopted and the published one are pinned.
+      atomically (updateCamera view (CameraIntent [Camera.ZoomBy 2])) `shouldReturn` Right ()
+      second ← awaitPublished' v 1 (first' + 1)
+      bounded (atomically (readView view >>= check . (== 2) . readingPins))
+      -- A third intent cannot pin a third revision: it waits.
+      atomically (updateCamera view (CameraIntent [Camera.ZoomBy 2])) `shouldReturn` Right ()
+      bounded (atomically (readView view >>= check . readingWaiting))
+      publishedRevision (vModel v) 1 `shouldReturn` second
+      -- The host adopts the second; the first unpins and the third publishes.
+      adoptNow (vModel v) 1 `shouldReturn` Adopted second
+      _ ← awaitPublished' v 1 (second + 1)
+      atomically (readView view) >>= (`shouldSatisfy` (<= 2)) . readingPins
+      closeView view
+
   it "refuses an attachment beyond the service's views, before taking anything" $
     withViewsConfig testConfig {tvMaxViews = 1} $ \v → do
       _ ← attached v 1
