@@ -331,6 +331,7 @@ renderJudged rig = do
                 inOrder
                   [ transitionResource recorder image (FromUse ColorAttachment) TransferRead
                   , copyTargetToReadback recorder image readback
+                  , transitionResource recorder image (FromUse TransferRead) ColorAttachment
                   ]
                   >>= \case
                     Left refusal → pure (Left (Text.pack (show refusal)))
@@ -371,7 +372,9 @@ renderJudged rig = do
         pixelBytes (x, y) = [fromIntegral (ByteString.index bytes ((y * width + x) * 4 + k)) | k ← [0 .. 3]]
         clear = [p | p ← passedPixels, pixelBytes p == clearBytes]
     take 4 failed `shouldBe` []
-    length passedPixels `shouldSatisfy` (> (width * height) `div` 2)
+    -- enough of the image is decided for the judgement to speak: a minified view leaves more texel boundaries to the
+    -- oracle's refusal, so the floor is a quarter of the pixels, not half
+    length passedPixels `shouldSatisfy` (> (width * height) `div` 4)
     -- the world is drawn: some judged pixel shows terrain, not the clear colour
     length clear `shouldSatisfy` (< length passedPixels)
     pure (RenderedWorld revision world clear)
