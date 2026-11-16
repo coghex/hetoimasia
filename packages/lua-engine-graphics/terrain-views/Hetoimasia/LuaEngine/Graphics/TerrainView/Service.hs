@@ -94,7 +94,7 @@ import Hetoimasia.LuaEngine.Graphics.Scene.World (SceneWorld (..), WorldTag (..)
 import Hetoimasia.LuaEngine.Graphics.TerrainView.Inputs (CopySet, combineCopies, copyArena, copyContent, copyKnowledge, planInputs)
 import Hetoimasia.LuaEngine.Graphics.TerrainView.Style
 import Hetoimasia.LuaEngine.Graphics.TerrainView.Types
-import Hetoimasia.LuaEngine.Graphics.TerrainView.Owner (RegionBuild (..), ViewOwner (..))
+import Hetoimasia.LuaEngine.Graphics.TerrainView.Owner (BuildFailure (..), RegionBuild (..), ViewOwner (..))
 import Hetoimasia.LuaEngine.Texture (RenderAccount, accountCharged, accountLimit, accountRelease, accountReserve)
 import Hetoimasia.Math.Vector (V2 (..))
 import Hetoimasia.Render.TwoD.Chunk (ChunkRef)
@@ -1201,7 +1201,8 @@ buildRegions service wanted
   | otherwise =
       ownerBuild (portOwner (svPorts service)) [RegionBuild instances records | (instances, records) ← Map.elems wanted] >>= \case
         Nothing → pure Nothing
-        Just (Left why) → recordFailure service ("a retained region could not be built: " <> why) >> pure Nothing
+        Just (Left (BuildPressure _)) → pure Nothing
+        Just (Left (BuildFailed why)) → recordFailure service ("a retained region could not be built: " <> why) >> pure Nothing
         Just (Right chunks)
           | length chunks /= Map.size wanted → recordFailure service "the owner built another number of regions than asked" >> pure Nothing
           | otherwise →

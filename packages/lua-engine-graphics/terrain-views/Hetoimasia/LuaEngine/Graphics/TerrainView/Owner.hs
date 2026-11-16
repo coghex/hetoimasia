@@ -9,6 +9,7 @@
 module Hetoimasia.LuaEngine.Graphics.TerrainView.Owner
   ( ViewOwner (..)
   , RegionBuild (..)
+  , BuildFailure (..)
   , productionViewOwner
   ) where
 
@@ -25,9 +26,16 @@ import Hetoimasia.Render.TwoD.Chunk (BoundsRequest (DeriveBounds), ChunkKind (Ch
 import Hetoimasia.Render.TwoD.Material (MaterialRecord, MaterialRef)
 import Hetoimasia.Render.TwoD.Snapshot (Instance)
 import Hetoimasia.Render.TwoD.Vulkan (registerMaterial, rendererDepthFormat)
-import Hetoimasia.Render.TwoD.Vulkan.Chunks (ChunkStanding, buildRetainedChunkWith, chunkStandingSTM, markChunkReleasedSTM, releaseChunkNow)
+import Hetoimasia.Render.TwoD.Vulkan.Chunks (BuildRefusal (BuildUploadBackpressure), ChunkStanding, buildRetainedChunkWith, chunkStandingSTM, markChunkReleasedSTM, releaseChunkNow)
 import Hetoimasia.Render.TwoD.Vulkan.Textures (registeredMarks)
 import Hetoimasia.Terrain.Render2D.Vulkan.Material (terrainMaterial)
+
+-- | Why a build was refused: temporary pressure (the staging buffer or its queue full now, so asking again later can
+-- succeed), or a failure no retry changes, which is kept as evidence.
+data BuildFailure
+  = BuildPressure !Text
+  | BuildFailed !Text
+  deriving (Eq, Show)
 
 -- | One region to build: its instances (each naming the terrain material) and the records they index.
 data RegionBuild = RegionBuild
@@ -41,7 +49,7 @@ data ViewOwner = ViewOwner
     -- ^ The terrain material, registered with the session's renderer.
   , ownerDepthQualified ∷ !Bool
     -- ^ Whether the session's depth format is @D32_SFLOAT@, which the qualified cutout path needs.
-  , ownerBuild ∷ [RegionBuild] → IO (Maybe (Either Text [ChunkRef]))
+  , ownerBuild ∷ [RegionBuild] → IO (Maybe (Either BuildFailure [ChunkRef]))
     -- ^ Build these regions on the owner, in one action, each as one retained chunk of a depth-enabled world layer,
     -- answering their references in order. A refusal releases whatever the action built before it. 'Nothing' when
     -- the owner takes no more actions.
@@ -73,7 +81,9 @@ productionViewOwner host graphics = do
                 buildRetainedChunkWith builders retained marks ChunkWorldDepth DeriveBounds (Map.singleton material (buildRecords region)) (buildInstances region) >>= \case
                   Left why → do
                     forM_ acc (releaseChunkNow builders retained)
-                    pure (Left (Text.pack (show why)))
+                    pure . Left $ case why of
+                      BuildUploadBackpressure _ → BuildPressure (Text.pack (show why))
+                      _ → BuildFailed (Text.pack (show why))
                   Right chunk → go (chunk : acc) rest
           go [] regions
       , ownerRelease = \chunks → act host $ VulkanAction $ \construction → forM chunks (\chunk → either (Left . Text.pack . show) Right <$> releaseChunkNow (hostBuilders host construction) retained chunk)

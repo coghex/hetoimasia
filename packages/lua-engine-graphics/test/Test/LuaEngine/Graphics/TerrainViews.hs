@@ -45,7 +45,7 @@ import Hetoimasia.LuaEngine.Texture (RenderAccount, accountCharged, accountLimit
 import Hetoimasia.Render.TwoD.Chunk (ChunkRef)
 import Hetoimasia.Render.TwoD.Chunk.Backend (chunkRef)
 import Hetoimasia.Render.TwoD.Metrics (PixelExtent (..), TargetMetrics (..))
-import Hetoimasia.Render.TwoD.Snapshot (Camera (..), View (..))
+import Hetoimasia.Render.TwoD.Snapshot (Camera (..), Instance, View (..))
 import Hetoimasia.Render.TwoD.Vulkan.Chunks (ChunkStanding (..))
 import Hetoimasia.GPU.Vulkan.GLFW (TextureHandle (..))
 import Hetoimasia.Render.TwoD.Vulkan.Textures (toBackendHandle)
@@ -467,6 +467,40 @@ lifecycle = describe "close orders and limits" $ do
       readingRetainedRegions reading `shouldSatisfy` (> 0)
       closeView view
 
+  it "keeps a failed build as evidence, never as busy or success, and the previous view stays until a build succeeds" $
+    withViews $ \v → do
+      view ← attached v 1
+      first' ← awaitPublished v 1
+      previous ← latestWorld v 1
+      atomically (writeTVar (foFailure (vOwner v)) (Just "injected: the device refused the buffer"))
+      atomically (updateCamera view (CameraIntent [Camera.ZoomBy 2])) `shouldReturn` Right ()
+      bounded (atomically (terrainViewsFailures (vViews v) >>= check . any (Text.isInfixOf "injected: the device refused the buffer")))
+      bounded (atomically (readView view >>= check . readingWaiting))
+      publishedRevision (vModel v) 1 `shouldReturn` first'
+      latestWorld v 1 >>= (`shouldBe` worldTag previous) . worldTag
+      -- The owner recovers: the next intent is built and published.
+      atomically (writeTVar (foFailure (vOwner v)) Nothing)
+      atomically (updateCamera view (CameraIntent [Camera.ZoomBy 0.5])) `shouldReturn` Right ()
+      _ ← awaitPublished' v 1 (first' + 1)
+      closeView view
+
+  it "reproduces the same plan for a fresh view of the arena from its retained terrain and knowledge" $
+    withViews $ \v → do
+      view ← attached v 1
+      _ ← awaitPublished v 1
+      _ ← adoptNow (vModel v) 1
+      revealAt v (8, 8, 3)
+      quiescent v
+      _ ← currentHit v view
+      original ← drawnInstances v 1
+      closeView view
+      modelWindow (vModel v) 2
+      fresh ← attached v 2
+      bounded (atomically (readView fresh >>= check . (/= Nothing) . readingPublished))
+      again ← drawnInstances v 2
+      again `shouldBe` original
+      closeView fresh
+
   it "refuses an attachment beyond the service's views, before taking anything" $
     withViewsConfig testConfig {tvMaxViews = 1} $ \v → do
       _ ← attached v 1
@@ -764,10 +798,14 @@ data FakeOwner = FakeOwner
     -- ^ While closed, a build waits: the adapter's worker is held inside the owner's action.
   , foWaiting ∷ !(TVar Int)
     -- ^ Builds waiting at the closed gate.
+  , foFailure ∷ !(TVar (Maybe Text.Text))
+    -- ^ While set, a build fails with this reason, as the owner's would.
+  , foInstances ∷ !(TVar (Map ChunkRef [Instance]))
+    -- ^ What each chunk was built from.
   }
 
 newFakeOwner ∷ Model → IO FakeOwner
-newFakeOwner model = FakeOwner model <$> newTVarIO 1 <*> newTVarIO Map.empty <*> newTVarIO [] <*> newTVarIO 0 <*> newTVarIO True <*> newTVarIO 0
+newFakeOwner model = FakeOwner model <$> newTVarIO 1 <*> newTVarIO Map.empty <*> newTVarIO [] <*> newTVarIO 0 <*> newTVarIO True <*> newTVarIO 0 <*> newTVarIO Nothing <*> newTVarIO Map.empty
 
 fakeViewOwner ∷ FakeOwner → ViewOwner
 fakeViewOwner owner =
@@ -779,12 +817,17 @@ fakeViewOwner owner =
        atomically (readTVar (foGate owner) >>= check)
        atomically $ do
         modifyTVar' (foWaiting owner) (subtract 1)
-        start ← readTVar (foNext owner)
-        let refs = [chunkRef index 1 | index ← take (length regions) [start ..]]
-        writeTVar (foNext owner) (start + fromIntegral (length regions))
-        modifyTVar' (foStanding owner) (Map.union (Map.fromList [(ref, ChunkReady) | ref ← refs]))
-        modifyTVar' (foBuilt owner) (+ length regions)
-        pure (Just (Right refs))
+        failure ← readTVar (foFailure owner)
+        case failure of
+         Just why → pure (Just (Left (BuildFailed why)))
+         Nothing → do
+          start ← readTVar (foNext owner)
+          let refs = [chunkRef index 1 | index ← take (length regions) [start ..]]
+          writeTVar (foNext owner) (start + fromIntegral (length regions))
+          modifyTVar' (foStanding owner) (Map.union (Map.fromList [(ref, ChunkReady) | ref ← refs]))
+          modifyTVar' (foInstances owner) (Map.union (Map.fromList (zip refs (map buildInstances regions))))
+          modifyTVar' (foBuilt owner) (+ length regions)
+          pure (Just (Right refs))
     , ownerRelease = \chunks → atomically $ do
         modifyTVar' (foStanding owner) (\held → foldr Map.delete held chunks)
         modifyTVar' (foReleased owner) (<> chunks)
@@ -797,6 +840,13 @@ fakeViewOwner owner =
   where
     material ∷ MaterialRef
     material = defaultMaterial
+
+-- The instances of every chunk the window's latest world lists, in the world's order.
+drawnInstances ∷ Views → Int → IO [[Instance]]
+drawnInstances v window = do
+  world ← latestWorld v window
+  built ← readTVarIO (foInstances (vOwner v))
+  pure [Map.findWithDefault [] chunk built | chunk ← Set.toList (worldChunks world)]
 
 releasedChunks ∷ FakeOwner → IO [ChunkRef]
 releasedChunks = readTVarIO . foReleased
