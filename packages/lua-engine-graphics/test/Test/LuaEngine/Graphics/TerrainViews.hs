@@ -14,7 +14,7 @@ import Control.Concurrent (forkIO, killThread, myThreadId)
 import Control.Exception (MaskingState (Unmasked), getMaskingState)
 import Control.Concurrent.STM
 import Control.Exception (finally)
-import Control.Monad (forever, unless, void, when)
+import Control.Monad (forM_, forever, unless, void, when)
 import qualified Data.ByteString as ByteString
 import qualified Data.ByteString.Char8 as BC
 import Data.Map.Strict (Map)
@@ -424,6 +424,33 @@ races = describe "attachment and intent" $ do
 
 eviction ∷ Spec
 eviction = describe "eviction" $ do
+  it "keeps publishing while another holder loads a region at every step of a panning camera: at most two attempts per publication" $
+    withViews $ \v → do
+      view ← attached v 1
+      _ ← awaitPublished v 1
+      quiescent v
+      other ← Runtime.openView (_vTerrain v) (vClient v) >>= either (fail . show) pure
+      let tagNow = tagRevision . worldTag <$> latestWorld v 1
+          steps = 10 ∷ Int64
+      published0 ← publishedRevision (vModel v) 1
+      attempts0 ← tagNow
+      forM_ [1 .. steps] $ \k → do
+        -- each step the camera moves and one more region loads elsewhere, moving the residency generation
+        atomically (updateCamera view (CameraIntent [Camera.Pan (if even k then 1 else -1) 0])) `shouldReturn` Right ()
+        start ← generationNow v
+        demand ← either (fail . show) pure (RegionDemand (RegionCoord (300 + k) 0 0) <$> coverageBox 0 16 0 16 0 32)
+        _ ← Runtime.setViewDemand (_vTerrain v) other (vArena v) [demand] >>= either (fail . show) pure
+        bounded . atomically $ Runtime.inspectArenaSTM (_vTerrain v) (vArena v) >>= \case
+          Just arena | fromIntegral (Runtime.viewGeneration arena) /= start → pure ()
+          _ → retry
+        -- the view publishes for the step's intent at the generation the load left
+        void (currentHit v view)
+      published ← subtract published0 <$> publishedRevision (vModel v) 1
+      attempts ← subtract attempts0 <$> tagNow
+      published `shouldSatisfy` (>= fromIntegral steps)
+      attempts `shouldSatisfy` (<= 2 * fromIntegral published)
+      Runtime.closeView (_vTerrain v) other
+      closeView view
   it "pans away until the view's regions are evicted and back: they reload, and the view publishes the same plan and picks again" $
     withViewsTerrain HostFirst tightTerrain stripes testConfig $ \v → do
       view ← attached v 1
