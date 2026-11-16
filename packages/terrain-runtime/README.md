@@ -296,11 +296,10 @@ borrow is released on every exit.
 `requestRegionSnapshot svc lease regions` (`regionsWith` on the settlement seam) asks for an immutable
 terrain-and-knowledge copy of at most `specHoldRegions` whole regions (16 × 16 × 32), resident or not.
 It is admitted at once or refused, creating nothing: `RefusedInvalid` for an empty set, a duplicate
-region, a region of unsupported coordinates or more than `specHoldRegions` regions; `RefusedBusy
-BusyRetained` when the retained bank cannot make its reservation; the usual authority and closure
-refusals. The configured extent bounds what a request may touch, not what a copy describes: under a
-reduced extent the copy still answers every cell, and a cell outside the extent holds the source (no
-removal can land there).
+region, a region of unsupported coordinates, more than `specHoldRegions` regions, or any region set
+under a configured extent smaller than a region (a copy covers whole regions, and a request may touch
+only cells inside the extent); `RefusedBusy BusyRetained` when the retained bank cannot make its
+reservation; the usual authority and closure refusals.
 
 **The value** (`RegionSnapshot`, abstract, accessors only): the arena incarnation; the content and
 knowledge revisions of the one committed version it was read from; the residency generation read in the

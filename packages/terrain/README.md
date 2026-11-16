@@ -1266,9 +1266,9 @@ service's regional snapshot). It names whole regions of supported tiles, at most
 distinct and at least one (`EmptyDemand`, `DuplicateRegion`, `UnsupportedRegion`, `DemandTooLarge`
 otherwise), and charges its hold records on the camera's share of staging like any hold, but it
 needs none of its regions resident, never protects resident detail from eviction, never touches
-recency and is not charged at the stored maximum. The configured extent bounds what a request may
-touch, not what a copy may describe, so a copied hold is taken under any extent. Like any hold it
-keeps its arena retiring until it is released.
+recency and is not charged at the stored maximum. The model checks no extent for it: the terrain
+service refuses a regional snapshot under an extent smaller than a region. Like any hold it keeps its
+arena retiring until it is released.
 
 A resident region may be chosen as a victim only when it has no interest, no hold
 (borrower or publication pin; a copied hold protects nothing), no job, no unsettled changes and no handoff in
