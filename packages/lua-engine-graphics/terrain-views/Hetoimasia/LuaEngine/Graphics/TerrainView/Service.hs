@@ -1424,9 +1424,17 @@ pickPrecondition (TerrainView service state) ref =
       claim ← claimOf (portClaims (svPorts service)) (pickTarget identity)
       adopted ← adoptedRevision service state
       residency ← residencyNow service state
+      -- the target is still usable and draws at the metrics the picked plan was made for: a resize, a content-scale
+      -- change or a revoked target makes the reference stale while the same revision stays adopted
+      usable ← vtUsable (vsTarget state)
+      metrics ← vtMetrics (vsTarget state)
+      picked ← fmap pinMetrics . Map.lookup (tagRevision (pickTag identity)) <$> readTVar (vsPins state)
       pure
         ( not closing
             && fmap claimView claim == Just (vsId state)
             && fmap (\(revision, tag) → (fromIntegral revision, tag)) adopted == Just (pickRevision identity, pickTag identity)
             && residency == Just (pickResidency identity)
+            && usable
+            && isJust metrics
+            && picked == metrics
         )

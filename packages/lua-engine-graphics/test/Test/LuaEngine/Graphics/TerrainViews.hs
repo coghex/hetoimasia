@@ -108,6 +108,8 @@ data Views = Views
   , vNormalKey ∷ !Word64
   , vClient ∷ !Runtime.Client
     -- ^ The terrain client that holds the arena's lease.
+  , vMetrics ∷ !(TVar TargetMetrics)
+    -- ^ What every test target draws at; an example changes it as a resize or a content-scale change would.
   }
 
 spec ∷ Spec
@@ -222,6 +224,23 @@ pickConsistency = describe "a pick's consistency reference" $ do
       quiescentRevisions ← Runtime.arenaStatus (_vTerrain v) (vArena v) >>= either (fail . show) pure
       Runtime.preconditionKnowledge (pickPrecondition view fresh) `shouldBe` Just (Runtime.statusKnowledgeRevision quiescentRevisions)
       removeWith v (pickRefCell fresh) (Just (pickPrecondition view fresh)) >>= (`shouldBe` Left Runtime.StaleView)
+      closeView view
+
+  it "refuses a pick's removal once the target is revoked or resized while the same revision stays adopted" $
+    withViews $ \v → do
+      view ← attached v 1
+      _ ← awaitPublished v 1
+      _ ← adoptNow (vModel v) 1
+      revealAt v (8, 8, 3)
+      quiescent v
+      hit ← currentHit v view
+      -- the target is revoked: the reference is stale, and the edit is not made
+      setUsable (vModel v) 1 False
+      removeWith v (pickRefCell hit) (Just (pickPrecondition view hit)) >>= (`shouldBe` Left Runtime.StaleView)
+      setUsable (vModel v) 1 True
+      -- the target is resized: the adopted revision is unchanged, but it was planned for the old metrics
+      atomically (modifyTVar' (vMetrics v) (\m → m {metricsFramebuffer = PixelExtent 160 96}))
+      removeWith v (pickRefCell hit) (Just (pickPrecondition view hit)) >>= (`shouldBe` Left Runtime.StaleView)
       closeView view
 
   it "refuses a pick's removal once a load moves the residency generation, and removes through one picked from the revision made at the new generation" $
@@ -1069,6 +1088,7 @@ withViewsTerrain order terrainConfig source config body = do
         normalKey ← leaseKey comp vm "normal"
         withTerrain terrainConfig source (cpAccount comp) $ \terrain client arena → do
           claims ← newSceneClaims
+          metricsVar ← newTVarIO metrics
           owner ← newFakeOwner model
           initial ← prepare initialGraphicsScene
           let ports =
@@ -1085,7 +1105,7 @@ withViewsTerrain order terrainConfig source config body = do
                   , portAccount = cpAccount comp
                   , portTaking = pure True
                   }
-          let run views = body (Views comp vm fake model terrain arena views owner claims (cpAccount comp) style colourKey normalKey client)
+          let run views = body (Views comp vm fake model terrain arena views owner claims (cpAccount comp) style colourKey normalKey client metricsVar)
           case order of
             HostFirst → withTerrainViews config ports (\views → run views `finally` dissolve model)
             ViewsFirst → withTerrainViews config ports run `finally` dissolve model
@@ -1107,7 +1127,7 @@ target v window =
         , vtUsable = usable
         , vtPublish = \scene → (== HostAccepted) <$> publishing scene
         , vtDepth = True
-        , vtMetrics = pure (Just metrics)
+        , vtMetrics = Just <$> readTVar (vMetrics v)
         }
 
 -- The request of a view of the arena on this window, with the instance's style.
