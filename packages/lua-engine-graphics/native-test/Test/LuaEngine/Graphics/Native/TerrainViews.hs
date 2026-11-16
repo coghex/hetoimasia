@@ -23,6 +23,7 @@ module Test.LuaEngine.Graphics.Native.TerrainViews (spec, fullSpec) where
 import Control.Concurrent.STM
 import Control.Exception (finally, onException)
 import Control.Monad (forM, forM_, unless, void, when)
+import System.Timeout (timeout)
 import qualified Data.ByteString as ByteString
 import qualified Data.ByteString.Char8 as BC
 import Data.IORef (newIORef, readIORef, writeIORef)
@@ -226,12 +227,18 @@ fullSpec env = describe "terrain views (full)" $ do
   it "keeps the adopted image when a replacement is refused as stale, then draws the replacement once it is made again" $ do
     stage ← newTVarIO (Nothing ∷ Maybe (Text.Text, TVar Bool))
     held ← newTVarIO False
+    -- every gate opens when the example ends, however it ends, so the views' worker is never left parked in the hook
+    -- and a failure is reported rather than hanging the teardown
+    released ← newTVarIO False
     let hook _ entered = do
           wait ← atomically $ readTVar stage >>= \case
             Just (wanted, opened) | wanted == entered → Just opened <$ (writeTVar stage Nothing >> writeTVar held True)
             _ → pure Nothing
-          forM_ wait $ \opened → atomically (readTVar opened >>= check)
-    within 90 . withRigOn loamOverGranite (\c → c {tvOnStage = hook}) env $ \rig → do
+          forM_ wait $ \opened → atomically ((||) <$> readTVar opened <*> readTVar released >>= check)
+        awaitHeld what =
+          timeout 20000000 (atomically (readTVar held >>= check))
+            >>= maybe (assertFailure ("the views' worker did not reach " <> what <> " within 20 seconds")) pure
+    within 90 . withRigOn loamOverGranite (\c → c {tvOnStage = hook}) env $ \rig → (`finally` atomically (writeTVar released True)) $ do
       view ← attach rig (metricsOf 128 96)
       n ← awaitAdopted rig 1
       before' ← renderJudged rig "the adopted image"
@@ -240,11 +247,11 @@ fullSpec env = describe "terrain views (full)" $ do
       uploaded ← newTVarIO False
       atomically (writeTVar stage (Just ("uploading", uploaded)))
       atomically (updateCamera view (CameraIntent [Camera.ZoomBy 2])) `shouldReturn` Right ()
-      within 20 (atomically (readTVar held >>= check))
+      awaitHeld "the replacement's uploading stage"
       moveResidency rig
       again ← newTVarIO False
       atomically (writeTVar held False >> writeTVar stage (Just ("copying", again)) >> writeTVar uploaded True)
-      within 20 (atomically (readTVar held >>= check))
+      awaitHeld "the copying stage of the preparation after the stale refusal"
       publishedOf rig `shouldReturn` n
       kept ← renderJudged rig "kept after the stale replacement"
       worldTag (rwWorld kept) `shouldBe` worldTag (rwWorld before')
