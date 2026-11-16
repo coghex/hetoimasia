@@ -537,10 +537,19 @@ account cannot reserve refuses the step as the model's own full staging bank wou
 (`RefusedBusy`, nothing changed); a decrease is returned. The model, its admission order
 and its invariants are unchanged; an explicit request stays one all-or-nothing unit, and a
 camera demand is refused whole while the account rather than the model is the binding
-limit (its holder sends it again). The owner's wait reads the account's charge, so a
-release by another consumer wakes queued work. What the service still holds is returned
-after its drain. Without an account the service keeps its internal bank and charges
-nothing outside.
+limit (its holder sends it again). A step that raises nothing (clearing or withdrawing
+a demand, closing a view, releasing a hold or borrow, a job, victim or commit report) is
+never refused by the account. The owner's wait reads the account's charge, so a
+release by another consumer wakes queued work. The snapshot backing bank
+(`configRetainedBytes`), which the ports charge outside the model's steps (snapshot
+backing, regional snapshot reservations and footprints, request result records), is held
+in the account as a fixed carve-out for the service's whole life: reserved in one
+transaction before anything starts, or the service is refused (`ConfigStagingAccount`)
+with nothing started and nothing reserved, and returned after the drain. So the model's
+staging and the backing bank together never exceed what the account granted, and a
+regional snapshot is never funded outside it. The rest of what the service holds is
+returned after its drain. Without an account the service keeps its internal bank and
+charges nothing outside.
 
 The service adds the approved caps of four arenas, 64 arena leases and eight views,
 a snapshot backing bank carved from the staging bank (see Snapshots; a regional snapshot names at most

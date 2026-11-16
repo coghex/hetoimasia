@@ -571,12 +571,20 @@ intent only) starts from regional copies (`requestRegionSnapshot`) of the
 camera's anchor and grows them with each plan's own visible demand, a bounded
 number of rounds, from fresh coherent copies (one incarnation, content and
 knowledge revision); copies of different versions are never combined, and a
-copy is released once the facts and knowledge are made. Regions not yet read
+copy is released once the facts and knowledge are made. Every copy's residency
+generation stays in the plan's identity: the one generation when they agree,
+otherwise a digest of all of them (top bit set), never one relabelled as
+another. Regions not yet read
 are pending, never fog or air. The camera's interests (`setViewDemand`,
 visible before prefetch) are kept and sent again when a busy refusal clears.
 A plan superseded by newer intent is abandoned. Its quads are grouped into
 retained regions of 16 x 16 cells of the view frame, each region one chunk; a
-region whose instances and records are unchanged is reused. Chunks are built
+region whose instances and records are unchanged is reused, checked by content,
+never assumed. Frames and presentation-only changes reuse every region. The
+planner's depth keys are dense plan-wide ranks, so an edit that changes the
+plan rebuilds every region whose bytes changed, which can be every region
+nearer than the edit; the old revision stays published until the new one is
+whole. Chunks are built
 by owner actions, published only once their uploads are ready, and retired
 through the host's release barrier (asked without waiting) and the ledger:
 released on the owner only when no adoption lists them.

@@ -13,7 +13,7 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView.Owner
   , productionViewOwner
   ) where
 
-import Control.Concurrent.STM (STM, atomically)
+import Control.Concurrent.STM (STM, atomically, retry)
 import Control.Monad (forM, forM_, void)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
@@ -63,6 +63,9 @@ data ViewOwner = ViewOwner
     -- meet it), or 'Left' when the request could not be queued now (a full lane: asked again later).
   , ownerStanding ∷ ChunkRef → STM (Maybe ChunkStanding)
     -- ^ A chunk's upload: uploading, ready or failed; 'Nothing' for one never built or since released.
+  , ownerEnd ∷ STM ()
+    -- ^ Completes once the owner takes no more actions (its admission closed or its session failed) and retries until
+    -- then. It writes nothing.
   }
 
 -- | The capability over the running host and the composed graphics session.
@@ -100,6 +103,13 @@ productionViewOwner host graphics = do
                   Just (ActionReturned ()) → pure (Just True)
                   Just _ → pure (Just False)
       , ownerStanding = chunkStandingSTM retained
+      , -- The host's own admission answers whether its owner still takes actions: a probe admitted while it does is
+        -- rolled back by the retry, so nothing is queued, and the transaction wakes when the admission changes.
+        ownerEnd =
+          submitVulkanAction host (VulkanAction (\_ → pure ())) >>= \case
+            Left (ActionSessionFailed _) → pure ()
+            Left ActionOwnerClosed → pure ()
+            _ → retry
       }
   where
     retained = graphicsRetained graphics

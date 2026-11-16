@@ -76,7 +76,7 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView.Service
 import Control.Concurrent (forkIOWithUnmask)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar)
 import Control.Concurrent.STM
-import Control.Exception (SomeException, catch, displayException, finally, mask_, try)
+import Control.Exception (SomeAsyncException, SomeException, displayException, finally, fromException, mask, mask_, onException, throwIO, try)
 import Control.Monad (forM, forM_, unless, void, when)
 import Data.Foldable (for_)
 import Data.List (nub)
@@ -181,6 +181,8 @@ data TerrainViews k = TerrainViews
   , svCursor ∷ !(TVar Word64)
   , svReleases ∷ !(TVar Word64)
     -- ^ Counts every release of a copy, a pin or a retained region's bytes: what a view waiting on pressure watches.
+  , svShutDown ∷ !(TVar Bool)
+    -- ^ Whether the service's end ran to completion (on the worker, or on the scope's exit when the worker was cancelled).
   }
 
 data Request k
@@ -302,10 +304,44 @@ withTerrainViews config ports body = do
       <*> newTVarIO []
       <*> newTVarIO 0
       <*> newTVarIO 0
+      <*> newTVarIO False
   done ← newEmptyMVar
-  mask_ $ do
-    _ ← forkIOWithUnmask $ \unmask → (unmask (worker service) `catch` \(failure ∷ SomeException) → recordFailure service ("the worker failed: " <> Text.pack (displayException failure))) `finally` putMVar done ()
-    (body service `finally` (atomically (writeTVar (svOpen service) False) >> tvStopping config >> readMVar done))
+  mask $ \restore → do
+    _ ← forkIOWithUnmask $ \unmask →
+      (unmask (worker service) >>= \case
+        Left failure → recordFailure service ("the worker failed: " <> Text.pack (displayException failure))
+        Right () → pure ())
+        `finally` (workerEnded service >> putMVar done ())
+    restore (body service) `finally` do
+      atomically (writeTVar (svOpen service) False)
+      tvStopping config
+      readMVar done
+      -- A worker that was cancelled did not run the service's end: run it here, so every view is still closed.
+      ended ← readTVarIO (svShutDown service)
+      unless ended (shutdown service)
+
+-- The worker is gone, by its end or a cancellation: no attachment is taken any more, and every one still queued settles
+-- stopped, releasing the parents it holds.
+workerEnded ∷ (Ord k, Show k) ⇒ TerrainViews k → IO ()
+workerEnded service = do
+  queued ← atomically $ do
+    writeTVar (svOpen service) False
+    readTVar (svRequests service) <* writeTVar (svRequests service) []
+  settleQueued queued
+
+settleQueued ∷ [Request k] → IO ()
+settleQueued queued =
+  forM_ queued $ \(RequestAttach _ style box) → do
+    releaseStyle style
+    atomically (readTVar box >>= \case Nothing → writeTVar box (Just (SettledRefused AttachStopped)); Just _ → pure ())
+
+-- | Run an action, answering a synchronous failure as a value and rethrowing an asynchronous exception (a cancellation
+-- is never recorded as a failure, and never lets the worker loop on).
+trySync ∷ IO a → IO (Either SomeException a)
+trySync action =
+  try action >>= \case
+    Left failure | Just (_ ∷ SomeAsyncException) ← fromException failure → throwIO failure
+    result → pure result
 
 recordFailure ∷ (Ord k, Show k) ⇒ TerrainViews k → Text → IO ()
 recordFailure service why = atomically (modifyTVar' (svFailures service) (take 64 . (why :)))
@@ -375,7 +411,7 @@ cancelAttach service (PendingAttach box) = do
 -- The worker's attachment: every check before the claim, then one transaction that claims and takes the interests.
 runAttach ∷ (Ord k, Show k) ⇒ TerrainViews k → AttachRequest k → AcquiredStyle → TVar (Maybe (Settled (TerrainView k))) → IO ()
 runAttach service request style box = do
-  outcome ← try (attachSteps service request style box)
+  outcome ← trySync (attachSteps service request style box) `onException` (releaseStyle style >> settle (SettledRefused AttachStopped))
   case outcome of
     Left (failure ∷ SomeException) → do
       recordFailure service ("an attachment failed: " <> Text.pack (displayException failure))
@@ -681,8 +717,8 @@ data Work k
   | WorkPrepare !(ViewState k)
   | WorkDemand !(ViewState k)
 
-worker ∷ (Ord k, Show k) ⇒ TerrainViews k → IO ()
-worker service = loop
+worker ∷ (Ord k, Show k) ⇒ TerrainViews k → IO (Either SomeException ())
+worker service = trySync loop
   where
     loop =
       atomically (nextWork service) >>= \case
@@ -693,7 +729,7 @@ worker service = loop
         WorkPrepare state → guarded (prepareView service state) >> loop
         WorkDemand state → guarded (resendDemand service state) >> loop
     guarded action =
-      try action >>= \case
+      trySync action >>= \case
         Left (failure ∷ SomeException) → recordFailure service (Text.pack (displayException failure))
         Right () → pure ()
 
@@ -772,15 +808,14 @@ shutdown service = do
   views ← Map.elems <$> readTVarIO (svViews service)
   forM_ views $ \state → do
     atomically (writeTVar (vsClosing state) True)
-    try (runClose service state) >>= \case
+    trySync (runClose service state) >>= \case
       Left (failure ∷ SomeException) → recordFailure service ("a view's close failed: " <> Text.pack (displayException failure))
       Right () → pure ()
   -- Settle every attachment still queued.
   queued ← atomically (readTVar (svRequests service) <* writeTVar (svRequests service) [])
-  forM_ queued $ \(RequestAttach _ style box) → do
-    releaseStyle style
-    atomically (readTVar box >>= \case Nothing → writeTVar box (Just (SettledRefused AttachStopped)); Just _ → pure ())
+  settleQueued queued
   drain
+  atomically (writeTVar (svShutDown service) True)
   where
     drain = do
       remaining ← null <$> readTVarIO (svRetiring service)
@@ -791,9 +826,11 @@ shutdown service = do
             True → drain
             False → abandonRetirements service
           else do
-            -- Wait for the ledger to let a retiring chunk go: an adopted revision's last use.
-            atomically (retirable service >>= check)
-            drain
+            -- Wait for the ledger to let a retiring chunk go (an adopted revision's last use), or for the graphics owner
+            -- to end: then no adoption it still records will ever be released to us, and what is left is kept as
+            -- terminal evidence. So the scope's exit ends in either order of the host's end and the views'.
+            moved ← atomically ((True <$ (retirable service >>= check)) `orElse` (False <$ ownerEnd (portOwner (svPorts service))))
+            if moved then drain else abandonRetirements service
 
 -- Whether some retiring chunk can move: its barrier not yet asked for, its barrier's answer arrived, or the barrier met
 -- and no adoption lists it. Nothing here waits for the barrier itself, so a target that adopts nothing delays only its

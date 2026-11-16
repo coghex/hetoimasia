@@ -10,10 +10,11 @@
 -- @terrain views@ subgroup draws.
 module Test.LuaEngine.Graphics.TerrainViews (spec) where
 
-import Control.Concurrent (forkIO)
+import Control.Concurrent (forkIO, killThread, myThreadId)
+import Control.Exception (MaskingState (Unmasked), getMaskingState)
 import Control.Concurrent.STM
 import Control.Exception (finally)
-import Control.Monad (unless, void, when)
+import Control.Monad (forever, unless, void, when)
 import qualified Data.ByteString as ByteString
 import qualified Data.ByteString.Char8 as BC
 import Data.Map.Strict (Map)
@@ -608,6 +609,67 @@ lifecycle = describe "close orders and limits" $ do
     Just second ← readTVarIO queued
     atomically (attachSettled second) `shouldReturn` Just (SettledRefused AttachStopped)
 
+  it "runs its body with the caller's masking state, never masked by the scope" $
+    withViews (\_ → getMaskingState) `shouldReturn` Unmasked
+
+  it "ends the scope's exit when the graphics owner ends first, keeping the retirements it can no longer prove as evidence" $ do
+    (views, built) ← withViewsOrdered ViewsFirst loamOverGranite testConfig $ \v → do
+      view ← attached v 1
+      first' ← awaitPublished v 1
+      adoptNow (vModel v) 1 `shouldReturn` Adopted first'
+      closeView view
+      -- the empty handback is adopted, but the host never releases the revision before it: the ledger still holds its
+      -- chunks when the owner ends
+      adoptNow (vModel v) 1 `shouldReturn` Adopted (first' + 1)
+      atomically (writeTVar (foEnded (vOwner v)) True)
+      built ← Map.keys <$> readTVarIO (foInstances (vOwner v))
+      pure (vViews v, built)
+    built `shouldSatisfy` (not . null)
+    failures ← atomically (terrainViewsFailures views)
+    failures `shouldSatisfy` any (Text.isPrefixOf "retirement could not be proved")
+
+  it "ends the scope's exit when the views end first while the host keeps presenting, releasing every chunk" $ do
+    stepper ← newTVarIO Nothing
+    (views, owner, claims) ← (`finally` (readTVarIO stepper >>= mapM_ killThread)) . withViewsOrdered ViewsFirst loamOverGranite testConfig $ \v → do
+      _ ← attached v 1
+      first' ← awaitPublished v 1
+      adoptNow (vModel v) 1 `shouldReturn` Adopted first'
+      -- the host adopts whatever is published and releases what that supersedes, for as long as the example runs
+      let step = forever $ do
+            atomically (modelCapture (vModel v) >>= id >>= check . not)
+            _ ← adoptNow (vModel v) 1
+            releasePass (vModel v)
+      thread ← forkIO step
+      atomically (writeTVar stepper (Just thread))
+      pure (vViews v, vOwner v, vClaims v)
+    atomically (terrainViewsFailures views) `shouldReturn` []
+    built ← Map.keys <$> readTVarIO (foInstances owner)
+    released ← releasedChunks owner
+    Set.fromList released `shouldBe` Set.fromList built
+    atomically (claimOf claims 1) `shouldReturn` Nothing
+
+  it "rethrows a cancellation of its worker instead of recording it: the worker ends, attachments stop, and the scope's exit still closes every view" $ do
+    (views, claims) ← withViews $ \v → do
+      view ← attached v 1
+      first' ← awaitPublished v 1
+      quiescent v
+      atomically (writeTVar (foCancelNext (vOwner v)) True)
+      -- a zoom changes every region, so the next plan builds
+      atomically (updateCamera view (CameraIntent [Camera.ZoomBy 2])) `shouldReturn` Right ()
+      -- the worker took the cancellation inside its next build
+      bounded (atomically (readTVar (foCancelNext (vOwner v)) >>= check . not))
+      modelWindow (vModel v) 2
+      settled ← inInstance (vComp v) (vVm v) "i" (attachView (vViews v) (requestFor v (target v 2))) >>= \case
+        Left refusal → pure (SettledRefused refusal)
+        Right attaching → bounded (awaitAttach attaching)
+      settled `shouldSatisfy` \case SettledRefused AttachStopped → True; _ → False
+      publishedRevision (vModel v) 1 `shouldReturn` first'
+      atomically (terrainViewsFailures (vViews v)) `shouldReturn` []
+      pure (vViews v, vClaims v)
+    -- the scope's exit ran the service's end itself: the view's claim is handed back
+    atomically (claimOf claims 1) `shouldReturn` Nothing
+    atomically (terrainViewsFailures views) `shouldReturn` []
+
   it "refuses an attachment beyond the service's views, before taking anything" $
     withViewsConfig testConfig {tvMaxViews = 1} $ \v → do
       _ ← attached v 1
@@ -682,7 +744,14 @@ withViewsConfig ∷ TerrainViewsConfig → (Views → IO a) → IO a
 withViewsConfig = withViewsOn loamOverGranite
 
 withViewsOn ∷ SourceSpec → TerrainViewsConfig → (Views → IO a) → IO a
-withViewsOn source config body = do
+withViewsOn = withViewsOrdered HostFirst
+
+-- | Which ends first at the scope's exit: the scene host (its windows dissolved, every adoption released) or the views
+-- (the host model stays, and the example decides what it does while the views end).
+data EndOrder = HostFirst | ViewsFirst
+
+withViewsOrdered ∷ EndOrder → SourceSpec → TerrainViewsConfig → (Views → IO a) → IO a
+withViewsOrdered order source config body = do
   style ← loadAtlasStyle 5 [("loam", "colour.loam"), ("granite", "colour.granite")]
   sample ← findSampleDirectory
   let atlas = sample </> "content" </> "textures" </> "terrain-atlas"
@@ -719,9 +788,10 @@ withViewsOn source config body = do
                   , portAccount = cpAccount comp
                   , portTaking = pure True
                   }
-          withTerrainViews config ports $ \views →
-            body (Views comp vm fake model terrain arena views owner claims (cpAccount comp) style colourKey normalKey)
-              `finally` dissolve model
+          let run views = body (Views comp vm fake model terrain arena views owner claims (cpAccount comp) style colourKey normalKey)
+          case order of
+            HostFirst → withTerrainViews config ports (\views → run views `finally` dissolve model)
+            ViewsFirst → withTerrainViews config ports run `finally` dissolve model
 
 -- Small enough for a quick example: a 128 x 96 target and a 30-level band, which reaches the surface below the followed
 -- camera's 25 levels of headroom.
@@ -911,10 +981,15 @@ data FakeOwner = FakeOwner
     -- ^ What each chunk was built from.
   , foHoldUploads ∷ !(TVar Bool)
     -- ^ While set, a new chunk's upload stays under way until the example completes it.
+  , foEnded ∷ !(TVar Bool)
+    -- ^ Once set, the owner takes no more actions, as a closed host's: builds and releases answer 'Nothing' and a
+    -- barrier not yet met is never met.
+  , foCancelNext ∷ !(TVar Bool)
+    -- ^ While set, the next build cancels the thread that asked for it (the adapter's worker), once.
   }
 
 newFakeOwner ∷ Model → IO FakeOwner
-newFakeOwner model = FakeOwner model <$> newTVarIO 1 <*> newTVarIO Map.empty <*> newTVarIO [] <*> newTVarIO 0 <*> newTVarIO True <*> newTVarIO 0 <*> newTVarIO Nothing <*> newTVarIO Map.empty <*> newTVarIO False
+newFakeOwner model = FakeOwner model <$> newTVarIO 1 <*> newTVarIO Map.empty <*> newTVarIO [] <*> newTVarIO 0 <*> newTVarIO True <*> newTVarIO 0 <*> newTVarIO Nothing <*> newTVarIO Map.empty <*> newTVarIO False <*> newTVarIO False <*> newTVarIO False
 
 fakeViewOwner ∷ FakeOwner → ViewOwner
 fakeViewOwner owner =
@@ -922,32 +997,45 @@ fakeViewOwner owner =
     { ownerMaterial = material
     , ownerDepthQualified = True
     , ownerBuild = \regions → do
-       atomically (modifyTVar' (foWaiting owner) (+ 1))
-       atomically (readTVar (foGate owner) >>= check)
-       atomically $ do
-        modifyTVar' (foWaiting owner) (subtract 1)
-        failure ← readTVar (foFailure owner)
-        case failure of
-         Just why → pure (Just (Left (BuildFailed why)))
-         Nothing → do
-          start ← readTVar (foNext owner)
-          let refs = [chunkRef index 1 | index ← take (length regions) [start ..]]
-          writeTVar (foNext owner) (start + fromIntegral (length regions))
-          holding ← readTVar (foHoldUploads owner)
-          modifyTVar' (foStanding owner) (Map.union (Map.fromList [(ref, if holding then ChunkUploading else ChunkReady) | ref ← refs]))
-          modifyTVar' (foInstances owner) (Map.union (Map.fromList (zip refs (map buildInstances regions))))
-          modifyTVar' (foBuilt owner) (+ length regions)
-          pure (Just (Right refs))
+       cancel ← atomically (readTVar (foCancelNext owner) <* writeTVar (foCancelNext owner) False)
+       when cancel (myThreadId >>= killThread)
+       ended ← readTVarIO (foEnded owner)
+       if ended then pure Nothing else buildNow regions
     , ownerRelease = \chunks → atomically $ do
-        modifyTVar' (foStanding owner) (\held → foldr Map.delete held chunks)
-        modifyTVar' (foReleased owner) (<> chunks)
-        pure (Just (map (const (Right ())) chunks))
+        ended ← readTVar (foEnded owner)
+        if ended
+          then pure Nothing
+          else do
+            modifyTVar' (foStanding owner) (\held → foldr Map.delete held chunks)
+            modifyTVar' (foReleased owner) (<> chunks)
+            pure (Just (map (const (Right ())) chunks))
     , ownerBarrier = \_ → do
         met ← modelCapture (foModel owner)
-        pure (Right ((\done → if done then Just True else Nothing) <$> met))
+        pure . Right $ do
+          ended ← readTVar (foEnded owner)
+          done ← met
+          pure (if done then Just True else if ended then Just False else Nothing)
     , ownerStanding = \chunk → Map.lookup chunk <$> readTVar (foStanding owner)
+    , ownerEnd = readTVar (foEnded owner) >>= check
     }
   where
+    buildNow regions = do
+         atomically (modifyTVar' (foWaiting owner) (+ 1))
+         atomically (readTVar (foGate owner) >>= check)
+         atomically $ do
+          modifyTVar' (foWaiting owner) (subtract 1)
+          failure ← readTVar (foFailure owner)
+          case failure of
+           Just why → pure (Just (Left (BuildFailed why)))
+           Nothing → do
+            start ← readTVar (foNext owner)
+            let refs = [chunkRef index 1 | index ← take (length regions) [start ..]]
+            writeTVar (foNext owner) (start + fromIntegral (length regions))
+            holding ← readTVar (foHoldUploads owner)
+            modifyTVar' (foStanding owner) (Map.union (Map.fromList [(ref, if holding then ChunkUploading else ChunkReady) | ref ← refs]))
+            modifyTVar' (foInstances owner) (Map.union (Map.fromList (zip refs (map buildInstances regions))))
+            modifyTVar' (foBuilt owner) (+ length regions)
+            pure (Just (Right refs))
     material ∷ MaterialRef
     material = defaultMaterial
 
