@@ -84,7 +84,7 @@ import Control.Exception (Exception, SomeAsyncException, SomeException, displayE
 import Control.Monad (forM, forM_, unless, void, when)
 import Data.Foldable (for_)
 import Data.Functor ((<&>))
-import Data.List (nub)
+import Data.List (nub, sortOn)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (fromMaybe, isJust, isNothing, mapMaybe)
@@ -96,7 +96,7 @@ import Hetoimasia.Foundation.Messaging.Payload (Prepared, prepare)
 import Hetoimasia.LuaEngine.Graphics.Scene.Claims (Claim (..), SceneClaims, claimOf, markClaimPublished, releaseClaim, takeClaim)
 import Hetoimasia.LuaEngine.Graphics.Scene.Ledger (GraphicsScene, SceneLedger, ledgerChunkHeld, ledgerDropInterest, ledgerNewestAdopted, ledgerRetainInterest, worldGraphicsScene)
 import Hetoimasia.LuaEngine.Graphics.Scene.World (SceneWorld (..), WorldTag (..))
-import Hetoimasia.LuaEngine.Graphics.TerrainView.Inputs (CopySet, combineCopies, copyArena, copyContent, copyGeneration, copyKnowledge, copySnapshots, planInputs)
+import Hetoimasia.LuaEngine.Graphics.TerrainView.Inputs (CopySet, combineCopies, copyArena, copyContent, copyGeneration, copyKnowledge, copyRegions, copySnapshots, planInputs)
 import Hetoimasia.LuaEngine.Graphics.TerrainView.Style
 import Hetoimasia.LuaEngine.Graphics.TerrainView.Types
 import Hetoimasia.LuaEngine.Graphics.TerrainView.Owner (Answer (..), BuildFailure (..), OwnerRefusal (..), RegionBuild (..), Ticket, ViewOwner (..))
@@ -287,6 +287,16 @@ data ViewState k = ViewState
   , vsStageCharge ∷ !(TVar Word64)
     -- ^ What the stage holds of the account: the copies taken so far, then the candidate's CPU bytes.
   , vsRestarts ∷ !(TVar Int)
+  , vsAdmitted ∷ !(TVar (Set.Set RegionCoord))
+    -- ^ The regions the last published plan admitted that its own visible demand named: when it left visible demand
+    -- unadmitted, the next preparation starts from them, so a partial plan goes on from where it stopped.
+  , vsVisibleAdmitted ∷ !(TVar (Set.Set RegionCoord))
+    -- ^ The candidate's admitted regions its own visible demand named: what 'vsAdmitted' becomes when it publishes.
+  , vsUnadmitted ∷ !(TVar Int)
+    -- ^ Regions of the visible demand the last published plan did not admit.
+  , vsContinue ∷ !(TVar Bool)
+    -- ^ The last published plan left visible demand unadmitted and admitted more than the plan before it: the view
+    -- prepares again, to go on.
   , vsFactsCharge ∷ !(TVar Word64)
     -- ^ What the facts kept for the camera ('vsFacts') hold of the account: charged with the inputs they were made
     -- from, kept while they are kept, replaced by the next facts' charge and returned at close.
@@ -579,6 +589,10 @@ newViewState service request style runtimeView camera light = do
     <*> newTVarIO StageIdle
     <*> newTVarIO 0
     <*> newTVarIO 0
+    <*> newTVarIO Set.empty
+    <*> newTVarIO Set.empty
+    <*> newTVarIO 0
+    <*> newTVarIO False
     <*> newTVarIO 0
 
 -- ---------------------------------------------------------------------------
@@ -715,6 +729,7 @@ readView (TerrainView service state) = do
   factsBytes ← readTVar (vsFactsCharge state)
   demandBytes' ← demandNeed state
   pinnedBytes ← pinnedNeed state
+  unadmitted ← readTVar (vsUnadmitted state)
   held ← readTVar (vsAccountHeld state)
   pure
     ViewReading
@@ -731,6 +746,7 @@ readView (TerrainView service state) = do
       , readingStagedBytes = staged'
       , readingFactsBytes = factsBytes
       , readingDemandBytes = demandBytes'
+      , readingUnadmitted = unadmitted
       , readingNeedBytes = pinnedBytes + sum (map regionCpu (Map.elems regions)) + staged' + factsBytes + demandBytes'
       }
 
@@ -892,7 +908,8 @@ viewDirty service state = do
   retryAt ← readTVar (vsRetry state)
   mark ← retryMark service state
   let current = arenaIdentity status residency
-  pure (intent /= prepared || current /= revisions || now /= metrics || maybe False (/= mark) retryAt)
+  continue ← readTVar (vsContinue state)
+  pure (intent /= prepared || current /= revisions || now /= metrics || maybe False (/= mark) retryAt || continue)
 
 -- What a waiting preparation watches: the service's releases, the target's newest adoption and the shared account's
 -- charge (moved by any of its consumers: coverage, view payloads or the terrain service's own staging).
@@ -1344,12 +1361,19 @@ startPreparation service state = do
   case (metrics, status) of
     _ | pins >= tvCpuPins (svConfig service) → finish service state Retry' Nothing
     (Just m, Right _) → do
-      camera ← readTVarIO (vsCamera state)
-      extra ← readTVarIO (vsExtraDemand state)
-      let regions = Set.fromList (anchorRegion camera : extra)
-          prep = Prep intent m identity regions maxRounds maxRestarts
+      (camera, extra, seeds) ← atomically $ do
+        writeTVar (vsContinue state) False
+        camera ← readTVar (vsCamera state)
+        extra ← readTVar (vsExtraDemand state)
+        -- a partial plan goes on from the regions it admitted that its own visible demand named
+        unadmitted ← readTVar (vsUnadmitted state)
+        admitted ← readTVar (vsAdmitted state)
+        pure (camera, extra, if unadmitted > 0 then Set.toList admitted else [])
+      let anchor = anchorRegion camera
+          ordered = take (max 1 (tvAdmitRegions (svConfig service))) (admissionOrder anchor (extra <> seeds))
+          prep = Prep intent m identity (Set.fromList ordered) maxRounds maxRestarts
       atomically (writeTVar (vsPhase state) PhasePreparing)
-      enter service state (StageCopying prep (Copying [] (batchesOf service (Set.toList regions)) Nothing Nothing))
+      enter service state (StageCopying prep (Copying [] (batchesOf service ordered) Nothing Nothing))
     _ → finish service state Unchanged' (Just (Prep intent (fromMaybe zeroMetrics metrics) identity Set.empty 0 0))
   where
     zeroMetrics = TargetMetrics (PixelExtent 0 0) (PixelExtent 0 0) 1 1
@@ -1360,6 +1384,15 @@ startPreparation service state = do
 -- in the published plan, and the next preparation goes on from there.
 maxRounds, maxRestarts ∷ Int
 maxRounds = 16
+
+-- The order regions are admitted in: the camera's anchor, then the others nearest it first (by the larger of the
+-- horizontal distances, then the vertical), then by coordinate. Pure, so a preparation admits the same regions for the
+-- same camera and demand.
+admissionOrder ∷ RegionCoord → [RegionCoord] → [RegionCoord]
+admissionOrder anchor others = anchor : sortOn key (Set.toList (Set.delete anchor (Set.fromList others)))
+  where
+    RegionCoord ax ay az = anchor
+    key r@(RegionCoord x y z) = (max (abs (x - ax)) (abs (y - ay)), abs (z - az), r)
 maxRestarts = 3
 
 -- Batches of at most the configured regions, and never more than the service's per-hold bound.
@@ -1398,12 +1431,18 @@ stepCopying service state prep copying = case cpPending copying of
         abandonStage service state >> finish service state Retry' (Just prep)
       -- copies of different committed versions are never combined: the copies start again from fresh ones
       Right Nothing → restart
-      -- the account cannot hold the copy now: it is asked again once something is released
-      Right (Just (Left mark)) → enter service state (StageCopying prep copying {cpPending = Nothing, cpTodo = batch : cpTodo copying, cpWait = Just mark})
+      -- the account cannot hold the copy now: with copies already taken, they are the admitted subset and the rest stays
+      -- pending (a deliberately partial plan); with none, it is asked again once something is released
+      Right (Just (Left mark))
+        | not (null (cpKept copying)) → partial (cpKept copying)
+        | otherwise → enter service state (StageCopying prep copying {cpPending = Nothing, cpTodo = batch : cpTodo copying, cpWait = Just mark})
       Right (Just (Right kept)) → next copying {cpKept = kept, cpPending = Nothing, cpWait = Nothing}
   Nothing → next copying {cpWait = Nothing}
   where
     terrain = portTerrain (svPorts service)
+    partial kept = case combineCopies kept of
+      Left _ → restart
+      Right copies → toPlanning service state prep {prpRegions = copyRegions copies, prpRounds = 1} copies
     restart
       | prpRestarts prep > 0 = do
           atomically (writeTVar (vsStageCharge state) 0 >> void (recharge service state) >> modifyTVar' (vsRestarts state) (+ 1))
@@ -1428,13 +1467,16 @@ stepCopying service state prep copying = case cpPending copying of
         Right copies → toPlanning service state prep copies
 
 toPlanning ∷ (Ord k, Show k) ⇒ TerrainViews k → ViewState k → Prep → CopySet → IO ()
-toPlanning service state prep copies = do
-  -- the inputs are charged before they are made: a copied region's facts and knowledge at most its own record
-  let inputs = inputsPerRegion * fromIntegral (Set.size (prpRegions prep))
-  charged ← atomically (growStage service state inputs)
-  if not charged
-    then abandonStage service state >> finish service state Retry' (Just prep)
-    else case planInputs (tvChangeLimits (svConfig service)) copies of
+toPlanning service state prep0 copies0 = do
+  -- the inputs are charged before they are made: a copied region's facts and knowledge at most its own record. When
+  -- the account cannot hold them for every copy, the longest prefix of the copies (in admission order) it can hold is
+  -- the admitted subset; the rest is dropped and stays pending.
+  admitted ← atomically (admitInputs service state (reverse (copySnapshots copies0)))
+  case admitted of
+    Nothing → abandonStage service state >> finish service state Retry' (Just prep0)
+    Just (copies, inputs) → planFrom (prep0 {prpRegions = copyRegions copies}) copies inputs
+  where
+    planFrom prep copies inputs = case planInputs (tvChangeLimits (svConfig service)) copies of
       Left why → failed ("the view's inputs could not be made: " <> Text.pack (show why))
       Right (facts, knowledge) → do
         camera ← settleCamera service state facts inputs
@@ -1444,8 +1486,25 @@ toPlanning service state prep copies = do
         case startCells cellInputs of
           Left why → failed ("the plan could not start: " <> Text.pack (show why))
           Right cellPrep → enter service state (StagePlanning prep (Planning copies cellInputs cellPrep base Nothing))
-  where
-    failed why = recordFailure service why >> abandonStage service state >> finish service state Retry' (Just prep)
+      where
+        failed why = recordFailure service why >> abandonStage service state >> finish service state Retry' (Just prep)
+
+-- The longest prefix of these copies (taken in admission order) whose inputs the account can hold beside them: the
+-- stage's charge becomes that prefix's footprint and its inputs. 'Nothing' (and nothing changed) when not even the
+-- first copy's inputs fit.
+admitInputs ∷ TerrainViews k → ViewState k → [Runtime.RegionSnapshot] → STM (Maybe (CopySet, Word64))
+admitInputs service state ordered = do
+  before ← readTVar (vsStageCharge state)
+  let prefixes = [take n ordered | n ← [length ordered, length ordered - 1 .. 1]]
+      attempt [] = writeTVar (vsStageCharge state) before >> pure Nothing
+      attempt (prefix : rest) = case combineCopies prefix of
+        Left _ → attempt rest
+        Right copies → do
+          let inputs = inputsPerRegion * fromIntegral (Set.size (copyRegions copies))
+          writeTVar (vsStageCharge state) (sum (map Runtime.regionSnapshotFootprint prefix) + inputs)
+          ok ← recharge service state
+          if ok then pure (Just (copies, inputs)) else attempt rest
+  attempt prefixes
 
 -- Grow the stage's charge by these bytes, covered by the account: 'False' (and nothing changed) when it cannot.
 growStage ∷ TerrainViews k → ViewState k → Word64 → STM Bool
@@ -1493,7 +1552,11 @@ stepPlanning service state prep planning = case cellPrepProgress (plPrep plannin
       let demand = cellPlanDemand plan
           visible = regionsOf (cdVisible demand)
           prefetch = regionsOf (cdPrefetch demand)
-          missing = (Set.fromList visible <> jumpDemand) `Set.difference` prpRegions prep
+          room = max 0 (tvAdmitRegions (svConfig service) - Set.size (prpRegions prep))
+          anchor = case Set.toList (prpRegions prep) of
+            first : _ → first
+            [] → RegionCoord 0 0 0
+          missing = Set.fromList (take room (drop 1 (admissionOrder anchor (Set.toList ((Set.fromList visible <> jumpDemand) `Set.difference` prpRegions prep)))))
       if not (Set.null missing) && prpRounds prep > 1
         then do
           -- the next round keeps the copies taken and makes the inputs again; the plan made here is dropped
@@ -1504,7 +1567,10 @@ stepPlanning service state prep planning = case cellPrepProgress (plPrep plannin
             Copying (copySnapshots (plCopies planning)) (batchesOf service (Set.toList missing)) Nothing Nothing
         else do
           let demanded = Set.toList (prpRegions prep <> Set.fromList visible)
-          atomically (writeTVar (vsPending state) (length (cellPlanPending plan)))
+          atomically $ do
+            writeTVar (vsPending state) (length (cellPlanPending plan))
+            writeTVar (vsUnadmitted state) (Set.size (Set.fromList visible `Set.difference` prpRegions prep))
+            writeTVar (vsVisibleAdmitted state) (prpRegions prep `Set.intersection` Set.fromList visible)
           -- the plan's own size, then the adaptation, the regions' instances and records and the renderer's copies of
           -- them, all charged before they are made; and the demand about to be kept, beyond what the kept demand holds
           let quads = length (cellPlanQuads plan)
@@ -1818,7 +1884,18 @@ publishPlan service state prep uploading = do
               void (recharge service state)
             pure accepted
       if committed
-        then finish service state (Published' revision) (Just prep)
+        then do
+          finish service state (Published' revision) (Just prep)
+          -- a partial plan goes on while each preparation admits more; one that could admit no more sleeps until
+          -- something it waits on changes (a release, an adoption, the account)
+          atomically $ do
+            unadmitted ← readTVar (vsUnadmitted state)
+            previous ← readTVar (vsAdmitted state)
+            readTVar (vsVisibleAdmitted state) >>= writeTVar (vsAdmitted state)
+            when (unadmitted > 0) $
+              if Set.size (prpRegions prep) > Set.size previous
+                then writeTVar (vsContinue state) True
+                else retryMark service state >>= writeTVar (vsRetry state) . Just
         else abandonStage service state >> finish service state Abandoned' (Just prep)
 
 -- The view's need of the account, covered: its pinned revisions and what its stage holds (taken copies, the candidate).

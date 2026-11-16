@@ -69,6 +69,9 @@ data TerrainViewsConfig = TerrainViewsConfig
   , tvCameraConfig ∷ !CameraConfig
   , tvChangeLimits ∷ !ChangeLimits
     -- ^ The bound on removed intervals one plan's facts may hold.
+  , tvAdmitRegions ∷ !Int
+    -- ^ The most regions one preparation admits (copies, makes inputs from and plans over); the account is the binding
+    -- limit, and this cap keeps one view from taking the whole of it from its peers.
   , tvStepsPerQuantum ∷ !Int
     -- ^ Planner steps the worker takes for one view before it serves the others.
   , tvRequestQueue ∷ !Int
@@ -113,6 +116,7 @@ defaultTerrainViewsConfig =
       tvCellConfig = defaultCellConfig {ccLimits = (ccLimits defaultCellConfig) {clStepLevels = 2048}}
     , tvCameraConfig = defaultCameraConfig
     , tvChangeLimits = ChangeLimits 1048576
+    , tvAdmitRegions = 2048
     , tvStepsPerQuantum = 4
     , tvRequestQueue = 64
     , tvClear = ClearColour 0 0 0 1
@@ -277,6 +281,9 @@ data ViewReading = ViewReading
     -- ^ What the facts the view keeps for its camera hold of the account.
   , readingDemandBytes ∷ !Word64
     -- ^ What the view's kept demand holds of the account.
+  , readingUnadmitted ∷ !Int
+    -- ^ Regions of the camera's visible demand the last published plan did not admit: pending, with their loading
+    -- envelope, in a deliberately partial plan.
   , readingNeedBytes ∷ !Word64
     -- ^ Everything the view keeps: its pinned plans, its listed regions' descriptions, its stage, its facts and its
     -- demand. 'readingCpuBytes' covers it, in whole granules.

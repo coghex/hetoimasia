@@ -577,6 +577,24 @@ stages = describe "stages and the owner" $ do
     charged ← atomically (accountCharged account)
     toInteger charged `shouldSatisfy` (>= sum kept)
 
+  it "publishes a coherent partial view of the largest approved envelope (3840 x 2160 at zoom 0.125) under the production bank: the rest stays pending, and it stops preparing" $
+    withViewsConfig defaultTerrainViewsConfig $ \v → do
+      atomically (writeTVar (vMetrics v) (TargetMetrics (PixelExtent 3840 2160) (PixelExtent 3840 2160) 1 1))
+      view ← attached v 1
+      let settled = bounded . atomically $ readView view >>= \r → if isJust (readingPublished r) && readingStagedBytes r == 0 && (readingUnadmitted r == 0 || readingWaiting r) then pure r else retry
+      -- at zoom 1 the whole demand fits: the view settles with nothing unadmitted
+      atZoom1 ← settled
+      readingUnadmitted atZoom1 `shouldBe` 0
+      atomically (updateCamera view (CameraIntent [Camera.SetZoom 0.125])) `shouldReturn` Right ()
+      reading ← bounded . atomically $ readView view >>= \r → if readingUnadmitted r > 0 && readingStagedBytes r == 0 && readingWaiting r then pure r else retry
+      -- a coherent partial plan: published, with the unadmitted demand pending and picks there answering loading
+      isJust (readingPublished reading) `shouldBe` True
+      readingPendingRegions reading `shouldSatisfy` (> 0)
+      corners ← atomically (mapM (pickView view) [(0.5, 0.5), (3839.5, 0.5), (0.5, 2159.5), (3839.5, 2159.5)])
+      [() | PickLoading ← corners] `shouldSatisfy` (not . null)
+      evidenceLine ("partial envelope: " <> show (readingUnadmitted reading) <> " visible regions unadmitted, " <> show (readingPendingRegions reading) <> " pending spans, " <> show (readingCpuBytes reading) <> " bytes held")
+      closeView view
+
   it "keeps an unpublished region's GPU bytes charged until its upload has ended and its release is answered" $
     withViews $ \v → do
       atomically (writeTVar (foHoldUploads (vOwner v)) True)
@@ -1951,3 +1969,7 @@ drawnInstances v window = do
 
 releasedChunks ∷ FakeOwner → IO [ChunkRef]
 releasedChunks = readTVarIO . foReleased
+
+-- A line of evidence in the run's output.
+evidenceLine ∷ String → IO ()
+evidenceLine = putStrLn
