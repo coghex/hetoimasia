@@ -26,7 +26,7 @@ import Hetoimasia.Foundation.Log (Logger, callbackSink, defaultLogFilter, mkLogg
 import Hetoimasia.Foundation.Messaging.Payload (prepare)
 import Hetoimasia.Foundation.Worker (withWorkerGroup)
 import Hetoimasia.LuaEngine.Graphics.Scene.Claims (SceneClaims, claimOf, newSceneClaims)
-import Hetoimasia.LuaEngine.Graphics.Scene.Ledger (GraphicsScene (..), initialGraphicsScene, ledgerInterests)
+import Hetoimasia.LuaEngine.Graphics.Scene.Ledger (GraphicsScene (..), LedgerReading (..), initialGraphicsScene, ledgerInterests, ledgerReading)
 import Hetoimasia.LuaEngine.Graphics.Scene.Publish (HostAnswer (..))
 import Hetoimasia.LuaEngine.Graphics.Scene.World (SceneWorld (..), WorldTag (..))
 import Hetoimasia.LuaEngine.Graphics.TerrainView
@@ -405,6 +405,49 @@ lifecycle = describe "close orders and limits" $ do
       adoptNow (vModel v) 1 `shouldReturn` Adopted second
       _ ← awaitPublished' v 1 (second + 1)
       atomically (readView view) >>= (`shouldSatisfy` (<= 2)) . readingPins
+      closeView view
+
+  it "retires a revision superseded before any adoption only behind the barrier, never as if it had been adopted" $
+    withViews $ \v → do
+      view ← attached v 1
+      first' ← awaitPublished v 1
+      chunksA ← worldChunks <$> latestWorld v 1
+      -- B replaces A before the host adopted either (a zoom rebuilds every region).
+      atomically (updateCamera view (CameraIntent [Camera.ZoomBy 2])) `shouldReturn` Right ()
+      second ← awaitPublished' v 1 (first' + 1)
+      chunksB ← worldChunks <$> latestWorld v 1
+      let onlyA = chunksA `Set.difference` chunksB
+      onlyA `shouldSatisfy` (not . Set.null)
+      -- A's regions wait for the barrier (the target has not adopted what was published): none is released.
+      released ← Set.fromList <$> releasedChunks (vOwner v)
+      Set.intersection onlyA released `shouldBe` Set.empty
+      -- The host adopts B; the barrier is met, no adoption ever listed A, and A's regions are released.
+      adoptNow (vModel v) 1 `shouldReturn` Adopted second
+      bounded (atomically (readTVar (foReleased (vOwner v)) >>= \done → unless (onlyA `Set.isSubsetOf` Set.fromList done) retry))
+      closeView view
+
+  it "keeps a revision adopted under two attachments until both adoptions are released" $
+    withViews $ \v → do
+      view ← attached v 1
+      first' ← awaitPublished v 1
+      chunksA ← worldChunks <$> latestWorld v 1
+      adoptFor (vModel v) 1 1 `shouldReturn` Adopted first'
+      adoptFor (vModel v) 1 2 `shouldReturn` Adopted first'
+      atomically (updateCamera view (CameraIntent [Camera.ZoomBy 2])) `shouldReturn` Right ()
+      second ← awaitPublished' v 1 (first' + 1)
+      chunksB ← worldChunks <$> latestWorld v 1
+      let onlyA = chunksA `Set.difference` chunksB
+      -- The first attachment moves to B and releases A: the second still holds A, so nothing of A is released.
+      adoptFor (vModel v) 1 1 `shouldReturn` Adopted second
+      _ ← releasePass (vModel v)
+      held ← atomically (ledgerReading (fakeLedger (vFake v)))
+      (onlyA `Set.isSubsetOf` readingChunks held) `shouldBe` True
+      released ← Set.fromList <$> releasedChunks (vOwner v)
+      Set.intersection onlyA released `shouldBe` Set.empty
+      -- The second moves too: A's last adoption is released and its regions with it.
+      adoptFor (vModel v) 1 2 `shouldReturn` Adopted second
+      _ ← releasePass (vModel v)
+      bounded (atomically (readTVar (foReleased (vOwner v)) >>= \done → unless (onlyA `Set.isSubsetOf` Set.fromList done) retry))
       closeView view
 
   it "refuses an attachment beyond the service's views, before taking anything" $
