@@ -103,7 +103,6 @@ import Hetoimasia.Render.TwoD.Settings (defaultViewSettings)
 import Hetoimasia.Render.TwoD.Snapshot (Instance, Layer (WorldLayerWith), LayerDepth (DepthEnabled), Viewport (..))
 import Hetoimasia.Render.TwoD.Vulkan.Chunks (ChunkStanding (..))
 import Hetoimasia.Render.Api.Texture (TextureHandle)
-import Hetoimasia.Terrain.Changes (emptyChanges)
 import Hetoimasia.Terrain.Coordinate (RegionCoord (..), axisValue)
 import Hetoimasia.Terrain.Render2D.Camera
   ( CameraState
@@ -138,8 +137,7 @@ import Hetoimasia.Terrain.Render2D.Cells
   , startCells
   , stepCells
   )
-import Hetoimasia.Terrain.Render2D.Facts (ChunkDemand (..), ChunkKey (..), Demand (..), TerrainFacts (..), mkAvailability)
-import Hetoimasia.Terrain.Render2D.Knowledge (CellKnowledge (CellPending), KnowledgeSpec (..), mkKnowledge)
+import Hetoimasia.Terrain.Render2D.Facts (ChunkDemand (..), ChunkKey (..), Demand (..), TerrainFacts (..))
 import Hetoimasia.Terrain.Render2D.Material (Adapted (..), AdaptedQuad (..), adaptCells, adaptedInstance, terrainView)
 import Hetoimasia.Terrain.Render2D.Presentation (LightInput (..), LightSettings, describeSettingRefusal, lightInput, mkLightSettings)
 import Hetoimasia.Terrain.Render2D.Projection (ViewSetup (..))
@@ -185,7 +183,7 @@ data TerrainViews k = TerrainViews
   }
 
 data Request k
-  = RequestAttach !(AttachRequest k) !(TVar (Maybe (Settled (TerrainView k))))
+  = RequestAttach !(AttachRequest k) !AcquiredStyle !(TVar (Maybe (Settled (TerrainView k))))
 
 -- | A chunk on its way out: its reference, its GPU bytes, and whether its barrier has been met.
 data Retiring = Retiring
@@ -304,21 +302,32 @@ recordFailure service why = atomically (modifyTVar' (svFailures service) (take 6
 -- | An attachment in progress.
 newtype PendingAttach k = PendingAttach (TVar (Maybe (Settled (TerrainView k))))
 
--- | Ask for a view. Never waits: a full request queue or a stopped service answers at once; otherwise the attachment
--- settles exactly once ('attachSettled').
+-- | Ask for a view. It must be called from inside the owning instance's own call (a binding), because the style's
+-- parents are retained there, through the instance's leases, before this returns: a parent the instance does not hold
+-- (released, ended, another instance's, of the wrong kind or profile) and an incomplete or unrepresentable mapping are
+-- refused at once ('AttachStyle'), with nothing retained. The rest never waits: a full request queue or a stopped
+-- service answers at once, and otherwise the attachment settles exactly once ('attachSettled'), on the adapter's worker,
+-- which validates the target and the arena, takes the claim and the GPU interests in one transaction, and on any
+-- refusal or cancellation releases the parents it was handed.
 attachView ∷ (Ord k, Show k) ⇒ TerrainViews k → AttachRequest k → IO (Either AttachRefusal (PendingAttach k))
-attachView service request = do
-  box ← newTVarIO Nothing
-  atomically $ do
-    open ← readTVar (svOpen service)
-    taking ← portTaking (svPorts service)
-    queued ← readTVar (svRequests service)
-    if not (open && taking)
-      then pure (Left AttachStopped)
-      else
-        if length queued >= tvRequestQueue (svConfig service)
-          then pure (Left (AttachBusy "the request queue is full"))
-          else Right (PendingAttach box) <$ writeTVar (svRequests service) (queued <> [RequestAttach request box])
+attachView service request = mask_ $
+  acquireStyle (attachStyle request) >>= \case
+    Left why → pure (Left (AttachStyle why))
+    Right style → do
+      box ← newTVarIO Nothing
+      queued ← atomically $ do
+        open ← readTVar (svOpen service)
+        taking ← portTaking (svPorts service)
+        waiting ← readTVar (svRequests service)
+        if not (open && taking)
+          then pure (Left AttachStopped)
+          else
+            if length waiting >= tvRequestQueue (svConfig service)
+              then pure (Left (AttachBusy "the request queue is full"))
+              else Right (PendingAttach box) <$ writeTVar (svRequests service) (waiting <> [RequestAttach request style box])
+      case queued of
+        Left refusal → releaseStyle style >> pure (Left refusal)
+        Right pending → pure (Right pending)
 
 -- | The settlement, once there is one.
 attachSettled ∷ (Ord k, Show k) ⇒ PendingAttach k → STM (Maybe (Settled (TerrainView k)))
@@ -328,32 +337,43 @@ attachSettled (PendingAttach box) = readTVar box
 awaitAttach ∷ (Ord k, Show k) ⇒ PendingAttach k → IO (Settled (TerrainView k))
 awaitAttach (PendingAttach box) = atomically (readTVar box >>= maybe retry pure)
 
--- | Cancel an attachment that has not settled: it settles cancelled and acquires nothing. One that settled already is
--- unchanged ('False').
+-- | Cancel an attachment that has not settled: it settles cancelled, and what it retained is released. One that settled
+-- already is unchanged ('False').
 cancelAttach ∷ (Ord k, Show k) ⇒ TerrainViews k → PendingAttach k → IO Bool
-cancelAttach service (PendingAttach box) = atomically $ do
-  settled ← readTVar box
-  case settled of
-    Just _ → pure False
-    Nothing → do
-      modifyTVar' (svRequests service) (filter (\(RequestAttach _ other) → other /= box))
-      True <$ writeTVar box (Just SettledCancelled)
+cancelAttach service (PendingAttach box) = do
+  outcome ← atomically $ do
+    settled ← readTVar box
+    case settled of
+      Just _ → pure Nothing
+      Nothing → do
+        waiting ← readTVar (svRequests service)
+        let (mine, rest) = partitionBy (\(RequestAttach _ _ other) → other == box) waiting
+        writeTVar (svRequests service) rest
+        writeTVar box (Just SettledCancelled)
+        -- a request the worker has taken is released by the worker, which finds it cancelled at its commit
+        pure (Just [style | RequestAttach _ style _ ← mine])
+  case outcome of
+    Nothing → pure False
+    Just styles → mapM_ releaseStyle styles >> pure True
+  where
+    partitionBy predicate xs = (filter predicate xs, filter (not . predicate) xs)
 
 -- The worker's attachment: every check before the claim, then one transaction that claims and takes the interests.
-runAttach ∷ (Ord k, Show k) ⇒ TerrainViews k → AttachRequest k → TVar (Maybe (Settled (TerrainView k))) → IO ()
-runAttach service request box = do
-  outcome ← try (attachSteps service request box)
+runAttach ∷ (Ord k, Show k) ⇒ TerrainViews k → AttachRequest k → AcquiredStyle → TVar (Maybe (Settled (TerrainView k))) → IO ()
+runAttach service request style box = do
+  outcome ← try (attachSteps service request style box)
   case outcome of
     Left (failure ∷ SomeException) → do
       recordFailure service ("an attachment failed: " <> Text.pack (displayException failure))
+      releaseStyle style
       settle (SettledRefused AttachStopped)
-    Right (Left refusal) → settle (SettledRefused refusal)
+    Right (Left refusal) → releaseStyle style >> settle (SettledRefused refusal)
     Right (Right ()) → pure ()
   where
     settle value = atomically (readTVar box >>= \case Nothing → writeTVar box (Just value); Just _ → pure ())
 
-attachSteps ∷ (Ord k, Show k) ⇒ TerrainViews k → AttachRequest k → TVar (Maybe (Settled (TerrainView k))) → IO (Either AttachRefusal ())
-attachSteps service request box = do
+attachSteps ∷ (Ord k, Show k) ⇒ TerrainViews k → AttachRequest k → AcquiredStyle → TVar (Maybe (Settled (TerrainView k))) → IO (Either AttachRefusal ())
+attachSteps service request style box = do
   let ports = svPorts service
       config = svConfig service
       target = attachTarget request
@@ -372,12 +392,9 @@ attachSteps service request box = do
               case status of
                 Left why → pure (Left (AttachArena (Text.pack (show why))))
                 Right _ →
-                  acquireStyle (attachStyle request) >>= \case
-                    Left why → pure (Left (AttachStyle why))
-                    Right style →
-                      Runtime.openView (portTerrain ports) (portClient ports) >>= \case
-                        Left why → releaseStyle style >> pure (Left (AttachBusy (Text.pack (show why))))
-                        Right runtimeView → commitAttach service request box style runtimeView camera light
+                  Runtime.openView (portTerrain ports) (portClient ports) >>= \case
+                    Left why → pure (Left (AttachBusy (Text.pack (show why))))
+                    Right runtimeView → commitAttach service request box style runtimeView camera light
 
 -- The attachment's commit: the authority, the target, the parents' registrations and the claim are read, and the claim
 -- and both GPU interests are taken, in one transaction. A cancellation that won before it, or any failed check, takes
@@ -412,8 +429,9 @@ commitAttach service request box style runtimeView camera light = do
     Right () → pure (Right ())
     Left refusal → do
       Runtime.closeView (portTerrain ports) runtimeView
-      releaseStyle style
-      pure (maybe (Right ()) Left refusal)
+      -- a cancellation that won is answered as a refusal here, so the caller releases the parents; the box stays as
+      -- the cancellation settled it
+      pure (Left (fromMaybe AttachStopped refusal))
 
 newViewState ∷ (Ord k, Show k) ⇒ TerrainViews k → AttachRequest k → AcquiredStyle → Runtime.View → CameraState → LightSettings → IO (ViewState k)
 newViewState service request style runtimeView camera light = do
@@ -635,7 +653,7 @@ runClose service state = do
 
 data Work k
   = WorkStop
-  | WorkAttach !(AttachRequest k) !(TVar (Maybe (Settled (TerrainView k))))
+  | WorkAttach !(AttachRequest k) !AcquiredStyle !(TVar (Maybe (Settled (TerrainView k))))
   | WorkClose !(ViewState k)
   | WorkRetire
   | WorkPrepare !(ViewState k)
@@ -647,7 +665,7 @@ worker service = loop
     loop =
       atomically (nextWork service) >>= \case
         WorkStop → shutdown service
-        WorkAttach request box → runAttach service request box >> loop
+        WorkAttach request style box → runAttach service request style box >> loop
         WorkClose state → guarded (runClose service state) >> loop
         WorkRetire → guarded (retireStep service >>= \progressed → unless progressed (abandonRetirements service)) >> loop
         WorkPrepare state → guarded (prepareView service state) >> loop
@@ -671,7 +689,7 @@ nextWork service = do
   where
     requests =
       readTVar (svRequests service) >>= \case
-        RequestAttach request box : rest → writeTVar (svRequests service) rest >> pure (WorkAttach request box)
+        RequestAttach request style box : rest → writeTVar (svRequests service) rest >> pure (WorkAttach request style box)
         [] → retry
     closes = do
       views ← Map.elems <$> readTVar (svViews service)
@@ -737,7 +755,9 @@ shutdown service = do
       Right () → pure ()
   -- Settle every attachment still queued.
   queued ← atomically (readTVar (svRequests service) <* writeTVar (svRequests service) [])
-  forM_ queued $ \(RequestAttach _ box) → atomically (readTVar box >>= \case Nothing → writeTVar box (Just (SettledRefused AttachStopped)); Just _ → pure ())
+  forM_ queued $ \(RequestAttach _ style box) → do
+    releaseStyle style
+    atomically (readTVar box >>= \case Nothing → writeTVar box (Just (SettledRefused AttachStopped)); Just _ → pure ())
   drain
   where
     drain = do
@@ -840,21 +860,37 @@ prepareFor service state intent metrics = do
     else do
       camera ← readTVarIO (vsCamera state)
       extra ← readTVarIO (vsExtraDemand state)
-      let anchor = anchorRegion camera
-      -- The anchor's copy names the arena's source and versions, which the candidate demand is planned against.
-      withCopies service state [anchor] $ \case
-        CopiesBusy → pure Retry'
-        CopiesGone → pure Abandoned'
-        CopiesReady anchorCopies → do
-          visible ← candidateRegions service state camera metrics anchorCopies
-          case visible of
-            Nothing → pure Unchanged'
-            Just (visibleRegions, prefetchRegions) → do
-              setDemand service state visibleRegions prefetchRegions
-              withCopies service state (Set.toList (Set.fromList (anchor : extra <> visibleRegions))) $ \case
-                CopiesBusy → pure Retry'
-                CopiesGone → pure Abandoned'
-                CopiesReady copies → planAndPublish service state intent metrics copies
+      grow (Set.fromList (anchorRegion camera : extra)) (maxRounds :: Int)
+  where
+    -- The planner finds its demand as it goes: regions behind known air become candidates only once the regions in
+    -- front of them are known. So the copies start from the camera's anchor, and each plan's own visible demand that
+    -- the copies did not hold is added and the plan made again from fresh coherent copies, a bounded number of rounds.
+    -- What is still missing then stays pending in the published plan, and the next preparation goes on from there.
+    maxRounds = 16
+    grow regions rounds = do
+      step ← withCopies service state (Set.toList regions) $ \case
+        CopiesBusy → pure (Done Retry')
+        CopiesGone → pure (Done Abandoned')
+        CopiesReady copies → planFrom service state intent metrics copies >>= \case
+          Nothing → pure (Done Abandoned')
+          Just (Left why) → recordFailure service why >> pure (Done Retry')
+          Just (Right (plan, adapted)) → do
+            let demand = cellPlanDemand plan
+                visible = regionsOf (cdVisible demand)
+                prefetch = regionsOf (cdPrefetch demand)
+                missing = Set.fromList visible `Set.difference` regions
+            if not (Set.null missing) && rounds > 1
+              then pure (More missing)
+              else do
+                setDemand service state visible prefetch
+                atomically (writeTVar (vsPending state) (length (cellPlanPending plan)))
+                Done <$> publishPlan service state metrics copies plan adapted
+      case step of
+        More missing → grow (regions <> missing) (rounds - 1)
+        Done outcome → pure outcome
+
+-- How one round of a preparation ended.
+data Round = More !(Set.Set RegionCoord) | Done !Prepared'
 
 -- The region of the camera's anchor column at its clip level.
 anchorRegion ∷ CameraState → RegionCoord
@@ -904,28 +940,6 @@ chunksOf ∷ Int → [a] → [[a]]
 chunksOf _ [] = []
 chunksOf n xs = let (a, b) = splitAt n xs in a : chunksOf n b
 
--- The candidate regions of the projected viewport and band, from a plan over the anchor copy's source with nothing
--- available and everything pending: every candidate column is a pending span, which is exactly the demand. The
--- prefetch is the planner's horizontal margin.
-candidateRegions ∷ (Ord k, Show k) ⇒ TerrainViews k → ViewState k → CameraState → TargetMetrics → CopySet → IO (Maybe ([RegionCoord], [RegionCoord]))
-candidateRegions service state camera metrics copies =
-  case planInputs (tvChangeLimits (svConfig service)) copies of
-    Left _ → pure Nothing
-    Right (facts, _) → case mkKnowledge (KnowledgeSpec 0 CellPending [] []) of
-      Left _ → pure Nothing
-      Right nothing → do
-        let blank = facts {factsChanges = emptyChanges, factsAvailability = mkAvailability []}
-            inputs = CellInputs (CellRequest (factsVersions facts) camera (setupFor metrics) (tvCellConfig (svConfig service))) blank nothing (styleAssets (vsStyle state))
-        pure $ case startCells inputs >>= runAll inputs >>= cellPlanOf inputs of
-          Left _ → Nothing
-          Right plan →
-            let demand = cellPlanDemand plan
-             in Just (regionsOf (cdVisible demand), regionsOf (cdPrefetch demand))
-  where
-    runAll inputs prep = case cellPrepProgress prep of
-      Working → stepCells inputs prep >>= runAll inputs
-      _ → Right prep
-
 regionsOf ∷ Demand → [RegionCoord]
 regionsOf (Demand chunks) = [RegionCoord cx cy (fromInteger level) | ChunkDemand (ChunkKey cx cy) _ levels ← chunks, level ← levels]
 
@@ -967,24 +981,22 @@ setupFor metrics =
   let PixelExtent width height = metricsFramebuffer metrics
    in ViewSetup metrics (Viewport (V2 0 0) (V2 (fromIntegral width) (fromIntegral height))) defaultViewSettings
 
--- Plan from coherent copies, then build, publish and retire.
-planAndPublish ∷ (Ord k, Show k) ⇒ TerrainViews k → ViewState k → Word64 → TargetMetrics → CopySet → IO Prepared'
-planAndPublish service state intent metrics copies =
+-- Plan from coherent copies: the facts and knowledge they make, the camera given those facts, the bounded plan and its
+-- adaptation. 'Nothing' when a newer intent superseded the plan.
+planFrom ∷ (Ord k, Show k) ⇒ TerrainViews k → ViewState k → Word64 → TargetMetrics → CopySet → IO (Maybe (Either Text (CellPlan, Adapted)))
+planFrom service state intent metrics copies =
   case planInputs (tvChangeLimits (svConfig service)) copies of
-    Left why → recordFailure service ("the view's inputs could not be made: " <> Text.pack (show why)) >> pure Retry'
+    Left why → pure (Just (Left ("the view's inputs could not be made: " <> Text.pack (show why))))
     Right (facts, knowledge) → do
       camera ← settleCamera service state facts
       light ← readTVarIO (vsLight state)
       let style = vsStyle state
           inputs = CellInputs (CellRequest (factsVersions facts) camera (setupFor metrics) (tvCellConfig (svConfig service))) facts knowledge (styleAssets style)
-      planned ← runPlan service state intent inputs
-      case planned of
-        Nothing → pure Abandoned'
-        Just plan → case adaptCells (styleTextures style) light (styleAssets style) plan of
-          Left why → recordFailure service ("the plan could not be adapted: " <> Text.pack (show why)) >> pure Retry'
-          Right adapted → do
-            atomically (writeTVar (vsPending state) (length (cellPlanPending plan)))
-            publishPlan service state metrics copies plan adapted
+      runPlan service state intent inputs >>= \case
+        Nothing → pure Nothing
+        Just plan → pure . Just $ case adaptCells (styleTextures style) light (styleAssets style) plan of
+          Left why → Left ("the plan could not be adapted: " <> Text.pack (show why))
+          Right adapted → Right (plan, adapted)
 
 -- Give the camera the new facts: a followed surface they supply is adopted, and a pending jump they allow lands. Only
 -- if the intent did not change meanwhile; otherwise the newer intent is prepared next.
