@@ -77,6 +77,10 @@ data TerrainViewsConfig = TerrainViewsConfig
     -- ^ What a terrain frame clears to before its quads.
   , tvCopyRegions ∷ !Int
     -- ^ Regions one regional copy asks for: at most the terrain service's per-hold region bound.
+  , tvAccountGranule ∷ !Word64
+    -- ^ The unit a view's CPU charge takes from the session's account (1 MiB): a need is covered by whole granules,
+    -- reserved as it grows and returned only when a whole granule is free, so a need that moves within one leaves the
+    -- account untouched. The over-reservation is the view's charge.
   }
 
 -- | The approved terrain GPU-data bank: 128 MiB.
@@ -96,6 +100,7 @@ defaultTerrainViewsConfig =
     , tvRequestQueue = 64
     , tvClear = ClearColour 0 0 0 1
     , tvCopyRegions = 256
+    , tvAccountGranule = 1024 * 1024
     }
 
 -- | The narrow capability of one target incarnation: its key in the host's one key space, whether it is still the
@@ -237,6 +242,7 @@ data ViewReading = ViewReading
   , readingPendingRegions ∷ !Int
   , readingRetainedRegions ∷ !Int
   , readingCpuBytes ∷ !Word64
+    -- ^ What the view holds in the session's account: whole granules, at least what its pinned revisions need.
   , readingGpuBytes ∷ !Word64
   , readingPins ∷ !Int
   , readingWaiting ∷ !Bool

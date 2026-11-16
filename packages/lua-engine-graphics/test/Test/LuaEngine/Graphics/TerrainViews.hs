@@ -74,6 +74,7 @@ import Hetoimasia.Terrain.Runtime
 import qualified Hetoimasia.Terrain.Runtime as Runtime
 import Hetoimasia.Terrain.Runtime.Storage (filesystemOf, minHeadroomBytes, mkStorageConfig)
 import Hetoimasia.Terrain.Runtime.Store (StoreSpec (..), defaultStoreSpec, minAllowanceBytes)
+import Hetoimasia.Terrain.Residency (Bank (StagingBank), Ledger (..), bankLedger)
 import Hetoimasia.Terrain.Source (CellSpec (..), LayerSpec (..), PatchSpec (..), SourceSpec (..))
 import System.FilePath ((</>))
 
@@ -513,6 +514,28 @@ lifecycle = describe "close orders and limits" $ do
       attachOutcome v (target v 2) >>= (`shouldSatisfy` \case SettledRefused (AttachArena _) → True; _ → False)
       atomically (claimOf (vClaims v) 2) `shouldReturn` Nothing
       atomically (ledgerInterests (fakeLedger (vFake v))) `shouldReturn` mempty
+
+  it "charges the shared account in whole granules: a pan whose need stays within one leaves the account untouched" $
+    withViews $ \v → do
+      view ← attached v 1
+      first' ← awaitPublished v 1
+      quiescent v
+      held ← readingCpuBytes <$> atomically (readView view)
+      held `shouldSatisfy` (\bytes → bytes > 0 && bytes `mod` tvAccountGranule testConfig == 0)
+      -- What the account holds beside the terrain service's own staging (whose charge is exactly the model's staging
+      -- use): the coverage planes and the view's granules.
+      let besideTerrain = do
+            charged ← accountCharged (_vAccount v)
+            model ← Runtime.inspectModelSTM (_vTerrain v)
+            let staging = bankLedger model StagingBank
+            pure (charged - (ledgerOccupied staging + ledgerReserved staging))
+      before' ← atomically besideTerrain
+      atomically (updateCamera view (CameraIntent [Camera.Pan 1 0])) `shouldReturn` Right ()
+      _ ← awaitPublished' v 1 (first' + 1)
+      -- the view's charge did not move, so nothing but the terrain service's own staging touched the account
+      atomically (readView view) >>= (`shouldBe` held) . readingCpuBytes
+      atomically besideTerrain `shouldReturn` before'
+      closeView view
 
   it "refuses an attachment beyond the service's views, before taking anything" $
     withViewsConfig testConfig {tvMaxViews = 1} $ \v → do

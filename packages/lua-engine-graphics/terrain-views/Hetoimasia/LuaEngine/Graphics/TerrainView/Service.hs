@@ -245,6 +245,9 @@ data ViewState k = ViewState
     -- ^ Regions a pending jump or an unavailable followed surface needs beyond the viewport.
   , vsDemand ∷ !(TVar (Maybe ([RegionCoord], [RegionCoord])))
     -- ^ The latest camera demand, visible then prefetch: kept, so that a busy refusal loses nothing.
+  , vsAccountHeld ∷ !(TVar Word64)
+    -- ^ What the view holds in the session's account: whole granules covering its pinned revisions and the candidate
+    -- being prepared, never less than they need.
   , vsDemandBusy ∷ !(TVar (Maybe (Word64, Maybe Natural, Word64)))
     -- ^ The latest demand was refused busy: the retry mark when it was. It is sent again when the mark moves.
   }
@@ -468,6 +471,7 @@ newViewState service request style runtimeView camera light = do
     <*> newTVarIO Nothing
     <*> newTVarIO []
     <*> newTVarIO Nothing
+    <*> newTVarIO 0
     <*> newTVarIO Nothing
 
 -- ---------------------------------------------------------------------------
@@ -591,6 +595,7 @@ readView (TerrainView service state) = do
   pending ← readTVar (vsPending state)
   adopted ← adoptedRevision service state
   waiting ← isJust <$> readTVar (vsRetry state)
+  held ← readTVar (vsAccountHeld state)
   pure
     ViewReading
       { readingPhase = phase
@@ -598,7 +603,7 @@ readView (TerrainView service state) = do
       , readingAdopted = tagRevision . snd <$> adopted
       , readingPendingRegions = pending
       , readingRetainedRegions = Map.size regions
-      , readingCpuBytes = sum (map pinBytes (Map.elems pins))
+      , readingCpuBytes = held
       , readingGpuBytes = sum (map rgBytes (Map.elems regions))
       , readingPins = Map.size pins
       , readingWaiting = waiting
@@ -655,10 +660,10 @@ runClose service state = do
     regions ← readTVar (vsRegions state)
     writeTVar (vsRegions state) Map.empty
     modifyTVar' (svRetiring service) (<> [Retiring (rgChunk region) (rgBytes region) BarrierUnasked | region ← Map.elems regions])
-    pins ← readTVar (vsPins state)
     writeTVar (vsPins state) Map.empty
-    let bytes = sum (map pinBytes (Map.elems pins))
-    when (bytes > 0) (accountRelease (portAccount ports) bytes)
+    held ← readTVar (vsAccountHeld state)
+    when (held > 0) (accountRelease (portAccount ports) held)
+    writeTVar (vsAccountHeld state) 0
     modifyTVar' (svReleases service) (+ 1)
     modifyTVar' (svViews service) (Map.delete (vsId state))
     writeTVar (vsPhase state) PhaseClosed
@@ -1114,7 +1119,8 @@ publishPlan service state intent metrics copies plan adapted = do
     if gpuNeed > tvGpuBytes (svConfig service) - min (tvGpuBytes (svConfig service)) charged
       then pure False
       else do
-        cpu ← accountReserve (portAccount ports) cpuNeed
+        pinned ← pinnedNeed state
+        cpu ← coverNeed service state (pinned + cpuNeed)
         when cpu (writeTVar (svGpu service) (charged + gpuNeed))
         pure cpu
   if not reserved
@@ -1122,7 +1128,8 @@ publishPlan service state intent metrics copies plan adapted = do
     else do
       built ← buildRegions service wanted
       let refund = do
-            accountRelease (portAccount ports) cpuNeed
+            pinned ← pinnedNeed state
+            void (coverNeed service state pinned)
             modifyTVar' (svGpu service) (subtract gpuNeed)
             modifyTVar' (svReleases service) (+ 1)
       case built of
@@ -1238,6 +1245,33 @@ discardFresh service fresh
         Just results | all (either (const False) (const True)) results → pure ()
         _ → recordFailure service "unpublished regions could not be released"
 
+-- | Cover the view's CPU need with whole granules of the session's account: on the way up, reserve the granules the need
+-- passes into, all or none ('False' changes nothing); on the way down, return only granules wholly free of the need. A
+-- need that moves within a granule leaves the account untouched, so a panning camera does not write the account (which
+-- the terrain service reads in its own transactions) at every publication.
+coverNeed ∷ TerrainViews k → ViewState k → Word64 → STM Bool
+coverNeed service state need = do
+  held ← readTVar (vsAccountHeld state)
+  let granule = max 1 (tvAccountGranule (svConfig service))
+      account = portAccount (svPorts service)
+  if need > held
+    then do
+      let more = ((need - held + granule - 1) `div` granule) * granule
+      ok ← accountReserve account more
+      when ok (writeTVar (vsAccountHeld state) (held + more))
+      pure ok
+    else do
+      let free = ((held - need) `div` granule) * granule
+      when (free > 0) $ do
+        accountRelease account free
+        writeTVar (vsAccountHeld state) (held - free)
+        modifyTVar' (svReleases service) (+ 1)
+      pure True
+
+-- What the view's pinned revisions need of the account.
+pinnedNeed ∷ ViewState k → STM Word64
+pinnedNeed state = sum . map pinBytes . Map.elems <$> readTVar (vsPins state)
+
 -- Unpin every plan that is neither the newest published nor the newest adopted, returning its CPU bytes.
 dropUnneededPins ∷ (Ord k, Show k) ⇒ TerrainViews k → ViewState k → IO ()
 dropUnneededPins service state = atomically $ do
@@ -1249,8 +1283,8 @@ dropUnneededPins service state = atomically $ do
       bytes = sum (map pinBytes (Map.elems dropped))
   unless (Map.null dropped) $ do
     writeTVar (vsPins state) kept
-    accountRelease (portAccount (svPorts service)) bytes
-    modifyTVar' (svReleases service) (+ 1)
+    void (coverNeed service state (sum (map pinBytes (Map.elems kept))))
+    when (bytes > 0) (modifyTVar' (svReleases service) (+ 1))
 
 -- ---------------------------------------------------------------------------
 -- Picking
