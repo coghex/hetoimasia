@@ -106,6 +106,7 @@ import Hetoimasia.GPU.Vulkan.GLFW
   ( FrameEvent
   , NativeObserver (..)
   , Readiness (..)
+  , SceneTargetKey
   , ValidationFeature (SynchronizationValidation)
   , VulkanHost (..)
   , VulkanHostConfig (..)
@@ -120,6 +121,7 @@ import Hetoimasia.LuaEngine.Facade
 import Hetoimasia.LuaEngine.Graphics.Facade (GraphicsFacade (..), defaultIssuedMemory, graphicsInjection)
 import Hetoimasia.LuaEngine.Graphics.Scene
   ( GraphicsScene
+  , SceneClaims
   , SceneSession (..)
   , configureScenes
   , newSceneSession
@@ -380,7 +382,7 @@ withPeersUsing hooks start folder scenario = mask $ \restore → do
             myThreadId >>= writeIORef sessionThread . Just
             readTVarIO abort >>= \stopped → when stopped (throwIO ScenarioCancelled)
             withTextureGraphics scenes textureConfiguration config vulkan $ \graphics →
-              compose lifetime folder graphics vulkan frames disposals jobs providerStep scenario
+              compose lifetime folder graphics vulkan (scenesClaims scenes) frames disposals jobs providerStep scenario
       serveSpawned
         lifetime
         owner
@@ -407,13 +409,14 @@ compose
   → FilePath
   → TextureGraphics
   → VulkanHost GraphicsScene
+  → SceneClaims SceneTargetKey
   → TVar (Int, [FrameEvent])
   → TVar [(Text, Int)]
   → TVar [IO ()]
   → IORef (IO ())
   → (Peers → IO a)
   → IO a
-compose lifetime folder graphics vulkan frames disposals jobs providerStep scenario = do
+compose lifetime folder graphics vulkan claims frames disposals jobs providerStep scenario = do
   stops ← newTVarIO 0
   fatals ← newTVarIO []
   quits ← newTVarIO 0
@@ -466,7 +469,7 @@ compose lifetime folder graphics vulkan frames disposals jobs providerStep scena
                 sink = OutputSink {sinkLine = \line → atomically (modifyTVar' out (<> [line])), sinkFlush = pure ()}
             withWindowProvider windowConfig port $ \provider → do
               writeIORef providerStep (windowMainStep provider)
-              let publisher = scenePublisher (graphicsTextures graphics) provider
+              let publisher = scenePublisher claims (graphicsTextures graphics) provider
                   injection = graphicsInjection (GraphicsFacade profile pipeline provider publisher noPublishHooks defaultIssuedMemory Nothing)
               statusRef ← newTVarIO (pure (StatusSample False Nothing Nothing))
               tickDuration ← either (\refused → ioError (userError ("the tick duration was refused: " <> show refused))) pure (durationFromNanoseconds RequirePositive 10000000)
