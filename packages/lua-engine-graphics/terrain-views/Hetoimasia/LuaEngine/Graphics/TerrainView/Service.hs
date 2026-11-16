@@ -460,8 +460,11 @@ commitAttach service request box style runtimeView camera light = do
   let ports = svPorts service
       target = attachTarget request
   state ← newViewState service request style runtimeView camera light
+  tvBeforeAttachCommit (svConfig service)
   outcome ← atomically $ do
     cancelled ← isJust <$> readTVar box
+    -- the arena's authority again, with the claim: a lease released or an arena closed since the early check refuses
+    arena ← Runtime.arenaStatusSTM (portTerrain ports) (attachArena request)
     open ← readTVar (svOpen service)
     taking ← portTaking ports
     usable ← vtUsable target
@@ -472,6 +475,7 @@ commitAttach service request box style runtimeView camera light = do
       | cancelled → pure (Left Nothing)
       | not (open && taking) → pure (Left (Just AttachStopped))
       | count >= tvMaxViews (svConfig service) → pure (Left (Just AttachTooManyViews))
+      | Left why ← arena → pure (Left (Just (AttachArena (Text.pack (show why)))))
       | not usable → pure (Left (Just AttachTargetUnusable))
       | isJust claim → pure (Left (Just AttachTargetClaimed))
       | released → pure (Left (Just AttachParentReleased))

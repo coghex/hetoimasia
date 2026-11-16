@@ -14,7 +14,7 @@ import Control.Concurrent (killThread, myThreadId)
 import Control.Exception (MaskingState (Unmasked), getMaskingState)
 import Control.Concurrent.STM
 import Control.Exception (finally)
-import Control.Monad (forM_, forever, unless, void, when)
+import Control.Monad (forM_, forever, join, unless, void, when)
 import qualified Data.ByteString as ByteString
 import qualified Data.ByteString.Char8 as BC
 import Data.Map.Strict (Map)
@@ -868,6 +868,14 @@ lifecycle = describe "close orders and limits" $ do
       atomically (picksOver fresh) `shouldReturn` originalPicks
       drawnInstances v 2 `shouldReturn` originalInstances
       closeView fresh
+
+  it "refuses an attachment whose arena lease is released between its early checks and its commit, taking nothing" $ do
+    seam ← newTVarIO (pure ())
+    withViewsConfig testConfig {tvBeforeAttachCommit = join (atomically (readTVar seam <* writeTVar seam (pure ())))} $ \v → do
+      atomically (writeTVar seam (void (Runtime.releaseLease (_vTerrain v) (vArena v))))
+      attachOutcome v (target v 1) >>= (`shouldSatisfy` \case SettledRefused (AttachArena _) → True; _ → False)
+      atomically (claimOf (vClaims v) 1) `shouldReturn` Nothing
+      atomically (ledgerInterests (fakeLedger (vFake v))) `shouldReturn` mempty
 
   it "refuses an attachment through a released arena lease before taking anything, and a view's close leaves its arena open" $
     withViews $ \v → do
