@@ -191,6 +191,7 @@ withScenes env body = do
           , kitTextures = graphicsTextures (envGraphics env)
           , kitPublish = targetAnswer
           , kitUsable = targetUsable
+          , kitClaimed = const (pure False)
           }
       config = WindowConfig 2 (atomically (modifyTVar' stops (+ 1))) (\_ → pure ())
       files = [("a.png", Png.solid 2 2 (200, 100, 50, 255)), ("b.png", Png.solid 2 2 (20, 100, 250, 255))]
