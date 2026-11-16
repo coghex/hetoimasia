@@ -175,6 +175,7 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Rendering
   , submitRenderingUpload
   , cancelRenderingUpload
   , readRenderingUploads
+  , setRenderingCompletionHold
 
     -- * Retirement
   , prepareTargetRetirement
@@ -252,6 +253,8 @@ import Hetoimasia.GPU.Vulkan.GLFW.Internal.Capture
   )
 import Hetoimasia.GPU.Vulkan.Native.Frames
   ( Acquisition (..)
+  , CompletionHold
+  , setFramesHold
   , FrameOps
   , FrameStanding (..)
   , Frames
@@ -976,7 +979,14 @@ data Rendering q inst msgr phys dev cmd = Rendering
     -- ^ Every frame-less batch recorded with the scene revision an offscreen
     -- target adopted whose ticket is neither complete nor discarded, by the
     -- batch.
+  , renderingCompletionHold ∷ !(TVar (Maybe CompletionHold))
+    -- ^ A test's completion hold, handed to the frames when they are made;
+    -- 'Nothing' in production.
   }
+
+-- | Set the test's completion hold the frames are made with.
+setRenderingCompletionHold ∷ Rendering q inst msgr phys dev cmd → Maybe CompletionHold → STM ()
+setRenderingCompletionHold rendering = writeTVar (renderingCompletionHold rendering)
 
 -- | One frame's recorded use of a scene revision: what keeps that revision from
 -- being released.
@@ -1061,6 +1071,7 @@ newRendering roots generations ops observer captures uploads windowDepth =
     <*> newTVarIO Map.empty
     <*> newTVarIO 0
     <*> newTVarIO Map.empty
+    <*> newTVarIO Nothing
 
 -- | The recording and the frames, made the first time they are needed once
 -- the device exists, on the owner's thread, which is what makes it their
@@ -1079,6 +1090,7 @@ live rendering =
           let made = Live recording frames
           -- The scene uses read completions from the frames' log.
           atomically (enableCompletionLog frames)
+          atomically (readTVar (renderingCompletionHold rendering) >>= setFramesHold frames)
           -- The generations built from now on carry the depth image the host
           -- asked for (GRS-13).
           atomically $ do

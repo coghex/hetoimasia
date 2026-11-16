@@ -467,7 +467,7 @@ import Hetoimasia.GPU.Vulkan.GLFW.Internal.Capture
   , withholdAll
   )
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Rendering
-import Hetoimasia.GPU.Vulkan.Native.Frames (FrameOps (..))
+import Hetoimasia.GPU.Vulkan.Native.Frames (CompletionHold, FrameOps (..))
 import Hetoimasia.GPU.Vulkan.Native.Recording (BatchTicket, ClearColor (..), Recorder, RecordingOps (..), Refusal)
 import Hetoimasia.GPU.Vulkan.Native.Uploads
   ( UploadsView
@@ -2648,6 +2648,10 @@ data VulkanHostConfig scene = VulkanHostConfig
     -- is refused ('TargetCapacityReached'), never waited for. It is apart from
     -- the windows' bound and never reduces it; zero refuses every
     -- registration. 'defaultTargetCapacity' by default.
+  , vulkanCompletionHold ∷ !(Maybe CompletionHold)
+    -- ^ TEST-ONLY: a hold on the recognition of frame-less batches'
+    -- completion ('CompletionHold'). 'Nothing', by default and in every
+    -- production configuration: nothing is held. Only a test suite sets it.
   }
 
 -- | When the session's one device is selected and created.
@@ -2681,7 +2685,7 @@ defaultReleaseCapacity = 64
 -- initial scene holds nothing.
 vulkanHostConfig ∷ HostConfig → CaptureConfig → Budgets → Prepared scene → VulkanHostConfig scene
 vulkanHostConfig host capture budgets scene =
-  VulkanHostConfig host capture [] [] ValidationOff budgets scene id (const noObserver) (clearRenderer (\_ _ → ClearColor 0 0 0 1)) noFrameObserver DeviceAtFirstSurface defaultActionCapacity defaultReleaseCapacity Nothing SharedScene noSceneLifecycle False False defaultTargetCapacity
+  VulkanHostConfig host capture [] [] ValidationOff budgets scene id (const noObserver) (clearRenderer (\_ _ → ClearColor 0 0 0 1)) noFrameObserver DeviceAtFirstSurface defaultActionCapacity defaultReleaseCapacity Nothing SharedScene noSceneLifecycle False False defaultTargetCapacity Nothing
 
 -- | A running Vulkan graphics host.
 data VulkanHost scene = VulkanHost
@@ -2766,6 +2770,8 @@ withVulkanOwnerHostHooked hooks capturing logger layer rendering pointer bridge 
     -- cell; and a sink failure the worker records while the owner is idle wakes
     -- it for that checkpoint.
     targets ← newTargets (vulkanTargetCapacity config) (vulkanScene config)
+    -- a test's completion hold, if any, reaches the frames when they are made
+    atomically (setRenderingCompletionHold (stateRendering state) (vulkanCompletionHold config))
     atomically $ do
       watchRootsDiagnosticsOrdered (stateRoots state) (DiagnosticWatch (diagnosticAlarms capture) (diagnosticOrder capture))
       writeTVar (stateWake state) (failureOwed state capture)

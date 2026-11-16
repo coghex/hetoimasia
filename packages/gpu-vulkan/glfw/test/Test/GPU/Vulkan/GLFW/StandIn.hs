@@ -232,7 +232,7 @@ import Hetoimasia.GPU.Model.Identity (TargetClass)
 import Hetoimasia.GPU.Vulkan.Diagnostics (CaptureConfig, DiagnosticCapture, DiagnosticVerdict, Quiesced, afterLastCallback, captureSinkFailure, captureUserData, defaultCaptureConfig, diagnosticVerdictInContext, requestDrain)
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Bridge (Created (..), Discharged (..), LeaseAnswer (..), SurfaceBridge (..))
 import Hetoimasia.Foundation.Time (Duration, DurationRequirement (AllowZero), Instant, addDuration, deadlineReached, durationFromNanoseconds, scriptedInstant, scriptedSource, zeroDuration)
-import Hetoimasia.GPU.Vulkan.Native.Frames (AcquireResult (..), FrameOps (..), PresentRequest (..), PresentStatus (..))
+import Hetoimasia.GPU.Vulkan.Native.Frames (AcquireResult (..), CompletionHold, FrameOps (..), PresentRequest (..), PresentStatus (..))
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Rendering (VulkanRenderer (..))
 import Hetoimasia.GPU.Vulkan.Native.Allocator
   ( AllocatorOps (..)
@@ -1645,6 +1645,8 @@ data Rig = Rig
   , rigInitialSceneHoldsNothing ∷ !Bool
     -- ^ Whether the host declares its initial scene holds nothing a release frees.
   , rigUploads ∷ !(Maybe UploadConfig)
+  , rigCompletionHold ∷ !(Maybe CompletionHold)
+    -- ^ The host's test-only completion hold, if the example sets one.
   , rigWindowDepth ∷ !Bool
     -- ^ Whether the host asked for windowed depth (GRS-13).
     -- ^ The session's uploads, if any (GRS-6).
@@ -2052,6 +2054,7 @@ newRigClocked visible windows clock = do
       , rigInitialSceneHoldsNothing = False
       , rigUploads = Nothing
       , rigWindowDepth = False
+      , rigCompletionHold = Nothing
       , rigSession = session
       , rigSceneMode = SharedScene
       , rigSceneEvents = sceneLog
@@ -2099,6 +2102,7 @@ runRigOwned rig body = myThreadId >>= \self → withBoundThread (rigBound rig) s
           , vulkanInitialSceneHoldsNothing = rigInitialSceneHoldsNothing rig
           , vulkanUploads = rigUploads rig
           , vulkanWindowDepth = rigWindowDepth rig
+          , vulkanCompletionHold = rigCompletionHold rig
           , vulkanSceneMode = rigSceneMode rig
           , vulkanOptionalValidation = rigValidation rig
           , vulkanSceneLifecycle =

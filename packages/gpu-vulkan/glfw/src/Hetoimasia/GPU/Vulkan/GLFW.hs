@@ -205,6 +205,7 @@ module Hetoimasia.GPU.Vulkan.GLFW
   , awaitUploadTicket
   , cancelVulkanUpload
   , readVulkanUploads
+  , CompletionHold (..)
   , UploadsView (..)
   , UploadView (..)
   , CancelRefusal (..)
@@ -372,6 +373,7 @@ import Hetoimasia.GLFW.Window (WindowId)
 import Hetoimasia.Runtime.GLFW (EventAdmission, GraphicsService, SceneMode (..), ScenePublication (..), WindowScenePublication (..))
 import Hetoimasia.GPU.Model.Identity (TargetClass)
 import Hetoimasia.GPU.Vulkan.Diagnostics (DiagnosticVerdict)
+import Hetoimasia.GPU.Vulkan.Native.Frames (CompletionHold (..))
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   ( ActionOutcome (..)
   , VulkanUploadRefusal (..)

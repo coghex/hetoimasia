@@ -28,6 +28,8 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Frames.State
     -- * The frames
   , Frames (..)
   , newFrames
+  , CompletionHold (..)
+  , setFramesHold
 
     -- * Answers
   , OwnedFrame (..)
@@ -78,7 +80,7 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Frames.State
   , frameMisuse
   ) where
 
-import Control.Concurrent.STM (STM, TVar, modifyTVar', newTVarIO, readTVar, stateTVar)
+import Control.Concurrent.STM (STM, TVar, modifyTVar', newTVarIO, readTVar, stateTVar, writeTVar)
 import Control.Exception (Exception (displayException))
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
@@ -325,7 +327,32 @@ data Frames q inst msgr phys dev cmd = Frames
     -- transaction as the model's completion, so a step that raises after
     -- recording a completion leaves it here; a submission an uncertain fence
     -- query dropped, or the device's loss let go of, is never in it.
+  , framesHold ∷ !(TVar (Maybe CompletionHold))
+    -- ^ A test's hold on frame-less batches' completion ('CompletionHold'),
+    -- 'Nothing' in production.
   }
+
+-- | TEST-ONLY. A hold on the recognition of frame-less batches' completion,
+-- which a test sets to keep a batch in use for as long as it needs (#645's
+-- overlap witness). While 'holdsBatch' answers 'True' for a frame-less
+-- batch, the owner's progress step does not ask its fence: the batch stays
+-- pending for every reader together (the model, its frame-less slot, its
+-- ticket, the completion log and so the scene's release of what it used), and
+-- everything it uses stays held. 'heldObserved' runs, in the step's
+-- transaction, each time a step passes over a held batch, so the test knows a
+-- step saw it. Letting go completes nothing: a later step asks the fence, and
+-- records the completion only once it is signalled. Window frames' fences,
+-- present fences and cleanup fences are never held. A hold still in place at
+-- the owner's exit retains the batch, as any unfinished frame-less batch is
+-- retained; device loss settles it lost as usual.
+data CompletionHold = CompletionHold
+  { holdsBatch ∷ BatchId → STM Bool
+  , heldObserved ∷ BatchId → STM ()
+  }
+
+-- | Set (or, with 'Nothing', clear) the frames' completion hold.
+setFramesHold ∷ Frames q inst msgr phys dev cmd → Maybe CompletionHold → STM ()
+setFramesHold frames = writeTVar (framesHold frames)
 
 -- | The frames over this recording, owned by the thread that owns it — the
 -- graphics owner's.
@@ -340,6 +367,7 @@ newFrames ops recording =
     <*> newTVarIO 0
     <*> newTVarIO Map.empty
     <*> newTVarIO Map.empty
+    <*> newTVarIO Nothing
     <*> newTVarIO Nothing
 
 framesRoots ∷ Frames q inst msgr phys dev cmd → Roots q inst msgr phys dev
