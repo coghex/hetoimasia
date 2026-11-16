@@ -501,6 +501,19 @@ lifecycle = describe "close orders and limits" $ do
       again `shouldBe` original
       closeView fresh
 
+  it "refuses an attachment through a released arena lease before taking anything, and a view's close leaves its arena open" $
+    withViews $ \v → do
+      view ← attached v 1
+      _ ← awaitPublished v 1
+      closeView view
+      -- The view's close did not close the arena: its lease still reads it.
+      Runtime.arenaStatus (_vTerrain v) (vArena v) >>= (`shouldSatisfy` either (const False) (const True))
+      _ ← Runtime.releaseLease (_vTerrain v) (vArena v)
+      modelWindow (vModel v) 2
+      attachOutcome v (target v 2) >>= (`shouldSatisfy` \case SettledRefused (AttachArena _) → True; _ → False)
+      atomically (claimOf (vClaims v) 2) `shouldReturn` Nothing
+      atomically (ledgerInterests (fakeLedger (vFake v))) `shouldReturn` mempty
+
   it "refuses an attachment beyond the service's views, before taking anything" $
     withViewsConfig testConfig {tvMaxViews = 1} $ \v → do
       _ ← attached v 1
