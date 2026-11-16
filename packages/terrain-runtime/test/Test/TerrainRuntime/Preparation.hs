@@ -6,6 +6,12 @@
 -- evaluated, and it is read at the owner's points. 'PointPrepared' is reported after the preparation and before the staging
 -- transaction that makes the work visible to the chooser and the arbitration; 'PointBeforeCommit' before each arbitration.
 -- Every race is ordered by the host's eligibility or by a gate at 'PointBeforeCommit', never by a delay.
+--
+-- THE LARGE DEFINITIONS ARE BUILT IN THE EXAMPLE THAT USES THEM AND ARE GARBAGE AFTER IT: a definition held at the top level
+-- stays live for the rest of the process (several megabytes as 'String'), and every later example that forces major
+-- collections (the storage backend's live-heap readings) copies it each time. Full laziness is off in this module so that
+-- the compiler does not float a definition back to the top level.
+{-# OPTIONS_GHC -fno-full-laziness #-}
 module Test.TerrainRuntime.Preparation (spec) where
 
 import Control.Concurrent.MVar
@@ -48,13 +54,9 @@ wideMaterials = last (takeWhile ((<= 256 * 1024) . accounted) [0 .. 4095])
   where
     accounted n = definitionHeaderBytes + layerRecordBytes + n * (materialRecordBytes + 64)
 
--- | The 256 KiB definition's shape.
-wide ∷ SourceSpec
-wide = definitionOf wideMaterials 64
-
--- | The 4,095 materials' shape.
-many ∷ SourceSpec
-many = definitionOf 4095 6
+-- | The 256 KiB definition's shape, built afresh for the example that calls it.
+wide ∷ () → SourceSpec
+wide () = definitionOf wideMaterials 64
 
 -- ---------------------------------------------------------------------------
 -- Observing evaluation
@@ -130,8 +132,9 @@ retired svc = do
 spec ∷ Spec
 spec = describe "Preparation outside the arbitration" $ do
   describe "an open's palette (requirement 3)" $ do
-    let interned name source materials =
+    let interned name materials bytes =
           it ("interns " <> name <> " before the open is staged and never in the chooser's or the arbitration's transaction") $ do
+            let source = definitionOf materials bytes
             counter ← newIORef 0
             host ← newHost True
             (probe, seen) ← recording counter host (countingInterning counter)
@@ -147,8 +150,8 @@ spec = describe "Preparation outside the arbitration" $ do
               seenBeforeCommit s `shouldBe` [(materials, 1)]
               readIORef counter `shouldReturn` materials
               settleChecks svc
-    interned "the 256 KiB definition's materials of 64 bytes" wide wideMaterials
-    interned "the 4,095 materials" many 4095
+    interned "the 256 KiB definition's materials of 64 bytes" wideMaterials 64
+    interned "the 4,095 materials" 4095 6
 
   describe "a staged answer's settlement (requirement 3, the column's commit)" $
     it "evaluates the host's preparation of a read's answer before it is staged, and the arbitration runs only the prepared settlement" $ do
@@ -195,7 +198,7 @@ spec = describe "Preparation outside the arbitration" $ do
         client ← okOf (registerClient svc)
         let base = hostEndpoint svc Nothing host
             counted = base {endpointEligible = endpointEligible base >>= \e → e <$ when (not e) (modifyTVar' refusals (+ 1))}
-        _ ← okOf (openArenaWith svc counted client "main" wide)
+        _ ← okOf (openArenaWith svc counted client "main" (wide ()))
         waitFor (readTVar arrivals >>= check . (>= 1))
         -- after the preparation, before the arbitration: the host withdraws its grant
         atomically (writeTVar (hostEligible host) False)
@@ -222,7 +225,7 @@ spec = describe "Preparation outside the arbitration" $ do
             let probe = ProbeWith (probePoint (gatedProbe (\case PointBeforeCommit _ → True; _ → False) gate)) (countingInterning counter)
             withServiceUsing defaultConfig (SessionAdmission (readTVar open)) probe $ \svc → (do
               client ← okOf (registerClient svc)
-              request ← okOf (openArenaWith svc (hostEndpoint svc Nothing host) client "main" wide)
+              request ← okOf (openArenaWith svc (hostEndpoint svc Nothing host) client "main" (wide ()))
               awaitReached gate
               readIORef counter `shouldReturn` wideMaterials
               _ ← end svc open request
