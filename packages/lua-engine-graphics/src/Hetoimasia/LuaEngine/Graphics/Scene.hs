@@ -7,13 +7,17 @@
 -- state in "Hetoimasia.LuaEngine.Graphics.Scene.Ledger", and what the host is configured with in
 -- "Hetoimasia.LuaEngine.Graphics.Scene.Configuration".
 module Hetoimasia.LuaEngine.Graphics.Scene
-  ( module Hetoimasia.LuaEngine.Graphics.Scene.Configuration
+  ( module Hetoimasia.LuaEngine.Graphics.Scene.Claims
+  , module Hetoimasia.LuaEngine.Graphics.Scene.Configuration
   , module Hetoimasia.LuaEngine.Graphics.Scene.Ledger
   , module Hetoimasia.LuaEngine.Graphics.Scene.Publish
   , module Hetoimasia.LuaEngine.Graphics.Scene.Render
+  , module Hetoimasia.LuaEngine.Graphics.Scene.World
   ) where
 
+import Hetoimasia.LuaEngine.Graphics.Scene.Claims
 import Hetoimasia.LuaEngine.Graphics.Scene.Configuration
 import Hetoimasia.LuaEngine.Graphics.Scene.Ledger
 import Hetoimasia.LuaEngine.Graphics.Scene.Publish
 import Hetoimasia.LuaEngine.Graphics.Scene.Render
+import Hetoimasia.LuaEngine.Graphics.Scene.World

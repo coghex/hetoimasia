@@ -1285,16 +1285,14 @@ commitStaged svc st rid req sg = case (reqCmd req, stagedWork sg) of
       pure (CommitDone Nothing Nothing)
     -- Removing air changes nothing: no history, no obligation, no revision; the
     -- reservations return and the result is kept until it is taken.
-    commitAir aid arena precondition
-      | staleView aid arena precondition = settleFailure StaleView
-      | otherwise = do
+    commitAir aid arena precondition =
+      preconditionStale aid (arenaRevision arena) (D.authKnowledge (arenaAuthority arena)) precondition >>= \case
+       True → settleFailure StaleView
+       False → do
           withdrawRecord svc rid req
           modifySt svc (\s → s {stateRequests = Map.insert rid req {reqPhase = Done, reqModel = False} (stateRequests s)})
           endpointSettle ep (Succeeded (ARemoved (RemoveAnswer aid (arenaRevision arena) False)))
           pure (CommitDone (Just aid) (Just (arenaRevision arena)))
-    staleView aid arena = \case
-      Just (Precondition pa pr) → pa /= aid || pr /= arenaRevision arena
-      Nothing → False
     -- RECOVERY IS DECIDED LIKE PUBLICATION: the conditions the probe certified, and the capacity pause
     -- when the supported next transaction fits beside the protected reserve, are cleared HERE, in the
     -- arbitration that settles the retry (its host eligible, its basis and every fault's generation

@@ -36,6 +36,7 @@ module Hetoimasia.LuaEngine.Graphics.Scene.Configuration
 
     -- * The host
   , configureScenes
+  , configureWorldDepth
   , SceneHostProblem (..)
   , checkSceneHostConfig
 
@@ -48,6 +49,7 @@ module Hetoimasia.LuaEngine.Graphics.Scene.Configuration
 import Data.Word (Word64)
 import Hetoimasia.Foundation.Messaging.Payload (Prepared, prepare)
 import Hetoimasia.GPU.Vulkan.GLFW (SceneMode (PerWindowScenes), SceneTargetKey, VulkanHostConfig (..))
+import Hetoimasia.LuaEngine.Graphics.Scene.Claims (SceneClaims, newSceneClaims)
 import Hetoimasia.LuaEngine.Graphics.Scene.Ledger
   ( GraphicsScene
   , SceneLedger
@@ -68,10 +70,12 @@ data SceneSession = SceneSession
     -- ^ Where the renderer hook finds the session's renderer; the composition fills it.
   , scenesInitial ∷ !(Prepared GraphicsScene)
     -- ^ The initial scene every window holds until it publishes.
+  , scenesClaims ∷ !SceneClaims
+    -- ^ The terrain views' exclusive claims of targets, which the M1 publisher reads in its commit.
   }
 
 newSceneSession ∷ IO SceneSession
-newSceneSession = SceneSession <$> newSceneLedger <*> newRenderSlot <*> prepare initialGraphicsScene
+newSceneSession = SceneSession <$> newSceneLedger <*> newRenderSlot <*> prepare initialGraphicsScene <*> newSceneClaims
 
 -- | Set the scene part of a host configuration. Every field is the one set that makes the others true.
 configureScenes ∷ SceneSession → VulkanHostConfig GraphicsScene → VulkanHostConfig GraphicsScene
@@ -83,6 +87,14 @@ configureScenes session host =
     , vulkanRenderer = sceneRenderer (scenesSlot session)
     , vulkanInitialSceneHoldsNothing = True
     }
+
+-- | Set the host-wide window depth a terrain-enabled composition needs (TRA-9): every swapchain generation of every
+-- window on the host gets a managed depth image, charged in the native bank beneath the model's accounting and
+-- destroyed after its batches complete. There is no per-window switch. An M1 scene names no depth-enabled world
+-- layer, so its output is unchanged by the supplied depth image; a terrain-disabled composition does not call this
+-- and keeps the host's own default.
+configureWorldDepth ∷ VulkanHostConfig scene → VulkanHostConfig scene
+configureWorldDepth host = host {vulkanWindowDepth = True}
 
 -- | What is wrong with a host configuration for scenes.
 data SceneHostProblem

@@ -235,8 +235,9 @@ decide svc credit dec = do
                   eligible ← endpointEligible (reqEndpoint req)
                   if not eligible
                     then pure NotEligible
-                    else
-                      if staleView precondition aid arena
+                    else do
+                     stale ← staleView precondition aid arena
+                     if stale
                         then do
                           -- the precondition no longer holds: the removal settles stale_view with nothing
                           -- changed; the transaction is the holder's to abort (it publishes nothing)
@@ -303,9 +304,7 @@ decide svc credit dec = do
           { stateSlot = Nothing
           , stateExplicitRun = if internal then 0 else stateExplicitRun s + 1
           }
-    staleView precondition aid arena = case precondition of
-      Just (Precondition pa pr) → pa /= aid || pr /= arenaRevision arena
-      Nothing → False
+    staleView precondition aid arena = preconditionStale aid (arenaRevision arena) (D.authKnowledge (arenaAuthority arena)) precondition
     stagedCurrent req arena = case reqPhase req of
       StagedPhase sg → stagedRevision sg == arenaRevision arena
       Waiting → False

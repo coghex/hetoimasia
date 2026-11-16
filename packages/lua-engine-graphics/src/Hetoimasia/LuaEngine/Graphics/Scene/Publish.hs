@@ -75,6 +75,7 @@ module Hetoimasia.LuaEngine.Graphics.Scene.Publish
   , offscreenTargetAnswer
 
   , publisherGatedBy
+  , publisherClaimedBy
 
     -- * Publishing
   , PublishResult (..)
@@ -96,13 +97,15 @@ import Control.Exception (throwIO)
 import Control.Monad (when)
 import qualified Data.ByteString as ByteString
 import Data.Functor ((<&>))
+import Data.Maybe (isJust)
 import Data.Text (Text)
 import Data.Typeable (Typeable)
 import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Encoding
 import Data.Word (Word64)
 import Hetoimasia.Foundation.Messaging.Payload (Prepared, prepare)
-import Hetoimasia.GPU.Vulkan.GLFW (OffscreenTargetId, TargetScenePublication (..), TextureHandle (..), VulkanHost, WindowScenePublication (..), publishVulkanTargetScene)
+import Hetoimasia.GPU.Vulkan.GLFW (OffscreenTargetId, SceneTargetKey (KeyWindow), TargetScenePublication (..), TextureHandle (..), VulkanHost, WindowScenePublication (..), publishVulkanTargetScene)
+import Hetoimasia.LuaEngine.Graphics.Scene.Claims (SceneClaims, claimOf)
 import Hetoimasia.LuaEngine.Graphics.Scene.Ledger (GraphicsScene, graphicsScene)
 import Hetoimasia.LuaEngine.Graphics.Texture.Port (TextureRef (..), textureRefOf)
 import Hetoimasia.LuaEngine.Graphics.Window.Host (WindowTarget (..))
@@ -153,6 +156,10 @@ data ScenePublisher target = ScenePublisher
     -- step. Never waits.
   , publisherUsable ∷ target → STM Bool
     -- ^ Whether the capability's window incarnation is still the admitted, attached one.
+  , publisherClaimed ∷ target → STM Bool
+    -- ^ Whether a terrain view holds the target's exclusive claim ("Hetoimasia.LuaEngine.Graphics.Scene.Claims"):
+    -- read in the commit's transaction, so a claim taken before the commit refuses it and one taken after waits for
+    -- it to have been accepted.
   }
 
 -- | The same publisher with one more authority read in the publication's own transaction: the session's admission. A
@@ -160,6 +167,10 @@ data ScenePublisher target = ScenePublisher
 -- check and the commit refuses the whole scene, leaving the previous one.
 publisherGatedBy ∷ STM Bool → ScenePublisher target → ScenePublisher target
 publisherGatedBy extra publisher = publisher {publisherTaking = (&&) <$> extra <*> publisherTaking publisher}
+
+-- | The same publisher refused, at its commit, whenever the claim reading says a terrain view holds the target.
+publisherClaimedBy ∷ (target → STM Bool) → ScenePublisher target → ScenePublisher target
+publisherClaimedBy claimed publisher = publisher {publisherClaimed = \target → (||) <$> claimed target <*> publisherClaimed publisher target}
 
 -- | What the host answered a publication, without the window identities its own answer carries.
 data HostAnswer
@@ -171,8 +182,14 @@ data HostAnswer
 
 -- | A publisher over the session's registry and the window provider, publishing through the capability
 -- the production window port yields.
-scenePublisher ∷ Textures → WindowProvider (WindowTarget GraphicsScene) → ScenePublisher (WindowTarget GraphicsScene)
-scenePublisher textures provider = scenePublisherOver textures provider targetAnswer targetUsable
+--
+-- It reads the session's claims in its commit, so an M1 publication never replaces a terrain view's scene: the
+-- production publisher cannot be built without them.
+scenePublisher ∷ SceneClaims → Textures → WindowProvider (WindowTarget GraphicsScene) → ScenePublisher (WindowTarget GraphicsScene)
+scenePublisher claims textures provider =
+  publisherClaimedBy
+    (\target → isJust <$> claimOf claims (KeyWindow (targetWindow target)))
+    (scenePublisherOver textures provider targetAnswer targetUsable)
 
 -- | The host's answer to a publication through the production window capability, without the window identities
 -- its own answer carries.
@@ -196,9 +213,10 @@ offscreenTargetAnswer host target scene =
     TargetSceneUnknown _ → HostAnsweredUnknown
     TargetSceneClosed _ → HostAnsweredClosed
 
--- | The same over any window capability: the lifecycle suite's, which has no window identity to mint.
+-- | The same over any window capability: the lifecycle suite's, which has no window identity to mint. It reads no
+-- claim ('publisherClaimedBy' adds one).
 scenePublisherOver ∷ Textures → WindowProvider target → (target → Prepared GraphicsScene → STM HostAnswer) → (target → STM Bool) → ScenePublisher target
-scenePublisherOver textures provider = ScenePublisher textures (providerTaking provider)
+scenePublisherOver textures provider answer usable = ScenePublisher textures (providerTaking provider) answer usable (const (pure False))
 
 -- | What a publication came to. Success carries no revision and no receipt: the scene is the window's
 -- latest value, and nothing is promised about when, or whether, a frame shows it.
@@ -232,6 +250,8 @@ data PublishRefusal
     HostClosed
   | -- | The host carries one scene for every window: it was not configured for per-window scenes.
     HostNotPerWindow
+  | -- | A terrain view holds the target's exclusive claim.
+    TargetClaimed
   deriving (Eq, Show)
 
 -- | A refusal as the bounded text a script or a log sees: fixed words and numbers, at most 160 bytes.
@@ -248,6 +268,7 @@ publishRefusalText refusal = clip $ case refusal of
   HostWindowUnknown → "the host holds no such window"
   HostClosed → "the host's publications have ended"
   HostNotPerWindow → "the host carries one scene for every window"
+  TargetClaimed → "a terrain view holds the window"
   where
     number = Text.pack . show
     clip text
@@ -314,6 +335,7 @@ boundary publisher resource uses = do
   taking ← ownerTaking (resourceOwner resource)
   provider ← publisherTaking publisher
   usable ← publisherUsable publisher (resourceTarget resource)
+  claimed ← publisherClaimed publisher (resourceTarget resource)
   released ← firstReleased uses
   pure $ case () of
     _
@@ -321,6 +343,7 @@ boundary publisher resource uses = do
       | not taking → Just InstanceEnded
       | not provider → Just PublicationStopped
       | not usable → Just WindowNotReady
+      | claimed → Just TargetClaimed
       | Just index ← released → Just (TextureReleased index)
       | otherwise → Nothing
   where

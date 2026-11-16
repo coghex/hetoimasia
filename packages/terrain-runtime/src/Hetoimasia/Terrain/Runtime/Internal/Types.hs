@@ -1,3 +1,5 @@
+{-# LANGUAGE PatternSynonyms #-}
+
 -- | The service's types: authorities, requests, the settlement seam, the
 -- configuration and the one state record the transactions share.
 --
@@ -36,7 +38,10 @@ module Hetoimasia.Terrain.Runtime.Internal.Types
   , Refused (..)
   , BusyWhy (..)
   , CancelResult (..)
-  , Precondition (..)
+  , Precondition (PreconditionWith, Precondition, preconditionArena, preconditionContent, preconditionKnowledge, preconditionGuard)
+  , PreconditionGuard (..)
+  , preconditionRevisionsStale
+  , preconditionStale
 
     -- * Configuration and ports
   , Config (..)
@@ -140,7 +145,7 @@ module Hetoimasia.Terrain.Runtime.Internal.Types
   , initialState
   ) where
 
-import Control.Concurrent.STM (STM, TVar)
+import Control.Concurrent.STM (STM, TVar, orElse)
 import Control.Exception (Exception)
 import Data.ByteString (ByteString)
 import Data.Map.Strict (Map)
@@ -422,10 +427,59 @@ data CancelResult
     CancelForeign
   deriving stock (Eq, Show)
 
--- | A removal's optional content precondition: the incarnation and the content
--- revision a displayed view was built from.
-data Precondition = Precondition !ArenaId !Revision
+-- | A removal's optional precondition: the incarnation and the content revision a displayed view was built from,
+-- optionally the knowledge revision it was built from too, and optionally the holder's own guard. Every part is
+-- checked in the arbitration that commits the removal, atomically with the commit; any part that no longer holds
+-- settles the removal 'StaleView' with nothing changed.
+data Precondition = PreconditionWith
+  { preconditionArena ∷ !ArenaId
+  , preconditionContent ∷ !Revision
+  , preconditionKnowledge ∷ !(Maybe Revision)
+    -- ^ The arena's knowledge revision the view was built from, when it matters.
+  , preconditionGuard ∷ !(Maybe PreconditionGuard)
+  }
   deriving stock (Eq, Show)
+
+-- | The content precondition alone: the incarnation and the content revision. As a pattern it matches only a
+-- precondition with no knowledge revision and no guard.
+pattern Precondition ∷ ArenaId → Revision → Precondition
+pattern Precondition arena revision = PreconditionWith arena revision Nothing Nothing
+
+{-# COMPLETE PreconditionWith #-}
+
+-- | A holder's own condition on a removal, read inside the removal's arbitration in the same transaction as the
+-- commit (a view's coherence, for example: that the picked frame is still the one adopted). It must be a pure read of
+-- transactional state: it runs no IO and no user code and never waits, and a guard that retries is read as not
+-- holding. It imports nothing of its holder into the service: the service sees only this transaction and an
+-- identity, which is what equality and display compare.
+data PreconditionGuard = PreconditionGuard
+  { guardIdentity ∷ !Word64
+  , guardHolds ∷ STM Bool
+  }
+
+instance Eq PreconditionGuard where
+  a == b = guardIdentity a == guardIdentity b
+
+instance Show PreconditionGuard where
+  showsPrec precedence guard' = showParen (precedence > 10) (showString "PreconditionGuard " . shows (guardIdentity guard'))
+
+-- | Whether the revision parts of a precondition no longer hold for an arena of this incarnation, content
+-- revision and knowledge revision: what admission can judge before any work.
+preconditionRevisionsStale ∷ ArenaId → Revision → Revision → Maybe Precondition → Bool
+preconditionRevisionsStale arena content knowledge = \case
+  Nothing → False
+  Just p →
+    preconditionArena p /= arena
+      || preconditionContent p /= content
+      || maybe False (/= knowledge) (preconditionKnowledge p)
+
+-- | Whether a precondition no longer holds, its guard included: what the arbitration judges, in its transaction.
+preconditionStale ∷ ArenaId → Revision → Revision → Maybe Precondition → STM Bool
+preconditionStale arena content knowledge precondition
+  | preconditionRevisionsStale arena content knowledge precondition = pure True
+  | otherwise = case precondition >>= preconditionGuard of
+      Nothing → pure False
+      Just guard' → not <$> (guardHolds guard' `orElse` pure False)
 
 -- ---------------------------------------------------------------------------
 -- Configuration and ports

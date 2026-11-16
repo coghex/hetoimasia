@@ -102,6 +102,7 @@ import Hetoimasia.LuaEngine.Graphics.Scene.Ledger (SceneLedger, ledgerHeld)
 import Hetoimasia.LuaEngine.Graphics.Texture.Port
 import qualified Hetoimasia.Render.TwoD.Vulkan as Render
 import Hetoimasia.Render.TwoD.Vulkan.Builders (Builders (..))
+import Hetoimasia.Render.TwoD.Vulkan.Chunks (Retained, newRetained)
 import Hetoimasia.Render.TwoD.Vulkan.Textures
   ( MarkPolicy (DefaultMark)
   , TextureRefusal (..)
@@ -120,6 +121,8 @@ data HostSession = HostSession
   { sessionRenderer ∷ !Render.Renderer
   , sessionTextures ∷ !Textures
   , sessionLedger ∷ !(SceneLedger SceneTargetKey)
+  , sessionRetained ∷ !Retained
+    -- ^ The session's one registry of retained chunks: empty unless a terrain view builds into it.
   }
 
 -- | Why the session could not be made. A structured startup failure, not a per-request one.
@@ -194,7 +197,8 @@ bootstrapHost configuration ledger host = do
           Left refusal → pure (Left refusal)
           Right renderer → do
             textures ← newTextures
-            pure (Right (HostSession renderer textures ledger))
+            retained ← newRetained
+            pure (Right (HostSession renderer textures ledger retained))
 
 -- | The port over a host that was bootstrapped.
 hostPort ∷ ∀ scene. VulkanHost scene → HostSession → Port Image UploadTicket

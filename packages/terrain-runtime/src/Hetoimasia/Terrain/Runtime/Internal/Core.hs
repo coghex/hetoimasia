@@ -734,9 +734,7 @@ decide svc st rid = \case
         else case Map.lookup (leaseArena ls) (stateArenas st) of
           Nothing → Left (ShortFailed ArenaClosed)
           Just arena → Right (lid, ls, leaseArena ls, arena)
-    stale aid arena = \case
-      Just (Precondition pa pr) → pa /= aid || pr /= arenaRevision arena
-      Nothing → False
+    stale aid arena = preconditionRevisionsStale aid (arenaRevision arena) (D.authKnowledge (arenaAuthority arena))
     -- each pending removal can advance the content, knowledge and store revisions by one: a removal
     -- that could need the last value of any of them is refused before any work
     revisionExhausted aid arena =

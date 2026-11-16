@@ -37,10 +37,12 @@ library
         Hetoimasia.LuaEngine.Graphics.Facade
         Hetoimasia.LuaEngine.Graphics.Input
         Hetoimasia.LuaEngine.Graphics.Scene
+        Hetoimasia.LuaEngine.Graphics.Scene.Claims
         Hetoimasia.LuaEngine.Graphics.Scene.Configuration
         Hetoimasia.LuaEngine.Graphics.Scene.Ledger
         Hetoimasia.LuaEngine.Graphics.Scene.Publish
         Hetoimasia.LuaEngine.Graphics.Scene.Render
+        Hetoimasia.LuaEngine.Graphics.Scene.World
         Hetoimasia.LuaEngine.Graphics.Texture
         Hetoimasia.LuaEngine.Graphics.Texture.Backend
         Hetoimasia.LuaEngine.Graphics.Texture.Configuration

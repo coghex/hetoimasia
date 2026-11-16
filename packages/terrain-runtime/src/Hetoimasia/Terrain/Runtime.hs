@@ -35,6 +35,10 @@ module Hetoimasia.Terrain.Runtime
   , OwnerControl (..)
   , standaloneSupervisor
   , withTerrainService
+  , StagingAccount (..)
+  , StagingAccountRefused (..)
+  , stagingBankBytes
+  , withTerrainServiceIn
   , closeService
   , awaitOwnerStopped
   , awaitClosed
@@ -72,6 +76,7 @@ module Hetoimasia.Terrain.Runtime
   , Refused (..)
   , BusyWhy (..)
   , Precondition (..)
+  , PreconditionGuard (..)
   , CancelResult (..)
   , openArena
   , OpenOptions (..)
@@ -411,6 +416,42 @@ withTerrainService config ports body = do
           tryWithContext (atomically retired) >>= \case
             Right () → pure late
             Left (interruption ∷ ExceptionWithContext SomeException) → wait (maybe (Just interruption) Just late)
+
+-- | A CPU allowance outside the service that its staging bank is funded from: the session's one CPU render/staging
+-- account, in a composition that has one. Both operations are transactions that never wait; a reservation is all
+-- or nothing ('False' reserves nothing).
+data StagingAccount = StagingAccount
+  { stagingAccountReserve ∷ Word64 → STM Bool
+  , stagingAccountRelease ∷ Word64 → STM ()
+  }
+
+-- | The account could not fund the service's staging bank: the bytes asked for. Nothing was reserved and no service
+-- was started.
+newtype StagingAccountRefused = StagingAccountRefused Word64
+  deriving stock (Show)
+
+instance Exception StagingAccountRefused
+
+-- | The service's whole CPU staging bank, the snapshot backing bank carved from it included: what
+-- 'withTerrainServiceIn' charges to the account.
+stagingBankBytes ∷ Config → Word64
+stagingBankBytes config = R.limitBytes (configLimits config) R.StagingBank
+
+-- | 'withTerrainService' with its staging bank funded from an account outside it, so that the service and the
+-- account's other consumers can never together hold more than the account allows. The whole bank
+-- ('stagingBankBytes') is reserved from the account before anything starts, in one transaction, or the scope is
+-- refused ('StagingAccountRefused') with nothing started; the service's own model then admits, refuses busy and
+-- keeps its invariants exactly as it does on its internal bank, inside that reservation; and the reservation returns
+-- to the account only after the service has drained (its owner ended and no borrower outstanding). A service built
+-- with 'withTerrainService' keeps its internal bank and charges no account.
+withTerrainServiceIn ∷ StagingAccount → Config → Ports → (Service → IO a) → IO a
+withTerrainServiceIn account config ports body =
+  withResource reserve (\() → atomically (stagingAccountRelease account bytes)) (\() → withTerrainService config ports body)
+  where
+    bytes = stagingBankBytes config
+    reserve = do
+      funded ← atomically (stagingAccountReserve account bytes)
+      if funded then pure () else throwIO (StagingAccountRefused bytes)
 
 -- | Wait until the owner has ended, however it ended. There is no deadline.
 awaitOwnerStopped ∷ Service → IO ()
