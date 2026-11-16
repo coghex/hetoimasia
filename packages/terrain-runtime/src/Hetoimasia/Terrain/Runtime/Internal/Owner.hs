@@ -1087,7 +1087,7 @@ stageRetry svc rid aid arena = stageWith svc rid (Just aid) (arenaRevision arena
 -- | 'stage' with the knowledge revision the work was read at and, for a creator command, the basis
 -- its preparation read.
 stageWith ∷ Service → RequestId → Maybe ArenaId → Revision → Revision → Maybe CreatorBasis → StagedWork → IO Bool
-stageWith svc rid aid rev knowledge basis work =
+stageWith svc rid aid rev knowledge basis work0 =
   tryNonAsync prepare >>= \case
     Left failure →
       failWith svc (ProviderDefect (Text.pack ("settlement preparation failed: " <> show failure))) [("request", Text.pack (show rid))]
@@ -1098,6 +1098,10 @@ stageWith svc rid aid rev knowledge basis work =
         Left failure → do
           failWith svc (ProviderDefect (Text.pack ("readiness callback failed: " <> show failure))) [("request", Text.pack (show rid))]
   where
+    -- the answer staged, through the test seam on answers ('probeAnswer', the identity in production)
+    work = case work0 of
+      StagedAnswer answer → StagedAnswer (probeAnswer (serviceProbe svc) answer)
+      other → other
     -- AN ANSWER'S SETTLEMENT IS PREPARED HERE, OUTSIDE EVERY TRANSACTION: a host's preparation of the
     -- answer ('endpointPrepare') is evaluated before the answer is staged, so the arbitration's transaction
     -- runs only the prepared settlement and never the host's pure work on the answer. A preparation that

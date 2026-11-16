@@ -94,7 +94,7 @@ recording counter host interning = do
         PointPrepared rid → note rid (\x s → s {seenPrepared = seenPrepared s <> [x]})
         PointBeforeCommit rid → note rid (\x s → s {seenBeforeCommit = seenBeforeCommit s <> [x]})
         _ → pure ()
-  pure (ProbeWith point interning, readIORef seen)
+  pure (ProbeWith point interning id, readIORef seen)
 
 -- | The one request a run recorded.
 onlyRequest ∷ Map.Map RequestId Seen → IO Seen
@@ -194,7 +194,7 @@ spec = describe "Preparation outside the arbitration" $ do
                   ticks ← readIORef counter
                   putMVar atSecond (length settled, ticks)
             _ → pure ()
-      withServiceUsing defaultConfig alwaysAdmitting (ProbeWith point (countingInterning counter)) $ \svc → (do
+      withServiceUsing defaultConfig alwaysAdmitting (ProbeWith point (countingInterning counter) id) $ \svc → (do
         client ← okOf (registerClient svc)
         let base = hostEndpoint svc Nothing host
             counted = base {endpointEligible = endpointEligible base >>= \e → e <$ when (not e) (modifyTVar' refusals (+ 1))}
@@ -222,7 +222,7 @@ spec = describe "Preparation outside the arbitration" $ do
             open ← newTVarIO True
             gate ← newGate
             host ← newHost True
-            let probe = ProbeWith (probePoint (gatedProbe (\case PointBeforeCommit _ → True; _ → False) gate)) (countingInterning counter)
+            let probe = ProbeWith (probePoint (gatedProbe (\case PointBeforeCommit _ → True; _ → False) gate)) (countingInterning counter) id
             withServiceUsing defaultConfig (SessionAdmission (readTVar open)) probe $ \svc → (do
               client ← okOf (registerClient svc)
               request ← okOf (openArenaWith svc (hostEndpoint svc Nothing host) client "main" (wide ()))
@@ -241,7 +241,7 @@ spec = describe "Preparation outside the arbitration" $ do
 
     it "settles an open whose preparation fails to intern as a definition failure, as before, publishing nothing and retiring its reservation" $ do
       host ← newHost True
-      let probe = ProbeWith (\_ → pure ()) (const (Left PaletteFull))
+      let probe = ProbeWith (\_ → pure ()) (const (Left PaletteFull)) id
       withServiceUsing defaultConfig alwaysAdmitting probe $ \svc → do
         client ← okOf (registerClient svc)
         _ ← okOf (openArenaWith svc (hostEndpoint svc Nothing host) client "main" soilOverStone)

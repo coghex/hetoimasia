@@ -48,7 +48,7 @@ module Hetoimasia.Terrain.Runtime.Internal.Types
   , SessionAdmission (..)
   , Supervisor (..)
   , OwnerControl (..)
-  , Probe (ProbeWith, Probe, probePoint, probeInterning)
+  , Probe (ProbeWith, Probe, probePoint, probeInterning, probeAnswer)
   , Point (..)
   , noProbe
   , Defect (..)
@@ -546,17 +546,21 @@ data OwnerControl = OwnerControl
 -- interning of the open's source into its palette, the value the owner evaluates
 -- outside every transaction before it stages the open ('PointPrepared'). The
 -- default ('Probe') leaves it unchanged; a test observes its evaluation or
--- injects a failure through it.
+-- injects a failure through it. 'probeAnswer' is the same seam on a read's
+-- answer: it is applied to the answer the owner stages, before the host's
+-- preparation of its settlement is evaluated ('PointPrepared'), so a test can
+-- observe how much of the answer that preparation evaluates.
 data Probe = ProbeWith
   { probePoint ∷ Point → IO ()
   , probeInterning ∷ Either PaletteError Palette → Either PaletteError Palette
+  , probeAnswer ∷ Answer → Answer
   }
 
--- | A probe of points alone: the interning is left unchanged.
+-- | A probe of points alone: the interning and the answers are left unchanged.
 pattern Probe ∷ (Point → IO ()) → Probe
-pattern Probe point ← ProbeWith point _
+pattern Probe point ← ProbeWith point _ _
   where
-    Probe point = ProbeWith point id
+    Probe point = ProbeWith point id id
 
 {-# COMPLETE Probe #-}
 
