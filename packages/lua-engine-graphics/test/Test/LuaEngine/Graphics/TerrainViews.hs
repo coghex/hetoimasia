@@ -115,6 +115,7 @@ data Views = Views
 
 spec ∷ Spec
 spec = describe "terrain views" $ do
+  stages
   eviction
   reuse
   pickConsistency
@@ -442,6 +443,273 @@ races = describe "attachment and intent" $ do
       closeView view
   where
     isInvalid = \case Left (IntentInvalid _) → True; _ → False
+
+-- ---------------------------------------------------------------------------
+-- Stages, the owner's tickets and the copies
+
+stages ∷ Spec
+stages = describe "stages and the owner" $ do
+  it "waits for room on the owner's queue instead of giving up a build, and builds once the queue drains, with no other event" $
+    withViews $ \v → do
+      atomically (writeTVar (foCapacity (vOwner v)) 0)
+      view ← attached v 1
+      bounded (atomically (readView view >>= check . readingWaiting))
+      atomically (readView view) >>= (`shouldBe` Nothing) . readingPublished
+      atomically (writeTVar (foCapacity (vOwner v)) 64)
+      _ ← awaitPublished v 1
+      atomically (terrainViewsFailures (vViews v)) `shouldReturn` []
+      closeView view
+
+  it "keeps retiring through a full owner queue: a release due while the queue is full is made once it drains, never abandoned" $
+    withViews $ \v → do
+      view ← attached v 1
+      first' ← awaitPublished v 1
+      adoptNow (vModel v) 1 `shouldReturn` Adopted first'
+      chunks ← Set.toList . worldChunks <$> latestWorld v 1
+      atomically (writeTVar (foCapacity (vOwner v)) 0)
+      closeView view
+      -- the empty handback is adopted and the terrain revision's adoption released: the release is due, the queue full
+      _ ← adoptNow (vModel v) 1
+      _ ← releasePass (vModel v)
+      atomically (writeTVar (foCapacity (vOwner v)) 64)
+      bounded (atomically (readTVar (foReleased (vOwner v)) >>= \done → check (Set.fromList chunks `Set.isSubsetOf` Set.fromList done)))
+      atomically (terrainViewsFailures (vViews v)) `shouldReturn` []
+
+  it "waits for room on a full release lane without asking again in a loop, while another view goes on" $
+    withViews $ \v → do
+      view ← attached v 1
+      first' ← awaitPublished v 1
+      adoptNow (vModel v) 1 `shouldReturn` Adopted first'
+      chunks ← Set.toList . worldChunks <$> latestWorld v 1
+      modelWindow (vModel v) 2
+      peer ← attached v 2
+      _ ← awaitPublished v 2
+      atomically (writeTVar (foLaneFull (vOwner v)) True)
+      asked ← readTVarIO (foBarrierAsks (vOwner v))
+      closeView view
+      -- the peer publishes three more revisions while the lane stays full
+      forM_ [1 .. 3 ∷ Int] $ \k → do
+        now ← publishedRevision (vModel v) 2
+        atomically (updateCamera peer (CameraIntent [Camera.Pan (if even k then 1 else -1) 0])) `shouldReturn` Right ()
+        newer ← awaitPublished' v 2 (now + 1)
+        adoptNow (vModel v) 2 `shouldReturn` Adopted newer
+        void (releasePass (vModel v))
+      readTVarIO (foBarrierAsks (vOwner v)) >>= (`shouldSatisfy` (<= asked + 1))
+      atomically (writeTVar (foLaneFull (vOwner v)) False)
+      _ ← adoptNow (vModel v) 1
+      _ ← releasePass (vModel v)
+      bounded (atomically (readTVar (foReleased (vOwner v)) >>= \done → check (Set.fromList chunks `Set.isSubsetOf` Set.fromList done)))
+      closeView peer
+
+  it "keeps a failed release as evidence once per region, never asks it again, and keeps its GPU bytes charged" $
+    withViews $ \v → do
+      view ← attached v 1
+      first' ← awaitPublished v 1
+      adoptNow (vModel v) 1 `shouldReturn` Adopted first'
+      chunks ← Set.toList . worldChunks <$> latestWorld v 1
+      atomically (writeTVar (foReleaseFailure (vOwner v)) (Just "injected: the buffer could not be freed"))
+      closeView view
+      _ ← adoptNow (vModel v) 1
+      _ ← releasePass (vModel v)
+      let injected = length . filter (Text.isInfixOf "injected: the buffer could not be freed") <$> terrainViewsFailures (vViews v)
+      bounded (atomically (injected >>= check . (== length chunks)))
+      -- later work on the service asks nothing of them again
+      modelWindow (vModel v) 2
+      other ← inInstance (vComp v) (vVm v) "i" (attachView (vViews v) (requestFor v (target v 2))) >>= either (fail . show) pure >>= bounded . awaitAttach >>= \case
+        SettledOk view' → pure view'
+        other' → fail (show other')
+      _ ← awaitPublished v 2
+      atomically injected `shouldReturn` length chunks
+      released ← releasedChunks (vOwner v)
+      filter (`elem` chunks) released `shouldBe` []
+      atomically (terrainViewsGpuCharged (vViews v)) >>= (`shouldSatisfy` (> 0))
+      closeView other
+
+  it "keeps an unpublished region's GPU bytes charged until its upload has ended and its release is answered" $
+    withViews $ \v → do
+      atomically (writeTVar (foHoldUploads (vOwner v)) True)
+      view ← attached v 1
+      bounded (atomically (readTVar (foStanding (vOwner v)) >>= check . elem ChunkUploading . Map.elems))
+      closeView view
+      atomically (terrainViewsGpuCharged (vViews v)) >>= (`shouldSatisfy` (> 0))
+      releasedChunks (vOwner v) `shouldReturn` []
+      -- the uploads end: the regions are released, and only then are their bytes returned
+      atomically $ do
+        writeTVar (foHoldUploads (vOwner v)) False
+        modifyTVar' (foStanding (vOwner v)) (Map.map (const ChunkReady))
+      bounded (atomically (terrainViewsGpuCharged (vViews v) >>= check . (== 0)))
+      releasedChunks (vOwner v) >>= (`shouldSatisfy` (not . null))
+
+  it "copies a viewport larger than the retained bank can reserve at once, one batch at a time" $
+    withViewsTerrain HostFirst (\c → c {configRetainedBytes = 1024 * 1024}) loamOverGranite testConfig {tvCopyRegions = 1} $ \v → do
+      view ← attached v 1
+      _ ← awaitPublished v 1
+      reading ← atomically (readView view)
+      readingRetainedRegions reading `shouldSatisfy` (> 0)
+      atomically (terrainViewsFailures (vViews v)) `shouldReturn` []
+      closeView view
+
+  it "hands a copy in flight to cleanup when the worker is cancelled, so the terrain service's end is not held" $ do
+    seam ← newStageSeam
+    withViewsConfig testConfig {tvOnStage = seamHook seam} $ \v → do
+      -- the second entry into copying has its first batch's request in flight
+      armSeam seam 1 "copying" 2 SeamKill
+      _ ← inInstance (vComp v) (vVm v) "i" (attachView (vViews v) (requestFor v (target v 1))) >>= either (fail . show) pure
+      awaitSeamFired seam
+    -- the whole scope, the terrain service's included, has ended: no borrow kept its drain waiting
+
+  it "starts its copies again when an edit commits between two batches, and publishes the edited arena" $ do
+    seam ← newStageSeam
+    editDone ← newTVarIO False
+    withViewsConfig testConfig {tvCopyRegions = 1, tvOnStage = seamHook seam} $ \v → do
+      view ← attached v 1
+      _ ← awaitPublished v 1
+      quiescent v
+      -- between the first batch's take and the second's request, an edit far from the view commits
+      armSeamAfter seam 1 "copying" 2 (SeamRun (void (removeWith v (tileAt 300 300 3) Nothing) >> atomically (writeTVar editDone True)))
+      atomically (updateCamera view (CameraIntent [Camera.ZoomBy 2])) `shouldReturn` Right ()
+      bounded (atomically (readTVar editDone >>= check))
+      hit ← currentHit v view
+      status ← Runtime.arenaStatus (_vTerrain v) (vArena v) >>= either (fail . show) pure
+      pickContent (pickRefIdentity hit) `shouldBe` Runtime.statusContentRevision status
+      atomically (readView view) >>= (`shouldSatisfy` (> 0)) . readingRestarts
+      closeView view
+
+  it "keeps publishing while an edit lands at every step of a panning camera: its copies start again, and publications keep up" $
+    withViewsConfig testConfig {tvCopyRegions = 1} $ \v → do
+      view ← attached v 1
+      _ ← awaitPublished v 1
+      quiescent v
+      let tagNow = tagRevision . worldTag <$> latestWorld v 1
+          steps = 8 ∷ Integer
+      published0 ← publishedRevision (vModel v) 1
+      attempts0 ← tagNow
+      forM_ [1 .. steps] $ \k → do
+        atomically (updateCamera view (CameraIntent [Camera.Pan (if even k then 1 else -1) 0])) `shouldReturn` Right ()
+        _ ← removeWith v (tileAt (300 + k) 300 3) Nothing
+        void (currentHit v view)
+      published ← subtract published0 <$> publishedRevision (vModel v) 1
+      attempts ← subtract attempts0 <$> tagNow
+      published `shouldSatisfy` (>= fromIntegral steps)
+      attempts `shouldSatisfy` (<= 3 * fromIntegral published)
+      closeView view
+
+  it "hands a close mid-copy to cleanup exactly once: the request in flight is cancelled and nothing is left" $ do
+    seam ← newStageSeam
+    opened ← newTVarIO False
+    withViewsConfig testConfig {tvOnStage = seamHook seam} $ \v → do
+      armSeam seam 1 "copying" 2 (SeamHold opened)
+      view ← attached v 1
+      awaitSeamFired seam
+      withOwnedThread (closeView view) $ \_ closed → do
+        bounded (atomically (viewClosing view >>= check))
+        atomically (writeTVar opened True)
+        bounded closed
+      atomically (claimOf (vClaims v) 1) `shouldReturn` Nothing
+      atomically (ledgerInterests (fakeLedger (vFake v))) `shouldReturn` mempty
+      atomically (terrainViewsFailures (vViews v)) `shouldReturn` []
+
+  it "hands a close mid-build to cleanup exactly once: the build in flight is collected when it answers, and released" $
+    withViews $ \v → do
+      atomically (writeTVar (foGate (vOwner v)) False)
+      view ← attached v 1
+      bounded (atomically (readTVar (foWaiting (vOwner v)) >>= check . (> 0)))
+      closeView view
+      atomically (writeTVar (foGate (vOwner v)) True)
+      bounded (atomically (readTVar (foBuilt (vOwner v)) >>= check . (> 0)))
+      built ← Map.keys <$> readTVarIO (foInstances (vOwner v))
+      bounded (atomically (readTVar (foReleased (vOwner v)) >>= \done → check (Set.fromList built `Set.isSubsetOf` Set.fromList done)))
+      bounded (atomically (terrainViewsGpuCharged (vViews v) >>= check . (== 0)))
+      atomically (terrainViewsFailures (vViews v)) `shouldReturn` []
+
+  it "hands a service stop mid-upload to cleanup exactly once: the regions are released once their uploads end" $ do
+    ownerRef ← newTVarIO Nothing
+    let endUploads = readTVarIO ownerRef >>= mapM_ (\owner → atomically (writeTVar (foHoldUploads owner) False >> modifyTVar' (foStanding owner) (Map.map (const ChunkReady))))
+    result ← newTVarIO Nothing
+    withViewsConfig testConfig {tvStopping = endUploads} $ \v → do
+      atomically (writeTVar ownerRef (Just (vOwner v)))
+      atomically (writeTVar (foHoldUploads (vOwner v)) True)
+      _ ← attached v 1
+      bounded (atomically (readTVar (foStanding (vOwner v)) >>= check . elem ChunkUploading . Map.elems))
+      atomically (writeTVar result (Just (vOwner v, vViews v)))
+    Just (owner, views) ← readTVarIO result
+    built ← Map.keys <$> readTVarIO (foInstances owner)
+    released ← releasedChunks owner
+    Set.fromList built `shouldSatisfy` (`Set.isSubsetOf` Set.fromList released)
+    atomically (terrainViewsGpuCharged views) `shouldReturn` 0
+
+  it "serves another view's attachment and close while a view is held mid-plan" $ do
+    seam ← newStageSeam
+    opened ← newTVarIO False
+    reopened ← newTVarIO False
+    withViewsConfig testConfig {tvStepsPerQuantum = 1, tvOnStage = seamHook seam} $ \v → do
+      modelWindow (vModel v) 3
+      third ← attached v 3
+      _ ← awaitPublished v 3
+      -- the long view (incarnation 2) is held as it enters its second planning quantum
+      armSeam seam 2 "planning" 2 (SeamHold opened)
+      long ← attached v 1
+      awaitSeamFired seam
+      -- an attachment and a close are asked for while it plans
+      modelWindow (vModel v) 2
+      asked ← inInstance (vComp v) (vVm v) "i" (attachView (vViews v) (requestFor v (target v 2))) >>= either (fail . show) pure
+      withOwnedThread (closeView third) $ \_ closed → do
+        bounded (atomically (viewClosing third >>= check))
+        -- it may take one more quantum, then it is held again: whatever its plan still needs, the attachment and the
+        -- close complete meanwhile, so neither waits for the plan
+        atomically (writeTVar (ssFired seam) False)
+        armSeam seam 2 "planning" 3 (SeamHold reopened)
+        atomically (writeTVar opened True)
+        settled ← bounded (awaitAttach asked)
+        bounded closed
+        atomically (writeTVar reopened True)
+        case settled of
+          SettledOk second → closeView second
+          other → expectationFailure (show other)
+      _ ← awaitPublished v 1
+      closeView long
+
+-- A seam over the views' stage entries: it counts each view's entries into each stage, and at one chosen entry holds
+-- the worker until the example opens it, cancels the worker there, or runs an action there.
+data StageSeam = StageSeam
+  { ssCounts ∷ !(TVar (Map (Word64, Text.Text) Int))
+  , ssArmed ∷ !(TVar (Maybe (Word64, Text.Text, Int, SeamAct)))
+  , ssFired ∷ !(TVar Bool)
+  }
+
+data SeamAct = SeamHold !(TVar Bool) | SeamKill | SeamRun !(IO ())
+
+newStageSeam ∷ IO StageSeam
+newStageSeam = StageSeam <$> newTVarIO Map.empty <*> newTVarIO Nothing <*> newTVarIO False
+
+seamHook ∷ StageSeam → Word64 → Text.Text → IO ()
+seamHook seam view stage = do
+  act ← atomically $ do
+    modifyTVar' (ssCounts seam) (Map.insertWith (+) (view, stage) 1)
+    count ← Map.findWithDefault 0 (view, stage) <$> readTVar (ssCounts seam)
+    readTVar (ssArmed seam) >>= \case
+      Just (v', s', n, a) | v' == view && s' == stage && n == count → Just a <$ (writeTVar (ssArmed seam) Nothing >> writeTVar (ssFired seam) True)
+      _ → pure Nothing
+  case act of
+    Just (SeamHold opened) → atomically (readTVar opened >>= check)
+    Just SeamKill → myThreadId >>= killThread
+    Just (SeamRun action) → action
+    Nothing → pure ()
+
+armSeam ∷ StageSeam → Word64 → Text.Text → Int → SeamAct → IO ()
+armSeam seam view stage n act = atomically (writeTVar (ssArmed seam) (Just (view, stage, n, act)))
+
+-- Arm the seam at the view's n-th entry into the stage from now.
+armSeamAfter ∷ StageSeam → Word64 → Text.Text → Int → SeamAct → IO ()
+armSeamAfter seam view stage n act = atomically $ do
+  now ← seamCount seam view stage
+  writeTVar (ssArmed seam) (Just (view, stage, now + n, act))
+
+awaitSeamFired ∷ StageSeam → IO ()
+awaitSeamFired seam = bounded (atomically (readTVar (ssFired seam) >>= check))
+
+seamCount ∷ StageSeam → Word64 → Text.Text → STM Int
+seamCount seam view stage = Map.findWithDefault 0 (view, stage) <$> readTVar (ssCounts seam)
 
 -- ---------------------------------------------------------------------------
 -- Residency under the view's own camera demand: eviction and reload at the full region extent
@@ -977,7 +1245,7 @@ lifecycle = describe "close orders and limits" $ do
   it "rethrows a cancellation of its worker instead of recording it: the worker ends, attachments stop, and the scope's exit still closes every view" $ do
     armed ← newTVarIO False
     -- the next stage the worker enters cancels it there, as a cancellation of the worker's thread would
-    let cancelAt stage = when (stage == "planning") $ do
+    let cancelAt _ stage = when (stage == "planning") $ do
           fire ← atomically (readTVar armed <* writeTVar armed False)
           when fire (myThreadId >>= killThread)
     (views, claims) ← withViewsConfig testConfig {tvOnStage = cancelAt} $ \v → do

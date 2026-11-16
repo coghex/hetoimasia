@@ -43,6 +43,7 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView.Service
   , TerrainViewsPorts (..)
   , withTerrainViews
   , terrainViewsFailures
+  , terrainViewsGpuCharged
   , renderStagingAccount
 
     -- * Views
@@ -55,6 +56,7 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView.Service
   , cancelAttach
   , closeView
   , viewClosed
+  , viewClosing
 
     -- * Intent
   , updateCamera
@@ -267,6 +269,7 @@ data ViewState k = ViewState
     -- ^ Where the view's preparation stands, and what that stage owns.
   , vsStageCharge ∷ !(TVar Word64)
     -- ^ What the stage holds of the account: the copies taken so far, then the candidate's CPU bytes.
+  , vsRestarts ∷ !(TVar Int)
   }
 
 -- | A published plan kept for picking, with its identity and its CPU charge.
@@ -305,6 +308,11 @@ renderStagingAccount account =
 -- not prove.
 terrainViewsFailures ∷ (Ord k, Show k) ⇒ TerrainViews k → STM [Text]
 terrainViewsFailures = readTVar . svFailures
+
+-- | The GPU bytes the service holds charged: every retained region listed, being built, uploading or retiring, until
+-- its release is proved. Read-only.
+terrainViewsGpuCharged ∷ TerrainViews k → STM Word64
+terrainViewsGpuCharged = readTVar . svGpu
 
 -- | Run the adapter for the body. On every exit every view is closed (its claim handed back, its interests dropped and
 -- its regions retired), the retirements are drained to the owner's evidence, and the worker is joined.
@@ -536,6 +544,7 @@ newViewState service request style runtimeView camera light = do
     <*> newTVarIO Nothing
     <*> newTVarIO StageIdle
     <*> newTVarIO 0
+    <*> newTVarIO 0
 
 -- ---------------------------------------------------------------------------
 -- Intent
@@ -665,6 +674,7 @@ readView (TerrainView service state) = do
     StageBuilding _ building → isNothing (bdTicket building)
     _ → False
   let waiting = stopped || staged
+  restarts ← readTVar (vsRestarts state)
   held ← readTVar (vsAccountHeld state)
   pure
     ViewReading
@@ -677,6 +687,7 @@ readView (TerrainView service state) = do
       , readingGpuBytes = sum (map rgBytes (Map.elems regions))
       , readingPins = Map.size pins
       , readingWaiting = waiting
+      , readingRestarts = restarts
       }
 
 -- | The view's latest camera demand: its visible regions, then its prefetch. 'Nothing' before its first preparation.
@@ -704,6 +715,10 @@ closeView (TerrainView _ state) = do
 -- | Whether the view has closed.
 viewClosed ∷ (Ord k, Show k) ⇒ TerrainView k → STM Bool
 viewClosed (TerrainView _ state) = readTVar (vsClosed state)
+
+-- | Whether the view's close was asked for (it may not have completed yet).
+viewClosing ∷ TerrainView k → STM Bool
+viewClosing (TerrainView _ state) = readTVar (vsClosing state)
 
 -- The worker's close of one view.
 runClose ∷ (Ord k, Show k) ⇒ TerrainViews k → ViewState k → IO ()
@@ -1154,7 +1169,7 @@ stageName = \case
 enter ∷ TerrainViews k → ViewState k → Stage → IO ()
 enter service state stage = do
   atomically (writeTVar (vsStage state) stage)
-  tvOnStage (svConfig service) (stageName stage)
+  tvOnStage (svConfig service) (vsId state) (stageName stage)
 
 -- End a preparation: the outcome is recorded, the stage is idle again and its charge is gone.
 finish ∷ (Ord k, Show k) ⇒ TerrainViews k → ViewState k → Prepared' → Maybe Prep → IO ()
@@ -1273,7 +1288,7 @@ stepCopying service state prep copying = case cpPending copying of
     terrain = portTerrain (svPorts service)
     restart
       | prpRestarts prep > 0 = do
-          atomically (writeTVar (vsStageCharge state) 0 >> void (recharge service state))
+          atomically (writeTVar (vsStageCharge state) 0 >> void (recharge service state) >> modifyTVar' (vsRestarts state) (+ 1))
           let prep' = prep {prpRestarts = prpRestarts prep - 1}
           enter service state (StageCopying prep' (Copying [] (batchesOf service (Set.toList (prpRegions prep))) Nothing Nothing))
       | otherwise = abandonStage service state >> finish service state Retry' (Just prep)

@@ -17,6 +17,7 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView
   , TerrainViews
   , withTerrainViews
   , terrainViewsFailures
+  , terrainViewsGpuCharged
   , renderStagingAccount
 
     -- * The graphics owner
@@ -53,6 +54,7 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView
   , cancelAttach
   , closeView
   , viewClosed
+  , viewClosing
 
     -- * Intent
   , CameraIntent (..)
