@@ -277,6 +277,9 @@ data ViewReading = ViewReading
     -- ^ What the facts the view keeps for its camera hold of the account.
   , readingDemandBytes ∷ !Word64
     -- ^ What the view's kept demand holds of the account.
+  , readingNeedBytes ∷ !Word64
+    -- ^ Everything the view keeps: its pinned plans, its listed regions' descriptions, its stage, its facts and its
+    -- demand. 'readingCpuBytes' covers it, in whole granules.
   }
   deriving (Eq, Show)
 

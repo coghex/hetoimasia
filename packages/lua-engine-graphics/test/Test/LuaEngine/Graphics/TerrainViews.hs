@@ -531,7 +531,8 @@ stages = describe "stages and the owner" $ do
       closeView other
 
   it "charges the facts it keeps for its camera and its kept demand for as long as it keeps them, after publication and after an abandoned preparation" $
-    withViews $ \v → do
+    -- a granule of 64 bytes, so the account's charge follows the view's need closely
+    withViewsConfig testConfig {tvAccountGranule = 64} $ \v → do
       view ← attached v 1
       _ ← awaitPublished v 1
       quiescent v
@@ -544,7 +545,7 @@ stages = describe "stages and the owner" $ do
       readingFactsBytes published `shouldSatisfy` (> 0)
       readingFactsBytes published `mod` 25872 `shouldBe` 0
       readingDemandBytes published `shouldSatisfy` (>= 32 * fromIntegral demanded)
-      readingCpuBytes published `shouldSatisfy` (>= readingFactsBytes published + readingDemandBytes published)
+      readingCpuBytes published `shouldSatisfy` (>= readingNeedBytes published)
       -- a superseded preparation held at the owner is abandoned: the facts it settled are still kept, and charged
       atomically (writeTVar (foGate (vOwner v)) False)
       atomically (updateCamera view (CameraIntent [Camera.ZoomBy 2])) `shouldReturn` Right ()
@@ -553,7 +554,7 @@ stages = describe "stages and the owner" $ do
       bounded (atomically (readView view >>= check . (== 0) . readingStagedBytes))
       abandoned ← atomically (readView view)
       readingFactsBytes abandoned `shouldSatisfy` (> 0)
-      readingCpuBytes abandoned `shouldSatisfy` (>= readingFactsBytes abandoned + readingDemandBytes abandoned)
+      readingCpuBytes abandoned `shouldSatisfy` (>= readingNeedBytes abandoned)
       atomically (writeTVar (foGate (vOwner v)) True)
       closeView view
 

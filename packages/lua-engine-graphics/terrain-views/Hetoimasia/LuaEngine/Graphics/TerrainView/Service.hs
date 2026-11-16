@@ -714,6 +714,7 @@ readView (TerrainView service state) = do
   staged' ← readTVar (vsStageCharge state)
   factsBytes ← readTVar (vsFactsCharge state)
   demandBytes' ← demandNeed state
+  pinnedBytes ← pinnedNeed state
   held ← readTVar (vsAccountHeld state)
   pure
     ViewReading
@@ -730,6 +731,7 @@ readView (TerrainView service state) = do
       , readingStagedBytes = staged'
       , readingFactsBytes = factsBytes
       , readingDemandBytes = demandBytes'
+      , readingNeedBytes = pinnedBytes + sum (map regionCpu (Map.elems regions)) + staged' + factsBytes + demandBytes'
       }
 
 -- | The view's latest camera demand: its visible regions, then its prefetch. 'Nothing' before its first preparation.
