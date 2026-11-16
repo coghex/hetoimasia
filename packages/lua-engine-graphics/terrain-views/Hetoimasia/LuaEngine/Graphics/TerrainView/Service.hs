@@ -75,6 +75,8 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView.Service
   , pickView
   , pickPrecondition
   , adoptedPlan
+  , admittedCostBound
+  , preparationCost
   ) where
 
 import Control.Concurrent (forkIOWithUnmask)
@@ -297,10 +299,21 @@ data ViewState k = ViewState
   , vsContinue ∷ !(TVar Bool)
     -- ^ The last published plan left visible demand unadmitted and admitted more than the plan before it: the view
     -- prepares again, to go on.
+  , vsBlocked ∷ !(TVar (Maybe Blocked))
+    -- ^ The last preparation could not start, and only this can change that: the view sleeps until it does, however
+    -- its intent or its peers move.
+  , vsSteps ∷ !(TVar Int)
+    -- ^ Steps the worker has taken for the view.
+  , vsAdmittedCount ∷ !(TVar Int)
+    -- ^ How many regions the last published plan admitted.
   , vsFactsCharge ∷ !(TVar Word64)
     -- ^ What the facts kept for the camera ('vsFacts') hold of the account: charged with the inputs they were made
     -- from, kept while they are kept, replaced by the next facts' charge and returned at close.
   }
+
+-- What a preparation that could not start waits for: an adoption other than the one it saw (a pin is then freed), or
+-- the target's metrics and the arena both available.
+data Blocked = BlockedOnAdoption !(Maybe Natural) | BlockedOnMetrics
 
 -- | A published plan kept for picking, with its identity and its CPU charge.
 data Pinned = Pinned
@@ -593,6 +606,9 @@ newViewState service request style runtimeView camera light = do
     <*> newTVarIO Set.empty
     <*> newTVarIO 0
     <*> newTVarIO False
+    <*> newTVarIO Nothing
+    <*> newTVarIO 0
+    <*> newTVarIO 0
     <*> newTVarIO 0
 
 -- ---------------------------------------------------------------------------
@@ -730,6 +746,8 @@ readView (TerrainView service state) = do
   demandBytes' ← demandNeed state
   pinnedBytes ← pinnedNeed state
   unadmitted ← readTVar (vsUnadmitted state)
+  steps ← readTVar (vsSteps state)
+  admittedCount ← readTVar (vsAdmittedCount state)
   held ← readTVar (vsAccountHeld state)
   pure
     ViewReading
@@ -747,6 +765,8 @@ readView (TerrainView service state) = do
       , readingFactsBytes = factsBytes
       , readingDemandBytes = demandBytes'
       , readingUnadmitted = unadmitted
+      , readingAdmitted = admittedCount
+      , readingSteps = steps
       , readingNeedBytes = pinnedBytes + sum (map regionCpu (Map.elems regions)) + staged' + factsBytes + demandBytes'
       }
 
@@ -899,7 +919,17 @@ arenaIdentity status residency = case (status, residency) of
 -- Whether a view has work: a new intent, a new arena revision or residency generation, new metrics, or pressure released
 -- since it stopped.
 viewDirty ∷ (Ord k, Show k) ⇒ TerrainViews k → ViewState k → STM Bool
-viewDirty service state = do
+viewDirty service state =
+  readTVar (vsBlocked state) >>= \case
+    Just (BlockedOnAdoption seen) → (/= seen) . fmap fst <$> ledgerNewestAdopted (portLedger (svPorts service)) (vtKey (vsTarget state))
+    Just BlockedOnMetrics → do
+      metrics ← vtMetrics (vsTarget state)
+      status ← Runtime.arenaStatusSTM (portTerrain (svPorts service)) (vsArena state)
+      pure (isJust metrics && either (const False) (const True) status)
+    Nothing → unblockedDirty service state
+
+unblockedDirty ∷ (Ord k, Show k) ⇒ TerrainViews k → ViewState k → STM Bool
+unblockedDirty service state = do
   intent ← readTVar (vsIntent state)
   (prepared, revisions, metrics) ← readTVar (vsPrepared state)
   status ← Runtime.arenaStatusSTM (portTerrain (svPorts service)) (vsArena state)
@@ -1230,7 +1260,8 @@ superseded state prep = do
 
 -- One step of the view's preparation.
 stepView ∷ (Ord k, Show k) ⇒ TerrainViews k → ViewState k → IO ()
-stepView service state =
+stepView service state = do
+  atomically (modifyTVar' (vsSteps state) (+ 1))
   readTVarIO (vsStage state) >>= \case
     StageIdle → startPreparation service state
     stage → do
@@ -1359,10 +1390,13 @@ startPreparation service state = do
     (,,,) <$> readTVar (vsIntent state) <*> vtMetrics (vsTarget state) <*> Runtime.arenaStatusSTM (portTerrain (svPorts service)) (vsArena state) <*> residencyNow service state
   let identity = arenaIdentity status residency
   case (metrics, status) of
-    _ | pins >= tvCpuPins (svConfig service) → finish service state Retry' Nothing
+    _ | pins >= tvCpuPins (svConfig service) → do
+      finish service state Retry' Nothing
+      atomically (BlockedOnAdoption . fmap fst <$> ledgerNewestAdopted (portLedger (svPorts service)) (vtKey (vsTarget state)) >>= writeTVar (vsBlocked state) . Just)
     (Just m, Right _) → do
       (camera, extra, seeds) ← atomically $ do
         writeTVar (vsContinue state) False
+        writeTVar (vsBlocked state) Nothing
         camera ← readTVar (vsCamera state)
         extra ← readTVar (vsExtraDemand state)
         -- a partial plan goes on from the regions it admitted that its own visible demand named
@@ -1374,9 +1408,9 @@ startPreparation service state = do
           prep = Prep intent m identity (Set.fromList ordered) maxRounds maxRestarts
       atomically (writeTVar (vsPhase state) PhasePreparing)
       enter service state (StageCopying prep (Copying [] (batchesOf service ordered) Nothing Nothing))
-    _ → finish service state Unchanged' (Just (Prep intent (fromMaybe zeroMetrics metrics) identity Set.empty 0 0))
-  where
-    zeroMetrics = TargetMetrics (PixelExtent 0 0) (PixelExtent 0 0) 1 1
+    _ → do
+      finish service state Unchanged' Nothing
+      atomically (writeTVar (vsBlocked state) (Just BlockedOnMetrics))
 
 -- The planner finds its demand as it goes: regions behind known air become candidates only once the regions in front of
 -- them are known. So the copies start from the camera's anchor, and each plan's own visible demand that the copies did
@@ -1384,6 +1418,19 @@ startPreparation service state = do
 -- in the published plan, and the next preparation goes on from there.
 maxRounds, maxRestarts ∷ Int
 maxRounds = 16
+
+-- | The most one preparation's admitted copies and the inputs made from them can hold of the account: the terrain
+-- service's reservation for the regions it copies, and each region's inputs.
+admittedCostBound ∷ TerrainViewsConfig → Word64
+admittedCostBound config =
+  let regions = max 1 (tvAdmitRegions config)
+   in Runtime.regionSnapshotReservation regions + inputsPerRegion * fromIntegral regions
+
+-- | What a preparation over this many regions needs of the account beyond what the view already holds, at most: the
+-- terrain service's reservation for their copies, their inputs and the room for the plan's first quantum over them.
+preparationCost ∷ TerrainViewsConfig → Int → Word64
+preparationCost config regions =
+  Runtime.regionSnapshotReservation (max 1 regions) + inputsPerRegion * fromIntegral (max 1 regions) + quantumBound config (max 1 regions)
 
 -- The order regions are admitted in: the camera's anchor, then the others nearest it first (by the larger of the
 -- horizontal distances, then the vertical), then by coordinate. Pure, so a preparation admits the same regions for the
@@ -1489,9 +1536,9 @@ toPlanning service state prep0 copies0 = do
       where
         failed why = recordFailure service why >> abandonStage service state >> finish service state Retry' (Just prep)
 
--- The longest prefix of these copies (taken in admission order) whose inputs the account can hold beside them: the
--- stage's charge becomes that prefix's footprint and its inputs. 'Nothing' (and nothing changed) when not even the
--- first copy's inputs fit.
+-- The longest prefix of these copies (taken in admission order) whose inputs the account can hold beside them, with
+-- room left for the plan's first quantum over them (so an admitted subset can always be planned): the stage's charge
+-- becomes that prefix's footprint and its inputs. 'Nothing' (and nothing changed) when not even the first copy fits.
 admitInputs ∷ TerrainViews k → ViewState k → [Runtime.RegionSnapshot] → STM (Maybe (CopySet, Word64))
 admitInputs service state ordered = do
   before ← readTVar (vsStageCharge state)
@@ -1501,9 +1548,12 @@ admitInputs service state ordered = do
         Left _ → attempt rest
         Right copies → do
           let inputs = inputsPerRegion * fromIntegral (Set.size (copyRegions copies))
-          writeTVar (vsStageCharge state) (sum (map Runtime.regionSnapshotFootprint prefix) + inputs)
+              held = sum (map Runtime.regionSnapshotFootprint prefix) + inputs
+          writeTVar (vsStageCharge state) (held + quantumBound (svConfig service) (Set.size (copyRegions copies)))
+          room ← recharge service state
+          writeTVar (vsStageCharge state) held
           ok ← recharge service state
-          if ok then pure (Just (copies, inputs)) else attempt rest
+          if room && ok then pure (Just (copies, inputs)) else attempt rest
   attempt prefixes
 
 -- Grow the stage's charge by these bytes, covered by the account: 'False' (and nothing changed) when it cannot.
@@ -1582,7 +1632,14 @@ stepPlanning service state prep planning = case cellPrepProgress (plPrep plannin
             void (recharge service state)
             kept ← maybe 0 (\(v', p') → demandBytes * fromIntegral (length v' + length p')) <$> readTVar (vsDemand state)
             growStage service state (adaptation + demandGrowth kept)
-          if not charged
+          -- a preparation woken only to admit more (the same intent, metrics and arena state as the published plan) that
+          -- admitted no more publishes nothing: it sleeps again until something it waits on changes
+          unchanged ← atomically $ do
+            (intent, identity, metrics) ← readTVar (vsPrepared state)
+            count ← readTVar (vsAdmittedCount state)
+            published ← isJust <$> readTVar (vsPublished state)
+            pure (published && intent == prpIntent prep && identity == prpIdentity prep && metrics == Just (prpMetrics prep) && Set.size (prpRegions prep) <= count)
+          if not charged || unchanged
             then abandonStage service state >> finish service state Retry' (Just prep)
             else do
               -- The camera's interests cover every region the plan was drawn from, not only what is still pending: the
@@ -1890,10 +1947,14 @@ publishPlan service state prep uploading = do
           -- something it waits on changes (a release, an adoption, the account)
           atomically $ do
             unadmitted ← readTVar (vsUnadmitted state)
-            previous ← readTVar (vsAdmitted state)
+            previous ← readTVar (vsAdmittedCount state)
             readTVar (vsVisibleAdmitted state) >>= writeTVar (vsAdmitted state)
-            when (unadmitted > 0) $
-              if Set.size (prpRegions prep) > Set.size previous
+            let admitted = Set.size (prpRegions prep)
+                capped = admitted >= tvAdmitRegions (svConfig service)
+            writeTVar (vsAdmittedCount state) admitted
+            -- at the cap only a new intent, metrics or arena state changes what is admitted: nothing more to do
+            when (unadmitted > 0 && not capped) $
+              if admitted > previous
                 then writeTVar (vsContinue state) True
                 else retryMark service state >>= writeTVar (vsRetry state) . Just
         else abandonStage service state >> finish service state Abandoned' (Just prep)

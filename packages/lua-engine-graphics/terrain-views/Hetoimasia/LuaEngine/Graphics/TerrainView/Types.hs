@@ -284,6 +284,10 @@ data ViewReading = ViewReading
   , readingUnadmitted ∷ !Int
     -- ^ Regions of the camera's visible demand the last published plan did not admit: pending, with their loading
     -- envelope, in a deliberately partial plan.
+  , readingAdmitted ∷ !Int
+    -- ^ Regions the last published plan admitted: at most 'tvAdmitRegions'.
+  , readingSteps ∷ !Int
+    -- ^ Steps the adapter's worker has taken for the view: flat while the view sleeps.
   , readingNeedBytes ∷ !Word64
     -- ^ Everything the view keeps: its pinned plans, its listed regions' descriptions, its stage, its facts and its
     -- demand. 'readingCpuBytes' covers it, in whole granules.
