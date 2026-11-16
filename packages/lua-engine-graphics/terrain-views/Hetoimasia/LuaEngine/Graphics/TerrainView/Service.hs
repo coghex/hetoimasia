@@ -80,7 +80,7 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView.Service
 import Control.Concurrent (forkIOWithUnmask)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar)
 import Control.Concurrent.STM
-import Control.Exception (Exception, SomeAsyncException, SomeException, displayException, finally, fromException, mask, mask_, onException, throwIO, try)
+import Control.Exception (Exception, SomeAsyncException, SomeException, displayException, finally, fromException, mask, mask_, onException, throwIO, try, uninterruptibleMask_)
 import Control.Monad (forM, forM_, unless, void, when)
 import Data.Foldable (for_)
 import Data.Functor ((<&>))
@@ -199,6 +199,9 @@ data TerrainViews k = TerrainViews
   , svRetiringCpu ∷ !(TVar Word64)
     -- ^ What the service holds of the account for retiring regions' CPU descriptions and builds left in flight, moved
     -- from their views' charges; returned as each release is answered, and at the service's end.
+  , svAbandonedCopies ∷ !(TVar [Runtime.Pending Runtime.RegionBorrow])
+    -- ^ Copy requests an abandoned stage left in flight, handed here in the transaction that ended the stage: the worker
+    -- (or the service's end) takes each settled one and releases it, or cancels it.
   }
 
 data Request k
@@ -354,6 +357,7 @@ withTerrainViews config ports body = do
       <*> newTVarIO False
       <*> newTVarIO []
       <*> newTVarIO 0
+      <*> newTVarIO []
   done ← newEmptyMVar
   mask $ \restore → do
     _ ← forkIOWithUnmask $ \unmask →
@@ -907,6 +911,7 @@ shutdown service = do
   -- Settle every attachment still queued.
   queued ← atomically (readTVar (svRequests service) <* writeTVar (svRequests service) [])
   settleQueued queued
+  disposeAbandonedCopies service
   drain
   -- what the service still holds for retiring regions (kept as evidence, or left by an owner that ended) returns now that
   -- nothing can use it
@@ -981,10 +986,17 @@ retireStep service = do
         recordFailureSTM service "a build left in flight answered another number of regions than asked"
         modifyTVar' (svRetiring service) (<> [Retiring chunk 0 0 RetireMet | chunk ← chunks])
         pure []
-      Just _ → do
-        -- it built nothing: its GPU bytes and the CPU it would have described return
-        modifyTVar' (svGpu service) (subtract (orGpu o))
-        returnFromService service (sum (orCpu o))
+      Just answer → do
+        -- it stopped: what it built retires with its charges, and the GPU bytes and the CPU of what it did not build
+        -- return
+        let built = case answer of
+              Answered (Left (BuildPressure chunks _)) → chunks
+              Answered (Left (BuildFailed chunks _)) → chunks
+              _ → []
+            paired = zip3 built (orBytes o) (orCpu o)
+        modifyTVar' (svRetiring service) (<> [Retiring chunk bytes cpu RetireMet | (chunk, bytes, cpu) ← paired])
+        modifyTVar' (svGpu service) (subtract (orGpu o - min (orGpu o) (sum [b | (_, b, _) ← paired])))
+        returnFromService service (sum (orCpu o) - min (sum (orCpu o)) (sum [c | (_, _, c) ← paired]))
         modifyTVar' (svReleases service) (+ 1)
         pure []
   writeTVar (svOrphans service) stillOut
@@ -1215,7 +1227,11 @@ stageName = \case
 enter ∷ TerrainViews k → ViewState k → Stage → IO ()
 enter service state stage = do
   atomically (writeTVar (vsStage state) stage)
-  tvOnStage (svConfig service) (vsId state) (stageName stage)
+  stageSeam service state stage
+
+-- The test seam after a stage was recorded.
+stageSeam ∷ TerrainViews k → ViewState k → Stage → IO ()
+stageSeam service state stage = tvOnStage (svConfig service) (vsId state) (stageName stage)
 
 -- End a preparation: the outcome is recorded, the stage is idle again and its charge is gone.
 finish ∷ (Ord k, Show k) ⇒ TerrainViews k → ViewState k → Prepared' → Maybe Prep → IO ()
@@ -1239,16 +1255,20 @@ finish service state outcome prep = atomically $ do
 -- the stage's charge returns.
 abandonStage ∷ (Ord k, Show k) ⇒ TerrainViews k → ViewState k → IO ()
 abandonStage service state = do
-  let terrain = portTerrain (svPorts service)
-  stage ← atomically (readTVar (vsStage state) <* writeTVar (vsStage state) StageIdle)
+  atomically (abandonStageSTM service state)
+  transferSeam service state "abandoned"
+  disposeAbandonedCopies service
+
+-- The stage ends and everything it holds changes owner in one transaction, so no cancellation can fall between the two: a
+-- copy request in flight to the service's abandoned copies, a build in flight to the orphans (a reservation with no
+-- build yet returns), built chunks to the retirements; the stage's charge returns.
+abandonStageSTM ∷ TerrainViews k → ViewState k → STM ()
+abandonStageSTM service state = do
+  stage ← readTVar (vsStage state)
+  writeTVar (vsStage state) StageIdle
   case stage of
-    StageCopying _ copying → forM_ (cpPending copying) $ \(_, pending) → do
-      taken ← atomically ((Just <$> Runtime.awaitSTM terrain pending) `orElse` pure Nothing)
-      case taken of
-        Just (Right borrow) → Runtime.releaseRegionBorrow terrain borrow
-        Just (Left _) → pure ()
-        Nothing → void (Runtime.cancelPending terrain pending)
-    StageBuilding _ building → atomically $ case bdTicket building of
+    StageCopying _ copying → forM_ (cpPending copying) $ \(_, pending) → modifyTVar' (svAbandonedCopies service) (pending :)
+    StageBuilding _ building → case bdTicket building of
       Just ticket → do
         let wanted = Map.elems (bdWanted building)
             cpus = [wantedCpu instances records | (instances, records) ← wanted]
@@ -1256,17 +1276,38 @@ abandonStage service state = do
         -- the CPU it will describe moves out of the stage's charge into the service's
         modifyTVar' (vsStageCharge state) (\c → c - min c (sum cpus))
         moveToService service state (sum cpus)
-      Nothing → modifyTVar' (svGpu service) (subtract (bdGpu building)) >> modifyTVar' (svReleases service) (+ 1)
-    StageUploading _ uploading → atomically $ do
+      Nothing → modifyTVar' (svGpu service) (subtract (bdGpu building))
+    StageUploading _ uploading → do
       retireFresh service (upFresh uploading)
       let cpus = sum (map regionCpu (Map.elems (upFresh uploading)))
       modifyTVar' (vsStageCharge state) (\c → c - min c cpus)
       moveToService service state cpus
     _ → pure ()
-  atomically $ do
-    writeTVar (vsStageCharge state) 0
-    void (recharge service state)
-    modifyTVar' (svReleases service) (+ 1)
+  writeTVar (vsStageCharge state) 0
+  void (recharge service state)
+  modifyTVar' (svReleases service) (+ 1)
+
+-- Dispose of the copy requests abandoned stages left in flight: a settled one is taken and its borrow released, a
+-- pending one cancelled. Each is taken from the list and disposed of with no cancellation between the two.
+disposeAbandonedCopies ∷ TerrainViews k → IO ()
+disposeAbandonedCopies service = do
+  let terrain = portTerrain (svPorts service)
+  more ← uninterruptibleMask_ $ do
+    next ← atomically $ readTVar (svAbandonedCopies service) >>= \case
+      pending : rest → Just pending <$ writeTVar (svAbandonedCopies service) rest
+      [] → pure Nothing
+    forM_ next $ \pending → do
+      taken ← atomically ((Just <$> Runtime.awaitSTM terrain pending) `orElse` pure Nothing)
+      case taken of
+        Just (Right borrow) → Runtime.releaseRegionBorrow terrain borrow
+        Just (Left _) → pure ()
+        Nothing → void (Runtime.cancelPending terrain pending)
+    pure (isJust next)
+  when more (disposeAbandonedCopies service)
+
+-- The test seam after a transaction that handed resources on.
+transferSeam ∷ TerrainViews k → ViewState k → Text → IO ()
+transferSeam service state = tvOnTransfer (svConfig service) (vsId state)
 
 -- Built chunks no revision listed retire with no barrier; their GPU bytes stay charged until each is released.
 retireFresh ∷ TerrainViews k → Map (Integer, Integer) Region → STM ()
@@ -1350,8 +1391,11 @@ stepCopying service state prep copying = case cpPending copying of
       | otherwise = abandonStage service state >> finish service state Retry' (Just prep)
     next current = case cpTodo current of
       batch : rest →
-        Runtime.requestRegionSnapshot terrain (vsArena state) batch >>= \case
-          Right pending → enter service state (StageCopying prep current {cpTodo = rest, cpPending = Just (batch, pending)})
+        -- the request and its record in the stage, with no cancellation between them
+        mask_ (Runtime.requestRegionSnapshot terrain (vsArena state) batch >>= traverse (\pending → pending <$ atomically (writeTVar (vsStage state) (StageCopying prep current {cpTodo = rest, cpPending = Just (batch, pending)})))) >>= \case
+          Right pending → do
+            transferSeam service state "requested"
+            stageSeam service state (StageCopying prep current {cpTodo = rest, cpPending = Just (batch, pending)})
           Left (Runtime.RefusedBusy _) → do
             mark ← atomically (retryMark service state)
             enter service state (StageCopying prep current {cpWait = Just mark})
@@ -1475,25 +1519,38 @@ toBuilding service state prep copies plan adapted held = do
   let reused = Map.mapMaybe id (Map.intersectionWith (\region (instances, records) → if rgInstances region == instances && rgRecords region == records then Just region else Nothing) existing groups)
       wanted = Map.difference groups reused
       gpuNeed = sum [fromIntegral (length instances) * instanceBytes | (instances, _) ← Map.elems wanted]
+  -- the GPU bytes are reserved and recorded with the stage that holds them, in one transaction
   reserved ← atomically $ do
     charged ← readTVar (svGpu service)
     if gpuNeed > tvGpuBytes (svConfig service) - min (tvGpuBytes (svConfig service)) charged
-      then pure False
-      else True <$ writeTVar (svGpu service) (charged + gpuNeed)
-  if not reserved
-    then abandonStage service state >> finish service state Retry' (Just prep)
-    else
-      if Map.null wanted
-        then enter service state (StageUploading prep (Uploading plan adapted copies reused Map.empty held))
-        else submitBuild service state prep (Building plan adapted copies reused wanted gpuNeed held Nothing)
+      then pure Nothing
+      else do
+        writeTVar (svGpu service) (charged + gpuNeed)
+        let next
+              | Map.null wanted = StageUploading prep (Uploading plan adapted copies reused Map.empty held)
+              | otherwise = StageBuilding prep (Building plan adapted copies reused wanted gpuNeed held Nothing)
+        Just next <$ writeTVar (vsStage state) next
+  case reserved of
+    Nothing → abandonStage service state >> finish service state Retry' (Just prep)
+    Just next → do
+      transferSeam service state "reserved"
+      case next of
+        StageBuilding _ building → submitBuild service state prep building
+        _ → stageSeam service state next
 
 submitBuild ∷ (Ord k, Show k) ⇒ TerrainViews k → ViewState k → Prep → Building → IO ()
 submitBuild service state prep building = do
-  submitted ← atomically (ownerBuild (portOwner (svPorts service)) [RegionBuild instances records | (instances, records) ← Map.elems (bdWanted building)])
+  -- the submission and its ticket's record in the stage, in one transaction
+  submitted ← atomically $
+    ownerBuild (portOwner (svPorts service)) [RegionBuild instances records | (instances, records) ← Map.elems (bdWanted building)] >>= \case
+      Right ticket → Right ticket <$ writeTVar (vsStage state) (StageBuilding prep building {bdTicket = Just ticket})
+      Left refusal → pure (Left refusal)
   case submitted of
-    Right ticket → enter service state (StageBuilding prep building {bdTicket = Just ticket})
-    -- a full queue: the build waits for room on the owner's queue, holding nothing but its reservation
-    Left OwnerBusy → enter service state (StageBuilding prep building {bdTicket = Nothing})
+    Right ticket → do
+      transferSeam service state "submitted"
+      stageSeam service state (StageBuilding prep building {bdTicket = Just ticket})
+    -- a full queue: the build waits for room on the owner's queue, holding nothing but its reservation (recorded)
+    Left OwnerBusy → stageSeam service state (StageBuilding prep building {bdTicket = Nothing})
     Left OwnerGone → do
       recordFailure service "a retained region could not be built: the graphics owner takes no more actions"
       abandonStage service state >> finish service state Retry' (Just prep)
@@ -1501,33 +1558,56 @@ submitBuild service state prep building = do
 stepBuilding ∷ (Ord k, Show k) ⇒ TerrainViews k → ViewState k → Prep → Building → IO ()
 stepBuilding service state prep building = case bdTicket building of
   Nothing → submitBuild service state prep building
-  Just ticket →
-    atomically ticket >>= \case
-      Nothing → pure ()
-      Just answer → do
-        -- the ticket is answered: the stage no longer has a build in flight
-        let settled = building {bdTicket = Nothing}
-        atomically (writeTVar (vsStage state) (StageBuilding prep settled))
-        case answer of
-          Answered (Right chunks)
-            | length chunks == Map.size (bdWanted building) → do
-                let fresh =
-                      Map.fromList
-                        [ (key, Region chunk instances records (fromIntegral (length instances) * 64))
-                        | ((key, (instances, records)), chunk) ← zip (Map.toList (bdWanted building)) chunks
-                        ]
-                enter service state (StageUploading prep (Uploading (bdPlan building) (bdAdapted building) (bdCopies building) (bdReused building) fresh (bdCpu building)))
-            | otherwise → do
-                recordFailure service "the owner built another number of regions than asked"
-                atomically (modifyTVar' (svRetiring service) (<> [Retiring chunk 0 0 RetireMet | chunk ← chunks]))
-                abandonStage service state >> finish service state Retry' (Just prep)
-          Answered (Left (BuildPressure _)) → abandonStage service state >> finish service state Retry' (Just prep)
-          Answered (Left (BuildFailed why)) → do
-            recordFailure service ("a retained region could not be built: " <> why)
-            abandonStage service state >> finish service state Retry' (Just prep)
-          NotRun why → do
-            recordFailure service ("a retained region's build did not run: " <> why)
-            abandonStage service state >> finish service state Retry' (Just prep)
+  Just ticket → do
+    -- the answer is read and what it built changes owner in the same transaction: to the uploading stage, or, for a
+    -- build that stopped, to the retirements
+    settled ← atomically $ ticket >>= \case
+      Nothing → pure Nothing
+      Just answer → Just <$> settleBuild service state prep building answer
+    forM_ settled $ \after → transferSeam service state "answered" >> after
+
+-- What a build's answer hands on, in the transaction that read it; answers what is left to do after it.
+settleBuild ∷ (Ord k, Show k) ⇒ TerrainViews k → ViewState k → Prep → Building → Answer (Either BuildFailure [ChunkRef]) → STM (IO ())
+settleBuild service state prep building = \case
+  Answered (Right chunks)
+    | length chunks == Map.size (bdWanted building) → do
+        let fresh =
+              Map.fromList
+                [ (key, Region chunk instances records (fromIntegral (length instances) * 64))
+                | ((key, (instances, records)), chunk) ← zip (Map.toList (bdWanted building)) chunks
+                ]
+            next = StageUploading prep (Uploading (bdPlan building) (bdAdapted building) (bdCopies building) (bdReused building) fresh (bdCpu building))
+        writeTVar (vsStage state) next
+        pure (stageSeam service state next)
+    | otherwise → do
+        retireBuilt service state building chunks
+        pure (recordFailure service "the owner built another number of regions than asked" >> finish service state Retry' (Just prep))
+  Answered (Left (BuildPressure built _)) → do
+    retireBuilt service state building built
+    pure (finish service state Retry' (Just prep))
+  Answered (Left (BuildFailed built why)) → do
+    retireBuilt service state building built
+    pure (recordFailure service ("a retained region could not be built: " <> why) >> finish service state Retry' (Just prep))
+  NotRun why → do
+    retireBuilt service state building []
+    pure (recordFailure service ("a retained region's build did not run: " <> why) >> finish service state Retry' (Just prep))
+
+-- The chunks a build made, when it stopped before the whole set or answered another number: each retires (no barrier:
+-- no revision listed it), its GPU bytes and its description's CPU still charged until its release is answered, since its
+-- upload may still be running. The GPU bytes of what it did not build return; the stage ends.
+retireBuilt ∷ TerrainViews k → ViewState k → Building → [ChunkRef] → STM ()
+retireBuilt service state building chunks = do
+  let sizes = [(fromIntegral (length instances) * instanceBytes, wantedCpu instances records) | (instances, records) ← Map.elems (bdWanted building)]
+      paired = zip chunks sizes
+      extra = drop (length sizes) chunks
+      gpuKept = sum [g | (_, (g, _)) ← paired]
+      cpuKept = sum [c | (_, (_, c)) ← paired]
+  modifyTVar' (svRetiring service) (<> ([Retiring chunk g c RetireMet | (chunk, (g, c)) ← paired] <> [Retiring chunk 0 0 RetireMet | chunk ← extra]))
+  modifyTVar' (svGpu service) (subtract (bdGpu building - min (bdGpu building) gpuKept))
+  modifyTVar' (vsStageCharge state) (\c → c - min c cpuKept)
+  moveToService service state cpuKept
+  writeTVar (vsStage state) StageIdle
+  modifyTVar' (svReleases service) (+ 1)
 
 stepUploading ∷ (Ord k, Show k) ⇒ TerrainViews k → ViewState k → Prep → Uploading → IO ()
 stepUploading service state prep uploading = do

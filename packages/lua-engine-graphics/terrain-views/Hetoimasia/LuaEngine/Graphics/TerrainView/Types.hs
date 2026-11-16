@@ -81,6 +81,11 @@ data TerrainViewsConfig = TerrainViewsConfig
     -- ^ Run on the worker each time a view (by its incarnation) enters a preparation stage ("copying", "planning", "building",
     -- "uploading"), after the stage is recorded: a test seam (to hold the worker there, or end it there). Production
     -- runs nothing.
+  , tvOnTransfer ∷ Word64 → Text → IO ()
+    -- ^ Run on the worker after each transaction that hands a preparation's resources on ("reserved": the GPU bytes
+    -- with the build stage; "submitted": the build's ticket; "answered": its chunks; "abandoned": a stage handed to
+    -- cleanup; "requested": a copy request), before the next: a test seam (to end the worker exactly between two
+    -- transfers). Production runs nothing.
   , tvBeforeAttachCommit ∷ IO ()
     -- ^ Run on the worker after an attachment's early checks and before its commit transaction: a test seam (to let a
     -- lease or a target change at exactly that point). Production runs nothing.
@@ -114,6 +119,7 @@ defaultTerrainViewsConfig =
     , tvCopyRegions = 256
     , tvAccountGranule = 1024 * 1024
     , tvOnStage = \_ _ → pure ()
+    , tvOnTransfer = \_ _ → pure ()
     , tvBeforeAttachCommit = pure ()
     , tvStopping = pure ()
     }

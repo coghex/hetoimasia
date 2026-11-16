@@ -650,6 +650,54 @@ stages = describe "stages and the owner" $ do
     Set.fromList built `shouldSatisfy` (`Set.isSubsetOf` Set.fromList released)
     atomically (terrainViewsGpuCharged views) `shouldReturn` 0
 
+  forM_ ["requested", "reserved", "submitted", "answered", "abandoned"] $ \point →
+    it ("hands everything on when its worker is cancelled between two transfers, after the one that " <> point <> ": every chunk built is released once and no GPU byte stays charged") $ do
+      armed ← newTVarIO True
+      ownerRef ← newTVarIO Nothing
+      -- the worker is cancelled right after the named transfer's transaction, as a cancellation of its thread would
+      let cancelAt _ name = when (name == Text.pack point) $ do
+            fire ← atomically (readTVar armed <* writeTVar armed False)
+            when fire (myThreadId >>= killThread)
+          openGate = readTVarIO ownerRef >>= mapM_ (\owner → atomically (writeTVar (foGate owner) True))
+      result ← newTVarIO Nothing
+      withViewsConfig testConfig {tvOnTransfer = cancelAt, tvStopping = openGate} $ \v → do
+        atomically (writeTVar ownerRef (Just (vOwner v)))
+        when (point == "abandoned") (atomically (writeTVar (foGate (vOwner v)) False))
+        view ← attached v 1
+        -- a build in flight is superseded, so its stage is abandoned
+        when (point == "abandoned") $ do
+          bounded (atomically (readTVar (foWaiting (vOwner v)) >>= check . (> 0)))
+          atomically (updateCamera view (CameraIntent [Camera.ZoomBy 2])) `shouldReturn` Right ()
+        bounded (atomically (readTVar armed >>= check . not))
+        atomically (writeTVar result (Just (vOwner v, vViews v)))
+      Just (owner, views) ← readTVarIO result
+      built ← Map.keys <$> readTVarIO (foInstances owner)
+      released ← releasedChunks owner
+      Set.fromList released `shouldBe` Set.fromList built
+      length released `shouldBe` Set.size (Set.fromList released)
+      atomically (terrainViewsGpuCharged views) `shouldReturn` 0
+
+  it "retires the chunks a stopped build made, keeping their charges until their uploads end and their releases answer" $
+    withViews $ \v → do
+      let owner = vOwner v
+      -- the build makes its first region, whose upload stays under way, then fails at the second
+      atomically (writeTVar (foHoldUploads owner) True >> writeTVar (foStopAfter owner) (Just (1, False)))
+      view ← attached v 1
+      bounded (atomically (readTVar (foBuilt owner) >>= check . (>= 1)))
+      first' ← bounded . atomically $ readTVar (foInstances owner) >>= maybe retry pure . fmap fst . Map.lookupMin
+      bounded (atomically (terrainViewsFailures (vViews v) >>= check . any ("could not be built" `Text.isInfixOf`)))
+      -- its upload has not ended: it is not released, and its bytes stay charged
+      atomically (terrainViewsRetiring (vViews v)) >>= (`shouldSatisfy` elem first' . map fst)
+      atomically (terrainViewsGpuCharged (vViews v)) >>= (`shouldSatisfy` (> 0))
+      releasedChunks owner >>= (`shouldNotContain` [first'])
+      -- once every upload ends it is released exactly once, and the view publishes from a later build
+      atomically (writeTVar (foHoldUploads owner) False >> modifyTVar' (foStanding owner) (Map.map (const ChunkReady)))
+      bounded (atomically (readTVar (foReleased owner) >>= check . elem first'))
+      _ ← awaitPublished v 1
+      released ← releasedChunks owner
+      length (filter (== first') released) `shouldBe` 1
+      closeView view
+
   it "serves another view's attachment and close while a view is held mid-plan" $ do
     seam ← newStageSeam
     opened ← newTVarIO False
@@ -1731,6 +1779,8 @@ data FakeOwner = FakeOwner
     -- ^ Release actions the owner ran.
   , foBarrierAsks ∷ !(TVar Int)
     -- ^ Barrier requests made, admitted or refused.
+  , foStopAfter ∷ !(TVar (Maybe (Int, Bool)))
+    -- ^ While set, the next build makes this many regions, then stops: as pressure ('True') or as a failure (once).
   }
 
 data FakeAction
@@ -1756,6 +1806,7 @@ newFakeOwner model =
     <*> newTVarIO Nothing
     <*> newTVarIO 0
     <*> newTVarIO 0
+    <*> newTVarIO Nothing
 
 -- The owner's thread: runs queued actions in order. A build waits at the gate; an ended owner answers what it did not
 -- run.
@@ -1772,18 +1823,23 @@ fakeOwnerLoop owner = forever $ do
         modifyTVar' (foWaiting owner) (subtract 1)
         ended ← readTVar (foEnded owner)
         failure ← readTVar (foFailure owner)
-        result ← case (ended, failure) of
-          (True, _) → pure (NotRun "the owner ended")
-          (_, Just why) → pure (Answered (Left (BuildFailed why)))
-          _ → do
-            start ← readTVar (foNext owner)
-            let refs = [chunkRef index 1 | index ← take (length regions) [start ..]]
-            writeTVar (foNext owner) (start + fromIntegral (length regions))
-            holding ← readTVar (foHoldUploads owner)
-            modifyTVar' (foStanding owner) (Map.union (Map.fromList [(ref, if holding then ChunkUploading else ChunkReady) | ref ← refs]))
-            modifyTVar' (foInstances owner) (Map.union (Map.fromList (zip refs (map buildInstances regions))))
-            modifyTVar' (foBuilt owner) (+ length regions)
-            pure (Answered (Right refs))
+        stop ← readTVar (foStopAfter owner) <* writeTVar (foStopAfter owner) Nothing
+        let make made = do
+              start ← readTVar (foNext owner)
+              let refs = [chunkRef index 1 | index ← take (length made) [start ..]]
+              writeTVar (foNext owner) (start + fromIntegral (length made))
+              holding ← readTVar (foHoldUploads owner)
+              modifyTVar' (foStanding owner) (Map.union (Map.fromList [(ref, if holding then ChunkUploading else ChunkReady) | ref ← refs]))
+              modifyTVar' (foInstances owner) (Map.union (Map.fromList (zip refs (map buildInstances made))))
+              modifyTVar' (foBuilt owner) (+ length made)
+              pure refs
+        result ← case (ended, failure, stop) of
+          (True, _, _) → pure (NotRun "the owner ended")
+          (_, Just why, _) → pure (Answered (Left (BuildFailed [] why)))
+          (_, _, Just (count, pressure)) → do
+            refs ← make (take count regions)
+            pure (Answered (Left ((if pressure then BuildPressure else BuildFailed) refs "the fake owner stopped the build")))
+          _ → Answered . Right <$> make regions
         writeTVar answer (Just result)
     FakeRelease chunks answer → atomically $ do
       ended ← readTVar (foEnded owner)

@@ -34,11 +34,12 @@ import Hetoimasia.Render.TwoD.Vulkan.Chunks (BuildRefusal (BuildUploadBackpressu
 import Hetoimasia.Render.TwoD.Vulkan.Textures (registeredMarks)
 import Hetoimasia.Terrain.Render2D.Vulkan.Material (terrainMaterial)
 
--- | Why a build was refused: temporary pressure (the staging buffer or its queue full now, so asking again later can
--- succeed), or a failure no retry changes, which is kept as evidence.
+-- | Why a build stopped: temporary pressure (the staging buffer or its queue full now, so asking again later can
+-- succeed), or a failure no retry changes, which is kept as evidence. Each names the chunks the action built, in order,
+-- before it stopped: they are the caller's to retire, since their uploads may still be running.
 data BuildFailure
-  = BuildPressure !Text
-  | BuildFailed !Text
+  = BuildPressure ![ChunkRef] !Text
+  | BuildFailed ![ChunkRef] !Text
   deriving (Eq, Show)
 
 -- | One region to build: its instances (each naming the terrain material) and the records they index.
@@ -69,7 +70,9 @@ data ViewOwner = ViewOwner
     -- ^ Whether the session's depth format is @D32_SFLOAT@, which the qualified cutout path needs.
   , ownerBuild ∷ [RegionBuild] → STM (Either OwnerRefusal (Ticket (Either BuildFailure [ChunkRef])))
     -- ^ Build these regions on the owner, in one action, each as one retained chunk of a depth-enabled world layer,
-    -- answering their references in order. A refusal releases whatever the action built before it.
+    -- answering their references in order. A region that cannot be built stops the action, and the failure names the
+    -- chunks built before it: nothing is released here, so a chunk whose upload may still run is retired by the caller
+    -- like any other.
   , ownerRelease ∷ [ChunkRef] → STM (Either OwnerRefusal (Ticket [Either Text ()]))
     -- ^ Release these chunks' buffers on the owner: only chunks no revision lists or ever listed, or that no adoption
     -- holds behind a met barrier, and only once their upload has ended, so the release is never deferred and its answer
@@ -105,11 +108,10 @@ productionViewOwner host graphics = do
           let go acc [] = pure (Right (reverse acc))
               go acc (region : rest) =
                 buildRetainedChunkWith builders retained marks ChunkWorldDepth DeriveBounds (Map.singleton material (buildRecords region)) (buildInstances region) >>= \case
-                  Left why → do
-                    forM_ acc (releaseChunkNow builders retained)
+                  Left why →
                     pure . Left $ case why of
-                      BuildUploadBackpressure _ → BuildPressure (Text.pack (show why))
-                      _ → BuildFailed (Text.pack (show why))
+                      BuildUploadBackpressure _ → BuildPressure (reverse acc) (Text.pack (show why))
+                      _ → BuildFailed (reverse acc) (Text.pack (show why))
                   Right chunk → go (chunk : acc) rest
           go [] regions
       , ownerRelease = \chunks → submit host $ VulkanAction $ \construction → forM chunks (\chunk → either (Left . Text.pack . show) Right <$> releaseChunkNow (hostBuilders host construction) retained chunk)
