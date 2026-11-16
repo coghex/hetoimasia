@@ -36,6 +36,7 @@ import System.Info (arch, compilerName, compilerVersion, os)
 import Hetoimasia.GPU.Vulkan.Diagnostics (DiagnosticVerdict (..), verdictIssues)
 import Hetoimasia.LuaEngine.Graphics.Texture
 import Hetoimasia.LuaEngine.Profile (fixedM1Profile)
+import Test.Hspec.Runner (Config (..), defaultConfig, readConfig)
 import Test.LuaEngine.Graphics.Native.Consent (Consent, consentBackend, describeConsent, readConsent, refusalMessage)
 import Test.LuaEngine.Graphics.Native.Environment (checkValidationFeatures, establishEnvironment, validationFeatures)
 import Test.LuaEngine.Graphics.Native.Loader (checkLoader)
@@ -76,8 +77,11 @@ main = do
       _ → \env → Native.spec env >> Windows.spec env >> Scenes.spec env >> Targets.spec env >> Pixels.spec env >> DataTextures.spec env >> Facade.spec env >> TerrainViews.spec env
   -- The terrain-enabled host's M1 witness (TRA-9): a second, short session of the host the terrain-enabled composition
   -- builds, with the host-wide window depth, in the same run as the complete profile and every ordinary selection.
+  -- It runs with the complete profile and whenever the run's own Hspec selection selects its example, and not
+  -- otherwise: a focused selection elsewhere neither starts it nor makes it an empty, failing run.
+  depthSelected ← if arguments == [completeFlag] then pure True else selects arguments Scenes.depthHostPath
   depthFacts ←
-    if probing || terrainFull
+    if probing || terrainFull || not depthSelected
       then pure Nothing
       else Just <$> runSessionOn TerrainEnabledHost (arguments == [completeFlag]) (consentBackend consent) validationFeatures configuration Scenes.depthHostSpec
   finished ← getCurrentTime
@@ -96,6 +100,14 @@ main = do
   where
     refuse refusal = hPutStrLn stderr ("lua-engine-graphics-native-tests: " <> Text.unpack (refusalMessage refusal)) >> exitWith (ExitFailure 3)
     stop why = hPutStrLn stderr ("lua-engine-graphics-native-tests: " <> Text.unpack why) >> exitFailure
+
+-- | Whether an ordinary Hspec run with these arguments selects the example at this path: its match filter keeps it
+-- (or there is none) and its skip filter does not drop it. Hspec's own argument reading decides, so the answer is the
+-- selection the run itself makes.
+selects ∷ [String] → ([String], String) → IO Bool
+selects arguments path = do
+  config ← readConfig defaultConfig arguments
+  pure (maybe True ($ path) (configFilterPredicate config) && not (maybe False ($ path) (configSkipPredicate config)))
 
 -- | Runs the whole profile with nothing an environment could narrow, which the catalog group passes; without it
 -- the suite is an ordinary Hspec run that selects as asked.

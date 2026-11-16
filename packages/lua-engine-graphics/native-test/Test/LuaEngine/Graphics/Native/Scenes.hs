@@ -15,6 +15,7 @@
 module Test.LuaEngine.Graphics.Native.Scenes
   ( spec
   , depthHostSpec
+  , depthHostPath
   , awaitAdopted
   , awaitFrame
   , demandFrame
@@ -208,9 +209,17 @@ withScenes env body = do
 -- host, with no frame refused. An M1 scene names no depth-enabled world layer, so the depth image changes nothing it
 -- draws; this suite cannot read a window's image back (the host's frame capture is private to the window integration),
 -- so the pixel identity rests on that, and the evidence says so.
+-- | The terrain-enabled host's example, by its Hspec path: what a selection is matched against.
+depthHostPath ∷ ([String], String)
+depthHostPath = ([depthHostGroup], depthHostExample)
+
+depthHostGroup, depthHostExample ∷ String
+depthHostGroup = "M1 output on the terrain-enabled host"
+depthHostExample = "adopts a published M1 scene and records and presents its frames with the host-wide window depth image"
+
 depthHostSpec ∷ Env → Spec
-depthHostSpec env = describe "M1 output on the terrain-enabled host" $
-  it "adopts a published M1 scene and records and presents its frames with the host-wide window depth image" $
+depthHostSpec env = describe depthHostGroup $
+  it depthHostExample $
     within 120 . withScenes env $ \comp vm _ → do
       vulkanWindowDepth (envHostConfig env) `shouldBe` True
       admitScene comp vm "a"
