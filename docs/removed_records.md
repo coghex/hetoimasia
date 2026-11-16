@@ -112,6 +112,14 @@ model) and `tra21/README.md` (#663, ten review rounds of the storage backend). `
 per-example times and all 64 store controls) was condensed the same way; its
 full write-up is at `218ba408`.
 
+Removed 2026-11-16, last present at `a30fe096`:
+
+| Path under `docs/evidence/terrain/` | Conclusion |
+| --- | --- |
+| `tra22/README.md` | #665, PR #683: edits and discovery commit through the temporary store; 2,945 buried removals fill a 64 MiB allowance under a pinned old version until `storage_full`, growth to 128 MiB clears it, and the edit bank's accounts stay within their limits throughout; no RSS or throughput claim |
+| `tra23/README.md` | #666, PR #691: storage status, growth and recovery through Lua over the production backed service, with faults injected at the native storage seam: every new error code in both roles, pause and recovery, the growth windows |
+| `regional-snapshots/README.md` | #690, PR #694: regional snapshots equal an every-cell oracle (81,920 cells at full depth); footprint 400 accounted bytes for a pristine region, 672 with one removal, always an upper bound of a heap walk; admission reserves 128 + 25,872 n + 747,520 bytes |
+
 ## Per-issue Vulkan records — last present at `18c3a659` (removed 2026-11-13)
 
 `docs/vulkan/` keeps the nine records `tools/test/VulkanProof.hs` reads. The
