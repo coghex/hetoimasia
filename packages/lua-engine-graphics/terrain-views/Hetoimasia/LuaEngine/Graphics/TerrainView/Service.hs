@@ -143,7 +143,8 @@ import Hetoimasia.Terrain.Render2D.Facts (ChunkDemand (..), ChunkKey (..), Deman
 import Hetoimasia.Terrain.Render2D.Material (Adapted (..), AdaptedQuad (..), adaptCells, adaptedInstance, terrainView)
 import Hetoimasia.Terrain.Render2D.Presentation (LightInput (..), LightSettings, describeSettingRefusal, lightInput, mkLightSettings)
 import Hetoimasia.Terrain.Render2D.Projection (ViewSetup (..))
-import Hetoimasia.Terrain.Residency (ArenaId, RegionDemand (..), Revision, coverageBox)
+import Hetoimasia.Terrain.Residency (ArenaId, RegionDemand (..), Revision, coverageBox, limitCameraRegions, limitHoldRegions)
+import Data.Containers.ListUtils (nubOrd)
 import qualified Hetoimasia.Terrain.Runtime as Runtime
 import Numeric.Natural (Natural)
 
@@ -995,7 +996,9 @@ withCopies ∷ (Ord k, Show k) ⇒ TerrainViews k → ViewState k → [RegionCoo
 withCopies service state regions body = attempt (3 ∷ Int)
   where
     terrain = portTerrain (svPorts service)
-    batches = chunksOf (max 1 (tvCopyRegions (svConfig service))) regions
+    -- one copy names at most the configured regions and never more than the service's per-hold bound
+    holdCap = fromIntegral (limitHoldRegions (Runtime.configLimits (Runtime.inspectConfig (portTerrain (svPorts service)))))
+    batches = chunksOf (max 1 (min holdCap (tvCopyRegions (svConfig service)))) regions
     attempt n = do
       requested ← forM batches (Runtime.requestRegionSnapshot terrain (vsArena state))
       let pendings = [p | Right p ← requested]
@@ -1047,16 +1050,19 @@ sendDemand service state =
     Nothing → pure ()
     Just (visible, prefetch) → do
       mark ← atomically (retryMark service state)
-      busy ← ask (visible <> prefetch) (Just visible)
+      -- One camera description holds at most the service's camera regions: visible regions first, in the plan's order,
+      -- then prefetch, never one dropped for the description's size and never the whole demand dropped.
+      let cap = fromIntegral (limitCameraRegions (Runtime.configLimits (Runtime.inspectConfig (portTerrain (svPorts service)))))
+          regions = take cap (nubOrd (visible <> prefetch))
+      busy ← case traverse demandOf regions of
+        Left why → recordFailure service ("the camera demand could not be described: " <> Text.pack (show why)) >> pure False
+        Right demands →
+          Runtime.setViewDemand (portTerrain (svPorts service)) (vsRuntimeView state) (vsArena state) demands >>= \case
+            Left (Runtime.RefusedBusy _) → pure True
+            Left refusal → recordFailure service ("the camera demand was refused: " <> Text.pack (show refusal)) >> pure False
+            Right _ → pure False
       atomically (writeTVar (vsDemandBusy state) (if busy then Just mark else Nothing))
   where
-    ask regions fallback = case traverse demandOf regions of
-      Left _ → pure False
-      Right demands →
-        Runtime.setViewDemand (portTerrain (svPorts service)) (vsRuntimeView state) (vsArena state) demands >>= \case
-          Left (Runtime.RefusedInvalid _) | Just smaller ← fallback, length smaller < length regions → ask smaller Nothing
-          Left (Runtime.RefusedBusy _) → pure True
-          _ → pure False
     demandOf region = RegionDemand region <$> coverageBox 0 16 0 16 0 32
 
 -- Send the kept demand again after a busy refusal.

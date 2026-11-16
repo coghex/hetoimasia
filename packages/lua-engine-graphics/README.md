@@ -571,10 +571,24 @@ intent only) starts from regional copies (`requestRegionSnapshot`) of the
 camera's anchor and grows them with each plan's own visible demand, a bounded
 number of rounds, from fresh coherent copies (one incarnation, content and
 knowledge revision); copies of different versions are never combined, and a
-copy is released once the facts and knowledge are made. Every copy's residency
-generation stays in the plan's identity: the one generation when they agree,
-otherwise a digest of all of them (top bit set), never one relabelled as
-another. Regions not yet read
+copy is released once the facts and knowledge are made.
+
+**Inputs.** Every terrain and knowledge input of a plan, of its retained
+regions and of its pick metadata comes from those regional copies and from
+nothing that depends on residency: the adapter never uses `withSnapshot` (the
+resident-detail borrow that answers `Unloaded` and protects its regions). A
+copy reads the store whether or not a region is resident, so evicting and
+reloading a region cannot change what a view reads; its residency generation
+can, and it is kept as an identity. Every copy's residency generation stays in
+the plan's identity: the one generation when they agree, otherwise a digest of
+all of them (top bit set), never one relabelled as another. The generation
+moves on every load, eviction and removal commit. A move makes the view
+prepare again; publication refuses a plan whose identity no longer matches the
+arena's generation, and a pick's removal guard refuses a reference whose
+adopted plan does not. Content-checked reuse means such a replan rebuilds no
+unchanged region.
+
+Regions not yet read
 are pending, never fog or air. The camera's interests (`setViewDemand`,
 visible before prefetch) are kept and sent again when a busy refusal clears.
 A plan superseded by newer intent is abandoned. Its quads are grouped into
@@ -646,7 +660,7 @@ layer, so its frames are unchanged by the depth image.
 | A target claim | the scene session | attach, publish, close | the M1 publisher's commit | released by close, with the empty handback |
 | A parent's CPU interest | the view | attach (caller's call), close | the planner | released at close or on any refusal |
 | A parent's GPU interest | the view, in the ledger | attach and close, each one transaction | the texture backend's release | dropped at close; retirement then waits for adoptions and GPU use |
-| A regional copy | the worker | the worker | the worker | released once the plan's inputs are made |
+| A regional copy (`requestRegionSnapshot`), the only terrain and knowledge borrow; `withSnapshot` is never used | the worker | the worker | the worker | released once the plan's inputs are made, on every outcome |
 | A pinned plan | the view | the worker | pick | unpinned when neither newest published nor adopted; its CPU bytes return |
 | A retained region | the view, then the retirement list | the worker, owner actions | adopted frames | barrier met and no adoption lists it, then released on the owner; its GPU bytes return then |
 

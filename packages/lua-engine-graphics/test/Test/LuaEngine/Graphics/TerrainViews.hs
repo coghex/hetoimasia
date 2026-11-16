@@ -19,10 +19,11 @@ import qualified Data.ByteString as ByteString
 import qualified Data.ByteString.Char8 as BC
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (isJust)
+import Data.Maybe (fromMaybe, isJust, listToMaybe)
 import qualified Data.Set as Set
 import qualified Data.Text as Text
 import Data.Bits (testBit)
+import Data.Int (Int64)
 import Data.Word (Word32, Word64)
 import Hetoimasia.Foundation.Log (Logger, callbackSink, defaultLogFilter, mkLogger)
 import Hetoimasia.Foundation.Messaging.Payload (prepare)
@@ -77,7 +78,7 @@ import Hetoimasia.Terrain.Runtime
 import qualified Hetoimasia.Terrain.Runtime as Runtime
 import Hetoimasia.Terrain.Runtime.Storage (filesystemOf, minHeadroomBytes, mkStorageConfig)
 import Hetoimasia.Terrain.Runtime.Store (StoreSpec (..), defaultStoreSpec, minAllowanceBytes)
-import Hetoimasia.Terrain.Residency (Bank (StagingBank), Ledger (..), RegionDemand (..), bankLedger, coverageBox)
+import Hetoimasia.Terrain.Residency (Bank (StagingBank), Ledger (..), LimitsSpec (..), RegionDemand (..), RegionInfo (..), bankLedger, coverageBox, mkLimits, modelRegions)
 import Hetoimasia.Terrain.Source (CellSpec (..), LayerSpec (..), PatchSpec (..), SourceSpec (..))
 import System.FilePath ((</>))
 
@@ -110,6 +111,7 @@ data Views = Views
 
 spec ∷ Spec
 spec = describe "terrain views" $ do
+  eviction
   reuse
   pickConsistency
   races
@@ -416,6 +418,128 @@ races = describe "attachment and intent" $ do
       closeView view
   where
     isInvalid = \case Left (IntentInvalid _) → True; _ → False
+
+-- ---------------------------------------------------------------------------
+-- Residency under the view's own camera demand: eviction and reload at the full region extent
+
+eviction ∷ Spec
+eviction = describe "eviction" $ do
+  it "pans away until the view's regions are evicted and back: they reload, and the view publishes the same plan and picks again" $
+    withViewsTerrain HostFirst tightTerrain stripes testConfig $ \v → do
+      view ← attached v 1
+      _ ← awaitPublished v 1
+      quiescent v
+      hit ← currentHit v view
+      plan ← atomically (adoptedPlan view) >>= maybe (fail "no adopted plan") pure
+      picks ← atomically (picksOver view)
+      instances ← drawnInstances v 1
+      original ← residentRegions v
+      -- pan east three regions at a time until one of the view's first regions has been evicted (a region the camera
+      -- demands stores at most about 37 KB, and each step demands about eight new ones)
+      let away k = do
+            now ← publishedRevision (vModel v) 1
+            atomically (updateCamera view (CameraIntent [Camera.Pan 48 0])) `shouldReturn` Right ()
+            _ ← awaitPublished' v 1 (now + 1)
+            _ ← adoptNow (vModel v) 1
+            _ ← releasePass (vModel v)
+            -- the step's demand loads before the camera moves on, so the bank fills step by step
+            demandResident v view
+            gone ← Set.difference original <$> residentRegions v
+            if not (Set.null gone) || k >= 60 then pure (k, gone) else away (k + 1)
+      (pans, evicted) ← away (1 ∷ Int)
+      evicted `shouldSatisfy` (not . Set.null)
+      -- back to the first camera: the evicted regions load again under the view's demand
+      atomically (updateCamera view (CameraIntent [Camera.Pan (-48 * fromIntegral pans) 0])) `shouldReturn` Right ()
+      bounded (atomically (Runtime.inspectModelSTM (_vTerrain v) >>= \model → check (original `Set.isSubsetOf` Set.fromList (map regionCoord (modelRegions model)))))
+      again ← currentHit v view
+      -- the residency generation moved, and the view caught up with it; what it draws and picks is what it was
+      pickResidency (pickRefIdentity again) `shouldNotBe` pickResidency (pickRefIdentity hit)
+      replanned ← atomically (adoptedPlan view) >>= maybe (fail "no adopted plan") pure
+      cellMembership replanned `shouldBe` cellMembership plan
+      atomically (picksOver view) `shouldReturn` picks
+      drawnInstances v 1 `shouldReturn` instances
+      closeView view
+
+  it "keeps every region of the view's visible demand resident while another holder's demand evicts others, the far background included" $
+    withViewsTerrain HostFirst (tightTerrainHolding 64) pillarOverStripes testConfig {tvCellConfig = defaultCellConfig {ccDepth = 250}} $ \v → do
+      view ← attached v 1
+      _ ← awaitPublished v 1
+      quiescent v
+      Just (visible, _) ← atomically (viewDemand view)
+      let protectedSet = Set.fromList visible
+          far = Set.filter (\region → abs (regionX region) > 1 || abs (regionY region) > 1) protectedSet
+      far `shouldSatisfy` (not . Set.null)
+      -- the view's demand loads (a view publishes from copies, so it does not wait for this)
+      bounded (atomically (Runtime.inspectModelSTM (_vTerrain v) >>= \model → check (protectedSet `Set.isSubsetOf` Set.fromList (map regionCoord (modelRegions model)))))
+      -- another holder demands batches of heavy regions far away, each batch replacing the last, until the bank has
+      -- evicted some of them
+      other ← Runtime.openView (_vTerrain v) (vClient v) >>= either (fail . show) pure
+      let press k seen evictedSoFar
+            | k > 40 = pure evictedSoFar
+            | otherwise = do
+                let batch = [RegionCoord (100 + 8 * k + i) j (-1) | i ← [0 .. 7], j ← [0 .. 3]]
+                demands ← either (fail . show) pure (traverse (\r → RegionDemand r <$> coverageBox 0 16 0 16 0 32) batch)
+                _ ← Runtime.setViewDemand (_vTerrain v) other (vArena v) demands >>= either (fail . show) pure
+                bounded . atomically $ Runtime.inspectModelSTM (_vTerrain v) >>= \model →
+                  check (all (`elem` map regionCoord (modelRegions model)) batch)
+                here ← residentRegions v
+                -- the view's visible demand, far background included, is never what the bank gives up
+                (protectedSet `Set.isSubsetOf` here) `shouldBe` True
+                let seen' = seen <> Set.fromList batch
+                    evicted = Set.difference seen' here
+                if Set.null evicted then press (k + 1) seen' evicted else pure evicted
+      evicted ← press (0 ∷ Int64) Set.empty Set.empty
+      evicted `shouldSatisfy` (not . Set.null)
+      Runtime.closeView (_vTerrain v) other
+      closeView view
+
+-- Limits at the full region extent with the smallest resident bank the minimum-budget rule accepts with four-region
+-- holds (about 3.5 MB; the bank scales with the hold bound), so a hundred or so of the camera's regions evict. A view's
+-- copies follow the hold bound.
+tightTerrain ∷ Config → Config
+tightTerrain = tightTerrainHolding 4
+
+-- The same with this hold bound (64 regions: a 21.5 MB bank, for a view whose demand is too wide for four-region
+-- copies to keep up with).
+tightTerrainHolding ∷ Integer → Config → Config
+tightTerrainHolding holdBound config = config {configLimits = limits, configRetainedBytes = retained}
+  where
+    spec' resident staging =
+      LimitsSpec
+        { specResidentBytes = resident
+        , specEditBytes = 4096
+        , specStagingBytes = staging
+        , specLoadJobs = 4
+        , specQueuedCommands = 6
+        , specPinsPerView = 2
+        , specAgingQuanta = 3
+        , specQueryRegions = 4
+        , specExtentX = 16
+        , specExtentY = 16
+        , specExtentZ = 32
+        , specHoldRegions = holdBound
+        , specCameraRegions = 64
+        }
+    valid resident staging = either (const Nothing) Just (mkLimits (spec' resident staging))
+    firstOf = fromMaybe (error "no valid limits") . listToMaybe
+    smallest = firstOf [r | r ← [100000, 200000 .. 400000000], Just _ ← [valid r 400000000]]
+    retained = 4 * 1024 * 1024
+    stagingFor resident = firstOf [t | t ← [100000, 200000 .. 400000000], Just _ ← [valid resident t]]
+    limits = fromMaybe (error "invalid limits") (valid smallest (3 * stagingFor smallest + toInteger retained))
+
+-- Wait until every region of the view's latest visible demand is resident.
+demandResident ∷ Views → TerrainView Int → IO ()
+demandResident v view = bounded . atomically $ do
+  demand ← viewDemand view
+  case demand of
+    Nothing → retry
+    Just (visible, _) → do
+      model ← Runtime.inspectModelSTM (_vTerrain v)
+      check (Set.fromList visible `Set.isSubsetOf` Set.fromList (map regionCoord (modelRegions model)))
+
+-- The regions the terrain service holds resident.
+residentRegions ∷ Views → IO (Set.Set RegionCoord)
+residentRegions v = Set.fromList . map regionCoord . modelRegions <$> Runtime.inspectModel (_vTerrain v)
 
 -- ---------------------------------------------------------------------------
 -- Reuse and coherent replacement
@@ -863,7 +987,10 @@ withViewsOn = withViewsOrdered HostFirst
 data EndOrder = HostFirst | ViewsFirst
 
 withViewsOrdered ∷ EndOrder → SourceSpec → TerrainViewsConfig → (Views → IO a) → IO a
-withViewsOrdered order source config body = do
+withViewsOrdered order = withViewsTerrain order id
+
+withViewsTerrain ∷ EndOrder → (Config → Config) → SourceSpec → TerrainViewsConfig → (Views → IO a) → IO a
+withViewsTerrain order terrainConfig source config body = do
   style ← loadAtlasStyle 5 [("loam", "colour.loam"), ("granite", "colour.granite")]
   sample ← findSampleDirectory
   let atlas = sample </> "content" </> "textures" </> "terrain-atlas"
@@ -882,7 +1009,7 @@ withViewsOrdered order source config body = do
         loadParent comp vm "normal" ["data", "coverage", "normal"]
         colourKey ← leaseKey comp vm "colour"
         normalKey ← leaseKey comp vm "normal"
-        withTerrain source (cpAccount comp) $ \terrain client arena → do
+        withTerrain terrainConfig source (cpAccount comp) $ \terrain client arena → do
           claims ← newSceneClaims
           owner ← newFakeOwner model
           initial ← prepare initialGraphicsScene
@@ -1031,22 +1158,39 @@ terrainProfile = case validateProfile changed of
 
 -- The real service over private files in a temporary directory, its staging charged to the session's account, with one
 -- arena of loam over granite.
-withTerrain ∷ SourceSpec → RenderAccount → (Service → Runtime.Client → ArenaLease → IO a) → IO a
-withTerrain source account body =
+withTerrain ∷ (Config → Config) → SourceSpec → RenderAccount → (Service → Runtime.Client → ArenaLease → IO a) → IO a
+withTerrain terrainConfig source account body =
   withSystemTempDirectory "hetoimasia-terrain-views" $ \dir → do
     let directory = BC.pack dir
     name ← filesystemOf directory >>= either (\f → fail ("cannot name the test filesystem: " <> show f)) pure
     storage ← either (fail . show) pure (mkStorageConfig [name] minHeadroomBytes)
     withWorkerGroup $ \group → do
       let config =
-            defaultConfig
-              { configStore = defaultStoreSpec {specAllowanceBytes = toInteger minAllowanceBytes}
-              , configStagingAccount = Just (renderStagingAccount account)
-              }
+            terrainConfig
+              defaultConfig
+                { configStore = defaultStoreSpec {specAllowanceBytes = toInteger minAllowanceBytes}
+                , configStagingAccount = Just (renderStagingAccount account)
+                }
       withTerrainService config (Ports alwaysAdmitting (standaloneSupervisor group) quiet noProbe (storagePort group storage directory)) $ \terrain → do
         client ← Runtime.registerClient terrain >>= either (fail . show) pure
         arena ← openArena terrain client "views" source >>= either (fail . show) pure >>= await terrain >>= either (fail . show) pure
         body terrain client arena
+
+-- One level of loam or granite in turn down to level -64, granite below: every column holds a run per level, so a
+-- region below the surface stores about a quarter of a megabyte.
+stripes ∷ SourceSpec
+stripes =
+  SourceSpec
+    { specMaterials = ["loam", "granite"]
+    , specLayers =
+        LayerSpec {layerMin = Nothing, layerMax = Just (-64), layerMaterial = "granite", layerShape = 0}
+          : [LayerSpec {layerMin = Just z, layerMax = Just (z + 1), layerMaterial = if even z then "loam" else "granite", layerShape = 0} | z ← [-64 .. -1]]
+    , specPatches = []
+    }
+
+-- The stripes, and one granite pillar rising to level 99 at the camera's column.
+pillarOverStripes ∷ SourceSpec
+pillarOverStripes = stripes {specPatches = [PatchSpec {patchX = 8, patchY = 8, patchMin = 0, patchMax = 100, patchValue = SpecSolid "granite" 0}]}
 
 cavitySource ∷ SourceSpec
 cavitySource =
