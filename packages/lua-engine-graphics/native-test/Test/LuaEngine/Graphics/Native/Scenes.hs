@@ -14,6 +14,7 @@
 -- The windows open on whatever the run's consent selected, and every example ends with its windows destroyed.
 module Test.LuaEngine.Graphics.Native.Scenes
   ( spec
+  , depthHostSpec
   , awaitAdopted
   , awaitFrame
   , demandFrame
@@ -38,6 +39,7 @@ import Hetoimasia.GPU.Vulkan.GLFW
   ( FrameEvent (..)
   , SceneTargetKey (..)
   , VulkanHost (..)
+  , VulkanHostConfig (..)
   , VulkanSceneState (..)
   , WindowSceneStanding (..)
   , readVulkanSceneState
@@ -200,6 +202,30 @@ withScenes env body = do
       writeIORef provider (Just (windowMainStep (scProvider comp)))
       vm ← startSceneVm comp runtime "native-scene-vm"
       body comp vm stops
+
+-- | M1 output on the terrain-enabled host (TRA-9), the session's host built with the host-wide window depth: a published
+-- M1 scene is adopted and its frames are recorded and presented with the window's depth image, as on the terrain-disabled
+-- host, with no frame refused. An M1 scene names no depth-enabled world layer, so the depth image changes nothing it
+-- draws; this suite cannot read a window's image back (the host's frame capture is private to the window integration),
+-- so the pixel identity rests on that, and the evidence says so.
+depthHostSpec ∷ Env → Spec
+depthHostSpec env = describe "M1 output on the terrain-enabled host" $
+  it "adopts a published M1 scene and records and presents its frames with the host-wide window depth image" $
+    within 120 . withScenes env $ \comp vm _ → do
+      vulkanWindowDepth (envHostConfig env) `shouldBe` True
+      admitScene comp vm "a"
+      window ← openWindow env comp vm "a"
+      loadTexture comp vm "a" "a" "a.png"
+      earlier ← frameLogMark <$> readTVarIO (envFrames env)
+      _ ← run comp vm "a" "publish" "a" (Just "a")
+      awaitAdopted env window 1
+      awaitFrame env window 1 earlier
+      mark ← frameLogMark <$> readTVarIO (envFrames env)
+      demandFrame env window
+      awaitFrame env window 1 mark
+      evidence env "terrain-enabled host: an M1 scene's revision 1 was adopted and its frames were recorded and presented with the host-wide window depth image"
+      stopScene comp vm "a"
+      awaitWindowCount env 0
 
 -- | Open a window for the instance, taken, and answer its identity.
 openWindow ∷ Env → SceneComp Target → SceneVm Target → Text → IO WindowId
