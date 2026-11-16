@@ -251,16 +251,15 @@ hostEndpoint svc watch host =
   Endpoint
     { endpointReady = modifyTVar' (hostReady host) (+ 1)
     , endpointEligible = readTVar (hostEligible host)
-    , endpointSettle = settle
-    , endpointPrepare = unpreparedSettlement settle
+    , endpointSettle = \settlement → do
+        modifyTVar' (hostSettled host) (settlement :)
+        seen <- case watch of
+          Nothing → pure Nothing
+          Just lease → fmap (\v → (revisionNumber (viewRevision v), False)) <$> inspectArenaSTM svc lease
+        modifyTVar' (hostSeen host) (seen :)
+    , endpointPrepare = Nothing
     }
   where
-    settle settlement = do
-      modifyTVar' (hostSettled host) (settlement :)
-      seen <- case watch of
-        Nothing → pure Nothing
-        Just lease → fmap (\v → (revisionNumber (viewRevision v), False)) <$> inspectArenaSTM svc lease
-      modifyTVar' (hostSeen host) (seen :)
     revisionNumber (Revision n) = toInteger n
 
 grant ∷ Host → IO ()

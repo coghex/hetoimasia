@@ -179,7 +179,6 @@ import qualified Hetoimasia.Terrain.Runtime as Terrain
 import Hetoimasia.Terrain.Runtime.Settlement
   ( Endpoint (..)
   , PreparedSettlement (..)
-  , unpreparedSettlement
   , attachArenaWith
   , cancel
   , cellWith
@@ -1249,7 +1248,7 @@ submitToService env submission found settling = do
           { endpointReady = note
           , endpointEligible = eligible
           , endpointSettle = settleInto env link
-          , endpointPrepare = prepareInto env link
+          , endpointPrepare = Just (prepareInto env link)
           }
   let admitAsk = case pdAsk found of
         AskOpen client name spec options → openArenaWithOptions (service env) ep client name spec options
@@ -1385,13 +1384,13 @@ declination = \case
 -- conversion of the answer into its Lua value and the host's judgement of that reply ('settlingPrepare') are done once, and the
 -- arbitration's transaction only settles the judged reply ('settleInto' decides the same, unprepared). Both read only the answer
 -- and what the request's admission fixed (the VM's integer ceiling, the owner's limits, the schema). Every other answer (a lease,
--- a growth's or a retry's, which read the arena's status at their commit) is settled as 'settleInto' settles it.
+-- a growth's or a retry's, which read the arena's status at their commit) prepares nothing and is settled as 'settleInto' settles it.
 prepareInto ∷ Env → Link → Answer → PreparedSettlement
 prepareInto env link answer = case answer of
   ACell _ → prepared
   AColumn _ → prepared
   ASurface _ → prepared
-  _ → unpreparedSettlement (settleInto env link) answer
+  _ → PreparedSettlement () (\() → settleInto env link (Succeeded answer))
   where
     prepared = PreparedSettlement (settlingPrepare (lkSettling link) (answerReply (tvIntegerCeiling (envVm env)) answer)) $ \reply →
       settlePrepared reply >> writeTVar (lkTerminal link) True

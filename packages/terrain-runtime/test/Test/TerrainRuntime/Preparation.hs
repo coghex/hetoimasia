@@ -104,7 +104,7 @@ onlyRequest seen = case Map.elems seen of
 -- value is evaluated, and @runs@ counts the prepared settlements the arbitration ran.
 preparedHost ∷ Service → Host → IORef Int → TVar Int → Endpoint
 preparedHost svc host evaluations runs =
-  base {endpointPrepare = \answer → PreparedSettlement (ticked evaluations answer) (\a → modifyTVar' runs (+ 1) >> endpointSettle base (Succeeded a))}
+  base {endpointPrepare = Just (\answer → PreparedSettlement (ticked evaluations answer) (\a → modifyTVar' runs (+ 1) >> endpointSettle base (Succeeded a)))}
   where
     base = hostEndpoint svc Nothing host
 

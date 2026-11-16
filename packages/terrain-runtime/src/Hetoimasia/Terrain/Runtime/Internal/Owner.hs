@@ -1098,7 +1098,7 @@ stageWith svc rid aid rev knowledge basis work =
         Left failure → do
           failWith svc (ProviderDefect (Text.pack ("readiness callback failed: " <> show failure))) [("request", Text.pack (show rid))]
   where
-    -- AN ANSWER'S SETTLEMENT IS PREPARED HERE, OUTSIDE EVERY TRANSACTION: the host's preparation of the
+    -- AN ANSWER'S SETTLEMENT IS PREPARED HERE, OUTSIDE EVERY TRANSACTION: a host's preparation of the
     -- answer ('endpointPrepare') is evaluated before the answer is staged, so the arbitration's transaction
     -- runs only the prepared settlement and never the host's pure work on the answer. A preparation that
     -- throws is a provider defect, as a readiness callback that throws is. The endpoint is the request's
@@ -1106,7 +1106,7 @@ stageWith svc rid aid rev knowledge basis work =
     prepare = case work of
       StagedAnswer answer → do
         st <- atomically (readSt svc)
-        forM (Map.lookup rid (stateRequests st)) $ \req → evaluate (endpointPrepare (reqEndpoint req) answer)
+        pure (Map.lookup rid (stateRequests st) >>= endpointPrepare . reqEndpoint) >>= traverse (\settle → evaluate (settle answer))
       _ → pure Nothing
     publish' settlement = do
         st <- readSt svc
@@ -1209,7 +1209,7 @@ commitStaged svc st rid req sg = case (reqCmd req, stagedWork sg) of
   -- THE SETTLEMENT OF A REGIONAL SNAPSHOT: in this one transaction the result becomes the service's
   -- untaken result and its charge shrinks from the admission's reservation to the exact footprint of the
   -- copied value (never less), which it keeps until its release
-  (CRegions _ hid, StagedAnswer (ARegions (RegionBorrow _ _ snapshot))) → do
+  (CRegions _ hid, StagedAnswer answer@(ARegions (RegionBorrow _ _ snapshot))) → do
     let footprint = snapshotFootprint snapshot
     modifySt svc $ \s →
       s
@@ -1218,22 +1218,20 @@ commitStaged svc st rid req sg = case (reqCmd req, stagedWork sg) of
         , stateWork = (stateWork s) {rwRegional = Map.adjust (\(n, _) → (n, footprint)) hid (rwRegional (stateWork s))}
         }
     markFreed svc
-    settleAnswer
+    settleAnswer answer
     pure (CommitDone Nothing Nothing)
-  (_, StagedAnswer _) → withFresh $ \aid _ → do
+  (_, StagedAnswer answer) → withFresh $ \aid _ → do
     modifySt svc (\s → s {stateRequests = Map.insert rid req {reqPhase = Done} (stateRequests s)})
-    settleAnswer
+    settleAnswer answer
     pure (CommitDone (Just aid) Nothing)
   (CRetry, StagedRetry certified) → withFresh (commitRetry certified)
   _ → pure CommitWaiting
   where
     ep = reqEndpoint req
     tag = serviceTag svc
-    -- AN ANSWER'S SETTLEMENT WAS PREPARED BEFORE IT WAS STAGED ('stageWith'): the host's pure work on the
-    -- answer is done, and the arbitration runs only the prepared transaction
-    settleAnswer = case stagedSettlement sg of
-      Just prepared → preparedSettle prepared
-      Nothing → throwSTM (OwnerDefect "an answer was staged without its prepared settlement")
+    -- AN ANSWER'S SETTLEMENT, IF ITS HOST PREPARES ONE, WAS PREPARED BEFORE IT WAS STAGED ('stageWith'): the
+    -- host's pure work on the answer is done, and the arbitration runs only the prepared transaction
+    settleAnswer answer = maybe (endpointSettle ep (Succeeded answer)) preparedSettle (stagedSettlement sg)
     -- Staged work for a superseded revision is not offered: the owner computes
     -- it again against the current one.
     withFresh k = case stagedArena sg >>= \aid → (,) aid <$> Map.lookup aid (stateArenas st) of
