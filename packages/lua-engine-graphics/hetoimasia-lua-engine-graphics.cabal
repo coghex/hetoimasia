@@ -102,6 +102,45 @@ library internal
         hetoimasia-foundation ==0.1.0.0,
         hetoimasia-lua-engine:texture
 
+-- The terrain-view adapter (TRA-9): a terrain view's attachment, preparation, retained regions, publication, picking
+-- and close over the graphics owner this package composes and the terrain service it is lent. A public sub-library of
+-- its own, so the terrain packages reach the graphics composition only through it: the main library imports no terrain
+-- package, and no terrain package imports this one.
+library terrain-views
+    import: language
+    visibility: public
+    hs-source-dirs: terrain-views
+    exposed-modules:
+        Hetoimasia.LuaEngine.Graphics.TerrainView.Inputs
+        Hetoimasia.LuaEngine.Graphics.TerrainView.Service
+        Hetoimasia.LuaEngine.Graphics.TerrainView.Style
+        Hetoimasia.LuaEngine.Graphics.TerrainView.Types
+    build-depends:
+        base >=4.22 && <4.23,
+        bytestring >=0.12 && <0.13,
+        containers >=0.8 && <0.9,
+        deepseq >=1.5 && <1.6,
+        stm >=2.5.3 && <2.6,
+        text >=2.1 && <2.2,
+        hetoimasia-asset-image ==0.1.0.0,
+        hetoimasia-foundation ==0.1.0.0,
+        hetoimasia-gpu-vulkan-glfw ==0.1.0.0,
+        hetoimasia-gpu-vulkan-native ==0.1.0.0,
+        hetoimasia-lua-engine:texture,
+        hetoimasia-lua-engine-graphics ==0.1.0.0,
+        hetoimasia-math ==0.1.0.0,
+        hetoimasia-render-api ==0.1.0.0,
+        hetoimasia-render-2d ==0.1.0.0,
+        hetoimasia-render-2d-vulkan ==0.1.0.0,
+        hetoimasia-scripting-lua ==0.1.0.0,
+        hetoimasia-scripting-lua:runtime-lua,
+        hetoimasia-terrain ==0.1.0.0,
+        hetoimasia-terrain-render-2d ==0.1.0.0,
+        hetoimasia-terrain-render-2d:terrain-atlas,
+        hetoimasia-terrain-render-2d:terrain-material,
+        hetoimasia-terrain-render-2d-vulkan ==0.1.0.0,
+        hetoimasia-terrain-runtime ==0.1.0.0
+
 -- The adapter's lifecycle contracts over an injected owner and completion boundary, registered with the
 -- group `test.vulkan-headless`. They need no device, display or GLFW session: the backend runs over a
 -- port whose owner, upload progression, table binding and slot reclamation each example holds or lets go.

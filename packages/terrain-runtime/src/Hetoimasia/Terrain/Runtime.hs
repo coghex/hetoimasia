@@ -105,6 +105,7 @@ module Hetoimasia.Terrain.Runtime
   , compileAccountFor
   , Condition (..)
   , await
+  , awaitSTM
   , cancelPending
 
     -- * View demand
@@ -629,6 +630,10 @@ inspectEditBankSTM svc = ledgers <$> readTVar (serviceEditBank svc)
 -- returned.
 await ∷ Service → Pending a → IO (Either Settlement a)
 await svc pending = atomically (awaitTake svc pending)
+
+-- | 'await' as a transaction, so a caller can wait for a settlement or for something else ('orElse').
+awaitSTM ∷ Service → Pending a → STM (Either Settlement a)
+awaitSTM = awaitTake
 
 -- | The settlement and the take in one transaction (it waits until the request settles).
 awaitTake ∷ Service → Pending a → STM (Either Settlement a)
