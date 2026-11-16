@@ -683,6 +683,58 @@ stages = describe "stages and the owner" $ do
       _ ← awaitPublished v 1
       closeView long
 
+  it "charges a preparation's inputs before it plans: at its first quantum the stage already holds them" $ do
+    seam ← newStageSeam
+    opened ← newTVarIO False
+    withViewsConfig testConfig {tvOnStage = seamHook seam, tvStopping = atomically (writeTVar opened True)} $ \v → do
+      armSeam seam 1 "planning" 1 (SeamHold opened)
+      view ← attached v 1
+      awaitSeamFired seam
+      reading ← atomically (readView view)
+      -- the copies taken and at least one region's inputs, before the planner has made anything
+      readingStagedBytes reading `shouldSatisfy` (>= 25872)
+      readingCpuBytes reading `shouldSatisfy` (>= readingStagedBytes reading)
+      atomically (writeTVar opened True)
+      _ ← awaitPublished v 1
+      closeView view
+
+  it "waits in its plan, growing it no further, while the account cannot hold the next quantum's growth" $ do
+    seam ← newStageSeam
+    withViewsConfig testConfig {tvStepsPerQuantum = 1, tvOnStage = seamHook seam} $ \v → do
+      -- another consumer leaves the account a granule and a half: room for the copies and the inputs, not a quantum
+      taken ← atomically $ do
+        held ← accountCharged (_vAccount v)
+        let room = accountLimit (_vAccount v) - held - 3 * 512 * 1024
+        ok ← accountReserve (_vAccount v) room
+        pure (if ok then room else 0)
+      taken `shouldSatisfy` (> 0)
+      view ← attached v 1
+      bounded (atomically (readView view >>= \r → check (readingWaiting r && readingPhase r == PhasePreparing)))
+      atomically (seamCount seam 1 "planning") >>= (`shouldSatisfy` (<= 2))
+      atomically (readView view) >>= (`shouldBe` Nothing) . readingPublished
+      atomically (accountRelease (_vAccount v) taken)
+      _ ← awaitPublished v 1
+      closeView view
+
+  it "keeps a retiring region's CPU description charged after its view closes, until its release is answered" $
+    withViews $ \v → do
+      -- what the account holds beside the terrain service's own staging
+      let besideTerrain = do
+            charged ← accountCharged (_vAccount v)
+            model ← Runtime.inspectModelSTM (_vTerrain v)
+            let staging = bankLedger model StagingBank
+            pure (charged - (ledgerOccupied staging + ledgerReserved staging))
+      before' ← atomically besideTerrain
+      view ← attached v 1
+      first' ← awaitPublished v 1
+      adoptNow (vModel v) 1 `shouldReturn` Adopted first'
+      closeView view
+      -- the adoption still lists the view's regions: their descriptions stay charged
+      atomically besideTerrain >>= (`shouldSatisfy` (> before'))
+      _ ← adoptNow (vModel v) 1
+      _ ← releasePass (vModel v)
+      bounded (atomically (besideTerrain >>= check . (== before')))
+
 -- A seam over the views' stage entries: it counts each view's entries into each stage, and at one chosen entry holds
 -- the worker until the example opens it, cancels the worker there, or runs an action there.
 data StageSeam = StageSeam

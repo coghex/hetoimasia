@@ -699,6 +699,7 @@ readView (TerrainView service state) = do
     _ → False
   let waiting = stopped || staged
   restarts ← readTVar (vsRestarts state)
+  staged' ← readTVar (vsStageCharge state)
   held ← readTVar (vsAccountHeld state)
   pure
     ViewReading
@@ -712,6 +713,7 @@ readView (TerrainView service state) = do
       , readingPins = Map.size pins
       , readingWaiting = waiting
       , readingRestarts = restarts
+      , readingStagedBytes = staged'
       }
 
 -- | The view's latest camera demand: its visible regions, then its prefetch. 'Nothing' before its first preparation.
