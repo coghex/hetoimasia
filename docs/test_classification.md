@@ -213,6 +213,13 @@ Other existing apparatus is already outside routine automation:
   `tra17-terrain-ci`, is the required scenario of `test.vulkan-native` and
   `test.vulkan-wayland`; a passing explicit run of the full command is the
   qualification record and moving it out of routine CI does not waive it.
+- The complete terrain-view matrix (TRA-9),
+  `HETOIMASIA_NATIVE_SESSION=desktop bash tools/vulkan/run.sh native hetoimasia-lua-engine-graphics:test:lua-engine-graphics-native-tests -- --terrain-views-full`:
+  the required `terrain views` witness, then every facing, zoom 0.5 and 2 and a portrait target, each judged pixel by pixel by the
+  render-2d oracle given the terrain material's model on a surface-free target with a `D32_SFLOAT` depth image. A dedicated mode accepted
+  alone, outside routine CI and not a catalog group; it opens no window. The required `--complete` profile of
+  `test.vulkan-lua-engine-native` runs only the `terrain views` witness; a passing explicit run of the full mode is the issue's evidence,
+  and moving the matrix out of routine CI does not waive it.
 - The allocator probe,
   `bash tools/vulkan/run.sh test hetoimasia-gpu-vulkan-native:test:allocator-parity-probe`:
   by default GRS-18's qualification of the production VMA integration on a
