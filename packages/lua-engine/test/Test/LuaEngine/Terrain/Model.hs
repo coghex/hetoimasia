@@ -212,8 +212,12 @@ spec = describe "Terrain lifecycle model" $
                 outLines world >>= \printed → printed `shouldContain` ["opened\tg\tfailure"]
                 writeIORef window False
                 openGate gate
-              when (odd seed && not gated) (void (command "g" "attach"))
+              let attachesEarly = odd seed && not gated
+              when attachesEarly (void (command "g" "attach"))
               advance (elem "opened\tp\tsuccess" <$> outLinesSTM world)
+              -- (the early attach is answered before it is read: one VM update at a time, p's success can be printed before the
+              -- g update that settles it, and a second attach sent then would orphan the first, whose lease nothing takes)
+              when attachesEarly (advance ((>= 1) . length . filter (Text.isPrefixOf "opened\tg\t") <$> outLinesSTM world))
               writeIORef (sdHandle p) True
               early ← length . filter (Text.isPrefixOf "opened\tg\t") <$> outLines world
               firstSuccess ← elem "opened\tg\tsuccess" <$> outLines world
