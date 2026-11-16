@@ -5,8 +5,8 @@ import Control.Concurrent.STM
 import Control.Concurrent (yield)
 import Control.Monad (forM, forM_)
 import Data.Word (Word64)
-import Hetoimasia.Foundation.Worker (withWorkerGroup)
-import Hetoimasia.Terrain.Residency (ArenaId (..), Revision (..), modelRegions, regionCoord)
+import Hetoimasia.Terrain.Coordinate (RegionCoord (..))
+import Hetoimasia.Terrain.Residency (ArenaId (..), Bank (StagingBank), Ledger (..), RegionDemand (..), Revision (..), bankLedger, coverageBox, modelRegions, regionCoord)
 import Hetoimasia.Terrain.Runtime
 import Hetoimasia.Terrain.Runtime.Settlement
 import Test.Hspec
@@ -137,25 +137,44 @@ spec = describe "Superseded work and ordering" $ do
       (cellIs <$> readCell svc lease (tile 1 1 1)) `shouldReturn` False
       settleChecks svc
 
-  it "funds the staging bank from an outside account: refused with nothing started when it cannot, returned after the drain" $ do
-    let config = smallestStore defaultConfig
-        bytes = stagingBankBytes config
+  it "charges an outside staging account what the model's staging holds, and returns all of it after the drain" $ do
     held <- newTVarIO (0 ∷ Word64)
-    let accountOf limit =
-          StagingAccount
-            { stagingAccountReserve = \wanted → readTVar held >>= \now → if wanted > limit - now then pure False else True <$ writeTVar held (now + wanted)
-            , stagingAccountRelease = \returned → modifyTVar' held (subtract returned)
-            }
-    withStoragePort $ \port → withWorkerGroup $ \group → do
-      let ports = Ports alwaysAdmitting (standaloneSupervisor group) quiet noProbe port
-      withTerrainServiceIn (accountOf (bytes - 1)) config ports (\_ → pure ()) `shouldThrow` \(StagingAccountRefused asked) → asked == bytes
-      readTVarIO held `shouldReturn` 0
-      inside <- withTerrainServiceIn (accountOf bytes) config ports $ \svc → do
-        (_, lease) <- openMain svc "main"
-        _ <- removeCell' svc lease (tile 1 1 1)
-        readTVarIO held
-      inside `shouldBe` bytes
-      readTVarIO held `shouldReturn` 0
+    inside <- withService defaultConfig {configStagingAccount = Just (accountOver held maxBound)} $ \svc → do
+      (_, lease) <- openMain svc "main"
+      _ <- removeCell' svc lease (tile 1 1 1)
+      charged <- readTVarIO held
+      model <- atomically (stagingUse <$> inspectModelSTM svc)
+      pure (charged, model)
+    -- the account holds exactly what the model's staging holds, and nothing is left once the service has drained
+    fst inside `shouldBe` snd inside
+    readTVarIO held `shouldReturn` 0
+
+  it "refuses camera demand whole while the shared account, not the model, is the binding limit, and admits it once another consumer releases" $ do
+    held <- newTVarIO (0 ∷ Word64)
+    withService defaultConfig {configStagingAccount = Just (accountOver held (64 * 1024 * 1024))} $ \svc → do
+      (client, lease) <- openMain svc "main"
+      view <- okOf (openView svc client)
+      demands <- either (fail . show) pure (traverse (\r → RegionDemand r <$> coverageBox 0 16 0 16 0 32) [RegionCoord 0 0 0, RegionCoord 1 0 0, RegionCoord 0 1 0])
+      -- another consumer takes all but one byte of what is left
+      other <- atomically $ do
+        now <- readTVar held
+        let taken = 64 * 1024 * 1024 - now - 1
+        writeTVar held (now + taken)
+        pure taken
+      used0 <- atomically (stagingUse <$> inspectModelSTM svc)
+      setViewDemand svc view lease demands >>= \case
+        Left (RefusedBusy _) → pure ()
+        other' → expectationFailure ("expected busy, found " <> show other')
+      -- nothing was admitted: no partial camera admission, the model's staging unchanged
+      atomically (stagingUse <$> inspectModelSTM svc) `shouldReturn` used0
+      -- the other consumer releases; the view sends its latest demand again and it is admitted
+      atomically (modifyTVar' held (subtract other))
+      _ <- okOf (setViewDemand svc view lease demands)
+      used1 <- atomically (stagingUse <$> inspectModelSTM svc)
+      used1 `shouldSatisfy` (> used0)
+      readTVarIO held `shouldReturn` used1
+      closeView svc view
+      settleChecks svc
 
   it "re-prepares an edit that another edit overtook and commits both in admission order" $
     withService defaultConfig $ \svc → do
@@ -200,3 +219,11 @@ spec = describe "Superseded work and ordering" $ do
   where
     tightConfig' spare = tightConfig (2, 1, 2) spare 4096
     modelRegionsOf = modelRegions
+    -- An outside account over a variable, of this size.
+    accountOver held limit =
+      StagingAccount
+        { stagingAccountReserve = \wanted → readTVar held >>= \now → if wanted > limit - now then pure False else True <$ writeTVar held (now + wanted)
+        , stagingAccountRelease = \returned → modifyTVar' held (subtract returned)
+        , stagingAccountCharged = readTVar held
+        }
+    stagingUse model = let l = bankLedger model StagingBank in ledgerOccupied l + ledgerReserved l

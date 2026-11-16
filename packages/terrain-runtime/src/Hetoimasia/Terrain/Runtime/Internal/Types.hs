@@ -45,6 +45,7 @@ module Hetoimasia.Terrain.Runtime.Internal.Types
 
     -- * Configuration and ports
   , Config (..)
+  , StagingAccount (..)
   , ConfigError (..)
   , SessionAdmission (..)
   , Supervisor (..)
@@ -514,6 +515,25 @@ data Config = Config
     configConnectivity ∷ !C.ConnectivityLimits
   , -- | The discovery model's bounds (#661: at most 64 structural updates a batch).
     configDiscovery ∷ !D.DiscoveryLimits
+  , -- | An allowance outside the service that its CPU staging is charged to as well, beside the model's own
+    -- staging bank: the session's one CPU render/staging account, in a composition that shares it. 'Nothing' (the
+    -- default) charges nothing outside.
+    configStagingAccount ∷ !(Maybe StagingAccount)
+  }
+
+-- | A CPU allowance outside the service. Every operation is a transaction that never waits: a reservation is all or
+-- nothing ('False' reserves nothing); a release returns what a reservation took; the charge is what the allowance holds
+-- now, from every consumer.
+--
+-- The service charges it, in the transaction that steps its accounting model, the change the step made to the model's
+-- staging use (occupied plus reserved): an increase is reserved, and a reservation the allowance cannot make refuses
+-- the step as the model's own full staging bank would (busy, nothing changed); a decrease is returned. The model, its
+-- admission order and its limit invariants are unchanged; the allowance is one more bound on the same steps. What the
+-- service still holds when it ends is returned after its drain.
+data StagingAccount = StagingAccount
+  { stagingAccountReserve ∷ Word64 → STM Bool
+  , stagingAccountRelease ∷ Word64 → STM ()
+  , stagingAccountCharged ∷ STM Word64
   }
 
 -- | The configuration cannot be built: the limits, with the snapshot bank taken out of the
@@ -1251,6 +1271,10 @@ data St = St
     stateDelivering ∷ !(Set RequestId)
   , -- | Something that may free capacity happened since the last retry pass.
     stateFreed ∷ !Bool
+  , -- | The staging bytes the service holds in its outside account ('configStagingAccount'), and that account's
+    -- charge as the service last saw it: a charge changed by another consumer frees capacity for queued work.
+    stateAccountCharged ∷ !Word64
+  , stateAccountSeen ∷ !(Maybe Word64)
   , -- | A dispatch found nothing to run since the last time capacity freed.
     stateDispatchIdle ∷ !Bool
   , stateDefects ∷ ![DefectRecord]
@@ -1360,6 +1384,8 @@ initialState config limits =
     , stateRegional = Map.empty
     , stateDelivering = Set.empty
     , stateFreed = False
+    , stateAccountCharged = 0
+    , stateAccountSeen = Nothing
     , stateDispatchIdle = False
     , stateDefects = []
     , stateDefectCount = 0

@@ -162,11 +162,13 @@ decisionVictims _ = []
 -- dropped from the retiring set.
 applyEvent ∷ Service → R.Event → STM (Either R.Refusal R.Report)
 applyEvent svc event = do
-  st <- readSt svc
-  let (model, outcome) = R.step (stateModel st) event
+  st0 <- readSt svc
+  let (model, outcome) = R.step (stateModel st0) event
   case outcome of
     Left _ → pure outcome
-    Right report → do
+    Right report → chargeStaging svc st0 model >>= \case
+     Left refusal → pure (Left refusal)
+     Right st → do
       writeTVar (serviceState svc) $
         (if freesCapacity event then \x → x {stateFreed = True, stateDispatchIdle = False} else id)
         st
@@ -179,6 +181,32 @@ applyEvent svc event = do
           , stateWork = syncWork model (stateWork st)
           }
       pure outcome
+
+-- | Charge the outside staging account, if there is one, the change a step made to the model's staging use, in the
+-- step's transaction: an increase it cannot reserve refuses the step busy with nothing changed (the model's own full
+-- staging bank answers the same way); a decrease is returned. The state answered carries the new charge.
+chargeStaging ∷ Service → St → R.Model → STM (Either R.Refusal St)
+chargeStaging svc st after = case configStagingAccount (serviceConfig svc) of
+  Nothing → pure (Right st)
+  Just account
+    | new > old → do
+        let more = new - old
+        funded ← stagingAccountReserve account more
+        if not funded
+          then do
+            charged ← stagingAccountCharged account
+            pure (Left (R.Busy (R.BankFull R.StagingBank (R.ledgerLimit (R.bankLedger after R.StagingBank)) charged more)))
+          else seen (st {stateAccountCharged = stateAccountCharged st + more})
+    | new < old → do
+        let fewer = min (stateAccountCharged st) (old - new)
+        stagingAccountRelease account fewer
+        seen (st {stateAccountCharged = stateAccountCharged st - fewer})
+    | otherwise → pure (Right st)
+    where
+      use model = let l = R.bankLedger model R.StagingBank in R.ledgerOccupied l + R.ledgerReserved l
+      old = use (stateModel st)
+      new = use after
+      seen st' = (\now → Right st' {stateAccountSeen = Just now}) <$> stagingAccountCharged account
 
 -- | Events whose acceptance may have returned credits, so that what waits for
 -- capacity should be tried again. Every release path goes through 'applyEvent',
