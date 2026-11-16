@@ -10,7 +10,7 @@
 -- @terrain views@ subgroup draws.
 module Test.LuaEngine.Graphics.TerrainViews (spec) where
 
-import Control.Concurrent (forkIO, killThread, myThreadId)
+import Control.Concurrent (killThread, myThreadId)
 import Control.Exception (MaskingState (Unmasked), getMaskingState)
 import Control.Concurrent.STM
 import Control.Exception (finally)
@@ -24,6 +24,7 @@ import qualified Data.Set as Set
 import qualified Data.Text as Text
 import Data.Bits (testBit)
 import Data.Int (Int64)
+import Test.Support.Owned (withOwnedThread)
 import Data.Word (Word32, Word64)
 import Hetoimasia.Foundation.Log (Logger, callbackSink, defaultLogFilter, mkLogger)
 import Hetoimasia.Foundation.Messaging.Payload (prepare)
@@ -139,12 +140,12 @@ spec = describe "terrain views" $ do
       _ ← adoptNow (vModel v) 1
       chunks ← Set.toList . worldChunks <$> latestWorld v 1
       chunks `shouldSatisfy` (not . null)
-      closing ← async' (closeView view)
-      -- The handback publishes the initial content as a new revision, naming nothing.
-      awaitRevision' v 1 (revision + 1)
-      latest ← latestScene (vModel v) 1
-      fmap graphicsWorld latest `shouldBe` Just Nothing
-      closing
+      withOwnedThread (closeView view) $ \_ closing → do
+        -- The handback publishes the initial content as a new revision, naming nothing.
+        awaitRevision' v 1 (revision + 1)
+        latest ← latestScene (vModel v) 1
+        fmap graphicsWorld latest `shouldBe` Just Nothing
+        bounded closing
       atomically (claimOf (vClaims v) 1) `shouldReturn` Nothing
       atomically (ledgerInterests (fakeLedger (vFake v))) `shouldReturn` mempty
       -- The terrain revision is still adopted: nothing is released yet.
@@ -921,18 +922,19 @@ lifecycle = describe "close orders and limits" $ do
     failures `shouldSatisfy` any (Text.isPrefixOf "retirement could not be proved")
 
   it "ends the scope's exit when the views end first while the host keeps presenting, releasing every chunk" $ do
-    stepper ← newTVarIO Nothing
-    (views, owner, claims) ← (`finally` (readTVarIO stepper >>= mapM_ killThread)) . withViewsOrdered ViewsFirst loamOverGranite testConfig $ \v → do
+    hostModel ← newTVarIO Nothing
+    -- the host adopts whatever is published and releases what that supersedes, for as long as the example runs, the
+    -- views' scope exit included
+    let step = forever $ do
+          model ← atomically (readTVar hostModel >>= maybe retry pure)
+          atomically (modelCapture model >>= id >>= check . not)
+          _ ← adoptNow model 1
+          releasePass model
+    (views, owner, claims) ← withOwnedThread step $ \_ _ → withViewsOrdered ViewsFirst loamOverGranite testConfig $ \v → do
       _ ← attached v 1
       first' ← awaitPublished v 1
       adoptNow (vModel v) 1 `shouldReturn` Adopted first'
-      -- the host adopts whatever is published and releases what that supersedes, for as long as the example runs
-      let step = forever $ do
-            atomically (modelCapture (vModel v) >>= id >>= check . not)
-            _ ← adoptNow (vModel v) 1
-            releasePass (vModel v)
-      thread ← forkIO step
-      atomically (writeTVar stepper (Just thread))
+      atomically (writeTVar hostModel (Just (vModel v)))
       pure (vViews v, vOwner v, vClaims v)
     atomically (terrainViewsFailures views) `shouldReturn` []
     built ← Map.keys <$> readTVarIO (foInstances owner)
@@ -1165,13 +1167,6 @@ latestWorld v window =
     _ → expectationFailure "the window holds no world" >> fail "unreachable"
 
 type Natural' = Natural
-
--- Run an action on its own thread and answer an action that waits for it.
-async' ∷ IO () → IO (IO ())
-async' action = do
-  done ← newEmptyTMVarIO
-  _ ← forkIO (action `finally` atomically (putTMVar done ()))
-  pure (bounded (atomically (takeTMVar done)))
 
 -- ---------------------------------------------------------------------------
 -- The parents
