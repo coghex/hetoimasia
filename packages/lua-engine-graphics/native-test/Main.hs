@@ -46,6 +46,7 @@ import qualified Test.LuaEngine.Graphics.Native.DataTextures as DataTextures
 import qualified Test.LuaEngine.Graphics.Native.Pixels as Pixels
 import qualified Test.LuaEngine.Graphics.Native.Scenes as Scenes
 import qualified Test.LuaEngine.Graphics.Native.Targets as Targets
+import qualified Test.LuaEngine.Graphics.Native.TerrainViews as TerrainViews
 import qualified Test.LuaEngine.Graphics.Native.Windows as Windows
 
 main ∷ IO ()
@@ -54,8 +55,8 @@ main = do
   started ← getCurrentTime
   environment ← establishEnvironment
   arguments ← getArgs
-  when (any (`elem` arguments) [completeFlag, probeFlag, latchFlag] && length arguments /= 1) $ do
-    hPutStrLn stderr ("lua-engine-graphics-native-tests: " <> completeFlag <> " runs the whole profile, " <> probeFlag <> " the cancellation probe and " <> latchFlag <> " the latched-supervision probe, each alone")
+  when (any (`elem` arguments) [completeFlag, probeFlag, latchFlag, terrainFullFlag] && length arguments /= 1) $ do
+    hPutStrLn stderr ("lua-engine-graphics-native-tests: " <> completeFlag <> " runs the whole profile, " <> probeFlag <> " the cancellation probe, " <> latchFlag <> " the latched-supervision probe and " <> terrainFullFlag <> " the terrain views' full matrix, each alone")
     exitWith (ExitFailure 2)
   forM_ environment (Text.putStrLn . ("lua-engine-graphics-native-tests: " <>))
   consent ← readConsent >>= either refuse pure
@@ -65,11 +66,14 @@ main = do
   configuration ← either (\refused → stop ("the profile could not be mapped: " <> Text.pack (show refused))) pure (configurationFor fixedM1Profile)
   let probing = arguments == [probeFlag] || arguments == [latchFlag]
       expectedFailure = if arguments == [latchFlag] then "LatchingProbe" else "user interrupt"
-  facts ← runSession (arguments == [completeFlag] || probing) (consentBackend consent) validationFeatures configuration $
+  let terrainFull = arguments == [terrainFullFlag]
+  facts ← runSession (arguments == [completeFlag] || probing || terrainFull) (consentBackend consent) validationFeatures configuration $
     case arguments of
       [flag] | flag == probeFlag → Facade.cancelProbe
       [flag] | flag == latchFlag → Facade.latchProbe
-      _ → \env → Native.spec env >> Windows.spec env >> Scenes.spec env >> Targets.spec env >> Pixels.spec env >> DataTextures.spec env >> Facade.spec env
+      -- the terrain views' full matrix runs its required witness too, then the broader judgments
+      [flag] | flag == terrainFullFlag → \env → TerrainViews.spec env >> TerrainViews.fullSpec env
+      _ → \env → Native.spec env >> Windows.spec env >> Scenes.spec env >> Targets.spec env >> Pixels.spec env >> DataTextures.spec env >> Facade.spec env >> TerrainViews.spec env
   finished ← getCurrentTime
   let problems = if probing then probeChecks expectedFailure facts else checks facts
       seconds = realToFrac (diffUTCTime finished started) ∷ Double
@@ -89,6 +93,13 @@ main = do
 -- the suite is an ordinary Hspec run that selects as asked.
 completeFlag ∷ String
 completeFlag = "--complete"
+
+-- | Runs the terrain views' complete evidence matrix alone (TRA-9): the required witness of the complete profile, then
+-- every facing, both zoom endpoints and a portrait target, each judged pixel by pixel by the independent oracle. It is
+-- outside routine CI and is mandatory evidence for the terrain-view issue; it runs with the same success, validation and
+-- teardown checks as the complete profile.
+terrainFullFlag ∷ String
+terrainFullFlag = "--terrain-views-full"
 
 -- | Runs the cancellation probe alone: the quad example's window is live and holds its texture when the process main thread is
 -- cancelled, and the run must end by itself with everything torn down in order.
