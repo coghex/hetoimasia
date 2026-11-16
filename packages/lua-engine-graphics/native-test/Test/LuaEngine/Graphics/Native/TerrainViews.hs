@@ -21,7 +21,7 @@
 module Test.LuaEngine.Graphics.Native.TerrainViews (spec, fullSpec) where
 
 import Control.Concurrent.STM
-import Control.Exception (finally)
+import Control.Exception (finally, onException)
 import Control.Monad (forM, forM_, unless, void)
 import qualified Data.ByteString as ByteString
 import qualified Data.ByteString.Char8 as BC
@@ -84,23 +84,24 @@ import Hetoimasia.Render.TwoD.Metrics (PixelExtent (..), TargetMetrics (..))
 import Hetoimasia.Render.TwoD.Oracle (OracleInput (..), Probe (..), TargetSpec (..), Verdict (..), judgeReadback, newOracleWith)
 import Hetoimasia.Render.TwoD.Oracle.Colour (ColourFormat (R8G8B8A8Srgb))
 import Hetoimasia.Render.TwoD.Chunk (ChunkRef)
-import Hetoimasia.Render.TwoD.Snapshot (ClearColour (..), Pass (..), Snapshot (..), Target (OffscreenTarget), View (..))
+import Hetoimasia.Render.TwoD.Snapshot (Camera (..), ClearColour (..), Pass (..), Snapshot (..), Target (OffscreenTarget), View (..))
 import Hetoimasia.Render.TwoD.Target.Backend (targetRef)
 import Hetoimasia.Render.TwoD.Validation (validateSnapshotWith)
 import Hetoimasia.Render.TwoD.Vulkan.Chunks (RetainedView (..), retainedChunks, retainedViewSTM)
 import Hetoimasia.Render.TwoD.Vulkan.Textures (registeredMarks)
-import Hetoimasia.Terrain.Coordinate (axisFromInteger, tileCoord)
+import Hetoimasia.Terrain.Coordinate (RegionCoord (..), axisFromInteger, tileCoord)
+import Hetoimasia.Terrain.Residency (RegionDemand (..), coverageBox)
 import Hetoimasia.Terrain.Render2D.AtlasFixtures (AtlasStyle, findSampleDirectory, loadAtlasStyle)
 import qualified Hetoimasia.Terrain.Render2D.AtlasFixtures as Fixtures
 import qualified Hetoimasia.Terrain.Render2D.Camera as Camera
-import Hetoimasia.Terrain.Render2D.Cells (CellConfig (..), defaultCellConfig)
+import Hetoimasia.Terrain.Render2D.Cells (CellConfig (..), PartKind (..), TargetRect (..), cellPlanQuads, quadCell, quadPart, quadTarget)
 import Hetoimasia.Terrain.Render2D.Material (terrainModel)
 import Hetoimasia.Terrain.Render2D.Presentation (defaultLightInput)
 import qualified Hetoimasia.Terrain.Runtime as Runtime
 import Hetoimasia.Terrain.Runtime.Storage (filesystemOf, minHeadroomBytes, mkStorageConfig)
 import Hetoimasia.Terrain.Runtime.Store (StoreSpec (..), defaultStoreSpec, minAllowanceBytes)
 import Hetoimasia.Terrain.Shape (ViewFacing (..))
-import Hetoimasia.Terrain.Source (LayerSpec (..), SourceSpec (..))
+import Hetoimasia.Terrain.Source (CellSpec (..), LayerSpec (..), PatchSpec (..), SourceSpec (..))
 import Numeric.Natural (Natural)
 import System.Directory (createDirectoryIfMissing)
 import System.Environment (lookupEnv)
@@ -145,36 +146,117 @@ spec env = describe "terrain views" $
       fmap graphicsWorld latest `shouldBe` Just Nothing
       atomically (claimOf (scenesClaims (envScenes env)) (KeyOffscreen (rgTarget rig))) `shouldReturn` Nothing
 
--- | The broader matrix, run alone by @--terrain-views-full@.
+-- | The broader matrix, run alone by @--terrain-views-full@. Every rendering is judged pixel by pixel by the oracle;
+-- the picks are judged against the plan the host adopted (the oracle names colours, not the quad that wins a pixel): at
+-- every judged terrain pixel that exactly one quad of a known part covers, the pick is a hit of that quad's cell.
 fullSpec ∷ Env → Spec
 fullSpec env = describe "terrain views (full)" $ do
   forM_ [FaceSouth, FaceWest, FaceNorth, FaceEast] $ \facing →
-    it ("draws every facing exactly: " <> show facing) $
+    it ("draws every facing exactly, and picks what it draws: " <> show facing) $
       within 60 . withRig env $ \rig → do
         view ← attach rig (metricsOf 128 96)
         n ← awaitAdopted rig 1
         atomically (updateCamera view (CameraIntent [Camera.SetFacing facing])) `shouldReturn` Right ()
         _ ← awaitAdopted rig (n + 1)
-        void (renderJudged rig ("facing " <> Text.pack (show facing)))
+        rendered ← renderJudged rig ("facing " <> Text.pack (show facing))
+        void (pickAgreement view rendered)
         closeView view
-  forM_ [0.5, 2] $ \zoom →
-    it ("draws a zoom exactly: " <> show zoom) $
+  forM_ [0.125, 0.5, 2, 8] $ \zoom →
+    it ("draws a zoom exactly, the endpoints included: " <> show zoom) $
       within 60 . withRig env $ \rig → do
         view ← attach rig (metricsOf 128 96)
         n ← awaitAdopted rig 1
         atomically (updateCamera view (CameraIntent [Camera.SetZoom zoom])) `shouldReturn` Right ()
         _ ← awaitAdopted rig (n + 1)
-        void (renderJudged rig ("zoom " <> Text.pack (show zoom)))
+        rendered ← renderJudged rig ("zoom " <> Text.pack (show zoom))
+        void (pickAgreement view rendered)
         closeView view
   it "draws a portrait target exactly, and a pick over the clear background finds nothing" $
     within 60 . withRig env $ \rig → do
       view ← attach rig (metricsOf 64 128)
       _ ← awaitAdopted rig 1
       rendered ← renderJudged rig "portrait"
-      forM_ (rwClear rendered) $ \(x, y) →
-        atomically (pickView view (fromIntegral x + 0.5, fromIntegral y + 0.5)) >>= (`shouldSatisfy` (/= PickLoading)) >> pure ()
       clearPicks ← forM (take 64 (rwClear rendered)) $ \(x, y) → atomically (pickView view (fromIntegral x + 0.5, fromIntegral y + 0.5))
       [p | p@(PickHit _) ← clearPicks] `shouldBe` []
+      void (pickAgreement view rendered)
+      closeView view
+  it "draws an adopted view again after its target is resized, at the new metrics, and picks what it draws" $
+    within 60 . withRig env $ \rig → do
+      view ← attach rig (metricsOf 128 96)
+      n ← awaitAdopted rig 1
+      _ ← renderJudged rig "before the resize"
+      atomically (writeTVar (rgMetrics rig) (metricsOf 96 128))
+      _ ← awaitAdopted rig (n + 1)
+      rendered ← renderJudged rig "after the resize"
+      void (pickAgreement view rendered)
+      closeView view
+  it "draws a lower background far outside the camera's radius exactly" $
+    within 60 . withRigOn pillarOverPlain (\c → c {tvCellConfig = (tvCellConfig c) {ccDepth = 250}}) env $ \rig → do
+      view ← attach rig (metricsOf 128 96)
+      _ ← awaitAdopted rig 1
+      Just (visible, _) ← atomically (viewDemand view)
+      [r | r ← visible, abs (regionX r) > 1 || abs (regionY r) > 1] `shouldSatisfy` (not . null)
+      rendered ← renderJudged rig "background"
+      void (pickAgreement view rendered)
+      closeView view
+  it "draws a revealed cavity's ordinary, fog and mixed cells exactly" $
+    within 60 . withRigOn cavitySource id env $ \rig → do
+      view ← attach rig (metricsOf 128 96)
+      n ← awaitAdopted rig 1
+      let axis = either (error . show) id . axisFromInteger
+      landing ← atomically (jumpView view (JumpRequest (axis 8, axis 8) (Just (axis 2)))) >>= either (assertFailure . show) pure
+      within 20 (atomically (jumpSettled landing >>= maybe retry pure)) `shouldReturn` SettledOk JumpLanded
+      removeAt rig (8, 8, 3)
+      _ ← awaitAdopted rig (n + 2)
+      Just plan ← atomically (adoptedPlan view)
+      let parts = Set.fromList (map quadPart (cellPlanQuads plan))
+      (Set.member PartFog parts, Set.member PartKnown parts, Set.member PartOrdinary parts) `shouldBe` (True, True, True)
+      rendered ← renderJudged rig "mixed"
+      void (pickAgreement view rendered)
+      closeView view
+  it "keeps the adopted image when a replacement is refused as stale, then draws the replacement once it is made again" $ do
+    stage ← newTVarIO (Nothing ∷ Maybe (Text.Text, TVar Bool))
+    held ← newTVarIO False
+    let hook _ entered = do
+          wait ← atomically $ readTVar stage >>= \case
+            Just (wanted, opened) | wanted == entered → Just opened <$ (writeTVar stage Nothing >> writeTVar held True)
+            _ → pure Nothing
+          forM_ wait $ \opened → atomically (readTVar opened >>= check)
+    within 90 . withRigOn loamOverGranite (\c → c {tvOnStage = hook}) env $ \rig → do
+      view ← attach rig (metricsOf 128 96)
+      n ← awaitAdopted rig 1
+      before' ← renderJudged rig "the adopted image"
+      -- the replacement is held as its uploads end, the arena's residency moves under it, and its publication is
+      -- refused as stale; the next preparation is held as it starts copying again
+      uploaded ← newTVarIO False
+      atomically (writeTVar stage (Just ("uploading", uploaded)))
+      atomically (updateCamera view (CameraIntent [Camera.ZoomBy 2])) `shouldReturn` Right ()
+      within 20 (atomically (readTVar held >>= check))
+      moveResidency rig
+      again ← newTVarIO False
+      atomically (writeTVar held False >> writeTVar stage (Just ("copying", again)) >> writeTVar uploaded True)
+      within 20 (atomically (readTVar held >>= check))
+      publishedOf rig `shouldReturn` n
+      kept ← renderJudged rig "kept after the stale replacement"
+      worldTag (rwWorld kept) `shouldBe` worldTag (rwWorld before')
+      atomically (writeTVar again True)
+      _ ← awaitAdopted rig (n + 1)
+      rendered ← renderJudged rig "the replacement"
+      zoomOf (rwWorld rendered) `shouldBe` 2
+      closeView view
+  it "keeps a superseded revision's regions while its batch is in flight, and draws it whole after a newer one is adopted" $
+    within 60 . withRig env $ \rig → do
+      view ← attach rig (metricsOf 128 96)
+      n ← awaitAdopted rig 1
+      inFlight ← renderSubmit rig "a revision in flight"
+      chunksA ← worldChunks . snd <$> (adoptedWorld rig)
+      -- a newer revision is made and adopted while the first one's batch may still be running
+      removeAt rig (8, 8, 3)
+      _ ← awaitAdopted rig (n + 1)
+      overlapped ← atomically (prInFlight inFlight)
+      a ← renderFinish inFlight
+      worldChunks (rwWorld a) `shouldBe` chunksA
+      evidenceNote ("terrain views (full): the newer revision was adopted " <> (if overlapped then "while" else "after") <> " the first one's batch was in flight; its readback was judged whole")
       closeView view
 
 -- ---------------------------------------------------------------------------
@@ -194,10 +276,15 @@ data Rig = Rig
   , rgIdentities ∷ !(Word64, Word64)
     -- ^ Their registrations' complete identities, which the oracle's decoded images are named by.
   , rgMetrics ∷ !(TVar TargetMetrics)
+  , rgClient ∷ !Runtime.Client
   }
 
 withRig ∷ Env → (Rig → IO a) → IO a
-withRig env body = do
+withRig = withRigOn loamOverGranite id
+
+-- The rig over this source, its views configured further by this.
+withRigOn ∷ SourceSpec → (TerrainViewsConfig → TerrainViewsConfig) → Env → (Rig → IO a) → IO a
+withRigOn source configure env body = do
   style ← loadAtlasStyle 5 [("loam", "colour.loam"), ("granite", "colour.granite")]
   sample ← findSampleDirectory
   let atlas = sample </> "content" </> "textures" </> "terrain-atlas"
@@ -217,12 +304,13 @@ withRig env body = do
       normalKey ← leaseKey comp vm "normal"
       colourIdentity ← identityOf comp vm "colour"
       normalIdentity ← identityOf comp vm "normal"
-      withTerrain (cpAccount comp) $ \terrain client arena → do
+      withTerrain source (cpAccount comp) $ \terrain client arena → do
         ports ← productionPorts host graphics (envScenes env) terrain client (cpAccount comp) (pure True)
-        withTerrainViews config ports $ \views →
-          body (Rig env comp vm target views terrain arena style (colourKey, normalKey) (colourIdentity, normalIdentity) metrics)
+        withTerrainViews (configure config) ports $ \views →
+          body (Rig env comp vm target views terrain arena style (colourKey, normalKey) (colourIdentity, normalIdentity) metrics client)
   where
-    config = defaultTerrainViewsConfig {tvCellConfig = defaultCellConfig {ccDepth = 30}}
+    -- the views' own cell configuration (their step bound included) with a 30-level band
+    config = defaultTerrainViewsConfig {tvCellConfig = (tvCellConfig defaultTerrainViewsConfig) {ccDepth = 30}}
 
 metricsOf ∷ Int → Int → TargetMetrics
 metricsOf w h = TargetMetrics (PixelExtent w h) (PixelExtent w h) 1 1
@@ -302,12 +390,28 @@ data RenderedWorld = RenderedWorld
   , rwWorld ∷ !SceneWorld
   , rwClear ∷ ![(Int, Int)]
     -- ^ The pixels the oracle determined show only the clear colour.
+  , rwDrawn ∷ ![(Int, Int)]
+    -- ^ The pixels the oracle judged that show terrain.
   }
 
 -- | Record the adopted world into a fresh colour target and depth image through the host's recording boundary, wait for
 -- the batch's own completion, read the colour back and judge every pixel with the independent oracle.
 renderJudged ∷ Rig → Text → IO RenderedWorld
-renderJudged rig name = do
+renderJudged rig name = renderSubmit rig name >>= renderFinish
+
+-- A render recorded and submitted, not yet waited for: its batch may still be in flight.
+data PendingRender = PendingRender
+  { prInFlight ∷ !(STM Bool)
+    -- ^ Whether the batch has not completed yet.
+  , prFinish ∷ !(IO RenderedWorld)
+  }
+
+renderFinish ∷ PendingRender → IO RenderedWorld
+renderFinish = prFinish
+
+-- | Record the adopted world into a fresh colour target and depth image and submit the batch, without waiting for it.
+renderSubmit ∷ Rig → Text → IO PendingRender
+renderSubmit rig name = do
   let env = rgEnv rig
       host = envHost env
       graphics = envGraphics env
@@ -321,7 +425,8 @@ renderJudged rig name = do
     readback ← constructReadback construction bytesWanted
     pure ((,,) <$> image <*> depth <*> readback)
   (image, depth, readback) ← either (assertFailure . Text.unpack) pure made
-  flip finally (void (act host (VulkanAction (\construction → mapM_ (releaseConstructed construction) [image, depth] >> releaseConstructed construction readback >> pure (Right ()))))) $ do
+  let release = void (act host (VulkanAction (\construction → mapM_ (releaseConstructed construction) [image, depth] >> releaseConstructed construction readback >> pure (Right ()))))
+  (`onException` release) $ do
     recorded ← newIORef Nothing
     ticket ← act host $ VulkanAction $ \construction →
       recordVulkanTargetBatch host (rgTarget rig) construction (\scene revision recorder → do
@@ -345,68 +450,69 @@ renderJudged rig name = do
           Right (batch, Left failure) → pure (Right (batch, Just failure))
           Right (batch, Right ()) → pure (Right (batch, Nothing))
     (batch, failure) ← either (assertFailure . Text.unpack) pure ticket
-    completion ← atomically (readTicket batch >>= \state → if state == TicketPending then retry else pure state)
-    forM_ failure (assertFailure . Text.unpack)
-    completion `shouldBe` TicketComplete
-    bytes ← act host (VulkanAction (\construction → readConstructedReadback construction readback 0 bytesWanted)) >>= either (assertFailure . Text.unpack) pure
-    (revision, world) ← readIORef recorded >>= maybe (assertFailure "nothing was recorded") pure
-    -- The independent judgement: the oracle, given the terrain material's pure model and the decoded parents.
-    chunks ← retainedChunks (graphicsRetained graphics)
-    marks ← registeredMarks (graphicsTextures graphics)
-    let reference = targetRef 1 1
-        snapshot = Snapshot [Pass (OffscreenTarget reference) (worldClear world) [worldView world]]
-    valid ← either (\why → assertFailure ("the world does not validate: " <> show why)) pure (validateSnapshotWith chunks snapshot)
-    let (colourIdentity, normalIdentity) = rgIdentities rig
-        decoded = Map.fromList [(textureHandleOf colourIdentity, Fixtures.styleColourImage (rgStyle rig)), (textureHandleOf normalIdentity, Fixtures.styleNormalImage (rgStyle rig))]
-        oracle =
-          newOracleWith
-            (Map.fromList [(material, terrainModel) | material ← Map.keys (viewMaterials (worldView world))])
-            OracleInput
-              { inputSnapshot = valid
-              , inputCutoutMarks = marks
-              , inputWindow = Nothing
-              , inputOffscreen = Map.singleton reference (TargetSpec metrics R8G8B8A8Srgb (PixelExtent width height))
-              , inputTextures = (`Map.lookup` decoded)
-              }
-        verdicts = [((x, y), judgeReadback oracle (Probe 0 x y) bytes) | y ← [0 .. height - 1], x ← [0 .. width - 1]]
-        failed = [(p, v) | (p, v@(OutOfTolerance _)) ← verdicts]
-        passedPixels = [p | (p, Passed) ← verdicts]
-        ClearColour cr cg cb ca = worldClear world
-        clearBytes = map (\c → round (c * 255) ∷ Int) [cr, cg, cb, ca]
-        pixelBytes (x, y) = [fromIntegral (ByteString.index bytes ((y * width + x) * 4 + k)) | k ← [0 .. 3]]
-        clear = [p | p ← passedPixels, pixelBytes p == clearBytes]
-    -- The evidence: the lossless readback and the machine-readable comparison, under the run's evidence directory.
-    let indeterminate = length [() | (_, ProbeIndeterminate _) ← verdicts]
-        byteAt x y k = fromIntegral (ByteString.index bytes ((y * width + x) * 4 + k))
-        png = Png.rgba8 width height (\x y → (byteAt x y 0, byteAt x y 1, byteAt x y 2, byteAt x y 3))
-        record =
-          Text.unlines
-            [ "{"
-            , "  \"name\": \"" <> name <> "\","
-            , "  \"revision\": " <> Text.pack (show revision) <> ","
-            , "  \"view\": " <> Text.pack (show (tagView (worldTag world))) <> ", \"plan\": " <> Text.pack (show (tagRevision (worldTag world))) <> ","
-            , "  \"framebuffer\": [" <> Text.pack (show width) <> ", " <> Text.pack (show height) <> "],"
-            , "  \"chunks\": " <> Text.pack (show (Set.size (worldChunks world))) <> ","
-            , "  \"pixels\": " <> Text.pack (show (width * height)) <> ", \"passed\": " <> Text.pack (show (length passedPixels)) <> ", \"failed\": " <> Text.pack (show (length failed)) <> ", \"indeterminate\": " <> Text.pack (show indeterminate) <> ","
-            , "  \"clear_pixels\": " <> Text.pack (show (length clear)) <> ","
-            , "  \"judge\": \"render-2d oracle with terrainModel and the decoded parents\","
-            , "  \"completion\": \"the batch's own ticket reported complete before the readback was read\""
-            , "}"
-            ]
-    directory ← lookupEnv "HETOIMASIA_VALIDATION_EVIDENCE"
-    forM_ directory $ \place → do
-      let folder = place </> "terrain-views"
-          stem = Text.unpack (Text.map (\c → if c `elem` (['a' .. 'z'] <> ['0' .. '9']) then c else '-') (Text.toLower name))
-      createDirectoryIfMissing True folder
-      ByteString.writeFile (folder </> stem <> ".png") png
-      Text.writeFile (folder </> stem <> ".json") record
-    take 4 failed `shouldBe` []
-    -- enough of the image is decided for the judgement to speak: a minified view leaves more texel boundaries to the
-    -- oracle's refusal, so the floor is a quarter of the pixels, not half
-    length passedPixels `shouldSatisfy` (> (width * height) `div` 4)
-    -- the world is drawn: some judged pixel shows terrain, not the clear colour
-    length clear `shouldSatisfy` (< length passedPixels)
-    pure (RenderedWorld revision world clear)
+    pure . PendingRender ((== TicketPending) <$> readTicket batch) . (`finally` release) $ do
+     completion ← atomically (readTicket batch >>= \state → if state == TicketPending then retry else pure state)
+     forM_ failure (assertFailure . Text.unpack)
+     completion `shouldBe` TicketComplete
+     bytes ← act host (VulkanAction (\construction → readConstructedReadback construction readback 0 bytesWanted)) >>= either (assertFailure . Text.unpack) pure
+     (revision, world) ← readIORef recorded >>= maybe (assertFailure "nothing was recorded") pure
+     -- The independent judgement: the oracle, given the terrain material's pure model and the decoded parents.
+     chunks ← retainedChunks (graphicsRetained graphics)
+     marks ← registeredMarks (graphicsTextures graphics)
+     let reference = targetRef 1 1
+         snapshot = Snapshot [Pass (OffscreenTarget reference) (worldClear world) [worldView world]]
+     valid ← either (\why → assertFailure ("the world does not validate: " <> show why)) pure (validateSnapshotWith chunks snapshot)
+     let (colourIdentity, normalIdentity) = rgIdentities rig
+         decoded = Map.fromList [(textureHandleOf colourIdentity, Fixtures.styleColourImage (rgStyle rig)), (textureHandleOf normalIdentity, Fixtures.styleNormalImage (rgStyle rig))]
+         oracle =
+           newOracleWith
+             (Map.fromList [(material, terrainModel) | material ← Map.keys (viewMaterials (worldView world))])
+             OracleInput
+               { inputSnapshot = valid
+               , inputCutoutMarks = marks
+               , inputWindow = Nothing
+               , inputOffscreen = Map.singleton reference (TargetSpec metrics R8G8B8A8Srgb (PixelExtent width height))
+               , inputTextures = (`Map.lookup` decoded)
+               }
+         verdicts = [((x, y), judgeReadback oracle (Probe 0 x y) bytes) | y ← [0 .. height - 1], x ← [0 .. width - 1]]
+         failed = [(p, v) | (p, v@(OutOfTolerance _)) ← verdicts]
+         passedPixels = [p | (p, Passed) ← verdicts]
+         ClearColour cr cg cb ca = worldClear world
+         clearBytes = map (\c → round (c * 255) ∷ Int) [cr, cg, cb, ca]
+         pixelBytes (x, y) = [fromIntegral (ByteString.index bytes ((y * width + x) * 4 + k)) | k ← [0 .. 3]]
+         clear = [p | p ← passedPixels, pixelBytes p == clearBytes]
+     -- The evidence: the lossless readback and the machine-readable comparison, under the run's evidence directory.
+     let indeterminate = length [() | (_, ProbeIndeterminate _) ← verdicts]
+         byteAt x y k = fromIntegral (ByteString.index bytes ((y * width + x) * 4 + k))
+         png = Png.rgba8 width height (\x y → (byteAt x y 0, byteAt x y 1, byteAt x y 2, byteAt x y 3))
+         record =
+           Text.unlines
+             [ "{"
+             , "  \"name\": \"" <> name <> "\","
+             , "  \"revision\": " <> Text.pack (show revision) <> ","
+             , "  \"view\": " <> Text.pack (show (tagView (worldTag world))) <> ", \"plan\": " <> Text.pack (show (tagRevision (worldTag world))) <> ","
+             , "  \"framebuffer\": [" <> Text.pack (show width) <> ", " <> Text.pack (show height) <> "],"
+             , "  \"chunks\": " <> Text.pack (show (Set.size (worldChunks world))) <> ","
+             , "  \"pixels\": " <> Text.pack (show (width * height)) <> ", \"passed\": " <> Text.pack (show (length passedPixels)) <> ", \"failed\": " <> Text.pack (show (length failed)) <> ", \"indeterminate\": " <> Text.pack (show indeterminate) <> ","
+             , "  \"clear_pixels\": " <> Text.pack (show (length clear)) <> ","
+             , "  \"judge\": \"render-2d oracle with terrainModel and the decoded parents\","
+             , "  \"completion\": \"the batch's own ticket reported complete before the readback was read\""
+             , "}"
+             ]
+     directory ← lookupEnv "HETOIMASIA_VALIDATION_EVIDENCE"
+     forM_ directory $ \place → do
+       let folder = place </> "terrain-views"
+           stem = Text.unpack (Text.map (\c → if c `elem` (['a' .. 'z'] <> ['0' .. '9']) then c else '-') (Text.toLower name))
+       createDirectoryIfMissing True folder
+       ByteString.writeFile (folder </> stem <> ".png") png
+       Text.writeFile (folder </> stem <> ".json") record
+     take 4 failed `shouldBe` []
+     -- enough of the image is decided for the judgement to speak: a minified view leaves more texel boundaries to the
+     -- oracle's refusal, so the floor is a quarter of the pixels, not half
+     length passedPixels `shouldSatisfy` (> (width * height) `div` 4)
+     -- the world is drawn: some judged pixel shows terrain, not the clear colour
+     length clear `shouldSatisfy` (< length passedPixels)
+     pure (RenderedWorld revision world clear [p | p ← passedPixels, p `notElem` clear])
 
 inOrder ∷ [IO (Either Refusal ())] → IO (Either Refusal ())
 inOrder = \case
@@ -422,6 +528,72 @@ act host action =
         ActionReturned (Right value) → pure (Right value)
         ActionReturned (Left refusal) → pure (Left (Text.pack (show refusal)))
         _ → pure (Left "the action raised or was refused")
+
+-- At every judged terrain pixel that exactly one quad of a known part covers in the adopted plan, the pick is a hit of
+-- that quad's cell: answers how many pixels it judged, at least one.
+pickAgreement ∷ TerrainView SceneTargetKey → RenderedWorld → IO Int
+pickAgreement view rendered = do
+  plan ← atomically (adoptedPlan view) >>= maybe (assertFailure "no adopted plan") pure
+  let quads = cellPlanQuads plan
+      covers (x, y) quad =
+        let TargetRect l t r b = quadTarget quad
+            px = fromIntegral x + 1 / 2
+            py = fromIntegral y + 1 / 2
+         in l <= px && px < r && t <= py && py < b
+      single = [(p, cell) | p ← rwDrawn rendered, [quad] ← [filter (covers p) quads], Just cell ← [quadCell quad]]
+  answers ← forM single $ \(p@(x, y), cell) → (,,) p cell <$> atomically (pickView view (fromIntegral x + 0.5, fromIntegral y + 0.5))
+  [(p, cell, answer) | (p, cell, answer) ← answers, not (hitOf cell answer)] `shouldBe` []
+  length single `shouldSatisfy` (> 0)
+  pure (length single)
+  where
+    hitOf cell = \case
+      PickHit ref → pickRefCell ref == cell
+      _ → False
+
+-- The adopted scene's world.
+adoptedWorld ∷ Rig → IO (Natural, SceneWorld)
+adoptedWorld rig = do
+  revision ← awaitAdopted rig 1
+  adoptedScene rig >>= \case
+    Just scene | Just world ← graphicsWorld scene → pure (revision, world)
+    _ → assertFailure "the adopted scene holds no world"
+
+zoomOf ∷ SceneWorld → Float
+zoomOf = cameraZoom . viewCamera . worldView
+
+-- Move the arena's residency generation by one completed load far from the view.
+moveResidency ∷ Rig → IO ()
+moveResidency rig = do
+  let generationNow = fmap Runtime.viewGeneration <$> Runtime.inspectArenaSTM (rgTerrain rig) (rgArena rig)
+  start ← atomically generationNow
+  other ← Runtime.openView (rgTerrain rig) (rgClient rig) >>= either (assertFailure . show) pure
+  demand ← either (assertFailure . show) pure (RegionDemand (RegionCoord 40 40 0) <$> coverageBox 0 16 0 16 0 32)
+  _ ← Runtime.setViewDemand (rgTerrain rig) other (rgArena rig) [demand] >>= either (assertFailure . show) pure
+  within 20 (atomically (generationNow >>= check . (/= start)))
+  Runtime.closeView (rgTerrain rig) other
+
+evidenceNote ∷ Text → IO ()
+evidenceNote = Text.putStrLn
+
+-- A plain of loam whose top is level -1, and one pillar of granite rising to level 99 at the camera's column.
+pillarOverPlain ∷ SourceSpec
+pillarOverPlain =
+  SourceSpec
+    { specMaterials = ["loam", "granite"]
+    , specLayers = [LayerSpec {layerMin = Nothing, layerMax = Just 0, layerMaterial = "loam", layerShape = 0}]
+    , specPatches = [PatchSpec {patchX = 8, patchY = 8, patchMin = 0, patchMax = 100, patchValue = SpecSolid "granite" 0}]
+    }
+
+-- A sealed one-column cavity at (8, 8), levels 1 and 2, with shaped cells around it on both levels.
+cavitySource ∷ SourceSpec
+cavitySource =
+  loamOverGranite
+    { specPatches =
+        [PatchSpec {patchX = 8, patchY = 8, patchMin = 1, patchMax = 3, patchValue = SpecAir}]
+          <> [ PatchSpec {patchX = x, patchY = y, patchMin = z, patchMax = z + 1, patchValue = SpecSolid "loam" shape}
+             | (((x, y), z), shape) ← zip [(c, z) | z ← [1, 2], c ← [(7, 8), (9, 8), (8, 7), (8, 9)]] [1 .. 8]
+             ]
+    }
 
 -- ---------------------------------------------------------------------------
 -- The parents and the terrain
@@ -465,8 +637,8 @@ terrainProfile = case validateProfile changed of
         , specBytes = \limit → maybe (specBytes base limit) Bytes (lookup limit bytesChanged)
         }
 
-withTerrain ∷ RenderAccount → (Runtime.Service → Runtime.Client → Runtime.ArenaLease → IO a) → IO a
-withTerrain account body =
+withTerrain ∷ SourceSpec → RenderAccount → (Runtime.Service → Runtime.Client → Runtime.ArenaLease → IO a) → IO a
+withTerrain source account body =
   withSystemTempDirectory "hetoimasia-terrain-views-native" $ \dir → do
     let directory = BC.pack dir
     name ← filesystemOf directory >>= either (\f → fail ("cannot name the test filesystem: " <> show f)) pure
@@ -479,7 +651,7 @@ withTerrain account body =
               }
       Runtime.withTerrainService config (Runtime.Ports Runtime.alwaysAdmitting (Runtime.standaloneSupervisor group) quiet Runtime.noProbe (Runtime.storagePort group storage directory)) $ \terrain → do
         client ← Runtime.registerClient terrain >>= either (fail . show) pure
-        arena ← Runtime.openArena terrain client "views" loamOverGranite >>= either (fail . show) pure >>= Runtime.await terrain >>= either (fail . show) pure
+        arena ← Runtime.openArena terrain client "views" source >>= either (fail . show) pure >>= Runtime.await terrain >>= either (fail . show) pure
         body terrain client arena
 
 loamOverGranite ∷ SourceSpec
