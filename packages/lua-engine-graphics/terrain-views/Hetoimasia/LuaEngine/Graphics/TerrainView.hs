@@ -80,6 +80,7 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView
   , pickRefIdentity
   , pickView
   , pickPrecondition
+  , adoptedPlan
   ) where
 
 import Control.Concurrent.STM (STM)

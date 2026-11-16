@@ -71,6 +71,7 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView.Service
     -- * Picking
   , pickView
   , pickPrecondition
+  , adoptedPlan
   ) where
 
 import Control.Concurrent (forkIOWithUnmask)
@@ -1347,6 +1348,14 @@ dropUnneededPins service state = atomically $ do
 -- adopted and the plan pinned for it. No adopted revision, a plan made for other metrics than the target's now, or
 -- information that could lie ahead is 'PickLoading'; zero or absent metrics, a point outside, air, gaps and fog are
 -- 'PickNoHit'; a visible known part is 'PickHit' with its consistency reference.
+-- | The plan of the revision the host adopted for the view's target, the one picks read: 'Nothing' before an adoption
+-- of the view's own revision. Read-only.
+adoptedPlan ∷ (Ord k, Show k) ⇒ TerrainView k → STM (Maybe CellPlan)
+adoptedPlan (TerrainView service state) =
+  adoptedRevision service state >>= \case
+    Nothing → pure Nothing
+    Just (_, tag) → fmap pinPlan . Map.lookup (tagRevision tag) <$> readTVar (vsPins state)
+
 pickView ∷ (Ord k, Show k) ⇒ TerrainView k → (Double, Double) → STM (PickResult k)
 pickView (TerrainView service state) (px, py) = do
   closing ← readTVar (vsClosing state)

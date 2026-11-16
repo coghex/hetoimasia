@@ -58,7 +58,7 @@ import Hetoimasia.Terrain.Coordinate (RegionCoord (..), TileCoord, axisFromInteg
 import qualified Hetoimasia.Terrain.Render2D.Camera as Camera
 import Hetoimasia.Terrain.Render2D.AtlasFixtures (AtlasStyle, findSampleDirectory, loadAtlasStyle)
 import qualified Hetoimasia.Terrain.Render2D.AtlasFixtures as Fixtures
-import Hetoimasia.Terrain.Render2D.Cells (CellConfig (..), defaultCellConfig)
+import Hetoimasia.Terrain.Render2D.Cells (CellConfig (..), CellKey (..), CellPlan, PartKind (..), cellPlanQuads, defaultCellConfig, quadKey, quadPart)
 import Hetoimasia.Terrain.Render2D.Presentation (defaultLightInput)
 import Hetoimasia.Terrain.Runtime
   ( ArenaLease
@@ -255,10 +255,13 @@ adoptedHit _ view = do
 -- A hit from a revision planned at the arena's current content and knowledge, adopted: discovery commits after an edit,
 -- so the first plan after one can already be a knowledge revision behind, and the view prepares again.
 currentHit ∷ Views → TerrainView Int → IO (PickRef Int)
-currentHit v view = bounded go
+currentHit v = currentHitOn v 1
+
+currentHitOn ∷ Views → Int → TerrainView Int → IO (PickRef Int)
+currentHitOn v window view = bounded go
   where
     go = do
-      _ ← adoptNow (vModel v) 1
+      _ ← adoptNow (vModel v) window
       _ ← releasePass (vModel v)
       hit ← adoptedHit v view
       status ← Runtime.arenaStatus (_vTerrain v) (vArena v) >>= either (fail . show) pure
@@ -269,8 +272,8 @@ currentHit v view = bounded go
         && pickResidency (pickRefIdentity hit) == generation
         then pure hit
         else do
-          now ← publishedRevision (vModel v) 1
-          awaitRevision (vModel v) 1 (now + 1)
+          now ← publishedRevision (vModel v) window
+          awaitRevision (vModel v) window (now + 1)
           go
 
 -- The zoom a world's view draws with, and the zoom of the first plan (the camera's default, 1).
@@ -279,6 +282,26 @@ zoomOf = cameraZoom . viewCamera . worldView
 
 zoomOfFirst ∷ Float
 zoomOfFirst = 1
+
+-- Each cell of a plan by what its quads make it: ordinary (a whole known cell), fog (only the blank fog) or mixed (a
+-- known solid, with or without its fog cover), keyed by its place in the rotated view frame.
+cellMembership ∷ CellPlan → Map (Integer, Integer, Integer, Integer) PartKind
+cellMembership plan = Map.fromListWith strongest [(place (quadKey quad), quadPart quad) | quad ← cellPlanQuads plan]
+  where
+    place (CellKey a b c d _) = (a, b, c, d)
+    strongest x y
+      | x == PartKnown || y == PartKnown = PartKnown
+      | x == PartOrdinary || y == PartOrdinary = PartOrdinary
+      | otherwise = PartFog
+
+-- What the view's adopted revision answers at every fourth pixel centre: the hit's cell and part, or the outcome.
+picksOver ∷ TerrainView Int → STM [Either String (TileCoord, PartKind)]
+picksOver view = mapM (fmap answer . pickView view) [(x + 0.5, y + 0.5) | y ← [0, 4 .. 92], x ← [0, 4 .. 124]]
+  where
+    answer = \case
+      PickHit ref → Right (pickRefCell ref, pickRefPart ref)
+      PickNoHit → Left "no_hit"
+      PickLoading → Left "loading"
 
 -- The arena's residency generation now.
 generationNow ∷ Views → IO Word64
@@ -603,21 +626,47 @@ lifecycle = describe "close orders and limits" $ do
       _ ← awaitPublished' v 1 (first' + 1)
       closeView view
 
-  it "reproduces the same plan for a fresh view of the arena from its retained terrain and knowledge" $
-    withViews $ \v → do
+  it "reproduces the ordinary, fog and mixed plan and the picks in a fresh view attached after a cavity's reveal, from its own copies of the store" $
+    withViewsOn cavitySource testConfig $ \v → do
+      -- The same camera intent for both views, whatever their history: a jump to the cavity's column at the exact level 2
+      -- (manual mode), so the cut runs through the cavity.
+      let axis = either (error . show) id . axisFromInteger
+          sliced view window = do
+            now ← publishedRevision (vModel v) window
+            landing ← atomically (jumpView view (JumpRequest (axis 8, axis 8) (Just (axis 2)))) >>= either (fail . show) pure
+            bounded (atomically (jumpSettled landing >>= maybe retry pure)) `shouldReturn` SettledOk JumpLanded
+            void (awaitPublished' v window (now + 1))
       view ← attached v 1
       _ ← awaitPublished v 1
-      _ ← adoptNow (vModel v) 1
-      revealAt v (8, 8, 3)
+      sliced view 1
+      -- the removal above the sealed cavity opens it: discovery reveals its air and walls
+      now ← publishedRevision (vModel v) 1
+      removeWith v (tileAt 8 8 3) Nothing `shouldReturn` Right True
+      _ ← awaitPublished' v 1 (now + 1)
       quiescent v
-      _ ← currentHit v view
-      original ← drawnInstances v 1
+      sliced view 1
+      hit ← currentHitOn v 1 view
+      original ← atomically (adoptedPlan view) >>= maybe (fail "no adopted plan") pure
+      originalPicks ← atomically (picksOver view)
+      originalInstances ← drawnInstances v 1
       closeView view
+      -- a separate view incarnation on another target, attached after the reveal committed and given the same intent:
+      -- it is handed nothing of the first view's and requests its own copies from the arena's store
       modelWindow (vModel v) 2
       fresh ← attached v 2
-      bounded (atomically (readView fresh >>= check . (/= Nothing) . readingPublished))
-      again ← drawnInstances v 2
-      again `shouldBe` original
+      _ ← awaitPublished v 2
+      sliced fresh 2
+      again ← currentHitOn v 2 fresh
+      pickViewId (pickRefIdentity again) `shouldNotBe` pickViewId (pickRefIdentity hit)
+      let versions identity = (pickArena identity, pickContent identity, pickKnowledge identity)
+      versions (pickRefIdentity again) `shouldBe` versions (pickRefIdentity hit)
+      replanned ← atomically (adoptedPlan fresh) >>= maybe (fail "no adopted plan") pure
+      let membership = cellMembership original
+      cellMembership replanned `shouldBe` membership
+      -- the revealed cavity leaves ordinary, fog and mixed cells in the view (19, 10 and 2 with this source)
+      [length [() | kind ← Map.elems membership, kind == wanted] | wanted ← [PartOrdinary, PartFog, PartKnown]] `shouldSatisfy` all (> 0)
+      atomically (picksOver fresh) `shouldReturn` originalPicks
+      drawnInstances v 2 `shouldReturn` originalInstances
       closeView fresh
 
   it "refuses an attachment through a released arena lease before taking anything, and a view's close leaves its arena open" $
@@ -998,6 +1047,16 @@ withTerrain source account body =
         client ← Runtime.registerClient terrain >>= either (fail . show) pure
         arena ← openArena terrain client "views" source >>= either (fail . show) pure >>= await terrain >>= either (fail . show) pure
         body terrain client arena
+
+cavitySource ∷ SourceSpec
+cavitySource =
+  loamOverGranite
+    { specPatches =
+        [PatchSpec {patchX = 8, patchY = 8, patchMin = 1, patchMax = 3, patchValue = SpecAir}]
+          <> [ PatchSpec {patchX = x, patchY = y, patchMin = z, patchMax = z + 1, patchValue = SpecSolid "loam" shape}
+             | (((x, y), z), shape) ← zip [(c, z) | z ← [1, 2], c ← [(7, 8), (9, 8), (8, 7), (8, 9)]] [1 .. 8]
+             ]
+    }
 
 loamOverGranite ∷ SourceSpec
 loamOverGranite =
