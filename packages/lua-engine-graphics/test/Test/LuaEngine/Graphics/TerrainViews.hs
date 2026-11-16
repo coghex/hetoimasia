@@ -1366,6 +1366,10 @@ lifecycle = describe "close orders and limits" $ do
       view ← attached v 1
       first' ← awaitPublished v 1
       quiescent v
+      -- the camera's demand is resident, so the terrain service's staging (in the shared account) stays where it is
+      demandResident v view
+      adoptNow (vModel v) 1 `shouldReturn` Adopted first'
+      _ ← releasePass (vModel v)
       -- an upload is under way and holds the staging buffer: the next build is refused as pressure
       atomically (writeTVar (foUploads (vOwner v)) [7] >> writeTVar (foStopAfter (vOwner v)) (Just (0, True)))
       built ← readTVarIO (foBuilt (vOwner v))
@@ -1374,6 +1378,10 @@ lifecycle = describe "close orders and limits" $ do
       bounded (atomically (readView view >>= \r → check (readingWaiting r && readingStagedBytes r == 0)))
       readTVarIO (foBuilt (vOwner v)) `shouldReturn` built
       publishedRevision (vModel v) 1 `shouldReturn` first'
+      -- it sleeps while the upload is under way
+      steps ← readingSteps <$> atomically (readView view)
+      _ ← releasePass (vModel v)
+      readingSteps <$> atomically (readView view) `shouldReturn` steps
       -- the upload settles: nothing else changes, and the build is asked again and published
       atomically (writeTVar (foUploads (vOwner v)) [])
       _ ← awaitPublished' v 1 (first' + 1)
