@@ -67,6 +67,7 @@ module Hetoimasia.Scripting.Lua.Provider.Types
   , Completion (..)
   , Settling (..)
   , PreparedReply (..)
+  , settlePrepared
   , SubmissionDeclined (..)
   , ProviderReply (..)
   , ReplyAnswer (..)
@@ -397,11 +398,15 @@ data ProviderReply
 
 -- | What became of an answer. Never an error: a duplicate, late or stale answer is evidence
 -- about the provider and is counted, and it still retires the provider's work.
--- | A reply judged outside any transaction ('settlingPrepare'): the transaction that settles the request with it. It is
--- 'settlingSettle' of the same reply, with the judgement already made.
-newtype PreparedReply = PreparedReply
-  { settlePrepared ∷ STM ReplyAnswer
-  }
+-- | A reply judged outside any transaction ('settlingPrepare'): the verdict, in a strict field (evaluating the prepared reply makes
+-- the judgement), and the settlement that applies it. Settling it ('settlePrepared') is 'settlingSettle' of the same reply, with the
+-- judgement already made. The verdict is a value, never inside an 'STM' action: the compiler may move work bound outside a function
+-- into its body.
+data PreparedReply = ∀ v. PreparedReply !v (v → STM ReplyAnswer)
+
+-- | Settle a request with its prepared reply, in the caller's transaction.
+settlePrepared ∷ PreparedReply → STM ReplyAnswer
+settlePrepared (PreparedReply verdict settle) = settle verdict
 
 data ReplyAnswer
   = -- | It settled the request.

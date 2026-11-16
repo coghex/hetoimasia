@@ -23,6 +23,7 @@ module Hetoimasia.Terrain.Runtime.Internal.Types
     -- * Settlement seam
   , Endpoint (..)
   , PreparedSettlement (..)
+  , preparedSettle
   , unpreparedSettlement
   , OpenOptions (..)
   , defaultOpenOptions
@@ -276,15 +277,21 @@ data Endpoint = Endpoint
   -- transaction. It runs no IO and never blocks. 'unpreparedSettlement' is today's settlement, unprepared.
   }
 
--- | A host's settlement of an answer, prepared outside any transaction ('endpointPrepare'): the
--- transaction the arbitration runs, in place of 'endpointSettle' with the answer's success.
-newtype PreparedSettlement = PreparedSettlement
-  { preparedSettle ∷ STM ()
-  }
+-- | A host's settlement of an answer, prepared outside any transaction ('endpointPrepare'): what the host
+-- prepared, held in a strict field, and the transaction the arbitration runs with it, in place of
+-- 'endpointSettle' with the answer's success. Evaluating a 'PreparedSettlement' evaluates what was
+-- prepared to weak head normal form. The prepared work is a value, never an 'STM' action of its own:
+-- the compiler may move work bound outside a function into its body, so a settlement whose
+-- preparation is only forced around the action can find it done in the transaction after all.
+data PreparedSettlement = ∀ p. PreparedSettlement !p (p → STM ())
+
+-- | The transaction the arbitration runs: the settlement, with what was prepared.
+preparedSettle ∷ PreparedSettlement → STM ()
+preparedSettle (PreparedSettlement prepared settle) = settle prepared
 
 -- | A settlement that prepares nothing: 'endpointSettle' of the answer's success, run in the arbitration.
 unpreparedSettlement ∷ (Settlement → STM ()) → Answer → PreparedSettlement
-unpreparedSettlement settle answer = PreparedSettlement (settle (Succeeded answer))
+unpreparedSettlement settle answer = PreparedSettlement () (\() → settle (Succeeded answer))
 
 -- | The one terminal outcome of an accepted request.
 data Settlement

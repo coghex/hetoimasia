@@ -1195,7 +1195,7 @@ spec = describe "Terrain windows and banks" $ do
       -- the first open is never eligible to commit in the example (the service holds it, and its name, while it is parked): what frees the name
       -- is the service's being told
       (secondEndpoint, secondBox) ← arrivalEndpoint
-      let firstEndpoint = Endpoint (pure ()) (pure False) (\_ → pure ()) (\_ → PreparedSettlement (pure ()))
+      let firstEndpoint = Endpoint (pure ()) (pure False) (\_ → pure ()) (\_ → PreparedSettlement () (\() → pure ()))
           -- the admission, held between the service's and the registration of the open's claim (the window), then its claim: found stale once
           -- the host has settled the open as cancelled, and the service is told by whoever finds it so
           admitFirst = do

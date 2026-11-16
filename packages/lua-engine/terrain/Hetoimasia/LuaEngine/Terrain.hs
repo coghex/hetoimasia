@@ -1393,9 +1393,8 @@ prepareInto env link answer = case answer of
   ASurface _ → prepared
   _ → unpreparedSettlement (settleInto env link) answer
   where
-    prepared =
-      let !reply = settlingPrepare (lkSettling link) (answerReply (tvIntegerCeiling (envVm env)) answer)
-       in PreparedSettlement (settlePrepared reply >> writeTVar (lkTerminal link) True)
+    prepared = PreparedSettlement (settlingPrepare (lkSettling link) (answerReply (tvIntegerCeiling (envVm env)) answer)) $ \reply →
+      settlePrepared reply >> writeTVar (lkTerminal link) True
 
 -- | The service's terminal outcome of a request, in the very transaction that decides it: the host's seam is read and written
 -- in it, and nothing else is.

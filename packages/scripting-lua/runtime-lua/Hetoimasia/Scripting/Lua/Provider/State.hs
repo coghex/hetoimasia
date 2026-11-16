@@ -1576,8 +1576,7 @@ settleWithFinal service ask schema final identity reply = settleChecked service 
 -- schema and the admission, none of which changes.
 prepareReply ∷ ProviderState → Admission → Schema → RequestId → ProviderReply → PreparedReply
 prepareReply service ask schema identity reply =
-  let !checked = checkReplyPure (psLimits service) schema ask reply
-   in PreparedReply (settleChecked service (pure Nothing) identity checked)
+  PreparedReply (checkReplyPure (psLimits service) schema ask reply) (settleChecked service (pure Nothing) identity)
 
 -- | The settlement of a judged reply, in the caller's transaction: what 'settleWithFinal' decides after its judgement.
 settleChecked ∷ ProviderState → STM (Maybe ExpectedFailure) → RequestId → Checked → STM ReplyAnswer

@@ -19,6 +19,7 @@ module Hetoimasia.Terrain.Runtime.Settlement
   ( -- * The seam
     Endpoint (..)
   , PreparedSettlement (..)
+  , preparedSettle
   , unpreparedSettlement
   , Settlement (..)
   , CancelResult (..)
