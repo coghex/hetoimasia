@@ -88,12 +88,14 @@ import Hetoimasia.Render.TwoD.Metrics (PixelExtent (..), TargetMetrics (..))
 import Hetoimasia.Render.TwoD.Oracle (OracleInput (..), Probe (..), TargetSpec (..), Verdict (..), judgeReadback, newOracleWith)
 import Hetoimasia.Render.TwoD.Oracle.Colour (ColourFormat (R8G8B8A8Srgb))
 import Hetoimasia.Render.TwoD.Chunk (ChunkRef)
-import Hetoimasia.Render.TwoD.Snapshot (ClearColour (..), Pass (..), Snapshot (..), Target (OffscreenTarget), View (..))
+import Hetoimasia.Render.TwoD.Snapshot (Camera (..), ClearColour (..), Pass (..), Snapshot (..), Target (OffscreenTarget), View (..))
 import Hetoimasia.Render.TwoD.Target.Backend (targetRef)
 import Hetoimasia.Render.TwoD.Validation (validateSnapshotWith)
 import Hetoimasia.Render.TwoD.Vulkan.Chunks (RetainedView (..), retainedChunks, retainedViewSTM)
 import Hetoimasia.Render.TwoD.Vulkan.Textures (registeredMarks)
 import Hetoimasia.Terrain.Coordinate (RegionCoord (..), axisFromInteger, tileCoord)
+import Hetoimasia.Terrain.Residency (RegionDemand (..), RegionInfo (..), coverageBox, modelRegions)
+import System.Timeout (timeout)
 import Hetoimasia.Terrain.Render2D.AtlasFixtures (AtlasStyle, findSampleDirectory, loadAtlasStyle)
 import qualified Hetoimasia.Terrain.Render2D.AtlasFixtures as Fixtures
 import qualified Hetoimasia.Terrain.Render2D.Camera as Camera
@@ -226,6 +228,47 @@ fullSpec env = describe "terrain views (full)" $ do
       rendered ← renderJudged rig "mixed"
       pickAgreement view rendered >>= notePicks
       closeView view
+  it "keeps the adopted image when a replacement is refused as stale, then draws the replacement once it is made again" $ do
+    stage ← newTVarIO (Nothing ∷ Maybe (Text.Text, TVar Bool))
+    held ← newTVarIO False
+    -- every gate opens when the example ends, however it ends, so the views' worker is never left parked in the hook
+    -- and a failure is reported rather than hanging the teardown
+    released ← newTVarIO False
+    let hook _ entered = do
+          wait ← atomically $ readTVar stage >>= \case
+            Just (wanted, opened) | wanted == entered → Just opened <$ (writeTVar stage Nothing >> writeTVar held True)
+            _ → pure Nothing
+          forM_ wait $ \opened → atomically ((||) <$> readTVar opened <*> readTVar released >>= check)
+        awaitHeld what =
+          timeout 20000000 (atomically (readTVar held >>= check))
+            >>= maybe (assertFailure ("the views' worker did not reach " <> what <> " within 20 seconds")) pure
+    within 90 . withRigOn loamOverGranite (\c → c {tvOnStage = hook}) env $ \rig → (`finally` atomically (writeTVar released True)) $ do
+      view ← attach rig (metricsOf 128 96)
+      _ ← awaitAdopted rig 1
+      -- the runtime's background loads are settled first: the view's whole demand is resident, so nothing but the far
+      -- view below moves the residency generation, and the view is idle with what it published adopted
+      settleBackground rig view
+      n ← publishedOf rig
+      before' ← renderJudged rig "the adopted image"
+      -- the replacement is held as its uploads end, the arena's residency moves under it, and its publication is
+      -- refused as stale; the next preparation is held as it starts copying again
+      uploaded ← newTVarIO False
+      atomically (writeTVar stage (Just ("uploading", uploaded)))
+      atomically (updateCamera view (CameraIntent [Camera.ZoomBy 2])) `shouldReturn` Right ()
+      awaitHeld "the replacement's uploading stage"
+      moveResidency rig
+      again ← newTVarIO False
+      atomically (writeTVar held False >> writeTVar stage (Just ("copying", again)) >> writeTVar uploaded True)
+      awaitHeld "the copying stage of the preparation after the stale refusal"
+      publishedOf rig `shouldReturn` n
+      kept ← renderJudged rig "kept after the stale replacement"
+      worldTag (rwWorld kept) `shouldBe` worldTag (rwWorld before')
+      atomically (writeTVar again True)
+      _ ← awaitAdopted rig (n + 1)
+      rendered ← renderJudged rig "the replacement"
+      zoomOf (rwWorld rendered) `shouldBe` 2
+      closeView view
+
 
 -- | The asserted overlap witness (owner decision S, #645 comment 6924532805), on a host whose test-only completion hold
 -- is set: A's batch is held from its recording, B is adopted, A's own chunks stay held by the production ledger and the
@@ -280,6 +323,7 @@ data Rig = Rig
   , rgIdentities ∷ !(Word64, Word64)
     -- ^ Their registrations' complete identities, which the oracle's decoded images are named by.
   , rgMetrics ∷ !(TVar TargetMetrics)
+  , rgClient ∷ !Runtime.Client
   }
 
 withRig ∷ Env → (Rig → IO a) → IO a
@@ -310,7 +354,7 @@ withRigOn source configure env body = do
       withTerrain source (cpAccount comp) $ \terrain client arena → do
         ports ← productionPorts host graphics (envScenes env) terrain client (cpAccount comp) (pure True)
         withTerrainViews (configure config) ports $ \views →
-          body (Rig env comp vm target views terrain arena style (colourKey, normalKey) (colourIdentity, normalIdentity) metrics)
+          body (Rig env comp vm target views terrain arena style (colourKey, normalKey) (colourIdentity, normalIdentity) metrics client)
   where
     -- the views' own cell configuration (their step bound included) with a 30-level band
     config = defaultTerrainViewsConfig {tvCellConfig = (tvCellConfig defaultTerrainViewsConfig) {ccDepth = 30}}
@@ -594,6 +638,38 @@ adoptedWorld rig = do
   adoptedScene rig >>= \case
     Just scene | Just world ← graphicsWorld scene → pure (revision, world)
     _ → assertFailure "the adopted scene holds no world"
+
+-- Wait until the view's whole visible demand is resident and the view is idle with what it published adopted.
+settleBackground ∷ Rig → TerrainView SceneTargetKey → IO ()
+settleBackground rig view = within 30 . atomically $ do
+  demand ← viewDemand view
+  model ← Runtime.inspectModelSTM (rgTerrain rig)
+  reading ← readView view
+  standing ← standingOf rig
+  let resident = Set.fromList (map regionCoord (modelRegions model))
+      hostSettled = maybe False (\st → isJust (windowAdopted st) && windowAdopted st == windowPublished st) standing
+  case demand of
+    Just (visible, _)
+      | Set.fromList visible `Set.isSubsetOf` resident
+      , readingStagedBytes reading == 0
+      , isJust (readingPublished reading)
+      , hostSettled →
+          pure ()
+    _ → retry
+
+zoomOf ∷ SceneWorld → Float
+zoomOf = cameraZoom . viewCamera . worldView
+
+-- Move the arena's residency generation by one completed load far from the view.
+moveResidency ∷ Rig → IO ()
+moveResidency rig = do
+  let generationNow = fmap Runtime.viewGeneration <$> Runtime.inspectArenaSTM (rgTerrain rig) (rgArena rig)
+  start ← atomically generationNow
+  other ← Runtime.openView (rgTerrain rig) (rgClient rig) >>= either (assertFailure . show) pure
+  demand ← either (assertFailure . show) pure (RegionDemand (RegionCoord 40 40 0) <$> coverageBox 0 16 0 16 0 32)
+  _ ← Runtime.setViewDemand (rgTerrain rig) other (rgArena rig) [demand] >>= either (assertFailure . show) pure
+  within 20 (atomically (generationNow >>= check . (/= start)))
+  Runtime.closeView (rgTerrain rig) other
 
 evidenceNote ∷ Text → IO ()
 evidenceNote = Text.putStrLn
