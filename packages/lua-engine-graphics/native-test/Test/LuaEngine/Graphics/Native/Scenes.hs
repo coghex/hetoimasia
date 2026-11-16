@@ -16,6 +16,7 @@ module Test.LuaEngine.Graphics.Native.Scenes
   ( spec
   , depthHostSpec
   , depthHostPath
+  , depthHostPaths
   , awaitAdopted
   , awaitFrame
   , demandFrame
@@ -27,15 +28,15 @@ module Test.LuaEngine.Graphics.Native.Scenes
   , within
   ) where
 
-import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, retry)
+import Control.Concurrent.STM (TVar, atomically, check, modifyTVar', newTVarIO, readTVar, readTVarIO, retry)
 import Control.Monad (unless)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as Text
-import Hetoimasia.GLFW.Command (clientDemandPublisher)
+import Hetoimasia.GLFW.Command (SubmitResult (..), clientDemandPublisher, setWindowSizeCommand, submitWindowCommand)
 import Hetoimasia.GLFW.Demand (immediateDemand, publishDemand)
-import Hetoimasia.GLFW.Window (WindowId)
+import Hetoimasia.GLFW.Window (Extent (..), WindowId)
 import Hetoimasia.GPU.Vulkan.GLFW
   ( FrameEvent (..)
   , SceneTargetKey (..)
@@ -43,13 +44,17 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , VulkanHostConfig (..)
   , VulkanSceneState (..)
   , WindowSceneStanding (..)
+  , readVulkanGenerations
   , readVulkanSceneState
   )
+import Hetoimasia.GPU.Vulkan.Native.Generations (GenerationStanding (..), GenerationView (..), TargetGenerationsView (..))
+import Data.Maybe (isJust, isNothing)
+import Test.Support.Owned (withOwnedThread)
 import Hetoimasia.LuaEngine.Graphics.Scene
 import Hetoimasia.LuaEngine.Graphics.Texture
 import Hetoimasia.LuaEngine.Graphics.Window.Host (WindowTarget (..), newHostPort)
 import Hetoimasia.LuaEngine.Graphics.Window.Provider (WindowConfig (..), windowMainStep)
-import Hetoimasia.Runtime.GLFW (attachmentWindow, hostWindowClient, hostWindowIdentities)
+import Hetoimasia.Runtime.GLFW (AttachmentId, attachmentWindow, hostCommandPort, hostWindowClient, hostWindowIdentities)
 import Numeric.Natural (Natural)
 import System.Timeout (timeout)
 import Test.HUnit.Lang (assertFailure)
@@ -184,7 +189,12 @@ spec env = describe "scene retention" $ do
 -- | The session: the production window port and texture backend inside a scene composition, with the main thread
 -- serving the provider's handovers.
 withScenes ∷ Env → (SceneComp Target → SceneVm Target → TVar Int → IO a) → IO a
-withScenes env body = do
+withScenes env body = withScenesRecording env (\comp vm stops _ → body comp vm stops)
+
+-- | The same, recording each window's graphics attachment as its target first publishes.
+withScenesRecording ∷ Env → (SceneComp Target → SceneVm Target → TVar Int → TVar (Map.Map WindowId AttachmentId) → IO a) → IO a
+withScenesRecording env body = do
+  attachments ← newTVarIO Map.empty
   stops ← newTVarIO 0
   (port, _) ← newHostPort (envHost env)
   provider ← newIORef (Nothing ∷ Maybe (IO ()))
@@ -192,7 +202,9 @@ withScenes env body = do
         SceneKit
           { kitPort = port
           , kitTextures = graphicsTextures (envGraphics env)
-          , kitPublish = targetAnswer
+          , kitPublish = \target scene → do
+              modifyTVar' attachments (Map.insert (targetWindow target) (targetAttachment target))
+              targetAnswer target scene
           , kitUsable = targetUsable
           , kitClaimed = const (pure False)
           }
@@ -202,7 +214,7 @@ withScenes env body = do
     withSceneComp kit config files (graphicsBackend (envGraphics env)) $ \comp _ runtime → do
       writeIORef provider (Just (windowMainStep (scProvider comp)))
       vm ← startSceneVm comp runtime "native-scene-vm"
-      body comp vm stops
+      body comp vm stops attachments
 
 -- | M1 output on the terrain-enabled host (TRA-9), the session's host built with the host-wide window depth: a published
 -- M1 scene is adopted and its frames are recorded and presented with the window's depth image, as on the terrain-disabled
@@ -213,12 +225,71 @@ withScenes env body = do
 depthHostPath ∷ ([String], String)
 depthHostPath = ([depthHostGroup], depthHostExample)
 
-depthHostGroup, depthHostExample ∷ String
+depthHostGroup, depthHostExample, depthHostPeerExample ∷ String
 depthHostGroup = "M1 output on the terrain-enabled host"
 depthHostExample = "adopts a published M1 scene and records and presents its frames with the host-wide window depth image"
+depthHostPeerExample = "keeps a peer window presenting while another is resized, and the earlier generation, retired, owns its depth image until it is destroyed"
+
+-- | Every example of the terrain-enabled host's session, by its Hspec path.
+depthHostPaths ∷ [([String], String)]
+depthHostPaths = [([depthHostGroup], depthHostExample), ([depthHostGroup], depthHostPeerExample)]
 
 depthHostSpec ∷ Env → Spec
-depthHostSpec env = describe depthHostGroup $
+depthHostSpec env = describe depthHostGroup $ do
+  it depthHostPeerExample $
+    within 120 . withScenesRecording env $ \comp vm _ attachments → do
+      admitScene comp vm "a"
+      admitScene comp vm "b"
+      resized ← openWindow env comp vm "a"
+      peer ← openWindow env comp vm "b"
+      noteWindows env 2
+      loadTexture comp vm "a" "a" "a.png"
+      loadTexture comp vm "b" "b" "b.png"
+      _ ← run comp vm "a" "publish" "a" (Just "a")
+      _ ← run comp vm "b" "publish" "b" (Just "b")
+      awaitAdopted env resized 1
+      awaitAdopted env peer 1
+      attachment ← atomically (readTVar attachments >>= maybe retry pure . Map.lookup resized)
+      let controller = vulkanController (envHost env)
+          generationsOf = readVulkanGenerations controller attachment
+      earlier ← within 10 . atomically $ generationsOf >>= maybe retry (maybe retry pure . viewActive)
+      -- Every change of the resized window's generations is recorded, from before the resize until the earlier one is
+      -- gone: its standing, the frames still using it and whether it still owns its depth image.
+      seen ← newTVarIO []
+      let record previous = do
+            now ← atomically $ do
+              view ← generationsOf
+              let entry = view >>= \v → lookup earlier [(viewGeneration g, (viewStanding g, viewUses g, isJust (viewDepth g))) | g ← viewGenerations v]
+              if entry == previous then retry else pure entry
+            atomically (modifyTVar' seen (now :))
+            unless (isNothing now) (record now)
+      withOwnedThread (record (Just (GenerationPresenting, 0, True))) $ \_ recorded → do
+        -- frames are asked for on both windows, then the first is resized while they are in flight
+        demandFrame env resized
+        demandFrame env peer
+        submitWindowCommand (hostCommandPort (vulkanWindowHost (envHost env))) [("client", "tra9-depth-host")] (setWindowSizeCommand resized (Extent 200 150)) >>= \case
+          SubmitAccepted _ → pure ()
+          other → assertFailure ("the resize was not admitted: " <> show other)
+        -- the resized window builds a new generation and presents with it; the earlier one is destroyed in time
+        within 30 . atomically $ generationsOf >>= maybe retry (\v → check (maybe False (/= earlier) (viewActive v)))
+        mark ← frameLogMark <$> readTVarIO (envFrames env)
+        demandFrame env resized
+        awaitFrame env resized 1 mark
+        within 30 recorded
+      observations ← reverse <$> readTVarIO seen
+      -- the earlier generation, retired, kept its depth image while anything still held it, and owned it in every state
+      -- seen until it was gone
+      [() | Just (GenerationRetiredHeld, _, True) ← observations] `shouldSatisfy` (not . null)
+      [() | Just (_, _, False) ← observations] `shouldBe` []
+      -- the peer kept presenting through the resize
+      peerMark ← frameLogMark <$> readTVarIO (envFrames env)
+      demandFrame env peer
+      awaitFrame env peer 1 peerMark
+      evidence env ("terrain-enabled host: a peer window kept presenting while the other was resized; the earlier generation " <> Text.pack (show earlier) <> ", retired, kept its depth image until it was destroyed (" <> Text.pack (show (length observations)) <> " states seen)")
+      stopScene comp vm "a"
+      stopScene comp vm "b"
+      awaitWindowCount env 0
+
   it depthHostExample $
     within 120 . withScenes env $ \comp vm _ → do
       vulkanWindowDepth (envHostConfig env) `shouldBe` True
