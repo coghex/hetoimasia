@@ -66,6 +66,7 @@ library
         Hetoimasia.Terrain.Internal.Discovery.Core
         Hetoimasia.Terrain.Internal.Discovery.Limits
         Hetoimasia.Terrain.Internal.Discovery.Records
+        Hetoimasia.Terrain.Internal.Discovery.Region
         Hetoimasia.Terrain.Internal.Interval
         Hetoimasia.Terrain.Internal.Packed
         Hetoimasia.Terrain.Internal.Polygon
@@ -98,6 +99,7 @@ test-suite terrain-tests
         Test.Terrain.Coordinate
         Test.Terrain.Discovery
         Test.Terrain.DiscoveryHarness
+        Test.Terrain.DiscoveryRegion
         Test.Terrain.Fixtures
         Test.Terrain.Geometry
         Test.Terrain.Growth

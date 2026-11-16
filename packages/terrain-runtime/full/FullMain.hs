@@ -12,6 +12,7 @@ import qualified Test.TerrainRuntime.Store.Evidence as StoreEvidence
 import qualified Test.TerrainRuntime.Store.Fuzz as StoreFuzz
 import qualified Test.TerrainRuntime.Store.FuzzTrees as StoreFuzzTrees
 import qualified Test.TerrainRuntime.Store.Cycles as StoreCycles
+import qualified Test.TerrainRuntime.Regional as Regional
 import Test.Hspec (Spec, before_)
 import Test.TerrainRuntime.Isolation (sequentialGuard)
 import Test.TerrainRuntime.Runner (runSuite)
@@ -36,3 +37,4 @@ fullDepth = do
   StoreCycles.fullSpec
   BackedPause.fullSpec
   BackedLoop.fullSpec
+  Regional.fullSpec

@@ -1125,6 +1125,7 @@ answerReply ceiling' = \case
   AGrown _ → ProviderFailure "terrain: a growth answer reached the value conversion without its arena's status"
   ARetried _ → ProviderFailure "terrain: a retry answer reached the value conversion without its arena's status"
   AKnowledge _ → ProviderFailure "terrain: a knowledge answer reached the value conversion (no Lua schema in this slice)"
+  ARegions _ → ProviderFailure "terrain: a regional snapshot reached the value conversion (no Lua schema in this slice)"
   AAttached _ → ProviderFailure "terrain: a lease answer reached the value conversion"
   where
     withRevision revision build = case revisionOf ceiling' revision of

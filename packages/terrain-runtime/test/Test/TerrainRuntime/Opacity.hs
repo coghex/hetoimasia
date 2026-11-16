@@ -18,6 +18,8 @@
 --   constructors of those inspection types are refused like an authority's, so a client
 --   cannot construct or forge one (and none carries an authority, a handle or a
 --   snapshot);
+-- * a regional snapshot or its borrow offered where a request needs an arena lease is refused for the
+--   type mismatch, @GHC-83865@: neither grants authority;
 -- * each hidden module is refused as a hidden module of the package's library,
 --   @GHC-87110@.
 module Test.TerrainRuntime.Opacity (spec) where
@@ -74,6 +76,13 @@ spec = describe "Terrain runtime opacity across the package boundary" $ do
         rejectedBecause outcome "GHC-22385"
         clientOutput outcome `shouldContain` "Not in scope: record field"
         clientOutput outcome `shouldContain` name
+
+  forM_ inPlaceOfLease $ \(name, imports, source) →
+    it ("rejects a client that offers " <> name <> " where a request needs an arena lease") $
+      withClient "Client.hs" (clientImporting imports source) $ \compile → do
+        outcome <- compile Typecheck
+        rejectedBecause outcome "GHC-83865"
+        clientOutput outcome `shouldContain` "ArenaLease"
 
   forM_ inspectionUpdates $ \(name, imports, source) →
     it ("rejects a client that rewrites an inspection value through " <> name <> " with record-update syntax") $
@@ -132,6 +141,11 @@ constructors =
   , ("RunningWork", ["import Hetoimasia.Terrain.Runtime (RunningWork (RunningWork))"])
   , ("JobWork", ["import Hetoimasia.Terrain.Runtime (JobWork (JobWork))"])
   , ("PreparationWork", ["import Hetoimasia.Terrain.Runtime (PreparationWork (PreparationWork))"])
+  , -- A regional snapshot, its borrow and their read-only figures.
+    ("RegionSnapshot", ["import Hetoimasia.Terrain.Runtime (RegionSnapshot (RegionSnapshot))"])
+  , ("RegionBorrow", ["import Hetoimasia.Terrain.Runtime (RegionBorrow (RegionBorrow))"])
+  , ("RegionWork", ["import Hetoimasia.Terrain.Runtime (RegionWork (RegionWork))"])
+  , ("RegionalCharge", ["import Hetoimasia.Terrain.Runtime (RegionalCharge (RegionalCharge))"])
   ]
 
 -- | An authority forged by applying a constructor the client never imported.
@@ -147,6 +161,8 @@ forged =
   , ("RunningWork", ["import Hetoimasia.Terrain.Runtime (RunningWork)"], ["forgedWork :: RunningWork", "forgedWork = RunningWork undefined Nothing undefined"])
   , ("JobWork", ["import Hetoimasia.Terrain.Runtime (JobWork)"], ["forgedJob :: JobWork", "forgedJob = JobWork undefined undefined 0 0 1"])
   , ("PreparationWork", ["import Hetoimasia.Terrain.Runtime (PreparationWork)"], ["forgedPreparation :: PreparationWork", "forgedPreparation = PreparationWork undefined Nothing True 0 0 0 0"])
+  , ("RegionSnapshot", ["import Hetoimasia.Terrain.Runtime (RegionSnapshot)"], ["forgedRegions :: RegionSnapshot", "forgedRegions = RegionSnapshot undefined undefined undefined 0 undefined undefined"])
+  , ("RegionBorrow", ["import Hetoimasia.Terrain.Runtime (RegionBorrow)"], ["forgedBorrow :: RegionBorrow", "forgedBorrow = RegionBorrow undefined undefined undefined"])
   ]
 
 -- | A snapshot rewritten through an exported accessor used as a field label.
@@ -155,6 +171,26 @@ recordUpdates =
   [ ("snapshotRevision", ["import Hetoimasia.Terrain.Runtime (Snapshot, snapshotRevision)"], ["newer :: Snapshot -> Snapshot", "newer s = s {snapshotRevision = snapshotRevision s}"])
   , ("snapshotIncarnation", ["import Hetoimasia.Terrain.Runtime (Snapshot, snapshotIncarnation)"], ["other :: Snapshot -> Snapshot", "other s = s {snapshotIncarnation = snapshotIncarnation s}"])
   , ("snapshotGeneration", ["import Hetoimasia.Terrain.Runtime (Snapshot, snapshotGeneration)"], ["later :: Snapshot -> Snapshot", "later s = s {snapshotGeneration = snapshotGeneration s}"])
+  , ("regionSnapshotContentRevision", ["import Hetoimasia.Terrain.Runtime (RegionSnapshot, regionSnapshotContentRevision)"], ["newer :: RegionSnapshot -> RegionSnapshot", "newer s = s {regionSnapshotContentRevision = regionSnapshotContentRevision s}"])
+  , ("regionSnapshotKnowledgeRevision", ["import Hetoimasia.Terrain.Runtime (RegionSnapshot, regionSnapshotKnowledgeRevision)"], ["wiser :: RegionSnapshot -> RegionSnapshot", "wiser s = s {regionSnapshotKnowledgeRevision = regionSnapshotKnowledgeRevision s}"])
+  ]
+
+-- | A regional snapshot or its borrow offered where a request needs an arena lease: a snapshot grants no
+-- authority, so no request, removal or other path accepts one in place of a lease.
+inPlaceOfLease ∷ [(String, [String], [String])]
+inPlaceOfLease =
+  [ ( "a regional borrow to a removal"
+    , ["import Hetoimasia.Terrain.Coordinate (TileCoord)", "import Hetoimasia.Terrain.Runtime"]
+    , ["remove :: Service -> RegionBorrow -> TileCoord -> IO (Either Refused (Pending RemoveAnswer))", "remove svc borrow at = removeAt svc borrow at Nothing"]
+    )
+  , ( "a regional snapshot to a read"
+    , ["import Hetoimasia.Terrain.Coordinate (TileCoord)", "import Hetoimasia.Terrain.Runtime"]
+    , ["know :: Service -> RegionSnapshot -> TileCoord -> IO (Either Refused (Pending KnowledgeAnswer))", "know svc snapshot at = knowledgeAt svc snapshot at"]
+    )
+  , ( "a regional borrow to another snapshot"
+    , ["import Hetoimasia.Terrain.Coordinate (RegionCoord)", "import Hetoimasia.Terrain.Runtime"]
+    , ["again :: Service -> RegionBorrow -> [RegionCoord] -> IO (Either Refused (Pending RegionBorrow))", "again svc borrow regions = requestRegionSnapshot svc borrow regions"]
+    )
   ]
 
 -- | An inspection value rewritten through an exported accessor used as a field label:
