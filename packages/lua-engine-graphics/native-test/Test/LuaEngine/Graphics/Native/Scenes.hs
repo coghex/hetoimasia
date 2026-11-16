@@ -246,7 +246,8 @@ depthHostSpec env = describe depthHostGroup $ do
       loadTexture comp vm "a" "a" "a.png"
       loadTexture comp vm "b" "b" "b.png"
       _ ← run comp vm "a" "publish" "a" (Just "a")
-      _ ← run comp vm "b" "publish" "b" (Just "b")
+      -- each instance names its own window "a"
+      _ ← run comp vm "b" "publish" "a" (Just "b")
       awaitAdopted env resized 1
       awaitAdopted env peer 1
       attachment ← atomically (readTVar attachments >>= maybe retry pure . Map.lookup resized)
