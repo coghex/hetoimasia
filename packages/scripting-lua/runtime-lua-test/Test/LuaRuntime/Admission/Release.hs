@@ -4,8 +4,7 @@
 -- take, and at its next boundary when a provider's thread completed the retirement.
 module Test.LuaRuntime.Admission.Release (spec) where
 
-import Control.Concurrent (forkIO)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVarIO, readTVar, throwSTM)
 import Control.Exception (Exception, ExceptionWithContext (ExceptionWithContext), finally, toException)
 import Control.Monad (when)
@@ -22,6 +21,7 @@ import Hetoimasia.Scripting.Lua.Runtime (LuaRuntime)
 import Hetoimasia.Scripting.Lua.Scheduled
 import Control.Exception (throwIO)
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
+import Test.Support.Owned (withOwnedThread)
 import Test.LuaRuntime.Admission.Support
 import Test.LuaRuntime.Instance.Support (awaitSettled, expectControl, sf)
 import Test.LuaRuntime.Request.Support (answerResult, awaitCancelled, awaitDiagnostic, diagnostics, failWorkWith, finishWork, onSubmit, submissions)
@@ -119,24 +119,28 @@ spec = describe "release points" $ do
       fixture ← newAFix 4
       shared ← newTVarIO (0 ∷ Int)
       shot ← newIORef True
+      go ← newEmptyMVar
+      written ← newEmptyMVar
       firstRuns ← malloc
       secondRuns ← malloc
       flip finally (free firstRuns >> free secondRuns) $ do
         poke firstRuns 0
         poke secondRuns 0
         -- Both credits are given back in the one transaction of the take. The first reads the shared state, so the
-        -- transaction holds that read; the second lets another thread change it, then reads it too.
-        setPolicy fixture (\held → held {polPerInstance = 1, polCredits = [readingCredit shared firstRuns, staleCredit shared shot secondRuns]})
-        withBoundary $ \_ runtime → settleAll fixture $ do
-          owner ← arrival fixture 8 runtime "stale release"
-          admitAdmitter fixture owner "i" "admitter"
-          acommand fixture owner "i" "start" "a"
-          awaitNote fixture "cmd start a started"
-          answerResult (afFake fixture) 0 1 >>= (`shouldBe` ReplySettled)
-          awaitDiagnostic owner ((== 0) . rdWorkPending)
-          acommand fixture owner "i" "take" "a"
-          awaitNote fixture "cmd take a {status=success,value={v=1}}"
-          awaitDiagnostic owner ((== 0) . rdHeld)
+        -- transaction holds that read; the second has another thread change it, then reads it too.
+        setPolicy fixture (\held → held {polPerInstance = 1, polCredits = [readingCredit shared firstRuns, staleCredit shared shot go written secondRuns]})
+        withOwnedThread (takeMVar go >> atomically (modifyTVar' shared (+ 1)) >> putMVar written ()) $ \_ joined → do
+          withBoundary $ \_ runtime → settleAll fixture $ do
+            owner ← arrival fixture 8 runtime "stale release"
+            admitAdmitter fixture owner "i" "admitter"
+            acommand fixture owner "i" "start" "a"
+            awaitNote fixture "cmd start a started"
+            answerResult (afFake fixture) 0 1 >>= (`shouldBe` ReplySettled)
+            awaitDiagnostic owner ((== 0) . rdWorkPending)
+            acommand fixture owner "i" "take" "a"
+            awaitNote fixture "cmd take a {status=success,value={v=1}}"
+            awaitDiagnostic owner ((== 0) . rdHeld)
+          joined
         firstCount ← peek firstRuns
         secondCount ← peek secondRuns
         -- The write made the transaction stale once, so it ran again; each credit's release ran once in each run.
@@ -262,12 +266,12 @@ readingCredit shared runs =
     , creditTransfers = False
     }
 
--- | A credit whose release, the first time it runs, has another thread change the shared state that an
+-- | A credit whose release, the first time it runs, asks another thread to change the shared state that an
 -- earlier release in the same transaction read, then reads it and counts its runs. Past the first run
 -- it allocates nothing, so if its run were repeated against the stale transaction it would never end:
 -- it raises at 'rerunCap' instead.
-staleCredit ∷ TVar Int → IORef Bool → Ptr Int → Credit
-staleCredit shared shot runs =
+staleCredit ∷ TVar Int → IORef Bool → MVar () → MVar () → Ptr Int → Credit
+staleCredit shared shot go written runs =
   Credit
     { creditName = "stale"
     , creditReserve = pure True
@@ -276,8 +280,7 @@ staleCredit shared shot runs =
           first ← readIORef shot
           when first $ do
             writeIORef shot False
-            written ← newEmptyMVar
-            _ ← forkIO (atomically (modifyTVar' shared (+ 1)) >> putMVar written ())
+            putMVar go ()
             takeMVar written
         seen ← readTVar shared
         n ← countRun runs

@@ -10,8 +10,8 @@
 -- 'boundedExample' only stops an example that has already hung.
 module Test.Foundation.Failures.Spec (spec) where
 
-import Control.Concurrent (forkIO, killThread)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar, tryPutMVar)
+import Control.Concurrent (killThread)
+import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, takeMVar, tryPutMVar)
 import Control.Concurrent.STM (STM, TVar, atomically, catchSTM, check, modifyTVar', newTVarIO, orElse, readTVar, readTVarIO, throwSTM, writeTVar)
 import Control.Exception
   ( AsyncException (ThreadKilled)
@@ -703,24 +703,28 @@ staleGuarded catching = do
   shared ← newTVarIO (0 ∷ Int)
   attempts ← newIORef (0 ∷ Int)
   shot ← newIORef True
+  go ← newEmptyMVar
+  written ← newEmptyMVar
   runs ← malloc
-  flip finally (free runs) $ do
-    poke runs 0
-    atomically $ do
-      unsafeIOToSTM (atomicModifyIORef' attempts (\n → (n + 1, ())))
-      readTVar shared >>= \seen → seen `seq` pure ()
-      unsafeIOToSTM (changeOnce shot shared)
-      guardedRead shared runs `catching` \ReranAgainstStale → pure ()
-    (,) <$> readIORef attempts <*> peek runs
+  flip finally (free runs) $
+    -- the other thread commits its change only when the transaction asks for it, and is joined after
+    withOwnedThread (takeMVar go >> atomically (modifyTVar' shared (+ 1)) >> putMVar written ()) $ \_ joined → do
+      poke runs 0
+      atomically $ do
+        unsafeIOToSTM (atomicModifyIORef' attempts (\n → (n + 1, ())))
+        readTVar shared >>= \seen → seen `seq` pure ()
+        unsafeIOToSTM (changeOnce shot go written)
+        guardedRead shared runs `catching` \ReranAgainstStale → pure ()
+      joined
+      (,) <$> readIORef attempts <*> peek runs
 
--- | The first time only: another thread commits a change to the value, and this waits for it.
-changeOnce ∷ IORef Bool → TVar Int → IO ()
-changeOnce shot shared = do
+-- | The first time only: ask the other thread to commit its change, and wait for it.
+changeOnce ∷ IORef Bool → MVar () → MVar () → IO ()
+changeOnce shot go written = do
   first ← readIORef shot
   when first $ do
     writeIORef shot False
-    written ← newEmptyMVar
-    _ ← forkIO (atomically (modifyTVar' shared (+ 1)) >> putMVar written ())
+    putMVar go ()
     takeMVar written
 
 testRestartingStale ∷ Expectation
@@ -786,9 +790,10 @@ testRestartingRetry = do
   flag ← newTVarIO False
   go ← newEmptyMVar
   -- The flag is set only after the transaction has asked for it, so its first attempt finds it unset and retries.
-  _ ← forkIO (takeMVar go >> atomically (writeTVar flag True))
-  answer ← atomically $ do
-    unsafeIOToSTM (void (tryPutMVar go ()))
-    (readTVar flag >>= check >> pure "set")
-      `catchSTMRestarting` \(_ ∷ SomeException) → pure ("handler" ∷ Text)
-  answer `shouldBe` "set"
+  withOwnedThread (takeMVar go >> atomically (writeTVar flag True)) $ \_ joined → do
+    answer ← atomically $ do
+      unsafeIOToSTM (void (tryPutMVar go ()))
+      (readTVar flag >>= check >> pure "set")
+        `catchSTMRestarting` \(_ ∷ SomeException) → pure ("handler" ∷ Text)
+    joined
+    answer `shouldBe` "set"
