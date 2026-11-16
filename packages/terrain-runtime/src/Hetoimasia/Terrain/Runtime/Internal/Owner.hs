@@ -213,6 +213,14 @@ data Work
 -- the parent session's admission, a stop, or a storage job a task waits for.
 nextWork ∷ Service → StopToken → STM Work
 nextWork svc token = do
+  -- ANOTHER CONSUMER OF THE OUTSIDE STAGING ACCOUNT RELEASED OR TOOK BYTES: what the service queued for room is
+  -- tried again. Reading the charge here wakes the owner whenever it changes, and the state every choice below reads
+  -- already carries the wakeup, so the work it selects commits it.
+  forM_ (configStagingAccount (serviceConfig svc)) $ \account → do
+    now <- stagingAccountCharged account
+    seen <- stateAccountSeen <$> readSt svc
+    when (seen /= Just now) $
+      modifySt svc (\s → s {stateAccountSeen = Just now, stateFreed = True, stateDispatchIdle = False})
   st <- readSt svc
   open <- sessionOpen (serviceAdmission svc)
   stopping <- stopRequested token
@@ -231,12 +239,6 @@ nextWork svc token = do
         []
           | closing && stateBorrowers st == 0 && stopping && backedIdle st → pure WStop
           | otherwise → do
-              -- ANOTHER CONSUMER OF THE OUTSIDE STAGING ACCOUNT RELEASED OR TOOK BYTES: what the service queued
-              -- for room is tried again. Reading the charge here wakes the owner whenever it changes.
-              forM_ (configStagingAccount (serviceConfig svc)) $ \account → do
-                now <- stagingAccountCharged account
-                when (stateAccountSeen st /= Just now) $
-                  modifySt svc (\s → s {stateAccountSeen = Just now, stateFreed = True, stateDispatchIdle = False})
               -- THE GRANT IS NOT STARVED BY READS THAT KEEP STARTING: while the slot is free and the first
               -- contender is a transaction that fits now, or waits for credits that pinned reads in flight
               -- hold, no new pinned read starts (no request's gather, no load's dispatch): the wait is bounded

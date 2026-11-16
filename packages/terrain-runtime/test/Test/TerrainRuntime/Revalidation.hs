@@ -5,8 +5,8 @@ import Control.Concurrent.STM
 import Control.Concurrent (yield)
 import Control.Monad (forM, forM_)
 import Data.Word (Word64)
-import Hetoimasia.Terrain.Coordinate (RegionCoord (..))
-import Hetoimasia.Terrain.Residency (ArenaId (..), Bank (StagingBank), Ledger (..), RegionDemand (..), Revision (..), bankLedger, coverageBox, modelRegions, regionCoord)
+import Hetoimasia.Terrain.Coordinate (RegionCoord (..), decomposeTile)
+import Hetoimasia.Terrain.Residency (ArenaId (..), Bank (StagingBank), JobPhase (..), Ledger (..), RegionDemand (..), Revision (..), bankLedger, coverageBox, coverageTile, jobPhase, modelJobs, modelRegions, modelViews, regionCoord, viewPending)
 import Hetoimasia.Terrain.Runtime
 import Hetoimasia.Terrain.Runtime.Settlement
 import Test.Hspec
@@ -206,6 +206,42 @@ spec = describe "Superseded work and ordering" $ do
       closeView svc view
       atomically (stagingUse <$> inspectModelSTM svc) >>= (`shouldSatisfy` (< used1))
       settleChecks svc
+
+  it "retries pending camera demand when another consumer releases the shared account, with no other event" $ do
+    held <- newTVarIO (0 ∷ Word64)
+    refusals <- newTVarIO (0 ∷ Int)
+    let limit = 64 * 1024 * 1024
+        counted =
+          (accountOver held limit)
+            { stagingAccountReserve = \wanted → readTVar held >>= \now →
+                if wanted > limit - now then False <$ modifyTVar' refusals (+ 1) else True <$ writeTVar held (now + wanted)
+            }
+    withService (tightConfig (2, 1, 2) 0 4096) {configStagingAccount = Just counted} $ \svc → do
+      (client, lease) <- openMain svc "main"
+      view <- okOf (openView svc client)
+      let oneCellOf (x, z) = let (area, local) = decomposeTile (tile x 0 z) in RegionDemand area (coverageTile local)
+          heldCells = [(0, 0), (16, 0)]
+          wanted = [oneCellOf (x, z) | x ← [32, 48, 64, -16, -32, -48, 80, 96], z ← [0, 32]]
+          pendingNow = concatMap viewPending . modelViews <$> inspectModelSTM svc
+      forM_ heldCells $ \(x, z) → readCell svc lease (tile x 0 z)
+      let heldRegions = [fst (decomposeTile (tile x 0 z)) | (x, z) ← heldCells]
+      (other, refusedBefore) <- withSnapshot svc lease heldRegions (\_ → do
+        _ <- okOf (setViewDemand svc view lease wanted)
+        bounded (atomically (inspectModelSTM svc >>= \m → check (null [() | j ← modelJobs m, jobPhase j /= JobQueued && jobPhase j /= JobWaiting])))
+        atomically pendingNow >>= (`shouldSatisfy` (not . null))
+        -- another consumer takes all the account's room before the borrow ends
+        atomically $ do
+          now <- readTVar held
+          writeTVar held limit
+          (,) (limit - now) <$> readTVar refusals)
+        >>= either (fail . show) pure
+      -- the borrow's end makes the owner retry; the account refuses the pending regions' admission
+      bounded (atomically (readTVar refusals >>= check . (> refusedBefore)))
+      atomically pendingNow >>= (`shouldSatisfy` (not . null))
+      -- the other consumer releases; nothing else happens, and the owner admits what was pending
+      atomically (modifyTVar' held (subtract other))
+      bounded (atomically (pendingNow >>= check . null))
+      inspectDefects svc >>= (`shouldBe` [])
 
   it "re-prepares an edit that another edit overtook and commits both in admission order" $
     withService defaultConfig $ \svc → do
