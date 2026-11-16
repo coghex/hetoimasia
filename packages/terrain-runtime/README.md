@@ -74,7 +74,13 @@ neither is a settlement. There is **one** winner. The success settlement is
 delivered in the same transaction that applies the content change and advances the
 revision, and that same transaction is the only place cancellation, the parent
 session's admission and the arena's closure are decided against it. Do not run an
-ordinary IO completion after a commit and call that atomic. A callback that throws
+ordinary IO completion after a commit and call that atomic. What does not depend on the
+race is prepared before it, outside every transaction, so the commit's transaction does not grow
+with a definition or an answer: the owner interns an open's materials into its palette before it
+stages the open, and, for a host that prepares a staged answer's settlement (`endpointPrepare`, a
+pure function of the answer and of what the host fixed at admission, never of state that can
+change before the commit), evaluates it before staging the answer, so the arbitration runs the
+prepared transaction in place of `endpointSettle`. A callback that throws
 is a provider defect: the transaction is abandoned with nothing committed, the
 request ends without a second call into the host, and the defect reaches
 supervision (the owner ends).
@@ -187,10 +193,16 @@ model itself. The registered clients are bounded too (`configMaxClients`, 256).
 
 Removing air is a no-op: `changed = false` and the unchanged revision. A removal
 whose staged revision was superseded is recomputed against the current revision and
-committed in order; it is not rejected. A supplied content precondition (the
-incarnation plus the committed revision a displayed view was built from) that
-differs from the arena's current state answers `stale_view`, even for a cell already
-air, with nothing changed.
+committed in order; it is not rejected. A supplied precondition (the incarnation
+plus the committed content revision a displayed view was built from, optionally its
+knowledge revision, and optionally the holder's guard) that no longer holds answers
+`stale_view`, even for a cell already air, with nothing changed. Admission judges the
+revisions; the decision judges them again with the guard, in the transaction that
+commits (`preconditionStale`). A guard (`PreconditionGuard`) is the holder's own
+transaction, a pure read that never waits (one that retries is read as not holding),
+with an identity for equality and display; it carries nothing of the holder into the
+service. A terrain view's pick guards that the view still holds its target and that the
+revision it was picked from is still the one adopted.
 
 **Ordering.** Among the eligible commands of one arena the owner commits in
 admission order. A command that is not yet eligible does not hold up the others; a
@@ -485,14 +497,14 @@ the stores only after the borrowers finish.
 | Duplicate name | `NameInUse` (settled) |
 | Absent name, or a pending open, on attach | `NotFound` (settled) |
 | Arena incarnation closed, through a well-formed lease | `ArenaClosed` (settled), no work admitted |
-| Stale content precondition | `StaleView` (settled), nothing changed |
+| Stale precondition: incarnation, content or knowledge revision, or a guard that does not hold at the decision | `StaleView` (settled), nothing changed |
 | Invalid source definition | `Definition` (settled), no name claimed |
 | Column answer over 1,024 runs | `TooLarge` (settled), never truncated |
 | Column range over 8,192 levels (refused in constant time, before any region is enumerated), a name that is empty or over 256 characters, a borrow naming more regions than a hold may, coordinates outside the extent | `RefusedInvalid` before admission |
 | A regional snapshot naming no region, a region twice, a region of unsupported coordinates or more regions than a hold may | `RefusedInvalid` before admission |
 | A page a regional snapshot's build needs fails or reads back invalid | The parts that needed it `PartUnavailable` (never air, fog or the source), the arena paused for the cause as for any read, the snapshot settled; other regions unaffected |
 | Forged, foreign, released or wrong-service authority | `RefusedAuthority` before admission |
-| Bank, slot, arena, lease or view cap | `RefusedBusy`, nothing created |
+| Bank, slot, arena, lease or view cap; an outside staging account that cannot take a step's increase | `RefusedBusy`, nothing created |
 | An identity, or a content, knowledge or store revision, that would wrap | `RefusedExhausted` before admission; internal work whose next commit would wrap stops |
 | The arena's allowance cannot take the next transaction beside the protected reserve; a page write or read fails; a page reads back invalid | `storage_full` / `storage_io` / `storage_integrity`: the arena pauses for that cause, its uncommitted removals settle with it and new ones at once while it holds, its committed terrain stays readable, other arenas continue; growth clears only `storage_full`, an explicit retry re-tests the recorded pages (a read again, a write by a probe it abandons) and clears, at its own publication, what it verified, and no failed removal is ever repeated |
 | An open on an unqualified filesystem; a reservation that fails; a source past a compile bound | `storage_unsupported` / `reservation_failed` / `source_complexity` (settled), nothing published, the name released |
@@ -523,6 +535,28 @@ of connectivity plus 32 bytes per node: 18 MiB) plus one compilation's 48 MiB pe
 for four arenas, and a configuration it cannot hold is refused. A source the compiler
 accepted before can now be refused at that bound: a column of 1,024 one-level patches two
 levels apart compiles to 16,777,224 bytes and is `source_complexity`.
+**An outside staging account.** With `configStagingAccount` set (a terrain-enabled
+composition gives the session's one CPU render/staging account), every step of the
+accounting model charges the account the change it made to the model's staging use
+(occupied plus reserved), in the step's own transaction (`applyEvent`): an increase the
+account cannot reserve refuses the step as the model's own full staging bank would
+(`RefusedBusy`, nothing changed); a decrease is returned. The model, its admission order
+and its invariants are unchanged; an explicit request stays one all-or-nothing unit, and a
+camera demand is refused whole while the account rather than the model is the binding
+limit (its holder sends it again). A step that raises nothing (clearing or withdrawing
+a demand, closing a view, releasing a hold or borrow, a job, victim or commit report) is
+never refused by the account. The owner's wait reads the account's charge, so a
+release by another consumer wakes queued work. The snapshot backing bank
+(`configRetainedBytes`), which the ports charge outside the model's steps (snapshot
+backing, regional snapshot reservations and footprints, request result records), is held
+in the account as a fixed carve-out for the service's whole life: reserved in one
+transaction before anything starts, or the service is refused (`ConfigStagingAccount`)
+with nothing started and nothing reserved, and returned after the drain. So the model's
+staging and the backing bank together never exceed what the account granted, and a
+regional snapshot is never funded outside it. The rest of what the service holds is
+returned after its drain. Without an account the service keeps its internal bank and
+charges nothing outside.
+
 The service adds the approved caps of four arenas, 64 arena leases and eight views,
 a snapshot backing bank carved from the staging bank (see Snapshots; a regional snapshot names at most
 `specHoldRegions` regions and is charged there too),
