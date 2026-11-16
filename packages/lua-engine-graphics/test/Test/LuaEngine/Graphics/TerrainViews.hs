@@ -61,7 +61,7 @@ import Hetoimasia.Terrain.Coordinate (RegionCoord (..), TileCoord (..), axisFrom
 import qualified Hetoimasia.Terrain.Render2D.Camera as Camera
 import Hetoimasia.Terrain.Render2D.AtlasFixtures (AtlasStyle, findSampleDirectory, loadAtlasStyle)
 import qualified Hetoimasia.Terrain.Render2D.AtlasFixtures as Fixtures
-import Hetoimasia.Terrain.Render2D.Cells (CellConfig (..), CellKey (..), CellPlan, PartKind (..), cellPlanQuads, defaultCellConfig, quadKey, quadPart)
+import Hetoimasia.Terrain.Render2D.Cells (CellConfig (..), CellKey (..), CellPlan, PartKind (..), cellPlanQuads, quadKey, quadPart)
 import Hetoimasia.Terrain.Render2D.Presentation (defaultLightInput)
 import Hetoimasia.Terrain.Runtime
   ( ArenaLease
@@ -656,7 +656,7 @@ stages = describe "stages and the owner" $ do
     reopened ← newTVarIO False
     -- the holds open when the service stops, so a failing example still ends
     let openAll = atomically (writeTVar opened True >> writeTVar reopened True)
-    withViewsConfig testConfig {tvStepsPerQuantum = 1, tvCellConfig = defaultCellConfig {ccDepth = 250}, tvOnStage = seamHook seam, tvStopping = openAll} $ \v → do
+    withViewsConfig testConfig {tvStepsPerQuantum = 1, tvCellConfig = (viewCells 250), tvOnStage = seamHook seam, tvStopping = openAll} $ \v → do
       modelWindow (vModel v) 3
       third ← attached v 3
       _ ← awaitPublished v 3
@@ -823,7 +823,7 @@ eviction = describe "eviction" $ do
       closeView view
 
   it "keeps every region of the view's visible demand resident while another holder's demand evicts others, the far background included" $
-    withViewsTerrain HostFirst (tightTerrainHolding 64) pillarOverStripes testConfig {tvCellConfig = defaultCellConfig {ccDepth = 250}} $ \v → do
+    withViewsTerrain HostFirst (tightTerrainHolding 64) pillarOverStripes testConfig {tvCellConfig = (viewCells 250)} $ \v → do
       view ← attached v 1
       _ ← awaitPublished v 1
       quiescent v
@@ -1079,7 +1079,7 @@ lifecycle = describe "close orders and limits" $ do
       closeView view
 
   it "demands, retains and draws a lower background far outside the camera's radius but inside the projected viewport" $
-    withViewsOn pillarOverPlain testConfig {tvCellConfig = defaultCellConfig {ccDepth = 250}} $ \v → do
+    withViewsOn pillarOverPlain testConfig {tvCellConfig = (viewCells 250)} $ \v → do
       view ← attached v 1
       _ ← awaitPublished v 1
       Just (visible, _) ← atomically (viewDemand view)
@@ -1432,8 +1432,12 @@ withViewsTerrain order terrainConfig source config body = do
 
 -- Small enough for a quick example: a 128 x 96 target and a 30-level band, which reaches the surface below the followed
 -- camera's 25 levels of headroom.
+-- The views' own cell configuration (their step bound included) with this band depth.
+viewCells ∷ Integer → CellConfig
+viewCells depth = (tvCellConfig defaultTerrainViewsConfig) {ccDepth = depth}
+
 testConfig ∷ TerrainViewsConfig
-testConfig = defaultTerrainViewsConfig {tvCellConfig = defaultCellConfig {ccDepth = 30}}
+testConfig = defaultTerrainViewsConfig {tvCellConfig = (viewCells 30)}
 
 metrics ∷ TargetMetrics
 metrics = TargetMetrics (PixelExtent 128 96) (PixelExtent 128 96) 1 1

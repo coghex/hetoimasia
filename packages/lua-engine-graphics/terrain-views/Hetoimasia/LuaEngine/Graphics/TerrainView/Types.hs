@@ -51,7 +51,7 @@ import Hetoimasia.Render.TwoD.Snapshot (ClearColour (..))
 import Hetoimasia.Terrain.Changes (ChangeLimits (..))
 import Hetoimasia.Terrain.Coordinate (AxisCoord, TileCoord)
 import Hetoimasia.Terrain.Render2D.Camera (CameraConfig, Command, defaultCameraConfig)
-import Hetoimasia.Terrain.Render2D.Cells (CellConfig, PartKind, defaultCellConfig)
+import Hetoimasia.Terrain.Render2D.Cells (CellConfig (..), CellLimits (..), PartKind, defaultCellConfig)
 import Hetoimasia.Terrain.Render2D.Presentation (LightInput)
 import Hetoimasia.Terrain.Residency (ArenaId, Revision)
 import Hetoimasia.Terrain.Runtime (ArenaLease)
@@ -103,7 +103,9 @@ defaultTerrainViewsConfig =
     { tvMaxViews = 8
     , tvCpuPins = 2
     , tvGpuBytes = terrainGpuBankBytes
-    , tvCellConfig = defaultCellConfig
+    , -- a step evaluates at most 2,048 levels (and finishes its column), so what one quantum can add to a plan is small
+      -- enough to charge to the account before it is made
+      tvCellConfig = defaultCellConfig {ccLimits = (ccLimits defaultCellConfig) {clStepLevels = 2048}}
     , tvCameraConfig = defaultCameraConfig
     , tvChangeLimits = ChangeLimits 1048576
     , tvStepsPerQuantum = 4

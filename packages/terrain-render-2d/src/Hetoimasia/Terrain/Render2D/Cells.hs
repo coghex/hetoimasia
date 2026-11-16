@@ -143,6 +143,7 @@ module Hetoimasia.Terrain.Render2D.Cells
   , stepCells
   , cellPlanOf
   , cellPrepProgress
+  , cellPrepSize
   , planCells
   ) where
 
@@ -330,6 +331,11 @@ cellPlanStats = cpStats
 -- | Where a preparation stands.
 cellPrepProgress ∷ CellPrep → Progress
 cellPrepProgress = cellProgressOf
+
+-- | What a preparation holds so far: its admitted quads and its pending spans. Read-only, so a caller can account for
+-- what each step adds.
+cellPrepSize ∷ CellPrep → (Int, Int)
+cellPrepSize prep = (prCount prep, prPendCount prep)
 
 -- | Prepare to completion or to a plan-wide bound: start, then step until
 -- settled or halted, and return the plan. Equivalent to the stepwise path.

@@ -139,7 +139,11 @@ import Hetoimasia.Terrain.Render2D.Cells
   , cellPlanIdentity
   , cellPlanOf
   , cellPlanPending
+  , cellPlanQuads
   , cellPrepProgress
+  , cellPrepSize
+  , CellConfig (..)
+  , CellLimits (..)
   , quadKey
   , startCells
   , stepCells
@@ -192,6 +196,9 @@ data TerrainViews k = TerrainViews
     -- ^ Whether the service's end ran to completion (on the worker, or on the scope's exit when the worker was cancelled).
   , svOrphans ∷ !(TVar [Orphan])
     -- ^ Builds a closed or superseded preparation left in flight: collected by the retirements when they answer.
+  , svRetiringCpu ∷ !(TVar Word64)
+    -- ^ What the service holds of the account for retiring regions' CPU descriptions and builds left in flight, moved
+    -- from their views' charges; returned as each release is answered, and at the service's end.
   }
 
 data Request k
@@ -201,6 +208,9 @@ data Request k
 data Retiring = Retiring
   { rtChunk ∷ !ChunkRef
   , rtBytes ∷ !Word64
+  , rtCpu ∷ !Word64
+    -- ^ Its CPU description's bytes (the region's instances and records, and the renderer registry's copy), held in the
+    -- service's charge of the account until its release is answered.
   , rtState ∷ !RetireState
   }
 
@@ -343,6 +353,7 @@ withTerrainViews config ports body = do
       <*> newTVarIO 0
       <*> newTVarIO False
       <*> newTVarIO []
+      <*> newTVarIO 0
   done ← newEmptyMVar
   mask $ \restore → do
     _ ← forkIOWithUnmask $ \unmask →
@@ -683,6 +694,7 @@ readView (TerrainView service state) = do
   stopped ← isJust <$> readTVar (vsRetry state)
   staged ← readTVar (vsStage state) <&> \case
     StageCopying _ copying → isJust (cpWait copying)
+    StagePlanning _ planning → isJust (plWait planning)
     StageBuilding _ building → isNothing (bdTicket building)
     _ → False
   let waiting = stopped || staged
@@ -758,7 +770,8 @@ runClose service state = do
     forM_ (Set.toList (styleIdentities (vsStyle state))) (ledgerDropInterest (portLedger ports))
     regions ← readTVar (vsRegions state)
     writeTVar (vsRegions state) Map.empty
-    modifyTVar' (svRetiring service) (<> [Retiring (rgChunk region) (rgBytes region) RetireUnasked | region ← Map.elems regions])
+    modifyTVar' (svRetiring service) (<> [Retiring (rgChunk region) (rgBytes region) (regionCpu region) RetireUnasked | region ← Map.elems regions])
+    moveToService service state (sum (map regionCpu (Map.elems regions)))
     writeTVar (vsPins state) Map.empty
     held ← readTVar (vsAccountHeld state)
     when (held > 0) (accountRelease (portAccount ports) held)
@@ -893,7 +906,11 @@ shutdown service = do
   queued ← atomically (readTVar (svRequests service) <* writeTVar (svRequests service) [])
   settleQueued queued
   drain
-  atomically (writeTVar (svShutDown service) True)
+  -- what the service still holds for retiring regions (kept as evidence, or left by an owner that ended) returns now that
+  -- nothing can use it
+  atomically $ do
+    returnFromService service maxBound
+    writeTVar (svShutDown service) True
   where
     drain = do
       remaining ← atomically ((\r o → not (null r && null o)) <$> readTVar (svRetiring service) <*> readTVar (svOrphans service))
@@ -955,14 +972,19 @@ retireStep service = do
     orTicket o >>= \case
       Nothing → pure [o]
       Just (Answered (Right chunks)) | length chunks == length (orBytes o) → do
-        modifyTVar' (svRetiring service) (<> [Retiring chunk bytes RetireMet | (chunk, bytes) ← zip chunks (orBytes o)])
+        modifyTVar' (svRetiring service) (<> [Retiring chunk bytes cpu RetireMet | (chunk, bytes, cpu) ← zip3 chunks (orBytes o) (orCpu o)])
         modifyTVar' (svGpu service) (subtract (orGpu o - sum (orBytes o)))
         pure []
       Just (Answered (Right chunks)) → do
         recordFailureSTM service "a build left in flight answered another number of regions than asked"
-        modifyTVar' (svRetiring service) (<> [Retiring chunk 0 RetireMet | chunk ← chunks])
+        modifyTVar' (svRetiring service) (<> [Retiring chunk 0 0 RetireMet | chunk ← chunks])
         pure []
-      Just _ → [] <$ (modifyTVar' (svGpu service) (subtract (orGpu o)) >> modifyTVar' (svReleases service) (+ 1))
+      Just _ → do
+        -- it built nothing: its GPU bytes and the CPU it would have described return
+        modifyTVar' (svGpu service) (subtract (orGpu o))
+        returnFromService service (sum (orCpu o))
+        modifyTVar' (svReleases service) (+ 1)
+        pure []
   writeTVar (svOrphans service) stillOut
   retiring ← readTVar (svRetiring service)
   laneRoom ← ownerReleaseRoom owner
@@ -996,6 +1018,7 @@ retireStep service = do
           left = [r' | Next r' ← stepped]
       unless (null released) $ do
         modifyTVar' (svGpu service) (subtract (sum (map rtBytes released)))
+        returnFromService service (sum (map rtCpu released))
         modifyTVar' (svReleases service) (+ 1)
       -- the chunks now releasable, released in one action when the owner has room
       room ← ownerRoom owner
@@ -1069,6 +1092,10 @@ data Planning = Planning
   { plCopies ∷ !CopySet
   , plInputs ∷ !CellInputs
   , plPrep ∷ !CellPrep
+  , plBase ∷ !Word64
+    -- ^ The stage's charge before planning: the copies and the inputs made from them.
+  , plWait ∷ !(Maybe Mark)
+    -- ^ The account could not hold the next quantum's growth: it is asked again once something is released.
   }
 
 data Building = Building
@@ -1096,6 +1123,7 @@ data Orphan = Orphan
   { orTicket ∷ !(Ticket (Either BuildFailure [ChunkRef]))
   , orGpu ∷ !Word64
   , orBytes ∷ ![Word64]
+  , orCpu ∷ ![Word64]
   }
 
 -- Whether the view's stage can take a step now (an idle view: whether it has work).
@@ -1111,7 +1139,11 @@ stepReady service state =
           (Just (_, pending), _) → settled pending
           (Nothing, Just mark) → (/= mark) <$> retryMark service state
           (Nothing, Nothing) → pure True
-    StagePlanning _ _ → pure True
+    StagePlanning prep planning → do
+      stale ← superseded state prep
+      case plWait planning of
+        Just mark | not stale → (/= mark) <$> retryMark service state
+        _ → pure True
     StageBuilding prep building → do
       stale ← superseded state prep
       if stale
@@ -1215,9 +1247,19 @@ abandonStage service state = do
         Just (Left _) → pure ()
         Nothing → void (Runtime.cancelPending terrain pending)
     StageBuilding _ building → atomically $ case bdTicket building of
-      Just ticket → modifyTVar' (svOrphans service) (<> [Orphan ticket (bdGpu building) [fromIntegral (length instances) * 64 | (instances, _) ← Map.elems (bdWanted building)]])
+      Just ticket → do
+        let wanted = Map.elems (bdWanted building)
+            cpus = [wantedCpu instances records | (instances, records) ← wanted]
+        modifyTVar' (svOrphans service) (<> [Orphan ticket (bdGpu building) [fromIntegral (length instances) * instanceBytes | (instances, _) ← wanted] cpus])
+        -- the CPU it will describe moves out of the stage's charge into the service's
+        modifyTVar' (vsStageCharge state) (\c → c - min c (sum cpus))
+        moveToService service state (sum cpus)
       Nothing → modifyTVar' (svGpu service) (subtract (bdGpu building)) >> modifyTVar' (svReleases service) (+ 1)
-    StageUploading _ uploading → atomically (retireFresh service (upFresh uploading))
+    StageUploading _ uploading → atomically $ do
+      retireFresh service (upFresh uploading)
+      let cpus = sum (map regionCpu (Map.elems (upFresh uploading)))
+      modifyTVar' (vsStageCharge state) (\c → c - min c cpus)
+      moveToService service state cpus
     _ → pure ()
   atomically $ do
     writeTVar (vsStageCharge state) 0
@@ -1226,7 +1268,7 @@ abandonStage service state = do
 
 -- Built chunks no revision listed retire with no barrier; their GPU bytes stay charged until each is released.
 retireFresh ∷ TerrainViews k → Map (Integer, Integer) Region → STM ()
-retireFresh service fresh = modifyTVar' (svRetiring service) (<> [Retiring (rgChunk r) (rgBytes r) RetireMet | r ← Map.elems fresh])
+retireFresh service fresh = modifyTVar' (svRetiring service) (<> [Retiring (rgChunk r) (rgBytes r) (regionCpu r) RetireMet | r ← Map.elems fresh])
 
 startPreparation ∷ (Ord k, Show k) ⇒ TerrainViews k → ViewState k → IO ()
 startPreparation service state = do
@@ -1319,23 +1361,61 @@ stepCopying service state prep copying = case cpPending copying of
         Right copies → toPlanning service state prep copies
 
 toPlanning ∷ (Ord k, Show k) ⇒ TerrainViews k → ViewState k → Prep → CopySet → IO ()
-toPlanning service state prep copies =
-  case planInputs (tvChangeLimits (svConfig service)) copies of
-    Left why → failed ("the view's inputs could not be made: " <> Text.pack (show why))
-    Right (facts, knowledge) → do
-      camera ← settleCamera service state facts
-      let inputs = CellInputs (CellRequest (factsVersions facts) camera (setupFor (prpMetrics prep)) (tvCellConfig (svConfig service))) facts knowledge (styleAssets (vsStyle state))
-      case startCells inputs of
-        Left why → failed ("the plan could not start: " <> Text.pack (show why))
-        Right cellPrep → enter service state (StagePlanning prep (Planning copies inputs cellPrep))
+toPlanning service state prep copies = do
+  -- the inputs are charged before they are made: a copied region's facts and knowledge at most its own record
+  let inputs = inputsPerRegion * fromIntegral (Set.size (prpRegions prep))
+  charged ← atomically (growStage service state inputs)
+  if not charged
+    then abandonStage service state >> finish service state Retry' (Just prep)
+    else case planInputs (tvChangeLimits (svConfig service)) copies of
+      Left why → failed ("the view's inputs could not be made: " <> Text.pack (show why))
+      Right (facts, knowledge) → do
+        camera ← settleCamera service state facts
+        let cellInputs = CellInputs (CellRequest (factsVersions facts) camera (setupFor (prpMetrics prep)) (tvCellConfig (svConfig service))) facts knowledge (styleAssets (vsStyle state))
+        base ← readTVarIO (vsStageCharge state)
+        case startCells cellInputs of
+          Left why → failed ("the plan could not start: " <> Text.pack (show why))
+          Right cellPrep → enter service state (StagePlanning prep (Planning copies cellInputs cellPrep base Nothing))
   where
     failed why = recordFailure service why >> abandonStage service state >> finish service state Retry' (Just prep)
 
+-- Grow the stage's charge by these bytes, covered by the account: 'False' (and nothing changed) when it cannot.
+growStage ∷ TerrainViews k → ViewState k → Word64 → STM Bool
+growStage service state bytes = do
+  before ← readTVar (vsStageCharge state)
+  writeTVar (vsStageCharge state) (before + bytes)
+  ok ← recharge service state
+  unless ok (writeTVar (vsStageCharge state) before)
+  pure ok
+
+-- The most one quantum can add to a plan: each step evaluates at most the step's levels and finishes the column it is
+-- in (whose levels are bounded by the band), each level at most two quads, and a step adds at most so many pending spans;
+-- and never more than the copied regions' cells can give, two quads a cell.
+quantumBound ∷ TerrainViewsConfig → Int → Word64
+quantumBound config regions =
+  let steps = fromIntegral (max 1 (tvStepsPerQuantum config))
+      levels = fromIntegral (clStepLevels (ccLimits (tvCellConfig config))) + 512
+      perSteps = steps * (levels * 2 * quadBytes + 64 * pendingBytes)
+      perCells = fromIntegral regions * 16 * 16 * 32 * 2 * quadBytes
+   in min perSteps perCells
+
 stepPlanning ∷ (Ord k, Show k) ⇒ TerrainViews k → ViewState k → Prep → Planning → IO ()
 stepPlanning service state prep planning = case cellPrepProgress (plPrep planning) of
-  Working → case steps (max 1 (tvStepsPerQuantum (svConfig service))) (plPrep planning) of
-    Left why → failed ("a plan step failed: " <> Text.pack (show why))
-    Right next → enter service state (StagePlanning prep planning {plPrep = next})
+  Working → do
+    -- the quantum's growth is charged before it is made, then the charge is set to what the plan now holds
+    mark ← atomically (retryMark service state)
+    charged ← atomically $ do
+      writeTVar (vsStageCharge state) (plBase planning + prepHeld (plPrep planning))
+      growStage service state (quantumBound (svConfig service) (Set.size (prpRegions prep)))
+    if not charged
+      then enter service state (StagePlanning prep planning {plWait = Just mark})
+      else case steps (max 1 (tvStepsPerQuantum (svConfig service))) (plPrep planning) of
+        Left why → failed ("a plan step failed: " <> Text.pack (show why))
+        Right next → do
+          atomically $ do
+            writeTVar (vsStageCharge state) (plBase planning + prepHeld next)
+            void (recharge service state)
+          enter service state (StagePlanning prep planning {plPrep = next, plWait = Nothing})
   _ → case cellPlanOf (plInputs planning) (plPrep planning) of
     Left why → failed ("the plan could not finish: " <> Text.pack (show why))
     Right plan → do
@@ -1347,7 +1427,11 @@ stepPlanning service state prep planning = case cellPrepProgress (plPrep plannin
           prefetch = regionsOf (cdPrefetch demand)
           missing = (Set.fromList visible <> jumpDemand) `Set.difference` prpRegions prep
       if not (Set.null missing) && prpRounds prep > 1
-        then
+        then do
+          -- the next round keeps the copies taken and makes the inputs again; the plan made here is dropped
+          atomically $ do
+            writeTVar (vsStageCharge state) (plBase planning - min (plBase planning) (inputsPerRegion * fromIntegral (Set.size (prpRegions prep))))
+            void (recharge service state)
           enter service state . StageCopying prep {prpRegions = prpRegions prep <> missing, prpRounds = prpRounds prep - 1} $
             Copying (copySnapshots (plCopies planning)) (batchesOf service (Set.toList missing)) Nothing Nothing
         else do
@@ -1355,45 +1439,51 @@ stepPlanning service state prep planning = case cellPrepProgress (plPrep plannin
           -- regions it shows, background far from the camera included, stay protected from eviction.
           setDemand service state (Set.toList (prpRegions prep <> Set.fromList visible)) prefetch
           atomically (writeTVar (vsPending state) (length (cellPlanPending plan)))
-          light ← readTVarIO (vsLight state)
-          let style = vsStyle state
-          case adaptCells (styleTextures style) light (styleAssets style) plan of
-            Left why → failed ("the plan could not be adapted: " <> Text.pack (show why))
-            Right adapted → toBuilding service state prep (plCopies planning) plan adapted
+          -- the plan's own size, then the adaptation, the regions' instances and records and the renderer's copies of
+          -- them, all charged before they are made
+          let quads = length (cellPlanQuads plan)
+              held = planHeld quads (length (cellPlanPending plan))
+              adaptation = fromIntegral quads * (adaptedPerQuad + 2 * instanceBytes)
+          charged ← atomically $ do
+            writeTVar (vsStageCharge state) (plBase planning + held)
+            void (recharge service state)
+            growStage service state adaptation
+          if not charged
+            then abandonStage service state >> finish service state Retry' (Just prep)
+            else do
+              light ← readTVarIO (vsLight state)
+              let style = vsStyle state
+              case adaptCells (styleTextures style) light (styleAssets style) plan of
+                Left why → failed ("the plan could not be adapted: " <> Text.pack (show why))
+                Right adapted → toBuilding service state prep (plCopies planning) plan adapted held
   where
     failed why = recordFailure service why >> abandonStage service state >> finish service state Retry' (Just prep)
     steps 0 cellPrep = Right cellPrep
     steps n cellPrep = case cellPrepProgress cellPrep of
       Working → stepCells (plInputs planning) cellPrep >>= steps (n - 1 ∷ Int)
       _ → Right cellPrep
+    prepHeld cellPrep = let (quads, pending) = cellPrepSize cellPrep in planHeld quads pending
 
--- Group the plan into regions, reserve the GPU bytes of those it must build and the CPU bytes of the candidate, then
--- submit the build (or, with nothing to build, go straight to publication).
-toBuilding ∷ (Ord k, Show k) ⇒ TerrainViews k → ViewState k → Prep → CopySet → CellPlan → Adapted → IO ()
-toBuilding service state prep copies plan adapted = do
+-- Group the plan into regions and reserve the GPU bytes of those it must build (their CPU bytes were charged before the
+-- adaptation), then submit the build (or, with nothing to build, go straight to publication).
+toBuilding ∷ (Ord k, Show k) ⇒ TerrainViews k → ViewState k → Prep → CopySet → CellPlan → Adapted → Word64 → IO ()
+toBuilding service state prep copies plan adapted held = do
   let groups = regionGroups (svMaterial service) adapted
   existing ← readTVarIO (vsRegions state)
   let reused = Map.mapMaybe id (Map.intersectionWith (\region (instances, records) → if rgInstances region == instances && rgRecords region == records then Just region else Nothing) existing groups)
       wanted = Map.difference groups reused
-      gpuNeed = sum [fromIntegral (length instances) * 64 | (instances, _) ← Map.elems wanted]
-      cpuNeed = planBytes adapted
+      gpuNeed = sum [fromIntegral (length instances) * instanceBytes | (instances, _) ← Map.elems wanted]
   reserved ← atomically $ do
     charged ← readTVar (svGpu service)
     if gpuNeed > tvGpuBytes (svConfig service) - min (tvGpuBytes (svConfig service)) charged
       then pure False
-      else do
-        before ← readTVar (vsStageCharge state)
-        writeTVar (vsStageCharge state) (before + cpuNeed)
-        cpu ← recharge service state
-        if cpu
-          then True <$ writeTVar (svGpu service) (charged + gpuNeed)
-          else False <$ writeTVar (vsStageCharge state) before
+      else True <$ writeTVar (svGpu service) (charged + gpuNeed)
   if not reserved
     then abandonStage service state >> finish service state Retry' (Just prep)
     else
       if Map.null wanted
-        then enter service state (StageUploading prep (Uploading plan adapted copies reused Map.empty cpuNeed))
-        else submitBuild service state prep (Building plan adapted copies reused wanted gpuNeed cpuNeed Nothing)
+        then enter service state (StageUploading prep (Uploading plan adapted copies reused Map.empty held))
+        else submitBuild service state prep (Building plan adapted copies reused wanted gpuNeed held Nothing)
 
 submitBuild ∷ (Ord k, Show k) ⇒ TerrainViews k → ViewState k → Prep → Building → IO ()
 submitBuild service state prep building = do
@@ -1427,7 +1517,7 @@ stepBuilding service state prep building = case bdTicket building of
                 enter service state (StageUploading prep (Uploading (bdPlan building) (bdAdapted building) (bdCopies building) (bdReused building) fresh (bdCpu building)))
             | otherwise → do
                 recordFailure service "the owner built another number of regions than asked"
-                atomically (modifyTVar' (svRetiring service) (<> [Retiring chunk 0 RetireMet | chunk ← chunks]))
+                atomically (modifyTVar' (svRetiring service) (<> [Retiring chunk 0 0 RetireMet | chunk ← chunks]))
                 abandonStage service state >> finish service state Retry' (Just prep)
           Answered (Left (BuildPressure _)) → abandonStage service state >> finish service state Retry' (Just prep)
           Answered (Left (BuildFailed why)) → do
@@ -1604,13 +1694,18 @@ publishPlan service state prep uploading = do
               writeTVar (vsPublished state) (Just revision)
               -- the candidate's CPU charge becomes the pin's, and the stage holds nothing more
               modifyTVar' (vsPins state) (Map.insert revision (Pinned plan metrics (copyArena copies) (copyContent copies) (copyKnowledge copies) (copyGeneration copies) (upCpu uploading)))
+              -- the stage's charge ends: the pin holds the plan, the listed regions their descriptions
               writeTVar (vsStageCharge state) 0
               writeTVar (vsStage state) StageIdle
               writeTVar (vsRegions state) regions
               -- What the new revision no longer lists starts its retirement; the host's barrier and the adoptions still
               -- protect it wherever an earlier revision may be drawn.
               let superseded' = Map.difference existing (upReused uploading)
-              modifyTVar' (svRetiring service) (<> [Retiring (rgChunk r) (rgBytes r) RetireUnasked | r ← Map.elems superseded'])
+              modifyTVar' (svRetiring service) (<> [Retiring (rgChunk r) (rgBytes r) (regionCpu r) RetireUnasked | r ← Map.elems superseded'])
+              -- the superseded regions' CPU descriptions move from the view's charge to the service's, and the view's
+              -- charge is now its pins and its listed regions
+              moveToService service state (sum (map regionCpu (Map.elems superseded')))
+              void (recharge service state)
             pure accepted
       if committed
         then finish service state (Published' revision) (Just prep)
@@ -1621,16 +1716,51 @@ publishPlan service state prep uploading = do
 recharge ∷ TerrainViews k → ViewState k → STM Bool
 recharge service state = do
   pinned ← pinnedNeed state
+  listed ← sum . map regionCpu . Map.elems <$> readTVar (vsRegions state)
   staged ← readTVar (vsStageCharge state)
-  coverNeed service state (pinned + staged)
+  coverNeed service state (pinned + listed + staged)
 
--- A conservative CPU charge of one pinned revision: the plan's quads and pending spans, the adapted instances and their
--- records, and the region copies of the instances kept for reuse.
-planBytes ∷ Adapted → Word64
-planBytes adapted =
-  let quads = fromIntegral (length (adaptedQuads adapted))
-      records = fromIntegral (length (adaptedRecords adapted))
-   in 4096 + quads * (256 + 64 + 64) + records * 128
+-- Move bytes the view holds in the account to the service's charge for retiring regions: a transfer of what is already
+-- reserved, never a new reservation, so it cannot be refused.
+moveToService ∷ TerrainViews k → ViewState k → Word64 → STM ()
+moveToService service state bytes = do
+  held ← readTVar (vsAccountHeld state)
+  let moved = min held bytes
+  writeTVar (vsAccountHeld state) (held - moved)
+  modifyTVar' (svRetiringCpu service) (+ moved)
+
+-- Return bytes the service held for retiring regions to the account.
+returnFromService ∷ TerrainViews k → Word64 → STM ()
+returnFromService service bytes = do
+  held ← readTVar (svRetiringCpu service)
+  let returned = min held bytes
+  when (returned > 0) $ do
+    accountRelease (portAccount (svPorts service)) returned
+    writeTVar (svRetiringCpu service) (held - returned)
+
+-- The CPU bytes a retained region's description holds: its instances and records here, and the renderer registry's copy
+-- of its instances, for as long as the chunk is listed or retiring.
+regionCpu ∷ Region → Word64
+regionCpu r = wantedCpu (rgInstances r) (rgRecords r)
+
+wantedCpu ∷ [Instance] → [MaterialRecord] → Word64
+wantedCpu instances records = 2 * instanceBytes * fromIntegral (length instances) + recordBytes * fromIntegral (length records)
+
+-- What the account is charged for each piece, conservatively: a planned quad and its key, a pending span, a copied
+-- region's facts and knowledge as the inputs hold them (the copy's own per-region record), an adapted quad, an encoded
+-- instance and a material record.
+quadBytes, pendingBytes, inputsPerRegion, adaptedPerQuad, instanceBytes, recordBytes ∷ Word64
+quadBytes = 384
+pendingBytes = 64
+inputsPerRegion = 25872
+adaptedPerQuad = 128
+instanceBytes = 64
+recordBytes = 128
+
+-- What a plan holds: its quads and its pending spans.
+planHeld ∷ Int → Int → Word64
+planHeld quads pending = 4096 + quadBytes * fromIntegral quads + pendingBytes * fromIntegral pending
+
 
 -- | Cover the view's CPU need with whole granules of the session's account: on the way up, reserve the granules the need
 -- passes into, all or none ('False' changes nothing); on the way down, return only granules wholly free of the need. A
