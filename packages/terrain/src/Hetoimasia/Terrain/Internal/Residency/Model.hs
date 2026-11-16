@@ -1493,8 +1493,9 @@ acquireHold m h a kind regions = do
     [] → Right ()
   case kind of
     -- A copied borrow names whole regions of supported tiles and needs none of them
-    -- resident: its data is copied out of the store, not borrowed from residency. The
-    -- configured extent bounds what a request may touch, not what a copy may describe.
+    -- resident: its data is copied out of the store, not borrowed from residency. No
+    -- extent is checked here: the terrain service refuses a regional snapshot under an
+    -- extent smaller than a region before it takes the hold.
     Copied →
       case filter (not . supportedRegion) regions of
         (r : _) → Left (Invalid (UnsupportedRegion r))
