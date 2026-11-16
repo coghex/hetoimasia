@@ -198,11 +198,15 @@ pickConsistency = describe "a pick's consistency reference" $ do
       again ← currentHit v view
       _ ← removeWith v (pickRefCell again) Nothing
       removeWith v (pickRefCell again) (Just (pickPrecondition view again)) >>= (`shouldBe` Left Runtime.StaleView)
-      -- A reference picked from a revision the host has since replaced is stale even with the content unchanged.
+      -- A reference picked from a revision the host has since replaced is stale even with the content and knowledge
+      -- unchanged: discovery has settled, so only the adoption moves.
+      quiescent v
       fresh ← currentHit v view
       atomically (updatePresentation view noPresentationUpdate {updateAmbient = Just 0.4}) `shouldReturn` Right ()
       newer ← publishedRevision (vModel v) 1 >>= \now → awaitPublished' v 1 (now + 1)
       adoptNow (vModel v) 1 `shouldReturn` Adopted newer
+      quiescentRevisions ← Runtime.arenaStatus (_vTerrain v) (vArena v) >>= either (fail . show) pure
+      Runtime.preconditionKnowledge (pickPrecondition view fresh) `shouldBe` Just (Runtime.statusKnowledgeRevision quiescentRevisions)
       removeWith v (pickRefCell fresh) (Just (pickPrecondition view fresh)) >>= (`shouldBe` Left Runtime.StaleView)
       closeView view
 
@@ -234,6 +238,13 @@ currentHit v view = bounded go
           now ← publishedRevision (vModel v) 1
           awaitRevision (vModel v) 1 (now + 1)
           go
+
+-- Wait until the arena's discovery has nothing pending, so its revisions stay where they are.
+quiescent ∷ Views → IO ()
+quiescent v = bounded . atomically $
+  Runtime.arenaStatusSTM (_vTerrain v) (vArena v) >>= \case
+    Right status | Runtime.statusDiscovery status == Runtime.DiscoveryIdle → pure ()
+    _ → retry
 
 revealAt ∷ Views → (Integer, Integer, Integer) → IO ()
 revealAt v (x, y, z) = do
