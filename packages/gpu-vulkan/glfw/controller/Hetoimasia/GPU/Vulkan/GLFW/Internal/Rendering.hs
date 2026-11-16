@@ -174,6 +174,7 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Rendering
   , renderingUploadsWaiting
   , submitRenderingUpload
   , cancelRenderingUpload
+  , readRenderingUploads
 
     -- * Retirement
   , prepareTargetRetirement
@@ -388,6 +389,8 @@ import Hetoimasia.GPU.Vulkan.Native.TextureTable
   )
 import Hetoimasia.GPU.Vulkan.Native.Uploads
   ( CancelRefusal (CancelUnknown)
+  , UploadsView
+  , readUploads
   , UploadConfig
   , UploadProgress (..)
   , UploadRefusal
@@ -1867,6 +1870,13 @@ submitRenderingUpload rendering gate request =
     UploadsUnconfigured → pure (Left (Left UploadsNotConfigured))
     UploadsPending _ → pure (Left (Left UploadsNotReady))
     UploadsRefused refusal → pure (Left (Left (UploadsRefusedBy refusal)))
+
+-- | The session's uploads as they stand ('readUploads'), once they exist. It writes nothing.
+readRenderingUploads ∷ Rendering q inst msgr phys dev cmd → STM (Maybe UploadsView)
+readRenderingUploads rendering =
+  readTVar (renderingUploads rendering) >>= \case
+    UploadsMade uploads → Just <$> readUploads uploads
+    _ → pure Nothing
 
 -- | Cancel an upload from any thread ('cancelUpload').
 cancelRenderingUpload ∷ Rendering q inst msgr phys dev cmd → UploadTicket → STM (Either CancelRefusal ())

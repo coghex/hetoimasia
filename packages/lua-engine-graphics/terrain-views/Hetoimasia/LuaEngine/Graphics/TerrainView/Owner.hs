@@ -22,7 +22,8 @@ import Control.Monad (forM, forM_, void)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as Text
-import Hetoimasia.GPU.Vulkan.GLFW (ActionOutcome (..), ActionRefusal (..), ImageFormat (Depth32Float), VulkanAction (..), VulkanHost, readVulkanAction, requestVulkanRelease, submitVulkanAction)
+import Hetoimasia.GPU.Vulkan.GLFW (ActionOutcome (..), ActionRefusal (..), ImageFormat (Depth32Float), UploadView (..), UploadsView (..), VulkanAction (..), VulkanHost, readVulkanAction, readVulkanUploads, requestVulkanRelease, submitVulkanAction)
+import Numeric.Natural (Natural)
 import Hetoimasia.LuaEngine.Graphics.Scene.Ledger (GraphicsScene)
 import Hetoimasia.LuaEngine.Graphics.Texture (TextureGraphics (..))
 import Hetoimasia.LuaEngine.Graphics.Texture.Host (hostBuilders)
@@ -89,6 +90,9 @@ data ViewOwner = ViewOwner
     -- ^ The same for a release request on the host's release lane.
   , ownerStanding ∷ ChunkRef → STM (Maybe ChunkStanding)
     -- ^ A chunk's upload: uploading, ready or failed; 'Nothing' for one never built or since released.
+  , ownerUploads ∷ STM [Natural]
+    -- ^ The uploads not yet settled, by their numbers: a build refused as upload pressure is asked again once this
+    -- changes (one settled, so the staging buffer or its queue has room again). It writes nothing.
   , ownerEnd ∷ STM ()
     -- ^ Completes once the owner takes no more actions (its admission closed or its session failed) and retries until
     -- then. It writes nothing.
@@ -128,6 +132,7 @@ productionViewOwner host graphics = do
       , ownerRoom = probe (submitVulkanAction host (VulkanAction (\_ → pure ())))
       , ownerReleaseRoom = probe (requestVulkanRelease host (VulkanAction (\_ → pure ())))
       , ownerStanding = chunkStandingSTM retained
+      , ownerUploads = maybe [] (map uploadNumber . uploadsUnsettled) <$> readVulkanUploads host
       , -- The host's own admission answers whether its owner still takes actions: a probe admitted while it does is
         -- rolled back by the retry, so nothing is queued, and the transaction wakes when the admission changes.
         ownerEnd =

@@ -236,6 +236,7 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , VulkanUploadRefusal (..)
   , submitVulkanUpload
   , cancelVulkanUpload
+  , readVulkanUploads
   , readVulkanAction
   , awaitVulkanAction
 
@@ -469,7 +470,8 @@ import Hetoimasia.GPU.Vulkan.GLFW.Internal.Rendering
 import Hetoimasia.GPU.Vulkan.Native.Frames (FrameOps (..))
 import Hetoimasia.GPU.Vulkan.Native.Recording (BatchTicket, ClearColor (..), Recorder, RecordingOps (..), Refusal)
 import Hetoimasia.GPU.Vulkan.Native.Uploads
-  ( CancelRefusal
+  ( UploadsView
+  , CancelRefusal
   , UploadConfig
   , UploadRefusal (UploadClosed, UploadSessionFailed)
   , UploadRequest
@@ -1296,6 +1298,11 @@ submitVulkanUpload (VulkanController state) request =
 -- ('cancelUpload').
 cancelVulkanUpload ∷ VulkanController → UploadTicket → STM (Either CancelRefusal ())
 cancelVulkanUpload (VulkanController state) = cancelRenderingUpload (stateRendering state)
+
+-- | The session's uploads as they stand ('readUploads'), once they exist: what a caller refused as backpressure watches
+-- to know that one has settled. It writes nothing.
+readVulkanUploads ∷ VulkanController → STM (Maybe UploadsView)
+readVulkanUploads (VulkanController state) = readRenderingUploads (stateRendering state)
 
 -- | Whether an owner-thread action may be admitted or started now: refused
 -- once the session has failed, with its primary, and once the owner's

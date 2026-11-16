@@ -76,6 +76,7 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView
   , ViewReading (..)
   , readView
   , viewDemand
+  , viewCameraState
 
     -- * Picking
   , PickResult (..)

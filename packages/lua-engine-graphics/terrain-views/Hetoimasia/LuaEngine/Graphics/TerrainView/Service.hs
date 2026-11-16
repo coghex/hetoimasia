@@ -70,6 +70,7 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView.Service
     -- * Observation
   , readView
   , viewDemand
+  , viewCameraState
 
     -- * Picking
   , pickView
@@ -115,6 +116,7 @@ import Hetoimasia.Terrain.Coordinate (RegionCoord (..), axisValue)
 import Hetoimasia.Terrain.Render2D.Camera
   ( CameraState
   , Command (Jump)
+  , FollowOutcome (..)
   , JumpEvent (..)
   , JumpId (..)
   , JumpTarget (..)
@@ -271,7 +273,7 @@ data ViewState k = ViewState
   , vsClosing ∷ !(TVar Bool)
   , vsClosed ∷ !(TVar Bool)
   , vsJumps ∷ !(TVar (Map Word64 (TVar (Maybe (Settled JumpOutcome)))))
-  , vsRetry ∷ !(TVar (Maybe (Word64, Maybe Natural, Word64)))
+  , vsRetry ∷ !(TVar (Maybe Mark))
     -- ^ A preparation left work it can complete once something is released or adopted (copies refused busy, a pin
     -- or a bank full): the service's release count and the target's newest adopted revision when it stopped. It runs
     -- again when either has moved.
@@ -282,7 +284,7 @@ data ViewState k = ViewState
   , vsAccountHeld ∷ !(TVar Word64)
     -- ^ What the view holds in the session's account: whole granules covering its pinned revisions and the candidate
     -- being prepared, never less than they need.
-  , vsDemandBusy ∷ !(TVar (Maybe (Word64, Maybe Natural, Word64)))
+  , vsDemandBusy ∷ !(TVar (Maybe Mark))
     -- ^ The latest demand was refused busy: the retry mark when it was. It is sent again when the mark moves.
   , vsStage ∷ !(TVar Stage)
     -- ^ Where the view's preparation stands, and what that stage owns.
@@ -403,14 +405,17 @@ withTerrainViews config ports body = do
       ended ← readTVarIO (svShutDown service)
       unless ended (shutdown service)
 
--- The worker is gone, by its end or a cancellation: no attachment is taken any more, and every one still queued settles
--- stopped, releasing the parents it holds.
+-- The worker is gone, by its end or a cancellation: no attachment is taken any more, every one still queued settles
+-- stopped, releasing the parents it holds, and, if the worker did not run the service's end, it runs here: every live
+-- view closes now, so a close asked of one (by the body, or its own finalizer) never waits on the worker that is gone.
 workerEnded ∷ (Ord k, Show k) ⇒ TerrainViews k → IO ()
 workerEnded service = do
   queued ← atomically $ do
     writeTVar (svOpen service) False
     readTVar (svRequests service) <* writeTVar (svRequests service) []
   settleQueued queued
+  ended ← readTVarIO (svShutDown service)
+  unless ended (shutdown service)
 
 settleQueued ∷ [Request k] → IO ()
 settleQueued queued =
@@ -770,6 +775,10 @@ readView (TerrainView service state) = do
       , readingNeedBytes = pinnedBytes + sum (map regionCpu (Map.elems regions)) + staged' + factsBytes + demandBytes'
       }
 
+-- | The view's camera as the last preparation settled it: its anchor, its followed surface, its clip, its zoom.
+viewCameraState ∷ TerrainView k → STM CameraState
+viewCameraState (TerrainView _ state) = readTVar (vsCamera state)
+
 -- | The view's latest camera demand: its visible regions, then its prefetch. 'Nothing' before its first preparation.
 viewDemand ∷ TerrainView k → STM (Maybe ([RegionCoord], [RegionCoord]))
 viewDemand (TerrainView _ state) = readTVar (vsDemand state)
@@ -943,12 +952,14 @@ unblockedDirty service state = do
 
 -- What a waiting preparation watches: the service's releases, the target's newest adoption and the shared account's
 -- charge (moved by any of its consumers: coverage, view payloads or the terrain service's own staging).
-retryMark ∷ (Ord k, Show k) ⇒ TerrainViews k → ViewState k → STM (Word64, Maybe Natural, Word64)
+retryMark ∷ (Ord k, Show k) ⇒ TerrainViews k → ViewState k → STM Mark
 retryMark service state = do
   releases ← readTVar (svReleases service)
   newest ← ledgerNewestAdopted (portLedger (svPorts service)) (vtKey (vsTarget state))
   charged ← accountCharged (portAccount (svPorts service))
-  pure (releases, fst <$> newest, charged)
+  -- an upload that settles frees the staging buffer or its queue, which a build refused as pressure waits for
+  uploads ← ownerUploads (portOwner (svPorts service))
+  pure (releases, fst <$> newest, charged, uploads)
 
 -- The graphics owner takes no more actions, so the retirements left cannot be proved: they are kept as terminal
 -- evidence, and their GPU bytes stay charged.
@@ -1132,8 +1143,9 @@ data Prepared'
   | Retry'
   | Abandoned'
 
--- What a waiting step watches: the service's releases, the target's newest adoption and the shared account's charge.
-type Mark = (Word64, Maybe Natural, Word64)
+-- What a waiting step watches: the service's releases, the target's newest adoption, the shared account's charge and the
+-- owner's unsettled uploads.
+type Mark = (Word64, Maybe Natural, Word64, [Natural])
 
 -- | Where a view's preparation stands. Each stage is resumable and owns what it holds until it hands it on: the worker
 -- takes one bounded step of one view at a time, so no view's copies, plan, build or uploads keep the worker from another
@@ -1759,14 +1771,20 @@ retireBuilt service state building chunks = do
 
 stepUploading ∷ (Ord k, Show k) ⇒ TerrainViews k → ViewState k → Prep → Uploading → IO ()
 stepUploading service state prep uploading = do
-  standings ← atomically (forM (Map.elems (upFresh uploading)) (ownerStanding (portOwner (svPorts service)) . rgChunk))
-  let failedUpload = \case
-        Just (ChunkFailed _) → True
-        Nothing → True
-        _ → False
+  standings ← atomically (forM (Map.elems (upFresh uploading)) (\region → (,) (rgChunk region) <$> ownerStanding (portOwner (svPorts service)) (rgChunk region)))
+  let failures =
+        [ why
+        | (chunk, standing) ← standings
+        , Just why ← [failedUpload chunk standing]
+        ]
+      failedUpload chunk = \case
+        Just (ChunkFailed state') → Just ("a retained region's upload failed: " <> Text.pack (show chunk) <> ": " <> Text.pack (show state'))
+        Nothing → Just ("a built retained region is not registered with the owner: " <> Text.pack (show chunk))
+        _ → Nothing
   if
-    | any (== Just ChunkUploading) standings → pure ()
-    | any failedUpload standings → abandonStage service state >> finish service state Retry' (Just prep)
+    | any ((== Just ChunkUploading) . snd) standings → pure ()
+    -- each failure is kept as evidence before the candidate retires; the previous revision stays published
+    | not (null failures) → mapM_ (recordFailure service) failures >> abandonStage service state >> finish service state Retry' (Just prep)
     | otherwise → publishPlan service state prep uploading
 
 -- The region of the camera's anchor column at its clip level.
@@ -1832,9 +1850,14 @@ settleCamera service state facts charge = atomically $ do
   writeTVar (vsFactsCharge state) charge
   camera ← readTVar (vsCamera state)
   let config = tvCameraConfig (svConfig service)
-      followed = either (const camera) stepCamera (refollow config facts camera)
+      stepped = either (const Nothing) Just (refollow config facts camera)
+      followed = maybe camera stepCamera stepped
+      -- a followed surface the facts do not hold yet: its regions are copied in the next round, as a jump's are
+      followNeed = case stepFollow <$> stepped of
+        Just (FollowUnavailable demand) → regionsOf demand
+        _ → []
   landed ← case camPending followed of
-    Nothing → pure followed
+    Nothing → followed <$ writeTVar (vsExtraDemand state) followNeed
     Just pending → case completeJump config facts (Camera.pendingId pending) followed of
       Right result → do
         case stepJump result of
@@ -1842,11 +1865,11 @@ settleCamera service state facts charge = atomically $ do
             jumps ← readTVar (vsJumps state)
             for_ (Map.lookup number jumps) $ \box → writeTVar box (Just (SettledOk JumpLanded))
             modifyTVar' (vsJumps state) (Map.delete number)
-            writeTVar (vsExtraDemand state) []
-          JumpPending _ demand → writeTVar (vsExtraDemand state) (regionsOf demand)
+            writeTVar (vsExtraDemand state) followNeed
+          JumpPending _ demand → writeTVar (vsExtraDemand state) (regionsOf demand <> followNeed)
           _ → pure ()
         pure (stepCamera result)
-      Left _ → pure followed
+      Left _ → followed <$ modifyTVar' (vsExtraDemand state) (nub . (<> followNeed))
   when (camRevision landed /= camRevision camera) (writeTVar (vsCamera state) landed)
   pure landed
 

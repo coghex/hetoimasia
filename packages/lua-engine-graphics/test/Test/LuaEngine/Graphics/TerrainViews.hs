@@ -20,7 +20,7 @@ import qualified Data.ByteString as ByteString
 import qualified Data.ByteString.Char8 as BC
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (fromMaybe, isJust, listToMaybe)
+import Data.Maybe (fromMaybe, isJust, isNothing, listToMaybe)
 import qualified Data.Set as Set
 import qualified Data.Text as Text
 import Data.Bits (testBit)
@@ -53,6 +53,7 @@ import Hetoimasia.Render.TwoD.Chunk.Backend (chunkRef)
 import Hetoimasia.Render.TwoD.Metrics (PixelExtent (..), TargetMetrics (..))
 import Hetoimasia.Render.TwoD.Snapshot (Camera (..), Instance, View (..))
 import Hetoimasia.Render.TwoD.Vulkan.Chunks (ChunkStanding (..))
+import Hetoimasia.GPU.Vulkan.Native.Uploads (UploadState (UploadCancelled))
 import Hetoimasia.GPU.Vulkan.GLFW (TextureHandle (..))
 import Hetoimasia.Render.TwoD.Vulkan.Textures (toBackendHandle)
 import Hetoimasia.LuaEngine.Graphics.Texture.Port (TextureRef (..))
@@ -580,19 +581,21 @@ stages = describe "stages and the owner" $ do
   it "publishes a coherent partial plan when another consumer leaves the account room for a plan over only some of its regions, sleeps there, and admits more once the room returns" $ do
     let config = testConfig {tvAccountGranule = 64, tvCopyRegions = 1}
     withViewsConfig config $ \v → do
+      atomically (writeTVar (vMetrics v) (TargetMetrics (PixelExtent 640 480) (PixelExtent 640 480) 1 1))
       view ← attached v 1
       first' ← awaitPublished v 1
       quiescent v
       adoptNow (vModel v) 1 `shouldReturn` Adopted first'
       full ← atomically (readView view)
       readingUnadmitted full `shouldBe` 0
-      -- another consumer takes the account but for room for a preparation over one region, not two: the view is charged a
-      -- copy's footprint (not the terrain service's reservation for it), the region's inputs and the first quantum
-      let oneRegion = preparationCost config 1 - Runtime.regionSnapshotReservation 1 + 4096
-      oneRegion + 25872 `shouldSatisfy` (< preparationCost config 2 - Runtime.regionSnapshotReservation 2)
+      -- another consumer takes the account but for room for a preparation over about half the demand: the view is charged
+      -- a copy's footprint (not the terrain service's reservation for it), each region's inputs and the first quantum
+      let half = max 2 (readingAdmitted full `div` 2)
+          halfCost = preparationCost config half - Runtime.regionSnapshotReservation half + 512 * fromIntegral half
+      readingAdmitted full `shouldSatisfy` (>= 6)
       taken ← atomically $ do
         held ← accountCharged (_vAccount v)
-        let room = accountLimit (_vAccount v) - held - oneRegion
+        let room = accountLimit (_vAccount v) - held - halfCost
         ok ← accountReserve (_vAccount v) room
         if ok then pure room else retry
       atomically (updateCamera view (CameraIntent [Camera.Pan 16 0])) `shouldReturn` Right ()
@@ -601,8 +604,8 @@ stages = describe "stages and the owner" $ do
       readingUnadmitted partial `shouldSatisfy` (> 0)
       readingAdmitted partial `shouldSatisfy` (< readingAdmitted full)
       readingPendingRegions partial `shouldSatisfy` (> 0)
-      picks ← atomically (picksOver view)
-      [() | Left "loading" ← picks] `shouldSatisfy` (not . null)
+      picks ← atomically (mapM (pickView view) [(x + 0.5, y + 0.5) | y ← [0, 32 .. 479], x ← [0, 32 .. 639]])
+      [() | PickLoading ← picks] `shouldSatisfy` (not . null)
       -- it sleeps: once what it retired is released, its unchanged world takes none of its steps
       _ ← adoptNow (vModel v) 1
       _ ← releasePass (vModel v)
@@ -896,18 +899,23 @@ stages = describe "stages and the owner" $ do
 
   it "waits in its plan, growing it no further, while the account cannot hold the next quantum's growth" $ do
     seam ← newStageSeam
-    withViewsConfig testConfig {tvStepsPerQuantum = 1, tvOnStage = seamHook seam} $ \v → do
-      -- another consumer leaves the account a granule and a half: room for the copies and the inputs, not a quantum
-      taken ← atomically $ do
-        held ← accountCharged (_vAccount v)
-        let room = accountLimit (_vAccount v) - held - 3 * 512 * 1024
-        ok ← accountReserve (_vAccount v) room
-        pure (if ok then room else 0)
-      taken `shouldSatisfy` (> 0)
+    takenVar ← newTVarIO 0
+    -- a fine granule, so the view holds no spare room of its own beside its need
+    withViewsConfig testConfig {tvStepsPerQuantum = 1, tvAccountGranule = 64, tvOnStage = seamHook seam} $ \v → do
+      -- once the copies and their inputs are admitted (with room for a quantum then), another consumer leaves the
+      -- account a granule and a half: room for no quantum
+      let squeeze = atomically $ do
+            held ← accountCharged (_vAccount v)
+            let room = accountLimit (_vAccount v) - held - 3 * 512 * 1024
+            ok ← accountReserve (_vAccount v) room
+            writeTVar takenVar (if ok then room else 0)
+      armSeam seam 1 "planning" 1 (SeamRun squeeze)
       view ← attached v 1
       bounded (atomically (readView view >>= \r → check (readingWaiting r && readingPhase r == PhasePreparing)))
       atomically (seamCount seam 1 "planning") >>= (`shouldSatisfy` (<= 2))
       atomically (readView view) >>= (`shouldBe` Nothing) . readingPublished
+      taken ← readTVarIO takenVar
+      taken `shouldSatisfy` (> 0)
       atomically (accountRelease (_vAccount v) taken)
       _ ← awaitPublished v 1
       closeView view
@@ -1343,6 +1351,56 @@ lifecycle = describe "close orders and limits" $ do
       readingRetainedRegions reading `shouldSatisfy` (> 0)
       closeView view
 
+  it "follows a surface above the band it first copied: the surface's regions are copied in the next round, and the camera lands on it" $
+    withViewsOn pillarOverPlain testConfig {tvCellConfig = (viewCells 250)} $ \v → do
+      view ← attached v 1
+      _ ← awaitPublished v 1
+      -- the pillar's top is level 99, three regions above the anchor's band at level 3: following adopts it
+      camera ← atomically (viewCameraState view)
+      fmap axisValue (Camera.camSurface camera) `shouldBe` Just 99
+      axisValue (Camera.camClip camera) `shouldSatisfy` (> 99)
+      closeView view
+
+  it "asks a build refused as upload pressure again once an upload settles, with no new intent, adoption or account change" $
+    withViews $ \v → do
+      view ← attached v 1
+      first' ← awaitPublished v 1
+      quiescent v
+      -- an upload is under way and holds the staging buffer: the next build is refused as pressure
+      atomically (writeTVar (foUploads (vOwner v)) [7] >> writeTVar (foStopAfter (vOwner v)) (Just (0, True)))
+      built ← readTVarIO (foBuilt (vOwner v))
+      atomically (updateCamera view (CameraIntent [Camera.ZoomBy 2])) `shouldReturn` Right ()
+      bounded (atomically (readTVar (foStopAfter (vOwner v)) >>= check . isNothing))
+      bounded (atomically (readView view >>= \r → check (readingWaiting r && readingStagedBytes r == 0)))
+      readTVarIO (foBuilt (vOwner v)) `shouldReturn` built
+      publishedRevision (vModel v) 1 `shouldReturn` first'
+      -- the upload settles: nothing else changes, and the build is asked again and published
+      atomically (writeTVar (foUploads (vOwner v)) [])
+      _ ← awaitPublished' v 1 (first' + 1)
+      closeView view
+
+  it "keeps an upload that failed as evidence and the previous revision published" $ do
+    ownerRef ← newTVarIO Nothing
+    -- the held uploads end when the service stops, so a failing example still ends
+    let endUploads = readTVarIO ownerRef >>= mapM_ (\owner → atomically (writeTVar (foHoldUploads owner) False >> modifyTVar' (foStanding owner) (Map.map (\s' → if s' == ChunkUploading then ChunkReady else s'))))
+    withViewsConfig testConfig {tvStopping = endUploads} $ \v → do
+      atomically (writeTVar ownerRef (Just (vOwner v)))
+      view ← attached v 1
+      first' ← awaitPublished v 1
+      previous ← latestWorld v 1
+      -- the next build's uploads stay under way; then one of them fails
+      atomically (writeTVar (foHoldUploads (vOwner v)) True)
+      built ← readTVarIO (foBuilt (vOwner v))
+      atomically (updateCamera view (CameraIntent [Camera.ZoomBy 2])) `shouldReturn` Right ()
+      bounded (atomically (readTVar (foBuilt (vOwner v)) >>= check . (> built)))
+      -- one of the new chunks' uploads fails, the others complete; a later build's uploads stay under way
+      failing ← bounded . atomically $ readTVar (foStanding (vOwner v)) >>= maybe retry (pure . fst) . Map.lookupMin . Map.filter (== ChunkUploading)
+      atomically (modifyTVar' (foStanding (vOwner v)) (Map.mapWithKey (\k s' → if k == failing then ChunkFailed UploadCancelled else if s' == ChunkUploading then ChunkReady else s')))
+      bounded (atomically (terrainViewsFailures (vViews v) >>= check . any ("upload failed" `Text.isInfixOf`)))
+      publishedRevision (vModel v) 1 `shouldReturn` first'
+      worldTag <$> latestWorld v 1 `shouldReturn` worldTag previous
+      closeView view
+
   it "keeps a failed build as evidence, never as busy or success, and the previous view stays until a build succeeds" $
     withViews $ \v → do
       view ← attached v 1
@@ -1504,7 +1562,7 @@ lifecycle = describe "close orders and limits" $ do
     Set.fromList released `shouldBe` Set.fromList built
     atomically (claimOf claims 1) `shouldReturn` Nothing
 
-  it "rethrows a cancellation of its worker instead of recording it: the worker ends, attachments stop, and the scope's exit still closes every view" $ do
+  it "rethrows a cancellation of its worker instead of recording it: the worker ends, attachments stop, and every view is closed" $ do
     armed ← newTVarIO False
     -- the next stage the worker enters cancels it there, as a cancellation of the worker's thread would
     let cancelAt _ stage = when (stage == "planning") $ do
@@ -1523,12 +1581,30 @@ lifecycle = describe "close orders and limits" $ do
         Left refusal → pure (SettledRefused refusal)
         Right attaching → bounded (awaitAttach attaching)
       settled `shouldSatisfy` \case SettledRefused AttachStopped → True; _ → False
-      publishedRevision (vModel v) 1 `shouldReturn` first'
+      -- the worker's end closed the view: its claim handed back with a real empty revision after the one it published
+      bounded (atomically (viewClosed view >>= check))
+      publishedRevision (vModel v) 1 `shouldReturn` (first' + 1)
       atomically (terrainViewsFailures (vViews v)) `shouldReturn` []
       pure (vViews v, vClaims v)
-    -- the scope's exit ran the service's end itself: the view's claim is handed back
     atomically (claimOf claims 1) `shouldReturn` Nothing
     atomically (terrainViewsFailures views) `shouldReturn` []
+
+  it "closes a live view when its worker is cancelled, so a close from the body returns and the scope exits" $ do
+    armed ← newTVarIO False
+    let cancelAt _ stage = when (stage == "planning") $ do
+          fire ← atomically (readTVar armed <* writeTVar armed False)
+          when fire (myThreadId >>= killThread)
+    withViewsConfig testConfig {tvOnStage = cancelAt} $ \v → do
+      view ← attached v 1
+      _ ← awaitPublished v 1
+      quiescent v
+      atomically (writeTVar armed True)
+      atomically (updateCamera view (CameraIntent [Camera.ZoomBy 2])) `shouldReturn` Right ()
+      bounded (atomically (readTVar armed >>= check . not))
+      -- the worker is gone: the close is answered all the same
+      bounded (closeView view)
+      atomically (viewClosed view) `shouldReturn` True
+      atomically (claimOf (vClaims v) 1) `shouldReturn` Nothing
 
   it "refuses an attachment beyond the service's views, before taking anything" $
     withViewsConfig testConfig {tvMaxViews = 1} $ \v → do
@@ -1929,6 +2005,8 @@ data FakeOwner = FakeOwner
     -- ^ Barrier requests made, admitted or refused.
   , foStopAfter ∷ !(TVar (Maybe (Int, Bool)))
     -- ^ While set, the next build makes this many regions, then stops: as pressure ('True') or as a failure (once).
+  , foUploads ∷ !(TVar [Natural])
+    -- ^ The uploads the owner reports unsettled, by number: the example settles them.
   }
 
 data FakeAction
@@ -1955,6 +2033,7 @@ newFakeOwner model =
     <*> newTVarIO 0
     <*> newTVarIO 0
     <*> newTVarIO Nothing
+    <*> newTVarIO []
 
 -- The owner's thread: runs queued actions in order. A build waits at the gate; an ended owner answers what it did not
 -- run.
@@ -2025,6 +2104,7 @@ fakeViewOwner owner =
     , ownerRoom = (&&) <$> (not <$> readTVar (foEnded owner)) <*> ((<) <$> (length <$> readTVar (foQueue owner)) <*> readTVar (foCapacity owner))
     , ownerReleaseRoom = (&&) <$> (not <$> readTVar (foEnded owner)) <*> (not <$> readTVar (foLaneFull owner))
     , ownerStanding = \chunk → Map.lookup chunk <$> readTVar (foStanding owner)
+    , ownerUploads = readTVar (foUploads owner)
     , ownerEnd = readTVar (foEnded owner) >>= check
     }
   where

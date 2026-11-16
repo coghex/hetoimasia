@@ -204,6 +204,9 @@ module Hetoimasia.GPU.Vulkan.GLFW
   , readUploadTicket
   , awaitUploadTicket
   , cancelVulkanUpload
+  , readVulkanUploads
+  , UploadsView (..)
+  , UploadView (..)
   , CancelRefusal (..)
 
     -- * The bindless texture table (GRS-7)
@@ -568,6 +571,8 @@ import Hetoimasia.GPU.Vulkan.Native.TextureTable
   )
 import Hetoimasia.GPU.Vulkan.Native.Uploads
   ( CancelRefusal (..)
+  , UploadsView (..)
+  , UploadView (..)
   , UploadConfig
   , UploadConfigRefused (..)
   , UploadPressure (..)
@@ -638,6 +643,11 @@ submitVulkanUpload host = Controller.submitVulkanUpload (vulkanController host)
 -- | Cancel an upload, from any thread, before its first copies are recorded.
 cancelVulkanUpload ∷ VulkanHost scene → UploadTicket → STM (Either CancelRefusal ())
 cancelVulkanUpload host = Controller.cancelVulkanUpload (vulkanController host)
+
+-- | The session's uploads as they stand, once they exist: what a caller whose upload was refused as backpressure
+-- watches to know that one has settled. It writes nothing.
+readVulkanUploads ∷ VulkanHost scene → STM (Maybe UploadsView)
+readVulkanUploads host = Controller.readVulkanUploads (vulkanController host)
 
 -- | Create one window's surface on the main thread, under its attachment, and
 -- hand it to this host's owner as a required or optional target.
