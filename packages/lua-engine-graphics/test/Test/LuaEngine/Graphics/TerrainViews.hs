@@ -1373,7 +1373,8 @@ lifecycle = describe "close orders and limits" $ do
       -- an upload is under way and holds the staging buffer: the next build is refused as pressure
       atomically (writeTVar (foUploads (vOwner v)) [7] >> writeTVar (foStopAfter (vOwner v)) (Just (0, True)))
       built ← readTVarIO (foBuilt (vOwner v))
-      atomically (updateCamera view (CameraIntent [Camera.ZoomBy 2])) `shouldReturn` Right ()
+      -- an edit in view rebuilds its region with the camera, and so the demand, unchanged
+      removeWith v (tileAt 9 9 3) Nothing `shouldReturn` Right True
       bounded (atomically (readTVar (foStopAfter (vOwner v)) >>= check . isNothing))
       bounded (atomically (readView view >>= \r → check (readingWaiting r && readingStagedBytes r == 0)))
       readTVarIO (foBuilt (vOwner v)) `shouldReturn` built
