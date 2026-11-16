@@ -48,7 +48,7 @@ import Hetoimasia.Terrain.Cell (Column (..))
 import Hetoimasia.Terrain.Coordinate (RegionCoord (..), axisValue, decomposeTile, regionLevels)
 import qualified Hetoimasia.Terrain.Query as Q
 import qualified Hetoimasia.Terrain.Discovery as D
-import Hetoimasia.Terrain.Palette (Palette, emptyPalette, internSourceMaterials)
+import Hetoimasia.Terrain.Palette (Palette)
 import qualified Hetoimasia.Terrain.Residency as R
 import Hetoimasia.Terrain.Residency (ArenaId (..), RequestId (..), Revision (..))
 import Hetoimasia.Terrain.Resident (Resident, discardRegion, emptyResident)
@@ -1088,12 +1088,27 @@ stageRetry svc rid aid arena = stageWith svc rid (Just aid) (arenaRevision arena
 -- its preparation read.
 stageWith ∷ Service → RequestId → Maybe ArenaId → Revision → Revision → Maybe CreatorBasis → StagedWork → IO Bool
 stageWith svc rid aid rev knowledge basis work =
-  tryNonAsync (atomically publish') >>= \case
-    Right staged → pure staged
-    Left failure → do
-      failWith svc (ProviderDefect (Text.pack ("readiness callback failed: " <> show failure))) [("request", Text.pack (show rid))]
+  tryNonAsync prepare >>= \case
+    Left failure →
+      failWith svc (ProviderDefect (Text.pack ("settlement preparation failed: " <> show failure))) [("request", Text.pack (show rid))]
+    Right settlement → do
+      when (isJust settlement) (probe svc (PointPrepared rid))
+      tryNonAsync (atomically (publish' settlement)) >>= \case
+        Right staged → pure staged
+        Left failure → do
+          failWith svc (ProviderDefect (Text.pack ("readiness callback failed: " <> show failure))) [("request", Text.pack (show rid))]
   where
-    publish' = do
+    -- AN ANSWER'S SETTLEMENT IS PREPARED HERE, OUTSIDE EVERY TRANSACTION: the host's preparation of the
+    -- answer ('endpointPrepare') is evaluated before the answer is staged, so the arbitration's transaction
+    -- runs only the prepared settlement and never the host's pure work on the answer. A preparation that
+    -- throws is a provider defect, as a readiness callback that throws is. The endpoint is the request's
+    -- own and never changes; a request that has ended meanwhile is not staged.
+    prepare = case work of
+      StagedAnswer answer → do
+        st <- atomically (readSt svc)
+        forM (Map.lookup rid (stateRequests st)) $ \req → evaluate (endpointPrepare (reqEndpoint req) answer)
+      _ → pure Nothing
+    publish' settlement = do
         st <- readSt svc
         fmap (fromMaybe False) . forM (Map.lookup rid (stateRequests st)) $ \req → do
           let arena = aid >>= \a → Map.lookup a (stateArenas st)
@@ -1104,7 +1119,7 @@ stageWith svc rid aid rev knowledge basis work =
                 Just _ → maybe False (\x → arenaRevision x == rev && D.authKnowledge (arenaAuthority x) == knowledge && maybe True (basisFresh x) basis) arena
               pending = case reqPhase req of Done → False; _ → True
           when (fresh && pending) $ do
-            modifySt svc (\s → s {stateRequests = Map.insert rid req {reqPhase = StagedPhase (Staged aid rev knowledge basis work)} (stateRequests s)})
+            modifySt svc (\s → s {stateRequests = Map.insert rid req {reqPhase = StagedPhase (Staged aid rev knowledge basis work settlement)} (stateRequests s)})
             -- A failing readiness callback abandons this transaction: the work stays
             -- unstaged and cannot commit. The caller treats it as a provider defect.
             endpointReady (reqEndpoint req)
@@ -1162,10 +1177,10 @@ commitWaits ∷ St → Bool → RequestId → Req → Staged → Bool
 commitWaits st open rid req sg
   | statePhase st /= Running || not open = True
   | otherwise = case (reqCmd req, stagedWork sg) of
-      -- a source that fails to intern settles at once; otherwise the open waits for its preparation,
-      -- and opens publish in the order their incarnations were allocated
-      (COpen _ source _ _, StagedControl)
-        | Left _ <- internSourceMaterials source emptyPalette → False
+      -- a source that failed to intern (its preparation, before it was staged) settles at once; otherwise
+      -- the open waits for its preparation, and opens publish in the order their incarnations were allocated
+      (COpen {}, StagedOpen prepared)
+        | Left _ <- prepared → False
         | otherwise → maybe True (\(aid, _, _, _, _) → not (openOrderAllows st aid)) (openReady st rid)
       (CAttach {}, StagedControl) → False
       -- a regional snapshot settles with the version it read, whatever has committed since
@@ -1186,7 +1201,7 @@ commitWaits st open rid req sg
 
 commitStaged ∷ Service → St → RequestId → Req → Staged → STM CommitResult
 commitStaged svc st rid req sg = case (reqCmd req, stagedWork sg) of
-  (COpen name source cid _, StagedControl) → commitOpen name source cid
+  (COpen name source cid _, StagedOpen prepared) → commitOpen name source cid prepared
   (CAttach name cid, StagedControl) → commitAttach name cid
   (CRemove _ precondition, StagedRemoval prepared)
     | not (preparedChanged prepared) → withFresh $ \aid arena → commitAir aid arena precondition
@@ -1194,7 +1209,7 @@ commitStaged svc st rid req sg = case (reqCmd req, stagedWork sg) of
   -- THE SETTLEMENT OF A REGIONAL SNAPSHOT: in this one transaction the result becomes the service's
   -- untaken result and its charge shrinks from the admission's reservation to the exact footprint of the
   -- copied value (never less), which it keeps until its release
-  (CRegions _ hid, StagedAnswer answer@(ARegions (RegionBorrow _ _ snapshot))) → do
+  (CRegions _ hid, StagedAnswer (ARegions (RegionBorrow _ _ snapshot))) → do
     let footprint = snapshotFootprint snapshot
     modifySt svc $ \s →
       s
@@ -1203,17 +1218,22 @@ commitStaged svc st rid req sg = case (reqCmd req, stagedWork sg) of
         , stateWork = (stateWork s) {rwRegional = Map.adjust (\(n, _) → (n, footprint)) hid (rwRegional (stateWork s))}
         }
     markFreed svc
-    endpointSettle ep (Succeeded answer)
+    settleAnswer
     pure (CommitDone Nothing Nothing)
-  (_, StagedAnswer answer) → withFresh $ \aid _ → do
+  (_, StagedAnswer _) → withFresh $ \aid _ → do
     modifySt svc (\s → s {stateRequests = Map.insert rid req {reqPhase = Done} (stateRequests s)})
-    endpointSettle ep (Succeeded answer)
+    settleAnswer
     pure (CommitDone (Just aid) Nothing)
   (CRetry, StagedRetry certified) → withFresh (commitRetry certified)
   _ → pure CommitWaiting
   where
     ep = reqEndpoint req
     tag = serviceTag svc
+    -- AN ANSWER'S SETTLEMENT WAS PREPARED BEFORE IT WAS STAGED ('stageWith'): the host's pure work on the
+    -- answer is done, and the arbitration runs only the prepared transaction
+    settleAnswer = case stagedSettlement sg of
+      Just prepared → preparedSettle prepared
+      Nothing → throwSTM (OwnerDefect "an answer was staged without its prepared settlement")
     -- Staged work for a superseded revision is not offered: the owner computes
     -- it again against the current one.
     withFresh k = case stagedArena sg >>= \aid → (,) aid <$> Map.lookup aid (stateArenas st) of
@@ -1223,7 +1243,8 @@ commitStaged svc st rid req sg = case (reqCmd req, stagedWork sg) of
     knowledgeFresh arena = case stagedWork sg of
       StagedAnswer (AKnowledge _) → D.authKnowledge (arenaAuthority arena) == stagedKnowledge sg
       _ → True
-    commitOpen name source cid = case (openReady st rid, internSourceMaterials source emptyPalette) of
+    -- the palette was interned and evaluated before the open was staged ('preparePalette'): installed here
+    commitOpen name source cid prepared = case (openReady st rid, prepared) of
       (_, Left why) → settleFailure (SourceFailure (Text.pack (show why)))
       (Nothing, _) → pure CommitWaiting
       (Just (aid, env, shared, backing, store), Right palette)

@@ -1,3 +1,5 @@
+{-# LANGUAGE PatternSynonyms #-}
+
 -- | The service's types: authorities, requests, the settlement seam, the
 -- configuration and the one state record the transactions share.
 --
@@ -20,6 +22,8 @@ module Hetoimasia.Terrain.Runtime.Internal.Types
 
     -- * Settlement seam
   , Endpoint (..)
+  , PreparedSettlement (..)
+  , unpreparedSettlement
   , OpenOptions (..)
   , defaultOpenOptions
   , Settlement (..)
@@ -44,7 +48,7 @@ module Hetoimasia.Terrain.Runtime.Internal.Types
   , SessionAdmission (..)
   , Supervisor (..)
   , OwnerControl (..)
-  , Probe (..)
+  , Probe (ProbeWith, Probe, probePoint, probeInterning)
   , Point (..)
   , noProbe
   , Defect (..)
@@ -157,7 +161,7 @@ import Hetoimasia.Foundation.Log (Logger)
 import Hetoimasia.Foundation.Worker (WorkerDefinition)
 import Hetoimasia.Terrain.Cell
 import Hetoimasia.Terrain.Coordinate (RegionCoord, TileCoord)
-import Hetoimasia.Terrain.Palette (Palette)
+import Hetoimasia.Terrain.Palette (Palette, PaletteError)
 import Hetoimasia.Terrain.Query (Occupied, QueryError, QueryLimits, Run)
 import Hetoimasia.Terrain.Residency
   ( ArenaId (..)
@@ -254,11 +258,33 @@ instance Show View where
 -- block or 'Control.Concurrent.STM.retry'. A host callback that throws is a
 -- provider defect: the transaction is abandoned with nothing committed, the
 -- request is failed, and the defect reaches supervision.
+--
+-- A read's answer is settled through 'endpointPrepare' instead of
+-- 'endpointSettle': the owner evaluates the host's preparation of the answer
+-- outside every transaction, when it stages the answer, and runs only the
+-- prepared settlement in the arbitration, so the host's pure work on a large
+-- answer (its conversion, its judgement) is never redone by a commit attempt.
 data Endpoint = Endpoint
   { endpointReady ∷ STM ()
   , endpointEligible ∷ STM Bool
   , endpointSettle ∷ Settlement → STM ()
+  , endpointPrepare ∷ Answer → PreparedSettlement
+  -- ^ The success settlement of a staged answer, prepared. THE PREPARED VALUE DEPENDS ONLY ON THE ANSWER
+  -- AND ON WHAT THE HOST FIXED WHEN IT ADMITTED THE REQUEST (its limits, its schema): never on state that
+  -- can change before the commit, which the prepared settlement reads in the arbitration itself. Evaluating
+  -- the result to weak head normal form does all of the host's pure work; the owner does that outside any
+  -- transaction. It runs no IO and never blocks. 'unpreparedSettlement' is today's settlement, unprepared.
   }
+
+-- | A host's settlement of an answer, prepared outside any transaction ('endpointPrepare'): the
+-- transaction the arbitration runs, in place of 'endpointSettle' with the answer's success.
+newtype PreparedSettlement = PreparedSettlement
+  { preparedSettle ∷ STM ()
+  }
+
+-- | A settlement that prepares nothing: 'endpointSettle' of the answer's success, run in the arbitration.
+unpreparedSettlement ∷ (Settlement → STM ()) → Answer → PreparedSettlement
+unpreparedSettlement settle answer = PreparedSettlement (settle (Succeeded answer))
 
 -- | The one terminal outcome of an accepted request.
 data Settlement
@@ -511,9 +537,24 @@ data OwnerControl = OwnerControl
 -- | Controlled gates and fault points on the owner thread, called outside any
 -- transaction. The default does nothing. A gate blocks the owner at a point; an
 -- exception injected at a point is a failure of the step it names.
-newtype Probe = Probe
+--
+-- 'probeInterning' is a test seam on an open's preparation: it is applied to the
+-- interning of the open's source into its palette, the value the owner evaluates
+-- outside every transaction before it stages the open ('PointPrepared'). The
+-- default ('Probe') leaves it unchanged; a test observes its evaluation or
+-- injects a failure through it.
+data Probe = ProbeWith
   { probePoint ∷ Point → IO ()
+  , probeInterning ∷ Either PaletteError Palette → Either PaletteError Palette
   }
+
+-- | A probe of points alone: the interning is left unchanged.
+pattern Probe ∷ (Point → IO ()) → Probe
+pattern Probe point ← ProbeWith point _
+  where
+    Probe point = ProbeWith point id
+
+{-# COMPLETE Probe #-}
 
 noProbe ∷ Probe
 noProbe = Probe (\_ → pure ())
@@ -526,6 +567,9 @@ data Point
     PointStaging !RequestId
   | -- | Staged work is about to be offered to the arbitration.
     PointBeforeCommit !RequestId
+  | -- | A request's settlement work (an open's palette, a staged answer's prepared settlement) was
+    -- evaluated, outside every transaction, and is about to be staged.
+    PointPrepared !RequestId
   | -- | A commit won and published.
     PointCommitted !RequestId !Revision
   | -- | A load job is about to run.
@@ -638,6 +682,9 @@ data Staged = Staged
     -- prepared against. It is stale once either moves, and prepared again.
     stagedBasis ∷ !(Maybe CreatorBasis)
   , stagedWork ∷ !StagedWork
+  , -- | For a staged answer: its host's settlement, prepared and evaluated before it was staged
+    -- ('endpointPrepare'). The arbitration runs it; nothing else of it is computed there.
+    stagedSettlement ∷ !(Maybe PreparedSettlement)
   }
 
 -- | What a creator command's preparation reads of its arena's store: the allowance and the
@@ -683,8 +730,11 @@ creatorFresh arena sg = maybe True (basisFresh arena) (stagedBasis sg)
 data StagedWork
   = StagedAnswer !Answer
   | StagedRemoval !Prepared
-  | -- | An open or attach, decided in the arbitration itself.
+  | -- | An attach, decided in the arbitration itself.
     StagedControl
+  | -- | An open, decided in the arbitration itself, with its source interned into the arena's palette:
+    -- computed and evaluated before it was staged, so no transaction interns.
+    StagedOpen !(Either PaletteError Palette)
   | -- | A creator's growth to a larger allowance, validated by the store's proposal: it takes
     -- the session's slot when its host is eligible.
     StagedGrowth !GrowthProposal
