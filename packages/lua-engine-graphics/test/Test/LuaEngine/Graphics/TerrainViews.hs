@@ -56,7 +56,7 @@ import Hetoimasia.GPU.Vulkan.GLFW (TextureHandle (..))
 import Hetoimasia.Render.TwoD.Vulkan.Textures (toBackendHandle)
 import Hetoimasia.LuaEngine.Graphics.Texture.Port (TextureRef (..))
 import Hetoimasia.Render.TwoD.Material (MaterialRef, defaultMaterial)
-import Hetoimasia.Terrain.Coordinate (RegionCoord (..), TileCoord, axisFromInteger, tileCoord)
+import Hetoimasia.Terrain.Coordinate (RegionCoord (..), TileCoord (..), axisFromInteger, axisValue, tileCoord)
 import qualified Hetoimasia.Terrain.Render2D.Camera as Camera
 import Hetoimasia.Terrain.Render2D.AtlasFixtures (AtlasStyle, findSampleDirectory, loadAtlasStyle)
 import qualified Hetoimasia.Terrain.Render2D.AtlasFixtures as Fixtures
@@ -79,7 +79,7 @@ import Hetoimasia.Terrain.Runtime
 import qualified Hetoimasia.Terrain.Runtime as Runtime
 import Hetoimasia.Terrain.Runtime.Storage (filesystemOf, minHeadroomBytes, mkStorageConfig)
 import Hetoimasia.Terrain.Runtime.Store (StoreSpec (..), defaultStoreSpec, minAllowanceBytes)
-import Hetoimasia.Terrain.Residency (Bank (StagingBank), Ledger (..), LimitsSpec (..), RegionDemand (..), RegionInfo (..), bankLedger, coverageBox, mkLimits, modelRegions)
+import Hetoimasia.Terrain.Residency (Bank (StagingBank), Ledger (..), LimitsSpec (..), RegionDemand (..), RegionInfo (..), bankLedger, coverageBox, mkLimits, modelJobs, modelRegions)
 import Hetoimasia.Terrain.Source (CellSpec (..), LayerSpec (..), PatchSpec (..), SourceSpec (..))
 import System.FilePath ((</>))
 
@@ -1037,6 +1037,27 @@ styles = describe "style refusals" $ do
 
 jumps ∷ Spec
 jumps = describe "jumps" $ do
+  it "lands a far jump on a quiescent arena with no other camera or terrain event, and publishes the destination" $
+    withViews $ \v → do
+      view ← attached v 1
+      _ ← awaitPublished v 1
+      quiescent v
+      -- nothing more will happen on its own: the view's demand is resident, no load is in flight, and the view has
+      -- published for the arena as it now is
+      demandResident v view
+      bounded (atomically (Runtime.inspectModelSTM (_vTerrain v) >>= check . null . modelJobs))
+      first' ← currentHit v view >> publishedRevision (vModel v) 1
+      axis ← pure (either (error . show) id . axisFromInteger)
+      -- the destination's facts are held by no copy the view has: its demand must be asked for and prepared
+      far ← atomically (jumpView view (JumpRequest (axis 4000, axis 4000) Nothing)) >>= either (fail . show) pure
+      bounded (atomically (jumpSettled far >>= maybe retry pure)) `shouldReturn` SettledOk JumpLanded
+      newer ← awaitPublished' v 1 (first' + 1)
+      adoptNow (vModel v) 1 `shouldReturn` Adopted newer
+      hit ← currentHit v view
+      let cell = pickRefCell hit
+      (abs (axisValue (tileX cell) - 4000) <= 4, abs (axisValue (tileY cell) - 4000) <= 4) `shouldBe` (True, True)
+      closeView view
+
   it "settles a jump exactly once: a landed jump moves the camera, a newer jump supersedes a pending one, and a cancelled one stays" $
     withViews $ \v → do
       view ← attached v 1

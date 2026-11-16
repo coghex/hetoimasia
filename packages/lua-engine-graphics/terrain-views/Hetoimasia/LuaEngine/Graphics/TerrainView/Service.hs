@@ -966,10 +966,13 @@ prepareFor service state intent metrics = do
           Nothing → pure (Done Abandoned')
           Just (Left why) → recordFailure service why >> pure (Done Retry')
           Just (Right (plan, adapted)) → do
+            -- a jump whose destination these copies did not hold left its demand in this round's settlement: it is
+            -- copied in the next round of the same preparation, as the plan's own missing demand is
+            jumpDemand ← Set.fromList <$> readTVarIO (vsExtraDemand state)
             let demand = cellPlanDemand plan
                 visible = regionsOf (cdVisible demand)
                 prefetch = regionsOf (cdPrefetch demand)
-                missing = Set.fromList visible `Set.difference` regions
+                missing = (Set.fromList visible <> jumpDemand) `Set.difference` regions
             if not (Set.null missing) && rounds > 1
               then pure (More missing)
               else do
