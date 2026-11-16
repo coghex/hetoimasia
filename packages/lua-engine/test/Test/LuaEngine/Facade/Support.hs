@@ -67,6 +67,7 @@ module Test.LuaEngine.Facade.Support
   , outLinesSTM
   , timerBackend
   , VmClock
+  , vmAhead
 
     -- * VMs
   , Fvm (..)
@@ -427,6 +428,10 @@ worldTimer world = timerBackend world Nothing
 -- wakes that VM's own registration; read by the VM's owner and its facade. Zero for a VM the step never woke.
 newtype VmClock = VmClock (IORef Word64)
 
+-- | How far the step has moved this VM's clock ahead of the world's, in nanoseconds.
+vmAhead ∷ Fvm → IO Word64
+vmAhead fvm = let VmClock ahead = fvClock fvm in readIORef ahead
+
 -- | A VM the world's timer knows, for 'explainSteps': its label, its clock, and the thread its owner arms on (recorded at its
 -- first registration; an owner arms only on its own thread) with the owner's scheduler.
 data TimerVm = TimerVm
@@ -711,6 +716,8 @@ data Fvm = Fvm
   , fvFacade ∷ !Facade
   , fvLoader ∷ !LoaderEndpoint
   , fvRole ∷ !Role
+  , fvClock ∷ !VmClock
+  -- ^ How far the step has moved this VM's clock ahead of the world's ('vmAhead').
   }
 
 requiredPolicy ∷ WorkerPolicy
@@ -845,7 +852,7 @@ withFvmRefusing world runtime shape body = do
     atomically (modifyTVar' (ftVms (wTimer world)) (<> [TimerVm vmLabel vmClock vmThread (Just (scheduledEndpoint owner))]))
     -- The owner stops before the coordinator and the output close: a hook that runs while it retires
     -- (a @shutdown@ that prints) still finds both.
-    body (Fvm owner coordinator facade endpoint (shRole shape)) `finally` retireAndAwait (wControl world) owner
+    body (Fvm owner coordinator facade endpoint (shRole shape) vmClock) `finally` retireAndAwait (wControl world) owner
   where
     session = wSession world
     profile = wProfile world

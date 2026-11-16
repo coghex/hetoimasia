@@ -1,9 +1,10 @@
 {-# LANGUAGE OverloadedStrings #-}
 
 -- | The examples of the pump the terrain set steps its scripts with (#692): 'stepNext' and what is built on it in
--- "Test.LuaEngine.Facade.Support", over real supervised presentation and gameplay owners and the world's fake timer. Every wait
--- is coordinated (a registration, a thread parked in a transaction, a printed line); the only timed wait is the bound the last
--- examples make fire on purpose, short, around an operation that can never end otherwise.
+-- "Test.LuaEngine.Facade.Support", over real supervised presentation and gameplay owners and the world's fake timer; one example
+-- holds a peer VM in its update at the terrain rig's @TEST_WAIT@ fixture. Every wait is coordinated (a registration, a thread parked
+-- in a transaction, a printed line, a fixture entered); the only timed wait is the bound two examples make fire on purpose, short,
+-- around an operation that can never end otherwise.
 module Test.LuaEngine.Terrain.Pump (spec) where
 
 import Control.Concurrent.STM (atomically, newTVarIO, readTVar, readTVarIO, writeTVar)
@@ -11,17 +12,27 @@ import Control.Exception (ErrorCall (ErrorCall), throwIO, try)
 import Data.Either (isLeft)
 import Data.IORef (readIORef)
 import Data.Text (Text)
+import Data.Word (Word64)
 import qualified Data.Text as Text
 import Hetoimasia.LuaEngine.Profile (fixedM1Profile)
 import Hetoimasia.Scripting.Lua.Scheduler (TimerBackend (..))
 import System.Timeout (timeout)
 import Test.Hspec
 import Test.LuaEngine.Facade.Support
+import Test.LuaEngine.Terrain.Support (Rig (rgTrace), presentationOver, signalRig, withRig)
 import Test.Support.Owned (withOwnedThread)
 
 -- | A script whose every update prints how many updates it has run.
 counter ∷ Script
 counter = script {scInit = ["self.n = 0"], scUpdate = ["self.n = self.n + 1", "print('n=' .. self.n)"]}
+
+-- | A script whose every update waits at the rig's fixture until the example signals @hold@.
+held ∷ Script
+held = script {scUpdate = ["TEST_WAIT('hold')"]}
+
+-- | One second of a VM's clock, in nanoseconds.
+oneSecond ∷ Word64
+oneSecond = 1000000000
 
 counted ∷ Int → [Text]
 counted n = ["n=" <> Text.pack (show k) | k ← [1 .. n]]
@@ -101,6 +112,30 @@ spec = describe "The Lua test pump" $ do
       stepUntil world (elem "n=2" <$> outLinesSTM world)
       -- the VM ran two updates a second apart on its own clock: the world's clock, which every other VM reads, did not move
       readIORef (wClock world) `shouldReturn` 0
+
+  it "steps one VM while a peer is held in its update: the peer's clock stays at the deadline that woke it, and no step waits for it" $
+    withRig $ \rig →
+      withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource counter), ("lua/held.lua", scriptSource held)]) $ \world _ runtime →
+        withFvm world runtime (presentationOver rig) $ \peer → withFvm world runtime presentationShape $ \fvm → do
+          -- a VM's reading of the clock: the world's, plus how far the step moved that VM on
+          let reading vm = (+) <$> readIORef (wClock world) <*> vmAhead vm
+          _ ← spawn world peer "modules-test" "lua/held.lua"
+          -- the step wakes the peer's first point, a second on its clock, and the peer stays in that update
+          stepUntil world (elem "entered hold" <$> readTVar (rgTrace rig))
+          reading peer `shouldReturn` oneSecond
+          _ ← spawn world fvm "modules-test" mainPath
+          stepUntil world (elem "n=3" <$> outLinesSTM world)
+          awaitTimers world 1
+          -- three updates of the other VM, each one second on its own clock, and nothing more; the peer is where it was
+          outLines world `shouldReturn` counted 3
+          reading fvm `shouldReturn` 3 * oneSecond
+          reading peer `shouldReturn` oneSecond
+          readTVarIO (rgTrace rig) `shouldReturn` ["entered hold"]
+          signalRig rig "hold"
+          -- let go, the peer ends that update and arms its next point: the step never ran it again meanwhile
+          awaitTimers world 2
+          readTVarIO (rgTrace rig) `shouldReturn` ["released hold", "entered hold"]
+          reading peer `shouldReturn` oneSecond
 
   it "bounds the whole pumping operation once: steps that each end are still ended by the bound around them" $
     withCounterVm $ \world fvm → do

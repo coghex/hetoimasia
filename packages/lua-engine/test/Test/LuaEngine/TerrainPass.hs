@@ -22,17 +22,18 @@ examplePaths s = concatMap (walk []) . snd <$> runSpecM s
 spec ∷ Spec
 spec = describe "The terrain set's multi-capability pass" $ do
   let held = map (("Terrain" :) . Terrain.heldPath) Terrain.heldOut
-  let setting = PassSetting 2 FromDefault 1
+  let settings = [PassSetting count FromDefault 1 | count ← [2, 4]]
   it "names every module of the set once, with a reason" $ do
     let names = map Terrain.entryModule Terrain.entries
     nub names `shouldBe` names
     forM_ Terrain.entries $ \entry → Terrain.entryReason entry `shouldNotBe` ""
-  it "runs every example of the set under the pass's label but those it holds out, and none twice" $ do
-    passPaths ← examplePaths (Terrain.passSpec setting)
+  it "runs every example of the set under the pass's label but those it holds out, and none twice, at 2 and at 4 capabilities" $ do
     inPlace ← examplePaths Terrain.spec
-    passPaths `shouldBe` map (Terrain.passLabel :) (filter (`notElem` held) inPlace)
-    nub passPaths `shouldBe` passPaths
-    length passPaths `shouldSatisfy` (> 0)
+    forM_ settings $ \setting → do
+      passPaths ← examplePaths (Terrain.passSpec setting)
+      passPaths `shouldBe` map (Terrain.passLabel :) (filter (`notElem` held) inPlace)
+      nub passPaths `shouldBe` passPaths
+      length passPaths `shouldSatisfy` (> 0)
   it "names each example it holds out once, with a reason naming the issue that returns it, and that example runs in its place" $ do
     inPlace ← examplePaths Terrain.spec
     nub held `shouldBe` held
@@ -40,6 +41,7 @@ spec = describe "The terrain set's multi-capability pass" $ do
       length (filter (== ("Terrain" : Terrain.heldPath h)) inPlace) `shouldBe` 1
       Terrain.heldReason h `shouldSatisfy` \reason → '#' `elem` reason
   it "gives the pass's examples identities no example of the set in its place has" $ do
-    passPaths ← examplePaths (Terrain.passSpec setting)
     inPlace ← examplePaths Terrain.spec
-    (passPaths \\ inPlace) `shouldBe` passPaths
+    forM_ settings $ \setting → do
+      passPaths ← examplePaths (Terrain.passSpec setting)
+      (passPaths \\ inPlace) `shouldBe` passPaths
