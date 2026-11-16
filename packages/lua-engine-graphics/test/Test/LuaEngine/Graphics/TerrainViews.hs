@@ -41,7 +41,7 @@ import Hetoimasia.LuaEngine.Profile
   , profileSpec
   , validateProfile
   )
-import Hetoimasia.LuaEngine.Texture (RenderAccount)
+import Hetoimasia.LuaEngine.Texture (RenderAccount, accountCharged, accountLimit, accountRelease, accountReserve)
 import Hetoimasia.Render.TwoD.Chunk (ChunkRef)
 import Hetoimasia.Render.TwoD.Chunk.Backend (chunkRef)
 import Hetoimasia.Render.TwoD.Metrics (PixelExtent (..), TargetMetrics (..))
@@ -370,6 +370,23 @@ lifecycle = describe "close orders and limits" $ do
       closeView view
       publishedRevision (vModel v) 1 `shouldReturn` published
       atomically (claimOf (vClaims v) 1) `shouldReturn` Nothing
+
+  it "waits without publishing while another consumer fills the shared account, and publishes once it releases" $
+    withViews $ \v → do
+      -- Another consumer of the session's one account takes all but a few bytes of what is left.
+      taken ← atomically $ do
+        held ← accountCharged (_vAccount v)
+        let room = accountLimit (_vAccount v) - held - 64
+        ok ← accountReserve (_vAccount v) room
+        pure (if ok then room else 0)
+      taken `shouldSatisfy` (> 0)
+      view ← attached v 1
+      bounded (atomically (readView view >>= check . readingWaiting))
+      atomically (readView view) >>= (`shouldBe` Nothing) . readingPublished
+      -- The account is released: the view prepares again and publishes, with no new intent.
+      atomically (accountRelease (_vAccount v) taken)
+      _ ← awaitPublished v 1
+      closeView view
 
   it "refuses an attachment beyond the service's views, before taking anything" $
     withViewsConfig testConfig {tvMaxViews = 1} $ \v → do

@@ -239,6 +239,9 @@ data ViewReading = ViewReading
   , readingCpuBytes ∷ !Word64
   , readingGpuBytes ∷ !Word64
   , readingPins ∷ !Int
+  , readingWaiting ∷ !Bool
+    -- ^ The last preparation stopped on pressure (a bank, the shared account, the copies, the pins) and waits for
+    -- something to be released or adopted.
   }
   deriving (Eq, Show)
 

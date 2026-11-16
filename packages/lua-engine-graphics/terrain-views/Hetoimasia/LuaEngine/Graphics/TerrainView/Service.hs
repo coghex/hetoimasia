@@ -588,6 +588,7 @@ readView (TerrainView service state) = do
   regions ← readTVar (vsRegions state)
   pending ← readTVar (vsPending state)
   adopted ← adoptedRevision service state
+  waiting ← isJust <$> readTVar (vsRetry state)
   pure
     ViewReading
       { readingPhase = phase
@@ -598,6 +599,7 @@ readView (TerrainView service state) = do
       , readingCpuBytes = sum (map pinBytes (Map.elems pins))
       , readingGpuBytes = sum (map rgBytes (Map.elems regions))
       , readingPins = Map.size pins
+      , readingWaiting = waiting
       }
 
 -- The newest revision the host adopted for the view's target, when it is this view's world.
