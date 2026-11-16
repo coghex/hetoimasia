@@ -230,7 +230,7 @@ module Hetoimasia.Terrain.Runtime
 
 import Control.Concurrent.STM
 import Control.Exception (Exception, ExceptionWithContext, SomeException, mask, rethrowIO, throwIO, try, tryWithContext)
-import Control.Monad (forM_, void, when)
+import Control.Monad (forM_, unless, void, when)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (isNothing)
 import Data.Text (Text)
@@ -355,7 +355,29 @@ standaloneSupervisor group = Supervisor $ \definition →
 -- the body, outside any uninterruptible release, and it has no deadline: a
 -- borrower that never returns keeps the service, and so its dependencies, alive.
 withTerrainService ∷ Config → Ports → (Service → IO a) → IO a
-withTerrainService config ports body = do
+withTerrainService config ports body = withRetainedCarveOut config (withTerrainServiceFunded config ports body)
+
+-- | With an outside staging account, the snapshot backing bank ('configRetainedBytes'), which the port charges outside
+-- the model's steps, is held in the account as a fixed carve-out for the service's whole life: reserved before anything
+-- starts, in one transaction, or the service is refused ('ConfigStagingAccount') with nothing started; returned after the
+-- drain. The model's staging is charged step by step beside it, so the two together never exceed what the account
+-- granted. Without an account nothing is reserved outside.
+withRetainedCarveOut ∷ Config → IO a → IO a
+withRetainedCarveOut config inner = case configStagingAccount config of
+  Nothing → inner
+  Just account →
+    withResource
+      ( do
+          funded ← atomically (stagingAccountReserve account bytes)
+          unless funded (throwIO (ConfigStagingAccount bytes (stagingAccountLimit account)))
+      )
+      (\() → atomically (stagingAccountRelease account bytes))
+      (\() → inner)
+  where
+    bytes = configRetainedBytes config
+
+withTerrainServiceFunded ∷ Config → Ports → (Service → IO a) → IO a
+withTerrainServiceFunded config ports body = do
   -- Everything the configuration says is validated before anything starts: the store's
   -- allowance, the edit bank's division (for the configured arenas), the model's banks, and the
   -- compile account beside them (owner decision 2026-11-13, option B).

@@ -145,9 +145,30 @@ spec = describe "Superseded work and ordering" $ do
       charged <- readTVarIO held
       model <- atomically (stagingUse <$> inspectModelSTM svc)
       pure (charged, model)
-    -- the account holds exactly what the model's staging holds, and nothing is left once the service has drained
-    fst inside `shouldBe` snd inside
+    -- the account holds exactly what the model's staging holds beside the snapshot backing bank's carve-out, and
+    -- nothing is left once the service has drained
+    fst inside `shouldBe` snd inside + configRetainedBytes defaultConfig
     readTVarIO held `shouldReturn` 0
+    -- an account that cannot hold the carve-out refuses the service, with nothing started and nothing reserved
+    small <- newTVarIO (0 ∷ Word64)
+    withService defaultConfig {configStagingAccount = Just (accountOver small (configRetainedBytes defaultConfig - 1))} (\_ → pure ())
+      `shouldThrow` \case ConfigStagingAccount _ _ → True; _ → False
+    readTVarIO small `shouldReturn` 0
+
+  it "funds a regional snapshot's reservation only from the account's carve-out, never outside it" $ do
+    held <- newTVarIO (0 ∷ Word64)
+    withService defaultConfig {configStagingAccount = Just (accountOver held maxBound)} $ \svc → do
+      (_, lease) <- openMain svc "main"
+      let besideModel = do
+            charged ← readTVar held
+            model ← inspectModelSTM svc
+            pure (charged - stagingUse model)
+      atomically besideModel `shouldReturn` configRetainedBytes defaultConfig
+      borrow ← okOf (requestRegionSnapshot svc lease [RegionCoord 0 0 0]) >>= await svc >>= either (fail . show) pure
+      -- the copy's reservation and footprint live in the backing bank, which the carve-out already holds
+      atomically besideModel `shouldReturn` configRetainedBytes defaultConfig
+      releaseRegionBorrow svc borrow
+      atomically besideModel `shouldReturn` configRetainedBytes defaultConfig
 
   it "refuses camera demand whole while the shared account, not the model, is the binding limit, and admits it once another consumer releases" $ do
     held <- newTVarIO (0 ∷ Word64)
@@ -161,6 +182,11 @@ spec = describe "Superseded work and ordering" $ do
         let taken = 64 * 1024 * 1024 - now - 1
         writeTVar held (now + taken)
         pure taken
+      let fillAgain = atomically $ do
+            now <- readTVar held
+            let room = 64 * 1024 * 1024 - now
+            writeTVar held (now + room)
+            pure room
       used0 <- atomically (stagingUse <$> inspectModelSTM svc)
       setViewDemand svc view lease demands >>= \case
         Left (RefusedBusy _) → pure ()
@@ -172,8 +198,13 @@ spec = describe "Superseded work and ordering" $ do
       _ <- okOf (setViewDemand svc view lease demands)
       used1 <- atomically (stagingUse <$> inspectModelSTM svc)
       used1 `shouldSatisfy` (> used0)
-      readTVarIO held `shouldReturn` used1
+      readTVarIO held `shouldReturn` (used1 + configRetainedBytes defaultConfig)
+      -- releasing steps are never refused by the account: with the account full again, the view's demand clears and
+      -- the view closes, and their staging returns
+      _ <- fillAgain
+      _ <- okOf (clearViewDemand svc view)
       closeView svc view
+      atomically (stagingUse <$> inspectModelSTM svc) >>= (`shouldSatisfy` (< used1))
       settleChecks svc
 
   it "re-prepares an edit that another edit overtook and commits both in admission order" $

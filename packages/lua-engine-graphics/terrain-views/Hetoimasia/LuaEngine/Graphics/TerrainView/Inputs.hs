@@ -28,6 +28,7 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView.Inputs
   , copyGeneration
   , copyRegions
   , copySnapshots
+  , generationIdentity
   , combineCopies
   , Incoherent (..)
   , InputsError (..)
@@ -36,6 +37,7 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView.Inputs
   , knowledgeState
   ) where
 
+import Data.Bits (setBit, shiftR, xor, (.&.))
 import Data.Int (Int64)
 import Data.List (sortOn)
 import qualified Data.Map.Strict as Map
@@ -69,7 +71,7 @@ data CopySet = CopySet
   , copyContent ∷ !Revision
   , copyKnowledge ∷ !Revision
   , copyGeneration ∷ !Word64
-    -- ^ The newest residency generation among the copies: a label, not a datum.
+    -- ^ The copies' residency identity: their one generation, or a digest naming every one of them.
   , copySource ∷ !Source
   , copySnapshots ∷ ![RegionSnapshot]
   , copyRegions ∷ !(Set RegionCoord)
@@ -93,13 +95,22 @@ combineCopies copies@(first : rest) =
           { copyArena = regionSnapshotIncarnation first
           , copyContent = regionSnapshotContentRevision first
           , copyKnowledge = regionSnapshotKnowledgeRevision first
-          , copyGeneration = maximum (map regionSnapshotGeneration copies)
+          , copyGeneration = generationIdentity (map regionSnapshotGeneration copies)
           , copySource = regionSnapshotSource first
           , copySnapshots = copies
           , copyRegions = Set.fromList (concatMap regionSnapshotRegions copies)
           }
   where
     identityOf snapshot = (regionSnapshotIncarnation snapshot, regionSnapshotContentRevision snapshot, regionSnapshotKnowledgeRevision snapshot)
+
+-- | The residency identity of copies with these generations: the generation itself when they agree; otherwise an FNV-1a
+-- digest of the distinct generations in ascending order, with the top bit set.
+generationIdentity ∷ [Word64] → Word64
+generationIdentity generations = case Set.toAscList (Set.fromList generations) of
+  [one] → one
+  distinct → setBit (foldl' (\acc g → foldl' (\h byte → (h `xor` byte) * 1099511628211) acc (bytesOf g)) 14695981039346656037 distinct) 63
+  where
+    bytesOf g = [(g `shiftR` (8 * k)) .&. 255 | k ← [0 .. 7]]
 
 -- | Why the inputs could not be made from coherent copies: a defect of the copies or of the bounds, never a
 -- pending region.

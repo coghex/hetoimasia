@@ -7,8 +7,9 @@ The concrete graphics backends of the Lua-first engine: the texture pipeline's
 port ([`packages/lua-engine/README.md`](../lua-engine/README.md#the-texture-pipeline-lfe-16)),
 [the window provider](#the-window-provider-lfe-18),
 [scene publication](#scene-publication-lfe-20),
-[the graphics facade](#the-graphics-facade-lfe-21) and
-[the Lua input adapter](#the-lua-input-adapter-tra-6). It works on the
+[the graphics facade](#the-graphics-facade-lfe-21),
+[the Lua input adapter](#the-lua-input-adapter-tra-6) and
+[terrain views](#terrain-views-tra-9). It works on the
 protected graphics owner the host lends: the adapter starts no device and no
 thread per texture, instance or VM.
 
@@ -26,7 +27,8 @@ of it. The package is named only by `cabal.project.vulkan`.
 | `Texture.Backend`, `Texture.Port` | The state machine and its one pump thread, over a `Port` of values (the seam the lifecycle suite injects). Nothing in them names Vulkan. Their implementations live in the package's **private** `internal` sub-library; what the suite needs beyond the public modules (`pumpOnce`, observed and unpumped scopes) is reachable by no client. |
 | `Texture.Host` | The production `Port`, over a running `VulkanHost`. |
 | `Window.*` | The window provider. |
-| `Scene.*` | Scene publication, the hold ledger and the frame of an adopted scene. |
+| `Scene.*` | Scene publication, the hold ledger and the frame of an adopted scene; `Scene.World` (a terrain view's frame as the 2D renderer's values) and `Scene.Claims` (targets' exclusive claims). |
+| `TerrainView.*` | The terrain-view adapter, in the public sub-library `terrain-views`, the package's only component that depends on the terrain packages. |
 | `Facade` | The composition of the CPU facade's graphics operations. |
 | `Input` | The Lua input adapter. |
 
@@ -511,6 +513,127 @@ An acknowledgement is one STM transaction and needs no command or request
 capacity. A poll is gated on the instance still taking work; an
 acknowledgement is not, because it is cleanup.
 
+## Terrain views (TRA-9)
+
+A terrain view publishes a borrowed terrain arena to one target as a retained
+world scene. `Hetoimasia.LuaEngine.Graphics.TerrainView` (sub-library
+`terrain-views`) is the Haskell interface a Lua binding wraps; it adds no Lua
+binding, request policy or input handling. The main library imports no
+terrain package, and no terrain, runtime or planner package imports this one.
+
+```haskell
+withTerrainViews ∷ (Ord k, Show k) ⇒ TerrainViewsConfig → TerrainViewsPorts k → (TerrainViews k → IO a) → IO a
+productionPorts ∷ VulkanHost GraphicsScene → TextureGraphics → SceneSession → Service → Client → RenderAccount → STM Bool → IO (TerrainViewsPorts SceneTargetKey)
+attachView ∷ TerrainViews k → AttachRequest k → IO (Either AttachRefusal (PendingAttach k))   -- inside the owning instance's call
+updateCamera, updatePresentation, jumpView, pickView, readView   -- one transaction each, never waiting
+pickPrecondition ∷ TerrainView k → PickRef k → Precondition                            -- for the removal's arbitration
+closeView ∷ TerrainView k → IO ()
+```
+
+**The scene.** A target's scene is an M1 scene or a world scene
+(`worldGraphicsScene`): one depth-enabled world view whose quads live in
+retained chunks, with the metrics it was planned for, the chunks it lists and
+the textures it names. The host's own latest-value publication, release
+barrier, adoption and ledger carry it; there is no second barrier, scene key,
+device or session. The ledger holds a world revision's chunks and textures for
+each adoption, and holds **explicit interests**: while a view holds an interest
+in a parent texture, the texture backend does not release its registration,
+whatever its lease.
+
+**Claims.** A view publishes only under its target's exclusive claim
+(`SceneClaims`, keyed by the host's target incarnation, naming the view
+incarnation). The M1 publisher reads the claim in its commit transaction and
+refuses ordinarily (`TargetClaimed`, "a terrain view holds the window"). The
+claim is taken in the transaction that checks the target, the session and the
+parents' registrations and takes the view's GPU interests; a terrain
+publication commits in the transaction that checks the claim still names its
+view.
+
+**Attaching** runs in the owning instance's call: the two parents are
+retained through the instance's leases (`retainTexture`, which needs the VM's
+loan), with their coverage planes, profiles and dimensions from one loaded
+version, and the style is checked (`checkStyle`: kinds, single-level parents,
+`unit-normal-rgb-v1`, every region of the manifest, the materials' colour
+regions, the instance's texture byte limit). The rest runs on the adapter's
+worker and settles once (`SettledOk`, `SettledRefused`, `SettledCancelled`);
+every refusal and a cancellation release what was retained.
+
+| Refusal | Meaning |
+| --- | --- |
+| `AttachStyle` | a parent refused by the lease, unsuitable, without coverage, unbindable; an incomplete mapping; parents over the instance's texture bytes. Never busy |
+| `AttachNoDepth` | the target's frames carry no `D32_SFLOAT` depth image, or the session's depth format is not `D32_SFLOAT` |
+| `AttachTargetUnusable`, `AttachTargetClaimed`, `AttachParentReleased` | read in the commit transaction, before any claim |
+| `AttachArena`, `AttachSettings`, `AttachCamera`, `AttachTooManyViews` | the arena lease, the presentation settings, the camera's start, eight views |
+| `AttachBusy`, `AttachStopped` | the request queue or the terrain service's admission; the adapter or session ended |
+
+**Preparation** (the adapter's one worker, round-robin over views, latest
+intent only) starts from regional copies (`requestRegionSnapshot`) of the
+camera's anchor and grows them with each plan's own visible demand, a bounded
+number of rounds, from fresh coherent copies (one incarnation, content and
+knowledge revision); copies of different versions are never combined, and a
+copy is released once the facts and knowledge are made. Regions not yet read
+are pending, never fog or air. The camera's interests (`setViewDemand`,
+visible before prefetch) are kept and sent again when a busy refusal clears.
+A plan superseded by newer intent is abandoned. Its quads are grouped into
+retained regions of 16 x 16 cells of the view frame, each region one chunk; a
+region whose instances and records are unchanged is reused. Chunks are built
+by owner actions, published only once their uploads are ready, and retired
+through the host's release barrier (asked without waiting) and the ledger:
+released on the owner only when no adoption lists them.
+
+**Accounting.** The view's CPU payloads, the parents' coverage planes and the
+terrain service's staging all draw on the session's one `RenderAccount`
+(the service is given it as `renderStagingAccount`). A view holds whole
+granules of it (`tvAccountGranule`, 1 MiB): reserved as its need (its pinned
+revisions and the candidate being prepared) grows past one, returned only when
+a whole granule is free, and counted as the view's charge. A need that moves
+within a granule leaves the account untouched, so a panning camera does not
+write the account the terrain service reads in its own transactions. The other
+variables a pick's guard reads in the terrain service's removal arbitration are
+written rarely: the view's close flag, the claim table (attach, close, a
+claim's first publication) and the target's own newest-adopted revision (an
+adoption of that target, which only its view publishes to). The terrain GPU-data bank
+(128 MiB) charges every retained chunk's bytes, live and retiring, until the
+owner reports the chunk released. Two pinned plans a view (the newest
+published and the newest adopted); a preparation that would need a third waits
+for an adoption. Pressure (a bank, the account, the copies) keeps the previous
+view and retries when something is released or adopted.
+
+**Picking** reads only the revision the host adopted for the target and the
+plan pinned for it: no adopted revision, or metrics that are not the plan's,
+is `PickLoading`; zero metrics, a point outside, air, gaps and fog are
+`PickNoHit`; a visible known part is `PickHit` with an opaque reference.
+`pickPrecondition` gives the removal the arena incarnation and the content and
+knowledge revisions, and a guard the terrain service reads in its removal
+arbitration: the view still holds the target and the revision picked from is
+still the one adopted.
+
+**Closing** withdraws the view's demand, then, in one transaction, releases the
+claim and, if the view published and the target is usable, publishes the
+host's initial content as a real new revision; drops the GPU interests; and
+starts the retirement of its regions. A view that never published leaves the
+target's latest value alone. The service's end closes every view, then drains
+the retirements to the owner's evidence; retirement the owner can no longer
+prove is kept as terminal evidence (`terrainViewsFailures`).
+
+**Depth.** A terrain-enabled composition sets the host-wide window depth
+(`configureWorldDepth`): every swapchain generation of every window gets a
+managed `D32_SFLOAT` image, charged in the native bank and destroyed after its
+batches complete. A surface-free target supplies its depth through its
+recording boundary (`renderWorldTarget`). An M1 scene names no depth-enabled
+layer, so its frames are unchanged by the depth image.
+
+| State | Owner | Writers / thread | Readers | Transfer and disposal |
+| --- | --- | --- | --- | --- |
+| The service (views, requests, GPU bank, retirements, failures) | `withTerrainViews` | its worker; callers' transactions | STM | the end closes every view, drains retirements, joins the worker |
+| A view's intent (camera, presentation, revision) | the view | callers, one transaction each | the worker | latest value, never queued |
+| A target claim | the scene session | attach, publish, close | the M1 publisher's commit | released by close, with the empty handback |
+| A parent's CPU interest | the view | attach (caller's call), close | the planner | released at close or on any refusal |
+| A parent's GPU interest | the view, in the ledger | attach and close, each one transaction | the texture backend's release | dropped at close; retirement then waits for adoptions and GPU use |
+| A regional copy | the worker | the worker | the worker | released once the plan's inputs are made |
+| A pinned plan | the view | the worker | pick | unpinned when neither newest published nor adopted; its CPU bytes return |
+| A retained region | the view, then the retirement list | the worker, owner actions | adopted frames | barrier met and no adoption lists it, then released on the owner; its GPU bytes return then |
+
 ## Tests
 
 Neither suite runs through `cabal test`.
@@ -550,6 +673,20 @@ nothing fails.
 | `window provider` | real | two instances' windows, one ended with the peer usable, a genuine native close. No pixel |
 | `scene retention` | real | holds and release through the host's frame events and scene state. No pixel |
 | `graphics facade` | real | the quad example and input polling on the production host. No pixel, and **no key, button or scroll is delivered**: real native event delivery through the adapter is not covered here |
+| `terrain views` | none | a terrain view on a surface-free target with its depth image, every pixel judged by the render-2d oracle with the terrain material's model; drawn again after the Lua handles' release and an edit; the superseded regions retired; the real empty handback |
+
+Every run except the probes and the full terrain matrix then starts a second,
+short session of the **terrain-enabled host** (host-wide window depth): an M1
+scene published to a real window, adopted, and its frames recorded and
+presented with the depth image (`M1 output on the terrain-enabled host`; no
+pixel, since a window's image is not readable from this suite).
+
+The broader terrain-view matrix (every facing, zoom 0.5 and 2, a portrait
+target) is outside routine CI and is run alone, with the same checks:
+
+```sh
+HETOIMASIA_NATIVE_SESSION=desktop bash tools/vulkan/run.sh native hetoimasia-lua-engine-graphics:test:lua-engine-graphics-native-tests -- --terrain-views-full
+```
 
 ## Lua offscreen pixels (LFE-24)
 

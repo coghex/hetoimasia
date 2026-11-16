@@ -559,6 +559,8 @@ data ConfigError
   | -- | The query limits let a read keep more runs than its pin credit can hold beside the pages one read
     -- step needs: what the worst read keeps, and what the credit leaves for it.
     ConfigQueryKeep !Integer !Integer
+  | -- | The outside staging account cannot hold the snapshot backing bank: what the bank needs, and the account's limit.
+    ConfigStagingAccount !Word64 !Word64
   deriving stock (Show)
 
 instance Exception ConfigError

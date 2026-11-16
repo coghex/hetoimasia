@@ -21,6 +21,7 @@ import qualified Data.Map.Strict as Map
 import Data.Maybe (isJust)
 import qualified Data.Set as Set
 import qualified Data.Text as Text
+import Data.Bits (testBit)
 import Data.Word (Word32, Word64)
 import Hetoimasia.Foundation.Log (Logger, callbackSink, defaultLogFilter, mkLogger)
 import Hetoimasia.Foundation.Messaging.Payload (prepare)
@@ -30,6 +31,7 @@ import Hetoimasia.LuaEngine.Graphics.Scene.Ledger (GraphicsScene (..), LedgerRea
 import Hetoimasia.LuaEngine.Graphics.Scene.Publish (HostAnswer (..))
 import Hetoimasia.LuaEngine.Graphics.Scene.World (SceneWorld (..), WorldTag (..))
 import Hetoimasia.LuaEngine.Graphics.TerrainView
+import Hetoimasia.LuaEngine.Graphics.TerrainView.Inputs (generationIdentity)
 import Hetoimasia.LuaEngine.Profile
   ( ByteLimit (..)
   , Bytes (..)
@@ -105,6 +107,7 @@ data Views = Views
 
 spec ∷ Spec
 spec = describe "terrain views" $ do
+  reuse
   pickConsistency
   races
   lifecycle
@@ -346,6 +349,57 @@ races = describe "attachment and intent" $ do
       closeView view
   where
     isInvalid = \case Left (IntentInvalid _) → True; _ → False
+
+-- ---------------------------------------------------------------------------
+-- Reuse and coherent replacement
+
+reuse ∷ Spec
+reuse = describe "retained regions" $ do
+  it "reuses every region across frames and across a presentation-only change, building nothing again" $
+    withViews $ \v → do
+      view ← attached v 1
+      first' ← awaitPublished v 1
+      chunks ← worldChunks <$> latestWorld v 1
+      built ← readTVarIO (foBuilt (vOwner v))
+      -- frames: adoptions and their releases build nothing
+      adoptNow (vModel v) 1 `shouldReturn` Adopted first'
+      _ ← releasePass (vModel v)
+      -- a presentation-only change publishes a new revision over the same regions
+      atomically (updatePresentation view noPresentationUpdate {updateAmbient = Just 0.5}) `shouldReturn` Right ()
+      _ ← awaitPublished' v 1 (first' + 1)
+      worldChunks <$> latestWorld v 1 `shouldReturn` chunks
+      readTVarIO (foBuilt (vOwner v)) `shouldReturn` built
+      closeView view
+
+  it "never exposes a partial frame while an edit's rebuild uploads: the old revision stays published and pickable until the whole new one is ready" $
+    withViews $ \v → do
+      view ← attached v 1
+      first' ← awaitPublished v 1
+      adoptNow (vModel v) 1 `shouldReturn` Adopted first'
+      old ← latestWorld v 1
+      atomically (writeTVar (foHoldUploads (vOwner v)) True)
+      _ ← removeWith v (tileAt 8 8 3) Nothing
+      -- the rebuild's chunks are built and still uploading: nothing new is published, and picks use the old frame
+      bounded (atomically (readTVar (foStanding (vOwner v)) >>= check . elem ChunkUploading . Map.elems))
+      publishedRevision (vModel v) 1 `shouldReturn` first'
+      (worldTag <$> latestWorld v 1) `shouldReturn` worldTag old
+      atomically (pickView view (64, 48)) >>= (`shouldSatisfy` (/= PickLoading))
+      -- the uploads complete: the new revision is published whole, every chunk it lists ready
+      atomically $ do
+        writeTVar (foHoldUploads (vOwner v)) False
+        modifyTVar' (foStanding (vOwner v)) (Map.map (const ChunkReady))
+      _ ← awaitPublished' v 1 (first' + 1)
+      new ← latestWorld v 1
+      standings ← readTVarIO (foStanding (vOwner v))
+      [Map.lookup chunk standings | chunk ← Set.toList (worldChunks new)] `shouldSatisfy` all (== Just ChunkReady)
+      closeView view
+
+  it "names every borrow's residency generation in the plan's identity, never relabelling one as another" $ do
+    generationIdentity [7, 7, 7] `shouldBe` 7
+    let mixed = generationIdentity [7, 9]
+    mixed `shouldBe` generationIdentity [9, 7, 9]
+    mixed `shouldSatisfy` (\g → g /= 7 && g /= 9 && testBit g 63)
+    generationIdentity [7, 10] `shouldNotBe` mixed
 
 -- ---------------------------------------------------------------------------
 -- Close orders, limits and the service's end
@@ -855,10 +909,12 @@ data FakeOwner = FakeOwner
     -- ^ While set, a build fails with this reason, as the owner's would.
   , foInstances ∷ !(TVar (Map ChunkRef [Instance]))
     -- ^ What each chunk was built from.
+  , foHoldUploads ∷ !(TVar Bool)
+    -- ^ While set, a new chunk's upload stays under way until the example completes it.
   }
 
 newFakeOwner ∷ Model → IO FakeOwner
-newFakeOwner model = FakeOwner model <$> newTVarIO 1 <*> newTVarIO Map.empty <*> newTVarIO [] <*> newTVarIO 0 <*> newTVarIO True <*> newTVarIO 0 <*> newTVarIO Nothing <*> newTVarIO Map.empty
+newFakeOwner model = FakeOwner model <$> newTVarIO 1 <*> newTVarIO Map.empty <*> newTVarIO [] <*> newTVarIO 0 <*> newTVarIO True <*> newTVarIO 0 <*> newTVarIO Nothing <*> newTVarIO Map.empty <*> newTVarIO False
 
 fakeViewOwner ∷ FakeOwner → ViewOwner
 fakeViewOwner owner =
@@ -877,7 +933,8 @@ fakeViewOwner owner =
           start ← readTVar (foNext owner)
           let refs = [chunkRef index 1 | index ← take (length regions) [start ..]]
           writeTVar (foNext owner) (start + fromIntegral (length regions))
-          modifyTVar' (foStanding owner) (Map.union (Map.fromList [(ref, ChunkReady) | ref ← refs]))
+          holding ← readTVar (foHoldUploads owner)
+          modifyTVar' (foStanding owner) (Map.union (Map.fromList [(ref, if holding then ChunkUploading else ChunkReady) | ref ← refs]))
           modifyTVar' (foInstances owner) (Map.union (Map.fromList (zip refs (map buildInstances regions))))
           modifyTVar' (foBuilt owner) (+ length regions)
           pure (Just (Right refs))
