@@ -451,32 +451,61 @@ eviction = describe "eviction" $ do
       attempts `shouldSatisfy` (<= 2 * fromIntegral published)
       Runtime.closeView (_vTerrain v) other
       closeView view
-  it "pans away until the view's regions are evicted and back: they reload, and the view publishes the same plan and picks again" $
+  it "pans away, has an original region evicted by another holder's pressure, and back: it reloads, and the view publishes the same plan and picks again" $
     withViewsTerrain HostFirst tightTerrain stripes testConfig $ \v → do
       view ← attached v 1
       _ ← awaitPublished v 1
       quiescent v
+      demandResident v view
       hit ← currentHit v view
       plan ← atomically (adoptedPlan view) >>= maybe (fail "no adopted plan") pure
       picks ← atomically (picksOver view)
       instances ← drawnInstances v 1
-      original ← residentRegions v
-      -- pan east three regions at a time until one of the view's first regions has been evicted (a region the camera
-      -- demands stores at most about 37 KB, and each step demands about eight new ones)
+      Just (firstVisible, _) ← atomically (viewDemand view)
+      let original = Set.fromList firstVisible
+      -- pan away three regions at a time until the view's demand no longer names any original region: they keep no
+      -- interest and become the bank's candidates
       let away k = do
             now ← publishedRevision (vModel v) 1
             atomically (updateCamera view (CameraIntent [Camera.Pan 48 0])) `shouldReturn` Right ()
-            _ ← awaitPublished' v 1 (now + 1)
-            _ ← adoptNow (vModel v) 1
+            newer ← awaitPublished' v 1 (now + 1)
+            -- the host adopts each step, so the view's pins move on
+            adoptNow (vModel v) 1 `shouldReturn` Adopted newer
             _ ← releasePass (vModel v)
-            -- the step's demand loads before the camera moves on, so the bank fills step by step
             demandResident v view
-            gone ← Set.difference original <$> residentRegions v
-            if not (Set.null gone) || k >= 60 then pure (k, gone) else away (k + 1)
-      (pans, evicted) ← away (1 ∷ Int)
+            Just (visibleNow, prefetchNow) ← atomically (viewDemand view)
+            if Set.null (Set.intersection original (Set.fromList (visibleNow <> prefetchNow))) || k >= 8 then pure k else away (k + 1)
+      pans ← away (1 ∷ Int)
+      Just (visibleAway, prefetchAway) ← atomically (viewDemand view)
+      Set.intersection original (Set.fromList (visibleAway <> prefetchAway)) `shouldBe` Set.empty
+      -- another holder presses the bank with batches of regions far away, each batch replacing the last, until a region
+      -- of the view's first demand, named by its coordinate, has been evicted
+      other ← Runtime.openView (_vTerrain v) (vClient v) >>= either (fail . show) pure
+      let press k
+            | k > 40 = pure Set.empty
+            | otherwise = do
+                let batch = [RegionCoord (200 + 4 * k + i) j (-1) | i ← [0 .. 3], j ← [0, 1]]
+                demands ← either (fail . show) pure (traverse (\r → RegionDemand r <$> coverageBox 0 16 0 16 0 32) batch)
+                _ ← Runtime.setViewDemand (_vTerrain v) other (vArena v) demands >>= either (fail . show) pure
+                bounded . atomically $ Runtime.inspectModelSTM (_vTerrain v) >>= \model →
+                  check (all (`elem` map regionCoord (modelRegions model)) batch)
+                -- the loads move the residency generation and the view publishes again; the host adopts what it
+                -- publishes, as a presenting host does (a view keeps at most two revisions pinned)
+                _ ← adoptNow (vModel v) 1
+                _ ← releasePass (vModel v)
+                gone ← Set.difference original <$> residentRegions v
+                if Set.null gone then press (k + 1) else pure gone
+      evicted ← press (0 ∷ Int64)
       evicted `shouldSatisfy` (not . Set.null)
-      -- back to the first camera: the evicted regions load again under the view's demand
+      Runtime.closeView (_vTerrain v) other
+      quiescent v
+      _ ← currentHit v view
+      -- back to the first camera: the evicted regions load again under the view's own demand
+      back ← publishedRevision (vModel v) 1
       atomically (updateCamera view (CameraIntent [Camera.Pan (-48 * fromIntegral pans) 0])) `shouldReturn` Right ()
+      returned ← awaitPublished' v 1 (back + 1)
+      adoptNow (vModel v) 1 `shouldReturn` Adopted returned
+      _ ← releasePass (vModel v)
       bounded (atomically (Runtime.inspectModelSTM (_vTerrain v) >>= \model → check (original `Set.isSubsetOf` Set.fromList (map regionCoord (modelRegions model)))))
       again ← currentHit v view
       -- the residency generation moved, and the view caught up with it; what it draws and picks is what it was
