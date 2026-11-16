@@ -22,7 +22,7 @@ module Test.LuaEngine.Graphics.Native.TerrainViews (spec, fullSpec) where
 
 import Control.Concurrent.STM
 import Control.Exception (finally, onException)
-import Control.Monad (forM, forM_, unless, void)
+import Control.Monad (forM, forM_, unless, void, when)
 import qualified Data.ByteString as ByteString
 import qualified Data.ByteString.Char8 as BC
 import Data.IORef (newIORef, readIORef, writeIORef)
@@ -159,7 +159,7 @@ fullSpec env = describe "terrain views (full)" $ do
         atomically (updateCamera view (CameraIntent [Camera.SetFacing facing])) `shouldReturn` Right ()
         _ ← awaitAdopted rig (n + 1)
         rendered ← renderJudged rig ("facing " <> Text.pack (show facing))
-        void (pickAgreement view rendered)
+        pickAgreement view rendered >>= notePicks
         closeView view
   forM_ [0.125, 0.5, 2, 8] $ \zoom →
     it ("draws a zoom exactly, the endpoints included: " <> show zoom) $
@@ -169,7 +169,7 @@ fullSpec env = describe "terrain views (full)" $ do
         atomically (updateCamera view (CameraIntent [Camera.SetZoom zoom])) `shouldReturn` Right ()
         _ ← awaitAdopted rig (n + 1)
         rendered ← renderJudged rig ("zoom " <> Text.pack (show zoom))
-        void (pickAgreement view rendered)
+        pickAgreement view rendered >>= notePicks
         closeView view
   it "draws a portrait target exactly, and a pick over the clear background finds nothing" $
     within 60 . withRig env $ \rig → do
@@ -178,7 +178,7 @@ fullSpec env = describe "terrain views (full)" $ do
       rendered ← renderJudged rig "portrait"
       clearPicks ← forM (take 64 (rwClear rendered)) $ \(x, y) → atomically (pickView view (fromIntegral x + 0.5, fromIntegral y + 0.5))
       [p | p@(PickHit _) ← clearPicks] `shouldBe` []
-      void (pickAgreement view rendered)
+      pickAgreement view rendered >>= notePicks
       closeView view
   it "draws an adopted view again after its target is resized, at the new metrics, and picks what it draws" $
     within 60 . withRig env $ \rig → do
@@ -188,7 +188,7 @@ fullSpec env = describe "terrain views (full)" $ do
       atomically (writeTVar (rgMetrics rig) (metricsOf 96 128))
       _ ← awaitAdopted rig (n + 1)
       rendered ← renderJudged rig "after the resize"
-      void (pickAgreement view rendered)
+      pickAgreement view rendered >>= notePicks
       closeView view
   it "draws a lower background far outside the camera's radius exactly" $
     within 60 . withRigOn pillarOverPlain (\c → c {tvCellConfig = (tvCellConfig c) {ccDepth = 250}}) env $ \rig → do
@@ -197,22 +197,31 @@ fullSpec env = describe "terrain views (full)" $ do
       Just (visible, _) ← atomically (viewDemand view)
       [r | r ← visible, abs (regionX r) > 1 || abs (regionY r) > 1] `shouldSatisfy` (not . null)
       rendered ← renderJudged rig "background"
-      void (pickAgreement view rendered)
+      pickAgreement view rendered >>= notePicks
       closeView view
   it "draws a revealed cavity's ordinary, fog and mixed cells exactly" $
     within 60 . withRigOn cavitySource id env $ \rig → do
       view ← attach rig (metricsOf 128 96)
-      n ← awaitAdopted rig 1
+      _ ← awaitAdopted rig 1
       let axis = either (error . show) id . axisFromInteger
-      landing ← atomically (jumpView view (JumpRequest (axis 8, axis 8) (Just (axis 2)))) >>= either (assertFailure . show) pure
-      within 20 (atomically (jumpSettled landing >>= maybe retry pure)) `shouldReturn` SettledOk JumpLanded
+          sliced = do
+            now ← publishedOf rig
+            landing ← atomically (jumpView view (JumpRequest (axis 8, axis 8) (Just (axis 2)))) >>= either (assertFailure . show) pure
+            within 20 (atomically (jumpSettled landing >>= maybe retry pure)) `shouldReturn` SettledOk JumpLanded
+            void (awaitAdopted rig (now + 1))
+      sliced
+      -- the removal above the sealed cavity opens it, and the view is cut through it again
+      now ← publishedOf rig
       removeAt rig (8, 8, 3)
-      _ ← awaitAdopted rig (n + 2)
-      Just plan ← atomically (adoptedPlan view)
-      let parts = Set.fromList (map quadPart (cellPlanQuads plan))
-      (Set.member PartFog parts, Set.member PartKnown parts, Set.member PartOrdinary parts) `shouldBe` (True, True, True)
+      _ ← awaitAdopted rig (now + 1)
+      sliced
+      parts ← within 20 . atomically $ do
+        plan ← adoptedPlan view >>= maybe retry pure
+        let found = Set.fromList (map quadPart (cellPlanQuads plan))
+        if Set.fromList [PartFog, PartKnown, PartOrdinary] `Set.isSubsetOf` found then pure found else retry
+      Set.size parts `shouldBe` 3
       rendered ← renderJudged rig "mixed"
-      void (pickAgreement view rendered)
+      pickAgreement view rendered >>= notePicks
       closeView view
   it "keeps the adopted image when a replacement is refused as stale, then draws the replacement once it is made again" $ do
     stage ← newTVarIO (Nothing ∷ Maybe (Text.Text, TVar Bool))
@@ -253,7 +262,9 @@ fullSpec env = describe "terrain views (full)" $ do
       -- a newer revision is made and adopted while the first one's batch may still be running
       removeAt rig (8, 8, 3)
       _ ← awaitAdopted rig (n + 1)
-      overlapped ← atomically (prInFlight inFlight)
+      (overlapped, live) ← atomically ((,) <$> prInFlight inFlight <*> liveChunksSTM rig)
+      -- while the first batch is in flight, every chunk it drew with is still held, the newer adoption notwithstanding
+      when overlapped (chunksA `Set.isSubsetOf` live `shouldBe` True)
       a ← renderFinish inFlight
       worldChunks (rwWorld a) `shouldBe` chunksA
       evidenceNote ("terrain views (full): the newer revision was adopted " <> (if overlapped then "while" else "after") <> " the first one's batch was in flight; its readback was judged whole")
@@ -450,6 +461,10 @@ renderSubmit rig name = do
           Right (batch, Left failure) → pure (Right (batch, Just failure))
           Right (batch, Right ()) → pure (Right (batch, Nothing))
     (batch, failure) ← either (assertFailure . Text.unpack) pure ticket
+    -- the registry as the batch was recorded: the world is judged against what it drew with, whatever is released
+    -- after its batch completes
+    chunks ← retainedChunks (graphicsRetained graphics)
+    marks ← registeredMarks (graphicsTextures graphics)
     pure . PendingRender ((== TicketPending) <$> readTicket batch) . (`finally` release) $ do
      completion ← atomically (readTicket batch >>= \state → if state == TicketPending then retry else pure state)
      forM_ failure (assertFailure . Text.unpack)
@@ -457,8 +472,6 @@ renderSubmit rig name = do
      bytes ← act host (VulkanAction (\construction → readConstructedReadback construction readback 0 bytesWanted)) >>= either (assertFailure . Text.unpack) pure
      (revision, world) ← readIORef recorded >>= maybe (assertFailure "nothing was recorded") pure
      -- The independent judgement: the oracle, given the terrain material's pure model and the decoded parents.
-     chunks ← retainedChunks (graphicsRetained graphics)
-     marks ← registeredMarks (graphicsTextures graphics)
      let reference = targetRef 1 1
          snapshot = Snapshot [Pass (OffscreenTarget reference) (worldClear world) [worldView world]]
      valid ← either (\why → assertFailure ("the world does not validate: " <> show why)) pure (validateSnapshotWith chunks snapshot)
@@ -529,26 +542,39 @@ act host action =
         ActionReturned (Left refusal) → pure (Left (Text.pack (show refusal)))
         _ → pure (Left "the action raised or was refused")
 
--- At every judged terrain pixel that exactly one quad of a known part covers in the adopted plan, the pick is a hit of
--- that quad's cell: answers how many pixels it judged, at least one.
-pickAgreement ∷ TerrainView SceneTargetKey → RenderedWorld → IO Int
+-- The picks judged against the adopted plan (the oracle names colours, not the quad that wins a pixel). At every
+-- judged terrain pixel whose containing quads in the plan are all known parts, the pick is a hit, and its cell is the
+-- cell of one of those quads: the frontmost, unless that quad's texel is a cutout there and a rearward one shows. Answers
+-- how many pixels were judged (at least one) and how many named the frontmost quad's cell.
+pickAgreement ∷ TerrainView SceneTargetKey → RenderedWorld → IO (Int, Int)
 pickAgreement view rendered = do
   plan ← atomically (adoptedPlan view) >>= maybe (assertFailure "no adopted plan") pure
-  let quads = cellPlanQuads plan
-      covers (x, y) quad =
+  -- nearest first, the order the pick examines them in
+  let nearestFirst = reverse (cellPlanQuads plan)
+      contains (x, y) quad =
         let TargetRect l t r b = quadTarget quad
-            px = fromIntegral x + 1 / 2
-            py = fromIntegral y + 1 / 2
-         in l <= px && px < r && t <= py && py < b
-      single = [(p, cell) | p ← rwDrawn rendered, [quad] ← [filter (covers p) quads], Just cell ← [quadCell quad]]
-  answers ← forM single $ \(p@(x, y), cell) → (,,) p cell <$> atomically (pickView view (fromIntegral x + 0.5, fromIntegral y + 0.5))
-  [(p, cell, answer) | (p, cell, answer) ← answers, not (hitOf cell answer)] `shouldBe` []
-  length single `shouldSatisfy` (> 0)
-  pure (length single)
+            px = fromIntegral x + 1 / 2 ∷ Double
+            py = fromIntegral y + 1 / 2 ∷ Double
+         in realToFrac l <= px && px < realToFrac r && realToFrac t <= py && py < realToFrac b
+      judged =
+        [ (p, cells)
+        | p ← rwDrawn rendered
+        , let containing = filter (contains p) nearestFirst
+        , not (null containing)
+        , all ((/= PartFog) . quadPart) containing
+        , Just cells ← [mapM quadCell containing]
+        ]
+  answers ← forM judged $ \(p@(x, y), cells) → (,,) p cells <$> atomically (pickView view (fromIntegral x + 0.5, fromIntegral y + 0.5))
+  [(p, take 3 cells, answer) | (p, cells, answer) ← answers, not (hitAmong cells answer)] `shouldBe` []
+  length judged `shouldSatisfy` (> 0)
+  pure (length judged, length [() | (_, front : _, PickHit ref) ← answers, pickRefCell ref == front])
   where
-    hitOf cell = \case
-      PickHit ref → pickRefCell ref == cell
+    hitAmong cells = \case
+      PickHit ref → pickRefCell ref `elem` cells
       _ → False
+
+notePicks ∷ (Int, Int) → IO ()
+notePicks (judged, front) = evidenceNote ("picks judged from the adopted plan: " <> Text.pack (show judged) <> " pixels, " <> Text.pack (show front) <> " naming the frontmost quad's cell")
 
 -- The adopted scene's world.
 adoptedWorld ∷ Rig → IO (Natural, SceneWorld)
