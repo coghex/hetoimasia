@@ -112,6 +112,7 @@ library terrain-views
     hs-source-dirs: terrain-views
     exposed-modules:
         Hetoimasia.LuaEngine.Graphics.TerrainView.Inputs
+        Hetoimasia.LuaEngine.Graphics.TerrainView.Owner
         Hetoimasia.LuaEngine.Graphics.TerrainView.Service
         Hetoimasia.LuaEngine.Graphics.TerrainView.Style
         Hetoimasia.LuaEngine.Graphics.TerrainView.Types

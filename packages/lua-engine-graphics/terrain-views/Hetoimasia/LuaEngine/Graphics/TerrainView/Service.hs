@@ -86,34 +86,24 @@ import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Word (Word64)
 import Hetoimasia.Foundation.Messaging.Payload (prepare)
-import Hetoimasia.GPU.Vulkan.GLFW
-  ( ActionOutcome (..)
-  , ImageFormat (Depth32Float)
-  , VulkanAction (..)
-  , VulkanHost
-  , awaitVulkanAction
-  , requestVulkanRelease
-  , submitVulkanAction
-  )
+import Hetoimasia.GPU.Vulkan.GLFW (SceneTargetKey)
 import Hetoimasia.LuaEngine.Graphics.Scene.Claims (Claim (..), claimOf, markClaimPublished, releaseClaim, takeClaim)
 import Hetoimasia.LuaEngine.Graphics.Scene.Configuration (SceneSession (..))
-import Hetoimasia.LuaEngine.Graphics.Scene.Ledger (GraphicsScene, ledgerChunkHeld, ledgerDropInterest, ledgerNewestAdopted, ledgerRetainInterest, worldGraphicsScene)
+import Hetoimasia.LuaEngine.Graphics.Scene.Ledger (SceneLedger, ledgerChunkHeld, ledgerDropInterest, ledgerNewestAdopted, ledgerRetainInterest, worldGraphicsScene)
 import Hetoimasia.LuaEngine.Graphics.Scene.World (SceneWorld (..), WorldTag (..))
 import Hetoimasia.LuaEngine.Graphics.TerrainView.Inputs (CopySet, combineCopies, copyArena, copyContent, copyKnowledge, planInputs)
 import Hetoimasia.LuaEngine.Graphics.TerrainView.Style
 import Hetoimasia.LuaEngine.Graphics.TerrainView.Types
-import Hetoimasia.LuaEngine.Graphics.Texture (TextureGraphics (..))
-import Hetoimasia.LuaEngine.Graphics.Texture.Host (hostBuilders)
+import Hetoimasia.LuaEngine.Graphics.TerrainView.Owner (RegionBuild (..), ViewOwner (..))
 import Hetoimasia.LuaEngine.Texture (RenderAccount, accountRelease, accountReserve)
 import Hetoimasia.Math.Vector (V2 (..))
-import Hetoimasia.Render.TwoD.Chunk (BoundsRequest (DeriveBounds), ChunkKind (ChunkWorldDepth), ChunkRef)
+import Hetoimasia.Render.TwoD.Chunk (ChunkRef)
 import Hetoimasia.Render.TwoD.Material (MaterialData (..), MaterialRecord, MaterialRef)
 import Hetoimasia.Render.TwoD.Metrics (PixelExtent (..), TargetMetrics (..))
 import Hetoimasia.Render.TwoD.Settings (defaultViewSettings)
 import Hetoimasia.Render.TwoD.Snapshot (Instance, Layer (WorldLayerWith), LayerDepth (DepthEnabled), Viewport (..))
-import Hetoimasia.Render.TwoD.Vulkan (registerMaterial, rendererDepthFormat)
-import Hetoimasia.Render.TwoD.Vulkan.Chunks (ChunkStanding (..), buildRetainedChunkWith, chunkStandingSTM, markChunkReleasedSTM, releaseChunkNow)
-import Hetoimasia.Render.TwoD.Vulkan.Textures (isReleased, registeredMarks)
+import Hetoimasia.Render.TwoD.Vulkan.Chunks (ChunkStanding (..))
+import Hetoimasia.Render.TwoD.Vulkan.Textures (Textures, isReleased)
 import Hetoimasia.Terrain.Changes (emptyChanges)
 import Hetoimasia.Terrain.Coordinate (RegionCoord (..), axisValue)
 import Hetoimasia.Terrain.Render2D.Camera
@@ -154,7 +144,6 @@ import Hetoimasia.Terrain.Render2D.Knowledge (CellKnowledge (CellPending), Knowl
 import Hetoimasia.Terrain.Render2D.Material (Adapted (..), AdaptedQuad (..), adaptCells, adaptedInstance, terrainView)
 import Hetoimasia.Terrain.Render2D.Presentation (LightInput (..), LightSettings, describeSettingRefusal, lightInput, mkLightSettings)
 import Hetoimasia.Terrain.Render2D.Projection (ViewSetup (..))
-import Hetoimasia.Terrain.Render2D.Vulkan.Material (terrainMaterial)
 import Hetoimasia.Terrain.Residency (ArenaId, RegionDemand (..), Revision, coverageBox)
 import qualified Hetoimasia.Terrain.Runtime as Runtime
 import Numeric.Natural (Natural)
@@ -162,12 +151,13 @@ import Numeric.Natural (Natural)
 -- ---------------------------------------------------------------------------
 -- The service
 
--- | What the adapter is lent: the graphics host and its composed session, the scene session (its claims and its
--- initial scene), the terrain service and the client its views are opened under, the session's one CPU render/staging
--- account, and the session's admission.
+-- | What the adapter is lent: the graphics owner's narrow capability, the session's texture registry and scene ledger,
+-- the scene session (its claims and its initial scene), the terrain service and the client its views are opened under,
+-- the session's one CPU render/staging account, and the session's admission.
 data TerrainViewsPorts = TerrainViewsPorts
-  { portHost ∷ !(VulkanHost GraphicsScene)
-  , portGraphics ∷ !TextureGraphics
+  { portOwner ∷ !ViewOwner
+  , portTextures ∷ !Textures
+  , portLedger ∷ !(SceneLedger SceneTargetKey)
   , portScenes ∷ !SceneSession
   , portTerrain ∷ !Runtime.Service
   , portClient ∷ !Runtime.Client
@@ -271,9 +261,8 @@ terrainViewsFailures = readTVar . svFailures
 -- its regions retired), the retirements are drained to the owner's evidence, and the worker is joined.
 withTerrainViews ∷ TerrainViewsConfig → TerrainViewsPorts → (TerrainViews → IO a) → IO a
 withTerrainViews config ports body = do
-  material ← registerMaterial (graphicsRenderer (portGraphics ports)) terrainMaterial
   service ←
-    TerrainViews config ports material
+    TerrainViews config ports (ownerMaterial (portOwner ports))
       <$> newTVarIO Map.empty
       <*> newTVarIO 1
       <*> newTVarIO []
@@ -353,7 +342,7 @@ attachSteps service request box = do
   count ← Map.size <$> readTVarIO (svViews service)
   if
     | count >= tvMaxViews config → pure (Left AttachTooManyViews)
-    | not (vtDepth target) || rendererDepthFormat (graphicsRenderer (portGraphics ports)) /= Just Depth32Float → pure (Left AttachNoDepth)
+    | not (vtDepth target) || not (ownerDepthQualified (portOwner ports)) → pure (Left AttachNoDepth)
     | otherwise → case mkLightSettings (attachLight request) of
         Left problems → pure (Left (AttachSettings (Text.intercalate "; " (map (Text.pack . describeSettingRefusal) problems))))
         Right light → do
@@ -379,7 +368,6 @@ commitAttach ∷ TerrainViews → AttachRequest → TVar (Maybe (Settled Terrain
 commitAttach service request box style runtimeView camera light = do
   let ports = svPorts service
       target = attachTarget request
-      graphics = portGraphics ports
   state ← newViewState service request style runtimeView camera light
   outcome ← atomically $ do
     cancelled ← isJust <$> readTVar box
@@ -387,7 +375,7 @@ commitAttach service request box style runtimeView camera light = do
     taking ← portTaking ports
     usable ← vtUsable target
     claim ← claimOf (scenesClaims (portScenes ports)) (vtKey target)
-    released ← or <$> traverse (isReleased (graphicsTextures graphics)) [styleColourHandle style, styleNormalHandle style]
+    released ← or <$> traverse (isReleased (portTextures ports)) [styleColourHandle style, styleNormalHandle style]
     count ← Map.size <$> readTVar (svViews service)
     if
       | cancelled → pure (Left Nothing)
@@ -398,7 +386,7 @@ commitAttach service request box style runtimeView camera light = do
       | released → pure (Left (Just AttachParentReleased))
       | otherwise → do
           _ ← takeClaim (scenesClaims (portScenes ports)) (vtKey target) (vsId state)
-          forM_ (Set.toList (styleIdentities style)) (ledgerRetainInterest (graphicsLedger graphics))
+          forM_ (Set.toList (styleIdentities style)) (ledgerRetainInterest (portLedger ports))
           modifyTVar' (svViews service) (Map.insert (vsId state) state)
           writeTVar box (Just (SettledOk (TerrainView service state)))
           pure (Right ())
@@ -566,7 +554,7 @@ readView (TerrainView service state) = do
 -- The newest revision the host adopted for the view's target, when it is this view's world.
 adoptedRevision ∷ TerrainViews → ViewState → STM (Maybe (Natural, WorldTag))
 adoptedRevision service state = do
-  newest ← ledgerNewestAdopted (graphicsLedger (portGraphics (svPorts service))) (vtKey (vsTarget state))
+  newest ← ledgerNewestAdopted (portLedger (svPorts service)) (vtKey (vsTarget state))
   pure $ case newest of
     Just (revision, Just tag) | tagView tag == vsId state → Just (revision, tag)
     _ → Nothing
@@ -589,7 +577,6 @@ viewClosed (TerrainView _ state) = readTVar (vsClosed state)
 runClose ∷ TerrainViews → ViewState → IO ()
 runClose service state = do
   let ports = svPorts service
-      graphics = portGraphics ports
       target = vsTarget state
   void (Runtime.clearViewDemand (portTerrain ports) (vsRuntimeView state))
   Runtime.closeView (portTerrain ports) (vsRuntimeView state)
@@ -607,7 +594,7 @@ runClose service state = do
         usable ← vtUsable target
         when usable (void (vtPublish target (scenesInitial (portScenes ports))))
       _ → pure ()
-    forM_ (Set.toList (styleIdentities (vsStyle state))) (ledgerDropInterest (graphicsLedger graphics))
+    forM_ (Set.toList (styleIdentities (vsStyle state))) (ledgerDropInterest (portLedger ports))
     regions ← readTVar (vsRegions state)
     writeTVar (vsRegions state) Map.empty
     modifyTVar' (svRetiring service) (<> [Retiring (rgChunk region) (rgBytes region) False | region ← Map.elems regions])
@@ -730,7 +717,7 @@ shutdown service = do
 retirable ∷ TerrainViews → STM Bool
 retirable service = do
   retiring ← readTVar (svRetiring service)
-  let ledger = graphicsLedger (portGraphics (svPorts service))
+  let ledger = portLedger (svPorts service)
   candidates ← forM retiring $ \r → if not (rtBarrierMet r) then pure True else not <$> ledgerChunkHeld ledger (rtChunk r)
   pure (or candidates)
 
@@ -741,50 +728,37 @@ retirable service = do
 retireStep ∷ TerrainViews → IO Bool
 retireStep service = do
   let ports = svPorts service
-      host = portHost ports
-      graphics = portGraphics ports
-      retained = graphicsRetained graphics
+      owner = portOwner ports
   retiring ← readTVarIO (svRetiring service)
-  let unmet = [r | r ← retiring, not (rtBarrierMet r)]
+  let unmet = [rtChunk r | r ← retiring, not (rtBarrierMet r)]
   barrier ←
     if null unmet
       then pure True
       else do
-        submitted ← atomically $ do
-          forM_ unmet (\r → void (markChunkReleasedSTM retained (rtChunk r)))
-          requestVulkanRelease host (VulkanAction (\_ → pure ()))
-        case submitted of
-          Left _ → pure False
-          Right ticket →
-            atomically (awaitVulkanAction ticket) >>= \case
-              ActionReturned () → do
-                atomically (modifyTVar' (svRetiring service) (map (\r → if any ((== rtChunk r) . rtChunk) unmet then r {rtBarrierMet = True} else r)))
-                pure True
-              _ → pure False
+        met ← ownerBarrier owner unmet
+        when met (atomically (modifyTVar' (svRetiring service) (map (\r → if rtChunk r `elem` unmet then r {rtBarrierMet = True} else r))))
+        pure met
   if not barrier
     then pure False
     else do
       eligible ← atomically $ do
         now ← readTVar (svRetiring service)
-        filterM' (\r → if rtBarrierMet r then not <$> ledgerChunkHeld (graphicsLedger graphics) (rtChunk r) else pure False) now
+        filterM' (\r → if rtBarrierMet r then not <$> ledgerChunkHeld (portLedger ports) (rtChunk r) else pure False) now
       if null eligible
         then pure True
-        else do
-          submitted ← atomically (submitVulkanAction host (VulkanAction (\construction → forM eligible (\r → (,) r <$> releaseChunkNow (hostBuilders host construction) retained (rtChunk r)))))
-          case submitted of
-            Left _ → pure False
-            Right ticket →
-              atomically (awaitVulkanAction ticket) >>= \case
-                ActionReturned results → do
-                  forM_ [(r, why) | (r, Left why) ← results] $ \(r, why) → recordFailure service ("a retained region's release failed: " <> Text.pack (show (rtChunk r)) <> ": " <> Text.pack (show why))
-                  let done = [rtChunk r | (r, Right ()) ← results]
-                      returned = sum [rtBytes r | (r, Right ()) ← results]
-                  atomically $ do
-                    modifyTVar' (svRetiring service) (filter (\r → rtChunk r `notElem` done))
-                    modifyTVar' (svGpu service) (subtract returned)
-                    modifyTVar' (svReleases service) (+ 1)
-                  pure True
-                _ → pure False
+        else
+          ownerRelease owner (map rtChunk eligible) >>= \case
+            Nothing → pure False
+            Just results → do
+              let paired = zip eligible results
+              forM_ [(r, why) | (r, Left why) ← paired] $ \(r, why) → recordFailure service ("a retained region's release failed: " <> Text.pack (show (rtChunk r)) <> ": " <> why)
+              let done = [rtChunk r | (r, Right ()) ← paired]
+                  returned = sum [rtBytes r | (r, Right ()) ← paired]
+              atomically $ do
+                modifyTVar' (svRetiring service) (filter (\r → rtChunk r `notElem` done))
+                modifyTVar' (svGpu service) (subtract returned)
+                modifyTVar' (svReleases service) (+ 1)
+              pure True
 
 -- ---------------------------------------------------------------------------
 -- Preparation
@@ -1109,36 +1083,22 @@ planBytes adapted =
 buildRegions ∷ TerrainViews → Map (Integer, Integer) ([Instance], [MaterialRecord]) → IO (Maybe (Map (Integer, Integer) Region))
 buildRegions service wanted
   | Map.null wanted = pure (Just Map.empty)
-  | otherwise = do
-      let ports = svPorts service
-          host = portHost ports
-          graphics = portGraphics ports
-          retained = graphicsRetained graphics
-          material = svMaterial service
-          action = VulkanAction $ \construction → do
-            let builders = hostBuilders host construction
-            marks ← registeredMarks (graphicsTextures graphics)
-            let go acc [] = pure (Right acc)
-                go acc ((key, (instances, records)) : rest) =
-                  buildRetainedChunkWith builders retained marks ChunkWorldDepth DeriveBounds (Map.singleton material records) instances >>= \case
-                    Left why → do
-                      forM_ (Map.elems acc) (\region → releaseChunkNow builders retained (rgChunk region))
-                      pure (Left (Text.pack (show why)))
-                    Right chunk → go (Map.insert key (Region chunk instances records (fromIntegral (length instances) * 64)) acc) rest
-            go Map.empty (Map.toList wanted)
-      submitted ← atomically (submitVulkanAction host action)
-      case submitted of
-        Left _ → pure Nothing
-        Right ticket →
-          atomically (awaitVulkanAction ticket) >>= \case
-            ActionReturned (Right fresh) → pure (Just fresh)
-            ActionReturned (Left why) → recordFailure service ("a retained region could not be built: " <> why) >> pure Nothing
-            _ → pure Nothing
+  | otherwise =
+      ownerBuild (portOwner (svPorts service)) [RegionBuild instances records | (instances, records) ← Map.elems wanted] >>= \case
+        Nothing → pure Nothing
+        Just (Left why) → recordFailure service ("a retained region could not be built: " <> why) >> pure Nothing
+        Just (Right chunks)
+          | length chunks /= Map.size wanted → recordFailure service "the owner built another number of regions than asked" >> pure Nothing
+          | otherwise →
+              pure . Just . Map.fromList $
+                [ (key, Region chunk instances records (fromIntegral (length instances) * 64))
+                | ((key, (instances, records)), chunk) ← zip (Map.toList wanted) chunks
+                ]
 
 -- Wait for every fresh chunk's upload: 'False' when one failed or the view is closing.
 awaitReady ∷ TerrainViews → ViewState → [ChunkRef] → IO Bool
 awaitReady service state chunks = atomically $ do
-  standings ← traverse (chunkStandingSTM (graphicsRetained (portGraphics (svPorts service)))) chunks
+  standings ← traverse (ownerStanding (portOwner (svPorts service))) chunks
   closing ← readTVar (vsClosing state)
   open ← readTVar (svOpen service)
   case () of
@@ -1157,15 +1117,10 @@ awaitReady service state chunks = atomically $ do
 discardFresh ∷ TerrainViews → Map (Integer, Integer) Region → IO ()
 discardFresh service fresh
   | Map.null fresh = pure ()
-  | otherwise = do
-      let host = portHost (svPorts service)
-          retained = graphicsRetained (portGraphics (svPorts service))
-      submitted ← atomically (submitVulkanAction host (VulkanAction (\construction → forM (Map.elems fresh) (\region → releaseChunkNow (hostBuilders host construction) retained (rgChunk region)))))
-      case submitted of
-        Left _ → recordFailure service "unpublished regions could not be released: the owner takes no more actions"
-        Right ticket → atomically (awaitVulkanAction ticket) >>= \case
-          ActionReturned results | all (either (const False) (const True)) results → pure ()
-          _ → recordFailure service "unpublished regions could not be released"
+  | otherwise =
+      ownerRelease (portOwner (svPorts service)) (map rgChunk (Map.elems fresh)) >>= \case
+        Just results | all (either (const False) (const True)) results → pure ()
+        _ → recordFailure service "unpublished regions could not be released"
 
 -- Unpin every plan that is neither the newest published nor the newest adopted, returning its CPU bytes.
 dropUnneededPins ∷ TerrainViews → ViewState → IO ()
