@@ -622,7 +622,15 @@ host's initial content as a real new revision; drops the GPU interests; and
 starts the retirement of its regions. A view that never published leaves the
 target's latest value alone. The service's end closes every view, then drains
 the retirements to the owner's evidence; retirement the owner can no longer
-prove is kept as terminal evidence (`terrainViewsFailures`).
+prove is kept as terminal evidence (`terrainViewsFailures`). The drain waits
+for the ledger to let a chunk go or for the graphics owner to end
+(`ownerEnd`, read from the host's own action admission), so the scope's exit
+ends whichever of the host and the views ends first. While the host runs, a
+target it no longer presents keeps the exit waiting until the host adopts a
+newer revision or drops the target: its chunks are in GPU use until then. The body runs with the
+caller's masking state. The worker records synchronous failures and rethrows
+a cancellation: a cancelled worker takes no more attachments, settles the
+queued ones stopped, and the scope's exit then runs the service's end itself.
 
 **Depth.** A terrain-enabled composition sets the host-wide window depth
 (`configureWorldDepth`): every swapchain generation of every window gets a

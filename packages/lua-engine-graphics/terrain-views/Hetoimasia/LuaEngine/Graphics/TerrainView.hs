@@ -74,8 +74,10 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView
     -- * Picking
   , PickResult (..)
   , PickRef
+  , PickIdentity (..)
   , pickRefCell
   , pickRefPart
+  , pickRefIdentity
   , pickView
   , pickPrecondition
   ) where

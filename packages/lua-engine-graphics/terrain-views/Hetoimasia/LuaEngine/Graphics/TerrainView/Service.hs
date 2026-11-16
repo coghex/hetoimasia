@@ -91,7 +91,7 @@ import Hetoimasia.Foundation.Messaging.Payload (Prepared, prepare)
 import Hetoimasia.LuaEngine.Graphics.Scene.Claims (Claim (..), SceneClaims, claimOf, markClaimPublished, releaseClaim, takeClaim)
 import Hetoimasia.LuaEngine.Graphics.Scene.Ledger (GraphicsScene, SceneLedger, ledgerChunkHeld, ledgerDropInterest, ledgerNewestAdopted, ledgerRetainInterest, worldGraphicsScene)
 import Hetoimasia.LuaEngine.Graphics.Scene.World (SceneWorld (..), WorldTag (..))
-import Hetoimasia.LuaEngine.Graphics.TerrainView.Inputs (CopySet, combineCopies, copyArena, copyContent, copyKnowledge, planInputs)
+import Hetoimasia.LuaEngine.Graphics.TerrainView.Inputs (CopySet, combineCopies, copyArena, copyContent, copyGeneration, copyKnowledge, planInputs)
 import Hetoimasia.LuaEngine.Graphics.TerrainView.Style
 import Hetoimasia.LuaEngine.Graphics.TerrainView.Types
 import Hetoimasia.LuaEngine.Graphics.TerrainView.Owner (BuildFailure (..), RegionBuild (..), ViewOwner (..))
@@ -227,7 +227,9 @@ data ViewState k = ViewState
   , vsLight ∷ !(TVar LightSettings)
   , vsIntent ∷ !(TVar Word64)
     -- ^ Bumped by every accepted intent update.
-  , vsPrepared ∷ !(TVar (Word64, Maybe (Revision, Revision), Maybe TargetMetrics))
+  , vsPrepared ∷ !(TVar (Word64, Maybe (Revision, Revision, Word64), Maybe TargetMetrics))
+    -- ^ What the last preparation was made for: the intent, the arena's content and knowledge revisions and residency
+    -- generation, and the target's metrics. A change in any of them makes the view dirty.
     -- ^ The intent revision, arena revisions and metrics the last completed preparation was made for.
   , vsFacts ∷ !(TVar (Maybe TerrainFacts))
   , vsPins ∷ !(TVar (Map Word64 Pinned))
@@ -261,6 +263,8 @@ data Pinned = Pinned
   , pinArena ∷ !ArenaId
   , pinContent ∷ !Revision
   , pinKnowledge ∷ !Revision
+  , pinResidency ∷ !Word64
+    -- ^ The plan's residency identity: the copies' one generation, or a digest of theirs ('generationIdentity').
   , pinBytes ∷ !Word64
   }
 
@@ -774,16 +778,24 @@ nextWork service = do
 filterM' ∷ (a → STM Bool) → [a] → STM [a]
 filterM' predicate = foldr (\x rest → predicate x >>= \keep → (if keep then (x :) else id) <$> rest) (pure [])
 
--- Whether a view has work: a new intent, a new arena revision, new metrics, or pressure released since it stopped.
+-- The arena's identity a preparation is made for: its content and knowledge revisions and its residency generation.
+arenaIdentity ∷ Either e Runtime.ArenaStatus → Maybe Word64 → Maybe (Revision, Revision, Word64)
+arenaIdentity status residency = case (status, residency) of
+  (Right s, Just generation) → Just (Runtime.statusContentRevision s, Runtime.statusKnowledgeRevision s, generation)
+  _ → Nothing
+
+-- Whether a view has work: a new intent, a new arena revision or residency generation, new metrics, or pressure released
+-- since it stopped.
 viewDirty ∷ (Ord k, Show k) ⇒ TerrainViews k → ViewState k → STM Bool
 viewDirty service state = do
   intent ← readTVar (vsIntent state)
   (prepared, revisions, metrics) ← readTVar (vsPrepared state)
   status ← Runtime.arenaStatusSTM (portTerrain (svPorts service)) (vsArena state)
+  residency ← residencyNow service state
   now ← vtMetrics (vsTarget state)
   retryAt ← readTVar (vsRetry state)
   mark ← retryMark service state
-  let current = either (const Nothing) (\s → Just (Runtime.statusContentRevision s, Runtime.statusKnowledgeRevision s)) status
+  let current = arenaIdentity status residency
   pure (intent /= prepared || current /= revisions || now /= metrics || maybe False (/= mark) retryAt)
 
 -- What a waiting preparation watches: the service's releases, the target's newest adoption and the shared account's
@@ -905,10 +917,10 @@ data Prepared'
 
 prepareView ∷ (Ord k, Show k) ⇒ TerrainViews k → ViewState k → IO ()
 prepareView service state = do
-  (intent, metrics, status) ← atomically $ do
+  (intent, metrics, status, residency) ← atomically $ do
     writeTVar (vsPhase state) PhasePreparing
-    (,,) <$> readTVar (vsIntent state) <*> vtMetrics (vsTarget state) <*> Runtime.arenaStatusSTM (portTerrain (svPorts service)) (vsArena state)
-  let revisions = either (const Nothing) (\s → Just (Runtime.statusContentRevision s, Runtime.statusKnowledgeRevision s)) status
+    (,,,) <$> readTVar (vsIntent state) <*> vtMetrics (vsTarget state) <*> Runtime.arenaStatusSTM (portTerrain (svPorts service)) (vsArena state) <*> residencyNow service state
+  let revisions = arenaIdentity status residency
   outcome ← case (metrics, status) of
     (Nothing, _) → pure Unchanged'
     (_, Left _) → pure Unchanged'
@@ -1207,11 +1219,16 @@ publishPlan service state intent metrics copies plan adapted = do
                     current ← readTVar (vsIntent state)
                     nowMetrics ← vtMetrics (vsTarget state)
                     status ← Runtime.arenaStatusSTM (portTerrain ports) (vsArena state)
+                    residency ← residencyNow service state
                     let mine = fmap claimView claim == Just (vsId state)
                         coherent =
                           current == intent
                             && nowMetrics == Just metrics
                             && either (const False) (\s → Runtime.statusContentRevision s == copyContent copies && Runtime.statusKnowledgeRevision s == copyKnowledge copies) status
+                            -- residency is part of the plan's identity: a load, eviction or removal since the copies
+                            -- were labelled makes the plan stale, and it is made again from fresh copies (content-checked
+                            -- reuse then rebuilds no region whose bytes did not change)
+                            && residency == Just (copyGeneration copies)
                     if closing || not open || not taking || not mine || not usable || not coherent
                       then pure False
                       else do
@@ -1219,7 +1236,7 @@ publishPlan service state intent metrics copies plan adapted = do
                         when accepted $ do
                           _ ← markClaimPublished (portClaims ports) (vtKey (vsTarget state)) (vsId state)
                           writeTVar (vsPublished state) (Just revision)
-                          modifyTVar' (vsPins state) (Map.insert revision (Pinned plan metrics (copyArena copies) (copyContent copies) (copyKnowledge copies) cpuNeed))
+                          modifyTVar' (vsPins state) (Map.insert revision (Pinned plan metrics (copyArena copies) (copyContent copies) (copyKnowledge copies) (copyGeneration copies) cpuNeed))
                           writeTVar (vsRegions state) regions
                           -- What the new revision no longer lists starts its retirement; the host's barrier and the
                           -- adoptions still protect it wherever an earlier revision may be drawn.
@@ -1365,12 +1382,17 @@ pickView (TerrainView service state) (px, py) = do
                                 , pickArena = pinArena pinned
                                 , pickContent = pinContent pinned
                                 , pickKnowledge = pinKnowledge pinned
+                                , pickResidency = pinResidency pinned
                                 }
                           )
 
 -- | The removal precondition of a pick: the arena incarnation and the content and knowledge revisions it was picked
 -- from, with a guard that the view still holds its target and that the revision it was picked from is still the one
 -- the host adopted. The terrain service reads the guard in its removal arbitration, atomically with the commit.
+-- The arena's current residency generation, through the view's lease ('Nothing' once the lease is gone).
+residencyNow ∷ TerrainViews k → ViewState k → STM (Maybe Word64)
+residencyNow service state = fmap (fromIntegral . Runtime.viewGeneration) <$> Runtime.inspectArenaSTM (portTerrain (svPorts service)) (vsArena state)
+
 pickPrecondition ∷ (Ord k, Show k) ⇒ TerrainView k → PickRef k → Runtime.Precondition
 pickPrecondition (TerrainView service state) ref =
   Runtime.PreconditionWith
@@ -1386,4 +1408,10 @@ pickPrecondition (TerrainView service state) ref =
       closing ← readTVar (vsClosing state)
       claim ← claimOf (portClaims (svPorts service)) (pickTarget identity)
       adopted ← adoptedRevision service state
-      pure (not closing && fmap claimView claim == Just (vsId state) && fmap (\(revision, tag) → (fromIntegral revision, tag)) adopted == Just (pickRevision identity, pickTag identity))
+      residency ← residencyNow service state
+      pure
+        ( not closing
+            && fmap claimView claim == Just (vsId state)
+            && fmap (\(revision, tag) → (fromIntegral revision, tag)) adopted == Just (pickRevision identity, pickTag identity)
+            && residency == Just (pickResidency identity)
+        )

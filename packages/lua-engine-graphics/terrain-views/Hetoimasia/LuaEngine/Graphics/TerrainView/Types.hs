@@ -273,6 +273,8 @@ data PickIdentity k = PickIdentity
   , pickArena ∷ !ArenaId
   , pickContent ∷ !Revision
   , pickKnowledge ∷ !Revision
+  , pickResidency ∷ !Word64
+    -- ^ The adopted plan's residency identity, checked against the arena's generation in the removal's arbitration.
   }
   deriving (Eq, Show)
 

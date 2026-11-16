@@ -77,7 +77,7 @@ import Hetoimasia.Terrain.Runtime
 import qualified Hetoimasia.Terrain.Runtime as Runtime
 import Hetoimasia.Terrain.Runtime.Storage (filesystemOf, minHeadroomBytes, mkStorageConfig)
 import Hetoimasia.Terrain.Runtime.Store (StoreSpec (..), defaultStoreSpec, minAllowanceBytes)
-import Hetoimasia.Terrain.Residency (Bank (StagingBank), Ledger (..), bankLedger)
+import Hetoimasia.Terrain.Residency (Bank (StagingBank), Ledger (..), RegionDemand (..), bankLedger, coverageBox)
 import Hetoimasia.Terrain.Source (CellSpec (..), LayerSpec (..), PatchSpec (..), SourceSpec (..))
 import System.FilePath ((</>))
 
@@ -104,6 +104,8 @@ data Views = Views
   , vStyle ∷ !AtlasStyle
   , vColourKey ∷ !Word64
   , vNormalKey ∷ !Word64
+  , vClient ∷ !Runtime.Client
+    -- ^ The terrain client that holds the arena's lease.
   }
 
 spec ∷ Spec
@@ -219,6 +221,27 @@ pickConsistency = describe "a pick's consistency reference" $ do
       removeWith v (pickRefCell fresh) (Just (pickPrecondition view fresh)) >>= (`shouldBe` Left Runtime.StaleView)
       closeView view
 
+  it "refuses a pick's removal once a load moves the residency generation, and removes through one picked from the revision made at the new generation" $
+    withViews $ \v → do
+      view ← attached v 1
+      _ ← awaitPublished v 1
+      _ ← adoptNow (vModel v) 1
+      revealAt v (8, 8, 3)
+      quiescent v
+      hit ← currentHit v view
+      -- one load elsewhere: content and knowledge are unchanged, only residency moved
+      held ← Runtime.arenaStatus (_vTerrain v) (vArena v) >>= either (fail . show) pure
+      moveResidency v
+      moved ← Runtime.arenaStatus (_vTerrain v) (vArena v) >>= either (fail . show) pure
+      (Runtime.statusContentRevision moved, Runtime.statusKnowledgeRevision moved) `shouldBe` (Runtime.statusContentRevision held, Runtime.statusKnowledgeRevision held)
+      removeWith v (pickRefCell hit) (Just (pickPrecondition view hit)) >>= (`shouldBe` Left Runtime.StaleView)
+      -- the view prepares again for the new generation; a hit from that revision is valid
+      fresh ← currentHit v view
+      generation ← generationNow v
+      pickResidency (pickRefIdentity fresh) `shouldBe` generation
+      removeWith v (pickRefCell fresh) (Just (pickPrecondition view fresh)) >>= (`shouldBe` Right True)
+      closeView view
+
 -- The first visible known part of the adopted frame, scanning the target's pixel centres.
 adoptedHit ∷ Views → TerrainView Int → IO (PickRef Int)
 adoptedHit _ view = do
@@ -239,9 +262,11 @@ currentHit v view = bounded go
       _ ← releasePass (vModel v)
       hit ← adoptedHit v view
       status ← Runtime.arenaStatus (_vTerrain v) (vArena v) >>= either (fail . show) pure
+      generation ← generationNow v
       let precondition = pickPrecondition view hit
       if Runtime.preconditionContent precondition == Runtime.statusContentRevision status
         && Runtime.preconditionKnowledge precondition == Just (Runtime.statusKnowledgeRevision status)
+        && pickResidency (pickRefIdentity hit) == generation
         then pure hit
         else do
           now ← publishedRevision (vModel v) 1
@@ -254,6 +279,24 @@ zoomOf = cameraZoom . viewCamera . worldView
 
 zoomOfFirst ∷ Float
 zoomOfFirst = 1
+
+-- The arena's residency generation now.
+generationNow ∷ Views → IO Word64
+generationNow v = Runtime.inspectArena (_vTerrain v) (vArena v) >>= maybe (fail "the arena lease is gone") (pure . fromIntegral . Runtime.viewGeneration)
+
+-- Move the arena's residency generation by one completed load and nothing else: another holder's demand for a region
+-- far from every view's camera, waited for until the generation moves, then withdrawn.
+moveResidency ∷ Views → IO ()
+moveResidency v = do
+  start ← generationNow v
+  other ← Runtime.openView (_vTerrain v) (vClient v) >>= either (fail . show) pure
+  demand ← either (fail . show) pure (RegionDemand (RegionCoord 40 40 0) <$> coverageBox 0 16 0 16 0 32)
+  _ ← Runtime.setViewDemand (_vTerrain v) other (vArena v) [demand] >>= either (fail . show) pure
+  bounded . atomically $
+    Runtime.inspectArenaSTM (_vTerrain v) (vArena v) >>= \case
+      Just arena | fromIntegral (Runtime.viewGeneration arena) /= start → pure ()
+      _ → retry
+  Runtime.closeView (_vTerrain v) other
 
 -- Wait until the arena's discovery has nothing pending, so its revisions stay where they are.
 quiescent ∷ Views → IO ()
@@ -356,6 +399,26 @@ races = describe "attachment and intent" $ do
 
 reuse ∷ Spec
 reuse = describe "retained regions" $ do
+  it "never publishes a plan whose residency generation moved after its copies were labelled: the next published revision carries the new generation" $
+    withViews $ \v → do
+      view ← attached v 1
+      first' ← awaitPublished v 1
+      _ ← adoptNow (vModel v) 1
+      quiescent v
+      -- the next plan's copies are labelled; its build is held at the owner
+      let openGate = atomically (writeTVar (foGate (vOwner v)) True)
+      atomically (writeTVar (foGate (vOwner v)) False)
+      generation ← (`finally` openGate) $ do
+        atomically (updateCamera view (CameraIntent [Camera.ZoomBy 2])) `shouldReturn` Right ()
+        bounded (atomically (readTVar (foWaiting (vOwner v)) >>= check . (> 0)))
+        moveResidency v
+        generationNow v
+      newer ← awaitPublished' v 1 (first' + 1)
+      adoptNow (vModel v) 1 `shouldReturn` Adopted newer
+      hit ← adoptedHit v view
+      pickResidency (pickRefIdentity hit) `shouldBe` generation
+      closeView view
+
   it "reuses every region across frames and across a presentation-only change, building nothing again" $
     withViews $ \v → do
       view ← attached v 1
@@ -788,7 +851,7 @@ withViewsOrdered order source config body = do
                   , portAccount = cpAccount comp
                   , portTaking = pure True
                   }
-          let run views = body (Views comp vm fake model terrain arena views owner claims (cpAccount comp) style colourKey normalKey)
+          let run views = body (Views comp vm fake model terrain arena views owner claims (cpAccount comp) style colourKey normalKey client)
           case order of
             HostFirst → withTerrainViews config ports (\views → run views `finally` dissolve model)
             ViewsFirst → withTerrainViews config ports run `finally` dissolve model
