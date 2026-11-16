@@ -527,11 +527,14 @@ data Config = Config
 --
 -- The service charges it, in the transaction that steps its accounting model, the change the step made to the model's
 -- staging use (occupied plus reserved): an increase is reserved, and a reservation the allowance cannot make refuses
--- the step as the model's own full staging bank would (busy, nothing changed); a decrease is returned. The model, its
+-- the step as the model's own full staging bank would (busy, nothing changed, reporting the account's own limit, its
+-- charge and the increase asked); a decrease is returned. The model, its
 -- admission order and its limit invariants are unchanged; the allowance is one more bound on the same steps. What the
 -- service still holds when it ends is returned after its drain.
 data StagingAccount = StagingAccount
-  { stagingAccountReserve ∷ Word64 → STM Bool
+  { stagingAccountLimit ∷ !Word64
+    -- ^ The most the allowance holds.
+  , stagingAccountReserve ∷ Word64 → STM Bool
   , stagingAccountRelease ∷ Word64 → STM ()
   , stagingAccountCharged ∷ STM Word64
   }

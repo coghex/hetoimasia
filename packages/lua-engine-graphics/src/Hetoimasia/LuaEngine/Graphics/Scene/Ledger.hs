@@ -75,7 +75,8 @@ module Hetoimasia.LuaEngine.Graphics.Scene.Ledger
   , ledgerReading
   ) where
 
-import Control.Concurrent.STM (STM, TVar, atomically, newTVarIO, readTVar, writeTVar)
+import Control.Concurrent.STM (STM, TVar, atomically, newTVar, newTVarIO, readTVar, writeTVar)
+import Control.Monad (when)
 import Control.DeepSeq (NFData (rnf))
 import Data.Map.Strict (Map)
 import Data.Maybe (fromMaybe)
@@ -171,11 +172,15 @@ data State w = State
 -- 'SceneTargetKey' in production ('ledgerLifecycle'): a window or an offscreen target, in one key space; it is a
 -- parameter so that the lifecycle suite, which cannot
 -- mint a window identity, drives the same ledger with any ordered key.
-newtype SceneLedger w = SceneLedger (TVar (State w))
+data SceneLedger w = SceneLedger !(TVar (State w)) !(TVar (Map w (TVar (Maybe (Natural, Maybe WorldTag)))))
+-- ^ The records, and for each target that has had an adoption a variable of its own holding its newest adopted
+-- revision. A reader that cares about one target (a terrain pick's guard, read in the terrain service's removal
+-- arbitration) reads that target's variable, which only that target's adoptions and releases write: never every
+-- adoption of every window. The registry itself is written only when a target has its first adoption.
 
 -- | A ledger with nothing adopted.
 newSceneLedger ∷ IO (SceneLedger w)
-newSceneLedger = SceneLedger <$> newTVarIO (State Map.empty Map.empty 0 0 0 Nothing)
+newSceneLedger = SceneLedger <$> newTVarIO (State Map.empty Map.empty 0 0 0 Nothing) <*> newTVarIO Map.empty
 
 -- | The two hooks the host is configured with. Both are one transaction over pure data on the owner's
 -- thread: neither waits, calls Lua or raises.
@@ -188,7 +193,9 @@ ledgerLifecycle ledger =
 
 -- | The owner adopted this revision of the window, with this scene: hold what it names, once more.
 ledgerAdopted ∷ (Ord w, Show w) ⇒ SceneLedger w → w → Natural → GraphicsScene → IO ()
-ledgerAdopted (SceneLedger var) window revision scene = atomically (adopt var window revision (adoptionOf scene))
+ledgerAdopted (SceneLedger var newest) window revision scene = atomically $ do
+  adopt var window revision (adoptionOf scene)
+  refreshNewest var newest window
 
 adoptionOf ∷ GraphicsScene → Adoption
 adoptionOf scene =
@@ -201,7 +208,24 @@ adoptionOf scene =
 
 -- | One adoption of this revision of the window has been released: hold what it names once less.
 ledgerReleased ∷ (Ord w, Show w) ⇒ SceneLedger w → w → Natural → IO ()
-ledgerReleased (SceneLedger var) window revision = atomically (release var window revision)
+ledgerReleased (SceneLedger var newest) window revision = atomically $ do
+  release var window revision
+  refreshNewest var newest window
+
+-- Set the target's newest adopted revision from the records, writing its variable only when it changed.
+refreshNewest ∷ Ord w ⇒ TVar (State w) → TVar (Map w (TVar (Maybe (Natural, Maybe WorldTag)))) → w → STM ()
+refreshNewest var newest target = do
+  st ← readTVar var
+  let found = foldr newer Nothing [(revision, adoptionTag a) | ((key, revision), a) ← Map.toList (stRecords st), key == target]
+      newer candidate = \case
+        Just kept | fst kept >= fst candidate → Just kept
+        _ → Just candidate
+  registry ← readTVar newest
+  case Map.lookup target registry of
+    Just cell → readTVar cell >>= \now → when (now /= found) (writeTVar cell found)
+    Nothing → do
+      cell ← newTVar found
+      writeTVar newest (Map.insert target cell registry)
 
 adopt ∷ (Ord w, Show w) ⇒ TVar (State w) → w → Natural → Adoption → STM ()
 adopt var window revision holds = do
@@ -248,14 +272,14 @@ defect what st = st {stDefects = stDefects st + 1, stFirstDefect = Just (fromMay
 -- | Whether this texture, by its complete identity, is held: by an adopted, unreleased revision, or by an
 -- explicit interest ('ledgerRetainInterest'). The texture backend's release is gated on it.
 ledgerHeld ∷ SceneLedger w → Word64 → STM Bool
-ledgerHeld ledger@(SceneLedger var) identity = do
+ledgerHeld ledger@(SceneLedger var _) identity = do
   adopted ← ledgerHolds ledger identity
   interests ← Map.findWithDefault 0 identity . stInterests <$> readTVar var
   pure (adopted > 0 || interests > 0)
 
 -- | Whether any adopted, unreleased revision lists this retained chunk.
 ledgerChunkHeld ∷ SceneLedger w → ChunkRef → STM Bool
-ledgerChunkHeld (SceneLedger var) chunk = any (Set.member chunk . adoptionChunks) . Map.elems . stRecords <$> readTVar var
+ledgerChunkHeld (SceneLedger var _) chunk = any (Set.member chunk . adoptionChunks) . Map.elems . stRecords <$> readTVar var
 
 -- Interests ---------------------------------------------------------------------------------------------
 
@@ -264,14 +288,14 @@ ledgerChunkHeld (SceneLedger var) chunk = any (Set.member chunk . adoptionChunks
 -- authority of a holder that is not an adopted revision (a terrain view, from its attachment to its close); it
 -- never clears a release flag and never makes a released handle publishable.
 ledgerRetainInterest ∷ SceneLedger w → Word64 → STM ()
-ledgerRetainInterest (SceneLedger var) identity = do
+ledgerRetainInterest (SceneLedger var _) identity = do
   st ← readTVar var
   writeTVar var st {stInterests = Map.insertWith (+) identity 1 (stInterests st)}
 
 -- | Drop one interest taken with 'ledgerRetainInterest'. Dropping one that is not held is a defect of the
 -- holder's pairing: counted, never raised, and the count is not driven below zero.
 ledgerDropInterest ∷ (Show w) ⇒ SceneLedger w → Word64 → STM ()
-ledgerDropInterest (SceneLedger var) identity = do
+ledgerDropInterest (SceneLedger var _) identity = do
   st ← readTVar var
   writeTVar var $ case Map.lookup identity (stInterests st) of
     Nothing → defect ("an interest was dropped that was not held: texture " <> Text.pack (show identity)) st
@@ -280,25 +304,20 @@ ledgerDropInterest (SceneLedger var) identity = do
 
 -- | The interests held now, with their counts.
 ledgerInterests ∷ SceneLedger w → STM (Map Word64 Natural)
-ledgerInterests (SceneLedger var) = stInterests <$> readTVar var
+ledgerInterests (SceneLedger var _) = stInterests <$> readTVar var
 
 -- The adopted world -------------------------------------------------------------------------------------
 
 -- | The newest adopted, unreleased revision of a target, and the world tag of its scene (none for an M1 scene):
 -- what the target shows now. An older revision a frame still uses stays held but is not what the target shows.
 ledgerNewestAdopted ∷ Ord w ⇒ SceneLedger w → w → STM (Maybe (Natural, Maybe WorldTag))
-ledgerNewestAdopted (SceneLedger var) target = do
-  st ← readTVar var
-  pure (foldr newer Nothing [(revision, adoptionTag found) | ((key, revision), found) ← Map.toList (stRecords st), key == target])
-  where
-    newer candidate = \case
-      Just kept | fst kept >= fst candidate → Just kept
-      _ → Just candidate
+ledgerNewestAdopted (SceneLedger _ newest) target =
+  readTVar newest >>= \registry → maybe (pure Nothing) readTVar (Map.lookup target registry)
 
 -- | How many adoptions hold this texture: for each window and revision, the count of its adoptions. A count is a
 -- 'Natural', as a revision is: nothing here wraps, however many adoptions a long run makes.
 ledgerHolds ∷ SceneLedger w → Word64 → STM Natural
-ledgerHolds (SceneLedger var) identity =
+ledgerHolds (SceneLedger var _) identity =
   sum . map adoptionCount . filter (Set.member identity . adoptionHolds) . Map.elems . stRecords <$> readTVar var
 
 -- | What the ledger holds now.
@@ -321,7 +340,7 @@ data LedgerReading w = LedgerReading
   deriving (Eq, Show)
 
 ledgerReading ∷ SceneLedger w → STM (LedgerReading w)
-ledgerReading (SceneLedger var) = do
+ledgerReading (SceneLedger var _) = do
   st ← readTVar var
   pure
     LedgerReading

@@ -94,7 +94,7 @@ import Hetoimasia.LuaEngine.Graphics.TerrainView.Inputs (CopySet, combineCopies,
 import Hetoimasia.LuaEngine.Graphics.TerrainView.Style
 import Hetoimasia.LuaEngine.Graphics.TerrainView.Types
 import Hetoimasia.LuaEngine.Graphics.TerrainView.Owner (RegionBuild (..), ViewOwner (..))
-import Hetoimasia.LuaEngine.Texture (RenderAccount, accountCharged, accountRelease, accountReserve)
+import Hetoimasia.LuaEngine.Texture (RenderAccount, accountCharged, accountLimit, accountRelease, accountReserve)
 import Hetoimasia.Math.Vector (V2 (..))
 import Hetoimasia.Render.TwoD.Chunk (ChunkRef)
 import Hetoimasia.Render.TwoD.Material (MaterialData (..), MaterialRecord, MaterialRef)
@@ -272,7 +272,8 @@ data Region = Region
 renderStagingAccount ∷ RenderAccount → Runtime.StagingAccount
 renderStagingAccount account =
   Runtime.StagingAccount
-    { Runtime.stagingAccountReserve = accountReserve account
+    { Runtime.stagingAccountLimit = accountLimit account
+    , Runtime.stagingAccountReserve = accountReserve account
     , Runtime.stagingAccountRelease = accountRelease account
     , Runtime.stagingAccountCharged = accountCharged account
     }

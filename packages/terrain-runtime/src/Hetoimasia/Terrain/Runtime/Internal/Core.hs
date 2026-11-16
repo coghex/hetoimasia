@@ -195,7 +195,8 @@ chargeStaging svc st after = case configStagingAccount (serviceConfig svc) of
         if not funded
           then do
             charged ← stagingAccountCharged account
-            pure (Left (R.Busy (R.BankFull R.StagingBank (R.ledgerLimit (R.bankLedger after R.StagingBank)) charged more)))
+            -- one coherent figure: the account's own limit and charge, and what the step asked of it
+            pure (Left (R.Busy (R.BankFull R.StagingBank (stagingAccountLimit account) charged more)))
           else seen (st {stateAccountCharged = stateAccountCharged st + more})
     | new < old → do
         let fewer = min (stateAccountCharged st) (old - new)

@@ -222,7 +222,8 @@ spec = describe "Superseded work and ordering" $ do
     -- An outside account over a variable, of this size.
     accountOver held limit =
       StagingAccount
-        { stagingAccountReserve = \wanted → readTVar held >>= \now → if wanted > limit - now then pure False else True <$ writeTVar held (now + wanted)
+        { stagingAccountLimit = limit
+        , stagingAccountReserve = \wanted → readTVar held >>= \now → if wanted > limit - now then pure False else True <$ writeTVar held (now + wanted)
         , stagingAccountRelease = \returned → modifyTVar' held (subtract returned)
         , stagingAccountCharged = readTVar held
         }

@@ -36,6 +36,7 @@ module Hetoimasia.LuaEngine.Graphics.Scene.Claims
   ) where
 
 import Control.Concurrent.STM (STM, TVar, newTVarIO, readTVar, writeTVar)
+import Control.Monad (when)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Word (Word64)
@@ -73,7 +74,12 @@ markClaimPublished ∷ Ord k ⇒ SceneClaims k → k → Word64 → STM Bool
 markClaimPublished (SceneClaims var) key view = do
   held ← readTVar var
   case Map.lookup key held of
-    Just claim | claimView claim == view → True <$ writeTVar var (Map.insert key claim {claimPublished = True} held)
+    -- written only when the flag first changes: a view's later publications leave the claims as they are, so a
+    -- reader of the claims (the M1 publisher's commit, a pick's guard) is not disturbed by every terrain publication
+    Just claim
+      | claimView claim == view → do
+          when (not (claimPublished claim)) (writeTVar var (Map.insert key claim {claimPublished = True} held))
+          pure True
     _ → pure False
 
 -- | Release the target's claim if, and only if, it names this view, answering what it was. A release by any other
