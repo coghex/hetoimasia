@@ -566,12 +566,27 @@ every refusal and a cancellation release what was retained.
 | `AttachArena`, `AttachSettings`, `AttachCamera`, `AttachTooManyViews` | the arena lease, the presentation settings, the camera's start, eight views |
 | `AttachBusy`, `AttachStopped` | the request queue or the terrain service's admission; the adapter or session ended |
 
-**Preparation** (the adapter's one worker, round-robin over views, latest
-intent only) starts from regional copies (`requestRegionSnapshot`) of the
-camera's anchor and grows them with each plan's own visible demand, a bounded
-number of rounds, from fresh coherent copies (one incarnation, content and
-knowledge revision); copies of different versions are never combined, and a
-copy is released once the facts and knowledge are made.
+**Preparation** (the adapter's one worker, latest intent only) is a
+resumable stage per view, and the worker takes one bounded step of one view at
+a time: queued attachments, closes, retirements and re-sent demands first, then
+the views' steps round-robin. So no view's copies, plan, build or uploads keep
+the worker from another view, and the worker never waits on the owner, the
+terrain service or an upload: it reads their answers when they are ready.
+
+| Stage | What it owns | Moves when | On a close, a cancellation or the service's end |
+| --- | --- | --- | --- |
+| copying | the copies taken so far (charged to the view) and at most one copy request in flight | the request settles, or what it waited for (room) is released | the request is cancelled (or, settled, released); the charge returns |
+| planning | the planner's state, stepped one quantum per step | always (one quantum) | dropped; the charge returns |
+| building | the build's ticket on the owner, or its reservation while the owner's queue is full | the ticket is answered, or the queue has room | a build in flight is collected by the retirements when it answers and what it built retires; its GPU bytes stay charged until then |
+| uploading | the built chunks until their uploads end | every upload has ended | the chunks retire (no barrier: no revision listed them); their GPU bytes stay charged until released |
+
+Copies start from the camera's anchor (and a jump's destination) and grow with
+each plan's own visible demand, a bounded number of rounds. They are asked for
+one batch at a time; a settled batch is taken, checked against the batches
+before it (one incarnation, content and knowledge revision), charged to the view
+and its borrow released, in one transaction. Copies of different versions are
+never combined: an edit that commits between two batches starts the copies again
+(a bounded number of times, then the preparation waits).
 
 **Inputs.** Every terrain and knowledge input of a plan, of its retained
 regions and of its pick metadata comes from those regional copies and from
@@ -602,17 +617,32 @@ plan rebuilds every region whose bytes changed, which can be every region
 nearer than the edit; the old revision stays published until the new one is
 whole. Chunks are built
 by owner actions, published only once their uploads are ready, and retired
-through the host's release barrier (asked without waiting) and the ledger:
-released on the owner only when no adoption lists them.
+through the host's release barrier and the ledger: released on the owner only
+when no adoption lists them and their upload has ended, so the release is never
+deferred and its answer proves the buffer gone; their GPU bytes return then.
+Owner actions are typed: a full queue or release lane is waited for (never
+asked again in a loop), and an owner that takes no more actions, or an action
+that never ran, is terminal evidence. A release that failed is kept as evidence,
+its bytes still charged, and is never asked again.
 
 **Accounting.** The view's CPU payloads, the parents' coverage planes and the
 terrain service's staging all draw on the session's one `RenderAccount`
-(the service is given it as `renderStagingAccount`). A view holds whole
-granules of it (`tvAccountGranule`, 1 MiB): reserved as its need (its pinned
-revisions and the candidate being prepared) grows past one, returned only when
-a whole granule is free, and counted as the view's charge. A need that moves
-within a granule leaves the account untouched, so a panning camera does not
-write the account the terrain service reads in its own transactions. The other
+(the service is given it as `renderStagingAccount`). A view's CPU is charged
+before it is made: a copy at its take, the inputs made from the copies (a
+copied region's record each), each planning quantum's growth (at most the
+quantum's steps of `clStepLevels` levels, the views' default 2,048, finishing
+their column, two quads a level, and never more than the copied regions'
+cells) trued up after the quantum to what the plan holds, then the
+adaptation and the regions' instances, records and the renderer registry's
+copies of them. A charge the account cannot hold leaves the stage waiting
+(nothing more is made) until something is released. Once published, the view
+holds its pinned plans and its listed regions' descriptions; a region that
+leaves a revision or a closed view keeps its description charged, held by the
+service, until its release is answered. A view holds whole granules of the
+account (`tvAccountGranule`, 1 MiB), reserved as its need grows past one,
+returned only when a whole granule is free, and counted as its charge, so a
+panning camera does not write the account the terrain service reads in its
+own transactions. The other
 variables a pick's guard reads in the terrain service's removal arbitration are
 written rarely: the view's close flag, the claim table (attach, close, a
 claim's first publication) and the target's own newest-adopted revision (an
@@ -662,7 +692,9 @@ layer, so its frames are unchanged by the depth image.
 | A target claim | the scene session | attach, publish, close | the M1 publisher's commit | released by close, with the empty handback |
 | A parent's CPU interest | the view | attach (caller's call), close | the planner | released at close or on any refusal |
 | A parent's GPU interest | the view, in the ledger | attach and close, each one transaction | the texture backend's release | dropped at close; retirement then waits for adoptions and GPU use |
-| A regional copy (`requestRegionSnapshot`), the only terrain and knowledge borrow; `withSnapshot` is never used | the worker | the worker | the worker | released once the plan's inputs are made, on every outcome |
+| A regional copy (`requestRegionSnapshot`), the only terrain and knowledge borrow; `withSnapshot` is never used | the view's copying stage | the worker | the worker | taken, charged to the view and released in one transaction; a request in flight is cancelled on every way out |
+| A view's preparation stage (see above) | the view | the worker | `readView` | handed to cleanup exactly once on a close, a cancellation, a supersession or the service's end |
+| A build or release in flight on the owner | the stage, then the retirements | owner actions (tickets) | the worker | collected when answered; GPU bytes charged until a release is answered |
 | A pinned plan | the view | the worker | pick | unpinned when neither newest published nor adopted; its CPU bytes return |
 | A retained region | the view, then the retirement list | the worker, owner actions | adopted frames | barrier met and no adoption lists it, then released on the owner; its GPU bytes return then |
 

@@ -1,0 +1,11 @@
+{
+  "name": "mixed",
+  "revision": 4,
+  "view": 1, "plan": 7,
+  "framebuffer": [128, 96],
+  "chunks": 4,
+  "pixels": 12288, "passed": 12288, "failed": 0, "indeterminate": 0,
+  "clear_pixels": 0,
+  "judge": "render-2d oracle with terrainModel and the decoded parents",
+  "completion": "the batch's own ticket reported complete before the readback was read"
+}

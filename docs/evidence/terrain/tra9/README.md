@@ -7,24 +7,26 @@ and terrain-runtime's README (the precondition guard, the outside staging accoun
 | | |
 | --- | --- |
 | Device | Apple M3 Max, MoltenVK (the pinned Homebrew driver), surface-free targets with a `D32_SFLOAT` depth image |
-| Tested head | `e3a625c9`, on base `6b35b315` |
+| Tested head | `34bdfb66`, on base `beb96171` (review round 2) |
 | Effective spec | `98a673fb` (review 6909126590): the atlas amendment 6731831183 as amended by reviews 6731944497, 6908703832 and 6909126590 and the decision comments 6908430167 and 6909009968 |
 
 ## Results
 
 | Run | Command | Result |
 | --- | --- | --- |
-| Required native witness | `bash tools/vulkan/run.sh native hetoimasia-lua-engine-graphics:test:lua-engine-graphics-native-tests -- --complete` | 32/32 in 8.86 s on the terrain-disabled host; 1/1 in 0.06 s on the terrain-enabled host (window depth on); 16 s wall, under the 30 s rule (`docs/vision.md:272`) |
-| Full qualification | the same suite with `-- --terrain-views-full` | 8/8 in 10.47 s |
-| Headless | `bash tools/vulkan/run.sh test hetoimasia-lua-engine-graphics:test:lua-engine-graphics-tests` (group `terrain views`) | 38/38, about 24 s, three runs in a row |
+| Required native witness | `bash tools/vulkan/run.sh native hetoimasia-lua-engine-graphics:test:lua-engine-graphics-native-tests -- --complete` | 32/32 in 9.22 s on the terrain-disabled host; 4/4 in 3.12 s on the terrain-enabled host; 12.34 s of test time, 21 s wall, under the 30 s rule (`docs/vision.md:272`) |
+| Full qualification | the same suite with `-- --terrain-views-full` | 14/14 in 24.76 s |
+| Headless | `bash tools/vulkan/run.sh test hetoimasia-lua-engine-graphics:test:lua-engine-graphics-tests` (group `terrain views`) | 57/57, about 33 s |
 
 Native commands run on macOS under the standing per-command consent (`HETOIMASIA_NATIVE_SESSION=desktop`);
 the full qualification wrote its files with `HETOIMASIA_VALIDATION_EVIDENCE` set.
 
 **Host configuration per witness.** The terrain views witness and every subgroup the native suite
-already had run on the terrain-disabled host. M1 output also runs, in a second short session, on a
-terrain-enabled host (`configureWorldDepth`, every window generation with a depth image): a published
-M1 scene is adopted, recorded and presented there.
+already had run on the terrain-disabled host. A second short session runs a terrain-enabled host
+(`configureWorldDepth`, every window generation with a depth image). On it, a published M1 scene is
+adopted, recorded and presented. The shipped quad and the twelve-colour grid are judged pixel by pixel
+there, as on the other host. A peer window keeps presenting while another is resized, and the resized
+window's earlier generation, once retired, keeps its depth image until it is destroyed.
 
 **Pixels.** Every pixel of each rendering is judged by the render-2d oracle with the terrain
 material's own model, independent of the production picker:
@@ -34,8 +36,29 @@ material's own model, independent of the production picker:
 | required A, required B (after the handles' release and an edit) | 128 x 96 | 12,288 each | 0 | 0 |
 | facing south, east, north, west | 128 x 96 | 12,288 each | 0 | 0 |
 | zoom 2 | 128 x 96 | 12,288 | 0 | 0 |
-| zoom 0.5 | 128 x 96 | 5,480 | 0 | 6,808 (minified texels the oracle cannot decide; determinacy floor a quarter) |
+| zoom 8 | 128 x 96 | 10,911 | 0 | 1,377 |
+| zoom 0.5 | 128 x 96 | 5,480 | 0 | 6,808 |
+| zoom 0.125 | 128 x 96 | 6,416 | 0 | 5,872 |
 | portrait | 64 x 128 | 8,192 | 0 | 0 |
+| before and after a resize of the adopted view | 128 x 96, then 96 x 128 | 12,288 each | 0 | 0 |
+| a far lower background (a 250-level band) | 128 x 96 | 12,288 | 0 | 0 |
+| a revealed cavity: ordinary, fog and mixed cells | 128 x 96 | 12,288 | 0 | 0 |
+| a revision whose batch was in flight while a newer one was adopted | 128 x 96 | 12,288 | 0 | 0 |
+
+Indeterminate pixels are minified or enlarged texel boundaries the oracle cannot decide. The
+determinacy floor is a quarter of the pixels.
+
+**Picks.** The oracle names colours, not the quad that wins a pixel, so picks are judged against the
+adopted plan's geometry. At every judged terrain pixel whose containing quads are all known parts, the
+pick must be a hit on one of those quads' cells, examined nearest first. That is the frontmost quad
+unless its texel there is a cutout. The rule does not decide texel coverage, which would repeat the
+picker. About half the picks name the frontmost quad (6,144 of 12,288 at each facing): a diamond tile
+fills half its quad's rectangle, and its corners are cutout texels.
+
+**Limits.** In both runs the GPU finished the in-flight batch before the newer revision was adopted,
+so the overlap was recorded, not exercised: no seam holds a batch's completion. A refused stale
+replacement is judged by the headless examples. Natively, the real runtime's background loads move the
+residency generation unpredictably, and the example cannot tell a fresh refresh from the replacement.
 
 ## Offload and reload (amendment 6909009968)
 
