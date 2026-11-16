@@ -13,7 +13,7 @@ module Test.LuaEngine.Graphics.TerrainViews (spec) where
 import Control.Concurrent (forkIO)
 import Control.Concurrent.STM
 import Control.Exception (finally)
-import Control.Monad (unless, void)
+import Control.Monad (unless, void, when)
 import qualified Data.ByteString as ByteString
 import qualified Data.ByteString.Char8 as BC
 import Data.Map.Strict (Map)
@@ -105,6 +105,9 @@ spec ∷ Spec
 spec = describe "terrain views" $ do
   pickConsistency
   races
+  lifecycle
+  styles
+  jumps
   it "attaches under the target's claim, publishes a whole world revision, and picks only from the revision the host adopted" $
     withViews $ \v → do
       view ← attached v 1
@@ -319,10 +322,102 @@ races = describe "attachment and intent" $ do
     isInvalid = \case Left (IntentInvalid _) → True; _ → False
 
 -- ---------------------------------------------------------------------------
+-- Close orders, limits and the service's end
+
+lifecycle ∷ Spec
+lifecycle = describe "close orders and limits" $ do
+  it "leaves the target's latest value alone when a view that never published closes, and releases its claim and interests" $
+    withViewsConfig testConfig {tvGpuBytes = 0} $ \v → do
+      -- With no GPU-data bank, nothing can be published: the view holds its claim and interests and stays pending.
+      view ← attached v 1
+      atomically (readView view) >>= (`shouldBe` Nothing) . readingPublished
+      atomically (pickView view (64, 48)) `shouldReturn` PickLoading
+      closeView view
+      publishedRevision (vModel v) 1 `shouldReturn` 0
+      atomically (claimOf (vClaims v) 1) `shouldReturn` Nothing
+      atomically (ledgerInterests (fakeLedger (vFake v))) `shouldReturn` mempty
+
+  it "publishes nothing when the target incarnation has ended before the close" $
+    withViews $ \v → do
+      view ← attached v 1
+      published ← awaitPublished v 1
+      setUsable (vModel v) 1 False
+      closeView view
+      publishedRevision (vModel v) 1 `shouldReturn` published
+      atomically (claimOf (vClaims v) 1) `shouldReturn` Nothing
+
+  it "refuses an attachment beyond the service's views, before taking anything" $
+    withViewsConfig testConfig {tvMaxViews = 1} $ \v → do
+      _ ← attached v 1
+      modelWindow (vModel v) 2
+      attachOutcome v (target v 2) `shouldReturn` SettledRefused AttachTooManyViews
+      atomically (claimOf (vClaims v) 2) `shouldReturn` Nothing
+
+  it "closes every view at the service's end, handing each claim back with a real empty revision" $ do
+    claims ← newTVarIO Nothing
+    withViews $ \v → do
+      _ ← attached v 1
+      published ← awaitPublished v 1
+      atomically (writeTVar claims (Just (vClaims v, vModel v, published)))
+    Just (claimTable, model, published) ← readTVarIO claims
+    atomically (claimOf claimTable 1) `shouldReturn` Nothing
+    _ ← pure model
+    published `shouldSatisfy` (> 0)
+
+-- ---------------------------------------------------------------------------
+-- Style refusals
+
+styles ∷ Spec
+styles = describe "style refusals" $ do
+  it "refuses a style whose parents swap roles, or exceed the instance's texture bytes, or whose mapping misses a material, as typed non-busy refusals with nothing held" $
+    withViews $ \v → do
+      let base = requestFor v (target v 1)
+          withStyle change = base {attachStyle = change (attachStyle base)}
+          outcome request = inInstance (vComp v) (vVm v) "i" (attachView (vViews v) request) >>= \case
+            Left refusal → pure (Just refusal)
+            Right _ → pure Nothing
+      swapped ← outcome (withStyle (\style → style {styleColourLease = styleNormalLease style, styleNormalLease = styleColourLease style}))
+      swapped `shouldSatisfy` \case Just (AttachStyle (ParentRefused ColourRole _)) → True; _ → False
+      tight ← outcome (withStyle (\style → style {styleInstanceTextureBytes = 4096}))
+      tight `shouldSatisfy` \case Just (AttachStyle (StyleExceedsTextureBytes _ 4096)) → True; _ → False
+      missing ← outcome (withStyle (\style → style {styleMaterials = [(material, "colour.unknown") | (material, _) ← styleMaterials style]}))
+      missing `shouldSatisfy` \case Just (AttachStyle (StyleMapping _)) → True; _ → False
+      atomically (claimOf (vClaims v) 1) `shouldReturn` Nothing
+      atomically (ledgerInterests (fakeLedger (vFake v))) `shouldReturn` mempty
+      -- The refusals held nothing: the same instance's valid style attaches.
+      void (attached v 1)
+
+-- ---------------------------------------------------------------------------
+-- Jumps
+
+jumps ∷ Spec
+jumps = describe "jumps" $ do
+  it "settles a jump exactly once: a landed jump moves the camera, a newer jump supersedes a pending one, and a cancelled one stays" $
+    withViews $ \v → do
+      view ← attached v 1
+      _ ← awaitPublished v 1
+      axis ← pure (either (error . show) id . axisFromInteger)
+      -- a nearby destination whose facts are held lands
+      near ← atomically (jumpView view (JumpRequest (axis 9, axis 9) Nothing)) >>= either (fail . show) pure
+      bounded (atomically (jumpSettled near >>= maybe retry pure)) `shouldReturn` SettledOk JumpLanded
+      -- a far destination waits for its facts; a newer jump supersedes it without moving the camera for it
+      far ← atomically (jumpView view (JumpRequest (axis 4000, axis 4000) Nothing)) >>= either (fail . show) pure
+      newer ← atomically (jumpView view (JumpRequest (axis 4100, axis 4100) Nothing)) >>= either (fail . show) pure
+      atomically (jumpSettled far) `shouldReturn` Just (SettledOk JumpSuperseded)
+      -- the newer one is cancelled and settles cancelled, once
+      cancelled ← atomically (cancelJumpView view newer)
+      when cancelled $ atomically (jumpSettled newer) `shouldReturn` Just SettledCancelled
+      atomically (cancelJumpView view newer) `shouldReturn` False
+      closeView view
+
+-- ---------------------------------------------------------------------------
 -- The rig
 
 withViews ∷ (Views → IO a) → IO a
-withViews body = do
+withViews = withViewsConfig testConfig
+
+withViewsConfig ∷ TerrainViewsConfig → (Views → IO a) → IO a
+withViewsConfig config body = do
   style ← loadAtlasStyle 5 [("loam", "colour.loam"), ("granite", "colour.granite")]
   sample ← findSampleDirectory
   let atlas = sample </> "content" </> "textures" </> "terrain-atlas"
@@ -359,7 +454,7 @@ withViews body = do
                   , portAccount = cpAccount comp
                   , portTaking = pure True
                   }
-          withTerrainViews testConfig ports $ \views →
+          withTerrainViews config ports $ \views →
             body (Views comp vm fake model terrain arena views owner claims (cpAccount comp) style colourKey normalKey)
               `finally` dissolve model
 
