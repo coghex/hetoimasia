@@ -79,9 +79,13 @@ main = do
   -- builds, with the host-wide window depth, in the same run as the complete profile and every ordinary selection.
   -- It runs with the complete profile and whenever the run's own Hspec selection selects its example, and not
   -- otherwise: a focused selection elsewhere neither starts it nor makes it an empty, failing run.
-  depthSelected ← if arguments == [completeFlag] then pure True else or <$> mapM (selects arguments) (Scenes.depthHostPaths <> Pixels.depthHostPixelPaths)
+  -- Hspec's argument reading is asked only for an ordinary selection: it refuses this program's own flags.
+  depthSelected ←
+    if probing || terrainFull
+      then pure False
+      else if arguments == [completeFlag] then pure True else or <$> mapM (selects arguments) (Scenes.depthHostPaths <> Pixels.depthHostPixelPaths)
   depthFacts ←
-    if probing || terrainFull || not depthSelected
+    if not depthSelected
       then pure Nothing
       else Just <$> runSessionOn TerrainEnabledHost (arguments == [completeFlag]) (consentBackend consent) validationFeatures configuration (\env → Scenes.depthHostSpec env >> Pixels.depthHostPixels env)
   finished ← getCurrentTime
