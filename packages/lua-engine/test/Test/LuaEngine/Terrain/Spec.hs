@@ -89,7 +89,8 @@ data HeldOut = HeldOut
   , heldReason ∷ String
   }
 
--- | The examples the pass leaves out (owner decision on #692, 2026-11-16: carry). Each still runs in its place.
+-- | The examples the pass leaves out (owner decisions on #692, 2026-11-16: carry, for the 256 KiB definition; A2+carry, for
+-- the 4,095 materials). Each still runs in its place.
 heldOut ∷ [HeldOut]
 heldOut =
   [ HeldOut
@@ -99,6 +100,13 @@ heldOut =
       "on two or more capabilities the open's commit transaction, which interns the whole definition, is restarted by the Lua \
       \host's STM writes for as long as the script keeps updating, and never commits: a terrain-runtime defect, #695, whose \
       \fix returns this example to the pass"
+  , HeldOut
+      [ "Terrain matrices"
+      , "accepts a definition of exactly the validator's 4,095 materials and settles one more as a definition failure, a cap no configuration reaches"
+      ]
+      "the same defect as the 256 KiB definition: on two or more capabilities the open's commit transaction is restarted by \
+      \the Lua host's STM writes for as long as the script keeps updating, and never commits (#695), whose fix returns this \
+      \example to the pass"
   ]
 
 -- | The set in its place: every example on one capability, the started count put back after it.
