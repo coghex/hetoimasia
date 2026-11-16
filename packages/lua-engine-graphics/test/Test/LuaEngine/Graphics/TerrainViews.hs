@@ -1,3 +1,4 @@
+{-# LANGUAGE MultiWayIf #-}
 {-# LANGUAGE OverloadedStrings #-}
 
 -- | Terrain views (TRA-9) over the real terrain service (#640/#665/#690), the real texture pipeline and instance
@@ -376,33 +377,36 @@ tileAt x y z = either (error . show) id (tileCoord x y z)
 
 races ∷ Spec
 races = describe "attachment and intent" $ do
-  it "refuses an attachment whose parent was released between its retention and the commit, taking no claim and no interest" $
-    withViews $ \v → do
-      -- Hold the worker inside the owner while the first view builds, then queue a second view.
-      atomically (writeTVar (foGate (vOwner v)) False)
+  it "refuses an attachment whose parent was released between its retention and the commit, taking no claim and no interest" $ do
+    commits ← newCommitHold
+    withViewsConfig testConfig {tvBeforeAttachCommit = holdCommit commits} $ \v → do
       first' ← inInstance (vComp v) (vVm v) "i" (attachView (vViews v) (requestFor v (target v 1))) >>= either (fail . show) pure
-      bounded (atomically (readTVar (foWaiting (vOwner v)) >>= check . (> 0)))
+      _ ← bounded (awaitAttach first')
+      -- The worker is held just before the second attachment's commit.
+      armCommitHold commits
       modelWindow (vModel v) 2
       second ← inInstance (vComp v) (vVm v) "i" (attachView (vViews v) (requestFor v (target v 2))) >>= either (fail . show) pure
+      awaitCommitHeld commits
       -- The instance releases the colour parent before the worker reaches the second commit.
       command (vComp v) (vVm v) "i" "release" "colour"
       _ ← awaitNoteContaining (vComp v) "i release colour"
       bounded (atomically (readFake (vFake v) >>= check . not . Set.null . readingMarkedNow))
-      atomically (writeTVar (foGate (vOwner v)) True)
-      _ ← bounded (awaitAttach first')
+      openCommitHold commits
       bounded (awaitAttach second) `shouldReturn` SettledRefused AttachParentReleased
       atomically (claimOf (vClaims v) 2) `shouldReturn` Nothing
 
-  it "cancels a queued attachment: it settles cancelled once, takes no claim, and a late cancel changes nothing" $
-    withViews $ \v → do
-      atomically (writeTVar (foGate (vOwner v)) False)
+  it "cancels a queued attachment: it settles cancelled once, takes no claim, and a late cancel changes nothing" $ do
+    commits ← newCommitHold
+    withViewsConfig testConfig {tvBeforeAttachCommit = holdCommit commits} $ \v → do
+      -- The worker is held inside the first attachment, so the second stays queued.
+      armCommitHold commits
       first' ← inInstance (vComp v) (vVm v) "i" (attachView (vViews v) (requestFor v (target v 1))) >>= either (fail . show) pure
-      bounded (atomically (readTVar (foWaiting (vOwner v)) >>= check . (> 0)))
+      awaitCommitHeld commits
       modelWindow (vModel v) 2
       second ← inInstance (vComp v) (vVm v) "i" (attachView (vViews v) (requestFor v (target v 2))) >>= either (fail . show) pure
       cancelAttach (vViews v) second `shouldReturn` True
       cancelAttach (vViews v) second `shouldReturn` False
-      atomically (writeTVar (foGate (vOwner v)) True)
+      openCommitHold commits
       _ ← bounded (awaitAttach first')
       bounded (awaitAttach second) `shouldReturn` SettledCancelled
       atomically (claimOf (vClaims v) 2) `shouldReturn` Nothing
@@ -913,15 +917,16 @@ lifecycle = describe "close orders and limits" $ do
       closeView view
 
   it "settles an attachment still queued at the service's end as stopped, releasing what it retained, while the view being built is discarded" $ do
-    gateRef ← newTVarIO Nothing
-    let releaseGate = readTVarIO gateRef >>= mapM_ (\gate → atomically (writeTVar gate True))
+    commits ← newCommitHold
     queued ← newTVarIO Nothing
-    withViewsConfig testConfig {tvStopping = releaseGate} $ \v → do
-      atomically (writeTVar gateRef (Just (foGate (vOwner v))))
-      atomically (writeTVar (foGate (vOwner v)) False)
+    withViewsConfig testConfig {tvBeforeAttachCommit = holdCommit commits, tvStopping = openCommitHold commits} $ \v → do
       first' ← inInstance (vComp v) (vVm v) "i" (attachView (vViews v) (requestFor v (target v 1))) >>= either (fail . show) pure
       _ ← bounded (awaitAttach first')
-      bounded (atomically (readTVar (foWaiting (vOwner v)) >>= check . (> 0)))
+      -- the worker is held inside a second attachment while a third is queued and the scope ends
+      armCommitHold commits
+      modelWindow (vModel v) 3
+      _ ← inInstance (vComp v) (vVm v) "i" (attachView (vViews v) (requestFor v (target v 3))) >>= either (fail . show) pure
+      awaitCommitHeld commits
       modelWindow (vModel v) 2
       second ← inInstance (vComp v) (vVm v) "i" (attachView (vViews v) (requestFor v (target v 2))) >>= either (fail . show) pure
       atomically (writeTVar queued (Just second))
@@ -970,15 +975,19 @@ lifecycle = describe "close orders and limits" $ do
     atomically (claimOf claims 1) `shouldReturn` Nothing
 
   it "rethrows a cancellation of its worker instead of recording it: the worker ends, attachments stop, and the scope's exit still closes every view" $ do
-    (views, claims) ← withViews $ \v → do
+    armed ← newTVarIO False
+    -- the next stage the worker enters cancels it there, as a cancellation of the worker's thread would
+    let cancelAt stage = when (stage == "planning") $ do
+          fire ← atomically (readTVar armed <* writeTVar armed False)
+          when fire (myThreadId >>= killThread)
+    (views, claims) ← withViewsConfig testConfig {tvOnStage = cancelAt} $ \v → do
       view ← attached v 1
       first' ← awaitPublished v 1
       quiescent v
-      atomically (writeTVar (foCancelNext (vOwner v)) True)
-      -- a zoom changes every region, so the next plan builds
+      atomically (writeTVar armed True)
       atomically (updateCamera view (CameraIntent [Camera.ZoomBy 2])) `shouldReturn` Right ()
-      -- the worker took the cancellation inside its next build
-      bounded (atomically (readTVar (foCancelNext (vOwner v)) >>= check . not))
+      -- the worker took the cancellation at the next plan
+      bounded (atomically (readTVar armed >>= check . not))
       modelWindow (vModel v) 2
       settled ← inInstance (vComp v) (vVm v) "i" (attachView (vViews v) (requestFor v (target v 2))) >>= \case
         Left refusal → pure (SettledRefused refusal)
@@ -1135,7 +1144,7 @@ withViewsTerrain order terrainConfig source config body = do
                   , portTaking = pure True
                   }
           let run views = body (Views comp vm fake model terrain arena views owner claims (cpAccount comp) style colourKey normalKey client metricsVar)
-          case order of
+          withOwnedThread (fakeOwnerLoop owner) $ \_ _ → case order of
             HostFirst → withTerrainViews config ports (\views → run views `finally` dissolve model)
             ViewsFirst → withTerrainViews config ports run `finally` dissolve model
 
@@ -1146,6 +1155,28 @@ testConfig = defaultTerrainViewsConfig {tvCellConfig = defaultCellConfig {ccDept
 
 metrics ∷ TargetMetrics
 metrics = TargetMetrics (PixelExtent 128 96) (PixelExtent 128 96) 1 1
+
+-- A seam that holds the worker just before an attachment's commit, once armed, until the example opens it.
+data CommitHold = CommitHold !(TVar Bool) !(TVar Bool) !(TVar Bool)
+
+newCommitHold ∷ IO CommitHold
+newCommitHold = CommitHold <$> newTVarIO False <*> newTVarIO False <*> newTVarIO False
+
+holdCommit ∷ CommitHold → IO ()
+holdCommit (CommitHold armed held opened) = do
+  holding ← atomically (readTVar armed <* writeTVar armed False)
+  when holding $ do
+    atomically (writeTVar held True)
+    atomically (readTVar opened >>= check)
+
+armCommitHold ∷ CommitHold → IO ()
+armCommitHold (CommitHold armed _ _) = atomically (writeTVar armed True)
+
+awaitCommitHeld ∷ CommitHold → IO ()
+awaitCommitHeld (CommitHold _ held _) = bounded (atomically (readTVar held >>= check))
+
+openCommitHold ∷ CommitHold → IO ()
+openCommitHold (CommitHold _ _ opened) = atomically (writeTVar opened True)
 
 -- The scene host model's window as a view target.
 target ∷ Views → Int → ViewTarget Int
@@ -1330,7 +1361,8 @@ quiet = mkLogger defaultLogFilter (callbackSink (\_ → pure ()))
 -- The fake graphics owner
 
 -- | A graphics owner that mints chunk references, each ready at once unless the example holds uploads, and releases them
--- when asked; its barrier is the scene host model's own.
+-- when asked; its barrier is the scene host model's own. Its actions are queued and run by its own thread, as the host's
+-- owner runs them, so the adapter's worker only ever reads their tickets.
 data FakeOwner = FakeOwner
   { foModel ∷ !Model
   , foNext ∷ !(TVar Word32)
@@ -1338,7 +1370,7 @@ data FakeOwner = FakeOwner
   , foReleased ∷ !(TVar [ChunkRef])
   , foBuilt ∷ !(TVar Int)
   , foGate ∷ !(TVar Bool)
-    -- ^ While closed, a build waits: the adapter's worker is held inside the owner's action.
+    -- ^ While closed, a build waits at the owner: the build stays in flight.
   , foWaiting ∷ !(TVar Int)
     -- ^ Builds waiting at the closed gate.
   , foFailure ∷ !(TVar (Maybe Text.Text))
@@ -1348,52 +1380,64 @@ data FakeOwner = FakeOwner
   , foHoldUploads ∷ !(TVar Bool)
     -- ^ While set, a new chunk's upload stays under way until the example completes it.
   , foEnded ∷ !(TVar Bool)
-    -- ^ Once set, the owner takes no more actions, as a closed host's: builds and releases answer 'Nothing' and a
-    -- barrier not yet met is never met.
-  , foCancelNext ∷ !(TVar Bool)
-    -- ^ While set, the next build cancels the thread that asked for it (the adapter's worker), once.
+    -- ^ Once set, the owner takes no more actions, as a closed host's: submissions are refused gone, queued actions do
+    -- not run and a barrier not yet met is never met.
+  , foQueue ∷ !(TVar [FakeAction])
+  , foCapacity ∷ !(TVar Int)
+    -- ^ How many actions the queue holds; a submission beyond it is refused busy.
+  , foLaneFull ∷ !(TVar Bool)
+    -- ^ While set, the release lane is full: a barrier request is refused busy.
+  , foReleaseFailure ∷ !(TVar (Maybe Text.Text))
+    -- ^ While set, every chunk of the next release action fails with this reason (once).
+  , foReleaseActions ∷ !(TVar Int)
+    -- ^ Release actions the owner ran.
+  , foBarrierAsks ∷ !(TVar Int)
+    -- ^ Barrier requests made, admitted or refused.
   }
 
-newFakeOwner ∷ Model → IO FakeOwner
-newFakeOwner model = FakeOwner model <$> newTVarIO 1 <*> newTVarIO Map.empty <*> newTVarIO [] <*> newTVarIO 0 <*> newTVarIO True <*> newTVarIO 0 <*> newTVarIO Nothing <*> newTVarIO Map.empty <*> newTVarIO False <*> newTVarIO False <*> newTVarIO False
+data FakeAction
+  = FakeBuild ![RegionBuild] !(TVar (Maybe (Answer (Either BuildFailure [ChunkRef]))))
+  | FakeRelease ![ChunkRef] !(TVar (Maybe (Answer [Either Text.Text ()])))
 
-fakeViewOwner ∷ FakeOwner → ViewOwner
-fakeViewOwner owner =
-  ViewOwner
-    { ownerMaterial = material
-    , ownerDepthQualified = True
-    , ownerBuild = \regions → do
-       cancel ← atomically (readTVar (foCancelNext owner) <* writeTVar (foCancelNext owner) False)
-       when cancel (myThreadId >>= killThread)
-       ended ← readTVarIO (foEnded owner)
-       if ended then pure Nothing else buildNow regions
-    , ownerRelease = \chunks → atomically $ do
+newFakeOwner ∷ Model → IO FakeOwner
+newFakeOwner model =
+  FakeOwner model
+    <$> newTVarIO 1
+    <*> newTVarIO Map.empty
+    <*> newTVarIO []
+    <*> newTVarIO 0
+    <*> newTVarIO True
+    <*> newTVarIO 0
+    <*> newTVarIO Nothing
+    <*> newTVarIO Map.empty
+    <*> newTVarIO False
+    <*> newTVarIO False
+    <*> newTVarIO []
+    <*> newTVarIO 64
+    <*> newTVarIO False
+    <*> newTVarIO Nothing
+    <*> newTVarIO 0
+    <*> newTVarIO 0
+
+-- The owner's thread: runs queued actions in order. A build waits at the gate; an ended owner answers what it did not
+-- run.
+fakeOwnerLoop ∷ FakeOwner → IO ()
+fakeOwnerLoop owner = forever $ do
+  action ← atomically $ readTVar (foQueue owner) >>= \case
+    next : rest → next <$ writeTVar (foQueue owner) rest
+    [] → retry
+  case action of
+    FakeBuild regions answer → do
+      atomically (modifyTVar' (foWaiting owner) (+ 1))
+      atomically ((readTVar (foGate owner) >>= check) `orElse` (readTVar (foEnded owner) >>= check))
+      atomically $ do
+        modifyTVar' (foWaiting owner) (subtract 1)
         ended ← readTVar (foEnded owner)
-        if ended
-          then pure Nothing
-          else do
-            modifyTVar' (foStanding owner) (\held → foldr Map.delete held chunks)
-            modifyTVar' (foReleased owner) (<> chunks)
-            pure (Just (map (const (Right ())) chunks))
-    , ownerBarrier = \_ → do
-        met ← modelCapture (foModel owner)
-        pure . Right $ do
-          ended ← readTVar (foEnded owner)
-          done ← met
-          pure (if done then Just True else if ended then Just False else Nothing)
-    , ownerStanding = \chunk → Map.lookup chunk <$> readTVar (foStanding owner)
-    , ownerEnd = readTVar (foEnded owner) >>= check
-    }
-  where
-    buildNow regions = do
-         atomically (modifyTVar' (foWaiting owner) (+ 1))
-         atomically (readTVar (foGate owner) >>= check)
-         atomically $ do
-          modifyTVar' (foWaiting owner) (subtract 1)
-          failure ← readTVar (foFailure owner)
-          case failure of
-           Just why → pure (Just (Left (BuildFailed why)))
-           Nothing → do
+        failure ← readTVar (foFailure owner)
+        result ← case (ended, failure) of
+          (True, _) → pure (NotRun "the owner ended")
+          (_, Just why) → pure (Answered (Left (BuildFailed why)))
+          _ → do
             start ← readTVar (foNext owner)
             let refs = [chunkRef index 1 | index ← take (length regions) [start ..]]
             writeTVar (foNext owner) (start + fromIntegral (length regions))
@@ -1401,9 +1445,61 @@ fakeViewOwner owner =
             modifyTVar' (foStanding owner) (Map.union (Map.fromList [(ref, if holding then ChunkUploading else ChunkReady) | ref ← refs]))
             modifyTVar' (foInstances owner) (Map.union (Map.fromList (zip refs (map buildInstances regions))))
             modifyTVar' (foBuilt owner) (+ length regions)
-            pure (Just (Right refs))
+            pure (Answered (Right refs))
+        writeTVar answer (Just result)
+    FakeRelease chunks answer → atomically $ do
+      ended ← readTVar (foEnded owner)
+      failure ← readTVar (foReleaseFailure owner) <* writeTVar (foReleaseFailure owner) Nothing
+      modifyTVar' (foReleaseActions owner) (+ 1)
+      result ← case (ended, failure) of
+        (True, _) → pure (NotRun "the owner ended")
+        (_, Just why) → pure (Answered (map (const (Left why)) chunks))
+        _ → do
+          modifyTVar' (foStanding owner) (\held → foldr Map.delete held chunks)
+          modifyTVar' (foReleased owner) (<> chunks)
+          pure (Answered (map (const (Right ())) chunks))
+      writeTVar answer (Just result)
+
+fakeViewOwner ∷ FakeOwner → ViewOwner
+fakeViewOwner owner =
+  ViewOwner
+    { ownerMaterial = material
+    , ownerDepthQualified = True
+    , ownerBuild = \regions → submitFake (FakeBuild regions)
+    , ownerRelease = \chunks → submitFake (FakeRelease chunks)
+    , ownerBarrier = \_ → do
+        modifyTVar' (foBarrierAsks owner) (+ 1)
+        ended ← readTVar (foEnded owner)
+        full ← readTVar (foLaneFull owner)
+        if
+          | ended → pure (Left OwnerGone)
+          | full → pure (Left OwnerBusy)
+          | otherwise → do
+              met ← modelCapture (foModel owner)
+              pure . Right $ do
+                gone ← readTVar (foEnded owner)
+                done ← met
+                pure (if done then Just True else if gone then Just False else Nothing)
+    , ownerRoom = (&&) <$> (not <$> readTVar (foEnded owner)) <*> ((<) <$> (length <$> readTVar (foQueue owner)) <*> readTVar (foCapacity owner))
+    , ownerReleaseRoom = (&&) <$> (not <$> readTVar (foEnded owner)) <*> (not <$> readTVar (foLaneFull owner))
+    , ownerStanding = \chunk → Map.lookup chunk <$> readTVar (foStanding owner)
+    , ownerEnd = readTVar (foEnded owner) >>= check
+    }
+  where
     material ∷ MaterialRef
     material = defaultMaterial
+    submitFake ∷ (TVar (Maybe (Answer a)) → FakeAction) → STM (Either OwnerRefusal (Ticket a))
+    submitFake make = do
+      ended ← readTVar (foEnded owner)
+      queued ← length <$> readTVar (foQueue owner)
+      capacity ← readTVar (foCapacity owner)
+      if
+        | ended → pure (Left OwnerGone)
+        | queued >= capacity → pure (Left OwnerBusy)
+        | otherwise → do
+            answer ← newTVar Nothing
+            modifyTVar' (foQueue owner) (<> [make answer])
+            pure (Right (readTVar answer))
 
 -- The instances of every chunk the window's latest world lists, in the world's order.
 drawnInstances ∷ Views → Int → IO [[Instance]]

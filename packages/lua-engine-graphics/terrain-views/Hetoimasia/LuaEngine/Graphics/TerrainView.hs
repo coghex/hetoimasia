@@ -21,6 +21,9 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView
 
     -- * The graphics owner
   , ViewOwner (..)
+  , OwnerRefusal (..)
+  , Answer (..)
+  , Ticket
   , RegionBuild (..)
   , BuildFailure (..)
   , productionViewOwner

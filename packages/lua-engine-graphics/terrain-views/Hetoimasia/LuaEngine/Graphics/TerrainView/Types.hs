@@ -77,6 +77,10 @@ data TerrainViewsConfig = TerrainViewsConfig
     -- ^ What a terrain frame clears to before its quads.
   , tvCopyRegions ∷ !Int
     -- ^ Regions one regional copy asks for: at most the terrain service's per-hold region bound.
+  , tvOnStage ∷ Text → IO ()
+    -- ^ Run on the worker each time a view enters a preparation stage ("copying", "planning", "building",
+    -- "uploading"), after the stage is recorded: a test seam (to hold the worker there, or end it there). Production
+    -- runs nothing.
   , tvBeforeAttachCommit ∷ IO ()
     -- ^ Run on the worker after an attachment's early checks and before its commit transaction: a test seam (to let a
     -- lease or a target change at exactly that point). Production runs nothing.
@@ -107,6 +111,7 @@ defaultTerrainViewsConfig =
     , tvClear = ClearColour 0 0 0 1
     , tvCopyRegions = 256
     , tvAccountGranule = 1024 * 1024
+    , tvOnStage = \_ → pure ()
     , tvBeforeAttachCommit = pure ()
     , tvStopping = pure ()
     }
