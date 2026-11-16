@@ -111,10 +111,12 @@ library terrain-views
     visibility: public
     hs-source-dirs: terrain-views
     exposed-modules:
+        Hetoimasia.LuaEngine.Graphics.TerrainView
         Hetoimasia.LuaEngine.Graphics.TerrainView.Inputs
         Hetoimasia.LuaEngine.Graphics.TerrainView.Owner
         Hetoimasia.LuaEngine.Graphics.TerrainView.Service
         Hetoimasia.LuaEngine.Graphics.TerrainView.Style
+        Hetoimasia.LuaEngine.Graphics.TerrainView.Target
         Hetoimasia.LuaEngine.Graphics.TerrainView.Types
     build-depends:
         base >=4.22 && <4.23,
