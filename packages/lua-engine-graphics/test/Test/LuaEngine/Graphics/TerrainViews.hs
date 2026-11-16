@@ -1366,16 +1366,15 @@ lifecycle = describe "close orders and limits" $ do
       view ← attached v 1
       first' ← awaitPublished v 1
       quiescent v
-      -- the camera's demand is resident, so the terrain service's staging (in the shared account) stays where it is
       demandResident v view
       adoptNow (vModel v) 1 `shouldReturn` Adopted first'
       _ ← releasePass (vModel v)
-      -- an upload is under way and holds the staging buffer: the next build is refused as pressure
-      atomically (writeTVar (foUploads (vOwner v)) [7] >> writeTVar (foStopAfter (vOwner v)) (Just (0, True)))
+      -- an upload is under way and holds the staging buffer: every build is refused as pressure while it is
+      atomically (writeTVar (foUploads (vOwner v)) [7] >> writeTVar (foPressured (vOwner v)) True)
       built ← readTVarIO (foBuilt (vOwner v))
-      -- an edit in view rebuilds its region with the camera, and so the demand, unchanged
+      -- an edit in view rebuilds its region, the camera unchanged
       removeWith v (tileAt 9 9 3) Nothing `shouldReturn` Right True
-      bounded (atomically (readTVar (foStopAfter (vOwner v)) >>= check . isNothing))
+      quiescent v
       bounded (atomically (readView view >>= \r → check (readingWaiting r && readingStagedBytes r == 0)))
       readTVarIO (foBuilt (vOwner v)) `shouldReturn` built
       publishedRevision (vModel v) 1 `shouldReturn` first'
@@ -2016,6 +2015,8 @@ data FakeOwner = FakeOwner
     -- ^ While set, the next build makes this many regions, then stops: as pressure ('True') or as a failure (once).
   , foUploads ∷ !(TVar [Natural])
     -- ^ The uploads the owner reports unsettled, by number: the example settles them.
+  , foPressured ∷ !(TVar Bool)
+    -- ^ While set, a build is refused as upload pressure for as long as 'foUploads' names an upload.
   }
 
 data FakeAction
@@ -2043,6 +2044,7 @@ newFakeOwner model =
     <*> newTVarIO 0
     <*> newTVarIO Nothing
     <*> newTVarIO []
+    <*> newTVarIO False
 
 -- The owner's thread: runs queued actions in order. A build waits at the gate; an ended owner answers what it did not
 -- run.
@@ -2059,7 +2061,8 @@ fakeOwnerLoop owner = forever $ do
         modifyTVar' (foWaiting owner) (subtract 1)
         ended ← readTVar (foEnded owner)
         failure ← readTVar (foFailure owner)
-        stop ← readTVar (foStopAfter owner) <* writeTVar (foStopAfter owner) Nothing
+        pressured ← (&&) <$> readTVar (foPressured owner) <*> (not . null <$> readTVar (foUploads owner))
+        stop ← if pressured then pure (Just (0, True)) else readTVar (foStopAfter owner) <* writeTVar (foStopAfter owner) Nothing
         let make made = do
               start ← readTVar (foNext owner)
               let refs = [chunkRef index 1 | index ← take (length made) [start ..]]
