@@ -227,9 +227,10 @@ data ViewState = ViewState
   , vsClosing ∷ !(TVar Bool)
   , vsClosed ∷ !(TVar Bool)
   , vsJumps ∷ !(TVar (Map Word64 (TVar (Maybe (Settled JumpOutcome)))))
-  , vsRetry ∷ !(TVar (Maybe Word64))
-    -- ^ A preparation left work it can complete once something is released (copies refused busy, a pin or a bank
-    -- full): the service's release count when it stopped. It runs again when that count has moved.
+  , vsRetry ∷ !(TVar (Maybe (Word64, Maybe Natural)))
+    -- ^ A preparation left work it can complete once something is released or adopted (copies refused busy, a pin
+    -- or a bank full): the service's release count and the target's newest adopted revision when it stopped. It runs
+    -- again when either has moved.
   , vsExtraDemand ∷ !(TVar [RegionCoord])
     -- ^ Regions a pending jump or an unavailable followed surface needs beyond the viewport.
   }
@@ -434,7 +435,9 @@ updateCamera (TerrainView service state) (CameraIntent commands) = do
     else do
       camera ← readTVar (vsCamera state)
       facts ← readTVar (vsFacts state)
-      case foldl' (step facts) (Right camera) commands of
+      case facts of
+       Nothing → pure (Left IntentBusy)
+       Just _ → case foldl' (step facts) (Right camera) commands of
         Left why → pure (Left (IntentInvalid why))
         Right moved → do
           writeTVar (vsCamera state) moved
@@ -675,9 +678,16 @@ viewDirty service state = do
   status ← Runtime.arenaStatusSTM (portTerrain (svPorts service)) (vsArena state)
   now ← vtMetrics (vsTarget state)
   retryAt ← readTVar (vsRetry state)
-  releases ← readTVar (svReleases service)
+  mark ← retryMark service state
   let current = either (const Nothing) (\s → Just (Runtime.statusContentRevision s, Runtime.statusKnowledgeRevision s)) status
-  pure (intent /= prepared || current /= revisions || now /= metrics || maybe False (/= releases) retryAt)
+  pure (intent /= prepared || current /= revisions || now /= metrics || maybe False (/= mark) retryAt)
+
+-- What a waiting preparation watches: the service's releases and the target's newest adoption.
+retryMark ∷ TerrainViews → ViewState → STM (Word64, Maybe Natural)
+retryMark service state = do
+  releases ← readTVar (svReleases service)
+  newest ← ledgerNewestAdopted (portLedger (svPorts service)) (vtKey (vsTarget state))
+  pure (releases, fst <$> newest)
 
 -- The graphics owner takes no more actions, so the retirements left cannot be proved: they are kept as terminal
 -- evidence, and their GPU bytes stay charged.
@@ -781,9 +791,9 @@ prepareView service state = do
     (_, Left _) → pure Unchanged'
     (Just m, Right _) → prepareFor service state intent m
   atomically $ do
-    releases ← readTVar (svReleases service)
+    mark ← retryMark service state
     case outcome of
-      Retry' → writeTVar (vsRetry state) (Just releases)
+      Retry' → writeTVar (vsRetry state) (Just mark)
       _ → writeTVar (vsRetry state) Nothing
     case outcome of
       Abandoned' → pure ()
@@ -810,8 +820,7 @@ prepareFor service state intent metrics = do
           case visible of
             Nothing → pure Unchanged'
             Just (visibleRegions, prefetchRegions) → do
-              demanded ← setDemand service state visibleRegions prefetchRegions
-              unless demanded (recordFailure service "the view's demand was refused by the terrain service")
+              setDemand service state visibleRegions prefetchRegions
               withCopies service state (Set.toList (Set.fromList (anchor : extra <> visibleRegions))) $ \case
                 CopiesBusy → pure Retry'
                 CopiesGone → pure Abandoned'
@@ -890,16 +899,18 @@ candidateRegions service state camera metrics copies =
 regionsOf ∷ Demand → [RegionCoord]
 regionsOf (Demand chunks) = [RegionCoord cx cy (fromInteger level) | ChunkDemand (ChunkKey cx cy) _ levels ← chunks, level ← levels]
 
--- The view's camera interests: its visible regions before its prefetch, latest value only.
-setDemand ∷ TerrainViews → ViewState → [RegionCoord] → [RegionCoord] → IO Bool
-setDemand service state visible prefetch =
-  case traverse demandOf (visible <> prefetch) of
-    Left _ → pure False
-    Right demands →
-      Runtime.setViewDemand (portTerrain (svPorts service)) (vsRuntimeView state) (vsArena state) demands >>= \case
-        Right _ → pure True
-        Left _ → pure False
+-- The view's camera interests: its visible regions before its prefetch, latest value only. More regions than the
+-- service's camera share takes are asked again with the visible ones alone; pressure is the runtime's to coalesce. The
+-- copies the view plans from do not depend on residency, so a refused demand delays nothing it draws.
+setDemand ∷ TerrainViews → ViewState → [RegionCoord] → [RegionCoord] → IO ()
+setDemand service state visible prefetch = ask (visible <> prefetch) (Just visible)
   where
+    ask regions fallback = case traverse demandOf regions of
+      Left _ → pure ()
+      Right demands →
+        Runtime.setViewDemand (portTerrain (svPorts service)) (vsRuntimeView state) (vsArena state) demands >>= \case
+          Left (Runtime.RefusedInvalid _) | Just smaller ← fallback, length smaller < length regions → ask smaller Nothing
+          _ → pure ()
     demandOf region = RegionDemand region <$> coverageBox 0 16 0 16 0 32
 
 -- The view's setup for these metrics: the whole framebuffer.
