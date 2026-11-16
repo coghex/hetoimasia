@@ -17,6 +17,13 @@ import Data.Word (Word64)
 import Hetoimasia.Foundation.Messaging.Payload (prepare)
 import Hetoimasia.LuaEngine.Graphics.Scene.Ledger
 import Hetoimasia.LuaEngine.Graphics.Scene.Publish (HostAnswer (..))
+import Hetoimasia.LuaEngine.Graphics.Scene.World (SceneWorld (..), WorldTag (..))
+import Hetoimasia.Math.Vector (V2 (..))
+import Hetoimasia.Render.TwoD.Chunk (ChunkRef)
+import Hetoimasia.Render.TwoD.Chunk.Backend (chunkRef)
+import Hetoimasia.Render.TwoD.Metrics (PixelExtent (..), TargetMetrics (..))
+import Hetoimasia.Render.TwoD.Settings (defaultViewSettings)
+import Hetoimasia.Render.TwoD.Snapshot (Camera (..), ClearColour (..), Layer (WorldLayerWith), LayerDepth (DepthEnabled), View (View), Viewport (..))
 import Hetoimasia.LuaEngine.Graphics.Texture.Backend (BackendReading (..))
 import Hetoimasia.LuaEngine.Graphics.Texture.Port (Fault (FaultFatal))
 import Hetoimasia.LuaEngine.Scene (initialContent)
@@ -72,6 +79,59 @@ spec = describe "scene retention" $ do
       readingFirstDefect first `shouldSatisfy` maybe False (not . null . show)
       -- The union is protected rather than a hold lost.
       readingHeld first `shouldBe` Set.fromList [10, 11]
+
+  describe "terrain views: world scenes and interests" $ do
+    it "holds a world revision's chunks and textures for each adoption, so the first release leaves the second's" $ do
+      ledger ← newSceneLedger ∷ IO (SceneLedger Int)
+      let world = worldNaming 1 1 [chunkRef 3 1, chunkRef 4 1] [10, 11]
+      ledgerAdopted ledger 1 5 world
+      ledgerAdopted ledger 1 5 world
+      atomically ((,,) <$> ledgerChunkHeld ledger (chunkRef 3 1) <*> ledgerChunkHeld ledger (chunkRef 3 2) <*> ledgerHeld ledger 11) `shouldReturn` (True, False, True)
+      ledgerReleased ledger 1 5
+      atomically ((,) <$> ledgerChunkHeld ledger (chunkRef 4 1) <*> ledgerHeld ledger 10) `shouldReturn` (True, True)
+      ledgerReleased ledger 1 5
+      atomically ((,) <$> ledgerChunkHeld ledger (chunkRef 4 1) <*> ledgerHeld ledger 10) `shouldReturn` (False, False)
+      reading ← atomically (ledgerReading ledger)
+      (readingDefects reading, readingChunks reading) `shouldBe` (0, Set.empty)
+
+    it "names the newest adopted revision of a target with its world's tag, and an M1 revision with none" $ do
+      ledger ← newSceneLedger ∷ IO (SceneLedger Int)
+      atomically (ledgerNewestAdopted ledger 1) `shouldReturn` Nothing
+      ledgerAdopted ledger 1 2 (worldNaming 7 3 [chunkRef 1 1] [10])
+      ledgerAdopted ledger 1 3 (worldNaming 7 4 [chunkRef 2 1] [10])
+      ledgerAdopted ledger 2 9 (naming [10])
+      atomically (ledgerNewestAdopted ledger 1) `shouldReturn` Just (3, Just (WorldTag 7 4))
+      atomically (ledgerNewestAdopted ledger 2) `shouldReturn` Just (9, Nothing)
+      ledgerReleased ledger 1 3
+      atomically (ledgerNewestAdopted ledger 1) `shouldReturn` Just (2, Just (WorldTag 7 3))
+
+    it "counts explicit interests apart from adoptions, and a drop of one not held as a defect that never goes below zero" $ do
+      ledger ← newSceneLedger ∷ IO (SceneLedger Int)
+      atomically (ledgerRetainInterest ledger 10 >> ledgerRetainInterest ledger 10)
+      atomically ((,) <$> ledgerHeld ledger 10 <*> ledgerHolds ledger 10) `shouldReturn` (True, 0)
+      atomically (ledgerDropInterest ledger 10)
+      atomically (ledgerHeld ledger 10) `shouldReturn` True
+      atomically (ledgerDropInterest ledger 10)
+      atomically (ledgerHeld ledger 10) `shouldReturn` False
+      atomically (ledgerDropInterest ledger 10)
+      reading ← atomically (ledgerReading ledger)
+      (readingDefects reading, readingInterests reading) `shouldBe` (1, mempty)
+
+    it "keeps a released texture's registration while an explicit interest holds it, and retires it once the interest is dropped" $
+      sceneRig defaultFakeConfig $ \rig model → do
+        let fake = rigFake rig
+        modelWindow model 1
+        (texture, identity) ← deliverTexture rig
+        atomically (ledgerRetainInterest (fakeLedger fake) identity)
+        reading ← textureRelease texture
+        -- The release passes the barrier (nothing is published) and finds the texture held by the interest alone.
+        awaitBackend rig (elem "held" . readingTextureStages)
+        eventCount fake "release attempted" `shouldReturn` 0
+        pendingNow reading `shouldReturn` True
+        atomically (ledgerDropInterest (fakeLedger fake) identity)
+        awaitEvent fake "released"
+        atomically (reading >>= \case ProviderComplete → pure (); _ → retry)
+        eventCount fake "release attempted" `shouldReturn` 1
 
   describe "the release of a published texture" $ do
     it "waits for the adoption of the scene, defers while the adopted scene holds it, and retires after the last use" $
@@ -335,6 +395,19 @@ spec = describe "scene retention" $ do
 
     naming ∷ [Word64] → GraphicsScene
     naming identities = GraphicsScene initialContent (Set.fromList identities)
+
+    -- A world scene of a view and revision, listing these chunks and naming these textures.
+    worldNaming ∷ Word64 → Word64 → [ChunkRef] → [Word64] → GraphicsScene
+    worldNaming view revision chunks identities =
+      worldGraphicsScene
+        SceneWorld
+          { worldTag = WorldTag view revision
+          , worldClear = ClearColour 0 0 0 1
+          , worldView = View (Camera (V2 0 0) 1 Nothing) (Viewport (V2 0 0) (V2 8 8)) defaultViewSettings [] [WorldLayerWith DepthEnabled chunks []]
+          , worldMetrics = TargetMetrics (PixelExtent 8 8) (PixelExtent 8 8) 1 1
+          , worldChunks = Set.fromList chunks
+          , worldTextures = Set.fromList identities
+          }
 
     publishScene' model window scene = do
       prepared ← prepare scene
