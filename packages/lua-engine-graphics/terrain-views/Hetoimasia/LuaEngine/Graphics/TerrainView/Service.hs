@@ -44,6 +44,7 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView.Service
   , withTerrainViews
   , terrainViewsFailures
   , terrainViewsGpuCharged
+  , terrainViewsRetiring
   , renderStagingAccount
 
     -- * Views
@@ -308,6 +309,17 @@ renderStagingAccount account =
 -- not prove.
 terrainViewsFailures ∷ (Ord k, Show k) ⇒ TerrainViews k → STM [Text]
 terrainViewsFailures = readTVar . svFailures
+
+-- | Where each retiring chunk stands: "unasked", "waiting" (on the host's barrier), "met" (released once no adoption
+-- lists it, its upload has ended and the owner has room) or "releasing". Read-only.
+terrainViewsRetiring ∷ TerrainViews k → STM [(ChunkRef, Text)]
+terrainViewsRetiring service = map (\r → (rtChunk r, name (rtState r))) <$> readTVar (svRetiring service)
+  where
+    name = \case
+      RetireUnasked → "unasked"
+      RetireWaiting _ → "waiting"
+      RetireMet → "met"
+      RetireReleasing _ _ → "releasing"
 
 -- | The GPU bytes the service holds charged: every retained region listed, being built, uploading or retiring, until
 -- its release is proved. Read-only.

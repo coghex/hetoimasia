@@ -471,6 +471,11 @@ stages = describe "stages and the owner" $ do
       -- the empty handback is adopted and the terrain revision's adoption released: the release is due, the queue full
       _ ← adoptNow (vModel v) 1
       _ ← releasePass (vModel v)
+      -- every region is behind its met barrier, waiting only for room on the owner
+      bounded . atomically $ do
+        retiring ← terrainViewsRetiring (vViews v)
+        check (Set.fromList chunks `Set.isSubsetOf` Set.fromList [chunk | (chunk, "met") ← retiring])
+      atomically (terrainViewsFailures (vViews v)) `shouldReturn` []
       atomically (writeTVar (foCapacity (vOwner v)) 64)
       bounded (atomically (readTVar (foReleased (vOwner v)) >>= \done → check (Set.fromList chunks `Set.isSubsetOf` Set.fromList done)))
       atomically (terrainViewsFailures (vViews v)) `shouldReturn` []
@@ -530,15 +535,20 @@ stages = describe "stages and the owner" $ do
       atomically (writeTVar (foHoldUploads (vOwner v)) True)
       view ← attached v 1
       bounded (atomically (readTVar (foStanding (vOwner v)) >>= check . elem ChunkUploading . Map.elems))
+      fresh ← Map.keys <$> readTVarIO (foStanding (vOwner v))
       closeView view
-      atomically (terrainViewsGpuCharged (vViews v)) >>= (`shouldSatisfy` (> 0))
+      -- retirements go before any view's step: once another view has published, they have been tried
+      atomically (writeTVar (foHoldUploads (vOwner v)) False)
+      modelWindow (vModel v) 2
+      peer ← attached v 2
+      _ ← awaitPublished v 2
+      charged ← atomically (terrainViewsGpuCharged (vViews v))
       releasedChunks (vOwner v) `shouldReturn` []
-      -- the uploads end: the regions are released, and only then are their bytes returned
-      atomically $ do
-        writeTVar (foHoldUploads (vOwner v)) False
-        modifyTVar' (foStanding (vOwner v)) (Map.map (const ChunkReady))
-      bounded (atomically (terrainViewsGpuCharged (vViews v) >>= check . (== 0)))
-      releasedChunks (vOwner v) >>= (`shouldSatisfy` (not . null))
+      -- the unpublished regions' uploads end: they are released, and only then are their bytes returned
+      atomically (modifyTVar' (foStanding (vOwner v)) (\standings → foldr (Map.adjust (const ChunkReady)) standings fresh))
+      bounded (atomically (readTVar (foReleased (vOwner v)) >>= \done → check (Set.fromList fresh `Set.isSubsetOf` Set.fromList done)))
+      atomically (terrainViewsGpuCharged (vViews v)) >>= (`shouldSatisfy` (< charged))
+      closeView peer
 
   it "copies a viewport larger than the retained bank can reserve at once, one batch at a time" $
     withViewsTerrain HostFirst (\c → c {configRetainedBytes = 1024 * 1024}) loamOverGranite testConfig {tvCopyRegions = 1} $ \v → do
@@ -607,6 +617,8 @@ stages = describe "stages and the owner" $ do
         bounded closed
       atomically (claimOf (vClaims v) 1) `shouldReturn` Nothing
       atomically (ledgerInterests (fakeLedger (vFake v))) `shouldReturn` mempty
+      -- the request that was in flight holds nothing of the terrain service any more
+      bounded (atomically (Runtime.inspectRegionalSTM (_vTerrain v) >>= check . null))
       atomically (terrainViewsFailures (vViews v)) `shouldReturn` []
 
   it "hands a close mid-build to cleanup exactly once: the build in flight is collected when it answers, and released" $
@@ -642,7 +654,9 @@ stages = describe "stages and the owner" $ do
     seam ← newStageSeam
     opened ← newTVarIO False
     reopened ← newTVarIO False
-    withViewsConfig testConfig {tvStepsPerQuantum = 1, tvOnStage = seamHook seam} $ \v → do
+    -- the holds open when the service stops, so a failing example still ends
+    let openAll = atomically (writeTVar opened True >> writeTVar reopened True)
+    withViewsConfig testConfig {tvStepsPerQuantum = 1, tvCellConfig = defaultCellConfig {ccDepth = 250}, tvOnStage = seamHook seam, tvStopping = openAll} $ \v → do
       modelWindow (vModel v) 3
       third ← attached v 3
       _ ← awaitPublished v 3
