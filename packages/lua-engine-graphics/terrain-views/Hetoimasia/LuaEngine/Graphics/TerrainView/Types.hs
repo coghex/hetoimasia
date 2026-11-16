@@ -43,7 +43,6 @@ import Control.Concurrent.STM (STM)
 import Data.Text (Text)
 import Data.Word (Word64)
 import Hetoimasia.Foundation.Messaging.Payload (Prepared)
-import Hetoimasia.GPU.Vulkan.GLFW (SceneTargetKey)
 import Hetoimasia.LuaEngine.Graphics.Scene.Ledger (GraphicsScene)
 import Hetoimasia.LuaEngine.Graphics.Scene.World (WorldTag)
 import Hetoimasia.LuaEngine.Graphics.TerrainView.Style (StyleRefusal, StyleRequest, describeStyleRefusal)
@@ -103,8 +102,8 @@ defaultTerrainViewsConfig =
 -- admitted incarnation, its latest-value publication as a transaction (the host's own), whether its recording supplies
 -- the qualified @D32_SFLOAT@ depth image, and the metrics its frames are recorded with now. It carries no native
 -- control and no disposal.
-data ViewTarget = ViewTarget
-  { vtKey ∷ !SceneTargetKey
+data ViewTarget k = ViewTarget
+  { vtKey ∷ !k
   , vtUsable ∷ STM Bool
   , vtPublish ∷ Prepared GraphicsScene → STM Bool
     -- ^ Make the scene the target's latest value; 'False' when the host holds no such incarnation.
@@ -117,8 +116,8 @@ data ViewTarget = ViewTarget
 
 -- | What an attachment names: the target, the style (the owning instance's parents and mapping), the arena lease
 -- the view reads through, where the camera starts, and its presentation settings.
-data AttachRequest = AttachRequest
-  { attachTarget ∷ !ViewTarget
+data AttachRequest k = AttachRequest
+  { attachTarget ∷ !(ViewTarget k)
   , attachStyle ∷ !StyleRequest
   , attachArena ∷ !ArenaLease
   , attachAnchor ∷ !(AxisCoord, AxisCoord, AxisCoord)
@@ -245,16 +244,16 @@ data ViewReading = ViewReading
 
 -- | What a pick found, mapping one-to-one onto the approved Lua answers: 'PickHit' is @hit@, 'PickNoHit' is
 -- @no_hit@ and 'PickLoading' is @loading@. Nothing else is answered.
-data PickResult
-  = PickHit !PickRef
+data PickResult k
+  = PickHit !(PickRef k)
   | PickNoHit
   | PickLoading
   deriving (Eq, Show)
 
 -- | Everything a pick's consistency is: the target and view incarnations, the adopted revision and its plan tag, the
 -- arena incarnation and its content and knowledge revisions. Opaque to callers.
-data PickIdentity = PickIdentity
-  { pickTarget ∷ !SceneTargetKey
+data PickIdentity k = PickIdentity
+  { pickTarget ∷ !k
   , pickViewId ∷ !Word64
   , pickRevision ∷ !Word64
   , pickTag ∷ !WorldTag
@@ -265,22 +264,22 @@ data PickIdentity = PickIdentity
   deriving (Eq, Show)
 
 -- | A hit's opaque consistency reference: the exact logical cell and part, and the identity it was picked under.
-data PickRef = PickRef
+data PickRef k = PickRef
   { refCell ∷ !TileCoord
   , refPart ∷ !PartKind
-  , refIdentity ∷ !PickIdentity
+  , refIdentity ∷ !(PickIdentity k)
   }
   deriving (Eq, Show)
 
-pickRefCell ∷ PickRef → TileCoord
+pickRefCell ∷ PickRef k → TileCoord
 pickRefCell = refCell
 
-pickRefPart ∷ PickRef → PartKind
+pickRefPart ∷ PickRef k → PartKind
 pickRefPart = refPart
 
-pickRefIdentity ∷ PickRef → PickIdentity
+pickRefIdentity ∷ PickRef k → PickIdentity k
 pickRefIdentity = refIdentity
 
 -- | Made only by the adapter's picker.
-mkPickRef ∷ TileCoord → PartKind → PickIdentity → PickRef
+mkPickRef ∷ TileCoord → PartKind → PickIdentity k → PickRef k
 mkPickRef = PickRef

@@ -13,6 +13,7 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView
   , defaultTerrainViewsConfig
   , terrainGpuBankBytes
   , TerrainViewsPorts (..)
+  , productionPorts
   , TerrainViews
   , withTerrainViews
   , terrainViewsFailures
@@ -77,8 +78,36 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView
   , pickPrecondition
   ) where
 
+import Control.Concurrent.STM (STM)
+import Hetoimasia.GPU.Vulkan.GLFW (SceneTargetKey, VulkanHost)
+import Hetoimasia.LuaEngine.Graphics.Scene.Configuration (SceneSession (..))
+import Hetoimasia.LuaEngine.Graphics.Scene.Ledger (GraphicsScene)
 import Hetoimasia.LuaEngine.Graphics.TerrainView.Owner
 import Hetoimasia.LuaEngine.Graphics.TerrainView.Service
 import Hetoimasia.LuaEngine.Graphics.TerrainView.Style
 import Hetoimasia.LuaEngine.Graphics.TerrainView.Target
 import Hetoimasia.LuaEngine.Graphics.TerrainView.Types
+import Hetoimasia.LuaEngine.Graphics.Texture (TextureGraphics (..))
+import Hetoimasia.LuaEngine.Texture (RenderAccount)
+import Hetoimasia.Render.TwoD.Vulkan.Textures (isReleased)
+import qualified Hetoimasia.Terrain.Runtime as Runtime
+
+-- | The ports of a terrain-enabled composition over the running host and its composed graphics session: the owner's
+-- capability over the host, the session's registry, ledger and claims, its initial scene, the terrain service and the
+-- client the views are opened under, the session's one CPU render/staging account (which the terrain service was also
+-- given, as 'renderStagingAccount', so all three consumers draw on it) and the session's admission.
+productionPorts ∷ VulkanHost GraphicsScene → TextureGraphics → SceneSession → Runtime.Service → Runtime.Client → RenderAccount → STM Bool → IO (TerrainViewsPorts SceneTargetKey)
+productionPorts host graphics scenes terrain client account taking = do
+  owner ← productionViewOwner host graphics
+  pure
+    TerrainViewsPorts
+      { portOwner = owner
+      , portReleased = isReleased (graphicsTextures graphics)
+      , portLedger = graphicsLedger graphics
+      , portClaims = scenesClaims scenes
+      , portInitial = scenesInitial scenes
+      , portTerrain = terrain
+      , portClient = client
+      , portAccount = account
+      , portTaking = taking
+      }

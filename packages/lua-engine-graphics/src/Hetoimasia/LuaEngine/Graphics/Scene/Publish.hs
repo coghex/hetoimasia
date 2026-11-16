@@ -185,7 +185,7 @@ data HostAnswer
 --
 -- It reads the session's claims in its commit, so an M1 publication never replaces a terrain view's scene: the
 -- production publisher cannot be built without them.
-scenePublisher ∷ SceneClaims → Textures → WindowProvider (WindowTarget GraphicsScene) → ScenePublisher (WindowTarget GraphicsScene)
+scenePublisher ∷ SceneClaims SceneTargetKey → Textures → WindowProvider (WindowTarget GraphicsScene) → ScenePublisher (WindowTarget GraphicsScene)
 scenePublisher claims textures provider =
   publisherClaimedBy
     (\target → isJust <$> claimOf claims (KeyWindow (targetWindow target)))

@@ -70,7 +70,7 @@ data SceneSession = SceneSession
     -- ^ Where the renderer hook finds the session's renderer; the composition fills it.
   , scenesInitial ∷ !(Prepared GraphicsScene)
     -- ^ The initial scene every window holds until it publishes.
-  , scenesClaims ∷ !SceneClaims
+  , scenesClaims ∷ !(SceneClaims SceneTargetKey)
     -- ^ The terrain views' exclusive claims of targets, which the M1 publisher reads in its commit.
   }
 

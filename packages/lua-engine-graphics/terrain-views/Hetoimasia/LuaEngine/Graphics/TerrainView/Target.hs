@@ -25,7 +25,7 @@ import Hetoimasia.Render.TwoD.Metrics (TargetMetrics)
 -- | A window incarnation's target. Its depth is the host's: 'True' only on a host built with the host-wide window
 -- depth ('Hetoimasia.LuaEngine.Graphics.Scene.Configuration.configureWorldDepth'), which the composition that built the
 -- host passes here. The metrics are the window's latest observation, as the composition reads it.
-windowViewTarget ∷ Bool → STM (Maybe TargetMetrics) → WindowTarget GraphicsScene → ViewTarget
+windowViewTarget ∷ Bool → STM (Maybe TargetMetrics) → WindowTarget GraphicsScene → ViewTarget SceneTargetKey
 windowViewTarget hostDepth metrics target =
   ViewTarget
     { vtKey = KeyWindow (targetWindow target)
@@ -40,7 +40,7 @@ windowViewTarget hostDepth metrics target =
 
 -- | A surface-free target registered with the host. Its recording boundary ('recordVulkanTargetBatch') is the one
 -- place its frames are recorded; whoever records them says whether they carry the qualified depth image.
-offscreenViewTarget ∷ VulkanHost GraphicsScene → OffscreenTargetId → STM Bool → Bool → STM (Maybe TargetMetrics) → ViewTarget
+offscreenViewTarget ∷ VulkanHost GraphicsScene → OffscreenTargetId → STM Bool → Bool → STM (Maybe TargetMetrics) → ViewTarget SceneTargetKey
 offscreenViewTarget host target usable depth metrics =
   ViewTarget
     { vtKey = KeyOffscreen target

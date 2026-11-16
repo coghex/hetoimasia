@@ -39,10 +39,10 @@ import Control.Concurrent.STM (STM, TVar, newTVarIO, readTVar, writeTVar)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Word (Word64)
-import Hetoimasia.GPU.Vulkan.GLFW (SceneTargetKey)
 
--- | The claims of one session's targets.
-newtype SceneClaims = SceneClaims (TVar (Map SceneTargetKey Claim))
+-- | The claims of one session's targets, by the host's target key ('SceneTargetKey' in production; a suite without a
+-- host keys its model's targets its own way).
+newtype SceneClaims k = SceneClaims (TVar (Map k Claim))
 
 -- | One target's claim: the view incarnation that holds it, and whether that view has published to it (which
 -- decides what its release publishes).
@@ -52,15 +52,15 @@ data Claim = Claim
   }
   deriving (Eq, Show)
 
-newSceneClaims ∷ IO SceneClaims
+newSceneClaims ∷ IO (SceneClaims k)
 newSceneClaims = SceneClaims <$> newTVarIO Map.empty
 
 -- | The target's claim, if any.
-claimOf ∷ SceneClaims → SceneTargetKey → STM (Maybe Claim)
+claimOf ∷ Ord k ⇒ SceneClaims k → k → STM (Maybe Claim)
 claimOf (SceneClaims var) key = Map.lookup key <$> readTVar var
 
 -- | Take the target's claim for this view: 'False', changing nothing, when any claim already holds it.
-takeClaim ∷ SceneClaims → SceneTargetKey → Word64 → STM Bool
+takeClaim ∷ Ord k ⇒ SceneClaims k → k → Word64 → STM Bool
 takeClaim (SceneClaims var) key view = do
   held ← readTVar var
   case Map.lookup key held of
@@ -69,7 +69,7 @@ takeClaim (SceneClaims var) key view = do
 
 -- | Record that the view holding the claim has published: 'False', changing nothing, when the claim does not name
 -- this view.
-markClaimPublished ∷ SceneClaims → SceneTargetKey → Word64 → STM Bool
+markClaimPublished ∷ Ord k ⇒ SceneClaims k → k → Word64 → STM Bool
 markClaimPublished (SceneClaims var) key view = do
   held ← readTVar var
   case Map.lookup key held of
@@ -78,7 +78,7 @@ markClaimPublished (SceneClaims var) key view = do
 
 -- | Release the target's claim if, and only if, it names this view, answering what it was. A release by any other
 -- view, or of a claim already released, changes nothing and answers 'Nothing'.
-releaseClaim ∷ SceneClaims → SceneTargetKey → Word64 → STM (Maybe Claim)
+releaseClaim ∷ Ord k ⇒ SceneClaims k → k → Word64 → STM (Maybe Claim)
 releaseClaim (SceneClaims var) key view = do
   held ← readTVar var
   case Map.lookup key held of
@@ -86,5 +86,5 @@ releaseClaim (SceneClaims var) key view = do
     _ → pure Nothing
 
 -- | Every claim held now.
-claimsHeld ∷ SceneClaims → STM (Map SceneTargetKey Claim)
+claimsHeld ∷ SceneClaims k → STM (Map k Claim)
 claimsHeld (SceneClaims var) = readTVar var
