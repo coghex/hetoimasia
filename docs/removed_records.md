@@ -120,6 +120,18 @@ Removed 2026-11-16, last present at `a30fe096`:
 | `tra23/README.md` | #666, PR #691: storage status, growth and recovery through Lua over the production backed service, with faults injected at the native storage seam: every new error code in both roles, pause and recovery, the growth windows |
 | `regional-snapshots/README.md` | #690, PR #694: regional snapshots equal an every-cell oracle (81,920 cells at full depth); footprint 400 accounted bytes for a pristine region, 672 with one removal, always an upper bound of a heap walk; admission reserves 128 + 25,872 n + 747,520 bytes |
 
+Removed 2026-11-19, last present at `d0cd45e8`: the records of running the
+terrain suites on several capabilities, and of the three product defects that
+found.
+
+| Path under `docs/evidence/terrain/` | Conclusion |
+| --- | --- |
+| `capability-pass/README.md` | #685, PR #693: `terrain-runtime-tests` runs its 32 concurrent modules a second time on 2 capabilities; every failure the pass first showed was test code (waits on momentary rest instead of quiescence); it costs 35 to 55 s locally, within the 240 s budget |
+| `commit-preparation/README.md` | #695, PR #698: the Lua host's per-update STM writes restarted the terrain owner's commit transaction for as long as a script ran (15,202 attempts in 10 s); the size-dependent work is now prepared before staging and each example commits at its first attempt |
+| `catchstm-composition/README.md` | #700, PR #701: GHC 9.14.1's `catchSTM` reruns only its guarded action when the nested commit fails, so an allocation-free action against a stale enclosing transaction loops forever; the repair is `catchSTMRestarting` in `Hetoimasia.Foundation.Failure` |
+| `reclaim-after-release/README.md` | #703, PR #704: an idle mark stamped at the store's state when the transaction ended, not at the store the plan was given, left retired pages unreclaimed after the last reader pin was released; the repair is `slotBasis` |
+| `lua-capability-pass/README.md` | #692, PR #707: `lua-engine-tests` runs its terrain set again on 2 capabilities behind a pump that wakes one update at a time; six test mechanisms repaired, the three defects above found; the lab trials were dropped by the owner and no lab result is claimed |
+
 ## Per-issue Vulkan records — last present at `18c3a659` (removed 2026-11-13)
 
 `docs/vulkan/` keeps the nine records `tools/test/VulkanProof.hs` reads. The
