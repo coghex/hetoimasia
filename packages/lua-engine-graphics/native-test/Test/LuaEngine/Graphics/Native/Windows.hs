@@ -12,8 +12,7 @@
 module Test.LuaEngine.Graphics.Native.Windows (spec) where
 
 import Control.Concurrent.STM (STM, TVar, atomically, check, modifyTVar', newTVarIO, readTVar, readTVarIO, retry)
-import Control.Concurrent (forkIO, killThread, newEmptyMVar, takeMVar, tryPutMVar)
-import Control.Exception (finally)
+import Control.Concurrent (newEmptyMVar, takeMVar, tryPutMVar)
 import Control.Monad (forM_, unless, void)
 import Data.IORef (atomicModifyIORef', newIORef, readIORef, writeIORef)
 import GHC.Conc (unsafeIOToSTM)
@@ -30,6 +29,7 @@ import Hetoimasia.Runtime.GLFW (OwnerStatus (..), TargetStanding (..), WindowSce
 import System.Timeout (timeout)
 import Test.HUnit.Lang (assertFailure)
 import Test.Hspec
+import Test.Support.Owned (withOwnedThread)
 import Test.LuaEngine.Graphics.Native.Session
 import Test.LuaEngine.Graphics.Windows
 
@@ -137,8 +137,8 @@ publishesEmptyScene env comp vm port name = do
       watch = atomically $ do
         unsafeIOToSTM (atomicModifyIORef' evaluations (\n → (n + 1, ())) >> void (tryPutMVar started ()))
         targetRetired target >>= check
-  watcher ← forkIO watch
-  (`finally` killThread watcher) $ do
+  -- the watcher is owned: it has ended however the scope ends
+  withOwnedThread watch $ \_ _ → do
     takeMVar started
     before' ← readIORef evaluations
     forM_ [1 .. 3 ∷ Int] $ \_ → do
