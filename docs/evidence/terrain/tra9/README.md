@@ -17,7 +17,7 @@ and terrain-runtime's README (the precondition guard, the outside staging accoun
 | --- | --- | --- |
 | Required native witness | `bash tools/vulkan/run.sh native hetoimasia-lua-engine-graphics:test:lua-engine-graphics-native-tests -- --complete` | 32/32 in 10.38 s on the terrain-disabled host; 4/4 in 3.23 s on the terrain-enabled host; 13.61 s of test time, 22 s wall, under the 30 s rule (`docs/vision.md:272`) |
 | Full qualification | the same suite with `-- --terrain-views-full` | 13/13 in 29.37 s, then the overlap witness on its own held host, 1/1 in 5.35 s |
-| Headless | `bash tools/vulkan/run.sh test hetoimasia-lua-engine-graphics:test:lua-engine-graphics-tests` (group `terrain views`) | 108/108, about 47 s, run alone; in the final series under load about 14, two examples ran past their bound (the eviction example and the unanswered-release example), recorded as #711 and not rerun |
+| Headless | `bash tools/vulkan/run.sh test hetoimasia-lua-engine-graphics:test:lua-engine-graphics-tests` (group `terrain views`) | 108/108 in 51.8 s at `58eba55d` (after the selection fix), run alone; in the final series at `cdc34252`, under load about 14, the eviction example ran past its bound (#711); a release-retirement example that also did was removed and is #710's item 7 |
 
 Native commands run on macOS under the standing per-command consent (`HETOIMASIA_NATIVE_SESSION=desktop`);
 the full qualification wrote its files with `HETOIMASIA_VALIDATION_EVIDENCE` set.
