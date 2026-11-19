@@ -9,7 +9,7 @@
 module Test.TerrainRuntime.Backed.Service (spec) where
 
 import Control.Concurrent.STM
-import Control.Exception (finally, try)
+import Control.Exception (Exception, bracket, finally, fromException, throwIO, try)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, takeMVar, tryPutMVar)
 import Control.Monad (forM, forM_, replicateM_, void, when)
 import Hetoimasia.Terrain.Coordinate (decomposeTile, mkLocalCoord)
@@ -46,6 +46,79 @@ isSetLength = \case OpSetFileLength {} → True; _ → False
 -- holds only the storage service's own records.
 atRest ∷ Service → IO ()
 atRest svc = waitFor (backedQuiescentSTM svc >>= check)
+
+-- | A failure an example injects.
+data Injected = Injected
+  deriving stock (Show)
+
+instance Exception Injected
+
+-- | A reclamation's plan is given the store while a reader pins retired history; the pin is released while the plan's page
+-- read is held; once the plan answers that the reader blocks it, the owner offers reclamation again by itself (#703). With
+-- @failInside@, the example fails instead once both reads are held at the seam, and every exit still lets them go.
+reclaimAfterRelease ∷ Bool → IO ()
+reclaimAfterRelease failInside = do
+  probe ← H.newProbe
+  -- the owner is held at each internal grant once armed, so the example can tell a reclamation's from discovery's and gate
+  -- its first page read before the transaction takes a step
+  granted ← newEmptyMVar
+  resume ← newEmptyMVar
+  armed ← newTVarIO False
+  let owner = Probe $ \case
+        PointGranted Nothing _ → readTVarIO armed >>= \a → when a (putMVar granted () >> takeMVar resume)
+        _ → pure ()
+      disarm = atomically (writeTVar armed False) >> void (tryPutMVar resume ())
+  withServiceSeam quiet defaultConfig alwaysAdmitting owner (H.seamFor probe) $ \svc → flip finally disarm $ do
+    (client, lease) ← openMain svc "main"
+    -- the store holds history, so the view's load reads its pages (a fresh store has none to read)
+    _ ← removeCell' svc lease (tile 3 4 4)
+    waitFor (backedQuiescentSTM svc >>= check)
+    let reclaimPending = statusPendingReclaimBytes <$> (arenaStatus svc lease >>= expectRight)
+        readers = maybe 0 (usReaders . viewUsage) <$> inspectArena svc lease
+    -- the pin: a view's load whose page read is held, far from the edit
+    pinRead ← H.addGateOnce probe isRead
+    flip finally (H.openGate pinRead) $ do
+      view ← okOf (openView svc client)
+      let (far, _) = decomposeTile (tile 100 100 0)
+      _ ← okOf (setViewDemand svc view lease [RegionDemand far (either (error . show) coverageTile (mkLocalCoord 0 0 0))])
+      H.awaitReached pinRead 1
+      readers `shouldReturn` 1
+      -- an edit retires pages the pin holds; every internal grant after it is held until the example has looked at it
+      atomically (writeTVar armed True)
+      edit ← okOf (removeAt svc lease (tile 3 4 5) Nothing)
+      -- the grant to take is a reclamation's (discovery has nothing left to do) made while the pin is held: its plan is
+      -- given the store with the pin. The owner stays held there until its first page read is gated
+      let intercept = do
+            bounded (takeMVar granted)
+            st ← arenaStatus svc lease >>= expectRight
+            n ← readers
+            if statusDiscovery st == DiscoveryIdle && n == 1
+              then pure ()
+              else putMVar resume () >> intercept
+      intercept
+      -- every exit lets the plan's read go, so a failure below never leaves the scope's drain waiting for it
+      bracket (H.addGateOnce probe isRead) H.openGate $ \planRead → do
+        atomically (writeTVar armed False)
+        putMVar resume ()
+        _ ← bounded (await svc edit) >>= expectSuccess
+        H.awaitReached planRead 1
+        -- an example that fails here, with the plan's read and the pin's read both held at the seam
+        when failInside (throwIO Injected)
+        held ← reclaimPending
+        held `shouldSatisfy` (> 0)
+        -- the pin goes while the plan that saw it is in flight: the view closes and its held read returns
+        clearViewDemand svc view >>= expectRight
+        closeView svc view
+        H.openGate pinRead
+        waitFor (inspectArenaSTM svc lease >>= check . maybe False ((== 0) . usReaders . viewUsage))
+        reclaimPending `shouldReturn` held
+        -- the plan answers that the reader blocks it; with nothing else to do the owner offers reclamation again on its own
+        H.openGate planRead
+        waitFor (arenaStatusSTM svc lease >>= check . either (const False) ((< held) . statusPendingReclaimBytes))
+    waitFor (backedQuiescentSTM svc >>= check)
+    reclaimPending `shouldReturn` 0
+    atomically (inspectIdleRepeatsSTM svc) `shouldReturn` []
+    settleChecks svc
 
 spec ∷ Spec
 spec = describe "The backed terrain service" $ do
@@ -120,67 +193,13 @@ spec = describe "The backed terrain service" $ do
           atomically (backedAtRestSTM svc) `shouldReturn` True
           inspectBacked svc `shouldReturn` []
 
-  it "offers reclamation again once the last reader pin is released while a reclamation's plan that saw the pin was in flight, with no further edit or request" $ do
-    probe ← H.newProbe
-    -- the owner is held at each internal grant once armed, so the example can tell a reclamation's from discovery's and gate
-    -- its first page read before the transaction takes a step
-    granted ← newEmptyMVar
-    resume ← newEmptyMVar
-    armed ← newTVarIO False
-    let owner = Probe $ \case
-          PointGranted Nothing _ → readTVarIO armed >>= \a → when a (putMVar granted () >> takeMVar resume)
-          _ → pure ()
-        disarm = atomically (writeTVar armed False) >> void (tryPutMVar resume ())
-    withServiceSeam quiet defaultConfig alwaysAdmitting owner (H.seamFor probe) $ \svc → flip finally disarm $ do
-      (client, lease) ← openMain svc "main"
-      -- the store holds history, so the view's load reads its pages (a fresh store has none to read)
-      _ ← removeCell' svc lease (tile 3 4 4)
-      waitFor (backedQuiescentSTM svc >>= check)
-      let reclaimPending = statusPendingReclaimBytes <$> (arenaStatus svc lease >>= expectRight)
-          readers = maybe 0 (usReaders . viewUsage) <$> inspectArena svc lease
-      -- the pin: a view's load whose page read is held, far from the edit
-      pinRead ← H.addGateOnce probe isRead
-      flip finally (H.openGate pinRead) $ do
-        view ← okOf (openView svc client)
-        let (far, _) = decomposeTile (tile 100 100 0)
-        _ ← okOf (setViewDemand svc view lease [RegionDemand far (either (error . show) coverageTile (mkLocalCoord 0 0 0))])
-        H.awaitReached pinRead 1
-        readers `shouldReturn` 1
-        -- an edit retires pages the pin holds; every internal grant after it is held until the example has looked at it
-        atomically (writeTVar armed True)
-        edit ← okOf (removeAt svc lease (tile 3 4 5) Nothing)
-        -- the grant to take is a reclamation's (discovery has nothing left to do) made while the pin is held: its plan is
-        -- given the store with the pin, and its first page read is held before it can answer
-        let intercept = do
-              bounded (takeMVar granted)
-              st ← arenaStatus svc lease >>= expectRight
-              n ← readers
-              if statusDiscovery st == DiscoveryIdle && n == 1
-                then do
-                  planRead ← H.addGateOnce probe isRead
-                  atomically (writeTVar armed False)
-                  putMVar resume ()
-                  pure planRead
-                else putMVar resume () >> intercept
-        planRead ← intercept
-        _ ← await svc edit >>= expectSuccess
-        flip finally (H.openGate planRead) $ do
-          H.awaitReached planRead 1
-          held ← reclaimPending
-          held `shouldSatisfy` (> 0)
-          -- the pin goes while the plan that saw it is in flight: the view closes and its held read returns
-          clearViewDemand svc view >>= expectRight
-          closeView svc view
-          H.openGate pinRead
-          waitFor (inspectArenaSTM svc lease >>= check . maybe False ((== 0) . usReaders . viewUsage))
-          reclaimPending `shouldReturn` held
-          -- the plan answers that the reader blocks it; with nothing else to do the owner offers reclamation again on its own
-          H.openGate planRead
-          waitFor (arenaStatusSTM svc lease >>= check . either (const False) ((< held) . statusPendingReclaimBytes))
-      waitFor (backedQuiescentSTM svc >>= check)
-      reclaimPending `shouldReturn` 0
-      atomically (inspectIdleRepeatsSTM svc) `shouldReturn` []
-      settleChecks svc
+  describe "Reclamation after a reader's release" $ do
+    it "offers reclamation again once the last reader pin is released while a reclamation's plan that saw the pin was in flight, with no further edit or request" $
+      reclaimAfterRelease False
+    it "lets the service tear down when the example fails while that plan's read and the pin's read are held at the seam" $
+      bounded (try (reclaimAfterRelease True)) >>= \case
+        Left failure | Just Injected ← fromException failure → pure ()
+        other → expectationFailure ("expected the injected failure, after teardown, got " <> either show (const "success") other)
 
   it "refuses at construction an edit bank that cannot fund one read beside the worst transaction and every reader pin (a circular wait), and accepts one byte more" $ do
     let atMinimum = toInteger (ramDecodedCopies A.worstTransactionCharge) + 2 * toInteger A.readerPinnedCacheBytes
