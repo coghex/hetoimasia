@@ -289,11 +289,14 @@ fullSpec env = describe "terrain views (full)" $ do
 -- | The asserted overlap witness (owner decision S, #645 comment 6924532805), on a host whose test-only completion hold
 -- is set: A's batch is held from its recording, B is adopted, A's own chunks stay held by the production ledger and the
 -- terrain GPU bank while a step has observed A's batch pending since B's adoption; the hold lets go, A's batch
--- completes on its fence, and A's own chunks retire. Both images are judged. Every hold is let go on every exit.
+-- completes on its fence, and A's own chunks retire. Both images are judged. Every hold is let go on every exit of the
+-- rig's body, before the rig's own end.
 overlapSpec ∷ Holding → Env → Spec
 overlapSpec holding env = describe "terrain views (full)" $
   it "keeps a superseded revision's own chunks held while its batch is held in GPU use after a newer one is adopted, and retires them once the batch completes" $
-    (`finally` atomically (writeTVar (holdingSet holding) Set.empty)) . within 60 . withRig env $ \rig → do
+    within 60 . withRig env $ \rig → (`finally` atomically (writeTVar (holdingSet holding) Set.empty)) $ do
+      -- the hold lets go on every exit of the rig's body, before the rig's end waits for A's chunks to retire, so a
+      -- failed assertion or a timeout drains and reports the failure itself
       view ← attach rig (metricsOf 128 96)
       _ ← awaitAdopted rig 1
       -- A is the settled revision: the residency stops moving first, so A is what stays drawn until the edit

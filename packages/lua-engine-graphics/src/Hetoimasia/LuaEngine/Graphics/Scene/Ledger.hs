@@ -69,6 +69,7 @@ module Hetoimasia.LuaEngine.Graphics.Scene.Ledger
 
     -- * The adopted world
   , ledgerNewestAdopted
+  , ledgerNewestTargets
 
     -- * Reading
   , LedgerReading (..)
@@ -212,7 +213,10 @@ ledgerReleased (SceneLedger var newest) window revision = atomically $ do
   release var window revision
   refreshNewest var newest window
 
--- Set the target's newest adopted revision from the records, writing its variable only when it changed.
+-- Set the target's newest adopted revision from the records, writing its variable only when it changed. A target with
+-- no adopted revision left has no variable: its entry goes with its last release (a reader also reads the registry, so
+-- it sees the entry go), and a later adoption makes a new one, so targets made and released over a session leave
+-- nothing behind.
 refreshNewest ∷ Ord w ⇒ TVar (State w) → TVar (Map w (TVar (Maybe (Natural, Maybe WorldTag)))) → w → STM ()
 refreshNewest var newest target = do
   st ← readTVar var
@@ -221,9 +225,13 @@ refreshNewest var newest target = do
         Just kept | fst kept >= fst candidate → Just kept
         _ → Just candidate
   registry ← readTVar newest
-  case Map.lookup target registry of
-    Just cell → readTVar cell >>= \now → when (now /= found) (writeTVar cell found)
-    Nothing → do
+  case (Map.lookup target registry, found) of
+    (Just cell, Nothing) → do
+      writeTVar cell Nothing
+      writeTVar newest (Map.delete target registry)
+    (Just cell, Just _) → readTVar cell >>= \now → when (now /= found) (writeTVar cell found)
+    (Nothing, Nothing) → pure ()
+    (Nothing, Just _) → do
       cell ← newTVar found
       writeTVar newest (Map.insert target cell registry)
 
@@ -313,6 +321,11 @@ ledgerInterests (SceneLedger var _) = stInterests <$> readTVar var
 ledgerNewestAdopted ∷ Ord w ⇒ SceneLedger w → w → STM (Maybe (Natural, Maybe WorldTag))
 ledgerNewestAdopted (SceneLedger _ newest) target =
   readTVar newest >>= \registry → maybe (pure Nothing) readTVar (Map.lookup target registry)
+
+-- | How many targets the newest-adoption registry holds an entry for: exactly those with an adopted, unreleased
+-- revision. Read-only.
+ledgerNewestTargets ∷ SceneLedger w → STM Int
+ledgerNewestTargets (SceneLedger _ newest) = Map.size <$> readTVar newest
 
 -- | How many adoptions hold this texture: for each window and revision, the count of its adoptions. A count is a
 -- 'Natural', as a revision is: nothing here wraps, however many adoptions a long run makes.

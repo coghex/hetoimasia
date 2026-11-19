@@ -43,6 +43,7 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView.Style
   , styleColourHandle
   , styleNormalHandle
   , styleNominalBytes
+  , styleMappedMaterials
   , acquireStyle
   , releaseStyle
 
@@ -113,6 +114,8 @@ data StyleRefusal
     StyleMapping !AtlasAssetError
   | -- | The parents' charged bytes exceed the owning instance's texture byte limit: what they need, and the limit.
     StyleExceedsTextureBytes !Word64 !Word64
+  | -- | The mapping names no region for these materials of the arena's palette: the planner could never draw them.
+    StyleMissingMaterials ![MaterialId]
   deriving (Eq, Show)
 
 -- | A refusal as bounded text: fixed words and numbers.
@@ -124,6 +127,7 @@ describeStyleRefusal = \case
   ParentNotBindable role why → roleName role <> " parent cannot be bound: " <> Text.pack (show why)
   StyleMapping why → "the style's mapping is incomplete: " <> Text.pack (describeAtlasAssetError why)
   StyleExceedsTextureBytes need limit → "the style's parents need " <> number need <> " texture bytes of " <> number limit
+  StyleMissingMaterials missing → "the style's mapping has no region for the arena's materials " <> Text.intercalate ", " (map (Text.pack . show) missing)
   where
     number = Text.pack . show
     roleName ColourRole = "the colour"
@@ -178,7 +182,13 @@ data AcquiredStyle = AcquiredStyle
   , acqAssets ∷ !AssetSnapshot
   , acqTextures ∷ !AtlasTextures
   , acqNominal ∷ !Word64
+  , acqMaterials ∷ !(Set MaterialId)
+    -- ^ The materials the mapping gives a region: the arena's palette must be among them.
   }
+
+-- | The materials the style's mapping gives a region.
+styleMappedMaterials ∷ AcquiredStyle → Set MaterialId
+styleMappedMaterials = acqMaterials
 
 styleAssets ∷ AcquiredStyle → AssetSnapshot
 styleAssets = acqAssets
@@ -226,7 +236,7 @@ acquireStyle request = mask $ \restore →
           let colourParent = parentOf colour cp
               normalParent = parentOf normal np
           (assets, textures) ← checkStyle (styleInstanceTextureBytes request) (styleManifest request) (styleMaterials request) colourParent normalParent
-          pure (AcquiredStyle colour normal assets textures (parentNominalBytes colourParent + parentNominalBytes normalParent))
+          pure (AcquiredStyle colour normal assets textures (parentNominalBytes colourParent + parentNominalBytes normalParent) (Set.fromList (map fst (styleMaterials request))))
     parentOf retained plane =
       let view = retainedView retained
        in StyleParent

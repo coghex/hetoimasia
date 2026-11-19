@@ -118,6 +118,8 @@ library terrain-views
         Hetoimasia.LuaEngine.Graphics.TerrainView.Style
         Hetoimasia.LuaEngine.Graphics.TerrainView.Target
         Hetoimasia.LuaEngine.Graphics.TerrainView.Types
+    other-modules:
+        Hetoimasia.LuaEngine.Graphics.TerrainView.Internal.Pick
     build-depends:
         base >=4.22 && <4.23,
         bytestring >=0.12 && <0.13,

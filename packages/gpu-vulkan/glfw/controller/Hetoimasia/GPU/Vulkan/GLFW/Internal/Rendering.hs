@@ -175,7 +175,6 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Rendering
   , submitRenderingUpload
   , cancelRenderingUpload
   , readRenderingUploads
-  , setRenderingCompletionHold
 
     -- * Retirement
   , prepareTargetRetirement
@@ -254,7 +253,6 @@ import Hetoimasia.GPU.Vulkan.GLFW.Internal.Capture
 import Hetoimasia.GPU.Vulkan.Native.Frames
   ( Acquisition (..)
   , CompletionHold
-  , setFramesHold
   , FrameOps
   , FrameStanding (..)
   , Frames
@@ -269,7 +267,7 @@ import Hetoimasia.GPU.Vulkan.Native.Frames
   , closeTargetFrames
   , closeUnpresentedFrame
   , drainWaitLimit
-  , newFrames
+  , newFramesWith
   , readFramelessSubmissions
   , recordFramelessIn
   , recordFramelessInWith
@@ -979,14 +977,11 @@ data Rendering q inst msgr phys dev cmd = Rendering
     -- ^ Every frame-less batch recorded with the scene revision an offscreen
     -- target adopted whose ticket is neither complete nor discarded, by the
     -- batch.
-  , renderingCompletionHold ∷ !(TVar (Maybe CompletionHold))
-    -- ^ A test's completion hold, handed to the frames when they are made;
-    -- 'Nothing' in production.
+  , renderingCompletionHold ∷ !(Maybe CompletionHold)
+    -- ^ A test's completion hold, given when the rendering is made and handed
+    -- to the frames when they are made: 'Nothing' in production, which holds
+    -- no cell for it.
   }
-
--- | Set the test's completion hold the frames are made with.
-setRenderingCompletionHold ∷ Rendering q inst msgr phys dev cmd → Maybe CompletionHold → STM ()
-setRenderingCompletionHold rendering = writeTVar (renderingCompletionHold rendering)
 
 -- | One frame's recorded use of a scene revision: what keeps that revision from
 -- being released.
@@ -1055,8 +1050,9 @@ newRendering
   → Captures
   → Maybe UploadConfig
   → Bool
+  → Maybe CompletionHold
   → IO (Rendering q inst msgr phys dev cmd)
-newRendering roots generations ops observer captures uploads windowDepth =
+newRendering roots generations ops observer captures uploads windowDepth hold =
   Rendering roots generations ops
     <$> newTVarIO Nothing
     <*> newTVarIO Map.empty
@@ -1071,7 +1067,7 @@ newRendering roots generations ops observer captures uploads windowDepth =
     <*> newTVarIO Map.empty
     <*> newTVarIO 0
     <*> newTVarIO Map.empty
-    <*> newTVarIO Nothing
+    <*> pure hold
 
 -- | The recording and the frames, made the first time they are needed once
 -- the device exists, on the owner's thread, which is what makes it their
@@ -1086,11 +1082,10 @@ live rendering =
         Just (plan, _) → do
           ops ← renderingRecordingOps (renderingOps rendering) (planDevice plan)
           recording ← newRecording ops (renderingRoots rendering) (renderingGenerations rendering)
-          frames ← newFrames (renderingFrameOps (renderingOps rendering)) recording
+          frames ← newFramesWith (renderingCompletionHold rendering) (renderingFrameOps (renderingOps rendering)) recording
           let made = Live recording frames
           -- The scene uses read completions from the frames' log.
           atomically (enableCompletionLog frames)
-          atomically (readTVar (renderingCompletionHold rendering) >>= setFramesHold frames)
           -- The generations built from now on carry the depth image the host
           -- asked for (GRS-13).
           atomically $ do

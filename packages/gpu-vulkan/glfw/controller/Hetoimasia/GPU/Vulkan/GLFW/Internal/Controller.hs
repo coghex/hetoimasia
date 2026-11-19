@@ -775,11 +775,12 @@ newVulkanController
   → MonotonicSource
   → Duration
   → IO VulkanController
-newVulkanController = newVulkanControllerWith noControllerHooks
+newVulkanController = newVulkanControllerWith noControllerHooks Nothing
 
 -- | 'newVulkanController' with the examples' hooks.
 newVulkanControllerWith
   ∷ ControllerHooks
+  → Maybe CompletionHold
   → CaptureMode
   → VulkanDeviceStart
   → Natural
@@ -799,7 +800,7 @@ newVulkanControllerWith
   → MonotonicSource
   → Duration
   → IO VulkanController
-newVulkanControllerWith hooks capture deviceStart capacity releaseCapacity initialEmpty uploads windowDepth ops rendering observer pointer bridge layers validation choice budgets clock poll = do
+newVulkanControllerWith hooks hold capture deviceStart capacity releaseCapacity initialEmpty uploads windowDepth ops rendering observer pointer bridge layers validation choice budgets clock poll = do
   roots ← newRoots ops budgets clock
   ownerOpen ← newTVarIO (pure True)
   scenes ← newScenes initialEmpty
@@ -813,7 +814,7 @@ newVulkanControllerWith hooks capture deviceStart capacity releaseCapacity initi
   -- nothing until the recording supplies what makes their depth images.
   when windowDepth (atomically (requireWindowDepth generations))
   captures ← newCaptures capture
-  rendered ← newRendering roots generations rendering observer captures uploads windowDepth
+  rendered ← newRendering roots generations rendering observer captures uploads windowDepth hold
   fmap VulkanController $
     State roots generations rendered pointer bridge layers validation choice
       <$> newTVarIO Nothing
@@ -2746,6 +2747,7 @@ withVulkanOwnerHostHooked hooks capturing logger layer rendering pointer bridge 
     controller@(VulkanController state) ←
       newVulkanControllerWith
         hooks
+        (vulkanCompletionHold config)
         capturing
         (vulkanDeviceStart config)
         (vulkanActionCapacity config)
@@ -2770,8 +2772,6 @@ withVulkanOwnerHostHooked hooks capturing logger layer rendering pointer bridge 
     -- cell; and a sink failure the worker records while the owner is idle wakes
     -- it for that checkpoint.
     targets ← newTargets (vulkanTargetCapacity config) (vulkanScene config)
-    -- a test's completion hold, if any, reaches the frames when they are made
-    atomically (setRenderingCompletionHold (stateRendering state) (vulkanCompletionHold config))
     atomically $ do
       watchRootsDiagnosticsOrdered (stateRoots state) (DiagnosticWatch (diagnosticAlarms capture) (diagnosticOrder capture))
       writeTVar (stateWake state) (failureOwed state capture)

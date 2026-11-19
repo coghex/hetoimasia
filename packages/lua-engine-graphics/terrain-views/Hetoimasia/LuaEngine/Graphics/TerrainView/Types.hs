@@ -28,15 +28,23 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView.Types
     -- * Observation
   , ViewPhase (..)
   , ViewReading (..)
+  , WindowRefusal (..)
 
     -- * Picking
   , PickResult (..)
   , PickRef
   , pickRefCell
   , pickRefPart
-  , mkPickRef
   , pickRefIdentity
-  , PickIdentity (..)
+  , PickIdentity
+  , pickTarget
+  , pickViewId
+  , pickRevision
+  , pickTag
+  , pickArena
+  , pickContent
+  , pickKnowledge
+  , pickResidency
   ) where
 
 import Control.Concurrent.STM (STM)
@@ -44,16 +52,15 @@ import Data.Text (Text)
 import Data.Word (Word64)
 import Hetoimasia.Foundation.Messaging.Payload (Prepared)
 import Hetoimasia.LuaEngine.Graphics.Scene.Ledger (GraphicsScene)
-import Hetoimasia.LuaEngine.Graphics.Scene.World (WorldTag)
+import Hetoimasia.LuaEngine.Graphics.TerrainView.Internal.Pick
 import Hetoimasia.LuaEngine.Graphics.TerrainView.Style (StyleRefusal, StyleRequest, describeStyleRefusal)
 import Hetoimasia.Render.TwoD.Metrics (TargetMetrics)
 import Hetoimasia.Render.TwoD.Snapshot (ClearColour (..))
 import Hetoimasia.Terrain.Changes (ChangeLimits (..))
-import Hetoimasia.Terrain.Coordinate (AxisCoord, TileCoord)
+import Hetoimasia.Terrain.Coordinate (AxisCoord)
 import Hetoimasia.Terrain.Render2D.Camera (CameraConfig, Command, defaultCameraConfig)
-import Hetoimasia.Terrain.Render2D.Cells (CellConfig (..), CellLimits (..), PartKind, defaultCellConfig)
+import Hetoimasia.Terrain.Render2D.Cells (CellConfig (..), CellLimits (..), defaultCellConfig)
 import Hetoimasia.Terrain.Render2D.Presentation (LightInput)
-import Hetoimasia.Terrain.Residency (ArenaId, Revision)
 import Hetoimasia.Terrain.Runtime (ArenaLease)
 
 -- | The adapter's configuration. Every bound is the approved figure by default; a test lowers them.
@@ -88,7 +95,9 @@ data TerrainViewsConfig = TerrainViewsConfig
     -- ^ Run on the worker after each transaction that hands a preparation's resources on ("reserved": the GPU bytes
     -- with the build stage; "submitted": the build's ticket; "answered": its chunks; "abandoned": a stage handed to
     -- cleanup; "requested": a copy request), before the next: a test seam (to end the worker exactly between two
-    -- transfers). Production runs nothing.
+    -- transfers). Also run as "closed" between a close's main transaction (the claim handed back) and its last step
+    -- (the parents released, the view gone from the service), and, with view 0, as "cancelling", between an abandoned
+    -- copy found unsettled and its cancellation. Production runs nothing.
   , tvBeforeAttachCommit ∷ IO ()
     -- ^ Run on the worker after an attachment's early checks and before its commit transaction: a test seam (to let a
     -- lease or a target change at exactly that point). Production runs nothing.
@@ -291,7 +300,31 @@ data ViewReading = ViewReading
   , readingNeedBytes ∷ !Word64
     -- ^ Everything the view keeps: its pinned plans, its listed regions' descriptions, its stage, its facts and its
     -- demand. 'readingCpuBytes' covers it, in whole granules.
+  , readingPinnedBytes ∷ !Word64
+    -- ^ What the view's pinned plans need of the account: each its quads, pending spans and its own demand.
+  , readingWindow ∷ !(Maybe WindowRefusal)
+    -- ^ The latest candidate's material records could not fit the renderer's storage window, so it was never accepted
+    -- (the previous publication stays): 'Nothing' once a candidate fits.
   }
+  deriving (Eq, Show)
+
+-- | Why a candidate was not accepted because its material records exceed the idle renderer's storage window (the most
+-- record bytes one batch may bind: one clip entry, then each drawn render region's records). The candidate is never
+-- published, so no frame is refused for it.
+data WindowRefusal
+  = -- | A typed refusal: one render region (by its key) whose records alone need these bytes, beyond the window; no
+    -- frame can ever record it.
+    UnitExceedsWindow
+      { windowUnit ∷ !(Integer, Integer)
+      , windowUnitBytes ∷ !Word64
+      , windowBytes ∷ !Word64
+      }
+  | -- | Every render region fits alone, but the candidate needs these bytes together, beyond the window: it waits (a
+    -- new intent, metrics or arena state prepares again).
+    EnvelopeExceedsWindow
+      { windowNeedBytes ∷ !Word64
+      , windowBytes ∷ !Word64
+      }
   deriving (Eq, Show)
 
 -- | What a pick found, mapping one-to-one onto the approved Lua answers: 'PickHit' is @hit@, 'PickNoHit' is
@@ -302,38 +335,3 @@ data PickResult k
   | PickLoading
   deriving (Eq, Show)
 
--- | Everything a pick's consistency is: the target and view incarnations, the adopted revision and its plan tag, the
--- arena incarnation and its content and knowledge revisions. Opaque to callers.
-data PickIdentity k = PickIdentity
-  { pickTarget ∷ !k
-  , pickViewId ∷ !Word64
-  , pickRevision ∷ !Word64
-  , pickTag ∷ !WorldTag
-  , pickArena ∷ !ArenaId
-  , pickContent ∷ !Revision
-  , pickKnowledge ∷ !Revision
-  , pickResidency ∷ !Word64
-    -- ^ The adopted plan's residency identity, checked against the arena's generation in the removal's arbitration.
-  }
-  deriving (Eq, Show)
-
--- | A hit's opaque consistency reference: the exact logical cell and part, and the identity it was picked under.
-data PickRef k = PickRef
-  { refCell ∷ !TileCoord
-  , refPart ∷ !PartKind
-  , refIdentity ∷ !(PickIdentity k)
-  }
-  deriving (Eq, Show)
-
-pickRefCell ∷ PickRef k → TileCoord
-pickRefCell = refCell
-
-pickRefPart ∷ PickRef k → PartKind
-pickRefPart = refPart
-
-pickRefIdentity ∷ PickRef k → PickIdentity k
-pickRefIdentity = refIdentity
-
--- | Made only by the adapter's picker.
-mkPickRef ∷ TileCoord → PartKind → PickIdentity k → PickRef k
-mkPickRef = PickRef

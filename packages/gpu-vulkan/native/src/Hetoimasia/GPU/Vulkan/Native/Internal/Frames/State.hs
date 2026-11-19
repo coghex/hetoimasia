@@ -29,7 +29,7 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Frames.State
   , Frames (..)
   , newFrames
   , CompletionHold (..)
-  , setFramesHold
+  , newFramesWith
 
     -- * Answers
   , OwnedFrame (..)
@@ -80,7 +80,7 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Frames.State
   , frameMisuse
   ) where
 
-import Control.Concurrent.STM (STM, TVar, modifyTVar', newTVarIO, readTVar, stateTVar, writeTVar)
+import Control.Concurrent.STM (STM, TVar, modifyTVar', newTVarIO, readTVar, stateTVar)
 import Control.Exception (Exception (displayException))
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
@@ -327,9 +327,10 @@ data Frames q inst msgr phys dev cmd = Frames
     -- transaction as the model's completion, so a step that raises after
     -- recording a completion leaves it here; a submission an uncertain fence
     -- query dropped, or the device's loss let go of, is never in it.
-  , framesHold ∷ !(TVar (Maybe CompletionHold))
+  , framesHold ∷ !(Maybe CompletionHold)
     -- ^ A test's hold on frame-less batches' completion ('CompletionHold'),
-    -- 'Nothing' in production.
+    -- given when the frames are made and never changed: 'Nothing' in
+    -- production, which then reads nothing more.
   }
 
 -- | TEST-ONLY. A hold on the recognition of frame-less batches' completion,
@@ -350,14 +351,15 @@ data CompletionHold = CompletionHold
   , heldObserved ∷ BatchId → STM ()
   }
 
--- | Set (or, with 'Nothing', clear) the frames' completion hold.
-setFramesHold ∷ Frames q inst msgr phys dev cmd → Maybe CompletionHold → STM ()
-setFramesHold frames = writeTVar (framesHold frames)
-
 -- | The frames over this recording, owned by the thread that owns it — the
 -- graphics owner's.
 newFrames ∷ FrameOps dev cmd → Recording q inst msgr phys dev cmd → IO (Frames q inst msgr phys dev cmd)
-newFrames ops recording =
+newFrames = newFramesWith Nothing
+
+-- | 'newFrames' with a test's completion hold ('CompletionHold'), fixed for
+-- the frames' life.
+newFramesWith ∷ Maybe CompletionHold → FrameOps dev cmd → Recording q inst msgr phys dev cmd → IO (Frames q inst msgr phys dev cmd)
+newFramesWith hold ops recording =
   Frames ops recording
     <$> newTVarIO Map.empty
     <*> newTVarIO Map.empty
@@ -368,7 +370,7 @@ newFrames ops recording =
     <*> newTVarIO Map.empty
     <*> newTVarIO Map.empty
     <*> newTVarIO Nothing
-    <*> newTVarIO Nothing
+    <*> pure hold
 
 framesRoots ∷ Frames q inst msgr phys dev cmd → Roots q inst msgr phys dev
 framesRoots = recordingRoots . framesRecording

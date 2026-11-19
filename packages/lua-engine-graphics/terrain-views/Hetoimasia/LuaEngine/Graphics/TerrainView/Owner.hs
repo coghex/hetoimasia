@@ -14,13 +14,17 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView.Owner
   , RegionBuild (..)
   , BuildFailure (..)
   , productionViewOwner
+  , buildRegions
+  , keepBuilt
   ) where
 
-import Control.Concurrent.STM (STM, catchSTM, retry, throwSTM)
-import Control.Exception (Exception)
+import Control.Concurrent.STM (STM, TVar, atomically, catchSTM, modifyTVar', newTVar, readTVar, retry, throwSTM)
+import Control.Exception (Exception, SomeAsyncException, displayException, fromException, throwIO, try)
+import Data.Functor ((<&>))
 import Control.Monad (forM, forM_, void)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
+import Data.Word (Word64)
 import qualified Data.Text as Text
 import Hetoimasia.GPU.Vulkan.GLFW (ActionOutcome (..), ActionRefusal (..), ImageFormat (Depth32Float), UploadView (..), UploadsView (..), VulkanAction (..), VulkanHost, readVulkanAction, readVulkanUploads, requestVulkanRelease, submitVulkanAction)
 import Numeric.Natural (Natural)
@@ -30,8 +34,8 @@ import Hetoimasia.LuaEngine.Graphics.Texture.Host (hostBuilders)
 import Hetoimasia.Render.TwoD.Chunk (BoundsRequest (DeriveBounds), ChunkKind (ChunkWorldDepth), ChunkRef)
 import Hetoimasia.Render.TwoD.Material (MaterialRecord, MaterialRef)
 import Hetoimasia.Render.TwoD.Snapshot (Instance)
-import Hetoimasia.Render.TwoD.Vulkan (registerMaterial, rendererDepthFormat)
-import Hetoimasia.Render.TwoD.Vulkan.Chunks (BuildRefusal (BuildUploadBackpressure), ChunkStanding, buildRetainedChunkWith, chunkStandingSTM, markChunkReleasedSTM, releaseChunkNow)
+import Hetoimasia.Render.TwoD.Vulkan (registerMaterial, rendererDepthFormat, rendererRegionWindow)
+import Hetoimasia.Render.TwoD.Vulkan.Chunks (BuildRefusal (..), ChunkStanding, buildRetainedChunkWith, chunkStandingSTM, markChunkReleasedSTM, releaseChunkNow)
 import Hetoimasia.Render.TwoD.Vulkan.Textures (registeredMarks)
 import Hetoimasia.Terrain.Render2D.Vulkan.Material (terrainMaterial)
 
@@ -69,6 +73,9 @@ data ViewOwner = ViewOwner
     -- ^ The terrain material, registered with the session's renderer.
   , ownerDepthQualified ∷ !Bool
     -- ^ Whether the session's depth format is @D32_SFLOAT@, which the qualified cutout path needs.
+  , ownerRegionWindow ∷ STM Word64
+    -- ^ The renderer's storage window: the most bytes of clip tables and material records one batch may bind. A
+    -- candidate whose records cannot fit is never accepted.
   , ownerBuild ∷ [RegionBuild] → STM (Either OwnerRefusal (Ticket (Either BuildFailure [ChunkRef])))
     -- ^ Build these regions on the owner, in one action, each as one retained chunk of a depth-enabled world layer,
     -- answering their references in order. A region that cannot be built stops the action, and the failure names the
@@ -106,18 +113,19 @@ productionViewOwner host graphics = do
     ViewOwner
       { ownerMaterial = material
       , ownerDepthQualified = rendererDepthFormat (graphicsRenderer graphics) == Just Depth32Float
-      , ownerBuild = \regions → submit host $ VulkanAction $ \construction → do
-          let builders = hostBuilders host construction
-          marks ← registeredMarks (graphicsTextures graphics)
-          let go acc [] = pure (Right (reverse acc))
-              go acc (region : rest) =
-                buildRetainedChunkWith builders retained marks ChunkWorldDepth DeriveBounds (Map.singleton material (buildRecords region)) (buildInstances region) >>= \case
-                  Left why →
-                    pure . Left $ case why of
-                      BuildUploadBackpressure _ → BuildPressure (reverse acc) (Text.pack (show why))
-                      _ → BuildFailed (reverse acc) (Text.pack (show why))
-                  Right chunk → go (chunk : acc) rest
-          go [] regions
+      , ownerRegionWindow = pure (rendererRegionWindow (graphicsRenderer graphics))
+      , ownerBuild = \regions → do
+          -- each chunk is recorded as it is made, so a build the owner's action ends by raising still hands back what
+          -- it built ('keepBuilt')
+          built ← newTVar []
+          submitted ← submit host $ VulkanAction $ \construction → do
+            let builders = hostBuilders host construction
+            marks ← registeredMarks (graphicsTextures graphics)
+            buildRegions
+              (\region → buildRetainedChunkWith builders retained marks ChunkWorldDepth DeriveBounds (Map.singleton material (buildRecords region)) (buildInstances region))
+              (\chunk → atomically (modifyTVar' built (chunk :)))
+              regions
+          pure (keepBuilt built <$> submitted)
       , ownerRelease = \chunks → submit host $ VulkanAction $ \construction → forM chunks (\chunk → either (Left . Text.pack . show) Right <$> releaseChunkNow (hostBuilders host construction) retained chunk)
       , ownerBarrier = \chunks →
           requestVulkanRelease host (VulkanAction (\_ → pure ())) >>= \case
@@ -143,6 +151,38 @@ productionViewOwner host graphics = do
       }
   where
     retained = graphicsRetained graphics
+
+-- | Build the regions in order, recording each chunk as it is made: a region that cannot be built stops the build,
+-- naming the chunks made before it (upload backpressure as 'BuildPressure', anything else as 'BuildFailed'), and so
+-- does a synchronous exception of the builder, as a failure. Nothing is released here: the chunks are the caller's.
+buildRegions ∷ (RegionBuild → IO (Either BuildRefusal ChunkRef)) → (ChunkRef → IO ()) → [RegionBuild] → IO (Either BuildFailure [ChunkRef])
+buildRegions build record = go []
+  where
+    go acc [] = pure (Right (reverse acc))
+    go acc (region : rest) =
+      tryNonAsync (build region) >>= \case
+        Left raised → pure (Left (BuildFailed (reverse acc) ("the build raised: " <> Text.pack (displayException raised))))
+        Right (Left why) →
+          pure . Left $ case why of
+            BuildUploadBackpressure _ → BuildPressure (reverse acc) (Text.pack (show why))
+            _ → BuildFailed (reverse acc) (Text.pack (show why))
+        Right (Right chunk) → record chunk >> go (chunk : acc) rest
+    tryNonAsync action =
+      try action >>= \case
+        Left failure | Just (_ ∷ SomeAsyncException) ← fromException failure → throwIO failure
+        result → pure result
+
+-- | A build's ticket that keeps what was built: when the owner's action ended without answering (it raised, or the
+-- owner ended), the chunks it recorded are answered as a failure naming them, for the caller to retire; with none, the
+-- outcome stands.
+keepBuilt ∷ TVar [ChunkRef] → Ticket (Either BuildFailure [ChunkRef]) → Ticket (Either BuildFailure [ChunkRef])
+keepBuilt built ticket =
+  ticket >>= \case
+    Just (NotRun why) →
+      readTVar built <&> \case
+        [] → Just (NotRun why)
+        chunks → Just (Answered (Left (BuildFailed (reverse chunks) ("the build did not answer: " <> why))))
+    other → pure other
 
 -- Submit one action without waiting: a refusal typed as busy (a full queue or lane, or a device not ready yet) or gone
 -- (the owner closed, its session failed), or a ticket read without waiting.

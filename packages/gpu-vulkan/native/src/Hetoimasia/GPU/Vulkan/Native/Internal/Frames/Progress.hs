@@ -148,9 +148,9 @@ progressFrames frames now = owner recording $ do
             sync ← Map.lookup (framelessSlot record) <$> readTVarIO (framesFrameless frames)
             -- A test's completion hold (production has none): a held batch's
             -- fence is not asked, so it stays pending for every reader.
-            heldNow ← atomically $ readTVar (framesHold frames) >>= \case
+            heldNow ← case framesHold frames of
               Nothing → pure False
-              Just hold → do
+              Just hold → atomically $ do
                 holding ← holdsBatch hold (framelessBatch record)
                 when holding (heldObserved hold (framelessBatch record))
                 pure holding

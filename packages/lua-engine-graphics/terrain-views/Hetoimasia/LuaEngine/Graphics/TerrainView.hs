@@ -56,6 +56,7 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView
   , closeView
   , viewClosed
   , viewClosing
+  , viewHoldsStyle
 
     -- * Intent
   , CameraIntent (..)
@@ -74,6 +75,7 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView
     -- * Observation
   , ViewPhase (..)
   , ViewReading (..)
+  , WindowRefusal (..)
   , readView
   , viewDemand
   , viewCameraState
@@ -81,10 +83,18 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView
     -- * Picking
   , PickResult (..)
   , PickRef
-  , PickIdentity (..)
   , pickRefCell
   , pickRefPart
   , pickRefIdentity
+  , PickIdentity
+  , pickTarget
+  , pickViewId
+  , pickRevision
+  , pickTag
+  , pickArena
+  , pickContent
+  , pickKnowledge
+  , pickResidency
   , pickView
   , pickPrecondition
   , adoptedPlan

@@ -169,6 +169,7 @@ module Hetoimasia.Terrain.Runtime
   , inspectDefects
   , inspectSnapshotBytes
   , inspectRetainedChargesSTM
+  , retainedBankUseSTM
   , inspectRegionalSTM
   , RegionalCharge
   , regionalChargeHold
@@ -1009,6 +1010,12 @@ inspectRetainedChargesSTM ∷ Service → STM (Word64, [(R.HoldId, Word64)])
 inspectRetainedChargesSTM svc = do
   st <- readSt svc
   pure (retainedBankUse st, Map.toList (stateSnapshots st))
+
+-- | What the retained bank holds now: outstanding snapshots' backing, every regional borrow's charge and untaken
+-- results. It moves whenever a regional request is admitted, settles (its reservation becomes its footprint) or is
+-- released, so a caller refused 'BusyRetained' waits on it. It writes nothing.
+retainedBankUseSTM ∷ Service → STM Word64
+retainedBankUseSTM svc = retainedBankUse <$> readSt svc
 
 inspectSnapshotBytes ∷ Service → IO (Word64, Word64)
 inspectSnapshotBytes svc = do

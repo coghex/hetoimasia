@@ -14,13 +14,13 @@ module Test.LuaEngine.Graphics.TerrainViews (spec) where
 import Control.Concurrent (killThread, myThreadId)
 import Control.Exception (MaskingState (Unmasked), getMaskingState)
 import Control.Concurrent.STM
-import Control.Exception (finally)
+import Control.Exception (finally, throwIO)
 import Control.Monad (forM_, forever, join, unless, void, when)
 import qualified Data.ByteString as ByteString
 import qualified Data.ByteString.Char8 as BC
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (fromMaybe, isJust, listToMaybe)
+import Data.Maybe (fromMaybe, isJust, isNothing, listToMaybe)
 import qualified Data.Set as Set
 import qualified Data.Text as Text
 import Data.Bits (testBit)
@@ -31,11 +31,13 @@ import Hetoimasia.Foundation.Log (Logger, callbackSink, defaultLogFilter, mkLogg
 import Hetoimasia.Foundation.Messaging.Payload (prepare)
 import Hetoimasia.Foundation.Worker (withWorkerGroup)
 import Hetoimasia.LuaEngine.Graphics.Scene.Claims (SceneClaims, claimOf, newSceneClaims)
-import Hetoimasia.LuaEngine.Graphics.Scene.Ledger (GraphicsScene (..), LedgerReading (..), initialGraphicsScene, ledgerInterests, ledgerReading)
+import Hetoimasia.LuaEngine.Graphics.Scene.Ledger (GraphicsScene (..), LedgerReading (..), initialGraphicsScene, ledgerAdopted, ledgerInterests, ledgerNewestAdopted, ledgerNewestTargets, ledgerReading, ledgerReleased, newSceneLedger)
 import Hetoimasia.LuaEngine.Graphics.Scene.Publish (HostAnswer (..))
 import Hetoimasia.LuaEngine.Graphics.Scene.World (SceneWorld (..), WorldTag (..))
 import Hetoimasia.LuaEngine.Graphics.TerrainView
 import Hetoimasia.LuaEngine.Graphics.TerrainView.Inputs (generationIdentity)
+import Hetoimasia.LuaEngine.Graphics.TerrainView.Owner (buildRegions, keepBuilt)
+import Hetoimasia.LuaEngine.Graphics.TerrainView.Service (planDemandHeld, planHeld)
 import Hetoimasia.LuaEngine.Profile
   ( ByteLimit (..)
   , Bytes (..)
@@ -62,7 +64,7 @@ import Hetoimasia.Terrain.Coordinate (RegionCoord (..), TileCoord (..), axisFrom
 import qualified Hetoimasia.Terrain.Render2D.Camera as Camera
 import Hetoimasia.Terrain.Render2D.AtlasFixtures (AtlasStyle, findSampleDirectory, loadAtlasStyle)
 import qualified Hetoimasia.Terrain.Render2D.AtlasFixtures as Fixtures
-import Hetoimasia.Terrain.Render2D.Cells (CellConfig (..), CellKey (..), CellPlan, PartKind (..), cellPlanQuads, quadKey, quadPart)
+import Hetoimasia.Terrain.Render2D.Cells (CellConfig (..), CellKey (..), CellPlan, PartKind (..), cellPlanDemand, cellPlanPending, cellPlanQuads, quadKey, quadPart)
 import Hetoimasia.Terrain.Render2D.Presentation (defaultLightInput)
 import Hetoimasia.Terrain.Runtime
   ( ArenaLease
@@ -124,6 +126,7 @@ spec = describe "terrain views" $ do
   lifecycle
   styles
   jumps
+  hardening
   it "attaches under the target's claim, publishes a whole world revision, and picks only from the revision the host adopted" $
     withViews $ \v → do
       view ← attached v 1
@@ -1659,6 +1662,268 @@ jumps = describe "jumps" $ do
       closeView view
 
 -- ---------------------------------------------------------------------------
+-- Wakes, ownership and limits
+
+hardening ∷ Spec
+hardening = describe "wakes, ownership and limits" $ do
+  it "asks a build refused as upload pressure again when the upload settles between the refusal and its wait" $ do
+    armed ← newTVarIO Nothing
+    -- right after the pressured build's answer is read, before the view installs its wait, the upload settles
+    let settleAt _ name = when (name == "answered") . atomically $
+          readTVar armed >>= mapM_ (\owner → writeTVar (foUploads owner) [] >> writeTVar armed Nothing)
+    withViewsConfig testConfig {tvOnTransfer = settleAt} $ \v → do
+      view ← attached v 1
+      first' ← awaitPublished v 1
+      quiescent v
+      demandResident v view
+      adoptNow (vModel v) 1 `shouldReturn` Adopted first'
+      _ ← releasePass (vModel v)
+      atomically (writeTVar (foUploads (vOwner v)) [7] >> writeTVar (foPressured (vOwner v)) True >> writeTVar armed (Just (vOwner v)))
+      -- an edit in view rebuilds its region, the camera unchanged: its build is refused as pressure, and the upload
+      -- settles before the wait: that is still a change since the submission, so the build is asked again
+      removeWith v (tileAt 9 9 3) Nothing `shouldReturn` Right True
+      _ ← awaitPublished' v 1 (first' + 1)
+      isNothing <$> readTVarIO armed `shouldReturn` True
+      closeView view
+
+  it "waits on a copy the account cannot hold without asking again, until another consumer releases room" $
+    withViews $ \v → do
+      taken ← atomically $ do
+        held ← accountCharged (_vAccount v)
+        let room = accountLimit (_vAccount v) - held - 64
+        ok ← accountReserve (_vAccount v) room
+        pure (if ok then room else 0)
+      taken `shouldSatisfy` (> 0)
+      view ← attached v 1
+      bounded (atomically (Runtime.inspectModelSTM (_vTerrain v) >>= check . null . modelJobs))
+      bounded (atomically (readView view >>= check . readingWaiting))
+      steps ← readingSteps <$> atomically (readView view)
+      -- the worker serves another attachment meanwhile (refused: the target is claimed), and takes no step of this
+      -- view: its copy's own release is not a change it waits for
+      attachOutcome v (target v 1) >>= (`shouldSatisfy` \case SettledRefused AttachTargetClaimed → True; _ → False)
+      readingSteps <$> atomically (readView view) `shouldReturn` steps
+      atomically (accountRelease (_vAccount v) taken)
+      _ ← awaitPublished v 1
+      closeView view
+
+  it "waits on a copy refused for the terrain service's retained bank, and copies once another caller releases its borrow, with no other change" $ do
+    -- the retained bank holds one region's reservation and its result record: while another caller holds a settled
+    -- borrow, no copy of the view's fits
+    let bank = Runtime.regionSnapshotReservation 1 + 160
+    withViewsTerrain HostFirst (\c → c {configRetainedBytes = bank}) loamOverGranite testConfig {tvCopyRegions = 1} $ \v → do
+      other ← Runtime.requestRegionSnapshot (_vTerrain v) (vArena v) [RegionCoord 0 0 0] >>= either (fail . show) pure
+      borrow ← Runtime.await (_vTerrain v) other >>= either (fail . show) pure
+      view ← attached v 1
+      bounded (atomically (readView view >>= check . readingWaiting))
+      atomically (readView view) >>= (`shouldBe` Nothing) . readingPublished
+      Runtime.releaseRegionBorrow (_vTerrain v) borrow
+      _ ← awaitPublished v 1
+      closeView view
+
+  it "takes and releases a copy that settles between an abandoning close's probe and its cancellation, leaving the terrain service nothing" $ do
+    gate ← newTVarIO False
+    holding ← newTVarIO True
+    held ← newTVarIO False
+    terrainRef ← newTVarIO Nothing
+    cancelled ← newTVarIO False
+    -- the first load job waits at the terrain service's owner: the view's first copy stays unsettled
+    let probe = Runtime.Probe $ \case
+          Runtime.PointJob _ _ → do
+            first' ← atomically (readTVar holding <* writeTVar holding False)
+            when first' $ do
+              atomically (writeTVar held True)
+              atomically (readTVar gate >>= check)
+          _ → pure ()
+        -- the close's cleanup found the copy unsettled: it settles now, before the cancellation
+        atCancel 0 "cancelling" = do
+          atomically (writeTVar gate True)
+          readTVarIO terrainRef >>= mapM_ (\terrain → atomically (Runtime.inspectRegionalSTM terrain >>= check . (\cs → not (null cs) && all (isJust . Runtime.regionalChargeFootprint) cs)))
+          atomically (writeTVar cancelled True)
+        atCancel _ _ = pure ()
+    withViewsProbed HostFirst probe id loamOverGranite testConfig {tvOnTransfer = atCancel} $ \v → do
+      atomically (writeTVar terrainRef (Just (_vTerrain v)))
+      view ← attached v 1
+      bounded (atomically (readTVar held >>= check))
+      bounded (closeView view)
+      readTVarIO cancelled `shouldReturn` True
+      bounded (atomically (Runtime.inspectRegionalSTM (_vTerrain v) >>= check . null))
+      atomically (claimOf (vClaims v) 1) `shouldReturn` Nothing
+
+  it "closes the runtime view an attachment opened when it is cancelled before its commit, so its slot is free at once" $
+    withViewsTerrain HostFirst (\c → c {configMaxViews = 1}) loamOverGranite testConfig {tvBeforeAttachCommit = myThreadId >>= killThread} $ \v → do
+      outcome ← inInstance (vComp v) (vVm v) "i" (attachView (vViews v) (requestFor v (target v 1))) >>= either (fail . show) pure >>= bounded . awaitAttach
+      outcome `shouldSatisfy` \case SettledRefused AttachStopped → True; _ → False
+      runtimeView ← Runtime.openView (_vTerrain v) (vClient v) >>= either (fail . show) pure
+      Runtime.closeView (_vTerrain v) runtimeView
+      atomically (claimOf (vClaims v) 1) `shouldReturn` Nothing
+      atomically (ledgerInterests (fakeLedger (vFake v))) `shouldReturn` mempty
+
+  it "closes a view whose worker is cancelled between the close's handback and its end, so a close from the body returns" $ do
+    seam ← newStageSeam
+    withViewsConfig testConfig {tvOnTransfer = seamHook seam} $ \v → do
+      view ← attached v 1
+      _ ← awaitPublished v 1
+      armSeam seam (viewIncarnation view) "closed" 1 SeamKill
+      bounded (closeView view)
+      awaitSeamFired seam
+      atomically (claimOf (vClaims v) 1) `shouldReturn` Nothing
+      atomically (viewHoldsStyle view) `shouldReturn` False
+
+  it "retires the chunk a build made before its builder raised, keeping its charges until its upload ends and its release answers" $
+    withViews $ \v → do
+      let owner = vOwner v
+      atomically (writeTVar (foHoldUploads owner) True >> writeTVar (foRaiseAt owner) (Just 1))
+      view ← attached v 1
+      bounded (atomically (terrainViewsFailures (vViews v) >>= check . any ("raised" `Text.isInfixOf`)))
+      first' ← bounded . atomically $ readTVar (foInstances owner) >>= maybe retry pure . fmap fst . Map.lookupMin
+      atomically (terrainViewsRetiring (vViews v)) >>= (`shouldSatisfy` elem first' . map fst)
+      atomically (terrainViewsGpuCharged (vViews v)) >>= (`shouldSatisfy` (> 0))
+      releasedChunks owner >>= (`shouldNotContain` [first'])
+      atomically (writeTVar (foHoldUploads owner) False >> modifyTVar' (foStanding owner) (Map.map (const ChunkReady)))
+      bounded (atomically (readTVar (foReleased owner) >>= check . elem first'))
+      _ ← awaitPublished v 1
+      released ← releasedChunks owner
+      length (filter (== first') released) `shouldBe` 1
+      closeView view
+
+  it "answers a build whose action ended without answering with the chunks it recorded, for the caller to retire" $ do
+    built ← newTVarIO []
+    let ticket = keepBuilt built (pure (Just (NotRun "the action raised")))
+    atomically ticket `shouldReturn` Just (NotRun "the action raised")
+    atomically (writeTVar built [chunkRef 2 1, chunkRef 1 1])
+    atomically ticket >>= \case
+      Just (Answered (Left (BuildFailed chunks _))) → chunks `shouldBe` [chunkRef 1 1, chunkRef 2 1]
+      other → expectationFailure ("the recorded chunks were not answered: " <> show other)
+
+  it "never accepts a candidate whose records exceed the renderer's storage window: a region that never fits is a typed refusal, a larger whole waits, and a window that holds it publishes" $ do
+    let windowed bytes body = withViews $ \v → do
+          atomically (writeTVar (foRegionWindow (vOwner v)) bytes)
+          view ← attached v 1
+          body v view
+        refusalOf view = bounded . atomically $ readView view >>= maybe retry pure . readingWindow
+    -- a window too small for any region: the largest region's records are a typed refusal; nothing is built or published
+    unitBytes ← windowed 17 $ \v view → do
+      refusal ← refusalOf view
+      publishedRevision (vModel v) 1 `shouldReturn` 0
+      readTVarIO (foBuilt (vOwner v)) `shouldReturn` 0
+      closeView view
+      case refusal of
+        UnitExceedsWindow _ bytes window → (window `shouldBe` 17) >> pure bytes
+        other → expectationFailure ("not a region's refusal: " <> show other) >> fail "unreachable"
+    -- a window that holds the largest region alone but not the whole: it waits, and says what the whole needs
+    need ← windowed unitBytes $ \v view → do
+      refusal ← refusalOf view
+      publishedRevision (vModel v) 1 `shouldReturn` 0
+      closeView view
+      case refusal of
+        EnvelopeExceedsWindow needed window → (window `shouldBe` unitBytes) >> pure needed
+        other → expectationFailure ("not the whole's wait: " <> show other) >> fail "unreachable"
+    need `shouldSatisfy` (> unitBytes)
+    -- the control: a window that holds the whole publishes it
+    windowed need $ \v view → do
+      _ ← awaitPublished v 1
+      atomically (readView view) >>= (`shouldBe` Nothing) . readingWindow
+      closeView view
+
+  it "refuses a style whose mapping gives no region to a material of the arena's palette, before taking anything" $
+    withViews $ \v → do
+      let request = requestFor v (target v 1)
+          kept = take 1 (Fixtures.styleMaterialIds (vStyle v))
+          partial = request {attachStyle = (attachStyle request) {styleMaterials = kept}}
+      outcome ← inInstance (vComp v) (vVm v) "i" (attachView (vViews v) partial) >>= \case
+        Left refusal → pure (SettledRefused refusal)
+        Right attaching → bounded (awaitAttach attaching)
+      case outcome of
+        SettledRefused (AttachStyle (StyleMissingMaterials missing)) → do
+          missing `shouldSatisfy` (not . null)
+          [material | material ← missing, material `elem` map fst kept] `shouldBe` []
+        SettledRefused other → expectationFailure ("refused otherwise: " <> Text.unpack (describeAttachRefusal other))
+        _ → expectationFailure "the attachment was not refused"
+      atomically (claimOf (vClaims v) 1) `shouldReturn` Nothing
+      atomically (ledgerInterests (fakeLedger (vFake v))) `shouldReturn` mempty
+
+  it "refuses an attachment through another client's lease on the same arena, before taking anything" $
+    withViews $ \v → do
+      other ← Runtime.registerClient (_vTerrain v) >>= either (fail . show) pure
+      lease ← Runtime.attachArena (_vTerrain v) other "views" >>= either (fail . show) pure >>= Runtime.await (_vTerrain v) >>= either (fail . show) pure
+      let request = (requestFor v (target v 1)) {attachArena = lease}
+      outcome ← inInstance (vComp v) (vVm v) "i" (attachView (vViews v) request) >>= either (fail . show) pure >>= bounded . awaitAttach
+      outcome `shouldSatisfy` \case SettledRefused (AttachArena _) → True; _ → False
+      atomically (claimOf (vClaims v) 1) `shouldReturn` Nothing
+      atomically (ledgerInterests (fakeLedger (vFake v))) `shouldReturn` mempty
+
+  it "closes an idle view whose arena lease is revoked, handing its target back, with no close or new intent" $
+    withViews $ \v → do
+      view ← attached v 1
+      _ ← awaitPublished v 1
+      quiescent v
+      _ ← Runtime.releaseLease (_vTerrain v) (vArena v)
+      bounded (atomically (viewClosed view >>= check))
+      atomically (claimOf (vClaims v) 1) `shouldReturn` Nothing
+      atomically (terrainViewsFailures (vViews v)) >>= (`shouldSatisfy` any ("arena authority" `Text.isInfixOf`))
+
+  it "closes an idle view whose target incarnation ends, with no close or new intent, publishing nothing to it" $
+    withViews $ \v → do
+      view ← attached v 1
+      published ← awaitPublished v 1
+      quiescent v
+      setUsable (vModel v) 1 False
+      bounded (atomically (viewClosed view >>= check))
+      atomically (claimOf (vClaims v) 1) `shouldReturn` Nothing
+      publishedRevision (vModel v) 1 `shouldReturn` published
+
+  it "cancels a jump only through the view it belongs to: another view's handle changes nothing" $
+    withViews $ \v → do
+      modelWindow (vModel v) 2
+      a ← attached v 1
+      b ← attached v 2
+      _ ← awaitPublished v 1
+      _ ← awaitPublished v 2
+      axis ← pure (either (error . show) id . axisFromInteger)
+      jumpA ← atomically (jumpView a (JumpRequest (axis 4000, axis 4000) Nothing)) >>= either (fail . show) pure
+      jumpB ← atomically (jumpView b (JumpRequest (axis 4100, axis 4100) Nothing)) >>= either (fail . show) pure
+      atomically (cancelJumpView b jumpA) `shouldReturn` False
+      atomically (jumpSettled jumpA) >>= (`shouldNotBe` Just SettledCancelled)
+      bounded (atomically (jumpSettled jumpA >>= maybe retry pure)) `shouldReturn` SettledOk JumpLanded
+      bounded (atomically (jumpSettled jumpB >>= maybe retry pure)) `shouldReturn` SettledOk JumpLanded
+      closeView a
+      closeView b
+
+  it "charges each pinned plan for its own demand, beside its quads and its pending spans" $
+    withViews $ \v → do
+      view ← attached v 1
+      published ← awaitPublished v 1
+      quiescent v
+      demandResident v view
+      adoptNow (vModel v) 1 `shouldReturn` Adopted published
+      plan ← bounded . atomically $ adoptedPlan view >>= maybe retry pure
+      reading ← atomically (readView view)
+      readingPins reading `shouldBe` 1
+      planDemandHeld (cellPlanDemand plan) `shouldSatisfy` (> 0)
+      readingPinnedBytes reading `shouldBe` planHeld (length (cellPlanQuads plan)) (length (cellPlanPending plan)) + planDemandHeld (cellPlanDemand plan)
+      closeView view
+
+  it "keeps no style or demand reachable through a closed view's handle" $
+    withViews $ \v → do
+      view ← attached v 1
+      _ ← awaitPublished v 1
+      atomically (viewHoldsStyle view) `shouldReturn` True
+      atomically (viewDemand view) >>= (`shouldSatisfy` isJust)
+      closeView view
+      atomically (viewHoldsStyle view) `shouldReturn` False
+      atomically (viewDemand view) `shouldReturn` Nothing
+
+  it "keeps no newest-adoption entry for a target once its last adoption is released, and makes one again on a later adoption" $ do
+    ledger ← newSceneLedger
+    forM_ [1 .. 20 ∷ Int] $ \window → ledgerAdopted ledger window 1 initialGraphicsScene
+    atomically (ledgerNewestTargets ledger) `shouldReturn` 20
+    forM_ [1 .. 20 ∷ Int] $ \window → ledgerReleased ledger window 1
+    atomically (ledgerNewestTargets ledger) `shouldReturn` 0
+    atomically (ledgerNewestAdopted ledger 3) `shouldReturn` Nothing
+    ledgerAdopted ledger 3 2 initialGraphicsScene
+    atomically (fmap fst <$> ledgerNewestAdopted ledger 3) `shouldReturn` Just 2
+
+-- ---------------------------------------------------------------------------
 -- The rig
 
 withViews ∷ (Views → IO a) → IO a
@@ -1678,7 +1943,11 @@ withViewsOrdered ∷ EndOrder → SourceSpec → TerrainViewsConfig → (Views �
 withViewsOrdered order = withViewsTerrain order id
 
 withViewsTerrain ∷ EndOrder → (Config → Config) → SourceSpec → TerrainViewsConfig → (Views → IO a) → IO a
-withViewsTerrain order terrainConfig source config body = do
+withViewsTerrain order = withViewsProbed order noProbe
+
+-- The rig over a terrain service whose owner reports its points to this probe.
+withViewsProbed ∷ EndOrder → Runtime.Probe → (Config → Config) → SourceSpec → TerrainViewsConfig → (Views → IO a) → IO a
+withViewsProbed order probe terrainConfig source config body = do
   style ← loadAtlasStyle 5 [("loam", "colour.loam"), ("granite", "colour.granite")]
   sample ← findSampleDirectory
   let atlas = sample </> "content" </> "textures" </> "terrain-atlas"
@@ -1697,7 +1966,7 @@ withViewsTerrain order terrainConfig source config body = do
         loadParent comp vm "normal" ["data", "coverage", "normal"]
         colourKey ← leaseKey comp vm "colour"
         normalKey ← leaseKey comp vm "normal"
-        withTerrain terrainConfig source (cpAccount comp) $ \terrain client arena → do
+        withTerrainProbed probe terrainConfig source (cpAccount comp) $ \terrain client arena → do
           claims ← newSceneClaims
           metricsVar ← newTVarIO metrics
           owner ← newFakeOwner model
@@ -1866,8 +2135,8 @@ terrainProfile = case validateProfile changed of
 
 -- The real service over private files in a temporary directory, its staging charged to the session's account, with one
 -- arena of loam over granite.
-withTerrain ∷ (Config → Config) → SourceSpec → RenderAccount → (Service → Runtime.Client → ArenaLease → IO a) → IO a
-withTerrain terrainConfig source account body =
+withTerrainProbed ∷ Runtime.Probe → (Config → Config) → SourceSpec → RenderAccount → (Service → Runtime.Client → ArenaLease → IO a) → IO a
+withTerrainProbed probe terrainConfig source account body =
   withSystemTempDirectory "hetoimasia-terrain-views" $ \dir → do
     let directory = BC.pack dir
     name ← filesystemOf directory >>= either (\f → fail ("cannot name the test filesystem: " <> show f)) pure
@@ -1879,7 +2148,7 @@ withTerrain terrainConfig source account body =
                 { configStore = defaultStoreSpec {specAllowanceBytes = toInteger minAllowanceBytes}
                 , configStagingAccount = Just (renderStagingAccount account)
                 }
-      withTerrainService config (Ports alwaysAdmitting (standaloneSupervisor group) quiet noProbe (storagePort group storage directory)) $ \terrain → do
+      withTerrainService config (Ports alwaysAdmitting (standaloneSupervisor group) quiet probe (storagePort group storage directory)) $ \terrain → do
         client ← Runtime.registerClient terrain >>= either (fail . show) pure
         arena ← openArena terrain client "views" source >>= either (fail . show) pure >>= await terrain >>= either (fail . show) pure
         body terrain client arena
@@ -1976,6 +2245,10 @@ data FakeOwner = FakeOwner
     -- ^ The uploads the owner reports unsettled, by number: the example settles them.
   , foPressured ∷ !(TVar Bool)
     -- ^ While set, a build is refused as upload pressure for as long as 'foUploads' names an upload.
+  , foRegionWindow ∷ !(TVar Word64)
+    -- ^ The renderer's storage window the owner reports: unbounded unless an example sets it.
+  , foRaiseAt ∷ !(TVar (Maybe Int))
+    -- ^ While set, the next build makes this many regions and then its builder raises (once).
   }
 
 data FakeAction
@@ -2004,6 +2277,8 @@ newFakeOwner model =
     <*> newTVarIO Nothing
     <*> newTVarIO []
     <*> newTVarIO False
+    <*> newTVarIO maxBound
+    <*> newTVarIO Nothing
 
 -- The owner's thread: runs queued actions in order. A build waits at the gate; an ended owner answers what it did not
 -- run.
@@ -2016,29 +2291,37 @@ fakeOwnerLoop owner = forever $ do
     FakeBuild regions answer → do
       atomically (modifyTVar' (foWaiting owner) (+ 1))
       atomically ((readTVar (foGate owner) >>= check) `orElse` (readTVar (foEnded owner) >>= check))
-      atomically $ do
-        modifyTVar' (foWaiting owner) (subtract 1)
-        ended ← readTVar (foEnded owner)
-        failure ← readTVar (foFailure owner)
-        pressured ← (&&) <$> readTVar (foPressured owner) <*> (not . null <$> readTVar (foUploads owner))
-        stop ← if pressured then pure (Just (0, True)) else readTVar (foStopAfter owner) <* writeTVar (foStopAfter owner) Nothing
-        let make made = do
-              start ← readTVar (foNext owner)
-              let refs = [chunkRef index 1 | index ← take (length made) [start ..]]
-              writeTVar (foNext owner) (start + fromIntegral (length made))
-              holding ← readTVar (foHoldUploads owner)
-              modifyTVar' (foStanding owner) (Map.union (Map.fromList [(ref, if holding then ChunkUploading else ChunkReady) | ref ← refs]))
-              modifyTVar' (foInstances owner) (Map.union (Map.fromList (zip refs (map buildInstances made))))
-              modifyTVar' (foBuilt owner) (+ length made)
-              pure refs
-        result ← case (ended, failure, stop) of
-          (True, _, _) → pure (NotRun "the owner ended")
-          (_, Just why, _) → pure (Answered (Left (BuildFailed [] why)))
-          (_, _, Just (count, pressure)) → do
-            refs ← make (take count regions)
-            pure (Answered (Left ((if pressure then BuildPressure else BuildFailed) refs "the fake owner stopped the build")))
-          _ → Answered . Right <$> make regions
-        writeTVar answer (Just result)
+      raise ← atomically (readTVar (foRaiseAt owner) <* writeTVar (foRaiseAt owner) Nothing)
+      case raise of
+        -- the production build loop, over a builder that makes this many regions and then raises
+        Just count → do
+          atomically (modifyTVar' (foWaiting owner) (subtract 1))
+          made ← newTVarIO (0 ∷ Int)
+          let builder region = do
+                index ← atomically (readTVar made <* modifyTVar' made (+ 1))
+                if index >= count
+                  then throwIO (userError "the fake builder raised")
+                  else
+                    atomically (mintChunks owner [region]) >>= \case
+                      [chunk] → pure (Right chunk)
+                      _ → throwIO (userError "the fake owner minted no chunk")
+          result ← buildRegions builder (\_ → pure ()) regions
+          atomically (writeTVar answer (Just (Answered result)))
+        Nothing → atomically $ do
+         modifyTVar' (foWaiting owner) (subtract 1)
+         ended ← readTVar (foEnded owner)
+         failure ← readTVar (foFailure owner)
+         pressured ← (&&) <$> readTVar (foPressured owner) <*> (not . null <$> readTVar (foUploads owner))
+         stop ← if pressured then pure (Just (0, True)) else readTVar (foStopAfter owner) <* writeTVar (foStopAfter owner) Nothing
+         let make = mintChunks owner
+         result ← case (ended, failure, stop) of
+           (True, _, _) → pure (NotRun "the owner ended")
+           (_, Just why, _) → pure (Answered (Left (BuildFailed [] why)))
+           (_, _, Just (count, pressure)) → do
+             refs ← make (take count regions)
+             pure (Answered (Left ((if pressure then BuildPressure else BuildFailed) refs "the fake owner stopped the build")))
+           _ → Answered . Right <$> make regions
+         writeTVar answer (Just result)
     FakeRelease chunks answer → atomically $ do
       ended ← readTVar (foEnded owner)
       failure ← readTVar (foReleaseFailure owner) <* writeTVar (foReleaseFailure owner) Nothing
@@ -2052,11 +2335,24 @@ fakeOwnerLoop owner = forever $ do
           pure (Answered (map (const (Right ())) chunks))
       writeTVar answer (Just result)
 
+-- Mint a chunk for each region, ready at once unless the example holds uploads.
+mintChunks ∷ FakeOwner → [RegionBuild] → STM [ChunkRef]
+mintChunks owner made = do
+  start ← readTVar (foNext owner)
+  let refs = [chunkRef index 1 | index ← take (length made) [start ..]]
+  writeTVar (foNext owner) (start + fromIntegral (length made))
+  holding ← readTVar (foHoldUploads owner)
+  modifyTVar' (foStanding owner) (Map.union (Map.fromList [(ref, if holding then ChunkUploading else ChunkReady) | ref ← refs]))
+  modifyTVar' (foInstances owner) (Map.union (Map.fromList (zip refs (map buildInstances made))))
+  modifyTVar' (foBuilt owner) (+ length made)
+  pure refs
+
 fakeViewOwner ∷ FakeOwner → ViewOwner
 fakeViewOwner owner =
   ViewOwner
     { ownerMaterial = material
     , ownerDepthQualified = True
+    , ownerRegionWindow = readTVar (foRegionWindow owner)
     , ownerBuild = \regions → submitFake (FakeBuild regions)
     , ownerRelease = \chunks → submitFake (FakeRelease chunks)
     , ownerBarrier = \_ → do
