@@ -323,6 +323,9 @@ data ViewState k = ViewState
     -- ^ How many regions the last published plan admitted.
   , vsWindow ∷ !(TVar (Maybe WindowRefusal))
     -- ^ Why the latest candidate's records could not fit the renderer's storage window, until one fits.
+  , vsPublishedFor ∷ !(TVar (Maybe (Word64, Maybe (Revision, Revision, Word64), TargetMetrics)))
+    -- ^ What the newest published plan was made for: its intent, arena identity and metrics. Unlike 'vsPrepared', a
+    -- preparation that was refused never writes it.
   , vsFactsCharge ∷ !(TVar Word64)
     -- ^ What the facts kept for the camera ('vsFacts') hold of the account: charged with the inputs they were made
     -- from, kept while they are kept, replaced by the next facts' charge and returned at close.
@@ -660,6 +663,7 @@ newViewState service request style runtimeView camera light = do
     <*> newTVarIO Nothing
     <*> newTVarIO 0
     <*> newTVarIO 0
+    <*> newTVarIO Nothing
     <*> newTVarIO Nothing
     <*> newTVarIO 0
 
@@ -1805,12 +1809,12 @@ stepPlanning service state prep planning = case cellPrepProgress (plPrep plannin
             kept ← maybe 0 (\(v', p') → demandBytes * fromIntegral (length v' + length p')) <$> readTVar (vsDemand state)
             growStage service state (adaptation + demandGrowth kept)
           -- a preparation woken only to admit more (the same intent, metrics and arena state as the published plan) that
-          -- admitted no more publishes nothing: it sleeps again until something it waits on changes
+          -- admitted no more publishes nothing: it sleeps again until something it waits on changes. It is compared with
+          -- what was published, never with a preparation that was refused (a retry after pressure is not unchanged)
           unchanged ← atomically $ do
-            (intent, identity, metrics) ← readTVar (vsPrepared state)
+            publishedFor ← readTVar (vsPublishedFor state)
             count ← readTVar (vsAdmittedCount state)
-            published ← isJust <$> readTVar (vsPublished state)
-            pure (published && intent == prpIntent prep && identity == prpIdentity prep && metrics == Just (prpMetrics prep) && Set.size (prpRegions prep) <= count)
+            pure (publishedFor == Just (prpIntent prep, prpIdentity prep, prpMetrics prep) && Set.size (prpRegions prep) <= count)
           if not charged || unchanged
             then abandonStage service state >> finish service state Retry' (Just prep)
             else do
@@ -2141,6 +2145,7 @@ publishPlan service state prep uploading = do
             when accepted $ do
               _ ← markClaimPublished (portClaims ports) (vtKey (vsTarget state)) (vsId state)
               writeTVar (vsPublished state) (Just revision)
+              writeTVar (vsPublishedFor state) (Just (prpIntent prep, prpIdentity prep, metrics))
               -- the candidate's CPU charge becomes the pin's, and the stage holds nothing more
               modifyTVar' (vsPins state) (Map.insert revision (Pinned plan metrics (copyArena copies) (copyContent copies) (copyKnowledge copies) (copyGeneration copies) (upCpu uploading)))
               -- the stage's charge ends: the pin holds the plan, the listed regions their descriptions

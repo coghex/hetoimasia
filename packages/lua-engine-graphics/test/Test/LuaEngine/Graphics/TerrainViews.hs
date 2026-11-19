@@ -1680,14 +1680,17 @@ hardening = describe "wakes, ownership and limits" $ do
       adoptNow (vModel v) 1 `shouldReturn` Adopted first'
       _ ← releasePass (vModel v)
       let owner = vOwner v
-      atomically (writeTVar (foUploads owner) [7] >> writeTVar (foPressured owner) True >> writeTVar (foGate owner) False)
-      -- an edit in view rebuilds its region, the camera unchanged; its build waits at the owner until the terrain
-      -- service is quiet, so nothing but the upload can change what the view waits on
+      atomically (writeTVar (foUploads owner) [7] >> writeTVar (foPressured owner) True)
+      -- an edit in view rebuilds its region, the camera unchanged; its build is refused as pressure, and it waits once
+      -- the terrain service is quiet, so nothing but an upload can change what it waits on
       removeWith v (tileAt 9 9 3) Nothing `shouldReturn` Right True
-      bounded (atomically (readTVar (foWaiting owner) >>= check . (> 0)))
       quiescent v
       bounded (atomically (Runtime.inspectModelSTM (_vTerrain v) >>= check . null . modelJobs))
-      -- the build is refused as pressure, and the upload settles before the wait: that is still a change since the
+      bounded (atomically (readView view >>= \r → check (readingWaiting r && readingStagedBytes r == 0)))
+      -- that upload settles and another starts: the build is asked again, and waits at the owner
+      atomically (writeTVar (foGate owner) False >> writeTVar (foUploads owner) [8])
+      bounded (atomically (readTVar (foWaiting owner) >>= check . (> 0)))
+      -- it is refused as pressure, and the upload settles before the wait: that is still a change since the
       -- submission, so the build is asked again
       atomically (writeTVar armed (Just owner) >> writeTVar (foGate owner) True)
       _ ← awaitPublished' v 1 (first' + 1)
