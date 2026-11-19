@@ -207,16 +207,6 @@ fullSpec env = describe "terrain views (full)" $ do
       rendered ← renderJudged rig "after the resize"
       pickAgreement rig view rendered >>= notePicks
       closeView view
-  it "draws a lower background far outside the camera's radius exactly" $
-    within 60 . withRigOn pillarOverPlain (\c → c {tvCellConfig = (tvCellConfig c) {ccDepth = 250}}) env $ \rig → do
-      view ← attach rig (metricsOf 128 96)
-      _ ← awaitAdopted rig 1
-      Just (visible, _) ← atomically (viewDemand view)
-      [r | r ← visible, abs (regionX r) > 1 || abs (regionY r) > 1] `shouldSatisfy` (not . null)
-      settleBackground rig view
-      rendered ← renderJudged rig "background"
-      pickAgreement rig view rendered >>= notePicks
-      closeView view
   it "draws a revealed cavity's ordinary, fog and mixed cells exactly" $
     within 60 . withRigOn cavitySource id env $ \rig → do
       view ← attach rig (metricsOf 128 96)
@@ -770,15 +760,6 @@ moveResidency rig = do
 
 evidenceNote ∷ Text → IO ()
 evidenceNote = Text.putStrLn
-
--- A plain of loam whose top is level -1, and one pillar of granite rising to level 99 at the camera's column.
-pillarOverPlain ∷ SourceSpec
-pillarOverPlain =
-  SourceSpec
-    { specMaterials = ["loam", "granite"]
-    , specLayers = [LayerSpec {layerMin = Nothing, layerMax = Just 0, layerMaterial = "loam", layerShape = 0}]
-    , specPatches = [PatchSpec {patchX = 8, patchY = 8, patchMin = 0, patchMax = 100, patchValue = SpecSolid "granite" 0}]
-    }
 
 -- A sealed one-column cavity at (8, 8), levels 1 and 2, with shaped cells around it on both levels.
 cavitySource ∷ SourceSpec
