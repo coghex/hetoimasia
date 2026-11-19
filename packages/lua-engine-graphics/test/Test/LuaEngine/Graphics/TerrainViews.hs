@@ -11,7 +11,7 @@
 -- @terrain views@ subgroup draws.
 module Test.LuaEngine.Graphics.TerrainViews (spec) where
 
-import Control.Concurrent (killThread, myThreadId)
+import Control.Concurrent (killThread, myThreadId, newEmptyMVar, putMVar, takeMVar)
 import Control.Exception (MaskingState (Unmasked), getMaskingState)
 import Control.Concurrent.STM
 import Control.Exception (SomeException, displayException, finally, throwIO, try)
@@ -85,6 +85,7 @@ import qualified Hetoimasia.Terrain.Runtime as Runtime
 import Hetoimasia.Terrain.Runtime.Storage (filesystemOf, minHeadroomBytes, mkStorageConfig)
 import Hetoimasia.Terrain.Runtime.Store (StoreSpec (..), defaultStoreSpec, minAllowanceBytes)
 import Hetoimasia.Terrain.Residency (Bank (StagingBank), Ledger (..), LimitsSpec (..), RegionDemand (..), RegionInfo (..), bankLedger, coverageBox, mkLimits, modelJobs, modelRegions)
+import Hetoimasia.Terrain.Shape (ViewFacing (..))
 import Hetoimasia.Terrain.Source (CellSpec (..), LayerSpec (..), PatchSpec (..), SourceSpec (..))
 import System.FilePath ((</>))
 
@@ -128,6 +129,7 @@ spec = describe "terrain views" $ do
   styles
   jumps
   hardening
+  stagesAndReaders
   it "attaches under the target's claim, publishes a whole world revision, and picks only from the revision the host adopted" $
     withViews $ \v → do
       view ← attached v 1
@@ -546,9 +548,9 @@ stages = describe "stages and the owner" $ do
             demand ← viewDemand view
             pure (reading, maybe 0 (\(visible, prefetch) → length visible + length prefetch) demand)
       (published, demanded) ← atomically covered
-      -- the facts are charged at their inputs' bytes, and the demand at its coordinates
-      readingFactsBytes published `shouldSatisfy` (> 0)
-      readingFactsBytes published `mod` 25872 `shouldBe` 0
+      -- the facts are charged at their inputs' bytes (each region's, and its knowledge's expansion), and the demand at
+      -- its coordinates
+      readingFactsBytes published `shouldSatisfy` (>= 25872 * fromIntegral (readingAdmitted published))
       readingDemandBytes published `shouldSatisfy` (>= 32 * fromIntegral demanded)
       readingCpuBytes published `shouldSatisfy` (>= readingNeedBytes published)
       -- a superseded preparation held at the owner is abandoned: the facts it settled are still kept, and charged
@@ -1969,6 +1971,155 @@ hardening = describe "wakes, ownership and limits" $ do
     atomically (fmap fst <$> ledgerNewestAdopted ledger 3) `shouldReturn` Just 2
 
 -- ---------------------------------------------------------------------------
+-- Stages, waits and readers
+
+stagesAndReaders ∷ Spec
+stagesAndReaders = describe "stages, waits and readers" $ do
+  it "closes a view whose arena lease is revoked while its uploads are held, handing its target back" $
+    withViews $ \v → do
+      let owner = vOwner v
+      view ← attached v 1
+      _ ← awaitPublished v 1
+      quiescent v
+      demandResident v view
+      atomically (writeTVar (foHoldUploads owner) True)
+      -- an edit's rebuild is built and its uploads held: the view waits in its uploading stage
+      removeWith v (tileAt 9 9 3) Nothing `shouldReturn` Right True
+      bounded (atomically (readTVar (foStanding owner) >>= check . elem ChunkUploading . Map.elems))
+      _ ← Runtime.releaseLease (_vTerrain v) (vArena v)
+      bounded (atomically (viewClosed view >>= check))
+      atomically (claimOf (vClaims v) 1) `shouldReturn` Nothing
+      atomically (terrainViewsFailures (vViews v)) >>= (`shouldSatisfy` any ("arena authority" `Text.isInfixOf`))
+      atomically (writeTVar (foHoldUploads owner) False >> modifyTVar' (foStanding owner) (Map.map (const ChunkReady)))
+
+  it "keeps two views that cannot fund their first copies asleep until room returns, however each other's copies come and go" $
+    withViews $ \v → do
+      taken ← atomically $ do
+        held ← accountCharged (_vAccount v)
+        let room = accountLimit (_vAccount v) - held - 64
+        ok ← accountReserve (_vAccount v) room
+        pure (if ok then room else 0)
+      taken `shouldSatisfy` (> 0)
+      modelWindow (vModel v) 2
+      a ← attached v 1
+      b ← attached v 2
+      bounded (atomically (Runtime.inspectModelSTM (_vTerrain v) >>= check . null . modelJobs))
+      bounded (atomically ((&&) <$> (readingWaiting <$> readView a) <*> (readingWaiting <$> readView b) >>= check))
+      let stepsOf = atomically ((,) <$> (readingSteps <$> readView a) <*> (readingSteps <$> readView b))
+      stepsBefore ← stepsOf
+      -- the worker serves another attachment meanwhile (refused: the target is claimed), and takes no step of either
+      attachOutcome v (target v 1) >>= (`shouldSatisfy` \case SettledRefused AttachTargetClaimed → True; _ → False)
+      stepsOf `shouldReturn` stepsBefore
+      atomically (accountRelease (_vAccount v) taken)
+      _ ← awaitPublished v 1
+      _ ← awaitPublished v 2
+      closeView a
+      closeView b
+
+  it "keeps a release that did not run as evidence with its charges, and goes on retiring another view's regions" $
+    withViews $ \v → do
+      let owner = vOwner v
+      modelWindow (vModel v) 2
+      a ← attached v 1
+      b ← attached v 2
+      _ ← awaitPublished v 1
+      _ ← awaitPublished v 2
+      quiescent v
+      demandResident v a
+      demandResident v b
+      firstA ← adoptNewest v 1
+      firstB ← adoptNewest v 2
+      _ ← releasePass (vModel v)
+      -- an edit in both views' ground rebuilds each: their superseded regions retire
+      removeWith v (tileAt 9 9 3) Nothing `shouldReturn` Right True
+      _ ← awaitPublished' v 1 (firstA + 1)
+      _ ← awaitPublished' v 2 (firstB + 1)
+      -- the first view's retirements are released in an action that does not answer; the second's are behind their own
+      -- adoption still
+      atomically (writeTVar (foReleaseRaise owner) True)
+      _ ← adoptNewest v 1
+      _ ← releasePass (vModel v)
+      bounded (atomically (terrainViewsFailures (vViews v) >>= check . any ("did not run" `Text.isInfixOf`)))
+      released ← length <$> releasedChunks owner
+      _ ← adoptNewest v 2
+      _ ← releasePass (vModel v)
+      bounded (atomically (readTVar (foReleased owner) >>= check . (> released) . length))
+      atomically (terrainViewsFailures (vViews v)) >>= (`shouldNotSatisfy` any ("could not be proved" `Text.isInfixOf`))
+      closeView a
+      closeView b
+
+  it "charges the planner's expanded knowledge of its copied regions with their inputs" $
+    withViews $ \v → do
+      view ← attached v 1
+      _ ← awaitPublished v 1
+      quiescent v
+      bounded (atomically (readView view >>= check . (== 0) . readingStagedBytes))
+      reading ← atomically (readView view)
+      -- each copied region's fixed inputs, and more for a region whose knowledge is more than one class
+      readingFactsBytes reading `shouldSatisfy` (> 25872 * fromIntegral (readingAdmitted reading))
+      closeView view
+
+  it "keeps a plan read under the view's reader pinned, charged and counted against its pin limit until the reader lets go" $
+    withViews $ \v → do
+      view ← attached v 1
+      first' ← awaitPublished v 1
+      adoptNow (vModel v) 1 `shouldReturn` Adopted first'
+      _ ← releasePass (vModel v)
+      quiescent v
+      demandResident v view
+      inside ← newEmptyMVar
+      gate ← newEmptyMVar
+      withOwnedThread (withAdoptedPlan view (\plan → putMVar inside (isJust plan) >> takeMVar gate)) $ \_ readerDone → do
+        takeMVar inside `shouldReturn` True
+        -- an edit publishes a second revision, which the host adopts: the first stays pinned and charged, being read
+        removeWith v (tileAt 9 9 3) Nothing `shouldReturn` Right True
+        second ← awaitPublished' v 1 (first' + 1)
+        adoptNow (vModel v) 1 `shouldReturn` Adopted second
+        _ ← releasePass (vModel v)
+        bounded (atomically (readView view >>= check . (== 2) . readingPins))
+        -- a third revision would need a third pin: it waits while the reader holds the first
+        removeWith v (tileAt 10 9 3) Nothing `shouldReturn` Right True
+        bounded (atomically (readView view >>= check . readingWaiting))
+        publishedRevision (vModel v) 1 `shouldReturn` second
+        putMVar gate ()
+        bounded readerDone
+        _ ← awaitPublished' v 1 (second + 1)
+        pure ()
+      closeView view
+
+  it "records a zoom and a facing asked for before its first facts, and publishes its first revision with them" $ do
+    seam ← newStageSeam
+    opened ← newTVarIO False
+    withViewsConfig testConfig {tvOnStage = seamHook seam} $ \v → do
+      armSeam seam 1 "copying" 1 (SeamHold opened)
+      view ← attached v 1
+      awaitSeamFired seam
+      atomically (updateCamera view (CameraIntent [Camera.SetZoom 2])) `shouldReturn` Right ()
+      atomically (updateCamera view (CameraIntent [Camera.SetFacing FaceEast])) `shouldReturn` Right ()
+      -- a pan follows the surface: it waits for the facts
+      atomically (updateCamera view (CameraIntent [Camera.Pan 1 0])) `shouldReturn` Left IntentBusy
+      atomically (writeTVar opened True)
+      _ ← awaitPublished v 1
+      world ← latestWorld v 1
+      cameraZoom (viewCamera (worldView world)) `shouldBe` 2
+      Camera.camFacing <$> atomically (viewCameraState view) `shouldReturn` FaceEast
+      closeView view
+
+  it "answers no hit for a point outside the target before any adoption and after a resize, not loading" $
+    withViews $ \v → do
+      view ← attached v 1
+      _ ← awaitPublished v 1
+      -- nothing adopted yet: inside is loading, outside is no hit
+      atomically (pickView view (10, 10)) `shouldReturn` PickLoading
+      atomically (pickView view (500, 500)) `shouldReturn` PickNoHit
+      atomically (pickView view (-1, 10)) `shouldReturn` PickNoHit
+      -- a resize: the adopted plan is for the old metrics, so inside is loading and outside the new bounds is no hit
+      atomically (modifyTVar' (vMetrics v) (\m → m {metricsLogical = PixelExtent 64 48, metricsFramebuffer = PixelExtent 64 48}))
+      atomically (pickView view (100, 80)) `shouldReturn` PickNoHit
+      atomically (pickView view (10, 10)) `shouldReturn` PickLoading
+      closeView view
+
+-- ---------------------------------------------------------------------------
 -- The rig
 
 withViews ∷ (Views → IO a) → IO a
@@ -2392,6 +2543,13 @@ fakeOwnerLoop owner = forever $ do
           modifyTVar' (foReleased owner) (<> chunks)
           pure (Answered (map (const (Right ())) chunks))
       writeTVar answer (Just result)
+
+-- Adopt the window's newest published revision, whichever it is, and answer it.
+adoptNewest ∷ Views → Int → IO Natural'
+adoptNewest v window = do
+  newest ← publishedRevision (vModel v) window
+  adoptNow (vModel v) window `shouldReturn` Adopted newest
+  pure newest
 
 -- The plan of the revision the host adopted, read under the view's reader once there is one.
 adoptedPlanOf ∷ TerrainView Int → IO CellPlan
