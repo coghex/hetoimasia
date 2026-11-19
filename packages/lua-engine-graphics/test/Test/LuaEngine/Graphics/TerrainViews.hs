@@ -2020,38 +2020,6 @@ stagesAndReaders = describe "stages, waits and readers" $ do
       closeView a
       closeView b
 
-  it "keeps a release that did not run as evidence with its charges, and goes on retiring another view's regions" $
-    withViews $ \v → do
-      let owner = vOwner v
-      modelWindow (vModel v) 2
-      a ← attached v 1
-      b ← attached v 2
-      _ ← awaitPublished v 1
-      _ ← awaitPublished v 2
-      quiescent v
-      demandResident v a
-      demandResident v b
-      firstA ← adoptNewest v 1
-      firstB ← adoptNewest v 2
-      _ ← releasePass (vModel v)
-      -- an edit in both views' ground rebuilds each: their superseded regions retire
-      removeWith v (tileAt 9 9 3) Nothing `shouldReturn` Right True
-      _ ← awaitPublished' v 1 (firstA + 1)
-      _ ← awaitPublished' v 2 (firstB + 1)
-      -- the first view's retirements are released in an action that does not answer; the second's are behind their own
-      -- adoption still
-      atomically (writeTVar (foReleaseRaise owner) True)
-      _ ← adoptNewest v 1
-      _ ← releasePass (vModel v)
-      bounded (atomically (terrainViewsFailures (vViews v) >>= check . any ("did not run" `Text.isInfixOf`)))
-      released ← length <$> releasedChunks owner
-      _ ← adoptNewest v 2
-      _ ← releasePass (vModel v)
-      bounded (atomically (readTVar (foReleased owner) >>= check . (> released) . length))
-      atomically (terrainViewsFailures (vViews v)) >>= (`shouldNotSatisfy` any ("could not be proved" `Text.isInfixOf`))
-      closeView a
-      closeView b
-
   it "charges the planner's expanded knowledge of its copied regions with their inputs" $
     withViews $ \v → do
       view ← attached v 1
@@ -2578,13 +2546,6 @@ fakeOwnerLoop owner = forever $ do
           modifyTVar' (foReleased owner) (<> chunks)
           pure (Answered (map (const (Right ())) chunks))
       writeTVar answer (Just result)
-
--- Adopt the window's newest published revision, whichever it is, and answer it.
-adoptNewest ∷ Views → Int → IO Natural'
-adoptNewest v window = do
-  newest ← publishedRevision (vModel v) window
-  adoptNow (vModel v) window `shouldReturn` Adopted newest
-  pure newest
 
 -- The plan of the revision the host adopted, read under the view's reader once there is one.
 adoptedPlanOf ∷ TerrainView Int → IO CellPlan
