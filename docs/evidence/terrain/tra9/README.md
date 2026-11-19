@@ -7,16 +7,17 @@ and terrain-runtime's README (the precondition guard, the outside staging accoun
 | | |
 | --- | --- |
 | Device | Apple M3 Max, MoltenVK (the pinned Homebrew driver), surface-free targets with a `D32_SFLOAT` depth image |
-| Tested head | `b5279516`, on base `26579849` (review round 4) |
-| Effective spec | `98a673fb` (review 6909126590): the atlas amendment 6731831183 as amended by reviews 6731944497, 6908703832 and 6909126590 and the decision comments 6908430167 and 6909009968 |
+| Tested head | `cdc34252`, on base `26579849` (review round 5); the pull request's head merges master over it |
+| Effective spec | `e2a0e8a1`: the atlas amendment 6731831183 as amended by reviews 6731944497, 6908703832 and 6909126590, the decision comments 6908430167 and 6909009968, the round-3 scope split 7016919733 (owner X), the frame-limit amendment 7017110545 and the round-4 scope split 7020752728 (owner N) |
+| Moved out | #706 (a camera tail the terrain service cut, asked again by an idle view); #709 (progress under a binding bound: whole-unit publication under the renderer's record window, a partial plan's continuation, a distant jump under the cap, multi-turn builds); #710 (stronger witnesses: the record window against the recorder, the far background tied to a drawn quad, every pixel accounted, the intent on the adopted plan, the native suite's focused selection) |
 
 ## Results
 
 | Run | Command | Result |
 | --- | --- | --- |
-| Required native witness | `bash tools/vulkan/run.sh native hetoimasia-lua-engine-graphics:test:lua-engine-graphics-native-tests -- --complete` | 32/32 in 9.73 s on the terrain-disabled host; 4/4 in 3.07 s on the terrain-enabled host; 12.80 s of test time, 20 s wall, under the 30 s rule (`docs/vision.md:272`) |
-| Full qualification | the same suite with `-- --terrain-views-full` | 13/13 in 27.93 s, then the overlap witness on its own held host, 1/1 in 2.45 s |
-| Headless | `bash tools/vulkan/run.sh test hetoimasia-lua-engine-graphics:test:lua-engine-graphics-tests` (group `terrain views`) | 93/93, about 42 s |
+| Required native witness | `bash tools/vulkan/run.sh native hetoimasia-lua-engine-graphics:test:lua-engine-graphics-native-tests -- --complete` | 32/32 in 10.38 s on the terrain-disabled host; 4/4 in 3.23 s on the terrain-enabled host; 13.61 s of test time, 22 s wall, under the 30 s rule (`docs/vision.md:272`) |
+| Full qualification | the same suite with `-- --terrain-views-full` | 13/13 in 29.37 s, then the overlap witness on its own held host, 1/1 in 5.35 s |
+| Headless | `bash tools/vulkan/run.sh test hetoimasia-lua-engine-graphics:test:lua-engine-graphics-tests` (group `terrain views`) | 108/108, about 47 s, run alone; in the final series under load about 14, two examples ran past their bound (the eviction example and the unanswered-release example), recorded as #711 and not rerun |
 
 Native commands run on macOS under the standing per-command consent (`HETOIMASIA_NATIVE_SESSION=desktop`);
 the full qualification wrote its files with `HETOIMASIA_VALIDATION_EVIDENCE` set.
@@ -67,8 +68,10 @@ hook-held, not natural. The stale replacement is causal: the replacement is held
 far view moves the residency, its publication is refused, the kept image is judged, and the replacement
 made again is judged.
 
-The far lower background (a 250-level band) is covered by the headless examples only: natively, the
-terrain service's loads of its whole demand did not settle within the example's bound.
+The far lower background (a 250-level band) is qualified by the headless example "demands, retains and
+draws a lower background far outside the camera's radius but inside the projected viewport": by owner
+decision A (recorded in 7016919733) the native example was removed, and tying a drawn quad to the far
+contributor is #710.
 
 ## Offload and reload (amendment 6909009968)
 

@@ -615,17 +615,33 @@ deliberately partial plan is coherent. With enough capacity and stable inputs,
 a partial plan goes on while each preparation admits more and so settles with
 no holes; at the cap it stops, and when the account binds it sleeps until a
 release, an adoption or the account wakes it, publishing nothing if it admits
-no more. With the production bank, the maximum approved envelope (3840 x 2160 at
-zoom 0.125, about 11,200 regions) publishes a coherent partial plan with
-explicit pending regions and does not settle fully: requirement 3's
-constrained-capacity case, not a footprint hole.
+no more. With the production bank, the copies of the maximum approved envelope
+(3840 x 2160 at zoom 0.125, about 11,200 regions) are admitted as a coherent
+partial plan with explicit pending regions, and its publication then depends on
+the record window below: the production window is 196,608 bytes, which after the
+one clip entry holds 2,891 terrain records (68 bytes each). A candidate whose
+render regions' records fit is published as that partial plan; one whose records
+exceed the window waits (`EnvelopeExceedsWindow`) and publishes nothing, and
+admitting it render region by render region under that bound is #709, as are the
+continuation of a partial plan across preparations and a distant jump's progress
+under the cap; an idle view asking again for a camera tail the terrain service cut
+is #706. The terrain world draws only retained chunks, whose instances live in
+their own device buffers, so the per-frame instance ring holds none of them: the
+qualified cutout path needs no ring space.
 
 A preparation that cannot start sleeps on the one thing that can change that:
 at its two-pin limit, an adoption other than the one seen when its pins were
-pruned (one transaction); without target metrics, the metrics. Its intent and
+pruned (one transaction), or a reader letting a pin go; without target metrics,
+the metrics. Its intent and
 its peers do not wake it. A view whose arena authority (its lease released or
 revoked, its arena closed) or target incarnation is gone for good closes
-through its own close, which hands the target back, and says so as evidence.
+through its own close, in whatever stage it is, which hands the target back,
+and says so as evidence.
+
+**Intent before the first facts.** A camera update that reads no terrain (a
+zoom, a facing, a turn, a slice) is recorded as intent before the view's first
+facts arrive, and the first publication carries the latest; a pan, which
+follows the surface, answers `IntentBusy` until then.
 
 **Inputs.** Every terrain and knowledge input of a plan, of its retained
 regions and of its pick metadata comes from those regional copies and from
@@ -664,12 +680,18 @@ asked again in a loop), and an owner that takes no more actions, or an action
 that never ran, is terminal evidence. A build that stops partway, by a refusal
 or by its builder raising, answers the chunks it made. A wait is installed
 against what the refusal saw, so a change between the two is never missed: a
-build refused as upload pressure waits for one of the session's uploads (the
-owner's unsettled uploads, from `readVulkanUploads`, read with its submission)
-to settle since then; a copy the account cannot hold waits from the state its
-own release leaves; a copy refused for the terrain service's retained bank
-waits on that bank (`retainedBankUseSTM`), read before the request; each also
-wakes for a release, an adoption or the account.
+build refused as upload pressure waits for more of the session's uploads to
+have settled than when it was submitted (a count that only grows:
+`readVulkanUploads`' issued uploads less its unsettled ones, read with the
+submission), so an upload that started and settled after the submission still
+wakes it; a copy the account cannot hold waits for the account to have the room
+its charge needs (whole granules), so another view's copy taken and dropped
+does not wake it; a copy refused for the terrain service's retained bank waits
+on that bank (`retainedBankUseSTM`), read before the request. A build's chunk
+and its record of what was built are one step no cancellation splits. A release
+action that ends without answering keeps its regions' failure and charges as
+evidence and every other retirement goes on; only an owner that takes no more
+actions ends them all.
 
 **The record window.** Before a candidate is built, its render regions'
 material records are checked against the renderer's storage window (the bytes
@@ -689,7 +711,9 @@ asked again.
 terrain service's staging all draw on the session's one `RenderAccount`
 (the service is given it as `renderStagingAccount`). A view's CPU is charged
 before it is made: a copy at its take, the inputs made from the copies (a
-copied region's record each), each planning quantum's growth (at most the
+copied region's record each, and what the planner's knowledge expands to for a
+region whose knowledge is more than one class, counted from the copy before it
+is made), each planning quantum's growth (at most the
 quantum's steps of `clStepLevels` levels, the views' default 2,048, finishing
 their column, two quads a level, and never more than the copied regions'
 cells) trued up after the quantum to what the plan holds, then the
@@ -724,7 +748,12 @@ plan pinned for it: no adopted revision, or metrics that are not the plan's,
 is `PickLoading`; zero metrics, a point outside, air, gaps and fog are
 `PickNoHit`; a visible known part is `PickHit` with an opaque reference: no
 module of the library exports its constructors or field labels, so a caller
-reads one through its accessor functions and can neither make nor alter one.
+reads one through its accessor functions and can neither make nor alter one. A
+point outside the target's current logical extent is `PickNoHit` before any
+adoption check. The adopted plan is read only under the view's reader
+(`withAdoptedPlan`): for as long as the body runs its revision stays pinned and
+charged and counts against the two-pin limit; `readingAdoptedResidency` reads
+its residency identity.
 `pickPrecondition` gives the removal the arena incarnation and the content and
 knowledge revisions, and a guard the terrain service reads in its removal
 arbitration: the view still holds the target and the revision picked from is
@@ -749,6 +778,12 @@ newer revision or drops the target: its chunks are in GPU use until then. The bo
 caller's masking state. The worker records synchronous failures and rethrows
 a cancellation: a cancelled worker takes no more attachments, settles the
 queued ones stopped, and the scope's exit then runs the service's end itself.
+The worker is the scope's resource (`withResource`): it announces its end on
+every exit, and the scope's release stops it, joins it and drains the views
+uninterruptibly, so the scope never exits before the worker is joined, and a
+body's failure and the release's are both kept. Cancelling an attachment
+releases its parents with no cancellation between its leaving the queue and the
+release.
 
 **Depth.** A terrain-enabled composition sets the host-wide window depth
 (`configureWorldDepth`): every swapchain generation of every window gets a
@@ -817,8 +852,14 @@ scene published to a real window, adopted, and its frames recorded and
 presented with the depth image (`M1 output on the terrain-enabled host`; no
 pixel, since a window's image is not readable from this suite).
 
-The broader terrain-view matrix (every facing, zoom 0.5 and 2, a portrait
-target) is outside routine CI and is run alone, with the same checks:
+The broader terrain-view matrix is outside routine CI and is run alone, with the
+same checks: every facing; zoom 0.125, 0.5, 2 and 8; a portrait target; a
+resized view; a revealed cavity's ordinary, fog and mixed cells; a replacement
+refused as stale, then made again; and, on a host whose test-only completion
+hold is set, a revision kept in GPU use while a newer one is adopted. Every
+rendering is judged pixel by pixel by the oracle and every pick against the
+oracle's winning instance. The far lower background is qualified headless only
+(its stronger witness is #710):
 
 ```sh
 HETOIMASIA_NATIVE_SESSION=desktop bash tools/vulkan/run.sh native hetoimasia-lua-engine-graphics:test:lua-engine-graphics-native-tests -- --terrain-views-full
