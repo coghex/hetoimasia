@@ -38,9 +38,9 @@ import Hetoimasia.LuaEngine.Graphics.Scene.Publish (HostAnswer (..))
 import Hetoimasia.LuaEngine.Graphics.Scene.World (SceneWorld (..), WorldTag (..))
 import Hetoimasia.LuaEngine.Graphics.TerrainView
 import Hetoimasia.LuaEngine.Graphics.TerrainView.Qualification (withAdoptedPlan)
-import Hetoimasia.LuaEngine.Graphics.TerrainView.Inputs (changesExpansion, changesExpansionBound, generationIdentity, knowledgeExpansionBound)
+import Hetoimasia.LuaEngine.Graphics.TerrainView.Inputs (changesExpansion, changesExpansionBound, generationIdentity, knowledgeExpansion, knowledgeExpansionBound)
 import Hetoimasia.LuaEngine.Graphics.TerrainView.Owner (buildRegions, keepBuilt, releaseEach)
-import Hetoimasia.LuaEngine.Graphics.TerrainView.Service (planDemandHeld, planHeld)
+import Hetoimasia.LuaEngine.Graphics.TerrainView.Service (inputsCharge, planDemandHeld, planHeld)
 import Hetoimasia.LuaEngine.Profile
   ( ByteLimit (..)
   , Bytes (..)
@@ -2247,6 +2247,9 @@ stagesAndReaders = describe "stages, waits and readers" $ do
       let snapshot = Runtime.regionBorrowSnapshot borrow
           removed = [interval | region ← Runtime.regionSnapshotRegions snapshot, Runtime.PartReady intervals ← [Runtime.regionTerrain snapshot region], interval ← intervals]
           charged = changesExpansion snapshot
+          regions = fromIntegral (length (Runtime.regionSnapshotRegions snapshot))
+      -- admission charges the copy's inputs as each region's fixed inputs, its knowledge's expansion and this index
+      inputsCharge [snapshot] `shouldBe` 25872 * regions + knowledgeExpansion snapshot + charged
       Runtime.releaseRegionBorrow (_vTerrain v) borrow
       index ← either (fail . show) pure (changesFromIntervals (tvChangeLimits testConfig) removed)
       changesBytes index `shouldSatisfy` (>= 3 * 64)

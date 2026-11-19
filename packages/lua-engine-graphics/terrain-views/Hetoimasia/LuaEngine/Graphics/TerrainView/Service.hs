@@ -81,6 +81,7 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView.Service
   , preparationCost
   , admittedInputsCost
   , uniformInputsCost
+  , inputsCharge
 
     -- * The account's figures (for the suites' exact checks)
   , planHeld
@@ -1696,6 +1697,15 @@ admittedCostBound config = admittedInputsCost config (max 1 (tvAdmitRegions conf
 preparationCost ∷ TerrainViewsConfig → Int → Word64
 preparationCost config regions = admittedInputsCost config (max 1 regions) + quantumBound config (max 1 regions)
 
+-- | What the inputs made from these copies are charged at admission: each region's fixed inputs, what the planner's
+-- knowledge expands to for regions of more than one class, and the removal index made from the copies' removed
+-- intervals. Pure, counted from the copies before anything is made.
+inputsCharge ∷ [Runtime.RegionSnapshot] → Word64
+inputsCharge snapshots =
+  inputsPerRegion * fromIntegral (Set.size (Set.fromList (concatMap Runtime.regionSnapshotRegions snapshots)))
+    + sum (map knowledgeExpansion snapshots)
+    + sum (map changesExpansion snapshots)
+
 -- | What copies of this many regions and their inputs hold at most, at the obligations 'admitInputs' charges.
 admittedInputsCost ∷ TerrainViewsConfig → Int → Word64
 admittedInputsCost config regions =
@@ -1830,9 +1840,7 @@ admitInputs service state ordered = do
       attempt (prefix : rest) = case combineCopies prefix of
         Left _ → attempt rest
         Right copies → do
-          -- each region's fixed inputs, what the planner's knowledge expands to for regions of more than one class, and
-          -- the removal index made from the copies' removed intervals
-          let inputs = inputsPerRegion * fromIntegral (Set.size (copyRegions copies)) + sum (map knowledgeExpansion prefix) + sum (map changesExpansion prefix)
+          let inputs = inputsCharge prefix
               held = sum (map Runtime.regionSnapshotFootprint prefix) + inputs
           writeTVar (vsStageCharge state) (held + quantumBound (svConfig service) (Set.size (copyRegions copies)))
           room ← recharge service state
