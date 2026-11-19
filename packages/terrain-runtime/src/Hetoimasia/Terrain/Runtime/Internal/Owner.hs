@@ -1444,10 +1444,12 @@ slotOver ∷ Service → SlotTask → Done → IO ()
 slotOver svc task done = do
   let aid = slotArena task
       key reclaim = (aid, reclaim)
+      -- at what the plan was given, never at the store's state now: a reader's release while the plan ran
+      -- is a change it did not see, and the work is offered again
       markIdle reclaim = atomically $ modifySt svc $ \s →
-        case Map.lookup aid (stateArenas s) of
-          Just arena → s {stateInternalIdle = Map.insert (key reclaim) (storeVersion (arenaStore arena), oldestPin (arenaStore arena)) (stateInternalIdle s)}
-          Nothing → s
+        if Map.member aid (stateArenas s)
+          then s {stateInternalIdle = Map.insert (key reclaim) (slotBasis task) (stateInternalIdle s)}
+          else s
       needsMaintenance = atomically (modifySt svc (\s → s {stateNeedsMaintenance = Set.insert aid (stateNeedsMaintenance s)}))
   case (slotWork task, done) of
     (SlotWriteProbe _, _) → failWith svc (OwnerDefect "a write probe reached a store transaction's end") []
