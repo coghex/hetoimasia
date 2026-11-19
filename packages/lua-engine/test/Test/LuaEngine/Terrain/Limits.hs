@@ -11,13 +11,17 @@ import Hetoimasia.Terrain.Query (QueryLimits (..), defaultQueryLimits)
 import Hetoimasia.Terrain.Residency (RequestId)
 import Hetoimasia.Terrain.Runtime (Answer (..), ColumnAnswer (..), Config (..), Point (..), Probe (..), defaultConfig)
 import System.IO.Unsafe (unsafePerformIO)
+import Hetoimasia.Scripting.Lua.Scheduled (AccountingWait (AccountingComplete), awaitScheduledAccounting)
 import Test.Hspec
 import Control.Concurrent.STM (readTVar)
+import Test.Support.Bounded (bounded)
 import Test.LuaEngine.Facade.Support
 import Test.LuaEngine.Terrain.Support
 
 -- | One instance: fill the request bank with untaken reads and find the next call busy with exactly two values and no handle, take them
--- and find the bank free again.
+-- in one update, and in a later update, once the owner has accounted for that one, find the bank free again. (A take frees a request's
+-- places and credits at once only when the owner has already reaped its provider's work; otherwise they come back at the owner's next
+-- accounted boundary, and not before: see "When a bank comes back" in the scripting-lua README.)
 busy ∷ Script
 busy =
   script
@@ -40,10 +44,13 @@ busy =
         , "  for i = 1, 16 do if not api.request.ready(self.held[i]) then all = false end end"
         , "  if all then"
         , "    for i = 1, 16 do api.request.take(self.held[i]) end"
-        , "    local r, e = api.terrain.cell(self.arena, {x = 0, y = 0, z = 0})"
-        , "    print('after taking', r ~= nil, e == nil)"
+        , "    print('taken')"
         , "    self.s = 2"
         , "  end"
+        , "elseif self.s == 2 then"
+        , "  local r, e = api.terrain.cell(self.arena, {x = 0, y = 0, z = 0})"
+        , "  print('after taking', r ~= nil, e == nil)"
+        , "  self.s = 3"
         , "end"
         ]
     }
@@ -124,9 +131,13 @@ spec ∷ Spec
 spec = describe "Terrain limits" $ do
   it "answers a full request bank with exactly nil and the busy record, and a taken bank with room again" $
     withRig $ \rig →
-      withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource busy)]) $ \world _ runtime →
+      withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource busy)]) $ \world control runtime →
         withFvm world runtime (presentationOver rig) $ \fvm → do
           _ ← spawn world fvm "modules-test" mainPath
+          untilPrinted world "taken"
+          -- the owner's accounting acknowledgement follows a boundary that begins after the update that took them: the work of every
+          -- read that update took has been reaped there, and its places and credits given back; the next update finds room
+          bounded (awaitScheduledAccounting control (fvOwner fvm)) `shouldReturn` AccountingComplete
           untilPrinted world "after taking\ttrue\ttrue"
           printed ← outLines world
           printed `shouldContain` ["busy\t2\ttrue\tbusy\tstring"]
