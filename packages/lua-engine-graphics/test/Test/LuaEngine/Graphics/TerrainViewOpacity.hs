@@ -9,7 +9,8 @@
 -- * the constructor of a reference or of its identity cannot be named: @GHC-10237@;
 -- * an identity's accessors are functions, never field labels, so record-update syntax cannot rewrite one:
 --   @GHC-22385@;
--- * the module that holds the constructors is hidden: @GHC-87110@;
+-- * the module that holds the constructors is hidden, and the implementation's service and qualification modules (the
+--   adopted plan among them) are not the library's: @GHC-87110@;
 -- * the picker's constructor function is exported by no module: @GHC-61689@.
 module Test.LuaEngine.Graphics.TerrainViewOpacity (spec) where
 
@@ -50,6 +51,17 @@ spec = describe "terrain views' pick references across the library boundary" $ d
         ExitSuccess → expectationFailure ("the client compiled, so the constructors' module is reachable:\n" <> clientOutput outcome)
       clientOutput outcome `shouldContain` "GHC-87110"
       clientOutput outcome `shouldContain` "Hetoimasia.LuaEngine.Graphics.TerrainView.Internal.Pick"
+
+  -- the adopted plan is read only under the pin that accounts for it, and only by this package's own suites
+  forM_ ["Hetoimasia.LuaEngine.Graphics.TerrainView.Qualification", "Hetoimasia.LuaEngine.Graphics.TerrainView.Service"] $ \name →
+    it ("rejects a client that imports the implementation's " <> name) $
+      withClient (clientImporting ["import " <> name] []) $ \compile → do
+        outcome ← compile Typecheck
+        case clientStatus outcome of
+          ExitFailure _ → pure ()
+          ExitSuccess → expectationFailure ("the client compiled, so the implementation's module is reachable:\n" <> clientOutput outcome)
+        clientOutput outcome `shouldContain` "GHC-87110"
+        clientOutput outcome `shouldContain` name
 
   it "rejects a client that asks the library's types module for the picker's constructor function" $
     withClient (clientImporting ["import Hetoimasia.LuaEngine.Graphics.TerrainView.Types (mkPickRef)"] []) $ \compile → do

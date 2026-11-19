@@ -269,7 +269,10 @@ testRegistration = do
     awaitTargetStanding host a ((== Just 2) . windowAdopted)
     awaitTargetStanding host b ((== Just 1) . windowAdopted)
     atRest ← (,) <$> currentStanding host a <*> currentStanding host b
+    -- the host holds both registrations, then only the one not ended
+    atomically ((,) <$> vulkanSceneTargetRegistered host a <*> vulkanSceneTargetRegistered host b) >>= (`shouldBe` (True, True))
     unregistered ← atomically (unregisterVulkanSceneTarget host a)
+    atomically ((,) <$> vulkanSceneTargetRegistered host a <*> vulkanSceneTargetRegistered host b) >>= (`shouldBe` (False, True))
     again ← atomically (unregisterVulkanSceneTarget host a)
     late ← publishNow host a 44
     -- What a had adopted is released once it ended, each revision once.
@@ -293,6 +296,7 @@ testRegistration = do
   (foreignAnswer, foreignUnregistered, own) ← runRig foreignRig $ \host _ → do
     awaitReady host
     mine ← registered host
+    atomically ((,) <$> vulkanSceneTargetRegistered host a <*> vulkanSceneTargetRegistered host mine) >>= (`shouldBe` (False, True))
     answer ← publishNow host a 1
     gone ← atomically (unregisterVulkanSceneTarget host a)
     pure (answer, gone, mine)

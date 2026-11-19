@@ -11,13 +11,13 @@
 -- @terrain views@ subgroup draws.
 module Test.LuaEngine.Graphics.TerrainViews (spec) where
 
-import Control.Concurrent (killThread, myThreadId, newEmptyMVar, putMVar, takeMVar)
+import Control.Concurrent (killThread, myThreadId, newEmptyMVar, putMVar, takeMVar, tryPutMVar)
 import Control.Exception (MaskingState (Unmasked), getMaskingState)
 import Control.Concurrent.STM
 import Data.IORef (atomicModifyIORef', newIORef, readIORef)
 import GHC.Conc (unsafeIOToSTM)
 import Control.Exception (SomeException, displayException, finally, throwIO, try)
-import Control.Monad (forM_, forever, join, unless, void, when)
+import Control.Monad (forM, forM_, forever, join, unless, void, when)
 import qualified Data.ByteString as ByteString
 import qualified Data.ByteString.Char8 as BC
 import Data.Map.Strict (Map)
@@ -37,8 +37,9 @@ import Hetoimasia.LuaEngine.Graphics.Scene.Ledger (GraphicsScene (..), LedgerRea
 import Hetoimasia.LuaEngine.Graphics.Scene.Publish (HostAnswer (..))
 import Hetoimasia.LuaEngine.Graphics.Scene.World (SceneWorld (..), WorldTag (..))
 import Hetoimasia.LuaEngine.Graphics.TerrainView
-import Hetoimasia.LuaEngine.Graphics.TerrainView.Inputs (generationIdentity)
-import Hetoimasia.LuaEngine.Graphics.TerrainView.Owner (buildRegions, keepBuilt)
+import Hetoimasia.LuaEngine.Graphics.TerrainView.Qualification (withAdoptedPlan)
+import Hetoimasia.LuaEngine.Graphics.TerrainView.Inputs (changesExpansion, changesExpansionBound, generationIdentity, knowledgeExpansionBound)
+import Hetoimasia.LuaEngine.Graphics.TerrainView.Owner (buildRegions, keepBuilt, releaseEach)
 import Hetoimasia.LuaEngine.Graphics.TerrainView.Service (planDemandHeld, planHeld)
 import Hetoimasia.LuaEngine.Profile
   ( ByteLimit (..)
@@ -87,6 +88,7 @@ import qualified Hetoimasia.Terrain.Runtime as Runtime
 import Hetoimasia.Terrain.Runtime.Storage (filesystemOf, minHeadroomBytes, mkStorageConfig)
 import Hetoimasia.Terrain.Runtime.Store (StoreSpec (..), defaultStoreSpec, minAllowanceBytes)
 import Hetoimasia.Terrain.Residency (Bank (StagingBank), Ledger (..), LimitsSpec (..), RegionDemand (..), RegionInfo (..), bankLedger, coverageBox, mkLimits, modelJobs, modelRegions)
+import Hetoimasia.Terrain.Changes (ChangeLimits (..), changesBytes, changesFromIntervals)
 import Hetoimasia.Terrain.Shape (ViewFacing (..))
 import Hetoimasia.Terrain.Source (CellSpec (..), LayerSpec (..), PatchSpec (..), SourceSpec (..))
 import System.FilePath ((</>))
@@ -118,6 +120,8 @@ data Views = Views
     -- ^ The terrain client that holds the arena's lease.
   , vMetrics ∷ !(TVar TargetMetrics)
     -- ^ What every test target draws at; an example changes it as a resize or a content-scale change would.
+  , vTaking ∷ !(TVar Bool)
+    -- ^ The session's admission the views are given: an example closes it as the session's end would.
   }
 
 spec ∷ Spec
@@ -586,11 +590,20 @@ stages = describe "stages and the owner" $ do
     charged ← atomically (accountCharged account)
     toInteger charged `shouldSatisfy` (>= sum kept)
 
-  it "admits at most its cap of regions, leaving the rest of its visible demand pending, and its maximum admitted cost fits the production bank" $
+  it "admits at most its cap of regions, leaving the rest of its visible demand pending, and its cost figures follow admission's obligations" $
     withViewsConfig testConfig {tvAdmitRegions = 4} $ \v → do
-      -- the default cap's copies and inputs fit the production bank
-      admittedCostBound defaultTerrainViewsConfig `shouldSatisfy` (<= m1RenderAccountBytes)
       tvAdmitRegions defaultTerrainViewsConfig `shouldBe` 2048
+      -- the most: each region's knowledge of more than one class in every column with a run for each of its 32 levels
+      -- (256 x (96 + 80 x 32) bytes), and the removal index at the change limits' most (here 4096 intervals in one
+      -- region's columns: 256 x 48 + 4096 x 16 bytes)
+      knowledgeExpansionBound `shouldBe` 679936
+      changesExpansionBound (ChangeLimits 4096) 1 `shouldBe` 77824
+      let regions = tvAdmitRegions defaultTerrainViewsConfig
+      admittedCostBound defaultTerrainViewsConfig
+        `shouldBe` (uniformInputsCost regions + knowledgeExpansionBound * fromIntegral regions + changesExpansionBound (tvChangeLimits defaultTerrainViewsConfig) regions)
+      preparationCost defaultTerrainViewsConfig 1 `shouldSatisfy` (> uniformInputsCost 1 + knowledgeExpansionBound)
+      -- terrain uniform per region and unedited: the default cap's copies and inputs fit the production bank
+      uniformInputsCost regions `shouldSatisfy` (<= m1RenderAccountBytes)
       view ← attached v 1
       reading ← bounded . atomically $ readView view >>= \r → if readingUnadmitted r > 0 && readingStagedBytes r == 0 && readingPhase r == PhasePublished then pure r else retry
       readingAdmitted reading `shouldSatisfy` (\n → n > 0 && n <= 4)
@@ -2078,6 +2091,203 @@ stagesAndReaders = describe "stages, waits and readers" $ do
       Camera.camFacing <$> atomically (viewCameraState view) `shouldReturn` FaceEast
       closeView view
 
+  it "keeps a plan read across its view's close, with its pin, its charge and its style, until the reader lets go, and hands the target back at once" $
+    withViews $ \v → do
+      view ← attached v 1
+      first' ← awaitPublished v 1
+      adoptNow (vModel v) 1 `shouldReturn` Adopted first'
+      _ ← releasePass (vModel v)
+      quiescent v
+      inside ← newEmptyMVar
+      gate ← newEmptyMVar
+      withOwnedThread (withAdoptedPlan view (\plan → putMVar inside (isJust plan) >> takeMVar gate)) $ \_ readerDone → do
+        takeMVar inside `shouldReturn` True
+        (`finally` void (tryPutMVar gate ())) $ do
+          bounded (closeView view)
+          atomically (claimOf (vClaims v) 1) `shouldReturn` Nothing
+          -- the read plan's pin, its bytes and the parents its coverage reads stay while it is read
+          reading ← atomically (readView view)
+          readingPins reading `shouldBe` 1
+          readingPinnedBytes reading `shouldSatisfy` (> 0)
+          atomically (viewHoldsStyle view) `shouldReturn` True
+          -- a reader cannot start on a closed view
+          withAdoptedPlan view (pure . isJust) `shouldReturn` False
+        bounded readerDone
+      reading ← atomically (readView view)
+      readingPins reading `shouldBe` 0
+      atomically (viewHoldsStyle view) `shouldReturn` False
+
+  it "wakes a preparation waiting on its pins when one reader starts as another ends, with no adoption between" $ do
+    armed ← newTVarIO False
+    held ← newTVarIO False
+    opened ← newTVarIO False
+    -- the worker is held inside another view's close, once armed, so both readers change before it looks again
+    let holdAt _ name = when (name == "closed") $ do
+          holding ← atomically (readTVar armed <* writeTVar armed False)
+          when holding $ atomically (writeTVar held True) >> atomically (readTVar opened >>= check)
+    withViewsConfig testConfig {tvOnTransfer = holdAt} $ \v → (`finally` atomically (writeTVar opened True)) $ do
+      view ← attached v 1
+      first' ← awaitPublished v 1
+      adoptNow (vModel v) 1 `shouldReturn` Adopted first'
+      _ ← releasePass (vModel v)
+      quiescent v
+      demandResident v view
+      insideA ← newEmptyMVar
+      gateA ← newEmptyMVar
+      withOwnedThread (withAdoptedPlan view (\_ → putMVar insideA () >> takeMVar gateA)) $ \_ readerADone → (`finally` void (tryPutMVar gateA ())) $ do
+        takeMVar insideA
+        removeWith v (tileAt 9 9 3) Nothing `shouldReturn` Right True
+        second ← awaitPublished' v 1 (first' + 1)
+        adoptNow (vModel v) 1 `shouldReturn` Adopted second
+        _ ← releasePass (vModel v)
+        bounded (atomically (readView view >>= check . (== 2) . readingPins))
+        -- a third revision needs a third pin: it waits while reader A holds the first
+        removeWith v (tileAt 10 9 3) Nothing `shouldReturn` Right True
+        bounded (atomically (readView view >>= check . readingWaiting))
+        modelWindow (vModel v) 2
+        other ← attached v 2
+        _ ← awaitPublished v 2
+        atomically (writeTVar armed True)
+        withOwnedThread (closeView other) $ \_ otherClosed → do
+          bounded (atomically (readTVar held >>= check))
+          -- reader B starts on the adopted second revision and reader A ends: the readers' total and the adoption are
+          -- what they were, but the first revision's pin can now go
+          insideB ← newEmptyMVar
+          gateB ← newEmptyMVar
+          withOwnedThread (withAdoptedPlan view (\_ → putMVar insideB () >> takeMVar gateB)) $ \_ readerBDone → (`finally` void (tryPutMVar gateB ())) $ do
+            takeMVar insideB
+            putMVar gateA ()
+            bounded readerADone
+            atomically (writeTVar opened True)
+            bounded otherClosed
+            _ ← awaitPublished' v 1 (second + 1)
+            putMVar gateB ()
+            bounded readerBDone
+      closeView view
+
+  it "closes every view and hands its target back once the session's admission closes, while the scope's body runs on" $
+    withViews $ \v → do
+      view ← attached v 1
+      _ ← awaitPublished v 1
+      quiescent v
+      atomically (writeTVar (vTaking v) False)
+      bounded (atomically (viewClosed view >>= check))
+      atomically (claimOf (vClaims v) 1) `shouldReturn` Nothing
+      atomically (viewHoldsStyle view) `shouldReturn` False
+      modelWindow (vModel v) 2
+      outcome ← inInstance (vComp v) (vVm v) "i" (attachView (vViews v) (requestFor v (target v 2)))
+      either (`shouldBe` AttachStopped) (const (expectationFailure "an attachment was taken after the admission closed")) outcome
+
+  it "closes a view before the attachments queued behind it, however many there are" $ do
+    commits ← newCommitHold
+    order ← newIORef ([] ∷ [Text.Text])
+    let note event = atomicModifyIORef' order (\seen → (seen <> [event], ()))
+        noteClose _ name = when (name == "closed") (note "close")
+    withViewsConfig testConfig {tvBeforeAttachCommit = holdCommit commits, tvOnTransfer = noteClose} $ \v → do
+      view ← attached v 1
+      _ ← awaitPublished v 1
+      quiescent v
+      -- the worker is held inside an attachment to a second window while requests for the first queue behind it
+      armCommitHold commits
+      modelWindow (vModel v) 2
+      second ← inInstance (vComp v) (vVm v) "i" (attachView (vViews v) (requestFor v (target v 2))) >>= either (fail . show) pure
+      awaitCommitHeld commits
+      let noted = (target v 1) {vtUsable = unsafeIOToSTM (note "attach") >> vtUsable (target v 1)}
+      queued ← forM [1 .. 3 ∷ Int] $ \_ → inInstance (vComp v) (vVm v) "i" (attachView (vViews v) (requestFor v noted)) >>= either (fail . show) pure
+      withOwnedThread (closeView view) $ \_ closed → do
+        bounded (atomically (viewClosing view >>= check))
+        openCommitHold commits
+        bounded closed
+      settled ← mapM (bounded . awaitAttach) (second : queued)
+      take 1 <$> readIORef order `shouldReturn` ["close"]
+      forM_ settled $ \case
+        SettledOk opened' → closeView opened'
+        _ → pure ()
+
+  it "joins its worker and ends its views however its stopping hook ends, raising the hook's failure after" $ do
+    stopped ← newTVarIO Nothing
+    let raising = throwIO (userError "the stopping hook raised")
+    outcome ← try . withViewsConfig testConfig {tvStopping = raising} $ \v → do
+      view ← attached v 1
+      _ ← awaitPublished v 1
+      quiescent v
+      atomically (writeTVar stopped (Just (view, vViews v)))
+    case outcome of
+      Left (failure ∷ SomeException) → displayException failure `shouldContain` "the stopping hook raised"
+      Right () → expectationFailure "the stopping hook's failure was not raised"
+    Just (view, views) ← readTVarIO stopped
+    -- the scope's end ran the service's end before it raised: the view is closed and its regions retired
+    atomically (viewClosed view) `shouldReturn` True
+    atomically (terrainViewsRetiring views) `shouldReturn` []
+
+  it "completes a close that fails at the service's end: the view leaves the service closed and its parents are released" $ do
+    armed ← newTVarIO False
+    kept ← newTVarIO Nothing
+    let raiseAt _ name = when (name == "closed") $ do
+          raising ← atomically (readTVar armed <* writeTVar armed False)
+          when raising (throwIO (userError "the close's seam raised"))
+    withViewsConfig testConfig {tvOnTransfer = raiseAt, tvStopping = atomically (writeTVar armed True)} $ \v → do
+      view ← attached v 1
+      _ ← awaitPublished v 1
+      quiescent v
+      atomically (writeTVar kept (Just (view, vViews v)))
+    Just (view, views) ← readTVarIO kept
+    atomically (viewClosed view) `shouldReturn` True
+    atomically (viewHoldsStyle view) `shouldReturn` False
+    atomically (terrainViewsFailures views) >>= (`shouldSatisfy` any ("a view's close failed" `Text.isInfixOf`))
+
+  it "charges the removal index its copies' removed intervals make, at the index's own figures, before making it" $
+    withViews $ \v → do
+      -- fragmented removals: cells in several columns, and separated cells in one column (a cell already air removes
+      -- nothing, so the example counts those that did)
+      removals ← forM ([tileAt x 9 3 | x ← [9 .. 14]] <> [tileAt 9 9 z | z ← [5, 7]]) $ \tile → removeWith v tile Nothing
+      length (filter (== Right True) removals) `shouldSatisfy` (>= 3)
+      request ← Runtime.requestRegionSnapshot (_vTerrain v) (vArena v) [RegionCoord 0 0 0] >>= either (fail . show) pure
+      borrow ← Runtime.await (_vTerrain v) request >>= either (fail . show) pure
+      let snapshot = Runtime.regionBorrowSnapshot borrow
+          removed = [interval | region ← Runtime.regionSnapshotRegions snapshot, Runtime.PartReady intervals ← [Runtime.regionTerrain snapshot region], interval ← intervals]
+          charged = changesExpansion snapshot
+      Runtime.releaseRegionBorrow (_vTerrain v) borrow
+      index ← either (fail . show) pure (changesFromIntervals (tvChangeLimits testConfig) removed)
+      changesBytes index `shouldSatisfy` (>= 3 * 64)
+      charged `shouldSatisfy` (>= fromIntegral (changesBytes index))
+      -- a view whose copies hold those removals is charged for the index beside each region's fixed inputs
+      view ← attached v 1
+      _ ← awaitPublished v 1
+      quiescent v
+      bounded (atomically (readView view >>= check . (== 0) . readingStagedBytes))
+      reading ← atomically (readView view)
+      readingFactsBytes reading `shouldSatisfy` (>= 25872 * fromIntegral (readingAdmitted reading) + charged)
+      closeView view
+
+  it "answers each chunk of a release on its own: a raise is that chunk's failure, and the chunks after it are released" $ do
+    released ← newIORef ([] ∷ [ChunkRef])
+    let releaseOne chunk
+          | chunk == chunkRef 2 1 = throwIO (userError "the release raised")
+          | otherwise = Right () <$ atomicModifyIORef' released (\seen → (seen <> [chunk], ()))
+    outcomes ← releaseEach releaseOne [chunkRef 1 1, chunkRef 2 1, chunkRef 3 1]
+    map (either (const False) (const True)) outcomes `shouldBe` [True, False, True]
+    readIORef released `shouldReturn` [chunkRef 1 1, chunkRef 3 1]
+
+  it "takes a manual pan asked before its first facts, and publishes its first revision with the slice and the pan" $ do
+    let axis = either (error . show) id . axisFromInteger
+    seam ← newStageSeam
+    opened ← newTVarIO False
+    withViewsConfig testConfig {tvOnStage = seamHook seam} $ \v → do
+      armSeam seam 1 "copying" 1 (SeamHold opened)
+      view ← attached v 1
+      awaitSeamFired seam
+      before' ← atomically (viewCameraState view)
+      (`finally` atomically (writeTVar opened True)) $ do
+        -- a slice makes the camera manual: its pan follows nothing, so it needs no facts; an invalid pan is refused
+        atomically (updateCamera view (CameraIntent [Camera.SelectSlice (axis 5), Camera.Pan 3 0])) `shouldReturn` Right ()
+        atomically (updateCamera view (CameraIntent [Camera.Pan (0 / 0) 0])) >>= (`shouldSatisfy` either (const True) (const False))
+      _ ← awaitPublished v 1
+      after' ← atomically (viewCameraState view)
+      Camera.camMode after' `shouldBe` Camera.Manual (axis 5)
+      axisValue (Camera.camAnchorX after') `shouldBe` axisValue (Camera.camAnchorX before') + 3
+      closeView view
+
   it "never wakes its worker for another holder's loads while its views wait mid-stage: the selection watches no terrain state" $ do
     evaluations ← newIORef (0 ∷ Int)
     withViews $ \v → do
@@ -2167,6 +2377,7 @@ withViewsProbed order probe terrainConfig source config body = do
         withTerrainProbed probe terrainConfig source (cpAccount comp) $ \terrain client arena → do
           claims ← newSceneClaims
           metricsVar ← newTVarIO metrics
+          taking ← newTVarIO True
           owner ← newFakeOwner model
           initial ← prepare initialGraphicsScene
           let ports =
@@ -2181,9 +2392,9 @@ withViewsProbed order probe terrainConfig source config body = do
                   , portTerrain = terrain
                   , portClient = client
                   , portAccount = cpAccount comp
-                  , portTaking = pure True
+                  , portTaking = readTVar taking
                   }
-          let run views = body (Views comp vm fake model terrain arena views owner claims (cpAccount comp) style colourKey normalKey client metricsVar)
+          let run views = body (Views comp vm fake model terrain arena views owner claims (cpAccount comp) style colourKey normalKey client metricsVar taking)
           withOwnedThread (fakeOwnerLoop owner) $ \_ _ → case order of
             HostFirst → withTerrainViews config ports (\views → run views `finally` dissolve model)
             ViewsFirst → withTerrainViews config ports run `finally` dissolve model

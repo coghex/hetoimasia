@@ -105,15 +105,34 @@ library internal
 -- The terrain-view adapter (TRA-9): a terrain view's attachment, preparation, retained regions, publication, picking
 -- and close over the graphics owner this package composes and the terrain service it is lent. A public sub-library of
 -- its own, so the terrain packages reach the graphics composition only through it: the main library imports no terrain
--- package, and no terrain package imports this one.
+-- package, and no terrain package imports this one. It re-exports the adapter's public modules from its implementation
+-- (`terrain-views-core`), and not the implementation's `Service` or `Qualification` modules: a client reaches no
+-- adopted plan beyond the bracket that pins it.
 library terrain-views
     import: language
     visibility: public
+    build-depends:
+        hetoimasia-lua-engine-graphics:terrain-views-core
+    reexported-modules:
+        Hetoimasia.LuaEngine.Graphics.TerrainView,
+        Hetoimasia.LuaEngine.Graphics.TerrainView.Inputs,
+        Hetoimasia.LuaEngine.Graphics.TerrainView.Owner,
+        Hetoimasia.LuaEngine.Graphics.TerrainView.Style,
+        Hetoimasia.LuaEngine.Graphics.TerrainView.Target,
+        Hetoimasia.LuaEngine.Graphics.TerrainView.Types
+
+-- The terrain-view adapter's implementation, private to this package: `terrain-views` re-exports its public modules,
+-- and only this package's suites reach the rest, the qualification module among them (the adopted plan, read under its
+-- pin).
+library terrain-views-core
+    import: language
+    visibility: private
     hs-source-dirs: terrain-views
     exposed-modules:
         Hetoimasia.LuaEngine.Graphics.TerrainView
         Hetoimasia.LuaEngine.Graphics.TerrainView.Inputs
         Hetoimasia.LuaEngine.Graphics.TerrainView.Owner
+        Hetoimasia.LuaEngine.Graphics.TerrainView.Qualification
         Hetoimasia.LuaEngine.Graphics.TerrainView.Service
         Hetoimasia.LuaEngine.Graphics.TerrainView.Style
         Hetoimasia.LuaEngine.Graphics.TerrainView.Target
@@ -243,6 +262,7 @@ test-suite lua-engine-graphics-tests
         hetoimasia-terrain-render-2d:terrain-material ==0.1.0.0,
         hetoimasia-terrain-runtime ==0.1.0.0,
         hetoimasia-lua-engine-graphics:terrain-views,
+        hetoimasia-lua-engine-graphics:terrain-views-core,
         hetoimasia-render-2d ==0.1.0.0,
         hetoimasia-render-2d-oracle ==0.1.0.0,
         hetoimasia-render-2d-vulkan ==0.1.0.0,
@@ -344,4 +364,5 @@ test-suite lua-engine-graphics-native-tests
         hetoimasia-terrain-render-2d:terrain-material ==0.1.0.0,
         hetoimasia-terrain-runtime ==0.1.0.0,
         hetoimasia-lua-engine-graphics:terrain-views,
+        hetoimasia-lua-engine-graphics:terrain-views-core,
         hetoimasia-test-support ==0.1.0.0

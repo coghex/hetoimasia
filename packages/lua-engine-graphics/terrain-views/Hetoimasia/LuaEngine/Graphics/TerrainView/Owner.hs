@@ -16,12 +16,13 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView.Owner
   , productionViewOwner
   , buildRegions
   , keepBuilt
+  , releaseEach
   ) where
 
 import Control.Concurrent.STM (STM, TVar, atomically, catchSTM, modifyTVar', newTVar, readTVar, retry, throwSTM)
 import Control.Exception (Exception, SomeAsyncException, displayException, fromException, mask_, throwIO, try)
 import Data.Functor ((<&>))
-import Control.Monad (forM, forM_, void)
+import Control.Monad (forM_, void)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import Data.Word (Word64)
@@ -84,7 +85,8 @@ data ViewOwner = ViewOwner
   , ownerRelease ∷ [ChunkRef] → STM (Either OwnerRefusal (Ticket [Either Text ()]))
     -- ^ Release these chunks' buffers on the owner: only chunks no revision lists or ever listed, or that no adoption
     -- holds behind a met barrier, and only once their upload has ended, so the release is never deferred and its answer
-    -- proves the buffer gone.
+    -- proves the buffer gone. Each chunk is answered on its own: one whose release raised is its own failure, and the
+    -- chunks after it are still released.
   , ownerBarrier ∷ [ChunkRef] → STM (Either OwnerRefusal (STM (Maybe Bool)))
     -- ^ Mark these chunks released for publication's check and ask the host's release barrier, in one transaction that
     -- never waits: every revision published before the request must be adopted before it is met. The answer is a
@@ -127,7 +129,7 @@ productionViewOwner host graphics = do
               (\chunk → atomically (modifyTVar' built (chunk :)))
               regions
           pure (keepBuilt built <$> submitted)
-      , ownerRelease = \chunks → submit host $ VulkanAction $ \construction → forM chunks (\chunk → either (Left . Text.pack . show) Right <$> releaseChunkNow (hostBuilders host construction) retained chunk)
+      , ownerRelease = \chunks → submit host $ VulkanAction $ \construction → releaseEach (\chunk → either (Left . Text.pack . show) Right <$> releaseChunkNow (hostBuilders host construction) retained chunk) chunks
       , ownerBarrier = \chunks →
           requestVulkanRelease host (VulkanAction (\_ → pure ())) >>= \case
             Left refusal → pure (Left (refusalOf refusal))
@@ -174,6 +176,15 @@ buildRegions build record = go []
       try action >>= \case
         Left failure | Just (_ ∷ SomeAsyncException) ← fromException failure → throwIO failure
         result → pure result
+
+-- | Release each chunk in order, answering each one's own outcome: a release that raises synchronously is that chunk's
+-- failure, and the chunks after it are still released, since each release is independent of the others.
+releaseEach ∷ (ChunkRef → IO (Either Text ())) → [ChunkRef] → IO [Either Text ()]
+releaseEach release = mapM $ \chunk →
+  try (release chunk) >>= \case
+    Left failure | Just (_ ∷ SomeAsyncException) ← fromException failure → throwIO failure
+    Left failure → pure (Left ("the release raised: " <> Text.pack (displayException failure)))
+    Right outcome → pure outcome
 
 -- | A build's ticket that keeps what was built: when the owner's action ended without answering (it raised, or the
 -- owner ended), the chunks it recorded are answered as a failure naming them, for the caller to retire; with none, the

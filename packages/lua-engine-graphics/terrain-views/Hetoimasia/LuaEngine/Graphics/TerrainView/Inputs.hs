@@ -35,6 +35,9 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView.Inputs
   , planInputs
   , plannerKnowledge
   , knowledgeExpansion
+  , knowledgeExpansionBound
+  , changesExpansion
+  , changesExpansionBound
   , knowledgeState
   ) where
 
@@ -46,8 +49,8 @@ import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Word (Word64)
 import Hetoimasia.Terrain.Cell (Column (..), ZRange, mkZRange)
-import Hetoimasia.Terrain.Changes (ChangeError, ChangeLimits, changesFromIntervals)
-import Hetoimasia.Terrain.Coordinate (RegionCoord (..), axisFromInteger)
+import Hetoimasia.Terrain.Changes (ChangeError, ChangeLimits (..), changeColumnBytes, changeIntervalBytes, changesFromIntervals)
+import Hetoimasia.Terrain.Coordinate (RegionCoord (..), axisFromInteger, regionLevels)
 import qualified Hetoimasia.Terrain.Discovery as D
 import Hetoimasia.Terrain.Render2D.Facts (Availability, ChunkKey (..), TerrainFacts (..), Versions (..), mkAvailability)
 import Hetoimasia.Terrain.Render2D.Knowledge (CellKnowledge (..), Knowledge, KnowledgeError, KnowledgeSpec (..), mkKnowledge)
@@ -195,9 +198,37 @@ knowledgeExpansion snapshot =
     uniform known = case D.regionKnowledgeClasses known of
       [[_]] → True
       _ → False
-    -- a column's map entry and its key, and one run's entry in its list (two bounds and a state)
-    columnEntryBytes = 96
-    runEntryBytes = 80
+
+-- A column's map entry and its key, and one run's entry in its list (two bounds and a state).
+columnEntryBytes, runEntryBytes ∷ Word64
+columnEntryBytes = 96
+runEntryBytes = 80
+
+-- | The most 'knowledgeExpansion' can be for one region: every column of more than one class, with a run for each of
+-- the region's levels.
+knowledgeExpansionBound ∷ Word64
+knowledgeExpansionBound = columnsPerRegion * (columnEntryBytes + runEntryBytes * fromIntegral regionLevels)
+
+columnsPerRegion ∷ Word64
+columnsPerRegion = fromIntegral (length (regionColumns (RegionCoord 0 0 0)))
+
+-- | The bytes the removal index made from this copy holds ('planInputs' makes one over every copy): an entry for each
+-- column with a removed interval and one for each interval, at the terrain package's own accounted figures (those of
+-- @changesBytes@). Counted from the copy, without making the index, so it is charged before it is made; intervals
+-- the index would merge are counted apart, so it never counts less than the index holds.
+changesExpansion ∷ RegionSnapshot → Word64
+changesExpansion snapshot =
+  let intervals = [interval | region ← regionSnapshotRegions snapshot, PartReady removed ← [regionTerrain snapshot region], interval ← removed]
+      columns = Set.size (Set.fromList (map fst intervals))
+   in fromIntegral (columns * changeColumnBytes + length intervals * changeIntervalBytes)
+
+-- | The most 'changesExpansion' can be over copies of this many regions that 'planInputs' accepts: the change limits'
+-- intervals, each in a column of its own as far as the regions have columns.
+changesExpansionBound ∷ ChangeLimits → Int → Word64
+changesExpansionBound limits regions =
+  let intervals = max 0 (limitRemovedIntervals limits)
+      columns = min intervals (max 0 regions * fromIntegral columnsPerRegion)
+   in fromIntegral (columns * changeColumnBytes + intervals * changeIntervalBytes)
 
 -- | The planner's state of what discovery knows of a cell.
 knowledgeState ∷ D.CellKnowledge → CellKnowledge

@@ -228,6 +228,7 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , TargetBatchRefusal (..)
   , registerVulkanSceneTarget
   , unregisterVulkanSceneTarget
+  , vulkanSceneTargetRegistered
   , publishVulkanTargetScene
   , recordVulkanTargetBatch
   , defaultTargetCapacity
@@ -447,6 +448,7 @@ import Hetoimasia.GPU.Vulkan.GLFW.Internal.Targets
   , targetsHeld
   , targetsRevisions
   , unregisterTarget
+  , targetRegistered
   )
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Capture
   ( CaptureMode (..)
@@ -1216,6 +1218,15 @@ registerVulkanSceneTarget host = case vulkanController host of
 -- until then.
 unregisterVulkanSceneTarget ∷ VulkanHost scene → OffscreenTargetId → STM Bool
 unregisterVulkanSceneTarget host = unregisterTarget (vulkanTargets host)
+
+-- | Whether this host holds this exact offscreen registration now: 'False'
+-- once it is unregistered, and for an identity this host never issued
+-- (another host's). It writes nothing, so it composes with a caller's own
+-- checks as one fact; it reads the registry that every publication writes, so
+-- a transaction that waits only for the target's end should wait on a cell of
+-- the registrant's instead.
+vulkanSceneTargetRegistered ∷ VulkanHost scene → OffscreenTargetId → STM Bool
+vulkanSceneTargetRegistered host = targetRegistered (vulkanTargets host)
 
 -- | Publish a prepared scene to an offscreen target, as one transaction that
 -- never waits for GPU work, adopted capacity or a displayed frame: the

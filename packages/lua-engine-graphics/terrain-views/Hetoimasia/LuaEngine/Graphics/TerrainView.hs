@@ -97,9 +97,10 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView
   , pickResidency
   , pickView
   , pickPrecondition
-  , withAdoptedPlan
   , admittedCostBound
   , preparationCost
+  , admittedInputsCost
+  , uniformInputsCost
   ) where
 
 import Control.Concurrent.STM (STM)

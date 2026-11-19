@@ -310,7 +310,8 @@ applyCommand ∷ CameraConfig → TerrainFacts → Command → CameraState → E
 applyCommand config facts command camera0 = fromMaybe (Left InvalidConfig) (applyCommandOn config (Just facts) command camera0)
 
 -- | Apply a command that reads no terrain facts, before any are known, exactly as 'applyCommand' would: a zoom, a
--- facing, a turn or a slice. 'Nothing' for a pan, which follows the surface, and a jump, which both need facts.
+-- facing, a turn, a slice, an invalid pan (its error) and a pan of a manual camera, which follows nothing. 'Nothing' for
+-- a pan of a following camera, which resolves the surface, and a jump: both need facts.
 applyCommandWithoutFacts ∷ CameraConfig → Command → CameraState → Maybe (Either CameraError Step)
 applyCommandWithoutFacts config = applyCommandOn config Nothing
 
@@ -318,9 +319,12 @@ applyCommandOn ∷ CameraConfig → Maybe TerrainFacts → Command → CameraSta
 applyCommandOn config known command camera0
   | not (validCameraConfig config) = Just (Left InvalidConfig)
   | otherwise = case command of
-      Pan dx dy → known <&> \facts → do
-        moved ← pan dx dy camera
-        pure (stamp camera0 (followIfFollowing config facts moved))
+      -- the displacement is checked before anything else; only a following camera needs the facts
+      Pan dx dy → case pan dx dy camera of
+        Left failure → Just (Left failure)
+        Right moved → case csMode moved of
+          Manual _ → Just (Right (plain moved))
+          Following → known <&> \facts → Right (stamp camera0 (followIfFollowing config facts moved))
       ZoomBy factor
         | bad factor → Just (Left NonFiniteInput)
         | otherwise → Just (Right (plain (camera {csZoom = clampZoom config (csZoom camera * factor)})))

@@ -138,6 +138,10 @@ data WindowTarget scene = WindowTarget
     -- atomic step: nothing that closes between them can be missed. It never waits.
   , targetUsable ∷ STM Bool
     -- ^ Whether this incarnation's target is still the admitted, attached one.
+  , targetRetired ∷ STM Bool
+    -- ^ Whether this incarnation has left its attached slot: read from the incarnation's own lifecycle cell, which
+    -- changes only on its lifecycle transitions (never on the owner's rounds, frames or publications), so a transaction
+    -- that waits for the window's end wakes for nothing else. 'False' while 'targetUsable' can still be 'True'.
   }
 
 -- | The input of one window incarnation, as the Lua input adapter may reach it: the window's one reader, its admission control
@@ -357,6 +361,7 @@ target vulkan var token = do
               , targetPublish = publishVulkanWindowScene vulkan (madeWindow made)
               , targetPublishSTM = publishGraphicsWindowScene (vulkanGraphicsOwner vulkan) (madeWindow made)
               , targetUsable = (== StandingUsable) <$> standing vulkan var token
+              , targetRetired = (/= SlotAttached) . observedSlot <$> readGraphicsService service
               }
         _ → Nothing
     _ → pure Nothing

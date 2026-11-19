@@ -11,9 +11,12 @@
 -- texture examples of this suite assert that no window exists.
 module Test.LuaEngine.Graphics.Native.Windows (spec) where
 
-import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, retry)
-import Control.Monad (forM_, unless)
-import Data.IORef (newIORef, readIORef, writeIORef)
+import Control.Concurrent.STM (STM, TVar, atomically, check, modifyTVar', newTVarIO, readTVar, readTVarIO, retry)
+import Control.Concurrent (forkIO, killThread, newEmptyMVar, takeMVar, tryPutMVar)
+import Control.Exception (finally)
+import Control.Monad (forM_, unless, void)
+import Data.IORef (atomicModifyIORef', newIORef, readIORef, writeIORef)
+import GHC.Conc (unsafeIOToSTM)
 import qualified Data.Text as Text
 import qualified Data.Text.Read as Text
 import Hetoimasia.Foundation.Messaging.Payload (prepare)
@@ -23,7 +26,7 @@ import Hetoimasia.LuaEngine.Graphics.Scene.Ledger (GraphicsScene, initialGraphic
 import Hetoimasia.LuaEngine.Graphics.Window.Host (PortReading (..), WindowTarget (..), newHostPort)
 import Hetoimasia.LuaEngine.Graphics.Window.Port (Fatal, Port (..), WindowToken (..))
 import Hetoimasia.LuaEngine.Graphics.Window.Provider
-import Hetoimasia.Runtime.GLFW (TargetStanding (..), WindowScenePublication (..), hostWindowIdentities, readTargetStanding)
+import Hetoimasia.Runtime.GLFW (OwnerStatus (..), TargetStanding (..), WindowScenePublication (..), awaitOwnerRound, hostWindowIdentities, readTargetStanding)
 import System.Timeout (timeout)
 import Test.HUnit.Lang (assertFailure)
 import Test.Hspec
@@ -125,10 +128,28 @@ publishesEmptyScene env comp vm port name = do
   target ← maybe (assertFailure "a ready window offered no scene publication") pure found
   atomically (targetUsable target) >>= (`shouldBe` True)
   readTargetStanding (vulkanGraphicsOwner (envHost env)) (targetAttachment target) `shouldReturnSTM` Just TargetUsable
-  scene ← prepare initialGraphicsScene
-  targetPublish target scene >>= \case
-    WindowScenePublished _ _ → pure ()
-    other → assertFailure ("the scene was not accepted: " <> show other)
+  -- the incarnation's retirement cell: not retired while attached, and a transaction waiting on it is not woken by the
+  -- owner's rounds, which publications here make (it counts its own evaluations)
+  atomically (targetRetired target) >>= (`shouldBe` False)
+  evaluations ← newIORef (0 ∷ Int)
+  started ← newEmptyMVar
+  let owner = vulkanGraphicsOwner (envHost env)
+      watch = atomically $ do
+        unsafeIOToSTM (atomicModifyIORef' evaluations (\n → (n + 1, ())) >> void (tryPutMVar started ()))
+        targetRetired target >>= check
+  watcher ← forkIO watch
+  (`finally` killThread watcher) $ do
+    takeMVar started
+    before' ← readIORef evaluations
+    forM_ [1 .. 3 ∷ Int] $ \_ → do
+      seen ← statusRounds <$> atomically (awaitOwnerRound owner 0)
+      scene ← prepare initialGraphicsScene
+      targetPublish target scene >>= \case
+        WindowScenePublished _ _ → pure ()
+        other → assertFailure ("the scene was not accepted: " <> show other)
+      void (atomically (awaitOwnerRound owner seen))
+    after' ← readIORef evaluations
+    (after' - before') `shouldSatisfy` (<= 1)
   where
     shouldReturnSTM action expected = atomically action >>= (`shouldBe` expected)
 

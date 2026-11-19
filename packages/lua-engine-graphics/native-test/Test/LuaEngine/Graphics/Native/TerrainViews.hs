@@ -70,6 +70,7 @@ import Hetoimasia.GPU.Model.Identity (BatchId)
 import Hetoimasia.GPU.Vulkan.Native.Frames (CompletionHold (..))
 import Hetoimasia.GPU.Vulkan.Native.Recording (ticketBatch)
 import Hetoimasia.LuaEngine.Graphics.TerrainView
+import Hetoimasia.LuaEngine.Graphics.TerrainView.Qualification (withAdoptedPlan)
 import Hetoimasia.LuaEngine.Graphics.Texture (TextureGraphics (..), textureHandleOf)
 import Hetoimasia.LuaEngine.Graphics.Texture.Host (hostBuilders)
 import Hetoimasia.LuaEngine.Texture (RenderAccount)
@@ -183,6 +184,19 @@ fullSpec env = describe "terrain views (full)" $ do
         rendered ← renderJudged rig ("zoom " <> Text.pack (show zoom))
         pickAgreement rig view rendered >>= notePicks
         closeView view
+  it "refuses a view of an offscreen target this host no longer holds, taking nothing, though its registrant's cell says it has not retired" $
+    within 60 . withRig env $ \rig → do
+      let host = envHost (rgEnv rig)
+      other ← atomically (registerVulkanSceneTarget host) >>= either (\why → assertFailure ("the registration was refused: " <> show why)) pure
+      atomically (unregisterVulkanSceneTarget host other) >>= (`shouldBe` True)
+      atomically (writeTVar (rgMetrics rig) (metricsOf 64 64))
+      let ended = offscreenViewTarget host other (pure False) True (Just <$> readTVar (rgMetrics rig))
+      attaching ← inInstance (rgComp rig) (rgVm rig) "i" (attachView (rgViews rig) (requestOf rig ended)) >>= either (\why → assertFailure ("refused early: " <> show why)) pure
+      awaitAttach attaching >>= \case
+        SettledRefused AttachTargetUnusable → pure ()
+        _ → assertFailure "a view of an ended target was not refused as unusable"
+      atomically (claimOf (scenesClaims (envScenes (rgEnv rig))) (KeyOffscreen other)) `shouldReturn` Nothing
+
   it "draws a portrait target exactly, and a pick over the clear background finds nothing" $
     within 60 . withRig env $ \rig → do
       view ← attach rig (metricsOf 64 128)
@@ -398,7 +412,19 @@ attach rig metrics = do
   atomically (writeTVar (rgMetrics rig) metrics)
   let host = envHost (rgEnv rig)
       viewTarget = offscreenViewTarget host (rgTarget rig) (readTVar (rgRetired rig)) True (Just <$> readTVar (rgMetrics rig))
-      (colourKey, normalKey) = rgKeys rig
+  attaching ← inInstance (rgComp rig) (rgVm rig) "i" (attachView (rgViews rig) (requestOf rig viewTarget)) >>= either (\why → assertFailure ("refused: " <> show why)) pure
+  awaitAttach attaching >>= \case
+    SettledOk view → pure view
+    other → assertFailure ("the attachment did not succeed: " <> show (() <$ settledText other))
+  where
+    settledText = \case
+      SettledRefused why → Just why
+      _ → Nothing
+
+-- The rig's attachment request for a view of its arena on this target.
+requestOf ∷ Rig → ViewTarget SceneTargetKey → AttachRequest SceneTargetKey
+requestOf rig viewTarget =
+  let (colourKey, normalKey) = rgKeys rig
       axis = either (error . show) id . axisFromInteger
       request =
         AttachRequest
@@ -416,14 +442,7 @@ attach rig metrics = do
           , attachAnchor = (axis 8, axis 8, axis 3)
           , attachLight = defaultLightInput
           }
-  attaching ← inInstance (rgComp rig) (rgVm rig) "i" (attachView (rgViews rig) request) >>= either (\why → assertFailure ("refused: " <> show why)) pure
-  awaitAttach attaching >>= \case
-    SettledOk view → pure view
-    other → assertFailure ("the attachment did not succeed: " <> show (() <$ settledText other))
-  where
-    settledText = \case
-      SettledRefused why → Just why
-      _ → Nothing
+   in request
 
 standingOf ∷ Rig → STM (Maybe WindowSceneStanding)
 standingOf rig = Map.lookup (KeyOffscreen (rgTarget rig)) . sceneWindows <$> readVulkanSceneState (envHost (rgEnv rig))

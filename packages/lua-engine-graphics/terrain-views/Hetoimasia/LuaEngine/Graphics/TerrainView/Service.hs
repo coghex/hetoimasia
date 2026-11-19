@@ -79,6 +79,8 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView.Service
   , withAdoptedPlan
   , admittedCostBound
   , preparationCost
+  , admittedInputsCost
+  , uniformInputsCost
 
     -- * The account's figures (for the suites' exact checks)
   , planHeld
@@ -106,7 +108,7 @@ import Hetoimasia.Foundation.Resource (withResource)
 import Hetoimasia.LuaEngine.Graphics.Scene.Claims (Claim (..), SceneClaims, claimOf, markClaimPublished, releaseClaim, takeClaim)
 import Hetoimasia.LuaEngine.Graphics.Scene.Ledger (GraphicsScene, SceneLedger, ledgerChunkHeld, ledgerDropInterest, ledgerNewestAdopted, ledgerRetainInterest, worldGraphicsScene)
 import Hetoimasia.LuaEngine.Graphics.Scene.World (SceneWorld (..), WorldTag (..))
-import Hetoimasia.LuaEngine.Graphics.TerrainView.Inputs (CopySet, combineCopies, copyArena, copyContent, copyGeneration, copyKnowledge, copyRegions, copySnapshots, knowledgeExpansion, planInputs)
+import Hetoimasia.LuaEngine.Graphics.TerrainView.Inputs (CopySet, changesExpansion, changesExpansionBound, combineCopies, copyArena, copyContent, copyGeneration, copyKnowledge, copyRegions, copySnapshots, knowledgeExpansion, knowledgeExpansionBound, planInputs)
 import Hetoimasia.LuaEngine.Graphics.TerrainView.Internal.Pick (PickIdentity (..), PickRef (..))
 import Hetoimasia.LuaEngine.Graphics.TerrainView.Style
 import Hetoimasia.LuaEngine.Graphics.TerrainView.Types
@@ -338,9 +340,9 @@ data ViewState k = ViewState
     -- from, kept while they are kept, replaced by the next facts' charge and returned at close.
   }
 
--- What a preparation that could not start waits for: an adoption other than the one it saw (a pin is then freed), or
--- the target's metrics and the arena both available.
-data Blocked = BlockedOnAdoption !(Maybe Natural) !Int | BlockedOnMetrics
+-- What a preparation that could not start waits for: room among its pins (an adoption, a publication or a reader's end
+-- lets one go), or the target's metrics and the arena both available.
+data Blocked = BlockedOnPins | BlockedOnMetrics
 
 -- | A published plan kept for picking, with its identity and its CPU charge.
 data Pinned = Pinned
@@ -431,13 +433,13 @@ withTerrainViews config ports body = do
             )
         )
     )
-    ( \() → do
-        atomically (writeTVar (svOpen service) False)
-        tvStopping config
-        readMVar done
-        -- A worker that was cancelled did not run the service's end: run it here, so every view is still closed.
-        ended ← readTVarIO (svShutDown service)
-        unless ended (shutdown service)
+    ( \() →
+        -- the join and the end run however the stopping hook ends; its failure is raised after them
+        (atomically (writeTVar (svOpen service) False) >> tvStopping config) `finally` do
+          readMVar done
+          -- A worker that was cancelled did not run the service's end: run it here, so every view is still closed.
+          ended ← readTVarIO (svShutDown service)
+          unless ended (shutdown service)
     )
     (\() → body service)
 
@@ -886,7 +888,8 @@ closeView (TerrainView _ state) = do
   atomically (readTVar (vsClosed state) >>= check)
 
 -- | Whether the view still holds its style (its parents' interests, its asset snapshot and both coverage planes): until
--- its close releases it. Read-only.
+-- its close releases it, or, while a reader still reads one of its plans ('withAdoptedPlan'), until that reader's end.
+-- Read-only.
 viewHoldsStyle ∷ TerrainView k → STM Bool
 viewHoldsStyle (TerrainView _ state) = isJust <$> readTVar (vsStyle state)
 
@@ -913,14 +916,37 @@ runClose service state = do
     Runtime.closeView (portTerrain ports) (vsRuntimeView state)
     closeMain service state target
     transferSeam service state "closed"
-  -- the parents are released, then the view leaves the service and its close is announced, with no cancellation
-  -- between: a 'closeView' waiting on it never waits on a view nobody can find
+  closeTail service state
+
+-- The close's end: the parents are released (unless a reader still reads a pinned plan: its end releases them), then the
+-- view leaves the service and its close is announced, with no cancellation between: a 'closeView' waiting on it never
+-- waits on a view nobody can find.
+closeTail ∷ TerrainViews k → ViewState k → IO ()
+closeTail service state =
   uninterruptibleMask_ $ do
-    style ← atomically (readTVar (vsStyle state) <* writeTVar (vsStyle state) Nothing)
+    style ← atomically $ do
+      readers ← sum <$> readTVar (vsReaders state)
+      if readers > 0 then pure Nothing else readTVar (vsStyle state) <* writeTVar (vsStyle state) Nothing
     forM_ style releaseStyle
     atomically $ do
       modifyTVar' (svViews service) (Map.delete (vsId state))
       writeTVar (vsClosed state) True
+
+-- The service's end completes a close that failed: what the close had not done yet is done now, each part's failure kept
+-- as evidence, and the view leaves the service closed, so nothing that waits on it waits on a service that has ended.
+completeClose ∷ (Ord k, Show k) ⇒ TerrainViews k → ViewState k → IO ()
+completeClose service state = do
+  let ports = svPorts service
+      attempt what action =
+        trySync action >>= \case
+          Left (failure ∷ SomeException) → recordFailure service ("a view's close could not " <> what <> ": " <> Text.pack (displayException failure))
+          Right () → pure ()
+  handedBack ← (== PhaseClosed) <$> readTVarIO (vsPhase state)
+  unless handedBack $ do
+    attempt "abandon its stage" (abandonStage service state)
+    attempt "close its runtime view" (void (Runtime.clearViewDemand (portTerrain ports) (vsRuntimeView state)) >> Runtime.closeView (portTerrain ports) (vsRuntimeView state))
+    attempt "hand its target back" (closeMain service state (vsTarget state))
+  closeTail service state
 
 -- The close's main step: the jumps settle, the claim is handed back, the interests drop, the regions retire and every
 -- charge and payload the view keeps goes, in one transaction.
@@ -943,10 +969,12 @@ closeMain service state target = do
       _ → pure ()
     forM_ (Set.toList (vsStyleIds state)) (ledgerDropInterest (portLedger ports))
     regions ← readTVar (vsRegions state)
+    readers ← readTVar (vsReaders state)
     writeTVar (vsRegions state) Map.empty
     modifyTVar' (svRetiring service) (<> [Retiring (rgChunk region) (rgBytes region) (regionCpu region) RetireUnasked | region ← Map.elems regions])
     moveToService service state (sum (map regionCpu (Map.elems regions)))
-    writeTVar (vsPins state) Map.empty
+    -- a pin a reader still reads stays, and stays charged, until that reader's end ('withAdoptedPlan')
+    modifyTVar' (vsPins state) (Map.filterWithKey (\revision _ → Map.findWithDefault 0 revision readers > 0))
     writeTVar (vsFacts state) Nothing
     writeTVar (vsFactsCharge state) 0
     -- what the closed handle would otherwise keep reachable: its demand, its admission sets
@@ -956,11 +984,20 @@ closeMain service state target = do
     writeTVar (vsVisibleAdmitted state) Set.empty
     writeTVar (vsDemandBusy state) Nothing
     writeTVar (vsRetry state) Nothing
-    held ← readTVar (vsAccountHeld state)
-    when (held > 0) (accountRelease (portAccount ports) held)
-    writeTVar (vsAccountHeld state) 0
+    releaseUnread service state
     modifyTVar' (svReleases service) (+ 1)
     writeTVar (vsPhase state) PhaseClosed
+
+-- A closed view's account: what it holds beyond the pins readers still read goes back (all of it once none is read).
+releaseUnread ∷ TerrainViews k → ViewState k → STM ()
+releaseUnread service state = do
+  read' ← not . Map.null <$> readTVar (vsPins state)
+  if read'
+    then void (recharge service state)
+    else do
+      held ← readTVar (vsAccountHeld state)
+      when (held > 0) (accountRelease (portAccount (svPorts service)) held)
+      writeTVar (vsAccountHeld state) 0
 
 -- ---------------------------------------------------------------------------
 -- The worker
@@ -1002,12 +1039,17 @@ worker service = trySync loop
 nextWork ∷ (Ord k, Show k) ⇒ TerrainViews k → STM (Work k)
 nextWork service = do
   open ← readTVar (svOpen service)
-  if not open
+  -- the session's admission closing is terminal: the service ends as at its scope's end, so every view closes and hands
+  -- its target back while the scope's body still runs
+  taking ← portTaking (svPorts service)
+  if not (open && taking)
     then pure WorkStop
     else
-      requests
-        `orElse` closes
+      -- control work first: a close (or a lease check) and a retirement are never kept waiting by attachment traffic,
+      -- which a producer could keep coming; each of them is finite work that hands something back
+      closes
         `orElse` retirements
+        `orElse` requests
         `orElse` demands
         `orElse` preparations
   where
@@ -1069,11 +1111,9 @@ arenaIdentity status residency = case (status, residency) of
 viewDirty ∷ (Ord k, Show k) ⇒ TerrainViews k → ViewState k → STM Bool
 viewDirty service state =
   readTVar (vsBlocked state) >>= \case
-    -- an adoption other than the one seen, or a reader that let a pin go
-    Just (BlockedOnAdoption seen readers) → do
-      newest ← fmap fst <$> ledgerNewestAdopted (portLedger (svPorts service)) (vtKey (vsTarget state))
-      now ← sum <$> readTVar (vsReaders state)
-      pure (newest /= seen || now /= readers)
+    -- the pin-capacity predicate itself: the pins kept now (published, adopted, newer than adopted, or read) leave room.
+    -- No count of readers or adoptions stands in for it: one reader can start as another ends.
+    Just BlockedOnPins → (< tvCpuPins (svConfig service)) . Map.size . fst <$> pinsKept service state
     Just BlockedOnMetrics → do
       metrics ← vtMetrics (vsTarget state)
       status ← Runtime.arenaStatusSTM (portTerrain (svPorts service)) (vsArena state)
@@ -1127,7 +1167,9 @@ shutdown service = do
   forM_ views $ \state → do
     atomically (writeTVar (vsClosing state) True)
     trySync (runClose service state) >>= \case
-      Left (failure ∷ SomeException) → recordFailure service ("a view's close failed: " <> Text.pack (displayException failure))
+      Left (failure ∷ SomeException) → do
+        recordFailure service ("a view's close failed: " <> Text.pack (displayException failure))
+        completeClose service state
       Right () → pure ()
   -- Settle every attachment still queued.
   queued ← atomically (readTVar (svRequests service) <* writeTVar (svRequests service) [])
@@ -1590,9 +1632,7 @@ startPreparation service state = do
     if pins >= tvCpuPins (svConfig service)
       then do
         finishSTM service state Retry' Nothing
-        newest ← fmap fst <$> ledgerNewestAdopted (portLedger (svPorts service)) (vtKey (vsTarget state))
-        readers ← sum <$> readTVar (vsReaders state)
-        writeTVar (vsBlocked state) (Just (BlockedOnAdoption newest readers))
+        writeTVar (vsBlocked state) (Just BlockedOnPins)
         pure False
       else pure True
   when started (prepareFrom service state)
@@ -1643,18 +1683,31 @@ prepareFrom service state = do
 maxRounds, maxRestarts ∷ Int
 maxRounds = 16
 
--- | The most one preparation's admitted copies and the inputs made from them can hold of the account: the terrain
--- service's reservation for the regions it copies, and each region's inputs.
+-- | The most one preparation's admitted copies and the inputs made from them can hold of the account, from the same
+-- obligations admission charges ('admitInputs'): the terrain service's reservation for the regions it copies, each
+-- region's fixed inputs, the planner's knowledge at its most for each region, and the removal index at the change
+-- limits' most.
 admittedCostBound ∷ TerrainViewsConfig → Word64
-admittedCostBound config =
-  let regions = max 1 (tvAdmitRegions config)
-   in Runtime.regionSnapshotReservation regions + inputsPerRegion * fromIntegral regions
+admittedCostBound config = admittedInputsCost config (max 1 (tvAdmitRegions config))
 
 -- | What a preparation over this many regions needs of the account beyond what the view already holds, at most: the
--- terrain service's reservation for their copies, their inputs and the room for the plan's first quantum over them.
+-- admitted copies and their inputs ('admittedCostBound' for that many regions) and the room for the plan's first
+-- quantum over them.
 preparationCost ∷ TerrainViewsConfig → Int → Word64
-preparationCost config regions =
-  Runtime.regionSnapshotReservation (max 1 regions) + inputsPerRegion * fromIntegral (max 1 regions) + quantumBound config (max 1 regions)
+preparationCost config regions = admittedInputsCost config (max 1 regions) + quantumBound config (max 1 regions)
+
+-- | What copies of this many regions and their inputs hold at most, at the obligations 'admitInputs' charges.
+admittedInputsCost ∷ TerrainViewsConfig → Int → Word64
+admittedInputsCost config regions =
+  Runtime.regionSnapshotReservation regions
+    + (inputsPerRegion + knowledgeExpansionBound) * fromIntegral regions
+    + changesExpansionBound (tvChangeLimits config) regions
+
+-- | What copies of this many regions and their inputs hold when every region's knowledge is one class and nothing was
+-- removed: the copies' reservation and each region's fixed inputs alone. The figure for terrain that is uniform per
+-- region and unedited; 'admittedInputsCost' is the most for any.
+uniformInputsCost ∷ Int → Word64
+uniformInputsCost regions = Runtime.regionSnapshotReservation regions + inputsPerRegion * fromIntegral regions
 
 -- The order regions are admitted in: the camera's anchor, then the others nearest it first (by the larger of the
 -- horizontal distances, then the vertical), then by coordinate. Pure, so a preparation admits the same regions for the
@@ -1777,8 +1830,9 @@ admitInputs service state ordered = do
       attempt (prefix : rest) = case combineCopies prefix of
         Left _ → attempt rest
         Right copies → do
-          -- each region's fixed inputs, and what the planner's knowledge expands to for regions of more than one class
-          let inputs = inputsPerRegion * fromIntegral (Set.size (copyRegions copies)) + sum (map knowledgeExpansion prefix)
+          -- each region's fixed inputs, what the planner's knowledge expands to for regions of more than one class, and
+          -- the removal index made from the copies' removed intervals
+          let inputs = inputsPerRegion * fromIntegral (Set.size (copyRegions copies)) + sum (map knowledgeExpansion prefix) + sum (map changesExpansion prefix)
               held = sum (map Runtime.regionSnapshotFootprint prefix) + inputs
           writeTVar (vsStageCharge state) (held + quantumBound (svConfig service) (Set.size (copyRegions copies)))
           room ← recharge service state
@@ -2354,17 +2408,23 @@ pinnedNeed state = sum . map pinBytes . Map.elems <$> readTVar (vsPins state)
 -- Unpin every plan that is neither the newest published nor the newest adopted, returning its CPU bytes.
 dropUnneededPinsSTM ∷ (Ord k, Show k) ⇒ TerrainViews k → ViewState k → STM ()
 dropUnneededPinsSTM service state = do
+  (kept, dropped) ← pinsKept service state
+  let bytes = sum (map pinBytes (Map.elems dropped))
+  unless (Map.null dropped) $ do
+    writeTVar (vsPins state) kept
+    void (recharge service state)
+    when (bytes > 0) (modifyTVar' (svReleases service) (+ 1))
+
+-- The pins a view keeps now, and those it can let go: it keeps the newest published, the newest adopted, any newer than
+-- that adoption, and any a reader holds.
+pinsKept ∷ (Ord k, Show k) ⇒ TerrainViews k → ViewState k → STM (Map Word64 Pinned, Map Word64 Pinned)
+pinsKept service state = do
   published ← readTVar (vsPublished state)
   adopted ← fmap (tagRevision . snd) <$> adoptedRevision service state
   pins ← readTVar (vsPins state)
   readers ← readTVar (vsReaders state)
   let keep revision = Just revision == published || Just revision == adopted || maybe False (revision >) adopted || Map.findWithDefault 0 revision readers > 0
-      (kept, dropped) = Map.partitionWithKey (\revision _ → keep revision) pins
-      bytes = sum (map pinBytes (Map.elems dropped))
-  unless (Map.null dropped) $ do
-    writeTVar (vsPins state) kept
-    void (recharge service state)
-    when (bytes > 0) (modifyTVar' (svReleases service) (+ 1))
+  pure (Map.partitionWithKey (\revision _ → keep revision) pins)
 
 -- ---------------------------------------------------------------------------
 -- Picking
@@ -2388,15 +2448,29 @@ adoptedPin service state =
 withAdoptedPlan ∷ (Ord k, Show k) ⇒ TerrainView k → (Maybe CellPlan → IO a) → IO a
 withAdoptedPlan (TerrainView service state) body = bracket acquire release (body . fmap (pinPlan . snd))
   where
+    -- a view asked to close has no plan to read
     acquire = atomically $ do
-      found ← adoptedPin service state
+      closing ← readTVar (vsClosing state)
+      found ← if closing then pure Nothing else adoptedPin service state
       forM_ found $ \(revision, _) → modifyTVar' (vsReaders state) (Map.insertWith (+) revision 1)
       pure found
+    -- the last reader of a closed view lets its pins go and releases what its close left to it: the account's bytes
+    -- and the parents (taken from the view in one transaction, so exactly one of this and the close releases them)
     release = \case
       Nothing → pure ()
-      Just (revision, _) → atomically $ do
-        modifyTVar' (vsReaders state) (Map.update (\n → if n > 1 then Just (n - 1) else Nothing) revision)
-        modifyTVar' (svReleases service) (+ 1)
+      Just (revision, _) → uninterruptibleMask_ $ do
+        style ← atomically $ do
+          modifyTVar' (vsReaders state) (Map.update (\n → if n > 1 then Just (n - 1) else Nothing) revision)
+          modifyTVar' (svReleases service) (+ 1)
+          closed ← (== PhaseClosed) <$> readTVar (vsPhase state)
+          remaining ← sum <$> readTVar (vsReaders state)
+          if closed && remaining == 0
+            then do
+              writeTVar (vsPins state) Map.empty
+              releaseUnread service state
+              readTVar (vsStyle state) <* writeTVar (vsStyle state) Nothing
+            else pure Nothing
+        forM_ style releaseStyle
 
 pickView ∷ (Ord k, Show k) ⇒ TerrainView k → (Double, Double) → STM (PickResult k)
 pickView (TerrainView service state) (px, py) = do
