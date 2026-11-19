@@ -2248,9 +2248,12 @@ stagesAndReaders = describe "stages, waits and readers" $ do
           removed = [interval | region ← Runtime.regionSnapshotRegions snapshot, Runtime.PartReady intervals ← [Runtime.regionTerrain snapshot region], interval ← intervals]
           charged = changesExpansion snapshot
           regions = fromIntegral (length (Runtime.regionSnapshotRegions snapshot))
-      -- admission charges the copy's inputs as each region's fixed inputs, its knowledge's expansion and this index
-      inputsCharge [snapshot] `shouldBe` 25872 * regions + knowledgeExpansion snapshot + charged
+          admitted = inputsCharge [snapshot]
+          expected = 25872 * regions + knowledgeExpansion snapshot + charged
+      -- the copy is let go before anything is checked, so a failed check never keeps the scope's end waiting on it
       Runtime.releaseRegionBorrow (_vTerrain v) borrow
+      -- admission charges the copy's inputs as each region's fixed inputs, its knowledge's expansion and this index
+      admitted `shouldBe` expected
       index ← either (fail . show) pure (changesFromIntervals (tvChangeLimits testConfig) removed)
       changesBytes index `shouldSatisfy` (>= 3 * 64)
       charged `shouldSatisfy` (>= fromIntegral (changesBytes index))
