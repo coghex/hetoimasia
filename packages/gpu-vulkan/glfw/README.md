@@ -141,7 +141,8 @@ and the suites' verification capture.
 - The test-only completion hold is public, unlike verification capture,
   because another package's suite needs it (#645's overlap witness):
   `vulkanCompletionHold`, `Nothing` by default and in every production
-  configuration, set by no library or executable. It holds frame-less batches
+  configuration, set by no library or executable, and fixed when the host is
+  made. It holds frame-less batches
   only, at the one place their completion is recognized: a held batch's fence
   is not asked, so it stays pending for every reader and everything it uses
   stays held; letting go completes nothing until a later step observes the

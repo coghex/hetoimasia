@@ -5,7 +5,6 @@
 -- Each runs real Lua instances over the real service.
 module Test.LuaEngine.Terrain.Matrix (spec) where
 
-import Control.Concurrent.STM (atomically)
 import Control.Exception (finally)
 import Data.IORef (atomicModifyIORef', newIORef, readIORef)
 import Control.Monad (forM_, replicateM_, void)
@@ -631,7 +630,7 @@ spec = describe "Terrain matrices" $ do
           untilPrintedBy world spawned "while preparing\tbusy"
           outLines world >>= \printed → printed `shouldContain` ["cancel\tcancelled", "take\tcancelled"]
           -- and it stays so over further updates while the owner is held
-          pumpUntil world (advanceClock world 2000000000 >> ((>= 3) . length . filter (== "still busy") <$> outLines world))
+          stepUntil world ((>= 3) . length . filter (== "still busy") <$> outLinesSTM world)
           outLines world >>= \printed → printed `shouldNotContain` ["free"]
           openGate gate
           untilPrintedBy world spawned "free"
@@ -644,8 +643,7 @@ spec = describe "Terrain matrices" $ do
           untilPrintedBy world spawned "taken"
           outLines world >>= \printed → printed `shouldContain` ["ready\ttrue", "take\tsuccess"]
           -- the instance is idle: nothing of it calls terrain again, and the service holds nothing for the request it took
-          let held = length . censusRequests <$> atomically (inspectCensusSTM (rgService rig))
-          pumpUntil world (advanceClock world 2000000000 >> ((== 0) <$> held))
+          stepUntil world ((== 0) . length . censusRequests <$> inspectCensusSTM (rgService rig))
           limitHeld (rgService rig) "command slots" `shouldReturn` 0
 
   it "refuses a call whose largest answer the VM's limits could never carry as an ordinary error before any bank, with the bank full or free, and no work reaches the service" $ do
@@ -699,7 +697,7 @@ spec = describe "Terrain matrices" $ do
           -- the read settles arena_closed; taken, its place is still charged: the owner has not finished with what the read borrowed
           untilPrinted world "after taking\tbusy"
           outLines world >>= \printed → printed `shouldContain` ["settled\tfailure\tarena_closed"]
-          pumpUntil world (advanceClock world 2000000000 >> ((>= 3) . length . filter (== "still busy") <$> outLines world))
+          stepUntil world ((>= 3) . length . filter (== "still busy") <$> outLinesSTM world)
           outLines world >>= \printed → printed `shouldNotContain` ["free"]
           openGate gate
           untilPrinted world "free"
@@ -721,12 +719,12 @@ spec = describe "Terrain matrices" $ do
               -- the read is ended some way while the owner is preparing it, and its instance is asked to end
               event fvm rig
               stopSpawned spawned
-              pumpUntil world (advanceClock world 2000000000 >> ((== Just Instance.Stopping) <$> phaseOf spawned))
+              stepUntil world ((== Just Instance.Stopping) <$> phaseOfSTM spawned)
               -- the instance is not over while the owner holds what the read borrowed: its end waits for the work's retirement
               replicateM_ 5 (advanceClock world 2000000000)
               phaseOf spawned >>= (`shouldBe` Just Instance.Stopping)
               openGate gate
-              pumpUntil world (advanceClock world 2000000000 >> ((/= Just Instance.Stopping) <$> phaseOf spawned))
+              stepUntil world ((/= Just Instance.Stopping) <$> phaseOfSTM spawned)
 
   it "refuses a column range over the service's configured level limit as an ordinary error before any bank, with the bank full or free" $ do
     captured ← newIORef (0 ∷ Int)
@@ -771,25 +769,25 @@ spec = describe "Terrain matrices" $ do
   it "keeps the place of a read that an arena's closure failed before its logical position charged, through the tick that serves it, until the owner has finished preparing it" $ do
     gate ← newGate
     withRigProbe defaultConfigForRaces (gatedProbe (\p → case p of PointCaptured {} → True; _ → False) gate) $ \rig →
-      withWorld (counts [(RequestsPerInstance, 1), (RequestsPerVm, 2)]) (Layout [("lua/main.lua", scriptSource closedCreator), ("lua/attached.lua", scriptSource closedAttachedLogical)]) $ \world control runtime →
+      withWorld (counts [(RequestsPerInstance, 1), (RequestsPerVm, 2)]) (Layout [("lua/main.lua", scriptSource closedCreator), ("lua/attached.lua", scriptSource closedAttachedLogical)]) $ \world _ runtime →
         withFvm world runtime (presentationOver rig) $ \creatorVm →
           withFvm world runtime (gameplayOver rig) $ \gameplayVm → (`finally` openGate gate) $ do
             creatorSpawn ← spawn world creatorVm "modules-test" mainPath
             untilPrintedBy world creatorSpawn "creator ready"
             _ ← spawn world gameplayVm "modules-test" "lua/attached.lua"
             -- tick 1 settles the attach and issues the read, due at tick 2: the owner is held where the read captured its answer
-            pumpUntil world (tickBy control gameplayVm 1 >> (elem "read issued at\t1" <$> outLines world))
+            tickUntil gameplayVm (elem "read issued at\t1" <$> outLinesSTM world)
             awaitReached gate
             -- the arena is closed under the read before its tick: it fails arena_closed, and its failure waits for its position
             signalRig rig "close"
-            pumpUntil world (advanceClock world 2000000000 >> (elem "release\tdone" <$> outLines world))
+            stepUntil world (elem "release\tdone" <$> outLinesSTM world)
             -- tick 2 serves it: the instance takes it, and the place is still charged, however many ticks pass, while the owner is held
-            pumpUntil world (tickBy control gameplayVm 1 >> (elem "after taking at\t2\tbusy" <$> outLines world))
+            tickUntil gameplayVm (elem "after taking at\t2\tbusy" <$> outLinesSTM world)
             outLines world >>= \printed → printed `shouldContain` ["settled at\t2\tfailure\tarena_closed"]
-            pumpUntil world (tickBy control gameplayVm 1 >> ((>= 3) . length . filter (== "still busy") <$> outLines world))
+            tickUntil gameplayVm ((>= 3) . length . filter (== "still busy") <$> outLinesSTM world)
             outLines world >>= \printed → printed `shouldNotContain` ["free"]
             openGate gate
-            pumpUntil world (tickBy control gameplayVm 1 >> (elem "free" <$> outLines world))
+            tickUntil gameplayVm (elem "free" <$> outLinesSTM world)
 
   forM_
     [ ("the service's closure failed", \_ rig → closeService (rgService rig))
@@ -803,15 +801,15 @@ spec = describe "Terrain matrices" $ do
           withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource heldReadLogical)]) $ \world control runtime →
             withFvm world runtime (gameplayOver rig) $ \fvm → (`finally` openGate gate) $ do
               spawned ← spawn world fvm "modules-test" mainPath
-              pumpUntil world (tickBy control fvm 1 >> (elem "read issued" <$> outLines world))
+              tickUntil fvm (elem "read issued" <$> outLinesSTM world)
               awaitReached gate
               event fvm rig
               stopSpawned spawned
-              pumpUntil world (tickBy control fvm 1 >> ((== Just Instance.Stopping) <$> phaseOf spawned))
+              tickUntil fvm ((== Just Instance.Stopping) <$> phaseOfSTM spawned)
               replicateM_ 3 (tickBy control fvm 1)
               phaseOf spawned >>= (`shouldBe` Just Instance.Stopping)
               openGate gate
-              pumpUntil world (tickBy control fvm 1 >> ((/= Just Instance.Stopping) <$> phaseOf spawned))
+              tickUntil fvm ((/= Just Instance.Stopping) <$> phaseOfSTM spawned)
 
   forM_
     [ ("an epoch cancelled it", \fvm → void (advanceRequestEpoch (scheduledEndpoint (fvOwner fvm))))
@@ -827,18 +825,18 @@ spec = describe "Terrain matrices" $ do
                 creatorSpawn ← spawn world creatorVm "modules-test" mainPath
                 untilPrintedBy world creatorSpawn "creator ready"
                 spawned ← spawn world fvm "modules-test" "lua/attached.lua"
-                pumpUntil world (tickBy control fvm 1 >> (elem "read issued at\t1" <$> outLines world))
+                tickUntil fvm (elem "read issued at\t1" <$> outLinesSTM world)
                 awaitReached gate
                 -- the closure fails the read before its position: its failure is held for the tick, and it leaves the provider's work owed
                 signalRig rig "close"
-                pumpUntil world (advanceClock world 2000000000 >> (elem "release\tdone" <$> outLines world))
+                stepUntil world (elem "release\tdone" <$> outLinesSTM world)
                 event fvm
                 stopSpawned spawned
-                pumpUntil world (tickBy control fvm 1 >> ((== Just Instance.Stopping) <$> phaseOf spawned))
+                tickUntil fvm ((== Just Instance.Stopping) <$> phaseOfSTM spawned)
                 replicateM_ 3 (tickBy control fvm 1)
                 phaseOf spawned >>= (`shouldBe` Just Instance.Stopping)
                 openGate gate
-                pumpUntil world (tickBy control fvm 1 >> ((/= Just Instance.Stopping) <$> phaseOf spawned))
+                tickUntil fvm ((/= Just Instance.Stopping) <$> phaseOfSTM spawned)
 
   it "answers a second release of one's own arena without error, before and after the first has retired" $
     withRig $ \rig →
@@ -905,7 +903,7 @@ spec = describe "Terrain matrices" $ do
           untilPrinted world "attached\tsuccess"
           stopSpawned attached
           seen ← length . filter (== "creator read\tsuccess") <$> outLines world
-          pumpUntil world (advanceClock world 2000000000 >> ((> seen + 2) . length . filter (== "creator read\tsuccess") <$> outLines world))
+          stepUntil world ((> seen + 2) . length . filter (== "creator read\tsuccess") <$> outLinesSTM world)
           limitHeld (rgService rig) "arenas" `shouldReturn` 1
 
   it "refuses another instance's captured api.terrain table as an ordinary error" $
@@ -936,7 +934,7 @@ spec = describe "Terrain matrices" $ do
       withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource unrelatedRequired)]) $ \world _ runtime →
         withFvm world runtime (presentationOver rig) $ \fvm → do
           spawned ← spawn world fvm "modules-test" mainPath
-          pumpUntil world (advanceClock world 2000000000 >> ((== Just Instance.Failed) <$> phaseOf spawned))
+          stepUntil world ((== Just Instance.Failed) <$> phaseOfSTM spawned)
           printed ← outLines world
           -- five updates ran with the unread failure settled; only the required request's failure ended the instance
           printed `shouldContain` ["alive\t5"]

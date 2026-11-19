@@ -1,130 +1,67 @@
 # Lua host
 
-One embedded Lua interpreter, reached through a private bridge. This package
-owns VM construction over an explicitly chosen set of standard libraries, chunk
-loading, protected calls, error and cancellation transport across the C
-boundary, and a terminal close. Its host library depends on
-`hetoimasia-foundation` and the Lua binding and on nothing else in the engine: no
-runtime, GLFW, Vulkan, console, or game code. The runtime adapter that puts
-owners under supervision is a sublibrary of its own, described under
-[The runtime adapter](#the-runtime-adapter).
+One embedded Lua interpreter, reached through a private bridge. The host
+library depends on `hetoimasia-foundation` and the Lua binding and on nothing
+else in the engine: no runtime, GLFW, Vulkan, console or game code. The layers,
+each in its own section:
 
-Beside it, and sharing nothing with it, the package owns the **protocol model**:
-the pure task, admission, request, subscription, epoch, failure, and stop types
-that later slices implement against. See
-[The protocol model](#the-protocol-model).
+| Layer | What it is |
+| --- | --- |
+| [The VM owner](#the-vm-owner) | One VM in a bracket-shaped IO lifetime that closes it on every exit and keeps the primary failure and the close's failures as evidence |
+| [Registration, modules and bounded values](#registration-modules-and-bounded-values) | Named bindings registered once, a per-owner policy of granted namespaces, application modules, entry points called with bounded copied values |
+| [Export modules and captured behaviors](#export-modules-and-captured-behaviors), [Ordered import chains](#ordered-import-chains-the-module-loader) | Modules that return an export table and `import` one another, one chain at a time |
+| [Tasks and the coroutine library](#tasks-and-the-coroutine-library) | An entry point run as a coroutine on its VM's owner, one segment at a time |
+| [The runtime adapter](#the-runtime-adapter) | Supervised workers each running one VM, with bounded dispatch and exactly-once settlement (a sublibrary of its own) |
+| [The scheduling machinery](#the-scheduling-machinery), [The scheduled owner](#the-scheduled-owner) | Policies, service classes, logical and elapsed time, budgets and control; then the same on real VMs |
+| [Script instances](#script-instances), [Instance leases](#instance-leases), [Lifecycle services](#lifecycle-services) | Instances of a module with their own state, hooks, events and an application-controlled lifecycle |
+| [Asynchronous requests](#asynchronous-requests), [Atomic request admission](#atomic-request-admission), [Provider events](#provider-events) | Requests a provider answers later, and events delivered into an instance's bounded queue |
+| [The script runner](#the-script-runner) | Runs a list of Lua files to completion as the instances of one named VM; the library behind the `lua` subcommand |
+| [The protocol model](#the-protocol-model) | The pure task, admission, request, subscription, epoch, failure and stop types; shares nothing with the host |
 
-The **protected VM owner** (LUA-2) is here: one VM held through a bracket-shaped
-IO lifetime that closes it on every exit and keeps the primary failure and the
-close's failures as cleanup evidence. See [The VM owner](#the-vm-owner).
-
-The **registration and value boundary** (LUA-3) is here too: an application
-registers named bindings once, gives each owner a policy naming the namespaces it
-exposes, supplies its own Lua modules, and calls their entry points with bounded
-copied values. See
-[Registration, modules and bounded values](#registration-modules-and-bounded-values).
-**Tasks** (LUA-20) are here as well: a module's entry point run as a Lua
-coroutine on its VM's owner, one segment at a time, with the yield and wait
-operations a script uses to give control back and the standard `coroutine`
-library for the transient sequences inside one. See
-[Tasks and the coroutine library](#tasks-and-the-coroutine-library).
-The **runtime adapter** (LUA-5) is here as well: trusted VM owners, each one a
-supervised worker running one VM, with bounded call dispatch, exactly-once
-settlement and the refusal of a reply wait from inside a Lua callback. See
-[The runtime adapter](#the-runtime-adapter). The **scheduling machinery** (LUA-21)
-sits beside it and needs no VM: per-owner policies, service classes and quanta,
-logical and elapsed time behind one owned timer, budgets, and safe-boundary
-control, tested against scripted segments. See
-[The scheduling machinery](#the-scheduling-machinery). **Scheduled owners** (LUA-6)
-host it, and the host's task coroutines, on supervised workers with real VMs. See
-[The scheduled owner](#the-scheduled-owner). **Script instances** (LUA-18) sit on
-them: instances of a module with their own state, hooks, event callbacks and a
-lifecycle the application controls. See [Script instances](#script-instances).
-**Lifecycle services** (LUA-23) let an owner's scripts pause, resume, stop and inspect instances
-of the owners the application grants them, and nothing else. See
-[Lifecycle services](#lifecycle-services). **Asynchronous requests** (LUA-7) let a script ask a provider for something it
-will answer later, with a reserved result slot, settled exactly once and, on a logical owner, delivered at the tick the
-application assigned. See [Asynchronous requests](#asynchronous-requests). **Provider events** (LUA-26) let an
-instance subscribe a function to a provider's events: owned by the instance, delivered into its bounded queue by
-producers that never call Lua, and, on a logical owner, admitted at the tick and place the application assigned. See
-[Provider events](#provider-events). **The script runner** (LUA-27, LUA-28) runs a list of Lua files to completion as the instances of one
-named VM, on the elapsed clock or on logical ticks, publishes the instances' start and end events, and answers a bounded report: the library the `lua` subcommand and a windowed application
-share. See [The script runner](#the-script-runner). **Ordered import chains** (LFE-9) let export modules `import` one another: a module
-suspends on a dependency's verified source and resumes on its VM's owner, one chain at a time, in the order the coordinator
-admitted the roots. See [Ordered import chains](#ordered-import-chains-the-module-loader). Any
-concrete game namespace and the confined path are later slices of
-[the Lua runtime design](../../docs/archive/designs/lua_runtime_design.md). What is here is the
-boundary they will be built on, and the evidence that it holds.
+A concrete game namespace and the confined path for untrusted code are not
+here (the retired Lua runtime design is listed in
+[removed_records.md](../../docs/removed_records.md)).
 
 ## What the boundary exposes
 
-Four modules are public. `Hetoimasia.Scripting.Lua.Owner` is the protected VM
-owner, described under [The VM owner](#the-vm-owner): `withVmOwner`, the owned
-VM it lends its body, `evalOwned` and `callOwned` on it, and the module and
-entry-point operations of
-[the value boundary](#registration-modules-and-bounded-values). A VM it
-constructs is an `OwnedVm`, which is not the bridge's `Vm`, so nothing below
-accepts it: no bridge operation can run Lua on a managed VM or close it behind
-its owner's back. `Hetoimasia.Scripting.Lua.Registration` and
-`Hetoimasia.Scripting.Lua.Value` are what an application registers and what
-crosses; they hold no VM.
+Four modules are public:
 
-`Hetoimasia.Scripting.Lua.Bridge` is the lower, unmanaged surface. Its callers
-close what they construct themselves, and it is what the owner is built on:
-
-- `newVm ∷ [Library] → IO Vm` and `closeVm ∷ Vm → IO ()`.
-- `evalChunk ∷ Vm → ChunkName → ByteString → IO ()` and
-  `callGlobal ∷ Vm → Text → IO ()`.
-- `chunkName`, the `Library` set, and the failure types.
+- `Hetoimasia.Scripting.Lua.Owner`: the protected VM owner (`withVmOwner`,
+  `evalOwned`, `callOwned`, and the module and entry-point operations). Its
+  `OwnedVm` is not the bridge's `Vm`, so no bridge operation can run Lua on a
+  managed VM or close it behind its owner's back.
+- `Hetoimasia.Scripting.Lua.Registration` and `Hetoimasia.Scripting.Lua.Value`:
+  what an application registers and what crosses. They hold no VM.
+- `Hetoimasia.Scripting.Lua.Bridge`: the lower, unmanaged surface the owner is
+  built on (`newVm`, `closeVm`, `evalChunk`, `callGlobal`, `chunkName`, the
+  `Library` set, the failure types). Its callers close what they construct.
 
 `Vm` and `ChunkName` are abstract. No exported module hands a caller a Lua
-state, a stack index, a registry reference, a coroutine, a closure, or a native
-address, and none of them has a reachable representation that becomes one (a
-`Task` of the owner is a handle that *names* a coroutine of its VM and gives
-access to nothing of it; see [Tasks](#tasks-and-the-coroutine-library)): the
-state, the callback entry, and the stack probes live in the package's private
-`bridge` sublibrary, which no client
-outside the package can depend on. `Test.Lua.Opacity` compiles clients that try
-each of those reaches and requires the compiler to refuse them, and one client
-that uses the whole public contract and requires it to link and run.
+state, a stack index, a registry reference, a coroutine, a closure or a native
+address; those live in the private `bridge` sublibrary, which nothing outside
+the package can depend on. A `Task` names a coroutine and gives access to
+nothing of it. `Test.Lua.Opacity` compiles clients that try each reach and
+requires the compiler to refuse them.
 
-Two absences are deliberate. There is no way to hand Lua a bare Haskell function
-from `Bridge` or from the owner: a Haskell function reaches a script only as a
-binding of a validated `Registration`, in a namespace the owner's policy grants,
-with schemas for what crosses, because installing callbacks without them is how a
-bridge acquires a surface nobody reviewed. And there is no call that opens "all
-the libraries": `newVm` takes the list, and `[]` is a VM with no standard
-library at all.
+Two absences are deliberate. **A bare Haskell function cannot be handed to
+Lua**: it reaches a script only as a binding of a validated `Registration`, in
+a namespace the owner's policy grants, with schemas for what crosses. And no
+call opens "all the libraries": `newVm` takes the list, and `[]` is a VM with
+no standard library.
 
 ## The binding, and why this one
 
-`lua-2.3.4`, which bundles the Lua **5.4.8** C sources, on GHC 9.14.1 and Cabal
-3.18.1.0 at `index-state: 2026-09-18T00:00:00Z` — the baseline
-[issue #157 qualified](../../docs/toolchain.md), merged as `3af4cb2`. The
-package contract's bound is `lua >=2.3.4 && <2.4`.
-
-`lua` is the HsLua project's own raw binding layer, the first candidate the
-design names. `hslua-core`, the monadic layer above it, is **not** used, for two
-reasons that are this slice's requirements rather than preferences:
-
-- Its `LuaE` monad exports `state`, which hands any holder the raw
-  `Lua.State`. A public API built on it could not keep the state private.
-- Its `run` masks asynchronous exceptions across the whole computation. This
-  bridge has to decide for itself what a cancellation delivered around a native
-  call does, and inheriting a blanket mask forecloses that.
-
-Nothing in `hslua-core` is needed for what this slice does. What is used from
-`lua` is narrower still: the Lua C API, the bundled interpreter, and the
-individual `luaopen_*` functions. Its Haskell-facing conveniences are not used,
-for the reasons under *The foreign-call audit*.
+`lua-2.3.4` (bound `lua >=2.3.4 && <2.4`), which bundles the Lua **5.4.8** C
+sources. `hslua-core` is **not** used: its `LuaE` monad exports the raw
+`Lua.State`, and its `run` masks asynchronous exceptions across the whole
+computation, where this bridge must decide for itself what a cancellation
+around a native call does. From `lua` only the C API, the bundled interpreter
+and the individual `luaopen_*` functions are used.
 
 ### Provisioning and build identity
 
-The interpreter is the copy `lua` bundles; nothing is provisioned. The Linux CI
-image recipe is unchanged, its pinned descriptor and toolchain identity contract
-are untouched, and no macOS remote CI is introduced.
-
-`cabal.project.common` pins the binding's own flags for every project
+The interpreter is the copy `lua` bundles; nothing is provisioned.
+`cabal.project.common` pins the binding's flags for every project
 configuration:
 
 ```
@@ -132,1135 +69,618 @@ package lua
   flags: -system-lua -pkg-config -allow-unsafe-gc
 ```
 
-`-system-lua` and `-pkg-config` are what keep a second Lua off the build.
-Both default to off, but they are stated rather than assumed: with either on,
-the build links whichever `liblua` the machine happens to offer, which is a
-different interpreter version per developer. `-allow-unsafe-gc` is the audited
-choice below.
-
-The dependency's cache identity is the workflow's existing package-store key,
-`cabal-store-<environment>-${{ hashFiles('cabal.project', 'cabal.project.common',
-'**/*.cabal') }}`. The bundled Lua sources are compiled once into that store and
-restored on every later run, so no job rebuilds Lua unconditionally; and because
-the key covers `cabal.project.common`, changing the flags above correctly
-invalidates it. A clean build with a cold store compiles the Lua C sources and
-the binding before this package, and nothing else changes.
+**`-system-lua` and `-pkg-config` keep a second Lua off the build**: with
+either on, the build links whichever `liblua` the machine offers.
+`-allow-unsafe-gc` is disabled for correctness (below). The CI package-store
+key covers `cabal.project.common`, so changing these flags invalidates the
+cached build of the bundled sources.
 
 ## The foreign-call audit
 
-What the boundary actually does, recorded here so later slices do not have to
-rediscover it.
-
 ### What is used, and what is not
 
-This package performs several Lua operations through its own C rather than the
-binding's wrappers, in `bridge/cbits/hetoimasia_lua_bridge.c`. The reason is the
-same each time and is set out under *Allocation* below: the binding's wrappers
-put their protected call after the allocation that builds their arguments, so
-the first allocation of the operation is unprotected.
+Several operations go through this package's own C
+(`bridge/cbits/hetoimasia_lua_bridge.c`) instead of the binding's wrappers,
+because the wrappers allocate their arguments before their protected call.
 
 | Import | Annotation | Used by |
 | --- | --- | --- |
-| `lua_pcall` | `safe`, fixed | every call into Lua |
-| `lua_close` | `safe`, fixed | the close |
-| `luaL_loadbuffer` | `safe`, by the flag | loading a chunk |
-| `luaL_ref`, `luaL_unref` | `safe`, by the flag | the fixtures' registry probe only |
-| `lua_tolstring` | `safe`, by the flag | reading a string error value |
-| `hetoimasia_lua_publish`, `hetoimasia_lua_getglobal`, `hetoimasia_lua_requiref` | `safe` | publishing a callback, reading a global, opening a library — each one protected call |
-| `hetoimasia_lua_filter_m1` | `safe` | filtering the M1 library profile's open libraries — one protected call, no argument crosses it |
+| `lua_pcall`, `lua_close` | `safe`, fixed | every call into Lua; the close |
+| `luaL_loadbuffer`, `lua_tolstring`, `luaL_ref`, `luaL_unref` | `safe`, by the flag | loading a chunk; reading a string error value; the fixtures' registry probe only |
+| `hetoimasia_lua_publish`, `hetoimasia_lua_getglobal`, `hetoimasia_lua_requiref`, `hetoimasia_lua_filter_m1` | `safe` | publishing a callback, reading a global, opening a library, filtering the M1 profile: each one protected call |
 | `hetoimasia_lua_newstate` | `unsafe` | creating the interpreter |
-| `lua_gettop`, `lua_settop`, `lua_type`, `lua_typename`, `lua_isinteger`, `lua_tointegerx`, `lua_tonumberx`, `lua_pushboolean`, `lua_pushlightuserdata`, `lua_touserdata`, `lua_remove` | `unsafe`, fixed | stack bookkeeping, rendering, and the callback entry |
-
-`lua-2.3.4` fixes some of its imports and leaves others to the
-`allow-unsafe-gc` flag, which this repository disables; under that setting the
-flagged ones are `safe`.
+| `lua_gettop`, `lua_settop`, `lua_type`, `lua_typename`, `lua_isinteger`, `lua_tointegerx`, `lua_tonumberx`, `lua_pushboolean`, `lua_pushlightuserdata`, `lua_touserdata`, `lua_remove` | `unsafe`, fixed | stack bookkeeping, rendering, the callback entry |
 
 Deliberately **not** used: `hsluaL_newstate`, `hsluaL_requiref`,
 `hslua_getglobal`, `hslua_setglobal`, `hslua_pushhsfunction`,
-`hslua_newhsfunction`, `hslua_extracthsfun`, and `hslua_error`. Each either
-allocates before its own protection or brings the binding's foreign export with
-it. Nothing this package does reaches them, so the binding is used for the Lua C
-API, the bundled interpreter, and the standard-library openers — not for its
-Haskell-facing conveniences.
+`hslua_newhsfunction`, `hslua_extracthsfun`, `hslua_error`. Each allocates
+before its own protection or brings the binding's foreign export with it.
 
-The `safe` calls are what let other Haskell work and other VMs progress while
-one VM is running a chunk: a `safe` call releases the capability for its
-duration. That is the property the one-capability example in `Test.Lua.Hazard`
-exists to make falsifiable.
-
-`-allow-unsafe-gc` is **disabled**. With it on, every call that can trigger a
-collection is imported `unsafe`. This bridge puts Haskell functions into Lua,
-and each one is a userdata whose `__gc` frees a stable pointer, so any VM that
-has ever held a callback re-enters the RTS from its collector. An `unsafe`
-import is not a context that may do that. Turning the flag off makes those calls
-`safe`. The cost is the `safe` foreign-call overhead on allocation paths, which
-this slice did not measure: it is a correctness setting, and a measurement
-belongs with the first workload that has a budget to weigh it against.
+The `safe` calls release the capability, so other Haskell work and other VMs
+progress while one VM runs a chunk. **`-allow-unsafe-gc` must stay off**: each
+Haskell function in Lua is a userdata whose `__gc` frees a stable pointer, so
+the collector re-enters the RTS, which an `unsafe` import may not do. The cost
+of the `safe` overhead on allocation paths has not been measured.
 
 ### Allocation, and where a Lua error can be raised
 
-Almost every Lua operation that allocates can raise `LUA_ERRMEM`, and where that
-raise lands depends on where the call was made from. There are two places, and
-they are not equally bad.
+Almost every allocating Lua operation can raise `LUA_ERRMEM`.
 
-**From inside a callback.** A protected frame exists — the caller's `lua_pcall`,
-further out — so a raise here `longjmp`s *out of a Haskell frame* to reach it.
-That is undefined behaviour, not an error report. So the callback entry itself
-uses only operations that allocate nothing: `lua_pushboolean` for a boolean
-result, and a light userdata for the failure marker rather than a string. A
-registered binding, which has to read and build values, does that work in
-`hetoimasia_lua_values.c`, each operation one `lua_pcall` whose body may raise
-freely because the only frames between it and its `lua_pcall` are C: reading the
-arguments, pushing the results and capturing the caller's context are each such a
-call, made as a `safe` foreign call from the callback's thread, so exhaustion is
-a status the handler turns into a typed fault and never an unwind.
+- **From inside a callback**, a raise `longjmp`s out of a Haskell frame to the
+  caller's `lua_pcall`: undefined behaviour. The callback entry therefore uses
+  only non-allocating operations (`lua_pushboolean`, a light userdata as the
+  failure marker). A registered binding reads arguments, pushes results and
+  captures context in `hetoimasia_lua_values.c`, each operation one
+  `lua_pcall` with only C frames inside it, so exhaustion is a status that
+  becomes a typed fault.
+- **From Haskell, outside any protected frame**, a raise runs Lua's panic
+  function and ends the process. So: `hetoimasia_lua_newstate` is
+  `luaL_newstate`, which answers null on failure (`newVm` raises
+  `MemoryExhausted`); publishing a callback, reading a global and opening a
+  library each run entirely inside one `lua_pcall`, name strings included;
+  reporting a fault takes no `luaL_ref` and calls `lua_tolstring` only on a
+  value that is already a string (a number is formatted in Haskell).
 
-**From Haskell, outside any protected frame.** A raise here finds no frame at
-all and runs Lua's panic function, which ends the process. Everything this
-package does from that position is therefore either non-allocating or wrapped:
-
-- Constructing the interpreter cannot be protected, because there is no state
-  yet to protect it with. `hetoimasia_lua_newstate` is `luaL_newstate`, which
-  reports an allocation failure by answering a null state rather than by
-  raising, and `newVm` turns that into `MemoryExhausted`. The binding's
-  `hsluaL_newstate` also builds a registry entry and a metatable afterwards,
-  unprotected; this package needs neither.
-- Publishing a callback, reading a global, and opening a standard library each
-  run entirely inside one `lua_pcall`, including the `lua_pushlstring` that
-  builds their names. The binding's wrappers push those names first.
-- Reporting a fault takes no `luaL_ref` reference (`luaL_ref` can raise) and calls
-  `lua_tolstring` only on a value that is already a string, where it converts
-  nothing; a number is read with the non-allocating accessors and formatted in
-  Haskell. `Test.Lua.Faults` pins that — a numeric error value renders in
-  Haskell's formatting, not Lua's, which is the observable difference.
-
-`lua-hazard allocation-failure` is the evidence, for all three replaced paths.
-The binding exports no `lua_newstate`, so an allocator that fails on demand
-cannot be installed from Haskell; the hazard runner builds one in C and walks
-its budget from nothing upwards, so every allocation on each path is the one
-that fails in some run. Each path must be refused at some budget and complete at
-another — a path never refused was never starved — and every refusal must be
-Lua's own memory status rather than something else, the shim must leave exactly
-one value on the stack whether it succeeded or failed, and the state must still
-work afterwards.
-
-Publication is asked two things more. At each budget it publishes to the *same*
-state again with room to spare and requires that to succeed, and requires the
-carriers the state finalizes to equal exactly those a publication took ownership
-of. That pair is what a half-built state breaks: this package's carrier
-metatable is registered only once complete, because a metatable registered
-before its `__gc` is installed would be found by the next publication, believed
-finished, and leave a carrier nothing ever finalizes.
-
-What the child cannot show is what the bridge does with the status it gets back,
-because it has no `Vm`; `Test.Lua.Faults` holds that half, and requires
-`LUA_ERRMEM` to become `MemoryExhausted` rather than the rejected chunk it was
-read as before these paths were protected.
-
-Ownership of the Haskell function's stable pointer is reported rather than
-inferred. Several allocations can fail on that path and only some leave an owner
-behind, so the status alone cannot say whether Lua took it: the shim sets a flag
-at the instruction the carrier's metatable is attached — the first point from
-which its `__gc` is certain to run — and the bridge frees the pointer only when
-that flag says Lua never took it.
+The carrier metatable is registered only once complete, `__gc` included, so a
+half-built state cannot leave a carrier nothing finalizes. Ownership of the
+stable pointer is reported by a flag the shim sets where the metatable is
+attached; the bridge frees the pointer only when the flag says Lua never took
+it. `lua-hazard allocation-failure` walks an allocator budget upward over all
+three replaced paths.
 
 ### How callbacks re-enter
 
-This package owns the callback path. `hetoimasia_lua_bridge.c` builds a userdata
-that carries a stable pointer to the Haskell operation, gives it a metatable
-whose `__gc` frees that pointer and whose `__metatable` keeps a script away from
-it, and wraps it in a C closure. Lua calls that closure, which calls this
-package's own `foreign export`, `hetoimasia_lua_enter`. The error protocol is
-correspondingly this package's: a negative result count means the value on top
-is the failure marker, and `lua_error` is raised by the C closure after every
-Haskell frame has returned, because a `longjmp` through one is undefined.
+The C closure calls this package's `foreign export`, `hetoimasia_lua_enter`. A
+negative result count means the value on top is the failure marker, and
+`lua_error` is raised by the C closure after every Haskell frame has returned.
 
-That export runs the callback **in a Haskell thread of its own**, not in the
-thread that called `evalChunk` — that is how GHC's foreign exports work, and two
-consequences follow:
+The export runs the callback **in a Haskell thread of its own**, not the
+thread that called `evalChunk`. So a callback cannot be cancelled by
+cancelling the calling thread, and the escape record lives on the `Vm`.
 
-- A callback cannot be cancelled by cancelling the calling thread, and the
-  calling thread cannot observe the callback's own thread.
-- The escape record has to live on the VM rather than on a thread, which is why
-  `Vm` holds one.
+**A callback's operation on its own VM is refused.** The caller holds the VM's
+gate until the callback returns, so an operation or close asked from a
+callback thread fails at once with `VmReentered` (naming the operation) before
+taking the gate: it runs no Lua, leaves the stack, retains no release and
+publishes no global. The refusal travels like any callback failure, and the VM
+stays open. This covers callbacks run by `__index`/`__newindex` metamethods
+and by a `__gc` during the close (carried by the close's `CloseFault`). The
+check is by thread identity: re-entry through a thread the callback starts, or
+through another VM calling back, is not detected and is equally forbidden.
 
-**A callback's operation on its own VM is refused.** The operation that ran the
-callback holds the VM's gate until the callback returns, so anything the
-callback asks of the same VM — evaluating a chunk under any message handler,
-calling or probing a global, installing a callback, closing — could only wait
-for its own caller, which is inside a `safe` call no cancellation reaches. The
-VM therefore keeps the threads running its callbacks, and an operation or close
-asked from one of them fails at once with `VmReentered`, naming the refused
-operation, before it takes the gate: it runs no Lua, leaves the stack as it was,
-retains no release and publishes no global. The refusal is an ordinary failure
-of the callback's action, so it travels like one: the operation that ran the
-callback raises it with its own type and context whatever Lua did with the
-placeholder, and the VM stays open. That includes callbacks an `__index` or
-`__newindex` metamethod runs, and callbacks a `__gc` runs during the close,
-whose refusals the close's `CloseFault` carries.
-
-Every other thread is unaffected: its operation waits for the gate while the
-owner is inside a call, then runs, exactly as before, and is never refused
-because a call is in progress. The check is by thread identity, so re-entry
-through a thread the callback starts, or through another VM whose callback
-calls back into this one, is not detected. Both remain forbidden by the
-callback contract; nested execution on one VM is outside it (`P-4` in
-[the runtime design](../../docs/archive/designs/lua_runtime_design.md)), and a synchronous call
-into another VM's owner is `D-13`'s to forbid.
-
-A globals table can carry `__index` and `__newindex` metamethods, so reading or
-publishing a global runs Lua too, and that Lua can call one of these callbacks.
-Every such path therefore reports its own protected call's status and drains the
-escape record; collapsing a failed lookup into "not a function" would report the
-wrong failure and leave the real one for an unrelated later operation.
+Reading or publishing a global can run metamethods, so every such path reports
+its own protected call's status and drains the escape record.
 
 ### Error and cancellation transport
 
-**Cancellation targets a VM's execution owner.** A callback thread is the
-runtime's machinery, created for one call and ending with it, and is not an
-endpoint an owner addresses. A trusted callback must not publish its own
-`ThreadId` for something else to cancel, and must not leave work running past
-its own return. This is a contract, not a wish: the runtime's own prologue and
-epilogue around a foreign export are not code this package can mask, and a
-cancellation delivered there ends the process. `lua-hazard
-callback-cancellation` reproduces that on demand and is kept as diagnostic
-evidence rather than as an example, because an example that accepts either
-outcome asserts nothing.
+**Cancellation targets a VM's execution owner, never a callback thread.** A
+trusted callback must not publish its `ThreadId` and must not leave work
+running past its return: a cancellation delivered in the RTS's prologue or
+epilogue around a foreign export ends the process (`lua-hazard
+callback-cancellation` reproduces it; diagnostic only).
 
-What the contract does promise:
-
-- **Owner cancellation stays observable.** It is not delivered while the owner
-  is inside Lua, because `lua_pcall` is a `safe` foreign call; it stays pending
-  and arrives once the call has returned *and* the operation's bookkeeping is
-  done. Operations run masked for that reason — delivered between the call
-  returning and the stack being restored, it would leave the stack deep and one
-  call's callback failure for the next to raise. Nothing is lost by masking,
-  because a thread inside Lua could not be cancelled anyway. What a cancelled
-  operation does not do is retire anything its callbacks borrowed; that waits
-  for the close.
-- **A callback's failure keeps its type and context.** The action runs unmasked,
-  so it is interruptible for its own purposes and a failure of any type is
-  caught with the context it carried, recorded on the VM, and answered to Lua
-  with a light-userdata failure marker carrying no message. Lua may catch that
-  with `pcall` and finish the chunk successfully; the operation's boundary still
-  re-raises the recorded exception with its own type and context, and adds its
-  operation to that context. The first escape of an operation is the one kept,
-  and an operation that leaves by any other exception takes the record with it.
+- **Owner cancellation stays observable.** It is not delivered inside Lua
+  (`lua_pcall` is `safe`); it arrives once the call has returned and the
+  operation's bookkeeping is done. Operations run masked for that reason. A
+  cancelled operation retires nothing its callbacks borrowed; that waits for
+  the close.
+- **A callback's failure keeps its type and context.** The action runs
+  unmasked; its failure is recorded on the VM and answered to Lua with a
+  message-less marker. Lua may `pcall` it and finish; the operation's boundary
+  still re-raises the recorded exception, adding its operation to the context.
+  The first escape of an operation is the one kept.
 - **Nothing promises to interrupt arbitrary Lua.** Callbacks are short and do
-  not block; work that would block belongs in an asynchronous request or is cut
-  into segments. Enforcing limits on untrusted code is the business of the
-  isolated processes that will run it, not of this boundary.
+  not block; blocking work belongs in an asynchronous request or is cut into
+  segments.
 
-A Lua error inside a protected call is a status code, never an unwind: it is
-classified — including `LUA_ERRMEM` as `MemoryExhausted`, wherever it comes from
-— its value is rendered under a bound, and it becomes a `LuaFault`. Rendering
-runs no Lua, so a `__tostring` metamethod is never called, and reports a value
-that is neither a string nor a number by its Lua type alone. Not by its address:
-a pointer rendered into text is still a native address, and `LuaFault` crosses
-the package boundary. Absence is read from the stack depth, so a `false` error
-value is reported as a boolean rather than mistaken for nothing.
+A Lua error inside a protected call is a status, never an unwind. It is
+classified (`LUA_ERRMEM` is `MemoryExhausted` wherever it comes from), its
+value rendered under a bound, and it becomes a `LuaFault`. Rendering runs no
+Lua (no `__tostring`), reports a non-string, non-number value by its Lua type
+alone, never by address, and reads absence from the stack depth, so `false`
+is a boolean.
 
 ### Supported and rejected execution paths
 
-Supported:
-
-- One execution owner per VM, enforced by a gate rather than assumed. A second
-  thread's operation waits; an operation on a closing or closed VM is refused.
-- Several VMs in one process, each with its own globals, running concurrently.
-- Haskell work and a second VM progressing while one VM runs a long chunk.
-- Closing a VM whose last call failed; closing twice.
+Supported: one execution owner per VM, enforced by a gate (a second thread's
+operation waits; an operation on a closing or closed VM is refused); several
+VMs running concurrently with separate globals; Haskell work and a second VM
+progressing while one VM runs a long chunk; closing a VM whose last call
+failed; closing twice.
 
 Rejected:
 
-- **Cancelling a thread that is inside Lua.** It does not work and cannot be
-  made to work with an asynchronous exception; `throwTo` blocks until the call
-  returns. A supervisor that must reclaim a running task needs something else —
-  a hook Lua itself consults, or a process boundary. `Test.Lua.Hazard` proves
-  this in a child process, because a chunk that never returns holds its thread
-  for the life of the process.
-- **Unprotected calls.** Anything that can raise a Lua error goes through
-  `lua_pcall` or the binding's protected ersatz functions; an unprotected one
-  that errors ends the process.
+- **Cancelling a thread that is inside Lua.** `throwTo` blocks until the call
+  returns. Reclaiming a running task needs a hook Lua consults or a process
+  boundary.
+- **Unprotected calls**: one that errors ends the process.
 - **Using a VM, or anything a callback borrowed, after the terminal close.**
-- **Taking a registry reference, or converting a number to a string, on a
-  reporting path.** Both can raise a Lua error where no protected frame is left
-  to catch it.
-- **Any allocating Lua operation from inside a callback.** A raise there unwinds
-  out of a Haskell frame to the protected call outside it.
-- **Reaching Lua from a callback with anything that allocates.** A raise there
-  unwinds out of a Haskell frame to the protected call outside it.
-- **Running Lua, or closing, from inside a callback of the same VM.** Refused
-  with `VmReentered` rather than left waiting; see *How callbacks re-enter*.
-  Re-entry through a thread the callback starts, or through another VM, is not
-  detected and is equally outside the contract.
-- **Cancelling a callback thread.** Not an endpoint; see *Error and cancellation
-  transport*. Cancel the VM's execution owner instead. The entry
-  pushes only a boolean or a light userdata for that reason.
+- **A registry reference or a number-to-string conversion on a reporting
+  path**, and **any allocating Lua operation from inside a callback**.
+- **Running Lua, or closing, from a callback of the same VM** (`VmReentered`).
+- **Cancelling a callback thread.**
 
 ### Process-global state and thread affinity
 
-The binding declares **no OS-thread affinity**, and this slice adopted none: the
-suite creates VMs, runs chunks, takes callbacks, and closes from ordinary
-`forkIO` threads, and the hazard runner drives one from a thread other than the
-main one. A VM may be driven from any Haskell thread its owner chooses, one at a
-time.
+The binding declares **no OS-thread affinity**: a VM may be driven from any
+Haskell thread its owner chooses, one at a time. Neither the binding nor the
+bridge adds a process-global lock; the only serialization is the per-VM gate.
+Two locks are reached indirectly: the RTS's stable-pointer table and the C
+allocator. Lua shares no state between `lua_State`s.
 
-The binding and this bridge introduce **no process-global lock**; the only
-serialization either adds is the per-VM gate. Two locks are still reached
-indirectly, and neither is this bridge's to remove: the RTS's stable-pointer
-table, when a callback userdata is created or collected, and the C allocator
-Lua's default allocation function uses. The Lua interpreter holds no state
-shared between `lua_State`s, which is why two VMs share no globals.
-
-The suite runs with `-threaded -rtsopts -with-rtsopts=-N2`, and so does the
-`lua-hazard` executable. `-N2` rather than `-N`, so every machine runs the same
-thing: the hazard needs one thread inside Lua and one observing it.
-
-The hazard runner carries four modes. The allocation sweep and progress proof
-are routine examples. The uninterruptible chunk is selected separately by
-`lua-hazard-probes`, which deliberately exhausts its observation window. The fourth,
-`callback-cancellation`, is a diagnostic — it cancels callback threads, which
-the contract does not support, and ends the process some of the time, which is
-the evidence for saying so. Run it by hand; the suite does not assert on it.
-
-The independent-progress proof runs `lua-hazard capability-release` with
-`+RTS -N1`, overriding that. Two things make it mean something.
-
-One capability is what makes it falsifiable: a Haskell thread can run during a
-foreign call only if the call released the capability, so an `unsafe` import
-would let no Haskell run at all inside the call. With two capabilities the same
-example passes either way.
-
-And the observation is made from inside Lua, by a count hook in the hazard
-runner's own C. Every signal Haskell can see from a running chunk arrives
-through a callback, and a callback is Haskell — so work observed around one
-proves only that one Haskell thread ran while another did. The hook samples a
-counter twice from within Lua's instruction loop, with nothing but Lua
-instructions in between; growth between those samples happened while Lua was
-executing. The test is that they differ, not that they differ by some amount,
-which would be a claim about throughput. What the hook costs is that it
-interrupts the interpreter every 200,000 instructions, which slows the chunk and
-creates yield points: that changes how much growth is seen, not whether any is
-possible, and no latency bound is read out of it.
-
-The in-process example in `Test.Lua.Independence` shows a second VM running to
-completion while the first VM's call is outstanding. That is deterministic, and
-it says nothing about capability release; it does not claim to.
+The suite and `lua-hazard` run with `-threaded -rtsopts -with-rtsopts=-N2`.
+The hazard runner has four modes: the allocation sweep and
+`capability-release` (run with `+RTS -N1`, observed by a count hook inside
+Lua, so it fails if the call did not release the capability) are routine; the
+uninterruptible chunk is selected by `lua-hazard-probes`;
+`callback-cancellation` is run by hand and ends the process some of the time.
 
 ## Lifetimes
 
-`closeVm` is terminal and runs once, and the VM's phase distinguishes *closing*
-from *closed*. The caller that finds it open runs the teardown holding the
-operation gate; the phase is `Closing` throughout, so an operation that arrives
-meanwhile is refused, and a second `closeVm` waits for that one teardown rather
-than being told the VM is closed while Lua is still running a finalizer. The
-teardown is masked, so a cancellation arriving during it can neither release a
-callback's borrowed dependencies early nor leave a half-finished close for a
-later call to retry.
+`closeVm` is terminal and runs once. The caller that finds the VM open runs
+the teardown holding the operation gate with the phase `Closing`: an operation
+arriving meanwhile is refused, and a second `closeVm` waits for that one
+teardown. The teardown is masked.
 
-Dependencies are released only after `lua_close` has returned, because until then
-Lua's finalizers are still running. A callback's release is retained *before* the
-callback is published, so there is no ordering in which Lua can reach a callback
-whose release is not held; a publication that then fails leaves a release that
-runs at the close and frees something never used, which is the harmless
-direction of that pair. Every release is attempted, and their failures — together
-with any failure a Haskell finalizer raised while `lua_close` ran it, which
-belongs to no caller's operation and would otherwise be observed by nobody — are
-collected into one `CloseFault` rather than letting the first hide the rest.
-Every failing finalizer is kept, not just the first: an operation's first
-callback failure is the one its caller is owed, but a close is not one
-operation — `lua_close` runs each pending finalizer, and each can fail on its
-own account.
+Dependencies are released only after `lua_close` has returned, because Lua's
+finalizers run until then. A callback's release is retained *before* the
+callback is published, so Lua can never reach a callback whose release is not
+held; a failed publication leaves a release that runs at the close. Every
+release is attempted, and their failures, with every failure a Haskell
+finalizer raised during `lua_close`, are collected into one `CloseFault`.
+Each is a `CloseFailure` with its origin (`FromFinalizer`,
+`FromRefusedFinalizer`, `FromRelease`, `FromStrandedOperation`,
+`FromTruncation`) and the exception with its context.
 
 An unrestricted `lua_close` is deliberately **not** wired into
-`Hetoimasia.Foundation.Resource`'s `withResource`. The resource contract's
-release discipline is written for releases whose blocking is controlled, and
-claiming it here would assert a property a close that runs arbitrary Lua
-finalizers does not have. The protected owner, below, is the facility that
-holds the VM's lifetime without making that claim: it masks the close itself and
-records what the close failed with through the foundation's evidence seam.
+`withResource`: the resource contract's release discipline assumes controlled
+blocking, which a close running arbitrary Lua finalizers does not have. The
+protected owner holds the lifetime instead.
 
-A `CloseFault` collects each failure as a `CloseFailure`: where it came from
-(`FromFinalizer`, `FromRefusedFinalizer`, `FromRelease`, `FromStrandedOperation`
-or `FromTruncation`) and the exception with the context it was caught with, so a
-finalizer's or a release's own annotations are kept. A VM made by `newVm` is
-*unmanaged*: no thread owns it beyond the gate's mutual exclusion, and the
-callbacks its finalizers reach all run. A library that fails to open, in `newVm`
-or in an owner, closes the interpreter through this same close before the
-failure is raised, and a failure of that close is retained beside it.
-
+A VM made by `newVm` is *unmanaged*: nothing owns it beyond the gate, and the
+callbacks its finalizers reach all run. A library that fails to open closes
+the interpreter through the same close before the failure is raised, and that
+close's failure is retained beside it.
 ## The VM owner
 
-`Hetoimasia.Scripting.Lua.Owner` offers the protected IO lifetime of one VM
-(LUA-2; design P-3, D-1, D-15):
+`Hetoimasia.Scripting.Lua.Owner` offers the protected IO lifetime of one VM:
+`withVmOwner` takes a `VmConfig` (libraries or a library profile, initial
+chunks, an owner name, a registration and its policy, value limits, initial
+modules; `vmConfig` and `vmProfileConfig` build one) and lends its body an
+`OwnedVm`. The body uses `evalOwned`, `callOwned`, `loadModule`,
+`loadedModule`, `callEntry`, `startTask`, `resumeTask` and `closeTask`.
+`OwnedVm` exposes no Lua state and no way to close the VM: only the lifetime
+does.
 
-```haskell
-withVmOwner ∷ VmConfig → (OwnedVm → IO r) → IO r
-data VmConfig = VmConfig
-  { vmLibraries ∷ [Library], vmLibraryProfile ∷ Maybe LibraryProfile
-  , vmInitialChunks ∷ [(ChunkName, ByteString)]
-  , vmOwnerName ∷ Text, vmRegistration ∷ Registration, vmPolicy ∷ [Text]
-  , vmValueLimits ∷ ValueLimits, vmModules ∷ [ModuleSource] }
-vmConfig    ∷ [Library] → VmConfig
-vmProfileConfig ∷ LibraryProfile → VmConfig
-evalOwned   ∷ OwnedVm → ChunkName → ByteString → IO ()
-callOwned   ∷ OwnedVm → Text → IO ()
-loadModule  ∷ OwnedVm → ModuleSource → IO ModuleHandle
-loadedModule ∷ OwnedVm → ModuleRef → IO (Maybe ModuleHandle)
-callEntry   ∷ OwnedVm → ModuleHandle → Text → [Value] → IO CallResult
-startTask   ∷ OwnedVm → ModuleHandle → Text → [Value] → IO TaskStart
-resumeTask  ∷ OwnedVm → Task → IO TaskStep
-closeTask   ∷ OwnedVm → Task → IO ()
-```
+The lifetime, in order:
 
-`withVmOwner` constructs one VM over exactly the libraries named (the empty list
-opens none), installs the registration's granted bindings, loads the initial
-chunks and the initial modules inside the lifetime, hands the body that VM
-and only that VM, and closes it on every exit. It depends on foundation and the
-binding and on nothing else: no runtime, GLFW, Vulkan or game package (P-1).
-`OwnedVm` exposes no Lua state, stack index, registry reference, coroutine,
-closure or native address, and no way to close the VM: only the lifetime does.
+1. The interpreter and its control state are allocated, masked (a failure
+   here leaves nothing to close).
+2. Initialization runs with the caller's masking state restored: the
+   libraries in order, the granted bindings, the initial chunks in order, the
+   initial modules in order.
+3. The body runs, unless initialization failed.
+4. The VM is closed, whatever ended the steps before.
+5. Every cancellation still pending is taken at one place, and the outcome is
+   composed.
 
-The lifetime, in order: the interpreter and its control state are allocated,
-masked (a failure here leaves nothing to close); initialization runs with the
-caller's masking state restored — the libraries in order, then the granted
-bindings, then the initial chunks in order, then the initial modules in order;
-the body runs unless initialization failed; the VM is closed, whatever
-ended the steps before it; every cancellation still pending is taken at one
-place, and the outcome is composed. The VM is never reachable half-constructed:
-the body does not run unless every initialization step succeeded, and the VM a
-failed step leaves is closed through the same close before the failure is
-raised.
+The VM is never reachable half-constructed.
 
 ### One owner per VM
 
-The gate is mutual exclusion, not identity: a thread that takes it may run Lua.
-A VM an owner constructed is stricter. It belongs to the thread that runs its
-lifetime, its execution owner, and an operation or a close asked by any other
-thread is refused with `VmNotOwned` *before* the gate is taken, so a refused
-attempt runs no Lua, changes nothing and does not disturb the rightful owner,
-which goes on using the VM. That holds for a thread the body started, for a second
-owner handed the first's VM, and for a reference that escaped the body, as long as
-the VM is open. After the lifetime every thread's attempt is refused with
-`VmClosed`. A callback's own attempt on its VM is `VmReentered`, as before.
+A VM an owner constructed belongs to the thread that runs its lifetime. An
+operation or close asked by any other thread is refused with `VmNotOwned`
+*before* the gate is taken, so it runs no Lua and does not disturb the owner.
+That holds for a thread the body started, a second owner handed the VM, and a
+reference that escaped. After the lifetime every attempt is `VmClosed`. A
+callback's own attempt on its VM is `VmReentered`.
 
 ### Any number of independent owners (D-15)
 
-Owners are independent. Any number may be live at once, created and closed in any
-order, on any threads. No owner shares a VM, a Lua global state, a registry or a
-callback table with another, so closing, failing or cancelling one leaves every
-other one usable, its state unchanged and its evidence unaffected. There is no
-pool, scheduler or sharding across them: an owner is the thread running its
-lifetime.
+Any number of owners may be live at once, created and closed in any order on
+any threads. None shares a VM, global state, registry or callback table with
+another, so closing, failing or cancelling one leaves the others unchanged.
+There is no pool or scheduler across them.
 
 ### The exit and evidence matrix
 
-Whatever ends the lifetime keeps its own type, value and context. The close's
-failures are retained beside it as cleanup evidence, each with the context it was
-caught with and under a label naming its source (`lua finalizer`, `lua finalizer
-refused`, `lua release`, `lua operation`, `lua evidence truncated`, `lua
-coroutine close`, `lua close`), through `composeCleanup`, the foundation's seam below. Evidence is read
-back with `cleanupFailures` or `cleanupFailuresInContext`, which is what a
-supervisor reads.
+Whatever ends the lifetime keeps its type, value and context. The close's
+failures are retained beside it as cleanup evidence through `composeCleanup`,
+each with its context and a label naming its source (`lua finalizer`, `lua
+finalizer refused`, `lua release`, `lua operation`, `lua evidence truncated`,
+`lua coroutine close`, `lua close`). A supervisor reads them with
+`cleanupFailures` or `cleanupFailuresInContext`.
 
 | Exit | What the owner raises | Cleanup evidence |
 |---|---|---|
 | Body returns, close succeeds | The body's result | None |
-| Body fails, close succeeds | The body's failure, unchanged | None: a close that succeeded is never reported |
-| Body fails, close fails | The body's failure | Every close failure, finalizers' first then releases' |
-| Body returns, close fails | The first close failure | Every close failure, that first one included, so it is the failure and cleanup evidence at once |
-| Body returns with tasks still suspended | The result, unless a close fails | Each suspended task's coroutine is closed first, in the order the tasks started, every one attempted whatever another does; a to-be-closed variable's error is evidence under `lua coroutine close` (see [Closing](#closing-a-task)) |
-| Construction or initialization fails at any step | That failure, after the VM that was made is closed | Any failure of that close |
+| Body fails | The body's failure, unchanged | Every close failure, finalizers' first then releases'; none if the close succeeded |
+| Body returns, close fails | The first close failure | Every close failure, that first one included |
+| Body returns with tasks still suspended | The result, unless a close fails | Each task's coroutine is closed first, in start order, every one attempted; a to-be-closed variable's error is evidence under `lua coroutine close` (see [Closing](#closing-a-task)) |
+| Construction or initialization fails | That failure, after the VM that was made is closed | Any failure of that close |
 | Cancellation before the lifetime | The cancellation; nothing was constructed | None |
-| Cancellation during initialization or the body | The cancellation, after the VM is closed | Any failure of the close |
-| Cancellation during the close | The cancellation, after the close has completed | Every close failure, on the cancellation |
-| Repeated cancellation | The first; the others are absorbed by it | As above |
-| Cancellation after the body failed | The cancellation, which supersedes the body's failure as it would for any scope | The close's failures; the body's failure stays reachable as the failure the cancellation was raised while handling (`WhileHandling`) |
+| Cancellation during initialization, the body or the close | The cancellation, after the close has completed; repeated ones are absorbed by the first | Every close failure |
+| Cancellation after the body failed | The cancellation, which supersedes the body's failure | The close's failures; the body's failure stays reachable as `WhileHandling` |
 
-A cleanup failure stays cleanup, including when a cancellation is the primary
-failure: the exception raised is an asynchronous exception, which is what makes a
-worker's outcome cancelled, and its context carries the evidence a supervisor
-classifies as cleanup. It is never re-raised as a new script error that a
-supervisor would read as a normal stop.
+**A cleanup failure stays cleanup**, also when a cancellation is primary: the
+exception raised is asynchronous, so a worker's outcome is cancelled, and it
+is never re-raised as a script error a supervisor would read as a normal stop.
 
 ### The evidence seam in foundation
 
-`Hetoimasia.Foundation.Resource.composeCleanup` is the public seam that composes a
-primary failure with cleanup failures its caller *already caught* from a release
-it ran itself: it neither runs nor masks anything, issues each failure its
-identity, keeps every payload immutable, preserves contexts, nested evidence and
-order, and applies the failure table the scopes use. It is the minimal additive
-seam P-3 asked for, so the host imports no private foundation module. See
+`Hetoimasia.Foundation.Resource.composeCleanup` composes a primary failure
+with cleanup failures its caller already caught from a release it ran itself.
+It neither runs nor masks anything. See
 [docs/resources.md](../../docs/resources.md#caller-run-cleanup).
 
 ### Cancellation points
-
-Where a cancellation can be delivered is what the bridge already proves, not an
-assumption (see [Error and cancellation transport](#error-and-cancellation-transport)
-and the hazard probes): a thread inside a Lua call is not cancelled, because the
-call is `safe`, and the exception waits until it returns. Each bridge operation
-runs masked, so it lands at the boundary after the call's bookkeeping.
 
 | Where the owner is | A cancellation |
 |---|---|
 | Before `withVmOwner` | Lands outside the lifetime; nothing is constructed |
 | Allocating the VM | Deferred: masked |
 | Initializing or in the body, outside Lua | Delivered; ends that step; the VM is closed |
-| Initializing or in the body, inside a Lua call or a callback | Waits for the call to return, then as above |
-| Closing, including inside a finalizer or a retained release | Deferred: the close is masked and cannot be interrupted; dependencies are released only after `lua_close` returns, each release running uninterruptibly as a scope's does, so a cancellation neither lands inside one nor is taken for its failure; it is taken afterwards |
+| Initializing or in the body, inside a Lua call or callback | Waits for the call to return, then as above |
+| Closing, including inside a finalizer or a retained release | Deferred; taken after the close |
 
-The close of the interpreter is *not* run as `uninterruptibleMask_`, and the
-owner is not a `withResource`. It is masked and runs once; the retained
-dependency releases that follow it are Haskell releases with a controlled
-blocking duration, and run uninterruptibly as any scope's release does; if a finalizer never returns the
-owner waits as the thread running it does, retains the dependencies and never
-detaches the VM. Repeated cancellation therefore cannot abandon a live VM, free
-callback dependencies under it, or start a second close, and every cancellation
-that is pending when the close has finished is taken together, however many, so
-a later one cannot supersede the exception that carries the evidence. The owner
-stops taking them when none is pending; a thread that cancels it without end keeps
-it there, as it would keep any masked region.
+The interpreter's close is masked, not `uninterruptibleMask_`, and runs once;
+the retained dependency releases after it run uninterruptibly, as a scope's
+do. **If a finalizer never returns the owner waits**, keeps the dependencies
+and never detaches the VM. All cancellations pending when the close finishes
+are taken together, so a later one cannot supersede the exception carrying the
+evidence.
 
 ### Shutdown phase and the finalizer allowlist
 
-Before the state closes the owner closes admission: every operation asked of the
-VM is refused. A callback reached from a Lua finalizer runs only if the owner's
-finalizer allowlist names it. The allowlist is exactly the bindings of the
-namespaces the owner is granted that the registration declares
-finalizer-eligible, named `namespace.binding`; the default is empty because no
-binding is eligible by default, and the asynchronous kind can never be (P-3).
-The allowlist is applied before the call is dispatched: before its arguments are
-read, its handles checked or its action run. Any other binding is refused with
-`FinalizerRefused` without running,
-and the refusal is recorded as cleanup evidence even if the finalizer's script
-caught the error it raised. What is recorded from finalizers is bounded: the
-first 64 failures are kept in the order they happened, and one further entry says
-how many were dropped (`FinalizerEvidenceTruncated`). Finalizers cannot start
-asynchronous work, wait for another stopping service or re-enter the VM, because
-nothing but an allowlisted callback runs, and an operation on the VM is refused.
+Before the state closes the owner closes admission: every operation on the VM
+is refused. A callback reached from a Lua finalizer runs only if the owner's
+finalizer allowlist names it: exactly the granted bindings the registration
+declares finalizer-eligible. The default is empty, and the asynchronous kind
+can never be eligible. The allowlist is applied before arguments are read. Any
+other binding is refused with `FinalizerRefused` without running, and the
+refusal is cleanup evidence even if the finalizer's script caught it. The
+first 64 finalizer failures are kept in order, and one further entry counts
+the dropped (`FinalizerEvidenceTruncated`).
 
 ### A scope around each callback
 
-An owner that holds something can lend it to a callback and take it back,
-whatever the callback does, by running a scope around each of the VM's
-callbacks. `withVmOwnerScoped` is `withVmOwner` with a `CallbackScope`: a function
-that receives the callback and a `CallbackSite` and runs it, on the callback's own
-thread. It starts after the VM has recorded the thread as one of its callbacks
-and ends before the record is removed, so everything it set up exists for exactly
-the callback's duration, and a callback that fails still ends it. It runs for
-every callback the VM runs: those of the initial chunks and the modules while
-they load, of a task's segments, of a closing handler, and of a finalizer-eligible
-binding the policy lets run while the VM closes. A callback a finalizer policy
-refuses never runs, so the scope never does for it.
-
-The site answers one question, `siteIsCallback`: whether the calling thread is
-one of this VM's recorded callback threads right now. It is the record the VM
-already keeps to refuse an operation re-entered from a callback (`VmReentered`),
-read at the time of the question. A thread the callback starts is not one, and
-neither is a callback of another VM, which is the same limit `VmReentered` has
-and is why a scope that lends something needs the question: it can tell the
-callback it lent to from every other thread without taking the thread's word.
-The scope runs masked and must neither raise nor wait, because it is not part of
-the callback's action and nothing is there to contain a failure of it; what the
-callback raises passes through unchanged. `withVmOwner` is the same lifetime with
-no scope, and nothing about reentry, cancellation or the exit matrix changes.
-
-### What proves it
-
-`Test.Lua.Owner.*` hold each part of this to expected values written in the
-tests. The exit matrix; partial construction at each step, with an allocator
-budget swept so that memory runs out at the state's allocation, while a library
-opens and while a chunk runs, for an explicit list and for the M1 profile (which
-`Test.Lua.Owner.Profile` also pins on real Lua: every exclusion through every
-alias, from the first chunk and from a module with no chunk before it, the exact
-surface left, ordinary caught and uncaught errors, permitted computation,
-unchanged explicit-list and empty-library owners, independent profiled and general
-owners, and the refusal of a profile with a library list); cancellation before, during initialization, the
-body and the close, repeated, and with a failing close, with the cancellation
-delivered by coordinated blocking and never by sleeping; the shutdown phase and
-an empty allowlist, a denied callback performing no action and leaving evidence
-even when Lua caught its refusal, and the bound; ownership by a thread the body
-started, a second owner and a stale reference; and ten owners live at once on
-separate threads, ended in a scrambled order, one failing, one cancelled and one
-closed with a failing finalizer; the scope around a callback, run for exactly the
-callback's duration on its own thread, ended by a failing callback, and told by the
-VM's own record which threads are callbacks. `Test.Lua.Opacity` compiles the clients that try
-to reach a state or a native handle through the owner or to bypass it with the
-bridge's operations, and one that uses the whole public owner contract and links
-and runs. Cancellation tests prove ordering, not Linux behavior: CI is what runs
-them where an asynchronous-exception race can differ.
+`withVmOwnerScoped` is `withVmOwner` with a `CallbackScope`: a function that
+receives each callback and a `CallbackSite` and runs it, on the callback's own
+thread, for exactly the callback's duration. It runs for every callback the VM
+runs (initial chunks and modules, task segments, closing handlers, allowed
+finalizer bindings) and still ends when the callback fails. `siteIsCallback`
+answers whether the calling thread is one of this VM's recorded callback
+threads right now, so a scope that lends something can tell the callback it
+lent to from every other thread. **The scope runs masked and must neither
+raise nor wait.**
 
 ## Registration, modules and bounded values
 
-The registration and value boundary (LUA-3; design P-4, D-2, D-6, D-9, D-12 to
-D-15) is what an application uses to expose a narrow capability to its own
-scripts. It names no concrete namespace, depends on foundation and the binding
-only (P-1) — `Test.Lua.Boundary.Dependencies` reads the Cabal stanzas and the
-imports to check that — and grants nothing to a mod: confinement, IPC and
-asynchronous providers are later slices.
+What an application uses to expose a narrow capability to its own scripts. It
+names no concrete namespace and grants nothing to a mod.
 
 ### Registration
 
-A `Registration` is plain data and closures, built once and validated where it is
-built, and opaque: its parts are read with ordinary functions, and neither a
-registration, a namespace, a binding nor a `ValueLimits` has an exported record
-label, so none can be updated into one that skipped validation: `registration ∷ [CapabilityType] → [Namespace] → Either
-RegistrationRefusal Registration`. It holds application-named *namespaces* of
-named *bindings*, and the *capability types* the application's scripts may be
-handed. One registration is usable by any number of owners at once. A binding
-declares its kind, the schemas of its arguments and of its results, and three
-eligibilities (D-14):
+A `Registration` is plain data and closures, built once by `registration`,
+validated there, and opaque (no exported record label, so none can be updated
+past validation). It holds application-named *namespaces* of named *bindings*
+and the *capability types* scripts may be handed. One registration serves any
+number of owners. A binding declares its kind, its argument and result
+schemas, and three eligibilities:
 
-| Kind | Constructor | Delivered here | Answers |
-|---|---|---|---|
-| snapshot query | `snapshotQuery` | trusted direct path | values |
-| owned state operation | `stateOperation` | trusted direct path | values |
-| command or UI intention | `commandIntention` | trusted direct path | `true, nil` accepted, or `false, reason` (at most 256 UTF-8 bytes) as data |
-| asynchronous native request | `asynchronousNativeRequest`, `asynchronousNativeRequestIn` | an owner configured with a request context | from an owner with none, a Lua call is a typed `NotYetSupported` fault and the action never runs; from one with it, the action runs and (`asynchronousNativeRequestIn`) is handed that owner's own context (see [Asynchronous requests](#asynchronous-requests)) |
-| lifecycle operation | `lifecycleOperation`, `lifecycleOperationIn` | an owner configured with a lifecycle context | from an owner with none, a Lua call is a typed `NotYetSupported` fault and the action never runs; from one with it, the action runs and (`lifecycleOperationIn`) is handed that owner's own context (see [Lifecycle services](#lifecycle-services)) |
-| scheduler operation | `yieldOperation`, `waitOperation` | trusted direct path | nothing: the task's coroutine is suspended (see [Tasks](#tasks-and-the-coroutine-library)); a wait for a request's settlement (`WaitSettlement`) is delivered only to an owner configured with a request context |
+| Kind | Constructor | Answers |
+|---|---|---|
+| snapshot query | `snapshotQuery` | values |
+| owned state operation | `stateOperation` | values |
+| command or UI intention | `commandIntention` | `true, nil` accepted, or `false, reason` (at most 256 UTF-8 bytes) as data |
+| asynchronous native request | `asynchronousNativeRequest`, `asynchronousNativeRequestIn` | only on an owner configured with a request context (the `In` form is handed that context); otherwise a `NotYetSupported` fault and the action never runs. See [Asynchronous requests](#asynchronous-requests) |
+| lifecycle operation | `lifecycleOperation`, `lifecycleOperationIn` | the same, with a lifecycle context. See [Lifecycle services](#lifecycle-services) |
+| scheduler operation | `yieldOperation`, `waitOperation` | nothing: the task's coroutine is suspended (see [Tasks](#tasks-and-the-coroutine-library)); `WaitSettlement` needs a request context |
 
-The defaults are the safe ones: a binding is **direct-eligible** and nothing
-else, so a default registration exposes nothing to a mod
-(`confinedEligibleBindings` of one is empty) and a direct-only binding needs no
-IPC equivalent. `confinedEligible` is refused when any schema of the binding
-carries a capability, because a handle into one VM has no meaning to a process
-that cannot hold it, and it grants nothing by itself: no grant exists until the
-broker that enforces one. It is refused for a scheduler operation as well, which
-suspends a coroutine of the trusted path. `finalizerEligible` is refused for the
-asynchronous kind. `withoutDirectPath` keeps an owner from installing the binding at all.
+A binding is **direct-eligible** and nothing else by default, so a default
+registration exposes nothing to a mod. `confinedEligible` is refused when a
+schema carries a capability and for a scheduler operation; it grants nothing
+by itself. `finalizerEligible` is refused for the asynchronous kind.
+`withoutDirectPath` keeps an owner from installing the binding.
 
-Refused when the registration is built: an invalid or duplicate namespace,
-binding or capability-type name; a namespace that would shadow a global the
-standard libraries define (`standardGlobals`); a bound passed; a schema that is
-too deep or too wide, repeats a record field or names an undeclared capability
-type; a confined eligibility on a binding with a capability in its schemas; a
-finalizer eligibility on the asynchronous kind. Each bound is pinned by
-`Test.Lua.Boundary.Registration` at the bound and one past it:
+Refused when the registration is built: an invalid or duplicate name; a
+namespace shadowing a standard-library global (`standardGlobals`); a bound
+passed; a schema too deep or wide, repeating a record field or naming an
+undeclared capability type; the eligibility refusals above.
 
 | What | Bound |
 |---|---|
 | a name | 1 to 64 ASCII letters, digits and underscores; not starting with a digit; not a Lua keyword |
-| namespaces in a registration | 64 |
+| namespaces in a registration; capability types | 64 each |
 | bindings in a namespace | 256 |
-| capability types | 64 |
 | arguments, results to a binding | 16 each |
-| nesting of a schema | 8 |
-| fields of a record schema | 64 |
+| nesting of a schema; fields of a record schema | 8; 64 |
 
 ### Per-owner policy
 
-An owner is configured with a registration and a policy, `vmPolicy`: the
-namespaces of it that this owner exposes beside its explicit standard-library set
-(D-15). Only granted namespaces are visible to its scripts. The bindings are
-installed during construction, inside the protected lifetime, after the libraries
-and before any initial chunk or module (P-3 step 2), and the set is fixed for the
-VM's lifetime. Only a binding eligible for the direct path is installed. The
-namespace tables and the bindings are created by raw access, so no metamethod of
-the globals runs. A policy naming a namespace the registration does not declare
-(`PolicyUnknownNamespace`), a failure to install, and memory running out while
-installing end construction like any other initialization failure: the VM is
-closed through the same close and the body never runs. Which standard libraries a
-script can reach is the owner's explicit set (`coroutine` is selectable like the
-others; `utf8` is not offered), or the set of a library profile (below), and the
-debug library an owner opens has no `sethook`, because a hook is script-defined
-Lua that Lua would run while a fault's traceback is being recorded. Opening the
-base library through an explicit list brings `load`, `loadfile`, `dofile` and
-`collectgarbage` with it, as Lua ships them: an owner that must not read the disk
-or compile source selects the M1 library profile (below), which is not an
-explicit list, rather than leaving the base library out.
+`vmPolicy` names the registration's namespaces this owner exposes. The
+bindings are installed during construction, after the libraries and before
+any initial chunk or module, by raw access (no metamethod runs), and the set
+is fixed for the VM's lifetime. A policy naming an undeclared namespace
+(`PolicyUnknownNamespace`), a failed install and memory exhaustion end
+construction like any initialization failure.
+
+The standard libraries a script reaches are the owner's explicit set
+(`coroutine` is selectable; `utf8` is not offered) or a profile's. The debug
+library an owner opens has no `sethook`. **An explicit `LibraryBase` brings
+`load`, `loadfile`, `dofile` and `collectgarbage`**: an owner that must not
+read the disk or compile source selects the M1 profile.
 
 ### The M1 library profile
 
-`vmLibraryProfile = Just LibraryProfileM1` (`vmProfileConfig LibraryProfileM1`
-builds such a configuration) selects the filtered standard-library surface of the
-M1 application's Lua owners, whichever role the owner has (D-5, D-69; LFE-1). It
-is opt-in: `vmLibraries`, the empty list, and the standalone `lua` command are as
-they were, and nothing filters an explicit `LibraryBase`, `LibraryString` or
-`LibraryMath`.
+`vmProfileConfig LibraryProfileM1` selects the filtered standard-library
+surface of the M1 application's Lua owners. It is opt-in; explicit lists and
+the standalone `lua` command are unaffected.
 
-```haskell
-withVmOwner (vmProfileConfig LibraryProfileM1) $ \owner →
-  evalOwned owner (chunkName "check") "assert(load == nil and os == nil and string.dump == nil)"
-```
-
-**Installation order.** The profile is installed inside protected construction:
-the interpreter is allocated, the profile's libraries open, the profile removes
-what it excludes, and only then does anything an application supplies run — the
-after-libraries step of a fixture, the granted bindings (`vmPolicy`), the initial
-chunks, the initial modules. The first authored code, a chunk or a module's
-top-level code, therefore already sees the filtered surface, and so does a module
-loaded from the body later.
-
-**The surface.** A profiled owner has exactly these standard libraries, and
-nothing else:
+**Order.** Inside protected construction the interpreter is allocated, the
+profile's libraries open, the profile removes what it excludes, and only then
+does anything the application supplies run. The first authored code already
+sees the filtered surface.
 
 | Library | Kept | Removed |
 | --- | --- | --- |
 | base (`_G`) | `_G`, `_VERSION`, `assert`, `error`, `getmetatable`, `ipairs`, `next`, `pairs`, `pcall`, `print`, `rawequal`, `rawget`, `rawlen`, `rawset`, `select`, `setmetatable`, `tonumber`, `tostring`, `type`, `warn`, `xpcall` | `load`, `loadfile`, `dofile`, `collectgarbage` |
 | `string` | `byte`, `char`, `find`, `format`, `gmatch`, `gsub`, `len`, `lower`, `match`, `pack`, `packsize`, `rep`, `reverse`, `sub`, `unpack`, `upper` | `dump` |
 | `table` | `concat`, `insert`, `move`, `pack`, `remove`, `sort`, `unpack` | — |
-| `math` | every function and constant of the bundled interpreter's `math` except those removed | `random`, `randomseed` |
+| `math` | everything else | `random`, `randomseed` |
 | `coroutine` | `close`, `create`, `isyieldable`, `resume`, `running`, `status`, `wrap`, `yield` | — |
-| `os`, `io`, `package` with `require`, `debug` | — | never opened: absent in full, with no search path, searcher or native loader |
+| `os`, `io`, `package` with `require`, `debug` | — | never opened |
 
-The removal is made on the library tables themselves, once, after they open. The
-string metatable's index is the `string` table, the registry's loaded-module table
-holds the same tables, and a module's environment reads through to the globals,
-so `rawget(_G, name)`, `_G` and `_ENV`, a module's environment,
-`getmetatable('').__index` and `('').dump` all find the name absent, and the
-`next`/`pairs` enumeration of each table does not list it. `package` and `debug`
-are absent, so a script has no way to the registry or to reopen an omitted
-library. Granted namespaces cannot bring a name back: the registration refuses
-the standard names (`os`, `io`, `load`, `loadfile`, `dofile`, `debug`, `package`,
-`require`, `collectgarbage` and the rest). This is about the supplied standard
-library: trusted Lua may define ordinary functions or tables with the same
-names.
+The removal is made once on the library tables themselves, so every route
+(`rawget(_G, name)`, `_ENV`, a module's environment, the string metatable)
+finds the name absent. Granted namespaces cannot bring a name back: the
+registration refuses the standard names. Trusted Lua may still define its own
+functions with those names.
 
-`print` and `warn` keep Lua's stock behaviour under the profile alone: `print`
-writes to the process's standard output, and `warn` writes to its standard error
-once a script has switched warnings on with `warn('@on')`. Bounded, rebound
-script output is a later slice (D-71, LFE-12), not something the profile
-delivers; filtering removes the ambient OS functions, not every way a process
-writes.
-
-**Errors.** A call to a removed function is an ordinary Lua operation on a
-missing value: `pcall` catches it, and later permitted computation goes on. An
-uncaught one follows the existing attributed Lua fault path — a `LuaFault` from an
-initial chunk, a `BoundaryFault` with a `ScriptFailed` reason from an entry
-point — and is not a latched host failure or a new refusal. The profile ships no
-random generator and makes no determinism claim; a script that needs one writes
-its own seeded one.
-
-**Profile and library list.** A profile owns the owner's whole standard-library
-set, so it cannot be combined with an explicit list. A configuration that selects
-a profile and also names libraries (`LibraryIo`, `LibraryOs`, `LibraryPackage`,
-`LibraryDebug`, or any other) is refused at construction, before any library
-opens or authored code runs, with a `BoundaryFault` of operation `OpenLibraries`
-and reason `ProfileWithLibraries`, through the same construction failure path as
-any other failed step: the VM is closed and the body never runs.
-
-**The protected boundary.** The filtering is one call, `hetoimasia_lua_filter_m1`,
-made as a single `lua_pcall` like `hetoimasia_lua_requiref`: the names it writes
-are built inside the protected frame, no argument crosses it, and a failure — a
-status Lua reports, or a library table missing — is classified like any other
-failed call (`MemoryExhausted` for memory, otherwise `CallFailed`), attributed to
-the stage `profile LibraryProfileM1`, and ends construction through the same
-close. Two independent owners never share a library table, so a profiled owner
-cannot receive a capability another owner opens, and opening, using or closing
-either leaves the other's surface as it was. The profile adds no dependency and
-exposes no Lua state, stack index, registry reference or native pointer.
-
-**What this is not.** Filtering removes ambient OS functions and arbitrary-source
-loading. It is not hostile-code containment: a trusted script can still hang its
-owner or exhaust the process's memory, and cooperative budgets are not hard
-limits. Engine-provided imports, bounded output, a module loader, content roots,
-services and the `run` command are later slices; none is delivered by this
-profile.
+- `print` and `warn` keep Lua's stock behaviour under the profile alone
+  (process stdout; stderr after `warn('@on')`).
+- A call to a removed function is an ordinary Lua error on a missing value.
+  The profile ships no random generator.
+- A configuration that selects a profile **and** names libraries is refused at
+  construction with a `BoundaryFault` (`OpenLibraries`,
+  `ProfileWithLibraries`).
+- The filtering is one protected call, `hetoimasia_lua_filter_m1`; its failure
+  is `MemoryExhausted` or `CallFailed` at stage `profile LibraryProfileM1`.
+- **This is not hostile-code containment**: a trusted script can still hang
+  its owner or exhaust memory.
 
 ### Modules and entry points
 
-A module is Lua source the application supplies under an identity, a name and a
-version (`ModuleSource`); the host reads nothing from disk and searches no path.
-It loads at initialization (`vmModules`; a failure ends the lifetime like an
-initial chunk) or from the body (`loadModule`), is known afterwards by an opaque
-`ModuleHandle` (`loadedModule` gives the body the handle of a module supplied at
-initialization, by identity), and a second load under the same identity is
-refused: there is no live reload. Source is text only; a precompiled chunk is refused. Each module
-runs in an environment of its own (B1): its global assignments are private to it,
-and the owner's standard libraries and granted namespaces are visible to it by
-reading through to the globals. That is separation of names, not a security
-boundary. At most 256 modules, 1 MiB of source, 64 entry points and 128 bytes of
-name or version for one module; a name, version or entry point that does not fit
-is refused with `NoEffect` before anything runs.
+A module is Lua source the application supplies under a name and a version
+(`ModuleSource`); the host reads nothing from disk and searches no path. It
+loads at initialization (`vmModules`) or from the body (`loadModule`) and is
+known by an opaque `ModuleHandle`. A second load under the same identity is
+refused: there is no live reload. Source is text only; a precompiled chunk is
+refused. Each module runs in its own environment: its global assignments are
+private, and the standard libraries and granted namespaces read through to
+the globals. That is separation of names, not a security boundary.
 
-The application declares the entry points, each `Required` or `Optional`, with
-schemas for its arguments and results. They are looked up by raw access in the
-module's environment, so no lookup metamethod can supply or hide one:
+Bounds: 256 modules, 1 MiB of source, 64 entry points, 128 bytes of name or
+version; one that does not fit is refused with `NoEffect`.
 
-- a required entry point the module does not define as a function fails the load
-  with `EntryMissing`, naming module and entry;
-- at call time a required one that has gone is a fault, never an absent answer;
-- an optional one that is not there answers `EntryAbsent`: nothing runs and
-  nothing faults;
-- one that is present and is not a function is a fault, required or optional.
+The application declares each entry point `Required` or `Optional`, with
+schemas. They are looked up by raw access in the module's environment:
 
-An opt-in alternative that **returns a table** the VM keeps as it is, instead of declaring entry points to call, is
-[export modules](#export-modules-and-captured-behaviors); the global-entry modules above are unchanged and remain the
-mode every existing caller uses.
+| Entry point | At load | At call |
+|---|---|---|
+| required, not a function | `EntryMissing` | a fault |
+| optional, absent | — | `EntryAbsent`: nothing runs |
+| present, not a function | — | a fault |
+
+The opt-in alternative that returns a table is
+[export modules](#export-modules-and-captured-behaviors).
 
 ### Values
 
-Values cross as bounded copies, in both directions: a binding's arguments and
-results, an entry point's arguments and results. A value is nil, a boolean, a
-64-bit integer, a float, a byte string, UTF-8 text, a list, a record or a
-capability. The rules:
+Values cross as bounded copies in both directions: nil, boolean, 64-bit
+integer, float, byte string, UTF-8 text, list, record, capability.
 
-- Integers keep their exact value over the whole 64-bit range and floats stay
-  floats. An integer schema refuses every float, an integral one such as `1.0`
-  included; a float schema refuses integers; `SNumber` accepts either and keeps
-  which it was.
-- Byte strings and text are distinct schemas over Lua's one string type, and
-  invalid UTF-8 is refused where text is declared.
-- A list is a table whose keys are exactly `1..n`; a record is a table whose keys
-  are exactly its declared fields, an optional one possibly absent, and an
-  undeclared field is refused. Arity is exact.
-- Tables are read raw. A table carrying a metatable, even an empty one, is
-  refused, so a copy never depends on a metamethod and none runs. A table that
-  contains itself is refused as a cycle (sharing is not a cycle).
-- A nil cannot be kept in a Lua table, so it cannot cross inside one: a nil list
-  element, or a nil value for a record field that is not optional, is refused
-  with `RuleNilInTable`; an optional field that is nil is simply absent from the Lua table, though it
-  is still inspected and so is charged against the limits like any other value.
-- Functions, coroutines, light userdata, and userdata that is not a capability of
-  this VM are refused with a typed reason; so is a table key that is neither an
-  integer nor a string.
-- One value crosses **by reference**, and only into Lua (LFE-11): `VExportTable`, declared by `SExportTable`, names the
-  [export table](#export-modules-and-captured-behaviors) a VM holds in a slot, and the owner pushes **the very table**, under the
-  protected boundary, where a copy would have been built. Functions, cycles and shared upvalues reach Lua as they are; nothing
-  is serialized and nothing is retained for the crossing. `exportTableValue` makes one from an `ExportHandle`. It is checked
-  where it crosses (the VM that builds the crossing must be the one that issued it, `RuleForeignHandle`; a slot that holds no table is
-  an `InternalError`, never a nil) and its size is that of a number, 9 bytes. A script cannot make one, a read from Lua never
-  yields one, and an endpoint's result schema may declare it where a capability is refused, because it names no handle.
+- Integers are exact over 64 bits; floats stay floats. An integer schema
+  refuses every float (`1.0` included); a float schema refuses integers;
+  `SNumber` accepts either and keeps which it was.
+- Byte strings and text are distinct schemas; invalid UTF-8 is refused where
+  text is declared.
+- A list is a table whose keys are exactly `1..n`; a record's keys are exactly
+  its declared fields (an optional one may be absent). Arity is exact.
+- Tables are read raw. **A table with a metatable, even an empty one, is
+  refused**, and so is a cycle (sharing is not a cycle).
+- A nil cannot cross inside a table (`RuleNilInTable`), except as an absent
+  optional field, which is still charged against the limits.
+- Functions, coroutines, light userdata, foreign userdata and table keys that
+  are neither integer nor string are refused with a typed reason.
+- One value crosses **by reference**, and only into Lua: `VExportTable`
+  (schema `SExportTable`, made by `exportTableValue` from an `ExportHandle`)
+  names the [export table](#export-modules-and-captured-behaviors) a VM holds,
+  and the owner pushes the very table. It must come from the VM that issued it
+  (`RuleForeignHandle`); a slot holding no table is an `InternalError`. Its
+  size is 9 bytes. A script cannot make one and a read from Lua never yields
+  one.
 
-A crossing is bounded by bytes, depth and elements, which together cover all the
-values of one call's arguments or one call's results: by default 64 KiB, depth 8
-and 4,096 elements, configurable with `vmValueLimits` up to 16 MiB, depth 64 and
-1,048,576 elements. Bytes are the size of the copy's encoding (1 for nil and a
-boolean, 9 for a number, 5 and the length for a string, 21 for a capability, and
-5 and the size of every key and value for a table), depth counts nested tables (a
-flat table is 1) and elements count every value of the copy, nested ones included
-and table keys not. The reader stops at the first limit it reaches, so the work
-it does is bounded by the limits and not by the input; a refusal's `visited`
-count is at most the element limit plus one. Each limit is pinned at the limit
-and one past it in `Test.Lua.Boundary.Bindings`, `Test.Lua.Boundary.Modules` and
-`Test.Lua.Boundary.Values`.
+One crossing (all arguments, or all results, of one call) is bounded by bytes,
+depth and elements: default 64 KiB, depth 8, 4,096 elements; configurable with
+`vmValueLimits` up to 16 MiB, depth 64, 1,048,576 elements. Bytes are the
+encoding's size (1 for nil and boolean, 9 for a number, 5 plus length for a
+string, 21 for a capability, 5 plus keys and values for a table); depth counts
+nested tables; elements count every value, not keys. The reader stops at the
+first limit reached, so its work is bounded by the limits, not the input.
 
-**A binding's own bound (LFE-19).** `withArgumentLimits limits binding` bounds the crossing of that binding's
-arguments by `limits` as well as by the owner's: for each of bytes, depth and elements the reader applies the smaller of the
-two, while it reads, and stops at the first limit it reaches (a refusal visits at most the limit plus one element). It can only
-tighten: a binding limit above the owner's changes nothing, and it leaves the binding's results and every other binding to the
-owner's limits. The refusal is the one the owner's limits give, an ordinary Lua error for a binding that is opted in
-([Recoverable refusals](#recoverable-refusals)) and a typed fault of the call otherwise, so a family of values with a smaller
-ceiling than the owner's (a scene's 2 MiB inside the common 16 MiB) is refused at its own ceiling and never admitted at the
-common one first. `bindingArgumentLimits` reads it back. `Test.Lua.Boundary.ArgumentLimits` pins it at the limit and one past,
-for a huge input, the stack and registry balance and an allocator budget swept over the read and the refusal.
+`withArgumentLimits limits binding` also bounds that binding's arguments: the
+reader applies the smaller of the binding's and the owner's limit for each
+measure. It can only tighten, and leaves results and other bindings alone.
+`bindingArgumentLimits` reads it back.
 
 ### Handles
 
-A capability is an opaque identity the application hands its scripts: a type it
-declared and a key within it, issued by one VM. In Lua it is a userdata with a
-shared metatable that hides itself (`getmetatable` answers `false`), and copying
-it creates no new authority. Using one is checked every time, before the
-binding's action: it must have been issued by this VM (`RuleForeignHandle`), be of
-the declared type (`RuleHandleType`), and still be live by the application's own
-check for its type (`RuleRetiredHandle`), which runs at every use. A number, a
-table with the same fields or a string with the same contents is not a handle and
-is refused as the wrong kind of value. A module handle carries the identity of
-the VM that issued it: another owner's is refused (`ModuleHandleForeign`), and
-after the lifetime every use is `VmClosed`, as for the VM itself.
+A capability is an opaque identity: a declared type and a key, issued by one
+VM. In Lua it is a userdata whose metatable hides itself; copying it creates
+no authority. Every use is checked before the binding's action: issued by
+this VM (`RuleForeignHandle`), of the declared type (`RuleHandleType`), and
+live by the application's own check (`RuleRetiredHandle`). A module handle
+from another owner is `ModuleHandleForeign`; after the lifetime every use is
+`VmClosed`.
 
-A handle the application's check reports retired is refused by every binding before its action
-runs, with one exception: an explicit release (`releaseOperation`, below and in
-[Instance leases](#instance-leases)). It is declared with the one capability type it releases and
-takes that handle as its only argument, so it is run for a handle whose lease has ended and for
-nothing else. The handle is still checked for being issued by this VM and of that type, and a
-retired handle of another type, or given to any other binding, is refused as before.
+One exception to the liveness check: an explicit release (`releaseOperation`,
+see [Instance leases](#instance-leases)) is declared with the one capability
+type it releases, takes that handle as its only argument, and runs for a
+handle whose lease has ended.
 
 ### Calling a binding
 
-A Lua call to a delivered binding is, in order: the kind is checked (a binding of
-a kind not yet delivered is a `NotYetSupported` fault, decision A1); the argument
-count is checked; the arguments are read into a bounded copy; the copy is checked
-against the schemas, capabilities included; the action runs with copies and
-nothing else — it receives no `OwnedVm`, no Lua state and no handle to its own
-VM, so running Lua on or closing its own VM is refused with `VmReentered` and
-using another owner's VM with `VmNotOwned`; its results are checked against the
-result schemas and encoded under the limits; they are built in Lua. #460's rules
-for trusted callbacks hold: the callback thread's identity is published nowhere
-and nothing is left running past the action's return.
+In order: the kind is checked (`NotYetSupported` for an undelivered kind); the
+argument count; the arguments are read into a bounded copy; the copy is
+checked against the schemas, capabilities included; the action runs with
+copies only (no `OwnedVm`, so its own VM is `VmReentered` and another owner's
+`VmNotOwned`); the results are checked, encoded under the limits and built in
+Lua.
 
-A refusal is a **fault of the call** (decision C1): the binding does not run for
-a refused argument, and the owner's operation raises a typed `BoundaryFault`
-naming the binding, the argument and the rule, even if the script caught Lua's
-side of it with `pcall`. Refusing a result necessarily follows the action, and is
-just as observable. A Haskell failure raised by the action itself keeps #460's
-contract and is not converted: it is re-raised at the owner's boundary with its
-own type and context.
+A refusal is a **fault of the call**: the action does not run for a refused
+argument, and the owner's operation raises a typed `BoundaryFault` naming the
+binding, the argument and the rule, even if the script caught Lua's side with
+`pcall`. A Haskell failure raised by the action is re-raised at the owner's
+boundary with its own type and context.
 
 ### Recoverable refusals
 
-A binding is **generic** unless its registration opts it in: every refusal above is a
-fault of the call a script cannot hide. Two public functions of
-`Hetoimasia.Scripting.Lua.Registration` opt one binding in, and nothing else does; there is
-no owner-wide or catch-all switch.
+A binding is generic (above) unless its registration opts it in. There is no
+owner-wide switch.
 
-- `recoverableRefusals binding` makes the refusals the host makes **before the action** an
-  ordinary Lua error: a wrong number of arguments, a value of the wrong shape, type or
-  encoding, a value past a limit, and a capability that is not of the declared type, was
-  not issued by this VM, or that the application's own check reports retired.
-- `withArgumentCheck check binding` does that too, and has `check` run **after** the host's own checks of the arguments:
-  the arguments were copied, found to be of the declared shapes and within the limits, and every handle live. `check` is
-  `OwnerContexts -> [Value] -> IO (Maybe Text)` and is handed the copied values (never a Lua-visible table, so no
-  authored metamethod runs for it). It decides a fact only the values carry: that an integer is positive, that a sum
-  is representable, that a name is one the application knows. It refuses as an ordinary Lua error exactly as a
-  precondition does, runs no provider or native action, and its reason is bounded by the same 256 bytes. Checks and
-  preconditions run in the order they were added, the preconditions of a binding before its argument checks.
-- `withPrecondition check binding` does that too, and has `check` run first. A precondition
-  is `OwnerContexts -> IO (Maybe Text)`: `Nothing` lets the call go on, `Just reason`
-  refuses it. It runs before the host asks whether a scheduler operation can suspend and
-  before any argument is read, so an adapter can refuse a wait made where it is not allowed
-  (a finite call, a hook that may not wait, the wrong instance) before the host reports
-  anything. Several preconditions run in the order they were added, and the first refusal
-  wins.
+| Function | Effect |
+|---|---|
+| `recoverableRefusals binding` | The refusals the host makes **before the action** become an ordinary Lua error: argument count, shape, type, encoding, a limit, a capability of the wrong type, from another VM or retired |
+| `withPrecondition check binding` | The same, and `check ∷ OwnerContexts → IO (Maybe Text)` runs first: before the host asks whether a scheduler operation can suspend and before any argument is read. `Just reason` refuses |
+| `withArgumentCheck check binding` | The same, and `check ∷ OwnerContexts → [Value] → IO (Maybe Text)` runs **after** the host's own argument checks, on the copied values |
 
-**What the script sees.** An ordinary Lua error whose value is a string,
-`binding: reason`, where `binding` is `namespace.name` and `reason` is at most 256 bytes
-(`refusalReasonLimit`, the bound of a command's rejection) of UTF-8, cut at a character.
-The host's own reasons are short fixed phrases, for example
-`checked.add: argument 1: a float where an integer is declared` or
-`checked.echo_list: argument 1[2]: expected number, found string`; anything of the script's
-own in them, a field name, is cut to 32 characters first, so nothing unbounded is copied. The message is built under a fixed allowance of its
-own, not the owner's value limits, so even the smallest valid byte limit cannot turn a
-refusal the script caught into a fault. A
-precondition's reason is its own and is carried whole when it is within the bound. One
-longer is not truncated: it is a defect of the application, and is a typed
-`BoundaryFault` of the call (`ValueRefused`, `RuleBytesLimit 256`) whether or not the
-binding is opted in. `pcall` catches the error and the invocation goes on and can succeed;
-raised and uncaught it is the script's own error, reported where any is reported
-(`LuaFault`, or `ScriptFailed CallFailed` for a call or task), and under the task's, call's
-or instance's existing policy. There is no `BoundaryFault` and nothing retained on the VM
-for it.
+Preconditions run before argument checks, each group in the order added; the
+first refusal wins.
 
-One refusal is ordinary though it is made after the action began: a credit of a request admission that says it is full for good
-([`CreditRefused`](#what-asking-reserves)). The engine raises it from inside `startAdmitted`, before it has any effect, as
-`OrdinaryCallRefusal`; an opted-in binding's handler answers it with the same ordinary error (`binding: request refused: WHY`),
-and a binding that is not opted in keeps the fault of the call. Nothing else the action does becomes recoverable
-except through the one export below.
+**What the script sees**: an ordinary Lua error whose value is the string
+`namespace.name: reason`, the reason at most 256 UTF-8 bytes
+(`refusalReasonLimit`). `pcall` catches it and the invocation goes on; nothing
+is retained on the VM. Uncaught, it is the script's own error. The host's
+reasons are short fixed phrases, with anything of the script's own cut to 32
+characters. **A precondition's or check's reason over the bound is not
+truncated**: it is an application defect and a typed `BoundaryFault`
+(`ValueRefused`, `RuleBytesLimit 256`), opted in or not.
 
-**`refuseOrdinarily :: Text -> IO a`** (`Hetoimasia.Scripting.Lua.Registration`, owner decision D-88) is for an
-**engine-owned** binding's action that finds, **before it has had any effect**, a fact that makes the call final but is not
-a fault: a state that changed after every check the host makes before the action (a stop, a closure, an instance ending).
-It throws the refusal the handler answers. The caller's contract:
+A refused call never ran its action. It is not a rollback: what the same
+invocation did earlier stands. A precondition reads only engine-owned state
+(the `OwnerContexts`, or what the application captured), never an argument or
+a Lua-visible table, so a script cannot change what it decides.
 
-- The action releases every temporary obligation it took (a pin, a borrow, a draft) **before** it raises this, and never
-  raises it after its effect has been committed to a host: a failure after that point is the application's own and
-  claims no rollback.
-- For a binding opted in to ordinary refusals (`recoverableRefusals`, `withPrecondition`, `withArgumentCheck`) the script
-  sees the same ordinary Lua error as a pre-action refusal, `binding: reason`, that `pcall` catches; the invocation goes
-  on and records nothing on the VM. For any other binding it is the fault of the call, `BindingRefused reason`.
-- The reason has the bound of a precondition's, `refusalReasonLimit` = 256 bytes of UTF-8. One longer is not truncated: it
-  is a defect of the application and a typed `BoundaryFault` of the call (`ValueRefused`, `RuleBytesLimit 256`), whether or
-  not the binding is opted in. The engine's own credit refusal (`CreditRefused`) is a separate exception and keeps its behavior.
-- **It counts as an action run.** The action began, so the action counter of the examples includes it, unlike the
-  refusals made before the action above, which never run it.
-- It is not for application code that is not an engine-owned binding, and not for the application's failures: any other
-  exception from an action is the application's own failure and ends the owner.
+**After the action began**, two refusals are still ordinary for an opted-in
+binding (`binding: reason`), and a fault of the call (`BindingRefused`)
+otherwise:
 
-**No action.** A refused call never ran its action: no provider or native work, no
-request accepted, no resource published, and the action counter of the examples stays at
-zero. It is not a rollback: what the same invocation's earlier Lua and earlier actions did
-stands.
+- a request admission's credit that is full for good
+  ([`CreditRefused`](#what-asking-reserves)), raised inside `startAdmitted`
+  before any effect;
+- **`refuseOrdinarily reason`**, for an **engine-owned** binding's action
+  that finds, **before it has had any effect**, a state that makes the call
+  final but is not a fault (a stop, a closure, an instance ending). The action
+  releases every temporary obligation first and never raises it after
+  committing an effect to a host. It counts as an action run. The reason has
+  the same 256-byte bound and the same defect rule.
 
-**Where the facts come from.** A precondition checks engine-owned state: the
-`OwnerContexts` it is handed (the lifecycle and request contexts the owner was configured
-with, never a value the script supplied) or what the application captured when it built the
-registration. It never reads an argument, a Lua-visible table or a global registry, so a
-script rewriting a global, a field or a metatable cannot change what it decides: the
-same-VM, wrong-instance example rewrites every Lua-visible name it can and is still
-refused. Validation runs no authored metamethod and no coercion: the reader that copies
-arguments is the one every binding uses.
+**A refusal is an error; a response is data.** A binding that returns
+`nil, {code = "busy", message = text}` through declared result schemas has
+answered successfully that it admitted nothing. The host never turns its own
+full-capacity exception into one.
 
-**Error versus data.** A refusal is an error. A *response* is data. A binding whose action
-declares results `[SOptional x, SOptional (SRecord [("code", SText), ("message", SText)])]`
-and returns `nil, {code = "busy", message = text}` has answered, successfully, that it
-admitted nothing: the call is an ordinary success, the checked, bounded result path carries
-it, no handle exists, nothing is retained, and a later call may succeed. Nothing retries
-it. The host never turns its own full-capacity exception into one: that is the engine's
-refusal and keeps its own contract. What admits work atomically and owns capacity is the
-request and lease facade, not this mechanism.
+**What stays fatal**, opted in or not: the application's own failure (an
+action's, a precondition's, a liveness check's); an asynchronous cancellation;
+a bridge defect; an allocation or encoding failure; the refusal of a *result*
+and every failure after the action ran; `SuspendRefused` once the
+preconditions passed; `NotYetSupported`, decided before any precondition. A
+caught refusal records nothing and clears nothing: a fault already recorded on
+the VM is still raised by the operation.
 
-**What stays fatal**, opted in or not: an application's own failure (an action's, a
-precondition's, a liveness check's) with its type and context; an asynchronous
-cancellation; an internal bridge defect; an allocation or encoding failure; the refusal of
-a *result* and every failure after the action ran; the host's own refusal of a scheduler
-operation once the preconditions have passed (`SuspendRefused`, for a call that is not in a
-task, in another coroutine, or where Lua cannot suspend); and `NotYetSupported`, for a
-binding the owner has no context to deliver, which is decided before any precondition
-runs. An opted-in binding does not make its effectful action recoverable: nothing wraps the
-action, and the VM's recorded failure is never cleared. A refusal that is caught records
-nothing, so it cannot erase a fault a generic binding already recorded, a deliberately
-latched failure or an application's failure, and a later success, busy answer or caught
-refusal cannot either; the operation that ran the script still raises it, with the effect
-(`BindingRan`) of everything that followed.
-
-**Finalizers.** Lua turns an error raised in a `__gc` finalizer into a warning and tells
-nobody, so an ordinary refusal there would be silent, where a generic binding's is recorded
-and fails the operation or is kept as cleanup evidence. A refusal of an opted-in binding
-therefore keeps the recorded fault whenever a finalizer may be the caller: for every call
-made while the VM is closing, and for any call made while the collector is not running,
-which is how Lua presents a running finalizer (it answers every collector request with its
-internal stop) and also how a script that stopped the collector looks. The cost of that
-conservative reading is only that a script which stopped its own collector gets the fault
-it always got. A finalizer-eligible binding can be opted in, and the closing finalizer's
-refusal is retained as cleanup evidence exactly as before.
-
-**Compatibility.** Every binding constructor still builds the generic binding; the
-existing examples are unchanged beside the new ones, and the foreign-call protections hold
-on the new path: the message is built by the protected push that results use (an
-allocation failure is a status, never a Lua error raised from a Haskell frame), the C
-closure raises it only after every Haskell frame has returned, the stack and temporary
-references are balanced on every path, and the registration's finalizer, scheduler and
-missing-context refusals are the ones in force. A scheduler operation opted in refuses
-before it reports any suspension, and the same operation not opted in keeps the order
-and the typed fault described under [Where it cannot reach a scheduler](#where-it-cannot-reach-a-scheduler).
-
-A small client, built from the public modules alone:
+**Finalizers.** Lua turns an error in `__gc` into a warning, so an ordinary
+refusal there would be silent. An opted-in binding's refusal therefore keeps
+the recorded fault for every call made while the VM is closing and for any
+call made while the collector is not running (how Lua presents a running
+finalizer, and also a script that stopped its collector).
 
 ```haskell
-import Hetoimasia.Scripting.Lua.Registration
-
-checked, tick ∷ Binding
 checked = recoverableRefusals (snapshotQuery "double" [SInteger] [SInteger] double)
 tick = withPrecondition engineOpen (stateOperation "tick" [] [] (\_ → pure []))
-  where
-    engineOpen _ = (\open → if open then Nothing else Just "engine closed") <$> readIORef engineState
 ```
 
 ```lua
 local ok, err = pcall(app.double, 1.5)
 -- ok == false, err == "app.double: argument 1: a float where an integer is declared"
-print(app.double(21))   -- 42: the invocation went on
 ```
-
-`Test.Lua.Opacity` compiles, links and runs exactly such a client.
 
 ### Fault evidence
 
-A `BoundaryFault` is an ordinary Haskell exception, produced with no Lua run to
-render it. It records the owner (by the name it was configured with, and the
-VM's identity), the operation (`InstallBindings`, `LoadModule`, `CallEntry`,
-`CallBinding`, and for a task `StartTask`, `ResumeTask`, `CloseTask`), the module's name and version and the entry point when a module
-was running, the binding's namespace and name, the source chunk the call was made
-from, a bounded traceback when one was captured, a typed reason, and an `Effect`:
+A `BoundaryFault` is an ordinary Haskell exception, produced with no Lua run
+to render it. It records the owner (name and VM identity), the operation
+(`InstallBindings`, `LoadModule`, `CallEntry`, `CallBinding`, `StartTask`,
+`ResumeTask`, `CloseTask`), the module's name and version and the entry point
+when the call was made from that module's own code, the binding, the source
+chunk, a bounded traceback, a typed reason and an `Effect`:
 
 | Effect | Meaning |
 |---|---|
 | `NoEffect` | refused before any Lua or binding action ran |
 | `LuaRan` | Lua had run in the operation; no binding action had |
-| `BindingRan` | a binding's action had run: application state may have been changed |
+| `BindingRan` | a binding's action had run: application state may have changed |
 
-The effect is the one the operation ended with, not the one at the first fault: a
-refusal the script caught is the operation's failure, and if a binding's action
-runs after it the fault says `BindingRan`. The module and entry point are named
-only when the call was made from that module's own code; a fault raised by
-another module's `__gc` finalizer while an entry point runs names the chunk that
-made the call and no module.
-
-The traceback is built from the debug interface's call records alone
-(`lua_getstack` and `lua_getinfo`; not `luaL_traceback`, whose function-name
-lookup reads the registry through metamethods), so no script-defined Lua can run
-while a fault is recorded, and it allocates nothing; it is bounded at 2,048 bytes
-and 22 levels. The close is an operation of its own: a fault recorded while
-finalizers run names no module or entry point and counts only the actions run
-during the close. A non-string error value, or one whose handler
-failed, is reported by the existing bounded fallback (its Lua type name, never its
-`__tostring`). A fault never claims that recovery is safe: whether state may have
-changed is exactly `Effect`, and task and session identities arrive with later
-slices.
+The effect is the one the operation **ended** with, not the one at the first
+fault. The traceback is built from `lua_getstack` and `lua_getinfo` alone (not
+`luaL_traceback`), so no script Lua runs and nothing is allocated; it is
+bounded at 2,048 bytes and 22 levels. The close is an operation of its own.
 
 ### Phases that execute nothing
 
-Allocating in Lua can start a collection step, and a step can run pending `__gc`
-finalizers: script-defined Lua that can call bindings. So the collector is held
-(stopped, and given back as it was found: a script that stopped it itself keeps it
-stopped) across every host-side phase — reading arguments, building results, the
-entry-point lookup, the set-up of the boundary's registry share, and a module load
-up to the moment its chunk starts. What the held collector owes is paid by the
-next script phase: giving the collector back clears its debt, so the bytes a held
-phase allocated are kept as owed and paid as one step of that many kilobytes where
-script code may run — when a module's chunk starts, just before an entry point is
-called, and when a binding returns to its script — and a loop of crossings whose
-script phases allocate nothing cannot grow the heap without bound. The lookup
-itself walks the module's environment comparing keys in place and allocates
-nothing; calling a C function can still grow the stack and start a step, so it is
-held too. Consequently:
+A Lua allocation can start a collection step that runs `__gc` finalizers,
+which can call bindings. So the collector is held across every host-side
+phase: reading arguments, building results, the entry-point lookup, the
+boundary's registry set-up, and a module load until its chunk starts. It is
+given back as found, and the bytes a held phase allocated are paid as one
+step where script code may run, so a loop of crossings cannot grow the heap
+without bound. Consequently:
 
-- looking an optional entry point up that the module does not define answers
-  `EntryAbsent` having run no Lua, finalizer, binding action or application
-  callback, and arguments are not even validated (the lookup comes first);
-- a load rejected before its chunk starts (a precompiled chunk, a syntax error, an
-  allocation failure while parsing) is `NoEffect`, because nothing executed; a load
-  that fails after the chunk started says what ran (`LuaRan` or `BindingRan`).
+- looking up an absent optional entry point answers `EntryAbsent` having run
+  no Lua, and arguments are not validated (the lookup comes first);
+- a load rejected before its chunk starts (precompiled, syntax error,
+  allocation failure while parsing) is `NoEffect`; one that fails later says
+  `LuaRan` or `BindingRan`.
 
 ### Registry, stack and memory discipline
 
-Every operation leaves the stack at the depth it entered at, on every path: a
-call, a refusal, a script's error, a failed load. A loaded module holds exactly
-one slot of a table the bridge keeps in the registry, for the owner's lifetime,
-and the close releases it. Failed loads, calls and refusals retain nothing. The
-slots are not `luaL_ref` references, so `probeReferenceSlot` stays where it was
-whatever is loaded; the live count is read from the table itself
-(`liveModuleReferences`), and `Test.Lua.Boundary.Discipline` checks both across
-more than a thousand calls, refusals and faults, and across repeated successful and
-failed loads.
+Every operation leaves the stack at the depth it entered at, on every path. A
+loaded module holds exactly one slot of a table the bridge keeps in the
+registry, for the owner's lifetime. Failed loads, calls and refusals retain
+nothing. The slots are not `luaL_ref` references; the live count is
+`liveModuleReferences`.
 
-Memory running out at any step of installing, loading, calling or marshalling in
-either direction, inside a callback included (a stack that cannot be reserved
-for a copy counts), is the existing classified
-failure — `MemoryExhausted` as a `LuaFault`, or a `BoundaryFault` whose reason is
-`ScriptFailed MemoryExhausted` — never a panic, a Lua error unwinding through a
-Haskell frame, or a leaked reference. The guarantee is for the recoverable
-allocator failures Lua reports; an operating-system failure to obtain memory at
-all is outside it. A failed *initialization* closes the VM and never enters the
-body; "the state is usable afterwards" applies only to failures caught inside an
-initialized owner's body. The registration itself is plain Haskell, built outside
-the owner, so `ownerBudget` (which limits the interpreter's allocator) covers its
-installation in the VM and not its construction.
-
-### What proves it
-
-`Test.Lua.Boundary.*`, under the `value boundary` selector of the suite:
-registration (names, bounds at the bound and one past, eligibility, shadowing);
-values without an interpreter (the encoding, the limits, the schemas); bindings
-called from Lua (every rule above, the limits at the limit and one past with
-input far larger than the limit, results, `pcall` cases for the settled
-decisions, handles, `VmReentered` and `VmNotOwned`, an action's own failure);
-modules and entry points; the finalizer allowlist (`__gc` finalizers reaching an
-eligible binding, an ineligible one, an allowlisted lifecycle binding, also for an owner configured to
-deliver lifecycle operations); lifecycle operations delivered to an owner with a lifecycle context and
-refused, their action never run, to one without;
-independent owners on separate threads with different policies; installation;
-discipline, with the allocator's budget swept across installation, loading,
-calling and marshalling; the opted-in bindings' recoverable refusals
-(`Test.Lua.Boundary.Recoverable`, beside the generic ones, and
-`Test.LuaRuntime.Recoverable` under real supervision); and the dependency closure. `Test.Lua.Opacity` adds
-negative clients that forge a handle or a capability, reach for a binding's
-closure or for a Lua state, and positive clients built from the public modules
-alone: one constructs a registration and an owner's policy, loads a module, calls
-an entry point and observes a typed refusal, and one opts a binding in to
-recoverable refusals.
-
+Memory running out at any step of installing, loading, calling or marshalling,
+inside a callback included, is `MemoryExhausted` as a `LuaFault` or a
+`BoundaryFault` with `ScriptFailed MemoryExhausted`: never a panic, an unwind
+through a Haskell frame or a leaked reference. This covers the allocator
+failures Lua reports. A failed *initialization* closes the VM and never enters
+the body. `ownerBudget` limits the interpreter's allocator, so it covers a
+registration's installation, not its construction.
 ## Export modules and captured behaviors
 
-An opt-in facility beside the global-entry modules above. Those modules, `ModuleSource`,
-`loadModule`, `callEntry` and the named-entry lookup are exactly as documented and are not
-replaced: nothing below changes what an existing caller, instance, task or the `lua` runner
-does. A module here is source text the application supplies under a stable identity whose
-chunk **returns one table**, which the VM keeps as it is.
-
-Everything in this section runs on the VM's owner, through the same protected foreign-call
-boundary as every other operation: no Lua longjmp crosses Haskell and no Haskell exception
-crosses C. The handles are values that name a slot of one VM's registry and are checked on
-every use; no raw Lua state, stack index, registry reference, native pointer or unrestricted
-cross-VM value API is exposed.
+An opt-in facility beside the global-entry modules, which are unchanged. A
+module here is source text under a stable identity whose chunk **returns one
+table**, which the VM keeps as it is. Everything runs on the VM's owner
+through the protected boundary. The handles name a slot of one VM's registry
+and are checked on every use.
 
 ### The export table
 
-`evaluateExport` loads the supplied text in a private module environment that reads through to
-the owner's globals (so [the M1 library profile](#the-m1-library-profile) has already removed
-what it removes before any authored code runs), runs it, and requires **exactly one** returned
-value, a table with **no metatable**. These are module failures, kept as the identity's outcome:
+`evaluateExport` loads the text in a private module environment that reads
+through to the owner's globals (so
+[the M1 library profile](#the-m1-library-profile) has already filtered them),
+runs it, and requires **exactly one** returned value, a table with **no
+metatable**. Module failures, kept as the identity's outcome:
 
 | The chunk | Failure |
 | --- | --- |
@@ -1269,162 +689,110 @@ value, a table with **no metatable**. These are module failures, kept as the ide
 | returns a boolean, number, string, function | `ExportNotTable` naming the type |
 | returns more than one value, an extra `nil` included | `ExportMultiple` |
 | returns a table with a metatable, protected or not | `ExportMetatable` |
-| fails to parse, is a precompiled chunk, or raises | `ScriptFailed`, the attributed protected Lua-failure path (traceback bounded) |
+| fails to parse, is a precompiled chunk, or raises | `ScriptFailed` (traceback bounded) |
 
-Precompiled binary chunks are refused (the chunk is loaded in text mode only), and no
-arbitrary-source load API is added. The table, and the functions, tables and cycles reachable
-from it, are retained **in the VM**: nothing is serialized, deep-copied or put through the
-copied-value schemas, and ordinary Lua graph cycles are permitted (import dependency cycles
-are reported by [the module loader](#ordered-import-chains-the-module-loader)). Other keys of the table are unrestricted library exports. Module
-globals stay in the module's own environment; mutable exports, closures and upvalues and the
-permitted shared library tables keep the trusted same-VM semantics Lua gives them. This is
-neither hostile-code isolation nor a rollback: what a chunk did before it failed is not undone.
+The table and everything reachable from it stay **in the VM**: nothing is
+serialized or copied, and Lua graph cycles are permitted. Module globals stay
+in the module's environment. This is neither isolation nor a rollback: what a
+chunk did before it failed is not undone.
 
 ### Identity, sticky failure and bounds
 
-An `ExportIdentity` is opaque bytes the caller chose (for the module loader, the root plus the canonical
-path). It is compared exactly, never truncated or hashed into a key, and never forced into the
-legacy 128-byte `ModuleRef`; one that is empty or longer than 4096 bytes is refused, not
-shortened. What a record or a handle retains is a **copy that owns its bytes**, so a short slice of a
-large buffer pins nothing after the call. The source label used in diagnostics is bounded separately.
+An `ExportIdentity` is opaque bytes the caller chose (for the loader, the
+root plus the canonical path), compared exactly, 1 to 4096 bytes, never
+truncated or hashed. A record keeps a copy that owns its bytes.
 
-* **Once per identity per VM.** Asking again, with `evaluateExport` or `retrieveExport`, answers
-  the same table, or the same failure, and runs nothing. A failed identity is never retried with
-  replacement bytes. Another VM has its own environment, result, failure and state.
-* **Ceilings** come from the owner's `ExportLimits`; the M1 profile's are 1 MiB of supplied
-  source, 256 identities per VM and, for the module loader, a chain of 32 frames (`Hetoimasia.LuaEngine.Behavior.exportLimits`). Failed
-  records and any in progress count, and nothing is evicted, retried or kept as history. A
-  source one byte over is **never compiled**: while room remains it is a failed record that counts,
-  `ModuleRefused (SourceTooLarge n)`, distinguishable from an evaluation failure. A *new*
-  identity at a full ceiling is refused, `ModuleRefused (TooManyExports n)`, with no record and
-  nothing evaluated. Retrieval of an existing identity consumes nothing.
-* The ceiling counts only identities of this facility. Global-entry modules, including the
-  instance driver an instance-hosting owner loads, keep their own bound (`maxModules`) and use
-  no slot.
-* The source bytes are not kept: the interpreter copies what it compiles, and a record holds the
-  identity, the outcome and the table.
-* A failure that happens before the chunk can start (memory running out as its environment is
-  made) is raised and charges nothing, so the identity can be asked for again. A Haskell
-  failure that reached a callback while the chunk ran is raised in preference to whatever Lua
-  reported, even if the script caught it with `pcall`, and the identity is recorded as failed
-  with no table kept.
+- **Once per identity per VM.** Asking again (`evaluateExport`,
+  `retrieveExport`) answers the same table or the same failure and runs
+  nothing. A failed identity is never retried with replacement bytes.
+- **Ceilings** come from the owner's `ExportLimits`; the M1 profile's
+  (`Hetoimasia.LuaEngine.Behavior.exportLimits`) are 1 MiB of source, 256
+  identities per VM and a chain of 32 frames. Failed and in-progress records
+  count; nothing is evicted.
+- A source one byte over is **never compiled**: while room remains it is a
+  failed record that counts, `ModuleRefused (SourceTooLarge n)`. A *new*
+  identity at a full ceiling is `ModuleRefused (TooManyExports n)` with no
+  record. Retrieval consumes nothing.
+- Global-entry modules, the instance driver included, keep their own bound
+  (`maxModules`) and use no slot here.
+- The source bytes are not kept.
+- A failure before the chunk can start charges nothing, so the identity can
+  be asked for again. A Haskell failure that reached a callback while the
+  chunk ran is raised in preference to what Lua reported, and the identity is
+  recorded as failed.
 
-`VmConfig` takes `vmExports` (evaluated after the modules, in order, at initialization; one that
-fails is a recorded failure and does not end construction) and `vmExportLimits`.
+`VmConfig` takes `vmExports` (evaluated after the modules at initialization;
+a failing one is a recorded failure and does not end construction) and
+`vmExportLimits`.
 
 ### A selected behavior
 
-`captureBehavior` validates one field of an export table as a **behavior** and captures it for
-one instance. It is selected by raw access and read by a raw traversal of the behavior table
-that stops after the entry that proves a field outside the schema, so **at most six entries
-are visited**: no `__index`, `pairs`, length or conversion metamethod runs, and nothing walks the
-library exports around it.
+`captureBehavior` validates one field of an export table as a **behavior**
+and captures it for one instance. It is read by raw access, visiting at most
+six entries; no metamethod runs and no hook runs.
 
-* The field must be a table with no metatable. Its only keys are `init`, `update`, `shutdown`,
-  `every_ticks` and `every_seconds`; a key that is not text, or not one of these, and a hook
-  that is neither absent nor a function, are refused (`BehaviorProblem`). A table with a `__call`
-  metamethod is not a function.
-* An unselected role that is invalid is not a failure of the module or of another role.
-* The answer reports which hooks exist and how each cadence field *reads* (`CadenceField`:
-  absent, a Lua integer, a Lua float, or another type), with no conversion applied. What a
-  cadence means is the application's: `hetoimasia-lua-engine` applies the M1 rules.
-* No hook runs during validation or capture.
+- The field must be a table with no metatable whose only keys are `init`,
+  `update`, `shutdown`, `every_ticks` and `every_seconds`. Any other key, or
+  a hook that is neither absent nor a function (a `__call` table is not a
+  function), is refused (`BehaviorProblem`).
+- An invalid role that was not selected fails nothing.
+- The answer reports which hooks exist and how each cadence field *reads*
+  (`CadenceField`: absent, integer, float, other), unconverted. What a
+  cadence means is the application's.
 
-A behavior that does not fit is returned as data and holds nothing; an allocation that fails on the
-way is a fault and holds nothing either.
+A behavior that does not fit is returned as data and holds nothing.
 
 ### What a capture holds
 
-A capture holds, by a slot of a registry table only the bridge reaches: the very `init`, `update`
-and `shutdown` functions (absence included), a fresh ordinary `self` table whose `api` is the
-facade, and the facade. The **facade** is the injection seam for the later M1 service
-namespaces. A `FacadeSource` names where it comes from, and it is made **last**, after the behavior
-has validated and been captured (so a facade builder never runs for a behavior that is refused):
+By one registry slot: the very `init`, `update` and `shutdown` functions, a
+fresh `self` table whose `api` is the facade, and the facade. The **facade**
+is made last, after the behavior validated, from a `FacadeSource`:
 
-* `FacadeValue v`: a copy of the value `v`, made fresh for this capture alone within the owner's
-  value limits (a capability the application's own check retires, or an oversize value, is refused).
-  Data only: it cannot carry a function. It must be a **table** (a record or a list): `nil` and every
-  scalar are refused (`FacadeNotATable`) before anything is captured, so `self.api` and `init`'s second
-  argument can never be a scalar.
-* `FacadeField export key`: the table a retained export module holds under `key`, used as it is: one
-  existing facade reference shared by every capture that names it.
-* `FacadeBuilt export key v`: built for this capture alone by calling the function the export module
-  holds under `key` with a copy of `v` (the instance's context). It returns the facade table, which may
-  carry closures bound to this instance. The builder is the engine's own Lua, runs under the protected
-  call and its traceback handler, and what it raises, or returns that is no table, fails the capture,
-  which is released.
+| Source | The facade is |
+| --- | --- |
+| `FacadeValue v` | a fresh copy of `v` within the owner's value limits; data only; must be a table (`FacadeNotATable` otherwise) |
+| `FacadeField export key` | the table a retained export module holds under `key`, shared by every capture naming it |
+| `FacadeBuilt export key v` | built for this capture by calling the function under `key` with a copy of `v`; it may carry closures bound to this instance; a raise or a non-table result fails and releases the capture |
 
-Whichever it is, the same Lua table is `init`'s `api` and `self.api`. It is an ordinary Lua table in
-Lua's hands: assigning to `self` or the facade cannot replace the engine's captured hooks, another
-capture's tables or its attribution. A source naming a field that is absent, or of the wrong type
-(`FacadeFieldMissing`, `FacadeNotATable`, `FacadeBuilderNotAFunction`), or an export handle that is not
-this owner's, is refused with no effect and holds nothing.
+The same table is `init`'s `api` and `self.api`. Assigning to `self` or the
+facade cannot replace the captured hooks. A missing or wrongly typed field
+(`FacadeFieldMissing`, `FacadeNotATable`, `FacadeBuilderNotAFunction`) or a
+foreign export handle is refused with no effect.
 
-Replacing or removing a field of the behavior table, replacing the role table, or editing a cadence
-field afterwards changes nothing a capture does; a later capture reads the table as it is then.
-Capturing a function does not freeze its upvalues or the shared exports: mutable upvalues and
-shared state stay ordinary Lua, and `self` stays separate.
+Editing the behavior table afterwards changes nothing a capture does.
+Capturing a function does not freeze its upvalues.
 
-What a captured hook raises is attributed to **the export module that holds it** (its bounded label and the
-version `export`, with the hook's name as the entry), not to the driver that calls it: the module and entry of a
-script error, and of a binding's refusal made from the module's own code (the chunk it was loaded under matches
-the module's), are the same for `init`, for each segment of an `update`, including after a resume, and for
-`shutdown`. A host failure a callback recorded while a facade builder ran is raised before anything that fails
-after it (and a builder that catches Lua's side of it with `pcall` still cannot hide it).
-
-The hooks are run by the runtime through a driver, never looked up again by name: see
-[M1 behavior instances](#m1-behavior-instances-opt-in).
+What a captured hook raises is attributed to **the export module that holds
+it** (its label, version `export`, the hook's name as the entry), for `init`,
+every segment of `update` and `shutdown`. The hooks are run through a driver:
+see [M1 behavior instances](#m1-behavior-instances-opt-in).
 
 ### Reference lifetimes
 
-| What | Made by | Held until | Released by | Refused or safe when |
-| --- | --- | --- | --- | --- |
-| export table | `evaluateExport` success, in one protected call | the VM closes | VM close; released at once if the evaluation fails afterwards | foreign owner `ExportHandleForeign`; slot not held `ExportHandleStale`; closed `VmClosed` |
-| failed record | evaluation or return-shape failure, oversize source | the VM closes | VM close | holds no Lua value; counts against the ceiling |
-| in-progress record | before the chunk starts | the call returns | replaced by the outcome; a failure or cancellation marks it failed (a failure before the chunk starts removes it) | never observable from another call |
-| capture | `captureBehavior`, the one store being the last step | `releaseBehavior`, or the VM closes | `releaseBehavior` (idempotent), the instance's end, VM close | foreign `CaptureHandleForeign`; released or never made `CaptureHandleStale`; closed `VmClosed` |
-| hook, `self`, facade in a coroutine | the running or suspended invocation's stack | the coroutine is closed or returns | the ending closes its coroutines before it releases the capture | a coroutine keeps them alive in Lua until then; release never invalidates a use under way |
-| temporary stack values | each call | the call returns | every call restores its entry depth, success or failure | checked by the examples' stack and registry-slot probes |
+| What | Held until | Refused when |
+| --- | --- | --- |
+| export table | the VM closes (released at once if the evaluation fails afterwards) | foreign owner `ExportHandleForeign`; slot not held `ExportHandleStale`; closed `VmClosed` |
+| failed record | the VM closes; holds no Lua value; counts against the ceiling | — |
+| capture | `releaseBehavior` (idempotent), the instance's end, or VM close | foreign `CaptureHandleForeign`; released or never made `CaptureHandleStale`; closed `VmClosed` |
+| hook, `self`, facade in a coroutine | the coroutine is closed or returns; an ending closes its coroutines before it releases the capture | release never invalidates a use under way |
 
-Slots are issued once and never reused, so a stale handle names an empty slot and can never be
-mistaken for a later capture's. A reference count alone proves nothing about who may use a
-reference; the owner, closed-VM and slot checks above do.
-
-### What proves it
-
-`Test.Lua.Boundary.Exports` (host examples, `lua-host-tests`): exactly-one-plain-table
-refusals and sticky failure with the side effect counted by a binding; attribution and effect;
-private environment; the filtered library; independence across owners; the 256-identity and 1 MiB
-ceilings at and one past, failed records counted, instance-driver module not counted; long
-identities kept distinct; each schema refusal holding no reference; raw access (a metamethod
-installed after the fact is never called); captured functions unmoved by later edits; fresh
-`self` and shared upvalues; release, stale, forged and foreign references; two hundred
-construct-and-end cycles returning the registry and stack to where they began; every use refused
-after the lifetime; a callback's failure raised through `pcall`; and a one-byte sweep of the
-allocator's budget over an evaluation, a capture and a release that checks every reference, record
-and the stack after each failure. `Test.Lua.Opacity` adds external clients: the handles cannot be
-forged, no raw table or registry reference is reachable, and a client using the whole interface
-links and runs.
+Slots are issued once and never reused, so a stale handle can never name a
+later capture.
 
 ## Ordered import chains: the module loader
 
-An opt-in, engine-managed way to evaluate the [export modules](#export-modules-and-captured-behaviors)
-when a module can discover a dependency while it runs (LFE-9, D-56 to D-59, D-75, D-77, D-80). The
-synchronous `evaluateExport` is unchanged and gives its module no `import`; the global-entry
-modules, tasks and instances are untouched. A module the loader evaluates is source text under a
-stable identity, run once as a Lua coroutine of the VM in an environment of its own, and it
-**returns one table** exactly as an export module does. What is new is that the module can call
-`import(path [, root_id])`, and that the call can **suspend the importing coroutine** until the
-dependency's verified source has arrived and its own module has finished, without blocking the
-VM's owner.
+An opt-in, engine-managed way to evaluate
+[export modules](#export-modules-and-captured-behaviors) when a module
+discovers a dependency while it runs. A module the loader evaluates runs once
+as a Lua coroutine of the VM in its own environment and returns one table.
+It can call `import(path [, root_id])`, which can **suspend the importing
+coroutine** until the dependency's verified source has arrived and its module
+has finished, without blocking the VM's owner. The synchronous
+`evaluateExport` gives its module no `import`.
 
-The loader is the VM owner's. It compiles, evaluates, resumes, publishes and releases only on the
-owner's thread, under the VM's gate, through the same protected foreign-call boundary as every
-other operation; a provider thread, a coordinator or a hook can ask nothing of it directly and is
-refused with `VmNotOwned`. It adds no filesystem read, no worker, no per-instance request ticket
-and no scheduler of its own: where source comes from, how an `import` becomes an identity, and
-when a root may begin are three narrow seams the application injects, and the production
-coordinator that drives them is a later slice's (LFE-11).
+The loader compiles, evaluates, resumes, publishes and releases only on the
+owner's thread, under the VM's gate; any other thread is refused with
+`VmNotOwned`. It reads no file and adds no worker or scheduler.
 
 ### The seams
 
@@ -1432,1950 +800,1232 @@ coordinator that drives them is a later slice's (LFE-11).
 
 | Seam | What it does | Where it runs |
 | --- | --- | --- |
-| `SourceSupplier` | `supplierAcquire identity` registers the loader's interest in an identity's source, exactly once per identity the loader holds a record of, and answers `SourcePending`, `SourceVerified bytes`, `SourceFailure reason` or, for a **dependency** only, `SourceNoRoom` (the application's own identity bound has no room, decided in the step that would take the interest: the loader keeps no record, the supplier took no interest and none is ended, and the import is refused as `ImportCacheFull`) for what is known now; `supplierRelease identity` ends that interest exactly once, when the bytes were consumed, the source failed, or the loader stopped. An acquire that raises took no interest. | acquire: the owner's thread (a root's admission) or the callback an `import` is (a dependency's); release: the owner's thread. Never blocking, and refused (`VmReentered`) if it asks the same VM for anything |
-| `AddressResolver` | `ImportContext -> path -> Maybe root -> IO (Either reason ResolvedAddress)`: turns an import's arguments, and the context of the **module whose code the `import` was made from**, into the canonical identity and a bounded label. `Left` is an ordinary Lua argument error. Production path, Unicode and root validation, and the approved lexical-root resolution, stay behind it (LFE-12) | the callback an `import` is, unmasked |
-| `loaderEligible` | whether the coordinator allows the root at the head of the queue to begin now | the owner's thread, only when no chain is active |
+| `SourceSupplier` | `supplierAcquire identity` registers interest once per identity and answers `SourcePending`, `SourceVerified bytes`, `SourceFailure reason` or, for a dependency only, `SourceNoRoom` (no interest taken; the import is `ImportCacheFull`). `supplierRelease identity` ends the interest exactly once: bytes consumed, source failed, or loader stopped. An acquire that raises took no interest | acquire: the owner's thread (a root) or the `import` callback (a dependency); release: the owner's thread. **Never blocking**; asking the same VM for anything is `VmReentered` |
+| `AddressResolver` | turns an import's arguments and the `ImportContext` of the module whose code made the call into a canonical identity and a bounded label; `Left` is an ordinary Lua argument error | the `import` callback, unmasked |
+| `loaderEligible` | whether the root at the head of the queue may begin now | the owner's thread, only when no chain is active |
 
-`ModulePhase` (`newModulePhase`, `modulePhaseActive`) is a flag the loader sets while a module's top
-level runs, readable without asking the VM for anything, for the application's own preconditions
-(below).
+`ModulePhase` (`newModulePhase`, `modulePhaseActive`) is a flag the loader
+sets while a module's top level runs.
 
 ### A chain
 
-A coordinator admits **roots** (`admitRoot`) in the order it chooses, a logical tick and sequence
-order or a UI request-admission order, and the loader keeps that order. It adds no priority, phase
-or second scheduler. The source of an admitted root is asked for at once (reads may overlap), but a
-root begins only when it is at the head of the queue, `loaderEligible` allows it and its source has
-arrived: **source arrival alone never starts a root and never lets a later root overtake the
-current one.** `deliverSource` records an arrived answer; it evaluates nothing. `advanceLoader` is
-the one operation that runs Lua. One **chain** is active per VM:
+A coordinator admits **roots** (`admitRoot`) in the order it chooses, and the
+loader keeps that order. A root's source is asked for at once, but the root
+begins only when it is at the head of the queue, `loaderEligible` allows it
+and its source has arrived: **source arrival alone never starts a root and
+never lets a later root overtake.** `deliverSource` records an answer and
+evaluates nothing. `advanceLoader` is the one operation that runs Lua. One
+chain is active per VM:
 
-1. The root's source is compiled (text only, the same bounds as an export module) into a coroutine
-   in an environment of its own, and its first segment runs.
-2. `import(path)` resolves to an identity. A **ready** identity returns the very table the VM holds
-   for it. A failed, cyclic or unsuspendable one is a failure (below). Otherwise the importing
-   coroutine is **suspended**, once every Haskell frame has returned (the yield is made in C, as an
-   error is, with a continuation that returns the exports or raises the error); the dependency's
-   source is asked for if it was not already; and the loader goes on.
-3. When the dependency's source has arrived the dependency runs as the next frame, **depth first, in
-   Lua's import call order**, and when it ends the importer is resumed with its exports (or its
-   failure). An identity that is already pending, because it was admitted as a later root, is
-   evaluated **within the active chain**, once, rather than waiting behind its importer or running
-   twice; its own turn in the queue later finds an outcome and evaluates nothing. Its request is not
-   settled here: the outcome is reported (`advanceSettled`, `lookupModule`) for the coordinator to
-   deliver at its own position.
-4. `advanceLoader` returns when the chain is finished, waits for a source (`BlockedSource`), or the
-   head of the queue is not eligible (`BlockedIneligible`), and says which identities came to an
-   outcome and how deep the chain is. A chain that is not finished is not forgotten: it holds its
-   frames until a source is delivered and the loader is advanced again, or until it is stopped.
+1. The root's source is compiled (text only) into a coroutine in its own
+   environment, and its first segment runs.
+2. `import(path)` resolves to an identity. A ready identity returns the very
+   table the VM holds. Otherwise the importing coroutine is suspended once
+   every Haskell frame has returned, and the dependency's source is asked for.
+3. When the source has arrived the dependency runs as the next frame, **depth
+   first, in Lua's import call order**, and the importer is resumed with its
+   exports or its failure. An identity already pending as a later root is
+   evaluated within the active chain, once; its own turn later finds an
+   outcome. Its request is not settled here: the outcome is reported
+   (`advanceSettled`, `lookupModule`) for the coordinator.
+4. `advanceLoader` returns when the chain is finished, waits for a source
+   (`BlockedSource`) or the head is not eligible (`BlockedIneligible`). An
+   unfinished chain holds its frames until advanced again or stopped.
 
-A module that never yields still blocks its owner while it runs: nothing here preempts trusted Lua.
-`pcall`, `xpcall` and metamethods called from Lua code suspend like any other call. A raw
-`coroutine.yield()` at a module's top level suspends it to no one and fails the module
-(`UnscheduledYield`). A scheduler yield or wait an application registered is never granted to a module chunk: the call is
-refused before it suspends anything, as a fault of the call (`SuspendRefused SuspendOutsideTask`) that fails the module. The module
-environment is the filtered global surface plus `import`; no C `require`, no binary chunk and no
-extra library entry point is added.
+**Nothing preempts trusted Lua**: a module that never yields blocks its owner.
+A raw `coroutine.yield()` at a module's top level fails the module
+(`UnscheduledYield`). A registered scheduler yield or wait is refused in a
+module chunk (`SuspendRefused SuspendOutsideTask`), failing the module. The
+module environment is the filtered globals plus `import`.
 
 ### `import` outside module evaluation
 
-In a hook, or in a helper a module exported and a hook called, `import` is the **immediate lookup**:
-a ready identity returns its exports, a failed identity raises its cached failure, and an identity
-that is absent, pending, evaluating or stopped raises an ordinary `module_not_ready` error. It reads
-no source, starts no work, takes no record, and never suspends. The default root is the one captured
-from the module the closure belongs to, even when its helper runs in another instance's hook.
+In a hook, or a helper a hook called, `import` is the **immediate lookup**: a
+ready identity returns its exports, a failed one raises its cached failure,
+and any other raises an ordinary `module_not_ready` error. It starts nothing
+and never suspends. The default root is the one captured from the module the
+closure belongs to.
 
 ### Where Lua cannot suspend
 
-An import of an identity that is **not ready** where Lua cannot yield never yields another
-coroutine and never blocks. It is refused before anything is admitted (no record, no slot, no source
-interest) with an ordinary Lua error, **and it fails the containing admitted load even if the script
-catches the error**: `ModuleRefused (ImportNotSuspendable why dependency)`. A ready identity is still
-returned in those places, and a failed one still reports its cached failure.
+An import of a **not ready** identity where Lua cannot yield is refused before
+anything is admitted, with an ordinary Lua error, **and it fails the
+containing load even if the script catches it**: `ModuleRefused
+(ImportNotSuspendable why dependency)`. Ready and failed identities answer as
+usual there.
 
 | Where the import was called from | Outcome |
 | --- | --- |
-| the module's own coroutine, including across `pcall`, `xpcall`, a metamethod called from Lua code, and a to-be-closed handler Lua lets yield | suspends |
-| a coroutine the script created (`coroutine.wrap`, `coroutine.create`), including its to-be-closed handlers run by `coroutine.close` | `SuspendOtherCoroutine` |
-| a `table.sort` comparator, a `string.gsub` replacement callback, a finalizer, a metamethod reached from a library function | `SuspendNotYieldable` |
-| the closing of a module that failed or was stopped | a lookup like a hook's: `module_not_ready` |
+| the module's own coroutine, including across `pcall`, `xpcall`, a metamethod called from Lua code, a yieldable to-be-closed handler | suspends |
+| a coroutine the script created, including its to-be-closed handlers | `SuspendOtherCoroutine` |
+| a `table.sort` comparator, a `string.gsub` callback, a finalizer, a metamethod reached from a library function | `SuspendNotYieldable` |
+| the closing of a failed or stopped module | a lookup like a hook's |
 
-`import` is not finalizer-eligible. Called from a finalizer while the VM is closing it is refused like any binding the
-registration did not list (`FinalizerRefused`, kept as close evidence); called from a finalizer at any other time it is a
-lookup like a hook's, and a not-ready identity there is the `ImportNotSuspendable` case above.
+`import` is not finalizer-eligible: from a finalizer while the VM closes it is
+`FinalizerRefused`.
 
 ### What an import refuses, and what it condemns
 
-| Case | Lua sees | The containing load |
-| --- | --- | --- |
-| path or root argument malformed, a root the resolver refuses (unknown, disabled) | an ordinary error, raised before any identity slot, source interest or frame exists | **not** failed by it |
-| a dependency that failed (source, syntax, runtime, return shape, dependency, cycle, limit) | an ordinary error | failed with `DependencyFailed label identity fault`, even if caught; the identity is the dependency's own, because a label is bounded and two identities can share one |
-| an identity already on the chain | an ordinary error naming the chain, `ImportCycle [a, b, a]`; **no extra frame is allocated for the edge that closes it** | failed |
-| a new dependency when the owner holds as many identities as it may | an ordinary error | failed with `ImportCacheFull`; the dependency has no record |
-| a new dependency that would make the chain longer than it may be | an ordinary error | failed with `ImportChainTooDeep`; the dependency has no record |
-| not ready where Lua cannot suspend | an ordinary error | failed with `ImportNotSuspendable` |
-| a call the module made to a registered binding that refused it as a fault of the call | the error the binding raised | failed with that fault, even if the script caught the error; the owner is not ended |
-| a Haskell failure that reached a callback (an application seam that raised, an engine defect) | an error, caught or not | **not** the module's: raised from the operation, see below |
+| Case | The containing load |
+| --- | --- |
+| malformed path or root, a root the resolver refuses | **not** failed; an ordinary error before any slot, interest or frame exists |
+| a dependency that failed | failed with `DependencyFailed label identity fault`, even if caught |
+| an identity already on the chain | failed with `ImportCycle [a, b, a]`; no frame is allocated for the closing edge |
+| a new dependency at the identity bound | failed with `ImportCacheFull`; no record |
+| a new dependency past the chain bound | failed with `ImportChainTooDeep`; no record |
+| not ready where Lua cannot suspend | failed with `ImportNotSuspendable` |
+| a registered binding refused a call as a fault of the call | failed with that fault, even if caught; the owner is not ended |
+| a Haskell failure that reached a callback | **not** the module's: raised from the operation (below) |
 
-A failure of a dependency propagates up the chain: each importer fails with `DependencyFailed`, and
-each dependency that **completed** before the failure stays ready and usable; its exports are not
-rolled back and a later importer reuses them without evaluating them again. There is no retry,
-eviction, partial export publication or rollback of what a module already did.
+In every row Lua sees an ordinary error. A dependency's failure propagates up
+the chain; each dependency that **completed** stays ready and is reused. No
+retry, eviction, partial publication or rollback.
 
 ### Identities, records and the bounds
 
-The loader keeps **no second cache**. Pending and evaluating identities are records of the same
-table as ready and failed ones ([identity, sticky failure and bounds](#identity-sticky-failure-and-bounds)),
-and the records are what `evaluateExport`, `retrieveExport` and `lookupModule` answer from. Every
-record counts against the identity bound until the VM ends. The M1 values come from the profile
-(`Hetoimasia.LuaEngine.Behavior.exportLimits`): 256 identities counting pending, evaluating, ready and
-failed entries; 1 MiB of source in a module; a chain of 32 frames, the root included (the 33rd is
-`ImportChainTooDeep 32`). `ExportLimits` now carries the chain depth as `exportMaxChainDepth`.
+The loader keeps **no second cache**: pending and evaluating identities are
+records of the same table as ready and failed ones, and every record counts
+against the identity bound until the VM ends. M1: 256 identities, 1 MiB per
+module, a chain of 32 frames with the root (`exportMaxChainDepth`; the 33rd is
+`ImportChainTooDeep 32`).
 
-* A **new root** past the bound is refused with `RootRefused (RootCacheFull n)`: no record, no source
-  asked for, no slot. A root or a dependency the owner **already holds** is reused at any fill:
-  `RootSettled` for a ready or failed one, `RootJoined` for a pending or evaluating one (queued as a
-  root if it was only a dependency), with no second interest in its source.
-* Source past the bound is **never copied, kept or compiled**: it is a failed record that counts,
-  `SourceTooLarge`, and its interest ends at once. What is held for pending identities is bounded by
-  the identity bound times the source bound, and each answer is dropped when its frame has been
-  compiled.
-* A dependency over a limit **fails its importer**; the loader never waits for room that a permanent
-  limit will never give, and never evicts.
-* Failures are sticky and the first one is kept: source (`SourceUnavailable`, `SourceTooLarge`),
-  syntax and runtime (`ScriptFailed`), return shape (`ExportShapeRefused`), dependency, cycle, limit,
-  `UnscheduledYield`. A module's failure is data; it ends neither the chain's other roots nor the owner.
+- A **new root** past the bound is `RootRefused (RootCacheFull n)`: no record,
+  no source asked for. A root the owner already holds is reused at any fill:
+  `RootSettled` (ready or failed) or `RootJoined` (pending or evaluating).
+- Source past the bound is never copied, kept or compiled: a failed record,
+  `SourceTooLarge`, its interest ended at once.
+- A dependency over a limit **fails its importer**; the loader never waits
+  for room and never evicts.
+- Failures are sticky, first kept: `SourceUnavailable`, `SourceTooLarge`,
+  `ScriptFailed`, `ExportShapeRefused`, dependency, cycle, limit,
+  `UnscheduledYield`. A module's failure is data and ends neither other roots
+  nor the owner.
 
 ### The phase of a module's top level
 
-A module's top level has a phase of its own. It does not inherit the authority of the instance whose
-hook happened to start the work: tables, functions, imports, pure helpers and allowed output are its
-surface, and an engine service the application guards with `withPrecondition` reads
-`modulePhaseActive` and refuses as an ordinary Lua error **before its action**: the action counter
-stays at zero, and the module can catch the error and go on. A function a module defines may use
-the service later, when a hook calls it; that includes a helper a module exported, and a facade a
-hook stashed in the shared exports and a module's top level later reached for. The phase also covers the closing of a
-module's coroutine: the to-be-closed variables a failed module's coroutine runs when it is closed, and those of a
-suspended one the loader's stop closes, are the module's own code and run under it, so a guarded service is refused there
-as at the top level. The flag is put back as it was however the closing ends. The phase also says **which module** is running:
-`modulePhaseModule` answers the `ImportContext` (the identity the module was admitted under, and its label) of the frame whose
-code runs, from the loader's own record and never from anything a script said, for a segment of its top level, of a dependency
-it imported, and of the closing of its coroutine alike, and `Nothing` outside every module (a hook, a task). It is put back as it
-was, like the flag. An application's binding reads it to name the module that called it: `hetoimasia-lua-engine`'s facade
-attributes a `warn` made while a module is evaluated to that module. Concrete facades and output bindings are installed by
-LFE-12 in `hetoimasia-lua-engine`'s `facade` sublibrary, over this phase.
+A module's top level does not inherit the authority of the instance whose hook
+started the work. An engine service guarded with `withPrecondition` reads
+`modulePhaseActive` and refuses as an ordinary Lua error before its action. A
+function the module defines may use the service later, when a hook calls it.
+The phase also covers the closing of a module's coroutine (its to-be-closed
+variables). `modulePhaseModule` answers the `ImportContext` of the module
+whose code runs, from the loader's own record, and `Nothing` outside every
+module; an application binding reads it to attribute a call. Both are put back
+as they were however the segment ends.
 
 ### Stop and what it leaves
 
-`stopModuleLoader` (the owner's lifetime does it too, before the VM closes) closes admission first,
-then closes every suspended module on the owner, innermost first, running its pending to-be-closed
-variables; withdraws every source interest once (withdrawing an interest tells the supplier the loader no longer wants the source;
-what a read the supplier has already started still needs stays the supplier's to retain until that read is over); drops every
-delivered answer that was not used;
-empties the queue; and marks every identity that was pending or evaluating **stopped**
-(`ModuleStopped`, `ExportStopped`). A stop is not a failure: it is a disposition distinct from the
-sticky content failures, so a later required-failure integration cannot mistake it for a module that
-failed, and no module is required to finish. A late or duplicate source cannot resume or publish
-anything (`SourceAfterStop`, `SourceDuplicate`, `SourceUnwanted`). Stop is terminal and idempotent;
-what completed stays readable, and hooks still import it. Every failure of closing a coroutine or
-releasing an interest is attempted, kept, and raised together after the stop, the first as the primary
-failure and the others as cleanup evidence, and the loader is stopped regardless; a failed close is
-not retried.
+`stopModuleLoader` (the owner's lifetime also does it, before the VM closes),
+in order: closes admission; closes every suspended module innermost first,
+running its to-be-closed variables; withdraws every source interest once;
+drops every unused answer; empties the queue; marks every pending or
+evaluating identity **stopped** (`ModuleStopped`, `ExportStopped`). **A stop
+is not a failure.** A late or duplicate source changes nothing
+(`SourceAfterStop`, `SourceDuplicate`, `SourceUnwanted`). Stop is terminal and
+idempotent; what completed stays readable. Every close and release failure is
+attempted, kept and raised together afterwards, the first as primary.
 
 ### Failures of the engine and the application
 
-A Haskell failure that reaches a callback while a chain runs (a supplier or resolver that raises, a
-re-entry refused, an allocation that fails in a handler) is raised from `advanceLoader` in preference
-to whatever Lua reported, even if the script caught the stand-in error, and it is never turned into
-a catchable content error. The chain is abandoned: every suspended frame is closed on the owner, its
-identity recorded as failed (`the evaluation was abandoned`), and a table a segment had already kept
-is released. Failures closing the frames and releasing interests are kept beside the primary one as
-cleanup evidence. Memory running out inside a segment is a classified failure of the module
-(`ScriptFailed`), never a crash. After an abandonment the loader is usable: identities that were
-only pending stay pending, and are asked for by whichever chain next needs them or withdrawn by stop.
+A Haskell failure that reaches a callback while a chain runs (a supplier or
+resolver that raises, a refused re-entry) is raised from `advanceLoader` in
+preference to what Lua reported, never as a catchable content error. The chain
+is abandoned: every suspended frame is closed, its identity recorded as failed
+(`the evaluation was abandoned`), and a table a segment kept is released.
+Memory exhaustion inside a segment is the module's `ScriptFailed`. The loader
+stays usable; identities that were only pending stay pending.
 
 ### Ownership, threads and lifetimes
 
-| What | Owner and thread | Made by | Ends by | Bound | If it fails or is stopped | Released when | Proved by |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| identity record | the VM's owner, under its gate | `admitRoot` (before the supplier is asked) or the import handler | terminal: ready (table anchored), failed, stopped | `exportMaxIdentities`, pending and failed counted | failed is sticky and first-kept; stopped is `ExportStopped` | at VM close (never evicted) | `Loader`, `Limits`, `Stop` |
-| source interest and the answer it holds | owner (acquire: owner thread or a callback of this VM) | supplier `acquire`, counted after it answers | consumed (bytes compiled), failed, stopped | one per pending identity; answer bytes at most the source bound | released once, failure kept as evidence | `supplierRelease` at the first of consumption, failure or stop | `acquired == released + held` in every `Loader`, `Stop`, `Failures` example's `balanced` |
-| module frame (coroutine anchored in a task slot) | the owner | `startFrame` compiling the delivered source | returns, fails, or closed by stop or abandonment | chain depth, 32 under M1 | closed with its to-be-closed variables run; errors are evidence | the slot is emptied on every end; `liveTaskReferences == chain depth` | `Stop` (each depth), `Failures` |
-| export table slot | the owner | a frame returned exactly one plain table | the VM closes | one per ready identity | a table a segment kept is released if the module is condemned or the operation fails | released at once on condemnation; else at VM close | `Loader`, `Failures`, the allocator sweep |
-| `import` closure and context | the VM's Lua state | the frame's environment | with the module's environment | one per evaluated identity | none | collected with the environment; the context number stays bounded by the identity bound | `Loader` (hooks, facade) |
-| pending import (the importer's wait) | the owner | the import handler noting the dependency | the dependency has an outcome, or stop | one per chain frame | resumed with the failure, or closed | when the frame ends | `Loader`, `Stop` |
-| evidence not yet raised | the owner | closing or releasing that failed | raised at the end of the operation | bounded by the frames closed | the first is primary | raised exactly once | `Failures`, `Stop` |
+Everything below is owned by the VM's owner, on its thread.
+
+| What | Made by | Ends by | Bound |
+| --- | --- | --- | --- |
+| identity record | `admitRoot` or the import handler | terminal: ready, failed (sticky), stopped; released at VM close | `exportMaxIdentities` |
+| source interest and its answer | supplier `acquire` | consumed, failed or stopped: `supplierRelease` once | one per pending identity; the source bound |
+| module frame (a coroutine in a task slot) | compiling the delivered source | returns, fails, or closed by stop or abandonment | chain depth; `liveTaskReferences == chain depth` |
+| export table slot | a frame returned one plain table | VM close; released at once on condemnation | one per ready identity |
+| pending import | the import handler | the dependency's outcome, or stop | one per chain frame |
 
 ### Hosting it on a scheduled owner
 
-A [scheduled owner](#the-scheduled-owner) created with `scheduledLoader = Just plan`
-(`Hetoimasia.Scripting.Lua.Loading`) hosts the loader on the worker that runs its VM. The plan carries
-the supplier, the resolver and the bound of the inbox. `scheduledLoaderEndpoint` hands out the side any thread may
-use without blocking:
+A [scheduled owner](#the-scheduled-owner) created with `scheduledLoader =
+Just plan` (`Hetoimasia.Scripting.Lua.Loading`) hosts the loader on its
+worker. `scheduledLoaderEndpoint` gives the side any thread may use without
+blocking:
 
-* `submitRoot endpoint request due` leaves a root: `DueUi` (eligible at once, in the order submitted) or
-  `DueTick t` (eligible once the owner's logical tick reaches `t`). Logical roots must be submitted in non-decreasing
-  tick order (`SubmitOutOfOrder`), so the loader's queue order is the logical order.
-* `notifySource endpoint identity answer` leaves what a provider found. A second notification for an identity
-  that is still waiting is a duplicate and changes nothing.
-* `loaderOutcome`, `awaitLoaderOutcome` (an STM action to compose with `awaitSupervised`), `loaderRefusals` and
-  `loaderDiagnostics` read what the owner published: admitted (a root reads as admitted from the moment its submission
-  is accepted, so one the owner never got to is told from one nobody sent), ready or failed with the very handle or
-  sticky fault, refused (nothing was recorded for it; the last `planBound` refusals are kept), or stopped.
+- `submitRoot endpoint request due`: `DueUi` (eligible at once, in submission
+  order) or `DueTick t`. Logical roots must be submitted in non-decreasing
+  tick order (`SubmitOutOfOrder`).
+- `notifySource endpoint identity answer`; a second one for a waiting
+  identity changes nothing.
+- `loaderOutcome`, `awaitLoaderOutcome` (STM), `loaderRefusals`,
+  `loaderDiagnostics`: admitted (from the moment the submission is accepted),
+  ready or failed with the handle or sticky fault, refused (the last
+  `planBound` kept), or stopped.
 
-Both queues are **bounded by admitted work** (`planBound` roots and as many arrived answers); a full inbox refuses
-(`SubmitFull`, `NotifyFull`) and nothing is dropped or grown. The owner waits for the inbox beside the scheduler's own
-work, and at each boundary admits what was submitted, delivers what arrived, and advances the loader, so every
-compile, evaluation, resume, publication and Lua-reference release happens on the owner's thread **between two scheduler
-turns**: hooks and stop requests go on while a chain waits for a source, another owner is not affected, and a
-non-yielding module still blocks its own owner.
+Both queues are bounded by `planBound`; a full inbox refuses (`SubmitFull`,
+`NotifyFull`). At each boundary the owner admits, delivers and advances, so
+all loader work happens on its thread **between two scheduler turns**.
 
-A **logical root owes its tick from its submission.** `submitRoot` records what the root owes (the tick `t` of a
-`DueTick t`) in the one transaction that accepts the submission and reads the tick, before the owner has looked at
-anything. The scheduler keeps the grant that reaches tick `t` unfinished, and applies no later grant, until the root has an
-outcome: however many grants were queued while the owner was busy, tick `t` is not complete, `awaitTicksComplete` does not
-return for it, and nothing advances past the obligation. The need is one whatever the number of roots, for the earliest
-tick an unfinished root owes (or the current tick, once that has passed), and is given back when none is owed or the
-owner exits. A root submitted again keeps the earliest of its obligations and of the ticks it may begin at; a later
-submission never postpones either. A UI chain owes nothing and holds nothing.
+**A logical root owes its tick from its submission.** `submitRoot` records
+the obligation in the transaction that accepts it. The scheduler keeps the
+grant that reaches tick `t` unfinished, and applies no later grant, until the
+root has an outcome. A resubmitted root keeps its earliest obligation. A UI
+chain owes nothing.
 
-Once a stop is asked of the owner, nothing more is admitted, delivered, started or resumed: its boundary leaves the
-loader alone, the loader starts no queued root and resumes no suspended importer or starts no dependency of an advance a
-stop interrupted (a module already running is not preempted), and what is unfinished is left for the exit. When the owner
-exits the inbox closes, the loader is stopped on the owner's thread, every outcome that was only admitted is published as
-stopped, and the need is given back. `LoaderPlanRefused` names, before anything starts, a bound below
-one and a VM configuration that already names a loader.
+Once a stop is asked of the owner, nothing more is admitted, delivered,
+started or resumed. At exit the inbox closes, the loader is stopped, and every
+merely admitted outcome is published as stopped. `LoaderPlanRefused` names a
+bound below one or a VM configuration that already names a loader.
 
 ### Placed roots (LFE-11)
 
-The module coordinator (`Hetoimasia.LuaEngine.Modules` in `hetoimasia-lua-engine`) drives the loader with these generic
-additions; none of them knows what a request, a tick offset or a content root is, and `admitRoot` and `submitRoot` behave as
-they did.
+Generic additions the module coordinator (`Hetoimasia.LuaEngine.Modules`)
+drives; `admitRoot` and `submitRoot` are unchanged.
 
-* **Order.** `admitRootAt` admits a root with a `RootOrder tick sequence`: independent roots start in order, equal orders in the
-  order admitted, whatever order their sources arrived in; `admitRoot` is the order every root had before (first in, first out).
-  `promoteRoot` asks for a pending or evaluating identity to start no later than an order: a root queued later moves up (keeping
-  the arrival number that breaks ties), a dependency of the active chain that was never a root is queued at it (so its own turn
-  finds an outcome and evaluates nothing), and an order never moves later. No second record, source interest or evaluation is
-  made: the loader answers `PromotionMoved`, `PromotionNotEarlier`, `PromotionNothingQueued` or `PromotionUnknown`.
-* **Reserved room.** `loaderReserved identity` is the number of identities, other than that one, the application has promised
-  room for and the loader holds no record of yet. It counts against the identity bound beside the records, so a dependency
-  cannot take the room an accepted root was promised and the root be refused after it was accepted; a root admitted from its
-  reservation (`admitRootAt … True`) is not asked the bound again. The count is read before the supplier is asked, so it
-  is a fast path: the supplier's `SourceNoRoom` is the arbiter for a dependency, and a root accepted between the two wins.
-* **A failed identity looked up outside a module's evaluation.** A hook (or a helper a hook called) that calls `import` for an
-  identity that has failed gets an ordinary error it may catch, and `loaderObserved identity fault` is called first, on the
-  owner's thread, with the fault. The scheduled owner wires it to the instance whose code is running: that instance is failed
-  with the module's attributed failure (`LoaderHooks.hookObserved` answers `Just reason` to opt in; `noLoaderHooks` answers `Nothing`, which keeps the ordinary catchable error for every plan that does not opt in) exactly as a required request's failure
-  fails its instance, latched once and applied at the owner's next safe boundary, so catching the error cannot make it a
-  success. Nothing fails when no instance's code was running.
-* **Placed roots on a scheduled owner.** `DueAt tick sequence` is a root placed at a position. It starts only once the
-  scheduler stands just before the tick (`ticksQuiet`, `tickQuietBefore`: every earlier tick begun and finished, nothing ready or
-  waiting to start, this tick not begun), and the tick is **held** (`ticksHold`: the grant that would reach it waits, with the
-  grants behind it) until the root has an outcome. This is the stronger sibling of `DueTick`, which lets the tick begin and keeps
-  its grant open: a placed root finishes before any work of its tick begins. The owner keeps one hold, for the earliest tick a
-  placed root is due in that has not begun, recomputed in the transaction that changes it. `promoteSubmitted` says a submitted
-  root is placed no later than a position, in the application's own transaction; the owner gives it to the loader at its
-  next boundary, and the hold follows. `submitReservedRoot` and `notifySourceNow` are the same operations in the caller's own
-  transaction; `pokeLoader` wakes the owner to run the plan's hook.
-* **Hooks.** `LoaderHooks` is what the owner tells the application as it serves the loader, on its own thread, outside Lua:
-  `hookService` before every service (where a failure a thread of the application's could only record is raised), `hookSettled`
-  with the identities that came to an outcome, dependencies included, in the order they did (not for an advance that settled
-  nothing), `hookBlocked` with what an advance waits for, `hookReserved` and `hookExit` once the loader is stopped. A hook that
-  raises is a failure of application code. The inbox's bounds (`planBound`) cover roots, arrived sources and promotions, each
-  keyed by identity, so an application with an identity bound never meets a full inbox.
+- **Order.** `admitRootAt` admits a root with a `RootOrder tick sequence`:
+  roots start in order, equal orders in admission order, whatever order their
+  sources arrived in. `promoteRoot` asks for a pending or evaluating identity
+  to start no later than an order; an order never moves later, and no second
+  record, interest or evaluation is made (`PromotionMoved`,
+  `PromotionNotEarlier`, `PromotionNothingQueued`, `PromotionUnknown`).
+- **Reserved room.** `loaderReserved identity` is the number of other
+  identities the application has promised room for. It counts against the
+  identity bound, so a dependency cannot take an accepted root's room; a root
+  admitted from its reservation (`admitRootAt … True`) is not asked the bound
+  again. The supplier's `SourceNoRoom` is the arbiter for a dependency.
+- **A failed identity looked up from a hook.** The hook gets an ordinary
+  catchable error, and `loaderObserved identity fault` is called first on the
+  owner's thread. With `LoaderHooks.hookObserved` answering `Just reason` the
+  scheduled owner fails the running instance with the module's attributed
+  failure, latched once and applied at the next safe boundary, so catching
+  the error cannot make it a success. `noLoaderHooks` keeps the plain error.
+- **Placed roots on a scheduled owner.** `DueAt tick sequence` starts only
+  once the scheduler stands just before the tick (`ticksQuiet`,
+  `tickQuietBefore`), and the tick is **held** (`ticksHold`) until the root
+  has an outcome: a placed root finishes before any work of its tick begins,
+  where `DueTick` lets the tick begin and keeps its grant open. The owner
+  keeps one hold, for the earliest such tick. `promoteSubmitted`,
+  `submitReservedRoot` and `notifySourceNow` run in the caller's own
+  transaction; `pokeLoader` wakes the owner.
+- **Hooks.** `LoaderHooks` is called on the owner's thread, outside Lua:
+  `hookService` before every service, `hookSettled` with the identities that
+  came to an outcome in order, `hookBlocked`, `hookReserved`, and `hookExit`
+  once the loader is stopped. A hook that raises is an application failure.
 
 ### What is not here
 
-The content reads and file workers, the per-request module waiters, the atomic request and identity reservation, the source
-bank and an assigned-position settlement are the application's: `hetoimasia-lua-engine`'s module coordinator composes them over
-this loader and the [request admission](#atomic-request-admission) (LFE-11). The lexical-root, content, time and output
-facades are `hetoimasia-lua-engine`'s (LFE-12), over the seams here; startup, session failure and quit policy (LFE-13); unavailable-state interception (LFE-26); hot reload, mods,
-hostile-code isolation and replay guarantees. The loader does not preempt a non-yielding module.
-
-### What proves it
-
-`Test.Lua.Boundary.Loader` (`lua-host-tests`, real interpreter, an injected supplier and resolver, nothing sleeps): depth-first
-order read from what modules marked; one shared table; a later root never overtaking; eligibility injected; a pending
-dependency reused within the chain; every sticky failure kept across a later import; a caught failure still condemning;
-completed dependencies surviving a failed parent; cycles with their chain and no extra frame; one example for each
-context where Lua cannot suspend and the contexts where it can; resolver refusals that latch nothing; the immediate lookup
-of a hook; the phase of a top level with a helper and a stashed facade; the seams' threads.
-`Test.Lua.Boundary.Loader.Limits` (each bound at and one past it, pending and failed identities charged, reuse at any
-fill), `Loader.Stop` (a chain stopped at each depth, idempotence, late and duplicate answers, failing closes and releases
-kept as evidence), `Loader.Failures` (a supplier, a resolver and a release that raise; an allocator budget swept over a
-chain so that every point of exhaustion is classified and the ledger balanced) and `Loader.Threads` (an answer from another
-thread, every other thread refused, hooks and stop served while a chain waits, an independent VM unaffected, a seam's
-re-entry refused). `Test.Lua.Opacity` adds an external client that composes injected sources and the loader through the
-public owner alone. `Test.LuaRuntime.Loading` (`lua-runtime-tests`) runs the hosted loader on real supervised scheduled
-owners: a chain waiting for another thread's source while a hook runs, an independent owner, the tick hold with a
-positive control, the bounded inbox, and the owner's exit. `Test.LuaEngine.Loader` (`lua-engine-tests`) configures a real
-owner from the fixed M1 profile and shows a chain of 32 and 256 identities and nothing more.
-
-`Test.Lua.Boundary.Loader.Placed` (`lua-host-tests`) pins the placed roots on a real interpreter: roots started by order
-whatever order they were admitted or their sources arrived in, equal orders in the order admitted, a later ready root never
-overtaking, first in first out for `admitRoot`, a root moved up keeping its tie-break and starting first with no second record,
-interest or evaluation, an order never moved later, a dependency queued so that its own turn runs nothing, what has nothing to
-move, and the reserved room: counted against a dependency, not asked of a reserved root, not counted against itself.
-`Test.Lua.Boundary.ExportTable` pushes an export table into Lua by reference (the same table each time, its cycle, function and
-upvalue as they are) and refuses another VM's table and a slot that holds none. `Test.LuaRuntime.Loading` (`lua-runtime-tests`)
-adds the placed roots on real owners: the tick held until the root has an outcome and the root started only when everything
-before it is finished, roots started by tick and sequence with an earlier place moving a queued one up, the hold moving earlier and
-never later, the hooks, and the poke; `Test.LuaRuntime.Scheduler.Requests` pins `tickQuietBefore`.
-
+Content reads, file workers, per-request module waiters, the request and
+identity reservation, and the lexical-root, content, time and output facades
+are `hetoimasia-lua-engine`'s, composed over this loader and
+[request admission](#atomic-request-admission). There is no hot reload, mod
+support or hostile-code isolation.
 ## Tasks and the coroutine library
 
-Tasks (LUA-20; design P-5, P-6, D-12, D-13, D-22, D-29; Q-3) are the host's
-mechanism for script code that gives control back: a module's entry point run as
-a Lua coroutine of its VM, on the VM's owner, a segment at a time. This is the
-mechanism and nothing else. The scheduler that decides when a task runs, what a
-deadline or a tick is, and in what order (LUA-21), and the supervised owners that
-use both (LUA-6, delivered in `runtime-lua`), are separate slices; no clock, timer, queue or policy is here,
-and the examples resume a task by hand.
+A task is a module's entry point run as a Lua coroutine of its VM, on the VM's
+owner, one segment at a time. This is the mechanism only: no clock, timer,
+queue or policy is here.
 
 ### What a task is
 
-```haskell
-startTask  ∷ OwnedVm → ModuleHandle → Text → [Value] → IO TaskStart
-resumeTask ∷ OwnedVm → Task → IO TaskStep
-closeTask  ∷ OwnedVm → Task → IO ()
+`startTask` checks the handle, entry point and arguments exactly as
+`callEntry` does and runs the entry point up to its first yield, wait or
+return, answering `TaskEntryAbsent` (an absent optional entry point; nothing
+runs) or `TaskStarted task step`. `resumeTask` runs the next segment with no
+values. A `TaskStep` is `Completed results` (checked like a call's; the task
+has ended), `Yielded`, or `Waiting` with a `WaitRequest` (the kind
+`WaitElapsed` or `WaitLogical`, the binding and its arguments).
 
-data TaskStart = TaskEntryAbsent | TaskStarted Task TaskStep
-data TaskStep  = Completed [Value] | Yielded | Waiting WaitRequest
-data WaitRequest = WaitRequest
-  { waitKind ∷ WaitKind, waitNamespace ∷ Text, waitBinding ∷ Text, waitArguments ∷ [Value] }
-data WaitKind  = WaitElapsed | WaitLogical
-```
-
-`startTask` checks the handle, the entry point and the arguments exactly as
-`callEntry` does (the same code), and runs the entry point as a coroutine up to
-its first yield, wait or return. An optional entry point the module does not
-define answers `TaskEntryAbsent` and executes nothing, as an absent entry point
-does for a call. Each segment ends in one of three ways: the entry point
-returned, with results checked against its declared schemas and the owner's
-limits like a call's (`Completed`, after which the task has ended); the script
-yielded (`Yielded`); or it waited, and the host reports which wait and the
-arguments it gave (`Waiting`). Resuming goes on from there with no values, and the
-operation that suspended returns nothing to the script.
-
-A task is a Lua thread of the owner's VM, kept in a table the bridge owns in the
-registry, one slot per task, until it ends, so that the collector cannot take it
-while the host holds its handle. Starting, resuming and closing are operations of
-the VM like any other: held under its gate by its one execution owner, refused
-from another thread with `VmNotOwned`, from one of the VM's own callbacks with
-`VmReentered`, and once the VM has closed with `VmClosed`. The `Task` is a value
-naming a slot of one VM, checked on every use: another owner's is refused with
-`TaskRefused TaskForeign`. It is never a `Value`, so no task, thread or coroutine
-can cross the boundary, and Lua never sees one. A task that has returned, failed
-or been closed cannot be resumed: `TaskRefused (TaskEnded TaskCompleted |
-TaskFaulted | TaskClosed)`, with `NoEffect`.
-
-The host keeps no count of tasks and imposes no cap on them: how many an owner
-runs, and when, is the admission of the scheduler that uses this. Every
+A task is a Lua thread kept in one slot of a registry table the bridge owns
+until it ends. Starting, resuming and closing are VM operations: refused from
+another thread (`VmNotOwned`), from the VM's callbacks (`VmReentered`) and
+after the close (`VmClosed`). A `Task` names a slot of one VM and is checked
+on every use: another owner's is `TaskRefused TaskForeign`, an ended one
+`TaskRefused (TaskEnded TaskCompleted | TaskFaulted | TaskClosed)` with
+`NoEffect`. It is never a `Value`. The host counts and caps no tasks; every
 suspended one is closed when the VM closes.
 
 ### Yielding and waiting
 
-A script gives control back through a **scheduler operation**: a binding of the
-application's registration, in a namespace the owner's policy grants, like any
-other (D-22: there is no universal environment, and a script that is not granted
-one has none). Two constructors make them, and the application chooses the names
-and, for a wait, the argument shapes:
+A script gives control back through a **scheduler operation**, a binding of
+the application's registration in a granted namespace: `yieldOperation name`
+(no arguments) or `waitOperation name kind schemas`. Neither runs application
+code. A wait's arguments are checked against its schemas and the owner's
+limits before anything is suspended (`ValueRefused ... Arguments` otherwise)
+and reported uninterpreted in the `WaitRequest`.
 
-```haskell
-yieldOperation ∷ Text → Binding                          -- no arguments
-waitOperation  ∷ Text → WaitKind → [Schema] → Binding    -- WaitElapsed | WaitLogical
-```
-
-Neither runs application code. A wait's arguments are checked against the schemas
-it declares and the owner's value limits like a binding's, before anything is
-suspended: a wrong type or count, or an argument past a limit, is a typed fault of
-the call (`ValueRefused ... Arguments`), and the task is not suspended. Accepted
-ones are reported as they are in `WaitRequest`; the host interprets none of them.
-
-A scheduler operation is a *handler decision and a C action*. The handler runs in
-Haskell like any binding's and decides whether the call can reach the scheduler at
-all; it records what the script asked for on the VM and returns. The C closure of
-the binding then calls `lua_yield`, after every Haskell frame has returned. That is
-the rule the error protocol already follows, for the same reason: `lua_yield`
-unwinds with a `longjmp` exactly as `lua_error` does, and a `longjmp` through a
-Haskell frame is undefined. The coroutine yields no values and is resumed with
-none, so what the script asked for travels in the host's record and never as a Lua
-value.
+The handler runs in Haskell, records what the script asked for on the VM and
+returns; the binding's C closure then calls `lua_yield` after every Haskell
+frame has returned. The coroutine yields and is resumed with no values.
 
 #### Where it cannot reach a scheduler
 
-A scheduler operation called anywhere the host is not resuming the calling
-coroutine is refused as a typed fault of the call (decision C1), not run: it never
-suspends something nobody will resume, and never yields to the wrong resumer.
-Like every refusal it is raised at the owner's boundary even if the script caught
-Lua's side of it with `pcall`.
+A scheduler operation called where the host is not resuming the calling
+coroutine is a typed fault of the call, raised at the owner's boundary even if
+the script caught it:
 
 | Called from | Reason (`SuspendRefused`) |
 |---|---|
-| a finite `callEntry`, an initial chunk, a module's load, a finalizer on the owner's main thread, a to-be-closed variable's handler while its coroutine closes, a close, another owner's VM | `SuspendOutsideTask`: the host is not running a task of this owner |
-| a coroutine the script created with the `coroutine` library, while a task runs | `SuspendOtherCoroutine` |
-| the task's own coroutine inside a table-sort comparator, a pattern-replacement callback, or a finalizer it happens to run on: anywhere Lua cannot suspend it | `SuspendNotYieldable` |
+| a finite `callEntry`, an initial chunk, a module's load, a finalizer on the owner's main thread, a to-be-closed handler while its coroutine closes, a close, another owner's VM | `SuspendOutsideTask` |
+| a coroutine the script created, while a task runs | `SuspendOtherCoroutine` |
+| the task's own coroutine inside a table-sort comparator, a pattern-replacement callback or a finalizer | `SuspendNotYieldable` |
 
-Lua can suspend across `pcall`, `xpcall` and a metamethod called from Lua code,
-and so a scheduler operation works there. A coroutine that yields with *no*
-scheduler operation, by calling `coroutine.yield` itself at the task's top level
-(directly or through `pcall`), would be suspended to no one; that is
-`UnscheduledYield`, a fault of the segment, and the task is closed. A script that
-resumes the task's own coroutine by hand leaves the host's next resume with
-`TaskRefused TaskNotSuspended`. If that coroutine died holding to-be-closed
-variables the host closes it, which runs them: their failures are cleanup
-evidence, and the fault's `Effect` says what ran (`BindingRan` if a binding's
-action did, `LuaRan` if the coroutine could have held something to run, otherwise
-`NoEffect`).
+It works across `pcall`, `xpcall` and a metamethod called from Lua code. A raw
+`coroutine.yield` at the task's top level is `UnscheduledYield`, a fault of
+the segment, and the task is closed. A script that resumes the task's own
+coroutine by hand leaves the host's next resume with `TaskRefused
+TaskNotSuspended`.
 
 ### The `coroutine` library
 
-`LibraryCoroutine` is selectable like the other standard libraries, so trusted
-code can use coroutines for transient sequences inside a task (P-5, D-22). Every
-existing library set and default is unchanged: opening it is the owner's explicit
-choice, and the opener is the C library's own. Lua coroutines are not serialized
-or migrated: authoritative long-lived progress uses explicit state. A coroutine a
-script makes is the script's own and is still refused as a value
-(`RuleUnsupportedType "thread"`); a scheduler operation inside it is governed by
-the table above.
+`LibraryCoroutine` is selectable like any library, for transient sequences
+inside a task. A coroutine a script makes is still refused as a value
+(`RuleUnsupportedType "thread"`). Coroutines are not serialized or migrated:
+long-lived progress uses explicit state.
 
 ### Faults in a segment
 
-Whichever segment fails, it fails as a typed `BoundaryFault`, with the module and
-entry point (the run context is set for every segment), the operation, a bounded
-traceback, a reason and an `Effect`:
+A failing segment raises a typed `BoundaryFault` with the module, entry point,
+operation, traceback, reason and `Effect`: `ScriptFailed CallFailed` or
+`ScriptFailed MemoryExhausted`; `ValueRefused` on results or arguments, as
+`callEntry` raises them; a binding action's Haskell failure re-raised
+unconverted.
 
-- a script error is `ScriptFailed CallFailed`, exhausted allocation
-  `ScriptFailed MemoryExhausted`, with `LuaRan` (`BindingRan` after an action);
-- a result the schema does not allow, or the wrong number, is `ValueRefused` on
-  the results; an argument a binding is called with is `ValueRefused` on the
-  arguments, as a fault of that call; both exactly as `callEntry` raises them;
-- a Haskell failure a binding's action raised is re-raised unconverted with its
-  own type and context, as `callEntry` re-raises it.
+**A failure the script caught still wins.** At every boundary of a segment, a
+refusal the boundary made or an application failure that reached a callback is
+raised in preference to what Lua reported, even when the script caught the
+stand-in and went on to yield, wait or return.
 
-**A failure the script caught still wins.** At every boundary of a segment,
-completed, yielded and waiting alike, a refusal the boundary made or a failure of
-application code that reached a callback is raised in preference to what Lua
-reported, even when the script caught the stand-in with `pcall` or
-`coroutine.resume` and went on to yield, wait or return; the host reports the
-failure and never a successful suspension, with its type, context and applicable
-`Effect`. This is `callEntry`'s precedence, applied at each boundary a segment can
-end in.
-
-**A segment that fails leaves nothing.** The coroutine is dead and its stack
-intact, so the host builds the traceback from it, then closes it, running its
-pending to-be-closed variables (Lua's own `coroutine.wrap` does the same), and
-empties its slot: the task has ended (`TaskEnded TaskFaulted`). The close is a
-step of its own, apart from the segment, so what it raises is never mistaken for
-what the segment did: the segment's failure (a Haskell failure that reached a
-callback, else the script's error) is the one raised, and every Haskell failure a
-to-be-closed variable's callback raises while the coroutine closes, with its own
-type and context, and any error of Lua's other than the one the segment died
-with, is kept beside it as cleanup evidence (`lua coroutine close`), bounded like
-the finalizers' (64, with one further entry saying how many were not kept).
-Nothing is lost because two failures look alike to Lua: they both reach it as the
-same placeholder (a light userdata that no script can build), and the host keeps
-the originals; an error of any other kind, a table included, is the script's own
-and is always reported. A binding's action that runs after a refusal the closing
-code caught upgrades the `Effect` of every failure kept this way, as it does the
-pending one.
+**A segment that fails leaves nothing.** The host builds the traceback from
+the dead coroutine, closes it (running its to-be-closed variables) and empties
+its slot (`TaskEnded TaskFaulted`). The segment's failure is the one raised;
+what the close raises is cleanup evidence (`lua coroutine close`), bounded at
+64 plus one count entry.
 
 ### Closing a task
 
-`closeTask` runs a suspended task's pending to-be-closed variables on the owner's
-thread and empties its slot. The close is terminal and idempotent: the task is
-closed whether or not a variable's handler failed, a failure is raised as a
-`BoundaryFault` of `CloseTask` (`ScriptFailed CallFailed`; a Haskell failure a
-handler's callback raised outranks it, and when several fail the first is the
-failure and the rest are cleanup evidence) once and not again, a second close
-does nothing, and a task that already ended is closed already. A scheduler
-operation inside a handler that runs during the close is refused
-(`SuspendOutsideTask`).
+`closeTask` runs a suspended task's pending to-be-closed variables on the
+owner's thread and empties its slot. It is terminal and idempotent: the task
+is closed whether or not a handler failed, and a failure is raised once as a
+`BoundaryFault` of `CloseTask` (a Haskell failure from a handler's callback
+outranks a script error; later ones are cleanup evidence). A scheduler
+operation inside a closing handler is `SuspendOutsideTask`.
 
-A VM that closes with tasks still suspended closes each of them first, before the
-state, in the order they started. Each is attempted whatever another does, on the
-owner's thread, with everything its callbacks borrow still alive; a callback a
-handler reaches is held to the finalizer allowlist exactly as a finalizer's is, so
-one the allowlist does not name is refused (`lua finalizer refused`) and an
-allowlisted one runs. A failing close is retained as evidence under `lua coroutine
-close`, in the exit matrix above, and the rest still close. A cancellation of the
-owner is deferred past all of it as it is for the close, so a cancellation that
-arrives in the middle of a resumed segment is delivered after the segment's
-bookkeeping, the suspended tasks are closed, and the original asynchronous
-exception is what the owner raises, with their failures on it.
+A VM closing with suspended tasks closes each first, in start order, every one
+attempted, with their callbacks held to the finalizer allowlist. A
+cancellation of the owner is deferred past all of it.
 
 ### Stack, registry and memory
 
-Every operation restores the stack depth it entered at, on every path. A task's
-slot is emptied when it ends, however it ends, so the registry holds exactly the
-suspended tasks and nothing else; the slots are not `luaL_ref` references, so
-`probeReferenceSlot` and `liveModuleReferences` do not move, and
-`liveTaskReferences` counts what is suspended. Creating a coroutine is one
-protected call with the collector held, so running out of memory there is a typed
-`ScriptFailed MemoryExhausted` of `StartTask` with `NoEffect` (nothing executed),
-and the allocation it needed is paid when the task first runs, as for a call.
-
-### What proves it
-
-`Test.Lua.Boundary.Tasks`, under the `value boundary` selector: start, yield,
-resume and complete; a wait of each kind with its exact request and arguments,
-resumed by hand, and malformed and over-limit wait arguments; a script error, a
-refused value, an exhausted allocator and a binding's failure in a resumed
-segment; a refusal and a failure caught by `pcall` or `coroutine.resume` and
-followed by a yield, a wait or a return; closing, with a failing handler,
-repeated, and after the task ended; resumption of an ended or foreign task;
-refusals from a finite call, an initial chunk, a module load, a finalizer, a
-script-created coroutine and the places Lua cannot suspend; the library selected
-and used inside a task, and a coroutine still refused as a value; stack, registry,
-tasks and heap across a thousand cycles of every shape and across allocation
-failures swept to the creation of a coroutine; the VM closed with suspended
-tasks, with a failing close, a refused callback and the allowlist; cancellation
-inside a resumed segment with several tasks suspended, delivered by coordinated
-blocking and never by sleeping; foreign-thread and re-entrant use; and two tasks
-on one VM keeping separate continuations and faults.
+Every operation restores its entry stack depth. A task's slot is emptied
+however it ends, so the registry holds exactly the suspended tasks
+(`liveTaskReferences`). Creating a coroutine is one protected call with the
+collector held: exhaustion there is `ScriptFailed MemoryExhausted` of
+`StartTask` with `NoEffect`.
 
 ## The runtime adapter
 
-The runtime adapter (LUA-5; design D-12 to D-15, P-1, P-3, P-5, P-7 to P-9,
-P-12) puts trusted VM owners under runtime supervision. It is the public
-`runtime-lua` sublibrary of this package, in its own source directory
-(`runtime-lua/`), and its one public module is
-`Hetoimasia.Scripting.Lua.Runtime`.
+Trusted VM owners under runtime supervision: the public `runtime-lua`
+sublibrary (`runtime-lua/`), whose one public module is
+`Hetoimasia.Scripting.Lua.Runtime`. It depends on the host library, the
+private `model` and `bridge`, `hetoimasia-runtime` and
+`hetoimasia-foundation`. It uses the bridge for the process-wide record of
+callback threads, the mark a failure of application code carries, and the
+value-limit check. `Hetoimasia.Runtime.Inbox` is not used.
 
-It depends on the host library, the private `model` and, only where it must, the
-private `bridge`, on `hetoimasia-runtime` and on `hetoimasia-foundation`, and on
-nothing of GLFW, Vulkan, the console or a game. The host library gained no
-dependency, and `Hetoimasia.Runtime.Inbox` is neither used nor changed: its
-already-initialized startup handoff is not what a VM owner needs, and P-3 says not
-to weaken it. The bridge is named for three things no public host module offers:
-the process-wide record of the threads running a Lua callback, the mark a failure
-of application code carries, and the value limits' check. The model supplies the
-validation of the two caps the adapter has (below). `Test.LuaRuntime.Dependencies`
-reads the stanza and the imports of the adapter's modules to check all of this,
-without a VM.
-
-One owner is one supervised worker. There is no pool, no scheduler across owners,
-no thread or timer of the adapter's own, and no new supervisor (a scheduled owner,
-below, is the opt-in owner that serves tasks, and shares none of this adapter's
-queue): it composes
-`withVmOwner` with `startSupervised`, `workerDefinition` and `awaitSupervised`.
+One owner is one supervised worker: `withVmOwner` composed with
+`startSupervised`, `workerDefinition` and `awaitSupervised`. No pool, thread,
+timer or supervisor of its own.
 
 ### Creation and readiness
 
-A `LuaRuntime` is made over the `RuntimeControl` of one `withSupervision`
-invocation (`newLuaRuntime`). `startLuaOwner` takes it, an `OwnerSpec` and
-answers an `OwnerStart`. The spec is the host's `VmConfig`, a `WorkerPolicy` the
-application chooses, and the two bounds, `CallBounds`.
+`newLuaRuntime` makes a `LuaRuntime` over the `RuntimeControl` of one
+`withSupervision` invocation. `startLuaOwner` takes an `OwnerSpec` (a
+`VmConfig`, a `WorkerPolicy`, `CallBounds`) and answers an `OwnerStart`:
 
-Creation checks the bounds first, and a bound below one raises
-`OwnerBoundsRefused` naming every violation before any worker starts or VM is
-built. It then issues the owner's identity and starts exactly one worker. The
-worker's `Scoped` startup allocates only the owner's bounded queue and counters.
-Constructing the VM, installing the registration's granted bindings, running the
-initial chunks and loading the configured modules all happen inside `withVmOwner`
-on the worker's own thread, which is therefore the VM's execution owner. Only then
-does the body publish readiness and open admission, in one transaction, and only
-then is an endpoint handed out.
+1. The bounds are checked; one below one raises `OwnerBoundsRefused` before
+   any worker starts.
+2. The owner's identity is issued and exactly one worker starts. Its `Scoped`
+   startup allocates only the bounded queue and counters.
+3. The VM is constructed and initialized inside `withVmOwner` on the worker's
+   thread, which is therefore the VM's execution owner.
+4. The body publishes readiness and opens admission in one transaction; only
+   then is an endpoint handed out.
 
-Readiness is awaited by one `awaitSupervised` wait, composed with the worker's own
-terminal status. The acknowledgement `startSupervised` waits for means only that
-the startup finished, and the creator never treats it as readiness: a slow initial
-chunk is in progress after `startSupervised` has returned and before creation
-does. A failure of initialization, whether a library, a binding installation, a
-chunk, a module load or a policy naming an unknown namespace, ends creation under
-the owner's policy, and nobody is left waiting. A required owner's failure is
-raised by supervision as any worker's is. An optional owner whose classifier
-recognizes it answers `OwnerUnavailable`, its status committed and the run
-continuing. At handoff admission is checked still to be live; an owner that ended
-without failing answers `OwnerEnded`, and a closed boundary `OwnerRejected`.
+Readiness is one `awaitSupervised` wait composed with the worker's terminal
+status. **The `startSupervised` acknowledgement is not readiness.** An
+initialization failure ends creation under the owner's policy: a required
+owner's failure is raised by supervision; an optional owner whose classifier
+recognizes it answers `OwnerUnavailable`; an owner that ended without failing
+`OwnerEnded`; a closed boundary `OwnerRejected`.
 
-Acquisition is masked from the worker's start to the endpoint's handoff, with
-only the readiness wait restored once the stop request is armed, so a cancellation
-cannot fall between the worker's start and that request, nor between the end of the
-wait and the handoff. A creator whose wait is abandoned, cancelled or woken by
-another worker's fatal outcome, asks the owner to stop. The worker group still owns the worker and
-drains it, and no detached helper exists. Creating an owner waits for readiness,
-so it is refused from a Lua callback (below).
+Acquisition is masked from the worker's start to the handoff, with only the
+readiness wait restored. A creator whose wait is abandoned or cancelled asks
+the owner to stop; the worker group still drains it. Creating an owner is
+refused from a Lua callback.
 
 ### Identity
 
-Each owner is issued an `OwnerId` by the `LuaRuntime` that created it, once and in
-order, and an identity is never issued again, including after the owner retires.
-The runtime boundary an identity is unique within is that `LuaRuntime` value: make
-one for each `withSupervision` invocation. Two runtimes never issue equal
-identities, even when their sequence numbers agree. The endpoint, every
-settlement and the exit record carry the identity beside the application's label,
-`vmOwnerName`. Neither confers trust or a grant: an owner's authority is exactly
-its configured `vmPolicy`, and two owners of one label with different policies
-keep the bindings of their own. The model's own two-valued `ExecutionDomain` is
-D-1's composition for LUA-8 and limits nothing here; the adapter's identity wraps
-nothing of it and changes none of its examples.
+Each owner gets an `OwnerId` from its `LuaRuntime`, issued once, in order,
+never reissued. Make one `LuaRuntime` per `withSupervision` invocation; two
+runtimes never issue equal identities. The endpoint, every settlement and the
+exit record carry it beside the label `vmOwnerName`. Neither confers
+authority: that is exactly the configured `vmPolicy`.
 
 ### Submitting calls
 
-An `OwnerEndpoint` submits a call to an entry point of a module the owner loaded
-at initialization, named by its `ModuleRef`, with `[Value]` arguments. It is a
-value usable from any thread, including a binding's action on this owner or on
-another, and it never needs the `RuntimeControl`. Modules come from the owner's
-configuration: nothing loads one through the endpoint after readiness.
+An `OwnerEndpoint` submits a call to an entry point of a module the owner
+loaded at initialization, named by `ModuleRef`. It is usable from any thread,
+a binding's action included. `submitCall` never blocks and answers
+`CallAccepted ticket`, `CallFull` or `CallClosed` (closed takes precedence; a
+refusal changes nothing).
 
-`submitCall` never blocks. It answers `CallAccepted` with a `CallTicket`,
-`CallFull` or `CallClosed`, the foundation channel's `Accepted`, `Full` and
-`Closed`, and a full or closed answer changes nothing. Closed takes precedence.
-Two bounds, both configuration, both at least one:
+| Bound (each at least one) | Meaning |
+|---|---|
+| `boundQueuedCalls` | accepted calls waiting to start; the running call is not queued |
+| `boundResults` | reservations held at once: taken atomically with the enqueue and held while the call waits, runs and sits settled but unobserved |
 
-- `boundQueuedCalls` is how many accepted calls may wait for the owner's thread to
-  start them. The call that is running is not queued.
-- `boundResults` is how many results may be reserved at once. A reservation is
-  taken, atomically with the enqueue, as a call is accepted, and held while the
-  call waits, runs, and sits settled but not yet observed. So a result always has
-  a place before its call runs, completion needs no capacity of its own, and the
-  unobserved results are bounded however slowly they are read.
+So a result always has a place before its call runs. An owner asked to stop
+admits nothing from that moment, even while a call is held in a binding.
 
-Submission answers full when either bound is reached. The private model's
-`validateLimits` checks the two caps, `maxQueuedAdmissions` and
-`maxRetainedResults`, which mean exactly this; its other caps belong to later
-slices and are held at the smallest valid value. No maximum is imposed beyond what
-memory allows.
-
-An owner that has been asked to stop admits nothing from that moment, whether or
-not its thread has got as far as acting on the request: a call held inside a
-binding does not keep admission open.
-
-The payload is prepared on the producer's thread before publication.
-`prepareCall` evaluates the arguments completely there, so a failure nested in a
-lazy value is raised in the producer, and the owner's thread is handed nothing
-unevaluated. It checks them against the owner's value limits as it goes and stops
-at the first limit, so an endless or oversized argument list costs no more to
-refuse than a small one, and none of it is kept. What is kept of an accepted call
-is compacted as well: every string in it, its values' and its routing strings (the
-module's name and version and the entry point's name), is copied to a buffer of its
-own, so a short slice never keeps the larger buffer it was cut from alive while the
-call waits, and a capability type name or routing string longer than any valid one
-is cut to one character past the longest valid one, which can only be refused, and
-is as much of it as a refusal will quote. A call whose arguments were over
-the limits is accepted like any other, carries only the rule they broke, and
-settles in its turn as the same `ValueRefused` fault the argument check raises,
-with `NoEffect`. Preparing is separate from `submitPrepared`, so the three-way
-answer never evaluates anything. The schema and capability checks still happen on
-the owner's thread, under `callEntry`'s own contract.
+`prepareCall` evaluates the arguments completely **on the producer's thread**
+and checks them against the owner's value limits, stopping at the first limit;
+`submitPrepared` then evaluates nothing. What is kept is compacted (every
+string copied to its own buffer). A call whose arguments were over the limits
+is accepted and settles in its turn as the `ValueRefused` fault, `NoEffect`.
+Schema and capability checks happen on the owner's thread.
 
 ### Settlement
 
-Calls run one at a time, to completion, on the owner's thread, in the order they
-were accepted, through `callEntry` with that module's handle. There are no
-coroutine yields, tasks, deadlines, timers or providers here (the host's tasks
-exist, but this adapter does not use them until the slices that schedule them). Each accepted call
-settles exactly once, as one of:
+Calls run one at a time, to completion, in acceptance order, through
+`callEntry`. Each accepted call settles exactly once:
 
-- `CallReturned`, with the entry point's `CallResult`, `Returned` values or
-  `EntryAbsent`;
-- `CallFaulted`, with a fault of the call returned to its caller as data:
-  `ScriptFailed` (a memory failure included), `ValueRefused`, `NotYetSupported`, a
-  missing entry point, all as the `BoundaryFault` or `LuaFault` they are, and
-  `ModuleNotLoaded` for a `ModuleRef` the owner did not load, which settles with
-  `NoEffect` and runs nothing. The owner goes on serving the next call, and none
-  of this is a worker failure;
-- `CallDiscarded`, when the owner exits before the call settles, recording how it
-  exited (`ExitStopped`, `ExitFailed` or `ExitCancelled`) and whether the call had
-  started.
+| Settlement | When |
+|---|---|
+| `CallReturned` | the entry point's `CallResult` (`Returned` values or `EntryAbsent`) |
+| `CallFaulted` | a fault of the call, as data: `ScriptFailed`, `ValueRefused`, `NotYetSupported`, a missing entry point, or `ModuleNotLoaded` (`NoEffect`). The owner goes on |
+| `CallDiscarded` | the owner exited first; records how (`ExitStopped`, `ExitFailed`, `ExitCancelled`) and whether the call had started |
 
-A call that had started may have run Lua and the application's bindings, so its
-effects may be real; a discard never claims otherwise, and only a call that never
-started is known to have done nothing. The failure that ended a failed owner goes
-only to supervision: no caller receives the exception or a rendering of it.
-
-No path settles a call twice, loses an accepted call or lets a late result
-overwrite a settlement, including a submission that races stop, failure or
-cancellation. A call the owner has dequeued is marked in flight in the same
-transaction, and its settlement and the clearing of that mark are one more, so a
-call is always queued, in flight or settled.
+A started call may have had real effects; only one that never started is
+known to have done nothing. The failure that ended a failed owner goes only
+to supervision. A call is always queued, in flight or settled, each change one
+transaction, so no path settles twice or loses a call.
 
 ### Observing results
 
-`pollCall` reads a settlement without blocking. `waitCall` waits for it on any
-thread that is not running a Lua callback, and `awaitCall` waits on the
-application thread, composed with `awaitSupervised`, so a worker's terminal
-outcome is handled first and a fatal one is raised rather than waited out. Every
-accepted call settles, so a wait ends once the owner has run the call or exited.
-
-Reading a settlement is observing it. The first read that finds one gives the
-reservation back, and every later read answers the same settlement and gives
-nothing back, however many threads read it at once. `forgetCall` withdraws
-interest: a settled call gives its reservation back at once, an unsettled one when
-it settles, and the ticket can still be read. A ticket nobody observes or forgets
-keeps its reservation, which is what bounds the unobserved results.
-
-None of these is a transaction, and the adapter exposes no primitive a callback
-could block on.
+`pollCall` reads without blocking; `waitCall` waits on any thread that is not
+running a Lua callback; `awaitCall` waits on the application thread, composed
+with `awaitSupervised`. The first read that finds a settlement gives the
+reservation back; later reads answer the same settlement. `forgetCall`
+withdraws interest (the reservation returns at settlement). **A ticket nobody
+observes or forgets keeps its reservation.**
 
 ### Waiting from a callback is refused
 
-A thread running a binding's action or any other Lua callback, of this owner or of
-any other VM, may submit calls but may not wait for a reply, its own owner's
-included: it would be a synchronous call into a thread that may be waiting for it
-(D-13). `waitCall`, `awaitCall` and `startLuaOwner` check when they execute, and
-raise `CallbackWaitRefused` naming the operation (`wait-call`, `await-call`,
-`start-lua-owner`) at once. They never block, so a wait action built earlier
-outside the callback is refused the same way when the callback runs it.
-
-The detection is a process-wide record of the threads running a callback, kept by
-the bridge's callback entry, so it covers the callbacks of a VM that was created
-outside the adapter and the application's own capability-liveness checks, which
-run as callbacks too. It answers a boolean to the adapter and publishes no thread
-identity to application code. A thread a callback starts is not a callback thread,
-and nothing detects it: that stays outside the contract, as it does for the VM's
-own re-entry check.
+A thread running any Lua callback, of any VM, may submit calls but may not
+wait for a reply. `waitCall`, `awaitCall` and `startLuaOwner` check when they
+execute and raise `CallbackWaitRefused` (`wait-call`, `await-call`,
+`start-lua-owner`) at once. Detection is the bridge's process-wide record of
+callback threads; a thread a callback starts is not detected and stays
+outside the contract.
 
 ### Host failures and policy
 
-A Haskell failure raised by a binding's action or by the application's liveness
-check, or any other exception escaping the owner, including one escaping the VM's
-close, ends that owner's worker. It is the worker's primary outcome with its own
-type and context, the VM's close failures are retained beside it as cleanup
-evidence, and the adapter neither converts nor retries it. What follows is the
-owner's `WorkerPolicy`, as for any worker: an optional owner whose classifier
-recognizes the failure becomes `WorkerUnavailable` and every other owner goes on;
-every other outcome is fatal. A retained cleanup failure is always fatal, whatever
-the policy, so a recognized failure whose VM close also failed is `WorkerFatal`
-with the close evidence on it. A normal stop and a requested cancellation keep
-their usual supervision treatment.
+A Haskell failure raised by a binding's action or a liveness check, or any
+exception escaping the owner (the VM's close included), ends that owner's
+worker as its primary outcome, with the close failures as cleanup evidence.
+The owner's `WorkerPolicy` then applies: a recognized failure of an optional
+owner is `WorkerUnavailable`; anything else is fatal. **A retained cleanup
+failure is always fatal**, whatever the policy.
 
-A failure is the host's by where it was raised, not by its type. A binding's action
-can throw a `BoundaryFault` or a `LuaFault`, and those are still the host's
-failures. The bridge marks a failure where it escapes application code, as an
-annotation on the exception's context, and the adapter reads the mark and not the
-type: an unmarked `BoundaryFault` or `LuaFault` is a fault of the call, settled as
-data, and a marked one ends the owner. The exception keeps its type and value. When
-a script catches a refusal the boundary made and then calls a binding whose action
-fails, the application's failure is the one the owner's boundary re-raises; in
-every other case the first failure of an operation is the one kept.
+A failure is the host's by where it was raised, not by type: the bridge marks
+a failure where it escapes application code. An unmarked `BoundaryFault` or
+`LuaFault` is a fault of the call, settled as data; a marked one ends the
+owner.
 
 ### Stop, retire and the exit record
 
-Stopping an owner, through `retireOwner`, `stopSupervised`, or the boundary
-closing, closes admission first, so later submissions answer closed. The owner's
-thread then lets the in-flight call return with its own settlement, discards every
-queued call as not started and stopped, and lets `withVmOwner` close the VM on the
-worker's thread. Retiring an owner is stopping its worker, and owners are created
-and retired while others run.
+Stopping (`retireOwner`, `stopSupervised`, the boundary closing) closes
+admission first. The in-flight call returns with its own settlement, queued
+calls are discarded as not started, and `withVmOwner` closes the VM on the
+worker's thread. Every other exit discards the same way, the in-flight call of
+a failed or cancelled owner as started. Admission always closes before the VM
+begins to close.
 
-The same discarding happens on every other exit, a failure of the application's
-code and a cancellation included, with the way the owner exited recorded. In every
-case admission closes, and what had not settled is discarded, before the VM begins
-to close, because closing can block for as long as a finalizer runs and no call may
-be accepted meanwhile. The in-flight call of a failed or cancelled owner is
-discarded as started.
+`ownerExitRecord` answers the `ExitRecord` once the owner has exited:
+identity, label, how it exited, and the discarded calls counted separately as
+started and not started. It carries no cleanup evidence. A stuck in-flight
+call keeps the worker, VM and dependencies live: nothing is detached.
 
-The `ExitRecord`, read through `ownerExitRecord` once the owner has exited, names
-the owner's identity and label, how it exited, and counts the discarded calls, those
-that had started and those that had not, separately. It carries no cleanup
-evidence: that is supervision's, as the model's own `ExitRecord` keeps the two
-apart. A stuck in-flight call keeps the worker, its VM, the registration and the
-binding dependencies live, because nothing is detached and the boundary's drain
-still owns the worker.
+### Test rules for this suite
 
-### What proves it
+`lua-runtime-tests` (`runtime-lua-test/`) runs real VMs under a real
+`withSupervision`, coordinated by gates, never sleeps. CI on Linux is the
+evidence for cancellation and shutdown windows.
 
-The adapter's examples are their own suite, `lua-runtime-tests`, in the
-`runtime-lua-test/` source directory, beside the host's suite and leaving its
-examples unchanged. Every execution and lifecycle example acquires real VMs under
-a real `withSupervision`; the structural checks need no VM. They are coordinated
-with gates the bindings open as they are reached, never with sleeps. Cancellation
-and shutdown windows are the kind an asynchronous-exception race can hide on one
-platform, so CI, which runs them on Linux, is the evidence for them and a local
-pass is not.
-
-An example that parks a callback at a gate (`fx.block`, `app.block`, `holdOwner`, a host
-callback) must fail, and fail within its 60-second `bounded` limit, whatever way it ends
-between the hold and its own release: the boundary's protected teardown waits for the
-callback a held gate holds, so a gate nothing opens turns a failed assertion into a hang
-until an outside deadline. Such an example runs its boundary through `withBoundaryOpening`
-(`expectFatalOpening`, `tryBoundaryOpening` where it expects the boundary to fail, and
-`alongsideOpening` where a helper thread acts) with the fixtures it parks callbacks at.
-When the body ends by raising anything, every gate of those fixtures is opened inside the
-body, the ones made so far and the ones a callback first arrives at later, before the
-teardown begins; and when the example's bound expires, `bounded` opens them from a thread of
-its own, because an example parked in the runner's protected retirement cannot, and the
-exception the bound throws does not end that wait. A helper thread that fails opens them too,
-and the example fails with the helper's failure. The passing path is untouched: each example
-still opens each gate where it opens it. The `Gates` examples hold these helpers to that.
-
-An example that expects the boundary, or a wait, to fail must not take its own failure for the
-one it expects. Every helper that catches the failure (`expectFatal`, `expectFatalOpening`,
-`tryBoundaryOpening`, `tryExpected` which the others are built on, and the accounting examples'
-`failingWait` and `retainedFailure`) raises a failed assertion, or the example's `bounded`
-timeout, as itself: the example fails with the assertion's own message and source location,
-within its bound, and the helper answers no outcome and runs nothing after it. What it still
-answers is the application's own failures: a typed one such as `Broken`, an injected
-`userError` or other `IOException`, and the supervised fatal outcomes with their context and
-retained cleanup evidence. So a helper or an example that asserts raises `failExample`, an
-`HUnitFailure` carrying the caller's location, and never `fail` or a `userError`, which a
-helper cannot tell from an application failure an example injected. An optional worker's
-`optionalPolicy` does not recognize a failed assertion either, whatever else it recognizes, so
-one a fixture raises on the worker is fatal. A catch that wraps only one production call, with
-no fixture or assertion of the example inside it, may stay a plain `try`. The `Expected` examples
-hold each helper to this, for an assertion raised in the boundary (the example's own and a fixture
-helper's) and for the bound expiring.
+- An example that parks a callback at a gate must fail within its 60-second
+  `bounded` limit however it ends: it runs its boundary through
+  `withBoundaryOpening` (`expectFatalOpening`, `tryBoundaryOpening`,
+  `alongsideOpening`), which opens every gate before teardown and when the
+  bound expires.
+- A helper that catches an expected failure (`expectFatal`, `tryExpected`,
+  `failingWait`, `retainedFailure`) re-raises a failed assertion or the
+  `bounded` timeout as itself. **Assert with `failExample`, never `fail` or a
+  `userError`**, which a helper cannot tell from an injected application
+  failure.
 
 ```bash
 cabal test hetoimasia-scripting-lua:lua-runtime-tests --test-show-details=direct
-```
-
-The script runner's examples are the `Runner` component of that suite, and a selector that matches none fails the suite:
-
-```bash
 cabal test hetoimasia-scripting-lua:lua-runtime-tests --test-show-details=direct --test-options='--match Runner'
 ```
 
 It also runs under `--project-file cabal.project.cpu`. The validation group is
-`test.scripting-lua-runtime`, non-optional, routed with `test.scripting-lua`; see
+`test.scripting-lua-runtime`; see
 [docs/validation.md](../../docs/validation.md).
-
 ## The scheduling machinery
 
-`Hetoimasia.Scripting.Lua.Scheduler` (LUA-21, in the `runtime-lua` sublibrary) is the
-reusable machinery one owner needs to choose, under a policy, which of its ready
-tasks runs next; to give each service class a bounded turn; to keep logical time
-that only the application advances, and elapsed deadlines behind one owned timer;
-to apply pause, resume and stop at safe boundaries; and to count what it did. It
-starts no thread, owns no VM and supervises nothing. It runs a task's segment and
-closes a task's continuation through the two actions of a `TaskHost`, so it is
-exercised against scripted segment outcomes and is independent of how coroutines
-come to exist (LUA-20). The scheduled owner that hosts it on a supervised worker with
-real VMs is LUA-6, below; the finite-call adapter above is unchanged. Its module imports
-nothing of the VM, the bridge, the registration, supervision, GLFW, Vulkan, the
-console or a game: only `base`, the foundation's clock and the protocol model, and
-`Test.LuaRuntime.Scheduler.Structure` reads its imports to check that.
+`Hetoimasia.Scripting.Lua.Scheduler` (in `runtime-lua`) is what one owner
+needs to choose, under a policy, which ready task runs next; give each
+service class a bounded turn; keep logical time only the application advances
+and elapsed deadlines behind one timer; apply pause, resume and stop at safe
+boundaries; and count what it did. It starts no thread, owns no VM and
+supervises nothing: it runs a segment and closes a continuation through the
+two actions of a `TaskHost`. It imports only `base`, the foundation's clock
+and the protocol model.
 
 ### How it is used
 
-An application makes a `Scheduler v` over tasks that carry values of type `v`
-(`newScheduler`), and calls its producer operations from any thread. Each is a
-transaction that never blocks and answers at once: `admitTask`, `grantStep`,
-`requestControl`. The owner's thread loops: `awaitWork`, which composes admissions,
-control requests, grants, the timer's wake and the owner's stop request in one STM
-wait so that an idle owner sleeps in one place and nothing polls; then
-`serviceTurn`; and on its way out, under mask, `stopScheduler`. Only the owner's thread
-calls those three, and a turn is not reentrant.
+`newScheduler` makes a `Scheduler v`. The producer operations (`admitTask`,
+`grantStep`, `requestControl`) are transactions callable from any thread that
+never block. The owner's thread loops `awaitWork` (one STM wait over
+admissions, control, grants, the timer's wake and the stop request; nothing
+polls), then `serviceTurn`, and on its way out, masked, `stopScheduler`.
+**Only the owner's thread calls those three, and a turn is not reentrant.**
 
-The waits that are for other threads, `awaitStepsComplete` and a ticket's
-`awaitControl`, are transactions an application composes with `awaitSupervised`. They
-are the application's: nothing here is reachable from Lua, and a Lua callback must not
-call them, for the reason the finite-call adapter refuses a reply wait from one. A
-task waits by yielding to its owner's scheduler, never by blocking its owner's thread.
+`awaitStepsComplete` and a ticket's `awaitControl` are transactions the
+application composes with `awaitSupervised`. A Lua callback must not call
+them: a task waits by yielding.
 
 ### Configuration
 
-`SchedulerBounds` holds the active-task, queued-admission and retained-result caps,
-the three quanta, the bound on outstanding grants, the bound on control requests and an
-optional elapsed service budget. `newScheduler` checks all of it before anything is
-made, and answers every violation at once: the caps and quanta through the protocol
-model's own `validateLimits` (a quantum below one is refused), a grant or control
-bound below one, and a budget that is not positive. A refused configuration
-creates no timer and no state. The caps the scheduler does not use are held at one,
-as the finite-call adapter holds the ones it does not use.
+`SchedulerBounds` holds the active-task, queued-admission and retained-result
+caps, the three quanta, the bounds on outstanding grants and control requests
+and an optional elapsed service budget. `newScheduler` checks all of it first
+and answers every violation at once (the model's `validateLimits`; a quantum,
+grant or control bound below one; a non-positive budget). A refused
+configuration creates no timer and no state.
 
 ### Policies
 
-Each scheduler takes a `Policy` at creation and keeps it for its life. A policy
-chooses which ready task runs next and nothing else: admission and capacity, the class
-pass and its quanta, control and stop, the timer, the settlement of results and
-ownership all stay with the runtime, under every policy, and none can be bypassed from
-a policy. `fifoPolicy` is the supplied default; the extension interface is
-`PolicyView` (the class whose opportunity it is, and every ready task with its class,
-kind, `Ordinal` and segment count, in `Ordinal` order) and `Candidate`. There is no
-other built-in policy and no live policy change.
+A `Policy`, fixed at creation, chooses which ready task runs next and nothing
+else. `fifoPolicy` is the default; the extension interface is `PolicyView`
+(the class whose opportunity it is, and every ready task with its class, kind,
+`Ordinal` and segment count) and `Candidate`.
 
-How the runtime guarantees a policy cannot starve a class, control or stop: the
-runtime offers a policy an opportunity for one class at a time, and a choice must be a
-ready task of that class. Anything else (a task that is not ready, one of another
-class, one that does not exist) is refused, counted in `diagRefusedChoices`, and
-never run: the oldest ready task of that class runs instead, so a policy that cannot
-choose cannot stall its owner. When a class has used its quantum or has nothing
-ready the pass moves to the next class whatever was chosen, and control requests and
-stop are served between segments, before the policy is asked again. What a policy
-can still do is order the tasks of one class, which includes starving a peer in it,
-and that is bounded only by the class's quantum. A policy that raises is a failure of
-the host and propagates from the turn, before anything is changed.
+A policy cannot starve a class, control or stop: it is offered one class at a
+time and must choose a ready task of that class. Any other choice is refused,
+counted in `diagRefusedChoices`, and the oldest ready task of the class runs
+instead. A policy can still order the tasks of one class, bounded by the
+class's quantum. A policy that raises is a host failure and propagates from
+the turn before anything changes.
 
 ### Service classes, quanta and turns
 
-Every task belongs to `ControlClass`, `OrdinaryClass` or `BackgroundClass`. Each class has a
-finite quantum of segments. The /pass/ visits the classes in that order; each class with a
-ready task runs at most its quantum of segments before the pass moves on, so no task, of
-any class, gets more than its class's quantum while a peer in another class is ready. A
-/turn/ (`serviceTurn`) runs the pass until it completes, the owner is idle, the budget has
-expired or the owner has been asked to stop.
+Every task is `ControlClass`, `OrdinaryClass` or `BackgroundClass`, each with
+a finite quantum of segments. The *pass* visits the classes in that order;
+each runs at most its quantum before the pass moves on. A *turn*
+(`serviceTurn`) runs the pass until it completes, the owner is idle, the
+budget has expired or a stop was asked.
 
-The position in the pass, and how much of the current class's quantum is used, belong to
-the scheduler and persist across turns. A turn that ends early, at the budget, continues
-the same pass in the next: it never restarts at the control class or replenishes a
-quantum, so where a budget cuts a pass moves where turns end and nothing else. The pass
-starts afresh when it completes and when nothing at all is ready.
+The position in the pass and the quantum used persist across turns: a turn
+cut at the budget continues the same pass and never replenishes a quantum.
+The pass starts afresh when it completes and when nothing is ready.
 
-Under `fifoPolicy` the ready tasks of a class run in `Ordinal` order. The model issues an
-`Ordinal` at admission and again whenever a task rejoins the ready set, so a yielded,
-woken or resumed task is behind everything already ready, and waiting and paused tasks
-occupy no turn.
-
-Admission records a `TaskKind`, looped or one-shot. The kind is visible to a policy and
-the diagnostics and the runtime never acts on it, so where a one-shot is placed is the
-selected policy's: the default appends it at its class's tail like any other task.
-Admission reserves the task's result storage in the model's session, as the model
-documents, and a finished task keeps its slot and reservation until `observeTask`
-takes its result.
+Under `fifoPolicy` ready tasks of a class run in `Ordinal` order. An `Ordinal`
+is issued at admission and whenever a task rejoins the ready set, so a
+yielded, woken or resumed task is behind everything already ready. Admission
+records a `TaskKind` (looped or one-shot), visible to policies; the runtime
+never acts on it. A finished task keeps its slot and result reservation until
+`observeTask` takes its result.
 
 ### Logical time
 
-The logical tick advances only when the application grants a step with a positive
-TIME-1 `Duration` (`grantStep`). A round of scheduling, an elapsed deadline and an expired
-budget never advance it.
+The logical tick advances only when the application grants a step with a
+positive `Duration` (`grantStep`).
 
-Accepted grants are applied in the order they were accepted, one tick each, none skipped
-or coalesced, and a grant is applied only when every earlier one has finished, so the
-logical timeline is strictly sequential and what runs depends on the grants and never on
-when they arrived. Applying one adds its duration to every task waiting for ticks and
-wakes the tasks whose wait it reaches, in the order their waits began, to the tail of
-their classes; the policy then serves them. A grant is finished, and its slot in the bound
-on outstanding grants (`boundOutstandingGrants`) is free again, when every task it woke has
-stopped being ready or running: by waiting again, completing, failing, being paused or being
-stopped. A grant past the bound answers `GrantFull` and changes nothing; a zero duration
-answers `GrantNotPositive`; a closed scheduler answers `GrantClosed`.
+- Accepted grants are applied in acceptance order, one tick each, none skipped
+  or coalesced, each only when every earlier one has finished.
+- Applying one adds its duration to every task waiting for ticks and wakes
+  those whose wait it reaches, in the order their waits began.
+- A grant is finished, and its slot in `boundOutstandingGrants` free, when
+  every task it woke has stopped being ready or running.
+- Answers: `GrantFull` past the bound, `GrantNotPositive` for zero,
+  `GrantClosed`; a refusal changes nothing.
 
-A task that waits for *n* ticks (`ReportWaitTicks`) wakes when the tick reaches the one it
-was at when the wait began plus *n*, and resumes with the tick it reached and the logical
-duration granted since its wait began (`ResumedLogical`). Both are fixed when the grant that
-satisfied the wait is applied, so a later grant or a delayed dispatch cannot change them. A
-wait for no ticks, or one whose end tick is not representable, is refused. A duration that
-cannot be represented fails that task with a typed failure; nothing wraps, and the rest of
-the step stands.
+A task that waits *n* ticks (`ReportWaitTicks`) wakes at its starting tick
+plus *n* and resumes with the tick reached and the duration granted since
+(`ResumedLogical`), both fixed when the satisfying grant is applied. A wait
+for no ticks, or one whose end tick is not representable, is refused; an
+unrepresentable accumulated duration fails that task. Nothing wraps.
 
-`tickQuietBefore scheduler tick` reads the boundary just before a tick: every earlier tick has begun and finished, nothing is
-ready or waiting to start, and this tick has not begun (a tick that has begun already, and tick zero, answer true). With
-`holdTick` on that tick it is where an owner runs the work that must be finished before the tick begins, which is how the module
-loader starts a root placed at a tick ([placed roots](#placed-roots-lfe-11)).
+`tickQuietBefore scheduler tick` reads the boundary just before a tick: every
+earlier tick begun and finished, nothing ready or waiting to start, this tick
+not begun. With `holdTick` it is where an owner runs work that must finish
+before the tick begins ([placed roots](#placed-roots-lfe-11)).
 
-`awaitStepsComplete` is the STM condition "every accepted grant is applied and finished".
-Composed with `awaitSupervised` it is how an application observes tick completion without
-blocking a thread of its own; `grantComplete` and `stepsOutstanding` read the same state
-without waiting. A task that is paused when its grant is applied does not hold the grant:
-it is not ready or running. That is the scheduler's progress, and all `awaitStepsComplete`
-promises: it does not say that the owner has accounted for an instance ending the work
-caused (`shutdown`, the drain of what the instance held, a retirement a provider still owes,
-its settlement, the application's escalation), which `awaitScheduledAccounting` waits for.
+`awaitStepsComplete` is "every accepted grant is applied and finished"
+(`grantComplete` and `stepsOutstanding` read the same without waiting). A
+paused task does not hold a grant. **This is the scheduler's progress only**:
+it does not say the owner has accounted for an instance ending the work
+caused, which `awaitScheduledAccounting` waits for.
 
 ### Elapsed time
 
-A task that waits for an elapsed duration (`ReportWaitElapsed`) wakes once the scheduler's
-monotonic source (`schedClock`: TIME-1's, injected in tests) reaches its deadline, the source's
-reading when the wait began plus the duration, and resumes with the time elapsed on that
-source (`ResumedElapsed`). Arithmetic uses `addDuration`, so a deadline that is not
-representable refuses the wait rather than wrapping; a wait of no time is refused. Deadlines
-are looked at once at the start of each turn, in deadline order and, for one deadline, in
-the order the waits began. How often turns start can therefore move when an elapsed wait
-wakes, and an elapsed wait is the one thing that legitimately changes readiness with real
-time.
+A task that waits an elapsed duration (`ReportWaitElapsed`) wakes once the
+scheduler's monotonic source (`schedClock`, injected in tests) reaches its
+deadline and resumes with the elapsed time (`ResumedElapsed`). A deadline that
+is not representable, or a wait of no time, is refused. Deadlines are looked
+at once at the start of each turn, in deadline order then wait order, so an
+elapsed wait is the one thing that changes readiness with real time.
 
-A refused wait fails its task with a recoverable `ValidationFault`, reports the
-`WaitRefusal` and the failure in the turn report, and counts in `diagRefusedWaits`. A task that fails while its
-continuation is suspended (a refused wait, or a logical wait whose accumulated duration cannot be represented)
-still owes that continuation a close: it is made on the owner's thread after the failure, its own failure
-is kept in the scheduler, in the step that records the close, and handed to a turn's report only after the timer has been
-brought in line; the stop reports it too until the next turn shows the report arrived (so no exception on the way out can lose it,
-and at worst it is reported twice), and an obligation that was interrupted is made by the scheduler's stop. A task that
-fails in its own segment owes none, since its continuation is dead.
+A refused wait fails its task with a recoverable `ValidationFault`, reports
+the `WaitRefusal` in the turn report and counts in `diagRefusedWaits`. A task
+that fails while its continuation is suspended still owes it a close: made on
+the owner's thread after the failure, its own failure kept in the scheduler
+and reported by a turn (and by the stop until a turn shows it arrived; at
+worst twice). An interrupted obligation is made by the scheduler's stop.
 
 ### The timer
 
-One owned registration (`Hetoimasia.Scripting.Lua.Scheduler.Timer`) is armed for the
-earliest elapsed deadline and re-armed as it changes. It is cancelled when nothing waits and
-at stop, and it is never more than one at a time. Its wake is a flag `awaitWork` composes
-with the owner's other conditions: there is no polling, no per-task timer and no thread of its
-own. Production uses the threaded runtime's timer manager (`systemTimerBackend`), which
-needs the threaded runtime, as running Lua does anyway; tests supply a `TimerBackend` and
-fire its wakes by hand.
+One owned registration (`Hetoimasia.Scripting.Lua.Scheduler.Timer`) is armed
+for the earliest elapsed deadline, re-armed as it changes, and cancelled when
+nothing waits and at stop. Its wake is a flag `awaitWork` composes. Production
+uses the threaded runtime's timer manager (`systemTimerBackend`); tests
+supply a `TimerBackend`.
 
-A wake is a prompt to look at the clock, never evidence that a deadline passed. An early wake
-finds nothing due and the timer is armed again. A wake of a registration that was replaced
-or cancelled is stale and ignored, as is any wake after stop. Arming, cancelling and disposing happen under an uninterruptible mask, so the registration the backend
-made and the way to cancel it are never separated by an asynchronous exception, even at a blocking operation
-inside the backend, which is therefore called uninterruptibly and must not block for long. Registrations are whole
-microseconds, rounded up, at least one and at most one hour (`maxRegistration`), so a
-distant deadline is reached by a chain of wakes each followed by a look at the clock. None of
-this defines a clock. An owner that exits without `stopScheduler` leaves the registration
-armed until it fires, which is why the exit path calls it.
+**A wake is a prompt to look at the clock, never evidence a deadline passed.**
+An early wake re-arms; a stale wake (replaced, cancelled, after stop) is
+ignored. Arming, cancelling and disposing run under an uninterruptible mask,
+so the backend must not block for long. Registrations are whole microseconds,
+rounded up, from one to one hour (`maxRegistration`); a distant deadline is a
+chain of wakes. An owner that exits without `stopScheduler` leaves the
+registration armed.
 
 ### Budgets and overruns
 
-A scheduler may be configured with an elapsed service budget per turn
-(`boundServiceBudget`). When the clock shows it expired as a segment returns, no further
-segment starts in that turn, control and stop are served at that boundary, and the pass
-continues in the next turn. A turn that is cut at the budget (or a stop request) when nothing is ready starts the pass afresh, as choosing the next segment would, so a cutoff can never change what runs next. The clock is read again after the work at each boundary, which can close
-continuations and so use up the budget. A turn always starts at least one segment, so a small budget cannot
-stop progress, and a budget so large that its deadline is not representable never
-expires. The budget never interrupts a running segment, never changes which task runs next
-or the order tasks run in, and installs no instruction hook: it is a service target, not a
-limit, and a segment that never returns is not stopped. A segment that ends strictly after
-the turn's deadline is an overrun, attributed to its owner, its task kind and its entry
-point; a segment that ends exactly at it is not. At most `maxOverrunSites` sites are
-attributed, and an overrun of a site that finds the table full is counted in
-`diagOverrunsUnattributed`.
+An optional elapsed service budget per turn (`boundServiceBudget`): when the
+clock shows it expired as a segment returns, no further segment starts in that
+turn, control and stop are served, and the pass continues next turn. A turn
+always starts at least one segment. **The budget is a service target, not a
+limit**: it never interrupts a segment, never changes what runs next, and
+installs no instruction hook. A segment that ends strictly after the turn's
+deadline is an overrun, attributed to its owner, task kind and entry point,
+for at most `maxOverrunSites` sites (`diagOverrunsUnattributed` beyond).
 
 ### Control
 
-A caller holding a task's identity requests that it pause, resume or stop
-(`requestControl`). A request never blocks, is usable from any thread including a
-binding's action, and answers `ControlAccepted`, `ControlFull`, `ControlClosed` or
-`ControlUnknownTarget` (a foreign, stale, ended or never-issued identity, or an admission
-still in the queue), in that order of precedence, and a refusal changes nothing but a
-counter. Accepting takes a reservation for the result, bounded by `boundControlRequests`,
-and holds it until the settlement is observed or abandoned through the request's
-`ControlTicket`, once, whichever comes first. Every accepted request settles exactly once,
-as `ControlApplied`, `ControlAlreadyInState` or `ControlNoLongerApplicable`, including one
-overtaken by the task's end and one outstanding when the scheduler stops.
+`requestControl` asks that a task pause, resume or stop. It never blocks, is
+usable from any thread (a binding's action included) and answers, in order of
+precedence, `ControlAccepted`, `ControlFull`, `ControlClosed` or
+`ControlUnknownTarget` (foreign, stale, ended, never issued, or still
+queued). Accepting reserves a result under `boundControlRequests`, held until
+the settlement is observed or abandoned through the `ControlTicket`. Every
+accepted request settles exactly once: `ControlApplied`,
+`ControlAlreadyInState` or `ControlNoLongerApplicable`.
 
-Requests are applied between segments, in the order accepted, except that stops come first:
-a stop takes precedence over any pause or resume accepted beside it, so a stop is never undone
-by a resume, and a task that has ended is never resurrected. A request about the running task
-is applied when its segment returns or yields; one about a task that completed in it is no
-longer applicable.
+Requests are applied between segments in acceptance order, **stops first**, so
+a stop is never undone by a resume and an ended task is never resurrected.
 
-Pause freezes a task: it runs no segment and occupies no turn. The model pauses only a
-ready task, so a task paused while it waits stays waiting, with its continuation, its wait
-and any wake it earns kept: if the wait is satisfied while it is paused it runs nothing,
-and resuming it then puts it at the tail of its class with a fresh `Ordinal` and the wake
-it earned; resuming it before the wait is satisfied returns it to waiting. A paused task
-reports `PhasePaused` either way. Stop closes the task's continuation on the owner's thread,
-once, through `hostClose`, and then cancels it. The close and its record are made under a
-mask, so a cancellation that arrives after a close has returned waits until the task is
-cancelled and the request settled, and a completed close is never repeated; a close that
-was interrupted inside the host is retried by the scheduler's stop. A synchronous failure of the close is retained
-in the settlement (`CloseFailed`) and in the turn report and is never reported as a clean
-close; the task is cancelled all the same. A second stop of a task that has ended is not
-applicable and closes nothing again.
+| Request | Effect |
+|---|---|
+| pause | The task runs no segment and occupies no turn (`PhasePaused`). A task paused while waiting keeps its continuation, its wait and any wake it earns |
+| resume | A task whose wait was satisfied while paused joins the tail of its class with the wake it earned; otherwise it returns to waiting |
+| stop | Closes the continuation on the owner's thread, once, through `hostClose`, then cancels the task. The close and its record are masked; an interrupted close is retried by the scheduler's stop. A close failure is kept in the settlement (`CloseFailed`) and the turn report |
 
 ### Stopping, determinism and diagnostics
 
-`stopScheduler` is the whole scheduler's stop, distinct from stopping a task. It closes
-admission, grants and control, closes every live continuation that is not inside a segment
-once, in identity order, records each task's disposition and what it discarded in the model's
-`ExitRecord`, settles every request not yet applied as no longer applicable, discards
-unfinished grants (so no one is left waiting for them) and cancels the timer, which stays
-disposed. A second call answers the first's report. A segment's report is applied, so its task is no longer running, before the clock is read or anything else that can
-fail or be interrupted; if reading the clock fails for an elapsed wait the wait is applied as a yield, which leaves
-the task ready and closable. A segment that was running when its host
-failed is recorded as outstanding and its continuation is not closed. The stop runs
-masked and attempts every close: one that is interrupted at its own interruptible
-point keeps the interruption as its failure, the others still run, the stop completes,
-and the first interruption is raised again afterwards.
+`stopScheduler` closes admission, grants and control; closes every live
+continuation not inside a segment, once, in identity order; records each
+task's disposition in the model's `ExitRecord`; settles every unapplied
+request as no longer applicable; discards unfinished grants; and cancels the
+timer. A second call answers the first's report. A segment running when its
+host failed is recorded as outstanding and not closed. The stop runs masked
+and attempts every close; the first interruption is raised again afterwards.
 
-Given the same configuration, policy, admitted tasks, segment outcomes and grants, the same
-tasks run in the same order whatever the budget and wherever a turn is cut. Elapsed waits are
-the exception, since a deadline reached changes readiness; the order among tasks already
-ready is unaffected. Arbitrary elapsed-time workloads are not promised the same trace from
-one run to the next. The proof on real VMs is the scheduled owner's, below.
+Given the same configuration, policy, admitted tasks, segment outcomes and
+grants, the same tasks run in the same order whatever the budget and wherever
+a turn is cut. Elapsed waits are the exception.
 
-`readDiagnostics` is a snapshot of bounded counters and gauges that borrows nothing from a Lua
-state: admitted and rejected work, queue and active high-water marks, completed, yielded,
-waiting, failed, cancelled and discarded counts, segments by class, overruns by site, refused
-policy choices and refused waits, control and grant counts, and the logical tick. There is no
-per-task history and no per-segment record.
-
-### What proves it
-
-The examples are part of `lua-runtime-tests` (`Test.LuaRuntime.Scheduler.*`), in
-`runtime-lua-test/`. They drive a rig of scripted segments under an injected clock and a
-fake timer whose wakes the example fires, so none sleeps and none needs a VM; the one
-exception that touches a VM checks that a lifecycle-operation binding still answers
-not-yet-supported through the finite-call adapter, which has no grant. One example arms the production timer and blocks in STM until its wake
-arrives. Cancellation and shutdown windows are the kind an asynchronous-exception race can
-hide on one platform, so CI, which runs them on Linux, is the evidence for them and a local
-pass is not.
+`readDiagnostics` is a snapshot of bounded counters and gauges: admitted and
+rejected work, queue and active high-water marks, outcome counts, segments by
+class, overruns by site, refused choices and waits, control and grant counts,
+the logical tick. No per-task history.
 
 ## The scheduled owner
 
-`Hetoimasia.Scripting.Lua.Scheduled` (LUA-6, in `runtime-lua`) hosts the host's task
-coroutines (LUA-20) and the scheduling machinery (LUA-21) on a supervised worker with a
-real VM. It adds no scheduling of its own: which task runs next, what a tick or a
-deadline is, how a budget ends a turn and how pause, resume and stop apply are the
-scheduler's, documented above. The finite-call owners of the runtime adapter are
-unchanged and stay the way to run a call; an application opts into a scheduled owner,
-which admits all executable work as tasks (finite work is a task that completes in one
-segment). A finite-call owner and a scheduled owner never run the same VM, and any
-number of each can be created and retired while the others run.
+`Hetoimasia.Scripting.Lua.Scheduled` (in `runtime-lua`) hosts task coroutines
+and the scheduling machinery on a supervised worker with a real VM. It adds no
+scheduling of its own. All executable work is admitted as tasks. A finite-call
+owner and a scheduled owner never run the same VM.
 
 ### Creation and readiness
 
-`startScheduledOwner` validates the scheduler's configuration (caps and quanta through the
-model's `validateLimits`, the grant and control bounds, the budget) before anything starts,
-raising `SchedulerRefused` naming every violation, then starts exactly one worker through
-`startSupervised`. The VM is constructed, its bindings installed, its initial chunks run
-and its modules loaded inside `withVmOwner` on the worker's thread; only then is
-readiness published and an endpoint returned. Readiness is awaited through
-`awaitSupervised` composed with the worker's outcome, never the startup acknowledgement,
-and acquisition is masked exactly as for a finite-call owner. A failure of initialization
-ends creation under the owner's `WorkerPolicy`. Unlike a finite-call owner's, a scheduled owner's creation
-leaves nothing behind when its wait fails or is abandoned (another worker's fatal outcome, a cancellation): it asks
-the owner to stop and waits for the worker it started to have ended (its raw completion, which supervision's latch
-does not shorten), recording each interruption of that wait and going on until the worker has ended, and only then raises
-what happened in order, a cancellation as itself and the rest as evidence beside it. A script held in a module's top
-level keeps creation pending, as a held segment keeps the worker (D-27); the wait is interruptible and never runs under an
-uninterruptible mask. This is what lets an application release what the owner's bindings borrow as soon as creation
-has returned or raised.
+`startScheduledOwner` validates the scheduler configuration first
+(`SchedulerRefused` naming every violation), then starts one worker; the VM is
+built inside `withVmOwner` on the worker's thread; readiness is awaited
+through `awaitSupervised`, masked as for a finite-call owner. An
+initialization failure ends creation under the `WorkerPolicy`.
 
-**Telling the application of an abandoned start (D-84).** The creator waits for the worker it started, and a worker held
-in its initialization can make that long. An application that owns other owners which the failure must stop first
-(the Lua-first session coordinator is one) is told earlier, through `scheduledOnStartAbandoned` of the specification
-(default: nothing): once, on the creator's thread, when a start that has not handed out an owner is abandoned (its
-readiness wait failed or was cancelled), after the worker was asked to stop and **before** the creator waits for it to have
-ended. It runs masked, so it must be finite and must not wait. What it raises is a failure of the host, kept as evidence beside
-the failure of the start (and beside a real cancellation of the creator): it never takes the place of the readiness failure, whatever
-its type (an exception of an asynchronous type the callback itself threw was not delivered to the creator and is evidence, not a
-cancellation), and it does not skip the creator's wait for its worker, so a creator never gets an exception back while the worker
-it started still runs Lua. What the worker itself ended with (its initialization or its VM's cleanup failing once it was let
-go on) is kept beside the failure of the start in the same way: the creator's wait keeps the worker's terminal completion, and
-a failure or a cancellation in it is evidence, never the exception that is raised. It
-is not told when creation returns an owner, when an initialization that fails ends creation under the owner's policy
-(`ScheduledUnavailable`, `ScheduledEnded`), or when the configuration is refused before a worker starts. The creator
-that does not set it behaves exactly as before.
+**Creation leaves nothing behind when its wait fails or is abandoned**: it
+asks the owner to stop and waits (interruptibly, never under an
+uninterruptible mask) for the worker to have ended, then raises what happened
+in order, a cancellation as itself and the rest as evidence. A script held in
+a module's top level keeps creation pending. So an application may release
+what the owner's bindings borrow as soon as creation has returned or raised.
+
+`scheduledOnStartAbandoned` (default: nothing) tells the application earlier:
+once, on the creator's thread, when a start that has not handed out an owner
+is abandoned, after the worker was asked to stop and **before** the creator
+waits for it. **It runs masked: it must be finite and must not wait.** What it
+raises is kept as evidence beside the failure of the start and never replaces
+it. It is not called when creation returns an owner, when initialization
+fails under the policy (`ScheduledUnavailable`, `ScheduledEnded`), or when
+the configuration is refused.
 
 ### Identity
 
-An owner has the `OwnerId` its `LuaRuntime` issues, from the one counter finite-call
-owners use. A task is named by a `ScheduledTaskId`: the owner's identity and the model's
-`TaskId` the owner issues from a counter that never rewinds. It is unique within the
-runtime and never reissued, after the task settles and is observed and after its owner
-retires. It is never an OS thread, a `ThreadId` or a coroutine, and neither it nor the
-application's optional name for the task grants authority. The model's `TaskId` is scoped
-by a `SessionKey` made from the owner's label, the configured domain and the owner's
-sequence number, so the model's two domains limit neither owners nor tasks, and
-`Test.Lua.Protocol` is untouched.
+An owner has the `OwnerId` its `LuaRuntime` issues. A task is a
+`ScheduledTaskId`: the owner's identity and a model `TaskId` from a counter
+that never rewinds; unique within the runtime, never reissued, never a thread
+or coroutine, and granting no authority.
 
 ### Admission, settlement and tickets
 
-`admitScheduledTask` admits a task (module entry, bounded arguments, class, kind, optional
-name). It never blocks and answers `TaskAccepted` with the identity and a ticket,
-`TaskQueueFull` or `TaskAdmissionClosed`. Arguments are evaluated, checked against the
-owner's value limits and copied on the producer's thread; arguments over the limits are
-accepted and settle as the refusal the argument check raises. Every accepted task settles
-exactly once, as `SettledReturned`, `SettledFaulted` (a script fault returned as data,
-never a worker failure), `SettledRefused` (the scheduler refused a wait: a recoverable
-failure of that task), `SettledCancelled` (a stop request) or `SettledDiscarded` (the owner
-exited first, with the exit kind and whether the task had begun).
+`admitScheduledTask` (module entry, bounded arguments, class, kind, optional
+name) never blocks and answers `TaskAccepted` with identity and ticket,
+`TaskQueueFull` or `TaskAdmissionClosed`. Arguments are evaluated, checked and
+copied on the producer's thread; over-limit ones settle as the refusal. Every
+accepted task settles exactly once:
 
-Reading a ticket is observing it, as for a finite call's: the first read that finds the
-task finished takes its result and gives its reservation back, and every later read, on
-any thread, answers the same settlement. `forgetTask` gives a finished task's reservation
-back at once and an unfinished one's when the owner next sweeps after it finishes. The
-engine keeps no other history of terminal results: the retained cells are bounded by the
-reservations.
+| Settlement | Meaning |
+|---|---|
+| `SettledReturned` | the entry point's results |
+| `SettledFaulted` | a script fault, as data; never a worker failure |
+| `SettledRefused` | the scheduler refused a wait: a recoverable failure of that task |
+| `SettledCancelled` | a stop request |
+| `SettledDiscarded` | the owner exited first; the exit kind and whether the task had begun |
 
-A wait is refused from inside a Lua callback, scheduled-owner creation, `waitTask`,
-`awaitTask`, `waitControl`, `awaitControl`, `awaitTicksComplete` and
-`awaitScheduledAccounting` included, with `CallbackWaitRefused`, and so is an action built
-outside the callback; a task waits by yielding. `awaitTicksComplete` ends with
-`TickOwnerEnded`, never a false completion, when the owner exits with a tick outstanding. It
-returns when every accepted grant has been applied and every task it woke has stopped being
-ready or running, which is the scheduler's progress and not the owner's accounting of what
-that work caused.
+The first read of a ticket that finds the task finished takes its result and
+returns the reservation; later reads answer the same. `forgetTask` returns the
+reservation at once or at the owner's next sweep after the task finishes.
+
+A wait from inside a Lua callback is `CallbackWaitRefused`: creation,
+`waitTask`, `awaitTask`, `waitControl`, `awaitControl`, `awaitTicksComplete`
+and `awaitScheduledAccounting`. `awaitTicksComplete` ends with
+`TickOwnerEnded`, never a false completion, when the owner exits with a tick
+outstanding.
 
 ### Time, control and what a script is told
 
-A script waits through a wait operation the application registered with `waitOperation`:
-its first argument, an integer, is the number of ticks of a `WaitLogical` wait or the
-nanoseconds of a `WaitElapsed` one; anything else is read as none and refused by the
-scheduler as a wait for nothing, so the operation's schema should require one integer. A `WaitElapsed` wait for a count a Lua
-integer cannot hold (past 2^63 - 1 nanoseconds, through the 2^64 - 1 a `Duration` holds) takes **two** integers instead, the high
-and the low 32 bits of the count, each from 0 to 2^32 - 1 (`waitOperation "wait_wide" WaitElapsed [SInteger, SInteger]`); the
-single-integer form is unchanged, and anything else, a half out of range included, is read as none and refused. A deadline the
-clock cannot count is refused as a wait that cannot be represented; nothing wraps.
-`grantScheduledStep` and `requestTaskControl` are the scheduler's `grantStep` and
-`requestControl` for this owner. `grantScheduledStepSTM` (D-85) is the same grant as a transaction, and
-`grantScheduledStep` is `atomically` of it: an application that decides whether to grant from state of its own (the Lua-first
-session coordinator closes its logical role's ticks and grants in one transaction) reads that state and grants in one atomic
-step, so a closure it committed before is seen by the grant and a grant it accepted was accepted before a closure committed
-after. It never retries or blocks, and what it answers is what `grantScheduledStep` answers; existing callers are unchanged. A resumed coroutine receives no value, so what the wait
-that ended earned (the tick reached and the granted duration, or the elapsed time) is told
-to the application on the owner's thread, before the segment that follows
-(`scheduledObserve`); a binding that should answer a script's question about its tick keeps
-what it was told where it reads it.
+A script waits through an operation registered with `waitOperation`. Its
+first argument, an integer, is the ticks of a `WaitLogical` wait or the
+nanoseconds of a `WaitElapsed` one; anything else is refused as a wait for
+nothing. A `WaitElapsed` wait past 2^63 − 1 nanoseconds takes **two**
+integers, the high and low 32 bits (`waitOperation "wait_wide" WaitElapsed
+[SInteger, SInteger]`).
 
-`scheduledRefusedWait` is told, on the owner's thread, of each wait the scheduler refused (a `WaitRefusal`), **at the moment the
-scheduler applies the report that asked for it and before anything else runs**: it is the owner's answer to the scheduler's
-`hostRefused` (a required field of `TaskHost`, called from the scheduler's `runSegment` the moment the report is applied). The
-order of a turn is: the segment runs; its report is applied (a refused wait is created here, and nowhere else); **the host is told**;
-the budget's overrun is accounted; the continuation the report left is closed (the script's own `__close` handlers run); then the next
-boundary (instances, providers, the loader and, last, the acknowledgement of an accounting wait), and only then another segment is
-chosen. Nothing is kept for a later look: the notice is a call, not a queue, so a host that ignores it (every standalone `serviceTurn`
-caller does, by saying so in its `TaskHost`) retains nothing. The task still failed and its instance still ends exactly as before, and
-the default does nothing. It is for an application whose own bindings check a wait before they suspend and so treat a refusal as the
-engine's fact (a clock that moved between the check and the placement): what it raises is a failure of the host and leaves the turn
-there, with the close the refusal left still owed (the scheduler's stop makes it), so a script's handler cannot keep the failure from
-being reported, no peer is dispatched and no accounting is acknowledged after it.
+`grantScheduledStep` and `requestTaskControl` are the scheduler's operations
+for this owner. `grantScheduledStepSTM` is the same grant as a transaction, so
+an application can read its own state and grant in one atomic step. What a
+finished wait earned (tick and granted duration, or elapsed time) is told to
+the application on the owner's thread before the next segment
+(`scheduledObserve`).
+
+`scheduledRefusedWait` is told, on the owner's thread, of each refused wait
+at the moment the scheduler applies the report (the owner's answer to
+`TaskHost`'s required `hostRefused`). The order of a turn:
+
+1. the segment runs;
+2. its report is applied (a refused wait is created here only);
+3. the host is told;
+4. the budget's overrun is accounted;
+5. the continuation the report left is closed (the script's `__close`
+   handlers run);
+6. the next boundary: instances, providers, the loader and, last, the
+   acknowledgement of an accounting wait;
+7. another segment is chosen.
+
+What `scheduledRefusedWait` raises is a host failure and leaves the turn
+there, with the close still owed to the scheduler's stop.
 
 ### Waiting for the owner's accounting
 
-`awaitScheduledAccounting` (LUA-31, D-47) is the supervised wait for the owner's accounting
-of the grants it has accepted: it returns `AccountingComplete` once the owner has finished
-those grants, has ended the boundary at which the last of them was found finished, and every
-instance ending begun by the end of that boundary has run its `shutdown` (or had it skipped),
-released and drained what it held, completed every retirement a provider owes it, settled and,
-for a failure, had `instanceEscalate` called **and returned**. An application decides a tick's
-commit, or a stop's outcome, on it: `awaitTicksComplete` can return while any of those still
-lies ahead on the owner's thread.
+`awaitScheduledAccounting` returns `AccountingComplete` once the owner has
+finished the grants it had accepted, ended the boundary at which the last was
+found finished, and every instance ending begun by the end of that boundary
+has run its `shutdown` (or had it skipped), released and drained what it held,
+completed every retirement a provider owes it, settled and, for a failure, had
+`instanceEscalate` called **and returned**. An application decides a tick's
+commit or a stop's outcome on it; `awaitTicksComplete` can return earlier.
 
-Its three parts are exported as transactions (D-86) for an application that must observe the accounting
-beside other things in the one supervised wait it makes, and so cannot block in this one while a
-retirement a provider owes holds it: `watchScheduledAccounting` takes the snapshot, once;
-`scheduledAccountingStep` is the wait itself, a transaction that retries until the accounting is
-complete or the owner has ended and otherwise answers `AccountingComplete` or `AccountingOwnerEnded`;
-`unwatchScheduledAccounting` clears the watch, harmlessly when repeated and however the wait ended.
-`awaitScheduledAccounting` is these three in that order (watch, then `awaitSupervised` over the step,
-then the clear in the cleanup of the same masked region) and behaves as before; callers of it are
-unchanged. The application keeps the single-pending rule of supervised waits: it composes the step
-into its own transaction under its one `awaitSupervised`, and does not call it from a Lua callback
-or from the owner's own thread.
+Its parts are transactions for an application that must compose them into its
+own single supervised wait: `watchScheduledAccounting` (the snapshot, once),
+`scheduledAccountingStep` (retries until `AccountingComplete` or
+`AccountingOwnerEnded`), `unwatchScheduledAccounting` (idempotent).
 
-- *Who may call it.* It is a supervised wait like every other, composed with
-  `awaitSupervised` and called on the application thread that owns the `RuntimeControl`
-  (`docs/supervision.md`: the control is owned by the application thread, the drain status
-  its one read-only exception), so one wait is pending at a time. Pending worker outcomes are
-  handled first, and a latched fatal failure is rethrown by the wait and wins over a ready
-  completion. It is refused from a Lua callback. It must not be called from the owner's own
-  thread, an escalation callback say, where it would wait for its own return.
-- *What it captures.* One committed snapshot of the owner's grant accounting, taken once
-  when the wait begins and kept across the retries of the wait and across supervision's
-  handling of outcomes, never taken again: every grant whose `grantScheduledStep` had
-  committed before it, and concurrent grant calls are ordered by it. It does not wait for a
-  grant accepted after the snapshot to be applied or finished, nor for a boundary after the
-  captured grants' final one.
-- *Where its ending cutoff lies.* At the end of that final boundary, not at the snapshot:
-  every ending begun by then is covered whatever began it (a failed hook, a refused wait, a
-  faulted invocation, a delivery failure, a stop, a one-shot completing, an instance stopping
-  itself, and a grant accepted after the snapshot that was applied in that same boundary,
-  which can fail a task by overflowing a logical wait's accumulated duration), and nothing
-  begun in a later boundary is. With no grant outstanding, or none ever accepted, it covers
-  the endings already begun, and it works for an owner that hosts no instances. It does not
-  wait for healthy instances' future ticks, for idle peers, or for an ordinary task's fault,
-  which stays a ticket result the application consumes.
-- *What can delay it.* The owner has one thread and nothing is preempted, so later work can
-  still delay an earlier wait: a later grant entering a blocking callback while an earlier
-  ending is parked awaiting retirement holds the thread the ending needs to settle. A
-  retirement a provider owes holds the wait for as long as it holds the instance's stop
-  completion; there is no timeout. Returning is evidence about the owner's accounting. It is not
-  permission to advance or to commit a tick that failed.
-- *Who decides it is complete.* The owner, never the wait. At the end of a boundary that finds
-  nothing more to do (the last step of its settling, after the instance layer's accounting, the
-  providers' and leases' retirements and the disposals they owed were swept and handed over), the
-  owner's thread, if it holds no failure that will end it (what the scheduler kept, what the owner
-  kept) and is not stopping, writes an acknowledgement. The wait completes on an acknowledgement
-  written after its cut was fixed (so a wait begun in the middle of a batch, the disposals a
-  retirement owes or the providers being told, waits for the end of that batch), when the grants it
-  captured have finished and no ending it covers was open when the acknowledgement was written.
-  A boundary cut short by a failure kept or raised, an exception included, writes none, so a
-  failure caught and not yet kept can never be acknowledged over. An idle owner is woken to write
-  one, and is woken again when an acknowledgement was written with a covered ending still open and
-  that ending has been accounted for since (its retirement completed after the boundary, and the
-  owner settled it after its turn): that acknowledgement can no longer answer the wait, and it
-  does not wait for unrelated work to cause another boundary. An owner whose covered ending is
-  still open is not woken, so one waiting for a retirement does not spin.
-- *What it costs the owner.* No task, control or result slot, no ticket and no per-wait state:
-  the owner keeps a watch and a count of the endings it has begun and not yet accounted for,
-  bounded by the instances' own bound, whatever number of waits were made, and the wait works
-  with every one of the scheduler's bounds exhausted. Cancelling a pending wait, while it is
-  parked or while supervision handles an outcome, abandons only that wait. A wait changes
-  nothing the owner does.
-- *When its owner ends.* An owner that exits, is stopped, cancelled or fails ends the wait
-  with `AccountingOwnerEnded` once it has ended and supervision has handled the outcome
-  without latching a fatal failure, and never with `AccountingComplete` unless the accounting
-  was complete before the owner began to exit. An owner that is exiting but has not ended (a
-  stop waiting for a provider's retirement) neither completes the wait nor ends it, and an owner
-  that holds cleanup evidence that will end it as a failure (the failure of closing a coroutine, of
-  a release, of a settlement) writes no acknowledgement, even with every ending accounted for: the
-  wait is for the exit, and for the failure supervision then handles. An
-  `Escalate` answer, an escalation callback that raises and a failed retirement end the owner
-  as a failure, and the wait follows the severity supervision gives that outcome: rethrown if
-  it is fatal, `AccountingOwnerEnded` if it is tolerated.
+- **Who may call it.** The application thread that owns the `RuntimeControl`,
+  one wait pending at a time (see `docs/supervision.md`). A latched fatal
+  failure is rethrown and wins over a ready completion. Refused from a Lua
+  callback. **Never from the owner's own thread** (an escalation callback).
+- **What it captures.** One snapshot of the grants whose `grantScheduledStep`
+  had committed when the wait began, kept across retries. Not a grant accepted
+  later, nor a boundary after the captured grants' final one.
+- **Its cutoff** is the end of that final boundary: every ending begun by
+  then is covered whatever began it; nothing begun later is. It does not wait
+  for healthy instances' future ticks, idle peers, or an ordinary task's
+  fault.
+- **What can delay it.** The owner has one thread and nothing is preempted. A
+  retirement a provider owes holds the wait for as long as it holds the
+  instance's stop completion; **there is no timeout**. Returning is evidence
+  about the accounting, not permission to commit a tick that failed.
+- **Who decides.** The owner writes an acknowledgement at the end of a
+  boundary that finds nothing more to do, if it holds no failure that will end
+  it and is not stopping. A boundary cut short by a failure writes none. An
+  idle owner is woken to write one; an owner whose covered ending is still
+  open is not, so it does not spin.
+- **Cost.** No task, control or result slot and no per-wait state; it works
+  with every scheduler bound exhausted. Cancelling a wait abandons only that
+  wait.
+- **When the owner ends.** `AccountingOwnerEnded` once it has ended and
+  supervision handled the outcome without latching a fatal failure. An owner
+  that is exiting but has not ended neither completes nor ends the wait. An
+  `Escalate` answer, a raising escalation callback and a failed retirement end
+  the owner as a failure, and the wait follows supervision's severity.
 
 ### Idle
 
-An owner whose tasks are all paused, or waiting for an ungranted tick or a future
-deadline, enters no Lua and does no periodic work: it blocks in the scheduler's one STM
-wait until a stop request, an admission, a control request, a grant or its timer's wake. A
-stop request wakes it whatever its tasks wait for.
+An owner whose tasks are all paused or waiting for an ungranted tick or a
+future deadline enters no Lua and does no periodic work: it blocks in the
+scheduler's one STM wait. A stop request always wakes it.
 
 ### Lending a collection
 
-An owner the application gave a `Lending` handle holds a resource collection owned by a
-capability instead of a thread (`Hetoimasia.Foundation.Resource.OwnedCollection`, LUA-25), on
-its own thread around the VM's lifetime, and lends it to each synchronous callback of its VM
-for exactly the callback's duration. The thread-owned collection cannot be used from a binding:
-a callback runs on a thread of its own while the owner's thread is blocked inside Lua, and it
-accepts calls from the thread that created it only. `Hetoimasia.Scripting.Lua.Lending` is how
-a binding's action uses what its callback was lent:
+An owner given a `Lending` handle holds a capability-owned resource
+collection (`Hetoimasia.Foundation.Resource.OwnedCollection`) on its own
+thread around the VM's lifetime and lends it to each synchronous callback for
+exactly the callback's duration. (A thread-owned collection cannot serve a
+binding: a callback runs on its own thread.) `Hetoimasia.Scripting.Lua.Lending`
+is the binding's side: `lentToCallback`, `acquireLent`, `acquireLentThen`,
+`withLentMember`, `retireLent`, `liveLentCount`.
 
-```haskell
-newLending      ∷ IO Lending
-lentToCallback  ∷ Lending → IO LentCollection
-acquireLent     ∷ LentCollection → Assembly a → IO (Member a)
-acquireLentThen ∷ LentCollection → Assembly a → (Member a → IO b) → IO b
-withLentMember  ∷ LentCollection → Member a → (a → IO r) → IO r
-retireLent      ∷ LentCollection → Member a → IO Retirement
-liveLentCount   ∷ LentCollection → IO Int
-```
+**The handle is the only route.** The application makes it with `newLending`,
+closes the bindings that use the collection over it, and gives it to one owner
+(`scheduledLending`); a second owner is refused with `LendingInUse`. Bindings
+that use the collection are therefore built per owner. Members belong to the
+owner: one acquired in a callback may be borrowed and retired in a later one,
+and what is live at retirement is released then. The foundation collection's
+guarantees all hold, with the live-member bound `scheduledMemberLimit`
+(default 256; below one is `OwnedInvalidMemberLimit`).
 
-**The handle is the only route.** The application makes a `Lending` with `newLending`, closes
-the bindings that use the collection over it, and gives it to the owner it creates
-(`scheduledLending`). A handle serves one owner; giving it to a second is refused with
-`LendingInUse` before anything starts. There is no registry of owners and no lookup by thread:
-a binding can reach only the owner whose handle it was built over, and an owner with no handle
-holds no collection and runs as it always did. Because a registration is built before an owner
-exists and may be shared, bindings that use the collection are built per owner, over that
-owner's handle.
-
-The action asks `lentToCallback handle` when it runs and finds the collection of the owner whose
-VM is running its callback. The loan is never a Lua value, so a script cannot hold or pass it.
-The members it acquires belong to the owner: a member acquired in one callback is borrowed and
-retired in a later one, and what is still live when the owner retires is released then. The
-operations are those of the foundation collection with every one of its guarantees, so the
-live-member bound (`scheduledMemberLimit`, 256 unless the spec says otherwise, and never below
-one: a lower limit is refused with `OwnedInvalidMemberLimit` before anything starts), staged
-acquisition with masked registration and the handoff, retirement exactly once, poisoning and the
-exit's failure table all hold, and a rejection is raised with its own type.
-
-A loan is valid for the callback it was lent to, on that callback's thread. It is refused before
-the operation has any effect, and a refusal does not invalidate the loan:
+A loan is refused before any effect, and a refusal does not invalidate it:
 
 | Presented | Outcome |
 |---|---|
 | After the callback returned, including in a later callback of the same VM | `LoanEnded` |
-| From a thread the callback started, from another VM's callback, or from any other thread | `LoanElsewhere` |
-| Asking the handle while the owner's VM is running no callback | `NoLoan` |
+| From a thread the callback started, another VM's callback, or any other thread | `LoanElsewhere` |
+| Asking the handle while the owner's VM runs no callback | `NoLoan` |
 
-Whether a thread is the VM's callback is decided by the record the VM keeps of its callbacks, the
-one that refuses an operation re-entered from a callback, not by anything the callback or the
-thread says: the owner lends through the VM's callback scope, which runs inside that record, and
-the check is made when the loan is presented, not when it is asked for. A thread that holds the
-handle can therefore ask and is given a loan it cannot use. The capability behind a loan is itself
-lent for the callback and revoked with it, so a loan that did reach the foundation's operations
-later would meet `CapabilityStale` there.
+The check uses the VM's own record of its callback threads, when the loan is
+presented. The capability behind a loan is revoked with the callback
+(`CapabilityStale`).
 
-The collection is allocated before the VM is constructed and closed after the VM has closed, as
-part of the owner's retirement. Callbacks run by a coroutine's closing handlers and by
-finalizer-eligible bindings while the VM closes still find it open. Retirement releases what
-remains, newest first, on the owner's thread, and a release that fails is cleanup evidence on the
-owner's outcome beside the VM's, fatal under every policy, as for any other cleanup failure of the
-owner. The same retirement runs when the owner fails or is cancelled, and when initialization
-fails after a callback acquired a member.
+The collection is allocated before the VM is constructed and closed after the
+VM has closed, so closing handlers and finalizer-eligible bindings still find
+it open. Retirement releases what remains, newest first, on the owner's
+thread; **a failing release is cleanup evidence, fatal under every policy**.
 
 ### Host failures, stop and exit
 
-A Haskell failure raised by a binding's action, the application's liveness check or
-observer, or anything else escaping the owner, ends the worker as for a finite-call owner:
-the primary outcome with its own type and context, unconverted, judged by the owner's
-`WorkerPolicy`, whatever its type. A script fault only fails its task.
+A Haskell failure from a binding's action, a liveness check, the observer or
+anything else escaping the owner ends the worker, unconverted, judged by the
+`WorkerPolicy`. A script fault only fails its task.
 
-Stopping the owner (`retireScheduled`, `stopSupervised`, the boundary closing) closes
-admission, grants and control at once, lets a running segment return (nothing is
-preempted, and a stuck segment keeps the worker, the VM and the binding dependencies
-live), settles every ticket (a finished task keeps its result, any other is discarded with
-the exit kind and whether it began), cancels the timer, discards the admissions that had
-not begun, and closes every suspended coroutine on the owner's thread, attempting each
-whatever another does. Closing errors are cleanup evidence on the owner's outcome, and a
-retained cleanup failure is fatal under any policy, as supervision decides for any worker
-(`WorkerCleanupFailed` when the worker was cancelled). `withVmOwnerScoped` then closes the VM,
-and the owner's collection then releases the members still live; a release that fails is
-cleanup evidence as well. The same retirement runs when the owner fails or is cancelled, with the way it exited
-recorded, so a primary host failure or cancellation survives beside the evidence. A
-coroutine the scheduler left alone because its task was inside a segment when the owner
-ended (the application's observer raised before it resumed, say) is closed too, before the
-VM is, where the cleanup a script asked for may run state operations a VM's own teardown
-refuses. A failure of cleanup is fatal and ends the owner at once, so nothing accumulates
-while it serves: the first coroutine whose close raised, a script error raised together with
-the failures of closing its coroutine (the task still settles as faulted), or a timer
-whose cancellation throws ends the owner through the same retirement. A stop that is itself
-interrupted keeps every close's failure, the interruption among them, and the failure of a
-timer's cancellation beside it (the scheduler's stop report carries it, whether the stop
-or an earlier service turn met it: the timer remembers the first, whatever the type of what
-the cancellation raised, an asynchronous exception type it throws itself included). A task-level stop
-whose close is interrupted keeps that failure before it propagates. A task's coroutine is
-acquired and published to the owner's table together, masked, and a resumed segment's
-outcome is recorded masked as well, so a cancellation queued during a segment lands after
-it: the retirement finds the coroutine, a task that finished in that segment keeps its
-result, and the failures of closing the coroutine of a task that failed in it are kept. The
-`ExitRecord` is the finite-call adapter's: it names the owner and counts the tasks it
-discarded, started and not started separately, and carries no cleanup evidence.
+Stopping (`retireScheduled`, `stopSupervised`, the boundary closing), in
+order: closes admission, grants and control; lets a running segment return
+(**nothing is preempted; a stuck segment keeps the worker, VM and
+dependencies live**); settles every ticket; cancels the timer; discards
+unbegun admissions; closes every suspended coroutine on the owner's thread,
+each attempted; `withVmOwnerScoped` closes the VM; the owner's collection
+releases its live members. The same retirement runs when the owner fails or is
+cancelled, the primary failure surviving beside the evidence.
+
+**A cleanup failure is fatal under any policy and ends the owner at once**: a
+coroutine whose close raised, or a timer whose cancellation throws. A task's
+coroutine is acquired and published masked, and a segment's outcome recorded
+masked, so a cancellation queued during a segment lands after it. The
+`ExitRecord` names the owner and counts discarded tasks, started and not
+started; it carries no cleanup evidence.
 
 ### Determinism
 
-On one owner with a fixed policy and configuration, the same admitted tasks, grants and
-control requests, each made at the same logical point (while the owner awaits the next
-grant), give the same sequence of segments, the same logical durations to each task and the
-same order of effects recorded through a binding, however long the segments take and
-whether budgets expire. It is a property of the scheduler's documented ordering, and holds
-for logical-time work: elapsed waits legitimately change readiness with real time, are not
-covered by it, and are tested separately. A control request that arrives in the middle of a
-step is not ordered logically here: deterministic logical admission of a script instance's
-controls is the instance layer's (LUA-23, [Lifecycle services](#lifecycle-services); D-30). No claim is made across policies, worker counts,
-platforms or versions.
-
-### What proves it
-
-`Test.LuaRuntime.Scheduled.*`, in `lua-runtime-tests`, run real Lua tasks as coroutines on
-real supervised scheduled owners, under an injected clock and a fake timer whose wakes the
-example fires, with gates and STM signals instead of sleeps: the policy, classes, quanta,
-one-shot placement, grants, elapsed waits, budgets and control end to end; creation,
-readiness and identity across cycles; every outcome, every bound, a thousand admissions
-racing control requests and a stop, and a ticket's reservation; idle and stop, with
-closing errors retained; host failures, failure and cancellation; the refused waits and tick
-completion; repeated runs of one workload under different delays and budgets; the
-accounting wait (`Test.LuaRuntime.Accounting.*`), each window it waits through on its own
-(a close the owner runs at a boundary, a refused wait's close, a `shutdown`, a retirement a
-provider completes later, the escalation callback and its return), the final boundary of the
-captured grants and an ending a later grant caused in it, prefix isolation and a snapshot kept
-across supervision's handling of an outcome, every bound exhausted, cancellation, and the
-owner's end in each way; and the
-lent collection (`Test.LuaRuntime.Scheduled.Lending`): members acquired, borrowed and
-retired during a callback and in a later one, the bound and a lower limit refused, a loan
-kept past its callback, used from a thread the callback started and presented from another
-VM's callback refused with no effect while the callback goes on using its own, a handle given to
-one owner only, a loan
-ended by a callback that fails, the loan found in an initial chunk, a closing handler and a
-finalizer-eligible binding, and retirement releasing what remains on the owner's thread
-after the VM closed, however the owner ends, with a failing release fatal under an optional
-policy that recognizes everything and kept beside the VM's own close failure, whether that is a
-coroutine's or a finalizer-eligible binding's that failed while the VM closed. The
-cancellation and shutdown windows are the kind an asynchronous-exception race can hide on
-one platform, so CI, which runs them on Linux, is the evidence for them and a local pass is
-not.
-
+On one owner with a fixed policy and configuration, the same admitted tasks,
+grants and control requests, each made at the same logical point (while the
+owner awaits the next grant), give the same sequence of segments, logical
+durations and order of binding effects, however long segments take and whether
+budgets expire. Elapsed waits are not covered. A control request arriving
+mid-step is not ordered logically here; that is
+[Lifecycle services](#lifecycle-services). No claim across policies, worker
+counts, platforms or versions.
 ## Script instances
 
-`Hetoimasia.Scripting.Lua.Instance` (LUA-18, in `runtime-lua`) puts instances on a scheduled
-owner. An *instance* is one running copy of a module's behavior, with a `self` of its own, hooks
-the module defines, functions it connected to events, and a lifecycle the application controls and
-reads. It follows the accepted
-[instance contract](../../docs/lua_instance_contract.md) (D-26, D-27). An owner hosts instances
-when it is created with a `scheduledInstances` configuration (`InstanceConfig`); one without serves
-tasks as before and loads nothing of this. The modules that host instances declare their hooks as
-optional entry points (`hookEntries`). Periodic update cadence (LUA-24) is described under
-[Cadence](#cadence). What an instance acquires through the application's bindings is owned by the
-engine (LUA-22, [Instance leases](#instance-leases)); control and inspection a script is granted across
-owners (LUA-23) are described under [Lifecycle services](#lifecycle-services); the requests a script makes of
-providers (LUA-7) are described under [Asynchronous requests](#asynchronous-requests), and the events a provider
-delivers to functions an instance subscribed (LUA-26) under [Provider events](#provider-events).
+`Hetoimasia.Scripting.Lua.Instance` (in `runtime-lua`) puts instances on a
+scheduled owner. An *instance* is one running copy of a module's behavior:
+its own `self`, the module's hooks, functions it connected to events, and a
+lifecycle the application controls and reads, following the
+[instance contract](../../docs/lua_instance_contract.md). An owner hosts
+instances when created with `scheduledInstances` (an `InstanceConfig`). The
+hosting modules declare their hooks as optional entry points (`hookEntries`).
 
 ### Instances and identity
 
-`admitInstance` admits an instance from a module the owner loaded and answers at once, from any
-thread, without blocking: `InstanceAccepted` with the instance's identity and a ticket, `InstanceFull`
-or `InstanceAdmissionClosed`. The identity (`InstanceId`, the TID) is the owner's identity and the
-owner's number for the instance. It is unique within the runtime and never reissued, not after the
-instance ends and its result is observed and not after its owner retires; it is never an OS thread,
-a `ThreadId` or a coroutine, and it, like the application's name for the instance, grants nothing.
-Live instances (`boundLiveInstances`) and the results of ended ones nobody has observed
-(`boundRetainedInstances`) are each bounded, and a result is reserved at admission. A configuration
-that does not fit the scheduler's own bounds is refused before anything starts, naming every
-violation (`InstancesRefused`; a source's name must also leave room for the driver's entry point's prefix): the scheduler's retained-result bound must be at least twice the
-live instances, because an instance's next invocation is admitted before the scheduler has given
-back its last result, and its queue of admissions must hold one invocation for each.
+`admitInstance` answers at once from any thread: `InstanceAccepted` with the
+identity and a ticket, `InstanceFull` or `InstanceAdmissionClosed`. The
+`InstanceId` is the owner's identity and the owner's number for the instance:
+unique within the runtime, never reissued, never a thread or coroutine, and
+granting nothing. Live instances (`boundLiveInstances`) and unobserved results
+(`boundRetainedInstances`) are bounded; a result is reserved at admission. A
+configuration that does not fit the scheduler's bounds is refused before
+anything starts (`InstancesRefused`): **the scheduler's retained-result bound
+must be at least twice the live instances**, and its admission queue must hold
+one invocation for each.
 
-The owner's thread makes the instance's `self`, a fresh empty table, before `init` runs. Module code is
-shared by the instances of a module and a fresh `self` does not isolate mutable module globals or
-upvalues. Ending one instance ends only that instance: another instance, the module and the VM stay,
-and what they share stays valid. Instances of one module are independent.
+The owner's thread makes `self`, a fresh empty table, before `init`. Module
+code is shared by a module's instances: a fresh `self` does not isolate
+module globals or upvalues. Ending one instance ends only that instance.
 
-`self`, and the functions an instance connected, are values of the VM: they have an identity and a
-lifetime of their own and cannot cross the value boundary, which copies. The layer keeps them in a
-table in the VM that only a driver module the owner loads beside the application's can reach, by the
-instance's number, and the host runs a hook by handing it to the driver, which calls it with its
-instance's `self`. A script cannot reach the table, so it cannot forge or erase another instance's
-state. The layer installs two bindings. `hetoimasia_instance.delta` hands the driver the `dt`, in
-seconds, of the update that is about to begin (a negative number for anything else), so that a one-shot's
-`run` and an update go through one driver entry point that takes the instance's number alone, which keeps
-the boundary footprint of `run` and of `update` to that one value; only the instance whose code is
-running is answered. `hetoimasia_instance.connect` tells the owner a connection was made, so the owner
-records it at once; it accepts only the number of the instance
-whose code is running, so a script that names another instance's number is refused. A script that connects itself through the binding and
-not through its `api` has a connection with no function behind it: the first event for it fails that instance, by name,
-rather than being dropped.
+`self` and connected functions stay in a VM table only a driver module the
+owner loads can reach, by instance number; a script cannot forge or erase
+another instance's state. The layer installs two bindings, both answering only
+the instance whose code is running: `hetoimasia_instance.delta` (the `dt` of
+the update about to begin) and `hetoimasia_instance.connect` (records a
+connection). A script that connects through the binding instead of its `api`
+has a connection with no function: the first event for it fails that instance.
 
 ### Hooks
 
 | Hook | When | Suspends |
 | --- | --- | --- |
-| `init(self, api)` | once, as a finite call, before anything else; an absent `init` is a successful empty one | no: a wait or a yield is a fault of the hook |
-| `update(self, dt)` | when a periodic instance's interval makes one due (see [Cadence](#cadence)), handed `dt` as a float number of seconds; an instance admitted without an interval never has one; a periodic instance whose module defines none is refused before any hook runs, naming `update` | yes, as `run` and the callbacks do |
-| `run(self, api)` | a one-shot's body (`RunOnce`), to completion after `init`; a one-shot whose module defines none is refused before any hook runs, naming `run` | yes, as a task's entry point does |
-| callbacks | an event's callback, handed `self` and the event | yes |
+| `init(self, api)` | once, as a finite call, before anything else; absent is a successful empty one | no: a wait or yield is a fault of the hook |
+| `update(self, dt)` | when a periodic instance's interval makes one due (see [Cadence](#cadence)); `dt` is a float number of seconds. A periodic instance whose module defines none is refused before any hook runs | yes |
+| `run(self, api)` | a one-shot's body (`RunOnce`), after `init`. A one-shot whose module defines none is refused | yes |
+| callbacks | an event's callback, handed `self` and the event (`source`, `sequence`, `tick`, `payload`) | yes |
 | `shutdown(self, reason)` | once, with `"stopped"`, `"completed"` or `"failed"`; optional | no |
 
-`api` carries only what the instance was granted. In this slice that is `api.connect(source,
-callback)`, which connects a function to an event source the instance was granted (`instanceGrants`)
-and is a script error for any other. The event a callback receives is a table with `source`,
-`sequence`, `tick` and `payload`.
+`api` carries only what the instance was granted: `api.connect(source,
+callback)` for a granted event source (`instanceGrants`), a script error for
+any other.
 
-**The segment notification.** `InstanceConfig`'s `instanceOnSegment` is told, on the owner's thread and just before the Lua runs,
-whose segment is about to begin: the instance's initialization (once, whether or not its behavior has an `init`), the first
-segment of an update, a callback or a `run`, every segment a wait resumes, and its `shutdown`. It runs no Lua, and what it raises is a
-failure of the host (the hook it was told of never runs). It is where an application samples what a script must read as the same
-throughout a segment: the Lua-first engine's facade takes the presentation clock's sample there. The default does nothing, and no
-existing caller is changed.
+`instanceOnSegment` is told, on the owner's thread just before the Lua runs,
+whose segment is about to begin: the initialization (once, with or without an
+`init`), the first segment of an update, callback or `run`, every resumed
+segment, and `shutdown`. It runs no Lua; what it raises is a host failure and
+the hook never runs. It is where an application samples what a script must
+read as constant throughout a segment.
 
 ### One invocation at a time
 
-An instance has at most one invocation in flight, including a suspended one: a callback, or a
-one-shot's `run`. An invocation is a task of the owner's scheduler, so the owner's policy orders the
-invocations of its instances among each other and among its tasks (first in, first out, yielding to
-the tail, by default) by the instance's service class; no policy overrides lifecycle, capacity or the
-order an instance's own invocations were accepted in. The next invocation of an instance is admitted at
-the boundary of the segment that ended the last, so the order depends on the order of admission and
-nothing about how long segments take, when timers fire or whether a budget expires.
+An instance has at most one invocation in flight, a suspended one included.
+An invocation is a task of the owner's scheduler, ordered by the owner's
+policy and the instance's service class. The next invocation is admitted at
+the boundary of the segment that ended the last, so the order depends only on
+the order of admission.
 
-**An invocation the scheduler had no room for is tried again wherever room appears, before the next segment is
-chosen.** Room is a result place, a place of the admission queue and an active slot, and a task keeps its slot and its
-place until its result is observed. The owner takes one step at every safe boundary, after the scheduler's own work
-there (its activations, controls and closes), and the scheduler does the boundary again while that step says it
-released or used something. The step accounts for the invocations that ended and gives back what they held, gives
-back what tickets the application forgot, and then, if the application asked anything or an invocation waits for room
-and there is room, looks at every instance in the order of its number: what waited for room goes before what the
-batch of requests begins. The sites that release room, and where each reaches the step, are these: an invocation's
-end (its place, when the step observes it at the boundary; its slot, with it), a queued admission's activation (a
-place of the queue, by the scheduler's own reconcile before the step), the application's observation or forgetting
-of a ticket (a place and a slot: at any time by the application, and for a forgotten ticket of an unfinished task,
-when the step sweeps after it finishes), an instance's control (a stop or a pause of a begun invocation ends or
-freezes it directly, and a control that finishes a grant settles it at the boundary's second look; a resume looks at
-the instance), the end of an instance (its coroutine's close, accounted at the step before it is looked at again),
-and the owner's own control of its tasks (applied by the scheduler before the step). So where a turn is cut, which
-only decides when the owner's thread is handed back to the loop, changes neither which invocation takes the room
-that is there nor in what order effects happen. Room an application's own thread releases while a segment runs is
-taken at the next boundary, whenever it was released: the application chose when to observe.
+**An invocation the scheduler had no room for is tried again wherever room
+appears, before the next segment is chosen.** Room is a result place, an
+admission-queue place and an active slot. At every safe boundary, after the
+scheduler's own work, the owner accounts for ended invocations, returns what
+forgotten tickets held, and, if room exists, looks at every instance in
+number order, what waited for room first. So where a turn is cut changes
+neither which invocation takes the room nor the order of effects.
 
 ### Events
 
-An owner offers named event sources (`EventSource`: a name and the shape of the payload). They are a seam
-for tests and for the application's own threads, which deliver in arrival order (a provider's events are
-[Provider events](#provider-events), which a logical owner admits by assigned place). `deliverEvent` answers at
-once, from any thread, without blocking: `DeliveryAccepted` with a sequence, `DeliveryQueueFull`,
-`DeliveryClosed`, `DeliveryUnknownTarget` (no live instance of this owner, or none with a connection to
-the source) or `DeliveryRefused` (the payload is over the owner's limits or not what the source
-declares). The payload is checked, as the callback will be handed it (stamped with its source and sequence,
-beside the instance's number, against the owner's limits) and copied on the producer's thread, and is kept with its sequence and
-the logical tick it was admitted at, unchanged, until its callback runs, however long that takes and
-whether the instance is paused. No producer thread enters Lua. A connection made during `init` is
-recorded when it is made, so events can be accepted while `init` runs; none is dispatched until `init`
-has succeeded, and if it fails the connection is revoked and the events are counted as unstarted.
+An owner offers named event sources (`EventSource`: a name and a payload
+shape), a seam for tests and the application's own threads, delivered in
+arrival order. `deliverEvent` answers at once from any thread:
+`DeliveryAccepted` with a sequence, `DeliveryQueueFull`, `DeliveryClosed`,
+`DeliveryUnknownTarget` or `DeliveryRefused` (payload over the limits or not
+what the source declares). The payload is checked and copied on the
+producer's thread and kept, with its sequence and admission tick, until its
+callback runs. **No producer thread enters Lua.** A connection made during
+`init` accepts events at once; none is dispatched until `init` succeeds, and
+if it fails they are counted as unstarted.
 
-Each instance has one bounded first-in, first-out queue of invocations (`boundInvocationQueue`),
-which a due update shares: the update keeps its place among the events and is never counted in the
-bound. A full queue refuses the new delivery, counts it (`snapshotQueueFull`) and never evicts an
-accepted one. Retained results use no part of it.
+Each instance has one bounded FIFO queue of invocations
+(`boundInvocationQueue`). A full queue refuses the new delivery
+(`snapshotQueueFull`) and never evicts.
 
 ### Cadence
 
-An instance is admitted with no periodic interval (`EventOnly`, `RunOnce`), or as `Periodic interval`,
-which reacts to events as an event-only instance does and has its module's `update` called on that
-interval. The interval is chosen at admission and fixed for the instance's life. Neither kind belongs
-to the UI or to gameplay: either can run on any scheduled owner, and a gameplay owner and a UI owner
-are an application's arrangement, not a hard-coded pair.
+An instance is admitted `EventOnly`, `RunOnce` or `Periodic interval`; the
+interval is fixed for its life. Neither kind belongs to UI or gameplay.
 
 | Interval | Meaning |
 | --- | --- |
-| `LogicalTicks n` | gameplay's logical time: a positive number of ticks (`n` is an `Integer`; zero, a negative number and one that is not a tick count are refused) |
-| `LogicalDuration d` | the same, as a duration: converted to ticks only when `d` is an exact multiple of the owner's configured tick duration (`instanceTickDuration`, a positive `Duration` the application sets; no production rate is hard-coded), and refused otherwise, naming `d` |
-| `ElapsedEvery d` | the UI's elapsed time: a positive duration on the owner's monotonic source |
+| `LogicalTicks n` | a positive number of logical ticks |
+| `LogicalDuration d` | the same as a duration: accepted only when `d` is an exact multiple of the owner's `instanceTickDuration` |
+| `ElapsedEvery d` | a positive duration on the owner's monotonic source |
 
-A refused interval answers `InstanceIntervalRefused` (`IntervalNotPositive`, `IntervalUnrepresentable`,
-`IntervalNotExact`, `IntervalNoTickDuration`), takes no place and no result, and changes nothing.
-Nothing is rounded.
+A refused interval answers `InstanceIntervalRefused` (`IntervalNotPositive`,
+`IntervalUnrepresentable`, `IntervalNotExact`, `IntervalNoTickDuration`) and
+takes nothing. Nothing is rounded.
 
-**Logical updates.** The cadence points are every `interval` ticks from the tick at which `init`
-succeeded, on a fixed phase. A point is looked at when its grant is *applied* (not when it was
-accepted), at the safe boundary that follows, before any task that grant woke is chosen. It makes
-an update due only if it finds the instance serving (not paused, stopping or ended) with no invocation
-*active*. An invocation is active from the segment that begins it until it finishes, including while
-it is suspended on a wait, and whether it is an `update`, a `run` or an event callback; one that is
-admitted and has not yet begun is still queued, and the update falls due behind it. A point that
-finds an invocation active adds nothing at all: no catch-up and no backlog, the grant that resumes a
-waiting invocation included. The next update is due at the first point after that invocation
-finishes, and no update overtakes an active invocation or an earlier queued one. An instance never has
-more than one unstarted update.
+**Logical updates.** Cadence points are every `interval` ticks from the tick
+at which `init` succeeded. A point is looked at when its grant is *applied*,
+at the safe boundary that follows, before any task that grant woke is chosen.
+It makes an update due only if the instance is serving with no invocation
+*active* (begun and not finished, suspended included). **A point that finds
+an invocation active adds nothing: no catch-up, no backlog.** An invocation
+admitted but not begun is queued, and the update falls due behind it. An
+instance never has more than one unstarted update.
 
-The update's `dt` is the logical duration granted since the previous update *finished* (since `init`
-succeeded, for the first), less any granted while the instance was intentionally paused (D-35), from
-grants alone. Ticks that pass while an invocation is active and the instance is not paused still
-count, so every tick granted while the instance is live is accounted to it once. It reaches Lua as a
-**float number of seconds**: the exact `Duration` (the sum of the durations actually granted, so grants
-of unequal sizes are summed as they were granted; or the elapsed difference) is converted once at the Lua
-boundary, which is the only rounding. The owner's tick duration is only the unit an interval given as a
-duration converts by, never a replacement for the grants. A representable `Duration` never fails because
-its count of nanoseconds exceeds Lua's integer range. It is fixed as the update begins and is unchanged by
-its own waits, by later grants and by real delays. The duration an invocation's own wait was granted is
-reported to the application on the owner's thread when it resumes (`scheduledObserve`'s
-`ResumedLogical`); a resumed coroutine receives no value, so a script learns it only through a binding
-the application grants, as the test fixture's `fx.resume` does. That duration overlaps the next
-update's `dt` and is no further credit. With a constant grant `q`, `init` at tick 0, interval 2 and an
-event callback that waits through tick 5, the callback's wait observation is `5q`, and the first update
-is at tick 6 with `dt = 6q`, whatever the callback did. Every granted tick is accounted exactly once in
-a `dt`, and once in the observation of the wait it fell in.
+`dt` is the logical duration granted since the previous update *finished*
+(since `init` succeeded, for the first), less any granted while the instance
+was paused, from grants alone, converted once to float seconds at the Lua
+boundary (the only rounding) and fixed as the update begins. Every granted
+tick is accounted once in a `dt`. Example: constant grant `q`, `init` at tick
+0, interval 2, a callback that waits through tick 5: the first update is at
+tick 6 with `dt = 6q`.
 
-**What a tick waits for.** A tick does not complete (`awaitTicksComplete`) until a due update has run
-in it, but only while the update can still run in it, so a tick never waits on an update that cannot
-start. The update lets go of its tick when: its instance is paused, or a stop or an ending discards it
-before it starts; an invocation queued ahead of it begins and suspends on a wait; it has begun and
-stopped being ready or running; or nothing at all is ready to run, so that what it waits for can never
-happen. A callback that waits for future ticks therefore never deadlocks a due update behind it.
-Real delay slows the simulation and never skips a due update: only the instance's own logical waits
-make a point a no-op.
+**What a tick waits for.** A tick does not complete (`awaitTicksComplete`)
+until a due update has run in it, but only while the update can still run in
+it. The update lets go of its tick when its instance is paused, stopped or
+ended before it starts; when an invocation queued ahead of it begins and
+suspends; when it has begun and stopped being ready or running; or when
+nothing at all is ready. Real delay slows the simulation and never skips a
+due update.
 
-**Elapsed updates.** The interval is measured on the owner's monotonic source, behind the owner's one
-timer: there is no per-instance timer, no polling and no thread. At most one refresh is kept
-unstarted; demand that finds one is coalesced into it, and queued events are never dropped. Unlike a
-logical point, an elapsed point queues its refresh behind an active invocation. Its `dt` is the elapsed
-time between update starts, from the instant `init` succeeded. Ordinary lateness moves the next deadline
-to the first point on the configured cadence strictly in the future: a stall of ten intervals gives one
-refresh, not ten.
+**Elapsed updates.** Measured on the owner's monotonic source behind the
+owner's one timer. At most one refresh is kept unstarted and later demand is
+coalesced into it; unlike a logical point, an elapsed point queues its refresh
+behind an active invocation. `dt` is the elapsed time between update starts.
+Lateness moves the next deadline to the first cadence point strictly in the
+future: a stall of ten intervals gives one refresh.
 
-**Pause and resume.** A paused instance accrues no periodic demand, logical or elapsed: its timer
-demand is cancelled and a point that finds it paused adds nothing. An update that was already due or
-admitted and had not begun is retained, in its place, and holds no tick; it runs after the resume. After
-a resume the first update newly due is one full interval later: that many ticks after the tick the
-resume was applied at, or that much time after the instant it was. An elapsed instance's baseline is
-rebased to that instant, and a logical instance accrues nothing toward its `dt` from the grants applied
-while it is paused, so either `dt` excludes the pause: a resumed instance's first update receives about
-one interval, plus whatever was granted between its previous update and the pause.
+**Pause and resume.** A paused instance accrues no periodic demand. An update
+already due and not begun is retained in place, holds no tick, and runs after
+the resume. After a resume the first newly due update is one full interval
+later, and either `dt` excludes the pause.
 
-**The queue.** A due update takes its place in the instance's one queue when it falls due: behind the
-events accepted before it, ahead of those accepted after it, so a continuous producer cannot starve it.
-It is not counted in `boundInvocationQueue` and never competes with events for it, so it is never refused
-as full; `snapshotUpdateOwed` says one is owed.
-
-**Ending.** Every way an instance ends (a stop, a failure, its owner's retirement or exit) cancels its timer demand, discards its unstarted update, counted with the other unstarted
-invocations (`terminationUnstarted`), and lets go of a tick it held.
-
-**Arithmetic.** An accrued duration, a tick or a deadline that cannot be represented fails the instance
-(`ErrorCadence`, at `StageUpdate`), attributably: nothing wraps, no timer demand is left and no tick is
-held.
+**Queue, ending, arithmetic.** A due update takes its place in the instance's
+queue when it falls due, is not counted in `boundInvocationQueue` and is never
+refused as full (`snapshotUpdateOwed`). Every ending cancels the timer demand,
+discards the unstarted update (counted in `terminationUnstarted`) and releases
+a held tick. An unrepresentable duration, tick or deadline fails the instance
+(`ErrorCadence` at `StageUpdate`); nothing wraps.
 
 ### M1 behavior instances (opt-in)
 
-Beside the instances above, which run the hooks a global-entry module defines and are
-unchanged, an owner that hosts instances admits **behavior instances** with
-`admitBehaviorInstance`: an instance of a behavior in an [export table](#export-modules-and-captured-behaviors)
-the owner holds. The request, `BehaviorRequest`, names the export module by its identity, the
-field of its table that holds the behavior, the **facade** the instance is injected with, and the
-application's rule that resolves the behavior's cadence from what its table read as. The facade is a
-`BehaviorFacade`: data (`FacadeData`), the table an export module holds (`FacadeShared`), or what a
-function an export module holds builds from a value for this instance (`FacadeBuilder`), so a facade can
-carry closures bound to its instance; the export modules it names are looked up by identity when the
-instance starts. It has no event
-grants and no connections, is no one-shot, and is admitted with the same live place and result
-reservation as any instance. `InstanceRequest`'s constructor and every existing caller are untouched.
+`admitBehaviorInstance` admits an instance of a behavior in an
+[export table](#export-modules-and-captured-behaviors) the owner holds. The
+`BehaviorRequest` names the export module by identity, the field holding the
+behavior, the facade (`BehaviorFacade`: `FacadeData`, `FacadeShared` or
+`FacadeBuilder`) and the application's rule resolving the cadence from how
+the table's fields read. It has no event grants or connections, is no
+one-shot, and takes the same live place and result reservation as any
+instance.
 
-The owner's thread does the rest when it starts the instance, in this order and before any hook:
+When the owner's thread starts the instance, in order, before any hook:
 
-1. find the export module (`retrieveExport`): none held is `ErrorExportMissing`; one that failed is
-   `ErrorExportFailed`, the module's own sticky fault;
-2. select, validate and capture the behavior (`captureBehavior`): a table that does not fit is
-   `ErrorBehavior`, a facade past the owner's value limits or an allocation that fails is
-   `ErrorFault`;
-3. resolve the cadence: the rule is applied to the shape once. A refusal, an interval that does not
-   resolve (exactly or not at all, as at any admission), an interval for a behavior with no `update`,
-   and an `update` with no interval are each `ErrorCadence`;
-4. run `init(self, api)` when the table has one, where `api` is the same table as `self.api`, the
-   facade. An absent `init` is a successful empty initialization, and `self.api` exists regardless.
+1. find the export module (`retrieveExport`): `ErrorExportMissing`, or
+   `ErrorExportFailed` with the module's sticky fault;
+2. capture the behavior (`captureBehavior`): `ErrorBehavior` for a table that
+   does not fit, `ErrorFault` for a facade past the limits or a failed
+   allocation;
+3. resolve the cadence: a refusal, an interval that does not resolve, an
+   interval with no `update`, or an `update` with no interval is
+   `ErrorCadence`;
+4. run `init(self, api)` if present; `api` is the facade, the same table as
+   `self.api`.
 
-Each of 1 to 3 fails the instance at the stage **`StageConstruct`**, distinct from an `init`
-failure (`StageInit`) and from a module's failure, with no hook run, `shutdown` skipped as for any
-instance whose `init` never succeeded, and whatever was captured released. A failure at `init`
-is `StageInit` as always, and runs no later hook.
+Steps 1 to 3 fail the instance at **`StageConstruct`** with no hook run,
+`shutdown` skipped and the capture released. A failing `init` is `StageInit`.
 
-An instance without an `update` hook has no cadence: it stays alive until it is stopped, has no
-public event subscription, and is not a new natural-completion mode. One with an `update` hook
-is periodic on the interval the rule resolved, through the same cadence machinery, scheduler and
-`dt` as any periodic instance: logical `dt` is the duration granted since the last update finished, and
-an elapsed refresh merges late demand and is handed the actual elapsed time, independent of
-rendering. `update(self, dt_seconds)`, `shutdown(self, reason)` with the strings `stopped`,
-`failed` and `completed`, one invocation at a time, pause, resume, stop, the suspension of an
-`update` in a wait and the refusal of a wait or yield in `init` and `shutdown` are all the existing
-instance contract.
+An instance without `update` has no cadence and lives until stopped. One with
+`update` is periodic on the resolved interval through the ordinary cadence
+machinery. Everything else (one invocation at a time, pause, resume, stop,
+`shutdown` reasons, no suspension in `init` and `shutdown`) is the instance
+contract.
 
-**Hooks are captured, not looked up.** The driver, a module of the owner's loaded beside the
-instance driver's, is called with the captured hook, `self` and the facade pushed after it, so
-nothing is looked up again by field or global: replacing a field of the behavior, replacing the
-role table or editing a cadence field afterwards changes nothing an instance does, and a later
-instance reads the table as it is then. Mutable upvalues stay Lua. The legacy instance driver's
-`api` (`connect`, `subscribe`, `unsubscribe`) is **not** handed to a behavior and is not part of this
-surface; the one binding the behavior driver calls is the instance layer's own `delta`.
-
-**Progress.** An `init` that is entered and then interrupted by a failure of the host or a cancellation
-settles the instance as *started* (`Discard … Started`) with `shutdown` skipped, as for the legacy path;
-the behavior path records this itself, separately from the legacy driver's record, which a behavior
-never makes.
-
-**The behavior driver and the module bound.** The driver that runs captured hooks is a module of the
-owner's like the instance driver, and counts against the same `maxModules` bound. It is loaded only
-for an owner that holds export modules (`vmExports`), so an owner that hosts instances and holds none
-keeps every module slot it had: 255 application modules and the instance driver still fit.
-`admitBehaviorInstance` on an owner without one fails at construction with `ModuleNotLoaded`.
-
-**Release.** What an instance captured is released whichever way it ends: after its `shutdown`
-decision, with the rest of what the instance holds, on the owner's thread and without entering
-Lua, so Lua being unsafe to enter keeps no reference. A release that fails is cleanup evidence
-that ends the owner, as a lease release's does. An invocation still running or suspended keeps its
-values alive in Lua until its coroutine is closed, which an ending does first.
-
-`Test.LuaRuntime.Instance.Behavior` runs these on real supervised scheduled owners under the
-injected clock and fake timer: the hooks, self and facade; shared upvalues and a peer outliving
-another's end; the capture surviving every later edit while a later instance captures what is
-there; no-update behaviors; every construction refusal at `StageConstruct` with no hook run; a
-failed `init` and its references let go (read by a weak table, since a captured `self` is
-reachable only through its capture); waits refused in `init` and `shutdown`; a suspended `update`
-closed on stop; an `update` failure ending only its instance; an elapsed update on the owner's clock;
-and the ceilings on an instance-hosting owner, at 256 identities and a 1 MiB source and one byte over.
+- **Hooks are captured, not looked up**: later edits to the behavior table
+  change nothing an instance does. The legacy driver's `api` (`connect`,
+  `subscribe`, `unsubscribe`) is **not** handed to a behavior.
+- An `init` entered and then interrupted by a host failure or cancellation
+  settles the instance as *started* with `shutdown` skipped.
+- The behavior driver is a module of the owner's, counted against
+  `maxModules`, and loaded only for an owner that holds export modules
+  (`vmExports`). On an owner without one, `admitBehaviorInstance` fails at
+  construction with `ModuleNotLoaded`.
+- The capture is released whichever way the instance ends, on the owner's
+  thread without entering Lua; a failing release is cleanup evidence that ends
+  the owner.
 
 ### Failure and escalation
 
-A failed `init` fails that instance: no `update`, `run`, callback or `shutdown` ever runs on it, its
-connections are revoked and its record in the VM is released. Its failure (`InstanceFailure`) names the
-instance, its owner, its source module, the phase, the stage, the error and the traceback, if one was
-captured; the `init` error is primary, nothing later replaces it, and what else failed while it ended is
-kept beside it (`failureSecondary`). There is no retry. An unhandled error in `run` or a callback fails the
-instance the same way, except that `shutdown` runs with the reason `failed`.
+A failed `init` fails that instance: no later hook runs, not `shutdown`
+either, its connections are revoked and its VM record released. An unhandled
+error in `update`, `run` or a callback fails it the same way, except that
+`shutdown` runs with `failed`. The `InstanceFailure` names the instance,
+owner, source module, phase, stage, error and traceback. **The first failure
+recorded is primary and nothing later replaces it**; what else failed while it
+ended is in `failureSecondary`. There is no retry.
 
-A required request that settled with an expected failure fails its instance too, with `ErrorRequest` (the endpoint and
-the failure attributed to the request): it is latched when the failure becomes eligible, whether or not the script
-ever read the request, and applied at the owner's next safe boundary, before any more of the instance's ordinary work
+A required request that settled with an expected failure fails its instance
+with `ErrorRequest`, latched when the failure becomes eligible, whether or not
+the script read the request, and applied at the owner's next safe boundary
 (see [Atomic request admission](#atomic-request-admission)).
 
-**Which failure is primary when a script raises over a latched required request.** The primary failure is the first one
-recorded and a later one never replaces it, with one exception owed to this rule: when an invocation that is running (an
-`update`, a `run` or a callback) raises an uncaught script error (Lua's own `error`, as `ScriptFailed CallFailed`) and a
-required *request's* expected failure of that instance has already been latched, the latched failure is the instance's
-primary (`ErrorRequest`, at the `request` stage, attributed to the endpoint) and the script's error is kept as a
-secondary, with its own stage and traceback intact, once. The latch settles with the request, whether the owner reaches
-the instance's dispatch boundary first or a script that was already running takes the refused result and raises it, so the
-instance fails with the same attributed failure in either order, and the earlier notice, the settled record and a session's
-first failure all name it. An uncaught script error recorded before the failure was latched stays primary. Nothing else
-changes: the primary of a failure of `init`, of `shutdown`, of a release or of a delivery, of a fault that is not an uncaught
-script error (a refused value, a memory limit, a wait the scheduler refused), of a cancellation that won, and of a failure
-latched from a required *module's* lookup is as before, and an optional request's failure is a result to read, not an
-instance failure.
+One exception to "first recorded is primary": when a running invocation
+raises an uncaught script error (`ScriptFailed CallFailed`) and a required
+*request's* failure of that instance is already latched, the latched failure
+is primary (`ErrorRequest`, stage `request`) and the script's error is a
+secondary. So the instance fails with the same attributed failure whichever
+of the two the owner reaches first. An uncaught error recorded before the
+latch stays primary. An optional request's failure is a result to read.
 
-**The earlier notice.** An instance's ending is *parked* when a provider has yet to retire something the instance released,
-and it settles, and `instanceEscalate` is told, only when every such retirement has completed, so a failure whose own provider
-is slow to retire is not told for as long. An application whose policy must act on a failure at once (close its admission, stop
-granting ticks, ask its owner to stop) is told earlier, through `instanceOnFailing` of the instance configuration (default:
-nothing): on the owner's thread, once, as the ending *begins* with a failure (an `init`, `update`, callback or `run` that failed, a
-wait the scheduler refused, a required request's failure, a construction refusal), before the `shutdown` hook runs and before the
-release and the retirements. The record is the primary failure alone, `failureSecondary` empty by contract (even when an uncaught script error was
-displaced as the primary by a latched required request's failure, as above); `instanceEscalate` is still told, with the
-settled record, which carries what else failed, that error included. A failure that
-arises only in settling (a `shutdown` that raises after a stop, a release that fails) is told to `instanceEscalate` alone. What the
-notice raises is a failure of the host, as for `instanceOnSegment`. The Lua-first engine's session coordinator is the application
-that uses it ([the session coordinator](../lua-engine/README.md#the-session-coordinator-lfe-13)).
+**The earlier notice.** An ending is *parked* while a provider has yet to
+retire something the instance released, and `instanceEscalate` is told only
+when it settles. `instanceOnFailing` (default: nothing) is told earlier: on
+the owner's thread, once, as an ending *begins* with a failure, before
+`shutdown`, the release and the retirements. Its record is the primary
+failure alone. A failure that arises only in settling (a raising `shutdown`,
+a failed release) goes to `instanceEscalate` alone. What the notice raises is
+a host failure. The Lua-first engine's
+[session coordinator](../lua-engine/README.md#the-session-coordinator-lfe-13)
+uses it.
 
-**Holding an instance after its construction.** A behavior instance is constructed, its behavior captured and
-validated and its cadence resolved on the owner's thread, one instance after another, and its `init` follows at once.
-An application that must know every instance it admitted is valid before any of them runs (a session that starts two
-roles, or an instance and its harness peer, together) cannot learn that from an instance whose `init` has already run:
-the first `init` may change what the instance behind it captures. `instanceHoldInit` of the instance configuration
-(default: hold nothing) is asked once per behavior instance, on the owner's thread, at exactly that point, and
-answering `True` holds the instance there. The owner goes on to the instances behind it, so nothing is parked. The
-application, having seen every instance come that far, releases them with `releaseHeldInstance`, and each begins on
-the owner's thread in its turn among the owner's jobs. What the question raises is a failure of the host.
+**Holding an instance after its construction.** `instanceHoldInit` (default:
+hold nothing) is asked once per behavior instance, on the owner's thread,
+after construction and before `init`. `True` holds the instance there while
+the owner goes on to those behind it, so an application can see every
+admitted instance validated before any runs, then release each with
+`releaseHeldInstance`. What the question raises is a host failure. Every
+transition is one transaction:
 
-A hold is a small state machine in the instance's cell, and every transition is one transaction:
+| State | Event | Result |
+| --- | --- | --- |
+| not held | the instance is validated | held: the rest of its start is registered **before** the application is asked |
+| held | the answer is `False` | the start runs at once; a racing release finds nothing |
+| held | `releaseHeldInstance` (any time after registration) | released: one job queued; answers `True` |
+| released | `releaseHeldInstance` again | nothing queued; answers `False` |
+| released | the job runs on the owner's thread | the start runs, unless the instance has stopped |
+| any | the instance settles or its owner is stopped | settles as stopped, `ShutdownSkippedNoInit`, no hook entered; a later release answers `False` |
 
-| State | Event | Next state | What happens |
-| --- | --- | --- | --- |
-| not held | the instance is validated | held (registered) | the rest of its start is registered **before** the application is asked, so a release can never arrive before there is something to release |
-| held (registered) | the answer is `False` | not held | the registration is taken back and the start runs at once; a release that raced the answer queued a job that will find nothing and do nothing |
-| held (registered) | the answer is `True` | held | the owner goes on |
-| held (registered) | `releaseHeldInstance`, at any time after the registration (including while the application is still being asked) | released | the release is recorded and its one job queued in the same transaction; the call answers `True` |
-| released | `releaseHeldInstance` again, from any thread | released | nothing is queued; the call answers `False`: one hold queues at most one job, however many releases are made |
-| released | the job runs on the owner's thread | not held | the start runs, unless the instance has stopped, in which case nothing runs |
-| any | the instance settles, or its owner is stopped | not held | a held or released instance settles as stopped with shutdown disposition `ShutdownSkippedNoInit` and none of its hooks entered; a later release is nothing and answers `False` |
-
-Isolation is the default: the instance ends and the owner's other instances run on. The engine cannot
-tell whether state the instances share was damaged, so the application is told of each failure on the
-owner's thread (`instanceEscalate`), after the instance has ended, and decides `Isolate` or `Escalate`,
-which fails the owner as a host failure does (`InstanceEscalated`) under its `WorkerPolicy`. A failure
-raised by application code is never an instance's failure; it ends the owner, unconverted, as it does for
-tasks. Cleanup is the engine's and nothing the application answers can hide it: what closing a coroutine
-raised, a closing handler the script defined included, is cleanup evidence on the owner's outcome and is
-fatal under any policy, as it is for a task, and it stays beside an instance's primary failure; a failure raised
-while an instance ends does not take a close's failure with it, a `shutdown` that raised a failure of the host is not
-started again when the owner's exit comes back to the instance, an instance whose coroutine the scheduler closed is ended
-from the owner's own code and not from inside the close, so a failure of the host that a hook raises is the owner's own
-failure and is never taken for a failure of the close, and when several instances' ends raise failures the first
-is the owner's and every other is kept whole as cleanup evidence. What an ending had counted survives a failure of the
-host in its hook.
+**Isolation is the default**: the instance ends and its peers run on. The
+application is told of each failure on the owner's thread
+(`instanceEscalate`), after the instance has ended, and answers `Isolate` or
+`Escalate`, which fails the owner as a host failure does
+(`InstanceEscalated`). A failure raised by application code is never an
+instance's failure: it ends the owner, unconverted. What closing a coroutine
+raised is cleanup evidence on the owner's outcome, fatal under any policy, and
+stays beside an instance's primary failure. When several instances' ends raise
+host failures, the first is the owner's and the rest are cleanup evidence.
 
 ### What an ending keeps
 
-An instance's ending is one record, made when it begins and kept until the instance settles: why it ends, its
-primary failure (the phase, the stage, the error and the traceback), what the ending revoked and discarded, and what
-became of `shutdown`. The hook's disposition is written once, when it is decided: not run because `init` never
-succeeded, skipped because Lua was not safe to enter, absent, started, or finished (returned, or raised a failure of the
-instance's code). A hook that was started and has not answered is recorded as started; if a failure of the host cut it
-short that is how it settles (`ShutdownRaised`, with no failure the instance can report), and coming back to the ending
-neither runs it again nor releases the instance's record in a VM that raised. Nothing is recomputed from the owner's mode
-afterwards.
+An ending is one record, made when it begins and kept until the instance
+settles: why it ends, its primary failure, what it revoked and discarded, and
+what became of `shutdown`. The hook's disposition is written once: not run
+because `init` never succeeded, skipped because Lua was unsafe to enter,
+absent, started, or finished. A hook cut short by a host failure settles as
+`ShutdownRaised` and is never run again.
 
-One function, `settleEnding`, settles an instance and tells the application of its failure, and every path that ends an
-instance reads the record through it: a stop of its own (`applyControl`, `continueStop`), an invocation that failed or a
-one-shot's `run` that completed (`invocationFailed`, `invocationCompleted`), an instance that failed at a hook
-(`failInstance`), a coroutine the scheduler closed (`instanceClosed`, ended from the owner's own code), the owner's
-retirement in order and after a failure or a cancellation (`retireInstances`, through `finishEnding`), an ending that a
-failure of the host interrupted and that retirement comes back to (`finishEnding` again, which finds the hook's record),
-and an ending that could not be carried through at all (`discardUnsettled`, which is the same function). A first failure,
-once recorded, is never replaced by anything later: not by the owner's exit, not by a hook that raised a failure of the
-host, not by the retirement. An instance with a failure in its record settles as failed, with that failure, its
-traceback and a failing `shutdown` beside it as secondary, whatever the owner's exit; one with none settles as discarded
-when the owner exited by a failure or a cancellation, or when its hook was cut short, and as stopped or completed
-otherwise. The failure of the host still ends the owner, unconverted, under its `WorkerPolicy`, and the way the owner first exited (a failure or a cancellation) is the way every instance left after it is discarded: what a later ending raises does not rewrite it. That is one function, `recordExit`, and it is the only thing that writes how the owner exits for its instances: the first failure or cancellation recorded wins, an exit in order gives way to the first of those, and a later cancellation, an interrupted close or a hook cut short is cleanup evidence on the owner's outcome and nothing else. Its callers are the owner's exit (from how its loop ended), the close of a coroutine the scheduler's own close interrupted, the scheduler's stop when it is interrupted, the close of a coroutine the scheduler did not close, and the retirement of an instance whose end raised; the owner's exit record (written once, as the owner exits) and the instances read the same first cause. An owner stopped in order is recorded as stopped, and a cancellation of its own teardown after that discards the instances as cancelled and leaves that record as it was written. Settling an instance and deciding that the application is told of it are one step a cancellation cannot cut between, and the hook's answer is recorded in a step it cannot cut either. The application is told of
-a failed instance exactly once, by whichever path settles it (an owner that is exiting is told too: what it answers is
-not raised, because the owner's own failure is what it exits with, and what telling it raised is kept as cleanup
-evidence beside that failure).
+Every path that ends an instance settles it through one function,
+`settleEnding`. An instance with a failure in its record settles as failed
+whatever the owner's exit; one with none settles as discarded when the owner
+exited by failure or cancellation or its hook was cut short, and as stopped or
+completed otherwise. How the owner exits for its instances is written by one
+function, `recordExit`: **the first failure or cancellation recorded wins**,
+and a later cancellation, interrupted close or cut-short hook is cleanup
+evidence only. The application is told of a failed instance exactly once; an
+exiting owner is told too, but its answer is not raised.
 
 ### Control
 
-`requestInstanceControl` asks that an instance pause, resume or stop, and answers at once, from any
-thread: `InstanceControlAccepted` with a receipt, `InstanceControlFull`, `InstanceControlClosed` or
-`InstanceControlUnknown` (another owner's identity, an ended or never issued instance). An accepted
-request holds a reservation until its settlement is observed or abandoned
-(`boundInstanceControls`), and settles exactly once, as applied, already in that state, or no longer
-applicable, including when the instance or the owner ends first. Requests are applied in the order accepted,
-at the owner's next safe boundary: the owner's thread services them at each of the scheduler's boundaries,
-before the first segment of a turn and after every segment, when no task is running, after the scheduler's own work
-at that boundary, and never inside a segment.
-Pause and resume of the invocation in flight, and stop, are done to its task directly, at that boundary,
-with no scheduler request, reservation or queue between: a request settles as it is applied, before anything that
-can raise a failure of the host. An invocation that has not run a segment has nothing to freeze or close, even when
-the scheduler holds it in its queue behind slots that stay occupied: pausing takes it back, with its event, to be
-started on resume (the task the scheduler holds is used again when the invocation is the same, so pausing and
-resuming over and over admits nothing new), and a stop discards it as an unstarted invocation. (A task the scheduler holds in its admission queue cannot be
-withdrawn from it: an instance that took one back leaves at most one such task, which does nothing when chosen and
-is used again by the same invocation, and it holds a queue place and a stored-result place until then.) Until it runs, an
-invocation holds its place in the instance's queue, so taking it back never overfills the queue; a one-shot's `run`
-is no event and holds none. It is owed from the success of the instance's `init` until its first segment begins,
-whatever became of it meanwhile (taken by the scheduler and queued, refused for want of a place or a queue place,
-taken back by a pause, held while paused): the instance has one record of that, and an ending of any kind (a stop, a
-failure, the owner's retirement or cancellation) counts it once among the unstarted invocations it discards. An owner that has been asked to stop services
-nothing more: its exit settles what was left. The scheduler's own task controls do not reach an instance's
-invocation, whatever the application learned of its identity: they answer unknown, and the instance layer is
-the only thing that pauses, resumes or stops it.
+`requestInstanceControl` asks an instance to pause, resume or stop and
+answers at once from any thread: `InstanceControlAccepted` with a receipt,
+`InstanceControlFull`, `InstanceControlClosed` or `InstanceControlUnknown`. An
+accepted request holds a reservation (`boundInstanceControls`) until observed
+or abandoned and settles exactly once: applied, already in that state, or no
+longer applicable. Requests are applied in acceptance order at the owner's
+next safe boundary, never inside a segment, and a request settles as it is
+applied, before anything that can raise a host failure. An owner asked to stop
+services nothing more. The scheduler's own task controls do not reach an
+instance's invocation: they answer unknown.
 
-- **Pause** stops new invocations from starting and freezes the invocation in flight, if any, suspended
-  where it is, running nothing, however its wait would have ended. Accepted events stay in the queue, in
-  order.
-- **Resume** lets it go on: a suspended invocation finishes before another starts, then the retained
-  events run in the order they were accepted and new ones behind them. It does not undo a stop.
-- **Stop** works while paused and takes precedence over ordinary work. It closes the instance's
-  admission, revokes its connections, discards what had not begun and counts it (an invocation stopped before its first segment is one
-  of those, not a coroutine closed), closes the coroutine of
-  the invocation in flight on the owner's thread and never resumes it, and only then runs `shutdown`. The
-  request's result says the stop was taken; its completion is the instance's settlement, written after the
-  hook and the release. A stop ends an instance as it is applied unless a hook raises a failure of the host, so a
-  second request finds it ended and settles as no longer applicable. Repeated requests are safe and never
-  resurrect an instance or run `shutdown` again.
+| Request | Effect |
+| --- | --- |
+| pause | No new invocation starts; the one in flight is frozen where it is. Accepted events stay queued in order. An invocation not yet begun is taken back, with its event, to start on resume |
+| resume | A suspended invocation finishes first, then retained events in order. It does not undo a stop |
+| stop | Works while paused and takes precedence. Closes admission, revokes connections, discards and counts what had not begun, closes the in-flight coroutine on the owner's thread without resuming it, then runs `shutdown`. Repeats are safe |
 
-Whole-owner control (`retireScheduled`) is distinct. An orderly retirement stops each live instance
-through the same path with the reason `stopped` before the VM is closed. An owner that fails or is
-cancelled does not enter Lua for its instances again: no `shutdown` runs, which the settlement reports
-(`ShutdownSkippedUnsafe`), and each instance settles as discarded. That includes an owner whose retirement is
-itself failing: once an instance's `shutdown` raises a failure of the host, or a close or hook is cut short as a
-cancellation is, the instances after it are discarded with the owner's exit, not stopped. A lifecycle binding a script
-calls answers a typed `NotYetSupported` fault from an owner that was granted nothing; an owner that was granted lifecycle
-services gives its scripts these same controls (see [Lifecycle services](#lifecycle-services)).
+An invocation is owed from the success of `init` until its first segment
+begins; any ending counts it once among the unstarted.
+
+Whole-owner control (`retireScheduled`) is distinct: an orderly retirement
+stops each live instance with `stopped` before the VM closes. **An owner that
+fails or is cancelled does not enter Lua for its instances again**: no
+`shutdown` runs (`ShutdownSkippedUnsafe`) and each settles as discarded,
+including the instances after one whose `shutdown` raised a host failure.
 
 ### Results, inspection and idle
 
-Every accepted instance settles exactly once (`InstanceSettlement`): completed, stopped, failed or
-discarded, with what its end revoked and released (`Termination`: the connections revoked, the unstarted
-invocations discarded, the invocations that began and were closed, and what became of `shutdown`). A
-failing `shutdown` is kept and never retried, runtime cleanup still happens, and an instance that would
-have completed or stopped is failed by it; a primary failure stays primary, with its traceback, on every path
-that ends an instance, including one a failure of the host interrupted (see *What an ending keeps*), and the
-disposition of `shutdown` is the one recorded when it was decided. Observing, abandoning and
-waiting work as for tasks (`pollInstance`, `waitInstance`, `awaitInstance`, `forgetInstance`), and a
-ticket nobody observes or forgets keeps its reservation, which bounds the retained results.
-`inspectInstance` and `inspectInstances` answer bounded, coherent snapshots (`InstanceSnapshot`), each
-read in one transaction, and never borrow a Lua table.
+Every accepted instance settles exactly once (`InstanceSettlement`):
+completed, stopped, failed or discarded, with its `Termination` (connections
+revoked, unstarted invocations discarded, begun invocations closed, the
+`shutdown` disposition). A failing `shutdown` is kept, never retried, and
+fails an instance that would have completed or stopped. `pollInstance`,
+`waitInstance`, `awaitInstance` and `forgetInstance` work as for tasks; an
+unobserved ticket keeps its reservation. `inspectInstance` and
+`inspectInstances` answer coherent `InstanceSnapshot`s, each read in one
+transaction.
 
-Everything the owner does for an instance is a response to something: an admission, an event, a request,
-a grant, a deadline or a stop, or room appearing in the scheduler's queue or results for an invocation it had none for, which the owner tries again
-at the boundary where room appears (every boundary gives back what ended invocations held first), so the order of
-invocations does not depend on where turns are cut even when the scheduler's result places are all taken. Its wait is
-the scheduled owner's one STM wait with the instance layer's jobs added, so an owner whose instances are all paused, waiting or idle enters no Lua and does no periodic
-work until one of those arrives.
+Everything the owner does for an instance responds to something, so an owner
+whose instances are all paused, waiting or idle enters no Lua.
 
 ### Determinism
 
-On one owner with a fixed configuration and policy, the same admitted instances, grants, delivered events
-and control requests, each made at the same logical point (while the owner awaits the next grant), give
-the same order of invocations and of effects recorded through a binding, however long the segments take,
-whenever timers fire and whether budgets expire. It holds for logical-time workloads: elapsed waits
-legitimately change readiness, as do elapsed-interval updates, which depend on real time and are tested
-against the injected clock. The order of logical updates among an instance's other invocations, and the
-`dt` each receives, are among what is the same. An event delivered to a connection, or an arrival-admitted request, that arrives in the middle of
-a step is not ordered logically (a provider's event is: see [Provider events](#provider-events)). A control admitted logically is: see [Logical admission](#logical-admission).
-
-### What proves it
-
-`Test.LuaRuntime.Instance.*`, in `lua-runtime-tests`, run real instances on real supervised scheduled
-owners under the injected clock and fake timer of the scheduled-owner examples, with gates and STM signals
-instead of sleeps: an instance's own `self` and the module it shares, one-shots, identity and snapshots, idle; a failed `init`
-and the hooks that cannot suspend, a failed callback, a failed `shutdown`, the application's escalation, a failure of the
-host and the evidence of a failed close; events during `init`, a full queue, every refusal, and what an accepted event
-keeps; pause and the order resume restores, stop while paused, contradictory and refused requests; what each way
-of ending revokes and counts, retirement, cancellation and the instances an owner never began; every bound and a
-configuration that does not fit; and one workload run under different segment costs and service budgets; the cadence's examples
-(`Test.LuaRuntime.Instance.Cadence` and `.Elapsed`): an interval's exact conversion and its refusals,
-the first update one interval after `init` and the duration granted since the previous one finished, a
-callback that waits across a due tick (the regression for a deadlock the first review of LUA-24 found), a
-due update's place in the queue and its tick released when it cannot start, pause and stop settlement of a
-due update, elapsed refreshes coalesced after a stall and rebased at a resume, the owner's one timer shared
-by instances and an ordinary waiter with a stale wake, and the checked arithmetic; and a sweep of what ended the owner first (a failure of the host, a failing script its escalation made the owner's, a stop, a cancellation) by what happened to its teardown (a close interrupted, a hook cut short as a cancellation is, nothing but an idle peer), holding the instances, the exit record and supervision to one cause, with the two paths of it that only an interrupted close of a task inside a segment, and a cancelled escalation, reach; a matrix of what first happened
-to an instance (a Lua error in a callback, a failure of the host, nothing) by what its `shutdown` does (returns, raises, raises a
-failure of the host) by how it ends (its own stop, the owner's retirement, the owner's teardown), each cell holding the settlement, the
-owner's exception and the application's notification to one model. Every wait in these examples is for a signal the code
-under test sets (a settlement, a terminal status, the notification the escalation makes, a diagnostic that says an invocation was queued or refused, the wait a grant is for
-having been taken), never for an ordering the test assumes. The
-cancellation and shutdown windows are the kind an asynchronous-exception race can hide on one platform, so CI, which
-runs them on Linux, is the evidence for them and a local pass is not.
-
+On one owner with a fixed configuration and policy, the same admitted
+instances, grants, delivered events and control requests, each made at the
+same logical point, give the same order of invocations and binding effects,
+and the same `dt`s, whatever segments cost and whether budgets expire.
+Elapsed waits and elapsed-interval updates are excluded. An event to a
+connection, or an arrival-admitted request, that arrives mid-step is not
+ordered logically; a provider's event is ([Provider events](#provider-events)),
+and so is a control admitted logically ([Logical admission](#logical-admission)).
 ## Instance leases
 
-`Hetoimasia.Scripting.Lua.Lease` (LUA-22, in `runtime-lua`) makes the resources a binding acquires for
-a script instance the engine's, so that cleanup is correct however the script behaves. It implements the
-accepted [instance contract's](../../docs/lua_instance_contract.md) "Automatic resource ownership"
-(D-26, D-27) on the capability-owned collection an owner lends to its callbacks
-([Lending a collection](#lending-a-collection), D-32). A script that raises before storing a handle,
-overwrites it, never stores it, or defines no `shutdown`, or a `shutdown` that fails, still has what
-it acquired released when its instance ends, and no Lua-written cleanup is ever required. **A binding
-that needs the script to clean up after it, whose ownership and retirement cannot be described, or that
-exposes a native lifetime for Lua to manage, is not qualified for this interface.**
+`Hetoimasia.Scripting.Lua.Lease` (in `runtime-lua`) makes the resources a
+binding acquires for a script instance the engine's, over the collection an
+owner lends its callbacks ([Lending a collection](#lending-a-collection)).
+What an instance acquired is released when it ends, however the script
+behaved, and no Lua-written cleanup is ever required. **A binding that needs
+the script to clean up after it, whose ownership and retirement cannot be
+described, or that exposes a native lifetime for Lua to manage, is not
+qualified for this interface.**
 
 ### The scope and the lent capability
 
-Each instance has a *scope* the engine makes before its first hook and dissolves when the instance
-settles. It lives in Haskell, in the state of the owner's `Leases` handle; `self`, a module's globals
-and every other Lua value cannot erase, replace or forge it, because none of them can reach it. A script
-holds only *handles*: capabilities whose key names a lease, issued by the VM and checked by the value
-boundary before a binding's action runs ([Handles](#handles)).
+Each instance has a *scope*, made before its first hook and dissolved when it
+settles. It lives in Haskell, in the owner's `Leases` handle, where no Lua
+value can reach it. A script holds only *handles*: capabilities whose key
+names a lease, checked by the value boundary ([Handles](#handles)).
 
-One owner has one collection, and each instance's scope keeps its own bookkeeping over it, so what one
-instance holds is never another's to release. A binding's operations run on its callback's thread,
-through the capability the owner lent for that callback; the drain at an instance's end runs on the
-owner's thread, through the capability the owner holds. Nothing assumes a binding runs on the owner's
-thread, and `init` and `shutdown` are callbacks like any other, so a binding can acquire inside both.
-
-The application makes the handle over its `Lending`, closes its bindings over it, and gives the owner
-both:
+One owner has one collection, with per-instance bookkeeping over it. A
+binding's operations run on its callback's thread through the lent
+capability; the drain at an instance's end runs on the owner's thread.
+`init` and `shutdown` are callbacks, so a binding can acquire inside both.
 
 ```haskell
 lending ← newLending
@@ -3383,1595 +2033,1171 @@ leases  ← newLeases lending 8      -- at most 8 charges for each instance
 spec = (scheduledSpec vm worker bounds)
   { scheduledInstances = Just instanceConfig
   , scheduledLending   = Just lending
-  , scheduledLeases    = Just leases
-  }
+  , scheduledLeases    = Just leases }
 ```
 
-An owner is refused before anything starts, naming every violation (`LeasesRefused`), if it hosts no
-instances, lends no collection, lends through a different handle than the leases were made over, or has
-a `scheduledMemberLimit` too small to hold every live instance at the capacity. A handle serves one owner,
-because the `Lending` it is made over does.
+An owner is refused before anything starts (`LeasesRefused`, every violation
+named) if it hosts no instances, lends no collection, lends through a
+different handle, or has a `scheduledMemberLimit` too small for every live
+instance at capacity.
 
 ### Reserving, acquiring and registering
 
-`acquireOwned` and `acquireShared` do three things, in this order, before they return, and none can be
-left half done:
+`acquireOwned` and `acquireShared` do three things in order before returning:
 
-1. **Reserve** one charge of the instance's capacity, before any stage runs. Exhausting the capacity is
-   an *engine* refusal of the calling invocation, below.
-2. **Acquire** through a staged `Assembly`, with every guarantee of the foundation collection: a failing
-   stage rolls back exactly the stages that completed, registers nothing and gives Lua no handle. The
-   constructor's own failure is a failure of application code, so it ends the owner under its
-   `WorkerPolicy`, unconverted, as any binding's does; a binding author who wants a recoverable refusal
-   returns it as bounded data. A rollback whose release fails is a cleanup failure.
-3. **Register** the obligation in the masked step that registered the member, so a cancellation or a
-   failure to publish the call's result cannot land between having the resource and having a record of
-   it.
+1. **Reserve** one charge of the instance's capacity, before any stage runs.
+2. **Acquire** through a staged `Assembly`, with the foundation collection's
+   guarantees: a failing stage rolls back the completed stages, registers
+   nothing and gives Lua no handle. The constructor's own failure is an
+   application failure and ends the owner; an author who wants a recoverable
+   refusal returns it as data. A failing rollback release is a cleanup
+   failure.
+3. **Register** the obligation in the masked step that registered the member.
 
-Only then does the action have a `Lease` to turn into a handle (`leaseHandle`). There is no interval
-in which Lua holds a resource whose cleanup depends on the script's next statement. A result that cannot
-be published (the call returned more values than the binding declares, say) leaves the lease
-registered and drained with the instance.
+Only then is there a `Lease` to turn into a handle (`leaseHandle`). A result
+that cannot be published leaves the lease registered and drained with the
+instance.
 
 ### Capacity and its refusal
 
-Capacity is bounded for each instance (`newLeases`). It counts every resource the instance holds *and*
-every released resource whose provider has not yet proved it retired, so a script cannot grow what is
-outstanding without limit by acquiring and releasing in a loop. An acquisition over it is refused by
-the engine, before any stage runs and before anything is charged:
-
-* the refusal is raised unmarked as application code, so it is a fault of the call
-  (`BindingRefused`, decision C1) and never a failure of the host, whatever the script does with the
-  Lua error it sees, a `pcall` included;
-* the invocation is faulted even though the script caught the error, so the instance fails (isolated,
-  as a faulted invocation is) and the owner goes on;
-* nothing converts an exception the `Assembly` throws: capacity is checked before the assembly runs
-  and only the engine can raise the refusal.
+Capacity is per instance (`newLeases`) and counts every resource held *and*
+every released resource whose provider has not yet proved it retired. An
+acquisition over it is refused by the engine before any stage runs: a fault
+of the call (`BindingRefused`), never a host failure. **The invocation is
+faulted even if the script caught the error**, so the instance fails and the
+owner goes on.
 
 ### Instance versus application leases
 
-The binding author chooses:
+- `acquireOwned`: the instance owns what the assembly builds; releasing the
+  lease destroys it.
+- `acquireShared label take drop`: the instance takes an interest in a
+  resource that lives on with its owner; releasing runs `drop` only.
 
-* `acquireOwned`: the instance owns what the assembly builds, and releasing the lease destroys it.
-* `acquireShared label take drop`: the instance takes an interest in a resource that lives on with its
-  owner (a shared asset, a world object). Releasing the lease runs `drop` and nothing else; another
-  instance's lease on the same asset, and the application's own, are untouched.
-
-A handle stays owned by the instance that acquired it. Caching it in a module's global or in another
-instance's `self` does not extend its lifetime: when the acquiring instance ends every later use is
-refused as retired (`RuleRetiredHandle`), and keys are issued in order and never again, so the capacity
-an ended lease gave back cannot make the old handle live. Using it from another instance while its
-owner lives is refused by the engine (`BindingRefused`). Longer-lived ownership than a lease is out of
-scope.
+A handle stays owned by the acquiring instance. Caching it elsewhere does not
+extend its lifetime: after that instance ends every use is
+`RuleRetiredHandle`, and keys are never reissued. Using it from another
+instance while its owner lives is `BindingRefused`.
 
 ### Using a handle
 
-The value boundary has already checked that a handle was issued by this VM, is of the declared type and,
-through `leaseLive` (declare the type with `leaseCapabilityType`), that its lease has not ended.
-`withLease leases key action` borrows the held resource for the action, under the collection's borrowing
-rules, and is refused for a lease of another type or another instance.
-
-`withLeaseOr leases key refused action` is the same borrow with the refusal handed back as data: it decides and borrows in
-one step on the calling thread, and for a lease that has ended, another instance's or of another type it calls `refused` with
-the same bounded reason `withLease` raises as a fault of the call, instead of raising. A binding that opted in to
-[recoverable refusals](#recoverable-refusals) turns that text into an ordinary Lua error with its action never run (the scene
-preparation of LFE-19 does), so a script's use of a peer's texture is a refusal `pcall` catches rather than a fault of the call. What the
-borrow itself raises (a loan that has ended, a defect, a cancellation) is raised as for `withLease`.
+Declare the type with `leaseCapabilityType`, so the value boundary checks
+liveness through `leaseLive`. `withLease leases key action` borrows the
+resource for the action and is refused for a lease of another type or
+instance. `withLeaseOr leases key refused action` hands the same refusal back
+as data, so a binding opted in to
+[recoverable refusals](#recoverable-refusals) can make it an ordinary Lua
+error.
 
 ### Early release and its answers
 
-A script may release a handle early through a binding built with `releaseOperation`
-([Handles](#handles)), whose action calls `releaseLease`:
+A script may release early through a binding built with `releaseOperation`,
+whose action calls `releaseLease`:
 
 | Answer | Meaning |
 |---|---|
-| `Released` | The first release; the resource is retired. |
-| `Retiring` | The lease is revoked and the provider's retirement is pending. A repeated release answers it again and restarts nothing. |
-| `AlreadyReleased` | The lease ended whole earlier. Nothing ran. |
+| `Released` | the first release; the resource is retired |
+| `Retiring` | the lease is revoked and the provider's retirement is pending; a repeat answers it again |
+| `AlreadyReleased` | the lease ended whole earlier; nothing ran |
 
-A release whose native cleanup failed answers none of them. Its failure is retained on the lease, is
-the answer to every later release of it, never runs the cleanup again, and ends the owner as cleanup
-failures do. An invalid or missing Lua value is an ordinary argument error and never prevents the
-engine from cleaning up the instance's other holdings. A closing handler a script defined runs as the
-instance whose invocation it is, so it may release a handle it holds.
+A release whose native cleanup failed answers none of them: the failure is
+retained on the lease, answers every later release, never reruns the cleanup,
+and ends the owner.
 
 ### Draining and its failure evidence
 
-On every path by which an instance ends (a failed `init`, a stop, a faulted invocation including a
-failure of a closing handler, a one-shot's completion, the owner's retirement or cancellation, and a
-`shutdown` that is absent or raises) the instance's remaining holdings are released on the owner's
-thread after its `shutdown` has run or been skipped, newest acquisition first and each one's parts in
-the order its assembly declared. Handles stay usable inside `shutdown`. A release that fails does not
-stop the others from being attempted. Draining runs no Lua, so it also runs when Lua is no longer safe
-to enter, and when a failure of the host in `shutdown` is what ends the owner: the instance is drained
-and, if a provider has yet to retire something, parked all the same, so nothing is left live for the
-collection's own close, where nothing would wait for its provider.
+On every path by which an instance ends, its remaining holdings are released
+on the owner's thread after `shutdown` has run or been skipped, newest
+acquisition first, each one's parts in assembly order. Handles stay usable
+inside `shutdown`. A failing release does not stop the others. **Draining runs
+no Lua**, so it also runs when Lua is unsafe to enter.
 
 A release failure is a cleanup failure:
 
-* it is kept beside the instance's primary failure, which stays primary, in the settlement
-  (`failureSecondary`, stage `StageRelease`), and is the instance's failure when there is none. That
-  includes a rollback release that failed while a constructor was failing: the constructor's exception
-  stays the owner's failure, as an application failure, and the rollback failure is kept for the
-  instance beside it;
-* it is cleanup evidence on the owner's outcome, so it ends the owner at once through supervision and
-  is fatal under every policy, an `Optional` owner whose classifier recognizes every exception
-  included. At once means at the boundary where it was observed: admission, grants and control close
-  and the scheduler is asked to stop, so no queued invocation or `init` begins after it, and the owner
-  exits as a failure from that moment: the instances still to end have no `shutdown` run and no Lua
-  entered, and their holdings are drained all the same, settling or awaiting what is left as any exit
-  does;
-* it is never retried and never reported as reclaimed. `resultLeases` counts what the end released,
-  waited for and saw fail.
+- it is kept in the settlement (`failureSecondary`, `StageRelease`) beside
+  the primary failure, or is the instance's failure when there is none;
+- it is cleanup evidence on the owner's outcome: **fatal under every policy**,
+  ending the owner at the boundary where it was observed. No queued invocation
+  or `init` begins after it, the remaining instances get no `shutdown`, and
+  their holdings are drained all the same;
+- it is never retried and never reported as reclaimed (`resultLeases` counts
+  what the end released, waited for and saw fail).
 
 ### Retained retirement
 
-A resource retired by a provider that finishes later does not wait inside the collection's
-uninterruptible release (`docs/resources.md`, "What a release may do"). The assembly's release hands the
-resource over and records the obligation with `retireAsynchronously retirements label reading`, where
-`reading` is an STM transaction that says `ProviderPending`, `ProviderComplete` or `ProviderFailed`. It is
-application code and may throw, when it is run or when what it answered is first inspected: either is
-that retirement failing, retained as cleanup evidence while every independent retirement is still served
-and awaited, and a reading that retries says it is not done. A reading only reads: what it writes is not kept,
-and it may read TVars that other readings share or that the provider's own thread writes. The engine polls it
-inside a transaction that has read state already, so when another thread commits to what both read, the poll
-starts again from a consistent view and runs the reading once more, rather than running it again and again
-against the stale one; that holds under the build and runtime settings the repository already has, and is the
-same one reading (`Hetoimasia.Scripting.Lua.Retention.pollObligation`) for leases, requests and subscriptions.
-The same holds for every other call into
-provider or application code the retirement makes (a deferred disposal, the application's escalation of
-an instance's failure, the Lua `release` hook, rendering an exception for the settlement): each is run
-through one guard that answers the failure instead of raising it, with what it answered evaluated inside
-that guard, and a failure of one is recorded while the independent ones go on. No failure is dropped:
-where several arise together (several endings settling at once, several releases of a drain, several
-retirements failing in one reading) the first is raised and every other is kept whole as cleanup evidence
-on the owner, so supervision receives each of them. The lease keeps its charge until the provider says it is done. The reading, the guard, the held
-disposals and their rules are one primitive, `Hetoimasia.Scripting.Lua.Retention`, which the request service
-uses for its provider work too (see [Asynchronous requests](#asynchronous-requests)); a lease's behavior is
-unchanged by that. The owner awaits it outside
-the collection, in its own protected lifetime:
+A resource retired by a provider that finishes later does not wait inside the
+collection's uninterruptible release. The assembly's release hands the
+resource over and records the obligation with `retireAsynchronously
+retirements label reading`, where `reading` is an STM transaction answering
+`ProviderPending`, `ProviderComplete` or `ProviderFailed`. **A reading only
+reads** (what it writes is not kept); a reading that throws is that
+retirement failing. The primitive is `Hetoimasia.Scripting.Lua.Retention`
+(`pollObligation`, one guard, held disposals), shared with requests and
+subscriptions. Every call into provider or application code that retirement
+makes goes through the one guard, which answers a failure instead of raising
+it; where several arise together the first is raised and the rest kept whole
+as cleanup evidence.
 
-* the instance's stop completion settles only after its obligations have completed; until then it is
-  `Stopping`, and nothing is reported as reclaimed merely because Lua stopped;
-* the owner stays live, with everything its exit keeps, through a stop and through a cancellation, as a
-  stuck segment keeps it, until the provider has proved completion;
-* what a retirement needs is handed to it, not disposed: the release of the part that owns a dependency
-  calls `afterRetirement disposal`, ranked after the parts being retired, and the engine runs the disposal
-  once every retirement the lease has recorded has completed, uninterruptibly on the owner's thread and
-  before the stop completion settles (at once, inside the release, if none is pending), so a dependency is
-  never disposed under a retirement still using it. If a provider reports its retirement failed the disposal
-  never runs: the dependency is retained, as the resource is. A disposal that fails is cleanup evidence
-  and is retained on the lease, whose every later release answers that failure and runs nothing again;
-* a retirement the provider reports failed is retained as cleanup evidence and is fatal, and the lease
-  it belonged to answers that failure and never success;
-* a stage rolled back whose provider has not finished keeps its charge, and the owner's life, though the
-  constructor failed.
-
-### What is not here
-
-Real providers (a request's provider and its retirement are [Asynchronous requests](#asynchronous-requests)), GPU or native game bindings, rollback of committed effects
-(D-7), a longer-lived ownership API than the lease boundary, and the update cadence of LUA-24, which
-is described under [Cadence](#cadence).
-
-### What proves it
-
-`Test.LuaRuntime.Instance.Lease.*`, in `lua-runtime-tests`, run real instances on real supervised
-scheduled owners that lend their collection and hold leases, with fake resources and a fake provider and
-no Lua cleanup code in any module: acquisition from `init`, a callback and `shutdown`; handles lost, overwritten or
-never stored; a constructor that fails part way, and a rollback whose release fails; the capacity and the
-engine's refusal, which a `pcall` does not turn into a host failure; a result that cannot be published; a
-shared asset surviving one instance's exit and a cached handle staying retired; early and repeated
-release, the retired handle accepted only by the release operation and refused by every other, and a failing
-release; the drain on each way an instance ends, newest first and past a failing release, with the failure
-beside the primary one and fatal under both a required and an optional policy; and a provider's retirement
-that holds the stop completion, the capacity and the owner's life through a stop and a cancellation. The
-release operation and the engine's refusal are also pinned in `lua-host-tests`. The cancellation and
-cleanup windows are the kind an asynchronous-exception race can hide on one platform, so CI, which runs
-them on Linux, is the evidence for them and a local pass is not.
+- The lease keeps its charge until the provider says it is done.
+- The instance's stop completion settles only after its obligations complete;
+  until then it is `Stopping`.
+- The owner stays live, through a stop and a cancellation, until the provider
+  has proved completion.
+- A dependency a retirement needs is handed over with `afterRetirement
+  disposal`: run once every retirement the lease recorded has completed,
+  uninterruptibly on the owner's thread, before the stop completion settles.
+  **If a retirement fails the disposal never runs.**
+- A failed retirement or disposal is cleanup evidence, fatal, and retained on
+  the lease.
+- A rolled-back stage whose provider has not finished keeps its charge.
 
 ## Lifecycle services
 
-`Hetoimasia.Scripting.Lua.Lifecycle` (LUA-23, in `runtime-lua`) lets a script instance's code ask that an
-instance pause, resume or stop, and read snapshots of instances, across owners of one `LuaRuntime`. It builds
-on the instance layer, the capability-owned collection and the instance cadences, and reopens none of their
-contracts. It is available to the application's scripts only where the application grants it, and a grant is
-the whole of the authority.
+`Hetoimasia.Scripting.Lua.Lifecycle` (in `runtime-lua`) lets a script ask that
+an instance pause, resume or stop, and read snapshots of instances, across
+owners of one `LuaRuntime`, only where the application grants it.
 
 ### Granting
 
-A `LifecycleGrant`, given to an owner as `scheduledLifecycle`, names the owners its scripts may reach
-(`GrantTarget`: `GrantedEndpoint` of another owner of the same runtime created earlier, or `GrantedSelf`), what
-each permits (`PermitInspect`, `PermitControl`) and two bounds (`grantReceiptBound`, `grantSnapshotBound`, each at
-least one; 32 and 64 by `lifecycleGrant`). It is validated before anything starts, and a grant that does not
-make sense is refused, naming every reason, as `LifecycleRefused`: a bound below one, too many or a repeated owner,
-no permits or a repeated one, an owner of another runtime, an owner that hosts no instances, a permitted control
-of an owner that admits logically with no assignment, and an assignment for an owner that does not.
+A `LifecycleGrant` (`scheduledLifecycle`) names the owners its scripts may
+reach (`GrantedEndpoint` of an earlier owner of the same runtime, or
+`GrantedSelf`), what each permits (`PermitInspect`, `PermitControl`) and two
+bounds (`grantReceiptBound` 32 and `grantSnapshotBound` 64 by
+`lifecycleGrant`). A grant that does not make sense is refused before
+anything starts (`LifecycleRefused`, every reason named).
 
-The bindings (`lifecycleBindings`, `lifecycleNamespace`) are registered once, in one `Registration` that any
-number of owners with different grants share, and exposed by an owner's policy like any namespace. Which owner
-is calling is not read from the script: the engine hands each owner's own state to its bindings through the host
-library's `LifecycleContext` (`lifecycleOperationIn`), set from the owner's configuration, so an inspection-only
-owner cannot control, a control-only owner cannot inspect, and an owner with no grant keeps the typed
-`NotYetSupported` fault with its action never run, whichever registration it was given. The calling instance is
-the one whose Lua the owner is running, and the calling task the one whose segment it is. The host library still
-depends on no runtime package, and a lifecycle binding a finalizer may call is never delivered.
+The bindings (`lifecycleBindings`, `lifecycleNamespace`) are registered once
+and shared by owners with different grants. Which owner is calling is never
+read from the script: each owner's state reaches its bindings through the
+host's `LifecycleContext`. An owner with no grant keeps the `NotYetSupported`
+fault.
 
 ### What a script calls
 
-Identities are plain data: a TID is the record `{runtime, owner, id}` and an owner reference `{runtime, owner}`, all
-integers (`instanceIdValue`, `ownerRefValue` make them). They name and grant nothing: a script can forge any
-number, and reaches exactly what its grant covers.
+Identities are plain data: a TID is `{runtime, owner, id}`, an owner
+reference `{runtime, owner}` (`instanceIdValue`, `ownerRefValue`). They grant
+nothing: a script can forge any number and reaches exactly what its grant
+covers.
 
 | Call | Answers |
 |---|---|
 | `pause(tid)`, `resume(tid)`, `stop(tid)` | `{accepted = true, receipt = n}` or `{accepted = false, refusal = reason}` |
-| `result(n)` | `pending`, or one of `applied`, `already_in_state`, `no_longer_applicable`, or `unknown_receipt` |
+| `result(n)` | `pending`, `applied`, `already_in_state`, `no_longer_applicable` or `unknown_receipt` |
 | `forget(n)` | whether the receipt was held |
-| `inspect(tid)` | `{ok, refusal?, snapshot?}`: the TID, the owner's label, the name and the status |
-| `inspect_owner(ref)` | `{ok, refusal?, instances, truncated}`, in order of identity |
-| `owners()` | `{owners, truncated}`: the covered owners with their label and what each permits |
+| `inspect(tid)` | `{ok, refusal?, snapshot?}` |
+| `inspect_owner(ref)` | `{ok, refusal?, instances, truncated}`, in identity order |
+| `owners()` | `{owners, truncated}` with each label and permits |
 | `self()` | the calling instance's TID, or nil |
 
-There is no call that controls an owner as a whole.
+No call controls an owner as a whole.
 
 ### Requests and refusals
 
-A request never blocks, and every refusal is an answer, never a fault. They are decided in this order, and the order is
-the contract: `unauthorized` (the owner is outside the grant, or the grant does not permit the operation there: nothing is
-tested of the target, so an owner outside the grant, another runtime's identity and an identity never issued answer
-alike; it is also the answer to a request made when no instance's code and no task's segment is running, such as an
-initial chunk's or a module's top level, which has no caller to read its answer or to abandon it); for a target admitting logically, `unassigned` (the application is asked for the request's place once the grant
-has passed it, and gave none); `full` (the caller already holds as many receipts as its grant allows); `closed` (the
-target's owner is stopping or has exited); `unknown_target` (within the authorized owner, no live instance has the
-identity: ended, stale or never issued); for a target admitting logically, `late` (the tick has begun) and `duplicate`
-(the place is taken); and `full` (the target's owner holds every result reservation it may). Inspection is refused as
-`unauthorized`, `closed` and `unknown_target`, in that order. Routing is by identity and never by label, so two owners with one label
-are told apart. A request that is accepted reserves its result at the target before it is accepted, and the receipt at
-the caller in the same transaction.
+A request never blocks, and every refusal is an answer, never a fault.
+Refusals are decided **in this order**:
+
+1. `unauthorized`: the owner is outside the grant or the operation is not
+   permitted there (nothing is tested of the target), or no instance's code
+   and no task's segment is running;
+2. `unassigned` (logical targets): the application gave the request no place;
+3. `full`: the caller holds as many receipts as its grant allows;
+4. `closed`: the target's owner is stopping or has exited;
+5. `unknown_target`: no live instance has the identity;
+6. `late` and `duplicate` (logical targets): the tick has begun; the place is
+   taken;
+7. `full`: the target's owner holds every result reservation it may.
+
+Inspection is refused as `unauthorized`, `closed`, `unknown_target`, in that
+order. Routing is by identity, never by label. An accepted request reserves
+its result at the target and its receipt at the caller in one transaction.
 
 ### Receipts
 
-An accepted request settles exactly once: `applied`, `already_in_state`, or `no_longer_applicable` (the instance ended
-first, a stop superseded it, or its owner stopped, failed or was cancelled first). A receipt is held until it is read
-once settled (reading consumes it and gives the reservation back; any later read answers `unknown_receipt`), forgotten
-(the reservation comes back when the request settles), or abandoned: when the instance that made the request ends, when
-a task that made it ends, and when the caller's owner exits. A closing handler a script defined runs as the instance or task
-whose coroutine is being closed, so it asks and reads as that caller and what it asked is abandoned with it. Only the instance or task that made a request reads its
-receipt. Abandoning interest never undoes a request already accepted: it is still applied, or settled, by its target.
-The engine keeps no other history of results; what is held is bounded by `grantReceiptBound`.
+An accepted request settles exactly once: `applied`, `already_in_state` or
+`no_longer_applicable`. A receipt is held until read once settled (reading
+consumes it), forgotten, or abandoned when the instance or task that made it
+ends or the caller's owner exits. Only the maker reads its receipt.
+Abandoning interest never undoes an accepted request.
 
-### Self-control
-
-An instance may ask for its own control. The request is not applied inside the segment that made it: the target applies
-requests at its safe boundaries, so the segment returns or yields first, and its own inspection inside it still reads the
-status it had. The stop precedence of the Haskell API is unchanged.
+An instance may ask for its own control; it is applied at the target's next
+safe boundary, not inside the asking segment.
 
 ### Inspection
 
-`inspect` and `inspect_owner` read one transaction each, so an owner's snapshot is coherent, and borrow no Lua table. A
-snapshot holds the TID, the owner's label, the name and the status (`initializing`, `active`, `paused`, `stopping`,
-`completed`, `stopped`, `failed`). The count is bounded by the grant's snapshot bound and the size by the owner's value limits:
-a list that would not fit is cut, and says so (`truncated`), and never faults the script.
+`inspect` and `inspect_owner` each read one transaction. A snapshot holds the
+TID, the owner's label, the name and the status (`initializing`, `active`,
+`paused`, `stopping`, `completed`, `stopped`, `failed`). A list over the
+grant's snapshot bound or the owner's value limits is cut and says
+`truncated`; it never faults.
 
 ### Logical admission
 
-An owner configured with `instanceControlAdmission = AdmitLogically` admits the controls made through a grant by the tick
-and sequence the application assigned each (D-23). The grant carries an `AssignControl` for such a target, which the engine
-calls for every request that passes the grant, telling it the calling owner, the calling instance, the target and the
-operation, all of them the engine's own knowledge; it answers a `ControlSlot` or declines. The request is applied at the
-logical boundary of its tick, before that tick's ordinary work and cadence point, in the order of (tick, sequence), whatever order
-requests arrived in and whichever VM sent them. The scheduler holds the grant that reaches such a tick, as it holds one a
-cadence point or a woken task owes work for, and applies no later grant, until the owner has applied the tick's controls, so
-grants queued together act exactly as grants served one by one; and the cadence points the tick reached are still the
-scheduler's while the controls are applied, so a pause and a resume assigned to a tick invalidate a point due at it, and the
-next update is a full interval after the resume. One assigned a tick the owner has begun is refused as `late`, one assigned
-a place another request holds as `duplicate`, and one given no place as `unassigned`; none is ever applied at another
-boundary. Admission reads the tick and enqueues in one transaction, so a request accepted for a tick is always queued before that
-tick is visible. A request waiting for its tick holds its reservation, and settles as no longer applicable if its instance
-ends or its owner exits first; its place stays taken until its tick begins whatever became of the request, and the places
-queued are bounded as the reservations are (a request is refused as `full` when the queue holds that many). The application's own `requestInstanceControl` is admitted on arrival whatever the owner admits,
-and `requestInstanceControlAt` takes a place from the Haskell API.
+An owner configured with `instanceControlAdmission = AdmitLogically` admits
+controls made through a grant by the tick and sequence the application
+assigns: the grant's `AssignControl` is called for every request that passes
+the grant and answers a `ControlSlot` or declines. The request is applied at
+the logical boundary of its tick, before that tick's ordinary work and
+cadence point, in (tick, sequence) order whatever the arrival order. The
+scheduler holds the grant that reaches such a tick until the tick's controls
+are applied. A pause and resume assigned to a tick invalidate a cadence point
+due at it. A place stays taken until its tick begins whatever became of the
+request. The application's own `requestInstanceControl` is admitted on
+arrival; `requestInstanceControlAt` takes a place.
 
-### Determinism
-
-The same tick-assigned requests give the same sequence of controls, and so of effects, however the threads that made them
-interleave: the order is (tick, sequence) and nothing about arrival. Requests admitted on arrival are not ordered logically.
-
-### What proves it
-
-`Test.LuaRuntime.Lifecycle.*`, in `lua-runtime-tests`, run real instances on two or more real supervised scheduled owners,
-under injected clocks and fake wakes, with gates and barriers and no sleeps: one registration shared by owners with different
-grants, authority and its refusals, control across owners and its receipts, every refusal, exactly-once settlement whatever
-ends a target first, abandonment by a caller's instance, task or owner, self-control, inspection and its bounds, and logical
-admission (order independence, late, duplicate, unassigned, before-the-tick's-work, racing the grant that begins a tick,
-and retirement). The host library's examples (`Test.Lua.Boundary.*`) pin that a lifecycle operation is delivered only
-to an owner configured with a context. Cancellation and shutdown windows are the kind an asynchronous-exception race can
-hide on one platform, so CI, which runs them on Linux, is the evidence for them and a local pass is not.
+The same tick-assigned requests give the same sequence of controls however
+the requesting threads interleave.
 
 ## Asynchronous requests
 
-`Hetoimasia.Scripting.Lua.Provider` and `Hetoimasia.Scripting.Lua.Request` (LUA-7, in `runtime-lua`) let a script ask
-for something an engine operation will answer later (pathfinding, an asset load, a query) without blocking its owner
-and without a provider's thread ever entering Lua. They follow P-7 of [the Lua runtime
-design](../../docs/archive/designs/lua_runtime_design.md): a component-local protocol, not an engine RPC bus. A bounded
-single-assignment result slot is reserved before a request is accepted; a response fills it without waiting on a
-shared queue; the session, domain, request identity and generation are carried; every admitted request settles
-exactly once, with a result, a failure or a cancellation; and a duplicate, late or stale reply cannot overwrite it.
-Cancelling revokes interest and is not proof that native work ended, so what the provider borrowed stays owned until
-it proves the work over. The mechanics are proven with fake providers. Subscriptions and provider events are
-[LUA-26](../../docs/archive/designs/lua_runtime_design.md#lua-26-deliver-provider-events-through-owned-lua-subscriptions)'s, which
-reuses this section's granted service, guard and epoch operation unchanged.
+`Hetoimasia.Scripting.Lua.Provider` and `Hetoimasia.Scripting.Lua.Request`
+(in `runtime-lua`) let a script ask for something an engine operation answers
+later, without blocking its owner and without a provider's thread entering
+Lua. A bounded single-assignment result slot is reserved before a request is
+accepted; a response fills it without waiting on a queue; every admitted
+request settles exactly once (result, failure or cancellation); a duplicate,
+late or stale reply cannot overwrite it. **Cancelling revokes interest and is
+not proof that native work ended.**
 
 ### Granting the service
 
-A scheduled owner is granted the service when it is created, with `scheduledRequests ∷ Maybe RequestGrant`. A
-`RequestGrant` names the providers' endpoints (`RequestEndpoint`: a name, the schema of what the provider answers, and
-how a request is handed to it), the bound on the requests the owner holds, and when settlements reach Lua
-(`RequestTiming`). The grant is the whole of the authority. An owner created with none keeps the
-`NotYetSupported` fault every asynchronous request answered before, with its action never run, whichever registration it
-was given; the finalizer refusals do not change (an asynchronous binding still cannot be declared finalizer-eligible,
-and a call made while the VM closes is still refused with `FinalizerRefused` before dispatch). A grant that does not
-make sense (a bound below one, no endpoint, an invalid or repeated endpoint name, a result schema that names a
-capability, or value limits too small to hold the smallest failure or cancellation record a script is handed:
-`SettlementsDoNotFit`) is refused before anything starts as `RequestGrantRefused`, naming every reason. One registration serves
-any number of owners with different grants, because the binding's action is handed the *owner's own* `RequestContext`,
-read from the owner's configuration and never from a value a script supplied (`asynchronousNativeRequestIn`).
+`scheduledRequests ∷ Maybe RequestGrant` names the providers' endpoints
+(`RequestEndpoint`: a name, the answer's schema, how a request is handed
+over), the bound on requests held, and the `RequestTiming`. An owner with no
+grant keeps `NotYetSupported`. A grant that does not make sense (a bound
+below one, no endpoint, a bad or repeated name, a result schema naming a
+capability, value limits too small for the smallest failure record:
+`SettlementsDoNotFit`) is refused as `RequestGrantRefused`. The binding's
+action is handed the owner's own `RequestContext`
+(`asynchronousNativeRequestIn`).
 
 ### What a provider implements
 
-An endpoint's `endpointSubmit` is handed a `Submission`: the request's arguments (bounded copies), a `Completion` and
-the request's identity (`RequestInfo`: the owner, the instance, the endpoint and the request's number). It answers a
-`ProviderWork`, which is how the engine later withdraws interest (`workCancel`) and reads where the provider's own
-retirement of the work has got to (`workRetirement`, a transaction that must not retry and only reads: what it writes
-is not kept). The provider answers through
-the `Completion`, from any thread, now or later: `ProviderResult` with a value, or `ProviderFailure` with a reason.
-Completing is one transaction that writes the request's reserved slot, or holds the answer, and never waits for the
-owner, a queue or Lua, so a full owner never makes a provider's thread wait. The answer says what became of the
-reply (`ReplyAnswer`): settled, held for its tick, refused for its size or shape, late, or unknown. None is an error;
-a duplicate, late or stale reply is evidence about the provider, is counted, overwrites nothing, and still retires
-the provider's work.
+`endpointSubmit` is handed a `Submission`: bounded argument copies, a
+`Completion` and the `RequestInfo` (owner, instance, endpoint, request
+number). It answers a `ProviderWork`: `workCancel` (how the engine withdraws
+interest) and `workRetirement` (a transaction that **must not retry and only
+reads**). The provider answers through the `Completion`, from any thread:
+`ProviderResult` or `ProviderFailure`. Completing is one transaction that
+never waits for the owner, a queue or Lua. The `ReplyAnswer` says what became
+of the reply: settled, held for its tick, refused for size or shape, late, or
+unknown. None is an error; a duplicate, late or stale reply is counted,
+overwrites nothing and still retires the provider's work.
 
-`Submission` also carries `submissionSettled`, a read-only transaction that never blocks: whether the request has settled
-(or is gone). It is additive and changes nothing for a provider that does not read it. It exists for one named consumer, the
-window provider (LFE-18): a resource reply that is accepted (`ReplyAdoption`) reports the provider's work over at once, so
-a request that is then cancelled, or otherwise settles, before the owner builds the resource never reaches `workCancel`, and
-the credit that transfers is returned only when the settled result is taken or discarded. A provider that has offered a
-resource and finds the request settled with the resource never adopted (the recipe marks adoption before the request
-settles) knows no lease will own it, and retires what it holds without waiting for the result to be consumed.
+`submissionSettled` is a read-only, non-blocking transaction saying whether
+the request has settled or is gone. It exists for a provider whose accepted
+resource reply (`ReplyAdoption`) ends its work at once: one that offered a
+resource and finds the request settled without adoption retires what it
+holds.
 
-A reply is bounded before it is retained, against the owner's value limits and the endpoint's schema, and what is
-measured is the record a script is handed when it takes the result, not the bare value, so a result that is
-retained is a result that can be delivered. A result over the limits settles an unsettled request as a failure, its
-value never kept, and retires the provider's accounting, as the model's `applyReplyIn` does; so does a result that is
-not what the endpoint declares. The same holds for a failure: a provider's failure reason is bounded, and one whose
-record would not fit the limits is retained as a failure that says so. Every record a script is handed (result,
-failure, cancellation) fits the owner's limits. Taking a settlement retires its handle, so it never loses one to a
-fault: a result that the taking operation itself cannot hold (its declared schema is not the endpoint's) is
-delivered as a failure that says so.
+A reply is bounded before it is retained, measured as the record a script
+will be handed. A result over the limits or not of the endpoint's shape
+settles the request as a failure, its value never kept. A failure reason is
+bounded the same way. Taking a settlement retires its handle, so one is never
+lost to a fault.
 
 ### What a script sees
 
-A binding's author starts a request with `startRequest` and returns the handle as a capability
-(`requestHandleValue`, of a type declared with `requestHandleType`). The generic operations a script uses on it are
-supplied by `requestBindings` (a namespace the application names): `ready(h)` answers without blocking whether the
-request has settled; `take(h)` takes the settlement once, as `{status, value, reason}` (`"pending"` without taking
-anything, or `"result"`, `"failure"` or `"cancelled"`), and retires the handle; `cancel(h)` settles the request as
-cancelled (or answers `"settled"` when it settled first and keeps its settlement); and `wait(h)` gives control back,
-cooperatively and without blocking the owner, until the request has settled. A wait in `init` or `shutdown` is a
-hook fault as any wait is there; an owner with no service answers the wait `NotYetSupported`.
+A binding's author starts a request with `startRequest` and returns the
+handle as a capability (`requestHandleValue`, type from `requestHandleType`).
+`requestBindings` supplies the generic operations:
 
-A handle carries no authority. It names a request of the instance, or task, that made it; another requester's handle,
-one whose settlement was taken and one that names nothing are refused as a fault of the call, never run.
+| Call | Effect |
+|---|---|
+| `ready(h)` | whether the request has settled, without blocking |
+| `take(h)` | the settlement, once: `{status, value, reason}` with `"result"`, `"failure"` or `"cancelled"` (or `"pending"`, taking nothing); retires the handle |
+| `cancel(h)` | settles as cancelled, or answers `"settled"` if it settled first |
+| `wait(h)` | gives control back until the request has settled; a hook fault in `init` or `shutdown` |
+
+A handle carries no authority: another requester's, a taken one and one that
+names nothing are refused as a fault of the call.
 
 ### Admission and the reserved place
 
-`startRequest` never blocks. It is allowed in any invocation of an instance that is taking requests, `init` included,
-and from a task's segment. It reserves the request's place in the protocol model's session before the provider is
-asked anything, and the place is held until the settlement has been taken or discarded *and* the provider has proved
-its work over: a result nobody took counts, and so does a cancelled request whose provider has not finished.
+`startRequest` never blocks and is allowed in any invocation of an instance
+that is taking requests (`init` included) and from a task's segment. It
+reserves the request's place before the provider is asked anything, and the
+place is held until the settlement has been taken or discarded **and** the
+provider has proved its work over.
 
-A request is refused, as a fault of the call and never a failure of the host, and with the provider asked nothing,
-in this order: when no instance or task is running to receive the answer; when the owner or the instance is no longer
-taking requests (it is stopping, which a `shutdown` hook and a coroutine's closing handlers already are, and so
-is a task whose coroutine is being closed); when the
-application's assignment declined to place it; when the tick assigned is one the owner has begun; when the place
-assigned is taken; and when every place is held. An endpoint the grant does not name is the application's own mistake
-and a failure of the host.
+Refused as a fault of the call, the provider asked nothing, in this order: no
+instance or task is running; the owner or instance is no longer taking
+requests (stopping, which `shutdown` and closing handlers already are); the
+assignment declined; the assigned tick has begun; the assigned place is
+taken; every place is held. An endpoint the grant does not name is a host
+failure.
 
 ### Whose a request is
 
-An instance owns its requests, not the invocation that admitted them. They survive that invocation's end until their
-settlement is taken, they are cancelled, or the instance ends; ending an invocation's task revokes nothing. This is
-the model's *holder*: an identity the session issues for an owner that is not one of its tasks, ended with the instance
-through the same revocation a retiring task's requests go through. A task of the owner that is no instance's invocation
-owns its own, and they are revoked at the first safe boundary after it ends.
-
-When an instance ends (a stop, a failed `init`, a faulting invocation, a one-shot's completion, the owner's exit) each
-of its requests settles once, as cancelled by the requester's end, and the providers are told once. The instance's
-settlement then *waits* for those providers to prove their work over, as it waits for a lease's retirement, so
-nothing is reported as stopped or reclaimed merely because Lua stopped. A scheduled owner's exit does the same for
-everything left: it revokes, tells the providers and stays live, through a stop and through a cancellation, until each
-has said it is done.
+An instance owns its requests, not the invocation that admitted them: they
+survive until taken, cancelled or the instance ends. A task that is no
+instance's invocation owns its own, revoked at the first safe boundary after
+it ends. When an instance ends each request settles once as cancelled, the
+providers are told once, and the instance's settlement **waits** for them to
+prove their work over. An owner's exit does the same and stays live until
+each has.
 
 ### Settling on arrival, and at an assigned tick
 
-`RequestTiming` is the owner's kind of time. **`SettleOnArrival`** is an owner on elapsed time: a reply settles the
-request when it arrives, the first settlement wins, and the waiting script resumes at the next safe boundary after it.
-A cancel that finds the request settled is refused, counted (`rdLateCancels`), and the settlement stands. While the
-instance is paused a settlement is retained in its slot without resuming Lua (D-26).
+**`SettleOnArrival`** (elapsed time): a reply settles the request when it
+arrives, the first settlement wins, and the waiting script resumes at the
+next safe boundary. A cancel that finds it settled is counted
+(`rdLateCancels`). A settlement for a paused instance is retained without
+resuming Lua.
 
-**`SettleAtAssignedTick`** is an owner on logical time (D-23, D-36, D-39). The application's policy, called through
-the binding that admits the request, assigns the tick its settlement is due (`AssignRequest`, which may decline,
-and by default the next tick) and the place among the requests due then, as LUA-23 assigns a control's. A tick the
-owner has begun is refused as late, and a place that is taken as a duplicate. Then:
+**`SettleAtAssignedTick`** (logical time): the application's `AssignRequest`
+assigns the due tick (default the next) and the place among requests due
+then, or declines. A begun tick is refused as late, a taken place as a
+duplicate. Then:
 
-* a reply that arrives *before* the due tick is a **held completion**, kept in the request's record and not a
-  settlement, until the request's place is served at the boundary of its tick (so a duplicate that arrives after
-  the owner applied the tick and before it served the place is still a duplicate). The first is kept; a later one is counted (`rdDuplicateHeld`) and never replaces it or resurrects a
-  value a cancel discarded; the script cannot see it, and readiness reports pending;
-* the tick does **not begin** until the request is complete. The scheduler holds the grant that would reach it
-  (`holdTick`), as LUA-23 holds a tick for its controls, until the completion is held or the request is cancelled
-  or its requester ended. A slow provider stalls the owner only at its tick, a provider that never answers stalls
-  it there until its stop or failure ends the request, and later grants wait behind the held one in order;
-* a **cancel before the due tick always wins**: the request settles `Cancelled` whatever the provider has done, any
-  held value is discarded without reaching Lua, the tick's hold is released and the provider's work is retired. The
-  same cancel gives the same `Cancelled` settlement and the same recorded effects whether the reply arrived before it
-  or after;
-* a request that is not cancelled settles at its tick, at the boundary where the grant that reached it is held, in the
-  order of the places, with what the provider delivered, and the tasks waiting for them are woken in that order.
-  Readiness answers from logical state: pending before the tick, settled from it on.
+- a reply arriving *before* the due tick is a **held completion**, invisible
+  to the script, until the place is served at its tick's boundary. The first
+  is kept; later ones are counted (`rdDuplicateHeld`);
+- **the tick does not begin until the request is complete**: the scheduler
+  holds the grant that would reach it (`holdTick`). A provider that never
+  answers stalls the owner at that tick until a stop or failure ends the
+  request;
+- **a cancel before the due tick always wins**, with the same recorded
+  effects whether the reply arrived before or after it;
+- otherwise the request settles at its tick, in place order, and waiting
+  tasks are woken in that order.
 
-The one watch the owner keeps on a tick is shared with LUA-23's tick-assigned controls and with cadence points: each
-is served at the boundary of its tick, controls first, and what is next watched for is the earliest tick any of them
-is still waiting for, taken in the same transaction as the step that served the last, so none leaves another
-without its watch. An owner that hosts no instances serves the watch's points itself. No ordinary work for the due
-tick begins while a required completion is pending, cadence work included.
+The owner keeps one watch on a tick, shared with tick-assigned controls and
+cadence points: each is served at its tick's boundary, controls first. No
+ordinary work for the due tick begins while a required completion is pending.
 
 ### Cancellation and the provider's lifetime
 
-Cancellation (a script's, the requester's end, an epoch change, the owner's stop) revokes interest and settles the
-waiter `Cancelled`. It does not tell the engine the work ended. Outstanding provider work is a **retained
-retirement obligation**, and it is the same one the instance leases keep: the primitive (`Hetoimasia.Scripting.Lua.Retention`:
-`Obligation`, `RetirementState`, the single reading `pollObligation`, the single guard `guarded`, and the
-disposals held behind obligations and run only after they completed without failure) is shared by a lease's
-`retireAsynchronously` and by the request service, which keeps no copy of the rules. The request's work is not a
-lease and is not charged to a lease slot or to lease capacity; it is charged to the request bound (the request's place
-is held until the provider proves its work over), and it stays so until the provider proves it over, by replying or
-by its own reading (`workRetirement`). A binding's `afterCompletion` (what the work needed, such as a borrowed
-dependency) is disposed of on the owner's thread, uninterruptibly, only after that, and never if the retirement
-failed; a retirement failure is a cleanup failure, fatal under every policy. The provider is told *once* that
-interest was withdrawn, as soon as it can be; a provider that had already finished is not asked to stop. The model is
-told the work is over whenever its request has settled and the work is known over, whichever came last, so work
-that ended long before the request settled (a completion held for its tick) never leaves a place charged.
+Cancellation (a script's, the requester's end, an epoch change, the owner's
+stop) settles the waiter `Cancelled`. Outstanding provider work is a retained
+retirement obligation under the same `Retention` primitive as leases, charged
+to the request bound until the provider proves it over by replying or by
+`workRetirement`. A binding's `afterCompletion` (what the work needed) is
+disposed on the owner's thread, uninterruptibly, only after that, and never if
+the retirement failed. The provider is told once that interest was withdrawn;
+one that had already finished is not asked to stop.
 
 ### Epochs
 
-`advanceRequestEpoch` (P-9) replaces the generation of an owner's records at a moment the application chooses.
-Every outstanding request settles, once, as cancelled by the epoch change, and its script can take that; a cancellation
-nobody has taken is still a place held, charged to the bound until it is taken, so repeated epochs cannot accumulate
-more than the bound; a settled result nobody had taken is discarded with the epoch's records, as the model discards
-it; the ticks the requests held are let go; and the providers whose work that was are told by the owner at its next
-boundary, as for every other withdrawal of interest, so one that raises is a failure of the host under the owner's
-policy and nothing is raised on the application's thread. The accounting for work that is not over is retained under
-the identities it was issued under, so a late reply retires it without reaching anything the new epoch issues.
-Instances and tasks are not invalidated by it.
+`advanceRequestEpoch` replaces the generation of an owner's records. Every
+outstanding request settles once as cancelled by the epoch change (a
+cancellation nobody took still holds its place); a settled result nobody took
+is discarded; held ticks are released; providers are told at the owner's next
+boundary. Accounting for unfinished work stays under its old identities, so a
+late reply retires it without reaching the new epoch. Instances and tasks are
+not invalidated.
 
 ### The guard, and what a failure is
 
-Every call into provider code (handing a request over, withdrawing interest, reading a retirement, disposing of what
-the work needed, and the application's assignment) goes through **one guard**, `guarded` (its transactional form,
-which the provider's own reading uses, is the same one the leases use), and is fully evaluated inside it. Nothing
-is dropped: where failures arise together the first is raised and the others are kept whole as cleanup evidence.
+Every call into provider code goes through one guard (`guarded`) and is fully
+evaluated inside it.
 
-* A provider reporting a failure is a reply, and settles the request as a failure, returned as data.
-* Provider code raising when the engine calls it (handing a request over, withdrawing interest, the assignment) is
-  a failure of application code: a failure of the host under the owner's `WorkerPolicy`, unconverted. A request
-  whose handoff raised is taken back as though it had never been admitted.
-* A provider's retirement that fails, and the disposal of what its work needed that raises, are cleanup failures:
-  retained on the work, never retried, fatal under every policy. Servicing answers each once, and recording it is
-  the same masked step, so a cancellation of the owner cannot come between and lose it; the same holds for a tell
-  that was claimed.
+| What happens | It is |
+|---|---|
+| a provider reports a failure | a reply: the request settles as a failure, as data |
+| provider code raises when the engine calls it (handoff, withdrawal, assignment) | a host failure under the `WorkerPolicy`; a request whose handoff raised is taken back as never admitted |
+| a retirement fails, or the disposal of what the work needed raises | a cleanup failure: retained, never retried, fatal under every policy |
 
 ### Determinism
 
-On one logical owner, identical inputs give identical settlements, settlement order and recorded effects however
-provider delays, arrival order and segment delays vary. The inputs are the admissions with their assigned ticks,
-cancels at logical points, and grants. What a binding's disposal of a dependency does follows when the provider
-finished, which is not logical time, and no script can see it.
-
-### What proves it
-
-`Test.LuaRuntime.Request.*`, in `lua-runtime-tests`, run real instances and tasks on real supervised scheduled owners
-with a fake provider the examples drive by hand, an injected clock and gates, never a sleep: admission and every
-refusal, a place reserved before the provider is asked and held until its work is over; settlement on every path
-with duplicate, late, unknown, oversized and malformed replies; interests admitted in `init` and in an update and
-taken in a later invocation; the instance's end and the owner's stop, failure and cancellation waiting for the
-provider; waits, pause, readiness and hook faults; a provider that raises, a retirement that fails, and failures
-arising together; a completion that never waits for the owner; the assigned tick, the held completion, the tick held
-until the provider completes, a late, unassigned or duplicate place, the cancel that wins whichever of the reply
-and the cancel came first, the order of the places, holds shared between requests, cadence work and controls, and
-determinism across arrival orders; and epochs. The protocol model's holders are pinned in `lua-host-tests`. The
-cancellation and cleanup windows are the kind an asynchronous-exception race can hide on one platform, so CI, which runs
-them on Linux, is the evidence for them and a local pass is not.
-
+On one logical owner, identical admissions with their assigned ticks, cancels
+at logical points and grants give identical settlements, settlement order and
+recorded effects however provider delays and arrival order vary. When a
+dependency is disposed follows the provider, not logical time, and no script
+can see it.
 ## Atomic request admission
 
-`Hetoimasia.Scripting.Lua.Admission` (LFE-7, in `runtime-lua`) is the other way to start a request, and the only
-way a full bank is an answer and not a refusal. It is **opt-in, per request**: a binding's author asks
-`startAdmitted` with an `Admission`, and nothing else changes. The generic `startRequest`, `requestBindings`,
-`RequestGrant`'s defaults, the full-capacity refusal that fails the call (`Test.LuaRuntime.Request.Admission` pins
-it), subscriptions, the runner and every existing example keep their meaning beside it. Core `scripting-lua`
-imports nothing of `lua-engine`, content, graphics, the console or a game; the profile's limits and the M1
-records are [`hetoimasia-lua-engine`'s](../lua-engine/README.md#the-m1-request-adapter), which passes them in.
+`Hetoimasia.Scripting.Lua.Admission` (in `runtime-lua`) is the other way to
+start a request, and the only way a full bank is an answer and not a refusal.
+It is **opt-in, per request**: a binding's author calls `startAdmitted` with
+an `Admission`. The generic `startRequest`, `requestBindings` and their
+full-capacity refusal are unchanged. The profile's limits and the M1 records
+are [`hetoimasia-lua-engine`'s](../lua-engine/README.md#the-m1-request-adapter),
+which passes them in.
 
 ### What asking reserves
 
-`startAdmitted` takes one transaction (`admitOptIn`), and only after it commits asks the provider anything. In it:
+`startAdmitted` takes one transaction (`admitOptIn`) and only after it commits
+asks the provider anything. In it, in this order:
 
-| Bank | Owner of the count | Reserved by | Refused as |
-| --- | --- | --- | --- |
-| Request record and terminal-result storage | the protocol model's session | `acceptRequestFor` | busy (`BankOwnerRequests`) when the model's cap is reached |
-| Accepted, unretired requests of the instance | the service's ledger (`pHeld`) | an entry for the request | busy (`BankInstanceRequests`) |
-| Accepted, unretired requests of the VM | the same ledger | the same entry | busy (`BankVmRequests`) |
-| The owner's places (the grant's bound) | every request's place at once: the same ledger, the model's outstanding requests and the cancelled results a generic request left untaken, each request counted once (`ownerPlaces`) | the same entry | busy (`BankOwnerRequests`) |
-| A result lease | `Leases`, the instance's lease capacity | `reserve`: a slot in `SlotConstructing` with the key the handle will have | busy (`BankLeases`) |
-| Provider credits | the provider's own STM variables | each `Credit`'s `creditReserve`, in the order declared | busy (`BankCredit`), or, for a credit that raises `CreditRefused`, a final refusal decided before any bank (below) |
-| The due position, for an owner on logical time | the scheduler's tick | `DueSlot (tick + offset) (request number)`, and the owner's hold on that tick | permanent refusal |
+| Bank | Owner of the count | Full is |
+| --- | --- | --- |
+| Request record and terminal-result storage | the protocol model's session | busy (`BankOwnerRequests`) |
+| Accepted, unretired requests of the instance | the service's ledger (`pHeld`) | busy (`BankInstanceRequests`) |
+| Accepted, unretired requests of the VM | the same ledger | busy (`BankVmRequests`) |
+| The owner's places (the grant's bound): the ledger, the model's outstanding requests and untaken cancelled results of generic requests, each request once (`ownerPlaces`) | the same ledger | busy (`BankOwnerRequests`) |
+| A result lease | `Leases`: a slot in `SlotConstructing` with the key the handle will have | busy (`BankLeases`) |
+| Provider credits | the provider's own STM variables, each `Credit`'s `creditReserve` in declared order | busy (`BankCredit`), or final for `CreditRefused` |
+| The due position (logical time) | the scheduler's tick: `DueSlot (tick + offset) (request number)` and the owner's hold on that tick | permanent refusal |
 
-A bank without room, or a permanent fact, raises inside the transaction and `catchSTM` undoes everything reserved
-before it: there is **no** handle, hold, credit, lease slot or counter left, the provider was asked nothing and the
-instance has no latent failure. That is the whole mechanism: no capacity is queried and then used, no exception is
-caught and relabelled, and no retry is queued. The order of the decisions is the contract: the owner or requester is
-not taking requests, the requester is a task, the request numbers are exhausted, an offset on an owner on arrival,
-an offset that is not positive, a tick and offset past the ceiling, a position that has begun, then the banks in the
-table's order, except one thing: a credit that says it can **never** be had (`CreditRefused`, below) is asked first, with
-everything it wrote undone, so that a full temporary bank is never the answer to a request that waiting cannot help. A credit that retries is full
-(`orElse`), so a provider's bank can never make the admission wait.
+A bank without room, or a permanent fact, raises inside the transaction and
+`catchSTM` undoes everything reserved before it: **no handle, hold, credit,
+lease slot or counter is left**, the provider was asked nothing, and the
+instance has no latent failure. Nothing queries capacity and then uses it, and
+no retry is queued.
 
-Classification, which the tests pin separately:
+The order of decisions is the contract: the owner or requester is not taking
+requests; the requester is a task; the request numbers are exhausted; an
+offset on an owner on arrival; a non-positive offset; a tick and offset past
+the ceiling; a position that has begun; then the banks in table order. One
+exception: a credit that can **never** be had (`CreditRefused`) is asked
+first, so a full temporary bank is never the answer to a request waiting
+cannot help. A credit that retries is treated as full (`orElse`), so a
+provider's bank can never make admission wait.
 
 | What | Answer |
 | --- | --- |
-| A temporary bank is full | `Unavailable bank`: data. The binding hands the script `nil, {code="busy", message=TEXT}`. Never an error, never the instance's failure; a later call may succeed |
-| A credit that is full **for good** (nothing will ever return a place: a permanent bank that is exhausted) | the credit raises `CreditRefused why` from `creditReserve` (with `throwSTM`), in the transaction that would have taken the place. The admission is refused **finally and not as a fault**: `startAdmitted` raises `OrdinaryCallRefusal`, which a binding opted in to ordinary refusals ([`recoverableRefusals`, `withPrecondition`, `withArgumentCheck`](#recoverable-refusals)) shows as an ordinary Lua error `binding: request refused: WHY` (the reason bounded to `refusalReasonBytes` = 256 **bytes of UTF-8**, cut between characters, so it is always delivered as the ordinary error it is) that `pcall` catches and an invocation that caught it can go on from, recording nothing on the VM; for a binding that is not opted in it is the fault of the call, as any `RequestRefusal`. Nothing is reserved, nothing reaches the provider and no latent failure is left; it is decided before any bank is asked, so it wins over a full temporary bank. A credit that answers `False` is a bank that may empty: busy data, as before. A credit that never raises `CreditRefused` behaves exactly as it did |
-| A permanent fact (wrong requester, closing, offset, ceiling, exhausted numbers, no lease scope) | `RequestRefusal`, a fault of the call raised before anything was reserved. A binding that wants an ordinary Lua error asks `preflightAdmission` in a [`withArgumentCheck`](#recoverable-refusals), which decides the same facts and reserves nothing |
-| The engine cannot keep its bookkeeping consistent after a valid admission (`AdmissionDefect`: the request counter has no number after the last, a result lease reserved with no way to hand its handle to the script) | a failure of the host, raised from the transaction; nothing is reserved |
-| A bank, provider or assignment that raises | the application's own failure, with its type; nothing is reserved. A provider that raises when handed the request is taken back whole, and a credit release that then raises is kept beside it |
+| A temporary bank is full | `Unavailable bank`: data. The binding hands the script `nil, {code="busy", message=TEXT}`. Never an error or an instance failure |
+| A credit full **for good** (`creditReserve` raises `CreditRefused why` with `throwSTM`) | final, not a fault: `startAdmitted` raises `OrdinaryCallRefusal`. An opted-in binding ([recoverable refusals](#recoverable-refusals)) shows `binding: request refused: WHY` (256 bytes of UTF-8, cut between characters); otherwise a fault of the call |
+| A permanent fact (wrong requester, closing, offset, ceiling, exhausted numbers, no lease scope) | `RequestRefusal`, a fault of the call before anything was reserved. For an ordinary Lua error, ask `preflightAdmission` in a `withArgumentCheck` |
+| The engine cannot keep its bookkeeping consistent (`AdmissionDefect`) | a host failure; nothing reserved |
+| A bank, provider or assignment raises | the application's own failure; nothing reserved. A provider that raises when handed the request is taken back whole |
 
 ### When a bank comes back
 
-The ledger holds one entry for each accepted request, from its admission until its result has been taken or discarded
-**and** its provider's work has been reaped as retired. Losing the Lua reference, waiting, cancelling and the
-provider's reply do none of that alone. The entry is written by the admission and by transactions on the **owner's**
-thread, never by a provider's completion; that is how the credits a native thread frees reach a logical owner's
-admission only at an accounted boundary (`D-77`).
+The ledger holds one entry per accepted request from its admission until its
+result has been taken or discarded **and** its provider's work has been reaped
+as retired. Losing the Lua reference, waiting, cancelling and the provider's
+reply do none of that alone. **The entry is written only by the admission and
+by transactions on the owner's thread, never by a provider's completion**, so
+credits a native thread frees reach a logical owner's admission only at an
+accounted boundary.
 
-| Event | Where it is accounted | What becomes visible to admission, and when |
-| --- | --- | --- |
-| Take of a terminal result, provider work already reaped | `takeTerminal`, on the owner's thread inside the Lua call | the places and credits, immediately: the next ask of the same call sees them |
-| Take of a terminal result, provider work still running | `takeTerminal` | nothing; the entry stays charged |
-| The provider proves its work over (reply, or its retirement reading) | the owner's next boundary: `sweepWorks`, `reapWorks`, then `releaseSettled` | the places and credits of a request already taken, at that boundary and not before; a retirement completed on a provider's thread is invisible until then |
-| The requester ends | `endRequesterSTM`, then `releaseSettled` | the requests it did not collect are discarded; their entries leave as their work is reaped |
-| An epoch change, the owner's exit | `advanceEpochSTM`, `closeSTM` | as above; what is cancelled for a script to take stays charged until it is taken. A resource already built for a result nobody took is queued for release with the epoch (`pDiscards`), on the owner's next boundary |
-| A resource whose building failed, a stage of which the provider is still retiring | `failAdoption`, then `releaseSettled` | nothing while the lease slot exists: the credits that were to transfer stay charged with it (`heldRetiring`), and are returned once the slot is gone and the request's work is reaped; the owner wakes for that |
-| A resource whose building failed and whose rollback release raised | `adoptReserved` (`retainFailed`), then `failAdoption` | nothing, ever: the slot stays, failed, with its charge, so the credits that were to transfer stay charged with it; the constructor's failure and the release's are both raised for the owner (the release's as cleanup evidence) |
-| An admission taken back (the provider could not be handed the request) | `withdrawAdmission` | everything at once: credits returned `CreditUnused`, the lease discharged |
-| A retirement that fails | the work's retained failure | nothing, ever: the place and credit stay charged and the failure is cleanup evidence |
-| A credit release that raises | `releaseSettled`, `withdrawAdmission` | the other credits and the place come back; the failure is cleanup evidence, kept on every path that services the provider: the boundary, the retirement of the instances and the owner's exit (`serviceProvider`) |
+| Event | What becomes visible to admission, and when |
+| --- | --- |
+| Take of a terminal result, work already reaped (`takeTerminal`) | the places and credits, immediately: the next ask of the same call sees them |
+| Take of a terminal result, work still running | nothing; the entry stays charged |
+| The provider proves its work over | at the owner's next boundary (`sweepWorks`, `reapWorks`, `releaseSettled`) and not before |
+| The requester ends; an epoch change; the owner's exit | uncollected requests are discarded; entries leave as their work is reaped. A resource built for an untaken result is queued for release (`pDiscards`) |
+| A resource whose building failed while a stage is still retiring | nothing while the lease slot exists (`heldRetiring`) |
+| A resource whose building failed and whose rollback release raised | nothing, ever: the slot stays failed with its charge |
+| An admission taken back (`withdrawAdmission`) | everything at once: credits returned `CreditUnused`, the lease discharged |
+| A retirement that fails | nothing, ever; the failure is cleanup evidence |
+| A credit release that raises | the other credits and the place come back; the failure is cleanup evidence (`serviceProvider`) |
 
-A `Credit` is returned once, with the reason (`CreditUnused` or `CreditSettled`), except one that `creditTransfers`
-and whose request succeeded with a resource: that credit is the resource's, and the provider's own release of the
-resource gives it back. A reserved lease nothing will use (the request failed, was cancelled, or got a result with no
-resource) is discharged by the same boundary once the provider's work is retired and the request has settled or
-gone; one that was adopted is the instance's live resource and is not touched. `rdHeld`, `rdHeldBy` and `rdBusy`
-read the ledger.
+A `Credit` is returned once, with `CreditUnused` or `CreditSettled`, except
+one that `creditTransfers` and whose request succeeded with a resource: that
+credit is the resource's, returned by the provider's own release of it. A
+reserved lease nothing will use is discharged once the work is retired and the
+request settled. `rdHeld`, `rdHeldBy` and `rdBusy` read the ledger.
 
 ### The reply, the resource and the defect
 
-A request admitted this way takes the service's contract for its reply (`checkReplyFor`). The reply is first
-evaluated to its constructor inside the same guard that evaluates what it holds, on the provider's thread: one that
-throws when it is first looked at (a failure whose strict message is an error) is a provider defect here and a
-refused value on the generic path, and an asynchronous exception is never taken for either. What is measured is
-the record the script will be handed:
+A request admitted this way has its reply judged by `checkReplyFor`,
+evaluated to its constructor inside the guard on the provider's thread:
 
-* a `ProviderResult` is checked against the owner's value limits and the endpoint's schema, the value against the
-  admission's ceilings, and the record a script is handed (the admission's frame) against the owner's. The
-  admission's combiner shapes that record only for a result whose resource the owner builds into the reserved lease
-  (a `ProviderResource` of a request that reserved one); a plain result is measured, and handed, as it is. The
-  value the engine keeps for a result whose resource is built is the provider's own, whatever the combiner hands
-  the script in its place, so it is bounded as well: as the plain record, against the owner's limits and the
-  admission's ceilings, before the schema is traversed, and its bytes are the larger of the two records';
-* a `ProviderExpected` failure must carry a code the admission lists, a root and path within their byte bound, and
-  an envelope that fits: a message is cut at a character, visibly (`...`), to its bound until it does;
-* a `ProviderResource value recipe` is a result whose resource the instance is to own: the owner builds the recipe
-  into the lease the request reserved on its own thread, uninterrupted, through the capability it holds
-  (`adoptReserved`), at its next boundary, and only then holds (on logical time) or settles the result. A cancel
-  that comes first drops an unclaimed recipe (the resource stays the provider's to retire); one that comes while the
-  recipe is being built finds the resource built and the owner releases it at once (`pDiscards`); a recipe that raises
-  rolls its stages back, gives the reservation back and is a failure of application code;
-* anything else (a `ProviderFailure` with no code, a code the service does not supply, a result over the ceilings or
-  of another shape) is a **provider defect**: `ReplyDefective`. It is never a failure of the request, never given a
-  code, never an optional content failure and never retained. It is recorded (bounded, at most sixteen), the work is
-  proved over and the request stays unsettled; the owner raises it as a failure of the host
-  (`ProviderDefect`) at its next boundary, under its policy, for a required and an optional request alike. A
-  defect that arrives after the owner's last boundary (an instance inside its `shutdown`, the owner waiting for its
-  providers) is taken by the retirement and is the owner's failure like a provider that raised when told: the
-  first is the owner's if nothing failed before it, and every other is kept whole. The
-  generic `requestBindings` path keeps settling a malformed or oversized reply as a `ValidationFault` failure.
+- a `ProviderResult` is checked against the owner's value limits, the
+  endpoint's schema and the admission's ceilings, measured as the record the
+  script will be handed;
+- a `ProviderExpected` failure must carry a code the admission lists, a root
+  and path within their byte bound, and an envelope that fits; a message is
+  cut visibly (`...`) until it does;
+- a `ProviderResource value recipe` is a result whose resource the instance
+  will own: the owner builds the recipe into the reserved lease on its own
+  thread at its next boundary (`adoptReserved`) and only then holds or
+  settles the result. A cancel that comes first drops an unclaimed recipe; one
+  that comes during the build finds the resource built and the owner releases
+  it at once; a recipe that raises rolls back and is an application failure;
+- anything else (a `ProviderFailure` with no code, an undeclared code, a
+  result over the ceilings or of another shape) is a **provider defect**,
+  `ReplyDefective`: never a failure of the request and never retained. It is
+  recorded (at most sixteen), the work is proved over, the request stays
+  unsettled, and the owner raises it as a host failure (`ProviderDefect`) at
+  its next boundary, for required and optional requests alike. The generic
+  path keeps settling a malformed reply as a `ValidationFault` failure.
 
 ### Timing
 
-On an owner on logical time the request's position is fixed once, inside the admission, from engine-owned values:
-the tick is 0 for an instance whose `init` is running and the owner's current tick otherwise (D-67), the offset is the
-admission's (default 1), and the sequence is the request number the same transaction issues. The tick and offset are
-added as integers and checked against `admitLogicalMaximum` (2^63 − 1 for M1) **before** acceptance, as is the
-request number. Numbers are never reissued and never wrap; a position the owner has begun is refused. The
-application's `AssignRequest` is not consulted for these requests, so there is no read-then-admit gap. A reply that
-arrives before its position is held and invisible to `ready`, `take` and `wait`; a late one holds the tick; a cancel
-before the position wins, whatever the provider delivered, discards the held value and releases the hold. An owner on
-elapsed time takes no offset and settles first-come. `RequestInfo` carries the metadata to the provider
-(`infoNecessity`, `infoSource`, `infoOffset`, `infoDue`). `skipRequestNumbers` moves the counter forward to bring it
-to its ceiling in a qualification without issuing every number before it.
+On logical time the position is fixed once, inside the admission, from
+engine-owned values: the tick is 0 for an instance whose `init` is running and
+the owner's current tick otherwise, the offset is the admission's (default 1),
+and the sequence is the request number the same transaction issues. Tick plus
+offset and the request number are checked against `admitLogicalMaximum`
+(2^63 − 1 for M1) before acceptance. Numbers never wrap or repeat.
+`AssignRequest` is not consulted, so there is no read-then-admit gap. A reply
+before its position is held and invisible; a late one holds the tick; a cancel
+before the position wins. An owner on elapsed time takes no offset.
+`RequestInfo` carries `infoNecessity`, `infoSource`, `infoOffset` and
+`infoDue` to the provider. `skipRequestNumbers` advances the counter for
+qualification.
 
 ### Required failure
 
-An expected failure of a request admitted `RequiredRequest` becomes eligible when it settles: at the reply on an
-owner on arrival, at the position's tick on logical time. At that point the requester's cell gets `isRequestFailure`
-and one `JobDispatch`, and the owner fails the instance with `ErrorRequest` at its next safe boundary, before any
-more of the instance's ordinary work and without preempting a segment. The latch is the owner's, set in the
-transaction that made the settlement eligible; nothing a script does afterwards (reading, not reading, a caught
-`take` or `ready` error, a late `cancel`, which answers `already_settled`) touches it. The owner only reads it to
-apply it: it stays on the instance until the instance is ending, so a cancellation between the reading and the
-recording of the failure leaves it for the next boundary or the settlement, which keeps a latch the instance ended
-with as its failure (or beside the failure it had), once. A cancel that won before
-eligibility prevents it, and a held failure is discarded unseen. `OptionalRequest` leaves the failure a result for the
-script. The failure reaches the application the way every instance failure does, through `instanceEscalate`; session
-and role escalation are the application's.
+An expected failure of a `RequiredRequest` becomes eligible when it settles
+(at the reply on arrival; at the position's tick on logical time). The
+requester's cell then gets `isRequestFailure`, and the owner fails the
+instance with `ErrorRequest` at its next safe boundary, before any more of its
+ordinary work. **Nothing a script does afterwards touches the latch**:
+reading, not reading, a caught error, a late `cancel` (`already_settled`). A
+cancel that won before eligibility prevents it. `OptionalRequest` leaves the
+failure a result for the script.
 
 ### Handles and phases
 
-`admittedHandleType` (over the `RequestHandles` the owner is given with `scheduledRequestHandles`, made before the
-owner and taken by it, as the leases are; of owners that start together exactly one takes it, in one atomic step) declares the handle capability type: a handle is live for the instance that
-holds it while its request exists. A handle that is another instance's, spent by a take, or never issued is refused
-by the value boundary before any action as a handle that has ended; the check reads the running instance, not
-anything a script supplied. `callerPhase` tells a precondition whether an instance is initializing, serving or
-ending: `wait` is for a serving instance, and an instance in `shutdown` is not taking requests. `callerInstance` tells a binding **which** instance's code is running, by the `InstanceId` its
-owner issued, or `Nothing` for a module's top level, a task's segment or no Lua of an instance: the engine's reading, never a script's
-claim, so an application can tell an instance's own call from a facade another instance's code reached.
+`admittedHandleType` (over the `RequestHandles` given with
+`scheduledRequestHandles`, which serves exactly one owner) declares the handle
+type: a handle is live for the instance that holds it while its request
+exists. `callerPhase` tells a precondition whether an instance is
+initializing, serving or ending. `callerInstance` tells a binding which
+instance's code is running (`Nothing` for a module's top level or a task): the
+engine's reading, never a script's claim.
 
 ### Owners, threads and lifetimes of what this adds
 
-| State | Owner | Written by | Read by | Lifetime |
-| --- | --- | --- | --- | --- |
-| `pHeld` (the ledger) | the service | the admission; the owner's thread (`takeTerminal`, `releaseSettled`, ending); never a provider | admission | from admission until taken or discarded and the work is reaped |
-| `Rec` metadata (`recAdmission`, `recFailure`, `recLease`, `recAdopted`) | the service | admission; the reply; adoption | settlement | with the record |
-| The provider's value, once validated (`adoptingValue` while a resource waits to be built; the settled `Payload`; a held completion) | the service | the checked reply | the take; the tick service | bounded as the plain record by the owner's limits and the admission's ceilings, whatever the combiner returns; until taken or discarded |
-| `pAdopting` | the service | a provider's reply (insert); the owner (claim, finish) | the owner's boundary | until built, failed or the request ends; a claimed entry is not dropped under the builder |
-| `pDiscards` | the service | `cancelOf`, the epoch | the owner's boundary | until released |
-| `pDefects` | the service | a provider's reply | the owner's boundary, or the retirement when no boundary follows | until raised; at most sixteen |
-| `pCleanup` | the service | a credit release that raised | `serviceProvider`: every path that services the provider | until kept as cleanup evidence; at most sixteen |
-| `heldRetiring` (of `pHeld`) | the service | `failAdoption` | `releaseSettled`, `workWaiting` | until the failed building's lease slot is gone |
-| `isRequestFailure` | the instance's cell | the settlement that made a failure eligible | the owner's dispatch; the instance's settlement | until the instance is ending; applied once |
-| `RequestHandles` | the application | the owner binds it | the value boundary's liveness check | with the owner; serves one |
-
-### What proves it
-
-`Test.LuaRuntime.Admission.*`, in `lua-runtime-tests`, run real instances on real supervised scheduled owners that
-lend their collection, hold leases and answer handle liveness, with the fake provider of the request examples, fake
-credit banks and fake lease resources, an injected clock and gates, never a sleep: each bank exhausted alone and in
-combination with zero left behind, competing admissions, a full ordinary bank that still drains; the release points
-(take before retirement, retirement before take, a retirement completed on a provider's thread invisible until the
-boundary, a lost reference, an instance that ends, a failed retirement, an admission taken back); the position
-(init at tick 0, default and explicit offsets, same-tick sequence order against reversed replies, a late provider
-holding the tick, the offset refused on arrival, the ceiling and exhausted numbers, an engine failure when the counter
-has nowhere to go); required and optional failure with the latch independent of reads, caught errors and late cancels;
-every kind of defect; the result lease built, kept live after a take, released with the instance, discharged unused and
-released when cancelled after adoption; immediate completion during submission, revocation during the handoff,
-late, duplicate and unknown completions, and a disposal that fails; handles across two instances; and the races a review found, one example each: a credit release that raises at a settlement, at a withdrawal and in the owner's exit; a second reply while a resource waits to be built; credits that transfer to a resource built after its request was cancelled; a resource whose building failed while a stage's retirement is pending; a resource adopted for a result nobody took when the epoch changes; a latch carried to the end of the instance; a defect that arrives while the owner is exiting; the registry of handles claimed by owners that start together; the owner's bound across generic and opt-in requests; a reply that throws as it is first looked at; and a plain result of a request that reserved a lease, measured as handed. `lua-host-tests`
-pin `withArgumentCheck`. The cancellation and cleanup windows are the kind an asynchronous-exception race can hide on
-one platform, so CI, which runs them on Linux, is the evidence for them and a local pass is not.
+| State | Written by | Lifetime |
+| --- | --- | --- |
+| `pHeld` (the ledger) | the admission; the owner's thread; never a provider | admission until taken or discarded and the work reaped |
+| `pAdopting` | a provider's reply (insert); the owner (claim, finish) | until built, failed or the request ends |
+| `pDiscards` | `cancelOf`, the epoch | until released at the owner's boundary |
+| `pDefects`, `pCleanup` | a provider's reply; a credit release that raised | until raised or kept as evidence; at most sixteen each |
+| `isRequestFailure` | the settlement that made a failure eligible | until the instance is ending; applied once |
+| `RequestHandles` | the owner binds it | with the owner |
 
 ### The settlement seam and the declining hand-off (TRA-5)
 
-Two opt-in mechanisms serve a provider whose request carries a change it commits, or whose own admission cannot run inside the
-engine's transaction. Both are carried by a request admitted through the opt-in `Admission` and by nothing else: the generic requests,
-the owner's defaults and a provider that never reads them behave exactly as before.
+Two opt-in mechanisms for a provider whose request carries a change it
+commits, or whose own admission cannot run inside the engine's transaction.
+Both apply only to requests admitted through an `Admission`.
 
-**`Submission.submissionSettling :: Maybe Settling`** is the two halves of one arbitration between the provider's commit and the
-request's own end. `completeRequest` cannot make a mutation atomic: it is one IO reply after the provider's own commit, a script's
-cancel can win between the two, and a held reply is not a settlement. A provider that commits at the request's settlement reads
-`settlingEligible` and calls `settlingSettle` in the one transaction that decides its commit:
+**`submissionSettling ∷ Maybe Settling`** arbitrates between the provider's
+commit and the request's own end in one transaction. (`completeRequest` cannot:
+a cancel can win between the provider's commit and its reply.)
 
 | Operation | Meaning |
 | --- | --- |
-| `settlingEligible` (STM, read only) | the request is still waiting for its answer (not settled, no completion held, no resource waiting to be built), the owner takes answers, and for an owner on logical time **its assigned tick has been granted and waits, unbegun, at the boundary for this request** (`ticksGranted`: the scheduler stands at the boundary just before it and the application's grant for it is accepted and not applied; a tick nobody has granted has not been reached). **and no earlier place of that tick is still waiting for its answer** (the assigned sequence orders what commits: two requests answered in the opposite order of their places still commit in the order they were assigned; a place that is held, settled, ended or cancelled does not hold the later ones, and another owner is another provider state and never waits). An owner on elapsed time is eligible whenever the request is waiting. A request cancelled, ended by its requester, replaced by an epoch change or taken by the owner's exit is settled in the model, so it is not eligible |
-| `settlingSettle reply` (STM) | the reply is judged **purely** under the request's admission (`checkReplyPure`, the same contract and verdicts as `completeRequest`'s), then applied: an eligible request settles now, on logical time too (the position was reached, which is what eligibility says), and hands its tick's hold back; one that is not eligible yet is held for its position as a completion is. A reply the service did not declare is recorded for the owner to raise and settles nothing (`ReplyDefective`). A resource reply waits for the owner to build the resource into the reserved lease at its next boundary. `settlingPrepare reply` (pure) is the same settlement with its judgement made outside any transaction: evaluating it judges the reply (it reads only the reply and what the admission fixed), and `settlePrepared` applies that verdict in the caller's transaction, deciding the rest exactly as `settlingSettle` does |
-| `settlingJudge reply` (pure) | whether the host would take this reply as the request's settlement: the very judgement `settlingSettle` passes (`checkReplyPure`: not a value over the owner's or the admission's ceilings, not a failure with a code the service did not declare), as a function that writes nothing. A provider whose settlement is part of an atomic change uses it **before** it commits, on the largest reply it can make, to refuse a request whose answer could never be delivered: a reply rejected inside the committing transaction can only abandon that transaction (and the record of the defect with it) |
-| `settlingSettleFinal final reply` (STM) | `settlingSettle` for a resource reply with **the provider's last look**: `final` is read in the very transaction that settles the request once the owner has built the resource, and answers whether the success may settle or an expected failure settles instead (the resource built is then released by the caller). What a success makes visible and what it needs to be alive are therefore one transaction with the settlement. A verdict the service did not declare is the provider's defect, recorded for the owner like any other reply of it. A resource reply made when the request is eligible settles at that point and is never held for its tick |
-| `settlingSettleKeeping reply` (STM) | `settlingSettle` for a reply made while the provider still holds something borrowed for the request (the service's preparation that was running when it failed the request): it settles the request but does **not** prove the provider's work over; the work is polled for its retirement as the work of a withdrawn request is, and the request's places return only when the provider reports it complete. A resource reply made before its request's tick (through `settlingSettleFinal`) is built at once and its success held for the tick; the provider's last look is kept with it (`recFinal`) and taken again where the tick settles it, so a resource that no longer holds settles its expected failure and is released, and one the request's cancel, epoch change or instance's end overtakes is released by the discard of an adopted result nobody took. A reply made before the request's logical position is held for its tick as any early completion is, but the held completion remembers that the work is not over (`recHeldKeeps`): the tick's service, a cancel, an epoch change, the requester's end and the owner's close all read the one `completedHeld`, so none of them proves the work over. Not for a resource reply |
-| `settlingCancel` (STM) | the provider has itself ended its interest (the lease the request was made through was released, its client ended): the request settles as cancelled, as its script's own cancel would, and a request that settled already keeps its settlement |
+| `settlingEligible` (STM, read only) | the request still waits for its answer, the owner takes answers, and on logical time **its assigned tick has been granted and waits unbegun at the boundary** (`ticksGranted`) **and no earlier place of that tick still waits** (so requests commit in assigned order). A cancelled, ended, epoch-replaced or exit-taken request is not eligible |
+| `settlingSettle reply` (STM) | judges the reply purely (`checkReplyPure`, the verdicts of `completeRequest`) and applies it: an eligible request settles now and returns its tick's hold; one not yet eligible is held for its position. An undeclared reply is recorded as a defect and settles nothing. `settlingPrepare` / `settlePrepared` split the judgement from the application |
+| `settlingJudge reply` (pure) | whether the host would take this reply. **Call it before committing**, on the largest reply possible: a reply rejected inside the committing transaction can only abandon that transaction |
+| `settlingSettleFinal final reply` (STM) | for a resource reply: `final` is read in the transaction that settles the request once the owner has built the resource, and decides whether the success settles or an expected failure does (the built resource is then released) |
+| `settlingSettleKeeping reply` (STM) | settles the request but does **not** prove the provider's work over (it still holds something borrowed); the places return only when the provider reports completion. Not for a resource reply |
+| `settlingCancel` (STM) | the provider ended its own interest: the request settles as cancelled, unless already settled |
 
+`preflightDeliverable context admission schema reply` is the same judgement
+for a binding's precondition, reserving nothing.
 
-`preflightDeliverable context admission schema reply` is the same judgement for a binding's precondition: whether the host would take `reply` as the settlement of a request admitted with this admission and result schema, over the owner's limits, read in no transaction and reserving nothing. A binding asks it, for the largest reply its call can make, before any bank is asked, so a call whose answer could never be delivered is a permanent refusal decided ahead of the temporary pressure of a full bank (`m1ReplyCheck` in `hetoimasia-lua-engine`'s request library does it for M1).
+A request settled by the seam on logical time stays hidden from its waiters
+until its tick serves it, in place order. A resource reply through the seam
+does not prove the work over: a request that ends first still gets
+`workCancel`. A reply arriving while a resource reply waits to be built is a
+duplicate.
 
-A request settled by the seam on logical time stays in the places not yet served, hidden from its waiters (`settledNumber`) until
-its tick serves it, so it reaches them in the order of the places. A resource reply made through the seam **does not prove the
-provider's work over**: the resource is the provider's until the owner has built it, so a request that ends first still has its work
-told (`workCancel`) and the provider reclaims what it offered at that very cancel. A reply made through `completeRequest` still proves
-the work over, as it always did. A reply that arrives while a resource reply waits to be built is a duplicate whatever it is (counted, never replacing the first).
-
-**`SubmissionDeclined`** (`DeclinedBusy bank` or `DeclinedRefused why`) is what a provider raises from `endpointSubmit` to decline a
-request it was handed, before it accepted any work. The admission is taken back whole (every bank it reserved is returned unused, the
-reserved lease is abandoned, no handle exists, the instance has no latent failure) and the call is answered as data
-(`Unavailable (BankCredit bank)`, which the binding hands the script as busy) or as the ordinary error a permanent refusal is. A
-provider whose own admission is an IO action of its own uses it, since it cannot reserve its banks inside the engine's transaction;
-it must have changed nothing when it raises it. Anything else a provider raises from the hand-off is, as it always was, a failure of
-the host with the admission taken back.
-
-**What proves it.** `lua-runtime-tests`, `Test.LuaRuntime.Admission.Seam`: the declining hand-off with nothing held afterwards and
-a later call accepted; an eligible request settled in the provider's own transaction, and a request a cancel won no longer eligible; every reply while a resource reply waits is a duplicate; two places of one logical tick commit in their assigned order whichever is ready first; and a final verdict the service did not declare is the provider's defect, fatal even for an optional request.
+**`SubmissionDeclined`** (`DeclinedBusy bank` or `DeclinedRefused why`) is
+what a provider raises from `endpointSubmit` to decline a request **before it
+has changed anything**. The admission is taken back whole and the call is
+answered as busy data or as the ordinary permanent refusal. Anything else
+raised from the hand-off is a host failure.
 
 ## Provider events
 
-`Hetoimasia.Scripting.Lua.Provider` (LUA-26, in `runtime-lua`) lets an instance subscribe a function to the events
-a provider delivers, without a provider's thread ever entering Lua. It follows P-7 of [the Lua runtime
-design](../../docs/archive/designs/lua_runtime_design.md): a subscription is an owned record with bounded delivery, unsubscribe and
-invalidation; a producer never invokes a Lua closure on its own thread, and the owner looks up the still-live callback
-when it services an event; overload is stated per endpoint, and there is no universal lossy stream. It is built on the
-granted provider service, the one guard and the epoch operation of [Asynchronous requests](#asynchronous-requests),
-used unchanged, on the shared retained-obligation primitive of the instance leases, and on the protocol model's
-subscription records ([The protocol model](#the-protocol-model)).
+`Hetoimasia.Scripting.Lua.Provider` (in `runtime-lua`) lets an instance
+subscribe a function to events a provider delivers. A subscription is an owned
+record with bounded delivery, unsubscribe and invalidation. **A producer never
+invokes a Lua closure on its own thread**; the owner looks up the still-live
+callback when it services an event. Overload is stated per endpoint. It reuses
+the granted service, guard, epoch operation and retained-obligation primitive
+of [Asynchronous requests](#asynchronous-requests).
 
 ### Granting the subscriptions
 
-A scheduled owner that is granted the request service (`scheduledRequests`) and hosts instances can also be granted
-subscriptions, with `scheduledSubscriptions ∷ Maybe SubscriptionGrant`. A `SubscriptionGrant` names the providers' event
-endpoints (`EventEndpoint`: a name, the schema every delivery must conform to, the endpoint's `OverloadPolicy` and how a
-subscription is handed to the provider), the bound on the subscriptions the owner holds, and the bound on the events a
-logical owner holds for ticks it has not reached. The grant is the whole of the authority: an instance's `api` can
-subscribe only to an endpoint the grant names *and* the instance was granted (`instanceGrants` names endpoints beside event
-sources). An owner created with no grant leaves `api.subscribe` refused as not yet supported, with its action never run.
-A grant that does not make sense (a bound below one, no endpoint, an invalid or repeated endpoint name, a payload that
-names a capability, more endpoints than the driver module can declare entry points for beside the owner's sources, an
-owner with no request service or no instances) is refused before anything starts as `SubscriptionGrantRefused`, naming
-every reason. The owner's kind of time is the request grant's (`RequestTiming`): an owner that settles at assigned ticks
-admits events at assigned ticks, and one that settles on arrival admits them on arrival.
+An owner granted the request service that hosts instances can be granted
+`scheduledSubscriptions ∷ Maybe SubscriptionGrant`: the event endpoints
+(`EventEndpoint`: a name, the delivery schema, an `OverloadPolicy`, how a
+subscription is handed over), the bound on subscriptions, and the bound on
+events held for unreached ticks. An instance's `api` can subscribe only to an
+endpoint the grant names **and** `instanceGrants` granted it. A grant that
+does not make sense is refused as `SubscriptionGrantRefused`. The owner's kind
+of time is the request grant's `RequestTiming`.
 
 ### What a provider implements
 
-An endpoint's `eventSubscribe` is handed an `EventSubscription`: an `EventFeed` and the subscription's identity
-(`SubscriptionInfo`: the owner, the instance, the endpoint and the subscription's number). It answers a `ProviderWork`, as
-a request's provider does: `workCancel` withdraws the engine's interest (called once, on any path that ends the
-subscription) and `workRetirement` reads where the provider's own retirement of it has got to (a transaction that must not
-retry). The provider delivers through the feed, from any thread, now or later:
+`eventSubscribe` is handed an `EventSubscription` (an `EventFeed` and the
+`SubscriptionInfo`) and answers a `ProviderWork` (`workCancel`, called once;
+`workRetirement`, which must not retry). It delivers through the feed from
+any thread:
 
-* `feedDeliver place value` delivers one value. It never blocks and never waits for the owner, the queue or Lua. On an owner
-  on elapsed time the place is `Nothing` and the value is admitted on arrival. On an owner on logical time the application
-  assigns the place, `Just (DueSlot tick sequence)` (D-36); the delivery is held until that tick's boundary.
-* `feedFail reason` surfaces a delivery failure: the provider cannot preserve an authoritative event. The instance fails with
-  it (`ErrorDelivery`), once, and the application's escalation (`instanceEscalate`) decides what that means for its peers; the
-  simulation cannot go on as though the event had been delivered.
+- `feedDeliver place value` never blocks. On elapsed time the place is
+  `Nothing` and the value is admitted on arrival. On logical time the
+  application assigns `Just (DueSlot tick sequence)` and the delivery is held
+  until that tick's boundary.
+- `feedFail reason` says the provider cannot preserve an authoritative event:
+  the instance fails with `ErrorDelivery`, once.
 
-The answer says what became of a delivery (`EventAnswer`), and none is an error: `EventAdmitted`, `EventCoalesced`,
-`EventStaged`, `EventQueueFull`, `EventStagingFull`, `EventEnded`, `EventRefusedValue`, `EventLate`, `EventDuplicate`,
-`EventUnassigned` and `EventNotLogical`. A refusal is evidence about the provider: it is counted, and the value is not kept.
-A delivery is checked before anything is retained, against the owner's value limits and the endpoint's schema. What is
-measured is what the callback's entry point is handed: the instance's number and the record naming the endpoint and the
-subscription, which the host checks together (so a payload that fits the record alone and not the record with the number is
-refused to the producer, and never accepted and then fails the instance). It is copied to buffers of its own, so a small slice
-of a large text or byte string does not keep the whole buffer alive while the delivery waits, which the limits do not count, and
-it is fully evaluated, all inside the guard: a value that throws when it is first looked at is a refused delivery and not an
-exception loose on the producer's thread. The reason of a `feedFail` is bounded (512 characters) and copied the same way.
+The `EventAnswer` is never an error: `EventAdmitted`, `EventCoalesced`,
+`EventStaged`, `EventQueueFull`, `EventStagingFull`, `EventEnded`,
+`EventRefusedValue`, `EventLate`, `EventDuplicate`, `EventUnassigned`,
+`EventNotLogical`. A refusal is counted and the value not kept. A delivery is
+checked, copied to its own buffers and fully evaluated inside the guard,
+measured as what the callback's entry point is handed; a value that throws
+when first looked at is a refused delivery. A `feedFail` reason is bounded at
+512 characters.
 
 ### What a script sees
 
-`api.subscribe(endpoint, callback)` subscribes a function to an endpoint and answers a handle; `api.unsubscribe(handle)`
-ends the subscription and answers whether it ended a live one (`false` for one that had ended already: unsubscribe settles
-once). A callback is handed the instance's `self` and a record `{source, sequence, tick, subscription, payload}`: `source`
-is the endpoint, `sequence` is the place admission gave the delivery among the instance's invocations, `tick` is the
-logical tick it was admitted at and `subscription` is the subscription's number. Subscribing is allowed in `init` and in
-any invocation of an instance that is taking subscriptions, and is refused, as a fault of the call and never a failure of the
-host, when the instance is stopping (a `shutdown` hook is past taking them), when the endpoint is not one the instance was
-granted, and when every place is held. The provider is asked nothing of a refused subscription. A provider that raises when
-it is handed one is a failure of the host, unconverted, and the subscription is taken back as though it had never been
-admitted.
+`api.subscribe(endpoint, callback)` answers a handle; `api.unsubscribe(handle)`
+answers whether it ended a live subscription. A callback is handed `self` and
+`{source, sequence, tick, subscription, payload}`. Subscribing is allowed in
+`init` and any invocation of an instance taking subscriptions. It is refused
+as a fault of the call, the provider asked nothing, when the instance is
+stopping, the endpoint is not granted, or every place is held. A provider that
+raises when handed a subscription is a host failure and the subscription is
+taken back.
 
 ### Whose a subscription is, and where deliveries wait
 
-An instance owns its subscriptions, not the invocation that made them: they survive that invocation's end and every callback
-after it, until the instance unsubscribes them, an epoch changes, or the instance ends. This is the protocol model's
-*holder* (the same one the instance's requests use): the model's subscription records are owned by an identity the session
-issues for the instance, ended through the revocation a retiring task goes through.
+An instance owns its subscriptions until it unsubscribes, an epoch changes or
+it ends. A delivery takes a place in the instance's one bounded invocation
+queue as a *reference*; the payload stays in the model's record until the
+callback's first segment is about to run. A paused instance's deliveries are
+retained in order.
 
-A producer's delivery takes a place in the instance's one bounded queue of invocations (`boundInvocationQueue`), shared with
-its events and its due update, as a *reference* to the subscription: the payload stays in the model's record for the
-subscription, and is taken as the callback's first segment is about to run. A delivery keeps its sequence, its logical tick
-and its place in the queue until then, whatever happens, paused included (D-26): a paused instance's deliveries are retained
-in order and run after the resume.
-
-* **Ordered events** take a place of their own and are refused, counted (`readingRefused`, `snapshotQueueFull`) and never
-  evicted when the queue has none. A provider whose event is authoritative surfaces the refusal with `feedFail`.
-* **Replaceable state** keeps at most one unstarted delivery per subscription. A later value replaces that delivery's payload
-  and tick *in place*, keeping its place in the queue and taking no further place; the value it replaced is counted as
-  coalesced and was never delivered. Filling an empty slot needs a place in the queue, as an ordered event does; replacing
-  needs none. "Unstarted" lasts through the callback's first segment, including the time after the owner selected the
-  delivery for its next invocation and before that segment runs; once the segment begins the payload is the callback's and
-  immutable, and a later value is a delivery of its own behind it.
-* A delivery to a subscription that has ended (unsubscribed, invalidated, or ended with its instance or its owner), or whose
-  instance is stopping, is refused and counted (`EventEnded`), never run, and on a logical owner never held for a tick the
-  instance will not reach. One accepted and not yet begun when its subscription ends is discarded, counted by
-  the model, and never run; an invocation already selected for it completes without entering Lua.
+- **Ordered events** take a place of their own and are refused, counted and
+  never evicted when the queue is full. A provider whose event is
+  authoritative surfaces that with `feedFail`.
+- **Replaceable state** keeps at most one unstarted delivery per
+  subscription. A later value replaces its payload and tick *in place*; the
+  replaced value is counted as coalesced. Filling an empty slot needs a queue
+  place; replacing needs none. Once the callback's first segment begins the
+  payload is immutable.
+- A delivery to an ended subscription, or to a stopping instance, is
+  `EventEnded`. One accepted and not begun when its subscription ends is
+  discarded.
 
 ### Logical event admission
 
-On an owner driven by logical time, provider events are admitted by application-assigned tick and sequence (D-36), as
-LUA-23 admits controls, and never in arrival order. A delivery with a place is held, in a store bounded by the grant
-(`grantStagingBound`, refused and counted as `EventStagingFull` past it) and keyed by its place (a place that is taken is
-`EventDuplicate`, a tick the owner has begun `EventLate`, and one with no place `EventUnassigned`). The owner asks to be held at
-the earliest tick it holds an event for, in the same transaction as the delivery, so the grant that reaches the tick is held
-until the owner has served it.
+On logical time, events are admitted by assigned tick and sequence, never in
+arrival order. A placed delivery is held in a store bounded by
+`grantStagingBound` (`EventStagingFull`), keyed by its place (`EventDuplicate`
+for a taken place, `EventLate` for a begun tick, `EventUnassigned` for none).
+The owner asks to be held at the earliest tick it holds an event for.
 
-At that boundary, after the controls the tick holds and before any task the tick woke, the owner admits the events due, in the
-order of their places, through the one function that applies the queue's bound and the endpoint's overload policy. That is
-where an ordered event is refused for want of a place, or replaceable state coalesces, so which input is accepted and which
-value a callback sees follow the logical sequence and not how fast the owner served; a value assigned to a later tick never
-replaces one that was visible at an earlier tick. An ordered event that is accepted for a tick and cannot be admitted at it
-(the queue is full) cannot be reported to the provider that is no longer waiting for an answer, so it is surfaced as the
-delivery failure it is, exactly as `feedFail` is, and is counted; a refused fill of replaceable state is counted and fails
-nothing, since only the newest value of a state matters.
+At that boundary, after the tick's controls and before any task the tick
+woke, the owner admits the due events in place order through the one function
+that applies the queue bound and the overload policy. So which input is
+accepted and which value a callback sees follow the logical sequence. An
+ordered event that cannot be admitted at its tick is surfaced as a delivery
+failure, as `feedFail` is; a refused fill of replaceable state is counted
+only.
 
-**The tick's claim.** A tick whose grant is applied is held, by the owner's one watch, for as long as any instance has a
-delivery of a subscription that is admitted and unfinished (waiting in its queue, selected for its next invocation, or being
-run by the invocation in flight) *and* can make progress in that tick: it is serving, and the invocation in flight is ready to
-run a segment (it yields and goes on, or it has just ended and the next is about to be given a place), or nothing is in flight
-and the next delivery waits its turn and something is ready to run. An instance whose work is suspended on a wait (a tick, a
-deadline, a request) cannot, and neither can one that is paused, stopping, ended or still initializing: the tick does not wait
-for it, and it claims the tick it is woken at, and later ones, as it becomes able, by the same rule. While any instance has such
-work the owner also asks to be held at the next tick, so every grant it applies is looked at before any task it woke is chosen.
-
-The claim is computed in one place from the instances' state as it is, and never from a flag set when a delivery was admitted,
-so no path that changes a delivery's state can leave a tick claimed that nothing needs, or unclaimed that something does:
-admission, selection for an invocation, a yield, a wait and the grant that resumes it, a coalesce, an unsubscribe, an epoch
-change, a pause and a resume, a stop, and a failure each change what that function reads. So the next tick's deliveries are not
-admitted while this tick's can still run, a callback that yields or waits for a tick waits for the same tick however the grants
-behind it were queued, several deliveries admitted at one tick each start at the tick their predecessor ended at, and queued
+**The tick's claim.** An applied tick is held for as long as any instance has
+an admitted, unfinished delivery **and** can make progress in that tick
+(serving, with the invocation in flight ready, or nothing in flight and
+something ready). An instance suspended on a wait, paused, stopping, ended or
+initializing does not hold it. The claim is computed in one place from the
+instances' state as it is, never from a flag set at admission. So queued
 grants give the same admissions and effects as grants served one at a time.
 
 ### Epochs
 
-`advanceRequestEpoch` replaces the generation of an owner's records, and invalidates every subscription with them, as the
-model's `advanceEpoch` does: each subscription ends once, the events held for it and its unstarted deliveries are discarded
-and counted, and the providers are told by the owner at its next boundary. The accounting of their work is retained under the
-identities it was issued under, so a late delivery from an old producer finds nothing, cannot reach a subscription made in the
-new epoch (an identity carries its epoch and a generation that is never reissued, so the same local number does not give it
-somewhere new to land), and the places stay charged until the providers prove their retirements over. Instances are not
-invalidated: the same instance subscribes again. The instance's VM is not left holding what it captured for the subscriptions
-the engine ended: the owner has the driver let go of their callbacks and handles at its next boundary, without the script
-unsubscribing them (the driver's creation entry on a slot that is live is that cleanup point, and it asks the engine for the numbers that
-ended one at a time, so the answer fits any limits however many ended; an epoch wakes the owner once for an instance, however
-often it changes before the owner gets there), so repeated subscribe, epoch-change and retirement cycles do not grow the VM.
+`advanceRequestEpoch` also invalidates every subscription: each ends once, its
+held events and unstarted deliveries are discarded and counted, and providers
+are told at the owner's next boundary. A late delivery from an old producer
+finds nothing (an identity carries its epoch and a never-reissued
+generation). Places stay charged until the providers prove retirement.
+Instances are not invalidated, and the owner has the driver drop the
+callbacks of ended subscriptions, so repeated cycles do not grow the VM.
 
 ### Retirement and the bound
 
-Outstanding provider work is a retained retirement obligation, the one the instance leases and the request service keep, and it
-is charged to the subscription's place in the owner's bound until the provider proves it over. A subscription that ended still
-holds its place while its provider's retirement is pending, so subscribing and unsubscribing over and over cannot reclaim
-capacity. An instance's settlement waits for the providers of its subscriptions, as it waits for a lease's retirement:
-nothing is reported as stopped merely because Lua stopped, and the owner's exit waits, uninterruptibly, through a stop and a
-cancellation, until each has said it is done.
+Outstanding provider work is a retained retirement obligation charged to the
+subscription's place until the provider proves it over, so subscribing and
+unsubscribing in a loop cannot reclaim capacity. An instance's settlement and
+the owner's exit wait for the providers.
 
 ### The guard, and what a failure is
 
-Every call into provider code for a subscription goes through the one guard and is fully evaluated inside it: subscribing,
-withdrawing interest, reading a retirement and reading a delivery. Where failures arise together the first is raised and the
-others are kept whole as cleanup evidence; nothing is dropped.
-
-* Provider code raising when the engine calls it (handing it a subscription, telling it interest was withdrawn) is a failure of
-  application code: a failure of the host under the owner's `WorkerPolicy`, unconverted.
-* A provider's retirement that fails is a cleanup failure: retained on the work, never retried, fatal under every policy.
-* A provider that cannot preserve an authoritative event surfaces a delivery failure, which fails the instance (above).
+Every call into provider code goes through the one guard. Provider code
+raising when the engine calls it is a host failure under the `WorkerPolicy`;
+a failing retirement is a cleanup failure, fatal under every policy; a
+provider that cannot preserve an authoritative event fails the instance.
 
 ### Determinism
 
-On one logical owner, identical inputs give identical event admission order and recorded effects, however the producers'
-arrivals, the grants' pacing (queued or served one at a time) and the segment delays vary. The inputs are the events with their
-assigned ticks and places, and the grants.
-
-### What proves it
-
-`Test.LuaRuntime.Subscription.*`, in `lua-runtime-tests`, run real instances on real supervised scheduled owners with a fake
-provider the examples drive by hand, an injected clock and gates, never a sleep: a producer from other threads that never blocks
-and never calls Lua; ordered events and their refusal at capacity; replaceable state coalescing in place, at capacity, through
-the delivery the owner selected for its next invocation, and not once a callback has begun; unsubscribe and stop settling once,
-in either order; every way an instance can end revoking its subscriptions and its stop waiting for the provider; a subscription
-made in `init` surviving every callback after it; a paused instance retaining its deliveries; a refused subscribe; logical
-admission by assigned place under reversed and permuted arrivals, late, duplicate and unassigned places and a full store, the
-queue's overflow decided at the boundary, queued and individually served grants, and the tick not waiting on what cannot start;
-epochs, generations and the bound that churn cannot reclaim; a provider that raises, a retirement that fails and failures
-arising together; unfit and throwing deliveries; and every grant that is refused. The protocol model's holders of
-subscriptions are pinned in `lua-host-tests`. The cancellation and cleanup windows are the kind an asynchronous-exception race
-can hide on one platform, so CI, which runs them on Linux, is the evidence for them and a local pass is not.
-
+On one logical owner, identical events with their assigned ticks and places,
+and identical grants, give identical admission order and recorded effects
+however arrivals, grant pacing and segment delays vary.
 ## The script runner
 
-`Hetoimasia.Scripting.Lua.Runner` (LUA-27 and LUA-28, in `runtime-lua`) runs a list of scripts, each a file, as instances of one
-named VM, on the elapsed clock or on logical ticks it grants at a real-time rate, and answers a bounded report of the run. It is the
-layer under the `lua` subcommand (LUA-19) and under a windowed application alike. It publishes an event when an instance starts and when
-it ends, to the scripts that subscribe. It parses no arguments, installs no signal handler, never calls `exit`, opens no window and imports nothing of the
-console, GLFW, Vulkan or a game: what the outside world does is injected. Its behavior is [D-40 and D-42 of the Lua runtime
-design](../../docs/archive/designs/lua_runtime_design.md#d-40-the-headless-runners-clock-ending-event-source-and-exit-statuses), over the
-instance contract (D-26, D-27), and it reopens none of the contracts it is built on.
-
-```haskell
-runScripts ∷ LuaRuntime → RunnerConfig → IO RunOutcome
-```
+`Hetoimasia.Scripting.Lua.Runner` (in `runtime-lua`) runs a list of scripts,
+each a file, as instances of one named VM, on the elapsed clock or on logical
+ticks it grants at a real-time rate, publishes an event when an instance
+starts and ends, and answers a bounded report: `runScripts ∷ LuaRuntime →
+RunnerConfig → IO RunOutcome`. It is the layer under the `lua` subcommand and
+a windowed application alike. It parses no arguments, installs no signal
+handler, never calls `exit` and opens no window: what the outside world does
+is injected.
 
 ### What a run is given
 
-`RunnerConfig` holds the VM's name (`runnerName`, the owner label the tables and reports show), the scripts
-(`runnerScripts`), an optional run limit (`runnerLimit`), an optional tick duration (`runnerTick`) with an optional limit of ticks
-(`runnerTickLimit`), and the inputs that are not data: the stop request
-(`runnerStop ∷ STM Bool`, which the run waits on and never polls), the monotonic clock and the timer backend
-(`runnerClock`, `runnerTimer`; `runnerConfig` supplies the production ones), the output sink and the error sink
-(`runnerOutput`, `runnerErrors ∷ Text → IO ()`) and a `Logger`. A `Script` is a file path, an optional name (without one, the last
-component of the path) and an optional interval: a positive elapsed duration (`Script path name (Just duration)`), or on a tick VM a
-positive whole number of ticks (`everyTicks n (script path)`). The `LuaRuntime` is the one a `withSupervision`
-boundary made: the owner the run starts is one of its supervised workers.
+`RunnerConfig` holds the VM's name (`runnerName`), the scripts
+(`runnerScripts`), an optional duration limit (`runnerLimit`), an optional
+tick duration (`runnerTick`) with an optional tick limit (`runnerTickLimit`),
+the stop request (`runnerStop ∷ STM Bool`, waited on, never polled), the
+clock and timer backend (`runnerClock`, `runnerTimer`), the output and error
+sinks (`runnerOutput`, `runnerErrors ∷ Text → IO ()`) and a `Logger`.
+`runnerConfig` supplies the production clock and timer. A `Script` is a path,
+an optional name (default: the path's last component) and an optional
+interval: an elapsed duration, or on a tick VM a whole number of ticks
+(`everyTicks n (script path)`).
 
-A run admits at most `runnerMaxScripts` (64) scripts. The scheduler and instance bounds are the runner's own, documented
-constants (`runnerSchedulerBounds`, `runnerInstanceBounds`) that pass the instance configuration's validation: the
-live-instance bound is the most scripts a run admits, and the retained results are twice that.
+A run admits at most `runnerMaxScripts` (64) scripts, under the runner's own
+`runnerSchedulerBounds` and `runnerInstanceBounds`.
 
 ### Loading
 
-The host reads nothing from disk, so the runner reads each *distinct* path once, in order (a path is distinct by its text;
-nothing is resolved), and hands the host the bytes as a module. A read is bounded by the host's source limit: no more than one byte
-past it is read, and a file over it is refused. A path named twice is read and loaded once and admitted twice. A module's identity is its
-place among the run's distinct paths, a colon and the end of its path, with control characters replaced and cut to the host's
-128-byte rule: two distinct paths never share one, even with the same file name in different directories, and it is the same for
-the same scripts every time.
+The runner reads each *distinct* path once, in order (distinct by its text;
+nothing is resolved), bounded by the host's source limit, and hands the bytes
+to the host as a module. A path named twice is loaded once and admitted
+twice. A module's identity is its place among the distinct paths, a colon and
+the end of its path, cut to the host's 128-byte rule.
 
-A missing, unreadable or over-bound file, and a module the host rejects (a syntax error, an error at its top level), are each *a source that
-did not load*. It fails the VM's start and not an instance: the run ends with `EndedStartupFailure` and a `LoadFailure` naming the
-file as it was given, the VM, the error and the traceback if one was captured, each bounded, and no TID. The first one in script
-order is the one reported, and the top level of the modules before it has run, as the host's load order has it; no instance is
-admitted and no `init`, `run`, `update`, callback or `shutdown` runs. The VM is retired. The status is failure.
+A missing, unreadable or over-bound file, or a module the host rejects, is a
+*source that did not load*. **It fails the VM's start, not an instance**: the
+run ends with `EndedStartupFailure` and a `LoadFailure` (the first in script
+order), no instance is admitted, no hook runs, the VM is retired, and the
+status is failure. The top level of the modules before it has run.
 
 ### The kind of an instance
 
-The owner reads, once, before it is ready and running none of the module's code, which of the optional hooks `init`, `update`,
-`shutdown` and `run` each module it loaded defines, and answers `moduleHooks` (in `Hetoimasia.Scripting.Lua.Instance`) from
-that reading for the owner's life. An entry that is present and is not a function counts as defined, as the instance's own check counts it.
-A module defining `run` is a one-shot, one defining `update` is looped on the script's interval, and one defining neither is an
-event-only instance. These are refused as usage, before any instance is admitted and before any hook runs, naming the script: a
-module defining both `run` and `update`; one defining `update` with no interval; an interval for a module that does not define
-`update`; no scripts at all; more scripts than a run admits; a zero interval or a zero limit; and, for the clock: a tick duration of zero
-(`TickDurationNotPositive`), an elapsed interval on a tick VM (`ElapsedIntervalOnTickClock`), a tick interval on an elapsed VM
-(`TickIntervalOnElapsedClock`), a tick limit on an elapsed VM (`TickLimitNeedsTickClock`), and a tick count, as a limit or as an interval,
-that is not positive (`TickCountNotPositive`) or does not fit a 64-bit tick (`TickCountTooLarge`). A refusal is the distinct outer result
-`Refused (UsageRefusal reasons)`, never a report of a run, so the command line can map it. Where it needed the VM to ask, the VM that
-was started is retired.
+`moduleHooks` (in `Hetoimasia.Scripting.Lua.Instance`) answers which of
+`init`, `update`, `shutdown` and `run` each loaded module defines, read once
+before readiness, running none of its code. A module defining `run` is a
+one-shot, one defining `update` is looped on the script's interval, one
+defining neither is event-only.
+
+Refused as usage, before any instance is admitted, as the distinct result
+`Refused (UsageRefusal reasons)`: both `run` and `update`; `update` with no
+interval; an interval without `update`; no scripts; too many scripts; a zero
+interval or limit; `TickDurationNotPositive`; `ElapsedIntervalOnTickClock`;
+`TickIntervalOnElapsedClock`; `TickLimitNeedsTickClock`;
+`TickCountNotPositive`; `TickCountTooLarge`. A VM started to ask is retired.
 
 ### The VM
 
-It opens the base, string, table, math and coroutine libraries and no others; `io`, `os`, `package` and `debug` stay closed. The policy is
-`fifo`, the only built-in one. The owner hosts instances with no event source of the old kind, and holds the request service and the subscription grant that the instance events
-need ([Events](#the-instance-events)). On the elapsed clock it has no tick duration and admits controls on arrival. On a tick VM it is hosted with the
-tick duration and admits controls logically ([Ticks](#the-tick-clock)). Every instance's failure is isolated (the runner's answer to the escalation decision is
-always `Isolate`). The lifecycle bindings are registered as `lifecycle` (`runnerLifecycleName`): `pause`, `resume`, `stop`, `inspect`,
-`inspect_owner`, `owners`, `self`, `result` and `forget`, as [Lifecycle services](#lifecycle-services) documents them. The owner is
-granted every control and inspection permit over its own VM's instances and nothing else, so one script can pause, resume, stop and inspect
-another, and itself. Scripts are trusted (D-12): nothing here claims a sandbox.
+It opens the base, string, table, math and coroutine libraries; `io`, `os`,
+`package` and `debug` stay closed. The policy is `fifo`. Every instance's
+failure is isolated. The lifecycle bindings are registered as `lifecycle`
+(`runnerLifecycleName`), and the owner is granted every control and
+inspection permit over its own instances only, so one script can pause,
+resume, stop and inspect another and itself. **Scripts are trusted: nothing
+here is a sandbox.**
 
 ### Admission
 
-Scripts are admitted one at a time, in the order they are listed, each only after the previous instance's `init` has finished or failed and the owner
-has nothing left to do (every instance quiet, which the runner reads from one inspection: nothing initializing or stopping, nothing ready or running,
-no event queued, no update owed, no one-shot's `run` yet to execute; a paused instance is quiet, and so is one whose invocation is suspended on a wait, however much is queued behind it: the owner can do nothing for it until its wake, a tick or a time that a grant of the runner's brings). So TIDs ascend in script order
-and the order of the `init`s is the script order, on both clocks. A failed `init` does not stop later scripts from being admitted. The wait is
-the run's one wait: a stop request, the duration limit or the owner's exit during admission admits no further script, the instances admitted are
-stopped in ascending TID order and the tables list them. While one instance is admitted the owner is held, before its next segment, at the gate the
-runner installs as the owner's segment observer; the instance's *started* event is produced while it is held, and only then does the owner run the
-instance's `run`. That is what makes a one-shot that runs, ends or unsubscribes at once give the same events as one the runner's thread observes
-promptly: the owner is never ahead of the runner's coordination. The gate is released on every way out of the admission and before every retirement.
-`runnerInstanceBounds` queues for twice as many invocations as a run has scripts (128), so a watcher with one subscription never overflows in the
-ordinary case.
+Scripts are admitted one at a time, in listed order, each only after the
+previous instance's `init` has finished or failed and every instance is quiet
+(nothing initializing, stopping, ready or running; no event queued, update
+owed or `run` pending; a paused or wait-suspended instance is quiet). So TIDs
+ascend in script order and `init`s run in script order on both clocks. A
+failed `init` does not stop later admissions. A stop request, the duration
+limit or the owner's exit during admission admits nothing further. While an
+instance is admitted the owner is held, before its next segment, at a gate
+the runner installs as the segment observer; the *started* event is produced
+while it is held, so the owner is never ahead of the runner's coordination.
 
 ### The tick clock
 
-With `runnerTick = Just d` (a positive duration of whole nanoseconds) the VM is a *tick VM*: it is hosted with tick duration `d`, admits Lua controls
-logically and takes events at assigned ticks. A looped script's interval is then in ticks (`everyTicks n`). The driver grants one tick of exactly `d`
-whenever one is due: tick *n* is due *n* tick durations after the instant read when admission is complete, on the injected clock, and waited for on
-the injected timer, whose wake only says to look at the clock again, so an early or a stale wake grants nothing. A tick that is late is granted at
-once, one grant for each, so that none is skipped, merged or shortened and the number granted is the number due. A grant the engine answers full is
-waited out and asked again; one it answers closed means the owner is stopping, and the run ends as for a stop request. After a grant the driver waits
-for the engine to have finished it *and* for every instance to be quiet (a grant finishes when the work it woke has finished, which is not the owner
-having nothing left to do: a resumed instance can make other work ready), and then, at the boundary, produces the ends it saw, for the next tick. The
-wait is one STM wait with no polling, composed with supervision, the stop request, the limits, the owner's exit and every instance having ended.
+With `runnerTick = Just d` the VM is a *tick VM*: it admits Lua controls
+logically, takes events at assigned ticks, and looped intervals are in ticks.
+Tick *n* is due *n* tick durations after the instant read when admission
+completes. The timer's wake only says to look at the clock. **A late tick is
+granted at once, one grant each: none is skipped, merged or shortened.** A
+grant answered full is waited out and asked again; closed ends the run as a
+stop request does. After a grant the driver waits for the engine to have
+finished it *and* for every instance to be quiet, then produces the ends it
+saw.
 
-A **tick limit** (`runnerTickLimit = Just n`, at least one) ends the run when *n* ticks have completed, exactly as a duration limit ends it: every
-remaining instance is stopped in ascending TID order, its `shutdown` runs once with reason `stopped`, the VM is retired, and no tick is granted after
-the stop begins. A tick that is in progress when a stop request or a duration limit arrives lets the running segment return and is not counted as
-completed. Both limits may be set; the first reached ends the run. **When several endings hold together** the order of precedence is the contract, and
-the tick limit is third: a failure to write, then *every instance ended* (a tick whose last instance ended is waited out and counted first), then *the
-stop request*, then *the tick limit*, then *the duration limit*. A tick that has finished is counted before the duration limit is looked at. The
-report says the run ended at the tick limit (`EndedTickLimit`) and how many ticks completed (`reportTicks`); the status is success only if no instance
-failed (a failing `shutdown` included) and no source failed to load, as for any ending.
+A **tick limit** ends the run when *n* ticks have completed, as a duration
+limit does. A tick in progress when a stop arrives is not counted. The
+runner assigns every script-requested control the first tick the owner has
+not begun and an increasing sequence, and never declines.
 
-Every pause, resume or stop a script requests through the lifecycle namespace on a tick VM is assigned by the runner a tick, the first the owner has not
-begun, and a sequence that is unique and increases in assignment order; the runner never declines to assign, so the engine's *late* and *duplicate*
-answers are not reachable in a correct run. On an elapsed VM controls are admitted on arrival.
-
-**Determinism.** On a tick VM, for identical scripts, intervals, tick duration and scheduling configuration, on the same build and platform, runs give the
-same script output, events (with their ticks and places), order of controls, tables and report however long segments take, however the runner's own
-threads are scheduled and whenever in real time the ticks are granted, provided the runs set no duration limit and take no external stop (those can change
-the completed work when pacing changes); a tick limit is allowed. Runtime identities are unique to a run, so a comparison maps TIDs to the instance's
-order in the run. The guarantee is of logical-time work: any elapsed wait a script makes keeps its wall-clock semantics.
+**Determinism.** On a tick VM, identical scripts, intervals, tick duration and
+configuration on the same build and platform give the same output, events,
+order of controls, tables and report however segments and threads are paced,
+provided no duration limit is set and no external stop arrives. Compare TIDs
+by an instance's order in the run. Elapsed waits keep wall-clock semantics.
 
 ### The instance events
 
-Every instance is granted one ordered-events endpoint, `instances` (`runnerEventsName`), which a script reaches with `api.subscribe("instances", callback)`.
-The callback is handed LUA-26's envelope (`source`, `sequence`, `tick`, `subscription`, `payload`) unchanged, and the payload is a record: `event`, `"started"` or
-`"ended"`; `tid`, the record the lifecycle namespace uses (`{runtime, owner, id}`), so a watcher can hand it to `pause`, `resume`, `stop` and `inspect`; `name`, the
-instance's name; and `outcome`, present only on an end, `"completed"`, `"stopped"` or `"failed"`. The request service the subscription grant needs holds exactly one
-endpoint, which no namespace of the VM can start (a script has no binding that starts a request); it settles at assigned ticks on a tick VM and on arrival on an
-elapsed VM, which is what decides whether the endpoint's deliveries are assigned. The endpoint's subscription bound is `runnerSubscriptionBound` (256) and its staging
-bound `runnerStagingBound` (1024), sized so that a watcher with one subscription in a run of the most scripts does not overflow in the ordinary case, since each instance
-produces at most two events. No capacity invariant is claimed for other subscription patterns. When the engine withdraws interest in a subscription the runner stops delivering
-to it and proves its retirement at once, so no instance's stop waits on the runner.
+Every instance is granted one ordered-events endpoint, `instances`
+(`runnerEventsName`): `api.subscribe("instances", callback)`. The payload is
+a record: `event` (`"started"` or `"ended"`), `tid` (the lifecycle
+namespace's `{runtime, owner, id}`), `name`, and on an end `outcome`
+(`"completed"`, `"stopped"`, `"failed"`). Bounds: `runnerSubscriptionBound`
+256, `runnerStagingBound` 1024.
 
-**When an event is produced.** *Started* is produced when an instance's `init` has succeeded, while the owner is held; an instance whose `init` fails produces only
-*ended*, with outcome `failed`, and an instance's *started* always precedes its *ended*. *Ended* is produced when the instance has ended. Ends seen while scripts are still
-being admitted are produced after admission is complete, after every *started*; on a tick VM ends seen during a tick are produced at its boundary, after the tick has
-completed; on an elapsed VM an end is produced when the run sees it. Events produced together are in ascending TID order. An event reaches only the subscriptions that
-exist when it is produced, and nothing is replayed to a later subscriber. One event is delivered once to each such subscription, in ascending order of the subscription's
-number, so several deliveries can go to one instance. On a tick VM every *delivery* is assigned the first tick the owner has not begun and a place of its own (a sequence that
-increases in production order and then recipient order; a place is unique across the owner); on an elapsed VM each is made on arrival. The ends instances have earned are produced, and counted, once the owner is quiet and before the run ends by every instance having ended or by the tick limit, even when no later tick can deliver them; no event is produced once the orderly
-stop (the stop request, the duration limit, the owner's exit) has begun.
+- *Started* is produced when `init` has succeeded, while the owner is held.
+  A failed `init` produces only *ended* with `failed`.
+- Ends seen during admission are produced after every *started*; on a tick VM,
+  ends seen during a tick are produced at its boundary; on an elapsed VM, when
+  the run sees them. Events produced together are in ascending TID order.
+- An event reaches only the subscriptions that exist when it is produced;
+  nothing is replayed. It is delivered once per subscription, in subscription
+  number order.
+- No event is produced once the orderly stop has begun.
 
-**Overload and defects.** Every answer to a delivery is classified by one pure function (`classifyAnswer`) and none is dropped without being counted. Admitted or staged:
-delivered (a staged one can still fail at its tick). Refused when offered because the queue is full (`EventQueueFull`, on an elapsed owner) or the staging store is full
-(`EventStagingFull`): counted in the report by kind, nothing evicted or retried, nothing fails. A delivery staged for a tick that finds its subscriber's queue full when the tick
-is admitted fails that watcher with LUA-26's delivery error (D-43): there is no second answer to the runner, the failure is reported once like any instance failure, the run's
-status is failure and the report counts the watcher failed. The subscription having ended is counted and benign. Late, duplicate, unassigned, not logical, a value the endpoint's
-schema refuses and coalesced (the endpoint is ordered events) are defects of the runner: they are raised as a failure of the host, never counted away.
+Every delivery answer is classified by one pure function (`classifyAnswer`):
+
+| Answer | Treatment |
+| --- | --- |
+| admitted, staged | delivered |
+| `EventQueueFull`, `EventStagingFull` when offered | counted in the report; nothing evicted, retried or failed |
+| a staged delivery that finds its subscriber's queue full at its tick | fails that watcher with the delivery error; the run's status is failure |
+| subscription ended | counted, benign |
+| late, duplicate, unassigned, not logical, refused value, coalesced | a runner defect: raised as a host failure |
 
 ### Output and the stream rules
 
-Before any module loads, `print` and `warn` are rebound, by an initial chunk, to bindings that write through Haskell; the namespace the
-chunk reads them from is removed from the globals, so no reference to the originals stays reachable and nothing a script runs writes
-to the process's C streams. `print` joins the `tostring` of its arguments with a tab and writes the line to the **output sink**; `warn` does the
-same after `Lua warning: ` and writes to the **error sink**, from a module's top level, `init`, `run`, `update`, a callback and
-`shutdown` alike. One call writes at most `outputCallLimit` (4096) bytes of UTF-8 in all, as it is written (each line counting one byte more for its end), cut
-with the visible marker `...` (counted in the bound), and any Lua string is accepted: it crosses as bytes, is decoded as UTF-8 with every
-invalid sequence replaced, is split at its line breaks, and has its control characters (an embedded NUL included) replaced by `\xNN`
-escapes, a tab excepted. The script cuts the text to the same number of bytes before it crosses, so the value boundary cannot refuse it for
-length, and the runner bounds what it writes again after decoding and escaping, which can make the text longer (a NUL byte becomes four
-characters, an invalid byte three). The bounding and the escaping are `Hetoimasia.Scripting.Lua.Output`, shared with the Lua-first
-engine's facade (which rebinds `print` and `warn` for its own owners with an engine-made prefix on each `warn` line, counted in the
-same bound, and a smaller bound when a validated profile gives one): `authoredLines prefix bytes`, `authoredLinesWith limit`, and the
-Lua of the conversion and cut (`renderFunctionLines`). The runner's own output is exactly what it was. When a prefix is given, **every line begins with the whole prefix, the line a cut
-ends included**: the marker is appended to the last kept (prefixed) line, never a line of its own and never after a cut prefix; a
-bound too small to hold a prefix, the marker and a line end is the bound winning over the format. A call with no prefix is cut as
-the runner's output is. **No call fits under `minimumOutputLimit`** (the marker and a line end, 4 bytes): below it
-`authoredLinesWith` writes nothing, and the Lua that cuts a call before it crosses keeps at most the marker, never a negative
-count. An application that needs the prefixed format validates its bound against what the format takes before using it.
+Before any module loads, `print` and `warn` are rebound to bindings that
+write through Haskell, and the originals are unreachable. `print` joins the
+`tostring` of its arguments with tabs and writes to the **output sink**;
+`warn` writes `Lua warning: ` plus the same to the **error sink**. One call
+writes at most `outputCallLimit` (4096) bytes of UTF-8, cut with a visible
+`...` counted in the bound. Any Lua string is accepted: decoded as UTF-8 with
+invalid sequences replaced, split at line breaks, control characters (NUL
+included, tab excepted) replaced by `\xNN`.
 
-The rules for every write: a sink is handed one line at a time, with no line break and no control character in it but a tab; a script's
-text and every other text a script can influence (a name, an error, a traceback, a path) has its control characters replaced and is then cut
-to a documented bound, so the bound holds for what is written and none can split a table or a report into forged lines; the runner holds one lock around each table, report or call,
-so a sink is never called by two threads at once and a table is never cut by a script's output. The **tables** go to the output sink, like
-`print`; the **source-did-not-load report** and every **instance failure report** go to the error sink, like `warn` (the owner's decision
-on [#492](https://github.com/coghex/hetoimasia/issues/492#issuecomment-6270451945)). Which process streams the two sinks are is LUA-19's
-wiring. The runner's own diagnostics (a record when a run starts and when it ends) go to the logger, under the component
-`scripting.lua.runner`; script output, tables and reports never do.
+The bounding and escaping are `Hetoimasia.Scripting.Lua.Output`
+(`authoredLines prefix bytes`, `authoredLinesWith limit`,
+`renderFunctionLines`), shared with the Lua-first engine's facade. With a
+prefix, every line begins with the whole prefix, the cut line included. Below
+`minimumOutputLimit` (4 bytes) nothing is written.
+
+Rules for every write: a sink gets one line at a time with no line break and
+no control character but a tab; every text a script can influence is escaped
+and cut to a documented bound; the runner holds one lock around each table,
+report or call. The tables go to the output sink; the source-did-not-load
+report and every instance failure report go to the error sink. The runner's
+own diagnostics go to the logger under `scripting.lua.runner`.
 
 ### The table
 
-At the start and at the end the runner writes a title line (`instances at start`, `instances at end`) and the table of D-17: a header
-`TID OWNER NAME STATUS` and a row for each instance of the run, ended ones included, in ascending TID order. A TID has one text form
-(`tidText`): the runtime's number, the owner's and the instance's, dotted, the three integers of the record a script reads from
-`lifecycle.self` and `lifecycle.inspect`. The status words are the lifecycle snapshot's: `initializing`, `active`, `paused`, `stopping`,
-`completed`, `stopped`, `failed`. The owner and name columns are cut to `columnLimit` (32) characters with the visible marker; a row has no
-control character; a run that admitted no instance writes no table.
+At the start and end the runner writes a title line (`instances at start`,
+`instances at end`), the header `TID OWNER NAME STATUS` and a row per
+instance, ended ones included, in ascending TID order. A TID's text
+(`tidText`) is the runtime, owner and instance numbers, dotted. Statuses are
+the lifecycle snapshot's. Owner and name are cut to `columnLimit` (32)
+characters. A run that admitted no instance writes no table.
 
-The start table is one coherent snapshot taken when the last admitted instance has finished its `init` or failed it, or has become terminal
-without its `init` having run (a stop of an instance the owner had not begun discards it, and nothing waits for an initializer that
-will never execute, nor makes it run to satisfy the barrier). Every admitted instance is a row, including one that completed or failed
-before the last initializer finished: the run reads an instance's settlement without observing it, so the owner's inspection keeps the
-instance for the tables. A run asked to end before the barrier opens writes no start table. The end table is taken after the VM is retired
-and shows each instance's final status.
+The start table is one snapshot taken when the last admitted instance has
+finished or failed its `init`, or become terminal without it. A run asked to
+end before then writes no start table. The end table is taken after the VM is
+retired.
 
 ### Failures
 
-An instance's failure is written to the error sink as one report as soon as it settles, and is in the run report. A report names the
-TID, the instance's name and script, the VM, the phase it was in, the stage (`init`, `run`, `update`, `event <source>`, `shutdown`,
-`release`), the error and the traceback if one was captured, each bounded, and up to `secondaryLimit` (8) other failures that happened as the
-instance ended (`also failed:` lines), with the count of those not kept. A failed `init` runs none of the instance's later hooks; a failure
-in `run`, `update` or a callback runs its `shutdown` once with reason `failed`; a failing `shutdown` is kept, a primary failure stays primary
-and the rest are listed. Every failure is written exactly once whichever wake or ending finds it, and failures that settle together are
-written in ascending TID order, all of them before the end table.
+An instance's failure is written to the error sink as one report when it
+settles, and is in the run report: TID, name, script, VM, phase, stage
+(`init`, `run`, `update`, `event <source>`, `shutdown`, `release`), error,
+traceback, and up to `secondaryLimit` (8) `also failed:` lines. Each is
+written exactly once; failures that settle together are written in ascending
+TID order before the end table.
 
-A failure of the **host** is not an instance's failure and is never turned into a report: an exception a binding or a sink raised, one the
-runner raised itself and a retained cleanup failure propagate unchanged, with their type and context, under the owner's policy (an
-optional worker whose classifier recognizes only the host's fault of loading a module, which is how a source that did not load is told
-from a host failure: an exception application code raised is the application's whatever its type). A host failure inside the owner
-ends the owner, which retires protected: Lua is not entered again, so the instances it left keep `ShutdownSkippedUnsafe`, and one whose
-`init` had not succeeded keeps `ShutdownSkippedNoInit`. One raised on the runner's own thread (a sink's, as a table or a report is written)
-retires the owner first, in order, as the run's end would.
+**A host failure is never turned into a report.** An exception from a binding
+or a sink, one the runner raised, and a retained cleanup failure propagate
+unchanged under the owner's policy. A host failure inside the owner ends it
+without entering Lua again (`ShutdownSkippedUnsafe`, `ShutdownSkippedNoInit`).
 
-The retirement is complete before anything propagates, however it began and however many times the runner's thread is interrupted meanwhile:
-the run asks the owner to stop and waits for the owner's worker to have ended (its raw completion, which supervision's latch of another worker's
-failure never makes unavailable), so what the run's sinks and bindings are borrowed from is not released while the owner's Lua still uses them.
-That wait is for arbitrary Lua segments and shutdown hooks, so it is interruptible and never runs under an uninterruptible mask (a release has
-a controlled blocking duration, and a worker's join has none); but an interruption does not end it. Each one is recorded and the wait goes on
-until the worker has actually ended, and then what happened is raised in order: a cancellation, if one was among them, as itself, and every other
-failure whole as evidence beside it. A segment that never returns keeps the call pending, as it keeps the worker (D-27). Creation is the same:
-`startScheduledOwner` does not return or raise, on a failure of its wait (another worker's latched failure, a cancellation) or any other, while the
-worker it started is alive, so a script held in a module's top level keeps the call pending until it is let go. The wait does not raise the owner's
-failure again: supervision delivers it, to the next supervised wait and at the boundary's exit beside the body's own. When failures arise together
-the first is the primary and the rest are kept whole as evidence beside it; a single failure is never recorded again as a failure of cleanup.
+**The retirement is complete before anything propagates.** The run asks the
+owner to stop and waits for its worker to have ended, so what the sinks and
+bindings borrow is not released while the owner's Lua still uses it. The wait
+is interruptible but an interruption does not end it: each is recorded, and
+afterwards a cancellation is raised as itself with the rest as evidence. A
+segment that never returns keeps the call pending.
 
 ### Waiting and ending
 
-A run waits in one place: a single STM wait, composed with supervision (a failure of the owner raises as soon as supervision commits it), that sees a
-failure to write, the ends to produce (an elapsed VM), every instance having ended, the stop request, the tick limit, the duration limit's timer and what the
-step the run is in waits for (an admission, a tick that is due, a tick that has finished). It polls nothing.
-The run ends at the first of: every instance has ended (a one-shot completing, a failure, or a granted Lua control, of itself or another); the stop
-request fires; the tick limit is reached; the duration limit is reached. **The limit** is a positive duration measured on the injected clock from the *origin*, the instant read just
-before the first instance is admitted, and waited for on the injected timer, whose wake only tells the run to look at the clock again: an early
-or a stale wake finds the deadline not reached and the run arms again. The timer's registration is cancelled on every way out of the run, and a
-limit too large for the clock's range is one that is never reached.
+A run waits in one STM wait composed with supervision. It ends at the first
+of: every instance has ended; the stop request; the tick limit; the duration
+limit (measured on the injected clock from just before the first admission).
 
-**When several apply together** the order of precedence is the contract: a failure to write, then what a finished `init` owes (the start table and the *started*
-event), then *every instance ended*, then *the stop request*, then *the tick limit*, then *the limit*. So a run in which every instance has ended ends as `EndedAllInstances` even if the stop request and the limit
-are due too; one that the stop request and the limit both end is `EndedStopRequest`; the limit ends a run nothing else has. A stop request that is
-already set when the run begins admits nothing, reads no file and starts no VM, and returns as stopped.
+**When several hold together, the order of precedence is the contract:** a
+failure to write; what a finished `init` owes (the start table and the
+*started* event); every instance ended (`EndedAllInstances`); the stop request
+(`EndedStopRequest`); the tick limit (`EndedTickLimit`); the duration limit
+(`EndedLimit`). A finished tick is counted before the duration limit is
+looked at. A stop request already set when the run begins admits nothing,
+reads no file and starts no VM.
 
-Whatever the end, every instance still unended is stopped in ascending TID order through the ordinary path: its `shutdown` runs once, with reason
-`stopped`, if its module defines one (an instance that is paused is stopped too), and then the VM is retired. A running segment is let return and the
-runner sets no deadline: a script stuck in non-yielding Lua keeps the stop pending (D-27), and forcing the exit is LUA-19's. An instance a Lua control
-stops, or that ends by itself, ends under the same contract: no path runs a `shutdown` twice or skips the retirement.
+Whatever the end, every unended instance is stopped in ascending TID order:
+its `shutdown` runs once with `stopped`, then the VM is retired. **The runner
+sets no deadline**: a script stuck in non-yielding Lua keeps the stop pending.
 
 ### The report and the status
 
-`Ran RunReport` holds how the run ended (`EndedAllInstances`, `EndedLimit`, `EndedTickLimit`, `EndedStopRequest`, or `EndedStartupFailure` when a source did not load),
-the ticks completed (`reportTicks`) and the event tallies (`reportEvents`: events produced, started and ended; delivery attempts, counted by the engine's answer, admitted,
-staged, refused queue-full, refused staging-full, subscription ended; and watchers failed by overflow), each instance's report (TID, name, file, final status, how it ended and what became of `shutdown`, its failure if any), the `LoadFailure` when
-there is one, and the `RunStatus`. The status is `StatusFailure` if any instance failed or a source did not load; otherwise `StatusInterrupted` if the
-stop request ended the run; otherwise `StatusSuccess`: a limit, a Lua control and every instance completing are success. Exit numbers are the command
-line's.
+`Ran RunReport` holds how the run ended (the four above, or
+`EndedStartupFailure`), `reportTicks`, `reportEvents` (events produced;
+deliveries by the engine's answer; watchers failed by overflow), each
+instance's report, the `LoadFailure` if any, and the `RunStatus`:
+`StatusFailure` if any instance failed or a source did not load; else
+`StatusInterrupted` if the stop request ended the run; else `StatusSuccess`.
 
 ### The command line
 
-`hetoimasia lua` (LUA-19, `console/Hetoimasia/Console/Lua*.hs` and `app/Main.hs` in the root package) is the
-runner's command line: it parses the arguments, installs two signal handlers, wires the runner to the
-process's streams and maps the runner's answer to an exit status. It changes nothing of the runner.
+`hetoimasia lua` (`console/Hetoimasia/Console/Lua*.hs` and `app/Main.hs` in
+the root package) parses the arguments, installs two signal handlers, wires
+the runner to the process's streams and maps its answer to an exit status.
 
 ```text
 hetoimasia lua [--vm NAME] [--scheduler fifo] [--headless] [--tick SECONDS] [--for SECONDS | --ticks N]
                --script PATH [--name NAME] [--every SECONDS | --every-ticks N] [--script PATH ...]
 ```
 
-Every option takes its value as the next argument. *VM options* may appear anywhere and at most once each: `--vm NAME`
-(default `main`), `--scheduler fifo` (the default and only value), `--headless` (accepted; headless is the default and only
-mode), `--tick SECONDS` (the tick duration: the VM runs on logical ticks granted at that real-time rate), `--for SECONDS` (the duration limit)
-and `--ticks N` (the tick limit). *Script options* bind to the most recent `--script PATH` and at most once each: `--name NAME` (default the
-file's name without directory and extension), `--every SECONDS` (an elapsed interval) and `--every-ticks N` (a tick interval). Seconds are positive decimal
-numbers of at most nine fractional digits with no sign and no exponent, so they are whole nanoseconds: zero, finer, malformed or unrepresentable
-values are refused and nothing is rounded. Counts are positive whole numbers that fit a 64-bit tick. `lua --help` alone writes the
-help to stdout and exits 0. No `--group` flag, and no stdin console.
+Every option takes its value as the next argument.
 
-**Usage is validated first**, as a pure function of the argument list (`Hetoimasia.Console.Lua.Options.parseLua`), before any file is read, any VM is
-started or any signal handler is installed. Refused: an unknown option or argument; a value that is missing, empty or itself an option; a repeated VM option
-(`--headless` included); a script option before the first `--script`; a script option repeated for one script; a scheduler other than `fifo`; a malformed number;
-no `--script`; `--ticks` or `--every-ticks` without `--tick`; `--every` with `--tick`; `--every` with `--every-ticks`. A refusal the runner returns (it needs the
-module's entries: a module defining both `run` and `update`, `update` with no interval, an interval for a module with no `update`) is a usage error too. A usage error
-writes the usage line and a one-line reason to stderr, nothing to stdout, and exits 2; so does the top-level unknown argument, through the same writer (`Hetoimasia.Console.Usage`). The reason is built from what the user typed, so every character that is not printable ASCII becomes a `\xNN` escape and each value is cut at 200 characters with a visible marker: a newline or a carriage return in an argument or a path cannot add a line, and a locale that cannot encode the text cannot turn a usage error into a failure to report it. A present but invalid logging
-variable is configuration, not usage: it fails startup with status 1 before any argument is read.
+| Option | Scope | Meaning |
+| --- | --- | --- |
+| `--vm NAME` | VM, once | default `main` |
+| `--scheduler fifo` | VM, once | the default and only value |
+| `--headless` | VM, once | accepted; the default and only mode |
+| `--tick SECONDS` | VM, once | run on logical ticks granted at that real-time rate |
+| `--for SECONDS`, `--ticks N` | VM, once | the duration limit; the tick limit |
+| `--name NAME` | the latest `--script`, once | default the file's name without directory and extension |
+| `--every SECONDS`, `--every-ticks N` | the latest `--script`, once | an elapsed interval; a tick interval |
 
-**Streams.** The runner's output sink is stdout and its error sink is stderr, each flushed after every write, so a reader on a pipe sees each line at once: `print` output
-and the TID/OWNER/NAME/STATUS tables on stdout; `warn`, failure and source-did-not-load reports and usage text on stderr (the owner's decision on
-[#492](https://github.com/coghex/hetoimasia/issues/492#issuecomment-6270451945)). The logger's records stay on stderr under the logging variables, as for `--smoke`. Both handles are UTF-8.
+Seconds are positive decimals of at most nine fractional digits, no sign or
+exponent; nothing is rounded. Counts are positive whole numbers that fit a
+64-bit tick. `lua --help` alone writes the help to stdout and exits 0.
 
-**Exit statuses** (`Hetoimasia.Console.Exit` names them; `Hetoimasia.Console.Lua.Status` maps the runner's answer, a pure function):
+**Usage is validated first**, as a pure function
+(`Hetoimasia.Console.Lua.Options.parseLua`), before any file is read, VM
+started or signal handler installed. Refused: an unknown option or argument; a
+missing or empty value, or one that is itself an option; a repeated VM option;
+a script option before the first `--script` or repeated for one script; a
+scheduler other than `fifo`; a malformed number; no `--script`; `--ticks` or
+`--every-ticks` without `--tick`; `--every` with `--tick`; `--every` with
+`--every-ticks`. A runner usage refusal is a usage error too. A usage error
+writes the usage line and a one-line reason to stderr and exits 2
+(`Hetoimasia.Console.Usage`); in the reason every character that is not
+printable ASCII becomes `\xNN` and each value is cut at 200 characters. An
+invalid logging variable is configuration, not usage: status 1 before any
+argument is read.
+
+**Streams.** Output sink stdout, error sink stderr, each flushed after every
+write, both UTF-8: `print` and the tables on stdout; `warn`, failure and
+source-did-not-load reports and usage text on stderr, with the logger's
+records.
 
 | Status | When |
 |---|---|
-| 0 | every instance completed or was stopped, by a control or by a limit |
-| 1 | an instance failed, a source did not load, or a failure of the host propagated |
+| 0 | every instance completed or was stopped, by a control or a limit |
+| 1 | an instance failed, a source did not load, or a host failure propagated |
 | 2 | invalid usage |
 | 130 | SIGINT or SIGTERM ended the run, after the orderly stop; also a cancellation |
 
-When several apply, 1 outranks 130, which outranks 0 (the runner's status value already ranks failure over interrupted over success).
+1 outranks 130, which outranks 0 (`Hetoimasia.Console.Exit`,
+`Hetoimasia.Console.Lua.Status`).
 
-**Signals.** SIGINT and SIGTERM handlers are installed on the `lua` path only, after the usage check and before the runner starts; every other path keeps GHC's
-defaults. Both call one coordinator (`Hetoimasia.Console.Lua.Signals`), one atomic step on one state: the first signal, whichever it is, sets the runner's stop
-request and returns without waiting for the shutdown it asks for, and the run ends through the orderly stop of the runner (nothing is admitted if it comes first). A
-**second** signal while that stop is still running exits at once with status 130, skipping the shutdown hooks that have not run, waiting for no cleanup and
-flushing nothing (D-42; `exitImmediately`); a later one changes nothing, and overlapping deliveries request the stop once and force at most once. A script stuck in
-non-yielding Lua keeps the first stop pending (D-27), which is what the second signal is for.
+**Signals.** SIGINT and SIGTERM handlers are installed on the `lua` path
+only, after the usage check. Both call one coordinator
+(`Hetoimasia.Console.Lua.Signals`): the first signal sets the runner's stop
+request and returns; a **second** signal while that stop is running exits at
+once with 130 (`exitImmediately`), skipping unrun shutdown hooks, cleanup and
+flushing; later ones change nothing.
 
-**Wiring.** The executable runs the runner through the runtime's application lifecycle (`runScopedApplication`): the logging lifetime over stderr, entered first and
-left last so it outlives the supervision drain and makes the one final flush after it, the public supervision boundary, and the runner inside it with the production
-clock and timer. The executable keeps `-threaded`; the bridge's calls are `safe`, so no more capabilities are needed. The interpreter is the copy the `lua` package bundles.
+**Wiring.** The executable runs the runner through `runScopedApplication`:
+the logging lifetime over stderr (entered first, left last), the supervision
+boundary, and the runner inside it. The executable keeps `-threaded`.
 
-**Examples.** Three checked-in scripts under `test/lua-examples/`, run by their documented commands in the root suite's `Console` group:
+**Examples** (checked in under `test/lua-examples/`, run by the root suite's
+`Console` group):
 
 ```sh
-# a one-shot: prints and completes
 hetoimasia lua --script test/lua-examples/oneshot.lua
-# a looped instance and a controller that pauses, resumes and stops it through the lifecycle controls
 hetoimasia lua --tick 0.001 --ticks 40 \
   --script test/lua-examples/looped.lua --every-ticks 1 \
   --script test/lua-examples/controller.lua --every-ticks 3
-# an event-only watcher of the instances' start and end events, which stops itself once every other instance has ended
 hetoimasia lua --tick 0.001 --ticks 20 \
   --script test/lua-examples/watcher.lua --script test/lua-examples/oneshot.lua
 ```
 
-The looped and watcher examples run on `--tick` with `--ticks`, so their output is the same on every run; the elapsed-clock variant (`--every SECONDS`,
-`--for SECONDS`) is asserted on structure only.
-
-**What proves it.** The `Console` group of `hetoimasia-tests` (`--test-options='--match Console'`): the command line as direct examples (every refusal, default and
-number at its boundary), the status mapping, the coordinator (first signal, second, later, overlapping deliveries on many threads), and every status by running the
-built executable as a child process: 0, 1, 2 (a representative of each class of usage error, a runner refusal and the top-level unknown argument) and 130 for SIGINT
-and SIGTERM with the instance's `shutdown` output on stdout before the process exits, and which stream carries what. A signal is delivered only after the child has said on stdout
-that its script is running; every read and wait is bounded; no example sleeps; every child is killed with `SIGKILL` and reaped on every way out, independently of
-the signal under test. The forced exit needs a script whose `shutdown` never returns, so it is the optional probe `lua-forced-exit-probe`
-(`cabal test hetoimasia:lua-forced-exit-probe --test-show-details=direct`, validation group `test.lua-forced-exit`, `optional: true`, never selected by affected
-inputs): a first signal after the script reports it is running, a second after it reports its stop has begun, and the process exits 130 promptly, the hook never having finished.
-Signal semantics differ between Linux and macOS; Linux CI is the evidence.
+The forced exit needs a `shutdown` that never returns, so it is the optional
+probe `cabal test hetoimasia:lua-forced-exit-probe --test-show-details=direct`
+(validation group `test.lua-forced-exit`). Signal semantics differ between
+Linux and macOS; Linux CI is the evidence.
 
 ### What is not here
 
-Signals, `exit` and exit numbers belong to the command line above, and the runner does not use them; window creation, VM groups, module reload, a stop deadline. `Hetoimasia.Scripting.Lua.Runner.Internal` is the seam the
-examples use for a callback (an event source, bindings of their own, the owner's endpoint): it is not part of the contract and
-is no way to configure a production run.
-
-### What proves it
-
-`Test.LuaRuntime.Runner.*`, in `lua-runtime-tests` (select them with `--test-options='--match Runner'`), run real Lua on real supervised
-scheduled owners started by the runner, with the injected clock, a fake timer, gates and STM signals, and no sleep: every way a source can fail to load,
-in script order; a path named twice; two files with one name; the identity's rules; each kind from a module's entries and each usage
-refusal, with no hook run and the VM retired; the query answering defined, absent and present-but-not-a-function, running no code and never
-changing; a failed `init`, a failing `run`, `update`, callback and `shutdown`, several failures in one run and a primary kept over a failing `shutdown`;
-a host failure from a binding, from a sink while a script prints and while a module loads (and an application's exception shaped as the host's
-fault of loading), the runner's own write failing after an orderly retirement, failures arising together, a failure another supervised worker latched
-propagating only after the owner's retirement is complete (during the run and during startup), and cancellations, during startup and during cleanup after a failure, that do not end the wait for the owner; every ending (a one-shot, a script stopping
-itself and another, the stop request, the limit with an early and a stale wake, a stop request set beforehand), each stop path stopping a live
-event-only, looped and paused instance in order, simultaneous endings in their order of precedence, the timer cancelled on every exit; the
-start table with a gated initializer and a stop before an instance began, the early settlement kept in the tables, and the tables' bounds; output
-to the sinks only (and to no C stream), bounded as it is written after escaping (NUL bytes, invalid bytes, line breaks, multibyte text, an error, a name and a path), safe and unforgeable; and the status for each combination. For LUA-28: every usage refusal of the clock; the driver granting ticks of exactly the tick duration, back to back when the clock
-jumps past several deadlines while a segment is held, nothing for an early or a stale wake, none after a stop begins; the tick limit and every ending of a tick VM
-leaving each remaining `shutdown` once, in order; the tie rule at a tick's boundary with the runner held in the write of a report; Lua controls placed by the runner in the
-order they were issued; the events a watcher sees, with a usable TID, the outcomes, the failed `init`, no replay and recipients in subscription order; the pure
-classification of every engine answer and production against feeds that answer each way; both overload cases and the defects with real VMs; admission one script at a time
-with an init held; and a scenario with a ready, yielding one-shot, a one-shot that unsubscribes at once and a paused one-shot resumed by a logical control, compared transcript
-for transcript across runs whose pacing differs. The cancellation and shutdown
-windows are the kind an asynchronous-exception race can hide on one platform, so CI, which runs them on Linux, is the evidence for them and a local
-pass is not.
-
+Window creation, VM groups, module reload and a stop deadline.
+`Hetoimasia.Scripting.Lua.Runner.Internal` is a seam for the examples, not
+part of the contract and no way to configure a production run.
 ## The protocol model
 
-The private `model` sublibrary (`model/`) is LUA-4: the vocabulary a scheduler,
-a provider, and a transport implement against, as pure data and pure functions.
-It performs no IO, reads no clock, and creates no interpreter, and its
-`build-depends` names only `base`, `containers`, and `text` — neither the `lua`
-binding nor this package's own `bridge` sublibrary. That last fact is the
-boundary, and it is checked two ways that answer different questions:
-`Test.Lua.Protocol.Fixture` reports that the examples acquired no interpreter,
-and `Test.Lua.Protocol.Boundary` reads the Cabal stanza and every model module's
-imports, because a component can depend on the binding and simply not call it.
-
-Every record is parameterised by one application value type the model never
-inspects. A cursor is one, a settlement carries one, an event delivers one, and
-nothing in the package pattern matches on it.
+The private `model` sublibrary (`model/`) is the vocabulary a scheduler, a
+provider and a transport implement against, as pure data and pure functions.
+It performs no IO, reads no clock and creates no interpreter; its
+`build-depends` names only `base`, `containers` and `text`. Every record is
+parameterised by one application value type the model never inspects.
 
 ### Identities
 
-`Hetoimasia.Scripting.Lua.Internal.Protocol.Identity`. An `Owner` is one `ModId`
-in one `ExecutionDomain`; a `SessionKey` adds its `SessionId` and `Epoch`. Every
-`TaskId`, `RequestId`, and `SubscriptionId` carries that scope, so D-8's
-isolation is structural: two mods' first tasks are different values, and so are
-two epochs' or two sessions'.
+`Hetoimasia.Scripting.Lua.Internal.Protocol.Identity`. An `Owner` is one
+`ModId` in one `ExecutionDomain`; a `SessionKey` adds its `SessionId` and
+`Epoch`. Every `TaskId`, `RequestId` and `SubscriptionId` carries that scope.
 
-Local numbers are not the caller's to guarantee. The session issues the
-`TaskName` outright — `requestAdmission` answers the `TaskId` it built — and
-stamps a `Generation` from one counter it never rewinds onto every `RequestId`
-and `SubscriptionId` it hands out. A `RequestName` or `SubscriptionName` the
-caller chooses is only half an identity, so reusing a handle after its record
-was reclaimed is safe: the identity is new, and a reply or event still in flight
-for the record that handle named before cannot reach the one it names now. That
-is the bound the alternative lacks — validating reuse against what has been
-forgotten would need a list of retired identities that grows forever.
-
-`Ordinal` is the one counter that is not an identity: the session issues it on
-admission and on every re-entry into the ready set, which is what puts a yielded
-task behind its ready peers.
+The session issues the `TaskName` outright and stamps a `Generation`, from
+one counter it never rewinds, onto every `RequestId` and `SubscriptionId`. A
+caller-chosen `RequestName` or `SubscriptionName` is only half an identity, so
+reusing a handle after its record was reclaimed is safe: a reply still in
+flight for the old record cannot reach the new one. `Ordinal` is issued at
+admission and on every re-entry to the ready set.
 
 ### Tasks and transitions
 
-`…Protocol.Task`. A `Task` holds identity, behaviour identity, service class,
-state, cursor, ordinal, readiness, and an optional pending interest. Its
-`TaskState` is `Ready`, `Running`, `Waiting` with its exact `WaitCause`,
-`Paused`, or one of `Completed`, `Cancelled`, and `Failed`. Each transition —
-`startTask`, `applySegment`, `wakeTask`, `pauseTask`, `resumeTask`,
-`cancelTask`, `failTask` — is a pure function answering the next task or a
-`TransitionRejection`: `AlreadyTerminal`, `WrongState`, `StaleScope`,
-`AheadOfScope`, or `ForeignScope`. A rejection returns the task untouched, a
-terminal task refuses everything including another terminal transition, and the
-scope check runs before the state check, so a stale resume reports staleness
-rather than the state it happened to find. `applySegment` is the only function
-that writes a cursor, and it requires `Running`: a `SegmentOutcome` is
-completed, yielded with a new cursor, or waiting on a named cause.
+`…Protocol.Task`. A `TaskState` is `Ready`, `Running`, `Waiting` with its
+`WaitCause`, `Paused`, or terminal (`Completed`, `Cancelled`, `Failed`). Each
+transition (`startTask`, `applySegment`, `wakeTask`, `pauseTask`,
+`resumeTask`, `cancelTask`, `failTask`) is a pure function answering the next
+task or a `TransitionRejection`: `AlreadyTerminal`, `WrongState`,
+`StaleScope`, `AheadOfScope`, `ForeignScope`. A rejection leaves the task
+untouched, a terminal task refuses everything, and the scope check runs
+before the state check. `applySegment` is the only function that writes a
+cursor, and requires `Running`.
 
 ### Caps
 
 `…Protocol.Limits`. `Limits` bounds active tasks, queued admissions,
-subscriptions, one ordered-event backlog, outstanding requests, payload size,
-and retained terminal results, with a finite `Quantum` per `ServiceClass`
-(`ControlClass`, `OrdinaryClass`, `BackgroundClass`). `validateLimits` answers
-every `LimitViolation` it finds, and a `ValidLimits` can be obtained no other
-way, so no session exists over an unchecked configuration. The quanta are
-recorded here and enforced by nothing in the model: the scheduling machinery of
-`runtime-lua` (LUA-21) enforces them per pass, and what runs next is a policy's choice
-within it. See [The scheduling machinery](#the-scheduling-machinery).
+subscriptions, one ordered-event backlog, outstanding requests, payload size
+and retained terminal results, with a finite `Quantum` per `ServiceClass`.
+`validateLimits` answers every `LimitViolation`, and a `ValidLimits` can be
+obtained no other way. The quanta are enforced by
+[the scheduling machinery](#the-scheduling-machinery), not the model.
 
 ### The session
 
-`…Protocol.Session` composes the rest. It is a facade over one pure session
-value, and it states the aggregate's contract; the implementation sits beneath
-it in `…Protocol.Session.*`, one responsibility per module and an acyclic
-import graph from the bottom up:
+`…Protocol.Session` is a facade over one pure session value; callers import
+only it. The implementation is `…Protocol.Session.*`:
 
 | Module | Owns |
 | --- | --- |
-| `Session.State` | The `Session` value, `newSession`, `Counters`, `SessionRejection`, and the records it keeps (`FailureRecord`, `ExitRecord`) |
-| `Session.Step` | Refusal, counters, the not-stopped and not-failed preconditions, ordinal/task-name/generation issuance, and one task transition |
-| `Session.Revocation` | `retire`, `invalidateHoldingsOf`, `revokeOne`, `revocableRequests`, `reclaim` — the one definition of the shared provider accounting |
-| `Session.Tasks` | Admission, activation, and every task transition up to observing its result |
-| `Session.Requests` | Accepting requests, replies, cancellation, observation, provider completion |
-| `Session.Subscriptions` | Registration, delivery, taking events, unsubscribing |
-| `Session.Epoch`, `Session.Failure`, `Session.Stop` | The three session-wide invalidations, kept apart because each retains different records and reports different counts |
+| `Session.State` | the `Session` value, `newSession`, `Counters`, `SessionRejection`, `FailureRecord`, `ExitRecord` |
+| `Session.Step` | refusal, counters, preconditions, ordinal/name/generation issuance, one task transition |
+| `Session.Revocation` | `retire`, `invalidateHoldingsOf`, `revokeOne`, `revocableRequests`, `reclaim`: the one definition of provider accounting |
+| `Session.Tasks` | admission, activation, task transitions, observing a result |
+| `Session.Requests` | accepting, replies, cancellation, observation, provider completion |
+| `Session.Subscriptions` | registration, delivery, taking events, unsubscribing |
+| `Session.Epoch`, `Session.Failure`, `Session.Stop` | the three session-wide invalidations |
 
-Callers import the facade only. Each operation answers
-`(Session v, Either SessionRejection a)`. A rejection never advances the
-protocol: no task changes state, no cursor moves, no settled slot is
-overwritten, no event is delivered, no admission is accepted. It is *not* true
-that a rejection changes nothing, and no later slice should be built on that
-stronger reading. A rejection may record evidence — always on
-`sessionCounters`, and on the record it was about in four places: a reply to an
-already-settled request retires its provider accounting, a reply over the
-payload cap discharges the request (settling an unsettled one as a provider
-failure), a repeated provider completion increments `requestLateCompletions`,
-and a delivery into a full ordered backlog increments `subscriptionRejected`.
-The payload-cap case is the only rejection that moves a record's protocol
-state. `SessionRejection` names `AdmissionIsClosed`, `CapReached`,
-`PayloadTooLarge`, the identity refusals `UnknownTask`, `UnknownRequest`,
-`UnknownSubscription`, `TaskRetired` (a task this epoch issued whose result has
-been observed away) and `TaskNotActivated` (an accepted admission that has
-never run), `NotTaskOwner`, `NoTerminalResult`,
-`NothingQueued`, `NoDelivery`, `SessionAlreadyFailed`, `SessionAlreadyStopped`,
-and the wrapped refusals of the records themselves (`TransitionRefused`,
-`ReplyRefused`, `ObserveRefused`, `ProviderRefused`, `DeliveryRefused`). There
-are no `Duplicate*` refusals: the session issues the identities that could have
-collided, so the collision cannot arise.
+Each operation answers `(Session v, Either SessionRejection a)`. A rejection
+never advances the protocol. **It is not true that a rejection changes
+nothing**: it always counts on `sessionCounters`, and in four places records
+on the record it was about: a reply to a settled request retires its provider
+accounting; a reply over the payload cap discharges the request (settling an
+unsettled one as a provider failure, the only rejection that moves protocol
+state); a repeated provider completion increments `requestLateCompletions`; a
+delivery into a full ordered backlog increments `subscriptionRejected`.
 
-Three bounds are worth stating in full.
+`SessionRejection`: `AdmissionIsClosed`, `CapReached`, `PayloadTooLarge`,
+`UnknownTask`, `UnknownRequest`, `UnknownSubscription`, `TaskRetired`,
+`TaskNotActivated`, `NotTaskOwner`, `NoTerminalResult`, `NothingQueued`,
+`NoDelivery`, `SessionAlreadyFailed`, `SessionAlreadyStopped`, and the wrapped
+`TransitionRefused`, `ReplyRefused`, `ObserveRefused`, `ProviderRefused`,
+`DeliveryRefused`. There are no `Duplicate*` refusals: the session issues the
+identities.
 
-**Terminal-result storage** is reserved at admission and released when the
-result is observed or discarded, so a completed task whose result nobody reads
-keeps occupying storage its admission already paid for, and the session refuses
-the next admission rather than growing. There is no ticket history.
+- **Terminal-result storage** is reserved at admission and released when the
+  result is observed or discarded. An unread result keeps its storage, and the
+  session refuses the next admission instead of growing.
+- **A request holds two independent obligations**, reclaimed only when both
+  are discharged: its result observed or discarded, and its provider's work
+  known to have ended. Cancellation, task invalidation, epoch change, failure
+  and stop revoke delivery authority without establishing provider
+  completion. A late reply is refused, publishes nothing, and still retires
+  the accounting.
+- **A `FailureReason`'s detail is bounded and copied.** `failureReason`, the
+  only constructor, truncates to `reasonDetailBound` characters and copies
+  the result to its own array, so a short slice never pins a large buffer.
 
-**A request holds two independent obligations** and its bookkeeping is reclaimed
-only when both are discharged: its result observed or discarded, and its
-provider's work known to have ended. Completing the provider does not release an
-unobserved result; observing a cancellation does not establish that the provider
-stopped. Cancellation, task invalidation, epoch change, failure, and stop all
-revoke delivery authority without establishing provider completion, and the
-accounting for it survives them, keyed by the old identity. A late reply is
-refused and publishes nothing, and still retires that accounting, because an
-answer is evidence the provider finished.
+Subscriptions declare an `OverloadPolicy`: `OrderedEvents` rejects and counts
+a delivery into a full backlog; `ReplaceableState` coalesces to the newest.
 
-A reply whose declared payload exceeds the cap is refused with
-`PayloadTooLarge` and its value is never stored, but it still discharges the
-request: an unsettled one settles as a provider failure naming the overrun, and
-one that had already settled is counted as a late reply. Either way the
-provider's work retires — a provider that overran still answered, and a refusal
-that left its accounting outstanding would hold capacity nothing could release.
-
-**A `FailureReason`'s detail is bounded and copied.** It may quote a script's
-own error text, so `failureReason` truncates it to `reasonDetailBound`
-characters -- counted as characters, so a multibyte detail is never cut inside
-one -- and copies what survives into an array of its own. Truncation alone
-would bound the characters and not the memory: a `Text` is a window onto a
-shared array, so a 512-character prefix of a megabyte of script output would
-keep the megabyte alive, and a detail already within the bound is just as
-likely to be a small window onto a large allocation. The copy is made either
-way. `failureReason` is also the only way to build one -- `reasonCode` and
-`reasonDetail` read a reason but are not its record fields, and the constructor
-is not exported -- so the count limits on stored failures bound retained memory
-rather than only the number of reasons held.
-
-Subscriptions declare their endpoint's `OverloadPolicy`: `OrderedEvents` rejects
-and counts a delivery into a full backlog, `ReplaceableState` coalesces to the
-newest value. There is no universal lossy stream.
-
-`advanceEpoch` invalidates every task, queued admission, subscription, and
-pending request of the previous epoch before the new one exists, retaining only
-provider-work accounting. It invalidates only what still holds a local
-interest: a stub whose owner already revoked it — by having its task
-invalidated, or by observing its cancellation and walking away — is carried for
-provider accounting and is not invalidated, or counted, a second time. Session
-failure, stop, and the invalidation of one task's own holdings all follow that
-same rule. `reportFailure` with `RecoveryUnsafe` moves the
-session to its terminal failed state: mutation admission closes, live work is
-invalidated, and the record is kept beside the identity of the last good
-snapshot. `Observing` admission stays open, because a failed gameplay session
-that could say nothing about itself would be worse than a stopped one, and
-`advanceEpoch` refuses it — replacing a failed domain means a new `Session`. An
-unsafe failure ends the session even when the task it names has already
-finished, or has been observed away entirely: the task keeps its one terminal
-outcome, but "the behaviour that touched authoritative state was cancelled a
-moment ago" is not evidence that the state is consistent. A *safe* failure
-naming such a task is refused. A failure naming a *queued* admission is refused
-either way and escalates nothing — a task that has never run cannot have left
-authoritative state half-applied — and an identity this epoch never issued is
-`UnknownTask`. The reporting work a failed session admits settles like any
-other task: a `RecoverySafe` failure naming one that is active fails it once,
-retires its holdings, and leaves its `ResultFailed` to be observed, so a report
-about the failure cannot strand the terminal-result capacity its own admission
-reserved. It settles once and overwrites nothing — the session keeps the first
-`FailureRecord` and its last-good snapshot, mutation admission stays closed, no
-epoch advances, and every other report a failed session receives, a repeat of
-that settlement included, is still `SessionAlreadyFailed`.
-`stopSession` closes admission, aborts queued work, records a task inside a
-segment as outstanding rather than draining it, and answers an `ExitRecord` of
-dispositions and discard counts. There is no operation that waits for every task
-to finish, and the exit record carries no worker cleanup evidence: that is
-supervision's, and mixing the two would let a clean stop here be read as proof a
-worker unwound.
+| Operation | Effect |
+| --- | --- |
+| `advanceEpoch` | invalidates every task, queued admission, subscription and pending request of the previous epoch, retaining only provider-work accounting. What its owner already revoked is not invalidated or counted twice |
+| `reportFailure` with `RecoveryUnsafe` | the session becomes terminally failed: mutation admission closes, live work is invalidated, the first `FailureRecord` is kept with the last good snapshot. `Observing` admission stays open; `advanceEpoch` is refused. It applies even when the named task already finished |
+| `reportFailure` with `RecoverySafe` | fails the named active task alone; refused for a finished task |
+| a failure naming a *queued* admission | refused either way |
+| `stopSession` | closes admission, aborts queued work, records a task inside a segment as outstanding, and answers an `ExitRecord`. It carries no worker cleanup evidence |
 
 ### Who consumes what
 
-| Slice | What it takes from this model |
+| Consumer | What it takes |
 | --- | --- |
-| LUA-21, the scheduling machinery | `Session` admission and its caps, `ServiceClass`, `Quanta` and `validateLimits`, `Ordinal`, the ready, waiting and paused states and their transitions, `activateNext`, `stopSession` |
-| LUA-6, the scheduled owner | the same, through LUA-21's machinery, with `TaskId` scoped by the owner's identity and wrapped in `ScheduledTaskId` |
-| LUA-7, requests | `RequestId`, `Settlement`, `Reply`, the two obligations, holders, the epoch change and the stop, in a session of the owner's requests |
-| LUA-26, subscriptions | `OverloadPolicy`, and LUA-7's granted service, guard and epoch operation unchanged |
-| LUA-9, the child-process transport | every identity, `Payload`, `Reply`, `SegmentOutcome`, the rejection vocabulary |
-| LUA-5, supervision integration | `Limits` and `validateLimits`, for the two caps its call dispatch has (`maxQueuedAdmissions`, `maxRetainedResults`) |
-
-LUA-5 takes nothing else from this model. It runs finite calls and no task, session
-or request, so the adapter has an exit record of its own, counting what its stop
-discarded. The scheduling machinery is the first consumer of a session of tasks: it keeps
-one `Session` per scheduler, drives its transitions, and answers the model's `ExitRecord`
-in its stop report. It does not use the model's `reportFailure`, whose unsafe case ends the
-whole session (D-7): a failed task is failed alone, its `TaskFailure` and recovery marking are
-reported in the turn, and whether a session ends is the integrating owner's decision. The request service keeps a
-session of its own (the scheduler's has no requests): requests are owned by *holders* the session issues, which an
-instance's end revokes through the same path a retiring task's requests go through; its epoch is the request
-service's, and the instances and tasks are not invalidated by it. Subscriptions wait for LUA-26.
+| the scheduling machinery | `Session` admission and caps, `ServiceClass`, `Quanta`, `validateLimits`, `Ordinal`, the task states and transitions, `activateNext`, `stopSession`. It does not use `reportFailure`: a failed task is failed alone |
+| the scheduled owner | the same through the scheduler, with `TaskId` wrapped in `ScheduledTaskId` |
+| requests | `RequestId`, `Settlement`, `Reply`, the two obligations, holders, the epoch change and the stop, in a session of its own |
+| subscriptions | `OverloadPolicy`, over the request service unchanged |
+| the runtime adapter | `Limits` and `validateLimits` for `maxQueuedAdmissions` and `maxRetainedResults` only |
 
 ## Running the suite
 
 ```bash
 cabal test hetoimasia-scripting-lua:lua-host-tests --test-show-details=direct
-```
-
-It also runs under `--project-file cabal.project.cpu`, which this package needs
-no GLFW SDK for. The validation group is `test.scripting-lua`; see
-[docs/validation.md](../../docs/validation.md).
-
-The runtime adapter's examples and the scheduling machinery's are a suite of their own,
-whose validation group is `test.scripting-lua-runtime`:
-
-```bash
 cabal test hetoimasia-scripting-lua:lua-runtime-tests --test-show-details=direct
 ```
 
-The owner's examples are the `VM owner` component of the host suite, and the
-bridge's own are the rest:
+Both also run under `--project-file cabal.project.cpu`. The validation groups
+are `test.scripting-lua` and `test.scripting-lua-runtime`; see
+[docs/validation.md](../../docs/validation.md). Components of the host suite:
 
 ```bash
 cabal test hetoimasia-scripting-lua:lua-host-tests \
   --test-show-details=direct --test-option=--match --test-option='VM owner'
-```
-
-The registration and value boundary's examples are the `value boundary`
-component of that same suite:
-
-```bash
 cabal test hetoimasia-scripting-lua:lua-host-tests \
   --test-show-details=direct --test-option=--match --test-option='the value boundary'
-```
-
-The protocol model's examples are the `Protocol` component of that same suite:
-
-```bash
 cabal test hetoimasia-scripting-lua:lua-host-tests \
   --test-show-details=direct --test-options='--match Protocol'
 ```
 
-They need no interpreter, and the group's last example reports that it acquired
-none.
+Cancellation, shutdown and cleanup windows can hide an asynchronous-exception
+race on one platform: **CI on Linux is the evidence for them, a local pass is
+not.**
 
 ## The Linux confinement probe
 
-`linux/` holds a second, private thing this package carries: the Linux
-feasibility probe LUA-14 ([#147](https://github.com/coghex/hetoimasia/issues/147))
-delivers. It is a child program (`lua-confine-child`) launched inside a
-candidate confinement profile, a parent-side driver, and the C that installs the
-profile and attempts the operations it is supposed to refuse.
-
-It is not part of the bridge and nothing above links it. No library, executable,
-or public interface depends on it; the only Lua source it ever loads is a fixture
-chunk compiled into the child; and it is built on Linux alone, excluded
-elsewhere by an `if os(linux)`/`else buildable` conditional rather than built
-and passing vacuously.
+`linux/` holds a private feasibility probe: a child program
+(`lua-confine-child`) launched inside a candidate confinement profile, a
+parent-side driver, and the C that installs the profile and attempts what it
+should refuse. Nothing links it, and it is built on Linux alone.
 
 ```bash
 cabal test hetoimasia-scripting-lua:linux-confinement-probe --test-show-details=direct
 ```
 
-The validation group is `test.lua-confinement-linux`, optional and local-only.
-It is not selected automatically, even for affected inputs. A green run of it is
-evidence and never a verdict: each example prints what it proved, or says that
-the machine could not install the profile and names the prerequisite that was
-missing. What those lines add up to is
-[the Linux confinement verdict](../../docs/archive/lua_linux_confinement_verdict.md),
-which is where the accounting semantics of the memory limit, the deployment
-baseline, and the residual limits are recorded, and the runs it draws on are
-kept verbatim in
-[the retained runs](../../docs/archive/lua_linux_confinement_evidence.md).
+The validation group is `test.lua-confinement-linux`, optional and
+local-only, never selected automatically. A green run is evidence, never a
+verdict; the Linux confinement verdict is listed in
+[removed_records.md](../../docs/removed_records.md).
 
 ## The macOS confinement probe
 
-`macos/` holds LUA-15's feasibility probe: a confined helper
-(`macos-confinement-helper`), the trusted parent side it is launched from
-(`macos-probe`, a private sublibrary), and the Hspec target that drives the
-epic's proof matrix (`macos-confinement-probe`). All three are built only on
-Darwin; elsewhere the components are not built rather than built and passing
-vacuously.
+`macos/` holds a confined helper (`macos-confinement-helper`), the trusted
+parent side (`macos-probe`, a private sublibrary) and the Hspec target
+`macos-confinement-probe`, built only on Darwin. None of it is an engine
+facility, and it admits no untrusted source through any public path.
 
-None of it is an engine facility. No production library, executable, or public
-API depends on it, and it admits no untrusted source through any public path —
-the only Lua it loads is the fixture its own parent wrote into the private
-directory it was given. It exists to answer
-[Q-5](../../docs/archive/designs/lua_runtime_design.md#q-5-verified-platform-confinement-and-resource-enforcement-profile)'s
-macOS row with observations.
-
-The answer is `inconclusive` — with one row of evidence explicitly identified as
-missing rather than passed — and
-[docs/archive/macos_confinement_verdict.md](../../docs/archive/macos_confinement_verdict.md) is
-where it is stated and argued: every proof row was demonstrated, on two
-interfaces Apple does not support. Read it before building anything on this
-code.
+**The answer was `inconclusive`**: every proof row was demonstrated, on two
+interfaces Apple does not support (the macOS confinement verdict is listed in
+[removed_records.md](../../docs/removed_records.md)). Do not build on this
+code without reading it.
 
 ```bash
 cabal test hetoimasia-scripting-lua:macos-confinement-probe --test-show-details=direct
 ```
 
-Each example prints what it proved. The validation group is
-`test.macos-confinement`, optional and local-only; see
+The validation group is `test.macos-confinement`, optional and local-only; see
 [docs/validation.md](../../docs/validation.md#the-macos-confinement-probe).
 
 ## Routine tests and optional probes
 
-`lua-host-tests` keeps the quick bridge/protocol contracts, including protected
-allocation failures and one-capability foreign-call progress. The deliberate
-nonterminating-Lua experiment is separate:
+`lua-host-tests` keeps the quick bridge and protocol contracts, including
+protected allocation failures and one-capability foreign-call progress. The
+deliberately nonterminating Lua experiment is separate:
 
 ```sh
 cabal test hetoimasia-scripting-lua:lua-hazard-probes --test-show-details=direct
 ```
 
-It deliberately waits five seconds and terminates its child process. It and
-both confinement feasibility probes are local-only and optional. Select them
-explicitly or through coordinated local testing; see the repository's
-[test classification](../../docs/test_classification.md). The existing
-`lua-hazard callback-cancellation` mode remains a manual diagnostic with no
-pass/fail oracle, not a routine test.
+It waits five seconds and terminates its child process. It and both
+confinement probes are local-only and optional; see the
+[test classification](../../docs/test_classification.md). `lua-hazard
+callback-cancellation` is a manual diagnostic with no pass/fail oracle.

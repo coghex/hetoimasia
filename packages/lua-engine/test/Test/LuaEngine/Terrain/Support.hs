@@ -43,12 +43,14 @@ module Test.LuaEngine.Terrain.Support
   , removalProbeIn
   , awaitReached
   , pumpUntilReached
+  , waitUntil
   , openGate
   , armGate
   , disarmGate
   ) where
 
-import Control.Concurrent.MVar (MVar, newEmptyMVar, takeMVar, tryPutMVar, tryTakeMVar)
+import Control.Concurrent (yield)
+import Control.Concurrent.MVar (MVar, newEmptyMVar, takeMVar, tryPutMVar)
 import qualified Data.ByteString.Char8 as BC
 import Data.ByteString (ByteString)
 import Hetoimasia.Foundation.Worker (WorkerGroup)
@@ -56,11 +58,10 @@ import Hetoimasia.Terrain.Runtime.Storage (StorageConfig, filesystemOf, minHeadr
 import Hetoimasia.Terrain.Runtime.Store (StoreSpec (..), defaultStoreSpec, minAllowanceBytes)
 import System.IO.Temp (withSystemTempDirectory)
 import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
-import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, retry, writeTVar)
+import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, retry, writeTVar)
 import Control.Exception (onException)
 import Control.Monad (void, when)
 import Data.List (find)
-import Data.Maybe (isJust)
 import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as Text
@@ -81,7 +82,7 @@ import Hetoimasia.Terrain.Runtime
 import Test.Hspec (Expectation, expectationFailure, shouldThrow)
 import Hetoimasia.Scripting.Lua.Instance (InstanceFailure (failureMessage))
 import qualified Hetoimasia.Scripting.Lua.Instance as Instance
-import Test.LuaEngine.Facade.Support (Script (..), Spawned, VmShape (..), World, advanceClock, errLines, gameplayShape, outLines, phaseOf, presentationShape, pumpUntil, script, settledFailure)
+import Test.LuaEngine.Facade.Support (Script (..), Spawned, VmShape (..), World, errLines, gameplayShape, outLines, outLinesSTM, phaseOf, presentationShape, script, settledFailure, stepUntil)
 import Test.Support.Bounded (bounded)
 
 -- | The real service and the adapter over it.
@@ -319,15 +320,24 @@ tightRigConfig = defaultConfig {configLimits = limits, configRetainedBytes = fro
 
 -- Gates -----------------------------------------------------------------------------------------------------
 
--- | A point the terrain owner can be held at, with a signal that it arrived.
+-- | A point the terrain owner can be held at, with a signal that it arrived: a flag, raised by an arrival and taken by the wait for
+-- it, so that a pump can decide to stop on it in the transaction that would otherwise claim the next update.
 data Gate = Gate
-  { gateArrived ∷ MVar ()
+  { gateArrived ∷ TVar Bool
   , gateOpen ∷ MVar ()
   , gateArmed ∷ TVar Bool
   }
 
 newGate ∷ IO Gate
-newGate = Gate <$> newEmptyMVar <*> newEmptyMVar <*> newTVarIO True
+newGate = Gate <$> newTVarIO False <*> newEmptyMVar <*> newTVarIO True
+
+-- | An arrival: raise the flag (an arrival before the last was taken is the same signal).
+arrive ∷ Gate → IO ()
+arrive gate = atomically (writeTVar (gateArrived gate) True)
+
+-- | Whether an arrival is waiting, taking it when one is.
+takeArrival ∷ Gate → STM Bool
+takeArrival gate = readTVar (gateArrived gate) >>= \arrived → arrived <$ when arrived (writeTVar (gateArrived gate) False)
 
 armGate, disarmGate ∷ Gate → IO ()
 armGate gate = atomically (writeTVar (gateArmed gate) True)
@@ -339,17 +349,24 @@ gatedProbe selects gate = Probe $ \point →
   when (selects point) $ do
     armed ← readTVarIO (gateArmed gate)
     when armed $ do
-      _ ← tryPutMVar (gateArrived gate) ()
+      arrive gate
       takeMVar (gateOpen gate)
 
--- | Wait, bounded, until the owner has arrived at the gate.
+-- | Wait, bounded, until the owner has arrived at the gate, taking the arrival.
 awaitReached ∷ Gate → IO ()
-awaitReached gate = bounded (takeMVar (gateArrived gate))
+awaitReached gate = bounded (atomically (takeArrival gate >>= \arrived → if arrived then pure () else retry))
 
--- | Drive the world's clock, bounded, until the owner has arrived at the gate: for an owner that only reaches it at a boundary a
--- clock tick brings.
+-- | Step the presentation VMs, one update at a time, until the owner has arrived at the gate, the arrival taken in the transaction
+-- that decides to stop ('stepUntil'): for an owner that only reaches it at a boundary an update brings.
 pumpUntilReached ∷ World → Gate → IO ()
-pumpUntilReached world gate = pumpUntil world (advanceClock world 2000000000 >> (isJust <$> tryTakeMVar (gateArrived gate)))
+pumpUntilReached world gate = stepUntil world (takeArrival gate)
+
+-- | Wait, bounded, until a reading the service offers only outside a transaction holds. It wakes nothing: what it waits for is
+-- the service's or an owner's own work (a control, a settlement), never an update.
+waitUntil ∷ IO Bool → IO ()
+waitUntil reading = bounded loop
+  where
+    loop = reading >>= \done → if done then pure () else yield >> loop
 
 -- | Let a held owner go, and every later arrival through. Idempotent, so a scope can open it as part of its stop.
 openGate ∷ Gate → IO ()
@@ -395,10 +412,12 @@ limitHeld service name = do
   rows ← inspectLimits service
   pure (maybe (-1) (toInteger . limitRowHeld) (find ((== name) . limitRowName) rows))
 
--- | Advance the presentation clock until the instance has printed this line, and when it does not in time say what it did print.
+-- | Step the presentation VMs, one update at a time, until the instance has printed this line, decided in the transaction that
+-- would claim the next update ('stepUntil'), so the update after the one that printed it never runs; when it does not come in
+-- time, say what was printed.
 untilPrinted ∷ World → Text → IO ()
 untilPrinted world marker =
-  pumpUntil world (advanceClock world 2000000000 >> (elem marker <$> outLines world))
+  stepUntil world (elem marker <$> outLinesSTM world)
     `onException` do
       printed ← outLines world
       warned ← errLines world
@@ -429,7 +448,7 @@ removalProbeIn gate = do
             armed ← readTVarIO (gateArmed gate)
             when armed $ do
               readIORef granted >>= writeIORef heldInSlot . elem rid
-              _ ← tryPutMVar (gateArrived gate) ()
+              arrive gate
               takeMVar (gateOpen gate)
         _ → pure ()
   pure (probe, readIORef heldInSlot)
@@ -455,7 +474,7 @@ holdAt ∷ Gate → IO ()
 holdAt gate = do
   armed ← readTVarIO (gateArmed gate)
   when armed $ do
-    _ ← tryPutMVar (gateArrived gate) ()
+    arrive gate
     takeMVar (gateOpen gate)
 
 -- | The name the service holds for an arena a Lua instance of this rig's session opened under this content root.

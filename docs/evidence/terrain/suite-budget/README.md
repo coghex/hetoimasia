@@ -7,7 +7,7 @@ large fixture when the first example reads it, and runs its pure families in
 parallel; `terrain-runtime-full-depth-tests`, an optional local probe, runs the
 same families at their original parameters. The rule and the budget are in
 [test_classification.md](../../../test_classification.md#the-suites-budget-and-its-parallel-group);
-the later two-capability pass has [its own record](../capability-pass/README.md).
+the later two-capability pass has [its own record](../../../removed_records.md).
 
 The full write-up (every measurement window, the per-example times, all 64
 store controls with their failing examples, the printed-line oracle) is in git

@@ -556,14 +556,18 @@ version, and the style is checked (`checkStyle`: kinds, single-level parents,
 `unit-normal-rgb-v1`, every region of the manifest, the materials' colour
 regions, the instance's texture byte limit). The rest runs on the adapter's
 worker and settles once (`SettledOk`, `SettledRefused`, `SettledCancelled`);
-every refusal and a cancellation release what was retained.
+every refusal and a cancellation release what was retained. From the moment
+the worker takes the request off its queue to the commit, the attachment owns
+the parents and the runtime view it opened, and every exit before the commit
+(a refusal, a failure, a cancellation) closes that runtime view and releases
+the parents.
 
 | Refusal | Meaning |
 | --- | --- |
-| `AttachStyle` | a parent refused by the lease, unsuitable, without coverage, unbindable; an incomplete mapping; parents over the instance's texture bytes. Never busy |
+| `AttachStyle` | a parent refused by the lease, unsuitable, without coverage, unbindable; an incomplete mapping; parents over the instance's texture bytes; a mapping that gives no region to a material of the arena's palette (`StyleMissingMaterials`, read in the commit transaction). Never busy |
 | `AttachNoDepth` | the target's frames carry no `D32_SFLOAT` depth image, or the session's depth format is not `D32_SFLOAT` |
 | `AttachTargetUnusable`, `AttachTargetClaimed`, `AttachParentReleased` | read in the commit transaction, before any claim |
-| `AttachArena`, `AttachSettings`, `AttachCamera`, `AttachTooManyViews` | the arena lease, the presentation settings, the camera's start, eight views |
+| `AttachArena`, `AttachSettings`, `AttachCamera`, `AttachTooManyViews` | the arena lease (released, closed, or another client's of the same service), the presentation settings, the camera's start, eight views |
 | `AttachBusy`, `AttachStopped` | the request queue or the terrain service's admission; the adapter or session ended |
 
 **Preparation** (the adapter's one worker, latest intent only) is a
@@ -617,8 +621,11 @@ explicit pending regions and does not settle fully: requirement 3's
 constrained-capacity case, not a footprint hole.
 
 A preparation that cannot start sleeps on the one thing that can change that:
-at its two-pin limit, an adoption of its target; without target metrics or an
-available arena, both of them. Its intent and its peers do not wake it.
+at its two-pin limit, an adoption other than the one seen when its pins were
+pruned (one transaction); without target metrics, the metrics. Its intent and
+its peers do not wake it. A view whose arena authority (its lease released or
+revoked, its arena closed) or target incarnation is gone for good closes
+through its own close, which hands the target back, and says so as evidence.
 
 **Inputs.** Every terrain and knowledge input of a plan, of its retained
 regions and of its pick metadata comes from those regional copies and from
@@ -654,9 +661,25 @@ when no adoption lists them and their upload has ended, so the release is never
 deferred and its answer proves the buffer gone; their GPU bytes return then.
 Owner actions are typed: a full queue or release lane is waited for (never
 asked again in a loop), and an owner that takes no more actions, or an action
-that never ran, is terminal evidence. A build refused as upload pressure waits
-for one of the session's uploads to settle (the owner's unsettled uploads, from
-`readVulkanUploads`), as well as for a release, an adoption or the account. An
+that never ran, is terminal evidence. A build that stops partway, by a refusal
+or by its builder raising, answers the chunks it made. A wait is installed
+against what the refusal saw, so a change between the two is never missed: a
+build refused as upload pressure waits for one of the session's uploads (the
+owner's unsettled uploads, from `readVulkanUploads`, read with its submission)
+to settle since then; a copy the account cannot hold waits from the state its
+own release leaves; a copy refused for the terrain service's retained bank
+waits on that bank (`retainedBankUseSTM`), read before the request; each also
+wakes for a release, an adoption or the account.
+
+**The record window.** Before a candidate is built, its render regions'
+material records are checked against the renderer's storage window (the bytes
+of clip tables and material records one batch may bind, `ownerRegionWindow`):
+one clip entry, then each region's record table. A candidate beyond it is
+never built or accepted, so no frame is refused for it, and the previous
+publication stays. A region whose records alone exceed the window is a typed
+refusal (`UnitExceedsWindow`: the region, its bytes, the window); otherwise the
+whole waits (`EnvelopeExceedsWindow`) until the view's intent, metrics or arena
+state change. `readingWindow` reads either. An
 upload that failed, or a built chunk the owner no longer knows, is kept as
 evidence before the candidate retires; the previous revision stays published.
 A release that failed is kept as evidence, its bytes still charged, and is never
@@ -675,7 +698,9 @@ copies of them. A charge the account cannot hold leaves the stage waiting
 (nothing more is made) until something is released. Once published, the view
 holds its pinned plans, its listed regions' descriptions, the facts it keeps
 for its camera (charged at their inputs, replaced by the next facts' charge)
-and its kept demand (32 bytes a region); `readingNeedBytes` is the sum. A region
+and its kept demand (32 bytes a region); each pinned plan pays for its own
+quads, pending spans and demand (`readingPinnedBytes`); `readingNeedBytes` is
+the sum. A region
 that leaves a revision or a closed view keeps its description charged, held by
 the service, until its release is answered; one whose release failed stays in
 the renderer's registry, so its charge stays after the service's end, reported
@@ -697,7 +722,9 @@ view and retries when something is released or adopted.
 **Picking** reads only the revision the host adopted for the target and the
 plan pinned for it: no adopted revision, or metrics that are not the plan's,
 is `PickLoading`; zero metrics, a point outside, air, gaps and fog are
-`PickNoHit`; a visible known part is `PickHit` with an opaque reference.
+`PickNoHit`; a visible known part is `PickHit` with an opaque reference: no
+module of the library exports its constructors or field labels, so a caller
+reads one through its accessor functions and can neither make nor alter one.
 `pickPrecondition` gives the removal the arena incarnation and the content and
 knowledge revisions, and a guard the terrain service reads in its removal
 arbitration: the view still holds the target and the revision picked from is
@@ -707,7 +734,11 @@ still the one adopted.
 claim and, if the view published and the target is usable, publishes the
 host's initial content as a real new revision; drops the GPU interests; and
 starts the retirement of its regions. A view that never published leaves the
-target's latest value alone. The service's end closes every view, then drains
+target's latest value alone. The view stays in the service's views until its
+parents are released, so a close interrupted there is finished by the service's
+end; a closed view's handle keeps no style, demand or admission state. A jump
+is cancelled only through the view it belongs to. The service's end closes
+every view, then drains
 the retirements to the owner's evidence; retirement the owner can no longer
 prove is kept as terminal evidence (`terrainViewsFailures`). The drain waits
 for the ledger to let a chunk go or for the graphics owner to end

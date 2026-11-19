@@ -18,7 +18,8 @@ import Hetoimasia.Scripting.Lua.Scheduled (scheduledEndpoint)
 import Hetoimasia.Terrain.Residency (Revision (..))
 import Hetoimasia.Terrain.Runtime (ArenaStatus (..), GrowAnswer (..), Point (..), Probe (..), RetryAnswer (..), StorageState (..), arenaStatus, await, backedAtRestSTM, growArena, openArena, registerClient, retryArena)
 import Hetoimasia.Terrain.Source (LayerSpec (..), SourceSpec (..))
-import Control.Concurrent.STM (atomically)
+import Control.Concurrent.STM (atomically, check)
+import Test.Support.Bounded (bounded)
 import Test.Hspec
 import Test.LuaEngine.Facade.Support
 import Test.LuaEngine.Terrain.Support
@@ -270,10 +271,10 @@ windowsSpec = describe "Terrain cancel windows" $ do
 
   it "leaves terrain unchanged for a logical removal cancelled before its position, and lets its tick begin" $
     withRig $ \rig →
-      withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource logicalCancel)]) $ \world control runtime →
+      withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource logicalCancel)]) $ \world _ runtime →
         withFvm world runtime (gameplayOver rig) $ \fvm → do
           _ ← spawn world fvm "modules-test" mainPath
-          pumpUntil world (tickBy control fvm 1 >> (elem "done" <$> outLines world))
+          tickUntil fvm (elem "done" <$> outLinesSTM world)
           printed ← outLines world
           printed `shouldContain` ["cancel at\t1\tcancelled", "take at\t2\tcancelled"]
           -- the cell is as authored when the later tick reads it, and the ticks went on past the cancelled removal's position
@@ -294,22 +295,22 @@ windowsSpec = describe "Terrain cancel windows" $ do
           PointCommitted rid _ → modifyIORef' commits (show rid :)
           _ → pure ()
     withRigProbe defaultConfigForRaces probe $ \rig →
-      withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource inverted), ("lua/holder.lua", scriptSource holder)]) $ \world control runtime →
+      withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource inverted), ("lua/holder.lua", scriptSource holder)]) $ \world _ runtime →
         withFvm world runtime (gameplayOver rig) $ \gameplayVm →
           withFvm world runtime (presentationOver rig) $ \shown → (`finally` openGate gate) $ do
             _ ← spawn world gameplayVm "modules-test" mainPath
             _ ← admitOnly world shown "modules-test" "lua/holder.lua"
             -- tick 1 settles the opens and issues the warming read; tick 2 settles it: the second arena's cell is resident, the first's is not
-            pumpUntil world (tickBy control gameplayVm 1 >> (elem "warm at\t2" <$> outLines world))
+            tickUntil gameplayVm (elem "warm at\t2" <$> outLinesSTM world)
             -- the holder reads a cell of a region nobody has read, and the owner is held loading it
             signalRig rig "go"
             pumpUntilReached world gate
             -- the holder cancels that read while its job is held; tick 3 issues the two removals, which wait behind the job
             untilPrinted world "E cancel\tcancelled"
-            pumpUntil world (tickBy control gameplayVm 1 >> (elem "issued at\t3" <$> outLines world))
+            tickUntil gameplayVm (elem "issued at\t3" <$> outLinesSTM world)
             -- the job is released: the owner prepares the removal whose cell is resident first, and the other when its region has loaded
             openGate gate
-            pumpUntil world (tickBy control gameplayVm 1 >> (any (Text.isPrefixOf "r2 at") <$> outLines world))
+            tickUntil gameplayVm (any (Text.isPrefixOf "r2 at") <$> outLinesSTM world)
             printed ← outLines world
             printed `shouldContain` ["r1 at\t4\tsuccess\ttrue\t1", "r2 at\t4\tsuccess\ttrue\t1"]
             staged ← reverse <$> readIORef stagings
@@ -330,12 +331,12 @@ windowsSpec = describe "Terrain cancel windows" $ do
           -- the owner stands at the commit (the publication decision) of the staged removal, which holds the session's
           -- mutating transaction: its writes are done and its credits are reserved; the owner's requests move to a new epoch
           heldInSlot `shouldReturn` True
+          -- (the epoch change is the owner's own control, applied when it looks at its controls: no update is woken for it)
           void (advanceRequestEpoch (scheduledEndpoint (fvOwner fvm)))
-          pumpUntil world (advanceClock world 2000000000 >> (pure True))
           openGate gate
           observeCell rig (arenaName rig "modules-test" "main") (0, 0, 0) `shouldReturn` (0, Just "soil")
           -- the transaction was aborted with no publication: the slot and its credits are returned
-          pumpUntil world (atomically (backedAtRestSTM (rgService rig)))
+          bounded (atomically (backedAtRestSTM (rgService rig) >>= check))
 
 racesSpec ∷ Spec
 racesSpec = describe "Terrain races" $ do
@@ -358,13 +359,13 @@ racesSpec = describe "Terrain races" $ do
           stopSpawned spawned
           -- the instance's end reaches the service: its removal is cancelled (its command slot freed) while the
           -- decision is still held
-          pumpUntil world ((== 0) <$> limitHeld (rgService rig) "command slots")
+          waitUntil ((== 0) <$> limitHeld (rgService rig) "command slots")
           openGate gate
           -- the arena went with its instance, and nothing advanced it past its opening revision: the decision found
           -- the removal's request gone and committed nothing
-          pumpUntil world ((== 0) <$> limitHeld (rgService rig) "arenas")
+          waitUntil ((== 0) <$> limitHeld (rgService rig) "arenas")
           readIORef committed >>= (`shouldSatisfy` all (== Revision 0))
-          pumpUntil world (atomically (backedAtRestSTM (rgService rig)))
+          bounded (atomically (backedAtRestSTM (rgService rig) >>= check))
 
   it "edits and reads from a Lua client while the host asks the arena's status, grows its allowance and retries it, on the same arena" $
     withRig $ \rig → do
@@ -392,7 +393,7 @@ racesSpec = describe "Terrain races" $ do
           printed `shouldContain` [line | i ← ["0", "1", "2"], line ← ["removed\t" <> i <> "\tsuccess\ttrue", "cell\t" <> i <> "\ttrue"]]
           Right final ← arenaStatus service lease
           (statusStorage final, statusReservedBytes final, statusContentRevision final) `shouldBe` (StorageReady, fromInteger (128 * mib), Revision 3)
-          pumpUntil world (atomically (backedAtRestSTM service))
+          bounded (atomically (backedAtRestSTM service >>= check))
 
   it "holds a late removal's tick while the presentation VM keeps reading, changes nothing before the position, and releases the tick when it commits" $ do
     gate ← newGate
@@ -415,7 +416,7 @@ racesSpec = describe "Terrain races" $ do
             tickTwos `shouldBe` 0
             -- the presentation VM carries on meanwhile: no Lua callback waits for the held request, so its updates keep running
             beats ← length . filter (== "heartbeat") <$> outLines world
-            pumpUntil world (advanceClock world 2000000000 >> ((>= beats + 3) . length . filter (== "heartbeat") <$> outLines world))
+            stepUntil world ((>= beats + 3) . length . filter (== "heartbeat") <$> outLinesSTM world)
             outLines world >>= \printed → printed `shouldNotContain` ["gameplay tick\t2"]
             -- the commit goes through: the tick begins, the removal settles at it, and the arena shows the edit
             openGate gate
@@ -446,7 +447,7 @@ racesSpec = describe "Terrain races" $ do
           printed ← outLines world
           -- the cancel won: nothing was edited, and the cell is as it was; the slot and its credits are returned
           printed `shouldContain` ["take\tcancelled", "cell\tfalse\t0"]
-          pumpUntil world (atomically (backedAtRestSTM (rgService rig)))
+          bounded (atomically (backedAtRestSTM (rgService rig) >>= check))
     -- and with the owner not held, the commit wins the race
     disarmGate gate
     withRigProbe defaultConfigForRaces noProbeForRaces $ \rig →
@@ -472,8 +473,9 @@ arbitration = describe "Terrain arbitration" $
           _ ← spawn world fvm "modules-test" mainPath
           untilPrinted world "issued"
           awaitReached commitGate
-          -- the script's next update cancels: the host settles it, and the cancelling thread stops before telling the service
-          pumpUntil world (advanceClock world 2000000000 >> (pure True))
+          -- the script's next update cancels: the host settles it, and the cancelling thread stops before telling the service. One
+          -- step wakes exactly that update, whenever its registration appears (the update that printed "issued" may still be ending)
+          stepOnce world
           awaitReached tellGate
           -- the owner attempts the commit now: the request is settled in the host, so it is not eligible and nothing is committed
           openGate commitGate

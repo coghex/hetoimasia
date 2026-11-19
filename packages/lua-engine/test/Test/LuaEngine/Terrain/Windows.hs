@@ -653,7 +653,7 @@ spec = describe "Terrain windows and banks" $ do
             awaitReached gate
             -- an attach decided now finds a name only the service has settled: it answers not_found at once, without waiting for the adoption
             notFound ← length . filter (== "attach\tfailure\tnot_found") <$> outLines world
-            pumpUntil world (advanceClock world 2000000000 >> ((> notFound + 4) . length . filter (== "attach\tfailure\tnot_found") <$> outLines world))
+            stepUntil world ((> notFound + 4) . length . filter (== "attach\tfailure\tnot_found") <$> outLinesSTM world)
             outLines world >>= \printed → printed `shouldNotContain` ["attach\tsuccess\tnil"]
             -- the service made a lease for each of those attaches and the host answered without publishing it: each was given back with its
             -- request's credit, so the leases the service holds are the open's, and at most the attach being asked now
@@ -764,7 +764,7 @@ spec = describe "Terrain windows and banks" $ do
                 failure `shouldSatisfy` isJust
                 -- an open the instance's end cancelled keeps its arena place until its reservation job has
                 -- drained and any file it made is closed (#665): then nothing is left
-                pumpUntil world ((== 0) <$> limitHeld (rgService rig) "arenas")
+                waitUntil ((== 0) <$> limitHeld (rgService rig) "arenas")
                 limitHeld (rgService rig) "leases" `shouldReturn` 0
                 -- the application forgets an instance it has observed end, as the session does: its terrain client ends with it
                 limitHeld (rgService rig) "clients" `shouldReturn` 1
@@ -808,7 +808,7 @@ spec = describe "Terrain windows and banks" $ do
                   withRigConfig defaultConfig {configFirstRevision = first} $ \rig →
                     withFvm world runtime (presentationOver rig) $ \fvm → do
                       _ ← spawn world fvm "modules-test" mainPath
-                      pumpUntil world (advanceClock world 2000000000 >> (pure False))
+                      stepUntil world (pure False)
               show raised `shouldSatisfy` Text.isInfixOf "ProviderDefect" . Text.pack
             else
               withWorld (counts [(LuaIntegerMaximum, 40)]) (Layout [("lua/main.lua", scriptSource firstRead)]) $ \world _ runtime →
@@ -914,7 +914,7 @@ spec = describe "Terrain windows and banks" $ do
         withRigHooks defaultConfigForRaces noProbeForRaces noTerrainHooks {hookAdopting = ioError (userError "adoption failed")} $ \rig →
           withFvm world runtime (presentationOver rig) $ \fvm → do
             _ ← admitOnly world fvm "modules-test" mainPath
-            failed ← try @SomeException (pumpUntil world (advanceClock world 2000000000 >> (pure False)))
+            failed ← try @SomeException (stepUntil world (pure False))
             failed `shouldSatisfy` isLeft
             limitHeld (rgService rig) "arenas" `shouldReturn` 0
             limitHeld (rgService rig) "leases" `shouldReturn` 0
@@ -935,15 +935,15 @@ spec = describe "Terrain windows and banks" $ do
           -- the three reads and the removal are prepared against revision 0, before anything commits
           when (length (filter (== "capture 0") seen) >= 3 && "staged" `elem` seen) (void (tryPutMVar prepared ()))
     withRigProbe defaultConfigForRaces probe $ \rig →
-      withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource ordered)]) $ \world control runtime →
+      withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource ordered)]) $ \world _ runtime →
         withFvm world runtime (gameplayOver rig) $ \fvm → do
           _ ← spawn world fvm "modules-test" mainPath
           -- tick 1 settles the open and issues the removal, the cell, the column and the surface, all due at tick 2
-          pumpUntil world (tickBy control fvm 1 >> (elem "issued" <$> outLines world))
+          tickUntil fvm (elem "issued" <$> outLinesSTM world)
           -- the stale captures exist before the commit: the owner has prepared all four against revision 0, and tick 2 has not begun
           bounded (takeMVar prepared)
           readIORef events >>= \seen → "commit 1" `shouldNotSatisfy` (`elem` seen)
-          pumpUntil world (tickBy control fvm 1 >> (elem "surface\t1\t-1\tsoil" <$> outLines world))
+          tickUntil fvm (elem "surface\t1\t-1\tsoil" <$> outLinesSTM world)
           printed ← outLines world
           printed `shouldContain` ["removal\tsuccess\ttrue\t1"]
           printed `shouldContain` ["cell\ttrue\t1"]
@@ -982,7 +982,7 @@ spec = describe "Terrain windows and banks" $ do
                   -- the first open lets go now: it is its own hold it lets go of, and the later open's stands
                   openGate releaseGate
                   asked ← length . filter (== "observer\tfailure\tnot_found") <$> outLines world
-                  pumpUntil world (advanceClock world 2000000000 >> ((> asked + 2) . length . filter (== "observer\tfailure\tnot_found") <$> outLines world))
+                  stepUntil world ((> asked + 2) . length . filter (== "observer\tfailure\tnot_found") <$> outLinesSTM world)
                   outLines world >>= \printed → printed `shouldNotContain` ["observer\tsuccess\tnil"]
                   openGate adoptGate
                   untilPrinted world "observer\tsuccess\tnil"
@@ -1088,7 +1088,7 @@ spec = describe "Terrain windows and banks" $ do
 
   it "holds the name of an open the service failed until the host settles it, against another VM's open, and frees it then" $
     withRig $ \rig →
-      withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource failsLogically), ("lua/other.lua", scriptSource (reopensOnSignal "dup"))]) $ \world control runtime →
+      withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource failsLogically), ("lua/other.lua", scriptSource (reopensOnSignal "dup"))]) $ \world _ runtime →
         withFvm world runtime (gameplayOver rig) $ \gameplayVm →
           withFvm world runtime (presentationOver rig) $ \shown → do
             _ ← spawn world gameplayVm "modules-test" mainPath
@@ -1097,7 +1097,7 @@ spec = describe "Terrain windows and banks" $ do
             signalRig rig "first"
             untilPrinted world "first answer\tfailure\tname_in_use"
             -- the tick is granted and the first open is settled: the name is free
-            pumpUntil world (tickBy control gameplayVm 1 >> (elem "invalid open\tfailure\tdefinition" <$> outLines world))
+            tickUntil gameplayVm (elem "invalid open\tfailure\tdefinition" <$> outLinesSTM world)
             signalRig rig "second"
             untilPrinted world "second answer\tsuccess\tnil"
 
@@ -1118,7 +1118,7 @@ spec = describe "Terrain windows and banks" $ do
 
   it "frees the name of a pending logical open whose instance ended, for another VM's open of it" $
     withRig $ \rig →
-      withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource opensLogically), ("lua/other.lua", scriptSource (reopensOnSignal "held"))]) $ \world control runtime →
+      withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource opensLogically), ("lua/other.lua", scriptSource (reopensOnSignal "held"))]) $ \world _ runtime →
         withFvm world runtime (gameplayOver rig) $ \gameplayVm →
           withFvm world runtime (presentationOver rig) $ \shown → do
             opener' ← spawn world gameplayVm "modules-test" mainPath
@@ -1126,7 +1126,10 @@ spec = describe "Terrain windows and banks" $ do
             signalRig rig "first"
             untilPrinted world "first answer\tfailure\tname_in_use"
             stopSpawned opener'
-            pumpUntil world (tickBy control gameplayVm 1 >> ((/= Just Instance.Active) <$> phaseOf opener'))
+            -- the instance has ended: its pending open's request is ended on its owner's thread after the stop has made it Stopping, and
+            -- it is Stopped only once that drain is done, so the other VM's open is signalled once the host's settlement has freed the
+            -- name, not while it may still be decided against the claim
+            tickUntil gameplayVm (maybe False Instance.isTerminal <$> phaseOfSTM opener')
             signalRig rig "second"
             untilPrinted world "second answer\tsuccess\tnil"
 
@@ -1224,16 +1227,16 @@ spec = describe "Terrain windows and banks" $ do
 
   it "keeps the failed opens' names only while the host has not settled them, whatever names they used, and none once their instance is forgotten" $
     withRig $ \rig →
-      withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource manyFailing)]) $ \world control runtime →
+      withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource manyFailing)]) $ \world _ runtime →
         withFvm world runtime (gameplayOver rig) $ \fvm → do
           spawned ← spawn world fvm "modules-test" mainPath
           let held = Map.size <$> readTVarIO (tfFailedOpens (rgFacade rig))
           -- eight failed opens of eight names wait for tick 1
           held `shouldReturn` 8
           -- tick 1 settles them, and issues eight more of other names: the first eight were swept as the next were entered
-          pumpUntil world (tickBy control fvm 1 >> (elem "second round issued" <$> outLines world))
+          tickUntil fvm (elem "second round issued" <$> outLinesSTM world)
           held >>= (`shouldSatisfy` (<= 8))
-          pumpUntil world (tickBy control fvm 1 >> (elem "second round settled" <$> outLines world))
+          tickUntil fvm (elem "second round settled" <$> outLinesSTM world)
           -- the instance is forgotten: nothing is left of any of them
           forgetInstance (fvFacade fvm) (spId spawned)
           held `shouldReturn` 0

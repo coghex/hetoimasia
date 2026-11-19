@@ -88,7 +88,7 @@ spec = describe "Terrain validation" $ do
       withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource checks)]) $ \world _ runtime →
         withFvm world runtime (presentationOver rig) $ \fvm → do
           _ ← spawn world fvm "modules-test" mainPath
-          pumpUntil world (advanceClock world 2000000000 >> (elem "done" <$> outLines world))
+          stepUntil world (elem "done" <$> outLinesSTM world)
           printed ← outLines world
           checkCases decodeCases printed
           -- No metamethod ran.
