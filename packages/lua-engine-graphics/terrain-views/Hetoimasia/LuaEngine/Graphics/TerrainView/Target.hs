@@ -30,6 +30,9 @@ windowViewTarget hostDepth metrics target =
   ViewTarget
     { vtKey = KeyWindow (targetWindow target)
     , vtUsable = targetUsable target
+    , -- the window's standing: its host's lifecycle record and the owner's target standing, which change with the
+      -- incarnation's construction and retirement
+      vtRetired = not <$> targetUsable target
     , vtPublish = \scene →
         targetPublishSTM target scene <&> \case
           WindowScenePublished _ _ → True
@@ -39,12 +42,14 @@ windowViewTarget hostDepth metrics target =
     }
 
 -- | A surface-free target registered with the host. Its recording boundary ('recordVulkanTargetBatch') is the one
--- place its frames are recorded; whoever records them says whether they carry the qualified depth image.
+-- place its frames are recorded; whoever records them says whether they carry the qualified depth image. Whoever
+-- registered it says whether it has retired, from a cell that changes only when it does (its unregistration).
 offscreenViewTarget ∷ VulkanHost GraphicsScene → OffscreenTargetId → STM Bool → Bool → STM (Maybe TargetMetrics) → ViewTarget SceneTargetKey
-offscreenViewTarget host target usable depth metrics =
+offscreenViewTarget host target retired depth metrics =
   ViewTarget
     { vtKey = KeyOffscreen target
-    , vtUsable = usable
+    , vtUsable = not <$> retired
+    , vtRetired = retired
     , vtPublish = \scene →
         publishVulkanTargetScene host target scene <&> \case
           TargetScenePublished _ _ → True

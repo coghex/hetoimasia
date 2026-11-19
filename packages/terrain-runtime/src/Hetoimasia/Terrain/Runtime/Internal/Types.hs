@@ -733,6 +733,10 @@ data Service = Service
   , -- | The compile account: the part of the resident bank carved out for compiled
     -- connectivity (every arena's result and the one active compilation's peak).
     serviceCompileBank ∷ !Word64
+  , -- | Bumped in the transaction that ends any lease's validity (an arena's close, a
+    -- lease's release, the service's end) and in no other: a holder watching for its
+    -- authority's loss watches this, not the whole state.
+    serviceAuthority ∷ !(TVar Word64)
   }
 
 -- ---------------------------------------------------------------------------

@@ -147,6 +147,10 @@ readSt = readTVar . serviceState
 modifySt ∷ Service → (St → St) → STM ()
 modifySt svc = modifyTVar' (serviceState svc)
 
+-- | Some lease stopped being valid: what watches the authority epoch looks again.
+bumpAuthority ∷ Service → STM ()
+bumpAuthority svc = modifyTVar' (serviceAuthority svc) (+ 1)
+
 -- | Something that may free capacity happened; the owner retries what waits.
 markFreed ∷ Service → STM ()
 markFreed svc = modifySt svc (\st → st {stateFreed = True, stateDispatchIdle = False})
@@ -1098,6 +1102,7 @@ closeArena svc aid = do
             _ → stateNames cur
         , stateLeases = foldr (Map.adjust (\l → l {leaseLive = False})) (stateLeases cur) (Set.toList (arenaLeases arena))
         }
+    bumpAuthority svc
     retireArenaRecord svc aid
 
 -- | Release a lease. Idempotent. It cancels the requests made through it, and
@@ -1114,6 +1119,7 @@ releaseLeaseSTM svc lid = do
         , stateClients = Map.adjust (\c → c {clientLeases = Set.delete lid (clientLeases c)}) (leaseClient ls) (stateClients cur)
         , stateArenas = Map.adjust (\a → a {arenaLeases = Set.delete lid (arenaLeases a)}) (leaseArena ls) (stateArenas cur)
         }
+    bumpAuthority svc
     after <- readSt svc
     when (leaseOwner ls && leaseLive ls) $
       forM_ (Map.lookup (leaseArena ls) (stateArenas after)) $ \arena →
@@ -1144,6 +1150,7 @@ closeServiceSTM svc = do
   forM_ (Map.keys (stateArenas after)) (closeArena svc)
   forM_ (Map.keys (stateViews after)) (closeViewByIdSTM svc)
   modifySt svc (\cur → cur {stateLeases = fmap (\l → l {leaseLive = False}) (stateLeases cur)})
+  bumpAuthority svc
 
 -- ---------------------------------------------------------------------------
 -- Views

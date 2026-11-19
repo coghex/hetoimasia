@@ -352,6 +352,8 @@ data Rig = Rig
     -- ^ Their registrations' complete identities, which the oracle's decoded images are named by.
   , rgMetrics ∷ !(TVar TargetMetrics)
   , rgClient ∷ !Runtime.Client
+  , rgRetired ∷ !(TVar Bool)
+    -- ^ The offscreen target's retirement: set only as the rig unregisters it.
   }
 
 withRig ∷ Env → (Rig → IO a) → IO a
@@ -369,7 +371,8 @@ withRigOn source configure env body = do
       graphics = envGraphics env
   target ← atomically (registerVulkanSceneTarget host) >>= either (\refusal → assertFailure ("the target was refused: " <> show refusal)) pure
   metrics ← newTVarIO (metricsOf 128 96)
-  flip finally (void (atomically (unregisterVulkanSceneTarget host target))) $
+  retired ← newTVarIO False
+  flip finally (atomically (writeTVar retired True) >> void (atomically (unregisterVulkanSceneTarget host target))) $
     withComposition terrainProfile [("colour.png", colourBytes), ("normal.png", normalBytes)] (graphicsBackend graphics) $ \comp _ runtime → do
       vm ← startVm comp runtime "terrain-native-vm"
       admit comp vm "i"
@@ -382,7 +385,7 @@ withRigOn source configure env body = do
       withTerrain source (cpAccount comp) $ \terrain client arena → do
         ports ← productionPorts host graphics (envScenes env) terrain client (cpAccount comp) (pure True)
         withTerrainViews (configure config) ports $ \views →
-          body (Rig env comp vm target views terrain arena style (colourKey, normalKey) (colourIdentity, normalIdentity) metrics client)
+          body (Rig env comp vm target views terrain arena style (colourKey, normalKey) (colourIdentity, normalIdentity) metrics client retired)
   where
     -- the views' own cell configuration (their step bound included) with a 30-level band
     config = defaultTerrainViewsConfig {tvCellConfig = (tvCellConfig defaultTerrainViewsConfig) {ccDepth = 30}}
@@ -394,7 +397,7 @@ attach ∷ Rig → TargetMetrics → IO (TerrainView SceneTargetKey)
 attach rig metrics = do
   atomically (writeTVar (rgMetrics rig) metrics)
   let host = envHost (rgEnv rig)
-      viewTarget = offscreenViewTarget host (rgTarget rig) (isJust <$> standingOf rig) True (Just <$> readTVar (rgMetrics rig))
+      viewTarget = offscreenViewTarget host (rgTarget rig) (readTVar (rgRetired rig)) True (Just <$> readTVar (rgMetrics rig))
       (colourKey, normalKey) = rgKeys rig
       axis = either (error . show) id . axisFromInteger
       request =

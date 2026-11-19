@@ -144,6 +144,9 @@ defaultTerrainViewsConfig =
 data ViewTarget k = ViewTarget
   { vtKey ∷ !k
   , vtUsable ∷ STM Bool
+  , vtRetired ∷ STM Bool
+    -- ^ Whether the incarnation has retired, read from a cell that changes only then: the views' worker watches it
+    -- for every view, so it must not read state that moves with every frame or publication.
   , vtPublish ∷ Prepared GraphicsScene → STM Bool
     -- ^ Make the scene the target's latest value; 'False' when the host holds no such incarnation.
   , vtDepth ∷ !Bool

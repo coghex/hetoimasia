@@ -324,6 +324,9 @@ data ViewState k = ViewState
     -- ^ How many regions the last published plan admitted.
   , vsWindow ∷ !(TVar (Maybe WindowRefusal))
     -- ^ Why the latest candidate's records could not fit the renderer's storage window, until one fits.
+  , vsAuthoritySeen ∷ !(TVar Word64)
+    -- ^ The terrain service's authority epoch when the view's lease was last found valid: the worker checks the lease
+    -- again only when the epoch moves.
   , vsReaders ∷ !(TVar (Map Word64 Int))
     -- ^ The readers of each pinned revision's plan ('withAdoptedPlan'): a pin with a reader is kept and stays charged,
     -- and it counts against the pin limit like any other.
@@ -680,6 +683,7 @@ newViewState service request style runtimeView camera light = do
     <*> newTVarIO 0
     <*> newTVarIO 0
     <*> newTVarIO Nothing
+    <*> newTVarIO 0
     <*> newTVarIO Map.empty
     <*> newTVarIO Nothing
     <*> newTVarIO 0
@@ -968,6 +972,7 @@ data Work k
   | WorkRetire
   | WorkStep !(ViewState k)
   | WorkDemand !(ViewState k)
+  | WorkAuthority !(ViewState k)
 
 worker ∷ (Ord k, Show k) ⇒ TerrainViews k → IO (Either SomeException ())
 worker service = trySync loop
@@ -988,6 +993,7 @@ worker service = trySync loop
         WorkRetire → guarded (atomically (retireStep service)) >> loop
         WorkStep state → guarded (stepView service state) >> loop
         WorkDemand state → guarded (resendDemand service state) >> loop
+        WorkAuthority state → guarded (checkAuthority service state) >> loop
     guarded action =
       trySync action >>= \case
         Left (failure ∷ SomeException) → recordFailure service (Text.pack (displayException failure))
@@ -1009,24 +1015,28 @@ nextWork service = do
       readTVar (svRequests service) >>= \case
         RequestAttach request style box : rest → writeTVar (svRequests service) rest >> pure (WorkAttach request style box)
         [] → retry
-    -- a view asked to close, or one whose arena authority or target is gone for good, in whatever stage it is: the
-    -- latter's close is asked here and the loss kept as evidence, so no stage keeps its claim or interests
+    -- a view asked to close, or one whose target has retired, in whatever stage it is (the latter's close is asked
+    -- here and the loss kept as evidence), or one whose lease must be checked again because some lease stopped being
+    -- valid. Only cells that change on those events are read: the terrain service's authority epoch, never its state,
+    -- which every load writes, and the target's retirement cell, never the host's scene state.
     closes = do
       views ← Map.elems <$> readTVar (svViews service)
-      firstClosing views >>= maybe retry (pure . WorkClose)
-    firstClosing = \case
+      epoch ← Runtime.authorityEpochSTM (portTerrain (svPorts service))
+      firstClosing epoch views >>= maybe retry pure
+    firstClosing epoch = \case
       [] → pure Nothing
       state : rest → do
         closing ← readTVar (vsClosing state)
-        if closing
-          then pure (Just state)
-          else
-            terminalLoss service state >>= \case
-              Just why → do
-                recordFailureSTM service ("view " <> Text.pack (show (vsId state)) <> " closes: " <> why)
-                writeTVar (vsClosing state) True
-                pure (Just state)
-              Nothing → firstClosing rest
+        retired ← vtRetired (vsTarget state)
+        seen ← readTVar (vsAuthoritySeen state)
+        if
+          | closing → pure (Just (WorkClose state))
+          | retired → do
+              recordFailureSTM service ("view " <> Text.pack (show (vsId state)) <> " closes: its target is gone")
+              writeTVar (vsClosing state) True
+              pure (Just (WorkClose state))
+          | seen /= epoch → pure (Just (WorkAuthority state))
+          | otherwise → firstClosing epoch rest
     retirements = retirable service >>= check >> pure WorkRetire
     demands = do
       views ← Map.elems <$> readTVar (svViews service)
@@ -1587,17 +1597,19 @@ startPreparation service state = do
       else pure True
   when started (prepareFrom service state)
 
--- The view's arena authority (its lease revoked or released, its arena closed) or its target incarnation is gone: no
--- preparation can ever publish again. 'Nothing' while both hold.
-terminalLoss ∷ (Ord k, Show k) ⇒ TerrainViews k → ViewState k → STM (Maybe Text)
-terminalLoss service state = do
+-- Some lease stopped being valid since the view's was last found valid: check the view's own, in a transaction of its
+-- own. The epoch is recorded; a lease that is gone (revoked, released, its arena closed) closes the view through its own
+-- close, which hands the target back, and the loss is kept as evidence.
+checkAuthority ∷ (Ord k, Show k) ⇒ TerrainViews k → ViewState k → IO ()
+checkAuthority service state = atomically $ do
+  epoch ← Runtime.authorityEpochSTM (portTerrain (svPorts service))
   status ← Runtime.arenaStatusSTM (portTerrain (svPorts service)) (vsArena state)
-  usable ← vtUsable (vsTarget state)
-  pure $ case status of
-    Left why → Just ("its arena authority is gone: " <> Text.pack (show why))
-    Right _
-      | not usable → Just "its target is gone"
-      | otherwise → Nothing
+  writeTVar (vsAuthoritySeen state) epoch
+  case status of
+    Left why → do
+      recordFailureSTM service ("view " <> Text.pack (show (vsId state)) <> " closes: its arena authority is gone: " <> Text.pack (show why))
+      writeTVar (vsClosing state) True
+    Right _ → pure ()
 
 prepareFrom ∷ (Ord k, Show k) ⇒ TerrainViews k → ViewState k → IO ()
 prepareFrom service state = do

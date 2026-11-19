@@ -170,6 +170,7 @@ module Hetoimasia.Terrain.Runtime
   , inspectSnapshotBytes
   , inspectRetainedChargesSTM
   , retainedBankUseSTM
+  , authorityEpochSTM
   , inspectRegionalSTM
   , RegionalCharge
   , regionalChargeHold
@@ -424,7 +425,8 @@ withTerrainServiceFunded config ports body = do
     acquire limits storage bank storeConfig compileBank = do
       tag <- newUnique
       var <- newTVarIO (initialState config limits)
-      pure (Service tag var config (portAdmission ports) (portLogger ports) (portProbe ports) storage bank (spDirectory sp) storeConfig compileBank)
+      authority <- newTVarIO 0
+      pure (Service tag var config (portAdmission ports) (portLogger ports) (portProbe ports) storage bank (spDirectory sp) storeConfig compileBank authority)
     -- Close admission, ask the owner to stop, and wait for both proofs: the
     -- owner's worker has published its terminal outcome, and no borrower is
     -- outstanding. There is no deadline and no detach. Any exception received
@@ -1010,6 +1012,13 @@ inspectRetainedChargesSTM ∷ Service → STM (Word64, [(R.HoldId, Word64)])
 inspectRetainedChargesSTM svc = do
   st <- readSt svc
   pure (retainedBankUse st, Map.toList (stateSnapshots st))
+
+-- | A count that moves only when some lease stops being valid (an arena's close, a lease's
+-- release, the service's end): a holder that must notice its authority's loss watches it and
+-- checks its own lease ('arenaStatusSTM') when it moves, rather than reading the service's
+-- whole state, which every load and settlement writes. It writes nothing.
+authorityEpochSTM ∷ Service → STM Word64
+authorityEpochSTM = readTVar . serviceAuthority
 
 -- | What the retained bank holds now: outstanding snapshots' backing, every regional borrow's charge and untaken
 -- results. It moves whenever a regional request is admitted, settles (its reservation becomes its footprint) or is

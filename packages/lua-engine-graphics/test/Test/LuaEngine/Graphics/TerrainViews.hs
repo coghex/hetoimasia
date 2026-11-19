@@ -14,6 +14,8 @@ module Test.LuaEngine.Graphics.TerrainViews (spec) where
 import Control.Concurrent (killThread, myThreadId, newEmptyMVar, putMVar, takeMVar)
 import Control.Exception (MaskingState (Unmasked), getMaskingState)
 import Control.Concurrent.STM
+import Data.IORef (atomicModifyIORef', newIORef, readIORef)
+import GHC.Conc (unsafeIOToSTM)
 import Control.Exception (SomeException, displayException, finally, throwIO, try)
 import Control.Monad (forM_, forever, join, unless, void, when)
 import qualified Data.ByteString as ByteString
@@ -2108,6 +2110,35 @@ stagesAndReaders = describe "stages, waits and readers" $ do
       Camera.camFacing <$> atomically (viewCameraState view) `shouldReturn` FaceEast
       closeView view
 
+  it "never wakes its worker for another holder's loads while its views wait mid-stage: the selection watches no terrain state" $ do
+    evaluations ← newIORef (0 ∷ Int)
+    withViews $ \v → do
+      let owner = vOwner v
+          -- the target's retirement cell is read once a view each time the worker's selection is evaluated, so this
+          -- counts the evaluations, woken or re-run
+          counted = (target v 1) {vtRetired = unsafeIOToSTM (atomicModifyIORef' evaluations (\n → (n + 1, ()))) >> vtRetired (target v 1)}
+      view ← attachOutcome v counted >>= \case
+        SettledOk view' → pure view'
+        _ → fail "the attachment did not succeed"
+      _ ← awaitPublished v 1
+      quiescent v
+      demandResident v view
+      -- an edit's rebuild waits at the owner: the view is mid-stage, its build in flight
+      atomically (writeTVar (foGate owner) False)
+      removeWith v (tileAt 9 9 3) Nothing `shouldReturn` Right True
+      bounded (atomically (readTVar (foWaiting owner) >>= check . (> 0)))
+      quiescent v
+      bounded (atomically (Runtime.inspectModelSTM (_vTerrain v) >>= check . null . modelJobs))
+      before' ← readIORef evaluations
+      -- another holder copies ten distant regions, one at a time: every request writes the terrain service's state
+      forM_ [1 .. 10 ∷ Int] $ \i → do
+        request ← Runtime.requestRegionSnapshot (_vTerrain v) (vArena v) [RegionCoord (40 + fromIntegral i) 40 0] >>= either (fail . show) pure
+        Runtime.await (_vTerrain v) request >>= either (fail . show) (Runtime.releaseRegionBorrow (_vTerrain v))
+      afterLoads ← readIORef evaluations
+      (afterLoads - before') `shouldSatisfy` (<= 2)
+      atomically (writeTVar (foGate owner) True)
+      closeView view
+
   it "answers no hit for a point outside the target before any adoption and after a resize, not loading" $
     withViews $ \v → do
       view ← attached v 1
@@ -2230,6 +2261,7 @@ target v window =
    in ViewTarget
         { vtKey = window
         , vtUsable = usable
+        , vtRetired = not <$> usable
         , vtPublish = \scene → (== HostAccepted) <$> publishing scene
         , vtDepth = True
         , vtMetrics = Just <$> readTVar (vMetrics v)
