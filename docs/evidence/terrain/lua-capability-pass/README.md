@@ -3,7 +3,7 @@
 `lua-engine-tests` runs its terrain set in place on one capability, then once more, last, on 2 capabilities (4 by override),
 behind a test pump that wakes one update at a time; every other example runs on one.
 
-Code head `02db861a`, GHC 9.14.1, Apple M3 Max (16 logical cores, macOS 26.7.1). Command, run consecutively, nothing rerun:
+Code head `2185922c`, GHC 9.14.1, Apple M3 Max (16 logical cores, macOS 26.7.1). Command, run consecutively, nothing rerun:
 
 ```
 cabal test --project-file cabal.project.cpu hetoimasia-lua-engine:lua-engine-tests --test-show-details=direct
@@ -23,10 +23,13 @@ The series at `4102c5f3` (owner decision L, 2026-11-19: it stands as run; tests 
 | 9 at 4 | `requested=4 (HETOIMASIA_CONCURRENT_PASS_CAPABILITIES) effective=4` | 8 with 0 failures; run 9 one test race in the pass (the growth outcomes example read its output mid-update), repaired at `02db861a` |
 
 At `02db861a`, once each: that example (in place and in the pass), passed; the whole suite, 1578 examples, 0 failures, 70.8 s real.
+At `2185922c` (owner decision D removed the pump's two bound self-tests), once each: the pump's examples, 16 (in place and in the
+pass), passed; the whole suite, 1574 examples, 0 failures, 69.5 s real.
 
-Budget, the same command: 46.6 s real for the whole suite at `394939d1` (1402 examples, once), 70.8 s at `02db861a` (1578).
+Budget, the same command, once each: 46.6 s real for the whole suite at `394939d1` (1402 examples), 69.5 s at `2185922c` (1574).
 
-CI: the pull request's run at the final head, recorded in its body.
+CI at `302daab3`: run 44584242192 failed only on terrain-runtime's census check tracked by #699 (a test race outside this
+change); run 44584405464 passed at the same head. The final head's run is recorded in the pull request.
 
 ## Findings
 
