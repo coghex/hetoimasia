@@ -88,11 +88,14 @@ module Hetoimasia.Terrain.Render2D.Camera
   , FollowOutcome (..)
   , Step (..)
   , applyCommand
+  , applyCommandWithoutFacts
   , refollow
   , completeJump
   , cancelJump
   ) where
 
+import Data.Functor ((<&>))
+import Data.Maybe (fromMaybe)
 import Data.Word (Word64)
 import Hetoimasia.Terrain.Cell (Column (..))
 import Hetoimasia.Terrain.Coordinate
@@ -304,27 +307,35 @@ data Step = Step
 
 -- | Apply one command with the current facts.
 applyCommand ∷ CameraConfig → TerrainFacts → Command → CameraState → Either CameraError Step
-applyCommand config facts command camera0
-  | not (validCameraConfig config) = Left InvalidConfig
+applyCommand config facts command camera0 = fromMaybe (Left InvalidConfig) (applyCommandOn config (Just facts) command camera0)
+
+-- | Apply a command that reads no terrain facts, before any are known, exactly as 'applyCommand' would: a zoom, a
+-- facing, a turn or a slice. 'Nothing' for a pan, which follows the surface, and a jump, which both need facts.
+applyCommandWithoutFacts ∷ CameraConfig → Command → CameraState → Maybe (Either CameraError Step)
+applyCommandWithoutFacts config = applyCommandOn config Nothing
+
+applyCommandOn ∷ CameraConfig → Maybe TerrainFacts → Command → CameraState → Maybe (Either CameraError Step)
+applyCommandOn config known command camera0
+  | not (validCameraConfig config) = Just (Left InvalidConfig)
   | otherwise = case command of
-      Pan dx dy → do
+      Pan dx dy → known <&> \facts → do
         moved ← pan dx dy camera
         pure (stamp camera0 (followIfFollowing config facts moved))
       ZoomBy factor
-        | bad factor → Left NonFiniteInput
-        | otherwise → Right (plain (camera {csZoom = clampZoom config (csZoom camera * factor)}))
+        | bad factor → Just (Left NonFiniteInput)
+        | otherwise → Just (Right (plain (camera {csZoom = clampZoom config (csZoom camera * factor)})))
       SetZoom zoom
-        | bad zoom → Left NonFiniteInput
-        | otherwise → Right (plain (camera {csZoom = clampZoom config zoom}))
-      SetFacing facing → Right (plain (camera {csFacing = facing}))
+        | bad zoom → Just (Left NonFiniteInput)
+        | otherwise → Just (Right (plain (camera {csZoom = clampZoom config zoom})))
+      SetFacing facing → Just (Right (plain (camera {csFacing = facing})))
       RotateBy count →
-        Right (plain (camera {csFacing = facingFromTurns (toInteger (turnCount (facingTurns (csFacing camera))) + toInteger count)}))
-      SelectSlice level → Right (plain (camera {csMode = Manual level, csClip = level}))
-      SliceBy delta → do
+        Just (Right (plain (camera {csFacing = facingFromTurns (toInteger (turnCount (facingTurns (csFacing camera))) + toInteger count)})))
+      SelectSlice level → Just (Right (plain (camera {csMode = Manual level, csClip = level})))
+      SliceBy delta → Just $ do
         let target = toInteger (axisValue (csClip camera)) + delta
         level ← either (const (Left SliceOutOfRange)) Right (axisFromInteger target)
         Right (plain (camera {csMode = Manual level, csClip = level}))
-      Jump target → Right (stamp camera0 (beginJump config facts target camera))
+      Jump target → known <&> \facts → Right (stamp camera0 (beginJump config facts target camera))
   where
     -- Whatever the zoom the camera was last given, the configuration in force now
     -- bounds it. The revision is stamped against the camera as it was passed in, so

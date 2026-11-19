@@ -983,7 +983,7 @@ eviction = describe "eviction" $ do
       quiescent v
       demandResident v view
       hit ← currentHit v view
-      plan ← atomically (adoptedPlan view) >>= maybe (fail "no adopted plan") pure
+      plan ← adoptedPlanOf view
       picks ← atomically (picksOver view)
       instances ← drawnInstances v 1
       Just (firstVisible, _) ← atomically (viewDemand view)
@@ -1035,7 +1035,7 @@ eviction = describe "eviction" $ do
       again ← currentHit v view
       -- the residency generation moved, and the view caught up with it; what it draws and picks is what it was
       pickResidency (pickRefIdentity again) `shouldNotBe` pickResidency (pickRefIdentity hit)
-      replanned ← atomically (adoptedPlan view) >>= maybe (fail "no adopted plan") pure
+      replanned ← adoptedPlanOf view
       cellMembership replanned `shouldBe` cellMembership plan
       atomically (picksOver view) `shouldReturn` picks
       drawnInstances v 1 `shouldReturn` instances
@@ -1333,7 +1333,7 @@ lifecycle = describe "close orders and limits" $ do
       adoptNow (vModel v) 1 `shouldReturn` Adopted first'
       _ ← releasePass (vModel v)
       -- an upload is under way and holds the staging buffer: every build is refused as pressure while it is
-      atomically (writeTVar (foUploads (vOwner v)) [7] >> writeTVar (foPressured (vOwner v)) True)
+      atomically (setUploads (vOwner v) [7] >> writeTVar (foPressured (vOwner v)) True)
       built ← readTVarIO (foBuilt (vOwner v))
       -- an edit in view rebuilds its region, the camera unchanged
       removeWith v (tileAt 9 9 3) Nothing `shouldReturn` Right True
@@ -1346,7 +1346,7 @@ lifecycle = describe "close orders and limits" $ do
       _ ← releasePass (vModel v)
       readingSteps <$> atomically (readView view) `shouldReturn` steps
       -- the upload settles: nothing else changes, and the build is asked again and published
-      atomically (writeTVar (foUploads (vOwner v)) [])
+      atomically (setUploads (vOwner v) [])
       _ ← awaitPublished' v 1 (first' + 1)
       closeView view
 
@@ -1409,7 +1409,7 @@ lifecycle = describe "close orders and limits" $ do
       quiescent v
       sliced view 1
       hit ← currentHitOn v 1 view
-      original ← atomically (adoptedPlan view) >>= maybe (fail "no adopted plan") pure
+      original ← adoptedPlanOf view
       originalPicks ← atomically (picksOver view)
       originalInstances ← drawnInstances v 1
       closeView view
@@ -1423,7 +1423,7 @@ lifecycle = describe "close orders and limits" $ do
       pickViewId (pickRefIdentity again) `shouldNotBe` pickViewId (pickRefIdentity hit)
       let versions identity = (pickArena identity, pickContent identity, pickKnowledge identity)
       versions (pickRefIdentity again) `shouldBe` versions (pickRefIdentity hit)
-      replanned ← atomically (adoptedPlan fresh) >>= maybe (fail "no adopted plan") pure
+      replanned ← adoptedPlanOf fresh
       let membership = cellMembership original
       cellMembership replanned `shouldBe` membership
       -- the revealed cavity leaves ordinary, fog and mixed cells in the view (19, 10 and 2 with this source)
@@ -1667,11 +1667,11 @@ jumps = describe "jumps" $ do
 
 hardening ∷ Spec
 hardening = describe "wakes, ownership and limits" $ do
-  it "asks a build refused as upload pressure again when the upload settles between the refusal and its wait" $ do
+  it "asks a build refused as upload pressure again when an upload that started after its submission settles before its wait" $ do
     armed ← newTVarIO Nothing
     -- right after the pressured build's answer is read, before the view installs its wait, the upload settles
     let settleAt _ name = when (name == "answered") . atomically $
-          readTVar armed >>= mapM_ (\owner → writeTVar (foUploads owner) [] >> writeTVar armed Nothing)
+          readTVar armed >>= mapM_ (\owner → setUploads owner [] >> writeTVar armed Nothing)
     withViewsConfig testConfig {tvOnTransfer = settleAt} $ \v → do
       view ← attached v 1
       first' ← awaitPublished v 1
@@ -1680,19 +1680,19 @@ hardening = describe "wakes, ownership and limits" $ do
       adoptNow (vModel v) 1 `shouldReturn` Adopted first'
       _ ← releasePass (vModel v)
       let owner = vOwner v
-      atomically (writeTVar (foUploads owner) [7] >> writeTVar (foPressured owner) True)
+      atomically (setUploads owner [7] >> writeTVar (foPressured owner) True)
       -- an edit in view rebuilds its region, the camera unchanged; its build is refused as pressure, and it waits once
       -- the terrain service is quiet, so nothing but an upload can change what it waits on
       removeWith v (tileAt 9 9 3) Nothing `shouldReturn` Right True
       quiescent v
       bounded (atomically (Runtime.inspectModelSTM (_vTerrain v) >>= check . null . modelJobs))
       bounded (atomically (readView view >>= \r → check (readingWaiting r && readingStagedBytes r == 0)))
-      -- that upload settles and another starts: the build is asked again, and waits at the owner
-      atomically (writeTVar (foGate owner) False >> writeTVar (foUploads owner) [8])
+      -- that upload settles: the build is asked again, submitted with no upload under way, and waits at the owner
+      atomically (writeTVar (foGate owner) False >> setUploads owner [])
       bounded (atomically (readTVar (foWaiting owner) >>= check . (> 0)))
-      -- it is refused as pressure, and the upload settles before the wait: that is still a change since the
-      -- submission, so the build is asked again
-      atomically (writeTVar armed (Just owner) >> writeTVar (foGate owner) True)
+      -- an upload starts after the submission, the build is refused as pressure, and that upload settles before the
+      -- wait: an upload settled since the submission, so the build is asked again
+      atomically (setUploads owner [8] >> writeTVar armed (Just owner) >> writeTVar (foGate owner) True)
       _ ← awaitPublished' v 1 (first' + 1)
       isNothing <$> readTVarIO armed `shouldReturn` True
       closeView view
@@ -1941,7 +1941,7 @@ hardening = describe "wakes, ownership and limits" $ do
       quiescent v
       demandResident v view
       adoptNow (vModel v) 1 `shouldReturn` Adopted published
-      plan ← bounded . atomically $ adoptedPlan view >>= maybe retry pure
+      plan ← adoptedPlanOf view
       reading ← atomically (readView view)
       readingPins reading `shouldBe` 1
       planDemandHeld (cellPlanDemand plan) `shouldSatisfy` (> 0)
@@ -2287,9 +2287,13 @@ data FakeOwner = FakeOwner
   , foStopAfter ∷ !(TVar (Maybe (Int, Bool)))
     -- ^ While set, the next build makes this many regions, then stops: as pressure ('True') or as a failure (once).
   , foUploads ∷ !(TVar [Natural])
+  , foSettled ∷ !(TVar Natural)
+    -- ^ How many uploads have settled: grows as 'setUploads' drops one from 'foUploads'.
     -- ^ The uploads the owner reports unsettled, by number: the example settles them.
   , foPressured ∷ !(TVar Bool)
     -- ^ While set, a build is refused as upload pressure for as long as 'foUploads' names an upload.
+  , foReleaseRaise ∷ !(TVar Bool)
+    -- ^ While set, the next release action ends without answering, as one that raised (once); the owner goes on.
   , foRegionWindow ∷ !(TVar Word64)
     -- ^ The renderer's storage window the owner reports: unbounded unless an example sets it.
   , foRaiseAt ∷ !(TVar (Maybe Int))
@@ -2321,6 +2325,8 @@ newFakeOwner model =
     <*> newTVarIO 0
     <*> newTVarIO Nothing
     <*> newTVarIO []
+    <*> newTVarIO 0
+    <*> newTVarIO False
     <*> newTVarIO False
     <*> newTVarIO maxBound
     <*> newTVarIO Nothing
@@ -2374,16 +2380,31 @@ fakeOwnerLoop owner = forever $ do
          writeTVar answer (Just result)
     FakeRelease chunks answer → atomically $ do
       ended ← readTVar (foEnded owner)
+      raised ← readTVar (foReleaseRaise owner) <* writeTVar (foReleaseRaise owner) False
       failure ← readTVar (foReleaseFailure owner) <* writeTVar (foReleaseFailure owner) Nothing
       modifyTVar' (foReleaseActions owner) (+ 1)
       result ← case (ended, failure) of
         (True, _) → pure (NotRun "the owner ended")
+        _ | raised → pure (NotRun "the fake owner's release action raised")
         (_, Just why) → pure (Answered (map (const (Left why)) chunks))
         _ → do
           modifyTVar' (foStanding owner) (\held → foldr Map.delete held chunks)
           modifyTVar' (foReleased owner) (<> chunks)
           pure (Answered (map (const (Right ())) chunks))
       writeTVar answer (Just result)
+
+-- The plan of the revision the host adopted, read under the view's reader once there is one.
+adoptedPlanOf ∷ TerrainView Int → IO CellPlan
+adoptedPlanOf view = do
+  bounded (atomically (readView view >>= check . isJust . readingAdoptedResidency))
+  withAdoptedPlan view pure >>= maybe (fail "no adopted plan") pure
+
+-- The uploads the owner reports unsettled are these now: each one dropped has settled.
+setUploads ∷ FakeOwner → [Natural] → STM ()
+setUploads owner new = do
+  old ← readTVar (foUploads owner)
+  modifyTVar' (foSettled owner) (+ fromIntegral (length [u | u ← old, u `notElem` new]))
+  writeTVar (foUploads owner) new
 
 -- Mint a chunk for each region, ready at once unless the example holds uploads.
 mintChunks ∷ FakeOwner → [RegionBuild] → STM [ChunkRef]
@@ -2421,7 +2442,7 @@ fakeViewOwner owner =
     , ownerRoom = (&&) <$> (not <$> readTVar (foEnded owner)) <*> ((<) <$> (length <$> readTVar (foQueue owner)) <*> readTVar (foCapacity owner))
     , ownerReleaseRoom = (&&) <$> (not <$> readTVar (foEnded owner)) <*> (not <$> readTVar (foLaneFull owner))
     , ownerStanding = \chunk → Map.lookup chunk <$> readTVar (foStanding owner)
-    , ownerUploads = readTVar (foUploads owner)
+    , ownerUploadsSettled = readTVar (foSettled owner)
     , ownerEnd = readTVar (foEnded owner) >>= check
     }
   where

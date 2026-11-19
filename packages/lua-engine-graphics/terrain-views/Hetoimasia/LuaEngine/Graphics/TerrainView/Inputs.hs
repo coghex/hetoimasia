@@ -34,6 +34,7 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView.Inputs
   , InputsError (..)
   , planInputs
   , plannerKnowledge
+  , knowledgeExpansion
   , knowledgeState
   ) where
 
@@ -175,6 +176,28 @@ plannerKnowledge copies =
           | column ← regionColumns region
           , Just runs ← [D.regionKnowledgeColumn known column]
           ]
+
+-- | The bytes the planner's knowledge of this copy holds beyond a region's fixed input charge: a region whose knowledge
+-- is not one class is expanded into a map entry for each column and one for each of its runs ('plannerKnowledge'),
+-- whatever the copy's packed classes share. Counted from the copy, without making that map, so it is charged before it
+-- is made.
+knowledgeExpansion ∷ RegionSnapshot → Word64
+knowledgeExpansion snapshot =
+  sum
+    [ columnEntryBytes + runEntryBytes * fromIntegral (length runs)
+    | region ← regionSnapshotRegions snapshot
+    , PartReady known ← [regionKnowledge snapshot region]
+    , not (uniform known)
+    , column ← regionColumns region
+    , Just runs ← [D.regionKnowledgeColumn known column]
+    ]
+  where
+    uniform known = case D.regionKnowledgeClasses known of
+      [[_]] → True
+      _ → False
+    -- a column's map entry and its key, and one run's entry in its list (two bounds and a state)
+    columnEntryBytes = 96
+    runEntryBytes = 80
 
 -- | The planner's state of what discovery knows of a cell.
 knowledgeState ∷ D.CellKnowledge → CellKnowledge

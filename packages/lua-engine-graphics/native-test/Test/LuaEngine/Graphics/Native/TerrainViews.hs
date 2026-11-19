@@ -28,7 +28,7 @@ import qualified Data.ByteString as ByteString
 import qualified Data.ByteString.Char8 as BC
 import Data.IORef (newIORef, readIORef, writeIORef)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (isJust, listToMaybe, mapMaybe)
+import Data.Maybe (isJust, listToMaybe)
 import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as Text
@@ -224,10 +224,15 @@ fullSpec env = describe "terrain views (full)" $ do
       _ ← awaitAdopted rig (now + 1)
       sliced
       settleBackground rig view
-      parts ← within 20 . atomically $ do
-        plan ← adoptedPlan view >>= maybe retry pure
-        let found = Set.fromList (map quadPart (cellPlanQuads plan))
-        if Set.fromList [PartFog, PartKnown, PartOrdinary] `Set.isSubsetOf` found then pure found else retry
+      -- the plan the host adopted, read under the view's reader, until one holds all three parts
+      let mixedParts = do
+            adopted ← viewAdopted <$> atomically (readView view)
+            plan ← adoptedPlanOf view
+            let found = Set.fromList (map quadPart (cellPlanQuads plan))
+            if Set.fromList [PartFog, PartKnown, PartOrdinary] `Set.isSubsetOf` found
+              then pure found
+              else atomically (readView view >>= check . (/= adopted) . viewAdopted) >> mixedParts
+      parts ← within 20 mixedParts
       Set.size parts `shouldBe` 3
       rendered ← renderJudged rig "mixed"
       pickAgreement rig view rendered >>= notePicks
@@ -636,7 +641,7 @@ pickAgreement rig view rendered = do
   -- picks answer from, is the one rendered
   adopted ← adoptedScene rig
   fmap worldTag (adopted >>= graphicsWorld) `shouldBe` Just (worldTag (rwWorld rendered))
-  plan ← atomically (adoptedPlan view) >>= maybe (assertFailure "no adopted plan") pure
+  plan ← adoptedPlanOf view
   let regionQuads = Map.elems (Map.fromListWith (flip (<>)) [(regionOf (quadKey quad), [quad]) | quad ← cellPlanQuads plan])
       regionOf (CellKey _ _ vx vy _) = (vx `div` 16, vy `div` 16)
       quadAt position index = case drop position regionQuads of
@@ -714,8 +719,7 @@ settleConditions rig view = do
   standing ← standingOf rig
   retiring ← terrainViewsRetiring (rgViews rig)
   generation ← fmap Runtime.viewGeneration <$> Runtime.inspectArenaSTM (rgTerrain rig) (rgArena rig)
-  extent ← metricsFramebuffer <$> readTVar (rgMetrics rig)
-  residency ← adoptedPlan view >>= maybe (pure Nothing) (adoptedResidency view extent)
+  let residency = readingAdoptedResidency reading
   let resident = Set.fromList (map regionCoord (modelRegions model))
       hostSettled = maybe False (\st → isJust (windowAdopted st) && windowAdopted st == windowPublished st) standing
   pure
@@ -731,21 +735,15 @@ settleConditions rig view = do
     , ("residency-current", isJust residency && residency == fmap fromIntegral generation)
     ]
 
--- The residency identity the adopted plan was prepared at, as a hit's pick identity carries it: the first known quad
--- whose part inside the target picks a hit at its centre answers it. 'Nothing' while no such pick hits.
-adoptedResidency ∷ TerrainView SceneTargetKey → PixelExtent → CellPlan → STM (Maybe Word64)
-adoptedResidency view (PixelExtent width height) plan = firstHit (mapMaybe inside [quad | quad ← cellPlanQuads plan, quadPart quad /= PartFog])
-  where
-    inside quad =
-      let TargetRect l t r b = quadTarget quad
-          (l', t', r', b') = (max l 0, max t 0, min r (fromIntegral width), min b (fromIntegral height))
-       in if l' < r' && t' < b' then Just (realToFrac ((l' + r') / 2), realToFrac ((t' + b') / 2)) else Nothing
-    firstHit = \case
-      [] → pure Nothing
-      point : rest →
-        pickView view point >>= \case
-          PickHit ref → pure (Just (pickResidency (pickRefIdentity ref)))
-          _ → firstHit rest
+-- The revision of the view's that the host adopted, from its reading.
+viewAdopted ∷ ViewReading → Maybe Word64
+viewAdopted ViewReading {readingAdopted = adopted} = adopted
+
+-- The plan of the revision the host adopted, read under the view's reader once there is one.
+adoptedPlanOf ∷ TerrainView SceneTargetKey → IO CellPlan
+adoptedPlanOf view = do
+  atomically (readView view >>= check . isJust . readingAdoptedResidency)
+  withAdoptedPlan view pure >>= maybe (assertFailure "no adopted plan") pure
 
 zoomOf ∷ SceneWorld → Float
 zoomOf = cameraZoom . viewCamera . worldView

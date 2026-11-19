@@ -97,7 +97,7 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView
   , pickResidency
   , pickView
   , pickPrecondition
-  , adoptedPlan
+  , withAdoptedPlan
   , admittedCostBound
   , preparationCost
   ) where

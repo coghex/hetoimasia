@@ -978,10 +978,15 @@ data UploadView = UploadView
   deriving (Eq, Show)
 
 -- | Every unsettled upload, in admission order, whether admission is open,
--- and the staging buffer's generation and size.
+-- the staging buffer's generation and size, and how many uploads were ever
+-- issued.
 data UploadsView = UploadsView
   { uploadsAdmitting ∷ !Bool
     -- ^ Whether admission is open.
+  , uploadsIssued ∷ !Natural
+    -- ^ How many uploads were ever issued a number (numbers are never
+    -- reissued): less the unsettled ones, how many have settled, which only
+    -- grows.
   , uploadsStagingBuffer ∷ !ResourceId
   , uploadsStagingSize ∷ !Natural
   , uploadsUnsettled ∷ ![UploadView]
@@ -994,6 +999,7 @@ readUploads uploads = do
   pure
     UploadsView
       { uploadsAdmitting = stateOpen state
+      , uploadsIssued = stateNext state
       , uploadsStagingBuffer = stagingResource (uploadsStaging uploads)
       , uploadsStagingSize = stagingBytes (uploadsStaging uploads)
       , uploadsUnsettled =

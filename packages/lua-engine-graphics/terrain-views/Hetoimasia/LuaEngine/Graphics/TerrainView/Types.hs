@@ -305,6 +305,8 @@ data ViewReading = ViewReading
   , readingWindow ∷ !(Maybe WindowRefusal)
     -- ^ The latest candidate's material records could not fit the renderer's storage window, so it was never accepted
     -- (the previous publication stays): 'Nothing' once a candidate fits.
+  , readingAdoptedResidency ∷ !(Maybe Word64)
+    -- ^ The residency identity of the plan the host adopted (the one picks read): 'Nothing' before an adoption.
   }
   deriving (Eq, Show)
 
