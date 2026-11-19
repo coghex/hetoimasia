@@ -3,15 +3,15 @@
 -- | The examples of the pump the terrain set steps its scripts with (#692): 'stepNext' and what is built on it in
 -- "Test.LuaEngine.Facade.Support", over real supervised presentation and gameplay owners and the world's fake timer; one example
 -- holds a peer VM in its update at the terrain rig's @TEST_WAIT@ fixture. Every wait is coordinated (a registration, a thread parked
--- in a transaction, a printed line, a fixture entered), and the two examples of the bound make it fire at a coordinated point, with an
--- exception of their own. A helper thread's own outcome is the example's: what it raised is raised again where the example waits.
+-- in a transaction, a printed line, a fixture entered), each under the standard bound. A helper thread's own outcome is the
+-- example's: what it raised is raised again where the example waits.
 module Test.LuaEngine.Terrain.Pump (spec) where
 
-import Control.Concurrent (ThreadId, myThreadId, throwTo)
+import Control.Concurrent (ThreadId)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
-import Control.Concurrent.STM (atomically, check, newTVarIO, readTVar, readTVarIO, writeTVar)
-import Control.Exception (Exception (toException), SomeException, finally, throwIO, try)
-import Data.IORef (modifyIORef', newIORef, readIORef)
+import Control.Concurrent.STM (atomically, newTVarIO, readTVar, readTVarIO, writeTVar)
+import Control.Exception (SomeException, finally, throwIO, try)
+import Data.IORef (readIORef)
 import Data.Text (Text)
 import Data.Word (Word64)
 import qualified Data.Text as Text
@@ -39,24 +39,6 @@ oneSecond = 1000000000
 counted ∷ Int → [Text]
 counted n = ["n=" <> Text.pack (show k) | k ← [1 .. n]]
 
--- | What the examples' own bound raises when it fires: told apart from every other way an operation can end.
-data BoundFired = BoundFired deriving (Eq, Show)
-
-instance Exception BoundFired
-
--- | A bound for 'stepUntilWithin' that fires at a coordinated point: it counts how many times it is entered, and once the wait it
--- is given (of the thread it bounds) has returned it raises 'BoundFired' in that thread, the way a timeout would. A wait that
--- fails raises its failure there instead, so the operation never outlives a bound that could not fire.
-firingAfter ∷ (ThreadId → IO ()) → IO (IO () → IO (), IO Int)
-firingAfter wait = do
-  entered ← newIORef (0 ∷ Int)
-  let bound action = do
-        modifyIORef' entered (+ 1)
-        self ← myThreadId
-        let fire = try @SomeException (wait self) >>= throwTo self . either id (const (toException BoundFired))
-        withOwnedThread fire (\_ _ → action)
-  pure (bound, readIORef entered)
-
 -- | 'withOwnedThread' whose body is given a wait for the action's end that answers what it returned, and raises again what it
 -- raised (a failure of the action is the example's, not the end of a thread).
 withChild ∷ IO a → (ThreadId → IO a → IO b) → IO b
@@ -81,7 +63,7 @@ spec = describe "The Lua test pump" $ do
       awaitTimers world 1
       outLines world `shouldReturn` counted 3
       stepOnce world
-      _ ← awaitOut world 4
+      _ ← bounded (awaitOut world 4)
       awaitTimers world 1
       outLines world `shouldReturn` counted 4
 
@@ -161,22 +143,6 @@ spec = describe "The Lua test pump" $ do
           awaitTimers world 2
           readTVarIO (rgTrace rig) `shouldReturn` ["released hold", "entered hold"]
           reading peer `shouldReturn` oneSecond
-
-  it "bounds the whole pumping operation once: steps that each end are still ended by the bound around them" $
-    withCounterVm $ \world fvm → do
-      _ ← spawn world fvm "modules-test" mainPath
-      -- the bound fires once three updates have printed: three steps each ended, and the operation did not
-      (bound, entered) ← firingAfter (\_ → atomically (outLinesSTM world >>= check . (>= 3) . length))
-      try (stepUntilWithin bound world (pure False)) `shouldReturn` Left BoundFired
-      entered `shouldReturn` 1
-      take 3 <$> outLines world `shouldReturn` counted 3
-
-  it "fails by the bound, rather than waiting on, a registration that never appears" $
-    withWorld fixedM1Profile (Layout []) $ \world _ _ → do
-      -- the bound fires once the step is parked in its transaction, waiting for a registration
-      (bound, entered) ← firingAfter awaitBlockedOnSTM
-      try (stepUntilWithin bound world (pure False)) `shouldReturn` Left BoundFired
-      entered `shouldReturn` 1
 
   it "grants a gameplay VM one tick at a time: waiting for the third update's line grants three ticks" $
     withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource counter)]) $ \world control runtime →

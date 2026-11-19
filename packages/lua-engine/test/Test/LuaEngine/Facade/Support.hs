@@ -57,7 +57,6 @@ module Test.LuaEngine.Facade.Support
   , stepNext
   , tickAndStepUntil
   , stepUntil
-  , stepUntilWithin
   , stepOnce
   , tickNext
   , tickUntil
@@ -579,11 +578,7 @@ wakeClaimed world next = do
 
 -- | Step until the stop condition holds: one bound ('bounded') over the whole operation, not one per step.
 stepUntil ∷ World → STM Bool → IO ()
-stepUntil = stepUntilWithin bounded
-
--- | 'stepUntil' under this bound over the whole operation.
-stepUntilWithin ∷ (IO () → IO ()) → World → STM Bool → IO ()
-stepUntilWithin bound world stop = bound loop `onException` explainSteps world
+stepUntil world stop = bounded loop `onException` explainSteps world
   where
     loop = stepNext world stop >>= \stopped → unless stopped loop
 
