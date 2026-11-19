@@ -353,7 +353,8 @@ outcomesSpec = describe "Terrain storage outcomes" $ do
           atWait rig go "extra released" (pure ())
           atWait rig go "largest" (addRule faults (-1) isReserve (FailWith 28) >> addRule faults (-1) isSetLength (FailWith 27))
           atWait rig go "cleared" (clearRules faults)
-          go (any ("grown at last\t" `Text.isPrefixOf`) <$> outLinesSTM world)
+          -- 'done' is printed by the same update as the last step's line: waiting for it reads that update's whole output
+          go (elem "done" <$> outLinesSTM world)
           printed ← outLines world
           let bytes = Text.pack . show . mib
           printed
@@ -371,6 +372,7 @@ outcomesSpec = describe "Terrain storage outcomes" $ do
                        , "largest open refused\tfailure\treservation_failed"
                        , "after the largest\tsuccess\t" <> bytes 112 <> " 0 ready"
                        , "grown at last\tsuccess\ttrue " <> bytes 160
+                       , "done"
                        ]
 
 -- | A status in the form the scripts print it ('show' of the copied record): what the service's own status says, rendered by the
