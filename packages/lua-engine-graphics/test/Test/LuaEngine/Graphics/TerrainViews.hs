@@ -14,7 +14,7 @@ module Test.LuaEngine.Graphics.TerrainViews (spec) where
 import Control.Concurrent (killThread, myThreadId)
 import Control.Exception (MaskingState (Unmasked), getMaskingState)
 import Control.Concurrent.STM
-import Control.Exception (finally, throwIO)
+import Control.Exception (SomeException, displayException, finally, throwIO, try)
 import Control.Monad (forM_, forever, join, unless, void, when)
 import qualified Data.ByteString as ByteString
 import qualified Data.ByteString.Char8 as BC
@@ -1679,10 +1679,17 @@ hardening = describe "wakes, ownership and limits" $ do
       demandResident v view
       adoptNow (vModel v) 1 `shouldReturn` Adopted first'
       _ ← releasePass (vModel v)
-      atomically (writeTVar (foUploads (vOwner v)) [7] >> writeTVar (foPressured (vOwner v)) True >> writeTVar armed (Just (vOwner v)))
-      -- an edit in view rebuilds its region, the camera unchanged: its build is refused as pressure, and the upload
-      -- settles before the wait: that is still a change since the submission, so the build is asked again
+      let owner = vOwner v
+      atomically (writeTVar (foUploads owner) [7] >> writeTVar (foPressured owner) True >> writeTVar (foGate owner) False)
+      -- an edit in view rebuilds its region, the camera unchanged; its build waits at the owner until the terrain
+      -- service is quiet, so nothing but the upload can change what the view waits on
       removeWith v (tileAt 9 9 3) Nothing `shouldReturn` Right True
+      bounded (atomically (readTVar (foWaiting owner) >>= check . (> 0)))
+      quiescent v
+      bounded (atomically (Runtime.inspectModelSTM (_vTerrain v) >>= check . null . modelJobs))
+      -- the build is refused as pressure, and the upload settles before the wait: that is still a change since the
+      -- submission, so the build is asked again
+      atomically (writeTVar armed (Just owner) >> writeTVar (foGate owner) True)
       _ ← awaitPublished' v 1 (first' + 1)
       isNothing <$> readTVarIO armed `shouldReturn` True
       closeView view
@@ -1734,9 +1741,10 @@ hardening = describe "wakes, ownership and limits" $ do
       -- the other request settles and keeps its borrow: only the retained bank moves, and the view copies and publishes
       atomically (writeTVar gate True)
       borrow ← Runtime.await (_vTerrain v) other >>= either (fail . show) pure
-      _ ← awaitPublished v 1
-      Runtime.releaseRegionBorrow (_vTerrain v) borrow
-      closeView view
+      -- the borrow goes back on every exit: a borrower that never returns would keep the terrain service's end waiting
+      (`finally` Runtime.releaseRegionBorrow (_vTerrain v) borrow) $ do
+        _ ← awaitPublished v 1
+        closeView view
 
   it "takes and releases a copy that settles between an abandoning close's probe and its cancellation, leaving the terrain service nothing" $ do
     gate ← newTVarIO False
@@ -2339,8 +2347,13 @@ fakeOwnerLoop owner = forever $ do
                     atomically (mintChunks owner [region]) >>= \case
                       [chunk] → pure (Right chunk)
                       _ → throwIO (userError "the fake owner minted no chunk")
-          result ← buildRegions builder (\_ → pure ()) regions
-          atomically (writeTVar answer (Just (Answered result)))
+          -- as the host's owner would: an action that raises ends unanswered, and what it recorded is kept
+          built ← newTVarIO []
+          result ← try (buildRegions builder (\chunk → atomically (modifyTVar' built (chunk :))) regions)
+          answered ← atomically . keepBuilt built . pure . Just $ case result of
+            Left (raised ∷ SomeException) → NotRun (Text.pack ("the fake owner's action raised: " <> displayException raised))
+            Right value → Answered value
+          atomically (writeTVar answer answered)
         Nothing → atomically $ do
          modifyTVar' (foWaiting owner) (subtract 1)
          ended ← readTVar (foEnded owner)
