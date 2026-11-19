@@ -179,6 +179,7 @@ test-suite lua-engine-graphics-tests
         Test.LuaEngine.Graphics.Png
         Test.LuaEngine.Graphics.Pressure
         Test.LuaEngine.Graphics.TerrainParents
+        Test.LuaEngine.Graphics.TerrainViewOpacity
         Test.LuaEngine.Graphics.TerrainViews
         Test.LuaEngine.Graphics.Release
         Test.LuaEngine.Graphics.Rig

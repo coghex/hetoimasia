@@ -59,7 +59,8 @@ import Hetoimasia.GPU.Vulkan.Native.Uploads (UploadState (UploadCancelled))
 import Hetoimasia.GPU.Vulkan.GLFW (TextureHandle (..))
 import Hetoimasia.Render.TwoD.Vulkan.Textures (toBackendHandle)
 import Hetoimasia.LuaEngine.Graphics.Texture.Port (TextureRef (..))
-import Hetoimasia.Render.TwoD.Material (MaterialRef, defaultMaterial)
+import Hetoimasia.Render.TwoD.Material (MaterialFacts (..), MaterialRef, RecordLayout (..), defaultMaterial, materialFacts)
+import Hetoimasia.Render.TwoD.Material.Backend (materialRef)
 import Hetoimasia.Terrain.Coordinate (RegionCoord (..), TileCoord (..), axisFromInteger, axisValue, tileCoord)
 import qualified Hetoimasia.Terrain.Render2D.Camera as Camera
 import Hetoimasia.Terrain.Render2D.AtlasFixtures (AtlasStyle, findSampleDirectory, loadAtlasStyle)
@@ -1722,26 +1723,34 @@ hardening = describe "wakes, ownership and limits" $ do
 
   it "takes and releases a copy that settles between an abandoning close's probe and its cancellation, leaving the terrain service nothing" $ do
     gate ← newTVarIO False
-    holding ← newTVarIO True
+    armed ← newTVarIO False
     held ← newTVarIO False
     terrainRef ← newTVarIO Nothing
     cancelled ← newTVarIO False
-    -- the first load job waits at the terrain service's owner: the view's first copy stays unsettled
+    -- once armed, the terrain service's owner waits before its next commit (the view's first copy's settlement): the
+    -- copy stays unsettled until the example lets it go
     let probe = Runtime.Probe $ \case
-          Runtime.PointJob _ _ → do
-            first' ← atomically (readTVar holding <* writeTVar holding False)
+          Runtime.PointBeforeCommit _ → do
+            first' ← atomically (readTVar armed <* writeTVar armed False)
             when first' $ do
               atomically (writeTVar held True)
               atomically (readTVar gate >>= check)
           _ → pure ()
-        -- the close's cleanup found the copy unsettled: it settles now, before the cancellation
+        -- the close's cleanup found the copy unsettled: it settles now, before the cancellation (a bounded wait that
+        -- needs no asynchronous exception, since the cleanup runs uninterruptibly)
         atCancel 0 "cancelling" = do
           atomically (writeTVar gate True)
-          readTVarIO terrainRef >>= mapM_ (\terrain → atomically (Runtime.inspectRegionalSTM terrain >>= check . (\cs → not (null cs) && all (isJust . Runtime.regionalChargeFootprint) cs)))
-          atomically (writeTVar cancelled True)
+          deadline ← registerDelay 20000000
+          settled ← readTVarIO terrainRef >>= \case
+            Nothing → pure False
+            Just terrain →
+              atomically $
+                (True <$ (Runtime.inspectRegionalSTM terrain >>= check . (\cs → not (null cs) && all (isJust . Runtime.regionalChargeFootprint) cs)))
+                  `orElse` (False <$ (readTVar deadline >>= check))
+          atomically (writeTVar cancelled settled)
         atCancel _ _ = pure ()
     withViewsProbed HostFirst probe id loamOverGranite testConfig {tvOnTransfer = atCancel} $ \v → do
-      atomically (writeTVar terrainRef (Just (_vTerrain v)))
+      atomically (writeTVar terrainRef (Just (_vTerrain v)) >> writeTVar armed True)
       view ← attached v 1
       bounded (atomically (readTVar held >>= check))
       bounded (closeView view)
@@ -1796,14 +1805,22 @@ hardening = describe "wakes, ownership and limits" $ do
       other → expectationFailure ("the recorded chunks were not answered: " <> show other)
 
   it "never accepts a candidate whose records exceed the renderer's storage window: a region that never fits is a typed refusal, a larger whole waits, and a window that holds it publishes" $ do
+    -- a target large enough for its plan's records to span several render regions
     let windowed bytes body = withViews $ \v → do
-          atomically (writeTVar (foRegionWindow (vOwner v)) bytes)
+          atomically (writeTVar (foRegionWindow (vOwner v)) bytes >> writeTVar (vMetrics v) (TargetMetrics (PixelExtent 1024 768) (PixelExtent 1024 768) 1 1))
           view ← attached v 1
           body v view
-        refusalOf view = bounded . atomically $ readView view >>= maybe retry pure . readingWindow
+        -- the view's outcome: its refusal, or a publication when the window held the candidate
+        refusalOf view =
+          bounded . atomically $
+            (readView view >>= maybe retry (pure . Right) . readingWindow)
+              `orElse` (readView view >>= maybe retry (pure . Left) . readingPublished)
+        expectRefusal view = refusalOf view >>= \case
+          Right refusal → pure refusal
+          Left revision → expectationFailure ("the candidate was published (revision " <> show revision <> ")") >> fail "unreachable"
     -- a window too small for any region: the largest region's records are a typed refusal; nothing is built or published
     unitBytes ← windowed 17 $ \v view → do
-      refusal ← refusalOf view
+      refusal ← expectRefusal view
       publishedRevision (vModel v) 1 `shouldReturn` 0
       readTVarIO (foBuilt (vOwner v)) `shouldReturn` 0
       closeView view
@@ -1812,7 +1829,7 @@ hardening = describe "wakes, ownership and limits" $ do
         other → expectationFailure ("not a region's refusal: " <> show other) >> fail "unreachable"
     -- a window that holds the largest region alone but not the whole: it waits, and says what the whole needs
     need ← windowed unitBytes $ \v view → do
-      refusal ← refusalOf view
+      refusal ← expectRefusal view
       publishedRevision (vModel v) 1 `shouldReturn` 0
       closeView view
       case refusal of
@@ -2375,8 +2392,9 @@ fakeViewOwner owner =
     , ownerEnd = readTVar (foEnded owner) >>= check
     }
   where
+    -- a material whose records take room, as the terrain material's do, so the renderer's storage window binds
     material ∷ MaterialRef
-    material = defaultMaterial
+    material = materialRef 7 (materialFacts defaultMaterial) {factRecordLayout = RecordLayout 2 2}
     submitFake ∷ (TVar (Maybe (Answer a)) → FakeAction) → STM (Either OwnerRefusal (Ticket a))
     submitFake make = do
       ended ← readTVar (foEnded owner)
