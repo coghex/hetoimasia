@@ -949,18 +949,20 @@ grantSlot svc contender = do
         Left _ → pure False
         Right (grant, adm') → do
           writeTVar (serviceEditBank svc) adm'
-          writeTVar (serviceState svc) st {stateSlot = Just (SlotTask aid work (SlotTxn (Txn.start (arenaStore arena) planner)) (Just grant) WakeNow False)}
+          writeTVar (serviceState svc) st {stateSlot = Just (SlotTask aid work (SlotTxn (Txn.start (arenaStore arena) planner)) (Just grant) WakeNow False (basisOf arena))}
           pure True
+      -- the store the run is given, as internal work's idle mark records it ('slotBasis')
+      basisOf arena = (storeVersion (arenaStore arena), oldestPin (arenaStore arena))
       live aid k = case (stateSlot st, Map.lookup aid (stateArenas st)) of
         (Nothing, Just arena) → k arena
         _ → pure False
   case contender of
     -- a growth holds no transaction RAM: its extra is the backend's, charged there
-    ContendGrowth rid aid proposal → live aid $ \_ → do
-      writeTVar (serviceState svc) st {stateSlot = Just (SlotTask aid (SlotGrowth rid) (SlotGrow (Growth.startGrowth proposal)) Nothing WakeNow False)}
+    ContendGrowth rid aid proposal → live aid $ \arena → do
+      writeTVar (serviceState svc) st {stateSlot = Just (SlotTask aid (SlotGrowth rid) (SlotGrow (Growth.startGrowth proposal)) Nothing WakeNow False (basisOf arena))}
       pure True
-    ContendRelease rid aid → live aid $ \_ → do
-      writeTVar (serviceState svc) st {stateSlot = Just (SlotTask aid (SlotRelease rid) (SlotGrow Growth.startRelease) Nothing WakeNow False)}
+    ContendRelease rid aid → live aid $ \arena → do
+      writeTVar (serviceState svc) st {stateSlot = Just (SlotTask aid (SlotRelease rid) (SlotGrow Growth.startRelease) Nothing WakeNow False (basisOf arena))}
       pure True
     ContendRemoval rid aid tile → live aid $ \arena → txn aid arena (SlotRemoval rid) (removalPlanner (arenaEnv arena) (arenaStore arena) tile)
     ContendDiscovery aid → live aid $ \arena → txn aid arena SlotDiscovery (discoveryPlanner (arenaEnv arena) (arenaStore arena))
@@ -970,7 +972,7 @@ grantSlot svc contender = do
       Left _ → pure False
       Right (grant, adm') → do
         writeTVar (serviceEditBank svc) adm'
-        writeTVar (serviceState svc) st {stateSlot = Just (SlotTask aid (SlotWriteProbe rid) (SlotProbe (WriteProbe.startWriteProbe (arenaStore arena) pages)) (Just grant) WakeNow False)}
+        writeTVar (serviceState svc) st {stateSlot = Just (SlotTask aid (SlotWriteProbe rid) (SlotProbe (WriteProbe.startWriteProbe (arenaStore arena) pages)) (Just grant) WakeNow False (basisOf arena))}
         pure True
 
 -- | Where a step left the slot's transaction, for the owner.
