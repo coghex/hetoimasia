@@ -126,6 +126,18 @@ spec ∷ Env → Spec
 spec env = describe "terrain views" $
   it "draws the adopted world into a surface-free target with its depth image, keeps drawing it across the Lua handles' release and an edit, and hands back a real empty revision" $
     within 60 . withRig env $ \rig → do
+      -- first, a view of an offscreen target this host no longer holds is refused, taking nothing, though its
+      -- registrant's cell says it has not retired
+      let host = envHost (rgEnv rig)
+      other ← atomically (registerVulkanSceneTarget host) >>= either (\why → assertFailure ("the registration was refused: " <> show why)) pure
+      atomically (unregisterVulkanSceneTarget host other) >>= (`shouldBe` True)
+      atomically (writeTVar (rgMetrics rig) (metricsOf 128 96))
+      let ended = offscreenViewTarget host other (pure False) True (Just <$> readTVar (rgMetrics rig))
+      refused ← inInstance (rgComp rig) (rgVm rig) "i" (attachView (rgViews rig) (requestOf rig ended)) >>= either (\why → assertFailure ("refused early: " <> show why)) pure
+      awaitAttach refused >>= \case
+        SettledRefused AttachTargetUnusable → pure ()
+        _ → assertFailure "a view of an ended target was not refused as unusable"
+      atomically (claimOf (scenesClaims (envScenes (rgEnv rig))) (KeyOffscreen other)) `shouldReturn` Nothing
       view ← attach rig (metricsOf 128 96)
       _ ← awaitAdopted rig 1
       settleBackground rig view
@@ -184,19 +196,6 @@ fullSpec env = describe "terrain views (full)" $ do
         rendered ← renderJudged rig ("zoom " <> Text.pack (show zoom))
         pickAgreement rig view rendered >>= notePicks
         closeView view
-  it "refuses a view of an offscreen target this host no longer holds, taking nothing, though its registrant's cell says it has not retired" $
-    within 60 . withRig env $ \rig → do
-      let host = envHost (rgEnv rig)
-      other ← atomically (registerVulkanSceneTarget host) >>= either (\why → assertFailure ("the registration was refused: " <> show why)) pure
-      atomically (unregisterVulkanSceneTarget host other) >>= (`shouldBe` True)
-      atomically (writeTVar (rgMetrics rig) (metricsOf 64 64))
-      let ended = offscreenViewTarget host other (pure False) True (Just <$> readTVar (rgMetrics rig))
-      attaching ← inInstance (rgComp rig) (rgVm rig) "i" (attachView (rgViews rig) (requestOf rig ended)) >>= either (\why → assertFailure ("refused early: " <> show why)) pure
-      awaitAttach attaching >>= \case
-        SettledRefused AttachTargetUnusable → pure ()
-        _ → assertFailure "a view of an ended target was not refused as unusable"
-      atomically (claimOf (scenesClaims (envScenes (rgEnv rig))) (KeyOffscreen other)) `shouldReturn` Nothing
-
   it "draws a portrait target exactly, and a pick over the clear background finds nothing" $
     within 60 . withRig env $ \rig → do
       view ← attach rig (metricsOf 64 128)
