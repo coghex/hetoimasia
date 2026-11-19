@@ -28,7 +28,7 @@ import qualified Data.ByteString as ByteString
 import qualified Data.ByteString.Char8 as BC
 import Data.IORef (newIORef, readIORef, writeIORef)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (isJust, listToMaybe)
+import Data.Maybe (isJust, listToMaybe, mapMaybe)
 import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as Text
@@ -99,7 +99,7 @@ import System.Timeout (timeout)
 import Hetoimasia.Terrain.Render2D.AtlasFixtures (AtlasStyle, findSampleDirectory, loadAtlasStyle)
 import qualified Hetoimasia.Terrain.Render2D.AtlasFixtures as Fixtures
 import qualified Hetoimasia.Terrain.Render2D.Camera as Camera
-import Hetoimasia.Terrain.Render2D.Cells (CellConfig (..), CellKey (..), PartKind (..), TargetRect (..), cellPlanQuads, quadCell, quadKey, quadPart, quadTarget)
+import Hetoimasia.Terrain.Render2D.Cells (CellConfig (..), CellKey (..), CellPlan, PartKind (..), TargetRect (..), cellPlanQuads, quadCell, quadKey, quadPart, quadTarget)
 import Hetoimasia.Terrain.Render2D.Material (terrainModel)
 import Hetoimasia.Terrain.Render2D.Presentation (defaultLightInput)
 import qualified Hetoimasia.Terrain.Runtime as Runtime
@@ -126,9 +126,13 @@ spec env = describe "terrain views" $
   it "draws the adopted world into a surface-free target with its depth image, keeps drawing it across the Lua handles' release and an edit, and hands back a real empty revision" $
     within 60 . withRig env $ \rig → do
       view ← attach rig (metricsOf 128 96)
-      first' ← awaitAdopted rig 1
+      _ ← awaitAdopted rig 1
+      settleBackground rig view
+      first' ← publishedOf rig
       a ← renderJudged rig "required A"
-      worldTag (rwWorld a) `shouldBe` WorldTag (viewIncarnation view) 1
+      -- the drawn world is this view's settled revision: the one it published, which the host adopted
+      settledRevision ← readingPublished <$> atomically (readView view)
+      Just (worldTag (rwWorld a)) `shouldBe` (WorldTag (viewIncarnation view) . fromIntegral <$> settledRevision)
       chunksA ← pure (worldChunks (rwWorld a))
       -- The original handles go; the view keeps drawing under its own interests.
       command (rgComp rig) (rgVm rig) "i" "release" "colour"
@@ -137,6 +141,7 @@ spec env = describe "terrain views" $
       -- An edit is prepared, published and adopted as B; A's regions that B does not list retire after A's batches.
       removeAt rig (8, 8, 3)
       _ ← awaitAdopted rig (first' + 1)
+      settleBackground rig view
       b ← renderJudged rig "required B"
       rwRevision b `shouldSatisfy` (> rwRevision a)
       let gone = chunksA `Set.difference` worldChunks (rwWorld b)
@@ -163,6 +168,7 @@ fullSpec env = describe "terrain views (full)" $ do
         n ← awaitAdopted rig 1
         atomically (updateCamera view (CameraIntent [Camera.SetFacing facing])) `shouldReturn` Right ()
         _ ← awaitAdopted rig (n + 1)
+        settleBackground rig view
         rendered ← renderJudged rig ("facing " <> Text.pack (show facing))
         pickAgreement rig view rendered >>= notePicks
         closeView view
@@ -173,6 +179,7 @@ fullSpec env = describe "terrain views (full)" $ do
         n ← awaitAdopted rig 1
         atomically (updateCamera view (CameraIntent [Camera.SetZoom zoom])) `shouldReturn` Right ()
         _ ← awaitAdopted rig (n + 1)
+        settleBackground rig view
         rendered ← renderJudged rig ("zoom " <> Text.pack (show zoom))
         pickAgreement rig view rendered >>= notePicks
         closeView view
@@ -180,6 +187,7 @@ fullSpec env = describe "terrain views (full)" $ do
     within 60 . withRig env $ \rig → do
       view ← attach rig (metricsOf 64 128)
       _ ← awaitAdopted rig 1
+      settleBackground rig view
       rendered ← renderJudged rig "portrait"
       clearPicks ← forM (take 64 (rwClear rendered)) $ \(x, y) → atomically (pickView view (fromIntegral x + 0.5, fromIntegral y + 0.5))
       [p | p@(PickHit _) ← clearPicks] `shouldBe` []
@@ -188,11 +196,13 @@ fullSpec env = describe "terrain views (full)" $ do
   it "draws an adopted view again after its target is resized, at the new metrics, and picks what it draws" $
     within 60 . withRig env $ \rig → do
       view ← attach rig (metricsOf 128 96)
-      n ← awaitAdopted rig 1
+      _ ← awaitAdopted rig 1
+      settleBackground rig view
+      n ← publishedOf rig
       _ ← renderJudged rig "before the resize"
       atomically (writeTVar (rgMetrics rig) (metricsOf 96 128))
       _ ← awaitAdopted rig (n + 1)
-      -- the new metrics' demand loads settle first, so the revision drawn is the one the picks answer from
+      -- the residency stops moving at the new metrics first, so the revision drawn is the one the picks answer from
       settleBackground rig view
       rendered ← renderJudged rig "after the resize"
       pickAgreement rig view rendered >>= notePicks
@@ -203,6 +213,7 @@ fullSpec env = describe "terrain views (full)" $ do
       _ ← awaitAdopted rig 1
       Just (visible, _) ← atomically (viewDemand view)
       [r | r ← visible, abs (regionX r) > 1 || abs (regionY r) > 1] `shouldSatisfy` (not . null)
+      settleBackground rig view
       rendered ← renderJudged rig "background"
       pickAgreement rig view rendered >>= notePicks
       closeView view
@@ -222,6 +233,7 @@ fullSpec env = describe "terrain views (full)" $ do
       removeAt rig (8, 8, 3)
       _ ← awaitAdopted rig (now + 1)
       sliced
+      settleBackground rig view
       parts ← within 20 . atomically $ do
         plan ← adoptedPlan view >>= maybe retry pure
         let found = Set.fromList (map quadPart (cellPlanQuads plan))
@@ -249,8 +261,8 @@ fullSpec env = describe "terrain views (full)" $ do
     within 90 . withRigOn loamOverGranite (\c → c {tvOnStage = hook}) env $ \rig → (`finally` atomically (writeTVar released True)) $ do
       view ← attach rig (metricsOf 128 96)
       _ ← awaitAdopted rig 1
-      -- the runtime's background loads are settled first: the view's whole demand is resident, so nothing but the far
-      -- view below moves the residency generation, and the view is idle with what it published adopted
+      -- the residency generation stops moving first, with the view idle and what it published adopted, so nothing but
+      -- the far view below moves it
       settleBackground rig view
       n ← publishedOf rig
       let generationNow = fmap Runtime.viewGeneration <$> Runtime.inspectArenaSTM (rgTerrain rig) (rgArena rig)
@@ -278,6 +290,7 @@ fullSpec env = describe "terrain views (full)" $ do
        worldTag (rwWorld kept) `shouldBe` worldTag (rwWorld before')
        atomically (writeTVar again True)
        _ ← awaitAdopted rig (n + 1)
+       settleBackground rig view
        rendered ← renderJudged rig "the replacement"
        zoomOf (rwWorld rendered) `shouldBe` 2
        closeView view
@@ -292,7 +305,10 @@ overlapSpec holding env = describe "terrain views (full)" $
   it "keeps a superseded revision's own chunks held while its batch is held in GPU use after a newer one is adopted, and retires them once the batch completes" $
     (`finally` atomically (writeTVar (holdingSet holding) Set.empty)) . within 60 . withRig env $ \rig → do
       view ← attach rig (metricsOf 128 96)
-      n ← awaitAdopted rig 1
+      _ ← awaitAdopted rig 1
+      -- A is the settled revision: the residency stops moving first, so A is what stays drawn until the edit
+      settleBackground rig view
+      n ← publishedOf rig
       chunksA ← worldChunks . snd <$> adoptedWorld rig
       heldA ← renderSubmitWith rig (Just holding) "A, held in GPU use"
       -- B: an edit's rebuild, adopted on the target
@@ -315,6 +331,7 @@ overlapSpec holding env = describe "terrain views (full)" $
       a ← renderFinish heldA
       worldChunks (rwWorld a) `shouldBe` chunksA
       within 20 . atomically $ liveChunksSTM rig >>= check . Set.null . Set.intersection onlyA
+      settleBackground rig view
       _ ← renderJudged rig "B, after A's batch"
       evidenceNote ("terrain views (overlap): " <> Text.pack (show (Set.size onlyA)) <> " chunks of A held through B's adoption while A's batch was held; retired after its completion")
       closeView view
@@ -674,26 +691,68 @@ adoptedWorld rig = do
     Just scene | Just world ← graphicsWorld scene → pure (revision, world)
     _ → assertFailure "the adopted scene holds no world"
 
--- Wait until the view's whole demand, visible and prefetch, is resident, the terrain service has no load in hand, and the
--- view is idle with what it published adopted: nothing then moves the residency generation but what the example does.
+-- Wait until the residency generation itself has stopped moving with the view idle (owner decision 'T'), all of it read
+-- in one transaction:
+--
+-- * the view's whole demand, visible and prefetch, is resident and the terrain service has no job in hand: a job's
+--   publication and the victims an admission commits are the generation's only moves besides an edit;
+-- * the views' release pass has run: no superseded region is still retiring;
+-- * the view has published its latest intent, holds no stage, is not waiting, and the host has adopted what it published;
+-- * the adopted plan was prepared at the arena's current residency generation (the identity its picks carry).
+--
+-- In that state the view has no work, so it changes no demand, and with no job nothing moves the generation: what the
+-- example renders next is what the picks answer from, until the example itself acts. On its bound, one DIAG line names
+-- each condition and whether it held.
 settleBackground ∷ Rig → TerrainView SceneTargetKey → IO ()
-settleBackground rig view = within 30 . atomically $ do
+settleBackground rig view =
+  timeout (30 * 1000000) (atomically (settleConditions rig view >>= check . all snd)) >>= \case
+    Just () → pure ()
+    Nothing → do
+      conditions ← atomically (settleConditions rig view)
+      Text.putStrLn ("DIAG settle: " <> Text.intercalate " " [name <> "=" <> Text.pack (show held) | (name, held) ← conditions])
+      assertFailure "the residency generation did not settle with the view idle within 30 seconds"
+
+-- Each of the settle's conditions, named, and whether it holds now.
+settleConditions ∷ Rig → TerrainView SceneTargetKey → STM [(Text, Bool)]
+settleConditions rig view = do
   demand ← viewDemand view
   model ← Runtime.inspectModelSTM (rgTerrain rig)
-  let loading = not (null (modelJobs model))
   reading ← readView view
   standing ← standingOf rig
+  retiring ← terrainViewsRetiring (rgViews rig)
+  generation ← fmap Runtime.viewGeneration <$> Runtime.inspectArenaSTM (rgTerrain rig) (rgArena rig)
+  extent ← metricsFramebuffer <$> readTVar (rgMetrics rig)
+  residency ← adoptedPlan view >>= maybe (pure Nothing) (adoptedResidency view extent)
   let resident = Set.fromList (map regionCoord (modelRegions model))
       hostSettled = maybe False (\st → isJust (windowAdopted st) && windowAdopted st == windowPublished st) standing
-  case demand of
-    Just (visible, prefetch)
-      | Set.fromList (visible <> prefetch) `Set.isSubsetOf` resident
-      , not loading
-      , readingStagedBytes reading == 0
-      , isJust (readingPublished reading)
-      , hostSettled →
-          pure ()
-    _ → retry
+  pure
+    [ ("demand-resident", maybe False (\(visible, prefetch) → Set.fromList (visible <> prefetch) `Set.isSubsetOf` resident) demand)
+    , ("no-job", null (modelJobs model))
+    , ("nothing-retiring", null retiring)
+    , ("phase-published", readingPhase reading == PhasePublished)
+    , ("not-waiting", not (readingWaiting reading))
+    , ("no-stage", readingStagedBytes reading == 0)
+    , ("published", isJust (readingPublished reading))
+    , ("host-adopted-published", hostSettled)
+    , ("residency-read", isJust residency)
+    , ("residency-current", isJust residency && residency == fmap fromIntegral generation)
+    ]
+
+-- The residency identity the adopted plan was prepared at, as a hit's pick identity carries it: the first known quad
+-- whose part inside the target picks a hit at its centre answers it. 'Nothing' while no such pick hits.
+adoptedResidency ∷ TerrainView SceneTargetKey → PixelExtent → CellPlan → STM (Maybe Word64)
+adoptedResidency view (PixelExtent width height) plan = firstHit (mapMaybe inside [quad | quad ← cellPlanQuads plan, quadPart quad /= PartFog])
+  where
+    inside quad =
+      let TargetRect l t r b = quadTarget quad
+          (l', t', r', b') = (max l 0, max t 0, min r (fromIntegral width), min b (fromIntegral height))
+       in if l' < r' && t' < b' then Just (realToFrac ((l' + r') / 2), realToFrac ((t' + b') / 2)) else Nothing
+    firstHit = \case
+      [] → pure Nothing
+      point : rest →
+        pickView view point >>= \case
+          PickHit ref → pure (Just (pickResidency (pickRefIdentity ref)))
+          _ → firstHit rest
 
 zoomOf ∷ SceneWorld → Float
 zoomOf = cameraZoom . viewCamera . worldView
