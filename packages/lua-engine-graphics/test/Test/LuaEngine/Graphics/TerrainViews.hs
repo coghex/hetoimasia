@@ -2123,20 +2123,20 @@ stagesAndReaders = describe "stages, waits and readers" $ do
       _ ← awaitPublished v 1
       quiescent v
       demandResident v view
-      -- an edit's rebuild waits at the owner: the view is mid-stage, its build in flight
-      atomically (writeTVar (foGate owner) False)
-      removeWith v (tileAt 9 9 3) Nothing `shouldReturn` Right True
-      bounded (atomically (readTVar (foWaiting owner) >>= check . (> 0)))
-      quiescent v
-      bounded (atomically (Runtime.inspectModelSTM (_vTerrain v) >>= check . null . modelJobs))
-      before' ← readIORef evaluations
-      -- another holder copies ten distant regions, one at a time: every request writes the terrain service's state
-      forM_ [1 .. 10 ∷ Int] $ \i → do
-        request ← Runtime.requestRegionSnapshot (_vTerrain v) (vArena v) [RegionCoord (40 + fromIntegral i) 40 0] >>= either (fail . show) pure
-        Runtime.await (_vTerrain v) request >>= either (fail . show) (Runtime.releaseRegionBorrow (_vTerrain v))
-      afterLoads ← readIORef evaluations
-      (afterLoads - before') `shouldSatisfy` (<= 2)
-      atomically (writeTVar (foGate owner) True)
+      -- an edit's rebuild waits at the owner: the view is mid-stage, its build in flight (let go on every exit)
+      (`finally` atomically (writeTVar (foGate owner) True)) $ do
+        atomically (writeTVar (foGate owner) False)
+        removeWith v (tileAt 9 9 3) Nothing `shouldReturn` Right True
+        bounded (atomically (readTVar (foWaiting owner) >>= check . (> 0)))
+        quiescent v
+        bounded (atomically (Runtime.inspectModelSTM (_vTerrain v) >>= check . null . modelJobs))
+        before' ← readIORef evaluations
+        -- another holder copies ten distant regions, one at a time: every request writes the terrain service's state
+        bounded . forM_ [1 .. 10 ∷ Int] $ \i → do
+          request ← Runtime.requestRegionSnapshot (_vTerrain v) (vArena v) [RegionCoord (40 + fromIntegral i) 40 0] >>= either (fail . show) pure
+          Runtime.await (_vTerrain v) request >>= either (fail . show) (Runtime.releaseRegionBorrow (_vTerrain v))
+        afterLoads ← readIORef evaluations
+        (afterLoads - before') `shouldSatisfy` (<= 2)
       closeView view
 
   it "answers no hit for a point outside the target before any adoption and after a resize, not loading" $
