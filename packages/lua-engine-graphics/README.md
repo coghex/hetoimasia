@@ -28,7 +28,7 @@ of it. The package is named only by `cabal.project.vulkan`.
 | `Texture.Host` | The production `Port`, over a running `VulkanHost`. |
 | `Window.*` | The window provider. |
 | `Scene.*` | Scene publication, the hold ledger and the frame of an adopted scene; `Scene.World` (a terrain view's frame as the 2D renderer's values) and `Scene.Claims` (targets' exclusive claims). |
-| `TerrainView.*` | The terrain-view adapter, in the public sub-library `terrain-views`, the package's only component that depends on the terrain packages. |
+| `TerrainView.*` | The terrain-view adapter: the public sub-library `terrain-views` re-exports its public modules from the private implementation `terrain-views-core`, the package's only components that depend on the terrain packages. |
 | `Facade` | The composition of the CPU facade's graphics operations. |
 | `Input` | The Lua input adapter. |
 
@@ -520,6 +520,10 @@ world scene. `Hetoimasia.LuaEngine.Graphics.TerrainView` (sub-library
 `terrain-views`) is the Haskell interface a Lua binding wraps; it adds no Lua
 binding, request policy or input handling. The main library imports no
 terrain package, and no terrain, runtime or planner package imports this one.
+`terrain-views` re-exports the adapter's public modules from its private
+implementation, `terrain-views-core`, and not the implementation's `Service`
+or `Qualification` modules, so no client can reach an adopted plan; only this
+package's suites read one (`Qualification.withAdoptedPlan`).
 
 ```haskell
 withTerrainViews ∷ (Ord k, Show k) ⇒ TerrainViewsConfig → TerrainViewsPorts k → (TerrainViews k → IO a) → IO a
@@ -566,14 +570,16 @@ the parents.
 | --- | --- |
 | `AttachStyle` | a parent refused by the lease, unsuitable, without coverage, unbindable; an incomplete mapping; parents over the instance's texture bytes; a mapping that gives no region to a material of the arena's palette (`StyleMissingMaterials`, read in the commit transaction). Never busy |
 | `AttachNoDepth` | the target's frames carry no `D32_SFLOAT` depth image, or the session's depth format is not `D32_SFLOAT` |
-| `AttachTargetUnusable`, `AttachTargetClaimed`, `AttachParentReleased` | read in the commit transaction, before any claim |
+| `AttachTargetUnusable`, `AttachTargetClaimed`, `AttachParentReleased` | read in the commit transaction, before any claim; a surface-free target is usable only while this host holds that exact registration (`vulkanSceneTargetRegistered`) and its registrant has not retired it |
 | `AttachArena`, `AttachSettings`, `AttachCamera`, `AttachTooManyViews` | the arena lease (released, closed, or another client's of the same service), the presentation settings, the camera's start, eight views |
 | `AttachBusy`, `AttachStopped` | the request queue or the terrain service's admission; the adapter or session ended |
 
 **Preparation** (the adapter's one worker, latest intent only) is a
 resumable stage per view, and the worker takes one bounded step of one view at
-a time: queued attachments, closes, retirements and re-sent demands first, then
-the views' steps round-robin. So no view's copies, plan, build or uploads keep
+a time: closes (and a view's lease check after some lease ended) and
+retirements first, then queued attachments and re-sent demands, then the
+views' steps round-robin, so attachment traffic never keeps a close or a
+retirement waiting. So no view's copies, plan, build or uploads keep
 the worker from another view, and the worker never waits on the owner, the
 terrain service or an upload: it reads their answers when they are ready.
 Every resource changes owner in the transaction that records it: a GPU
@@ -607,9 +613,16 @@ then the regions nearest it (a jump's or a followed surface's, the plan's
 visible demand; never prefetch). It admits at most `tvAdmitRegions` (2,048 by
 default), and of those the longest prefix the account can hold beside the room
 for the plan's first quantum over them. The account is the binding limit; the
-cap only keeps one view from starving another, and 2,048 regions' copies and
-inputs (`admittedCostBound`) let two views at the largest approved envelope each
-hold a coherent partial plan under the production 128 MiB bank. Regions not
+cap only keeps one view from starving another. Admission charges each copied
+region's fixed inputs, the planner's knowledge for a region of more than one
+class (an entry for each column and run) and the removal index the copies'
+removed intervals make, all counted from the copies before anything is made
+(`inputsCharge`). `admittedCostBound` and `preparationCost` take the same
+obligations at their most (`knowledgeExpansionBound` a region, the change
+limits' `changesExpansionBound`): about 1.43 GiB for the default 2,048 regions,
+beyond the 128 MiB bank, which admission therefore binds first. For terrain
+that is one class a region and unedited (`uniformInputsCost`), 2,048 regions'
+copies and inputs take about 102 MiB and fit the bank. Regions not
 admitted stay pending with their loading envelope (`readingUnadmitted`), so a
 deliberately partial plan is coherent. With enough capacity and stable inputs,
 a partial plan goes on while each preparation admits more and so settles with
@@ -630,18 +643,27 @@ their own device buffers, so the per-frame instance ring holds none of them: the
 qualified cutout path needs no ring space.
 
 A preparation that cannot start sleeps on the one thing that can change that:
-at its two-pin limit, an adoption other than the one seen when its pins were
-pruned (one transaction), or a reader letting a pin go; without target metrics,
-the metrics. Its intent and
-its peers do not wake it. A view whose arena authority (its lease released or
-revoked, its arena closed) or target incarnation is gone for good closes
+at its two-pin limit, the pin-capacity predicate itself (the pins it would keep:
+published, adopted, newer than adopted, or read), so one reader starting as
+another ends still wakes it; without target metrics, the metrics. Its intent
+and its peers do not wake it. A view whose arena authority (its lease released
+or revoked, its arena closed) or target incarnation is gone for good closes
 through its own close, in whatever stage it is, which hands the target back,
-and says so as evidence.
+and says so as evidence. The worker watches only cells that change on those
+events: the terrain service's authority epoch (`authorityEpochSTM`, moved only
+where a lease stops being valid; a move checks each view's lease in its own
+transaction) and each target's retirement cell (`vtRetired`: a window's own
+lifecycle cell, `targetRetired`, which the owner's rounds never write; a
+surface-free target's registrant's cell). The session's admission
+(`portTaking`) closing is terminal: the service ends then, closing every view
+while the scope's body runs; the composition supplies it from a cell that
+changes only then.
 
 **Intent before the first facts.** A camera update that reads no terrain (a
 zoom, a facing, a turn, a slice) is recorded as intent before the view's first
-facts arrive, and the first publication carries the latest; a pan, which
-follows the surface, answers `IntentBusy` until then.
+facts arrive, and the first publication carries the latest; so is a pan of a
+manual camera, which follows nothing. A pan of a following camera answers
+`IntentBusy` until then; a pan's displacement is checked first.
 
 **Inputs.** Every terrain and knowledge input of a plan, of its retained
 regions and of its pick metadata comes from those regional copies and from
@@ -689,9 +711,11 @@ its charge needs (whole granules), so another view's copy taken and dropped
 does not wake it; a copy refused for the terrain service's retained bank waits
 on that bank (`retainedBankUseSTM`), read before the request. A build's chunk
 and its record of what was built are one step no cancellation splits. A release
-action that ends without answering keeps its regions' failure and charges as
-evidence and every other retirement goes on; only an owner that takes no more
-actions ends them all.
+answers each chunk on its own: one whose release raised is that chunk's failure
+and the chunks after it are still released (`releaseEach`). A release action
+that ends without answering keeps its regions' failure and charges as evidence
+and every other retirement goes on; only an owner that takes no more actions
+ends them all.
 
 **The record window.** Before a candidate is built, its render regions'
 material records are checked against the renderer's storage window (the bytes
@@ -750,10 +774,10 @@ is `PickLoading`; zero metrics, a point outside, air, gaps and fog are
 module of the library exports its constructors or field labels, so a caller
 reads one through its accessor functions and can neither make nor alter one. A
 point outside the target's current logical extent is `PickNoHit` before any
-adoption check. The adopted plan is read only under the view's reader
-(`withAdoptedPlan`): for as long as the body runs its revision stays pinned and
-charged and counts against the two-pin limit; `readingAdoptedResidency` reads
-its residency identity.
+adoption check. The adopted plan is read only by this package's suites, under
+the view's reader (`Qualification.withAdoptedPlan`): for as long as the body
+runs its revision stays pinned and charged and counts against the two-pin
+limit; `readingAdoptedResidency` reads its residency identity.
 `pickPrecondition` gives the removal the arena incarnation and the content and
 knowledge revisions, and a guard the terrain service reads in its removal
 arbitration: the view still holds the target and the revision picked from is
@@ -765,7 +789,10 @@ host's initial content as a real new revision; drops the GPU interests; and
 starts the retirement of its regions. A view that never published leaves the
 target's latest value alone. The view stays in the service's views until its
 parents are released, so a close interrupted there is finished by the service's
-end; a closed view's handle keeps no style, demand or admission state. A jump
+end; a closed view's handle keeps no style, demand or admission state. A plan
+a reader still reads keeps its pin, its charge and the view's parents (its
+coverage) past the close, which still hands the target back at once: the last
+reader's end lets them go, and no reader starts on a closing view. A jump
 is cancelled only through the view it belongs to. The service's end closes
 every view, then drains
 the retirements to the owner's evidence; retirement the owner can no longer
@@ -780,8 +807,11 @@ a cancellation: a cancelled worker takes no more attachments, settles the
 queued ones stopped, and the scope's exit then runs the service's end itself.
 The worker is the scope's resource (`withResource`): it announces its end on
 every exit, and the scope's release stops it, joins it and drains the views
-uninterruptibly, so the scope never exits before the worker is joined, and a
-body's failure and the release's are both kept. Cancelling an attachment
+uninterruptibly, however its stopping hook ends (the hook's failure is raised
+after), so the scope never exits before the worker is joined, and a body's
+failure and the release's are both kept. A close that fails at the service's
+end is completed (its stage, its runtime view, the handback, then its end), so
+nothing waiting on it waits on a service that has ended. Cancelling an attachment
 releases its parents with no cancellation between its leaving the queue and the
 release.
 
