@@ -1707,18 +1707,35 @@ hardening = describe "wakes, ownership and limits" $ do
       _ ← awaitPublished v 1
       closeView view
 
-  it "waits on a copy refused for the terrain service's retained bank, and copies once another caller releases its borrow, with no other change" $ do
-    -- the retained bank holds one region's reservation and its result record: while another caller holds a settled
-    -- borrow, no copy of the view's fits
-    let bank = Runtime.regionSnapshotReservation 1 + 160
-    withViewsTerrain HostFirst (\c → c {configRetainedBytes = bank}) loamOverGranite testConfig {tvCopyRegions = 1} $ \v → do
+  it "waits on a copy refused for the terrain service's retained bank, and copies once another caller's request settles to its footprint while it keeps the borrow" $ do
+    gate ← newTVarIO False
+    armed ← newTVarIO False
+    held ← newTVarIO False
+    -- once armed, the terrain service's owner waits before its next commit: another caller's request holds its whole
+    -- reservation until the example lets it settle
+    let probe = Runtime.Probe $ \case
+          Runtime.PointBeforeCommit _ → do
+            first' ← atomically (readTVar armed <* writeTVar armed False)
+            when first' $ do
+              atomically (writeTVar held True)
+              atomically (readTVar gate >>= check)
+          _ → pure ()
+        -- room for two pending one-region reservations' worth less a byte: while the other caller's request holds its
+        -- reservation, no copy of the view's fits; once it settles to its footprint, one does
+        reservation = Runtime.regionSnapshotReservation 1 + 160
+        bank = 2 * reservation - 1
+    withViewsProbed HostFirst probe (\c → c {configRetainedBytes = bank}) loamOverGranite testConfig {tvCopyRegions = 1} $ \v → do
+      atomically (writeTVar armed True)
       other ← Runtime.requestRegionSnapshot (_vTerrain v) (vArena v) [RegionCoord 0 0 0] >>= either (fail . show) pure
-      borrow ← Runtime.await (_vTerrain v) other >>= either (fail . show) pure
+      bounded (atomically (readTVar held >>= check))
       view ← attached v 1
       bounded (atomically (readView view >>= check . readingWaiting))
       atomically (readView view) >>= (`shouldBe` Nothing) . readingPublished
-      Runtime.releaseRegionBorrow (_vTerrain v) borrow
+      -- the other request settles and keeps its borrow: only the retained bank moves, and the view copies and publishes
+      atomically (writeTVar gate True)
+      borrow ← Runtime.await (_vTerrain v) other >>= either (fail . show) pure
       _ ← awaitPublished v 1
+      Runtime.releaseRegionBorrow (_vTerrain v) borrow
       closeView view
 
   it "takes and releases a copy that settles between an abandoning close's probe and its cancellation, leaving the terrain service nothing" $ do
