@@ -1264,6 +1264,9 @@ a signalled cleanup fence followed by a returned release is
 `UnpresentedFrameSettled`. Nothing else (elapsed time, a returned call, a
 cancellation, a reset fence) becomes any of them. Completions are also
 appended to a log (`readCompletedSubmissions`, `takeCompletedSubmissions`).
+The one exception to when a fence is asked is the test-only completion hold
+(see [Frame-less batches](#frame-less-batches)): it keeps a held frame-less
+batch's fence from being asked at all, and so completes nothing itself.
 
 A step makes at most the model's progress-action limit of native calls and
 starts one place further along its work each time, so a fence that never
@@ -1721,7 +1724,9 @@ A fence is asked only when the model's schedule says a poll is due
 frame is to be attempted this step. A round something unrelated woke asks no
 fence and takes no model turn. The backoff moves on once per poll: 5, 10, 20,
 40, 80 and then 100 ms. New demand, a new obligation, an observed completion
-or a close transition restarts it.
+or a close transition restarts it. A frame-less batch the test-only completion
+hold holds is passed over at every poll, and asked again only at a poll after
+the hold lets it go.
 
 ### Pacing, suspension and fairness
 
@@ -1871,6 +1876,23 @@ own submission and completion. The model's rules are
   most a hundred), for each outstanding frame-less fence. One still
   outstanding without device-loss evidence is retained (`FramelessRetained`),
   and so is the device.
+- **The test-only completion hold.** `vulkanCompletionHold`, `Nothing` by
+  default and in every production configuration, is the one test-owned
+  lifecycle addition (#645's overlap witness, owner decision 2026-11-16). Only
+  a test suite sets it; no library or executable does. It holds frame-less
+  batches only; window frames, present fences and cleanup fences are never
+  held. While its `holdsBatch` answers `True` for a frame-less batch, the
+  owner's progress step does not ask that batch's fence, so every reader sees
+  it pending together: the model's completion, its frame-less slot, its ticket
+  (`TicketPending`), the completion log, and so the scene ledger's release of
+  the revision it used, and everything it uses stays held. `heldObserved` runs
+  in the step's transaction each time a step passes over a held batch, so the
+  test knows a step saw it. Letting go completes nothing: a later step asks the
+  fence and records the completion only once it is signalled. A batch still
+  held at whole-owner retirement is retained like any outstanding frame-less
+  batch, and device loss settles it lost; the hold adds no bypass, timeout or
+  automatic release. Production reads one unset `TVar` per frame-less
+  observation.
 
 ## Destruction order
 
