@@ -378,12 +378,12 @@ spec = describe "Terrain storage calls" $ do
               withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource creatorSteps)]) $ \world control runtime →
                 withFvm world runtime (over rig) $ \fvm → do
                   _ ← spawn world fvm "modules-test" mainPath
-                  pumpUntil world (drive world control fvm >> (elem "done" <$> outLines world))
+                  drive world control fvm (elem "done" <$> outLinesSTM world)
                   printed ← outLines world
                   masked printed `shouldBe` creatorExpected
       )
-      [ ("presentation", presentationOver, \world _ _ → advanceClock world 2000000000)
-      , ("gameplay", gameplayOver, \_ control fvm → tickBy control fvm 1)
+      [ ("presentation", presentationOver, \world _ _ → stepUntil world)
+      , ("gameplay", gameplayOver, \_ _ fvm → tickUntil fvm)
       ]
 
   it "refuses another instance's handle and a captured facade as ordinary errors, and an attachment's growth and retry, never busy, with the caller's bank full" $

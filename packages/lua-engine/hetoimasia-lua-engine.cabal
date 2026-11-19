@@ -384,8 +384,9 @@ test-suite lua-engine-tests
     hs-source-dirs: test
     -- The terrain examples run the production backed service (#665), whose storage backend
     -- refuses a runtime that is not threaded (a blocking native call must not stall the
-    -- capability the terrain owner runs on).
-    ghc-options: -threaded
+    -- capability the terrain owner runs on). -rtsopts lets the lab run it at +RTS -N<k>: the started
+    -- count sets the terrain set's multi-capability pass (Test.Support.Capabilities).
+    ghc-options: -threaded -rtsopts
     other-modules:
         Test.LuaEngine.Behavior
         Test.LuaEngine.Boot
@@ -491,6 +492,7 @@ test-suite lua-engine-tests
         Test.LuaEngine.Terrain.Names
         Test.LuaEngine.Terrain.Ownership
         Test.LuaEngine.Terrain.Picks
+        Test.LuaEngine.Terrain.Pump
         Test.LuaEngine.Terrain.Races
         Test.LuaEngine.Terrain.Seam
         Test.LuaEngine.Terrain.Spec
@@ -499,6 +501,7 @@ test-suite lua-engine-tests
         Test.LuaEngine.Terrain.Support
         Test.LuaEngine.Terrain.Validation
         Test.LuaEngine.Terrain.Windows
+        Test.LuaEngine.TerrainPass
         Test.LuaEngine.Texture.Spec
         Test.LuaEngine.Texture.Stages
         Test.LuaEngine.Texture.Teardown
@@ -540,6 +543,7 @@ test-suite lua-engine-tests
         hetoimasia-terrain-runtime:testing,
         hetoimasia-test-support ==0.1.0.0,
         hspec >=2.11 && <3,
+        hspec-core >=2.11 && <3,
         QuickCheck >=2.15 && <2.19,
         HUnit >=1.6 && <1.7,
         process >=1.6 && <1.7,

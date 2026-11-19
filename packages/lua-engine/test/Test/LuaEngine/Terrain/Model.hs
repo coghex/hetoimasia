@@ -28,10 +28,11 @@ import Data.Text (Text)
 import qualified Hetoimasia.Scripting.Lua.Instance as Instance
 import Hetoimasia.LuaEngine.Terrain (TerrainHooks (..), noTerrainHooks)
 import Hetoimasia.Scripting.Lua.Provider (advanceRequestEpoch)
-import Hetoimasia.Scripting.Lua.Scheduled (scheduledEndpoint)
+import Hetoimasia.Scripting.Lua.Scheduled (AccountingWait (AccountingComplete), awaitScheduledAccounting, scheduledEndpoint)
 import Hetoimasia.LuaEngine.Profile (CountLimit (RequestsPerInstance, RequestsPerVm))
 import Hetoimasia.Terrain.Runtime (Config (..), censusRequests, defaultConfig, inspectCensusSTM)
 import Test.Hspec
+import Test.Support.Bounded (bounded)
 import Test.LuaEngine.Facade.Support
 import Test.LuaEngine.Request.Profiles (counts)
 import Test.LuaEngine.Terrain.Support
@@ -115,16 +116,23 @@ spec = describe "Terrain lifecycle model" $
               clientBaseline ← newIORef (-1 ∷ Integer)
               p ← Side <$> newIORef False <*> newIORef 0
               g ← Side <$> newIORef False <*> newIORef 0
-              let advance = tickBy control gv 1 >> advanceClock world 2000000000
-                  settleAll = replicateM_ 6 (advance >> yield')
-                  yield' = pure ()
-                  -- Queue a command for a label, and wait for the instance's answer to it.
+              -- one gameplay tick, then one presentation step, until the condition holds: both VMs move, one update at a time
+              let advance = tickAndStepUntil gv world
+                  settleAll = replicateM_ 6 (tickBy control gv 1)
+                  -- Queue a command for a label, and wait for the instance's answer to it. For p, also for p's owner to account for the
+                  -- update that answered: the step pump wakes p and goes on, the ack is printed inside p's update, and what the update ended
+                  -- (a read started and taken in it, 'readtake') is accounted at the boundary after p's turn, by the providers' polling and
+                  -- the credit release there. The owner's accounting acknowledgement is written as the last step of a boundary that begins
+                  -- after the wait does, so it follows the answering update's boundary whether that update is still running or not; it wakes
+                  -- p's owner for a boundary only, never for another update. Not for p's open: the host's adoption of it is at p's
+                  -- boundary, held at the gate on the gated seeds until after the command, and the example waits for its answer by its line.
                   command label text = do
                     n ← atomicModifyIORef'' serial
                     modifyIORef' tally (Text.takeWhile (/= ' ') text :)
                     sendCommand rig label (Text.pack (show n) <> " " <> text)
                     let wanted = "ack\t" <> Text.pack (show n) <> "\t"
-                    pumpUntil world (advance >> any (Text.isPrefixOf wanted) <$> outLines world)
+                    advance (any (Text.isPrefixOf wanted) <$> outLinesSTM world)
+                    when (label == "p" && text /= "open") (bounded (awaitScheduledAccounting control (fvOwner pv)) >>= (`shouldBe` AccountingComplete))
                     printed ← outLines world
                     pure (maybe "" (Text.drop (Text.length wanted)) (find (Text.isPrefixOf wanted) printed))
                   sideOf label = if label == "p" then p else g
@@ -176,7 +184,7 @@ spec = describe "Terrain lifecycle model" $
                         -- the gameplay instance ends and is replaced: everything it held goes with it, and the new instance attaches again
                         Just old ← readIORef gSpawnRef
                         stopSpawned old
-                        pumpUntil world (advance >> ((== Just Instance.Stopped) <$> phaseOf old))
+                        advance ((== Just Instance.Stopped) <$> phaseOfSTM old)
                         forgetInstance (fvFacade gv) (spId old)
                         writeIORef (sdHandle g) False
                         writeIORef (sdReads g) 0
@@ -190,7 +198,7 @@ spec = describe "Terrain lifecycle model" $
                         writeIORef gSpawnRef (Just fresh)
                         opened ← length . filter (== "opened\tg\tsuccess") <$> outLines world
                         void (command "g" "attach")
-                        pumpUntil world (advance >> ((> opened) . length . filter (== "opened\tg\tsuccess") <$> outLines world))
+                        advance ((> opened) . length . filter (== "opened\tg\tsuccess") <$> outLinesSTM world)
                         writeIORef (sdHandle g) True
                       _ → void (command label "idle")
                     check (label <> " op " <> Text.pack (show choice))
@@ -207,13 +215,17 @@ spec = describe "Terrain lifecycle model" $
                 awaitReached gate
                 writeIORef window True
                 void (command "g" "attach")
-                pumpUntil world (advance >> ((>= 1) . length . filter (Text.isPrefixOf "opened\tg\t") <$> outLines world))
+                advance ((>= 1) . length . filter (Text.isPrefixOf "opened\tg\t") <$> outLinesSTM world)
                 check "after an attach to an open the host has not published"
                 outLines world >>= \printed → printed `shouldContain` ["opened\tg\tfailure"]
                 writeIORef window False
                 openGate gate
-              when (odd seed && not gated) (void (command "g" "attach"))
-              pumpUntil world (advance >> elem "opened\tp\tsuccess" <$> outLines world)
+              let attachesEarly = odd seed && not gated
+              when attachesEarly (void (command "g" "attach"))
+              advance (elem "opened\tp\tsuccess" <$> outLinesSTM world)
+              -- (the early attach is answered before it is read: one VM update at a time, p's success can be printed before the
+              -- g update that settles it, and a second attach sent then would orphan the first, whose lease nothing takes)
+              when attachesEarly (advance ((>= 1) . length . filter (Text.isPrefixOf "opened\tg\t") <$> outLinesSTM world))
               writeIORef (sdHandle p) True
               early ← length . filter (Text.isPrefixOf "opened\tg\t") <$> outLines world
               firstSuccess ← elem "opened\tg\tsuccess" <$> outLines world
@@ -221,7 +233,7 @@ spec = describe "Terrain lifecycle model" $
               when (early > 0) (check "after an attach before the open was published")
               when (not firstSuccess) $ do
                 void (command "g" "attach")
-                pumpUntil world (advance >> elem "opened\tg\tsuccess" <$> outLines world)
+                advance (elem "opened\tg\tsuccess" <$> outLinesSTM world)
                 writeIORef (sdHandle g) True
               -- the instances' clients are what they are while the instances live: nothing a sequence does adds or ends one
               limitHeld (rgService rig) "clients" >>= writeIORef clientBaseline
@@ -262,8 +274,8 @@ spec = describe "Terrain lifecycle model" $
               stopSpawned pSpawn
               Just gSpawn ← readIORef gSpawnRef
               stopSpawned gSpawn
-              pumpUntil world (advance >> ((== Just Instance.Stopped) <$> phaseOf pSpawn))
-              pumpUntil world (advance >> ((== Just Instance.Stopped) <$> phaseOf gSpawn))
+              advance ((== Just Instance.Stopped) <$> phaseOfSTM pSpawn)
+              advance ((== Just Instance.Stopped) <$> phaseOfSTM gSpawn)
               settleAll
               -- the facade forgets an ended instance (the session does so in the host), and its clients go with it
               forgetInstance (fvFacade pv) (spId pSpawn)

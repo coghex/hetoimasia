@@ -69,7 +69,7 @@ spec = describe "Terrain ownership" $ do
         withFvm world runtime (presentationOver rig) $ \fvm → do
           _ ← spawn world fvm "modules-test" mainPath
           _ ← spawn world fvm "modules-test" mainPath
-          pumpUntil world (advanceClock world 2000000000 >> (elem "B alive" <$> outLines world))
+          stepUntil world (elem "B alive" <$> outLinesSTM world)
           printed ← outLines world
           printed
             `shouldBe` [ "A open\tsuccess"

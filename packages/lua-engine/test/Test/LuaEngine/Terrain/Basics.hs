@@ -62,10 +62,10 @@ spec ∷ Spec
 spec = describe "Terrain basics" $ do
   it "runs the whole surface from a gameplay instance, each request settling at its assigned tick" $
     withRig $ \rig →
-      withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource roundTrip)]) $ \world control runtime →
+      withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource roundTrip)]) $ \world _ runtime →
         withFvm world runtime (gameplayOver rig) $ \fvm → do
           _ ← spawn world fvm "modules-test" mainPath
-          pumpUntil world (tickBy control fvm 1 >> (elem "release\tdone" <$> outLines world))
+          tickUntil fvm (elem "release\tdone" <$> outLinesSTM world)
           found ← outLines world
           found `shouldBe` expected
 
@@ -74,6 +74,6 @@ spec = describe "Terrain basics" $ do
       withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource roundTrip)]) $ \world _ runtime →
         withFvm world runtime (presentationOver rig) $ \fvm → do
           _ ← spawn world fvm "modules-test" mainPath
-          pumpUntil world (advanceClock world 2000000000 >> (elem "release\tdone" <$> outLines world))
+          stepUntil world (elem "release\tdone" <$> outLinesSTM world)
           found ← outLines world
           found `shouldBe` expected
