@@ -7,16 +7,16 @@ and terrain-runtime's README (the precondition guard, the outside staging accoun
 | | |
 | --- | --- |
 | Device | Apple M3 Max, MoltenVK (the pinned Homebrew driver), surface-free targets with a `D32_SFLOAT` depth image |
-| Tested head | `cd68e54a`, on base `26579849` (review round 3) |
+| Tested head | `b5279516`, on base `26579849` (review round 4) |
 | Effective spec | `98a673fb` (review 6909126590): the atlas amendment 6731831183 as amended by reviews 6731944497, 6908703832 and 6909126590 and the decision comments 6908430167 and 6909009968 |
 
 ## Results
 
 | Run | Command | Result |
 | --- | --- | --- |
-| Required native witness | `bash tools/vulkan/run.sh native hetoimasia-lua-engine-graphics:test:lua-engine-graphics-native-tests -- --complete` | 32/32 in 10.00 s on the terrain-disabled host; 4/4 in 3.00 s on the terrain-enabled host; 13.00 s of test time, 20 s wall, under the 30 s rule (`docs/vision.md:272`) |
-| Full qualification | the same suite with `-- --terrain-views-full` | 13/13 in 29.04 s, then the overlap witness on its own held host, 1/1 in 4.74 s |
-| Headless | `bash tools/vulkan/run.sh test hetoimasia-lua-engine-graphics:test:lua-engine-graphics-tests` (group `terrain views`) | 76/76, about 40 s |
+| Required native witness | `bash tools/vulkan/run.sh native hetoimasia-lua-engine-graphics:test:lua-engine-graphics-native-tests -- --complete` | 32/32 in 9.73 s on the terrain-disabled host; 4/4 in 3.07 s on the terrain-enabled host; 12.80 s of test time, 20 s wall, under the 30 s rule (`docs/vision.md:272`) |
+| Full qualification | the same suite with `-- --terrain-views-full` | 13/13 in 27.93 s, then the overlap witness on its own held host, 1/1 in 2.45 s |
+| Headless | `bash tools/vulkan/run.sh test hetoimasia-lua-engine-graphics:test:lua-engine-graphics-tests` (group `terrain views`) | 93/93, about 42 s |
 
 Native commands run on macOS under the standing per-command consent (`HETOIMASIA_NATIVE_SESSION=desktop`);
 the full qualification wrote its files with `HETOIMASIA_VALIDATION_EVIDENCE` set.

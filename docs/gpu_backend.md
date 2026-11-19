@@ -1891,8 +1891,9 @@ own submission and completion. The model's rules are
   fence and records the completion only once it is signalled. A batch still
   held at whole-owner retirement is retained like any outstanding frame-less
   batch, and device loss settles it lost; the hold adds no bypass, timeout or
-  automatic release. Production reads one unset `TVar` per frame-less
-  observation.
+  automatic release. The hold is given when the host is made and fixed for
+  the frames' life (`newFramesWith`); production has none, holds no cell for
+  it and reads nothing more.
 
 ## Destruction order
 
