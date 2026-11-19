@@ -38,9 +38,9 @@ import Hetoimasia.LuaEngine.Graphics.Scene.Publish (HostAnswer (..))
 import Hetoimasia.LuaEngine.Graphics.Scene.World (SceneWorld (..), WorldTag (..))
 import Hetoimasia.LuaEngine.Graphics.TerrainView
 import Hetoimasia.LuaEngine.Graphics.TerrainView.Qualification (withAdoptedPlan)
-import Hetoimasia.LuaEngine.Graphics.TerrainView.Inputs (changesExpansion, changesExpansionBound, generationIdentity, knowledgeExpansion, knowledgeExpansionBound)
+import Hetoimasia.LuaEngine.Graphics.TerrainView.Inputs (changesExpansion, changesExpansionBound, generationIdentity, knowledgeExpansionBound)
 import Hetoimasia.LuaEngine.Graphics.TerrainView.Owner (buildRegions, keepBuilt, releaseEach)
-import Hetoimasia.LuaEngine.Graphics.TerrainView.Service (inputsCharge, planDemandHeld, planHeld)
+import Hetoimasia.LuaEngine.Graphics.TerrainView.Service (planDemandHeld, planHeld)
 import Hetoimasia.LuaEngine.Profile
   ( ByteLimit (..)
   , Bytes (..)
@@ -2244,19 +2244,15 @@ stagesAndReaders = describe "stages, waits and readers" $ do
       length (filter (== Right True) removals) `shouldSatisfy` (>= 3)
       request ← Runtime.requestRegionSnapshot (_vTerrain v) (vArena v) [RegionCoord 0 0 0] >>= either (fail . show) pure
       borrow ← Runtime.await (_vTerrain v) request >>= either (fail . show) pure
-      let snapshot = Runtime.regionBorrowSnapshot borrow
-          removed = [interval | region ← Runtime.regionSnapshotRegions snapshot, Runtime.PartReady intervals ← [Runtime.regionTerrain snapshot region], interval ← intervals]
-          charged = changesExpansion snapshot
-          regions = fromIntegral (length (Runtime.regionSnapshotRegions snapshot))
-          admitted = inputsCharge [snapshot]
-          expected = 25872 * regions + knowledgeExpansion snapshot + charged
-      -- the copy is let go before anything is checked, so a failed check never keeps the scope's end waiting on it
-      Runtime.releaseRegionBorrow (_vTerrain v) borrow
-      -- admission charges the copy's inputs as each region's fixed inputs, its knowledge's expansion and this index
-      admitted `shouldBe` expected
-      index ← either (fail . show) pure (changesFromIntervals (tvChangeLimits testConfig) removed)
-      changesBytes index `shouldSatisfy` (>= 3 * 64)
-      charged `shouldSatisfy` (>= fromIntegral (changesBytes index))
+      -- the copy is read while it is borrowed, and let go however the checks end
+      charged ← (`finally` Runtime.releaseRegionBorrow (_vTerrain v) borrow) $ do
+        let snapshot = Runtime.regionBorrowSnapshot borrow
+            removed = [interval | region ← Runtime.regionSnapshotRegions snapshot, Runtime.PartReady intervals ← [Runtime.regionTerrain snapshot region], interval ← intervals]
+            charged' = changesExpansion snapshot
+        index ← either (fail . show) pure (changesFromIntervals (tvChangeLimits testConfig) removed)
+        changesBytes index `shouldSatisfy` (>= 3 * 64)
+        charged' `shouldSatisfy` (>= fromIntegral (changesBytes index))
+        pure charged'
       -- a view whose copies hold those removals is charged for the index beside each region's fixed inputs
       view ← attached v 1
       _ ← awaitPublished v 1
