@@ -138,6 +138,16 @@ and the suites' verification capture.
   the swapchains it did before and refuses every request. A surface offering
   no transfer-source usage is still admitted, and its capture is refused with
   a typed reason.
+- The test-only completion hold is public, unlike verification capture,
+  because another package's suite needs it (#645's overlap witness):
+  `vulkanCompletionHold`, `Nothing` by default and in every production
+  configuration, set by no library or executable. It holds frame-less batches
+  only, at the one place their completion is recognized: a held batch's fence
+  is not asked, so it stays pending for every reader and everything it uses
+  stays held; letting go completes nothing until a later step observes the
+  fence signalled. It is the one exception to the rule that tests never own a
+  production lifecycle; [`docs/gpu_backend.md`](../../../docs/gpu_backend.md#frame-less-batches)
+  states it in full.
 
 Every Vulkan object is created and destroyed on the graphics owner's thread;
 the controller makes no GLFW call. [`docs/gpu_backend.md`](../../../docs/gpu_backend.md)

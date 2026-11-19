@@ -612,7 +612,9 @@ cabal test hetoimasia-tests --test-show-details=direct
   terrain material's model, drawn again after the Lua handles' release and an edit, with the superseded regions retired and a real empty
   revision handed back at the close. Every run but the probes and the full terrain matrix then starts a second, short session of the
   terrain-enabled host (the host-wide window depth) for `M1 output on the terrain-enabled host`, which opens one real window. The broader
-  terrain-view matrix (every facing, zoom 0.5 and 2, a portrait target) is the separate mode
+  terrain-view matrix (every facing, zoom 0.125, 0.5, 2 and 8, a portrait target, a resized view, a revealed cavity's
+  ordinary, fog and mixed cells, a refused stale replacement keeping the old image, picks judged exactly against the oracle's winning
+  instance, and the overlap witness on its own host session, the only one whose test-only completion hold is set) is the separate mode
   `HETOIMASIA_NATIVE_SESSION=desktop bash tools/vulkan/run.sh native hetoimasia-lua-engine-graphics:test:lua-engine-graphics-native-tests -- --terrain-views-full`,
   accepted alone, run directly with the same checks, and not part of the catalog group. The headless counterpart is the `terrain views`
   group of `lua-engine-graphics-tests` (`test.vulkan-headless`), over the real terrain service and texture pipeline with the scene host

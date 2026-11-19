@@ -1,7 +1,7 @@
 {
   "name": "portrait",
-  "revision": 1,
-  "view": 1, "plan": 1,
+  "revision": 2,
+  "view": 1, "plan": 3,
   "framebuffer": [64, 128],
   "chunks": 4,
   "pixels": 8192, "passed": 8192, "failed": 0, "indeterminate": 0,
