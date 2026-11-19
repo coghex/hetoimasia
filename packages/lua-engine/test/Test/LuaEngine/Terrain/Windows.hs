@@ -1126,7 +1126,10 @@ spec = describe "Terrain windows and banks" $ do
             signalRig rig "first"
             untilPrinted world "first answer\tfailure\tname_in_use"
             stopSpawned opener'
-            tickUntil gameplayVm ((/= Just Instance.Active) <$> phaseOfSTM opener')
+            -- the instance has ended: its pending open's request is ended on its owner's thread after the stop has made it Stopping, and
+            -- it is Stopped only once that drain is done, so the other VM's open is signalled once the host's settlement has freed the
+            -- name, not while it may still be decided against the claim
+            tickUntil gameplayVm (maybe False Instance.isTerminal <$> phaseOfSTM opener')
             signalRig rig "second"
             untilPrinted world "second answer\tsuccess\tnil"
 

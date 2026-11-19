@@ -17,9 +17,9 @@
 --   are exactly zero, and a read of a fresh instance is accepted: nothing a VM left behind keeps another from the capacity.
 module Test.LuaEngine.Terrain.Model (spec) where
 
-import Control.Concurrent.STM (atomically)
+import Control.Concurrent.STM (atomically, retry)
 import Control.Exception (finally)
-import Control.Monad (forM_, replicateM_, void, when)
+import Control.Monad (forM_, replicateM_, unless, void, when)
 import Data.Bits (shiftR, (.&.))
 import Data.List (find)
 import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
@@ -28,10 +28,11 @@ import Data.Text (Text)
 import qualified Hetoimasia.Scripting.Lua.Instance as Instance
 import Hetoimasia.LuaEngine.Terrain (TerrainHooks (..), noTerrainHooks)
 import Hetoimasia.Scripting.Lua.Provider (advanceRequestEpoch)
-import Hetoimasia.Scripting.Lua.Scheduled (scheduledEndpoint)
+import Hetoimasia.Scripting.Lua.Scheduled (Diagnostics (diagCompleted), scheduledDiagnostics, scheduledEndpoint)
 import Hetoimasia.LuaEngine.Profile (CountLimit (RequestsPerInstance, RequestsPerVm))
 import Hetoimasia.Terrain.Runtime (Config (..), censusRequests, defaultConfig, inspectCensusSTM)
 import Test.Hspec
+import Test.Support.Bounded (bounded)
 import Test.LuaEngine.Facade.Support
 import Test.LuaEngine.Request.Profiles (counts)
 import Test.LuaEngine.Terrain.Support
@@ -118,13 +119,22 @@ spec = describe "Terrain lifecycle model" $
               -- one gameplay tick, then one presentation step, until the condition holds: both VMs move, one update at a time
               let advance = tickAndStepUntil gv world
                   settleAll = replicateM_ 6 (tickBy control gv 1)
-                  -- Queue a command for a label, and wait for the instance's answer to it.
+                  -- The presentation owner's segments completed: a step it was woken for has ended.
+                  pCompleted = diagCompleted <$> scheduledDiagnostics (scheduledEndpoint (fvOwner pv))
+                  -- Queue a command for a label, and wait for the instance's answer to it. For p, also for the end of the step that answered:
+                  -- the step pump wakes p and goes on, and the ack is printed inside p's update, before the boundary at which p's owner
+                  -- accounts what the update ended (a read started and taken in it, 'readtake'), so a check read at the ack can find the
+                  -- service still holding it. p is first let finish a step another command's pump woke (it has armed its timer again: only p
+                  -- arms one), so the first step woken after the command is queued is the one that answers it, and the step it completes
+                  -- past the count read then is that one.
                   command label text = do
+                    pBefore ← if label == "p" then Just <$> (awaitTimers world 1 >> atomically pCompleted) else pure Nothing
                     n ← atomicModifyIORef'' serial
                     modifyIORef' tally (Text.takeWhile (/= ' ') text :)
                     sendCommand rig label (Text.pack (show n) <> " " <> text)
                     let wanted = "ack\t" <> Text.pack (show n) <> "\t"
                     advance (any (Text.isPrefixOf wanted) <$> outLinesSTM world)
+                    forM_ pBefore $ \count → bounded (atomically (pCompleted >>= \now → unless (now > count) retry))
                     printed ← outLines world
                     pure (maybe "" (Text.drop (Text.length wanted)) (find (Text.isPrefixOf wanted) printed))
                   sideOf label = if label == "p" then p else g
