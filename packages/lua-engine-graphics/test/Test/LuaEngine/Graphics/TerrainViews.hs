@@ -1982,15 +1982,17 @@ stagesAndReaders = describe "stages, waits and readers" $ do
       _ ← awaitPublished v 1
       quiescent v
       demandResident v view
-      atomically (writeTVar (foHoldUploads owner) True)
-      -- an edit's rebuild is built and its uploads held: the view waits in its uploading stage
-      removeWith v (tileAt 9 9 3) Nothing `shouldReturn` Right True
-      bounded (atomically (readTVar (foStanding owner) >>= check . elem ChunkUploading . Map.elems))
-      _ ← Runtime.releaseLease (_vTerrain v) (vArena v)
-      bounded (atomically (viewClosed view >>= check))
-      atomically (claimOf (vClaims v) 1) `shouldReturn` Nothing
-      atomically (terrainViewsFailures (vViews v)) >>= (`shouldSatisfy` any ("arena authority" `Text.isInfixOf`))
-      atomically (writeTVar (foHoldUploads owner) False >> modifyTVar' (foStanding owner) (Map.map (const ChunkReady)))
+      -- the held uploads end on every exit, so a failure is reported rather than holding the scope's end
+      let endUploads = atomically (writeTVar (foHoldUploads owner) False >> modifyTVar' (foStanding owner) (Map.map (const ChunkReady)))
+      (`finally` endUploads) $ do
+        atomically (writeTVar (foHoldUploads owner) True)
+        -- an edit's rebuild is built and its uploads held: the view waits in its uploading stage
+        removeWith v (tileAt 9 9 3) Nothing `shouldReturn` Right True
+        bounded (atomically (readTVar (foStanding owner) >>= check . elem ChunkUploading . Map.elems))
+        _ ← Runtime.releaseLease (_vTerrain v) (vArena v)
+        bounded (atomically (viewClosed view >>= check))
+        atomically (claimOf (vClaims v) 1) `shouldReturn` Nothing
+        atomically (terrainViewsFailures (vViews v)) >>= (`shouldSatisfy` any ("arena authority" `Text.isInfixOf`))
 
   it "keeps two views that cannot fund their first copies asleep until room returns, however each other's copies come and go" $
     withViews $ \v → do
@@ -2094,11 +2096,12 @@ stagesAndReaders = describe "stages, waits and readers" $ do
       armSeam seam 1 "copying" 1 (SeamHold opened)
       view ← attached v 1
       awaitSeamFired seam
-      atomically (updateCamera view (CameraIntent [Camera.SetZoom 2])) `shouldReturn` Right ()
-      atomically (updateCamera view (CameraIntent [Camera.SetFacing FaceEast])) `shouldReturn` Right ()
-      -- a pan follows the surface: it waits for the facts
-      atomically (updateCamera view (CameraIntent [Camera.Pan 1 0])) `shouldReturn` Left IntentBusy
-      atomically (writeTVar opened True)
+      -- the held copy goes on on every exit, so a failure is reported rather than holding the scope's end
+      (`finally` atomically (writeTVar opened True)) $ do
+        atomically (updateCamera view (CameraIntent [Camera.SetZoom 2])) `shouldReturn` Right ()
+        atomically (updateCamera view (CameraIntent [Camera.SetFacing FaceEast])) `shouldReturn` Right ()
+        -- a pan follows the surface: it waits for the facts
+        atomically (updateCamera view (CameraIntent [Camera.Pan 1 0])) `shouldReturn` Left IntentBusy
       _ ← awaitPublished v 1
       world ← latestWorld v 1
       cameraZoom (viewCamera (worldView world)) `shouldBe` 2
