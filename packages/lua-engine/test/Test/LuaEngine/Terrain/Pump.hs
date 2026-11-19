@@ -3,23 +3,25 @@
 -- | The examples of the pump the terrain set steps its scripts with (#692): 'stepNext' and what is built on it in
 -- "Test.LuaEngine.Facade.Support", over real supervised presentation and gameplay owners and the world's fake timer; one example
 -- holds a peer VM in its update at the terrain rig's @TEST_WAIT@ fixture. Every wait is coordinated (a registration, a thread parked
--- in a transaction, a printed line, a fixture entered); the only timed wait is the bound two examples make fire on purpose, short,
--- around an operation that can never end otherwise.
+-- in a transaction, a printed line, a fixture entered), and the two examples of the bound make it fire at a coordinated point, with an
+-- exception of their own. A helper thread's own outcome is the example's: what it raised is raised again where the example waits.
 module Test.LuaEngine.Terrain.Pump (spec) where
 
-import Control.Concurrent.STM (atomically, newTVarIO, readTVar, readTVarIO, writeTVar)
-import Control.Exception (ErrorCall (ErrorCall), finally, throwIO, try)
-import Data.Either (isLeft)
-import Data.IORef (readIORef)
+import Control.Concurrent (ThreadId, myThreadId, throwTo)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import Control.Concurrent.STM (atomically, check, newTVarIO, readTVar, readTVarIO, writeTVar)
+import Control.Exception (Exception (toException), SomeException, finally, throwIO, try)
+import Data.IORef (modifyIORef', newIORef, readIORef)
 import Data.Text (Text)
 import Data.Word (Word64)
 import qualified Data.Text as Text
 import Hetoimasia.LuaEngine.Profile (fixedM1Profile)
+import Hetoimasia.Scripting.Lua.Scheduled (scheduledEndpoint, ticksOutstanding)
 import Hetoimasia.Scripting.Lua.Scheduler (TimerBackend (..))
-import System.Timeout (timeout)
 import Test.Hspec
 import Test.LuaEngine.Facade.Support
-import Test.LuaEngine.Terrain.Support (Rig (rgTrace), presentationOver, signalRig, withRig)
+import Test.LuaEngine.Terrain.Support (Rig (rgTrace), gameplayOver, presentationOver, signalRig, withRig)
+import Test.Support.Bounded (bounded)
 import Test.Support.Owned (withOwnedThread)
 
 -- | A script whose every update prints how many updates it has run.
@@ -37,9 +39,31 @@ oneSecond = 1000000000
 counted ∷ Int → [Text]
 counted n = ["n=" <> Text.pack (show k) | k ← [1 .. n]]
 
--- | A bound that fires after a fifth of a second: for an operation that must be ended by the bound around the whole of it.
-shortBound ∷ IO () → IO ()
-shortBound action = timeout 200000 action >>= maybe (throwIO (ErrorCall "the bound fired")) pure
+-- | What the examples' own bound raises when it fires: told apart from every other way an operation can end.
+data BoundFired = BoundFired deriving (Eq, Show)
+
+instance Exception BoundFired
+
+-- | A bound for 'stepUntilWithin' that fires at a coordinated point: it counts how many times it is entered, and once the wait it
+-- is given (of the thread it bounds) has returned it raises 'BoundFired' in that thread, the way a timeout would. A wait that
+-- fails raises its failure there instead, so the operation never outlives a bound that could not fire.
+firingAfter ∷ (ThreadId → IO ()) → IO (IO () → IO (), IO Int)
+firingAfter wait = do
+  entered ← newIORef (0 ∷ Int)
+  let bound action = do
+        modifyIORef' entered (+ 1)
+        self ← myThreadId
+        let fire = try @SomeException (wait self) >>= throwTo self . either id (const (toException BoundFired))
+        withOwnedThread fire (\_ _ → action)
+  pure (bound, readIORef entered)
+
+-- | 'withOwnedThread' whose body is given a wait for the action's end that answers what it returned, and raises again what it
+-- raised (a failure of the action is the example's, not the end of a thread).
+withChild ∷ IO a → (ThreadId → IO a → IO b) → IO b
+withChild action body = do
+  outcome ← newEmptyMVar
+  withOwnedThread (try @SomeException action >>= putMVar outcome) $ \thread ended →
+    body thread (ended >> takeMVar outcome >>= either throwIO pure)
 
 -- | Run a body over one presentation VM of the counter, not yet admitted.
 withCounterVm ∷ (World → Fvm → IO a) → IO a
@@ -63,14 +87,14 @@ spec = describe "The Lua test pump" $ do
 
   it "waits, without waking anything, for a registration that has not appeared, and wakes it once when it does" $
     withCounterVm $ \world fvm →
-      withOwnedThread (stepOnce world) $ \stepping ended → do
+      withChild (stepOnce world) $ \stepping ended → do
         -- nothing is registered: the step waits in its transaction
         awaitBlockedOnSTM stepping
         outLines world `shouldReturn` []
         -- the instance's first point is registered when its init has run: the step wakes exactly that one
         _ ← spawn world fvm "modules-test" mainPath
         ended
-        _ ← awaitOut world 1
+        _ ← bounded (awaitOut world 1)
         awaitTimers world 1
         outLines world `shouldReturn` counted 1
 
@@ -81,7 +105,7 @@ spec = describe "The Lua test pump" $ do
       let TimerBackend arm = worldTimer world
       cancel ← arm 1000 (atomically (writeTVar first True))
       cancel
-      withOwnedThread (stepOnce world) $ \stepping ended → do
+      withChild (stepOnce world) $ \stepping ended → do
         awaitBlockedOnSTM stepping
         _ ← arm 2000 (atomically (writeTVar second True))
         ended
@@ -90,7 +114,7 @@ spec = describe "The Lua test pump" $ do
   it "stops when the condition holds, with nothing registered, and claims nothing when it already holds" $
     withWorld fixedM1Profile (Layout []) $ \world _ _ → do
       stop ← newTVarIO False
-      withOwnedThread (stepUntil world (readTVar stop)) $ \stepping ended → do
+      withChild (stepUntil world (readTVar stop)) $ \stepping ended → do
         awaitBlockedOnSTM stepping
         atomically (writeTVar stop True)
         ended
@@ -141,14 +165,18 @@ spec = describe "The Lua test pump" $ do
   it "bounds the whole pumping operation once: steps that each end are still ended by the bound around them" $
     withCounterVm $ \world fvm → do
       _ ← spawn world fvm "modules-test" mainPath
-      ended ← try @ErrorCall (stepUntilWithin shortBound world (pure False))
-      ended `shouldSatisfy` isLeft
-      length <$> outLines world >>= (`shouldSatisfy` (> 0))
+      -- the bound fires once three updates have printed: three steps each ended, and the operation did not
+      (bound, entered) ← firingAfter (\_ → atomically (outLinesSTM world >>= check . (>= 3) . length))
+      try (stepUntilWithin bound world (pure False)) `shouldReturn` Left BoundFired
+      entered `shouldReturn` 1
+      take 3 <$> outLines world `shouldReturn` counted 3
 
   it "fails by the bound, rather than waiting on, a registration that never appears" $
     withWorld fixedM1Profile (Layout []) $ \world _ _ → do
-      ended ← try @ErrorCall (stepUntilWithin shortBound world (pure False))
-      ended `shouldSatisfy` isLeft
+      -- the bound fires once the step is parked in its transaction, waiting for a registration
+      (bound, entered) ← firingAfter awaitBlockedOnSTM
+      try (stepUntilWithin bound world (pure False)) `shouldReturn` Left BoundFired
+      entered `shouldReturn` 1
 
   it "grants a gameplay VM one tick at a time: waiting for the third update's line grants three ticks" $
     withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource counter)]) $ \world control runtime →
@@ -158,3 +186,25 @@ spec = describe "The Lua test pump" $ do
         -- the tick that ran the third update completes, and no other was granted
         awaitTickDone control fvm
         outLines world `shouldReturn` counted 3
+
+  it "drives a presentation VM on while the gameplay VM beside it is held in a granted tick, and grants that VM no other tick" $
+    withRig $ \rig →
+      withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource counter), ("lua/held.lua", scriptSource held)]) $ \world control runtime →
+        -- however the example ends, the gameplay VM is let go before its owner is retired
+        withFvm world runtime (gameplayOver rig) $ \gameplay → (`finally` signalRig rig "hold") $ withFvm world runtime presentationShape $ \shown → do
+          let outstanding = atomically (ticksOutstanding (scheduledEndpoint (fvOwner gameplay)))
+          _ ← spawn world gameplay "modules-test" "lua/held.lua"
+          -- the first granted tick runs the gameplay VM's update, which stays at the fixture: that tick is outstanding
+          tickUntil gameplay (elem "entered hold" <$> readTVar (rgTrace rig))
+          outstanding `shouldReturn` 1
+          _ ← spawn world shown "modules-test" mainPath
+          -- the drive needs three presentation updates while the tick is outstanding: it steps the presentation VM, three times
+          tickAndStepUntil gameplay world (elem "n=3" <$> outLinesSTM world)
+          awaitTimers world 1
+          outLines world `shouldReturn` counted 3
+          outstanding `shouldReturn` 1
+          readTVarIO (rgTrace rig) `shouldReturn` ["entered hold"]
+          -- let go, the gameplay VM ends that update and its tick completes; no other tick was granted meanwhile
+          signalRig rig "hold"
+          awaitTickDone control gameplay
+          readTVarIO (rgTrace rig) `shouldReturn` ["released hold", "entered hold"]

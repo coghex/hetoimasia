@@ -55,8 +55,6 @@ module Test.LuaEngine.Facade.Support
   , awaitWaiting
   , pumpUntil
   , stepNext
-  , Stepped (..)
-  , stepIfRegistered
   , tickAndStepUntil
   , stepUntil
   , stepUntilWithin
@@ -121,6 +119,7 @@ import Control.Concurrent.STM
   , atomically
   , modifyTVar'
   , newTVarIO
+  , orElse
   , readTVar
   , readTVarIO
   , retry
@@ -557,45 +556,26 @@ awaitWaiting fvm wanted = bounded . atomically $ do
 -- next step's stop condition, and that VM's own next update still waits for a step. An example's own 'advanceClock' or 'setClock'
 -- moves every VM's clock, as it always did.
 stepNext ∷ World → STM Bool → IO Bool
-stepNext world stop = (== StepStopped) <$> stepWith True world stop
-
--- | What one step did.
-data Stepped
-  = -- | The stop condition held: nothing was claimed and no clock moved.
-    StepStopped
-  | -- | A registration was claimed and woken.
-    StepWoke
-  | -- | Nothing was live, and the step was not asked to wait for a registration ('stepIfRegistered').
-    StepNothingLive
-  deriving (Eq, Show)
-
--- | 'stepNext' that does not wait for a registration to appear: for a drive that also grants logical ticks, whose presentation
--- VM may have nothing armed.
-stepIfRegistered ∷ World → STM Bool → IO Stepped
-stepIfRegistered = stepWith False
-
-stepWith ∷ Bool → World → STM Bool → IO Stepped
-stepWith waitForOne world stop = do
-  let timer = wTimer world
+stepNext world stop = do
   claimed ← atomically $ do
     stopped ← stop
     if stopped
-      then pure (Left StepStopped)
+      then pure Nothing
       else
-        liveList timer >>= \case
-          []
-            | waitForOne → retry
-            | otherwise → pure (Left StepNothingLive)
-          next : _ → Right next <$ writeTVar (regLive next) False
-  case claimed of
-    Left stepped → pure stepped
-    Right next → do
-      base ← readIORef (wClock world)
-      case regVm next of
-        Just (_, VmClock ahead) → atomicModifyIORef' ahead (\extra → (if regDeadline next > base + extra then regDeadline next - base else extra, ()))
-        Nothing → atomicModifyIORef' (wClock world) (\now → (max now (regDeadline next), ()))
-      regWake next
-      pure StepWoke
+        liveList (wTimer world) >>= \case
+          [] → retry
+          next : _ → Just next <$ writeTVar (regLive next) False
+  maybe (pure True) (\next → False <$ wakeClaimed world next) claimed
+
+-- | Wake a registration a step has claimed: move the clock of the VM that armed it to exactly its deadline (never back, never
+-- beyond; the world's clock, for a registration of no VM) and wake it, once.
+wakeClaimed ∷ World → Registration → IO ()
+wakeClaimed world next = do
+  base ← readIORef (wClock world)
+  case regVm next of
+    Just (_, VmClock ahead) → atomicModifyIORef' ahead (\extra → (if regDeadline next > base + extra then regDeadline next - base else extra, ()))
+    Nothing → atomicModifyIORef' (wClock world) (\now → (max now (regDeadline next), ()))
+  regWake next
 
 -- | Step until the stop condition holds: one bound ('bounded') over the whole operation, not one per step.
 stepUntil ∷ World → STM Bool → IO ()
@@ -638,16 +618,37 @@ tickUntil fvm stop = bounded loop
   where
     loop = tickNext fvm stop >>= \stopped → unless stopped loop
 
--- | Drive a gameplay VM and the presentation VMs beside it together until the condition holds: each round one tick ('tickNext')
--- and then one step ('stepIfRegistered'), the condition decided before each; one bound over the whole operation.
+-- | Drive a gameplay VM and the presentation VMs beside it together until the condition holds; one bound over the whole operation.
+-- Each round is one transaction that decides the condition and, when it does not hold, makes one move: it grants the gameplay VM a
+-- tick when none granted before is outstanding ('tickNext'), or claims the oldest live registration ('stepNext'), and it waits
+-- (retry, no sleep) while neither can be made. When both can, it makes the kind the last round did not (a tick first, then a step,
+-- and so on), so the two are paced as before. A gameplay VM held in its update during a tick (a script at a fixture's wait) never
+-- keeps the presentation VMs from being stepped, and no tick is granted to it while that one is outstanding; a presentation VM with
+-- nothing armed never keeps the ticks from being granted.
 tickAndStepUntil ∷ Fvm → World → STM Bool → IO ()
-tickAndStepUntil fvm world stop = bounded loop `onException` explainSteps world
+tickAndStepUntil fvm world stop = bounded (loop True) `onException` explainSteps world
   where
-    loop =
-      tickNext fvm stop >>= \stopped → unless stopped $
-        stepIfRegistered world stop >>= \case
-          StepStopped → pure ()
-          _ → loop
+    endpoint = scheduledEndpoint (fvOwner fvm)
+    loop tickFirst = do
+      one ← either (\refused → assertFailure (show refused)) pure (durationFromNanoseconds RequirePositive 1)
+      let tick = do
+            outstanding ← ticksOutstanding endpoint
+            when (outstanding > 0) retry
+            Left <$> grantScheduledStepSTM endpoint one
+          claim =
+            liveList (wTimer world) >>= \case
+              [] → retry
+              next : _ → Right next <$ writeTVar (regLive next) False
+      moved ← atomically $ do
+        stopped ← stop
+        if stopped
+          then pure Nothing
+          else Just <$> if tickFirst then tick `orElse` claim else claim `orElse` tick
+      case moved of
+        Nothing → pure ()
+        Just (Left GrantAccepted {}) → loop False
+        Just (Left refused) → assertFailure ("the tick was not granted: " <> show refused)
+        Just (Right next) → wakeClaimed world next >> loop True
 
 -- | What the step was waiting for, when a pumping operation did not end: the world's clock and the live registrations, each with
 -- its VM, its length, its deadline on that VM's clock and how far ahead of the world that clock is.

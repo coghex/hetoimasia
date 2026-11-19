@@ -17,9 +17,9 @@
 --   are exactly zero, and a read of a fresh instance is accepted: nothing a VM left behind keeps another from the capacity.
 module Test.LuaEngine.Terrain.Model (spec) where
 
-import Control.Concurrent.STM (atomically, retry)
+import Control.Concurrent.STM (atomically)
 import Control.Exception (finally)
-import Control.Monad (forM_, replicateM_, unless, void, when)
+import Control.Monad (forM_, replicateM_, void, when)
 import Data.Bits (shiftR, (.&.))
 import Data.List (find)
 import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
@@ -28,7 +28,7 @@ import Data.Text (Text)
 import qualified Hetoimasia.Scripting.Lua.Instance as Instance
 import Hetoimasia.LuaEngine.Terrain (TerrainHooks (..), noTerrainHooks)
 import Hetoimasia.Scripting.Lua.Provider (advanceRequestEpoch)
-import Hetoimasia.Scripting.Lua.Scheduled (Diagnostics (diagCompleted), scheduledDiagnostics, scheduledEndpoint)
+import Hetoimasia.Scripting.Lua.Scheduled (AccountingWait (AccountingComplete), awaitScheduledAccounting, scheduledEndpoint)
 import Hetoimasia.LuaEngine.Profile (CountLimit (RequestsPerInstance, RequestsPerVm))
 import Hetoimasia.Terrain.Runtime (Config (..), censusRequests, defaultConfig, inspectCensusSTM)
 import Test.Hspec
@@ -119,22 +119,20 @@ spec = describe "Terrain lifecycle model" $
               -- one gameplay tick, then one presentation step, until the condition holds: both VMs move, one update at a time
               let advance = tickAndStepUntil gv world
                   settleAll = replicateM_ 6 (tickBy control gv 1)
-                  -- The presentation owner's segments completed: a step it was woken for has ended.
-                  pCompleted = diagCompleted <$> scheduledDiagnostics (scheduledEndpoint (fvOwner pv))
-                  -- Queue a command for a label, and wait for the instance's answer to it. For p, also for the end of the step that answered:
-                  -- the step pump wakes p and goes on, and the ack is printed inside p's update, before the boundary at which p's owner
-                  -- accounts what the update ended (a read started and taken in it, 'readtake'), so a check read at the ack can find the
-                  -- service still holding it. p is first let finish a step another command's pump woke (it has armed its timer again: only p
-                  -- arms one), so the first step woken after the command is queued is the one that answers it, and the step it completes
-                  -- past the count read then is that one.
+                  -- Queue a command for a label, and wait for the instance's answer to it. For p, also for p's owner to account for the
+                  -- update that answered: the step pump wakes p and goes on, the ack is printed inside p's update, and what the update ended
+                  -- (a read started and taken in it, 'readtake') is accounted at the boundary after p's turn, by the providers' polling and
+                  -- the credit release there. The owner's accounting acknowledgement is written as the last step of a boundary that begins
+                  -- after the wait does, so it follows the answering update's boundary whether that update is still running or not; it wakes
+                  -- p's owner for a boundary only, never for another update. Not for p's open: the host's adoption of it is at p's
+                  -- boundary, held at the gate on the gated seeds until after the command, and the example waits for its answer by its line.
                   command label text = do
-                    pBefore ← if label == "p" then Just <$> (awaitTimers world 1 >> atomically pCompleted) else pure Nothing
                     n ← atomicModifyIORef'' serial
                     modifyIORef' tally (Text.takeWhile (/= ' ') text :)
                     sendCommand rig label (Text.pack (show n) <> " " <> text)
                     let wanted = "ack\t" <> Text.pack (show n) <> "\t"
                     advance (any (Text.isPrefixOf wanted) <$> outLinesSTM world)
-                    forM_ pBefore $ \count → bounded (atomically (pCompleted >>= \now → unless (now > count) retry))
+                    when (label == "p" && text /= "open") (bounded (awaitScheduledAccounting control (fvOwner pv)) >>= (`shouldBe` AccountingComplete))
                     printed ← outLines world
                     pure (maybe "" (Text.drop (Text.length wanted)) (find (Text.isPrefixOf wanted) printed))
                   sideOf label = if label == "p" then p else g
