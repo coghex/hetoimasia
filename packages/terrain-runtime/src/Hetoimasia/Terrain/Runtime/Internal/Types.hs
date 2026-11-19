@@ -1260,6 +1260,11 @@ data SlotTask = SlotTask
   , -- | The decision found the host not eligible, or the staging moved: the transaction is
     -- aborted (no write) and the slot given up; the request waits again.
     slotYield ∷ !Bool
+  , -- | The committed version and the oldest reader pin of the arena's store at the grant: the store
+    -- the run plans against. Internal work that ends finding nothing it could do is marked idle at
+    -- this, never at the store's state when it ends: a pin released while the plan ran is a change
+    -- the plan did not see, so the work is offered again ('stateInternalIdle').
+    slotBasis ∷ !(Word64, Maybe Word64)
   }
 
 -- | A closed arena's backing, kept until everything of it has drained and its file has

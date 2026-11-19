@@ -259,7 +259,11 @@ cabal test hetoimasia-tests --test-show-details=direct
   separately compiled client of the generic data-map boundary that cannot forge a retained texture, an account, a reservation
   or a version. The fixed M1 scene schema (LFE-19, `Test.LuaEngine.Scene.*`, `--match Scene`) is covered on real instances that own real textures behind the injected backend and a controlled sink: the schema's accepted and refused tables, the colour and geometry rules, the limits at the limit and one past under the fixed and smaller profiles, the calling instance's texture authority, refusals as ordinary Lua errors, and the translation to the renderer's snapshot under its validation, draw plan and oracle; the host's per-binding argument limits are `lua-host-tests`' (`Test.Lua.Boundary.ArgumentLimits`) and the non-throwing lease borrow `lua-runtime-tests`' (`Test.LuaRuntime.Instance.Lease.*`). The module coordinator (LFE-11, `Test.LuaEngine.Modules.*`, `--match Modules`): real modules through real VMs on supervised scheduled owners over a real content root, inventory and read pool, with the production reader behind gates and nothing slept, and a separately compiled client. The authoring facade (LFE-12, `Test.LuaEngine.Facade.*`, `--match Facade`): the accepted P-72 example, every call's schema table-driven in every role and phase, instance ownership, the lexical import and the instance-rooted requests, the request records, the role clocks and waits under an injected clock and fake timer, print and warn with their exact bound, the sinks under contention and failure, and a separately compiled client, on real instances over a real content root, inventory and read pool with recording sinks and nothing slept. It starts no window or GPU; its one example of the Lua host's
   module loader under the fixed profile (`Test.LuaEngine.Loader`, LFE-9) starts an in-process Lua owner. The terrain calls (TRA-5,
-  TRA-23, `Test.LuaEngine.Terrain.*`, `--match Terrain`) run real Lua over the production backed terrain service; the storage examples
+  TRA-23, `Test.LuaEngine.Terrain.*`, `--match Terrain`) run real Lua over the production backed terrain service, each script
+  stepped one update at a time by the pump of `Test.LuaEngine.Facade.Support` (its own examples: `Test.LuaEngine.Terrain.Pump`);
+  every example of that set runs in its place on one capability and once more, last, on 2 capabilities
+  ([the pass](test_classification.md#the-multi-capability-pass); the set is named in
+  `Test.LuaEngine.Terrain.Spec`); the storage examples
   (`Test.LuaEngine.Terrain.Storage`, `Test.LuaEngine.Terrain.StorageFaults`) inject native faults and causal gates through the terrain
   service's test-only library (`hetoimasia-terrain-runtime:testing`, this suite's fixture `Test.LuaEngine.Terrain.Seam`). A new
   manifest or profile example belongs there, in the component spec that owns it.
@@ -608,7 +612,9 @@ cabal test hetoimasia-tests --test-show-details=direct
   terrain material's model, drawn again after the Lua handles' release and an edit, with the superseded regions retired and a real empty
   revision handed back at the close. Every run but the probes and the full terrain matrix then starts a second, short session of the
   terrain-enabled host (the host-wide window depth) for `M1 output on the terrain-enabled host`, which opens one real window. The broader
-  terrain-view matrix (every facing, zoom 0.5 and 2, a portrait target) is the separate mode
+  terrain-view matrix (every facing, zoom 0.125, 0.5, 2 and 8, a portrait target, a resized view, a revealed cavity's
+  ordinary, fog and mixed cells, a refused stale replacement keeping the old image, picks judged exactly against the oracle's winning
+  instance, and the overlap witness on its own host session, the only one whose test-only completion hold is set) is the separate mode
   `HETOIMASIA_NATIVE_SESSION=desktop bash tools/vulkan/run.sh native hetoimasia-lua-engine-graphics:test:lua-engine-graphics-native-tests -- --terrain-views-full`,
   accepted alone, run directly with the same checks, and not part of the catalog group. The headless counterpart is the `terrain views`
   group of `lua-engine-graphics-tests` (`test.vulkan-headless`), over the real terrain service and texture pipeline with the scene host

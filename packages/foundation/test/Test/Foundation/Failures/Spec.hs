@@ -11,8 +11,8 @@
 module Test.Foundation.Failures.Spec (spec) where
 
 import Control.Concurrent (killThread)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar, tryPutMVar)
-import Control.Concurrent.STM (STM, atomically, catchSTM, newTVarIO, readTVarIO, throwSTM, writeTVar)
+import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, takeMVar, tryPutMVar)
+import Control.Concurrent.STM (STM, TVar, atomically, catchSTM, check, modifyTVar', newTVarIO, orElse, readTVar, readTVarIO, throwSTM, writeTVar)
 import Control.Exception
   ( AsyncException (ThreadKilled)
   , Exception
@@ -21,6 +21,7 @@ import Control.Exception
   , SomeException
   , annotateIO
   , catchNoPropagate
+  , finally
   , fromException
   , rethrowIO
   , throw
@@ -30,9 +31,9 @@ import Control.Exception
   )
 import Control.Exception.Annotation (ExceptionAnnotation)
 import Control.Exception.Context (displayExceptionContext, getExceptionAnnotations)
-import Control.Monad (void)
+import Control.Monad (void, when)
 import Control.Monad.IO.Class (liftIO)
-import Data.IORef (newIORef, readIORef, writeIORef)
+import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (isInfixOf, isPrefixOf)
 import Data.Text (Text)
 import qualified Data.Text as Text
@@ -47,6 +48,7 @@ import Hetoimasia.Foundation.Failure
   , failureEvidence
   , failureEvidenceInContext
   , operation
+  , catchSTMRestarting
   , throwFailure
   , throwFailureSTM
   , withOperationContext
@@ -69,6 +71,10 @@ import System.IO (IOMode (ReadMode), openFile)
 import System.IO.Error (ioeGetErrorString, isDoesNotExistError)
 import System.IO.Temp (withSystemTempDirectory)
 import System.Timeout (timeout)
+import Foreign.Marshal.Alloc (free, malloc)
+import Foreign.Ptr (Ptr)
+import Foreign.Storable (peek, poke)
+import GHC.Conc (unsafeIOToSTM)
 import Test.Hspec
   ( Expectation
   , Spec
@@ -145,6 +151,22 @@ spec = describe "Failures" $ do
       testSTMFaultingIdentifier
     it "rolls back an escaping transaction and only the caught action's writes"
       testSTMRollback
+
+  describe "Catching inside STM without a nested rerun" $ do
+    it "restarts the whole transaction when the caught action's commit finds what it read changed"
+      (boundedExample testRestartingStale)
+    it "is needed: a bare catchSTM reruns the action alone against the stale transaction"
+      (boundedExample testBareCatchReruns)
+    it "commits the action's result and writes when nothing is raised"
+      testRestartingCommits
+    it "rolls back only the caught action's writes and hands the handler its exception"
+      testRestartingRollback
+    it "lets an exception the handler does not match, and one the handler raises, propagate"
+      testRestartingPropagates
+    it "lets a retry in the caught action retry the whole transaction, never running the handler"
+      (boundedExample testRestartingRetry)
+    it "lets a retry in the caught action select an enclosing orElse's alternative, never running the handler"
+      testRestartingRetryAlternative
 
 -- Fixtures -------------------------------------------------------------------
 
@@ -645,3 +667,133 @@ testSTMRollback = do
   caught `shouldBe` Just (WidgetBroken 7)
   readTVarIO before `shouldReturnValue` 1
   readTVarIO guarded `shouldReturnValue` 0
+
+-- Catching inside STM without a nested rerun -------------------------------------
+
+-- | Raised by 'guardedRead' once it has run 'rerunCap' times, so an action run again without end
+-- fails the example instead of hanging it.
+data ReranAgainstStale = ReranAgainstStale
+  deriving stock (Show)
+
+instance Exception ReranAgainstStale
+
+-- | Runs of 'guardedRead' that count as running again without end.
+rerunCap ∷ Int
+rerunCap = 10000
+
+-- | Read the shared value and count the run without allocating, so that a run repeated against a stale
+-- transaction never reaches a heap check: under a bare 'catchSTM' it would run forever, so it raises
+-- at 'rerunCap'.
+guardedRead ∷ TVar Int → Ptr Int → STM ()
+guardedRead shared runs = do
+  seen ← readTVar shared
+  n ← unsafeIOToSTM $ do
+    counted ← peek runs
+    poke runs (counted + 1)
+    pure (counted + 1)
+  when (n >= rerunCap) (throwSTM ReranAgainstStale)
+  seen `seq` pure ()
+
+-- | One transaction reads a value, then, in its first attempt only, waits while another thread
+-- commits a change to it, then reads it again in an action guarded by the given catch. Answers the
+-- transaction's attempts and the guarded action's runs. Coordinated by an 'MVar', on any number of
+-- capabilities, with no timing.
+staleGuarded ∷ (STM () → (ReranAgainstStale → STM ()) → STM ()) → IO (Int, Int)
+staleGuarded catching = do
+  shared ← newTVarIO (0 ∷ Int)
+  attempts ← newIORef (0 ∷ Int)
+  shot ← newIORef True
+  go ← newEmptyMVar
+  written ← newEmptyMVar
+  runs ← malloc
+  flip finally (free runs) $
+    -- the other thread commits its change only when the transaction asks for it, and is joined after
+    withOwnedThread (takeMVar go >> atomically (modifyTVar' shared (+ 1)) >> putMVar written ()) $ \_ joined → do
+      poke runs 0
+      atomically $ do
+        unsafeIOToSTM (atomicModifyIORef' attempts (\n → (n + 1, ())))
+        readTVar shared >>= \seen → seen `seq` pure ()
+        unsafeIOToSTM (changeOnce shot go written)
+        guardedRead shared runs `catching` \ReranAgainstStale → pure ()
+      joined
+      (,) <$> readIORef attempts <*> peek runs
+
+-- | The first time only: ask the other thread to commit its change, and wait for it.
+changeOnce ∷ IORef Bool → MVar () → MVar () → IO ()
+changeOnce shot go written = do
+  first ← readIORef shot
+  when first $ do
+    writeIORef shot False
+    putMVar go ()
+    takeMVar written
+
+testRestartingStale ∷ Expectation
+testRestartingStale = do
+  (attempts, runs) ← staleGuarded catchSTMRestarting
+  -- The change made the first attempt stale, so the transaction ran twice, and the action once in each.
+  (attempts, runs) `shouldBe` (2, 2)
+
+testBareCatchReruns ∷ Expectation
+testBareCatchReruns = do
+  (attempts, runs) ← staleGuarded catchSTM
+  -- The first attempt reran the action alone until it raised; only the transaction's own commit restarted it.
+  attempts `shouldBe` 2
+  runs `shouldBe` rerunCap + 1
+
+testRestartingRollback ∷ Expectation
+testRestartingRollback = do
+  before ← newTVarIO (0 ∷ Int)
+  guarded ← newTVarIO (0 ∷ Int)
+  caught ← atomically $ do
+    writeTVar before 1
+    (writeTVar guarded 1 >> failWidgetSTM (WidgetBroken 8) >> pure Nothing)
+      `catchSTMRestarting` \(failure ∷ WidgetFailure) → pure (Just failure)
+  caught `shouldBe` Just (WidgetBroken 8)
+  readTVarIO before `shouldReturnValue` 1
+  readTVarIO guarded `shouldReturnValue` 0
+
+testRestartingCommits ∷ Expectation
+testRestartingCommits = do
+  guarded ← newTVarIO (0 ∷ Int)
+  answer ← atomically $
+    (writeTVar guarded 1 >> pure "done")
+      `catchSTMRestarting` \(_ ∷ WidgetFailure) → pure ("caught" ∷ Text)
+  answer `shouldBe` "done"
+  readTVarIO guarded `shouldReturnValue` 1
+
+testRestartingPropagates ∷ Expectation
+testRestartingPropagates = do
+  guarded ← newTVarIO (0 ∷ Int)
+  unmatched ←
+    try . atomically $
+      (writeTVar guarded 1 >> failWidgetSTM (WidgetBroken 9) >> pure ())
+        `catchSTMRestarting` \(_ ∷ IOException) → pure ()
+  unmatched `shouldBe` Left (WidgetBroken 9)
+  fromHandler ←
+    try . atomically $
+      (writeTVar guarded 1 >> failWidgetSTM (WidgetBroken 10) >> pure ())
+        `catchSTMRestarting` \(_ ∷ WidgetFailure) → failWidgetSTM (WidgetMissing "handler")
+  fromHandler `shouldBe` Left (WidgetMissing "handler")
+  readTVarIO guarded `shouldReturnValue` 0
+
+testRestartingRetryAlternative ∷ Expectation
+testRestartingRetryAlternative = do
+  handled ← newTVarIO False
+  answer ← atomically $
+    ((check False >> pure "action") `catchSTMRestarting` \(_ ∷ SomeException) → ("handler" ∷ Text) <$ writeTVar handled True)
+      `orElse` pure "alternative"
+  answer `shouldBe` "alternative"
+  readTVarIO handled `shouldReturnValue` False
+
+testRestartingRetry ∷ Expectation
+testRestartingRetry = do
+  flag ← newTVarIO False
+  go ← newEmptyMVar
+  -- The flag is set only after the transaction has asked for it, so its first attempt finds it unset and retries.
+  withOwnedThread (takeMVar go >> atomically (writeTVar flag True)) $ \_ joined → do
+    answer ← atomically $ do
+      unsafeIOToSTM (void (tryPutMVar go ()))
+      (readTVar flag >>= check >> pure "set")
+        `catchSTMRestarting` \(_ ∷ SomeException) → pure ("handler" ∷ Text)
+    joined
+    answer `shouldBe` "set"

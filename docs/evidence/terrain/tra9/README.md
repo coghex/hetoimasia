@@ -7,16 +7,16 @@ and terrain-runtime's README (the precondition guard, the outside staging accoun
 | | |
 | --- | --- |
 | Device | Apple M3 Max, MoltenVK (the pinned Homebrew driver), surface-free targets with a `D32_SFLOAT` depth image |
-| Tested head | `34bdfb66`, on base `beb96171` (review round 2) |
+| Tested head | `cd68e54a`, on base `26579849` (review round 3) |
 | Effective spec | `98a673fb` (review 6909126590): the atlas amendment 6731831183 as amended by reviews 6731944497, 6908703832 and 6909126590 and the decision comments 6908430167 and 6909009968 |
 
 ## Results
 
 | Run | Command | Result |
 | --- | --- | --- |
-| Required native witness | `bash tools/vulkan/run.sh native hetoimasia-lua-engine-graphics:test:lua-engine-graphics-native-tests -- --complete` | 32/32 in 9.22 s on the terrain-disabled host; 4/4 in 3.12 s on the terrain-enabled host; 12.34 s of test time, 21 s wall, under the 30 s rule (`docs/vision.md:272`) |
-| Full qualification | the same suite with `-- --terrain-views-full` | 14/14 in 24.76 s |
-| Headless | `bash tools/vulkan/run.sh test hetoimasia-lua-engine-graphics:test:lua-engine-graphics-tests` (group `terrain views`) | 57/57, about 33 s |
+| Required native witness | `bash tools/vulkan/run.sh native hetoimasia-lua-engine-graphics:test:lua-engine-graphics-native-tests -- --complete` | 32/32 in 10.00 s on the terrain-disabled host; 4/4 in 3.00 s on the terrain-enabled host; 13.00 s of test time, 20 s wall, under the 30 s rule (`docs/vision.md:272`) |
+| Full qualification | the same suite with `-- --terrain-views-full` | 13/13 in 29.04 s, then the overlap witness on its own held host, 1/1 in 4.74 s |
+| Headless | `bash tools/vulkan/run.sh test hetoimasia-lua-engine-graphics:test:lua-engine-graphics-tests` (group `terrain views`) | 76/76, about 40 s |
 
 Native commands run on macOS under the standing per-command consent (`HETOIMASIA_NATIVE_SESSION=desktop`);
 the full qualification wrote its files with `HETOIMASIA_VALIDATION_EVIDENCE` set.
@@ -41,24 +41,34 @@ material's own model, independent of the production picker:
 | zoom 0.125 | 128 x 96 | 6,416 | 0 | 5,872 |
 | portrait | 64 x 128 | 8,192 | 0 | 0 |
 | before and after a resize of the adopted view | 128 x 96, then 96 x 128 | 12,288 each | 0 | 0 |
-| a far lower background (a 250-level band) | 128 x 96 | 12,288 | 0 | 0 |
 | a revealed cavity: ordinary, fog and mixed cells | 128 x 96 | 12,288 | 0 | 0 |
-| a revision whose batch was in flight while a newer one was adopted | 128 x 96 | 12,288 | 0 | 0 |
+| the adopted image, kept after a refused stale replacement, then the replacement | 128 x 96 | 12,288 each | 0 | 0 |
+| A, held in GPU use while B was adopted; B after A's batch completed | 128 x 96 | 12,288 each | 0 | 0 |
 
 Indeterminate pixels are minified or enlarged texel boundaries the oracle cannot decide. The
 determinacy floor is a quarter of the pixels.
 
-**Picks.** The oracle names colours, not the quad that wins a pixel, so picks are judged against the
-adopted plan's geometry. At every judged terrain pixel whose containing quads are all known parts, the
-pick must be a hit on one of those quads' cells, examined nearest first. That is the frontmost quad
-unless its texel there is a cutout. The rule does not decide texel coverage, which would repeat the
-picker. About half the picks name the frontmost quad (6,144 of 12,288 at each facing): a diamond tile
-fills half its quad's rectangle, and its corners are cutout texels.
+**Picks.** Judged exactly. At every pixel the oracle decides, it names the instances that draw there in
+drawing order (`probeSources`, its own depth and cutout pipeline, apart from its colour judgement and from
+the picker). The frontmost is one quad of the adopted plan; the pick must be a hit on that quad's cell and
+part, no hit for fog, and no hit over the clear colour. Every decided pixel of every rendering agrees. A
+picker that answered the rearmost quad containing the pixel would fail at most of them (11,520 of 12,288
+at each facing).
 
-**Limits.** In both runs the GPU finished the in-flight batch before the newer revision was adopted,
-so the overlap was recorded, not exercised: no seam holds a batch's completion. A refused stale
-replacement is judged by the headless examples. Natively, the real runtime's background loads move the
-residency generation unpredictably, and the example cannot tell a fresh refresh from the replacement.
+Every rendering and every arming waits until the residency generation has stopped moving with the view
+idle (the view's demand resident and no terrain job, nothing retiring, the view's publication adopted and
+prepared at the arena's current generation), so the image drawn is the one the picks answer from.
+
+**Overlap and stale replacement.** The overlap is asserted on a host whose test-only completion hold is
+set (owner decision S, #645 comment 6924532805): A's batch is held from its recording, B is adopted, and
+A's four own chunks stay held by the ledger and the terrain GPU bank while a step observes A's batch
+pending; the hold lets go, A's batch completes on its fence and its chunks retire. The timing is
+hook-held, not natural. The stale replacement is causal: the replacement is held as its uploads end, a
+far view moves the residency, its publication is refused, the kept image is judged, and the replacement
+made again is judged.
+
+The far lower background (a 250-level band) is covered by the headless examples only: natively, the
+terrain service's loads of its whole demand did not settle within the example's bound.
 
 ## Offload and reload (amendment 6909009968)
 

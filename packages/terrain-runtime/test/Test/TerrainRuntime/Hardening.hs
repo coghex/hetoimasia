@@ -10,6 +10,7 @@ import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (find)
 import Control.Monad (forM, forM_, void, when)
 import qualified Data.Text as T
+import Hetoimasia.Foundation.Failure (catchSTMRestarting)
 import Hetoimasia.Foundation.Log (LogEntry (..), callbackSink, defaultLogFilter, mkLogger)
 import Hetoimasia.Terrain.Cell (zRangeLo)
 import Hetoimasia.Terrain.Coordinate (RegionCoord (..), decomposeTile, mkLocalCoord)
@@ -375,6 +376,31 @@ spec = describe "Accounting and lifetime hardening" $ do
       again <- atomically (releaseArenaLeaseSTM svc lease)
       again `shouldBe` Right ()
       heldLeases svc >>= \remaining → (leasesBefore, remaining) `shouldBe` (1, 0)
+      settleChecks svc
+
+  it "gives a result back once when the host's release retires it again, and not at all when the host's transaction is rolled back" $
+    withService (defaultConfig {configRetainedBytes = 330}) $ \svc → do
+      (_, lease) <- openMain svc "main"
+      host <- newHost True
+      request <- okOf (removeWith svc (hostEndpoint svc Nothing host) lease (tile 1 1 1) Nothing)
+      waitFor (readTVar (hostSettled host) >>= \x → check (not (null x)))
+      inspectSnapshotBytes svc >>= (`shouldBe` (160, 330))
+      -- the host's transaction is abandoned after the retirement: nothing is given back
+      abandoned <- try (atomically (retireSTM svc request >> throwSTM (ErrorCall "the host's transaction failed")) ∷ IO ())
+      abandoned `shouldBe` Left (ErrorCall "the host's transaction failed")
+      inspectSnapshotBytes svc >>= (`shouldBe` (160, 330))
+      -- a release guarded as the Lua host guards one, which raises after retiring: only its own writes are undone
+      caught <- atomically $
+        (retireSTM svc request >> throwSTM (ErrorCall "the release failed"))
+          `catchSTMRestarting` \(ErrorCall why) → pure why
+      caught `shouldBe` "the release failed"
+      inspectSnapshotBytes svc >>= (`shouldBe` (160, 330))
+      -- retired by two guarded releases in one transaction, as two credits of one request would: given back once
+      atomically $ do
+        retireSTM svc request `catchSTMRestarting` \(_ ∷ SomeException) → pure ()
+        retireSTM svc request `catchSTMRestarting` \(_ ∷ SomeException) → pure ()
+      inspectSnapshotBytes svc >>= (`shouldBe` (0, 330))
+      inspectInvariants svc >>= (`shouldBe` [])
       settleChecks svc
 
   it "reserves a removal's result bytes at admission, so pending removals and snapshots cannot overfill the retained bank" $

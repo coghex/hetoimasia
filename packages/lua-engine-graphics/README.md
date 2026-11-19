@@ -572,12 +572,21 @@ a time: queued attachments, closes, retirements and re-sent demands first, then
 the views' steps round-robin. So no view's copies, plan, build or uploads keep
 the worker from another view, and the worker never waits on the owner, the
 terrain service or an upload: it reads their answers when they are ready.
+Every resource changes owner in the transaction that records it: a GPU
+reservation with the stage that holds it, a build's submission with its
+ticket, the ticket's answer with its chunks, and an abandoned stage with the
+service-owned lists that dispose of what it held (a copy request in flight is
+taken from that list and released or cancelled with no cancellation between
+the two). A cancellation of the worker between any two transfers leaves
+everything owned. If the worker ends, by its end or a cancellation, every live
+view is closed then, so a close asked of one never waits on a worker that is
+gone.
 
 | Stage | What it owns | Moves when | On a close, a cancellation or the service's end |
 | --- | --- | --- | --- |
 | copying | the copies taken so far (charged to the view) and at most one copy request in flight | the request settles, or what it waited for (room) is released | the request is cancelled (or, settled, released); the charge returns |
 | planning | the planner's state, stepped one quantum per step | always (one quantum) | dropped; the charge returns |
-| building | the build's ticket on the owner, or its reservation while the owner's queue is full | the ticket is answered, or the queue has room | a build in flight is collected by the retirements when it answers and what it built retires; its GPU bytes stay charged until then |
+| building | the build's ticket on the owner, or its reservation while the owner's queue is full | the ticket is answered, or the queue has room | a build in flight is collected by the retirements when it answers and what it built retires; its GPU bytes stay charged until then. A build that stops partway answers the chunks it made, which retire with their charges, since their uploads may still run |
 | uploading | the built chunks until their uploads end | every upload has ended | the chunks retire (no barrier: no revision listed them); their GPU bytes stay charged until released |
 
 Copies start from the camera's anchor (and a jump's destination) and grow with
@@ -586,7 +595,30 @@ one batch at a time; a settled batch is taken, checked against the batches
 before it (one incarnation, content and knowledge revision), charged to the view
 and its borrow released, in one transaction. Copies of different versions are
 never combined: an edit that commits between two batches starts the copies again
-(a bounded number of times, then the preparation waits).
+(a bounded number of times, then the preparation waits). A followed surface the
+copies do not reach yet, like a jump's destination, is copied in the next round.
+
+**Admission.** A preparation admits regions in one order: the camera's anchor,
+then the regions nearest it (a jump's or a followed surface's, the plan's
+visible demand; never prefetch). It admits at most `tvAdmitRegions` (2,048 by
+default), and of those the longest prefix the account can hold beside the room
+for the plan's first quantum over them. The account is the binding limit; the
+cap only keeps one view from starving another, and 2,048 regions' copies and
+inputs (`admittedCostBound`) let two views at the largest approved envelope each
+hold a coherent partial plan under the production 128 MiB bank. Regions not
+admitted stay pending with their loading envelope (`readingUnadmitted`), so a
+deliberately partial plan is coherent. With enough capacity and stable inputs,
+a partial plan goes on while each preparation admits more and so settles with
+no holes; at the cap it stops, and when the account binds it sleeps until a
+release, an adoption or the account wakes it, publishing nothing if it admits
+no more. With the production bank, the maximum approved envelope (3840 x 2160 at
+zoom 0.125, about 11,200 regions) publishes a coherent partial plan with
+explicit pending regions and does not settle fully: requirement 3's
+constrained-capacity case, not a footprint hole.
+
+A preparation that cannot start sleeps on the one thing that can change that:
+at its two-pin limit, an adoption of its target; without target metrics or an
+available arena, both of them. Its intent and its peers do not wake it.
 
 **Inputs.** Every terrain and knowledge input of a plan, of its retained
 regions and of its pick metadata comes from those regional copies and from
@@ -622,8 +654,13 @@ when no adoption lists them and their upload has ended, so the release is never
 deferred and its answer proves the buffer gone; their GPU bytes return then.
 Owner actions are typed: a full queue or release lane is waited for (never
 asked again in a loop), and an owner that takes no more actions, or an action
-that never ran, is terminal evidence. A release that failed is kept as evidence,
-its bytes still charged, and is never asked again.
+that never ran, is terminal evidence. A build refused as upload pressure waits
+for one of the session's uploads to settle (the owner's unsettled uploads, from
+`readVulkanUploads`), as well as for a release, an adoption or the account. An
+upload that failed, or a built chunk the owner no longer knows, is kept as
+evidence before the candidate retires; the previous revision stays published.
+A release that failed is kept as evidence, its bytes still charged, and is never
+asked again.
 
 **Accounting.** The view's CPU payloads, the parents' coverage planes and the
 terrain service's staging all draw on the session's one `RenderAccount`
@@ -636,9 +673,13 @@ cells) trued up after the quantum to what the plan holds, then the
 adaptation and the regions' instances, records and the renderer registry's
 copies of them. A charge the account cannot hold leaves the stage waiting
 (nothing more is made) until something is released. Once published, the view
-holds its pinned plans and its listed regions' descriptions; a region that
-leaves a revision or a closed view keeps its description charged, held by the
-service, until its release is answered. A view holds whole granules of the
+holds its pinned plans, its listed regions' descriptions, the facts it keeps
+for its camera (charged at their inputs, replaced by the next facts' charge)
+and its kept demand (32 bytes a region); `readingNeedBytes` is the sum. A region
+that leaves a revision or a closed view keeps its description charged, held by
+the service, until its release is answered; one whose release failed stays in
+the renderer's registry, so its charge stays after the service's end, reported
+as evidence. A view holds whole granules of the
 account (`tvAccountGranule`, 1 MiB), reserved as its need grows past one,
 returned only when a whole granule is free, and counted as its charge, so a
 panning camera does not write the account the terrain service reads in its

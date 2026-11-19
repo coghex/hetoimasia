@@ -212,6 +212,20 @@ with `catchSTM` discards only the writes made by the action that `catchSTM`
 guarded. Writes the transaction made before or after that action remain and
 commit with the rest of the transaction.
 
+A `catchSTM` whose action commits can, under GHC, run that action again and again
+without ever restarting the transaction. When the action's nested commit finds a
+value it read changed by another thread, GHC reruns only the action, inside an
+enclosing transaction that nothing revalidates, so a value the enclosing
+transaction had already read stays stale and every rerun fails again. Only a
+heap check returns the thread to the scheduler, which then restarts the whole
+transaction. An action that allocates nothing on that path, such as a release
+that finds nothing to release, therefore spins forever and holds up every
+garbage-collection sync. `orElse` restarts the whole transaction instead, and an
+action that always ends in `throwSTM` never commits. Guard such an action with
+`catchSTMRestarting`, in `Hetoimasia.Foundation.Failure`: it is `catchSTM` over
+``action `orElse` retry``, the same in every other respect, including rollback,
+handler matching, propagation and `retry`.
+
 ## Native causes
 
 A native or library exception, such as an `IOException` from `openFile`, carries

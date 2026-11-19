@@ -20,6 +20,13 @@ does.
   every package by name.
 - `Test.Support.Bounded` bounds a call that must return, so a stuck example
   fails instead of hanging the run.
+- `Test.Support.Capabilities` is the multi-capability pass's one setting and
+  its guard, shared by the suites that run their concurrent examples a second
+  time on several capabilities (`terrain-runtime-tests`, `lua-engine-tests`):
+  the count (`HETOIMASIA_CONCURRENT_PASS_CAPABILITIES`, else the count the
+  process started with when it is 2 or more, else 2; below 2 refused before any
+  example), the wrapper that sets it around each example and fails when the
+  runtime does not report it, and the line the run prints.
 - `Test.Support.Owned` is the one way a test starts a helper thread:
   `withOwnedThread action body` forks the thread and registers its
   stop-and-join in one masked step, runs the body with the caller's
