@@ -687,6 +687,9 @@ stages = describe "stages and the owner" $ do
       -- the unpublished regions' uploads end: they are released, and only then are their bytes returned
       atomically (modifyTVar' (foStanding (vOwner v)) (\standings → foldr (Map.adjust (const ChunkReady)) standings fresh))
       bounded (atomically (readTVar (foReleased (vOwner v)) >>= \done → check (Set.fromList fresh `Set.isSubsetOf` Set.fromList done)))
+      -- the fake records a release when its action runs; the service returns the bytes when it takes the answer, in the
+      -- transaction that also takes the chunks off its retiring list: that is what is waited for
+      bounded (atomically (terrainViewsRetiring (vViews v) >>= check . all ((`notElem` fresh) . fst)))
       atomically (terrainViewsGpuCharged (vViews v)) >>= (`shouldSatisfy` (< charged))
       closeView peer
 
