@@ -179,7 +179,10 @@ asked.
 **Teardown.** `withBackend` exits in dependency order: admission closes; every
 unfinished job is cancelled and taken apart; every unreleased texture is
 released; the drain waits in STM until every job has answered and every
-texture is proved retired or failed; only then does the pump stop. Ending one
+texture is proved retired or failed; only then does the pump stop. The host's
+port reads the owner's clean exit (its action gate closed) as the owner's end,
+as it reads a failure, so a texture an interest still holds is reported failed
+then rather than waited for. Ending one
 instance neither closes the shared owner nor touches a peer's texture.
 
 ## Image kinds and format routing (TRA-15)
@@ -678,18 +681,29 @@ qualified cutout path needs no ring space.
 
 A preparation that cannot start sleeps on the one thing that can change that:
 at its two-pin limit, the pin-capacity predicate itself (the pins it would keep:
-published, adopted, newer than adopted, or read), so one reader starting as
+published, adopted, newer than adopted, or read; before the target's first
+adoption, every published one), so one reader starting as
 another ends still wakes it; without target metrics, the metrics. Its intent
 and its peers do not wake it. A view whose arena authority (its lease released
 or revoked, its arena closed) or target incarnation is gone for good closes
 through its own close, in whatever stage it is, which hands the target back,
-and says so as evidence. A step that waits after a refusal reads only that
-refusal's own cell: the shared account's room, the session's settled-upload
-count, the terrain service's retained bank or its freed-capacity count, the
-owner's action or release-lane room (read from its admission, never its scenes
-or targets). Only a step that failed with nothing to wait for watches the
-service's releases and the target's newest adoption: a peer's copy or close
-wakes no other wait. The freed-capacity count moves on every event that may
+and says so as evidence. A step that waits after a refusal saves a predicate
+for exactly the resource and amount refused, captured with the refusal, and
+reads only that resource's own cell: the shared account's room for the whole
+granules a copy, the first copy's admission, a plan quantum, or the adaptation
+and demand growth need (after the stage's own bytes went back); the terrain
+service's staging account's room for what a refused step asked of it; whether
+a regional request of the refused size fits the terrain service's retained
+bank (`regionalFitsSTM`, the service's own admission test); the service's GPU
+room for the regions to build; the session's settled-upload count; the terrain
+service's freed-capacity count for any other capacity; and the owner's action
+or release-lane room (read from its admission, never its scenes or targets).
+Each room is a level read against the amount, so a room that came back before
+the wait, or came and went while a peer held it, is still seen. Only a step
+that failed with no capacity refused watches the service's releases and the
+target's newest adoption: a peer's copy or close wakes no other wait. A plan
+that admitted no more than the published one waits for the account to have
+more room than it had. The freed-capacity count moves on every event that may
 free capacity, a second before the terrain service retries included. The
 worker watches only cells that change on those
 events: the terrain service's authority epoch (`authorityEpochSTM`, moved only
@@ -759,7 +773,7 @@ submission), so an upload that started and settled after the submission still
 wakes it; a copy, or a plan quantum, the account cannot hold waits for the account to
 have the room its charge needs (whole granules), so another view's copy taken
 and dropped does not wake it; a copy refused for the terrain service's retained bank waits
-on that bank (`retainedBankUseSTM`), read before the request. A build's chunk
+until a request of its size fits that bank (`regionalFitsSTM`). A build's chunk
 and its record of what was built are one step no cancellation splits. A release
 answers each chunk on its own: one whose release raised is that chunk's failure
 and the chunks after it are still released (`releaseEach`). A release action
@@ -813,8 +827,9 @@ claim's first publication) and the target's own newest-adopted revision (an
 adoption of that target, which only its view publishes to). The terrain GPU-data bank
 (128 MiB) charges every retained chunk's bytes, live and retiring, until the
 owner reports the chunk released. Two pinned plans a view (the newest
-published and the newest adopted); a preparation that would need a third waits
-for an adoption. Pressure (a bank, the account, the copies) keeps the previous
+published and the newest adopted; before the target's first adoption, the
+published ones, any of which the host may still adopt); a preparation that
+would need a third waits for an adoption. Pressure (a bank, the account, the copies) keeps the previous
 view and retries when what refused it changes (see the waits below).
 
 **Picking** reads only the revision the host adopted for the target and the
@@ -861,7 +876,10 @@ transaction, so the scope's exit never waits on the host; the keeper takes the
 same steps while the session lives, its texture backend's drain included, and
 keeps what it cannot prove as terminal evidence (`terrainViewsUnproved`, and
 `terrainViewsFailures`), charged, after taking every answer that had already
-arrived. The session's admission closing, or
+arrived. Once the graphics owner ends, it still waits for a build that was
+running then: what that build made is kept as evidence and what it did not
+make returns; a build that has not answered by the keeper's own end is kept
+with its ticket. The session's admission closing, or
 the graphics owner ending, ends the service the same way while the scope's
 body runs. The body runs with the
 caller's masking state. The worker records synchronous failures and rethrows

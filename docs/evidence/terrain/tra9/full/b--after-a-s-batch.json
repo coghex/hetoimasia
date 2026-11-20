@@ -1,7 +1,7 @@
 {
   "name": "B, after A's batch",
-  "revision": 3,
-  "view": 1, "plan": 8,
+  "revision": 4,
+  "view": 1, "plan": 7,
   "framebuffer": [128, 96],
   "chunks": 4,
   "pixels": 12288, "passed": 12288, "failed": 0, "indeterminate": 0,
