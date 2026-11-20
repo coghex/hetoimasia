@@ -107,6 +107,7 @@ spec = describe "Offscreen scene targets (LFE-27)" $ do
     itBounded "keeps a held frame-less batch pending through owner steps that observed it, its revision unreleased" testHoldKeepsBatch
     itBounded "completes a held batch only at a step after the hold lets go, then releases its revision" testHoldReleaseCompletes
     itBounded "changes nothing when no batch is held: the same script releases at the same step" testHoldUnsetUnchanged
+    itBounded "lets a held batch go when the rig's body fails with the hold active, so the host's teardown completes it" testHoldReleasedOnFailure
 
   describe "teardown" $ do
     itBounded "retains an unregistered target's unresolved records in the observation, counted against capacity, until every batch has completed" testUnregisterRetainsRecords
@@ -657,7 +658,8 @@ testHoldKeepsBatch ∷ IO ()
 testHoldKeepsBatch = do
   (holding, hold) ← newHolding
   rig ← (\r → r {rigCompletionHold = Just hold}) <$> surfaceFreeRig 0
-  (pending, released, seen) ← (`finally` atomically (writeTVar (holdingSet holding) HeldSet.empty)) . runRig rig $ \host _ → do
+  -- the hold lets go inside the rig's callback, on every exit: the host's teardown never finds a batch still held
+  (pending, released, seen) ← runRig rig $ \host _ → (`finally` atomically (writeTVar (holdingSet holding) HeldSet.empty)) $ do
     awaitReady host
     target ← registered host
     awaitTargetStanding host target ((== Just 0) . windowAdopted)
@@ -681,11 +683,29 @@ testHoldKeepsBatch = do
   released `shouldBe` [0]
   seen `shouldSatisfy` (> 0)
 
+testHoldReleasedOnFailure ∷ IO ()
+testHoldReleasedOnFailure = do
+  (holding, hold) ← newHolding
+  rig ← (\r → r {rigCompletionHold = Just hold}) <$> surfaceFreeRig 0
+  outcome ← runRigCaught rig $ \host _ → (`finally` atomically (writeTVar (holdingSet holding) HeldSet.empty)) $ do
+    awaitReady host
+    target ← registered host
+    awaitTargetStanding host target ((== Just 0) . windowAdopted)
+    _ ← publishNow host target 11
+    awaitTargetStanding host target ((== Just 1) . windowAdopted)
+    _ ← recordHeld holding host target
+    -- the body fails with the batch held
+    throwIO (userError "the body failed with a batch held")
+  -- the failure is the body's, and the teardown that followed finished (the example's bound would say otherwise)
+  either (\failure → show failure `shouldSatisfy` isInfixOf "the body failed with a batch held") (\() → expectationFailure "the body's failure was lost") outcome
+  atomically (readTVar (holdingSet holding)) >>= (`shouldBe` HeldSet.empty)
+
 testHoldReleaseCompletes ∷ IO ()
 testHoldReleaseCompletes = do
   (holding, hold) ← newHolding
   rig ← (\r → r {rigCompletionHold = Just hold}) <$> surfaceFreeRig 0
-  (whileHeld, afterRelease) ← (`finally` atomically (writeTVar (holdingSet holding) HeldSet.empty)) . runRig rig $ \host _ → do
+  -- the hold lets go inside the rig's callback, on every exit: the host's teardown never finds a batch still held
+  (whileHeld, afterRelease) ← runRig rig $ \host _ → (`finally` atomically (writeTVar (holdingSet holding) HeldSet.empty)) $ do
     awaitReady host
     target ← registered host
     awaitTargetStanding host target ((== Just 0) . windowAdopted)

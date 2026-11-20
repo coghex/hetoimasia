@@ -2308,9 +2308,11 @@ stagesAndReaders = describe "stages, waits and readers" $ do
   it "completes a close that fails at the service's end: the view leaves the service closed and its parents are released" $ do
     armed ← newTVarIO False
     kept ← newTVarIO Nothing
+    -- the only close of the view is the service's end's: it waits at its seam until the stopping hook (run by the
+    -- scope's release, after the service took no more work) has armed the failure, so the two meet in one order
     let raiseAt _ name = when (name == "closed") $ do
-          raising ← atomically (readTVar armed <* writeTVar armed False)
-          when raising (throwIO (userError "the close's seam raised"))
+          atomically (readTVar armed >>= check)
+          throwIO (userError "the close's seam raised")
     withViewsConfig testConfig {tvOnTransfer = raiseAt, tvStopping = atomically (writeTVar armed True)} $ \v → do
       view ← attached v 1
       _ ← awaitPublished v 1
