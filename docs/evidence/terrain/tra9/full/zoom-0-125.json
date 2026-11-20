@@ -1,7 +1,7 @@
 {
   "name": "zoom 0.125",
   "revision": 2,
-  "view": 1, "plan": 3,
+  "view": 7, "plan": 3,
   "framebuffer": [128, 96],
   "chunks": 4,
   "pixels": 12288, "passed": 6416, "failed": 0, "indeterminate": 5872,

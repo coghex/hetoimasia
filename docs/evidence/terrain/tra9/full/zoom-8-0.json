@@ -1,7 +1,7 @@
 {
   "name": "zoom 8.0",
   "revision": 2,
-  "view": 1, "plan": 3,
+  "view": 10, "plan": 3,
   "framebuffer": [128, 96],
   "chunks": 4,
   "pixels": 12288, "passed": 10911, "failed": 0, "indeterminate": 1377,

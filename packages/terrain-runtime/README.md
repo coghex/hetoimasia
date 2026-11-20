@@ -112,7 +112,9 @@ TRA-5 (#641) at the manager's authorization under the owner's 2026-11-09 decisio
   writes. The epoch moves only in the transactions that end a lease's validity (an arena's close, a lease's release, the service's end).
   An arena's mark (`ArenaMark`: its content and knowledge revisions and its residency generation) is resolved through a live lease once
   and written by the state's one write (`putSt`) only when one of them moves; it is `Nothing` once the arena has ended, and says nothing
-  of the lease, whose end the epoch reports.
+  of the lease, whose end the epoch reports. `retainedBankUseSTM` and `capacityFreedSTM` are such cells too: the retained bank's use,
+  written only when it changes, and a count bumped each time the owner frees capacity, which a holder refused `BusyRetained` or for a
+  model capacity waits on.
 * `retireSTM service request` and `releaseArenaLeaseSTM service lease` are `retire` and `releaseLease` as transactions (`Settlement`): the same functions, writing the same
   state, for a host that gives a result or a lease back from inside a transaction of its own. The Lua host gives a request's credit back in the
   transaction that takes the result or accounts its work, on whichever thread does, so it retires the result in that transaction instead of
@@ -208,8 +210,11 @@ revisions; the decision judges them again with the guard, in the transaction tha
 commits (`preconditionStale`). A guard (`PreconditionGuard`) is the holder's own
 transaction, a pure read that never waits (one that retries is read as not holding),
 with an identity for equality and display; it carries nothing of the holder into the
-service. A terrain view's pick guards that the view still holds its target and that the
-revision it was picked from is still the one adopted.
+service. A guard may be bound to the service its holder read from (`guardService`,
+`serviceIdentity`): bound to another service it is stale before its transaction is read,
+since equal arena and revision numbers in two services name different terrain. A terrain
+view's pick guards, bound to its own service, that the view still holds its target and
+that the revision it was picked from is still the one adopted.
 
 **Ordering.** Among the eligible commands of one arena the owner commits in
 admission order. A command that is not yet eligible does not hold up the others; a

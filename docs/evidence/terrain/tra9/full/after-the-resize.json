@@ -1,7 +1,7 @@
 {
   "name": "after the resize",
   "revision": 3,
-  "view": 1, "plan": 4,
+  "view": 12, "plan": 4,
   "framebuffer": [96, 128],
   "chunks": 4,
   "pixels": 12288, "passed": 12288, "failed": 0, "indeterminate": 0,

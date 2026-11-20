@@ -1,7 +1,7 @@
 {
   "name": "facing FaceWest",
   "revision": 2,
-  "view": 1, "plan": 4,
+  "view": 4, "plan": 4,
   "framebuffer": [128, 96],
   "chunks": 4,
   "pixels": 12288, "passed": 12288, "failed": 0, "indeterminate": 0,

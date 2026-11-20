@@ -99,7 +99,16 @@ and the suites' verification capture.
 - A host configured with `DeviceSurfaceFree` (`vulkanDeviceStart`) creates
   the session's device in the owner's startup, with no surface and before any
   window; a window handed over later is admitted only if the chosen queue
-  family presents to it. With or without windows, `submitVulkanAction` hands
+  family presents to it. `vulkanActionRoom`, `vulkanReleaseRoom`,
+  `vulkanOwnerEnded` and `readVulkanUploadsSettled` answer whether an action
+  or a release request would be admitted now, whether the owner takes no more,
+  and how many uploads have settled, reading only the owner's gate, the device
+  and the action queue (or a count written when an upload settles): never a
+  barrier, a scene or a target, so a consumer that waits on them wakes for
+  that change alone. An owner round that takes no action writes no queue.
+  `vulkanHostIdentity` names the host, which every offscreen registration
+  carries; `vulkanSceneTargetRegistered` answers whether this host holds an
+  exact registration now. With or without windows, `submitVulkanAction` hands
   the owner a bounded `VulkanAction` from any thread, run once on the owner's
   thread with the same `Construction`, never beside a frame; admission refuses
   at once — a full queue, no device yet, a failed session, a closed owner —

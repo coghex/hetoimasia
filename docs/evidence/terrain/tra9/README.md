@@ -7,8 +7,8 @@ and terrain-runtime's README (the precondition guard, the outside staging accoun
 | | |
 | --- | --- |
 | Device | Apple M3 Max, MoltenVK (the pinned Homebrew driver), surface-free targets with a `D32_SFLOAT` depth image |
-| Final code | `cae6bc2c` (review round 7). Its qualification is CI's native receipts at the pull request's head, which carries this code: `test.vulkan-native`, `test.vulkan-lua-engine-native` (with `--complete`), `test.glfw-native` and `test.vulkan-wayland`, recorded in the pull request's body with the head each ran at |
-| Renderings | captured at `cdc34252` on base `26579849` (round 5), before rounds 5 and 6 changed the worker's selection, close, pins, waits and admission charge; the pixel and pick tables below are for that head |
+| Final code | `bd3f6f7d` (review round 7, the approved design `docs/designs/terrain_view_service_design.md`); `b1ea400b` adds one test change. Every run below is at this code unless it names another head |
+| Renderings | captured at `bd3f6f7d` in the strict window w645s; the pixel and pick tables below are for that head (they equal round 5's at `cdc34252`, which this replaces) |
 | Effective spec | `d107834a`, approved in review 7024627413: the atlas amendment 6731831183 as amended by reviews 6731944497, 6908703832 and 6909126590, the decision comments 6908430167 and 6909009968, the round-3 scope split 7016919733 (owner X), the frame-limit amendment 7017110545, the round-4 scope split 7020752728 (owner N) and the flaky-example amendment 7024520210 (round 5's review read `3b7424f6`, before it) |
 | Moved out | #706 (a camera tail the terrain service cut, asked again by an idle view); #709 (progress under a binding bound: whole-unit publication under the renderer's record window, a partial plan's continuation, a distant jump under the cap, multi-turn builds, and a preparation the account binds); #710 (stronger witnesses: the record window against the recorder and its diagnostic, the far background tied to a drawn quad, every pixel accounted, the intent on the adopted plan, the native suite's focused selection, and, item 7, a deterministic witness for a release that did not run beside another view's retirements); #711 (two headless examples that ran past their bound or their attempt limit under machine load; the idle view's check for new work and a window's lifecycle cell were found to wake on every load and every host round, and are fixed); #712 (terrain-runtime's store allocation-ratio example under load) |
 
@@ -16,9 +16,11 @@ and terrain-runtime's README (the precondition guard, the outside staging accoun
 
 | Run | Command | Result |
 | --- | --- | --- |
-| Required native witness (at `cdc34252`) | `bash tools/vulkan/run.sh native hetoimasia-lua-engine-graphics:test:lua-engine-graphics-native-tests -- --complete` | 32/32 in 10.38 s on the terrain-disabled host; 4/4 in 3.23 s on the terrain-enabled host; 13.61 s of test time, 22 s wall, under the 30 s rule (`docs/vision.md:272`) |
-| Full qualification (at `cdc34252`) | the same suite with `-- --terrain-views-full` | 13/13 in 29.37 s, then the overlap witness on its own held host, 1/1 in 5.35 s |
-| Headless | `bash tools/vulkan/run.sh test hetoimasia-lua-engine-graphics:test:lua-engine-graphics-tests` (group `terrain views`) | at `cae6bc2c`: 119/119 in 64.0 s under load about 20. CI at `455d86ef` then failed the eviction group's attempts example (22) and its visible-demand residency example (bound) in one of two runs: both rest on how loads and evictions interleave with a view's preparations, and were removed to #711 (owner M, `7f24b697`); terrain-runtime's suite, once at `e43f0e3d`: 1791/1792, the failure its store allocation-ratio example (`Store/Bounds.hs:448`, #712). At `6d306f02`: 118/119 in 58.9 s under load 16 to 20 from another workload; the attempts example of the eviction group took 21 attempts (#711). At `58eba55d`: 108/108 in 51.8 s. At `cdc34252`, under load about 14, the eviction example ran past its bound (#711) |
+| Required native witness | `bash tools/vulkan/run.sh native hetoimasia-lua-engine-graphics:test:lua-engine-graphics-native-tests -- --complete` | 33/33 in 11.49 s on the terrain-disabled host (the quiet-worker example included); 4/4 in 3.53 s on the terrain-enabled host; 15.02 s of test time, 22 s wall, under the 30 s rule (`docs/vision.md:272`) |
+| Focused native selection | the same suite with `-- --match "terrain views"` | 2/2 in 3.51 s |
+| Full qualification | the same suite with `-- --terrain-views-full` | 13/13 in 28.52 s, then the overlap witness on its own held host, 1/1 in 3.66 s; every pixel judged, 0 failed; every pick exact; synchronization validation clean (64 records) |
+| Headless | `bash tools/vulkan/run.sh test` (the `test.vulkan-headless` set) | at `b1ea400b`: every suite passed, `lua-engine-graphics-tests` 445/445. At `bd3f6f7d` the unpublished-region example raced the service's refund of the GPU bytes (the example read the charge before the service took the release's answer; 2 of 2, fixed in the example at `b1ea400b`), and the pick-removal example "refuses a pick's removal once a load moves the residency generation, and removes through one picked from the revision made at the new generation" ran past its 15 s bound once (seed 1402948167; passed in the separate `terrain views` selection; #711) |
+| Every other group the planner selects on macOS (w645s) | as `tools/validation/catalog.json` names them | at `bd3f6f7d`, each once, all passed: engine 159, foundation 489, runtime 243, glfw 1097, lua host 642, lua runtime 1184, lua domains 418, gpu model 277, diagnostics 84, math 128, terrain 920, terrain-render-2d 559, terrain-runtime 1794, lua-engine 1574, content 520 (5 pending), asset-image 1413, render-api 19, render-2d 544, oracle 219, run-native 59, vulkan-native 208 (2 pending), glfw-native 163 (25 pending), workflow 965. The two Wayland groups are Linux-only: CI |
 
 Native commands run on macOS under the standing per-command consent (`HETOIMASIA_NATIVE_SESSION=desktop`);
 the full qualification wrote its files with `HETOIMASIA_VALIDATION_EVIDENCE` set.
@@ -73,6 +75,18 @@ The far lower background (a 250-level band) is qualified by the headless example
 draws a lower background far outside the camera's radius but inside the projected viewport": by owner
 decision A (recorded in 7016919733) the native example was removed, and tying a drawn quad to the far
 contributor is #710.
+
+## Removed examples (flaky-example amendment 7024520210)
+
+Each was removed after it failed under a run's timing, never rerun, and is recorded with its follow-up. The command
+of each is `bash tools/vulkan/run.sh test hetoimasia-lua-engine-graphics:test:lua-engine-graphics-tests` with
+`--match` the path given; the bound is the suite's example bound, 15 s, unless named.
+
+| Example (`--match` path) | Failed | Follow-up |
+| --- | --- | --- |
+| `/terrain views/eviction/keeps publishing while another holder loads a region at every step of a panning camera: at most two attempts per publication/` | 21 attempts against 20, seed 689505196 (CI run 44620294984 at `9bbd7e0a`); 21, seed 1398494402 (local, `6d306f02`); 21, seed 279248281 (CI run 44641923134 at `638f4187`); 22, seed 1096541889 (CI run 44661948923 at `455d86ef`) | #711 (owner M) |
+| `/terrain views/eviction/keeps every region of the view's visible demand resident while another holder's demand evicts others, the far background included/` | bound expired, seed 928086029 (local w645r series at `cdc34252`); seed 689505196 (CI run 44620294984 at `9bbd7e0a`); seed 1096541889 (CI run 44661948923 at `455d86ef`) | #711 (owner M) |
+| `/terrain views/stages, waits and readers/keeps a release that did not run as evidence with its charges, and goes on retiring another view's regions/` | bound expired, seed 928086029 (local w645r series at `cdc34252`); seed 1386309823 (local, `c1f08f99`) | #710 item 7 (owner D). The behaviour is verified by reading the code: a release action that does not answer keeps its region's failure and charges, and only an ended owner abandons every retirement (`retireSettled`) |
 
 ## Offload and reload (amendment 6909009968)
 
