@@ -82,7 +82,7 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView.Session
   ) where
 
 import Control.Concurrent.STM
-import Control.Exception (Exception, mask, onException, throwIO, uninterruptibleMask_)
+import Control.Exception (Exception, evaluate, mask, onException, throwIO, uninterruptibleMask_)
 import Control.Monad (forM, forM_, unless, void, when)
 import Data.Foldable (for_, toList)
 import Data.List (sortOn)
@@ -359,6 +359,10 @@ data TerrainViews k = TerrainViews
   , svFreed ∷ !(TVar Natural)
   , svPlanningFrame ∷ !(TVar Word64)
   , svPlanningMax ∷ !(TVar Word64)
+  , svPlanningStep ∷ !(TVar Word64)
+    -- ^ The planning time of the owner step under way.
+  , svPlanningStepMax ∷ !(TVar Word64)
+    -- ^ The greatest planning time of one owner step.
   , svReserved ∷ !Integer
   }
 
@@ -389,6 +393,8 @@ withTerrainViews config ports body = do
       <*> newTVarIO True
       <*> newTVarIO False
       <*> newTVarIO False
+      <*> newTVarIO 0
+      <*> newTVarIO 0
       <*> newTVarIO 0
       <*> newTVarIO 0
       <*> newTVarIO 0
@@ -827,10 +833,11 @@ abandonFlight service flight = do
 -- retirements. It asks for the next step when it leaves work it can do at once.
 stepOwner ∷ (Ord k, Show k) ⇒ TerrainViews k → Hands → IO ()
 stepOwner service hands = do
-  atomically (writeTVar (svScheduled service) False)
+  atomically (writeTVar (svScheduled service) False >> writeTVar (svPlanningStep service) 0)
   views ← Map.elems <$> readTVarIO (svViews service)
   busy ← or <$> forM views (stepView service hands)
   retired ← retire service hands
+  atomically (readTVar (svPlanningStep service) >>= \spent → modifyTVar' (svPlanningStepMax service) (max spent))
   when (busy || retired) (atomically (kick service))
 
 -- Whether the view did something a further step can continue at once.
@@ -1104,10 +1111,10 @@ setupFor metrics =
 -- lack, or the candidate's chunks and its admission.
 stepPlanning ∷ (Ord k, Show k) ⇒ TerrainViews k → ViewState k → Word64 → Prep → CopySet → CellInputs → CellPrep → IO Bool
 stepPlanning service vs serial prep copies inputs prepared = case cellPrepProgress prepared of
-  Working → timed service (pure $! stepCells inputs prepared) >>= \case
+  Working → timed service (\() → forcedStep (stepCells inputs prepared)) >>= \case
     Left why → False <$ atomically (refuse service vs serial (prepBasis prep) (LimitFailure ("a plan step failed: " <> Text.pack (show why))))
     Right next → atomically (writeBack service vs serial (Planning prep copies inputs next))
-  _ → case cellPlanOf inputs prepared of
+  _ → timed service (\() → forcedPlan (cellPlanOf inputs prepared)) >>= \case
     Left why → False <$ atomically (refuse service vs serial (prepBasis prep) (LimitFailure ("the plan could not finish: " <> Text.pack (show why))))
     Right plan → do
       let profile = tvProfile (svConfig service)
@@ -1119,7 +1126,7 @@ stepPlanning service vs serial prep copies inputs prepared = case cellPrepProgre
         then atomically (writeBack service vs serial (Copying prep {prepRounds = prepRounds prep - 1, prepRegions = prepRegions prep <> Set.fromList missing} missing (copySnapshots copies) Nothing))
         else do
           light ← readTVarIO (vsLight vs)
-          admitted ← timed service (pure $! candidateOf service vs plan copies light)
+          admitted ← timed service (\() → forcedCandidate (candidateOf service vs plan copies light))
           case admitted of
             Left limit → False <$ atomically (refuse service vs serial (prepBasis prep) limit)
             Right (adapted, wanted) → do
@@ -1135,13 +1142,36 @@ stepPlanning service vs serial prep copies inputs prepared = case cellPrepProgre
                   then False <$ refuse service vs serial (prepBasis prep) (LimitSlots (length toBuild) free)
                   else writeBack service vs serial (Building prep (Candidate plan copies adapted toBuild Map.empty reused (not (null missing))))
 
+-- The planner's work done, not deferred past the timing: a step's preparation to its strict fields, a plan to its
+-- quads, pending spans and demand, a candidate to every part's instances and records.
+forcedStep ∷ Either e CellPrep → Either e CellPrep
+forcedStep = \case
+  Right next → next `seq` Right next
+  other → other
+
+forcedPlan ∷ Either e CellPlan → Either e CellPlan
+forcedPlan = \case
+  Right plan → length (cellPlanQuads plan) `seq` length (cellPlanPending plan) `seq` cellPlanDemand plan `seq` Right plan
+  other → other
+
+forcedCandidate ∷ Either e (Adapted, [(PartKey, [Instance], [MaterialRecord])]) → Either e (Adapted, [(PartKey, [Instance], [MaterialRecord])])
+forcedCandidate = \case
+  Right (adapted, parts) → foldr (\(_, instances, records) rest → foldr seq () instances `seq` foldr seq () records `seq` rest) () parts `seq` Right (adapted, parts)
+  other → other
+
 -- Time pure work on the owner's thread, into the current frame's planning total.
-timed ∷ TerrainViews k → IO a → IO a
+{-# NOINLINE timed #-}
+
+-- The work is a function of @()@, applied and evaluated between the two readings of the clock, so the compiler cannot
+-- evaluate it before the first.
+timed ∷ TerrainViews k → (() → a) → IO a
 timed service work = do
   start ← getMonotonicTimeNSec
-  result ← work
+  result ← evaluate (work ())
   end ← getMonotonicTimeNSec
-  atomically (modifyTVar' (svPlanningFrame service) (+ (end - start)))
+  atomically $ do
+    modifyTVar' (svPlanningFrame service) (+ (end - start))
+    modifyTVar' (svPlanningStep service) (+ (end - start))
   pure result
 
 -- Adapt the plan and group it into the candidate's chunks: render regions of 16 x 16 cells of the rotated view frame,
@@ -1431,7 +1461,10 @@ data ServiceReading k = ServiceReading
   , serviceFailures ∷ ![(k, Maybe ChunkRef, Text)]
   , serviceReserved ∷ !Integer
   , servicePlanningMax ∷ !Word64
-    -- ^ The greatest owner-thread planning time within one frame, in nanoseconds.
+    -- ^ The greatest owner-thread planning time between two presentations' enqueues, in nanoseconds.
+  , servicePlanningStepMax ∷ !Word64
+    -- ^ The greatest planning time of one owner step, in nanoseconds: a step runs alone in its owner round, so no frame
+    -- waits on more than one.
   }
 
 readTerrainViews ∷ TerrainViews k → STM (ServiceReading k)
@@ -1444,3 +1477,4 @@ readTerrainViews service =
     <*> readTVar (svFailed service)
     <*> pure (svReserved service)
     <*> ((\a b → max a b) <$> readTVar (svPlanningMax service) <*> readTVar (svPlanningFrame service))
+    <*> readTVar (svPlanningStepMax service)

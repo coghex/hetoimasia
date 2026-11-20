@@ -62,7 +62,8 @@ import Hetoimasia.GPU.Vulkan.GLFW
 import Hetoimasia.LuaEngine.Graphics.Scene
 import Hetoimasia.LuaEngine.Graphics.TerrainView hiding (styleAssets)
 import Hetoimasia.LuaEngine.Graphics.Texture
-import Hetoimasia.LuaEngine.Graphics.Window.Host (WindowTarget)
+import Hetoimasia.Foundation.Messaging.Payload (prepare)
+import Hetoimasia.LuaEngine.Graphics.Window.Host (WindowTarget (..))
 import Hetoimasia.LuaEngine.Graphics.Window.Port (Port (..), WindowToken (..))
 import Hetoimasia.LuaEngine.Graphics.Window.Provider (WindowRole (PresentationRole))
 import Hetoimasia.LuaEngine.Texture (newRenderAccount)
@@ -185,15 +186,28 @@ fullSpec env = describe "terrain views (full)" $
     within 300 . withLoaded env files $ \comp vm → withViews env comp vm $ \views _ lease style →
       withWindows env Nothing $ \wcomp wvm _ _ port _ → do
         window ← openWindow wcomp wvm port
+        noteWindows env 1
         let receipts = scenesReceipts (envScenes env)
+        -- a window view plans for its window's latest recorded frame: the window's empty scene asks for its first
+        empty ← prepare initialGraphicsScene
+        _ ← targetPublish window empty
+        _ ← waitWithin "the window's first frame" (latestFrameMetrics receipts (targetAttachment window) >>= maybe retry pure)
         view ←
           openView views (OpenRequest (windowViewTarget True receipts window) lease (pure (Right style)) (axis 0, axis 0, axis 1) defaultLightSettings)
             >>= either (\why → assertFailure ("the view was refused: " <> show why)) pure
-        let drawnAt revision = atomically $ do
+        let drawnAt revision = waitFor ("a receipt of revision " <> show revision) $ do
               reading ← readView view
               case readingDrawn reading of
                 Just drawn | tagRevision (drawnTag drawn) >= revision → pure drawn
                 _ → retry
+            waitFor what condition =
+              timeout 60000000 (atomically condition) >>= \case
+                Just value → pure value
+                Nothing → do
+                  readings ← atomically (viewReadings views)
+                  service ← atomically (readTerrainViews views)
+                  frames ← atomically (latestFrameMetrics receipts (targetAttachment window))
+                  assertFailure ("waited a minute for " <> what <> ": views " <> show readings <> ", occupied " <> show (Map.toList (serviceOccupied service)) <> ", failures " <> show (serviceFailures service) <> ", frame metrics " <> show frames)
         firstDrawn ← drawnAt 1
         let changes = [noConfigure {configureZoom = Just 0.5}, noConfigure {configureZoom = Just 2}, noConfigure {configureZoom = Just 1}]
         forM_ changes $ \change → do
@@ -204,14 +218,22 @@ fullSpec env = describe "terrain views (full)" $
           forM_ published (void . drawnAt)
         reading ← atomically (readTerrainViews views)
         let planning = servicePlanningMax reading
+            stepPlanning = servicePlanningStepMax reading
         _ ← closeView view
         Win.stopInstance wcomp wvm "w"
         evidence env
           ( "terrain views, real window: drawn at the presentation's enqueue (first receipt " <> tshow (drawnTag firstDrawn) <> " at "
               <> tshow (drawnMetrics firstDrawn) <> "), then through zoom 0.5, 2 and 1; greatest owner-thread planning time within one frame "
-              <> tshow planning <> " ns against the frame budget of " <> tshow frameBudget <> " ns (one 60 Hz refresh)"
-              <> (if planning <= frameBudget then "" else "; PLANNING EXCEEDS THE FRAME BUDGET")
+              <> tshow planning <> " ns between two presentations, and in one owner step (one round of the owner, which a frame follows) "
+              <> tshow stepPlanning <> " ns, against the frame budget of " <> tshow frameBudget <> " ns (one 60 Hz refresh)"
+              <> (if stepPlanning <= frameBudget then "" else "; PLANNING IN ONE OWNER STEP EXCEEDS THE FRAME BUDGET")
           )
+
+waitWithin ∷ String → STM a → IO a
+waitWithin what condition =
+  timeout 60000000 (atomically condition) >>= \case
+    Just value → pure value
+    Nothing → assertFailure ("waited a minute for " <> what)
 
 -- One 60 Hz refresh, in nanoseconds: the budget a frame of the owner has.
 frameBudget ∷ Word64
