@@ -118,6 +118,8 @@ module Hetoimasia.Terrain.Runtime.Internal.Types
 
     -- * State
   , Arena (..)
+  , ArenaMark (..)
+  , arenaMark
   , arenaAuthority
   , arenaRevision
   , FaultRecord (..)
@@ -737,6 +739,11 @@ data Service = Service
     -- lease's release, the service's end) and in no other: a holder watching for its
     -- authority's loss watches this, not the whole state.
     serviceAuthority ∷ !(TVar Word64)
+  , -- | Each arena's identity cell ('ArenaMark'), written by every state write that moves
+    -- that arena's content or knowledge revision or its residency generation, and by no
+    -- other; 'Nothing' once the arena has ended. A holder watching for an arena's new
+    -- version watches its cell, not the whole state, which every load writes.
+    serviceArenaMarks ∷ !(TVar (Map ArenaId (TVar (Maybe ArenaMark))))
   }
 
 -- ---------------------------------------------------------------------------
@@ -1086,6 +1093,18 @@ data Arena = Arena
   , arenaCreator ∷ !Word64
   , arenaLeases ∷ !(Set Word64)
   }
+
+-- | What a holder reads to know an arena has a new version: its committed content and
+-- knowledge revisions and its residency generation.
+data ArenaMark = ArenaMark
+  { markContent ∷ !Revision
+  , markKnowledge ∷ !Revision
+  , markGeneration ∷ !Word64
+  }
+  deriving (Eq, Show)
+
+arenaMark ∷ Arena → ArenaMark
+arenaMark arena = let auth = arenaAuthority arena in ArenaMark (D.authContent auth) (D.authKnowledge auth) (arenaGeneration arena)
 
 -- | The committed authority of an arena: its incarnation and its content, knowledge and
 -- store revisions, from the store's committed header.

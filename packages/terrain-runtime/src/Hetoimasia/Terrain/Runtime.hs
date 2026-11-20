@@ -171,6 +171,8 @@ module Hetoimasia.Terrain.Runtime
   , inspectRetainedChargesSTM
   , retainedBankUseSTM
   , authorityEpochSTM
+  , ArenaMark (..)
+  , arenaMarkSTM
   , inspectRegionalSTM
   , RegionalCharge
   , regionalChargeHold
@@ -426,7 +428,8 @@ withTerrainServiceFunded config ports body = do
       tag <- newUnique
       var <- newTVarIO (initialState config limits)
       authority <- newTVarIO 0
-      pure (Service tag var config (portAdmission ports) (portLogger ports) (portProbe ports) storage bank (spDirectory sp) storeConfig compileBank authority)
+      marks <- newTVarIO Map.empty
+      pure (Service tag var config (portAdmission ports) (portLogger ports) (portProbe ports) storage bank (spDirectory sp) storeConfig compileBank authority marks)
     -- Close admission, ask the owner to stop, and wait for both proofs: the
     -- owner's worker has published its terminal outcome, and no borrower is
     -- outstanding. There is no deadline and no detach. Any exception received
@@ -1019,6 +1022,32 @@ inspectRetainedChargesSTM svc = do
 -- whole state, which every load and settlement writes. It writes nothing.
 authorityEpochSTM ∷ Service → STM Word64
 authorityEpochSTM = readTVar . serviceAuthority
+
+-- | The identity cell of the arena a live lease names: a transaction reading the arena's
+-- content and knowledge revisions and its residency generation, from a cell written only
+-- in the transactions that move one of them ('Nothing' once the arena has ended). It is
+-- resolved through the lease once; reading it never reads the service's state, so a
+-- transaction that waits on it wakes for a new version of that arena and for nothing
+-- else, whatever other arenas and requests do. It says nothing about the lease, whose
+-- end 'authorityEpochSTM' reports.
+arenaMarkSTM ∷ Service → ArenaLease → STM (Either Refused (STM (Maybe ArenaMark)))
+arenaMarkSTM svc lease = do
+  st <- readSt svc
+  case leaseOf svc lease st of
+    Left refused → pure (Left refused)
+    Right (_, ls)
+      | not (leaseLive ls) → pure (Left RefusedAuthority)
+      | otherwise → case Map.lookup (leaseArena ls) (stateArenas st) of
+          Nothing → pure (Left RefusedAuthority)
+          Just arena → do
+            cells <- readTVar (serviceArenaMarks svc)
+            cell <- case Map.lookup (leaseArena ls) cells of
+              Just cell → pure cell
+              Nothing → do
+                cell <- newTVar (Just (arenaMark arena))
+                writeTVar (serviceArenaMarks svc) (Map.insert (leaseArena ls) cell cells)
+                pure cell
+            pure (Right (readTVar cell))
 
 -- | What the retained bank holds now: outstanding snapshots' backing, every regional borrow's charge and untaken
 -- results. It moves whenever a regional request is admitted, settles (its reservation becomes its footprint) or is

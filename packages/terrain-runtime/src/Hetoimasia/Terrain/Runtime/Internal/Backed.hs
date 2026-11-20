@@ -497,7 +497,7 @@ stepOpen svc ops rid = do
                   s ← readSt svc
                   let aid = ArenaId (stateNextArena s)
                       ident = StoreIdentity aid (stateNextSource s)
-                  writeTVar (serviceState svc) s {stateNextArena = stateNextArena s + 1, stateNextSource = stateNextSource s + 1}
+                  putSt svc s {stateNextArena = stateNextArena s + 1, stateNextSource = stateNextSource s + 1}
                   setPhase task (OpenSubmitting aid ident env shared held WakeNow)
     OpenSubmitting aid ident env shared held _
       | not alive → atomically (dropOpen svc rid held)
@@ -645,7 +645,7 @@ startGatherFor svc key aid what = do
       , Right (store', run) ← begin arena → do
           sameCommittedSTM aid st store'
           writeTVar (serviceEditBank svc) adm'
-          writeTVar (serviceState svc) (putStore aid store' st) {stateGathers = Map.insert key (GatherTask aid run grant (arenaRevision arena) (D.authKnowledge (arenaAuthority arena)) (arenaGeneration arena) WakeNow) (stateGathers st)}
+          putSt svc (putStore aid store' st) {stateGathers = Map.insert key (GatherTask aid run grant (arenaRevision arena) (D.authKnowledge (arenaAuthority arena)) (arenaGeneration arena) WakeNow) (stateGathers st)}
           pure True
     _ → pure False
   where
@@ -776,7 +776,7 @@ stepGatherTask svc key deliver = do
             s ← readSt svc
             forM_ (storeOfArena s aid) $ \(current, _) → do
               sameCommittedSTM aid s (release' current run)
-              writeTVar (serviceState svc) (putStore aid (release' current run) s) {stateGathers = Map.delete key (stateGathers s)}
+              putSt svc (putStore aid (release' current run) s) {stateGathers = Map.delete key (stateGathers s)}
             modifyTVar' (serviceEditBank svc) (releaseCredit (gatherGrant task))
             -- a regional borrow whose request ended while this build ran is released now it has drained, or
             -- once its delivery ends
@@ -949,7 +949,7 @@ grantSlot svc contender = do
         Left _ → pure False
         Right (grant, adm') → do
           writeTVar (serviceEditBank svc) adm'
-          writeTVar (serviceState svc) st {stateSlot = Just (SlotTask aid work (SlotTxn (Txn.start (arenaStore arena) planner)) (Just grant) WakeNow False (basisOf arena))}
+          putSt svc st {stateSlot = Just (SlotTask aid work (SlotTxn (Txn.start (arenaStore arena) planner)) (Just grant) WakeNow False (basisOf arena))}
           pure True
       -- the store the run is given, as internal work's idle mark records it ('slotBasis')
       basisOf arena = (storeVersion (arenaStore arena), oldestPin (arenaStore arena))
@@ -959,10 +959,10 @@ grantSlot svc contender = do
   case contender of
     -- a growth holds no transaction RAM: its extra is the backend's, charged there
     ContendGrowth rid aid proposal → live aid $ \arena → do
-      writeTVar (serviceState svc) st {stateSlot = Just (SlotTask aid (SlotGrowth rid) (SlotGrow (Growth.startGrowth proposal)) Nothing WakeNow False (basisOf arena))}
+      putSt svc st {stateSlot = Just (SlotTask aid (SlotGrowth rid) (SlotGrow (Growth.startGrowth proposal)) Nothing WakeNow False (basisOf arena))}
       pure True
     ContendRelease rid aid → live aid $ \arena → do
-      writeTVar (serviceState svc) st {stateSlot = Just (SlotTask aid (SlotRelease rid) (SlotGrow Growth.startRelease) Nothing WakeNow False (basisOf arena))}
+      putSt svc st {stateSlot = Just (SlotTask aid (SlotRelease rid) (SlotGrow Growth.startRelease) Nothing WakeNow False (basisOf arena))}
       pure True
     ContendRemoval rid aid tile → live aid $ \arena → txn aid arena (SlotRemoval rid) (removalPlanner (arenaEnv arena) (arenaStore arena) tile)
     ContendDiscovery aid → live aid $ \arena → txn aid arena SlotDiscovery (discoveryPlanner (arenaEnv arena) (arenaStore arena))
@@ -972,7 +972,7 @@ grantSlot svc contender = do
       Left _ → pure False
       Right (grant, adm') → do
         writeTVar (serviceEditBank svc) adm'
-        writeTVar (serviceState svc) st {stateSlot = Just (SlotTask aid (SlotWriteProbe rid) (SlotProbe (WriteProbe.startWriteProbe (arenaStore arena) pages)) (Just grant) WakeNow False (basisOf arena))}
+        putSt svc st {stateSlot = Just (SlotTask aid (SlotWriteProbe rid) (SlotProbe (WriteProbe.startWriteProbe (arenaStore arena) pages)) (Just grant) WakeNow False (basisOf arena))}
         pure True
 
 -- | Where a step left the slot's transaction, for the owner.

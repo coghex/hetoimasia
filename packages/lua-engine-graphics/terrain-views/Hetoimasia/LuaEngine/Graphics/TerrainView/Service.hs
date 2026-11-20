@@ -268,6 +268,9 @@ data ViewState k = ViewState
   , vsStyleIds ∷ !(Set.Set Word64)
     -- ^ The style's two texture identities: the view's GPU interests and what its worlds name.
   , vsArena ∷ !Runtime.ArenaLease
+  , vsArenaMark ∷ STM (Maybe Runtime.ArenaMark)
+    -- ^ The arena's identity cell (its revisions and residency generation), which the worker's dirty checks read
+    -- instead of the terrain service's state: a load in another arena, or a request, never wakes the view.
   , vsRuntimeView ∷ !Runtime.View
   , vsStyle ∷ !(TVar (Maybe AcquiredStyle))
     -- ^ The style the view holds, emptied as its close releases it: a closed handle a caller keeps reaches neither
@@ -654,7 +657,9 @@ newViewState service request style runtimeView camera light = do
     next ← readTVar (svNext service)
     writeTVar (svNext service) (next + 1)
     pure next
-  ViewState identity (attachTarget request) (styleIdentities style) (attachArena request) runtimeView
+  -- resolved through the lease once; an attachment whose lease is already gone fails its own checks
+  mark ← either (const (pure Nothing)) id <$> atomically (Runtime.arenaMarkSTM (portTerrain (svPorts service)) (attachArena request))
+  ViewState identity (attachTarget request) (styleIdentities style) (attachArena request) mark runtimeView
     <$> newTVarIO (Just style)
     <*> newTVarIO camera
     <*> newTVarIO light
@@ -1117,22 +1122,23 @@ viewDirty service state =
     Just BlockedOnPins → (< tvCpuPins (svConfig service)) . Map.size . fst <$> pinsKept service state
     Just BlockedOnMetrics → do
       metrics ← vtMetrics (vsTarget state)
-      status ← Runtime.arenaStatusSTM (portTerrain (svPorts service)) (vsArena state)
-      pure (isJust metrics && either (const False) (const True) status)
+      arena ← isJust <$> vsArenaMark state
+      pure (isJust metrics && arena)
     Nothing → unblockedDirty service state
 
 unblockedDirty ∷ (Ord k, Show k) ⇒ TerrainViews k → ViewState k → STM Bool
 unblockedDirty service state = do
   intent ← readTVar (vsIntent state)
   (prepared, revisions, metrics) ← readTVar (vsPrepared state)
-  status ← Runtime.arenaStatusSTM (portTerrain (svPorts service)) (vsArena state)
-  residency ← residencyNow service state
+  -- the arena's identity cell, never the terrain service's state: only a new version of this arena moves it (the
+  -- lease's own end is the authority epoch's)
+  current ← fmap (\m → (Runtime.markContent m, Runtime.markKnowledge m, Runtime.markGeneration m)) <$> vsArenaMark state
   now ← vtMetrics (vsTarget state)
+  -- what a waiting preparation watches is read only while it waits
   retryAt ← readTVar (vsRetry state)
-  mark ← retryMark service state
-  let current = arenaIdentity status residency
+  waited ← maybe (pure False) (\at → (/= at) <$> retryMark service state) retryAt
   continue ← readTVar (vsContinue state)
-  pure (intent /= prepared || current /= revisions || now /= metrics || maybe False (/= mark) retryAt || continue)
+  pure (intent /= prepared || current /= revisions || now /= metrics || waited || continue)
 
 -- What a waiting preparation watches: the service's releases, the target's newest adoption, the shared account's charge
 -- (moved by any of its consumers: coverage, view payloads or the terrain service's own staging), the owner's unsettled

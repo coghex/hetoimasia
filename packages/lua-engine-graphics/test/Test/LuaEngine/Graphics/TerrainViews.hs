@@ -2319,6 +2319,28 @@ stagesAndReaders = describe "stages, waits and readers" $ do
         (afterLoads - before') `shouldSatisfy` (<= 2)
       closeView view
 
+  it "never wakes an idle view's worker for edits committed in another arena: its dirty check reads its own arena's cell" $ do
+    evaluations ← newIORef (0 ∷ Int)
+    withViews $ \v → do
+      -- the target's retirement cell is read once a view each time the worker's selection is evaluated
+      let counted = (target v 1) {vtRetired = unsafeIOToSTM (atomicModifyIORef' evaluations (\n → (n + 1, ()))) >> vtRetired (target v 1)}
+      view ← attachOutcome v counted >>= \case
+        SettledOk view' → pure view'
+        _ → fail "the attachment did not succeed"
+      _ ← awaitPublished v 1
+      quiescent v
+      demandResident v view
+      quiescent v
+      other ← openArena (_vTerrain v) (vClient v) "other" loamOverGranite >>= either (fail . show) pure >>= Runtime.await (_vTerrain v) >>= either (fail . show) pure
+      before' ← readIORef evaluations
+      -- another arena's edits commit one at a time: every commit writes the terrain service's state
+      bounded . forM_ [0 .. 9 ∷ Integer] $ \i → do
+        removal ← Runtime.removeAt (_vTerrain v) other (tileAt (2 + i) 2 3) Nothing >>= either (fail . show) pure
+        void (Runtime.await (_vTerrain v) removal)
+      afterEdits ← readIORef evaluations
+      (afterEdits - before') `shouldSatisfy` (<= 2)
+      closeView view
+
   it "answers no hit for a point outside the target before any adoption and after a resize, not loading" $
     withViews $ \v → do
       view ← attached v 1
