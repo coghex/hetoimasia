@@ -42,10 +42,13 @@ import Hetoimasia.Render.TwoD.Vulkan.Chunks (ChunkStanding (..))
 import Hetoimasia.Terrain.Cell (mkMaterialId)
 import Hetoimasia.Terrain.Coordinate (AxisCoord, axisFromInteger, tileCoord)
 import Hetoimasia.Terrain.Render2D.AtlasFixtures (AtlasStyle (..), boundPackedTextures, loadAtlasStyle)
-import Hetoimasia.LuaEngine.Graphics.TerrainView.Inputs (combineCopies, planInputs)
+import Hetoimasia.LuaEngine.Graphics.TerrainView.Inputs (combineCopies, planInputs, plannerRuns)
+import qualified Hetoimasia.Terrain.Discovery as D
+import Hetoimasia.Terrain.Coordinate (RegionCoord (..))
+import Hetoimasia.Terrain.Render2D.Facts (Demand (..))
 import Hetoimasia.Terrain.Changes (ChangeLimits (..))
 import Hetoimasia.Terrain.Render2D.Camera (JumpTarget (..))
-import Hetoimasia.Terrain.Render2D.Cells (CellInputs (..), CellKey (..), CellPlan, CellRequest (..), PartKind (PartFog), cellPlanPending, cellPlanQuads, planCells, quadKey, quadPart)
+import Hetoimasia.Terrain.Render2D.Cells (CellDemand (..), CellInputs (..), CellKey (..), CellPlan, CellRequest (..), PartKind (PartFog), cellPlanDemand, cellPlanPending, cellPlanQuads, planCells, quadKey, quadPart)
 import Hetoimasia.Terrain.Render2D.Facts (TerrainFacts (..))
 import Hetoimasia.Terrain.Render2D.Material (recordLayout)
 import Hetoimasia.Terrain.Render2D.Presentation (pushBlockBytes)
@@ -363,6 +366,7 @@ viewTarget target =
   ViewTarget
     { vtKey = targetKey target
     , vtUsable = readTVar (targetUsable target)
+    , vtShowing = not . null <$> readTVar (targetScenes target)
     , vtAuthority = readTVar (targetAuthority target)
     , vtBind = pure ()
     , vtUnbind = pure ()
@@ -597,14 +601,23 @@ spec = describe "terrain views (TRA-9 v2)" $ do
           _ → False)
         atomically (readTVar (targetScenes target)) `shouldReturn` []
 
-    it "refuses a candidate whose copies hold more input runs and intervals than the profile allows, across split copies" $
-      withRig defaultOptions {optProfile = smallProfile {profileRuns = 1, profileRequestRegions = 1}} $ \rig → do
+    it "refuses a candidate whose copies hold more input runs and intervals than the profile allows, across split copies, counting every column's runs" $ do
+      -- one region's copy: its knowledge is one class of several runs shared by every column, which the planner is
+      -- handed column by column
+      (expanded, compressed) ← withRig defaultOptions $ \rig → do
+        snapshot ← withRegionSnapshot (rigTerrain rig) (rigLease rig) [RegionCoord 0 0 0] (either (fail . show) pure) >>= either (fail . show) pure
+        let classes = [D.regionKnowledgeClasses known | region ← regionSnapshotRegions snapshot, PartReady known ← [regionKnowledge snapshot region]]
+        case classes of
+          [[shared]] | length shared > 1 → pure (plannerRuns snapshot, length shared)
+          _ → fail ("the fixture's region is not one shared multi-run class: " <> show (map (map length) classes))
+      expanded `shouldSatisfy` (> compressed * 16)
+      -- one region's copy fits; two do not; the compressed count of every region the view copies would
+      withRig defaultOptions {optProfile = smallProfile {profileRuns = expanded, profileRequestRegions = 1}} $ \rig → do
         target ← newTarget 1
         view ← openOn rig target
         settleUntil rig (isJust . readingRefusal <$> readView view)
-        -- each copy holds one region: the cap is met by the copies together, as they are accepted
         atomically (readingRefusal <$> readView view) >>= (`shouldSatisfy` \case
-          Just (LimitRuns runs 1) → runs > 1
+          Just (LimitRuns runs limit) → limit == expanded && runs > expanded
           _ → False)
 
     it "refuses a view when the profile's targets are all open, or the target carries no qualified depth image" $
@@ -754,8 +767,9 @@ spec = describe "terrain views (TRA-9 v2)" $ do
 
     it "ends a view whose target incarnation retired, dropping its claim" $
       withPublished defaultOptions $ \rig target view → do
+        -- an idle target retires: the views notice it with no caller's kick
         atomically (writeTVar (targetUsable target) False)
-        atomically (kick (rigViews rig))
+        eventually (not . Seq.null <$> readTVar (rigQueue rig))
         settleUntil rig ((== ViewEnded EndTargetGone) . readingStatus <$> readView view)
         atomically (claimOf (rigClaims rig) 1) `shouldReturn` Nothing
 
@@ -836,29 +850,47 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         atomically (serviceOccupied <$> readTerrainViews (rigViews rig)) `shouldReturn` Map.empty
 
     it "waits for the owner's running build before the service returns its reservation, and disposes of what it built" $ do
-      held ← newIORef Nothing
-      withRig defaultOptions $ \rig → do
-        writeIORef held (Just rig)
-        target ← newTarget 1
-        _ ← openOn rig target
-        first ← readTVarIO (rigNext rig)
-        atomically (writeTVar (rigHold rig) (Just first))
-        stop ← newTVarIO False
-        let owner = do
-              runOwner rig
-              continue ← atomically ((False <$ (readTVar stop >>= check)) `orElse` (True <$ (readTVar (rigQueue rig) >>= check . not . Seq.null)))
-              when continue owner
-        -- the build is held across the body's end; the scope's drain waits for the step, which is resumed from here
-        _ ← withOwnedThread owner $ \_ _ → do
-          timeout 10000000 (atomically (takeTMVar (rigEntered rig))) >>= maybe (expectationFailure "no build was held") pure
+      box ← newEmptyTMVarIO
+      bodyEnded ← newTVarIO False
+      seenHeld ← newTVarIO False
+      stop ← newTVarIO False
+      charged ← newEmptyTMVarIO
+      -- the owner and the example's controller outlive the service's scope: the build is held across its exit
+      let owner = do
+            rig ← atomically (readTMVar box)
+            let loop = do
+                  runOwner rig
+                  continue ← atomically ((False <$ (readTVar stop >>= check)) `orElse` (True <$ (readTVar (rigQueue rig) >>= check . not . Seq.null)))
+                  when continue loop
+            loop
+          controller = do
+            rig ← atomically (readTMVar box)
+            timeout 10000000 (atomically (takeTMVar (rigEntered rig))) >>= maybe (fail "no build was held") pure
+            atomically (writeTVar seenHeld True)
+            -- the body has returned and the scope's drain waits for the held step: the reservation is still charged
+            atomically (readTVar bodyEnded >>= check)
+            atomically (accountCharged (rigAccount rig)) >>= atomically . putTMVar charged
+            atomically (putTMVar (rigResume rig) ())
+      withOwnedThread owner $ \_ _ →
+        withOwnedThread controller $ \_ controllerEnded → do
+          withRig defaultOptions {optTeardown = TeardownNone} $ \rig → do
+            target ← newTarget 1
+            _ ← openOn rig target
+            held ← readTVarIO (rigNext rig)
+            atomically (writeTVar (rigHold rig) (Just held))
+            atomically (putTMVar box rig)
+            timeout 10000000 (atomically (readTVar seenHeld >>= check)) >>= maybe (expectationFailure "the build was never held") pure
+            atomically (writeTVar bodyEnded True)
+          controllerEnded
           atomically (writeTVar stop True)
-        _ ← withOwnedThread (atomically (putTMVar (rigResume rig) ())) $ \_ _ → pure ()
-        pure ()
-      rig ← readIORef held >>= maybe (fail "the rig never started") pure
-      atomically (accountCharged (rigAccount rig)) `shouldReturn` 0
-      readTVarIO (rigChunks rig) `shouldReturn` Map.empty
-      attempts ← readTVarIO (rigAttempts rig)
-      Map.elems attempts `shouldSatisfy` all (== 1)
+          rig ← atomically (readTMVar box)
+          whileHeld ← atomically (takeTMVar charged)
+          whileHeld `shouldSatisfy` (> 0)
+          atomically (accountCharged (rigAccount rig)) `shouldReturn` 0
+          held ← subtract 1 <$> readTVarIO (rigNext rig)
+          readTVarIO (rigChunks rig) `shouldReturn` Map.empty
+          -- the chunk the held build made was disposed of exactly once
+          Map.lookup (chunkRef held 1) <$> readTVarIO (rigAttempts rig) >>= (`shouldBe` Just 1)
 
     it "keeps a released chunk's slot until the backend confirms its disposal; a failed disposal keeps it with its cause" $
       withPublished defaultOptions $ \rig target view → do
@@ -901,6 +933,32 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         adopt rig first
         meetBarriers rig
         settleUntil rig (Map.null . serviceOccupied <$> readTerrainViews (rigViews rig))
+        _ ← openOn rig second
+        pure ()
+
+    it "counts a target's first build under way against the profile's targets, and its close as retiring" $
+      withRig defaultOptions {optProfile = smallProfile {profileTargets = 1}} $ \rig → do
+        first ← newTarget 1
+        view ← openOn rig first
+        index ← readTVarIO (rigNext rig)
+        atomically (writeTVar (rigHold rig) (Just index))
+        stop ← newTVarIO False
+        let owner = do
+              runOwner rig
+              continue ← atomically ((False <$ (readTVar stop >>= check)) `orElse` (True <$ (readTVar (rigQueue rig) >>= check . not . Seq.null)))
+              when continue owner
+        second ← newTarget 2
+        style ← styleOf rig
+        withOwnedThread owner $ \_ ended → do
+          timeout 10000000 (atomically (takeTMVar (rigEntered rig))) >>= maybe (expectationFailure "no build was held") pure
+          closeView view `shouldReturn` CloseRetiring
+          refused ← openView (rigViews rig) (OpenRequest (viewTarget second) (rigLease rig) (pure (Right style)) (axis 0, axis 0, axis 1) defaultLightSettings)
+          either Just (const Nothing) refused `shouldBe` Just OpenTooManyViews
+          atomically (putTMVar (rigResume rig) ())
+          atomically (writeTVar stop True)
+          ended
+        settleUntil rig (Map.null . serviceOccupied <$> readTerrainViews (rigViews rig))
+        Map.findWithDefault 0 (chunkRef index 1) <$> readTVarIO (rigAttempts rig) >>= (`shouldBe` 1)
         _ ← openOn rig second
         pure ()
 
@@ -974,21 +1032,37 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         failures ← atomically (serviceFailures <$> readTerrainViews (rigViews rig))
         [chunk | (_, Just chunk, cause) ← failures, "lane refused" `Text.isInfixOf` cause] `shouldMatchList` Set.toList (worldChunks world)
 
-    it "settles a move with pressure when its destination is beyond the profile's regions, and bounds every copy round by them" $
+    it "refuses a plan whose visible demand exceeds the profile's regions, never publishing it as loading, and settles a move beyond them with pressure" $
       withRig defaultOptions {optProfile = smallProfile {profileRegions = 1}} $ \rig → do
         target ← newTarget 1
         view ← openOn rig target
-        settleUntil rig (publishedAtLeast view 1)
-        drawn ← do
-          world ← atomically (latestWorld target) >>= maybe (fail "no world") pure
-          atomically (noteSubmitted (rigReceipts rig) (worldTag world) (worldMetrics world))
-          atomically (viewDrawn view) >>= maybe (fail "nothing drawn") pure
-        fmap Set.size (drawnPlanRegions drawn) `shouldBe` Just 1
+        settleUntil rig (isJust . readingRefusal <$> readView view)
+        atomically (readingRefusal <$> readView view) >>= (`shouldSatisfy` \case
+          Just (LimitRegions visible 1) → visible > 1
+          _ → False)
+        atomically (latestWorld target) `shouldReturn` Nothing
         Right move ← atomically (moveView view (JumpTarget (axis 70) (axis 70) Nothing))
         settleUntil rig (isJust <$> moveSettled move)
         atomically (moveSettled move) >>= (`shouldSatisfy` \case
           Just (MovePressure (LimitRegions _ 1)) → True
           _ → False)
+
+    it "copies the current visible demand first after a camera move, and publishes it with nothing visible loading" $ do
+      -- the regions a first view copies, measured: the second service's profile holds exactly that many
+      copied ← withPublished defaultOptions $ \rig target view → do
+        world ← atomically (latestWorld target) >>= maybe (fail "no world") pure
+        atomically (noteSubmitted (rigReceipts rig) (worldTag world) (worldMetrics world))
+        drawn ← atomically (viewDrawn view) >>= maybe (fail "nothing drawn") pure
+        maybe (fail "no regions") (pure . Set.size) (drawnPlanRegions drawn)
+      withPublished defaultOptions {optProfile = smallProfile {profileRegions = copied}} $ \rig target view → do
+        Right move ← atomically (moveView view (JumpTarget (axis 70) (axis 70) (Just (axis 1))))
+        settleUntil rig (publishedAtLeast view 2)
+        atomically (moveSettled move) `shouldReturn` Just MoveLanded
+        world ← atomically (latestWorld target) >>= maybe (fail "no world") pure
+        atomically (noteSubmitted (rigReceipts rig) (worldTag world) (worldMetrics world))
+        drawn ← atomically (viewDrawn view) >>= maybe (fail "nothing drawn") pure
+        plan ← maybe (fail "the drawn plan is not pinned") pure (drawnPlanPlan drawn)
+        demandChunks (cdVisible (cellPlanDemand plan)) `shouldBe` []
 
     it "refuses a replacement whose plan meets a plan-wide bound, and keeps the drawing" $
       withPublished defaultOptions {optProfile = smallProfile {profileQuads = 4096}} $ \rig target view → do
@@ -1029,9 +1103,25 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         view ← openOn rig target
         scenes ← readTVarIO (targetScenes target)
         map (graphicsWorld . snd) scenes `shouldBe` [Nothing]
-        -- the frame it asked for is recorded at these metrics, and its event asks for a step
-        atomically (writeTVar (targetMetrics target) (Just (metricsOf 320 240)) >> kick (rigViews rig))
+        -- the frame it asked for is recorded at these metrics: the views notice them with no caller's kick
+        atomically (writeTVar (targetMetrics target) (Just (metricsOf 320 240)))
+        eventually (not . Seq.null <$> readTVar (rigQueue rig))
         settleUntil rig (publishedAtLeast view 1)
+
+    it "keeps a window's M1 scene on open, and when the first terrain candidate is refused" $
+      withRig defaultOptions {optWindow = 64} $ \rig → do
+        target ← newTarget 1
+        m1 ← prepare initialGraphicsScene
+        atomically (writeTVar (targetScenes target) [(1, preparedValue m1)] >> writeTVar (targetMetrics target) Nothing)
+        view ← openOn rig target
+        -- the scene it shows stays: its frame's metrics, once noticed, start the view
+        map fst <$> readTVarIO (targetScenes target) >>= (`shouldBe` [1])
+        atomically (writeTVar (targetMetrics target) (Just (metricsOf 320 240)))
+        settleUntil rig (isJust . readingRefusal <$> readView view)
+        map fst <$> readTVarIO (targetScenes target) >>= (`shouldBe` [1])
+        -- closed with its claim never published: returned directly, the M1 scene still shown
+        _ ← closeView view
+        map fst <$> readTVarIO (targetScenes target) >>= (`shouldBe` [1])
 
   describe "the service's end" $ do
     it "ends every view, drains its retirements and returns the reservation" $ do

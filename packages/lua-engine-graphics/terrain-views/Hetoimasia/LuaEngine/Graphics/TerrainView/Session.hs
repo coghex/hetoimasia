@@ -186,13 +186,16 @@ data TerrainViewsRefused
 
 instance Exception TerrainViewsRefused
 
--- | A target a view attaches to: its incarnation's key, whether it is usable, the caller's original authority over it
+-- | A target a view attaches to: its incarnation's key, whether it is usable, whether it shows a scene already, the
+-- caller's original authority over it
 -- (its window lease, checked in the open's commit), its latest-value publication as the host's own transaction,
 -- what the view binds and unbinds on it from its open to its close, whether its frames carry the qualified depth
 -- image and the metrics its next frame is recorded with.
 data ViewTarget k = ViewTarget
   { vtKey ∷ !k
   , vtUsable ∷ STM Bool
+  , vtShowing ∷ STM Bool
+    -- ^ Whether the target holds a published scene (an M1 scene, say), whose frame is or was drawn.
   , vtAuthority ∷ STM Bool
   , vtBind ∷ STM ()
   , vtUnbind ∷ STM ()
@@ -279,7 +282,8 @@ data Planned = Planned
   , plannedCamera ∷ !CameraState
   , plannedVisible ∷ ![RegionCoord]
   , plannedPrefetch ∷ ![RegionCoord]
-  , plannedNext ∷ !(Either [RegionCoord] (Adapted, [(PartKey, [Instance], [MaterialRecord])], Bool))
+  , plannedNext ∷ !(Either (Bool, [RegionCoord]) (Adapted, [(PartKey, [Instance], [MaterialRecord])], Bool))
+    -- ^ Another copy round (afresh, dropping the copies so far, or adding to them), or the candidate's parts.
   }
 
 data Candidate = Candidate
@@ -345,8 +349,8 @@ data ViewState k = ViewState
   , vsRuntime ∷ !Runtime.View
   , vsStyle ∷ !ViewStyle
   , vsMarkCell ∷ STM (Maybe ArenaMark)
-  , vsSeen ∷ !(TVar (Maybe ArenaMark, Word64))
-    -- ^ The watcher's last reading of the arena's mark and the authority epoch.
+  , vsSeen ∷ !(TVar (Maybe ArenaMark, Word64, Bool, Maybe TargetMetrics))
+    -- ^ The watcher's last reading of the arena's mark, the authority epoch, the target's usability and its metrics.
   , vsStatus ∷ !(TVar ViewStatus)
   , vsCamera ∷ !(TVar CameraState)
   , vsLight ∷ !(TVar LightSettings)
@@ -529,7 +533,8 @@ newService config ports allowance = do
       , svReserved = allowance
       }
 
--- The watcher: signals only. It blocks until a view's arena mark or the authority epoch moves, until the views' own
+-- The watcher: signals only. It blocks until a view's arena mark, the authority epoch, its target's usability or its
+-- target's metrics move (an idle target's retirement or first frame), until the views' own
 -- outstanding work can go on (a refused kick, a barrier to ask, a chunk to release, a confirmed disposal, a completed
 -- offscreen batch), or until the owner has ended; then it asks for the owner's next step, or ends every view.
 watch ∷ (Ord k, Show k) ⇒ TerrainViews k → STM Bool → IO ()
@@ -553,8 +558,11 @@ watch service stopping = loop
       epoch ← Runtime.authorityEpochSTM (portTerrain (svPorts service))
       moved ← fmap or . forM views $ \vs → do
         mark ← vsMarkCell vs
+        usable ← vtUsable (vsTarget vs)
+        metrics ← vtMetrics (vsTarget vs)
         seen ← readTVar (vsSeen vs)
-        if seen == (mark, epoch) then pure False else True <$ writeTVar (vsSeen vs) (mark, epoch)
+        let now = (mark, epoch, usable, metrics)
+        if seen == now then pure False else True <$ writeTVar (vsSeen vs) now
       if moved then kick service else retry
     work = do
       swept ← sweepOffscreen (portReceipts (svPorts service))
@@ -770,9 +778,9 @@ data OpenRefusal
 -- | Open a view of an arena on a target. It settles here, at attachment: the style is retained and checked, then
 -- one transaction checks the session, the original window and style leases, the target, the arena, the style's
 -- coverage of the arena's palette, the targets in use and the exclusive claim shared with M1, and takes the claim,
--- the style's GPU interests, the receipt and the view. A target with no frame metrics yet is published the real empty
--- revision in that transaction, which asks it for the first frame its views plan for. A refusal leaves nothing
--- behind.
+-- the style's GPU interests, the receipt and the view. A target that shows nothing and has no frame metrics yet is
+-- published the real empty revision in that transaction, which asks it for the first frame its views plan for; a
+-- target showing a scene keeps it until the view's first revision is published. A refusal leaves nothing behind.
 openView ∷ (Ord k, Show k) ⇒ TerrainViews k → OpenRequest k → IO (Either OpenRefusal (TerrainView k))
 openView service request = mask $ \restore → do
   let ports = svPorts service
@@ -812,7 +820,7 @@ newViewState ∷ TerrainViews k → OpenRequest k → ViewStyle → Runtime.View
 newViewState service request style rview markCell camera = do
   incarnation ← atomically (newClaimHolder (portClaims (svPorts service)))
   ViewState incarnation (openTarget request) (openLease request) rview style markCell
-    <$> newTVarIO (Nothing, 0)
+    <$> newTVarIO (Nothing, 0, True, Nothing)
     <*> newTVarIO ViewOpen
     <*> newTVarIO camera
     <*> newTVarIO (openLight request)
@@ -859,8 +867,11 @@ commitOpen service vs = do
             writeTVar (svViews service) (Map.insert (vsId vs) vs views)
             openReceipt (portReceipts ports) (vsId vs)
             vtBind target
+            -- a target that shows nothing yet is asked for its first frame with the real empty revision; one that shows
+            -- a scene keeps it until the view's first revision replaces it (its frame gives the metrics)
             metrics ← vtMetrics target
-            when (isNothing metrics) (void (vtPublish target (portInitial ports)))
+            shown ← vtShowing target
+            when (isNothing metrics && not shown) (void (vtPublish target (portInitial ports)))
             pure (Right ())
 
 -- ---------------------------------------------------------------------------
@@ -996,7 +1007,8 @@ closeView (TerrainView service vs) =
       atomically $ do
         retiring ← readTVar (svRetiring service)
         held ← (\a b c → a <> b <> map fst c) <$> readTVar (svPrivate service) <*> readTVar (svInHand service) <*> readTVar (svDisposing service)
-        pure (if any ((== vsId vs) . rtView) retiring || any (\(_, v, _) → v == vsId vs) held then CloseRetiring else CloseDone)
+        occupied ← Map.member (vtKey (vsTarget vs)) <$> readTVar (svSlots service)
+        pure (if occupied || any ((== vsId vs) . rtView) retiring || any (\(_, v, _) → v == vsId vs) held then CloseRetiring else CloseDone)
 
 -- End a view, once: 'False' when it had already ended. The transaction does every state change; the terrain service's
 -- calls and the style's release follow it.
@@ -1178,7 +1190,7 @@ startIfDue service vs basis = atomically $ do
           anchor = anchorRegion camera
           jumpTo = maybe [] (\p → [targetRegion (pendingTarget p) (camClip camera)]) (camPending camera)
           -- the anchor's region and a pending jump's destination first, then the demand nearest the anchor
-          wanted = take (profileRegions profile) (nubOrdered (anchor : jumpTo <> ordered anchor demand))
+          wanted = take (profileRegions profile) (nubOrdered (anchor : jumpTo <> demand))
       writeTVar (vsStage vs) (Copying (Prep basis metrics (profileRounds profile - 1) (Set.fromList wanted) 0) wanted [] Nothing)
       pure True
     _ → pure False
@@ -1408,16 +1420,22 @@ planOf service style light inputs prep = do
       camera = crCamera (inputsRequest inputs)
       visible = regionsOf (cdVisible (cellPlanDemand plan))
       prefetch = regionsOf (cdPrefetch (cellPlanDemand plan))
-      room = max 0 (profileRegions profile - Set.size (prepRegions prep))
-      unasked = filter (`Set.notMember` prepRegions prep) (ordered (anchorRegion (crCamera (inputsRequest inputs))) visible)
-      -- what fits the profile's regions; what is beyond them stays loading in the published revision
-      fits = take room unasked
-  if not (null fits) && prepRounds prep > 0
-    then Right (Planned plan camera visible prefetch (Left fits))
-    else do
-      (adapted, parts) ← candidateOf service style plan light
-      -- regions that fit but had no copy round left: the view prepares again to copy them
-      Right (Planned plan camera visible prefetch (Right (adapted, parts, not (null fits))))
+      limit = profileRegions profile
+      room = max 0 (limit - Set.size (prepRegions prep))
+      current = ordered (anchorRegion (crCamera (inputsRequest inputs))) visible
+      unasked = filter (`Set.notMember` prepRegions prep) current
+      candidate incomplete = do
+        (adapted, parts) ← candidateOf service style plan light
+        Right (Planned plan camera visible prefetch (Right (adapted, parts, incomplete)))
+  if
+    | null unasked → candidate False
+    -- the current visible demand never fits the profile's regions: refused, the drawing kept
+    | length current > limit → Left (LimitRegions (length current) limit)
+    | prepRounds prep > 0 && length unasked <= room → Right (Planned plan camera visible prefetch (Left (False, unasked)))
+    -- it fits only without the copies so far (a previous camera's demand): another round copies it afresh
+    | prepRounds prep > 0 → Right (Planned plan camera visible prefetch (Left (True, current)))
+    -- no copy round left: published with that coverage loading, and the view prepares again for it
+    | otherwise → candidate True
   where
     failed what why = Left (LimitFailure (what <> ": " <> Text.pack (show why)))
     -- a plan-wide bound is a refusal: a halted plan is never published as if it were complete
@@ -1434,7 +1452,7 @@ forcedPlanned = \case
     let plan = plannedPlan planned
         parts = case plannedNext planned of
           Right (_, made, _) → foldr (\(_, instances, records) rest → foldr seq () instances `seq` foldr seq () records `seq` rest) () made
-          Left missing → foldr seq () missing
+          Left (_, missing) → foldr seq () missing
      in length (cellPlanQuads plan) `seq` length (cellPlanPending plan) `seq` length (plannedVisible planned) `seq` length (plannedPrefetch planned) `seq` parts `seq` Right planned
   other → other
 
@@ -1446,11 +1464,14 @@ stepPlanning service vs serial prep copies box =
     Nothing → pure False
     Just (Left limit) → False <$ atomically (refuse service vs serial (prepBasis prep) limit)
     Just (Right planned) → case plannedNext planned of
-      Left missing → atomically (writeBack service vs serial (Copying prep {prepRounds = prepRounds prep - 1, prepRegions = prepRegions prep <> Set.fromList missing} missing (copySnapshots copies) Nothing))
+      Left (False, missing) → atomically (writeBack service vs serial (Copying prep {prepRounds = prepRounds prep - 1, prepRegions = prepRegions prep <> Set.fromList missing} missing (copySnapshots copies) Nothing))
+      -- the current visible demand did not fit beside the copies so far (a previous camera's): copied afresh
+      Left (True, visible) → atomically (writeBack service vs serial (Copying prep {prepRounds = prepRounds prep - 1, prepRegions = Set.fromList visible, prepRuns = 0} visible [] Nothing))
       Right (adapted, wanted, incomplete) → do
         let profile = tvProfile (svConfig service)
             plan = plannedPlan planned
-        atomically (writeTVar (vsDemand vs) (Set.toList (prepRegions prep) <> plannedVisible planned))
+        -- the next preparation's first round: this plan's visible regions first, then the rest it copied
+        atomically (writeTVar (vsDemand vs) (nubOrdered (plannedVisible planned <> Set.toList (prepRegions prep))))
         setDemand service vs (plannedVisible planned <> plannedPrefetch planned)
         parts ← readTVarIO (vsParts vs)
         -- the reuse comparison is the owner's own planning work, timed into the frame's total
@@ -1558,21 +1579,28 @@ stepBuilding service hands vs serial prep candidate = case cdWanted candidate of
       Just (ChunkFailed _) → True
       Nothing → True
       _ → False
-    -- Each chunk is handed on in the transaction after its build: it occupies its target's slot, and goes to the
-    -- candidate while the stage is still this step's, otherwise to disposal. A stage replaced meanwhile stops the batch.
+    -- Each chunk is handed on in the transaction after its build: to the candidate while the stage is still this
+    -- step's, otherwise to disposal. A stage replaced meanwhile stops the batch.
+    -- The chunk's slot is taken before its build, in the transaction that finds the stage still this step's, so the
+    -- target counts against the profile's targets while the build is under way; a refused build gives it back.
     buildEach [] = pure Nothing
     buildEach ((key, instances, records) : more) = do
-      mine ← atomically ((== serial) <$> readTVar (vsStageSerial vs))
-      if not mine
-        then pure Nothing
-        else do
-          outcome ← mask $ \_ →
-            handBuild hands instances records >>= \case
-              Left why → pure (Just why)
+      outcome ← mask $ \_ → do
+        mine ← atomically $ do
+          current ← (== serial) <$> readTVar (vsStageSerial vs)
+          when current (occupy service tkey 1)
+          pure current
+        if not mine
+          then pure (Just Nothing)
+          else
+            (handBuild hands instances records `onException` atomically (occupy service tkey (-1))) >>= \case
+              Left why → Just (Just why) <$ atomically (occupy service tkey (-1))
               Right chunk → Nothing <$ atomically (handOn key (Part chunk instances records))
-          maybe (buildEach more) (pure . Just) outcome
+      case outcome of
+        Nothing → buildEach more
+        Just stopped → pure stopped
+    tkey = vtKey (vsTarget vs)
     handOn key part = do
-      occupy service (vtKey (vsTarget vs)) 1
       current ← readTVar (vsStageSerial vs)
       status ← readTVar (vsStatus vs)
       stage ← readTVar (vsStage vs)

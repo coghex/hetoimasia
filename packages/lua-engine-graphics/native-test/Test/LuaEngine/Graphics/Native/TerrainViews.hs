@@ -73,7 +73,9 @@ import Hetoimasia.Terrain.Coordinate (AxisCoord, axisFromInteger, tileCoord)
 import Hetoimasia.Terrain.Render2D.AtlasFixtures (AtlasStyle (..), boundPackedTextures, findSampleDirectory, loadAtlasStyle)
 import Hetoimasia.Terrain.Render2D.Presentation (defaultLightSettings)
 import Hetoimasia.Terrain.Residency (Limits, LimitsSpec (..), mkLimits)
+import Data.Maybe (fromMaybe)
 import Hetoimasia.Terrain.Cell (mkMaterialId)
+import Hetoimasia.Terrain.Render2D.Camera (camZoom)
 import Hetoimasia.Terrain.Runtime hiding (closeView, openView)
 import Hetoimasia.Terrain.Runtime.Storage (filesystemOf, minHeadroomBytes, mkStorageConfig)
 import Hetoimasia.Terrain.Runtime.Store (StoreSpec (..), defaultStoreSpec, minAllowanceBytes)
@@ -190,7 +192,7 @@ fullSpec env = describe "terrain views (full)" $
         let receipts = scenesReceipts (envScenes env)
         -- opened directly on the fresh window: the open asks it for the first frame its view plans for
         view ←
-          openView views (OpenRequest (windowViewTarget True receipts (pure True) window) lease (pure (Right style)) (axis 0, axis 0, axis 1) defaultLightSettings)
+          openView views (OpenRequest (windowViewTarget (envHost env) True receipts (pure True) window) lease (pure (Right style)) (axis 0, axis 0, axis 1) defaultLightSettings)
             >>= either (\why → assertFailure ("the view was refused: " <> show why)) pure
         let drawnAt revision = waitFor ("a receipt of revision " <> show revision) $ do
               reading ← readView view
@@ -207,20 +209,27 @@ fullSpec env = describe "terrain views (full)" $
                   assertFailure ("waited a minute for " <> what <> ": views " <> show readings <> ", occupied " <> show (Map.toList (serviceOccupied service)) <> ", failures " <> show (serviceFailures service) <> ", frame metrics " <> show frames)
         firstDrawn ← drawnAt 1
         let changes = [noConfigure {configureZoom = Just 0.5}, noConfigure {configureZoom = Just 2}, noConfigure {configureZoom = Just 1}]
+        -- each change is drawn: a new revision presented, its pinned camera at the requested zoom
         forM_ changes $ \change → do
           before ← atomically (readingPublished <$> readView view)
           atomically (configureView view change) >>= either (\why → assertFailure ("the change was refused: " <> show why)) pure
-          atomically (readView view >>= \reading → check (readingPublished reading > before || readingRefusal reading /= Nothing))
-          published ← atomically (readingPublished <$> readView view)
-          forM_ published (void . drawnAt)
+          published ← fmap (fromMaybe (Left Nothing)) . timeout 60000000 . atomically $ do
+            reading ← readView view
+            case (readingRefusal reading, readingPublished reading) of
+              (Just limit, _) → pure (Left (Just limit))
+              (_, Just revision) | Just revision > before → pure (Right revision)
+              _ → retry
+          revision ← either (\limit → assertFailure ("the change was not published: " <> maybe "waited a minute" show limit)) pure published
+          drawn ← drawnAt revision
+          tagRevision (drawnTag drawn) `shouldSatisfy` (>= revision)
+          plan ← atomically (viewDrawn view) >>= maybe (assertFailure "the receipt vanished") pure
+          fmap camZoom (drawnPlanCamera plan) `shouldBe` configureZoom change
         reading ← atomically (readTerrainViews views)
         let planning = servicePlanningMax reading
             stepPlanning = servicePlanningStepMax reading
             owned = serviceOwnerMax reading
             ownedStep = serviceOwnerStepMax reading
         _ ← closeView view
-        -- the window's frame metrics are kept only while a view watches it
-        atomically (latestFrameMetrics receipts (targetAttachment window)) >>= (`shouldBe` Nothing)
         Win.stopInstance wcomp wvm "w"
         evidence env
           ( "terrain views, real window: drawn at the presentation's enqueue (first receipt " <> tshow (drawnTag firstDrawn) <> " at "

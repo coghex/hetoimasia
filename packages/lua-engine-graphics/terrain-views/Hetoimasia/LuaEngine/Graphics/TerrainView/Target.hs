@@ -14,6 +14,8 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView.Target
 
 import Control.Concurrent.STM (STM, atomically)
 import Data.Functor ((<&>))
+import qualified Data.Map.Strict as Map
+import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Word (Word32)
@@ -31,6 +33,9 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , WindowScenePublication (..)
   , awaitVulkanAction
   , readTicket
+  , readVulkanSceneState
+  , VulkanSceneState (..)
+  , WindowSceneStanding (..)
   , publishVulkanTargetScene
   , recordVulkanTargetBatch
   , submitVulkanAction
@@ -48,12 +53,14 @@ import Hetoimasia.Render.TwoD.Metrics (TargetMetrics)
 -- | A window incarnation's target. Its depth is the host's: 'True' only on a host built with the window depth a world
 -- scene draws with ('Hetoimasia.LuaEngine.Graphics.Scene.Configuration.configureWorldDepth'), which the composition
 -- passes here. Its metrics are those of the window's latest recorded frame ('latestFrameMetrics'), kept from the
--- view's open to its close. Its authority is the caller's original window lease (checked in the open's commit).
-windowViewTarget ∷ Bool → DrawReceipts → STM Bool → WindowTarget GraphicsScene → ViewTarget SceneTargetKey
-windowViewTarget hostDepth receipts authority target =
+-- view's open to its close. Its authority is the caller's original window lease (checked in the open's commit). It
+-- shows a scene once the host holds one published for it.
+windowViewTarget ∷ VulkanHost GraphicsScene → Bool → DrawReceipts → STM Bool → WindowTarget GraphicsScene → ViewTarget SceneTargetKey
+windowViewTarget host hostDepth receipts authority target =
   ViewTarget
     { vtKey = KeyWindow (targetWindow target)
     , vtUsable = targetUsable target
+    , vtShowing = showing host (KeyWindow (targetWindow target))
     , vtAuthority = authority
     , vtBind = watchFrameMetrics receipts (targetAttachment target)
     , vtUnbind = unwatchFrameMetrics receipts (targetAttachment target)
@@ -72,6 +79,7 @@ offscreenViewTarget host target usable metrics =
   ViewTarget
     { vtKey = KeyOffscreen target
     , vtUsable = usable
+    , vtShowing = showing host (KeyOffscreen target)
     , vtAuthority = usable
     , vtBind = pure ()
     , vtUnbind = pure ()
@@ -82,6 +90,10 @@ offscreenViewTarget host target usable metrics =
     , vtDepth = True
     , vtMetrics = metrics
     }
+
+-- Whether the host holds a scene published for this target.
+showing ∷ VulkanHost GraphicsScene → SceneTargetKey → STM Bool
+showing host key = maybe False ((> 0) . fromMaybe 0 . windowPublished) . Map.lookup key . sceneWindows <$> readVulkanSceneState host
 
 -- | Record the world the host adopted for a registered offscreen target into the caller's colour image (of this
 -- format) and @D32_SFLOAT@ depth image, then the caller's own commands in the same batch (a copy to a readback, say),

@@ -19,8 +19,9 @@
 -- was. Only a live view incarnation's receipt moves: a view is registered at its open ('openReceipt') and forgotten at
 -- its close ('forgetReceipt'), which also drops whatever of it was recorded and not yet promoted.
 --
--- Frame metrics are kept only for the window attachments a view watches ('watchFrameMetrics'), from its open to its
--- close, so ordinary window churn leaves nothing behind.
+-- Frame metrics are kept for the most recently drawn window attachments, at most 'metricsKept' of them, so a window
+-- already showing a scene has its metrics when a view opens on it and window churn leaves a bounded record. An
+-- attachment a view watches ('watchFrameMetrics', from its open to its close) is never evicted.
 --
 -- = Owned state, threads and lifetime
 --
@@ -62,7 +63,7 @@ module Hetoimasia.LuaEngine.Graphics.Scene.Receipts
   , latestFrameMetrics
   ) where
 
-import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVarIO, readTVar, writeTVar)
+import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVarIO, readTVar, stateTVar, writeTVar)
 import Control.Monad (when)
 import Data.Foldable (for_)
 import Data.Map.Strict (Map)
@@ -97,13 +98,20 @@ data DrawReceipts = DrawReceipts
   , receiptsLive ∷ !(TVar (Set Word64))
     -- ^ The view incarnations whose receipts may move.
   , receiptsListener ∷ !(TVar (Bool → STM ()))
-  , receiptsWatched ∷ !(TVar (Map AttachmentId (Maybe TargetMetrics)))
-    -- ^ The watched window attachments, with the metrics of each one's latest recorded frame.
+  , receiptsMetrics ∷ !(TVar (Map AttachmentId (TargetMetrics, Natural)))
+    -- ^ The metrics of each kept attachment's latest recorded frame, with when it was noted.
+  , receiptsWatched ∷ !(TVar (Map AttachmentId Natural))
+    -- ^ How many views watch each attachment.
+  , receiptsClock ∷ !(TVar Natural)
   }
+
+-- | How many window attachments' metrics are kept beyond the watched ones.
+metricsKept ∷ Int
+metricsKept = 64
 
 newDrawReceipts ∷ IO DrawReceipts
 newDrawReceipts =
-  DrawReceipts <$> newTVarIO Map.empty <*> newTVarIO Seq.empty <*> newTVarIO Map.empty <*> newTVarIO Set.empty <*> newTVarIO (const (pure ())) <*> newTVarIO Map.empty
+  DrawReceipts <$> newTVarIO Map.empty <*> newTVarIO Seq.empty <*> newTVarIO Map.empty <*> newTVarIO Set.empty <*> newTVarIO (const (pure ())) <*> newTVarIO Map.empty <*> newTVarIO Map.empty <*> newTVarIO 0
 
 -- | The view incarnation's latest receipt, if it has drawn.
 readReceipt ∷ DrawReceipts → Word64 → STM (Maybe Drawn)
@@ -193,23 +201,34 @@ receiptObserver receipts event = atomically $ do
 receiptsListen ∷ DrawReceipts → (Bool → STM ()) → STM ()
 receiptsListen receipts = writeTVar (receiptsListener receipts)
 
--- | Keep the metrics of this window attachment's frames from now on.
+-- | A view watches this window attachment from now on: its metrics are not evicted.
 watchFrameMetrics ∷ DrawReceipts → AttachmentId → STM ()
-watchFrameMetrics receipts attachment = modifyTVar' (receiptsWatched receipts) (Map.insertWith (\_ old → old) attachment Nothing)
+watchFrameMetrics receipts attachment = modifyTVar' (receiptsWatched receipts) (Map.insertWith (+) attachment 1)
 
--- | Stop keeping them, and drop what was kept.
+-- | A view stops watching it.
 unwatchFrameMetrics ∷ DrawReceipts → AttachmentId → STM ()
-unwatchFrameMetrics receipts attachment = modifyTVar' (receiptsWatched receipts) (Map.delete attachment)
+unwatchFrameMetrics receipts attachment = modifyTVar' (receiptsWatched receipts) (Map.update (\n → if n <= 1 then Nothing else Just (n - 1)) attachment)
 
--- | A frame of this window attachment is recorded with these metrics: kept only for a watched attachment, and
--- written only when they change.
+-- | A frame of this window attachment is recorded with these metrics: written only when they change. Beyond
+-- 'metricsKept' unwatched attachments, the least recently drawn one's are forgotten.
 noteFrameMetrics ∷ DrawReceipts → AttachmentId → TargetMetrics → STM ()
 noteFrameMetrics receipts attachment metrics = do
-  held ← readTVar (receiptsWatched receipts)
+  held ← readTVar (receiptsMetrics receipts)
   case Map.lookup attachment held of
-    Just seen | seen /= Just metrics → writeTVar (receiptsWatched receipts) (Map.insert attachment (Just metrics) held)
-    _ → pure ()
+    Just (same, _) | same == metrics → pure ()
+    _ → do
+      now ← stateTVar (receiptsClock receipts) (\t → (t, t + 1))
+      watched ← readTVar (receiptsWatched receipts)
+      let updated = Map.insert attachment (metrics, now) held
+          unwatched = [(at, a) | (a, (_, at)) ← Map.toList updated, Map.notMember a watched]
+          evicted
+            | length unwatched > metricsKept = maybe updated (\(_, a) → Map.delete a updated) (minimumMaybe unwatched)
+            | otherwise = updated
+      writeTVar (receiptsMetrics receipts) evicted
+  where
+    minimumMaybe [] = Nothing
+    minimumMaybe xs = Just (minimum xs)
 
--- | The metrics of the watched attachment's latest recorded frame, once it has had one.
+-- | The metrics of the attachment's latest recorded frame, while they are kept.
 latestFrameMetrics ∷ DrawReceipts → AttachmentId → STM (Maybe TargetMetrics)
-latestFrameMetrics receipts attachment = (>>= id) . Map.lookup attachment <$> readTVar (receiptsWatched receipts)
+latestFrameMetrics receipts attachment = fmap fst . Map.lookup attachment <$> readTVar (receiptsMetrics receipts)
