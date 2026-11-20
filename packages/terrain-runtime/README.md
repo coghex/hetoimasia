@@ -113,8 +113,9 @@ TRA-5 (#641) at the manager's authorization under the owner's 2026-11-09 decisio
   An arena's mark (`ArenaMark`: its content and knowledge revisions and its residency generation) is resolved through a live lease once
   and written by the state's one write (`putSt`) only when one of them moves; it is `Nothing` once the arena has ended, and says nothing
   of the lease, whose end the epoch reports. `retainedBankUseSTM` and `capacityFreedSTM` are such cells too: the retained bank's use,
-  written only when it changes, and a count bumped each time the owner frees capacity, which a holder refused `BusyRetained` or for a
-  model capacity waits on.
+  written only when it changes, and a count bumped by every event that may free capacity, which a holder refused for a model capacity
+  waits on. `regionalFitsSTM service n` reads the retained bank's cell and answers whether a regional request of `n` regions fits it now,
+  by the one predicate (`regionalFits`) a regional request is refused `BusyRetained` by, so a holder refused it waits for exactly that.
 * `retireSTM service request` and `releaseArenaLeaseSTM service lease` are `retire` and `releaseLease` as transactions (`Settlement`): the same functions, writing the same
   state, for a host that gives a result or a lease back from inside a transaction of its own. The Lua host gives a request's credit back in the
   transaction that takes the result or accounts its work, on whichever thread does, so it retires the result in that transaction instead of
