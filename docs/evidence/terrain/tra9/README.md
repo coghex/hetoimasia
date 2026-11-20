@@ -18,7 +18,7 @@ and terrain-runtime's README (the precondition guard, the outside staging accoun
 | --- | --- | --- |
 | Required native witness (at `cdc34252`) | `bash tools/vulkan/run.sh native hetoimasia-lua-engine-graphics:test:lua-engine-graphics-native-tests -- --complete` | 32/32 in 10.38 s on the terrain-disabled host; 4/4 in 3.23 s on the terrain-enabled host; 13.61 s of test time, 22 s wall, under the 30 s rule (`docs/vision.md:272`) |
 | Full qualification (at `cdc34252`) | the same suite with `-- --terrain-views-full` | 13/13 in 29.37 s, then the overlap witness on its own held host, 1/1 in 5.35 s |
-| Headless | `bash tools/vulkan/run.sh test hetoimasia-lua-engine-graphics:test:lua-engine-graphics-tests` (group `terrain views`) | at `cae6bc2c`: 119/119 in 64.0 s under load about 20; terrain-runtime's suite, once at `e43f0e3d`: 1791/1792, the failure its store allocation-ratio example (`Store/Bounds.hs:448`, #712). At `6d306f02`: 118/119 in 58.9 s under load 16 to 20 from another workload; the attempts example of the eviction group took 21 attempts (#711). At `58eba55d`: 108/108 in 51.8 s. At `cdc34252`, under load about 14, the eviction example ran past its bound (#711) |
+| Headless | `bash tools/vulkan/run.sh test hetoimasia-lua-engine-graphics:test:lua-engine-graphics-tests` (group `terrain views`) | at `cae6bc2c`: 119/119 in 64.0 s under load about 20. CI at `455d86ef` then failed the eviction group's attempts example (22) and its visible-demand residency example (bound) in one of two runs: both rest on how loads and evictions interleave with a view's preparations, and were removed to #711 (owner M, `7f24b697`); terrain-runtime's suite, once at `e43f0e3d`: 1791/1792, the failure its store allocation-ratio example (`Store/Bounds.hs:448`, #712). At `6d306f02`: 118/119 in 58.9 s under load 16 to 20 from another workload; the attempts example of the eviction group took 21 attempts (#711). At `58eba55d`: 108/108 in 51.8 s. At `cdc34252`, under load about 14, the eviction example ran past its bound (#711) |
 
 Native commands run on macOS under the standing per-command consent (`HETOIMASIA_NATIVE_SESSION=desktop`);
 the full qualification wrote its files with `HETOIMASIA_VALIDATION_EVIDENCE` set.
@@ -88,7 +88,8 @@ instances.
 Eviction itself is forced at the full region extent with the smallest valid resident bank (about
 3.5 MB with four-region holds, 21.5 MB with 64): a view that pans away loses an original region to
 another holder's pressure, by coordinate, and panning back reloads it and republishes the same plan
-and picks; under pressure the view's visible demand, far background included, stays resident.
+and picks. That the view's visible demand, far background included, stays resident under another
+holder's pressure is #711: its example's bound rested on the run's timing and was removed.
 
 ## Files
 
