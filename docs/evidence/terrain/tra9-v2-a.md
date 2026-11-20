@@ -1,0 +1,21 @@
+# TRA-9-V2-A evidence: terrain views publish retained terrain
+
+Issue #714. Code head `750252b3` (the native runs below name their own heads; the final head's acceptance record is in the pull request). Device: Apple M3 Max, MoltenVK (the pinned driver). Contract: the graphics
+package's README, "Terrain views (TRA-9)".
+
+| Check | Command | Result |
+| --- | --- | --- |
+| Native, surface-free target | `HETOIMASIA_NATIVE_SESSION=desktop bash tools/vulkan/run.sh native hetoimasia-lua-engine-graphics:test:lua-engine-graphics-native-tests -- --match 'terrain views'` | `0dc11a83`: 1/1, the drawn revision covering 25,600 of 25,600 pixels, an edit drawn again, every chunk retired after the handback |
+| Native, real window | the same with `-- --terrain-views-full` | `750252b3`: 1/1, the receipt advanced at the presentation's enqueue (480 x 320 logical, 960 x 640 framebuffer) through zoom 0.5, 2 and 1 |
+| Headless | `bash tools/vulkan/run.sh test hetoimasia-lua-engine-graphics:test:lua-engine-graphics-tests -- --match 'terrain views (TRA-9 v2)'` | `750252b3`: 31/31 |
+
+**Planning time (acceptance 4).** Budget: one refresh of a 60 Hz display, 16,666,667 ns. Before the planner moved
+off the owner's thread (`7fcd3eb6`): 154,147,000 ns between two presentations' enqueues, 65,865,000 ns in one owner
+step. After (`750252b3`): planning 4,000 ns; the views' whole work on the owner's thread (planning, camera,
+builds, publication, retirement) 2,429,000 ns between two presentations and 1,136,000 ns in one owner step: within
+the budget.
+
+**Admission (acceptance 2).** Default profile: 2 targets, 128 slots of 32 KiB, 16,384 quads, 8,192 pending spans,
+512 copied regions, 131,072 input runs and intervals, 64 regions a request, 16 builds a step, 3 copy rounds. Declared
+reservation 101,744,640 bytes. A full default-profile view over the fixture arena: 6 chunks occupied; peak live
+heap of the whole headless test process 8,330,944 bytes (`+RTS -T`, `max_live_bytes`).
