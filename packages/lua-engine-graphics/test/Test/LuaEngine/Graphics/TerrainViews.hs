@@ -40,7 +40,11 @@ import qualified Hetoimasia.Render.TwoD.Validation as Validation
 import Hetoimasia.Render.TwoD.Vulkan.Chunks (ChunkStanding (..))
 import Hetoimasia.Terrain.Coordinate (AxisCoord, axisFromInteger, tileCoord)
 import Hetoimasia.Terrain.Render2D.AtlasFixtures (AtlasStyle (..), boundPackedTextures, loadAtlasStyle)
+import Hetoimasia.LuaEngine.Graphics.TerrainView.Inputs (combineCopies, planInputs)
+import Hetoimasia.Terrain.Changes (ChangeLimits (..))
 import Hetoimasia.Terrain.Render2D.Camera (JumpTarget (..))
+import Hetoimasia.Terrain.Render2D.Cells (CellInputs (..), CellKey (..), CellPlan, CellRequest (..), PartKind (PartFog), cellPlanPending, cellPlanQuads, planCells, quadKey, quadPart)
+import Hetoimasia.Terrain.Render2D.Facts (TerrainFacts (..))
 import Hetoimasia.Terrain.Render2D.Material (recordLayout)
 import Hetoimasia.Terrain.Render2D.Presentation (pushBlockBytes)
 import Hetoimasia.Terrain.Render2D.Presentation (LightInput (..), LightSettings, defaultLightInput, defaultLightSettings, mkLightSettings)
@@ -421,6 +425,29 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         worldChunks after `shouldNotBe` worldChunks before
         Set.size (Set.intersection (worldChunks after) (worldChunks before)) `shouldSatisfy` (> 0)
 
+  describe "what is drawn" $
+    it "draws what the planner plans from the same version, fog and every contributing region included, before and after an edit" $
+      withPublished defaultOptions $ \rig target view → do
+        let check' = do
+              runOwner rig
+              world ← atomically (latestWorld target) >>= maybe (fail "no world") pure
+              atomically (noteSubmitted (rigReceipts rig) (worldTag world) (worldMetrics world))
+              drawn ← atomically (viewDrawn view) >>= maybe (fail "nothing drawn") pure
+              plan ← maybe (fail "the drawn plan is not pinned") pure (drawnPlanPlan drawn)
+              independent ← independentPlan rig drawn
+              cellPlanQuads plan `shouldBe` cellPlanQuads independent
+              cellPlanPending plan `shouldBe` cellPlanPending independent
+              pure plan
+        before' ← check'
+        -- fog and more than one region contribute to the fixture's plan
+        [() | quad ← cellPlanQuads before', quadPart quad == PartFog] `shouldSatisfy` (not . null)
+        Set.size (Set.fromList [regionOfKey (quadKey quad) | quad ← cellPlanQuads before']) `shouldSatisfy` (> 1)
+        Right removal ← removeAt (rigTerrain rig) (rigLease rig) (either (error . show) id (tileCoord 2 2 1)) Nothing
+        _ ← await (rigTerrain rig) removal
+        settleUntil rig (publishedAtLeast view 2)
+        after' ← check'
+        cellPlanQuads after' `shouldNotBe` cellPlanQuads before'
+
   describe "the draw receipt" $ do
     it "names only a revision whose batch was submitted: adoption alone leaves it as it was" $
       withPublished defaultOptions $ \rig target view → do
@@ -666,3 +693,24 @@ spec = describe "terrain views (TRA-9 v2)" $ do
               <> " peak-live-bytes=" <> maybe "unmeasured (+RTS -T)" show peak
           )
         published `shouldSatisfy` (> 0)
+
+-- The plan the planner makes from fresh copies of the drawn plan's regions, at its camera and metrics: what the view
+-- must have drawn.
+independentPlan ∷ Rig → DrawnPlan → IO CellPlan
+independentPlan rig drawn = do
+  regions ← maybe (fail "no regions") (pure . Set.toList) (drawnPlanRegions drawn)
+  camera ← maybe (fail "no camera") pure (drawnPlanCamera drawn)
+  metrics ← maybe (fail "no metrics") pure (drawnPlanMetrics drawn)
+  copies ← fmap concat . mapM (copyOf . take 64) . takeWhile (not . null) . iterate (drop 64) $ regions
+  combined ← either (fail . show) pure (combineCopies copies)
+  (facts, knowledge) ← either (fail . show) pure (planInputs (ChangeLimits (profileRuns smallProfile)) combined)
+  let config = viewCellConfig defaultTerrainViewsConfig {tvProfile = smallProfile}
+      inputs = CellInputs (CellRequest (factsVersions facts) camera (viewSetup metrics) config) facts knowledge (styleAssets (rigStyle rig))
+  either (fail . show) pure (planCells inputs)
+  where
+    copyOf batch =
+      withRegionSnapshot (rigTerrain rig) (rigLease rig) batch (either (fail . show) (pure . pure)) >>= either (fail . show) pure
+
+-- The 16 x 16 region of the rotated view frame a quad's key is in, with its level's 32-level region.
+regionOfKey ∷ CellKey → (Integer, Integer, Integer)
+regionOfKey (CellKey _ z vx vy _) = (vx `div` 16, vy `div` 16, z `div` 32)

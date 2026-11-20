@@ -77,6 +77,8 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView.Session
   , viewReadings
   , DrawnPlan (..)
   , viewDrawn
+  , viewCellConfig
+  , viewSetup
   , ServiceReading (..)
   , readTerrainViews
   ) where
@@ -252,6 +254,7 @@ data Stage
 -- copy round asks for or the adapted candidate's parts (with whether the visible demand was left incomplete).
 data Planned = Planned
   { plannedPlan ∷ !CellPlan
+  , plannedCamera ∷ !CameraState
   , plannedVisible ∷ ![RegionCoord]
   , plannedPrefetch ∷ ![RegionCoord]
   , plannedNext ∷ !(Either [RegionCoord] (Adapted, [(PartKey, [Instance], [MaterialRecord])], Bool))
@@ -264,6 +267,7 @@ data Candidate = Candidate
   , cdWanted ∷ ![(PartKey, [Instance], [MaterialRecord])]
   , cdBuilt ∷ !(Map PartKey Part)
   , cdReused ∷ !(Map PartKey Part)
+  , cdCamera ∷ !CameraState
   , cdIncomplete ∷ !Bool
     -- ^ The plan's visible demand names regions its copies did not ask for: the published revision is coherent, with
     -- that coverage loading, and the view prepares again to copy it.
@@ -273,6 +277,9 @@ data Candidate = Candidate
 data Pinned = Pinned
   { pinPlan ∷ !CellPlan
   , pinCopies ∷ !(ArenaId, Revision, Revision, Word64)
+  , pinRegions ∷ !(Set RegionCoord)
+  , pinCamera ∷ !CameraState
+  , pinMetrics ∷ !TargetMetrics
   }
 
 -- | What a view's preparation is waiting on, for observation.
@@ -1152,9 +1159,14 @@ settleCamera service vs facts = do
 
 -- The planner's configuration under the profile's limits.
 cellConfig ∷ TerrainViews k → CellConfig
-cellConfig service =
-  let profile = tvProfile (svConfig service)
-      base = tvCells (svConfig service)
+cellConfig = viewCellConfig . svConfig
+
+-- | The planner's configuration a view plans with: the configuration's band, margins and query bounds under the
+-- profile's limits.
+viewCellConfig ∷ TerrainViewsConfig → CellConfig
+viewCellConfig config =
+  let profile = tvProfile config
+      base = tvCells config
    in base
         { ccLimits =
             (ccLimits base)
@@ -1165,6 +1177,10 @@ cellConfig service =
               , clStepWork = profileStepWork profile
               }
         }
+
+-- | The view setup a plan is made for at these metrics: the whole framebuffer, default settings.
+viewSetup ∷ TargetMetrics → ViewSetup
+viewSetup = setupFor
 
 setupFor ∷ TargetMetrics → ViewSetup
 setupFor metrics =
@@ -1182,16 +1198,17 @@ planOf service style light inputs prep = do
   finished ← steps started
   plan ← either (failed "the plan could not finish") Right (cellPlanOf inputs finished)
   let profile = tvProfile (svConfig service)
+      camera = crCamera (inputsRequest inputs)
       visible = regionsOf (cdVisible (cellPlanDemand plan))
       prefetch = regionsOf (cdPrefetch (cellPlanDemand plan))
       room = profileRegions profile - Set.size (prepRegions prep)
       unasked = filter (`Set.notMember` prepRegions prep) (ordered (anchorRegion (crCamera (inputsRequest inputs))) visible)
       missing = take room unasked
   if not (null missing) && prepRounds prep > 0
-    then Right (Planned plan visible prefetch (Left missing))
+    then Right (Planned plan camera visible prefetch (Left missing))
     else do
       (adapted, parts) ← candidateOf service style plan light
-      Right (Planned plan visible prefetch (Right (adapted, parts, not (null missing))))
+      Right (Planned plan camera visible prefetch (Right (adapted, parts, not (null missing))))
   where
     failed what why = Left (LimitFailure (what <> ": " <> Text.pack (show why)))
     steps prepared = case cellPrepProgress prepared of
@@ -1236,7 +1253,7 @@ stepPlanning service vs serial prep copies box =
           let free = profileSlots profile - occupied
           if length toBuild > free
             then False <$ refuse service vs serial (prepBasis prep) (LimitSlots (length toBuild) free)
-            else writeBack service vs serial (Building prep (Candidate plan copies adapted toBuild Map.empty reused incomplete))
+            else writeBack service vs serial (Building prep (Candidate plan copies adapted toBuild Map.empty reused (plannedCamera planned) incomplete))
 
 -- Time the owner's own pure work, into the current frame's and the current step's planning totals.
 {-# NOINLINE timed #-}
@@ -1401,7 +1418,7 @@ publish service vs serial prep candidate = do
                 -- the pins: the drawn revision's plan and this successor's
                 drawn ← fmap (tagRevision . drawnTag) <$> readReceipt (portReceipts ports) (vsId vs)
                 let copies = cdCopies candidate
-                    pin = Pinned plan (copyArena copies, copyContent copies, copyKnowledge copies, copyGeneration copies)
+                    pin = Pinned plan (copyArena copies, copyContent copies, copyKnowledge copies, copyGeneration copies) (copyRegions copies) (cdCamera candidate) (prepMetrics prep)
                 modifyTVar' (vsPins vs) (Map.insert revision pin . Map.filterWithKey (\r _ → Just r == drawn))
                 pure False
 
@@ -1521,6 +1538,12 @@ data DrawnPlan = DrawnPlan
   { drawnPlanReceipt ∷ !Drawn
   , drawnPlanPlan ∷ !(Maybe CellPlan)
   , drawnPlanArena ∷ !(Maybe (ArenaId, Revision, Revision, Word64))
+  , drawnPlanRegions ∷ !(Maybe (Set RegionCoord))
+    -- ^ The regions the plan's copies hold.
+  , drawnPlanCamera ∷ !(Maybe CameraState)
+    -- ^ The camera the plan was made for.
+  , drawnPlanMetrics ∷ !(Maybe TargetMetrics)
+    -- ^ The metrics the plan was made for.
   }
 
 viewDrawn ∷ TerrainView k → STM (Maybe DrawnPlan)
@@ -1529,7 +1552,7 @@ viewDrawn (TerrainView service vs) =
     Nothing → pure Nothing
     Just drawn → do
       pin ← Map.lookup (tagRevision (drawnTag drawn)) <$> readTVar (vsPins vs)
-      pure (Just (DrawnPlan drawn (pinPlan <$> pin) (pinCopies <$> pin)))
+      pure (Just (DrawnPlan drawn (pinPlan <$> pin) (pinCopies <$> pin) (pinRegions <$> pin) (pinCamera <$> pin) (pinMetrics <$> pin)))
 
 -- | The service's resources now.
 data ServiceReading k = ServiceReading
