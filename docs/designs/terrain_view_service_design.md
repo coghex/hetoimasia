@@ -1,6 +1,6 @@
 # Terrain view service ownership and wake-up design
 
-Design state: `exploring`
+Design state: `approved (owner, 2026-11-20)`
 
 ## Processing status
 
@@ -81,4 +81,4 @@ After owner approval, apply the steps in order in PR #697. Each row names a sing
 
 Every check gets one run. Record a flaky outcome and its original receipt. Never fix or rerun a flake in this issue. The shutdown and hold-order changes above address defects identified by inspection. Keep the existing splits: generation-only publication in #705, dropped camera-demand tails in #706, progress under binding preparation/upload/recorder limits in #709, stronger qualification and the deterministic release-with-peer witness in #710, eviction witnesses in #711. No additional round-six finding moves out.
 
-**Q-1.** Owner approval requested for the ownership transfers, wait inputs, terminal results, construction checks and ordered implementation above. The existing PR remains paused pending that decision.
+**Q-1. Answered.** On 2026-11-20 the owner approved the design as written. All six implementation and verification steps belong in #645. [Owner-decision amendment](https://github.com/coghex/hetoimasia/issues/645#issuecomment-7031377779)
