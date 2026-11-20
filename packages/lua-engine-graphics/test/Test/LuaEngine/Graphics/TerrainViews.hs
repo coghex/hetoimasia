@@ -964,7 +964,7 @@ eviction = describe "eviction" $ do
       quiescent v
       demandResident v view
       hit ← currentHit v view
-      plan ← adoptedPlanOf view
+      membership ← adoptedMembership view
       picks ← atomically (picksOver view)
       instances ← drawnInstances v 1
       Just (firstVisible, _) ← atomically (viewDemand view)
@@ -1016,8 +1016,7 @@ eviction = describe "eviction" $ do
       again ← currentHit v view
       -- the residency generation moved, and the view caught up with it; what it draws and picks is what it was
       pickResidency (pickRefIdentity again) `shouldNotBe` pickResidency (pickRefIdentity hit)
-      replanned ← adoptedPlanOf view
-      cellMembership replanned `shouldBe` cellMembership plan
+      adoptedMembership view `shouldReturn` membership
       atomically (picksOver view) `shouldReturn` picks
       drawnInstances v 1 `shouldReturn` instances
       closeView view
@@ -1357,7 +1356,7 @@ lifecycle = describe "close orders and limits" $ do
       quiescent v
       sliced view 1
       hit ← currentHitOn v 1 view
-      original ← adoptedPlanOf view
+      membership ← adoptedMembership view
       originalPicks ← atomically (picksOver view)
       originalInstances ← drawnInstances v 1
       closeView view
@@ -1371,9 +1370,7 @@ lifecycle = describe "close orders and limits" $ do
       pickViewId (pickRefIdentity again) `shouldNotBe` pickViewId (pickRefIdentity hit)
       let versions identity = (pickArena identity, pickContent identity, pickKnowledge identity)
       versions (pickRefIdentity again) `shouldBe` versions (pickRefIdentity hit)
-      replanned ← adoptedPlanOf fresh
-      let membership = cellMembership original
-      cellMembership replanned `shouldBe` membership
+      adoptedMembership fresh `shouldReturn` membership
       -- the revealed cavity leaves ordinary, fog and mixed cells in the view (19, 10 and 2 with this source)
       [length [() | kind ← Map.elems membership, kind == wanted] | wanted ← [PartOrdinary, PartFog, PartKnown]] `shouldSatisfy` all (> 0)
       atomically (picksOver fresh) `shouldReturn` originalPicks
@@ -2105,11 +2102,12 @@ hardening = describe "wakes, ownership and limits" $ do
       quiescent v
       demandResident v view
       adoptNow (vModel v) 1 `shouldReturn` Adopted published
-      plan ← adoptedPlanOf view
+      -- the plan's figures are read and forced inside its reader
+      (quads, spans, demandHeld) ← adoptedPlanRead view $ \plan → evaluate (length (cellPlanQuads plan), length (cellPlanPending plan), planDemandHeld (cellPlanDemand plan)) >>= \(q, p, d) → q `seq` p `seq` d `seq` pure (q, p, d)
       reading ← atomically (readView view)
       readingPins reading `shouldBe` 1
-      planDemandHeld (cellPlanDemand plan) `shouldSatisfy` (> 0)
-      readingPinnedBytes reading `shouldBe` planHeld (length (cellPlanQuads plan)) (length (cellPlanPending plan)) + planDemandHeld (cellPlanDemand plan)
+      demandHeld `shouldSatisfy` (> 0)
+      readingPinnedBytes reading `shouldBe` planHeld quads spans + demandHeld
       closeView view
 
   it "keeps no style or demand reachable through a closed view's handle" $
@@ -2201,7 +2199,7 @@ stagesAndReaders = describe "stages, waits and readers" $ do
       demandResident v view
       inside ← newEmptyMVar
       gate ← newEmptyMVar
-      withOwnedThread (withAdoptedPlan view (\plan → putMVar inside (isJust plan) >> takeMVar gate)) $ \_ readerDone → do
+      withOwnedThread (withAdoptedPlan view (\plan → (putMVar inside $! isJust plan) >> takeMVar gate)) $ \_ readerDone → do
         takeMVar inside `shouldReturn` True
         -- an edit publishes a second revision, which the host adopts: the first stays pinned and charged, being read
         removeWith v (tileAt 9 9 3) Nothing `shouldReturn` Right True
@@ -2247,7 +2245,7 @@ stagesAndReaders = describe "stages, waits and readers" $ do
       quiescent v
       inside ← newEmptyMVar
       gate ← newEmptyMVar
-      withOwnedThread (withAdoptedPlan view (\plan → putMVar inside (isJust plan) >> takeMVar gate)) $ \_ readerDone → do
+      withOwnedThread (withAdoptedPlan view (\plan → (putMVar inside $! isJust plan) >> takeMVar gate)) $ \_ readerDone → do
         takeMVar inside `shouldReturn` True
         (`finally` void (tryPutMVar gate ())) $ do
           bounded (closeView view)
@@ -2258,7 +2256,7 @@ stagesAndReaders = describe "stages, waits and readers" $ do
           readingPinnedBytes reading `shouldSatisfy` (> 0)
           atomically (viewHoldsStyle view) `shouldReturn` True
           -- a reader cannot start on a closed view
-          withAdoptedPlan view (pure . isJust) `shouldReturn` False
+          withAdoptedPlan view (evaluate . isJust) `shouldReturn` False
         bounded readerDone
       reading ← atomically (readView view)
       readingPins reading `shouldBe` 0
@@ -3007,11 +3005,19 @@ fakeOwnerLoop owner = forever $ do
           pure (Answered (map (const (Right ())) chunks))
       writeTVar answer (Just result)
 
--- The plan of the revision the host adopted, read under the view's reader once there is one.
-adoptedPlanOf ∷ TerrainView Int → IO CellPlan
-adoptedPlanOf view = do
+-- Read the plan of the revision the host adopted under the view's reader, once there is one: the plan is used only
+-- inside, and the reader forces what it answers before the reader ends.
+adoptedPlanRead ∷ TerrainView Int → (CellPlan → IO a) → IO a
+adoptedPlanRead view use = do
   bounded (atomically (readView view >>= check . isJust . readingAdoptedResidency))
-  withAdoptedPlan view pure >>= maybe (fail "no adopted plan") pure
+  withAdoptedPlan view (maybe (fail "no adopted plan") use)
+
+-- The adopted plan's cells and their parts, made and forced inside the reader.
+adoptedMembership ∷ TerrainView Int → IO (Map (Integer, Integer, Integer, Integer) PartKind)
+adoptedMembership view = adoptedPlanRead view $ \plan → do
+  let membership = cellMembership plan
+  _ ← evaluate (length (show membership))
+  pure membership
 
 -- The uploads the owner reports unsettled are these now: each one dropped has settled.
 setUploads ∷ FakeOwner → [Natural] → STM ()
