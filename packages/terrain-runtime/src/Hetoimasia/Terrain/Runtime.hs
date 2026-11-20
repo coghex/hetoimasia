@@ -166,6 +166,9 @@ module Hetoimasia.Terrain.Runtime
   , inspectDefects
   , inspectSnapshotBytes
   , inspectRetainedChargesSTM
+  , authorityEpochSTM
+  , ArenaMark (..)
+  , arenaMarkSTM
   , inspectRegionalSTM
   , RegionalCharge
   , regionalChargeHold
@@ -392,7 +395,9 @@ withTerrainService config ports body = do
     acquire limits storage bank storeConfig compileBank = do
       tag <- newUnique
       var <- newTVarIO (initialState config limits)
-      pure (Service tag var config (portAdmission ports) (portLogger ports) (portProbe ports) storage bank (spDirectory sp) storeConfig compileBank)
+      authority <- newTVarIO 0
+      marks <- newTVarIO Map.empty
+      pure (Service tag var config (portAdmission ports) (portLogger ports) (portProbe ports) storage bank (spDirectory sp) storeConfig compileBank authority marks)
     -- Close admission, ask the owner to stop, and wait for both proofs: the
     -- owner's worker has published its terminal outcome, and no borrower is
     -- outstanding. There is no deadline and no detach. Any exception received
@@ -1001,6 +1006,38 @@ inspectArena svc lease = atomically (inspectArenaSTM svc lease)
 
 -- | The same as a transaction, so a host's settlement callback can see the
 -- arena as the arbitration leaves it.
+-- | A count that moves only when some lease stops being valid (an arena's close, a lease's release, a
+-- client's end, the service's close): a holder that must notice its authority's loss watches it and checks
+-- its own lease when it moves, rather than reading the service's whole state, which every load and
+-- settlement writes. It writes nothing.
+authorityEpochSTM ∷ Service → STM Word64
+authorityEpochSTM = readTVar . serviceAuthority
+
+-- | The identity cell of the arena a live lease names: a transaction reading the arena's content and
+-- knowledge revisions and its residency generation ('ArenaMark'), from a cell written only in the
+-- transactions that move one of them, and set to 'Nothing' once the arena has ended. It is resolved
+-- through the lease once; reading it never reads the service's state, so a transaction that waits on it
+-- wakes for a new version of that arena, or its end, and for nothing else. It says nothing about the
+-- lease, whose end 'authorityEpochSTM' reports. A released, closed or foreign lease is refused.
+arenaMarkSTM ∷ Service → ArenaLease → STM (Either Refused (STM (Maybe ArenaMark)))
+arenaMarkSTM svc lease = do
+  st <- readSt svc
+  case leaseOf svc lease st of
+    Left refused → pure (Left refused)
+    Right (_, ls)
+      | not (leaseLive ls) → pure (Left RefusedAuthority)
+      | otherwise → case Map.lookup (leaseArena ls) (stateArenas st) of
+          Nothing → pure (Left RefusedAuthority)
+          Just arena → do
+            cells <- readTVar (serviceArenaMarks svc)
+            cell <- case Map.lookup (leaseArena ls) cells of
+              Just cell → pure cell
+              Nothing → do
+                cell <- newTVar (Just (arenaMark arena))
+                writeTVar (serviceArenaMarks svc) (Map.insert (leaseArena ls) cell cells)
+                pure cell
+            pure (Right (readTVar cell))
+
 inspectArenaSTM ∷ Service → ArenaLease → STM (Maybe ArenaView)
 inspectArenaSTM svc lease = do
   st <- readSt svc

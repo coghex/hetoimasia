@@ -19,6 +19,7 @@ module Hetoimasia.Terrain.Runtime.Internal.Core
   ( -- * State access
     readSt
   , modifySt
+  , putSt
   , applyEvent
   , recordDefect
   , recordFatalDefect
@@ -145,7 +146,27 @@ readSt ∷ Service → STM St
 readSt = readTVar . serviceState
 
 modifySt ∷ Service → (St → St) → STM ()
-modifySt svc = modifyTVar' (serviceState svc)
+modifySt svc f = readSt svc >>= putSt svc . f
+
+-- | The one write of the state. It also brings every arena's identity cell up to the state
+-- written ('serviceArenaMarks'), writing a cell only when that arena's mark moved, so a cell
+-- changes in the transactions that move its arena's version, or end it, and in no other.
+putSt ∷ Service → St → STM ()
+putSt svc st = do
+  writeTVar (serviceState svc) st
+  cells <- readTVar (serviceArenaMarks svc)
+  unless (Map.null cells) $ do
+    let marks = Map.map arenaMark (stateArenas st)
+        ended = Map.difference cells marks
+    forM_ ended (\cell → writeTVar cell Nothing)
+    unless (Map.null ended) (writeTVar (serviceArenaMarks svc) (Map.difference cells ended))
+    forM_ (Map.intersectionWith (,) cells marks) $ \(cell, mark) → do
+      seen <- readTVar cell
+      when (seen /= Just mark) (writeTVar cell (Just mark))
+
+-- | Some lease stopped being valid: what watches the authority epoch looks again.
+bumpAuthority ∷ Service → STM ()
+bumpAuthority svc = modifyTVar' (serviceAuthority svc) (+ 1)
 
 -- | Something that may free capacity happened; the owner retries what waits.
 markFreed ∷ Service → STM ()
@@ -168,7 +189,7 @@ applyEvent svc event = do
   case outcome of
     Left _ → pure outcome
     Right report → do
-      writeTVar (serviceState svc) $
+      putSt svc $
         (if freesCapacity event then \x → x {stateFreed = True, stateDispatchIdle = False} else id)
         st
           { stateModel = model
@@ -212,7 +233,7 @@ takeUnreportedSTM ∷ Service → STM [Defect]
 takeUnreportedSTM svc = do
   st <- readSt svc
   let unreported = [defectOf r | r <- reverse (stateDefects st), not (defectReported r)]
-  writeTVar (serviceState svc) st {stateDefects = [r {defectReported = True} | r <- stateDefects st]}
+  putSt svc st {stateDefects = [r {defectReported = True} | r <- stateDefects st]}
   pure unreported
 
 -- | Keep a bounded record of an unexpected defect.
@@ -267,7 +288,7 @@ registerClientSTM svc =
       | otherwise → case allocate (stateNextClient st) of
        Left refused → pure (Left refused)
        Right cid → do
-        writeTVar (serviceState svc) st {stateNextClient = cid + 1, stateClients = Map.insert cid (ClientRec Set.empty Set.empty) (stateClients st)}
+        putSt svc st {stateNextClient = cid + 1, stateClients = Map.insert cid (ClientRec Set.empty Set.empty) (stateClients st)}
         pure (Right (Client (serviceTag svc) cid))
 
 -- ---------------------------------------------------------------------------
@@ -615,7 +636,7 @@ admit svc ep sub =
                   names = case insClaim ins of
                     Nothing → stateNames st
                     Just name → Map.insert name (ClaimPending (RequestId rid)) (stateNames st)
-              writeTVar (serviceState svc) st {stateNextRequest = rid + 1, stateNextSeq = stateNextSeq st + 1, stateRequests = Map.insert (RequestId rid) req (stateRequests st), stateNames = names, stateDispatchIdle = False}
+              putSt svc st {stateNextRequest = rid + 1, stateNextSeq = stateNextSeq st + 1, stateRequests = Map.insert (RequestId rid) req (stateRequests st), stateNames = names, stateDispatchIdle = False}
               pure (Right request)
 
 decide ∷ Service → St → RequestId → Submission → STM (Either Short Insertion)
@@ -1071,6 +1092,7 @@ closeArena svc aid = do
             _ → stateNames cur
         , stateLeases = foldr (Map.adjust (\l → l {leaseLive = False})) (stateLeases cur) (Set.toList (arenaLeases arena))
         }
+    bumpAuthority svc
     retireArenaRecord svc aid
 
 -- | Release a lease. Idempotent. It cancels the requests made through it, and
@@ -1087,6 +1109,7 @@ releaseLeaseSTM svc lid = do
         , stateClients = Map.adjust (\c → c {clientLeases = Set.delete lid (clientLeases c)}) (leaseClient ls) (stateClients cur)
         , stateArenas = Map.adjust (\a → a {arenaLeases = Set.delete lid (arenaLeases a)}) (leaseArena ls) (stateArenas cur)
         }
+    bumpAuthority svc
     after <- readSt svc
     when (leaseOwner ls && leaseLive ls) $
       forM_ (Map.lookup (leaseArena ls) (stateArenas after)) $ \arena →
@@ -1117,6 +1140,7 @@ closeServiceSTM svc = do
   forM_ (Map.keys (stateArenas after)) (closeArena svc)
   forM_ (Map.keys (stateViews after)) (closeViewByIdSTM svc)
   modifySt svc (\cur → cur {stateLeases = fmap (\l → l {leaseLive = False}) (stateLeases cur)})
+  bumpAuthority svc
 
 -- ---------------------------------------------------------------------------
 -- Views
@@ -1142,7 +1166,7 @@ openViewSTM svc client =
         | otherwise → case allocate (stateNextView st) of
             Left refused → pure (Left refused)
             Right vid → do
-              writeTVar (serviceState svc) st
+              putSt svc st
                 { stateNextView = vid + 1
                 , stateViews = Map.insert (ViewId vid) (ViewRec cid) (stateViews st)
                 , stateClients = Map.adjust (\c → c {clientViews = Set.insert (ViewId vid) (clientViews c)}) cid (stateClients st)
