@@ -42,6 +42,7 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView.Service
     TerrainViews
   , TerrainViewsPorts (..)
   , withTerrainViews
+  , terrainViewsRefusal
   , terrainViewsFailures
   , terrainViewsGpuCharged
   , terrainViewsRetiring
@@ -99,14 +100,14 @@ import Data.List (nub, sortOn)
 import Data.Ord (Down (..))
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (fromMaybe, isJust, isNothing, mapMaybe)
+import Data.Maybe (catMaybes, fromMaybe, isJust, isNothing, listToMaybe, mapMaybe)
 import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Word (Word64)
 import Hetoimasia.Foundation.Messaging.Payload (Prepared, prepare)
 import Hetoimasia.Foundation.Resource (withResource)
-import Hetoimasia.LuaEngine.Graphics.Scene.Claims (Claim (..), SceneClaims, claimOf, markClaimPublished, releaseClaim, takeClaim)
+import Hetoimasia.LuaEngine.Graphics.Scene.Claims (Claim (..), SceneClaims, claimOf, markClaimPublished, newClaimHolder, releaseClaim, takeClaim)
 import Hetoimasia.LuaEngine.Graphics.Scene.Ledger (GraphicsScene, SceneLedger, ledgerChunkHeld, ledgerDropInterest, ledgerNewestAdopted, ledgerRetainInterest, worldGraphicsScene)
 import Hetoimasia.LuaEngine.Graphics.Scene.World (SceneWorld (..), WorldTag (..))
 import Hetoimasia.LuaEngine.Graphics.TerrainView.Inputs (CopySet, changesExpansion, changesExpansionBound, combineCopies, copyArena, copyContent, copyGeneration, copyKnowledge, copyRegions, copySnapshots, knowledgeExpansion, knowledgeExpansionBound, planInputs)
@@ -192,6 +193,8 @@ data TerrainViewsPorts k = TerrainViewsPorts
   , portClient ∷ !Runtime.Client
   , portAccount ∷ !RenderAccount
   , portTaking ∷ STM Bool
+  , portIssuer ∷ !TargetIssuer
+    -- ^ The host the service is built over: it takes only that host's targets.
   }
 
 -- | The adapter's service.
@@ -200,7 +203,6 @@ data TerrainViews k = TerrainViews
   , svPorts ∷ !(TerrainViewsPorts k)
   , svMaterial ∷ !MaterialRef
   , svViews ∷ !(TVar (Map Word64 (ViewState k)))
-  , svNext ∷ !(TVar Word64)
   , svRequests ∷ !(TVar [Request k])
   , svOpen ∷ !(TVar Bool)
   , svGpu ∷ !(TVar Word64)
@@ -405,10 +407,11 @@ terrainViewsGpuCharged = readTVar . svGpu
 -- its regions retired), the retirements are drained to the owner's evidence, and the worker is joined.
 withTerrainViews ∷ (Ord k, Show k) ⇒ TerrainViewsConfig → TerrainViewsPorts k → (TerrainViews k → IO a) → IO a
 withTerrainViews config ports body = do
+  -- the hard maxima are checked before the worker starts or any request is taken
+  forM_ (terrainViewsRefusal config (accountLimit (portAccount ports))) (throwIO . TerrainViewsRefused)
   service ←
     TerrainViews config ports (ownerMaterial (portOwner ports))
       <$> newTVarIO Map.empty
-      <*> newTVarIO 1
       <*> newTVarIO []
       <*> newTVarIO True
       <*> newTVarIO 0
@@ -446,6 +449,23 @@ withTerrainViews config ports body = do
           unless ended (shutdown service)
     )
     (\() → body service)
+
+-- | Why a configuration, with a render account of this many bytes, is beyond the hard maxima ('terrainViewsLimits'),
+-- if it is: what 'withTerrainViews' refuses before its worker starts.
+terrainViewsRefusal ∷ TerrainViewsConfig → Word64 → Maybe Text
+terrainViewsRefusal config accountBytes = listToMaybe (catMaybes checks)
+  where
+    (views, pins, gpu, account) = terrainViewsLimits
+    beyond what value limit = if value > limit then Just (what <> " " <> Text.pack (show value) <> " is beyond the maximum " <> Text.pack (show limit)) else Nothing
+    below what value = if value < 0 then Just (what <> " " <> Text.pack (show value) <> " is negative") else Nothing
+    checks =
+      [ beyond "views" (tvMaxViews config) views
+      , below "views" (tvMaxViews config)
+      , beyond "pins" (tvCpuPins config) pins
+      , below "pins" (tvCpuPins config)
+      , beyond "terrain GPU bytes" (tvGpuBytes config) gpu
+      , beyond "the render account's bytes" accountBytes account
+      ]
 
 -- The worker is gone, by its end or a cancellation: no attachment is taken any more, every one still queued settles
 -- stopped, releasing the parents it holds, and, if the worker did not run the service's end, it runs here: every live
@@ -493,7 +513,10 @@ newtype PendingAttach k = PendingAttach (TVar (Maybe (Settled (TerrainView k))))
 -- which validates the target and the arena, takes the claim and the GPU interests in one transaction, and on any
 -- refusal or cancellation releases the parents it was handed.
 attachView ∷ (Ord k, Show k) ⇒ TerrainViews k → AttachRequest k → IO (Either AttachRefusal (PendingAttach k))
-attachView service request = mask_ $
+attachView service request
+  -- a target of another host is refused before anything is taken, the caller's style parents included
+  | vtIssuer (attachTarget request) /= portIssuer (svPorts service) = pure (Left AttachTargetForeign)
+  | otherwise = mask_ $
   acquireStyle (attachStyle request) >>= \case
     Left why → pure (Left (AttachStyle why))
     Right style → do
@@ -654,9 +677,8 @@ commitAttach service request box style runtimeView camera light = do
 newViewState ∷ (Ord k, Show k) ⇒ TerrainViews k → AttachRequest k → AcquiredStyle → Runtime.View → CameraState → LightSettings → IO (ViewState k)
 newViewState service request style runtimeView camera light = do
   identity ← atomically $ do
-    next ← readTVar (svNext service)
-    writeTVar (svNext service) (next + 1)
-    pure next
+    -- issued by the session's claims, so no other service's view of this session has the same identity
+    newClaimHolder (portClaims (svPorts service))
   -- resolved through the lease once; an attachment whose lease is already gone fails its own checks
   mark ← either (const (pure Nothing)) id <$> atomically (Runtime.arenaMarkSTM (portTerrain (svPorts service)) (attachArena request))
   ViewState identity (attachTarget request) (styleIdentities style) (attachArena request) mark runtimeView
@@ -2540,7 +2562,8 @@ pickPrecondition (TerrainView service state) ref =
     { Runtime.preconditionArena = pickArena identity
     , Runtime.preconditionContent = pickContent identity
     , Runtime.preconditionKnowledge = Just (pickKnowledge identity)
-    , Runtime.preconditionGuard = Just (Runtime.PreconditionGuard guardId guard)
+    , -- bound to the terrain service the view reads, so no other service's equal arena and revisions satisfy it
+      Runtime.preconditionGuard = Just (Runtime.PreconditionGuard guardId (Just (Runtime.serviceIdentity (portTerrain (svPorts service)))) guard)
     }
   where
     identity = pickRefIdentity ref

@@ -130,6 +130,7 @@ module Hetoimasia.GPU.Vulkan.GLFW
   , registerVulkanSceneTarget
   , unregisterVulkanSceneTarget
   , vulkanSceneTargetRegistered
+  , vulkanHostIdentity
   , publishVulkanTargetScene
   , TargetScenePublication (..)
   , recordVulkanTargetBatch
@@ -398,6 +399,7 @@ import Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , registerVulkanSceneTarget
   , unregisterVulkanSceneTarget
   , vulkanSceneTargetRegistered
+  , vulkanHostIdentity
   , awaitVulkanAction
   , noSceneLifecycle
   , defaultActionCapacity

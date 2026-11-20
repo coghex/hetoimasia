@@ -14,6 +14,7 @@ module Test.LuaEngine.Graphics.TerrainViews (spec) where
 import Control.Concurrent (killThread, myThreadId, newEmptyMVar, putMVar, takeMVar, tryPutMVar)
 import Control.Exception (MaskingState (Unmasked), getMaskingState)
 import Control.Concurrent.STM
+import Data.Unique (newUnique)
 import Data.IORef (atomicModifyIORef', newIORef, readIORef)
 import GHC.Conc (unsafeIOToSTM)
 import Control.Exception (SomeException, displayException, finally, throwIO, try)
@@ -122,6 +123,8 @@ data Views = Views
     -- ^ What every test target draws at; an example changes it as a resize or a content-scale change would.
   , vTaking ∷ !(TVar Bool)
     -- ^ The session's admission the views are given: an example closes it as the session's end would.
+  , vIssuer ∷ !TargetIssuer
+    -- ^ The host identity the views' ports and every test target carry.
   }
 
 spec ∷ Spec
@@ -1844,6 +1847,33 @@ hardening = describe "wakes, ownership and limits" $ do
       atomically (claimOf (vClaims v) 1) `shouldReturn` Nothing
       atomically (ledgerInterests (fakeLedger (vFake v))) `shouldReturn` mempty
 
+  it "refuses a configuration beyond its hard maxima before its worker starts, and takes the maxima and smaller settings" $ do
+    let mib = 1024 * 1024
+        refused config = withViewsConfig config (\_ → expectationFailure "the service was made") `shouldThrow` \(TerrainViewsRefused _) → True
+    terrainViewsLimits `shouldBe` (8, 2, 128 * mib, 128 * mib)
+    refused testConfig {tvMaxViews = 9}
+    refused testConfig {tvCpuPins = 3}
+    refused testConfig {tvGpuBytes = 128 * mib + 1}
+    -- the one injected render account: at its maximum it is taken, one byte beyond it is not
+    terrainViewsRefusal testConfig (128 * mib) `shouldBe` Nothing
+    terrainViewsRefusal testConfig (128 * mib + 1) `shouldSatisfy` isJust
+    -- the maxima themselves (the suite's own configuration and account), and smaller settings, zero GPU bytes included
+    (tvMaxViews testConfig, tvCpuPins testConfig, tvGpuBytes testConfig) `shouldBe` (8, 2, 128 * mib)
+    withViewsConfig testConfig (\v → attached v 1 >>= closeView)
+    withViewsConfig testConfig {tvMaxViews = 1, tvCpuPins = 1, tvGpuBytes = 0} (\_ → pure ())
+
+  it "refuses a target another host issued, before taking anything, the caller's style parents included" $
+    withViews $ \v → do
+      foreign' ← TargetIssuer <$> newUnique
+      let request = requestFor v ((target v 1) {vtIssuer = foreign'})
+      outcome ← inInstance (vComp v) (vVm v) "i" (attachView (vViews v) request)
+      either (`shouldBe` AttachTargetForeign) (const (expectationFailure "a foreign target was taken")) outcome
+      atomically (claimOf (vClaims v) 1) `shouldReturn` Nothing
+      atomically (ledgerInterests (fakeLedger (vFake v))) `shouldReturn` mempty
+      -- the same request with this host's target is taken
+      view ← attached v 1
+      closeView view
+
   it "refuses an attachment through another client's lease on the same arena, before taking anything" $
     withViews $ \v → do
       other ← Runtime.registerClient (_vTerrain v) >>= either (fail . show) pure
@@ -2320,6 +2350,7 @@ withViewsProbed order probe terrainConfig source config body = do
           claims ← newSceneClaims
           metricsVar ← newTVarIO metrics
           taking ← newTVarIO True
+          issuer ← TargetIssuer <$> newUnique
           owner ← newFakeOwner model
           initial ← prepare initialGraphicsScene
           let ports =
@@ -2335,8 +2366,9 @@ withViewsProbed order probe terrainConfig source config body = do
                   , portClient = client
                   , portAccount = cpAccount comp
                   , portTaking = readTVar taking
+                  , portIssuer = issuer
                   }
-          let run views = body (Views comp vm fake model terrain arena views owner claims (cpAccount comp) style colourKey normalKey client metricsVar taking)
+          let run views = body (Views comp vm fake model terrain arena views owner claims (cpAccount comp) style colourKey normalKey client metricsVar taking issuer)
           withOwnedThread (fakeOwnerLoop owner) $ \_ _ → case order of
             HostFirst → withTerrainViews config ports (\views → run views `finally` dissolve model)
             ViewsFirst → withTerrainViews config ports run `finally` dissolve model
@@ -2381,6 +2413,7 @@ target v window =
   let (publishing, usable) = modelTarget (vModel v) window
    in ViewTarget
         { vtKey = window
+        , vtIssuer = vIssuer v
         , vtUsable = usable
         , vtRetired = not <$> usable
         , vtPublish = \scene → (== HostAccepted) <$> publishing scene

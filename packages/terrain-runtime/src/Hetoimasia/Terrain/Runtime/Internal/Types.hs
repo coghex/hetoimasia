@@ -42,6 +42,8 @@ module Hetoimasia.Terrain.Runtime.Internal.Types
   , CancelResult (..)
   , Precondition (PreconditionWith, Precondition, preconditionArena, preconditionContent, preconditionKnowledge, preconditionGuard)
   , PreconditionGuard (..)
+  , ServiceIdentity
+  , serviceIdentity
   , preconditionRevisionsStale
   , preconditionStale
 
@@ -160,7 +162,7 @@ import qualified Data.Sequence as Seq
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Text (Text)
-import Data.Unique (Unique)
+import Data.Unique (Unique, hashUnique)
 import Data.Int (Int64)
 import Data.Word (Word64)
 import Hetoimasia.Foundation.Log (Logger)
@@ -485,8 +487,19 @@ pattern Precondition arena revision = PreconditionWith arena revision Nothing No
 -- identity, which is what equality and display compare.
 data PreconditionGuard = PreconditionGuard
   { guardIdentity ∷ !Word64
+  , guardService ∷ !(Maybe ServiceIdentity)
+    -- ^ The service the guard's holder read its view from, when it is bound to one: a guard bound to another service
+    -- never holds here, whatever its transaction answers, since equal arena and revision numbers in two services name
+    -- different terrain.
   , guardHolds ∷ STM Bool
   }
+
+-- | A terrain service's identity, for binding what a holder read from it (a pick's guard) to that service alone.
+newtype ServiceIdentity = ServiceIdentity Unique
+  deriving (Eq)
+
+instance Show ServiceIdentity where
+  showsPrec precedence (ServiceIdentity tag) = showParen (precedence > 10) (showString "ServiceIdentity " . shows (hashUnique tag))
 
 instance Eq PreconditionGuard where
   a == b = guardIdentity a == guardIdentity b
@@ -504,13 +517,16 @@ preconditionRevisionsStale arena content knowledge = \case
       || preconditionContent p /= content
       || maybe False (/= knowledge) (preconditionKnowledge p)
 
--- | Whether a precondition no longer holds, its guard included: what the arbitration judges, in its transaction.
-preconditionStale ∷ ArenaId → Revision → Revision → Maybe Precondition → STM Bool
-preconditionStale arena content knowledge precondition
+-- | Whether a precondition no longer holds, its guard included: what the arbitration of this service judges, in its
+-- transaction. A guard bound to another service is stale before its transaction is read.
+preconditionStale ∷ ServiceIdentity → ArenaId → Revision → Revision → Maybe Precondition → STM Bool
+preconditionStale recipient arena content knowledge precondition
   | preconditionRevisionsStale arena content knowledge precondition = pure True
   | otherwise = case precondition >>= preconditionGuard of
       Nothing → pure False
-      Just guard' → not <$> (guardHolds guard' `orElse` pure False)
+      Just guard'
+        | maybe False (/= recipient) (guardService guard') → pure True
+        | otherwise → not <$> (guardHolds guard' `orElse` pure False)
 
 -- ---------------------------------------------------------------------------
 -- Configuration and ports
@@ -745,6 +761,10 @@ data Service = Service
     -- version watches its cell, not the whole state, which every load writes.
     serviceArenaMarks ∷ !(TVar (Map ArenaId (TVar (Maybe ArenaMark))))
   }
+
+-- | The service's identity, which a holder binds what it read from this service to.
+serviceIdentity ∷ Service → ServiceIdentity
+serviceIdentity = ServiceIdentity . serviceTag
 
 -- ---------------------------------------------------------------------------
 -- Commands and requests

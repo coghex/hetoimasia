@@ -304,7 +304,7 @@ decide svc credit dec = do
           { stateSlot = Nothing
           , stateExplicitRun = if internal then 0 else stateExplicitRun s + 1
           }
-    staleView precondition aid arena = preconditionStale aid (arenaRevision arena) (D.authKnowledge (arenaAuthority arena)) precondition
+    staleView precondition aid arena = preconditionStale (serviceIdentity svc) aid (arenaRevision arena) (D.authKnowledge (arenaAuthority arena)) precondition
     stagedCurrent req arena = case reqPhase req of
       StagedPhase sg → stagedRevision sg == arenaRevision arena
       Waiting → False

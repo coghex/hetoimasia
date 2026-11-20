@@ -111,7 +111,7 @@ spec = describe "Superseded work and ordering" $ do
     withService defaultConfig $ \svc → do
       (_, lease) <- openMain svc "main"
       first' <- removeCell' svc lease (tile 3 4 5)
-      let guarded identity holds = Just (PreconditionWith (removeIncarnation first') (removeRevision first') Nothing (Just (PreconditionGuard identity holds)))
+      let guarded identity holds = Just (PreconditionWith (removeIncarnation first') (removeRevision first') Nothing (Just (PreconditionGuard identity Nothing holds)))
       okOf (removeAt svc lease (tile 1 1 1) (guarded 1 (pure False))) >>= await svc >>= (`shouldBe` Left (Failed StaleView))
       okOf (removeAt svc lease (tile 1 1 1) (guarded 2 retry)) >>= await svc >>= (`shouldBe` Left (Failed StaleView))
       -- A guard over air is read as well: the no-op removal of a cell already air is stale too.
@@ -121,12 +121,28 @@ spec = describe "Superseded work and ordering" $ do
       removeChangedFlag removed `shouldBe` True
       settleChecks svc
 
+  it "refuses a guard bound to another service, though both services name the same arena and revisions, and takes one bound to itself" $
+    withService defaultConfig $ \issuer → withService defaultConfig $ \recipient → do
+      (_, issued) <- openMain issuer "main"
+      (_, lease) <- openMain recipient "main"
+      first' <- removeCell' issuer issued (tile 3 4 5)
+      second' <- removeCell' recipient lease (tile 3 4 5)
+      -- the two services' arena and revisions are equal numbers
+      (removeIncarnation first', removeRevision first') `shouldBe` (removeIncarnation second', removeRevision second')
+      let boundTo svc = Just (PreconditionWith (removeIncarnation second') (removeRevision second') Nothing (Just (PreconditionGuard 1 (Just (serviceIdentity svc)) (pure True))))
+      okOf (removeAt recipient lease (tile 1 1 1) (boundTo issuer)) >>= await recipient >>= (`shouldBe` Left (Failed StaleView))
+      (cellIs <$> readCell recipient lease (tile 1 1 1)) `shouldReturn` False
+      removed <- okOf (removeAt recipient lease (tile 1 1 1) (boundTo recipient)) >>= await recipient >>= expectSuccess
+      removeChangedFlag removed `shouldBe` True
+      settleChecks recipient
+      settleChecks issuer
+
   it "refuses a removal whose guard held at admission and staging but not at the arbitration, and commits nothing" $
     withService defaultConfig $ \svc → do
       (_, lease) <- openMain svc "main"
       holds <- newTVarIO True
       host <- newHost False
-      let precondition = Just (PreconditionWith (ArenaId 0) (Revision 0) Nothing (Just (PreconditionGuard 7 (readTVar holds))))
+      let precondition = Just (PreconditionWith (ArenaId 0) (Revision 0) Nothing (Just (PreconditionGuard 7 Nothing (readTVar holds))))
       _ <- okOf (removeWith svc (hostEndpoint svc Nothing host) lease (tile 1 1 1) precondition)
       -- Staged and waiting for its host's eligibility, with the guard still holding.
       waitFor (readTVar (hostReady host) >>= \n → check (n >= 1))

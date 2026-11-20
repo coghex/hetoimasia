@@ -74,6 +74,8 @@ module Hetoimasia.Terrain.Runtime
   , BusyWhy (..)
   , Precondition (..)
   , PreconditionGuard (..)
+  , ServiceIdentity
+  , serviceIdentity
   , CancelResult (..)
   , openArena
   , OpenOptions (..)

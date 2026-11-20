@@ -1317,7 +1317,7 @@ commitStaged svc st rid req sg = case (reqCmd req, stagedWork sg) of
     -- Removing air changes nothing: no history, no obligation, no revision; the
     -- reservations return and the result is kept until it is taken.
     commitAir aid arena precondition =
-      preconditionStale aid (arenaRevision arena) (D.authKnowledge (arenaAuthority arena)) precondition >>= \case
+      preconditionStale (serviceIdentity svc) aid (arenaRevision arena) (D.authKnowledge (arenaAuthority arena)) precondition >>= \case
        True → settleFailure StaleView
        False → do
           withdrawRecord svc rid req

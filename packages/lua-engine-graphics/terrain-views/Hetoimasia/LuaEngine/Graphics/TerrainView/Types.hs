@@ -5,9 +5,12 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView.Types
     TerrainViewsConfig (..)
   , defaultTerrainViewsConfig
   , terrainGpuBankBytes
+  , terrainViewsLimits
+  , TerrainViewsRefused (..)
 
     -- * Targets
   , ViewTarget (..)
+  , TargetIssuer (..)
 
     -- * Attachment
   , AttachRequest (..)
@@ -48,7 +51,9 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView.Types
   ) where
 
 import Control.Concurrent.STM (STM)
+import Control.Exception (Exception)
 import Data.Text (Text)
+import Data.Unique (Unique, hashUnique)
 import Data.Word (Word64)
 import Hetoimasia.Foundation.Messaging.Payload (Prepared)
 import Hetoimasia.LuaEngine.Graphics.Scene.Ledger (GraphicsScene)
@@ -111,6 +116,25 @@ data TerrainViewsConfig = TerrainViewsConfig
   }
 
 -- | The approved terrain GPU-data bank: 128 MiB.
+-- | The identity of the host that issued a target incarnation.
+newtype TargetIssuer = TargetIssuer Unique
+  deriving (Eq)
+
+instance Show TargetIssuer where
+  showsPrec precedence (TargetIssuer host) = showParen (precedence > 10) (showString "TargetIssuer " . shows (hashUnique host))
+
+-- | A configuration or a port beyond the adapter's hard maxima, refused when the service is made, before its worker
+-- starts or any request is taken.
+newtype TerrainViewsRefused = TerrainViewsRefused Text
+  deriving (Show)
+
+instance Exception TerrainViewsRefused
+
+-- | The adapter's hard maxima: views per service, protected CPU revisions per view, terrain GPU bytes and the bytes of
+-- the one injected CPU render and staging account. Smaller settings are taken.
+terrainViewsLimits ∷ (Int, Int, Word64, Word64)
+terrainViewsLimits = (8, 2, terrainGpuBankBytes, 128 * 1024 * 1024)
+
 terrainGpuBankBytes ∷ Word64
 terrainGpuBankBytes = 128 * 1024 * 1024
 
@@ -143,6 +167,8 @@ defaultTerrainViewsConfig =
 -- control and no disposal.
 data ViewTarget k = ViewTarget
   { vtKey ∷ !k
+  , vtIssuer ∷ !TargetIssuer
+    -- ^ The host that issued the incarnation: a service takes only targets of the host its ports are built over.
   , vtUsable ∷ STM Bool
   , vtRetired ∷ STM Bool
     -- ^ Whether the incarnation has retired, read from a cell that changes only then: the views' worker watches it
@@ -174,6 +200,8 @@ data AttachRefusal
     AttachStyle !StyleRefusal
   | -- | The target is not the admitted incarnation, or the host holds no such target.
     AttachTargetUnusable
+  | -- | The target was issued by another host than the one the service is built over.
+    AttachTargetForeign
   | -- | The target's frames are not recorded with the qualified depth image, or the renderer's session depth format
     -- is not @D32_SFLOAT@.
     AttachNoDepth
@@ -199,6 +227,7 @@ describeAttachRefusal ∷ AttachRefusal → Text
 describeAttachRefusal = \case
   AttachStyle why → describeStyleRefusal why
   AttachTargetUnusable → "the target is not usable"
+  AttachTargetForeign → "the target belongs to another host"
   AttachNoDepth → "the target's frames carry no D32_SFLOAT depth image"
   AttachTargetClaimed → "another terrain view holds the target"
   AttachParentReleased → "a parent texture was released"

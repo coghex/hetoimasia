@@ -12,6 +12,9 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView
     TerrainViewsConfig (..)
   , defaultTerrainViewsConfig
   , terrainGpuBankBytes
+  , terrainViewsLimits
+  , terrainViewsRefusal
+  , TerrainViewsRefused (..)
   , TerrainViewsPorts (..)
   , productionPorts
   , TerrainViews
@@ -32,6 +35,7 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView
 
     -- * Targets
   , ViewTarget (..)
+  , TargetIssuer (..)
   , windowViewTarget
   , offscreenViewTarget
 
@@ -104,7 +108,7 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView
   ) where
 
 import Control.Concurrent.STM (STM)
-import Hetoimasia.GPU.Vulkan.GLFW (SceneTargetKey, VulkanHost)
+import Hetoimasia.GPU.Vulkan.GLFW (SceneTargetKey, VulkanHost, vulkanHostIdentity)
 import Hetoimasia.LuaEngine.Graphics.Scene.Configuration (SceneSession (..))
 import Hetoimasia.LuaEngine.Graphics.Scene.Ledger (GraphicsScene)
 import Hetoimasia.LuaEngine.Graphics.TerrainView.Owner
@@ -135,4 +139,5 @@ productionPorts host graphics scenes terrain client account taking = do
       , portClient = client
       , portAccount = account
       , portTaking = taking
+      , portIssuer = TargetIssuer (vulkanHostIdentity host)
       }

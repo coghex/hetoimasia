@@ -229,6 +229,7 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , registerVulkanSceneTarget
   , unregisterVulkanSceneTarget
   , vulkanSceneTargetRegistered
+  , vulkanHostIdentity
   , publishVulkanTargetScene
   , recordVulkanTargetBatch
   , defaultTargetCapacity
@@ -309,6 +310,7 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , VulkanRequiredTargetFailed (..)
   ) where
 
+import Data.Unique (Unique)
 import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, retry, stateTVar, writeTVar)
 import Control.Exception
   ( Exception (displayException)
@@ -449,6 +451,7 @@ import Hetoimasia.GPU.Vulkan.GLFW.Internal.Targets
   , targetsRevisions
   , unregisterTarget
   , targetRegistered
+  , targetsIssuer
   )
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Capture
   ( CaptureMode (..)
@@ -1227,6 +1230,12 @@ unregisterVulkanSceneTarget host = unregisterTarget (vulkanTargets host)
 -- the registrant's instead.
 vulkanSceneTargetRegistered ∷ VulkanHost scene → OffscreenTargetId → STM Bool
 vulkanSceneTargetRegistered host = targetRegistered (vulkanTargets host)
+
+-- | The host's identity: every offscreen registration it issues carries it, and
+-- a consumer binds a window or target of this host to it, so that a target is
+-- never taken by a service built over another host.
+vulkanHostIdentity ∷ VulkanHost scene → Unique
+vulkanHostIdentity = targetsIssuer . vulkanTargets
 
 -- | Publish a prepared scene to an offscreen target, as one transaction that
 -- never waits for GPU work, adopted capacity or a displayed frame: the

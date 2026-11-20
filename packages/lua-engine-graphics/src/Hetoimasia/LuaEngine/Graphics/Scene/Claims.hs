@@ -27,6 +27,7 @@
 module Hetoimasia.LuaEngine.Graphics.Scene.Claims
   ( SceneClaims
   , newSceneClaims
+  , newClaimHolder
   , Claim (..)
   , claimOf
   , takeClaim
@@ -35,15 +36,16 @@ module Hetoimasia.LuaEngine.Graphics.Scene.Claims
   , claimsHeld
   ) where
 
-import Control.Concurrent.STM (STM, TVar, newTVarIO, readTVar, writeTVar)
+import Control.Concurrent.STM (STM, TVar, modifyTVar', newTVarIO, readTVar, writeTVar)
 import Control.Monad (when)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Word (Word64)
 
 -- | The claims of one session's targets, by the host's target key ('SceneTargetKey' in production; a suite without a
--- host keys its model's targets its own way).
-newtype SceneClaims k = SceneClaims (TVar (Map k Claim))
+-- host keys its model's targets its own way), and the session's one issuer of claim holders' identities, so holders
+-- from different services of one session never share one.
+data SceneClaims k = SceneClaims !(TVar (Map k Claim)) !(TVar Word64)
 
 -- | One target's claim: the view incarnation that holds it, and whether that view has published to it (which
 -- decides what its release publishes).
@@ -54,15 +56,19 @@ data Claim = Claim
   deriving (Eq, Show)
 
 newSceneClaims ∷ IO (SceneClaims k)
-newSceneClaims = SceneClaims <$> newTVarIO Map.empty
+newSceneClaims = SceneClaims <$> newTVarIO Map.empty <*> newTVarIO 1
+
+-- | A claim holder's identity no other holder of this session has had: a view incarnation names itself with one.
+newClaimHolder ∷ SceneClaims k → STM Word64
+newClaimHolder (SceneClaims _ next) = readTVar next <* modifyTVar' next (+ 1)
 
 -- | The target's claim, if any.
 claimOf ∷ Ord k ⇒ SceneClaims k → k → STM (Maybe Claim)
-claimOf (SceneClaims var) key = Map.lookup key <$> readTVar var
+claimOf (SceneClaims var _) key = Map.lookup key <$> readTVar var
 
 -- | Take the target's claim for this view: 'False', changing nothing, when any claim already holds it.
 takeClaim ∷ Ord k ⇒ SceneClaims k → k → Word64 → STM Bool
-takeClaim (SceneClaims var) key view = do
+takeClaim (SceneClaims var _) key view = do
   held ← readTVar var
   case Map.lookup key held of
     Just _ → pure False
@@ -71,7 +77,7 @@ takeClaim (SceneClaims var) key view = do
 -- | Record that the view holding the claim has published: 'False', changing nothing, when the claim does not name
 -- this view.
 markClaimPublished ∷ Ord k ⇒ SceneClaims k → k → Word64 → STM Bool
-markClaimPublished (SceneClaims var) key view = do
+markClaimPublished (SceneClaims var _) key view = do
   held ← readTVar var
   case Map.lookup key held of
     -- written only when the flag first changes: a view's later publications leave the claims as they are, so a
@@ -85,7 +91,7 @@ markClaimPublished (SceneClaims var) key view = do
 -- | Release the target's claim if, and only if, it names this view, answering what it was. A release by any other
 -- view, or of a claim already released, changes nothing and answers 'Nothing'.
 releaseClaim ∷ Ord k ⇒ SceneClaims k → k → Word64 → STM (Maybe Claim)
-releaseClaim (SceneClaims var) key view = do
+releaseClaim (SceneClaims var _) key view = do
   held ← readTVar var
   case Map.lookup key held of
     Just claim | claimView claim == view → Just claim <$ writeTVar var (Map.delete key held)
@@ -93,4 +99,4 @@ releaseClaim (SceneClaims var) key view = do
 
 -- | Every claim held now.
 claimsHeld ∷ SceneClaims k → STM (Map k Claim)
-claimsHeld (SceneClaims var) = readTVar var
+claimsHeld (SceneClaims var _) = readTVar var

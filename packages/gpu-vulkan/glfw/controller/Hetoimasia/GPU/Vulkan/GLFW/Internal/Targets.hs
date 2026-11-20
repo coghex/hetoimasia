@@ -85,6 +85,7 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Targets
   , registerTarget
   , unregisterTarget
   , targetRegistered
+  , targetsIssuer
   , publishTarget
   , targetsHeld
   , targetsRevisions
@@ -215,6 +216,10 @@ unregisterTarget targets identity = do
           }
       pure True
     else pure False
+
+-- | The host identity every registration of this registry carries.
+targetsIssuer ∷ Targets scene → Unique
+targetsIssuer = targetsHost
 
 -- | Whether this registry holds this exact registration now: 'False' for one unregistered, never registered or another
 -- host's. It writes nothing.

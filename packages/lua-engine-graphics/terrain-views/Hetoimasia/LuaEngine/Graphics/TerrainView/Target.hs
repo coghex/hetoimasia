@@ -16,20 +16,22 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , VulkanHost
   , WindowScenePublication (..)
   , publishVulkanTargetScene
+  , vulkanHostIdentity
   , vulkanSceneTargetRegistered
   )
 import Hetoimasia.LuaEngine.Graphics.Scene.Ledger (GraphicsScene)
-import Hetoimasia.LuaEngine.Graphics.TerrainView.Types (ViewTarget (..))
+import Hetoimasia.LuaEngine.Graphics.TerrainView.Types (TargetIssuer (..), ViewTarget (..))
 import Hetoimasia.LuaEngine.Graphics.Window.Host (WindowTarget (..))
 import Hetoimasia.Render.TwoD.Metrics (TargetMetrics)
 
--- | A window incarnation's target. Its depth is the host's: 'True' only on a host built with the host-wide window
+-- | A window incarnation's target, bound to the host the window belongs to. Its depth is the host's: 'True' only on a host built with the host-wide window
 -- depth ('Hetoimasia.LuaEngine.Graphics.Scene.Configuration.configureWorldDepth'), which the composition that built the
 -- host passes here. The metrics are the window's latest observation, as the composition reads it.
-windowViewTarget ∷ Bool → STM (Maybe TargetMetrics) → WindowTarget GraphicsScene → ViewTarget SceneTargetKey
-windowViewTarget hostDepth metrics target =
+windowViewTarget ∷ VulkanHost GraphicsScene → Bool → STM (Maybe TargetMetrics) → WindowTarget GraphicsScene → ViewTarget SceneTargetKey
+windowViewTarget host hostDepth metrics target =
   ViewTarget
     { vtKey = KeyWindow (targetWindow target)
+    , vtIssuer = TargetIssuer (vulkanHostIdentity host)
     , vtUsable = targetUsable target
     , -- the incarnation's own lifecycle cell, which the owner's rounds never write
       vtRetired = targetRetired target
@@ -50,6 +52,7 @@ offscreenViewTarget ∷ VulkanHost GraphicsScene → OffscreenTargetId → STM B
 offscreenViewTarget host target retired depth metrics =
   ViewTarget
     { vtKey = KeyOffscreen target
+    , vtIssuer = TargetIssuer (vulkanHostIdentity host)
     , vtUsable = (&&) <$> vulkanSceneTargetRegistered host target <*> (not <$> retired)
     , vtRetired = retired
     , vtPublish = \scene →
