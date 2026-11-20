@@ -23,7 +23,7 @@ of it. The package is named only by `cabal.project.vulkan`.
 | Module (under `Hetoimasia.LuaEngine.Graphics`) | What it is |
 | --- | --- |
 | `Texture` | The composition: `withTextureGraphics` over a borrowed host, the session's renderer and texture registry, the backend, and its keeper. |
-| `Keeper` | The session's keeper of work a shorter scope hands over at its end (a terrain view service's retirements): its own thread, started and joined with the session; at the session's end what it cannot prove stays as charged evidence. |
+| `Keeper` | The session's keeper of work a shorter scope hands over at its end (a terrain view service's retirements): its own thread, run across the session's texture backend (`withKeeperAcross`), so it works through the backend's drain and is joined after it; at the session's end what it cannot prove stays as charged evidence. |
 | `Texture.Configuration` | The native configuration the fixed M1 profile maps to, and the checks of a host built for it. Pure. |
 | `Texture.Backend`, `Texture.Port` | The state machine and its one pump thread, over a `Port` of values (the seam the lifecycle suite injects). Nothing in them names Vulkan. Their implementations live in the package's **private** `internal` sub-library; what the suite needs beyond the public modules (`pumpOnce`, observed and unpumped scopes) is reachable by no client. |
 | `Texture.Host` | The production `Port`, over a running `VulkanHost`. |
@@ -567,11 +567,37 @@ the parents and the runtime view it opened, and every exit before the commit
 (a refusal, a failure, a cancellation) closes that runtime view and releases
 the parents.
 
+**The caller's contract.** The adapter's guarantees hold for a trusted
+in-engine caller, which keeps to four rules:
+
+- one live view service a graphics session, over the session and host its
+  ports were built over; sessions made one after another are each judged with
+  their own values;
+- handles, window targets and styles from that session and host only;
+- a configuration inside the documented ranges (the maxima above, sizes far
+  below `Word64`'s limit);
+- `readView` and `viewDemand` readings consumed inside the caller's own work,
+  never kept unevaluated, and no edit precondition kept past the view's scope.
+
+The adapter still checks: a target another host issued (`AttachTargetForeign`,
+as above), a precondition bound to another terrain service, another client's
+lease of the same service, released parents in the destination registry, and
+the maxima at construction. It does not check: whether a window target's
+capability belongs to the host argument it was made with; whether a style's
+parents were registered by the destination session (only that they are not
+released there); granule arithmetic near `Word64`'s limit; a reading kept
+unevaluated, which can keep an older plan's regions reachable after they were
+refunded; or a precondition kept past the scope, which keeps the service's
+state reachable. Picks are outside these rules: a pick is made and forced under
+its pin. The worker takes queued attachments before the views' steps, so
+sustained attachment traffic can delay those steps; the request queue and the
+eight-view limit bound it.
+
 | Refusal | Meaning |
 | --- | --- |
 | `AttachStyle` | a parent refused by the lease, unsuitable, without coverage, unbindable; an incomplete mapping; parents over the instance's texture bytes; a mapping that gives no region to a material of the arena's palette (`StyleMissingMaterials`, read in the commit transaction). Never busy |
 | `AttachNoDepth` | the target's frames carry no `D32_SFLOAT` depth image, or the session's depth format is not `D32_SFLOAT` |
-| `AttachTargetForeign` | the target was issued by another host than the one the service's ports are built over (`vtIssuer`, `portIssuer`); refused before anything is taken |
+| `AttachTargetForeign` | the target's issuer (`vtIssuer`) is not the host the service's ports are built over (`portIssuer`); refused before anything is taken. A surface-free target carries the issuer of the host that registered it; a window target carries the host its constructor was given, which is not checked against the window capability |
 | `AttachTargetUnusable`, `AttachTargetClaimed`, `AttachParentReleased` | read in the commit transaction, before any claim; a surface-free target is usable only while this host holds that exact registration (`vulkanSceneTargetRegistered`) and its registrant has not retired it |
 | `AttachArena`, `AttachSettings`, `AttachCamera`, `AttachTooManyViews` | the arena lease (released, closed, or another client's of the same service), the presentation settings, the camera's start, eight views |
 | `AttachBusy`, `AttachStopped` | the request queue or the terrain service's admission; the adapter or session ended |
@@ -624,26 +650,29 @@ class (an entry for each column and run) and the removal index the copies'
 removed intervals make, all counted from the copies before anything is made
 (`inputsCharge`). `admittedCostBound` and `preparationCost` take the same
 obligations at their most (`knowledgeExpansionBound` a region, the change
-limits' `changesExpansionBound`): about 1.43 GiB for the default 2,048 regions,
+limits' `changesExpansionBound`, an entry for every column and sixteen removed
+runs in each, for every region): about 1.54 GiB for the default 2,048 regions,
 beyond the 128 MiB bank, which admission therefore binds first. For terrain
 that is one class a region and unedited (`uniformInputsCost`), 2,048 regions'
 copies and inputs take about 102 MiB and fit the bank. Regions not
 admitted stay pending with their loading envelope (`readingUnadmitted`), so a
 deliberately partial plan is coherent. With enough capacity and stable inputs,
 a partial plan goes on while each preparation admits more and so settles with
-no holes; at the cap it stops, and when the account binds it sleeps until a
-release, an adoption or the account wakes it, publishing nothing if it admits
-no more. With the production bank, the copies of the maximum approved envelope
+no holes; at the cap it stops, and when the account binds it sleeps until the
+account has more room, publishing nothing if it admits no more. A preparation
+that cannot fund even its first copy's inputs and first quantum gives its
+copies back and waits for the account to have the room they need (whole
+granules). With the production bank, the copies of the maximum approved envelope
 (3840 x 2160 at zoom 0.125, about 11,200 regions) are admitted as a coherent
 partial plan with explicit pending regions, and its publication then depends on
 the record window below: the production window is 196,608 bytes, which after the
 one clip entry holds 2,891 terrain records (68 bytes each). A candidate whose
 render regions' records fit is published as that partial plan; one whose records
-exceed the window waits (`EnvelopeExceedsWindow`) and publishes nothing, and
-admitting it render region by render region under that bound is #709, as are the
-continuation of a partial plan across preparations and a distant jump's progress
-under the cap; an idle view asking again for a camera tail the terrain service cut
-is #706. The terrain world draws only retained chunks, whose instances live in
+exceed the window waits (`EnvelopeExceedsWindow`) and publishes nothing. Current
+limits: such a candidate is not admitted render region by render region under
+that bound, a partial plan does not continue across preparations, a distant
+jump does not progress under the cap, and an idle view does not ask again for a
+camera tail the terrain service cut. The terrain world draws only retained chunks, whose instances live in
 their own device buffers, so the per-frame instance ring holds none of them: the
 qualified cutout path needs no ring space.
 
@@ -658,7 +687,10 @@ and says so as evidence. A step that waits after a refusal reads only that
 refusal's own cell: the shared account's room, the session's settled-upload
 count, the terrain service's retained bank or its freed-capacity count, the
 owner's action or release-lane room (read from its admission, never its scenes
-or targets), with the service's releases and the target's newest adoption. The
+or targets). Only a step that failed with nothing to wait for watches the
+service's releases and the target's newest adoption: a peer's copy or close
+wakes no other wait. The freed-capacity count moves on every event that may
+free capacity, a second before the terrain service retries included. The
 worker watches only cells that change on those
 events: the terrain service's authority epoch (`authorityEpochSTM`, moved only
 where a lease stops being valid; a move checks each view's lease in its own
@@ -669,7 +701,10 @@ An idle view's check for new work reads its arena's identity cell
 (`arenaMarkSTM`: the content and knowledge revisions and the residency
 generation, written only when one of them moves), never the terrain service's
 state, and what a waiting preparation watches is read only while it waits, so
-another arena's work and the requests of this one never wake it. The session's admission
+another arena's work and the requests of this one never wake it. A current
+limit: a retirement behind a met barrier and an uploading stage's wait read the
+scene ledger and the renderer's retained registry whole, so another view's
+adoptions and chunk builds wake the worker for them, to no effect. The session's admission
 (`portTaking`) closing is terminal: the service ends then, closing every view
 while the scope's body runs; the composition supplies it from a cell that
 changes only then.
@@ -721,9 +756,9 @@ build refused as upload pressure waits for more of the session's uploads to
 have settled than when it was submitted (a count that only grows:
 `readVulkanUploads`' issued uploads less its unsettled ones, read with the
 submission), so an upload that started and settled after the submission still
-wakes it; a copy the account cannot hold waits for the account to have the room
-its charge needs (whole granules), so another view's copy taken and dropped
-does not wake it; a copy refused for the terrain service's retained bank waits
+wakes it; a copy, or a plan quantum, the account cannot hold waits for the account to
+have the room its charge needs (whole granules), so another view's copy taken
+and dropped does not wake it; a copy refused for the terrain service's retained bank waits
 on that bank (`retainedBankUseSTM`), read before the request. A build's chunk
 and its record of what was built are one step no cancellation splits. A release
 answers each chunk on its own: one whose release raised is that chunk's failure
@@ -780,7 +815,7 @@ adoption of that target, which only its view publishes to). The terrain GPU-data
 owner reports the chunk released. Two pinned plans a view (the newest
 published and the newest adopted); a preparation that would need a third waits
 for an adoption. Pressure (a bank, the account, the copies) keeps the previous
-view and retries when something is released or adopted.
+view and retries when what refused it changes (see the waits below).
 
 **Picking** reads only the revision the host adopted for the target and the
 plan pinned for it, and makes and forces its whole result while it reads them,
@@ -793,7 +828,8 @@ point outside the target's current logical extent is `PickNoHit` before any
 adoption check. The adopted plan is read only by this package's suites, under
 the view's reader (`Qualification.withAdoptedPlan`): for as long as the body
 runs its revision stays pinned and charged and counts against the two-pin
-limit; `readingAdoptedResidency` reads its residency identity.
+limit, and the body computes and forces what it compares inside, returning
+nothing that refers to the plan; `readingAdoptedResidency` reads its residency identity.
 `pickPrecondition` gives the removal the arena incarnation and the content and
 knowledge revisions, and a guard, bound to the view's terrain service, that the
 service reads in its removal arbitration: the view still holds the target and the revision picked from is
@@ -822,8 +858,10 @@ every view, then hands what only the host can still prove (retirements waiting
 on a barrier, an adoption, an upload or a release's answer, builds in flight,
 failed handbacks) to the graphics session's keeper (`ownerKeep`) in one
 transaction, so the scope's exit never waits on the host; the keeper takes the
-same steps while the session lives and keeps what it cannot prove as terminal
-evidence (`terrainViewsFailures`), charged. The session's admission closing, or
+same steps while the session lives, its texture backend's drain included, and
+keeps what it cannot prove as terminal evidence (`terrainViewsUnproved`, and
+`terrainViewsFailures`), charged, after taking every answer that had already
+arrived. The session's admission closing, or
 the graphics owner ending, ends the service the same way while the scope's
 body runs. The body runs with the
 caller's masking state. The worker records synchronous failures and rethrows
@@ -858,6 +896,17 @@ layer, so its frames are unchanged by the depth image.
 | A build or release in flight on the owner | the stage, then the retirements | owner actions (tickets) | the worker | collected when answered; GPU bytes charged until a release is answered |
 | A pinned plan | the view | the worker | pick | unpinned when neither newest published nor adopted; its CPU bytes return |
 | A retained region | the view, then the retirement list | the worker, owner actions | adopted frames | barrier met and no adoption lists it, then released on the owner; its GPU bytes return then |
+| An abandoned build (an orphan) | the service's retirements | the stage's abandonment, in one transaction; the retirement step | `terrainViewsGpuCharged` | its GPU reservation stays charged and its CPU moves to the service's charge; when it answers, what it built retires as above and what it did not build returns; if the owner ends first, it is kept as evidence (`terrainViewsUnproved`) with both charges |
+| A failed handback | the service, as evidence (`terrainViewsUnhanded`) | the close, in the transaction after the failed handback | the target, whose current scene still names it | the claim, the shown scene's chunks and texture interests and their CPU stay charged while the target lives; once it retires (seen by the worker or the keeper), the claim goes, the interests drop and the chunks retire as above |
+| The last reader of a closed view | the reader (`withAdoptedPlan`) | the reader's release, uninterruptible | the reader's body | a close leaves the pins a reader holds, their CPU and the parents to it; the last reader's end takes them from the view in one transaction and releases them, so exactly one of it and the close does |
+| Retirements left at the scope's exit | the graphics session's keeper (`graphicsKeeper`) | `keepWork`, in the transaction that ends the service; then the keeper's thread, one step at a time | `keeperHolding`; the service's readers above | proved as above: each release's answer returns its GPU and CPU bytes. The keeper runs across the texture backend's drain. When the graphics owner ends, the answers already arrived are taken first, and what is left is kept as evidence (`terrainViewsUnproved`) with its charges; the keeper's release ends every job left the same way |
+
+The CPU of everything kept, retiring or unproved stays in the session's one
+render account, which every view service of the session shares: a later
+service sees it as account room it cannot have. The GPU bytes stay in the
+handing service's own figure (`terrainViewsGpuCharged`); a later service starts
+its own allowance at zero, and the chunks themselves stay in the renderer until
+their release is proved.
 
 ## Tests
 
@@ -903,8 +952,10 @@ nothing fails.
 Every run except the probes and the full terrain matrix then starts a second,
 short session of the **terrain-enabled host** (host-wide window depth): an M1
 scene published to a real window, adopted, and its frames recorded and
-presented with the depth image (`M1 output on the terrain-enabled host`; no
-pixel, since a window's image is not readable from this suite).
+presented with the depth image (`M1 output on the terrain-enabled host`; that
+window's image is not read back), and the shipped quad and the twelve-colour
+grid drawn into a surface-free target on the same host, judged pixel by pixel as
+on the other host (`Lua offscreen pixels on the terrain-enabled host`).
 
 The broader terrain-view matrix is outside routine CI and is run alone, with the
 same checks: every facing; zoom 0.125, 0.5, 2 and 8; a portrait target; a
@@ -912,8 +963,8 @@ resized view; a revealed cavity's ordinary, fog and mixed cells; a replacement
 refused as stale, then made again; and, on a host whose test-only completion
 hold is set, a revision kept in GPU use while a newer one is adopted. Every
 rendering is judged pixel by pixel by the oracle and every pick against the
-oracle's winning instance. The far lower background is qualified headless only
-(its stronger witness is #710):
+oracle's winning instance. The far lower background is qualified headless only:
+no native rendering ties a drawn quad to the far contributor.
 
 ```sh
 HETOIMASIA_NATIVE_SESSION=desktop bash tools/vulkan/run.sh native hetoimasia-lua-engine-graphics:test:lua-engine-graphics-native-tests -- --terrain-views-full
