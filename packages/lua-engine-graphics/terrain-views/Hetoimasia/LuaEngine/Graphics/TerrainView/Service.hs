@@ -175,7 +175,7 @@ import Hetoimasia.Terrain.Render2D.Facts (ChunkDemand (..), ChunkKey (..), Deman
 import Hetoimasia.Terrain.Render2D.Material (Adapted (..), AdaptedQuad (..), adaptCells, adaptedInstance, terrainView)
 import Hetoimasia.Terrain.Render2D.Presentation (LightInput (..), LightSettings, describeSettingRefusal, lightInput, mkLightSettings)
 import Hetoimasia.Terrain.Render2D.Projection (ViewSetup (..))
-import Hetoimasia.Terrain.Residency (ArenaId, RegionDemand (..), Revision, coverageBox, limitCameraRegions, limitHoldRegions)
+import Hetoimasia.Terrain.Residency (ArenaId, Bank (StagingBank), BusyReason (BankFull), RegionDemand (..), Revision, coverageBox, limitCameraRegions, limitHoldRegions)
 import Data.Containers.ListUtils (nubOrd)
 import qualified Hetoimasia.Terrain.Runtime as Runtime
 import Numeric.Natural (Natural)
@@ -245,6 +245,9 @@ data Unproved = Unproved
   , unStanding ∷ !Text
   , unGpu ∷ !Word64
   , unCpu ∷ !Word64
+  , unBuild ∷ !(Maybe (Ticket (Either BuildFailure [ChunkRef])))
+    -- ^ A build that had not answered when the session's keeper ended: its ticket, so a reader still sees what it
+    -- built if it answers later.
   }
 
 -- A close whose handback failed: the view, its target's key (shown), whether that target has retired, the claim's
@@ -443,11 +446,23 @@ retireStanding = \case
   RetireMet → "met"
   RetireReleasing _ _ → "releasing"
 
--- | What the graphics owner ended before it could be proved, after every answer that had already arrived was taken:
--- each retiring chunk, or a build that never answered ('Nothing'), with where it stood ("unasked", "waiting", "met",
--- "releasing" or "building") and the GPU and CPU bytes it keeps charged. Kept for the service's life. Read-only.
+-- | What the graphics owner ended before it could be proved, after every answer that had already arrived was taken
+-- (and, while the session's keeper holds the retirements, every build still running when the owner ended has answered):
+-- each retiring chunk, or a build that had not answered by the keeper's end ('Nothing'), with where it stood
+-- ("unasked", "waiting", "met", "releasing", or for a build "building", or what it answered since) and the GPU and CPU
+-- bytes it keeps charged. Kept for the service's life. Read-only.
 terrainViewsUnproved ∷ TerrainViews k → STM [(Maybe ChunkRef, Text, Word64, Word64)]
-terrainViewsUnproved service = map (\u → (unChunk u, unStanding u, unGpu u, unCpu u)) <$> readTVar (svUnproved service)
+terrainViewsUnproved service = readTVar (svUnproved service) >>= mapM (\u → (\standing → (unChunk u, standing, unGpu u, unCpu u)) <$> standingOf u)
+  where
+    standingOf u = case unBuild u of
+      Nothing → pure (unStanding u)
+      Just ticket →
+        ticket <&> \case
+          Nothing → unStanding u
+          Just (Answered (Right chunks)) → "built after the keeper's end: " <> Text.pack (show (length chunks)) <> " chunks"
+          Just (Answered (Left (BuildPressure chunks _))) → "stopped after the keeper's end: " <> Text.pack (show (length chunks)) <> " chunks built"
+          Just (Answered (Left (BuildFailed chunks _))) → "failed after the keeper's end: " <> Text.pack (show (length chunks)) <> " chunks built"
+          Just (NotRun _) → "not run"
 
 -- | The GPU bytes the service holds charged: every retained region listed, being built, uploading or retiring, until
 -- its release is proved. Read-only.
@@ -1252,9 +1267,12 @@ markNow service state reason =
   Mark <$> readTVar (svReleases service) <*> (fmap fst <$> ledgerNewestAdopted (portLedger (svPorts service)) (vtKey (vsTarget state))) <*> pure reason
 
 -- Whether what a mark waits for has happened. A specific reason watches its own cell and nothing else: the shared
--- account's room (moved by any of its consumers: coverage, view payloads or the terrain service's own staging), the
--- owner's settled uploads, the terrain service's retained bank or its freed-capacity count. A release or an adoption
--- wakes only 'ForChange', so a peer's copy coming and going never restarts a step that waits for something else.
+-- account's room, the terrain service's staging account's room, the service's GPU room, the owner's settled uploads,
+-- whether a regional request fits the terrain service's retained bank, or its freed-capacity count. Each room is a
+-- level read against the amount the refusal needed, so a wait installed after its room came back wakes at once and
+-- one whose room came and went (a peer reserving and releasing) still sees it. A release or an adoption wakes only
+-- 'ForChange', which a step installs only when no capacity was refused, so a peer's copy coming and going never
+-- restarts a step that waits for something else.
 markMoved ∷ (Ord k, Show k) ⇒ TerrainViews k → ViewState k → Mark → STM Bool
 markMoved service state (Mark releases adopted reason) = case reason of
   ForChange → do
@@ -1263,35 +1281,46 @@ markMoved service state (Mark releases adopted reason) = case reason of
   ForRoomAbove room → (> room) <$> accountRoom (portAccount (svPorts service))
   ForRoom room → (>= room) <$> accountRoom (portAccount (svPorts service))
   ForUploads settled → (/= settled) <$> ownerUploadsSettled (portOwner (svPorts service))
-  ForRetained retained → (/= retained) <$> Runtime.retainedBankUseSTM (portTerrain (svPorts service))
+  ForGpu need → gpuRoomFor service need
+  ForStaging more → case Runtime.configStagingAccount (Runtime.inspectConfig (portTerrain (svPorts service))) of
+    Nothing → pure True
+    Just account → (\charged → Runtime.stagingAccountLimit account - min (Runtime.stagingAccountLimit account) charged >= more) <$> Runtime.stagingAccountCharged account
+  ForRegional regions → Runtime.regionalFitsSTM (portTerrain (svPorts service)) regions
   ForCapacity freed → (/= freed) <$> Runtime.capacityFreedSTM (portTerrain (svPorts service))
 
 withReason ∷ Mark → Reason → Mark
 withReason (Mark releases adopted _) = Mark releases adopted
 
--- The reason a terrain service's busy refusal gives, from its two cells read before the request: so a refusal never
--- waits for a change that already happened.
-busyReason ∷ (Word64, Word64) → Runtime.BusyWhy → Reason
-busyReason (retained, freed) = \case
-  Runtime.BusyRetained → ForRetained retained
+-- The reason a terrain service's busy refusal of a request of this many regions gives: the retained bank's room for
+-- exactly that request, the staging account's room for exactly what the refused step asked of it, or, for any other
+-- capacity, the freed-capacity count read before the request (it only grows, so a return between the read and the
+-- refusal is a change, never missed).
+busyReason ∷ Int → Word64 → Runtime.BusyWhy → Reason
+busyReason regions freed = \case
+  Runtime.BusyRetained → ForRegional regions
+  Runtime.BusyModel (BankFull StagingBank _ _ more) → ForStaging more
   _ → ForCapacity freed
 
--- The terrain service's retained bank and its freed-capacity count, read together.
-busyCells ∷ TerrainViews k → STM (Word64, Word64)
-busyCells service = (,) <$> Runtime.retainedBankUseSTM (portTerrain (svPorts service)) <*> Runtime.capacityFreedSTM (portTerrain (svPorts service))
+-- Whether the service's GPU allowance has this much room.
+gpuRoomFor ∷ TerrainViews k → Word64 → STM Bool
+gpuRoomFor service need = (\charged → tvGpuBytes (svConfig service) - min (tvGpuBytes (svConfig service)) charged >= need) <$> readTVar (svGpu service)
 
--- The graphics owner takes no more actions, so the retirements and builds left cannot be proved: each is kept as
--- terminal evidence ('svUnproved') with its charges, its GPU bytes in 'svGpu' and its CPU description in 'svKeptCpu' (its
--- description may still be in the renderer's registry).
+-- The graphics owner takes no more actions, so the retirements left cannot be proved: each is kept as terminal evidence
+-- ('svUnproved') with its charges, its GPU bytes in 'svGpu' and its CPU description in 'svKeptCpu' (its description may
+-- still be in the renderer's registry). A build still in flight stays with the retirements: an action already running
+-- when the owner's admission closed can still answer, and its answer is collected as any other.
 abandonRetirements ∷ TerrainViews k → STM ()
-abandonRetirements service = do
+abandonRetirements service = abandonWith service False
+
+-- The retirements' final abandonment: builds that have not answered are kept as evidence too, with their tickets.
+abandonWith ∷ TerrainViews k → Bool → STM ()
+abandonWith service final = do
   left ← readTVar (svRetiring service)
-  orphans ← readTVar (svOrphans service)
+  orphans ← if final then readTVar (svOrphans service) <* writeTVar (svOrphans service) [] else pure []
   writeTVar (svRetiring service) []
-  writeTVar (svOrphans service) []
   let entries =
-        [Unproved (Just (rtChunk r)) (retireStanding (rtState r)) (rtBytes r) (rtCpu r) | r ← left]
-          <> [Unproved Nothing "building" (orGpu o) (sum (orCpu o)) | o ← orphans]
+        [Unproved (Just (rtChunk r)) (retireStanding (rtState r)) (rtBytes r) (rtCpu r) Nothing | r ← left]
+          <> [Unproved Nothing "building" (orGpu o) (sum (orCpu o)) (Just (orTicket o)) | o ← orphans]
   unless (null entries) $ do
     modifyTVar' (svUnproved service) (<> entries)
     modifyTVar' (svKeptCpu service) (+ sum (map unCpu entries))
@@ -1329,7 +1358,13 @@ retirementWork service =
     { keptReady = retirable service
     , keptStep = retireStep service
     , keptDone = not <$> retirementsLeft service
-    , keptStuck = (True <$ ownerEnd (portOwner (svPorts service))) `orElse` pure False
+      -- the owner has ended and no build of it is still in flight: an action already running when its admission
+      -- closed can still answer, and the keeper waits for it
+    , keptStuck = do
+        ended ← (True <$ ownerEnd (portOwner (svPorts service))) `orElse` pure False
+        if not ended
+          then pure False
+          else readTVar (svOrphans service) >>= fmap (not . or) . mapM (fmap isNothing . orTicket)
     , keptEnd = endRetirements service
     }
 
@@ -1340,7 +1375,7 @@ retirementWork service =
 endRetirements ∷ (Ord k, Show k) ⇒ TerrainViews k → STM ()
 endRetirements service = do
   collectAnswers service
-  abandonRetirements service
+  abandonWith service True
   kept ← readTVar (svKeptCpu service)
   held ← readTVar (svRetiringCpu service)
   returnFromService service (held - min held kept)
@@ -1567,8 +1602,13 @@ data Reason
     ForRoom !Word64
   | -- | An upload settling past this count (a build refused as upload pressure, captured with its submission).
     ForUploads !Natural
-  | -- | The terrain service's retained bank moving from this (a copy refused 'Runtime.BusyRetained').
-    ForRetained !Word64
+  | -- | The service's GPU allowance having this much room (a refused GPU reservation).
+    ForGpu !Word64
+  | -- | The terrain service's staging account having this much room (a camera demand or request it refused).
+    ForStaging !Word64
+  | -- | A regional request of this many regions fitting the terrain service's retained bank (a copy refused
+    -- 'Runtime.BusyRetained').
+    ForRegional !Int
   | -- | The terrain service freeing capacity past this count (any other capacity refusal).
     ForCapacity !Word64
   deriving (Eq)
@@ -1923,9 +1963,12 @@ admittedCostBound config = admittedInputsCost config (max 1 (tvAdmitRegions conf
 
 -- | What a preparation over this many regions needs of the account beyond what the view already holds, at most: the
 -- admitted copies and their inputs ('admittedCostBound' for that many regions) and the room for the plan's first
--- quantum over them.
+-- quantum over them, in the whole granules of the account ('tvAccountGranule') the view reserves it in.
 preparationCost ∷ TerrainViewsConfig → Int → Word64
-preparationCost config regions = admittedInputsCost config (max 1 regions) + quantumBound config (max 1 regions)
+preparationCost config regions =
+  let granule = max 1 (tvAccountGranule config)
+      cost = admittedInputsCost config (max 1 regions) + quantumBound config (max 1 regions)
+   in ((cost + granule - 1) `div` granule) * granule
 
 -- | What the inputs made from these copies are charged at admission: each region's fixed inputs, what the planner's
 -- knowledge expands to for regions of more than one class, and the removal index made from the copies' removed
@@ -2019,13 +2062,14 @@ stepCopying service state prep copying = case cpPending copying of
       batch : rest → do
         -- the mark is read before the request: whatever makes room after it (the retained bank included) moves it, so a
         -- refusal never waits for a change that already happened
-        (before, cells) ← atomically ((,) <$> markNow service state ForChange <*> busyCells service)
+        (before, freed) ← atomically ((,) <$> markNow service state ForChange <*> Runtime.capacityFreedSTM terrain)
+        transferSeam service state "requesting"
         -- the request and its record in the stage, with no cancellation between them
         mask_ (Runtime.requestRegionSnapshot terrain (vsArena state) batch >>= traverse (\pending → pending <$ atomically (writeTVar (vsStage state) (StageCopying prep current {cpTodo = rest, cpPending = Just (batch, pending)})))) >>= \case
           Right pending → do
             transferSeam service state "requested"
             stageSeam service state (StageCopying prep current {cpTodo = rest, cpPending = Just (batch, pending)})
-          Left (Runtime.RefusedBusy why) → enter service state (StageCopying prep current {cpWait = Just (WaitMark (withReason before (busyReason cells why)))})
+          Left (Runtime.RefusedBusy why) → enter service state (StageCopying prep current {cpWait = Just (WaitMark (withReason before (busyReason (length batch) freed why)))})
           Left refusal → do
             recordFailure service ("a regional copy was refused: " <> Text.pack (show refusal))
             abandonStage service state >> finish service state Retry' (Just prep)
@@ -2164,11 +2208,15 @@ stepPlanning service state prep planning = case cellPrepProgress (plPrep plannin
               held = planHeld quads (length (cellPlanPending plan)) + planDemandHeld (cellPlanDemand plan)
               adaptation = fromIntegral quads * (adaptedPerQuad + 2 * instanceBytes)
               demandGrowth kept = demandBytes * fromIntegral (length demanded + length prefetch) - min (demandBytes * fromIntegral (length demanded + length prefetch)) kept
+          -- refused, the answer is the stage's whole charge at that step (what it held and what it asked for)
+          transferSeam service state "adapting"
           charged ← atomically $ do
             writeTVar (vsStageCharge state) (plBase planning + held)
             void (recharge service state)
             kept ← maybe 0 (\(v', p') → demandBytes * fromIntegral (length v' + length p')) <$> readTVar (vsDemand state)
-            growStage service state (adaptation + demandGrowth kept)
+            let growth = adaptation + demandGrowth kept
+            grown ← growStage service state growth
+            pure (if grown then Nothing else Just (plBase planning + held + growth))
           -- a preparation woken only to admit more (the same intent, metrics and arena state as the published plan) that
           -- admitted no more publishes nothing: it sleeps again until something it waits on changes. It is compared with
           -- what was published, never with a preparation that was refused (a retry after pressure is not unchanged)
@@ -2176,11 +2224,26 @@ stepPlanning service state prep planning = case cellPrepProgress (plPrep plannin
             publishedFor ← readTVar (vsPublishedFor state)
             count ← readTVar (vsAdmittedCount state)
             pure (publishedFor == Just (prpIntent prep, prpIdentity prep, prpMetrics prep) && Set.size (prpRegions prep) <= count)
-          if not charged || unchanged
-            then abandonStage service state >> finish service state Retry' (Just prep)
-            else do
+          case charged of
+           Just whole → do
+            -- the account refused the adaptation and the demand: the stage's bytes go back with its copies, and the
+            -- preparation waits for the room that whole stage needs beyond what the view then holds
+            abandonStage service state
+            atomically $ do
+              finishSTM service state Retry' (Just prep)
+              roomFor service state whole >>= markNow service state . ForRoom >>= writeTVar (vsRetry state) . Just
+           Nothing
+            | unchanged → do
+              -- admitted no more than the published plan: it sleeps until the account has more room than now (its
+              -- intent, metrics and arena state wake it as always)
+              abandonStage service state
+              atomically $ do
+                finishSTM service state Retry' (Just prep)
+                accountRoom (portAccount (svPorts service)) >>= markNow service state . ForRoomAbove >>= writeTVar (vsRetry state) . Just
+            | otherwise → do
               -- The camera's interests cover every region the plan was drawn from, not only what is still pending: the
               -- regions it shows, background far from the camera included, stay protected from eviction.
+              transferSeam service state "demanding"
               setDemand service state demanded prefetch
               light ← readTVarIO (vsLight state)
               readTVarIO (vsStyle state) >>= \case
@@ -2245,7 +2308,13 @@ buildGroups service state prep copies plan adapted held groups = do
               | otherwise = StageBuilding prep (Building plan adapted copies reused wanted gpuNeed held Nothing 0)
         Just next <$ writeTVar (vsStage state) next
   case reserved of
-    Nothing → abandonStage service state >> finish service state Retry' (Just prep)
+    Nothing → do
+      -- the GPU allowance cannot hold the regions to build: the stage goes, and the preparation waits for that much
+      -- GPU room (a peer's copies and releases of the account do not wake it)
+      abandonStage service state
+      atomically $ do
+        finishSTM service state Retry' (Just prep)
+        markNow service state (ForGpu gpuNeed) >>= writeTVar (vsRetry state) . Just
     Just next → do
       transferSeam service state "reserved"
       case next of
@@ -2372,7 +2441,7 @@ sendDemand service state =
   readTVarIO (vsDemand state) >>= \case
     Nothing → pure ()
     Just (visible, prefetch) → do
-      (mark, cells) ← atomically ((,) <$> markNow service state ForChange <*> busyCells service)
+      (mark, freed) ← atomically ((,) <$> markNow service state ForChange <*> Runtime.capacityFreedSTM (portTerrain (svPorts service)))
       -- One camera description holds at most the service's camera regions: visible regions first, in the plan's order,
       -- then prefetch, never one dropped for the description's size and never the whole demand dropped.
       let cap = fromIntegral (limitCameraRegions (Runtime.configLimits (Runtime.inspectConfig (portTerrain (svPorts service)))))
@@ -2384,7 +2453,7 @@ sendDemand service state =
             Left (Runtime.RefusedBusy why) → pure (Just why)
             Left refusal → recordFailure service ("the camera demand was refused: " <> Text.pack (show refusal)) >> pure Nothing
             Right _ → pure Nothing
-      atomically (writeTVar (vsDemandBusy state) (withReason mark . busyReason cells <$> busy))
+      atomically (writeTVar (vsDemandBusy state) (withReason mark . busyReason (length regions) freed <$> busy))
   where
     demandOf region = RegionDemand region <$> coverageBox 0 16 0 16 0 32
 
@@ -2679,7 +2748,9 @@ pinsKept service state = do
   adopted ← fmap (tagRevision . snd) <$> adoptedRevision service state
   pins ← readTVar (vsPins state)
   readers ← readTVar (vsReaders state)
-  let keep revision = Just revision == published || Just revision == adopted || maybe False (revision >) adopted || Map.findWithDefault 0 revision readers > 0
+  -- before the target's first adoption every published revision may still be the one the host adopts, so none is let
+  -- go; after it, the newest adoption is the watermark below which no revision is adopted again
+  let keep revision = Just revision == published || Just revision == adopted || maybe True (revision >) adopted || Map.findWithDefault 0 revision readers > 0
   pure (Map.partitionWithKey (\revision _ → keep revision) pins)
 
 -- ---------------------------------------------------------------------------

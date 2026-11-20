@@ -734,9 +734,12 @@ pickAgreement rig view rendered = do
           (Just quad, PickHit ref) → quadPart quad /= PartFog && Just (pickRefCell ref) == quadCell quad && pickRefPart ref == quadPart quad
           _ → False
         rearWrong = length [() | (_, Just quad, _, Just rear) ← judged, quadCell rear /= quadCell quad || quadPart rear /= quadPart quad]
+    -- the count, the rear count and every character of the shown pixels are forced here, and the tuple returned holds
+    -- nothing else: no list of the plan's quads leaves the reader
     let shown = map show (take 4 wrong)
-    _ ← evaluate (length judged + rearWrong + sum (map length shown))
-    pure (length judged, rearWrong, shown)
+        count = length judged
+    _ ← evaluate (count + rearWrong + sum (map (sum . map fromEnum) shown))
+    count `seq` rearWrong `seq` pure (count, rearWrong, shown)
   wrongShown `shouldBe` []
   judgedCount `shouldSatisfy` (> 0)
   rearWrong `shouldSatisfy` (> 0)

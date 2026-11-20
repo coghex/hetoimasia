@@ -172,6 +172,7 @@ module Hetoimasia.Terrain.Runtime
   , inspectSnapshotBytes
   , inspectRetainedChargesSTM
   , retainedBankUseSTM
+  , regionalFitsSTM
   , authorityEpochSTM
   , ArenaMark (..)
   , arenaMarkSTM
@@ -1059,6 +1060,15 @@ arenaMarkSTM svc lease = do
 -- released, so a caller refused 'BusyRetained' waits on it. It writes nothing.
 retainedBankUseSTM ∷ Service → STM Word64
 retainedBankUseSTM = readTVar . serviceRetainedCell
+
+-- | Whether a regional request of this many regions fits the retained bank now: the bank's use, the request's
+-- reservation and its result record within the bank, the same test 'requestRegionSnapshot' refuses 'BusyRetained' by.
+-- It reads only the retained bank's own cell, so a caller refused 'BusyRetained' waits on it for exactly the room its
+-- request needs, however the bank moved since. It writes nothing.
+regionalFitsSTM ∷ Service → Int → STM Bool
+regionalFitsSTM svc regions = do
+  used ← readTVar (serviceRetainedCell svc)
+  pure (used + resultRecordBytes + regionReservation regions <= configRetainedBytes (serviceConfig svc))
 
 -- | How many times capacity has been freed in this service: a cell bumped once by every event
 -- that may free capacity, including a second one before the owner has retried anything, and at

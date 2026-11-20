@@ -24,8 +24,10 @@ import Hetoimasia.Render.TwoD.Chunk.Backend (chunkRef)
 import Hetoimasia.Render.TwoD.Metrics (PixelExtent (..), TargetMetrics (..))
 import Hetoimasia.Render.TwoD.Settings (defaultViewSettings)
 import Hetoimasia.Render.TwoD.Snapshot (Camera (..), ClearColour (..), Layer (WorldLayerWith), LayerDepth (DepthEnabled), View (View), Viewport (..))
+import Hetoimasia.GPU.Vulkan.GLFW (Readiness (..))
 import Hetoimasia.LuaEngine.Graphics.Texture.Backend (BackendReading (..))
-import Hetoimasia.LuaEngine.Graphics.Texture.Port (Fault (FaultFatal))
+import Hetoimasia.LuaEngine.Graphics.Texture.Host (hostStanding)
+import Hetoimasia.LuaEngine.Graphics.Texture.Port (Fault (FaultFatal), Standing (..))
 import Hetoimasia.LuaEngine.Scene (initialContent)
 import Hetoimasia.LuaEngine.Texture.Backend (BackendTexture (..), RetirementState (..))
 import Numeric.Natural (Natural)
@@ -132,6 +134,27 @@ spec = describe "scene retention" $ do
         awaitEvent fake "released"
         atomically (reading >>= \case ProviderComplete → pure (); _ → retry)
         eventCount fake "release attempted" `shouldReturn` 1
+
+    it "fails a texture an explicit interest still holds once the owner ends, so the scope's drain ends without waiting for the interest" $
+      sceneRig defaultFakeConfig $ \rig model → do
+        let fake = rigFake rig
+        modelWindow model 1
+        (texture, identity) ← deliverTexture rig
+        -- held by an interest alone, as a failed handback holds the parents of the scene still shown
+        atomically (ledgerRetainInterest (fakeLedger fake) identity)
+        reading ← textureRelease texture
+        awaitBackend rig (elem "held" . readingTextureStages)
+        -- the owner ends: the held texture attempts nothing more, and is reported failed to retire, not waited for
+        setStanding fake (Ended "the graphics owner's exit began: it takes no more actions")
+        atomically (reading >>= \case ProviderFailed _ → pure (); _ → retry)
+        eventCount fake "release attempted" `shouldReturn` 0
+
+    it "reads the production host's clean exit as the owner's end, as it reads a failure" $ do
+      let ready = hostStanding RootsReady
+      ready (Nothing ∷ Maybe String) False `shouldBe` Running
+      ready (Nothing ∷ Maybe String) True `shouldSatisfy` \case Ended _ → True; _ → False
+      ready (Just "device lost") False `shouldBe` Ended "\"device lost\""
+      hostStanding RootsPending (Nothing ∷ Maybe String) True `shouldBe` Starting
 
   describe "the release of a published texture" $ do
     it "waits for the adoption of the scene, defers while the adopted scene holds it, and retires after the last use" $

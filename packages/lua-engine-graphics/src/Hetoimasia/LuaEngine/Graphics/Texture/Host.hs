@@ -32,6 +32,7 @@ module Hetoimasia.LuaEngine.Graphics.Texture.Host
   , BootstrapRefused (..)
   , bootstrapHost
   , hostPort
+  , hostStanding
   , hostBuilders
   , renderBuilders
   ) where
@@ -84,6 +85,7 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , constructTextureTable
   , readConstructedTable
   , readReadiness
+  , vulkanOwnerEnded
   , readUploadTicket
   , readVulkanAction
   , readVulkanModel
@@ -233,15 +235,23 @@ hostPort host session =
     }
   where
     controller = vulkanController host
+    -- the owner's clean exit ends the backend too: once its action gate has closed nothing more runs on its thread,
+    -- so a texture held by an interest would otherwise never learn of the end on its own
     standing ∷ STM Standing
-    standing =
-      readReadiness controller >>= \case
-        RootsPending → pure Starting
-        RootsFailed why → pure (Ended why)
-        RootsReady →
-          readVulkanTerminal controller <&> \report → case reportPrimary report of
-            Nothing → Running
-            Just cause → Ended (Text.pack (show cause))
+    standing = hostStanding <$> readReadiness controller <*> (reportPrimary <$> readVulkanTerminal controller) <*> vulkanOwnerEnded host
+
+-- | The backend's standing from the host's readiness, its terminal failure's primary, and whether the owner takes no
+-- more actions (its exit began, or its session failed): a failure names its cause; an owner that closed cleanly ends
+-- the backend as well, so every texture not proved retired is reported failed to retire rather than waited for.
+hostStanding ∷ Show cause ⇒ Readiness → Maybe cause → Bool → Standing
+hostStanding readiness primary ended = case readiness of
+  RootsPending → Starting
+  RootsFailed why → Ended why
+  RootsReady → case primary of
+    Just cause → Ended (Text.pack (show cause))
+    Nothing
+      | ended → Ended "the graphics owner's exit began: it takes no more actions"
+      | otherwise → Running
 
 -- | An admitted action, as the backend reads it.
 admitted ∷ Either ActionRefusal (ActionTicket a) → Either PortRefusal (Submitted a)
