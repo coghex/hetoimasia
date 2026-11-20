@@ -136,7 +136,8 @@ spec = describe "scene retention" $ do
         eventCount fake "release attempted" `shouldReturn` 1
 
     it "fails a texture an explicit interest still holds once the owner ends, so the scope's drain ends without waiting for the interest" $
-      sceneRig defaultFakeConfig $ \rig model → do
+      -- unchecked: what an ended owner made is its own teardown's to retire, which the fake does not model
+      sceneRigUnchecked defaultFakeConfig $ \rig model → do
         let fake = rigFake rig
         modelWindow model 1
         (texture, identity) ← deliverTexture rig
@@ -412,6 +413,12 @@ spec = describe "scene retention" $ do
     -- However the example ends its windows are dissolved: the backend's scope drains until every texture is proved
     -- retired, and a texture an adopted scene still holds retires only when that scene is released.
     sceneRig cfg body = withRig cfg $ \rig → do
+      model ← newModel (fakeLedger (rigFake rig))
+      setBarrier (rigFake rig) (modelCapture model)
+      body rig model `finally` dissolve model
+
+    -- The same without the native leak check, for an example whose owner ends.
+    sceneRigUnchecked cfg body = newFake cfg >>= \fake → withRigUnchecked fake $ \rig → do
       model ← newModel (fakeLedger (rigFake rig))
       setBarrier (rigFake rig) (modelCapture model)
       body rig model `finally` dissolve model
