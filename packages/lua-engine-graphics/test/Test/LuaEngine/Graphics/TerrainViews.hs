@@ -590,6 +590,9 @@ stages = describe "stages and the owner" $ do
       admittedCostBound defaultTerrainViewsConfig
         `shouldBe` (uniformInputsCost regions + knowledgeExpansionBound * fromIntegral regions + changesExpansionBound regions)
       preparationCost defaultTerrainViewsConfig 1 `shouldSatisfy` (> uniformInputsCost 1 + knowledgeExpansionBound)
+      -- in the account's whole granules: what it advertises is room a preparation's first reservation can take
+      let coarse = defaultTerrainViewsConfig {tvAccountGranule = 16 * 1024 * 1024}
+      preparationCost coarse 1 `shouldSatisfy` (\bytes → bytes >= 16 * 1024 * 1024 && bytes `mod` (16 * 1024 * 1024) == 0)
       -- terrain uniform per region and unedited: the default cap's copies and inputs fit the production bank
       uniformInputsCost regions `shouldSatisfy` (<= m1RenderAccountBytes)
       view ← attached v 1
@@ -1834,6 +1837,157 @@ hardening = describe "wakes, ownership and limits" $ do
       atomically (terrainViewsUnproved inner) `shouldReturn` []
       atomically (terrainViewsFailures inner) >>= (`shouldSatisfy` not . any ("could not be proved" `Text.isInfixOf`))
 
+  it "wakes a copy refused for the retained bank once a request of its size fits, though the bank came back to where it was before the request" $ do
+    gate ← newTVarIO False
+    armed ← newTVarIO False
+    held ← newTVarIO False
+    reserve ← newIORef (pure ())
+    -- once armed, the terrain service's owner waits before its next commit: another caller's request holds its whole
+    -- reservation until the example lets it go
+    let probe = Runtime.Probe $ \case
+          Runtime.PointBeforeCommit _ → do
+            first' ← atomically (readTVar armed <* writeTVar armed False)
+            when first' $ do
+              atomically (writeTVar held True)
+              atomically (readTVar gate >>= check)
+          _ → pure ()
+        reservation = Runtime.regionSnapshotReservation 1 + 160
+        bank = 2 * reservation - 1
+        atRequesting _ "requesting" = join (readIORef reserve <* writeIORef reserve (pure ()))
+        atRequesting _ _ = pure ()
+    seam ← newStageSeam
+    withViewsProbed HostFirst probe (\c → c {configRetainedBytes = bank}) loamOverGranite testConfig {tvCopyRegions = 1, tvOnTransfer = atRequesting, tvOnStage = seamHook seam} $ \v → (`finally` atomically (writeTVar gate True)) $ do
+      otherVar ← newIORef Nothing
+      -- after the view read the terrain service and before its copy request, another caller's request takes the bank
+      writeIORef reserve $ do
+        atomically (writeTVar armed True)
+        other ← Runtime.requestRegionSnapshot (_vTerrain v) (vArena v) [RegionCoord 0 0 0] >>= either (fail . show) pure
+        writeIORef otherVar (Just other)
+        bounded (atomically (readTVar held >>= check))
+      -- the view's request is refused; in that same step, before the worker looks at its wait, the caller lets go and
+      -- the bank is back where the view first read it, with nothing after
+      armSeam seam 1 "copying" 2 . SeamRun $
+        readIORef otherVar >>= mapM_ (\other → do
+          _ ← Runtime.cancelPending (_vTerrain v) other
+          atomically (writeTVar gate True)
+          bounded (atomically (Runtime.retainedBankUseSTM (_vTerrain v) >>= check . (== 0))))
+      view ← attached v 1
+      _ ← awaitPublished v 1
+      awaitSeamFired seam
+      closeView view
+
+  it "sends a camera demand the staging account refused once that account has the room, with the terrain service otherwise idle" $ do
+    squeeze ← newIORef (pure ())
+    built ← newTVarIO False
+    let hook _ "demanding" = join (readIORef squeeze <* writeIORef squeeze (pure ()))
+        hook _ "reserved" = atomically (writeTVar built True)
+        hook _ _ = pure ()
+    withViewsConfig testConfig {tvOnTransfer = hook} $ \v → do
+      taken ← newTVarIO 0
+      -- just before the view's first demand, another consumer takes all the shared account's room
+      writeIORef squeeze . atomically $ do
+        held ← accountCharged (_vAccount v)
+        let room = accountLimit (_vAccount v) - held
+        ok ← accountReserve (_vAccount v) room
+        writeTVar taken (if ok then room else 0)
+      view ← attached v 1
+      -- the demand was refused whole and the view went on to build: nothing of the demand is resident or loading
+      bounded (atomically (readTVar built >>= check))
+      released ← readTVarIO taken
+      released `shouldSatisfy` (> 0)
+      -- the account's room comes back with no other event: the view sends its demand again, and it loads
+      atomically (accountRelease (_vAccount v) released)
+      demandResident v view
+      closeView view
+
+  it "waits for the room its adaptation needs when the account refuses it, and publishes once another consumer releases it, with no release of its own" $ do
+    squeeze ← newIORef (pure ())
+    let hook _ "adapting" = join (readIORef squeeze <* writeIORef squeeze (pure ()))
+        hook _ _ = pure ()
+    withViewsConfig testConfig {tvOnTransfer = hook, tvAccountGranule = 64} $ \v → do
+      taken ← newTVarIO 0
+      -- just before the adaptation and the demand are charged, another consumer takes all the account's room
+      writeIORef squeeze . atomically $ do
+        held ← accountCharged (_vAccount v)
+        let room = accountLimit (_vAccount v) - held
+        ok ← accountReserve (_vAccount v) room
+        writeTVar taken (if ok then room else 0)
+      view ← attached v 1
+      bounded (atomically (readView view >>= \r → check (readingWaiting r && readingStagedBytes r == 0)))
+      atomically (readView view) >>= (`shouldBe` Nothing) . readingPublished
+      released ← readTVarIO taken
+      released `shouldSatisfy` (> 0)
+      atomically (accountRelease (_vAccount v) released)
+      _ ← awaitPublished v 1
+      closeView view
+
+  it "keeps two views whose regions the GPU allowance cannot hold asleep, however each other's copies come and go" $
+    withViewsConfig testConfig {tvGpuBytes = 0} $ \v → do
+      modelWindow (vModel v) 2
+      a ← attached v 1
+      b ← attached v 2
+      bounded (atomically (forM_ [a, b] (\w → readView w >>= \r → check (readingWaiting r && readingStagedBytes r == 0))))
+      let stepsOf = atomically ((,) <$> (readingSteps <$> readView a) <*> (readingSteps <$> readView b))
+      stepsBefore ← stepsOf
+      -- the worker serves two attachments meanwhile (refused: the targets are claimed), and takes no step of either
+      forM_ [1, 2 ∷ Int] $ \_ → attachOutcome v (target v 1) >>= (`shouldSatisfy` \case SettledRefused AttachTargetClaimed → True; _ → False)
+      stepsOf `shouldReturn` stepsBefore
+      atomically (readView a) >>= (`shouldBe` Nothing) . readingPublished
+      closeView a
+      closeView b
+
+  it "keeps every published revision pinned until the target's first adoption, so the one the host adopts can still be picked" $
+    withViews $ \v → do
+      view ← attached v 1
+      first' ← awaitPublished v 1
+      -- a second revision is published before the host adopted either: both stay pinned, the first included
+      atomically (updateCamera view (CameraIntent [Camera.ZoomBy 2])) `shouldReturn` Right ()
+      second ← awaitPublished' v 1 (first' + 1)
+      bounded (atomically (readView view >>= check . (== 2) . readingPins))
+      -- a third intent waits for an adoption rather than let either go
+      atomically (updateCamera view (CameraIntent [Camera.ZoomBy 2])) `shouldReturn` Right ()
+      bounded (atomically (readView view >>= check . readingWaiting))
+      atomically (readView view) >>= (`shouldBe` 2) . readingPins
+      publishedRevision (vModel v) 1 `shouldReturn` second
+      adoptNow (vModel v) 1 `shouldReturn` Adopted second
+      _ ← awaitPublished' v 1 (second + 1)
+      closeView view
+
+  it "waits, after the graphics owner ends, for a build still running then, and keeps what it built as evidence and returns the rest" $
+    withViews $ \v → do
+      let owner = vOwner v
+      captured ← newTVarIO Nothing
+      let ports = (vPorts v) {portOwner = (portOwner (vPorts v)) {ownerKeep = \job → True <$ writeTVar captured (Just job)}}
+      modelWindow (vModel v) 2
+      -- the view's first build is held at the owner, and will make one region and then stop
+      atomically (writeTVar (foGate owner) False >> writeTVar (foHoldBuild owner) True >> writeTVar (foRaiseAt owner) (Just 1))
+      inner ← withTerrainViews testConfig ports $ \views → do
+        view ← inInstance (vComp v) (vVm v) "i" (attachView views (requestFor v (target v 2))) >>= either (fail . show) pure >>= bounded . awaitAttach >>= \case
+          SettledOk view' → pure view'
+          _ → fail "the attachment did not succeed"
+        bounded (atomically (readTVar (foWaiting owner) >>= check . (> 0)))
+        bounded (closeView view)
+        pure views
+      job ← atomically (readTVar captured) >>= maybe (fail "nothing was handed over") pure
+      charged ← atomically (terrainViewsGpuCharged inner)
+      charged `shouldSatisfy` (> 0)
+      -- the owner ends while the build still runs: the job is not stuck, it waits for that build's answer
+      atomically (writeTVar (foEnded owner) True)
+      atomically (keptStuck job) `shouldReturn` False
+      atomically (keptReady job) `shouldReturn` False
+      -- the build makes one region and stops; its answer is taken: the region is kept as evidence, the rest returns
+      atomically (writeTVar (foHoldBuild owner) False >> writeTVar (foGate owner) True)
+      bounded (atomically (keptReady job >>= check))
+      atomically (keptStep job)
+      bounded (atomically (keptStuck job >>= check))
+      atomically (keptEnd job)
+      unproved ← atomically (terrainViewsUnproved inner)
+      [chunk | (Just chunk, _, _, _) ← unproved] `shouldSatisfy` ((== 1) . length)
+      [() | (Nothing, _, _, _) ← unproved] `shouldBe` []
+      left ← atomically (terrainViewsGpuCharged inner)
+      left `shouldSatisfy` (\bytes → bytes > 0 && bytes < charged)
+      left `shouldBe` sum [gpu | (_, _, gpu, _) ← unproved]
+
   it "cancels and collects an abandoned copy however the hook before its cancellation ends, leaving the terrain service no regional charge" $ do
     gate ← newTVarIO False
     armed ← newTVarIO False
@@ -2910,6 +3064,9 @@ data FakeOwner = FakeOwner
     -- ^ The renderer's storage window the owner reports: unbounded unless an example sets it.
   , foRaiseAt ∷ !(TVar (Maybe Int))
     -- ^ While set, the next build makes this many regions and then its builder raises (once).
+  , foHoldBuild ∷ !(TVar Bool)
+    -- ^ While set, a build waiting at the closed gate stays there even after the owner ends: an action already running
+    -- when the owner's admission closed.
   }
 
 data FakeAction
@@ -2942,6 +3099,7 @@ newFakeOwner model =
     <*> newTVarIO False
     <*> newTVarIO maxBound
     <*> newTVarIO Nothing
+    <*> newTVarIO False
 
 -- The owner's thread: runs queued actions in order. A build waits at the gate; an ended owner answers what it did not
 -- run.
@@ -2953,7 +3111,7 @@ fakeOwnerLoop owner = forever $ do
   case action of
     FakeBuild regions answer → do
       atomically (modifyTVar' (foWaiting owner) (+ 1))
-      atomically ((readTVar (foGate owner) >>= check) `orElse` (readTVar (foEnded owner) >>= check))
+      atomically ((readTVar (foGate owner) >>= check) `orElse` ((&&) <$> readTVar (foEnded owner) <*> (not <$> readTVar (foHoldBuild owner)) >>= check))
       raise ← atomically (readTVar (foRaiseAt owner) <* writeTVar (foRaiseAt owner) Nothing)
       case raise of
         -- the production build loop, over a builder that makes this many regions and then raises
