@@ -18,7 +18,7 @@
 -- 'spec' is the bounded required witness, part of the complete profile and of @--match 'terrain views'@. 'fullSpec' is
 -- the broader matrix that @--terrain-views-full@ runs alone: every facing, both zoom endpoints the band allows and a
 -- portrait resize, each judged the same way.
-module Test.LuaEngine.Graphics.Native.TerrainViews (spec, fullSpec, overlapSpec, Holding, newHolding) where
+module Test.LuaEngine.Graphics.Native.TerrainViews (spec, quietSpec, fullSpec, overlapSpec, Holding, newHolding) where
 
 import Control.Concurrent.STM
 import Control.Exception (finally, onException)
@@ -26,7 +26,8 @@ import Control.Monad (forM, forM_, unless, void)
 import Data.Foldable (for_)
 import qualified Data.ByteString as ByteString
 import qualified Data.ByteString.Char8 as BC
-import Data.IORef (newIORef, readIORef, writeIORef)
+import Data.IORef (atomicModifyIORef', newIORef, readIORef, writeIORef)
+import GHC.Conc (unsafeIOToSTM)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (isJust, listToMaybe)
 import qualified Data.Set as Set
@@ -34,6 +35,7 @@ import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Word (Word64)
 import Hetoimasia.Foundation.Log (Logger, callbackSink, defaultLogFilter, mkLogger)
+import Hetoimasia.Foundation.Messaging.Payload (prepare)
 import Hetoimasia.Foundation.Worker (withWorkerGroup)
 import Hetoimasia.GPU.Vulkan.GLFW
   ( ActionOutcome (..)
@@ -44,6 +46,7 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , Refusal (..)
   , ResourceUse (..)
   , SceneTargetKey (..)
+  , TargetScenePublication (..)
   , TicketState (..)
   , TransitionSource (..)
   , VulkanAction (..)
@@ -57,6 +60,7 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , formatCode
   , readConstructedReadback
   , readTicket
+  , publishVulkanTargetScene
   , readVulkanSceneState
   , recordVulkanTargetBatch
   , registerVulkanSceneTarget
@@ -172,6 +176,40 @@ spec env = describe "terrain views" $
 -- | The broader matrix, run alone by @--terrain-views-full@. Every rendering is judged pixel by pixel by the oracle;
 -- the picks are judged against the plan the host adopted (the oracle names colours, not the quad that wins a pixel): at
 -- every judged terrain pixel that exactly one quad of a known part covers, the pick is a hit of that quad's cell.
+-- | The worker's selection is quiet while the host's owner runs rounds for another target: an idle view's worker is
+-- not woken by scene, target or barrier state, only by its own cells.
+quietSpec ∷ Env → Spec
+quietSpec env = describe "terrain views (quiet)" $
+  it "keeps an idle view's worker asleep while the host's owner adopts another target's publications" $
+    within 60 . withRig env $ \rig → do
+      evaluations ← newIORef (0 ∷ Int)
+      let host = envHost (rgEnv rig)
+      atomically (writeTVar (rgMetrics rig) (metricsOf 128 96))
+      let viewTarget = offscreenViewTarget host (rgTarget rig) (readTVar (rgRetired rig)) True (Just <$> readTVar (rgMetrics rig))
+          -- the target's retirement cell is read once a view each time the worker's selection is evaluated
+          counted = viewTarget {vtRetired = unsafeIOToSTM (atomicModifyIORef' evaluations (\n → (n + 1, ()))) >> vtRetired viewTarget}
+      attaching ← inInstance (rgComp rig) (rgVm rig) "i" (attachView (rgViews rig) (requestOf rig counted)) >>= either (\why → assertFailure ("refused: " <> show why)) pure
+      view ← awaitAttach attaching >>= \case
+        SettledOk view' → pure view'
+        _ → assertFailure "the attachment did not succeed"
+      _ ← awaitAdopted rig 1
+      settleBackground rig view
+      other ← atomically (registerVulkanSceneTarget host) >>= either (\why → assertFailure ("the registration was refused: " <> show why)) pure
+      (`finally` atomically (unregisterVulkanSceneTarget host other)) $ do
+        before' ← readIORef evaluations
+        forM_ [1 .. 3 ∷ Natural] $ \k → do
+          scene ← prepare initialGraphicsScene
+          atomically (publishVulkanTargetScene host other scene) >>= \case
+            TargetScenePublished _ _ → pure ()
+            refused → assertFailure ("the publication was refused: " <> show refused)
+          within 10 . atomically $
+            Map.lookup (KeyOffscreen other) . sceneWindows <$> readVulkanSceneState host >>= \case
+              Just standing | windowAdopted standing >= Just k → pure ()
+              _ → retry
+        afterRounds ← readIORef evaluations
+        (afterRounds - before') `shouldSatisfy` (<= 1)
+      closeView view
+
 fullSpec ∷ Env → Spec
 fullSpec env = describe "terrain views (full)" $ do
   forM_ [FaceSouth, FaceWest, FaceNorth, FaceEast] $ \facing →

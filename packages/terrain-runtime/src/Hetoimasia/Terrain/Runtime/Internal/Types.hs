@@ -760,6 +760,11 @@ data Service = Service
     -- other; 'Nothing' once the arena has ended. A holder watching for an arena's new
     -- version watches its cell, not the whole state, which every load writes.
     serviceArenaMarks ∷ !(TVar (Map ArenaId (TVar (Maybe ArenaMark))))
+  , -- | The retained bank's use, written by the state's one write only when it changes.
+    serviceRetainedCell ∷ !(TVar Word64)
+  , -- | Bumped by the state's one write each time capacity is freed (the owner's freed flag
+    -- turning on): a holder refused for a model capacity waits on it, not on the state.
+    serviceFreedCell ∷ !(TVar Word64)
   }
 
 -- | The service's identity, which a holder binds what it read from this service to.

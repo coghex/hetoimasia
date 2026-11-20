@@ -74,7 +74,7 @@ main = do
       [flag] | flag == latchFlag → Facade.latchProbe
       -- the terrain views' full matrix runs its required witness too, then the broader judgments
       [flag] | flag == terrainFullFlag → \env → TerrainViews.spec env >> TerrainViews.fullSpec env
-      _ → \env → Native.spec env >> Windows.spec env >> Scenes.spec env >> Targets.spec env >> Pixels.spec env >> DataTextures.spec env >> Facade.spec env >> TerrainViews.spec env
+      _ → \env → Native.spec env >> Windows.spec env >> Scenes.spec env >> Targets.spec env >> Pixels.spec env >> DataTextures.spec env >> Facade.spec env >> TerrainViews.spec env >> TerrainViews.quietSpec env
   -- The terrain-enabled host's M1 witness (TRA-9): a second, short session of the host the terrain-enabled composition
   -- builds, with the host-wide window depth, in the same run as the complete profile and every ordinary selection.
   -- It runs with the complete profile and whenever the run's own Hspec selection selects its example, and not

@@ -175,6 +175,7 @@ module Hetoimasia.Terrain.Runtime
   , authorityEpochSTM
   , ArenaMark (..)
   , arenaMarkSTM
+  , capacityFreedSTM
   , inspectRegionalSTM
   , RegionalCharge
   , regionalChargeHold
@@ -431,7 +432,9 @@ withTerrainServiceFunded config ports body = do
       var <- newTVarIO (initialState config limits)
       authority <- newTVarIO 0
       marks <- newTVarIO Map.empty
-      pure (Service tag var config (portAdmission ports) (portLogger ports) (portProbe ports) storage bank (spDirectory sp) storeConfig compileBank authority marks)
+      retainedCell <- newTVarIO 0
+      freedCell <- newTVarIO 0
+      pure (Service tag var config (portAdmission ports) (portLogger ports) (portProbe ports) storage bank (spDirectory sp) storeConfig compileBank authority marks retainedCell freedCell)
     -- Close admission, ask the owner to stop, and wait for both proofs: the
     -- owner's worker has published its terminal outcome, and no borrower is
     -- outstanding. There is no deadline and no detach. Any exception received
@@ -1055,7 +1058,13 @@ arenaMarkSTM svc lease = do
 -- results. It moves whenever a regional request is admitted, settles (its reservation becomes its footprint) or is
 -- released, so a caller refused 'BusyRetained' waits on it. It writes nothing.
 retainedBankUseSTM ∷ Service → STM Word64
-retainedBankUseSTM svc = retainedBankUse <$> readSt svc
+retainedBankUseSTM = readTVar . serviceRetainedCell
+
+-- | How many times capacity has been freed in this service: a cell the state's one write bumps
+-- each time it frees capacity and at no other time, which a holder refused for a model capacity
+-- waits on instead of the state. It writes nothing.
+capacityFreedSTM ∷ Service → STM Word64
+capacityFreedSTM = readTVar . serviceFreedCell
 
 inspectSnapshotBytes ∷ Service → IO (Word64, Word64)
 inspectSnapshotBytes svc = do

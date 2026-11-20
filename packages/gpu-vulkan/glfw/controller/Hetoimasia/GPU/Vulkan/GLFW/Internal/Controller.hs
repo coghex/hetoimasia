@@ -239,6 +239,10 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , submitVulkanUpload
   , cancelVulkanUpload
   , readVulkanUploads
+  , readVulkanUploadsSettled
+  , vulkanActionRoom
+  , vulkanReleaseRoom
+  , vulkanOwnerEnded
   , readVulkanAction
   , awaitVulkanAction
 
@@ -402,6 +406,8 @@ import Hetoimasia.GPU.Vulkan.GLFW.Internal.Actions
   , actionsWaiting
   , admitAction
   , admitRelease
+  , actionsRoom
+  , actionsEnded
   , awaitActionTicket
   , beginBatch
   , newActions
@@ -1324,6 +1330,30 @@ cancelVulkanUpload (VulkanController state) = cancelRenderingUpload (stateRender
 -- to know that one has settled. It writes nothing.
 readVulkanUploads ∷ VulkanController → STM (Maybe UploadsView)
 readVulkanUploads (VulkanController state) = readRenderingUploads (stateRendering state)
+
+-- | How many of the session's uploads have settled ('Nothing' before the uploads exist): a count that only grows,
+-- written only when an upload settles, so a transaction waiting for one to settle wakes for that alone.
+readVulkanUploadsSettled ∷ VulkanController → STM (Maybe Natural)
+readVulkanUploadsSettled (VulkanController state) = readRenderingUploadsSettled (stateRendering state)
+
+-- | Whether an owner-thread action would be admitted now ('submitVulkanAction'), written nowhere and reading only
+-- the owner's gate, the device's existence and the action queue: never a scene, a barrier or a target, so a
+-- transaction waiting for room wakes when room or the gate changes and at no other time.
+vulkanActionRoom ∷ VulkanController → STM Bool
+vulkanActionRoom (VulkanController state) = do
+  device ← isJust <$> readRootsDevice (stateRoots state)
+  actionsRoom (stateActions state) device False
+
+-- | Whether a release request would find room on the release lane now ('requestVulkanRelease'), with the same reads
+-- as 'vulkanActionRoom': its barrier is not read, since it is recorded, not refused, at admission.
+vulkanReleaseRoom ∷ VulkanController → STM Bool
+vulkanReleaseRoom (VulkanController state) = do
+  device ← isJust <$> readRootsDevice (stateRoots state)
+  actionsRoom (stateActions state) device True
+
+-- | Whether the owner takes no more actions (it closed, or its session failed), reading only its gate.
+vulkanOwnerEnded ∷ VulkanController → STM Bool
+vulkanOwnerEnded (VulkanController state) = actionsEnded (stateActions state)
 
 -- | Whether an owner-thread action may be admitted or started now: refused
 -- once the session has failed, with its primary, and once the owner's

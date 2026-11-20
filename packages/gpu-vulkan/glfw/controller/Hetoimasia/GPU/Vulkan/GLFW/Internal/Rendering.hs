@@ -175,6 +175,7 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Rendering
   , submitRenderingUpload
   , cancelRenderingUpload
   , readRenderingUploads
+  , readRenderingUploadsSettled
 
     -- * Retirement
   , prepareTargetRetirement
@@ -392,6 +393,7 @@ import Hetoimasia.GPU.Vulkan.Native.Uploads
   ( CancelRefusal (CancelUnknown)
   , UploadsView
   , readUploads
+  , readUploadsSettled
   , UploadConfig
   , UploadProgress (..)
   , UploadRefusal
@@ -1883,6 +1885,13 @@ readRenderingUploads ∷ Rendering q inst msgr phys dev cmd → STM (Maybe Uploa
 readRenderingUploads rendering =
   readTVar (renderingUploads rendering) >>= \case
     UploadsMade uploads → Just <$> readUploads uploads
+    _ → pure Nothing
+
+-- | How many uploads have settled ('Nothing' before the uploads exist): written only when one settles.
+readRenderingUploadsSettled ∷ Rendering q inst msgr phys dev cmd → STM (Maybe Natural)
+readRenderingUploadsSettled rendering =
+  readTVar (renderingUploads rendering) >>= \case
+    UploadsMade uploads → Just <$> readUploadsSettled uploads
     _ → pure Nothing
 
 -- | Cancel an upload from any thread ('cancelUpload').

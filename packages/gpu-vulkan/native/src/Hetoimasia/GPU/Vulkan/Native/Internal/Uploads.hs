@@ -68,6 +68,7 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Uploads
   , UploadView (..)
   , UploadsView (..)
   , readUploads
+  , readUploadsSettled
   ) where
 
 import Control.Concurrent (ThreadId, myThreadId)
@@ -197,6 +198,9 @@ data Uploads q inst msgr phys dev cmd = Uploads
   , uploadsStaging ∷ !Staging
   , uploadsCompressionBC ∷ !Bool
   , uploadsState ∷ !(TVar UploadsState)
+  , uploadsSettledCount ∷ !(TVar Natural)
+    -- ^ How many uploads have settled (or were forgotten unqueued), written only when one does: a consumer waiting
+    -- for an upload to settle waits on it, not on the registry, which every upload's progress writes.
   }
 
 -- | The staging buffer: its managed generation, its mapping, its size, and
@@ -301,7 +305,8 @@ newUploads frames config =
               Left refusal → pure (Left refusal)
               Right (resource, mapping, atom) → do
                 state ← newTVarIO (UploadsState True 0 0 Map.empty False)
-                pure (Right (Uploads frames config (Staging resource mapping (uploadStagingBytes config) (max 16 atom)) (planTextureCompressionBC devicePlan) state))
+                settledCount ← newTVarIO 0
+                pure (Right (Uploads frames config (Staging resource mapping (uploadStagingBytes config) (max 16 atom)) (planTextureCompressionBC devicePlan) state settledCount))
   where
     recording = framesRecording frames
     roots = recordingRoots recording
@@ -529,6 +534,7 @@ forget uploads number = do
   state ← readTVar (uploadsState uploads)
   for' (Map.lookup number (stateEntries state)) $ \entry → do
     writeTVar (uploadsState uploads) state {stateEntries = Map.delete number (stateEntries state)}
+    modifyTVar' (uploadsSettledCount uploads) (+ 1)
     modifyTVar' (recordingFilled (framesRecording (uploadsFrames uploads))) (Set.delete (entryTarget entry))
     unhold uploads (entryTarget entry)
 
@@ -636,6 +642,7 @@ settle uploads number outcome = do
   for' (Map.lookup number (stateEntries state)) $ \entry → do
     writeTVar (entryTicket entry) outcome
     writeTVar (uploadsState uploads) state {stateEntries = Map.delete number (stateEntries state)}
+    modifyTVar' (uploadsSettledCount uploads) (+ 1)
     when (outcome == UploadCancelled && not (entryStarted entry)) $
       modifyTVar' (recordingFilled recording) (Set.delete (entryTarget entry))
     when (outcome == UploadComplete) $
@@ -992,6 +999,11 @@ data UploadsView = UploadsView
   , uploadsUnsettled ∷ ![UploadView]
   }
   deriving (Eq, Show)
+
+-- | How many uploads have settled: a count that only grows, and is written only when an upload settles. It writes
+-- nothing.
+readUploadsSettled ∷ Uploads q inst msgr phys dev cmd → STM Natural
+readUploadsSettled = readTVar . uploadsSettledCount
 
 readUploads ∷ Uploads q inst msgr phys dev cmd → STM UploadsView
 readUploads uploads = do

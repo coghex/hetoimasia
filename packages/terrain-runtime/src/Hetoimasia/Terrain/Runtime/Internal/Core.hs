@@ -153,7 +153,12 @@ modifySt svc f = readSt svc >>= putSt svc . f
 -- in the transactions that move them and in no other.
 putSt ∷ Service → St → STM ()
 putSt svc st = do
+  before ← readTVar (serviceState svc)
   writeTVar (serviceState svc) st
+  let retained = retainedBankUse st
+  seenRetained ← readTVar (serviceRetainedCell svc)
+  when (seenRetained /= retained) (writeTVar (serviceRetainedCell svc) retained)
+  when (stateFreed st && not (stateFreed before)) (modifyTVar' (serviceFreedCell svc) (+ 1))
   cells ← readTVar (serviceArenaMarks svc)
   let marks = Map.map arenaMark (stateArenas st)
       ended = Map.difference cells marks

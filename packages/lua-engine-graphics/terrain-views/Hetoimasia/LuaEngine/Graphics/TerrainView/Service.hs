@@ -1070,7 +1070,10 @@ nextWork service = do
   -- the session's admission closing is terminal: the service ends as at its scope's end, so every view closes and hands
   -- its target back while the scope's body still runs
   taking ← portTaking (svPorts service)
-  if not (open && taking)
+  -- the graphics owner ending (closed, or its session failed) is terminal too: no build, upload or release can be
+  -- proved any more, so the service ends while the scope's body runs
+  ended ← (True <$ ownerEnd (portOwner (svPorts service))) `orElse` pure False
+  if not (open && taking) || ended
     then pure WorkStop
     else
       -- control work first: a close (or a lease check) and a retirement are never kept waiting by attachment traffic,
@@ -1110,7 +1113,7 @@ nextWork service = do
     retirements = retirable service >>= check >> pure WorkRetire
     demands = do
       views ← Map.elems <$> readTVar (svViews service)
-      waiting ← filterM' (\state → readTVar (vsDemandBusy state) >>= maybe (pure False) (\mark → (/= mark) <$> retryMark service state)) views
+      waiting ← filterM' (\state → readTVar (vsDemandBusy state) >>= maybe (pure False) (markMoved service state)) views
       case waiting of
         state : _ → pure (WorkDemand state)
         [] → retry
@@ -1158,24 +1161,43 @@ unblockedDirty service state = do
   now ← vtMetrics (vsTarget state)
   -- what a waiting preparation watches is read only while it waits
   retryAt ← readTVar (vsRetry state)
-  waited ← maybe (pure False) (\at → (/= at) <$> retryMark service state) retryAt
+  waited ← maybe (pure False) (markMoved service state) retryAt
   continue ← readTVar (vsContinue state)
   pure (intent /= prepared || current /= revisions || now /= metrics || waited || continue)
 
 -- What a waiting preparation watches: the service's releases, the target's newest adoption, the shared account's charge
 -- (moved by any of its consumers: coverage, view payloads or the terrain service's own staging), the owner's unsettled
 -- uploads and the terrain service's retained bank.
-retryMark ∷ (Ord k, Show k) ⇒ TerrainViews k → ViewState k → STM Mark
-retryMark service state = do
-  releases ← readTVar (svReleases service)
-  newest ← ledgerNewestAdopted (portLedger (svPorts service)) (vtKey (vsTarget state))
-  charged ← accountCharged (portAccount (svPorts service))
-  -- an upload that settles frees the staging buffer or its queue, which a build refused as pressure waits for
-  uploads ← ownerUploadsSettled (portOwner (svPorts service))
-  -- the terrain service's retained bank: a regional request that settles (its reservation becomes its footprint) or is
-  -- released makes room a copy refused 'BusyRetained' waits for
-  retained ← Runtime.retainedBankUseSTM (portTerrain (svPorts service))
-  pure (releases, fst <$> newest, charged, uploads, retained)
+markNow ∷ (Ord k, Show k) ⇒ TerrainViews k → ViewState k → Reason → STM Mark
+markNow service state reason =
+  Mark <$> readTVar (svReleases service) <*> (fmap fst <$> ledgerNewestAdopted (portLedger (svPorts service)) (vtKey (vsTarget state))) <*> pure reason
+
+-- Whether what a mark waits for has happened: a release, an adoption, or its reason's own cell moving.
+markMoved ∷ (Ord k, Show k) ⇒ TerrainViews k → ViewState k → Mark → STM Bool
+markMoved service state (Mark releases adopted reason) = do
+  Mark releases' adopted' _ ← markNow service state reason
+  if releases' /= releases || adopted' /= adopted
+    then pure True
+    else case reason of
+      ForChange → pure False
+      ForRoomAbove room → (> room) <$> accountRoom (portAccount (svPorts service))
+      ForUploads settled → (/= settled) <$> ownerUploadsSettled (portOwner (svPorts service))
+      ForRetained retained → (/= retained) <$> Runtime.retainedBankUseSTM (portTerrain (svPorts service))
+      ForCapacity freed → (/= freed) <$> Runtime.capacityFreedSTM (portTerrain (svPorts service))
+
+withReason ∷ Mark → Reason → Mark
+withReason (Mark releases adopted _) = Mark releases adopted
+
+-- The reason a terrain service's busy refusal gives, from its two cells read before the request: so a refusal never
+-- waits for a change that already happened.
+busyReason ∷ (Word64, Word64) → Runtime.BusyWhy → Reason
+busyReason (retained, freed) = \case
+  Runtime.BusyRetained → ForRetained retained
+  _ → ForCapacity freed
+
+-- The terrain service's retained bank and its freed-capacity count, read together.
+busyCells ∷ TerrainViews k → STM (Word64, Word64)
+busyCells service = (,) <$> Runtime.retainedBankUseSTM (portTerrain (svPorts service)) <*> Runtime.capacityFreedSTM (portTerrain (svPorts service))
 
 -- The graphics owner takes no more actions, so the retirements left cannot be proved: they are kept as terminal
 -- evidence, and their GPU bytes stay charged.
@@ -1237,12 +1259,11 @@ retirable service = do
   orphans ← readTVar (svOrphans service)
   orphanAnswered ← or <$> forM orphans (\o → isJust <$> orTicket o)
   retiring ← readTVar (svRetiring service)
-  laneRoom ← ownerReleaseRoom owner
-  room ← ownerRoom owner
+  -- each retirement reads only what its own state waits on, and an empty list reads neither of the owner's queues
   candidates ← forM retiring $ \r → case rtState r of
-    RetireUnasked → pure laneRoom
+    RetireUnasked → ownerReleaseRoom owner
     RetireWaiting reading → isJust <$> reading
-    RetireMet → if room then releasable ledger owner r else pure False
+    RetireMet → releasable ledger owner r >>= \eligible → if eligible then ownerRoom owner else pure False
     RetireReleasing ticket _ → isJust <$> ticket
   pure (orphanAnswered || or candidates)
 
@@ -1370,9 +1391,23 @@ data Prepared'
   | Retry'
   | Abandoned'
 
--- What a waiting step watches: the service's releases, the target's newest adoption, the shared account's charge, how
--- many of the owner's uploads have settled, and the terrain service's retained bank.
-type Mark = (Word64, Maybe Natural, Word64, Natural, Word64)
+-- What a waiting step waits for: the service letting something go or the target's newest adoption moving, and the one
+-- reason its own refusal gave, read from that reason's own change-only cell and no other.
+data Mark = Mark !Word64 !(Maybe Natural) !Reason
+  deriving (Eq)
+
+data Reason
+  = -- | A release or an adoption alone.
+    ForChange
+  | -- | The shared account's free room growing past this.
+    ForRoomAbove !Word64
+  | -- | An upload settling past this count (a build refused as upload pressure, captured with its submission).
+    ForUploads !Natural
+  | -- | The terrain service's retained bank moving from this (a copy refused 'Runtime.BusyRetained').
+    ForRetained !Word64
+  | -- | The terrain service freeing capacity past this count (any other capacity refusal).
+    ForCapacity !Word64
+  deriving (Eq)
 
 -- | Where a view's preparation stands. Each stage is resumable and owns what it holds until it hands it on: the worker
 -- takes one bounded step of one view at a time, so no view's copies, plan, build or uploads keep the worker from another
@@ -1470,13 +1505,13 @@ stepReady service state =
         then pure True
         else case (cpPending copying, cpWait copying) of
           (Just (_, pending), _) → settled pending
-          (Nothing, Just (WaitMark mark)) → (/= mark) <$> retryMark service state
+          (Nothing, Just (WaitMark mark)) → markMoved service state mark
           (Nothing, Just (WaitRoom room)) → (>= room) <$> accountRoom (portAccount (svPorts service))
           (Nothing, Nothing) → pure True
     StagePlanning prep planning → do
       stale ← superseded state prep
       case plWait planning of
-        Just mark | not stale → (/= mark) <$> retryMark service state
+        Just mark | not stale → markMoved service state mark
         _ → pure True
     StageBuilding prep building → do
       stale ← superseded state prep
@@ -1563,14 +1598,15 @@ finish service state outcome prep = atomically (finishSTM service state outcome 
 finishPressured ∷ (Ord k, Show k) ⇒ TerrainViews k → ViewState k → Natural → Prep → IO ()
 finishPressured service state uploads prep = atomically $ do
   finishSTM service state Retry' (Just prep)
-  modifyTVar' (vsRetry state) (fmap (\(releases, adopted, charged, _, retained) → (releases, adopted, charged, uploads, retained)))
+  -- what it waits for is an upload settling past the count captured with its submission
+  markNow service state (ForUploads uploads) >>= writeTVar (vsRetry state) . Just
 
 finishSTM ∷ (Ord k, Show k) ⇒ TerrainViews k → ViewState k → Prepared' → Maybe Prep → STM ()
 finishSTM service state outcome prep = do
   writeTVar (vsStage state) StageIdle
   writeTVar (vsStageCharge state) 0
   _ ← recharge service state
-  mark ← retryMark service state
+  mark ← markNow service state ForChange
   case outcome of
     Retry' → writeTVar (vsRetry state) (Just mark)
     _ → writeTVar (vsRetry state) Nothing
@@ -1817,13 +1853,13 @@ stepCopying service state prep copying = case cpPending copying of
       batch : rest → do
         -- the mark is read before the request: whatever makes room after it (the retained bank included) moves it, so a
         -- refusal never waits for a change that already happened
-        before ← atomically (retryMark service state)
+        (before, cells) ← atomically ((,) <$> markNow service state ForChange <*> busyCells service)
         -- the request and its record in the stage, with no cancellation between them
         mask_ (Runtime.requestRegionSnapshot terrain (vsArena state) batch >>= traverse (\pending → pending <$ atomically (writeTVar (vsStage state) (StageCopying prep current {cpTodo = rest, cpPending = Just (batch, pending)})))) >>= \case
           Right pending → do
             transferSeam service state "requested"
             stageSeam service state (StageCopying prep current {cpTodo = rest, cpPending = Just (batch, pending)})
-          Left (Runtime.RefusedBusy _) → enter service state (StageCopying prep current {cpWait = Just (WaitMark before)})
+          Left (Runtime.RefusedBusy why) → enter service state (StageCopying prep current {cpWait = Just (WaitMark (withReason before (busyReason cells why)))})
           Left refusal → do
             recordFailure service ("a regional copy was refused: " <> Text.pack (show refusal))
             abandonStage service state >> finish service state Retry' (Just prep)
@@ -1901,7 +1937,8 @@ stepPlanning ∷ (Ord k, Show k) ⇒ TerrainViews k → ViewState k → Prep →
 stepPlanning service state prep planning = case cellPrepProgress (plPrep planning) of
   Working → do
     -- the quantum's growth is charged before it is made, then the charge is set to what the plan now holds
-    mark ← atomically (retryMark service state)
+    -- the account's room before the attempt: it waits for room beyond that
+    mark ← atomically (accountRoom (portAccount (svPorts service)) >>= markNow service state . ForRoomAbove)
     charged ← atomically $ do
       writeTVar (vsStageCharge state) (plBase planning + prepHeld (plPrep planning))
       growStage service state (quantumBound (svConfig service) (Set.size (prpRegions prep)))
@@ -2156,19 +2193,19 @@ sendDemand service state =
   readTVarIO (vsDemand state) >>= \case
     Nothing → pure ()
     Just (visible, prefetch) → do
-      mark ← atomically (retryMark service state)
+      (mark, cells) ← atomically ((,) <$> markNow service state ForChange <*> busyCells service)
       -- One camera description holds at most the service's camera regions: visible regions first, in the plan's order,
       -- then prefetch, never one dropped for the description's size and never the whole demand dropped.
       let cap = fromIntegral (limitCameraRegions (Runtime.configLimits (Runtime.inspectConfig (portTerrain (svPorts service)))))
           regions = take cap (nubOrd (visible <> prefetch))
       busy ← case traverse demandOf regions of
-        Left why → recordFailure service ("the camera demand could not be described: " <> Text.pack (show why)) >> pure False
+        Left why → recordFailure service ("the camera demand could not be described: " <> Text.pack (show why)) >> pure Nothing
         Right demands →
           Runtime.setViewDemand (portTerrain (svPorts service)) (vsRuntimeView state) (vsArena state) demands >>= \case
-            Left (Runtime.RefusedBusy _) → pure True
-            Left refusal → recordFailure service ("the camera demand was refused: " <> Text.pack (show refusal)) >> pure False
-            Right _ → pure False
-      atomically (writeTVar (vsDemandBusy state) (if busy then Just mark else Nothing))
+            Left (Runtime.RefusedBusy why) → pure (Just why)
+            Left refusal → recordFailure service ("the camera demand was refused: " <> Text.pack (show refusal)) >> pure Nothing
+            Right _ → pure Nothing
+      atomically (writeTVar (vsDemandBusy state) (withReason mark . busyReason cells <$> busy))
   where
     demandOf region = RegionDemand region <$> coverageBox 0 16 0 16 0 32
 
@@ -2322,7 +2359,7 @@ publishPlan service state prep uploading = do
             when (unadmitted > 0 && not capped) $
               if admitted > previous
                 then writeTVar (vsContinue state) True
-                else retryMark service state >>= writeTVar (vsRetry state) . Just
+                else accountRoom (portAccount (svPorts service)) >>= markNow service state . ForRoomAbove >>= writeTVar (vsRetry state) . Just
         else abandonStage service state >> finish service state Abandoned' (Just prep)
 
 -- The view's need of the account, covered: its pinned revisions and what its stage holds (taken copies, the candidate).

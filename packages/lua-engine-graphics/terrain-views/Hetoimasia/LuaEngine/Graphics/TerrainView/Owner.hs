@@ -19,15 +19,16 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView.Owner
   , releaseEach
   ) where
 
-import Control.Concurrent.STM (STM, TVar, atomically, catchSTM, modifyTVar', newTVar, readTVar, retry, throwSTM)
-import Control.Exception (Exception, SomeAsyncException, displayException, fromException, mask_, throwIO, try)
+import Control.Concurrent.STM (STM, TVar, atomically, check, modifyTVar', newTVar, readTVar)
+import Control.Exception (SomeAsyncException, displayException, fromException, mask_, throwIO, try)
+import Data.Maybe (fromMaybe)
 import Data.Functor ((<&>))
 import Control.Monad (forM_, void)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import Data.Word (Word64)
 import qualified Data.Text as Text
-import Hetoimasia.GPU.Vulkan.GLFW (ActionOutcome (..), ActionRefusal (..), ImageFormat (Depth32Float), UploadsView (..), VulkanAction (..), VulkanHost, readVulkanAction, readVulkanUploads, requestVulkanRelease, submitVulkanAction)
+import Hetoimasia.GPU.Vulkan.GLFW (ActionOutcome (..), ActionRefusal (..), ImageFormat (Depth32Float), VulkanAction (..), VulkanHost, readVulkanAction, readVulkanUploadsSettled, requestVulkanRelease, submitVulkanAction, vulkanActionRoom, vulkanOwnerEnded, vulkanReleaseRoom)
 import Numeric.Natural (Natural)
 import Hetoimasia.LuaEngine.Graphics.Scene.Ledger (GraphicsScene)
 import Hetoimasia.LuaEngine.Graphics.Texture (TextureGraphics (..))
@@ -140,17 +141,15 @@ productionViewOwner host graphics = do
                   Nothing → pure Nothing
                   Just (ActionReturned ()) → pure (Just True)
                   Just _ → pure (Just False)
-      , ownerRoom = probe (submitVulkanAction host (VulkanAction (\_ → pure ())))
-      , ownerReleaseRoom = probe (requestVulkanRelease host (VulkanAction (\_ → pure ())))
+      , -- the host's own room projections: its gate, its device and its queue, never a scene or a target, so a wait on
+        -- them wakes when room or the gate changes and at no other time
+        ownerRoom = vulkanActionRoom host
+      , ownerReleaseRoom = vulkanReleaseRoom host
       , ownerStanding = chunkStandingSTM retained
-      , ownerUploadsSettled = maybe 0 (\view → uploadsIssued view - min (uploadsIssued view) (fromIntegral (length (uploadsUnsettled view)))) <$> readVulkanUploads host
-      , -- The host's own admission answers whether its owner still takes actions: a probe admitted while it does is
-        -- rolled back by the retry, so nothing is queued, and the transaction wakes when the admission changes.
-        ownerEnd =
-          submitVulkanAction host (VulkanAction (\_ → pure ())) >>= \case
-            Left (ActionSessionFailed _) → pure ()
-            Left ActionOwnerClosed → pure ()
-            _ → retry
+      , -- written only when an upload settles, never by an upload's progress
+        ownerUploadsSettled = fromMaybe 0 <$> readVulkanUploadsSettled host
+      , -- the host's gate alone: its owner closed or its session failed
+        ownerEnd = vulkanOwnerEnded host >>= check
       }
   where
     retained = graphicsRetained graphics
@@ -223,12 +222,3 @@ refusalOf = \case
   ActionDeviceNotReady → OwnerBusy
   _ → OwnerGone
 
--- Whether a submission would be admitted now, written nowhere: the probe's admission is rolled back by the exception
--- that carries its answer out of the transaction, and a transaction that waits on the answer wakes when the queue does.
-probe ∷ STM (Either ActionRefusal a) → STM Bool
-probe admission = (admission >>= throwSTM . Probe . either (const False) (const True)) `catchSTM` \(Probe room) → pure room
-
-newtype Probe = Probe Bool
-  deriving (Show)
-
-instance Exception Probe

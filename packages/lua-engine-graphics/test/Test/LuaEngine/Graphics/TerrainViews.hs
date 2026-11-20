@@ -2148,6 +2148,34 @@ stagesAndReaders = describe "stages, waits and readers" $ do
       outcome ← inInstance (vComp v) (vVm v) "i" (attachView (vViews v) (requestFor v (target v 2)))
       either (`shouldBe` AttachStopped) (const (expectationFailure "an attachment was taken after the admission closed")) outcome
 
+  it "ends every view while the scope's body runs once the graphics owner ends, with the session admission open, a build waiting for room" $
+    withViews $ \v → do
+      let owner = vOwner v
+      view ← attached v 1
+      _ ← awaitPublished v 1
+      quiescent v
+      demandResident v view
+      -- the owner's action queue is full: an edit's rebuild waits for room, with no ticket
+      atomically (writeTVar (foCapacity owner) 0)
+      removeWith v (tileAt 9 9 3) Nothing `shouldReturn` Right True
+      bounded (atomically (readView view >>= check . readingWaiting))
+      -- the owner ends; the session still takes work
+      atomically (readTVar (vTaking v)) `shouldReturn` True
+      atomically (writeTVar (foEnded owner) True)
+      bounded (atomically (viewClosed view >>= check))
+      atomically (claimOf (vClaims v) 1) `shouldReturn` Nothing
+      atomically (viewHoldsStyle view) `shouldReturn` False
+      -- what the owner can no longer prove is kept as evidence; no attachment is taken any more
+      bounded (atomically (terrainViewsRetiring (vViews v) >>= check . null))
+      modelWindow (vModel v) 2
+      outcome ← inInstance (vComp v) (vVm v) "i" (attachView (vViews v) (requestFor v (target v 2)))
+      case outcome of
+        Left AttachStopped → pure ()
+        Right attaching → bounded (awaitAttach attaching) >>= \case
+          SettledRefused AttachStopped → pure ()
+          _ → expectationFailure "an attachment was taken after the owner ended"
+        Left other → expectationFailure ("an attachment was refused for another reason: " <> show other)
+
   it "closes a view before the attachments queued behind it, however many there are" $ do
     commits ← newCommitHold
     order ← newIORef ([] ∷ [Text.Text])

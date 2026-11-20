@@ -207,6 +207,10 @@ module Hetoimasia.GPU.Vulkan.GLFW
   , awaitUploadTicket
   , cancelVulkanUpload
   , readVulkanUploads
+  , readVulkanUploadsSettled
+  , vulkanActionRoom
+  , vulkanReleaseRoom
+  , vulkanOwnerEnded
   , CompletionHold (..)
   , UploadsView (..)
   , UploadView (..)
@@ -368,6 +372,7 @@ module Hetoimasia.GPU.Vulkan.GLFW
   , FrameStorageRefused (..)
   ) where
 
+import Numeric.Natural (Natural)
 import Control.Concurrent.STM (STM)
 import Hetoimasia.Foundation.Log (Logger)
 import Hetoimasia.GLFW.Vulkan (LoaderIntegration)
@@ -654,6 +659,23 @@ cancelVulkanUpload host = Controller.cancelVulkanUpload (vulkanController host)
 -- watches to know that one has settled. It writes nothing.
 readVulkanUploads ∷ VulkanHost scene → STM (Maybe UploadsView)
 readVulkanUploads host = Controller.readVulkanUploads (vulkanController host)
+
+-- | How many of the session's uploads have settled ('Nothing' before the uploads exist), written only when one
+-- settles: what a consumer waiting for an upload to settle reads instead of 'readVulkanUploads'.
+readVulkanUploadsSettled ∷ VulkanHost scene → STM (Maybe Natural)
+readVulkanUploadsSettled host = Controller.readVulkanUploadsSettled (vulkanController host)
+
+-- | Whether an action would be admitted now, reading only the owner's gate, the device and the action queue.
+vulkanActionRoom ∷ VulkanHost scene → STM Bool
+vulkanActionRoom host = Controller.vulkanActionRoom (vulkanController host)
+
+-- | Whether a release request would find room on the release lane now, with the same reads.
+vulkanReleaseRoom ∷ VulkanHost scene → STM Bool
+vulkanReleaseRoom host = Controller.vulkanReleaseRoom (vulkanController host)
+
+-- | Whether the owner takes no more actions (closed, or its session failed), reading only its gate.
+vulkanOwnerEnded ∷ VulkanHost scene → STM Bool
+vulkanOwnerEnded host = Controller.vulkanOwnerEnded (vulkanController host)
 
 -- | Create one window's surface on the main thread, under its attachment, and
 -- hand it to this host's owner as a required or optional target.

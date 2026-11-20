@@ -27,8 +27,8 @@ import Control.Concurrent.STM (STM, TVar, atomically, check, modifyTVar', newTVa
 import Control.Exception (AsyncException (ThreadKilled), ErrorCall (..), Exception, ExceptionWithContext (..), SomeAsyncException, SomeException, catch, displayException, finally, fromException, rethrowIO, throwIO, try, tryWithContext)
 import Control.Monad (replicateM_, void, when)
 import Data.Foldable (for_)
-import Data.IORef (newIORef, readIORef, writeIORef)
-import GHC.Conc (BlockReason (BlockedOnException), ThreadStatus (..), threadStatus)
+import Data.IORef (atomicModifyIORef', newIORef, readIORef, writeIORef)
+import GHC.Conc (BlockReason (BlockedOnException), ThreadStatus (..), threadStatus, unsafeIOToSTM)
 import qualified Data.Map.Strict as Map
 import Data.List (isInfixOf, isSubsequenceOf)
 import Data.Maybe (isJust, isNothing)
@@ -84,6 +84,7 @@ spec = describe "Offscreen scene targets (LFE-27)" $ do
   describe "registration and publication" $ do
     itBounded "registers targets with distinct identities at the initial scene's revision 0, takes publications as a rising latest value replaced in execution order, and answers what it does not hold naming it, including a stale or foreign identity" testRegistration
     itBounded "refuses a registration with a typed reason before the device exists, after the session failed and once the owner's exit has begun, and refuses a publication to a closed host" testRegistrationRefusals
+    itBounded "keeps its room, release-lane room, settled-upload and owner-end projections unwritten by owner rounds that adopt publications, and writes them when an action is queued" testQuietProjections
     itBounded "bounds the targets the host accounts for, counting a retired target until its last record is released, and leaves the windows' own bound alone" testCapacity
 
   describe "the barrier" $ do
@@ -303,6 +304,39 @@ testRegistration = do
   foreignAnswer `shouldBe` TargetSceneUnknown a
   foreignUnregistered `shouldBe` False
   own `shouldSatisfy` (/= a)
+
+testQuietProjections ∷ IO ()
+testQuietProjections = do
+  rig ← surfaceFreeRig 0
+  (quiet, woken) ← runRig rig $ \host _ → do
+    awaitReady host
+    a ← registered host
+    awaitTargetStanding host a ((== Just 0) . windowAdopted)
+    evaluations ← newIORef (0 ∷ Int)
+    started ← newEmptyMVar
+    let controller = vulkanController host
+        -- a transaction that waits while there is room on both lanes and the owner runs: it counts its evaluations
+        watch = atomically $ do
+          unsafeIOToSTM (atomicModifyIORef' evaluations (\n → (n + 1, ())) >> void (tryPutMVar started ()))
+          room ← vulkanActionRoom controller
+          lane ← vulkanReleaseRoom controller
+          _ ← readVulkanUploadsSettled controller
+          ended ← vulkanOwnerEnded controller
+          check (ended || not room || not lane)
+    withOwnedThread watch $ \_ _ → do
+      takeMVar started
+      before ← readIORef evaluations
+      -- three publications, each adopted by an owner round: the scene and target state they write are not read
+      for_ [1 .. 3 ∷ Natural] $ \k → do
+        _ ← publishNow host a (fromIntegral k)
+        awaitTargetStanding host a ((== Just k) . windowAdopted)
+      afterRounds ← readIORef evaluations
+      -- an action queued (and run) changes the queue: the projection sees it
+      act host (VulkanAction (\_ → pure ())) >>= returned
+      afterAction ← readIORef evaluations
+      pure (afterRounds - before, afterAction - afterRounds)
+  quiet `shouldSatisfy` (<= 1)
+  woken `shouldSatisfy` (>= 1)
 
 testRegistrationRefusals ∷ IO ()
 testRegistrationRefusals = do
