@@ -265,11 +265,11 @@ spec = describe "Superseded work and ordering" $ do
       -- two regional borrows, then nothing pending that the owner could retry
       first' <- okOf (requestRegionSnapshot svc lease [RegionCoord 0 0 0]) >>= await svc >>= either (fail . show) pure
       second <- okOf (requestRegionSnapshot svc lease [RegionCoord 1 0 0]) >>= await svc >>= either (fail . show) pure
-      before <- atomically (capacityFreedSTM svc)
+      initial <- atomically (capacityFreedSTM svc)
       -- each return moves the cell, the second though the first already left the owner something to retry
       releaseRegionBorrow svc first'
       once <- atomically (capacityFreedSTM svc)
-      once `shouldSatisfy` (> before)
+      once `shouldSatisfy` (> initial)
       releaseRegionBorrow svc second
       atomically (capacityFreedSTM svc) >>= (`shouldSatisfy` (> once))
       inspectDefects svc >>= (`shouldBe` [])

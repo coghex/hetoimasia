@@ -11,7 +11,7 @@
 -- @terrain views@ subgroup draws.
 module Test.LuaEngine.Graphics.TerrainViews (spec) where
 
-import Control.Concurrent (MVar, forkIO, killThread, myThreadId, newEmptyMVar, putMVar, readMVar, takeMVar, tryPutMVar)
+import Control.Concurrent (killThread, myThreadId, newEmptyMVar, putMVar, takeMVar, tryPutMVar)
 import Control.Exception (MaskingState (Unmasked), getMaskingState)
 import Control.Concurrent.STM
 import Data.Unique (newUnique)
@@ -33,7 +33,7 @@ import Data.Word (Word32, Word64)
 import Hetoimasia.Foundation.Log (Logger, callbackSink, defaultLogFilter, mkLogger)
 import Hetoimasia.Foundation.Messaging.Payload (prepare)
 import Hetoimasia.Foundation.Worker (withWorkerGroup)
-import Hetoimasia.LuaEngine.Graphics.Keeper (Keeper, keepWork, keeperHolding, withKeeperAcross)
+import Hetoimasia.LuaEngine.Graphics.Keeper (Keeper, KeptWork (..), keepWork, keeperHolding, withKeeperAcross)
 import Hetoimasia.LuaEngine.Graphics.Scene.Claims (SceneClaims, claimOf, newSceneClaims)
 import Hetoimasia.LuaEngine.Graphics.Scene.Ledger (GraphicsScene (..), LedgerReading (..), initialGraphicsScene, ledgerAdopted, ledgerInterests, ledgerNewestAdopted, ledgerNewestTargets, ledgerReading, ledgerReleased, newSceneLedger)
 import Hetoimasia.LuaEngine.Graphics.Scene.Publish (HostAnswer (..))
@@ -131,8 +131,6 @@ data Views = Views
     -- ^ The session's keeper, which outlives the views' scope.
   , vPorts ∷ !(TerrainViewsPorts Int)
     -- ^ The ports the views were made with, for an example that makes a further views scope in the same session.
-  , vDrainBegun ∷ !(MVar ())
-    -- ^ Filled once the texture backend's drain at the session's end has read a texture.
   }
 
 spec ∷ Spec
@@ -1667,6 +1665,31 @@ hardening = describe "wakes, ownership and limits" $ do
       _ ← awaitPublished v 1
       closeView view
 
+  it "waits for the room its first copy's inputs need when admission cannot fund them, and admits them once another consumer releases it, with no release of its own" $ do
+    requests ← newIORef (0 ∷ Int)
+    squeeze ← newIORef (pure () ∷ IO ())
+    -- at the view's second copy request, its first copy taken and charged, another consumer leaves the account a granule
+    let atRequested _ "requested" = atomicModifyIORef' requests (\n → (n + 1, n + 1)) >>= \n → when (n == 2) (join (readIORef squeeze))
+        atRequested _ _ = pure ()
+    withViewsConfig testConfig {tvCopyRegions = 1, tvAccountGranule = 64, tvOnTransfer = atRequested} $ \v → do
+      taken ← newTVarIO 0
+      writeIORef squeeze . atomically $ do
+        held ← accountCharged (_vAccount v)
+        let room = accountLimit (_vAccount v) - held - 64
+        ok ← accountReserve (_vAccount v) room
+        writeTVar taken (if ok then room else 0)
+      view ← attached v 1
+      -- the second copy cannot be charged, so the first is the admitted subset; its inputs and first quantum cannot be
+      -- funded either: the copies go back and the view waits, holding no stage
+      bounded (atomically (readView view >>= \r → check (readingWaiting r && readingStagedBytes r == 0)))
+      atomically (readView view) >>= (`shouldBe` Nothing) . readingPublished
+      released ← readTVarIO taken
+      released `shouldSatisfy` (> 0)
+      -- another consumer releases: nothing of the views' moves, and the view admits and publishes
+      atomically (accountRelease (_vAccount v) released)
+      _ ← awaitPublished v 1
+      closeView view
+
   it "waits on a copy refused for the terrain service's retained bank, and copies once another caller's request settles to its footprint while it keeps the borrow" $ do
     gate ← newTVarIO False
     armed ← newTVarIO False
@@ -1760,26 +1783,23 @@ hardening = describe "wakes, ownership and limits" $ do
       bounded (atomically (keeperHolding (vKeeper v) >>= check . (== 0)))
       atomically (terrainViewsGpuCharged inner) `shouldReturn` 0
 
-  it "keeps a failed handback's keeper work running through the texture backend's drain, so a target retiring during it lets the drain end" $
-    withViewsOrdered DrainFirst loamOverGranite testConfig $ \v → do
-      modelWindow (vModel v) 2
-      armed ← newTVarIO False
-      let base = target v 2
-          raising = base {vtPublish = \scene → readTVar armed >>= \raise → if raise then throwSTM (userError "the empty publication raised") else vtPublish base scene}
-      -- a further views scope whose view's handback fails: its target keeps the claim and the scene's texture interests
-      withTerrainViews testConfig (vPorts v) $ \views → do
-        view ← inInstance (vComp v) (vVm v) "i" (attachView views (requestFor v raising)) >>= either (fail . show) pure >>= bounded . awaitAttach >>= \case
-          SettledOk view' → pure view'
-          _ → fail "the attachment did not succeed"
-        _ ← awaitPublished v 2
-        atomically (writeTVar armed True)
-        outcome ← try (bounded (closeView view))
-        either (\(TerrainViewCloseFailed _) → pure ()) (const (expectationFailure "the close reported no failure")) outcome
-      -- the keeper holds the failed handback, whose interests the backend's drain will wait for
-      atomically (keeperHolding (vKeeper v)) `shouldReturn` 1
-      atomically (ledgerInterests (fakeLedger (vFake v))) >>= (`shouldSatisfy` (not . null))
-      -- the window goes only once the session's end has begun draining the backend
-      void (forkIO (readMVar (vDrainBegun v) >> removeWindow (vModel v) 2))
+  it "keeps the session's keeper running across the scope it is composed with until that scope's exit has drained, so a kept job can let the drain end" $ do
+    exiting ← newTVarIO False
+    letGo ← newTVarIO False
+    -- the job can move only once the scope's exit has begun, and its step is what that exit waits for: a keeper that
+    -- ended before the exit's drain would leave it waiting forever
+    let job =
+          KeptWork
+            { keptReady = (&&) <$> readTVar exiting <*> (not <$> readTVar letGo)
+            , keptStep = writeTVar letGo True
+            , keptDone = readTVar letGo
+            , keptStuck = pure False
+            , keptEnd = pure ()
+            }
+        draining inner = inner () `finally` (atomically (writeTVar exiting True) >> atomically (readTVar letGo >>= check))
+    bounded (withKeeperAcross draining (\keeper () → atomically (keepWork keeper job)))
+      `shouldReturn` True
+    readTVarIO letGo `shouldReturn` True
 
   it "cancels and collects an abandoned copy however the hook before its cancellation ends, leaving the terrain service no regional charge" $ do
     gate ← newTVarIO False
@@ -2531,10 +2551,8 @@ withViewsOn ∷ SourceSpec → TerrainViewsConfig → (Views → IO a) → IO a
 withViewsOn = withViewsOrdered HostFirst
 
 -- | Which ends first at the scope's exit: the scene host (its windows dissolved, every adoption released) or the views
--- (the host model stays, and the example decides what it does while the views end). 'DrainFirst' is 'ViewsFirst' with
--- the session's end not waiting for its keeper before the texture backend drains: the example leaves the keeper work
--- that only the host can finish, during that drain.
-data EndOrder = HostFirst | ViewsFirst | DrainFirst
+-- (the host model stays, and the example decides what it does while the views end).
+data EndOrder = HostFirst | ViewsFirst
 
 withViewsOrdered ∷ EndOrder → SourceSpec → TerrainViewsConfig → (Views → IO a) → IO a
 withViewsOrdered order = withViewsTerrain order id
@@ -2551,10 +2569,9 @@ withViewsProbed order probe terrainConfig source config body = do
   colourBytes ← ByteString.readFile (atlas </> "colour.png")
   normalBytes ← ByteString.readFile (atlas </> "normal.png")
   fake ← newFake defaultFakeConfig {fcStagingBytes = 4 * 1024 * 1024}
-  drainBegun ← newEmptyMVar
   -- the session's keeper runs across its texture backend, as the graphics session composes them
   bounded . withFakeOwner fake $
-    withKeeperAcross (withBackendOnRawDraining drainBegun fake) $ \keeper rig →
+    withKeeperAcross (withBackendOnRaw fake) $ \keeper rig →
       withComposition terrainProfile [("colour.png", colourBytes), ("normal.png", normalBytes)] (rigPort rig) $ \comp _ runtime → do
         model ← newModel (fakeLedger fake)
         setBarrier fake (modelCapture model)
@@ -2590,15 +2607,12 @@ withViewsProbed order probe terrainConfig source config body = do
           -- the session's keeper outlives the views' scope
           withOwnedThread (fakeOwnerLoop owner) $ \_ _ → do
             let ports' = ports {portOwner = (portOwner ports) {ownerKeep = keepWork keeper}}
-                run' views = body (Views comp vm fake model terrain arena views owner claims (cpAccount comp) style colourKey normalKey client metricsVar taking issuer keeper ports' drainBegun)
+                run' views = body (Views comp vm fake model terrain arena views owner claims (cpAccount comp) style colourKey normalKey client metricsVar taking issuer keeper ports')
             result ← case order of
               HostFirst → withTerrainViews config ports' (\views → run' views `finally` dissolve model)
               ViewsFirst → withTerrainViews config ports' run' `finally` dissolve model
-              DrainFirst → withTerrainViews config ports' run'
             -- the session lives on until its keeper has done what the views handed it
-            case order of
-              DrainFirst → pure ()
-              _ → bounded (atomically (keeperHolding keeper >>= check . (== 0)))
+            bounded (atomically (keeperHolding keeper >>= check . (== 0)))
             pure result
 
 -- Small enough for a quick example: a 128 x 96 target and a 30-level band, which reaches the surface below the followed

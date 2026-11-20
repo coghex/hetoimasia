@@ -10,7 +10,6 @@ module Test.LuaEngine.Graphics.Rig
   , withRig
   , withRigUnchecked
   , withBackendOnRaw
-  , withBackendOnRawDraining
   , withSteppedRig
   , Schedule (..)
   , settle
@@ -56,12 +55,11 @@ import Control.Concurrent.STM
   , writeTVar
   )
 import Control.Concurrent (ThreadId)
-import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, tryPutMVar)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar)
 import Control.Exception (SomeException, finally, throwIO, try)
 import Data.List (findIndex)
 import Data.IORef (newIORef, readIORef, writeIORef)
-import Control.Monad (forM_, unless, void, when)
-import GHC.Conc (unsafeIOToSTM)
+import Control.Monad (forM_, unless, when)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
 import Data.Text (Text)
@@ -134,14 +132,6 @@ withRigOver fake body = do
 withBackendOnRaw ∷ Fake → (Rig → IO a) → IO a
 withBackendOnRaw fake body =
   uncurry withBackendObserved (pumpObserver (fakeWork fake)) (fakePort fake) $ \backend → body (Rig fake backend (textureBackend backend))
-
--- | 'withBackendOnRaw', announcing the first texture its close's drain reads in this variable (a side effect no retry of
--- the drain's transaction takes back), so an example can act while the backend drains.
-withBackendOnRawDraining ∷ MVar () → Fake → (Rig → IO a) → IO a
-withBackendOnRawDraining begun fake body =
-  let (examined, committed) = pumpObserver (fakeWork fake)
-      announcing seen = examined seen >> when (seen == ExaminedDrain) (unsafeIOToSTM (void (tryPutMVar begun ())))
-   in withBackendObserved announcing committed (fakePort fake) $ \backend → body (Rig fake backend (textureBackend backend))
 
 -- | A rig with no thread of the pump's or of the owner's: the example advances both, one step at a time, with 'settle', so what it
 -- measures has no concurrency in it (#679). The fake has the leak check of 'withRig' and no bound: nothing waits unless the
