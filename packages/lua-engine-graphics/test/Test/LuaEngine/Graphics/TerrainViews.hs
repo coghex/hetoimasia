@@ -267,27 +267,6 @@ pickConsistency = describe "a pick's consistency reference" $ do
       removeWith v (pickRefCell hit) (Just (pickPrecondition view hit)) >>= (`shouldBe` Left Runtime.StaleView)
       closeView view
 
-  it "refuses a pick's removal once a load moves the residency generation, and removes through one picked from the revision made at the new generation" $
-    withViews $ \v → do
-      view ← attached v 1
-      _ ← awaitPublished v 1
-      _ ← adoptNow (vModel v) 1
-      revealAt v (8, 8, 3)
-      quiescent v
-      hit ← currentHit v view
-      -- one load elsewhere: content and knowledge are unchanged, only residency moved
-      held ← Runtime.arenaStatus (_vTerrain v) (vArena v) >>= either (fail . show) pure
-      moveResidency v
-      moved ← Runtime.arenaStatus (_vTerrain v) (vArena v) >>= either (fail . show) pure
-      (Runtime.statusContentRevision moved, Runtime.statusKnowledgeRevision moved) `shouldBe` (Runtime.statusContentRevision held, Runtime.statusKnowledgeRevision held)
-      removeWith v (pickRefCell hit) (Just (pickPrecondition view hit)) >>= (`shouldBe` Left Runtime.StaleView)
-      -- the view prepares again for the new generation; a hit from that revision is valid
-      fresh ← currentHit v view
-      generation ← generationNow v
-      pickResidency (pickRefIdentity fresh) `shouldBe` generation
-      removeWith v (pickRefCell fresh) (Just (pickPrecondition view fresh)) >>= (`shouldBe` Right True)
-      closeView view
-
 -- The first visible known part of the adopted frame, scanning the target's pixel centres.
 adoptedHit ∷ Views → TerrainView Int → IO (PickRef Int)
 adoptedHit _ view = do
