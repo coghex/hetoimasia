@@ -36,16 +36,18 @@ import System.Info (arch, compilerName, compilerVersion, os)
 import Hetoimasia.GPU.Vulkan.Diagnostics (DiagnosticVerdict (..), verdictIssues)
 import Hetoimasia.LuaEngine.Graphics.Texture
 import Hetoimasia.LuaEngine.Profile (fixedM1Profile)
+import Test.Hspec.Runner (Config (..), defaultConfig, readConfig)
 import Test.LuaEngine.Graphics.Native.Consent (Consent, consentBackend, describeConsent, readConsent, refusalMessage)
 import Test.LuaEngine.Graphics.Native.Environment (checkValidationFeatures, establishEnvironment, validationFeatures)
 import Test.LuaEngine.Graphics.Native.Loader (checkLoader)
-import Test.LuaEngine.Graphics.Native.Session (Facts (..), runSession)
+import Test.LuaEngine.Graphics.Native.Session (Facts (..), HostVariant (..), runSession, runSessionOn, runSessionOnHolding)
 import qualified Test.LuaEngine.Graphics.Native.Spec as Native
 import qualified Test.LuaEngine.Graphics.Native.Facade as Facade
 import qualified Test.LuaEngine.Graphics.Native.DataTextures as DataTextures
 import qualified Test.LuaEngine.Graphics.Native.Pixels as Pixels
 import qualified Test.LuaEngine.Graphics.Native.Scenes as Scenes
 import qualified Test.LuaEngine.Graphics.Native.Targets as Targets
+import qualified Test.LuaEngine.Graphics.Native.TerrainViews as TerrainViews
 import qualified Test.LuaEngine.Graphics.Native.Windows as Windows
 
 main ∷ IO ()
@@ -54,8 +56,8 @@ main = do
   started ← getCurrentTime
   environment ← establishEnvironment
   arguments ← getArgs
-  when (any (`elem` arguments) [completeFlag, probeFlag, latchFlag] && length arguments /= 1) $ do
-    hPutStrLn stderr ("lua-engine-graphics-native-tests: " <> completeFlag <> " runs the whole profile, " <> probeFlag <> " the cancellation probe and " <> latchFlag <> " the latched-supervision probe, each alone")
+  when (any (`elem` arguments) [completeFlag, probeFlag, latchFlag, terrainFullFlag] && length arguments /= 1) $ do
+    hPutStrLn stderr ("lua-engine-graphics-native-tests: " <> completeFlag <> " runs the whole profile, " <> probeFlag <> " the cancellation probe, " <> latchFlag <> " the latched-supervision probe and " <> terrainFullFlag <> " the terrain views' full matrix, each alone")
     exitWith (ExitFailure 2)
   forM_ environment (Text.putStrLn . ("lua-engine-graphics-native-tests: " <>))
   consent ← readConsent >>= either refuse pure
@@ -65,13 +67,39 @@ main = do
   configuration ← either (\refused → stop ("the profile could not be mapped: " <> Text.pack (show refused))) pure (configurationFor fixedM1Profile)
   let probing = arguments == [probeFlag] || arguments == [latchFlag]
       expectedFailure = if arguments == [latchFlag] then "LatchingProbe" else "user interrupt"
-  facts ← runSession (arguments == [completeFlag] || probing) (consentBackend consent) validationFeatures configuration $
+  let terrainFull = arguments == [terrainFullFlag]
+  facts ← runSession (arguments == [completeFlag] || probing || terrainFull) (consentBackend consent) validationFeatures configuration $
     case arguments of
       [flag] | flag == probeFlag → Facade.cancelProbe
       [flag] | flag == latchFlag → Facade.latchProbe
-      _ → \env → Native.spec env >> Windows.spec env >> Scenes.spec env >> Targets.spec env >> Pixels.spec env >> DataTextures.spec env >> Facade.spec env
+      -- the terrain views' full matrix runs its required witness too, then the broader judgments
+      [flag] | flag == terrainFullFlag → \env → TerrainViews.spec env >> TerrainViews.fullSpec env
+      _ → \env → Native.spec env >> Windows.spec env >> Scenes.spec env >> Targets.spec env >> Pixels.spec env >> DataTextures.spec env >> Facade.spec env >> TerrainViews.spec env >> TerrainViews.quietSpec env
+  -- The terrain-enabled host's M1 witness (TRA-9): a second, short session of the host the terrain-enabled composition
+  -- builds, with the host-wide window depth, in the same run as the complete profile and every ordinary selection.
+  -- It runs with the complete profile and whenever the run's own Hspec selection selects its example, and not
+  -- otherwise: a focused selection elsewhere neither starts it nor makes it an empty, failing run.
+  -- Hspec's argument reading is asked only for an ordinary selection: it refuses this program's own flags.
+  depthSelected ←
+    if probing || terrainFull
+      then pure False
+      else if arguments == [completeFlag] then pure True else or <$> mapM (selects arguments) (Scenes.depthHostPaths <> Pixels.depthHostPixelPaths)
+  depthFacts ←
+    if not depthSelected
+      then pure Nothing
+      else Just <$> runSessionOn TerrainEnabledHost (arguments == [completeFlag]) (consentBackend consent) validationFeatures configuration (\env → Scenes.depthHostSpec env >> Pixels.depthHostPixels env)
+  -- The overlap witness runs on its own host, whose test-only completion hold is set; no other example's host has one.
+  overlapFacts ←
+    if not terrainFull
+      then pure Nothing
+      else do
+        (holding, hold) ← TerrainViews.newHolding
+        Just <$> runSessionOnHolding TerrainDisabledHost (Just hold) True (consentBackend consent) validationFeatures configuration (TerrainViews.overlapSpec holding)
   finished ← getCurrentTime
-  let problems = if probing then probeChecks expectedFailure facts else checks facts
+  let problems =
+        (if probing then probeChecks expectedFailure facts else checks facts)
+          <> maybe [] (map ("the terrain-enabled host: " <>) . checks) depthFacts
+          <> maybe [] (map ("the overlap witness's host: " <>) . checks) overlapFacts
       seconds = realToFrac (diffUTCTime finished started) ∷ Double
   record ← evidenceRecord consent loader configuration facts problems seconds
   Text.putStrLn record
@@ -85,10 +113,25 @@ main = do
     refuse refusal = hPutStrLn stderr ("lua-engine-graphics-native-tests: " <> Text.unpack (refusalMessage refusal)) >> exitWith (ExitFailure 3)
     stop why = hPutStrLn stderr ("lua-engine-graphics-native-tests: " <> Text.unpack why) >> exitFailure
 
+-- | Whether an ordinary Hspec run with these arguments selects the example at this path: its match filter keeps it
+-- (or there is none) and its skip filter does not drop it. Hspec's own argument reading decides, so the answer is the
+-- selection the run itself makes.
+selects ∷ [String] → ([String], String) → IO Bool
+selects arguments path = do
+  config ← readConfig defaultConfig arguments
+  pure (maybe True ($ path) (configFilterPredicate config) && not (maybe False ($ path) (configSkipPredicate config)))
+
 -- | Runs the whole profile with nothing an environment could narrow, which the catalog group passes; without it
 -- the suite is an ordinary Hspec run that selects as asked.
 completeFlag ∷ String
 completeFlag = "--complete"
+
+-- | Runs the terrain views' complete evidence matrix alone (TRA-9): the required witness of the complete profile, then
+-- every facing, both zoom endpoints and a portrait target, each judged pixel by pixel by the independent oracle. It is
+-- outside routine CI and is mandatory evidence for the terrain-view issue; it runs with the same success, validation and
+-- teardown checks as the complete profile.
+terrainFullFlag ∷ String
+terrainFullFlag = "--terrain-views-full"
 
 -- | Runs the cancellation probe alone: the quad example's window is live and holds its texture when the process main thread is
 -- cancelled, and the run must end by itself with everything torn down in order.

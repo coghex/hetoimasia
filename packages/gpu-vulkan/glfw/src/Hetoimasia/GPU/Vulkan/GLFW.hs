@@ -129,6 +129,8 @@ module Hetoimasia.GPU.Vulkan.GLFW
   , SceneTargetRefusal (..)
   , registerVulkanSceneTarget
   , unregisterVulkanSceneTarget
+  , vulkanSceneTargetRegistered
+  , vulkanHostIdentity
   , publishVulkanTargetScene
   , TargetScenePublication (..)
   , recordVulkanTargetBatch
@@ -204,6 +206,14 @@ module Hetoimasia.GPU.Vulkan.GLFW
   , readUploadTicket
   , awaitUploadTicket
   , cancelVulkanUpload
+  , readVulkanUploads
+  , readVulkanUploadsSettled
+  , vulkanActionRoom
+  , vulkanReleaseRoom
+  , vulkanOwnerEnded
+  , CompletionHold (..)
+  , UploadsView (..)
+  , UploadView (..)
   , CancelRefusal (..)
 
     -- * The bindless texture table (GRS-7)
@@ -362,6 +372,7 @@ module Hetoimasia.GPU.Vulkan.GLFW
   , FrameStorageRefused (..)
   ) where
 
+import Numeric.Natural (Natural)
 import Control.Concurrent.STM (STM)
 import Hetoimasia.Foundation.Log (Logger)
 import Hetoimasia.GLFW.Vulkan (LoaderIntegration)
@@ -369,6 +380,7 @@ import Hetoimasia.GLFW.Window (WindowId)
 import Hetoimasia.Runtime.GLFW (EventAdmission, GraphicsService, SceneMode (..), ScenePublication (..), WindowScenePublication (..))
 import Hetoimasia.GPU.Model.Identity (TargetClass)
 import Hetoimasia.GPU.Vulkan.Diagnostics (DiagnosticVerdict)
+import Hetoimasia.GPU.Vulkan.Native.Frames (CompletionHold (..))
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   ( ActionOutcome (..)
   , VulkanUploadRefusal (..)
@@ -391,6 +403,8 @@ import Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , recordVulkanTargetBatch
   , registerVulkanSceneTarget
   , unregisterVulkanSceneTarget
+  , vulkanSceneTargetRegistered
+  , vulkanHostIdentity
   , awaitVulkanAction
   , noSceneLifecycle
   , defaultActionCapacity
@@ -568,6 +582,8 @@ import Hetoimasia.GPU.Vulkan.Native.TextureTable
   )
 import Hetoimasia.GPU.Vulkan.Native.Uploads
   ( CancelRefusal (..)
+  , UploadsView (..)
+  , UploadView (..)
   , UploadConfig
   , UploadConfigRefused (..)
   , UploadPressure (..)
@@ -638,6 +654,28 @@ submitVulkanUpload host = Controller.submitVulkanUpload (vulkanController host)
 -- | Cancel an upload, from any thread, before its first copies are recorded.
 cancelVulkanUpload ∷ VulkanHost scene → UploadTicket → STM (Either CancelRefusal ())
 cancelVulkanUpload host = Controller.cancelVulkanUpload (vulkanController host)
+
+-- | The session's uploads as they stand, once they exist: what a caller whose upload was refused as backpressure
+-- watches to know that one has settled. It writes nothing.
+readVulkanUploads ∷ VulkanHost scene → STM (Maybe UploadsView)
+readVulkanUploads host = Controller.readVulkanUploads (vulkanController host)
+
+-- | How many of the session's uploads have settled ('Nothing' before the uploads exist), written only when one
+-- settles: what a consumer waiting for an upload to settle reads instead of 'readVulkanUploads'.
+readVulkanUploadsSettled ∷ VulkanHost scene → STM (Maybe Natural)
+readVulkanUploadsSettled host = Controller.readVulkanUploadsSettled (vulkanController host)
+
+-- | Whether an action would be admitted now, reading only the owner's gate, the device and the action queue.
+vulkanActionRoom ∷ VulkanHost scene → STM Bool
+vulkanActionRoom host = Controller.vulkanActionRoom (vulkanController host)
+
+-- | Whether a release request would find room on the release lane now, with the same reads.
+vulkanReleaseRoom ∷ VulkanHost scene → STM Bool
+vulkanReleaseRoom host = Controller.vulkanReleaseRoom (vulkanController host)
+
+-- | Whether the owner takes no more actions (closed, or its session failed), reading only its gate.
+vulkanOwnerEnded ∷ VulkanHost scene → STM Bool
+vulkanOwnerEnded host = Controller.vulkanOwnerEnded (vulkanController host)
 
 -- | Create one window's surface on the main thread, under its attachment, and
 -- hand it to this host's owner as a required or optional target.

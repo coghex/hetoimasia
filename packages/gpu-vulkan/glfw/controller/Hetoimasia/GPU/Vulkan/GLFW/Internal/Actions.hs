@@ -95,6 +95,8 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Actions
   , newActions
   , admitAction
   , admitRelease
+  , actionsRoom
+  , actionsEnded
   , pendingBarriers
   , actionsWaiting
   , actionsCount
@@ -107,7 +109,9 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Actions
 
 import Control.Concurrent.STM (STM, TVar, newTVar, newTVarIO, readTVar, retry, writeTVar)
 import Control.Exception (ExceptionWithContext, SomeException)
+import Control.Monad (when)
 import Data.Foldable (for_, toList)
+
 import Data.Map.Strict (Map)
 import Data.Maybe (isJust)
 import Data.Sequence (Seq, ViewL (..), viewl, (|>))
@@ -330,33 +334,63 @@ data Started = ∀ r. Started !(VulkanAction r) !(ActionOutcome r → STM ())
 -- when its barrier is met and no earlier release request remains queued. An
 -- entry admitted after the batch began is never taken, and stays queued.
 startAction ∷ Actions → Batch → STM (Maybe Started)
-startAction actions (Batch limit) = readTVar (actionsQueue actions) >>= scan Seq.empty False
+startAction actions (Batch limit) = readTVar (actionsQueue actions) >>= \queue → scan queue Seq.empty False queue
   where
-    scan kept blocked remaining = case viewl remaining of
-      EmptyL → Nothing <$ writeTVar (actionsQueue actions) kept
+    -- The scan only drops entries, so a queue of the same length is the same
+    -- queue: it is written only when it changed, so a round that takes nothing
+    -- wakes nobody who waits on the queue (for room, say).
+    keep queue kept = when (Seq.length kept /= Seq.length queue) (writeTVar (actionsQueue actions) kept)
+    scan queue kept blocked remaining = case viewl remaining of
+      EmptyL → Nothing <$ keep queue kept
       entry@(Entry place standing action barrier) :< rest
         -- The queue is in the order of admission: nothing after this is in the
         -- batch either.
-        | place >= limit → Nothing <$ writeTVar (actionsQueue actions) (kept <> remaining)
+        | place >= limit → Nothing <$ keep queue (kept <> remaining)
         | otherwise →
             readTVar standing >>= \case
               Queued →
                 actionsGate actions >>= \case
-                  Just refusal → writeTVar standing (Settled (ActionRefused refusal)) >> scan kept blocked rest
+                  Just refusal → writeTVar standing (Settled (ActionRefused refusal)) >> scan queue kept blocked rest
                   Nothing → case barrier of
                     Nothing → start standing action kept rest
                     Just wanted
-                      | blocked → scan (kept |> entry) blocked rest
+                      | blocked → scan queue (kept |> entry) blocked rest
                       | otherwise →
                           actionsMet actions wanted >>= \case
                             True → start standing action kept rest
-                            False → scan (kept |> entry) True rest
-              _ → scan kept blocked rest
+                            False → scan queue (kept |> entry) True rest
+              _ → scan queue kept blocked rest
     start ∷ TVar (Standing r) → VulkanAction r → Seq Entry → Seq Entry → STM (Maybe Started)
     start standing action kept rest = do
       writeTVar (actionsQueue actions) (kept <> rest)
       writeTVar standing Running
       pure (Just (Started action (writeTVar standing . Settled)))
+
+-- | Whether an action (or, given 'True', a release request) would be admitted
+-- now, given whether the session's device exists. It writes nothing, and reads
+-- only the gate and the queue (never a barrier, a scene or a target), so a
+-- transaction that waits on it wakes when room or the gate changes and at no
+-- other time.
+actionsRoom ∷ Actions → Bool → Bool → STM Bool
+actionsRoom actions device release =
+  actionsGate actions >>= \case
+    Just _ → pure False
+    Nothing
+      | not device → pure False
+      | otherwise → do
+          queue ← readTVar (actionsQueue actions)
+          let capacity = if release then actionsReleaseCapacity actions else actionsCapacity actions
+              sameClass (Entry _ _ _ held) = isJust held == release
+          pure (fromIntegral (length (filter sameClass (toList queue))) < capacity)
+
+-- | Whether the gate refuses for good: the owner closed or the session failed.
+-- It reads only the gate and writes nothing.
+actionsEnded ∷ Actions → STM Bool
+actionsEnded actions =
+  flip fmap (actionsGate actions) $ \case
+    Just ActionOwnerClosed → True
+    Just (ActionSessionFailed _) → True
+    _ → False
 
 -- | Settle every action still queued as refused, with the gate's answer or
 -- this, and empty the queue: the owner's retirement, after which nothing

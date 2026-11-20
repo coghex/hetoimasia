@@ -62,6 +62,7 @@ module Hetoimasia.GPU.Vulkan.Native.Uploads
   , UploadView (..)
   , UploadsView (..)
   , readUploads
+  , readUploadsSettled
   ) where
 
 import Hetoimasia.GPU.Vulkan.Native.Internal.Uploads

@@ -14,6 +14,9 @@ module Test.LuaEngine.Graphics.Native.Session
   , serveMain
   , noteWindows
   , runSession
+  , HostVariant (..)
+  , runSessionOnHolding
+  , runSessionOn
   , usageNow
   , awaitUsage
   , restNow
@@ -50,7 +53,8 @@ import Hetoimasia.GPU.Vulkan.Native.Roots (RootsView (..))
 import Test.LuaEngine.Graphics.FrameLog (FrameLog, emptyFrameLog, recordEvent)
 import Test.LuaEngine.Graphics.Served (serveProfile, withProfileBeyond)
 import Hetoimasia.GPU.Vulkan.GLFW
-  ( FrameEvent (..)
+  ( CompletionHold
+  , FrameEvent (..)
   , NativeObserver (..)
   , Readiness (..)
   , ValidationFeature
@@ -156,8 +160,21 @@ awaitUsage env wanted = atomically $ do
   unless (wanted now) retry
 
 -- | Run the examples inside a session that requests this backend, or the platform's own.
+-- | Which host the session builds: the production composition as it ships (terrain-disabled), or the terrain-enabled
+-- composition's host, which sets the host-wide window depth (TRA-9).
+data HostVariant = TerrainDisabledHost | TerrainEnabledHost
+  deriving (Eq, Show)
+
 runSession ∷ Bool → Maybe Backend → [ValidationFeature] → TextureGraphicsConfiguration → (Env → Spec) → IO Facts
-runSession complete backend features configuration examples = do
+runSession = runSessionOn TerrainDisabledHost
+
+runSessionOn ∷ HostVariant → Bool → Maybe Backend → [ValidationFeature] → TextureGraphicsConfiguration → (Env → Spec) → IO Facts
+runSessionOn variant = runSessionOnHolding variant Nothing
+
+-- | 'runSessionOn' on a host whose test-only completion hold is set: only the overlap witness's session (#645, owner
+-- decision S) uses one; every other session's host has none.
+runSessionOnHolding ∷ HostVariant → Maybe CompletionHold → Bool → Maybe Backend → [ValidationFeature] → TextureGraphicsConfiguration → (Env → Spec) → IO Facts
+runSessionOnHolding variant hold complete backend features configuration examples = do
   mainThread ← myThreadId
   recorded ← newIORef []
   verdictCell ← newIORef Nothing
@@ -169,12 +186,14 @@ runSession complete backend features configuration examples = do
   scenes ← newSceneSession
   let host = requestingBackend backend (defaultHostConfig [])
       base = vulkanHostConfig host defaultCaptureConfig {captureTextBudget = 16384} (configurationBudgets configuration) (scenesInitial scenes)
+      depth = if variant == TerrainEnabledHost then configureWorldDepth else id
       config =
-        (configureScenes scenes (configureWindows (configureHost configuration base)))
+        (depth (configureScenes scenes (configureWindows (configureHost configuration base))))
           { vulkanFrameObserver = \event → atomically (modifyTVar' frames (recordEvent event))
           , vulkanLayers = ["VK_LAYER_KHRONOS_validation"]
           , vulkanValidationFeatures = features
           , vulkanObserver = const (observer recorded)
+          , vulkanCompletionHold = hold
           }
   done ← newEmptyMVar
   let -- The profile is the session thread's, as in the shipped launcher (@Hetoimasia.Run.Serve@): it owns the texture adapter's scope

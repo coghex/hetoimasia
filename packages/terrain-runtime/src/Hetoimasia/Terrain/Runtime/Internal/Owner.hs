@@ -213,6 +213,15 @@ data Work
 -- the parent session's admission, a stop, or a storage job a task waits for.
 nextWork ∷ Service → StopToken → STM Work
 nextWork svc token = do
+  -- ANOTHER CONSUMER OF THE OUTSIDE STAGING ACCOUNT RELEASED OR TOOK BYTES: what the service queued for room is
+  -- tried again. Reading the charge here wakes the owner whenever it changes, and the state every choice below reads
+  -- already carries the wakeup, so the work it selects commits it.
+  forM_ (configStagingAccount (serviceConfig svc)) $ \account → do
+    now <- stagingAccountCharged account
+    seen <- stateAccountSeen <$> readSt svc
+    when (seen /= Just now) $ do
+      modifySt svc (\s → s {stateAccountSeen = Just now, stateFreed = True, stateDispatchIdle = False})
+      noteFreed svc
   st <- readSt svc
   open <- sessionOpen (serviceAdmission svc)
   stopping <- stopRequested token
@@ -1308,16 +1317,14 @@ commitStaged svc st rid req sg = case (reqCmd req, stagedWork sg) of
       pure (CommitDone Nothing Nothing)
     -- Removing air changes nothing: no history, no obligation, no revision; the
     -- reservations return and the result is kept until it is taken.
-    commitAir aid arena precondition
-      | staleView aid arena precondition = settleFailure StaleView
-      | otherwise = do
+    commitAir aid arena precondition =
+      preconditionStale (serviceIdentity svc) aid (arenaRevision arena) (D.authKnowledge (arenaAuthority arena)) precondition >>= \case
+       True → settleFailure StaleView
+       False → do
           withdrawRecord svc rid req
           modifySt svc (\s → s {stateRequests = Map.insert rid req {reqPhase = Done, reqModel = False} (stateRequests s)})
           endpointSettle ep (Succeeded (ARemoved (RemoveAnswer aid (arenaRevision arena) False)))
           pure (CommitDone (Just aid) (Just (arenaRevision arena)))
-    staleView aid arena = \case
-      Just (Precondition pa pr) → pa /= aid || pr /= arenaRevision arena
-      Nothing → False
     -- RECOVERY IS DECIDED LIKE PUBLICATION: the conditions the probe certified, and the capacity pause
     -- when the supported next transaction fits beside the protected reserve, are cleared HERE, in the
     -- arbitration that settles the retry (its host eligible, its basis and every fault's generation

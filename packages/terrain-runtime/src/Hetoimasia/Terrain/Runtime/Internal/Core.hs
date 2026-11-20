@@ -19,11 +19,13 @@ module Hetoimasia.Terrain.Runtime.Internal.Core
   ( -- * State access
     readSt
   , modifySt
+  , putSt
   , applyEvent
   , recordDefect
   , recordFatalDefect
   , takeUnreportedSTM
   , markFreed
+  , noteFreed
 
     -- * Authorities
   , clientOf
@@ -41,6 +43,7 @@ module Hetoimasia.Terrain.Runtime.Internal.Core
   , demandFor
   , commandRanges
   , resultRecordBytes
+  , regionalFits
   , surfaceWindowLevels
   , keepCap
   , rangeKeep
@@ -145,11 +148,42 @@ readSt ∷ Service → STM St
 readSt = readTVar . serviceState
 
 modifySt ∷ Service → (St → St) → STM ()
-modifySt svc = modifyTVar' (serviceState svc)
+modifySt svc f = readSt svc >>= putSt svc . f
+
+-- | The one write of the state: it also brings every arena's identity cell up to the
+-- state written, writing a cell only when that arena's mark moved, so the cells change
+-- in the transactions that move them and in no other.
+putSt ∷ Service → St → STM ()
+putSt svc st = do
+  writeTVar (serviceState svc) st
+  let retained = retainedBankUse st
+  seenRetained ← readTVar (serviceRetainedCell svc)
+  when (seenRetained /= retained) (writeTVar (serviceRetainedCell svc) retained)
+  cells ← readTVar (serviceArenaMarks svc)
+  let marks = Map.map arenaMark (stateArenas st)
+      ended = Map.difference cells marks
+      started = Map.difference marks cells
+  forM_ ended (\cell → writeTVar cell Nothing)
+  fresh ← traverse (newTVar . Just) started
+  unless (Map.null ended && Map.null fresh) $
+    writeTVar (serviceArenaMarks svc) (Map.union fresh (Map.difference cells ended))
+  forM_ (Map.intersectionWith (,) cells marks) $ \(cell, mark) → do
+    seen ← readTVar cell
+    when (seen /= Just mark) (writeTVar cell (Just mark))
+
+-- | Some lease stopped being valid: what watches the authority epoch looks again.
+bumpAuthority ∷ Service → STM ()
+bumpAuthority svc = modifyTVar' (serviceAuthority svc) (+ 1)
 
 -- | Something that may free capacity happened; the owner retries what waits.
 markFreed ∷ Service → STM ()
-markFreed svc = modifySt svc (\st → st {stateFreed = True, stateDispatchIdle = False})
+markFreed svc = modifySt svc (\st → st {stateFreed = True, stateDispatchIdle = False}) >> noteFreed svc
+
+-- | Count one capacity-freeing event in the freed cell ('capacityFreedSTM'). It counts every such event, whether or not
+-- the owner's retry flag was already set, so a holder that captured the count before a refusal sees each return; the
+-- state's other writes leave it alone.
+noteFreed ∷ Service → STM ()
+noteFreed svc = modifyTVar' (serviceFreedCell svc) (+ 1)
 
 -- | The regions a decision committed as victims, for the owner to discard.
 decisionVictims ∷ R.Decision → [R.RegionKey]
@@ -163,12 +197,15 @@ decisionVictims _ = []
 -- dropped from the retiring set.
 applyEvent ∷ Service → R.Event → STM (Either R.Refusal R.Report)
 applyEvent svc event = do
-  st <- readSt svc
-  let (model, outcome) = R.step (stateModel st) event
+  st0 <- readSt svc
+  let (model, outcome) = R.step (stateModel st0) event
   case outcome of
     Left _ → pure outcome
-    Right report → do
-      writeTVar (serviceState svc) $
+    Right report → chargeStaging svc st0 model >>= \case
+     Left refusal → pure (Left refusal)
+     Right st → do
+      when (freesCapacity event) (noteFreed svc)
+      putSt svc $
         (if freesCapacity event then \x → x {stateFreed = True, stateDispatchIdle = False} else id)
         st
           { stateModel = model
@@ -180,6 +217,33 @@ applyEvent svc event = do
           , stateWork = syncWork model (stateWork st)
           }
       pure outcome
+
+-- | Charge the outside staging account, if there is one, the change a step made to the model's staging use, in the
+-- step's transaction: an increase it cannot reserve refuses the step busy with nothing changed (the model's own full
+-- staging bank answers the same way); a decrease is returned. The state answered carries the new charge.
+chargeStaging ∷ Service → St → R.Model → STM (Either R.Refusal St)
+chargeStaging svc st after = case configStagingAccount (serviceConfig svc) of
+  Nothing → pure (Right st)
+  Just account
+    | new > old → do
+        let more = new - old
+        funded ← stagingAccountReserve account more
+        if not funded
+          then do
+            charged ← stagingAccountCharged account
+            -- one coherent figure: the account's own limit and charge, and what the step asked of it
+            pure (Left (R.Busy (R.BankFull R.StagingBank (stagingAccountLimit account) charged more)))
+          else seen (st {stateAccountCharged = stateAccountCharged st + more})
+    | new < old → do
+        let fewer = min (stateAccountCharged st) (old - new)
+        stagingAccountRelease account fewer
+        seen (st {stateAccountCharged = stateAccountCharged st - fewer})
+    | otherwise → pure (Right st)
+    where
+      use model = let l = R.bankLedger model R.StagingBank in R.ledgerOccupied l + R.ledgerReserved l
+      old = use (stateModel st)
+      new = use after
+      seen st' = (\now → Right st' {stateAccountSeen = Just now}) <$> stagingAccountCharged account
 
 -- | Events whose acceptance may have returned credits, so that what waits for
 -- capacity should be tried again. Every release path goes through 'applyEvent',
@@ -212,7 +276,7 @@ takeUnreportedSTM ∷ Service → STM [Defect]
 takeUnreportedSTM svc = do
   st <- readSt svc
   let unreported = [defectOf r | r <- reverse (stateDefects st), not (defectReported r)]
-  writeTVar (serviceState svc) st {stateDefects = [r {defectReported = True} | r <- stateDefects st]}
+  putSt svc st {stateDefects = [r {defectReported = True} | r <- stateDefects st]}
   pure unreported
 
 -- | Keep a bounded record of an unexpected defect.
@@ -267,7 +331,7 @@ registerClientSTM svc =
       | otherwise → case allocate (stateNextClient st) of
        Left refused → pure (Left refused)
        Right cid → do
-        writeTVar (serviceState svc) st {stateNextClient = cid + 1, stateClients = Map.insert cid (ClientRec Set.empty Set.empty) (stateClients st)}
+        putSt svc st {stateNextClient = cid + 1, stateClients = Map.insert cid (ClientRec Set.empty Set.empty) (stateClients st)}
         pure (Right (Client (serviceTag svc) cid))
 
 -- ---------------------------------------------------------------------------
@@ -464,6 +528,12 @@ countReqs p st = Map.size (Map.filter p (stateRequests st)) + Map.size (Map.filt
 resultRecordBytes ∷ Word64
 resultRecordBytes = 160
 
+-- | Whether a regional request of this many regions fits the retained bank at this use: the use, the request's
+-- reservation and its result record within the bank. The one test a regional request is refused 'BusyRetained' by,
+-- and the one a holder refused it waits on ('regionalFitsSTM').
+regionalFits ∷ Config → Word64 → Int → Bool
+regionalFits config used regions = used + resultRecordBytes + regionReservation regions <= configRetainedBytes config
+
 -- | Bytes the retained bank holds: outstanding snapshots' backing and untaken
 -- results.
 retainedBankUse ∷ St → Word64
@@ -615,7 +685,7 @@ admit svc ep sub =
                   names = case insClaim ins of
                     Nothing → stateNames st
                     Just name → Map.insert name (ClaimPending (RequestId rid)) (stateNames st)
-              writeTVar (serviceState svc) st {stateNextRequest = rid + 1, stateNextSeq = stateNextSeq st + 1, stateRequests = Map.insert (RequestId rid) req (stateRequests st), stateNames = names, stateDispatchIdle = False}
+              putSt svc st {stateNextRequest = rid + 1, stateNextSeq = stateNextSeq st + 1, stateRequests = Map.insert (RequestId rid) req (stateRequests st), stateNames = names, stateDispatchIdle = False}
               pure (Right request)
 
 decide ∷ Service → St → RequestId → Submission → STM (Either Short Insertion)
@@ -667,7 +737,7 @@ decide svc st rid = \case
         Right hid → case capacityRefusal config st True of
           Just refusal → pure (Left (busyWhy refusal))
           Nothing
-            | retainedBankUse st + resultRecordBytes + reservation > configRetainedBytes config →
+            | not (regionalFits config (retainedBankUse st) (length regions)) →
                 pure (Left (ShortRefused (RefusedBusy BusyRetained)))
             | otherwise →
                 applyEvent svc (R.AcquireHold (HoldId hid) aid R.Copied regions) >>= \case
@@ -735,9 +805,7 @@ decide svc st rid = \case
         else case Map.lookup (leaseArena ls) (stateArenas st) of
           Nothing → Left (ShortFailed ArenaClosed)
           Just arena → Right (lid, ls, leaseArena ls, arena)
-    stale aid arena = \case
-      Just (Precondition pa pr) → pa /= aid || pr /= arenaRevision arena
-      Nothing → False
+    stale aid arena = preconditionRevisionsStale aid (arenaRevision arena) (D.authKnowledge (arenaAuthority arena))
     -- each pending removal can advance the content, knowledge and store revisions by one: a removal
     -- that could need the last value of any of them is refused before any work
     revisionExhausted aid arena =
@@ -1071,6 +1139,7 @@ closeArena svc aid = do
             _ → stateNames cur
         , stateLeases = foldr (Map.adjust (\l → l {leaseLive = False})) (stateLeases cur) (Set.toList (arenaLeases arena))
         }
+    bumpAuthority svc
     retireArenaRecord svc aid
 
 -- | Release a lease. Idempotent. It cancels the requests made through it, and
@@ -1087,6 +1156,7 @@ releaseLeaseSTM svc lid = do
         , stateClients = Map.adjust (\c → c {clientLeases = Set.delete lid (clientLeases c)}) (leaseClient ls) (stateClients cur)
         , stateArenas = Map.adjust (\a → a {arenaLeases = Set.delete lid (arenaLeases a)}) (leaseArena ls) (stateArenas cur)
         }
+    bumpAuthority svc
     after <- readSt svc
     when (leaseOwner ls && leaseLive ls) $
       forM_ (Map.lookup (leaseArena ls) (stateArenas after)) $ \arena →
@@ -1117,6 +1187,7 @@ closeServiceSTM svc = do
   forM_ (Map.keys (stateArenas after)) (closeArena svc)
   forM_ (Map.keys (stateViews after)) (closeViewByIdSTM svc)
   modifySt svc (\cur → cur {stateLeases = fmap (\l → l {leaseLive = False}) (stateLeases cur)})
+  bumpAuthority svc
 
 -- ---------------------------------------------------------------------------
 -- Views
@@ -1142,7 +1213,7 @@ openViewSTM svc client =
         | otherwise → case allocate (stateNextView st) of
             Left refused → pure (Left refused)
             Right vid → do
-              writeTVar (serviceState svc) st
+              putSt svc st
                 { stateNextView = vid + 1
                 , stateViews = Map.insert (ViewId vid) (ViewRec cid) (stateViews st)
                 , stateClients = Map.adjust (\c → c {clientViews = Set.insert (ViewId vid) (clientViews c)}) cid (stateClients st)

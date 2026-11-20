@@ -84,6 +84,8 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Targets
     -- * Any thread
   , registerTarget
   , unregisterTarget
+  , targetRegistered
+  , targetsIssuer
   , publishTarget
   , targetsHeld
   , targetsRevisions
@@ -214,6 +216,15 @@ unregisterTarget targets identity = do
           }
       pure True
     else pure False
+
+-- | The host identity every registration of this registry carries.
+targetsIssuer ∷ Targets scene → Unique
+targetsIssuer = targetsHost
+
+-- | Whether this registry holds this exact registration now: 'False' for one unregistered, never registered or another
+-- host's. It writes nothing.
+targetRegistered ∷ Targets scene → OffscreenTargetId → STM Bool
+targetRegistered targets identity = Map.member identity . standingLive <$> readTVar (targetsStanding targets)
 
 -- | Publish a scene to a target as its latest value, given the host's gate.
 publishTarget ∷ Targets scene → STM (Maybe ActionRefusal) → OffscreenTargetId → Prepared scene → STM TargetScenePublication

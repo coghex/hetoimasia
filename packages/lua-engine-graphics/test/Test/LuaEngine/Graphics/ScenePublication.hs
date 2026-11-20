@@ -7,7 +7,7 @@
 -- refusals and its ownership, never a frame.
 module Test.LuaEngine.Graphics.ScenePublication (spec) where
 
-import Control.Concurrent.STM (atomically, modifyTVar', newTVarIO)
+import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVar)
 import Control.Exception (SomeException, finally, fromException, try)
 import Control.Monad (forM_)
 import qualified Data.Set as Set
@@ -44,6 +44,8 @@ data Pub = Pub
   , pubVm ∷ SceneVm Int
   , pubModel ∷ Model
   , pubRig ∷ Rig
+  , pubClaims ∷ TVar (Set.Set Int)
+    -- ^ The windows a terrain view claims, as the publisher's commit reads them.
   }
 
 spec ∷ Spec
@@ -142,6 +144,21 @@ spec = describe "scene publication" $ do
       stopped `shouldSatisfy` Text.isInfixOf "stopped"
       publishedRevision (pubModel pub) winA `shouldReturn` 1
 
+  it "refuses an M1 publication to a window a terrain view claims as an ordinary error, keeps the previous scene, and publishes once the claim is released" $
+    withPublication $ \pub → do
+      ready pub "a"
+      loaded pub "a" "a" "a.png"
+      _ ← run pub "a" "publish" "a" (Just "a")
+      previous ← latest pub winA
+      atomically (modifyTVar' (pubClaims pub) (Set.insert winA))
+      claimed ← run pub "a" "ppublish" "a" (Just "a,a")
+      claimed `shouldSatisfy` Text.isInfixOf "a terrain view holds the window"
+      publishedRevision (pubModel pub) winA `shouldReturn` 1
+      latest pub winA `shouldReturn` previous
+      atomically (modifyTVar' (pubClaims pub) (Set.delete winA))
+      _ ← run pub "a" "publish" "a" (Just "a,a")
+      publishedRevision (pubModel pub) winA `shouldReturn` 2
+
   describe "a fact that changes while the publication is in flight" $ do
     -- Each pauses the script inside the publication at a gate, changes one fact the commit reads, and lets it go:
     -- the commit refuses the whole publication as an ordinary Lua error (pcall returns false) and the previous scene
@@ -173,6 +190,8 @@ spec = describe "scene publication" $ do
       refusedAt "before-commit" "not ready" $ \pub → setUsable (pubModel pub) winA False
     it "refuses when the host closes between the borrows and the commit" $
       refusedAt "before-commit" "ended" $ \pub → closeHost (pubModel pub)
+    it "refuses when a terrain view claims the window between the borrows and the commit" $
+      refusedAt "before-commit" "a terrain view holds the window" $ \pub → atomically (modifyTVar' (pubClaims pub) (Set.insert winA))
     it "refuses a texture released between the check and the action's preparation as an ordinary error, the previous scene unchanged" $
       withPublication $ \pub → do
         ready pub "a"
@@ -359,6 +378,7 @@ withPublicationAt limits body =
     forM_ [1 .. 8] (modelWindow model)
     windows ← WF.newFake WF.defaultFakeConfig
     textures ← newTextures
+    claims ← newTVarIO Set.empty
     stops ← newTVarIO (0 ∷ Int)
     let config = WindowConfig 2 (atomically (modifyTVar' stops (+ 1))) (\_ → pure ())
         kit =
@@ -367,11 +387,12 @@ withPublicationAt limits body =
             , kitTextures = textures
             , kitPublish = \window scene → fst (modelTarget model window) scene
             , kitUsable = \window → snd (modelTarget model window)
+            , kitClaimed = \window → Set.member window <$> readTVar claims
             }
         files = [("a.png", Png.solid 2 2 (200, 100, 50, 255)), ("b.png", Png.solid 2 2 (20, 100, 250, 255))]
     withSceneComp kit config files (rigPort rig) $ \comp _ runtime → do
       vm ← startSceneVmWith limits comp runtime "scene-vm"
-      body (Pub comp vm model rig)
+      body (Pub comp vm model rig claims)
         `finally` (openAllGates vm >> WF.releaseAll windows >> dissolve model >> endWindows (scProvider comp))
 
 -- | The window fake's port, yielding the window's token number as its capability.

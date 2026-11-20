@@ -103,6 +103,21 @@ spec = describe "depth" $ do
       -- No: brightness scales the un-premultiplied colour, then the store clamps.
       valueAt (overView [(A, (100, 200, 0, 153))] settings [depth [cell A]]) 4 4 `shouldBe` Just (Rgba8 83 167 0 255)
 
+  describe "the instances that draw at a pixel (probeSources)" $ do
+    it "names the drawing instances in drawing order, the nearest cutout last, a farther one hidden" $ do
+      let textures = [(A, (255, 0, 0, 255)), (B, (0, 255, 0, 255))]
+      probeSources (over textures [depth [keyed 9 (cell A), keyed 5 (cell B)]]) (Probe 0 4 4) `shouldBe` Right [AtInstance 0 0 0 0]
+      probeSources (over textures [depth [keyed 5 (cell A), keyed 9 (cell B)]]) (Probe 0 4 4) `shouldBe` Right [AtInstance 0 0 0 0, AtInstance 0 0 0 1]
+
+    it "passes over a nearer cutout's discarded texel to the one behind it" $ do
+      -- A is nearer and its texel is a hole: B, behind it, is what draws
+      let textures = [(A, (255, 0, 0, 0)), (B, (0, 255, 0, 255))]
+      probeSources (over textures [depth [keyed 5 (cell B), keyed 9 (cell A)]]) (Probe 0 4 4) `shouldBe` Right [AtInstance 0 0 0 0]
+
+    it "answers an indeterminate probe's reason and names no instance" $ do
+      let textures = [(A, (200, 100, 50, 127))]
+      probeSources (over textures [depth [cell A]]) (Probe 0 4 4) `shouldBe` Left (Indeterminate (NearCutoutThreshold (AtInstance 0 0 0 0)))
+
   describe "the depth test" $ do
     it "lets a larger key win whatever the submission order" $ do
       let layer first second = depth [keyed first (cell A), keyed second (cell B)]

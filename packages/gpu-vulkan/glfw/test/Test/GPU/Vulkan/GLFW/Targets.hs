@@ -46,7 +46,10 @@ import Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Loop (runVulkanOwnerLoop)
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Scenes (adoptScene, endSceneTarget, newScenes, readSceneState, registerSceneTarget, releaseScenes, retentionLimit)
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Target (Adopter (..), OffscreenTargetId (..))
-import Hetoimasia.GPU.Vulkan.Native.Recording (BatchTicket, TicketState (..), readTicket)
+import Hetoimasia.GPU.Vulkan.Native.Frames (CompletionHold (..))
+import Hetoimasia.GPU.Vulkan.Native.Recording (BatchTicket, TicketState (..), readTicket, ticketBatch)
+import Hetoimasia.GPU.Model.Identity (BatchId)
+import qualified Data.Set as HeldSet
 import Hetoimasia.Runtime.GLFW
   ( OwnerPhase (..)
   , OwnerStatus (..)
@@ -98,6 +101,12 @@ spec = describe "Offscreen scene targets (LFE-27)" $ do
     itBounded "keeps a revision while any batch recorded with it is pending, whichever batch of another revision or target completed" testUnrelatedCompletion
     itBounded "ends the use of a batch that was discarded, releasing the revision it read" testDiscardEndsUse
     itBounded "holds a finite number of unreleased revisions for a target, defers an adoption at the limit without making publication wait, and adopts the deferred revision once a release makes room" testRetentionLimit
+
+  describe "the test-only completion hold" $ do
+    itBounded "keeps a held frame-less batch pending through owner steps that observed it, its revision unreleased" testHoldKeepsBatch
+    itBounded "completes a held batch only at a step after the hold lets go, then releases its revision" testHoldReleaseCompletes
+    itBounded "changes nothing when no batch is held: the same script releases at the same step" testHoldUnsetUnchanged
+    itBounded "lets a held batch go when the rig's body fails with the hold active, so the host's teardown completes it" testHoldReleasedOnFailure
 
   describe "teardown" $ do
     itBounded "retains an unregistered target's unresolved records in the observation, counted against capacity, until every batch has completed" testUnregisterRetainsRecords
@@ -261,7 +270,10 @@ testRegistration = do
     awaitTargetStanding host a ((== Just 2) . windowAdopted)
     awaitTargetStanding host b ((== Just 1) . windowAdopted)
     atRest ← (,) <$> currentStanding host a <*> currentStanding host b
+    -- the host holds both registrations, then only the one not ended
+    atomically ((,) <$> vulkanSceneTargetRegistered host a <*> vulkanSceneTargetRegistered host b) >>= (`shouldBe` (True, True))
     unregistered ← atomically (unregisterVulkanSceneTarget host a)
+    atomically ((,) <$> vulkanSceneTargetRegistered host a <*> vulkanSceneTargetRegistered host b) >>= (`shouldBe` (False, True))
     again ← atomically (unregisterVulkanSceneTarget host a)
     late ← publishNow host a 44
     -- What a had adopted is released once it ended, each revision once.
@@ -285,6 +297,7 @@ testRegistration = do
   (foreignAnswer, foreignUnregistered, own) ← runRig foreignRig $ \host _ → do
     awaitReady host
     mine ← registered host
+    atomically ((,) <$> vulkanSceneTargetRegistered host a <*> vulkanSceneTargetRegistered host mine) >>= (`shouldBe` (False, True))
     answer ← publishNow host a 1
     gone ← atomically (unregisterVulkanSceneTarget host a)
     pure (answer, gone, mine)
@@ -584,6 +597,118 @@ testReleaseOnTicketCompletion = do
   releasedWhileHeld `shouldBe` [0]
   settled `shouldBe` ([0, 1], Just [])
   target `shouldSatisfy` const True
+
+-- A completion hold over a set of batch ids, counting each step that observed a held batch.
+data Holding = Holding
+  { holdingSet ∷ !(TVar (HeldSet.Set BatchId))
+  , holdingSeen ∷ !(TVar Int)
+  }
+
+newHolding ∷ IO (Holding, CompletionHold)
+newHolding = do
+  held ← newTVarIO HeldSet.empty
+  seen ← newTVarIO 0
+  pure (Holding held seen, CompletionHold (\batch → HeldSet.member batch <$> readTVar held) (\_ → modifyTVar' seen (+ 1)))
+
+-- Record a batch for the target with its batch held from inside the recording action, so no owner step can observe it
+-- before it is held.
+recordHeld ∷ Holding → VulkanHost Scene → OffscreenTargetId → IO (BatchTicket, (Scene, Natural))
+recordHeld holding host target =
+  act host (VulkanAction (\construction → recordVulkanTargetBatch host target construction (\scene revision _ → pure (scene, revision)) >>= \case
+      Right (ticket, handed) → Right (ticket, handed) <$ atomically (modifyTVar' (holdingSet holding) (HeldSet.insert (ticketBatch ticket)))
+      Left refusal → pure (Left refusal)))
+    >>= returned
+    >>= either (\refusal → failWith ("the batch was refused: " <> show refusal)) pure
+
+testHoldKeepsBatch ∷ IO ()
+testHoldKeepsBatch = do
+  (holding, hold) ← newHolding
+  rig ← (\r → r {rigCompletionHold = Just hold}) <$> surfaceFreeRig 0
+  -- the hold lets go inside the rig's callback, on every exit: the host's teardown never finds a batch still held
+  (pending, released, seen) ← runRig rig $ \host _ → (`finally` atomically (writeTVar (holdingSet holding) HeldSet.empty)) $ do
+    awaitReady host
+    target ← registered host
+    awaitTargetStanding host target ((== Just 0) . windowAdopted)
+    _ ← publishNow host target 11
+    awaitTargetStanding host target ((== Just 1) . windowAdopted)
+    (ticket, _) ← recordHeld holding host target
+    _ ← publishNow host target 22
+    awaitTargetStanding host target ((== Just 2) . windowAdopted)
+    -- steps that observed the held batch, with its fence signalled all the while
+    seen0 ← readTVarIO (holdingSeen holding)
+    roundTrip host
+    roundTrip host
+    atomically (readTVar (holdingSeen holding) >>= check . (> seen0))
+    state ← ticketNow ticket
+    events ← readTVarIO (rigSceneEvents rig)
+    seen ← readTVarIO (holdingSeen holding)
+    -- let go so the owner's exit completes it
+    atomically (writeTVar (holdingSet holding) HeldSet.empty)
+    pure (state, releasedOf events target, seen)
+  pending `shouldBe` TicketPending
+  released `shouldBe` [0]
+  seen `shouldSatisfy` (> 0)
+
+testHoldReleasedOnFailure ∷ IO ()
+testHoldReleasedOnFailure = do
+  (holding, hold) ← newHolding
+  rig ← (\r → r {rigCompletionHold = Just hold}) <$> surfaceFreeRig 0
+  outcome ← runRigCaught rig $ \host _ → (`finally` atomically (writeTVar (holdingSet holding) HeldSet.empty)) $ do
+    awaitReady host
+    target ← registered host
+    awaitTargetStanding host target ((== Just 0) . windowAdopted)
+    _ ← publishNow host target 11
+    awaitTargetStanding host target ((== Just 1) . windowAdopted)
+    _ ← recordHeld holding host target
+    -- the body fails with the batch held
+    throwIO (userError "the body failed with a batch held")
+  -- the failure is the body's, and the teardown that followed finished (the example's bound would say otherwise)
+  either (\failure → show failure `shouldSatisfy` isInfixOf "the body failed with a batch held") (\() → expectationFailure "the body's failure was lost") outcome
+  atomically (readTVar (holdingSet holding)) >>= (`shouldBe` HeldSet.empty)
+
+testHoldReleaseCompletes ∷ IO ()
+testHoldReleaseCompletes = do
+  (holding, hold) ← newHolding
+  rig ← (\r → r {rigCompletionHold = Just hold}) <$> surfaceFreeRig 0
+  -- the hold lets go inside the rig's callback, on every exit: the host's teardown never finds a batch still held
+  (whileHeld, afterRelease) ← runRig rig $ \host _ → (`finally` atomically (writeTVar (holdingSet holding) HeldSet.empty)) $ do
+    awaitReady host
+    target ← registered host
+    awaitTargetStanding host target ((== Just 0) . windowAdopted)
+    _ ← publishNow host target 11
+    awaitTargetStanding host target ((== Just 1) . windowAdopted)
+    (ticket, _) ← recordHeld holding host target
+    _ ← publishNow host target 22
+    awaitTargetStanding host target ((== Just 2) . windowAdopted)
+    roundTrip host
+    held ← (,) <$> ticketNow ticket <*> (flip releasedOf target <$> readTVarIO (rigSceneEvents rig))
+    -- letting go completes nothing by itself: the next step asks the fence and records the completion
+    atomically (writeTVar (holdingSet holding) HeldSet.empty)
+    ticketIs ticket TicketComplete
+    awaitEvents rig ((== [0, 1]) . (`releasedOf` target))
+    pure (held, ())
+  whileHeld `shouldBe` (TicketPending, [0])
+  afterRelease `shouldBe` ()
+
+testHoldUnsetUnchanged ∷ IO ()
+testHoldUnsetUnchanged = do
+  -- a hold that holds nothing, beside no hold at all: the same script releases revision 1 once its batch completes
+  (_, hold) ← newHolding
+  let script rig = runRig rig $ \host _ → do
+        awaitReady host
+        target ← registered host
+        awaitTargetStanding host target ((== Just 0) . windowAdopted)
+        _ ← publishNow host target 11
+        awaitTargetStanding host target ((== Just 1) . windowAdopted)
+        (ticket, _) ← recordFor host target
+        _ ← publishNow host target 22
+        awaitTargetStanding host target ((== Just 2) . windowAdopted)
+        ticketIs ticket TicketComplete
+        awaitEvents rig ((== [0, 1]) . (`releasedOf` target))
+        flip releasedOf target <$> readTVarIO (rigSceneEvents rig)
+  unset ← surfaceFreeRig 0 >>= script
+  set ← ((\r → r {rigCompletionHold = Just hold}) <$> surfaceFreeRig 0) >>= script
+  (unset, set) `shouldBe` ([0, 1], [0, 1])
 
 -- | A whole owner step that began after the caller had observed what it was waiting for: an owner-thread action
 -- runs in a step that begins after it was admitted, so by the time it has returned, the step that was in progress

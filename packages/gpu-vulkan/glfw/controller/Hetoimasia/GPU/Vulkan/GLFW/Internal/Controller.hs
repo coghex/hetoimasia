@@ -228,6 +228,8 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , TargetBatchRefusal (..)
   , registerVulkanSceneTarget
   , unregisterVulkanSceneTarget
+  , vulkanSceneTargetRegistered
+  , vulkanHostIdentity
   , publishVulkanTargetScene
   , recordVulkanTargetBatch
   , defaultTargetCapacity
@@ -236,6 +238,11 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , VulkanUploadRefusal (..)
   , submitVulkanUpload
   , cancelVulkanUpload
+  , readVulkanUploads
+  , readVulkanUploadsSettled
+  , vulkanActionRoom
+  , vulkanReleaseRoom
+  , vulkanOwnerEnded
   , readVulkanAction
   , awaitVulkanAction
 
@@ -307,6 +314,7 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , VulkanRequiredTargetFailed (..)
   ) where
 
+import Data.Unique (Unique)
 import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, retry, stateTVar, writeTVar)
 import Control.Exception
   ( Exception (displayException)
@@ -398,6 +406,8 @@ import Hetoimasia.GPU.Vulkan.GLFW.Internal.Actions
   , actionsWaiting
   , admitAction
   , admitRelease
+  , actionsRoom
+  , actionsEnded
   , awaitActionTicket
   , beginBatch
   , newActions
@@ -446,6 +456,8 @@ import Hetoimasia.GPU.Vulkan.GLFW.Internal.Targets
   , targetsHeld
   , targetsRevisions
   , unregisterTarget
+  , targetRegistered
+  , targetsIssuer
   )
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Capture
   ( CaptureMode (..)
@@ -466,10 +478,11 @@ import Hetoimasia.GPU.Vulkan.GLFW.Internal.Capture
   , withholdAll
   )
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Rendering
-import Hetoimasia.GPU.Vulkan.Native.Frames (FrameOps (..))
+import Hetoimasia.GPU.Vulkan.Native.Frames (CompletionHold, FrameOps (..))
 import Hetoimasia.GPU.Vulkan.Native.Recording (BatchTicket, ClearColor (..), Recorder, RecordingOps (..), Refusal)
 import Hetoimasia.GPU.Vulkan.Native.Uploads
-  ( CancelRefusal
+  ( UploadsView
+  , CancelRefusal
   , UploadConfig
   , UploadRefusal (UploadClosed, UploadSessionFailed)
   , UploadRequest
@@ -773,11 +786,12 @@ newVulkanController
   → MonotonicSource
   → Duration
   → IO VulkanController
-newVulkanController = newVulkanControllerWith noControllerHooks
+newVulkanController = newVulkanControllerWith noControllerHooks Nothing
 
 -- | 'newVulkanController' with the examples' hooks.
 newVulkanControllerWith
   ∷ ControllerHooks
+  → Maybe CompletionHold
   → CaptureMode
   → VulkanDeviceStart
   → Natural
@@ -797,7 +811,7 @@ newVulkanControllerWith
   → MonotonicSource
   → Duration
   → IO VulkanController
-newVulkanControllerWith hooks capture deviceStart capacity releaseCapacity initialEmpty uploads windowDepth ops rendering observer pointer bridge layers validation choice budgets clock poll = do
+newVulkanControllerWith hooks hold capture deviceStart capacity releaseCapacity initialEmpty uploads windowDepth ops rendering observer pointer bridge layers validation choice budgets clock poll = do
   roots ← newRoots ops budgets clock
   ownerOpen ← newTVarIO (pure True)
   scenes ← newScenes initialEmpty
@@ -811,7 +825,7 @@ newVulkanControllerWith hooks capture deviceStart capacity releaseCapacity initi
   -- nothing until the recording supplies what makes their depth images.
   when windowDepth (atomically (requireWindowDepth generations))
   captures ← newCaptures capture
-  rendered ← newRendering roots generations rendering observer captures uploads windowDepth
+  rendered ← newRendering roots generations rendering observer captures uploads windowDepth hold
   fmap VulkanController $
     State roots generations rendered pointer bridge layers validation choice
       <$> newTVarIO Nothing
@@ -1214,6 +1228,21 @@ registerVulkanSceneTarget host = case vulkanController host of
 unregisterVulkanSceneTarget ∷ VulkanHost scene → OffscreenTargetId → STM Bool
 unregisterVulkanSceneTarget host = unregisterTarget (vulkanTargets host)
 
+-- | Whether this host holds this exact offscreen registration now: 'False'
+-- once it is unregistered, and for an identity this host never issued
+-- (another host's). It writes nothing, so it composes with a caller's own
+-- checks as one fact; it reads the registry that every publication writes, so
+-- a transaction that waits only for the target's end should wait on a cell of
+-- the registrant's instead.
+vulkanSceneTargetRegistered ∷ VulkanHost scene → OffscreenTargetId → STM Bool
+vulkanSceneTargetRegistered host = targetRegistered (vulkanTargets host)
+
+-- | The host's identity: every offscreen registration it issues carries it, and
+-- a consumer binds a window or target of this host to it, so that a target is
+-- never taken by a service built over another host.
+vulkanHostIdentity ∷ VulkanHost scene → Unique
+vulkanHostIdentity = targetsIssuer . vulkanTargets
+
 -- | Publish a prepared scene to an offscreen target, as one transaction that
 -- never waits for GPU work, adopted capacity or a displayed frame: the
 -- target's latest value, at the next revision the host holds, replacing a
@@ -1296,6 +1325,35 @@ submitVulkanUpload (VulkanController state) request =
 -- ('cancelUpload').
 cancelVulkanUpload ∷ VulkanController → UploadTicket → STM (Either CancelRefusal ())
 cancelVulkanUpload (VulkanController state) = cancelRenderingUpload (stateRendering state)
+
+-- | The session's uploads as they stand ('readUploads'), once they exist: what a caller refused as backpressure watches
+-- to know that one has settled. It writes nothing.
+readVulkanUploads ∷ VulkanController → STM (Maybe UploadsView)
+readVulkanUploads (VulkanController state) = readRenderingUploads (stateRendering state)
+
+-- | How many of the session's uploads have settled ('Nothing' before the uploads exist): a count that only grows,
+-- written only when an upload settles, so a transaction waiting for one to settle wakes for that alone.
+readVulkanUploadsSettled ∷ VulkanController → STM (Maybe Natural)
+readVulkanUploadsSettled (VulkanController state) = readRenderingUploadsSettled (stateRendering state)
+
+-- | Whether an owner-thread action would be admitted now ('submitVulkanAction'), written nowhere and reading only
+-- the owner's gate, the device's existence and the action queue: never a scene, a barrier or a target, so a
+-- transaction waiting for room wakes when room or the gate changes and at no other time.
+vulkanActionRoom ∷ VulkanController → STM Bool
+vulkanActionRoom (VulkanController state) = do
+  device ← isJust <$> readRootsDevice (stateRoots state)
+  actionsRoom (stateActions state) device False
+
+-- | Whether a release request would find room on the release lane now ('requestVulkanRelease'), with the same reads
+-- as 'vulkanActionRoom': its barrier is not read, since it is recorded, not refused, at admission.
+vulkanReleaseRoom ∷ VulkanController → STM Bool
+vulkanReleaseRoom (VulkanController state) = do
+  device ← isJust <$> readRootsDevice (stateRoots state)
+  actionsRoom (stateActions state) device True
+
+-- | Whether the owner takes no more actions (it closed, or its session failed), reading only its gate.
+vulkanOwnerEnded ∷ VulkanController → STM Bool
+vulkanOwnerEnded (VulkanController state) = actionsEnded (stateActions state)
 
 -- | Whether an owner-thread action may be admitted or started now: refused
 -- once the session has failed, with its primary, and once the owner's
@@ -2641,6 +2699,10 @@ data VulkanHostConfig scene = VulkanHostConfig
     -- is refused ('TargetCapacityReached'), never waited for. It is apart from
     -- the windows' bound and never reduces it; zero refuses every
     -- registration. 'defaultTargetCapacity' by default.
+  , vulkanCompletionHold ∷ !(Maybe CompletionHold)
+    -- ^ TEST-ONLY: a hold on the recognition of frame-less batches'
+    -- completion ('CompletionHold'). 'Nothing', by default and in every
+    -- production configuration: nothing is held. Only a test suite sets it.
   }
 
 -- | When the session's one device is selected and created.
@@ -2674,7 +2736,7 @@ defaultReleaseCapacity = 64
 -- initial scene holds nothing.
 vulkanHostConfig ∷ HostConfig → CaptureConfig → Budgets → Prepared scene → VulkanHostConfig scene
 vulkanHostConfig host capture budgets scene =
-  VulkanHostConfig host capture [] [] ValidationOff budgets scene id (const noObserver) (clearRenderer (\_ _ → ClearColor 0 0 0 1)) noFrameObserver DeviceAtFirstSurface defaultActionCapacity defaultReleaseCapacity Nothing SharedScene noSceneLifecycle False False defaultTargetCapacity
+  VulkanHostConfig host capture [] [] ValidationOff budgets scene id (const noObserver) (clearRenderer (\_ _ → ClearColor 0 0 0 1)) noFrameObserver DeviceAtFirstSurface defaultActionCapacity defaultReleaseCapacity Nothing SharedScene noSceneLifecycle False False defaultTargetCapacity Nothing
 
 -- | A running Vulkan graphics host.
 data VulkanHost scene = VulkanHost
@@ -2735,6 +2797,7 @@ withVulkanOwnerHostHooked hooks capturing logger layer rendering pointer bridge 
     controller@(VulkanController state) ←
       newVulkanControllerWith
         hooks
+        (vulkanCompletionHold config)
         capturing
         (vulkanDeviceStart config)
         (vulkanActionCapacity config)

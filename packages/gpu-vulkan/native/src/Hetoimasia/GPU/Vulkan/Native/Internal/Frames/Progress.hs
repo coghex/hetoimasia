@@ -146,7 +146,15 @@ progressFrames frames now = owner recording $ do
                     else note failures (toException (FrameEffectUncertain (submissionFrames record) "the model refused a completion its fence proved"))
           ObserveFrameless submission record → do
             sync ← Map.lookup (framelessSlot record) <$> readTVarIO (framesFrameless frames)
-            for_ sync $ \held →
+            -- A test's completion hold (production has none): a held batch's
+            -- fence is not asked, so it stays pending for every reader.
+            heldNow ← case framesHold frames of
+              Nothing → pure False
+              Just hold → atomically $ do
+                holding ← holdsBatch hold (framelessBatch record)
+                when holding (heldObserved hold (framelessBatch record))
+                pure holding
+            for_ (if heldNow then Nothing else sync) $ \held →
               observe handle (framelessFence held) $ \case
                 Left failure@(ExceptionWithContext _ exception)
                   -- The device's loss lets go of the submission under its own

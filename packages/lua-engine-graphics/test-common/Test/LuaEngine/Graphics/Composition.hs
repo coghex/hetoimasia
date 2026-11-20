@@ -27,6 +27,7 @@ module Test.LuaEngine.Graphics.Composition
   , commandLoad
   , commandLoadPolicy
   , commandRetain
+  , inInstance
   , commandUnretain
   , heldRetained
   , ownerOf
@@ -47,7 +48,9 @@ import Control.Exception (finally, mask_)
 import Control.Monad (forM_, unless, when)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
-import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
+import Data.Unique (hashUnique, newUnique)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import Data.Set (Set)
@@ -224,6 +227,9 @@ data Vm = Vm
   , vmRetained ∷ !(IORef (Map Text RetainedTexture))
     -- ^ The textures the example's @tex.retain@ holds a CPU interest in, by label: what a consumer of a version's coverage
     -- and checked profile holds, taken through the public retention boundary and nowhere else.
+  , vmHook ∷ !(IORef (IO Text))
+    -- ^ What the example's @tex.hook@ runs, inside the instance's own call: where a binding the engine will write later
+    -- (a terrain view's attachment) runs, with the instance's leases lent to it.
   }
 
 requiredPolicy ∷ WorkerPolicy
@@ -245,7 +251,8 @@ startVm composition runtime label = do
   leases ← newLeases lending capacity
   owners ← newIORef Map.empty
   retained ← newIORef Map.empty
-  let vm' = Vm (error "owner not started") service leases owners retained
+  hook ← newIORef (pure "none")
+  let vm' = Vm (error "owner not started") service leases owners retained hook
       registered =
         either (error . ("registration refused: " <>) . show) id $
           registration [admittedHandleType handles requestHandleType, leaseCapabilityType leases textureHandleType] (bindings composition vm')
@@ -300,7 +307,7 @@ bindings ∷ Composition → Vm → [Namespace]
 bindings composition vm =
   [ namespace "fx" [recording]
   , namespace "request" (m1RequestBindings (M1Service requestHandleType textureValueSchema))
-  , namespace "tex" [loading, using, releasing, retaining, unretaining]
+  , namespace "tex" [loading, using, leasing, hooking, releasing, retaining, unretaining]
   ]
   where
     service = vmService vm
@@ -331,6 +338,18 @@ bindings composition vm =
             view ← withTexture (vmLeases vm) (capabilityKey handle) pure
             pure [VInteger (fromIntegral (viewIdentity view))]
           _ → pure []
+    -- The lease's key in the VM's lease scope: what a Haskell consumer that is handed the instance's authority (a
+    -- terrain view's style) names the texture by. The example's scaffolding, not an API of the engine.
+    leasing =
+      recoverableRefusals $
+        stateOperation "lease" [SCapability textureHandleType] [SInteger] $ \arguments → case arguments of
+          [VCapability handle] → pure [VInteger (fromIntegral (capabilityKey handle))]
+          _ → pure []
+    hooking =
+      stateOperation "hook" [] [SText] $ \_ → do
+        action ← readIORef (vmHook vm)
+        answer ← action
+        pure [VText answer]
     retaining =
       recoverableRefusals $
         stateOperation "retain" [SCapability textureHandleType, SText, SText] [SText] $ \arguments → case arguments of
@@ -415,6 +434,8 @@ driverSource =
       , "    if r.status == 'success' then self.ts[key] = r.value.texture end"
       , "    out = fmt(r)"
       , "  elseif p.op == 'use' then out = tostring(tex.use(self.ts[key]))"
+      , "  elseif p.op == 'lease' then out = tostring(tex.lease(self.ts[key]))"
+      , "  elseif p.op == 'hook' then out = tex.hook()"
       , "  elseif p.op == 'puse' then"
       , "    local ok, r = pcall(tex.use, self.ts[key])"
       , "    out = ok and tostring(r) or ('error ' .. tostring(r))"
@@ -485,6 +506,18 @@ commandLoadPolicy composition vm name key path optional wordsGiven = commandWith
 -- @coverage@, @normal@, @data@, @colour@. The answer is the instance's note, @retained@ or @refused: …@.
 commandRetain ∷ Composition → Vm → Text → Text → Text → [Text] → IO ()
 commandRetain composition vm name key label wantedWords = commandWith composition vm name "retain" key (Just (label, False, wantedWords))
+
+-- | Run an action inside the named instance's own call (the driver's @tex.hook@), with the instance's leases lent to
+-- it, and answer what it answered. One at a time: the hook is the VM's.
+inInstance ∷ Composition → Vm → Text → IO a → IO a
+inInstance composition vm name action = do
+  box ← newEmptyMVar
+  serial ← hashUnique <$> newUnique
+  let tag = "hook-" <> Text.pack (show serial)
+  writeIORef (vmHook vm) (action >>= putMVar box >> pure tag)
+  commandWith composition vm name "hook" tag Nothing
+  _ ← awaitNoteContaining composition (name <> " hook " <> tag <> " ")
+  takeMVar box
 
 -- | Tell the instance to let go of a retained texture.
 commandUnretain ∷ Composition → Vm → Text → Text → Text → IO ()

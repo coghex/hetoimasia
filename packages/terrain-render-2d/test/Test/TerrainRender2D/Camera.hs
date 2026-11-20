@@ -153,6 +153,13 @@ spec = describe "Camera" $ do
       applyCommand cfg variedFacts (Pan 1 0) farCamera `shouldBe` Left PanOutOfRange
       applyCommand cfg variedFacts (Pan 0 (0 / 0)) start `shouldBe` Left NonFiniteInput
       applyCommand cfg variedFacts (Pan 1e300 0) start `shouldBe` Left PanOutOfRange
+    it "pans a manual camera without facts exactly as with them, refuses an invalid pan without them, and waits for facts only to follow" $ do
+      let m = camera' (SelectSlice (axis 3)) variedFacts start
+      applyCommandWithoutFacts cfg (Pan 2 0) m `shouldBe` Just (applyCommand cfg variedFacts (Pan 2 0) m)
+      applyCommandWithoutFacts cfg (Pan (0 / 0) 0) m `shouldBe` Just (Left NonFiniteInput)
+      applyCommandWithoutFacts cfg (Pan (0 / 0) 0) start `shouldBe` Just (Left NonFiniteInput)
+      applyCommandWithoutFacts cfg (Pan 1e300 0) start `shouldBe` Just (Left PanOutOfRange)
+      applyCommandWithoutFacts cfg (Pan 1 0) start `shouldBe` Nothing
     it "keeps the integer address exact at the supported extreme" $ do
       let farCamera = either (error . show) id (newCamera cfg (axis (axisMaxValue - 1)) (axis 0) (axis 0))
           p = camera' (Pan 0.25 0) variedFacts farCamera

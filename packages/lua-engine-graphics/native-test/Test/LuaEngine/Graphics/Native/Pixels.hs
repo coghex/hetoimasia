@@ -33,7 +33,7 @@
 --
 -- See "Test.LuaEngine.Graphics.Pixels": the hand-stated expectations, the render-2d oracle over the specification, and the
 -- render-2d oracle over the published window-pass scene with the managed target's own 'TargetSpec', every pixel.
-module Test.LuaEngine.Graphics.Native.Pixels (spec) where
+module Test.LuaEngine.Graphics.Native.Pixels (spec, depthHostPixels, depthHostPixelPaths) where
 
 import Control.Concurrent (killThread)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, takeMVar, tryPutMVar, tryReadMVar)
@@ -94,16 +94,47 @@ import Test.Support.Owned (withOwnedThreadOpening)
 
 -- The subgroup ----------------------------------------------------------------------------------------------------------
 
+-- | M1 output judged on the terrain-enabled host (the host-wide window depth, TRA-9): the shipped quad and the
+-- twelve-colour grid, judged exactly as on the terrain-disabled host.
+depthHostPixels ∷ Env → Spec
+depthHostPixels env = describe depthHostPixelGroup $ do
+  it shippedQuadExample (shippedQuad env " (terrain-enabled host)")
+  it topLeftExample (topLeftNearest env " (terrain-enabled host)")
+
+depthHostPixelGroup, shippedQuadExample, topLeftExample ∷ String
+depthHostPixelGroup = "Lua offscreen pixels on the terrain-enabled host"
+shippedQuadExample = "shipped Lua quad: the unchanged samples/lua-quad content, at known offscreen metrics, draws its authored PNG at its declared rectangle over its clear"
+topLeftExample = "top-left, full image, nearest: an asymmetric twelve-colour texture, enlarged eight to a texel, shows every texel at its place with no colour between neighbours, after the initial scene read opaque black"
+
+-- | The depth host's pixel examples, by their Hspec paths.
+depthHostPixelPaths ∷ [([String], String)]
+depthHostPixelPaths = [([depthHostPixelGroup], shippedQuadExample), ([depthHostPixelGroup], topLeftExample)]
+
+shippedQuad ∷ Env → Text → IO ()
+shippedQuad env suffix =
+  within 120 $ do
+    files ← shippedFiles
+    withLiveSession env "shipped-quad" files [] $ \live → do
+      awaitPublished live 1
+      awaitAdopted live 1
+      _ ← checkImage env live ("shipped quad" <> suffix) quadSpec 1 (pure ())
+      publishedNow live >>= (`shouldBe` Just 1)
+
+topLeftNearest ∷ Env → Text → IO ()
+topLeftNearest env suffix =
+  within 120 $
+    withProgram env "top-left-nearest" gridProgram $ \live → do
+      -- Before the first publication the target holds the host's initial scene: opaque black, naming nothing.
+      awaitAdopted live 0
+      _ ← checkImage env live ("initial scene" <> suffix) initialSpec 0 (pure ())
+      releaseGate live 1
+      awaitAdopted live 1
+      _ ← checkImage env live ("grid" <> suffix) gridSpec 1 (pure ())
+      publishedNow live >>= (`shouldBe` Just 1)
+
 spec ∷ Env → Spec
 spec env = describe "Lua offscreen pixels" $ do
-  it "shipped Lua quad: the unchanged samples/lua-quad content, at known offscreen metrics, draws its authored PNG at its declared rectangle over its clear" $
-    within 120 $ do
-      files ← shippedFiles
-      withLiveSession env "shipped-quad" files [] $ \live → do
-        awaitPublished live 1
-        awaitAdopted live 1
-        _ ← checkImage env live "shipped quad" quadSpec 1 (pure ())
-        publishedNow live >>= (`shouldBe` Just 1)
+  it shippedQuadExample (shippedQuad env "")
 
   it "a Lua failure before any window exists ends the example with the roles' failure, with the scenario joined and nothing left behind" $
     -- Well inside the scenario's own 60-second bound: the session has already returned, so nothing may wait for that bound.
@@ -115,16 +146,7 @@ spec env = describe "Lua offscreen pixels" $ do
       withLiveSession env "failure-before-window" files [] (\_ → pure ()) `shouldThrow` roleFailed
       awaitGone env
 
-  it "top-left, full image, nearest: an asymmetric twelve-colour texture, enlarged eight to a texel, shows every texel at its place with no colour between neighbours, after the initial scene read opaque black" $
-    within 120 $
-      withProgram env "top-left-nearest" gridProgram $ \live → do
-        -- Before the first publication the target holds the host's initial scene: opaque black, naming nothing.
-        awaitAdopted live 0
-        _ ← checkImage env live "initial scene" initialSpec 0 (pure ())
-        releaseGate live 1
-        awaitAdopted live 1
-        _ ← checkImage env live "grid" gridSpec 1 (pure ())
-        publishedNow live >>= (`shouldBe` Just 1)
+  it topLeftExample (topLeftNearest env "")
 
   it "ordered transparency: later list entries cover earlier ones with the premultiplied blend, and the reversed list in a separate publication shows the reversed overlap" $
     within 120 $

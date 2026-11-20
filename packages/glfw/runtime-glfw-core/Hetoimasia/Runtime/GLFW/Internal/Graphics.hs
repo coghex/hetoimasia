@@ -79,7 +79,8 @@ module Hetoimasia.Runtime.GLFW.Internal.Graphics
   , serviceFor
   ) where
 
-import Control.Concurrent.STM (STM, TVar, modifyTVar', newTVar, readTVar)
+import Control.Concurrent.STM (STM, TVar, newTVar, readTVar, writeTVar)
+import Control.Monad (when)
 import Hetoimasia.GLFW.Internal.Attachment
   ( AttachmentId
   , RetirementFact
@@ -153,15 +154,21 @@ newGraphicsCell incarnation missing =
 readGraphicsCell ∷ GraphicsCell → STM GraphicsObservation
 readGraphicsCell (GraphicsCell cell) = readTVar cell
 
--- | Record where the incarnation stands and what it still owes.
+-- | Record where the incarnation stands and what it still owes. The cell is written only
+-- when that changes: the host refreshes every cell each round, and a transaction waiting
+-- on one must wake for a change of this incarnation's lifecycle and for nothing else.
 writeGraphicsSlot ∷ GraphicsCell → SlotState → [RetirementFact] → STM ()
-writeGraphicsSlot (GraphicsCell cell) slot missing =
-  modifyTVar' cell (\observed → observed {observedSlot = slot, observedMissing = missing})
+writeGraphicsSlot cell slot missing = changeCell cell (\observed → observed {observedSlot = slot, observedMissing = missing})
 
--- | Record what the window's own release settled as.
+-- | Record what the window's own release settled as, written only when that changes.
 writeGraphicsDisposal ∷ GraphicsCell → NativeDisposal → STM ()
-writeGraphicsDisposal (GraphicsCell cell) disposal =
-  modifyTVar' cell (\observed → observed {observedDisposal = disposal})
+writeGraphicsDisposal cell disposal = changeCell cell (\observed → observed {observedDisposal = disposal})
+
+changeCell ∷ GraphicsCell → (GraphicsObservation → GraphicsObservation) → STM ()
+changeCell (GraphicsCell cell) change = do
+  observed ← readTVar cell
+  let changed = change observed
+  when (changed /= observed) (writeTVar cell changed)
 
 -- ---------------------------------------------------------------------------
 -- The opaque service

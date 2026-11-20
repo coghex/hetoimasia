@@ -63,7 +63,7 @@ seams ∷ [String]
 seams = ["withBackendObserved", "withBackendUnpumped", "pumpOnce", "Examined (..)"]
 
 withClient ∷ String → ((Mode → IO Client) → IO ()) → IO ()
-withClient = withStorePackageClient ["base", "text", "hetoimasia-lua-engine-graphics"] "Client.hs"
+withClient = withStorePackageClient ["base", "text", "hetoimasia-lua-engine-graphics-0.1.0.0-inplace"] "Client.hs"
 
 spec ∷ Spec
 spec = describe "the texture backend's package boundary" $ do

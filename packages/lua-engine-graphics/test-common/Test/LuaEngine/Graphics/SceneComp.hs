@@ -65,6 +65,7 @@ import Hetoimasia.LuaEngine.Graphics.Scene
   , graphicsPublishBindingWith
   , publishRefusalText
   , publishScene
+  , publisherClaimedBy
   , scenePublisherOver
   )
 import Hetoimasia.LuaEngine.Graphics.Window.Port (Port)
@@ -110,6 +111,8 @@ data SceneKit target = SceneKit
   , kitTextures ∷ !Textures
   , kitPublish ∷ target → Prepared GraphicsScene → STM HostAnswer
   , kitUsable ∷ target → STM Bool
+  , kitClaimed ∷ target → STM Bool
+    -- ^ Whether a terrain view holds the target's exclusive claim, read in the publication's commit.
   }
 
 -- | Everything an example shares: the texture composition and the window provider.
@@ -193,7 +196,7 @@ startSceneVmWith limits' comp runtime label = do
   gates ← newTVarIO (Gates [] [] [] [] False)
   early ← newIORef Nothing
   let kit = scKit comp
-      publisher = scenePublisherOver (kitTextures kit) (scProvider comp) (kitPublish kit) (kitUsable kit)
+      publisher = publisherClaimedBy (kitClaimed kit) (scenePublisherOver (kitTextures kit) (scProvider comp) (kitPublish kit) (kitUsable kit))
       vm' = SceneVm (error "owner not started") textureService' windowService' leases textureOwners windowOwners gates publisher early
       registered =
         either (error . ("registration refused: " <>) . show) id $

@@ -46,6 +46,7 @@ module Hetoimasia.LuaEngine.Graphics.Texture
   , BackendReading (..)
   ) where
 
+import Hetoimasia.LuaEngine.Graphics.Keeper (Keeper, withKeeperAcross)
 import Control.Concurrent.STM (STM)
 import Control.Exception (Exception, ExceptionWithContext, SomeException, throwIO)
 import Data.Word (Word64)
@@ -67,6 +68,7 @@ import Hetoimasia.LuaEngine.Graphics.Texture.Port (Port, TextureRef (..), textur
 import Hetoimasia.LuaEngine.Texture.Backend (TextureBackend)
 import qualified Hetoimasia.Render.Api.Texture as Api
 import qualified Hetoimasia.Render.TwoD.Vulkan as Render
+import Hetoimasia.Render.TwoD.Vulkan.Chunks (Retained)
 import Hetoimasia.Render.TwoD.Vulkan.Textures (Textures, fromBackendHandle)
 
 -- | The adapter, as a body sees it.
@@ -79,6 +81,8 @@ data TextureGraphics = TextureGraphics
     -- ^ The session's one texture registry, whose handles the scene adapters name.
   , graphicsLedger ∷ !(SceneLedger SceneTargetKey)
     -- ^ What the adopted scene revisions hold: the release of a delivered texture is gated on it.
+  , graphicsRetained ∷ !Retained
+    -- ^ The session's one registry of retained chunks, which a terrain view builds into and the renderer draws from.
   , graphicsConfiguration ∷ !TextureGraphicsConfiguration
   , graphicsPort ∷ !(Port Image UploadTicket)
     -- ^ The adapter seam: the port the backend runs over, for a client that composes a further backend over
@@ -86,6 +90,9 @@ data TextureGraphics = TextureGraphics
   , graphicsReading ∷ STM BackendReading
   , graphicsFailure ∷ STM (ExceptionWithContext SomeException)
     -- ^ Retries until the backend has latched a failure of its own.
+  , graphicsKeeper ∷ !Keeper
+    -- ^ The session's keeper of work a shorter scope handed over when it ended (a terrain view service's retirements):
+    -- made and ended with this session, inside the backend's scope.
   }
 
 -- | Why the adapter could not be composed. A structured startup or configuration failure, raised before
@@ -113,9 +120,10 @@ withTextureGraphics scenes configuration hostConfig host body =
       bootstrapHost (configurationRenderer configuration) (scenesLedger scenes) host >>= \case
         Left refusal → throwIO (SessionRefused refusal)
         Right session →
-          withBackend (hostPort host session) $ \backend → do
+          -- the session's keeper runs across the backend: work it holds can still let go of what the drain waits for
+          withKeeperAcross (withBackend (hostPort host session)) $ \keeper backend → do
             -- The renderer hook finds the session's renderer here, filled before any window can exist.
-            fillRenderSlot (scenesSlot scenes) (RenderSession (sessionRenderer session) (sessionTextures session))
+            fillRenderSlot (scenesSlot scenes) (RenderSession (sessionRenderer session) (sessionTextures session) (sessionRetained session))
             -- Composition ends when the table's placeholder is bound: texture work needs it, so it is
             -- asked for and waited for here, where a failure of the owner ends the assembly.
             awaitBound backend
@@ -125,10 +133,12 @@ withTextureGraphics scenes configuration hostConfig host body =
                 , graphicsRenderer = sessionRenderer session
                 , graphicsTextures = sessionTextures session
                 , graphicsLedger = sessionLedger session
+                , graphicsRetained = sessionRetained session
                 , graphicsConfiguration = configuration
                 , graphicsPort = hostPort host session
                 , graphicsReading = readBackend backend
                 , graphicsFailure = awaitBackendFailure backend
+                , graphicsKeeper = keeper
                 }
 
 -- | The renderer's handle for the identity a texture was delivered with.

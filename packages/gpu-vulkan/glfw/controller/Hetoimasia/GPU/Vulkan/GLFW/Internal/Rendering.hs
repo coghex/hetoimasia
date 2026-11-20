@@ -174,6 +174,8 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Rendering
   , renderingUploadsWaiting
   , submitRenderingUpload
   , cancelRenderingUpload
+  , readRenderingUploads
+  , readRenderingUploadsSettled
 
     -- * Retirement
   , prepareTargetRetirement
@@ -251,6 +253,7 @@ import Hetoimasia.GPU.Vulkan.GLFW.Internal.Capture
   )
 import Hetoimasia.GPU.Vulkan.Native.Frames
   ( Acquisition (..)
+  , CompletionHold
   , FrameOps
   , FrameStanding (..)
   , Frames
@@ -265,7 +268,7 @@ import Hetoimasia.GPU.Vulkan.Native.Frames
   , closeTargetFrames
   , closeUnpresentedFrame
   , drainWaitLimit
-  , newFrames
+  , newFramesWith
   , readFramelessSubmissions
   , recordFramelessIn
   , recordFramelessInWith
@@ -388,6 +391,9 @@ import Hetoimasia.GPU.Vulkan.Native.TextureTable
   )
 import Hetoimasia.GPU.Vulkan.Native.Uploads
   ( CancelRefusal (CancelUnknown)
+  , UploadsView
+  , readUploads
+  , readUploadsSettled
   , UploadConfig
   , UploadProgress (..)
   , UploadRefusal
@@ -973,6 +979,10 @@ data Rendering q inst msgr phys dev cmd = Rendering
     -- ^ Every frame-less batch recorded with the scene revision an offscreen
     -- target adopted whose ticket is neither complete nor discarded, by the
     -- batch.
+  , renderingCompletionHold ∷ !(Maybe CompletionHold)
+    -- ^ A test's completion hold, given when the rendering is made and handed
+    -- to the frames when they are made: 'Nothing' in production, which holds
+    -- no cell for it.
   }
 
 -- | One frame's recorded use of a scene revision: what keeps that revision from
@@ -1042,8 +1052,9 @@ newRendering
   → Captures
   → Maybe UploadConfig
   → Bool
+  → Maybe CompletionHold
   → IO (Rendering q inst msgr phys dev cmd)
-newRendering roots generations ops observer captures uploads windowDepth =
+newRendering roots generations ops observer captures uploads windowDepth hold =
   Rendering roots generations ops
     <$> newTVarIO Nothing
     <*> newTVarIO Map.empty
@@ -1058,6 +1069,7 @@ newRendering roots generations ops observer captures uploads windowDepth =
     <*> newTVarIO Map.empty
     <*> newTVarIO 0
     <*> newTVarIO Map.empty
+    <*> pure hold
 
 -- | The recording and the frames, made the first time they are needed once
 -- the device exists, on the owner's thread, which is what makes it their
@@ -1072,7 +1084,7 @@ live rendering =
         Just (plan, _) → do
           ops ← renderingRecordingOps (renderingOps rendering) (planDevice plan)
           recording ← newRecording ops (renderingRoots rendering) (renderingGenerations rendering)
-          frames ← newFrames (renderingFrameOps (renderingOps rendering)) recording
+          frames ← newFramesWith (renderingCompletionHold rendering) (renderingFrameOps (renderingOps rendering)) recording
           let made = Live recording frames
           -- The scene uses read completions from the frames' log.
           atomically (enableCompletionLog frames)
@@ -1867,6 +1879,20 @@ submitRenderingUpload rendering gate request =
     UploadsUnconfigured → pure (Left (Left UploadsNotConfigured))
     UploadsPending _ → pure (Left (Left UploadsNotReady))
     UploadsRefused refusal → pure (Left (Left (UploadsRefusedBy refusal)))
+
+-- | The session's uploads as they stand ('readUploads'), once they exist. It writes nothing.
+readRenderingUploads ∷ Rendering q inst msgr phys dev cmd → STM (Maybe UploadsView)
+readRenderingUploads rendering =
+  readTVar (renderingUploads rendering) >>= \case
+    UploadsMade uploads → Just <$> readUploads uploads
+    _ → pure Nothing
+
+-- | How many uploads have settled ('Nothing' before the uploads exist): written only when one settles.
+readRenderingUploadsSettled ∷ Rendering q inst msgr phys dev cmd → STM (Maybe Natural)
+readRenderingUploadsSettled rendering =
+  readTVar (renderingUploads rendering) >>= \case
+    UploadsMade uploads → Just <$> readUploadsSettled uploads
+    _ → pure Nothing
 
 -- | Cancel an upload from any thread ('cancelUpload').
 cancelRenderingUpload ∷ Rendering q inst msgr phys dev cmd → UploadTicket → STM (Either CancelRefusal ())

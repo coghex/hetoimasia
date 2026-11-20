@@ -35,6 +35,7 @@ module Hetoimasia.Terrain.Runtime
   , OwnerControl (..)
   , standaloneSupervisor
   , withTerrainService
+  , StagingAccount (..)
   , closeService
   , awaitOwnerStopped
   , awaitClosed
@@ -72,6 +73,9 @@ module Hetoimasia.Terrain.Runtime
   , Refused (..)
   , BusyWhy (..)
   , Precondition (..)
+  , PreconditionGuard (..)
+  , ServiceIdentity
+  , serviceIdentity
   , CancelResult (..)
   , openArena
   , OpenOptions (..)
@@ -100,6 +104,7 @@ module Hetoimasia.Terrain.Runtime
   , compileAccountFor
   , Condition (..)
   , await
+  , awaitSTM
   , cancelPending
 
     -- * View demand
@@ -166,6 +171,12 @@ module Hetoimasia.Terrain.Runtime
   , inspectDefects
   , inspectSnapshotBytes
   , inspectRetainedChargesSTM
+  , retainedBankUseSTM
+  , regionalFitsSTM
+  , authorityEpochSTM
+  , ArenaMark (..)
+  , arenaMarkSTM
+  , capacityFreedSTM
   , inspectRegionalSTM
   , RegionalCharge
   , regionalChargeHold
@@ -227,7 +238,7 @@ module Hetoimasia.Terrain.Runtime
 
 import Control.Concurrent.STM
 import Control.Exception (Exception, ExceptionWithContext, SomeException, mask, rethrowIO, throwIO, try, tryWithContext)
-import Control.Monad (void, when)
+import Control.Monad (forM_, unless, void, when)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (isNothing)
 import Data.Text (Text)
@@ -304,6 +315,7 @@ defaultConfig =
     , configFirstIdentity = 0
     , configFirstRevision = 0
     , configRetainedBytes = 16 * 1024 * 1024
+    , configStagingAccount = Nothing
     , configStore = defaultStoreSpec
     , configEditBank = defaultEditBankSpec
     , configConnectivity = defaultConnectivityLimits
@@ -351,7 +363,29 @@ standaloneSupervisor group = Supervisor $ \definition →
 -- the body, outside any uninterruptible release, and it has no deadline: a
 -- borrower that never returns keeps the service, and so its dependencies, alive.
 withTerrainService ∷ Config → Ports → (Service → IO a) → IO a
-withTerrainService config ports body = do
+withTerrainService config ports body = withRetainedCarveOut config (withTerrainServiceFunded config ports body)
+
+-- | With an outside staging account, the snapshot backing bank ('configRetainedBytes'), which the port charges outside
+-- the model's steps, is held in the account as a fixed carve-out for the service's whole life: reserved before anything
+-- starts, in one transaction, or the service is refused ('ConfigStagingAccount') with nothing started; returned after the
+-- drain. The model's staging is charged step by step beside it, so the two together never exceed what the account
+-- granted. Without an account nothing is reserved outside.
+withRetainedCarveOut ∷ Config → IO a → IO a
+withRetainedCarveOut config inner = case configStagingAccount config of
+  Nothing → inner
+  Just account →
+    withResource
+      ( do
+          funded ← atomically (stagingAccountReserve account bytes)
+          unless funded (throwIO (ConfigStagingAccount bytes (stagingAccountLimit account)))
+      )
+      (\() → atomically (stagingAccountRelease account bytes))
+      (\() → inner)
+  where
+    bytes = configRetainedBytes config
+
+withTerrainServiceFunded ∷ Config → Ports → (Service → IO a) → IO a
+withTerrainServiceFunded config ports body = do
   -- Everything the configuration says is validated before anything starts: the store's
   -- allowance, the edit bank's division (for the configured arenas), the model's banks, and the
   -- compile account beside them (owner decision 2026-11-13, option B).
@@ -384,6 +418,11 @@ withTerrainService config ports body = do
       -- propagates; an interruption received while draining is delivered after it.
       outcome <- tryWithContext (restore (body svc))
       late <- drain svc owner
+      -- what the service still holds in its outside staging account goes back once nothing can use it
+      forM_ (configStagingAccount config) $ \account → atomically $ do
+        st <- readSt svc
+        stagingAccountRelease account (stateAccountCharged st)
+        modifySt svc (\s → s {stateAccountCharged = 0})
       case outcome of
         Right result → maybe (pure result) rethrowIO late
         Left primary → rethrowIO (primary ∷ ExceptionWithContext SomeException)
@@ -392,7 +431,11 @@ withTerrainService config ports body = do
     acquire limits storage bank storeConfig compileBank = do
       tag <- newUnique
       var <- newTVarIO (initialState config limits)
-      pure (Service tag var config (portAdmission ports) (portLogger ports) (portProbe ports) storage bank (spDirectory sp) storeConfig compileBank)
+      authority <- newTVarIO 0
+      marks <- newTVarIO Map.empty
+      retainedCell <- newTVarIO 0
+      freedCell <- newTVarIO 0
+      pure (Service tag var config (portAdmission ports) (portLogger ports) (portProbe ports) storage bank (spDirectory sp) storeConfig compileBank authority marks retainedCell freedCell)
     -- Close admission, ask the owner to stop, and wait for both proofs: the
     -- owner's worker has published its terminal outcome, and no borrower is
     -- outstanding. There is no deadline and no detach. Any exception received
@@ -588,6 +631,10 @@ inspectEditBankSTM svc = ledgers <$> readTVar (serviceEditBank svc)
 -- returned.
 await ∷ Service → Pending a → IO (Either Settlement a)
 await svc pending = atomically (awaitTake svc pending)
+
+-- | 'await' as a transaction, so a caller can wait for a settlement or for something else ('orElse').
+awaitSTM ∷ Service → Pending a → STM (Either Settlement a)
+awaitSTM = awaitTake
 
 -- | The settlement and the take in one transaction (it waits until the request settles).
 awaitTake ∷ Service → Pending a → STM (Either Settlement a)
@@ -974,6 +1021,60 @@ inspectRetainedChargesSTM ∷ Service → STM (Word64, [(R.HoldId, Word64)])
 inspectRetainedChargesSTM svc = do
   st <- readSt svc
   pure (retainedBankUse st, Map.toList (stateSnapshots st))
+
+-- | A count that moves only when some lease stops being valid (an arena's close, a lease's
+-- release, the service's end): a holder that must notice its authority's loss watches it and
+-- checks its own lease ('arenaStatusSTM') when it moves, rather than reading the service's
+-- whole state, which every load and settlement writes. It writes nothing.
+authorityEpochSTM ∷ Service → STM Word64
+authorityEpochSTM = readTVar . serviceAuthority
+
+-- | The identity cell of the arena a live lease names: a transaction reading the arena's
+-- content and knowledge revisions and its residency generation, from a cell written only
+-- in the transactions that move one of them ('Nothing' once the arena has ended). It is
+-- resolved through the lease once; reading it never reads the service's state, so a
+-- transaction that waits on it wakes for a new version of that arena and for nothing
+-- else, whatever other arenas and requests do. It says nothing about the lease, whose
+-- end 'authorityEpochSTM' reports.
+arenaMarkSTM ∷ Service → ArenaLease → STM (Either Refused (STM (Maybe ArenaMark)))
+arenaMarkSTM svc lease = do
+  st <- readSt svc
+  case leaseOf svc lease st of
+    Left refused → pure (Left refused)
+    Right (_, ls)
+      | not (leaseLive ls) → pure (Left RefusedAuthority)
+      | otherwise → case Map.lookup (leaseArena ls) (stateArenas st) of
+          Nothing → pure (Left RefusedAuthority)
+          Just arena → do
+            cells <- readTVar (serviceArenaMarks svc)
+            cell <- case Map.lookup (leaseArena ls) cells of
+              Just cell → pure cell
+              Nothing → do
+                cell <- newTVar (Just (arenaMark arena))
+                writeTVar (serviceArenaMarks svc) (Map.insert (leaseArena ls) cell cells)
+                pure cell
+            pure (Right (readTVar cell))
+
+-- | What the retained bank holds now: outstanding snapshots' backing, every regional borrow's charge and untaken
+-- results. It moves whenever a regional request is admitted, settles (its reservation becomes its footprint) or is
+-- released, so a caller refused 'BusyRetained' waits on it. It writes nothing.
+retainedBankUseSTM ∷ Service → STM Word64
+retainedBankUseSTM = readTVar . serviceRetainedCell
+
+-- | Whether a regional request of this many regions fits the retained bank now: the bank's use, the request's
+-- reservation and its result record within the bank, by the one predicate 'requestRegionSnapshot' refuses
+-- 'BusyRetained' by.
+-- It reads only the retained bank's own cell, so a caller refused 'BusyRetained' waits on it for exactly the room its
+-- request needs, however the bank moved since. It writes nothing.
+regionalFitsSTM ∷ Service → Int → STM Bool
+regionalFitsSTM svc regions = (\used → regionalFits (serviceConfig svc) used regions) <$> readTVar (serviceRetainedCell svc)
+
+-- | How many times capacity has been freed in this service: a cell bumped once by every event
+-- that may free capacity, including a second one before the owner has retried anything, and at
+-- no other time, which a holder refused for a model capacity waits on instead of the state. It
+-- writes nothing.
+capacityFreedSTM ∷ Service → STM Word64
+capacityFreedSTM = readTVar . serviceFreedCell
 
 inspectSnapshotBytes ∷ Service → IO (Word64, Word64)
 inspectSnapshotBytes svc = do

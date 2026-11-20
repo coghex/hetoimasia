@@ -40,10 +40,16 @@ module Hetoimasia.Terrain.Runtime.Internal.Types
   , Refused (..)
   , BusyWhy (..)
   , CancelResult (..)
-  , Precondition (..)
+  , Precondition (PreconditionWith, Precondition, preconditionArena, preconditionContent, preconditionKnowledge, preconditionGuard)
+  , PreconditionGuard (..)
+  , ServiceIdentity
+  , serviceIdentity
+  , preconditionRevisionsStale
+  , preconditionStale
 
     -- * Configuration and ports
   , Config (..)
+  , StagingAccount (..)
   , ConfigError (..)
   , SessionAdmission (..)
   , Supervisor (..)
@@ -114,6 +120,8 @@ module Hetoimasia.Terrain.Runtime.Internal.Types
 
     -- * State
   , Arena (..)
+  , ArenaMark (..)
+  , arenaMark
   , arenaAuthority
   , arenaRevision
   , FaultRecord (..)
@@ -144,7 +152,7 @@ module Hetoimasia.Terrain.Runtime.Internal.Types
   , initialState
   ) where
 
-import Control.Concurrent.STM (STM, TVar)
+import Control.Concurrent.STM (STM, TVar, orElse)
 import Control.Exception (Exception)
 import Data.ByteString (ByteString)
 import Data.Map.Strict (Map)
@@ -154,7 +162,7 @@ import qualified Data.Sequence as Seq
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Text (Text)
-import Data.Unique (Unique)
+import Data.Unique (Unique, hashUnique)
 import Data.Int (Int64)
 import Data.Word (Word64)
 import Hetoimasia.Foundation.Log (Logger)
@@ -452,10 +460,73 @@ data CancelResult
     CancelForeign
   deriving stock (Eq, Show)
 
--- | A removal's optional content precondition: the incarnation and the content
--- revision a displayed view was built from.
-data Precondition = Precondition !ArenaId !Revision
+-- | A removal's optional precondition: the incarnation and the content revision a displayed view was built from,
+-- optionally the knowledge revision it was built from too, and optionally the holder's own guard. Every part is
+-- checked in the arbitration that commits the removal, atomically with the commit; any part that no longer holds
+-- settles the removal 'StaleView' with nothing changed.
+data Precondition = PreconditionWith
+  { preconditionArena ∷ !ArenaId
+  , preconditionContent ∷ !Revision
+  , preconditionKnowledge ∷ !(Maybe Revision)
+    -- ^ The arena's knowledge revision the view was built from, when it matters.
+  , preconditionGuard ∷ !(Maybe PreconditionGuard)
+  }
   deriving stock (Eq, Show)
+
+-- | The content precondition alone: the incarnation and the content revision. As a pattern it matches only a
+-- precondition with no knowledge revision and no guard.
+pattern Precondition ∷ ArenaId → Revision → Precondition
+pattern Precondition arena revision = PreconditionWith arena revision Nothing Nothing
+
+{-# COMPLETE PreconditionWith #-}
+
+-- | A holder's own condition on a removal, read inside the removal's arbitration in the same transaction as the
+-- commit (a view's coherence, for example: that the picked frame is still the one adopted). It must be a pure read of
+-- transactional state: it runs no IO and no user code and never waits, and a guard that retries is read as not
+-- holding. It imports nothing of its holder into the service: the service sees only this transaction and an
+-- identity, which is what equality and display compare.
+data PreconditionGuard = PreconditionGuard
+  { guardIdentity ∷ !Word64
+  , guardService ∷ !(Maybe ServiceIdentity)
+    -- ^ The service the guard's holder read its view from, when it is bound to one: a guard bound to another service
+    -- never holds here, whatever its transaction answers, since equal arena and revision numbers in two services name
+    -- different terrain.
+  , guardHolds ∷ STM Bool
+  }
+
+-- | A terrain service's identity, for binding what a holder read from it (a pick's guard) to that service alone.
+newtype ServiceIdentity = ServiceIdentity Unique
+  deriving (Eq)
+
+instance Show ServiceIdentity where
+  showsPrec precedence (ServiceIdentity tag) = showParen (precedence > 10) (showString "ServiceIdentity " . shows (hashUnique tag))
+
+instance Eq PreconditionGuard where
+  a == b = guardIdentity a == guardIdentity b
+
+instance Show PreconditionGuard where
+  showsPrec precedence guard' = showParen (precedence > 10) (showString "PreconditionGuard " . shows (guardIdentity guard'))
+
+-- | Whether the revision parts of a precondition no longer hold for an arena of this incarnation, content
+-- revision and knowledge revision: what admission can judge before any work.
+preconditionRevisionsStale ∷ ArenaId → Revision → Revision → Maybe Precondition → Bool
+preconditionRevisionsStale arena content knowledge = \case
+  Nothing → False
+  Just p →
+    preconditionArena p /= arena
+      || preconditionContent p /= content
+      || maybe False (/= knowledge) (preconditionKnowledge p)
+
+-- | Whether a precondition no longer holds, its guard included: what the arbitration of this service judges, in its
+-- transaction. A guard bound to another service is stale before its transaction is read.
+preconditionStale ∷ ServiceIdentity → ArenaId → Revision → Revision → Maybe Precondition → STM Bool
+preconditionStale recipient arena content knowledge precondition
+  | preconditionRevisionsStale arena content knowledge precondition = pure True
+  | otherwise = case precondition >>= preconditionGuard of
+      Nothing → pure False
+      Just guard'
+        | maybe False (/= recipient) (guardService guard') → pure True
+        | otherwise → not <$> (guardHolds guard' `orElse` pure False)
 
 -- ---------------------------------------------------------------------------
 -- Configuration and ports
@@ -490,6 +561,28 @@ data Config = Config
     configConnectivity ∷ !C.ConnectivityLimits
   , -- | The discovery model's bounds (#661: at most 64 structural updates a batch).
     configDiscovery ∷ !D.DiscoveryLimits
+  , -- | An allowance outside the service that its CPU staging is charged to as well, beside the model's own
+    -- staging bank: the session's one CPU render/staging account, in a composition that shares it. 'Nothing' (the
+    -- default) charges nothing outside.
+    configStagingAccount ∷ !(Maybe StagingAccount)
+  }
+
+-- | A CPU allowance outside the service. Every operation is a transaction that never waits: a reservation is all or
+-- nothing ('False' reserves nothing); a release returns what a reservation took; the charge is what the allowance holds
+-- now, from every consumer.
+--
+-- The service charges it, in the transaction that steps its accounting model, the change the step made to the model's
+-- staging use (occupied plus reserved): an increase is reserved, and a reservation the allowance cannot make refuses
+-- the step as the model's own full staging bank would (busy, nothing changed, reporting the account's own limit, its
+-- charge and the increase asked); a decrease is returned. The model, its
+-- admission order and its limit invariants are unchanged; the allowance is one more bound on the same steps. What the
+-- service still holds when it ends is returned after its drain.
+data StagingAccount = StagingAccount
+  { stagingAccountLimit ∷ !Word64
+    -- ^ The most the allowance holds.
+  , stagingAccountReserve ∷ Word64 → STM Bool
+  , stagingAccountRelease ∷ Word64 → STM ()
+  , stagingAccountCharged ∷ STM Word64
   }
 
 -- | The configuration cannot be built: the limits, with the snapshot bank taken out of the
@@ -512,6 +605,8 @@ data ConfigError
   | -- | The query limits let a read keep more runs than its pin credit can hold beside the pages one read
     -- step needs: what the worst read keeps, and what the credit leaves for it.
     ConfigQueryKeep !Integer !Integer
+  | -- | The outside staging account cannot hold the snapshot backing bank: what the bank needs, and the account's limit.
+    ConfigStagingAccount !Word64 !Word64
   deriving stock (Show)
 
 instance Exception ConfigError
@@ -656,7 +751,26 @@ data Service = Service
   , -- | The compile account: the part of the resident bank carved out for compiled
     -- connectivity (every arena's result and the one active compilation's peak).
     serviceCompileBank ∷ !Word64
+  , -- | Bumped in the transaction that ends any lease's validity (an arena's close, a
+    -- lease's release, the service's end) and in no other: a holder watching for its
+    -- authority's loss watches this, not the whole state.
+    serviceAuthority ∷ !(TVar Word64)
+  , -- | Each arena's identity cell ('ArenaMark'), written by every state write that moves
+    -- that arena's content or knowledge revision or its residency generation, and by no
+    -- other; 'Nothing' once the arena has ended. A holder watching for an arena's new
+    -- version watches its cell, not the whole state, which every load writes.
+    serviceArenaMarks ∷ !(TVar (Map ArenaId (TVar (Maybe ArenaMark))))
+  , -- | The retained bank's use, written by the state's one write only when it changes.
+    serviceRetainedCell ∷ !(TVar Word64)
+  , -- | Bumped once by every event that may free capacity (each one that sets the owner's
+    -- freed flag, set or not already): a holder refused for a model capacity waits on it, not
+    -- on the state.
+    serviceFreedCell ∷ !(TVar Word64)
   }
+
+-- | The service's identity, which a holder binds what it read from this service to.
+serviceIdentity ∷ Service → ServiceIdentity
+serviceIdentity = ServiceIdentity . serviceTag
 
 -- ---------------------------------------------------------------------------
 -- Commands and requests
@@ -1006,6 +1120,18 @@ data Arena = Arena
   , arenaLeases ∷ !(Set Word64)
   }
 
+-- | What a holder reads to know an arena has a new version: its committed content and
+-- knowledge revisions and its residency generation.
+data ArenaMark = ArenaMark
+  { markContent ∷ !Revision
+  , markKnowledge ∷ !Revision
+  , markGeneration ∷ !Word64
+  }
+  deriving (Eq, Show)
+
+arenaMark ∷ Arena → ArenaMark
+arenaMark arena = let auth = arenaAuthority arena in ArenaMark (D.authContent auth) (D.authKnowledge auth) (arenaGeneration arena)
+
 -- | The committed authority of an arena: its incarnation and its content, knowledge and
 -- store revisions, from the store's committed header.
 arenaAuthority ∷ Arena → D.Authority
@@ -1260,6 +1386,10 @@ data St = St
     stateDelivering ∷ !(Set RequestId)
   , -- | Something that may free capacity happened since the last retry pass.
     stateFreed ∷ !Bool
+  , -- | The staging bytes the service holds in its outside account ('configStagingAccount'), and that account's
+    -- charge as the service last saw it: a charge changed by another consumer frees capacity for queued work.
+    stateAccountCharged ∷ !Word64
+  , stateAccountSeen ∷ !(Maybe Word64)
   , -- | A dispatch found nothing to run since the last time capacity freed.
     stateDispatchIdle ∷ !Bool
   , stateDefects ∷ ![DefectRecord]
@@ -1369,6 +1499,8 @@ initialState config limits =
     , stateRegional = Map.empty
     , stateDelivering = Set.empty
     , stateFreed = False
+    , stateAccountCharged = 0
+    , stateAccountSeen = Nothing
     , stateDispatchIdle = False
     , stateDefects = []
     , stateDefectCount = 0

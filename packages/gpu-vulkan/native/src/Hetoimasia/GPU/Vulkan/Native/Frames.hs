@@ -200,6 +200,8 @@ module Hetoimasia.GPU.Vulkan.Native.Frames
     -- * The frames
   , Frames
   , newFrames
+  , CompletionHold (..)
+  , newFramesWith
 
     -- * Acquisition
   , tryAcquireFrame
@@ -321,6 +323,8 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.State
   , SlotView (..)
   , Submitted (..)
   , newFrames
+  , CompletionHold (..)
+  , newFramesWith
   , readFrameStandings
   , readOutstandingSubmissions
   , enableCompletionLog
