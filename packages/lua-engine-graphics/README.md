@@ -564,9 +564,13 @@ opened at the view's commit and forgotten at its end, with whatever of it was
 recorded or noted and not yet promoted. A caller that sets
 `vulkanFrameObserver` after `configureScenes` keeps the receipts with
 `sceneFrameObserver`. A window view plans for the metrics of its window's
-latest recorded frame (`latestFrameMetrics`), kept only while a view watches
-that window; an open on a target with no metrics yet publishes the real empty
-revision in its commit, which asks for that first frame.
+latest recorded frame (`latestFrameMetrics`), kept for the most recently drawn
+window attachments (a watched one is never evicted). An open on a target that
+shows nothing and has no metrics yet publishes the real empty revision in its
+commit, which asks for that first frame. A target already showing a scene (an
+M1 scene, say) keeps it through the attach, and through a refused first
+candidate, until the view's first revision is published; its frame gives the
+metrics.
 
 ### One owner
 
@@ -587,10 +591,11 @@ Two threads, both started and joined inside `withTerrainViews`, own nothing:
   thread is measured per owner step and per presentation interval, for its
   planning (`servicePlanningStepMax`, `servicePlanningMax`) and for all of it
   (`serviceOwnerStepMax`, `serviceOwnerMax`);
-- the **watcher** blocks on the open views' arena mark cells (`arenaMarkSTM`)
-  and the terrain service's authority epoch (`authorityEpochSTM`) and kicks,
-  so an edit, a discovery or a lost lease reaches an idle window; and on the
-  views' own outstanding work: a kick the owner's queue refused, a barrier the
+- the **watcher** blocks on the open views' arena mark cells (`arenaMarkSTM`),
+  the terrain service's authority epoch (`authorityEpochSTM`) and each open
+  view's target usability and metrics, and kicks, so an edit, a discovery, a
+  lost lease, a retired target or a first frame reaches an idle view; and on
+  the views' own outstanding work: a kick the owner's queue refused, a barrier the
   release lane has room for, a chunk that can be released, a disposal the
   backend confirmed, an offscreen batch that completed. It also observes the
   owner's end (its action gate closed by exit or failure, an admission refused
@@ -615,8 +620,9 @@ Two threads, both started and joined inside `withTerrainViews`, own nothing:
    `profileRequestRegions` regions; its borrow is taken and returned in one
    transaction as soon as it settles, and returned if cancellation lost the
    race. The first round copies the camera's anchor, a pending move's
-   destination and then the last plan's regions; up to `profileRounds` rounds
-   copy what the camera or the plan's visible demand still lacks. Every round is
+   destination, then the last plan's visible regions and the rest it copied;
+   up to `profileRounds` rounds copy what the camera or the plan's visible
+   demand still lacks. Every round is
    bounded by `profileRegions` in all. Each copy's input runs and intervals are
    counted as the planner is handed them and checked against `profileRuns` as
    the copy is accepted. Copies of different versions are never combined.
@@ -635,7 +641,9 @@ Two threads, both started and joined inside `withTerrainViews`, own nothing:
    renderer's storage window as a frame binds them, or more new chunks than the
    target's free slots.
 4. **Building.** At most `profileBuilds` chunks a step; each occupies a slot
-   from its build, and is handed to the candidate in the transaction after its
+   from just before its build (so a target counts against `W` while its first
+   build is under way; a refused build returns the slot), and is handed to the
+   candidate in the transaction after its
    build, or to disposal if the stage was replaced meanwhile. Upload
    backpressure keeps the built prefix.
 5. **Publication**, once every chunk is ready, in the transaction that rechecks
@@ -646,9 +654,13 @@ Two threads, both started and joined inside `withTerrainViews`, own nothing:
    waits until one of them can no longer be drawn. The view's runtime demand is
    its plan's visible regions before its prefetch.
 
-A plan whose visible demand names regions its copies did not reach is still
-published (that coverage is loading). The view prepares again for those within
-`profileRegions` that lacked a copy round; those beyond it stay loading.
+Current visible demand has priority over earlier copies: a plan whose visible
+regions do not fit beside what was copied (a previous camera's demand, after a
+move) copies them afresh in the next round. A plan whose visible demand alone
+exceeds `profileRegions` is refused with that limit (`LimitRegions`), and the
+drawing is kept. Only a plan whose visible regions fit but had no copy round
+left is published with that coverage loading, and the view prepares again for
+it.
 
 ### Limits and the reservation
 

@@ -1,22 +1,24 @@
 # TRA-9-V2-A evidence: terrain views publish retained terrain
 
-Issue #714. Code head `ca55b1f3` (round 1's repairs; each row names its head). Device: Apple M3 Max, MoltenVK (the
-pinned driver). Contract: the graphics package's README, "Terrain views (TRA-9)".
+Issue #714. Code head `7a53091e` (round 3's repairs, quiet window w714f). Device: Apple M3 Max, MoltenVK (the pinned
+driver). Contract: the graphics package's README, "Terrain views (TRA-9)".
 
 | Check | Command | Result |
 | --- | --- | --- |
-| Native, surface-free target | `HETOIMASIA_NATIVE_SESSION=desktop bash tools/vulkan/run.sh native hetoimasia-lua-engine-graphics:test:lua-engine-graphics-native-tests -- --match 'terrain views'` | `ca55b1f3`: 1/1, the drawn revision covering 25,600 of 25,600 pixels, an edit drawn again, every chunk retired after the handback |
-| Native, real window | the same with `-- --terrain-views-full` | `ca55b1f3`: 1/1, opened directly on a fresh window; the receipt advanced at the presentation's enqueue (480 x 320 logical, 960 x 640 framebuffer) through zoom 0.5, 2 and 1; no frame metrics kept after the close |
-| Headless | `bash tools/vulkan/run.sh test hetoimasia-lua-engine-graphics:test:lua-engine-graphics-tests` | `ca55b1f3`: 362/362, the `terrain views (TRA-9 v2)` group's 44 included |
+| Native, surface-free target | `HETOIMASIA_NATIVE_SESSION=desktop bash tools/vulkan/run.sh native hetoimasia-lua-engine-graphics:test:lua-engine-graphics-native-tests -- --match 'terrain views'` | 1/1, the drawn revision covering 25,600 of 25,600 pixels, an edit drawn again, every chunk retired after the handback |
+| Native, real window | the same with `-- --terrain-views-full` | 1/1, opened directly on a fresh window; each of zoom 0.5, 2 and 1 drawn as a new revision presented with that zoom (480 x 320 logical, 960 x 640 framebuffer) |
+| Headless | `bash tools/vulkan/run.sh test hetoimasia-lua-engine-graphics:test:lua-engine-graphics-tests` | 365/365, the `terrain views (TRA-9 v2)` group's 47 included |
 
 **Planning time (acceptance 4).** Budget: one refresh of a 60 Hz display, 16,666,667 ns. Before the planner moved
 off the owner's thread (`7fcd3eb6`): 154,147,000 ns between two presentations' enqueues, 65,865,000 ns in one owner
-step. At `ca55b1f3`: owner-thread planning (the reuse comparison and the copies' run counts) 580,000 ns between two
-presentations and 389,000 ns in one owner step; the views' whole work on the owner's thread (planning, camera,
-builds, publication, retirement) 8,318,000 ns between two presentations and 6,011,000 ns in one owner step: within
+step. At `7a53091e`: owner-thread planning (the reuse comparison and the copies' run counts) 540,000 ns between two
+presentations and 439,000 ns in one owner step; the views' whole work on the owner's thread (planning, camera,
+builds, publication, retirement) 4,170,000 ns between two presentations and 2,204,000 ns in one owner step: within
 the budget.
 
 **Admission (acceptance 2).** Default profile: 2 targets, 128 slots of 32 KiB, 16,384 quads, 8,192 pending spans,
 512 copied regions, 131,072 input runs and intervals, 64 regions a request, 16 builds a step, 3 copy rounds. Declared
-reservation 101,744,640 bytes. A full default-profile view over the fixture arena: 6 chunks occupied (`ca55b1f3`);
-peak live heap of the whole headless test process 8,330,944 bytes (`750252b3`, `+RTS -T`, `max_live_bytes`).
+reservation 101,744,640 bytes. A full default-profile view over the fixture arena: 6 chunks occupied; peak live heap
+of the whole headless test process 4,739,184 bytes (`bash tools/vulkan/run.sh test
+hetoimasia-lua-engine-graphics:test:lua-engine-graphics-tests -- --match "/terrain views (TRA-9 v2)/evidence/" +RTS
+-T -RTS`, `max_live_bytes`).
