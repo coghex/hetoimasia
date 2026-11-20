@@ -1801,6 +1801,42 @@ hardening = describe "wakes, ownership and limits" $ do
       `shouldReturn` True
     readTVarIO letGo `shouldReturn` True
 
+  it "takes the release answers that already arrived when the graphics owner ends, keeping nothing proved as evidence" $
+    withViews $ \v → do
+      let owner = vOwner v
+      -- the job the views hand at their scope's exit is run here, step by step, as the keeper would run it
+      captured ← newTVarIO Nothing
+      let ports = (vPorts v) {portOwner = (portOwner (vPorts v)) {ownerKeep = \job → True <$ writeTVar captured (Just job)}}
+      modelWindow (vModel v) 2
+      inner ← withTerrainViews testConfig ports $ \views → do
+        view ← inInstance (vComp v) (vVm v) "i" (attachView views (requestFor v (target v 2))) >>= either (fail . show) pure >>= bounded . awaitAttach >>= \case
+          SettledOk view' → pure view'
+          _ → fail "the attachment did not succeed"
+        _ ← awaitPublished v 2
+        atomically (writeTVar (foLaneFull owner) True)
+        bounded (closeView view)
+        pure views
+      job ← atomically (readTVar captured) >>= maybe (fail "nothing was handed over") pure
+      atomically (terrainViewsGpuCharged inner) >>= (`shouldSatisfy` (> 0))
+      -- the host can prove the retirements: the job runs until their release is in flight, then the owner answers it
+      atomically (writeTVar (foLaneFull owner) False)
+      removeWindow (vModel v) 2
+      actions ← readTVarIO (foReleaseActions owner)
+      let releasing = any ((== "releasing") . snd) <$> terrainViewsRetiring inner
+          stepUntilReleasing = do
+            now ← atomically releasing
+            unless now (atomically (keptReady job >>= check >> keptStep job) >> stepUntilReleasing)
+      bounded stepUntilReleasing
+      bounded (atomically (readTVar (foReleaseActions owner) >>= check . (> actions)))
+      atomically (keptReady job) `shouldReturn` True
+      -- the owner ends with the answer not yet taken: the job is stuck, and its end takes the answer first
+      atomically (writeTVar (foEnded owner) True)
+      atomically (keptStuck job) `shouldReturn` True
+      atomically (keptEnd job)
+      atomically (terrainViewsGpuCharged inner) `shouldReturn` 0
+      atomically (terrainViewsUnproved inner) `shouldReturn` []
+      atomically (terrainViewsFailures inner) >>= (`shouldSatisfy` not . any ("could not be proved" `Text.isInfixOf`))
+
   it "cancels and collects an abandoned copy however the hook before its cancellation ends, leaving the terrain service no regional charge" $ do
     gate ← newTVarIO False
     armed ← newTVarIO False
