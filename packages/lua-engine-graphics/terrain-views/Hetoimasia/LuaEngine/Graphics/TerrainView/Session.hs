@@ -82,7 +82,7 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView.Session
   ) where
 
 import Control.Concurrent.STM
-import Control.Exception (Exception, evaluate, mask, onException, throwIO, uninterruptibleMask_)
+import Control.Exception (Exception, SomeAsyncException, displayException, evaluate, fromException, mask, onException, throwIO, try, uninterruptibleMask_)
 import Control.Monad (forM, forM_, unless, void, when)
 import Data.Foldable (for_, toList)
 import Data.List (sortOn)
@@ -124,6 +124,7 @@ import qualified Hetoimasia.Terrain.Discovery as D
 import Hetoimasia.Terrain.Render2D.Camera (CameraConfig, CameraError, CameraState, Command (..), FollowOutcome (..), JumpEvent (..), JumpId (..), JumpTarget (..), PendingJump (..), Step (..), applyCommand, cancelJump, camAnchorX, camAnchorY, camClip, camPending, completeJump, defaultCameraConfig, newCamera, refollow)
 import Hetoimasia.Terrain.Render2D.Cells
 import Hetoimasia.Terrain.Render2D.Facts (ChunkDemand (..), ChunkKey (..), Demand (..), TerrainFacts (..))
+import Hetoimasia.Terrain.Render2D.Knowledge (Knowledge)
 import Hetoimasia.Terrain.Render2D.Material (Adapted (..), AdaptedQuad (..), adaptCells, adaptedInstance, terrainView)
 import Hetoimasia.Terrain.Render2D.Presentation (LightSettings)
 import Hetoimasia.Terrain.Render2D.Projection (ViewSetup (..))
@@ -241,8 +242,20 @@ data Prep = Prep
 data Stage
   = Idle
   | Copying !Prep ![RegionCoord] ![Runtime.RegionSnapshot] !(Maybe InFlight)
-  | Planning !Prep !CopySet !CellInputs !CellPrep
+  | Inputting !Prep ![Runtime.RegionSnapshot] !(TMVar (Either BindingLimit (CopySet, TerrainFacts, Knowledge)))
+    -- ^ The planner makes the copies' inputs.
+  | Planning !Prep !CopySet !(TMVar (Either BindingLimit Planned))
+    -- ^ The planner makes the plan and, when its copies suffice, the candidate's parts.
   | Building !Prep !Candidate
+
+-- What the planner hands back for a plan: the plan, its visible and prefetch regions, and either the regions another
+-- copy round asks for or the adapted candidate's parts (with whether the visible demand was left incomplete).
+data Planned = Planned
+  { plannedPlan ∷ !CellPlan
+  , plannedVisible ∷ ![RegionCoord]
+  , plannedPrefetch ∷ ![RegionCoord]
+  , plannedNext ∷ !(Either [RegionCoord] (Adapted, [(PartKey, [Instance], [MaterialRecord])], Bool))
+  }
 
 data Candidate = Candidate
   { cdPlan ∷ !CellPlan
@@ -363,6 +376,8 @@ data TerrainViews k = TerrainViews
     -- ^ The planning time of the owner step under way.
   , svPlanningStepMax ∷ !(TVar Word64)
     -- ^ The greatest planning time of one owner step.
+  , svJobs ∷ !(TVar (Map Word64 (IO ())))
+    -- ^ The planner's queue: each view's latest job, which a newer one replaces before it starts.
   , svReserved ∷ !Integer
   }
 
@@ -398,6 +413,7 @@ withTerrainViews config ports body = do
       <*> newTVarIO 0
       <*> newTVarIO 0
       <*> newTVarIO 0
+      <*> newTVarIO Map.empty
       <*> pure allowance
   let listen = do
         ledgerListen (portLedger ports) (kick service)
@@ -415,13 +431,15 @@ withTerrainViews config ports body = do
       restore
         ( withWorkerGroup $ \group → do
             started ← startWorker group (workerDefinition "terrain-views-watcher" (\_ → pure ()) (\token () → watch service (stopRequested token)))
-            case started of
-              Started worker → do
-                result ← body service `onException` (atomically (requestStop worker) >> void (closeWorkerGroup group))
-                atomically (requestStop worker)
+            planner ← startWorker group (workerDefinition "terrain-views-planner" (\_ → pure ()) (\token () → runPlanner service (stopRequested token)))
+            case (started, planner) of
+              (Started worker, Started planning) → do
+                let stop = atomically (requestStop worker >> requestStop planning)
+                result ← body service `onException` (stop >> void (closeWorkerGroup group))
+                stop
                 _ ← closeWorkerGroup group
                 pure result
-              _ → throwIO (TerrainViewsWatcher "the watcher did not start")
+              _ → throwIO (TerrainViewsWatcher "the watcher or the planner did not start")
         )
         `onException` cleanup
     cleanup
@@ -450,6 +468,33 @@ watch service stopping = loop
           if wanted && not scheduled
             then admit service >>= check
             else retry
+
+-- The planner: one thread that runs the views' pure planning, latest job first come, and hands each result back to
+-- its stage, asking for the owner's next step. It owns nothing; a result whose stage was abandoned is dropped.
+runPlanner ∷ (Ord k, Show k) ⇒ TerrainViews k → STM Bool → IO ()
+runPlanner service stopping = loop
+  where
+    loop =
+      atomically ((stopping >>= check >> pure Nothing) `orElse` (Just <$> takeJob)) >>= \case
+        Nothing → pure ()
+        Just job → job >> loop
+    takeJob = do
+      jobs ← readTVar (svJobs service)
+      case Map.minViewWithKey jobs of
+        Nothing → retry
+        Just ((_, job), rest) → job <$ writeTVar (svJobs service) rest
+
+-- Queue a view's planning job: the work, evaluated on the planner's thread, then its result handed to the box and the
+-- owner kicked. A failure of the pure work is the job's result, never the planner's end.
+submitJob ∷ (Ord k, Show k) ⇒ TerrainViews k → ViewState k → (() → Either BindingLimit a) → TMVar (Either BindingLimit a) → STM ()
+submitJob service vs work box =
+  modifyTVar' (svJobs service) . Map.insert (vsId vs) $ do
+    result ←
+      try (evaluate (work ())) >>= \case
+        Left failure | Just (_ ∷ SomeAsyncException) ← fromException failure → throwIO failure
+        Left failure → pure (Left (LimitFailure ("the planner raised: " <> Text.pack (displayException failure))))
+        Right value → pure value
+    atomically (void (tryPutTMVar box result) >> kick service)
 
 -- | Ask for the owner's next step: one admission, unless one is already queued. Never waits.
 kick ∷ (Ord k, Show k) ⇒ TerrainViews k → STM ()
@@ -801,6 +846,7 @@ takeStage ∷ TerrainViews k → ViewState k → STM (Maybe InFlight)
 takeStage service vs = do
   stage ← readTVar (vsStage vs)
   writeTVar (vsStage vs) Idle
+  modifyTVar' (svJobs service) (Map.delete (vsId vs))
   modifyTVar' (vsStageSerial vs) (+ 1)
   case stage of
     Building _ candidate → do
@@ -866,9 +912,12 @@ stepView service hands vs = do
         Copying prep wanted taken flight
           | stale prep basis → abandon service vs serial >> pure True
           | otherwise → stepCopying service vs serial prep wanted taken flight
-        Planning prep copies inputs prepared
+        Inputting prep taken box
           | stale prep basis → abandon service vs serial >> pure True
-          | otherwise → stepPlanning service vs serial prep copies inputs prepared
+          | otherwise → stepInputting service vs serial prep taken box
+        Planning prep copies box
+          | stale prep basis → abandon service vs serial >> pure True
+          | otherwise → stepPlanning service vs serial prep copies box
         Building prep candidate
           | stale prep basis → abandon service vs serial >> pure True
           | otherwise → stepBuilding service hands vs serial prep candidate
@@ -1014,30 +1063,48 @@ takeCopy terrain flight = \case
   Failed why → Left ("the copy failed: " <> Text.pack (show why)) <$ retireSTM terrain (flightRequest flight)
   Cancelled → pure (Left "the copy was cancelled")
 
--- Combine the copies, settle the camera with their facts, and start planning (or copy again for what the camera
--- itself still needs).
+-- The copies are complete: the planner makes their inputs.
 toPlanning ∷ (Ord k, Show k) ⇒ TerrainViews k → ViewState k → Word64 → Prep → [Runtime.RegionSnapshot] → IO Bool
-toPlanning service vs serial prep taken = do
-  let profile = tvProfile (svConfig service)
-      basis = prepBasis prep
-  case combineCopies taken of
-    Left _ → False <$ atomically (refuse service vs serial basis (LimitRuntime "the copies are of different versions"))
-    Right copies
-      | runs > profileRuns profile → False <$ atomically (refuse service vs serial basis (LimitRuns runs (profileRuns profile)))
-      | otherwise → case planInputs (ChangeLimits (profileRuns profile)) copies of
-          Left why → False <$ atomically (refuse service vs serial basis (LimitFailure ("the copies could not be planned from: " <> Text.pack (show why))))
-          Right (facts, knowledge) → atomically $ do
-            (camera, extra) ← settleCamera service vs facts
-            let fresh = filter (`Set.notMember` prepRegions prep) extra
-            if not (null fresh) && prepRounds prep > 0
-              then writeBack service vs serial (Copying prep {prepRounds = prepRounds prep - 1, prepRegions = prepRegions prep <> Set.fromList fresh} fresh taken Nothing)
-              else do
-                let inputs = CellInputs (CellRequest (factsVersions facts) camera (setupFor (prepMetrics prep)) (cellConfig service)) facts knowledge (styleSnapshot (vsStyle vs))
-                case startCells inputs of
-                  Left why → False <$ refuse service vs serial basis (LimitFailure ("the plan could not start: " <> Text.pack (show why)))
-                  Right prepared → writeBack service vs serial (Planning prep copies inputs prepared)
+toPlanning service vs serial prep taken = atomically $ do
+  box ← newEmptyTMVar
+  kept ← writeBack service vs serial (Inputting prep taken box)
+  when kept (submitJob service vs (\() → inputsOf (tvProfile (svConfig service)) taken) box)
+  pure False
+
+-- The copies' inputs: combined into one version, within the profile's runs, as the planner's facts and knowledge.
+inputsOf ∷ ViewProfile → [Runtime.RegionSnapshot] → Either BindingLimit (CopySet, TerrainFacts, Knowledge)
+inputsOf profile taken = case combineCopies taken of
+  Left _ → Left (LimitRuntime "the copies are of different versions")
+  Right copies
+    | runs > profileRuns profile → Left (LimitRuns runs (profileRuns profile))
+    | otherwise → case planInputs (ChangeLimits (profileRuns profile)) copies of
+        Left why → Left (LimitFailure ("the copies could not be planned from: " <> Text.pack (show why)))
+        Right (facts, knowledge) → facts `seq` knowledge `seq` Right (copies, facts, knowledge)
   where
     runs = sum (map copyRuns taken)
+
+-- The inputs are made: the camera settles with their facts (on the owner, where the camera lives), then another copy
+-- round for what the camera itself lacks, or the plan, which the planner makes.
+stepInputting ∷ (Ord k, Show k) ⇒ TerrainViews k → ViewState k → Word64 → Prep → [Runtime.RegionSnapshot] → TMVar (Either BindingLimit (CopySet, TerrainFacts, Knowledge)) → IO Bool
+stepInputting service vs serial prep taken box =
+  atomically $
+    tryReadTMVar box >>= \case
+      Nothing → pure False
+      Just (Left limit) → False <$ refuse service vs serial (prepBasis prep) limit
+      Just (Right (copies, facts, knowledge)) → do
+        (camera, extra) ← settleCamera service vs facts
+        let fresh = filter (`Set.notMember` prepRegions prep) extra
+        if not (null fresh) && prepRounds prep > 0
+          then writeBack service vs serial (Copying prep {prepRounds = prepRounds prep - 1, prepRegions = prepRegions prep <> Set.fromList fresh} fresh taken Nothing)
+          else do
+            light ← readTVar (vsLight vs)
+            planned ← newEmptyTMVar
+            let inputs = CellInputs (CellRequest (factsVersions facts) camera (setupFor (prepMetrics prep)) (cellConfig service)) facts knowledge (styleSnapshot (vsStyle vs))
+            kept ← writeBack service vs serial (Planning prep copies planned)
+            when kept (submitJob service vs (\() → planned' inputs light) planned)
+            pure False
+  where
+    planned' inputs light = forcedPlanned (planOf service (vsStyle vs) light inputs prep)
 
 -- The input runs and intervals of one copy: every removed interval, and every knowledge run of a region that is not
 -- one class.
@@ -1107,59 +1174,71 @@ setupFor metrics =
 -- ---------------------------------------------------------------------------
 -- Planning
 
--- One planning quantum, timed on the owner's thread; at its end, another copy round for the visible demand the copies
--- lack, or the candidate's chunks and its admission.
-stepPlanning ∷ (Ord k, Show k) ⇒ TerrainViews k → ViewState k → Word64 → Prep → CopySet → CellInputs → CellPrep → IO Bool
-stepPlanning service vs serial prep copies inputs prepared = case cellPrepProgress prepared of
-  Working → timed service (\() → forcedStep (stepCells inputs prepared)) >>= \case
-    Left why → False <$ atomically (refuse service vs serial (prepBasis prep) (LimitFailure ("a plan step failed: " <> Text.pack (show why))))
-    Right next → atomically (writeBack service vs serial (Planning prep copies inputs next))
-  _ → timed service (\() → forcedPlan (cellPlanOf inputs prepared)) >>= \case
-    Left why → False <$ atomically (refuse service vs serial (prepBasis prep) (LimitFailure ("the plan could not finish: " <> Text.pack (show why))))
-    Right plan → do
-      let profile = tvProfile (svConfig service)
-          visible = regionsOf (cdVisible (cellPlanDemand plan))
-          room = profileRegions profile - Set.size (prepRegions prep)
-          unasked = filter (`Set.notMember` prepRegions prep) (ordered (anchorRegion (crCamera (inputsRequest inputs))) visible)
-          missing = take room unasked
-      if not (null missing) && prepRounds prep > 0
-        then atomically (writeBack service vs serial (Copying prep {prepRounds = prepRounds prep - 1, prepRegions = prepRegions prep <> Set.fromList missing} missing (copySnapshots copies) Nothing))
-        else do
-          light ← readTVarIO (vsLight vs)
-          admitted ← timed service (\() → forcedCandidate (candidateOf service vs plan copies light))
-          case admitted of
-            Left limit → False <$ atomically (refuse service vs serial (prepBasis prep) limit)
-            Right (adapted, wanted) → do
-              atomically (writeTVar (vsDemand vs) (Set.toList (prepRegions prep) <> visible))
-              setDemand service vs (visible <> regionsOf (cdPrefetch (cellPlanDemand plan)))
-              parts ← readTVarIO (vsParts vs)
-              let reused = Map.mapMaybe id (Map.intersectionWith (\part (_, instances, records) → if partInstances part == instances && partRecords part == records then Just part else Nothing) parts (Map.fromList [(key, (key, i, r)) | (key, i, r) ← wanted]))
-                  toBuild = [w | w@(key, _, _) ← wanted, Map.notMember key reused]
-              atomically $ do
-                occupied ← Map.findWithDefault 0 (vtKey (vsTarget vs)) <$> readTVar (svSlots service)
-                let free = profileSlots profile - occupied
-                if length toBuild > free
-                  then False <$ refuse service vs serial (prepBasis prep) (LimitSlots (length toBuild) free)
-                  else writeBack service vs serial (Building prep (Candidate plan copies adapted toBuild Map.empty reused (not (null missing))))
+-- The planner's whole work for one preparation, pure: the plan run to its end, then either another copy round for the
+-- visible demand its copies lack, or the candidate's parts.
+planOf ∷ TerrainViews k → ViewStyle → LightSettings → CellInputs → Prep → Either BindingLimit Planned
+planOf service style light inputs prep = do
+  started ← either (failed "the plan could not start") Right (startCells inputs)
+  finished ← steps started
+  plan ← either (failed "the plan could not finish") Right (cellPlanOf inputs finished)
+  let profile = tvProfile (svConfig service)
+      visible = regionsOf (cdVisible (cellPlanDemand plan))
+      prefetch = regionsOf (cdPrefetch (cellPlanDemand plan))
+      room = profileRegions profile - Set.size (prepRegions prep)
+      unasked = filter (`Set.notMember` prepRegions prep) (ordered (anchorRegion (crCamera (inputsRequest inputs))) visible)
+      missing = take room unasked
+  if not (null missing) && prepRounds prep > 0
+    then Right (Planned plan visible prefetch (Left missing))
+    else do
+      (adapted, parts) ← candidateOf service style plan light
+      Right (Planned plan visible prefetch (Right (adapted, parts, not (null missing))))
+  where
+    failed what why = Left (LimitFailure (what <> ": " <> Text.pack (show why)))
+    steps prepared = case cellPrepProgress prepared of
+      Working → either (failed "a plan step failed") Right (stepCells inputs prepared) >>= steps
+      _ → Right prepared
 
--- The planner's work done, not deferred past the timing: a step's preparation to its strict fields, a plan to its
--- quads, pending spans and demand, a candidate to every part's instances and records.
-forcedStep ∷ Either e CellPrep → Either e CellPrep
-forcedStep = \case
-  Right next → next `seq` Right next
+-- The planner's work done before it is handed back: the plan's quads, pending spans and demand, every part's
+-- instances and records.
+forcedPlanned ∷ Either BindingLimit Planned → Either BindingLimit Planned
+forcedPlanned = \case
+  Right planned →
+    let plan = plannedPlan planned
+        parts = case plannedNext planned of
+          Right (_, made, _) → foldr (\(_, instances, records) rest → foldr seq () instances `seq` foldr seq () records `seq` rest) () made
+          Left missing → foldr seq () missing
+     in length (cellPlanQuads plan) `seq` length (cellPlanPending plan) `seq` length (plannedVisible planned) `seq` length (plannedPrefetch planned) `seq` parts `seq` Right planned
   other → other
 
-forcedPlan ∷ Either e CellPlan → Either e CellPlan
-forcedPlan = \case
-  Right plan → length (cellPlanQuads plan) `seq` length (cellPlanPending plan) `seq` cellPlanDemand plan `seq` Right plan
-  other → other
+-- The plan is made: another copy round, or the candidate's admission, on the owner: its parts equal to a published
+-- part are reused by reference, and what is left must fit the target's free slots.
+stepPlanning ∷ (Ord k, Show k) ⇒ TerrainViews k → ViewState k → Word64 → Prep → CopySet → TMVar (Either BindingLimit Planned) → IO Bool
+stepPlanning service vs serial prep copies box =
+  atomically (tryReadTMVar box) >>= \case
+    Nothing → pure False
+    Just (Left limit) → False <$ atomically (refuse service vs serial (prepBasis prep) limit)
+    Just (Right planned) → case plannedNext planned of
+      Left missing → atomically (writeBack service vs serial (Copying prep {prepRounds = prepRounds prep - 1, prepRegions = prepRegions prep <> Set.fromList missing} missing (copySnapshots copies) Nothing))
+      Right (adapted, wanted, incomplete) → do
+        let profile = tvProfile (svConfig service)
+            plan = plannedPlan planned
+        atomically (writeTVar (vsDemand vs) (Set.toList (prepRegions prep) <> plannedVisible planned))
+        setDemand service vs (plannedVisible planned <> plannedPrefetch planned)
+        parts ← readTVarIO (vsParts vs)
+        -- the reuse comparison is the owner's own planning work, timed into the frame's total
+        (reused, toBuild) ← timed service $ \() →
+          let byKey = Map.fromList [(key, (instances, records)) | (key, instances, records) ← wanted]
+              kept = Map.mapMaybe id (Map.intersectionWith (\part (instances, records) → if partInstances part == instances && partRecords part == records then Just part else Nothing) parts byKey)
+              fresh = [w | w@(key, _, _) ← wanted, Map.notMember key kept]
+           in Map.size kept `seq` length fresh `seq` (kept, fresh)
+        atomically $ do
+          occupied ← Map.findWithDefault 0 (vtKey (vsTarget vs)) <$> readTVar (svSlots service)
+          let free = profileSlots profile - occupied
+          if length toBuild > free
+            then False <$ refuse service vs serial (prepBasis prep) (LimitSlots (length toBuild) free)
+            else writeBack service vs serial (Building prep (Candidate plan copies adapted toBuild Map.empty reused incomplete))
 
-forcedCandidate ∷ Either e (Adapted, [(PartKey, [Instance], [MaterialRecord])]) → Either e (Adapted, [(PartKey, [Instance], [MaterialRecord])])
-forcedCandidate = \case
-  Right (adapted, parts) → foldr (\(_, instances, records) rest → foldr seq () instances `seq` foldr seq () records `seq` rest) () parts `seq` Right (adapted, parts)
-  other → other
-
--- Time pure work on the owner's thread, into the current frame's planning total.
+-- Time the owner's own pure work, into the current frame's and the current step's planning totals.
 {-# NOINLINE timed #-}
 
 -- The work is a function of @()@, applied and evaluated between the two readings of the clock, so the compiler cannot
@@ -1177,9 +1256,9 @@ timed service work = do
 -- Adapt the plan and group it into the candidate's chunks: render regions of 16 x 16 cells of the rotated view frame,
 -- each split into parts of at most a chunk's instances, each part with the distinct records its quads use. Refused
 -- when its records cannot fit the renderer's storage window as a frame binds them.
-candidateOf ∷ TerrainViews k → ViewState k → CellPlan → CopySet → LightSettings → Either BindingLimit (Adapted, [(PartKey, [Instance], [MaterialRecord])])
-candidateOf service vs plan _ light = do
-  adapted ← either (Left . LimitFailure . ("the plan could not be adapted: " <>) . Text.pack . show) Right (adaptCells (styleBound (vsStyle vs)) light (styleSnapshot (vsStyle vs)) plan)
+candidateOf ∷ TerrainViews k → ViewStyle → CellPlan → LightSettings → Either BindingLimit (Adapted, [(PartKey, [Instance], [MaterialRecord])])
+candidateOf service style plan light = do
+  adapted ← either (Left . LimitFailure . ("the plan could not be adapted: " <>) . Text.pack . show) Right (adaptCells (styleBound style) light (styleSnapshot style) plan)
   let owner = portOwner (svPorts service)
       material = ownerMaterial owner
       perPart = chunkInstances (tvProfile (svConfig service))
@@ -1427,6 +1506,7 @@ readView (TerrainView service vs) =
     stageName = \case
       Idle → "idle"
       Copying _ wanted taken flight → "copying (" <> Text.pack (show (length wanted)) <> " to ask, " <> Text.pack (show (length taken)) <> " taken, " <> (if isNothing flight then "none" else "one") <> " in flight)"
+      Inputting {} → "making inputs"
       Planning {} → "planning"
       Building _ candidate → "building (" <> Text.pack (show (length (cdWanted candidate))) <> " to build)"
 
