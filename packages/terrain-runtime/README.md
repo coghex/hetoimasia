@@ -108,6 +108,11 @@ TRA-5 (#641) at the manager's authorization under the owner's 2026-11-09 decisio
   host that composes over a service asks it, instead of being handed a configuration that might differ from the one the service enforces
   (the Lua adapter reads every limit it applies from it, and refuses a service configured above the caps Lua is promised). A terrain-runtime
   example reports the limits a service was built with whatever configuration a caller holds.
+* `authorityEpochSTM service` and `arenaMarkSTM service lease` are cells a holder waits on instead of the state, which every load
+  writes. The epoch moves only in the transactions that end a lease's validity (an arena's close, a lease's release, the service's end).
+  An arena's mark (`ArenaMark`: its content and knowledge revisions and its residency generation) is resolved through a live lease once
+  and written by the state's one write (`putSt`) only when one of them moves; it is `Nothing` once the arena has ended, and says nothing
+  of the lease, whose end the epoch reports.
 * `retireSTM service request` and `releaseArenaLeaseSTM service lease` are `retire` and `releaseLease` as transactions (`Settlement`): the same functions, writing the same
   state, for a host that gives a result or a lease back from inside a transaction of its own. The Lua host gives a request's credit back in the
   transaction that takes the result or accounts its work, on whichever thread does, so it retires the result in that transaction instead of
@@ -115,7 +120,9 @@ TRA-5 (#641) at the manager's authorization under the owner's 2026-11-09 decisio
 
 ## State, owner, thread and lifetime
 
-All mutable state is one record behind one `TVar`. Admission, cancellation, release
+All mutable state is one record behind one `TVar`, written only through `putSt`,
+which also brings each arena's identity cell (`arenaMarkSTM`) up to the state it
+writes. Admission, cancellation, release
 and closure run as transactions on the caller's thread and write only
 **bookkeeping**: the request table, leases, names, views and the accounting model.
 The owner thread is the **sole writer of arena contents**: the resident detail, the

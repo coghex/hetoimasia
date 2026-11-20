@@ -653,8 +653,13 @@ and says so as evidence. The worker watches only cells that change on those
 events: the terrain service's authority epoch (`authorityEpochSTM`, moved only
 where a lease stops being valid; a move checks each view's lease in its own
 transaction) and each target's retirement cell (`vtRetired`: a window's own
-lifecycle cell, `targetRetired`, which the owner's rounds never write; a
-surface-free target's registrant's cell). The session's admission
+lifecycle cell, `targetRetired`, which the host writes only when that
+incarnation's lifecycle changes; a surface-free target's registrant's cell).
+An idle view's check for new work reads its arena's identity cell
+(`arenaMarkSTM`: the content and knowledge revisions and the residency
+generation, written only when one of them moves), never the terrain service's
+state, and what a waiting preparation watches is read only while it waits, so
+another arena's work and the requests of this one never wake it. The session's admission
 (`portTaking`) closing is terminal: the service ends then, closing every view
 while the scope's body runs; the composition supplies it from a cell that
 changes only then.
