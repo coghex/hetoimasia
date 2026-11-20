@@ -42,6 +42,7 @@ module Test.LuaEngine.Graphics.SceneHost
   , releasePass
   , dissolve
   , publishedRevision
+  , publishedRevisionSTM
   , awaitRevision
   , latestScene
   , adoptedRecords
@@ -265,7 +266,11 @@ releaseWindow model window = go []
 
 -- | The window's latest published revision.
 publishedRevision ∷ Model → Int → IO Natural
-publishedRevision model window = maybe 0 winPublished . Map.lookup window <$> readTVarIO (mWindows model)
+publishedRevision model window = atomically (publishedRevisionSTM model window)
+
+-- | The window's latest published revision, in a transaction.
+publishedRevisionSTM ∷ Model → Int → STM Natural
+publishedRevisionSTM model window = maybe 0 winPublished . Map.lookup window <$> readTVar (mWindows model)
 
 -- | Block until the window's latest published revision is at least this one.
 awaitRevision ∷ Model → Int → Natural → IO ()

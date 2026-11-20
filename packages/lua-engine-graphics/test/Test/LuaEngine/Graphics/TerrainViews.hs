@@ -1344,7 +1344,7 @@ lifecycle = describe "close orders and limits" $ do
       -- The same camera intent for both views, whatever their history: a jump to the cavity's column at the exact level 2
       -- (manual mode), so the cut runs through the cavity.
       let axis = either (error . show) id . axisFromInteger
-          sliced view window = do
+          sliced view window = withAdoptingHost v [window] $ do
             now ← publishedRevision (vModel v) window
             landing ← atomically (jumpView view (JumpRequest (axis 8, axis 8) (Just (axis 2)))) >>= either (fail . show) pure
             bounded (atomically (jumpSettled landing >>= maybe retry pure)) `shouldReturn` SettledOk JumpLanded
@@ -2240,12 +2240,15 @@ hardening = describe "wakes, ownership and limits" $ do
       _ ← awaitPublished v 1
       _ ← awaitPublished v 2
       axis ← pure (either (error . show) id . axisFromInteger)
-      jumpA ← atomically (jumpView a (JumpRequest (axis 4000, axis 4000) Nothing)) >>= either (fail . show) pure
-      jumpB ← atomically (jumpView b (JumpRequest (axis 4100, axis 4100) Nothing)) >>= either (fail . show) pure
-      atomically (cancelJumpView b jumpA) `shouldReturn` False
-      atomically (jumpSettled jumpA) >>= (`shouldNotBe` Just SettledCancelled)
-      bounded (atomically (jumpSettled jumpA >>= maybe retry pure)) `shouldReturn` SettledOk JumpLanded
-      bounded (atomically (jumpSettled jumpB >>= maybe retry pure)) `shouldReturn` SettledOk JumpLanded
+      -- the host adopts what each view publishes as it arrives, as a running host does: a view keeps every revision
+      -- it published pinned until its target's first adoption
+      withAdoptingHost v [1, 2] $ do
+       jumpA ← atomically (jumpView a (JumpRequest (axis 4000, axis 4000) Nothing)) >>= either (fail . show) pure
+       jumpB ← atomically (jumpView b (JumpRequest (axis 4100, axis 4100) Nothing)) >>= either (fail . show) pure
+       atomically (cancelJumpView b jumpA) `shouldReturn` False
+       atomically (jumpSettled jumpA) >>= (`shouldNotBe` Just SettledCancelled)
+       bounded (atomically (jumpSettled jumpA >>= maybe retry pure)) `shouldReturn` SettledOk JumpLanded
+       bounded (atomically (jumpSettled jumpB >>= maybe retry pure)) `shouldReturn` SettledOk JumpLanded
       closeView a
       closeView b
 
@@ -2892,6 +2895,22 @@ attached v window =
 -- Wait for the window's first terrain publication and answer its host revision.
 awaitPublished ∷ Views → Int → IO Natural'
 awaitPublished v window = awaitPublished' v window 1
+
+-- Run the body while the host's owner adopts each of these windows' newest publications as it arrives, and lets the
+-- adoptions it superseded go, as a running host does.
+withAdoptingHost ∷ Views → [Int] → IO a → IO a
+withAdoptingHost v windows body = withOwnedThread (loop Map.empty) (\_ _ → body)
+  where
+    model = vModel v
+    loop seen = do
+      (window, revision) ← atomically $ do
+        published ← forM windows (\w → (,) w <$> publishedRevisionSTM model w)
+        case [(w, r) | (w, r) ← published, r > Map.findWithDefault 0 w seen] of
+          next : _ → pure next
+          [] → retry
+      _ ← adoptNow model window
+      _ ← releasePass model
+      loop (Map.insert window revision seen)
 
 awaitPublished' ∷ Views → Int → Natural' → IO Natural'
 awaitPublished' v window at = do
