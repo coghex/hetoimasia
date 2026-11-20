@@ -46,6 +46,7 @@ module Hetoimasia.LuaEngine.Graphics.Texture
   , BackendReading (..)
   ) where
 
+import Hetoimasia.LuaEngine.Graphics.Keeper (Keeper, withKeeper)
 import Control.Concurrent.STM (STM)
 import Control.Exception (Exception, ExceptionWithContext, SomeException, throwIO)
 import Data.Word (Word64)
@@ -89,6 +90,9 @@ data TextureGraphics = TextureGraphics
   , graphicsReading ∷ STM BackendReading
   , graphicsFailure ∷ STM (ExceptionWithContext SomeException)
     -- ^ Retries until the backend has latched a failure of its own.
+  , graphicsKeeper ∷ !Keeper
+    -- ^ The session's keeper of work a shorter scope handed over when it ended (a terrain view service's retirements):
+    -- made and ended with this session, inside the backend's scope.
   }
 
 -- | Why the adapter could not be composed. A structured startup or configuration failure, raised before
@@ -122,7 +126,7 @@ withTextureGraphics scenes configuration hostConfig host body =
             -- Composition ends when the table's placeholder is bound: texture work needs it, so it is
             -- asked for and waited for here, where a failure of the owner ends the assembly.
             awaitBound backend
-            body
+            withKeeper $ \keeper → body
               TextureGraphics
                 { graphicsBackend = textureBackend backend
                 , graphicsRenderer = sessionRenderer session
@@ -133,6 +137,7 @@ withTextureGraphics scenes configuration hostConfig host body =
                 , graphicsPort = hostPort host session
                 , graphicsReading = readBackend backend
                 , graphicsFailure = awaitBackendFailure backend
+                , graphicsKeeper = keeper
                 }
 
 -- | The renderer's handle for the identity a texture was delivered with.

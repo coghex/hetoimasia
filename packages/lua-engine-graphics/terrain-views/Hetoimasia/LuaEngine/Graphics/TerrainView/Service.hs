@@ -46,6 +46,7 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView.Service
   , terrainViewsFailures
   , terrainViewsGpuCharged
   , terrainViewsRetiring
+  , terrainViewsUnhanded
   , renderStagingAccount
 
     -- * Views
@@ -58,6 +59,7 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView.Service
   , cancelAttach
   , closeView
   , viewClosed
+  , viewCloseOutcome
   , viewClosing
   , viewHoldsStyle
 
@@ -107,6 +109,7 @@ import qualified Data.Text as Text
 import Data.Word (Word64)
 import Hetoimasia.Foundation.Messaging.Payload (Prepared, prepare)
 import Hetoimasia.Foundation.Resource (withResource)
+import Hetoimasia.LuaEngine.Graphics.Keeper (KeptWork (..))
 import Hetoimasia.LuaEngine.Graphics.Scene.Claims (Claim (..), SceneClaims, claimOf, markClaimPublished, newClaimHolder, releaseClaim, takeClaim)
 import Hetoimasia.LuaEngine.Graphics.Scene.Ledger (GraphicsScene, SceneLedger, ledgerChunkHeld, ledgerDropInterest, ledgerNewestAdopted, ledgerRetainInterest, worldGraphicsScene)
 import Hetoimasia.LuaEngine.Graphics.Scene.World (SceneWorld (..), WorldTag (..))
@@ -223,7 +226,25 @@ data TerrainViews k = TerrainViews
     -- stays charged after the service's end, reported as evidence.
   , svAbandonedCopies ∷ !(TVar [Runtime.Pending Runtime.RegionBorrow])
     -- ^ Copy requests an abandoned stage left in flight, handed here in the transaction that ended the stage: the worker
-    -- (or the service's end) takes each settled one and releases it, or cancels it.
+    -- (or the service's end) takes each settled one and releases it, or cancels it. An entry stays here until its
+    -- disposal is done.
+  , svUnhanded ∷ !(TVar [Unhanded])
+    -- ^ Closes whose handback failed: the claim stays with the target, and the scene still current there keeps its
+    -- chunks and texture interests, charged; kept as evidence for the service's life.
+  }
+
+-- A close whose handback failed: the view, its target's key (shown), whether that target has retired, the claim's
+-- release, the chunks (to retire) and texture interests of the scene still current there, their CPU bytes, and why. It
+-- holds them only while the target lives: once it has retired the scene is shown nowhere, and they go.
+data Unhanded = Unhanded
+  { uhView ∷ !Word64
+  , uhTarget ∷ !Text
+  , uhRetired ∷ STM Bool
+  , uhRelease ∷ STM ()
+  , uhRegions ∷ ![Retiring]
+  , uhStyleIds ∷ ![Word64]
+  , uhCpu ∷ !Word64
+  , uhWhy ∷ !Text
   }
 
 data Request k
@@ -293,7 +314,11 @@ data ViewState k = ViewState
   , vsPending ∷ !(TVar Int)
   , vsPhase ∷ !(TVar ViewPhase)
   , vsClosing ∷ !(TVar Bool)
-  , vsClosed ∷ !(TVar Bool)
+  , vsOutcome ∷ !(TVar (Maybe CloseOutcome))
+    -- ^ The close's one result, written once when the close has done all it can: every waiter, present or later, reads
+    -- it.
+  , vsCloseFailures ∷ !(TVar [Text])
+    -- ^ What failed during the close so far, so its result says so.
   , vsJumps ∷ !(TVar (Map Word64 (TVar (Maybe (Settled JumpOutcome)))))
   , vsRetry ∷ !(TVar (Maybe Mark))
     -- ^ A preparation left work it can complete once something is released or adopted (copies refused busy, a pin
@@ -389,6 +414,11 @@ terrainViewsFailures = readTVar . svFailures
 
 -- | Where each retiring chunk stands: "unasked", "waiting" (on the host's barrier), "met" (released once no adoption
 -- lists it, its upload has ended and the owner has room) or "releasing". Read-only.
+-- | The closes whose handback failed: each one's view and why. Their claims, chunks and texture interests stay, charged,
+-- for the service's life. Read-only.
+terrainViewsUnhanded ∷ TerrainViews k → STM [(Word64, Text)]
+terrainViewsUnhanded service = map (\entry → (uhView entry, uhTarget entry <> ": " <> uhWhy entry)) <$> readTVar (svUnhanded service)
+
 terrainViewsRetiring ∷ TerrainViews k → STM [(ChunkRef, Text)]
 terrainViewsRetiring service = map (\r → (rtChunk r, name (rtState r))) <$> readTVar (svRetiring service)
   where
@@ -423,6 +453,7 @@ withTerrainViews config ports body = do
       <*> newTVarIO []
       <*> newTVarIO 0
       <*> newTVarIO 0
+      <*> newTVarIO []
       <*> newTVarIO []
   done ← newEmptyMVar
   -- The worker is the scope's resource: started under the scope's mask, it announces its end on every exit (its own end
@@ -695,7 +726,8 @@ newViewState service request style runtimeView camera light = do
     <*> newTVarIO 0
     <*> newTVarIO PhaseStarting
     <*> newTVarIO False
-    <*> newTVarIO False
+    <*> newTVarIO Nothing
+    <*> newTVarIO []
     <*> newTVarIO Map.empty
     <*> newTVarIO Nothing
     <*> newTVarIO []
@@ -913,7 +945,9 @@ adoptedRevision service state = do
 closeView ∷ (Ord k, Show k) ⇒ TerrainView k → IO ()
 closeView (TerrainView _ state) = do
   atomically (writeTVar (vsClosing state) True)
-  atomically (readTVar (vsClosed state) >>= check)
+  atomically (readTVar (vsOutcome state) >>= maybe retry pure) >>= \case
+    Closed → pure ()
+    CloseFailed why → throwIO (TerrainViewCloseFailed why)
 
 -- | Whether the view still holds its style (its parents' interests, its asset snapshot and both coverage planes): until
 -- its close releases it, or, while a reader still reads one of its plans ('withAdoptedPlan'), until that reader's end.
@@ -923,31 +957,44 @@ viewHoldsStyle (TerrainView _ state) = isJust <$> readTVar (vsStyle state)
 
 -- | Whether the view has closed.
 viewClosed ∷ (Ord k, Show k) ⇒ TerrainView k → STM Bool
-viewClosed (TerrainView _ state) = readTVar (vsClosed state)
+viewClosed (TerrainView _ state) = isJust <$> readTVar (vsOutcome state)
+
+-- | The view's close result, once its close has done all it can ('Nothing' before): the same for every reader.
+viewCloseOutcome ∷ TerrainView k → STM (Maybe CloseOutcome)
+viewCloseOutcome (TerrainView _ state) = readTVar (vsOutcome state)
 
 -- | Whether the view's close was asked for (it may not have completed yet).
 viewClosing ∷ TerrainView k → STM Bool
 viewClosing (TerrainView _ state) = readTVar (vsClosing state)
 
--- The worker's close of one view.
+-- The worker's close of one view. Each part runs whatever the others did, and a part that fails is recorded; the close
+-- then ends with its one result. A close is re-entrant: one interrupted after its main step (the phase is then closed)
+-- goes on from its end. The view stays in the service's views until then, so the service's end finds it.
 runClose ∷ (Ord k, Show k) ⇒ TerrainViews k → ViewState k → IO ()
 runClose service state = do
   let ports = svPorts service
-      target = vsTarget state
-  -- A close is re-entrant: one interrupted after its main transaction (the phase is then closed) goes on from the
-  -- parents' release. The view stays in the service's views until then, so the service's end finds it.
   handedBack ← (== PhaseClosed) <$> readTVarIO (vsPhase state)
   unless handedBack $ do
     -- whatever the view's preparation holds is handed to cleanup first
-    abandonStage service state
-    void (Runtime.clearViewDemand (portTerrain ports) (vsRuntimeView state))
-    Runtime.closeView (portTerrain ports) (vsRuntimeView state)
-    closeMain service state target
-    transferSeam service state "closed"
+    closePart service state "its stage could not be abandoned" (abandonStage service state)
+    closePart service state "its runtime view could not be closed" (void (Runtime.clearViewDemand (portTerrain ports) (vsRuntimeView state)) >> Runtime.closeView (portTerrain ports) (vsRuntimeView state))
+    closeMain service state (vsTarget state)
+    -- a hook after the main step: the handback committed (or its failure is recorded) whatever the hook does
+    closePart service state "the close's hook failed after its main step" (transferSeam service state "closed")
   closeTail service state
 
+-- One part of a close: a synchronous failure is recorded as the close's, and a cancellation is raised.
+closePart ∷ TerrainViews k → ViewState k → Text → IO () → IO ()
+closePart service state what action =
+  trySync action >>= \case
+    Left (failure ∷ SomeException) → do
+      let why = what <> ": " <> Text.pack (displayException failure)
+      recordFailure service ("view " <> Text.pack (show (vsId state)) <> ": " <> why)
+      atomically (modifyTVar' (vsCloseFailures state) (<> [why]))
+    Right () → pure ()
+
 -- The close's end: the parents are released (unless a reader still reads a pinned plan: its end releases them), then the
--- view leaves the service and its close is announced, with no cancellation between: a 'closeView' waiting on it never
+-- view leaves the service and its one result is written, with no cancellation between: a 'closeView' waiting on it never
 -- waits on a view nobody can find.
 closeTail ∷ TerrainViews k → ViewState k → IO ()
 closeTail service state =
@@ -955,52 +1002,61 @@ closeTail service state =
     style ← atomically $ do
       readers ← sum <$> readTVar (vsReaders state)
       if readers > 0 then pure Nothing else readTVar (vsStyle state) <* writeTVar (vsStyle state) Nothing
-    forM_ style releaseStyle
+    released ← trySync (forM_ style releaseStyle)
     atomically $ do
+      failures ← readTVar (vsCloseFailures state)
+      let failures' = failures <> either (\failure → ["its parents could not be released: " <> Text.pack (displayException (failure ∷ SomeException))]) (const []) released
       modifyTVar' (svViews service) (Map.delete (vsId state))
-      writeTVar (vsClosed state) True
+      readTVar (vsOutcome state) >>= \case
+        Just _ → pure ()
+        Nothing → writeTVar (vsOutcome state) (Just (if null failures' then Closed else CloseFailed (Text.intercalate "; " failures')))
 
--- The service's end completes a close that failed: what the close had not done yet is done now, each part's failure kept
--- as evidence, and the view leaves the service closed, so nothing that waits on it waits on a service that has ended.
-completeClose ∷ (Ord k, Show k) ⇒ TerrainViews k → ViewState k → IO ()
-completeClose service state = do
-  let ports = svPorts service
-      attempt what action =
-        trySync action >>= \case
-          Left (failure ∷ SomeException) → recordFailure service ("a view's close could not " <> what <> ": " <> Text.pack (displayException failure))
-          Right () → pure ()
-  handedBack ← (== PhaseClosed) <$> readTVarIO (vsPhase state)
-  unless handedBack $ do
-    attempt "abandon its stage" (abandonStage service state)
-    attempt "close its runtime view" (void (Runtime.clearViewDemand (portTerrain ports) (vsRuntimeView state)) >> Runtime.closeView (portTerrain ports) (vsRuntimeView state))
-    attempt "hand its target back" (closeMain service state (vsTarget state))
-  closeTail service state
+-- Why a handback publication was refused: it rolls the handback back.
+data HandbackRefused = HandbackRefused
+  deriving (Show)
 
--- The close's main step: the jumps settle, the claim is handed back, the interests drop, the regions retire and every
--- charge and payload the view keeps goes, in one transaction.
+instance Exception HandbackRefused
+
+-- The close's main step, in two transactions. The handback first, alone: the jumps settle, the claim is released and, if
+-- it still names this view and the view published to a target still usable, the host's initial content (opaque black,
+-- naming nothing) is published as a real new revision with its own barrier entry and adoption, so the closed terrain
+-- retires without a later M1 publication. A refused or raising publication rolls the whole handback back: the claim
+-- stays. Then, whatever the handback did, everything independent of it goes, in a transaction of its own: after a
+-- handback the interests drop and the regions retire; after a failed one the claim, the regions and the interests of the
+-- scene still current at the target stay, charged, in the service's evidence ('svUnhanded').
 closeMain ∷ (Ord k, Show k) ⇒ TerrainViews k → ViewState k → ViewTarget k → IO ()
 closeMain service state target = do
   let ports = svPorts service
-  atomically $ do
-    jumps ← readTVar (vsJumps state)
-    forM_ (Map.elems jumps) $ \box → readTVar box >>= \case Nothing → writeTVar box (Just SettledCancelled); Just _ → pure ()
-    writeTVar (vsJumps state) Map.empty
-    -- The claim is handed back in the same step as its empty revision: if it still names this view and the view
-    -- published, the host's initial content (opaque black, naming nothing) is published as a real new revision with
-    -- its own barrier entry and adoption, so the closed terrain retires without a later M1 publication. A view that
-    -- never published leaves the latest value alone; an ended target is published nothing.
+  handback ← trySync . atomically $ do
     released ← releaseClaim (portClaims ports) (vtKey target) (vsId state)
     case released of
       Just claim | claimPublished claim → do
         usable ← vtUsable target
-        when usable (void (vtPublish target (portInitial ports)))
+        when usable $ do
+          accepted ← vtPublish target (portInitial ports)
+          unless accepted (throwSTM HandbackRefused)
       _ → pure ()
-    forM_ (Set.toList (vsStyleIds state)) (ledgerDropInterest (portLedger ports))
+  let failed = either (\failure → Just ("the target could not be handed back: " <> Text.pack (displayException (failure ∷ SomeException)))) (const Nothing) handback
+  forM_ failed $ \why → recordFailure service ("view " <> Text.pack (show (vsId state)) <> ": " <> why)
+  atomically $ do
+    jumps ← readTVar (vsJumps state)
+    forM_ (Map.elems jumps) $ \box → readTVar box >>= \case Nothing → writeTVar box (Just SettledCancelled); Just _ → pure ()
+    writeTVar (vsJumps state) Map.empty
     regions ← readTVar (vsRegions state)
     readers ← readTVar (vsReaders state)
     writeTVar (vsRegions state) Map.empty
-    modifyTVar' (svRetiring service) (<> [Retiring (rgChunk region) (rgBytes region) (regionCpu region) RetireUnasked | region ← Map.elems regions])
-    moveToService service state (sum (map regionCpu (Map.elems regions)))
+    let cpu = sum (map regionCpu (Map.elems regions))
+    case failed of
+      Nothing → do
+        forM_ (Set.toList (vsStyleIds state)) (ledgerDropInterest (portLedger ports))
+        modifyTVar' (svRetiring service) (<> [Retiring (rgChunk region) (rgBytes region) (regionCpu region) RetireUnasked | region ← Map.elems regions])
+        moveToService service state cpu
+      Just why → do
+        -- the scene still current at the target names these: they stay, their GPU bytes and CPU kept charged
+        moveToService service state cpu
+        modifyTVar' (svKeptCpu service) (+ cpu)
+        modifyTVar' (svUnhanded service) (<> [Unhanded (vsId state) (Text.pack (show (vtKey target))) (vtRetired target) (void (releaseClaim (portClaims ports) (vtKey target) (vsId state))) [Retiring (rgChunk region) (rgBytes region) (regionCpu region) RetireUnasked | region ← Map.elems regions] (Set.toList (vsStyleIds state)) cpu why])
+        modifyTVar' (vsCloseFailures state) (<> [why])
     -- a pin a reader still reads stays, and stays charged, until that reader's end ('withAdoptedPlan')
     modifyTVar' (vsPins state) (Map.filterWithKey (\revision _ → Map.findWithDefault 0 revision readers > 0))
     writeTVar (vsFacts state) Nothing
@@ -1217,43 +1273,77 @@ shutdown service = do
   views ← Map.elems <$> readTVarIO (svViews service)
   forM_ views $ \state → do
     atomically (writeTVar (vsClosing state) True)
-    trySync (runClose service state) >>= \case
-      Left (failure ∷ SomeException) → do
-        recordFailure service ("a view's close failed: " <> Text.pack (displayException failure))
-        completeClose service state
-      Right () → pure ()
+    runClose service state
   -- Settle every attachment still queued.
   queued ← atomically (readTVar (svRequests service) <* writeTVar (svRequests service) [])
   settleQueued queued
   disposeAbandonedCopies service
-  drain
-  -- what the service still holds for retiring regions left by an owner that ended returns now that nothing can use it;
-  -- a failed release's description is still in the renderer's registry, so its CPU stays charged, reported here
+  -- What only the host can still prove (retirements waiting on a barrier, an adoption, an upload or a release's
+  -- answer) goes to the graphics session's keeper, in one transaction with the service's end: the scope's exit never
+  -- waits on the host. With nothing left, or a keeper that has ended, what the service holds is settled here.
   atomically $ do
-    kept ← readTVar (svKeptCpu service)
-    held ← readTVar (svRetiringCpu service)
-    returnFromService service (held - min held kept)
-    when (kept > 0) $
-      recordFailureSTM service ("failed releases keep " <> Text.pack (show kept) <> " bytes of their descriptions charged: they are still in the renderer's registry")
+    left ← retirementsLeft service
+    handed ← if left then ownerKeep (portOwner (svPorts service)) (retirementWork service) else pure False
+    unless handed (endRetirements service)
     writeTVar (svShutDown service) True
-  where
-    drain = do
-      remaining ← atomically ((\r o → not (null r && null o)) <$> readTVar (svRetiring service) <*> readTVar (svOrphans service))
-      when remaining $ do
-        -- Wait for a retirement to be able to move (an answer, a barrier, room on the owner, the ledger letting a chunk
-        -- go, an upload ending), or for the graphics owner to end: then nothing it still holds will ever be handed back,
-        -- and what is left is kept as terminal evidence. So the scope's exit ends in either order of the host's end and
-        -- the views'.
-        moved ← atomically ((True <$ (retirable service >>= check)) `orElse` (False <$ ownerEnd (portOwner (svPorts service))))
-        if moved
-          then atomically (retireStep service) >> drain
-          else atomically (abandonRetirements service)
+
+-- Whether the service still has retirements or builds left in flight.
+retirementsLeft ∷ TerrainViews k → STM Bool
+retirementsLeft service = (\r o u → not (null r && null o && null u)) <$> readTVar (svRetiring service) <*> readTVar (svOrphans service) <*> readTVar (svUnhanded service)
+
+-- The service's retirements as the session's keeper runs them: the same steps the worker takes, until none is left, or
+-- the graphics owner ends (then they can never be proved); its end settles what the service holds.
+retirementWork ∷ (Ord k, Show k) ⇒ TerrainViews k → KeptWork
+retirementWork service =
+  KeptWork
+    { keptReady = retirable service
+    , keptStep = retireStep service
+    , keptDone = not <$> retirementsLeft service
+    , keptStuck = (True <$ ownerEnd (portOwner (svPorts service))) `orElse` pure False
+    , keptEnd = endRetirements service
+    }
+
+-- The retirements' end: what is left can no longer be proved and is kept as terminal evidence, its GPU bytes charged;
+-- what the service holds for retiring regions returns, except what failed releases keep (their descriptions are still in
+-- the renderer's registry), reported here.
+endRetirements ∷ TerrainViews k → STM ()
+endRetirements service = do
+  abandonRetirements service
+  kept ← readTVar (svKeptCpu service)
+  held ← readTVar (svRetiringCpu service)
+  returnFromService service (held - min held kept)
+  when (kept > 0) $
+    recordFailureSTM service ("failed releases keep " <> Text.pack (show kept) <> " bytes of their descriptions charged: they are still in the renderer's registry")
 
 -- Whether a retirement can move now. Every wait is on something that changes: an action's or a barrier's answer, room
 -- on the owner's queue or release lane, the ledger letting a chunk go, an upload ending. A full lane or queue is waited
 -- on, never asked again at once, so a blocked retirement never makes the worker loop; a failed release has left the list.
-retirable ∷ TerrainViews k → STM Bool
-retirable service = do
+retirable ∷ (Ord k, Show k) ⇒ TerrainViews k → STM Bool
+retirable service = (||) <$> unhandedRetirable service <*> retirementsMovable service
+
+-- Whether a failed handback's target has retired: its claim, interests and chunks can go.
+unhandedRetirable ∷ (Ord k, Show k) ⇒ TerrainViews k → STM Bool
+unhandedRetirable service = readTVar (svUnhanded service) >>= fmap or . mapM uhRetired
+
+-- A failed handback whose target has retired lets go of what it held: the claim, the interests, and its chunks, which
+-- retire as any other (their CPU, kept until now, goes with them).
+releaseUnhanded ∷ (Ord k, Show k) ⇒ TerrainViews k → STM Bool
+releaseUnhanded service = do
+  entries ← readTVar (svUnhanded service)
+  retired ← mapM uhRetired entries
+  case [entry | (entry, True) ← zip entries retired] of
+    [] → pure False
+    entry : _ → do
+      uhRelease entry
+      forM_ (uhStyleIds entry) (ledgerDropInterest (portLedger (svPorts service)))
+      modifyTVar' (svRetiring service) (<> uhRegions entry)
+      modifyTVar' (svKeptCpu service) (\kept → kept - min kept (uhCpu entry))
+      let at = length (takeWhile not retired)
+      writeTVar (svUnhanded service) (take at entries <> drop (at + 1) entries)
+      pure True
+
+retirementsMovable ∷ (Ord k, Show k) ⇒ TerrainViews k → STM Bool
+retirementsMovable service = do
   let owner = portOwner (svPorts service)
       ledger = portLedger (svPorts service)
   orphans ← readTVar (svOrphans service)
@@ -1286,8 +1376,11 @@ releasable ledger owner r = do
 -- * the chunks now releasable are released on the owner in one action, when the owner has room.
 --
 -- An owner that will never answer (gone, or a barrier it will never meet) ends the retirements as terminal evidence.
-retireStep ∷ TerrainViews k → STM ()
-retireStep service = do
+retireStep ∷ (Ord k, Show k) ⇒ TerrainViews k → STM ()
+retireStep service = releaseUnhanded service >>= \released → unless released (retireSettled service)
+
+retireSettled ∷ (Ord k, Show k) ⇒ TerrainViews k → STM ()
+retireSettled service = do
   let ports = svPorts service
       owner = portOwner ports
   -- builds left in flight
@@ -1661,16 +1754,16 @@ disposeAbandonedCopies ∷ TerrainViews k → IO ()
 disposeAbandonedCopies service = do
   let terrain = portTerrain (svPorts service)
   more ← uninterruptibleMask_ $ do
-    next ← atomically $ readTVar (svAbandonedCopies service) >>= \case
-      pending : rest → Just pending <$ writeTVar (svAbandonedCopies service) rest
-      [] → pure Nothing
-    forM_ next $ \pending → do
+    -- the oldest entry is disposed of first and stays listed until its disposal is done: an abandoned stage adds at the
+    -- front, so the last entry is this one throughout
+    next ← atomically (lastMaybe <$> readTVar (svAbandonedCopies service))
+    forM_ next $ \pending → (`finally` atomically (modifyTVar' (svAbandonedCopies service) (\xs → if null xs then xs else init xs))) $ do
       taken ← atomically ((Just <$> Runtime.awaitSTM terrain pending) `orElse` pure Nothing)
       case taken of
         Just (Right borrow) → Runtime.releaseRegionBorrow terrain borrow
         Just (Left _) → pure ()
-        Nothing → do
-          tvOnTransfer (svConfig service) 0 "cancelling"
+        -- the cancellation and the collection run however the hook before them ends; its failure is raised after
+        Nothing → tvOnTransfer (svConfig service) 0 "cancelling" `finally` do
           Runtime.cancelPending terrain pending >>= \case
             -- it settled after the probe: the settled result is taken and its borrow released, as a cancellation that
             -- lost to the settlement must ('Runtime.withRegionSnapshot')
@@ -1678,6 +1771,8 @@ disposeAbandonedCopies service = do
             _ → pure ()
     pure (isJust next)
   when more (disposeAbandonedCopies service)
+  where
+    lastMaybe xs = if null xs then Nothing else Just (last xs)
 
 -- The test seam after a transaction that handed resources on.
 transferSeam ∷ TerrainViews k → ViewState k → Text → IO ()

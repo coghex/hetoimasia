@@ -30,6 +30,7 @@ import Data.Word (Word64)
 import qualified Data.Text as Text
 import Hetoimasia.GPU.Vulkan.GLFW (ActionOutcome (..), ActionRefusal (..), ImageFormat (Depth32Float), VulkanAction (..), VulkanHost, readVulkanAction, readVulkanUploadsSettled, requestVulkanRelease, submitVulkanAction, vulkanActionRoom, vulkanOwnerEnded, vulkanReleaseRoom)
 import Numeric.Natural (Natural)
+import Hetoimasia.LuaEngine.Graphics.Keeper (KeptWork, keepWork)
 import Hetoimasia.LuaEngine.Graphics.Scene.Ledger (GraphicsScene)
 import Hetoimasia.LuaEngine.Graphics.Texture (TextureGraphics (..))
 import Hetoimasia.LuaEngine.Graphics.Texture.Host (hostBuilders)
@@ -104,6 +105,9 @@ data ViewOwner = ViewOwner
     -- ^ How many of the session's uploads have settled: it only grows. A build refused as upload pressure is asked
     -- again once it moves past what it was when the build was submitted (one settled since, so the staging buffer or
     -- its queue has room again), even if that upload started after the submission. It writes nothing.
+  , ownerKeep ∷ KeptWork → STM Bool
+    -- ^ Hand work that only the host can still prove (retirements left at a view scope's end) to the graphics
+    -- session's keeper, in the caller's transaction: 'False', taking nothing, once the keeper has ended.
   , ownerEnd ∷ STM ()
     -- ^ Completes once the owner takes no more actions (its admission closed or its session failed) and retries until
     -- then. It writes nothing.
@@ -148,6 +152,7 @@ productionViewOwner host graphics = do
       , ownerStanding = chunkStandingSTM retained
       , -- written only when an upload settles, never by an upload's progress
         ownerUploadsSettled = fromMaybe 0 <$> readVulkanUploadsSettled host
+      , ownerKeep = keepWork (graphicsKeeper graphics)
       , -- the host's gate alone: its owner closed or its session failed
         ownerEnd = vulkanOwnerEnded host >>= check
       }

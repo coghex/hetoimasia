@@ -15,6 +15,8 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView.Types
     -- * Attachment
   , AttachRequest (..)
   , AttachRefusal (..)
+  , CloseOutcome (..)
+  , TerrainViewCloseFailed (..)
   , describeAttachRefusal
   , Settled (..)
 
@@ -122,6 +124,17 @@ newtype TargetIssuer = TargetIssuer Unique
 
 instance Show TargetIssuer where
   showsPrec precedence (TargetIssuer host) = showParen (precedence > 10) (showString "TargetIssuer " . shows (hashUnique host))
+
+-- | A view's close result: closed, or failed with why (a failed handback keeps the target's claim and its scene's
+-- dependencies as evidence; other parts that failed are named too).
+data CloseOutcome = Closed | CloseFailed !Text
+  deriving (Eq, Show)
+
+-- | What 'closeView' raises when the close failed: the same result every waiter reads.
+newtype TerrainViewCloseFailed = TerrainViewCloseFailed Text
+  deriving (Show)
+
+instance Exception TerrainViewCloseFailed
 
 -- | A configuration or a port beyond the adapter's hard maxima, refused when the service is made, before its worker
 -- starts or any request is taken.

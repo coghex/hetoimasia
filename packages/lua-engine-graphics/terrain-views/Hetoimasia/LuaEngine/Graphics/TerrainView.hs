@@ -48,6 +48,8 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView
     -- * Attaching and closing
   , AttachRequest (..)
   , AttachRefusal (..)
+  , CloseOutcome (..)
+  , TerrainViewCloseFailed (..)
   , describeAttachRefusal
   , Settled (..)
   , TerrainView
@@ -59,6 +61,8 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView
   , cancelAttach
   , closeView
   , viewClosed
+  , viewCloseOutcome
+  , terrainViewsUnhanded
   , viewClosing
   , viewHoldsStyle
 

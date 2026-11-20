@@ -43,6 +43,7 @@ library
         Hetoimasia.LuaEngine.Graphics.Scene.Publish
         Hetoimasia.LuaEngine.Graphics.Scene.Render
         Hetoimasia.LuaEngine.Graphics.Scene.World
+        Hetoimasia.LuaEngine.Graphics.Keeper
         Hetoimasia.LuaEngine.Graphics.Texture
         Hetoimasia.LuaEngine.Graphics.Texture.Backend
         Hetoimasia.LuaEngine.Graphics.Texture.Configuration

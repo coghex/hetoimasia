@@ -33,6 +33,7 @@ import Data.Word (Word32, Word64)
 import Hetoimasia.Foundation.Log (Logger, callbackSink, defaultLogFilter, mkLogger)
 import Hetoimasia.Foundation.Messaging.Payload (prepare)
 import Hetoimasia.Foundation.Worker (withWorkerGroup)
+import Hetoimasia.LuaEngine.Graphics.Keeper (Keeper, keepWork, keeperHolding, withKeeper)
 import Hetoimasia.LuaEngine.Graphics.Scene.Claims (SceneClaims, claimOf, newSceneClaims)
 import Hetoimasia.LuaEngine.Graphics.Scene.Ledger (GraphicsScene (..), LedgerReading (..), initialGraphicsScene, ledgerAdopted, ledgerInterests, ledgerNewestAdopted, ledgerNewestTargets, ledgerReading, ledgerReleased, newSceneLedger)
 import Hetoimasia.LuaEngine.Graphics.Scene.Publish (HostAnswer (..))
@@ -125,6 +126,10 @@ data Views = Views
     -- ^ The session's admission the views are given: an example closes it as the session's end would.
   , vIssuer ∷ !TargetIssuer
     -- ^ The host identity the views' ports and every test target carry.
+  , vKeeper ∷ !Keeper
+    -- ^ The session's keeper, which outlives the views' scope.
+  , vPorts ∷ !(TerrainViewsPorts Int)
+    -- ^ The ports the views were made with, for an example that makes a further views scope in the same session.
   }
 
 spec ∷ Spec
@@ -1746,6 +1751,87 @@ hardening = describe "wakes, ownership and limits" $ do
       bounded (atomically (Runtime.inspectRegionalSTM (_vTerrain v) >>= check . null))
       atomically (claimOf (vClaims v) 1) `shouldReturn` Nothing
 
+  it "hands what only the host can still prove to the session's keeper at its scope's exit: the scope returns, and the keeper releases the chunks once the host can" $
+    withViews $ \v → do
+      let owner = vOwner v
+      modelWindow (vModel v) 2
+      -- a further views scope in the same session: its view publishes, then closes with the release lane held
+      (inner, view) ← withTerrainViews testConfig (vPorts v) $ \views → do
+        view ← inInstance (vComp v) (vVm v) "i" (attachView views (requestFor v (target v 2))) >>= either (fail . show) pure >>= bounded . awaitAttach >>= \case
+          SettledOk view' → pure view'
+          _ → fail "the attachment did not succeed"
+        _ ← awaitPublished v 2
+        atomically (writeTVar (foLaneFull owner) True)
+        bounded (closeView view)
+        pure (views, view)
+      -- the scope returned with its retirements unproved: the keeper holds them, still charged; the view's own CPU
+      -- dependencies went with its close
+      atomically (keeperHolding (vKeeper v)) `shouldReturn` 1
+      atomically (terrainViewsGpuCharged inner) >>= (`shouldSatisfy` (> 0))
+      atomically (viewHoldsStyle view) `shouldReturn` False
+      -- the host can prove them once its lane has room and the window's target has gone
+      atomically (writeTVar (foLaneFull owner) False)
+      removeWindow (vModel v) 2
+      bounded (atomically (keeperHolding (vKeeper v) >>= check . (== 0)))
+      atomically (terrainViewsGpuCharged inner) `shouldReturn` 0
+
+  it "cancels and collects an abandoned copy however the hook before its cancellation ends, leaving the terrain service no regional charge" $ do
+    gate ← newTVarIO False
+    armed ← newTVarIO False
+    held ← newTVarIO False
+    -- once armed, the terrain service's owner waits before its next commit: the view's first copy stays unsettled
+    let probe = Runtime.Probe $ \case
+          Runtime.PointBeforeCommit _ → do
+            first' ← atomically (readTVar armed <* writeTVar armed False)
+            when first' $ do
+              atomically (writeTVar held True)
+              atomically (readTVar gate >>= check)
+          _ → pure ()
+        -- the hook before the cancellation raises
+        atCancel 0 "cancelling" = throwIO (userError "the cancelling hook raised")
+        atCancel _ _ = pure ()
+    withViewsProbed HostFirst probe id loamOverGranite testConfig {tvOnTransfer = atCancel} $ \v → (`finally` atomically (writeTVar gate True)) $ do
+      atomically (writeTVar armed True)
+      view ← attached v 1
+      bounded (atomically (readTVar held >>= check))
+      -- the close records the hook's failure and still ends, with its one result
+      outcome ← try (bounded (closeView view))
+      case outcome of
+        Left (TerrainViewCloseFailed why) → why `shouldSatisfy` ("the cancelling hook raised" `Text.isInfixOf`)
+        Right () → expectationFailure "the close reported no failure"
+      atomically (claimOf (vClaims v) 1) `shouldReturn` Nothing
+      -- the copy was cancelled (or, settled, released): once the owner goes on, nothing regional is left
+      atomically (writeTVar gate True)
+      bounded (atomically (Runtime.inspectRegionalSTM (_vTerrain v) >>= check . null))
+
+  it "keeps the claim, and the chunks and interests of the scene still shown, when the empty publication raises, and gives every close waiter the same failure" $
+    withViews $ \v → do
+      armed ← newTVarIO False
+      let base = target v 1
+          raising = base {vtPublish = \scene → readTVar armed >>= \raise → if raise then throwSTM (userError "the empty publication raised") else vtPublish base scene}
+      view ← attachOutcome v raising >>= \case
+        SettledOk view' → pure view'
+        _ → fail "the attachment did not succeed"
+      _ ← awaitPublished v 1
+      quiescent v
+      atomically (writeTVar armed True)
+      withOwnedThread (void (try (closeView view) ∷ IO (Either TerrainViewCloseFailed ()))) $ \_ otherDone → do
+        first' ← try (bounded (closeView view))
+        bounded otherDone
+        second' ← try (closeView view)
+        case (first', second') of
+          (Left (TerrainViewCloseFailed a), Left (TerrainViewCloseFailed b)) → do
+            a `shouldBe` b
+            a `shouldSatisfy` ("could not be handed back" `Text.isInfixOf`)
+          _ → expectationFailure "a close waiter did not read the failure"
+      -- the target's claim and the shown scene's interests and chunks stay, as evidence
+      atomically (claimOf (vClaims v) 1) >>= (`shouldSatisfy` isJust)
+      atomically (ledgerInterests (fakeLedger (vFake v))) >>= (`shouldSatisfy` (not . null))
+      atomically (terrainViewsUnhanded (vViews v)) >>= (`shouldSatisfy` ((== 1) . length))
+      -- what did not depend on the handback went: the demand, the parents' CPU coverage
+      atomically (viewDemand view) `shouldReturn` Nothing
+      atomically (viewHoldsStyle view) `shouldReturn` False
+
   it "closes the runtime view an attachment opened when it is cancelled before its commit, so its slot is free at once" $
     withViewsTerrain HostFirst (\c → c {configMaxViews = 1}) loamOverGranite testConfig {tvBeforeAttachCommit = myThreadId >>= killThread} $ \v → do
       outcome ← inInstance (vComp v) (vVm v) "i" (attachView (vViews v) (requestFor v (target v 1))) >>= either (fail . show) pure >>= bounded . awaitAttach
@@ -2232,7 +2318,8 @@ stagesAndReaders = describe "stages, waits and readers" $ do
     Just (view, views) ← readTVarIO kept
     atomically (viewClosed view) `shouldReturn` True
     atomically (viewHoldsStyle view) `shouldReturn` False
-    atomically (terrainViewsFailures views) >>= (`shouldSatisfy` any ("a view's close failed" `Text.isInfixOf`))
+    atomically (terrainViewsFailures views) >>= (`shouldSatisfy` any ("the close's hook failed after its main step" `Text.isInfixOf`))
+    atomically (viewCloseOutcome view) >>= (`shouldSatisfy` \case Just (CloseFailed _) → True; _ → False)
 
   it "charges the removal index its copies' removed intervals make, at the index's own figures, before making it" $
     withViews $ \v → do
@@ -2396,10 +2483,16 @@ withViewsProbed order probe terrainConfig source config body = do
                   , portTaking = readTVar taking
                   , portIssuer = issuer
                   }
-          let run views = body (Views comp vm fake model terrain arena views owner claims (cpAccount comp) style colourKey normalKey client metricsVar taking issuer)
-          withOwnedThread (fakeOwnerLoop owner) $ \_ _ → case order of
-            HostFirst → withTerrainViews config ports (\views → run views `finally` dissolve model)
-            ViewsFirst → withTerrainViews config ports run `finally` dissolve model
+          -- the session's keeper runs while the fake owner does, and outlives the views' scope
+          withOwnedThread (fakeOwnerLoop owner) $ \_ _ → withKeeper $ \keeper → do
+            let ports' = ports {portOwner = (portOwner ports) {ownerKeep = keepWork keeper}}
+                run' views = body (Views comp vm fake model terrain arena views owner claims (cpAccount comp) style colourKey normalKey client metricsVar taking issuer keeper ports')
+            result ← case order of
+              HostFirst → withTerrainViews config ports' (\views → run' views `finally` dissolve model)
+              ViewsFirst → withTerrainViews config ports' run' `finally` dissolve model
+            -- the session lives on until its keeper has done what the views handed it
+            bounded (atomically (keeperHolding keeper >>= check . (== 0)))
+            pure result
 
 -- Small enough for a quick example: a 128 x 96 target and a 30-level band, which reaches the surface below the followed
 -- camera's 25 levels of headroom.
@@ -2807,6 +2900,7 @@ fakeViewOwner owner =
     , ownerReleaseRoom = (&&) <$> (not <$> readTVar (foEnded owner)) <*> (not <$> readTVar (foLaneFull owner))
     , ownerStanding = \chunk → Map.lookup chunk <$> readTVar (foStanding owner)
     , ownerUploadsSettled = readTVar (foSettled owner)
+    , ownerKeep = \_ → pure False
     , ownerEnd = readTVar (foEnded owner) >>= check
     }
   where
