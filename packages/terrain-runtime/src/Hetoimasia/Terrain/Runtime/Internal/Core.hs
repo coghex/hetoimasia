@@ -25,6 +25,7 @@ module Hetoimasia.Terrain.Runtime.Internal.Core
   , recordFatalDefect
   , takeUnreportedSTM
   , markFreed
+  , noteFreed
 
     -- * Authorities
   , clientOf
@@ -153,12 +154,10 @@ modifySt svc f = readSt svc >>= putSt svc . f
 -- in the transactions that move them and in no other.
 putSt ∷ Service → St → STM ()
 putSt svc st = do
-  before ← readTVar (serviceState svc)
   writeTVar (serviceState svc) st
   let retained = retainedBankUse st
   seenRetained ← readTVar (serviceRetainedCell svc)
   when (seenRetained /= retained) (writeTVar (serviceRetainedCell svc) retained)
-  when (stateFreed st && not (stateFreed before)) (modifyTVar' (serviceFreedCell svc) (+ 1))
   cells ← readTVar (serviceArenaMarks svc)
   let marks = Map.map arenaMark (stateArenas st)
       ended = Map.difference cells marks
@@ -177,7 +176,13 @@ bumpAuthority svc = modifyTVar' (serviceAuthority svc) (+ 1)
 
 -- | Something that may free capacity happened; the owner retries what waits.
 markFreed ∷ Service → STM ()
-markFreed svc = modifySt svc (\st → st {stateFreed = True, stateDispatchIdle = False})
+markFreed svc = modifySt svc (\st → st {stateFreed = True, stateDispatchIdle = False}) >> noteFreed svc
+
+-- | Count one capacity-freeing event in the freed cell ('capacityFreedSTM'). It counts every such event, whether or not
+-- the owner's retry flag was already set, so a holder that captured the count before a refusal sees each return; the
+-- state's other writes leave it alone.
+noteFreed ∷ Service → STM ()
+noteFreed svc = modifyTVar' (serviceFreedCell svc) (+ 1)
 
 -- | The regions a decision committed as victims, for the owner to discard.
 decisionVictims ∷ R.Decision → [R.RegionKey]
@@ -198,6 +203,7 @@ applyEvent svc event = do
     Right report → chargeStaging svc st0 model >>= \case
      Left refusal → pure (Left refusal)
      Right st → do
+      when (freesCapacity event) (noteFreed svc)
       putSt svc $
         (if freesCapacity event then \x → x {stateFreed = True, stateDispatchIdle = False} else id)
         st

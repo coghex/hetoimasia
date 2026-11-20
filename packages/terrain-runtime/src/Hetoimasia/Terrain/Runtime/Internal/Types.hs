@@ -762,8 +762,9 @@ data Service = Service
     serviceArenaMarks ∷ !(TVar (Map ArenaId (TVar (Maybe ArenaMark))))
   , -- | The retained bank's use, written by the state's one write only when it changes.
     serviceRetainedCell ∷ !(TVar Word64)
-  , -- | Bumped by the state's one write each time capacity is freed (the owner's freed flag
-    -- turning on): a holder refused for a model capacity waits on it, not on the state.
+  , -- | Bumped once by every event that may free capacity (each one that sets the owner's
+    -- freed flag, set or not already): a holder refused for a model capacity waits on it, not
+    -- on the state.
     serviceFreedCell ∷ !(TVar Word64)
   }
 

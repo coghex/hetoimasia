@@ -46,7 +46,7 @@ module Hetoimasia.LuaEngine.Graphics.Texture
   , BackendReading (..)
   ) where
 
-import Hetoimasia.LuaEngine.Graphics.Keeper (Keeper, withKeeper)
+import Hetoimasia.LuaEngine.Graphics.Keeper (Keeper, withKeeperAcross)
 import Control.Concurrent.STM (STM)
 import Control.Exception (Exception, ExceptionWithContext, SomeException, throwIO)
 import Data.Word (Word64)
@@ -120,13 +120,14 @@ withTextureGraphics scenes configuration hostConfig host body =
       bootstrapHost (configurationRenderer configuration) (scenesLedger scenes) host >>= \case
         Left refusal → throwIO (SessionRefused refusal)
         Right session →
-          withBackend (hostPort host session) $ \backend → do
+          -- the session's keeper runs across the backend: work it holds can still let go of what the drain waits for
+          withKeeperAcross (withBackend (hostPort host session)) $ \keeper backend → do
             -- The renderer hook finds the session's renderer here, filled before any window can exist.
             fillRenderSlot (scenesSlot scenes) (RenderSession (sessionRenderer session) (sessionTextures session) (sessionRetained session))
             -- Composition ends when the table's placeholder is bound: texture work needs it, so it is
             -- asked for and waited for here, where a failure of the owner ends the assembly.
             awaitBound backend
-            withKeeper $ \keeper → body
+            body
               TextureGraphics
                 { graphicsBackend = textureBackend backend
                 , graphicsRenderer = sessionRenderer session

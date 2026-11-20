@@ -259,6 +259,21 @@ spec = describe "Superseded work and ordering" $ do
       bounded (atomically (pendingNow >>= check . null))
       inspectDefects svc >>= (`shouldBe` [])
 
+  it "counts every capacity return in the freed cell, two returns in a row with no retry between them included" $
+    withService defaultConfig $ \svc → do
+      (_, lease) <- openMain svc "main"
+      -- two regional borrows, then nothing pending that the owner could retry
+      first' <- okOf (requestRegionSnapshot svc lease [RegionCoord 0 0 0]) >>= await svc >>= either (fail . show) pure
+      second <- okOf (requestRegionSnapshot svc lease [RegionCoord 1 0 0]) >>= await svc >>= either (fail . show) pure
+      before <- atomically (capacityFreedSTM svc)
+      -- each return moves the cell, the second though the first already left the owner something to retry
+      releaseRegionBorrow svc first'
+      once <- atomically (capacityFreedSTM svc)
+      once `shouldSatisfy` (> before)
+      releaseRegionBorrow svc second
+      atomically (capacityFreedSTM svc) >>= (`shouldSatisfy` (> once))
+      inspectDefects svc >>= (`shouldBe` [])
+
   it "re-prepares an edit that another edit overtook and commits both in admission order" $
     withService defaultConfig $ \svc → do
       (_, lease) <- openMain svc "main"

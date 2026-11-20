@@ -7,17 +7,20 @@
 -- | State | Owner | Writers / thread | Readers | Lifetime and disposal |
 -- | --- | --- | --- | --- | --- |
 -- | The kept jobs | the keeper, made with the graphics session ('withKeeper') | 'keepWork' (the handing scope, in its own transaction); the keeper's thread | 'keeperHolding' | a job leaves when it is done, or when it can never move, after its end runs; at the keeper's end every job left runs its end |
--- | The keeper's thread | the session's scope ('withResource') | started at the keeper's acquisition, stopped and joined at its release | | joined before the session's dependencies unwind |
+-- | The keeper's thread | the session's scope ('withResource') | started at the keeper's acquisition, stopped and joined at its release | | joined after the scope it is run across ('withKeeperAcross': the texture backend) has drained, before the session's dependencies unwind |
 --
 -- A job is handed over in one transaction with whatever marks its old owner done, so it always has exactly one owner.
 -- The keeper's thread takes one step of one ready job at a time, never waiting on anything but the jobs' own ready,
--- done and stuck conditions and its own stop. Its release stops the thread, joins it, and runs every remaining job's end
--- in one transaction each: an end keeps what cannot be proved as its owner's evidence (charged) and waits for nothing,
--- so the session's exit never waits on GPU completion or an adoption.
+-- done and stuck conditions and its own stop. The session runs it across its texture backend, so it keeps working while
+-- the backend drains: a job that holds what the drain waits for (a failed handback's texture interests, until its
+-- target retires) can still let it go. Its release, after that drain, stops the thread, joins it, and runs every
+-- remaining job's end in one transaction each: an end keeps what cannot be proved as its owner's evidence (charged) and
+-- waits for nothing, so the session's exit never waits on GPU completion or an adoption.
 module Hetoimasia.LuaEngine.Graphics.Keeper
   ( Keeper
   , KeptWork (..)
   , withKeeper
+  , withKeeperAcross
   , keepWork
   , keeperHolding
   ) where
@@ -61,6 +64,12 @@ withKeeper body = do
         forM_ left (atomically . keptEnd)
     )
     (\() → body keeper)
+
+-- | Run a keeper across a scope that drains on its exit (the texture backend): the keeper's thread runs until that
+-- scope, its drain included, has returned, and its own release runs after. The session composes its keeper and its
+-- backend through this one function, so a job can still let go of what the drain waits for.
+withKeeperAcross ∷ ((x → IO a) → IO a) → (Keeper → x → IO a) → IO a
+withKeeperAcross scope body = withKeeper (\keeper → scope (body keeper))
 
 -- | Hand a job to the keeper, in the caller's transaction: 'False', taking nothing, once the keeper has ended (the
 -- caller keeps the job, and its evidence, itself).

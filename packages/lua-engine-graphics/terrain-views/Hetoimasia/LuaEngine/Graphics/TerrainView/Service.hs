@@ -47,6 +47,7 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView.Service
   , terrainViewsGpuCharged
   , terrainViewsRetiring
   , terrainViewsUnhanded
+  , terrainViewsUnproved
   , renderStagingAccount
 
     -- * Views
@@ -232,6 +233,18 @@ data TerrainViews k = TerrainViews
   , svUnhanded ∷ !(TVar [Unhanded])
     -- ^ Closes whose handback failed: the claim stays with the target, and the scene still current there keeps its
     -- chunks and texture interests, charged; kept as evidence for the service's life.
+  , svUnproved ∷ !(TVar [Unproved])
+    -- ^ Retirements and builds whose end the graphics owner can no longer prove, kept as evidence with their charges:
+    -- their GPU bytes stay in 'svGpu', their CPU in 'svKeptCpu'.
+  }
+
+-- A retirement or a build left in flight that the graphics owner ended before it could be proved: its chunk (none for
+-- a build that never answered), where it stood, and the GPU and CPU bytes it keeps charged.
+data Unproved = Unproved
+  { unChunk ∷ !(Maybe ChunkRef)
+  , unStanding ∷ !Text
+  , unGpu ∷ !Word64
+  , unCpu ∷ !Word64
   }
 
 -- A close whose handback failed: the view, its target's key (shown), whether that target has retired, the claim's
@@ -421,13 +434,20 @@ terrainViewsUnhanded ∷ TerrainViews k → STM [(Word64, Text)]
 terrainViewsUnhanded service = map (\entry → (uhView entry, uhTarget entry <> ": " <> uhWhy entry)) <$> readTVar (svUnhanded service)
 
 terrainViewsRetiring ∷ TerrainViews k → STM [(ChunkRef, Text)]
-terrainViewsRetiring service = map (\r → (rtChunk r, name (rtState r))) <$> readTVar (svRetiring service)
-  where
-    name = \case
-      RetireUnasked → "unasked"
-      RetireWaiting _ → "waiting"
-      RetireMet → "met"
-      RetireReleasing _ _ → "releasing"
+terrainViewsRetiring service = map (\r → (rtChunk r, retireStanding (rtState r))) <$> readTVar (svRetiring service)
+
+retireStanding ∷ RetireState → Text
+retireStanding = \case
+  RetireUnasked → "unasked"
+  RetireWaiting _ → "waiting"
+  RetireMet → "met"
+  RetireReleasing _ _ → "releasing"
+
+-- | What the graphics owner ended before it could be proved, after every answer that had already arrived was taken:
+-- each retiring chunk, or a build that never answered ('Nothing'), with where it stood ("unasked", "waiting", "met",
+-- "releasing" or "building") and the GPU and CPU bytes it keeps charged. Kept for the service's life. Read-only.
+terrainViewsUnproved ∷ TerrainViews k → STM [(Maybe ChunkRef, Text, Word64, Word64)]
+terrainViewsUnproved service = map (\u → (unChunk u, unStanding u, unGpu u, unCpu u)) <$> readTVar (svUnproved service)
 
 -- | The GPU bytes the service holds charged: every retained region listed, being built, uploading or retiring, until
 -- its release is proved. Read-only.
@@ -454,6 +474,7 @@ withTerrainViews config ports body = do
       <*> newTVarIO []
       <*> newTVarIO 0
       <*> newTVarIO 0
+      <*> newTVarIO []
       <*> newTVarIO []
       <*> newTVarIO []
   done ← newEmptyMVar
@@ -661,8 +682,8 @@ attachChecks service request = do
 -- The attachment's commit. The lease must be one the runtime view can use: a live lease of another client of the same
 -- service passes the arena's checks, but every demand of the view would be refused, so it is refused here, before any
 -- claim (a lease's client never changes, so this holds at the commit too). Then the authority, the target, the parents'
--- registrations, the arena's palette against the style's mapping and the claim are read, and the claim and both GPU
--- interests are taken, in one transaction. A cancellation that won before it, or any failed check, takes nothing.
+-- registrations, the arena's palette against the style's mapping, the graphics owner's end and the claim are read, and
+-- the claim and both GPU interests are taken, in one transaction. A cancellation that won before it, or any failed check, takes nothing.
 commitAttach ∷ (Ord k, Show k) ⇒ TerrainViews k → AttachRequest k → TVar (Maybe (Settled (TerrainView k))) → AcquiredStyle → Runtime.View → CameraState → LightSettings → IO (Either AttachRefusal ())
 commitAttach service request box style runtimeView camera light = do
   let ports = svPorts service
@@ -682,6 +703,8 @@ commitAttach service request box style runtimeView camera light = do
         palette ← fmap (paletteMaterials . Runtime.viewPalette) <$> Runtime.inspectArenaSTM (portTerrain ports) (attachArena request)
         open ← readTVar (svOpen service)
         taking ← portTaking ports
+        -- an owner that ended while the attachment ran its early checks takes no new view: the request settles stopped
+        ended ← (True <$ ownerEnd (portOwner ports)) `orElse` pure False
         usable ← vtUsable target
         claim ← claimOf (portClaims ports) (vtKey target)
         released ← or <$> traverse (portReleased ports) [styleColourHandle style, styleNormalHandle style]
@@ -689,7 +712,7 @@ commitAttach service request box style runtimeView camera light = do
         let missing = [material | material ← fromMaybe [] palette, material `Set.notMember` styleMappedMaterials style]
         if
           | cancelled → pure (Left Nothing)
-          | not (open && taking) → pure (Left (Just AttachStopped))
+          | not (open && taking) || ended → pure (Left (Just AttachStopped))
           | count >= tvMaxViews (svConfig service) → pure (Left (Just AttachTooManyViews))
           | Left why ← arena → pure (Left (Just (AttachArena (Text.pack (show why)))))
           | not (null missing) → pure (Left (Just (AttachStyle (StyleMissingMaterials missing))))
@@ -1222,25 +1245,26 @@ unblockedDirty service state = do
   continue ← readTVar (vsContinue state)
   pure (intent /= prepared || current /= revisions || now /= metrics || waited || continue)
 
--- What a waiting preparation watches: the service's releases, the target's newest adoption, the shared account's charge
--- (moved by any of its consumers: coverage, view payloads or the terrain service's own staging), the owner's unsettled
--- uploads and the terrain service's retained bank.
+-- What a waiting preparation watches, captured now: the service's releases and the target's newest adoption, which only
+-- 'ForChange' waits on, and the one reason its refusal gave.
 markNow ∷ (Ord k, Show k) ⇒ TerrainViews k → ViewState k → Reason → STM Mark
 markNow service state reason =
   Mark <$> readTVar (svReleases service) <*> (fmap fst <$> ledgerNewestAdopted (portLedger (svPorts service)) (vtKey (vsTarget state))) <*> pure reason
 
--- Whether what a mark waits for has happened: a release, an adoption, or its reason's own cell moving.
+-- Whether what a mark waits for has happened. A specific reason watches its own cell and nothing else: the shared
+-- account's room (moved by any of its consumers: coverage, view payloads or the terrain service's own staging), the
+-- owner's settled uploads, the terrain service's retained bank or its freed-capacity count. A release or an adoption
+-- wakes only 'ForChange', so a peer's copy coming and going never restarts a step that waits for something else.
 markMoved ∷ (Ord k, Show k) ⇒ TerrainViews k → ViewState k → Mark → STM Bool
-markMoved service state (Mark releases adopted reason) = do
-  Mark releases' adopted' _ ← markNow service state reason
-  if releases' /= releases || adopted' /= adopted
-    then pure True
-    else case reason of
-      ForChange → pure False
-      ForRoomAbove room → (> room) <$> accountRoom (portAccount (svPorts service))
-      ForUploads settled → (/= settled) <$> ownerUploadsSettled (portOwner (svPorts service))
-      ForRetained retained → (/= retained) <$> Runtime.retainedBankUseSTM (portTerrain (svPorts service))
-      ForCapacity freed → (/= freed) <$> Runtime.capacityFreedSTM (portTerrain (svPorts service))
+markMoved service state (Mark releases adopted reason) = case reason of
+  ForChange → do
+    Mark releases' adopted' _ ← markNow service state reason
+    pure (releases' /= releases || adopted' /= adopted)
+  ForRoomAbove room → (> room) <$> accountRoom (portAccount (svPorts service))
+  ForRoom room → (>= room) <$> accountRoom (portAccount (svPorts service))
+  ForUploads settled → (/= settled) <$> ownerUploadsSettled (portOwner (svPorts service))
+  ForRetained retained → (/= retained) <$> Runtime.retainedBankUseSTM (portTerrain (svPorts service))
+  ForCapacity freed → (/= freed) <$> Runtime.capacityFreedSTM (portTerrain (svPorts service))
 
 withReason ∷ Mark → Reason → Mark
 withReason (Mark releases adopted _) = Mark releases adopted
@@ -1256,17 +1280,22 @@ busyReason (retained, freed) = \case
 busyCells ∷ TerrainViews k → STM (Word64, Word64)
 busyCells service = (,) <$> Runtime.retainedBankUseSTM (portTerrain (svPorts service)) <*> Runtime.capacityFreedSTM (portTerrain (svPorts service))
 
--- The graphics owner takes no more actions, so the retirements left cannot be proved: they are kept as terminal
--- evidence, and their GPU bytes stay charged.
+-- The graphics owner takes no more actions, so the retirements and builds left cannot be proved: each is kept as
+-- terminal evidence ('svUnproved') with its charges, its GPU bytes in 'svGpu' and its CPU description in 'svKeptCpu' (its
+-- description may still be in the renderer's registry).
 abandonRetirements ∷ TerrainViews k → STM ()
 abandonRetirements service = do
   left ← readTVar (svRetiring service)
   orphans ← readTVar (svOrphans service)
   writeTVar (svRetiring service) []
   writeTVar (svOrphans service) []
-  let count = length left + length orphans
-  when (count > 0) $
-    recordFailureSTM service ("retirement could not be proved for " <> Text.pack (show count) <> " retained regions or builds: the graphics owner takes no more actions")
+  let entries =
+        [Unproved (Just (rtChunk r)) (retireStanding (rtState r)) (rtBytes r) (rtCpu r) | r ← left]
+          <> [Unproved Nothing "building" (orGpu o) (sum (orCpu o)) | o ← orphans]
+  unless (null entries) $ do
+    modifyTVar' (svUnproved service) (<> entries)
+    modifyTVar' (svKeptCpu service) (+ sum (map unCpu entries))
+    recordFailureSTM service ("retirement could not be proved for " <> Text.pack (show (length entries)) <> " retained regions or builds: the graphics owner takes no more actions; they keep " <> Text.pack (show (sum (map unGpu entries))) <> " GPU bytes and " <> Text.pack (show (sum (map unCpu entries))) <> " CPU bytes charged")
 
 -- The service's end: close every view, then drain the retirements.
 shutdown ∷ (Ord k, Show k) ⇒ TerrainViews k → IO ()
@@ -1304,11 +1333,13 @@ retirementWork service =
     , keptEnd = endRetirements service
     }
 
--- The retirements' end: what is left can no longer be proved and is kept as terminal evidence, its GPU bytes charged;
--- what the service holds for retiring regions returns, except what failed releases keep (their descriptions are still in
--- the renderer's registry), reported here.
-endRetirements ∷ TerrainViews k → STM ()
+-- The retirements' end: every answer that already arrived is taken first (a build's chunks join the retirements, a
+-- release's answer ends its chunks); what is left can no longer be proved and is kept as terminal evidence with its
+-- charges; what the service holds for retiring regions returns, except what failed releases and unproved retirements
+-- keep (their descriptions may still be in the renderer's registry), reported here.
+endRetirements ∷ (Ord k, Show k) ⇒ TerrainViews k → STM ()
 endRetirements service = do
+  collectAnswers service
   abandonRetirements service
   kept ← readTVar (svKeptCpu service)
   held ← readTVar (svRetiringCpu service)
@@ -1384,7 +1415,103 @@ retireSettled ∷ (Ord k, Show k) ⇒ TerrainViews k → STM ()
 retireSettled service = do
   let ports = svPorts service
       owner = portOwner ports
-  -- builds left in flight
+  collectOrphans service
+  retiring ← readTVar (svRetiring service)
+  laneRoom ← ownerReleaseRoom owner
+  let unasked = [rtChunk r | r ← retiring, RetireUnasked ← [rtState r]]
+  asked ← if null unasked || not laneRoom then pure (Left OwnerBusy) else ownerBarrier owner unasked
+  stepped ← forM retiring $ \r → case rtState r of
+    RetireUnasked → pure $ case asked of
+      Right reading → Next r {rtState = RetireWaiting reading}
+      Left OwnerGone → Gone r
+      Left OwnerBusy → Next r
+    RetireWaiting reading →
+      reading >>= \case
+        Just True → pure (Next r {rtState = RetireMet})
+        Just False → pure (Gone r)
+        Nothing → pure (Next r)
+    RetireMet → pure (Next r)
+    RetireReleasing ticket index →
+      ticket >>= \case
+        Nothing → pure (Next r)
+        -- a release action that did not answer: only an owner that takes no more actions ends every retirement; one that
+        -- goes on serving keeps this region's failure and charges as evidence, and every other retirement goes on
+        Just (NotRun why) → do
+          ended ← (True <$ ownerEnd owner) `orElse` pure False
+          if ended
+            then pure (Gone r)
+            else do
+              recordFailureSTM service ("a retained region's release did not run: " <> Text.pack (show (rtChunk r)) <> ": " <> why)
+              modifyTVar' (svKeptCpu service) (+ rtCpu r)
+              pure Kept
+        Just (Answered results) → releaseAnswered service r index results
+  -- what was released returns its bytes, whatever else happened in this step
+  left ← settleReleased service retiring stepped
+  if any isGone stepped
+    then do
+      -- an owner that will never answer: what is left, and what could not move, is kept as evidence
+      writeTVar (svRetiring service) (left <> [r | Gone r ← stepped])
+      abandonRetirements service
+    else do
+      -- the chunks now releasable, released in one action when the owner has room
+      room ← ownerRoom owner
+      eligible ← if room then filterM' (\r → case rtState r of RetireMet → releasable (portLedger ports) owner r; _ → pure False) left else pure []
+      if null eligible
+        then writeTVar (svRetiring service) left
+        else
+          ownerRelease owner (map rtChunk eligible) >>= \case
+            Left OwnerBusy → writeTVar (svRetiring service) left
+            Left OwnerGone → writeTVar (svRetiring service) left >> abandonRetirements service
+            Right ticket → do
+              let indexOf = Map.fromList (zip (map rtChunk eligible) [0 ..])
+              writeTVar (svRetiring service) [maybe r (\i → r {rtState = RetireReleasing ticket i}) (Map.lookup (rtChunk r) indexOf) | r ← left]
+  where
+    isGone = \case
+      Gone _ → True
+      _ → False
+
+-- Every answer that already arrived, taken without asking the owner anything: a build left in flight that answered
+-- (its chunks join the retirements), a barrier that answered met, and a release that answered (its chunks end, released
+-- or kept as evidence). What has not answered stays as it stands.
+collectAnswers ∷ (Ord k, Show k) ⇒ TerrainViews k → STM ()
+collectAnswers service = do
+  collectOrphans service
+  retiring ← readTVar (svRetiring service)
+  stepped ← forM retiring $ \r → case rtState r of
+    RetireWaiting reading →
+      reading <&> \case
+        Just True → Next r {rtState = RetireMet}
+        _ → Next r
+    RetireReleasing ticket index →
+      ticket >>= \case
+        Just (Answered results) → releaseAnswered service r index results
+        _ → pure (Next r)
+    _ → pure (Next r)
+  settleReleased service retiring stepped >>= writeTVar (svRetiring service)
+
+-- A release action's answer for one of its chunks: released, or a failure kept as evidence with its charges.
+releaseAnswered ∷ (Ord k, Show k) ⇒ TerrainViews k → Retiring → Int → [Either Text ()] → STM RetireStep
+releaseAnswered service r index results = case drop index results of
+  Right () : _ → pure Released
+  Left why : _ → do
+    recordFailureSTM service ("a retained region's release failed: " <> Text.pack (show (rtChunk r)) <> ": " <> why)
+    modifyTVar' (svKeptCpu service) (+ rtCpu r)
+    pure Kept
+  [] → pure Kept
+
+-- The released chunks of a step return their GPU and CPU bytes; the answer is what goes on retiring.
+settleReleased ∷ TerrainViews k → [Retiring] → [RetireStep] → STM [Retiring]
+settleReleased service retiring stepped = do
+  let released = [r | (r, Released) ← zip retiring stepped]
+  unless (null released) $ do
+    modifyTVar' (svGpu service) (subtract (sum (map rtBytes released)))
+    returnFromService service (sum (map rtCpu released))
+    modifyTVar' (svReleases service) (+ 1)
+  pure [r' | Next r' ← stepped]
+
+-- Builds left in flight that answered: what they built joins the retirements.
+collectOrphans ∷ TerrainViews k → STM ()
+collectOrphans service = do
   orphans ← readTVar (svOrphans service)
   stillOut ← fmap concat . forM orphans $ \o →
     orTicket o >>= \case
@@ -1411,69 +1538,9 @@ retireSettled service = do
         modifyTVar' (svReleases service) (+ 1)
         pure []
   writeTVar (svOrphans service) stillOut
-  retiring ← readTVar (svRetiring service)
-  laneRoom ← ownerReleaseRoom owner
-  let unasked = [rtChunk r | r ← retiring, RetireUnasked ← [rtState r]]
-  asked ← if null unasked || not laneRoom then pure (Left OwnerBusy) else ownerBarrier owner unasked
-  stepped ← forM retiring $ \r → case rtState r of
-    RetireUnasked → pure $ case asked of
-      Right reading → Next r {rtState = RetireWaiting reading}
-      Left OwnerGone → Gone
-      Left OwnerBusy → Next r
-    RetireWaiting reading →
-      reading >>= \case
-        Just True → pure (Next r {rtState = RetireMet})
-        Just False → pure Gone
-        Nothing → pure (Next r)
-    RetireMet → pure (Next r)
-    RetireReleasing ticket index →
-      ticket >>= \case
-        Nothing → pure (Next r)
-        -- a release action that did not answer: only an owner that takes no more actions ends every retirement; one that
-        -- goes on serving keeps this region's failure and charges as evidence, and every other retirement goes on
-        Just (NotRun why) → do
-          ended ← (True <$ ownerEnd owner) `orElse` pure False
-          if ended
-            then pure Gone
-            else do
-              recordFailureSTM service ("a retained region's release did not run: " <> Text.pack (show (rtChunk r)) <> ": " <> why)
-              modifyTVar' (svKeptCpu service) (+ rtCpu r)
-              pure Kept
-        Just (Answered results) → case drop index results of
-          Right () : _ → pure Released
-          Left why : _ → do
-            recordFailureSTM service ("a retained region's release failed: " <> Text.pack (show (rtChunk r)) <> ": " <> why)
-            modifyTVar' (svKeptCpu service) (+ rtCpu r)
-            pure Kept
-          [] → pure Kept
-  if any isGone stepped
-    then abandonRetirements service
-    else do
-      let released = [r | (r, Released) ← zip retiring stepped]
-          left = [r' | Next r' ← stepped]
-      unless (null released) $ do
-        modifyTVar' (svGpu service) (subtract (sum (map rtBytes released)))
-        returnFromService service (sum (map rtCpu released))
-        modifyTVar' (svReleases service) (+ 1)
-      -- the chunks now releasable, released in one action when the owner has room
-      room ← ownerRoom owner
-      eligible ← if room then filterM' (\r → case rtState r of RetireMet → releasable (portLedger ports) owner r; _ → pure False) left else pure []
-      if null eligible
-        then writeTVar (svRetiring service) left
-        else
-          ownerRelease owner (map rtChunk eligible) >>= \case
-            Left OwnerBusy → writeTVar (svRetiring service) left
-            Left OwnerGone → writeTVar (svRetiring service) left >> abandonRetirements service
-            Right ticket → do
-              let indexOf = Map.fromList (zip (map rtChunk eligible) [0 ..])
-              writeTVar (svRetiring service) [maybe r (\i → r {rtState = RetireReleasing ticket i}) (Map.lookup (rtChunk r) indexOf) | r ← left]
-  where
-    isGone = \case
-      Gone → True
-      _ → False
 
 -- What one retirement entry's step decided.
-data RetireStep = Next !Retiring | Released | Kept | Gone
+data RetireStep = Next !Retiring | Released | Kept | Gone !Retiring
 
 -- ---------------------------------------------------------------------------
 -- Preparation
@@ -1491,10 +1558,13 @@ data Mark = Mark !Word64 !(Maybe Natural) !Reason
   deriving (Eq)
 
 data Reason
-  = -- | A release or an adoption alone.
+  = -- | A release or an adoption alone (a step that failed and has no capacity to wait for).
     ForChange
-  | -- | The shared account's free room growing past this.
+  | -- | The shared account's free room growing past this (more admitted needs room, how much is not known).
     ForRoomAbove !Word64
+  | -- | The shared account's free room reaching this: the whole granules a refused charge needs beyond what the view
+    -- holds.
+    ForRoom !Word64
   | -- | An upload settling past this count (a build refused as upload pressure, captured with its submission).
     ForUploads !Natural
   | -- | The terrain service's retained bank moving from this (a copy refused 'Runtime.BusyRetained').
@@ -1717,8 +1787,8 @@ finishSTM service state outcome prep = do
 abandonStage ∷ (Ord k, Show k) ⇒ TerrainViews k → ViewState k → IO ()
 abandonStage service state = do
   atomically (abandonStageSTM service state)
-  transferSeam service state "abandoned"
-  disposeAbandonedCopies service
+  -- the disposal runs however the hook before it ends; its failure is raised after
+  transferSeam service state "abandoned" `finally` disposeAbandonedCopies service
 
 -- The stage ends and everything it holds changes owner in one transaction, so no cancellation can fall between the two: a
 -- copy request in flight to the service's abandoned copies, a build in flight to the orphans (a reservation with no
@@ -1970,8 +2040,14 @@ toPlanning service state prep0 copies0 = do
   -- the admitted subset; the rest is dropped and stays pending.
   admitted ← atomically (admitInputs service state (reverse (copySnapshots copies0)))
   case admitted of
-    Nothing → abandonStage service state >> finish service state Retry' (Just prep0)
-    Just (copies, inputs) → planFrom (prep0 {prpRegions = copyRegions copies}) copies inputs
+    -- the copies go back; the preparation waits for the room the first copy's admission needs (its footprint, inputs
+    -- and first quantum beyond what the view then holds), so another consumer's release of that room wakes it
+    Left need → do
+      abandonStage service state
+      atomically $ do
+        finishSTM service state Retry' (Just prep0)
+        forM_ need $ \bytes → roomFor service state bytes >>= markNow service state . ForRoom >>= writeTVar (vsRetry state) . Just
+    Right (copies, inputs) → planFrom (prep0 {prpRegions = copyRegions copies}) copies inputs
   where
     planFrom prep copies inputs = case planInputs (tvChangeLimits (svConfig service)) copies of
       Left why → failed ("the view's inputs could not be made: " <> Text.pack (show why))
@@ -1991,22 +2067,28 @@ toPlanning service state prep0 copies0 = do
 
 -- The longest prefix of these copies (taken in admission order) whose inputs the account can hold beside them, with
 -- room left for the plan's first quantum over them (so an admitted subset can always be planned): the stage's charge
--- becomes that prefix's footprint and its inputs. 'Nothing' (and nothing changed) when not even the first copy fits.
-admitInputs ∷ TerrainViews k → ViewState k → [Runtime.RegionSnapshot] → STM (Maybe (CopySet, Word64))
+-- becomes that prefix's footprint and its inputs. When not even the first copy fits, nothing is changed and the answer
+-- is what the first copy's admission would charge the stage (its footprint, inputs and first quantum), for the wait.
+admitInputs ∷ TerrainViews k → ViewState k → [Runtime.RegionSnapshot] → STM (Either (Maybe Word64) (CopySet, Word64))
 admitInputs service state ordered = do
   before ← readTVar (vsStageCharge state)
   let prefixes = [take n ordered | n ← [length ordered, length ordered - 1 .. 1]]
-      attempt [] = writeTVar (vsStageCharge state) before >> pure Nothing
+      refuse whole = writeTVar (vsStageCharge state) before >> pure (Left whole)
+      attempt [] = refuse Nothing
       attempt (prefix : rest) = case combineCopies prefix of
         Left _ → attempt rest
         Right copies → do
           let inputs = inputsCharge prefix
               held = sum (map Runtime.regionSnapshotFootprint prefix) + inputs
-          writeTVar (vsStageCharge state) (held + quantumBound (svConfig service) (Set.size (copyRegions copies)))
+              whole = held + quantumBound (svConfig service) (Set.size (copyRegions copies))
+          writeTVar (vsStageCharge state) whole
           room ← recharge service state
           writeTVar (vsStageCharge state) held
           ok ← recharge service state
-          if room && ok then pure (Just (copies, inputs)) else attempt rest
+          if
+            | room && ok → pure (Right (copies, inputs))
+            | null rest → refuse (Just whole)
+            | otherwise → attempt rest
   attempt prefixes
 
 -- Grow the stage's charge by these bytes, covered by the account: 'False' (and nothing changed) when it cannot.
@@ -2032,15 +2114,16 @@ quantumBound config regions =
 stepPlanning ∷ (Ord k, Show k) ⇒ TerrainViews k → ViewState k → Prep → Planning → IO ()
 stepPlanning service state prep planning = case cellPrepProgress (plPrep planning) of
   Working → do
-    -- the quantum's growth is charged before it is made, then the charge is set to what the plan now holds
-    -- the account's room before the attempt: it waits for room beyond that
-    mark ← atomically (accountRoom (portAccount (svPorts service)) >>= markNow service state . ForRoomAbove)
-    charged ← atomically $ do
+    -- the quantum's growth is charged before it is made, then the charge is set to what the plan now holds; refused, it
+    -- waits for the room that growth needs
+    let quantum = quantumBound (svConfig service) (Set.size (prpRegions prep))
+    refused ← atomically $ do
       writeTVar (vsStageCharge state) (plBase planning + prepHeld (plPrep planning))
-      growStage service state (quantumBound (svConfig service) (Set.size (prpRegions prep)))
-    if not charged
-      then enter service state (StagePlanning prep planning {plWait = Just mark})
-      else case steps (max 1 (tvStepsPerQuantum (svConfig service))) (plPrep planning) of
+      charged ← growStage service state quantum
+      if charged then pure Nothing else Just <$> (roomFor service state quantum >>= markNow service state . ForRoom)
+    case refused of
+      Just mark → enter service state (StagePlanning prep planning {plWait = Just mark})
+      Nothing → case steps (max 1 (tvStepsPerQuantum (svConfig service))) (plPrep planning) of
         Left why → failed ("a plan step failed: " <> Text.pack (show why))
         Right next → do
           atomically $ do
@@ -2476,8 +2559,12 @@ viewNeed state = do
 -- The free room the account must have for the view to cover its need as it stands now: the whole granules beyond what it
 -- holds.
 roomNeeded ∷ TerrainViews k → ViewState k → STM Word64
-roomNeeded service state = do
-  need ← viewNeed state
+roomNeeded service state = roomFor service state 0
+
+-- The free room the account must have for the view to cover its need as it stands now and these bytes more.
+roomFor ∷ TerrainViews k → ViewState k → Word64 → STM Word64
+roomFor service state extra = do
+  need ← (+ extra) <$> viewNeed state
   held ← readTVar (vsAccountHeld state)
   let granule = max 1 (tvAccountGranule (svConfig service))
   pure (if need > held then ((need - held + granule - 1) `div` granule) * granule else 0)

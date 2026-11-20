@@ -63,6 +63,7 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView
   , viewClosed
   , viewCloseOutcome
   , terrainViewsUnhanded
+  , terrainViewsUnproved
   , viewClosing
   , viewHoldsStyle
 

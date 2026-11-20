@@ -21,7 +21,7 @@
 module Test.LuaEngine.Graphics.Native.TerrainViews (spec, quietSpec, fullSpec, overlapSpec, Holding, newHolding) where
 
 import Control.Concurrent.STM
-import Control.Exception (finally, onException)
+import Control.Exception (evaluate, finally, onException)
 import Control.Monad (forM, forM_, unless, void)
 import Data.Foldable (for_)
 import qualified Data.ByteString as ByteString
@@ -278,8 +278,8 @@ fullSpec env = describe "terrain views (full)" $ do
       -- the plan the host adopted, read under the view's reader, until one holds all three parts
       let mixedParts = do
             adopted ← viewAdopted <$> atomically (readView view)
-            plan ← adoptedPlanOf view
-            let found = Set.fromList (map quadPart (cellPlanQuads plan))
+            -- the parts are read inside the reader and forced there: the plan never leaves it
+            found ← withAdoptedPlanRead view (\plan → evaluate (Set.fromList (map quadPart (cellPlanQuads plan))))
             if Set.fromList [PartFog, PartKnown, PartOrdinary] `Set.isSubsetOf` found
               then pure found
               else atomically (readView view >>= check . (/= adopted) . viewAdopted) >> mixedParts
@@ -700,42 +700,47 @@ pickAgreement rig view rendered = do
   -- picks answer from, is the one rendered
   adopted ← adoptedScene rig
   fmap worldTag (adopted >>= graphicsWorld) `shouldBe` Just (worldTag (rwWorld rendered))
-  plan ← adoptedPlanOf view
-  let regionQuads = Map.elems (Map.fromListWith (flip (<>)) [(regionOf (quadKey quad), [quad]) | quad ← cellPlanQuads plan])
-      regionOf (CellKey _ _ vx vy _) = (vx `div` 16, vy `div` 16)
-      quadAt position index = case drop position regionQuads of
-        quads : _ → listToMaybe (drop index quads)
-        [] → Nothing
-      winner p = case Map.lookup p (rwSources rendered) of
-        Just drawn@(_ : _) → case last drawn of
-          AtChunkInstance _ _ _ position index → Right (quadAt position index)
-          other → Left ("a non-chunk instance draws there: " <> show other)
-        _ → Right Nothing
-      contains (x, y) quad =
-        let TargetRect l t r b = quadTarget quad
-            px = fromIntegral x + 1 / 2 ∷ Double
-            py = fromIntegral y + 1 / 2 ∷ Double
-         in realToFrac l <= px && px < realToFrac r && realToFrac t <= py && py < realToFrac b
-  judged ← forM (Map.keys (rwSources rendered)) $ \p@(x, y) → do
-    answer ← atomically (pickView view (fromIntegral x + 0.5, fromIntegral y + 0.5))
-    expected ← either assertFailure pure (winner p)
-    let rear = listToMaybe (filter (contains p) (cellPlanQuads plan))
-    pure (p, expected, answer, rear)
-  let wrong =
-        [ (p, fmap (\q → (quadCell q, quadPart q)) expected, answer)
-        | (p, expected, answer, _) ← judged
-        , not (agrees expected answer)
-        ]
-      agrees expected answer = case (expected, answer) of
-        (Nothing, PickNoHit) → True
-        (Just quad, PickNoHit) → quadPart quad == PartFog
-        (Just quad, PickHit ref) → quadPart quad /= PartFog && Just (pickRefCell ref) == quadCell quad && pickRefPart ref == quadPart quad
-        _ → False
-      rearWrong = length [() | (_, Just quad, _, Just rear) ← judged, quadCell rear /= quadCell quad || quadPart rear /= quadPart quad]
-  take 4 wrong `shouldBe` []
-  length judged `shouldSatisfy` (> 0)
+  -- every comparison runs inside the view's reader of that plan, and only the forced counts and the first few wrong
+  -- pixels, shown, leave it
+  (judgedCount, rearWrong, wrongShown) ← withAdoptedPlanRead view $ \plan → do
+    let regionQuads = Map.elems (Map.fromListWith (flip (<>)) [(regionOf (quadKey quad), [quad]) | quad ← cellPlanQuads plan])
+        regionOf (CellKey _ _ vx vy _) = (vx `div` 16, vy `div` 16)
+        quadAt position index = case drop position regionQuads of
+          quads : _ → listToMaybe (drop index quads)
+          [] → Nothing
+        winner p = case Map.lookup p (rwSources rendered) of
+          Just drawn@(_ : _) → case last drawn of
+            AtChunkInstance _ _ _ position index → Right (quadAt position index)
+            other → Left ("a non-chunk instance draws there: " <> show other)
+          _ → Right Nothing
+        contains (x, y) quad =
+          let TargetRect l t r b = quadTarget quad
+              px = fromIntegral x + 1 / 2 ∷ Double
+              py = fromIntegral y + 1 / 2 ∷ Double
+           in realToFrac l <= px && px < realToFrac r && realToFrac t <= py && py < realToFrac b
+    judged ← forM (Map.keys (rwSources rendered)) $ \p@(x, y) → do
+      answer ← atomically (pickView view (fromIntegral x + 0.5, fromIntegral y + 0.5))
+      expected ← either assertFailure pure (winner p)
+      let rear = listToMaybe (filter (contains p) (cellPlanQuads plan))
+      pure (p, expected, answer, rear)
+    let wrong =
+          [ (p, fmap (\q → (quadCell q, quadPart q)) expected, answer)
+          | (p, expected, answer, _) ← judged
+          , not (agrees expected answer)
+          ]
+        agrees expected answer = case (expected, answer) of
+          (Nothing, PickNoHit) → True
+          (Just quad, PickNoHit) → quadPart quad == PartFog
+          (Just quad, PickHit ref) → quadPart quad /= PartFog && Just (pickRefCell ref) == quadCell quad && pickRefPart ref == quadPart quad
+          _ → False
+        rearWrong = length [() | (_, Just quad, _, Just rear) ← judged, quadCell rear /= quadCell quad || quadPart rear /= quadPart quad]
+    let shown = map show (take 4 wrong)
+    _ ← evaluate (length judged + rearWrong + sum (map length shown))
+    pure (length judged, rearWrong, shown)
+  wrongShown `shouldBe` []
+  judgedCount `shouldSatisfy` (> 0)
   rearWrong `shouldSatisfy` (> 0)
-  pure (length judged, rearWrong)
+  pure (judgedCount, rearWrong)
 
 notePicks ∷ (Int, Int) → IO ()
 notePicks (judged, rear) = evidenceNote ("picks judged exactly against the oracle's winning instance: " <> Text.pack (show judged) <> " pixels; a rear-picking picker would fail " <> Text.pack (show rear) <> " of them")
@@ -798,11 +803,12 @@ settleConditions rig view = do
 viewAdopted ∷ ViewReading → Maybe Word64
 viewAdopted ViewReading {readingAdopted = adopted} = adopted
 
--- The plan of the revision the host adopted, read under the view's reader once there is one.
-adoptedPlanOf ∷ TerrainView SceneTargetKey → IO CellPlan
-adoptedPlanOf view = do
+-- Read the plan of the revision the host adopted under the view's reader, once there is one, and answer what the reader
+-- makes of it. The plan is used only inside: the reader forces what it answers before the reader ends.
+withAdoptedPlanRead ∷ TerrainView SceneTargetKey → (CellPlan → IO a) → IO a
+withAdoptedPlanRead view use = do
   atomically (readView view >>= check . isJust . readingAdoptedResidency)
-  withAdoptedPlan view pure >>= maybe (assertFailure "no adopted plan") pure
+  withAdoptedPlan view (maybe (assertFailure "no adopted plan") use)
 
 zoomOf ∷ SceneWorld → Float
 zoomOf = cameraZoom . viewCamera . worldView

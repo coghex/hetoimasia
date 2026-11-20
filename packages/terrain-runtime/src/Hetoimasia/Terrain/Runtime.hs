@@ -1060,9 +1060,10 @@ arenaMarkSTM svc lease = do
 retainedBankUseSTM ∷ Service → STM Word64
 retainedBankUseSTM = readTVar . serviceRetainedCell
 
--- | How many times capacity has been freed in this service: a cell the state's one write bumps
--- each time it frees capacity and at no other time, which a holder refused for a model capacity
--- waits on instead of the state. It writes nothing.
+-- | How many times capacity has been freed in this service: a cell bumped once by every event
+-- that may free capacity, including a second one before the owner has retried anything, and at
+-- no other time, which a holder refused for a model capacity waits on instead of the state. It
+-- writes nothing.
 capacityFreedSTM ∷ Service → STM Word64
 capacityFreedSTM = readTVar . serviceFreedCell
 

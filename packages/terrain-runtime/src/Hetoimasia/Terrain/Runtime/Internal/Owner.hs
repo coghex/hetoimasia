@@ -219,8 +219,9 @@ nextWork svc token = do
   forM_ (configStagingAccount (serviceConfig svc)) $ \account → do
     now <- stagingAccountCharged account
     seen <- stateAccountSeen <$> readSt svc
-    when (seen /= Just now) $
+    when (seen /= Just now) $ do
       modifySt svc (\s → s {stateAccountSeen = Just now, stateFreed = True, stateDispatchIdle = False})
+      noteFreed svc
   st <- readSt svc
   open <- sessionOpen (serviceAdmission svc)
   stopping <- stopRequested token
