@@ -91,6 +91,7 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
     -- * Observation
   , ManagedView (..)
   , readManaged
+  , readManagedStanding
   , BatchView (..)
   , readBatch
   , readBatches
@@ -878,6 +879,10 @@ data ManagedView = ManagedView
   , viewNativeHandles ∷ ![Word64]
   }
   deriving (Eq, Show)
+
+-- | One managed generation's standing, 'Nothing' once its destruction has been recorded and it is forgotten.
+readManagedStanding ∷ Recording q inst msgr phys dev cmd → ResourceId → STM (Maybe ManagedStanding)
+readManagedStanding recording resource = fmap managedStanding . Map.lookup resource <$> readTVar (recordingManaged recording)
 
 readManaged ∷ Recording q inst msgr phys dev cmd → STM [ManagedView]
 readManaged recording =

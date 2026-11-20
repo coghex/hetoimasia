@@ -62,7 +62,6 @@ import Hetoimasia.GPU.Vulkan.GLFW
 import Hetoimasia.LuaEngine.Graphics.Scene
 import Hetoimasia.LuaEngine.Graphics.TerrainView hiding (styleAssets)
 import Hetoimasia.LuaEngine.Graphics.Texture
-import Hetoimasia.Foundation.Messaging.Payload (prepare)
 import Hetoimasia.LuaEngine.Graphics.Window.Host (WindowTarget (..))
 import Hetoimasia.LuaEngine.Graphics.Window.Port (Port (..), WindowToken (..))
 import Hetoimasia.LuaEngine.Graphics.Window.Provider (WindowRole (PresentationRole))
@@ -74,6 +73,7 @@ import Hetoimasia.Terrain.Coordinate (AxisCoord, axisFromInteger, tileCoord)
 import Hetoimasia.Terrain.Render2D.AtlasFixtures (AtlasStyle (..), boundPackedTextures, findSampleDirectory, loadAtlasStyle)
 import Hetoimasia.Terrain.Render2D.Presentation (defaultLightSettings)
 import Hetoimasia.Terrain.Residency (Limits, LimitsSpec (..), mkLimits)
+import Hetoimasia.Terrain.Cell (mkMaterialId)
 import Hetoimasia.Terrain.Runtime hiding (closeView, openView)
 import Hetoimasia.Terrain.Runtime.Storage (filesystemOf, minHeadroomBytes, mkStorageConfig)
 import Hetoimasia.Terrain.Runtime.Store (StoreSpec (..), defaultStoreSpec, minAllowanceBytes)
@@ -188,12 +188,9 @@ fullSpec env = describe "terrain views (full)" $
         window ← openWindow wcomp wvm port
         noteWindows env 1
         let receipts = scenesReceipts (envScenes env)
-        -- a window view plans for its window's latest recorded frame: the window's empty scene asks for its first
-        empty ← prepare initialGraphicsScene
-        _ ← targetPublish window empty
-        _ ← waitWithin "the window's first frame" (latestFrameMetrics receipts (targetAttachment window) >>= maybe retry pure)
+        -- opened directly on the fresh window: the open asks it for the first frame its view plans for
         view ←
-          openView views (OpenRequest (windowViewTarget True receipts window) lease (pure (Right style)) (axis 0, axis 0, axis 1) defaultLightSettings)
+          openView views (OpenRequest (windowViewTarget True receipts (pure True) window) lease (pure (Right style)) (axis 0, axis 0, axis 1) defaultLightSettings)
             >>= either (\why → assertFailure ("the view was refused: " <> show why)) pure
         let drawnAt revision = waitFor ("a receipt of revision " <> show revision) $ do
               reading ← readView view
@@ -222,6 +219,8 @@ fullSpec env = describe "terrain views (full)" $
             owned = serviceOwnerMax reading
             ownedStep = serviceOwnerStepMax reading
         _ ← closeView view
+        -- the window's frame metrics are kept only while a view watches it
+        atomically (latestFrameMetrics receipts (targetAttachment window)) >>= (`shouldBe` Nothing)
         Win.stopInstance wcomp wvm "w"
         evidence env
           ( "terrain views, real window: drawn at the presentation's enqueue (first receipt " <> tshow (drawnTag firstDrawn) <> " at "
@@ -233,12 +232,6 @@ fullSpec env = describe "terrain views (full)" $
               <> (if ownedStep <= frameBudget then "" else "; ONE OWNER STEP EXCEEDS THE FRAME BUDGET")
               <> (if owned <= frameBudget then "" else "; THE OWNER'S WORK BETWEEN TWO PRESENTATIONS EXCEEDS THE FRAME BUDGET")
           )
-
-waitWithin ∷ String → STM a → IO a
-waitWithin what condition =
-  timeout 60000000 (atomically condition) >>= \case
-    Just value → pure value
-    Nothing → assertFailure ("waited a minute for " <> what)
 
 -- One 60 Hz refresh, in nanoseconds: the budget a frame of the owner has.
 frameBudget ∷ Word64
@@ -273,7 +266,15 @@ withViews env comp vm body =
     colour ← loadOn comp vm "c" "colour.png" []
     normal ← loadOn comp vm "n" "normal.png" ["data"]
     textures ← boundPackedTextures atlas (textureHandleOf (fromIntegral colour)) (textureHandleOf (fromIntegral normal))
-    let style = ViewStyle (styleAssets atlas) textures (Set.fromList [fromIntegral colour, fromIntegral normal]) (pure ())
+    let style =
+          ViewStyle
+            { styleSnapshot = styleAssets atlas
+            , styleBound = textures
+            , styleParents = Set.fromList [fromIntegral colour, fromIntegral normal]
+            , styleMapped = Set.fromList [either (error . show) id (mkMaterialId material) | material ← ["loam", "granite"]]
+            , styleLive = pure True
+            , styleRelease = pure ()
+            }
         config = defaultConfig {configStore = defaultStoreSpec {specAllowanceBytes = toInteger minAllowanceBytes}, configLimits = cameraLimits}
     withWorkerGroup $ \group →
       withTerrainService config (Ports alwaysAdmitting (standaloneSupervisor group) quiet noProbe (storagePort group storage directory)) $ \terrain → do

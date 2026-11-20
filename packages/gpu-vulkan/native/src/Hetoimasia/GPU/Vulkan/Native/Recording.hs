@@ -491,6 +491,7 @@ module Hetoimasia.GPU.Vulkan.Native.Recording
   , ManagedStanding (..)
   , ManagedView (..)
   , readManaged
+  , readManagedStanding
   , BatchStanding (..)
   , BatchView (..)
   , readBatch
@@ -679,4 +680,5 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   , readBatch
   , readBatches
   , readManaged
+  , readManagedStanding
   )

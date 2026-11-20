@@ -12,6 +12,9 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView.Owner
   ( Hands (..)
   , BuildFailure (..)
   , OwnerPorts (..)
+  , ScheduleRefusal (..)
+  , StepOutcome (..)
+  , ConstructedDisposal (..)
   , productionOwner
   ) where
 
@@ -25,12 +28,13 @@ import Hetoimasia.GPU.Vulkan.GLFW
   ( ActionOutcome (..)
   , ActionRefusal (..)
   , Construction
+  , ConstructedDisposal (..)
+  , constructedDisposal
   , ImageFormat (Depth32Float)
-  , TerminalReport (..)
   , VulkanAction (..)
   , VulkanHost (..)
   , readVulkanAction
-  , readVulkanTerminal
+  , readVulkanActionGate
   , requestVulkanRelease
   , submitVulkanAction
   )
@@ -41,7 +45,7 @@ import Hetoimasia.Render.TwoD.Chunk (BoundsRequest (DeriveBounds), ChunkKind (Ch
 import Hetoimasia.Render.TwoD.Material (MaterialRecord, MaterialRef)
 import Hetoimasia.Render.TwoD.Snapshot (Instance)
 import Hetoimasia.Render.TwoD.Vulkan (registerMaterial, rendererDepthFormat, rendererRegionWindow)
-import Hetoimasia.Render.TwoD.Vulkan.Chunks (BuildRefusal (..), ChunkStanding, buildRetainedChunkWith, chunkStandingSTM, releaseChunkNow)
+import Hetoimasia.Render.TwoD.Vulkan.Chunks (BuildRefusal (..), ChunkStanding, buildRetainedChunkWith, chunkBufferOf, chunkStandingSTM, releaseChunkNow)
 import Hetoimasia.Render.TwoD.Vulkan.Textures (registeredMarks)
 import Hetoimasia.Terrain.Render2D.Vulkan.Material (terrainMaterial)
 
@@ -57,20 +61,31 @@ data Hands = Hands
   { handBuild ∷ [Instance] → [MaterialRecord] → IO (Either BuildFailure ChunkRef)
     -- ^ Build one chunk of a depth-enabled world layer: its instances (each naming the terrain material) and the
     -- records they index. A refusal holds nothing.
-  , handDispose ∷ ChunkRef → IO (Either Text ())
-    -- ^ Release a chunk's buffer and forget it. A buffer still read by a recorded batch is destroyed by the backend
-    -- once that batch completes.
+  , handDispose ∷ ChunkRef → IO (Either Text (STM ConstructedDisposal))
+    -- ^ Release a chunk's buffer and forget the chunk, answering a reading of the buffer's physical disposal: the
+    -- backend destroys it once the batches that recorded it complete, and only then is it done. A chunk without a
+    -- buffer is done at once.
   }
+
+-- | Why the owner did not admit a step: its queue is full or its device is not ready (a later admission can
+-- succeed), or it takes no more actions (its exit began, or its session failed), with the host's answer.
+data ScheduleRefusal = ScheduleBusy | ScheduleEnded !Text
+  deriving (Eq, Show)
+
+-- | How an admitted step ended: it ran, the owner refused it before it ran (its exit began, its session failed), or it
+-- raised.
+data StepOutcome = StepRan | StepRefused !Text | StepRaised !Text
+  deriving (Eq, Show)
 
 -- | What the views use of the owner and its host from any thread: each a transaction that never waits.
 data OwnerPorts = OwnerPorts
-  { ownerSchedule ∷ (Hands → IO ()) → STM Bool
-    -- ^ Admit one owner action that runs this step with the owner's hands; 'False' when the owner's queue refused
-    -- it (full, not ready, closed).
-  , ownerRelease ∷ STM () → STM (Either Text (STM (Maybe Bool)))
+  { ownerSchedule ∷ (Hands → IO ()) → STM (Either ScheduleRefusal (STM (Maybe StepOutcome)))
+    -- ^ Admit one owner action that runs this step with the owner's hands, answering a reading of how it ended
+    -- ('Nothing' while it is queued or running).
+  , ownerRelease ∷ STM () → STM (Either Text (STM (Maybe (Either Text ()))))
     -- ^ Ask the host's FIFO release lane for a barrier: the action runs, with this transaction, once every revision
-    -- published before the request has been adopted. The reading is 'Nothing' while it waits, 'Just True' once
-    -- met and 'Just False' when the owner will never meet it. A full lane is a 'Left'.
+    -- published before the request has been adopted. The reading is 'Nothing' while it waits, @Just (Right ())@ once
+    -- met and @Just (Left why)@, with the host's answer, when the owner will never meet it. A full lane is a 'Left'.
   , ownerStanding ∷ ChunkRef → STM (Maybe ChunkStanding)
     -- ^ A chunk's upload: uploading, ready or failed; 'Nothing' for one never built or since released.
   , ownerMaterial ∷ !MaterialRef
@@ -80,7 +95,8 @@ data OwnerPorts = OwnerPorts
   , ownerDepthQualified ∷ !Bool
     -- ^ Whether the session's depth format is @D32_SFLOAT@.
   , ownerEnded ∷ STM (Maybe Text)
-    -- ^ The owner's terminal failure, once it has one: what can no longer be disposed of ends with it as cause.
+    -- ^ Why the owner takes no more actions, once it does not: its session failed, or its exit began. What can no
+    -- longer be disposed of ends with it as cause.
   }
 
 -- | The capabilities over the running host and the composed graphics session.
@@ -91,8 +107,16 @@ productionOwner host graphics = do
     OwnerPorts
       { ownerSchedule = \step →
           submitVulkanAction host (VulkanAction (\construction → step (hands material construction))) >>= \case
-            Right _ → pure True
-            Left _ → pure False
+            Left ActionQueueFull → pure (Left ScheduleBusy)
+            Left ActionDeviceNotReady → pure (Left ScheduleBusy)
+            Left refusal → pure (Left (ScheduleEnded (Text.pack (show refusal))))
+            Right ticket →
+              pure . Right $
+                readVulkanAction ticket >>= \case
+                  Nothing → pure Nothing
+                  Just (ActionReturned ()) → pure (Just StepRan)
+                  Just (ActionRefused why) → pure (Just (StepRefused (Text.pack (show why))))
+                  Just (ActionRaised why) → pure (Just (StepRaised (Text.pack (show why))))
       , ownerRelease = \after →
           requestVulkanRelease host (VulkanAction (\_ → atomically after)) >>= \case
             Left refusal → pure (Left (Text.pack (refusalText refusal)))
@@ -100,13 +124,14 @@ productionOwner host graphics = do
               pure . Right $
                 readVulkanAction ticket >>= \case
                   Nothing → pure Nothing
-                  Just (ActionReturned ()) → pure (Just True)
-                  Just _ → pure (Just False)
+                  Just (ActionReturned ()) → pure (Just (Right ()))
+                  Just (ActionRefused why) → pure (Just (Left ("the release lane refused the barrier: " <> Text.pack (show why))))
+                  Just (ActionRaised why) → pure (Just (Left ("the barrier raised: " <> Text.pack (show why))))
       , ownerStanding = chunkStandingSTM retained
       , ownerMaterial = material
       , ownerRegionWindow = rendererRegionWindow (graphicsRenderer graphics)
       , ownerDepthQualified = rendererDepthFormat (graphicsRenderer graphics) == Just Depth32Float
-      , ownerEnded = fmap (Text.pack . show) . reportPrimary <$> readVulkanTerminal (vulkanController host)
+      , ownerEnded = fmap (Text.pack . show) <$> readVulkanActionGate (vulkanController host)
       }
   where
     retained = graphicsRetained graphics
@@ -120,11 +145,13 @@ productionOwner host graphics = do
               Right (Left (BuildUploadBackpressure pressure)) → Left (BuildBackpressure (Text.pack (show pressure)))
               Right (Left refusal) → Left (BuildFailed (Text.pack (show refusal)))
               Right (Right chunk) → Right chunk
-        , handDispose = \chunk →
+        , handDispose = \chunk → do
+            -- the buffer, read before the release forgets the chunk, is what is physically disposed of later
+            buffer ← chunkBufferOf retained chunk
             guarded (releaseChunkNow (hostBuilders host construction) retained chunk) >>= pure . \case
               Left raised → Left raised
               Right (Left refusal) → Left (Text.pack (show refusal))
-              Right (Right ()) → Right ()
+              Right (Right ()) → Right (maybe (pure DisposalDone) (constructedDisposal construction) buffer)
         }
     refusalText = \case
       ReleaseQueueFull → "the release lane is full"

@@ -81,6 +81,7 @@ module Hetoimasia.LuaEngine.Graphics.Scene.Ledger
   , ledgerHeld
   , ledgerHolds
   , ledgerChunkHeld
+  , ledgerTagHeld
 
     -- * Interests
   , ledgerRetainInterest
@@ -114,7 +115,7 @@ import Hetoimasia.LuaEngine.Scene
   , initialContent
   , textureUses
   )
-import Hetoimasia.LuaEngine.Graphics.Scene.World (SceneWorld (..))
+import Hetoimasia.LuaEngine.Graphics.Scene.World (SceneWorld (..), WorldTag)
 import Hetoimasia.LuaEngine.Texture (TextureView (viewIdentity))
 import Hetoimasia.Render.TwoD.Chunk (ChunkRef)
 import Numeric.Natural (Natural)
@@ -168,10 +169,11 @@ data Adoption = Adoption
   { adoptionCount ∷ !Natural
   , adoptionHolds ∷ !(Set Word64)
   , adoptionChunks ∷ !(Set ChunkRef)
+  , adoptionTag ∷ !(Maybe WorldTag)
   }
 
 sameScene ∷ Adoption → Adoption → Bool
-sameScene a b = adoptionHolds a == adoptionHolds b && adoptionChunks a == adoptionChunks b
+sameScene a b = adoptionHolds a == adoptionHolds b && adoptionChunks a == adoptionChunks b && adoptionTag a == adoptionTag b
 
 data State w = State
   { stRecords ∷ !(Map (w, Natural) Adoption)
@@ -207,7 +209,7 @@ ledgerLifecycle ledger =
 -- | The owner adopted this revision of the window, with this scene: hold what it names, once more.
 ledgerAdopted ∷ (Ord w, Show w) ⇒ SceneLedger w → w → Natural → GraphicsScene → IO ()
 ledgerAdopted (SceneLedger var listener) window revision scene = atomically $ do
-  adopt var window revision (Adoption 1 (sceneHolds scene) (maybe Set.empty worldChunks (graphicsWorld scene)))
+  adopt var window revision (Adoption 1 (sceneHolds scene) (maybe Set.empty worldChunks (graphicsWorld scene)) (worldTag <$> graphicsWorld scene))
   join (readTVar listener)
 
 -- | One adoption of this revision of the window has been released: hold what it names once less.
@@ -229,7 +231,7 @@ adopt var window revision holds = do
           -- A revision is one scene. Protect the union rather than lose a hold, and say so.
           defect
             ("a revision was adopted again under a different scene: window " <> Text.pack (show window) <> ", revision " <> Text.pack (show revision))
-            counted {stRecords = Map.insert key (Adoption (adoptionCount found + 1) (adoptionHolds found <> adoptionHolds holds) (adoptionChunks found <> adoptionChunks holds)) (stRecords st)}
+            counted {stRecords = Map.insert key (Adoption (adoptionCount found + 1) (adoptionHolds found <> adoptionHolds holds) (adoptionChunks found <> adoptionChunks holds) (adoptionTag found)) (stRecords st)}
 
 release ∷ (Ord w, Show w) ⇒ TVar (State w) → w → Natural → STM ()
 release var window revision = do
@@ -259,6 +261,12 @@ ledgerHeld ledger@(SceneLedger var _) identity = do
 -- | Whether any adopted, unreleased revision lists this retained chunk.
 ledgerChunkHeld ∷ SceneLedger w → ChunkRef → STM Bool
 ledgerChunkHeld (SceneLedger var _) chunk = any (Set.member chunk . adoptionChunks) . Map.elems . stRecords <$> readTVar var
+
+-- | Whether an adopted, unreleased revision of this target is the world with this tag: a revision that can still be
+-- drawn, or whose frames are still in flight.
+ledgerTagHeld ∷ Eq w ⇒ SceneLedger w → w → WorldTag → STM Bool
+ledgerTagHeld (SceneLedger var _) target tag =
+  any (\((key, _), adoption) → key == target && adoptionTag adoption == Just tag) . Map.toList . stRecords <$> readTVar var
 
 -- | Take one explicit interest in a texture, by its complete identity: while any interest is held, the texture
 -- backend does not release the texture's registration. It never makes a released handle publishable.

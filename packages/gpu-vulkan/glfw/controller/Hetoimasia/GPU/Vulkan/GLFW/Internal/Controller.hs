@@ -179,6 +179,7 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , readVulkanRoots
   , readVulkanModel
   , readVulkanTerminal
+  , readVulkanActionGate
 
     -- * Recovery (VK-14)
   , replaceVulkanSurfaces
@@ -262,6 +263,8 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , constructReadback
   , readConstructedReadback
   , releaseConstructed
+  , ConstructedDisposal (..)
+  , constructedDisposal
   , constructTextureTable
   , constructTablePipelineLayout
   , constructShaderSampledTablePipelineLayout
@@ -2381,6 +2384,11 @@ readVulkanModel (VulkanController state) = readRootsModel (stateRoots state)
 -- retained because it could not be verified.
 readVulkanTerminal ∷ VulkanController → STM TerminalReport
 readVulkanTerminal (VulkanController state) = readRootsTerminal (stateRoots state)
+
+-- | Whether the owner takes actions now, read as admission reads it: 'Nothing' while it does, and otherwise why not
+-- (its session failed, with the primary, or its admission closed, its exit having begun).
+readVulkanActionGate ∷ VulkanController → STM (Maybe ActionRefusal)
+readVulkanActionGate (VulkanController state) = actionGate (stateRoots state) (stateOwnerOpen state)
 
 -- | What a checkpoint learns from the capture — its error latch, set by any
 -- error-severity report whatever became of the report's detail, and its

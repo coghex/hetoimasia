@@ -34,6 +34,7 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView.Inputs
   , InputsError (..)
   , planInputs
   , plannerKnowledge
+  , plannerRuns
   , knowledgeState
   ) where
 
@@ -157,24 +158,41 @@ plannerKnowledge copies =
       KnowledgeSpec
         { specRevision = let Revision knowledge = copyKnowledge copies in knowledge
         , specDefault = CellPending
-        , specRegions = [(chunkOf region, toInteger (regionZ region), knowledgeState state) | (region, Left state) ← ready]
+        , specRegions = [(chunkOf region, toInteger (regionZ region), state) | (region, Left state) ← ready]
         , specColumns = Map.toList (Map.map (sortOn (\(lo, _, _) → lo)) (Map.fromListWith (<>) (concat [columns | (_, Right columns) ← ready])))
         }
   where
     ready =
-      [ (region, summarised region known)
+      [ (region, plannerRegionKnowledge region known)
       | snapshot ← copySnapshots copies
       , region ← regionSnapshotRegions snapshot
       , PartReady known ← [regionKnowledge snapshot region]
       ]
-    summarised region known = case D.regionKnowledgeClasses known of
-      [[(_, _, only)]] → Left only
-      _ →
-        Right
-          [ (column, [(toInteger lo, toInteger hi, knowledgeState state) | (lo, hi, state) ← runs])
-          | column ← regionColumns region
-          , Just runs ← [D.regionKnowledgeColumn known column]
-          ]
+
+-- How one region's knowledge is handed to the planner: one state for a region whose knowledge is one class, and
+-- otherwise every column's runs.
+plannerRegionKnowledge ∷ RegionCoord → D.RegionKnowledge → Either CellKnowledge [(Column, [(Integer, Integer, CellKnowledge)])]
+plannerRegionKnowledge region known = case D.regionKnowledgeClasses known of
+  [[(_, _, only)]] → Left (knowledgeState only)
+  _ →
+    Right
+      [ (column, [(toInteger lo, toInteger hi, knowledgeState state) | (lo, hi, state) ← runs])
+      | column ← regionColumns region
+      , Just runs ← [D.regionKnowledgeColumn known column]
+      ]
+
+-- | The input runs and intervals one copy hands the planner, counted in the representation it is handed
+-- ('plannerKnowledge' makes it with the same helper): every removed interval, one run for a region whose knowledge is
+-- one class, and otherwise every run of every column.
+plannerRuns ∷ RegionSnapshot → Int
+plannerRuns snapshot = sum [terrain region + knowledge region | region ← regionSnapshotRegions snapshot]
+  where
+    terrain region = case regionTerrain snapshot region of
+      PartReady intervals → length intervals
+      _ → 0
+    knowledge region = case regionKnowledge snapshot region of
+      PartReady known → either (const 1) (sum . map (length . snd)) (plannerRegionKnowledge region known)
+      _ → 0
 
 -- | The planner's state of what discovery knows of a cell.
 knowledgeState ∷ D.CellKnowledge → CellKnowledge

@@ -26,6 +26,7 @@ import GHC.Stats (RTSStats (..), getRTSStats, getRTSStatsEnabled)
 import Hetoimasia.Foundation.Log (callbackSink, defaultLogFilter, mkLogger)
 import Hetoimasia.Foundation.Messaging.Payload (prepare, preparedValue)
 import Hetoimasia.Foundation.Worker (withWorkerGroup)
+import Hetoimasia.GPU.Vulkan.GLFW (TicketState (..))
 import Hetoimasia.LuaEngine.Graphics.Scene
 import Hetoimasia.LuaEngine.Graphics.TerrainView hiding (styleAssets)
 import Hetoimasia.LuaEngine.Graphics.Texture (textureHandleOf)
@@ -38,6 +39,7 @@ import Hetoimasia.Render.TwoD.Material.Backend (materialRef)
 import Hetoimasia.Render.TwoD.Metrics (PixelExtent (..), TargetMetrics (..))
 import qualified Hetoimasia.Render.TwoD.Validation as Validation
 import Hetoimasia.Render.TwoD.Vulkan.Chunks (ChunkStanding (..))
+import Hetoimasia.Terrain.Cell (mkMaterialId)
 import Hetoimasia.Terrain.Coordinate (AxisCoord, axisFromInteger, tileCoord)
 import Hetoimasia.Terrain.Render2D.AtlasFixtures (AtlasStyle (..), boundPackedTextures, loadAtlasStyle)
 import Hetoimasia.LuaEngine.Graphics.TerrainView.Inputs (combineCopies, planInputs)
@@ -48,10 +50,11 @@ import Hetoimasia.Terrain.Render2D.Facts (TerrainFacts (..))
 import Hetoimasia.Terrain.Render2D.Material (recordLayout)
 import Hetoimasia.Terrain.Render2D.Presentation (pushBlockBytes)
 import Hetoimasia.Terrain.Render2D.Presentation (LightInput (..), LightSettings, defaultLightInput, defaultLightSettings, mkLightSettings)
-import Hetoimasia.Terrain.Runtime hiding (closeView, openView)
+import Hetoimasia.Terrain.Runtime hiding (closeView, openView, viewIncarnation)
 import Hetoimasia.Terrain.Runtime.Storage (filesystemOf, minHeadroomBytes, mkStorageConfig)
 import Hetoimasia.Terrain.Runtime.Store (StoreSpec (..), defaultStoreSpec, minAllowanceBytes)
 import Hetoimasia.Terrain.Residency (Limits, LimitsSpec (..), mkLimits)
+import Hetoimasia.Terrain.Shape (ViewFacing (..))
 import Hetoimasia.Terrain.Source (LayerSpec (..), SourceSpec (..))
 import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec hiding (after, before)
@@ -67,9 +70,9 @@ data Rig = Rig
   { rigViews ∷ TerrainViews Int
   , rigTerrain ∷ !Service
   , rigLease ∷ !ArenaLease
-  , rigQueue ∷ !(TVar (Seq (Hands → IO ())))
+  , rigQueue ∷ !(TVar (Seq (Hands → IO (), TVar (Maybe StepOutcome))))
   , rigQueueOpen ∷ !(TVar Bool)
-  , rigLane ∷ !(TVar (Seq (STM (), TVar (Maybe Bool))))
+  , rigLane ∷ !(TVar (Seq (STM (), TVar (Maybe (Either Text ())))))
   , rigLaneCapacity ∷ !(TVar Int)
   , rigStandings ∷ !(TVar (Map.Map ChunkRef ChunkStanding))
   , rigChunks ∷ !(TVar (Map.Map ChunkRef Chunk))
@@ -84,24 +87,36 @@ data Rig = Rig
   , rigOwnerEnded ∷ !(TVar (Maybe Text))
   , rigStyle ∷ !AtlasStyle
   , rigAccount ∷ !RenderAccount
+  , rigDeferDisposal ∷ !(TVar Bool)
+  , rigPendingDisposals ∷ !(TVar (Map.Map ChunkRef (TVar ConstructedDisposal)))
+  , rigHold ∷ !(TVar (Maybe Word32))
+    -- ^ The build of this chunk index waits, once, until the example resumes it.
+  , rigEntered ∷ !(TMVar ())
+  , rigResume ∷ !(TMVar ())
+  , rigStyleReleases ∷ !(TVar Int)
   }
 
+-- | What the host does once the body has ended: everything (its targets retire), everything but retire its targets'
+-- adoptions (a live target keeps its scene), or nothing.
+data Teardown = TeardownFull | TeardownLive | TeardownNone
+  deriving (Eq)
+
 data Options = Options
-  { optTeardown ∷ Bool
-    -- ^ Whether the host's teardown is played when the body ends ('False' leaves the views' drain waiting).
+  { optTeardown ∷ Teardown
+    -- ^ The host's teardown, played when the body ends ('TeardownNone' leaves the views' drain waiting).
   , optProfile ∷ ViewProfile
   , optWindow ∷ Word64
   , optRuntime ∷ Config → Config
   }
 
 defaultOptions ∷ Options
-defaultOptions = Options True smallProfile 196608 id
+defaultOptions = Options TeardownFull smallProfile 196608 id
 
 -- A small profile: enough for the examples' views, small enough that its caps are reachable.
 smallProfile ∷ ViewProfile
 smallProfile = defaultViewProfile {profileSlots = 64, profileQuads = 8192, profilePending = 4096, profileRegions = 64}
 
--- A profile of eight slots, which a zoomed-out replacement cannot fit beside the drawn revision.
+-- A profile of eight slots, which a replacement rebuilding every chunk cannot fit beside the drawn revision.
 slotted ∷ ViewProfile
 slotted = smallProfile {profileSlots = 8, profileQuads = 4096}
 
@@ -152,12 +167,26 @@ withRig options body =
         receipts ← newDrawReceipts
         ownerEnded ← newTVarIO Nothing
         account ← newRenderAccount (128 * 1024 * 1024)
+        deferDisposal ← newTVarIO False
+        pendingDisposals ← newTVarIO Map.empty
+        hold ← newTVarIO Nothing
+        entered ← newEmptyTMVarIO
+        resume ← newEmptyTMVarIO
+        styleReleases ← newTVarIO 0
         initial ← prepare initialGraphicsScene
         let owner =
               OwnerPorts
                 { ownerSchedule = \step → do
+                    ended ← readTVar ownerEnded
                     accepting ← readTVar queueOpen
-                    if accepting then True <$ modifyTVar' queue (|> step) else pure False
+                    case ended of
+                      Just why → pure (Left (ScheduleEnded why))
+                      Nothing
+                        | not accepting → pure (Left ScheduleBusy)
+                        | otherwise → do
+                            outcome ← newTVar Nothing
+                            modifyTVar' queue (|> (step, outcome))
+                            pure (Right (readTVar outcome))
                 , ownerRelease = \after → do
                     room ← readTVar laneCapacity
                     held ← Seq.length <$> readTVar lane
@@ -175,27 +204,30 @@ withRig options body =
                 }
             ports = TerrainViewsPorts owner ledger claims receipts initial terrain client account
         ending ← newTVarIO False
-        -- When the body has ended, the host's own teardown is played by this thread: every target's adoptions are
-        -- released (the targets retire), the barriers met and the owner's actions run, so the views' drain completes.
-        let teardown = do
+        -- When the body has ended, the host's own teardown is played by this thread: the barriers are met and the
+        -- owner's actions run, and (unless the targets stay live) every target's adoptions are released, so the views'
+        -- drain completes.
+        let retireTargets = optTeardown options == TeardownFull
+            teardown = do
               atomically (readTVar ending >>= check)
               let loop = do
                     atomically $ do
                       queued ← readTVar queue
                       asked ← readTVar lane
                       records ← readingRecords <$> ledgerReading ledger
-                      check (not (Seq.null queued && Seq.null asked && null records))
-                    records ← readingRecords <$> atomically (ledgerReading ledger)
-                    forM_ records $ \((key, revision), count) → forM_ [1 .. count] (\_ → ledgerReleased ledger key revision)
+                      check (not (Seq.null queued && Seq.null asked && (null records || not retireTargets)))
+                    when retireTargets $ do
+                      records ← readingRecords <$> atomically (ledgerReading ledger)
+                      forM_ records $ \((key, revision), count) → forM_ [1 .. count] (\_ → ledgerReleased ledger key revision)
                     entries ← atomically (readTVar lane <* writeTVar lane Seq.empty)
-                    forM_ entries $ \(after, answer) → atomically (writeTVar answer (Just True) >> after)
+                    forM_ entries $ \(after, answer) → atomically (writeTVar answer (Just (Right ())) >> after)
                     steps ← atomically (readTVar queue <* writeTVar queue Seq.empty)
-                    forM_ steps ($ fakeHands)
+                    forM_ steps $ \(step, outcome) → step fakeHands >> atomically (writeTVar outcome (Just StepRan))
                     loop
               loop
-            rig views = Rig views terrain lease queue queueOpen lane laneCapacity standings chunks disposed attempts buildFailure disposeFailure next ledger claims receipts ownerEnded style account
+            rig views = Rig views terrain lease queue queueOpen lane laneCapacity standings chunks disposed attempts buildFailure disposeFailure next ledger claims receipts ownerEnded style account deferDisposal pendingDisposals hold entered resume styleReleases
             fakeHands = hands (rig (error "the teardown's hands read no service"))
-        withOwnedThread (when (optTeardown options) teardown) $ \_ _ →
+        withOwnedThread (when (optTeardown options /= TeardownNone) teardown) $ \_ _ →
           withTerrainViews defaultTerrainViewsConfig {tvProfile = optProfile options} ports $ \views →
             body (rig views) `finally` atomically (writeTVar ending True)
 
@@ -225,7 +257,13 @@ cameraLimits =
 hands ∷ Rig → Hands
 hands rig =
   Hands
-    { handBuild = \instances records → atomically $ do
+    { handBuild = \instances records → do
+      upcoming ← readTVarIO (rigNext rig)
+      held ← atomically $ do
+        hold ← readTVar (rigHold rig)
+        if hold == Just upcoming then True <$ (writeTVar (rigHold rig) Nothing >> putTMVar (rigEntered rig) ()) else pure False
+      when held (atomically (takeTMVar (rigResume rig)))
+      atomically $ do
         failure ← readTVar (rigBuildFailure rig)
         case failure of
           Just why → pure (Left why)
@@ -247,7 +285,13 @@ hands rig =
             modifyTVar' (rigChunks rig) (Map.delete chunk)
             modifyTVar' (rigStandings rig) (Map.delete chunk)
             modifyTVar' (rigDisposed rig) (chunk :)
-            pure (Right ())
+            deferred ← readTVar (rigDeferDisposal rig)
+            if deferred
+              then do
+                standing ← newTVar DisposalPending
+                modifyTVar' (rigPendingDisposals rig) (Map.insert chunk standing)
+                pure (Right (readTVar standing))
+              else pure (Right (pure DisposalDone))
     }
   where
     material = materialRef 11 (MaterialFacts True recordLayout (fromIntegral pushBlockBytes))
@@ -258,12 +302,26 @@ runOwner rig = go (100000 ∷ Int)
   where
     go 0 = expectationFailure "the owner never became idle"
     go n =
-      atomically (Seq.viewl <$> readTVar (rigQueue rig)) >>= \case
-        Seq.EmptyL → pure ()
-        step Seq.:< _ → do
-          atomically (modifyTVar' (rigQueue rig) (Seq.drop 1))
+      atomically (Seq.viewl <$> readTVar (rigQueue rig) >>= \case
+        Seq.EmptyL → pure Nothing
+        next Seq.:< rest → Just next <$ writeTVar (rigQueue rig) rest) >>= \case
+        Nothing → pure ()
+        Just (step, outcome) → do
           step (hands rig)
+          atomically (writeTVar outcome (Just StepRan))
           go (n - 1)
+
+-- The owner's exit begins: it takes no more actions, and refuses the ones queued.
+endRigOwner ∷ Rig → Text → IO ()
+endRigOwner rig why = atomically $ do
+  writeTVar (rigOwnerEnded rig) (Just why)
+  queued ← readTVar (rigQueue rig)
+  writeTVar (rigQueue rig) Seq.empty
+  forM_ queued $ \(_, outcome) → writeTVar outcome (Just (StepRefused why))
+
+-- Wait, bounded, for a condition the views' own threads bring about.
+eventually ∷ STM Bool → IO ()
+eventually condition = timeout 10000000 (atomically (condition >>= check)) >>= maybe (expectationFailure "the condition never held") pure
 
 -- Run the owner, waiting (bounded) for the terrain service's settlements that ask for further steps, until the
 -- condition holds.
@@ -291,19 +349,23 @@ data Target = Target
   , targetMetrics ∷ !(TVar (Maybe TargetMetrics))
   , targetAccepts ∷ !(TVar Bool)
   , targetAdopted ∷ !(TVar (Maybe Word64))
+  , targetAuthority ∷ !(TVar Bool)
   }
 
 metricsOf ∷ Int → Int → TargetMetrics
 metricsOf w h = TargetMetrics (PixelExtent w h) (PixelExtent w h) 1 1
 
 newTarget ∷ Int → IO Target
-newTarget key = Target key <$> newTVarIO [] <*> newTVarIO True <*> newTVarIO (Just (metricsOf 320 240)) <*> newTVarIO True <*> newTVarIO Nothing
+newTarget key = Target key <$> newTVarIO [] <*> newTVarIO True <*> newTVarIO (Just (metricsOf 320 240)) <*> newTVarIO True <*> newTVarIO Nothing <*> newTVarIO True
 
 viewTarget ∷ Target → ViewTarget Int
 viewTarget target =
   ViewTarget
     { vtKey = targetKey target
     , vtUsable = readTVar (targetUsable target)
+    , vtAuthority = readTVar (targetAuthority target)
+    , vtBind = pure ()
+    , vtUnbind = pure ()
     , vtPublish = \scene → do
         accepts ← readTVar (targetAccepts target)
         when accepts $ do
@@ -339,7 +401,13 @@ adoptHolding rig target = do
 meetBarriers ∷ Rig → IO ()
 meetBarriers rig = do
   entries ← atomically (readTVar (rigLane rig) <* writeTVar (rigLane rig) Seq.empty)
-  forM_ entries $ \(after, answer) → atomically (writeTVar answer (Just True) >> after)
+  forM_ entries $ \(after, answer) → atomically (writeTVar answer (Just (Right ())) >> after)
+
+-- The host refuses every barrier asked so far.
+refuseBarriers ∷ Rig → Text → IO ()
+refuseBarriers rig why = do
+  entries ← atomically (readTVar (rigLane rig) <* writeTVar (rigLane rig) Seq.empty)
+  forM_ entries $ \(_, answer) → atomically (writeTVar answer (Just (Left why)))
 
 -- Publish, adopt, meet the barriers and run the owner until nothing more moves.
 quiesce ∷ Rig → Target → IO ()
@@ -360,9 +428,22 @@ publishedAtLeast ∷ TerrainView Int → Word64 → STM Bool
 publishedAtLeast view revision = maybe False (>= revision) . readingPublished <$> readView view
 
 styleOf ∷ Rig → IO ViewStyle
-styleOf rig = do
+styleOf rig = styleWith rig ["loam", "granite"] (pure True)
+
+-- A style whose mapping gives a region to these materials, whose parents' leases are live while this says so, and
+-- whose release is counted.
+styleWith ∷ Rig → [String] → STM Bool → IO ViewStyle
+styleWith rig mapped live = do
   textures ← boundPackedTextures (rigStyle rig) (textureHandleOf colourIdentity) (textureHandleOf normalIdentity)
-  pure (ViewStyle (styleAssets (rigStyle rig)) textures (Set.fromList [colourIdentity, normalIdentity]) (pure ()))
+  pure
+    ViewStyle
+      { styleSnapshot = styleAssets (rigStyle rig)
+      , styleBound = textures
+      , styleParents = Set.fromList [colourIdentity, normalIdentity]
+      , styleMapped = Set.fromList [either (error . show) id (mkMaterialId name) | name ← mapped]
+      , styleLive = live
+      , styleRelease = atomically (modifyTVar' (rigStyleReleases rig) (+ 1))
+      }
 
 openOn ∷ Rig → Target → IO (TerrainView Int)
 openOn rig target = do
@@ -392,8 +473,9 @@ coherent rig world = do
     Left why → expectationFailure ("the published revision does not validate: " <> show why)
     Right _ → pure ()
 
-brighter ∷ LightSettings
+brighter, dimmer ∷ LightSettings
 brighter = either (error . show) id (mkLightSettings defaultLightInput {inputAmbient = 0.6})
+dimmer = either (error . show) id (mkLightSettings defaultLightInput {inputAmbient = 0.4})
 
 -- ---------------------------------------------------------------------------
 -- The examples
@@ -481,8 +563,8 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         quiesce rig target
         before ← atomically (latestWorld target)
         published ← atomically (readingPublished <$> readView view)
-        -- a zoom out needs more chunks than the slots left beside the drawn revision's
-        atomically (configureView view noConfigure {configureZoom = Just 0.125}) `shouldReturn` Right ()
+        -- a new facing rebuilds every chunk: more than the slots left beside the drawn revision's
+        atomically (configureView view noConfigure {configureFacing = Just FaceWest}) `shouldReturn` Right ()
         settleUntil rig (isJust . readingRefusal <$> readView view)
         reading ← atomically (readView view)
         readingRefusal reading `shouldSatisfy` \case
@@ -515,13 +597,14 @@ spec = describe "terrain views (TRA-9 v2)" $ do
           _ → False)
         atomically (readTVar (targetScenes target)) `shouldReturn` []
 
-    it "refuses a candidate whose copies hold more input runs and intervals than the profile allows" $
-      withRig defaultOptions {optProfile = smallProfile {profileRuns = 1}} $ \rig → do
+    it "refuses a candidate whose copies hold more input runs and intervals than the profile allows, across split copies" $
+      withRig defaultOptions {optProfile = smallProfile {profileRuns = 1, profileRequestRegions = 1}} $ \rig → do
         target ← newTarget 1
         view ← openOn rig target
         settleUntil rig (isJust . readingRefusal <$> readView view)
+        -- each copy holds one region: the cap is met by the copies together, as they are accepted
         atomically (readingRefusal <$> readView view) >>= (`shouldSatisfy` \case
-          Just (LimitRuns _ 1) → True
+          Just (LimitRuns runs 1) → runs > 1
           _ → False)
 
     it "refuses a view when the profile's targets are all open, or the target carries no qualified depth image" $
@@ -633,7 +716,7 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         Set.toList (worldChunks world) `shouldSatisfy` all (`elem` after)
         atomically (serviceOccupied <$> readTerrainViews (rigViews rig)) `shouldReturn` Map.empty
 
-    it "keeps a retirement behind a full release lane, and drains it when the lane has room" $
+    it "keeps a retirement behind a full release lane, and drains it once the lane has room, with no caller's kick" $
       withPublished defaultOptions $ \rig target view → do
         quiesce rig target
         atomically (writeTVar (rigLaneCapacity rig) 0)
@@ -643,12 +726,13 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         runOwner rig
         reading ← atomically (readTerrainViews (rigViews rig))
         serviceRetiring reading `shouldBe` Set.size (worldChunks world)
+        -- another component's release leaves the lane: the views' watcher asks for the barrier itself
         atomically (writeTVar (rigLaneCapacity rig) 64)
-        atomically (kick (rigViews rig))
-        runOwner rig
+        eventually (not . Seq.null <$> readTVar (rigLane rig))
         meetBarriers rig
-        runOwner rig
-        atomically (serviceRetiring <$> readTerrainViews (rigViews rig)) `shouldReturn` 0
+        settleUntil rig ((== 0) . serviceRetiring <$> readTerrainViews (rigViews rig))
+        disposed ← readTVarIO (rigDisposed rig)
+        Set.toList (worldChunks world) `shouldSatisfy` all (`elem` disposed)
 
     it "disposes of an in-flight build's chunks when its view closes, and of a failed build's" $
       withRig defaultOptions $ \rig → do
@@ -674,6 +758,22 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         atomically (kick (rigViews rig))
         settleUntil rig ((== ViewEnded EndTargetGone) . readingStatus <$> readView view)
         atomically (claimOf (rigClaims rig) 1) `shouldReturn` Nothing
+
+    it "hands a failed handback's chunks to the session's teardown when the service ends while its target still shows them" $ do
+      held ← newIORef Nothing
+      _ ← withPublished defaultOptions {optTeardown = TeardownLive} $ \rig target view → do
+        quiesce rig target
+        world ← atomically (latestWorld target) >>= maybe (fail "no world") pure
+        atomically (writeTVar (targetAccepts target) False)
+        _ ← closeView view
+        runOwner rig
+        writeIORef held (Just (rigViews rig, rigDisposed rig, world))
+      (views, disposedVar, world) ← readIORef held >>= maybe (fail "the rig never started") pure
+      -- the scope returned with the live target still adopting the scene: nothing of it was disposed of
+      disposed ← readTVarIO disposedVar
+      Set.toList (worldChunks world) `shouldSatisfy` all (`notElem` disposed)
+      failures ← atomically (serviceFailures <$> readTerrainViews views)
+      [chunk | (_, Just chunk, cause) ← failures, "failed handback" `Text.isInfixOf` cause] `shouldMatchList` Set.toList (worldChunks world)
 
     it "keeps the chunks of a failed handback until the service ends" $
       withPublished defaultOptions $ \rig target view → do
@@ -708,6 +808,231 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         Map.findWithDefault 0 1 (serviceOccupied reading) `shouldBe` length failures
         (serviceRetiring reading, servicePrivate reading) `shouldBe` (0, 0)
 
+  describe "ownership" $ do
+    it "hands each chunk on once when its view closes between two builds of a batch" $
+      withRig defaultOptions $ \rig → do
+        target ← newTarget 1
+        view ← openOn rig target
+        -- the second chunk of the first batch waits: the first is the built prefix
+        first ← readTVarIO (rigNext rig)
+        atomically (writeTVar (rigHold rig) (Just (first + 1)))
+        stop ← newTVarIO False
+        let owner = do
+              runOwner rig
+              continue ← atomically ((False <$ (readTVar stop >>= check)) `orElse` (True <$ (readTVar (rigQueue rig) >>= check . not . Seq.null)))
+              when continue owner
+        withOwnedThread (owner `finally` pure ()) $ \_ ended → do
+          timeout 10000000 (atomically (takeTMVar (rigEntered rig))) >>= maybe (expectationFailure "no build was held") pure
+          _ ← closeView view
+          atomically (putTMVar (rigResume rig) ())
+          atomically (writeTVar stop True)
+          ended
+        settleUntil rig (((== 0) . servicePrivate) <$> readTerrainViews (rigViews rig))
+        built ← readTVarIO (rigNext rig)
+        attempts ← readTVarIO (rigAttempts rig)
+        -- every chunk built, the prefix and the one in hand when the view closed, was released exactly once
+        [Map.findWithDefault 0 (chunkRef index 1) attempts | index ← [first .. built - 1]] `shouldSatisfy` all (== 1)
+        readTVarIO (rigChunks rig) `shouldReturn` Map.empty
+        atomically (serviceOccupied <$> readTerrainViews (rigViews rig)) `shouldReturn` Map.empty
+
+    it "waits for the owner's running build before the service returns its reservation, and disposes of what it built" $ do
+      held ← newIORef Nothing
+      withRig defaultOptions $ \rig → do
+        writeIORef held (Just rig)
+        target ← newTarget 1
+        _ ← openOn rig target
+        first ← readTVarIO (rigNext rig)
+        atomically (writeTVar (rigHold rig) (Just first))
+        stop ← newTVarIO False
+        let owner = do
+              runOwner rig
+              continue ← atomically ((False <$ (readTVar stop >>= check)) `orElse` (True <$ (readTVar (rigQueue rig) >>= check . not . Seq.null)))
+              when continue owner
+        -- the build is held across the body's end; the scope's drain waits for the step, which is resumed from here
+        _ ← withOwnedThread owner $ \_ _ → do
+          timeout 10000000 (atomically (takeTMVar (rigEntered rig))) >>= maybe (expectationFailure "no build was held") pure
+          atomically (writeTVar stop True)
+        _ ← withOwnedThread (atomically (putTMVar (rigResume rig) ())) $ \_ _ → pure ()
+        pure ()
+      rig ← readIORef held >>= maybe (fail "the rig never started") pure
+      atomically (accountCharged (rigAccount rig)) `shouldReturn` 0
+      readTVarIO (rigChunks rig) `shouldReturn` Map.empty
+      attempts ← readTVarIO (rigAttempts rig)
+      Map.elems attempts `shouldSatisfy` all (== 1)
+
+    it "keeps a released chunk's slot until the backend confirms its disposal; a failed disposal keeps it with its cause" $
+      withPublished defaultOptions $ \rig target view → do
+        quiesce rig target
+        atomically (writeTVar (rigDeferDisposal rig) True)
+        world ← atomically (latestWorld target) >>= maybe (fail "no world") pure
+        let chunks = Set.toList (worldChunks world)
+        _ ← closeView view
+        adopt rig target
+        runOwner rig
+        meetBarriers rig
+        settleUntil rig ((== length chunks) . serviceDisposing <$> readTerrainViews (rigViews rig))
+        -- released, not yet destroyed: every slot is still occupied
+        atomically (Map.findWithDefault 0 1 . serviceOccupied <$> readTerrainViews (rigViews rig)) `shouldReturn` length chunks
+        awaiting ← readTVarIO (rigPendingDisposals rig)
+        case chunks of
+          refused : rest → do
+            atomically $ do
+              forM_ rest $ \chunk → forM_ (Map.lookup chunk awaiting) (`writeTVar` DisposalDone)
+              forM_ (Map.lookup refused awaiting) (`writeTVar` DisposalFailed "the device refused")
+            settleUntil rig ((== 0) . serviceDisposing <$> readTerrainViews (rigViews rig))
+            reading ← atomically (readTerrainViews (rigViews rig))
+            Map.findWithDefault 0 1 (serviceOccupied reading) `shouldBe` 1
+            [cause | (_, Just chunk, cause) ← serviceFailures reading, chunk == refused] `shouldSatisfy` any ("device refused" `Text.isInfixOf`)
+          [] → expectationFailure "the world listed no chunk"
+
+    it "counts a closed target whose chunks still occupy slots against the profile's targets until they are disposed of" $
+      withRig defaultOptions {optProfile = smallProfile {profileTargets = 1}} $ \rig → do
+        first ← newTarget 1
+        view ← openOn rig first
+        settleUntil rig (publishedAtLeast view 1)
+        adoptHolding rig first
+        _ ← closeView view
+        runOwner rig
+        second ← newTarget 2
+        style ← styleOf rig
+        refused ← openView (rigViews rig) (OpenRequest (viewTarget second) (rigLease rig) (pure (Right style)) (axis 0, axis 0, axis 1) defaultLightSettings)
+        either Just (const Nothing) refused `shouldBe` Just OpenTooManyViews
+        -- the handback is adopted, the old frames complete, the chunks go
+        adopt rig first
+        meetBarriers rig
+        settleUntil rig (Map.null . serviceOccupied <$> readTerrainViews (rigViews rig))
+        _ ← openOn rig second
+        pure ()
+
+    it "pins an adopted successor: a third revision waits while the drawn one and an adopted successor can still be drawn" $
+      withPublished defaultOptions $ \rig target view → do
+        first ← atomically (latestWorld target) >>= maybe (fail "no world") pure
+        adopt rig target
+        atomically (noteSubmitted (rigReceipts rig) (worldTag first) (worldMetrics first))
+        atomically (configureView view noConfigure {configureLight = Just brighter}) `shouldReturn` Right ()
+        settleUntil rig (publishedAtLeast view 2)
+        second ← atomically (latestWorld target) >>= maybe (fail "no world") pure
+        adoptHolding rig target
+        atomically (configureView view noConfigure {configureLight = Just dimmer}) `shouldReturn` Right ()
+        settleUntil rig ((== "building (0 to build)") . readingStage <$> readView view)
+        runOwner rig
+        atomically (readingPublished <$> readView view) `shouldReturn` Just (tagRevision (worldTag second))
+        -- a frame draws the adopted successor: its plan is still pinned, and the third revision follows
+        atomically (noteSubmitted (rigReceipts rig) (worldTag second) (worldMetrics second))
+        drawn ← atomically (viewDrawn view) >>= maybe (fail "nothing drawn") pure
+        drawnTag (drawnPlanReceipt drawn) `shouldBe` worldTag second
+        isJust (drawnPlanPlan drawn) `shouldBe` True
+        atomically (kick (rigViews rig))
+        settleUntil rig (publishedAtLeast view (tagRevision (worldTag second) + 1))
+        again ← atomically (viewDrawn view) >>= maybe (fail "nothing drawn") pure
+        isJust (drawnPlanPlan again) `shouldBe` True
+
+    it "moves a live view's receipt only: an offscreen batch advances it once complete, never once discarded or after the close" $
+      withPublished defaultOptions $ \rig target view → do
+        world ← atomically (latestWorld target) >>= maybe (fail "no world") pure
+        let receipts = rigReceipts rig
+            note = do
+              ticket ← newTVarIO TicketPending
+              atomically (noteOffscreenBatch receipts (readTVar ticket) (worldTag world) (worldMetrics world))
+              pure ticket
+        discarded ← note
+        atomically (writeTVar discarded TicketDiscarded)
+        atomically (readingDrawn <$> readView view) `shouldReturn` Nothing
+        complete ← note
+        atomically (readingDrawn <$> readView view) `shouldReturn` Nothing
+        atomically (writeTVar complete TicketComplete)
+        atomically (fmap drawnTag . readingDrawn <$> readView view) `shouldReturn` Just (worldTag world)
+        late ← note
+        _ ← closeView view
+        atomically (writeTVar late TicketComplete)
+        atomically (noteSubmitted receipts (worldTag world) (worldMetrics world))
+        _ ← atomically (sweepOffscreen receipts)
+        atomically (readReceipt receipts (viewIncarnation view)) `shouldReturn` Nothing
+
+  describe "settlement" $ do
+    it "ends every view when the owner's exit begins: a pending move settles as ended, and controls are refused" $
+      withPublished defaultOptions $ \rig _ view → do
+        Right move ← atomically (moveView view (JumpTarget (axis 4000) (axis 4000) (Just (axis 1))))
+        endRigOwner rig "its exit began"
+        eventually ((== ViewEnded EndStopped) . readingStatus <$> readView view)
+        atomically (moveSettled move) `shouldReturn` Just (MoveEnded EndStopped)
+        atomically (configureView view noConfigure {configureLight = Just brighter}) `shouldReturn` Left ControlEnded
+        target ← newTarget 2
+        style ← styleOf rig
+        refused ← openView (rigViews rig) (OpenRequest (viewTarget target) (rigLease rig) (pure (Right style)) (axis 0, axis 0, axis 1) defaultLightSettings)
+        either Just (const Nothing) refused `shouldBe` Just OpenStopped
+
+    it "ends a refused barrier's retirement with the host's cause, and the service still drains" $
+      withPublished defaultOptions $ \rig target view → do
+        quiesce rig target
+        world ← atomically (latestWorld target) >>= maybe (fail "no world") pure
+        _ ← closeView view
+        adopt rig target
+        runOwner rig
+        refuseBarriers rig "the lane refused the barrier"
+        settleUntil rig ((== 0) . serviceRetiring <$> readTerrainViews (rigViews rig))
+        failures ← atomically (serviceFailures <$> readTerrainViews (rigViews rig))
+        [chunk | (_, Just chunk, cause) ← failures, "lane refused" `Text.isInfixOf` cause] `shouldMatchList` Set.toList (worldChunks world)
+
+    it "settles a move with pressure when its destination is beyond the profile's regions, and bounds every copy round by them" $
+      withRig defaultOptions {optProfile = smallProfile {profileRegions = 1}} $ \rig → do
+        target ← newTarget 1
+        view ← openOn rig target
+        settleUntil rig (publishedAtLeast view 1)
+        drawn ← do
+          world ← atomically (latestWorld target) >>= maybe (fail "no world") pure
+          atomically (noteSubmitted (rigReceipts rig) (worldTag world) (worldMetrics world))
+          atomically (viewDrawn view) >>= maybe (fail "nothing drawn") pure
+        fmap Set.size (drawnPlanRegions drawn) `shouldBe` Just 1
+        Right move ← atomically (moveView view (JumpTarget (axis 70) (axis 70) Nothing))
+        settleUntil rig (isJust <$> moveSettled move)
+        atomically (moveSettled move) >>= (`shouldSatisfy` \case
+          Just (MovePressure (LimitRegions _ 1)) → True
+          _ → False)
+
+    it "refuses a replacement whose plan meets a plan-wide bound, and keeps the drawing" $
+      withPublished defaultOptions {optProfile = smallProfile {profileQuads = 4096}} $ \rig target view → do
+        quiesce rig target
+        before ← atomically (latestWorld target)
+        published ← atomically (readingPublished <$> readView view)
+        atomically (configureView view noConfigure {configureZoom = Just 0.125}) `shouldReturn` Right ()
+        settleUntil rig (isJust . readingRefusal <$> readView view)
+        reading ← atomically (readView view)
+        readingRefusal reading `shouldSatisfy` \case
+          Just (LimitPlan _) → True
+          _ → False
+        readingPublished reading `shouldBe` published
+        atomically (latestWorld target) `shouldReturn` before
+
+    it "refuses an open whose style misses a palette material or whose leases ended, leaving nothing held" $
+      withRig defaultOptions $ \rig → do
+        target ← newTarget 1
+        let attempt style = openView (rigViews rig) (OpenRequest (viewTarget target) (rigLease rig) (pure (Right style)) (axis 0, axis 0, axis 1) defaultLightSettings)
+        unmapped ← styleWith rig ["loam"] (pure True) >>= attempt
+        either Just (const Nothing) unmapped `shouldSatisfy` \case
+          Just (OpenStyle (StyleMissingMaterials [_])) → True
+          _ → False
+        ended ← styleWith rig ["loam", "granite"] (pure False) >>= attempt
+        either Just (const Nothing) ended `shouldBe` Just OpenLeaseEnded
+        atomically (writeTVar (targetAuthority target) False)
+        windowGone ← styleOf rig >>= attempt
+        either Just (const Nothing) windowGone `shouldBe` Just OpenLeaseEnded
+        -- each refused style was released, and no claim or GPU interest stayed
+        readTVarIO (rigStyleReleases rig) `shouldReturn` 3
+        atomically (claimOf (rigClaims rig) 1) `shouldReturn` Nothing
+        atomically (readingInterests <$> ledgerReading (rigLedger rig)) `shouldReturn` Map.empty
+
+    it "asks a target with no frame metrics yet for its first frame at open, and plans once it has one" $
+      withRig defaultOptions $ \rig → do
+        target ← newTarget 1
+        atomically (writeTVar (targetMetrics target) Nothing)
+        view ← openOn rig target
+        scenes ← readTVarIO (targetScenes target)
+        map (graphicsWorld . snd) scenes `shouldBe` [Nothing]
+        -- the frame it asked for is recorded at these metrics, and its event asks for a step
+        atomically (writeTVar (targetMetrics target) (Just (metricsOf 320 240)) >> kick (rigViews rig))
+        settleUntil rig (publishedAtLeast view 1)
+
   describe "the service's end" $ do
     it "ends every view, drains its retirements and returns the reservation" $ do
       account ← withRig defaultOptions $ \rig → do
@@ -728,7 +1053,7 @@ spec = describe "terrain views (TRA-9 v2)" $ do
 
     it "answers an interrupted drain: the reservation returns, what was retiring is recorded with the interruption, which is raised after the cleanup" $ do
       held ← newIORef Nothing
-      outcome ← timeout 3000000 . withRig defaultOptions {optTeardown = False} $ \rig → do
+      outcome ← timeout 3000000 . withRig defaultOptions {optTeardown = TeardownNone} $ \rig → do
         writeIORef held (Just (rigAccount rig, rigViews rig))
         target ← newTarget 1
         view ← openOn rig target

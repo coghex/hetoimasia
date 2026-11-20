@@ -3,8 +3,9 @@
 -- its usability, its latest-value publication as the host's own transaction, whether its frames carry the qualified
 -- depth image and the metrics its next frame is recorded with: no native control, no disposal and no raw handle.
 --
--- A registered offscreen target's frames are recorded by whoever registered it ('drawOffscreenView'), which is also
--- where its receipt advances: at the successful submission of the batch that drew the revision.
+-- A registered offscreen target's frames are recorded by whoever registered it ('drawOffscreenView'). Its receipt
+-- advances once the batch that drew the revision is complete: the owner action that records the batch notes its
+-- ticket, and the receipts promote it when the ticket says so, whatever becomes of the caller.
 module Hetoimasia.LuaEngine.Graphics.TerrainView.Target
   ( windowViewTarget
   , offscreenViewTarget
@@ -29,12 +30,13 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , VulkanHost
   , WindowScenePublication (..)
   , awaitVulkanAction
+  , readTicket
   , publishVulkanTargetScene
   , recordVulkanTargetBatch
   , submitVulkanAction
   )
 import Hetoimasia.LuaEngine.Graphics.Scene.Ledger (GraphicsScene (..))
-import Hetoimasia.LuaEngine.Graphics.Scene.Receipts (DrawReceipts, latestFrameMetrics, noteSubmitted)
+import Hetoimasia.LuaEngine.Graphics.Scene.Receipts (DrawReceipts, latestFrameMetrics, noteOffscreenBatch, unwatchFrameMetrics, watchFrameMetrics)
 import Hetoimasia.LuaEngine.Graphics.Scene.Render (RenderSession (..), renderWorldTarget)
 import Hetoimasia.LuaEngine.Graphics.Scene.World (SceneWorld (..), WorldTag)
 import Hetoimasia.LuaEngine.Graphics.TerrainView.Session (ViewTarget (..))
@@ -45,12 +47,16 @@ import Hetoimasia.Render.TwoD.Metrics (TargetMetrics)
 
 -- | A window incarnation's target. Its depth is the host's: 'True' only on a host built with the window depth a world
 -- scene draws with ('Hetoimasia.LuaEngine.Graphics.Scene.Configuration.configureWorldDepth'), which the composition
--- passes here. Its metrics are those of the window's latest recorded frame ('latestFrameMetrics').
-windowViewTarget ∷ Bool → DrawReceipts → WindowTarget GraphicsScene → ViewTarget SceneTargetKey
-windowViewTarget hostDepth receipts target =
+-- passes here. Its metrics are those of the window's latest recorded frame ('latestFrameMetrics'), kept from the
+-- view's open to its close. Its authority is the caller's original window lease (checked in the open's commit).
+windowViewTarget ∷ Bool → DrawReceipts → STM Bool → WindowTarget GraphicsScene → ViewTarget SceneTargetKey
+windowViewTarget hostDepth receipts authority target =
   ViewTarget
     { vtKey = KeyWindow (targetWindow target)
     , vtUsable = targetUsable target
+    , vtAuthority = authority
+    , vtBind = watchFrameMetrics receipts (targetAttachment target)
+    , vtUnbind = unwatchFrameMetrics receipts (targetAttachment target)
     , vtPublish = \scene →
         targetPublishSTM target scene <&> \case
           WindowScenePublished _ _ → True
@@ -66,6 +72,9 @@ offscreenViewTarget host target usable metrics =
   ViewTarget
     { vtKey = KeyOffscreen target
     , vtUsable = usable
+    , vtAuthority = usable
+    , vtBind = pure ()
+    , vtUnbind = pure ()
     , vtPublish = \scene →
         publishVulkanTargetScene host target scene <&> \case
           TargetScenePublished _ _ → True
@@ -76,8 +85,9 @@ offscreenViewTarget host target usable metrics =
 
 -- | Record the world the host adopted for a registered offscreen target into the caller's colour image (of this
 -- format) and @D32_SFLOAT@ depth image, then the caller's own commands in the same batch (a copy to a readback, say),
--- in one owner action, and advance the view's receipt once that batch has been submitted. Answers the batch's ticket
--- and the revision drawn. A target whose adopted scene is not a world records nothing and is refused.
+-- in one owner action, which notes the batch's ticket with the receipts: the view's receipt advances once that batch is
+-- complete (a discarded or lost batch drew nothing). Answers the batch's ticket and the revision drawn. A target whose
+-- adopted scene is not a world records nothing and is refused.
 drawOffscreenView
   ∷ VulkanHost GraphicsScene
   → TextureGraphics
@@ -91,21 +101,27 @@ drawOffscreenView
   → IO (Either Text (BatchTicket, WorldTag))
 drawOffscreenView host graphics receipts target metrics image format depth after = do
   let session = RenderSession (graphicsRenderer graphics) (graphicsTextures graphics) (graphicsRetained graphics)
-      action = VulkanAction $ \construction →
-        recordVulkanTargetBatch host target construction $ \scene _ recorder → case graphicsWorld scene of
-          Nothing → pure (Left "the target's adopted scene is not a terrain view's")
-          Just world →
-            renderWorldTarget session (hostBuilders host construction) world metrics image format depth recorder >>= \case
-              Left refusal → pure (Left (Text.pack (show refusal)))
-              Right () →
-                after recorder <&> \case
-                  Left refusal → Left (Text.pack (show refusal))
-                  Right () → Right (worldTag world)
+      action = VulkanAction $ \construction → do
+        recorded ←
+          recordVulkanTargetBatch host target construction $ \scene _ recorder → case graphicsWorld scene of
+            Nothing → pure (Left "the target's adopted scene is not a terrain view's")
+            Just world →
+              renderWorldTarget session (hostBuilders host construction) world metrics image format depth recorder >>= \case
+                Left refusal → pure (Left (Text.pack (show refusal)))
+                Right () →
+                  after recorder <&> \case
+                    Left refusal → Left (Text.pack (show refusal))
+                    Right () → Right (worldTag world)
+        -- on the owner's thread, before the action returns and its batch is submitted
+        case recorded of
+          Right (batch, Right tag) → atomically (noteOffscreenBatch receipts (readTicket batch) tag metrics)
+          _ → pure ()
+        pure recorded
   atomically (submitVulkanAction host action) >>= \case
     Left refusal → pure (Left (Text.pack (show refusal)))
     Right ticket →
       atomically (awaitVulkanAction ticket) >>= \case
-        ActionReturned (Right (batch, Right tag)) → Right (batch, tag) <$ atomically (noteSubmitted receipts tag metrics)
+        ActionReturned (Right (batch, Right tag)) → pure (Right (batch, tag))
         ActionReturned (Right (_, Left why)) → pure (Left why)
         ActionReturned (Left refusal) → pure (Left (Text.pack (show refusal)))
         other → pure (Left (Text.pack (outcomeText other)))
