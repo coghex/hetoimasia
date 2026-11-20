@@ -226,4 +226,3 @@ refusalOf = \case
   ReleaseQueueFull → OwnerBusy
   ActionDeviceNotReady → OwnerBusy
   _ → OwnerGone
-
