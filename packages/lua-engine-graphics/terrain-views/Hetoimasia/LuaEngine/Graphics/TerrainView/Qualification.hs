@@ -4,6 +4,7 @@
 -- keep a plan past the bracket that accounts for it.
 module Hetoimasia.LuaEngine.Graphics.TerrainView.Qualification
   ( withAdoptedPlan
+  , pickViewWith
   ) where
 
-import Hetoimasia.LuaEngine.Graphics.TerrainView.Service (withAdoptedPlan)
+import Hetoimasia.LuaEngine.Graphics.TerrainView.Service (pickViewWith, withAdoptedPlan)

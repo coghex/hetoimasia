@@ -222,13 +222,15 @@ changesExpansion snapshot =
       columns = Set.size (Set.fromList (map fst intervals))
    in fromIntegral (columns * changeColumnBytes + length intervals * changeIntervalBytes)
 
--- | The most 'changesExpansion' can be over copies of this many regions that 'planInputs' accepts: the change limits'
--- intervals, each in a column of its own as far as the regions have columns.
-changesExpansionBound ∷ ChangeLimits → Int → Word64
-changesExpansionBound limits regions =
-  let intervals = max 0 (limitRemovedIntervals limits)
-      columns = min intervals (max 0 regions * fromIntegral columnsPerRegion)
-   in fromIntegral (columns * changeColumnBytes + intervals * changeIntervalBytes)
+-- | The most 'changesExpansion' can be for copies of this many region occurrences, whatever their partition into
+-- snapshots and before the merged change limit is checked: each region's intervals are clipped to it and counted per
+-- snapshot, and a region of 32 levels holds at most 16 disjoint, non-adjacent removed runs in each of its columns, so
+-- each occurrence is at most an entry for every column and one for each of those runs.
+changesExpansionBound ∷ Int → Word64
+changesExpansionBound regions =
+  let occurrences = fromIntegral (max 0 regions)
+      runsPerColumn = fromIntegral (regionLevels `div` 2)
+   in occurrences * columnsPerRegion * (fromIntegral changeColumnBytes + runsPerColumn * fromIntegral changeIntervalBytes)
 
 -- | The planner's state of what discovery knows of a cell.
 knowledgeState ∷ D.CellKnowledge → CellKnowledge

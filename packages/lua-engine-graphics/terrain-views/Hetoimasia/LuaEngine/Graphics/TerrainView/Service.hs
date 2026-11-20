@@ -78,6 +78,7 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView.Service
 
     -- * Picking
   , pickView
+  , pickViewWith
   , pickPrecondition
   , withAdoptedPlan
   , admittedCostBound
@@ -1867,10 +1868,10 @@ inputsCharge snapshots =
 
 -- | What copies of this many regions and their inputs hold at most, at the obligations 'admitInputs' charges.
 admittedInputsCost ∷ TerrainViewsConfig → Int → Word64
-admittedInputsCost config regions =
+admittedInputsCost _ regions =
   Runtime.regionSnapshotReservation regions
     + (inputsPerRegion + knowledgeExpansionBound) * fromIntegral regions
-    + changesExpansionBound (tvChangeLimits config) regions
+    + changesExpansionBound regions
 
 -- | What copies of this many regions and their inputs hold when every region's knowledge is one class and nothing was
 -- removed: the copies' reservation and each region's fixed inputs alone. The figure for terrain that is uniform per
@@ -2641,7 +2642,12 @@ withAdoptedPlan (TerrainView service state) body = bracket acquire release (body
         forM_ style releaseStyle
 
 pickView ∷ (Ord k, Show k) ⇒ TerrainView k → (Double, Double) → STM (PickResult k)
-pickView (TerrainView service state) (px, py) = do
+pickView = pickViewWith id
+
+-- | 'pickView' with a function applied to each of a hit's cell and part as the result is made: qualification only
+-- ('Hetoimasia.LuaEngine.Graphics.TerrainView.Qualification'), to witness where the result is evaluated.
+pickViewWith ∷ (Ord k, Show k) ⇒ (∀ a. a → a) → TerrainView k → (Double, Double) → STM (PickResult k)
+pickViewWith mark (TerrainView service state) (px, py) = do
   closing ← readTVar (vsClosing state)
   metrics ← vtMetrics (vsTarget state)
   case metrics of
@@ -2660,15 +2666,17 @@ pickView (TerrainView service state) (px, py) = do
                 Nothing → pure PickLoading
                 Just pinned
                   | pinMetrics pinned /= m → pure PickLoading
-                  | otherwise → pure $ case pickCells (pinPlan pinned) (CellPickQuery (cellPlanIdentity (pinPlan pinned)) (V2 (realToFrac px) (realToFrac py))) of
+                  -- the whole result is made and forced here, while the adopted pin is read: a field left as a thunk over the
+                  -- plan would keep the plan reachable after its pin goes
+                  | otherwise → pure $! forcePick $ case pickCells (pinPlan pinned) (CellPickQuery (cellPlanIdentity (pinPlan pinned)) (V2 (realToFrac px) (realToFrac py))) of
                       Left _ → PickNoHit
                       Right CellPickNoHit → PickNoHit
                       Right CellPickLoading → PickLoading
                       Right (CellPickHit hit) →
                         PickHit
                           ( PickRef
-                              (hitCell hit)
-                              (hitPart hit)
+                              (mark (hitCell hit))
+                              (mark (hitPart hit))
                               PickIdentity
                                 { identityTarget = vtKey (vsTarget state)
                                 , identityViewId = vsId state
@@ -2680,6 +2688,12 @@ pickView (TerrainView service state) (px, py) = do
                                 , identityResidency = pinResidency pinned
                                 }
                           )
+
+-- A pick result forced through every field, the identity's included (all strict).
+forcePick ∷ PickResult k → PickResult k
+forcePick result = case result of
+  PickHit ref → ref `seq` result
+  _ → result
 
 -- | The removal precondition of a pick: the arena incarnation and the content and knowledge revisions it was picked
 -- from, with a guard that the view still holds its target and that the revision it was picked from is still the one

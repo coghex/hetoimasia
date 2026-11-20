@@ -15,9 +15,9 @@ import Control.Concurrent (killThread, myThreadId, newEmptyMVar, putMVar, takeMV
 import Control.Exception (MaskingState (Unmasked), getMaskingState)
 import Control.Concurrent.STM
 import Data.Unique (newUnique)
-import Data.IORef (atomicModifyIORef', newIORef, readIORef)
+import Data.IORef (atomicModifyIORef', newIORef, readIORef, writeIORef)
 import GHC.Conc (unsafeIOToSTM)
-import Control.Exception (SomeException, displayException, finally, throwIO, try)
+import Control.Exception (SomeException, displayException, evaluate, finally, throwIO, try)
 import Control.Monad (forM, forM_, forever, join, unless, void, when)
 import qualified Data.ByteString as ByteString
 import qualified Data.ByteString.Char8 as BC
@@ -39,10 +39,11 @@ import Hetoimasia.LuaEngine.Graphics.Scene.Ledger (GraphicsScene (..), LedgerRea
 import Hetoimasia.LuaEngine.Graphics.Scene.Publish (HostAnswer (..))
 import Hetoimasia.LuaEngine.Graphics.Scene.World (SceneWorld (..), WorldTag (..))
 import Hetoimasia.LuaEngine.Graphics.TerrainView
-import Hetoimasia.LuaEngine.Graphics.TerrainView.Qualification (withAdoptedPlan)
+import Hetoimasia.LuaEngine.Graphics.TerrainView.Qualification (pickViewWith, withAdoptedPlan)
 import Hetoimasia.LuaEngine.Graphics.TerrainView.Inputs (changesExpansion, changesExpansionBound, generationIdentity, knowledgeExpansionBound)
 import Hetoimasia.LuaEngine.Graphics.TerrainView.Owner (buildRegions, keepBuilt, releaseEach)
 import Hetoimasia.LuaEngine.Graphics.TerrainView.Service (planDemandHeld, planHeld)
+import System.IO.Unsafe (unsafePerformIO)
 import Hetoimasia.LuaEngine.Profile
   ( ByteLimit (..)
   , Bytes (..)
@@ -90,7 +91,7 @@ import qualified Hetoimasia.Terrain.Runtime as Runtime
 import Hetoimasia.Terrain.Runtime.Storage (filesystemOf, minHeadroomBytes, mkStorageConfig)
 import Hetoimasia.Terrain.Runtime.Store (StoreSpec (..), defaultStoreSpec, minAllowanceBytes)
 import Hetoimasia.Terrain.Residency (Bank (StagingBank), Ledger (..), LimitsSpec (..), RegionDemand (..), RegionInfo (..), bankLedger, coverageBox, mkLimits, modelJobs, modelRegions)
-import Hetoimasia.Terrain.Changes (ChangeLimits (..), changesBytes, changesFromIntervals)
+import Hetoimasia.Terrain.Changes (changesBytes, changesFromIntervals)
 import Hetoimasia.Terrain.Shape (ViewFacing (..))
 import Hetoimasia.Terrain.Source (CellSpec (..), LayerSpec (..), PatchSpec (..), SourceSpec (..))
 import System.FilePath ((</>))
@@ -602,13 +603,13 @@ stages = describe "stages and the owner" $ do
     withViewsConfig testConfig {tvAdmitRegions = 4} $ \v → do
       tvAdmitRegions defaultTerrainViewsConfig `shouldBe` 2048
       -- the most: each region's knowledge of more than one class in every column with a run for each of its 32 levels
-      -- (256 x (96 + 80 x 32) bytes), and the removal index at the change limits' most (here 4096 intervals in one
-      -- region's columns: 256 x 48 + 4096 x 16 bytes)
+      -- (256 x (96 + 80 x 32) bytes), and the removal index at its most for one region occurrence, before the merged
+      -- change limit is checked: an entry for each of its 256 columns and 16 runs in each (256 x 48 + 4096 x 16 bytes)
       knowledgeExpansionBound `shouldBe` 679936
-      changesExpansionBound (ChangeLimits 4096) 1 `shouldBe` 77824
+      changesExpansionBound 1 `shouldBe` 77824
       let regions = tvAdmitRegions defaultTerrainViewsConfig
       admittedCostBound defaultTerrainViewsConfig
-        `shouldBe` (uniformInputsCost regions + knowledgeExpansionBound * fromIntegral regions + changesExpansionBound (tvChangeLimits defaultTerrainViewsConfig) regions)
+        `shouldBe` (uniformInputsCost regions + knowledgeExpansionBound * fromIntegral regions + changesExpansionBound regions)
       preparationCost defaultTerrainViewsConfig 1 `shouldSatisfy` (> uniformInputsCost 1 + knowledgeExpansionBound)
       -- terrain uniform per region and unedited: the default cap's copies and inputs fit the production bank
       uniformInputsCost regions `shouldSatisfy` (<= m1RenderAccountBytes)
@@ -2346,6 +2347,54 @@ stagesAndReaders = describe "stages, waits and readers" $ do
       reading ← atomically (readView view)
       readingFactsBytes reading `shouldSatisfy` (>= 25872 * fromIntegral (readingAdmitted reading) + charged)
       closeView view
+
+  it "charges a removed run crossing two regions once in each of their copies, within both advertised bounds" $
+    withViews $ \v → do
+      -- one removed run from level -1 to level 0: regions z = -1 and z = 0 each clip it
+      forM_ [tileAt 9 9 (-1), tileAt 9 9 0] $ \tile → removeWith v tile Nothing `shouldReturn` Right True
+      charges ← forM [RegionCoord 0 0 (-1), RegionCoord 0 0 0] $ \region → do
+        request ← Runtime.requestRegionSnapshot (_vTerrain v) (vArena v) [region] >>= either (fail . show) pure
+        borrow ← Runtime.await (_vTerrain v) request >>= either (fail . show) pure
+        (`finally` Runtime.releaseRegionBorrow (_vTerrain v) borrow) $ do
+          let snapshot = Runtime.regionBorrowSnapshot borrow
+              removed = [interval | r ← Runtime.regionSnapshotRegions snapshot, Runtime.PartReady intervals ← [Runtime.regionTerrain snapshot r], interval ← intervals]
+          length removed `shouldBe` 1
+          pure $! changesExpansion snapshot
+      -- before coalescing each copy charges its clipped interval: 64 bytes each, 128 in all, where the merged index (a
+      -- limit of one interval takes it) would be 64
+      charges `shouldBe` [64, 64]
+      sum charges `shouldSatisfy` (<= changesExpansionBound 2)
+      admittedInputsCost testConfig 2 `shouldSatisfy` (>= uniformInputsCost 2 + sum charges)
+      preparationCost testConfig 2 `shouldSatisfy` (>= admittedInputsCost testConfig 2)
+
+  it "makes and forces a pick while its adopted plan is read: no field of a kept result is evaluated after the pin goes" $
+    withViews $ \v → do
+      view ← attached v 1
+      _ ← awaitPublished v 1
+      quiescent v
+      _ ← adoptNow (vModel v) 1
+      _ ← releasePass (vModel v)
+      let points = [(x + 0.5, y + 0.5) | y ← [0, 4 .. 92], x ← [0, 4 .. 124]]
+      point ← bounded . atomically $ do
+        results ← mapM (\p → (p,) <$> pickView view p) points
+        case [p | (p, PickHit _) ← results] of
+          p : _ → pure p
+          [] → retry
+      inside ← newIORef True
+      seen ← newIORef ([] ∷ [Bool])
+      let mark ∷ ∀ a. a → a
+          mark x = unsafePerformIO $ do
+            _ ← evaluate x
+            readIORef inside >>= \now → atomicModifyIORef' seen (\marks → (now : marks, ()))
+            pure x
+      result ← atomically (pickViewWith mark view point)
+      writeIORef inside False
+      closeView view
+      -- whatever is left of the kept result is evaluated now, after the pin has gone
+      length (show result) `shouldSatisfy` (> 0)
+      marks ← readIORef seen
+      marks `shouldSatisfy` (not . null)
+      marks `shouldSatisfy` and
 
   it "answers each chunk of a release on its own: a raise is that chunk's failure, and the chunks after it are released" $ do
     released ← newIORef ([] ∷ [ChunkRef])
