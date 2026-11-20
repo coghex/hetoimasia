@@ -43,6 +43,7 @@ module Hetoimasia.Terrain.Runtime.Internal.Core
   , demandFor
   , commandRanges
   , resultRecordBytes
+  , regionalFits
   , surfaceWindowLevels
   , keepCap
   , rangeKeep
@@ -527,6 +528,12 @@ countReqs p st = Map.size (Map.filter p (stateRequests st)) + Map.size (Map.filt
 resultRecordBytes ∷ Word64
 resultRecordBytes = 160
 
+-- | Whether a regional request of this many regions fits the retained bank at this use: the use, the request's
+-- reservation and its result record within the bank. The one test a regional request is refused 'BusyRetained' by,
+-- and the one a holder refused it waits on ('regionalFitsSTM').
+regionalFits ∷ Config → Word64 → Int → Bool
+regionalFits config used regions = used + resultRecordBytes + regionReservation regions <= configRetainedBytes config
+
 -- | Bytes the retained bank holds: outstanding snapshots' backing and untaken
 -- results.
 retainedBankUse ∷ St → Word64
@@ -730,7 +737,7 @@ decide svc st rid = \case
         Right hid → case capacityRefusal config st True of
           Just refusal → pure (Left (busyWhy refusal))
           Nothing
-            | retainedBankUse st + resultRecordBytes + reservation > configRetainedBytes config →
+            | not (regionalFits config (retainedBankUse st) (length regions)) →
                 pure (Left (ShortRefused (RefusedBusy BusyRetained)))
             | otherwise →
                 applyEvent svc (R.AcquireHold (HoldId hid) aid R.Copied regions) >>= \case
