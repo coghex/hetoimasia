@@ -18,7 +18,10 @@ import qualified Data.Text as Text
 import Data.Word (Word32)
 import Hetoimasia.GPU.Vulkan.GLFW
   ( ActionOutcome (..)
+  , BatchTicket
   , Image
+  , Recorder
+  , Refusal
   , OffscreenTargetId
   , SceneTargetKey (..)
   , TargetScenePublication (..)
@@ -31,7 +34,7 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , submitVulkanAction
   )
 import Hetoimasia.LuaEngine.Graphics.Scene.Ledger (GraphicsScene (..))
-import Hetoimasia.LuaEngine.Graphics.Scene.Receipts (DrawReceipts, noteSubmitted)
+import Hetoimasia.LuaEngine.Graphics.Scene.Receipts (DrawReceipts, latestFrameMetrics, noteSubmitted)
 import Hetoimasia.LuaEngine.Graphics.Scene.Render (RenderSession (..), renderWorldTarget)
 import Hetoimasia.LuaEngine.Graphics.Scene.World (SceneWorld (..), WorldTag)
 import Hetoimasia.LuaEngine.Graphics.TerrainView.Session (ViewTarget (..))
@@ -42,9 +45,9 @@ import Hetoimasia.Render.TwoD.Metrics (TargetMetrics)
 
 -- | A window incarnation's target. Its depth is the host's: 'True' only on a host built with the window depth a world
 -- scene draws with ('Hetoimasia.LuaEngine.Graphics.Scene.Configuration.configureWorldDepth'), which the composition
--- passes here. The metrics are the window's latest observation, as the composition reads it.
-windowViewTarget ∷ Bool → STM (Maybe TargetMetrics) → WindowTarget GraphicsScene → ViewTarget SceneTargetKey
-windowViewTarget hostDepth metrics target =
+-- passes here. Its metrics are those of the window's latest recorded frame ('latestFrameMetrics').
+windowViewTarget ∷ Bool → DrawReceipts → WindowTarget GraphicsScene → ViewTarget SceneTargetKey
+windowViewTarget hostDepth receipts target =
   ViewTarget
     { vtKey = KeyWindow (targetWindow target)
     , vtUsable = targetUsable target
@@ -53,7 +56,7 @@ windowViewTarget hostDepth metrics target =
           WindowScenePublished _ _ → True
           _ → False
     , vtDepth = hostDepth
-    , vtMetrics = metrics
+    , vtMetrics = latestFrameMetrics receipts (targetAttachment target)
     }
 
 -- | A surface-free target registered with the host: usable while its registrant says so, drawn with the depth image
@@ -72,8 +75,9 @@ offscreenViewTarget host target usable metrics =
     }
 
 -- | Record the world the host adopted for a registered offscreen target into the caller's colour image (of this
--- format) and @D32_SFLOAT@ depth image, in one owner action, and advance the view's receipt once that batch has been
--- submitted. A target whose adopted scene is not a world records nothing and is refused.
+-- format) and @D32_SFLOAT@ depth image, then the caller's own commands in the same batch (a copy to a readback, say),
+-- in one owner action, and advance the view's receipt once that batch has been submitted. Answers the batch's ticket
+-- and the revision drawn. A target whose adopted scene is not a world records nothing and is refused.
 drawOffscreenView
   ∷ VulkanHost GraphicsScene
   → TextureGraphics
@@ -83,21 +87,25 @@ drawOffscreenView
   → Image
   → Word32
   → Image
-  → IO (Either Text WorldTag)
-drawOffscreenView host graphics receipts target metrics image format depth = do
+  → (∀ q inst msgr phys dev cmd. Recorder q inst msgr phys dev cmd → IO (Either Refusal ()))
+  → IO (Either Text (BatchTicket, WorldTag))
+drawOffscreenView host graphics receipts target metrics image format depth after = do
   let session = RenderSession (graphicsRenderer graphics) (graphicsTextures graphics) (graphicsRetained graphics)
       action = VulkanAction $ \construction →
         recordVulkanTargetBatch host target construction $ \scene _ recorder → case graphicsWorld scene of
           Nothing → pure (Left "the target's adopted scene is not a terrain view's")
           Just world →
-            renderWorldTarget session (hostBuilders host construction) world metrics image format depth recorder <&> \case
-              Left refusal → Left (Text.pack (show refusal))
-              Right () → Right (worldTag world)
+            renderWorldTarget session (hostBuilders host construction) world metrics image format depth recorder >>= \case
+              Left refusal → pure (Left (Text.pack (show refusal)))
+              Right () →
+                after recorder <&> \case
+                  Left refusal → Left (Text.pack (show refusal))
+                  Right () → Right (worldTag world)
   atomically (submitVulkanAction host action) >>= \case
     Left refusal → pure (Left (Text.pack (show refusal)))
     Right ticket →
       atomically (awaitVulkanAction ticket) >>= \case
-        ActionReturned (Right (_, Right tag)) → Right tag <$ atomically (noteSubmitted receipts tag metrics)
+        ActionReturned (Right (batch, Right tag)) → Right (batch, tag) <$ atomically (noteSubmitted receipts tag metrics)
         ActionReturned (Right (_, Left why)) → pure (Left why)
         ActionReturned (Left refusal) → pure (Left (Text.pack (show refusal)))
         other → pure (Left (Text.pack (outcomeText other)))

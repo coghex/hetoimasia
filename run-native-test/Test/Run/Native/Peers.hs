@@ -124,6 +124,7 @@ import Hetoimasia.LuaEngine.Graphics.Scene
   , configureScenes
   , newSceneSession
   , noPublishHooks
+  , sceneFrameObserver
   , scenePublisher
   )
 import Hetoimasia.LuaEngine.Graphics.Texture
@@ -294,7 +295,7 @@ withPeersUsing hooks start folder scenario = mask $ \restore → do
       base = vulkanHostConfig (defaultHostConfig []) capture (configurationBudgets textureConfiguration) (scenesInitial scenes)
       config =
         (configureScenes scenes (configureWindows (configureHost textureConfiguration base)))
-          { vulkanFrameObserver = \event → atomically (modifyTVar' frames (\(count, events) → (count + 1, take 4096 (event : events))))
+          { vulkanFrameObserver = sceneFrameObserver scenes (\event → atomically (modifyTVar' frames (\(count, events) → (count + 1, take 4096 (event : events)))))
           , vulkanObserver = \diagnostics → tracingDisposals frames disposals (vulkanObserver base diagnostics)
           , vulkanLayers = ["VK_LAYER_KHRONOS_validation"]
           , vulkanValidationFeatures = [SynchronizationValidation]
@@ -380,7 +381,7 @@ withPeersUsing hooks start folder scenario = mask $ \restore → do
             myThreadId >>= writeIORef sessionThread . Just
             readTVarIO abort >>= \stopped → when stopped (throwIO ScenarioCancelled)
             withTextureGraphics scenes textureConfiguration config vulkan $ \graphics →
-              compose lifetime folder graphics vulkan frames disposals jobs providerStep scenario
+              compose lifetime folder scenes graphics vulkan frames disposals jobs providerStep scenario
       serveSpawned
         lifetime
         owner
@@ -405,6 +406,7 @@ compose
   ∷ ∀ a
    . LoggingLifetime
   → FilePath
+  → SceneSession
   → TextureGraphics
   → VulkanHost GraphicsScene
   → TVar (Int, [FrameEvent])
@@ -413,7 +415,7 @@ compose
   → IORef (IO ())
   → (Peers → IO a)
   → IO a
-compose lifetime folder graphics vulkan frames disposals jobs providerStep scenario = do
+compose lifetime folder scenes graphics vulkan frames disposals jobs providerStep scenario = do
   stops ← newTVarIO 0
   fatals ← newTVarIO []
   quits ← newTVarIO 0

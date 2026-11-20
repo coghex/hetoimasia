@@ -65,7 +65,7 @@ import Hetoimasia.GPU.Vulkan.GLFW (FrameRequest (..), Image, ImageFormat (Depth3
 import Hetoimasia.GPU.Vulkan.Native.Presentation (SurfaceExtent (..))
 import Hetoimasia.GPU.Vulkan.Native.Recording (Buffer, Recorder, Refusal (RefusedIllegal))
 import Hetoimasia.LuaEngine.Graphics.Scene.Ledger (GraphicsScene (graphicsContent, graphicsWorld))
-import Hetoimasia.LuaEngine.Graphics.Scene.Receipts (DrawReceipts, noteRecorded, noteUnrecorded)
+import Hetoimasia.LuaEngine.Graphics.Scene.Receipts (DrawReceipts, noteFrameMetrics, noteRecorded, noteUnrecorded)
 import Hetoimasia.LuaEngine.Graphics.Scene.World (SceneWorld (..), worldSnapshot)
 import Hetoimasia.LuaEngine.Graphics.Texture.Host (renderBuilders)
 import Hetoimasia.LuaEngine.Graphics.Texture.Port (TextureRef (..), textureRefOf)
@@ -170,7 +170,10 @@ readRenderSlot (RenderSlot var) = readTVarIO var
 -- cleared.
 sceneRenderer ∷ DrawReceipts → RenderSlot → VulkanRenderer GraphicsScene
 sceneRenderer receipts slot = VulkanRenderer $ \scene request construction recorder → do
-  atomically (noteUnrecorded receipts (requestAttachment request) (requestFrame request))
+  let SurfaceExtent width height = requestExtent request
+  atomically $ do
+    noteUnrecorded receipts (requestAttachment request) (requestFrame request)
+    either (const (pure ())) (noteFrameMetrics receipts (requestAttachment request)) (frameMetrics (FrameFacts (width, height) (requestLogicalExtent request) (requestContentScale request)))
   readRenderSlot slot >>= \case
     Nothing → pure (Left (RefusedIllegal "the scene renderer has no session yet, so the frame is skipped"))
     Just session → case graphicsWorld scene of

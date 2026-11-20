@@ -39,13 +39,15 @@ import Hetoimasia.LuaEngine.Profile (fixedM1Profile)
 import Test.LuaEngine.Graphics.Native.Consent (Consent, consentBackend, describeConsent, readConsent, refusalMessage)
 import Test.LuaEngine.Graphics.Native.Environment (checkValidationFeatures, establishEnvironment, validationFeatures)
 import Test.LuaEngine.Graphics.Native.Loader (checkLoader)
-import Test.LuaEngine.Graphics.Native.Session (Facts (..), runSession)
+import Hetoimasia.LuaEngine.Graphics.Scene (configureWorldDepth)
+import Test.LuaEngine.Graphics.Native.Session (Facts (..), runSessionWith)
 import qualified Test.LuaEngine.Graphics.Native.Spec as Native
 import qualified Test.LuaEngine.Graphics.Native.Facade as Facade
 import qualified Test.LuaEngine.Graphics.Native.DataTextures as DataTextures
 import qualified Test.LuaEngine.Graphics.Native.Pixels as Pixels
 import qualified Test.LuaEngine.Graphics.Native.Scenes as Scenes
 import qualified Test.LuaEngine.Graphics.Native.Targets as Targets
+import qualified Test.LuaEngine.Graphics.Native.TerrainViews as TerrainViews
 import qualified Test.LuaEngine.Graphics.Native.Windows as Windows
 
 main ∷ IO ()
@@ -54,8 +56,8 @@ main = do
   started ← getCurrentTime
   environment ← establishEnvironment
   arguments ← getArgs
-  when (any (`elem` arguments) [completeFlag, probeFlag, latchFlag] && length arguments /= 1) $ do
-    hPutStrLn stderr ("lua-engine-graphics-native-tests: " <> completeFlag <> " runs the whole profile, " <> probeFlag <> " the cancellation probe and " <> latchFlag <> " the latched-supervision probe, each alone")
+  when (any (`elem` arguments) [completeFlag, probeFlag, latchFlag, terrainFlag] && length arguments /= 1) $ do
+    hPutStrLn stderr ("lua-engine-graphics-native-tests: " <> completeFlag <> " runs the whole profile, " <> probeFlag <> " the cancellation probe, " <> latchFlag <> " the latched-supervision probe and " <> terrainFlag <> " the terrain views on a real window, each alone")
     exitWith (ExitFailure 2)
   forM_ environment (Text.putStrLn . ("lua-engine-graphics-native-tests: " <>))
   consent ← readConsent >>= either refuse pure
@@ -64,12 +66,16 @@ main = do
   Text.putStrLn ("lua-engine-graphics-native-tests: the binding's loader is the recorded loader " <> Text.pack loader)
   configuration ← either (\refused → stop ("the profile could not be mapped: " <> Text.pack (show refused))) pure (configurationFor fixedM1Profile)
   let probing = arguments == [probeFlag] || arguments == [latchFlag]
+      terrain = arguments == [terrainFlag]
       expectedFailure = if arguments == [latchFlag] then "LatchingProbe" else "user interrupt"
-  facts ← runSession (arguments == [completeFlag] || probing) (consentBackend consent) validationFeatures configuration $
+      -- the full terrain views run on a host whose windows carry the depth image a world scene draws with
+      adjust = if terrain then configureWorldDepth else id
+  facts ← runSessionWith adjust (arguments == [completeFlag] || probing || terrain) (consentBackend consent) validationFeatures configuration $
     case arguments of
       [flag] | flag == probeFlag → Facade.cancelProbe
       [flag] | flag == latchFlag → Facade.latchProbe
-      _ → \env → Native.spec env >> Windows.spec env >> Scenes.spec env >> Targets.spec env >> Pixels.spec env >> DataTextures.spec env >> Facade.spec env
+      [flag] | flag == terrainFlag → TerrainViews.fullSpec
+      _ → \env → Native.spec env >> Windows.spec env >> Scenes.spec env >> Targets.spec env >> Pixels.spec env >> DataTextures.spec env >> TerrainViews.spec env >> Facade.spec env
   finished ← getCurrentTime
   let problems = if probing then probeChecks expectedFailure facts else checks facts
       seconds = realToFrac (diffUTCTime finished started) ∷ Double
@@ -100,6 +106,9 @@ probeFlag = "--probe-cancel-loop"
 -- supervision before the texture backend's drain.
 latchFlag ∷ String
 latchFlag = "--probe-latch-loop"
+
+terrainFlag ∷ String
+terrainFlag = "--terrain-views-full"
 
 -- | What the probe must have shown: the run ended by itself (it returned), its only failure is the cancellation it made, a window
 -- existed and was destroyed, and everything else a run must show about the native calls (the destruction order, none raised)

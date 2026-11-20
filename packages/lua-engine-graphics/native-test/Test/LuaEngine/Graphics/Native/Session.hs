@@ -14,6 +14,7 @@ module Test.LuaEngine.Graphics.Native.Session
   , serveMain
   , noteWindows
   , runSession
+  , runSessionWith
   , usageNow
   , awaitUsage
   , restNow
@@ -157,7 +158,12 @@ awaitUsage env wanted = atomically $ do
 
 -- | Run the examples inside a session that requests this backend, or the platform's own.
 runSession ∷ Bool → Maybe Backend → [ValidationFeature] → TextureGraphicsConfiguration → (Env → Spec) → IO Facts
-runSession complete backend features configuration examples = do
+runSession = runSessionWith id
+
+-- | 'runSession' with the host's configuration adjusted after the session's own (the terrain-enabled host's window
+-- depth, say).
+runSessionWith ∷ (VulkanHostConfig GraphicsScene → VulkanHostConfig GraphicsScene) → Bool → Maybe Backend → [ValidationFeature] → TextureGraphicsConfiguration → (Env → Spec) → IO Facts
+runSessionWith adjust complete backend features configuration examples = do
   mainThread ← myThreadId
   recorded ← newIORef []
   verdictCell ← newIORef Nothing
@@ -170,8 +176,8 @@ runSession complete backend features configuration examples = do
   let host = requestingBackend backend (defaultHostConfig [])
       base = vulkanHostConfig host defaultCaptureConfig {captureTextBudget = 16384} (configurationBudgets configuration) (scenesInitial scenes)
       config =
-        (configureScenes scenes (configureWindows (configureHost configuration base)))
-          { vulkanFrameObserver = \event → atomically (modifyTVar' frames (recordEvent event))
+        adjust (configureScenes scenes (configureWindows (configureHost configuration base)))
+          { vulkanFrameObserver = sceneFrameObserver scenes (\event → atomically (modifyTVar' frames (recordEvent event)))
           , vulkanLayers = ["VK_LAYER_KHRONOS_validation"]
           , vulkanValidationFeatures = features
           , vulkanObserver = const (observer recorded)

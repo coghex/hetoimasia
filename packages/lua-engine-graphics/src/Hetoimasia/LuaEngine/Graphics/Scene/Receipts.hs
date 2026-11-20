@@ -44,6 +44,8 @@ module Hetoimasia.LuaEngine.Graphics.Scene.Receipts
   , noteSubmitted
   , receiptObserver
   , receiptsListen
+  , noteFrameMetrics
+  , latestFrameMetrics
   ) where
 
 import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVarIO, readTVar, writeTVar)
@@ -72,10 +74,12 @@ data DrawReceipts = DrawReceipts
   { receiptsRecorded ∷ !(TVar (Map (AttachmentId, FrameSlotId) (WorldTag, TargetMetrics)))
   , receiptsDrawn ∷ !(TVar (Map Word64 Drawn))
   , receiptsListener ∷ !(TVar (Bool → STM ()))
+  , receiptsMetrics ∷ !(TVar (Map AttachmentId TargetMetrics))
+    -- ^ The metrics of each window attachment's latest recorded frame: what a view of that window plans for.
   }
 
 newDrawReceipts ∷ IO DrawReceipts
-newDrawReceipts = DrawReceipts <$> newTVarIO Map.empty <*> newTVarIO Map.empty <*> newTVarIO (const (pure ()))
+newDrawReceipts = DrawReceipts <$> newTVarIO Map.empty <*> newTVarIO Map.empty <*> newTVarIO (const (pure ())) <*> newTVarIO Map.empty
 
 -- | The view incarnation's latest receipt, if it has drawn.
 readReceipt ∷ DrawReceipts → Word64 → STM (Maybe Drawn)
@@ -126,3 +130,15 @@ receiptObserver receipts event = atomically $ case event of
 -- ('const (pure ())' clears it). It must not wait or raise.
 receiptsListen ∷ DrawReceipts → (Bool → STM ()) → STM ()
 receiptsListen receipts = writeTVar (receiptsListener receipts)
+
+-- | A frame of this window attachment is recorded with these metrics. Written only when they change.
+noteFrameMetrics ∷ DrawReceipts → AttachmentId → TargetMetrics → STM ()
+noteFrameMetrics receipts attachment metrics = do
+  held ← readTVar (receiptsMetrics receipts)
+  case Map.lookup attachment held of
+    Just same | same == metrics → pure ()
+    _ → writeTVar (receiptsMetrics receipts) (Map.insert attachment metrics held)
+
+-- | The metrics of the attachment's latest recorded frame, once it has had one.
+latestFrameMetrics ∷ DrawReceipts → AttachmentId → STM (Maybe TargetMetrics)
+latestFrameMetrics receipts attachment = Map.lookup attachment <$> readTVar (receiptsMetrics receipts)

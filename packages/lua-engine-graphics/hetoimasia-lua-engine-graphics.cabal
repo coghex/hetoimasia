@@ -277,6 +277,7 @@ test-suite lua-engine-graphics-native-tests
         Test.LuaEngine.Graphics.Native.Session
         Test.LuaEngine.Graphics.Native.Spec
         Test.LuaEngine.Graphics.Native.Targets
+        Test.LuaEngine.Graphics.Native.TerrainViews
         Test.LuaEngine.Graphics.Native.Windows
         Test.LuaEngine.Graphics.Pixels
         Test.LuaEngine.Graphics.Png
@@ -318,6 +319,7 @@ test-suite lua-engine-graphics-native-tests
         hetoimasia-gpu-vulkan-native ==0.1.0.0,
         hetoimasia-lua-engine ==0.1.0.0,
         hetoimasia-lua-engine-graphics,
+        hetoimasia-lua-engine-graphics:terrain-views,
         hetoimasia-lua-engine:facade,
         hetoimasia-lua-engine:request,
         hetoimasia-lua-engine:scene,
@@ -331,4 +333,9 @@ test-suite lua-engine-graphics-native-tests
         hetoimasia-runtime ==0.1.0.0,
         hetoimasia-scripting-lua ==0.1.0.0,
         hetoimasia-scripting-lua:runtime-lua,
+        hetoimasia-terrain ==0.1.0.0,
+        hetoimasia-terrain-render-2d ==0.1.0.0,
+        hetoimasia-terrain-render-2d:terrain-fixtures ==0.1.0.0,
+        hetoimasia-terrain-render-2d:terrain-material ==0.1.0.0,
+        hetoimasia-terrain-runtime ==0.1.0.0,
         hetoimasia-test-support ==0.1.0.0

@@ -9,7 +9,7 @@
 -- The windows open on whatever the run's consent selected: an isolated X11 display on Linux, the desktop on
 -- macOS under the run's own consent. Every example ends with the windows it made destroyed, because the
 -- texture examples of this suite assert that no window exists.
-module Test.LuaEngine.Graphics.Native.Windows (spec) where
+module Test.LuaEngine.Graphics.Native.Windows (spec, withWindows) where
 
 import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, retry)
 import Control.Monad (forM_, unless)
