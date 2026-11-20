@@ -84,7 +84,7 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView.Session
   ) where
 
 import Control.Concurrent.STM
-import Control.Exception (Exception, SomeAsyncException, displayException, evaluate, fromException, mask, onException, throwIO, try, uninterruptibleMask_)
+import Control.Exception (Exception, SomeAsyncException, SomeException, displayException, evaluate, fromException, mask, onException, throwIO, try, uninterruptibleMask_)
 import Control.Monad (forM, forM_, unless, void, when)
 import Data.Foldable (for_, toList)
 import Data.List (sortOn)
@@ -383,6 +383,10 @@ data TerrainViews k = TerrainViews
     -- ^ The planning time of the owner step under way.
   , svPlanningStepMax ∷ !(TVar Word64)
     -- ^ The greatest planning time of one owner step.
+  , svOwnerFrame ∷ !(TVar Word64)
+    -- ^ The owner's time in the views' steps since the last presentation's enqueue.
+  , svOwnerMax ∷ !(TVar Word64)
+  , svOwnerStepMax ∷ !(TVar Word64)
   , svJobs ∷ !(TVar (Map Word64 (IO ())))
     -- ^ The planner's queue: each view's latest job, which a newer one replaces before it starts.
   , svReserved ∷ !Integer
@@ -420,6 +424,9 @@ withTerrainViews config ports body = do
       <*> newTVarIO 0
       <*> newTVarIO 0
       <*> newTVarIO 0
+      <*> newTVarIO 0
+      <*> newTVarIO 0
+      <*> newTVarIO 0
       <*> newTVarIO Map.empty
       <*> pure allowance
   let listen = do
@@ -431,9 +438,10 @@ withTerrainViews config ports body = do
   mask $ \restore → do
     atomically listen
     let cleanup = do
-          shutdown service
+          interrupted ← shutdown service
           atomically unlisten
           atomically (accountRelease account (fromInteger allowance))
+          pure interrupted
     outcome ←
       restore
         ( withWorkerGroup $ \group → do
@@ -449,8 +457,8 @@ withTerrainViews config ports body = do
               _ → throwIO (TerrainViewsWatcher "the watcher or the planner did not start")
         )
         `onException` cleanup
-    cleanup
-    pure outcome
+    -- an interruption of the drain is raised after the cleanup; on the body's own failure that failure goes on
+    cleanup >>= maybe (pure outcome) throwIO
 
 -- The watcher: signals only. It blocks until a view's arena mark or the authority epoch moves, or a refused kick
 -- can be admitted, and asks for the owner's next step.
@@ -522,16 +530,28 @@ frameEnded service = do
   spent ← readTVar (svPlanningFrame service)
   modifyTVar' (svPlanningMax service) (max spent)
   writeTVar (svPlanningFrame service) 0
+  owned ← readTVar (svOwnerFrame service)
+  modifyTVar' (svOwnerMax service) (max owned)
+  writeTVar (svOwnerFrame service) 0
 
 -- Close admission, end every view, and drain what retires, with the owner live: the drain waits in STM for the
 -- retirements, asking the release lane and the owner itself, until they are done or the owner has ended.
-shutdown ∷ (Ord k, Show k) ⇒ TerrainViews k → IO ()
-shutdown service = uninterruptibleMask_ $ do
+--
+-- It runs masked, not uninterruptibly: the drain's wait for the owner (its barriers, its completions) is an STM wait
+-- that stays interruptible. An interruption is remembered and answered: what was still retiring is recorded as
+-- failures with that cause (the session's own teardown destroys what its managed resources hold), and the caller
+-- raises it once the rest of the scope's cleanup is done.
+shutdown ∷ (Ord k, Show k) ⇒ TerrainViews k → IO (Maybe SomeException)
+shutdown service = do
   views ← atomically $ do
     writeTVar (svOpen service) False
     Map.elems <$> readTVar (svViews service)
   forM_ views $ \vs → endView service vs EndStopped
-  drain
+  try drain >>= \case
+    Right () → pure Nothing
+    Left interruption → do
+      atomically (abandonRetirements service ("the drain was interrupted: " <> Text.pack (displayException interruption)))
+      pure (Just interruption)
   where
     drain = do
       next ← atomically $ do
@@ -540,7 +560,7 @@ shutdown service = uninterruptibleMask_ $ do
           then pure Nothing
           else
             ownerEnded (portOwner (svPorts service)) >>= \case
-              Just why → Just (Left why) <$ abandonRetirements service why
+              Just why → Just (Left why) <$ abandonRetirements service ("the graphics owner ended before disposal: " <> why)
               Nothing → do
                 asked ← askBarriers service
                 scheduled ← readTVar (svScheduled service)
@@ -560,10 +580,9 @@ drained service = do
 -- The owner ended for good: what it can no longer dispose of ends as a failure with that cause. The session's managed
 -- resources are destroyed with it.
 abandonRetirements ∷ TerrainViews k → Text → STM ()
-abandonRetirements service why = do
+abandonRetirements service cause = do
   retiring ← readTVar (svRetiring service)
   private ← readTVar (svPrivate service)
-  let cause = "the graphics owner ended before disposal: " <> why
   modifyTVar' (svFailed service) (<> ([(rtTarget r, Just chunk, cause) | r ← toList retiring, chunk ← rtChunks r] <> [(k, Just chunk, cause) | (k, _, chunk) ← private]))
   writeTVar (svRetiring service) Seq.empty
   writeTVar (svPrivate service) []
@@ -886,11 +905,17 @@ abandonFlight service flight = do
 -- retirements. It asks for the next step when it leaves work it can do at once.
 stepOwner ∷ (Ord k, Show k) ⇒ TerrainViews k → Hands → IO ()
 stepOwner service hands = do
+  start ← getMonotonicTimeNSec
   atomically (writeTVar (svScheduled service) False >> writeTVar (svPlanningStep service) 0)
   views ← Map.elems <$> readTVarIO (svViews service)
   busy ← or <$> forM views (stepView service hands)
   retired ← retire service hands
-  atomically (readTVar (svPlanningStep service) >>= \spent → modifyTVar' (svPlanningStepMax service) (max spent))
+  end ← getMonotonicTimeNSec
+  atomically $ do
+    readTVar (svPlanningStep service) >>= \spent → modifyTVar' (svPlanningStepMax service) (max spent)
+    -- the whole step: everything the views asked of the owner's thread in it
+    modifyTVar' (svOwnerFrame service) (+ (end - start))
+    modifyTVar' (svOwnerStepMax service) (max (end - start))
   when (busy || retired) (atomically (kick service))
 
 -- Whether the view did something a further step can continue at once.
@@ -1465,25 +1490,22 @@ retire service hands = do
       Met | not (rtProtected entry && open) → filterM' (\(_, chunk) → (&&) <$> (not <$> ledgerChunkHeld (portLedger (svPorts service)) chunk) <*> notUploading chunk) [(rtTarget entry, chunk) | chunk ← rtChunks entry]
       _ → pure []
     pure (ready, candidates)
-  disposedPrivate ← forM (take budget private) $ \(key, _, chunk) → disposeOne key chunk >>= \ok → pure (ok, chunk)
-  disposedRetiring ← forM (take budget retiring) $ \(key, chunk) → disposeOne key chunk >>= \ok → pure (ok, chunk)
-  let gone = Set.fromList (map snd (disposedPrivate <> disposedRetiring))
-  atomically $ do
-    modifyTVar' (svPrivate service) (filter (\(_, _, chunk) → Set.notMember chunk gone))
-    modifyTVar' (svRetiring service) (Seq.filter (not . null . rtChunks) . fmap (\entry → entry {rtChunks = filter (`Set.notMember` gone) (rtChunks entry)}))
-  pure (not (Set.null gone))
+  disposed ← forM (take budget ([(key, chunk) | (key, _, chunk) ← private] <> take budget retiring)) (uncurry disposeOne)
+  pure (or disposed)
   where
     budget = 64
     notUploading chunk = (/= Just ChunkUploading) <$> ownerStanding (portOwner (svPorts service)) chunk
+    -- Each chunk is attempted once: in the transaction after its release it leaves the lists that act on it. Disposed,
+    -- its slot is freed; failed, it becomes evidence with its identity and cause, and keeps its slot.
     disposeOne key chunk =
-      mask $ \_ →
-        handDispose hands chunk >>= \case
-          Right () → do
-            atomically $ do
-              occupy service key (-1)
-              modifyTVar' (svFreed service) (+ 1)
-            pure ()
-          Left why → atomically (modifyTVar' (svFailed service) (<> [(key, Just chunk, "the chunk's release failed: " <> why)]))
+      mask $ \_ → do
+        outcome ← handDispose hands chunk
+        atomically $ do
+          modifyTVar' (svPrivate service) (filter (\(_, _, held) → held /= chunk))
+          modifyTVar' (svRetiring service) (Seq.filter (not . null . rtChunks) . fmap (\entry → entry {rtChunks = filter (/= chunk) (rtChunks entry)}))
+          case outcome of
+            Right () → True <$ (occupy service key (-1) >> modifyTVar' (svFreed service) (+ 1))
+            Left why → False <$ modifyTVar' (svFailed service) (<> [(key, Just chunk, "the chunk's release failed: " <> why)])
 
 filterM' ∷ Monad m ⇒ (a → m Bool) → [a] → m [a]
 filterM' p = fmap catMaybes . mapM (\x → (\keep → if keep then Just x else Nothing) <$> p x)
@@ -1570,6 +1592,11 @@ data ServiceReading k = ServiceReading
   , servicePlanningStepMax ∷ !Word64
     -- ^ The greatest planning time of one owner step, in nanoseconds: a step runs alone in its owner round, so no frame
     -- waits on more than one.
+  , serviceOwnerMax ∷ !Word64
+    -- ^ The greatest time of the views' whole work on the owner's thread between two presentations' enqueues, in
+    -- nanoseconds: planning, the camera, builds, publication and retirement.
+  , serviceOwnerStepMax ∷ !Word64
+    -- ^ The greatest time of one owner step, in nanoseconds.
   }
 
 readTerrainViews ∷ TerrainViews k → STM (ServiceReading k)
@@ -1583,3 +1610,5 @@ readTerrainViews service =
     <*> pure (svReserved service)
     <*> ((\a b → max a b) <$> readTVar (svPlanningMax service) <*> readTVar (svPlanningFrame service))
     <*> readTVar (svPlanningStepMax service)
+    <*> ((\a b → max a b) <$> readTVar (svOwnerMax service) <*> readTVar (svOwnerFrame service))
+    <*> readTVar (svOwnerStepMax service)

@@ -219,14 +219,19 @@ fullSpec env = describe "terrain views (full)" $
         reading ← atomically (readTerrainViews views)
         let planning = servicePlanningMax reading
             stepPlanning = servicePlanningStepMax reading
+            owned = serviceOwnerMax reading
+            ownedStep = serviceOwnerStepMax reading
         _ ← closeView view
         Win.stopInstance wcomp wvm "w"
         evidence env
           ( "terrain views, real window: drawn at the presentation's enqueue (first receipt " <> tshow (drawnTag firstDrawn) <> " at "
               <> tshow (drawnMetrics firstDrawn) <> "), then through zoom 0.5, 2 and 1; greatest owner-thread planning time within one frame "
               <> tshow planning <> " ns between two presentations, and in one owner step (one round of the owner, which a frame follows) "
-              <> tshow stepPlanning <> " ns, against the frame budget of " <> tshow frameBudget <> " ns (one 60 Hz refresh)"
-              <> (if stepPlanning <= frameBudget then "" else "; PLANNING IN ONE OWNER STEP EXCEEDS THE FRAME BUDGET")
+              <> tshow stepPlanning <> " ns; the views' whole work on the owner's thread (planning, camera, builds, publication, retirement) "
+              <> tshow owned <> " ns between two presentations and " <> tshow ownedStep <> " ns in one owner step; against the frame budget of "
+              <> tshow frameBudget <> " ns (one 60 Hz refresh)"
+              <> (if ownedStep <= frameBudget then "" else "; ONE OWNER STEP EXCEEDS THE FRAME BUDGET")
+              <> (if owned <= frameBudget then "" else "; THE OWNER'S WORK BETWEEN TWO PRESENTATIONS EXCEEDS THE FRAME BUDGET")
           )
 
 waitWithin ∷ String → STM a → IO a

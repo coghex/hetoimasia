@@ -57,6 +57,7 @@ import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec hiding (after, before)
 import Test.Support.Owned (withOwnedThread)
 import Control.Exception (finally)
+import Data.IORef (newIORef, readIORef, writeIORef)
 import System.Timeout (timeout)
 
 -- ---------------------------------------------------------------------------
@@ -73,6 +74,7 @@ data Rig = Rig
   , rigStandings ∷ !(TVar (Map.Map ChunkRef ChunkStanding))
   , rigChunks ∷ !(TVar (Map.Map ChunkRef Chunk))
   , rigDisposed ∷ !(TVar [ChunkRef])
+  , rigAttempts ∷ !(TVar (Map.Map ChunkRef Int))
   , rigBuildFailure ∷ !(TVar (Maybe BuildFailure))
   , rigDisposeFailure ∷ !(TVar Bool)
   , rigNext ∷ !(TVar Word32)
@@ -85,13 +87,15 @@ data Rig = Rig
   }
 
 data Options = Options
-  { optProfile ∷ ViewProfile
+  { optTeardown ∷ Bool
+    -- ^ Whether the host's teardown is played when the body ends ('False' leaves the views' drain waiting).
+  , optProfile ∷ ViewProfile
   , optWindow ∷ Word64
   , optRuntime ∷ Config → Config
   }
 
 defaultOptions ∷ Options
-defaultOptions = Options smallProfile 196608 id
+defaultOptions = Options True smallProfile 196608 id
 
 -- A small profile: enough for the examples' views, small enough that its caps are reachable.
 smallProfile ∷ ViewProfile
@@ -139,6 +143,7 @@ withRig options body =
         standings ← newTVarIO Map.empty
         chunks ← newTVarIO Map.empty
         disposed ← newTVarIO []
+        attempts ← newTVarIO Map.empty
         buildFailure ← newTVarIO Nothing
         disposeFailure ← newTVarIO False
         next ← newTVarIO 1
@@ -188,9 +193,9 @@ withRig options body =
                     forM_ steps ($ fakeHands)
                     loop
               loop
-            rig views = Rig views terrain lease queue queueOpen lane laneCapacity standings chunks disposed buildFailure disposeFailure next ledger claims receipts ownerEnded style account
+            rig views = Rig views terrain lease queue queueOpen lane laneCapacity standings chunks disposed attempts buildFailure disposeFailure next ledger claims receipts ownerEnded style account
             fakeHands = hands (rig (error "the teardown's hands read no service"))
-        withOwnedThread teardown $ \_ _ →
+        withOwnedThread (when (optTeardown options) teardown) $ \_ _ →
           withTerrainViews defaultTerrainViewsConfig {tvProfile = optProfile options} ports $ \views →
             body (rig views) `finally` atomically (writeTVar ending True)
 
@@ -234,6 +239,7 @@ hands rig =
               modifyTVar' (rigStandings rig) (Map.insert chunk ChunkReady)
               pure (Right chunk)
     , handDispose = \chunk → atomically $ do
+        modifyTVar' (rigAttempts rig) (Map.insertWith (+) chunk 1)
         failing ← readTVar (rigDisposeFailure rig)
         if failing
           then pure (Left "the backend refused the release")
@@ -693,6 +699,14 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         failures ← atomically (serviceFailures <$> readTerrainViews (rigViews rig))
         failures `shouldSatisfy` (not . null)
         failures `shouldSatisfy` all (\(_, chunk, cause) → isJust chunk && "release failed" `Text.isInfixOf` cause)
+        -- two more steps: no chunk is attempted again, no evidence is added, and the failed chunks keep their slots
+        forM_ [1 ∷ Int, 2] $ \_ → atomically (kick (rigViews rig)) >> runOwner rig
+        reading ← atomically (readTerrainViews (rigViews rig))
+        serviceFailures reading `shouldBe` failures
+        attempted ← readTVarIO (rigAttempts rig)
+        [Map.lookup chunk attempted | (_, Just chunk, _) ← failures] `shouldSatisfy` all (== Just 1)
+        Map.findWithDefault 0 1 (serviceOccupied reading) `shouldBe` length failures
+        (serviceRetiring reading, servicePrivate reading) `shouldBe` (0, 0)
 
   describe "the service's end" $ do
     it "ends every view, drains its retirements and returns the reservation" $ do
@@ -711,6 +725,20 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         runOwner rig
         timeout 10000000 (atomically (inspectRetainedChargesSTM (rigTerrain rig) >>= \(held, borrows) → check (held == 0 && null borrows)))
           >>= (`shouldBe` Just ())
+
+    it "answers an interrupted drain: the reservation returns, what was retiring is recorded with the interruption, which is raised after the cleanup" $ do
+      held ← newIORef Nothing
+      outcome ← timeout 3000000 . withRig defaultOptions {optTeardown = False} $ \rig → do
+        writeIORef held (Just (rigAccount rig, rigViews rig))
+        target ← newTarget 1
+        view ← openOn rig target
+        settleUntil rig (publishedAtLeast view 1)
+      outcome `shouldBe` Nothing
+      (account, views) ← readIORef held >>= maybe (fail "the rig never started") pure
+      atomically (accountCharged account) `shouldReturn` 0
+      failures ← atomically (serviceFailures <$> readTerrainViews views)
+      failures `shouldSatisfy` (not . null)
+      failures `shouldSatisfy` all (\(_, _, cause) → "drain was interrupted" `Text.isInfixOf` cause)
 
     it "ends what the owner can no longer dispose of as failures with the owner's cause" $ do
       failures ← withRig defaultOptions $ \rig → do
