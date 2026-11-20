@@ -1534,8 +1534,10 @@ viewReadings service = readTVar (svViews service) >>= mapM (readView . TerrainVi
 -- | The revision a view's target drew, for picking (#715): its tag, the frame's metrics, how many drawings the view
 -- has had, and the drawn plan with the arena version it was copied from while it is pinned ('Nothing' once a
 -- successor's pin replaced it).
-data DrawnPlan = DrawnPlan
-  { drawnPlanReceipt ∷ !Drawn
+data DrawnPlan k = DrawnPlan
+  { drawnPlanTarget ∷ !k
+    -- ^ The target incarnation the view, and so the receipt, is bound to.
+  , drawnPlanReceipt ∷ !Drawn
   , drawnPlanPlan ∷ !(Maybe CellPlan)
   , drawnPlanArena ∷ !(Maybe (ArenaId, Revision, Revision, Word64))
   , drawnPlanRegions ∷ !(Maybe (Set RegionCoord))
@@ -1546,13 +1548,13 @@ data DrawnPlan = DrawnPlan
     -- ^ The metrics the plan was made for.
   }
 
-viewDrawn ∷ TerrainView k → STM (Maybe DrawnPlan)
+viewDrawn ∷ TerrainView k → STM (Maybe (DrawnPlan k))
 viewDrawn (TerrainView service vs) =
   readReceipt (portReceipts (svPorts service)) (vsId vs) >>= \case
     Nothing → pure Nothing
     Just drawn → do
       pin ← Map.lookup (tagRevision (drawnTag drawn)) <$> readTVar (vsPins vs)
-      pure (Just (DrawnPlan drawn (pinPlan <$> pin) (pinCopies <$> pin) (pinRegions <$> pin) (pinCamera <$> pin) (pinMetrics <$> pin)))
+      pure (Just (DrawnPlan (vtKey (vsTarget vs)) drawn (pinPlan <$> pin) (pinCopies <$> pin) (pinRegions <$> pin) (pinCamera <$> pin) (pinMetrics <$> pin)))
 
 -- | The service's resources now.
 data ServiceReading k = ServiceReading

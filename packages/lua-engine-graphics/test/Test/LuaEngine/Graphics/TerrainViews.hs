@@ -458,6 +458,7 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         atomically (noteSubmitted (rigReceipts rig) (worldTag world) (worldMetrics world))
         drawn ← atomically (viewDrawn view) >>= maybe (fail "nothing drawn") pure
         drawnTag (drawnPlanReceipt drawn) `shouldBe` worldTag world
+        drawnPlanTarget drawn `shouldBe` 1
         isJust (drawnPlanPlan drawn) `shouldBe` True
         -- a successor that is accepted and adopted but never drawn leaves the receipt where it was
         atomically (configureView view noConfigure {configureLight = Just brighter}) `shouldReturn` Right ()
@@ -465,6 +466,8 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         adopt rig target
         again ← atomically (viewDrawn view) >>= maybe (fail "nothing drawn") pure
         drawnTag (drawnPlanReceipt again) `shouldBe` worldTag world
+        -- the drawn revision's plan stays pinned beside its successor's
+        isJust (drawnPlanPlan again) `shouldBe` True
 
   describe "admission" $ do
     it "refuses a replacement beyond the target's chunk slots and keeps the drawing; the occupancy never exceeds the slots" $
@@ -506,6 +509,27 @@ spec = describe "terrain views (TRA-9 v2)" $ do
           _ → False)
         atomically (readTVar (targetScenes target)) `shouldReturn` []
 
+    it "refuses a candidate whose copies hold more input runs and intervals than the profile allows" $
+      withRig defaultOptions {optProfile = smallProfile {profileRuns = 1}} $ \rig → do
+        target ← newTarget 1
+        view ← openOn rig target
+        settleUntil rig (isJust . readingRefusal <$> readView view)
+        atomically (readingRefusal <$> readView view) >>= (`shouldSatisfy` \case
+          Just (LimitRuns _ 1) → True
+          _ → False)
+
+    it "refuses a view when the profile's targets are all open, or the target carries no qualified depth image" $
+      withRig defaultOptions {optProfile = smallProfile {profileTargets = 1}} $ \rig → do
+        first ← newTarget 1
+        second ← newTarget 2
+        _ ← openOn rig first
+        style ← styleOf rig
+        refused ← openView (rigViews rig) (OpenRequest (viewTarget second) (rigLease rig) (pure (Right style)) (axis 0, axis 0, axis 1) defaultLightSettings)
+        either Just (const Nothing) refused `shouldBe` Just OpenTooManyViews
+        shallow ← openView (rigViews rig) (OpenRequest ((viewTarget second) {vtDepth = False}) (rigLease rig) (pure (Right style)) (axis 0, axis 0, axis 1) defaultLightSettings)
+        either Just (const Nothing) shallow `shouldBe` Just OpenNoDepth
+        atomically (claimOf (rigClaims rig) 2) `shouldReturn` Nothing
+
     it "reserves the declared allowance once, and returns it when the views end" $
       withRig defaultOptions $ \rig → do
         let allowance = reserveTotal (reservation smallProfile)
@@ -543,6 +567,16 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         settleUntil rig (isJust <$> moveSettled move)
         atomically (moveSettled move) `shouldReturn` Just MoveLanded
 
+    it "applies none of an invalid configure's fields" $
+      withPublished defaultOptions $ \_ _ view → do
+        before' ← atomically (readView view)
+        atomically (configureView view noConfigure {configureZoom = Just (0 / 0), configureLight = Just brighter}) >>= (`shouldSatisfy` \case
+          Left (ControlInvalid _) → True
+          _ → False)
+        after' ← atomically (readView view)
+        readingPublished after' `shouldBe` readingPublished before'
+        readingStage after' `shouldBe` "idle"
+
     it "applies none of a busy configure's fields" $
       withRig defaultOptions $ \rig → do
         target ← newTarget 1
@@ -565,7 +599,10 @@ spec = describe "terrain views (TRA-9 v2)" $ do
   describe "endings" $ do
     it "on close, hands the published claim back with a real empty revision, after which M1 may publish" $
       withPublished defaultOptions $ \rig target view → do
+        -- while the view is open its style's two parents are held by interests the texture backend's release reads
+        atomically (readingInterests <$> ledgerReading (rigLedger rig)) `shouldReturn` Map.fromList [(colourIdentity, 1), (normalIdentity, 1)]
         _ ← closeView view
+        atomically (readingInterests <$> ledgerReading (rigLedger rig)) `shouldReturn` Map.empty
         scenes ← readTVarIO (targetScenes target)
         case scenes of
           (_, scene) : _ → graphicsWorld scene `shouldBe` Nothing
@@ -666,6 +703,15 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         pure (rigAccount rig)
       atomically (accountCharged account) `shouldReturn` 0
 
+    it "returns the terrain service's every borrow when a view closes with a copy under way" $
+      withPublished defaultOptions $ \rig _ view → do
+        atomically (configureView view noConfigure {configureZoom = Just 2}) `shouldReturn` Right ()
+        runOwner rig
+        _ ← closeView view
+        runOwner rig
+        timeout 10000000 (atomically (inspectRetainedChargesSTM (rigTerrain rig) >>= \(held, borrows) → check (held == 0 && null borrows)))
+          >>= (`shouldBe` Just ())
+
     it "ends what the owner can no longer dispose of as failures with the owner's cause" $ do
       failures ← withRig defaultOptions $ \rig → do
         target ← newTarget 1
@@ -696,7 +742,7 @@ spec = describe "terrain views (TRA-9 v2)" $ do
 
 -- The plan the planner makes from fresh copies of the drawn plan's regions, at its camera and metrics: what the view
 -- must have drawn.
-independentPlan ∷ Rig → DrawnPlan → IO CellPlan
+independentPlan ∷ Rig → DrawnPlan Int → IO CellPlan
 independentPlan rig drawn = do
   regions ← maybe (fail "no regions") (pure . Set.toList) (drawnPlanRegions drawn)
   camera ← maybe (fail "no camera") pure (drawnPlanCamera drawn)
