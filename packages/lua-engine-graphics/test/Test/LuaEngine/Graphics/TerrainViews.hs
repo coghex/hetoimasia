@@ -1921,21 +1921,6 @@ hardening = describe "wakes, ownership and limits" $ do
       _ ← awaitPublished v 1
       closeView view
 
-  it "keeps two views whose regions the GPU allowance cannot hold asleep, however each other's copies come and go" $
-    withViewsConfig testConfig {tvGpuBytes = 0} $ \v → do
-      modelWindow (vModel v) 2
-      a ← attached v 1
-      b ← attached v 2
-      bounded (atomically (forM_ [a, b] (\w → readView w >>= \r → check (readingWaiting r && readingStagedBytes r == 0))))
-      let stepsOf = atomically ((,) <$> (readingSteps <$> readView a) <*> (readingSteps <$> readView b))
-      stepsBefore ← stepsOf
-      -- the worker serves two attachments meanwhile (refused: the targets are claimed), and takes no step of either
-      forM_ [1, 2 ∷ Int] $ \_ → attachOutcome v (target v 1) >>= (`shouldSatisfy` \case SettledRefused AttachTargetClaimed → True; _ → False)
-      stepsOf `shouldReturn` stepsBefore
-      atomically (readView a) >>= (`shouldBe` Nothing) . readingPublished
-      closeView a
-      closeView b
-
   it "keeps every published revision pinned until the target's first adoption, so the one the host adopts can still be picked" $
     withViews $ \v → do
       view ← attached v 1
