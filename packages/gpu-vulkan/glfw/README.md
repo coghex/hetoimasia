@@ -19,7 +19,9 @@ and the suites' verification capture.
   required or optional target — or, once the session has failed, refuses naming
   its primary failure. `readVulkanTerminal` reads the session's terminal latch:
   that primary, the device's loss if it was observed, and what teardown found
-  and retained beside it. `replaceVulkanSurfaces` creates, on the main
+  and retained beside it; `readVulkanActionGate` reads, as admission does,
+  whether the owner takes actions now (refused once its session failed or its
+  exit began). `replaceVulkanSurfaces` creates, on the main
   thread, the replacement surface the owner asked for to recover a lost one,
   under the same attachment (VK-14); `readVulkanUnavailability` reports an
   optional target that could not be recovered, and a required one fails the
@@ -77,7 +79,8 @@ and the suites' verification capture.
   session's `Construction`: on the graphics owner's thread it builds pipeline
   layouts and graphics pipelines over embedded shaders
   (`constructPipelineLayout`, `constructPipeline`), replaces and releases them
-  (`replaceConstructedPipeline`, `releaseConstructed`), and binds one built for
+  (`replaceConstructedPipeline`, `releaseConstructed`; `constructedDisposal`
+  reads whether a released buffer has been destroyed), and binds one built for
   the frame's format inside the dynamic rendering it begins and ends. Any other
   thread is refused before anything native happens, a pipeline built for
   another format is refused at its binding, and it never holds a native

@@ -543,7 +543,9 @@ planned for, its chunks and the textures its records name. The host's own
 publication, release barrier, adoption and ledger carry it. The ledger holds a
 world revision's chunks and textures for each adoption, and holds a view's
 **interests** in its two atlas parents from attachment to close, so the
-texture backend does not release their registrations meanwhile.
+texture backend does not release their registrations meanwhile. They are taken
+in the open's commit, in the transaction that checks the caller's original
+window lease and both parents' leases are still live.
 
 A view publishes only under its target incarnation's exclusive **claim**
 (`SceneClaims`, shared with M1). The M1 publisher reads the claim in its
@@ -553,12 +555,18 @@ in the transaction that checks the claim still names its view.
 The **draw receipt** (`Scene.Receipts`) names the revision a target drew and
 the metrics of the frame that drew it. It advances only at a window frame's
 successful presentation enqueue (the renderer notes a world frame's attachment
-and slot; the host's frame observer promotes it) or at the successful
-submission of a registered offscreen target's batch (`drawOffscreenView`).
-Adoption, recording, a refused or abandoned frame and an M1 frame leave it as
-it was. A caller that sets `vulkanFrameObserver` after `configureScenes` keeps
-the receipts with `sceneFrameObserver`. A window view plans for the metrics of
-its window's latest recorded frame (`latestFrameMetrics`).
+and slot; the host's frame observer promotes it) or once a registered offscreen
+target's batch is complete (`drawOffscreenView`'s owner action notes the
+batch's ticket; a discarded or lost batch drew nothing; the caller's fate
+changes nothing). Adoption, recording, a refused or abandoned frame and an M1
+frame leave it as it was. Only a live view incarnation's receipt moves: it is
+opened at the view's commit and forgotten at its end, with whatever of it was
+recorded or noted and not yet promoted. A caller that sets
+`vulkanFrameObserver` after `configureScenes` keeps the receipts with
+`sceneFrameObserver`. A window view plans for the metrics of its window's
+latest recorded frame (`latestFrameMetrics`), kept only while a view watches
+that window; an open on a target with no metrics yet publishes the real empty
+revision in its commit, which asks for that first frame.
 
 ### One owner
 
@@ -581,15 +589,21 @@ Two threads, both started and joined inside `withTerrainViews`, own nothing:
   (`serviceOwnerStepMax`, `serviceOwnerMax`);
 - the **watcher** blocks on the open views' arena mark cells (`arenaMarkSTM`)
   and the terrain service's authority epoch (`authorityEpochSTM`) and kicks,
-  so an edit, a discovery or a lost lease reaches an idle window, and admits
-  again a kick the owner's queue refused once the queue has room.
+  so an edit, a discovery or a lost lease reaches an idle window; and on the
+  views' own outstanding work: a kick the owner's queue refused, a barrier the
+  release lane has room for, a chunk that can be released, a disposal the
+  backend confirmed, an offscreen batch that completed. It also observes the
+  owner's end (its action gate closed by exit or failure, an admission refused
+  for good, an admitted step refused or raised): admission stops and every view
+  ends.
 
 | State | Owner | Writers | Lifetime |
 | --- | --- | --- | --- |
 | A view's camera, intent, moves | the view | the controls (STM, any thread), its steps | open to end |
 | A view's stage (copying, planning, building) | the view | its steps (owner thread); an ending takes it | one preparation |
 | Published parts, pins, the receipt's plan | the view | its steps; its ending | to the view's end |
-| Slots, the FIFO retirements, private builds, failures | the service | steps, endings, the drain | the service's scope |
+| Slots, the FIFO retirements, private builds, the owner's hand, disposals awaiting confirmation, failures | the service | steps, endings, the drain | the service's scope |
+| The admitted step's outcome, the owner's end | the service | admission, the watcher, the drain | the service's scope |
 | The planner's queue (one job a view) | the service | the owner's steps; the planner takes | the service's scope |
 | The planner, the watcher | the service | none | the service's scope |
 
@@ -601,13 +615,19 @@ Two threads, both started and joined inside `withTerrainViews`, own nothing:
    `profileRequestRegions` regions; its borrow is taken and returned in one
    transaction as soon as it settles, and returned if cancellation lost the
    race. The first round copies the camera's anchor, a pending move's
-   destination and the last plan's regions; up to `profileRounds` rounds copy
-   what the camera or the plan's visible demand still lacks. Copies of
-   different versions are never combined.
+   destination and then the last plan's regions; up to `profileRounds` rounds
+   copy what the camera or the plan's visible demand still lacks. Every round is
+   bounded by `profileRegions` in all. Each copy's input runs and intervals are
+   counted as the planner is handed them and checked against `profileRuns` as
+   the copy is accepted. Copies of different versions are never combined.
 2. **Planning**, on the planner: the copies' inputs, then (once the owner has
    settled the camera with their facts, landing a pending move whose
    destination they reach, settling it once) the plan in `profileStepWork`
-   quanta, its adaptation and its parts.
+   quanta, its adaptation and its parts. A plan that meets a plan-wide bound
+   (columns, levels, quads, pending spans) is refused (`LimitPlan`), never
+   published truncated. A pending move the preparation cannot land within its
+   rounds and regions settles with recoverable pressure (`MovePressure`), as
+   does every pending move of a refused preparation; the camera stays.
 3. **Admission.** The parts are render regions of 16 × 16 view-frame cells,
    each split into chunks of at most `profileChunkBytes` of instances, each
    with its own records. A part equal by content to a published one is reused
@@ -615,26 +635,38 @@ Two threads, both started and joined inside `withTerrainViews`, own nothing:
    renderer's storage window as a frame binds them, or more new chunks than the
    target's free slots.
 4. **Building.** At most `profileBuilds` chunks a step; each occupies a slot
-   from its build. Upload backpressure keeps the built prefix.
+   from its build, and is handed to the candidate in the transaction after its
+   build, or to disposal if the stage was replaced meanwhile. Upload
+   backpressure keeps the built prefix.
 5. **Publication**, once every chunk is ready, in the transaction that rechecks
    the claim, the target, the session, the intent, the metrics and the arena's
    content and knowledge revisions. Overtaken, the candidate's builds are
-   discarded and the newer state prepared. The view's runtime demand is its
-   plan's visible regions before its prefetch.
+   discarded and the newer state prepared. A view pins the revision its receipt
+   names and one later revision the ledger holds adopted; a third publication
+   waits until one of them can no longer be drawn. The view's runtime demand is
+   its plan's visible regions before its prefetch.
 
 A plan whose visible demand names regions its copies did not reach is still
-published (that coverage is loading) and the view prepares again for it.
+published (that coverage is loading). The view prepares again for those within
+`profileRegions` that lacked a copy round; those beyond it stay loading.
 
 ### Limits and the reservation
 
 Every limit is a count enforced at admission (`ViewProfile`). With `W`
 targets, `K` slots and `C` chunk bytes, terrain vertex data, live and
 retiring, is at most `W × K × C ≤ 128 MiB`; candidate, drawn, retiring and
-failed chunks all occupy their target's slots, across a close and reopen. At
-construction the views reserve, with checked arithmetic, one CPU allowance in
-the shared render/staging account (`reservation`: controls, one candidate's
-scratch, two pins and the slots' descriptions for each target), returned at
-the scope's end.
+failed chunks all occupy their target's slots, across a close and reopen, and a
+target whose chunks still occupy slots counts against `W` until they are
+disposed of (`OpenTooManyViews`). At construction the views reserve, with
+checked arithmetic, one CPU allowance in the shared render/staging account
+(`reservation`: controls, one candidate's scratch, two pins and the slots'
+descriptions for each target), in a resource scope that returns it however the
+views end.
+
+An open is also refused when the caller's window or style lease ended before
+its commit (`OpenLeaseEnded`), or when the style's mapping gives no region to
+a material of the arena's palette (`StyleMissingMaterials`); a refusal leaves
+nothing held.
 
 | Default | Value | Default | Value |
 | --- | ---: | --- | ---: |
@@ -652,22 +684,27 @@ its intent, its metrics, its arena's revisions or residency, or a freed slot.
 
 ### Retirement
 
-What a published revision no longer lists asks the host's FIFO release lane
-for a barrier, in publication order, and each chunk is disposed of once its
-barrier is met and no adopted revision holds it. A private build no revision
-listed is disposed of once its upload has ended. Independent chunks may finish
-in either order. Each chunk is released once: a failed disposal becomes
-evidence with the chunk's identity and cause and keeps its slot; the others go
-on.
+A chunk has one holder at a time (the candidate, the published revision, the
+retirement queue or the private builds, the owner's hand, the disposals
+awaiting confirmation, the failures) and leaves one in the transaction that
+hands it to the next. What a published revision no longer lists asks the
+host's FIFO release lane for a barrier, in publication order, and each chunk
+is released once its barrier is met and no adopted revision holds it. A
+private build no revision listed is released once its upload has ended.
+Independent chunks may finish in either order. Each chunk is released once;
+its slot is freed when the backend confirms the buffer's physical disposal
+(`constructedDisposal`). A failed release or disposal, or a barrier the lane
+refused, becomes evidence with the chunk's identity and the host's cause and
+keeps its slot; the others go on.
 
 | Ending | Disposal and caller outcome |
 | --- | --- |
 | `closeView` | Revoked at once, without a step. A published claim is handed back with a real empty revision in the same transaction; an unpublished one is returned. Its chunks retire. `CloseRetiring`, `CloseDone` or `CloseAlreadyReleased`. |
 | Lease, client or arena gone | `EndRevoked`: the claim handed back, moves settled, chunks retired. |
 | Target retired | `EndTargetGone`: the claim and demand dropped. |
-| Graphics owner ends | What it can no longer dispose of ends as a failure with its cause. |
-| `withTerrainViews` ends | Every view ends (`EndStopped`), retirements drain with the owner live, the reservation returns, the planner and watcher are joined. The drain's wait stays interruptible: an interruption records what was retiring as failures with that cause and is raised after the cleanup. |
-| Failure | Private builds are discarded. A failed handback keeps its scene's chunks until the service ends. |
+| Graphics owner ends | Admission stops; every view ends (`EndStopped`), settling its pending moves; controls answer `ControlEnded` and opens `OpenStopped`; what it can no longer dispose of ends as a failure with its cause. |
+| `withTerrainViews` ends | Every view ends (`EndStopped`); the drain waits, with the owner live, for the admitted step and every chunk's holder; the listeners go and the reservation returns; the planner and watcher are joined first. The drain's wait stays interruptible: an interruption records what was retiring as failures with that cause and is raised after the cleanup, kept beside the body's own failure. |
+| Failure | Private builds are discarded. A failed handback keeps its scene's chunks while the service is open; at its end, those a live target still shows go to the session's teardown, recorded as failures with that cause. |
 
 ### What is ordered
 

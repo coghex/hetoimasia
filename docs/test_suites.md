@@ -612,7 +612,7 @@ cabal test hetoimasia-tests --test-show-details=direct
   hands a real empty revision back and retires every chunk. The terrain views in a real window are the separate mode
   `HETOIMASIA_NATIVE_SESSION=desktop bash tools/vulkan/run.sh native hetoimasia-lua-engine-graphics:test:lua-engine-graphics-native-tests -- --terrain-views-full`,
   accepted alone on a host whose windows carry the world depth image, run directly with the same checks and not part of the catalog
-  group: a view drawn at the presentation's enqueue through zoom changes, with the owner-thread planning time recorded against the
+  group: a view opened directly on a fresh window and drawn at the presentation's enqueue through zoom changes, with the owner-thread planning time recorded against the
   frame budget. The headless counterpart is the `terrain views (TRA-9 v2)` group of `lua-engine-graphics-tests`
   (`test.vulkan-headless`), over the real terrain service with the graphics owner, the release lane and the target stepped by the
   example.
