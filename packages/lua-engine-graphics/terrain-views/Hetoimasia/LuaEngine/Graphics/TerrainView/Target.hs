@@ -52,8 +52,8 @@ import Hetoimasia.Render.TwoD.Metrics (TargetMetrics)
 
 -- | A window incarnation's target. Its depth is the host's: 'True' only on a host built with the window depth a world
 -- scene draws with ('Hetoimasia.LuaEngine.Graphics.Scene.Configuration.configureWorldDepth'), which the composition
--- passes here. Its metrics are those of the window's latest recorded frame ('latestFrameMetrics'), kept from the
--- view's open to its close. Its authority is the caller's original window lease (checked in the open's commit). It
+-- passes here. Its metrics are those of the window's latest recorded frame ('latestFrameMetrics'), or, when none is
+-- kept (a fresh window, or an idle one whose entry was evicted), its live geometry ('targetGeometry'). Its authority is the caller's original window lease (checked in the open's commit). It
 -- shows a scene once the host holds one published for it.
 windowViewTarget ∷ VulkanHost GraphicsScene → Bool → DrawReceipts → STM Bool → WindowTarget GraphicsScene → ViewTarget SceneTargetKey
 windowViewTarget host hostDepth receipts authority target =
@@ -69,7 +69,8 @@ windowViewTarget host hostDepth receipts authority target =
           WindowScenePublished _ _ → True
           _ → False
     , vtDepth = hostDepth
-    , vtMetrics = latestFrameMetrics receipts (targetAttachment target)
+    , -- the latest recorded frame's metrics, or, before the window has one kept, its live geometry
+      vtMetrics = latestFrameMetrics receipts (targetAttachment target) >>= maybe (targetGeometry target) (pure . Just)
     }
 
 -- | A surface-free target registered with the host: usable while its registrant says so, drawn with the depth image

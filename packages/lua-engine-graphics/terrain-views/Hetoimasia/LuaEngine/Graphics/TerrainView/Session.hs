@@ -132,7 +132,7 @@ import Hetoimasia.Render.TwoD.Snapshot (ClearColour (..), Instance, Layer (World
 import Hetoimasia.Render.TwoD.Vulkan.Chunks (ChunkStanding (..))
 import Hetoimasia.Render.TwoD.Vulkan.Layout (clipEntryBytes)
 import Hetoimasia.Terrain.Changes (ChangeLimits (..))
-import Hetoimasia.Terrain.Coordinate (AxisCoord, RegionCoord (..), axisValue)
+import Hetoimasia.Terrain.Coordinate (AxisCoord, RegionCoord (..), TileCoord (..), axisValue)
 import Hetoimasia.Terrain.Render2D.Camera (CameraConfig, CameraError, CameraState, Command (..), FollowOutcome (..), JumpEvent (..), JumpId (..), JumpTarget (..), PendingJump (..), Step (..), applyCommand, cancelJump, camAnchorX, camAnchorY, camClip, camPending, completeJump, defaultCameraConfig, newCamera, refollow)
 import Hetoimasia.Terrain.Render2D.Cells
 import Hetoimasia.Terrain.Render2D.Facts (ChunkDemand (..), ChunkKey (..), Demand (..), TerrainFacts (..))
@@ -264,6 +264,11 @@ data Prep = Prep
     -- ^ Every region asked for so far.
   , prepRuns ∷ !Int
     -- ^ The input runs and intervals of the copies taken so far, as the planner is handed them.
+  , prepNeeded ∷ !(Set RegionCoord)
+    -- ^ Every region the current camera's plans have needed in this preparation: their drawn cells' regions and their
+    -- visible demand, across copy rounds.
+  , prepSeeding ∷ !Bool
+    -- ^ The first round, seeded from the last plan's regions: copies it cannot afford are dropped, not refused.
   }
 
 data Stage
@@ -281,7 +286,10 @@ data Planned = Planned
   { plannedPlan ∷ !CellPlan
   , plannedCamera ∷ !CameraState
   , plannedVisible ∷ ![RegionCoord]
+    -- ^ The camera's visible footprint, nearest the anchor first.
   , plannedPrefetch ∷ ![RegionCoord]
+  , plannedNeeded ∷ !(Set RegionCoord)
+    -- ^ Every region this preparation's plans have needed.
   , plannedNext ∷ !(Either (Bool, [RegionCoord]) (Adapted, [(PartKey, [Instance], [MaterialRecord])], Bool))
     -- ^ Another copy round (afresh, dropping the copies so far, or adding to them), or the candidate's parts.
   }
@@ -368,6 +376,8 @@ data ViewState k = ViewState
   , vsNextRevision ∷ !(TVar Word64)
   , vsRefused ∷ !(TVar (Maybe (BindingLimit, RefusedAt)))
   , vsRefusals ∷ !(TVar Natural)
+  , vsAsked ∷ !(TVar [RegionCoord])
+    -- ^ The runtime demand last asked for, in order.
   , vsDemand ∷ !(TVar [RegionCoord])
     -- ^ The regions the last plan drew from and still wanted, which seed the next preparation's copies.
   }
@@ -697,7 +707,8 @@ shutdown service = do
             done ← drained service
             if
               | running → retry
-              | done → pure False
+              -- the final check closes step admission in the same transaction: no kick queues a step after it
+              | done → False <$ endOwner service "the views' service has ended"
               | otherwise → do
                   asked ← askBarriers service
                   ready ← retirementReady service
@@ -835,6 +846,7 @@ newViewState service request style rview markCell camera = do
     <*> newTVarIO 1
     <*> newTVarIO Nothing
     <*> newTVarIO 0
+    <*> newTVarIO []
     <*> newTVarIO []
 
 commitOpen ∷ (Ord k, Show k) ⇒ TerrainViews k → ViewState k → STM (Either OpenRefusal ())
@@ -1189,11 +1201,17 @@ startIfDue service vs basis = atomically $ do
       let profile = tvProfile (svConfig service)
           anchor = anchorRegion camera
           jumpTo = maybe [] (\p → [targetRegion (pendingTarget p) (camClip camera)]) (camPending camera)
-          -- the anchor's region and a pending jump's destination first, then the demand nearest the anchor
-          wanted = take (profileRegions profile) (nubOrdered (anchor : jumpTo <> demand))
-      writeTVar (vsStage vs) (Copying (Prep basis metrics (profileRounds profile - 1) (Set.fromList wanted) 0) wanted [] Nothing)
+          -- the anchor's region and a pending jump's destination first, then the last plan's regions; a pending jump
+          -- leaves those out: they are the previous camera's
+          seeds = if null jumpTo then demand else []
+          wanted = take (profileRegions profile) (nubOrdered (anchor : jumpTo <> seeds))
+      writeTVar (vsStage vs) (Copying (Prep basis metrics (profileRounds profile - 1) (Set.fromList wanted) 0 Set.empty True) wanted [] Nothing)
       pure True
     _ → pure False
+
+-- The region of a cell.
+regionOfTile ∷ TileCoord → RegionCoord
+regionOfTile tile = RegionCoord (fromIntegral (axisValue (tileX tile) `div` 16)) (fromIntegral (axisValue (tileY tile) `div` 16)) (fromIntegral (axisValue (tileZ tile) `div` 32))
 
 -- The regions in admission order: the anchor's first, then the nearest to it, each once.
 ordered ∷ RegionCoord → [RegionCoord] → [RegionCoord]
@@ -1227,21 +1245,27 @@ writeBack _ vs serial stage = do
 
 -- Enter refusal: the current drawing stays; the binding limit is reported once, on entering; the private builds go
 -- to disposal, and the pending moves settle with that pressure.
-refuse ∷ TerrainViews k → ViewState k → Word64 → Basis → BindingLimit → STM ()
+refuse ∷ (Ord k, Show k) ⇒ TerrainViews k → ViewState k → Word64 → Basis → BindingLimit → STM ()
 refuse service vs serial basis limit = do
   current ← readTVar (vsStageSerial vs)
+  intent ← readTVar (vsIntent vs)
   when (current == serial) $ do
     stage ← readTVar (vsStage vs)
     case stage of
       Building _ candidate → privately service vs (map partChunk (Map.elems (cdBuilt candidate)))
       _ → pure ()
     writeTVar (vsStage vs) Idle
-    pressure vs limit
-    residency ← currentResidency service vs
-    freed ← readTVar (svFreed service)
-    before ← readTVar (vsRefused vs)
-    when (isNothing before) (modifyTVar' (vsRefusals vs) (+ 1))
-    writeTVar (vsRefused vs) (Just (limit, RefusedAt basis residency freed))
+    -- an overtaken preparation (a newer control moved the intent) discards its own work only: the newer state is
+    -- prepared next, and its moves stay pending
+    when (intent == basisIntent basis) $ do
+      pressure vs limit
+      residency ← currentResidency service vs
+      freed ← readTVar (svFreed service)
+      before ← readTVar (vsRefused vs)
+      when (isNothing before) (modifyTVar' (vsRefusals vs) (+ 1))
+      writeTVar (vsRefused vs) (Just (limit, RefusedAt basis residency freed))
+    -- overtaken: the newer state is prepared now
+    unless (intent == basisIntent basis) (kick service)
 
 -- Settle every pending move with recoverable pressure, once, and cancel the camera's pending jump: the camera stays
 -- where it was.
@@ -1269,9 +1293,11 @@ stepCopying service vs serial prep wanted taken = \case
         -- the cumulative input runs, counted as the planner is handed them, are checked as each copy is accepted
         runs ← timed service (\() → prepRuns prep + plannerRuns snapshot)
         let limit = profileRuns (tvProfile (svConfig service))
-        if runs > limit
-          then False <$ atomically (refuse service vs serial (prepBasis prep) (LimitRuns runs limit))
-          else atomically (writeBack service vs serial (Copying prep {prepRuns = runs} wanted (snapshot : taken) Nothing))
+        if
+          | runs <= limit → atomically (writeBack service vs serial (Copying prep {prepRuns = runs} wanted (snapshot : taken) Nothing))
+          -- the seed round cannot afford the last plan's regions: they are dropped, and the plan asks for what it needs
+          | prepSeeding prep && not (null taken) → toPlanning service vs serial prep {prepSeeding = False} taken
+          | otherwise → False <$ atomically (refuse service vs serial (prepBasis prep) (LimitRuns runs limit))
       Just (Left why) → False <$ atomically (refuse service vs serial (prepBasis prep) (LimitRuntime why))
   Nothing → case wanted of
     [] → toPlanning service vs serial prep taken
@@ -1332,10 +1358,11 @@ stepInputting service vs serial prep taken box =
             fresh = filter (`Set.notMember` prepRegions prep) (nubOrdered extra)
             fits = take room fresh
         if not (null fits) && prepRounds prep > 0
-          then writeBack service vs serial (Copying prep {prepRounds = prepRounds prep - 1, prepRegions = prepRegions prep <> Set.fromList fits} fits taken Nothing)
+          then writeBack service vs serial (Copying prep {prepRounds = prepRounds prep - 1, prepRegions = prepRegions prep <> Set.fromList fits, prepSeeding = False} fits taken Nothing)
           else do
             -- a pending jump this preparation cannot land settles with pressure, and the camera stays
-            when (isJust (camPending settled)) $
+            intent ← readTVar (vsIntent vs)
+            when (isJust (camPending settled) && intent == basisIntent (prepBasis prep)) $
               pressure vs $
                 if null fresh
                   then LimitFailure "the jump's destination cannot be reached with its copied facts"
@@ -1418,22 +1445,28 @@ planOf service style light inputs prep = do
   plan ← either (failed "the plan could not finish") Right (cellPlanOf inputs finished)
   let profile = tvProfile (svConfig service)
       camera = crCamera (inputsRequest inputs)
-      visible = regionsOf (cdVisible (cellPlanDemand plan))
+      anchor = anchorRegion camera
+      -- the camera's whole visible footprint: the regions of the cells it draws and of the visible demand still
+      -- missing, with what earlier rounds of this preparation needed
+      drawn = [regionOfTile tile | Just tile ← map quadCell (cellPlanQuads plan)]
+      footprint = ordered anchor (drawn <> regionsOf (cdVisible (cellPlanDemand plan)))
+      needed = prepNeeded prep <> Set.fromList footprint
+      current = ordered anchor (Set.toList needed)
       prefetch = regionsOf (cdPrefetch (cellPlanDemand plan))
       limit = profileRegions profile
       room = max 0 (limit - Set.size (prepRegions prep))
-      current = ordered (anchorRegion (crCamera (inputsRequest inputs))) visible
       unasked = filter (`Set.notMember` prepRegions prep) current
+      planned = Planned plan camera footprint prefetch needed
       candidate incomplete = do
         (adapted, parts) ← candidateOf service style plan light
-        Right (Planned plan camera visible prefetch (Right (adapted, parts, incomplete)))
+        Right (planned (Right (adapted, parts, incomplete)))
   if
+    -- the footprint never fits the profile's regions: refused, the drawing kept
+    | Set.size needed > limit → Left (LimitRegions (Set.size needed) limit)
     | null unasked → candidate False
-    -- the current visible demand never fits the profile's regions: refused, the drawing kept
-    | length current > limit → Left (LimitRegions (length current) limit)
-    | prepRounds prep > 0 && length unasked <= room → Right (Planned plan camera visible prefetch (Left (False, unasked)))
+    | prepRounds prep > 0 && length unasked <= room → Right (planned (Left (False, unasked)))
     -- it fits only without the copies so far (a previous camera's demand): another round copies it afresh
-    | prepRounds prep > 0 → Right (Planned plan camera visible prefetch (Left (True, current)))
+    | prepRounds prep > 0 → Right (planned (Left (True, current)))
     -- no copy round left: published with that coverage loading, and the view prepares again for it
     | otherwise → candidate True
   where
@@ -1464,14 +1497,15 @@ stepPlanning service vs serial prep copies box =
     Nothing → pure False
     Just (Left limit) → False <$ atomically (refuse service vs serial (prepBasis prep) limit)
     Just (Right planned) → case plannedNext planned of
-      Left (False, missing) → atomically (writeBack service vs serial (Copying prep {prepRounds = prepRounds prep - 1, prepRegions = prepRegions prep <> Set.fromList missing} missing (copySnapshots copies) Nothing))
+      Left (False, missing) → atomically (writeBack service vs serial (Copying prep {prepRounds = prepRounds prep - 1, prepRegions = prepRegions prep <> Set.fromList missing, prepNeeded = plannedNeeded planned, prepSeeding = False} missing (copySnapshots copies) Nothing))
       -- the current visible demand did not fit beside the copies so far (a previous camera's): copied afresh
-      Left (True, visible) → atomically (writeBack service vs serial (Copying prep {prepRounds = prepRounds prep - 1, prepRegions = Set.fromList visible, prepRuns = 0} visible [] Nothing))
+      Left (True, needed) → atomically (writeBack service vs serial (Copying prep {prepRounds = prepRounds prep - 1, prepRegions = Set.fromList needed, prepRuns = 0, prepNeeded = plannedNeeded planned, prepSeeding = False} needed [] Nothing))
       Right (adapted, wanted, incomplete) → do
         let profile = tvProfile (svConfig service)
             plan = plannedPlan planned
         -- the next preparation's first round: this plan's visible regions first, then the rest it copied
         atomically (writeTVar (vsDemand vs) (nubOrdered (plannedVisible planned <> Set.toList (prepRegions prep))))
+        -- the runtime demand: the whole visible footprint first, copied or not, then the prefetch
         setDemand service vs (plannedVisible planned <> plannedPrefetch planned)
         parts ← readTVarIO (vsParts vs)
         -- the reuse comparison is the owner's own planning work, timed into the frame's total
@@ -1541,7 +1575,9 @@ setDemand ∷ TerrainViews k → ViewState k → [RegionCoord] → IO ()
 setDemand service vs regions = do
   let terrain = portTerrain (svPorts service)
       cap = fromIntegral (limitCameraRegions (Runtime.configLimits (Runtime.inspectConfig terrain)))
-      demands = [RegionDemand region coverage | region ← take cap (nubOrdered regions), Right coverage ← [coverageBox 0 16 0 16 0 32]]
+      asked = take cap (nubOrdered regions)
+      demands = [RegionDemand region coverage | region ← asked, Right coverage ← [coverageBox 0 16 0 16 0 32]]
+  atomically (writeTVar (vsAsked vs) asked)
   void (Runtime.setViewDemand terrain (vsRuntime vs) (vsLease vs) demands)
 
 -- Each region once, in the order first named.
@@ -1804,6 +1840,9 @@ data ViewReading = ViewReading
     -- ^ Chunks the published revision lists.
   , readingStage ∷ !Text
     -- ^ Where its preparation is: idle, copying, planning or building.
+  , readingDemand ∷ ![RegionCoord]
+    -- ^ The runtime demand it last asked for: its visible footprint first, then its prefetch, within the service's
+    -- camera regions.
   }
   deriving (Eq, Show)
 
@@ -1818,6 +1857,7 @@ readView (TerrainView service vs) = do
     <*> readTVar (vsRefusals vs)
     <*> (Map.size <$> readTVar (vsParts vs))
     <*> (stageName <$> readTVar (vsStage vs))
+    <*> readTVar (vsAsked vs)
   where
     stageName = \case
       Idle → "idle"

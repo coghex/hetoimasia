@@ -11,7 +11,7 @@
 module Test.LuaEngine.Graphics.TerrainViews (spec) where
 
 import Control.Concurrent.STM
-import Control.Monad (forM_, unless, when)
+import Control.Monad (forM, forM_, unless, when)
 import qualified Data.ByteString.Char8 as BC
 import Data.Bits (shiftL, (.|.))
 import qualified Data.Map.Strict as Map
@@ -969,6 +969,72 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         _ ← openOn rig second
         pure ()
 
+    it "refuses a replacement whose visible footprint exceeds the profile's regions with part of it already copied, keeping the drawing" $ do
+      copied ← regionsCopied defaultOptions
+      withPublished defaultOptions {optProfile = smallProfile {profileRegions = copied, profileQuads = 16384}} $ \rig target view → do
+        quiesce rig target
+        before ← atomically (latestWorld target)
+        published ← atomically (readingPublished <$> readView view)
+        atomically (configureView view noConfigure {configureZoom = Just 0.5}) `shouldReturn` Right ()
+        settleUntil rig (isJust . readingRefusal <$> readView view)
+        atomically (readingRefusal <$> readView view) >>= (`shouldSatisfy` \case
+          Just (LimitRegions needed limit) → limit == copied && needed > copied
+          _ → False)
+        atomically (readingPublished <$> readView view) `shouldReturn` published
+        atomically (latestWorld target) `shouldReturn` before
+
+    it "lands a move whose destination's copies fit the run cap though both views' together do not" $ do
+      -- both footprints' runs, measured: each fits the second service's cap with one region to spare, together they do not
+      (origin, destination, region) ← withPublished defaultOptions $ \rig target view → do
+        here ← drawnRuns rig target view
+        Right move ← atomically (moveView view (JumpTarget (axis 70) (axis 70) (Just (axis 1))))
+        settleUntil rig (publishedAtLeast view 2)
+        atomically (moveSettled move) `shouldReturn` Just MoveLanded
+        there ← drawnRuns rig target view
+        pure (fst here, fst there, max (snd here) (snd there))
+      let limit = max origin destination + region
+      (origin + destination) `shouldSatisfy` (> limit)
+      withPublished defaultOptions {optProfile = smallProfile {profileRuns = limit}} $ \rig _ view → do
+        Right move ← atomically (moveView view (JumpTarget (axis 70) (axis 70) (Just (axis 1))))
+        settleUntil rig (publishedAtLeast view 2)
+        atomically (moveSettled move) `shouldReturn` Just MoveLanded
+        atomically (readingRefusal <$> readView view) `shouldReturn` Nothing
+
+    it "asks the runtime for the whole visible footprint first, copied regions included, before any prefetch" $
+      withPublished defaultOptions $ \rig target view → do
+        world ← atomically (latestWorld target) >>= maybe (fail "no world") pure
+        atomically (noteSubmitted (rigReceipts rig) (worldTag world) (worldMetrics world))
+        drawn ← atomically (viewDrawn view) >>= maybe (fail "nothing drawn") pure
+        regions ← maybe (fail "no regions") pure (drawnPlanRegions drawn)
+        -- the service's camera regions (four) are fewer than the footprint, all of it copied: every one asked is in it
+        asked ← atomically (readingDemand <$> readView view)
+        length asked `shouldBe` 4
+        asked `shouldSatisfy` all (`Set.member` regions)
+
+    it "does not settle a newer move with the refusal of the preparation it overtook" $
+      withPublished defaultOptions $ \rig target view → do
+        quiesce rig target
+        index ← readTVarIO (rigNext rig)
+        atomically (writeTVar (rigHold rig) (Just index))
+        stop ← newTVarIO False
+        let owner = do
+              runOwner rig
+              continue ← atomically ((False <$ (readTVar stop >>= check)) `orElse` (True <$ (readTVar (rigQueue rig) >>= check . not . Seq.null)))
+              when continue owner
+        -- a rebuild whose first build is held; the move arrives meanwhile, and the build is then refused
+        atomically (configureView view noConfigure {configureFacing = Just FaceWest}) `shouldReturn` Right ()
+        move ← withOwnedThread owner $ \_ ended → do
+          timeout 10000000 (atomically (takeTMVar (rigEntered rig))) >>= maybe (expectationFailure "no build was held") pure
+          Right move ← atomically (moveView view (JumpTarget (axis 70) (axis 70) (Just (axis 1))))
+          atomically (writeTVar (rigBuildFailure rig) (Just (BuildFailed "an injected failure")) >> putTMVar (rigResume rig) ())
+          atomically (writeTVar stop True)
+          ended
+          pure move
+        atomically (moveSettled move) `shouldReturn` Nothing
+        atomically (writeTVar (rigBuildFailure rig) Nothing)
+        settleUntil rig (isJust <$> moveSettled move)
+        atomically (moveSettled move) `shouldReturn` Just MoveLanded
+
     it "pins an adopted successor: a third revision waits while the drawn one and an adopted successor can still be drawn" $
       withPublished defaultOptions $ \rig target view → do
         first ← atomically (latestWorld target) >>= maybe (fail "no world") pure
@@ -1162,6 +1228,19 @@ spec = describe "terrain views (TRA-9 v2)" $ do
       failures `shouldSatisfy` (not . null)
       failures `shouldSatisfy` all (\(_, _, cause) → "drain was interrupted" `Text.isInfixOf` cause)
 
+    it "admits no owner step once its final drain has completed" $ do
+      held ← newIORef Nothing
+      withRig defaultOptions $ \rig → do
+        target ← newTarget 1
+        view ← openOn rig target
+        settleUntil rig (publishedAtLeast view 1)
+        writeIORef held (Just rig)
+      rig ← readIORef held >>= maybe (fail "the rig never started") pure
+      atomically (readTVar (rigQueue rig) >>= \queued → writeTVar (rigQueue rig) Seq.empty >> pure (Seq.length queued)) >>= (`shouldBe` 0)
+      -- a late frame event or ledger callback
+      atomically (kick (rigViews rig))
+      atomically (Seq.length <$> readTVar (rigQueue rig)) `shouldReturn` 0
+
     it "ends what the owner can no longer dispose of as failures with the owner's cause" $ do
       failures ← withRig defaultOptions $ \rig → do
         target ← newTarget 1
@@ -1189,6 +1268,25 @@ spec = describe "terrain views (TRA-9 v2)" $ do
               <> " peak-live-bytes=" <> maybe "unmeasured (+RTS -T)" show peak
           )
         published `shouldSatisfy` (> 0)
+
+-- How many regions a default view's first publication copied.
+regionsCopied ∷ Options → IO Int
+regionsCopied options = withPublished options $ \rig target view → do
+  world ← atomically (latestWorld target) >>= maybe (fail "no world") pure
+  atomically (noteSubmitted (rigReceipts rig) (worldTag world) (worldMetrics world))
+  drawn ← atomically (viewDrawn view) >>= maybe (fail "nothing drawn") pure
+  maybe (fail "no regions") (pure . Set.size) (drawnPlanRegions drawn)
+
+-- The input runs of the view's latest revision's copies, as the planner is handed them, and the most of one region.
+drawnRuns ∷ Rig → Target → TerrainView Int → IO (Int, Int)
+drawnRuns rig target view = do
+  world ← atomically (latestWorld target) >>= maybe (fail "no world") pure
+  atomically (noteSubmitted (rigReceipts rig) (worldTag world) (worldMetrics world))
+  drawn ← atomically (viewDrawn view) >>= maybe (fail "nothing drawn") pure
+  regions ← maybe (fail "no regions") (pure . Set.toList) (drawnPlanRegions drawn)
+  perRegion ← forM regions $ \region →
+    withRegionSnapshot (rigTerrain rig) (rigLease rig) [region] (either (fail . show) (pure . plannerRuns)) >>= either (fail . show) pure
+  pure (sum perRegion, maximum (0 : perRegion))
 
 -- The plan the planner makes from fresh copies of the drawn plan's regions, at its camera and metrics: what the view
 -- must have drawn.
