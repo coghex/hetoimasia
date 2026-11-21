@@ -47,6 +47,14 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Uploads
   , submitUpload
   , submitUploadGated
 
+    -- * Reservations
+  , UploadGrant
+  , uploadGrantBytes
+  , uploadRoom
+  , reserveUpload
+  , submitUploadGranted
+  , abandonUploadGrant
+
     -- * Tickets
   , UploadTicket
   , ticketUpload
@@ -225,7 +233,23 @@ data UploadsState = UploadsState
     -- copies: no upload then wakes the owner, whose later turns — the ones
     -- that observe the batches holding the frame-less slots complete — try
     -- again, rather than spinning while every slot is held.
+  , stateGrants ∷ !(Map Natural Grant)
+    -- ^ Every reservation not yet spent or abandoned, by the number its
+    -- upload will have: each holds a place in the queue and a staging region
+    -- exactly as an admitted upload does.
   }
+
+-- | One reservation's staging region — where it starts, and the bytes it
+-- holds, padded — and its standing, which its handle reads.
+data Grant = Grant
+  { grantRegion ∷ !(Natural, Natural)
+  , grantCell ∷ !(TVar GrantStanding)
+  }
+
+-- | Where a reservation stands. Only a reserved one can be spent or
+-- abandoned; the other two are terminal.
+data GrantStanding = GrantReserved | GrantSpent | GrantAbandoned
+  deriving (Eq, Show)
 
 -- | One upload not yet settled.
 data Entry = Entry
@@ -300,7 +324,7 @@ newUploads frames config =
             createStaging recording (uploadStagingBytes config) >>= \case
               Left refusal → pure (Left refusal)
               Right (resource, mapping, atom) → do
-                state ← newTVarIO (UploadsState True 0 0 Map.empty False)
+                state ← newTVarIO (UploadsState True 0 0 Map.empty False Map.empty)
                 pure (Right (Uploads frames config (Staging resource mapping (uploadStagingBytes config) (max 16 atom)) (planTextureCompressionBC devicePlan) state))
   where
     recording = framesRecording frames
@@ -387,8 +411,16 @@ submitUploadGated
   → Uploads q inst msgr phys dev cmd
   → UploadRequest
   → IO (Either UploadRefusal UploadTicket)
-submitUploadGated gate uploads request = mask $ \restore →
-  atomically (gate >>= maybe (admit uploads request) (pure . Left)) >>= \case
+submitUploadGated gate uploads = submitWith gate uploads Nothing
+
+submitWith
+  ∷ STM (Maybe UploadRefusal)
+  → Uploads q inst msgr phys dev cmd
+  → Maybe UploadGrant
+  → UploadRequest
+  → IO (Either UploadRefusal UploadTicket)
+submitWith gate uploads grant request = mask $ \restore →
+  atomically (gate >>= maybe (admit uploads grant request) (pure . Left)) >>= \case
     Left refusal → pure (Left refusal)
     Right (number, ticket, offset, pieces) → do
       written ← tryWithContext @SomeException (restore (writePieces uploads offset pieces))
@@ -415,13 +447,17 @@ writePieces uploads offset pieces =
     unless (ByteString.null piece) $
       opsWriteMapped (recordingOps (framesRecording (uploadsFrames uploads))) (stagingMapping (uploadsStaging uploads)) start piece
 
--- | Everything admission decides and reserves, in one transaction.
+-- | Everything admission decides and reserves, in one transaction: with a
+-- reservation, its place and region, otherwise the shared decision's
+-- ('roomIn').
 admit
   ∷ Uploads q inst msgr phys dev cmd
+  → Maybe UploadGrant
   → UploadRequest
   → STM (Either UploadRefusal (Natural, UploadTicket, Natural, [ByteString]))
-admit uploads request = do
+admit uploads grant request = do
   state ← readTVar (uploadsState uploads)
+  heldGrant ← maybe (pure (Right Nothing)) (liveGrant uploads state) grant
   primary ← reportPrimary <$> readRootsTerminal roots
   managed ← readTVar (recordingManaged recording)
   uploading ← readTVar (recordingUploading recording)
@@ -431,6 +467,8 @@ admit uploads request = do
   let decided = do
         whenLeft (fmap UploadSessionFailed primary)
         unless (stateOpen state) (Left UploadClosed)
+        held ← heldGrant
+        let granted = (,) <$> grant <*> held
         when (resourceSession target /= rootsSessionIdentity roots) (Left (UploadMisuse (ForeignIdentity ResourceIdentity)))
         record ← maybe (Left (UploadMisuse (StaleIdentity ResourceIdentity))) Right (Map.lookup target managed)
         unless (managedStanding record == ManagedLive) (Left (UploadMisuse (WrongPhase ResourceIdentity)))
@@ -447,27 +485,38 @@ admit uploads request = do
             | Set.member target filled → Left UploadNotFresh
             | any (`elem` [RecordedReferenceOwed, SubmittedUseOwed]) (maybe [] viewOutstanding (holdView (ResourceSubject target) model)) → Left UploadNotFresh
           _ → Right ()
-        let padded = roundUp total (stagingGranule staging)
-        when (padded > stagingBytes staging) (Left (UploadOversized padded (stagingBytes staging)))
-        when (fromIntegral (Map.size (stateEntries state)) >= uploadQueueCapacity (uploadsConfig uploads)) (Left (UploadBackpressure QueueFull))
-        offset ← maybe (Left (UploadBackpressure StagingFull)) Right (place state padded)
-        pure (shape, indices, offset, padded)
+        case granted of
+          -- A reservation's place and region are the upload's: nothing
+          -- competes for capacity again. It binds only a fresh vertex buffer
+          -- of exactly the bytes reserved.
+          Just (reserved, region) → do
+            case shape of
+              ShapeBuffer _ kind _ | kind == bufferResourceKind VertexBuffer → Right ()
+              _ → Left UploadWrongKind
+            when (total /= uploadGrantBytes reserved) $
+              Left (UploadMalformed ("the reservation holds " <> tshow (uploadGrantBytes reserved) <> " bytes, and " <> tshow total <> " were given"))
+            pure (shape, indices, Right (grantNumber reserved, grantRegion region))
+          Nothing → do
+            region ← roomIn uploads state total
+            pure (shape, indices, Left region)
   case decided of
     Left refusal → pure (Left refusal)
-    Right (shape, indices, offset, padded) → do
+    Right (shape, indices, placed) → do
       ticket ← newTVar UploadQueued
-      let number = stateNext state
-          cursor = case shape of
+      let cursor = case shape of
             ShapeBuffer {} → CursorBytes 0
             ShapeImage {} → CursorRows 0 0
-          entry = Entry target shape (offset, padded) PhaseAdmitting cursor False Nothing False ticket indices
-          next = offset + padded
+      (number, (offset, padded)) ← case placed of
+        Left region → pure (stateNext state, region)
+        Right (number, region) → do
+          for' grant (\spent → writeTVar (uploadGrantCell spent) GrantSpent)
+          pure (number, region)
+      let entry = Entry target shape (offset, padded) PhaseAdmitting cursor False Nothing False ticket indices
       writeTVar
         (uploadsState uploads)
-        state
-          { stateNext = number + 1
-          , stateHead = if next >= stagingBytes staging then 0 else next
-          , stateEntries = Map.insert number entry (stateEntries state)
+        (either (\region → claimRegion uploads state region) (const state) placed)
+          { stateEntries = Map.insert number entry (stateEntries state)
+          , stateGrants = Map.delete number (stateGrants state)
           }
       case shape of
         ShapeBuffer {} → modifyTVar' (recordingFilled recording) (Set.insert target)
@@ -477,12 +526,12 @@ admit uploads request = do
   where
     recording = framesRecording (uploadsFrames uploads)
     roots = recordingRoots recording
-    staging = uploadsStaging uploads
     (target, pieces) = case request of
       UploadImage (Image resource) levels → (resource, levels)
       UploadBuffer (Buffer resource) bytes → (resource, [bytes])
     total = sum (map (fromIntegral . ByteString.length) pieces)
     whenLeft = maybe (Right ()) Left
+    -- the bytes the request writes, as a reservation counts them
     shapeOf = \case
       NativeImage description memory _
         | imageKind description /= TextureImage → Left UploadWrongKind
@@ -509,18 +558,132 @@ admit uploads request = do
               , if kind == IndexBuffer then Just (ByteString.copy (mconcat pieces)) else Nothing
               )
       _ → Left UploadWrongKind
-    -- The first gap that holds the region, tried from where the last one
-    -- ended and then from the start, so regions wrap round.
-    place state padded =
-      let taken = sortOn fst [(offset, offset + span') | entry ← Map.elems (stateEntries state), let (offset, span') = entryRegion entry]
-          ends = map snd taken
-          gaps = zip (0 : ends) (map fst taken <> [stagingBytes staging])
-          start = stateHead state
-          ahead = [(max low start, high) | (low, high) ← gaps, high > start]
-          fits (low, high) = let offset = roundUp low (stagingGranule staging) in if offset + padded <= high then Just offset else Nothing
-       in case [offset | Just offset ← map fits (ahead <> gaps)] of
-            offset : _ → Just offset
-            [] → Nothing
+
+-- | The one capacity decision every admission and reservation makes, for
+-- this many bytes: padded to the staging granule, larger than the whole
+-- staging buffer is 'UploadOversized', for good; otherwise one place in the
+-- queue and one aligned gap that holds the padded bytes, each counted over
+-- admitted uploads and reservations alike, or 'UploadBackpressure'. The gap
+-- is the first that holds the region, tried from where the last one ended
+-- and then from the start, so regions wrap round. Answers the region: where
+-- it starts, and its padded bytes.
+roomIn ∷ Uploads q inst msgr phys dev cmd → UploadsState → Natural → Either UploadRefusal (Natural, Natural)
+roomIn uploads state bytes = do
+  when (padded > stagingBytes staging) (Left (UploadOversized padded (stagingBytes staging)))
+  when (fromIntegral (Map.size (stateEntries state) + Map.size (stateGrants state)) >= uploadQueueCapacity (uploadsConfig uploads)) (Left (UploadBackpressure QueueFull))
+  case [offset | Just offset ← map fits (ahead <> gaps)] of
+    offset : _ → Right (offset, padded)
+    [] → Left (UploadBackpressure StagingFull)
+  where
+    staging = uploadsStaging uploads
+    padded = roundUp bytes (stagingGranule staging)
+    taken = sortOn fst [(offset, offset + span') | (offset, span') ← map entryRegion (Map.elems (stateEntries state)) <> map grantRegion (Map.elems (stateGrants state))]
+    ends = map snd taken
+    gaps = zip (0 : ends) (map fst taken <> [stagingBytes staging])
+    start = stateHead state
+    ahead = [(max low start, high) | (low, high) ← gaps, high > start]
+    fits (low, high) = let offset = roundUp low (stagingGranule staging) in if offset + padded <= high then Just offset else Nothing
+
+-- | The state with a region taken for the next number: that number issued,
+-- and the next region tried from this one's end.
+claimRegion ∷ Uploads q inst msgr phys dev cmd → UploadsState → (Natural, Natural) → UploadsState
+claimRegion uploads state (offset, padded) =
+  state
+    { stateNext = stateNext state + 1
+    , stateHead = if next >= stagingBytes (uploadsStaging uploads) then 0 else next
+    }
+  where
+    next = offset + padded
+
+-- ---------------------------------------------------------------------------
+-- Reservations
+
+-- | A reservation of one place in the queue and one staging region for the
+-- upload that fills a future vertex buffer of exactly this many bytes. It is
+-- this session's uploads' alone, and only while reserved can it be spent
+-- ('submitUploadGranted') — once — or abandoned ('abandonUploadGrant').
+-- Closing admission abandons every reservation not yet spent.
+data UploadGrant = UploadGrant
+  { grantNumber ∷ !Natural
+    -- ^ The number its upload will have.
+  , uploadGrantBytes ∷ !Natural
+    -- ^ The bytes it holds room for, unpadded.
+  , grantOwner ∷ !(TVar UploadsState)
+  , uploadGrantCell ∷ !(TVar GrantStanding)
+  }
+
+instance Eq UploadGrant where
+  left == right = grantOwner left == grantOwner right && grantNumber left == grantNumber right
+
+instance Show UploadGrant where
+  showsPrec precedence grant = showParen (precedence > 10) (showString "UploadGrant " . showsPrec 11 (grantNumber grant) . showChar ' ' . showsPrec 11 (uploadGrantBytes grant))
+
+-- | Whether an upload of this many bytes would be admitted or reserved now,
+-- read-only: the decision 'reserveUpload' makes, so a 'Right' here and no
+-- change between is a grant there. The session must be running and admission
+-- open; then 'roomIn'. Zero bytes need no room.
+uploadRoom ∷ Uploads q inst msgr phys dev cmd → Natural → STM (Either UploadRefusal ())
+uploadRoom uploads bytes = fmap (const ()) <$> decideRoom uploads bytes
+
+-- | Reserve, from any thread, the place and region an upload of this many
+-- bytes needs: the decision 'uploadRoom' reads, and on a grant both are
+-- occupied at once, for every other caller, until the grant is spent or
+-- abandoned. A refusal reserves nothing.
+reserveUpload ∷ Uploads q inst msgr phys dev cmd → Natural → STM (Either UploadRefusal UploadGrant)
+reserveUpload uploads bytes =
+  decideRoom uploads bytes >>= \case
+    Left refusal → pure (Left refusal)
+    Right (state, region) → do
+      cell ← newTVar GrantReserved
+      let number = stateNext state
+      writeTVar (uploadsState uploads) (claimRegion uploads state region) {stateGrants = Map.insert number (Grant region cell) (stateGrants state)}
+      pure (Right (UploadGrant number bytes (uploadsState uploads) cell))
+
+decideRoom ∷ Uploads q inst msgr phys dev cmd → Natural → STM (Either UploadRefusal (UploadsState, (Natural, Natural)))
+decideRoom uploads bytes = do
+  state ← readTVar (uploadsState uploads)
+  primary ← reportPrimary <$> readRootsTerminal (recordingRoots (framesRecording (uploadsFrames uploads)))
+  pure $ do
+    maybe (Right ()) (Left . UploadSessionFailed) primary
+    unless (stateOpen state) (Left UploadClosed)
+    (,) state <$> roomIn uploads state bytes
+
+-- | The reservation's region, while it is reserved here; a spent, abandoned
+-- or foreign one is misuse, and changes nothing.
+liveGrant ∷ Uploads q inst msgr phys dev cmd → UploadsState → UploadGrant → STM (Either UploadRefusal (Maybe Grant))
+liveGrant uploads state grant = do
+  standing ← readTVar (uploadGrantCell grant)
+  pure $ case Map.lookup (grantNumber grant) (stateGrants state) of
+    Just held
+      | grantOwner grant == uploadsState uploads
+      , standing == GrantReserved
+      , grantCell held == uploadGrantCell grant →
+          Right (Just held)
+    _ → Left (UploadMisuse (StaleIdentity ResourceIdentity))
+
+-- | 'submitUploadGated' for a fresh vertex buffer of exactly the reserved
+-- bytes, into the reservation's place and region, which it spends: nothing
+-- competes for capacity again. A refusal leaves the reservation as it was,
+-- for its holder to spend or abandon.
+submitUploadGranted
+  ∷ STM (Maybe UploadRefusal)
+  → Uploads q inst msgr phys dev cmd
+  → UploadGrant
+  → Buffer
+  → ByteString
+  → IO (Either UploadRefusal UploadTicket)
+submitUploadGranted gate uploads grant buffer bytes = submitWith gate uploads (Just grant) (UploadBuffer buffer bytes)
+
+-- | Abandon a reservation, from any thread: its place and region are free
+-- again. A spent, abandoned or foreign one changes nothing.
+abandonUploadGrant ∷ Uploads q inst msgr phys dev cmd → UploadGrant → STM ()
+abandonUploadGrant uploads grant = do
+  state ← readTVar (uploadsState uploads)
+  liveGrant uploads state grant >>= \case
+    Right (Just _) → do
+      writeTVar (uploadGrantCell grant) GrantAbandoned
+      writeTVar (uploadsState uploads) state {stateGrants = Map.delete (grantNumber grant) (stateGrants state)}
+    _ → pure ()
 
 -- | Forget an upload that was never queued: its entry, its region and its
 -- target's hold. Its ticket was never answered.
@@ -918,10 +1081,13 @@ chunk budget entry = case (entryShape entry, entryCursor entry) of
 
 -- | Close admission, from the owner's exit: nothing more is admitted, and
 -- every upload not yet started is cancelled, its staging freed and its
--- target left as it was. Those started go on with the other frame-less work.
+-- target left as it was, and every reservation not yet spent is abandoned.
+-- Those started go on with the other frame-less work.
 closeUploads ∷ Uploads q inst msgr phys dev cmd → STM ()
 closeUploads uploads = do
-  modifyTVar' (uploadsState uploads) (\state → state {stateOpen = False})
+  grants ← stateGrants <$> readTVar (uploadsState uploads)
+  forM_ grants (\grant → writeTVar (grantCell grant) GrantAbandoned)
+  modifyTVar' (uploadsState uploads) (\state → state {stateOpen = False, stateGrants = Map.empty})
   entries ← Map.toList . stateEntries <$> readTVar (uploadsState uploads)
   forM_ [number | (number, entry) ← entries, entryPhase entry == PhaseQueued, not (entryStarted entry), maybe True (const False) (entryFlight entry), not (entryClaimed entry)] $ \number →
     settle uploads number UploadCancelled
@@ -985,6 +1151,9 @@ data UploadsView = UploadsView
   , uploadsStagingBuffer ∷ !ResourceId
   , uploadsStagingSize ∷ !Natural
   , uploadsUnsettled ∷ ![UploadView]
+  , uploadsReserved ∷ ![(Natural, (Natural, Natural))]
+    -- ^ Every reservation not yet spent or abandoned: the number its upload
+    -- will have, and its staging region.
   }
   deriving (Eq, Show)
 
@@ -1000,6 +1169,7 @@ readUploads uploads = do
           [ UploadView number (entryTarget entry) (entryPhase entry) (entryRegion entry) (entryStarted entry) (maybe False (const True) (entryFlight entry)) (entryCursor entry == CursorDone) (entryClaimed entry)
           | (number, entry) ← Map.toList (stateEntries state)
           ]
+      , uploadsReserved = [(number, grantRegion grant) | (number, grant) ← Map.toList (stateGrants state)]
       }
 
 -- ---------------------------------------------------------------------------

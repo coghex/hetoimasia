@@ -176,7 +176,10 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Rendering
   , renderingUploadsWaiting
   , submitRenderingUpload
   , cancelRenderingUpload
-  , unsettledRenderingUploads
+  , renderingUploadRoom
+  , reserveRenderingUpload
+  , submitRenderingGranted
+  , abandonRenderingGrant
 
     -- * Retirement
   , prepareTargetRetirement
@@ -393,9 +396,6 @@ import Hetoimasia.GPU.Vulkan.Native.TextureTable
   )
 import Hetoimasia.GPU.Vulkan.Native.Uploads
   ( CancelRefusal (CancelUnknown)
-  , UploadView (uploadNumber)
-  , UploadsView (uploadsUnsettled)
-  , readUploads
   , UploadConfig
   , UploadProgress (..)
   , UploadRefusal
@@ -409,6 +409,11 @@ import Hetoimasia.GPU.Vulkan.Native.Uploads
   , retireUploads
   , submitUploadGated
   , uploadsWaiting
+  , UploadGrant
+  , uploadRoom
+  , reserveUpload
+  , submitUploadGranted
+  , abandonUploadGrant
   )
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Target (Adopter (..), OffscreenTargetId)
 import Hetoimasia.Runtime.GLFW (AttachmentId, OwnerDemand (..))
@@ -1894,13 +1899,62 @@ submitRenderingUpload rendering gate request =
     UploadsPending _ → pure (Left (Left UploadsNotReady))
     UploadsRefused refusal → pure (Left (Left (UploadsRefusedBy refusal)))
 
--- | The numbers of the session's unsettled uploads, from any thread, in STM: empty before its uploads are made. An
--- upload that leaves the list has settled, and the staging and queue room it held are free again.
-unsettledRenderingUploads ∷ Rendering q inst msgr phys dev cmd → STM [Natural]
-unsettledRenderingUploads rendering =
+-- | Whether an upload of this many bytes would be admitted now ('uploadRoom'), from any thread, read-only, under
+-- the caller's gate: the decision 'reserveRenderingUpload' makes. Uploads configured and not yet made are
+-- 'UploadsNotReady', which their startup can change.
+renderingUploadRoom
+  ∷ Rendering q inst msgr phys dev cmd
+  → STM (Maybe UploadRefusal)
+  → Natural
+  → STM (Either (Either UploadsUnavailable UploadRefusal) ())
+renderingUploadRoom rendering gate bytes = withUploads rendering gate (`uploadRoom` bytes)
+
+-- | Reserve the room an upload of this many bytes needs ('reserveUpload'), from any thread, under the caller's
+-- gate, read in the same transaction: a refusal reserves nothing.
+reserveRenderingUpload
+  ∷ Rendering q inst msgr phys dev cmd
+  → STM (Maybe UploadRefusal)
+  → Natural
+  → STM (Either (Either UploadsUnavailable UploadRefusal) UploadGrant)
+reserveRenderingUpload rendering gate bytes = withUploads rendering gate (`reserveUpload` bytes)
+
+withUploads
+  ∷ Rendering q inst msgr phys dev cmd
+  → STM (Maybe UploadRefusal)
+  → (Uploads q inst msgr phys dev cmd → STM (Either UploadRefusal a))
+  → STM (Either (Either UploadsUnavailable UploadRefusal) a)
+withUploads rendering gate decide =
+  gate >>= \case
+    Just refusal → pure (Left (Right refusal))
+    Nothing →
+      readTVar (renderingUploads rendering) >>= \case
+        UploadsMade uploads → either (Left . Right) Right <$> decide uploads
+        UploadsUnconfigured → pure (Left (Left UploadsNotConfigured))
+        UploadsPending _ → pure (Left (Left UploadsNotReady))
+        UploadsRefused refusal → pure (Left (Left (UploadsRefusedBy refusal)))
+
+-- | Spend a reservation on the upload that fills a fresh vertex buffer of exactly its bytes
+-- ('submitUploadGranted'), under the caller's gate, read in the transactions that bind and queue it.
+submitRenderingGranted
+  ∷ Rendering q inst msgr phys dev cmd
+  → STM (Maybe UploadRefusal)
+  → UploadGrant
+  → Buffer
+  → ByteString.ByteString
+  → IO (Either (Either UploadsUnavailable UploadRefusal) UploadTicket)
+submitRenderingGranted rendering gate grant buffer bytes =
+  readTVarIO (renderingUploads rendering) >>= \case
+    UploadsMade uploads → either (Left . Right) Right <$> submitUploadGranted gate uploads grant buffer bytes
+    UploadsUnconfigured → pure (Left (Left UploadsNotConfigured))
+    UploadsPending _ → pure (Left (Left UploadsNotReady))
+    UploadsRefused refusal → pure (Left (Left (UploadsRefusedBy refusal)))
+
+-- | Abandon a reservation from any thread ('abandonUploadGrant'): its room is free again.
+abandonRenderingGrant ∷ Rendering q inst msgr phys dev cmd → UploadGrant → STM ()
+abandonRenderingGrant rendering grant =
   readTVar (renderingUploads rendering) >>= \case
-    UploadsMade uploads → map uploadNumber . uploadsUnsettled <$> readUploads uploads
-    _ → pure []
+    UploadsMade uploads → abandonUploadGrant uploads grant
+    _ → pure ()
 
 -- | Cancel an upload from any thread ('cancelUpload').
 cancelRenderingUpload ∷ Rendering q inst msgr phys dev cmd → UploadTicket → STM (Either CancelRefusal ())

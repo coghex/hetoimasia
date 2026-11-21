@@ -12,6 +12,12 @@
 -- 'UploadTicket' reports where it stands without a native call, and is waited
 -- on explicitly, with a deadline ('awaitUploadTicket').
 --
+-- A caller that must know there is room before it makes a vertex buffer
+-- reserves it first ('reserveUpload'): the same decision admission makes, and
+-- on a grant the place and region are held for every other caller until the
+-- grant is spent once by the buffer's upload ('submitUploadGranted') or
+-- abandoned. 'uploadRoom' reads that decision without reserving.
+--
 -- The graphics owner progresses uploads in its own turns ('progressUploads'),
 -- recording each one's copies into frame-less batches in chunks — whole block
 -- rows of one mip level, or byte ranges of a buffer — up to the configured
@@ -40,6 +46,14 @@ module Hetoimasia.GPU.Vulkan.Native.Uploads
   , UploadPressure (..)
   , submitUpload
   , submitUploadGated
+
+    -- * Reservations
+  , UploadGrant
+  , uploadGrantBytes
+  , uploadRoom
+  , reserveUpload
+  , submitUploadGranted
+  , abandonUploadGrant
 
     -- * Tickets
   , UploadTicket

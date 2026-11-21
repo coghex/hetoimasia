@@ -206,7 +206,12 @@ module Hetoimasia.GPU.Vulkan.GLFW
   , readUploadTicket
   , awaitUploadTicket
   , cancelVulkanUpload
-  , unsettledVulkanUploads
+  , UploadGrant
+  , uploadGrantBytes
+  , vulkanUploadRoom
+  , reserveVulkanUpload
+  , submitVulkanGranted
+  , abandonVulkanGrant
   , CancelRefusal (..)
 
     -- * The bindless texture table (GRS-7)
@@ -366,6 +371,7 @@ module Hetoimasia.GPU.Vulkan.GLFW
   , FrameStorageRefused (..)
   ) where
 
+import Data.ByteString (ByteString)
 import Numeric.Natural (Natural)
 import Control.Concurrent.STM (STM)
 import Hetoimasia.Foundation.Log (Logger)
@@ -582,10 +588,12 @@ import Hetoimasia.GPU.Vulkan.Native.Uploads
   , UploadRefusal (..)
   , UploadRequest (..)
   , UploadState (..)
+  , UploadGrant
   , UploadTicket
   , awaitUploadTicket
   , readUploadTicket
   , ticketUpload
+  , uploadGrantBytes
   , validateUploadConfig
   )
 import Hetoimasia.GPU.Vulkan.Native.Roots (GraphicsSessionFailed (..), TeardownEvidence (..), TerminalCause (..), TerminalReport (..))
@@ -647,10 +655,23 @@ submitVulkanUpload host = Controller.submitVulkanUpload (vulkanController host)
 cancelVulkanUpload ∷ VulkanHost scene → UploadTicket → STM (Either CancelRefusal ())
 cancelVulkanUpload host = Controller.cancelVulkanUpload (vulkanController host)
 
--- | The numbers of the session's unsettled uploads (any view's or texture's), from any thread: an upload that leaves
--- the list has settled, and the room it held is free again.
-unsettledVulkanUploads ∷ VulkanHost scene → STM [Natural]
-unsettledVulkanUploads host = Controller.unsettledVulkanUploads (vulkanController host)
+-- | Whether an upload of this many bytes would be admitted into this host's session now, read-only, in the
+-- caller's transaction: the decision 'reserveVulkanUpload' makes.
+vulkanUploadRoom ∷ VulkanHost scene → Natural → STM (Either VulkanUploadRefusal ())
+vulkanUploadRoom host = Controller.vulkanUploadRoom (vulkanController host)
+
+-- | Reserve, in the caller's transaction, the queue place and staging region an upload of this many bytes needs,
+-- before the vertex buffer it fills is made: held for every other upload until spent or abandoned.
+reserveVulkanUpload ∷ VulkanHost scene → Natural → STM (Either VulkanUploadRefusal UploadGrant)
+reserveVulkanUpload host = Controller.reserveVulkanUpload (vulkanController host)
+
+-- | Spend a reservation on the upload that fills a fresh vertex buffer of exactly its bytes.
+submitVulkanGranted ∷ VulkanHost scene → UploadGrant → Buffer → ByteString → IO (Either VulkanUploadRefusal UploadTicket)
+submitVulkanGranted host = Controller.submitVulkanGranted (vulkanController host)
+
+-- | Abandon a reservation, from any thread: its room is free again.
+abandonVulkanGrant ∷ VulkanHost scene → UploadGrant → STM ()
+abandonVulkanGrant host = Controller.abandonVulkanGrant (vulkanController host)
 
 -- | Create one window's surface on the main thread, under its attachment, and
 -- hand it to this host's owner as a required or optional target.

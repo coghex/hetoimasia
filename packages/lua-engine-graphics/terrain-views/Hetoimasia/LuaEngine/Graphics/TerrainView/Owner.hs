@@ -2,14 +2,18 @@
 -- the narrow host capabilities the views use from any thread.
 --
 -- Every view step runs on the graphics owner's thread, inside one owner action ('Hetoimasia.GPU.Vulkan.GLFW.submitVulkanAction'),
--- between frames. That action lends 'Hands': build a chunk into the session's one retained registry, release a
--- chunk's buffer, read a chunk's upload. Outside a step the views only admit the next step, ask the host's release
--- lane for a barrier, and read the host's end; each is one transaction that never waits ('OwnerPorts').
+-- between frames. That action lends 'Hands': prepare a chunk, reserve its admission into the session's one retained
+-- registry and the host's uploads (spent once by its build, which makes the buffer only then), release a chunk's
+-- buffer. Outside a step the views only admit the next step, ask the host's release lane for a barrier, observe a
+-- part's admission and a chunk's upload, and read the host's end; each is one transaction that never waits
+-- ('OwnerPorts').
 --
 -- The production capabilities ('productionOwner') are the host's own: no barrier, scene key, device, thread or
 -- session of their own. A suite without a device injects its own, whose owner it steps itself.
 module Hetoimasia.LuaEngine.Graphics.TerrainView.Owner
   ( Hands (..)
+  , Admission (..)
+  , Grant (..)
   , BuildFailure (..)
   , Allocated (..)
   , OwnerPorts (..)
@@ -22,10 +26,10 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView.Owner
 import Control.Concurrent.STM (STM, atomically)
 import Control.Exception (SomeAsyncException, displayException, fromException, throwIO, try)
 import qualified Data.Map.Strict as Map
+import Data.Functor ((<&>))
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Word (Word64)
-import Numeric.Natural (Natural)
 import Hetoimasia.GPU.Vulkan.GLFW
   ( ActionOutcome (..)
   , ActionRefusal (..)
@@ -33,35 +37,66 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , ConstructedDisposal (..)
   , constructedDisposal
   , ImageFormat (Depth32Float)
+  , UploadRefusal (UploadOversized)
   , VulkanAction (..)
   , VulkanHost (..)
   , readVulkanAction
   , readVulkanActionGate
   , requestVulkanRelease
   , submitVulkanAction
-  , unsettledVulkanUploads
   )
 import Hetoimasia.LuaEngine.Graphics.Scene.Ledger (GraphicsScene)
 import Hetoimasia.LuaEngine.Graphics.Texture (TextureGraphics (..))
-import Hetoimasia.LuaEngine.Graphics.Texture.Host (hostBuilders)
+import Hetoimasia.LuaEngine.Graphics.Texture.Host (hostBufferUploads, hostBuilders)
 import Hetoimasia.Render.TwoD.Chunk (BoundsRequest (DeriveBounds), ChunkKind (ChunkWorldDepth), ChunkRef)
 import Hetoimasia.Render.TwoD.Material (MaterialRecord, MaterialRef)
 import Hetoimasia.Render.TwoD.Snapshot (Instance)
 import Hetoimasia.Render.TwoD.Vulkan (registerMaterial, rendererDepthFormat, rendererRegionWindow)
-import Hetoimasia.Render.TwoD.Vulkan.Chunks (BuildRefusal (..), BuildRefused (..), ChunkStanding, RefusedAllocation (..), buildRetainedChunkWith, chunkBufferOf, chunkStandingSTM, releaseChunkNow)
+import Hetoimasia.Render.TwoD.Vulkan.Builders (BufferUploads (roomFor))
+import Hetoimasia.Render.TwoD.Vulkan.Chunks
+  ( BuildRefusal (..)
+  , BuildRefused (..)
+  , ChunkGrant
+  , ChunkStanding
+  , PreparedChunk
+  , RefusedAllocation (..)
+  , abandonChunkGrant
+  , admitRetainedChunk
+  , chunkBufferOf
+  , chunkRoom
+  , chunkStandingSTM
+  , preparedBytes
+  , prepareRetainedChunk
+  , releaseChunkNow
+  , spendChunkGrant
+  )
 import Hetoimasia.Render.TwoD.Vulkan.Textures (registeredMarks)
 import Hetoimasia.Terrain.Render2D.Vulkan.Material (terrainMaterial)
 
--- | Why a chunk was not built: the staging buffer or its queue is full now (a later step can succeed), or a failure
--- no retry changes; each with what became of the vertex buffer the build made.
-data BuildFailure
-  = BuildBackpressure !Text !Allocated
-  | BuildFailed !Text !Allocated
+-- | Why a prepared part was not admitted: its room is taken for now (the uploads' queue or staging, or the registry's
+-- references), and can come free; the part is larger than the whole staging buffer; or an end no wait changes (the
+-- uploads closed, the session failed). A refused admission holds and made nothing.
+data Admission
+  = AdmitLater !Text
+  | AdmitOversized !Text
+  | AdmitNever !Text
+  deriving (Eq, Show)
 
--- | What a refused build left of its vertex buffer: none was made; one was made and released (named by the renderer,
+-- | A part's admission, granted in the owner's transaction together with the target's slot: its reference and its
+-- upload's room. Spent once by its build ('grantSpend', which gives the grant back on every failure), or given back
+-- unspent ('grantAbandon'). It lives within the owner step that took it.
+data Grant = Grant
+  { grantSpend ∷ IO (Either BuildFailure ChunkRef)
+  , grantAbandon ∷ STM ()
+  }
+
+-- | Why a granted build failed, with what became of the vertex buffer it made.
+data BuildFailure = BuildFailed !Text !Allocated
+
+-- | What a failed build left of its vertex buffer: none was made; one was made and released (named by the renderer,
 -- or by the exception its construction raised), and a reading of its physical destruction says when its capacity is
--- free; or one whose release failed, or a build that raised with no buffer named, with the cause: its capacity stays
--- charged.
+-- free; or one whose release failed or raised, or a build that raised with no buffer named, with the cause: its
+-- capacity stays charged.
 data Allocated
   = NotAllocated
   | -- | The buffer's identity, and a reading of its physical destruction.
@@ -71,9 +106,12 @@ data Allocated
 
 -- | What one owner step may do on the owner's thread.
 data Hands = Hands
-  { handBuild ∷ [Instance] → [MaterialRecord] → IO (Either BuildFailure ChunkRef)
-    -- ^ Build one chunk of a depth-enabled world layer: its instances (each naming the terrain material) and the
-    -- records they index. A refusal says what became of the buffer it made ('Allocated').
+  { handPrepare ∷ [Instance] → [MaterialRecord] → IO (Either Text PreparedChunk)
+    -- ^ Prepare one chunk of a depth-enabled world layer: its instances (each naming the terrain material) and the
+    -- records they index, routed and encoded, its exact upload bytes known. Nothing is reserved or made.
+  , handReserve ∷ PreparedChunk → STM (Either Admission Grant)
+    -- ^ Reserve a prepared chunk's reference and upload room, in the caller's transaction: the decision 'ownerRoom'
+    -- observes.
   , handDispose ∷ ChunkRef → IO (Either Text (STM ConstructedDisposal))
     -- ^ Release a chunk's buffer and forget the chunk, answering a reading of the buffer's physical disposal: the
     -- backend destroys it once the batches that recorded it complete, and only then is it done. A chunk without a
@@ -107,9 +145,8 @@ data OwnerPorts = OwnerPorts
     -- ^ The renderer's storage window: the most bytes of clip tables and material records one batch binds.
   , ownerDepthQualified ∷ !Bool
     -- ^ Whether the session's depth format is @D32_SFLOAT@.
-  , ownerUploads ∷ STM [Natural]
-    -- ^ The numbers of the session's unsettled uploads, any view's or texture's: one that leaves the list has settled,
-    -- and the staging and queue room it held are free again.
+  , ownerRoom ∷ PreparedChunk → STM (Either Admission ())
+    -- ^ Whether a prepared chunk would be admitted now, read-only: the decision 'handReserve' makes.
   , ownerEnded ∷ STM (Maybe Text)
     -- ^ Why the owner takes no more actions, once it does not: its session failed, or its exit began. What can no
     -- longer be disposed of ends with it as cause.
@@ -147,29 +184,27 @@ productionOwner host graphics = do
       , ownerMaterial = material
       , ownerRegionWindow = rendererRegionWindow (graphicsRenderer graphics)
       , ownerDepthQualified = rendererDepthFormat (graphicsRenderer graphics) == Just Depth32Float
-      , ownerUploads = unsettledVulkanUploads host
+      , ownerRoom = \prepared → either (Left . admission) Right <$> chunkRoom (roomFor uploads) retained (preparedBytes prepared)
       , ownerEnded = fmap (Text.pack . show) <$> readVulkanActionGate (vulkanController host)
       }
   where
     retained = graphicsRetained graphics
+    uploads = hostBufferUploads host
     hands ∷ MaterialRef → Construction q inst msgr phys dev cmd → Hands
     hands material construction =
       Hands
-        { handBuild = \instances records → do
+        { handPrepare = \instances records → do
             marks ← registeredMarks (graphicsTextures graphics)
-            guarded (buildRetainedChunkWith (hostBuilders host construction) retained marks ChunkWorldDepth DeriveBounds (Map.singleton material records) instances) >>= pure . \case
-              -- raised past the renderer's own handling: whether a buffer was made is not known
-              Left raised → Left (BuildFailed raised (AllocatedFailed ("the build raised: " <> raised)))
-              Right (Left (BuildRefused refusal allocation)) →
-                let allocated = case allocation of
-                      NoAllocation → NotAllocated
-                      AllocationReleased buffer (Right ()) → AllocatedDisposing (Text.pack (show buffer)) (constructedDisposal construction buffer)
-                      AllocationReleased buffer (Left why) → AllocatedFailed ("the refused build's buffer " <> Text.pack (show buffer) <> " could not be released: " <> Text.pack (show why))
-                      AllocationReleaseRaised buffer why → AllocatedFailed ("the refused build's buffer " <> Text.pack (show buffer) <> " raised on its release: " <> why)
-                 in case refusal of
-                      BuildUploadBackpressure pressure → Left (BuildBackpressure (Text.pack (show pressure)) allocated)
-                      other → Left (BuildFailed (Text.pack (show other)) allocated)
-              Right (Right chunk) → Right chunk
+            pure (either (Left . Text.pack . show) Right (prepareRetainedChunk marks ChunkWorldDepth DeriveBounds (Map.singleton material records) instances))
+        , handReserve = \prepared →
+            admitRetainedChunk uploads retained prepared <&> \case
+              Left refusal → Left (admission refusal)
+              Right grant →
+                Right
+                  Grant
+                    { grantSpend = spend construction grant
+                    , grantAbandon = abandonChunkGrant uploads retained grant
+                    }
         , handDispose = \chunk → do
             -- the buffer, read before the release forgets the chunk, is what is physically disposed of later
             buffer ← chunkBufferOf retained chunk
@@ -178,9 +213,30 @@ productionOwner host graphics = do
               Right (Left refusal) → Left (Text.pack (show refusal))
               Right (Right ()) → Right (maybe (pure DisposalDone) (constructedDisposal construction) buffer)
         }
+    -- the granted build: a failure gives the grant back (the renderer's own), and says what became of its buffer
+    spend ∷ Construction q inst msgr phys dev cmd → ChunkGrant → IO (Either BuildFailure ChunkRef)
+    spend construction grant =
+      guarded (spendChunkGrant (hostBuilders host construction) retained grant) >>= pure . \case
+        -- raised past the renderer's own handling: whether a buffer was made is not known
+        Left raised → Left (BuildFailed raised (AllocatedFailed ("the build raised: " <> raised)))
+        Right (Left (BuildRefused refusal allocation)) →
+          Left . BuildFailed (Text.pack (show refusal)) $ case allocation of
+            NoAllocation → NotAllocated
+            AllocationReleased buffer (Right ()) → AllocatedDisposing (Text.pack (show buffer)) (constructedDisposal construction buffer)
+            AllocationReleased buffer (Left why) → AllocatedFailed ("the failed build's buffer " <> Text.pack (show buffer) <> " could not be released: " <> Text.pack (show why))
+            AllocationReleaseRaised buffer why → AllocatedFailed ("the failed build's buffer " <> Text.pack (show buffer) <> " raised on its release: " <> why)
+        Right (Right chunk) → Right chunk
     refusalText = \case
       ReleaseQueueFull → "the release lane is full"
       other → show other
+
+-- What the renderer's admission refusal means to a view: room that can come free, a part no staging holds, or an end.
+admission ∷ BuildRefusal → Admission
+admission = \case
+  BuildUploadBackpressure pressure → AdmitLater (Text.pack (show pressure))
+  BuildReferencesExhausted → AdmitLater "every chunk reference is in use"
+  BuildUploadRefused (UploadOversized padded staging) → AdmitOversized ("a part needs " <> Text.pack (show padded) <> " staging bytes, and the staging buffer holds " <> Text.pack (show staging))
+  refusal → AdmitNever (Text.pack (show refusal))
 
 -- A synchronous failure as its text; an asynchronous one goes on.
 guarded ∷ IO a → IO (Either Text a)

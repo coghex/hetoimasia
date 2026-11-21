@@ -237,7 +237,10 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , VulkanUploadRefusal (..)
   , submitVulkanUpload
   , cancelVulkanUpload
-  , unsettledVulkanUploads
+  , vulkanUploadRoom
+  , reserveVulkanUpload
+  , submitVulkanGranted
+  , abandonVulkanGrant
   , readVulkanAction
   , awaitVulkanAction
 
@@ -471,11 +474,12 @@ import Hetoimasia.GPU.Vulkan.GLFW.Internal.Capture
   )
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Rendering
 import Hetoimasia.GPU.Vulkan.Native.Frames (FrameOps (..))
-import Hetoimasia.GPU.Vulkan.Native.Recording (BatchTicket, ClearColor (..), Recorder, RecordingOps (..), Refusal)
+import Hetoimasia.GPU.Vulkan.Native.Recording (BatchTicket, Buffer, ClearColor (..), Recorder, RecordingOps (..), Refusal)
 import Hetoimasia.GPU.Vulkan.Native.Uploads
   ( CancelRefusal
   , UploadConfig
   , UploadRefusal (UploadClosed, UploadSessionFailed)
+  , UploadGrant
   , UploadRequest
   , UploadTicket
   )
@@ -1286,24 +1290,51 @@ data VulkanUploadRefusal
 submitVulkanUpload ∷ VulkanController → UploadRequest → IO (Either VulkanUploadRefusal UploadTicket)
 submitVulkanUpload (VulkanController state) request =
   either (Left . either VulkanUploadsUnavailable VulkanUploadRefused) Right
-    <$> submitRenderingUpload (stateRendering state) gate request
-  where
-    -- The owner's own gate, read in the transactions that reserve and queue
-    -- the upload, so none is queued once quiescence has closed the owner.
-    gate =
-      actionGate (stateRoots state) (stateOwnerOpen state) <&> \case
-        Just (ActionSessionFailed primary) → Just (UploadSessionFailed primary)
-        Just _ → Just UploadClosed
-        Nothing → Nothing
+    <$> submitRenderingUpload (stateRendering state) (uploadGate state) request
+
+-- | The owner's own gate, read in the transactions that reserve and queue an
+-- upload, so none is reserved or queued once quiescence has closed the owner.
+uploadGate ∷ State inst msgr phys dev cmd lease obligation → STM (Maybe UploadRefusal)
+uploadGate state =
+  actionGate (stateRoots state) (stateOwnerOpen state) <&> \case
+    Just (ActionSessionFailed primary) → Just (UploadSessionFailed primary)
+    Just _ → Just UploadClosed
+    Nothing → Nothing
+
+-- | Whether an upload of this many bytes would be admitted now, from any
+-- thread, read-only: the decision 'reserveVulkanUpload' makes, under the
+-- owner's gate, in the caller's transaction.
+vulkanUploadRoom ∷ VulkanController → Natural → STM (Either VulkanUploadRefusal ())
+vulkanUploadRoom (VulkanController state) bytes =
+  either (Left . either VulkanUploadsUnavailable VulkanUploadRefused) Right
+    <$> renderingUploadRoom (stateRendering state) (uploadGate state) bytes
+
+-- | Reserve, in the caller's transaction, the queue place and staging region
+-- an upload of this many bytes needs, under the owner's gate: shared with
+-- every other upload, and held until spent ('submitVulkanGranted') or
+-- abandoned. A refusal reserves nothing.
+reserveVulkanUpload ∷ VulkanController → Natural → STM (Either VulkanUploadRefusal UploadGrant)
+reserveVulkanUpload (VulkanController state) bytes =
+  either (Left . either VulkanUploadsUnavailable VulkanUploadRefused) Right
+    <$> reserveRenderingUpload (stateRendering state) (uploadGate state) bytes
+
+-- | Spend a reservation on the upload that fills a fresh vertex buffer of
+-- exactly its bytes, under the owner's gate. A refusal leaves the
+-- reservation to its holder.
+submitVulkanGranted ∷ VulkanController → UploadGrant → Buffer → ByteString → IO (Either VulkanUploadRefusal UploadTicket)
+submitVulkanGranted (VulkanController state) grant buffer bytes =
+  either (Left . either VulkanUploadsUnavailable VulkanUploadRefused) Right
+    <$> submitRenderingGranted (stateRendering state) (uploadGate state) grant buffer bytes
+
+-- | Abandon a reservation, from any thread: its room is free again.
+abandonVulkanGrant ∷ VulkanController → UploadGrant → STM ()
+abandonVulkanGrant (VulkanController state) = abandonRenderingGrant (stateRendering state)
 
 -- | Cancel an upload from any thread, before its first copies are recorded
 -- ('cancelUpload').
 cancelVulkanUpload ∷ VulkanController → UploadTicket → STM (Either CancelRefusal ())
 cancelVulkanUpload (VulkanController state) = cancelRenderingUpload (stateRendering state)
 
--- | The numbers of the session's unsettled uploads, from any thread ('unsettledRenderingUploads').
-unsettledVulkanUploads ∷ VulkanController → STM [Natural]
-unsettledVulkanUploads (VulkanController state) = unsettledRenderingUploads (stateRendering state)
 
 -- | Whether an owner-thread action may be admitted or started now: refused
 -- once the session has failed, with its primary, and once the owner's

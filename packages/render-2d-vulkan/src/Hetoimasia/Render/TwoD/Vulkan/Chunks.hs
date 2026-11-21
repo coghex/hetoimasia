@@ -15,28 +15,35 @@
 --    validate, with every reason;
 -- 2. it encodes the cutout-path instances, 64 bytes each in the order the buffer
 --    holds them ('encodeChunkCutouts');
--- 3. when there are any, it makes a device-local vertex buffer of exactly that
---    size and admits the upload that fills it through the bounded staging
---    uploads. A chunk with no cutout instance, which is every chunk of a world
---    layer without depth and of a UI layer, makes no buffer and no upload: a
---    zero-byte buffer is refused by the backend, and an ordered-path instance is
---    written to the ring each frame, never retained on the device;
--- 4. it registers the description with the buffer and the upload's ticket under
---    a fresh reference.
+-- 3. it reserves, in one transaction, a reference private until registration
+--    and, when there are cutout bytes, one place in the uploads' queue and one
+--    staging region for exactly that many bytes, in the decision the uploads make
+--    for every caller ('admitRetainedChunk'). A chunk with no cutout instance,
+--    which is every chunk of a world layer without depth and of a UI layer,
+--    reserves no room and makes no buffer and no upload: a zero-byte buffer is
+--    refused by the backend, and an ordered-path instance is written to the ring
+--    each frame, never retained on the device;
+-- 4. only then does it make a device-local vertex buffer of exactly that size,
+--    spend the reserved room on the upload that fills it, and register the
+--    description with the buffer and the upload's ticket under the reserved
+--    reference ('spendChunkGrant').
 --
--- A refusal changes nothing the registry holds. A buffer made for a chunk whose
--- upload was refused is released at once, and so is one made when an exception
--- or a cancellation interrupts the build after it was made, so no refusal and no
--- interruption leaves a buffer behind. 'buildRetainedChunkWith' says whether a
--- refused build had made its buffer ('BuildRefused'): a released buffer is
--- destroyed only once the backend confirms it, and a caller that charges the
--- buffer's capacity keeps it charged until then. A synchronous exception after
--- the buffer was made is answered as such a refusal ('BuildRaised'). The refusals say what to do about them:
--- 'BuildUploadBackpressure' is the staging buffer or its queue being full now,
--- and asking again later can succeed; 'BuildUploadRefused' is every other
--- refusal, none of which asking again changes, among them 'UploadOversized'
--- (a chunk whose cutout bytes cannot fit the staging buffer at all: build it as
--- smaller chunks) and a failed or closed session.
+-- Steps 1–2 are 'prepareRetainedChunk', pure; a caller that must take its own
+-- capacity with the chunk's runs step 3 inside its own transaction and step 4
+-- after it, and 'chunkRoom' reads step 3's decision without reserving.
+--
+-- A refusal before the buffer is made holds nothing and made nothing:
+-- 'BuildUploadBackpressure' is the queue or the staging buffer full now, and
+-- asking again later can succeed; 'BuildUploadRefused' is every other refusal,
+-- none of which asking again changes, among them 'UploadOversized' (a chunk whose
+-- cutout bytes cannot fit the staging buffer at all: build it as smaller chunks)
+-- and a failed or closed session. After the buffer is made, a failure releases it
+-- at one site, once, gives the grant back, and says what became of the buffer
+-- ('BuildRefused'): a released buffer is destroyed only once the backend confirms
+-- it, and a caller that charges the buffer's capacity keeps it charged until
+-- then; a release that raised is a cleanup failure naming the buffer. A
+-- synchronous exception after the buffer was made is answered as such a refusal
+-- ('BuildRaised').
 --
 -- A chunk's records are not retained on the device: they are written into the
 -- batch's storage region each frame, beside the view's, and the textures their
@@ -80,6 +87,15 @@ module Hetoimasia.Render.TwoD.Vulkan.Chunks
   , RefusedAllocation (..)
   , buildRetainedChunk
   , buildRetainedChunkWith
+  , PreparedChunk
+  , preparedChunk
+  , preparedBytes
+  , prepareRetainedChunk
+  , ChunkGrant
+  , chunkRoom
+  , admitRetainedChunk
+  , abandonChunkGrant
+  , spendChunkGrant
   , ChunkStanding (..)
   , chunkStanding
   , chunkStandingSTM
@@ -95,7 +111,7 @@ module Hetoimasia.Render.TwoD.Vulkan.Chunks
   , liveChunks
   ) where
 
-import Control.Concurrent.STM (STM, TVar, atomically, newTVarIO, readTVar, readTVarIO, writeTVar)
+import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVar, newTVarIO, readTVar, readTVarIO, writeTVar)
 import Data.IORef (atomicModifyIORef', newIORef)
 import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeAsyncException, SomeException, displayException, fromException, mask_, onException, rethrowIO, throwIO, try, tryWithContext)
 import Control.Monad (when)
@@ -107,7 +123,7 @@ import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Word (Word32)
 import Hetoimasia.GPU.Vulkan.Native.Recording (Buffer, Refusal, releasedBufferOf)
-import Hetoimasia.GPU.Vulkan.Native.Uploads (UploadPressure, UploadRefusal (..), UploadState (..), UploadTicket, readUploadTicket)
+import Hetoimasia.GPU.Vulkan.Native.Uploads (UploadGrant, UploadPressure, UploadRefusal (..), UploadState (..), UploadTicket, readUploadTicket)
 import Hetoimasia.Render.TwoD.Chunk
   ( BoundsRequest
   , Chunk
@@ -123,7 +139,7 @@ import Hetoimasia.Render.TwoD.Chunk.Backend (chunkRef, chunkRefGeneration, chunk
 import Hetoimasia.Render.TwoD.DrawPlan (CutoutMarks)
 import Hetoimasia.Render.TwoD.Encoding (encodeChunkCutouts)
 import Hetoimasia.Render.TwoD.Snapshot (Instance)
-import Hetoimasia.Render.TwoD.Vulkan.Builders (Builders (..))
+import Hetoimasia.Render.TwoD.Vulkan.Builders (BufferUploads (..), Builders (..))
 import Numeric.Natural (Natural)
 
 -- | The registry of retained chunks.
@@ -167,6 +183,8 @@ data BuildRefusal
     BuildReferencesExhausted
   | -- | A synchronous exception after the buffer was made, with its text.
     BuildRaised !Text
+  | -- | The grant was already spent or given back.
+    BuildGrantSpent
   deriving (Eq, Show)
 
 -- | A refused build and what became of the buffer it made, if it made one.
@@ -185,9 +203,11 @@ data RefusedAllocation
   | AllocationReleaseRaised !Buffer !Text
   deriving (Eq, Show)
 
--- | Build a chunk on the graphics owner's thread: describe, route and bound it,
--- encode its cutout instances, make their buffer, admit their upload and register
--- it. The instances are routed against the registered marks the caller gives.
+-- | Build a chunk on the graphics owner's thread: prepare it, reserve its
+-- reference and its upload's room, then make its buffer, spend the room on the
+-- upload that fills it and register it. The instances are routed against the
+-- registered marks the caller gives. A refusal before the buffer is made holds
+-- and made nothing; one after says what became of the buffer.
 buildRetainedChunk
   ∷ Builders q inst msgr phys dev cmd
   → Retained
@@ -195,9 +215,9 @@ buildRetainedChunk
   → ChunkKind
   → BoundsRequest
   → [Instance]
-  → IO (Either BuildRefusal ChunkRef)
-buildRetainedChunk builders retained marks kind bounds instances =
-  either (Left . buildRefusal) Right <$> buildRetainedChunkWith builders retained marks kind bounds Map.empty instances
+  → IO (Either BuildRefused ChunkRef)
+buildRetainedChunk builders retained marks kind bounds =
+  buildRetainedChunkWith builders retained marks kind bounds Map.empty
 
 -- | 'buildRetainedChunk' for a chunk that carries its own records (R2D-11, D-31)
 -- for the application materials its instances use: each must have the layout its
@@ -214,49 +234,158 @@ buildRetainedChunkWith
   → Map MaterialRef [MaterialRecord]
   → [Instance]
   → IO (Either BuildRefused ChunkRef)
-buildRetainedChunkWith builders (Retained ledger) marks kind bounds records instances =
+buildRetainedChunkWith builders retained marks kind bounds records instances =
+  case prepareRetainedChunk marks kind bounds records instances of
+    Left refusal → pure (Left (BuildRefused refusal NoAllocation))
+    Right prepared →
+      mask_ $
+        atomically (admitRetainedChunk (bufferUploads builders) retained prepared) >>= \case
+          Left refusal → pure (Left (BuildRefused refusal NoAllocation))
+          Right grant → spendChunkGrant builders retained grant
+
+-- | A chunk ready to be built: described, routed and bounded for one kind of
+-- layer, and its cutout instances encoded — before anything is reserved or made.
+data PreparedChunk = PreparedChunk
+  { preparedChunk ∷ !Chunk
+    -- ^ Its immutable description.
+  , preparedEncoded ∷ !ByteString.ByteString
+  }
+
+-- | The exact bytes its vertex buffer and upload hold: zero for a chunk with no
+-- cutout instance, which makes neither.
+preparedBytes ∷ PreparedChunk → Natural
+preparedBytes = fromIntegral . ByteString.length . preparedEncoded
+
+-- | Prepare a chunk, refusing the instances, the records or the bounds that do
+-- not validate, with every reason. Pure: nothing is reserved.
+prepareRetainedChunk
+  ∷ CutoutMarks
+  → ChunkKind
+  → BoundsRequest
+  → Map MaterialRef [MaterialRecord]
+  → [Instance]
+  → Either BuildRefusal PreparedChunk
+prepareRetainedChunk marks kind bounds records instances =
   case buildChunkWith marks kind bounds records instances of
-    Left refusals → pure (Left (BuildRefused (BuildInvalid refusals) NoAllocation))
-    Right described → mask_ $ do
-      let bytes = encodeChunkCutouts described
-      if ByteString.null bytes
-        then register described Nothing
-        else
-          madeOrRaised (buildVertexBuffer builders (fromIntegral (ByteString.length bytes) ∷ Natural)) >>= \case
-            -- the buffer's construction raised after it made and released the buffer: no handle, but its identity
-            Left (buffer, raised) → pure (Left (BuildRefused (BuildRaised raised) (AllocationReleased buffer (Right ()))))
-            Right (Left refusal) → pure (Left (BuildRefused (BuildBufferRefused refusal) NoAllocation))
-            Right (Right buffer) → do
-              -- from here the buffer exists: it is released at one site ('releaseOnce'), at most once, for a refusal,
-              -- a synchronous exception or a cancellation
-              done ← newIORef False
-              let releaseOnce = do
-                    already ← atomicModifyIORef' done (\d → (True, d))
-                    if already then pure Nothing else Just <$> trySync (releaseBuffer builders buffer)
-                  refusedWith refusal = do
-                    released ← releaseOnce
-                    pure . Left . BuildRefused refusal $ case released of
-                      Just (Right outcome) → AllocationReleased buffer outcome
-                      Just (Left raised) → AllocationReleaseRaised buffer (Text.pack (displayException (raised ∷ SomeException)))
-                      Nothing → AllocationReleased buffer (Right ())
-                  raisedText raised = Text.pack (displayException (raised ∷ SomeException))
-                  attempt = do
-                    outcome ← trySync (uploadBuffer builders buffer bytes)
-                    case outcome of
-                      Left raised → refusedWith (BuildRaised (raisedText raised))
-                      Right (Left (UploadBackpressure pressure)) → refusedWith (BuildUploadBackpressure pressure)
-                      Right (Left refusal) → refusedWith (BuildUploadRefused refusal)
-                      Right (Right ticket) →
-                        trySync (atomically (issue described (Just (buffer, ticket)))) >>= \case
-                          Left raised → refusedWith (BuildRaised (raisedText raised))
-                          Right (Left refusal) → refusedWith refusal
-                          Right (Right reference) → pure (Right reference)
-              attempt `onException` releaseOnce
+    Left refusals → Left (BuildInvalid refusals)
+    Right described → Right (PreparedChunk described (encodeChunkCutouts described))
+
+-- | A prepared chunk's admission: a reference, private until the chunk is
+-- registered under it, and for a chunk with bytes the upload's reserved room.
+-- Spent once ('spendChunkGrant') or abandoned ('abandonChunkGrant').
+data ChunkGrant = ChunkGrant
+  { grantReference ∷ !ChunkRef
+  , grantPrepared ∷ !PreparedChunk
+  , grantUpload ∷ !(Maybe UploadGrant)
+  , grantLive ∷ !(TVar Bool)
+  }
+
+-- | Whether a chunk of this many bytes would be admitted now, read-only: the
+-- decision 'admitRetainedChunk' makes, with the uploads' room observed through
+-- this reading.
+chunkRoom ∷ (Natural → STM (Either UploadRefusal ())) → Retained → Natural → STM (Either BuildRefusal ())
+chunkRoom room (Retained ledger) bytes = do
+  held ← readTVar ledger
+  case nextReference held of
+    Nothing → pure (Left BuildReferencesExhausted)
+    Just _
+      | bytes == 0 → pure (Right ())
+      | otherwise → either (Left . uploadRefusal) Right <$> room bytes
+
+-- | Admit a prepared chunk in one transaction: its reference, and for a chunk
+-- with bytes its upload's room, reserved in the decision every upload shares.
+-- A refusal reserves nothing: 'BuildUploadBackpressure' can change, every other
+-- refusal (an oversized chunk among them) cannot.
+admitRetainedChunk ∷ BufferUploads → Retained → PreparedChunk → STM (Either BuildRefusal ChunkGrant)
+admitRetainedChunk uploads (Retained ledger) prepared = do
+  held ← readTVar ledger
+  case nextReference held of
+    Nothing → pure (Left BuildReferencesExhausted)
+    Just (reference, afterwards) → do
+      upload ←
+        if preparedBytes prepared == 0
+          then pure (Right Nothing)
+          else fmap Just <$> reserveRoom uploads (preparedBytes prepared)
+      case upload of
+        Left refusal → pure (Left (uploadRefusal refusal))
+        Right granted → do
+          writeTVar ledger afterwards
+          live ← newTVar True
+          pure (Right (ChunkGrant reference prepared granted live))
+
+uploadRefusal ∷ UploadRefusal → BuildRefusal
+uploadRefusal = \case
+  UploadBackpressure pressure → BuildUploadBackpressure pressure
+  refusal → BuildUploadRefused refusal
+
+-- | Give back an unspent grant: its reference is free again, and its upload's
+-- room. A spent or abandoned grant changes nothing.
+abandonChunkGrant ∷ BufferUploads → Retained → ChunkGrant → STM ()
+abandonChunkGrant uploads (Retained ledger) grant = do
+  live ← readTVar (grantLive grant)
+  when live $ do
+    writeTVar (grantLive grant) False
+    mapM_ (abandonRoom uploads) (grantUpload grant)
+    modifyTVar' ledger (\held → held {ledgerFree = chunkRefIndex (grantReference grant) : ledgerFree held})
+
+-- | Spend a grant on the graphics owner's thread: make the chunk's buffer, spend
+-- the reserved room on the upload that fills it and register the chunk under
+-- the granted reference. Nothing competes for capacity again. Every exit before
+-- registration gives the grant back. From the buffer's making on, the buffer is
+-- released at one site, at most once, for a refusal, a synchronous exception or a
+-- cancellation, and a refusal says what became of it ('RefusedAllocation'): a
+-- released buffer is destroyed only once the backend confirms it, and its
+-- capacity stays occupied until then. A cancellation releases it and goes on.
+spendChunkGrant ∷ Builders q inst msgr phys dev cmd → Retained → ChunkGrant → IO (Either BuildRefused ChunkRef)
+spendChunkGrant builders retained@(Retained ledger) grant =
+  mask_ (spend `onException` atomically giveBack)
   where
-    register described held =
-      atomically (issue described held) >>= \case
-        Left refusal → pure (Left (BuildRefused refusal NoAllocation))
-        Right reference → pure (Right reference)
+    uploads = bufferUploads builders
+    giveBack = abandonChunkGrant uploads retained grant
+    prepared = grantPrepared grant
+    bytes = preparedEncoded prepared
+    givenBack refused = Left refused <$ atomically giveBack
+    register held =
+      readTVar (grantLive grant) >>= \case
+        False → pure (Left BuildGrantSpent)
+        True → do
+          writeTVar (grantLive grant) False
+          modifyTVar' ledger (\current → current {ledgerEntries = Map.insert (grantReference grant) (Entry (preparedChunk prepared) held False) (ledgerEntries current)})
+          pure (Right (grantReference grant))
+    spend =
+      atomically (readTVar (grantLive grant)) >>= \case
+        False → pure (Left (BuildRefused BuildGrantSpent NoAllocation))
+        True → case grantUpload grant of
+          Nothing → either (Left . (`BuildRefused` NoAllocation)) Right <$> atomically (register Nothing)
+          Just upload →
+            madeOrRaised (buildVertexBuffer builders (preparedBytes prepared)) >>= \case
+              -- the buffer's construction raised after it made and released the buffer: no handle, but its identity
+              Left (buffer, raised) → givenBack (BuildRefused (BuildRaised raised) (AllocationReleased buffer (Right ())))
+              Right (Left refusal) → givenBack (BuildRefused (BuildBufferRefused refusal) NoAllocation)
+              Right (Right buffer) → do
+                -- from here the buffer exists: it is released at one site ('releaseOnce'), at most once, for a
+                -- refusal, a synchronous exception or a cancellation
+                done ← newIORef False
+                let releaseOnce = do
+                      already ← atomicModifyIORef' done (\d → (True, d))
+                      if already then pure Nothing else Just <$> trySync (releaseBuffer builders buffer)
+                    refusedWith refusal = do
+                      released ← releaseOnce
+                      givenBack . BuildRefused refusal $ case released of
+                        Just (Right outcome) → AllocationReleased buffer outcome
+                        Just (Left raised) → AllocationReleaseRaised buffer (raisedText raised)
+                        Nothing → AllocationReleased buffer (Right ())
+                    attempt =
+                      trySync (uploadGranted uploads upload buffer bytes) >>= \case
+                        Left raised → refusedWith (BuildRaised (raisedText raised))
+                        Right (Left refusal) → refusedWith (uploadRefusal refusal)
+                        Right (Right ticket) →
+                          trySync (atomically (register (Just (buffer, ticket)))) >>= \case
+                            Left raised → refusedWith (BuildRaised (raisedText raised))
+                            Right (Left refusal) → refusedWith refusal
+                            Right (Right reference) → pure (Right reference)
+                attempt `onException` releaseOnce
+    raisedText raised = Text.pack (displayException (raised ∷ SomeException))
     -- a construction that raised naming the buffer it made and released; any other exception goes on (with no buffer
     -- named, nothing says whether one was made)
     madeOrRaised action =
@@ -272,13 +401,6 @@ buildRetainedChunkWith builders (Retained ledger) marks kind bounds records inst
       try action >>= \case
         Left raised | Just (_ ∷ SomeAsyncException) ← fromException raised → throwIO raised
         other → pure other
-    issue described held = do
-      current ← readTVar ledger
-      case nextReference current of
-        Nothing → pure (Left BuildReferencesExhausted)
-        Just (reference, afterwards) → do
-          writeTVar ledger afterwards {ledgerEntries = Map.insert reference (Entry described held False) (ledgerEntries afterwards)}
-          pure (Right reference)
 
 -- | The reference the registry issues next and the ledger with it taken.
 nextReference ∷ Ledger → Maybe (ChunkRef, Ledger)

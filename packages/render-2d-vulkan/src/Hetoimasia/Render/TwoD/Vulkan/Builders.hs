@@ -8,8 +8,12 @@
 -- type parameters are the host session's, which only a batch's recorder names.
 module Hetoimasia.Render.TwoD.Vulkan.Builders
   ( Builders (..)
+  , BufferUploads (..)
+  , noBufferUploads
+  , bufferUploadsOf
   ) where
 
+import Control.Concurrent.STM (STM)
 import Data.ByteString (ByteString)
 import Data.Word (Word32)
 import Hetoimasia.GPU.Vulkan.Native.Recording
@@ -25,7 +29,16 @@ import Hetoimasia.GPU.Vulkan.Native.Recording
   , StorageWindow
   )
 import Hetoimasia.GPU.Vulkan.Native.Shader (CheckedShaders)
-import Hetoimasia.GPU.Vulkan.Native.Uploads (UploadRefusal, UploadTicket)
+import Hetoimasia.GPU.Vulkan.Native.Uploads
+  ( UploadGrant
+  , UploadRefusal (UploadClosed)
+  , UploadTicket
+  , Uploads
+  , abandonUploadGrant
+  , reserveUpload
+  , submitUploadGranted
+  , uploadRoom
+  )
 import Numeric.Natural (Natural)
 import Hetoimasia.GPU.Vulkan.Native.TextureTable
   ( SwapTicket
@@ -68,12 +81,50 @@ data Builders q inst msgr phys dev cmd = Builders
   , buildVertexBuffer ∷ Natural → IO (Either Refusal Buffer)
     -- ^ A device-local vertex buffer of this many bytes, which a retained chunk's
     -- cutout instances are uploaded into (R2D-10). Never asked for zero bytes.
-  , uploadBuffer ∷ Buffer → ByteString → IO (Either UploadRefusal UploadTicket)
-    -- ^ Admit the upload that fills a fresh buffer through the bounded staging
-    -- buffer: admission copies the bytes before it returns and never waits, and
-    -- the ticket says where the upload stands.
+  , bufferUploads ∷ BufferUploads
+    -- ^ The room a fresh vertex buffer's upload needs, reserved before the buffer
+    -- is made, and the upload that spends it.
   , releaseBuffer ∷ Buffer → IO (Either Refusal ())
     -- ^ Release a managed buffer: nothing records through it again, batches that
     -- already recorded it keep it until their own references end, and an upload
     -- still settling into it is cancelled or finishes first.
   }
+
+-- | The bounded staging uploads as a retained chunk's build reaches them: room
+-- for an upload of a byte length is observed or reserved in one decision the
+-- host's uploads make for every caller, before the vertex buffer is made, and
+-- the reservation is spent once by the upload that fills the buffer, or
+-- abandoned.
+data BufferUploads = BufferUploads
+  { roomFor ∷ Natural → STM (Either UploadRefusal ())
+    -- ^ Whether an upload of this many bytes would be reserved now, read-only.
+  , reserveRoom ∷ Natural → STM (Either UploadRefusal UploadGrant)
+    -- ^ Reserve its queue place and staging region; a refusal reserves nothing.
+  , uploadGranted ∷ UploadGrant → Buffer → ByteString → IO (Either UploadRefusal UploadTicket)
+    -- ^ Spend the reservation on the upload that fills a fresh vertex buffer of
+    -- exactly its bytes: admission copies the bytes before it returns and never
+    -- waits, and the ticket says where the upload stands. A refusal leaves the
+    -- reservation to be abandoned.
+  , abandonRoom ∷ UploadGrant → STM ()
+    -- ^ Free an unspent reservation's room.
+  }
+
+-- | Uploads that admit nothing: a construction that records no chunk's buffer.
+noBufferUploads ∷ BufferUploads
+noBufferUploads =
+  BufferUploads
+    { roomFor = \_ → pure (Left UploadClosed)
+    , reserveRoom = \_ → pure (Left UploadClosed)
+    , uploadGranted = \_ _ _ → pure (Left UploadClosed)
+    , abandonRoom = \_ → pure ()
+    }
+
+-- | A session's own uploads, ungated.
+bufferUploadsOf ∷ Uploads q inst msgr phys dev cmd → BufferUploads
+bufferUploadsOf uploads =
+  BufferUploads
+    { roomFor = uploadRoom uploads
+    , reserveRoom = reserveUpload uploads
+    , uploadGranted = \grant buffer bytes → submitUploadGranted (pure Nothing) uploads grant buffer bytes
+    , abandonRoom = abandonUploadGrant uploads
+    }
