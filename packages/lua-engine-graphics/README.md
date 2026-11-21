@@ -565,12 +565,13 @@ recorded or noted and not yet promoted. A caller that sets
 `vulkanFrameObserver` after `configureScenes` keeps the receipts with
 `sceneFrameObserver`. A window view plans for the metrics of its window's
 latest recorded frame (`latestFrameMetrics`), kept for the most recently drawn
-window attachments (a watched one is never evicted). An open on a target that
-shows nothing and has no metrics yet publishes the real empty revision in its
-commit, which asks for that first frame. A target already showing a scene (an
-M1 scene, say) keeps it through the attach, and through a refused first
-candidate, until the view's first revision is published; its frame gives the
-metrics.
+window attachments (a watched one is never evicted), and otherwise for the
+window's live geometry (`targetGeometry`: its observed logical and framebuffer
+extents and content scale). An open on a target that shows nothing and has no
+metrics publishes the real empty revision in its commit, which asks for a first
+frame. A target already showing a scene (an M1 scene, say) keeps it through the
+attach, and through a refused first candidate, until the view's first revision
+is published.
 
 ### One owner
 
@@ -620,9 +621,10 @@ Two threads, both started and joined inside `withTerrainViews`, own nothing:
    `profileRequestRegions` regions; its borrow is taken and returned in one
    transaction as soon as it settles, and returned if cancellation lost the
    race. The first round copies the camera's anchor, a pending move's
-   destination, then the last plan's visible regions and the rest it copied;
-   up to `profileRounds` rounds copy what the camera or the plan's visible
-   demand still lacks. Every round is
+   destination and, without a pending move, the last plan's visible regions and
+   the rest it copied; copies of that seed the run cap cannot afford are
+   dropped, not refused. Up to `profileRounds` rounds copy what the camera or
+   the plan's visible footprint still lacks. Every round is
    bounded by `profileRegions` in all. Each copy's input runs and intervals are
    counted as the planner is handed them and checked against `profileRuns` as
    the copy is accepted. Copies of different versions are never combined.
@@ -633,7 +635,9 @@ Two threads, both started and joined inside `withTerrainViews`, own nothing:
    (columns, levels, quads, pending spans) is refused (`LimitPlan`), never
    published truncated. A pending move the preparation cannot land within its
    rounds and regions settles with recoverable pressure (`MovePressure`), as
-   does every pending move of a refused preparation; the camera stays.
+   does every pending move of a refused preparation; the camera stays. A
+   refusal of a preparation a newer control overtook settles nothing: the newer
+   state is prepared.
 3. **Admission.** The parts are render regions of 16 × 16 view-frame cells,
    each split into chunks of at most `profileChunkBytes` of instances, each
    with its own records. A part equal by content to a published one is reused
@@ -652,13 +656,15 @@ Two threads, both started and joined inside `withTerrainViews`, own nothing:
    discarded and the newer state prepared. A view pins the revision its receipt
    names and one later revision the ledger holds adopted; a third publication
    waits until one of them can no longer be drawn. The view's runtime demand is
-   its plan's visible regions before its prefetch.
+   its plan's whole visible footprint, copied regions included, before its
+   prefetch (`readingDemand`).
 
-Current visible demand has priority over earlier copies: a plan whose visible
-regions do not fit beside what was copied (a previous camera's demand, after a
-move) copies them afresh in the next round. A plan whose visible demand alone
-exceeds `profileRegions` is refused with that limit (`LimitRegions`), and the
-drawing is kept. Only a plan whose visible regions fit but had no copy round
+A plan's visible footprint is the regions of the cells it draws and of the
+visible demand it still lacks, accumulated across the preparation's rounds.
+It has priority over earlier copies: a footprint that does not fit beside what
+was copied (a previous camera's demand, after a move) is copied afresh in the
+next round. A footprint that exceeds `profileRegions` is refused with that
+limit (`LimitRegions`), and the drawing is kept. Only a plan whose visible regions fit but had no copy round
 left is published with that coverage loading, and the view prepares again for
 it.
 
@@ -715,7 +721,7 @@ keeps its slot; the others go on.
 | Lease, client or arena gone | `EndRevoked`: the claim handed back, moves settled, chunks retired. |
 | Target retired | `EndTargetGone`: the claim and demand dropped. |
 | Graphics owner ends | Admission stops; every view ends (`EndStopped`), settling its pending moves; controls answer `ControlEnded` and opens `OpenStopped`; what it can no longer dispose of ends as a failure with its cause. |
-| `withTerrainViews` ends | Every view ends (`EndStopped`); the drain waits, with the owner live, for the admitted step and every chunk's holder; the listeners go and the reservation returns; the planner and watcher are joined first. The drain's wait stays interruptible: an interruption records what was retiring as failures with that cause and is raised after the cleanup, kept beside the body's own failure. |
+| `withTerrainViews` ends | Every view ends (`EndStopped`); the drain waits, with the owner live, for the admitted step and every chunk's holder, and closes step admission in the transaction that finds it done; the listeners go and the reservation returns; the planner and watcher are joined first. The drain's wait stays interruptible: an interruption records what was retiring as failures with that cause and is raised after the cleanup, kept beside the body's own failure. |
 | Failure | Private builds are discarded. A failed handback keeps its scene's chunks while the service is open; at its end, those a live target still shows go to the session's teardown, recorded as failures with that cause. |
 
 ### What is ordered
