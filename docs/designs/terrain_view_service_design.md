@@ -236,7 +236,9 @@ Replace `startIfDue`'s published/invalid/idle tests, `vsIdleAt`, `settleWith.wit
 
 [Issue #714](https://github.com/coghex/hetoimasia/issues/714) · [Amendment F](https://github.com/coghex/hetoimasia/issues/714#issuecomment-7052799078) · [Amendment S](https://github.com/coghex/hetoimasia/issues/714#issuecomment-7056078928) · [PR principle audit](https://github.com/coghex/hetoimasia/pull/716#issuecomment-7059259004) · [PR conformance table](https://github.com/coghex/hetoimasia/pull/716#issuecomment-7059259209)
 
-## Proposal for owner approval · Chunk-build admission before allocation in #714
+## Approved amendment for #714 · Chunk-build admission before allocation
+
+The owner approved this section at `3277c13c93` with “Y” on 2026-11-21 at 20:42:22 UTC.
 
 **Proposed #714 amendment.** A retained chunk build must secure capacity before creating its vertex buffer. A refused reservation owns nothing. Temporary pressure keeps the current candidate and its built parts. An impossible replacement is refused once, keeps the drawing and retires its private parts. A failure after admission retains its resource identity and cleanup outcome. This replaces amendment D’s “A refused build still has an owner”, its corresponding ledger change and its final acceptance example. It applies to delivery A under the existing six guarantees and amendment F’s teardown scope.
 
