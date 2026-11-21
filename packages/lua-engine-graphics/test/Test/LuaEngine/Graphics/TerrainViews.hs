@@ -63,6 +63,7 @@ import Test.Hspec hiding (after, before, it)
 import qualified Test.Hspec as Hspec
 import Test.Support.Bounded (bounded)
 import Test.Support.Owned (withOwnedThread)
+import Numeric.Natural (Natural)
 import Hetoimasia.GLFW.Window (Attribute (..), ContentScale (..), Extent (..))
 import Hetoimasia.LuaEngine.Graphics.Window.Host (WindowGeometry (..), geometryOfAttributes)
 import Control.Exception (finally)
@@ -102,6 +103,12 @@ data Rig = Rig
   , rigStyleReleases ∷ !(TVar Int)
   , rigUnavailable ∷ !(TVar (Set.Set RegionCoord))
     -- ^ Regions whose terrain part the views read as unavailable at their copy boundary (a storage fault).
+  , rigUploads ∷ !(TVar [Natural])
+    -- ^ The host's unsettled uploads (any view's or texture's), as the owner reports them.
+  , rigBuildAttempts ∷ !(TVar Int)
+    -- ^ How many builds the fake hands were asked for.
+  , rigFailNext ∷ !(TVar [Maybe BuildFailure])
+    -- ^ The outcomes of the next builds, in order: a failure, or a build as usual.
   , rigCountGate ∷ !(TVar (Maybe (Int → Bool, TMVar [RegionCoord], TMVar ())))
     -- ^ When set: the first held copy whose counted total satisfies the test names its batch here, once its total is
     -- counted, and waits until the example resumes it.
@@ -187,6 +194,9 @@ withRig options body =
         resume ← newEmptyTMVarIO
         styleReleases ← newTVarIO 0
         unavailable ← newTVarIO Set.empty
+        uploads ← newTVarIO []
+        buildAttempts ← newTVarIO 0
+        failNext ← newTVarIO []
         countGate ← newTVarIO Nothing
         initial ← prepare initialGraphicsScene
         let owner =
@@ -215,6 +225,7 @@ withRig options body =
                 , ownerMaterial = materialRef 11 (MaterialFacts True recordLayout (fromIntegral pushBlockBytes))
                 , ownerRegionWindow = optWindow options
                 , ownerDepthQualified = True
+                , ownerUploads = readTVar uploads
                 , ownerEnded = readTVar ownerEnded
                 }
             hooks =
@@ -250,7 +261,7 @@ withRig options body =
                     forM_ steps $ \(step, outcome) → step fakeHands >> atomically (writeTVar outcome (Just StepRan))
                     loop
               loop
-            rig views = Rig views terrain lease queue queueOpen lane laneCapacity standings chunks disposed attempts buildFailure disposeFailure next ledger claims receipts ownerEnded style account deferDisposal pendingDisposals hold entered resume styleReleases unavailable countGate
+            rig views = Rig views terrain lease queue queueOpen lane laneCapacity standings chunks disposed attempts buildFailure disposeFailure next ledger claims receipts ownerEnded style account deferDisposal pendingDisposals hold entered resume styleReleases unavailable uploads buildAttempts failNext countGate
             fakeHands = hands (rig (error "the teardown's hands read no service"))
         withOwnedThread (when (optTeardown options /= TeardownNone) teardown) $ \_ _ →
           withTerrainViews (configOf options) ports $ \views →
@@ -297,7 +308,12 @@ hands rig =
         if hold == Just upcoming then True <$ (writeTVar (rigHold rig) Nothing >> putTMVar (rigEntered rig) ()) else pure False
       when held (atomically (takeTMVar (rigResume rig)))
       atomically $ do
-        failure ← readTVar (rigBuildFailure rig)
+        modifyTVar' (rigBuildAttempts rig) (+ 1)
+        next ← readTVar (rigFailNext rig)
+        persistent ← readTVar (rigBuildFailure rig)
+        failure ← case next of
+          outcome : rest → outcome <$ writeTVar (rigFailNext rig) rest
+          [] → pure persistent
         case failure of
           Just why → pure (Left why)
           Nothing → case buildChunkWith noCutoutMarks ChunkWorldDepth DeriveBounds (Map.singleton material records) instances of
@@ -1430,27 +1446,66 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         settleUntil rig (isJust <$> moveSettled third)
         atomically (readingRefusals <$> readView view) `shouldReturn` 2
 
-    it "never builds beyond the target's slots while refused builds' buffers await destruction, however often it is woken" $
+    it "retries a backpressured build only once an upload settles, never beyond the slots, and publishes once the buffers are destroyed" $
       withRig defaultOptions {optProfile = smallProfile {profileSlots = 4, profileQuads = 2048}} $ \rig → do
         let occupied = Map.findWithDefault 0 1 . serviceOccupied <$> readTerrainViews (rigViews rig)
+            attempts = readTVarIO (rigBuildAttempts rig)
+            wake = atomically (kick (rigViews rig)) >> runOwner rig
         destruction ← newTVarIO DisposalPending
-        -- every build meets upload backpressure after making its buffer, which then awaits destruction
+        -- a texture's upload holds the staging; every build meets backpressure after making its buffer
+        atomically (writeTVar (rigUploads rig) [7])
         atomically (writeTVar (rigBuildFailure rig) (Just (BuildBackpressure "the staging is full" (AllocatedDisposing "a vertex buffer" (readTVar destruction)))))
         target ← newTarget 1
         view ← openOn rig target
         settleUntil rig ((> 0) <$> occupied)
-        -- unrelated wakes: each retry reserves a free slot first, so the occupancy never passes the four slots
+        refused ← attempts
+        -- unrelated wakes while the staging stays held: no retry
+        forM_ [1 .. 8 ∷ Int] (const wake)
+        attempts `shouldReturn` refused
+        atomically occupied `shouldReturn` 1
+        -- the texture's upload settles: one retry, then again none until another settles; never past the slots
+        atomically (writeTVar (rigUploads rig) [8])
+        wake
+        attempts `shouldReturn` (refused + 1)
         forM_ [1 .. 8 ∷ Int] $ \_ → do
-          atomically (kick (rigViews rig))
-          runOwner rig
+          wake
           atomically occupied >>= (`shouldSatisfy` (<= 4))
-        atomically occupied `shouldReturn` 4
-        atomically (readingPublished <$> readView view) `shouldReturn` Nothing
-        -- the buffers destroyed, the builds go on and publish on the freed slots
-        atomically (writeTVar (rigBuildFailure rig) Nothing)
+        attempts `shouldReturn` (refused + 1)
+        -- the staging free and the buffers destroyed: the builds go on and publish on the freed slots
+        atomically (writeTVar (rigBuildFailure rig) Nothing >> writeTVar (rigUploads rig) [])
         atomically (writeTVar destruction DisposalDone)
+        forM_ [1 .. 4 ∷ Int] (const wake)
         settleUntil rig (publishedAtLeast view 1)
         atomically occupied `shouldReturn` 4
+
+    it "refuses a replacement whose remaining parts a buffer lost for good leaves unaffordable, keeping the loss" $
+      withRig defaultOptions {optProfile = smallProfile {profileSlots = 4, profileQuads = 2048}} $ \rig → do
+        let reading = readTerrainViews (rigViews rig)
+            wake = atomically (kick (rigViews rig)) >> runOwner rig
+        -- the second build's buffer is refused and its release fails: its slot is lost for good
+        atomically (writeTVar (rigFailNext rig) [Nothing, Just (BuildBackpressure "the staging is full" (AllocatedFailed "buffer 9 could not be released"))])
+        target ← newTarget 1
+        view ← openOn rig target
+        settleUntil rig (isJust . readingRefusal <$> readView view)
+        atomically (readingRefusal <$> readView view) >>= (`shouldSatisfy` \case
+          Just (LimitSlots _ _) → True
+          _ → False)
+        -- the refused candidate's own builds retire; the lost buffer keeps its slot, with its cause
+        forM_ [1 .. 8 ∷ Int] (const wake)
+        settleUntil rig ((== 1) . Map.findWithDefault 0 1 . serviceOccupied <$> reading)
+        failures ← serviceFailures <$> atomically reading
+        [cause | (1, Nothing, cause) ← failures] `shouldSatisfy` any (Text.isInfixOf "buffer 9")
+
+    it "admits no control once the view's authority is revoked, ending its pending move as revoked before the owner steps" $
+      withPublished defaultOptions $ \rig target view → do
+        quiesce rig target
+        Right first ← atomically (moveView view far)
+        atomically (writeTVar (targetAuthority target) False)
+        -- before any owner step
+        fmap (either Just (const Nothing)) (atomically (moveView view (JumpTarget (axis 6) (axis 6) Nothing))) `shouldReturn` Just ControlEnded
+        atomically (moveSettled first) `shouldReturn` Just (MoveEnded EndRevoked)
+        atomically (configureView view noConfigure {configureZoom = Just 2}) `shouldReturn` Left ControlEnded
+        atomically (configureView view noConfigure {configureLight = Just brighter}) `shouldReturn` Left ControlEnded
 
     it "names a refused build's buffer when its destruction fails, and keeps its slot" $
       withRig defaultOptions {optProfile = smallProfile {profileSlots = 4, profileQuads = 2048}} $ \rig → do

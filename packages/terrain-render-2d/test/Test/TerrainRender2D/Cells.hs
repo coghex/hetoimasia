@@ -17,6 +17,7 @@ module Test.TerrainRender2D.Cells
   , collapse
   ) where
 
+import Control.Exception (evaluate)
 import Control.Monad (forM_)
 import Data.Foldable (toList)
 import qualified Data.Set as Set
@@ -34,7 +35,7 @@ import Hetoimasia.Terrain.Render2D.Assets
 import Hetoimasia.Terrain.Render2D.Camera (Command (..), Step (..), applyCommand, camRef, defaultCameraConfig)
 import Hetoimasia.Terrain.Render2D.CellPick
 import Hetoimasia.Terrain.Render2D.Cells
-import Hetoimasia.Terrain.Render2D.Facts (Versions (..), chunkOfColumn, emptyDemand, mkAvailability)
+import Hetoimasia.Terrain.Render2D.Facts (Availability, Versions (..), chunkOfColumn, emptyDemand, mkAvailability)
 import Hetoimasia.Terrain.Render2D.Knowledge
 import Hetoimasia.Terrain.Shape (ShapeId, ViewFacing (..), allViewFacings, mkShapeId)
 import System.FilePath ((</>))
@@ -117,6 +118,13 @@ emptyAndPrefetch = describe "an empty footprint's plan and the prefetch prefix" 
     prefix config {ccChunkMargin = 0} 64 `shouldBe` []
     -- a step's work too small to read one chunk's window: nothing is read, nothing listed
     prefix config {ccLimits = (ccLimits config) {clStepWork = 1}} 64 `shouldBe` []
+    -- an exhausted allowance ends the walk before any availability is read: here reading it raises
+    let unread = error "the availability was read" ∷ Availability
+        walk c = evaluate (length (cellPrefetchRegions c unread plan outside 64))
+    walk config {ccLimits = (ccLimits config) {clRegionsPerChunk = 0}} `shouldReturn` 0
+    walk config {ccLimits = (ccLimits config) {clDemandIntervals = 0}} `shouldReturn` 0
+    walk config {ccLimits = (ccLimits config) {clDemandChunks = 0}} `shouldReturn` 0
+    walk config {ccLimits = (ccLimits config) {clStepWork = 1}} `shouldReturn` 0
 
 -- ---------------------------------------------------------------------------
 -- Inputs

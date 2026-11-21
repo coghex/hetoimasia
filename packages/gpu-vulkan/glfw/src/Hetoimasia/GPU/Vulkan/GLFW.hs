@@ -206,6 +206,7 @@ module Hetoimasia.GPU.Vulkan.GLFW
   , readUploadTicket
   , awaitUploadTicket
   , cancelVulkanUpload
+  , unsettledVulkanUploads
   , CancelRefusal (..)
 
     -- * The bindless texture table (GRS-7)
@@ -365,6 +366,7 @@ module Hetoimasia.GPU.Vulkan.GLFW
   , FrameStorageRefused (..)
   ) where
 
+import Numeric.Natural (Natural)
 import Control.Concurrent.STM (STM)
 import Hetoimasia.Foundation.Log (Logger)
 import Hetoimasia.GLFW.Vulkan (LoaderIntegration)
@@ -644,6 +646,11 @@ submitVulkanUpload host = Controller.submitVulkanUpload (vulkanController host)
 -- | Cancel an upload, from any thread, before its first copies are recorded.
 cancelVulkanUpload ∷ VulkanHost scene → UploadTicket → STM (Either CancelRefusal ())
 cancelVulkanUpload host = Controller.cancelVulkanUpload (vulkanController host)
+
+-- | The numbers of the session's unsettled uploads (any view's or texture's), from any thread: an upload that leaves
+-- the list has settled, and the room it held is free again.
+unsettledVulkanUploads ∷ VulkanHost scene → STM [Natural]
+unsettledVulkanUploads host = Controller.unsettledVulkanUploads (vulkanController host)
 
 -- | Create one window's surface on the main thread, under its attachment, and
 -- hand it to this host's owner as a required or optional target.

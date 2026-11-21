@@ -25,6 +25,7 @@ import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Word (Word64)
+import Numeric.Natural (Natural)
 import Hetoimasia.GPU.Vulkan.GLFW
   ( ActionOutcome (..)
   , ActionRefusal (..)
@@ -38,6 +39,7 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , readVulkanActionGate
   , requestVulkanRelease
   , submitVulkanAction
+  , unsettledVulkanUploads
   )
 import Hetoimasia.LuaEngine.Graphics.Scene.Ledger (GraphicsScene)
 import Hetoimasia.LuaEngine.Graphics.Texture (TextureGraphics (..))
@@ -105,6 +107,9 @@ data OwnerPorts = OwnerPorts
     -- ^ The renderer's storage window: the most bytes of clip tables and material records one batch binds.
   , ownerDepthQualified ∷ !Bool
     -- ^ Whether the session's depth format is @D32_SFLOAT@.
+  , ownerUploads ∷ STM [Natural]
+    -- ^ The numbers of the session's unsettled uploads, any view's or texture's: one that leaves the list has settled,
+    -- and the staging and queue room it held are free again.
   , ownerEnded ∷ STM (Maybe Text)
     -- ^ Why the owner takes no more actions, once it does not: its session failed, or its exit began. What can no
     -- longer be disposed of ends with it as cause.
@@ -142,6 +147,7 @@ productionOwner host graphics = do
       , ownerMaterial = material
       , ownerRegionWindow = rendererRegionWindow (graphicsRenderer graphics)
       , ownerDepthQualified = rendererDepthFormat (graphicsRenderer graphics) == Just Depth32Float
+      , ownerUploads = unsettledVulkanUploads host
       , ownerEnded = fmap (Text.pack . show) <$> readVulkanActionGate (vulkanController host)
       }
   where
@@ -159,6 +165,7 @@ productionOwner host graphics = do
                       NoAllocation → NotAllocated
                       AllocationReleased buffer (Right ()) → AllocatedDisposing (Text.pack (show buffer)) (constructedDisposal construction buffer)
                       AllocationReleased buffer (Left why) → AllocatedFailed ("the refused build's buffer " <> Text.pack (show buffer) <> " could not be released: " <> Text.pack (show why))
+                      AllocationReleaseRaised buffer why → AllocatedFailed ("the refused build's buffer " <> Text.pack (show buffer) <> " raised on its release: " <> why)
                  in case refusal of
                       BuildUploadBackpressure pressure → Left (BuildBackpressure (Text.pack (show pressure)) allocated)
                       other → Left (BuildFailed (Text.pack (show other)) allocated)

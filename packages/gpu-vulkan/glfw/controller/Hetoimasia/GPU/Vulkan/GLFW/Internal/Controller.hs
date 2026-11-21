@@ -237,6 +237,7 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , VulkanUploadRefusal (..)
   , submitVulkanUpload
   , cancelVulkanUpload
+  , unsettledVulkanUploads
   , readVulkanAction
   , awaitVulkanAction
 
@@ -1299,6 +1300,10 @@ submitVulkanUpload (VulkanController state) request =
 -- ('cancelUpload').
 cancelVulkanUpload ∷ VulkanController → UploadTicket → STM (Either CancelRefusal ())
 cancelVulkanUpload (VulkanController state) = cancelRenderingUpload (stateRendering state)
+
+-- | The numbers of the session's unsettled uploads, from any thread ('unsettledRenderingUploads').
+unsettledVulkanUploads ∷ VulkanController → STM [Natural]
+unsettledVulkanUploads (VulkanController state) = unsettledRenderingUploads (stateRendering state)
 
 -- | Whether an owner-thread action may be admitted or started now: refused
 -- once the session has failed, with its primary, and once the owner's

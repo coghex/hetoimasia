@@ -96,6 +96,7 @@ module Hetoimasia.Render.TwoD.Vulkan.Chunks
   ) where
 
 import Control.Concurrent.STM (STM, TVar, atomically, newTVarIO, readTVar, readTVarIO, writeTVar)
+import Data.IORef (atomicModifyIORef', newIORef)
 import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeAsyncException, SomeException, displayException, fromException, mask_, onException, rethrowIO, throwIO, try, tryWithContext)
 import Control.Monad (when)
 import qualified Data.ByteString as ByteString
@@ -176,10 +177,12 @@ data BuildRefused = BuildRefused
   deriving (Eq, Show)
 
 -- | A refused build made no buffer, or made one and released it: the release's answer, and the buffer whose physical
--- destruction the backend confirms later. Until then the buffer still occupies its capacity.
+-- destruction the backend confirms later (until then the buffer still occupies its capacity); or one whose release
+-- raised, with the buffer and the cause: a cleanup failure, its capacity kept.
 data RefusedAllocation
   = NoAllocation
   | AllocationReleased !Buffer !(Either Refusal ())
+  | AllocationReleaseRaised !Buffer !Text
   deriving (Eq, Show)
 
 -- | Build a chunk on the graphics owner's thread: describe, route and bound it,
@@ -224,22 +227,35 @@ buildRetainedChunkWith builders (Retained ledger) marks kind bounds records inst
             Left (buffer, raised) → pure (Left (BuildRefused (BuildRaised raised) (AllocationReleased buffer (Right ()))))
             Right (Left refusal) → pure (Left (BuildRefused (BuildBufferRefused refusal) NoAllocation))
             Right (Right buffer) → do
-              -- from here the buffer exists: every refusal, and every synchronous exception, releases it and says so
-              outcome ← trySync (uploadBuffer builders buffer bytes) `onException` releaseBuffer builders buffer
-              case outcome of
-                Left raised → refusedWith buffer (BuildRaised (Text.pack (displayException (raised ∷ SomeException))))
-                Right (Left (UploadBackpressure pressure)) → refusedWith buffer (BuildUploadBackpressure pressure)
-                Right (Left refusal) → refusedWith buffer (BuildUploadRefused refusal)
-                Right (Right ticket) →
-                  (trySync (register described (Just (buffer, ticket))) `onException` releaseBuffer builders buffer) >>= \case
-                    Left raised → refusedWith buffer (BuildRaised (Text.pack (displayException (raised ∷ SomeException))))
-                    Right result → pure result
+              -- from here the buffer exists: it is released at one site ('releaseOnce'), at most once, for a refusal,
+              -- a synchronous exception or a cancellation
+              done ← newIORef False
+              let releaseOnce = do
+                    already ← atomicModifyIORef' done (\d → (True, d))
+                    if already then pure Nothing else Just <$> trySync (releaseBuffer builders buffer)
+                  refusedWith refusal = do
+                    released ← releaseOnce
+                    pure . Left . BuildRefused refusal $ case released of
+                      Just (Right outcome) → AllocationReleased buffer outcome
+                      Just (Left raised) → AllocationReleaseRaised buffer (Text.pack (displayException (raised ∷ SomeException)))
+                      Nothing → AllocationReleased buffer (Right ())
+                  raisedText raised = Text.pack (displayException (raised ∷ SomeException))
+                  attempt = do
+                    outcome ← trySync (uploadBuffer builders buffer bytes)
+                    case outcome of
+                      Left raised → refusedWith (BuildRaised (raisedText raised))
+                      Right (Left (UploadBackpressure pressure)) → refusedWith (BuildUploadBackpressure pressure)
+                      Right (Left refusal) → refusedWith (BuildUploadRefused refusal)
+                      Right (Right ticket) →
+                        trySync (atomically (issue described (Just (buffer, ticket)))) >>= \case
+                          Left raised → refusedWith (BuildRaised (raisedText raised))
+                          Right (Left refusal) → refusedWith refusal
+                          Right (Right reference) → pure (Right reference)
+              attempt `onException` releaseOnce
   where
     register described held =
       atomically (issue described held) >>= \case
-        Left refusal → case held of
-          Nothing → pure (Left (BuildRefused refusal NoAllocation))
-          Just (buffer, _) → refusedWith buffer refusal
+        Left refusal → pure (Left (BuildRefused refusal NoAllocation))
         Right reference → pure (Right reference)
     -- a construction that raised naming the buffer it made and released; any other exception goes on (with no buffer
     -- named, nothing says whether one was made)
@@ -251,14 +267,11 @@ buildRetainedChunkWith builders (Retained ledger) marks kind bounds records inst
               pure (Left (buffer, Text.pack (displayException raised)))
         Left failure → rethrowIO failure
         Right value → pure (Right value)
-    -- a synchronous exception as a value; an asynchronous one (a cancellation) goes on, after the release
+    -- a synchronous exception as a value; an asynchronous one (a cancellation) goes on
     trySync action =
       try action >>= \case
         Left raised | Just (_ ∷ SomeAsyncException) ← fromException raised → throwIO raised
         other → pure other
-    refusedWith buffer refusal = do
-      released ← releaseBuffer builders buffer
-      pure (Left (BuildRefused refusal (AllocationReleased buffer released)))
     issue described held = do
       current ← readTVar ledger
       case nextReference current of

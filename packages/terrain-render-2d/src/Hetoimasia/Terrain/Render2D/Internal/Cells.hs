@@ -651,30 +651,33 @@ cellPrefetchRegions config availability plan excluded places
       ]
     -- one chunk's window read: its cost is charged, and checked, before it is read
     cost = 1 + windowWork lo hi
-    -- lazy: only the prefix asked for is made
-    go _ _ _ _ _ [] = []
-    go seen chunks intervals work left (key@(ChunkKey cx cy) : rest)
-      | work <= 0 = []
-      | Map.member key windows || Set.member key seen = go seen chunks intervals (work - 1) left rest
-      | chunks <= 0 || cost > work = []
-      | otherwise =
-          let unready = unknownPieces availability key lo hi
-              regions =
-                take
-                  (clRegionsPerChunk limits)
-                  [ region
-                  | z ← levelsOf unready
-                  , let region = RegionCoord cx cy (fromInteger z)
-                  , Set.notMember region excluded
-                  ]
-              seen' = Set.insert key seen
-           in if
-                | length unready > intervals → []
-                | null regions → go seen' chunks intervals (work - cost) left rest
-                | otherwise →
-                    let taken = take left regions
-                        left' = left - length taken
-                     in taken <> (if left' > 0 then go seen' (chunks - 1) (intervals - length unready) (work - cost) left' rest else [])
+    perChunk = clRegionsPerChunk limits
+    -- lazy: only the prefix asked for is made. Every remaining allowance is checked before the next ring position is
+    -- matched or a window read: an exhausted one ends the walk with the prefix made
+    go seen chunks intervals work left keys
+      | work <= 0 || chunks <= 0 || intervals <= 0 || perChunk <= 0 || left <= 0 = []
+      | otherwise = case keys of
+          [] → []
+          key@(ChunkKey cx cy) : rest
+            | Map.member key windows || Set.member key seen → go seen chunks intervals (work - 1) left rest
+            | cost > work → []
+            | otherwise →
+                let unready = unknownPieces availability key lo hi
+                    regions =
+                      take
+                        perChunk
+                        [ region
+                        | z ← levelsOf unready
+                        , let region = RegionCoord cx cy (fromInteger z)
+                        , Set.notMember region excluded
+                        ]
+                    seen' = Set.insert key seen
+                 in if
+                      | length unready > intervals → []
+                      | null regions → go seen' chunks intervals (work - cost) left rest
+                      | otherwise →
+                          let taken = take left regions
+                           in taken <> go seen' (chunks - 1) (intervals - length unready) (work - cost) (left - length taken) rest
     -- the level-regions the unready pieces cross, each once
     levelsOf pieces = Set.toAscList (Set.fromList [z | (a, b) ← pieces, z ← [regionOfLevel a .. regionOfLevel (b - 1)]])
 

@@ -16,7 +16,7 @@ import Control.Concurrent (yield)
 import Control.Monad (forM_)
 import Control.Concurrent.STM (atomically, newTVarIO, readTVar, readTVarIO, retry, writeTVar)
 import qualified Data.Map.Strict as Map
-import Control.Exception (AsyncException (ThreadKilled), throwIO, try)
+import Control.Exception (AsyncException (ThreadKilled), ErrorCall (ErrorCall), throwIO, try)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
@@ -368,6 +368,21 @@ refusalSpec = describe "refusing a build" $ do
         Left (BuildRefused (BuildUploadBackpressure _) (AllocationReleased buffer (Right ()))) → Just buffer `shouldBe` lastMaybe made
         other → expectationFailure ("expected backpressure with the released buffer, found " <> show other)
       readIORef (trackedReleased (setupTracked setup)) >>= (`shouldBe` drop 8 made)
+
+  it "releases a refused build's buffer at one site: a release that raises is called once and answered with the buffer and the cause" $
+    withSetup $ \setup → do
+      calls ← newIORef []
+      _ ← mapM (\i → built setup ChunkWorldDepth [cutAt (fromIntegral (i ∷ Int)) 1]) [1 .. 8]
+      let raising = (trackedBuilders setup) {releaseBuffer = \buffer → atomicModifyIORef' calls (\held → (held <> [buffer], ())) >> throwIO (ErrorCall "the release raised")}
+      answer ← buildRetainedChunkWith raising (setupRetained setup) artMarks ChunkWorldDepth DeriveBounds Map.empty [cutAt 0 1]
+      made ← readIORef (trackedMade (setupTracked setup))
+      released ← readIORef calls
+      released `shouldBe` drop 8 made
+      case answer of
+        Left (BuildRefused (BuildUploadBackpressure _) (AllocationReleaseRaised buffer cause)) → do
+          [buffer] `shouldBe` drop 8 made
+          cause `shouldSatisfy` Text.isInfixOf "the release raised"
+        other → expectationFailure ("expected backpressure with a raised release, found " <> show other)
 
   it "releases the buffer when the build is interrupted by an exception after it was made, leaving nothing registered" $
     withSetup $ \setup → do

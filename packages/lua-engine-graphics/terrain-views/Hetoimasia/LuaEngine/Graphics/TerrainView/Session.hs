@@ -375,9 +375,9 @@ data Candidate = Candidate
   , cdReused ∷ !(Map PartKey Part)
   , cdCamera ∷ !CameraState
   , cdMetrics ∷ !TargetMetrics
-  , cdUploadWait ∷ !(Maybe [ChunkRef])
-    -- ^ After upload backpressure: the view's chunks that were uploading then. A build is retried only once one of
-    -- them has left the upload (evidence of upload capacity), or when none was.
+  , cdUploadWait ∷ !(Maybe [Natural])
+    -- ^ After upload backpressure: the session's unsettled uploads then (any view's or texture's). A build is retried
+    -- only once one of them has settled (evidence that staging or queue room is free again), or when none was.
   , cdDemand ∷ ![RegionCoord]
     -- ^ The runtime demand its publication applies: F nearest the anchor first, then the prefetch, cut at the
     -- service's camera regions.
@@ -523,6 +523,8 @@ data TerrainViews k = TerrainViews
   , svEnded ∷ !(TVar (Maybe Text))
     -- ^ The graphics owner takes no more steps, and why: admission is stopped.
   , svKickWanted ∷ !(TVar Bool)
+  , svSeenUploads ∷ !(TVar [Natural])
+    -- ^ The watcher's last reading of the session's unsettled uploads: a change is what a backpressured build awaits.
   , svPlanningFrame ∷ !(TVar Word64)
   , svPlanningMax ∷ !(TVar Word64)
   , svPlanningStep ∷ !(TVar Word64)
@@ -608,6 +610,7 @@ newService config ports allowance = do
   step ← newTVarIO Nothing
   ended ← newTVarIO Nothing
   wanted ← newTVarIO False
+  seenUploads ← newTVarIO []
   [planningFrame, planningMax, planningStep, planningStepMax, ownerFrame, ownerMax, ownerStepMax] ← mapM newTVarIO (replicate 7 0)
   jobs ← newTVarIO Map.empty
   running ← newTVarIO Nothing
@@ -627,6 +630,7 @@ newService config ports allowance = do
       , svStep = step
       , svEnded = ended
       , svKickWanted = wanted
+      , svSeenUploads = seenUploads
       , svPlanningFrame = planningFrame
       , svPlanningMax = planningMax
       , svPlanningStep = planningStep
@@ -662,7 +666,10 @@ watch service stopping = loop
     marks = do
       views ← Map.elems <$> readTVar (svViews service)
       epoch ← Runtime.authorityEpochSTM (portTerrain (svPorts service))
-      moved ← fmap or . forM views $ \vs → do
+      uploads ← ownerUploads (portOwner (svPorts service))
+      seenUploads ← readTVar (svSeenUploads service)
+      when (uploads /= seenUploads) (writeTVar (svSeenUploads service) uploads)
+      moved ← fmap ((uploads /= seenUploads) ||) . fmap or . forM views $ \vs → do
         mark ← vsMarkCell vs
         usable ← vtUsable (vsTarget vs)
         geometry ← vtGeometry (vsTarget vs)
@@ -1026,12 +1033,10 @@ moveSettled (PendingMove box) = readTVar box
 -- reads (and, for a jump with a level, its destination part is ready); with recoverable pressure when that preparation
 -- is refused or the part is not ready. A newer move or camera change cancels it; a lighting change does not.
 moveView ∷ (Ord k, Show k) ⇒ TerrainView k → JumpTarget → STM (Either ControlRefusal PendingMove)
-moveView (TerrainView service vs) target = do
-  ended ← readTVar (svEnded service)
-  readTVar (vsStatus vs) >>= \case
-    ViewEnded _ → pure (Left ControlEnded)
-    ViewOpen | isJust ended → pure (Left ControlEnded)
-    ViewOpen → do
+moveView (TerrainView service vs) target =
+  admitControl service vs >>= \case
+    Just _ → pure (Left ControlEnded)
+    Nothing → do
       -- the jump always waits for a preparation of its destination: whatever facts the view holds of it, it lands only
       -- at the camera transition of a preparation that copied its destination
       supersede vs
@@ -1063,14 +1068,12 @@ noConfigure = Configure Nothing Nothing Nothing Nothing
 -- busy until it has them; a camera change cancels a pending move, a lighting change does not.
 configureView ∷ (Ord k, Show k) ⇒ TerrainView k → Configure → STM (Either ControlRefusal ())
 configureView (TerrainView service vs) update
-  | null commands = do
-      status ← readTVar (vsStatus vs)
-      ended ← readTVar (svEnded service)
-      case (status, configureLight update) of
-        (ViewEnded _, _) → pure (Left ControlEnded)
-        _ | isJust ended → pure (Left ControlEnded)
-        (_, Nothing) → pure (Right ())
-        (_, Just light) → Right () <$ (writeTVar (vsLight vs) light >> bumpIntent service vs)
+  | null commands =
+      admitControl service vs >>= \case
+        Just _ → pure (Left ControlEnded)
+        Nothing → case configureLight update of
+          Nothing → pure (Right ())
+          Just light → Right () <$ (writeTVar (vsLight vs) light >> bumpIntent service vs)
   | otherwise =
       controlled service vs $ \camera →
         case foldl (\acc command → acc >>= \c → stepCamera <$> applyLocal (tvCamera (svConfig service)) command c) (Right camera) commands of
@@ -1084,16 +1087,40 @@ configureView (TerrainView service vs) update
   where
     commands = catMaybes [SetZoom <$> configureZoom update, SetFacing <$> configureFacing update, SelectSlice <$> configureDepth update]
 
-controlled ∷ TerrainViews k → ViewState k → (CameraState → STM (Either ControlRefusal a)) → STM (Either ControlRefusal a)
-controlled service vs body = do
-  ended ← readTVar (svEnded service)
-  readTVar (vsStatus vs) >>= \case
-    ViewEnded _ → pure (Left ControlEnded)
-    ViewOpen | isJust ended → pure (Left ControlEnded)
-    ViewOpen →
+controlled ∷ (Ord k, Show k) ⇒ TerrainViews k → ViewState k → (CameraState → STM (Either ControlRefusal a)) → STM (Either ControlRefusal a)
+controlled service vs body =
+  admitControl service vs >>= \case
+    Just _ → pure (Left ControlEnded)
+    Nothing →
       readTVar (vsSettled vs) >>= \case
         Nothing → pure (Left ControlBusy)
         Just _ → readTVar (vsCamera vs) >>= body
+
+-- | Whether a control may be admitted, read live in the control's own transaction: the view open, the service
+-- admitting, the target usable, the view's original authority held and its arena lease live. When it may not, the
+-- ending it shows ends the pending moves (never as superseded) and the owner is asked to end the view; nothing else
+-- changes.
+admitControl ∷ (Ord k, Show k) ⇒ TerrainViews k → ViewState k → STM (Maybe Ending)
+admitControl service vs = do
+  status ← readTVar (vsStatus vs)
+  open ← readTVar (svOpen service)
+  ended ← readTVar (svEnded service)
+  usable ← vtUsable (vsTarget vs)
+  authority ← authorityOf vs
+  arena ← Runtime.inspectArenaSTM (portTerrain (svPorts service)) (vsLease vs)
+  let ending = case status of
+        ViewEnded why → Just why
+        ViewOpen
+          | not open || isJust ended → Just EndStopped
+          | not usable → Just EndTargetGone
+          | not authority || isNothing arena → Just EndRevoked
+          | otherwise → Nothing
+  for_ ending $ \why → do
+    moves ← readTVar (vsMoves vs)
+    forM_ (Map.elems moves) (settleOnce (MoveEnded why))
+    writeTVar (vsMoves vs) Map.empty
+    kick service
+  pure ending
 
 -- Settle every pending move as superseded and cancel the camera's pending jump.
 supersede ∷ ViewState k → STM ()
@@ -1347,14 +1374,25 @@ reconcileDemand service vs = do
             Left why → do
               let limit = LimitRuntime ("the terrain service refused the view's demand: " <> Text.pack (show why))
               pressure vs limit
-              before ← readTVar (vsRefused vs)
-              when (isNothing before) (modifyTVar' (vsRefusals vs) (+ 1))
-              writeTVar (vsRefused vs) (Just (limit, RefusedAt basis Nothing (Just desired)))
+              recordRefusal vs limit (RefusedAt basis Nothing (Just desired))
               pure True
 
 -- The runtime demand of a list of regions: each whole.
 demandsOf ∷ [RegionCoord] → [RegionDemand]
 demandsOf regions = [RegionDemand region coverage | region ← regions, Right coverage ← [coverageBox 0 16 0 16 0 32]]
+
+-- The slots of a target that can still come free: its chunks retiring, private, in the owner's hand or awaiting
+-- confirmed disposal (refused builds' buffers included). A failure keeps its slot for good and is not among them.
+freeing ∷ Eq k ⇒ TerrainViews k → k → STM Int
+freeing service key = do
+  retiring ← readTVar (svRetiring service)
+  private ← readTVar (svPrivate service)
+  inHand ← readTVar (svInHand service)
+  disposing ← readTVar (svDisposing service)
+  pure $
+    sum [length (rtChunks r) | r ← toList retiring, rtTarget r == key]
+      + length [() | (k, _, _) ← private <> inHand, k == key]
+      + length [() | (entry, _) ← disposing, disposalTarget entry == key]
 
 -- The target's free slots.
 freeSlots ∷ Ord k ⇒ TerrainViews k → ViewState k → STM Int
@@ -1583,12 +1621,21 @@ refuse service vs serial basis limit =
         _ → pure ()
       writeTVar (vsStage vs) Idle
       pressure vs limit
-      before ← readTVar (vsRefused vs)
-      when (isNothing before) (modifyTVar' (vsRefusals vs) (+ 1))
       let need = case limit of
             LimitSlots wanted _ → Just wanted
             _ → Nothing
-      writeTVar (vsRefused vs) (Just (limit, RefusedAt basis need Nothing))
+      recordRefusal vs limit (RefusedAt basis need Nothing)
+
+-- Record a refusal: a new entry (no record, or one of another basis or desired list) is reported once; the same
+-- refusal again adds nothing.
+recordRefusal ∷ ViewState k → BindingLimit → RefusedAt → STM ()
+recordRefusal vs limit at@(RefusedAt basis _ list) = do
+  before ← readTVar (vsRefused vs)
+  let same = case before of
+        Just (_, RefusedAt basis' _ list') → basis' == basis && list' == list
+        Nothing → False
+  unless same (modifyTVar' (vsRefusals vs) (+ 1))
+  writeTVar (vsRefused vs) (Just (limit, at))
 
 -- Settle every pending move with recoverable pressure, once, and cancel the camera's pending jump: the camera stays
 -- where it was.
@@ -1920,16 +1967,24 @@ stepBuilding service hands vs serial prep candidate = case cdWanted candidate of
     evidence ← case cdUploadWait candidate of
       Nothing → pure True
       Just [] → pure True
-      Just waiting → atomically (any (/= Just ChunkUploading) <$> mapM (ownerStanding (portOwner (svPorts service))) waiting)
+      Just waiting → atomically ((\now → any (`notElem` now) waiting) <$> ownerUploads (portOwner (svPorts service)))
     if not evidence
       then pure False
       else
         buildEach (take (profileBuilds (tvProfile (svConfig service))) (cdWanted candidate)) >>= \case
           BuildsDone → pure True
           -- no slot is free on the target: a confirmed disposal, or a slot freed otherwise, asks for the next step
-          BuildsWait → pure False
+          -- no slot free: wait for a disposal, unless the slots that can still come free cannot cover what is left
+          -- (a buffer lost for good keeps its slot): then the replacement is refused
+          BuildsWait →
+            atomically $ do
+              free ← freeSlots service vs
+              coming ← freeing service (vtKey (vsTarget vs))
+              let left = length (cdWanted candidate)
+              False <$ when (free + coming < left) (refuse service vs serial (prepBasis prep) (LimitSlots left (free + coming)))
           -- the staging is full now: the view's uploads under way are what a retry waits on
-          BuildsFailed (BuildBackpressure _ _) → False <$ atomically awaitUploads
+          -- (a change of them wakes the watcher); with none unsettled, the retry goes on at the next step
+          BuildsFailed (BuildBackpressure _ _) → null <$> atomically awaitUploads
           BuildsFailed (BuildFailed why _) → False <$ atomically (refuse service vs serial (prepBasis prep) (LimitFailure ("a chunk could not be built: " <> why)))
   [] → do
     standings ← atomically (forM (Map.elems (cdBuilt candidate)) (ownerStanding (portOwner (svPorts service)) . partChunk))
@@ -1970,16 +2025,15 @@ stepBuilding service hands vs serial prep candidate = case cdWanted candidate of
       case outcome of
         Nothing → buildEach more
         Just stopped → pure stopped
-    -- the view's chunks uploading now, recorded on the candidate while its stage is still this step's
+    -- the session's unsettled uploads now, recorded on the candidate while its stage is still this step's
     awaitUploads = do
-      parts ← readTVar (vsParts vs)
       stage ← readTVar (vsStage vs)
-      let chunks = map partChunk (Map.elems parts) <> map partChunk (Map.elems (cdBuilt candidate))
-      uploading ← filterM (fmap (== Just ChunkUploading) . ownerStanding (portOwner (svPorts service))) chunks
+      uploading ← ownerUploads (portOwner (svPorts service))
       live ← stillCurrent service vs serial (prepBasis prep) Nothing
       case stage of
         Building p c | live → writeTVar (vsStage vs) (Building p c {cdUploadWait = Just uploading})
         _ → pure ()
+      pure uploading
     tkey = vtKey (vsTarget vs)
     unreserve = occupy service tkey (-1) >> modifyTVar' (vsBuilding vs) (subtract 1)
     -- a refused build returns its slot only when it made no buffer; a buffer it made keeps the slot until the backend

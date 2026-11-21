@@ -176,6 +176,7 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Rendering
   , renderingUploadsWaiting
   , submitRenderingUpload
   , cancelRenderingUpload
+  , unsettledRenderingUploads
 
     -- * Retirement
   , prepareTargetRetirement
@@ -392,6 +393,9 @@ import Hetoimasia.GPU.Vulkan.Native.TextureTable
   )
 import Hetoimasia.GPU.Vulkan.Native.Uploads
   ( CancelRefusal (CancelUnknown)
+  , UploadView (uploadNumber)
+  , UploadsView (uploadsUnsettled)
+  , readUploads
   , UploadConfig
   , UploadProgress (..)
   , UploadRefusal
@@ -1889,6 +1893,14 @@ submitRenderingUpload rendering gate request =
     UploadsUnconfigured → pure (Left (Left UploadsNotConfigured))
     UploadsPending _ → pure (Left (Left UploadsNotReady))
     UploadsRefused refusal → pure (Left (Left (UploadsRefusedBy refusal)))
+
+-- | The numbers of the session's unsettled uploads, from any thread, in STM: empty before its uploads are made. An
+-- upload that leaves the list has settled, and the staging and queue room it held are free again.
+unsettledRenderingUploads ∷ Rendering q inst msgr phys dev cmd → STM [Natural]
+unsettledRenderingUploads rendering =
+  readTVar (renderingUploads rendering) >>= \case
+    UploadsMade uploads → map uploadNumber . uploadsUnsettled <$> readUploads uploads
+    _ → pure []
 
 -- | Cancel an upload from any thread ('cancelUpload').
 cancelRenderingUpload ∷ Rendering q inst msgr phys dev cmd → UploadTicket → STM (Either CancelRefusal ())
