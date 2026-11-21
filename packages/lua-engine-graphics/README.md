@@ -615,58 +615,71 @@ Two threads, both started and joined inside `withTerrainViews`, own nothing:
 
 ### A preparation
 
-`copying → planning → building → publication`, one bounded unit a step:
+`surface → footprint → copying → settling → planning → building →
+publication`, one bounded unit a step, all for the **destination camera**:
 
-1. **Copying.** One regional snapshot request in flight, at most
-   `profileRequestRegions` regions; its borrow is taken and returned in one
-   transaction as soon as it settles, and returned if cancellation lost the
-   race. The first round copies the camera's anchor, a pending move's
-   destination and, without a pending move, the last plan's visible regions and
-   the rest it copied; copies of that seed the run cap cannot afford are
-   dropped, not refused. Up to `profileRounds` rounds copy what the camera or
-   the plan's visible footprint still lacks. Every round is
-   bounded by `profileRegions` in all. Each copy's input runs and intervals are
-   counted as the planner is handed them and checked against `profileRuns` as
-   the copy is accepted. Copies of different versions are never combined.
-2. **Planning**, on the planner: the copies' inputs, then (once the owner has
-   settled the camera with their facts, landing a pending move whose
-   destination they reach, settling it once) the plan in `profileStepWork`
-   quanta, its adaptation and its parts. A plan that meets a plan-wide bound
-   (columns, levels, quads, pending spans) is refused (`LimitPlan`), never
-   published truncated. A pending move the preparation cannot land within its
-   rounds and regions settles with recoverable pressure (`MovePressure`), as
-   does every pending move of a refused preparation; the camera stays. A
-   refusal of a preparation a newer control overtook settles nothing: the newer
-   state is prepared.
-3. **Admission.** The parts are render regions of 16 × 16 view-frame cells,
+1. **Surface.** A camera that follows (or a pending move without a level)
+   asks the terrain service for the surface of that one column (`surfaceWith`),
+   reused for the same column at the same content revision. An answer at
+   another content revision is superseded and asked again; a failed read
+   refuses with the runtime's cause.
+2. **Footprint.** On the planner, **F**: every region key the cell planner can
+   read for the camera as it will be (a pending move's destination landed, the
+   followed surface adopted; `prospectiveCamera`), from the geometry planning
+   shares (`cellReadFootprint`: each candidate column's own read and its two
+   nearer columns', rotated to world columns and floor-divided into regions),
+   with the anchor's own region. It depends on the camera, the metrics and
+   the configuration only. More than `profileRegions` keys refuses
+   (`LimitRegions`) at the first excess key; more candidate columns than the
+   planner's bound refuses (`LimitPlan`). An empty F (a zero drawable) waits
+   for the basis to move.
+3. **Copying.** The whole of F, in disjoint batches of at most
+   `profileRequestRegions` (and the terrain service's hold and query bounds),
+   one request in flight; each borrow is taken and returned in one transaction
+   as soon as it settles, and returned if cancellation lost the race. Each copy
+   must hold exactly its batch, at the surface answer's content revision. One
+   total of input runs and intervals, counted as the planner is handed them,
+   is checked against `profileRuns` as each copy is accepted (`LimitRuns`).
+   Splitting is transport only: F is admitted or refused as a whole. Copies of
+   different versions are never combined.
+4. **Settling**, at the camera's transition: a pending move lands (a move
+   without a level at the answered surface; a move with a level once its
+   destination part is ready in the copies, otherwise it settles with
+   recoverable pressure, `MovePressure`, the camera stays and the view prepares
+   again), a following camera adopts the answered surface. The settled camera
+   is the one F was enumerated for.
+5. **Planning**, on the planner: the copies' inputs and the plan in
+   `profileStepWork` quanta, its adaptation and its parts, once. A plan that
+   meets a plan-wide bound (columns, levels, quads, pending spans) is refused
+   (`LimitPlan`), never published truncated. Every pending move of a refused
+   preparation settles with pressure; a refusal of a preparation a newer
+   control overtook settles nothing, and the newer state is prepared.
+6. **Admission.** The parts are render regions of 16 × 16 view-frame cells,
    each split into chunks of at most `profileChunkBytes` of instances, each
    with its own records. A part equal by content to a published one is reused
    by reference. Refused before anything is built: records that cannot fit the
    renderer's storage window as a frame binds them, or more new chunks than the
    target's free slots.
-4. **Building.** At most `profileBuilds` chunks a step; each occupies a slot
+7. **Building.** At most `profileBuilds` chunks a step; each occupies a slot
    from just before its build (so a target counts against `W` while its first
    build is under way; a refused build returns the slot), and is handed to the
-   candidate in the transaction after its
-   build, or to disposal if the stage was replaced meanwhile. Upload
-   backpressure keeps the built prefix.
-5. **Publication**, once every chunk is ready, in the transaction that rechecks
+   candidate in the transaction after its build, or to disposal if the stage
+   was replaced meanwhile. Upload backpressure keeps the built prefix.
+8. **Publication**, once every chunk is ready, in the transaction that rechecks
    the claim, the target, the session, the intent, the metrics and the arena's
-   content and knowledge revisions. Overtaken, the candidate's builds are
-   discarded and the newer state prepared. A view pins the revision its receipt
-   names and one later revision the ledger holds adopted; a third publication
-   waits until one of them can no longer be drawn. The view's runtime demand is
-   its plan's whole visible footprint, copied regions included, before its
-   prefetch (`readingDemand`).
+   content and knowledge revisions, and applies the view's runtime demand under
+   its own authority (`setViewDemandSTM`): F nearest the anchor first, then the
+   plan's prefetch outside F, cut at the service's camera regions without
+   refusing (`readingDemand`, with the service's receipt in `readingReceipt`;
+   completing a cut demand is the terrain service's). A refused demand keeps the
+   candidate from adoption. Overtaken, the candidate's builds are discarded and
+   the newer state prepared. A view pins the revision its receipt names and one
+   later revision the ledger holds adopted; a third publication waits until one
+   of them can no longer be drawn.
 
-A plan's visible footprint is the regions of the cells it draws and of the
-visible demand it still lacks, accumulated across the preparation's rounds.
-It has priority over earlier copies: a footprint that does not fit beside what
-was copied (a previous camera's demand, after a move) is copied afresh in the
-next round. A footprint that exceeds `profileRegions` is refused with that
-limit (`LimitRegions`), and the drawing is kept. Only a plan whose visible regions fit but had no copy round
-left is published with that coverage loading, and the view prepares again for
-it.
+A move never lands from facts the view already holds: it waits for a
+preparation of its destination. An attachment checks that the client owns the
+arena lease.
 
 ### Limits and the reservation
 
@@ -693,7 +706,7 @@ nothing held.
 | chunk bytes `C` | 32 KiB | copied regions | 512 |
 | request regions | 64 | input runs and intervals | 131,072 |
 | planner step work | 1,048,576 | chunks built a step | 16 |
-| copy rounds | 3 | reservation | 101,744,640 bytes |
+| reservation | 101,744,640 bytes | | |
 
 A refused replacement keeps the current drawing and mapping; the binding
 limit is reported once on entering refusal (`readingRefusal`,
