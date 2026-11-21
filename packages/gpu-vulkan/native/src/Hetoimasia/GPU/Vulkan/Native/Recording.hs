@@ -362,6 +362,8 @@ module Hetoimasia.GPU.Vulkan.Native.Recording
 
     -- * Buffers and images (GRS-2)
   , Buffer
+  , releasedBufferOf
+  , releasedResourceOf
   , BufferKind (..)
   , bufferKindUse
   , BufferDescription (..)
@@ -648,6 +650,8 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   , BatchTicket (ticketBatch)
   , BatchView (..)
   , Buffer
+  , releasedBufferOf
+  , releasedResourceOf
   , ClaimRecord (..)
   , FrameStorage
   , Image

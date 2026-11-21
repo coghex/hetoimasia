@@ -13,7 +13,7 @@ import Control.Arrow ((&&&))
 import Control.Concurrent (killThread, myThreadId)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM (atomically)
-import Control.Exception (ErrorCall (ErrorCall), SomeException, throwIO, try)
+import Control.Exception (ErrorCall (ErrorCall), ExceptionWithContext (ExceptionWithContext), SomeException, throwIO, try, tryWithContext)
 import Control.Monad (forM_, void, when)
 import qualified Data.ByteString as ByteString
 import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
@@ -831,11 +831,13 @@ spec = describe "Recording" $ do
       rig ← newNamingRig
       layout ← created (createPipelineLayout (rigRecording rig))
       failNaming (rigStandIn rig) ObjectPipeline
-      raised ← try @NamingFailure (createPipeline (rigRecording rig) layout shaders formatB8G8R8A8Srgb)
-      fmap (const ()) raised `shouldBe` Left (NamingFailure ObjectPipeline)
+      raised ← tryWithContext @NamingFailure (createPipeline (rigRecording rig) layout shaders formatB8G8R8A8Srgb)
+      fmap (const ()) (either (\(ExceptionWithContext _ failure) → Left failure) Right raised) `shouldBe` Left (NamingFailure ObjectPipeline)
       [(unnamed, standing)] ←
         (\views → [(viewResource view, viewManagedStanding view) | view ← views, viewKind view == "pipeline"]) <$> atomically (readManaged (rigRecording rig))
       standing `shouldBe` ManagedReleased
+      -- the exception names the resource it released, though no handle was returned
+      either (\(ExceptionWithContext context _) → releasedResourceOf context) (const Nothing) raised `shouldBe` Just unnamed
       pipelineNative ← (\calls → last [handle | CreatedPipeline handle _ _ ← calls]) <$> nativeCalls' rig
       disposed ← dispose rig
       disposed `shouldContain` [unnamed]

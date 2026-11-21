@@ -51,6 +51,7 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Construction
 
 import Control.Concurrent.STM (STM, atomically, modifyTVar', readTVar, readTVarIO, writeTVar)
 import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, displayException, mask_, rethrowIO, throwIO, tryWithContext)
+import Control.Exception.Context (addExceptionAnnotation)
 import Control.Monad (when)
 import qualified Data.Text as Text
 import Data.ByteString (ByteString)
@@ -128,6 +129,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Layer
   )
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   ( Buffer (..)
+  , ReleasedResource (..)
   , TableState (..)
   , Image (..)
   , Managed (..)
@@ -1079,7 +1081,9 @@ nameManaged recording resource native =
         modelEdit roots (releaseResource resource)
         modelEdit roots (endResourceCpuUse resource)
         editManaged recording resource (\entry → entry {managedStanding = ManagedReleased})
-      rethrowIO failure
+      -- the caller gets no handle: the exception names the released resource, so it can be tracked to its destruction
+      let ExceptionWithContext context raised = failure
+      rethrowIO (ExceptionWithContext (addExceptionAnnotation (ReleasedResource resource) context) raised)
   where
     roots = recordingRoots recording
     -- An allocation is named inside the allocator whether or not the device

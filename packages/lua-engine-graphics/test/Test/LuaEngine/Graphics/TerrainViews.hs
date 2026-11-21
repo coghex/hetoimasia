@@ -102,8 +102,9 @@ data Rig = Rig
   , rigStyleReleases ∷ !(TVar Int)
   , rigUnavailable ∷ !(TVar (Set.Set RegionCoord))
     -- ^ Regions whose terrain part the views read as unavailable at their copy boundary (a storage fault).
-  , rigCountGate ∷ !(TVar (Maybe (TMVar [RegionCoord], TMVar ())))
-    -- ^ When set: the next run count of a held copy names its batch here and waits, once, until the example resumes it.
+  , rigCountGate ∷ !(TVar (Maybe (Int → Bool, TMVar [RegionCoord], TMVar ())))
+    -- ^ When set: the first held copy whose counted total satisfies the test names its batch here, once its total is
+    -- counted, and waits until the example resumes it.
   }
 
 -- | What the host does once the body has ended: everything (its targets retire), everything but retire its targets'
@@ -219,8 +220,11 @@ withRig options body =
             hooks =
               CopyHooks
                 { hookUnavailable = readTVar unavailable
-                , hookCounting = \batch → do
-                    gate ← atomically (readTVar countGate <* writeTVar countGate Nothing)
+                , hookCounting = \batch total → do
+                    gate ← atomically $
+                      readTVar countGate >>= \case
+                        Just (crosses, counting, resumed) | crosses total → Just (counting, resumed) <$ writeTVar countGate Nothing
+                        _ → pure Nothing
                     forM_ gate $ \(counting, resumed) → atomically (putTMVar counting batch) >> atomically (takeTMVar resumed)
                 }
             ports = TerrainViewsPorts owner ledger claims receipts initial terrain client account hooks
@@ -1111,28 +1115,21 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         drawn ← drawLatest rig target view
         before ← atomically (latestWorld target)
         published ← atomically (readingPublished <$> readView view)
-        -- every run count of a held copy waits at a gate: the example observes the copy's charge there, then resumes it
+        -- the held copy whose count crosses the cap waits at a gate inside its count: its regional charge is observed
+        -- there, still taken by the view; resumed, the copy is refused and its charge returned
         counting ← newEmptyTMVarIO
         resumed ← newEmptyTMVarIO
-        atomically (writeTVar (rigCountGate rig) (Just (counting, resumed)))
+        atomically (writeTVar (rigCountGate rig) (Just ((> 3104), counting, resumed)))
         -- removing the cell below splits that region's knowledge by column, taking F's copies over the cap
         remove 0
         held ← withOwnedThread (settleUntil rig (isJust . readingRefusal <$> readView view)) $ \_ ended → do
-          let observe seen =
-                timeout 5000000 (atomically (takeTMVar counting)) >>= \case
-                  Nothing → pure seen
-                  Just _ → do
-                    -- a taken copy's charge stays in the terrain service's retained bank until it is returned
-                    (bank, _) ← atomically (inspectRetainedChargesSTM (rigTerrain rig))
-                    atomically (putTMVar resumed ())
-                    observe ((bank > 0) : seen)
-          seen ← observe []
+          batch ← timeout 10000000 (atomically (takeTMVar counting)) >>= maybe (fail "no count crossed the cap") pure
+          charges ← atomically (inspectRegionalSTM (rigTerrain rig))
+          atomically (putTMVar resumed ())
           ended
-          pure seen
-        atomically (writeTVar (rigCountGate rig) Nothing)
-        -- each counted copy was still charged to the terrain service while it was counted
-        held `shouldSatisfy` (not . null)
-        held `shouldSatisfy` and
+          pure (batch, [charge | charge ← charges, regionalChargeTaken charge, regionalChargeRegions charge == length batch])
+        -- the crossing batch's copy was taken by the view and still charged while it was counted
+        snd held `shouldSatisfy` (not . null)
         atomically (readingRefusal <$> readView view) >>= (`shouldSatisfy` \case
           Just (LimitRuns over 3104) → over > 3104
           _ → False)
@@ -1140,7 +1137,8 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         atomically (latestWorld target) `shouldReturn` before
         after ← atomically (viewDrawn view) >>= maybe (fail "nothing drawn after the refusal") pure
         (drawnPlanReceipt after, drawnPlanCamera after, drawnPlanMetrics after) `shouldBe` (drawnPlanReceipt drawn, drawnPlanCamera drawn, drawnPlanMetrics drawn)
-        -- and returned, once: nothing is left charged
+        -- and returned, once: no regional charge is left
+        atomically (inspectRegionalSTM (rigTerrain rig)) `shouldReturn` []
         atomically (inspectRetainedChargesSTM (rigTerrain rig)) >>= (`shouldSatisfy` \(bank, borrows) → bank == 0 && null borrows)
 
     it "asks the runtime for F first, cut at its camera regions, and the receipt disposes of every key it was given" $
@@ -1357,7 +1355,7 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         _ ← closeView early
         -- refused after its buffer was made: the buffer's slot stays charged while its destruction is pending
         destruction ← newTVarIO DisposalPending
-        atomically (writeTVar (rigBuildFailure rig) (Just (BuildFailed "refused after its buffer" (AllocatedDisposing (readTVar destruction)))))
+        atomically (writeTVar (rigBuildFailure rig) (Just (BuildFailed "refused after its buffer" (AllocatedDisposing "a vertex buffer" (readTVar destruction)))))
         first ← openOn rig target
         settleUntil rig (isJust . readingRefusal <$> readView first)
         atomically occupied `shouldReturn` 1
@@ -1392,6 +1390,85 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         atomically (latestWorld target) `shouldReturn` world
         -- the move landed at its eligibility; the later publication refusal keeps that result
         atomically (moveSettled move) `shouldReturn` Just MoveLanded
+
+    it "ends a view whose original window authority is revoked while its target stays usable, settling its pending move" $
+      withPublished defaultOptions $ \rig target view → do
+        quiesce rig target
+        Right move ← atomically (moveView view far)
+        atomically (writeTVar (targetAuthority target) False)
+        settleUntil rig ((== ViewEnded EndRevoked) . readingStatus <$> readView view)
+        atomically (moveSettled move) `shouldReturn` Just (MoveEnded EndRevoked)
+        atomically (claimOf (rigClaims rig) 1) `shouldReturn` Nothing
+        atomically (readTVar (targetUsable target)) `shouldReturn` True
+
+    it "keeps the installed demand and its receipt when a publication's demand is unchanged" $
+      withPublished defaultOptions $ \rig target view → do
+        quiesce rig target
+        before ← atomically (readView view)
+        atomically (configureView view noConfigure {configureLight = Just brighter}) `shouldReturn` Right ()
+        settleUntil rig (publishedAtLeast view (maybe 1 (+ 1) (readingPublished before)))
+        after ← atomically (readView view)
+        (readingDemand after, readingReceipt after, readingInstalls after) `shouldBe` (readingDemand before, readingReceipt before, readingInstalls before)
+
+    it "retires a refusal whose basis no longer applies, and counts a new one once, through successive moves at zero geometry" $
+      withPublished defaultOptions $ \rig target view → do
+        quiesce rig target
+        atomically (writeTVar (targetMetrics target) (Just (metricsOf 0 0)))
+        settleUntil rig (null . readingDemand <$> readView view)
+        atomically (writeTVar (rigUnavailable rig) (Set.singleton (RegionCoord 4 4 0)))
+        Right first ← atomically (moveView view (JumpTarget (axis 70) (axis 70) (Just (axis 1))))
+        settleUntil rig (isJust <$> moveSettled first)
+        atomically (moveSettled first) `shouldReturn` Just (MovePressure (LimitFailure "the jump's destination is not ready"))
+        atomically ((,) <$> (readingRefusal <$> readView view) <*> (readingRefusals <$> readView view)) `shouldReturn` (Just (LimitFailure "the jump's destination is not ready"), 1)
+        -- a ready move elsewhere lands: the first refusal no longer applies
+        Right second ← atomically (moveView view (JumpTarget (axis 6) (axis 6) (Just (axis 1))))
+        settleUntil rig (isJust <$> moveSettled second)
+        atomically (moveSettled second) `shouldReturn` Just MoveLanded
+        atomically (readingRefusal <$> readView view) `shouldReturn` Nothing
+        -- a new refusal is a new entry
+        Right third ← atomically (moveView view (JumpTarget (axis 70) (axis 70) (Just (axis 1))))
+        settleUntil rig (isJust <$> moveSettled third)
+        atomically (readingRefusals <$> readView view) `shouldReturn` 2
+
+    it "never builds beyond the target's slots while refused builds' buffers await destruction, however often it is woken" $
+      withRig defaultOptions {optProfile = smallProfile {profileSlots = 4, profileQuads = 2048}} $ \rig → do
+        let occupied = Map.findWithDefault 0 1 . serviceOccupied <$> readTerrainViews (rigViews rig)
+        destruction ← newTVarIO DisposalPending
+        -- every build meets upload backpressure after making its buffer, which then awaits destruction
+        atomically (writeTVar (rigBuildFailure rig) (Just (BuildBackpressure "the staging is full" (AllocatedDisposing "a vertex buffer" (readTVar destruction)))))
+        target ← newTarget 1
+        view ← openOn rig target
+        settleUntil rig ((> 0) <$> occupied)
+        -- unrelated wakes: each retry reserves a free slot first, so the occupancy never passes the four slots
+        forM_ [1 .. 8 ∷ Int] $ \_ → do
+          atomically (kick (rigViews rig))
+          runOwner rig
+          atomically occupied >>= (`shouldSatisfy` (<= 4))
+        atomically occupied `shouldReturn` 4
+        atomically (readingPublished <$> readView view) `shouldReturn` Nothing
+        -- the buffers destroyed, the builds go on and publish on the freed slots
+        atomically (writeTVar (rigBuildFailure rig) Nothing)
+        atomically (writeTVar destruction DisposalDone)
+        settleUntil rig (publishedAtLeast view 1)
+        atomically occupied `shouldReturn` 4
+
+    it "names a refused build's buffer when its destruction fails, and keeps its slot" $
+      withRig defaultOptions {optProfile = smallProfile {profileSlots = 4, profileQuads = 2048}} $ \rig → do
+        atomically (writeTVar (rigBuildFailure rig) (Just (BuildFailed "refused after its buffer" (AllocatedDisposing "buffer 7" (pure (DisposalFailed "the device was lost"))))))
+        target ← newTarget 1
+        view ← openOn rig target
+        settleUntil rig (isJust . readingRefusal <$> readView view)
+        settleUntil rig (not . null . serviceFailures <$> readTerrainViews (rigViews rig))
+        reading ← atomically (readTerrainViews (rigViews rig))
+        [cause | (1, Nothing, cause) ← serviceFailures reading] `shouldSatisfy` any (Text.isInfixOf "buffer 7")
+        Map.findWithDefault 0 1 (serviceOccupied reading) `shouldBe` 1
+
+    it "treats a target whose metrics have an infinite scale as of unknown geometry: no demand" $
+      withPublished defaultOptions $ \rig target view → do
+        quiesce rig target
+        atomically (writeTVar (targetMetrics target) (Just (TargetMetrics (PixelExtent 320 240) (PixelExtent 320 240) (1 / 0) 1)))
+        settleUntil rig (null . readingDemand <$> readView view)
+        atomically (readingStatus <$> readView view) `shouldReturn` ViewOpen
 
     it "follows a removed summit whose new top is in the vertical region below" $
       withPublished defaultOptions $ \rig target view → do
@@ -1546,6 +1623,8 @@ spec = describe "terrain views (TRA-9 v2)" $ do
       geometryOfAttributes (extent 480 320) Unavailable scale `shouldBe` WindowGeometryUnknown
       geometryOfAttributes (extent 480 320) (extent 960 640) Unavailable `shouldBe` WindowGeometryUnknown
       geometryOfAttributes (extent 480 320) (extent 960 640) scale `shouldBe` WindowGeometryExtent full
+      geometryOfAttributes (extent 480 320) (extent 960 640) (Observed (ContentScale (1 / 0) 2)) `shouldBe` WindowGeometryUnknown
+      geometryOfMetrics (Just full {metricsScaleX = 1 / 0}) `shouldBe` GeometryUnknown
 
   describe "the service's end" $ do
     it "ends every view, drains its retirements and returns the reservation" $ do

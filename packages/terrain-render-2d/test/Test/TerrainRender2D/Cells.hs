@@ -115,6 +115,8 @@ emptyAndPrefetch = describe "an empty footprint's plan and the prefetch prefix" 
     three `shouldSatisfy` all (`Set.notMember` outside)
     Set.size (Set.fromList [(regionX r, regionY r) | r ← prefix oneChunk 64]) `shouldBe` 1
     prefix config {ccChunkMargin = 0} 64 `shouldBe` []
+    -- a step's work too small to read one chunk's window: nothing is read, nothing listed
+    prefix config {ccLimits = (ccLimits config) {clStepWork = 1}} 64 `shouldBe` []
 
 -- ---------------------------------------------------------------------------
 -- Inputs

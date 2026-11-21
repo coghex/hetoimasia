@@ -642,20 +642,23 @@ cellPrefetchRegions config availability plan excluded places
     worldHi = 2 ^ (62 ∷ Int)
     chunkLo = negate (2 ^ (58 ∷ Int)) ∷ Integer
     chunkHi = 2 ^ (58 ∷ Int) - 1 ∷ Integer
-    ringKeys = [key | ChunkKey cx cy ← Map.keys windows, key ← ring cx cy, Map.notMember key windows]
+    -- every raw ring position, visible ones included: each charges the scan
+    ringKeys = [key | ChunkKey cx cy ← Map.keys windows, key ← ring cx cy]
     ring cx cy =
       [ ChunkKey (fromInteger nx) (fromInteger ny)
       | nx ← [max chunkLo (toInteger cx - margin) .. min chunkHi (toInteger cx + margin)]
       , ny ← [max chunkLo (toInteger cy - margin) .. min chunkHi (toInteger cy + margin)]
       ]
+    -- one chunk's window read: its cost is charged, and checked, before it is read
+    cost = 1 + windowWork lo hi
     -- lazy: only the prefix asked for is made
     go _ _ _ _ _ [] = []
     go seen chunks intervals work left (key@(ChunkKey cx cy) : rest)
       | work <= 0 = []
-      | Set.member key seen = go seen chunks intervals (work - 1) left rest
+      | Map.member key windows || Set.member key seen = go seen chunks intervals (work - 1) left rest
+      | chunks <= 0 || cost > work = []
       | otherwise =
           let unready = unknownPieces availability key lo hi
-              cost = 1 + windowWork lo hi
               regions =
                 take
                   (clRegionsPerChunk limits)
@@ -666,8 +669,8 @@ cellPrefetchRegions config availability plan excluded places
                   ]
               seen' = Set.insert key seen
            in if
+                | length unready > intervals → []
                 | null regions → go seen' chunks intervals (work - cost) left rest
-                | chunks <= 0 || length unready > intervals || cost > work → []
                 | otherwise →
                     let taken = take left regions
                         left' = left - length taken

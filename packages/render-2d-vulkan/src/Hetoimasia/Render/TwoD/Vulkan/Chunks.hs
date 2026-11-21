@@ -96,7 +96,7 @@ module Hetoimasia.Render.TwoD.Vulkan.Chunks
   ) where
 
 import Control.Concurrent.STM (STM, TVar, atomically, newTVarIO, readTVar, readTVarIO, writeTVar)
-import Control.Exception (SomeAsyncException, SomeException, displayException, fromException, mask_, onException, throwIO, try)
+import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeAsyncException, SomeException, displayException, fromException, mask_, onException, rethrowIO, throwIO, try, tryWithContext)
 import Control.Monad (when)
 import qualified Data.ByteString as ByteString
 import Data.List.NonEmpty (NonEmpty)
@@ -105,7 +105,7 @@ import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Word (Word32)
-import Hetoimasia.GPU.Vulkan.Native.Recording (Buffer, Refusal)
+import Hetoimasia.GPU.Vulkan.Native.Recording (Buffer, Refusal, releasedBufferOf)
 import Hetoimasia.GPU.Vulkan.Native.Uploads (UploadPressure, UploadRefusal (..), UploadState (..), UploadTicket, readUploadTicket)
 import Hetoimasia.Render.TwoD.Chunk
   ( BoundsRequest
@@ -219,9 +219,11 @@ buildRetainedChunkWith builders (Retained ledger) marks kind bounds records inst
       if ByteString.null bytes
         then register described Nothing
         else
-          buildVertexBuffer builders (fromIntegral (ByteString.length bytes) ∷ Natural) >>= \case
-            Left refusal → pure (Left (BuildRefused (BuildBufferRefused refusal) NoAllocation))
-            Right buffer → do
+          madeOrRaised (buildVertexBuffer builders (fromIntegral (ByteString.length bytes) ∷ Natural)) >>= \case
+            -- the buffer's construction raised after it made and released the buffer: no handle, but its identity
+            Left (buffer, raised) → pure (Left (BuildRefused (BuildRaised raised) (AllocationReleased buffer (Right ()))))
+            Right (Left refusal) → pure (Left (BuildRefused (BuildBufferRefused refusal) NoAllocation))
+            Right (Right buffer) → do
               -- from here the buffer exists: every refusal, and every synchronous exception, releases it and says so
               outcome ← trySync (uploadBuffer builders buffer bytes) `onException` releaseBuffer builders buffer
               case outcome of
@@ -239,6 +241,16 @@ buildRetainedChunkWith builders (Retained ledger) marks kind bounds records inst
           Nothing → pure (Left (BuildRefused refusal NoAllocation))
           Just (buffer, _) → refusedWith buffer refusal
         Right reference → pure (Right reference)
+    -- a construction that raised naming the buffer it made and released; any other exception goes on (with no buffer
+    -- named, nothing says whether one was made)
+    madeOrRaised action =
+      tryWithContext action >>= \case
+        Left (ExceptionWithContext context raised)
+          | Nothing ← fromException raised ∷ Maybe SomeAsyncException
+          , Just buffer ← releasedBufferOf context →
+              pure (Left (buffer, Text.pack (displayException raised)))
+        Left failure → rethrowIO failure
+        Right value → pure (Right value)
     -- a synchronous exception as a value; an asynchronous one (a cancellation) goes on, after the release
     trySync action =
       try action >>= \case

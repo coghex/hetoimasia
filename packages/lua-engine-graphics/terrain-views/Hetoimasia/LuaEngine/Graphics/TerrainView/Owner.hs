@@ -56,13 +56,16 @@ data BuildFailure
   = BuildBackpressure !Text !Allocated
   | BuildFailed !Text !Allocated
 
--- | What a refused build left of its vertex buffer: none was made; one was made and released, and a reading of its
--- physical destruction says when its capacity is free; or one whose release failed, or which is not known to be
--- released (a raised build), with the cause: its capacity stays charged.
+-- | What a refused build left of its vertex buffer: none was made; one was made and released (named by the renderer,
+-- or by the exception its construction raised), and a reading of its physical destruction says when its capacity is
+-- free; or one whose release failed, or a build that raised with no buffer named, with the cause: its capacity stays
+-- charged.
 data Allocated
   = NotAllocated
-  | AllocatedDisposing (STM ConstructedDisposal)
-  | AllocatedFailed !Text
+  | -- | The buffer's identity, and a reading of its physical destruction.
+    AllocatedDisposing !Text (STM ConstructedDisposal)
+  | -- | The cause, which names the buffer when it is known.
+    AllocatedFailed !Text
 
 -- | What one owner step may do on the owner's thread.
 data Hands = Hands
@@ -154,8 +157,8 @@ productionOwner host graphics = do
               Right (Left (BuildRefused refusal allocation)) →
                 let allocated = case allocation of
                       NoAllocation → NotAllocated
-                      AllocationReleased buffer (Right ()) → AllocatedDisposing (constructedDisposal construction buffer)
-                      AllocationReleased _ (Left why) → AllocatedFailed ("the refused build's buffer could not be released: " <> Text.pack (show why))
+                      AllocationReleased buffer (Right ()) → AllocatedDisposing (Text.pack (show buffer)) (constructedDisposal construction buffer)
+                      AllocationReleased buffer (Left why) → AllocatedFailed ("the refused build's buffer " <> Text.pack (show buffer) <> " could not be released: " <> Text.pack (show why))
                  in case refusal of
                       BuildUploadBackpressure pressure → Left (BuildBackpressure (Text.pack (show pressure)) allocated)
                       other → Left (BuildFailed (Text.pack (show other)) allocated)

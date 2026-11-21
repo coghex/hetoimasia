@@ -78,6 +78,9 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   , FrameStorage (..)
   , Readback (..)
   , Buffer (..)
+  , ReleasedResource (..)
+  , releasedBufferOf
+  , releasedResourceOf
   , Image (..)
   , Managed (..)
   , Ordered
@@ -115,6 +118,8 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
 import Control.Concurrent (ThreadId, myThreadId)
 import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVar, newTVarIO, readTVar, readTVarIO, retry, writeTVar)
 import Control.Exception (Exception (displayException), SomeAsyncException, SomeException, fromException, throwIO)
+import Control.Exception.Annotation (ExceptionAnnotation (displayExceptionAnnotation))
+import Control.Exception.Context (ExceptionContext, getExceptionAnnotations)
 import Data.ByteString (ByteString)
 import Data.Foldable (for_)
 import Data.Map.Strict (Map)
@@ -727,6 +732,24 @@ newtype Readback = Readback ResourceId
 -- | A managed buffer of one 'BufferKind'.
 newtype Buffer = Buffer ResourceId
   deriving (Eq, Ord, Show)
+
+-- | The annotation a construction adds to an exception it rethrows after it released the resource it had made: the
+-- resource, whose physical destruction the backend confirms later, though its caller received no handle.
+newtype ReleasedResource = ReleasedResource ResourceId
+  deriving (Eq, Show)
+
+instance ExceptionAnnotation ReleasedResource where
+  displayExceptionAnnotation (ReleasedResource resource) = "the construction released its resource " <> show resource
+
+-- | The resource an exception's context says its construction made and released, if any.
+releasedResourceOf ∷ ExceptionContext → Maybe ResourceId
+releasedResourceOf context = case getExceptionAnnotations context of
+  ReleasedResource resource : _ → Just resource
+  [] → Nothing
+
+-- | The buffer a buffer's construction made and released, as the exception it raised names it.
+releasedBufferOf ∷ ExceptionContext → Maybe Buffer
+releasedBufferOf = fmap Buffer . releasedResourceOf
 
 -- | A managed image of one 'ImageKind', with its one owned view.
 newtype Image = Image ResourceId

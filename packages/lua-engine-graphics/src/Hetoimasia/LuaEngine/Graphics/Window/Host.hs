@@ -98,7 +98,7 @@ import Hetoimasia.GLFW.Window
   , observedLogicalExtent
   , observedPhase
   )
-import Hetoimasia.Render.TwoD.Metrics (PixelExtent (..), TargetMetrics (..))
+import Hetoimasia.Render.TwoD.Metrics (PixelExtent (..), TargetMetrics (..), validMetrics)
 import Hetoimasia.GPU.Model.Identity (TargetClass (RequiredTarget))
 import Hetoimasia.GPU.Vulkan.GLFW
   ( VulkanHandover (..)
@@ -259,7 +259,9 @@ geometryOfAttributes ∷ Attribute Extent → Attribute Extent → Attribute Con
 geometryOfAttributes logical framebuffer scale = case (logical, framebuffer, scale) of
   _ | zero logical || zero framebuffer → WindowGeometryZero
   (Observed (Extent lw lh), Observed (Extent fw fh), Observed (ContentScale sx sy))
-    | lw > 0, lh > 0, fw > 0, fh > 0, sx > 0, sy > 0 → WindowGeometryExtent (TargetMetrics (PixelExtent lw lh) (PixelExtent fw fh) sx sy)
+    | lw > 0, lh > 0, fw > 0, fh > 0, validMetrics metrics → WindowGeometryExtent metrics
+    where
+      metrics = TargetMetrics (PixelExtent lw lh) (PixelExtent fw fh) sx sy
   _ → WindowGeometryUnknown
   where
     zero = \case
