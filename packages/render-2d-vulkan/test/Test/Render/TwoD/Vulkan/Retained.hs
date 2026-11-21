@@ -351,6 +351,24 @@ refusalSpec = describe "refusing a build" $ do
       _ ← built setup ChunkWorldDepth [cutAt 0 1]
       pure ()
 
+  it "says what became of a refused build's buffer: none made before its validation, the one it released after its upload's backpressure" $
+    withSetup $ \setup → do
+      let withRecords = buildRetainedChunkWith (trackedBuilders setup) (setupRetained setup) artMarks ChunkWorldDepth DeriveBounds Map.empty
+          lastMaybe xs = if null xs then Nothing else Just (last xs)
+      -- refused before any buffer: nothing made, nothing to wait for
+      withRecords [cutAt 0 16777216] >>= \case
+        Left (BuildRefused (BuildInvalid _) NoAllocation) → pure ()
+        other → expectationFailure ("expected an invalid build with no allocation, found " <> show other)
+      readIORef (trackedMade (setupTracked setup)) >>= (`shouldBe` [])
+      -- the queue holds eight uploads: the ninth build makes its buffer, meets backpressure and releases that buffer
+      _ ← mapM (\i → built setup ChunkWorldDepth [cutAt (fromIntegral (i ∷ Int)) 1]) [1 .. 8]
+      answer ← withRecords [cutAt 0 1]
+      made ← readIORef (trackedMade (setupTracked setup))
+      case answer of
+        Left (BuildRefused (BuildUploadBackpressure _) (AllocationReleased buffer (Right ()))) → Just buffer `shouldBe` lastMaybe made
+        other → expectationFailure ("expected backpressure with the released buffer, found " <> show other)
+      readIORef (trackedReleased (setupTracked setup)) >>= (`shouldBe` drop 8 made)
+
   it "releases the buffer when the build is interrupted by an exception after it was made, leaving nothing registered" $
     withSetup $ \setup → do
       writeIORef (trackedFail (setupTracked setup)) True
