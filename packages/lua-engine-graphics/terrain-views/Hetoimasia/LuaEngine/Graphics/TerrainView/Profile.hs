@@ -58,9 +58,6 @@ data ViewProfile = ViewProfile
     -- ^ What one planning step may examine (the planner's meter): the owner's planning quantum.
   , profileBuilds ∷ !Int
     -- ^ Chunks one owner step builds.
-  , profileRounds ∷ !Int
-    -- ^ Copy rounds one preparation takes: the first copies what the camera needs, each later one what the
-    -- plan's visible demand still lacks.
   }
   deriving (Eq, Show)
 
@@ -81,7 +78,6 @@ defaultViewProfile =
     , profileLevels = 1048576
     , profileStepWork = 1048576
     , profileBuilds = 16
-    , profileRounds = 3
     }
 
 -- | Why a profile cannot be used.
@@ -133,7 +129,6 @@ checkProfile profile
       , ("levels", profileLevels profile, 1)
       , ("step work", profileStepWork profile, 8192)
       , ("builds", profileBuilds profile, 1)
-      , ("rounds", profileRounds profile, 1)
       ]
 
 -- Declared costs: what each counted thing may hold on the CPU, in bytes.

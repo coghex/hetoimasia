@@ -44,6 +44,7 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , VulkanAction (..)
   , VulkanHost (..)
   , VulkanSceneState (..)
+  , WindowScenePublication (..)
   , WindowSceneStanding (..)
   , awaitVulkanAction
   , constructImage
@@ -74,6 +75,7 @@ import Hetoimasia.Terrain.Render2D.AtlasFixtures (AtlasStyle (..), boundPackedTe
 import Hetoimasia.Terrain.Render2D.Presentation (defaultLightSettings)
 import Hetoimasia.Terrain.Residency (Limits, LimitsSpec (..), mkLimits)
 import Data.Maybe (fromMaybe)
+import Hetoimasia.Foundation.Messaging.Payload (prepare)
 import Hetoimasia.Terrain.Cell (mkMaterialId)
 import Hetoimasia.Terrain.Render2D.Camera (camZoom)
 import Hetoimasia.Terrain.Runtime hiding (closeView, openView)
@@ -182,7 +184,40 @@ coloured side bytes =
 -- The window
 
 fullSpec ∷ Env → Spec
-fullSpec env = describe "terrain views (full)" $
+fullSpec env = describe "terrain views (full)" $ do
+  it "keeps a window's M1 scene when a view attaches with no kept metrics and its first candidate is refused" $ do
+    files ← atlasFiles
+    -- a profile of one region: the first candidate's footprint is refused
+    let narrow = defaultTerrainViewsConfig {tvProfile = defaultViewProfile {profileRegions = 1}}
+    within 300 . withLoaded env files $ \comp vm → withViewsAt narrow env comp vm $ \views _ lease style →
+      withWindows env Nothing $ \wcomp wvm _ _ port _ → do
+        window ← openWindow wcomp wvm port
+        noteWindows env 1
+        let receipts = scenesReceipts (envScenes env)
+        -- the window shows an M1 scene, drawn
+        m1 ← prepare initialGraphicsScene
+        shown ←
+          targetPublish window m1 >>= \case
+            WindowScenePublished _ revision → pure revision
+            other → assertFailure ("the M1 scene was not published: " <> show other)
+        _ ← within 60 (atomically (latestFrameMetrics receipts (targetAttachment window) >>= maybe retry pure))
+        -- the view's metrics come from receipts that keep nothing of the window (its entry evicted): only the live
+        -- geometry gives them, with no other frame and no metrics written by the example
+        evicted ← newDrawReceipts
+        view ←
+          openView views (OpenRequest (windowViewTarget (envHost env) True evicted (pure True) window) lease (pure (Right style)) (axis 0, axis 0, axis 1) defaultLightSettings)
+            >>= either (\why → assertFailure ("the view was refused: " <> show why)) pure
+        refusal ← within 60 (atomically (readView view >>= maybe retry pure . readingRefusal))
+        refusal `shouldSatisfy` \case
+          LimitRegions _ 1 → True
+          _ → False
+        state ← atomically (readVulkanSceneState (envHost env))
+        fmap windowPublished (Map.lookup (KeyWindow (targetWindow window)) (sceneWindows state)) `shouldBe` Just (Just shown)
+        closeView view `shouldReturn` CloseDone
+        state' ← atomically (readVulkanSceneState (envHost env))
+        fmap windowPublished (Map.lookup (KeyWindow (targetWindow window)) (sceneWindows state')) `shouldBe` Just (Just shown)
+        Win.stopInstance wcomp wvm "w"
+
   it "draws a view in a real window, advances its receipt at the presentation's enqueue through camera changes, and records the owner-thread planning time within one frame against the frame budget" $ do
     files ← atlasFiles
     within 300 . withLoaded env files $ \comp vm → withViews env comp vm $ \views _ lease style →
@@ -264,7 +299,10 @@ openWindow wcomp wvm port = do
 -- A terrain service over a temporary directory, an arena of loam over granite, the two atlas parents loaded through the
 -- pipeline, and the views over the production ports.
 withViews ∷ Env → Composition → Vm → (TerrainViews SceneTargetKey → Service → ArenaLease → ViewStyle → IO a) → IO a
-withViews env comp vm body =
+withViews = withViewsAt defaultTerrainViewsConfig
+
+withViewsAt ∷ TerrainViewsConfig → Env → Composition → Vm → (TerrainViews SceneTargetKey → Service → ArenaLease → ViewStyle → IO a) → IO a
+withViewsAt viewsConfig env comp vm body =
   withSystemTempDirectory "hetoimasia-native-terrain-views" $ \dir → do
     let directory = BC.pack dir
         quiet = mkLogger defaultLogFilter (callbackSink (\_ → pure ()))
@@ -291,7 +329,7 @@ withViews env comp vm body =
         lease ← openArena terrain client "main" source >>= either (assertFailure . show) pure >>= await terrain >>= either (assertFailure . show) pure
         account ← newRenderAccount (128 * 1024 * 1024)
         ports ← productionPorts (envHost env) (envGraphics env) (envScenes env) terrain client account
-        withTerrainViews defaultTerrainViewsConfig ports $ \views → body views terrain lease style
+        withTerrainViews viewsConfig ports $ \views → body views terrain lease style
 
 -- Load this file with these policy words on instance "a" and answer the texture's identity once the request succeeded.
 loadOn ∷ Composition → Vm → Text → Text → [Text] → IO Integer

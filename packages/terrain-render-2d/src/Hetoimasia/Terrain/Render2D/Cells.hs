@@ -144,6 +144,10 @@ module Hetoimasia.Terrain.Render2D.Cells
   , cellPlanOf
   , cellPrepProgress
   , planCells
+
+    -- * The read footprint
+  , ReadFootprint (..)
+  , cellReadFootprint
   ) where
 
 import qualified Data.Set as Set

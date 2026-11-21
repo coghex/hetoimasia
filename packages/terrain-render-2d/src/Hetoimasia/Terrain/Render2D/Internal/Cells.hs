@@ -43,6 +43,10 @@ module Hetoimasia.Terrain.Render2D.Internal.Cells
   , unresolvedAhead
   , cellProgressOf
   , zeroDrawable
+
+    -- * The read footprint
+  , ReadFootprint (..)
+  , cellReadFootprint
   ) where
 
 import Control.Monad (unless, when)
@@ -60,6 +64,7 @@ import Hetoimasia.Render.TwoD.Snapshot (depthKeyLimit)
 import Hetoimasia.Terrain.Cell (Column (..), MaterialId)
 import Hetoimasia.Terrain.Coordinate
   ( AxisCoord
+  , RegionCoord (..)
   , TileCoord (..)
   , axisFromInteger
   , axisValue
@@ -448,22 +453,7 @@ startCells ∷ CellInputs → Either CellError CellPrep
 startCells inputs = do
   identity ← cellIdentityOf inputs
   let request = inputsRequest inputs
-      camera = crCamera request
-      config = crConfig request
-  view ←
-    either (Left . CellInvalidView) Right $
-      mkRenderView (crSetup request) (camZoom camera) (camFacing camera) (camFrac camera)
-  let ref = camRef camera
-      clip = toInteger (axisValue (camClip camera))
-      bandLo = clip - ccDepth config
-  envelope ←
-    if zeroDrawable (crSetup request) || bandLo > clip
-      then pure Nothing
-      else do
-        when (settingPixelSnap (setupSettings (crSetup request)) && not (snapCompatible view)) $
-          Left (CellPixelSnapUnsupported (viewScale view))
-        rect ← maybe (Left (CellUnrepresentable "the visible rectangle")) Right (visibleRect (ccMargin config) view)
-        pure (Just (envelopeOf rect ref clip bandLo))
+  (view, envelope) ← requestGeometry (crCamera request) (crSetup request) (crConfig request)
   pure
     CellPrep
       { prIdentity = identity
@@ -485,6 +475,102 @@ startCells inputs = do
       , prUsed = Set.empty
       , prExactY = Map.empty
       }
+
+-- The request's view and its envelope of candidate columns (none for a zero drawable or an empty band): the geometry
+-- planning and the read footprint share. Nothing is read from the terrain.
+requestGeometry ∷ CameraState → ViewSetup → CellConfig → Either CellError (RenderView, Maybe Envelope)
+requestGeometry camera setup config = do
+  view ←
+    either (Left . CellInvalidView) Right $
+      mkRenderView setup (camZoom camera) (camFacing camera) (camFrac camera)
+  let ref = camRef camera
+      clip = toInteger (axisValue (camClip camera))
+      bandLo = clip - ccDepth config
+  envelope ←
+    if zeroDrawable setup || bandLo > clip
+      then pure Nothing
+      else do
+        when (settingPixelSnap (setupSettings setup) && not (snapCompatible view)) $
+          Left (CellPixelSnapUnsupported (viewScale view))
+        rect ← maybe (Left (CellUnrepresentable "the visible rectangle")) Right (visibleRect (ccMargin config) view)
+        pure (Just (envelopeOf rect ref clip bandLo))
+  pure (view, envelope)
+
+-- The inclusive levels @[lo, hi]@ of the column at a cursor whose canvases can touch the padded visible rectangle,
+-- within the band; empty when @lo > hi@. Planning and the read footprint share it.
+columnWindow ∷ Envelope → (Integer, Integer) → (Integer, Integer)
+columnWindow env (v, _) = (lo, hi)
+  where
+    (zLoRel, zHiRel) = envZRel env
+    ref = envRef env
+    y1 = rectMinY (envRect env)
+    y2 = rectMaxY (envRect env)
+    lo = max zLoRel (ceiling ((24 * fromInteger (v - 1) - 16 - y2) / 16)) + ref
+    hi = min zHiRel (floor ((24 * fromInteger (v + 1) - y1) / 16)) + ref
+
+-- The three state reads planning makes of the column at a view offset with window @[lo, hi]@, as inclusive levels:
+-- its own column one level above the window (what covers its top, capped at the clip level), and the two nearer
+-- columns over the window. Planning and the read footprint share it.
+columnReads ∷ Integer → (Integer, Integer) → (Integer, Integer) → (StateRead, StateRead, StateRead)
+columnReads clip (rx, ry) (lo, hi) =
+  ( ((rx, ry), lo, min (hi + 1) clip)
+  , ((rx + 1, ry), lo, min hi clip)
+  , ((rx, ry + 1), lo, min hi clip)
+  )
+
+-- One state read: a view offset and its inclusive levels.
+type StateRead = ((Integer, Integer), Integer, Integer)
+
+-- | The storage regions a request's plan can read, or the bound the walk met first.
+data ReadFootprint
+  = -- | Every region key (16 x 16 columns, 32 levels) touched by the planner's state reads for the request's camera.
+    ReadRegions !(Set.Set RegionCoord)
+  | -- | More than this many regions: the walk stopped at the first excess key.
+    ReadBeyondRegions !Int
+  | -- | More candidate columns than the configuration's column limit: planning would halt there.
+    ReadBeyondColumns !Int
+  deriving stock (Eq, Show)
+
+-- | The storage regions the cell planner can read for a camera under a setup and configuration (at most the given
+-- number of them): for every candidate column of its
+-- envelope (the same walk, windows and reads planning makes), its own read and its two nearer columns' reads, rotated to
+-- world columns, intersected with the representable world and floor-divided into region keys, with every level-region
+-- crossed. It depends on the camera, the setup and the configuration only: not on any terrain content, knowledge,
+-- cache or earlier camera. A zero drawable or empty band reads nothing.
+cellReadFootprint ∷ Int → CameraState → ViewSetup → CellConfig → Either CellError ReadFootprint
+cellReadFootprint regionLimit camera setup config = do
+  (_, envelope) ← requestGeometry camera setup config
+  pure $ case envelope of
+    Nothing → ReadRegions Set.empty
+    Just env → walk env (firstCursor env) 0 Set.empty
+  where
+    columnLimit = clColumns (ccLimits config)
+    worldLo = negate (2 ^ (62 ∷ Int))
+    worldHi = 2 ^ (62 ∷ Int) - 1
+    walk _ Nothing _ acc = ReadRegions acc
+    walk env (Just cursor@(v, u)) columns acc
+      | lo > hi = walk env (nextCursor env cursor) columns acc
+      | columns + 1 > columnLimit = ReadBeyondColumns columnLimit
+      | Set.size acc' > regionLimit = ReadBeyondRegions regionLimit
+      | otherwise = walk env (nextCursor env cursor) (columns + 1) acc'
+      where
+        (lo, hi) = columnWindow env cursor
+        offset = ((u + v) `div` 2, (v - u) `div` 2)
+        acc' =
+          foldr
+            Set.insert
+            acc
+            [ key
+            | let (own, east, south) = columnReads (envClip env) offset (lo, hi)
+            , (at, a, b) ← [own, east, south]
+            , Just column ← [worldColumn camera at]
+            , key ← regionsOver column (max a worldLo) (min b worldHi)
+            ]
+    regionsOver (Column x y) a b =
+      [ RegionCoord (fromInteger (toInteger (axisValue x) `div` 16)) (fromInteger (toInteger (axisValue y) `div` 16)) (fromInteger z)
+      | a <= b
+      , z ← [a `div` 32 .. b `div` 32]
+      ]
 
 -- The envelope of candidate columns. The column of view offset @(rx, ry)@ has
 -- @u = rx - ry@ and @v = rx + ry@; the full 96 x 64 canvas of its level @z@
@@ -635,9 +721,11 @@ evaluateColumn inputs st env (v, u) budget
   | otherwise = do
       -- Own states one level above the window (what covers its top), the
       -- columns nearer to the camera over the window itself.
-      own ← statesOf inputs camera (rx, ry) lo (min (hi + 2) (clip + 1))
-      east ← statesOf inputs camera (rx + 1, ry) lo (min (hi + 1) (clip + 1))
-      south ← statesOf inputs camera (rx, ry + 1) lo (min (hi + 1) (clip + 1))
+      let (ownRead, eastRead, southRead) = columnReads clip (rx, ry) (lo, hi)
+          readStates (at, a, b) = statesOf inputs camera at a (b + 1)
+      own ← readStates ownRead
+      east ← readStates eastRead
+      south ← readStates southRead
       let opaque = opaqueState (inputsAssets inputs) facing
           ownWindow = [SRun a (min b (hi + 1)) s | SRun a b s ← own, a <= hi]
           hidden =
@@ -669,13 +757,9 @@ evaluateColumn inputs st env (v, u) budget
     camera = crCamera request
     facing = camFacing camera
     limits = ccLimits (crConfig request)
-    (zLoRel, zHiRel) = envZRel env
     ref = envRef env
     clip = envClip env
-    y1 = rectMinY (envRect env)
-    y2 = rectMaxY (envRect env)
-    lo = max zLoRel (ceiling ((24 * fromInteger (v - 1) - 16 - y2) / 16)) + ref
-    hi = min zHiRel (floor ((24 * fromInteger (v + 1) - y1) / 16)) + ref
+    (lo, hi) = columnWindow env (v, u)
     column = worldColumn camera (rx, ry)
 
     -- A column with no unit at all still counts as examined.

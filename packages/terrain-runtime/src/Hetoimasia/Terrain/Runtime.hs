@@ -107,6 +107,7 @@ module Hetoimasia.Terrain.Runtime
   , DemandReceipt (..)
   , openView
   , setViewDemand
+  , setViewDemandSTM
   , clearViewDemand
   , closeView
 
