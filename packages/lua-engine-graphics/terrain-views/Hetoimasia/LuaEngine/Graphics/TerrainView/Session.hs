@@ -1953,9 +1953,12 @@ stepPlanning service vs serial prep copies camera box =
             Nothing → False <$ refuse service vs serial (prepBasis prep) (LimitFailure "a plan was made without a drawable extent")
             Just metrics → writeBack service vs serial (prepBasis prep) (Building prep (Candidate plan copies (plannedAdapted planned) toBuild [] (length toBuild) Nothing Map.empty reused camera metrics demand))
 
--- The element with the greatest key, if any.
+-- The element with the greatest key, if any, every comparison made as the list is walked (no deferred chain).
 maximumOn ∷ Ord b ⇒ (a → b) → [a] → Maybe a
-maximumOn key = foldr (\x best → Just (maybe x (\y → if key x >= key y then x else y) best)) Nothing
+maximumOn key = foldl' step Nothing
+  where
+    step Nothing x = Just $! x
+    step (Just y) x = if key x > key y then Just $! x else Just $! y
 
 -- Time the owner's own pure work, into the current frame's and the current step's planning totals.
 {-# NOINLINE timed #-}
@@ -2025,7 +2028,8 @@ stepBuilding service hands vs serial prep candidate
           stage ← readTVar (vsStage vs)
           case stage of
             Building p c →
-              let largest = maximumOn preparedBytes (maybe id (:) (cdLargest c) [part | (_, part, _, _) ← parts])
+              -- the largest so far, decided here, within this batch's bound
+              let !largest = maximumOn preparedBytes (maybe id (:) (cdLargest c) [part | (_, part, _, _) ← parts])
                in writeBack service vs serial basis (Building p c {cdWanted = rest, cdPrepared = cdPrepared c <> parts, cdLargest = largest})
             _ → pure False
     -- One decision for the candidate ('nextPart'), taken in one transaction that finds the work still current: a
