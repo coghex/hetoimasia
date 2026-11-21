@@ -60,7 +60,6 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , FrameEvent (..)
   , FrameRequest (..)
   , Readiness (..)
-  , UploadRefusal (..)
   , Refusal
   , SceneLifecycle (..)
   , SceneMode (..)
