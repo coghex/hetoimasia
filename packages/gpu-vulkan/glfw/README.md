@@ -103,12 +103,14 @@ and the suites' verification capture.
   the session's device in the owner's startup, with no surface and before any
   window; a window handed over later is admitted only if the chosen queue
   family presents to it. `vulkanActionRoom`, `vulkanReleaseRoom`,
-  `vulkanOwnerEnded` and `unsettledVulkanUploads` answer whether an action
-  or a release request would be admitted now, whether the owner takes no more,
-  and which uploads are still unsettled, reading only the owner's gate, the
-  device and the action queue (or the uploads' own state): never a
+  `vulkanOwnerEnded` and `vulkanUploadRoom` answer whether an action, a
+  release request or an upload of a size would be admitted now, and whether
+  the owner takes no more, reading only the owner's gate, the device and the
+  action queue (or the uploads' own state): never a
   barrier, a scene or a target, so a consumer that waits on them wakes for
-  that change alone. An owner round that takes no action writes no queue.
+  that change alone. `reserveVulkanUpload` takes the room `vulkanUploadRoom`
+  reads, in the caller's transaction, for a vertex buffer not yet made;
+  `submitVulkanGranted` spends it once and `abandonVulkanGrant` frees it. An owner round that takes no action writes no queue.
   `vulkanHostIdentity` names the host, which every offscreen registration
   carries; `vulkanSceneTargetRegistered` answers whether this host holds an
   exact registration now. With or without windows, `submitVulkanAction` hands

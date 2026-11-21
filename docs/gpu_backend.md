@@ -894,6 +894,20 @@ and makes the ticket. The caller's thread then copies the bytes into the
 region, so its bytes are free when admission returns. If the copy raises or is
 cancelled, every reservation is given back.
 
+**Reservations.** A caller that must know there is room before it makes a
+vertex buffer reserves it first: `reserveUpload uploads bytes`, in the
+caller's transaction (`reserveVulkanUpload` through the host, under the
+owner's gate). It makes steps 1, 7 and 8 above, with the same placement rule,
+and on a grant occupies one queue place and one aligned staging region for
+every other caller, admitted uploads and reservations alike.
+`uploadRoom uploads bytes` reads the same decision without reserving
+(`vulkanUploadRoom`). A grant belongs to the uploads that issued it. While it
+is reserved it is spent once, by `submitUploadGranted` for a fresh vertex
+buffer of exactly its bytes, which takes its place and region and competes for
+nothing again, or abandoned (`abandonUploadGrant`). A refused spend leaves it
+reserved. A spent, abandoned or foreign grant changes nothing, and closing
+admission abandons every grant not yet spent.
+
 **The exclusive target.** From admission until its upload settles, a target
 belongs to the upload alone: every other batch's use of it is
 `RefusedUninitialized`, disposal does not destroy it, and releasing it is
