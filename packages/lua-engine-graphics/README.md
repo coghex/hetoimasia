@@ -584,7 +584,8 @@ retirement are the owner's alone. A **kick** admits the next action unless one
 is queued; it never waits. Kicks come from the controls, the regional
 snapshot's settlement, the planner's results, the ledger's adoptions and
 releases, the host's frame events, the release lane's barrier actions and a
-step that leaves work it can do at once. Nothing waits for capacity.
+step that leaves work it can do at once. A replacement that cannot fit is
+refused; one blocked only for now waits, armed, on its own admission decision.
 
 Two threads, both started and joined inside `withTerrainViews`, own nothing:
 
@@ -601,7 +602,9 @@ Two threads, both started and joined inside `withTerrainViews`, own nothing:
   lost lease, a retired target or a first frame reaches an idle view; and on
   the views' own outstanding work: a kick the owner's queue refused, a barrier the
   release lane has room for, a chunk that can be released, a disposal the
-  backend confirmed, an offscreen batch that completed. It also observes the
+  backend confirmed, an offscreen batch that completed, an armed candidate
+  whose next part's admission or whose chunks' standings let it go on. It also
+  observes the
   owner's end (its action gate closed by exit or failure, an admission refused
   for good, an admitted step refused or raised): admission stops and every view
   ends.
@@ -678,23 +681,30 @@ publication`, one bounded unit a step, all for the **destination camera**:
    with its own records. A part equal by content to a published one is reused
    by reference. Refused before anything is built: records that cannot fit the
    renderer's storage window as a frame binds them, or more new chunks than the
-   target's free slots.
-7. **Building.** At most `profileBuilds` chunks a step; each first reserves a
-   free slot of its target, in one transaction (with none free the builds wait
-   for a disposal to free one), and occupies it from then (so a target counts
-   against `W` while its first build is under way), and is handed to the
+   target's recoverable slots (free now, or freeing independently of the
+   candidate: retiring, private, in hand or awaiting confirmed disposal; a
+   failure is not among them), each counted once.
+7. **Building.** Every fresh part is prepared on the owner first, at most
+   `profileBuilds` a step (`handPrepare`: routed and encoded, its exact upload
+   bytes known, nothing reserved). Then one decision, which the owner takes
+   and the watcher observes, admits the next part. The candidate is refused
+   (`LimitSlots`, recording its whole fresh requirement) if the remaining parts
+   exceed the target's recoverable slots, its built prefix not among them, or
+   (`LimitOversized`) if a remaining part is larger than the whole staging. It
+   waits if no slot is free or the uploads' room is taken for now. Otherwise
+   the owner takes the slot, the renderer's reference and the uploads' queue
+   place and staging region for that part in one transaction (`handReserve`;
+   a refused grant takes none of them). It then makes, fills and registers the
+   chunk (`grantSpend`), at most `profileBuilds` a step, handing each to the
    candidate in the transaction after its build, or to disposal if the stage
-   was replaced meanwhile. Upload backpressure keeps the built prefix, and a
-   retry waits until one of the session's uploads unsettled at the refusal
-   (any view's or texture's, `ownerUploads`) has settled; the watcher wakes on
-   their change. A build waiting for a slot that the target's freeable slots
-   can no longer provide (a buffer lost for good keeps its slot) refuses the
-   replacement, and its built prefix retires. A refused build returns its slot only when it made no buffer
-   (`Allocated`). A buffer it made keeps the slot until the backend confirms
-   its destruction, named by the renderer or by the exception its
-   construction raised. A buffer whose release failed, or a build that raised
-   with no buffer named, keeps the slot as a failure with its cause, which
-   names the buffer when it is known.
+   was replaced meanwhile. A waiting candidate keeps its built prefix and is
+   armed in the transaction that found it blocked. The watcher asks for a step
+   once the same decision, or the candidate's own chunk standings and
+   publication room, let it go on. A failure after a grant refuses the
+   replacement and says what became of its buffer (`Allocated`): none made
+   returns the slot; a released buffer keeps it until the backend confirms its
+   destruction; a release that failed or raised keeps it as a failure naming
+   the buffer, with the build's cause and the release's.
 8. **Publication**, once every chunk is ready, in the transaction that rechecks
    the claim, the target, the session, the intent, the metrics and the arena's
    content and knowledge revisions, and applies the view's runtime demand under
@@ -733,8 +743,9 @@ when it settles a move, the same pending move. Stale work discards only itself
 and the newer state is prepared. Camera controls other than a move need no
 terrain facts: they apply once a preparation has settled the camera. Every
 control (`moveView`, `configureView`) is admitted only in a transaction that
-finds the view live: open, its service admitting, its target usable, its
-original authority held and its lease live. When it is not, the control is
+finds the view live: open, its service admitting and the graphics owner's own
+gate open (read live, whatever the watcher has recorded), its target usable,
+its original authority held and its lease live. When it is not, the control is
 refused (`ControlEnded`) and the pending moves end with that ending (a
 revocation answers `MoveEnded EndRevoked`), never as superseded. An attachment checks that the client owns the
 arena lease.

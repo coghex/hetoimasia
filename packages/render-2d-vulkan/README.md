@@ -162,30 +162,42 @@ description; this package makes it a device buffer, draws from it and manages
 its life.
 
 **Building.** `buildRetainedChunk builders retained marks kind bounds
-instances` runs on the owner's thread inside an action that lends `Builders`.
-It builds and validates the description (`BuildInvalid`), encodes the
-cutout-path instances, makes a device-local vertex buffer of exactly that size
-and admits the upload that fills it, and registers everything under a fresh
-`ChunkRef` (an index and a generation, so a stale reference resolves to
-nothing).
+instances` runs on the owner's thread inside an action that lends `Builders`,
+in three steps a caller can also take apart:
 
-- **An empty cutout partition makes no buffer and no upload.** A chunk of a
-  world layer without depth, or of a UI layer, has no device buffer: its
-  ordered instances are written to the ring each frame.
-- A refusal changes nothing the registry holds; a buffer made before a refusal
-  or an interruption is released at once. `buildRetainedChunkWith` says which
-  (`BuildRefused`): `NoAllocation`, or the buffer it released with the
-  release's answer (`AllocationReleased`), whose capacity stays occupied until
-  the backend confirms its destruction. A synchronous exception after the
-  buffer was made is such a refusal (`BuildRaised`), and so is one the
-  buffer's construction raised after making and releasing it, which names the
-  buffer (`releasedBufferOf`). The buffer is released at one site, at most
-  once; a release that raises is a cleanup failure naming the buffer and the
-  cause (`AllocationReleaseRaised`).
-- `BuildUploadBackpressure` is the staging buffer or its queue being full now,
-  so asking again later can succeed. `BuildUploadRefused` is everything else
-  (for `UploadOversized`, build smaller chunks). `BuildBufferRefused` and
-  `BuildReferencesExhausted` are the remaining refusals.
+1. **Prepare** (`prepareRetainedChunk`, pure): build and validate the
+   description (`BuildInvalid`) and encode the cutout-path instances, which
+   fixes the exact byte length (`preparedBytes`).
+2. **Admit** (`admitRetainedChunk`, one transaction): reserve a `ChunkRef`
+   (an index and a generation, so a stale reference resolves to nothing),
+   private until registration, and for a positive byte length the uploads'
+   queue place and aligned staging region for exactly those bytes, in the
+   decision every upload shares (`BufferUploads`). A refusal reserves nothing
+   and makes nothing. `BuildUploadBackpressure` is the queue or staging full
+   now, so asking again later can succeed. `BuildReferencesExhausted` frees as
+   chunks are released. `BuildUploadRefused` is everything else; for
+   `UploadOversized`, build smaller chunks. `chunkRoom` reads this decision
+   without reserving, from any thread.
+3. **Spend** (`spendChunkGrant`): only now make the device-local vertex buffer,
+   spend the reserved room on the upload that fills it, and register the
+   chunk under the reserved reference. Every exit before registration gives
+   the grant back (`abandonChunkGrant`).
+
+- **An empty cutout partition makes no buffer and no upload, and reserves no
+  upload room.** A chunk of a world layer without depth, or of a UI layer, has
+  no device buffer: its ordered instances are written to the ring each frame.
+- After the buffer is made, it has one cleanup owner and is released at one
+  site, at most once, for a refusal, a synchronous exception or a
+  cancellation. The answer (`BuildRefused`) carries what became of it, through
+  `buildRetainedChunk` and `buildRetainedChunkWith` alike: `NoAllocation`; or
+  the buffer released with the release's answer (`AllocationReleased`), whose
+  capacity stays occupied until the backend confirms its destruction; or a
+  release that raised, a cleanup failure naming the buffer and the cause
+  (`AllocationReleaseRaised`). A synchronous exception after the buffer was
+  made is such a failure (`BuildRaised`), and so is one the buffer's
+  construction raised after making and releasing it, which names the buffer
+  (`releasedBufferOf`). `BuildBufferRefused` is the backend refusing the
+  buffer itself.
 
 **Standing.** `chunkStanding` reads, from any thread, `ChunkUploading`,
 `ChunkReady` (at once for a chunk with no cutout instance) or `ChunkFailed`
