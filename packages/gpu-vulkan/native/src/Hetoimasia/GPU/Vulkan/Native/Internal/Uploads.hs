@@ -621,7 +621,7 @@ instance Show UploadGrant where
 -- | Whether an upload of this many bytes would be admitted or reserved now,
 -- read-only: the decision 'reserveUpload' makes, so a 'Right' here and no
 -- change between is a grant there. The session must be running and admission
--- open; then 'roomIn'. Zero bytes need no room.
+-- open; then 'roomIn'.
 uploadRoom ∷ Uploads q inst msgr phys dev cmd → Natural → STM (Either UploadRefusal ())
 uploadRoom uploads bytes = fmap (const ()) <$> decideRoom uploads bytes
 
