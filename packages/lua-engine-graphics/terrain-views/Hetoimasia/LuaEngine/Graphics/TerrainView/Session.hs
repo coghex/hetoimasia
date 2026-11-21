@@ -135,7 +135,7 @@ import Hetoimasia.Render.TwoD.Material (MaterialData (..), MaterialRecord, mater
 import Hetoimasia.Render.TwoD.Metrics (PixelExtent (..), TargetMetrics (..), validMetrics)
 import Hetoimasia.Render.TwoD.Settings (defaultViewSettings)
 import Hetoimasia.Render.TwoD.Snapshot (ClearColour (..), Instance, Layer (WorldLayerWith), LayerDepth (DepthEnabled), Viewport (..))
-import Hetoimasia.Render.TwoD.Vulkan.Chunks (ChunkStanding (..), PreparedChunk)
+import Hetoimasia.Render.TwoD.Vulkan.Chunks (ChunkStanding (..), PreparedChunk, preparedBytes)
 import Hetoimasia.Render.TwoD.Vulkan.Layout (clipEntryBytes)
 import Hetoimasia.Terrain.Changes (ChangeLimits (..))
 import Hetoimasia.Terrain.Coordinate (AxisCoord, RegionCoord (..), axisValue)
@@ -380,6 +380,9 @@ data Candidate = Candidate
     -- ^ The fresh parts prepared and not yet built: the live remainder, built in this order.
   , cdFresh ∷ !Int
     -- ^ How many fresh parts the candidate needs in all, after reuse.
+  , cdLargest ∷ !(Maybe PreparedChunk)
+    -- ^ Its largest prepared part. Whether a part can ever fit the staging is the candidate's property, and the
+    -- largest decides it; a part already built fitted, so the largest of all is as good as the largest remaining.
   , cdBuilt ∷ !(Map PartKey Part)
   , cdReused ∷ !(Map PartKey Part)
   , cdCamera ∷ !CameraState
@@ -1948,7 +1951,11 @@ stepPlanning service vs serial prep copies camera box =
           then False <$ refuse service vs serial (prepBasis prep) (LimitSlots (length toBuild) recoverable)
           else case prepMetrics prep of
             Nothing → False <$ refuse service vs serial (prepBasis prep) (LimitFailure "a plan was made without a drawable extent")
-            Just metrics → writeBack service vs serial (prepBasis prep) (Building prep (Candidate plan copies (plannedAdapted planned) toBuild [] (length toBuild) Map.empty reused camera metrics demand))
+            Just metrics → writeBack service vs serial (prepBasis prep) (Building prep (Candidate plan copies (plannedAdapted planned) toBuild [] (length toBuild) Nothing Map.empty reused camera metrics demand))
+
+-- The element with the greatest key, if any.
+maximumOn ∷ Ord b ⇒ (a → b) → [a] → Maybe a
+maximumOn key = foldr (\x best → Just (maybe x (\y → if key x >= key y then x else y) best)) Nothing
 
 -- Time the owner's own pure work, into the current frame's and the current step's planning totals.
 {-# NOINLINE timed #-}
@@ -2017,7 +2024,9 @@ stepBuilding service hands vs serial prep candidate
         Right parts → atomically $ do
           stage ← readTVar (vsStage vs)
           case stage of
-            Building p c → writeBack service vs serial basis (Building p c {cdWanted = rest, cdPrepared = cdPrepared c <> parts})
+            Building p c →
+              let largest = maximumOn preparedBytes (maybe id (:) (cdLargest c) [part | (_, part, _, _) ← parts])
+               in writeBack service vs serial basis (Building p c {cdWanted = rest, cdPrepared = cdPrepared c <> parts, cdLargest = largest})
             _ → pure False
     -- One decision for the candidate ('nextPart'), taken in one transaction that finds the work still current: a
     -- failed or missing built part refuses it; all built and ready, with publication room, it publishes; otherwise the
@@ -2099,8 +2108,9 @@ stepBuilding service hands vs serial prep candidate
 -- first, whatever the next part's admission. All built: publication once every part is ready and two earlier drawable
 -- revisions do not hold it back. Otherwise impossibility: the remainder exceeds the target's free slots and those that
 -- can still come free independently of this candidate (each counted once; the displayed revision, reused parts, the
--- candidate's own built prefix and permanent losses are not among them), or a remaining part is larger than the whole
--- staging. Then a free slot, and the uploads' room and a reference for the next part.
+-- candidate's own built prefix and permanent losses are not among them), or its largest part is larger than the whole
+-- staging. Then a free slot, and the uploads' room and a reference for the next part. Beyond the built parts'
+-- standings, no work here grows with the candidate: the uploads are asked about two parts.
 nextPart ∷ Ord k ⇒ TerrainViews k → ViewState k → Candidate → (PreparedChunk → STM (Either Admission a)) → STM (NextPart a)
 nextPart service vs candidate admitNext = do
   standings ← forM (Map.elems (cdBuilt candidate)) (ownerStanding owner . partChunk)
@@ -2111,13 +2121,15 @@ nextPart service vs candidate admitNext = do
       [] → do
         room ← (< 2) . Set.size <$> pinsKept service vs
         pure (if all (== Just ChunkReady) standings && room then NextPublish else NextBlocked)
-      remaining@((_, first, _, _) : _) → do
+      (_, first, _, _) : _ → do
         free ← freeSlots service vs
         recoverable ← recoverableSlots service vs
-        rooms ← forM remaining (\(_, part, _, _) → ownerRoom owner part)
+        -- two probes, whatever the candidate's size: the largest part (whether any can ever fit) and the next
+        largest ← maybe (pure (Right ())) (ownerRoom owner) (cdLargest candidate)
+        let remaining = cdFresh candidate - Map.size (cdBuilt candidate)
         if
-          | length remaining > recoverable → pure (NextImpossible (cdFresh candidate) (recoverable + Map.size (cdBuilt candidate)))
-          | why : _ ← [why | Left (AdmitOversized why) ← rooms] → pure (NextOversized why)
+          | remaining > recoverable → pure (NextImpossible (cdFresh candidate) (recoverable + Map.size (cdBuilt candidate)))
+          | Left (AdmitOversized why) ← largest → pure (NextOversized why)
           | free <= 0 → pure NextBlocked
           | otherwise →
               admitNext first <&> \case
