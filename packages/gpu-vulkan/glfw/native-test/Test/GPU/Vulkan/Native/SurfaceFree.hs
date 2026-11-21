@@ -257,6 +257,7 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , awaitUploadTicket
   , copyLevelToReadback
   , submitVulkanUpload
+  , UploadsUnavailable (UploadsNotReady)
   , vulkanUploadRoom
   , reserveVulkanUpload
   , submitVulkanGranted
@@ -288,7 +289,6 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , beginRenderingWithDepth
   , clearDepthRect
   , depthTested
-  , UploadRefusal (..)
   , VulkanUploadRefusal (..)
   , requestVulkanRelease
   )
@@ -2089,8 +2089,9 @@ retainedHost vulkan =
         , Render.abandonRoom = abandonVulkanGrant vulkan
         }
     answered = \case
-      Left (VulkanUploadRefused refusal) → Left refusal
-      Left (VulkanUploadsUnavailable _) → Left UploadClosed
+      Left (VulkanUploadRefused refusal) → Left (Render.BufferUploadRefused refusal)
+      Left (VulkanUploadsUnavailable UploadsNotReady) → Left Render.BufferUploadsNotReady
+      Left (VulkanUploadsUnavailable unavailable) → Left (Render.BufferUploadsUnavailable (tshow unavailable))
       Right value → Right value
 
 -- | The ordered path's evidence host over this suite's session: owner-thread

@@ -54,13 +54,13 @@ import Hetoimasia.Render.TwoD.Target.Backend (targetRef)
 import Hetoimasia.Render.TwoD.Validation (Location (..), Reason (..), ValidSnapshot, validLayers, validateSnapshot, validateSnapshotWith)
 import qualified Hetoimasia.Render.TwoD.Validation as Validation
 import qualified Hetoimasia.Render.TwoD.Vulkan as Render
-import Hetoimasia.Render.TwoD.Vulkan.Builders (BufferUploads (..), Builders (..))
+import Hetoimasia.Render.TwoD.Vulkan.Builders (BufferUploadRefusal (..), BufferUploads (..), Builders (..))
 import Hetoimasia.Render.TwoD.Vulkan.Chunks
 import Hetoimasia.Render.TwoD.Vulkan.Frame
 import Hetoimasia.Render.TwoD.Vulkan.Textures (MarkPolicy (..), registeredMarks)
 import Hetoimasia.Render.TwoD.Vulkan.Window
 import Numeric.Natural (Natural)
-import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldSatisfy)
+import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldReturn, shouldSatisfy)
 import Test.Support.Owned (withOwnedThread)
 import Test.Render.TwoD.Vulkan.Environment
 import Test.Render.TwoD.Vulkan.StandIn
@@ -190,6 +190,12 @@ trackedBuilders setup =
 -- | Build a chunk of this kind with the art marked, answering a refusal's cause.
 buildChunkOf ∷ Setup → ChunkKind → [Instance] → IO (Either BuildRefusal ChunkRef)
 buildChunkOf setup kind instances = either (Left . buildRefusal) Right <$> buildRetainedChunk (trackedBuilders setup) (setupRetained setup) artMarks kind DeriveBounds instances
+
+-- | A grant for a chunk of this depth layer, admitted into the setup's registry and uploads.
+admittedGrant ∷ Setup → [Instance] → IO ChunkGrant
+admittedGrant setup instances = do
+  prepared ← either (fail . show) pure (prepareRetainedChunk artMarks ChunkWorldDepth DeriveBounds Map.empty instances)
+  atomically (admitRetainedChunk (bufferUploads (trackedBuilders setup)) (setupRetained setup) prepared) >>= either (fail . show) pure
 
 -- | The uploads' reservations not yet spent or abandoned.
 reservedOf ∷ Setup → IO Int
@@ -372,7 +378,7 @@ refusalSpec = describe "refusing a build" $ do
       length <$> readIORef (trackedMade (setupTracked setup)) >>= (`shouldBe` 8)
       settleUploads (setupRig setup)
       -- admitted, then its upload refused after the buffer was made: that buffer released, the grant given back
-      let refusing = (trackedBuilders setup) {bufferUploads = (bufferUploads (trackedBuilders setup)) {uploadGranted = \_ _ _ → pure (Left UploadClosed)}}
+      let refusing = (trackedBuilders setup) {bufferUploads = (bufferUploads (trackedBuilders setup)) {uploadGranted = \_ _ _ → pure (Left (BufferUploadRefused UploadClosed))}}
       answer ← withRecords refusing [cutAt 0 1]
       made ← readIORef (trackedMade (setupTracked setup))
       case answer of
@@ -387,7 +393,7 @@ refusalSpec = describe "refusing a build" $ do
       let raising =
             (trackedBuilders setup)
               { releaseBuffer = \buffer → atomicModifyIORef' calls (\held → (held <> [buffer], ())) >> throwIO (ErrorCall "the release raised")
-              , bufferUploads = (bufferUploads (trackedBuilders setup)) {uploadGranted = \_ _ _ → pure (Left UploadClosed)}
+              , bufferUploads = (bufferUploads (trackedBuilders setup)) {uploadGranted = \_ _ _ → pure (Left (BufferUploadRefused UploadClosed))}
               }
       answer ← buildRetainedChunk raising (setupRetained setup) artMarks ChunkWorldDepth DeriveBounds [cutAt 0 1]
       made ← readIORef (trackedMade (setupTracked setup))
@@ -411,19 +417,96 @@ refusalSpec = describe "refusing a build" $ do
       (uploadsUnsettled after, uploadsReserved after) `shouldBe` (uploadsUnsettled before, uploadsReserved before)
       length <$> readIORef (trackedMade (setupTracked setup)) >>= (`shouldBe` 8)
 
-  it "releases the buffer when the build is interrupted by an exception after it was made, leaving nothing registered" $
+  it "releases the buffer when the build is interrupted after it was made, handing over the buffer and its release before the interruption goes on, and leaving nothing registered" $
     withSetup $ \setup → do
-      writeIORef (trackedFail (setupTracked setup)) True
-      outcome ← try (buildChunkOf setup ChunkWorldDepth [cutAt 0 1])
-      case outcome of
+      handed ← newIORef []
+      let interruptedWith builders' = do
+            writeIORef (trackedFail (setupTracked setup)) True
+            grant ← admittedGrant setup [cutAt 0 1]
+            try (spendChunkGrant builders' (setupRetained setup) grant (\refused → atomicModifyIORef' handed (\held → (held <> [refused], ()))))
+      -- the release succeeds: its destruction is pending, and the buffer is handed over with it
+      interruptedWith (trackedBuilders setup) >>= \case
         Left ThreadKilled → pure ()
-        Left other → expectationFailure ("a different exception: " <> show other)
-        Right answer → expectationFailure ("expected an exception, found " <> show answer)
+        other → expectationFailure ("expected the interruption, found " <> show (fmap (const ()) other))
       made ← readIORef (trackedMade (setupTracked setup))
-      released ← readIORef (trackedReleased (setupTracked setup))
-      (length made, released) `shouldBe` (1, made)
+      readIORef (trackedReleased (setupTracked setup)) >>= (`shouldBe` made)
+      readIORef handed >>= \case
+        [BuildRefused (BuildRaised _) (AllocationReleased buffer (Right ()))] → [buffer] `shouldBe` made
+        other → expectationFailure ("expected the released buffer handed over, found " <> show other)
+      -- the release raises: the buffer is handed over with the release's cause
+      writeIORef handed []
+      let raising = (trackedBuilders setup) {releaseBuffer = \_ → throwIO (ErrorCall "the release raised")}
+      interruptedWith raising >>= \case
+        Left ThreadKilled → pure ()
+        other → expectationFailure ("expected the interruption, found " <> show (fmap (const ()) other))
+      second ← drop 1 <$> readIORef (trackedMade (setupTracked setup))
+      readIORef handed >>= \case
+        [BuildRefused (BuildRaised _) (AllocationReleaseRaised buffer cause)] → do
+          [buffer] `shouldBe` second
+          cause `shouldSatisfy` Text.isInfixOf "the release raised"
+        other → expectationFailure ("expected the buffer handed over with its release's cause, found " <> show other)
       reservedOf setup >>= (`shouldBe` 0)
       liveChunks (setupRetained setup) >>= (`shouldBe` [])
+
+  it "binds a grant to the registry that issued it: another registry can neither spend nor give it back" $
+    withSetup $ \setup → do
+      other ← newRetained
+      grant ← admittedGrant setup [cutAt 0 1]
+      atomically (abandonChunkGrant other grant)
+      reservedOf setup >>= (`shouldBe` 1)
+      spendChunkGrant (trackedBuilders setup) other grant (\_ → pure ()) >>= \case
+        Left (BuildRefused BuildGrantSpent NoAllocation) → pure ()
+        answer → expectationFailure ("expected a foreign spend refused, found " <> show answer)
+      readIORef (trackedMade (setupTracked setup)) >>= (`shouldBe` [])
+      liveChunks other >>= (`shouldBe` [])
+      -- the other registry's own build takes its own first reference
+      ours ← either (fail . show) pure =<< buildRetainedChunk (trackedBuilders setup) other artMarks ChunkUi DeriveBounds [ordAt 0 1]
+      -- the original reservation is intact and spends in its own registry
+      reference ← either (fail . show) pure =<< spendChunkGrant (trackedBuilders setup) (setupRetained setup) grant (\_ → pure ())
+      liveChunks (setupRetained setup) >>= (`shouldBe` [reference])
+      liveChunks other >>= (`shouldBe` [ours])
+
+  it "keeps a grant's capacity the spend's once it is spending: an abandonment while its buffer is made frees nothing, and a competing build is refused" $
+    withSetup $ \setup → do
+      _ ← mapM (\i → built setup ChunkWorldDepth [cutAt (fromIntegral (i ∷ Int)) 1]) [1 .. 7]
+      grant ← admittedGrant setup [cutAt 0 1]
+      competing ← either (fail . show) pure (prepareRetainedChunk artMarks ChunkWorldDepth DeriveBounds Map.empty [cutAt 9 1])
+      seen ← newIORef Nothing
+      -- while the spend makes its buffer (on this, the owner's thread), the grant is abandoned and a competing chunk
+      -- asks for the same room
+      let holding =
+            (trackedBuilders setup)
+              { buildVertexBuffer = \bytes → do
+                  atomically (abandonChunkGrant (setupRetained setup) grant)
+                  reserved ← reservedOf setup
+                  rival ← atomically (admitRetainedChunk (bufferUploads (trackedBuilders setup)) (setupRetained setup) competing)
+                  writeIORef seen (Just (reserved, either Left (const (Right ())) rival))
+                  buildVertexBuffer (trackedBuilders setup) bytes
+              }
+      _ ← spendChunkGrant holding (setupRetained setup) grant (\_ → pure ()) >>= either (fail . show) pure
+      readIORef seen >>= \case
+        Just (1, Left (BuildUploadBackpressure _)) → pure ()
+        other → expectationFailure ("expected the reservation kept and the competing chunk refused, found " <> show other)
+      reservedOf setup >>= (`shouldBe` 0)
+
+  it "answers uploads awaiting their startup as a refusal that can change, and uploads the host lacks with their cause" $
+    withSetup $ \setup → do
+      ready ← newTVarIO False
+      let base = bufferUploads (builders (setupRig setup))
+          awaiting =
+            base
+              { roomFor = \bytes → readTVar ready >>= \up → if up then roomFor base bytes else pure (Left BufferUploadsNotReady)
+              , reserveRoom = \bytes → readTVar ready >>= \up → if up then reserveRoom base bytes else pure (Left BufferUploadsNotReady)
+              }
+          lacking cause = base {roomFor = \_ → pure (Left (BufferUploadsUnavailable cause)), reserveRoom = \_ → pure (Left (BufferUploadsUnavailable cause))}
+          prepared = either (error . show) id (prepareRetainedChunk artMarks ChunkWorldDepth DeriveBounds Map.empty [cutAt 0 1])
+          admit uploads = fmap (const ()) <$> atomically (admitRetainedChunk uploads (setupRetained setup) prepared)
+      admit awaiting `shouldReturn` Left BuildUploadsNotReady
+      atomically (chunkRoom (roomFor awaiting) (setupRetained setup) (preparedBytes prepared)) `shouldReturn` Left BuildUploadsNotReady
+      atomically (writeTVar ready True)
+      admit awaiting `shouldReturn` Right ()
+      admit (lacking "the host configured no uploads") `shouldReturn` Left (BuildUploadsUnavailable "the host configured no uploads")
+      admit (lacking "the device refused the uploads: out of memory") `shouldReturn` Left (BuildUploadsUnavailable "the device refused the uploads: out of memory")
 
   it "ends the chunk's reference when it is released, whether its upload had completed or not, reusing the index under the next generation" $
     withSetup $ \setup → do

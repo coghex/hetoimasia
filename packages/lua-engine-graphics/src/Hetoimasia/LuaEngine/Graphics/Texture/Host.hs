@@ -34,6 +34,7 @@ module Hetoimasia.LuaEngine.Graphics.Texture.Host
   , hostPort
   , hostBuilders
   , hostBufferUploads
+  , hostUploadAnswer
   , renderBuilders
   ) where
 
@@ -72,6 +73,7 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , VulkanAction (..)
   , VulkanHost (..)
   , VulkanUploadRefusal (..)
+  , UploadsUnavailable (..)
   , cancelVulkanUpload
   , constructBlendedCheckedPipeline
   , constructBuffer
@@ -107,7 +109,7 @@ import Hetoimasia.LuaEngine.Graphics.Scene.Ledger (SceneLedger, ledgerHeld)
 import Hetoimasia.Render.TwoD.Vulkan.Chunks (Retained, newRetained)
 import Hetoimasia.LuaEngine.Graphics.Texture.Port
 import qualified Hetoimasia.Render.TwoD.Vulkan as Render
-import Hetoimasia.Render.TwoD.Vulkan.Builders (BufferUploads (..), Builders (..), noBufferUploads)
+import Hetoimasia.Render.TwoD.Vulkan.Builders (BufferUploadRefusal (..), BufferUploads (..), Builders (..), noBufferUploads)
 import Hetoimasia.Render.TwoD.Vulkan.Textures
   ( MarkPolicy (DefaultMark)
   , TextureRefusal (..)
@@ -148,20 +150,26 @@ hostBuilders ∷ VulkanHost scene → Construction q inst msgr phys dev cmd → 
 hostBuilders host construction = (renderBuilders construction) {bufferUploads = hostBufferUploads host}
 
 -- | The host's bounded uploads as a retained chunk's build reaches them, from any thread: room observed or reserved
--- under the owner's gate, in the caller's transaction. Uploads the host does not have are closed to it.
+-- under the owner's gate, in the caller's transaction, answered as 'hostUploadAnswer' says.
 hostBufferUploads ∷ VulkanHost scene → BufferUploads
 hostBufferUploads host =
   BufferUploads
-    { roomFor = fmap answered . vulkanUploadRoom host
-    , reserveRoom = fmap answered . reserveVulkanUpload host
-    , uploadGranted = \grant buffer bytes → answered <$> submitVulkanGranted host grant buffer bytes
+    { roomFor = fmap hostUploadAnswer . vulkanUploadRoom host
+    , reserveRoom = fmap hostUploadAnswer . reserveVulkanUpload host
+    , uploadGranted = \grant buffer bytes → hostUploadAnswer <$> submitVulkanGranted host grant buffer bytes
     , abandonRoom = abandonVulkanGrant host
     }
-  where
-    answered = \case
-      Right value → Right value
-      Left (VulkanUploadRefused refusal) → Left refusal
-      Left (VulkanUploadsUnavailable _) → Left UploadClosed
+
+-- | The host's upload answer as a chunk's build reads it: uploads configured and awaiting the device are not ready
+-- (their startup can make them); none configured, or a startup the device refused, is unavailable with its cause;
+-- every other refusal is the uploads' own.
+hostUploadAnswer ∷ Either VulkanUploadRefusal a → Either BufferUploadRefusal a
+hostUploadAnswer = \case
+  Right value → Right value
+  Left (VulkanUploadRefused refusal) → Left (BufferUploadRefused refusal)
+  Left (VulkanUploadsUnavailable UploadsNotReady) → Left BufferUploadsNotReady
+  Left (VulkanUploadsUnavailable UploadsNotConfigured) → Left (BufferUploadsUnavailable "the host configured no uploads")
+  Left (VulkanUploadsUnavailable (UploadsRefusedBy refusal)) → Left (BufferUploadsUnavailable ("the device refused the uploads: " <> Text.pack (show refusal)))
 
 -- | The same constructions for a frame's recording, which admits no buffer upload: the M1 scene retains no
 -- chunk, so nothing records into a chunk's buffer. A frame hook is given a 'Construction' and no host.

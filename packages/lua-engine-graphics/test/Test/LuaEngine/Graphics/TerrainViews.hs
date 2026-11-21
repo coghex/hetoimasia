@@ -26,7 +26,9 @@ import GHC.Stats (RTSStats (..), getRTSStats, getRTSStatsEnabled)
 import Hetoimasia.Foundation.Log (callbackSink, defaultLogFilter, mkLogger)
 import Hetoimasia.Foundation.Messaging.Payload (prepare, preparedValue)
 import Hetoimasia.Foundation.Worker (withWorkerGroup)
-import Hetoimasia.GPU.Vulkan.GLFW (TicketState (..), UploadState (UploadLost))
+import Hetoimasia.GPU.Vulkan.GLFW (Refusal (RefusedDeviceAbsent), TicketState (..), UploadRefusal (UploadClosed), UploadState (UploadLost), UploadsUnavailable (..), VulkanUploadRefusal (..))
+import Hetoimasia.LuaEngine.Graphics.Texture.Host (hostUploadAnswer)
+import Hetoimasia.Render.TwoD.Vulkan.Builders (BufferUploadRefusal (..))
 import Hetoimasia.LuaEngine.Graphics.Scene
 import Hetoimasia.LuaEngine.Graphics.TerrainView hiding (styleAssets)
 import Hetoimasia.LuaEngine.Graphics.Texture (textureHandleOf)
@@ -334,7 +336,7 @@ hands rig =
             modifyTVar' (rigGrants rig) (+ 1)
             live ← newTVar True
             let giveBack = readTVar live >>= \held → when held (writeTVar live False >> modifyTVar' (rigGrants rig) (subtract 1))
-            pure (Right (Grant (spend prepared giveBack) giveBack))
+            pure (Right (Grant (\_ → spend prepared giveBack) giveBack))
     , handDispose = \chunk → atomically $ do
         modifyTVar' (rigAttempts rig) (Map.insertWith (+) chunk 1)
         failing ← readTVar (rigDisposeFailure rig)
@@ -1463,15 +1465,25 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         atomically (configureView view noConfigure {configureZoom = Just 2}) `shouldReturn` Left ControlEnded
         atomically (configureView view noConfigure {configureLight = Just brighter}) `shouldReturn` Left ControlEnded
 
-    it "names a failed build's buffer when its destruction fails, and keeps its slot" $
+    it "names a failed build's buffer, the build's cause and the destruction's when its destruction fails, and keeps its slot across a close and reopen" $
       withRig defaultOptions {optProfile = smallProfile {profileSlots = 4, profileQuads = 2048}} $ \rig → do
-        atomically (writeTVar (rigBuildFailure rig) (Just (BuildFailed "failed after its buffer" (AllocatedDisposing "buffer 7" (pure (DisposalFailed "the device was lost"))))))
+        destruction ← newTVarIO DisposalPending
+        atomically (writeTVar (rigFailNext rig) [Just (BuildFailed "failed after its buffer" (AllocatedDisposing "buffer 7" (readTVar destruction)))])
         target ← newTarget 1
         view ← openOn rig target
         settleUntil rig (isJust . readingRefusal <$> readView view)
+        atomically (writeTVar destruction (DisposalFailed "the device was lost"))
         settleUntil rig (not . null . serviceFailures <$> readTerrainViews (rigViews rig))
+        let named reading = [cause | (1, Nothing, cause) ← serviceFailures reading, all (`Text.isInfixOf` cause) ["buffer 7", "failed after its buffer", "the device was lost"]]
+        failures ← serviceFailures <$> atomically (readTerrainViews (rigViews rig))
+        named' ← named <$> atomically (readTerrainViews (rigViews rig))
+        length named' `shouldBe` 1
+        _ ← closeView view
+        runOwner rig
+        second ← openOn rig target
+        settleUntil rig (isJust . readingRefusal <$> readView second)
         reading ← atomically (readTerrainViews (rigViews rig))
-        [cause | (1, Nothing, cause) ← serviceFailures reading] `shouldSatisfy` any (Text.isInfixOf "buffer 7")
+        serviceFailures reading `shouldBe` failures
         Map.findWithDefault 0 1 (serviceOccupied reading) `shouldBe` 1
 
     it "treats a target whose metrics have an infinite scale as of unknown geometry: no demand" $
@@ -1645,6 +1657,58 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         atomically (servicePrivate <$> reading) `shouldReturn` 0
         atomically (readingPublished <$> readView view) `shouldReturn` published
         atomically (latestWorld target) `shouldReturn` before
+
+    it "refuses a candidate one of whose built uploads fails while its next part waits for room, retiring it and keeping the drawing" $
+      withPublished defaultOptions {optProfile = smallProfile {profileSlots = 8, profileQuads = 2048}} $ \rig target view → do
+        quiesce rig target
+        let reading = readTerrainViews (rigViews rig)
+            occupied = Map.findWithDefault 0 1 . serviceOccupied <$> reading
+        before ← atomically (latestWorld target)
+        published ← atomically (readingPublished <$> readView view)
+        drawn ← Map.keysSet <$> readTVarIO (rigStandings rig)
+        -- a zoom that rebuilds every part: one is built, still uploading, and the next waits for the uploads' room
+        atomically (writeTVar (rigUploading rig) True >> writeTVar (rigAdmitBudget rig) (Just 1))
+        atomically (configureView view noConfigure {configureZoom = Just 2}) `shouldReturn` Right ()
+        settleUntil rig ((== 5) <$> occupied)
+        runOwner rig
+        attempts ← readTVarIO (rigBuildAttempts rig)
+        -- the built part's upload fails: only the watcher asks for a step
+        fresh ← filter (`Set.notMember` drawn) . Map.keys <$> readTVarIO (rigStandings rig)
+        case fresh of
+          [built] → atomically (modifyTVar' (rigStandings rig) (Map.insert built (ChunkFailed UploadLost)))
+          _ → expectationFailure ("expected one built part, found " <> show fresh)
+        settleUntil rig (isJust . readingRefusal <$> readView view)
+        atomically (readingRefusal <$> readView view) >>= (`shouldSatisfy` \case
+          Just (LimitFailure _) → True
+          _ → False)
+        settleUntil rig ((== 0) . servicePrivate <$> reading)
+        atomically occupied `shouldReturn` 4
+        readTVarIO (rigBuildAttempts rig) `shouldReturn` attempts
+        readTVarIO (rigGrants rig) `shouldReturn` 0
+        atomically (readingPublished <$> readView view) `shouldReturn` published
+        atomically (latestWorld target) `shouldReturn` before
+
+    it "settles a pending move as ended when the owner's exit begins inside the step that would settle it, before the watcher records it" $
+      withPublished defaultOptions $ \rig target view → do
+        quiesce rig target
+        counting ← newEmptyTMVarIO
+        resumed ← newEmptyTMVarIO
+        stop ← newTVarIO False
+        atomically (writeTVar (rigCountGate rig) (Just (const True, counting, resumed)))
+        Right first ← atomically (moveView view far)
+        let owner = do
+              runOwner rig
+              continue ← atomically ((False <$ (readTVar stop >>= check)) `orElse` (True <$ (readTVar (rigQueue rig) >>= check . not . Seq.null)))
+              when continue owner
+        withOwnedThread owner $ \_ ended → do
+          -- the step is under way, inside the destination's copy: the owner's exit begins now
+          _ ← timeout 10000000 (atomically (takeTMVar counting)) >>= maybe (fail "no copy was counted") pure
+          atomically (writeTVar (rigOwnerEnded rig) (Just "the owner's exit began"))
+          atomically (putTMVar resumed ())
+          eventually (isJust <$> moveSettled first)
+          atomically (writeTVar stop True)
+          ended
+        atomically (moveSettled first) `shouldReturn` Just (MoveEnded EndStopped)
 
     it "keeps a failed cleanup's buffer charged across a close and reopen, with the build's cause and the release's" $
       withRig defaultOptions {optProfile = smallProfile {profileSlots = 4, profileQuads = 2048}} $ \rig → do
@@ -1829,6 +1893,16 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         -- closed with its claim never published: returned directly, the M1 scene still shown
         _ ← closeView view
         map fst <$> readTVarIO (targetScenes target) >>= (`shouldBe` [1])
+
+  describe "the host's upload answer to a chunk's build" $
+    it "is not ready while configured uploads await the device, and keeps the cause of uploads the host lacks or the device refused" $ do
+      let answer ∷ Either VulkanUploadRefusal () → Either BufferUploadRefusal ()
+          answer = hostUploadAnswer
+      answer (Left (VulkanUploadsUnavailable UploadsNotReady)) `shouldBe` Left BufferUploadsNotReady
+      answer (Left (VulkanUploadsUnavailable UploadsNotConfigured)) `shouldBe` Left (BufferUploadsUnavailable "the host configured no uploads")
+      answer (Left (VulkanUploadsUnavailable (UploadsRefusedBy RefusedDeviceAbsent))) `shouldBe` Left (BufferUploadsUnavailable "the device refused the uploads: RefusedDeviceAbsent")
+      answer (Left (VulkanUploadRefused UploadClosed)) `shouldBe` Left (BufferUploadRefused UploadClosed)
+      answer (Right ()) `shouldBe` Right ()
 
   describe "a window's geometry" $
     it "is zero for an observed zero dimension whatever else is missing, unknown while incomplete, and an extent only when complete" $ do

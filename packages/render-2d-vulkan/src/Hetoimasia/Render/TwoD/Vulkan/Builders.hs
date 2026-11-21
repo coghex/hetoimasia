@@ -9,12 +9,14 @@
 module Hetoimasia.Render.TwoD.Vulkan.Builders
   ( Builders (..)
   , BufferUploads (..)
+  , BufferUploadRefusal (..)
   , noBufferUploads
   , bufferUploadsOf
   ) where
 
 import Control.Concurrent.STM (STM)
 import Data.ByteString (ByteString)
+import Data.Text (Text)
 import Data.Word (Word32)
 import Hetoimasia.GPU.Vulkan.Native.Recording
   ( Buffer
@@ -96,11 +98,11 @@ data Builders q inst msgr phys dev cmd = Builders
 -- the reservation is spent once by the upload that fills the buffer, or
 -- abandoned.
 data BufferUploads = BufferUploads
-  { roomFor ∷ Natural → STM (Either UploadRefusal ())
+  { roomFor ∷ Natural → STM (Either BufferUploadRefusal ())
     -- ^ Whether an upload of this many bytes would be reserved now, read-only.
-  , reserveRoom ∷ Natural → STM (Either UploadRefusal UploadGrant)
+  , reserveRoom ∷ Natural → STM (Either BufferUploadRefusal UploadGrant)
     -- ^ Reserve its queue place and staging region; a refusal reserves nothing.
-  , uploadGranted ∷ UploadGrant → Buffer → ByteString → IO (Either UploadRefusal UploadTicket)
+  , uploadGranted ∷ UploadGrant → Buffer → ByteString → IO (Either BufferUploadRefusal UploadTicket)
     -- ^ Spend the reservation on the upload that fills a fresh vertex buffer of
     -- exactly its bytes: admission copies the bytes before it returns and never
     -- waits, and the ticket says where the upload stands. A refusal leaves the
@@ -109,22 +111,37 @@ data BufferUploads = BufferUploads
     -- ^ Free an unspent reservation's room.
   }
 
+-- | Why the uploads did not answer room or an upload: the host's uploads are
+-- configured and not yet made (their startup can make them: a later attempt can
+-- succeed); the host has none, or their startup failed, with its cause (no wait
+-- changes it); or the uploads themselves refused, as they say.
+data BufferUploadRefusal
+  = BufferUploadsNotReady
+  | BufferUploadsUnavailable !Text
+  | BufferUploadRefused !UploadRefusal
+  deriving (Eq, Show)
+
 -- | Uploads that admit nothing: a construction that records no chunk's buffer.
 noBufferUploads ∷ BufferUploads
 noBufferUploads =
   BufferUploads
-    { roomFor = \_ → pure (Left UploadClosed)
-    , reserveRoom = \_ → pure (Left UploadClosed)
-    , uploadGranted = \_ _ _ → pure (Left UploadClosed)
+    { roomFor = \_ → pure closed
+    , reserveRoom = \_ → pure closed
+    , uploadGranted = \_ _ _ → pure closed
     , abandonRoom = \_ → pure ()
     }
+  where
+    closed = Left (BufferUploadRefused UploadClosed)
 
 -- | A session's own uploads, ungated.
 bufferUploadsOf ∷ Uploads q inst msgr phys dev cmd → BufferUploads
 bufferUploadsOf uploads =
   BufferUploads
-    { roomFor = uploadRoom uploads
-    , reserveRoom = reserveUpload uploads
-    , uploadGranted = \grant buffer bytes → submitUploadGranted (pure Nothing) uploads grant buffer bytes
+    { roomFor = fmap refused . uploadRoom uploads
+    , reserveRoom = fmap refused . reserveUpload uploads
+    , uploadGranted = \grant buffer bytes → refused <$> submitUploadGranted (pure Nothing) uploads grant buffer bytes
     , abandonRoom = abandonUploadGrant uploads
     }
+  where
+    refused ∷ Either UploadRefusal a → Either BufferUploadRefusal a
+    refused = either (Left . BufferUploadRefused) Right

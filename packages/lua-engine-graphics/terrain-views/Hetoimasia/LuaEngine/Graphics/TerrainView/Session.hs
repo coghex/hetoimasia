@@ -399,6 +399,8 @@ data NextPart a
   | NextImpossible !Int !Int
   | NextOversized !Text
   | NextEnded !Text
+  | NextFailed !Text
+  | NextPublish
 
 -- | A plan a view keeps for its target: the drawn revision's and one successor's.
 data Pinned = Pinned
@@ -516,7 +518,8 @@ type Held k = (k, Word64, ChunkRef)
 -- target and view.
 data Disposal k
   = DisposeChunk !(Held k)
-  | DisposeAllocation !k !Word64 !Text
+  | DisposeAllocation !k !Word64 !Text !Text
+    -- ^ A failed build's buffer: its target, view, identity and the build's own cause.
 
 data TerrainViews k = TerrainViews
   { svConfig ∷ !TerrainViewsConfig
@@ -1183,7 +1186,7 @@ closeView (TerrainView service vs) =
         building ← (> 0) <$> readTVar (vsBuilding vs)
         let ofView = \case
               DisposeChunk (_, v, _) → v == vsId vs
-              DisposeAllocation _ v _ → v == vsId vs
+              DisposeAllocation _ v _ _ → v == vsId vs
         pure (if building || any ((== vsId vs) . rtView) retiring || any (\(_, v, _) → v == vsId vs) held || any ofView disposing then CloseRetiring else CloseDone)
 
 -- End a view, once: 'False' when it had already ended. The transaction does every state change; the terrain service's
@@ -1370,6 +1373,7 @@ reconcileDemand service vs = do
   usable ← vtUsable (vsTarget vs)
   authority ← authorityOf vs
   arena ← Runtime.inspectArenaSTM (portTerrain (svPorts service)) (vsLease vs)
+  gone ← ownerEnded (portOwner (svPorts service))
   geometry ← vtGeometry (vsTarget vs)
   accepted ← readTVar (vsPublished vs)
   installed ← readTVar (vsAsked vs)
@@ -1377,7 +1381,7 @@ reconcileDemand service vs = do
         GeometryExtent _ → maybe [] accDemand accepted
         _ → []
       -- an ending (a revoked authority or lease, a retired target) is the step's to settle, never a demand refusal
-      live = status == ViewOpen && open && isNothing ended && usable && authority && isJust arena
+      live = status == ViewOpen && open && isNothing ended && isNothing gone && usable && authority && isJust arena
   if not live || desired == installed
     then pure False
     else do
@@ -1603,12 +1607,14 @@ stillCurrent service vs serial basis jump = do
   status ← readTVar (vsStatus vs)
   open ← readTVar (svOpen service)
   ended ← readTVar (svEnded service)
+  -- the graphics owner's own gate, live: work an owner step carries past its exit's start is stale
+  gone ← ownerEnded (portOwner (svPorts service))
   usable ← vtUsable (vsTarget vs)
   authority ← authorityOf vs
   arena ← Runtime.inspectArenaSTM (portTerrain (svPorts service)) (vsLease vs)
   now ← currentBasis service vs
   pending ← fmap pendingId . camPending <$> readTVar (vsCamera vs)
-  pure (current && status == ViewOpen && open && isNothing ended && usable && authority && isJust arena && now == basis && maybe True (== pending) jump)
+  pure (current && status == ViewOpen && open && isNothing ended && isNothing gone && usable && authority && isJust arena && now == basis && maybe True (== pending) jump)
 
 -- | The view's original authority, as its open checked it: the caller's lease of the target and of the style's parents.
 authorityOf ∷ ViewState k → STM Bool
@@ -1993,34 +1999,17 @@ candidateOf service style plan light = do
 stepBuilding ∷ (Ord k, Show k) ⇒ TerrainViews k → Hands → ViewState k → Word64 → Prep → Candidate → IO Bool
 stepBuilding service hands vs serial prep candidate
   | not (null (cdWanted candidate)) = prepareParts
-  | not (null (cdPrepared candidate)) = builds (profileBuilds (tvProfile (svConfig service)))
-  | otherwise = do
-      -- every part built: publication once all are ready and two earlier drawable revisions do not hold it back; a
-      -- failed or missing part retires the private candidate. Otherwise the view is armed on the same reading.
-      (failed, publishable) ← atomically $ do
-        standings ← forM (Map.elems (cdBuilt candidate)) (ownerStanding owner . partChunk)
-        room ← (< 2) . Set.size <$> pinsKept service vs
-        let failures = [standing | standing ← standings, failedStanding standing]
-            ready = all (== Just ChunkReady) standings && room
-        when (null failures && not ready) (writeTVar (vsArmed vs) True)
-        pure (failures, ready)
-      if
-        | not (null failed) → False <$ atomically (refuse service vs serial basis (LimitFailure ("a chunk's upload ended without completing: " <> Text.pack (show failed))))
-        | publishable → publish service vs serial prep candidate
-        | otherwise → pure False
+  | otherwise = builds (profileBuilds (tvProfile (svConfig service)))
   where
-    owner = portOwner (svPorts service)
     basis = prepBasis prep
     tkey = vtKey (vsTarget vs)
-    failedStanding = \case
-      Just (ChunkFailed _) → True
-      Nothing → True
-      _ → False
     -- At most 'profileBuilds' parts are prepared in one step, on the owner (the renderer routes and encodes them, and
     -- nothing is reserved); every part is prepared before the first is admitted, so the whole remainder is known.
     prepareParts = do
       let (batch, rest) = splitAt (profileBuilds (tvProfile (svConfig service))) (cdWanted candidate)
-      prepared ← forM batch $ \(key, instances, records) → fmap (\part → (key, part, instances, records)) <$> handPrepare hands instances records
+      -- each part's description and encoding are evaluated here, within this step's bound
+      prepared ← forM batch $ \(key, instances, records) →
+        handPrepare hands instances records >>= traverse evaluate <&> fmap (\part → (key, part, instances, records))
       case sequence prepared of
         Left why → False <$ atomically (refuse service vs serial basis (LimitFailure ("a chunk could not be prepared: " <> why)))
         Right parts → atomically $ do
@@ -2028,10 +2017,12 @@ stepBuilding service hands vs serial prep candidate
           case stage of
             Building p c → writeBack service vs serial basis (Building p c {cdWanted = rest, cdPrepared = cdPrepared c <> parts})
             _ → pure False
-    -- Each build first takes, in one transaction that finds the work still current, the target's slot, the renderer's
-    -- reference and the uploads' room for the next part ('nextPart'); a refused grant takes none of them. The granted
-    -- build then makes, fills and registers the chunk, and hands it to the candidate (or, the work stale, to
-    -- disposal) in the transaction after it.
+    -- One decision for the candidate ('nextPart'), taken in one transaction that finds the work still current: a
+    -- failed or missing built part refuses it; all built and ready, with publication room, it publishes; otherwise the
+    -- next part's admission. A grant takes the target's slot, the renderer's reference and the uploads' room together
+    -- (a refused grant takes none of them); the granted build then makes, fills and registers the chunk, and hands it
+    -- to the candidate (or, the work stale, to disposal) in the transaction after it. Blocked, the view is armed in
+    -- the deciding transaction.
     builds 0 = pure True
     builds n = do
       outcome ← mask $ \_ → do
@@ -2040,25 +2031,34 @@ stepBuilding service hands vs serial prep candidate
           live ← stillCurrent service vs serial basis Nothing
           stage ← readTVar (vsStage vs)
           case stage of
-            Building _ c@Candidate {cdPrepared = (key, _, instances, records) : _} | current && live → do
+            Building _ c | current && live → do
               next ← nextPart service vs c (handReserve hands)
               case next of
                 NextGranted _ → occupy service tkey 1 >> modifyTVar' (vsBuilding vs) (+ 1)
                 NextBlocked → writeTVar (vsArmed vs) True
                 _ → pure ()
-              pure (Just (key, instances, records, next))
+              pure (Just (c, next))
             _ → pure Nothing
         case decided of
           Nothing → pure (Just True)
-          Just (key, instances, records, NextGranted grant) →
-            (grantSpend grant `onException` atomically (grantAbandon grant >> raisedBuild)) >>= \case
-              Left failure@(BuildFailed why _) →
-                Just False <$ atomically (refusedBuild failure >> refuse service vs serial basis (LimitFailure ("a chunk could not be built: " <> why)))
-              Right chunk → Nothing <$ atomically (handOn key (Part chunk instances records))
-          Just (_, _, _, NextBlocked) → pure (Just False)
-          Just (_, _, _, NextImpossible need have) → Just False <$ atomically (refuse service vs serial basis (LimitSlots need have))
-          Just (_, _, _, NextOversized why) → Just False <$ atomically (refuse service vs serial basis (LimitOversized why))
-          Just (_, _, _, NextEnded why) → Just False <$ atomically (refuse service vs serial basis (LimitFailure ("a chunk could not be admitted: " <> why)))
+          Just (c, NextGranted grant) → case cdPrepared c of
+            (key, _, instances, records) : _ → do
+              -- an exception or cancellation hands over what became of the buffer before it goes on; with nothing
+              -- handed over, whether a buffer was made is not known
+              handed ← newTVarIO False
+              let handOver failure = atomically (writeTVar handed True >> refusedBuild failure)
+                  unknown = readTVar handed >>= \done → unless done (grantAbandon grant >> raisedBuild)
+              (grantSpend grant handOver `onException` atomically unknown) >>= \case
+                Left failure@(BuildFailed why _) →
+                  Just False <$ atomically (refusedBuild failure >> refuse service vs serial basis (LimitFailure ("a chunk could not be built: " <> why)))
+                Right chunk → Nothing <$ atomically (handOn key (Part chunk instances records))
+            [] → Just False <$ atomically (grantAbandon grant >> unreserve)
+          Just (c, NextPublish) → Just <$> publish service vs serial prep c
+          Just (_, NextBlocked) → pure (Just False)
+          Just (_, NextFailed why) → Just False <$ atomically (refuse service vs serial basis (LimitFailure ("a chunk's upload ended without completing: " <> why)))
+          Just (_, NextImpossible need have) → Just False <$ atomically (refuse service vs serial basis (LimitSlots need have))
+          Just (_, NextOversized why) → Just False <$ atomically (refuse service vs serial basis (LimitOversized why))
+          Just (_, NextEnded why) → Just False <$ atomically (refuse service vs serial basis (LimitFailure ("a chunk could not be admitted: " <> why)))
       case outcome of
         Nothing → builds (n - 1 ∷ Int)
         Just more → pure more
@@ -2069,7 +2069,7 @@ stepBuilding service hands vs serial prep candidate
       NotAllocated → unreserve
       AllocatedDisposing identity reading → do
         modifyTVar' (vsBuilding vs) (subtract 1)
-        modifyTVar' (svDisposing service) (<> [(DisposeAllocation tkey (vsId vs) identity, reading)])
+        modifyTVar' (svDisposing service) (<> [(DisposeAllocation tkey (vsId vs) identity primary, reading)])
       AllocatedFailed why → do
         modifyTVar' (vsBuilding vs) (subtract 1)
         modifyTVar' (svFailed service) (<> [(tkey, Nothing, "the build failed (" <> primary <> "), and " <> why)])
@@ -2092,52 +2092,56 @@ stepBuilding service hands vs serial prep candidate
           privately service vs [partChunk part]
           unless live (discardStale service vs serial)
 
--- The next part's admission. Impossibility comes first: the remainder exceeds the target's free slots and those that
+-- The candidate's one decision, which the owner takes (reserving through @admitNext@, with the slot, in the caller's
+-- transaction) and the watcher observes (through the same decision, read-only). A failed or missing built part comes
+-- first, whatever the next part's admission. All built: publication once every part is ready and two earlier drawable
+-- revisions do not hold it back. Otherwise impossibility: the remainder exceeds the target's free slots and those that
 -- can still come free independently of this candidate (each counted once; the displayed revision, reused parts, the
 -- candidate's own built prefix and permanent losses are not among them), or a remaining part is larger than the whole
--- staging. Then a free slot, and the uploads' room and a reference for the next part: what the owner reserves through
--- @admitNext@ (with the slot, in the caller's transaction) is what the watcher observes through the same decision.
+-- staging. Then a free slot, and the uploads' room and a reference for the next part.
 nextPart ∷ Ord k ⇒ TerrainViews k → ViewState k → Candidate → (PreparedChunk → STM (Either Admission a)) → STM (NextPart a)
-nextPart service vs candidate admitNext = case cdPrepared candidate of
-  [] → pure NextBlocked
-  remaining@((_, first, _, _) : _) → do
-    free ← freeSlots service vs
-    recoverable ← recoverableSlots service vs
-    rooms ← forM remaining (\(_, part, _, _) → ownerRoom (portOwner (svPorts service)) part)
-    if
-      | length remaining > recoverable → pure (NextImpossible (cdFresh candidate) (recoverable + Map.size (cdBuilt candidate)))
-      | why : _ ← [why | Left (AdmitOversized why) ← rooms] → pure (NextOversized why)
-      | free <= 0 → pure NextBlocked
-      | otherwise →
-          admitNext first <&> \case
-            Right granted → NextGranted granted
-            Left (AdmitLater _) → NextBlocked
-            Left (AdmitOversized why) → NextOversized why
-            Left (AdmitNever why) → NextEnded why
-
--- Whether an armed view's candidate can go on, read as the owner decides it: a part still to prepare; the next part's
--- admission no longer blocked; or every part built and either one failed or missing, or all ready with publication
--- room. Any other stage than building: yes (whatever replaced it asked for its own step).
-buildActionable ∷ Ord k ⇒ TerrainViews k → ViewState k → STM Bool
-buildActionable service vs =
-  readTVar (vsStage vs) >>= \case
-    Building _ candidate
-      | not (null (cdWanted candidate)) → pure True
-      | not (null (cdPrepared candidate)) →
-          nextPart service vs candidate (fmap (fmap (const ())) . ownerRoom owner) <&> \case
-            NextBlocked → False
-            _ → True
-      | otherwise → do
-          standings ← forM (Map.elems (cdBuilt candidate)) (ownerStanding owner . partChunk)
-          room ← (< 2) . Set.size <$> pinsKept service vs
-          pure (any ended standings || (all (== Just ChunkReady) standings && room))
-    _ → pure True
+nextPart service vs candidate admitNext = do
+  standings ← forM (Map.elems (cdBuilt candidate)) (ownerStanding owner . partChunk)
+  let failures = [standing | standing ← standings, ended standing]
+  if not (null failures)
+    then pure (NextFailed (Text.pack (show failures)))
+    else case cdPrepared candidate of
+      [] → do
+        room ← (< 2) . Set.size <$> pinsKept service vs
+        pure (if all (== Just ChunkReady) standings && room then NextPublish else NextBlocked)
+      remaining@((_, first, _, _) : _) → do
+        free ← freeSlots service vs
+        recoverable ← recoverableSlots service vs
+        rooms ← forM remaining (\(_, part, _, _) → ownerRoom owner part)
+        if
+          | length remaining > recoverable → pure (NextImpossible (cdFresh candidate) (recoverable + Map.size (cdBuilt candidate)))
+          | why : _ ← [why | Left (AdmitOversized why) ← rooms] → pure (NextOversized why)
+          | free <= 0 → pure NextBlocked
+          | otherwise →
+              admitNext first <&> \case
+                Right granted → NextGranted granted
+                Left (AdmitLater _) → NextBlocked
+                Left (AdmitOversized why) → NextOversized why
+                Left (AdmitNever why) → NextEnded why
   where
     owner = portOwner (svPorts service)
     ended = \case
       Just (ChunkFailed _) → True
       Nothing → True
       _ → False
+
+-- Whether an armed view's candidate can go on: a part still to prepare, or the candidate's one decision ('nextPart',
+-- observed) no longer blocked. Any other stage than building: yes (whatever replaced it asked for its own step).
+buildActionable ∷ Ord k ⇒ TerrainViews k → ViewState k → STM Bool
+buildActionable service vs =
+  readTVar (vsStage vs) >>= \case
+    Building _ candidate
+      | not (null (cdWanted candidate)) → pure True
+      | otherwise →
+          nextPart service vs candidate (fmap (fmap (const ())) . ownerRoom (portOwner (svPorts service))) <&> \case
+            NextBlocked → False
+            _ → True
+    _ → pure True
 
 occupy ∷ Ord k ⇒ TerrainViews k → k → Int → STM ()
 occupy service key n = modifyTVar' (svSlots service) (Map.alter (\held → nonZero (fromMaybe 0 held + n)) key)
@@ -2325,13 +2329,13 @@ confirmDisposals service = do
 disposalTarget ∷ Disposal k → k
 disposalTarget = \case
   DisposeChunk (key, _, _) → key
-  DisposeAllocation key _ _ → key
+  DisposeAllocation key _ _ _ → key
 
 -- A disposal that cannot complete, as a failure that keeps its slot.
 disposalFailure ∷ Disposal k → Text → (k, Maybe ChunkRef, Text)
 disposalFailure entry cause = case entry of
   DisposeChunk (key, _, chunk) → (key, Just chunk, cause)
-  DisposeAllocation key _ identity → (key, Nothing, "a refused build's buffer " <> identity <> ": " <> cause)
+  DisposeAllocation key _ identity primary → (key, Nothing, "a failed build's buffer " <> identity <> " (the build failed: " <> primary <> "): " <> cause)
 
 -- Whether the owner has retirement work it can do now.
 retirementReady ∷ Ord k ⇒ TerrainViews k → STM Bool

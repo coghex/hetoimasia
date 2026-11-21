@@ -24,7 +24,7 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView.Owner
   ) where
 
 import Control.Concurrent.STM (STM, atomically)
-import Control.Exception (SomeAsyncException, displayException, fromException, throwIO, try)
+import Control.Exception (SomeAsyncException, displayException, evaluate, fromException, throwIO, try)
 import qualified Data.Map.Strict as Map
 import Data.Functor ((<&>))
 import Data.Text (Text)
@@ -86,7 +86,9 @@ data Admission
 -- upload's room. Spent once by its build ('grantSpend', which gives the grant back on every failure), or given back
 -- unspent ('grantAbandon'). It lives within the owner step that took it.
 data Grant = Grant
-  { grantSpend ∷ IO (Either BuildFailure ChunkRef)
+  { grantSpend ∷ (BuildFailure → IO ()) → IO (Either BuildFailure ChunkRef)
+    -- ^ An exception or cancellation hands the failure it would have answered (what became of the buffer included) to
+    -- this action before it goes on.
   , grantAbandon ∷ STM ()
   }
 
@@ -195,7 +197,8 @@ productionOwner host graphics = do
       Hands
         { handPrepare = \instances records → do
             marks ← registeredMarks (graphicsTextures graphics)
-            pure (either (Left . Text.pack . show) Right (prepareRetainedChunk marks ChunkWorldDepth DeriveBounds (Map.singleton material records) instances))
+            -- evaluated here, on this step: the description and its encoded bytes are made now
+            either (Left . Text.pack . show) Right <$> evaluate (prepareRetainedChunk marks ChunkWorldDepth DeriveBounds (Map.singleton material records) instances)
         , handReserve = \prepared →
             admitRetainedChunk uploads retained prepared <&> \case
               Left refusal → Left (admission refusal)
@@ -203,7 +206,7 @@ productionOwner host graphics = do
                 Right
                   Grant
                     { grantSpend = spend construction grant
-                    , grantAbandon = abandonChunkGrant uploads retained grant
+                    , grantAbandon = abandonChunkGrant retained grant
                     }
         , handDispose = \chunk → do
             -- the buffer, read before the release forgets the chunk, is what is physically disposed of later
@@ -213,19 +216,22 @@ productionOwner host graphics = do
               Right (Left refusal) → Left (Text.pack (show refusal))
               Right (Right ()) → Right (maybe (pure DisposalDone) (constructedDisposal construction) buffer)
         }
-    -- the granted build: a failure gives the grant back (the renderer's own), and says what became of its buffer
-    spend ∷ Construction q inst msgr phys dev cmd → ChunkGrant → IO (Either BuildFailure ChunkRef)
-    spend construction grant =
-      guarded (spendChunkGrant (hostBuilders host construction) retained grant) >>= pure . \case
+    -- the granted build: a failure gives the grant back (the renderer's own), and says what became of its buffer; an
+    -- exception or cancellation hands the same answer to the caller before it goes on
+    spend ∷ Construction q inst msgr phys dev cmd → ChunkGrant → (BuildFailure → IO ()) → IO (Either BuildFailure ChunkRef)
+    spend construction grant interrupted =
+      guarded (spendChunkGrant (hostBuilders host construction) retained grant (interrupted . failureOf construction)) >>= pure . \case
         -- raised past the renderer's own handling: whether a buffer was made is not known
         Left raised → Left (BuildFailed raised (AllocatedFailed ("the build raised: " <> raised)))
-        Right (Left (BuildRefused refusal allocation)) →
-          Left . BuildFailed (Text.pack (show refusal)) $ case allocation of
-            NoAllocation → NotAllocated
-            AllocationReleased buffer (Right ()) → AllocatedDisposing (Text.pack (show buffer)) (constructedDisposal construction buffer)
-            AllocationReleased buffer (Left why) → AllocatedFailed ("the failed build's buffer " <> Text.pack (show buffer) <> " could not be released: " <> Text.pack (show why))
-            AllocationReleaseRaised buffer why → AllocatedFailed ("the failed build's buffer " <> Text.pack (show buffer) <> " raised on its release: " <> why)
+        Right (Left refused) → Left (failureOf construction refused)
         Right (Right chunk) → Right chunk
+    failureOf ∷ Construction q inst msgr phys dev cmd → BuildRefused → BuildFailure
+    failureOf construction (BuildRefused refusal allocation) =
+      BuildFailed (Text.pack (show refusal)) $ case allocation of
+        NoAllocation → NotAllocated
+        AllocationReleased buffer (Right ()) → AllocatedDisposing (Text.pack (show buffer)) (constructedDisposal construction buffer)
+        AllocationReleased buffer (Left why) → AllocatedFailed ("the failed build's buffer " <> Text.pack (show buffer) <> " could not be released: " <> Text.pack (show why))
+        AllocationReleaseRaised buffer why → AllocatedFailed ("the failed build's buffer " <> Text.pack (show buffer) <> " raised on its release: " <> why)
     refusalText = \case
       ReleaseQueueFull → "the release lane is full"
       other → show other
@@ -235,6 +241,8 @@ admission ∷ BuildRefusal → Admission
 admission = \case
   BuildUploadBackpressure pressure → AdmitLater (Text.pack (show pressure))
   BuildReferencesExhausted → AdmitLater "every chunk reference is in use"
+  BuildUploadsNotReady → AdmitLater "the host's uploads await its startup"
+  BuildUploadsUnavailable cause → AdmitNever cause
   BuildUploadRefused (UploadOversized padded staging) → AdmitOversized ("a part needs " <> Text.pack (show padded) <> " staging bytes, and the staging buffer holds " <> Text.pack (show staging))
   refusal → AdmitNever (Text.pack (show refusal))
 
