@@ -105,6 +105,8 @@ spec = do
   describe "The backed open's ending paths (sweep)" $
     forM_ [minBound .. maxBound] $ \step → forM_ [e | e ← [minBound .. maxBound], applies step e] $ \exit →
       it ("held " <> show step <> ", ended " <> show exit) (openCase step exit)
+  describe "The backed open whose request ends while it waits for its host" $
+    it "keeps the backed oracle while the owner closes its file, before it forgets the open" deadOpenClosing
   where
     -- nothing native runs while an open compiles or waits for its host: a native failure is the
     -- reserving step's
@@ -124,6 +126,30 @@ data OpenExit = OpenByCancel | OpenByClientEnd | OpenByServiceClose | OpenByNati
 
 isReserve ∷ NativeOp → Bool
 isReserve = \case OpReserveRange {} → True; _ → False
+
+isClose ∷ NativeOp → Bool
+isClose = \case OpCloseFile → True; _ → False
+
+-- | An open prepared completely and waiting for its host is cancelled: the owner closes its file
+-- (the backing leaves the storage service's table) and only then forgets the open. The oracle is
+-- read while that close is held at the native seam, between the two.
+deadOpenClosing ∷ IO ()
+deadOpenClosing = do
+  probe ← H.newProbe
+  withServiceSeam quiet defaultConfig alwaysAdmitting noProbe (H.seamFor probe) $ \svc → do
+    client ← okOf (registerClient svc)
+    host ← newHost False
+    request ← okOf (openArenaWith svc (hostEndpoint svc Nothing host) client "main" soilOverStone)
+    waitFor (readTVar (hostReady host) >>= \n → check (n >= 1))
+    closeGate ← H.addGateOnce probe isClose
+    flip finally (H.openGate closeGate) $ do
+      cancel svc request `shouldReturn` CancelWon
+      H.awaitReached closeGate 1
+      oracle svc
+    settled ← waitFor (readTVar (hostSettled host) >>= \s → if null s then retry else pure s)
+    settled `shouldBe` [Cancelled]
+    bankAtRest svc
+    oracle svc
 
 -- | An open held at a step and ended by an exit: it settles once, nothing of it is left (no
 -- compile charge, no file, no bank credit: the oracle and the bank at rest), and unless the service
