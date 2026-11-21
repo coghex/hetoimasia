@@ -11,7 +11,7 @@
 module Test.LuaEngine.Graphics.TerrainViews (spec) where
 
 import Control.Concurrent.STM
-import Control.Monad (forM, forM_, unless, when)
+import Control.Monad (forM_, unless, when)
 import qualified Data.ByteString.Char8 as BC
 import Data.Bits (shiftL, (.|.))
 import qualified Data.Map.Strict as Map
@@ -40,14 +40,14 @@ import Hetoimasia.Render.TwoD.Metrics (PixelExtent (..), TargetMetrics (..))
 import qualified Hetoimasia.Render.TwoD.Validation as Validation
 import Hetoimasia.Render.TwoD.Vulkan.Chunks (ChunkStanding (..))
 import Hetoimasia.Terrain.Cell (mkMaterialId)
-import Hetoimasia.Terrain.Coordinate (AxisCoord, axisFromInteger, axisValue, tileCoord)
+import Hetoimasia.Terrain.Coordinate (AxisCoord, TileCoord (..), axisFromInteger, axisValue, tileCoord)
 import Hetoimasia.Terrain.Render2D.AtlasFixtures (AtlasStyle (..), boundPackedTextures, loadAtlasStyle)
 import Hetoimasia.LuaEngine.Graphics.TerrainView.Inputs (combineCopies, planInputs, plannerRuns)
 import qualified Hetoimasia.Terrain.Discovery as D
 import Hetoimasia.Terrain.Coordinate (RegionCoord (..))
 import Hetoimasia.Terrain.Changes (ChangeLimits (..))
-import Hetoimasia.Terrain.Render2D.Camera (CameraState, Command (SetZoom), JumpTarget (..), Step (..), applyCommand, camAnchorX, camAnchorY, camClip, camRef, camSurface, defaultCameraConfig)
-import Hetoimasia.Terrain.Render2D.Cells (CellConfig (..), CellInputs (..), CellLimits (..), ReadFootprint (..), cellReadFootprint, CellKey (..), CellPlan, CellRequest (..), PartKind (PartFog), cellPlanPending, cellPlanQuads, planCells, quadKey, quadPart)
+import Hetoimasia.Terrain.Render2D.Camera (JumpTarget (..), camAnchorX, camAnchorY, camRef, camSurface)
+import Hetoimasia.Terrain.Render2D.Cells (CellConfig (..), CellInputs (..), CellLimits (..), CellKey (..), CellPlan, CellRequest (..), PartKind (PartFog), cellPlanPending, cellPlanQuads, planCells, quadCell, quadKey, quadPart)
 import Hetoimasia.Terrain.Render2D.Facts (TerrainFacts (..))
 import Hetoimasia.Terrain.Render2D.Material (recordLayout)
 import Hetoimasia.Terrain.Render2D.Presentation (pushBlockBytes)
@@ -1052,119 +1052,121 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         atomically (readReceipt receipts (viewIncarnation view)) `shouldReturn` Nothing
 
   describe "copy admission from the destination camera" $ do
-    it "refuses a footprint one region over the cap though part of it is already drawn, keeping the drawing" $ do
-      (here, wider) ← withPublished defaultOptions $ \rig target view → do
-        drawn ← drawLatest rig target view
-        here ← footprintFor defaultOptions drawn
-        facts ← factsFor rig here
-        camera ← maybe (fail "no camera") pure (drawnPlanCamera drawn)
-        metrics ← maybe (fail "no metrics") pure (drawnPlanMetrics drawn)
-        let zoomed = stepCamera (either (error . show) id (applyCommand defaultCameraConfig facts (SetZoom 0.5) camera))
-        wider ← footprintAt defaultOptions zoomed metrics
-        pure (here, wider)
-      Set.size (Set.intersection here wider) `shouldSatisfy` (> 0)
-      let cap = Set.size wider - 1
-      Set.size here `shouldSatisfy` (<= cap)
-      withPublished defaultOptions {optProfile = smallProfile {profileRegions = cap, profileQuads = 16384}} $ \rig target view → do
+    it "refuses a footprint one region over the cap though part of it is already drawn, keeping the drawing" $
+      withPublished defaultOptions {optProfile = smallProfile {profileRegions = 163}} $ \rig target view → do
         quiesce rig target
         before ← atomically (latestWorld target)
         published ← atomically (readingPublished <$> readView view)
-        atomically (configureView view noConfigure {configureZoom = Just 0.5}) `shouldReturn` Right ()
+        atomically (configureView view noConfigure {configureZoom = Just 0.125}) `shouldReturn` Right ()
         settleUntil rig (isJust . readingRefusal <$> readView view)
-        atomically (readingRefusal <$> readView view) `shouldReturn` Just (LimitRegions (Set.size wider) cap)
+        atomically (readingRefusal <$> readView view) `shouldReturn` Just (LimitRegions 164 163)
         atomically (readingPublished <$> readView view) `shouldReturn` published
         atomically (latestWorld target) `shouldReturn` before
 
-    it "moves between two disjoint footprints that each fit the region cap exactly" $ do
-      (origin, destination) ← withPublished defaultOptions $ \rig target view → do
-        origin ← drawLatest rig target view >>= footprintFor defaultOptions
-        Right move ← atomically (moveView view far)
-        settleUntil rig (isJust <$> moveSettled move)
-        atomically (moveSettled move) `shouldReturn` Just MoveLanded
-        settleUntil rig (publishedAtLeast view 2)
-        destination ← drawLatest rig target view >>= footprintFor defaultOptions
-        pure (origin, destination)
-      Set.intersection origin destination `shouldBe` Set.empty
-      withPublished defaultOptions {optProfile = smallProfile {profileRegions = max (Set.size origin) (Set.size destination)}} $ \rig _ view → do
+    it "moves between two disjoint footprints that each fit the region cap exactly" $
+      withPublished defaultOptions {optProfile = smallProfile {profileRegions = 36}} $ \rig target view → do
         Right move ← atomically (moveView view far)
         settleUntil rig (isJust <$> moveSettled move)
         atomically (moveSettled move) `shouldReturn` Just MoveLanded
         settleUntil rig (publishedAtLeast view 2)
         atomically (readingRefusal <$> readView view) `shouldReturn` Nothing
+        camera ← drawLatest rig target view >>= maybe (fail "no camera") pure . drawnPlanCamera
+        (axisValue (camAnchorX camera), axisValue (camAnchorY camera)) `shouldBe` (192, 192)
 
-    it "lands a move given exactly the destination's runs, though both views' together exceed them" $ do
-      (origin, destination) ← withPublished defaultOptions $ \rig target view → do
-        origin ← drawLatest rig target view >>= footprintFor defaultOptions >>= runsOf rig
-        Right move ← atomically (moveView view far)
-        settleUntil rig (publishedAtLeast view 2)
-        atomically (moveSettled move) `shouldReturn` Just MoveLanded
-        destination ← drawLatest rig target view >>= footprintFor defaultOptions >>= runsOf rig
-        pure (origin, destination)
-      origin `shouldSatisfy` (<= destination)
-      withPublished defaultOptions {optProfile = smallProfile {profileRuns = destination}} $ \rig _ view → do
+    it "lands a move given exactly the destination's runs, though both views' together exceed them" $
+      withPublished defaultOptions {optProfile = smallProfile {profileRuns = 3104}} $ \rig _ view → do
         Right move ← atomically (moveView view far)
         settleUntil rig (publishedAtLeast view 2)
         atomically (moveSettled move) `shouldReturn` Just MoveLanded
         atomically (readingRefusal <$> readView view) `shouldReturn` Nothing
 
-    it "refuses a whole copy whose later batches take its runs over the cap, keeping the drawing" $ do
-      -- the drawn view's runs, and the zoomed-out replacement's: more, though no one-region batch is over the cap
-      (here, wider, widest) ← withPublished defaultOptions $ \rig target view → do
-        drawn ← drawLatest rig target view
-        footprint ← footprintFor defaultOptions drawn
-        here ← runsOf rig footprint
-        facts ← factsFor rig footprint
-        camera ← maybe (fail "no camera") pure (drawnPlanCamera drawn)
-        metrics ← maybe (fail "no metrics") pure (drawnPlanMetrics drawn)
-        let zoomed = stepCamera (either (error . show) id (applyCommand defaultCameraConfig facts (SetZoom 0.5) camera))
-        wider ← footprintAt defaultOptions zoomed metrics
-        perRegion ← mapM (runsOf rig . Set.singleton) (Set.toList wider)
-        total ← runsOf rig wider
-        pure (here, total, maximum perRegion)
-      wider `shouldSatisfy` (> here)
-      widest `shouldSatisfy` (<= here)
-      withPublished defaultOptions {optProfile = smallProfile {profileRuns = here, profileRequestRegions = 1}} $ \rig target view → do
+    it "refuses a whole copy that an edit of the drawn footprint takes over the run cap, keeping the drawing" $
+      withPublished defaultOptions {optProfile = smallProfile {profileRuns = 3104, profileRequestRegions = 1}} $ \rig target view → do
+        quiesce rig target
+        let remove z = do
+              Right removal ← removeAt (rigTerrain rig) (rigLease rig) (either (error . show) id (tileCoord 2 2 z)) Nothing
+              _ ← await (rigTerrain rig) removal
+              pure ()
+        -- the camera stays. Removing the top cell of column (2, 2) keeps F's copies at 3,104 runs: republished
+        remove 1
+        settleUntil rig (publishedAtLeast view 2)
         quiesce rig target
         before ← atomically (latestWorld target)
         published ← atomically (readingPublished <$> readView view)
-        atomically (configureView view noConfigure {configureZoom = Just 0.5}) `shouldReturn` Right ()
+        -- removing the cell below splits that region's knowledge by column: 3,355 runs, though no one-region batch is
+        -- over the cap
+        remove 0
         settleUntil rig (isJust . readingRefusal <$> readView view)
         atomically (readingRefusal <$> readView view) >>= (`shouldSatisfy` \case
-          Just (LimitRuns over limit) → limit == here && over > here
+          Just (LimitRuns over 3104) → over > 3104
           _ → False)
         atomically (readingPublished <$> readView view) `shouldReturn` published
         atomically (latestWorld target) `shouldReturn` before
 
-    it "asks the runtime for F first, ready copies included, cut at its camera regions, and keeps its receipt apart" $
+    it "asks the runtime for F first, cut at its camera regions, and the receipt disposes of every key it was given" $
       withPublished defaultOptions $ \rig target view → do
-        footprint ← drawLatest rig target view >>= footprintFor defaultOptions
-        Set.size footprint `shouldSatisfy` (> 4)
+        copied ← drawLatest rig target view >>= maybe (fail "no regions") pure . drawnPlanRegions
+        Set.size copied `shouldBe` 36
         asked ← atomically (readingDemand <$> readView view)
-        -- the runtime's four camera regions all go to F; the complete destination still drew
+        -- four camera regions: the anchor's region first, all four of F (copied), none of the prefetch
         length asked `shouldBe` 4
-        asked `shouldSatisfy` all (`Set.member` footprint)
+        take 1 asked `shouldBe` [RegionCoord 0 0 0]
+        asked `shouldSatisfy` all (`Set.member` copied)
         receipt ← atomically (readingReceipt <$> readView view) >>= maybe (fail "no receipt") pure
-        (receiptAdmitted receipt <> receiptPending receipt <> receiptTruncated receipt) `shouldSatisfy` all (`elem` asked)
+        let disposed = Set.fromList (receiptAdmitted receipt <> receiptPending receipt <> receiptExcluded receipt <> receiptTruncated receipt)
+        Set.fromList asked `shouldSatisfy` (`Set.isSubsetOf` disposed)
+        disposed `shouldSatisfy` (not . Set.null)
 
-    it "gives every region of F, fog-only ones included, a runtime place when it has as many, and refuses with one region fewer" $ do
-      footprint ← withPublished defaultOptions $ \rig target view → drawLatest rig target view >>= footprintFor defaultOptions
-      withPublished defaultOptions {optRuntime = \c → c {configLimits = cameraLimitsWith (Set.size footprint)}} $ \_ _ view →
-        atomically (Set.fromList . readingDemand <$> readView view) `shouldReturn` footprint
-      withRig defaultOptions {optProfile = smallProfile {profileRegions = Set.size footprint - 1}} $ \rig → do
+    it "gives every region of F a runtime place when it has 36, and refuses with a cap of 35" $ do
+      withPublished defaultOptions {optRuntime = \c → c {configLimits = cameraLimitsWith 36}} $ \rig target view → do
+        copied ← drawLatest rig target view >>= maybe (fail "no regions") pure . drawnPlanRegions
+        asked ← atomically (Set.fromList . readingDemand <$> readView view)
+        Set.size asked `shouldBe` 36
+        asked `shouldBe` copied
+      withRig defaultOptions {optProfile = smallProfile {profileRegions = 35}} $ \rig → do
         target ← newTarget 1
         view ← openOn rig target
         settleUntil rig (isJust . readingRefusal <$> readView view)
-        atomically (readingRefusal <$> readView view) `shouldReturn` Just (LimitRegions (Set.size footprint) (Set.size footprint - 1))
+        atomically (readingRefusal <$> readView view) `shouldReturn` Just (LimitRegions 36 35)
         atomically (latestWorld target) `shouldReturn` Nothing
 
+    it "gives a fog-only region of F a runtime place, and charges no anchor region a manual slice does not read" $
+      withPublished defaultOptions $ \rig target view → do
+        -- a cut at level -10 through the undiscovered ground, 12 levels below the reference: the cut's level region
+        -- (z = -1) draws only fog there
+        atomically (configureView view noConfigure {configureDepth = Just (axis (-10))}) `shouldReturn` Right ()
+        settleUntil rig (publishedAtLeast view 2)
+        drawn ← drawLatest rig target view
+        plan ← maybe (fail "the drawn plan is not pinned") pure (drawnPlanPlan drawn)
+        copied ← maybe (fail "no regions") pure (drawnPlanRegions drawn)
+        let ordinary = Set.fromList [RegionCoord (axisValue x `div` 16) (axisValue y `div` 16) (axisValue z `div` 32) | quad ← cellPlanQuads plan, Just (TileCoord x y z) ← [quadCell quad]]
+            fogOnly region = regionZ region == -1 && Set.notMember region ordinary
+        [() | quad ← cellPlanQuads plan, quadPart quad == PartFog] `shouldSatisfy` (not . null)
+        asked ← atomically (readingDemand <$> readView view)
+        filter fogOnly asked `shouldSatisfy` (not . null)
+        -- the anchor's own region at the cut holds no cell this camera reads, and only a pending jump with a level
+        -- charges an unread anchor region
+        Set.member (RegionCoord 0 0 (-1)) copied `shouldBe` False
+
     it "counts F from geometry, not from the planner's bounded demand listing" $ do
-      footprint ← withPublished defaultOptions $ \rig target view → drawLatest rig target view >>= footprintFor defaultOptions
       let unlisted c = c {ccLimits = (ccLimits c) {clDemandChunks = 0}}
-      withRig defaultOptions {optCells = unlisted, optProfile = smallProfile {profileRegions = Set.size footprint - 1}} $ \rig → do
+      withRig defaultOptions {optCells = unlisted, optProfile = smallProfile {profileRegions = 35}} $ \rig → do
         target ← newTarget 1
         view ← openOn rig target
         settleUntil rig (isJust . readingRefusal <$> readView view)
-        atomically (readingRefusal <$> readView view) `shouldReturn` Just (LimitRegions (Set.size footprint) (Set.size footprint - 1))
+        atomically (readingRefusal <$> readView view) `shouldReturn` Just (LimitRegions 36 35)
+
+    it "copies nothing and asks the runtime for nothing while nothing can be drawn, then plans once something can" $
+      withRig defaultOptions $ \rig → do
+        target ← newTarget 1
+        atomically (writeTVar (targetMetrics target) (Just (metricsOf 0 0)))
+        view ← openOn rig target
+        runOwner rig
+        reading ← atomically (readView view)
+        (readingDemand reading, readingPublished reading, readingRefusal reading) `shouldBe` ([], Nothing, Nothing)
+        atomically (inspectRetainedChargesSTM (rigTerrain rig)) >>= (`shouldSatisfy` (null . snd))
+        atomically (writeTVar (targetMetrics target) (Just (metricsOf 320 240)))
+        settleUntil rig (publishedAtLeast view 1)
 
     it "follows a removed summit whose new top is in the vertical region below" $
       withPublished defaultOptions $ \rig target view → do
@@ -1391,36 +1393,6 @@ drawLatest rig target view = do
   world ← atomically (latestWorld target) >>= maybe (fail "no world") pure
   atomically (noteSubmitted (rigReceipts rig) (worldTag world) (worldMetrics world))
   atomically (viewDrawn view) >>= maybe (fail "nothing drawn") pure
-
--- F for a drawn plan's camera and metrics: the planner's shared read geometry, with the anchor's own region.
-footprintFor ∷ Options → DrawnPlan Int → IO (Set.Set RegionCoord)
-footprintFor options drawn = do
-  camera ← maybe (fail "no camera") pure (drawnPlanCamera drawn)
-  metrics ← maybe (fail "no metrics") pure (drawnPlanMetrics drawn)
-  footprintAt options camera metrics
-
-footprintAt ∷ Options → CameraState → TargetMetrics → IO (Set.Set RegionCoord)
-footprintAt options camera metrics =
-  case cellReadFootprint maxBound camera (viewSetup metrics) (viewCellConfig (configOf options)) of
-    Right (ReadRegions keys) → pure (Set.insert anchor keys)
-    other → fail ("no footprint: " <> show other)
-  where
-    anchor = RegionCoord (fromIntegral (axisValue (camAnchorX camera) `div` 16)) (fromIntegral (axisValue (camAnchorY camera) `div` 16)) (fromIntegral (axisValue (camClip camera) `div` 32))
-
--- The input runs of fresh copies of these regions, as the planner is handed them.
-runsOf ∷ Rig → Set.Set RegionCoord → IO Int
-runsOf rig regions =
-  fmap sum . forM (Set.toList regions) $ \region →
-    withRegionSnapshot (rigTerrain rig) (rigLease rig) [region] (either (fail . show) (pure . plannerRuns)) >>= either (fail . show) pure
-
--- The planner's facts from fresh copies of these regions.
-factsFor ∷ Rig → Set.Set RegionCoord → IO TerrainFacts
-factsFor rig regions = do
-  copies ← fmap concat . mapM (copyOf . take 64) . takeWhile (not . null) . iterate (drop 64) $ Set.toList regions
-  combined ← either (fail . show) pure (combineCopies copies)
-  fst <$> either (fail . show) pure (planInputs (ChangeLimits (profileRuns smallProfile)) combined)
-  where
-    copyOf batch = withRegionSnapshot (rigTerrain rig) (rigLease rig) batch (either (fail . show) (pure . pure)) >>= either (fail . show) pure
 
 -- The plan the planner makes from fresh copies of the drawn plan's regions, at its camera and metrics: what the view
 -- must have drawn.

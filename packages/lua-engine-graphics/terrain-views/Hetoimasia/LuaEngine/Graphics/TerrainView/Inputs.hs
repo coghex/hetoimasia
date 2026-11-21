@@ -41,6 +41,7 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView.Inputs
 import Data.Bits (setBit, shiftR, xor, (.&.))
 import Data.Int (Int64)
 import Data.List (sortOn)
+import qualified Data.IntMap.Strict as IntMap
 import qualified Data.Map.Strict as Map
 import Data.Set (Set)
 import qualified Data.Set as Set
@@ -181,18 +182,26 @@ plannerRegionKnowledge region known = case D.regionKnowledgeClasses known of
       , Just runs ← [D.regionKnowledgeColumn known column]
       ]
 
--- | The input runs and intervals one copy hands the planner, counted in the representation it is handed
--- ('plannerKnowledge' makes it with the same helper): every removed interval, one run for a region whose knowledge is
--- one class, and otherwise every run of every column.
+-- | The input runs and intervals one copy hands the planner, counted from the copy's interval and class data before
+-- anything is expanded: every removed interval, one run for a region whose knowledge is one uniform class, and
+-- otherwise every run of every column ('plannerKnowledge' hands the planner exactly those).
 plannerRuns ∷ RegionSnapshot → Int
-plannerRuns snapshot = sum [terrain region + knowledge region | region ← regionSnapshotRegions snapshot]
+plannerRuns snapshot = sum [terrain region + knowledgeOf region | region ← regionSnapshotRegions snapshot]
   where
     terrain region = case regionTerrain snapshot region of
       PartReady intervals → length intervals
       _ → 0
-    knowledge region = case regionKnowledge snapshot region of
-      PartReady known → either (const 1) (sum . map (length . snd)) (plannerRegionKnowledge region known)
+    -- counted from the class data, not by expanding it: one run for a uniform region, every column's class's runs
+    -- otherwise (a single shared class is held by all 256 columns)
+    knowledgeOf region = case regionKnowledge snapshot region of
+      PartReady known → case D.regionKnowledgeClasses known of
+        [[_]] → 1
+        [shared] → columnsPerRegion * length shared
+        classes →
+          let lengths = IntMap.fromList (zip [0 ..] (map length classes))
+           in sum [IntMap.findWithDefault 0 index lengths | index ← D.regionKnowledgeColumns known]
       _ → 0
+    columnsPerRegion = 256
 
 -- | The planner's state of what discovery knows of a cell.
 knowledgeState ∷ D.CellKnowledge → CellKnowledge

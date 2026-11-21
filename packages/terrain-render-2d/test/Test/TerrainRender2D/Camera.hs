@@ -220,6 +220,20 @@ spec = describe "Camera" $ do
       followed `shouldBe` FollowAdopted (axis 2)
       (camMode landed, level (camClip landed), camRef landed, camSurface landed) `shouldBe` (Following, 27, 3, Just (axis 2))
       geometry planned `shouldBe` geometry landed
+    it "lands neither a jump with Z nor a follow jump without a surface answer: those stay pending" $ do
+      let Step withZ _ _ = ok (requestJump cfg (JumpTarget (axis 1) (axis 0) (Just (axis 7))) start)
+          Step kept _ event = ok (completeJumpKnown cfg (Just (KnownSurfaceAt (axis 2))) (JumpId 1) withZ)
+      event `shouldSatisfy` isPending
+      kept `shouldBe` withZ
+      let Step following _ _ = ok (requestJump cfg (JumpTarget (axis 2) (axis 0) Nothing) start)
+          Step unanswered _ event' = ok (completeJumpKnown cfg Nothing (JumpId 1) following)
+      event' `shouldSatisfy` isPending
+      unanswered `shouldBe` following
+    it "applies zoom, facing and slices without facts, and refuses a pan or a jump there" $ do
+      let Step zoomed _ _ = ok (applyLocal cfg (SetZoom 2) start)
+      camZoom zoomed `shouldBe` 2
+      applyLocal cfg (Pan 1 0) start `shouldBe` Left CommandNeedsFacts
+      applyLocal cfg (Jump (JumpTarget (axis 1) (axis 0) Nothing)) start `shouldBe` Left CommandNeedsFacts
     it "keeps the slice and reference over an empty followed column" $ do
       let Step kept followed _ = ok (followKnown cfg KnownSurfaceEmpty start)
       followed `shouldBe` FollowColumnEmpty
