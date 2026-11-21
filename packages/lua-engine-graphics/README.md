@@ -631,10 +631,15 @@ publication`, one bounded unit a step, all for the **destination camera**:
    nothing else. A pending move with a level also has its destination's region
    copied, and charged with F, when F lacks it: its part is checked there, and
    it is never demanded. It depends on the camera, the metrics and the
-   configuration only. More than `profileRegions` keys refuses
-   (`LimitRegions`) at the first excess key; more candidate columns than the
-   planner's bound refuses (`LimitPlan`). An empty F (a zero drawable) copies
-   and demands nothing and waits for the basis to move.
+   configuration only, and is checked against the planner's configuration
+   first. More than `profileRegions` keys refuses (`LimitRegions`) at the
+   first distinct excess key; more candidate columns than the planner's bound
+   refuses (`LimitPlan`). F, its order and its request batches are made and
+   fully evaluated on the planner. An empty F asks for no copy: the camera
+   settles without inputs and the view publishes an empty revision, with an
+   empty runtime demand; when nothing can be drawn (a zero drawable, or a view
+   that has never copied) it withdraws its runtime demand instead and waits for
+   the basis to move.
 3. **Copying.** The whole of F, in disjoint batches of at most
    `profileRequestRegions` (and the terrain service's hold and query bounds),
    one request in flight; a settled borrow stays charged through the copy's
@@ -642,21 +647,23 @@ publication`, one bounded unit a step, all for the **destination camera**:
    copy, refuses it or finds it stale, and returned if cancellation lost the
    race. Each copy must hold exactly its batch, at the surface answer's content
    revision. One total of input runs and intervals, counted from the copies'
-   interval and class data before anything is expanded (as many as the planner
-   is handed), is checked against `profileRuns` as each copy is accepted
-   (`LimitRuns`).
+   packed parts before anything is decoded (`regionInputCounts`: as many as
+   the planner is handed), is checked against `profileRuns` as each copy is
+   accepted (`LimitRuns`).
    Splitting is transport only: F is admitted or refused as a whole. Copies of
    different versions are never combined.
 4. **Settling**, at the camera's transition: a pending move lands (a move
    without a level at the answered surface; a move with a level once its
-   destination part is ready in the copies, otherwise it settles with
-   recoverable pressure, `MovePressure`, the camera stays and the view prepares
-   again), a following camera adopts the answered surface. The settled camera
+   destination part is ready in the copies; otherwise the preparation is
+   refused, the move settles with recoverable pressure, `MovePressure`, and
+   the camera and the drawing stay until something changes), a following
+   camera adopts the answered surface. The settled camera
    is the one F was enumerated for.
 5. **Planning**, on the planner: the copies' inputs and the plan in
    `profileStepWork` quanta, its adaptation and its parts, once. Its prefetch
-   ring is listed only as far as the service's camera regions leave places
-   after F. A plan that
+   is a prefix of distinct regions outside F, as many as the service's camera
+   regions leave after F, from the planner's configured ring; no ring is
+   looked at when none is left. A plan that
    meets a plan-wide bound (columns, levels, quads, pending spans) is refused
    (`LimitPlan`), never published truncated. Every pending move of a refused
    preparation settles with pressure; a refusal of a preparation a newer
