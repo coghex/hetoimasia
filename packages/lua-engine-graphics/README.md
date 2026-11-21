@@ -686,8 +686,12 @@ publication`, one bounded unit a step, all for the **destination camera**:
    failure is not among them), each counted once.
 7. **Building.** Every fresh part is prepared on the owner first, at most
    `profileBuilds` a step (`handPrepare`: routed and encoded, its exact upload
-   bytes known, nothing reserved). Then one decision, which the owner takes
-   and the watcher observes, admits the next part. The candidate is refused
+   bytes known, nothing reserved), and evaluated in that step. Then one
+   decision, which the owner takes and the watcher observes, governs the
+   candidate. A failed or missing built part refuses it (`LimitFailure`) and
+   retires its private parts, whatever the next part's admission; with every
+   part built, it publishes once all are ready. Otherwise the decision admits
+   the next part. The candidate is refused
    (`LimitSlots`, recording its whole fresh requirement) if the remaining parts
    exceed the target's recoverable slots, its built prefix not among them, or
    (`LimitOversized`) if a remaining part is larger than the whole staging. It
@@ -704,7 +708,11 @@ publication`, one bounded unit a step, all for the **destination camera**:
    replacement and says what became of its buffer (`Allocated`): none made
    returns the slot; a released buffer keeps it until the backend confirms its
    destruction; a release that failed or raised keeps it as a failure naming
-   the buffer, with the build's cause and the release's.
+   the buffer, with the build's cause and the release's. A buffer awaiting its
+   destruction keeps the build's cause too, so a destruction that fails is
+   recorded with both. A build interrupted by an exception or a cancellation
+   hands over what became of its buffer before the interruption goes on, and
+   is accounted for the same way.
 8. **Publication**, once every chunk is ready, in the transaction that rechecks
    the claim, the target, the session, the intent, the metrics and the arena's
    content and knowledge revisions, and applies the view's runtime demand under
@@ -737,8 +745,8 @@ settle a pending move, and at Unknown never.
 A move never lands from facts the view already holds: it waits for a
 preparation of its destination. Every transaction that writes a stage back,
 changes the camera, settles a move, records a refusal or publishes first checks
-that the work is still current: the same stage, an open view and service, a
-usable target, a live arena lease, the full basis it was prepared from, and,
+that the work is still current: the same stage, an open view and service, the
+graphics owner's own gate open (read live), a usable target, a live arena lease, the full basis it was prepared from, and,
 when it settles a move, the same pending move. Stale work discards only itself
 and the newer state is prepared. Camera controls other than a move need no
 terrain facts: they apply once a preparation has settled the camera. Every

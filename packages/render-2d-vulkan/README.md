@@ -167,21 +167,28 @@ in three steps a caller can also take apart:
 
 1. **Prepare** (`prepareRetainedChunk`, pure): build and validate the
    description (`BuildInvalid`) and encode the cutout-path instances, which
-   fixes the exact byte length (`preparedBytes`).
+   fixes the exact byte length (`preparedBytes`). Both are computed when the
+   answer is evaluated, so admission reads only the size.
 2. **Admit** (`admitRetainedChunk`, one transaction): reserve a `ChunkRef`
    (an index and a generation, so a stale reference resolves to nothing),
    private until registration, and for a positive byte length the uploads'
    queue place and aligned staging region for exactly those bytes, in the
    decision every upload shares (`BufferUploads`). A refusal reserves nothing
    and makes nothing. `BuildUploadBackpressure` is the queue or staging full
-   now, so asking again later can succeed. `BuildReferencesExhausted` frees as
-   chunks are released. `BuildUploadRefused` is everything else; for
-   `UploadOversized`, build smaller chunks. `chunkRoom` reads this decision
-   without reserving, from any thread.
-3. **Spend** (`spendChunkGrant`): only now make the device-local vertex buffer,
-   spend the reserved room on the upload that fills it, and register the
-   chunk under the reserved reference. Every exit before registration gives
-   the grant back (`abandonChunkGrant`).
+   now, and `BuildUploadsNotReady` the host's uploads awaiting its startup, so
+   asking again later can succeed. `BuildReferencesExhausted` frees as chunks
+   are released. `BuildUploadsUnavailable` is uploads the host lacks or whose
+   startup failed, with the cause; `BuildUploadRefused` is every other
+   refusal; for `UploadOversized`, build smaller chunks. `chunkRoom` reads
+   this decision without reserving, from any thread.
+3. **Spend** (`spendChunkGrant`): move the grant from reserved to spending in
+   one transaction, then make the device-local vertex buffer, spend the
+   reserved room on the upload that fills it, and register the chunk under the
+   reserved reference. A grant belongs to the registry and the uploads that
+   issued it: another registry can neither spend nor give it back, and once it
+   is spending only its spend accounts for it. A reserved grant is given back
+   with `abandonChunkGrant`; every exit of a spend before registration gives
+   it back itself.
 
 - **An empty cutout partition makes no buffer and no upload, and reserves no
   upload room.** A chunk of a world layer without depth, or of a UI layer, has
@@ -196,7 +203,10 @@ in three steps a caller can also take apart:
   (`AllocationReleaseRaised`). A synchronous exception after the buffer was
   made is such a failure (`BuildRaised`), and so is one the buffer's
   construction raised after making and releasing it, which names the buffer
-  (`releasedBufferOf`). `BuildBufferRefused` is the backend refusing the
+  (`releasedBufferOf`). A cancellation, or an exception before any buffer, is
+  not answered: the spend hands the same `BuildRefused` to the caller's
+  action and the exception goes on, so the caller keeps the buffer's identity
+  and its release's outcome. `BuildBufferRefused` is the backend refusing the
   buffer itself.
 
 **Standing.** `chunkStanding` reads, from any thread, `ChunkUploading`,
