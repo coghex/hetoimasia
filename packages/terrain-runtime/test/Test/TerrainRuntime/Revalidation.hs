@@ -92,6 +92,36 @@ spec = describe "Superseded work and ordering" $ do
       removed `shouldBe` RemoveAnswer (removeIncarnation first') (Revision 2) True
       settleChecks svc
 
+  it "keeps an arena's mark cell at its version until an edit moves it, and empties it when the arena ends" $
+    withService defaultConfig $ \svc → do
+      (_, lease) <- openMain svc "main"
+      cell <- atomically (arenaMarkSTM svc lease) >>= either (\refused → fail ("the mark was refused: " <> show refused)) pure
+      initial <- atomically cell
+      fmap markContent initial `shouldBe` Just (Revision 0)
+      -- a read moves no version
+      _ <- readCell svc lease (tile 3 4 5)
+      fmap (\m → (markContent m, markKnowledge m)) <$> atomically cell `shouldReturn` fmap (\m → (markContent m, markKnowledge m)) initial
+      removed <- removeCell' svc lease (tile 3 4 5)
+      fmap markContent <$> atomically cell `shouldReturn` Just (removeRevision removed)
+      -- the creator's last owner lease closes the arena: the cell says it ended, and the lease is refused a cell
+      epoch <- atomically (authorityEpochSTM svc)
+      releaseLease svc lease `shouldReturn` Right ()
+      atomically cell `shouldReturn` Nothing
+      atomically (authorityEpochSTM svc) >>= (`shouldSatisfy` (> epoch))
+      either Just (const Nothing) <$> atomically (arenaMarkSTM svc lease) `shouldReturn` Just RefusedAuthority
+      settleChecks svc
+
+  it "moves the authority epoch when a lease is released while its arena lives on" $
+    withService defaultConfig $ \svc → do
+      (client, lease) <- openMain svc "main"
+      attached <- okOf (attachArena svc client "main") >>= await svc >>= expectSuccess
+      cell <- atomically (arenaMarkSTM svc lease) >>= either (\refused → fail ("the mark was refused: " <> show refused)) pure
+      epoch <- atomically (authorityEpochSTM svc)
+      releaseLease svc attached `shouldReturn` Right ()
+      atomically (authorityEpochSTM svc) >>= (`shouldSatisfy` (> epoch))
+      fmap markContent <$> atomically cell `shouldReturn` Just (Revision 0)
+      settleChecks svc
+
   it "re-prepares an edit that another edit overtook and commits both in admission order" $
     withService defaultConfig $ \svc → do
       (_, lease) <- openMain svc "main"

@@ -16,6 +16,13 @@
 --   window published to, without them.
 -- * @vulkanRenderer@ the per-window renderer, which records each frame with the window's own metrics
 --   ("Hetoimasia.LuaEngine.Graphics.Scene.Render").
+-- * @vulkanFrameObserver@ the session's draw receipts' observer ("Hetoimasia.LuaEngine.Graphics.Scene.Receipts"),
+--   before whatever observer the host already had. A caller that sets its own observer afterwards keeps the receipts'
+--   with 'sceneFrameObserver'.
+--
+-- A terrain-enabled composition also calls 'configureWorldDepth', which gives every window's swapchain generations
+-- the depth image a world scene draws with. An M1 scene names no depth-enabled world layer, so its frames are
+-- unchanged by it.
 --
 -- The texture backend's configuration ('Hetoimasia.LuaEngine.Graphics.Texture.configureHost') and the
 -- window provider's ('Hetoimasia.LuaEngine.Graphics.Window.Configuration.configureWindows') are separate
@@ -33,6 +40,8 @@ module Hetoimasia.LuaEngine.Graphics.Scene.Configuration
   ( -- * The session
     SceneSession (..)
   , newSceneSession
+  , configureWorldDepth
+  , sceneFrameObserver
 
     -- * The host
   , configureScenes
@@ -47,7 +56,9 @@ module Hetoimasia.LuaEngine.Graphics.Scene.Configuration
 
 import Data.Word (Word64)
 import Hetoimasia.Foundation.Messaging.Payload (Prepared, prepare)
-import Hetoimasia.GPU.Vulkan.GLFW (SceneMode (PerWindowScenes), SceneTargetKey, VulkanHostConfig (..))
+import Hetoimasia.GPU.Vulkan.GLFW (FrameObserver, SceneMode (PerWindowScenes), SceneTargetKey, VulkanHostConfig (..))
+import Hetoimasia.LuaEngine.Graphics.Scene.Claims (SceneClaims, newSceneClaims)
+import Hetoimasia.LuaEngine.Graphics.Scene.Receipts (DrawReceipts, newDrawReceipts, receiptObserver)
 import Hetoimasia.LuaEngine.Graphics.Scene.Ledger
   ( GraphicsScene
   , SceneLedger
@@ -68,10 +79,14 @@ data SceneSession = SceneSession
     -- ^ Where the renderer hook finds the session's renderer; the composition fills it.
   , scenesInitial ∷ !(Prepared GraphicsScene)
     -- ^ The initial scene every window holds until it publishes.
+  , scenesClaims ∷ !(SceneClaims SceneTargetKey)
+    -- ^ The terrain views' exclusive claims of targets, which the M1 publisher reads in its commit.
+  , scenesReceipts ∷ !DrawReceipts
+    -- ^ Which terrain-view revision each target drew.
   }
 
 newSceneSession ∷ IO SceneSession
-newSceneSession = SceneSession <$> newSceneLedger <*> newRenderSlot <*> prepare initialGraphicsScene
+newSceneSession = SceneSession <$> newSceneLedger <*> newRenderSlot <*> prepare initialGraphicsScene <*> newSceneClaims <*> newDrawReceipts
 
 -- | Set the scene part of a host configuration. Every field is the one set that makes the others true.
 configureScenes ∷ SceneSession → VulkanHostConfig GraphicsScene → VulkanHostConfig GraphicsScene
@@ -80,9 +95,20 @@ configureScenes session host =
     { vulkanScene = scenesInitial session
     , vulkanSceneMode = PerWindowScenes
     , vulkanSceneLifecycle = ledgerLifecycle (scenesLedger session)
-    , vulkanRenderer = sceneRenderer (scenesSlot session)
+    , vulkanRenderer = sceneRenderer (scenesReceipts session) (scenesSlot session)
+    , vulkanFrameObserver = sceneFrameObserver session (vulkanFrameObserver host)
     , vulkanInitialSceneHoldsNothing = True
     }
+
+-- | The session's frame observer before the caller's own: what a caller that sets 'vulkanFrameObserver' after
+-- 'configureScenes' sets, so the draw receipts still see every frame.
+sceneFrameObserver ∷ SceneSession → FrameObserver → FrameObserver
+sceneFrameObserver session observer event = receiptObserver (scenesReceipts session) event >> observer event
+
+-- | Give every swapchain generation of every window on the host a managed depth image, which a terrain view's world
+-- scene draws with. There is no per-window switch.
+configureWorldDepth ∷ VulkanHostConfig scene → VulkanHostConfig scene
+configureWorldDepth host = host {vulkanWindowDepth = True}
 
 -- | What is wrong with a host configuration for scenes.
 data SceneHostProblem

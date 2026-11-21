@@ -67,6 +67,7 @@ import Hetoimasia.LuaEngine.Graphics.Texture.Port (Port, TextureRef (..), textur
 import Hetoimasia.LuaEngine.Texture.Backend (TextureBackend)
 import qualified Hetoimasia.Render.Api.Texture as Api
 import qualified Hetoimasia.Render.TwoD.Vulkan as Render
+import Hetoimasia.Render.TwoD.Vulkan.Chunks (Retained)
 import Hetoimasia.Render.TwoD.Vulkan.Textures (Textures, fromBackendHandle)
 
 -- | The adapter, as a body sees it.
@@ -79,6 +80,8 @@ data TextureGraphics = TextureGraphics
     -- ^ The session's one texture registry, whose handles the scene adapters name.
   , graphicsLedger ∷ !(SceneLedger SceneTargetKey)
     -- ^ What the adopted scene revisions hold: the release of a delivered texture is gated on it.
+  , graphicsRetained ∷ !Retained
+    -- ^ The session's one registry of retained chunks, which a terrain view builds into and the renderer draws from.
   , graphicsConfiguration ∷ !TextureGraphicsConfiguration
   , graphicsPort ∷ !(Port Image UploadTicket)
     -- ^ The adapter seam: the port the backend runs over, for a client that composes a further backend over
@@ -115,7 +118,7 @@ withTextureGraphics scenes configuration hostConfig host body =
         Right session →
           withBackend (hostPort host session) $ \backend → do
             -- The renderer hook finds the session's renderer here, filled before any window can exist.
-            fillRenderSlot (scenesSlot scenes) (RenderSession (sessionRenderer session) (sessionTextures session))
+            fillRenderSlot (scenesSlot scenes) (RenderSession (sessionRenderer session) (sessionTextures session) (sessionRetained session))
             -- Composition ends when the table's placeholder is bound: texture work needs it, so it is
             -- asked for and waited for here, where a failure of the owner ends the assembly.
             awaitBound backend
@@ -125,6 +128,7 @@ withTextureGraphics scenes configuration hostConfig host body =
                 , graphicsRenderer = sessionRenderer session
                 , graphicsTextures = sessionTextures session
                 , graphicsLedger = sessionLedger session
+                , graphicsRetained = sessionRetained session
                 , graphicsConfiguration = configuration
                 , graphicsPort = hostPort host session
                 , graphicsReading = readBackend backend

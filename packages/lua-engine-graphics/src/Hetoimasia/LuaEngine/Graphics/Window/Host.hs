@@ -81,14 +81,21 @@ import Hetoimasia.GLFW.Command
   )
 import Hetoimasia.GLFW.Input (InputControl, InputReader)
 import Hetoimasia.GLFW.Window
-  ( WindowId
+  ( Attribute (..)
+  , ContentScale (..)
+  , Extent (..)
+  , WindowId
   , WindowObservation
   , WindowPhase (..)
   , closeRequestNumber
   , defaultWindowConfig
   , observedCloseRequest
+  , observedContentScale
+  , observedFramebufferExtent
+  , observedLogicalExtent
   , observedPhase
   )
+import Hetoimasia.Render.TwoD.Metrics (PixelExtent (..), TargetMetrics (..))
 import Hetoimasia.GPU.Model.Identity (TargetClass (RequiredTarget))
 import Hetoimasia.GPU.Vulkan.GLFW
   ( VulkanHandover (..)
@@ -138,6 +145,9 @@ data WindowTarget scene = WindowTarget
     -- atomic step: nothing that closes between them can be missed. It never waits.
   , targetUsable ∷ STM Bool
     -- ^ Whether this incarnation's target is still the admitted, attached one.
+  , targetGeometry ∷ STM (Maybe TargetMetrics)
+    -- ^ The window's metrics as its latest observation gives them (logical and framebuffer extents, content scale),
+    -- once all three are observed and positive: what its next frame is recorded at, before it has recorded one.
   }
 
 -- | The input of one window incarnation, as the Lua input adapter may reach it: the window's one reader, its admission control
@@ -228,6 +238,13 @@ newHostPorts vulkan = do
       , portQueueRoom = (\stats → commandsPending stats < commandsCapacity stats) <$> hostCommandStatistics (vulkanWindowHost vulkan)
       , portWakeMain = wakeGraphicsHost (vulkanGraphicsOwner vulkan)
       }
+
+-- A window's metrics from its observation, as a frame computes them from its own facts.
+observedGeometry ∷ WindowObservation → Maybe TargetMetrics
+observedGeometry observation = case (observedLogicalExtent observation, observedFramebufferExtent observation, observedContentScale observation) of
+  (Observed (Extent lw lh), Observed (Extent fw fh), Observed (ContentScale sx sy))
+    | lw > 0, lh > 0, fw > 0, fh > 0, sx > 0, sy > 0 → Just (TargetMetrics (PixelExtent lw lh) (PixelExtent fw fh) sx sy)
+  _ → Nothing
 
 -- Input ----------------------------------------------------------------------------------------------
 
@@ -357,6 +374,7 @@ target vulkan var token = do
               , targetPublish = publishVulkanWindowScene vulkan (madeWindow made)
               , targetPublishSTM = publishGraphicsWindowScene (vulkanGraphicsOwner vulkan) (madeWindow made)
               , targetUsable = (== StandingUsable) <$> standing vulkan var token
+              , targetGeometry = observedGeometry . preparedValue . observedValue <$> readSnapshot (clientObservations (madeClient made))
               }
         _ → Nothing
     _ → pure Nothing

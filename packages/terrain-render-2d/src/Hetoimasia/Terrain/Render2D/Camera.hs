@@ -88,9 +88,17 @@ module Hetoimasia.Terrain.Render2D.Camera
   , FollowOutcome (..)
   , Step (..)
   , applyCommand
+  , applyLocal
   , refollow
   , completeJump
   , cancelJump
+    -- * Settling from an authoritative surface
+  , KnownSurface (..)
+  , followedColumn
+  , requestJump
+  , followKnown
+  , completeJumpKnown
+  , prospectiveCamera
   ) where
 
 import Data.Word (Word64)
@@ -267,6 +275,8 @@ data CameraError
     PanOutOfRange
   | -- | A slice outside the supported range.
     SliceOutOfRange
+  | -- | A pan or a jump, given to 'applyLocal': they read the terrain's facts.
+    CommandNeedsFacts
   deriving stock (Eq, Show)
 
 -- | What following the surface did on this step.
@@ -310,6 +320,19 @@ applyCommand config facts command camera0
       Pan dx dy → do
         moved ← pan dx dy camera
         pure (stamp camera0 (followIfFollowing config facts moved))
+      Jump target → Right (stamp camera0 (beginJump config facts target camera))
+      _ → applyLocal config command camera0
+  where
+    camera = withinConfig config camera0
+
+-- | Apply one command that reads no terrain facts: zoom, facing, rotation and slices. A pan or a jump is refused
+-- ('CommandNeedsFacts'); 'applyCommand' applies those.
+applyLocal ∷ CameraConfig → Command → CameraState → Either CameraError Step
+applyLocal config command camera0
+  | not (validCameraConfig config) = Left InvalidConfig
+  | otherwise = case command of
+      Pan _ _ → Left CommandNeedsFacts
+      Jump _ → Left CommandNeedsFacts
       ZoomBy factor
         | bad factor → Left NonFiniteInput
         | otherwise → Right (plain (camera {csZoom = clampZoom config (csZoom camera * factor)}))
@@ -324,7 +347,6 @@ applyCommand config facts command camera0
         let target = toInteger (axisValue (csClip camera)) + delta
         level ← either (const (Left SliceOutOfRange)) Right (axisFromInteger target)
         Right (plain (camera {csMode = Manual level, csClip = level}))
-      Jump target → Right (stamp camera0 (beginJump config facts target camera))
   where
     -- Whatever the zoom the camera was last given, the configuration in force now
     -- bounds it. The revision is stamped against the camera as it was passed in, so
@@ -479,3 +501,77 @@ land target camera =
         , csAnchorY = jumpY target
         , csFrac = (1 / 2, 1 / 2)
         }
+
+-- ---------------------------------------------------------------------------
+-- Settling from an authoritative surface
+
+-- | A column's followed surface as an authority answered it (the terrain service's highest remaining occupied level):
+-- present at a level, or an empty column.
+data KnownSurface = KnownSurfaceAt !AxisCoord | KnownSurfaceEmpty
+  deriving stock (Eq, Show)
+
+-- | The column whose surface a camera will follow once its pending jump lands: the destination of a jump without Z,
+-- or, with no jump pending, the anchor while following. 'Nothing' when the camera will not follow (manual depth, or a
+-- jump with Z).
+followedColumn ∷ CameraState → Maybe Column
+followedColumn camera = case csPending camera of
+  Just PendingJump {pendingTarget = target} → case jumpZ target of
+    Nothing → Just (Column (jumpX target) (jumpY target))
+    Just _ → Nothing
+  Nothing → case csMode camera of
+    Following → Just (anchorColumn camera)
+    Manual _ → Nothing
+
+-- | Begin a jump that waits, whatever facts the caller holds: it is pending under a new identity until it is
+-- completed. Zoom and facing are kept.
+requestJump ∷ CameraConfig → JumpTarget → CameraState → Either CameraError Step
+requestJump config target camera0
+  | not (validCameraConfig config) = Left InvalidConfig
+  | otherwise =
+      let camera = withinConfig config camera0
+          jid = JumpId (csJumps camera + 1)
+          pending = camera {csJumps = csJumps camera + 1, csPending = Just (PendingJump jid target)}
+       in Right (stamp camera0 (Step pending FollowNotApplied (JumpPending jid (Demand []))))
+
+-- | Re-resolve the followed surface from an authoritative answer: a present surface is adopted (reference and clip
+-- move to it); an empty column keeps the slice and reference. A camera that is not following is unchanged.
+followKnown ∷ CameraConfig → KnownSurface → CameraState → Either CameraError Step
+followKnown config known camera0
+  | not (validCameraConfig config) = Left InvalidConfig
+  | otherwise = Right (stamp camera0 (adopt config known (withinConfig config camera0)))
+
+-- | Land the current pending jump without Z with the destination's surface as an authority answered it. A jump with Z,
+-- or one without a surface answer, does not land here: it stays pending ('completeJump' checks a jump with Z against
+-- its destination's facts). Only the current pending jump can move the camera.
+completeJumpKnown ∷ CameraConfig → Maybe KnownSurface → JumpId → CameraState → Either CameraError Step
+completeJumpKnown config known jump camera0
+  | not (validCameraConfig config) = Left InvalidConfig
+  | otherwise = Right $ case csPending camera0 of
+      Just PendingJump {pendingId = pid, pendingTarget = target}
+        | pid == jump → case (jumpZ target, known) of
+            (Nothing, Just surface) →
+              let landed = land target (withinConfig config camera0) {csPending = Nothing}
+               in stamp camera0 (adopt config surface landed) {stepJump = JumpApplied pid}
+            _ → Step camera0 FollowNotApplied (JumpPending pid (Demand []))
+      _ → Step camera0 FollowNotApplied (JumpStale jump)
+
+-- | The camera a preparation plans for before any of its copies: the pending jump's destination as it would land, and
+-- the followed surface from an authoritative answer for 'followedColumn'. Nothing is settled by it.
+prospectiveCamera ∷ CameraConfig → Maybe KnownSurface → CameraState → CameraState
+prospectiveCamera config known camera0 = case csPending camera of
+  Just PendingJump {pendingTarget = target} →
+    let landed = land target camera {csPending = Nothing}
+     in case (jumpZ target, known) of
+          (Nothing, Just surface) → stepCamera (adopt config surface landed)
+          _ → landed
+  Nothing → maybe camera (\surface → stepCamera (adopt config surface camera)) known
+  where
+    camera = withinConfig config camera0
+
+-- Adopt an authoritative surface while following.
+adopt ∷ CameraConfig → KnownSurface → CameraState → Step
+adopt config known camera = case (csMode camera, known) of
+  (Manual _, _) → Step camera FollowNotApplied NoJump
+  (Following, KnownSurfaceAt h) →
+    Step camera {csSurface = Just h, csClip = clipFor config h, csRef = clipPlaneElevation h} (FollowAdopted h) NoJump
+  (Following, KnownSurfaceEmpty) → Step camera {csSurface = Nothing} FollowColumnEmpty NoJump

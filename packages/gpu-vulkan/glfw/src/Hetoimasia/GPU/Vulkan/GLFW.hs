@@ -148,6 +148,8 @@ module Hetoimasia.GPU.Vulkan.GLFW
   , constructPipeline
   , replaceConstructedPipeline
   , releaseConstructed
+  , ConstructedDisposal (..)
+  , constructedDisposal
   , PipelineLayout
   , Pipeline
   , PipelineShaders (..)
@@ -334,6 +336,7 @@ module Hetoimasia.GPU.Vulkan.GLFW
 
     -- * Terminal failure
   , readVulkanTerminal
+  , readVulkanActionGate
   , TerminalReport (..)
   , TerminalCause (..)
   , TeardownEvidence (..)
@@ -426,6 +429,8 @@ import Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , replaceConstructedCheckedPipeline
   , replaceConstructedPipeline
   , releaseConstructed
+  , ConstructedDisposal (..)
+  , constructedDisposal
   , InstanceExtensionsMissing (..)
   , LeaseRetained (..)
   , NativeObserver (..)
@@ -460,6 +465,7 @@ import Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , readVulkanRoots
   , readVulkanTargets
   , readVulkanTerminal
+  , readVulkanActionGate
   , noObserver
   , useVulkanGeneration
   , rejectionsRetained

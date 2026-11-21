@@ -18,6 +18,7 @@ module Test.TerrainRender2D.Cells
   ) where
 
 import Control.Monad (forM_)
+import Data.Foldable (toList)
 import Data.Int (Int64)
 import Data.Function (on)
 import Data.List (sortOn)
@@ -26,7 +27,7 @@ import qualified Data.ByteString as ByteString
 import Hetoimasia.Asset.Image.DataMap (NormalEncoding (..), buildBinaryCoverage)
 import Hetoimasia.Asset.Image.Region (regionViewCoverageAt)
 import Hetoimasia.Terrain.Cell (Column (..))
-import Hetoimasia.Terrain.Coordinate (TileCoord (..), axisValue)
+import Hetoimasia.Terrain.Coordinate (RegionCoord (..), TileCoord (..), axisValue)
 import Hetoimasia.Terrain.MapBake.Catalog (MapKey (..), MapRole (..), catalogKeys, mapFileName)
 import Hetoimasia.Terrain.Render2D.Assets
 import Hetoimasia.Terrain.Render2D.Camera (camRef)
@@ -39,13 +40,14 @@ import System.FilePath ((</>))
 import Test.Hspec
 import Test.TerrainRender2D.Art (texturesDirectory)
 import Test.TerrainRender2D.CellFixtures
-import Test.TerrainRender2D.Fixtures (axis, tileAt)
+import Test.TerrainRender2D.Fixtures (axis, manualCamera, setup, tileAt)
 
 shapeNo ∷ Int → ShapeId
 shapeNo n = either (error . show) id (mkShapeId n)
 
 spec ∷ Spec
 spec = describe "Cell quads (TRA-16)" $ do
+  readFootprint
   checkedInputs
   checkedAssets
   beforeAll (loadAssets 5) $ do
@@ -53,6 +55,31 @@ spec = describe "Cell quads (TRA-16)" $ do
     agreement
     exactOrder
     negativeControls
+
+-- ---------------------------------------------------------------------------
+-- The read footprint: its expectations are the design's constants, never the production walk.
+
+readFootprint ∷ Spec
+readFootprint = describe "the read footprint" $ do
+  let camera = manualCamera 0 0 1
+      regionsOf = \case
+        Right (ReadRegions keys) → keys
+        other → error ("not a footprint: " <> show other)
+  it "is empty for a zero drawable" $
+    regionsOf (cellReadFootprint 512 camera (setup 0 0) defaultCellConfig) `shouldBe` mempty
+  it "refuses at the first region over its limit, and at the planner's column bound" $ do
+    cellReadFootprint 0 camera (setup 320 240) defaultCellConfig `shouldBe` Right (ReadBeyondRegions 0)
+    let oneColumn = defaultCellConfig {ccLimits = (ccLimits defaultCellConfig) {clColumns = 1}}
+    cellReadFootprint 512 camera (setup 320 240) oneColumn `shouldBe` Right (ReadBeyondColumns 1)
+  it "checks the planner's configuration before it walks: a depth past the planner's bound is refused" $
+    cellReadFootprint 512 camera (setup 320 240) defaultCellConfig {ccDepth = 1000000} `shouldBe` Left CellInvalidConfig
+  it "holds the anchor's region and stays inside the representable world at its edge" $ do
+    let top = 2 ^ (62 ∷ Int) - 1 ∷ Integer
+        keys = regionsOf (cellReadFootprint 512 (manualCamera top 0 1) (setup 320 240) defaultCellConfig)
+        xs = [toInteger (regionX key) | key ← toList keys]
+    keys `shouldSatisfy` (not . null)
+    maximum xs `shouldBe` top `div` 16
+    regionsOf (cellReadFootprint 512 camera (setup 320 240) defaultCellConfig) `shouldSatisfy` elem (RegionCoord 0 0 0)
 
 -- ---------------------------------------------------------------------------
 -- Inputs

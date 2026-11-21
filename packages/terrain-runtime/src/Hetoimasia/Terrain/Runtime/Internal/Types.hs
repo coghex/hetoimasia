@@ -56,6 +56,8 @@ module Hetoimasia.Terrain.Runtime.Internal.Types
 
     -- * Service
   , Service (..)
+  , ArenaMark (..)
+  , arenaMark
 
     -- * Commands and requests
   , Cmd (..)
@@ -656,7 +658,28 @@ data Service = Service
   , -- | The compile account: the part of the resident bank carved out for compiled
     -- connectivity (every arena's result and the one active compilation's peak).
     serviceCompileBank ∷ !Word64
+  , -- | A count that moves only in the transactions that end a lease's validity (an arena's close, a
+    -- lease's release, a client's end, the service's close): what watches it looks at its own lease
+    -- when it moves, rather than at the whole state, which every load and settlement writes.
+    serviceAuthority ∷ !(TVar Word64)
+  , -- | Each live arena's identity cell ('ArenaMark'), written by the state's one write ('putSt')
+    -- only when that arena's mark moves, and set to 'Nothing' when the arena ends. A cell is made
+    -- the first time a holder asks for it, or when the arena appears.
+    serviceArenaMarks ∷ !(TVar (Map ArenaId (TVar (Maybe ArenaMark))))
   }
+
+-- | What identifies an arena's committed version: its content and knowledge revisions and its
+-- residency generation.
+data ArenaMark = ArenaMark
+  { markContent ∷ !Revision
+  , markKnowledge ∷ !Revision
+  , markGeneration ∷ !Word64
+  }
+  deriving stock (Eq, Show)
+
+-- | The mark of an arena as its state stands.
+arenaMark ∷ Arena → ArenaMark
+arenaMark arena = let auth = arenaAuthority arena in ArenaMark (D.authContent auth) (D.authKnowledge auth) (arenaGeneration arena)
 
 -- ---------------------------------------------------------------------------
 -- Commands and requests

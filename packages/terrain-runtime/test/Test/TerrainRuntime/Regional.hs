@@ -556,6 +556,34 @@ compressionSpec = describe "compression" $ do
       mapM_ (releaseRegionBorrow svc) [pristine, one]
       settleChecks svc
 
+  it "counts a region's input runs from its packed parts as decoding them does: its intervals, and one run for a uniform region or every column's class's runs" $
+    withService defaultConfig $ \svc → guarded svc $ \taken → do
+      (_, lease) ← openWith svc (ground []) []
+      let below = region 5 5 (-1)
+          above = region 5 5 1
+      _ ← removeCell' svc lease (tile 88 88 (-16))
+      _ ← removeCell' svc lease (tile 83 90 (-20))
+      settled svc lease
+      borrow ← borrowOf taken lease [below, above]
+      let snapshot = regionBorrowSnapshot borrow
+          decoded r = case (regionTerrain snapshot r, regionKnowledge snapshot r) of
+            (PartReady intervals, PartReady known) → Just (length intervals, runsOf known)
+            _ → Nothing
+          runsOf known = case D.regionKnowledgeClasses known of
+            [[_]] → 1
+            classes → sum [length (classes !! c) | c ← classOfEach known]
+          classOfEach known = case D.regionKnowledgeColumns known of
+            [] → replicate 256 0
+            columns → columns
+      -- by hand: the region above is one class of one run; the one below holds the two removed intervals
+      regionInputCounts snapshot above `shouldBe` Just (0, 1)
+      fmap fst (regionInputCounts snapshot below) `shouldBe` Just 2
+      -- and both agree with counting the decoded parts
+      map (regionInputCounts snapshot) [below, above] `shouldBe` map decoded [below, above]
+      regionInputCounts snapshot (region 0 0 9) `shouldBe` Nothing
+      releaseRegionBorrow svc borrow
+      settleChecks svc
+
   it "evaluates every level of a box whose components keep the level, and counts those evaluations apart" $
     withService defaultConfig $ \svc → guarded svc $ \taken → do
       -- a covered stack of N ramps: stacked non-flat cells never connect between levels

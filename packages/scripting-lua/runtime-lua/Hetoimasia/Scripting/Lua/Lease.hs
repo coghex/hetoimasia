@@ -191,6 +191,7 @@ module Hetoimasia.Scripting.Lua.Lease
 
     -- * The application's check
   , leaseLive
+  , leaseLiveSTM
   , leaseCapabilityType
 
     -- * Reading
@@ -402,6 +403,11 @@ releaseLease leases key = do
 -- handle's type, run by the value boundary before a binding's action.
 leaseLive ∷ Leases → Word64 → IO Bool
 leaseLive leases key = atomically (liveKey leases key)
+
+-- | 'leaseLive' inside a caller's transaction, so a check and what it authorises are one atomic step: a release that
+-- begins after it cannot be missed.
+leaseLiveSTM ∷ Leases → Word64 → STM Bool
+leaseLiveSTM = liveKey
 
 -- | A capability type for lease handles, named, whose liveness is the lease's.
 leaseCapabilityType ∷ Leases → Text → CapabilityType

@@ -3,7 +3,7 @@
 module Test.TerrainRender2D.Camera (spec, variedSource, variedFacts) where
 
 import Control.Monad (forM_)
-import Hetoimasia.Terrain.Cell (ZRange, mkZRange)
+import Hetoimasia.Terrain.Cell (Column (..), ZRange, mkZRange)
 import Hetoimasia.Terrain.Changes (ChangeLimits (..), RemoveOutcome (..), emptyChanges, removeCell)
 import Hetoimasia.Terrain.Coordinate (AxisCoord, axisMaxValue, axisValue)
 import Hetoimasia.Terrain.Render2D.Camera
@@ -208,6 +208,44 @@ spec = describe "Camera" $ do
           Step waiting _ event = step (Jump (JumpTarget (axis 0) (axis 0) (Just (axis 500)))) partial start
       event `shouldBe` JumpPending (JumpId 1) (demandFrom [(ChunkKey 0 0, 500, 501)])
       camMode waiting `shouldBe` camMode start
+
+  describe "settling from an authoritative surface" $ do
+    it "lands a follow jump at the answered surface, and agrees with the prospective camera" $ do
+      let Step waiting _ _ = ok (requestJump cfg (JumpTarget (axis 2) (axis 0) Nothing) start)
+      followedColumn waiting `shouldBe` Just (Column (axis 2) (axis 0))
+      let Step landed followed done = ok (completeJumpKnown cfg (Just (KnownSurfaceAt (axis 2))) (JumpId 1) waiting)
+          planned = prospectiveCamera cfg (Just (KnownSurfaceAt (axis 2))) waiting
+          geometry c = (camAnchorX c, camAnchorY c, camFrac c, camRef c, camClip c, camMode c, camSurface c, camZoom c, camFacing c)
+      done `shouldBe` JumpApplied (JumpId 1)
+      followed `shouldBe` FollowAdopted (axis 2)
+      (camMode landed, level (camClip landed), camRef landed, camSurface landed) `shouldBe` (Following, 27, 3, Just (axis 2))
+      geometry planned `shouldBe` geometry landed
+    it "lands neither a jump with Z nor a follow jump without a surface answer: those stay pending" $ do
+      let Step withZ _ _ = ok (requestJump cfg (JumpTarget (axis 1) (axis 0) (Just (axis 7))) start)
+          Step kept _ event = ok (completeJumpKnown cfg (Just (KnownSurfaceAt (axis 2))) (JumpId 1) withZ)
+      event `shouldSatisfy` isPending
+      kept `shouldBe` withZ
+      let Step following _ _ = ok (requestJump cfg (JumpTarget (axis 2) (axis 0) Nothing) start)
+          Step unanswered _ event' = ok (completeJumpKnown cfg Nothing (JumpId 1) following)
+      event' `shouldSatisfy` isPending
+      unanswered `shouldBe` following
+    it "applies zoom, facing and slices without facts, and refuses a pan or a jump there" $ do
+      let Step zoomed _ _ = ok (applyLocal cfg (SetZoom 2) start)
+      camZoom zoomed `shouldBe` 2
+      applyLocal cfg (Pan 1 0) start `shouldBe` Left CommandNeedsFacts
+      applyLocal cfg (Jump (JumpTarget (axis 1) (axis 0) Nothing)) start `shouldBe` Left CommandNeedsFacts
+    it "keeps the slice and reference over an empty followed column" $ do
+      let Step kept followed _ = ok (followKnown cfg KnownSurfaceEmpty start)
+      followed `shouldBe` FollowColumnEmpty
+      (level (camClip kept), camRef kept, camSurface kept) `shouldBe` (level (camClip start), camRef start, Nothing)
+    it "waits on every requested jump, whatever facts the caller holds, and lands a with-Z jump only through completion" $ do
+      let Step waiting _ event = ok (requestJump cfg (JumpTarget (axis 1) (axis 0) (Just (axis 7))) start)
+      event `shouldSatisfy` isPending
+      followedColumn waiting `shouldBe` Nothing
+      (camAnchorX waiting, camClip waiting) `shouldBe` (camAnchorX start, camClip start)
+      let Step landed _ done = ok (completeJump cfg variedFacts (JumpId 1) waiting)
+      done `shouldBe` JumpApplied (JumpId 1)
+      (camMode landed, level (camClip landed), camRef landed) `shouldBe` (Manual (axis 7), 7, 8)
 
   describe "configuration" $ do
     it "refuses an invalid configuration in every transition, keeping the camera" $ do

@@ -86,6 +86,7 @@ import Hetoimasia.LuaEngine.Graphics.Scene
   , configureScenes
   , newSceneSession
   , noPublishHooks
+  , sceneFrameObserver
   , scenePublisher
   )
 import Hetoimasia.LuaEngine.Graphics.Texture
@@ -222,7 +223,7 @@ runNativeWith observation environment choice lifetime stop link prepared = do
                     , graphicsMount = \pipeline link' continue →
                         withWindowProvider (linkWindowConfig link') port $ \provider → do
                           writeIORef providerStep (windowMainStep provider)
-                          let publisher = scenePublisher (graphicsTextures graphics) provider
+                          let publisher = scenePublisher (scenesClaims scenes) (graphicsTextures graphics) provider
                               injection = graphicsInjection (GraphicsFacade profile pipeline provider publisher noPublishHooks defaultIssuedMemory Nothing)
                           continue injection `finally` writeIORef providerStep (pure ())
                     }
@@ -240,7 +241,7 @@ runNativeWith observation environment choice lifetime stop link prepared = do
 hostConfiguration ∷ Observation → ValidationChoice → TextureGraphicsConfiguration → SceneSession → VulkanHostConfig GraphicsScene
 hostConfiguration observation choice textureConfiguration scenes =
   (configureScenes scenes (configureWindows (configureHost textureConfiguration base)))
-    { vulkanFrameObserver = observeFrame observation
+    { vulkanFrameObserver = sceneFrameObserver scenes (observeFrame observation)
     , vulkanOptionalValidation = choice
     }
   where

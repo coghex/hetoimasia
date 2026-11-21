@@ -127,6 +127,8 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Rendering
   , constructBuffer
   , constructImage
   , releaseConstructed
+  , ConstructedDisposal (..)
+  , constructedDisposal
   , constructFramelessBatch
   , constructTargetBatch
   , constructReadback
@@ -302,8 +304,10 @@ import Hetoimasia.GPU.Vulkan.Native.Recording
   , Image
   , ImageDescription
   , ImageLayout (..)
+  , Managed (managedResource)
   , ManagedStanding (..)
   , ManagedView (..)
+  , readManagedStanding
   , Pipeline
   , PipelineLayout
   , PipelineShaders
@@ -742,6 +746,24 @@ releaseConstructedTexture construction handle = confined construction (releaseTe
 -- | The texture table as it stands, if the session made one.
 readConstructedTable ∷ Construction q inst msgr phys dev cmd → IO (Maybe TableView)
 readConstructedTable construction = atomically (readTable (constructionRecording construction))
+
+-- | Where a released buffer's physical disposal stands: still held (its release
+-- waits for the batches that recorded it, or for the model to record its
+-- destruction), done (destroyed and forgotten), or failed (its destruction
+-- raised and is never attempted again). A caller that frees capacity only once
+-- a buffer is gone asks this, on the owner's thread, in an action.
+data ConstructedDisposal
+  = DisposalPending
+  | DisposalDone
+  | DisposalFailed !Text
+  deriving (Eq, Show)
+
+constructedDisposal ∷ Construction q inst msgr phys dev cmd → Buffer → STM ConstructedDisposal
+constructedDisposal construction buffer =
+  readManagedStanding (constructionRecording construction) (managedResource buffer) <&> \case
+    Nothing → DisposalDone
+    Just (ManagedUncertain why) → DisposalFailed why
+    Just _ → DisposalPending
 
 -- | Release a handle the renderer constructed: nothing records it again, and a
 -- batch that recorded it keeps it until that batch's references end. The
