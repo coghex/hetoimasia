@@ -628,18 +628,23 @@ publication`, one bounded unit a step, all for the **destination camera**:
    followed surface adopted; `prospectiveCamera`), from the geometry planning
    shares (`cellReadFootprint`: each candidate column's own read and its two
    nearer columns', rotated to world columns and floor-divided into regions),
-   with the anchor's own region. It depends on the camera, the metrics and
-   the configuration only. More than `profileRegions` keys refuses
+   nothing else. A pending move with a level also has its destination's region
+   copied, and charged with F, when F lacks it: its part is checked there, and
+   it is never demanded. It depends on the camera, the metrics and the
+   configuration only. More than `profileRegions` keys refuses
    (`LimitRegions`) at the first excess key; more candidate columns than the
-   planner's bound refuses (`LimitPlan`). An empty F (a zero drawable) waits
-   for the basis to move.
+   planner's bound refuses (`LimitPlan`). An empty F (a zero drawable) copies
+   and demands nothing and waits for the basis to move.
 3. **Copying.** The whole of F, in disjoint batches of at most
    `profileRequestRegions` (and the terrain service's hold and query bounds),
-   one request in flight; each borrow is taken and returned in one transaction
-   as soon as it settles, and returned if cancellation lost the race. Each copy
-   must hold exactly its batch, at the surface answer's content revision. One
-   total of input runs and intervals, counted as the planner is handed them,
-   is checked against `profileRuns` as each copy is accepted (`LimitRuns`).
+   one request in flight; a settled borrow stays charged through the copy's
+   checks and is returned exactly once, in the transaction that accepts the
+   copy, refuses it or finds it stale, and returned if cancellation lost the
+   race. Each copy must hold exactly its batch, at the surface answer's content
+   revision. One total of input runs and intervals, counted from the copies'
+   interval and class data before anything is expanded (as many as the planner
+   is handed), is checked against `profileRuns` as each copy is accepted
+   (`LimitRuns`).
    Splitting is transport only: F is admitted or refused as a whole. Copies of
    different versions are never combined.
 4. **Settling**, at the camera's transition: a pending move lands (a move
@@ -649,7 +654,9 @@ publication`, one bounded unit a step, all for the **destination camera**:
    again), a following camera adopts the answered surface. The settled camera
    is the one F was enumerated for.
 5. **Planning**, on the planner: the copies' inputs and the plan in
-   `profileStepWork` quanta, its adaptation and its parts, once. A plan that
+   `profileStepWork` quanta, its adaptation and its parts, once. Its prefetch
+   ring is listed only as far as the service's camera regions leave places
+   after F. A plan that
    meets a plan-wide bound (columns, levels, quads, pending spans) is refused
    (`LimitPlan`), never published truncated. Every pending move of a refused
    preparation settles with pressure; a refusal of a preparation a newer
@@ -678,7 +685,13 @@ publication`, one bounded unit a step, all for the **destination camera**:
    of them can no longer be drawn.
 
 A move never lands from facts the view already holds: it waits for a
-preparation of its destination. An attachment checks that the client owns the
+preparation of its destination. Every transaction that writes a stage back,
+changes the camera, settles a move, records a refusal or publishes first checks
+that the work is still current: the same stage, an open view and service, a
+usable target, a live arena lease, the full basis it was prepared from, and,
+when it settles a move, the same pending move. Stale work discards only itself
+and the newer state is prepared. Camera controls other than a move need no
+terrain facts: they apply once a preparation has settled the camera. An attachment checks that the client owns the
 arena lease.
 
 ### Limits and the reservation
