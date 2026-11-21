@@ -163,9 +163,11 @@ In `TerrainView.Session`, replace the seeding in `startIfDue`, the over-budget f
 
 Replace the tests that derive their expected region cap from `regionsCopied`, allow a spare region of runs in the move budget, or treat an empty `cdVisible` as proof of coverage. Delete their obsolete measurement helpers where unused. Keep the split-copy expanded-run regression, pure camera/Cells planner tests, the stale-refusal guard, runtime bank refusals, capture and native zoom assertions, draw receipts, retirement, shutdown and final-head evidence. View-specific close reporting and the evicted-metrics M1 regression remain separate outstanding #716 fixes within A.
 
-## Proposal for owner approval · View lifecycle in #714
+## Approved amendment for #714 · View lifecycle
 
-At `7194e362`, minimizing a populated view clears its runtime demand. Restoring the same metrics satisfies the published-basis check, so the demand stays empty. The window adapter can also miss the minimize altogether. Both failures follow from using a record of a past draw to answer a question about the target now. This proposal amends delivery A. The approved destination-copy rule, amendment F and the boundary with #715 and #717 continue to apply. [Round 6](https://github.com/coghex/hetoimasia/pull/716#issuecomment-7059053106) · [Round 7](https://github.com/coghex/hetoimasia/pull/716#issuecomment-7059489440)
+The owner approved this section at `741cb5e9cd` with “Y” on 2026-11-21 at 16:48:26 UTC.
+
+At `7194e362`, minimizing a populated view clears its runtime demand. Restoring the same metrics satisfies the published-basis check, so the demand stays empty. The window adapter can also miss the minimize altogether. Both failures follow from using a record of a past draw to answer a question about the target now. This section amends delivery A. The approved destination-copy rule, amendment F and the boundary with #715 and #717 continue to apply. [Round 6](https://github.com/coghex/hetoimasia/pull/716#issuecomment-7059053106) · [Round 7](https://github.com/coghex/hetoimasia/pull/716#issuecomment-7059489440)
 
 ### What the view observes
 
@@ -216,9 +218,9 @@ Distinguish a refused *build call* from a refused *view replacement*. Transient 
 
 Replace `startIfDue`'s published/invalid/idle tests, `vsIdleAt`, `settleWith.withdraw`, the `vsSource` branch and the separate `vsReady` flag with the observations and output comparisons above. Replace the overloaded publication Boolean with actual part validity, and the global freed-counter refusal test with the current refusal and its relevant inputs. Keep one bounded candidate, serial and move guards, packed counting under borrow, latest pure planner, owner-only build/publication and the independent invalidation of failed uploads. Wake the reconciler on changes to its observed inputs or completion of its outstanding work. Ledger, receipt and owner-queue notifications may coalesce. A kick carries no instruction to rebuild or settle. Extend the existing disposal ledger to represent a refused allocation as well as a registered chunk.
 
-### Proposed #714 amendment and acceptance
+### Approved #714 amendment and acceptance
 
-**Amendment text for approval.** Derive this view's runtime demand, terrain publication and control settlement from the current authority, observed geometry, camera intent and readiness under the rules above. Restore demand independently of drawing. Publish a drawable empty footprint as a coherent clear revision. Retain a refused allocation's charge until confirmed destruction. Apply the following acceptance examples alongside amendments F and S. Each runs once and checks outcomes. Ordering within a priority class, owner steps and elapsed time are free.
+**Amendment text.** Derive this view's runtime demand, terrain publication and control settlement from the current authority, observed geometry, camera intent and readiness under the rules above. Restore demand independently of drawing. Publish a drawable empty footprint as a coherent clear revision. Retain a refused allocation's charge until confirmed destruction. Apply the following acceptance examples alongside amendments F and S. Each runs once and checks outcomes. Ordering within a priority class, owner steps and elapsed time are free.
 
 | Example | Observable outcome |
 | --- | --- |
