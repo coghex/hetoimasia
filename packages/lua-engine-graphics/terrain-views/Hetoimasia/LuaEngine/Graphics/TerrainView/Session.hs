@@ -96,7 +96,7 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView.Session
 
 import Control.Concurrent.STM
 import Control.Applicative ((<|>))
-import Control.Exception (Exception, SomeAsyncException, SomeException, displayException, evaluate, finally, fromException, mask, onException, rethrowIO, throwIO, try, tryWithContext, uninterruptibleMask_)
+import Control.Exception (Exception, SomeAsyncException, SomeException, displayException, evaluate, finally, fromException, mask, mask_, onException, rethrowIO, throwIO, try, tryWithContext, uninterruptibleMask_)
 import Control.Monad (filterM, forM, forM_, unless, void, when)
 import Data.Foldable (for_, toList)
 import Data.Functor ((<&>))
@@ -920,7 +920,7 @@ data OpenRefusal
 -- published the real empty revision in that transaction, which asks it for the first frame its views plan for; a
 -- target showing a scene keeps it until the view's first revision is published. A refusal leaves nothing behind.
 openView ∷ (Ord k, Show k) ⇒ TerrainViews k → OpenRequest k → IO (Either OpenRefusal (TerrainView k))
-openView service request = mask $ \restore → do
+openView service request = mask_ $ do
   let ports = svPorts service
       target = openTarget request
       (x, y, z) = openAnchor request
@@ -933,7 +933,9 @@ openView service request = mask $ \restore → do
         else case newCamera (tvCamera (svConfig service)) x y z of
           Left why → pure (Left (OpenCamera why))
           Right camera →
-            restore (openStyle request) >>= \case
+            -- masked: the style is recorded (its release attached) in the handoff that acquires it; only its own
+            -- interruptible waits can be interrupted
+            openStyle request >>= \case
               Left why → pure (Left (OpenStyle why))
               Right style → do
                 let undo = styleRelease style

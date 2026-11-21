@@ -113,7 +113,7 @@ module Hetoimasia.Render.TwoD.Vulkan.Chunks
 
 import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVar, newTVarIO, readTVar, readTVarIO, writeTVar)
 import Data.IORef (atomicModifyIORef', newIORef, readIORef, writeIORef)
-import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeAsyncException, SomeException, displayException, fromException, mask, mask_, rethrowIO, throwIO, try, tryWithContext)
+import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeAsyncException, SomeException, displayException, fromException, mask_, rethrowIO, throwIO, try, tryWithContext)
 import Control.Monad (when)
 import qualified Data.ByteString as ByteString
 import Data.List.NonEmpty (NonEmpty)
@@ -378,7 +378,7 @@ spendChunkGrant
   → ChunkGrant
   → (BuildRefused → IO ())
   → IO (Either BuildRefused ChunkRef)
-spendChunkGrant builders (Retained ledger) grant interrupted = mask $ \restore → do
+spendChunkGrant builders (Retained ledger) grant interrupted = mask_ $ do
   taken ← atomically $
     if grantRegistry grant /= ledger
       then pure False
@@ -406,7 +406,9 @@ spendChunkGrant builders (Retained ledger) grant interrupted = mask $ \restore �
               Made buffer → allocationOf buffer <$> releaseOnce buffer
             atomically (spendingGiveBack grant)
             pure (BuildRefused refusal allocation)
-      outcome ← tryWithContext @SomeException (restore (attempt made))
+      -- masked throughout: the buffer is recorded in the same handoff that makes it, and only the native calls' own
+      -- interruptible waits can be interrupted, before a buffer exists or once it is recorded
+      outcome ← tryWithContext @SomeException (attempt made)
       case outcome of
         Right (Right reference) → pure (Right reference)
         Right (Left refusal) → Left <$> failed refusal
