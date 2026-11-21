@@ -1813,10 +1813,9 @@ publish service vs serial prep candidate = do
         claim ← claimOf (portClaims ports) (vtKey (vsTarget vs))
         let mine = fmap claimView claim == Just (vsId vs)
         if
-          | not live || not mine → do
+          | not live || not mine →
               -- overtaken: the private builds go, and the newer state is prepared next
-              _ ← takeStage service vs
-              pure True
+              True <$ discardStale service vs serial
           | Set.size keep >= 2 →
               -- two earlier revisions can still be drawn (the drawn one and an adopted successor): publication waits
               -- for one of them to stop being drawable, which a frame or the ledger reports with a kick
