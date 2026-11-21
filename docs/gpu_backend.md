@@ -467,8 +467,10 @@ is named and nothing fails.
   `resource <n>.<generation> pipeline`.
 - A naming call that raised is a failure of the thing being named, by that
   thing's own rules: a surface is not admitted, a generation fails its
-  construction, a managed resource is released and its handle never returned.
-  Nothing is published as named that was not.
+  construction, a managed resource is released and its handle never returned;
+  the exception it raises names the released resource in its context
+  (`releasedResourceOf`, `releasedBufferOf`), so a caller can follow it to its
+  destruction. Nothing is published as named that was not.
 - **Two objects are never named.** The instance, because naming requires
   external synchronization and the main thread uses the instance through the
   surface bridge's lease. The debug messenger, because the pinned loader
