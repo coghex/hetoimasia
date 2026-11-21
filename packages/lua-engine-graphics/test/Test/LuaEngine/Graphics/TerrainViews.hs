@@ -60,7 +60,9 @@ import Hetoimasia.Terrain.Residency (Limits, LimitsSpec (..), mkLimits)
 import Hetoimasia.Terrain.Shape (ViewFacing (..))
 import Hetoimasia.Terrain.Source (LayerSpec (..), SourceSpec (..))
 import System.IO.Temp (withSystemTempDirectory)
-import Test.Hspec hiding (after, before)
+import Test.Hspec hiding (after, before, it)
+import qualified Test.Hspec as Hspec
+import Test.Support.Bounded (bounded)
 import Test.Support.Owned (withOwnedThread)
 import Control.Exception (finally)
 import Data.IORef (newIORef, readIORef, writeIORef)
@@ -484,6 +486,10 @@ dimmer = either (error . show) id (mkLightSettings defaultLightInput {inputAmbie
 -- ---------------------------------------------------------------------------
 -- The examples
 
+-- Every example is bounded ("Test.Support.Bounded"): a hang fails in seconds instead of holding the run.
+it ∷ HasCallStack ⇒ String → IO () → Spec
+it name = Hspec.it name . bounded
+
 spec ∷ Spec
 spec = describe "terrain views (TRA-9 v2)" $ do
   describe "publication" $ do
@@ -851,7 +857,7 @@ spec = describe "terrain views (TRA-9 v2)" $ do
 
     it "waits for the owner's running build before the service returns its reservation, and disposes of what it built" $ do
       box ← newEmptyTMVarIO
-      bodyEnded ← newTVarIO False
+      viewBox ← newEmptyTMVarIO
       seenHeld ← newTVarIO False
       stop ← newTVarIO False
       charged ← newEmptyTMVarIO
@@ -867,20 +873,21 @@ spec = describe "terrain views (TRA-9 v2)" $ do
             rig ← atomically (readTMVar box)
             timeout 10000000 (atomically (takeTMVar (rigEntered rig))) >>= maybe (fail "no build was held") pure
             atomically (writeTVar seenHeld True)
-            -- the body has returned and the scope's drain waits for the held step: the reservation is still charged
-            atomically (readTVar bodyEnded >>= check)
+            -- the gate: the scope's shutdown has ended the view (nothing else ends it here), so the held chunk can only go
+            -- to disposal and nothing is published; the drain waits for the held step, and the reservation is still charged
+            view ← atomically (readTMVar viewBox)
+            atomically (readView view >>= check . (== ViewEnded EndStopped) . readingStatus)
             atomically (accountCharged (rigAccount rig)) >>= atomically . putTMVar charged
             atomically (putTMVar (rigResume rig) ())
       withOwnedThread owner $ \_ _ →
         withOwnedThread controller $ \_ controllerEnded → do
           withRig defaultOptions {optTeardown = TeardownNone} $ \rig → do
             target ← newTarget 1
-            _ ← openOn rig target
+            view ← openOn rig target
             held ← readTVarIO (rigNext rig)
             atomically (writeTVar (rigHold rig) (Just held))
-            atomically (putTMVar box rig)
+            atomically (putTMVar viewBox view >> putTMVar box rig)
             timeout 10000000 (atomically (readTVar seenHeld >>= check)) >>= maybe (expectationFailure "the build was never held") pure
-            atomically (writeTVar bodyEnded True)
           controllerEnded
           atomically (writeTVar stop True)
           rig ← atomically (readTMVar box)
