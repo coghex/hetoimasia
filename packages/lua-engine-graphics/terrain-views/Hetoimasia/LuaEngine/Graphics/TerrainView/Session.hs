@@ -1132,14 +1132,19 @@ abandonFlight ∷ TerrainViews k → InFlight → IO ()
 abandonFlight service flight = do
   let terrain = portTerrain (svPorts service)
   _ ← cancel terrain (flightRequest flight)
-  atomically $
-    tryReadTMVar (flightBox flight) >>= \case
-      Just (Succeeded (Runtime.ARegions borrow)) →
-        takeSTM terrain (flightRequest flight) >>= \case
-          Taken → Runtime.releaseRegionBorrowSTM terrain borrow
-          TakeReleased → pure ()
-      Just _ → retireSTM terrain (flightRequest flight)
-      Nothing → pure ()
+  atomically (finishSettled terrain flight)
+
+-- Finish a request whose settlement is in its box: a borrow not yet taken is taken and returned, any other answer
+-- retired. A request taken already, or not settled, is left as it is.
+finishSettled ∷ Runtime.Service → InFlight → STM ()
+finishSettled terrain flight =
+  tryReadTMVar (flightBox flight) >>= \case
+    Just (Succeeded (Runtime.ARegions borrow)) →
+      takeSTM terrain (flightRequest flight) >>= \case
+        Taken → Runtime.releaseRegionBorrowSTM terrain borrow
+        TakeReleased → pure ()
+    Just _ → retireSTM terrain (flightRequest flight)
+    Nothing → pure ()
 
 -- ---------------------------------------------------------------------------
 -- The owner's step
@@ -1398,13 +1403,18 @@ stillCurrent service vs serial basis jump = do
   pure (current && status == ViewOpen && open && isNothing ended && usable && isJust arena && now == basis && maybe True (== pending) jump)
 
 -- Stale work discards only itself: a stage that is still the step's (its serial) goes, its private builds to disposal
--- and its request cancelled by the caller, and the newer state is prepared.
-discardStale ∷ (Ord k, Show k) ⇒ TerrainViews k → ViewState k → Word64 → STM (Maybe InFlight)
+-- and its settled request finished here, and the newer state is prepared.
+--
+-- Invariant: the stage a step discards holds no unsettled request. A step reaches 'writeBack', 'refuse' or this only
+-- after the flight its stage holds has settled (and, for a copy, been taken); a step that starts a request passes it
+-- to 'writeBack' in the new stage, and abandons it itself when 'writeBack' answers 'False'. Only 'abandon' (an
+-- overtaken stage, outside any step's work) takes an unsettled request, and it cancels it.
+discardStale ∷ (Ord k, Show k) ⇒ TerrainViews k → ViewState k → Word64 → STM ()
 discardStale service vs serial = do
   mine ← (== serial) <$> readTVar (vsStageSerial vs)
   flight ← if mine then takeStage service vs else pure Nothing
+  for_ flight (finishSettled (portTerrain (svPorts service)))
   kick service
-  pure flight
 
 -- Write a step's new stage back while its work is still current ('False' otherwise: then it is stale, and discarded).
 -- No stage written back holds a chunk the step made: a build is handed to the stage, or to disposal, in its own
@@ -1421,7 +1431,7 @@ writeBack service vs serial basis stage =
 refuse ∷ (Ord k, Show k) ⇒ TerrainViews k → ViewState k → Word64 → Basis → BindingLimit → STM ()
 refuse service vs serial basis limit =
   stillCurrent service vs serial basis Nothing >>= \case
-    False → void (discardStale service vs serial)
+    False → discardStale service vs serial
     True → do
       stage ← readTVar (vsStage vs)
       case stage of
