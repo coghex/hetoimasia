@@ -685,7 +685,7 @@ prepare profile host directory device (subPixelBits, driverName, driverInfo) sty
           <> [(decoded, if take 7 identity == "colour." then Rgba8Srgb else Rgba8Linear, DefaultMark) | (identity, decoded, _) ← singleImages singles]
           <> [(styleColourImage holedOf, Rgba8Srgb, DefaultMark)]
   made ← OrderedPath.hostAct (retainedBase host) "making the renderer and the atlas textures" $ \construction → do
-    renderer ← Render.makeRenderer (buildersWith (retainedSubmit host) construction) terrainConfiguration
+    renderer ← Render.makeRenderer (buildersWith (retainedUploads host) construction) terrainConfiguration
     made' ← traverse (\(decoded, format, _) → constructImage construction (ImageDescription TextureImage format (decodedWidth decoded) (decodedHeight decoded) 1)) images
     pure ((,) <$> renderer <*> sequence made')
   case made of
@@ -701,7 +701,7 @@ prepare profile host directory device (subPixelBits, driverName, driverInfo) sty
               textures ← newTextures
               registered ← OrderedPath.hostAct (retainedBase host) "registering the atlases" $ \construction →
                 fmap sequence . forM (zip images gpuImages) $ \((decoded, _, policy), image) →
-                  registerTexture (buildersWith (retainedSubmit host) construction) textures image decoded policy >>= \case
+                  registerTexture (buildersWith (retainedUploads host) construction) textures image decoded policy >>= \case
                     Left refusal → pure (Left (RefusedIllegal (tshow refusal)))
                     Right handle → pure (Right (handle, decoded))
               case registered of
@@ -760,11 +760,11 @@ teardown ∷ Ctx → IO ()
 teardown ctx = do
   live ← liveChunks (ctxRetained ctx)
   _ ← OrderedPath.hostAct (retainedBase (ctxHost ctx)) "releasing the retained chunks" $ \construction → do
-    let builders = buildersWith (retainedSubmit (ctxHost ctx)) construction
+    let builders = buildersWith (retainedUploads (ctxHost ctx)) construction
     results ← traverse (releaseChunkNow builders (ctxRetained ctx)) live
     pure (sequence_ results)
   _ ← OrderedPath.hostAct (retainedBase (ctxHost ctx)) "releasing the atlases" $ \construction → do
-    let builders = buildersWith (retainedSubmit (ctxHost ctx)) construction
+    let builders = buildersWith (retainedUploads (ctxHost ctx)) construction
     results ← traverse (releaseTextureNow builders (ctxTextures ctx)) (ctxAll ctx)
     pure (sequence_ results)
   pure ()
@@ -931,7 +931,7 @@ retainedFixture ctx s sc plan shape =
           (chunkB, dynamic) = partition (even . cellY') odd'
           built group = OrderedPath.hostAct (retainedBase (ctxHost ctx)) "building a retained chunk" $ \construction →
             buildRetainedChunkWith
-              (buildersWith (retainedSubmit (ctxHost ctx)) construction)
+              (buildersWith (retainedUploads (ctxHost ctx)) construction)
               (ctxRetained ctx)
               marks
               ChunkWorldDepth
@@ -953,7 +953,7 @@ retainedFixture ctx s sc plan shape =
               Right view → do
                 outcome ← renderSnapshot ctx s [Part sc plan camera shape (Pass (OffscreenTarget (shapeRef shape)) (ClearColour 0 0 0 1) [view]) adapted]
                 _ ← OrderedPath.hostAct (retainedBase (ctxHost ctx)) "releasing the fixture's chunks" $ \construction → do
-                  let builders = buildersWith (retainedSubmit (ctxHost ctx)) construction
+                  let builders = buildersWith (retainedUploads (ctxHost ctx)) construction
                   results ← traverse (releaseChunkNow builders (ctxRetained ctx)) [a, b]
                   pure (sequence_ results)
                 pure outcome

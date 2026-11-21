@@ -55,7 +55,7 @@ module Test.GPU.Vulkan.Native.AnimationPath
   ) where
 
 import qualified Data.ByteString as ByteString
-import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
+import Data.IORef (IORef, newIORef, readIORef)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as Text
@@ -70,9 +70,7 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , ImageFormat (..)
   , ImageKind (..)
   , Refusal (..)
-  , UploadRefusal
   , UploadRequest (..)
-  , UploadTicket
   , constructDepthFormat
   , constructImage
   )
@@ -123,7 +121,7 @@ import Test.GPU.Vulkan.Native.OrderedPath.Fixtures
   , sampled
   , tinted
   )
-import Test.GPU.Vulkan.Native.RetainedPath (RetainedHost (..), buildersWith)
+import Test.GPU.Vulkan.Native.RetainedPath (RetainedHost (..), buildersWith, countingUploads)
 
 -- ---------------------------------------------------------------------------
 -- The suite
@@ -185,7 +183,7 @@ backward count duration = tableShowing count duration (\k → 3 - k `mod` 4)
 
 data Ctx = Ctx
   { ctxHost ∷ !RetainedHost
-  , ctxSubmit ∷ UploadRequest → IO (Either UploadRefusal UploadTicket)
+  , ctxUploads ∷ Render.BufferUploads
   , ctxSubmits ∷ !(IORef Int)
   , ctxDirectory ∷ !FilePath
   , ctxFormat ∷ !ImageFormat
@@ -233,10 +231,7 @@ runAnimation host directory = do
 prepare ∷ RetainedHost → FilePath → ImageFormat → IO (Either Text Ctx)
 prepare host directory format = do
   submits ← newIORef 0
-  let submit request = do
-        answer ← retainedSubmit host request
-        either (const (pure ())) (const (atomicModifyIORef' submits (\count → (count + 1, ())))) answer
-        pure answer
+  let submit = countingUploads submits (retainedUploads host)
   made ← OrderedPath.hostAct (retainedBase host) "making the renderer and the strip texture" $ \construction → do
     renderer ← Render.makeRenderer (buildersWith submit construction) OrderedPath.configuration
     image ← constructImage construction (ImageDescription TextureImage Rgba8Linear 4 1 1)
@@ -292,7 +287,7 @@ buildTile ctx = do
   marks ← registeredMarks (ctxTextures ctx)
   built ←
     OrderedPath.hostAct (base ctx) "building the retained tile" $ \construction →
-      buildRetainedChunk (buildersWith (ctxSubmit ctx) construction) (ctxRetained ctx) marks ChunkWorldDepth DeriveBounds [tile ctx 2 (4, 20)] >>= \case
+      buildRetainedChunk (buildersWith (ctxUploads ctx) construction) (ctxRetained ctx) marks ChunkWorldDepth DeriveBounds [tile ctx 2 (4, 20)] >>= \case
         Left refusal → pure (Left (RefusedIllegal (tshow refusal)))
         Right reference → pure (Right reference)
   case built of

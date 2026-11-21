@@ -182,7 +182,7 @@ builders rig =
     , Render.swapImage = swapTexture (rigRecording rig)
     , Render.releaseImage = releaseTexture (rigRecording rig)
     , Render.buildVertexBuffer = \bytes → createBuffer (rigRecording rig) (BufferDescription VertexBuffer bytes)
-    , Render.uploadBuffer = \buffer bytes → submitUpload (rigUploads rig) (UploadBuffer buffer bytes)
+    , Render.bufferUploads = Render.bufferUploadsOf (rigUploads rig)
     , Render.releaseBuffer = releaseManaged (rigRecording rig)
     }
 

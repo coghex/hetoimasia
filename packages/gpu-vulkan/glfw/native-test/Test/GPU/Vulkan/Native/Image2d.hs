@@ -91,7 +91,6 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , FrameEvent (..)
   , FrameRequest (..)
   , Readiness (..)
-  , UploadRefusal (..)
   , Refusal
   , SceneLifecycle (..)
   , SceneMode (..)
@@ -557,7 +556,7 @@ renderBuildersOf construction =
     , Render.releaseImage = releaseConstructedTexture construction
     , Render.buildVertexBuffer = \bytes → constructBuffer construction (BufferDescription VertexBuffer bytes)
     , -- This sample retains no chunk, so it admits no upload into a chunk's buffer.
-      Render.uploadBuffer = \_ _ → pure (Left UploadClosed)
+      Render.bufferUploads = Render.noBufferUploads
     , Render.releaseBuffer = releaseConstructed construction
     }
 

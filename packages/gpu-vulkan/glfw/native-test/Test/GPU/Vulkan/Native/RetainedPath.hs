@@ -49,6 +49,7 @@
 -- @retained-measurements.json@ beside the probe record.
 module Test.GPU.Vulkan.Native.RetainedPath
   ( RetainedHost (..)
+  , countingUploads
   , retainedSuite
   , runRetained
   , buildersWith
@@ -78,9 +79,7 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , ImageFormat (..)
   , ImageKind (..)
   , Refusal (..)
-  , UploadRefusal
   , UploadRequest (..)
-  , UploadTicket
   , constructBlendedCheckedPipeline
   , constructBuffer
   , constructDepthCheckedPipeline
@@ -180,8 +179,9 @@ import Test.GPU.Vulkan.Native.OrderedPath.Fixtures
 -- adapter's releases.
 data RetainedHost = RetainedHost
   { retainedBase ∷ !OrderedPath.Host
-  , retainedSubmit ∷ UploadRequest → IO (Either UploadRefusal UploadTicket)
-    -- ^ Admit an upload from any thread, answering its ticket.
+  , retainedUploads ∷ Render.BufferUploads
+    -- ^ The session's uploads as a chunk's build reaches them: room reserved before its buffer is made, and spent by
+    -- the upload that fills it.
   , retainedRequestRelease ∷ ReleaseBody → IO (Either Text ())
     -- ^ The integration's release request: an owner-thread action that waits for
     -- the revisions its windows must have adopted (none here).
@@ -189,13 +189,13 @@ data RetainedHost = RetainedHost
     -- ^ An owner-thread action that waits for nothing.
   }
 
--- | The renderer's constructions over a session's, with uploads admitted
--- through this function.
+-- | The renderer's constructions over a session's, with a chunk's upload
+-- reserved and admitted through these uploads.
 buildersWith
-  ∷ (UploadRequest → IO (Either UploadRefusal UploadTicket))
+  ∷ Render.BufferUploads
   → Construction q inst msgr phys dev cmd
   → Render.Builders q inst msgr phys dev cmd
-buildersWith submit construction =
+buildersWith uploads construction =
   Render.Builders
     { Render.buildRing = constructRingWith construction
     , Render.buildStorageTable = constructStorageTable construction
@@ -209,8 +209,18 @@ buildersWith submit construction =
     , Render.swapImage = swapConstructedTexture construction
     , Render.releaseImage = releaseConstructedTexture construction
     , Render.buildVertexBuffer = \bytes → constructBuffer construction (BufferDescription VertexBuffer bytes)
-    , Render.uploadBuffer = \buffer bytes → submit (UploadBuffer buffer bytes)
+    , Render.bufferUploads = uploads
     , Render.releaseBuffer = releaseConstructed construction
+    }
+
+-- | The uploads, counting each upload a spent reservation admits.
+countingUploads ∷ IORef Int → Render.BufferUploads → Render.BufferUploads
+countingUploads count uploads =
+  uploads
+    { Render.uploadGranted = \grant buffer bytes → do
+        answer ← Render.uploadGranted uploads grant buffer bytes
+        either (const (pure ())) (const (atomicModifyIORef' count (\held → (held + 1, ())))) answer
+        pure answer
     }
 
 -- | The adapter's host: nothing is published to a window, and the releases it
@@ -280,8 +290,8 @@ wrongTexel = [255, 0, 0, 128]
 -- | What a session holds once it is prepared.
 data Ctx = Ctx
   { ctxHost ∷ !RetainedHost
-  , ctxSubmit ∷ UploadRequest → IO (Either UploadRefusal UploadTicket)
-    -- ^ The host's upload admission, counting the uploads admitted.
+  , ctxUploads ∷ Render.BufferUploads
+    -- ^ The host's uploads, counting the uploads admitted.
   , ctxSubmits ∷ !(IORef Int)
   , ctxDirectory ∷ !FilePath
   , ctxFormat ∷ !ImageFormat
@@ -338,10 +348,7 @@ runRetained host directory = do
 prepare ∷ RetainedHost → FilePath → ImageFormat → IO (Either Text Ctx)
 prepare host directory format = do
   submits ← newIORef 0
-  let submit request = do
-        answer ← retainedSubmit host request
-        either (const (pure ())) (const (atomicModifyIORef' submits (\count → (count + 1, ())))) answer
-        pure answer
+  let submit = countingUploads submits (retainedUploads host)
   made ← OrderedPath.hostAct (retainedBase host) "making the renderer and the textures" $ \construction → do
     renderer ← Render.makeRenderer (buildersWith submit construction) configuration
     images ← traverse (const (constructImage construction (ImageDescription TextureImage Rgba8Linear 1 1 1))) pieces
@@ -462,7 +469,7 @@ buildChunkOf ctx kind instances = do
   marks ← registeredMarks (ctxTextures ctx)
   built ←
     OrderedPath.hostAct (base ctx) "building a retained chunk" $ \construction →
-      buildRetainedChunk (buildersWith (ctxSubmit ctx) construction) (ctxRetained ctx) marks kind DeriveBounds instances >>= \case
+      buildRetainedChunk (buildersWith (ctxUploads ctx) construction) (ctxRetained ctx) marks kind DeriveBounds instances >>= \case
         Left refusal → pure (Left (RefusedIllegal (tshow refusal)))
         Right reference → pure (Right reference)
   case built of
@@ -646,7 +653,7 @@ swapped ctx = do
         Left why → pure (Left why)
         Right image →
           OrderedPath.hostAct (base ctx) "swapping the texture" $ \construction →
-            swapTexture (buildersWith (ctxSubmit ctx) construction) (ctxTextures ctx) handle image (decodedOf greenTexel) RefuseMarkChange >>= \case
+            swapTexture (buildersWith (ctxUploads ctx) construction) (ctxTextures ctx) handle image (decodedOf greenTexel) RefuseMarkChange >>= \case
               Left refusal → pure (Left (RefusedIllegal (tshow refusal)))
               Right _ → pure (Right ())
       case accepted of
@@ -659,7 +666,7 @@ swapped ctx = do
         Left why → pure (Left why)
         Right image →
           OrderedPath.hostAct (base ctx) "swapping the texture to a different mark" $ \construction →
-            swapTexture (buildersWith (ctxSubmit ctx) construction) (ctxTextures ctx) handle image (decodedOf wrongTexel) RefuseMarkChange >>= \case
+            swapTexture (buildersWith (ctxUploads ctx) construction) (ctxTextures ctx) handle image (decodedOf wrongTexel) RefuseMarkChange >>= \case
               Left (MarkMismatch registered computed) → pure (Right (registered, computed))
               Left other → pure (Left (RefusedIllegal (tshow other)))
               Right _ → pure (Left (RefusedIllegal "the swap to a different mark was accepted"))

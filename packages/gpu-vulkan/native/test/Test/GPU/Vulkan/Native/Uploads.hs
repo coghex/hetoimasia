@@ -234,6 +234,88 @@ spec = describe "Uploads" $ do
       uploadsSupportBC7 uploads `shouldBe` False
       createImage (rigRecording rig) (ImageDescription TextureImage Bc7Srgb 16 16 1) `shouldReturn` Left (RefusedImageUnsupported TextureImage Bc7Srgb)
 
+  describe "reservations" $ do
+    it "reserves on the decision admission makes, holding its queue place for every other caller until abandoned" $ do
+      rig ← newUploadRig
+      uploads ← made rig (config 1024 64 1)
+      other ← bufferOf rig VertexBuffer 16
+      atomically (uploadRoom uploads 16) `shouldReturn` Right ()
+      grant ← atomically (reserveUpload uploads 16) >>= either (fail . show) pure
+      -- the one queue place is the reservation's: observed and refused alike, nothing copied
+      atomically (uploadRoom uploads 16) `shouldReturn` Left (UploadBackpressure QueueFull)
+      fmap (const ()) <$> submitUpload uploads (UploadBuffer other (level 16 1)) `shouldReturn` Left (UploadBackpressure QueueFull)
+      writes rig `shouldReturn` []
+      atomically (abandonUploadGrant uploads grant)
+      uploadsReserved <$> atomically (readUploads uploads) `shouldReturn` []
+      _ ← admitted uploads (UploadBuffer other (level 16 1))
+      clean rig
+
+    it "refuses room no aligned gap holds though the free bytes suffice, and a reservation larger than the whole staging for good" $ do
+      rig ← newUploadRig
+      uploads ← made rig (config 64 64 8)
+      grants ← forM [1 ∷ Int .. 3] (\_ → atomically (reserveUpload uploads 16) >>= either (fail . show) pure)
+      -- 32 bytes are free, in two gaps of 16: a 32-byte request fits neither
+      atomically (abandonUploadGrant uploads (grants !! 1))
+      atomically (uploadRoom uploads 32) `shouldReturn` Left (UploadBackpressure StagingFull)
+      fmap (const ()) <$> atomically (reserveUpload uploads 32) `shouldReturn` Left (UploadBackpressure StagingFull)
+      atomically (uploadRoom uploads 16) `shouldReturn` Right ()
+      fmap (const ()) <$> atomically (reserveUpload uploads 65) `shouldReturn` Left (UploadOversized 80 64)
+      length . uploadsReserved <$> atomically (readUploads uploads) `shouldReturn` 2
+
+    it "spends a reservation once, into a fresh vertex buffer of exactly its bytes, which then competes for nothing" $ do
+      rig ← newUploadRig
+      uploads ← made rig (config 1024 64 1)
+      grant ← atomically (reserveUpload uploads 16) >>= either (fail . show) pure
+      wrongSize ← bufferOf rig VertexBuffer 32
+      indices ← bufferOf rig IndexBuffer 16
+      vertices ← bufferOf rig VertexBuffer 16
+      -- refusals leave the reservation as it was
+      submitUploadGranted (pure Nothing) uploads grant wrongSize (level 32 1) >>= \case
+        Left (UploadMalformed _) → pure ()
+        other → expectationFailure ("a spend of other bytes than reserved was answered " <> show (fmap (const ()) other))
+      fmap (const ()) <$> submitUploadGranted (pure Nothing) uploads grant indices (level 16 1) `shouldReturn` Left UploadWrongKind
+      length . uploadsReserved <$> atomically (readUploads uploads) `shouldReturn` 1
+      -- the queue holds one: the reservation's place is what the spend takes
+      ticket ← submitUploadGranted (pure Nothing) uploads grant vertices (level 16 1) >>= either (fail . show) pure
+      atomically (readUploadTicket ticket) `shouldReturn` UploadQueued
+      uploadsReserved <$> atomically (readUploads uploads) `shouldReturn` []
+      -- spent: it binds nothing again, and abandoning it frees nothing of the live upload's
+      again ← bufferOf rig VertexBuffer 16
+      fmap (const ()) <$> submitUploadGranted (pure Nothing) uploads grant again (level 16 1) `shouldReturn` Left (UploadMisuse (StaleIdentity ResourceIdentity))
+      atomically (abandonUploadGrant uploads grant)
+      map uploadRegion . uploadsUnsettled <$> atomically (readUploads uploads) `shouldReturn` [(0, 16)]
+      atomically (uploadRoom uploads 16) `shouldReturn` Left (UploadBackpressure QueueFull)
+      clean rig
+
+    it "binds or abandons a reservation only through the uploads that issued it, though another's over the same recording has the same number" $ do
+      rig ← newUploadRig
+      first ← made rig (config 1024 64 4)
+      second ← made rig (config 1024 64 4)
+      ours ← atomically (reserveUpload first 16) >>= either (fail . show) pure
+      theirs ← atomically (reserveUpload second 16) >>= either (fail . show) pure
+      map fst . uploadsReserved <$> atomically (readUploads first) `shouldReturn` [0]
+      map fst . uploadsReserved <$> atomically (readUploads second) `shouldReturn` [0]
+      vertices ← bufferOf rig VertexBuffer 16
+      fmap (const ()) <$> submitUploadGranted (pure Nothing) second ours vertices (level 16 1) `shouldReturn` Left (UploadMisuse (StaleIdentity ResourceIdentity))
+      atomically (abandonUploadGrant second ours >> abandonUploadGrant first theirs)
+      length . uploadsReserved <$> atomically (readUploads first) `shouldReturn` 1
+      length . uploadsReserved <$> atomically (readUploads second) `shouldReturn` 1
+      uploadsUnsettled <$> atomically (readUploads second) `shouldReturn` []
+      -- each spends in its own
+      _ ← submitUploadGranted (pure Nothing) first ours vertices (level 16 1) >>= either (fail . show) pure
+      length . uploadsReserved <$> atomically (readUploads second) `shouldReturn` 1
+      clean rig
+
+    it "abandons every unspent reservation when admission closes" $ do
+      rig ← newUploadRig
+      uploads ← made rig (config 1024 64 4)
+      grant ← atomically (reserveUpload uploads 16) >>= either (fail . show) pure
+      atomically (closeUploads uploads)
+      uploadsReserved <$> atomically (readUploads uploads) `shouldReturn` []
+      vertices ← bufferOf rig VertexBuffer 16
+      fmap (const ()) <$> submitUploadGranted (pure Nothing) uploads grant vertices (level 16 1) `shouldReturn` Left UploadClosed
+      fmap (const ()) <$> atomically (reserveUpload uploads 16) `shouldReturn` Left UploadClosed
+
   describe "progress" $ do
     it "records each turn's copies at block-row boundaries under the budget, the target resting in its transfer write between batches, and completes on the final batch's fence" $ do
       rig ← newUploadRig

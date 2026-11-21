@@ -223,7 +223,7 @@ runMaterials host directory = do
 prepare ∷ RetainedHost → FilePath → ImageFormat → IO (Either Text Ctx)
 prepare host directory format = do
   made ← OrderedPath.hostAct (retainedBase host) "making the renderer and the textures" $ \construction → do
-    renderer ← Render.makeRenderer (buildersWith (retainedSubmit host) construction) configuration
+    renderer ← Render.makeRenderer (buildersWith (retainedUploads host) construction) configuration
     images ← traverse (const (constructImage construction (ImageDescription TextureImage Rgba8Linear 1 1 1))) (pieces <> [Short])
     pure ((,) <$> renderer <*> sequence images)
   case made of
@@ -243,7 +243,7 @@ prepare host directory format = do
                   textures ← newTextures
                   registered ←
                     OrderedPath.hostAct (retainedBase host) "registering the textures" $ \construction →
-                      fmap sequence . traverse (registerPiece (buildersWith (retainedSubmit host) construction) textures) $ zip pieces images
+                      fmap sequence . traverse (registerPiece (buildersWith (retainedUploads host) construction) textures) $ zip pieces images
                   case registered of
                     Left failure → pure (Left failure)
                     Right handles → do
@@ -421,7 +421,7 @@ chunkFrame ctx = do
   marks ← registeredMarks (ctxTextures ctx)
   let build records instances =
         OrderedPath.hostAct (base ctx) "building a retained chunk" $ \construction →
-          buildRetainedChunkWith (buildersWith (retainedSubmit (ctxHost ctx)) construction) (ctxRetained ctx) marks ChunkWorldDepth DeriveBounds (Map.singleton (ctxMix ctx) records) instances >>= \case
+          buildRetainedChunkWith (buildersWith (retainedUploads (ctxHost ctx)) construction) (ctxRetained ctx) marks ChunkWorldDepth DeriveBounds (Map.singleton (ctxMix ctx) records) instances >>= \case
             Left refusal → pure (Left (RefusedIllegal (tshow refusal)))
             Right reference → pure (Right reference)
       mix = inst ctx (ctxMix ctx) Primary 0 1
@@ -478,12 +478,12 @@ reuseAfter ∷ Ctx → IO FixtureResult
 reuseAfter ctx = do
   let old = handleOf ctx Short
   released ← OrderedPath.hostAct (base ctx) "releasing the short-lived texture" $ \construction →
-    releaseTextureNow (buildersWith (retainedSubmit (ctxHost ctx)) construction) (ctxTextures ctx) old
+    releaseTextureNow (buildersWith (retainedUploads (ctxHost ctx)) construction) (ctxTextures ctx) old
   case released of
     Left why → pure (failedAt "reuse-after" why)
     Right () → do
       registered ← OrderedPath.hostAct (base ctx) "registering the replacement" $ \construction →
-        registerTexture (buildersWith (retainedSubmit (ctxHost ctx)) construction) (ctxTextures ctx) (ctxReplacement ctx) (decodedOf replacementTexel) DefaultMark >>= \case
+        registerTexture (buildersWith (retainedUploads (ctxHost ctx)) construction) (ctxTextures ctx) (ctxReplacement ctx) (decodedOf replacementTexel) DefaultMark >>= \case
           Left refusal → pure (Left (RefusedIllegal (tshow refusal)))
           Right handle → pure (Right handle)
       case registered of

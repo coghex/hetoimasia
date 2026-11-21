@@ -36,7 +36,7 @@ import Hetoimasia.GPU.Vulkan.Native.Recording
   , validateStorageWindow
   )
 import Hetoimasia.GPU.Vulkan.Native.TextureTable (validateTableConfig)
-import Hetoimasia.GPU.Vulkan.Native.Uploads (UploadRefusal (..), UploadState (..))
+import Hetoimasia.GPU.Vulkan.Native.Uploads (UploadRefusal (..), UploadState (..), UploadsView (..), readUploads)
 import Hetoimasia.Math.Affine2 (fromColumns)
 import Hetoimasia.Math.Vector (V2 (..))
 import qualified Hetoimasia.Render.Api.Texture as Api
@@ -54,7 +54,7 @@ import Hetoimasia.Render.TwoD.Target.Backend (targetRef)
 import Hetoimasia.Render.TwoD.Validation (Location (..), Reason (..), ValidSnapshot, validLayers, validateSnapshot, validateSnapshotWith)
 import qualified Hetoimasia.Render.TwoD.Validation as Validation
 import qualified Hetoimasia.Render.TwoD.Vulkan as Render
-import Hetoimasia.Render.TwoD.Vulkan.Builders (Builders (..))
+import Hetoimasia.Render.TwoD.Vulkan.Builders (BufferUploads (..), Builders (..))
 import Hetoimasia.Render.TwoD.Vulkan.Chunks
 import Hetoimasia.Render.TwoD.Vulkan.Frame
 import Hetoimasia.Render.TwoD.Vulkan.Textures (MarkPolicy (..), registeredMarks)
@@ -168,24 +168,32 @@ trackedBuilders setup =
         made ← buildVertexBuffer (builders (setupRig setup)) bytes
         either (const (pure ())) (\buffer → atomicModifyIORef' (trackedMade tracked) (\held → (held <> [buffer], ()))) made
         pure made
-    , uploadBuffer = \buffer bytes → do
-        failing ← readIORef (trackedFail tracked)
-        if failing
-          then writeIORef (trackedFail tracked) False >> throwIO ThreadKilled
-          else do
-            answer ← uploadBuffer (builders (setupRig setup)) buffer bytes
-            either (const (pure ())) (const (atomicModifyIORef' (trackedUploads tracked) (\count → (count + 1, ()))))  answer
-            pure answer
+    , bufferUploads =
+        base
+          { uploadGranted = \grant buffer bytes → do
+              failing ← readIORef (trackedFail tracked)
+              if failing
+                then writeIORef (trackedFail tracked) False >> throwIO ThreadKilled
+                else do
+                  answer ← uploadGranted base grant buffer bytes
+                  either (const (pure ())) (const (atomicModifyIORef' (trackedUploads tracked) (\count → (count + 1, ())))) answer
+                  pure answer
+          }
     , releaseBuffer = \buffer → do
         atomicModifyIORef' (trackedReleased tracked) (\held → (held <> [buffer], ()))
         releaseBuffer (builders (setupRig setup)) buffer
     }
   where
     tracked = setupTracked setup
+    base = bufferUploads (builders (setupRig setup))
 
--- | Build a chunk of this kind with the art marked.
+-- | Build a chunk of this kind with the art marked, answering a refusal's cause.
 buildChunkOf ∷ Setup → ChunkKind → [Instance] → IO (Either BuildRefusal ChunkRef)
-buildChunkOf setup kind = buildRetainedChunk (trackedBuilders setup) (setupRetained setup) artMarks kind DeriveBounds
+buildChunkOf setup kind instances = either (Left . buildRefusal) Right <$> buildRetainedChunk (trackedBuilders setup) (setupRetained setup) artMarks kind DeriveBounds instances
+
+-- | The uploads' reservations not yet spent or abandoned.
+reservedOf ∷ Setup → IO Int
+reservedOf setup = length . uploadsReserved <$> atomically (readUploads (rigUploads (setupRig setup)))
 
 -- | Build, expecting acceptance.
 built ∷ Setup → ChunkKind → [Instance] → IO ChunkRef
@@ -315,12 +323,12 @@ refusalSpec = describe "refusing a build" $ do
       let bad = (cutAt 0 16777216) {instanceClip = 2}
       buildChunkOf setup ChunkWorldDepth [cutAt 0 1, bad]
         `shouldReturnRefused` BuildInvalid (ChunkInstanceInvalid 1 DepthKeyTooLarge :| [ChunkInstanceInvalid 1 ClipIndexUnknown])
-      buildRetainedChunk (trackedBuilders setup) (setupRetained setup) artMarks ChunkUi (SuppliedBounds (Bounds (V2 0 0) (V2 1 1))) [cutAt 0 1]
+      (either (Left . buildRefusal) Right <$> buildRetainedChunk (trackedBuilders setup) (setupRetained setup) artMarks ChunkUi (SuppliedBounds (Bounds (V2 0 0) (V2 1 1))) [cutAt 0 1])
         `shouldReturnRefused` BuildInvalid (ChunkBoundsInsufficient :| [])
       liveChunks (setupRetained setup) >>= (`shouldBe` [])
       readIORef (trackedMade (setupTracked setup)) >>= (`shouldBe` [])
 
-  it "refuses an upload that cannot ever fit the staging buffer, releasing the buffer it made, and holding nothing" $
+  it "refuses an upload that cannot ever fit the staging buffer before making any buffer, holding nothing" $
     withSetup $ \setup → do
       -- 17,000 cutout instances are 1,088,000 bytes; the staging buffer holds 1,048,576.
       let huge = [cutAt (fromIntegral i) 1 | i ← [0 .. 16999 ∷ Int]]
@@ -328,13 +336,12 @@ refusalSpec = describe "refusing a build" $ do
       case answer of
         Left (BuildUploadRefused (UploadOversized _ _)) → pure ()
         other → expectationFailure ("expected an oversized refusal, found " <> show other)
-      made ← readIORef (trackedMade (setupTracked setup))
-      released ← readIORef (trackedReleased (setupTracked setup))
-      length made `shouldBe` 1
-      released `shouldBe` made
+      readIORef (trackedMade (setupTracked setup)) >>= (`shouldBe` [])
+      readIORef (trackedReleased (setupTracked setup)) >>= (`shouldBe` [])
+      reservedOf setup >>= (`shouldBe` 0)
       liveChunks (setupRetained setup) >>= (`shouldBe` [])
 
-  it "answers pressure when the upload queue is full, as a retry that can succeed, releasing the buffer and holding nothing; the build succeeds once the uploads settle" $
+  it "answers pressure when the upload queue is full, as a retry that can succeed, before making any buffer and holding nothing; the build succeeds once the uploads settle" $
     withSetup $ \setup → do
       -- The queue holds eight uploads and none has been turned.
       references ← mapM (\i → built setup ChunkWorldDepth [cutAt (fromIntegral (i ∷ Int)) 1]) [1 .. 8]
@@ -342,47 +349,67 @@ refusalSpec = describe "refusing a build" $ do
       case answer of
         Left (BuildUploadBackpressure _) → pure ()
         other → expectationFailure ("expected backpressure, found " <> show other)
-      made ← readIORef (trackedMade (setupTracked setup))
-      released ← readIORef (trackedReleased (setupTracked setup))
-      length made `shouldBe` 9
-      released `shouldBe` drop 8 made
+      length <$> readIORef (trackedMade (setupTracked setup)) >>= (`shouldBe` 8)
+      readIORef (trackedReleased (setupTracked setup)) >>= (`shouldBe` [])
+      reservedOf setup >>= (`shouldBe` 0)
       liveChunks (setupRetained setup) >>= (`shouldBe` references)
       settleUploads (setupRig setup)
       _ ← built setup ChunkWorldDepth [cutAt 0 1]
       pure ()
 
-  it "says what became of a refused build's buffer: none made before its validation, the one it released after its upload's backpressure" $
+  it "says what became of a refused build's buffer: none before its admission, the one it released when its upload failed after it" $
     withSetup $ \setup → do
-      let withRecords = buildRetainedChunkWith (trackedBuilders setup) (setupRetained setup) artMarks ChunkWorldDepth DeriveBounds Map.empty
-          lastMaybe xs = if null xs then Nothing else Just (last xs)
+      let withRecords builders' = buildRetainedChunkWith builders' (setupRetained setup) artMarks ChunkWorldDepth DeriveBounds Map.empty
       -- refused before any buffer: nothing made, nothing to wait for
-      withRecords [cutAt 0 16777216] >>= \case
+      withRecords (trackedBuilders setup) [cutAt 0 16777216] >>= \case
         Left (BuildRefused (BuildInvalid _) NoAllocation) → pure ()
         other → expectationFailure ("expected an invalid build with no allocation, found " <> show other)
-      readIORef (trackedMade (setupTracked setup)) >>= (`shouldBe` [])
-      -- the queue holds eight uploads: the ninth build makes its buffer, meets backpressure and releases that buffer
+      -- the queue holds eight uploads: the ninth is refused before its buffer is made
       _ ← mapM (\i → built setup ChunkWorldDepth [cutAt (fromIntegral (i ∷ Int)) 1]) [1 .. 8]
-      answer ← withRecords [cutAt 0 1]
+      withRecords (trackedBuilders setup) [cutAt 0 1] >>= \case
+        Left (BuildRefused (BuildUploadBackpressure _) NoAllocation) → pure ()
+        other → expectationFailure ("expected backpressure with no allocation, found " <> show other)
+      length <$> readIORef (trackedMade (setupTracked setup)) >>= (`shouldBe` 8)
+      settleUploads (setupRig setup)
+      -- admitted, then its upload refused after the buffer was made: that buffer released, the grant given back
+      let refusing = (trackedBuilders setup) {bufferUploads = (bufferUploads (trackedBuilders setup)) {uploadGranted = \_ _ _ → pure (Left UploadClosed)}}
+      answer ← withRecords refusing [cutAt 0 1]
       made ← readIORef (trackedMade (setupTracked setup))
       case answer of
-        Left (BuildRefused (BuildUploadBackpressure _) (AllocationReleased buffer (Right ()))) → Just buffer `shouldBe` lastMaybe made
-        other → expectationFailure ("expected backpressure with the released buffer, found " <> show other)
+        Left (BuildRefused (BuildUploadRefused UploadClosed) (AllocationReleased buffer (Right ()))) → [buffer] `shouldBe` drop 8 made
+        other → expectationFailure ("expected a refused upload with the released buffer, found " <> show other)
       readIORef (trackedReleased (setupTracked setup)) >>= (`shouldBe` drop 8 made)
+      reservedOf setup >>= (`shouldBe` 0)
 
-  it "releases a refused build's buffer at one site: a release that raises is called once and answered with the buffer and the cause" $
+  it "releases a failed build's buffer at one site: a release that raises is called once and answered with the buffer and the cause, through the public build too" $
     withSetup $ \setup → do
       calls ← newIORef []
-      _ ← mapM (\i → built setup ChunkWorldDepth [cutAt (fromIntegral (i ∷ Int)) 1]) [1 .. 8]
-      let raising = (trackedBuilders setup) {releaseBuffer = \buffer → atomicModifyIORef' calls (\held → (held <> [buffer], ())) >> throwIO (ErrorCall "the release raised")}
-      answer ← buildRetainedChunkWith raising (setupRetained setup) artMarks ChunkWorldDepth DeriveBounds Map.empty [cutAt 0 1]
+      let raising =
+            (trackedBuilders setup)
+              { releaseBuffer = \buffer → atomicModifyIORef' calls (\held → (held <> [buffer], ())) >> throwIO (ErrorCall "the release raised")
+              , bufferUploads = (bufferUploads (trackedBuilders setup)) {uploadGranted = \_ _ _ → pure (Left UploadClosed)}
+              }
+      answer ← buildRetainedChunk raising (setupRetained setup) artMarks ChunkWorldDepth DeriveBounds [cutAt 0 1]
       made ← readIORef (trackedMade (setupTracked setup))
       released ← readIORef calls
-      released `shouldBe` drop 8 made
+      (length made, released) `shouldBe` (1, made)
       case answer of
-        Left (BuildRefused (BuildUploadBackpressure _) (AllocationReleaseRaised buffer cause)) → do
-          [buffer] `shouldBe` drop 8 made
+        Left (BuildRefused (BuildUploadRefused UploadClosed) (AllocationReleaseRaised buffer cause)) → do
+          [buffer] `shouldBe` made
           cause `shouldSatisfy` Text.isInfixOf "the release raised"
-        other → expectationFailure ("expected backpressure with a raised release, found " <> show other)
+        other → expectationFailure ("expected a refused upload with a raised release, found " <> show other)
+      reservedOf setup >>= (`shouldBe` 0)
+
+  it "admits a chunk with no cutout bytes while another upload holds the last queue place: ready at once, the uploads untouched" $
+    withSetup $ \setup → do
+      _ ← mapM (\i → built setup ChunkWorldDepth [cutAt (fromIntegral (i ∷ Int)) 1]) [1 .. 8]
+      before ← atomically (readUploads (rigUploads (setupRig setup)))
+      reference ← built setup ChunkWorldDepth [ordAt 0 1]
+      chunkStanding (setupRetained setup) reference >>= (`shouldBe` Just ChunkReady)
+      chunkBufferOf (setupRetained setup) reference >>= (`shouldBe` Nothing)
+      after ← atomically (readUploads (rigUploads (setupRig setup)))
+      (uploadsUnsettled after, uploadsReserved after) `shouldBe` (uploadsUnsettled before, uploadsReserved before)
+      length <$> readIORef (trackedMade (setupTracked setup)) >>= (`shouldBe` 8)
 
   it "releases the buffer when the build is interrupted by an exception after it was made, leaving nothing registered" $
     withSetup $ \setup → do
@@ -395,6 +422,7 @@ refusalSpec = describe "refusing a build" $ do
       made ← readIORef (trackedMade (setupTracked setup))
       released ← readIORef (trackedReleased (setupTracked setup))
       (length made, released) `shouldBe` (1, made)
+      reservedOf setup >>= (`shouldBe` 0)
       liveChunks (setupRetained setup) >>= (`shouldBe` [])
 
   it "ends the chunk's reference when it is released, whether its upload had completed or not, reusing the index under the next generation" $

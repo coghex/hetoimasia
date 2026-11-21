@@ -257,6 +257,10 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , awaitUploadTicket
   , copyLevelToReadback
   , submitVulkanUpload
+  , vulkanUploadRoom
+  , reserveVulkanUpload
+  , submitVulkanGranted
+  , abandonVulkanGrant
   , validateUploadConfig
   , LookupEntry (..)
   , TableSampler (..)
@@ -323,6 +327,7 @@ import qualified Test.GPU.Vulkan.Native.CutoutDepth as CutoutDepth
 import qualified Test.GPU.Vulkan.Native.OrderedPath as OrderedPath
 import qualified Test.GPU.Vulkan.Native.MaterialsPath as MaterialsPath
 import qualified Test.GPU.Vulkan.Native.TerrainPath as TerrainPath
+import qualified Hetoimasia.Render.TwoD.Vulkan as Render
 import qualified Test.GPU.Vulkan.Native.RetainedPath as RetainedPath
 import Test.GPU.Vulkan.Native.Platform (requestingBackend)
 import Test.GPU.Vulkan.Native.Png (encodeRgba)
@@ -2065,22 +2070,28 @@ retainedHost ∷ VulkanHost () → RetainedPath.RetainedHost
 retainedHost vulkan =
   RetainedPath.RetainedHost
     { RetainedPath.retainedBase = orderedHost vulkan
-    , RetainedPath.retainedSubmit = submit
+    , RetainedPath.retainedUploads = uploads
     , RetainedPath.retainedRequestRelease = \body →
-        atomically (requestVulkanRelease vulkan (VulkanAction (body . RetainedPath.buildersWith submit))) >>= \case
+        atomically (requestVulkanRelease vulkan (VulkanAction (body . RetainedPath.buildersWith uploads))) >>= \case
           Left refusal → pure (Left (tshow refusal))
           Right _ → pure (Right ())
     , RetainedPath.retainedRunOnOwner = \body →
-        atomically (submitVulkanAction vulkan (VulkanAction (body . RetainedPath.buildersWith submit))) >>= \case
+        atomically (submitVulkanAction vulkan (VulkanAction (body . RetainedPath.buildersWith uploads))) >>= \case
           Left refusal → pure (Left (tshow refusal))
           Right _ → pure (Right ())
     }
   where
-    submit request =
-      submitVulkanUpload vulkan request >>= \case
-        Left (VulkanUploadRefused refusal) → pure (Left refusal)
-        Left (VulkanUploadsUnavailable _) → pure (Left UploadClosed)
-        Right ticket → pure (Right ticket)
+    uploads =
+      Render.BufferUploads
+        { Render.roomFor = fmap answered . vulkanUploadRoom vulkan
+        , Render.reserveRoom = fmap answered . reserveVulkanUpload vulkan
+        , Render.uploadGranted = \grant buffer bytes → answered <$> submitVulkanGranted vulkan grant buffer bytes
+        , Render.abandonRoom = abandonVulkanGrant vulkan
+        }
+    answered = \case
+      Left (VulkanUploadRefused refusal) → Left refusal
+      Left (VulkanUploadsUnavailable _) → Left UploadClosed
+      Right value → Right value
 
 -- | The ordered path's evidence host over this suite's session: owner-thread
 -- actions over its constructions, uploads admitted from the main thread and
