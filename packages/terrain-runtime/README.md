@@ -338,6 +338,10 @@ incarnation is its identity); and for each held region two parts, each `PartRead
 * knowledge (`regionKnowledge`): what #661 knows of every cell (`queryCell`, as `knowledgeAt` answers at
   the copy's knowledge revision) as compressed column runs; a uniform region is one class of one run.
 
+`regionInputCounts` reads a held region's input counts from its packed parts without unpacking them: its
+removed intervals, and the knowledge runs a consumer expanding its classes is handed (one for a uniform
+region, otherwise each column's class's runs). An unavailable part counts zero.
+
 `regionCell` and `regionCellKnowledge` answer one cell. Both parts are packed, so what a copy holds grows
 with a region's intervals and knowledge runs, never with its cells (`regionSnapshotFootprint`, every heap
 object of the copy counted, an upper bound of a walk of its heap without the shared source: a 128-byte
