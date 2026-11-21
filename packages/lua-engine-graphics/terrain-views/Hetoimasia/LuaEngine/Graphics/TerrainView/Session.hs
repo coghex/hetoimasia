@@ -2004,31 +2004,39 @@ publish service vs serial prep candidate = do
               -- for one of them to stop being drawable, which a frame or the ledger reports with a kick
               pure False
           | otherwise → do
-            -- the runtime demand, under the view's own authority, applied in the transaction that publishes: a refusal
-            -- keeps the candidate from being adopted
-            let terrain = portTerrain ports
-            Runtime.setViewDemandSTM terrain (vsRuntime vs) (vsLease vs) (demandsOf (cdDemand candidate)) >>= \case
-              Left why → False <$ refuse service vs serial (prepBasis prep) (LimitRuntime ("the terrain service refused the view's demand: " <> Text.pack (show why)))
-              Right receipt → do
-                writeTVar (vsAsked vs) (cdDemand candidate)
-                writeTVar (vsReceipt vs) (Just receipt)
-                vtPublish (vsTarget vs) scene >>= \case
-                  False → False <$ refuse service vs serial (prepBasis prep) (LimitFailure "the host refused the publication")
-                  True → do
-                    _ ← markClaimPublished (portClaims ports) (vtKey (vsTarget vs)) (vsId vs)
-                    old ← readTVar (vsParts vs)
-                    let superseded = [partChunk part | (key, part) ← Map.toList old, Map.notMember key (cdReused candidate)]
-                    unless (null superseded) $
-                      modifyTVar' (svRetiring service) (|> Retiring (vtKey (vsTarget vs)) (vsId vs) superseded Unasked False)
-                    writeTVar (vsParts vs) parts
-                    writeTVar (vsPublished vs) (Just (Accepted revision (prepBasis prep) (cdDemand candidate) (Map.size parts)))
-                    writeTVar (vsRefused vs) Nothing
-                    writeTVar (vsStage vs) Idle
-                    -- the pins: those of the revisions that can still be drawn, and this successor's
-                    let (copied, regions) = cdCopies candidate
-                        pin = Pinned plan copied regions (cdCamera candidate) (cdMetrics candidate)
-                    modifyTVar' (vsPins vs) (Map.insert revision pin . Map.filterWithKey (\r _ → Set.member r keep))
-                    pure False
+            -- the successor's runtime demand and its scene are accepted together, or neither: a refusal of either is
+            -- thrown inside 'catchSTM', which rolls back everything the attempt wrote (the runtime's demand and the
+            -- receipt included), and then recorded as a refusal
+            let accept = do
+                  receipt ←
+                    Runtime.setViewDemandSTM (portTerrain ports) (vsRuntime vs) (vsLease vs) (demandsOf (cdDemand candidate))
+                      >>= either (\why → throwSTM (PublicationRefused (LimitRuntime ("the terrain service refused the view's demand: " <> Text.pack (show why))))) pure
+                  writeTVar (vsAsked vs) (cdDemand candidate)
+                  writeTVar (vsReceipt vs) (Just receipt)
+                  published ← vtPublish (vsTarget vs) scene
+                  unless published (throwSTM (PublicationRefused (LimitFailure "the host refused the publication")))
+                adopted = do
+                  _ ← markClaimPublished (portClaims ports) (vtKey (vsTarget vs)) (vsId vs)
+                  old ← readTVar (vsParts vs)
+                  let superseded = [partChunk part | (key, part) ← Map.toList old, Map.notMember key (cdReused candidate)]
+                  unless (null superseded) $
+                    modifyTVar' (svRetiring service) (|> Retiring (vtKey (vsTarget vs)) (vsId vs) superseded Unasked False)
+                  writeTVar (vsParts vs) parts
+                  writeTVar (vsPublished vs) (Just (Accepted revision (prepBasis prep) (cdDemand candidate) (Map.size parts)))
+                  writeTVar (vsRefused vs) Nothing
+                  writeTVar (vsStage vs) Idle
+                  -- the pins: those of the revisions that can still be drawn, and this successor's
+                  let (copied, regions) = cdCopies candidate
+                      pin = Pinned plan copied regions (cdCamera candidate) (cdMetrics candidate)
+                  modifyTVar' (vsPins vs) (Map.insert revision pin . Map.filterWithKey (\r _ → Set.member r keep))
+                  pure False
+            (accept >> adopted) `catchSTM` \(PublicationRefused limit) → False <$ refuse service vs serial (prepBasis prep) limit
+
+-- A refusal of a successor's demand or scene, thrown to roll back its attempt.
+newtype PublicationRefused = PublicationRefused BindingLimit
+  deriving Show
+
+instance Exception PublicationRefused
 
 -- The revisions of a view that can still be drawn: the one its receipt names, and every later one the scene ledger
 -- holds adopted. At most two are pinned: a third waits.

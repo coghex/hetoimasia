@@ -55,7 +55,7 @@ import Hetoimasia.Terrain.Render2D.Presentation (LightInput (..), LightSettings,
 import Hetoimasia.Terrain.Runtime hiding (closeView, openView, viewIncarnation)
 import Hetoimasia.Terrain.Runtime.Storage (filesystemOf, minHeadroomBytes, mkStorageConfig)
 import Hetoimasia.Terrain.Runtime.Store (StoreSpec (..), defaultStoreSpec, minAllowanceBytes)
-import Hetoimasia.Terrain.Residency (Limits, LimitsSpec (..), mkLimits)
+import Hetoimasia.Terrain.Residency (Limits, LimitsSpec (..), RegionDemand (..), ViewInfo (..), mkLimits, modelViews)
 import Hetoimasia.Terrain.Shape (ViewFacing (..))
 import Hetoimasia.Terrain.Source (LayerSpec (..), SourceSpec (..))
 import System.IO.Temp (withSystemTempDirectory)
@@ -1373,6 +1373,25 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         settleUntil rig (publishedAtLeast second 1)
         atomically occupied `shouldReturn` 4
         atomically (readingListed <$> readView second) `shouldReturn` 4
+
+    it "keeps the installed runtime demand, its receipt and the accepted scene when the host refuses a successor with other demand" $
+      withPublished defaultOptions $ \rig target view → do
+        quiesce rig target
+        let runtimeDemand = map (map demandRegion . viewDemand) . modelViews <$> inspectModelSTM (rigTerrain rig)
+        before ← atomically (readView view)
+        installed ← atomically runtimeDemand
+        world ← atomically (latestWorld target)
+        -- the host refuses the next publication; the move's destination asks for other regions
+        atomically (writeTVar (targetAccepts target) False)
+        Right move ← atomically (moveView view far)
+        settleUntil rig (isJust . readingRefusal <$> readView view)
+        atomically (readingRefusal <$> readView view) `shouldReturn` Just (LimitFailure "the host refused the publication")
+        after ← atomically (readView view)
+        (readingDemand after, readingReceipt after, readingPublished after) `shouldBe` (readingDemand before, readingReceipt before, readingPublished before)
+        atomically runtimeDemand `shouldReturn` installed
+        atomically (latestWorld target) `shouldReturn` world
+        -- the move landed at its eligibility; the later publication refusal keeps that result
+        atomically (moveSettled move) `shouldReturn` Just MoveLanded
 
     it "follows a removed summit whose new top is in the vertical region below" $
       withPublished defaultOptions $ \rig target view → do
