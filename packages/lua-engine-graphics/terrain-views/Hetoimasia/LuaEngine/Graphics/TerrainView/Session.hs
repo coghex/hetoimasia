@@ -184,17 +184,19 @@ data TerrainViewsPorts k = TerrainViewsPorts
   , portCopyHooks ∷ !CopyHooks
   }
 
--- | What the views read at their copy boundary besides the copies: the regions whose terrain part a copy is read as
--- unavailable (a storage fault, in a suite) and an action run inside the run count of a held copy, once its total is
--- counted and before the copy is accepted or refused, its batch and the total named (a gate a suite observes the held
--- charge at). 'noCopyHooks' in production.
+-- | What the views read at their copy and demand boundaries besides the terrain service: the regions whose terrain
+-- part a copy is read as unavailable (a storage fault, in a suite); an action run inside the run count of a held copy,
+-- once its total is counted and before the copy is accepted or refused, its batch and the total named (a gate a suite
+-- observes the held charge at); and a refusal answered for a demand installation in place of the terrain service's
+-- (a suite's deterministic refusal). 'noCopyHooks' in production.
 data CopyHooks = CopyHooks
   { hookUnavailable ∷ STM (Set RegionCoord)
   , hookCounting ∷ [RegionCoord] → Int → IO ()
+  , hookDemandRefused ∷ [RegionCoord] → STM (Maybe Text)
   }
 
 noCopyHooks ∷ CopyHooks
-noCopyHooks = CopyHooks (pure Set.empty) (\_ _ → pure ())
+noCopyHooks = CopyHooks (pure Set.empty) (\_ _ → pure ()) (\_ → pure Nothing)
 
 -- | Why the service could not be made. Nothing was reserved or started.
 data TerrainViewsRefused
@@ -1387,13 +1389,19 @@ reconcileDemand service vs = do
       if suppressed
         then pure False
         else
-          Runtime.setViewDemandSTM (portTerrain (svPorts service)) (vsRuntime vs) (vsLease vs) (demandsOf desired) >>= \case
+          install desired >>= \case
             Right receipt → True <$ (writeTVar (vsAsked vs) desired >> writeTVar (vsReceipt vs) (Just receipt) >> modifyTVar' (vsInstalls vs) (+ 1))
             Left why → do
-              let limit = LimitRuntime ("the terrain service refused the view's demand: " <> Text.pack (show why))
+              let limit = LimitRuntime ("the terrain service refused the view's demand: " <> why)
               pressure vs limit
               recordRefusal vs limit (RefusedAt basis Nothing (Just desired))
               pure True
+
+  where
+    install desired =
+      hookDemandRefused (portCopyHooks (svPorts service)) desired >>= \case
+        Just why → pure (Left why)
+        Nothing → either (Left . Text.pack . show) Right <$> Runtime.setViewDemandSTM (portTerrain (svPorts service)) (vsRuntime vs) (vsLease vs) (demandsOf desired)
 
 -- The runtime demand of a list of regions: each whole.
 demandsOf ∷ [RegionCoord] → [RegionDemand]
@@ -2057,14 +2065,14 @@ stepBuilding service hands vs serial prep candidate
     unreserve = occupy service tkey (-1) >> modifyTVar' (vsBuilding vs) (subtract 1)
     -- a failed build returns its slot only when it made no buffer; a buffer it made keeps the slot until the backend
     -- confirms its destruction, and one whose release failed keeps it as a failure with its cause
-    refusedBuild (BuildFailed _ allocated) = case allocated of
+    refusedBuild (BuildFailed primary allocated) = case allocated of
       NotAllocated → unreserve
       AllocatedDisposing identity reading → do
         modifyTVar' (vsBuilding vs) (subtract 1)
         modifyTVar' (svDisposing service) (<> [(DisposeAllocation tkey (vsId vs) identity, reading)])
       AllocatedFailed why → do
         modifyTVar' (vsBuilding vs) (subtract 1)
-        modifyTVar' (svFailed service) (<> [(tkey, Nothing, why)])
+        modifyTVar' (svFailed service) (<> [(tkey, Nothing, "the build failed (" <> primary <> "), and " <> why)])
     -- a build interrupted past the renderer's own accounting: whether it made a buffer is not known, so its slot stays
     -- charged, identified with the cause
     raisedBuild = do
