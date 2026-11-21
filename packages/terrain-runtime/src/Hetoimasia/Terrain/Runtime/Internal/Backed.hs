@@ -1113,9 +1113,10 @@ closeDrained svc aid = do
 --   active store transaction exists exactly when the session's slot runs one of it.
 -- * The compile account's use is the sum of what each arena, closing file and open holds, and
 --   never above the account.
--- * The storage service holds a backing for every live arena and every reserved open, and at most
---   one more for each closing arena (its file closes in one bounded call, after which the owner
---   forgets it) and each open whose reservation has finished untaken.
+-- * The storage service holds a backing for every live arena and every reserved open whose request
+--   is live, and at most one more for each closing arena, each reserved open whose request has
+--   ended (each closes its file in one bounded call, after which the owner forgets it) and each
+--   open whose reservation has finished untaken.
 -- * With no task of the owner and no job of the backend, the edit bank's cache and staging hold
 --   nothing, and its control holds exactly the storage service's own records: a backing record
 --   for each backing, charged closing record, held close and running open, and a kept-failure
@@ -1184,11 +1185,17 @@ backedInvariants st adm compileBank sn =
       OpenReserving _ _ _ n _ _ → n
       OpenPublishable _ _ n _ _ → n
       OpenUnwinding n _ _ → n
-    wanted = Map.size (stateArenas st) + length [() | OpenPublishable {} ← map openPhase (Map.elems (stateOpens st))]
-    reserving = Map.size (stateClosing st) + length [() | p ← map openPhase (Map.elems (stateOpens st)), isReserving p]
-    isReserving = \case
+    wanted = Map.size (stateArenas st) + length [() | (rid, t) ← Map.toList (stateOpens st), isPublishable (openPhase t), live rid]
+    reserving = Map.size (stateClosing st) + length [() | (rid, t) ← Map.toList (stateOpens st), isReserving rid (openPhase t)]
+    live rid = Map.member rid (stateRequests st)
+    isPublishable = \case
+      OpenPublishable {} → True
+      _ → False
+    -- a reserved open whose request ended is closing its file ('stepOpen'), like a closing arena
+    isReserving rid = \case
       OpenReserving {} → True
       OpenUnwinding {} → True
+      OpenPublishable {} → not (live rid)
       _ → False
     backings = length (snBackings sn)
     storageControl =
