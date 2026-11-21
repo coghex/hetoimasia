@@ -679,23 +679,28 @@ publication`, one bounded unit a step, all for the **destination camera**:
    by reference. Refused before anything is built: records that cannot fit the
    renderer's storage window as a frame binds them, or more new chunks than the
    target's free slots.
-7. **Building.** At most `profileBuilds` chunks a step; each occupies a slot
-   from just before its build (so a target counts against `W` while its first
-   build is under way), and is handed to the
+7. **Building.** At most `profileBuilds` chunks a step; each first reserves a
+   free slot of its target, in one transaction (with none free the builds wait
+   for a disposal to free one), and occupies it from then (so a target counts
+   against `W` while its first build is under way), and is handed to the
    candidate in the transaction after its build, or to disposal if the stage
-   was replaced meanwhile. Upload backpressure keeps the built prefix. A
-   refused build returns its slot only when it made no buffer (`Allocated`);
-   a buffer it made keeps the slot until the backend confirms its destruction,
-   and one whose release failed, or a build that raised, keeps it as a failure
-   with its cause.
+   was replaced meanwhile. Upload backpressure keeps the built prefix, and a
+   retry waits until an upload of the view's that was under way then has left
+   the upload. A refused build returns its slot only when it made no buffer
+   (`Allocated`). A buffer it made keeps the slot until the backend confirms
+   its destruction, named by the renderer or by the exception its
+   construction raised. A buffer whose release failed, or a build that raised
+   with no buffer named, keeps the slot as a failure with its cause, which
+   names the buffer when it is known.
 8. **Publication**, once every chunk is ready, in the transaction that rechecks
    the claim, the target, the session, the intent, the metrics and the arena's
    content and knowledge revisions, and applies the view's runtime demand under
    its own authority (`setViewDemandSTM`): F nearest the anchor first, then the
    plan's prefetch outside F, cut at the service's camera regions without
    refusing (`readingDemand`, with the service's receipt in `readingReceipt`;
-   completing a cut demand is the terrain service's). The successor's demand and
-   its scene are accepted together or neither: a refusal of either (the
+   completing a cut demand is the terrain service's). A successor whose list
+   equals the installed one keeps that installation and its receipt. The
+   successor's demand and its scene are accepted together or neither: a refusal of either (the
    runtime's or the host's) rolls the attempt back, the installed demand and
    receipt included, and is recorded as a refusal. Overtaken, the candidate's builds are discarded and
    the newer state prepared. A view pins the revision its receipt names and one
@@ -705,9 +710,13 @@ publication`, one bounded unit a step, all for the **destination camera**:
 **Reconciliation.** Each owner step derives the view's outputs from one
 current snapshot. Its runtime demand is the accepted revision's on an Extent
 (empty before the first), and empty at Unknown or Zero. Whenever the installed
-list differs, it is replaced once under the view's authority and its receipt
-recorded, so a restore reinstalls the retained revision's demand with no new
-publication. A preparation runs on an Extent whose accepted revision is not of
+list differs, it is replaced once, in a transaction that also finds the view
+live (open, its target usable, its original authority held, its lease live),
+and its receipt is recorded (`readingInstalls` counts installations). A
+restore reinstalls the retained revision's demand with no new publication. The
+view's original authority (the caller's window and style leases its open
+checked) is part of every check that work is still current; its loss ends the
+view (`EndRevoked`). A preparation runs on an Extent whose accepted revision is not of
 the current basis (intent, geometry, arena incarnation, content and knowledge
 revisions) or lists a part that failed its upload. At Zero it runs only to
 settle a pending move, and at Unknown never.
@@ -756,7 +765,8 @@ prepares again when the basis moves, or, for a refusal over the slots, when the
 target's free slots reach what the attempt needed. Residency churn, unrelated
 wakes and the failed attempt's own returned slots do not count as a change. A
 refused demand replacement is suppressed while its basis and the desired list
-stay as they were.
+stay as they were. A refusal whose basis no longer applies retires, and a new
+refusal is a new entry, reported once.
 
 ### Retirement
 
@@ -776,7 +786,7 @@ keeps its slot; the others go on.
 | Ending | Disposal and caller outcome |
 | --- | --- |
 | `closeView` | Revoked at once, without a step. A published claim is handed back with a real empty revision in the same transaction; an unpublished one is returned. Its chunks retire. `CloseRetiring`, `CloseDone` or `CloseAlreadyReleased`. |
-| Lease, client or arena gone | `EndRevoked`: the claim handed back, moves settled, chunks retired. |
+| Lease, client or arena gone, or the original window or style authority revoked | `EndRevoked`: the claim handed back, moves settled, chunks retired. |
 | Target retired | `EndTargetGone`: the claim and demand dropped. |
 | Graphics owner ends | Admission stops; every view ends (`EndStopped`), settling its pending moves; controls answer `ControlEnded` and opens `OpenStopped`; what it can no longer dispose of ends as a failure with its cause. |
 | `withTerrainViews` ends | Every view ends (`EndStopped`); the drain waits, with the owner live, for the admitted step and every chunk's holder, and closes step admission in the transaction that finds it done; the listeners go and the reservation returns; the planner and watcher are joined first. The drain's wait stays interruptible: an interruption records what was retiring as failures with that cause and is raised after the cleanup, kept beside the body's own failure. |
