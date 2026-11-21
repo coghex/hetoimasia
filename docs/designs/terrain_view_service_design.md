@@ -92,9 +92,11 @@ Use A’s draw receipt for the fifth operation and the terrain runtime’s final
 2. Show that residency churn preserves the drawn revision, invalidates an old token and permits a fresh pick on the same frame.
 3. Through real edit settlement, a valid token edits its cell. A superseding drawn revision, revoked authority or a relevant change during storage preparation returns `stale_view` with terrain intact.
 
-## Proposal for #714 · Copy admission from the destination camera
+## Approved amendment for #714 · Copy admission from the destination camera
 
-**Proposed amendment for owner approval.** A preparation copies every storage region the cell planner can read for one camera. It admits that set as a whole. A cap refusal preserves the displayed terrain or M1 scene and its drawn mapping. Runtime camera demand gives those same regions priority for residency. This amends delivery A. The six guarantees, the “F” amendment, and the scope of delivery B still apply. [#714 amendment F](https://github.com/coghex/hetoimasia/issues/714#issuecomment-7052799078) · [Readiness review](https://github.com/coghex/hetoimasia/issues/714#issuecomment-7052832709)
+The owner approved this section at `8b8e7f32cf` with “Y” on 2026-11-21 at 02:39:46 UTC.
+
+A preparation copies every storage region the cell planner can read for one camera. It admits that set as a whole. A cap refusal preserves the displayed terrain or M1 scene and its drawn mapping. Runtime camera demand gives those same regions priority for residency. This amends delivery A. The six guarantees, the “F” amendment, and the scope of delivery B still apply. [#714 amendment F](https://github.com/coghex/hetoimasia/issues/714#issuecomment-7052799078) · [Readiness review](https://github.com/coghex/hetoimasia/issues/714#issuecomment-7052832709)
 
 ### Settle the camera, then enumerate its reads
 
