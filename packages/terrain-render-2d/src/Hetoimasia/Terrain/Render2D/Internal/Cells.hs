@@ -539,6 +539,8 @@ data ReadFootprint
 -- cache or earlier camera. A zero drawable or empty band reads nothing.
 cellReadFootprint ∷ Int → CameraState → ViewSetup → CellConfig → Either CellError ReadFootprint
 cellReadFootprint regionLimit camera setup config = do
+  -- the planner's own configuration check first: its depth bound is what bounds a column's level-regions
+  unless (validConfig config) (Left CellInvalidConfig)
   (_, envelope) ← requestGeometry camera setup config
   pure $ case envelope of
     Nothing → ReadRegions Set.empty
@@ -551,21 +553,25 @@ cellReadFootprint regionLimit camera setup config = do
     walk env (Just cursor@(v, u)) columns acc
       | lo > hi = walk env (nextCursor env cursor) columns acc
       | columns + 1 > columnLimit = ReadBeyondColumns columnLimit
-      | Set.size acc' > regionLimit = ReadBeyondRegions regionLimit
-      | otherwise = walk env (nextCursor env cursor) (columns + 1) acc'
+      | otherwise = case insertEach acc keys of
+          Nothing → ReadBeyondRegions regionLimit
+          Just acc' → walk env (nextCursor env cursor) (columns + 1) acc'
       where
         (lo, hi) = columnWindow env cursor
         offset = ((u + v) `div` 2, (v - u) `div` 2)
-        acc' =
-          foldr
-            Set.insert
-            acc
-            [ key
-            | let (own, east, south) = columnReads (envClip env) offset (lo, hi)
-            , (at, a, b) ← [own, east, south]
-            , Just column ← [worldColumn camera at]
-            , key ← regionsOver column (max a worldLo) (min b worldHi)
-            ]
+        keys =
+          [ key
+          | let (own, east, south) = columnReads (envClip env) offset (lo, hi)
+          , (at, a, b) ← [own, east, south]
+          , Just column ← [worldColumn camera at]
+          , key ← regionsOver column (max a worldLo) (min b worldHi)
+          ]
+    -- one key at a time: the first distinct key past the limit stops the walk, before it is held
+    insertEach acc [] = Just acc
+    insertEach acc (key : rest)
+      | Set.member key acc = insertEach acc rest
+      | Set.size acc >= regionLimit = Nothing
+      | otherwise = insertEach (Set.insert key acc) rest
     regionsOver (Column x y) a b =
       [ RegionCoord (fromInteger (toInteger (axisValue x) `div` 16)) (fromInteger (toInteger (axisValue y) `div` 16)) (fromInteger z)
       | a <= b

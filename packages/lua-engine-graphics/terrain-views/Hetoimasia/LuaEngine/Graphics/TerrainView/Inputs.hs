@@ -27,12 +27,14 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView.Inputs
   , copyKnowledge
   , copyGeneration
   , copyRegions
+  , copySource
   , copySnapshots
   , generationIdentity
   , combineCopies
   , Incoherent (..)
   , InputsError (..)
   , planInputs
+  , emptyInputs
   , plannerKnowledge
   , plannerRuns
   , knowledgeState
@@ -41,13 +43,12 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView.Inputs
 import Data.Bits (setBit, shiftR, xor, (.&.))
 import Data.Int (Int64)
 import Data.List (sortOn)
-import qualified Data.IntMap.Strict as IntMap
 import qualified Data.Map.Strict as Map
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Word (Word64)
 import Hetoimasia.Terrain.Cell (Column (..), ZRange, mkZRange)
-import Hetoimasia.Terrain.Changes (ChangeError, ChangeLimits (..), changesFromIntervals)
+import Hetoimasia.Terrain.Changes (ChangeError, ChangeLimits (..), changesFromIntervals, emptyChanges)
 import Hetoimasia.Terrain.Coordinate (RegionCoord (..), axisFromInteger)
 import qualified Hetoimasia.Terrain.Discovery as D
 import Hetoimasia.Terrain.Render2D.Facts (Availability, ChunkKey (..), TerrainFacts (..), Versions (..), mkAvailability)
@@ -56,6 +57,7 @@ import Hetoimasia.Terrain.Residency (ArenaId (..), Revision (..))
 import Hetoimasia.Terrain.Runtime
   ( RegionPart (..)
   , RegionSnapshot
+  , regionInputCounts
   , regionKnowledge
   , regionSnapshotContentRevision
   , regionSnapshotGeneration
@@ -145,6 +147,14 @@ planInputs limits copies = do
     availabilityOf ∷ [(ChunkKey, [ZRange])] → Availability
     availabilityOf = mkAvailability
 
+-- | The planner's inputs for a footprint that reads nothing, at a version: no removed interval, nothing available, and
+-- every cell pending. The planner reads no cell of them, so the source (the arena incarnation's own, immutable) is
+-- only their identity's.
+emptyInputs ∷ Source → (ArenaId, Revision, Revision, Word64) → Either InputsError (TerrainFacts, Knowledge)
+emptyInputs source (ArenaId arena, Revision content, Revision knowledge, generation) = do
+  known ← either (Left . InputsKnowledge) Right (mkKnowledge KnowledgeSpec {specRevision = knowledge, specDefault = CellPending, specRegions = [], specColumns = []})
+  pure (TerrainFacts (Versions arena content generation) source emptyChanges (mkAvailability []), known)
+
 versionsOf ∷ CopySet → Versions
 versionsOf copies =
   let ArenaId arena = copyArena copies
@@ -182,26 +192,11 @@ plannerRegionKnowledge region known = case D.regionKnowledgeClasses known of
       , Just runs ← [D.regionKnowledgeColumn known column]
       ]
 
--- | The input runs and intervals one copy hands the planner, counted from the copy's interval and class data before
--- anything is expanded: every removed interval, one run for a region whose knowledge is one uniform class, and
--- otherwise every run of every column ('plannerKnowledge' hands the planner exactly those).
+-- | The input runs and intervals one copy hands the planner, counted from the copy's packed parts before anything is
+-- decoded ('regionInputCounts'): every removed interval, one run for a region whose knowledge is one uniform class,
+-- and otherwise every run of every column ('plannerKnowledge' hands the planner exactly those).
 plannerRuns ∷ RegionSnapshot → Int
-plannerRuns snapshot = sum [terrain region + knowledgeOf region | region ← regionSnapshotRegions snapshot]
-  where
-    terrain region = case regionTerrain snapshot region of
-      PartReady intervals → length intervals
-      _ → 0
-    -- counted from the class data, not by expanding it: one run for a uniform region, every column's class's runs
-    -- otherwise (a single shared class is held by all 256 columns)
-    knowledgeOf region = case regionKnowledge snapshot region of
-      PartReady known → case D.regionKnowledgeClasses known of
-        [[_]] → 1
-        [shared] → columnsPerRegion * length shared
-        classes →
-          let lengths = IntMap.fromList (zip [0 ..] (map length classes))
-           in sum [IntMap.findWithDefault 0 index lengths | index ← D.regionKnowledgeColumns known]
-      _ → 0
-    columnsPerRegion = 256
+plannerRuns snapshot = sum [terrain + knowledge | region ← regionSnapshotRegions snapshot, Just (terrain, knowledge) ← [regionInputCounts snapshot region]]
 
 -- | The planner's state of what discovery knows of a cell.
 knowledgeState ∷ D.CellKnowledge → CellKnowledge

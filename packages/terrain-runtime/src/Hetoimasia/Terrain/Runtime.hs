@@ -137,6 +137,7 @@ module Hetoimasia.Terrain.Runtime
   , regionSnapshotRegions
   , regionTerrain
   , regionKnowledge
+  , regionInputCounts
   , regionCell
   , regionCellKnowledge
   , regionSnapshotFootprint
@@ -264,6 +265,7 @@ import Hetoimasia.Terrain.Runtime.Backed.RegionCopy
   , RegionWork
   , regionCell
   , regionCellKnowledge
+  , regionInputCounts
   , regionKnowledge
   , regionReservation
   , regionSnapshotContentRevision

@@ -37,6 +37,7 @@ module Hetoimasia.Terrain.Runtime.Backed.RegionCopy
   , regionSnapshotRegions
   , regionTerrain
   , regionKnowledge
+  , regionInputCounts
   , regionCell
   , regionCellKnowledge
 
@@ -68,6 +69,7 @@ module Hetoimasia.Terrain.Runtime.Backed.RegionCopy
 import Data.Bits (shiftL, shiftR, (.&.))
 import Data.ByteString.Short (ShortByteString)
 import qualified Data.ByteString.Short as SBS
+import qualified Data.IntMap.Strict as IntMap
 import Data.Int (Int64)
 import Data.List (sortOn)
 import Data.Map.Strict (Map)
@@ -140,6 +142,42 @@ regionSnapshotSource = rsSource
 -- | The regions the snapshot holds, ascending.
 regionSnapshotRegions ∷ RegionSnapshot → [RegionCoord]
 regionSnapshotRegions = Map.keys . rsRegions
+
+-- | A held region's input counts, read from its packed parts without unpacking them: the removed intervals of its
+-- terrain, and the knowledge runs a consumer expanding its classes hands on (one for a region whose answer is one
+-- class of one run; otherwise every column's class's runs, a shared class counted for each column that uses it). An
+-- unavailable part counts zero; 'Nothing' for a region the snapshot does not hold. A truncated part counts what it
+-- holds.
+regionInputCounts ∷ RegionSnapshot → RegionCoord → Maybe (Int, Int)
+regionInputCounts snapshot region = do
+  copy ← Map.lookup region (rsRegions snapshot)
+  pure (maybe 0 terrainCount (rcTerrain copy), maybe 0 knowledgeCount (rcKnowledge copy))
+  where
+    byte packed i = fromIntegral (SBS.index packed i) ∷ Int
+    -- each column with intervals: its index, its count, then two ends per interval
+    terrainCount packed = go 0 0
+      where
+        size = SBS.length packed
+        go i acc
+          | i + 1 < size = let n = byte packed (i + 1) in go (i + 2 + 2 * n) (acc + n)
+          | otherwise = acc
+    -- the class count, each class's run count (then two bytes per run), then the class of each column
+    knowledgeCount packed
+      | size < 2 = 0
+      | otherwise = case runsOf (2 ∷ Int) classes [] of
+          (_, [1]) → 1
+          (_, [runs]) → columns * runs
+          (start, counts) →
+            let byClass = IntMap.fromList (zip [0 ..] (reverse counts))
+             in sum [IntMap.findWithDefault 0 (byte packed i) byClass | i ← [start .. min size (start + columns) - 1]]
+      where
+        size = SBS.length packed
+        classes = byte packed 0 * 256 + byte packed 1
+        columns = 256
+        runsOf i 0 acc = (i, acc)
+        runsOf i n acc
+          | i < size = let r = byte packed i in runsOf (i + 1 + 2 * r) (n - 1) (r : acc)
+          | otherwise = (i, acc)
 
 -- | A held region's removed intervals, @[lo, hi)@ in absolute levels, clipped to its 32 levels.
 regionTerrain ∷ RegionSnapshot → RegionCoord → RegionPart [(Column, ZRange)]

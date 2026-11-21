@@ -40,14 +40,14 @@ import Hetoimasia.Render.TwoD.Metrics (PixelExtent (..), TargetMetrics (..))
 import qualified Hetoimasia.Render.TwoD.Validation as Validation
 import Hetoimasia.Render.TwoD.Vulkan.Chunks (ChunkStanding (..))
 import Hetoimasia.Terrain.Cell (mkMaterialId)
-import Hetoimasia.Terrain.Coordinate (AxisCoord, TileCoord (..), axisFromInteger, axisValue, tileCoord)
+import Hetoimasia.Terrain.Coordinate (AxisCoord, axisFromInteger, axisValue, tileCoord)
 import Hetoimasia.Terrain.Render2D.AtlasFixtures (AtlasStyle (..), boundPackedTextures, loadAtlasStyle)
 import Hetoimasia.LuaEngine.Graphics.TerrainView.Inputs (combineCopies, planInputs, plannerRuns)
 import qualified Hetoimasia.Terrain.Discovery as D
 import Hetoimasia.Terrain.Coordinate (RegionCoord (..))
 import Hetoimasia.Terrain.Changes (ChangeLimits (..))
 import Hetoimasia.Terrain.Render2D.Camera (JumpTarget (..), camAnchorX, camAnchorY, camRef, camSurface)
-import Hetoimasia.Terrain.Render2D.Cells (CellConfig (..), CellInputs (..), CellLimits (..), CellKey (..), CellPlan, CellRequest (..), PartKind (PartFog), cellPlanPending, cellPlanQuads, planCells, quadCell, quadKey, quadPart)
+import Hetoimasia.Terrain.Render2D.Cells (CellConfig (..), CellInputs (..), CellLimits (..), CellKey (..), CellPlan, CellRequest (..), PartKind (PartFog), cellPlanPending, cellPlanQuads, planCells, quadKey, quadPart)
 import Hetoimasia.Terrain.Render2D.Facts (TerrainFacts (..))
 import Hetoimasia.Terrain.Render2D.Material (recordLayout)
 import Hetoimasia.Terrain.Render2D.Presentation (pushBlockBytes)
@@ -1091,6 +1091,8 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         remove 1
         settleUntil rig (publishedAtLeast view 2)
         quiesce rig target
+        -- the revision before the edit is drawn: its receipt and its pinned camera and metrics
+        drawn ← drawLatest rig target view
         before ← atomically (latestWorld target)
         published ← atomically (readingPublished <$> readView view)
         -- removing the cell below splits that region's knowledge by column: 3,355 runs, though no one-region batch is
@@ -1102,20 +1104,31 @@ spec = describe "terrain views (TRA-9 v2)" $ do
           _ → False)
         atomically (readingPublished <$> readView view) `shouldReturn` published
         atomically (latestWorld target) `shouldReturn` before
+        after ← atomically (viewDrawn view) >>= maybe (fail "nothing drawn after the refusal") pure
+        (drawnPlanReceipt after, drawnPlanCamera after, drawnPlanMetrics after) `shouldBe` (drawnPlanReceipt drawn, drawnPlanCamera drawn, drawnPlanMetrics drawn)
+        -- the copy refused over the cap was held through its count and returned: no borrow is left charged
+        atomically (inspectRetainedChargesSTM (rigTerrain rig)) >>= (`shouldSatisfy` (null . snd))
 
     it "asks the runtime for F first, cut at its camera regions, and the receipt disposes of every key it was given" $
       withPublished defaultOptions $ \rig target view → do
         copied ← drawLatest rig target view >>= maybe (fail "no regions") pure . drawnPlanRegions
         Set.size copied `shouldBe` 36
         asked ← atomically (readingDemand <$> readView view)
-        -- four camera regions: the anchor's region first, all four of F (copied), none of the prefetch
+        -- four camera regions: all four of F (copied, in any order within F), none of the prefetch
         length asked `shouldBe` 4
-        take 1 asked `shouldBe` [RegionCoord 0 0 0]
         asked `shouldSatisfy` all (`Set.member` copied)
         receipt ← atomically (readingReceipt <$> readView view) >>= maybe (fail "no receipt") pure
         let disposed = Set.fromList (receiptAdmitted receipt <> receiptPending receipt <> receiptExcluded receipt <> receiptTruncated receipt)
         Set.fromList asked `shouldSatisfy` (`Set.isSubsetOf` disposed)
         disposed `shouldSatisfy` (not . Set.null)
+
+    it "gives the one place F leaves to one prefetch region outside F" $
+      withPublished defaultOptions {optRuntime = \c → c {configLimits = cameraLimitsWith 37}} $ \rig target view → do
+        copied ← drawLatest rig target view >>= maybe (fail "no regions") pure . drawnPlanRegions
+        asked ← atomically (readingDemand <$> readView view)
+        (length asked, Set.size (Set.fromList asked)) `shouldBe` (37, 37)
+        Set.fromList (filter (`Set.member` copied) asked) `shouldBe` copied
+        length (filter (`Set.notMember` copied) asked) `shouldBe` 1
 
     it "gives every region of F a runtime place when it has 36, and refuses with a cap of 35" $ do
       withPublished defaultOptions {optRuntime = \c → c {configLimits = cameraLimitsWith 36}} $ \rig target view → do
@@ -1130,20 +1143,23 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         atomically (readingRefusal <$> readView view) `shouldReturn` Just (LimitRegions 36 35)
         atomically (latestWorld target) `shouldReturn` Nothing
 
-    it "gives a fog-only region of F a runtime place, and charges no anchor region a manual slice does not read" $
-      withPublished defaultOptions $ \rig target view → do
-        -- a cut at level -10 through the undiscovered ground, 12 levels below the reference: the cut's level region
-        -- (z = -1) draws only fog there
+    it "gives the regions that draw fog runtime places, and charges no anchor region a manual slice does not read" $
+      withPublished defaultOptions {optRuntime = \c → c {configLimits = cameraLimitsWith 38}} $ \rig target view → do
+        -- a cut at level -10 through the undiscovered ground, 12 levels below the reference, facing south from the
+        -- origin: fog conceals the cut. The runtime has a place for each of F's 38 regions
         atomically (configureView view noConfigure {configureDepth = Just (axis (-10))}) `shouldReturn` Right ()
         settleUntil rig (publishedAtLeast view 2)
         drawn ← drawLatest rig target view
         plan ← maybe (fail "the drawn plan is not pinned") pure (drawnPlanPlan drawn)
         copied ← maybe (fail "no regions") pure (drawnPlanRegions drawn)
-        let ordinary = Set.fromList [RegionCoord (axisValue x `div` 16) (axisValue y `div` 16) (axisValue z `div` 32) | quad ← cellPlanQuads plan, Just (TileCoord x y z) ← [quadCell quad]]
-            fogOnly region = regionZ region == -1 && Set.notMember region ordinary
-        [() | quad ← cellPlanQuads plan, quadPart quad == PartFog] `shouldSatisfy` (not . null)
-        asked ← atomically (readingDemand <$> readView view)
-        filter fogOnly asked `shouldSatisfy` (not . null)
+        -- the world regions of the fog quads' own cells (facing south from the origin, the view frame is the world's)
+        let fogRegions = Set.fromList [RegionCoord (fromInteger (vx `div` 16)) (fromInteger (vy `div` 16)) (fromInteger (z `div` 32)) | quad ← cellPlanQuads plan, quadPart quad == PartFog, let CellKey _ z vx vy _ = quadKey quad]
+        fogRegions `shouldSatisfy` (not . Set.null)
+        asked ← atomically (Set.fromList . readingDemand <$> readView view)
+        fogRegions `shouldSatisfy` (`Set.isSubsetOf` asked)
+        receipt ← atomically (readingReceipt <$> readView view) >>= maybe (fail "no receipt") pure
+        let disposed = Set.fromList (receiptAdmitted receipt <> receiptPending receipt <> receiptExcluded receipt <> receiptTruncated receipt)
+        fogRegions `shouldSatisfy` (`Set.isSubsetOf` disposed)
         -- the anchor's own region at the cut holds no cell this camera reads, and only a pending jump with a level
         -- charges an unread anchor region
         Set.member (RegionCoord 0 0 (-1)) copied `shouldBe` False
@@ -1167,6 +1183,35 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         atomically (inspectRetainedChargesSTM (rigTerrain rig)) >>= (`shouldSatisfy` (null . snd))
         atomically (writeTVar (targetMetrics target) (Just (metricsOf 320 240)))
         settleUntil rig (publishedAtLeast view 1)
+
+    it "withdraws a populated view's runtime demand when its target becomes a zero drawable, keeping its revision" $
+      withPublished defaultOptions $ \rig target view → do
+        published ← atomically (readingPublished <$> readView view)
+        atomically (readingDemand <$> readView view) >>= (`shouldSatisfy` (not . null))
+        atomically (writeTVar (targetMetrics target) (Just (metricsOf 0 0)))
+        settleUntil rig (null . readingDemand <$> readView view)
+        reading ← atomically (readView view)
+        (readingPublished reading, readingRefusal reading) `shouldBe` (published, Nothing)
+        atomically (inspectRetainedChargesSTM (rigTerrain rig)) >>= (`shouldSatisfy` (null . snd))
+
+    it "publishes an empty revision, and withdraws the demand, when a populated view's footprint reads nothing" $
+      withPublished defaultOptions $ \rig target view → do
+        -- at the world's corner, a slice 400 levels above the reference projects every read outside the world
+        let top = 2 ^ (62 ∷ Int) - 1
+        Right move ← atomically (moveView view (JumpTarget (axis top) (axis top) Nothing))
+        settleUntil rig (isJust <$> moveSettled move)
+        atomically (moveSettled move) `shouldReturn` Just MoveLanded
+        settleUntil rig (publishedAtLeast view 2)
+        atomically (readingDemand <$> readView view) >>= (`shouldSatisfy` (not . null))
+        reference ← drawLatest rig target view >>= maybe (fail "no camera") pure . drawnPlanCamera
+        atomically (configureView view noConfigure {configureDepth = Just (axis (camRef reference + 399))}) `shouldReturn` Right ()
+        settleUntil rig (publishedAtLeast view 3)
+        world ← atomically (latestWorld target) >>= maybe (fail "no world") pure
+        worldChunks world `shouldBe` Set.empty
+        reading ← atomically (readView view)
+        (readingDemand reading, readingRefusal reading) `shouldBe` ([], Nothing)
+        drawn ← drawLatest rig target view
+        fmap (null . cellPlanQuads) (drawnPlanPlan drawn) `shouldBe` Just True
 
     it "follows a removed summit whose new top is in the vertical region below" $
       withPublished defaultOptions $ \rig target view → do

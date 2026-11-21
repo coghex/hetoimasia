@@ -71,6 +71,8 @@ readFootprint = describe "the read footprint" $ do
     cellReadFootprint 0 camera (setup 320 240) defaultCellConfig `shouldBe` Right (ReadBeyondRegions 0)
     let oneColumn = defaultCellConfig {ccLimits = (ccLimits defaultCellConfig) {clColumns = 1}}
     cellReadFootprint 512 camera (setup 320 240) oneColumn `shouldBe` Right (ReadBeyondColumns 1)
+  it "checks the planner's configuration before it walks: a depth past the planner's bound is refused" $
+    cellReadFootprint 512 camera (setup 320 240) defaultCellConfig {ccDepth = 1000000} `shouldBe` Left CellInvalidConfig
   it "holds the anchor's region and stays inside the representable world at its edge" $ do
     let top = 2 ^ (62 ∷ Int) - 1 ∷ Integer
         keys = regionsOf (cellReadFootprint 512 (manualCamera top 0 1) (setup 320 240) defaultCellConfig)
