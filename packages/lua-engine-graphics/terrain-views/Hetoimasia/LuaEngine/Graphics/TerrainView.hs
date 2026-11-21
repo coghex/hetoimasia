@@ -45,4 +45,5 @@ productionPorts host graphics scenes terrain client account = do
       , portTerrain = terrain
       , portClient = client
       , portAccount = account
+      , portCopyHooks = noCopyHooks
       }

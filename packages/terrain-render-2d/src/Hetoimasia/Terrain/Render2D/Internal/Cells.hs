@@ -47,6 +47,8 @@ module Hetoimasia.Terrain.Render2D.Internal.Cells
     -- * The read footprint
   , ReadFootprint (..)
   , cellReadFootprint
+  , planEmptyFootprint
+  , cellPrefetchRegions
   ) where
 
 import Control.Monad (unless, when)
@@ -313,6 +315,9 @@ data CellPlan = CellPlan
   , cpBounds ∷ !(Maybe Rect)
   , cpUsed ∷ !(Set.Set AssetKey)
   , cpStats ∷ !CellStats
+  , cpWindows ∷ !(Map.Map ChunkKey (Integer, Integer))
+  -- ^ The level window each visible chunk's candidate columns read: what a
+  -- prefetch ring is taken around.
   }
 
 -- | Why a plan, a step or a continuation was refused.
@@ -336,6 +341,8 @@ data CellError
     CellInconsistentKnowledge !Column !Integer
   | -- | A value could not be represented in the target.
     CellUnrepresentable !String
+  | -- | An empty plan was asked for a camera whose read footprint is not empty.
+    CellFootprintNotEmpty
   deriving stock (Eq, Show)
 
 -- | The resumable state of preparation. The constructor is private.
@@ -389,15 +396,20 @@ type Offset = (Integer, Integer)
 cellIdentityOf ∷ CellInputs → Either CellError CellIdentity
 cellIdentityOf inputs = do
   let request = inputsRequest inputs
-      camera = crCamera request
       config = crConfig request
   when (crVersions request /= factsVersions (inputsFacts inputs)) $
     Left (CellMixedVersions (crVersions request) (factsVersions (inputsFacts inputs)))
   unless (validConfig config) (Left CellInvalidConfig)
-  pure
-    CellIdentity
+  pure (identityFor request (knowledgeRevision (inputsKnowledge inputs)) (inputsAssets inputs))
+
+-- The identity a request gives a plan, with the knowledge revision and the assets it is made with.
+identityFor ∷ CellRequest → Word64 → AssetSnapshot → CellIdentity
+identityFor request knowledge assets =
+  let camera = crCamera request
+      config = crConfig request
+   in CellIdentity
       { idVersions = crVersions request
-      , idKnowledge = knowledgeRevision (inputsKnowledge inputs)
+      , idKnowledge = knowledge
       , idCameraRevision = camRevision camera
       , idAnchor = (camAnchorX camera, camAnchorY camera)
       , idFrac = camFrac camera
@@ -406,7 +418,7 @@ cellIdentityOf inputs = do
       , idFacing = camFacing camera
       , idCut = camClip camera
       , idSetup = crSetup request
-      , idAssets = assetIdentity (inputsAssets inputs)
+      , idAssets = assetIdentity assets
       , idConfig = config
       }
 
@@ -577,6 +589,91 @@ cellReadFootprint regionLimit camera setup config = do
       | a <= b
       , z ← [a `div` 32 .. b `div` 32]
       ]
+
+-- | The plan of a camera whose read footprint is empty, from the planner's own proof ('cellReadFootprint' finds no
+-- key): no quad, no pending span and no demand, labelled with the request's versions, this knowledge revision and these
+-- assets. It reads no terrain. Refused ('CellFootprintNotEmpty') when the camera reads anything.
+planEmptyFootprint ∷ CellRequest → Word64 → AssetSnapshot → Either CellError CellPlan
+planEmptyFootprint request knowledge assets = do
+  let camera = crCamera request
+      setup = crSetup request
+      config = crConfig request
+  footprint ← cellReadFootprint 0 camera setup config
+  case footprint of
+    ReadRegions keys | Set.null keys → pure ()
+    _ → Left CellFootprintNotEmpty
+  (view, _) ← requestGeometry camera setup config
+  pure
+    CellPlan
+      { cpIdentity = identityFor request knowledge assets
+      , cpView = view
+      , cpAssets = assets
+      , cpQuads = []
+      , cpPendings = []
+      , cpUnresolved = Nothing
+      , cpProgress = Settled
+      , cpDemand = CellDemand {cdVisible = emptyDemand, cdPrefetch = emptyDemand, cdTruncated = False}
+      , cpBounds = Nothing
+      , cpUsed = Set.empty
+      , cpStats = CellStats 0 0 0 0 0 0 0 0 0
+      , cpWindows = Map.empty
+      }
+
+-- | The prefetch prefix of a settled plan: distinct region keys outside @excluded@ (the camera's read footprint), at
+-- most @places@ of them, from the configured horizontal margin around the plan's visible chunks over their level
+-- band, made ring chunk by ring chunk. Each chunk it lists charges one of the chunks the visible demand left, its
+-- unready intervals to the intervals it left, at most 'clRegionsPerChunk' of its regions, and its scan to the step's
+-- work; the walk stops at the first bound exhausted and keeps what it made. Nothing is looked at when no place is left
+-- or the margin is zero.
+cellPrefetchRegions ∷ CellConfig → Availability → CellPlan → Set.Set RegionCoord → Int → [RegionCoord]
+cellPrefetchRegions config availability plan excluded places
+  | places <= 0 || margin <= 0 || Map.null windows = []
+  | otherwise = go Set.empty chunkRoom intervalRoom (clStepWork limits) places ringKeys
+  where
+    limits = ccLimits config
+    margin = ccChunkMargin config
+    windows = cpWindows plan
+    visible = cdVisible (cpDemand plan)
+    chunkRoom = clDemandChunks limits - length (demandChunks visible)
+    intervalRoom = clDemandIntervals limits - demandIntervalCount visible
+    lo = max worldLo (minimum (map fst (Map.elems windows)))
+    hi = min worldHi (maximum (map snd (Map.elems windows)))
+    worldLo = negate (2 ^ (62 ∷ Int))
+    worldHi = 2 ^ (62 ∷ Int)
+    chunkLo = negate (2 ^ (58 ∷ Int)) ∷ Integer
+    chunkHi = 2 ^ (58 ∷ Int) - 1 ∷ Integer
+    ringKeys = [key | ChunkKey cx cy ← Map.keys windows, key ← ring cx cy, Map.notMember key windows]
+    ring cx cy =
+      [ ChunkKey (fromInteger nx) (fromInteger ny)
+      | nx ← [max chunkLo (toInteger cx - margin) .. min chunkHi (toInteger cx + margin)]
+      , ny ← [max chunkLo (toInteger cy - margin) .. min chunkHi (toInteger cy + margin)]
+      ]
+    -- lazy: only the prefix asked for is made
+    go _ _ _ _ _ [] = []
+    go seen chunks intervals work left (key@(ChunkKey cx cy) : rest)
+      | work <= 0 = []
+      | Set.member key seen = go seen chunks intervals (work - 1) left rest
+      | otherwise =
+          let unready = unknownPieces availability key lo hi
+              cost = 1 + windowWork lo hi
+              regions =
+                take
+                  (clRegionsPerChunk limits)
+                  [ region
+                  | z ← levelsOf unready
+                  , let region = RegionCoord cx cy (fromInteger z)
+                  , Set.notMember region excluded
+                  ]
+              seen' = Set.insert key seen
+           in if
+                | null regions → go seen' chunks intervals (work - cost) left rest
+                | chunks <= 0 || length unready > intervals || cost > work → []
+                | otherwise →
+                    let taken = take left regions
+                        left' = left - length taken
+                     in taken <> (if left' > 0 then go seen' (chunks - 1) (intervals - length unready) (work - cost) left' rest else [])
+    -- the level-regions the unready pieces cross, each once
+    levelsOf pieces = Set.toAscList (Set.fromList [z | (a, b) ← pieces, z ← [regionOfLevel a .. regionOfLevel (b - 1)]])
 
 -- The envelope of candidate columns. The column of view offset @(rx, ry)@ has
 -- @u = rx - ry@ and @v = rx + ry@; the full 96 x 64 canvas of its level @z@
@@ -1141,6 +1238,7 @@ cellPlanOf inputs prep = do
             , cellStatDemandWork = demandWork
             , cellStatProofs = Map.size (prExactY prep)
             }
+      , cpWindows = prChunks prep
       }
 
 -- The demand of the wants within the demand bounds, in ascending chunk order,

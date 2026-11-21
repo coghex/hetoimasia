@@ -19,6 +19,7 @@ module Test.TerrainRender2D.Cells
 
 import Control.Monad (forM_)
 import Data.Foldable (toList)
+import qualified Data.Set as Set
 import Data.Int (Int64)
 import Data.Function (on)
 import Data.List (sortOn)
@@ -30,17 +31,17 @@ import Hetoimasia.Terrain.Cell (Column (..))
 import Hetoimasia.Terrain.Coordinate (RegionCoord (..), TileCoord (..), axisValue)
 import Hetoimasia.Terrain.MapBake.Catalog (MapKey (..), MapRole (..), catalogKeys, mapFileName)
 import Hetoimasia.Terrain.Render2D.Assets
-import Hetoimasia.Terrain.Render2D.Camera (camRef)
+import Hetoimasia.Terrain.Render2D.Camera (Command (..), Step (..), applyCommand, camRef, defaultCameraConfig)
 import Hetoimasia.Terrain.Render2D.CellPick
 import Hetoimasia.Terrain.Render2D.Cells
-import Hetoimasia.Terrain.Render2D.Facts (chunkOfColumn)
+import Hetoimasia.Terrain.Render2D.Facts (Versions (..), chunkOfColumn, emptyDemand, mkAvailability)
 import Hetoimasia.Terrain.Render2D.Knowledge
 import Hetoimasia.Terrain.Shape (ShapeId, ViewFacing (..), allViewFacings, mkShapeId)
 import System.FilePath ((</>))
 import Test.Hspec
 import Test.TerrainRender2D.Art (texturesDirectory)
 import Test.TerrainRender2D.CellFixtures
-import Test.TerrainRender2D.Fixtures (axis, manualCamera, setup, tileAt)
+import Test.TerrainRender2D.Fixtures (axis, factsOf, flatWorld, manualCamera, setup, tileAt)
 
 shapeNo ∷ Int → ShapeId
 shapeNo n = either (error . show) id (mkShapeId n)
@@ -51,6 +52,7 @@ spec = describe "Cell quads (TRA-16)" $ do
   checkedInputs
   checkedAssets
   beforeAll (loadAssets 5) $ do
+    emptyAndPrefetch
     representation
     agreement
     exactOrder
@@ -80,6 +82,39 @@ readFootprint = describe "the read footprint" $ do
     keys `shouldSatisfy` (not . null)
     maximum xs `shouldBe` top `div` 16
     regionsOf (cellReadFootprint 512 camera (setup 320 240) defaultCellConfig) `shouldSatisfy` elem (RegionCoord 0 0 0)
+
+-- The plan of a footprint that reads nothing, and the prefetch prefix's bounds.
+emptyAndPrefetch ∷ SpecWith AssetSnapshot
+emptyAndPrefetch = describe "an empty footprint's plan and the prefetch prefix" $ do
+  it "plans a camera that reads nothing as a clear plan from its own proof, and refuses one that reads anything" $ \assets → do
+    let top = 2 ^ (62 ∷ Int) - 1 ∷ Integer
+        request camera = CellRequest (Versions 1 1 1) camera (setup 320 240) defaultCellConfig
+        -- at the world's corner, a cut 400 levels over the reference: every read is outside the world
+        corner = case applyCommand defaultCameraConfig (factsOf flatWorld) (SelectSlice (axis 401)) (manualCamera top top 1) of
+          Right step → stepCamera step
+          Left e → error (show e)
+    case planEmptyFootprint (request corner) 7 assets of
+      Left why → expectationFailure ("refused: " <> show why)
+      Right plan → do
+        (cellPlanQuads plan, cellPlanPending plan, cellPlanProgress plan) `shouldBe` ([], [], Settled)
+        cellPlanDemand plan `shouldBe` CellDemand emptyDemand emptyDemand False
+        cellIdentityKnowledge (cellPlanIdentity plan) `shouldBe` 7
+    fmap (const ()) (planEmptyFootprint (request (manualCamera 0 0 1)) 7 assets) `shouldBe` Left CellFootprintNotEmpty
+  it "lists at most the places given, each once and outside the footprint, at most one chunk's worth under a one-chunk bound, and none without a margin" $ \assets → do
+    let scene = sceneOf FaceSouth 0 [OCell 0 0 0 1 KnownAll]
+        plan = planScene assets scene
+        config = sceneConfig scene
+        nothingReady = mkAvailability []
+        outside = Set.fromList [RegionCoord 0 0 0]
+        prefix c = cellPrefetchRegions c nothingReady plan outside
+        oneChunk = config {ccLimits = (ccLimits config) {clDemandChunks = 1}}
+    prefix config 0 `shouldBe` []
+    let three = prefix config 3
+    length three `shouldBe` 3
+    length (Set.fromList three) `shouldBe` 3
+    three `shouldSatisfy` all (`Set.notMember` outside)
+    Set.size (Set.fromList [(regionX r, regionY r) | r ← prefix oneChunk 64]) `shouldBe` 1
+    prefix config {ccChunkMargin = 0} 64 `shouldBe` []
 
 -- ---------------------------------------------------------------------------
 -- Inputs

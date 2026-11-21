@@ -51,6 +51,10 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView.Session
 
     -- * Targets and styles
   , ViewTarget (..)
+  , ViewGeometry (..)
+  , geometryOfMetrics
+  , CopyHooks (..)
+  , noCopyHooks
   , ViewStyle (..)
   , retainedStyle
 
@@ -113,8 +117,8 @@ import Hetoimasia.LuaEngine.Graphics.Scene.Claims (SceneClaims, claimOf, Claim (
 import Hetoimasia.LuaEngine.Graphics.Scene.Ledger (GraphicsScene, SceneLedger, ledgerChunkHeld, ledgerDropInterest, ledgerListen, ledgerRetainInterest, ledgerTagHeld, worldGraphicsScene)
 import Hetoimasia.LuaEngine.Graphics.Scene.Receipts (DrawReceipts, Drawn (..), forgetReceipt, openReceipt, readReceipt, receiptsListen, sweepOffscreen)
 import Hetoimasia.LuaEngine.Graphics.Scene.World (SceneWorld (..), WorldTag (..))
-import Hetoimasia.LuaEngine.Graphics.TerrainView.Inputs (CopySet (..), combineCopies, emptyInputs, planInputs, plannerRuns)
-import Hetoimasia.LuaEngine.Graphics.TerrainView.Owner (BuildFailure (..), ConstructedDisposal (..), Hands (..), OwnerPorts (..), ScheduleRefusal (..), StepOutcome (..))
+import Hetoimasia.LuaEngine.Graphics.TerrainView.Inputs (CopySet (..), combineCopies, planInputs, plannerRuns)
+import Hetoimasia.LuaEngine.Graphics.TerrainView.Owner (Allocated (..), BuildFailure (..), ConstructedDisposal (..), Hands (..), OwnerPorts (..), ScheduleRefusal (..), StepOutcome (..))
 import Hetoimasia.LuaEngine.Graphics.TerrainView.Profile
 import Hetoimasia.LuaEngine.Graphics.TerrainView.Style (StyleRefusal (..), StyleRequest (styleColourLease, styleLeases, styleNormalLease), acquireStyle, releaseStyle, styleAssets, styleIdentities, styleMappedMaterials, styleTextures)
 import Hetoimasia.Scripting.Lua.Lease (leaseLiveSTM)
@@ -135,7 +139,7 @@ import Hetoimasia.Terrain.Changes (ChangeLimits (..))
 import Hetoimasia.Terrain.Coordinate (AxisCoord, RegionCoord (..), axisValue)
 import Hetoimasia.Terrain.Render2D.Camera (CameraConfig, CameraError, CameraState, Command (..), FollowOutcome (..), JumpEvent (..), JumpId (..), JumpTarget (..), KnownSurface (..), PendingJump (..), Step (..), applyLocal, camAnchorX, camAnchorY, camClip, camFacing, camFrac, camPending, camRef, camZoom, cancelJump, completeJump, completeJumpKnown, defaultCameraConfig, followKnown, followedColumn, newCamera, prospectiveCamera, requestJump)
 import Hetoimasia.Terrain.Render2D.Cells
-import Hetoimasia.Terrain.Render2D.Facts (ChunkDemand (..), ChunkKey (..), Demand (..), TerrainFacts (..))
+import Hetoimasia.Terrain.Render2D.Facts (TerrainFacts (..), Versions (..))
 import Hetoimasia.Terrain.Render2D.Knowledge (Knowledge)
 import Hetoimasia.Terrain.Render2D.Material (Adapted (..), AdaptedQuad (..), adaptCells, adaptedInstance, terrainView)
 import Hetoimasia.Terrain.Render2D.Presentation (LightSettings)
@@ -144,7 +148,6 @@ import Hetoimasia.Terrain.Query (Occupied (..))
 import Hetoimasia.Terrain.Residency (ArenaId (..), RegionDemand (..), Revision (..), coverageBox, limitCameraRegions, limitHoldRegions, limitQueryRegions)
 import Hetoimasia.Terrain.Runtime (ArenaMark (..), ArenaView (viewGeneration, viewKnowledgeRevision, viewPalette, viewRevision), Settlement (..))
 import qualified Hetoimasia.Terrain.Runtime as Runtime
-import Hetoimasia.Terrain.Source (Source)
 import Hetoimasia.Terrain.Runtime.Settlement (Endpoint (..), TakeOutcome (..), cancel, regionsWith, retireSTM, surfaceWith, takeSTM)
 import Hetoimasia.Terrain.Shape (ViewFacing)
 import Numeric.Natural (Natural)
@@ -176,7 +179,19 @@ data TerrainViewsPorts k = TerrainViewsPorts
   , portTerrain ∷ !Runtime.Service
   , portClient ∷ !Runtime.Client
   , portAccount ∷ !RenderAccount
+  , portCopyHooks ∷ !CopyHooks
   }
+
+-- | What the views read at their copy boundary besides the copies: the regions whose terrain part a copy is read as
+-- unavailable (a storage fault, in a suite) and an action run inside the run count of a held copy, its batch named
+-- (a gate a suite observes the held charge at). 'noCopyHooks' in production.
+data CopyHooks = CopyHooks
+  { hookUnavailable ∷ STM (Set RegionCoord)
+  , hookCounting ∷ [RegionCoord] → IO ()
+  }
+
+noCopyHooks ∷ CopyHooks
+noCopyHooks = CopyHooks (pure Set.empty) (\_ → pure ())
 
 -- | Why the service could not be made. Nothing was reserved or started.
 data TerrainViewsRefused
@@ -203,8 +218,28 @@ data ViewTarget k = ViewTarget
   , vtUnbind ∷ STM ()
   , vtPublish ∷ Prepared GraphicsScene → STM Bool
   , vtDepth ∷ !Bool
-  , vtMetrics ∷ STM (Maybe TargetMetrics)
+  , vtGeometry ∷ STM ViewGeometry
+    -- ^ The target's geometry as observed now.
   }
+
+-- | A target's geometry as observed now: unknown (incomplete), zero (an observed zero dimension, logical or framebuffer,
+-- whatever else is missing), or a complete positive extent.
+data ViewGeometry
+  = GeometryUnknown
+  | GeometryZero
+  | GeometryExtent !TargetMetrics
+  deriving (Eq, Show)
+
+-- | The geometry of a metrics cell (an offscreen registration's, say): none is unknown; a zero dimension is zero.
+geometryOfMetrics ∷ Maybe TargetMetrics → ViewGeometry
+geometryOfMetrics = \case
+  Nothing → GeometryUnknown
+  Just metrics
+    | any (== 0) dimensions → GeometryZero
+    | all (> 0) dimensions && metricsScaleX metrics > 0 && metricsScaleY metrics > 0 → GeometryExtent metrics
+    | otherwise → GeometryUnknown
+    where
+      dimensions = [pixelWidth (metricsLogical metrics), pixelHeight (metricsLogical metrics), pixelWidth (metricsFramebuffer metrics), pixelHeight (metricsFramebuffer metrics)]
 
 -- | A view's style: the checked asset snapshot over the two atlas parents' shared coverage planes, the bound
 -- textures, the parents' complete identities (which the view holds interests in and its revisions name), the
@@ -243,15 +278,26 @@ data Part = Part
 -- | What a preparation was started from.
 data Basis = Basis
   { basisIntent ∷ !Word64
-  , basisMetrics ∷ !(Maybe TargetMetrics)
+  , basisGeometry ∷ !ViewGeometry
   , basisArena ∷ !(Maybe (ArenaId, Revision, Revision))
     -- ^ The arena's incarnation and its content and knowledge revisions.
   }
   deriving (Eq, Show)
 
--- | What a refused view waits on: its basis, the arena's residency and the slots freed when it was refused.
-data RefusedAt = RefusedAt !Basis !(Maybe Word64) !Natural
+-- | What a refusal is keyed by: the attempt's basis; for a refusal over the target's free slots, the slots the attempt
+-- needed (a change of the target's free slots to that many is the one other input that can make it fit); and for a
+-- refused demand replacement, the list refused (suppressed while the basis and the desired list stay as they were).
+data RefusedAt = RefusedAt !Basis !(Maybe Int) !(Maybe [RegionCoord])
   deriving (Eq, Show)
+
+-- | The terrain revision the view's target accepted: its basis, its runtime demand (the visible-first prefix it was
+-- planned with) and how many parts it lists. It is valid while every one of them is.
+data Accepted = Accepted
+  { accRevision ∷ !Word64
+  , accBasis ∷ !Basis
+  , accDemand ∷ ![RegionCoord]
+  , accParts ∷ !Int
+  }
 
 data InFlight = InFlight
   { flightRequest ∷ !Runtime.Request
@@ -261,7 +307,8 @@ data InFlight = InFlight
 -- | One preparation: what it was started from, and the destination camera it copies and plans for.
 data Prep = Prep
   { prepBasis ∷ !Basis
-  , prepMetrics ∷ !TargetMetrics
+  , prepMetrics ∷ !(Maybe TargetMetrics)
+    -- ^ The extent the preparation plans and publishes for; 'Nothing' at a zero geometry, where it only settles a move.
   , prepCamera ∷ !CameraState
     -- ^ The camera as it will be once settled: a pending jump's destination landed, and the followed surface as the
     -- terrain service answered it ('prospectiveCamera'). The copies and the plan are for it.
@@ -291,7 +338,7 @@ data Footprint = Footprint
 
 data Stage
   = Idle
-  | Surfacing !Basis !TargetMetrics !Column !InFlight
+  | Surfacing !Basis !(Maybe TargetMetrics) !Column !InFlight
     -- ^ The terrain service is asked for the followed column's surface.
   | Footprinting !Prep !(TMVar (Either BindingLimit Footprint))
     -- ^ The planner enumerates F for the camera, and its batches.
@@ -326,6 +373,7 @@ data Candidate = Candidate
   , cdBuilt ∷ !(Map PartKey Part)
   , cdReused ∷ !(Map PartKey Part)
   , cdCamera ∷ !CameraState
+  , cdMetrics ∷ !TargetMetrics
   , cdDemand ∷ ![RegionCoord]
     -- ^ The runtime demand its publication applies: F nearest the anchor first, then the prefetch, cut at the
     -- service's camera regions.
@@ -381,23 +429,20 @@ data ViewState k = ViewState
   , vsRuntime ∷ !Runtime.View
   , vsStyle ∷ !ViewStyle
   , vsMarkCell ∷ STM (Maybe ArenaMark)
-  , vsSeen ∷ !(TVar (Maybe ArenaMark, Word64, Bool, Maybe TargetMetrics))
-    -- ^ The watcher's last reading of the arena's mark, the authority epoch, the target's usability and its metrics.
+  , vsSeen ∷ !(TVar (Maybe ArenaMark, Word64, Bool, ViewGeometry))
+    -- ^ The watcher's last reading of the arena's mark, the authority epoch, the target's usability and its geometry.
   , vsStatus ∷ !(TVar ViewStatus)
   , vsCamera ∷ !(TVar CameraState)
   , vsLight ∷ !(TVar LightSettings)
   , vsIntent ∷ !(TVar Word64)
   , vsMoves ∷ !(TVar (Map Word64 (TVar (Maybe MoveOutcome))))
-  , vsReady ∷ !(TVar Bool)
-    -- ^ Whether a preparation has settled the camera: a camera field can be configured from then on.
-  , vsSource ∷ !(TVar (Maybe Source))
-    -- ^ The arena incarnation's source (immutable, shared, never a copy), from the view's first copy: what an empty
-    -- footprint's plan is labelled with.
+  , vsSettled ∷ !(TVar (Maybe CameraState))
+    -- ^ The last camera a preparation settled ('Nothing' until one has): a camera field can be configured from then on.
   , vsStage ∷ !(TVar Stage)
   , vsStageSerial ∷ !(TVar Word64)
     -- ^ Moves whenever the stage is replaced from outside a step (an ending), so a step's write-back can tell.
-  , vsPublished ∷ !(TVar (Maybe (Word64, Basis, Bool)))
-    -- ^ The published revision, the basis it was prepared from, and whether its visible demand was incomplete.
+  , vsPublished ∷ !(TVar (Maybe Accepted))
+    -- ^ The terrain revision the target accepted.
   , vsParts ∷ !(TVar (Map PartKey Part))
     -- ^ The chunks the published revision lists.
   , vsPins ∷ !(TVar (Map Word64 Pinned))
@@ -405,15 +450,13 @@ data ViewState k = ViewState
   , vsRefused ∷ !(TVar (Maybe (BindingLimit, RefusedAt)))
   , vsRefusals ∷ !(TVar Natural)
   , vsAsked ∷ !(TVar [RegionCoord])
-    -- ^ The runtime demand last applied, in order.
+    -- ^ The runtime demand last installed successfully, in order (initially empty).
   , vsReceipt ∷ !(TVar (Maybe Runtime.DemandReceipt))
     -- ^ The terrain service's receipt for it.
   , vsSurface ∷ !(TVar (Maybe (Column, Revision, KnownSurface)))
     -- ^ The last surface answer: reused for the same column at the same content revision.
   , vsBuilding ∷ !(TVar Int)
     -- ^ Builds of this view under way (each holds a slot it took before its build).
-  , vsIdleAt ∷ !(TVar (Maybe Basis))
-    -- ^ A basis with nothing to draw (a zero drawable): not prepared again until the basis moves.
   }
 
 -- | A view: a capability over one view incarnation.
@@ -440,6 +483,12 @@ data Retiring k = Retiring
 -- | A chunk a view built, with its target and view.
 type Held k = (k, Word64, ChunkRef)
 
+-- | What a disposal is of: a released chunk, or the buffer a refused build made (no chunk was registered), with its
+-- target and view.
+data Disposal k
+  = DisposeChunk !(Held k)
+  | DisposeAllocation !k !Word64
+
 data TerrainViews k = TerrainViews
   { svConfig ∷ !TerrainViewsConfig
   , svPorts ∷ !(TerrainViewsPorts k)
@@ -451,8 +500,9 @@ data TerrainViews k = TerrainViews
     -- ^ Built chunks no revision listed: released once their upload has ended.
   , svInHand ∷ !(TVar [Held k])
     -- ^ Chunks the owner is releasing now.
-  , svDisposing ∷ !(TVar [(Held k, STM ConstructedDisposal)])
-    -- ^ Released chunks whose physical disposal the backend has not yet confirmed.
+  , svDisposing ∷ !(TVar [(Disposal k, STM ConstructedDisposal)])
+    -- ^ Released chunks, and buffers refused builds made, whose physical disposal the backend has not yet confirmed:
+    -- each keeps its slot until then.
   , svFailed ∷ !(TVar [(k, Maybe ChunkRef, Text)])
     -- ^ Terminal failures, with their causes: a chunk whose release or disposal failed keeps its identity and its slot.
   , svOpen ∷ !(TVar Bool)
@@ -463,7 +513,6 @@ data TerrainViews k = TerrainViews
   , svEnded ∷ !(TVar (Maybe Text))
     -- ^ The graphics owner takes no more steps, and why: admission is stopped.
   , svKickWanted ∷ !(TVar Bool)
-  , svFreed ∷ !(TVar Natural)
   , svPlanningFrame ∷ !(TVar Word64)
   , svPlanningMax ∷ !(TVar Word64)
   , svPlanningStep ∷ !(TVar Word64)
@@ -549,7 +598,6 @@ newService config ports allowance = do
   step ← newTVarIO Nothing
   ended ← newTVarIO Nothing
   wanted ← newTVarIO False
-  freed ← newTVarIO 0
   [planningFrame, planningMax, planningStep, planningStepMax, ownerFrame, ownerMax, ownerStepMax] ← mapM newTVarIO (replicate 7 0)
   jobs ← newTVarIO Map.empty
   running ← newTVarIO Nothing
@@ -569,7 +617,6 @@ newService config ports allowance = do
       , svStep = step
       , svEnded = ended
       , svKickWanted = wanted
-      , svFreed = freed
       , svPlanningFrame = planningFrame
       , svPlanningMax = planningMax
       , svPlanningStep = planningStep
@@ -608,9 +655,9 @@ watch service stopping = loop
       moved ← fmap or . forM views $ \vs → do
         mark ← vsMarkCell vs
         usable ← vtUsable (vsTarget vs)
-        metrics ← vtMetrics (vsTarget vs)
+        geometry ← vtGeometry (vsTarget vs)
         seen ← readTVar (vsSeen vs)
-        let now = (mark, epoch, usable, metrics)
+        let now = (mark, epoch, usable, geometry)
         if seen == now then pure False else True <$ writeTVar (vsSeen vs) now
       if moved then kick service else retry
     work = do
@@ -792,7 +839,8 @@ abandonRetirements service cause = do
   modifyTVar' (svFailed service) $ \failed →
     failed
       <> [(rtTarget r, Just chunk, cause) | r ← toList retiring, chunk ← rtChunks r]
-      <> [(k, Just chunk, cause) | (k, _, chunk) ← private <> inHand <> map fst disposing]
+      <> [(k, Just chunk, cause) | (k, _, chunk) ← private <> inHand]
+      <> [disposalFailure entry cause | (entry, _) ← disposing]
   writeTVar (svRetiring service) Seq.empty
   writeTVar (svPrivate service) []
   writeTVar (svInHand service) []
@@ -873,13 +921,12 @@ newViewState ∷ TerrainViews k → OpenRequest k → ViewStyle → Runtime.View
 newViewState service request style rview markCell camera = do
   incarnation ← atomically (newClaimHolder (portClaims (svPorts service)))
   ViewState incarnation (openTarget request) (openLease request) rview style markCell
-    <$> newTVarIO (Nothing, 0, True, Nothing)
+    <$> newTVarIO (Nothing, 0, True, GeometryUnknown)
     <*> newTVarIO ViewOpen
     <*> newTVarIO camera
     <*> newTVarIO (openLight request)
     <*> newTVarIO 0
     <*> newTVarIO Map.empty
-    <*> newTVarIO False
     <*> newTVarIO Nothing
     <*> newTVarIO Idle
     <*> newTVarIO 0
@@ -893,7 +940,6 @@ newViewState service request style rview markCell camera = do
     <*> newTVarIO Nothing
     <*> newTVarIO Nothing
     <*> newTVarIO 0
-    <*> newTVarIO Nothing
 
 commitOpen ∷ (Ord k, Show k) ⇒ TerrainViews k → ViewState k → STM (Either OpenRefusal ())
 commitOpen service vs = do
@@ -930,9 +976,9 @@ commitOpen service vs = do
             vtBind target
             -- a target that shows nothing yet is asked for its first frame with the real empty revision; one that shows
             -- a scene keeps it until the view's first revision replaces it (its frame gives the metrics)
-            metrics ← vtMetrics target
+            geometry ← vtGeometry target
             shown ← vtShowing target
-            when (isNothing metrics && not shown) (void (vtPublish target (portInitial ports)))
+            when (geometry == GeometryUnknown && not shown) (void (vtPublish target (portInitial ports)))
             pure (Right ())
 
 -- ---------------------------------------------------------------------------
@@ -1033,9 +1079,9 @@ controlled service vs body = do
     ViewEnded _ → pure (Left ControlEnded)
     ViewOpen | isJust ended → pure (Left ControlEnded)
     ViewOpen →
-      readTVar (vsReady vs) >>= \case
-        False → pure (Left ControlBusy)
-        True → readTVar (vsCamera vs) >>= body
+      readTVar (vsSettled vs) >>= \case
+        Nothing → pure (Left ControlBusy)
+        Just _ → readTVar (vsCamera vs) >>= body
 
 -- Settle every pending move as superseded and cancel the camera's pending jump.
 supersede ∷ ViewState k → STM ()
@@ -1073,9 +1119,13 @@ closeView (TerrainView service vs) =
     True →
       atomically $ do
         retiring ← readTVar (svRetiring service)
-        held ← (\a b c → a <> b <> map fst c) <$> readTVar (svPrivate service) <*> readTVar (svInHand service) <*> readTVar (svDisposing service)
+        held ← (<>) <$> readTVar (svPrivate service) <*> readTVar (svInHand service)
+        disposing ← map fst <$> readTVar (svDisposing service)
         building ← (> 0) <$> readTVar (vsBuilding vs)
-        pure (if building || any ((== vsId vs) . rtView) retiring || any (\(_, v, _) → v == vsId vs) held then CloseRetiring else CloseDone)
+        let ofView = \case
+              DisposeChunk (_, v, _) → v == vsId vs
+              DisposeAllocation _ v → v == vsId vs
+        pure (if building || any ((== vsId vs) . rtView) retiring || any (\(_, v, _) → v == vsId vs) held || any ofView disposing then CloseRetiring else CloseDone)
 
 -- End a view, once: 'False' when it had already ended. The transaction does every state change; the terrain service's
 -- calls and the style's release follow it.
@@ -1200,9 +1250,10 @@ stepView service hands vs = do
     Just (Just why) → False <$ endView service vs why
     Nothing → do
       checkPublished service vs
+      demanded ← atomically (reconcileDemand service vs)
       (serial, stage, basis) ← atomically ((,,) <$> readTVar (vsStageSerial vs) <*> readTVar (vsStage vs) <*> currentBasis service vs)
       case stage of
-        Idle → startIfDue service vs serial basis
+        Idle → (demanded ||) <$> startIfDue service vs serial basis
         Surfacing at metrics column flight
           | at /= basis → abandon service vs serial >> pure True
           | otherwise → stepSurfacing service vs serial at metrics column flight
@@ -1227,15 +1278,15 @@ stepView service hands vs = do
 currentBasis ∷ TerrainViews k → ViewState k → STM Basis
 currentBasis service vs = do
   intent ← readTVar (vsIntent vs)
-  metrics ← vtMetrics (vsTarget vs)
+  geometry ← vtGeometry (vsTarget vs)
   arena ← Runtime.inspectArenaSTM (portTerrain (svPorts service)) (vsLease vs)
-  pure (Basis intent metrics ((\a → (Runtime.viewIncarnation a, viewRevision a, viewKnowledgeRevision a)) <$> arena))
+  pure (Basis intent geometry ((\a → (Runtime.viewIncarnation a, viewRevision a, viewKnowledgeRevision a)) <$> arena))
 
 currentResidency ∷ TerrainViews k → ViewState k → STM (Maybe Word64)
 currentResidency service vs = fmap (fromIntegral . viewGeneration) <$> Runtime.inspectArenaSTM (portTerrain (svPorts service)) (vsLease vs)
 
--- A published revision whose chunk failed its upload can never draw: its parts are dropped, so the next preparation
--- rebuilds them, and the view prepares again.
+-- A published revision whose chunk failed its upload can never draw: its parts are dropped, so the accepted revision
+-- is no longer valid (it lists more parts than are left) and the view prepares again.
 checkPublished ∷ TerrainViews k → ViewState k → IO ()
 checkPublished service vs = atomically $ do
   parts ← readTVar (vsParts vs)
@@ -1245,37 +1296,89 @@ checkPublished service vs = atomically $ do
     -- the revision that lists them stays published until a rebuilt one replaces it; they retire behind it
     writeTVar (vsParts vs) (foldr Map.delete parts failed)
     modifyTVar' (svRetiring service) (|> Retiring (vtKey (vsTarget vs)) (vsId vs) (mapMaybe (fmap partChunk . (`Map.lookup` parts)) failed) Unasked False)
-    modifyTVar' (vsPublished vs) (fmap (\(revision, at, _) → (revision, at, True)))
     writeTVar (vsRefused vs) Nothing
 
--- Start a preparation when the published revision is not of the current basis and the view is not refused at it: with
--- the followed column's surface first (asked of the terrain service, or reused from its last answer for the column at
--- this content revision), then F.
+-- Reconcile the view's runtime demand with the one its state prescribes: on a drawable target, the accepted revision's
+-- (empty before the first); otherwise empty. A differing installed list is replaced once, under the live authority,
+-- and its receipt recorded; a refused replacement is a current refusal at this basis, suppressed while the basis and the
+-- desired list stay as they were. Answers whether it changed anything.
+reconcileDemand ∷ (Ord k, Show k) ⇒ TerrainViews k → ViewState k → STM Bool
+reconcileDemand service vs = do
+  status ← readTVar (vsStatus vs)
+  open ← readTVar (svOpen service)
+  ended ← readTVar (svEnded service)
+  geometry ← vtGeometry (vsTarget vs)
+  accepted ← readTVar (vsPublished vs)
+  installed ← readTVar (vsAsked vs)
+  let desired = case geometry of
+        GeometryExtent _ → maybe [] accDemand accepted
+        _ → []
+  if status /= ViewOpen || not open || isJust ended || desired == installed
+    then pure False
+    else do
+      basis ← currentBasis service vs
+      refused ← readTVar (vsRefused vs)
+      let suppressed = case refused of
+            Just (_, RefusedAt at _ (Just list)) → at == basis && list == desired
+            _ → False
+      if suppressed
+        then pure False
+        else
+          Runtime.setViewDemandSTM (portTerrain (svPorts service)) (vsRuntime vs) (vsLease vs) (demandsOf desired) >>= \case
+            Right receipt → True <$ (writeTVar (vsAsked vs) desired >> writeTVar (vsReceipt vs) (Just receipt))
+            Left why → do
+              let limit = LimitRuntime ("the terrain service refused the view's demand: " <> Text.pack (show why))
+              pressure vs limit
+              before ← readTVar (vsRefused vs)
+              when (isNothing before) (modifyTVar' (vsRefusals vs) (+ 1))
+              writeTVar (vsRefused vs) (Just (limit, RefusedAt basis Nothing (Just desired)))
+              pure True
+
+-- The runtime demand of a list of regions: each whole.
+demandsOf ∷ [RegionCoord] → [RegionDemand]
+demandsOf regions = [RegionDemand region coverage | region ← regions, Right coverage ← [coverageBox 0 16 0 16 0 32]]
+
+-- The target's free slots.
+freeSlots ∷ Ord k ⇒ TerrainViews k → ViewState k → STM Int
+freeSlots service vs = do
+  occupied ← Map.findWithDefault 0 (vtKey (vsTarget vs)) <$> readTVar (svSlots service)
+  pure (profileSlots (tvProfile (svConfig service)) - occupied)
+
+-- Start a preparation when the view's state asks for one and no current refusal applies: on a drawable target, when
+-- the accepted revision is not of the current basis or is no longer valid; at a zero geometry, only to settle a
+-- pending move; never while the geometry is unknown. A refusal applies while its basis is current and, for a refusal
+-- over the target's slots, while the target's free slots are fewer than the attempt needed. The followed column's
+-- surface comes first (asked of the terrain service, or reused from its last answer for the column at this content
+-- revision), then F.
 startIfDue ∷ (Ord k, Show k) ⇒ TerrainViews k → ViewState k → Word64 → Basis → IO Bool
 startIfDue service vs serial basis = do
   decision ← atomically $ do
     running ← (== Just (vsId vs)) <$> readTVar (svRunning service)
-    published ← readTVar (vsPublished vs)
+    accepted ← readTVar (vsPublished vs)
+    parts ← readTVar (vsParts vs)
     refused ← readTVar (vsRefused vs)
-    idleAt ← readTVar (vsIdleAt vs)
-    residency ← currentResidency service vs
-    freed ← readTVar (svFreed service)
-    let due = case published of
-          Nothing → True
-          Just (_, at, invalid) → at /= basis || invalid
-        stillRefused = case refused of
-          Just (_, RefusedAt at seen count) → at == basis && seen == residency && count == freed
+    camera ← readTVar (vsCamera vs)
+    free ← freeSlots service vs
+    let current = case accepted of
+          Just acc → accBasis acc == basis && Map.size parts == accParts acc
           Nothing → False
-    case basisMetrics basis of
-      Just metrics | due && not stillRefused && idleAt /= Just basis && not running → do
-        camera ← readTVar (vsCamera vs)
+        moving = isJust (camPending camera)
+        stillRefused = case refused of
+          Just (_, RefusedAt at need _) → at == basis && maybe True (> free) need
+          Nothing → False
+        metrics = case basisGeometry basis of
+          GeometryExtent m | not current → Just (Just m)
+          GeometryZero | moving → Just Nothing
+          _ → Nothing
+    case metrics of
+      Just extent | not stillRefused && not running → do
         cached ← readTVar (vsSurface vs)
         case followedColumn camera of
-          Nothing → Nothing <$ footprint metrics camera Nothing
+          Nothing → Nothing <$ footprint extent camera Nothing
           Just column → case (cached, basisArena basis) of
             (Just (at, revision, known), Just (_, content, _))
-              | at == column && revision == content → Nothing <$ footprint metrics camera (Just (known, revision))
-            _ → pure (Just (metrics, column))
+              | at == column && revision == content → Nothing <$ footprint extent camera (Just (known, revision))
+            _ → pure (Just (extent, column))
       _ → pure Nothing
   case decision of
     Nothing → atomically (isStarted <$> readTVar (vsStage vs))
@@ -1302,7 +1405,7 @@ startIfDue service vs serial basis = do
       when kept (submitJob service vs (\() → footprintOf service prep) box)
 
 -- The preparation of a basis for a camera and its followed surface: the camera it will settle to.
-prepFor ∷ TerrainViews k → Basis → TargetMetrics → CameraState → Maybe (KnownSurface, Revision) → STM Prep
+prepFor ∷ TerrainViews k → Basis → Maybe TargetMetrics → CameraState → Maybe (KnownSurface, Revision) → STM Prep
 prepFor service basis metrics camera known =
   pure (Prep basis metrics (prospectiveCamera (tvCamera (svConfig service)) (fst <$> known) camera) known (pendingId <$> camPending camera) zJump [] [] 0)
   where
@@ -1310,7 +1413,7 @@ prepFor service basis metrics camera known =
 
 -- The surface answer is taken: the camera it settles is footprinted. A failed read refuses with the runtime's cause; an
 -- answer at another content revision than the basis's is superseded and asked again.
-stepSurfacing ∷ (Ord k, Show k) ⇒ TerrainViews k → ViewState k → Word64 → Basis → TargetMetrics → Column → InFlight → IO Bool
+stepSurfacing ∷ (Ord k, Show k) ⇒ TerrainViews k → ViewState k → Word64 → Basis → Maybe TargetMetrics → Column → InFlight → IO Bool
 stepSurfacing service vs serial basis metrics column flight =
   atomically $
     tryReadTMVar (flightBox flight) >>= \case
@@ -1345,7 +1448,8 @@ stepSurfacing service vs serial basis metrics column flight =
 -- planner and handed back fully evaluated, so the owner sorts and splits nothing.
 footprintOf ∷ TerrainViews k → Prep → Either BindingLimit Footprint
 footprintOf service prep =
-  case cellReadFootprint limit camera (setupFor (prepMetrics prep)) (cellConfig service) of
+  -- a zero geometry reads nothing: F is empty without a walk
+  case maybe (Right (ReadRegions Set.empty)) (\metrics → cellReadFootprint limit camera (setupFor metrics) (cellConfig service)) (prepMetrics prep) of
     Left why → Left (LimitFailure ("the footprint could not be made: " <> Text.pack (show why)))
     Right (ReadBeyondColumns _) → Left (LimitPlan HaltColumns)
     Right (ReadBeyondRegions n) → Left (LimitRegions (n + 1) n)
@@ -1453,11 +1557,12 @@ refuse service vs serial basis limit =
         _ → pure ()
       writeTVar (vsStage vs) Idle
       pressure vs limit
-      residency ← currentResidency service vs
-      freed ← readTVar (svFreed service)
       before ← readTVar (vsRefused vs)
       when (isNothing before) (modifyTVar' (vsRefusals vs) (+ 1))
-      writeTVar (vsRefused vs) (Just (limit, RefusedAt basis residency freed))
+      let need = case limit of
+            LimitSlots wanted _ → Just wanted
+            _ → Nothing
+      writeTVar (vsRefused vs) (Just (limit, RefusedAt basis need Nothing))
 
 -- Settle every pending move with recoverable pressure, once, and cancel the camera's pending jump: the camera stays
 -- where it was.
@@ -1480,18 +1585,20 @@ stepCopying service vs serial prep batches taken = \case
     -- the settled borrow is taken and kept, charged to the terrain service, through the copy's validation and the run
     -- count; it is returned exactly once, in the transaction that accepts the copy, refuses it or finds it stale
     let terrain = portTerrain (svPorts service)
+        hooks = portCopyHooks (svPorts service)
     outcome ← atomically $ do
+      unavailable ← hookUnavailable hooks
       tryReadTMVar (flightBox flight) >>= \case
         Nothing → pure Nothing
-        Just settlement → Just <$> takeHeld terrain flight settlement
+        Just settlement → Just . fmap ((,) unavailable) <$> takeHeld terrain flight settlement
     case outcome of
       Nothing → pure False
       Just (Left why) → False <$ atomically (refuse service vs serial (prepBasis prep) (LimitRuntime why))
-      Just (Right borrow) → mask $ \restore → do
+      Just (Right (unavailable, borrow)) → mask $ \restore → do
         let snapshot = Runtime.regionBorrowSnapshot borrow
             release = Runtime.releaseRegionBorrowSTM terrain borrow
             limit = profileRuns (tvProfile (svConfig service))
-        counted ← restore (timed service (\() → prepRuns prep + plannerRuns snapshot)) `onException` atomically release
+        counted ← restore (hookCounting hooks batch >> timed service (\() → prepRuns prep + plannerRuns unavailable snapshot)) `onException` atomically release
         atomically $ do
           release
           if
@@ -1505,8 +1612,9 @@ stepCopying service vs serial prep batches taken = \case
   Nothing → case batches of
     [] → atomically $ do
       box ← newEmptyTMVar
+      unavailable ← hookUnavailable (portCopyHooks (svPorts service))
       kept ← writeBack service vs serial (prepBasis prep) (Inputting prep taken box)
-      when kept (submitJob service vs (\() → inputsOf (tvProfile (svConfig service)) taken) box)
+      when kept (submitJob service vs (\() → inputsOf (tvProfile (svConfig service)) unavailable taken) box)
       pure False
     batch : rest → do
       box ← newEmptyTMVarIO
@@ -1533,10 +1641,10 @@ takeHeld terrain flight = \case
 
 -- The copies' inputs: combined into one version (copies of different versions are never combined), as the planner's
 -- facts and knowledge.
-inputsOf ∷ ViewProfile → [Runtime.RegionSnapshot] → Either BindingLimit (CopySet, TerrainFacts, Knowledge)
-inputsOf profile taken = case combineCopies taken of
+inputsOf ∷ ViewProfile → Set RegionCoord → [Runtime.RegionSnapshot] → Either BindingLimit (CopySet, TerrainFacts, Knowledge)
+inputsOf profile unavailable taken = case combineCopies taken of
   Left _ → Left (LimitRuntime "the copies are of different versions")
-  Right copies → case planInputs (ChangeLimits (profileRuns profile)) copies of
+  Right copies → case planInputs (ChangeLimits (profileRuns profile)) unavailable copies of
     Left why → Left (LimitFailure ("the copies could not be planned from: " <> Text.pack (show why)))
     Right (facts, knowledge) → facts `seq` knowledge `seq` Right (copies, facts, knowledge)
 
@@ -1588,53 +1696,42 @@ settleWith service vs serial prep inputs =
                   _ → pure ()
                 let landed = stepCamera step
                 writeTVar (vsCamera vs) landed
-                writeTVar (vsReady vs) True
-                for_ inputs (\(copies, _, _) → writeTVar (vsSource vs) (Just (copySource copies)))
-                source ← readTVar (vsSource vs)
-                residency ← currentResidency service vs
-                case (inputs, basisArena basis, source) of
-                  (Just (copies, facts, knowledge), _, _) → plan landed (copyIdentity copies) facts knowledge
-                  (Nothing, Just (arena, content, knowledge), Just known')
-                    | drawable (prepMetrics prep) →
-                        let identity = (arena, content, knowledge, fromMaybe 0 residency)
-                         in case emptyInputs known' identity of
-                              Left why → False <$ refuse service vs serial basis (LimitFailure ("the empty inputs could not be made: " <> Text.pack (show why)))
-                              Right (facts, knowledge') → plan landed (identity, Set.empty) facts knowledge'
-                  _ → withdraw
+                writeTVar (vsSettled vs) (Just landed)
+                case (prepMetrics prep, inputs) of
+                  -- a zero geometry: the move is settled; nothing is planned or published
+                  (Nothing, _) → False <$ writeTVar (vsStage vs) Idle
+                  -- a drawable footprint that reads nothing: the planner's own empty plan (readiness-only copies draw nothing)
+                  (Just metrics, _)
+                    | null (prepFootprint prep) → do
+                        residency ← currentResidency service vs
+                        case basisArena basis of
+                          Nothing → False <$ discardStale service vs serial
+                          Just (arena, content, knowledge) → do
+                            let ArenaId arenaNumber = arena
+                                Revision contentNumber = content
+                                Revision knowledgeNumber = knowledge
+                                generation = fromMaybe 0 residency
+                                request = CellRequest (Versions arenaNumber contentNumber generation) landed (setupFor metrics) (cellConfig service)
+                                identity = ((arena, content, knowledge, generation), Set.empty)
+                            plan landed metrics identity (\light → forcedPlanned (emptyPlanOf service (vsStyle vs) light request knowledgeNumber))
+                  (Just metrics, Just (copies, facts, knowledge)) → do
+                    let terrain = portTerrain (svPorts service)
+                        slots = fromIntegral (limitCameraRegions (Runtime.configLimits (Runtime.inspectConfig terrain)))
+                        -- the runtime's places F leaves: the prefetch prefix's length
+                        remaining = max 0 (slots - length (prepFootprint prep))
+                        base = cellConfig service
+                        -- the cell planner lists no ring: the prefix is walked after the plan, within its bounds
+                        cellInputs = CellInputs (CellRequest (factsVersions facts) landed (setupFor metrics) base {ccChunkMargin = 0}) facts knowledge (styleSnapshot (vsStyle vs))
+                    plan landed metrics (copyIdentity copies) (\light → forcedPlanned (planOf service (vsStyle vs) light cellInputs base prep remaining))
+                  (Just _, Nothing) → False <$ refuse service vs serial basis (LimitFailure "a footprint that reads regions has no copies")
   where
     basis = prepBasis prep
-    terrain = portTerrain (svPorts service)
-    drawable metrics = all (> 0) [pixelWidth (metricsLogical metrics), pixelHeight (metricsLogical metrics), pixelWidth (metricsFramebuffer metrics), pixelHeight (metricsFramebuffer metrics)]
-    plan landed identity facts knowledge = do
-      let slots = fromIntegral (limitCameraRegions (Runtime.configLimits (Runtime.inspectConfig terrain)))
-          -- the runtime's places F leaves: the prefetch is a prefix of that many distinct regions outside F, and the
-          -- ring is not looked at when none is left
-          remaining = max 0 (slots - length (prepFootprint prep))
-          base = cellConfig service
-          bounded = if remaining == 0 then base {ccChunkMargin = 0} else base
+    plan landed metrics identity work = do
       light ← readTVar (vsLight vs)
       planned ← newEmptyTMVar
-      let cellInputs = CellInputs (CellRequest (factsVersions facts) landed (setupFor (prepMetrics prep)) bounded) facts knowledge (styleSnapshot (vsStyle vs))
-      kept ← writeBack service vs serial basis (Planning prep identity landed planned)
-      when kept (submitJob service vs (\() → forcedPlanned (planOf service (vsStyle vs) light cellInputs prep remaining)) planned)
+      kept ← writeBack service vs serial basis (Planning prep {prepMetrics = Just metrics} identity landed planned)
+      when kept (submitJob service vs (\() → work light) planned)
       pure False
-    -- nothing can be drawn: no copy and no plan; the runtime demand is withdrawn under the view's own authority, and
-    -- the view waits for its basis to move
-    withdraw = do
-      asked ← readTVar (vsAsked vs)
-      outcome ←
-        if null asked
-          then pure (Right Nothing)
-          else Runtime.setViewDemandSTM terrain (vsRuntime vs) (vsLease vs) [] >>= \case
-            Left why → pure (Left why)
-            Right receipt → pure (Right (Just receipt))
-      case outcome of
-        Left why → False <$ refuse service vs serial basis (LimitRuntime ("the terrain service refused the view's demand: " <> Text.pack (show why)))
-        Right receipt → do
-          for_ receipt $ \r → writeTVar (vsAsked vs) [] >> writeTVar (vsReceipt vs) (Just r)
-          writeTVar (vsIdleAt vs) (Just basis)
-          writeTVar (vsStage vs) Idle
-          pure False
 
 -- Whether two cameras draw the same picture: anchor, offset, reference, clip, zoom and facing.
 sameGeometry ∷ CameraState → CameraState → Bool
@@ -1677,13 +1774,14 @@ setupFor metrics =
 
 -- The planner's whole work for one preparation, pure: the plan run to its end, from F's copies, then the candidate's
 -- parts. A plan-wide bound refuses: a halted plan is never published as if it were complete.
-planOf ∷ TerrainViews k → ViewStyle → LightSettings → CellInputs → Prep → Int → Either BindingLimit Planned
-planOf service style light inputs prep remaining = do
+planOf ∷ TerrainViews k → ViewStyle → LightSettings → CellInputs → CellConfig → Prep → Int → Either BindingLimit Planned
+planOf service style light inputs ring prep remaining = do
   started ← either (failed "the plan could not start") Right (startCells inputs)
   finished ← steps started
   plan ← either (failed "the plan could not finish") Right (cellPlanOf inputs finished)
-  let inF = Set.fromList (prepFootprint prep)
-      prefetch = take remaining (distinctOutside inF (regionsOf (cdPrefetch (cellPlanDemand plan))))
+  -- the prefetch prefix, walked around the plan's visible chunks with the configured ring, outside F, no longer than
+  -- the runtime's places F leaves
+  let prefetch = cellPrefetchRegions ring (factsAvailability (inputsFacts inputs)) plan (Set.fromList (prepFootprint prep)) remaining
   (adapted, parts) ← candidateOf service style plan light
   Right (Planned plan prefetch adapted parts)
   where
@@ -1692,6 +1790,13 @@ planOf service style light inputs prep remaining = do
       Working → either (failed "a plan step failed") Right (stepCells inputs prepared) >>= steps
       Halted reason → Left (LimitPlan reason)
       Settled → Right prepared
+
+-- The plan of a drawable footprint that reads nothing: the cell planner's own (no quad, no demand), adapted.
+emptyPlanOf ∷ TerrainViews k → ViewStyle → LightSettings → CellRequest → Word64 → Either BindingLimit Planned
+emptyPlanOf service style light request knowledge = do
+  plan ← either (Left . LimitFailure . ("the empty plan could not be made: " <>) . Text.pack . show) Right (planEmptyFootprint request knowledge (styleSnapshot style))
+  (adapted, parts) ← candidateOf service style plan light
+  Right (Planned plan [] adapted parts)
 
 -- The planner's work done before it is handed back: the plan's quads, pending spans and demand, every part's
 -- instances and records.
@@ -1712,8 +1817,7 @@ stepPlanning service vs serial prep copies camera box =
     Nothing → pure False
     Just (Left limit) → False <$ atomically (refuse service vs serial (prepBasis prep) limit)
     Just (Right planned) → do
-      let profile = tvProfile (svConfig service)
-          plan = plannedPlan planned
+      let plan = plannedPlan planned
           wanted = plannedParts planned
           terrain = portTerrain (svPorts service)
           cap = fromIntegral (limitCameraRegions (Runtime.configLimits (Runtime.inspectConfig terrain)))
@@ -1726,11 +1830,12 @@ stepPlanning service vs serial prep copies camera box =
             fresh = [w | w@(key, _, _) ← wanted, Map.notMember key kept]
          in Map.size kept `seq` length fresh `seq` (kept, fresh)
       atomically $ do
-        occupied ← Map.findWithDefault 0 (vtKey (vsTarget vs)) <$> readTVar (svSlots service)
-        let free = profileSlots profile - occupied
+        free ← freeSlots service vs
         if length toBuild > free
           then False <$ refuse service vs serial (prepBasis prep) (LimitSlots (length toBuild) free)
-          else writeBack service vs serial (prepBasis prep) (Building prep (Candidate plan copies (plannedAdapted planned) toBuild Map.empty reused camera demand))
+          else case prepMetrics prep of
+            Nothing → False <$ refuse service vs serial (prepBasis prep) (LimitFailure "a plan was made without a drawable extent")
+            Just metrics → writeBack service vs serial (prepBasis prep) (Building prep (Candidate plan copies (plannedAdapted planned) toBuild Map.empty reused camera metrics demand))
 
 -- Time the owner's own pure work, into the current frame's and the current step's planning totals.
 {-# NOINLINE timed #-}
@@ -1777,18 +1882,6 @@ candidateOf service style plan light = do
       (chunk, []) → [chunk]
       (chunk, rest) → chunk : slices n rest
 
--- The regions not in a set, each once, in order; lazy, so a prefix is all that is made.
-distinctOutside ∷ Set RegionCoord → [RegionCoord] → [RegionCoord]
-distinctOutside = go
-  where
-    go _ [] = []
-    go seen (region : rest)
-      | Set.member region seen = go seen rest
-      | otherwise = region : go (Set.insert region seen) rest
-
-regionsOf ∷ Demand → [RegionCoord]
-regionsOf (Demand chunks) = [RegionCoord cx cy (fromInteger level) | ChunkDemand (ChunkKey cx cy) _ levels ← chunks, level ← levels]
-
 -- ---------------------------------------------------------------------------
 -- Building and publication
 
@@ -1798,8 +1891,8 @@ stepBuilding service hands vs serial prep candidate = case cdWanted candidate of
     buildEach (take (profileBuilds (tvProfile (svConfig service))) (cdWanted candidate)) >>= \case
       Nothing → pure True
       -- the staging is full now: an upload's completion asks for the next step
-      Just (BuildBackpressure _) → pure False
-      Just (BuildFailed why) → False <$ atomically (refuse service vs serial (prepBasis prep) (LimitFailure ("a chunk could not be built: " <> why)))
+      Just (BuildBackpressure _ _) → pure False
+      Just (BuildFailed why _) → False <$ atomically (refuse service vs serial (prepBasis prep) (LimitFailure ("a chunk could not be built: " <> why)))
   [] → do
     standings ← atomically (forM (Map.elems (cdBuilt candidate)) (ownerStanding (portOwner (svPorts service)) . partChunk))
     case () of
@@ -1829,14 +1922,31 @@ stepBuilding service hands vs serial prep candidate = case cdWanted candidate of
         if not mine
           then pure (Just Nothing)
           else
-            (handBuild hands instances records `onException` atomically unreserve) >>= \case
-              Left why → Just (Just why) <$ atomically unreserve
+            (handBuild hands instances records `onException` atomically raisedBuild) >>= \case
+              Left why → Just (Just why) <$ atomically (refusedBuild why)
               Right chunk → Nothing <$ atomically (handOn key (Part chunk instances records))
       case outcome of
         Nothing → buildEach more
         Just stopped → pure stopped
     tkey = vtKey (vsTarget vs)
     unreserve = occupy service tkey (-1) >> modifyTVar' (vsBuilding vs) (subtract 1)
+    -- a refused build returns its slot only when it made no buffer; a buffer it made keeps the slot until the backend
+    -- confirms its destruction, and one whose release failed keeps it as a failure with its cause
+    refusedBuild failure = case allocatedOf failure of
+      NotAllocated → unreserve
+      AllocatedDisposing reading → do
+        modifyTVar' (vsBuilding vs) (subtract 1)
+        modifyTVar' (svDisposing service) (<> [(DisposeAllocation tkey (vsId vs), reading)])
+      AllocatedFailed why → do
+        modifyTVar' (vsBuilding vs) (subtract 1)
+        modifyTVar' (svFailed service) (<> [(tkey, Nothing, why)])
+    -- a build that raised: whether it made a buffer is not known, so its slot stays charged, identified with the cause
+    raisedBuild = do
+      modifyTVar' (vsBuilding vs) (subtract 1)
+      modifyTVar' (svFailed service) (<> [(tkey, Nothing, "a build raised after its slot was reserved")])
+    allocatedOf = \case
+      BuildBackpressure _ allocated → allocated
+      BuildFailed _ allocated → allocated
     -- the build is handed to the candidate while the work is still current, otherwise to disposal (and a stale stage
     -- that is still this step's is discarded with it)
     handOn key part = do
@@ -1875,7 +1985,7 @@ publish service vs serial prep candidate = do
               { worldTag = WorldTag (vsId vs) revision
               , worldClear = tvClear (svConfig service)
               , worldView = view
-              , worldMetrics = prepMetrics prep
+              , worldMetrics = cdMetrics candidate
               , worldChunks = Set.fromList chunks
               , worldTextures = styleParents (vsStyle vs)
               }
@@ -1897,8 +2007,7 @@ publish service vs serial prep candidate = do
             -- the runtime demand, under the view's own authority, applied in the transaction that publishes: a refusal
             -- keeps the candidate from being adopted
             let terrain = portTerrain ports
-                demands = [RegionDemand region coverage | region ← cdDemand candidate, Right coverage ← [coverageBox 0 16 0 16 0 32]]
-            Runtime.setViewDemandSTM terrain (vsRuntime vs) (vsLease vs) demands >>= \case
+            Runtime.setViewDemandSTM terrain (vsRuntime vs) (vsLease vs) (demandsOf (cdDemand candidate)) >>= \case
               Left why → False <$ refuse service vs serial (prepBasis prep) (LimitRuntime ("the terrain service refused the view's demand: " <> Text.pack (show why)))
               Right receipt → do
                 writeTVar (vsAsked vs) (cdDemand candidate)
@@ -1912,12 +2021,12 @@ publish service vs serial prep candidate = do
                     unless (null superseded) $
                       modifyTVar' (svRetiring service) (|> Retiring (vtKey (vsTarget vs)) (vsId vs) superseded Unasked False)
                     writeTVar (vsParts vs) parts
-                    writeTVar (vsPublished vs) (Just (revision, prepBasis prep, False))
+                    writeTVar (vsPublished vs) (Just (Accepted revision (prepBasis prep) (cdDemand candidate) (Map.size parts)))
                     writeTVar (vsRefused vs) Nothing
                     writeTVar (vsStage vs) Idle
                     -- the pins: those of the revisions that can still be drawn, and this successor's
                     let (copied, regions) = cdCopies candidate
-                        pin = Pinned plan copied regions (cdCamera candidate) (prepMetrics prep)
+                        pin = Pinned plan copied regions (cdCamera candidate) (cdMetrics candidate)
                     modifyTVar' (vsPins vs) (Map.insert revision pin . Map.filterWithKey (\r _ → Set.member r keep))
                     pure False
 
@@ -1989,7 +2098,7 @@ retire service hands = do
           when (held `elem` inHand) $ do
             writeTVar (svInHand service) (filter (/= held) inHand)
             case outcome of
-              Right reading → modifyTVar' (svDisposing service) (<> [(held, reading)])
+              Right reading → modifyTVar' (svDisposing service) (<> [(DisposeChunk held, reading)])
               Left why → modifyTVar' (svFailed service) (<> [(key, Just chunk, "the chunk's release failed: " <> why)])
 
 -- What can be released now: private builds whose upload has ended, and chunks of met retirements that no adopted
@@ -2015,13 +2124,24 @@ confirmDisposals ∷ Ord k ⇒ TerrainViews k → STM Bool
 confirmDisposals service = do
   disposing ← readTVar (svDisposing service)
   readings ← forM disposing $ \entry@(_, reading) → (,) entry <$> reading
-  forM_ readings $ \(((key, _, chunk), _), standing) → case standing of
-    DisposalDone → occupy service key (-1) >> modifyTVar' (svFreed service) (+ 1)
-    DisposalFailed why → modifyTVar' (svFailed service) (<> [(key, Just chunk, "the chunk's disposal failed: " <> why)])
+  forM_ readings $ \((entry, _), standing) → case standing of
+    DisposalDone → occupy service (disposalTarget entry) (-1)
+    DisposalFailed why → modifyTVar' (svFailed service) (<> [disposalFailure entry ("the disposal failed: " <> why)])
     DisposalPending → pure ()
   let pending = [entry | (entry, DisposalPending) ← readings]
   when (length pending /= length disposing) (writeTVar (svDisposing service) pending)
   pure (length pending /= length disposing)
+
+disposalTarget ∷ Disposal k → k
+disposalTarget = \case
+  DisposeChunk (key, _, _) → key
+  DisposeAllocation key _ → key
+
+-- A disposal that cannot complete, as a failure that keeps its slot.
+disposalFailure ∷ Disposal k → Text → (k, Maybe ChunkRef, Text)
+disposalFailure entry cause = case entry of
+  DisposeChunk (key, _, chunk) → (key, Just chunk, cause)
+  DisposeAllocation key _ → (key, Nothing, "a refused build's buffer: " <> cause)
 
 -- Whether the owner has retirement work it can do now.
 retirementReady ∷ Ord k ⇒ TerrainViews k → STM Bool
@@ -2062,7 +2182,7 @@ readView (TerrainView service vs) = do
   _ ← sweepOffscreen (portReceipts (svPorts service))
   ViewReading
     <$> readTVar (vsStatus vs)
-    <*> (fmap (\(revision, _, _) → revision) <$> readTVar (vsPublished vs))
+    <*> (fmap accRevision <$> readTVar (vsPublished vs))
     <*> readReceipt (portReceipts (svPorts service)) (vsId vs)
     <*> (fmap fst <$> readTVar (vsRefused vs))
     <*> readTVar (vsRefusals vs)

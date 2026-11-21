@@ -11,6 +11,7 @@
 module Hetoimasia.LuaEngine.Graphics.TerrainView.Owner
   ( Hands (..)
   , BuildFailure (..)
+  , Allocated (..)
   , OwnerPorts (..)
   , ScheduleRefusal (..)
   , StepOutcome (..)
@@ -45,22 +46,29 @@ import Hetoimasia.Render.TwoD.Chunk (BoundsRequest (DeriveBounds), ChunkKind (Ch
 import Hetoimasia.Render.TwoD.Material (MaterialRecord, MaterialRef)
 import Hetoimasia.Render.TwoD.Snapshot (Instance)
 import Hetoimasia.Render.TwoD.Vulkan (registerMaterial, rendererDepthFormat, rendererRegionWindow)
-import Hetoimasia.Render.TwoD.Vulkan.Chunks (BuildRefusal (..), ChunkStanding, buildRetainedChunkWith, chunkBufferOf, chunkStandingSTM, releaseChunkNow)
+import Hetoimasia.Render.TwoD.Vulkan.Chunks (BuildRefusal (..), BuildRefused (..), ChunkStanding, RefusedAllocation (..), buildRetainedChunkWith, chunkBufferOf, chunkStandingSTM, releaseChunkNow)
 import Hetoimasia.Render.TwoD.Vulkan.Textures (registeredMarks)
 import Hetoimasia.Terrain.Render2D.Vulkan.Material (terrainMaterial)
 
 -- | Why a chunk was not built: the staging buffer or its queue is full now (a later step can succeed), or a failure
--- no retry changes.
+-- no retry changes; each with what became of the vertex buffer the build made.
 data BuildFailure
-  = BuildBackpressure !Text
-  | BuildFailed !Text
-  deriving (Eq, Show)
+  = BuildBackpressure !Text !Allocated
+  | BuildFailed !Text !Allocated
+
+-- | What a refused build left of its vertex buffer: none was made; one was made and released, and a reading of its
+-- physical destruction says when its capacity is free; or one whose release failed, or which is not known to be
+-- released (a raised build), with the cause: its capacity stays charged.
+data Allocated
+  = NotAllocated
+  | AllocatedDisposing (STM ConstructedDisposal)
+  | AllocatedFailed !Text
 
 -- | What one owner step may do on the owner's thread.
 data Hands = Hands
   { handBuild ∷ [Instance] → [MaterialRecord] → IO (Either BuildFailure ChunkRef)
     -- ^ Build one chunk of a depth-enabled world layer: its instances (each naming the terrain material) and the
-    -- records they index. A refusal holds nothing.
+    -- records they index. A refusal says what became of the buffer it made ('Allocated').
   , handDispose ∷ ChunkRef → IO (Either Text (STM ConstructedDisposal))
     -- ^ Release a chunk's buffer and forget the chunk, answering a reading of the buffer's physical disposal: the
     -- backend destroys it once the batches that recorded it complete, and only then is it done. A chunk without a
@@ -141,9 +149,16 @@ productionOwner host graphics = do
         { handBuild = \instances records → do
             marks ← registeredMarks (graphicsTextures graphics)
             guarded (buildRetainedChunkWith (hostBuilders host construction) retained marks ChunkWorldDepth DeriveBounds (Map.singleton material records) instances) >>= pure . \case
-              Left raised → Left (BuildFailed raised)
-              Right (Left (BuildUploadBackpressure pressure)) → Left (BuildBackpressure (Text.pack (show pressure)))
-              Right (Left refusal) → Left (BuildFailed (Text.pack (show refusal)))
+              -- raised past the renderer's own handling: whether a buffer was made is not known
+              Left raised → Left (BuildFailed raised (AllocatedFailed ("the build raised: " <> raised)))
+              Right (Left (BuildRefused refusal allocation)) →
+                let allocated = case allocation of
+                      NoAllocation → NotAllocated
+                      AllocationReleased buffer (Right ()) → AllocatedDisposing (constructedDisposal construction buffer)
+                      AllocationReleased _ (Left why) → AllocatedFailed ("the refused build's buffer could not be released: " <> Text.pack (show why))
+                 in case refusal of
+                      BuildUploadBackpressure pressure → Left (BuildBackpressure (Text.pack (show pressure)) allocated)
+                      other → Left (BuildFailed (Text.pack (show other)) allocated)
               Right (Right chunk) → Right chunk
         , handDispose = \chunk → do
             -- the buffer, read before the release forgets the chunk, is what is physically disposed of later

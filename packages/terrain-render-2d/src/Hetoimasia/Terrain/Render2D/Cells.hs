@@ -148,6 +148,8 @@ module Hetoimasia.Terrain.Render2D.Cells
     -- * The read footprint
   , ReadFootprint (..)
   , cellReadFootprint
+  , planEmptyFootprint
+  , cellPrefetchRegions
   ) where
 
 import qualified Data.Set as Set

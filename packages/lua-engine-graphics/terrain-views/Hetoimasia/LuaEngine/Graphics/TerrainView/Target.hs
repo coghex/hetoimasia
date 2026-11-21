@@ -8,6 +8,7 @@
 -- ticket, and the receipts promote it when the ticket says so, whatever becomes of the caller.
 module Hetoimasia.LuaEngine.Graphics.TerrainView.Target
   ( windowViewTarget
+  , windowGeometry
   , offscreenViewTarget
   , drawOffscreenView
   ) where
@@ -41,20 +42,21 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , submitVulkanAction
   )
 import Hetoimasia.LuaEngine.Graphics.Scene.Ledger (GraphicsScene (..))
-import Hetoimasia.LuaEngine.Graphics.Scene.Receipts (DrawReceipts, latestFrameMetrics, noteOffscreenBatch, unwatchFrameMetrics, watchFrameMetrics)
+import Hetoimasia.LuaEngine.Graphics.Scene.Receipts (DrawReceipts, noteOffscreenBatch, unwatchFrameMetrics, watchFrameMetrics)
 import Hetoimasia.LuaEngine.Graphics.Scene.Render (RenderSession (..), renderWorldTarget)
 import Hetoimasia.LuaEngine.Graphics.Scene.World (SceneWorld (..), WorldTag)
-import Hetoimasia.LuaEngine.Graphics.TerrainView.Session (ViewTarget (..))
+import Hetoimasia.LuaEngine.Graphics.TerrainView.Session (ViewGeometry (..), ViewTarget (..), geometryOfMetrics)
 import Hetoimasia.LuaEngine.Graphics.Texture (TextureGraphics (..))
 import Hetoimasia.LuaEngine.Graphics.Texture.Host (hostBuilders)
-import Hetoimasia.LuaEngine.Graphics.Window.Host (WindowTarget (..))
+import Hetoimasia.LuaEngine.Graphics.Window.Host (WindowGeometry (..), WindowTarget (..))
 import Hetoimasia.Render.TwoD.Metrics (TargetMetrics)
 
 -- | A window incarnation's target. Its depth is the host's: 'True' only on a host built with the window depth a world
 -- scene draws with ('Hetoimasia.LuaEngine.Graphics.Scene.Configuration.configureWorldDepth'), which the composition
--- passes here. Its metrics are those of the window's latest recorded frame ('latestFrameMetrics'), or, when none is
--- kept (a fresh window, or an idle one whose entry was evicted), its live geometry ('targetGeometry'). Its authority is the caller's original window lease (checked in the open's commit). It
--- shows a scene once the host holds one published for it.
+-- passes here. Its geometry is the window's live observation ('windowGeometry'), whatever frame was recorded last: a
+-- recorded frame's metrics describe that frame (for drawing and picking), never the window now. Its authority is the
+-- caller's original window lease (checked in the open's commit). It shows a scene once the host holds one published
+-- for it.
 windowViewTarget ∷ VulkanHost GraphicsScene → Bool → DrawReceipts → STM Bool → WindowTarget GraphicsScene → ViewTarget SceneTargetKey
 windowViewTarget host hostDepth receipts authority target =
   ViewTarget
@@ -69,12 +71,20 @@ windowViewTarget host hostDepth receipts authority target =
           WindowScenePublished _ _ → True
           _ → False
     , vtDepth = hostDepth
-    , -- the latest recorded frame's metrics, or, before the window has one kept, its live geometry
-      vtMetrics = latestFrameMetrics receipts (targetAttachment target) >>= maybe (targetGeometry target) (pure . Just)
+    , vtGeometry = windowGeometry target
     }
 
+-- | A window's geometry as the views read it: its live observation, a zero dimension included.
+windowGeometry ∷ WindowTarget scene → STM ViewGeometry
+windowGeometry target =
+  targetGeometry target <&> \case
+    WindowGeometryUnknown → GeometryUnknown
+    WindowGeometryZero → GeometryZero
+    WindowGeometryExtent metrics → GeometryExtent metrics
+
 -- | A surface-free target registered with the host: usable while its registrant says so, drawn with the depth image
--- its registrant records with ('drawOffscreenView'), at the metrics its registrant gives.
+-- its registrant records with ('drawOffscreenView'), at the metrics its registrant gives (none is an unknown geometry,
+-- a zero dimension a zero one).
 offscreenViewTarget ∷ VulkanHost GraphicsScene → OffscreenTargetId → STM Bool → STM (Maybe TargetMetrics) → ViewTarget SceneTargetKey
 offscreenViewTarget host target usable metrics =
   ViewTarget
@@ -89,7 +99,7 @@ offscreenViewTarget host target usable metrics =
           TargetScenePublished _ _ → True
           _ → False
     , vtDepth = True
-    , vtMetrics = metrics
+    , vtGeometry = geometryOfMetrics <$> metrics
     }
 
 -- Whether the host holds a scene published for this target.

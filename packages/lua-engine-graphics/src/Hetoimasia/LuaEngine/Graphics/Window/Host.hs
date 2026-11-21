@@ -40,6 +40,9 @@ module Hetoimasia.LuaEngine.Graphics.Window.Host
 
     -- * The capability a ready window yields
   , WindowTarget (..)
+  , WindowGeometry (..)
+  , observedGeometry
+  , geometryOfAttributes
   ) where
 
 import Control.Concurrent.STM
@@ -145,10 +148,18 @@ data WindowTarget scene = WindowTarget
     -- atomic step: nothing that closes between them can be missed. It never waits.
   , targetUsable ∷ STM Bool
     -- ^ Whether this incarnation's target is still the admitted, attached one.
-  , targetGeometry ∷ STM (Maybe TargetMetrics)
-    -- ^ The window's metrics as its latest observation gives them (logical and framebuffer extents, content scale),
-    -- once all three are observed and positive: what its next frame is recorded at, before it has recorded one.
+  , targetGeometry ∷ STM WindowGeometry
+    -- ^ The window's geometry as its latest observation gives it, read live whether or not it records frames.
   }
+
+-- | A window's geometry as an observation gives it: zero when its logical or framebuffer extent is observed with a
+-- zero dimension (whatever else is missing: a minimized window); its metrics once both extents and the content scale
+-- are observed and positive; otherwise unknown.
+data WindowGeometry
+  = WindowGeometryUnknown
+  | WindowGeometryZero
+  | WindowGeometryExtent !TargetMetrics
+  deriving (Eq, Show)
 
 -- | The input of one window incarnation, as the Lua input adapter may reach it: the window's one reader, its admission control
 -- and a transaction reading its latest observation, and nothing else. It carries no command port, no producer, no
@@ -240,11 +251,20 @@ newHostPorts vulkan = do
       }
 
 -- A window's metrics from its observation, as a frame computes them from its own facts.
-observedGeometry ∷ WindowObservation → Maybe TargetMetrics
-observedGeometry observation = case (observedLogicalExtent observation, observedFramebufferExtent observation, observedContentScale observation) of
+observedGeometry ∷ WindowObservation → WindowGeometry
+observedGeometry observation = geometryOfAttributes (observedLogicalExtent observation) (observedFramebufferExtent observation) (observedContentScale observation)
+
+-- | The geometry of an observation's logical extent, framebuffer extent and content scale.
+geometryOfAttributes ∷ Attribute Extent → Attribute Extent → Attribute ContentScale → WindowGeometry
+geometryOfAttributes logical framebuffer scale = case (logical, framebuffer, scale) of
+  _ | zero logical || zero framebuffer → WindowGeometryZero
   (Observed (Extent lw lh), Observed (Extent fw fh), Observed (ContentScale sx sy))
-    | lw > 0, lh > 0, fw > 0, fh > 0, sx > 0, sy > 0 → Just (TargetMetrics (PixelExtent lw lh) (PixelExtent fw fh) sx sy)
-  _ → Nothing
+    | lw > 0, lh > 0, fw > 0, fh > 0, sx > 0, sy > 0 → WindowGeometryExtent (TargetMetrics (PixelExtent lw lh) (PixelExtent fw fh) sx sy)
+  _ → WindowGeometryUnknown
+  where
+    zero = \case
+      Observed (Extent w h) → w == 0 || h == 0
+      _ → False
 
 -- Input ----------------------------------------------------------------------------------------------
 

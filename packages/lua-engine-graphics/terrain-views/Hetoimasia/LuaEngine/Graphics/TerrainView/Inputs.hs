@@ -27,14 +27,12 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView.Inputs
   , copyKnowledge
   , copyGeneration
   , copyRegions
-  , copySource
   , copySnapshots
   , generationIdentity
   , combineCopies
   , Incoherent (..)
   , InputsError (..)
   , planInputs
-  , emptyInputs
   , plannerKnowledge
   , plannerRuns
   , knowledgeState
@@ -48,7 +46,7 @@ import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Word (Word64)
 import Hetoimasia.Terrain.Cell (Column (..), ZRange, mkZRange)
-import Hetoimasia.Terrain.Changes (ChangeError, ChangeLimits (..), changesFromIntervals, emptyChanges)
+import Hetoimasia.Terrain.Changes (ChangeError, ChangeLimits (..), changesFromIntervals)
 import Hetoimasia.Terrain.Coordinate (RegionCoord (..), axisFromInteger)
 import qualified Hetoimasia.Terrain.Discovery as D
 import Hetoimasia.Terrain.Render2D.Facts (Availability, ChunkKey (..), TerrainFacts (..), Versions (..), mkAvailability)
@@ -128,9 +126,10 @@ data InputsError
   deriving (Eq, Show)
 
 -- | The facts and the knowledge of a coherent copy set.
-planInputs ∷ ChangeLimits → CopySet → Either InputsError (TerrainFacts, Knowledge)
-planInputs limits copies = do
-  let readyTerrain = [(region, intervals) | snapshot ← copySnapshots copies, region ← regionSnapshotRegions snapshot, PartReady intervals ← [regionTerrain snapshot region]]
+planInputs ∷ ChangeLimits → Set RegionCoord → CopySet → Either InputsError (TerrainFacts, Knowledge)
+planInputs limits unavailable copies = do
+  -- a region named unavailable at the copy boundary has its terrain part read as unavailable, as a failed page makes it
+  let readyTerrain = [(region, intervals) | snapshot ← copySnapshots copies, region ← regionSnapshotRegions snapshot, Set.notMember region unavailable, PartReady intervals ← [regionTerrain snapshot region]]
   changes ← either (Left . InputsChanges) Right (changesFromIntervals limits (concatMap snd readyTerrain))
   available ← traverse (\(region, _) → (,) (chunkOf region) . pure <$> levelRange region) readyTerrain
   knowledge ← plannerKnowledge copies
@@ -146,14 +145,6 @@ planInputs limits copies = do
   where
     availabilityOf ∷ [(ChunkKey, [ZRange])] → Availability
     availabilityOf = mkAvailability
-
--- | The planner's inputs for a footprint that reads nothing, at a version: no removed interval, nothing available, and
--- every cell pending. The planner reads no cell of them, so the source (the arena incarnation's own, immutable) is
--- only their identity's.
-emptyInputs ∷ Source → (ArenaId, Revision, Revision, Word64) → Either InputsError (TerrainFacts, Knowledge)
-emptyInputs source (ArenaId arena, Revision content, Revision knowledge, generation) = do
-  known ← either (Left . InputsKnowledge) Right (mkKnowledge KnowledgeSpec {specRevision = knowledge, specDefault = CellPending, specRegions = [], specColumns = []})
-  pure (TerrainFacts (Versions arena content generation) source emptyChanges (mkAvailability []), known)
 
 versionsOf ∷ CopySet → Versions
 versionsOf copies =
@@ -195,8 +186,9 @@ plannerRegionKnowledge region known = case D.regionKnowledgeClasses known of
 -- | The input runs and intervals one copy hands the planner, counted from the copy's packed parts before anything is
 -- decoded ('regionInputCounts'): every removed interval, one run for a region whose knowledge is one uniform class,
 -- and otherwise every run of every column ('plannerKnowledge' hands the planner exactly those).
-plannerRuns ∷ RegionSnapshot → Int
-plannerRuns snapshot = sum [terrain + knowledge | region ← regionSnapshotRegions snapshot, Just (terrain, knowledge) ← [regionInputCounts snapshot region]]
+plannerRuns ∷ Set RegionCoord → RegionSnapshot → Int
+plannerRuns unavailable snapshot =
+  sum [(if Set.member region unavailable then 0 else terrain) + knowledge | region ← regionSnapshotRegions snapshot, Just (terrain, knowledge) ← [regionInputCounts snapshot region]]
 
 -- | The planner's state of what discovery knows of a cell.
 knowledgeState ∷ D.CellKnowledge → CellKnowledge
