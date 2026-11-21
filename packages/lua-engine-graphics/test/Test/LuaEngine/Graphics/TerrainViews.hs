@@ -1588,14 +1588,15 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         before ← atomically (latestWorld target)
         published ← atomically (readingPublished <$> readView view)
         destruction ← newTVarIO DisposalPending
-        -- a move whose first build fails after making its buffer: that buffer awaits its destruction
+        -- a zoom that rebuilds every part, whose first build fails after making its buffer: that buffer awaits its
+        -- destruction
         atomically (writeTVar (rigFailNext rig) [Just (BuildFailed "an injected failure" (AllocatedDisposing "buffer 9" (readTVar destruction)))])
-        Right _ ← atomically (moveView view far)
+        atomically (configureView view noConfigure {configureZoom = Just 2}) `shouldReturn` Right ()
         settleUntil rig (isJust . readingRefusal <$> readView view)
         atomically occupied `shouldReturn` 5
-        -- the next move builds two of its four parts, then finds the upload room taken
+        -- the next zoom builds two of its four parts, then finds the upload room taken
         atomically (writeTVar (rigAdmitBudget rig) (Just 2))
-        Right _ ← atomically (moveView view far)
+        atomically (configureView view noConfigure {configureZoom = Just 0.5}) `shouldReturn` Right ()
         settleUntil rig ((== 7) <$> occupied)
         refusals ← atomically (readingRefusals <$> readView view)
         attempts ← readTVarIO (rigBuildAttempts rig)
@@ -1624,9 +1625,9 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         before ← atomically (latestWorld target)
         published ← atomically (readingPublished <$> readView view)
         refusals ← atomically (readingRefusals <$> readView view)
-        -- queue pressure after one fitting part: the prefix waits
+        -- a zoom that rebuilds every part, and queue pressure after one fitting part: the prefix waits
         atomically (writeTVar (rigAdmitBudget rig) (Just 1))
-        Right _ ← atomically (moveView view far)
+        atomically (configureView view noConfigure {configureZoom = Just 2}) `shouldReturn` Right ()
         settleUntil rig ((== 5) <$> occupied)
         forM_ [1 .. 4 ∷ Int] (const wake)
         atomically occupied `shouldReturn` 5
@@ -1681,8 +1682,8 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         before ← atomically (latestWorld target)
         published ← atomically (readingPublished <$> readView view)
         drawn ← Map.keysSet <$> readTVarIO (rigStandings rig)
-        -- a candidate one of whose uploads fails
-        Right _ ← atomically (moveView view far)
+        -- a zoom's candidate, one of whose uploads fails
+        atomically (configureView view noConfigure {configureZoom = Just 2}) `shouldReturn` Right ()
         settleUntil rig (allBuilt <$> readView view)
         fresh ← filter (`Set.notMember` drawn) . Map.keys <$> readTVarIO (rigStandings rig)
         case fresh of
