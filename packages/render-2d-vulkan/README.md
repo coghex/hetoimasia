@@ -179,7 +179,9 @@ nothing).
   the backend confirms its destruction. A synchronous exception after the
   buffer was made is such a refusal (`BuildRaised`), and so is one the
   buffer's construction raised after making and releasing it, which names the
-  buffer (`releasedBufferOf`).
+  buffer (`releasedBufferOf`). The buffer is released at one site, at most
+  once; a release that raises is a cleanup failure naming the buffer and the
+  cause (`AllocationReleaseRaised`).
 - `BuildUploadBackpressure` is the staging buffer or its queue being full now,
   so asking again later can succeed. `BuildUploadRefused` is everything else
   (for `UploadOversized`, build smaller chunks). `BuildBufferRefused` and

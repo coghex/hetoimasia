@@ -685,8 +685,11 @@ publication`, one bounded unit a step, all for the **destination camera**:
    against `W` while its first build is under way), and is handed to the
    candidate in the transaction after its build, or to disposal if the stage
    was replaced meanwhile. Upload backpressure keeps the built prefix, and a
-   retry waits until an upload of the view's that was under way then has left
-   the upload. A refused build returns its slot only when it made no buffer
+   retry waits until one of the session's uploads unsettled at the refusal
+   (any view's or texture's, `ownerUploads`) has settled; the watcher wakes on
+   their change. A build waiting for a slot that the target's freeable slots
+   can no longer provide (a buffer lost for good keeps its slot) refuses the
+   replacement, and its built prefix retires. A refused build returns its slot only when it made no buffer
    (`Allocated`). A buffer it made keeps the slot until the backend confirms
    its destruction, named by the renderer or by the exception its
    construction raised. A buffer whose release failed, or a build that raised
@@ -728,7 +731,12 @@ that the work is still current: the same stage, an open view and service, a
 usable target, a live arena lease, the full basis it was prepared from, and,
 when it settles a move, the same pending move. Stale work discards only itself
 and the newer state is prepared. Camera controls other than a move need no
-terrain facts: they apply once a preparation has settled the camera. An attachment checks that the client owns the
+terrain facts: they apply once a preparation has settled the camera. Every
+control (`moveView`, `configureView`) is admitted only in a transaction that
+finds the view live: open, its service admitting, its target usable, its
+original authority held and its lease live. When it is not, the control is
+refused (`ControlEnded`) and the pending moves end with that ending (a
+revocation answers `MoveEnded EndRevoked`), never as superseded. An attachment checks that the client owns the
 arena lease.
 
 ### Limits and the reservation
@@ -765,8 +773,9 @@ prepares again when the basis moves, or, for a refusal over the slots, when the
 target's free slots reach what the attempt needed. Residency churn, unrelated
 wakes and the failed attempt's own returned slots do not count as a change. A
 refused demand replacement is suppressed while its basis and the desired list
-stay as they were. A refusal whose basis no longer applies retires, and a new
-refusal is a new entry, reported once.
+stay as they were. A refusal whose basis no longer applies retires. A refusal
+at another basis, or of another desired list, is a new entry, reported once;
+the same refusal again adds nothing.
 
 ### Retirement
 
