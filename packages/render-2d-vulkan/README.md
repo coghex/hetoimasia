@@ -173,7 +173,11 @@ nothing).
   world layer without depth, or of a UI layer, has no device buffer: its
   ordered instances are written to the ring each frame.
 - A refusal changes nothing the registry holds; a buffer made before a refusal
-  or an interruption is released at once.
+  or an interruption is released at once. `buildRetainedChunkWith` says which
+  (`BuildRefused`): `NoAllocation`, or the buffer it released with the
+  release's answer (`AllocationReleased`), whose capacity stays occupied until
+  the backend confirms its destruction. A synchronous exception after the
+  buffer was made is such a refusal (`BuildRaised`).
 - `BuildUploadBackpressure` is the staging buffer or its queue being full now,
   so asking again later can succeed. `BuildUploadRefused` is everything else
   (for `UploadOversized`, build smaller chunks). `BuildBufferRefused` and

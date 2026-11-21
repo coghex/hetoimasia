@@ -563,13 +563,16 @@ frame leave it as it was. Only a live view incarnation's receipt moves: it is
 opened at the view's commit and forgotten at its end, with whatever of it was
 recorded or noted and not yet promoted. A caller that sets
 `vulkanFrameObserver` after `configureScenes` keeps the receipts with
-`sceneFrameObserver`. A window view plans for the metrics of its window's
-latest recorded frame (`latestFrameMetrics`), kept for the most recently drawn
-window attachments (a watched one is never evicted), and otherwise for the
-window's live geometry (`targetGeometry`: its observed logical and framebuffer
-extents and content scale). An open on a target that shows nothing and has no
-metrics publishes the real empty revision in its commit, which asks for a first
-frame. A target already showing a scene (an M1 scene, say) keeps it through the
+`sceneFrameObserver`. A view reads its target's geometry live
+(`vtGeometry`): **Unknown** while incomplete, **Zero** for an observed zero
+dimension in either the logical or the framebuffer extent (whatever else is
+missing), **Extent** for complete positive metrics. A window's comes from its
+live observation (`targetGeometry`, `windowGeometry`), whatever frame it
+recorded last: a recorded frame's metrics (`latestFrameMetrics`) describe that
+frame, for drawing and picking. An offscreen registration's metrics cell gives
+the same three values. An open on a target that shows nothing and whose
+geometry is unknown publishes the real empty revision in its commit, which asks
+for a first frame. A target already showing a scene (an M1 scene, say) keeps it through the
 attach, and through a refused first candidate, until the view's first revision
 is published.
 
@@ -635,11 +638,9 @@ publication`, one bounded unit a step, all for the **destination camera**:
    first. More than `profileRegions` keys refuses (`LimitRegions`) at the
    first distinct excess key; more candidate columns than the planner's bound
    refuses (`LimitPlan`). F, its order and its request batches are made and
-   fully evaluated on the planner. An empty F asks for no copy: the camera
-   settles without inputs and the view publishes an empty revision, with an
-   empty runtime demand; when nothing can be drawn (a zero drawable, or a view
-   that has never copied) it withdraws its runtime demand instead and waits for
-   the basis to move.
+   fully evaluated on the planner. At Zero, F is empty without a walk. An
+   empty F asks for no copy (a move with a level still copies its destination
+   region).
 3. **Copying.** The whole of F, in disjoint batches of at most
    `profileRequestRegions` (and the terrain service's hold and query bounds),
    one request in flight; a settled borrow stays charged through the copy's
@@ -658,12 +659,16 @@ publication`, one bounded unit a step, all for the **destination camera**:
    refused, the move settles with recoverable pressure, `MovePressure`, and
    the camera and the drawing stay until something changes), a following
    camera adopts the answered surface. The settled camera
-   is the one F was enumerated for.
+   is the one F was enumerated for. At Zero the preparation ends here.
 5. **Planning**, on the planner: the copies' inputs and the plan in
-   `profileStepWork` quanta, its adaptation and its parts, once. Its prefetch
-   is a prefix of distinct regions outside F, as many as the service's camera
-   regions leave after F, from the planner's configured ring; no ring is
-   looked at when none is left. A plan that
+   `profileStepWork` quanta, its adaptation and its parts, once. A footprint
+   that reads nothing is the cell planner's own clear plan
+   (`planEmptyFootprint`: no quad, no demand), published as a terrain revision
+   like any other. Its prefetch is a prefix of distinct regions outside F,
+   walked around the plan's visible chunks (`cellPrefetchRegions`), as many as
+   the service's camera regions leave after F, within the configured ring's
+   chunk, interval, per-chunk region and work allowances; no ring is looked at
+   when no place is left. A plan that
    meets a plan-wide bound (columns, levels, quads, pending spans) is refused
    (`LimitPlan`), never published truncated. Every pending move of a refused
    preparation settles with pressure; a refusal of a preparation a newer
@@ -676,20 +681,36 @@ publication`, one bounded unit a step, all for the **destination camera**:
    target's free slots.
 7. **Building.** At most `profileBuilds` chunks a step; each occupies a slot
    from just before its build (so a target counts against `W` while its first
-   build is under way; a refused build returns the slot), and is handed to the
+   build is under way), and is handed to the
    candidate in the transaction after its build, or to disposal if the stage
-   was replaced meanwhile. Upload backpressure keeps the built prefix.
+   was replaced meanwhile. Upload backpressure keeps the built prefix. A
+   refused build returns its slot only when it made no buffer (`Allocated`);
+   a buffer it made keeps the slot until the backend confirms its destruction,
+   and one whose release failed, or a build that raised, keeps it as a failure
+   with its cause.
 8. **Publication**, once every chunk is ready, in the transaction that rechecks
    the claim, the target, the session, the intent, the metrics and the arena's
    content and knowledge revisions, and applies the view's runtime demand under
    its own authority (`setViewDemandSTM`): F nearest the anchor first, then the
    plan's prefetch outside F, cut at the service's camera regions without
    refusing (`readingDemand`, with the service's receipt in `readingReceipt`;
-   completing a cut demand is the terrain service's). A refused demand keeps the
-   candidate from adoption. Overtaken, the candidate's builds are discarded and
+   completing a cut demand is the terrain service's). The successor's demand and
+   its scene are accepted together or neither: a refusal of either (the
+   runtime's or the host's) rolls the attempt back, the installed demand and
+   receipt included, and is recorded as a refusal. Overtaken, the candidate's builds are discarded and
    the newer state prepared. A view pins the revision its receipt names and one
    later revision the ledger holds adopted; a third publication waits until one
    of them can no longer be drawn.
+
+**Reconciliation.** Each owner step derives the view's outputs from one
+current snapshot. Its runtime demand is the accepted revision's on an Extent
+(empty before the first), and empty at Unknown or Zero. Whenever the installed
+list differs, it is replaced once under the view's authority and its receipt
+recorded, so a restore reinstalls the retained revision's demand with no new
+publication. A preparation runs on an Extent whose accepted revision is not of
+the current basis (intent, geometry, arena incarnation, content and knowledge
+revisions) or lists a part that failed its upload. At Zero it runs only to
+settle a pending move, and at Unknown never.
 
 A move never lands from facts the view already holds: it waits for a
 preparation of its destination. Every transaction that writes a stage back,
@@ -730,8 +751,12 @@ nothing held.
 
 A refused replacement keeps the current drawing and mapping; the binding
 limit is reported once on entering refusal (`readingRefusal`,
-`readingRefusals`). A refused view prepares again after a relevant change:
-its intent, its metrics, its arena's revisions or residency, or a freed slot.
+`readingRefusals`). The refusal is keyed by its attempt's basis. A refused view
+prepares again when the basis moves, or, for a refusal over the slots, when the
+target's free slots reach what the attempt needed. Residency churn, unrelated
+wakes and the failed attempt's own returned slots do not count as a change. A
+refused demand replacement is suppressed while its basis and the desired list
+stay as they were.
 
 ### Retirement
 
@@ -741,8 +766,8 @@ awaiting confirmation, the failures) and leaves one in the transaction that
 hands it to the next. What a published revision no longer lists asks the
 host's FIFO release lane for a barrier, in publication order, and each chunk
 is released once its barrier is met and no adopted revision holds it. A
-private build no revision listed is released once its upload has ended.
-Independent chunks may finish in either order. Each chunk is released once;
+private build no revision listed is released once its upload has ended, and
+so is the buffer a refused build made, without a chunk. Independent chunks may finish in either order. Each chunk is released once;
 its slot is freed when the backend confirms the buffer's physical disposal
 (`constructedDisposal`). A failed release or disposal, or a barrier the lane
 refused, becomes evidence with the chunk's identity and the host's cause and
