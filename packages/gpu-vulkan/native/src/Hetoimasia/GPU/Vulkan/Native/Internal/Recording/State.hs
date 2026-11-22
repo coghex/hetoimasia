@@ -79,6 +79,10 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   , Readback (..)
   , Buffer (..)
   , ReleasedResource (..)
+  , ReleasedHandle (..)
+  , releasedHandle
+  , releasedHandleResource
+  , releasedHandleOf
   , releasedBufferOf
   , releasedResourceOf
   , Image (..)
@@ -733,23 +737,69 @@ newtype Readback = Readback ResourceId
 newtype Buffer = Buffer ResourceId
   deriving (Eq, Ord, Show)
 
+-- | The managed handle a construction made and released before it raised, decoded from the native resource itself:
+-- a buffer, an image, a pipeline, a pipeline layout, a frame storage, a readback, or one of the texture table's own
+-- generations (a sampler, a set layout, a pool, a version), which no caller holds a handle of. Each keeps its own
+-- kind: a released pipeline is never read as a buffer.
+data ReleasedHandle
+  = ReleasedBuffer !Buffer
+  | ReleasedImage !Image
+  | ReleasedPipeline !Pipeline
+  | ReleasedPipelineLayout !PipelineLayout
+  | ReleasedFrameStorage !FrameStorage
+  | ReleasedReadback !Readback
+  | ReleasedTableObject !ResourceId
+  deriving (Eq, Show)
+
+-- | The released handle of one generation, by the native resource it was made as.
+releasedHandle ∷ ResourceId → NativeResource cmd → ReleasedHandle
+releasedHandle resource = \case
+  NativeBuffer {} → ReleasedBuffer (Buffer resource)
+  NativeImage {} → ReleasedImage (Image resource)
+  NativePipeline {} → ReleasedPipeline (Pipeline resource)
+  NativeLayout {} → ReleasedPipelineLayout (PipelineLayout resource)
+  NativeStorage {} → ReleasedFrameStorage (FrameStorage resource)
+  NativeReadback {} → ReleasedReadback (Readback resource)
+  NativeSampler {} → ReleasedTableObject resource
+  NativeSetLayout {} → ReleasedTableObject resource
+  NativeDescriptorPool {} → ReleasedTableObject resource
+  NativeVersion {} → ReleasedTableObject resource
+
+-- | The generation a released handle names, whatever its kind.
+releasedHandleResource ∷ ReleasedHandle → ResourceId
+releasedHandleResource = \case
+  ReleasedBuffer (Buffer resource) → resource
+  ReleasedImage (Image resource) → resource
+  ReleasedPipeline (Pipeline resource) → resource
+  ReleasedPipelineLayout (PipelineLayout resource) → resource
+  ReleasedFrameStorage (FrameStorage resource) → resource
+  ReleasedReadback (Readback resource) → resource
+  ReleasedTableObject resource → resource
+
 -- | The annotation a construction adds to an exception it rethrows after it released the resource it had made: the
--- resource, whose physical destruction the backend confirms later, though its caller received no handle.
-newtype ReleasedResource = ReleasedResource ResourceId
+-- released handle, whose physical destruction the backend confirms later, though its caller received no handle.
+newtype ReleasedResource = ReleasedResource ReleasedHandle
   deriving (Eq, Show)
 
 instance ExceptionAnnotation ReleasedResource where
-  displayExceptionAnnotation (ReleasedResource resource) = "the construction released its resource " <> show resource
+  displayExceptionAnnotation (ReleasedResource handle) = "the construction released its resource " <> show handle
 
--- | The resource an exception's context says its construction made and released, if any.
-releasedResourceOf ∷ ExceptionContext → Maybe ResourceId
-releasedResourceOf context = case getExceptionAnnotations context of
-  ReleasedResource resource : _ → Just resource
+-- | The one release record an exception's context carries, if its construction made and released a resource.
+releasedHandleOf ∷ ExceptionContext → Maybe ReleasedHandle
+releasedHandleOf context = case getExceptionAnnotations context of
+  ReleasedResource handle : _ → Just handle
   [] → Nothing
 
--- | The buffer a buffer's construction made and released, as the exception it raised names it.
+-- | The generation an exception's context says its construction made and released, whatever its kind.
+releasedResourceOf ∷ ExceptionContext → Maybe ResourceId
+releasedResourceOf = fmap releasedHandleResource . releasedHandleOf
+
+-- | The buffer an exception's context says its construction made and released: only a released buffer is one.
 releasedBufferOf ∷ ExceptionContext → Maybe Buffer
-releasedBufferOf = fmap Buffer . releasedResourceOf
+releasedBufferOf context =
+  releasedHandleOf context >>= \case
+    ReleasedBuffer buffer → Just buffer
+    _ → Nothing
 
 -- | A managed image of one 'ImageKind', with its one owned view.
 newtype Image = Image ResourceId

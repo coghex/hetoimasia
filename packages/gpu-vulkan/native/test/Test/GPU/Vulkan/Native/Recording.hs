@@ -838,6 +838,9 @@ spec = describe "Recording" $ do
       standing `shouldBe` ManagedReleased
       -- the exception names the resource it released, though no handle was returned
       either (\(ExceptionWithContext context _) → releasedResourceOf context) (const Nothing) raised `shouldBe` Just unnamed
+      -- the release record keeps the pipeline's own kind: it projects to no buffer
+      either (\(ExceptionWithContext context _) → releasedHandleOf context) (const Nothing) raised `shouldSatisfy` releasedAs "pipeline" unnamed
+      either (\(ExceptionWithContext context _) → releasedBufferOf context) (const Nothing) raised `shouldBe` Nothing
       pipelineNative ← (\calls → last [handle | CreatedPipeline handle _ _ ← calls]) <$> nativeCalls' rig
       disposed ← dispose rig
       disposed `shouldContain` [unnamed]
@@ -1272,10 +1275,13 @@ spec = describe "Recording" $ do
       rig ← newNamingRig
       base ← chargedOf rig
       failNaming (rigStandIn rig) ObjectImageView
-      raised ← try @NamingFailure (createImage (rigRecording rig) (ImageDescription TextureImage Rgba8Srgb 16 16 1))
-      fmap (const ()) raised `shouldBe` Left (NamingFailure ObjectImageView)
+      raised ← tryWithContext @NamingFailure (createImage (rigRecording rig) (ImageDescription TextureImage Rgba8Srgb 16 16 1))
+      fmap (const ()) (either (\(ExceptionWithContext _ failure) → Left failure) Right raised) `shouldBe` Left (NamingFailure ObjectImageView)
       [(unnamed, standing)] ← (\views → [(viewResource view, viewManagedStanding view) | view ← views]) <$> atomically (readManaged (rigRecording rig))
       standing `shouldBe` ManagedReleased
+      -- the release record names the image as an image, and no buffer
+      either (\(ExceptionWithContext context _) → releasedHandleOf context) (const Nothing) raised `shouldSatisfy` releasedAs "image" unnamed
+      either (\(ExceptionWithContext context _) → releasedBufferOf context) (const Nothing) raised `shouldBe` Nothing
       -- The generation keeps its accounting until its disposal restores it.
       snd <$> chargedSince rig base `shouldReturn` 3
       dispose rig `shouldReturn` [unnamed]
@@ -1288,9 +1294,12 @@ spec = describe "Recording" $ do
       rig ← newRig
       base ← chargedOf rig
       failAllocatorAt (allocatorOf rig) AtName
-      raised ← try @AllocatorFailure (createBuffer (rigRecording rig) (BufferDescription StagingBuffer 64))
-      fmap (const ()) raised `shouldBe` Left (AllocatorFailure AtName)
+      raised ← tryWithContext @AllocatorFailure (createBuffer (rigRecording rig) (BufferDescription StagingBuffer 64))
+      fmap (const ()) (either (\(ExceptionWithContext _ failure) → Left failure) Right raised) `shouldBe` Left (AllocatorFailure AtName)
       [(unnamed, ManagedReleased)] ← (\views → [(viewResource view, viewManagedStanding view) | view ← views]) <$> atomically (readManaged (rigRecording rig))
+      -- the release record names exactly the buffer
+      either (\(ExceptionWithContext context _) → releasedBufferOf context) (const Nothing) raised `shouldSatisfy` maybe False ((== unnamed) . managedResource)
+      either (\(ExceptionWithContext context _) → releasedHandleOf context) (const Nothing) raised `shouldSatisfy` releasedAs "buffer" unnamed
       dispose rig `shouldReturn` [unnamed]
       liveAllocations (allocatorOf rig) `shouldReturn` 0
       snd <$> chargedSince rig base `shouldReturn` 0
@@ -1897,3 +1906,15 @@ unsafeDeclarations source = go (Text.lines source)
     -- @mkCmdDraw@ calls @vkCmdDraw@; @mkBeginCommandBuffer@ calls
     -- @vkBeginCommandBuffer@.
     entryPoint name = "vk" <> Text.drop 2 name
+
+-- Whether a release record names this generation as this kind.
+releasedAs ∷ String → ResourceId → Maybe ReleasedHandle → Bool
+releasedAs kind resource = \case
+  Just (ReleasedBuffer handle) → kind == "buffer" && managedResource handle == resource
+  Just (ReleasedImage handle) → kind == "image" && managedResource handle == resource
+  Just (ReleasedPipeline handle) → kind == "pipeline" && managedResource handle == resource
+  Just (ReleasedPipelineLayout handle) → kind == "pipeline layout" && managedResource handle == resource
+  Just (ReleasedFrameStorage handle) → kind == "frame storage" && managedResource handle == resource
+  Just (ReleasedReadback handle) → kind == "readback" && managedResource handle == resource
+  Just (ReleasedTableObject other) → kind == "table object" && other == resource
+  Nothing → False
