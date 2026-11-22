@@ -34,7 +34,6 @@ import qualified Data.ByteString as ByteString
 import Data.Foldable (toList)
 import Data.List (intercalate, isInfixOf, isPrefixOf, isSuffixOf, nub)
 import qualified Data.Map.Strict as Map
-import Data.Char (toLower)
 import Distribution.Compiler (PerCompilerFlavor (..))
 import Distribution.Fields (Field (..), FieldLine (..), Name (..), readFields)
 import Distribution.Fields.ConfVar (parseConditionConfVar)
@@ -164,8 +163,8 @@ projectPackages root project = go [project] [] [] []
                   let relativeImports = [normalise (takeDirectory file </> imported) | imported ← imports]
                   go (rest <> relativeImports) (file : seen) (reverse (map normalise entries) <> directories) (problems <> found)
 
--- The @packages:@ entries, @import:@ targets and unsupported forms of a project file, read by Cabal's own field parser:
--- field names in any case, continuation lines, and every section (a @package@ stanza, a conditional and its @else@)
+-- The @packages:@ entries, @import:@ targets and unsupported forms of a project file, read by Cabal's own field parser
+-- (which lowercases field and section names): continuation lines, and every section (a @package@ stanza, a conditional and its @else@)
 -- walked. A condition on anything but a supported operating system or architecture is unsupported.
 projectFields ∷ FilePath → ByteString.ByteString → Either String ([String], [String], [String])
 projectFields file bytes = case readFields bytes of
@@ -177,7 +176,7 @@ projectFields file bytes = case readFields bytes of
        in (concatMap (\(e, _, _) → e) results, concatMap (\(_, i, _) → i) results, concatMap (\(_, _, p) → p) results)
     one = \case
       Field (Name _ name) contents →
-        let key = map toLower (fromUTF8BS name)
+        let key = fromUTF8BS name
             values = words (map (\c → if c == ',' then ' ' else c) (unwords [fromUTF8BS line | FieldLine _ line ← contents]))
          in case key of
               "packages" → (values, [], entryProblems values)
@@ -188,7 +187,7 @@ projectFields file bytes = case readFields bytes of
                     ([], [], ["unsupported: the option " <> unwords refused <> " in " <> file <> ", which changes which packages are visible"])
                 | otherwise → ([], [], [])
       Section (Name _ name) arguments inner →
-        let key = map toLower (fromUTF8BS name)
+        let key = fromUTF8BS name
             (entries, imports, problems) = walk inner
          in case key of
               "source-repository-package" → (entries, imports, ("unsupported: source-repository-package in " <> file) : problems)
