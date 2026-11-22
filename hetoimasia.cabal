@@ -65,7 +65,6 @@ extra-source-files:
     tools/validation/owned_starts.py
     tools/validation/owned_starts.json
     tools/validation/owned_starts_baseline.json
-    tools/validation/owner_tx_guard.py
     tools/validation/owner_tx_issuers.json
     tools/validation/plan.py
     tools/validation/plan_repository.py
@@ -226,6 +225,8 @@ test-suite workflow-tests
     import: language
     type: exitcode-stdio-1.0
     main-is: Main.hs
+    -- The issuer bridge's import guard, which OwnerTxGuard.hs runs against fixtures and the repository.
+    build-tool-depends: hetoimasia:owner-tx-guard
     -- Two capabilities: the owned-thread examples about a cancellation racing the helper it unwinds into only see the race
     -- when threads run at the same time.
     ghc-options: -threaded -rtsopts "-with-rtsopts=-N2"

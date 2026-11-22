@@ -977,17 +977,19 @@
     },
     {
       "id": "test.owner-tx-guard",
-      "description": "Run the import guard of the ownership transactions' issuer bridge (#721), tools/validation/owner_tx_guard.py, against the repository itself: every component of every package cabal.project and cabal.project.vulkan list (libraries, sublibraries, executables, test suites, both branches of a manual flag's conditional), its exposed and other modules and main-is in its source directories. It fails a module that imports Hetoimasia.Foundation.OwnerTx.Issuer or the bridge-equivalent Hetoimasia.Foundation.OwnerTx.Representation without being listed with its component in tools/validation/owner_tx_issuers.json, a component that depends on hetoimasia-foundation:owner-tx-issuer without being a listed dependent, a re-export of the bridge or the representation (a Haskell export list, Cabal reexported-modules or mixins), a stale entry, and anything it cannot read. Its inputs are every package description and source directory it reads; its fixtures are examples in workflow-tests.",
+      "description": "Run the import guard of the ownership transactions' issuer bridge (#721), tools/owner-tx-guard, against the repository itself. Cabal's own parser supplies every component of every local package cabal.project and cabal.project.vulkan list (following project imports; libraries, sublibraries, foreign libraries, executables, tests and benchmarks; common stanzas expanded; every distinct flag, operating-system and architecture configuration with its own source search order) and each dependency's library apart from its version range; GHC's preprocessing and header parser supply every source's direct imports; GHC typechecks every listed importer and both defining modules for their typed exports. It fails a module that imports Hetoimasia.Foundation.OwnerTx.Issuer or the bridge-equivalent Hetoimasia.Foundation.OwnerTx.Representation without being listed with its component in tools/validation/owner_tx_issuers.json, an unlisted dependent of hetoimasia-foundation:owner-tx-issuer, a re-export of the bridge or the representation (typed exports, Cabal reexported-modules or mixins), an export of a conversion between STM and the ownership transaction or of a representation constructor outside its defining module, an export its contract does not list, a stale entry, and anything it cannot read. Its inputs are everything the guard reads; its fixtures are examples in workflow-tests.",
       "command": [
-        "python3",
-        "-I",
-        "tools/validation/owner_tx_guard.py",
+        "cabal",
+        "run",
+        "owner-tx-guard",
+        "--",
         "check"
       ],
       "component": null,
       "inputs": [
         "cabal.project",
         "cabal.project.vulkan",
+        "cabal.project.common",
         "hetoimasia.cabal",
         "app/",
         "app-cpu/",
@@ -1005,7 +1007,8 @@
         "tools/x11-test/",
         "tools/test-support/",
         "packages/",
-        "samples/"
+        "samples/",
+        "tools/owner-tx-guard/"
       ],
       "framework": "none",
       "runner": "cpu",
