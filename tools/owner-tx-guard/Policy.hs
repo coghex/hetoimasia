@@ -4,9 +4,9 @@
 -- guard").
 --
 -- The allowlist is exact: it equals the components whose effective @build-depends@ selects
--- @hetoimasia-foundation:owner-tx-issuer@ in at least one supported configuration. No component's Cabal
+-- @hetoimasia-foundation:owner-tx-issuer@ in at least one supported buildable configuration. No component's Cabal
 -- @reexported-modules@ or @mixins@ may expose or rename the bridge or the representation, a listed component's
--- included. The protected modules are declared only by their defining components, the representation's privately, and
+-- included: a mixin by the modules its renaming actually brings into scope. The protected modules are declared only by their defining components, the representation's privately, and
 -- a library selector on a local package names one of its libraries. What a listed component's modules import, export
 -- and instantiate is the issuer review's, not the guard's.
 module Policy
@@ -80,6 +80,7 @@ check allowlist inventory =
     -- what Cabal builds; an unbuildable configuration is only diagnosed
     configurations = filter configBuildable everyConfiguration
     libraries = Map.fromList [(packageName package', packageLibraries package') | package' ← packages]
+    exposedModules = Map.fromList [((packageName package', label), modules) | package' ← packages, (label, modules) ← packageExposed package']
     dependents =
       [ configuration
       | configuration ← configurations
@@ -103,11 +104,19 @@ check allowlist inventory =
       , (original, renamed) ← configReexports configuration
       , original `elem` protectedModules || renamed `elem` protectedModules
       ]
+    -- what a mixin brings into scope: the included library's exposed modules, all of them, the renamed ones or those not
+    -- hidden, and every name its renamings give
     mixinProblems =
-      [ configurationId configuration <> " names a protected module or library in the mixin " <> package <> (if null library then "" else ":" <> library) <> " " <> renaming
+      [ configurationId configuration <> " exposes or renames " <> intercalate ", " touched <> " through the mixin " <> mixinPackage mixin <> (if null (mixinLibrary mixin) then "" else ":" <> mixinLibrary mixin) <> (if null (mixinText mixin) then "" else " " <> mixinText mixin)
       | configuration ← configurations
-      , (package, library, renaming, mentioned) ← configMixins configuration
-      , (package == bridgePackage && library `elem` [bridgeLibrary, "internal"]) || any (`elem` protectedModules) mentioned
+      , mixin ← configMixins configuration
+      , let available = Map.findWithDefault [] (mixinPackage mixin, mixinLibrary mixin) exposedModules
+            provided = case mixinProvides mixin of
+              ProvidesAll → available
+              ProvidesRenamed pairs → concat [[from, to] | (from, to) ← pairs]
+              ProvidesHiding hidden → filter (`notElem` hidden) available
+            touched = nub (filter (`elem` protectedModules) (provided <> mixinRequires mixin))
+      , not (null touched)
       ]
     declarations =
       [ configurationId configuration <> " declares the protected module " <> moduleName <> ", which only " <> defining <> " may"
@@ -129,12 +138,12 @@ check allowlist inventory =
                ]
         | (moduleName, defining, private) ← protected
         ]
+    -- every selector in any branch of any component, buildable or not, of a dependency or a mixin
     selectors =
       nub
-        [ "uncovered: " <> configurationId configuration <> " selects " <> dependency <> ":" <> library <> ", which names no library of the local package " <> dependency
-        | configuration ← configurations
-        , (dependency, selected) ← configDependencies configuration
+        [ "uncovered: " <> component <> " selects " <> dependency <> ":" <> library <> ", which names no library of the local package " <> dependency
+        | package' ← packages
+        , (component, dependency, library) ← packageSelectors package'
         , Just known ← [Map.lookup dependency libraries]
-        , library ← selected
         , library `notElem` known
         ]

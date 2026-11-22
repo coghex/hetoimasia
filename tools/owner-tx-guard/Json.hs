@@ -1,7 +1,8 @@
 {-# LANGUAGE NoOverloadedStrings #-}
 
--- | A small JSON reader for the guard's allowlist: objects, arrays, strings, numbers, booleans and null. It reads the
--- whole document or refuses it, naming where it stopped; nothing is guessed.
+-- | A small JSON reader for the guard's allowlist: objects, arrays, strings, integers, booleans and null. It reads the
+-- whole document or refuses it, naming where it stopped; nothing is guessed. An integer with a leading zero, a number
+-- with a fraction or an exponent, and an object that repeats a key are refused.
 module Json
   ( Json (..)
   , parseJson
@@ -57,15 +58,23 @@ value input = case input of
   't' : 'r' : 'u' : 'e' : rest → Right (JBool True, rest)
   'f' : 'a' : 'l' : 's' : 'e' : rest → Right (JBool False, rest)
   'n' : 'u' : 'l' : 'l' : rest → Right (JNull, rest)
-  '-' : rest | (digits@(_ : _), after) ← span isDigit rest → Right (JNumber (negate (read digits)), after)
-  _ | (digits@(_ : _), after) ← span isDigit input → Right (JNumber (read digits), after)
+  '-' : rest | (digits@(_ : _), after) ← span isDigit rest → fmap (\n → (JNumber (negate n), after)) (integer digits after)
+  _ | (digits@(_ : _), after) ← span isDigit input → fmap (\n → (JNumber n, after)) (integer digits after)
   _ → Left ("unexpected text: " <> take 40 input)
+
+-- JSON's integer grammar: no leading zero, and nothing this reader would have to round.
+integer ∷ String → String → Either String Integer
+integer digits after
+  | length digits > 1 && take 1 digits == "0" = Left ("a number with a leading zero: " <> digits)
+  | take 1 after `elem` [".", "e", "E"] = Left ("a number that is not an integer: " <> digits <> take 10 after)
+  | otherwise = Right (read digits)
 
 object ∷ String → [(String, Json)] → Either String (Json, String)
 object input fields = case input of
   '}' : rest | null fields → Right (JObject [], rest)
   '"' : rest → do
     (key, afterKey) ← string rest ""
+    if key `elem` map fst fields then Left ("an object that repeats the key " <> show key) else Right ()
     case skip afterKey of
       ':' : afterColon → do
         (item, afterValue) ← value (skip afterColon)

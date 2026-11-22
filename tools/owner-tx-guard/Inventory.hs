@@ -21,6 +21,8 @@ module Inventory
   , targetLabel
   , Package (..)
   , Configuration (..)
+  , MixinFacts (..)
+  , Provides (..)
   , Inventory (..)
   , readInventory
   , componentId
@@ -32,10 +34,14 @@ import qualified Data.ByteString as ByteString
 import Data.Foldable (toList)
 import Data.List (intercalate, isInfixOf, isPrefixOf, isSuffixOf, nub)
 import qualified Data.Map.Strict as Map
+import Data.Char (toLower)
 import Distribution.Compiler (PerCompilerFlavor (..))
+import Distribution.Fields (Field (..), FieldLine (..), Name (..), readFields)
+import Distribution.Fields.ConfVar (parseConditionConfVar)
 import Distribution.ModuleName (ModuleName)
 import Distribution.PackageDescription
 import Distribution.PackageDescription.Parsec (parseGenericPackageDescription, runParseResult)
+import Distribution.Utils.Generic (fromUTF8BS)
 import Distribution.Parsec.Warning (PWarnType (..), PWarning (..))
 import Distribution.Pretty (prettyShow)
 import Distribution.System (Arch (..), OS (..))
@@ -63,6 +69,11 @@ data Package = Package
   , packageCabal ∷ FilePath
   , packageLibraries ∷ [String]
     -- ^ Its libraries' labels: the empty string for the main library, otherwise the sublibrary's name.
+  , packageExposed ∷ [(String, [String])]
+    -- ^ Each library's exposed modules, in any branch.
+  , packageSelectors ∷ [(String, String, String)]
+    -- ^ Every library selector in any branch of any component, of a dependency or a mixin: the component, the selected
+    -- package and its library label.
   , packageConfigurations ∷ [Configuration]
   , packageProblems ∷ [String]
   }
@@ -79,8 +90,7 @@ data Configuration = Configuration
   , configProblems ∷ [String]
   , configDependencies ∷ [(String, [String])]
     -- ^ Each dependency's package and the libraries it selects (the empty string for the main library).
-  , configMixins ∷ [(String, String, String, [String])]
-    -- ^ Each mixin's package, library, renaming as written, and every module name its renamings mention.
+  , configMixins ∷ [MixinFacts]
   , configReexports ∷ [(String, String)]
   , configModules ∷ [String]
     -- ^ The modules it declares (exposed and other).
@@ -89,6 +99,22 @@ data Configuration = Configuration
   , configBuildable ∷ Bool
     -- ^ Whether Cabal builds it: an unbuildable configuration is diagnosed for unsupported forms but selects nothing.
   }
+
+-- | A mixin: the package and library it includes, its renaming as written, what it provides and the module names its
+-- requirement renaming mentions.
+data MixinFacts = MixinFacts
+  { mixinPackage ∷ String
+  , mixinLibrary ∷ String
+  , mixinText ∷ String
+  , mixinProvides ∷ Provides
+  , mixinRequires ∷ [String]
+  }
+
+-- | Which of the included library's modules a mixin brings into scope.
+data Provides
+  = ProvidesAll
+  | ProvidesRenamed [(String, String)]
+  | ProvidesHiding [String]
 
 -- | What the inventory found: the files it read, the packages, and every unsupported form of the projects.
 data Inventory = Inventory
@@ -131,40 +157,67 @@ projectPackages root project = go [project] [] [] []
           if not present
             then pure (Left (file <> " does not exist"))
             else do
-              text ← readFile (root </> file)
-              let (entries, imports, found) = projectFields file text
-                  relativeImports = [normalise (takeDirectory file </> imported) | imported ← imports]
-              go (rest <> relativeImports) (file : seen) (reverse (map normalise entries) <> directories) (problems <> found)
+              bytes ← ByteString.readFile (root </> file)
+              case projectFields file bytes of
+                Left why → pure (Left why)
+                Right (entries, imports, found) → do
+                  let relativeImports = [normalise (takeDirectory file </> imported) | imported ← imports]
+                  go (rest <> relativeImports) (file : seen) (reverse (map normalise entries) <> directories) (problems <> found)
 
--- The @packages:@ entries, @import:@ targets and unsupported forms of a project file.
-projectFields ∷ FilePath → String → ([String], [String], [String])
-projectFields file text = collect (lines text) Nothing [] [] []
+-- The @packages:@ entries, @import:@ targets and unsupported forms of a project file, read by Cabal's own field parser:
+-- field names in any case, continuation lines, and every section (a @package@ stanza, a conditional and its @else@)
+-- walked. A condition on anything but a supported operating system or architecture is unsupported.
+projectFields ∷ FilePath → ByteString.ByteString → Either String ([String], [String], [String])
+projectFields file bytes = case readFields bytes of
+  Left failure → Left (file <> ": Cabal refused it: " <> show failure)
+  Right fields → Right (walk fields)
   where
-    collect [] _ entries imports problems = (reverse entries, reverse imports, reverse problems <> entryProblems (reverse entries) <> importProblems (reverse imports))
-    collect (line : rest) collecting entries imports problems
-      | all (`elem` " \t") line || "--" `isPrefixOf` dropWhile (== ' ') line = collect rest collecting entries imports problems
-      | Just indent ← collecting, leading line > indent = collect rest collecting (reverse (words' line) <> entries) imports problems
-      | Just value ← field "packages" line = collect rest (Just (leading line)) (reverse (words' value) <> entries) imports problems
-      | Just value ← field "import" line = collect rest Nothing entries (reverse (words' value) <> imports) problems
-      | Just name ← unsupportedField line = collect rest Nothing entries imports (("unsupported: " <> name <> " in " <> file) : problems)
-      | leading line == 0 && "source-repository-package" `isPrefixOf` line = collect rest Nothing entries imports (("unsupported: source-repository-package in " <> file) : problems)
-      | Just value ← optionField line, refused@(_ : _) ← filter visibilityOption (words value) =
-          collect rest Nothing entries imports (("unsupported: the option " <> unwords refused <> " in " <> file <> ", which changes which packages are visible") : problems)
-      | otherwise = collect rest Nothing entries imports problems
-    leading = length . takeWhile (== ' ')
-    words' = words . map (\c → if c == ',' then ' ' else c)
-    field name line = case break (== ':') (dropWhile (== ' ') line) of
-      (key, ':' : value) | key == name → Just value
-      _ → Nothing
-    optionField line = case break (== ':') (dropWhile (== ' ') line) of
-      (key, ':' : value) | key `elem` ["ghc-options", "ghc-prof-options", "ghc-shared-options"] → Just value
-      _ → Nothing
-    unsupportedField line = case break (== ':') (dropWhile (== ' ') line) of
-      (key, ':' : _) | key `elem` ["optional-packages", "extra-packages"] → Just key
-      _ → Nothing
+    walk fields =
+      let results = map one fields
+       in (concatMap (\(e, _, _) → e) results, concatMap (\(_, i, _) → i) results, concatMap (\(_, _, p) → p) results)
+    one = \case
+      Field (Name _ name) contents →
+        let key = map toLower (fromUTF8BS name)
+            values = words (map (\c → if c == ',' then ' ' else c) (unwords [fromUTF8BS line | FieldLine _ line ← contents]))
+         in case key of
+              "packages" → (values, [], entryProblems values)
+              "import" → ([], values, importProblems values)
+              _
+                | key `elem` ["optional-packages", "extra-packages"] → ([], [], ["unsupported: " <> key <> " in " <> file])
+                | key `elem` ["ghc-options", "ghc-prof-options", "ghc-shared-options"], refused@(_ : _) ← filter visibilityOption values →
+                    ([], [], ["unsupported: the option " <> unwords refused <> " in " <> file <> ", which changes which packages are visible"])
+                | otherwise → ([], [], [])
+      Section (Name _ name) arguments inner →
+        let key = map toLower (fromUTF8BS name)
+            (entries, imports, problems) = walk inner
+         in case key of
+              "source-repository-package" → (entries, imports, ("unsupported: source-repository-package in " <> file) : problems)
+              _ | key `elem` ["if", "elif"] → (entries, imports, conditionProblems arguments <> problems)
+              _ → (entries, imports, problems)
+    conditionProblems arguments = case runParseResult (parseConditionConfVar arguments) of
+      (_, Left _) → ["unsupported: a condition Cabal cannot read in " <> file]
+      (_, Right condition) →
+        [ "unsupported: condition " <> atom <> " in " <> file
+        | atom ← nub (concatMap projectAtom (conditionVariables condition))
+        ]
+    projectAtom = \case
+      OS os | os `elem` [Linux, OSX] → []
+      Arch arch | arch `elem` [X86_64, AArch64] → []
+      OS os → ["os(" <> prettyShow os <> ")"]
+      Arch arch → ["arch(" <> prettyShow arch <> ")"]
+      PackageFlag flag → ["flag(" <> unFlagName flag <> ")"]
+      Impl flavour range → ["impl(" <> prettyShow flavour <> " " <> prettyShow range <> ")"]
     remote entry = any (`isInfixOf` entry) ["://", "*", "?", "[", "{"] || any (`isSuffixOf` entry) [".tar.gz", ".cabal"]
     entryProblems entries = ["unsupported: the package entry " <> entry <> " in " <> file <> " (only literal local directories)" | entry ← entries, remote entry]
     importProblems imports = ["unsupported: the project import " <> entry <> " in " <> file <> " (only literal local files)" | entry ← imports, remote entry]
+
+conditionVariables ∷ Condition c → [c]
+conditionVariables = \case
+  Var v → [v]
+  Lit _ → []
+  CNot c → conditionVariables c
+  COr a b → conditionVariables a <> conditionVariables b
+  CAnd a b → conditionVariables a <> conditionVariables b
 
 readPackage ∷ FilePath → FilePath → IO (Either String Package)
 readPackage root directory = do
@@ -192,9 +245,9 @@ configurations directory cabal warnings description = do
             , configName = builtName built
             , configTarget = target
             , configFlagsLabel = flagsLabel
-            , configProblems = [why <> " in " <> place | why ← builtProblems built <> visibilityProblems info]
+            , configProblems = [why <> " in " <> place | why ← builtProblems built]
             , configDependencies = [(unPackageName (depPkgName dependency), map libraryLabel (toList (depLibraries dependency))) | dependency ← targetBuildDepends info]
-            , configMixins = [(unPackageName (mixinPackageName mixin), libraryLabel (mixinLibraryName mixin), prettyShow (mixinIncludeRenaming mixin), renamed (mixinIncludeRenaming mixin)) | mixin ← mixins info]
+            , configMixins = map mixinFacts (mixins info)
             , configReexports = builtReexports built
             , configModules = map prettyShow (builtModules built)
             , configPublic = builtPublic built
@@ -205,10 +258,37 @@ configurations directory cabal warnings description = do
               info = builtInfo built
               place = name <> ":" <> builtKind built <> ":" <> builtName built <> " (" <> targetLabel target <> (if null flagsLabel then "" else " " <> flagsLabel) <> ")"
         ]
-  pure (Package name directory cabal libraries configs problems)
+  pure (Package name directory cabal libraries exposed selectors configs (problems <> treeProblems))
   where
     name = unPackageName (pkgName (package (packageDescription description)))
     libraries = ["" | Just _ ← [condLibrary description]] <> [unUnqualComponentName sub | (sub, _) ← condSubLibraries description]
+    libraryTrees = [(name, "", tree) | Just tree ← [condLibrary description]] <> [(unUnqualComponentName sub, unUnqualComponentName sub, tree) | (sub, tree) ← condSubLibraries description]
+    exposed = [(label, nub [prettyShow m | lib ← nodes tree, m ← exposedModules lib]) | (_, label, tree) ← libraryTrees]
+    -- every node of every component's conditional tree, before any branch is dropped: its place, build information and
+    -- the signatures it declares
+    everyNode ∷ [(String, BuildInfo, [ModuleName])]
+    everyNode =
+      concat
+        [ [(name <> ":lib:" <> componentName, libBuildInfo lib, signatures lib) | (componentName, _, tree) ← libraryTrees, lib ← nodes tree]
+        , [(name <> ":flib:" <> unUnqualComponentName sub, foreignLibBuildInfo flib, []) | (sub, tree) ← condForeignLibs description, flib ← nodes tree]
+        , [(name <> ":exe:" <> unUnqualComponentName sub, buildInfo exe, []) | (sub, tree) ← condExecutables description, exe ← nodes tree]
+        , [(name <> ":test:" <> unUnqualComponentName sub, testBuildInfo suite, []) | (sub, tree) ← condTestSuites description, suite ← nodes tree]
+        , [(name <> ":bench:" <> unUnqualComponentName sub, benchmarkBuildInfo bench, []) | (sub, tree) ← condBenchmarks description, bench ← nodes tree]
+        ]
+    treeProblems =
+      nub $
+        concat
+          [ ["unsupported: signatures " <> unwords (map prettyShow sigs) <> " in " <> place | not (null sigs)]
+              <> [why <> " in " <> place | why ← visibilityProblems info]
+          | (place, info, sigs) ← everyNode
+          ]
+    selectors =
+      nub $
+        concat
+          [ [(place, unPackageName (depPkgName dependency), libraryLabel selected) | dependency ← targetBuildDepends info, selected ← toList (depLibraries dependency)]
+              <> [(place, unPackageName (mixinPackageName mixin), libraryLabel (mixinLibraryName mixin)) | mixin ← mixins info]
+          | (place, info, _) ← everyNode
+          ]
     manual = [flagName flag | flag ← genPackageFlags description, flagManual flag]
     assignments = mapM (\flag → [(flag, True), (flag, False)]) manual
     environments = [(target, flags) | target ← targets, flags ← assignments]
@@ -237,13 +317,7 @@ configurations directory cabal warnings description = do
         , concatMap (atomsOf . snd) (condBenchmarks description)
         ]
     atomsOf ∷ CondTree ConfVar [Dependency] c → [ConfVar]
-    atomsOf tree = concat [variables (condBranchCondition branch) <> atomsOf (condBranchIfTrue branch) <> maybe [] atomsOf (condBranchIfFalse branch) | branch ← condTreeComponents tree]
-    variables = \case
-      Var v → [v]
-      Lit _ → []
-      CNot c → variables c
-      COr a b → variables a <> variables b
-      CAnd a b → variables a <> variables b
+    atomsOf tree = concat [conditionVariables (condBranchCondition branch) <> atomsOf (condBranchIfTrue branch) <> maybe [] atomsOf (condBranchIfFalse branch) | branch ← condTreeComponents tree]
     -- a component whose conditions are all supported, under every environment; an unbuildable result is kept, so its
     -- unsupported forms are diagnosed, and selects nothing
     component ∷ Semigroup c ⇒ CondTree ConfVar [Dependency] c → (c → Built) → [((Target, [(FlagName, Bool)]), Built)]
@@ -261,7 +335,7 @@ configurations directory cabal warnings description = do
           (exposedModules lib <> otherModules (libBuildInfo lib))
           (componentName == name || libVisibility lib == LibraryVisibilityPublic)
           [(prettyShow (moduleReexportOriginalName reexport), prettyShow (moduleReexportName reexport)) | reexport ← reexportedModules lib]
-          ["unsupported: signatures " <> unwords (map prettyShow (signatures lib)) | not (null (signatures lib))]
+          []
     entries =
       concat
         [ maybe [] (library name) (condLibrary description)
@@ -297,14 +371,27 @@ data Built = Built
 builtKey ∷ Built → (String, String, String, [String], Bool, [(String, String)], [String])
 builtKey (Built kind name info modules public reexports problems) = (kind, name, show info, map prettyShow modules, public, reexports, problems)
 
--- Every module name a mixin's renamings mention, on either side, provided and required.
-renamed ∷ IncludeRenaming → [String]
-renamed (IncludeRenaming provides requires) = concatMap names [provides, requires]
+-- Every node of a conditional tree, both branches of every condition.
+nodes ∷ CondTree v d c → [c]
+nodes tree = condTreeData tree : concat [nodes (condBranchIfTrue branch) <> maybe [] nodes (condBranchIfFalse branch) | branch ← condTreeComponents tree]
+
+mixinFacts ∷ Mixin → MixinFacts
+mixinFacts mixin =
+  MixinFacts
+    { mixinPackage = unPackageName (mixinPackageName mixin)
+    , mixinLibrary = libraryLabel (mixinLibraryName mixin)
+    , mixinText = prettyShow (mixinIncludeRenaming mixin)
+    , mixinProvides = case provides of
+        DefaultRenaming → ProvidesAll
+        ModuleRenaming pairs → ProvidesRenamed [(prettyShow from, prettyShow to) | (from, to) ← pairs]
+        HidingRenaming hidden → ProvidesHiding (map prettyShow hidden)
+    , mixinRequires = case requires of
+        DefaultRenaming → []
+        ModuleRenaming pairs → concat [[prettyShow from, prettyShow to] | (from, to) ← pairs]
+        HidingRenaming hidden → map prettyShow hidden
+    }
   where
-    names = \case
-      DefaultRenaming → []
-      ModuleRenaming pairs → concat [[prettyShow from, prettyShow to] | (from, to) ← pairs]
-      HidingRenaming hidden → map prettyShow hidden
+    IncludeRenaming provides requires = mixinIncludeRenaming mixin
 
 libraryLabel ∷ LibraryName → String
 libraryLabel = \case
@@ -314,7 +401,28 @@ libraryLabel = \case
 -- | Compiler options that change which packages are visible, which only the manifest's structured dependencies may do.
 visibilityOption ∷ String → Bool
 visibilityOption option =
-  any (`isPrefixOf` option) ["-package", "-hide-package", "-ignore-package", "-trust", "-distrust", "-clear-package-db", "-global-package-db", "-no-global-package-db", "-user-package-db", "-no-user-package-db"]
+  any
+    (`isPrefixOf` option)
+    [ "-package"
+    , "-hide-package"
+    , "-hide-all-packages"
+    , "-ignore-package"
+    , "-trust"
+    , "-distrust"
+    , "-distrust-all-packages"
+    , "-fpackage-trust"
+    , "-plugin-package"
+    , "-hide-all-plugin-packages"
+    , "-clear-package-db"
+    , "-global-package-db"
+    , "-no-global-package-db"
+    , "-user-package-db"
+    , "-no-user-package-db"
+    , "-this-unit-id"
+    , "-this-package-name"
+    , "-working-dir"
+    , "-unit"
+    ]
 
 visibilityProblems ∷ BuildInfo → [String]
 visibilityProblems info =
