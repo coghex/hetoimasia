@@ -904,9 +904,14 @@ every other caller, admitted uploads and reservations alike.
 (`vulkanUploadRoom`). A grant belongs to the uploads that issued it. While it
 is reserved it is spent once, by `submitUploadGranted` for a fresh vertex
 buffer of exactly its bytes, which takes its place and region and competes for
-nothing again, or abandoned (`abandonUploadGrant`). A refused spend leaves it
-reserved. A spent, abandoned or foreign grant changes nothing, and closing
-admission abandons every grant not yet spent.
+nothing again, or abandoned (`abandonUploadGrant`). Binding is the transaction
+that admits the upload, and it spends the grant. A refusal in that
+transaction (the gate, the session, misuse, a buffer of the wrong kind or
+size) leaves the grant reserved. After binding, a copy that raised or was
+cancelled, and a refusal when the upload is queued (the gate or admission
+closing meanwhile), give the place and region back and consume the grant. A
+spent, abandoned or foreign grant changes nothing, and closing admission
+abandons every grant not yet spent.
 
 **The exclusive target.** From admission until its upload settles, a target
 belongs to the upload alone: every other batch's use of it is

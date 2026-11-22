@@ -204,12 +204,15 @@ in three steps a caller can also take apart:
   the release's answer (`AllocationReleased`), whose capacity stays occupied
   until the backend confirms its destruction; or a release that raised, a
   cleanup failure naming the buffer and the cause
-  (`AllocationReleaseRaised`). A refusal is answered with the receipt. A
+  (`AllocationReleaseRaised`). The seal commits whatever the settlement does:
+  an exception from it undoes only its own effects and goes on once the seal
+  has committed, the receipt saying so (`settlementRaised`). A refusal is
+  answered with the receipt. A
   raised exit goes on with the receipt attached to the exception
   (`buildSettlementOf`), its cause `BuildRaised`: the build's cancellation if
   it was one, otherwise a cancellation the release raised, otherwise the
-  build's exception. `buildRetainedChunk` and `buildRetainedChunkWith` answer
-  the same way. `BuildBufferRefused` is the backend refusing the buffer
+  settlement's exception, otherwise the build's. `buildRetainedChunk` and
+  `buildRetainedChunkWith` answer the same way. `BuildBufferRefused` is the backend refusing the buffer
   itself.
 
 **Standing.** `chunkStanding` reads, from any thread, `ChunkUploading`,
