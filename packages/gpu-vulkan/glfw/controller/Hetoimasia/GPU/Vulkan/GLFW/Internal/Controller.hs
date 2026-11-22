@@ -483,7 +483,7 @@ import Hetoimasia.GPU.Vulkan.Native.Uploads
   , UploadGrant
   , UploadRequest
   , UploadTicket
-  , gateOn
+  , admittedWhile
   )
 import Hetoimasia.GPU.Vulkan.Native.Generations
   ( GenerationUse
@@ -603,6 +603,7 @@ import Hetoimasia.Runtime.GLFW
   , ownerRetired
   , readGraphicsService
   , rollbackEvidence
+  , targetAdmission
   , targetEventsOpen
   , targetEvidence
   , targetRetired
@@ -698,7 +699,7 @@ data State inst msgr phys dev cmd lease obligation = State
     -- ^ The owner-thread actions admitted and not yet taken (GRS-15): any
     -- thread admits; the owner's step takes and runs them, and whole-owner
     -- retirement refuses what is left.
-  , stateOwnerOpen ∷ !(TVar (STM Bool))
+  , stateOwnerOpen ∷ !(TVar (TVar Bool))
     -- ^ Whether the owner's admission is still open, read by every action's
     -- admission and start. The composition installs the owner's own once it
     -- exists; it closes when the owner's exit begins or its run ends.
@@ -809,7 +810,7 @@ newVulkanControllerWith
   → IO VulkanController
 newVulkanControllerWith hooks capture deviceStart capacity releaseCapacity initialEmpty uploads windowDepth ops rendering observer pointer bridge layers validation choice budgets clock poll = do
   roots ← newRoots ops budgets clock
-  ownerOpen ← newTVarIO (pure True)
+  ownerOpen ← newTVarIO =<< newTVarIO True
   scenes ← newScenes initialEmpty
   actions ← newActions capacity releaseCapacity (actionGate roots ownerOpen) (sceneBarrierMet scenes)
   -- Only a host built for verification capture plans its swapchains
@@ -1298,11 +1299,17 @@ submitVulkanUpload (VulkanController state) request =
 -- upload, so none is reserved or queued once quiescence has closed the owner.
 uploadGate ∷ State inst msgr phys dev cmd lease obligation → UploadGate
 uploadGate state =
-  gateOn $
-    actionGate (stateRoots state) (stateOwnerOpen state) <&> \case
-      Just (ActionSessionFailed primary) → Just (UploadSessionFailed primary)
-      Just _ → Just UploadClosed
-      Nothing → Nothing
+  uploadRefusalNow state >>= \case
+    Just refusal → pure (Left refusal)
+    Nothing → Right . admittedWhile <$> readTVar (stateOwnerOpen state)
+
+-- The owner's admission as an upload reads it now, through the controller's own cells.
+uploadRefusalNow ∷ State inst msgr phys dev cmd lease obligation → STM (Maybe UploadRefusal)
+uploadRefusalNow state =
+  actionGate (stateRoots state) (stateOwnerOpen state) <&> \case
+    Just (ActionSessionFailed primary) → Just (UploadSessionFailed primary)
+    Just _ → Just UploadClosed
+    Nothing → Nothing
 
 -- | Whether an upload of this many bytes would be admitted now, from any
 -- thread, read-only: the decision 'reserveVulkanUpload' makes, under the
@@ -1310,7 +1317,7 @@ uploadGate state =
 vulkanUploadRoom ∷ VulkanController → Natural → STM (Either VulkanUploadRefusal ())
 vulkanUploadRoom (VulkanController state) bytes =
   either (Left . either VulkanUploadsUnavailable VulkanUploadRefused) Right
-    <$> renderingUploadRoom (stateRendering state) (uploadGate state) bytes
+    <$> renderingUploadRoom (stateRendering state) (uploadRefusalNow state) bytes
 
 -- | Reserve, in the caller's transaction, the queue place and staging region
 -- an upload of this many bytes needs, under the owner's gate: shared with
@@ -1319,7 +1326,7 @@ vulkanUploadRoom (VulkanController state) bytes =
 reserveVulkanUpload ∷ VulkanController → Natural → STM (Either VulkanUploadRefusal UploadGrant)
 reserveVulkanUpload (VulkanController state) bytes =
   either (Left . either VulkanUploadsUnavailable VulkanUploadRefused) Right
-    <$> reserveRenderingUpload (stateRendering state) (uploadGate state) bytes
+    <$> reserveRenderingUpload (stateRendering state) (uploadRefusalNow state) bytes
 
 -- | Spend a reservation on the upload that fills a fresh vertex buffer of
 -- exactly its bytes, under the owner's gate. A refusal before binding leaves
@@ -1344,11 +1351,11 @@ cancelVulkanUpload (VulkanController state) = cancelRenderingUpload (stateRender
 -- | Whether an owner-thread action may be admitted or started now: refused
 -- once the session has failed, with its primary, and once the owner's
 -- admission has closed.
-actionGate ∷ Roots Quiesced inst msgr phys dev → TVar (STM Bool) → STM (Maybe ActionRefusal)
+actionGate ∷ Roots Quiesced inst msgr phys dev → TVar (TVar Bool) → STM (Maybe ActionRefusal)
 actionGate roots ownerOpen =
   reportPrimary <$> readRootsTerminal roots >>= \case
     Just primary → pure (Just (ActionSessionFailed primary))
-    Nothing → join (readTVar ownerOpen) <&> \open → if open then Nothing else Just ActionOwnerClosed
+    Nothing → (readTVar ownerOpen >>= readTVar) <&> \open → if open then Nothing else Just ActionOwnerClosed
 
 -- | Run the owner-thread actions queued when the step began — its 'Batch',
 -- fixed before the step's checkpoint and its scene adoption — one at a time,
@@ -2827,7 +2834,9 @@ withVulkanOwnerHostHooked hooks capturing logger layer rendering pointer bridge 
           -- while the owner's own admission is open.
           atomically $ do
             writeTVar (stateHostWake state) (wakeGraphicsHost graphics)
-            writeTVar (stateOwnerOpen state) (targetEventsOpen (ownerHandoff graphics))
+            -- the admission before the owner closes in the transaction that hands over to the owner's own
+            readTVar (stateOwnerOpen state) >>= (`writeTVar` False)
+            writeTVar (stateOwnerOpen state) (targetAdmission (ownerHandoff graphics))
             -- A release request is held to the scenes the owner holds for the
             -- windows the host holds, and its hook is the host's own.
             installSceneSource

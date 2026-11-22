@@ -94,6 +94,7 @@ module Hetoimasia.Runtime.GLFW.Internal.Owner.Handoff
   , takeTargetEvents
   , closeTargetEvents
   , targetEventsOpen
+  , targetAdmission
   , pendingTargetEvents
   , closeOwnerPublications
 
@@ -518,6 +519,12 @@ closeTargetEvents handoff = do
 -- and taking nothing.
 targetEventsOpen ∷ OwnerHandoff scene → STM Bool
 targetEventsOpen = readTVar . handoffAdmitting
+
+-- | The port's admission itself, for a consumer that must verify it as data
+-- inside its own commits: 'True' until 'closeTargetEvents', then 'False' for
+-- good. A later handoff has a cell of its own.
+targetAdmission ∷ OwnerHandoff scene → TVar Bool
+targetAdmission = handoffAdmitting
 
 -- | End every publication into the handoff: the lifetime port, the demand
 -- snapshot, the scene snapshot, and each target's observation slot.

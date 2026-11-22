@@ -1901,33 +1901,33 @@ submitRenderingUpload rendering gate request =
     UploadsRefused refusal → pure (Left (Left (UploadsRefusedBy refusal)))
 
 -- | Whether an upload of this many bytes would be admitted now ('uploadRoom'), from any thread, read-only, under
--- the caller's gate: the decision 'reserveRenderingUpload' makes. Uploads configured and not yet made are
+-- the owner's admission as its own cells give it: the decision 'reserveRenderingUpload' makes. Uploads configured and not yet made are
 -- 'UploadsNotReady', which their startup can change.
 renderingUploadRoom
   ∷ Rendering q inst msgr phys dev cmd
-  → UploadGate
+  → STM (Maybe UploadRefusal)
   → Natural
   → STM (Either (Either UploadsUnavailable UploadRefusal) ())
 renderingUploadRoom rendering gate bytes = withUploads rendering gate (`uploadRoom` bytes)
 
--- | Reserve the room an upload of this many bytes needs ('reserveUpload'), from any thread, under the caller's
--- gate, read in the same transaction: a refusal reserves nothing.
+-- | Reserve the room an upload of this many bytes needs ('reserveUpload'), from any thread, under the owner's
+-- admission as its own cells give it, read in the same transaction: a refusal reserves nothing.
 reserveRenderingUpload
   ∷ Rendering q inst msgr phys dev cmd
-  → UploadGate
+  → STM (Maybe UploadRefusal)
   → Natural
   → STM (Either (Either UploadsUnavailable UploadRefusal) UploadGrant)
 reserveRenderingUpload rendering gate bytes = withUploads rendering gate (`reserveUpload` bytes)
 
 withUploads
   ∷ Rendering q inst msgr phys dev cmd
-  → UploadGate
+  → STM (Maybe UploadRefusal)
   → (Uploads q inst msgr phys dev cmd → STM (Either UploadRefusal a))
   → STM (Either (Either UploadsUnavailable UploadRefusal) a)
-withUploads rendering gate decide =
-  gate >>= \case
-    Left refusal → pure (Left (Right refusal))
-    Right _ →
+withUploads rendering admission decide =
+  admission >>= \case
+    Just refusal → pure (Left (Right refusal))
+    Nothing →
       readTVar (renderingUploads rendering) >>= \case
         UploadsMade uploads → either (Left . Right) Right <$> decide uploads
         UploadsUnconfigured → pure (Left (Left UploadsNotConfigured))

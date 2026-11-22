@@ -721,6 +721,7 @@ module Hetoimasia.Runtime.GLFW
   , TargetEvent (..)
   , EventAdmission (..)
   , targetEventsOpen
+  , targetAdmission
   , TargetObservation (..)
   , ObservationPublication (..)
   , OwnerDemand (..)

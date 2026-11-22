@@ -16,7 +16,7 @@
 module Test.GPU.Vulkan.Native.Uploads (spec) where
 
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar, tryPutMVar, tryTakeMVar)
-import Control.Concurrent.STM (atomically, check, modifyTVar', newTVarIO, readTVar, readTVarIO, retry, throwSTM, writeTVar)
+import Control.Concurrent.STM (TVar, atomically, check, modifyTVar', newTVar, newTVarIO, readTVar, readTVarIO, retry, throwSTM, writeTVar)
 import Control.Exception (AsyncException (ThreadKilled), ErrorCall (ErrorCall), SomeException, fromException, try)
 import Control.Monad (forM, forM_, replicateM_, void, when)
 import qualified Data.ByteString as ByteString
@@ -200,17 +200,17 @@ spec = describe "Uploads" $ do
       rig ← newUploadRig
       uploads ← made rig (config 64 64 4)
       texture ← textureOf rig Rgba8Linear 4 4 1
-      open ← newTVarIO False
-      let gate = gateOn (readTVar open <&> \opened → if opened then Nothing else Just UploadClosed)
+      current ← newTVarIO =<< newTVarIO False
+      let gate = gateOver current
       fmap (const ()) <$> submitUploadGated gate uploads (UploadImage texture [level 64 1]) `shouldReturn` Left UploadClosed
       writes rig `shouldReturn` []
-      atomically (writeTVar open True)
-      onceAt (rigRecordingStandIn rig) AtWriteMapped (atomically (writeTVar open False))
+      atomically (newTVar True >>= writeTVar current)
+      onceAt (rigRecordingStandIn rig) AtWriteMapped (atomically (readTVar current >>= (`writeTVar` False)))
       fmap (const ()) <$> submitUploadGated gate uploads (UploadImage texture [level 64 1]) `shouldReturn` Left UploadClosed
       uploadsUnsettled <$> atomically (readUploads uploads) `shouldReturn` []
       -- The target, the place in the queue and the whole staging buffer are
       -- all free again.
-      atomically (writeTVar open True)
+      atomically (newTVar True >>= writeTVar current)
       _ ← admitted uploads (UploadImage texture [level 64 1])
       clean rig
 
@@ -326,7 +326,7 @@ spec = describe "Uploads" $ do
         afterCopy ← newTVarIO Nothing
         let gate =
               readTVar afterCopy >>= \case
-                Nothing → pure (Right (UploadPermit (pure Nothing)))
+                Nothing → ungated
                 Just GateRaises → throwSTM (ErrorCall "the gate raised")
                 Just GateWaits → retry
                 Just _ → throwSTM ThreadKilled
@@ -351,20 +351,62 @@ spec = describe "Uploads" $ do
       rig ← newUploadRig
       uploads ← made rig (config 64 64 1)
       vertices ← bufferOf rig VertexBuffer 64
-      open ← newTVarIO True
-      let gate = gateOn (readTVar open <&> \opened → if opened then Nothing else Just UploadClosed)
+      current ← newTVarIO =<< newTVarIO True
+      let gate = gateOver current
+          close = readTVar current >>= (`writeTVar` False)
       -- closed first: the gate closes while the bytes are copied
-      onceAt (rigRecordingStandIn rig) AtWriteMapped (atomically (writeTVar open False))
+      onceAt (rigRecordingStandIn rig) AtWriteMapped (atomically close)
       fmap (const ()) <$> submitUploadGated gate uploads (UploadBuffer vertices (level 64 1)) `shouldReturn` Left UploadClosed
       uploadsUnsettled <$> atomically (readUploads uploads) `shouldReturn` []
       -- queued first: the gate closes once the upload is queued
-      atomically (writeTVar open True)
+      atomically (newTVar True >>= writeTVar current)
       ticket ← submitUploadGated gate uploads (UploadBuffer vertices (level 64 1)) >>= either (fail . show) pure
-      atomically (writeTVar open False)
+      atomically close
       fmap (const ()) <$> submitUploadGated ungated uploads (UploadBuffer vertices (level 64 1)) `shouldReturn` Left UploadAlreadyTargeted
       settleUploads rig uploads
       atomically (readUploadTicket ticket) `shouldReturn` UploadComplete
       clean rig
+
+    it "refuses an upload whose permit's admission closed after the gate admitted it and before the commit that binds or queues it, and one whose admission was closed and reopened while its bytes were copied" $ do
+      let fresh = do
+            rig ← newUploadRig
+            uploads ← made rig (config 64 64 1)
+            vertices ← bufferOf rig VertexBuffer 64
+            current ← newTVarIO =<< newTVarIO True
+            pure (rig, uploads, vertices, current)
+          closeNow current = readTVar current >>= (`writeTVar` False)
+      -- closed after the first ask admits, before the binding commit: nothing taken, the grant still spendable
+      (rig, uploads, vertices, current) ← fresh
+      grant ← atomically (reserveUpload uploads 64) >>= either (fail . show) pure
+      let closingOnAsk = gateOver current <* closeNow current
+      fmap (const ()) <$> submitUploadGranted closingOnAsk uploads grant vertices (level 64 1) `shouldReturn` Left UploadClosed
+      length . uploadsReserved <$> atomically (readUploads uploads) `shouldReturn` 1
+      atomically (newTVar True >>= writeTVar current)
+      _ ← submitUploadGranted (gateOver current) uploads grant vertices (level 64 1) >>= either (fail . show) pure
+      clean rig
+      -- closed after the second ask admits, before the queueing commit: the room returns, the grant is spent
+      (rig', uploads', vertices', current') ← fresh
+      grant' ← atomically (reserveUpload uploads' 64) >>= either (fail . show) pure
+      asks ← newTVarIO (0 ∷ Int)
+      let closingOnSecond = do
+            answer ← gateOver current'
+            n ← readTVar asks
+            writeTVar asks (n + 1)
+            when (n == 1) (closeNow current')
+            pure answer
+      fmap (const ()) <$> submitUploadGranted closingOnSecond uploads' grant' vertices' (level 64 1) `shouldReturn` Left UploadClosed
+      uploadsUnsettled <$> atomically (readUploads uploads') `shouldReturn` []
+      atomically (newTVar True >>= writeTVar current')
+      fmap (const ()) <$> submitUploadGranted (gateOver current') uploads' grant' vertices' (level 64 1) `shouldReturn` Left (UploadMisuse (StaleIdentity ResourceIdentity))
+      _ ← submitUploadGated (gateOver current') uploads' (UploadBuffer vertices' (level 64 1)) >>= either (fail . show) pure
+      clean rig'
+      -- closed and reopened while the bytes are copied: the reopened admission does not revive the upload
+      (rig'', uploads'', vertices'', current'') ← fresh
+      onceAt (rigRecordingStandIn rig'') AtWriteMapped (atomically (closeNow current'' >> newTVar True >>= writeTVar current''))
+      fmap (const ()) <$> submitUploadGated (gateOver current'') uploads'' (UploadBuffer vertices'' (level 64 1)) `shouldReturn` Left UploadClosed
+      uploadsUnsettled <$> atomically (readUploads uploads'') `shouldReturn` []
+      _ ← submitUploadGated (gateOver current'') uploads'' (UploadBuffer vertices'' (level 64 1)) >>= either (fail . show) pure
+      clean rig''
 
   describe "progress" $ do
     it "records each turn's copies at block-row boundaries under the budget, the target resting in its transfer write between batches, and completes on the final batch's fence" $ do
@@ -930,3 +972,7 @@ milliseconds n = either (error . show) id (durationFromNanoseconds AllowZero (n 
 -- | What ends a granted upload between its binding and its queueing.
 data PostBind = AfterCopyRaises | GateRaises | GateWaits | GateCancelled
   deriving (Eq, Show)
+
+-- | A gate over the admission cell an example holds now: open while that cell is.
+gateOver ∷ TVar (TVar Bool) → UploadGate
+gateOver current = readTVar current >>= \cell → readTVar cell <&> \open → if open then Right (admittedWhile cell) else Left UploadClosed
