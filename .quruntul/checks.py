@@ -310,7 +310,7 @@ class AdapterChecks(unittest.TestCase):
         self.assertEqual(probe.data["component"], "hetoimasia:test:run-native-repeat-probe")
         self.assertEqual((native.kind, native.data["component"]), ("ci", "hetoimasia:test:run-native-tests"))
         self.assertNotEqual(probe.identity, native.identity)
-        self.assertEqual([g["id"] for g in CATALOG["groups"] if "run-native-repeat-probe" in g.get("component", "")], ["test.run-native-repeat"])
+        self.assertEqual([g["id"] for g in CATALOG["groups"] if "run-native-repeat-probe" in (g.get("component") or "")], ["test.run-native-repeat"])
         # The planner on the real catalog, over the committed head, as a Darwin runner would plan it (on any other runner the
         # Darwin-only group is `platform-inapplicable`, which is also not a selection, but is not the reason this asserts): a change inside the probe's own inputs and a change
         # to a path no group claims (which widens non-optional selection to everything) leave it unselected.
@@ -376,7 +376,7 @@ class AdapterChecks(unittest.TestCase):
     def test_each_execution_policy_change_changes_the_affected_identities(self):
         workflow = (ROOT / ".github" / "workflows" / "validation.yml").read_text()
         wrapped = 'if [ "$group" = "test.glfw-wayland" ]; then'
-        routed = '"haskell-workflow=cpu:test.workflow"'
+        routed = '"haskell-workflow=cpu:test.workflow,test.owner-tx-guard"'
         for count in (workflow.count(wrapped), workflow.count(routed)):
             self.assertEqual(count, 1, "validation.yml changed shape; update these overlays")
         native = ["bash", "tools/vulkan/run.sh", "native"]
@@ -400,7 +400,7 @@ class AdapterChecks(unittest.TestCase):
             ("platforms", "test.x11-helper", dict(platforms=["Linux"]), None, ["platforms"]),
             ("catalog classification", "test.x11-helper", dict(optional=False), None, ["kind"]),
             ("workflow routing classification", "test.x11-helper", {},
-             workflow.replace(routed, '"haskell-workflow=cpu:test.workflow,test.x11-helper"'), ["kind"]),
+             workflow.replace(routed, '"haskell-workflow=cpu:test.workflow,test.owner-tx-guard,test.x11-helper"'), ["kind"]),
             # A narrowed profile and a compositor profile change apart from
             # the unnarrowed suite of the executable they share.
             ("narrowed profile timeout", "test.glfw-wayland", dict(timeout_seconds=900), None, ["trial_seconds"]),
