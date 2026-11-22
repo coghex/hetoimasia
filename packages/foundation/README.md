@@ -268,7 +268,7 @@ never waits. A reader that must wait reads in ordinary `STM` (`watch`,
 | --- | --- | --- | --- |
 | `OwnerCell` | its issuer, never exported | its issuer's commits, by value | its issuer's commits |
 | `ReadOnly` | readers the issuer hands it to | none | commits (`readTx`), waiting readers (`watch`) |
-| `Publisher` | an independent source | the source's own transaction, with the fact's change (teardown included), a `Prepared` value and the next revision together | none |
+| `Publisher` | an independent source | the source's own transaction, with the fact's change (teardown included), a `Prepared` value (its handle selected before anything is written) and the next revision together; its payload's role is nominal | none |
 | `Publication` | readers | none | commits (`readPublication`), waiting readers (`watchPublication`) |
 
 An issuer keeps its own `STM` and state and embeds a concrete operation with
@@ -277,8 +277,10 @@ only issuer-controlled inputs, validates before its first write, answers a
 refusal as data, and finishes without waiting or raising; review and the
 issuer's outcome tests check this, its callees included. Only the importers and
 dependents `tools/validation/owner_tx_issuers.json` lists may use the bridge or
-the representation, and nothing may re-export either; the repository's guard
-enforces it ([the import guard](../../docs/validation.md#the-issuer-bridges-import-guard)).
+the representation, and nothing may re-export either or export a conversion
+between `STM` and the transaction under any name; the repository's guard
+enforces it with Cabal's and GHC's own facts against a reviewed typed export
+contract ([the import guard](../../docs/validation.md#the-issuer-bridges-import-guard)).
 
 `classifyExit` reads an operation's result beside its issuer's standing, live,
 ended, or ended by an escaped construction failure, and answers one `Exit`: a
