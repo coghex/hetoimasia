@@ -16,7 +16,7 @@ module Policy
   ) where
 
 import Control.Monad (forM)
-import Data.List (intercalate, isInfixOf, nub)
+import Data.List (intercalate, nub)
 import qualified Data.Map.Strict as Map
 import Inventory
 import Json
@@ -66,7 +66,7 @@ check ∷ Allowlist → Inventory → [String]
 check allowlist inventory =
   inventoryProblems inventory
     <> concatMap packageProblems packages
-    <> nub (concatMap configProblems configurations)
+    <> nub (concatMap configProblems everyConfiguration)
     <> unlisted
     <> stale
     <> reexports
@@ -76,7 +76,9 @@ check allowlist inventory =
     <> selectors
   where
     packages = inventoryPackages inventory
-    configurations = concatMap packageConfigurations packages
+    everyConfiguration = concatMap packageConfigurations packages
+    -- what Cabal builds; an unbuildable configuration is only diagnosed
+    configurations = filter configBuildable everyConfiguration
     libraries = Map.fromList [(packageName package', packageLibraries package') | package' ← packages]
     dependents =
       [ configuration
@@ -99,13 +101,13 @@ check allowlist inventory =
       [ configurationId configuration <> " re-exports " <> original <> " as " <> renamed <> " through reexported-modules, exposing a protected module"
       | configuration ← configurations
       , (original, renamed) ← configReexports configuration
-      , any (`isInfixOf` original) protectedModules || renamed `elem` protectedModules
+      , original `elem` protectedModules || renamed `elem` protectedModules
       ]
     mixinProblems =
       [ configurationId configuration <> " names a protected module or library in the mixin " <> package <> (if null library then "" else ":" <> library) <> " " <> renaming
       | configuration ← configurations
-      , (package, library, renaming) ← configMixins configuration
-      , (package == bridgePackage && library `elem` [bridgeLibrary, "internal"]) || any (`isInfixOf` renaming) protectedModules
+      , (package, library, renaming, mentioned) ← configMixins configuration
+      , (package == bridgePackage && library `elem` [bridgeLibrary, "internal"]) || any (`elem` protectedModules) mentioned
       ]
     declarations =
       [ configurationId configuration <> " declares the protected module " <> moduleName <> ", which only " <> defining <> " may"

@@ -11,8 +11,8 @@
 -- Each negative example asserts the guard's own diagnostic.
 --
 -- The last group runs the guard on this repository: it passes, it reads only what its catalog group lists as inputs, and
--- the planner selects that group for a change to a Vulkan-only package's source, to a package description and to the
--- allowlist.
+-- the planner selects that group for a change to a Vulkan-only package's source, to a package description, to either
+-- project file or their shared import, and to the allowlist.
 module OwnerTxGuard (spec) where
 
 import Control.Exception (finally)
@@ -182,6 +182,23 @@ spec = describe "The issuer bridge's dependency guard (tools/owner-tx-guard)" $ 
         )
         ["vulkanpkg:lib:vulkanpkg (linux/x86_64 -full) depends on hetoimasia-foundation:owner-tx-issuer and is not a listed dependent"]
 
+    it "admits a dependency confined to an unbuildable configuration, and still diagnoses that configuration's unsupported forms" $ do
+      let native extra =
+            unlines $
+              cabalHeader "vulkanpkg"
+                <> ["flag native", "    default: False", "    manual: True", ""]
+                <> ["library", "    exposed-modules: Vulkan.Native", "    hs-source-dirs: src"]
+                <> common
+                <> ["    build-depends: base, hetoimasia-foundation", "    if flag(native)", "        build-depends: hetoimasia-foundation:owner-tx-issuer", "        buildable: False"]
+                <> extra
+      checked (changed [("vulkanpkg/vulkanpkg.cabal", native [])]) >>= (`shouldBe` (ExitSuccess, ""))
+      refused
+        (changed [("vulkanpkg/vulkanpkg.cabal", native []), ("tools/validation/owner_tx_issuers.json", allowlist (baseDependents <> ["vulkanpkg:lib:vulkanpkg"]))])
+        ["the listed dependent vulkanpkg:lib:vulkanpkg depends on no hetoimasia-foundation:owner-tx-issuer in any supported configuration: a stale entry"]
+      refused
+        (changed [("vulkanpkg/vulkanpkg.cabal", native ["        ghc-options: -package hetoimasia-foundation:owner-tx-issuer"])])
+        ["vulkanpkg:lib:vulkanpkg (darwin/aarch64 +native)", "unsupported: the GHC option -package, which changes which packages are visible"]
+
     it "reads a dependency inherited through nested common stanzas, and a foreign library's" $ do
       refused
         ( changed
@@ -237,6 +254,13 @@ spec = describe "The issuer bridge's dependency guard (tools/owner-tx-guard)" $ 
       refused
         (changed [("foundation/hetoimasia-foundation.cabal", foundationWith ["    reexported-modules: Hetoimasia.Foundation.OwnerTx.Representation as Hetoimasia.Foundation.OwnerTx.Raw"])])
         ["hetoimasia-foundation:lib:internal (", "re-exports Hetoimasia.Foundation.OwnerTx.Representation as Hetoimasia.Foundation.OwnerTx.Raw"]
+
+    it "matches the protected modules by their exact names: a re-export or mixin of the public module is accepted" $ do
+      checked (changed [("consumer/consumer.cabal", consumerWith ["    reexported-modules: Hetoimasia.Foundation.OwnerTx as Consumer.Transactions"])]) >>= (`shouldBe` (ExitSuccess, ""))
+      checked (changed [("consumer/consumer.cabal", consumerWith ["    mixins: hetoimasia-foundation (Hetoimasia.Foundation.OwnerTx as Consumer.Transactions)"])]) >>= (`shouldBe` (ExitSuccess, ""))
+      refused
+        (changed [("consumer/consumer.cabal", consumerWith ["    mixins: hetoimasia-foundation (Hetoimasia.Foundation.OwnerTx as Consumer.Transactions, Hetoimasia.Foundation.OwnerTx.Representation as Consumer.Raw)"])])
+        ["names a protected module or library in the mixin hetoimasia-foundation (Hetoimasia.Foundation.OwnerTx as Consumer.Transactions, Hetoimasia.Foundation.OwnerTx.Representation as Consumer.Raw)"]
 
     it "refuses a protected module declared outside its defining component, and a public representation library" $ do
       refused
@@ -315,12 +339,15 @@ spec = describe "The issuer bridge's dependency guard (tools/owner-tx-guard)" $ 
       inputs `shouldSatisfy` (/= Nothing)
       missing `shouldBe` []
 
-    it "selects its group for a change to a Vulkan-only package's source, to a package description and to the allowlist" $ inCheckout $ \checkout → do
+    it "selects its group for a change to a Vulkan-only package's source, to a package description, to either project file or their import, and to the allowlist" $ inCheckout $ \checkout → do
       settings ← sanitizedEnvironment
       files ← lines <$> git settings checkout ["-c", "safe.directory=*", "ls-files", "*.cabal", "cabal.project*", "tools/validation/catalog.json"]
       let changedPaths =
             [ "packages/gpu-vulkan/native/src/Hetoimasia/GPU/Vulkan/Native/Uploads.hs"
             , "packages/foundation/hetoimasia-foundation.cabal"
+            , "cabal.project"
+            , "cabal.project.vulkan"
+            , "cabal.project.common"
             , "tools/validation/owner_tx_issuers.json"
             ]
       forM_ changedPaths $ \path →

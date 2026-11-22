@@ -79,12 +79,15 @@ data Configuration = Configuration
   , configProblems ∷ [String]
   , configDependencies ∷ [(String, [String])]
     -- ^ Each dependency's package and the libraries it selects (the empty string for the main library).
-  , configMixins ∷ [(String, String, String)]
+  , configMixins ∷ [(String, String, String, [String])]
+    -- ^ Each mixin's package, library, renaming as written, and every module name its renamings mention.
   , configReexports ∷ [(String, String)]
   , configModules ∷ [String]
     -- ^ The modules it declares (exposed and other).
   , configPublic ∷ Bool
     -- ^ A library with @visibility: public@ (always true of a main library).
+  , configBuildable ∷ Bool
+    -- ^ Whether Cabal builds it: an unbuildable configuration is diagnosed for unsupported forms but selects nothing.
   }
 
 -- | What the inventory found: the files it read, the packages, and every unsupported form of the projects.
@@ -191,10 +194,11 @@ configurations directory cabal warnings description = do
             , configFlagsLabel = flagsLabel
             , configProblems = [why <> " in " <> place | why ← builtProblems built <> visibilityProblems info]
             , configDependencies = [(unPackageName (depPkgName dependency), map libraryLabel (toList (depLibraries dependency))) | dependency ← targetBuildDepends info]
-            , configMixins = [(unPackageName (mixinPackageName mixin), libraryLabel (mixinLibraryName mixin), prettyShow (mixinIncludeRenaming mixin)) | mixin ← mixins info]
+            , configMixins = [(unPackageName (mixinPackageName mixin), libraryLabel (mixinLibraryName mixin), prettyShow (mixinIncludeRenaming mixin), renamed (mixinIncludeRenaming mixin)) | mixin ← mixins info]
             , configReexports = builtReexports built
             , configModules = map prettyShow (builtModules built)
             , configPublic = builtPublic built
+            , configBuildable = buildable info
             }
         | (target, flagSets, built) ← groups entries
         , let flagsLabel = intercalate " | " (nub [unwords [(if on then "+" else "-") <> unFlagName flag | (flag, on) ← flags] | flags ← flagSets])
@@ -240,14 +244,13 @@ configurations directory cabal warnings description = do
       CNot c → variables c
       COr a b → variables a <> variables b
       CAnd a b → variables a <> variables b
-    -- a component whose conditions are all supported, under every environment it is buildable in
+    -- a component whose conditions are all supported, under every environment; an unbuildable result is kept, so its
+    -- unsupported forms are diagnosed, and selects nothing
     component ∷ Semigroup c ⇒ CondTree ConfVar [Dependency] c → (c → Built) → [((Target, [(FlagName, Bool)]), Built)]
     component tree build =
-      [ (environment, built)
+      [ (environment, build (snd (simplifyCondTree (evaluate environment) tree)))
       | null (concatMap conditionProblems (atomsOf tree))
       , environment ← environments
-      , let built = build (snd (simplifyCondTree (evaluate environment) tree))
-      , buildable (builtInfo built)
       ]
     library componentName tree =
       component tree $ \lib →
@@ -293,6 +296,15 @@ data Built = Built
 
 builtKey ∷ Built → (String, String, String, [String], Bool, [(String, String)], [String])
 builtKey (Built kind name info modules public reexports problems) = (kind, name, show info, map prettyShow modules, public, reexports, problems)
+
+-- Every module name a mixin's renamings mention, on either side, provided and required.
+renamed ∷ IncludeRenaming → [String]
+renamed (IncludeRenaming provides requires) = concatMap names [provides, requires]
+  where
+    names = \case
+      DefaultRenaming → []
+      ModuleRenaming pairs → concat [[prettyShow from, prettyShow to] | (from, to) ← pairs]
+      HidingRenaming hidden → map prettyShow hidden
 
 libraryLabel ∷ LibraryName → String
 libraryLabel = \case

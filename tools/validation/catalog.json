@@ -990,8 +990,7 @@
           "cabal",
           "build",
           "--only-dependencies",
-          "exe:owner-tx-guard",
-          "hetoimasia-foundation:test:foundation-tests"
+          "exe:owner-tx-guard"
         ],
         "timeout_seconds": 1800
       },
