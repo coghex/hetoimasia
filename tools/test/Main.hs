@@ -16,6 +16,7 @@ import qualified OwnedHost
 import qualified OwnedStarts
 import qualified OwnedSubprocess
 import qualified OwnedThread
+import qualified OwnerTxGuard
 import qualified Packaging
 import qualified PlanStep
 import qualified QuruntulAdapter
@@ -105,6 +106,7 @@ suite = hspec $ do
   OwnedSubprocess.spec
   OwnedHost.spec
   OwnedStarts.spec
+  OwnerTxGuard.spec
 
 withRepository ∷ Bool → (Repository → IO a) → IO a
 withRepository alias action = do

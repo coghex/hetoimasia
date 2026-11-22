@@ -171,7 +171,7 @@ jobs:
           # a display group on a CPU-only worker, or a group owned twice or by
           # nobody — and every later step reads the assignment out of the plan.
           arguments+=(--worker "haskell-engine=cpu:build.all,test.engine,test.foundation,test.runtime,test.glfw,test.scripting-lua,test.scripting-lua-runtime,test.lua-domains,test.lua-engine,test.vulkan,test.vulkan-diagnostics,test.math,test.content,test.asset-image,test.render-api,test.render-2d,test.render-2d-oracle,test.terrain,test.terrain-render-2d,test.terrain-runtime,smoke.console")
-          arguments+=(--worker "haskell-workflow=cpu:test.workflow")
+          arguments+=(--worker "haskell-workflow=cpu:test.workflow,test.owner-tx-guard")
           arguments+=(--worker "glfw-native=display:test.glfw-native,test.glfw-wayland")
           arguments+=(--worker "vulkan=cpu+display:test.vulkan-headless,test.vulkan-native,test.vulkan-wayland,test.vulkan-lua-engine-native,test.vulkan-run-native")
           if [ "$EVENT_NAME" = "pull_request" ]; then

@@ -976,6 +976,44 @@
       "optional": false
     },
     {
+      "id": "test.owner-tx-guard",
+      "description": "Run the import guard of the ownership transactions' issuer bridge (#721), tools/validation/owner_tx_guard.py, against the repository itself: every component of every package cabal.project and cabal.project.vulkan list (libraries, sublibraries, executables, test suites, both branches of a manual flag's conditional), its exposed and other modules and main-is in its source directories. It fails a module that imports Hetoimasia.Foundation.OwnerTx.Issuer or the bridge-equivalent Hetoimasia.Foundation.OwnerTx.Representation without being listed with its component in tools/validation/owner_tx_issuers.json, a component that depends on hetoimasia-foundation:owner-tx-issuer without being a listed dependent, a re-export of the bridge or the representation (a Haskell export list, Cabal reexported-modules or mixins), a stale entry, and anything it cannot read. Its inputs are every package description and source directory it reads; its fixtures are examples in workflow-tests.",
+      "command": [
+        "python3",
+        "-I",
+        "tools/validation/owner_tx_guard.py",
+        "check"
+      ],
+      "component": null,
+      "inputs": [
+        "cabal.project",
+        "cabal.project.vulkan",
+        "hetoimasia.cabal",
+        "app/",
+        "app-cpu/",
+        "app-full/",
+        "console/",
+        "probe/",
+        "run/",
+        "run-native-repeat/",
+        "run-native-test/",
+        "test/",
+        "test-cpu/",
+        "test-full/",
+        "tools/test/",
+        "tools/wayland-test/",
+        "tools/x11-test/",
+        "tools/test-support/",
+        "packages/",
+        "samples/"
+      ],
+      "framework": "none",
+      "runner": "cpu",
+      "timeout_seconds": 300,
+      "category": "test",
+      "optional": false
+    },
+    {
       "id": "test.x11-helper",
       "description": "Local-only optional headless X11 helper probes using stub servers and window managers, including real 30-second startup deadlines. Never selected automatically or routed to CI; eligible for coordinated local testing. Opens no desktop session.",
       "command": [

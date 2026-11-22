@@ -43,6 +43,8 @@ consumed =
   , ("tools/validation/owned_starts.py", "OwnedStarts.hs runs it against fixture trees and, in a checkout, against the repository")
   , ("tools/validation/owned_starts.json", "owned_starts.py reads the scan's primitives, exclusions and exemptions from it")
   , ("tools/validation/owned_starts_baseline.json", "owned_starts.py reads the recorded debt from it")
+  , ("tools/validation/owner_tx_guard.py", "OwnerTxGuard.hs runs it against fixture trees and, in a checkout, against the repository; it loads owned_starts.py and plan_cabal.py")
+  , ("tools/validation/owner_tx_issuers.json", "owner_tx_guard.py reads the allowlist from it")
   , ("tools/validation/plan_repository.py", "plan.py, run.py, range.py, and aggregate.py load it")
   , ("tools/validation/plan_cabal.py", "plan.py and run.py load it")
   , ("tools/validation/plan_catalog.py", "plan.py and run.py load it")

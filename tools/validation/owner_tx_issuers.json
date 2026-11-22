@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "description": "Who may import the ownership transactions' issuer bridge (Hetoimasia.Foundation.OwnerTx.Issuer) or its bridge-equivalent representation (Hetoimasia.Foundation.OwnerTx.Representation), and which components may depend on hetoimasia-foundation:owner-tx-issuer. tools/validation/owner_tx_guard.py refuses every importer, dependent and re-export this list does not admit, and every entry that has gone stale.",
+  "importers": [
+    {
+      "component": "hetoimasia-foundation:lib:hetoimasia-foundation",
+      "module": "Hetoimasia.Foundation.OwnerTx",
+      "reason": "Foundation's public module: it re-exports the representation's types abstractly and builds the safe API over them"
+    },
+    {
+      "component": "hetoimasia-foundation:lib:owner-tx-issuer",
+      "module": "Hetoimasia.Foundation.OwnerTx.Issuer",
+      "reason": "the bridge itself: it defines fromIssuerSTM and the issuer-side cell updates over the representation"
+    },
+    {
+      "component": "hetoimasia-foundation:test:foundation-tests",
+      "module": "Test.Foundation.Ownership.Composition",
+      "reason": "the positive issuer composition over existing STM, built through the bridge (#721 acceptance)"
+    }
+  ],
+  "dependents": [
+    {
+      "component": "hetoimasia-foundation:test:foundation-tests",
+      "reason": "its composition example builds through the bridge"
+    }
+  ]
+}

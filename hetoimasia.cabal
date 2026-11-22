@@ -65,6 +65,8 @@ extra-source-files:
     tools/validation/owned_starts.py
     tools/validation/owned_starts.json
     tools/validation/owned_starts_baseline.json
+    tools/validation/owner_tx_guard.py
+    tools/validation/owner_tx_issuers.json
     tools/validation/plan.py
     tools/validation/plan_repository.py
     tools/validation/plan_cabal.py
@@ -214,6 +216,7 @@ test-suite workflow-tests
         OwnedStarts
         OwnedSubprocess
         OwnedThread
+        OwnerTxGuard
         Packaging
         PlanStep
         QuruntulAdapter
