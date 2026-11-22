@@ -84,6 +84,7 @@ library
         base >=4.22 && <4.23,
         bytestring >=0.12 && <0.13,
         containers >=0.8 && <0.9,
+        deepseq >=1.5 && <1.6,
         hetoimasia-math ==0.1.0.0,
         hetoimasia-render-api ==0.1.0.0
 

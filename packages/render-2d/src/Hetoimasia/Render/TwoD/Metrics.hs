@@ -16,7 +16,12 @@
 -- either rule is not refused here, because a metrics value is only data: the
 -- mapping built from it in "Hetoimasia.Render.TwoD.Mapping" is refused.
 --
--- __Dependencies.__ @base@.
+-- __Evaluation.__ Every field is strict and of a strict type, so a metrics
+-- value is fully evaluated once it is evaluated at all: its 'NFData' instance,
+-- which a writer's 'Hetoimasia.Foundation.Messaging.Payload.prepare' runs,
+-- forces it to weak head normal form, and that is all of it.
+--
+-- __Dependencies.__ @base@, @deepseq@.
 --
 -- __State.__ The module owns none.
 module Hetoimasia.Render.TwoD.Metrics
@@ -26,6 +31,7 @@ module Hetoimasia.Render.TwoD.Metrics
   , validMetrics
   ) where
 
+import Control.DeepSeq (NFData (rnf), rwhnf)
 import Hetoimasia.Render.TwoD.Internal.Check (positiveFinite)
 
 -- | A width and a height in whole pixels. The fields are 'Int', as the window
@@ -66,3 +72,10 @@ validMetrics metrics =
   where
     PixelExtent lw lh = metricsLogical metrics
     PixelExtent fw fh = metricsFramebuffer metrics
+
+-- Every field is strict and of a strict type: weak head normal form is all of it.
+instance NFData PixelExtent where
+  rnf = rwhnf
+
+instance NFData TargetMetrics where
+  rnf = rwhnf
