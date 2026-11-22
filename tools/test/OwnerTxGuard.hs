@@ -334,6 +334,24 @@ spec = describe "The issuer bridge's import guard (tools/owner-tx-guard)" $ do
         )
         ["Consumer.Adapter in consumer:lib:consumer", "exports embed, which converts between STM and the ownership transaction"]
 
+    it "finds a conversion anywhere in an exported value's type: a caller's callback, STM nested in an argument, a local newtype over STM, and the converse" $
+      forM_
+        [ ("fromCallback", ["fromCallback ∷ (Int → STM b) → OwnerTx b", "fromCallback k = Bridge.fromIssuerSTM (k 0)"])
+        , ("fromMaybe", ["fromMaybe ∷ Maybe (STM a) → OwnerTx a", "fromMaybe = maybe (Bridge.fromIssuerSTM retry) Bridge.fromIssuerSTM"])
+        , ("fromPair", ["fromPair ∷ (STM a, Int) → OwnerTx a", "fromPair (t, _) = Bridge.fromIssuerSTM t"])
+        , ("fromWrap", ["newtype Wrap a = Wrap (STM a)", "fromWrap ∷ Wrap a → OwnerTx a", "fromWrap (Wrap t) = Bridge.fromIssuerSTM t"])
+        , ("toSTM", ["toSTM ∷ OwnerTx a → Maybe (STM a)", "toSTM _ = Nothing"])
+        ]
+        $ \(name, body) →
+          refused
+            ( changed
+                [ ( "consumer/src/Consumer/Adapter.hs"
+                  , adapter ("module Consumer.Adapter (reserveSlot, " <> name <> ") where") body `withImport` "import Control.Concurrent.STM (STM, retry)"
+                  )
+                ]
+            )
+            ["Consumer.Adapter in consumer:lib:consumer", "exports " <> name <> ", which converts between STM and the ownership transaction"]
+
     it "refuses an export its contract does not list, and a contract entry no longer exported" $ do
       refused
         (changed [("consumer/src/Consumer/Adapter.hs", adapter "module Consumer.Adapter (reserveSlot, slots) where" ["slots ∷ Int", "slots = 4"])])

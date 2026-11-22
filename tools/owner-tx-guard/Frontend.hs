@@ -14,6 +14,7 @@ module Frontend
 import Control.Exception (SomeException, displayException, try)
 import Control.Monad.IO.Class (liftIO)
 import Data.List (intercalate)
+import qualified Data.Set as Set
 import GHC
   ( Ghc
   , LoadHowMuch (LoadAllTargets)
@@ -38,18 +39,21 @@ import GHC
   , unLoc
   )
 import GHC.Core.ConLike (ConLike (..))
-import GHC.Core.DataCon (dataConName, dataConWrapperType)
-import GHC.Core.TyCon (TyCon, tyConName)
+import GHC.Core.DataCon (dataConName, dataConOrigArgTys, dataConWrapperType)
+import GHC.Core.TyCon (tyConDataCons, tyConName)
 import GHC.Core.Multiplicity (scaledThing)
-import GHC.Core.Type (Type, expandTypeSynonyms, splitForAllTyCoVars, splitFunTys, tyConAppTyCon_maybe)
+import GHC.Core.TyCo.FVs (tyConsOfType)
+import GHC.Core.Type (Type, expandTypeSynonyms, splitForAllTyCoVars, splitFunTys)
 import GHC.Data.StringBuffer (hGetStringBuffer)
 import GHC.Driver.Config.Parser (initParserOpts)
-import GHC.Driver.Env (hscSetFlags)
+import GHC.Driver.Env (hscActiveUnitId, hscSetFlags)
 import GHC.Driver.Pipeline (preprocess)
 import GHC.Parser.Header (getImports)
 import GHC.Types.Id (idType)
 import GHC.Types.Name (Name, getOccString, nameModule_maybe)
-import GHC.Unit.Module (moduleName)
+import GHC.Types.Unique.Set (nonDetEltsUniqSet)
+import GHC.Unit.Module (moduleName, moduleUnit)
+import GHC.Unit.Types (UnitId, toUnitId)
 import GHC.Utils.Outputable (showPprUnsafe)
 
 -- | One export of a typechecked module.
@@ -116,36 +120,58 @@ readExports libdir flags databases importPaths packages target =
           Failed → pure (Left ("GHC could not typecheck " <> target))
           Succeeded → do
             found ← findModule (mkModuleName target) Nothing
+            home ← hscActiveUnitId <$> getSession
             getModuleInfo found >>= \case
               Nothing → pure (Left ("GHC has no interface for " <> target))
-              Just info → Right <$> mapM describe (modInfoExports info)
+              Just info → Right <$> mapM (describe home) (modInfoExports info)
   where
-    describe ∷ Name → Ghc Export
-    describe name = do
+    describe ∷ UnitId → Name → Ghc Export
+    describe home name = do
       thing ← lookupName name
       let defined = maybe "" (moduleNameString . moduleName) (nameModule_maybe name)
       pure $ case thing of
         Just (AnId identifier) →
           let shown = expandTypeSynonyms (idType identifier)
-           in Export (getOccString name) defined "value" (showPprUnsafe shown) (converts shown)
+           in Export (getOccString name) defined "value" (showPprUnsafe shown) (converts home shown)
         Just (AConLike (RealDataCon constructor)) →
           let shown = expandTypeSynonyms (dataConWrapperType constructor)
-           in Export (getOccString (dataConName constructor)) defined "constructor" (showPprUnsafe shown) (converts shown)
+           in Export (getOccString (dataConName constructor)) defined "constructor" (showPprUnsafe shown) (converts home shown)
         Just (ATyCon tycon) → Export (getOccString (tyConName tycon)) defined "type" "" False
         _ → Export (getOccString name) defined "other" "" False
 
--- Whether a type converts between STM and the ownership transaction: an argument of one and a result of the other, at
--- any depth of a returned function.
-converts ∷ Type → Bool
-converts ty =
+-- Whether a type converts between STM and the ownership transaction, either way: once its arrows are split, an argument
+-- that mentions one and a result that mentions the other. A type mentions what occurs anywhere in it, under arrows,
+-- tuples and applications, with synonyms expanded, and inside the fields of every data type or newtype the checked
+-- module's own unit defines (the representation's types excepted: they are the boundary itself, opaque).
+converts ∷ UnitId → Type → Bool
+converts home ty =
   let (_, body) = splitForAllTyCoVars ty
       (arguments, result) = splitFunTys body
-      heads = map (headOf . scaledThing) arguments
-   in (Just "STM" `elem` heads && headOf result == Just "OwnerTx")
-        || (Just "OwnerTx" `elem` heads && headOf result == Just "STM")
-        || (not (null arguments) && converts result)
+      argumentMentions = Set.unions (map (mentions home . scaledThing) arguments)
+      resultMentions = mentions home result
+   in (Set.member "STM" argumentMentions && Set.member "OwnerTx" resultMentions)
+        || (Set.member "OwnerTx" argumentMentions && Set.member "STM" resultMentions)
+
+-- The type constructors a type mentions, by name, reached through the fields of the home unit's own data types.
+mentions ∷ UnitId → Type → Set.Set String
+mentions home = go Set.empty
   where
-    headOf t = getOccString . tyConName <$> (tyConAppTyCon_maybe (expandTypeSynonyms t) ∷ Maybe TyCon)
+    opaque = Set.fromList ["OwnerTx", "OwnerCell", "ReadOnly", "Publisher", "Publication"]
+    go visited t =
+      let constructors = nonDetEltsUniqSet (tyConsOfType (expandTypeSynonyms t))
+          names = Set.fromList (map (getOccString . tyConName) constructors)
+          inner =
+            [ field
+            | constructor ← constructors
+            , let name = tyConName constructor
+            , not (Set.member (getOccString name) opaque)
+            , not (Set.member (getOccString name) visited)
+            , maybe False ((== home) . toUnitId . moduleUnit) (nameModule_maybe name)
+            , dataConstructor ← tyConDataCons constructor
+            , field ← map scaledThing (dataConOrigArgTys dataConstructor)
+            ]
+          visited' = Set.union visited names
+       in Set.unions (names : map (go visited') inner)
 
 guarded ∷ IO (Either String a) → IO (Either String a)
 guarded action =
