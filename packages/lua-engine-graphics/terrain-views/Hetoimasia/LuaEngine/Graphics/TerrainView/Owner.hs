@@ -37,6 +37,7 @@ import Data.Functor ((<&>))
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Word (Word64)
+import Hetoimasia.Foundation.Exit (Exit (..), IssuerStanding (..), classifyExit)
 import Hetoimasia.GPU.Vulkan.GLFW
   ( ActionOutcome (..)
   , ActionRefusal (..)
@@ -155,10 +156,24 @@ data Hands = Hands
 data ScheduleRefusal = ScheduleBusy | ScheduleEnded !Text
   deriving (Eq, Show)
 
--- | How an admitted step ended: it ran, the owner refused it before it ran (its exit began, its session failed), or it
--- raised.
-data StepOutcome = StepRan | StepRefused !Text | StepRaised !Text
-  deriving (Eq, Show)
+-- | How an admitted step ended: it ran; the owner refused it before it ran (its exit began, its session failed); or it
+-- raised, classified once against the owner's standing ('classifyExit'): an exception of the step alone while the
+-- owner lives, which the owner outlives; a cancellation; or a terminal failure. The ticket keeps the original exception
+-- with its context.
+data StepOutcome = StepRan | StepRefused !Text | StepRaised !(Exit Text ())
+
+instance Show StepOutcome where
+  show = \case
+    StepRan → "StepRan"
+    StepRefused why → "StepRefused " <> show why
+    StepRaised exit → "StepRaised (" <> exitKind exit <> ")"
+    where
+      exitKind = \case
+        Completed () → "completed"
+        Refused _ → "refused"
+        Raised _ → "raised, recoverable"
+        Cancelled _ → "cancelled"
+        Terminal _ → "terminal"
 
 -- | What the views use of the owner and its host from any thread: each a transaction that never waits.
 data OwnerPorts = OwnerPorts
@@ -203,7 +218,10 @@ productionOwner host graphics = do
                   Nothing → pure Nothing
                   Just (ActionReturned ()) → pure (Just StepRan)
                   Just (ActionRefused why) → pure (Just (StepRefused (Text.pack (show why))))
-                  Just (ActionRaised why) → pure (Just (StepRaised (Text.pack (show why))))
+                  -- classified against the owner's gate, read after the action ended: no text is made here
+                  Just (ActionRaised why) → do
+                    standing ← maybe IssuerLive (const IssuerEnded) <$> readVulkanActionGate (vulkanController host)
+                    pure (Just (StepRaised (classifyExit standing (Left why))))
       , ownerRelease = \after →
           requestVulkanRelease host (VulkanAction (\_ → atomically after)) >>= \case
             Left refusal → pure (Left (Text.pack (refusalText refusal)))

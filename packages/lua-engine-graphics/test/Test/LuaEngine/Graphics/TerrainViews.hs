@@ -26,6 +26,7 @@ import Data.Word (Word32, Word64)
 import GHC.Stats (RTSStats (..), getRTSStats, getRTSStatsEnabled)
 import Hetoimasia.Foundation.Admission (admissionToken, closeAdmission, newAdmissionIO)
 import Hetoimasia.Foundation.Log (callbackSink, defaultLogFilter, mkLogger)
+import Hetoimasia.Foundation.Exit (IssuerStanding (..), classifyExit)
 import Hetoimasia.Foundation.Messaging.Payload (prepare)
 import Hetoimasia.Foundation.Worker (withWorkerGroup)
 import Hetoimasia.GPU.Vulkan.GLFW (Refusal (RefusedDeviceAbsent), UploadRefusal (UploadClosed), UploadState (UploadLost), UploadsUnavailable (..), VulkanUploadRefusal (..))
@@ -560,14 +561,16 @@ runOwner rig = go (100000 ∷ Int)
         Nothing → pure ()
         Just (step, outcome) → do
           -- a target fault armed in this step lasts for this step alone; a step that raises is answered as the host
-          -- answers it (which ends the views' owner), and its exception goes on to the example
+          -- answers it, classified against the owner's standing, and its exception goes on to the example
           ran ← tryWithContext @SomeException (step (stepHands rig))
           atomically disarm
           -- the native stand-in's uploads progress, and its released buffers are destroyed, after each step
           forM_ (rigNative rig) settleNative
           case ran of
-            Left failure@(ExceptionWithContext _ raised) → do
-              atomically (writeTVar outcome (Just (StepRaised (Text.pack (displayException raised)))))
+            Left failure → do
+              atomically $ do
+                standing ← maybe IssuerLive (const IssuerEnded) <$> readTVar (rigOwnerEnded rig)
+                writeTVar outcome (Just (StepRaised (classifyExit standing (Left failure))))
               rethrowIO failure
             Right () → atomically (writeTVar outcome (Just StepRan)) >> go (n - 1)
 
@@ -684,6 +687,18 @@ quiesce rig target = do
   adopt rig target
   meetBarriers rig
   runOwner rig
+
+-- Settle through the one step whose revalidation the example made raise: the step relinquishes its build to the sweep
+-- and its original exception goes on to the owner's action (here, the example) with its context; the views' owner
+-- outlives it, and settling goes on until the condition holds.
+settleThroughRaise ∷ Rig → STM Bool → IO ()
+settleThroughRaise rig done = do
+  raised ← tryWithContext @ErrorCall (settleUntil rig done)
+  case raised of
+    Left (ExceptionWithContext _ failure) → failure `shouldBe` ErrorCall "the held target's facts could not be read"
+    Right () → expectationFailure "the step's revalidation never raised"
+  atomically (readTVar (rigOwnerEnded rig)) `shouldReturn` Nothing
+  settleUntil rig done
 
 -- Install a held target's metrics as its holder does: prepared, then written with the facts' next version.
 heldMetrics ∷ HeldTarget → Maybe TargetMetrics → IO ()
@@ -2084,7 +2099,7 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         readTVarIO (rigGrants rig) `shouldReturn` 0
 
   describe "the settlement hand-off" $ do
-    it "leaves a refused build whose revalidation raises or waits to the sweep, which returns its slot once and keeps the refusal's cause and the revalidation's; the view goes on and publishes" $
+    it "leaves a refused build whose revalidation raises or waits to the sweep, which returns its slot once and keeps the refusal's cause and the revalidation's; a raise reaches the owner's action as the original exception, the owner goes on, and the view publishes" $
       forM_ [(HeldRaises, "its revalidation raised"), (HeldWaits, "its revalidation would wait")] $ \(fault, because) →
         withRig defaultOptions {optProfile = smallProfile {profileSlots = 4, profileQuads = 2048}} $ \rig → do
           target ← newTarget 1
@@ -2092,7 +2107,9 @@ spec = describe "terrain views (TRA-9 v2)" $ do
             writeTVar (rigFailNext rig) [Just (BuildFailed "an injected refusal" NotAllocated)]
             writeTVar (rigFault rig) (Just (targetHeld target, fault, False))
           view ← openOn rig target
-          settleUntil rig (publishedAtLeast view 1)
+          if fault == HeldRaises
+            then settleThroughRaise rig (publishedAtLeast view 1)
+            else settleUntil rig (publishedAtLeast view 1)
           -- the refused build's slot came back once: the target holds exactly the parts it lists
           reading ← atomically (readTerrainViews (rigViews rig))
           listed ← atomically (readingListed <$> readView view)
@@ -2147,7 +2164,7 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         before ← atomically (targetScenes target)
         first ← openOn rig target
         -- the sweep retires the registered chunk privately; its release waits for its destruction
-        settleUntil rig ((\now → not (null (serviceSwept now)) && serviceDisposing now >= 1) <$> reading)
+        settleThroughRaise rig ((\now → not (null (serviceSwept now)) && serviceDisposing now >= 1) <$> reading)
         map fst <$> atomically (targetScenes target) `shouldReturn` map fst before
         _ ← closeView first
         atomically (writeTVar (rigAdmission rig) Nothing)
@@ -2176,7 +2193,7 @@ spec = describe "terrain views (TRA-9 v2)" $ do
           writeTVar (rigFault rig) (Just (targetHeld firstTarget, HeldRaises, False))
           writeTVar (nativeHoldClaim native) True
         first ← openOn rig firstTarget
-        settleUntil rig ((== Just 0) <$> readTVar (rigAdmitBudget rig))
+        settleThroughRaise rig ((== Just 0) <$> readTVar (rigAdmitBudget rig))
         servicePending <$> atomically reading `shouldReturn` 1
         [(firstKey, given)] ← readTVarIO (nativeGrants native)
         -- the first view ends, so nothing of it admits again; the second view's one grant is held before its spend

@@ -115,6 +115,7 @@ import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Word (Word64)
 import GHC.Clock (getMonotonicTimeNSec)
+import qualified Hetoimasia.Foundation.Exit as Exit
 import Hetoimasia.Foundation.Messaging.Payload (Prepared, prepare)
 import Hetoimasia.Foundation.Resource (composeCleanup, withResourceLabelled)
 import Hetoimasia.Foundation.Worker (StartOutcome (..), closeWorkerGroup, requestStop, startWorker, stopRequested, withWorkerGroup, workerDefinition)
@@ -813,9 +814,13 @@ ownerGone service =
     Nothing → do
       failed ← ownerEnded (portOwner (svPorts service))
       outcome ← readTVar (svStep service) >>= maybe (pure Nothing) id
+      -- a step's exception of its own, while the owner lives, ends nothing: the owner goes on and the step's work is
+      -- the sweep's; a cancellation or a terminal failure ends admission
       let refused = case outcome of
             Just (StepRefused why) → Just ("the graphics owner refused a step: " <> why)
-            Just (StepRaised why) → Just ("a step raised: " <> why)
+            Just (StepRaised (Exit.Cancelled _)) → Just "a step was cancelled"
+            Just (StepRaised (Exit.Terminal (Left why))) → Just ("a step was refused for good: " <> why)
+            Just (StepRaised (Exit.Terminal (Right _))) → Just "a step raised once the graphics owner had ended"
             _ → Nothing
           gone = (("the graphics owner ended: " <>) <$> failed) <|> refused
       for_ gone (endOwner service)
@@ -2172,12 +2177,14 @@ stepBuilding service hands vs serial prep candidate
                 tryWithContext @SomeException (atomically ((Just <$> witnessOf service vs) `orElse` pure Nothing) >>= traverse (\seen → seen <$ evaluate (seen == seen)) >>= \seen → seen <$ when (isJust seen) (hookCollecting (portCopyHooks (svPorts service)))) >>= \case
                   Left failure
                     | asynchronous failure → cancelled failure
-                    -- a revalidation that raised: the sweep collects the build, with the cause, and the step yields
-                    -- a cancellation met while describing the cause: the build is relinquished all the same, then it goes on
+                    -- a revalidation that raised: the sweep collects the build, with the cause, and then the original
+                    -- exception goes on, with its context, to the owner's action, which the owner outlives; a
+                    -- cancellation met while describing the cause is relinquished all the same, and goes on instead
                     | ExceptionWithContext _ raised ← failure → do
                         (why, pending) ← describedText raised
                         atomically (relinquish service key ("its revalidation raised: " <> why))
-                        Just False <$ mapM_ rethrowIO pending
+                        mapM_ rethrowIO pending
+                        rethrowIO failure
                   -- the revalidation would wait: the sweep collects the build, and the step yields
                   Right Nothing → Just False <$ atomically (relinquish service key "its revalidation would wait")
                   Right (Just evidence) →
