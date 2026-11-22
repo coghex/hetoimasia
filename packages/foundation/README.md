@@ -201,17 +201,21 @@ their dependency direction and [its state table](../../docs/workers.md#state)
 for the module that owns and writes each piece of state.
 
 Ownership transactions have two public modules, `OwnerTx` and `Exit`, in the
-main library. The representation is `OwnerTx.Representation` in the private
-`internal` sublibrary; the issuer bridge, `OwnerTx.Issuer`, is the public
-`owner-tx-issuer` sublibrary's one module. Both are guarded: see
-[Ownership transactions](#ownership-transactions).
+main library. The private `internal` sublibrary holds the representation,
+`OwnerTx.Representation`; the cells, `OwnerTx.Cells`, which do not import it;
+and `OwnerTx.Operations`, the listed adapter of the STM-free operations the
+public module re-exports. The issuer bridge, `OwnerTx.Issuer`, is the public
+`owner-tx-issuer` sublibrary's one module. The representation and the bridge
+are guarded: see [Ownership transactions](#ownership-transactions).
 
 | Logical module | Source path | Cabal component | Visibility | Purpose |
 | --- | --- | --- | --- | --- |
 | `Hetoimasia.Foundation.Admission` | `src/Hetoimasia/Foundation/Admission.hs` | main library | exposed | An admission its owner opens once and closes once (`Admission`, the only capability that closes it), and the read-only `AdmissionToken` others hold: they read whether it is open and compare it by identity, a read of the owner's cell and nothing more, so a commit may verify one |
 | `Hetoimasia.Foundation.OwnerTx` | `src/Hetoimasia/Foundation/OwnerTx.hs` | main library | exposed | The abstract ownership transaction and `commit`; owner cells by value, read-only capabilities, and revisioned publications of prepared values |
 | `Hetoimasia.Foundation.Exit` | `src/Hetoimasia/Foundation/Exit.hs` | main library | exposed | `classifyExit`, the one classification of an operation's end by its issuer's standing, with its decision table; `tryExit` and `deliverExit` |
-| `Hetoimasia.Foundation.OwnerTx.Representation` | `internal/Hetoimasia/Foundation/OwnerTx/Representation.hs` | `internal` sublibrary | package-private, guarded | The transaction's and its cells' representation; bridge-equivalent |
+| `Hetoimasia.Foundation.OwnerTx.Representation` | `internal/Hetoimasia/Foundation/OwnerTx/Representation.hs` | `internal` sublibrary | package-private, guarded | The transaction's representation; bridge-equivalent |
+| `Hetoimasia.Foundation.OwnerTx.Cells` | `internal/Hetoimasia/Foundation/OwnerTx/Cells.hs` | `internal` sublibrary | package-private | The cells' representations and the reads waiting readers make in ordinary `STM`; no transaction |
+| `Hetoimasia.Foundation.OwnerTx.Operations` | `internal/Hetoimasia/Foundation/OwnerTx/Operations.hs` | `internal` sublibrary | package-private, listed adapter | `commit` and the transaction's cell, capability and publication reads and writes, STM-free in their types |
 | `Hetoimasia.Foundation.OwnerTx.Issuer` | `owner-tx-issuer/Hetoimasia/Foundation/OwnerTx/Issuer.hs` | `owner-tx-issuer` sublibrary | public, guarded | The issuer bridge: `fromIssuerSTM` and the issuer-side cell updates that take functions |
 | `Hetoimasia.Foundation.Log` | `src/Hetoimasia/Foundation/Log.hs` | main library | exposed | Public logging facade; logger construction, scoped context, flushing, emission, and call-site extraction |
 | `Hetoimasia.Foundation.Log.Base` | `src/Hetoimasia/Foundation/Log/Base.hs` | main library | hidden | Levels, source locations, and the format and variable-name options |
@@ -277,8 +281,8 @@ only issuer-controlled inputs, validates before its first write, answers a
 refusal as data, and finishes without waiting or raising; review and the
 issuer's outcome tests check this, its callees included. Only the importers and
 dependents `tools/validation/owner_tx_issuers.json` lists may use the bridge or
-the representation, and nothing may re-export either or export a conversion
-between `STM` and the transaction under any name; the repository's guard
+the representation, and nothing else may re-export either or export anything
+whose type contains `STM`; the repository's guard
 enforces it with Cabal's and GHC's own facts against a reviewed typed export
 contract ([the import guard](../../docs/validation.md#the-issuer-bridges-import-guard)).
 
