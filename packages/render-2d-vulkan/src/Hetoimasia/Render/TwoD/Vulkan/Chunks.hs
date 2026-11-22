@@ -371,7 +371,8 @@ giveBack grant = do
   modifyTVar' (grantRegistry grant) (\held → held {ledgerFree = chunkRefIndex (grantReference grant) : ledgerFree held})
 
 -- | Spend a grant on the graphics owner's thread, and settle it once, whatever the exit. The grant moves from reserved
--- to spending in one transaction (a grant not reserved, or another registry's, is refused and changes nothing). Then
+-- to spending in one transaction (a grant not reserved, or another registry's, is refused, changes nothing and settles
+-- nothing). Then
 -- the chunk's buffer is made and recorded on the grant as it is made, the reserved room is spent on the upload that
 -- fills it (the uploads mark the room spent in the transaction that hands it to that upload), and the chunk is
 -- registered under the granted reference. Nothing competes for capacity again.
