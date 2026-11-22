@@ -563,14 +563,24 @@ frame leave it as it was. Only a live view incarnation's receipt moves: it is
 opened at the view's commit and forgotten at its end, with whatever of it was
 recorded or noted and not yet promoted. A caller that sets
 `vulkanFrameObserver` after `configureScenes` keeps the receipts with
-`sceneFrameObserver`. A view reads its target's geometry live
-(`vtGeometry`): **Unknown** while incomplete, **Zero** for an observed zero
-dimension in either the logical or the framebuffer extent (whatever else is
-missing), **Extent** for complete positive metrics. A window's comes from its
-live observation (`targetGeometry`, `windowGeometry`), whatever frame it
-recorded last: a recorded frame's metrics (`latestFrameMetrics`) describe that
-frame, for drawing and picking. An offscreen registration's metrics cell gives
-the same three values. An open on a target that shows nothing and whose
+`sceneFrameObserver`.
+
+A view's **target** is closed data (`ViewSurface`) its session reads only
+through concrete readers, never through code its caller supplies: a window
+incarnation through the capability its host issues (`windowViewTarget` over
+`targetView`), with the caller's original leases; a registered offscreen target
+through its host, its id and the facts its registrant sets
+(`offscreenViewTarget`, `newOffscreenFacts`, `setOffscreenUsable`,
+`setOffscreenMetrics`); or a target held in memory (`HeldTarget`). A fact that
+can change and change back carries a version its writer advances in the same
+commit: a window's observation's snapshot cursor, a generation for the others.
+A view reads its target's geometry live (`surfaceGeometry`): **Unknown** while
+incomplete, **Zero** for an observed zero dimension in either the logical or
+the framebuffer extent (whatever else is missing), **Extent** for complete
+positive metrics. A window's comes from its live observation
+(`windowGeometryOf`), whatever frame it recorded last: a recorded frame's
+metrics (`latestFrameMetrics`) describe that frame, for drawing and picking.
+An offscreen registration's facts give the same three values. An open on a target that shows nothing and whose
 geometry is unknown publishes the real empty revision in its commit, which asks
 for a first frame. A target already showing a scene (an M1 scene, say) keeps it through the
 attach, and through a refused first candidate, until the view's first revision
@@ -699,10 +709,17 @@ publication`, one bounded unit a step, all for the **destination camera**:
    the owner takes the slot, the renderer's reference and the uploads' queue
    place and staging region for that part in one transaction (`handReserve`;
    a refused grant takes none of them). It then makes, fills and registers the
-   chunk (`grantSpend`), at most `profileBuilds` a step. Each build is settled
-   once, whatever its exit, and the view's ledger moves in the renderer's
-   settlement transaction: the chunk goes to the candidate, or to disposal if
-   the stage was replaced meanwhile. A waiting candidate keeps its built prefix and is
+   chunk (`grantSpend`), at most `profileBuilds` a step; the grant is recorded
+   as one pending build of the view, holding its slot. The renderer seals each
+   build's outcome into its receipt, whatever its exit. The view then
+   revalidates its work in a read-only transaction of its own, and collects the
+   receipt in another that runs no caller code: when the revalidation's
+   evidence still matches the live versions and the candidate's next part is
+   this one, the chunk goes to the candidate; otherwise to private
+   retirement. A build the view cannot collect (its spend cancelled, its
+   revalidation raised or would wait, the view closed, its step gone) is
+   collected by the sweep instead, which retires a chunk privately and keeps a
+   failure's charge, and asks for the owner's next step. A waiting candidate keeps its built prefix and is
    armed in the transaction that found it blocked. The watcher asks for a step
    once the same decision, or the candidate's own chunk standings and
    publication room, let it go on. A failure after a grant refuses the
@@ -711,9 +728,9 @@ publication`, one bounded unit a step, all for the **destination camera**:
    destruction; a release that failed or raised keeps it as a failure naming
    the buffer, with the build's cause and the release's. A buffer awaiting its
    destruction keeps the build's cause too, so a destruction that fails is
-   recorded with both. A build that raises or is cancelled is settled the
-   same way before the exception goes on; a synchronous one is then reported
-   as that refusal, and a cancellation goes on.
+   recorded with both. A build that raised synchronously is collected the same
+   way, its cause in the refusal. Only the attempt that took the grant, still
+   current, records a refusal; the sweep never does.
 8. **Publication**, once every chunk is ready, in the transaction that rechecks
    the claim, the target, the session, the intent, the metrics and the arena's
    content and knowledge revisions, and applies the view's runtime demand under
