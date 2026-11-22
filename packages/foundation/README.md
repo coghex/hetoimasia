@@ -203,20 +203,20 @@ for the module that owns and writes each piece of state.
 Ownership transactions have two public modules, `OwnerTx` and `Exit`, in the
 main library. The private `internal` sublibrary holds the representation,
 `OwnerTx.Representation`; the cells, `OwnerTx.Cells`, which do not import it;
-and `OwnerTx.Operations`, the listed adapter of the STM-free operations the
+and `OwnerTx.Operations`, the adapter of the STM-free operations the
 public module re-exports. The issuer bridge, `OwnerTx.Issuer`, is the public
 `owner-tx-issuer` sublibrary's one module. The representation and the bridge
-are guarded: see [Ownership transactions](#ownership-transactions).
+are protected modules: see [Ownership transactions](#ownership-transactions).
 
 | Logical module | Source path | Cabal component | Visibility | Purpose |
 | --- | --- | --- | --- | --- |
 | `Hetoimasia.Foundation.Admission` | `src/Hetoimasia/Foundation/Admission.hs` | main library | exposed | An admission its owner opens once and closes once (`Admission`, the only capability that closes it), and the read-only `AdmissionToken` others hold: they read whether it is open and compare it by identity, a read of the owner's cell and nothing more, so a commit may verify one |
 | `Hetoimasia.Foundation.OwnerTx` | `src/Hetoimasia/Foundation/OwnerTx.hs` | main library | exposed | The abstract ownership transaction and `commit`; owner cells by value, read-only capabilities, and revisioned publications of prepared values |
 | `Hetoimasia.Foundation.Exit` | `src/Hetoimasia/Foundation/Exit.hs` | main library | exposed | `classifyExit`, the one classification of an operation's end by its issuer's standing, with its decision table; `tryExit` and `deliverExit` |
-| `Hetoimasia.Foundation.OwnerTx.Representation` | `internal/Hetoimasia/Foundation/OwnerTx/Representation.hs` | `internal` sublibrary | package-private, guarded | The transaction's representation; bridge-equivalent |
+| `Hetoimasia.Foundation.OwnerTx.Representation` | `internal/Hetoimasia/Foundation/OwnerTx/Representation.hs` | `internal` sublibrary | package-private, protected | The transaction's representation; bridge-equivalent |
 | `Hetoimasia.Foundation.OwnerTx.Cells` | `internal/Hetoimasia/Foundation/OwnerTx/Cells.hs` | `internal` sublibrary | package-private | The cells' representations and the reads waiting readers make in ordinary `STM`; no transaction |
-| `Hetoimasia.Foundation.OwnerTx.Operations` | `internal/Hetoimasia/Foundation/OwnerTx/Operations.hs` | `internal` sublibrary | package-private, listed adapter | `commit` and the transaction's cell, capability and publication reads and writes, STM-free in their types |
-| `Hetoimasia.Foundation.OwnerTx.Issuer` | `owner-tx-issuer/Hetoimasia/Foundation/OwnerTx/Issuer.hs` | `owner-tx-issuer` sublibrary | public, guarded | The issuer bridge: `fromIssuerSTM` and the issuer-side cell updates that take functions |
+| `Hetoimasia.Foundation.OwnerTx.Operations` | `internal/Hetoimasia/Foundation/OwnerTx/Operations.hs` | `internal` sublibrary | package-private | `commit` and the transaction's cell, capability and publication reads and writes, STM-free in their types |
+| `Hetoimasia.Foundation.OwnerTx.Issuer` | `owner-tx-issuer/Hetoimasia/Foundation/OwnerTx/Issuer.hs` | `owner-tx-issuer` sublibrary | public, protected | The issuer bridge: `fromIssuerSTM` and the issuer-side cell updates that take functions |
 | `Hetoimasia.Foundation.Log` | `src/Hetoimasia/Foundation/Log.hs` | main library | exposed | Public logging facade; logger construction, scoped context, flushing, emission, and call-site extraction |
 | `Hetoimasia.Foundation.Log.Base` | `src/Hetoimasia/Foundation/Log/Base.hs` | main library | hidden | Levels, source locations, and the format and variable-name options |
 | `Hetoimasia.Foundation.Log.Component` | `src/Hetoimasia/Foundation/Log/Component.hs` | main library | hidden | The validated `Component`, its constructors and operations, and shared quoting |
@@ -279,12 +279,31 @@ An issuer keeps its own `STM` and state and embeds a concrete operation with
 `fromIssuerSTM` from the `owner-tx-issuer` sublibrary. Every embedded path reads
 only issuer-controlled inputs, validates before its first write, answers a
 refusal as data, and finishes without waiting or raising; review and the
-issuer's outcome tests check this, its callees included. Only the importers and
-dependents `tools/validation/owner_tx_issuers.json` lists may use the bridge or
-the representation, and nothing else may re-export either or export anything
-whose type contains `STM`; the repository's guard
-enforces it with Cabal's and GHC's own facts against a reviewed typed export
-contract ([the import guard](../../docs/validation.md#the-issuer-bridges-import-guard)).
+issuer's outcome tests check this, its callees included.
+
+**What the guard checks.** From Cabal's facts alone
+([the import guard](../../docs/validation.md#the-issuer-bridges-import-guard)):
+the components that depend on the `owner-tx-issuer` sublibrary in any
+buildable configuration are exactly those `tools/validation/owner_tx_issuers.json`
+lists; no Cabal `reexported-modules` or `mixins` entry exposes or renames
+`OwnerTx.Issuer` or `OwnerTx.Representation`, in a listed component too; and
+neither module is declared anywhere but here, the representation's library
+private. Package visibility then keeps the bridge out of reach of every client
+built against the main library.
+
+**What issuer review checks.** Within a listed component any module may import
+the bridge, so review reads that component's modules, and Foundation's own
+consumers of the representation, for where issuer code runs and what reaches
+its clients:
+
+- no export, outside the bridge and the representation, that converts a
+  caller's `STM` to or from `OwnerTx`, directly or through a wrapper, a class
+  method or a re-export;
+- no instance on `STM` or on `OwnerTx`, `OwnerCell`, `ReadOnly`, `Publisher` or
+  `Publication`, and no export equivalent to the representation;
+- the cells and operations stay split as above, handles stay opaque,
+  publication payloads nominal, writes prepared, and `Exit` keeps the original
+  context. Safe observation and publication through `STM` stay public.
 
 `classifyExit` reads an operation's result beside its issuer's standing, live,
 ended, or ended by an escaped construction failure, and answers one `Exit`: a
