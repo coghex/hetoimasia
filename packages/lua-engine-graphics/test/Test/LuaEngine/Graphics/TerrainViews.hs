@@ -2111,6 +2111,21 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         [why | (1, _, why) ← serviceSwept now] `shouldSatisfy` any (\why → all (`Text.isInfixOf` why) ["an injected refusal", "thread killed"])
         readTVarIO (rigGrants rig) `shouldReturn` 0
 
+    it "relinquishes a build whose revalidation raised an exception whose description is cancelled, with the fallback cause, before the cancellation ends the views' owner: the sweep returns its slot once" $
+      withRig defaultOptions {optProfile = smallProfile {profileSlots = 4, profileQuads = 2048}} $ \rig → do
+        let reading = readTerrainViews (rigViews rig)
+        target ← newTarget 1
+        atomically $ do
+          writeTVar (rigFailNext rig) [Just (BuildFailed "an injected refusal" NotAllocated)]
+          writeTVar (rigFault rig) (Just (targetHeld target, HeldRaisesUnspeakable, False))
+        view ← openOn rig target
+        try @AsyncException (settleUntil rig (publishedAtLeast view 1)) `shouldReturn` Left ThreadKilled
+        eventually ((\now → servicePending now == 0 && not (null (serviceSwept now))) <$> reading)
+        now ← atomically reading
+        Map.findWithDefault 0 1 (serviceOccupied now) `shouldBe` 0
+        [why | (1, _, why) ← serviceSwept now] `shouldSatisfy` any (\why → all (`Text.isInfixOf` why) ["an injected refusal", "its revalidation raised: an exception whose description raised"])
+        readTVarIO (rigGrants rig) `shouldReturn` 0
+
     it "retires a registered build whose revalidation raises in place of its view: the target keeps its scene, the chunk's destruction holds a reopened view back while pending and frees its slot once" $
       withRig defaultOptions {optProfile = smallProfile {profileSlots = 4, profileQuads = 2048}} $ \rig → do
         let reading = readTerrainViews (rigViews rig)

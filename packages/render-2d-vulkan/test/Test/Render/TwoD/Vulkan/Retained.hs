@@ -17,7 +17,7 @@ import Control.Monad (forM_)
 import Control.Concurrent.STM (atomically, newTVarIO, readTVar, readTVarIO, retry, writeTVar)
 import Data.Maybe (catMaybes)
 import qualified Data.Map.Strict as Map
-import Control.Exception (AsyncException (ThreadKilled), ErrorCall (ErrorCall), Exception (displayException), ExceptionWithContext (ExceptionWithContext), SomeException, rethrowIO, throwIO, toException, tryWithContext)
+import Control.Exception (AsyncException (ThreadKilled), ErrorCall (ErrorCall), Exception (displayException), ExceptionWithContext (ExceptionWithContext), SomeException, rethrowIO, throw, throwIO, toException, tryWithContext)
 import Control.Exception.Annotation (ExceptionAnnotation (displayExceptionAnnotation))
 import Control.Exception.Context (addExceptionAnnotation, emptyExceptionContext, getExceptionAnnotations)
 import Data.ByteString (ByteString)
@@ -211,6 +211,15 @@ instance Show Indescribable where
 
 instance Exception Indescribable where
   displayException _ = error "the description raised"
+
+-- | An exception whose description is cancelled.
+data Unspeakable = Unspeakable
+
+instance Show Unspeakable where
+  show _ = "Unspeakable"
+
+instance Exception Unspeakable where
+  displayException _ = throw ThreadKilled
 
 -- | Where an injected exception was thrown, carried as its annotation.
 newtype ThrowSite = ThrowSite String
@@ -640,6 +649,36 @@ refusalSpec = describe "refusing a build" $ do
       claimsOf grant >>= \case
         [Left refused@(BuildRefused (BuildRaised "an exception whose description raised") (AllocationReleased _ (Right ())))] → length (show refused) `shouldSatisfy` (> 0)
         other → expectationFailure ("expected the fixed text with the released buffer, found " <> show other)
+      reservedOf setup `shouldReturn` 0
+
+  it "seals a spend whose exception's description is cancelled: the fallback text is sealed, the buffer released and the room returned before the cancellation goes on" $
+    bounded . withSetup $ \setup → do
+      let raising = (trackedBuilders setup) {bufferUploads = observingSpends (\_ _ _ _ → throwIO Unspeakable) (bufferUploads (trackedBuilders setup))}
+      prepared ← either (fail . show) pure (prepareRetainedChunk artMarks ChunkWorldDepth DeriveBounds Map.empty [cutAt 0 1])
+      grant ← atomically (admitRetainedChunk (bufferUploads raising) (setupRetained setup) prepared) >>= either (fail . show) pure
+      tryWithContext @AsyncException (spendChunkGrant raising (setupRetained setup) grant) >>= \case
+        Left (ExceptionWithContext _ ThreadKilled) → pure ()
+        other → expectationFailure ("expected the cancellation, found " <> either (const "another exception") show other)
+      claimsOf grant >>= \case
+        [Left (BuildRefused (BuildRaised "an exception whose description raised") (AllocationReleased _ (Right ())))] → pure ()
+        other → expectationFailure ("expected the fixed text with the released buffer, found " <> show other)
+      reservedOf setup `shouldReturn` 0
+
+  it "seals a refused spend whose release raised an exception whose description is cancelled: sealed with the buffer and the fallback text, the room returned, then the cancellation goes on" $
+    bounded . withSetup $ \setup → do
+      let raising =
+            (trackedBuilders setup)
+              { bufferUploads = observingSpends (\_ _ _ _ → pure (Left (BufferUploadRefused UploadClosed))) (bufferUploads (trackedBuilders setup))
+              , releaseBuffer = \_ → throwIO Unspeakable
+              }
+      prepared ← either (fail . show) pure (prepareRetainedChunk artMarks ChunkWorldDepth DeriveBounds Map.empty [cutAt 0 1])
+      grant ← atomically (admitRetainedChunk (bufferUploads raising) (setupRetained setup) prepared) >>= either (fail . show) pure
+      tryWithContext @AsyncException (spendChunkGrant raising (setupRetained setup) grant) >>= \case
+        Left (ExceptionWithContext _ ThreadKilled) → pure ()
+        other → expectationFailure ("expected the cancellation, found " <> either (const "another exception") show other)
+      claimsOf grant >>= \case
+        [Left (BuildRefused (BuildUploadRefused UploadClosed) (AllocationReleaseRaised _ "an exception whose description raised"))] → pure ()
+        other → expectationFailure ("expected the release's fallback text, found " <> show other)
       reservedOf setup `shouldReturn` 0
 
   it "sweeps a sealed registration whose collector never ran at the registry's teardown: claimed once, with its chunk, and the registry holds no receipt after" $

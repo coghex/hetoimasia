@@ -129,7 +129,7 @@ import Control.Exception.Context (ExceptionContext, addExceptionAnnotation, getE
 import Control.Monad (forM, when)
 import Data.Foldable (for_)
 import Data.Functor ((<&>))
-import Data.Maybe (isJust)
+import Data.Maybe (fromMaybe, isJust)
 import qualified Data.ByteString as ByteString
 import Data.List.NonEmpty (NonEmpty)
 import Data.Map.Strict (Map)
@@ -506,7 +506,11 @@ spendChunkGrant builders (Retained ledger) grant = mask_ $ do
       (receipt, cleanupRaised) ← case outcome of
         Right (Right held) → pure (Right held, Nothing)
         Right (Left refusal) → unregistered made refusal
-        Left (ExceptionWithContext _ raised) → raisedText raised >>= unregistered made . BuildRaised
+        -- a cancellation met while describing the exception is carried through the cleanup and the seal, then goes on
+        Left (ExceptionWithContext _ raised) → do
+          (text, pending) ← raisedText raised
+          (refused, cleanup) ← unregistered made (BuildRaised text)
+          pure (refused, maybe cleanup Just pending)
       -- the seal: the grant's disposition and its receipt, in one transaction with no caller code
       answer ← atomically $ do
         answer ← case receipt of
@@ -562,7 +566,7 @@ spendChunkGrant builders (Retained ledger) grant = mask_ $ do
         tryWithContext @SomeException (releaseBuffer builders buffer >>= evaluate >>= either (fmap Left . settled) (fmap Right . evaluate)) >>= \case
           Right released → pure (Left (BuildRefused cause (AllocationReleased buffer released)), Nothing)
           Left failure@(ExceptionWithContext _ raised) →
-            raisedText raised <&> \why → (Left (BuildRefused cause (AllocationReleaseRaised buffer why)), Just failure)
+            raisedText raised <&> \(why, pending) → (Left (BuildRefused cause (AllocationReleaseRaised buffer why)), Just (fromMaybe failure pending))
     register held = do
       writeTVar standing GrantSealed
       modifyTVar' ledger (\current → current {ledgerEntries = Map.insert (grantReference grant) (Entry (preparedChunk prepared) held False) (ledgerEntries current)})
@@ -570,14 +574,17 @@ spendChunkGrant builders (Retained ledger) grant = mask_ $ do
     cancellation (ExceptionWithContext _ raised) = isJust (fromException raised ∷ Maybe SomeAsyncException)
 
 -- An exception's text, rendered and forced here, before it is sealed: a description that itself raises is answered with a
--- fixed text, so what a receipt keeps is plain data. The exception itself still goes on.
-raisedText ∷ SomeException → IO Text
+-- fixed text, so what a receipt keeps is plain data, and a cancellation met while describing it is answered with the
+-- same text and handed back, for the caller to carry through its cleanup and seal and then raise. Nothing escapes here.
+raisedText ∷ SomeException → IO (Text, Maybe (ExceptionWithContext SomeException))
 raisedText raised =
-  tryWithContext @SomeException (evaluate (Text.pack (displayException raised)) >>= \text → text <$ evaluate (Text.length text)) >>= \case
-    Right text → pure text
+  tryWithContext @SomeException (evaluate (Text.pack (displayException raised)) >>= \text → text <$ evaluate (Text.length text)) <&> \case
+    Right text → (text, Nothing)
     Left failure@(ExceptionWithContext _ inner)
-      | isJust (fromException inner ∷ Maybe SomeAsyncException) → rethrowIO failure
-      | otherwise → pure "an exception whose description raised"
+      | isJust (fromException inner ∷ Maybe SomeAsyncException) → (indescribable, Just failure)
+      | otherwise → (indescribable, Nothing)
+  where
+    indescribable = "an exception whose description raised"
 
 -- A refusal evaluated in full, where its exception is the step's that made it: its text is what a receipt keeps.
 settled ∷ Show a ⇒ a → IO a

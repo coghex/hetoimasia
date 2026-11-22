@@ -49,7 +49,7 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView.Surface
   ) where
 
 import Control.Concurrent.STM (STM, TVar, modifyTVar', newTVar, readTVar, retry, throwSTM, writeTVar)
-import Control.Exception (AsyncException (ThreadKilled), ErrorCall (ErrorCall))
+import Control.Exception (AsyncException (ThreadKilled), ErrorCall (ErrorCall), Exception (displayException), throw)
 import Control.Monad (when)
 import Data.Functor ((<&>))
 import qualified Data.Map.Strict as Map
@@ -178,9 +178,17 @@ data HeldTarget = HeldTarget
   , heldFault ∷ !(TVar (Maybe HeldFault))
   }
 
--- | How a held target's revalidation read fails, while its holder says so: it raises, waits, or is cancelled.
-data HeldFault = HeldRaises | HeldWaits | HeldCancelled
+-- | How a held target's revalidation read fails, while its holder says so: it raises, waits, or is cancelled; or it
+-- raises an exception whose description is itself cancelled.
+data HeldFault = HeldRaises | HeldWaits | HeldCancelled | HeldRaisesUnspeakable
   deriving (Eq, Show)
+
+-- An exception whose description is cancelled ('HeldRaisesUnspeakable').
+data Unspeakable = Unspeakable
+  deriving (Show)
+
+instance Exception Unspeakable where
+  displayException _ = throw ThreadKilled
 
 -- | Make the held target's revalidation read fail, or read again.
 setHeldFault ∷ HeldTarget → Maybe HeldFault → STM ()
@@ -246,6 +254,7 @@ surfaceRevalidation = \case
       Just HeldRaises → throwSTM (ErrorCall "the held target's facts could not be read")
       Just HeldWaits → retry
       Just HeldCancelled → throwSTM ThreadKilled
+      Just HeldRaisesUnspeakable → throwSTM Unspeakable
   _ → pure ()
 
 -- | Whether the target holds a published scene (an M1 scene, say), whose frame is or was drawn.
