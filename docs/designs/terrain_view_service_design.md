@@ -324,7 +324,9 @@ Remove the `interrupted` callback, the spend adapter’s `guarded` conversion, a
 | Upload refuses before binding and release raises `ThreadKilled` | Cancellation carries the upload refusal, buffer identity and release failure. The failed buffer remains charged. A competing build with its own target room can acquire the returned reference capacity, queue place and staging range. |
 | Public `buildRetainedChunk` is cancelled after allocation and release refuses or raises synchronously | The caller catches the original cancellation and reads the exact buffer and cleanup outcome from its settlement annotation. |
 
-## Proposal for owner approval · Settlement hand-off and post-bind upload exits
+## Approved amendment for #714 · Settlement hand-off and post-bind upload exits
+
+The owner approved this section at `ec219909f7` with “Y” on 2026-11-22 at 02:16:47 UTC.
 
 **Proposed #714 amendment.** The renderer seals the spend and retains its receipt. The view collects it in a second transaction. Each owner commits its own transitions using strict data and operations on its own or explicitly shared records. Caller-supplied actions run outside those commits. From admission until transfer, one scoped cleanup owns every exit. This replaces the same-transaction view transfer in the [approved spend amendment](https://github.com/coghex/hetoimasia/issues/714#issuecomment-7071245012). Its four dispositions describe the outcome across seal and collection. Build-count consumption belongs to collection or sweep reconciliation.
 
