@@ -2278,7 +2278,7 @@ sweptBuild service key entry outcome why = do
 
 -- Whether a pending build is sealed: the sweep or its collector can take it now.
 anySealed ∷ TerrainViews k → STM Bool
-anySealed service = readTVar (svPending service) >>= fmap or . mapM (receiptSealed . pbReceipt) . Map.elems
+anySealed service = readTVar (svPending service) >>= fmap or . mapM (fmap isJust . receiptOutcome . pbReceipt) . Map.elems
 
 -- Builds no step will collect: once no owner step is queued or running, every sealed pending build is left to the
 -- sweep. Answers whether it left any.
@@ -2289,7 +2289,7 @@ orphanedBuilds service = do
     then pure False
     else do
       pending ← Map.toList <$> readTVar (svPending service)
-      sealed ← filterM (receiptSealed . pbReceipt . snd) [(key, entry) | (key, entry) ← pending, isNothing (pbSweep entry)]
+      sealed ← filterM (fmap isJust . receiptOutcome . pbReceipt . snd) [(key, entry) | (key, entry) ← pending, isNothing (pbSweep entry)]
       forM_ sealed (\(key, _) → relinquish service key "no owner step collected it")
       pure (not (null sealed))
 

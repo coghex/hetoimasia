@@ -476,7 +476,7 @@ hands rig =
                 receipt =
                   Receipt
                     { receiptKey = key
-                    , receiptSealed = isJust <$> readTVar cell
+                    , receiptOutcome = readTVar cell
                     , receiptClaim = claimRigReceipt rig key
                     }
                 abandon = readTVar live >>= \held → when held (giveBack >> seal (Left (BuildFailed "BuildAbandoned" NotAllocated)))

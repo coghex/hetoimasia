@@ -113,10 +113,11 @@ data Grant = Grant
 data Receipt = Receipt
   { receiptKey ∷ !Word64
     -- ^ Unique among the registry's receipts.
-  , receiptSealed ∷ STM Bool
-    -- ^ Whether the build's outcome is sealed (available, or already claimed).
+  , receiptOutcome ∷ STM (Maybe (Either BuildFailure ChunkRef))
+    -- ^ The build's sealed outcome, the one projection every reader uses: nothing while it is unsealed, then the
+    -- outcome, before and after its claim.
   , receiptClaim ∷ STM (Maybe (Either BuildFailure ChunkRef))
-    -- ^ Take the sealed outcome, once: nothing while it is unsealed or after another claimant took it.
+    -- ^ Take the sealed outcome's ownership, once: nothing while it is unsealed or after another claimant took it.
   }
 
 -- | Why a granted build failed, with what became of the vertex buffer it made.
@@ -286,7 +287,7 @@ viewGrant disposal builders retained grant =
     , grantReceipt =
         Receipt
           { receiptKey = receiptNumber receipt
-          , receiptSealed = Chunks.receiptSealed receipt
+          , receiptOutcome = fmap (viewReceipt disposal) <$> Chunks.receiptOutcome receipt
           , receiptClaim = fmap (viewReceipt disposal) <$> claimReceipt receipt
           }
     }
