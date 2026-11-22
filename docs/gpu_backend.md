@@ -889,10 +889,25 @@ order:
 8. the queue and staging have room now (`UploadBackpressure`, as `QueueFull`
    or `StagingFull`).
 
+A caller's gate (`submitUploadGated`, an `UploadGate`) is asked in its own
+transaction before this one and again after the copy; it may refuse, raise or
+wait, and a wait answers `UploadGateBusy`, a refusal that can change. Only
+these asks run the gate's own transaction. An admitting answer carries an
+`UploadPermit` as data: the owner's admission cell (`admittedWhile`), open
+until its owner closes it once (a reopened admission is a cell of its own).
+The commit that admits the upload reads that cell; the commit that queues it
+requires the second answer to name the same admission, still open. An
+admission closed after either ask, or closed and reopened during the copy,
+refuses the upload. `ungated` admits everything.
+
 The transaction reserves the target, the queue place and the staging region
 and makes the ticket. The caller's thread then copies the bytes into the
-region, so its bytes are free when admission returns. If the copy raises or is
-cancelled, every reservation is given back.
+region, so its bytes are free when admission returns. From that commit until
+the one that queues the upload, one cleanup owns every exit: a copy that
+raised or was cancelled, the gate refusing, raising or waiting after it, and a
+refusal in the queueing transaction each give back every reservation, and an
+exception goes on after it. Retirement waits for copies under way, so the
+staging buffer is never unmapped under a writer.
 
 **Reservations.** A caller that must know there is room before it makes a
 vertex buffer reserves it first: `reserveUpload uploads bytes`, in the
@@ -905,11 +920,12 @@ every other caller, admitted uploads and reservations alike.
 is reserved it is spent once, by `submitUploadGranted` for a fresh vertex
 buffer of exactly its bytes, which takes its place and region and competes for
 nothing again, or abandoned (`abandonUploadGrant`). Binding is the transaction
-that admits the upload, and it spends the grant. A refusal in that
-transaction (the gate, the session, misuse, a buffer of the wrong kind or
-size) leaves the grant reserved. After binding, a copy that raised or was
-cancelled, and a refusal when the upload is queued (the gate or admission
-closing meanwhile), give the place and region back and consume the grant. A
+that admits the upload, and it spends the grant. A refusal before it (the
+gate, the session, misuse, a buffer of the wrong kind or size) leaves the
+grant reserved. After binding, every exit before the upload is queued (the
+copy raising or cancelled, the gate refusing, raising or waiting, the permit
+or admission closing) gives the place and region back and consumes the
+grant. A
 spent, abandoned or foreign grant changes nothing, and closing admission
 abandons every grant not yet spent.
 

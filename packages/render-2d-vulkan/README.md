@@ -184,36 +184,36 @@ in three steps a caller can also take apart:
 3. **Spend** (`spendChunkGrant`): move the grant from reserved to spending in
    one transaction, then make the device-local vertex buffer, spend the
    reserved room on the upload that fills it, and register the chunk under the
-   reserved reference. A grant is the build's record. It belongs to the
-   registry and the uploads that issued it: another registry can neither spend
-   nor give it back, and once it is spending only its spend settles it. A
-   reserved grant is given back with `abandonChunkGrant`.
+   reserved reference. A grant belongs to the registry and the uploads that
+   issued it: another registry can neither spend nor give it back, and once it
+   is spending only its spend seals it. A reserved grant is given back with
+   `abandonChunkGrant`, which seals it as `BuildAbandoned`.
 
 - **An empty cutout partition makes no buffer and no upload, and reserves no
   upload room.** A chunk of a world layer without depth, or of a UI layer, has
   no device buffer: its ordered instances are written to the ring each frame.
-- A spend is settled once on every exit: a value, a synchronous exception or a
-  cancellation. The buffer is recorded on the grant as it is made. A buffer
-  made and not registered is released at one site, at most once, and any
-  outcome of that release is kept, a cancellation included. A construction
-  that raised after making and releasing its buffer names it
-  (`releasedBufferOf`), and that release is adopted. One transaction then
-  seals the grant (registered, or its reference and any room still reserved
-  given back) and runs the caller's settlement with the receipt
-  (`BuildRefused` or the chunk): `NoAllocation`; or the buffer released with
-  the release's answer (`AllocationReleased`), whose capacity stays occupied
-  until the backend confirms its destruction; or a release that raised, a
-  cleanup failure naming the buffer and the cause
-  (`AllocationReleaseRaised`). The seal commits whatever the settlement does:
-  an exception from it undoes only its own effects and goes on once the seal
-  has committed, the receipt saying so (`settlementRaised`). A refusal is
-  answered with the receipt. A
-  raised exit goes on with the receipt attached to the exception
-  (`buildSettlementOf`), its cause `BuildRaised`: the build's cancellation if
-  it was one, otherwise a cancellation the release raised, otherwise the
-  settlement's exception, otherwise the build's. `buildRetainedChunk` and
-  `buildRetainedChunkWith` answer the same way. `BuildBufferRefused` is the backend refusing the buffer
-  itself.
+- **Receipts.** Admission creates the build's receipt (`chunkGrantReceipt`),
+  indexed in its registry. A spend is sealed once on every exit: a value, a
+  synchronous exception or a cancellation. The buffer is recorded on the grant
+  as it is made. A buffer made and not registered is released at one site, at
+  most once, and any outcome of that release is kept, a cancellation
+  included. A construction that raised after making and releasing its buffer
+  names it (`releasedBufferOf`), and that release is adopted. One
+  transaction, which runs no caller code, then seals the grant (registered, or
+  its reference and any room still reserved given back) and writes the
+  outcome into the receipt: the chunk, or `BuildRefused` with `NoAllocation`;
+  the buffer released with the release's answer (`AllocationReleased`), whose
+  capacity stays occupied until the backend confirms its destruction; or a
+  release that raised, a cleanup failure naming the buffer and the cause
+  (`AllocationReleaseRaised`). One claimant takes the outcome
+  (`claimReceipt`), once; a receipt nobody claims stays in the registry. A
+  refusal is answered with it as well. A raised exit goes on with it
+  attached to the exception (`buildSettlementOf`), its cause `BuildRaised`:
+  the build's cancellation if it was one, otherwise a cancellation the release
+  raised, otherwise the build's exception. `buildRetainedChunk` and
+  `buildRetainedChunkWith` claim their own receipt in their masked handoff
+  and answer the same way. `BuildBufferRefused` is the backend refusing the
+  buffer itself.
 
 **Standing.** `chunkStanding` reads, from any thread, `ChunkUploading`,
 `ChunkReady` (at once for a chunk with no cutout instance) or `ChunkFailed`
