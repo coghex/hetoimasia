@@ -566,10 +566,14 @@ refusalSpec = describe "refusing a build" $ do
       reference ← built setup ChunkWorldDepth [cutAt 9 1]
       reference `shouldBe` chunkRefOf 7 1
       readIORef (trackedReleased (setupTracked setup)) >>= (`shouldBe` made)
+      -- the outcome reads the same before and after its one successful claim
+      before ← atomically (receiptOutcome (chunkGrantReceipt grant))
       claimsOf grant >>= \case
         [Left receipt@(BuildRefused (BuildUploadRefused UploadClosed) (AllocationReleased buffer (Right ())))] → do
           [buffer] `shouldBe` made
           answer `shouldBe` Left receipt
+          before `shouldBe` Just (Left receipt)
+          atomically (receiptOutcome (chunkGrantReceipt grant)) `shouldReturn` Just (Left receipt)
         other → expectationFailure ("expected the refusal's receipt once, found " <> show other)
 
   it "settles a granted build whose bound upload raises at the mapped write: its queue place and staging range return, its buffer is released once and the build settles once" $
@@ -665,11 +669,14 @@ refusalSpec = describe "refusing a build" $ do
       reference ← spendChunkGrant (trackedBuilders setup) (setupRetained setup) grant >>= either (fail . show) pure
       -- nobody collects it
       atomically (receiptsHeld (setupRetained setup)) `shouldReturn` (1, 1)
+      atomically (receiptOutcome (chunkGrantReceipt grant)) `shouldReturn` Just (Right reference)
       atomically (sweepRegistry (setupRetained setup)) >>= \case
         [(_, Right swept)] → swept `shouldBe` reference
         other → expectationFailure ("expected the registered chunk swept once, found " <> show (map snd other))
       atomically (receiptsHeld (setupRetained setup)) `shouldReturn` (0, 0)
       claimsOf grant `shouldReturn` []
+      -- the sweep took the ownership; the outcome still reads the same through the grant's own receipt
+      atomically (receiptOutcome (chunkGrantReceipt grant)) `shouldReturn` Just (Right reference)
       -- a public build claims its own receipt, which the registry never indexes
       _ ← built setup ChunkWorldDepth [cutAt 1 1]
       atomically (receiptsHeld (setupRetained setup)) `shouldReturn` (0, 0)

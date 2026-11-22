@@ -101,6 +101,7 @@ module Hetoimasia.Render.TwoD.Vulkan.Chunks
   , chunkGrantReceipt
   , chunkGrantReference
   , receiptNumber
+  , receiptOutcome
   , receiptSealed
   , claimReceipt
   , sweepRegistry
@@ -326,31 +327,35 @@ data ChunkGrant = ChunkGrant
 -- collector, or a sweep in its place. It is unique to its grant.
 data BuildReceipt = BuildReceipt
   { receiptNumber ∷ !Word64
-  , receiptCell ∷ !(TVar ReceiptState)
+  , receiptCell ∷ !(TVar (Maybe (Either BuildRefused ChunkRef)))
+    -- ^ The build's outcome, written once when it is sealed and kept: every holder of the receipt reads it.
+  , receiptClaimed ∷ !(TVar Bool)
+    -- ^ Whether a claimant has taken the outcome's ownership: set once, by the first claim.
   , receiptRegistry ∷ !(TVar Ledger)
   }
-
--- | Open while the build is admitted and unsealed; available once sealed, with its outcome; claimed once taken.
-data ReceiptState = ReceiptOpen | ReceiptAvailable !(Either BuildRefused ChunkRef) | ReceiptClaimed
 
 -- | The receipt an admitted build's outcome is sealed into.
 chunkGrantReceipt ∷ ChunkGrant → BuildReceipt
 chunkGrantReceipt = grantReceipt
 
--- | Whether the build is sealed: its outcome available, or already claimed.
-receiptSealed ∷ BuildReceipt → STM Bool
-receiptSealed receipt =
-  readTVar (receiptCell receipt) <&> \case
-    ReceiptOpen → False
-    _ → True
+-- | The build's sealed outcome, the one projection every reader uses: nothing while the build is unsealed, then the
+-- outcome it was sealed with, before and after its claim.
+receiptOutcome ∷ BuildReceipt → STM (Maybe (Either BuildRefused ChunkRef))
+receiptOutcome = readTVar . receiptCell
 
--- | Claim a sealed outcome, once: the first claimant takes it and the registry forgets the receipt; an open receipt,
--- or one already claimed, answers nothing and changes nothing.
+-- | Whether the build is sealed.
+receiptSealed ∷ BuildReceipt → STM Bool
+receiptSealed receipt = isJust <$> receiptOutcome receipt
+
+-- | Take the ownership of a sealed outcome, once: the first claimant gets the outcome ('receiptOutcome') and the
+-- registry forgets the receipt; an unsealed receipt, or one already claimed, answers nothing and changes nothing. The
+-- outcome itself stays readable through every holder of the receipt.
 claimReceipt ∷ BuildReceipt → STM (Maybe (Either BuildRefused ChunkRef))
-claimReceipt receipt =
-  readTVar (receiptCell receipt) >>= \case
-    ReceiptAvailable outcome → do
-      writeTVar (receiptCell receipt) ReceiptClaimed
+claimReceipt receipt = do
+  claimed ← readTVar (receiptClaimed receipt)
+  receiptOutcome receipt >>= \case
+    Just outcome | not claimed → do
+      writeTVar (receiptClaimed receipt) True
       modifyTVar' (receiptRegistry receipt) (\held → held {ledgerReceipts = Map.delete (receiptNumber receipt) (ledgerReceipts held)})
       pure (Just outcome)
     _ → pure Nothing
@@ -374,9 +379,9 @@ receiptsHeld (Retained ledger) = do
   pure (length grants, settleable)
   where
     settleableNow grant =
-      (,) <$> readTVar (receiptCell (grantReceipt grant)) <*> readTVar (grantStanding grant) <&> \case
-        (ReceiptAvailable _, _) → True
-        (_, GrantReserved) → True
+      (,,) <$> receiptOutcome (grantReceipt grant) <*> readTVar (receiptClaimed (grantReceipt grant)) <*> readTVar (grantStanding grant) <&> \case
+        (Just _, False, _) → True
+        (_, _, GrantReserved) → True
         _ → False
 
 -- Seal a build's outcome into its receipt, available to one claimant.
@@ -385,8 +390,12 @@ receiptsHeld (Retained ledger) = do
 chunkGrantReference ∷ ChunkGrant → ChunkRef
 chunkGrantReference = grantReference
 
+-- Written once: a receipt already sealed keeps its outcome.
 sealReceipt ∷ ChunkGrant → Either BuildRefused ChunkRef → STM ()
-sealReceipt grant outcome = writeTVar (receiptCell (grantReceipt grant)) (ReceiptAvailable outcome)
+sealReceipt grant outcome =
+  readTVar (receiptCell (grantReceipt grant)) >>= \case
+    Nothing → writeTVar (receiptCell (grantReceipt grant)) (Just outcome)
+    Just _ → pure ()
 
 -- | Where a grant stands: reserved; being spent, its capacity the spend's to
 -- settle, with the buffer it owns; or sealed (registered, or given back).
@@ -429,9 +438,10 @@ admitWith indexed uploads (Retained ledger) prepared = do
         Left refusal → pure (Left (uploadRefusal refusal))
         Right granted → do
           standing ← newTVar GrantReserved
-          cell ← newTVar ReceiptOpen
+          cell ← newTVar Nothing
+          claimed ← newTVar False
           let number = ledgerReceiptNext afterwards
-              grant = ChunkGrant reference prepared granted ledger uploads standing (BuildReceipt number cell ledger)
+              grant = ChunkGrant reference prepared granted ledger uploads standing (BuildReceipt number cell claimed ledger)
           writeTVar ledger afterwards {ledgerReceipts = (if indexed then Map.insert number grant else id) (ledgerReceipts afterwards), ledgerReceiptNext = number + 1}
           pure (Right grant)
 
