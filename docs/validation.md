@@ -1008,24 +1008,38 @@ exact components (`package:kind:name`) allowed to depend on it; an issuer adds
 its component as it lands.
 
 - **Supported inputs.** The local packages `cabal.project` and
-  `cabal.project.vulkan` list, following literal local imports; Simple
-  manifests read by Cabal's own parser, common stanzas expanded; every
-  component kind in every configuration on Linux and Darwin, x86_64 and
-  aarch64, under both values of each manual flag.
+  `cabal.project.vulkan` list, following literal local imports, each project
+  file read by Cabal's own field parser; Simple manifests read by Cabal's own
+  parser, common stanzas expanded; every component kind in every configuration
+  on Linux and Darwin, x86_64 and aarch64, under both values of each manual
+  flag.
+- **Allow-listed.** Project fields: `packages` and `import` (literal local
+  directories and files only), `constraints`, `index-state`, `jobs`,
+  `optimization`, `semaphore`, `active-repositories`, `tests` and
+  `benchmarks`; sections: `package` (its `flags`, `tests`, `benchmarks`,
+  `optimization`, native search paths and options) and conditionals on the
+  supported targets. Compiler options, in a manifest or a
+  project, tokenized as Cabal does: warnings (`-W…`, `-w`), optimisation
+  levels, `-threaded`, `-rtsopts`, `-with-rtsopts=…`, `-j`, linker options
+  (`-optl…`) and `-fno-full-laziness`. Anything else is unsupported.
 - **Refused.** A component whose effective `build-depends` selects the
   sublibrary in any buildable configuration, a nondefault manual flag's
   included, and is not listed; a listed entry that depends on it nowhere; a
-  Cabal `reexported-modules` or `mixins` entry that exposes or renames the
-  bridge or the representation (`Hetoimasia.Foundation.OwnerTx.Representation`)
-  by exact module name, in a listed component too; a protected module declared
-  outside its defining component, or in a public representation library.
-- **Unsupported, in every configuration before any branch is dropped.**
-  Optional, extra, remote or globbed package selection; a condition on another
-  target, on a non-manual flag or on `impl`; signatures; and a project or
-  manifest option that changes which packages are visible. An unbuildable
-  configuration is diagnosed for these and selects nothing.
-- **Fails closed.** A manifest Cabal refuses, a library selector that names no
-  library of a local package, and an unreadable allowlist.
+  Cabal `reexported-modules` entry that names the bridge or the representation
+  (`Hetoimasia.Foundation.OwnerTx.Representation`) exactly, or a `mixins` entry
+  whose renaming brings either into scope (all of a library, a renaming of it,
+  or a hiding that leaves it), in a listed component too; a protected module
+  declared outside its defining component, or in a public representation
+  library.
+- **Validated before any branch is dropped.** Every node of every component's
+  conditional tree, buildable or not: condition atoms outside the supported
+  targets and manual flags, signatures and unsupported options are
+  unsupported, and a library selector of a dependency or a mixin that names no
+  library of a local package fails closed. Only membership is computed from
+  the simplified configurations; an unbuildable one selects nothing.
+- **Fails closed.** A project file or manifest Cabal refuses, and an allowlist
+  that is not strict JSON (a repeated key, a malformed or non-integer number)
+  or not schema 3.
 
 The guard reads no Haskell source. What a listed component's modules import,
 export and instantiate is issuer review's, as
