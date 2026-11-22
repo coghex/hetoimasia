@@ -159,15 +159,17 @@ data Facts = Facts
 -- and the metrics its next frame is recorded with. Scoped to one registration.
 newtype OffscreenFacts = OffscreenFacts (TVar Facts)
 
--- | Facts for a registration: usable or not, and its metrics, if known.
-newOffscreenFacts ∷ Bool → Maybe TargetMetrics → STM OffscreenFacts
-newOffscreenFacts usable metrics = OffscreenFacts <$> newTVar (Facts 0 usable usable metrics)
+-- | Facts for a registration: usable or not, and its metrics, if known, prepared by the registrant.
+newOffscreenFacts ∷ Bool → Prepared (Maybe TargetMetrics) → STM OffscreenFacts
+newOffscreenFacts usable metrics = OffscreenFacts <$> newTVar (Facts 0 usable usable (preparedValue metrics))
 
 setOffscreenUsable ∷ OffscreenFacts → Bool → STM ()
 setOffscreenUsable (OffscreenFacts cell) usable = changeFacts cell (\facts → facts {factsUsable = usable, factsAuthority = usable})
 
-setOffscreenMetrics ∷ OffscreenFacts → Maybe TargetMetrics → STM ()
-setOffscreenMetrics (OffscreenFacts cell) metrics = changeFacts cell (\facts → facts {factsMetrics = metrics})
+-- | Install the registrant's metrics, prepared (fully evaluated) before this transaction, with the facts' next version:
+-- a value whose evaluation raises raised at its preparation, and the facts keep their value and version.
+setOffscreenMetrics ∷ OffscreenFacts → Prepared (Maybe TargetMetrics) → STM ()
+setOffscreenMetrics (OffscreenFacts cell) metrics = changeFacts cell (\facts → facts {factsMetrics = preparedValue metrics})
 
 -- | A target held in memory: its facts, the scenes published to it, newest first with the revision it gave each, and
 -- whether it accepts a publication.
@@ -195,15 +197,16 @@ setHeldFault ∷ HeldTarget → Maybe HeldFault → STM ()
 setHeldFault held = writeTVar (heldFault held)
 
 -- | A usable, accepting target held in memory, under its caller's authority, at these metrics.
-newHeldTarget ∷ Maybe TargetMetrics → STM HeldTarget
-newHeldTarget metrics = HeldTarget <$> newTVar (Facts 0 True True metrics) <*> newTVar [] <*> newTVar True <*> newTVar Nothing
+newHeldTarget ∷ Prepared (Maybe TargetMetrics) → STM HeldTarget
+newHeldTarget metrics = HeldTarget <$> newTVar (Facts 0 True True (preparedValue metrics)) <*> newTVar [] <*> newTVar True <*> newTVar Nothing
 
 setHeldUsable, setHeldAuthority ∷ HeldTarget → Bool → STM ()
 setHeldUsable held usable = changeFacts (heldFacts held) (\facts → facts {factsUsable = usable})
 setHeldAuthority held authority = changeFacts (heldFacts held) (\facts → facts {factsAuthority = authority})
 
-setHeldMetrics ∷ HeldTarget → Maybe TargetMetrics → STM ()
-setHeldMetrics held metrics = changeFacts (heldFacts held) (\facts → facts {factsMetrics = metrics})
+-- | Install the holder's metrics, prepared before this transaction, with the facts' next version.
+setHeldMetrics ∷ HeldTarget → Prepared (Maybe TargetMetrics) → STM ()
+setHeldMetrics held metrics = changeFacts (heldFacts held) (\facts → facts {factsMetrics = preparedValue metrics})
 
 setHeldAccepts ∷ HeldTarget → Bool → STM ()
 setHeldAccepts held = writeTVar (heldAccepting held)

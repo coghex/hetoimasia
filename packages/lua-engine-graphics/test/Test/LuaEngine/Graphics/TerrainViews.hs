@@ -629,7 +629,7 @@ metricsOf ∷ Int → Int → TargetMetrics
 metricsOf w h = TargetMetrics (PixelExtent w h) (PixelExtent w h) 1 1
 
 newTarget ∷ Int → IO Target
-newTarget key = Target key <$> atomically (newHeldTarget (Just (metricsOf 320 240))) <*> newTVarIO Nothing
+newTarget key = Target key <$> (prepare (Just (metricsOf 320 240)) >>= atomically . newHeldTarget) <*> newTVarIO Nothing
 
 viewTarget ∷ Target → ViewTarget Int
 viewTarget target = ViewTarget (targetKey target) (HeldSurface (targetHeld target)) True
@@ -684,6 +684,10 @@ quiesce rig target = do
   adopt rig target
   meetBarriers rig
   runOwner rig
+
+-- Install a held target's metrics as its holder does: prepared, then written with the facts' next version.
+heldMetrics ∷ HeldTarget → Maybe TargetMetrics → IO ()
+heldMetrics held metrics = prepare metrics >>= atomically . setHeldMetrics held
 
 -- The latest world the target was published, if its latest scene is one.
 latestWorld ∷ Target → STM (Maybe SceneWorld)
@@ -965,7 +969,7 @@ spec = describe "terrain views (TRA-9 v2)" $ do
     it "revokes a close at once, with no owner step, even on a minimized target" $
       withPublished defaultOptions $ \rig target view → do
         atomically (writeTVar (rigQueueOpen rig) False)
-        atomically (setHeldMetrics (targetHeld target) (Just (metricsOf 0 0)))
+        heldMetrics (targetHeld target) (Just (metricsOf 0 0))
         outcome ← closeView view
         outcome `shouldSatisfy` (`elem` [CloseRetiring, CloseDone])
         atomically (readingStatus <$> readView view) `shouldReturn` ViewEnded EndClosed
@@ -1447,13 +1451,13 @@ spec = describe "terrain views (TRA-9 v2)" $ do
     it "copies nothing and asks the runtime for nothing while nothing can be drawn, then plans once something can" $
       withRig defaultOptions $ \rig → do
         target ← newTarget 1
-        atomically (setHeldMetrics (targetHeld target) (Just (metricsOf 0 0)))
+        heldMetrics (targetHeld target) (Just (metricsOf 0 0))
         view ← openOn rig target
         runOwner rig
         reading ← atomically (readView view)
         (readingDemand reading, readingPublished reading, readingRefusal reading) `shouldBe` ([], Nothing, Nothing)
         atomically (inspectRetainedChargesSTM (rigTerrain rig)) >>= (`shouldSatisfy` (null . snd))
-        atomically (setHeldMetrics (targetHeld target) (Just (metricsOf 320 240)))
+        heldMetrics (targetHeld target) (Just (metricsOf 320 240))
         settleUntil rig (publishedAtLeast view 1)
 
     it "derives its runtime demand from the geometry now: present, empty when minimized, present again on restore, empty again" $
@@ -1464,7 +1468,7 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         asked `shouldSatisfy` (not . null)
         published ← atomically (readingPublished <$> readView view)
         let at metrics expected = do
-              atomically (setHeldMetrics (targetHeld target) (Just metrics))
+              heldMetrics (targetHeld target) (Just metrics)
               settleUntil rig ((== expected) . readingDemand <$> readView view)
               reading ← atomically (readView view)
               receipt ← maybe (fail "no receipt") pure (readingReceipt reading)
@@ -1525,7 +1529,7 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         quiesce rig target
         drawn ← drawLatest rig target view
         published ← atomically (readingPublished <$> readView view)
-        atomically (setHeldMetrics (targetHeld target) (Just (metricsOf 0 0)))
+        heldMetrics (targetHeld target) (Just (metricsOf 0 0))
         settleUntil rig (null . readingDemand <$> readView view)
         Right move ← atomically (moveView view (JumpTarget (axis 70) (axis 70) (Just (axis 1))))
         settleUntil rig (isJust <$> moveSettled move)
@@ -1535,7 +1539,7 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         kept ← atomically (viewDrawn view) >>= maybe (fail "nothing drawn") pure
         (drawnPlanReceipt kept, drawnPlanCamera kept, drawnPlanMetrics kept) `shouldBe` (drawnPlanReceipt drawn, drawnPlanCamera drawn, drawnPlanMetrics drawn)
         -- restored: the landed camera is prepared and published
-        atomically (setHeldMetrics (targetHeld target) (Just (metricsOf 320 240)))
+        heldMetrics (targetHeld target) (Just (metricsOf 320 240))
         settleUntil rig (publishedAtLeast view (maybe 1 (+ 1) published))
         camera ← drawLatest rig target view >>= maybe (fail "no camera") pure . drawnPlanCamera
         (axisValue (camAnchorX camera), axisValue (camAnchorY camera)) `shouldBe` (70, 70)
@@ -1618,7 +1622,7 @@ spec = describe "terrain views (TRA-9 v2)" $ do
     it "retires a refusal whose basis no longer applies, and counts a new one once, through successive moves at zero geometry" $
       withPublished defaultOptions $ \rig target view → do
         quiesce rig target
-        atomically (setHeldMetrics (targetHeld target) (Just (metricsOf 0 0)))
+        heldMetrics (targetHeld target) (Just (metricsOf 0 0))
         settleUntil rig (null . readingDemand <$> readView view)
         atomically (writeTVar (rigUnavailable rig) (Set.singleton (RegionCoord 4 4 0)))
         Right first ← atomically (moveView view (JumpTarget (axis 70) (axis 70) (Just (axis 1))))
@@ -1670,7 +1674,7 @@ spec = describe "terrain views (TRA-9 v2)" $ do
     it "treats a target whose metrics have an infinite scale as of unknown geometry: no demand" $
       withPublished defaultOptions $ \rig target view → do
         quiesce rig target
-        atomically (setHeldMetrics (targetHeld target) (Just (TargetMetrics (PixelExtent 320 240) (PixelExtent 320 240) (1 / 0) 1)))
+        heldMetrics (targetHeld target) (Just (TargetMetrics (PixelExtent 320 240) (PixelExtent 320 240) (1 / 0) 1))
         settleUntil rig (null . readingDemand <$> readView view)
         atomically (readingStatus <$> readView view) `shouldReturn` ViewOpen
 
@@ -1968,7 +1972,8 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         readingRefusals refused `shouldBe` 1
         before ← atomically (latestWorld target)
         -- minimized with the lease live, its withdrawal refused, and no move between
-        atomically (writeTVar (rigDemandRefused rig) (Just "the withdrawal is refused") >> setHeldMetrics (targetHeld target) (Just (metricsOf 0 0)))
+        zero ← prepare (Just (metricsOf 0 0))
+        atomically (writeTVar (rigDemandRefused rig) (Just "the withdrawal is refused") >> setHeldMetrics (targetHeld target) zero)
         settleUntil rig ((== 2) . readingRefusals <$> readView view)
         forM_ [1 .. 8 ∷ Int] (const wake)
         after ← atomically (readView view)
@@ -2262,6 +2267,23 @@ spec = describe "terrain views (TRA-9 v2)" $ do
       filter (== orphan) <$> readTVarIO disposed `shouldReturn` [orphan]
       Map.lookup orphan <$> readTVarIO attempts `shouldReturn` Just 1
 
+    it "refuses at their writer metrics whose evaluation raises between a build's revalidation and its collection: the target keeps its version, and the build is collected as current" $
+      withRig defaultOptions {optProfile = smallProfile {profileSlots = 4, profileQuads = 2048}} $ \rig → do
+        let reading = readTerrainViews (rigViews rig)
+        target ← newTarget 1
+        observed ← newTVarIO Nothing
+        -- between the two boundaries: the holder's new metrics raise when evaluated, which their preparation does
+        atomically . writeTVar (rigBeforeCollect rig) . Just $ do
+          outcome ← try @ErrorCall (heldMetrics (targetHeld target) (Just (metricsOf (error "the deferred metrics raised") 240)))
+          atomically (writeTVar observed (Just (either (\(ErrorCall why) → Text.pack why) (const "written") outcome)))
+        view ← openOn rig target
+        settleUntil rig (publishedAtLeast view 1)
+        readTVarIO observed `shouldReturn` Just "the deferred metrics raised"
+        now ← atomically reading
+        listed ← atomically (readingListed <$> readView view)
+        Map.findWithDefault 0 1 (serviceOccupied now) `shouldBe` listed
+        (servicePending now, servicePrivate now, serviceSwept now, serviceFailures now) `shouldBe` (0, 0, [], [])
+
     it "keeps the cause of a refused build no view held when the registry's teardown sweep claims it, though it made no buffer" $ do
       views ← withRig defaultOptions $ \rig → do
         sealed ← newTVarIO (Just (Left (BuildFailed "BuildAbandoned" NotAllocated)))
@@ -2274,11 +2296,11 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         quiesce rig target
         asked ← atomically (readingDemand <$> readView view)
         published ← atomically (readingPublished <$> readView view)
-        atomically (setHeldMetrics (targetHeld target) (Just (metricsOf 0 0)))
+        heldMetrics (targetHeld target) (Just (metricsOf 0 0))
         settleUntil rig (null . readingDemand <$> readView view)
-        atomically (setHeldMetrics (targetHeld target) Nothing)
+        heldMetrics (targetHeld target) Nothing
         settleUntil rig (null . readingDemand <$> readView view)
-        atomically (setHeldMetrics (targetHeld target) (Just (metricsOf 320 240)))
+        heldMetrics (targetHeld target) (Just (metricsOf 320 240))
         settleUntil rig ((== asked) . readingDemand <$> readView view)
         atomically (readingPublished <$> readView view) `shouldReturn` published
 
@@ -2362,12 +2384,12 @@ spec = describe "terrain views (TRA-9 v2)" $ do
     it "asks a target with no frame metrics yet for its first frame at open, and plans once it has one" $
       withRig defaultOptions $ \rig → do
         target ← newTarget 1
-        atomically (setHeldMetrics (targetHeld target) Nothing)
+        heldMetrics (targetHeld target) Nothing
         view ← openOn rig target
         scenes ← atomically (targetScenes target)
         map (graphicsWorld . snd) scenes `shouldBe` [Nothing]
         -- the frame it asked for is recorded at these metrics: the views notice them with no caller's kick
-        atomically (setHeldMetrics (targetHeld target) (Just (metricsOf 320 240)))
+        heldMetrics (targetHeld target) (Just (metricsOf 320 240))
         eventually (not . Seq.null <$> readTVar (rigQueue rig))
         settleUntil rig (publishedAtLeast view 1)
 
@@ -2375,11 +2397,12 @@ spec = describe "terrain views (TRA-9 v2)" $ do
       withRig defaultOptions {optWindow = 64} $ \rig → do
         target ← newTarget 1
         m1 ← prepare initialGraphicsScene
-        atomically (void (surfacePublish (HeldSurface (targetHeld target)) m1) >> setHeldMetrics (targetHeld target) Nothing)
+        unknown ← prepare Nothing
+        atomically (void (surfacePublish (HeldSurface (targetHeld target)) m1) >> setHeldMetrics (targetHeld target) unknown)
         view ← openOn rig target
         -- the scene it shows stays: its frame's metrics, once noticed, start the view
         map fst <$> atomically (targetScenes target) >>= (`shouldBe` [1])
-        atomically (setHeldMetrics (targetHeld target) (Just (metricsOf 320 240)))
+        heldMetrics (targetHeld target) (Just (metricsOf 320 240))
         settleUntil rig (isJust . readingRefusal <$> readView view)
         map fst <$> atomically (targetScenes target) >>= (`shouldBe` [1])
         -- closed with its claim never published: returned directly, the M1 scene still shown

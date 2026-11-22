@@ -100,7 +100,7 @@ spec env = describe "terrain views" $
       let host = envHost env
           metrics = TargetMetrics (PixelExtent side side) (PixelExtent side side) 1 1
       target ← atomically (registerVulkanSceneTarget host) >>= either (\refusal → assertFailure ("the target was refused: " <> show refusal)) pure
-      facts ← atomically (newOffscreenFacts True (Just metrics))
+      facts ← prepare (Just metrics) >>= atomically . newOffscreenFacts True
       let cleanup = atomically (setOffscreenUsable facts False) >> void (atomically (unregisterVulkanSceneTarget host target))
       flip finally cleanup . withImages host (fromIntegral side) $ \images → do
         view ←

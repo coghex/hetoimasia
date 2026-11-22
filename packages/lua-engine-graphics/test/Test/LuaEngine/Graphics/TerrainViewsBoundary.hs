@@ -146,6 +146,20 @@ spec = describe "the terrain views' package boundary" $ do
         rejectedBecause outcome "GHC-83865"
         clientOutput outcome `shouldContain` "BatchTicket"
 
+  it "rejects a client that hands an offscreen target's facts raw metrics, unprepared" $
+    withClient
+      ( unlines
+          [ "module Client (raw) where"
+          , "import Hetoimasia.LuaEngine.Graphics.TerrainView"
+          , "raw facts metrics = setOffscreenMetrics facts (Just metrics)"
+          ]
+      )
+      $ \compile → do
+        outcome ← compile Typecheck
+        -- the writer takes only a prepared, fully evaluated value
+        rejectedBecause outcome "GHC-83865"
+        clientOutput outcome `shouldContain` "Prepared"
+
   forM_ ["TerrainViewsPorts", "ViewTarget"] $ \constructor →
     it ("rejects a client that forges the public module's opaque " <> constructor) $
       withClient (unlines ["module Client (forged) where", "import " <> publicModule, "forged = " <> constructor]) $ \compile → do
