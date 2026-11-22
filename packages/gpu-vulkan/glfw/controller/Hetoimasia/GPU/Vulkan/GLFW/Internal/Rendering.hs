@@ -176,6 +176,7 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Rendering
   , renderingUploadsWaiting
   , submitRenderingUpload
   , cancelRenderingUpload
+  , renderingUploadAccess
   , renderingUploadRoom
   , reserveRenderingUpload
   , submitRenderingGranted
@@ -394,14 +395,21 @@ import Hetoimasia.GPU.Vulkan.Native.TextureTable
   , failPendingSwaps
   , swapTexture
   )
+import Hetoimasia.Foundation.Admission (AdmissionToken)
 import Hetoimasia.GPU.Vulkan.Native.Uploads
   ( CancelRefusal (CancelUnknown)
+  , UploadAccess
+  , UploadsStanding (..)
+  , UploadsUnavailable (..)
+  , accessRoom
+  , accessReserve
+  , accessSubmitGranted
+  , ownedUploadAccess
   , UploadConfig
   , UploadProgress (..)
   , UploadRefusal
   , UploadRequest
   , UploadTicket
-  , Uploads
   , cancelUpload
   , closeUploads
   , newUploads
@@ -411,9 +419,6 @@ import Hetoimasia.GPU.Vulkan.Native.Uploads
   , uploadsWaiting
   , UploadGate
   , UploadGrant
-  , uploadRoom
-  , reserveUpload
-  , submitUploadGranted
   , abandonUploadGrant
   )
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Target (Adopter (..), OffscreenTargetId)
@@ -1054,17 +1059,6 @@ targetUseOver use =
     TicketDiscarded → True
     TicketPending → False
     TicketLost → False
-
--- | Where the session's uploads stand.
-data UploadsStanding q inst msgr phys dev cmd
-  = UploadsUnconfigured
-    -- ^ The host configured none.
-  | UploadsPending !UploadConfig
-    -- ^ Configured, and not yet made: the device does not exist yet.
-  | UploadsMade !(Uploads q inst msgr phys dev cmd)
-  | UploadsRefused !Refusal
-    -- ^ The device refused them: the turn budget holds no block row of its
-    -- widest level, or the staging buffer could not be made.
 
 newRendering
   ∷ Roots q inst msgr phys dev
@@ -1824,16 +1818,6 @@ endCaptures rendering = do
 -- ---------------------------------------------------------------------------
 -- Uploads (GRS-6)
 
--- | Why the session takes no upload now.
-data UploadsUnavailable
-  = UploadsNotConfigured
-    -- ^ The host configured no uploads.
-  | UploadsNotReady
-    -- ^ Configured, and not yet made: the device does not exist yet.
-  | UploadsRefusedBy !Refusal
-    -- ^ The device refused them when they were made.
-  deriving (Eq, Show)
-
 -- | Make the session's uploads, on the owner's thread, the first time the
 -- recording and the frames exist, if configured: an owner step does this
 -- before it runs any owner-thread action, so an action's uploads find them.
@@ -1900,57 +1884,28 @@ submitRenderingUpload rendering gate request =
     UploadsPending _ → pure (Left (Left UploadsNotReady))
     UploadsRefused refusal → pure (Left (Left (UploadsRefusedBy refusal)))
 
--- | Whether an upload of this many bytes would be admitted now ('uploadRoom'), from any thread, read-only, under
--- the owner's admission as its own cells give it: the decision 'reserveRenderingUpload' makes. Uploads configured and not yet made are
--- 'UploadsNotReady', which their startup can change.
-renderingUploadRoom
-  ∷ Rendering q inst msgr phys dev cmd
-  → STM (Maybe UploadRefusal)
-  → Natural
-  → STM (Either (Either UploadsUnavailable UploadRefusal) ())
-renderingUploadRoom rendering gate bytes = withUploads rendering gate (`uploadRoom` bytes)
+-- | The session's uploads as a holder reaches them: the uploads this rendering records, under the owner's admission
+-- whose token is in that cell and the session's terminal state ('ownedUploadAccess'). Every decision through it is
+-- the native uploads' own, over these cells.
+renderingUploadAccess ∷ Rendering q inst msgr phys dev cmd → TVar AdmissionToken → UploadAccess
+renderingUploadAccess rendering = (\owner → ownedUploadAccess (renderingRoots rendering) owner (renderingUploads rendering))
 
--- | Reserve the room an upload of this many bytes needs ('reserveUpload'), from any thread, under the owner's
--- admission as its own cells give it, read in the same transaction: a refusal reserves nothing.
-reserveRenderingUpload
-  ∷ Rendering q inst msgr phys dev cmd
-  → STM (Maybe UploadRefusal)
-  → Natural
-  → STM (Either (Either UploadsUnavailable UploadRefusal) UploadGrant)
-reserveRenderingUpload rendering gate bytes = withUploads rendering gate (`reserveUpload` bytes)
+-- | Whether an upload of this many bytes would be admitted now through this access ('accessRoom'), from any thread,
+-- read-only: the decision 'reserveRenderingUpload' makes. Uploads configured and not yet made are 'UploadsNotReady',
+-- which their startup can change.
+renderingUploadRoom ∷ UploadAccess → Natural → STM (Either (Either UploadsUnavailable UploadRefusal) ())
+renderingUploadRoom = accessRoom
 
-withUploads
-  ∷ Rendering q inst msgr phys dev cmd
-  → STM (Maybe UploadRefusal)
-  → (Uploads q inst msgr phys dev cmd → STM (Either UploadRefusal a))
-  → STM (Either (Either UploadsUnavailable UploadRefusal) a)
-withUploads rendering admission decide =
-  admission >>= \case
-    Just refusal → pure (Left (Right refusal))
-    Nothing →
-      readTVar (renderingUploads rendering) >>= \case
-        UploadsMade uploads → either (Left . Right) Right <$> decide uploads
-        UploadsUnconfigured → pure (Left (Left UploadsNotConfigured))
-        UploadsPending _ → pure (Left (Left UploadsNotReady))
-        UploadsRefused refusal → pure (Left (Left (UploadsRefusedBy refusal)))
+-- | Reserve the room an upload of this many bytes needs through this access ('accessReserve'), from any thread: a
+-- refusal reserves nothing.
+reserveRenderingUpload ∷ UploadAccess → Natural → STM (Either (Either UploadsUnavailable UploadRefusal) UploadGrant)
+reserveRenderingUpload = accessReserve
 
--- | Spend a reservation on the upload that fills a fresh vertex buffer of exactly its bytes
--- ('submitUploadGranted'), under the caller's gate, read in the transactions that bind and queue it. Uploads that are
--- not made, and a refusal when binding, leave the reservation spendable; once bound, a failed or cancelled copy or a
--- refusal when queueing gives its place and region back and consumes it.
-submitRenderingGranted
-  ∷ Rendering q inst msgr phys dev cmd
-  → UploadGate
-  → UploadGrant
-  → Buffer
-  → ByteString.ByteString
-  → IO (Either (Either UploadsUnavailable UploadRefusal) UploadTicket)
-submitRenderingGranted rendering gate grant buffer bytes =
-  readTVarIO (renderingUploads rendering) >>= \case
-    UploadsMade uploads → either (Left . Right) Right <$> submitUploadGranted gate uploads grant buffer bytes
-    UploadsUnconfigured → pure (Left (Left UploadsNotConfigured))
-    UploadsPending _ → pure (Left (Left UploadsNotReady))
-    UploadsRefused refusal → pure (Left (Left (UploadsRefusedBy refusal)))
+-- | Spend a reservation on the upload that fills a fresh vertex buffer of exactly its bytes through this access
+-- ('accessSubmitGranted'). Uploads that are not made, and a refusal when binding, leave the reservation spendable;
+-- once bound, a failed or cancelled copy or a refusal when queueing gives its place and region back and consumes it.
+submitRenderingGranted ∷ UploadAccess → UploadGrant → Buffer → ByteString.ByteString → IO (Either (Either UploadsUnavailable UploadRefusal) UploadTicket)
+submitRenderingGranted = accessSubmitGranted
 
 -- | Abandon a reservation from any thread ('abandonUploadGrant'): its room is free again.
 abandonRenderingGrant ∷ Rendering q inst msgr phys dev cmd → UploadGrant → STM ()

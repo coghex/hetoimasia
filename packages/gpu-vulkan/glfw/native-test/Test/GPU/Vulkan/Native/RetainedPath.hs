@@ -215,13 +215,11 @@ buildersWith uploads construction =
 
 -- | The uploads, counting each upload a spent reservation admits.
 countingUploads ∷ IORef Int → Render.BufferUploads → Render.BufferUploads
-countingUploads count uploads =
-  uploads
-    { Render.uploadGranted = \grant buffer bytes → do
-        answer ← Render.uploadGranted uploads grant buffer bytes
-        either (const (pure ())) (const (atomicModifyIORef' count (\held → (held + 1, ())))) answer
-        pure answer
-    }
+countingUploads count =
+  Render.observingSpends $ \spend grant buffer bytes → do
+    answer ← spend grant buffer bytes
+    either (const (pure ())) (const (atomicModifyIORef' count (\held → (held + 1, ())))) answer
+    pure answer
 
 -- | The adapter's host: nothing is published to a window, and the releases it
 -- asks for go to the session.

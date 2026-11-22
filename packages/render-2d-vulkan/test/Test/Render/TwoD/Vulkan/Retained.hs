@@ -39,7 +39,8 @@ import Hetoimasia.GPU.Vulkan.Native.Recording
   , validateStorageWindow
   )
 import Hetoimasia.GPU.Vulkan.Native.TextureTable (validateTableConfig)
-import Hetoimasia.GPU.Vulkan.Native.Uploads (UploadRefusal (..), UploadState (..), UploadsView (..), readUploads)
+import Hetoimasia.Foundation.Admission (admissionToken, newAdmissionIO)
+import Hetoimasia.GPU.Vulkan.Native.Uploads (UploadRefusal (..), UploadState (..), UploadsStanding (..), UploadsView (..), ownedUploadAccess, readUploads, validateUploadConfig)
 import Hetoimasia.Math.Affine2 (fromColumns)
 import Hetoimasia.Math.Vector (V2 (..))
 import qualified Hetoimasia.Render.Api.Texture as Api
@@ -57,14 +58,16 @@ import Hetoimasia.Render.TwoD.Target.Backend (targetRef)
 import Hetoimasia.Render.TwoD.Validation (Location (..), Reason (..), ValidSnapshot, validLayers, validateSnapshot, validateSnapshotWith)
 import qualified Hetoimasia.Render.TwoD.Validation as Validation
 import qualified Hetoimasia.Render.TwoD.Vulkan as Render
-import Hetoimasia.Render.TwoD.Vulkan.Builders (BufferUploadRefusal (..), BufferUploads (..), Builders (..))
+import Hetoimasia.Render.TwoD.Vulkan.Builders (BufferUploadRefusal (..), Builders (..), bufferUploadsThrough, observingSpends, roomFor)
 import Hetoimasia.Render.TwoD.Vulkan.Chunks
 import Hetoimasia.Render.TwoD.Vulkan.Frame
 import Hetoimasia.Render.TwoD.Vulkan.Textures (MarkPolicy (..), registeredMarks)
 import Hetoimasia.Render.TwoD.Vulkan.Window
 import Numeric.Natural (Natural)
-import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldReturn, shouldSatisfy)
+import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldContain, shouldReturn, shouldSatisfy)
 import Test.Support.Bounded (bounded)
+import Test.Support.ExternalClient (Client (..), Mode (..), rejectedBecause, withStorePackageClient)
+import System.Exit (ExitCode (ExitSuccess))
 import Test.Support.Owned (withOwnedThread)
 import Test.Render.TwoD.Vulkan.Environment
 import Test.Render.TwoD.Vulkan.StandIn
@@ -79,6 +82,7 @@ spec = describe "Retained chunks" $ do
   holdsSpec
   releaseSpec
   pressureSpec
+  boundarySpec
 
 -- ---------------------------------------------------------------------------
 -- Fixtures
@@ -173,16 +177,14 @@ trackedBuilders setup =
         either (const (pure ())) (\buffer → atomicModifyIORef' (trackedMade tracked) (\held → (held <> [buffer], ()))) made
         pure made
     , bufferUploads =
-        base
-          { uploadGranted = \grant buffer bytes → do
-              failing ← readIORef (trackedFail tracked)
-              if failing
-                then writeIORef (trackedFail tracked) False >> rethrowIO (ExceptionWithContext (addExceptionAnnotation (ThrowSite "the upload's admission") emptyExceptionContext) ThreadKilled)
-                else do
-                  answer ← uploadGranted base grant buffer bytes
-                  either (const (pure ())) (const (atomicModifyIORef' (trackedUploads tracked) (\count → (count + 1, ())))) answer
-                  pure answer
-          }
+        flip observingSpends base $ \spend grant buffer bytes → do
+          failing ← readIORef (trackedFail tracked)
+          if failing
+            then writeIORef (trackedFail tracked) False >> rethrowIO (ExceptionWithContext (addExceptionAnnotation (ThrowSite "the upload's admission") emptyExceptionContext) ThreadKilled)
+            else do
+              answer ← spend grant buffer bytes
+              either (const (pure ())) (const (atomicModifyIORef' (trackedUploads tracked) (\count → (count + 1, ())))) answer
+              pure answer
     , releaseBuffer = \buffer → do
         atomicModifyIORef' (trackedReleased tracked) (\held → (held <> [buffer], ()))
         releaseBuffer (builders (setupRig setup)) buffer
@@ -393,7 +395,7 @@ refusalSpec = describe "refusing a build" $ do
       length <$> readIORef (trackedMade (setupTracked setup)) >>= (`shouldBe` 8)
       settleUploads (setupRig setup)
       -- admitted, then its upload refused after the buffer was made: that buffer released, the grant given back
-      let refusing = (trackedBuilders setup) {bufferUploads = (bufferUploads (trackedBuilders setup)) {uploadGranted = \_ _ _ → pure (Left (BufferUploadRefused UploadClosed))}}
+      let refusing = (trackedBuilders setup) {bufferUploads = observingSpends (\_ _ _ _ → pure (Left (BufferUploadRefused UploadClosed))) (bufferUploads (trackedBuilders setup))}
       answer ← withRecords refusing [cutAt 0 1]
       made ← readIORef (trackedMade (setupTracked setup))
       case answer of
@@ -408,7 +410,7 @@ refusalSpec = describe "refusing a build" $ do
       let raising =
             (trackedBuilders setup)
               { releaseBuffer = \buffer → atomicModifyIORef' calls (\held → (held <> [buffer], ())) >> throwIO (ErrorCall "the release raised")
-              , bufferUploads = (bufferUploads (trackedBuilders setup)) {uploadGranted = \_ _ _ → pure (Left (BufferUploadRefused UploadClosed))}
+              , bufferUploads = observingSpends (\_ _ _ _ → pure (Left (BufferUploadRefused UploadClosed))) (bufferUploads (trackedBuilders setup))
               }
       answer ← buildRetainedChunk raising (setupRetained setup) artMarks ChunkWorldDepth DeriveBounds [cutAt 0 1]
       made ← readIORef (trackedMade (setupTracked setup))
@@ -475,7 +477,7 @@ refusalSpec = describe "refusing a build" $ do
       _ ← mapM (\i → built setup ChunkWorldDepth [cutAt (fromIntegral (i ∷ Int)) 1]) [1 .. 7]
       let refusing =
             (trackedBuilders setup)
-              { bufferUploads = (bufferUploads (trackedBuilders setup)) {uploadGranted = \_ _ _ → pure (Left (BufferUploadRefused UploadClosed))}
+              { bufferUploads = observingSpends (\_ _ _ _ → pure (Left (BufferUploadRefused UploadClosed))) (bufferUploads (trackedBuilders setup))
               , releaseBuffer = \_ → throwIO ThreadKilled
               }
       -- admitted through the uploads that refuse its upload: a grant is spent by the uploads that reserved it
@@ -524,7 +526,7 @@ refusalSpec = describe "refusing a build" $ do
     bounded . withSetup $ \setup → do
       -- seven uploads hold seven of the queue's eight places; the grant holds the last
       _ ← mapM (\i → built setup ChunkWorldDepth [cutAt (fromIntegral (i ∷ Int)) 1]) [1 .. 7]
-      let refusing = (trackedBuilders setup) {bufferUploads = (bufferUploads (trackedBuilders setup)) {uploadGranted = \_ _ _ → pure (Left (BufferUploadRefused UploadClosed))}}
+      let refusing = (trackedBuilders setup) {bufferUploads = observingSpends (\_ _ _ _ → pure (Left (BufferUploadRefused UploadClosed))) (bufferUploads (trackedBuilders setup))}
       prepared ← either (fail . show) pure (prepareRetainedChunk artMarks ChunkWorldDepth DeriveBounds Map.empty [cutAt 0 1])
       grant ← atomically (admitRetainedChunk (bufferUploads refusing) (setupRetained setup) prepared) >>= either (fail . show) pure
       answer ← spendChunkGrant refusing (setupRetained setup) grant
@@ -632,22 +634,21 @@ refusalSpec = describe "refusing a build" $ do
 
   it "answers uploads awaiting their startup as a refusal that can change, and uploads the host lacks with their cause" $
     withSetup $ \setup → do
-      ready ← newTVarIO False
-      let base = bufferUploads (builders (setupRig setup))
-          awaiting =
-            base
-              { roomFor = \bytes → readTVar ready >>= \up → if up then roomFor base bytes else pure (Left BufferUploadsNotReady)
-              , reserveRoom = \bytes → readTVar ready >>= \up → if up then reserveRoom base bytes else pure (Left BufferUploadsNotReady)
-              }
-          lacking cause = base {roomFor = \_ → pure (Left (BufferUploadsUnavailable cause)), reserveRoom = \_ → pure (Left (BufferUploadsUnavailable cause))}
+      -- uploads an owner records in its cell, under its admission: configured and not yet made, then made
+      config ← either (fail . show) pure (validateUploadConfig 1048576 262144 8)
+      owner ← newAdmissionIO >>= newTVarIO . admissionToken
+      standing ← newTVarIO (UploadsPending config)
+      let rig = setupRig setup
+          awaiting = bufferUploadsThrough (ownedUploadAccess (rigRoots rig) owner standing)
+          lacking held = bufferUploadsThrough . ownedUploadAccess (rigRoots rig) owner <$> newTVarIO held
           prepared = either (error . show) id (prepareRetainedChunk artMarks ChunkWorldDepth DeriveBounds Map.empty [cutAt 0 1])
           admit uploads = fmap (const ()) <$> atomically (admitRetainedChunk uploads (setupRetained setup) prepared)
       admit awaiting `shouldReturn` Left BuildUploadsNotReady
       atomically (chunkRoom (roomFor awaiting) (setupRetained setup) (preparedBytes prepared)) `shouldReturn` Left BuildUploadsNotReady
-      atomically (writeTVar ready True)
+      atomically (writeTVar standing (UploadsMade (rigUploads rig)))
       admit awaiting `shouldReturn` Right ()
-      admit (lacking "the host configured no uploads") `shouldReturn` Left (BuildUploadsUnavailable "the host configured no uploads")
-      admit (lacking "the device refused the uploads: out of memory") `shouldReturn` Left (BuildUploadsUnavailable "the device refused the uploads: out of memory")
+      lacking UploadsUnconfigured >>= admit >>= (`shouldBe` Left (BuildUploadsUnavailable "the host configured no uploads"))
+      lacking (UploadsRefused RefusedDeviceAbsent) >>= admit >>= (`shouldBe` Left (BuildUploadsUnavailable ("the device refused the uploads: " <> Text.pack (show RefusedDeviceAbsent))))
 
   it "ends the chunk's reference when it is released, whether its upload had completed or not, reusing the index under the next generation" $
     withSetup $ \setup → do
@@ -1230,3 +1231,34 @@ chunkRefOf = Backend.chunkRef
 chunkRefIndexOf, chunkRefGenerationOf ∷ ChunkRef → Word32
 chunkRefIndexOf = Backend.chunkRefIndex
 chunkRefGenerationOf = Backend.chunkRefGeneration
+
+-- ---------------------------------------------------------------------------
+-- The uploads' boundary
+
+-- | What a client of the renderer can make of a build's uploads: it can observe the spend, which a build runs outside
+-- every transaction, and it cannot forge the uploads or reach their room and reservation, which the registry's
+-- admission commit takes.
+boundarySpec ∷ Spec
+boundarySpec = describe "the uploads a build reserves through" $ do
+  it "accepts a client that observes a build's spend" $
+    withClient (unlines ["module Client (spends) where", "import Hetoimasia.Render.TwoD.Vulkan (noBufferUploads, observingSpends)", "spends = observingSpends id noBufferUploads"]) $ \compile → do
+      outcome ← compile Typecheck
+      case clientStatus outcome of
+        ExitSuccess → pure ()
+        status → expectationFailure ("the supported client must compile, but the compiler exited with " <> show status <> ":\n" <> clientOutput outcome)
+
+  it "rejects a client that forges the uploads" $
+    withClient (unlines ["module Client (forged) where", "import Hetoimasia.Render.TwoD.Vulkan.Builders", "forged = BufferUploads"]) $ \compile → do
+      outcome ← compile Typecheck
+      -- no data constructor of that name is in scope: only the type is exported
+      rejectedBecause outcome "GHC-01928"
+      clientOutput outcome `shouldContain` "BufferUploads"
+
+  forM_ ["bufferAccess", "bufferSpend"] $ \field →
+    it ("rejects a client that asks for the uploads' " <> field) $
+      withClient (unlines ["module Client () where", "import Hetoimasia.Render.TwoD.Vulkan.Builders (" <> field <> ")"]) $ \compile → do
+        outcome ← compile Typecheck
+        rejectedBecause outcome "GHC-61689"
+        clientOutput outcome `shouldContain` field
+  where
+    withClient = withStorePackageClient ["base", "hetoimasia-render-2d-vulkan"] "Client.hs"

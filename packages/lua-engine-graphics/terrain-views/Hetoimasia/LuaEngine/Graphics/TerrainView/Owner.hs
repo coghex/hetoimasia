@@ -57,7 +57,7 @@ import Hetoimasia.Render.TwoD.Chunk (BoundsRequest (DeriveBounds), ChunkKind (Ch
 import Hetoimasia.Render.TwoD.Material (MaterialRecord, MaterialRef)
 import Hetoimasia.Render.TwoD.Snapshot (Instance)
 import Hetoimasia.Render.TwoD.Vulkan (registerMaterial, rendererDepthFormat, rendererRegionWindow)
-import Hetoimasia.Render.TwoD.Vulkan.Builders (BufferUploads (roomFor), Builders)
+import Hetoimasia.Render.TwoD.Vulkan.Builders (Builders, roomFor)
 import Hetoimasia.Render.TwoD.Vulkan.Chunks
   ( BuildRefusal (..)
   , BuildRefused (..)

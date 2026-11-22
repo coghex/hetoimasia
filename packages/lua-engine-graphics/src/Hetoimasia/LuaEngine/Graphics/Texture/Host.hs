@@ -97,9 +97,7 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , requestVulkanRelease
   , submitVulkanAction
   , submitVulkanUpload
-  , vulkanUploadRoom
-  , reserveVulkanUpload
-  , submitVulkanGranted
+  , vulkanUploadAccess
   , swapConstructedTexture
   , awaitVulkanAction
   )
@@ -108,7 +106,7 @@ import Hetoimasia.LuaEngine.Graphics.Scene.Ledger (SceneLedger, ledgerHeld)
 import Hetoimasia.Render.TwoD.Vulkan.Chunks (Retained, newRetained)
 import Hetoimasia.LuaEngine.Graphics.Texture.Port
 import qualified Hetoimasia.Render.TwoD.Vulkan as Render
-import Hetoimasia.Render.TwoD.Vulkan.Builders (BufferUploadRefusal (..), BufferUploads (..), Builders (..), noBufferUploads)
+import Hetoimasia.Render.TwoD.Vulkan.Builders (BufferUploadRefusal (..), BufferUploads, Builders (..), bufferUploadsThrough, noBufferUploads)
 import Hetoimasia.Render.TwoD.Vulkan.Textures
   ( MarkPolicy (DefaultMark)
   , TextureRefusal (..)
@@ -149,14 +147,10 @@ hostBuilders ∷ VulkanHost scene → Construction q inst msgr phys dev cmd → 
 hostBuilders host construction = (renderBuilders construction) {bufferUploads = hostBufferUploads host}
 
 -- | The host's bounded uploads as a retained chunk's build reaches them, from any thread: room observed or reserved
--- under the owner's gate, in the caller's transaction, answered as 'hostUploadAnswer' says.
+-- under the owner's admission, in the caller's transaction, every decision the native uploads' own over the host's
+-- cells ('vulkanUploadAccess').
 hostBufferUploads ∷ VulkanHost scene → BufferUploads
-hostBufferUploads host =
-  BufferUploads
-    { roomFor = fmap hostUploadAnswer . vulkanUploadRoom host
-    , reserveRoom = fmap hostUploadAnswer . reserveVulkanUpload host
-    , uploadGranted = \grant buffer bytes → hostUploadAnswer <$> submitVulkanGranted host grant buffer bytes
-    }
+hostBufferUploads = bufferUploadsThrough . vulkanUploadAccess
 
 -- | The host's upload answer as a chunk's build reads it: uploads configured and awaiting the device are not ready
 -- (their startup can make them); none configured, or a startup the device refused, is unavailable with its cause;

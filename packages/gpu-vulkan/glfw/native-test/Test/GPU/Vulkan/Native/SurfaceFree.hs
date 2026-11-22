@@ -257,10 +257,7 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , awaitUploadTicket
   , copyLevelToReadback
   , submitVulkanUpload
-  , UploadsUnavailable (UploadsNotReady)
-  , vulkanUploadRoom
-  , reserveVulkanUpload
-  , submitVulkanGranted
+  , vulkanUploadAccess
   , validateUploadConfig
   , LookupEntry (..)
   , TableSampler (..)
@@ -288,7 +285,6 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , beginRenderingWithDepth
   , clearDepthRect
   , depthTested
-  , VulkanUploadRefusal (..)
   , requestVulkanRelease
   )
 import Hetoimasia.GPU.Vulkan.Native.Presentation (formatB8G8R8A8Srgb)
@@ -2080,17 +2076,7 @@ retainedHost vulkan =
           Right _ → pure (Right ())
     }
   where
-    uploads =
-      Render.BufferUploads
-        { Render.roomFor = fmap answered . vulkanUploadRoom vulkan
-        , Render.reserveRoom = fmap answered . reserveVulkanUpload vulkan
-        , Render.uploadGranted = \grant buffer bytes → answered <$> submitVulkanGranted vulkan grant buffer bytes
-        }
-    answered = \case
-      Left (VulkanUploadRefused refusal) → Left (Render.BufferUploadRefused refusal)
-      Left (VulkanUploadsUnavailable UploadsNotReady) → Left Render.BufferUploadsNotReady
-      Left (VulkanUploadsUnavailable unavailable) → Left (Render.BufferUploadsUnavailable (tshow unavailable))
-      Right value → Right value
+    uploads = Render.bufferUploadsThrough (vulkanUploadAccess vulkan)
 
 -- | The ordered path's evidence host over this suite's session: owner-thread
 -- actions over its constructions, uploads admitted from the main thread and

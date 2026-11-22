@@ -113,6 +113,8 @@ data Rig = Rig
   , rigNaming ∷ !(TVar (Maybe SomeException))
     -- ^ An exception the allocator's next naming call raises, once.
   , rigWriting ∷ !(TVar (Maybe SomeException))
+  , rigRoots ∷ !(Roots () Int Int Text Int)
+    -- ^ The session's roots.
     -- ^ An exception the next write into mapped memory raises, once, before it writes.
   }
 
@@ -162,7 +164,7 @@ newRigWith offered windowed = do
         _ ← stepGenerations generations (scriptedInstant zeroDuration) (Map.singleton admitted (TargetGeometry (Right ()) (Just (SurfaceExtent 640 480)) Nothing 1))
         mapM_ (\slot → createFrameStorage recording admitted slot >>= either (fail . show) pure) [0, 1]
         pure (Just admitted)
-  pure (Rig recording frames uploads commands writes fences handles pipelines layouts window naming writing)
+  pure (Rig recording frames uploads commands writes fences handles pipelines layouts window naming writing roots)
 
 -- | Make the renderer as a host does — the ring, the table, the layout — and
 -- let the table's placeholder upload complete, so a batch can bind it.

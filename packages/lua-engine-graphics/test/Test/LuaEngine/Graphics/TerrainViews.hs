@@ -30,7 +30,7 @@ import Hetoimasia.GPU.Vulkan.GLFW (Refusal (RefusedDeviceAbsent), TicketState (.
 import Hetoimasia.LuaEngine.Graphics.Texture.Host (hostUploadAnswer)
 import Hetoimasia.Render.TwoD.Vulkan.Builders (BufferUploadRefusal (..))
 import Hetoimasia.LuaEngine.Graphics.Scene
-import Hetoimasia.LuaEngine.Graphics.TerrainView hiding (styleAssets)
+import Hetoimasia.LuaEngine.Graphics.TerrainView.Internal hiding (styleAssets)
 import Hetoimasia.LuaEngine.Graphics.Texture (textureHandleOf)
 import Hetoimasia.LuaEngine.Texture (RenderAccount, accountCharged, newRenderAccount)
 import Hetoimasia.Render.TwoD.Chunk (BoundsRequest (DeriveBounds), Chunk, ChunkKind (ChunkWorldDepth), ChunkRef, chunksFrom)

@@ -76,6 +76,18 @@ module Hetoimasia.GPU.Vulkan.Native.Uploads
   , closeUploads
   , retireUploads
 
+    -- * Access
+  , UploadsStanding (..)
+  , UploadsUnavailable (..)
+  , UploadAccess
+  , noUploadAccess
+  , sessionUploadAccess
+  , ownedUploadAccess
+  , accessGate
+  , accessRoom
+  , accessReserve
+  , accessSubmitGranted
+
     -- * Observation
   , UploadPhase (..)
   , UploadView (..)

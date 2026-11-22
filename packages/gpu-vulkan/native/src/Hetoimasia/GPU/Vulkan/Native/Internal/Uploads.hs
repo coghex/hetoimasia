@@ -76,6 +76,18 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Uploads
   , closeUploads
   , retireUploads
 
+    -- * Access
+  , UploadsStanding (..)
+  , UploadsUnavailable (..)
+  , UploadAccess
+  , noUploadAccess
+  , sessionUploadAccess
+  , ownedUploadAccess
+  , accessGate
+  , accessRoom
+  , accessReserve
+  , accessSubmitGranted
+
     -- * Observation
   , UploadPhase (..)
   , UploadView (..)
@@ -84,7 +96,7 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Uploads
   ) where
 
 import Control.Concurrent (ThreadId, myThreadId)
-import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVar, newTVarIO, orElse, readTVar, retry, writeTVar)
+import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVar, newTVarIO, orElse, readTVar, readTVarIO, retry, writeTVar)
 import Control.Exception (SomeException, evaluate, mask, rethrowIO, tryWithContext)
 import Control.Monad (forM, forM_, unless, when)
 import Data.ByteString (ByteString)
@@ -153,7 +165,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   , tshow
   )
 import Hetoimasia.GPU.Vulkan.Native.Profile (DevicePlan (..))
-import Hetoimasia.GPU.Vulkan.Native.Roots (TerminalCause, TerminalReport (reportPrimary), readRootsDevice, readRootsModel, readRootsTerminal, rootsSessionIdentity)
+import Hetoimasia.GPU.Vulkan.Native.Roots (Roots, TerminalCause, TerminalReport (reportPrimary), readRootsDevice, readRootsModel, readRootsTerminal, rootsSessionIdentity)
 
 -- ---------------------------------------------------------------------------
 -- Configuration
@@ -1264,6 +1276,111 @@ readUploads uploads = do
 
 roundUp ∷ Natural → Natural → Natural
 roundUp value granule = ((value + granule - 1) `div` granule) * granule
+
+-- ---------------------------------------------------------------------------
+-- Access
+
+-- | Where a session's uploads stand, as their owner records them in its cell.
+data UploadsStanding q inst msgr phys dev cmd
+  = UploadsUnconfigured
+    -- ^ The host configured none.
+  | UploadsPending !UploadConfig
+    -- ^ Configured, and not yet made: the device does not exist yet.
+  | UploadsMade !(Uploads q inst msgr phys dev cmd)
+  | UploadsRefused !Refusal
+    -- ^ The device refused them: the turn budget holds no block row of its
+    -- widest level, or the staging buffer could not be made.
+
+-- | Why access to a session's uploads takes no upload now.
+data UploadsUnavailable
+  = UploadsNotConfigured
+    -- ^ The host configured no uploads.
+  | UploadsNotReady
+    -- ^ Configured, and not yet made: the device does not exist yet.
+  | UploadsRefusedBy !Refusal
+    -- ^ The device refused them when they were made.
+  deriving (Eq, Show)
+
+-- | A holder's way to a session's uploads, as data: none; a session's own uploads, ungated; or the uploads an owner
+-- records in its cell, under its admission (the token in its cell) and the session's terminal state. Every decision
+-- made through it is this module's own, over those cells and the uploads' state: it runs no holder's code, so the
+-- transactions that observe room and reserve it may take one.
+data UploadAccess
+  = NoUploadAccess
+  | ∀ q inst msgr phys dev cmd. SessionUploadAccess !(Uploads q inst msgr phys dev cmd)
+  | ∀ q inst msgr phys dev cmd. OwnedUploadAccess !(Roots q inst msgr phys dev) !(TVar AdmissionToken) !(TVar (UploadsStanding q inst msgr phys dev cmd))
+
+-- | Access to no uploads: every upload is refused as closed.
+noUploadAccess ∷ UploadAccess
+noUploadAccess = NoUploadAccess
+
+-- | A session's own uploads, ungated.
+sessionUploadAccess ∷ Uploads q inst msgr phys dev cmd → UploadAccess
+sessionUploadAccess = SessionUploadAccess
+
+-- | The uploads an owner records in this cell, under the admission whose token is in that cell and the session's
+-- terminal state, read through these roots.
+ownedUploadAccess ∷ Roots q inst msgr phys dev → TVar AdmissionToken → TVar (UploadsStanding q inst msgr phys dev cmd) → UploadAccess
+ownedUploadAccess = OwnedUploadAccess
+
+-- | The gate an access admits uploads under: none closed, a session's own ungated, and an owner's refusing once the
+-- session has failed, with its primary, or its admission has closed, and otherwise naming that admission.
+accessGate ∷ UploadAccess → UploadGate
+accessGate = \case
+  NoUploadAccess → pure (Left UploadClosed)
+  SessionUploadAccess _ → ungated
+  OwnedUploadAccess roots owner _ → ownerGate roots owner
+
+ownerGate ∷ Roots q inst msgr phys dev → TVar AdmissionToken → UploadGate
+ownerGate roots owner =
+  reportPrimary <$> readRootsTerminal roots >>= \case
+    Just primary → pure (Left (UploadSessionFailed primary))
+    Nothing → do
+      token ← readTVar owner
+      open ← tokenOpen token
+      pure (if open then Right (UploadAdmitted token) else Left UploadClosed)
+
+-- | Whether an upload of this many bytes would be reserved through this access now, read-only ('uploadRoom').
+accessRoom ∷ UploadAccess → Natural → STM (Either (Either UploadsUnavailable UploadRefusal) ())
+accessRoom access bytes = through access (`uploadRoom` bytes)
+
+-- | Reserve through this access the room an upload of this many bytes needs ('reserveUpload'), the gate and the
+-- standing read in the same transaction: a refusal reserves nothing.
+accessReserve ∷ UploadAccess → Natural → STM (Either (Either UploadsUnavailable UploadRefusal) UploadGrant)
+accessReserve access bytes = through access (`reserveUpload` bytes)
+
+through
+  ∷ UploadAccess
+  → (∀ q inst msgr phys dev cmd. Uploads q inst msgr phys dev cmd → STM (Either UploadRefusal a))
+  → STM (Either (Either UploadsUnavailable UploadRefusal) a)
+through access decide = case access of
+  NoUploadAccess → pure (Left (Right UploadClosed))
+  SessionUploadAccess uploads → either (Left . Right) Right <$> decide uploads
+  OwnedUploadAccess roots owner standing →
+    ownerGate roots owner >>= \case
+      Left refusal → pure (Left (Right refusal))
+      Right _ →
+        readTVar standing >>= \case
+          UploadsMade uploads → either (Left . Right) Right <$> decide uploads
+          other → pure (Left (Left (unavailable other)))
+
+unavailable ∷ UploadsStanding q inst msgr phys dev cmd → UploadsUnavailable
+unavailable = \case
+  UploadsUnconfigured → UploadsNotConfigured
+  UploadsPending _ → UploadsNotReady
+  UploadsRefused refusal → UploadsRefusedBy refusal
+  UploadsMade _ → UploadsNotReady
+
+-- | Spend a reservation through this access ('submitUploadGranted', under 'accessGate'). Uploads not made leave the
+-- reservation as it was.
+accessSubmitGranted ∷ UploadAccess → UploadGrant → Buffer → ByteString → IO (Either (Either UploadsUnavailable UploadRefusal) UploadTicket)
+accessSubmitGranted access grant buffer bytes = case access of
+  NoUploadAccess → pure (Left (Right UploadClosed))
+  SessionUploadAccess uploads → either (Left . Right) Right <$> submitUploadGranted ungated uploads grant buffer bytes
+  OwnedUploadAccess roots owner standing →
+    readTVarIO standing >>= \case
+      UploadsMade uploads → either (Left . Right) Right <$> submitUploadGranted (ownerGate roots owner) uploads grant buffer bytes
+      other → pure (Left (Left (unavailable other)))
 
 roundDown ∷ Natural → Natural → Natural
 roundDown value granule = (value `div` granule) * granule

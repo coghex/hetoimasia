@@ -237,6 +237,7 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , VulkanUploadRefusal (..)
   , submitVulkanUpload
   , cancelVulkanUpload
+  , vulkanUploadAccess
   , vulkanUploadRoom
   , reserveVulkanUpload
   , submitVulkanGranted
@@ -480,11 +481,12 @@ import Hetoimasia.GPU.Vulkan.Native.Uploads
   ( CancelRefusal
   , UploadConfig
   , UploadGate
-  , UploadRefusal (UploadClosed, UploadSessionFailed)
+  , UploadRefusal
   , UploadGrant
   , UploadRequest
   , UploadTicket
-  , admittedWhile
+  , UploadAccess
+  , accessGate
   )
 import Hetoimasia.GPU.Vulkan.Native.Generations
   ( GenerationUse
@@ -1304,18 +1306,16 @@ submitVulkanUpload (VulkanController state) request =
 -- | The owner's own gate, read in the transactions that reserve and queue an
 -- upload, so none is reserved or queued once quiescence has closed the owner.
 uploadGate ∷ State inst msgr phys dev cmd lease obligation → UploadGate
-uploadGate state =
-  uploadRefusalNow state >>= \case
-    Just refusal → pure (Left refusal)
-    Nothing → Right . admittedWhile <$> readTVar (stateOwnerOpen state)
+uploadGate state = accessGate (stateUploadAccess state)
 
--- The owner's admission as an upload reads it now, through the controller's own cells.
-uploadRefusalNow ∷ State inst msgr phys dev cmd lease obligation → STM (Maybe UploadRefusal)
-uploadRefusalNow state =
-  actionGate (stateRoots state) (stateOwnerOpen state) <&> \case
-    Just (ActionSessionFailed primary) → Just (UploadSessionFailed primary)
-    Just _ → Just UploadClosed
-    Nothing → Nothing
+-- The session's uploads under the owner's admission, through the controller's own cells.
+stateUploadAccess ∷ State inst msgr phys dev cmd lease obligation → UploadAccess
+stateUploadAccess state = renderingUploadAccess (stateRendering state) (stateOwnerOpen state)
+
+-- | The session's uploads as a holder reaches them from any thread: room, reservation and spend under the owner's
+-- admission and the session's terminal state, every decision the native uploads' own over the controller's cells.
+vulkanUploadAccess ∷ VulkanController → UploadAccess
+vulkanUploadAccess (VulkanController state) = stateUploadAccess state
 
 -- | Whether an upload of this many bytes would be admitted now, from any
 -- thread, read-only: the decision 'reserveVulkanUpload' makes, under the
@@ -1323,7 +1323,7 @@ uploadRefusalNow state =
 vulkanUploadRoom ∷ VulkanController → Natural → STM (Either VulkanUploadRefusal ())
 vulkanUploadRoom (VulkanController state) bytes =
   either (Left . either VulkanUploadsUnavailable VulkanUploadRefused) Right
-    <$> renderingUploadRoom (stateRendering state) (uploadRefusalNow state) bytes
+    <$> renderingUploadRoom (stateUploadAccess state) bytes
 
 -- | Reserve, in the caller's transaction, the queue place and staging region
 -- an upload of this many bytes needs, under the owner's gate: shared with
@@ -1332,7 +1332,7 @@ vulkanUploadRoom (VulkanController state) bytes =
 reserveVulkanUpload ∷ VulkanController → Natural → STM (Either VulkanUploadRefusal UploadGrant)
 reserveVulkanUpload (VulkanController state) bytes =
   either (Left . either VulkanUploadsUnavailable VulkanUploadRefused) Right
-    <$> reserveRenderingUpload (stateRendering state) (uploadRefusalNow state) bytes
+    <$> reserveRenderingUpload (stateUploadAccess state) bytes
 
 -- | Spend a reservation on the upload that fills a fresh vertex buffer of
 -- exactly its bytes, under the owner's gate. A refusal before binding leaves
@@ -1342,7 +1342,7 @@ reserveVulkanUpload (VulkanController state) bytes =
 submitVulkanGranted ∷ VulkanController → UploadGrant → Buffer → ByteString → IO (Either VulkanUploadRefusal UploadTicket)
 submitVulkanGranted (VulkanController state) grant buffer bytes =
   either (Left . either VulkanUploadsUnavailable VulkanUploadRefused) Right
-    <$> submitRenderingGranted (stateRendering state) (uploadGate state) grant buffer bytes
+    <$> submitRenderingGranted (stateUploadAccess state) grant buffer bytes
 
 -- | Abandon a reservation, from any thread: its room is free again.
 abandonVulkanGrant ∷ VulkanController → UploadGrant → STM ()

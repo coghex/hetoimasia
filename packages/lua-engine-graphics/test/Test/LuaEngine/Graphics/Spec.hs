@@ -18,6 +18,7 @@ import qualified Test.LuaEngine.Graphics.PixelComparator as PixelComparator
 import qualified Test.LuaEngine.Graphics.Pressure as Pressure
 import qualified Test.LuaEngine.Graphics.TerrainParents as TerrainParents
 import qualified Test.LuaEngine.Graphics.TerrainViews as TerrainViews
+import qualified Test.LuaEngine.Graphics.TerrainViewsBoundary as TerrainViewsBoundary
 import qualified Test.LuaEngine.Graphics.Release as Release
 import qualified Test.LuaEngine.Graphics.SceneFrames as SceneFrames
 import qualified Test.LuaEngine.Graphics.ScenePublication as ScenePublication
@@ -37,6 +38,7 @@ spec = do
   Pressure.spec
   TerrainParents.spec
   TerrainViews.spec
+  TerrainViewsBoundary.spec
   Release.spec
   Teardown.spec
   Lifecycle.spec

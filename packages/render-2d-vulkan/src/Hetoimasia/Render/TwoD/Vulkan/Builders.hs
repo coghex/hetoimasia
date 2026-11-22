@@ -8,10 +8,15 @@
 -- type parameters are the host session's, which only a batch's recorder names.
 module Hetoimasia.Render.TwoD.Vulkan.Builders
   ( Builders (..)
-  , BufferUploads (..)
+  , BufferUploads
+  , roomFor
+  , reserveRoom
+  , uploadGranted
   , BufferUploadRefusal (..)
   , noBufferUploads
   , bufferUploadsOf
+  , bufferUploadsThrough
+  , observingSpends
   ) where
 
 import Control.Concurrent.STM (STM)
@@ -31,15 +36,19 @@ import Hetoimasia.GPU.Vulkan.Native.Recording
   , StorageWindow
   )
 import Hetoimasia.GPU.Vulkan.Native.Shader (CheckedShaders)
+import qualified Data.Text as Text
 import Hetoimasia.GPU.Vulkan.Native.Uploads
-  ( UploadGrant
-  , UploadRefusal (UploadClosed)
+  ( UploadAccess
+  , UploadGrant
+  , UploadRefusal
   , UploadTicket
   , Uploads
-  , reserveUpload
-  , submitUploadGranted
-  , ungated
-  , uploadRoom
+  , UploadsUnavailable (..)
+  , accessReserve
+  , accessRoom
+  , accessSubmitGranted
+  , noUploadAccess
+  , sessionUploadAccess
   )
 import Numeric.Natural (Natural)
 import Hetoimasia.GPU.Vulkan.Native.TextureTable
@@ -97,21 +106,61 @@ data Builders q inst msgr phys dev cmd = Builders
 -- host's uploads make for every caller, before the vertex buffer is made, and
 -- the reservation is spent once by the upload that fills the buffer, or
 -- abandoned.
+--
+-- Room and reservation are the native uploads' own decisions over their
+-- issuer's cells ('UploadAccess'), so a registry's admission commit may take
+-- one: nothing a holder supplies runs in it. Only the spend, which a build
+-- runs on its own thread outside every transaction, can be observed
+-- ('observingSpends').
 data BufferUploads = BufferUploads
-  { roomFor ∷ Natural → STM (Either BufferUploadRefusal ())
-    -- ^ Whether an upload of this many bytes would be reserved now, read-only.
-  , reserveRoom ∷ Natural → STM (Either BufferUploadRefusal UploadGrant)
-    -- ^ Reserve its queue place and staging region; a refusal reserves nothing.
-  , uploadGranted ∷ UploadGrant → Buffer → ByteString → IO (Either BufferUploadRefusal UploadTicket)
-    -- ^ Spend the reservation on the upload that fills a fresh vertex buffer of
-    -- exactly its bytes: admission copies the bytes before it returns and never
-    -- waits, and the ticket says where the upload stands. A refusal before
-    -- binding leaves the reservation to be spent or abandoned; once bound, a
-    -- failed or cancelled copy, or a refusal before the upload is queued, gives
-    -- its place and region back and consumes it, so abandoning it changes
-    -- nothing. An unspent reservation is given back through the uploads that
-    -- issued it ('returnUploadGrant'), not through this record.
+  { bufferAccess ∷ !UploadAccess
+  , bufferSpend ∷ UploadGrant → Buffer → ByteString → IO (Either BufferUploadRefusal UploadTicket)
   }
+
+-- | Whether an upload of this many bytes would be reserved now, read-only.
+roomFor ∷ BufferUploads → Natural → STM (Either BufferUploadRefusal ())
+roomFor uploads bytes = either (Left . bufferRefusal) Right <$> accessRoom (bufferAccess uploads) bytes
+
+-- | Reserve its queue place and staging region; a refusal reserves nothing.
+reserveRoom ∷ BufferUploads → Natural → STM (Either BufferUploadRefusal UploadGrant)
+reserveRoom uploads bytes = either (Left . bufferRefusal) Right <$> accessReserve (bufferAccess uploads) bytes
+
+-- | Spend the reservation on the upload that fills a fresh vertex buffer of
+-- exactly its bytes: admission copies the bytes before it returns and never
+-- waits, and the ticket says where the upload stands. A refusal before
+-- binding leaves the reservation to be spent or abandoned; once bound, a
+-- failed or cancelled copy, or a refusal before the upload is queued, gives
+-- its place and region back and consumes it, so abandoning it changes
+-- nothing. An unspent reservation is given back through the uploads that
+-- issued it ('returnUploadGrant'), not through this value.
+uploadGranted ∷ BufferUploads → UploadGrant → Buffer → ByteString → IO (Either BufferUploadRefusal UploadTicket)
+uploadGranted = bufferSpend
+
+-- | These uploads with their spend observed: the observer is given the spend and runs in its place, on the build's
+-- thread, outside every transaction. Room and reservation are unchanged.
+observingSpends
+  ∷ ((UploadGrant → Buffer → ByteString → IO (Either BufferUploadRefusal UploadTicket)) → UploadGrant → Buffer → ByteString → IO (Either BufferUploadRefusal UploadTicket))
+  → BufferUploads
+  → BufferUploads
+observingSpends observe uploads = uploads {bufferSpend = observe (bufferSpend uploads)}
+
+-- | Uploads reached through this access: room, reservation and spend all the native uploads' own.
+bufferUploadsThrough ∷ UploadAccess → BufferUploads
+bufferUploadsThrough access =
+  BufferUploads
+    { bufferAccess = access
+    , bufferSpend = \grant buffer bytes → either (Left . bufferRefusal) Right <$> accessSubmitGranted access grant buffer bytes
+    }
+
+-- The access's answer as a chunk's build reads it: uploads configured and awaiting the device are not ready (their
+-- startup can make them); none configured, or a startup the device refused, is unavailable with its cause; every
+-- other refusal is the uploads' own.
+bufferRefusal ∷ Either UploadsUnavailable UploadRefusal → BufferUploadRefusal
+bufferRefusal = \case
+  Right refusal → BufferUploadRefused refusal
+  Left UploadsNotReady → BufferUploadsNotReady
+  Left UploadsNotConfigured → BufferUploadsUnavailable "the host configured no uploads"
+  Left (UploadsRefusedBy refusal) → BufferUploadsUnavailable ("the device refused the uploads: " <> Text.pack (show refusal))
 
 -- | Why the uploads did not answer room or an upload: the host's uploads are
 -- configured and not yet made (their startup can make them: a later attempt can
@@ -125,23 +174,8 @@ data BufferUploadRefusal
 
 -- | Uploads that admit nothing: a construction that records no chunk's buffer.
 noBufferUploads ∷ BufferUploads
-noBufferUploads =
-  BufferUploads
-    { roomFor = \_ → pure closed
-    , reserveRoom = \_ → pure closed
-    , uploadGranted = \_ _ _ → pure closed
-    }
-  where
-    closed = Left (BufferUploadRefused UploadClosed)
+noBufferUploads = bufferUploadsThrough noUploadAccess
 
 -- | A session's own uploads, ungated.
 bufferUploadsOf ∷ Uploads q inst msgr phys dev cmd → BufferUploads
-bufferUploadsOf uploads =
-  BufferUploads
-    { roomFor = fmap refused . uploadRoom uploads
-    , reserveRoom = fmap refused . reserveUpload uploads
-    , uploadGranted = \grant buffer bytes → refused <$> submitUploadGranted ungated uploads grant buffer bytes
-    }
-  where
-    refused ∷ Either UploadRefusal a → Either BufferUploadRefusal a
-    refused = either (Left . BufferUploadRefused) Right
+bufferUploadsOf = bufferUploadsThrough . sessionUploadAccess

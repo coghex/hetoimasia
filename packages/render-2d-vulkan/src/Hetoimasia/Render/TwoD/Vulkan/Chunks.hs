@@ -153,7 +153,7 @@ import Hetoimasia.Render.TwoD.Chunk.Backend (chunkRef, chunkRefGeneration, chunk
 import Hetoimasia.Render.TwoD.DrawPlan (CutoutMarks)
 import Hetoimasia.Render.TwoD.Encoding (encodeChunkCutouts)
 import Hetoimasia.Render.TwoD.Snapshot (Instance)
-import Hetoimasia.Render.TwoD.Vulkan.Builders (BufferUploadRefusal (..), BufferUploads (..), Builders (..))
+import Hetoimasia.Render.TwoD.Vulkan.Builders (BufferUploadRefusal (..), BufferUploads, Builders (..), reserveRoom, uploadGranted)
 import Numeric.Natural (Natural)
 
 -- | The registry of retained chunks.

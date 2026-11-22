@@ -208,6 +208,7 @@ module Hetoimasia.GPU.Vulkan.GLFW
   , cancelVulkanUpload
   , UploadGrant
   , uploadGrantBytes
+  , vulkanUploadAccess
   , vulkanUploadRoom
   , reserveVulkanUpload
   , submitVulkanGranted
@@ -582,6 +583,7 @@ import Hetoimasia.GPU.Vulkan.Native.TextureTable
   )
 import Hetoimasia.GPU.Vulkan.Native.Uploads
   ( CancelRefusal (..)
+  , UploadAccess
   , UploadConfig
   , UploadConfigRefused (..)
   , UploadPressure (..)
@@ -654,6 +656,11 @@ submitVulkanUpload host = Controller.submitVulkanUpload (vulkanController host)
 -- | Cancel an upload, from any thread, before its first copies are recorded.
 cancelVulkanUpload ∷ VulkanHost scene → UploadTicket → STM (Either CancelRefusal ())
 cancelVulkanUpload host = Controller.cancelVulkanUpload (vulkanController host)
+
+-- | The session's uploads as a holder reaches them from any thread ('Controller.vulkanUploadAccess'): room,
+-- reservation and spend under the owner's admission, every decision the native uploads' own over the host's cells.
+vulkanUploadAccess ∷ VulkanHost scene → UploadAccess
+vulkanUploadAccess host = Controller.vulkanUploadAccess (vulkanController host)
 
 -- | Whether an upload of this many bytes would be admitted into this host's session now, read-only, in the
 -- caller's transaction: the decision 'reserveVulkanUpload' makes.

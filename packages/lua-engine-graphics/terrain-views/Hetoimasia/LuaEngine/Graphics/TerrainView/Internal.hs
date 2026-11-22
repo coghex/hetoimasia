@@ -1,13 +1,14 @@
--- | Terrain views (TRA-9), the Haskell operations a Lua binding (#646) wraps: open a view of a borrowed arena on a
--- target under the exclusive claim it shares with M1, move it, configure it, close it, and read which revision its
--- target drew.
+-- | Terrain views (TRA-9) as the package itself reaches them: every module's names, including the graphics owner's
+-- capability records ('OwnerPorts', 'Hands', 'Grant', 'Receipt'), the copy hooks and the held target the headless
+-- rigs stand in with. This module is in the package's private library: no client reaches it. Clients use
+-- "Hetoimasia.LuaEngine.Graphics.TerrainView", whose composition is opaque.
 --
 -- The ownership, threads and endings are in "Hetoimasia.LuaEngine.Graphics.TerrainView.Session"; the limits and the
 -- allowance in "Hetoimasia.LuaEngine.Graphics.TerrainView.Profile"; the style's authority in
 -- "Hetoimasia.LuaEngine.Graphics.TerrainView.Style"; the planning inputs in
 -- "Hetoimasia.LuaEngine.Graphics.TerrainView.Inputs"; the graphics owner's capabilities in
 -- "Hetoimasia.LuaEngine.Graphics.TerrainView.Owner".
-module Hetoimasia.LuaEngine.Graphics.TerrainView
+module Hetoimasia.LuaEngine.Graphics.TerrainView.Internal
   ( module Hetoimasia.LuaEngine.Graphics.TerrainView.Owner
   , module Hetoimasia.LuaEngine.Graphics.TerrainView.Profile
   , module Hetoimasia.LuaEngine.Graphics.TerrainView.Session

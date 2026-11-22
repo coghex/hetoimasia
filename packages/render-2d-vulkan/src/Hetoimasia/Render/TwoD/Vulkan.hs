@@ -130,10 +130,15 @@
 module Hetoimasia.Render.TwoD.Vulkan
   ( -- * Constructions
     Builders (..)
-  , BufferUploads (..)
+  , BufferUploads
+  , roomFor
+  , reserveRoom
+  , uploadGranted
   , BufferUploadRefusal (..)
   , noBufferUploads
   , bufferUploadsOf
+  , bufferUploadsThrough
+  , observingSpends
     -- * Making the renderer
   , Configuration (..)
   , defaultConfiguration
@@ -218,7 +223,7 @@ import Hetoimasia.Render.TwoD.Material (MaterialRef, defaultMaterial)
 import Hetoimasia.Render.TwoD.Material.Backend (materialRef, materialRefIdentity)
 import Hetoimasia.Render.TwoD.Snapshot (Pass (..), Snapshot (..), Target (..))
 import Hetoimasia.Render.TwoD.Validation (Location (..), validSnapshot)
-import Hetoimasia.Render.TwoD.Vulkan.Builders (BufferUploadRefusal (..), BufferUploads (..), Builders (..), bufferUploadsOf, noBufferUploads)
+import Hetoimasia.Render.TwoD.Vulkan.Builders (BufferUploadRefusal (..), BufferUploads, Builders (..), bufferUploadsOf, bufferUploadsThrough, noBufferUploads, observingSpends, reserveRoom, roomFor, uploadGranted)
 import Hetoimasia.Render.TwoD.Vulkan.Frame
 import Hetoimasia.Render.TwoD.Vulkan.Layout (applicationPushOffset, instanceStride, packRecordBase, recordBaseOffset)
 import Hetoimasia.Render.TwoD.Vulkan.Material (DefinedMaterial (..))

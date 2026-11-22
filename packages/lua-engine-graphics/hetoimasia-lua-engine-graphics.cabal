@@ -83,14 +83,16 @@ library
         hetoimasia-lua-engine-graphics:internal
 
 -- Terrain views (TRA-9): the session-owned views of borrowed terrain arenas, prepared and published by the graphics
--- owner, retired through the host's release lane. The package's only component that depends on the terrain packages;
--- the main library imports none of them.
-library terrain-views
+-- owner, retired through the host's release lane. The package's only components that depend on the terrain packages;
+-- the main library imports none of them. The implementation is private: its modules export the graphics owner's
+-- capability records, the copy hooks and the held target, which only this package's composition and its own suites
+-- may construct; clients reach the views through the public terrain-views library, whose composition is opaque.
+library terrain-views-internal
     import: language
-    visibility: public
+    visibility: private
     hs-source-dirs: terrain-views
     exposed-modules:
-        Hetoimasia.LuaEngine.Graphics.TerrainView
+        Hetoimasia.LuaEngine.Graphics.TerrainView.Internal
         Hetoimasia.LuaEngine.Graphics.TerrainView.Inputs
         Hetoimasia.LuaEngine.Graphics.TerrainView.Owner
         Hetoimasia.LuaEngine.Graphics.TerrainView.Profile
@@ -120,6 +122,18 @@ library terrain-views
         hetoimasia-terrain-render-2d:terrain-material ==0.1.0.0,
         hetoimasia-terrain-render-2d-vulkan ==0.1.0.0,
         hetoimasia-terrain-runtime ==0.1.0.0
+
+-- The terrain views as clients reach them: the service, its opaque composition ('productionPorts'), targets, styles
+-- and the operations a Lua binding wraps. None of the graphics owner's capability records is reachable here.
+library terrain-views
+    import: language
+    visibility: public
+    hs-source-dirs: terrain-views-public
+    exposed-modules:
+        Hetoimasia.LuaEngine.Graphics.TerrainView
+    build-depends:
+        base >=4.22 && <4.23,
+        hetoimasia-lua-engine-graphics:terrain-views-internal
 
 -- The texture backend and the port it runs over, in a private sub-library that only this package's public library and its own suites
 -- depend on (#679): the public Backend and Port modules re-export what clients may use, and what an example needs beyond them (an
@@ -176,6 +190,7 @@ test-suite lua-engine-graphics-tests
         Test.LuaEngine.Graphics.Pressure
         Test.LuaEngine.Graphics.TerrainParents
         Test.LuaEngine.Graphics.TerrainViews
+        Test.LuaEngine.Graphics.TerrainViewsBoundary
         Test.LuaEngine.Graphics.Release
         Test.LuaEngine.Graphics.Rig
         Test.LuaEngine.Graphics.SceneComp
@@ -225,6 +240,7 @@ test-suite lua-engine-graphics-tests
         hetoimasia-lua-engine ==0.1.0.0,
         hetoimasia-lua-engine-graphics,
         hetoimasia-lua-engine-graphics:terrain-views,
+        hetoimasia-lua-engine-graphics:terrain-views-internal,
         hetoimasia-lua-engine:data,
         hetoimasia-lua-engine:facade,
         hetoimasia-lua-engine:modules,
