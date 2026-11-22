@@ -2160,7 +2160,7 @@ stepBuilding service hands vs serial prep candidate
           Just (_, NextGranted grant) → do
             let key = receiptKey (grantReceipt grant)
                 -- a cancellation: the build is left to the sweep, and the cancellation goes on (the owner is ending)
-                cancelled failure@(ExceptionWithContext _ raised) = atomically (relinquish service key (Text.pack (displayException raised))) >> rethrowIO failure
+                cancelled failure@(ExceptionWithContext _ raised) = describedText raised >>= atomically . relinquish service key >> rethrowIO failure
                 asynchronous (ExceptionWithContext _ raised) = isJust (fromException raised ∷ Maybe SomeAsyncException)
             -- the outcome is sealed whatever the spend's exit: a synchronous exception's cause is in it
             tryWithContext @SomeException (grantSpend grant) >>= \case
@@ -2173,7 +2173,7 @@ stepBuilding service hands vs serial prep candidate
                   Left failure
                     | asynchronous failure → cancelled failure
                     -- a revalidation that raised: the sweep collects the build, with the cause, and the step yields
-                    | ExceptionWithContext _ raised ← failure → Just False <$ atomically (relinquish service key ("its revalidation raised: " <> Text.pack (displayException raised)))
+                    | ExceptionWithContext _ raised ← failure → describedText raised >>= \why → Just False <$ atomically (relinquish service key ("its revalidation raised: " <> why))
                   -- the revalidation would wait: the sweep collects the build, and the step yields
                   Right Nothing → Just False <$ atomically (relinquish service key "its revalidation would wait")
                   Right (Just evidence) → atomically (collectBuild service vs serial basis evidence key) <&> \taken → if taken then Nothing else Just False
@@ -2186,6 +2186,16 @@ stepBuilding service hands vs serial prep candidate
       case outcome of
         Nothing → builds (n - 1 ∷ Int)
         Just more → pure more
+
+-- An exception's text, rendered and forced here, before the views record it: a description that itself raises is
+-- answered with a fixed text, so a record holds plain data. An asynchronous exception met while rendering goes on.
+describedText ∷ SomeException → IO Text
+describedText raised =
+  tryWithContext @SomeException (evaluate (Text.pack (displayException raised)) >>= \text → text <$ evaluate (Text.length text)) >>= \case
+    Right text → pure text
+    Left failure@(ExceptionWithContext _ inner)
+      | isJust (fromException inner ∷ Maybe SomeAsyncException) → rethrowIO failure
+      | otherwise → pure "an exception whose description raised"
 
 -- Collect a granted build for the view that took it, once its receipt is sealed: in one transaction that runs no caller
 -- code, the receipt is claimed and its pending entry goes. The part goes to the candidate when the attempt that granted

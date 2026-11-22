@@ -506,7 +506,7 @@ spendChunkGrant builders (Retained ledger) grant = mask_ $ do
       (receipt, cleanupRaised) ← case outcome of
         Right (Right held) → pure (Right held, Nothing)
         Right (Left refusal) → unregistered made refusal
-        Left (ExceptionWithContext _ raised) → unregistered made (BuildRaised (raisedText raised))
+        Left (ExceptionWithContext _ raised) → raisedText raised >>= unregistered made . BuildRaised
       -- the seal: the grant's disposition and its receipt, in one transaction with no caller code
       answer ← atomically $ do
         answer ← case receipt of
@@ -559,16 +559,25 @@ spendChunkGrant builders (Retained ledger) grant = mask_ $ do
       NotMade → pure (Left (BuildRefused cause NoAllocation), Nothing)
       MadeAndReleased buffer → pure (Left (BuildRefused cause (AllocationReleased buffer (Right ()))), Nothing)
       Made buffer →
-        tryWithContext @SomeException (releaseBuffer builders buffer >>= evaluate >>= either (fmap Left . settled) (fmap Right . evaluate)) <&> \case
-          Right released → (Left (BuildRefused cause (AllocationReleased buffer released)), Nothing)
+        tryWithContext @SomeException (releaseBuffer builders buffer >>= evaluate >>= either (fmap Left . settled) (fmap Right . evaluate)) >>= \case
+          Right released → pure (Left (BuildRefused cause (AllocationReleased buffer released)), Nothing)
           Left failure@(ExceptionWithContext _ raised) →
-            (Left (BuildRefused cause (AllocationReleaseRaised buffer (raisedText raised))), Just failure)
+            raisedText raised <&> \why → (Left (BuildRefused cause (AllocationReleaseRaised buffer why)), Just failure)
     register held = do
       writeTVar standing GrantSealed
       modifyTVar' ledger (\current → current {ledgerEntries = Map.insert (grantReference grant) (Entry (preparedChunk prepared) held False) (ledgerEntries current)})
       pure (grantReference grant)
-    raisedText raised = Text.pack (displayException (raised ∷ SomeException))
     cancellation (ExceptionWithContext _ raised) = isJust (fromException raised ∷ Maybe SomeAsyncException)
+
+-- An exception's text, rendered and forced here, before it is sealed: a description that itself raises is answered with a
+-- fixed text, so what a receipt keeps is plain data. The exception itself still goes on.
+raisedText ∷ SomeException → IO Text
+raisedText raised =
+  tryWithContext @SomeException (evaluate (Text.pack (displayException raised)) >>= \text → text <$ evaluate (Text.length text)) >>= \case
+    Right text → pure text
+    Left failure@(ExceptionWithContext _ inner)
+      | isJust (fromException inner ∷ Maybe SomeAsyncException) → rethrowIO failure
+      | otherwise → pure "an exception whose description raised"
 
 -- A refusal evaluated in full, where its exception is the step's that made it: its text is what a receipt keeps.
 settled ∷ Show a ⇒ a → IO a

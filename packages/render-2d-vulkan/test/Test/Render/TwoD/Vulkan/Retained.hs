@@ -17,7 +17,7 @@ import Control.Monad (forM_)
 import Control.Concurrent.STM (atomically, newTVarIO, readTVar, readTVarIO, retry, writeTVar)
 import Data.Maybe (catMaybes)
 import qualified Data.Map.Strict as Map
-import Control.Exception (AsyncException (ThreadKilled), ErrorCall (ErrorCall), ExceptionWithContext (ExceptionWithContext), SomeException, rethrowIO, throwIO, toException, tryWithContext)
+import Control.Exception (AsyncException (ThreadKilled), ErrorCall (ErrorCall), Exception (displayException), ExceptionWithContext (ExceptionWithContext), SomeException, rethrowIO, throwIO, toException, tryWithContext)
 import Control.Exception.Annotation (ExceptionAnnotation (displayExceptionAnnotation))
 import Control.Exception.Context (addExceptionAnnotation, emptyExceptionContext, getExceptionAnnotations)
 import Data.ByteString (ByteString)
@@ -202,6 +202,15 @@ admittedGrant ∷ Setup → [Instance] → IO ChunkGrant
 admittedGrant setup instances = do
   prepared ← either (fail . show) pure (prepareRetainedChunk artMarks ChunkWorldDepth DeriveBounds Map.empty instances)
   atomically (admitRetainedChunk (bufferUploads (trackedBuilders setup)) (setupRetained setup) prepared) >>= either (fail . show) pure
+
+-- | An exception whose description raises.
+data Indescribable = Indescribable
+
+instance Show Indescribable where
+  show _ = error "the description raised"
+
+instance Exception Indescribable where
+  displayException _ = error "the description raised"
 
 -- | Where an injected exception was thrown, carried as its annotation.
 newtype ThrowSite = ThrowSite String
@@ -618,6 +627,19 @@ refusalSpec = describe "refusing a build" $ do
         Left (BuildRefused BuildUploadUnbound (AllocationReleased _ (Right ()))) → pure ()
         other → expectationFailure ("expected the unbound answer refused with its buffer released, found " <> show other)
       liveChunks (setupRetained setup) `shouldReturn` held
+      reservedOf setup `shouldReturn` 0
+
+  it "seals a spend that raised an exception whose description itself raises with a fixed text: claimed once, the room returns, and the original exception goes on" $
+    bounded . withSetup $ \setup → do
+      let raising = (trackedBuilders setup) {bufferUploads = observingSpends (\_ _ _ _ → throwIO Indescribable) (bufferUploads (trackedBuilders setup))}
+      prepared ← either (fail . show) pure (prepareRetainedChunk artMarks ChunkWorldDepth DeriveBounds Map.empty [cutAt 0 1])
+      grant ← atomically (admitRetainedChunk (bufferUploads raising) (setupRetained setup) prepared) >>= either (fail . show) pure
+      tryWithContext @Indescribable (spendChunkGrant raising (setupRetained setup) grant) >>= \case
+        Left _ → pure ()
+        Right answer → expectationFailure ("expected the original exception, found " <> show answer)
+      claimsOf grant >>= \case
+        [Left refused@(BuildRefused (BuildRaised "an exception whose description raised") (AllocationReleased _ (Right ())))] → length (show refused) `shouldSatisfy` (> 0)
+        other → expectationFailure ("expected the fixed text with the released buffer, found " <> show other)
       reservedOf setup `shouldReturn` 0
 
   it "sweeps a sealed registration whose collector never ran at the registry's teardown: claimed once, with its chunk, and the registry holds no receipt after" $
