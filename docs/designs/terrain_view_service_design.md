@@ -285,7 +285,9 @@ Use deterministic gates or supplied backend states. Each example runs once and a
 | Clean owner exit closes action admission while an earlier move is pending and the watcher has yet to record closure | A second move and camera or lighting configure return `ControlEnded`. The first move settles once as `MoveEnded EndStopped`. |
 | A drawn view has one recorded zoom refusal. Minimize with the lease live and deterministically refuse the demand withdrawal, with no intervening move | The refusal count goes from one to two. The last installed list and receipt survive, as does the drawing. Unchanged wakes leave the count at two. |
 
-## Proposal for owner approval · One settlement per chunk-build spend
+## Approved amendment for #714 · One settlement per chunk-build spend
+
+The owner approved this section at `3e2c2755e8` with “Y” on 2026-11-21 at approximately 23:59 UTC.
 
 **Proposed #714 amendment.** Replace the mechanism in “Failure after a grant”. Each admitted build has one record of what it owns. On every exit the graphics owner settles that record before returning a value or propagating an exception. The admission decision, six guarantees and amendment F’s teardown scope still apply. [Approved admission](https://github.com/coghex/hetoimasia/issues/714#issuecomment-7068947065) · [Round 12, findings 1–4](https://github.com/coghex/hetoimasia/pull/716#issuecomment-7070130411)
 
