@@ -892,13 +892,15 @@ order:
 A caller's gate (`submitUploadGated`, an `UploadGate`) is asked in its own
 transaction before this one and again after the copy; it may refuse, raise or
 wait, and a wait answers `UploadGateBusy`, a refusal that can change. Only
-these asks run the gate's own transaction. An admitting answer carries an
-`UploadPermit` as data: the owner's admission cell (`admittedWhile`), open
-until its owner closes it once (a reopened admission is a cell of its own).
-The commit that admits the upload reads that cell; the commit that queues it
-requires the second answer to name the same admission, still open. An
-admission closed after either ask, or closed and reopened during the copy,
-refuses the upload. `ungated` admits everything.
+these asks run the gate's own transaction, and each answer is evaluated inside
+the cleanup that owns the upload. An admitting answer carries an
+`UploadPermit` as data: the read-only token of its owner's admission
+(`admittedWhile`, a foundation `AdmissionToken`), which its owner closes once
+and which never reopens (a reopened admission is another). The commit that
+admits the upload reads that token; the commit that queues it requires the
+session not to have failed (`UploadSessionFailed`) and the second answer to
+name the same admission, still open. An admission closed after either ask, or
+replaced during the copy, refuses the upload. `ungated` admits everything.
 
 The transaction reserves the target, the queue place and the staging region
 and makes the ticket. The caller's thread then copies the bytes into the
@@ -927,7 +929,19 @@ copy raising or cancelled, the gate refusing, raising or waiting, the permit
 or admission closing) gives the place and region back and consumes the
 grant. A
 spent, abandoned or foreign grant changes nothing, and closing admission
-abandons every grant not yet spent.
+abandons every grant not yet spent. `returnUploadGrant` gives a reserved grant
+back through the state of the uploads that issued it and its own cell, with no
+handle to them.
+
+**Access.** A holder reaches a session's uploads through an `UploadAccess`,
+closed data over the issuer's cells: none (`noUploadAccess`), a session's own
+uploads, ungated (`sessionUploadAccess`), or the uploads an owner records in
+its cell (`UploadsStanding`) under the admission token in its cell and the
+session's terminal state (`ownedUploadAccess`; the host's is
+`vulkanUploadAccess`). Room (`accessRoom`), reservation (`accessReserve`), the
+gate (`accessGate`) and the spend of a reservation (`accessSubmitGranted`) are
+the uploads' own decisions over those cells, so a holder's transaction may
+reserve through it: it runs no holder's code.
 
 **The exclusive target.** From admission until its upload settles, a target
 belongs to the upload alone: every other batch's use of it is
