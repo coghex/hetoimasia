@@ -22,7 +22,8 @@ import System.Directory (doesDirectoryExist, doesFileExist, findExecutable, list
 import System.Environment (getArgs)
 import System.Exit (ExitCode (..), exitWith)
 import System.FilePath ((</>))
-import System.IO (hPutStrLn, stderr)
+import GHC.IO.Encoding (setFileSystemEncoding, setForeignEncoding, setLocaleEncoding)
+import System.IO (hPutStrLn, hSetEncoding, stderr, stdout, utf8)
 import System.Process (readProcessWithExitCode)
 
 allowlistPath ∷ FilePath
@@ -30,6 +31,10 @@ allowlistPath = "tools/validation/owner_tx_issuers.json"
 
 main ∷ IO ()
 main = do
+  -- Every file, path and handle is UTF-8, whatever the locale: package descriptions, project files and diagnostics hold
+  -- non-ASCII text, and a C locale would otherwise refuse to read or write it.
+  mapM_ ($ utf8) [setLocaleEncoding, setFileSystemEncoding, setForeignEncoding]
+  mapM_ (`hSetEncoding` utf8) [stdout, stderr]
   arguments ← getArgs
   case arguments of
     [command] → run command "."
