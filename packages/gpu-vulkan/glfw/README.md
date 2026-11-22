@@ -110,7 +110,10 @@ and the suites' verification capture.
   barrier, a scene or a target, so a consumer that waits on them wakes for
   that change alone. `reserveVulkanUpload` takes the room `vulkanUploadRoom`
   reads, in the caller's transaction, for a vertex buffer not yet made;
-  `submitVulkanGranted` spends it once and `abandonVulkanGrant` frees it. An owner round that takes no action writes no queue.
+  `submitVulkanGranted` spends it once and `abandonVulkanGrant` frees it. A
+  refusal before binding leaves the reservation spendable; once bound, a
+  failed or cancelled copy, or the owner's gate closing before the upload is
+  queued, gives its place and region back and consumes it. An owner round that takes no action writes no queue.
   `vulkanHostIdentity` names the host, which every offscreen registration
   carries; `vulkanSceneTargetRegistered` answers whether this host holds an
   exact registration now. With or without windows, `submitVulkanAction` hands
