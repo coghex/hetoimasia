@@ -1,6 +1,6 @@
 {
-  "schema_version": 1,
-  "description": "Who may import the ownership transactions' issuer bridge (Hetoimasia.Foundation.OwnerTx.Issuer) or its bridge-equivalent representation (Hetoimasia.Foundation.OwnerTx.Representation), and which components may depend on hetoimasia-foundation:owner-tx-issuer. tools/validation/owner_tx_guard.py refuses every importer, dependent and re-export this list does not admit, and every entry that has gone stale.",
+  "schema_version": 2,
+  "description": "Who may import the ownership transactions' issuer bridge (Hetoimasia.Foundation.OwnerTx.Issuer) or its bridge-equivalent representation (Hetoimasia.Foundation.OwnerTx.Representation), which components may depend on hetoimasia-foundation:owner-tx-issuer, and the reviewed typed export contract of every listed importer and both defining modules. tools/owner-tx-guard (the validation group test.owner-tx-guard) takes the facts from Cabal and GHC and refuses every importer, dependent, export, re-export and conversion this list does not admit, and every entry that has gone stale.",
   "importers": [
     {
       "component": "hetoimasia-foundation:lib:hetoimasia-foundation",
@@ -22,6 +22,239 @@
     {
       "component": "hetoimasia-foundation:test:foundation-tests",
       "reason": "its composition example builds through the bridge"
+    }
+  ],
+  "exports": [
+    {
+      "component": "hetoimasia-foundation:lib:hetoimasia-foundation",
+      "module": "Hetoimasia.Foundation.OwnerTx",
+      "symbol": "commit",
+      "kind": "value",
+      "type": "forall a. OwnerTx a -> IO a"
+    },
+    {
+      "component": "hetoimasia-foundation:lib:hetoimasia-foundation",
+      "module": "Hetoimasia.Foundation.OwnerTx",
+      "symbol": "newCell",
+      "kind": "value",
+      "type": "forall a. a -> OwnerTx (OwnerCell a)"
+    },
+    {
+      "component": "hetoimasia-foundation:lib:hetoimasia-foundation",
+      "module": "Hetoimasia.Foundation.OwnerTx",
+      "symbol": "newCellIO",
+      "kind": "value",
+      "type": "forall a. a -> IO (OwnerCell a)"
+    },
+    {
+      "component": "hetoimasia-foundation:lib:hetoimasia-foundation",
+      "module": "Hetoimasia.Foundation.OwnerTx",
+      "symbol": "newPublisher",
+      "kind": "value",
+      "type": "forall a. Prepared a -> STM (Publisher a)"
+    },
+    {
+      "component": "hetoimasia-foundation:lib:hetoimasia-foundation",
+      "module": "Hetoimasia.Foundation.OwnerTx",
+      "symbol": "newPublisherIO",
+      "kind": "value",
+      "type": "forall a. Prepared a -> IO (Publisher a)"
+    },
+    {
+      "component": "hetoimasia-foundation:lib:hetoimasia-foundation",
+      "module": "Hetoimasia.Foundation.OwnerTx",
+      "symbol": "publication",
+      "kind": "value",
+      "type": "forall a. Publisher a -> Publication a"
+    },
+    {
+      "component": "hetoimasia-foundation:lib:hetoimasia-foundation",
+      "module": "Hetoimasia.Foundation.OwnerTx",
+      "symbol": "publish",
+      "kind": "value",
+      "type": "forall a. Publisher a -> Prepared a -> STM ()"
+    },
+    {
+      "component": "hetoimasia-foundation:lib:hetoimasia-foundation",
+      "module": "Hetoimasia.Foundation.OwnerTx",
+      "symbol": "readCell",
+      "kind": "value",
+      "type": "forall a. OwnerCell a -> OwnerTx a"
+    },
+    {
+      "component": "hetoimasia-foundation:lib:hetoimasia-foundation",
+      "module": "Hetoimasia.Foundation.OwnerTx",
+      "symbol": "readOnly",
+      "kind": "value",
+      "type": "forall a. OwnerCell a -> ReadOnly a"
+    },
+    {
+      "component": "hetoimasia-foundation:lib:hetoimasia-foundation",
+      "module": "Hetoimasia.Foundation.OwnerTx",
+      "symbol": "readPublication",
+      "kind": "value",
+      "type": "forall a. Publication a -> OwnerTx (Word64, a)"
+    },
+    {
+      "component": "hetoimasia-foundation:lib:hetoimasia-foundation",
+      "module": "Hetoimasia.Foundation.OwnerTx",
+      "symbol": "readTx",
+      "kind": "value",
+      "type": "forall a. ReadOnly a -> OwnerTx a"
+    },
+    {
+      "component": "hetoimasia-foundation:lib:hetoimasia-foundation",
+      "module": "Hetoimasia.Foundation.OwnerTx",
+      "symbol": "watch",
+      "kind": "value",
+      "type": "forall a. ReadOnly a -> STM a"
+    },
+    {
+      "component": "hetoimasia-foundation:lib:hetoimasia-foundation",
+      "module": "Hetoimasia.Foundation.OwnerTx",
+      "symbol": "watchPublication",
+      "kind": "value",
+      "type": "forall a. Publication a -> STM (Word64, a)"
+    },
+    {
+      "component": "hetoimasia-foundation:lib:hetoimasia-foundation",
+      "module": "Hetoimasia.Foundation.OwnerTx",
+      "symbol": "writeCell",
+      "kind": "value",
+      "type": "forall a. OwnerCell a -> a -> OwnerTx ()"
+    },
+    {
+      "component": "hetoimasia-foundation:lib:hetoimasia-foundation",
+      "module": "Hetoimasia.Foundation.OwnerTx",
+      "symbol": "OwnerCell",
+      "kind": "type",
+      "type": ""
+    },
+    {
+      "component": "hetoimasia-foundation:lib:hetoimasia-foundation",
+      "module": "Hetoimasia.Foundation.OwnerTx",
+      "symbol": "OwnerTx",
+      "kind": "type",
+      "type": ""
+    },
+    {
+      "component": "hetoimasia-foundation:lib:hetoimasia-foundation",
+      "module": "Hetoimasia.Foundation.OwnerTx",
+      "symbol": "Publication",
+      "kind": "type",
+      "type": ""
+    },
+    {
+      "component": "hetoimasia-foundation:lib:hetoimasia-foundation",
+      "module": "Hetoimasia.Foundation.OwnerTx",
+      "symbol": "Publisher",
+      "kind": "type",
+      "type": ""
+    },
+    {
+      "component": "hetoimasia-foundation:lib:hetoimasia-foundation",
+      "module": "Hetoimasia.Foundation.OwnerTx",
+      "symbol": "ReadOnly",
+      "kind": "type",
+      "type": ""
+    },
+    {
+      "component": "hetoimasia-foundation:lib:owner-tx-issuer",
+      "module": "Hetoimasia.Foundation.OwnerTx.Issuer",
+      "symbol": "fromIssuerSTM",
+      "kind": "value",
+      "type": "forall a. STM a -> OwnerTx a"
+    },
+    {
+      "component": "hetoimasia-foundation:lib:owner-tx-issuer",
+      "module": "Hetoimasia.Foundation.OwnerTx.Issuer",
+      "symbol": "modifyCell",
+      "kind": "value",
+      "type": "forall a. OwnerCell a -> (a -> a) -> OwnerTx ()"
+    },
+    {
+      "component": "hetoimasia-foundation:lib:owner-tx-issuer",
+      "module": "Hetoimasia.Foundation.OwnerTx.Issuer",
+      "symbol": "stateCell",
+      "kind": "value",
+      "type": "forall a b. OwnerCell a -> (a -> (b, a)) -> OwnerTx b"
+    },
+    {
+      "component": "hetoimasia-foundation:test:foundation-tests",
+      "module": "Test.Foundation.Ownership.Composition",
+      "symbol": "spec",
+      "kind": "value",
+      "type": "SpecM () ()"
+    },
+    {
+      "component": "hetoimasia-foundation:lib:internal",
+      "module": "Hetoimasia.Foundation.OwnerTx.Representation",
+      "symbol": "OwnerCell",
+      "kind": "type",
+      "type": ""
+    },
+    {
+      "component": "hetoimasia-foundation:lib:internal",
+      "module": "Hetoimasia.Foundation.OwnerTx.Representation",
+      "symbol": "OwnerCell",
+      "kind": "constructor",
+      "type": "forall a. TVar a %1 -> OwnerCell a"
+    },
+    {
+      "component": "hetoimasia-foundation:lib:internal",
+      "module": "Hetoimasia.Foundation.OwnerTx.Representation",
+      "symbol": "OwnerTx",
+      "kind": "type",
+      "type": ""
+    },
+    {
+      "component": "hetoimasia-foundation:lib:internal",
+      "module": "Hetoimasia.Foundation.OwnerTx.Representation",
+      "symbol": "OwnerTx",
+      "kind": "constructor",
+      "type": "forall a. STM a %1 -> OwnerTx a"
+    },
+    {
+      "component": "hetoimasia-foundation:lib:internal",
+      "module": "Hetoimasia.Foundation.OwnerTx.Representation",
+      "symbol": "Publication",
+      "kind": "type",
+      "type": ""
+    },
+    {
+      "component": "hetoimasia-foundation:lib:internal",
+      "module": "Hetoimasia.Foundation.OwnerTx.Representation",
+      "symbol": "Publication",
+      "kind": "constructor",
+      "type": "forall a. TVar Word64 %1 -> TVar a %1 -> Publication a"
+    },
+    {
+      "component": "hetoimasia-foundation:lib:internal",
+      "module": "Hetoimasia.Foundation.OwnerTx.Representation",
+      "symbol": "Publisher",
+      "kind": "type",
+      "type": ""
+    },
+    {
+      "component": "hetoimasia-foundation:lib:internal",
+      "module": "Hetoimasia.Foundation.OwnerTx.Representation",
+      "symbol": "Publisher",
+      "kind": "constructor",
+      "type": "forall a. TVar Word64 %1 -> TVar a %1 -> Publisher a"
+    },
+    {
+      "component": "hetoimasia-foundation:lib:internal",
+      "module": "Hetoimasia.Foundation.OwnerTx.Representation",
+      "symbol": "ReadOnly",
+      "kind": "type",
+      "type": ""
+    },
+    {
+      "component": "hetoimasia-foundation:lib:internal",
+      "module": "Hetoimasia.Foundation.OwnerTx.Representation",
+      "symbol": "ReadOnly",
+      "kind": "constructor",
+      "type": "forall a. TVar a %1 -> ReadOnly a"
     }
   ]
 }

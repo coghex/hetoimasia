@@ -198,6 +198,30 @@ executable hetoimasia
         hetoimasia-scripting-lua,
         hetoimasia-scripting-lua:runtime-lua
 
+-- The import guard of the ownership transactions' issuer bridge (#721): Cabal's
+-- parser for the components, GHC's frontend for imports and typed exports, and
+-- the allowlist tools/validation/owner_tx_issuers.json. The validation group
+-- test.owner-tx-guard runs it against the repository, workflow-tests against
+-- fixtures. It is built for the pinned compiler alone.
+executable owner-tx-guard
+    import: language
+    main-is: Main.hs
+    hs-source-dirs: tools/owner-tx-guard
+    other-modules:
+        Frontend
+        Inventory
+        Json
+        Policy
+    build-depends:
+        base >=4.22 && <4.23,
+        bytestring >=0.12 && <0.13,
+        Cabal-syntax ==3.16.*,
+        containers >=0.8 && <0.9,
+        directory >=1.3 && <1.4,
+        filepath >=1.5 && <1.6,
+        ghc ==9.14.1,
+        process >=1.6 && <1.7
+
 test-suite workflow-tests
     import: language
     type: exitcode-stdio-1.0
