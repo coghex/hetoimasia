@@ -20,6 +20,9 @@ module Test.LuaEngine.Graphics.NativeStandIn
   , failNextWrite
   , settleUploads
   , disposeNow
+  , submittedBatch
+  , discardedBatch
+  , completeBatches
   ) where
 
 import Control.Concurrent.STM (STM, TQueue, TVar, atomically, modifyTVar', newEmptyTMVarIO, newTQueueIO, newTVarIO, putTMVar, readTQueue, readTVar, readTVarIO, takeTMVar, writeTQueue, writeTVar)
@@ -28,7 +31,7 @@ import Control.Monad (forever, join, void, when)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
 import Data.Functor ((<&>))
-import Data.IORef (atomicModifyIORef', newIORef, readIORef)
+import Data.IORef (atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
@@ -49,7 +52,7 @@ import Hetoimasia.GPU.Vulkan.Native.Allocator
   , MemoryTypeOffer (..)
   , Placement (..)
   )
-import Hetoimasia.GPU.Vulkan.Native.Frames (AcquireResult (..), FrameOps (..), Frames, newFrames, progressFrames)
+import Hetoimasia.GPU.Vulkan.Native.Frames (AcquireResult (..), FrameOps (..), Frames, newFrames, progressFrames, recordFramelessIn, withFramelessScope)
 import Hetoimasia.GPU.Vulkan.Native.Generations (newGenerations)
 import Hetoimasia.GPU.Vulkan.Native.Presentation
 import Hetoimasia.GPU.Vulkan.Native.Profile
@@ -155,6 +158,30 @@ settleUploads standIn = onNative standIn (go (32 ∷ Int))
       _ ← progressUploads (standUploads standIn) >>= either (fail . show) pure
       left ← uploadsUnsettled <$> atomically (readUploads (standUploads standIn))
       when (not (null left)) (go (remaining - 1))
+
+-- | A frame-less batch, recorded with nothing and submitted: its ticket is pending until the stand-in completes it
+-- ('completeBatches').
+submittedBatch ∷ StandIn → IO BatchTicket
+submittedBatch standIn =
+  onNative standIn . withFramelessScope (standFrames standIn) $ \scope →
+    recordFramelessIn scope (\_ → pure ()) >>= either (fail . show) (pure . fst)
+
+-- | A frame-less batch recorded and then discarded before its submission: its ticket says so.
+discardedBatch ∷ StandIn → IO BatchTicket
+discardedBatch standIn =
+  onNative standIn $ do
+    held ← newIORef Nothing
+    _ ← try @SomeException . withFramelessScope (standFrames standIn) $ \scope → do
+      recordFramelessIn scope (\_ → pure ()) >>= either (fail . show) (writeIORef held . Just . fst)
+      throwIO (userError "the scope ends before it submits")
+    readIORef held >>= maybe (fail "no batch was recorded") pure
+
+-- | Complete every submitted batch: its fence signals and the frames observe it.
+completeBatches ∷ StandIn → IO ()
+completeBatches standIn =
+  onNative standIn $ do
+    atomically (modifyTVar' (standFences standIn) (Map.map (const True)))
+    void (progressFrames (standFrames standIn) later)
 
 -- | Destroy every released buffer whose holds have ended, as the owner's disposal does.
 disposeNow ∷ StandIn → IO ()

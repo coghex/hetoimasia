@@ -123,7 +123,7 @@ module Hetoimasia.Render.TwoD.Vulkan.Chunks
   ) where
 
 import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVar, newTVarIO, readTVar, readTVarIO, writeTVar)
-import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeAsyncException, SomeException, displayException, finally, fromException, mask_, rethrowIO, tryWithContext)
+import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeAsyncException, SomeException, displayException, evaluate, finally, fromException, mask_, rethrowIO, tryWithContext)
 import Control.Exception.Annotation (ExceptionAnnotation (displayExceptionAnnotation))
 import Control.Exception.Context (ExceptionContext, addExceptionAnnotation, getExceptionAnnotations)
 import Control.Monad (forM, when)
@@ -524,20 +524,20 @@ spendChunkGrant builders (Retained ledger) grant = mask_ $ do
     uploads = grantUploads grant
     prepared = grantPrepared grant
     bytes = preparedEncoded prepared
-    -- the steps that can be refused or raise
+    -- the steps that can be refused or raise; every answer is forced here, inside the handler that records its failure
     attempt = case grantUpload grant of
       Nothing → pure (Right Nothing)
       Just upload →
         constructed >>= \case
-          Left refusal → pure (Left (BuildBufferRefused refusal))
+          Left refusal → Left . BuildBufferRefused <$> settled refusal
           Right buffer →
-            uploadGranted uploads upload buffer bytes <&> \case
-              Left refusal → Left (uploadRefusal refusal)
-              Right ticket → Right (Just (buffer, ticket))
+            uploadGranted uploads upload buffer bytes >>= evaluate >>= \case
+              Left refusal → Left . uploadRefusal <$> settled refusal
+              Right ticket → evaluate ticket <&> \held → Right (Just (buffer, held))
     -- the buffer, recorded in the handoff that makes it; a construction that raised naming the buffer whose release it
     -- already made has that release adopted, whatever the exception
     constructed =
-      tryWithContext @SomeException (buildVertexBuffer builders (preparedBytes prepared)) >>= \case
+      tryWithContext @SomeException (buildVertexBuffer builders (preparedBytes prepared) >>= evaluate >>= traverse evaluate) >>= \case
         Right (Right buffer) → Right buffer <$ atomically (writeTVar standing (GrantSpending (Made buffer)))
         Right (Left refusal) → pure (Left refusal)
         Left failure@(ExceptionWithContext context _) → do
@@ -548,7 +548,7 @@ spendChunkGrant builders (Retained ledger) grant = mask_ $ do
       NotMade → pure (Left (BuildRefused cause NoAllocation), Nothing)
       MadeAndReleased buffer → pure (Left (BuildRefused cause (AllocationReleased buffer (Right ()))), Nothing)
       Made buffer →
-        tryWithContext @SomeException (releaseBuffer builders buffer) <&> \case
+        tryWithContext @SomeException (releaseBuffer builders buffer >>= evaluate >>= either (fmap Left . settled) (fmap Right . evaluate)) <&> \case
           Right released → (Left (BuildRefused cause (AllocationReleased buffer released)), Nothing)
           Left failure@(ExceptionWithContext _ raised) →
             (Left (BuildRefused cause (AllocationReleaseRaised buffer (raisedText raised))), Just failure)
@@ -558,6 +558,10 @@ spendChunkGrant builders (Retained ledger) grant = mask_ $ do
       pure (grantReference grant)
     raisedText raised = Text.pack (displayException (raised ∷ SomeException))
     cancellation (ExceptionWithContext _ raised) = isJust (fromException raised ∷ Maybe SomeAsyncException)
+
+-- A refusal evaluated in full, where its exception is the step's that made it: its text is what a receipt keeps.
+settled ∷ Show a ⇒ a → IO a
+settled refusal = refusal <$ evaluate (length (show refusal))
 
 -- What a spend owns of its buffer: none yet; one it made; or one whose construction raised after releasing it.
 data MadeBuffer = NotMade | Made !Buffer | MadeAndReleased !Buffer

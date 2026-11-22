@@ -23,10 +23,11 @@ import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Word (Word32, Word64)
 import GHC.Stats (RTSStats (..), getRTSStats, getRTSStatsEnabled)
+import Hetoimasia.Foundation.Admission (admissionToken, closeAdmission, newAdmissionIO)
 import Hetoimasia.Foundation.Log (callbackSink, defaultLogFilter, mkLogger)
 import Hetoimasia.Foundation.Messaging.Payload (prepare)
 import Hetoimasia.Foundation.Worker (withWorkerGroup)
-import Hetoimasia.GPU.Vulkan.GLFW (Refusal (RefusedDeviceAbsent), TicketState (..), UploadRefusal (UploadClosed), UploadState (UploadLost), UploadsUnavailable (..), VulkanUploadRefusal (..))
+import Hetoimasia.GPU.Vulkan.GLFW (Refusal (RefusedDeviceAbsent), UploadRefusal (UploadClosed), UploadState (UploadLost), UploadsUnavailable (..), VulkanUploadRefusal (..))
 import Hetoimasia.LuaEngine.Graphics.Texture.Host (hostUploadAnswer)
 import Hetoimasia.Render.TwoD.Vulkan.Builders (BufferUploadRefusal (..))
 import Hetoimasia.LuaEngine.Graphics.Scene
@@ -45,7 +46,7 @@ import Hetoimasia.Render.TwoD.Vulkan.Chunks (BuildRefusal (BuildRaised, BuildUpl
 import qualified Hetoimasia.Render.TwoD.Vulkan.Chunks as Chunks
 import Hetoimasia.Render.TwoD.Vulkan.Builders (bufferUploads)
 import Hetoimasia.Render.TwoD.Chunk.Backend (chunkRefIndex)
-import Test.LuaEngine.Graphics.NativeStandIn (StandIn, disposeNow, failNextWrite, settleUploads, standInBuilders, standInDisposal, withStandIn)
+import Test.LuaEngine.Graphics.NativeStandIn (StandIn, completeBatches, discardedBatch, disposeNow, failNextWrite, settleUploads, standInBuilders, standInDisposal, submittedBatch, withStandIn)
 import Hetoimasia.Terrain.Cell (mkMaterialId)
 import Hetoimasia.Terrain.Coordinate (AxisCoord, axisFromInteger, axisValue, tileCoord)
 import Hetoimasia.Terrain.Render2D.AtlasFixtures (AtlasStyle (..), boundPackedTextures, loadAtlasStyle)
@@ -145,6 +146,8 @@ data Rig = Rig
     -- counted, and waits until the example resumes it.
   , rigNative ∷ !(Maybe Native)
     -- ^ The native stand-in, for an example whose hands are the renderer's registry over the backend's own uploads.
+  , rigBeforeCollect ∷ !(TVar (Maybe (IO ())))
+    -- ^ When set: run once on the owner's thread after the next build's revalidation succeeded, before its collection.
   }
 
 -- | An example's native stand-in: the session, the renderer's registry the production hands admit into
@@ -260,6 +263,7 @@ withRig options body =
         afterSeal ← newTVarIO Nothing
         fault ← newTVarIO Nothing
         countGate ← newTVarIO Nothing
+        beforeCollect ← newTVarIO Nothing
         initial ← prepare initialGraphicsScene
         withNativeOf (optNative options) $ \native → do
          let owner =
@@ -309,6 +313,7 @@ withRig options body =
                          _ → pure Nothing
                      forM_ gate $ \(counting, resumed) → atomically (putTMVar counting batch) >> atomically (takeTMVar resumed)
                  , hookDemandRefused = \_ → readTVar demandRefused
+                 , hookCollecting = atomically (readTVar beforeCollect <* writeTVar beforeCollect Nothing) >>= sequence_
                  }
              ports = TerrainViewsPorts owner ledger claims receipts initial terrain client account hooks
          ending ← newTVarIO False
@@ -334,7 +339,7 @@ withRig options body =
                      forM_ native settleNative
                      loop
                loop
-             rig views = Rig views terrain lease queue queueOpen lane laneCapacity standings chunks disposed attempts buildFailure disposeFailure next ledger claims receipts ownerEnded style account deferDisposal pendingDisposals hold entered resume styleReleases unavailable admission admitBudget grants uploading demandRefused buildAttempts failNext raising raiseSealed receiptNext registry afterSeal fault countGate native
+             rig views = Rig views terrain lease queue queueOpen lane laneCapacity standings chunks disposed attempts buildFailure disposeFailure next ledger claims receipts ownerEnded style account deferDisposal pendingDisposals hold entered resume styleReleases unavailable admission admitBudget grants uploading demandRefused buildAttempts failNext raising raiseSealed receiptNext registry afterSeal fault countGate native beforeCollect
              fakeHands = stepHands (rig (error "the teardown's hands read no service"))
          withOwnedThread (when (optTeardown options /= TeardownNone) teardown) $ \_ _ →
            withTerrainViews (configOf options) ports $ \views →
@@ -641,6 +646,7 @@ adopt rig target = do
       ledgerAdopted (rigLedger rig) (targetKey target) (fromIntegral revision) scene
       forM_ previous (ledgerReleased (rigLedger rig) (targetKey target) . fromIntegral)
       atomically (writeTVar (targetAdopted target) (Just revision))
+      noticed rig
     _ → pure ()
 
 -- The host adopts the latest revision while a frame of the one before is still in flight: both stay held.
@@ -651,7 +657,12 @@ adoptHolding rig target = do
     (revision, scene) : _ → do
       ledgerAdopted (rigLedger rig) (targetKey target) (fromIntegral revision) scene
       atomically (writeTVar (targetAdopted target) (Just revision))
+      noticed rig
     [] → pure ()
+
+-- Wait (bounded) until the views' watcher has seen the ledger's latest change, and so asked for any step it needs.
+noticed ∷ Rig → IO ()
+noticed rig = eventually ((>=) <$> ledgerNoticed (rigViews rig) <*> ledgerChanges (rigLedger rig))
 
 -- The host meets every barrier asked so far: what was published before each has been adopted.
 meetBarriers ∷ Rig → IO ()
@@ -690,7 +701,8 @@ styleOf rig = styleWith rig ["loam", "granite"] True
 -- whose release is counted.
 styleWith ∷ Rig → [String] → Bool → IO ViewStyle
 styleWith rig mapped live = do
-  authority ← newTVarIO live
+  authority ← newAdmissionIO
+  unless live (atomically (closeAdmission authority))
   textures ← boundPackedTextures (rigStyle rig) (textureHandleOf colourIdentity) (textureHandleOf normalIdentity)
   pure
     ViewStyle
@@ -698,7 +710,7 @@ styleWith rig mapped live = do
       , styleBound = textures
       , styleParents = Set.fromList [colourIdentity, normalIdentity]
       , styleMapped = Set.fromList [either (error . show) id (mkMaterialId name) | name ← mapped]
-      , styleAuthority = [HeldAuthority authority]
+      , styleAuthority = [HeldAuthority (admissionToken authority)]
       , styleRelease = atomically (modifyTVar' (rigStyleReleases rig) (+ 1))
       }
 
@@ -1274,23 +1286,20 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         isJust (drawnPlanPlan again) `shouldBe` True
 
     it "moves a live view's receipt only: an offscreen batch advances it once complete, never once discarded or after the close" $
-      withPublished defaultOptions $ \rig target view → do
+      withPublished defaultOptions $ \rig target view → withStandIn $ \standIn → do
         world ← atomically (latestWorld target) >>= maybe (fail "no world") pure
+        -- the batches are the backend's own, their tickets read through its reader
         let receipts = rigReceipts rig
-            note = do
-              ticket ← newTVarIO TicketPending
-              atomically (noteOffscreenBatch receipts (readTVar ticket) (worldTag world) (worldMetrics world))
-              pure ticket
-        discarded ← note
-        atomically (writeTVar discarded TicketDiscarded)
+            note batch = atomically (noteOffscreenBatch receipts batch (worldTag world) (worldMetrics world))
+        discardedBatch standIn >>= note
         atomically (readingDrawn <$> readView view) `shouldReturn` Nothing
-        complete ← note
+        submittedBatch standIn >>= note
         atomically (readingDrawn <$> readView view) `shouldReturn` Nothing
-        atomically (writeTVar complete TicketComplete)
+        completeBatches standIn
         atomically (fmap drawnTag . readingDrawn <$> readView view) `shouldReturn` Just (worldTag world)
-        late ← note
+        submittedBatch standIn >>= note
         _ ← closeView view
-        atomically (writeTVar late TicketComplete)
+        completeBatches standIn
         atomically (noteSubmitted receipts (worldTag world) (worldMetrics world))
         _ ← atomically (sweepOffscreen receipts)
         atomically (readReceipt receipts (viewIncarnation view)) `shouldReturn` Nothing
@@ -2176,6 +2185,33 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         done ← atomically reading
         listed ← atomically (readingListed <$> readView second)
         (Map.findWithDefault 0 2 (serviceOccupied done), servicePending done) `shouldBe` (listed, 0)
+
+    it "retires a build privately, once, when its target's facts change after its revalidation and before its collection, and the view goes on" $
+      withRig defaultOptions {optProfile = smallProfile {profileSlots = 4, profileQuads = 2048}} $ \rig → do
+        let reading = readTerrainViews (rigViews rig)
+        target ← newTarget 1
+        changed ← newTVarIO Nothing
+        -- between the two boundaries, outside both transactions: the target's facts move (a new version, same facts)
+        atomically . writeTVar (rigBeforeCollect rig) . Just $ do
+          built ← subtract 1 <$> readTVarIO (rigNext rig)
+          atomically (setHeldUsable (targetHeld target) True >> writeTVar changed (Just (chunkRef built 1)))
+        view ← openOn rig target
+        settleUntil rig (publishedAtLeast view 1)
+        quiesce rig target
+        stale ← readTVarIO changed >>= maybe (fail "the seam never ran") pure
+        -- the stale part went to private retirement and was released once; its slot is free and the view holds its parts
+        filter (== stale) <$> readTVarIO (rigDisposed rig) `shouldReturn` [stale]
+        now ← atomically reading
+        listed ← atomically (readingListed <$> readView view)
+        Map.findWithDefault 0 1 (serviceOccupied now) `shouldBe` listed
+        (servicePending now, servicePrivate now, serviceSwept now) `shouldBe` (0, 0, [])
+
+    it "keeps the cause of a refused build no view held when the registry's teardown sweep claims it, though it made no buffer" $ do
+      views ← withRig defaultOptions $ \rig → do
+        sealed ← newTVarIO (Just (Left (BuildFailed "BuildAbandoned" NotAllocated)))
+        atomically (modifyTVar' (rigRegistry rig) (Map.insert 9000 sealed))
+        pure (rigViews rig)
+      serviceUnheld <$> atomically (readTerrainViews views) `shouldReturn` [(9000, "the build failed: BuildAbandoned; no buffer was made")]
 
     it "follows a held target's observed zero, then unknown geometry with no new frame, clearing its demand, and restores it with the drawing" $
       withPublished defaultOptions $ \rig target view → do

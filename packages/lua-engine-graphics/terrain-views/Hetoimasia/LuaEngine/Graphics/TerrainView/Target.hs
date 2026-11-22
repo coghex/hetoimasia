@@ -28,7 +28,6 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , VulkanAction (..)
   , VulkanHost
   , awaitVulkanAction
-  , readTicket
   , recordVulkanTargetBatch
   , submitVulkanAction
   )
@@ -98,7 +97,7 @@ drawOffscreenView host graphics receipts target metrics image format depth after
                     Right () → Right (worldTag world)
         -- on the owner's thread, before the action returns and its batch is submitted
         case recorded of
-          Right (batch, Right tag) → atomically (noteOffscreenBatch receipts (readTicket batch) tag metrics)
+          Right (batch, Right tag) → atomically (noteOffscreenBatch receipts batch tag metrics)
           _ → pure ()
         pure recorded
   atomically (submitVulkanAction host action) >>= \case

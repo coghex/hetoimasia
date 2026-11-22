@@ -36,13 +36,16 @@
 -- | Receipts (by    | the scene       | the observer, an offscreen recording's| any thread (STM)    | until the view's |
 -- | view)           | session         | caller, a view's close                |                     | close forgets it |
 -- +-----------------+-----------------+---------------------------------------+---------------------+------------------+
--- | The listener    | the scene       | the terrain views' scope              | the observer        | that scope's     |
--- |                 | session         |                                       |                     |                  |
+-- | Frame events    | the scene       | the observer                          | any thread (STM)    | the session's    |
+-- | (two counts)    | session         |                                       |                     |                  |
 -- +-----------------+-----------------+---------------------------------------+---------------------+------------------+
 --
 -- A recorded frame lives only between two events the host reports for the same frame slot, so at most one is kept
 -- per attachment and slot; a recording the host never reports again is replaced by the slot's next recording. The
--- observer runs one transaction per event and neither waits nor raises.
+-- observer runs one transaction per event and neither waits nor raises. It counts every frame event, and every
+-- presentation's enqueue, and runs no holder's code: a holder that acts on frames, as the terrain views do, watches
+-- the counts in a transaction of its own ('receiptsFrames'). An offscreen batch is noted by its native ticket, which
+-- the receipts read through the backend's own reader.
 module Hetoimasia.LuaEngine.Graphics.Scene.Receipts
   ( DrawReceipts
   , newDrawReceipts
@@ -56,7 +59,7 @@ module Hetoimasia.LuaEngine.Graphics.Scene.Receipts
   , noteOffscreenBatch
   , receiptObserver
   , sweepOffscreen
-  , receiptsListen
+  , receiptsFrames
   , watchFrameMetrics
   , unwatchFrameMetrics
   , noteFrameMetrics
@@ -74,7 +77,7 @@ import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Word (Word64)
 import Hetoimasia.GPU.Model.Identity (FrameSlotId)
-import Hetoimasia.GPU.Vulkan.GLFW (FrameEvent (..), FrameObserver, TicketState (..))
+import Hetoimasia.GPU.Vulkan.GLFW (BatchTicket, FrameEvent (..), FrameObserver, TicketState (..), readTicket)
 import Hetoimasia.LuaEngine.Graphics.Scene.World (WorldTag (..))
 import Hetoimasia.Render.TwoD.Metrics (TargetMetrics)
 import Hetoimasia.Runtime.GLFW (AttachmentId)
@@ -92,12 +95,13 @@ data Drawn = Drawn
 -- | The session's receipts.
 data DrawReceipts = DrawReceipts
   { receiptsRecorded ∷ !(TVar (Map (AttachmentId, FrameSlotId) (WorldTag, TargetMetrics)))
-  , receiptsOffscreen ∷ !(TVar (Seq (STM TicketState, WorldTag, TargetMetrics)))
+  , receiptsOffscreen ∷ !(TVar (Seq (BatchTicket, WorldTag, TargetMetrics)))
     -- ^ Offscreen batches noted and not yet settled, in the order they were noted.
   , receiptsDrawn ∷ !(TVar (Map Word64 Drawn))
   , receiptsLive ∷ !(TVar (Set Word64))
     -- ^ The view incarnations whose receipts may move.
-  , receiptsListener ∷ !(TVar (Bool → STM ()))
+  , receiptsEvents ∷ !(TVar (Natural, Natural))
+    -- ^ How many frame events the observer has seen, and how many of them were a presentation's enqueue.
   , receiptsMetrics ∷ !(TVar (Map AttachmentId (TargetMetrics, Natural)))
     -- ^ The metrics of each kept attachment's latest recorded frame, with when it was noted.
   , receiptsWatched ∷ !(TVar (Map AttachmentId Natural))
@@ -111,7 +115,7 @@ metricsKept = 64
 
 newDrawReceipts ∷ IO DrawReceipts
 newDrawReceipts =
-  DrawReceipts <$> newTVarIO Map.empty <*> newTVarIO Seq.empty <*> newTVarIO Map.empty <*> newTVarIO Set.empty <*> newTVarIO (const (pure ())) <*> newTVarIO Map.empty <*> newTVarIO Map.empty <*> newTVarIO 0
+  DrawReceipts <$> newTVarIO Map.empty <*> newTVarIO Seq.empty <*> newTVarIO Map.empty <*> newTVarIO Set.empty <*> newTVarIO (0, 0) <*> newTVarIO Map.empty <*> newTVarIO Map.empty <*> newTVarIO 0
 
 -- | The view incarnation's latest receipt, if it has drawn.
 readReceipt ∷ DrawReceipts → Word64 → STM (Maybe Drawn)
@@ -145,7 +149,7 @@ noteUnrecorded receipts attachment slot = modifyTVar' (receiptsRecorded receipts
 
 -- | A batch recording this revision into a registered offscreen target, noted by the owner action that recorded it,
 -- with the reading of its ticket. It is promoted once the batch is complete.
-noteOffscreenBatch ∷ DrawReceipts → STM TicketState → WorldTag → TargetMetrics → STM ()
+noteOffscreenBatch ∷ DrawReceipts → BatchTicket → WorldTag → TargetMetrics → STM ()
 noteOffscreenBatch receipts ticket tag metrics = do
   live ← Set.member (tagView tag) <$> readTVar (receiptsLive receipts)
   when live (modifyTVar' (receiptsOffscreen receipts) (|> (ticket, tag, metrics)))
@@ -165,7 +169,7 @@ sweepOffscreen receipts = do
     go held kept (entry@(ticket, tag, metrics) : rest)
       | Set.member (tagView tag) held = go held (kept |> entry) rest
       | otherwise =
-          ticket >>= \case
+          readTicket ticket >>= \case
             TicketPending → go (Set.insert (tagView tag) held) (kept |> entry) rest
             TicketComplete → noteSubmitted receipts tag metrics >> go held kept rest
             _ → go held kept rest
@@ -181,7 +185,7 @@ noteSubmitted receipts tag metrics = do
 
 -- | The host's frame observer for receipts: a frame whose presentation was enqueued draws what was recorded for its
 -- attachment and slot; an abandoned frame drew nothing; every event promotes the offscreen batches that completed.
--- Every frame event also runs the listener, told whether it was a presentation's enqueue.
+-- Every frame event is counted, and so is every presentation's enqueue.
 receiptObserver ∷ DrawReceipts → FrameObserver
 receiptObserver receipts event = atomically $ do
   presented ← case event of
@@ -194,12 +198,12 @@ receiptObserver receipts event = atomically $ do
     FrameAbandoned attachment slot _ → False <$ modifyTVar' (receiptsRecorded receipts) (Map.delete (attachment, slot))
     _ → pure False
   _ ← sweepOffscreen receipts
-  readTVar (receiptsListener receipts) >>= \run → run presented
+  modifyTVar' (receiptsEvents receipts) (\(events, presentations) → (events + 1, if presented then presentations + 1 else presentations))
 
--- | Install the transaction every frame event runs, given whether the event was a presentation's enqueue
--- ('const (pure ())' clears it). It must not wait or raise.
-receiptsListen ∷ DrawReceipts → (Bool → STM ()) → STM ()
-receiptsListen receipts = writeTVar (receiptsListener receipts)
+-- | How many frame events the observer has seen, and how many of them were a presentation's enqueue: each moves with
+-- every such event, and only with them.
+receiptsFrames ∷ DrawReceipts → STM (Natural, Natural)
+receiptsFrames receipts = readTVar (receiptsEvents receipts)
 
 -- | A view watches this window attachment from now on: its metrics are not evicted.
 watchFrameMetrics ∷ DrawReceipts → AttachmentId → STM ()

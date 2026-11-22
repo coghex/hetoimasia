@@ -85,6 +85,8 @@ capabilities =
   , "HeldTarget"
   , "newHeldTarget"
   , "surfaceRevalidation"
+  , "HeldAuthority"
+  , "LeaseAuthority"
   ]
 
 spec ∷ Spec
@@ -121,6 +123,29 @@ spec = describe "the terrain views' package boundary" $ do
         rejectedBecause outcome "GHC-61689"
         clientOutput outcome `shouldContain` capability
 
+  -- the scene ledger and the receipts, whose commits the views watch: no client code runs in them
+  forM_ [("Hetoimasia.LuaEngine.Graphics.Scene.Ledger", "ledgerListen"), ("Hetoimasia.LuaEngine.Graphics.Scene.Receipts", "receiptsListen")] $ \(moduleName, listener) →
+    it ("rejects a client that asks " <> moduleName <> " for a listener (" <> listener <> ")") $
+      withSessionClient (importClient moduleName listener) $ \compile → do
+        outcome ← compile Typecheck
+        rejectedBecause outcome "GHC-61689"
+        clientOutput outcome `shouldContain` listener
+
+  it "rejects a client that notes an offscreen batch with a ticket reader of its own" $
+    withSessionClient
+      ( unlines
+          [ "module Client (noted) where"
+          , "import Control.Concurrent.STM (STM)"
+          , "import Hetoimasia.LuaEngine.Graphics.Scene.Receipts (noteOffscreenBatch)"
+          , "noted receipts tag metrics = noteOffscreenBatch receipts (pure undefined ∷ STM ()) tag metrics"
+          ]
+      )
+      $ \compile → do
+        outcome ← compile Typecheck
+        -- the ticket is the backend's own batch ticket: a transaction does not type
+        rejectedBecause outcome "GHC-83865"
+        clientOutput outcome `shouldContain` "BatchTicket"
+
   forM_ ["TerrainViewsPorts", "ViewTarget"] $ \constructor →
     it ("rejects a client that forges the public module's opaque " <> constructor) $
       withClient (unlines ["module Client (forged) where", "import " <> publicModule, "forged = " <> constructor]) $ \compile → do
@@ -128,6 +153,10 @@ spec = describe "the terrain views' package boundary" $ do
         -- no data constructor of that name is in scope: only the type is exported
         rejectedBecause outcome "GHC-01928"
         clientOutput outcome `shouldContain` constructor
+
+-- The main library's unit, by its in-place id: the scene ledger and receipts as a client reaches them.
+withSessionClient ∷ String → ((Mode → IO Client) → IO ()) → IO ()
+withSessionClient = withStorePackageClient ["base", "stm", "hetoimasia-lua-engine-graphics-0.1.0.0-inplace"] "Client.hs"
 
 -- A client that imports these names from a module, or only the module when no name is given.
 importClient ∷ String → String → String

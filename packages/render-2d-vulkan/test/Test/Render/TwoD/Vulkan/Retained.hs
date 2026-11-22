@@ -17,13 +17,13 @@ import Control.Monad (forM_)
 import Control.Concurrent.STM (atomically, newTVarIO, readTVar, readTVarIO, retry, writeTVar)
 import Data.Maybe (catMaybes)
 import qualified Data.Map.Strict as Map
-import Control.Exception (AsyncException (ThreadKilled), ErrorCall (ErrorCall), ExceptionWithContext (ExceptionWithContext), rethrowIO, throwIO, toException, tryWithContext)
+import Control.Exception (AsyncException (ThreadKilled), ErrorCall (ErrorCall), ExceptionWithContext (ExceptionWithContext), SomeException, rethrowIO, throwIO, toException, tryWithContext)
 import Control.Exception.Annotation (ExceptionAnnotation (displayExceptionAnnotation))
 import Control.Exception.Context (addExceptionAnnotation, emptyExceptionContext, getExceptionAnnotations)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
-import Data.List (nub)
+import Data.List (isInfixOf, nub)
 import Data.List.NonEmpty (NonEmpty ((:|)))
 import qualified Data.Set as Set
 import qualified Data.Text as Text
@@ -566,6 +566,40 @@ refusalSpec = describe "refusing a build" $ do
       -- a successor takes the returned reference, queue place and staging range
       reference ← built setup ChunkWorldDepth [cutAt 9 1]
       reference `shouldBe` chunkRefOf 7 1
+
+  it "seals a spend whose upload answer raises only when evaluated: the made buffer is released, the receipt holds the cause and the room returns" $
+    bounded . withSetup $ \setup → do
+      let lazily = (trackedBuilders setup) {bufferUploads = observingSpends (\_ _ _ _ → pure (error "the upload's answer raised")) (bufferUploads (trackedBuilders setup))}
+      prepared ← either (fail . show) pure (prepareRetainedChunk artMarks ChunkWorldDepth DeriveBounds Map.empty [cutAt 0 1])
+      grant ← atomically (admitRetainedChunk (bufferUploads lazily) (setupRetained setup) prepared) >>= either (fail . show) pure
+      tryWithContext @SomeException (spendChunkGrant lazily (setupRetained setup) grant) >>= \case
+        Left (ExceptionWithContext _ raised) → show raised `shouldSatisfy` ("the upload's answer raised" `isInfixOf`)
+        Right answer → expectationFailure ("expected the answer's exception, found " <> show answer)
+      made ← readIORef (trackedMade (setupTracked setup))
+      claimsOf grant >>= \case
+        [Left (BuildRefused (BuildRaised cause) (AllocationReleased buffer (Right ())))] → do
+          Text.unpack cause `shouldSatisfy` ("the upload's answer raised" `isInfixOf`)
+          [buffer] `shouldBe` made
+        other → expectationFailure ("expected the released buffer with the cause, found " <> show other)
+      readIORef (trackedReleased (setupTracked setup)) `shouldReturn` made
+      reservedOf setup `shouldReturn` 0
+
+  it "seals a refused spend whose release answer raises only when evaluated: the receipt names the buffer and the release's cause, and reading it raises nothing" $
+    bounded . withSetup $ \setup → do
+      let lazily =
+            (trackedBuilders setup)
+              { bufferUploads = observingSpends (\_ _ _ _ → pure (Left (BufferUploadRefused UploadClosed))) (bufferUploads (trackedBuilders setup))
+              , releaseBuffer = \_ → pure (Left (error "the release's answer raised"))
+              }
+      prepared ← either (fail . show) pure (prepareRetainedChunk artMarks ChunkWorldDepth DeriveBounds Map.empty [cutAt 0 1])
+      grant ← atomically (admitRetainedChunk (bufferUploads lazily) (setupRetained setup) prepared) >>= either (fail . show) pure
+      _ ← tryWithContext @SomeException (spendChunkGrant lazily (setupRetained setup) grant)
+      claimsOf grant >>= \case
+        [Left refused@(BuildRefused (BuildUploadRefused UploadClosed) (AllocationReleaseRaised _ why))] → do
+          Text.unpack why `shouldSatisfy` ("the release's answer raised" `isInfixOf`)
+          length (show refused) `shouldSatisfy` (> 0)
+        other → expectationFailure ("expected the release's cause, found " <> show other)
+      reservedOf setup `shouldReturn` 0
 
   it "sweeps a sealed registration whose collector never ran at the registry's teardown: claimed once, with its chunk, and the registry holds no receipt after" $
     bounded . withSetup $ \setup → do

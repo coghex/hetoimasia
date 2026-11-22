@@ -32,11 +32,11 @@
 -- terrain view holds its style's two parents from its attachment to its close, so the texture backend, whose release
 -- is gated on 'ledgerHeld', does not release their registrations meanwhile, whatever their leases.
 --
--- = The listener
+-- = Changes
 --
--- One transaction a holder installs ('ledgerListen'), run inside every adoption and release: the terrain views of
--- the session ask for the graphics owner's next step with it, so a retirement waiting for a release is looked at
--- again. It must not wait or raise.
+-- Every adoption and release counts one change ('ledgerChanges'). A holder that must look again when the ledger
+-- changes, as the terrain views of the session do for a retirement waiting for a release, watches the count in a
+-- transaction of its own: no holder's code runs in an adoption or a release.
 --
 -- = Owned state, threads and lifetime
 --
@@ -50,9 +50,6 @@
 -- +--------------+--------+-----------------------+------------------------+------------------------------+
 -- | Interests    | the    | a terrain view (STM,  | the texture backend's  | an interest goes with its    |
 -- |              | ledger | any thread)           | release                | holder's drop                |
--- +--------------+--------+-----------------------+------------------------+------------------------------+
--- | The listener | the    | the terrain views'    | the two hooks          | replaced by the next holder; |
--- |              | ledger | scope (install, clear)|                        | cleared at its scope's end   |
 -- +--------------+--------+-----------------------+------------------------+------------------------------+
 --
 -- The ledger exists before the host does, so the lifecycle the host is configured with is the real one
@@ -87,8 +84,8 @@ module Hetoimasia.LuaEngine.Graphics.Scene.Ledger
   , ledgerRetainInterest
   , ledgerDropInterest
 
-    -- * The listener
-  , ledgerListen
+    -- * Changes
+  , ledgerChanges
 
     -- * Reading
   , LedgerReading (..)
@@ -96,7 +93,6 @@ module Hetoimasia.LuaEngine.Graphics.Scene.Ledger
   ) where
 
 import Control.Concurrent.STM (STM, TVar, atomically, newTVarIO, readTVar, writeTVar)
-import Control.Monad (join)
 import Control.DeepSeq (NFData (rnf))
 import Data.Map.Strict (Map)
 import Data.Maybe (fromMaybe)
@@ -191,11 +187,11 @@ data State w = State
 -- 'SceneTargetKey' in production ('ledgerLifecycle'): a window or an offscreen target, in one key space; it is a
 -- parameter so that the lifecycle suite, which cannot
 -- mint a window identity, drives the same ledger with any ordered key.
-data SceneLedger w = SceneLedger !(TVar (State w)) !(TVar (STM ()))
+data SceneLedger w = SceneLedger !(TVar (State w))
 
--- | A ledger with nothing adopted, no interest and a listener that does nothing.
+-- | A ledger with nothing adopted and no interest.
 newSceneLedger ∷ IO (SceneLedger w)
-newSceneLedger = SceneLedger <$> newTVarIO (State Map.empty 0 0 0 Nothing Map.empty) <*> newTVarIO (pure ())
+newSceneLedger = SceneLedger <$> newTVarIO (State Map.empty 0 0 0 Nothing Map.empty)
 
 -- | The two hooks the host is configured with. Both are one transaction over pure data on the owner's
 -- thread: neither waits, calls Lua or raises.
@@ -208,15 +204,12 @@ ledgerLifecycle ledger =
 
 -- | The owner adopted this revision of the window, with this scene: hold what it names, once more.
 ledgerAdopted ∷ (Ord w, Show w) ⇒ SceneLedger w → w → Natural → GraphicsScene → IO ()
-ledgerAdopted (SceneLedger var listener) window revision scene = atomically $ do
+ledgerAdopted (SceneLedger var) window revision scene = atomically $
   adopt var window revision (Adoption 1 (sceneHolds scene) (maybe Set.empty worldChunks (graphicsWorld scene)) (worldTag <$> graphicsWorld scene))
-  join (readTVar listener)
 
 -- | One adoption of this revision of the window has been released: hold what it names once less.
 ledgerReleased ∷ (Ord w, Show w) ⇒ SceneLedger w → w → Natural → IO ()
-ledgerReleased (SceneLedger var listener) window revision = atomically $ do
-  release var window revision
-  join (readTVar listener)
+ledgerReleased (SceneLedger var) window revision = atomically (release var window revision)
 
 adopt ∷ (Ord w, Show w) ⇒ TVar (State w) → w → Natural → Adoption → STM ()
 adopt var window revision holds = do
@@ -253,47 +246,46 @@ defect what st = st {stDefects = stDefects st + 1, stFirstDefect = Just (fromMay
 -- | Whether this texture, by its complete identity, is held: by an adopted, unreleased revision, or by an
 -- explicit interest ('ledgerRetainInterest'). The texture backend's release is gated on it.
 ledgerHeld ∷ SceneLedger w → Word64 → STM Bool
-ledgerHeld ledger@(SceneLedger var _) identity = do
+ledgerHeld ledger@(SceneLedger var) identity = do
   adopted ← ledgerHolds ledger identity
   interests ← Map.findWithDefault 0 identity . stInterests <$> readTVar var
   pure (adopted > 0 || interests > 0)
 
 -- | Whether any adopted, unreleased revision lists this retained chunk.
 ledgerChunkHeld ∷ SceneLedger w → ChunkRef → STM Bool
-ledgerChunkHeld (SceneLedger var _) chunk = any (Set.member chunk . adoptionChunks) . Map.elems . stRecords <$> readTVar var
+ledgerChunkHeld (SceneLedger var) chunk = any (Set.member chunk . adoptionChunks) . Map.elems . stRecords <$> readTVar var
 
 -- | Whether an adopted, unreleased revision of this target is the world with this tag: a revision that can still be
 -- drawn, or whose frames are still in flight.
 ledgerTagHeld ∷ Eq w ⇒ SceneLedger w → w → WorldTag → STM Bool
-ledgerTagHeld (SceneLedger var _) target tag =
+ledgerTagHeld (SceneLedger var) target tag =
   any (\((key, _), adoption) → key == target && adoptionTag adoption == Just tag) . Map.toList . stRecords <$> readTVar var
 
 -- | Take one explicit interest in a texture, by its complete identity: while any interest is held, the texture
 -- backend does not release the texture's registration. It never makes a released handle publishable.
 ledgerRetainInterest ∷ SceneLedger w → Word64 → STM ()
-ledgerRetainInterest (SceneLedger var _) identity = do
+ledgerRetainInterest (SceneLedger var) identity = do
   st ← readTVar var
   writeTVar var st {stInterests = Map.insertWith (+) identity 1 (stInterests st)}
 
 -- | Drop one interest taken with 'ledgerRetainInterest'. Dropping one that is not held is a defect of the holder's
 -- pairing: counted, never raised, and the count is not driven below zero.
 ledgerDropInterest ∷ SceneLedger w → Word64 → STM ()
-ledgerDropInterest (SceneLedger var _) identity = do
+ledgerDropInterest (SceneLedger var) identity = do
   st ← readTVar var
   writeTVar var $ case Map.lookup identity (stInterests st) of
     Nothing → defect ("an interest was dropped that was not held: texture " <> Text.pack (show identity)) st
     Just 1 → st {stInterests = Map.delete identity (stInterests st)}
     Just n → st {stInterests = Map.insert identity (n - 1) (stInterests st)}
 
--- | Install the transaction every adoption and release runs after its own ('pure ()' clears it). It must not wait
--- or raise.
-ledgerListen ∷ SceneLedger w → STM () → STM ()
-ledgerListen (SceneLedger _ listener) = writeTVar listener
+-- | How many adoptions and releases the ledger has recorded: it moves with every one, and only with them.
+ledgerChanges ∷ SceneLedger w → STM Natural
+ledgerChanges (SceneLedger var) = (\st → stAdopted st + stReleased st) <$> readTVar var
 
 -- | How many adoptions hold this texture: for each window and revision, the count of its adoptions. A count is a
 -- 'Natural', as a revision is: nothing here wraps, however many adoptions a long run makes.
 ledgerHolds ∷ SceneLedger w → Word64 → STM Natural
-ledgerHolds (SceneLedger var _) identity =
+ledgerHolds (SceneLedger var) identity =
   sum . map adoptionCount . filter (Set.member identity . adoptionHolds) . Map.elems . stRecords <$> readTVar var
 
 -- | What the ledger holds now.
@@ -316,7 +308,7 @@ data LedgerReading w = LedgerReading
   deriving (Eq, Show)
 
 ledgerReading ∷ SceneLedger w → STM (LedgerReading w)
-ledgerReading (SceneLedger var _) = do
+ledgerReading (SceneLedger var) = do
   st ← readTVar var
   pure
     LedgerReading

@@ -29,7 +29,8 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView
   , newOffscreenFacts
   , setOffscreenUsable
   , setOffscreenMetrics
-  , Authority (..)
+  , Authority
+  , leaseAuthority
   , ViewGeometry (..)
   , geometryOfMetrics
   , windowGeometryOf

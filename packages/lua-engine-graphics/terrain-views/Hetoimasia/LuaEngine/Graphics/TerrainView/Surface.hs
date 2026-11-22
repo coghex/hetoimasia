@@ -12,6 +12,7 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView.Surface
     ViewTarget (..)
   , ViewSurface (..)
   , Authority (..)
+  , leaseAuthority
   , leasesLive
   , ViewGeometry (..)
   , geometryOfMetrics
@@ -79,6 +80,7 @@ import Hetoimasia.LuaEngine.Graphics.Window.Host
   , windowViewUsable
   )
 import Hetoimasia.Render.TwoD.Metrics (PixelExtent (..), TargetMetrics (..), validMetrics)
+import Hetoimasia.Foundation.Admission (AdmissionToken, tokenOpen)
 import Hetoimasia.Scripting.Lua.Lease (Leases, leaseLiveSTM)
 
 -- | A target a view attaches to: its incarnation's key, the target itself, and whether its frames carry the qualified
@@ -98,9 +100,14 @@ data ViewSurface
   | -- | A target held in memory.
     HeldSurface !HeldTarget
 
--- | An original authority the caller holds, live until it ends, once: a lease (exact and never reissued), or a cell
--- held in memory that its holder ends.
-data Authority = LeaseAuthority !Leases !Word64 | HeldAuthority !(TVar Bool)
+-- | An original authority the caller holds, live until it ends, once: a lease (exact and never reissued), or an
+-- admission held in memory, whose closing is permanent. Neither can go live again once ended, so the views' evidence
+-- of it is a Boolean. Clients make only a lease authority ('leaseAuthority').
+data Authority = LeaseAuthority !Leases !Word64 | HeldAuthority !AdmissionToken
+
+-- | The authority of this exact lease of the table.
+leaseAuthority ∷ Leases → Word64 → Authority
+leaseAuthority = LeaseAuthority
 
 -- | Whether every one of these authorities is still live.
 leasesLive ∷ [Authority] → STM Bool
@@ -108,7 +115,7 @@ leasesLive = fmap and . mapM live
   where
     live = \case
       LeaseAuthority table key → leaseLiveSTM table key
-      HeldAuthority cell → readTVar cell
+      HeldAuthority token → tokenOpen token
 
 -- | A target's geometry as observed now: unknown (incomplete), zero (an observed zero dimension, logical or
 -- framebuffer, whatever else is missing), or a complete positive extent.

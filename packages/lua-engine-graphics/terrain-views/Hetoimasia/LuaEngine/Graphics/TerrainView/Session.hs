@@ -49,6 +49,7 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView.Session
   , withTerrainViews
   , stepOwner
   , kick
+  , ledgerNoticed
 
     -- * Targets and styles
   , ViewTarget (..)
@@ -118,8 +119,8 @@ import Hetoimasia.Foundation.Messaging.Payload (Prepared, prepare)
 import Hetoimasia.Foundation.Resource (composeCleanup, withResourceLabelled)
 import Hetoimasia.Foundation.Worker (StartOutcome (..), closeWorkerGroup, requestStop, startWorker, stopRequested, withWorkerGroup, workerDefinition)
 import Hetoimasia.LuaEngine.Graphics.Scene.Claims (SceneClaims, claimOf, Claim (..), markClaimPublished, newClaimHolder, releaseClaim, takeClaim)
-import Hetoimasia.LuaEngine.Graphics.Scene.Ledger (GraphicsScene, SceneLedger, ledgerChunkHeld, ledgerDropInterest, ledgerListen, ledgerRetainInterest, ledgerTagHeld, worldGraphicsScene)
-import Hetoimasia.LuaEngine.Graphics.Scene.Receipts (DrawReceipts, Drawn (..), forgetReceipt, openReceipt, readReceipt, receiptsListen, sweepOffscreen)
+import Hetoimasia.LuaEngine.Graphics.Scene.Ledger (GraphicsScene, SceneLedger, ledgerChunkHeld, ledgerChanges, ledgerDropInterest, ledgerRetainInterest, ledgerTagHeld, worldGraphicsScene)
+import Hetoimasia.LuaEngine.Graphics.Scene.Receipts (DrawReceipts, Drawn (..), forgetReceipt, openReceipt, readReceipt, receiptsFrames, sweepOffscreen)
 import Hetoimasia.LuaEngine.Graphics.Scene.World (SceneWorld (..), WorldTag (..))
 import Hetoimasia.LuaEngine.Graphics.TerrainView.Inputs (CopySet (..), combineCopies, planInputs, plannerRuns)
 import Hetoimasia.LuaEngine.Graphics.TerrainView.Owner (Admission (..), Allocated (..), BuildFailure (..), ConstructedDisposal (..), Grant (..), Hands (..), Receipt (..), OwnerPorts (..), ScheduleRefusal (..), StepOutcome (..))
@@ -190,15 +191,17 @@ data TerrainViewsPorts k = TerrainViewsPorts
 -- part a copy is read as unavailable (a storage fault, in a suite); an action run inside the run count of a held copy,
 -- once its total is counted and before the copy is accepted or refused, its batch and the total named (a gate a suite
 -- observes the held charge at); and a refusal answered for a demand installation in place of the terrain service's
--- (a suite's deterministic refusal). 'noCopyHooks' in production.
+-- (a suite's deterministic refusal); and an action run on the owner's thread after a build's revalidation succeeded
+-- and before its collection, outside both transactions (a suite changes a source there). 'noCopyHooks' in production.
 data CopyHooks = CopyHooks
   { hookUnavailable ∷ STM (Set RegionCoord)
   , hookCounting ∷ [RegionCoord] → Int → IO ()
   , hookDemandRefused ∷ [RegionCoord] → STM (Maybe Text)
+  , hookCollecting ∷ IO ()
   }
 
 noCopyHooks ∷ CopyHooks
-noCopyHooks = CopyHooks (pure Set.empty) (\_ _ → pure ()) (\_ → pure Nothing)
+noCopyHooks = CopyHooks (pure Set.empty) (\_ _ → pure ()) (\_ → pure Nothing) (pure ())
 
 -- | Why the service could not be made. Nothing was reserved or started.
 data TerrainViewsRefused
@@ -521,11 +524,16 @@ data TerrainViews k = TerrainViews
   , svSwept ∷ !(TVar (Seq (k, Word64, Text)))
     -- ^ The latest builds the sweep collected in their views' place: target, view, what the build left and why the
     -- sweep took it (at most 64).
+  , svNoticed ∷ !(TVar (Natural, Natural, Natural))
+    -- ^ The ledger's change count, and the receipts' frame events and presentations, as the watcher last saw them.
+  , svUnheld ∷ !(TVar (Seq (Word64, Text)))
+    -- ^ The latest builds the registry's teardown sweep claimed that no view held: the receipt's key and what each
+    -- left, its cause included (at most 64).
   , svOrphans ∷ !(TVar [ChunkRef])
-  , svOrphanInHand ∷ !(TVar (Maybe ChunkRef))
-    -- ^ The orphan the owner is releasing now: it stays named here until its release's outcome is recorded.
     -- ^ Registered chunks the registry's teardown sweep found with no pending build: released by the owner, charged to
     -- no target.
+  , svOrphanInHand ∷ !(TVar (Maybe ChunkRef))
+    -- ^ The orphan the owner is releasing now: it stays named here until its release's outcome is recorded.
   , svOrphansDisposing ∷ !(TVar [(Text, STM ConstructedDisposal)])
     -- ^ Those released, until the backend confirms their disposal.
   , svOrphanFailures ∷ !(TVar [(Text, Text)])
@@ -581,14 +589,7 @@ withTerrainViews config ports body = do
         unless reserved $ throwIO (TerrainViewsAccount allowance (-1))
   withResourceLabelled "terrain views: the account reservation" reserve (\() → atomically (accountRelease account (fromInteger allowance))) $ \() → do
     service ← newService config ports allowance
-    let listen = do
-          ledgerListen (portLedger ports) (kick service)
-          receiptsListen (portReceipts ports) (\presented → when presented (frameEnded service) >> kick service)
-        unlisten = do
-          ledgerListen (portLedger ports) (pure ())
-          receiptsListen (portReceipts ports) (const (pure ()))
     mask $ \restore → do
-      atomically listen
       outcome ←
         tryWithContext . restore . withWorkerGroup $ \group → do
           started ← startWorker group (workerDefinition "terrain-views-watcher" (\_ → pure ()) (\token () → watch service (stopRequested token)))
@@ -602,7 +603,6 @@ withTerrainViews config ports body = do
               pure result
             _ → throwIO (TerrainViewsWatcher "the watcher or the planner did not start")
       drainedOrNot ← tryWithContext (shutdown service)
-      atomically unlisten
       case (outcome, drainedOrNot) of
         (Right result, Right ()) → pure result
         (Right _, Left failure) → rethrowIO failure
@@ -620,6 +620,8 @@ newService config ports allowance = do
   failed ← newTVarIO []
   pending ← newTVarIO Map.empty
   swept ← newTVarIO Seq.empty
+  unheld ← newTVarIO Seq.empty
+  noticed ← newTVarIO (0, 0, 0)
   orphans ← newTVarIO []
   orphanInHand ← newTVarIO Nothing
   orphansDisposing ← newTVarIO []
@@ -645,6 +647,8 @@ newService config ports allowance = do
       , svFailed = failed
       , svPending = pending
       , svSwept = swept
+      , svUnheld = unheld
+      , svNoticed = noticed
       , svOrphans = orphans
       , svOrphanInHand = orphanInHand
       , svOrphansDisposing = orphansDisposing
@@ -704,15 +708,33 @@ watch service stopping = loop
         if seen == now then pure actionable else True <$ writeTVar (vsSeen vs) now
       if moved then kick service else retry
     work = do
+      noticed ← notice service
       swept ← sweepOffscreen (portReceipts (svPorts service))
       asked ← askBarriers service
       queued ← stepQueued service
       wanted ← readTVar (svKickWanted service)
       ready ← if queued then pure False else retirementReady service
       if
-        | swept || asked → kick service
+        | noticed || swept || asked → kick service
         | not queued && (wanted || ready) → admit service >>= check
         | otherwise → retry
+
+-- The ledger's and the receipts' counts against those the watcher last saw: a change since asks for the owner's next
+-- step, and a presentation ends the frame's accounting. Read in the watcher's own transaction: no view's code runs in
+-- an adoption, a release or a frame event.
+notice ∷ TerrainViews k → STM Bool
+notice service = do
+  changes ← ledgerChanges (portLedger (svPorts service))
+  (events, presentations) ← receiptsFrames (portReceipts (svPorts service))
+  seen@(_, _, presented) ← readTVar (svNoticed service)
+  let now = (changes, events, presentations)
+  when (presentations /= presented) (frameEnded service)
+  if now == seen then pure False else True <$ writeTVar (svNoticed service) now
+
+-- | The ledger's change count as the views' watcher last saw it: once it has reached a change, the watcher has asked for
+-- the owner's step that change may need.
+ledgerNoticed ∷ TerrainViews k → STM Natural
+ledgerNoticed service = (\(changes, _, _) → changes) <$> readTVar (svNoticed service)
 
 -- The planner: one thread that runs the views' pure planning, latest job first come, and hands each result back to
 -- its stage, asking for the owner's next step. It owns nothing; a result whose stage was abandoned is dropped.
@@ -2146,7 +2168,8 @@ stepBuilding service hands vs serial prep candidate
               _ →
                 -- revalidation: one read-only snapshot, its evidence strict
                 -- every part of the evidence collection compares is forced here, where its exception is this step's
-                tryWithContext @SomeException (atomically ((Just <$> witnessOf service vs) `orElse` pure Nothing) >>= traverse (\seen → seen <$ evaluate (seen == seen))) >>= \case
+                -- then the seam between the two boundaries, outside both transactions (nothing in production)
+                tryWithContext @SomeException (atomically ((Just <$> witnessOf service vs) `orElse` pure Nothing) >>= traverse (\seen → seen <$ evaluate (seen == seen)) >>= \seen → seen <$ when (isJust seen) (hookCollecting (portCopyHooks (svPorts service)))) >>= \case
                   Left failure
                     | asynchronous failure → cancelled failure
                     -- a revalidation that raised: the sweep collects the build, with the cause, and the step yields
@@ -2504,12 +2527,19 @@ registrySwept service claimed = do
   forM_ claimed $ \(key, outcome) →
     Map.lookup key <$> readTVar (svPending service) >>= \case
       Just entry → sweptBuild service key entry outcome (fromMaybe "the registry's teardown sweep found it" (pbSweep entry))
-      -- no build of a view: a registered chunk is an orphan, and a refusal's buffer keeps its evidence uncharged
-      Nothing → case outcome of
-        Right chunk → modifyTVar' (svOrphans service) (chunk :)
-        Left (BuildFailed _ NotAllocated) → pure ()
-        Left (BuildFailed primary (AllocatedDisposing identity reading)) → modifyTVar' (svOrphansDisposing service) (<> [(identity <> " (the build failed: " <> primary <> ")", reading)])
-        Left (BuildFailed primary (AllocatedFailed why)) → modifyTVar' (svOrphanFailures service) (<> [("a failed build's buffer", "the build failed (" <> primary <> "), and " <> why)])
+      -- no build of a view: a registered chunk is an orphan, and a refusal's buffer keeps its evidence uncharged; the
+      -- record keeps what each left, a refusal's cause with it
+      Nothing → do
+        let unheld left = modifyTVar' (svUnheld service) (\records → Seq.drop (Seq.length records - 63) (records |> (key, left)))
+        case outcome of
+          Right chunk → modifyTVar' (svOrphans service) (chunk :) >> unheld ("a registered chunk (" <> Text.pack (show chunk) <> "), released as an orphan")
+          Left (BuildFailed primary NotAllocated) → unheld ("the build failed: " <> primary <> "; no buffer was made")
+          Left (BuildFailed primary (AllocatedDisposing identity reading)) → do
+            modifyTVar' (svOrphansDisposing service) (<> [(identity <> " (the build failed: " <> primary <> ")", reading)])
+            unheld ("the build failed: " <> primary <> "; its buffer " <> identity <> " was released")
+          Left (BuildFailed primary (AllocatedFailed why)) → do
+            modifyTVar' (svOrphanFailures service) (<> [("a failed build's buffer", "the build failed (" <> primary <> "), and " <> why)])
+            unheld ("the build failed: " <> primary <> "; " <> why)
   pure (not (null claimed))
 
 -- The disposals the backend has finished: a done one frees its slot, a failed one becomes a failure with its cause and
@@ -2651,6 +2681,8 @@ data ServiceReading k = ServiceReading
     -- ^ Granted builds not yet collected, by their views or the sweep.
   , serviceSwept ∷ ![(k, Word64, Text)]
     -- ^ The latest builds the sweep collected in their views' place: target, view, what each left and why it was swept.
+  , serviceUnheld ∷ ![(Word64, Text)]
+    -- ^ The latest builds the registry's teardown sweep claimed that no view held: the receipt's key and what each left.
   , serviceOrphans ∷ ![(Text, Text)]
     -- ^ Buffers and registered chunks no view collected whose release or disposal failed: their identity and the cause.
   , serviceFailures ∷ ![(k, Maybe ChunkRef, Text)]
@@ -2677,6 +2709,7 @@ readTerrainViews service =
     <*> ((+) <$> (length <$> readTVar (svInHand service)) <*> (length <$> readTVar (svDisposing service)))
     <*> (Map.size <$> readTVar (svPending service))
     <*> (toList <$> readTVar (svSwept service))
+    <*> (toList <$> readTVar (svUnheld service))
     <*> readTVar (svOrphanFailures service)
     <*> readTVar (svFailed service)
     <*> pure (svReserved service)
