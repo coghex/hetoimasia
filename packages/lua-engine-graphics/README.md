@@ -699,9 +699,10 @@ publication`, one bounded unit a step, all for the **destination camera**:
    the owner takes the slot, the renderer's reference and the uploads' queue
    place and staging region for that part in one transaction (`handReserve`;
    a refused grant takes none of them). It then makes, fills and registers the
-   chunk (`grantSpend`), at most `profileBuilds` a step, handing each to the
-   candidate in the transaction after its build, or to disposal if the stage
-   was replaced meanwhile. A waiting candidate keeps its built prefix and is
+   chunk (`grantSpend`), at most `profileBuilds` a step. Each build is settled
+   once, whatever its exit, and the view's ledger moves in the renderer's
+   settlement transaction: the chunk goes to the candidate, or to disposal if
+   the stage was replaced meanwhile. A waiting candidate keeps its built prefix and is
    armed in the transaction that found it blocked. The watcher asks for a step
    once the same decision, or the candidate's own chunk standings and
    publication room, let it go on. A failure after a grant refuses the
@@ -710,9 +711,9 @@ publication`, one bounded unit a step, all for the **destination camera**:
    destruction; a release that failed or raised keeps it as a failure naming
    the buffer, with the build's cause and the release's. A buffer awaiting its
    destruction keeps the build's cause too, so a destruction that fails is
-   recorded with both. A build interrupted by an exception or a cancellation
-   hands over what became of its buffer before the interruption goes on, and
-   is accounted for the same way.
+   recorded with both. A build that raises or is cancelled is settled the
+   same way before the exception goes on; a synchronous one is then reported
+   as that refusal, and a cancellation goes on.
 8. **Publication**, once every chunk is ready, in the transaction that rechecks
    the claim, the target, the session, the intent, the metrics and the arena's
    content and knowledge revisions, and applies the view's runtime demand under
