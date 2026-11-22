@@ -167,8 +167,8 @@ data Ledger = Ledger
     -- ^ The indices free to reuse, with the generation they will be issued under.
   , ledgerNext ∷ !Word32
     -- ^ The next index never issued.
-  , ledgerReceipts ∷ !(Map Word64 (TVar ReceiptState))
-    -- ^ Every admitted build's receipt not yet claimed, by its number.
+  , ledgerReceipts ∷ !(Map Word64 ChunkGrant)
+    -- ^ Every build admitted for an outside collector whose receipt is not yet claimed, by its receipt's number.
   , ledgerReceiptNext ∷ !Word64
     -- ^ The next receipt number, never reissued.
   }
@@ -354,20 +354,29 @@ claimReceipt receipt =
       pure (Just outcome)
     _ → pure Nothing
 
--- | The registry's teardown sweep: claim every indexed receipt whose build is sealed and whose collector has not
--- claimed it, with its number, so its owner can retire what it holds. An unsealed receipt is left for a later sweep.
+-- | The registry's teardown sweep: a build still reserved (its spend never began) is given back and sealed as
+-- 'BuildAbandoned'; then every indexed receipt that is sealed and unclaimed is claimed, with its number, so its owner
+-- can retire what it holds. A build being spent is left to seal.
 sweepRegistry ∷ Retained → STM [(Word64, Either BuildRefused ChunkRef)]
-sweepRegistry (Retained ledger) = do
+sweepRegistry retained@(Retained ledger) = do
   indexed ← Map.toList . ledgerReceipts <$> readTVar ledger
-  fmap concat . forM indexed $ \(number, cell) →
-    claimReceipt (BuildReceipt number cell ledger) <&> maybe [] (\outcome → [(number, outcome)])
+  fmap concat . forM indexed $ \(number, grant) → do
+    abandonChunkGrant retained grant
+    claimReceipt (grantReceipt grant) <&> maybe [] (\outcome → [(number, outcome)])
 
--- | How many indexed receipts the registry holds, none of them claimed yet, and how many of those are sealed.
+-- | How many indexed builds the registry holds, none of them claimed yet, and how many of those the teardown sweep can
+-- settle now (sealed, or still reserved).
 receiptsHeld ∷ Retained → STM (Int, Int)
 receiptsHeld (Retained ledger) = do
-  cells ← Map.elems . ledgerReceipts <$> readTVar ledger
-  sealed ← length . filter id <$> mapM (\cell → readTVar cell <&> \case ReceiptOpen → False; _ → True) cells
-  pure (length cells, sealed)
+  grants ← Map.elems . ledgerReceipts <$> readTVar ledger
+  settleable ← length . filter id <$> mapM settleableNow grants
+  pure (length grants, settleable)
+  where
+    settleableNow grant =
+      (,) <$> readTVar (receiptCell (grantReceipt grant)) <*> readTVar (grantStanding grant) <&> \case
+        (ReceiptAvailable _, _) → True
+        (_, GrantReserved) → True
+        _ → False
 
 -- Seal a build's outcome into its receipt, available to one claimant.
 sealReceipt ∷ ChunkGrant → Either BuildRefused ChunkRef → STM ()
@@ -416,8 +425,9 @@ admitWith indexed uploads (Retained ledger) prepared = do
           standing ← newTVar GrantReserved
           cell ← newTVar ReceiptOpen
           let number = ledgerReceiptNext afterwards
-          writeTVar ledger afterwards {ledgerReceipts = (if indexed then Map.insert number cell else id) (ledgerReceipts afterwards), ledgerReceiptNext = number + 1}
-          pure (Right (ChunkGrant reference prepared granted ledger uploads standing (BuildReceipt number cell ledger)))
+              grant = ChunkGrant reference prepared granted ledger uploads standing (BuildReceipt number cell ledger)
+          writeTVar ledger afterwards {ledgerReceipts = (if indexed then Map.insert number grant else id) (ledgerReceipts afterwards), ledgerReceiptNext = number + 1}
+          pure (Right grant)
 
 uploadRefusal ∷ BufferUploadRefusal → BuildRefusal
 uploadRefusal = \case

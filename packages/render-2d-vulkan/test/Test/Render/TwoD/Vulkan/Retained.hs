@@ -579,6 +579,15 @@ refusalSpec = describe "refusing a build" $ do
       -- a public build claims its own receipt, which the registry never indexes
       _ ← built setup ChunkWorldDepth [cutAt 1 1]
       atomically (receiptsHeld (setupRetained setup)) `shouldReturn` (0, 0)
+      -- a reservation whose spend never began is given back by the sweep and sealed as abandoned; a later spend of it is
+      -- refused and makes nothing
+      unspent ← admittedGrant setup [cutAt 2 1]
+      reservedOf setup >>= (`shouldBe` 1)
+      atomically (sweepRegistry (setupRetained setup)) >>= \case
+        [(_, Left (BuildRefused BuildAbandoned NoAllocation))] → pure ()
+        other → expectationFailure ("expected the unspent reservation abandoned, found " <> show (map snd other))
+      reservedOf setup >>= (`shouldBe` 0)
+      spendChunkGrant (trackedBuilders setup) (setupRetained setup) unspent `shouldReturn` Left (BuildRefused BuildGrantSpent NoAllocation)
 
   it "binds a grant to the registry that issued it: another registry can neither spend nor give it back" $
     withSetup $ \setup → do

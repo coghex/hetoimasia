@@ -522,11 +522,13 @@ data TerrainViews k = TerrainViews
     -- ^ The latest builds the sweep collected in their views' place: target, view, what the build left and why the
     -- sweep took it (at most 64).
   , svOrphans ∷ !(TVar [ChunkRef])
+  , svOrphanInHand ∷ !(TVar (Maybe ChunkRef))
+    -- ^ The orphan the owner is releasing now: it stays named here until its release's outcome is recorded.
     -- ^ Registered chunks the registry's teardown sweep found with no pending build: released by the owner, charged to
     -- no target.
-  , svOrphansDisposing ∷ !(TVar [(ChunkRef, STM ConstructedDisposal)])
+  , svOrphansDisposing ∷ !(TVar [(Text, STM ConstructedDisposal)])
     -- ^ Those released, until the backend confirms their disposal.
-  , svOrphanFailures ∷ !(TVar [(ChunkRef, Text)])
+  , svOrphanFailures ∷ !(TVar [(Text, Text)])
     -- ^ Those whose release or disposal failed, with the cause.
   , svOpen ∷ !(TVar Bool)
   , svScheduled ∷ !(TVar Bool)
@@ -619,6 +621,7 @@ newService config ports allowance = do
   pending ← newTVarIO Map.empty
   swept ← newTVarIO Seq.empty
   orphans ← newTVarIO []
+  orphanInHand ← newTVarIO Nothing
   orphansDisposing ← newTVarIO []
   orphanFailures ← newTVarIO []
   open ← newTVarIO True
@@ -643,6 +646,7 @@ newService config ports allowance = do
       , svPending = pending
       , svSwept = swept
       , svOrphans = orphans
+      , svOrphanInHand = orphanInHand
       , svOrphansDisposing = orphansDisposing
       , svOrphanFailures = orphanFailures
       , svOpen = open
@@ -859,9 +863,10 @@ drained service = do
   disposing ← readTVar (svDisposing service)
   pending ← readTVar (svPending service)
   orphans ← readTVar (svOrphans service)
+  orphanInHand ← readTVar (svOrphanInHand service)
   orphansDisposing ← readTVar (svOrphansDisposing service)
   (held, _) ← ownerReceiptsHeld (portOwner (svPorts service))
-  pure (Seq.null retiring && null private && null inHand && null disposing && Map.null pending && null orphans && null orphansDisposing && held == 0)
+  pure (Seq.null retiring && null private && null inHand && null disposing && Map.null pending && null orphans && isNothing orphanInHand && null orphansDisposing && held == 0)
 
 -- At the service's end: chunks a failed handback protects that an adopted revision still holds go to the session's
 -- teardown, recorded with that cause; their slots stay occupied.
@@ -895,6 +900,14 @@ abandonRetirements service cause = do
   writeTVar (svPrivate service) []
   writeTVar (svInHand service) []
   writeTVar (svDisposing service) []
+  -- orphans, which charge no target, keep their identities with the cause
+  orphans ← readTVar (svOrphans service)
+  orphanInHand ← readTVar (svOrphanInHand service)
+  orphansDisposing ← readTVar (svOrphansDisposing service)
+  modifyTVar' (svOrphanFailures service) (<> [(Text.pack (show chunk), cause) | chunk ← orphans <> toList orphanInHand] <> [(identity, cause) | (identity, _) ← orphansDisposing])
+  writeTVar (svOrphans service) []
+  writeTVar (svOrphanInHand service) Nothing
+  writeTVar (svOrphansDisposing service) []
 
 -- ---------------------------------------------------------------------------
 -- Opening
@@ -2132,7 +2145,8 @@ stepBuilding service hands vs serial prep candidate
               Left failure | asynchronous failure → cancelled failure
               _ →
                 -- revalidation: one read-only snapshot, its evidence strict
-                tryWithContext @SomeException (atomically ((Just <$> witnessOf service vs) `orElse` pure Nothing)) >>= \case
+                -- every part of the evidence collection compares is forced here, where its exception is this step's
+                tryWithContext @SomeException (atomically ((Just <$> witnessOf service vs) `orElse` pure Nothing) >>= traverse (\seen → seen <$ evaluate (seen == seen))) >>= \case
                   Left failure
                     | asynchronous failure → cancelled failure
                     -- a revalidation that raised: the sweep collects the build, with the cause, and the step yields
@@ -2425,11 +2439,14 @@ retire service hands = do
   -- at the service's end, the registry's teardown sweep: every sealed receipt no view collected
   closing ← not <$> readTVarIO (svOpen service)
   registry ← if closing then atomically (handSweepReceipts hands >>= registrySwept service) else pure False
+  -- one orphan at a time, named in hand until its release's outcome is recorded
   orphaned ← atomically $ do
+    inHand ← readTVar (svOrphanInHand service)
     orphans ← readTVar (svOrphans service)
     ready ← filterM notUploading orphans
-    writeTVar (svOrphans service) (filter (`notElem` ready) orphans)
-    pure ready
+    case (inHand, ready) of
+      (Nothing, chunk : _) → Just chunk <$ (writeTVar (svOrphans service) (filter (/= chunk) orphans) >> writeTVar (svOrphanInHand service) (Just chunk))
+      _ → pure Nothing
   forM_ orphaned releaseOrphan
   picked ← atomically $ do
     chosen ← take budget <$> disposable service
@@ -2439,15 +2456,17 @@ retire service hands = do
     modifyTVar' (svInHand service) (<> chosen)
     pure chosen
   forM_ picked releaseOne
-  pure (confirmed || registry || not (null orphaned) || not (null picked))
+  pure (confirmed || registry || isJust orphaned || not (null picked))
   where
     budget = 64
     notUploading chunk = (/= Just ChunkUploading) <$> ownerStanding (portOwner (svPorts service)) chunk
     releaseOrphan chunk =
       mask $ \_ →
-        handDispose hands chunk >>= \outcome → atomically $ case outcome of
-          Right reading → modifyTVar' (svOrphansDisposing service) (<> [(chunk, reading)])
-          Left why → modifyTVar' (svOrphanFailures service) (<> [(chunk, "the orphaned chunk's release failed: " <> why)])
+        handDispose hands chunk >>= \outcome → atomically $ do
+          writeTVar (svOrphanInHand service) Nothing
+          case outcome of
+            Right reading → modifyTVar' (svOrphansDisposing service) (<> [(Text.pack (show chunk), reading)])
+            Left why → modifyTVar' (svOrphanFailures service) (<> [(Text.pack (show chunk), "the orphaned chunk's release failed: " <> why)])
     releaseOne held@(key, _, chunk) =
       mask $ \_ → do
         outcome ← handDispose hands chunk
@@ -2485,9 +2504,12 @@ registrySwept service claimed = do
   forM_ claimed $ \(key, outcome) →
     Map.lookup key <$> readTVar (svPending service) >>= \case
       Just entry → sweptBuild service key entry outcome (fromMaybe "the registry's teardown sweep found it" (pbSweep entry))
+      -- no build of a view: a registered chunk is an orphan, and a refusal's buffer keeps its evidence uncharged
       Nothing → case outcome of
         Right chunk → modifyTVar' (svOrphans service) (chunk :)
-        Left _ → pure ()
+        Left (BuildFailed _ NotAllocated) → pure ()
+        Left (BuildFailed primary (AllocatedDisposing identity reading)) → modifyTVar' (svOrphansDisposing service) (<> [(identity <> " (the build failed: " <> primary <> ")", reading)])
+        Left (BuildFailed primary (AllocatedFailed why)) → modifyTVar' (svOrphanFailures service) (<> [("a failed build's buffer", "the build failed (" <> primary <> "), and " <> why)])
   pure (not (null claimed))
 
 -- The disposals the backend has finished: a done one frees its slot, a failed one becomes a failure with its cause and
@@ -2496,8 +2518,8 @@ confirmDisposals ∷ Ord k ⇒ TerrainViews k → STM Bool
 confirmDisposals service = do
   orphans ← readTVar (svOrphansDisposing service)
   orphanReadings ← forM orphans $ \entry@(_, reading) → (,) entry <$> reading
-  forM_ orphanReadings $ \((chunk, _), standing) → case standing of
-    DisposalFailed why → modifyTVar' (svOrphanFailures service) (<> [(chunk, "the orphaned chunk's disposal failed: " <> why)])
+  forM_ orphanReadings $ \((identity, _), standing) → case standing of
+    DisposalFailed why → modifyTVar' (svOrphanFailures service) (<> [(identity, "the orphaned buffer's disposal failed: " <> why)])
     _ → pure ()
   writeTVar (svOrphansDisposing service) [entry | (entry, DisposalPending) ← orphanReadings]
   disposing ← readTVar (svDisposing service)
@@ -2629,8 +2651,8 @@ data ServiceReading k = ServiceReading
     -- ^ Granted builds not yet collected, by their views or the sweep.
   , serviceSwept ∷ ![(k, Word64, Text)]
     -- ^ The latest builds the sweep collected in their views' place: target, view, what each left and why it was swept.
-  , serviceOrphans ∷ ![(ChunkRef, Text)]
-    -- ^ Registered chunks no view collected whose release or disposal failed, with the cause.
+  , serviceOrphans ∷ ![(Text, Text)]
+    -- ^ Buffers and registered chunks no view collected whose release or disposal failed: their identity and the cause.
   , serviceFailures ∷ ![(k, Maybe ChunkRef, Text)]
   , serviceReserved ∷ !Integer
   , servicePlanningMax ∷ !Word64

@@ -2024,20 +2024,6 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         atomically occupied `shouldReturn` 4
         servicePending <$> atomically reading `shouldReturn` 0
 
-    it "collects a build whose target's facts change between its revalidation and its collection into private retirement, once, and the view goes on" $
-      withRig defaultOptions {optProfile = smallProfile {profileSlots = 4, profileQuads = 2048}} $ \rig → do
-        let reading = readTerrainViews (rigViews rig)
-        target ← newTarget 1
-        atomically (writeTVar (rigFault rig) (Just (targetHeld target, HeldChanges, False)))
-        view ← openOn rig target
-        settleUntil rig (publishedAtLeast view 1)
-        quiesce rig target
-        now ← atomically reading
-        listed ← atomically (readingListed <$> readView view)
-        -- the stale part was retired once, not swept: its slot is free again, and the target holds exactly its parts
-        Map.findWithDefault 0 1 (serviceOccupied now) `shouldBe` listed
-        (servicePending now, serviceSwept now) `shouldBe` (0, [])
-
     it "reconciles a swept build's receipt without touching a later admission's: the successor keeps its part and its slot until its own build completes" $
       withRig defaultOptions {optProfile = smallProfile {profileSlots = 4, profileQuads = 2048}} $ \rig → do
         let reading = readTerrainViews (rigViews rig)

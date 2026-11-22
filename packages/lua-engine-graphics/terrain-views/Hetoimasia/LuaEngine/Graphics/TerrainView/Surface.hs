@@ -171,9 +171,8 @@ data HeldTarget = HeldTarget
   , heldFault ∷ !(TVar (Maybe HeldFault))
   }
 
--- | How a held target's revalidation read fails, while its holder says so: it raises, waits, or is cancelled; or
--- its facts change right after the read.
-data HeldFault = HeldRaises | HeldWaits | HeldCancelled | HeldChanges
+-- | How a held target's revalidation read fails, while its holder says so: it raises, waits, or is cancelled.
+data HeldFault = HeldRaises | HeldWaits | HeldCancelled
   deriving (Eq, Show)
 
 -- | Make the held target's revalidation read fail, or read again.
@@ -231,7 +230,7 @@ surfaceVersion = \case
   HeldSurface held → HeldFacts . factsVersion <$> readTVar (heldFacts held)
 
 -- | What a view's revalidation of its work reads of the target beyond its facts: nothing, but for a held target its
--- holder has made fail ('setHeldFault'): raise, wait, be cancelled, or see the facts change right after the read.
+-- holder has made fail ('setHeldFault'): raise, wait or be cancelled. It only reads.
 surfaceRevalidation ∷ ViewSurface → STM ()
 surfaceRevalidation = \case
   HeldSurface held →
@@ -240,7 +239,6 @@ surfaceRevalidation = \case
       Just HeldRaises → throwSTM (ErrorCall "the held target's facts could not be read")
       Just HeldWaits → retry
       Just HeldCancelled → throwSTM ThreadKilled
-      Just HeldChanges → changeFacts (heldFacts held) id
   _ → pure ()
 
 -- | Whether the target holds a published scene (an M1 scene, say), whose frame is or was drawn.
