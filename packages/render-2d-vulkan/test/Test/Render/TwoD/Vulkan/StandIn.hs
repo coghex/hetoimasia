@@ -38,6 +38,7 @@ module Test.Render.TwoD.Vulkan.StandIn
   ) where
 
 import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, writeTVar)
+import Control.Exception (SomeException, throwIO)
 import Control.Monad (when)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
@@ -109,6 +110,8 @@ data Rig = Rig
     -- ^ The window target of a 'newRigWindowed' rig, with a generation and a
     -- storage for each of its frame slots, so that 'windowFrameOnce' can acquire
     -- one of its frames.
+  , rigNaming ∷ !(TVar (Maybe SomeException))
+    -- ^ An exception the allocator's next naming call raises, once.
   }
 
 -- | A session with a surface-free device and its frames and uploads, with
@@ -138,8 +141,9 @@ newRigWith offered windowed = do
   pipelines ← newTVarIO []
   layouts ← newTVarIO []
   memory ← newTVarIO Map.empty
+  naming ← newTVarIO Nothing
   budgets ← either (fail . show) pure (validateBudgets defaultBudgetRequest {requestedFrameSlots = 2, requestedProgressActions = 32})
-  roots ← newRoots (rootOps memory handles) budgets (scriptedSource (pure (scriptedInstant zeroDuration)))
+  roots ← newRoots (rootOps memory handles naming) budgets (scriptedSource (pure (scriptedInstant zeroDuration)))
   _ ← startRoots roots (InstanceRequest [] [] [])
   _ ← startRootsDevice roots
   generations ← newGenerations roots
@@ -155,7 +159,7 @@ newRigWith offered windowed = do
         _ ← stepGenerations generations (scriptedInstant zeroDuration) (Map.singleton admitted (TargetGeometry (Right ()) (Just (SurfaceExtent 640 480)) Nothing 1))
         mapM_ (\slot → createFrameStorage recording admitted slot >>= either (fail . show) pure) [0, 1]
         pure (Just admitted)
-  pure (Rig recording frames uploads commands writes fences handles pipelines layouts window)
+  pure (Rig recording frames uploads commands writes fences handles pipelines layouts window naming)
 
 -- | Make the renderer as a host does — the ring, the table, the layout — and
 -- let the table's placeholder upload complete, so a batch can bind it.
@@ -320,8 +324,8 @@ fresh handles = atomically $ do
 -- ---------------------------------------------------------------------------
 -- The roots
 
-rootOps ∷ TVar (Map Word64 ByteString) → TVar Word64 → RootOps () Int Int Text Int
-rootOps _ handles =
+rootOps ∷ TVar (Map Word64 ByteString) → TVar Word64 → TVar (Maybe SomeException) → RootOps () Int Int Text Int
+rootOps _ handles naming =
   RootOps
     { opsInstanceOffer =
         pure
@@ -338,7 +342,7 @@ rootOps _ handles =
     , opsDeviceOffers = \_ _ → pure [standInDevice]
     , opsCreateDevice = \_ _ → pure 3
     , opsDestroyDevice = \_ → pure ()
-    , opsCreateAllocator = \_ _ _ → allocatorOps handles
+    , opsCreateAllocator = \_ _ _ → allocatorOps handles naming
     , opsSurfaceSupport = \_ _ _ _ → pure True
     , opsDeviceLoss = const False
     , opsNativeFailure = const Nothing
@@ -398,8 +402,8 @@ standInOffer =
 -- The allocator: every creation opens a dedicated block of its own size, and
 -- every destruction frees it, so the model's accounting balances.
 
-allocatorOps ∷ TVar Word64 → IO AllocatorOps
-allocatorOps handles = do
+allocatorOps ∷ TVar Word64 → TVar (Maybe SomeException) → IO AllocatorOps
+allocatorOps handles naming = do
   held ← newIORef (Map.empty ∷ Map Word64 Natural)
   let create size kind placement
         -- A placement in held memory opens nothing: this allocator holds no
@@ -432,7 +436,7 @@ allocatorOps handles = do
       , allocatorUnmap = \_ → pure ()
       , allocatorFlush = \_ _ → pure ()
       , allocatorInvalidate = \_ _ → pure ()
-      , allocatorName = \_ _ → pure ()
+      , allocatorName = \_ _ → atomically (readTVar naming <* writeTVar naming Nothing) >>= mapM_ throwIO
       , allocatorDestroy = do
           sizes ← readIORef held
           pure (MemoryEvents 0 0 (fromIntegral (Map.size sizes)) (sum (Map.elems sizes)))

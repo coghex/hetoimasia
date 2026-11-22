@@ -21,6 +21,8 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView.Owner
   , StepOutcome (..)
   , ConstructedDisposal (..)
   , productionOwner
+  , viewGrant
+  , viewReceipt
   ) where
 
 import Control.Concurrent.STM (STM, atomically)
@@ -33,6 +35,7 @@ import Data.Word (Word64)
 import Hetoimasia.GPU.Vulkan.GLFW
   ( ActionOutcome (..)
   , ActionRefusal (..)
+  , Buffer
   , Construction
   , ConstructedDisposal (..)
   , constructedDisposal
@@ -56,7 +59,6 @@ import Hetoimasia.Render.TwoD.Vulkan.Builders (BufferUploads (roomFor))
 import Hetoimasia.Render.TwoD.Vulkan.Chunks
   ( BuildRefusal (..)
   , BuildRefused (..)
-  , ChunkGrant
   , ChunkStanding
   , PreparedChunk
   , RefusedAllocation (..)
@@ -83,22 +85,22 @@ data Admission
   deriving (Eq, Show)
 
 -- | A part's admission, granted in the owner's transaction together with the target's slot: its reference and its
--- upload's room. Spent once by its build ('grantSpend', which gives the grant back on every failure), or given back
--- unspent ('grantAbandon'). It lives within the owner step that took it.
+-- upload's room. Spent once by its build ('grantSpend'), or given back unspent ('grantAbandon'). It lives within the
+-- owner step that took it.
 data Grant = Grant
-  { grantSpend ∷ (BuildFailure → IO ()) → IO (Either BuildFailure ChunkRef)
-    -- ^ An exception or cancellation hands the failure it would have answered (what became of the buffer included) to
-    -- this action before it goes on.
+  { grantSpend ∷ (Either BuildFailure ChunkRef → STM ()) → IO (Either BuildFailure ChunkRef)
+    -- ^ Build the part and settle it once, whatever the exit: the given settlement runs, with the build's receipt, in
+    -- the one transaction that seals the grant (registered, or its capacity given back). A refusal is answered with
+    -- that receipt; an exception or a cancellation goes on after it.
   , grantAbandon ∷ STM ()
   }
 
 -- | Why a granted build failed, with what became of the vertex buffer it made.
 data BuildFailure = BuildFailed !Text !Allocated
 
--- | What a failed build left of its vertex buffer: none was made; one was made and released (named by the renderer,
--- or by the exception its construction raised), and a reading of its physical destruction says when its capacity is
--- free; or one whose release failed or raised, or a build that raised with no buffer named, with the cause: its
--- capacity stays charged.
+-- | What a failed build left of its vertex buffer: none was made; one was made and released (by the build's cleanup,
+-- or by its construction before it raised), and a reading of its physical destruction says when its capacity is free;
+-- or one whose release failed or raised, with the cause: its capacity stays charged.
 data Allocated
   = NotAllocated
   | -- | The buffer's identity, and a reading of its physical destruction.
@@ -203,11 +205,7 @@ productionOwner host graphics = do
             admitRetainedChunk uploads retained prepared <&> \case
               Left refusal → Left (admission refusal)
               Right grant →
-                Right
-                  Grant
-                    { grantSpend = spend construction grant
-                    , grantAbandon = abandonChunkGrant retained grant
-                    }
+                Right (viewGrant (constructedDisposal construction) (spendChunkGrant (hostBuilders host construction) retained grant) (abandonChunkGrant retained grant))
         , handDispose = \chunk → do
             -- the buffer, read before the release forgets the chunk, is what is physically disposed of later
             buffer ← chunkBufferOf retained chunk
@@ -216,22 +214,6 @@ productionOwner host graphics = do
               Right (Left refusal) → Left (Text.pack (show refusal))
               Right (Right ()) → Right (maybe (pure DisposalDone) (constructedDisposal construction) buffer)
         }
-    -- the granted build: a failure gives the grant back (the renderer's own), and says what became of its buffer; an
-    -- exception or cancellation hands the same answer to the caller before it goes on
-    spend ∷ Construction q inst msgr phys dev cmd → ChunkGrant → (BuildFailure → IO ()) → IO (Either BuildFailure ChunkRef)
-    spend construction grant interrupted =
-      guarded (spendChunkGrant (hostBuilders host construction) retained grant (interrupted . failureOf construction)) >>= pure . \case
-        -- raised past the renderer's own handling: whether a buffer was made is not known
-        Left raised → Left (BuildFailed raised (AllocatedFailed ("the build raised: " <> raised)))
-        Right (Left refused) → Left (failureOf construction refused)
-        Right (Right chunk) → Right chunk
-    failureOf ∷ Construction q inst msgr phys dev cmd → BuildRefused → BuildFailure
-    failureOf construction (BuildRefused refusal allocation) =
-      BuildFailed (Text.pack (show refusal)) $ case allocation of
-        NoAllocation → NotAllocated
-        AllocationReleased buffer (Right ()) → AllocatedDisposing (Text.pack (show buffer)) (constructedDisposal construction buffer)
-        AllocationReleased buffer (Left why) → AllocatedFailed ("the failed build's buffer " <> Text.pack (show buffer) <> " could not be released: " <> Text.pack (show why))
-        AllocationReleaseRaised buffer why → AllocatedFailed ("the failed build's buffer " <> Text.pack (show buffer) <> " raised on its release: " <> why)
     refusalText = \case
       ReleaseQueueFull → "the release lane is full"
       other → show other
@@ -245,6 +227,31 @@ admission = \case
   BuildUploadsUnavailable cause → AdmitNever cause
   BuildUploadRefused (UploadOversized padded staging) → AdmitOversized ("a part needs " <> Text.pack (show padded) <> " staging bytes, and the staging buffer holds " <> Text.pack (show staging))
   refusal → AdmitNever (Text.pack (show refusal))
+
+-- | A part's grant over the renderer's (the production adapter): its spend passes the view's settlement into the
+-- renderer's one settlement and projects the sealed receipt; giving it back is the renderer's.
+viewGrant
+  ∷ (Buffer → STM ConstructedDisposal)
+  → ((Either BuildRefused ChunkRef → STM ()) → IO (Either BuildRefused ChunkRef))
+  → STM ()
+  → Grant
+viewGrant disposal spend abandon =
+  Grant
+    { grantSpend = \settle → viewReceipt disposal <$> spend (settle . viewReceipt disposal)
+    , grantAbandon = abandon
+    }
+
+-- | A renderer's build receipt as a view reads it: the chunk, or the cause with what became of the buffer (its
+-- identity, and the reading of its destruction or why its release failed).
+viewReceipt ∷ (Buffer → STM ConstructedDisposal) → Either BuildRefused ChunkRef → Either BuildFailure ChunkRef
+viewReceipt disposal = \case
+  Right chunk → Right chunk
+  Left (BuildRefused refusal allocation) →
+    Left . BuildFailed (Text.pack (show refusal)) $ case allocation of
+      NoAllocation → NotAllocated
+      AllocationReleased buffer (Right ()) → AllocatedDisposing (Text.pack (show buffer)) (disposal buffer)
+      AllocationReleased buffer (Left why) → AllocatedFailed ("the failed build's buffer " <> Text.pack (show buffer) <> " could not be released: " <> Text.pack (show why))
+      AllocationReleaseRaised buffer why → AllocatedFailed ("the failed build's buffer " <> Text.pack (show buffer) <> " raised on its release: " <> why)
 
 -- A synchronous failure as its text; an asynchronous one goes on.
 guarded ∷ IO a → IO (Either Text a)

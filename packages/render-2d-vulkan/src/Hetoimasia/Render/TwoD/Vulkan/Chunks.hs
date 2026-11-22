@@ -37,13 +37,14 @@
 -- asking again later can succeed; 'BuildUploadRefused' is every other refusal,
 -- none of which asking again changes, among them 'UploadOversized' (a chunk whose
 -- cutout bytes cannot fit the staging buffer at all: build it as smaller chunks)
--- and a failed or closed session. After the buffer is made, a failure releases it
--- at one site, once, gives the grant back, and says what became of the buffer
--- ('BuildRefused'): a released buffer is destroyed only once the backend confirms
--- it, and a caller that charges the buffer's capacity keeps it charged until
--- then; a release that raised is a cleanup failure naming the buffer. A
--- synchronous exception after the buffer was made is answered as such a refusal
--- ('BuildRaised').
+-- and a failed or closed session. Once admitted, a build is settled once on every
+-- exit ('spendChunkGrant'): a buffer it made and did not register is released at
+-- one site, once, the grant is given back, and the receipt says what became of
+-- the buffer ('BuildRefused'): a released buffer is destroyed only once the
+-- backend confirms it, and a caller that charges the buffer's capacity keeps it
+-- charged until then; a release that failed is a cleanup failure naming the
+-- buffer. A refusal is answered with the receipt; an exception or a cancellation
+-- goes on carrying it ('buildSettlementOf').
 --
 -- A chunk's records are not retained on the device: they are written into the
 -- batch's storage region each frame, beside the view's, and the textures their
@@ -96,6 +97,8 @@ module Hetoimasia.Render.TwoD.Vulkan.Chunks
   , admitRetainedChunk
   , abandonChunkGrant
   , spendChunkGrant
+  , BuildSettlement (..)
+  , buildSettlementOf
   , ChunkStanding (..)
   , chunkStanding
   , chunkStandingSTM
@@ -112,9 +115,13 @@ module Hetoimasia.Render.TwoD.Vulkan.Chunks
   ) where
 
 import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVar, newTVarIO, readTVar, readTVarIO, writeTVar)
-import Data.IORef (atomicModifyIORef', newIORef, readIORef, writeIORef)
-import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeAsyncException, SomeException, displayException, fromException, mask_, rethrowIO, throwIO, try, tryWithContext)
+import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeAsyncException, SomeException, displayException, fromException, mask_, rethrowIO, tryWithContext)
+import Control.Exception.Annotation (ExceptionAnnotation (displayExceptionAnnotation))
+import Control.Exception.Context (ExceptionContext, addExceptionAnnotation, getExceptionAnnotations)
 import Control.Monad (when)
+import Data.Foldable (for_)
+import Data.Functor ((<&>))
+import Data.Maybe (isJust)
 import qualified Data.ByteString as ByteString
 import Data.List.NonEmpty (NonEmpty)
 import Data.Map.Strict (Map)
@@ -181,7 +188,7 @@ data BuildRefusal
     BuildUploadRefused !UploadRefusal
   | -- | Every reference this registry can issue is in use.
     BuildReferencesExhausted
-  | -- | A synchronous exception after the buffer was made, with its text.
+  | -- | The exception the build raised, with its text: a raised build's cause.
     BuildRaised !Text
   | -- | The grant was already spent or given back, or is another registry's.
     BuildGrantSpent
@@ -212,7 +219,9 @@ data RefusedAllocation
 -- reference and its upload's room, then make its buffer, spend the room on the
 -- upload that fills it and register it. The instances are routed against the
 -- registered marks the caller gives. A refusal before the buffer is made holds
--- and made nothing; one after says what became of the buffer.
+-- and made nothing; one after says what became of the buffer. A build that
+-- raised, or was cancelled, goes on with the same receipt attached to the
+-- exception ('buildSettlementOf').
 buildRetainedChunk
   ∷ Builders q inst msgr phys dev cmd
   → Retained
@@ -281,9 +290,10 @@ prepareRetainedChunk marks kind bounds records instances =
 
 -- | A prepared chunk's admission: a reference, private until the chunk is
 -- registered under it, and for a chunk with bytes the upload's reserved room.
--- It belongs to the registry and the uploads that issued it, and moves once
--- from reserved to spending ('spendChunkGrant'), whose cleanup is the spend's
--- own, or from reserved to given back ('abandonChunkGrant').
+-- It is the build's record: it belongs to the registry and the uploads that
+-- issued it, and moves once from reserved to spending ('spendChunkGrant'), which
+-- records the buffer it makes and settles it once, or from reserved to given back
+-- ('abandonChunkGrant').
 data ChunkGrant = ChunkGrant
   { grantReference ∷ !ChunkRef
   , grantPrepared ∷ !PreparedChunk
@@ -296,8 +306,8 @@ data ChunkGrant = ChunkGrant
   }
 
 -- | Where a grant stands: reserved; being spent, its capacity the spend's to
--- account for; or done (registered, or given back).
-data GrantStanding = GrantReserved | GrantSpending | GrantDone
+-- settle, with the buffer it owns; or sealed (registered, or given back).
+data GrantStanding = GrantReserved | GrantSpending !MadeBuffer | GrantSealed
   deriving (Eq, Show)
 
 -- | Whether a chunk of this many bytes would be admitted now, read-only: the
@@ -356,118 +366,124 @@ abandonChunkGrant (Retained ledger) grant =
 -- upload's room to its uploads (a room the upload has spent is not freed by this).
 giveBack ∷ ChunkGrant → STM ()
 giveBack grant = do
-  writeTVar (grantStanding grant) GrantDone
+  writeTVar (grantStanding grant) GrantSealed
   mapM_ (abandonRoom (grantUploads grant)) (grantUpload grant)
   modifyTVar' (grantRegistry grant) (\held → held {ledgerFree = chunkRefIndex (grantReference grant) : ledgerFree held})
 
--- | Spend a grant on the graphics owner's thread: move it from reserved to
--- spending in one transaction (a grant not reserved, or another registry's, is
--- refused and changed in nothing), then make the chunk's buffer, spend the
--- reserved room on the upload that fills it and register the chunk under the
--- granted reference. Nothing competes for capacity again. Every exit before
--- registration gives the grant back. From the buffer's making on, the buffer is
--- released at one site, at most once, and a refusal says what became of it
--- ('RefusedAllocation'): a released buffer is destroyed only once the backend
--- confirms it, and its capacity stays occupied until then. An exception or a
--- cancellation releases it too, and hands the refusal it would have answered
--- (the exception as its cause) to @interrupted@ before it goes on, so the caller
--- keeps the buffer's identity and its release's outcome.
+-- | Spend a grant on the graphics owner's thread, and settle it once, whatever the exit. The grant moves from reserved
+-- to spending in one transaction (a grant not reserved, or another registry's, is refused and changes nothing). Then
+-- the chunk's buffer is made and recorded on the grant as it is made, the reserved room is spent on the upload that
+-- fills it (the uploads mark the room spent in the transaction that hands it to that upload), and the chunk is
+-- registered under the granted reference. Nothing competes for capacity again.
+--
+-- One masked finalizer settles the spend on every exit, a value, an exception or a cancellation alike: a buffer made
+-- and not registered is released once (a construction that raised after releasing its buffer has that release
+-- adopted), any outcome of the release kept, a cancellation included; then one transaction, which never waits, seals
+-- the grant (registered, or its reference and any room still reserved given back) and runs @settle@ with the receipt.
+-- A failure's receipt says what became of the buffer ('RefusedAllocation'): a released buffer is destroyed only once
+-- the backend confirms it, and its capacity stays occupied until then. A refusal is answered with the receipt; a
+-- raised exit goes on with the receipt attached to the exception ('buildSettlementOf'): the build's cancellation if it
+-- was one, otherwise a cancellation the release raised, otherwise the build's exception.
 spendChunkGrant
   ∷ Builders q inst msgr phys dev cmd
   → Retained
   → ChunkGrant
-  → (BuildRefused → IO ())
+  → (Either BuildRefused ChunkRef → STM ())
   → IO (Either BuildRefused ChunkRef)
-spendChunkGrant builders (Retained ledger) grant interrupted = mask_ $ do
-  taken ← atomically $
+spendChunkGrant builders (Retained ledger) grant settle = mask_ $ do
+  claimed ← atomically $
     if grantRegistry grant /= ledger
       then pure False
       else
-        readTVar (grantStanding grant) >>= \case
-          GrantReserved → True <$ writeTVar (grantStanding grant) GrantSpending
+        readTVar standing >>= \case
+          GrantReserved → True <$ writeTVar standing (GrantSpending NotMade)
           _ → pure False
-  if not taken
+  if not claimed
     then pure (Left (BuildRefused BuildGrantSpent NoAllocation))
     else do
-      made ← newIORef NotMade
-      done ← newIORef False
-      let releaseOnce buffer = do
-            already ← atomicModifyIORef' done (\d → (True, d))
-            if already then pure Nothing else Just <$> trySync (releaseBuffer builders buffer)
-          allocationOf buffer released = case released of
-            Just (Right outcome) → AllocationReleased buffer outcome
-            Just (Left raised) → AllocationReleaseRaised buffer (raisedText raised)
-            Nothing → AllocationReleased buffer (Right ())
-          -- every exit that does not register: the buffer released once, the grant given back
-          failed refusal = do
-            allocation ← readIORef made >>= \case
-              NotMade → pure NoAllocation
-              MadeAndReleased buffer → pure (AllocationReleased buffer (Right ()))
-              Made buffer → allocationOf buffer <$> releaseOnce buffer
-            atomically (spendingGiveBack grant)
-            pure (BuildRefused refusal allocation)
-      -- masked throughout: the buffer is recorded in the same handoff that makes it, and only the native calls' own
-      -- interruptible waits can be interrupted, before a buffer exists or once it is recorded
-      outcome ← tryWithContext @SomeException (attempt made)
-      case outcome of
-        Right (Right reference) → pure (Right reference)
-        Right (Left refusal) → Left <$> failed refusal
-        Left (ExceptionWithContext context raised) → do
-          buffer ← readIORef made
-          lost ← failed (BuildRaised (Text.pack (displayException raised)))
-          case (fromException raised ∷ Maybe SomeAsyncException, buffer) of
-            -- a synchronous exception once a buffer was made is answered as such a refusal
-            (Nothing, Made _) → pure (Left lost)
-            -- a cancellation, or an exception before any buffer: the caller is handed the refusal, and it goes on
-            _ → interrupted lost >> rethrowIO (ExceptionWithContext context raised)
+      -- masked throughout: each fact is recorded in the handoff that makes it, and only the native calls' own
+      -- interruptible waits can be interrupted
+      outcome ← tryWithContext @SomeException attempt
+      made ←
+        readTVarIO standing <&> \case
+          GrantSpending buffer → buffer
+          _ → NotMade
+      (receipt, cleanupRaised) ← case outcome of
+        Right (Right held) → pure (Right held, Nothing)
+        Right (Left refusal) → unregistered made refusal
+        Left (ExceptionWithContext _ raised) → unregistered made (BuildRaised (raisedText raised))
+      answer ← atomically $ do
+        answer ← case receipt of
+          Right held → Right <$> register held
+          Left refused → Left refused <$ giveBack grant
+        settle answer
+        pure answer
+      let built = either Just (const Nothing) outcome
+          carrying (ExceptionWithContext context raised) = case answer of
+            Left refused → ExceptionWithContext (addExceptionAnnotation (BuildSettlement refused) context) raised
+            Right _ → ExceptionWithContext context raised
+      case (built, cleanupRaised) of
+        (Just failure, _) | cancellation failure → rethrowIO (carrying failure)
+        (_, Just failure) | cancellation failure → rethrowIO (carrying failure)
+        (Just failure, _) → rethrowIO (carrying failure)
+        _ → pure answer
   where
+    standing = grantStanding grant
     uploads = grantUploads grant
     prepared = grantPrepared grant
     bytes = preparedEncoded prepared
-    -- the steps that can be refused; the buffer, once made, is noted for the one release site
-    attempt made = case grantUpload grant of
-      Nothing → atomically (register Nothing)
+    -- the steps that can be refused or raise
+    attempt = case grantUpload grant of
+      Nothing → pure (Right Nothing)
       Just upload →
-        madeOrRaised (buildVertexBuffer builders (preparedBytes prepared)) >>= \case
-          -- the buffer's construction raised after it made and released the buffer: no handle, but its identity, and
-          -- the release already made
-          Left (buffer, raised) → Left (BuildRaised raised) <$ writeIORef made (MadeAndReleased buffer)
-          Right (Left refusal) → pure (Left (BuildBufferRefused refusal))
-          Right (Right buffer) → do
-            writeIORef made (Made buffer)
-            uploadGranted uploads upload buffer bytes >>= \case
-              Left refusal → pure (Left (uploadRefusal refusal))
-              Right ticket → atomically (register (Just (buffer, ticket)))
+        constructed >>= \case
+          Left refusal → pure (Left (BuildBufferRefused refusal))
+          Right buffer →
+            uploadGranted uploads upload buffer bytes <&> \case
+              Left refusal → Left (uploadRefusal refusal)
+              Right ticket → Right (Just (buffer, ticket))
+    -- the buffer, recorded in the handoff that makes it; a construction that raised naming the buffer whose release it
+    -- already made has that release adopted, whatever the exception
+    constructed =
+      tryWithContext @SomeException (buildVertexBuffer builders (preparedBytes prepared)) >>= \case
+        Right (Right buffer) → Right buffer <$ atomically (writeTVar standing (GrantSpending (Made buffer)))
+        Right (Left refusal) → pure (Left refusal)
+        Left failure@(ExceptionWithContext context _) → do
+          for_ (releasedBufferOf context) (atomically . writeTVar standing . GrantSpending . MadeAndReleased)
+          rethrowIO failure
+    -- an exit that does not register: the owned buffer released once, any outcome of the release kept
+    unregistered made cause = case made of
+      NotMade → pure (Left (BuildRefused cause NoAllocation), Nothing)
+      MadeAndReleased buffer → pure (Left (BuildRefused cause (AllocationReleased buffer (Right ()))), Nothing)
+      Made buffer →
+        tryWithContext @SomeException (releaseBuffer builders buffer) <&> \case
+          Right released → (Left (BuildRefused cause (AllocationReleased buffer released)), Nothing)
+          Left failure@(ExceptionWithContext _ raised) →
+            (Left (BuildRefused cause (AllocationReleaseRaised buffer (raisedText raised))), Just failure)
     register held = do
-      writeTVar (grantStanding grant) GrantDone
+      writeTVar standing GrantSealed
       modifyTVar' ledger (\current → current {ledgerEntries = Map.insert (grantReference grant) (Entry (preparedChunk prepared) held False) (ledgerEntries current)})
-      pure (Right (grantReference grant))
+      pure (grantReference grant)
     raisedText raised = Text.pack (displayException (raised ∷ SomeException))
-    -- a construction that raised naming the buffer it made and released; any other exception goes on (with no buffer
-    -- named, nothing says whether one was made)
-    madeOrRaised action =
-      tryWithContext action >>= \case
-        Left (ExceptionWithContext context raised)
-          | Nothing ← fromException raised ∷ Maybe SomeAsyncException
-          , Just buffer ← releasedBufferOf context →
-              pure (Left (buffer, Text.pack (displayException raised)))
-        Left failure → rethrowIO failure
-        Right value → pure (Right value)
-    -- a synchronous exception as a value; an asynchronous one (a cancellation) goes on
-    trySync action =
-      try action >>= \case
-        Left raised | Just (_ ∷ SomeAsyncException) ← fromException raised → throwIO raised
-        other → pure other
+    cancellation (ExceptionWithContext _ raised) = isJust (fromException raised ∷ Maybe SomeAsyncException)
 
--- What a spend made of its buffer, for its one release site.
+-- What a spend owns of its buffer: none yet; one it made; or one whose construction raised after releasing it.
 data MadeBuffer = NotMade | Made !Buffer | MadeAndReleased !Buffer
+  deriving (Eq, Show)
 
--- A spending grant given back by its spend: once.
-spendingGiveBack ∷ ChunkGrant → STM ()
-spendingGiveBack grant =
-  readTVar (grantStanding grant) >>= \case
-    GrantSpending → giveBack grant
-    _ → pure ()
+-- | The settlement of a build that raised, attached to the exception it propagates: the cause (the build's exception,
+-- or the refusal a cancellation during cleanup interrupted) and what became of its buffer.
+newtype BuildSettlement = BuildSettlement BuildRefused
+  deriving (Show)
+
+instance ExceptionAnnotation BuildSettlement where
+  displayExceptionAnnotation (BuildSettlement refused) = "the chunk build settled: " <> show refused
+
+-- | The settlement a raised build's exception carries, if it is one.
+buildSettlementOf ∷ ExceptionContext → Maybe BuildRefused
+buildSettlementOf context = case getExceptionAnnotations context of
+  BuildSettlement refused : _ → Just refused
+  [] → Nothing
 
 -- | The reference the registry issues next and the ledger with it taken.
 nextReference ∷ Ledger → Maybe (ChunkRef, Ledger)

@@ -40,7 +40,7 @@ import Hetoimasia.Render.TwoD.Material (MaterialFacts (..))
 import Hetoimasia.Render.TwoD.Material.Backend (materialRef)
 import Hetoimasia.Render.TwoD.Metrics (PixelExtent (..), TargetMetrics (..))
 import qualified Hetoimasia.Render.TwoD.Validation as Validation
-import Hetoimasia.Render.TwoD.Vulkan.Chunks (ChunkStanding (..), prepareRetainedChunk, preparedChunk)
+import Hetoimasia.Render.TwoD.Vulkan.Chunks (BuildRefusal (BuildRaised, BuildUploadsNotReady), BuildRefused (..), ChunkStanding (..), RefusedAllocation (NoAllocation), prepareRetainedChunk, preparedChunk)
 import Hetoimasia.Terrain.Cell (mkMaterialId)
 import Hetoimasia.Terrain.Coordinate (AxisCoord, axisFromInteger, axisValue, tileCoord)
 import Hetoimasia.Terrain.Render2D.AtlasFixtures (AtlasStyle (..), boundPackedTextures, loadAtlasStyle)
@@ -67,7 +67,7 @@ import Test.Support.Bounded (bounded)
 import Test.Support.Owned (withOwnedThread)
 import Hetoimasia.GLFW.Window (Attribute (..), ContentScale (..), Extent (..))
 import Hetoimasia.LuaEngine.Graphics.Window.Host (WindowGeometry (..), geometryOfAttributes)
-import Control.Exception (finally)
+import Control.Exception (AsyncException (ThreadKilled), ErrorCall (ErrorCall), SomeException, displayException, finally, throwIO, toException, try)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import System.Timeout (timeout)
 
@@ -118,6 +118,11 @@ data Rig = Rig
     -- ^ How many granted builds the fake hands spent: each makes a buffer.
   , rigFailNext ∷ !(TVar [Maybe BuildFailure])
     -- ^ The outcomes of the next builds, in order: a failure, or a build as usual.
+  , rigRaising ∷ !(TVar (Maybe SomeException))
+    -- ^ When set: the next granted build's constructor raises it before making a buffer. That grant is the production
+    -- adapter's ('viewGrant'), whose renderer side settles once with no allocation and then raises.
+  , rigCancelSettled ∷ !(TVar Bool)
+    -- ^ Whether the next failed build is cancelled once settled: its settlement runs, then the cancellation goes on.
   , rigCountGate ∷ !(TVar (Maybe (Int → Bool, TMVar [RegionCoord], TMVar ())))
     -- ^ When set: the first held copy whose counted total satisfies the test names its batch here, once its total is
     -- counted, and waits until the example resumes it.
@@ -210,6 +215,8 @@ withRig options body =
         demandRefused ← newTVarIO Nothing
         buildAttempts ← newTVarIO 0
         failNext ← newTVarIO []
+        raising ← newTVarIO Nothing
+        cancelSettled ← newTVarIO False
         countGate ← newTVarIO Nothing
         initial ← prepare initialGraphicsScene
         let owner =
@@ -275,7 +282,7 @@ withRig options body =
                     forM_ steps $ \(step, outcome) → step fakeHands >> atomically (writeTVar outcome (Just StepRan))
                     loop
               loop
-            rig views = Rig views terrain lease queue queueOpen lane laneCapacity standings chunks disposed attempts buildFailure disposeFailure next ledger claims receipts ownerEnded style account deferDisposal pendingDisposals hold entered resume styleReleases unavailable admission admitBudget grants uploading demandRefused buildAttempts failNext countGate
+            rig views = Rig views terrain lease queue queueOpen lane laneCapacity standings chunks disposed attempts buildFailure disposeFailure next ledger claims receipts ownerEnded style account deferDisposal pendingDisposals hold entered resume styleReleases unavailable admission admitBudget grants uploading demandRefused buildAttempts failNext raising cancelSettled countGate
             fakeHands = hands (rig (error "the teardown's hands read no service"))
         withOwnedThread (when (optTeardown options /= TeardownNone) teardown) $ \_ _ →
           withTerrainViews (configOf options) ports $ \views →
@@ -322,7 +329,8 @@ roomOf admission budget = do
 
 -- The fake hands: a part is prepared by the renderer itself; a grant comes from the fake uploads' answer, and its
 -- build makes render-2d's own description of the instances under the material's records, ready at once unless the
--- example says otherwise.
+-- example says otherwise. A build settles once, in its own transaction, with the session's settlement, and then
+-- answers (or, as the example asks, raises).
 hands ∷ Rig → Hands
 hands rig =
   Hands
@@ -336,7 +344,15 @@ hands rig =
             modifyTVar' (rigGrants rig) (+ 1)
             live ← newTVar True
             let giveBack = readTVar live >>= \held → when held (writeTVar live False >> modifyTVar' (rigGrants rig) (subtract 1))
-            pure (Right (Grant (\_ → spend prepared giveBack) giveBack))
+            readTVar (rigRaising rig) >>= \case
+              Just raised → do
+                writeTVar (rigRaising rig) Nothing
+                -- the renderer's side of a constructor that raised before any buffer: settled once, then raised
+                let renderer settle = do
+                      atomically (giveBack >> settle (Left (BuildRefused (BuildRaised (Text.pack (displayException raised))) NoAllocation)))
+                      throwIO raised
+                pure (Right (viewGrant (\_ → pure DisposalDone) renderer giveBack))
+              Nothing → pure (Right (Grant (spend prepared giveBack) giveBack))
     , handDispose = \chunk → atomically $ do
         modifyTVar' (rigAttempts rig) (Map.insertWith (+) chunk 1)
         failing ← readTVar (rigDisposeFailure rig)
@@ -356,13 +372,23 @@ hands rig =
     }
   where
     material = materialRef 11 (MaterialFacts True recordLayout (fromIntegral pushBlockBytes))
-    spend prepared giveBack = do
+    spend prepared giveBack settle = do
       upcoming ← readTVarIO (rigNext rig)
       held ← atomically $ do
         hold ← readTVar (rigHold rig)
         if hold == Just upcoming then True <$ (writeTVar (rigHold rig) Nothing >> putTMVar (rigEntered rig) ()) else pure False
       when held (atomically (takeTMVar (rigResume rig)))
-      atomically $ do
+      (receipt, cancelled) ← atomically $ do
+        receipt ← built
+        settle receipt
+        cancelled ← case receipt of
+          Left _ → readTVar (rigCancelSettled rig) <* writeTVar (rigCancelSettled rig) False
+          Right _ → pure False
+        pure (receipt, cancelled)
+      when cancelled (throwIO ThreadKilled)
+      pure receipt
+      where
+       built = do
         modifyTVar' (rigBuildAttempts rig) (+ 1)
         giveBack
         next ← readTVar (rigFailNext rig)
@@ -381,7 +407,8 @@ hands rig =
             modifyTVar' (rigStandings rig) (Map.insert chunk (if uploading then ChunkUploading else ChunkReady))
             pure (Right chunk)
 
--- Run the owner until the views ask for nothing more: every queued action, with the fake hands.
+-- Run the owner until the views ask for nothing more: every queued action, with the fake hands. A step that raises has
+-- run (this owner outlives it), and its exception goes on to the example.
 runOwner ∷ Rig → IO ()
 runOwner rig = go (100000 ∷ Int)
   where
@@ -392,8 +419,7 @@ runOwner rig = go (100000 ∷ Int)
         next Seq.:< rest → Just next <$ writeTVar (rigQueue rig) rest) >>= \case
         Nothing → pure ()
         Just (step, outcome) → do
-          step (hands rig)
-          atomically (writeTVar outcome (Just StepRan))
+          step (hands rig) `finally` atomically (writeTVar outcome (Just StepRan))
           go (n - 1)
 
 -- The owner's exit begins: it takes no more actions, and refuses the ones queued.
@@ -1795,6 +1821,82 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         (readingDemand after, readingReceipt after, readingPublished after) `shouldBe` (readingDemand refused, readingReceipt refused, readingPublished refused)
         atomically (latestWorld target) `shouldReturn` before
 
+  describe "one settlement per chunk-build spend" $ do
+    it "settles a build whose constructor raises before allocating once, through the production adapter: the cause recorded, slots and grants at their baseline, and a later held build counted at close" $
+      withRig defaultOptions {optProfile = smallProfile {profileSlots = 4, profileQuads = 2048}} $ \rig → do
+        let reading = readTerrainViews (rigViews rig)
+        atomically (writeTVar (rigRaising rig) (Just (toException (ErrorCall "the constructor raised"))))
+        target ← newTarget 1
+        view ← openOn rig target
+        settleUntil rig (isJust . readingRefusal <$> readView view)
+        refusal ← atomically (readingRefusal <$> readView view)
+        Text.pack (show refusal) `shouldSatisfy` Text.isInfixOf "the constructor raised"
+        settled ← atomically reading
+        (Map.findWithDefault 0 1 (serviceOccupied settled), serviceFailures settled) `shouldBe` (0, [])
+        readTVarIO (rigGrants rig) `shouldReturn` 0
+        -- a later real build, held: the view's close counts it as retiring
+        index ← readTVarIO (rigNext rig)
+        atomically (writeTVar (rigHold rig) (Just index))
+        stop ← newTVarIO False
+        let owner = do
+              runOwner rig
+              continue ← atomically ((False <$ (readTVar stop >>= check)) `orElse` (True <$ (readTVar (rigQueue rig) >>= check . not . Seq.null)))
+              when continue owner
+        atomically (configureView view noConfigure {configureZoom = Just 2}) `shouldReturn` Right ()
+        withOwnedThread owner $ \_ ended → do
+          timeout 10000000 (atomically (takeTMVar (rigEntered rig))) >>= maybe (expectationFailure "no build was held") pure
+          closeView view `shouldReturn` CloseRetiring
+          atomically (putTMVar (rigResume rig) () >> writeTVar stop True)
+          ended
+
+    it "keeps the slot of the buffer a cancelled build's backend released across a close and reopen, and frees it once its destruction is confirmed" $
+      withRig defaultOptions {optProfile = smallProfile {profileSlots = 4, profileQuads = 2048}} $ \rig → do
+        let occupied = Map.findWithDefault 0 1 . serviceOccupied <$> readTerrainViews (rigViews rig)
+            wake = atomically (kick (rigViews rig)) >> runOwner rig
+        destruction ← newTVarIO DisposalPending
+        -- the build settles with the release its construction already made, then its cancellation goes on
+        atomically $ do
+          writeTVar (rigFailNext rig) [Just (BuildFailed "BuildRaised \"thread killed\"" (AllocatedDisposing "buffer 7" (readTVar destruction)))]
+          writeTVar (rigCancelSettled rig) True
+        target ← newTarget 1
+        first ← openOn rig target
+        try @AsyncException (settleUntil rig (isJust . readingRefusal <$> readView first)) `shouldReturn` Left ThreadKilled
+        atomically (isJust . readingRefusal <$> readView first) `shouldReturn` True
+        atomically occupied `shouldReturn` 1
+        closeView first `shouldReturn` CloseRetiring
+        runOwner rig
+        -- a second view of the target holds three parts and waits for the fourth slot
+        second ← openOn rig target
+        settleUntil rig ((== 4) <$> occupied)
+        forM_ [1 .. 8 ∷ Int] (const wake)
+        atomically ((,) <$> (readingPublished <$> readView second) <*> (readingRefusal <$> readView second)) `shouldReturn` (Nothing, Nothing)
+        -- the destruction is confirmed: the slot frees once, and the four parts publish within the slots
+        atomically (writeTVar destruction DisposalDone)
+        settleUntil rig (publishedAtLeast second 1)
+        atomically occupied `shouldReturn` 4
+
+    it "keeps a buffer whose cleanup was cancelled charged, with the upload's refusal and the release's cause, while a competing view with its own room builds" $
+      withRig defaultOptions {optProfile = smallProfile {profileSlots = 4, profileQuads = 2048}} $ \rig → do
+        let reading = readTerrainViews (rigViews rig)
+            occupiedOn key = Map.findWithDefault 0 key . serviceOccupied <$> reading
+        atomically $ do
+          writeTVar (rigFailNext rig) [Just (BuildFailed "BuildUploadRefused UploadClosed" (AllocatedFailed "the failed build's buffer 7 raised on its release: thread killed"))]
+          writeTVar (rigCancelSettled rig) True
+        target ← newTarget 1
+        first ← openOn rig target
+        try @AsyncException (settleUntil rig (isJust . readingRefusal <$> readView first)) `shouldReturn` Left ThreadKilled
+        failures ← serviceFailures <$> atomically reading
+        [cause | (1, Nothing, cause) ← failures] `shouldSatisfy` any (\cause → all (`Text.isInfixOf` cause) ["buffer 7", "UploadClosed", "thread killed"])
+        atomically (occupiedOn 1) `shouldReturn` 1
+        readTVarIO (rigGrants rig) `shouldReturn` 0
+        -- a competing view of another target, with its own room, builds and publishes; the failed buffer stays charged
+        other ← newTarget 2
+        second ← openOn rig other
+        settleUntil rig (publishedAtLeast second 1)
+        atomically (occupiedOn 1) `shouldReturn` 1
+        serviceFailures <$> atomically reading `shouldReturn` failures
+        readTVarIO (rigGrants rig) `shouldReturn` 0
+
   describe "settlement" $ do
     it "ends every view when the owner's exit begins: a pending move settles as ended, and controls are refused" $
       withPublished defaultOptions $ \rig _ view → do
@@ -1903,6 +2005,14 @@ spec = describe "terrain views (TRA-9 v2)" $ do
       answer (Left (VulkanUploadsUnavailable (UploadsRefusedBy RefusedDeviceAbsent))) `shouldBe` Left (BufferUploadsUnavailable "the device refused the uploads: RefusedDeviceAbsent")
       answer (Left (VulkanUploadRefused UploadClosed)) `shouldBe` Left (BufferUploadRefused UploadClosed)
       answer (Right ()) `shouldBe` Right ()
+
+  describe "the view's reading of a build receipt" $
+    it "reads a registered chunk as built, and a refusal that made no buffer as its cause with no allocation" $ do
+      let disposal _ = pure DisposalDone
+      either (const Nothing) Just (viewReceipt disposal (Right (chunkRef 3 1))) `shouldBe` Just (chunkRef 3 1)
+      case viewReceipt disposal (Left (BuildRefused BuildUploadsNotReady NoAllocation)) of
+        Left (BuildFailed cause NotAllocated) → cause `shouldBe` "BuildUploadsNotReady"
+        _ → expectationFailure "expected the cause with no allocation"
 
   describe "a window's geometry" $
     it "is zero for an observed zero dimension whatever else is missing, unknown while incomplete, and an extent only when complete" $ do

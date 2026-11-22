@@ -14,9 +14,9 @@ module Test.Render.TwoD.Vulkan.Retained (spec) where
 
 import Control.Concurrent (yield)
 import Control.Monad (forM_)
-import Control.Concurrent.STM (atomically, newTVarIO, readTVar, readTVarIO, retry, writeTVar)
+import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, retry, writeTVar)
 import qualified Data.Map.Strict as Map
-import Control.Exception (AsyncException (ThreadKilled), ErrorCall (ErrorCall), throwIO, try)
+import Control.Exception (AsyncException (ThreadKilled), ErrorCall (ErrorCall), ExceptionWithContext (ExceptionWithContext), throwIO, toException, tryWithContext)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
@@ -61,6 +61,7 @@ import Hetoimasia.Render.TwoD.Vulkan.Textures (MarkPolicy (..), registeredMarks)
 import Hetoimasia.Render.TwoD.Vulkan.Window
 import Numeric.Natural (Natural)
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldReturn, shouldSatisfy)
+import Test.Support.Bounded (bounded)
 import Test.Support.Owned (withOwnedThread)
 import Test.Render.TwoD.Vulkan.Environment
 import Test.Render.TwoD.Vulkan.StandIn
@@ -196,6 +197,10 @@ admittedGrant ∷ Setup → [Instance] → IO ChunkGrant
 admittedGrant setup instances = do
   prepared ← either (fail . show) pure (prepareRetainedChunk artMarks ChunkWorldDepth DeriveBounds Map.empty instances)
   atomically (admitRetainedChunk (bufferUploads (trackedBuilders setup)) (setupRetained setup) prepared) >>= either (fail . show) pure
+
+-- | A settlement that keeps every receipt it is given.
+settleInto ∷ TVar [Either BuildRefused ChunkRef] → Either BuildRefused ChunkRef → STM ()
+settleInto settled receipt = modifyTVar' settled (<> [receipt])
 
 -- | The uploads' reservations not yet spent or abandoned.
 reservedOf ∷ Setup → IO Int
@@ -417,34 +422,92 @@ refusalSpec = describe "refusing a build" $ do
       (uploadsUnsettled after, uploadsReserved after) `shouldBe` (uploadsUnsettled before, uploadsReserved before)
       length <$> readIORef (trackedMade (setupTracked setup)) >>= (`shouldBe` 8)
 
-  it "releases the buffer when the build is interrupted after it was made, handing over the buffer and its release before the interruption goes on, and leaving nothing registered" $
-    withSetup $ \setup → do
-      handed ← newIORef []
-      let interruptedWith builders' = do
+  it "settles a build whose constructor raises before allocating: the cause in its receipt, the reference and the upload room given back" $
+    bounded . withSetup $ \setup → do
+      settled ← newTVarIO []
+      grant ← admittedGrant setup [cutAt 0 1]
+      let raising = (trackedBuilders setup) {buildVertexBuffer = \_ → throwIO (ErrorCall "the constructor raised")}
+      raised ← tryWithContext @ErrorCall (spendChunkGrant raising (setupRetained setup) grant (settleInto settled))
+      receipts ← readTVarIO settled
+      case raised of
+        Left (ExceptionWithContext context (ErrorCall cause)) → do
+          cause `shouldBe` "the constructor raised"
+          case buildSettlementOf context of
+            Just receipt@(BuildRefused (BuildRaised text) NoAllocation) → do
+              text `shouldSatisfy` Text.isInfixOf "the constructor raised"
+              receipts `shouldBe` [Left receipt]
+            other → expectationFailure ("expected the cause with no allocation, found " <> show other)
+        Right answer → expectationFailure ("expected the constructor's exception, found " <> show answer)
+      reservedOf setup >>= (`shouldBe` 0)
+      readIORef (trackedReleased (setupTracked setup)) >>= (`shouldBe` [])
+      -- the reference is issued again, the room taken again
+      reference ← built setup ChunkWorldDepth [cutAt 0 1]
+      reference `shouldBe` chunkRefOf 0 1
+
+  it "settles a build cancelled while the backend names its buffer: the cancellation names the buffer the backend released, and that release is adopted" $
+    bounded . withSetup $ \setup → do
+      settled ← newTVarIO []
+      grant ← admittedGrant setup [cutAt 0 1]
+      atomically (writeTVar (rigNaming (setupRig setup)) (Just (toException ThreadKilled)))
+      raised ← tryWithContext @AsyncException (spendChunkGrant (trackedBuilders setup) (setupRetained setup) grant (settleInto settled))
+      receipts ← readTVarIO settled
+      case raised of
+        Left (ExceptionWithContext context ThreadKilled) → case buildSettlementOf context of
+          Just receipt@(BuildRefused (BuildRaised _) (AllocationReleased _ (Right ()))) → receipts `shouldBe` [Left receipt]
+          other → expectationFailure ("expected the released buffer named, found " <> show other)
+        other → expectationFailure ("expected the cancellation, found " <> either (const "another exception") show other)
+      -- the backend released it; the build releases nothing again
+      readIORef (trackedReleased (setupTracked setup)) >>= (`shouldBe` [])
+      reservedOf setup >>= (`shouldBe` 0)
+      liveChunks (setupRetained setup) >>= (`shouldBe` [])
+
+  it "settles a build whose upload is refused before binding and whose release is cancelled: the cancellation carries the refusal, the buffer and the release's cause, and the room returns" $
+    bounded . withSetup $ \setup → do
+      -- seven uploads hold seven of the queue's eight places; the grant holds the last
+      _ ← mapM (\i → built setup ChunkWorldDepth [cutAt (fromIntegral (i ∷ Int)) 1]) [1 .. 7]
+      settled ← newTVarIO []
+      let refusing =
+            (trackedBuilders setup)
+              { bufferUploads = (bufferUploads (trackedBuilders setup)) {uploadGranted = \_ _ _ → pure (Left (BufferUploadRefused UploadClosed))}
+              , releaseBuffer = \_ → throwIO ThreadKilled
+              }
+      -- admitted through the uploads that refuse its upload: a grant is spent by the uploads that reserved it
+      prepared ← either (fail . show) pure (prepareRetainedChunk artMarks ChunkWorldDepth DeriveBounds Map.empty [cutAt 0 1])
+      grant ← atomically (admitRetainedChunk (bufferUploads refusing) (setupRetained setup) prepared) >>= either (fail . show) pure
+      raised ← tryWithContext @AsyncException (spendChunkGrant refusing (setupRetained setup) grant (settleInto settled))
+      receipts ← readTVarIO settled
+      made ← drop 7 <$> readIORef (trackedMade (setupTracked setup))
+      case raised of
+        Left (ExceptionWithContext context ThreadKilled) → case buildSettlementOf context of
+          Just receipt@(BuildRefused (BuildUploadRefused UploadClosed) (AllocationReleaseRaised buffer cause)) → do
+            [buffer] `shouldBe` made
+            cause `shouldSatisfy` Text.isInfixOf "thread killed"
+            receipts `shouldBe` [Left receipt]
+          other → expectationFailure ("expected the refusal, the buffer and the release's cause, found " <> show other)
+        other → expectationFailure ("expected the cancellation, found " <> either (const "another exception") show other)
+      reservedOf setup >>= (`shouldBe` 0)
+      -- a competing build takes the returned reference, queue place and staging range
+      reference ← built setup ChunkWorldDepth [cutAt 9 1]
+      reference `shouldBe` chunkRefOf 7 1
+
+  it "answers a public build cancelled after its buffer was made with the original cancellation, carrying the buffer and its release's outcome" $
+    bounded . withSetup $ \setup → do
+      let cancelled builders' = do
             writeIORef (trackedFail (setupTracked setup)) True
-            grant ← admittedGrant setup [cutAt 0 1]
-            try (spendChunkGrant builders' (setupRetained setup) grant (\refused → atomicModifyIORef' handed (\held → (held <> [refused], ()))))
-      -- the release succeeds: its destruction is pending, and the buffer is handed over with it
-      interruptedWith (trackedBuilders setup) >>= \case
-        Left ThreadKilled → pure ()
-        other → expectationFailure ("expected the interruption, found " <> show (fmap (const ()) other))
-      made ← readIORef (trackedMade (setupTracked setup))
-      readIORef (trackedReleased (setupTracked setup)) >>= (`shouldBe` made)
-      readIORef handed >>= \case
-        [BuildRefused (BuildRaised _) (AllocationReleased buffer (Right ()))] → [buffer] `shouldBe` made
-        other → expectationFailure ("expected the released buffer handed over, found " <> show other)
-      -- the release raises: the buffer is handed over with the release's cause
-      writeIORef handed []
-      let raising = (trackedBuilders setup) {releaseBuffer = \_ → throwIO (ErrorCall "the release raised")}
-      interruptedWith raising >>= \case
-        Left ThreadKilled → pure ()
-        other → expectationFailure ("expected the interruption, found " <> show (fmap (const ()) other))
-      second ← drop 1 <$> readIORef (trackedMade (setupTracked setup))
-      readIORef handed >>= \case
-        [BuildRefused (BuildRaised _) (AllocationReleaseRaised buffer cause)] → do
-          [buffer] `shouldBe` second
-          cause `shouldSatisfy` Text.isInfixOf "the release raised"
-        other → expectationFailure ("expected the buffer handed over with its release's cause, found " <> show other)
+            tryWithContext @AsyncException (buildRetainedChunk builders' (setupRetained setup) artMarks ChunkWorldDepth DeriveBounds [cutAt 0 1])
+      -- the release refuses
+      cancelled ((trackedBuilders setup) {releaseBuffer = \_ → pure (Left RefusedDeviceAbsent)}) >>= \case
+        Left (ExceptionWithContext context ThreadKilled) → do
+          made ← readIORef (trackedMade (setupTracked setup))
+          buildSettlementOf context `shouldBe` Just (BuildRefused (BuildRaised "thread killed") (AllocationReleased (last made) (Left RefusedDeviceAbsent)))
+        other → expectationFailure ("expected the cancellation, found " <> either (const "another exception") show other)
+      -- the release raises
+      cancelled ((trackedBuilders setup) {releaseBuffer = \_ → throwIO (ErrorCall "the release raised")}) >>= \case
+        Left (ExceptionWithContext context ThreadKilled) → do
+          made ← readIORef (trackedMade (setupTracked setup))
+          buildSettlementOf context `shouldBe` Just (BuildRefused (BuildRaised "thread killed") (AllocationReleaseRaised (last made) "the release raised"))
+        other → expectationFailure ("expected the cancellation, found " <> either (const "another exception") show other)
+      length <$> readIORef (trackedMade (setupTracked setup)) >>= (`shouldBe` 2)
       reservedOf setup >>= (`shouldBe` 0)
       liveChunks (setupRetained setup) >>= (`shouldBe` [])
 

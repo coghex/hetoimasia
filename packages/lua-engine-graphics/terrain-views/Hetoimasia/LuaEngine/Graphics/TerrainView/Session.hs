@@ -96,7 +96,7 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView.Session
 
 import Control.Concurrent.STM
 import Control.Applicative ((<|>))
-import Control.Exception (Exception, SomeAsyncException, SomeException, displayException, evaluate, finally, fromException, mask, mask_, onException, rethrowIO, throwIO, try, tryWithContext, uninterruptibleMask_)
+import Control.Exception (Exception, ExceptionWithContext (ExceptionWithContext), SomeAsyncException, SomeException, displayException, evaluate, finally, fromException, mask, mask_, onException, rethrowIO, throwIO, try, tryWithContext, uninterruptibleMask_)
 import Control.Monad (filterM, forM, forM_, unless, void, when)
 import Data.Foldable (for_, toList)
 import Data.Functor ((<&>))
@@ -2035,9 +2035,9 @@ stepBuilding service hands vs serial prep candidate
     -- One decision for the candidate ('nextPart'), taken in one transaction that finds the work still current: a
     -- failed or missing built part refuses it; all built and ready, with publication room, it publishes; otherwise the
     -- next part's admission. A grant takes the target's slot, the renderer's reference and the uploads' room together
-    -- (a refused grant takes none of them); the granted build then makes, fills and registers the chunk, and hands it
-    -- to the candidate (or, the work stale, to disposal) in the transaction after it. Blocked, the view is armed in
-    -- the deciding transaction.
+    -- (a refused grant takes none of them); the granted build then makes, fills and registers the chunk, and its one
+    -- settlement hands the chunk to the candidate (or, the work stale, to disposal), or records what its failure left,
+    -- in the transaction that seals the grant. Blocked, the view is armed in the deciding transaction.
     builds 0 = pure True
     builds n = do
       outcome ← mask $ \_ → do
@@ -2058,15 +2058,19 @@ stepBuilding service hands vs serial prep candidate
           Nothing → pure (Just True)
           Just (c, NextGranted grant) → case cdPrepared c of
             (key, _, instances, records) : _ → do
-              -- an exception or cancellation hands over what became of the buffer before it goes on; with nothing
-              -- handed over, whether a buffer was made is not known
-              handed ← newTVarIO False
-              let handOver failure = atomically (writeTVar handed True >> refusedBuild failure)
-                  unknown = readTVar handed >>= \done → unless done (grantAbandon grant >> raisedBuild)
-              (grantSpend grant handOver `onException` atomically unknown) >>= \case
-                Left failure@(BuildFailed why _) →
-                  Just False <$ atomically (refusedBuild failure >> refuse service vs serial basis (LimitFailure ("a chunk could not be built: " <> why)))
-                Right chunk → Nothing <$ atomically (handOn key (Part chunk instances records))
+              -- the build settles once, whatever its exit, and the view's ledger moves in that settlement's own
+              -- transaction; an exception after it is reported as the refusal already recorded, and a cancellation
+              -- goes on
+              let settled = \case
+                    Left failure@(BuildFailed why _) →
+                      refusedBuild failure >> refuse service vs serial basis (LimitFailure ("a chunk could not be built: " <> why))
+                    Right chunk → handOn key (Part chunk instances records)
+              tryWithContext @SomeException (grantSpend grant settled) >>= \case
+                Right (Right _) → pure Nothing
+                Right (Left _) → pure (Just False)
+                Left (ExceptionWithContext context raised)
+                  | Just (_ ∷ SomeAsyncException) ← fromException raised → rethrowIO (ExceptionWithContext context raised)
+                  | otherwise → pure (Just False)
             [] → Just False <$ atomically (grantAbandon grant >> unreserve)
           Just (c, NextPublish) → Just <$> publish service vs serial prep c
           Just (_, NextBlocked) → pure (Just False)
@@ -2088,11 +2092,6 @@ stepBuilding service hands vs serial prep candidate
       AllocatedFailed why → do
         modifyTVar' (vsBuilding vs) (subtract 1)
         modifyTVar' (svFailed service) (<> [(tkey, Nothing, "the build failed (" <> primary <> "), and " <> why)])
-    -- a build interrupted past the renderer's own accounting: whether it made a buffer is not known, so its slot stays
-    -- charged, identified with the cause
-    raisedBuild = do
-      modifyTVar' (vsBuilding vs) (subtract 1)
-      modifyTVar' (svFailed service) (<> [(tkey, Nothing, "a build was interrupted after its slot was reserved")])
     -- the build is handed to the candidate while the work is still current, otherwise to disposal (and a stale stage
     -- that is still this step's is discarded with it)
     handOn key part = do
