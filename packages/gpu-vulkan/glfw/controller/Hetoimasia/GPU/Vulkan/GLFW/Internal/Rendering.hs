@@ -1934,7 +1934,9 @@ withUploads rendering gate decide =
         UploadsRefused refusal → pure (Left (Left (UploadsRefusedBy refusal)))
 
 -- | Spend a reservation on the upload that fills a fresh vertex buffer of exactly its bytes
--- ('submitUploadGranted'), under the caller's gate, read in the transactions that bind and queue it.
+-- ('submitUploadGranted'), under the caller's gate, read in the transactions that bind and queue it. Uploads that are
+-- not made, and a refusal when binding, leave the reservation spendable; once bound, a failed or cancelled copy or a
+-- refusal when queueing gives its place and region back and consumes it.
 submitRenderingGranted
   ∷ Rendering q inst msgr phys dev cmd
   → STM (Maybe UploadRefusal)

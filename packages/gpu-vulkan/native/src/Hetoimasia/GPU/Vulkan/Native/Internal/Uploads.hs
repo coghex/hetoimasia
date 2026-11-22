@@ -663,8 +663,15 @@ liveGrant uploads state grant = do
 
 -- | 'submitUploadGated' for a fresh vertex buffer of exactly the reserved
 -- bytes, into the reservation's place and region, which it spends: nothing
--- competes for capacity again. A refusal leaves the reservation as it was,
--- for its holder to spend or abandon.
+-- competes for capacity again. Binding is the transaction that admits the
+-- upload, and it spends the reservation. A refusal from that transaction
+-- (the gate, the session, misuse, a buffer of the wrong kind or size) comes
+-- before binding and leaves the reservation as it was, for its holder to
+-- spend or abandon. After binding the bytes are copied: a copy that raised or
+-- was cancelled, and a refusal in the transaction that queues the upload
+-- (the gate or the uploads closing meanwhile), give the place and region back
+-- to the uploads and consume the reservation, which is then stale: a later
+-- spend is misuse and an abandonment changes nothing.
 submitUploadGranted
   ∷ STM (Maybe UploadRefusal)
   → Uploads q inst msgr phys dev cmd

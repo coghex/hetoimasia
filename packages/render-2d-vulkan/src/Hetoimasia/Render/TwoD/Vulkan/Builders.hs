@@ -105,8 +105,11 @@ data BufferUploads = BufferUploads
   , uploadGranted ∷ UploadGrant → Buffer → ByteString → IO (Either BufferUploadRefusal UploadTicket)
     -- ^ Spend the reservation on the upload that fills a fresh vertex buffer of
     -- exactly its bytes: admission copies the bytes before it returns and never
-    -- waits, and the ticket says where the upload stands. A refusal leaves the
-    -- reservation to be abandoned.
+    -- waits, and the ticket says where the upload stands. A refusal before
+    -- binding leaves the reservation to be spent or abandoned; once bound, a
+    -- failed or cancelled copy, or a refusal before the upload is queued, gives
+    -- its place and region back and consumes it, so abandoning it changes
+    -- nothing.
   , abandonRoom ∷ UploadGrant → STM ()
     -- ^ Free an unspent reservation's room.
   }

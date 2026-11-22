@@ -665,7 +665,9 @@ vulkanUploadRoom host = Controller.vulkanUploadRoom (vulkanController host)
 reserveVulkanUpload ∷ VulkanHost scene → Natural → STM (Either VulkanUploadRefusal UploadGrant)
 reserveVulkanUpload host = Controller.reserveVulkanUpload (vulkanController host)
 
--- | Spend a reservation on the upload that fills a fresh vertex buffer of exactly its bytes.
+-- | Spend a reservation on the upload that fills a fresh vertex buffer of exactly its bytes. A refusal before binding
+-- leaves the reservation spendable; once bound, a failed or cancelled copy, or the owner's gate closing before the
+-- upload is queued, gives its place and region back and consumes it.
 submitVulkanGranted ∷ VulkanHost scene → UploadGrant → Buffer → ByteString → IO (Either VulkanUploadRefusal UploadTicket)
 submitVulkanGranted host = Controller.submitVulkanGranted (vulkanController host)
 

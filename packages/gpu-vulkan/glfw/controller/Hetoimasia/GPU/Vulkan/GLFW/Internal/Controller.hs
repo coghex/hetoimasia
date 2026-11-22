@@ -1319,8 +1319,10 @@ reserveVulkanUpload (VulkanController state) bytes =
     <$> reserveRenderingUpload (stateRendering state) (uploadGate state) bytes
 
 -- | Spend a reservation on the upload that fills a fresh vertex buffer of
--- exactly its bytes, under the owner's gate. A refusal leaves the
--- reservation to its holder.
+-- exactly its bytes, under the owner's gate. A refusal before binding leaves
+-- the reservation to its holder; once bound, a failed or cancelled copy, or
+-- the gate closing before the upload is queued, gives the place and region
+-- back and consumes the reservation ('submitUploadGranted').
 submitVulkanGranted ∷ VulkanController → UploadGrant → Buffer → ByteString → IO (Either VulkanUploadRefusal UploadTicket)
 submitVulkanGranted (VulkanController state) grant buffer bytes =
   either (Left . either VulkanUploadsUnavailable VulkanUploadRefused) Right

@@ -112,6 +112,8 @@ data Rig = Rig
     -- one of its frames.
   , rigNaming ∷ !(TVar (Maybe SomeException))
     -- ^ An exception the allocator's next naming call raises, once.
+  , rigWriting ∷ !(TVar (Maybe SomeException))
+    -- ^ An exception the next write into mapped memory raises, once, before it writes.
   }
 
 -- | A session with a surface-free device and its frames and uploads, with
@@ -142,12 +144,13 @@ newRigWith offered windowed = do
   layouts ← newTVarIO []
   memory ← newTVarIO Map.empty
   naming ← newTVarIO Nothing
+  writing ← newTVarIO Nothing
   budgets ← either (fail . show) pure (validateBudgets defaultBudgetRequest {requestedFrameSlots = 2, requestedProgressActions = 32})
   roots ← newRoots (rootOps memory handles naming) budgets (scriptedSource (pure (scriptedInstant zeroDuration)))
   _ ← startRoots roots (InstanceRequest [] [] [])
   _ ← startRootsDevice roots
   generations ← newGenerations roots
-  recording ← newRecording (recordingOps offered commands writes pipelines layouts memory handles) roots generations
+  recording ← newRecording (recordingOps offered commands writes pipelines layouts memory handles writing) roots generations
   frames ← newFrames (frameOps windowed fences handles) recording
   uploads ← newUploads frames (either (error . show) id (validateUploadConfig 1048576 262144 8)) >>= either (fail . show) pure
   window ←
@@ -159,7 +162,7 @@ newRigWith offered windowed = do
         _ ← stepGenerations generations (scriptedInstant zeroDuration) (Map.singleton admitted (TargetGeometry (Right ()) (Just (SurfaceExtent 640 480)) Nothing 1))
         mapM_ (\slot → createFrameStorage recording admitted slot >>= either (fail . show) pure) [0, 1]
         pure (Just admitted)
-  pure (Rig recording frames uploads commands writes fences handles pipelines layouts window naming)
+  pure (Rig recording frames uploads commands writes fences handles pipelines layouts window naming writing)
 
 -- | Make the renderer as a host does — the ring, the table, the layout — and
 -- let the table's placeholder upload complete, so a batch can bind it.
@@ -445,8 +448,8 @@ allocatorOps handles naming = do
 -- ---------------------------------------------------------------------------
 -- The recording
 
-recordingOps ∷ [ImageFormat] → TVar [NativeCommand] → TVar [(Word64, Natural, ByteString)] → TVar [(Word64, PipelineRequest)] → TVar [([Word64], [PushConstantRange])] → TVar (Map Word64 ByteString) → TVar Word64 → RecordingOps Int Word64
-recordingOps offered commands writes pipelines layouts memory handles =
+recordingOps ∷ [ImageFormat] → TVar [NativeCommand] → TVar [(Word64, Natural, ByteString)] → TVar [(Word64, PipelineRequest)] → TVar [([Word64], [PushConstantRange])] → TVar (Map Word64 ByteString) → TVar Word64 → TVar (Maybe SomeException) → RecordingOps Int Word64
+recordingOps offered commands writes pipelines layouts memory handles writing =
   RecordingOps
     { opsCreatePipelineLayout = \_ sets ranges → do
         atomically (modifyTVar' layouts ((sets, ranges) :))
@@ -467,7 +470,7 @@ recordingOps offered commands writes pipelines layouts memory handles =
     , opsReadMapped = \allocation offset size → do
         bytes ← Map.findWithDefault ByteString.empty (allocationMapped allocation) <$> readTVarIO memory
         pure (ByteString.take (fromIntegral size) (ByteString.drop (fromIntegral offset) bytes))
-    , opsWriteMapped = \allocation offset bytes → atomically $ do
+    , opsWriteMapped = \allocation offset bytes → atomically (readTVar writing <* writeTVar writing Nothing) >>= mapM_ throwIO >> atomically (do
         modifyTVar' writes ((allocationMapped allocation, offset, bytes) :)
         modifyTVar' memory $
           Map.alter
@@ -475,7 +478,7 @@ recordingOps offered commands writes pipelines layouts memory handles =
                 let current = maybe (ByteString.replicate (fromIntegral (allocationSize allocation)) 0) id held
                  in Just (ByteString.take (fromIntegral offset) current <> bytes <> ByteString.drop (fromIntegral offset + ByteString.length bytes) current)
             )
-            (allocationMapped allocation)
+            (allocationMapped allocation))
     , opsBeginCommands = \_ → pure ()
     , opsEndCommands = \_ → pure ()
     , opsRecord = \_ command → atomically (modifyTVar' commands (command :))

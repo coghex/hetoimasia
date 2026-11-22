@@ -135,7 +135,7 @@ import Hetoimasia.Render.TwoD.Material (MaterialData (..), MaterialRecord, mater
 import Hetoimasia.Render.TwoD.Metrics (PixelExtent (..), TargetMetrics (..), validMetrics)
 import Hetoimasia.Render.TwoD.Settings (defaultViewSettings)
 import Hetoimasia.Render.TwoD.Snapshot (ClearColour (..), Instance, Layer (WorldLayerWith), LayerDepth (DepthEnabled), Viewport (..))
-import Hetoimasia.Render.TwoD.Vulkan.Chunks (ChunkStanding (..), PreparedChunk, preparedBytes)
+import Hetoimasia.Render.TwoD.Vulkan.Chunks (BuildSettlement (..), ChunkStanding (..), PreparedChunk, buildSettlementOf, preparedBytes)
 import Hetoimasia.Render.TwoD.Vulkan.Layout (clipEntryBytes)
 import Hetoimasia.Terrain.Changes (ChangeLimits (..))
 import Hetoimasia.Terrain.Coordinate (AxisCoord, RegionCoord (..), axisValue)
@@ -376,8 +376,9 @@ data Candidate = Candidate
   , cdAdapted ∷ !Adapted
   , cdWanted ∷ ![(PartKey, [Instance], [MaterialRecord])]
     -- ^ The fresh parts not yet prepared.
-  , cdPrepared ∷ ![(PartKey, PreparedChunk, [Instance], [MaterialRecord])]
-    -- ^ The fresh parts prepared and not yet built: the live remainder, built in this order.
+  , cdPrepared ∷ !(Seq (PartKey, PreparedChunk, [Instance], [MaterialRecord]))
+    -- ^ The fresh parts prepared and not yet built: the live remainder, built in this order from its head. A batch is
+    -- appended and the built head removed, each in time bounded by the remainder's logarithm.
   , cdFresh ∷ !Int
     -- ^ How many fresh parts the candidate needs in all, after reuse.
   , cdLargest ∷ !(Maybe PreparedChunk)
@@ -1951,7 +1952,7 @@ stepPlanning service vs serial prep copies camera box =
           then False <$ refuse service vs serial (prepBasis prep) (LimitSlots (length toBuild) recoverable)
           else case prepMetrics prep of
             Nothing → False <$ refuse service vs serial (prepBasis prep) (LimitFailure "a plan was made without a drawable extent")
-            Just metrics → writeBack service vs serial (prepBasis prep) (Building prep (Candidate plan copies (plannedAdapted planned) toBuild [] (length toBuild) Nothing Map.empty reused camera metrics demand))
+            Just metrics → writeBack service vs serial (prepBasis prep) (Building prep (Candidate plan copies (plannedAdapted planned) toBuild Seq.empty (length toBuild) Nothing Map.empty reused camera metrics demand))
 
 -- The element with the greatest key, if any, every comparison made as the list is walked (no deferred chain).
 maximumOn ∷ Ord b ⇒ (a → b) → [a] → Maybe a
@@ -2030,7 +2031,7 @@ stepBuilding service hands vs serial prep candidate
             Building p c →
               -- the largest so far, decided here, within this batch's bound
               let !largest = maximumOn preparedBytes (maybe id (:) (cdLargest c) [part | (_, part, _, _) ← parts])
-               in writeBack service vs serial basis (Building p c {cdWanted = rest, cdPrepared = cdPrepared c <> parts, cdLargest = largest})
+               in writeBack service vs serial basis (Building p c {cdWanted = rest, cdPrepared = cdPrepared c Seq.>< Seq.fromList parts, cdLargest = largest})
             _ → pure False
     -- One decision for the candidate ('nextPart'), taken in one transaction that finds the work still current: a
     -- failed or missing built part refuses it; all built and ready, with publication room, it publishes; otherwise the
@@ -2056,11 +2057,11 @@ stepBuilding service hands vs serial prep candidate
             _ → pure Nothing
         case decided of
           Nothing → pure (Just True)
-          Just (c, NextGranted grant) → case cdPrepared c of
-            (key, _, instances, records) : _ → do
+          Just (c, NextGranted grant) → case Seq.viewl (cdPrepared c) of
+            (key, _, instances, records) Seq.:< _ → do
               -- the build settles once, whatever its exit, and the view's ledger moves in that settlement's own
               -- transaction; an exception after it is reported as the refusal already recorded, and a cancellation
-              -- goes on
+              -- goes on, as does an exception whose receipt says this settlement raised (the ledger did not move)
               let settled = \case
                     Left failure@(BuildFailed why _) →
                       refusedBuild failure >> refuse service vs serial basis (LimitFailure ("a chunk could not be built: " <> why))
@@ -2070,8 +2071,9 @@ stepBuilding service hands vs serial prep candidate
                 Right (Left _) → pure (Just False)
                 Left (ExceptionWithContext context raised)
                   | Just (_ ∷ SomeAsyncException) ← fromException raised → rethrowIO (ExceptionWithContext context raised)
+                  | Just (BuildSettlement _ (Just _)) ← buildSettlementOf context → rethrowIO (ExceptionWithContext context raised)
                   | otherwise → pure (Just False)
-            [] → Just False <$ atomically (grantAbandon grant >> unreserve)
+            Seq.EmptyL → Just False <$ atomically (grantAbandon grant >> unreserve)
           Just (c, NextPublish) → Just <$> publish service vs serial prep c
           Just (_, NextBlocked) → pure (Just False)
           Just (_, NextFailed why) → Just False <$ atomically (refuse service vs serial basis (LimitFailure ("a chunk's upload ended without completing: " <> why)))
@@ -2101,10 +2103,17 @@ stepBuilding service hands vs serial prep candidate
       case stage of
         Building p c
           | live →
-              writeTVar (vsStage vs) (Building p c {cdBuilt = Map.insert key part (cdBuilt c), cdPrepared = filter (\(k, _, _, _) → k /= key) (cdPrepared c)})
+              writeTVar (vsStage vs) (Building p c {cdBuilt = Map.insert key part (cdBuilt c), cdPrepared = builtHead key (cdPrepared c)})
         _ → do
           privately service vs [partChunk part]
           unless live (discardStale service vs serial)
+
+-- The prepared remainder without the part just built, which is its head: the owner builds the head of a candidate it
+-- has revalidated, and nothing else takes from it.
+builtHead ∷ PartKey → Seq (PartKey, PreparedChunk, [Instance], [MaterialRecord]) → Seq (PartKey, PreparedChunk, [Instance], [MaterialRecord])
+builtHead key prepared = case Seq.viewl prepared of
+  (first, _, _, _) Seq.:< rest | first == key → rest
+  _ → prepared
 
 -- The candidate's one decision, which the owner takes (reserving through @admitNext@, with the slot, in the caller's
 -- transaction) and the watcher observes (through the same decision, read-only). A failed or missing built part comes
@@ -2120,11 +2129,11 @@ nextPart service vs candidate admitNext = do
   let failures = [standing | standing ← standings, ended standing]
   if not (null failures)
     then pure (NextFailed (Text.pack (show failures)))
-    else case cdPrepared candidate of
-      [] → do
+    else case Seq.viewl (cdPrepared candidate) of
+      Seq.EmptyL → do
         room ← (< 2) . Set.size <$> pinsKept service vs
         pure (if all (== Just ChunkReady) standings && room then NextPublish else NextBlocked)
-      (_, first, _, _) : _ → do
+      (_, first, _, _) Seq.:< _ → do
         free ← freeSlots service vs
         recoverable ← recoverableSlots service vs
         -- two probes, whatever the candidate's size: the largest part (whether any can ever fit) and the next

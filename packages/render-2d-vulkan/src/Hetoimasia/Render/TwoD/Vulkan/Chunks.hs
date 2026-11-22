@@ -114,8 +114,8 @@ module Hetoimasia.Render.TwoD.Vulkan.Chunks
   , liveChunks
   ) where
 
-import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVar, newTVarIO, readTVar, readTVarIO, writeTVar)
-import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeAsyncException, SomeException, displayException, fromException, mask_, rethrowIO, tryWithContext)
+import Control.Concurrent.STM (STM, TVar, atomically, catchSTM, modifyTVar', newTVar, newTVarIO, readTVar, readTVarIO, writeTVar)
+import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeAsyncException, SomeException, displayException, fromException, mask_, rethrowIO, someExceptionContext, tryWithContext)
 import Control.Exception.Annotation (ExceptionAnnotation (displayExceptionAnnotation))
 import Control.Exception.Context (ExceptionContext, addExceptionAnnotation, getExceptionAnnotations)
 import Control.Monad (when)
@@ -381,10 +381,12 @@ giveBack grant = do
 -- and not registered is released once (a construction that raised after releasing its buffer has that release
 -- adopted), any outcome of the release kept, a cancellation included; then one transaction, which never waits, seals
 -- the grant (registered, or its reference and any room still reserved given back) and runs @settle@ with the receipt.
+-- The seal commits whatever @settle@ does: an exception from @settle@ undoes only @settle@'s own effects, and goes on
+-- once the seal has committed, its receipt saying the settlement raised ('settlementRaised').
 -- A failure's receipt says what became of the buffer ('RefusedAllocation'): a released buffer is destroyed only once
 -- the backend confirms it, and its capacity stays occupied until then. A refusal is answered with the receipt; a
 -- raised exit goes on with the receipt attached to the exception ('buildSettlementOf'): the build's cancellation if it
--- was one, otherwise a cancellation the release raised, otherwise the build's exception.
+-- was one, otherwise a cancellation the release raised, otherwise the settlement's exception, otherwise the build's.
 spendChunkGrant
   ∷ Builders q inst msgr phys dev cmd
   → Retained
@@ -413,20 +415,22 @@ spendChunkGrant builders (Retained ledger) grant settle = mask_ $ do
         Right (Right held) → pure (Right held, Nothing)
         Right (Left refusal) → unregistered made refusal
         Left (ExceptionWithContext _ raised) → unregistered made (BuildRaised (raisedText raised))
-      answer ← atomically $ do
+      -- the seal commits whatever the settlement does: its exception undoes only its own effects
+      (answer, settleRaised) ← atomically $ do
         answer ← case receipt of
           Right held → Right <$> register held
           Left refused → Left refused <$ giveBack grant
-        settle answer
-        pure answer
+        raised ← (Nothing <$ settle answer) `catchSTM` (\(failure ∷ SomeException) → pure (Just failure))
+        pure (answer, raised)
       let built = either Just (const Nothing) outcome
-          carrying (ExceptionWithContext context raised) = case answer of
-            Left refused → ExceptionWithContext (addExceptionAnnotation (BuildSettlement refused) context) raised
-            Right _ → ExceptionWithContext context raised
-      case (built, cleanupRaised) of
-        (Just failure, _) | cancellation failure → rethrowIO (carrying failure)
-        (_, Just failure) | cancellation failure → rethrowIO (carrying failure)
-        (Just failure, _) → rethrowIO (carrying failure)
+          settled = (\raised → ExceptionWithContext (someExceptionContext raised) raised) <$> settleRaised
+          receiptOf = BuildSettlement answer (Text.pack . displayException <$> settleRaised)
+          carrying (ExceptionWithContext context raised) = ExceptionWithContext (addExceptionAnnotation receiptOf context) raised
+      case (built, cleanupRaised, settled) of
+        (Just failure, _, _) | cancellation failure → rethrowIO (carrying failure)
+        (_, Just failure, _) | cancellation failure → rethrowIO (carrying failure)
+        (_, _, Just failure) → rethrowIO (carrying failure)
+        (Just failure, _, _) → rethrowIO (carrying failure)
         _ → pure answer
   where
     standing = grantStanding grant
@@ -472,18 +476,23 @@ spendChunkGrant builders (Retained ledger) grant settle = mask_ $ do
 data MadeBuffer = NotMade | Made !Buffer | MadeAndReleased !Buffer
   deriving (Eq, Show)
 
--- | The settlement of a build that raised, attached to the exception it propagates: the cause (the build's exception,
--- or the refusal a cancellation during cleanup interrupted) and what became of its buffer.
-newtype BuildSettlement = BuildSettlement BuildRefused
-  deriving (Show)
+-- | The settlement of a build that raised, attached to the exception it propagates.
+data BuildSettlement = BuildSettlement
+  { settlementReceipt ∷ !(Either BuildRefused ChunkRef)
+    -- ^ The sealed receipt: the cause (the build's exception, or the refusal a cancellation during cleanup
+    -- interrupted) and what became of the buffer; or the chunk, registered.
+  , settlementRaised ∷ !(Maybe Text)
+    -- ^ The caller's settlement raised, with its text: its own effects were undone, the grant's seal was not.
+  }
+  deriving (Eq, Show)
 
 instance ExceptionAnnotation BuildSettlement where
-  displayExceptionAnnotation (BuildSettlement refused) = "the chunk build settled: " <> show refused
+  displayExceptionAnnotation settlement = "the chunk build settled: " <> show settlement
 
 -- | The settlement a raised build's exception carries, if it is one.
-buildSettlementOf ∷ ExceptionContext → Maybe BuildRefused
+buildSettlementOf ∷ ExceptionContext → Maybe BuildSettlement
 buildSettlementOf context = case getExceptionAnnotations context of
-  BuildSettlement refused : _ → Just refused
+  settlement : _ → Just settlement
   [] → Nothing
 
 -- | The reference the registry issues next and the ledger with it taken.
