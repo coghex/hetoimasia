@@ -1,0 +1,11 @@
+-- The exact components allowed to depend on hetoimasia-foundation:owner-tx-issuer,
+-- the ownership transactions' issuer bridge, in Cabal's field syntax.
+-- tools/owner-tx-guard (the test.owner-tx-guard group) refuses an unlisted or
+-- stale entry, a component listed twice, and any Cabal re-export or mixin of
+-- the bridge or its representation. What a listed component's modules import,
+-- export and instantiate is checked by issuer review; see
+-- docs/validation.md#the-issuer-bridges-import-guard.
+
+dependent
+  component: hetoimasia-foundation:test:foundation-tests
+  reason: its composition example builds through the bridge

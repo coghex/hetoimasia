@@ -5,14 +5,15 @@
 --
 -- Cabal supplies the components, their configurations, dependencies, re-exports, mixins and declared modules
 -- ("Inventory"); the guard compares those facts with the exact component allowlist
--- @tools/validation/owner_tx_issuers.json@ ("Policy"). It reads no Haskell source and needs no compiler or store.
+-- @tools/validation/owner_tx_issuers.fields@ ("Policy"). It reads no Haskell source and needs no compiler or store.
 --
 -- @owner-tx-guard check [--root DIR]@ fails (exit 1) on any problem and refuses (exit 2) what it cannot read.
 -- @owner-tx-guard scope [--root DIR]@ prints every project file and package description the check reads, one
 -- @kind path@ per line.
 module Main (main) where
 
-import Control.Monad (filterM, forM_, unless)
+import Control.Monad (forM_, unless)
+import qualified Data.ByteString as ByteString
 import Data.List (nub, sort)
 import GHC.IO.Encoding (setFileSystemEncoding, setForeignEncoding, setLocaleEncoding)
 import Inventory (Inventory (..), Package (..), readInventory)
@@ -24,7 +25,7 @@ import System.FilePath ((</>))
 import System.IO (hPutStrLn, hSetEncoding, stderr, stdout, utf8)
 
 allowlistPath ∷ FilePath
-allowlistPath = "tools/validation/owner_tx_issuers.json"
+allowlistPath = "tools/validation/owner_tx_issuers.fields"
 
 main ∷ IO ()
 main = do
@@ -41,8 +42,10 @@ main = do
 run ∷ String → FilePath → IO ()
 run command given = do
   root ← makeAbsolute given
-  projects ← filterM (\project → doesFileExist (root </> project)) ["cabal.project", "cabal.project.vulkan"]
-  unless ("cabal.project" `elem` projects) (refuse (root </> "cabal.project does not exist"))
+  let projects = ["cabal.project", "cabal.project.vulkan"]
+  forM_ projects $ \project → do
+    present ← doesFileExist (root </> project)
+    unless present (refuse (project <> " does not exist: the guard reads both project files"))
   inventory ← readInventory root projects >>= either refuse pure
   case command of
     "scope" → mapM_ putStrLn (scope inventory)
@@ -63,8 +66,8 @@ readAllowlistAt ∷ FilePath → IO Allowlist
 readAllowlistAt root = do
   present ← doesFileExist (root </> allowlistPath)
   unless present (refuse (allowlistPath <> " cannot be read: it does not exist"))
-  text ← readFile (root </> allowlistPath)
-  either (\why → refuse (allowlistPath <> " cannot be read: " <> why)) pure (readAllowlist text)
+  bytes ← ByteString.readFile (root </> allowlistPath)
+  either (\why → refuse (allowlistPath <> " cannot be read: " <> why)) pure (readAllowlist bytes)
 
 refuse ∷ String → IO a
 refuse why = hPutStrLn stderr ("owner_tx_guard: " <> why) >> exitWith (ExitFailure 2)

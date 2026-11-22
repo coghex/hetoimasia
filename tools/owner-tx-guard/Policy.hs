@@ -1,4 +1,4 @@
-{-# LANGUAGE NoOverloadedStrings #-}
+{-# LANGUAGE LambdaCase, NoOverloadedStrings #-}
 
 -- | The guard's policy: Cabal's facts compared with the component allowlist (the design's "Cabal issuer dependency
 -- guard").
@@ -16,10 +16,12 @@ module Policy
   ) where
 
 import Control.Monad (forM)
+import qualified Data.ByteString as ByteString
 import Data.List (intercalate, nub)
 import qualified Data.Map.Strict as Map
+import Distribution.Fields (Field (..), FieldLine (..), Name (..), readFields)
+import Distribution.Utils.Generic (fromUTF8BS)
 import Inventory
-import Json
 
 -- | The exact allowlist: each listed component, by package, kind and name (@package:kind:name@).
 newtype Allowlist = Allowlist
@@ -42,23 +44,37 @@ protected =
 protectedModules ∷ [String]
 protectedModules = [moduleName | (moduleName, _, _) ← protected]
 
-readAllowlist ∷ String → Either String Allowlist
-readAllowlist text = do
-  document ← parseJson text
-  case member "schema_version" document >>= asInteger of
-    Just 3 → pure ()
-    _ → Left "the allowlist must be an object with schema_version 3"
-  let known = ["schema_version", "description", "dependents"]
-  case document of
-    JObject fields | all ((`elem` known) . fst) fields → pure ()
-    _ → Left ("the allowlist has fields other than " <> intercalate ", " known)
-  listed ← maybe (Left "the allowlist has no dependents") Right (member "dependents" document)
-  items ← maybe (Left "dependents is not an array") Right (asArray listed)
-  dependents ← forM items $ \item → do
-    let get key = maybe (Left ("dependents: an entry needs " <> key <> " as a string: " <> show item)) Right (member key item >>= asString)
-    _ ← get "reason"
-    get "component"
-  pure (Allowlist dependents)
+-- | Read the allowlist, in Cabal's field syntax, with Cabal's own field parser: only @dependent@ sections, each with
+-- exactly one @component@ (@package:kind:name@) and one @reason@; any other field or section, and a component listed
+-- twice, make it unreadable.
+--
+-- > dependent
+-- >   component: hetoimasia-foundation:test:foundation-tests
+-- >   reason: its composition example builds through the bridge
+readAllowlist ∷ ByteString.ByteString → Either String Allowlist
+readAllowlist bytes = do
+  fields ← either (\failure → Left ("Cabal's field parser refused it: " <> show failure)) Right (readFields bytes)
+  components ← forM fields $ \case
+    Section (Name _ section) [] inner | fromUTF8BS section == "dependent" → do
+      let values key = [unwords [fromUTF8BS line | FieldLine _ line ← contents] | Field (Name _ name) contents ← inner, fromUTF8BS name == key]
+          others = [fromUTF8BS name | Field (Name _ name) _ ← inner, fromUTF8BS name `notElem` ["component", "reason"]] <> ["a section" | Section {} ← inner]
+      case (values "component", values "reason", others) of
+        ([component], [reason], [])
+          | [_, kind, _] ← splitOn component
+          , kind `elem` ["lib", "flib", "exe", "test", "bench"]
+          , not (any (`elem` " \t") component)
+          , not (null (words reason)) →
+              Right component
+        _ → Left ("a dependent section needs exactly one component (package:kind:name) and one reason, and nothing else: " <> show (values "component", others))
+    Section (Name _ name) _ _ → Left ("the section " <> fromUTF8BS name <> " is not a dependent section with no arguments")
+    Field (Name _ name) _ → Left ("the field " <> fromUTF8BS name <> " is outside a dependent section")
+  case [component | (component, count) ← Map.toList (Map.fromListWith (+) [(c, 1 ∷ Int) | c ← components]), count > 1] of
+    [] → Right (Allowlist components)
+    repeated → Left ("a component listed more than once: " <> intercalate ", " repeated)
+  where
+    splitOn text = case break (== ':') text of
+      (part, ':' : rest) → part : splitOn rest
+      (part, _) → [part]
 
 -- | Every problem: unsupported forms, an unlisted or stale dependent, a protected re-export or mixin, a protected module
 -- declared outside its defining component, and an unresolved library selector.
@@ -74,6 +90,7 @@ check allowlist inventory =
     <> declarations
     <> definitions
     <> selectors
+    <> unresolvedMixins
   where
     packages = inventoryPackages inventory
     everyConfiguration = concatMap packageConfigurations packages
@@ -146,4 +163,19 @@ check allowlist inventory =
         , (component, dependency, library) ← packageSelectors package'
         , Just known ← [Map.lookup dependency libraries]
         , library `notElem` known
+        ]
+        <> nub
+          [ "uncovered: " <> component <> " selects " <> dependency <> ":" <> library <> ", a library of a package outside this repository, which the guard cannot establish"
+          | package' ← packages
+          , (component, dependency, library) ← packageSelectors package'
+          , Nothing ← [Map.lookup dependency libraries]
+          , not (null library)
+          ]
+    -- every mixin includes a library its configuration depends on
+    unresolvedMixins =
+      nub
+        [ "uncovered: " <> configurationId configuration <> " has the mixin " <> mixinPackage mixin <> (if null (mixinLibrary mixin) then "" else ":" <> mixinLibrary mixin) <> ", which names no dependency of that configuration"
+        | configuration ← everyConfiguration
+        , mixin ← configMixins configuration
+        , not (or [package' == mixinPackage mixin && mixinLibrary mixin `elem` selected | (package', selected) ← configDependencies configuration])
         ]

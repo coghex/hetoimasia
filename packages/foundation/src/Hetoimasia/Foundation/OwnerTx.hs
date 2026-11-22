@@ -9,7 +9,7 @@
 -- __Issuers.__ An issuer (a subsystem that owns state and exports ownership operations over it) keeps its own 'STM' and
 -- its existing state, and embeds a concrete operation through
 -- 'Hetoimasia.Foundation.OwnerTx.Issuer.fromIssuerSTM', in the @owner-tx-issuer@ sublibrary of this package. Only the
--- components @tools/validation/owner_tx_issuers.json@ lists may depend on that sublibrary; the repository's dependency
+-- components @tools/validation/owner_tx_issuers.fields@ lists may depend on that sublibrary; the repository's dependency
 -- guard (@tools/owner-tx-guard@) refuses any other dependent and any Cabal re-export or mixin of the bridge or the
 -- representation, and issuer review checks what a listed component's modules import and export. Every embedded path
 -- must:

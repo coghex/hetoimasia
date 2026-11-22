@@ -3,7 +3,7 @@
 --
 -- @owner-tx-guard@ takes its facts from Cabal alone (components, their configurations on Linux and Darwin on x86_64 and
 -- aarch64 under every manual flag, structured dependencies, re-exports, mixins, declared modules and visibility) and
--- compares them with the exact component allowlist @tools/validation/owner_tx_issuers.json@. Every example runs the
+-- compares them with the exact component allowlist @tools/validation/owner_tx_issuers.fields@. Every example runs the
 -- production guard against a temporary tree of buildable minimal packages under ordinary Cabal visibility: a
 -- Foundation of the real one's shape (a public main library, the private representation library, the public issuer
 -- sublibrary and a test suite composing through the bridge), a consumer that depends on public libraries only, and a
@@ -17,7 +17,7 @@ module OwnerTxGuard (spec) where
 
 import Control.Exception (finally)
 import Control.Monad (forM_, void)
-import Data.List (intercalate, isInfixOf, isPrefixOf)
+import Data.List (isInfixOf, isPrefixOf)
 import Json (Json (..), asArray, asString, entryFor, field, parseJson)
 import Sandbox (git, run, sanitizedEnvironment, writeFixtureFile)
 import System.Directory (copyFile, createDirectoryIfMissing, doesFileExist, getCurrentDirectory, getPermissions, setOwnerWritable, setPermissions)
@@ -86,21 +86,16 @@ haskell ∷ String → [String] → [String] → String
 haskell header imports body = unlines ([header, ""] <> imports <> [""] <> body)
 
 allowlist ∷ [String] → String
-allowlist dependents =
-  unlines
-    [ "{"
-    , "  \"schema_version\": 3,"
-    , "  \"dependents\": [" <> intercalate ", " ["{\"component\": " <> show component <> ", \"reason\": \"a fixture\"}" | component ← dependents] <> "]"
-    , "}"
-    ]
+allowlist dependents = unlines (concat [["dependent", "  component: " <> component, "  reason: a fixture"] | component ← dependents])
 
 baseDependents ∷ [String]
 baseDependents = ["hetoimasia-foundation:test:foundation-tests", "consumer:lib:consumer"]
 
 baseTree ∷ [(FilePath, String)]
 baseTree =
-  [ ("cabal.project", "packages:\n  foundation\n  consumer\nactive-repositories: :none\n")
-  , ("cabal.project.vulkan", "packages:\n  foundation\n  consumer\n  vulkanpkg\nactive-repositories: :none\n")
+  [ ("cabal.project", "import: cabal.project.common\npackages:\n  foundation\n  consumer\n")
+  , ("cabal.project.vulkan", "import: cabal.project.common\npackages:\n  foundation\n  consumer\n  vulkanpkg\n")
+  , ("cabal.project.common", "active-repositories: :none\n")
   , ("foundation/hetoimasia-foundation.cabal", foundationWith [])
   , ("foundation/internal/Hetoimasia/Foundation/OwnerTx/Representation.hs", haskell "module Hetoimasia.Foundation.OwnerTx.Representation (OwnerTx (..)) where" ["import Control.Concurrent.STM (STM)"] ["newtype OwnerTx a = OwnerTx (STM a)", "  deriving newtype (Functor, Applicative, Monad)"])
   , ("foundation/internal/Hetoimasia/Foundation/OwnerTx/Cells.hs", haskell "module Hetoimasia.Foundation.OwnerTx.Cells (ReadOnly (..), watch) where" ["import Control.Concurrent.STM (STM, TVar, readTVar)"] ["newtype ReadOnly a = ReadOnly (TVar a)", "watch ∷ ReadOnly a → STM a", "watch (ReadOnly cell) = readTVar cell"])
@@ -123,15 +118,19 @@ baseTree =
   , ("consumer/src/Consumer/Adapter.hs", adapterImporting "Hetoimasia.Foundation.OwnerTx")
   , ("vulkanpkg/vulkanpkg.cabal", vulkanWith [] [])
   , ("vulkanpkg/src/Vulkan/Native.hs", haskell "module Vulkan.Native () where" ["import Hetoimasia.Foundation.OwnerTx ()"] [])
-  , ("tools/validation/owner_tx_issuers.json", allowlist baseDependents)
+  , ("tools/validation/owner_tx_issuers.fields", allowlist baseDependents)
   ]
 
 -- | The consumer's adapter, importing the public transaction type from this module.
 adapterImporting ∷ String → String
-adapterImporting moduleName =
+adapterImporting moduleName = adapterWith moduleName "Hetoimasia.Foundation.OwnerTx.Issuer"
+
+-- | The consumer's adapter, importing the transaction type and the bridge from these modules.
+adapterWith ∷ String → String → String
+adapterWith moduleName bridge =
   haskell
     "module Consumer.Adapter (reserveSlot) where"
-    ["import Control.Concurrent.STM (TVar, readTVar, writeTVar)", "import " <> moduleName <> " (OwnerTx)", "import Hetoimasia.Foundation.OwnerTx.Issuer (fromIssuerSTM)"]
+    ["import Control.Concurrent.STM (TVar, readTVar, writeTVar)", "import " <> moduleName <> " (OwnerTx)", "import " <> bridge <> " (fromIssuerSTM)"]
     ["reserveSlot ∷ TVar Int → OwnerTx (Either String ())", "reserveSlot free = fromIssuerSTM (readTVar free >>= \\n → if n <= 0 then pure (Left \"full\") else Right () <$ writeTVar free (n - 1))"]
 
 -- | A package whose library depends on the bridge on every target.
@@ -169,6 +168,17 @@ acceptedAndBuilt files =
     settings ← sanitizedEnvironment
     (guarded, _, guardErrors) ← run settings directory "owner-tx-guard" ["check", "--root", directory]
     (guarded, guardErrors) `shouldBe` (ExitSuccess, "")
+    (built, _, buildErrors) ← run settings directory "cabal" ["build", "--offline", "--enable-tests", "all"]
+    (built, if built == ExitSuccess then "" else buildErrors) `shouldBe` (ExitSuccess, "")
+
+-- | The guard refuses the tree with its policy diagnostic, though Cabal builds it: the refusal is the policy's, not a
+-- build failure's.
+refusedButBuilt ∷ [(FilePath, String)] → [String] → IO ()
+refusedButBuilt files said = do
+  refused files said
+  withSystemTempDirectory "hetoimasia-owner-tx-build" $ \directory → do
+    forM_ files (uncurry (writeFixtureFile directory))
+    settings ← sanitizedEnvironment
     (built, _, buildErrors) ← run settings directory "cabal" ["build", "--offline", "--enable-tests", "all"]
     (built, if built == ExitSuccess then "" else buildErrors) `shouldBe` (ExitSuccess, "")
 
@@ -214,7 +224,7 @@ spec = describe "The issuer bridge's dependency guard (tools/owner-tx-guard)" $ 
                 <> extra
       checked (changed [("vulkanpkg/vulkanpkg.cabal", native [])]) >>= (`shouldBe` (ExitSuccess, ""))
       refused
-        (changed [("vulkanpkg/vulkanpkg.cabal", native []), ("tools/validation/owner_tx_issuers.json", allowlist (baseDependents <> ["vulkanpkg:lib:vulkanpkg"]))])
+        (changed [("vulkanpkg/vulkanpkg.cabal", native []), ("tools/validation/owner_tx_issuers.fields", allowlist (baseDependents <> ["vulkanpkg:lib:vulkanpkg"]))])
         ["the listed dependent vulkanpkg:lib:vulkanpkg depends on no hetoimasia-foundation:owner-tx-issuer in any supported configuration: a stale entry"]
       refused
         (changed [("vulkanpkg/vulkanpkg.cabal", native ["        ghc-options: -package hetoimasia-foundation:owner-tx-issuer"])])
@@ -257,9 +267,9 @@ spec = describe "The issuer bridge's dependency guard (tools/owner-tx-guard)" $ 
       mentioning "extra:lib:extra (linux/" errors `shouldBe` []
 
     it "refuses a missing entry and a stale entry" $ do
-      refused (changed [("tools/validation/owner_tx_issuers.json", allowlist ["hetoimasia-foundation:test:foundation-tests"])]) ["consumer:lib:consumer (darwin/aarch64) depends on hetoimasia-foundation:owner-tx-issuer and is not a listed dependent"]
+      refused (changed [("tools/validation/owner_tx_issuers.fields", allowlist ["hetoimasia-foundation:test:foundation-tests"])]) ["consumer:lib:consumer (darwin/aarch64) depends on hetoimasia-foundation:owner-tx-issuer and is not a listed dependent"]
       refused
-        (changed [("tools/validation/owner_tx_issuers.json", allowlist (baseDependents <> ["consumer:test:gone"]))])
+        (changed [("tools/validation/owner_tx_issuers.fields", allowlist (baseDependents <> ["consumer:test:gone"]))])
         ["the listed dependent consumer:test:gone depends on no hetoimasia-foundation:owner-tx-issuer in any supported configuration: a stale entry"]
 
     it "refuses a Cabal re-export or mixin of a protected module, in a listed component too" $ do
@@ -269,8 +279,12 @@ spec = describe "The issuer bridge's dependency guard (tools/owner-tx-guard)" $ 
       refused
         (changed [("consumer/consumer.cabal", consumerWith ["    reexported-modules: hetoimasia-foundation:Hetoimasia.Foundation.OwnerTx.Issuer"])])
         ["re-exports Hetoimasia.Foundation.OwnerTx.Issuer as Hetoimasia.Foundation.OwnerTx.Issuer through reexported-modules"]
-      refused
-        (changed [("consumer/consumer.cabal", consumerWith ["    mixins: hetoimasia-foundation:owner-tx-issuer (Hetoimasia.Foundation.OwnerTx.Issuer as Consumer.Bridge)"])])
+      refusedButBuilt
+        ( changed
+            [ ("consumer/consumer.cabal", consumerWith ["    mixins: hetoimasia-foundation:owner-tx-issuer (Hetoimasia.Foundation.OwnerTx.Issuer as Consumer.Bridge)"])
+            , ("consumer/src/Consumer/Adapter.hs", adapterWith "Hetoimasia.Foundation.OwnerTx" "Consumer.Bridge")
+            ]
+        )
         ["consumer:lib:consumer (", "exposes or renames Hetoimasia.Foundation.OwnerTx.Issuer through the mixin hetoimasia-foundation:owner-tx-issuer (Hetoimasia.Foundation.OwnerTx.Issuer as Consumer.Bridge)"]
       refused
         (changed [("consumer/consumer.cabal", consumerWith ["    mixins: hetoimasia-foundation:owner-tx-issuer"])])
@@ -334,8 +348,26 @@ spec = describe "The issuer bridge's dependency guard (tools/owner-tx-guard)" $ 
       refused (imported "packages: extra\npackage *\n  ghc-options: \"-hide-all-packages\"\n") ["unsupported: the GHC option -hide-all-packages in extra.project (ghc-options), outside the guard's supported options"]
       refused (imported "packages: extra\nprogram-options\n  ghc-options: -Wall\n") ["unsupported: the project section program-options in extra.project"]
       refused (imported "packages: extra\nlibrary-vanilla: False\n") ["unsupported: the project field library-vanilla in extra.project"]
-      refused (imported "packages: extra\nif os(freebsd)\n  ghc-options: -Wall\n") ["unsupported: condition os(freebsd) in extra.project"]
-      refused (imported "packages: extra\nif impl(ghc >= 9.14)\n  ghc-options: -Wall\n") ["unsupported: condition impl(ghc >=9.14) in extra.project"]
+      refused (imported "packages: extra\nif os(freebsd)\n  package consumer\n    ghc-options: -Wall\n") ["unsupported: condition os(freebsd) in extra.project"]
+      refused (imported "packages: extra\nif impl(ghc >= 9.14)\n  package consumer\n    ghc-options: -Wall\n") ["unsupported: condition impl(ghc >=9.14) in extra.project"]
+
+    it "supports exactly this repository's project syntax: no selection or import inside a conditional, no quoted or spaced path" $ do
+      let imported text = changed [("cabal.project", "import: cabal.project.common\nimport: extra.project\npackages:\n  foundation\n  consumer\n"), ("extra.project", text)] <> extraPackage
+      checked (imported "if os(darwin)\n  package consumer\n    ghc-options: -Wall\nelse\n  package consumer\n    flags: -full\n") >>= (`shouldBe` (ExitSuccess, ""))
+      refused (imported "if os(linux)\n  packages: extra\n") ["unsupported: the project field packages inside a conditional in extra.project (only package sections)"]
+      refused (imported "packages: extra\nif os(darwin)\n  import: more.project\n") ["unsupported: the project field import inside a conditional in extra.project (only package sections)"]
+      refused (imported "if os(darwin)\n  jobs: 4\n") ["unsupported: the project field jobs inside a conditional in extra.project (only package sections)"]
+      refused (imported "packages: \"extra\"\n") ["unsupported: the package entry \"extra\" in extra.project (only unquoted literal local directories)"]
+      refused (imported "packages: extra\nimport: \"shared.project\"\n") ["unsupported: the project import \"shared.project\" in extra.project (only one unquoted literal relative local file)"]
+      refused (imported "packages: extra\nimport: shared settings.project\n") ["unsupported: the project import shared settings.project in extra.project (only one unquoted literal relative local file)"]
+
+    it "requires both project files and refuses an import cycle, while two projects may share an import" $ do
+      (missing, missingSaid) ← checked [entry | entry@(path, _) ← baseTree, path /= "cabal.project.vulkan"]
+      (missing, missingSaid) `shouldSatisfy` ((== ExitFailure 2) . fst)
+      missingSaid `shouldContain` "cabal.project.vulkan does not exist: the guard reads both project files"
+      (cycled, cycledSaid) ← checked (changed [("cabal.project", "import: cabal.project.common\npackages:\n  foundation\n  consumer\n"), ("cabal.project.common", "active-repositories: :none\nimport: cabal.project\n")])
+      cycled `shouldBe` ExitFailure 2
+      cycledSaid `shouldContain` "a cyclic project import: cabal.project → cabal.project.common → cabal.project"
 
     it "fails closed on a library selector it cannot resolve, a description Cabal refuses and an allowlist it cannot read" $ do
       refused (changed [("vulkanpkg/vulkanpkg.cabal", vulkanWith ["hetoimasia-foundation:issuer"] [])]) ["uncovered: vulkanpkg:lib:vulkanpkg selects hetoimasia-foundation:issuer, which names no library of the local package hetoimasia-foundation"]
@@ -348,21 +380,29 @@ spec = describe "The issuer bridge's dependency guard (tools/owner-tx-guard)" $ 
       (malformed, malformedSaid) ← checked (changed [("consumer/consumer.cabal", "cabal-version: 3.4\nname: consumer\nlibrary\n  exposed-modules: {\n")])
       malformed `shouldBe` ExitFailure 2
       malformedSaid `shouldContain` "consumer/consumer.cabal: Cabal refused it"
-      (missing, missingSaid) ← checked [entry | entry@(path, _) ← baseTree, path /= "tools/validation/owner_tx_issuers.json"]
+      (missing, missingSaid) ← checked [entry | entry@(path, _) ← baseTree, path /= "tools/validation/owner_tx_issuers.fields"]
       missing `shouldBe` ExitFailure 2
-      missingSaid `shouldContain` "tools/validation/owner_tx_issuers.json cannot be read"
-      (old, oldSaid) ← checked (changed [("tools/validation/owner_tx_issuers.json", "{\"schema_version\": 2, \"importers\": [], \"dependents\": [], \"exports\": []}\n")])
-      old `shouldBe` ExitFailure 2
-      oldSaid `shouldContain` "the allowlist must be an object with schema_version 3"
+      missingSaid `shouldContain` "tools/validation/owner_tx_issuers.fields cannot be read"
       forM_
-        [ ("{\"schema_version\": 03, \"dependents\": []}\n", "a number with a leading zero: 03")
-        , ("{\"schema_version\": 3.0, \"dependents\": []}\n", "a number that is not an integer")
-        , ("{\"schema_version\": 3, \"dependents\": [], \"dependents\": [{\"component\": \"consumer:lib:consumer\", \"reason\": \"x\"}]}\n", "an object that repeats the key \"dependents\"")
+        [ ("dependent\n  component: consumer:lib:consumer\n  reason: one\ndependent\n  component: consumer:lib:consumer\n  reason: two\n", "a component listed more than once: consumer:lib:consumer")
+        , ("version: 3\n", "the field version is outside a dependent section")
+        , ("importer consumer\n  component: consumer:lib:consumer\n  reason: x\n", "the section importer is not a dependent section with no arguments")
+        , ("dependent\n  component: consumer:lib:consumer\n  component: consumer:test:gone\n  reason: x\n", "a dependent section needs exactly one component (package:kind:name) and one reason")
+        , ("dependent\n  component: consumer\n  reason: x\n", "a dependent section needs exactly one component (package:kind:name) and one reason")
+        , ("{\"schema_version\": 3, \"dependents\": []}\n", "tools/validation/owner_tx_issuers.fields cannot be read")
         ]
         $ \(text, said) → do
-          (ambiguous, ambiguousSaid) ← checked (changed [("tools/validation/owner_tx_issuers.json", text)])
-          ambiguous `shouldBe` ExitFailure 2
-          ambiguousSaid `shouldContain` ("tools/validation/owner_tx_issuers.json cannot be read: " <> said)
+          (unreadable, unreadableSaid) ← checked (changed [("tools/validation/owner_tx_issuers.fields", text)])
+          unreadable `shouldBe` ExitFailure 2
+          unreadableSaid `shouldContain` said
+
+    it "resolves a mixin against its configuration's dependencies, and refuses a library selector outside the repository" $ do
+      refused
+        (changed [("cabal.project", "import: cabal.project.common\npackages:\n  foundation\n  consumer\n  extra\n")] <> [("extra/extra.cabal", unlines (cabalHeader "extra" <> ["library", "    exposed-modules: Extra", "    hs-source-dirs: src"] <> common <> ["    build-depends: base", "    mixins: hetoimasia-foundation (Hetoimasia.Foundation.OwnerTx as PublicTx)"])), ("extra/src/Extra.hs", "module Extra () where\n")])
+        ["uncovered: extra:lib:extra (darwin/aarch64) has the mixin hetoimasia-foundation, which names no dependency of that configuration"]
+      refused
+        (changed [("vulkanpkg/vulkanpkg.cabal", vulkanWith ["base:missing"] [])])
+        ["uncovered: vulkanpkg:lib:vulkanpkg selects base:missing, a library of a package outside this repository, which the guard cannot establish"]
 
     it "checks a read-only checkout without writing into it" $
       withSystemTempDirectory "hetoimasia-owner-tx-readonly" $ \directory → do
@@ -414,7 +454,7 @@ spec = describe "The issuer bridge's dependency guard (tools/owner-tx-guard)" $ 
             , "cabal.project"
             , "cabal.project.vulkan"
             , "cabal.project.common"
-            , "tools/validation/owner_tx_issuers.json"
+            , "tools/validation/owner_tx_issuers.fields"
             ]
       forM_ changedPaths $ \path →
         withSystemTempDirectory "hetoimasia-owner-tx-plan" $ \directory → do

@@ -147,13 +147,15 @@ readInventory root projects = do
       packages ← forM directories (readPackage root)
       pure (Inventory files <$> sequence packages <*> pure problems)
 
--- A project file's files read, package directories and unsupported forms, following literal local imports.
+-- A project file's files read, package directories and unsupported forms, following literal local imports depth first.
+-- A file already on the active import chain is a cycle, an error; one already read through another chain (two projects
+-- sharing an import) is read once.
 projectPackages ∷ FilePath → FilePath → IO (Either String ([FilePath], [FilePath], [String]))
-projectPackages root project = go [project] [] [] []
+projectPackages root project = fmap (\(files, directories, problems) → (reverse files, reverse directories, problems)) <$> visit [] ([], [], []) project
   where
-    go [] seen directories problems = pure (Right (reverse seen, reverse directories, problems))
-    go (file : rest) seen directories problems
-      | file `elem` seen = go rest seen directories problems
+    visit chain state@(seen, directories, problems) file
+      | file `elem` chain = pure (Left ("a cyclic project import: " <> intercalate " → " (reverse (file : chain))))
+      | file `elem` seen = pure (Right state)
       | otherwise = do
           present ← doesFileExist (root </> file)
           if not present
@@ -163,40 +165,48 @@ projectPackages root project = go [project] [] [] []
               case projectFields file bytes of
                 Left why → pure (Left why)
                 Right (entries, imports, found) → do
-                  let relativeImports = [normalise (takeDirectory file </> imported) | imported ← imports]
-                  go (rest <> relativeImports) (file : seen) (reverse (map normalise entries) <> directories) (problems <> found)
+                  let start = (file : seen, reverse (map normalise entries) <> directories, problems <> found)
+                  foldImports (file : chain) start [normalise (takeDirectory file </> imported) | imported ← imports]
+    foldImports _ state [] = pure (Right state)
+    foldImports chain state (next : rest) =
+      visit chain state next >>= \case
+        Left why → pure (Left why)
+        Right state' → foldImports chain state' rest
 
 -- The @packages:@ entries, @import:@ targets and unsupported forms of a project file, read by Cabal's own field parser
--- (which lowercases field and section names): continuation lines, and every section walked. Fields, sections and options
--- are allow-listed: anything else is unsupported, as is a condition on anything but a supported operating system or
--- architecture.
+-- (which lowercases field and section names). The guard supports exactly the project syntax this repository uses:
+-- unquoted literal @import:@s of one relative local file and @packages:@ of literal local directories at the top level;
+-- the allow-listed top-level fields; @package@ sections of allow-listed fields; and @if@/@elif@/@else@ over the supported
+-- targets whose bodies hold only @package@ sections (or further conditionals). Anything else is unsupported: package
+-- selection or an import inside a conditional, a quoted or URI path, another field, section, option or condition.
 projectFields ∷ FilePath → ByteString.ByteString → Either String ([String], [String], [String])
 projectFields file bytes = case readFields bytes of
   Left failure → Left (file <> ": Cabal refused it: " <> show failure)
-  Right fields → Right (walk False fields)
+  Right fields → Right (walk Top fields)
   where
-    walk inPackage fields =
-      let results = map (one inPackage) fields
+    walk place fields =
+      let results = map (one place) fields
        in (concatMap (\(e, _, _) → e) results, concatMap (\(_, i, _) → i) results, concatMap (\(_, _, p) → p) results)
-    one inPackage = \case
+    one place = \case
       Field (Name _ name) contents →
         let key = fromUTF8BS name
             text = unwords [fromUTF8BS line | FieldLine _ line ← contents]
             values = words (map (\c → if c == ',' then ' ' else c) text)
-         in case key of
-              "packages" | not inPackage → (values, [], entryProblems values)
-              "import" | not inPackage → ([], values, importProblems values)
-              _
-                | key `elem` (if inPackage then projectPackageFields else projectFieldsAllowed) →
-                    ([], [], if key `elem` optionFields then optionProblems (file <> " (" <> key <> ")") text else [])
-                | otherwise → ([], [], ["unsupported: the project field " <> key <> " in " <> file])
+         in case (place, key) of
+              -- an unsupported entry is reported, not followed
+              (Top, "packages") → ([value | value ← values, not (nonLiteral value)], [], entryProblems values)
+              (Top, "import") → ([], [trim text | null (importProblems (trim text))], importProblems (trim text))
+              (Conditional, _) → ([], [], ["unsupported: the project field " <> key <> " inside a conditional in " <> file <> " (only package sections)"])
+              (InPackage, _) | key `elem` projectPackageFields → ([], [], if key `elem` optionFields then optionProblems (file <> " (" <> key <> ")") text else [])
+              (Top, _) | key `elem` projectFieldsAllowed → ([], [], [])
+              _ → ([], [], ["unsupported: the project field " <> key <> " in " <> file])
       Section (Name _ name) arguments inner →
         let key = fromUTF8BS name
          in case key of
-              "package" | not inPackage → walk True inner
+              "package" | place /= InPackage → walk InPackage inner
               _
-                | key `elem` ["if", "elif"] → let (e, i, p) = walk inPackage inner in (e, i, conditionProblems arguments <> p)
-                | key == "else" → walk inPackage inner
+                | key `elem` ["if", "elif"], place /= InPackage → let (e, i, p) = walk Conditional inner in (e, i, conditionProblems arguments <> p)
+                | key == "else", place /= InPackage → walk Conditional inner
                 | otherwise → ([], [], ["unsupported: the project section " <> key <> " in " <> file])
     conditionProblems arguments = case runParseResult (parseConditionConfVar arguments) of
       (_, Left _) → ["unsupported: a condition Cabal cannot read in " <> file]
@@ -211,9 +221,17 @@ projectFields file bytes = case readFields bytes of
       Arch arch → ["arch(" <> prettyShow arch <> ")"]
       PackageFlag flag → ["flag(" <> unFlagName flag <> ")"]
       Impl flavour range → ["impl(" <> prettyShow flavour <> " " <> prettyShow range <> ")"]
-    remote entry = any (`isInfixOf` entry) ["://", "*", "?", "[", "{"] || any (`isSuffixOf` entry) [".tar.gz", ".cabal"]
-    entryProblems entries = ["unsupported: the package entry " <> entry <> " in " <> file <> " (only literal local directories)" | entry ← entries, remote entry]
-    importProblems imports = ["unsupported: the project import " <> entry <> " in " <> file <> " (only literal local files)" | entry ← imports, remote entry]
+    trim = reverse . dropWhile (== ' ') . reverse . dropWhile (== ' ')
+    nonLiteral entry = any (`isInfixOf` entry) ["://", "*", "?", "[", "{", "\"", "'"] || any (`isSuffixOf` entry) [".tar.gz", ".cabal"]
+    entryProblems entries = ["unsupported: the package entry " <> entry <> " in " <> file <> " (only unquoted literal local directories)" | entry ← entries, nonLiteral entry]
+    importProblems entry =
+      [ "unsupported: the project import " <> entry <> " in " <> file <> " (only one unquoted literal relative local file)"
+      | null entry || nonLiteral entry || any (`elem` " \t") entry || take 1 entry == "/"
+      ]
+
+-- Where a project field or section sits.
+data ProjectPlace = Top | InPackage | Conditional
+  deriving (Eq)
 
 -- The project fields the guard supports: package selection and imports, and settings that change no package's
 -- visibility. Inside a @package@ stanza, its flags, tests, optimisation, native search paths and allow-listed options.
