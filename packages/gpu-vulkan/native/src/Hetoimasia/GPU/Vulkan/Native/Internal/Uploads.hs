@@ -59,6 +59,7 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Uploads
   , submitUploadGranted
   , abandonUploadGrant
   , returnUploadGrant
+  , grantBoundAs
 
     -- * Tickets
   , UploadTicket
@@ -772,6 +773,15 @@ returnUploadGrant grant = do
           writeTVar (uploadGrantCell grant) GrantAbandoned
           writeTVar (grantOwner grant) state {stateGrants = Map.delete (grantNumber grant) (stateGrants state)}
     _ → pure ()
+
+-- | Whether this ticket is the upload this reservation was spent on: the
+-- reservation is spent, and the ticket's upload has the number the
+-- reservation's binding gave it. A ticket of any other upload is not. It
+-- reads only the reservation's own cell.
+grantBoundAs ∷ UploadGrant → UploadTicket → STM Bool
+grantBoundAs grant ticket = do
+  standing ← readTVar (uploadGrantCell grant)
+  pure (standing == GrantSpent && ticketUpload ticket == grantNumber grant)
 
 -- | Abandon a reservation, from any thread: its place and region are free
 -- again. A spent, abandoned or foreign one changes nothing.

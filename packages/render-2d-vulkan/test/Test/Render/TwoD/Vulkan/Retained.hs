@@ -601,6 +601,25 @@ refusalSpec = describe "refusing a build" $ do
         other → expectationFailure ("expected the release's cause, found " <> show other)
       reservedOf setup `shouldReturn` 0
 
+  it "refuses a spend whose upload answers another upload's ticket without spending: the buffer is released, nothing is registered and the reservation returns" $
+    bounded . withSetup $ \setup → do
+      -- a ticket of an earlier, real upload
+      earlier ← newIORef Nothing
+      let capturing = (trackedBuilders setup) {bufferUploads = observingSpends (\spend grant buffer bytes → spend grant buffer bytes >>= \answer → answer <$ either (const (pure ())) (writeIORef earlier . Just) answer) (bufferUploads (trackedBuilders setup))}
+      _ ← buildRetainedChunk capturing (setupRetained setup) artMarks ChunkWorldDepth DeriveBounds [cutAt 0 1] >>= either (fail . show) pure
+      ticket ← readIORef earlier >>= maybe (fail "no ticket was captured") pure
+      held ← liveChunks (setupRetained setup)
+      -- the next spend answers it without spending its own reservation
+      let forging = (trackedBuilders setup) {bufferUploads = observingSpends (\_ _ _ _ → pure (Right ticket)) (bufferUploads (trackedBuilders setup))}
+      prepared ← either (fail . show) pure (prepareRetainedChunk artMarks ChunkWorldDepth DeriveBounds Map.empty [cutAt 1 1])
+      grant ← atomically (admitRetainedChunk (bufferUploads forging) (setupRetained setup) prepared) >>= either (fail . show) pure
+      reservedOf setup `shouldReturn` 1
+      spendChunkGrant forging (setupRetained setup) grant >>= \case
+        Left (BuildRefused BuildUploadUnbound (AllocationReleased _ (Right ()))) → pure ()
+        other → expectationFailure ("expected the unbound answer refused with its buffer released, found " <> show other)
+      liveChunks (setupRetained setup) `shouldReturn` held
+      reservedOf setup `shouldReturn` 0
+
   it "sweeps a sealed registration whose collector never ran at the registry's teardown: claimed once, with its chunk, and the registry holds no receipt after" $
     bounded . withSetup $ \setup → do
       grant ← admittedGrant setup [cutAt 0 1]
