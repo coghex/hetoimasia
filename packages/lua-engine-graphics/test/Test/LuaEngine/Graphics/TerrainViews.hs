@@ -10,6 +10,7 @@
 -- disposed of and when it may be, how each operation settled. None asserts an order, a step count or a timing.
 module Test.LuaEngine.Graphics.TerrainViews (spec) where
 
+import Control.Concurrent (forkIO)
 import Control.Concurrent.STM
 import Control.Monad (forM, forM_, unless, void, when)
 import qualified Data.ByteString.Char8 as BC
@@ -2220,6 +2221,46 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         listed ← atomically (readingListed <$> readView view)
         Map.findWithDefault 0 1 (serviceOccupied now) `shouldBe` listed
         (servicePending now, servicePrivate now, serviceSwept now) `shouldBe` (0, 0, [])
+
+    it "goes on with a candidate whose refusal before any buffer is collected stale after its target's facts moved with equal geometry: its slot settles once and the view publishes" $
+      withRig defaultOptions {optProfile = smallProfile {profileSlots = 4, profileQuads = 2048}} $ \rig → do
+        let reading = readTerrainViews (rigViews rig)
+        target ← newTarget 1
+        moved ← newTVarIO False
+        atomically $ do
+          writeTVar (rigFailNext rig) [Just (BuildFailed "an injected refusal" NotAllocated)]
+          -- between the two boundaries: the target's facts move to a new version with the same geometry, so the refusal
+          -- is collected stale, and nothing else (no frame, no edit) asks for a step
+          writeTVar (rigBeforeCollect rig) (Just (atomically (setHeldUsable (targetHeld target) True >> writeTVar moved True)))
+        view ← openOn rig target
+        settleUntil rig (publishedAtLeast view 1)
+        readTVarIO moved `shouldReturn` True
+        now ← atomically reading
+        listed ← atomically (readingListed <$> readView view)
+        Map.findWithDefault 0 1 (serviceOccupied now) `shouldBe` listed
+        (servicePending now, serviceFailures now, serviceSwept now) `shouldBe` (0, [], [])
+        readTVarIO (rigGrants rig) `shouldReturn` 0
+
+    it "holds an orphan whose upload still runs during the drain as work the owner cannot take, and releases it once when its upload settles" $ do
+      let orphan = chunkRef 9001 1
+      heldAttempts ← newEmptyTMVarIO
+      outcome ← timeout 20000000 . withRig defaultOptions $ \rig → do
+        sealed ← newTVarIO (Just (Right orphan))
+        atomically $ do
+          modifyTVar' (rigRegistry rig) (Map.insert 9000 sealed)
+          modifyTVar' (rigStandings rig) (Map.insert orphan ChunkUploading)
+        -- the drain's teardown sweep takes the chunk as an orphan while its upload runs: the owner has no retirement work
+        -- it can take; then the upload settles
+        _ ← forkIO $ do
+          atomically (readTerrainViews (rigViews rig) >>= check . any ((== 9000) . fst) . serviceUnheld)
+          held ← atomically (readTerrainViews (rigViews rig))
+          attempts ← Map.findWithDefault 0 orphan <$> readTVarIO (rigAttempts rig)
+          atomically (modifyTVar' (rigStandings rig) (Map.insert orphan ChunkReady) >> putTMVar heldAttempts (serviceRetirementReady held, attempts))
+        pure (rigDisposed rig, rigAttempts rig)
+      (disposed, attempts) ← maybe (fail "the drain never ended") pure outcome
+      atomically (takeTMVar heldAttempts) `shouldReturn` (False, 0)
+      filter (== orphan) <$> readTVarIO disposed `shouldReturn` [orphan]
+      Map.lookup orphan <$> readTVarIO attempts `shouldReturn` Just 1
 
     it "keeps the cause of a refused build no view held when the registry's teardown sweep claims it, though it made no buffer" $ do
       views ← withRig defaultOptions $ \rig → do

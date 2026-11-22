@@ -2180,7 +2180,12 @@ stepBuilding service hands vs serial prep candidate
                         Just False <$ mapM_ rethrowIO pending
                   -- the revalidation would wait: the sweep collects the build, and the step yields
                   Right Nothing → Just False <$ atomically (relinquish service key "its revalidation would wait")
-                  Right (Just evidence) → atomically (collectBuild service vs serial basis evidence key) <&> \taken → if taken then Nothing else Just False
+                  Right (Just evidence) →
+                    atomically (collectBuild service vs serial basis evidence key) <&> \case
+                      Nothing → Nothing
+                      -- not the candidate's part: what the surviving candidate can do next decides whether the step goes on
+                      Just CandidateRunnable → Just True
+                      Just _ → Just False
           Just (c, NextPublish) → Just <$> publish service vs serial prep c
           Just (_, NextBlocked) → pure (Just False)
           Just (_, NextFailed why) → Just False <$ atomically (refuse service vs serial basis (LimitFailure ("a chunk's upload ended without completing: " <> why)))
@@ -2208,30 +2213,35 @@ describedText raised =
 -- code, the receipt is claimed and its pending entry goes. The part goes to the candidate when the attempt that granted
 -- it is still the view's: the revalidation's evidence found the work current and the live versions are the evidence's
 -- (no source changed since), and the candidate's head is this part; otherwise to private retirement. A failure records
--- what it left, and, for the current attempt, its refusal. Answers whether the candidate took the part. A build already
--- swept, or not yet sealed, is left as it is.
-collectBuild ∷ (Ord k, Show k) ⇒ TerrainViews k → ViewState k → Word64 → Basis → Witness → Word64 → STM Bool
-collectBuild service vs serial basis evidence key =
-  Map.lookup key <$> readTVar (svPending service) >>= \case
-    Nothing → pure False
-    Just entry →
-      receiptClaim (pbReceipt entry) >>= \case
-        Nothing → pure False
-        Just outcome → do
-          modifyTVar' (svPending service) (Map.delete key)
-          -- the evidence against the writers' cells now: no source changed since the revalidation read it
-          now ← liveWitness service vs
-          let current = pbSerial entry == serial && currentBy serial basis Nothing evidence && evidence == now
-          stage ← readTVar (vsStage vs)
-          case (outcome, stage) of
-            (Right chunk, Building p c)
-              | current
-              , (part, _, instances, records) Seq.:< rest ← Seq.viewl (cdPrepared c)
-              , part == pbPart entry →
-                  True <$ writeTVar (vsStage vs) (Building p c {cdBuilt = Map.insert part (Part chunk instances records) (cdBuilt c), cdPrepared = rest})
-            (Left failure@(BuildFailed why _), Building _ _)
-              | current → False <$ (failureLeft service entry failure >> enterRefusal service vs basis (LimitFailure ("a chunk could not be built: " <> why)))
-            _ → False <$ retireOutcome service entry outcome
+-- what it left, and, for the current attempt, its refusal. Answers 'Nothing' when the candidate took the part, and
+-- otherwise, once what the build left is accounted, the surviving candidate's next work ('applyCandidateWork'). A build
+-- already swept, or not yet sealed, is left as it is.
+collectBuild ∷ (Ord k, Show k) ⇒ TerrainViews k → ViewState k → Word64 → Basis → Witness → Word64 → STM (Maybe CandidateWork)
+collectBuild service vs serial basis evidence key = do
+  collected ← collect
+  if collected then pure Nothing else Just <$> applyCandidateWork service vs
+  where
+    collect =
+      Map.lookup key <$> readTVar (svPending service) >>= \case
+       Nothing → pure False
+       Just entry →
+         receiptClaim (pbReceipt entry) >>= \case
+           Nothing → pure False
+           Just outcome → do
+             modifyTVar' (svPending service) (Map.delete key)
+             -- the evidence against the writers' cells now: no source changed since the revalidation read it
+             now ← liveWitness service vs
+             let current = pbSerial entry == serial && currentBy serial basis Nothing evidence && evidence == now
+             stage ← readTVar (vsStage vs)
+             case (outcome, stage) of
+               (Right chunk, Building p c)
+                 | current
+                 , (part, _, instances, records) Seq.:< rest ← Seq.viewl (cdPrepared c)
+                 , part == pbPart entry →
+                     True <$ writeTVar (vsStage vs) (Building p c {cdBuilt = Map.insert part (Part chunk instances records) (cdBuilt c), cdPrepared = rest})
+               (Left failure@(BuildFailed why _), Building _ _)
+                 | current → False <$ (failureLeft service entry failure >> enterRefusal service vs basis (LimitFailure ("a chunk could not be built: " <> why)))
+               _ → False <$ retireOutcome service entry outcome
 
 -- A build collected in place of its view, or no longer its view's: a registered chunk to private retirement, a failure
 -- to the ledger that keeps what it left.
@@ -2259,12 +2269,16 @@ sweepPending ∷ Ord k ⇒ TerrainViews k → STM Bool
 sweepPending service = do
   pending ← Map.toList <$> readTVar (svPending service)
   swept ←
-    fmap or . forM [(key, entry, why) | (key, entry) ← pending, Just why ← [pbSweep entry]] $ \(key, entry, why) →
+    fmap catMaybes . forM [(key, entry, why) | (key, entry) ← pending, Just why ← [pbSweep entry]] $ \(key, entry, why) →
       receiptClaim (pbReceipt entry) >>= \case
-        Nothing → pure False
-        Just outcome → True <$ sweptBuild service key entry outcome why
-  when swept (writeTVar (svKickWanted service) True)
-  pure swept
+        Nothing → pure Nothing
+        Just outcome → Just (pbView entry) <$ sweptBuild service key entry outcome why
+  -- once what the swept builds left is accounted, each surviving candidate's next work decides: a runnable one asks for
+  -- the owner's step, a waiting one is armed
+  views ← readTVar (svViews service)
+  decisions ← forM (Set.toList (Set.fromList swept)) $ \view → maybe (pure CandidateEnded) (applyCandidateWork service) (Map.lookup view views)
+  when (CandidateRunnable `elem` decisions) (writeTVar (svKickWanted service) True)
+  pure (not (null swept))
 
 -- A build the sweep collected: its pending entry goes, what it left is retired, and the record keeps both causes.
 sweptBuild ∷ Ord k ⇒ TerrainViews k → Word64 → PendingBuild k → Either BuildFailure ChunkRef → Text → STM ()
@@ -2337,15 +2351,39 @@ nextPart service vs candidate admitNext = do
 -- Whether an armed view's candidate can go on: a part still to prepare, or the candidate's one decision ('nextPart',
 -- observed) no longer blocked. Any other stage than building: yes (whatever replaced it asked for its own step).
 buildActionable ∷ Ord k ⇒ TerrainViews k → ViewState k → STM Bool
-buildActionable service vs =
-  readTVar (vsStage vs) >>= \case
-    Building _ candidate
-      | not (null (cdWanted candidate)) → pure True
-      | otherwise →
-          nextPart service vs candidate (fmap (fmap (const ())) . ownerRoom (portOwner (svPorts service))) <&> \case
-            NextBlocked → False
-            _ → True
-    _ → pure True
+buildActionable service vs = (/= CandidateWaiting) <$> nextCandidateWork service vs
+
+-- | What a view's candidate can do next: the one decision the collection, the sweep and the watcher share. Runnable work
+-- (a preparation overtaken by its basis, a part still to prepare, or the candidate's one decision, 'nextPart', not
+-- blocked); a wait on the target's slots, the uploads' room or the built parts' standings, which the watcher observes
+-- once the view is armed; or an ended view. Any stage but building asks for its own step: runnable.
+data CandidateWork = CandidateRunnable | CandidateWaiting | CandidateEnded
+  deriving (Eq, Show)
+
+nextCandidateWork ∷ Ord k ⇒ TerrainViews k → ViewState k → STM CandidateWork
+nextCandidateWork service vs = do
+  status ← readTVar (vsStatus vs)
+  stage ← readTVar (vsStage vs)
+  case (status, stage) of
+    (ViewEnded _, _) → pure CandidateEnded
+    (ViewOpen, Building prep candidate) → do
+      basis ← currentBasis service vs
+      if
+        | prepBasis prep /= basis → pure CandidateRunnable
+        | not (null (cdWanted candidate)) → pure CandidateRunnable
+        | otherwise →
+            nextPart service vs candidate (fmap (fmap (const ())) . ownerRoom (portOwner (svPorts service))) <&> \case
+              NextBlocked → CandidateWaiting
+              _ → CandidateRunnable
+    (ViewOpen, _) → pure CandidateRunnable
+
+-- Apply the candidate's next work where a collection or a sweep left it: a waiting candidate is armed, so the watcher
+-- asks for the owner's step once the same decision lets it go on. Answers the decision.
+applyCandidateWork ∷ Ord k ⇒ TerrainViews k → ViewState k → STM CandidateWork
+applyCandidateWork service vs = do
+  work ← nextCandidateWork service vs
+  when (work == CandidateWaiting) (writeTVar (vsArmed vs) True)
+  pure work
 
 occupy ∷ Ord k ⇒ TerrainViews k → k → Int → STM ()
 occupy service key n = modifyTVar' (svSlots service) (Map.alter (\held → nonZero (fromMaybe 0 held + n)) key)
@@ -2479,17 +2517,14 @@ retire service hands = do
   -- at the service's end, the registry's teardown sweep: every sealed receipt no view collected
   closing ← not <$> readTVarIO (svOpen service)
   registry ← if closing then atomically (handSweepReceipts hands >>= registrySwept service) else pure False
-  -- one orphan at a time, named in hand until its release's outcome is recorded
+  -- one orphan at a time, named in hand until its release's outcome is recorded: the selection readiness asks about
   orphaned ← atomically $ do
-    inHand ← readTVar (svOrphanInHand service)
-    orphans ← readTVar (svOrphans service)
-    ready ← filterM notUploading orphans
-    case (inHand, ready) of
-      (Nothing, chunk : _) → Just chunk <$ (writeTVar (svOrphans service) (filter (/= chunk) orphans) >> writeTVar (svOrphanInHand service) (Just chunk))
-      _ → pure Nothing
+    selected ← retirementOrphan <$> nextRetirement service
+    for_ selected $ \chunk → modifyTVar' (svOrphans service) (filter (/= chunk)) >> writeTVar (svOrphanInHand service) (Just chunk)
+    pure selected
   forM_ orphaned releaseOrphan
   picked ← atomically $ do
-    chosen ← take budget <$> disposable service
+    chosen ← retirementHeld <$> nextRetirement service
     let taken (key, view, chunk) = (key, view, chunk) `elem` chosen
     modifyTVar' (svPrivate service) (filter (not . taken))
     modifyTVar' (svRetiring service) (Seq.filter (not . null . rtChunks) . fmap (\entry → entry {rtChunks = filter (\chunk → not (taken (rtTarget entry, rtView entry, chunk))) (rtChunks entry)}))
@@ -2498,8 +2533,6 @@ retire service hands = do
   forM_ picked releaseOne
   pure (confirmed || registry || isJust orphaned || not (null picked))
   where
-    budget = 64
-    notUploading chunk = (/= Just ChunkUploading) <$> ownerStanding (portOwner (svPorts service)) chunk
     releaseOrphan chunk =
       mask $ \_ →
         handDispose hands chunk >>= \outcome → atomically $ do
@@ -2590,18 +2623,45 @@ disposalFailure entry cause = case entry of
   DisposeChunk (key, _, chunk) → (key, Just chunk, cause)
   DisposeAllocation key _ identity primary → (key, Nothing, "a failed build's buffer " <> identity <> " (the build failed: " <> primary <> "): " <> cause)
 
--- Whether the owner has retirement work it can do now.
-retirementReady ∷ Ord k ⇒ TerrainViews k → STM Bool
-retirementReady service = do
-  candidates ← disposable service
+-- | The retirement work the owner can take now, the one selection readiness and the owner's release share: the next
+-- orphan to take in hand (none in hand, and its upload no longer running), the chunks it can release (at most a step's
+-- budget), whether a disposal the backend was asked for has finished, and, at the service's end, whether a sealed receipt
+-- no view collected awaits the registry's teardown sweep.
+data Retirement k = Retirement
+  { retirementOrphan ∷ !(Maybe ChunkRef)
+  , retirementHeld ∷ ![Held k]
+  , retirementConfirmable ∷ !Bool
+  , retirementSweepable ∷ !Bool
+  }
+
+nextRetirement ∷ Ord k ⇒ TerrainViews k → STM (Retirement k)
+nextRetirement service = do
+  inHand ← readTVar (svOrphanInHand service)
+  orphans ← readTVar (svOrphans service)
+  ready ← filterM notUploading orphans
+  held ← take 64 <$> disposable service
   disposing ← readTVar (svDisposing service)
   finished ← or <$> forM disposing (\(_, reading) → (/= DisposalPending) <$> reading)
-  orphans ← readTVar (svOrphans service)
   orphanFinished ← readTVar (svOrphansDisposing service) >>= fmap or . mapM (\(_, reading) → (/= DisposalPending) <$> reading)
-  -- at the service's end, a sealed receipt no view collected is the registry's teardown sweep's
   closing ← not <$> readTVar (svOpen service)
   (_, sealed) ← ownerReceiptsHeld (portOwner (svPorts service))
-  pure (not (null candidates) || finished || not (null orphans) || orphanFinished || (closing && sealed > 0))
+  pure
+    Retirement
+      { retirementOrphan = case (inHand, ready) of
+          (Nothing, chunk : _) → Just chunk
+          _ → Nothing
+      , retirementHeld = held
+      , retirementConfirmable = finished || orphanFinished
+      , retirementSweepable = closing && sealed > 0
+      }
+  where
+    notUploading chunk = (/= Just ChunkUploading) <$> ownerStanding (portOwner (svPorts service)) chunk
+
+-- Whether the owner has retirement work it can do now: whether the selection it would take can advance.
+retirementReady ∷ Ord k ⇒ TerrainViews k → STM Bool
+retirementReady service = advances <$> nextRetirement service
+  where
+    advances retirement = isJust (retirementOrphan retirement) || not (null (retirementHeld retirement)) || retirementConfirmable retirement || retirementSweepable retirement
 
 -- ---------------------------------------------------------------------------
 -- Observation
@@ -2714,9 +2774,12 @@ data ServiceReading k = ServiceReading
     -- nanoseconds: planning, the camera, builds, publication and retirement.
   , serviceOwnerStepMax ∷ !Word64
     -- ^ The greatest time of one owner step, in nanoseconds.
+  , serviceRetirementReady ∷ !Bool
+    -- ^ Whether the owner has retirement work it can take now: the selection its release takes ('nextRetirement') can
+    -- advance.
   }
 
-readTerrainViews ∷ TerrainViews k → STM (ServiceReading k)
+readTerrainViews ∷ Ord k ⇒ TerrainViews k → STM (ServiceReading k)
 readTerrainViews service =
   ServiceReading
     <$> (Map.size <$> readTVar (svViews service))
@@ -2734,3 +2797,4 @@ readTerrainViews service =
     <*> readTVar (svPlanningStepMax service)
     <*> ((\a b → max a b) <$> readTVar (svOwnerMax service) <*> readTVar (svOwnerFrame service))
     <*> readTVar (svOwnerStepMax service)
+    <*> retirementReady service
