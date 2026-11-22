@@ -9,7 +9,7 @@
 -- and a refusal of either leaves all three as they were.
 --
 -- This module imports the bridge, so its component, @hetoimasia-foundation:test:foundation-tests@, depends on the
--- @owner-tx-issuer@ sublibrary, and @tools/validation/owner_tx_issuers.fields@ lists that component.
+-- @owner-tx-issuer@ sublibrary, and @tools/validation/owner-tx-issuers.fields@ lists that component.
 module Test.Foundation.Ownership.Composition (spec) where
 
 import Control.Concurrent.STM (TVar, newTVarIO, readTVar, readTVarIO, writeTVar)

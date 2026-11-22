@@ -97,6 +97,7 @@ check allowlist inventory =
     -- what Cabal builds; an unbuildable configuration is only diagnosed
     configurations = filter configBuildable everyConfiguration
     libraries = Map.fromList [(packageName package', packageLibraries package') | package' ← packages]
+    manifests = Map.fromList [(packageName package', packageCabal package') | package' ← packages]
     exposedModules = Map.fromList [((packageName package', label), modules) | package' ← packages, (label, modules) ← packageExposed package']
     dependents =
       [ configuration
@@ -158,23 +159,23 @@ check allowlist inventory =
     -- every selector in any branch of any component, buildable or not, of a dependency or a mixin
     selectors =
       nub
-        [ "uncovered: " <> component <> " selects " <> dependency <> ":" <> library <> ", which names no library of the local package " <> dependency
+        [ packageCabal package' <> ": uncovered: " <> component <> " selects " <> dependency <> ":" <> library <> ", which names no library of the local package " <> dependency <> " (" <> places <> ")"
         | package' ← packages
-        , (component, dependency, library) ← packageSelectors package'
+        , (component, dependency, library, places) ← packageSelectors package'
         , Just known ← [Map.lookup dependency libraries]
         , library `notElem` known
         ]
         <> nub
-          [ "uncovered: " <> component <> " selects " <> dependency <> ":" <> library <> ", a library of a package outside this repository, which the guard cannot establish"
+          [ packageCabal package' <> ": uncovered: " <> component <> " selects " <> dependency <> ":" <> library <> ", a library of a package outside this repository, which the guard cannot establish (" <> places <> ")"
           | package' ← packages
-          , (component, dependency, library) ← packageSelectors package'
+          , (component, dependency, library, places) ← packageSelectors package'
           , Nothing ← [Map.lookup dependency libraries]
           , not (null library)
           ]
     -- every mixin includes a library its configuration depends on
     unresolvedMixins =
       nub
-        [ "uncovered: " <> configurationId configuration <> " has the mixin " <> mixinPackage mixin <> (if null (mixinLibrary mixin) then "" else ":" <> mixinLibrary mixin) <> ", which names no dependency of that configuration"
+        [ Map.findWithDefault "" (configPackage configuration) manifests <> ": uncovered: " <> configurationId configuration <> " has the mixin " <> mixinPackage mixin <> (if null (mixinLibrary mixin) then "" else ":" <> mixinLibrary mixin) <> ", which names no dependency of that configuration"
         | configuration ← everyConfiguration
         , mixin ← configMixins configuration
         , not (or [package' == mixinPackage mixin && mixinLibrary mixin `elem` selected | (package', selected) ← configDependencies configuration])

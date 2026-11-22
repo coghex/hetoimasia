@@ -65,7 +65,7 @@ extra-source-files:
     tools/validation/owned_starts.py
     tools/validation/owned_starts.json
     tools/validation/owned_starts_baseline.json
-    tools/validation/owner_tx_issuers.fields
+    tools/validation/owner-tx-issuers.fields
     tools/validation/plan.py
     tools/validation/plan_repository.py
     tools/validation/plan_cabal.py
@@ -199,7 +199,7 @@ executable hetoimasia
 
 -- The dependency guard of the ownership transactions' issuer bridge (#721):
 -- Cabal's parser for the components and their dependencies, re-exports and
--- mixins, and the allowlist tools/validation/owner_tx_issuers.fields. The validation group
+-- mixins, and the allowlist tools/validation/owner-tx-issuers.fields. The validation group
 -- test.owner-tx-guard runs it against the repository, workflow-tests against
 -- fixtures.
 executable owner-tx-guard

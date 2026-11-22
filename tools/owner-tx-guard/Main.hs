@@ -5,7 +5,7 @@
 --
 -- Cabal supplies the components, their configurations, dependencies, re-exports, mixins and declared modules
 -- ("Inventory"); the guard compares those facts with the exact component allowlist
--- @tools/validation/owner_tx_issuers.fields@ ("Policy"). It reads no Haskell source and needs no compiler or store.
+-- @tools/validation/owner-tx-issuers.fields@ ("Policy"). It reads no Haskell source and needs no compiler or store.
 --
 -- @owner-tx-guard check [--root DIR]@ fails (exit 1) on any problem and refuses (exit 2) what it cannot read.
 -- @owner-tx-guard scope [--root DIR]@ prints every project file and package description the check reads, one
@@ -25,7 +25,7 @@ import System.FilePath ((</>))
 import System.IO (hPutStrLn, hSetEncoding, stderr, stdout, utf8)
 
 allowlistPath ∷ FilePath
-allowlistPath = "tools/validation/owner_tx_issuers.fields"
+allowlistPath = "tools/validation/owner-tx-issuers.fields"
 
 main ∷ IO ()
 main = do

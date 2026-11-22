@@ -1,7 +1,7 @@
 -- | The issuer bridge: how an issuer embeds a concrete operation over its own 'STM' and its existing state into an
 -- ownership transaction ("Hetoimasia.Foundation.OwnerTx").
 --
--- __Who may depend on it.__ Only the components @tools/validation/owner_tx_issuers.fields@ lists. The repository's
+-- __Who may depend on it.__ Only the components @tools/validation/owner-tx-issuers.fields@ lists. The repository's
 -- dependency guard (@tools/owner-tx-guard@) refuses any other component that depends on this sublibrary
 -- (@hetoimasia-foundation:owner-tx-issuer@) and any Cabal re-export or mixin of this module or of the representation,
 -- in a listed component too. Issuer review checks what a listed component's modules import and export: an issuer

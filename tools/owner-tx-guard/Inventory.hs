@@ -73,9 +73,9 @@ data Package = Package
     -- ^ Its libraries' labels: the empty string for the main library, otherwise the sublibrary's name.
   , packageExposed ∷ [(String, [String])]
     -- ^ Each library's exposed modules, in any branch.
-  , packageSelectors ∷ [(String, String, String)]
+  , packageSelectors ∷ [(String, String, String, String)]
     -- ^ Every library selector in any branch of any component, of a dependency or a mixin: the component, the selected
-    -- package and its library label.
+    -- package, its library label, and the configurations it appears in.
   , packageConfigurations ∷ [Configuration]
   , packageProblems ∷ [String]
   }
@@ -98,6 +98,11 @@ data Configuration = Configuration
     -- ^ The modules it declares (exposed and other).
   , configPublic ∷ Bool
     -- ^ A library with @visibility: public@ (always true of a main library).
+  , configOptions ∷ [String]
+    -- ^ Its compiler options, as Cabal tokenized them.
+  , configSignatures ∷ [String]
+  , configSelectors ∷ [(String, String)]
+    -- ^ Every package and library label its dependencies and mixins select.
   , configBuildable ∷ Bool
     -- ^ Whether Cabal builds it: an unbuildable configuration is diagnosed for unsupported forms but selects nothing.
   }
@@ -272,8 +277,9 @@ readPackage root directory = do
 
 -- Every distinct configuration of every component, and the package's unsupported forms.
 configurations ∷ FilePath → FilePath → [PWarning] → GenericPackageDescription → IO Package
-configurations directory cabal warnings description = do
-  let configs =
+configurations directory cabal warnings description = pure (Package name directory cabal libraries exposed selectors configs (problems <> treeProblems))
+  where
+    configs =
         [ Configuration
             { configPackage = name
             , configKind = builtKind built
@@ -286,6 +292,9 @@ configurations directory cabal warnings description = do
             , configReexports = builtReexports built
             , configModules = map prettyShow (builtModules built)
             , configPublic = builtPublic built
+            , configOptions = optionsOf info
+            , configSignatures = map prettyShow (builtSignatures built)
+            , configSelectors = selectorsOf info
             , configBuildable = buildable info
             }
         | (target, flagSets, built) ← groups entries
@@ -293,8 +302,10 @@ configurations directory cabal warnings description = do
               info = builtInfo built
               place = name <> ":" <> builtKind built <> ":" <> builtName built <> " (" <> targetLabel target <> (if null flagsLabel then "" else " " <> flagsLabel) <> ")"
         ]
-  pure (Package name directory cabal libraries exposed selectors configs (problems <> treeProblems))
-  where
+    -- the configurations of a component in which a fact holds, or the branch no supported configuration selects
+    whereIn owner holds = case [configurationId configuration | configuration ← configs, componentId configuration == owner, holds configuration] of
+      [] → "in a branch no supported configuration selects"
+      found → "in " <> intercalate ", " found
     name = unPackageName (pkgName (package (packageDescription description)))
     libraries = ["" | Just _ ← [condLibrary description]] <> [unUnqualComponentName sub | (sub, _) ← condSubLibraries description]
     libraryTrees = [(name, "", tree) | Just tree ← [condLibrary description]] <> [(unUnqualComponentName sub, unUnqualComponentName sub, tree) | (sub, tree) ← condSubLibraries description]
@@ -313,17 +324,21 @@ configurations directory cabal warnings description = do
     treeProblems =
       nub $
         concat
-          [ ["unsupported: signatures " <> unwords (map prettyShow sigs) <> " in " <> place | not (null sigs)]
-              <> [why <> " in " <> place | why ← optionsProblems info]
+          [ [ cabal <> ": unsupported: signatures " <> unwords (map prettyShow sigs) <> " in " <> place <> " (" <> whereIn place (\c → any ((`elem` configSignatures c) . prettyShow) sigs) <> ")"
+            | not (null sigs)
+            ]
+              <> [ cabal <> ": unsupported: the GHC option " <> option <> ", outside the guard's supported options in " <> place <> " (" <> whereIn place ((option `elem`) . configOptions) <> ")"
+                 | option ← optionsOf info
+                 , not (supportedOption option)
+                 ]
           | (place, info, sigs) ← everyNode
           ]
     selectors =
-      nub $
-        concat
-          [ [(place, unPackageName (depPkgName dependency), libraryLabel selected) | dependency ← targetBuildDepends info, selected ← toList (depLibraries dependency)]
-              <> [(place, unPackageName (mixinPackageName mixin), libraryLabel (mixinLibraryName mixin)) | mixin ← mixins info]
-          | (place, info, _) ← everyNode
-          ]
+      nub
+        [ (place, package', library', whereIn place (((package', library') `elem`) . configSelectors))
+        | (place, info, _) ← everyNode
+        , (package', library') ← selectorsOf info
+        ]
     manual = [flagName flag | flag ← genPackageFlags description, flagManual flag]
     assignments = mapM (\flag → [(flag, True), (flag, False)]) manual
     environments = [(target, flags) | target ← targets, flags ← assignments]
@@ -369,23 +384,24 @@ configurations directory cabal warnings description = do
           (libBuildInfo lib)
           (exposedModules lib <> otherModules (libBuildInfo lib))
           (componentName == name || libVisibility lib == LibraryVisibilityPublic)
+          (signatures lib)
           [(prettyShow (moduleReexportOriginalName reexport), prettyShow (moduleReexportName reexport)) | reexport ← reexportedModules lib]
           []
     entries =
       concat
         [ maybe [] (library name) (condLibrary description)
         , concat [library (unUnqualComponentName sub) tree | (sub, tree) ← condSubLibraries description]
-        , concat [component tree (\flib → Built "flib" (unUnqualComponentName sub) (foreignLibBuildInfo flib) (otherModules (foreignLibBuildInfo flib)) False [] []) | (sub, tree) ← condForeignLibs description]
-        , concat [component tree (\exe → Built "exe" (unUnqualComponentName sub) (buildInfo exe) (otherModules (buildInfo exe)) False [] []) | (sub, tree) ← condExecutables description]
+        , concat [component tree (\flib → Built "flib" (unUnqualComponentName sub) (foreignLibBuildInfo flib) (otherModules (foreignLibBuildInfo flib)) False [] [] []) | (sub, tree) ← condForeignLibs description]
+        , concat [component tree (\exe → Built "exe" (unUnqualComponentName sub) (buildInfo exe) (otherModules (buildInfo exe)) False [] [] []) | (sub, tree) ← condExecutables description]
         , concat [component tree (testBuilt (unUnqualComponentName sub)) | (sub, tree) ← condTestSuites description]
         , concat [component tree (benchBuilt (unUnqualComponentName sub)) | (sub, tree) ← condBenchmarks description]
         ]
     testBuilt sub suite = case testInterface suite of
-      TestSuiteExeV10 _ _ → Built "test" sub (testBuildInfo suite) (otherModules (testBuildInfo suite)) False [] []
-      other → Built "test" sub (testBuildInfo suite) (otherModules (testBuildInfo suite)) False [] ["unsupported: the test interface " <> show other]
+      TestSuiteExeV10 _ _ → Built "test" sub (testBuildInfo suite) (otherModules (testBuildInfo suite)) False [] [] []
+      other → Built "test" sub (testBuildInfo suite) (otherModules (testBuildInfo suite)) False [] [] ["unsupported: the test interface " <> show other]
     benchBuilt sub bench = case benchmarkInterface bench of
-      BenchmarkExeV10 _ _ → Built "bench" sub (benchmarkBuildInfo bench) (otherModules (benchmarkBuildInfo bench)) False [] []
-      other → Built "bench" sub (benchmarkBuildInfo bench) (otherModules (benchmarkBuildInfo bench)) False [] ["unsupported: the benchmark interface " <> show other]
+      BenchmarkExeV10 _ _ → Built "bench" sub (benchmarkBuildInfo bench) (otherModules (benchmarkBuildInfo bench)) False [] [] []
+      other → Built "bench" sub (benchmarkBuildInfo bench) (otherModules (benchmarkBuildInfo bench)) False [] [] ["unsupported: the benchmark interface " <> show other]
     -- distinct configurations per target, each with every flag assignment that selects it there
     groups found =
       [ (target, map fst members, built)
@@ -399,12 +415,13 @@ data Built = Built
   , builtInfo ∷ BuildInfo
   , builtModules ∷ [ModuleName]
   , builtPublic ∷ Bool
+  , builtSignatures ∷ [ModuleName]
   , builtReexports ∷ [(String, String)]
   , builtProblems ∷ [String]
   }
 
-builtKey ∷ Built → (String, String, String, [String], Bool, [(String, String)], [String])
-builtKey (Built kind name info modules public reexports problems) = (kind, name, show info, map prettyShow modules, public, reexports, problems)
+builtKey ∷ Built → (String, String, String, [String], Bool, [String], [(String, String)], [String])
+builtKey (Built kind name info modules public sigs reexports problems) = (kind, name, show info, map prettyShow modules, public, map prettyShow sigs, reexports, problems)
 
 -- Every node of a conditional tree, both branches of every condition.
 nodes ∷ CondTree v d c → [c]
@@ -442,8 +459,15 @@ supportedOption option =
     || any (`isPrefixOf` option) ["-W", "-with-rtsopts=", "-rtsopts=", "-optl"]
     || (take 2 option == "-j" && all (`elem` "0123456789") (drop 2 option))
 
-optionsProblems ∷ BuildInfo → [String]
-optionsProblems info =
-  ["unsupported: the GHC option " <> option <> ", outside the guard's supported options" | option ← concatMap ghcOf [options info, profOptions info, sharedOptions info, staticOptions info], not (supportedOption option)]
+-- | A build's compiler options, as Cabal tokenized them.
+optionsOf ∷ BuildInfo → [String]
+optionsOf info = concatMap ghcOf [options info, profOptions info, sharedOptions info, staticOptions info]
   where
     ghcOf (PerCompilerFlavor ghc _) = ghc
+
+-- | Every package and library label a build's dependencies and mixins select.
+selectorsOf ∷ BuildInfo → [(String, String)]
+selectorsOf info =
+  nub $
+    [(unPackageName (depPkgName dependency), libraryLabel selected) | dependency ← targetBuildDepends info, selected ← toList (depLibraries dependency)]
+      <> [(unPackageName (mixinPackageName mixin), libraryLabel (mixinLibraryName mixin)) | mixin ← mixins info]
