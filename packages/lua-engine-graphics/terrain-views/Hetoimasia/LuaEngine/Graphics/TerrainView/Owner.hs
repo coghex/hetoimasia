@@ -22,6 +22,9 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView.Owner
   , StepOutcome (..)
   , ConstructedDisposal (..)
   , productionOwner
+  , registryHands
+  , registryRoom
+  , viewAdmission
   , viewGrant
   , viewReceipt
   ) where
@@ -57,7 +60,7 @@ import Hetoimasia.Render.TwoD.Chunk (BoundsRequest (DeriveBounds), ChunkKind (Ch
 import Hetoimasia.Render.TwoD.Material (MaterialRecord, MaterialRef)
 import Hetoimasia.Render.TwoD.Snapshot (Instance)
 import Hetoimasia.Render.TwoD.Vulkan (registerMaterial, rendererDepthFormat, rendererRegionWindow)
-import Hetoimasia.Render.TwoD.Vulkan.Builders (Builders, roomFor)
+import Hetoimasia.Render.TwoD.Vulkan.Builders (Builders (bufferUploads), BufferUploads, roomFor)
 import Hetoimasia.Render.TwoD.Vulkan.Chunks
   ( BuildRefusal (..)
   , BuildRefused (..)
@@ -214,41 +217,58 @@ productionOwner host graphics = do
       , ownerMaterial = material
       , ownerRegionWindow = rendererRegionWindow (graphicsRenderer graphics)
       , ownerDepthQualified = rendererDepthFormat (graphicsRenderer graphics) == Just Depth32Float
-      , ownerRoom = \prepared → either (Left . admission) Right <$> chunkRoom (roomFor uploads) retained (preparedBytes prepared)
+      , ownerRoom = registryRoom (hostBufferUploads host) retained
       , ownerReceiptsHeld = receiptsHeld retained
       , ownerEnded = fmap (Text.pack . show) <$> readVulkanActionGate (vulkanController host)
       }
   where
     retained = graphicsRetained graphics
-    uploads = hostBufferUploads host
     hands ∷ MaterialRef → Construction q inst msgr phys dev cmd → Hands
-    hands material construction =
-      Hands
-        { handPrepare = \instances records → do
-            marks ← registeredMarks (graphicsTextures graphics)
-            -- evaluated here, on this step: the description and its encoded bytes are made now
-            either (Left . Text.pack . show) Right <$> evaluate (prepareRetainedChunk marks ChunkWorldDepth DeriveBounds (Map.singleton material records) instances)
-        , handReserve = \prepared →
-            admitRetainedChunk uploads retained prepared <&> \case
-              Left refusal → Left (admission refusal)
-              Right grant →
-                Right (viewGrant (constructedDisposal construction) (hostBuilders host construction) retained grant)
-        , handSweepReceipts = map (fmap (viewReceipt (constructedDisposal construction))) <$> sweepRegistry retained
-        , handDispose = \chunk → do
-            -- the buffer, read before the release forgets the chunk, is what is physically disposed of later
-            buffer ← chunkBufferOf retained chunk
-            guarded (releaseChunkNow (hostBuilders host construction) retained chunk) >>= pure . \case
-              Left raised → Left raised
-              Right (Left refusal) → Left (Text.pack (show refusal))
-              Right (Right ()) → Right (maybe (pure DisposalDone) (constructedDisposal construction) buffer)
-        }
+    hands material construction = registryHands prepare (constructedDisposal construction) (hostBuilders host construction) retained
+      where
+        prepare instances records = do
+          marks ← registeredMarks (graphicsTextures graphics)
+          -- evaluated here, on this step: the description and its encoded bytes are made now
+          either (Left . Text.pack . show) Right <$> evaluate (prepareRetainedChunk marks ChunkWorldDepth DeriveBounds (Map.singleton material records) instances)
     refusalText = \case
       ReleaseQueueFull → "the release lane is full"
       other → show other
 
--- What the renderer's admission refusal means to a view: room that can come free, a part no staging holds, or an end.
-admission ∷ BuildRefusal → Admission
-admission = \case
+-- | The hands over a renderer's registry, its constructions (whose uploads a part's room is reserved in) and a reading
+-- of a buffer's physical destruction, preparing parts as given: a part is admitted into the registry and the uploads
+-- in the caller's transaction, its grant is the renderer's ('viewGrant'), the teardown sweep is the registry's, and a
+-- chunk's release is the renderer's. The production hands are these over the host's.
+registryHands
+  ∷ ([Instance] → [MaterialRecord] → IO (Either Text PreparedChunk))
+  → (Buffer → STM ConstructedDisposal)
+  → Builders q inst msgr phys dev cmd
+  → Retained
+  → Hands
+registryHands prepare disposal builders retained =
+  Hands
+    { handPrepare = prepare
+    , handReserve = \prepared →
+        admitRetainedChunk (bufferUploads builders) retained prepared <&> \case
+          Left refusal → Left (viewAdmission refusal)
+          Right grant → Right (viewGrant disposal builders retained grant)
+    , handSweepReceipts = map (fmap (viewReceipt disposal)) <$> sweepRegistry retained
+    , handDispose = \chunk → do
+        -- the buffer, read before the release forgets the chunk, is what is physically disposed of later
+        buffer ← chunkBufferOf retained chunk
+        guarded (releaseChunkNow builders retained chunk) >>= pure . \case
+          Left raised → Left raised
+          Right (Left refusal) → Left (Text.pack (show refusal))
+          Right (Right ()) → Right (maybe (pure DisposalDone) disposal buffer)
+    }
+
+-- | Whether a prepared part would be admitted into this registry and these uploads now, read-only: the decision
+-- 'registryHands' makes.
+registryRoom ∷ BufferUploads → Retained → PreparedChunk → STM (Either Admission ())
+registryRoom uploads retained prepared = either (Left . viewAdmission) Right <$> chunkRoom (roomFor uploads) retained (preparedBytes prepared)
+
+-- | What the renderer's admission refusal means to a view: room that can come free, a part no staging holds, or an end.
+viewAdmission ∷ BuildRefusal → Admission
+viewAdmission = \case
   BuildUploadBackpressure pressure → AdmitLater (Text.pack (show pressure))
   BuildReferencesExhausted → AdmitLater "every chunk reference is in use"
   BuildUploadsNotReady → AdmitLater "the host's uploads await its startup"

@@ -35,12 +35,17 @@ import Hetoimasia.LuaEngine.Graphics.Texture (textureHandleOf)
 import Hetoimasia.LuaEngine.Texture (RenderAccount, accountCharged, newRenderAccount)
 import Hetoimasia.Render.TwoD.Chunk (BoundsRequest (DeriveBounds), Chunk, ChunkKind (ChunkWorldDepth), ChunkRef, chunksFrom)
 import Hetoimasia.Render.TwoD.Chunk.Backend (chunkRef)
-import Hetoimasia.Render.TwoD.DrawPlan (noCutoutMarks)
+import Hetoimasia.Render.TwoD.DrawPlan (cutoutMarks, noCutoutMarks)
+import Hetoimasia.Render.TwoD.Snapshot (Instance (instanceTexture))
 import Hetoimasia.Render.TwoD.Material (MaterialFacts (..))
 import Hetoimasia.Render.TwoD.Material.Backend (materialRef)
 import Hetoimasia.Render.TwoD.Metrics (PixelExtent (..), TargetMetrics (..))
 import qualified Hetoimasia.Render.TwoD.Validation as Validation
-import Hetoimasia.Render.TwoD.Vulkan.Chunks (BuildRefusal (BuildRaised, BuildUploadsNotReady), BuildRefused (..), ChunkStanding (..), RefusedAllocation (NoAllocation), prepareRetainedChunk, preparedChunk)
+import Hetoimasia.Render.TwoD.Vulkan.Chunks (BuildRefusal (BuildRaised, BuildUploadsNotReady), BuildRefused (..), ChunkStanding (..), RefusedAllocation (NoAllocation), Retained, chunkStandingSTM, newRetained, prepareRetainedChunk, preparedChunk, receiptsHeld)
+import qualified Hetoimasia.Render.TwoD.Vulkan.Chunks as Chunks
+import Hetoimasia.Render.TwoD.Vulkan.Builders (bufferUploads)
+import Hetoimasia.Render.TwoD.Chunk.Backend (chunkRefIndex)
+import Test.LuaEngine.Graphics.NativeStandIn (StandIn, disposeNow, failNextWrite, settleUploads, standInBuilders, standInDisposal, withStandIn)
 import Hetoimasia.Terrain.Cell (mkMaterialId)
 import Hetoimasia.Terrain.Coordinate (AxisCoord, axisFromInteger, axisValue, tileCoord)
 import Hetoimasia.Terrain.Render2D.AtlasFixtures (AtlasStyle (..), boundPackedTextures, loadAtlasStyle)
@@ -138,6 +143,25 @@ data Rig = Rig
   , rigCountGate ∷ !(TVar (Maybe (Int → Bool, TMVar [RegionCoord], TMVar ())))
     -- ^ When set: the first held copy whose counted total satisfies the test names its batch here, once its total is
     -- counted, and waits until the example resumes it.
+  , rigNative ∷ !(Maybe Native)
+    -- ^ The native stand-in, for an example whose hands are the renderer's registry over the backend's own uploads.
+  }
+
+-- | An example's native stand-in: the session, the renderer's registry the production hands admit into
+-- ('registryHands'), and what the example controls of them.
+data Native = Native
+  { nativeStandIn ∷ !StandIn
+  , nativeRetained ∷ !Retained
+  , nativeDisposing ∷ !(TVar Bool)
+    -- ^ Whether the owner's turns destroy released buffers (a destruction is held pending while not).
+  , nativeHoldClaim ∷ !(TVar Bool)
+    -- ^ When set: the next grant's receipt answers no claim (it reads as unsealed) until the example lets it go.
+  , nativeClaimsHeld ∷ !(TVar (Set.Set Word64))
+    -- ^ The receipts whose claims are held, by key.
+  , nativeGrants ∷ !(TVar [(Word64, ChunkRef)])
+    -- ^ Every grant's receipt key and reference, oldest first.
+  , nativeAdmitted ∷ !(TVar Word32)
+    -- ^ How many grants the registry gave: the next is held when 'rigHold' names its ordinal.
   }
 
 -- | What the host does once the body has ended: everything (its targets retire), everything but retire its targets'
@@ -153,10 +177,12 @@ data Options = Options
   , optRuntime ∷ Config → Config
   , optCells ∷ CellConfig → CellConfig
   , optCamera ∷ CameraConfig → CameraConfig
+  , optNative ∷ Bool
+    -- ^ Whether the hands are the renderer's registry over the native stand-in's uploads, rather than the fake's.
   }
 
 defaultOptions ∷ Options
-defaultOptions = Options TeardownFull smallProfile 196608 id id id
+defaultOptions = Options TeardownFull smallProfile 196608 id id id False
 
 -- A small profile: enough for the examples' views, small enough that its caps are reachable.
 smallProfile ∷ ViewProfile
@@ -235,78 +261,151 @@ withRig options body =
         fault ← newTVarIO Nothing
         countGate ← newTVarIO Nothing
         initial ← prepare initialGraphicsScene
-        let owner =
-              OwnerPorts
-                { ownerSchedule = \step → do
-                    ended ← readTVar ownerEnded
-                    accepting ← readTVar queueOpen
-                    case ended of
-                      Just why → pure (Left (ScheduleEnded why))
-                      Nothing
-                        | not accepting → pure (Left ScheduleBusy)
-                        | otherwise → do
-                            outcome ← newTVar Nothing
-                            modifyTVar' queue (|> (step, outcome))
-                            pure (Right (readTVar outcome))
-                , ownerRelease = \after → do
-                    room ← readTVar laneCapacity
-                    held ← Seq.length <$> readTVar lane
-                    if held >= room
-                      then pure (Left "the release lane is full")
-                      else do
-                        answer ← newTVar Nothing
-                        modifyTVar' lane (|> (after, answer))
-                        pure (Right (readTVar answer))
-                , ownerStanding = \chunk → Map.lookup chunk <$> readTVar standings
-                , ownerMaterial = materialRef 11 (MaterialFacts True recordLayout (fromIntegral pushBlockBytes))
-                , ownerRegionWindow = optWindow options
-                , ownerDepthQualified = True
-                , ownerRoom = \_ → roomOf admission admitBudget
-                , ownerReceiptsHeld = do
-                    cells ← Map.elems <$> readTVar registry
-                    sealed ← length . filter isJust <$> mapM readTVar cells
-                    pure (length cells, sealed)
-                , ownerEnded = readTVar ownerEnded
-                }
-            hooks =
-              CopyHooks
-                { hookUnavailable = readTVar unavailable
-                , hookCounting = \batch total → do
-                    gate ← atomically $
-                      readTVar countGate >>= \case
-                        Just (crosses, counting, resumed) | crosses total → Just (counting, resumed) <$ writeTVar countGate Nothing
-                        _ → pure Nothing
-                    forM_ gate $ \(counting, resumed) → atomically (putTMVar counting batch) >> atomically (takeTMVar resumed)
-                , hookDemandRefused = \_ → readTVar demandRefused
-                }
-            ports = TerrainViewsPorts owner ledger claims receipts initial terrain client account hooks
-        ending ← newTVarIO False
-        -- When the body has ended, the host's own teardown is played by this thread: the barriers are met and the
-        -- owner's actions run, and (unless the targets stay live) every target's adoptions are released, so the views'
-        -- drain completes.
-        let retireTargets = optTeardown options == TeardownFull
-            teardown = do
-              atomically (readTVar ending >>= check)
-              let loop = do
-                    atomically $ do
-                      queued ← readTVar queue
-                      asked ← readTVar lane
-                      records ← readingRecords <$> ledgerReading ledger
-                      check (not (Seq.null queued && Seq.null asked && (null records || not retireTargets)))
-                    when retireTargets $ do
-                      records ← readingRecords <$> atomically (ledgerReading ledger)
-                      forM_ records $ \((key, revision), count) → forM_ [1 .. count] (\_ → ledgerReleased ledger key revision)
-                    entries ← atomically (readTVar lane <* writeTVar lane Seq.empty)
-                    forM_ entries $ \(after, answer) → atomically (writeTVar answer (Just (Right ())) >> after)
-                    steps ← atomically (readTVar queue <* writeTVar queue Seq.empty)
-                    forM_ steps $ \(step, outcome) → step fakeHands >> atomically (writeTVar outcome (Just StepRan))
-                    loop
-              loop
-            rig views = Rig views terrain lease queue queueOpen lane laneCapacity standings chunks disposed attempts buildFailure disposeFailure next ledger claims receipts ownerEnded style account deferDisposal pendingDisposals hold entered resume styleReleases unavailable admission admitBudget grants uploading demandRefused buildAttempts failNext raising raiseSealed receiptNext registry afterSeal fault countGate
-            fakeHands = hands (rig (error "the teardown's hands read no service"))
-        withOwnedThread (when (optTeardown options /= TeardownNone) teardown) $ \_ _ →
-          withTerrainViews (configOf options) ports $ \views →
-            body (rig views) `finally` atomically (writeTVar ending True)
+        withNativeOf (optNative options) $ \native → do
+         let owner =
+               OwnerPorts
+                 { ownerSchedule = \step → do
+                     ended ← readTVar ownerEnded
+                     accepting ← readTVar queueOpen
+                     case ended of
+                       Just why → pure (Left (ScheduleEnded why))
+                       Nothing
+                         | not accepting → pure (Left ScheduleBusy)
+                         | otherwise → do
+                             outcome ← newTVar Nothing
+                             modifyTVar' queue (|> (step, outcome))
+                             pure (Right (readTVar outcome))
+                 , ownerRelease = \after → do
+                     room ← readTVar laneCapacity
+                     held ← Seq.length <$> readTVar lane
+                     if held >= room
+                       then pure (Left "the release lane is full")
+                       else do
+                         answer ← newTVar Nothing
+                         modifyTVar' lane (|> (after, answer))
+                         pure (Right (readTVar answer))
+                 , ownerStanding = \chunk → maybe (Map.lookup chunk <$> readTVar standings) (\held → chunkStandingSTM (nativeRetained held) chunk) native
+                 , ownerMaterial = materialRef 11 (MaterialFacts True recordLayout (fromIntegral pushBlockBytes))
+                 , ownerRegionWindow = optWindow options
+                 , ownerDepthQualified = True
+                 , ownerRoom = \prepared → case native of
+                     Nothing → roomOf admission admitBudget
+                     Just held → roomOf admission admitBudget >>= either (pure . Left) (const (registryRoom (bufferUploads (standInBuilders (nativeStandIn held))) (nativeRetained held) prepared))
+                 , ownerReceiptsHeld = case native of
+                     Just held → receiptsHeld (nativeRetained held)
+                     Nothing → do
+                       cells ← Map.elems <$> readTVar registry
+                       sealed ← length . filter isJust <$> mapM readTVar cells
+                       pure (length cells, sealed)
+                 , ownerEnded = readTVar ownerEnded
+                 }
+             hooks =
+               CopyHooks
+                 { hookUnavailable = readTVar unavailable
+                 , hookCounting = \batch total → do
+                     gate ← atomically $
+                       readTVar countGate >>= \case
+                         Just (crosses, counting, resumed) | crosses total → Just (counting, resumed) <$ writeTVar countGate Nothing
+                         _ → pure Nothing
+                     forM_ gate $ \(counting, resumed) → atomically (putTMVar counting batch) >> atomically (takeTMVar resumed)
+                 , hookDemandRefused = \_ → readTVar demandRefused
+                 }
+             ports = TerrainViewsPorts owner ledger claims receipts initial terrain client account hooks
+         ending ← newTVarIO False
+         -- When the body has ended, the host's own teardown is played by this thread: the barriers are met and the
+         -- owner's actions run, and (unless the targets stay live) every target's adoptions are released, so the views'
+         -- drain completes.
+         let retireTargets = optTeardown options == TeardownFull
+             teardown = do
+               atomically (readTVar ending >>= check)
+               let loop = do
+                     atomically $ do
+                       queued ← readTVar queue
+                       asked ← readTVar lane
+                       records ← readingRecords <$> ledgerReading ledger
+                       check (not (Seq.null queued && Seq.null asked && (null records || not retireTargets)))
+                     when retireTargets $ do
+                       records ← readingRecords <$> atomically (ledgerReading ledger)
+                       forM_ records $ \((key, revision), count) → forM_ [1 .. count] (\_ → ledgerReleased ledger key revision)
+                     entries ← atomically (readTVar lane <* writeTVar lane Seq.empty)
+                     forM_ entries $ \(after, answer) → atomically (writeTVar answer (Just (Right ())) >> after)
+                     steps ← atomically (readTVar queue <* writeTVar queue Seq.empty)
+                     forM_ steps $ \(step, outcome) → step fakeHands >> atomically (writeTVar outcome (Just StepRan))
+                     forM_ native settleNative
+                     loop
+               loop
+             rig views = Rig views terrain lease queue queueOpen lane laneCapacity standings chunks disposed attempts buildFailure disposeFailure next ledger claims receipts ownerEnded style account deferDisposal pendingDisposals hold entered resume styleReleases unavailable admission admitBudget grants uploading demandRefused buildAttempts failNext raising raiseSealed receiptNext registry afterSeal fault countGate native
+             fakeHands = stepHands (rig (error "the teardown's hands read no service"))
+         withOwnedThread (when (optTeardown options /= TeardownNone) teardown) $ \_ _ →
+           withTerrainViews (configOf options) ports $ \views →
+             body (rig views) `finally` atomically (writeTVar ending True)
+
+-- The native stand-in an example asked for, for the length of the body.
+withNativeOf ∷ Bool → (Maybe Native → IO a) → IO a
+withNativeOf False body = body Nothing
+withNativeOf True body =
+  withStandIn $ \standIn → do
+    native ← Native standIn <$> newRetained <*> newTVarIO True <*> newTVarIO False <*> newTVarIO Set.empty <*> newTVarIO [] <*> newTVarIO 0
+    body (Just native)
+
+-- The hands an owner step is lent: the native stand-in's when the example has one, the fake's otherwise.
+stepHands ∷ Rig → Hands
+stepHands rig = maybe (hands rig) (nativeHands rig) (rigNative rig)
+
+-- After a step with the native stand-in: its uploads are recorded and completed, and released buffers are destroyed
+-- unless the example holds their destruction.
+settleNative ∷ Native → IO ()
+settleNative native = do
+  settleUploads (nativeStandIn native)
+  disposing ← readTVarIO (nativeDisposing native)
+  when disposing (disposeNow (nativeStandIn native))
+
+-- The production hands over the renderer's registry and the stand-in's uploads ('registryHands'), with what the example
+-- controls of them: the fake's admission answer and budget (cells, read before the registry decides), the ordinal of a
+-- grant whose spend waits until resumed (before the renderer's spend begins), the held target's fault armed once the
+-- renderer's spend has sealed its outcome, and a receipt whose claim reads as unsealed until the example lets it go.
+nativeHands ∷ Rig → Native → Hands
+nativeHands rig native =
+  production
+    { handReserve = \prepared →
+        roomOf (rigAdmission rig) (rigAdmitBudget rig) >>= \case
+          Left refusal → pure (Left refusal)
+          Right () →
+            Chunks.admitRetainedChunk (bufferUploads builders) (nativeRetained native) prepared >>= \case
+              Left refusal → pure (Left (viewAdmission refusal))
+              Right granted → do
+                let grant = viewGrant (standInDisposal standIn) builders (nativeRetained native) granted
+                    grantedReference = Chunks.chunkGrantReference granted
+                modifyTVar' (rigAdmitBudget rig) (fmap (subtract 1))
+                ordinal ← stateTVar (nativeAdmitted native) (\count → (count + 1, count + 1))
+                let receipt = grantReceipt grant
+                    key = receiptKey receipt
+                modifyTVar' (nativeGrants native) (<> [(key, grantedReference)])
+                holding ← readTVar (nativeHoldClaim native)
+                when holding (writeTVar (nativeHoldClaim native) False >> modifyTVar' (nativeClaimsHeld native) (Set.insert key))
+                pure . Right $
+                  grant
+                    { grantSpend = (held ordinal >> grantSpend grant) `finally` atomically arm
+                    , grantReceipt = receipt {receiptClaim = readTVar (nativeClaimsHeld native) >>= \claims → if Set.member key claims then pure Nothing else receiptClaim receipt}
+                    }
+    }
+  where
+    standIn = nativeStandIn native
+    builders = standInBuilders standIn
+    production = registryHands prepareOf (standInDisposal standIn) builders (nativeRetained native)
+    -- the instances' own textures marked, as the production hands mark the registered art: each part has bytes, and its
+    -- build makes and fills a buffer
+    prepareOf instances records = pure (either (Left . Text.pack . show) Right (prepareRetainedChunk (cutoutMarks (Set.toList (Set.fromList (map instanceTexture instances)))) ChunkWorldDepth DeriveBounds (Map.singleton material records) instances))
+    material = materialRef 11 (MaterialFacts True recordLayout (fromIntegral pushBlockBytes))
+    held ordinal = do
+      waits ← atomically $ do
+        hold ← readTVar (rigHold rig)
+        if hold == Just ordinal then True <$ (writeTVar (rigHold rig) Nothing >> putTMVar (rigEntered rig) ()) else pure False
+      when waits (atomically (takeTMVar (rigResume rig)))
+    arm =
+      readTVar (rigFault rig) >>= \case
+        Just (faulty, failing, False) → setHeldFault faulty (Just failing) >> writeTVar (rigFault rig) (Just (faulty, failing, True))
+        _ → pure ()
 
 -- The views' configuration an example's options give.
 configOf ∷ Options → TerrainViewsConfig
@@ -456,8 +555,10 @@ runOwner rig = go (100000 ∷ Int)
         Just (step, outcome) → do
           -- a target fault armed in this step lasts for this step alone; a step that raises is answered as the host
           -- answers it (which ends the views' owner), and its exception goes on to the example
-          ran ← tryWithContext @SomeException (step (hands rig))
+          ran ← tryWithContext @SomeException (step (stepHands rig))
           atomically disarm
+          -- the native stand-in's uploads progress, and its released buffers are destroyed, after each step
+          forM_ (rigNative rig) settleNative
           case ran of
             Left failure@(ExceptionWithContext _ raised) → do
               atomically (writeTVar outcome (Just (StepRaised (Text.pack (displayException raised)))))
@@ -1912,30 +2013,37 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         -- the released buffer's slot is held until its destruction is confirmed
         Map.findWithDefault 0 1 . serviceOccupied <$> atomically reading `shouldReturn` 1
 
-    it "charges one slot for a granted build whose bound upload raised at the mapped write while its released buffer's destruction is pending, and frees it once confirmed" $
-      withRig defaultOptions {optProfile = smallProfile {profileSlots = 4, profileQuads = 2048}} $ \rig → do
-        let occupied = Map.findWithDefault 0 1 . serviceOccupied <$> readTerrainViews (rigViews rig)
-        destruction ← newTVarIO DisposalPending
-        -- the renderer sealed the released buffer with the mapped write's cause, and the exception goes on
+    it "charges one slot for a granted build whose bound upload raised at the mapped write, through the renderer's grant and receipt: its released buffer's destruction is held pending across a close and reopen, and its slot is returned once" $
+      withRig defaultOptions {optProfile = smallProfile {profileSlots = 4, profileQuads = 2048}, optNative = True} $ \rig → do
+        native ← maybe (fail "the example needs the native stand-in") pure (rigNative rig)
+        let reading = readTerrainViews (rigViews rig)
+            occupied = Map.findWithDefault 0 1 . serviceOccupied <$> reading
+        -- the owner's turns keep released buffers, and the first build's write into staging raises
         atomically $ do
-          writeTVar (rigFailNext rig) [Just (BuildFailed "BuildRaised \"the mapped write failed\"" (AllocatedDisposing "buffer 7" (readTVar destruction)))]
-          writeTVar (rigRaiseSealed rig) (Just (toException (ErrorCall "the mapped write failed")))
+          writeTVar (nativeDisposing native) False
+          failNextWrite (nativeStandIn native) (toException (ErrorCall "the mapped write failed"))
         target ← newTarget 1
         first ← openOn rig target
-        -- the view collects the sealed failure: its refusal names the cause, and the buffer's slot stays charged
+        -- the view collects the renderer's sealed failure: its refusal names the cause, and the released buffer's slot
+        -- stays charged while its destruction is pending
         settleUntil rig (isJust . readingRefusal <$> readView first)
         refusal ← atomically (readingRefusal <$> readView first)
         Text.pack (show refusal) `shouldSatisfy` Text.isInfixOf "the mapped write failed"
-        atomically occupied `shouldReturn` 1
+        (,) <$> atomically occupied <*> (serviceDisposing <$> atomically reading) `shouldReturn` (1, 1)
         _ ← closeView first
         runOwner rig
         second ← openOn rig target
         settleUntil rig ((== 4) <$> occupied)
         atomically (readingPublished <$> readView second) `shouldReturn` Nothing
-        atomically (writeTVar destruction DisposalDone)
+        serviceDisposing <$> atomically reading `shouldReturn` 1
+        -- the owner destroys it: its slot comes back once, and the reopened view publishes
+        atomically (writeTVar (nativeDisposing native) True)
+        disposeNow (nativeStandIn native)
         settleUntil rig (publishedAtLeast second 1)
-        atomically occupied `shouldReturn` 4
-        servicePending <$> atomically (readTerrainViews (rigViews rig)) `shouldReturn` 0
+        done ← atomically reading
+        listed ← atomically (readingListed <$> readView second)
+        (Map.findWithDefault 0 1 (serviceOccupied done), serviceDisposing done, servicePending done) `shouldBe` (listed, 0, 0)
+        atomically (receiptsHeld (nativeRetained native)) `shouldReturn` (0, 0)
 
     it "keeps a buffer whose cleanup raised charged, with the upload's refusal and the release's cause, while a competing view with its own room builds" $
       withRig defaultOptions {optProfile = smallProfile {profileSlots = 4, profileQuads = 2048}} $ \rig → do
@@ -2024,33 +2132,50 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         atomically occupied `shouldReturn` 4
         servicePending <$> atomically reading `shouldReturn` 0
 
-    it "reconciles a swept build's receipt without touching a later admission's: the successor keeps its part and its slot until its own build completes" $
-      withRig defaultOptions {optProfile = smallProfile {profileSlots = 4, profileQuads = 2048}} $ \rig → do
+    it "reconciles a refused build's late receipt while a second view's admission holds the reference it gave back: only the first build's entry goes, and the successor's entry and charge survive until it builds" $
+      withRig defaultOptions {optProfile = smallProfile {profileSlots = 4, profileQuads = 2048}, optNative = True} $ \rig → do
+        native ← maybe (fail "the example needs the native stand-in") pure (rigNative rig)
         let reading = readTerrainViews (rigViews rig)
-        target ← newTarget 1
-        -- the first build is sealed and its revalidation raises; the next build is held after its admission
+        firstTarget ← newTarget 1
+        secondTarget ← newTarget 2
+        -- one grant, the first view's first build: its write into staging raises (refused, and the renderer gives its
+        -- reference back), its revalidation raises (left to the sweep), and its receipt's claim is held
         atomically $ do
-          writeTVar (rigFault rig) (Just (targetHeld target, HeldRaises, False))
-          writeTVar (rigAfterSeal rig) (Just (readTVar (rigNext rig) >>= writeTVar (rigHold rig) . Just))
-        view ← openOn rig target
+          writeTVar (rigAdmitBudget rig) (Just 1)
+          failNextWrite (nativeStandIn native) (toException (ErrorCall "the mapped write failed"))
+          writeTVar (rigFault rig) (Just (targetHeld firstTarget, HeldRaises, False))
+          writeTVar (nativeHoldClaim native) True
+        first ← openOn rig firstTarget
+        settleUntil rig ((== Just 0) <$> readTVar (rigAdmitBudget rig))
+        servicePending <$> atomically reading `shouldReturn` 1
+        [(firstKey, given)] ← readTVarIO (nativeGrants native)
+        -- the first view ends, so nothing of it admits again; the second view's one grant is held before its spend
+        _ ← closeView first
+        atomically (writeTVar (rigHold rig) (Just 2) >> writeTVar (rigAdmitBudget rig) (Just 1))
+        second ← openOn rig secondTarget
         stop ← newTVarIO False
         let owner = do
               runOwner rig
               continue ← atomically ((False <$ (readTVar stop >>= check)) `orElse` (True <$ (readTVar (rigQueue rig) >>= check . not . Seq.null)))
               when continue owner
         withOwnedThread owner $ \_ ended → do
-          timeout 10000000 (atomically (takeTMVar (rigEntered rig))) >>= maybe (expectationFailure "no build was held") pure
-          -- the sweep reconciles the first receipt while the successor's admission is pending
-          eventually (not . null . serviceSwept <$> reading)
-          now ← atomically reading
-          servicePending now `shouldBe` 1
-          Map.findWithDefault 0 1 (serviceOccupied now) `shouldBe` 2
-          atomically (putTMVar (rigResume rig) () >> writeTVar stop True)
+          timeout 10000000 (atomically (takeTMVar (rigEntered rig))) >>= maybe (expectationFailure "the second admission was never held") pure
+          -- the second admission holds the reference the refused build gave back, beside the first's unclaimed receipt
+          map (chunkRefIndex . snd) <$> readTVarIO (nativeGrants native) `shouldReturn` [chunkRefIndex given, chunkRefIndex given]
+          held ← atomically reading
+          (servicePending held, Map.findWithDefault 0 2 (serviceOccupied held)) `shouldBe` (2, 1)
+          -- the first receipt's claim is let go: the sweep reconciles it, and only its entry goes
+          atomically (modifyTVar' (nativeClaimsHeld native) (Set.delete firstKey))
+          eventually ((== 1) . servicePending <$> reading)
+          swept ← atomically reading
+          Map.findWithDefault 0 2 (serviceOccupied swept) `shouldBe` 1
+          [why | (1, _, why) ← serviceSwept swept] `shouldSatisfy` any ("the mapped write failed" `Text.isInfixOf`)
+          atomically (writeTVar (rigAdmitBudget rig) Nothing >> putTMVar (rigResume rig) () >> writeTVar stop True)
           ended
-        settleUntil rig (publishedAtLeast view 1)
+        settleUntil rig (publishedAtLeast second 1)
         done ← atomically reading
-        listed ← atomically (readingListed <$> readView view)
-        (Map.findWithDefault 0 1 (serviceOccupied done), servicePending done) `shouldBe` (listed, 0)
+        listed ← atomically (readingListed <$> readView second)
+        (Map.findWithDefault 0 2 (serviceOccupied done), servicePending done) `shouldBe` (listed, 0)
 
     it "follows a held target's observed zero, then unknown geometry with no new frame, clearing its demand, and restores it with the drawing" $
       withPublished defaultOptions $ \rig target view → do

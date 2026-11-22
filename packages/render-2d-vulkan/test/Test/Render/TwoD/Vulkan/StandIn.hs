@@ -113,9 +113,9 @@ data Rig = Rig
   , rigNaming ∷ !(TVar (Maybe SomeException))
     -- ^ An exception the allocator's next naming call raises, once.
   , rigWriting ∷ !(TVar (Maybe SomeException))
+    -- ^ An exception the next write into mapped memory raises, once, before it writes.
   , rigRoots ∷ !(Roots () Int Int Text Int)
     -- ^ The session's roots.
-    -- ^ An exception the next write into mapped memory raises, once, before it writes.
   }
 
 -- | A session with a surface-free device and its frames and uploads, with

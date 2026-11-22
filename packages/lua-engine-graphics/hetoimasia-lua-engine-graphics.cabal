@@ -191,6 +191,7 @@ test-suite lua-engine-graphics-tests
         Test.LuaEngine.Graphics.TerrainParents
         Test.LuaEngine.Graphics.TerrainViews
         Test.LuaEngine.Graphics.TerrainViewsBoundary
+        Test.LuaEngine.Graphics.NativeStandIn
         Test.LuaEngine.Graphics.Release
         Test.LuaEngine.Graphics.Rig
         Test.LuaEngine.Graphics.SceneComp

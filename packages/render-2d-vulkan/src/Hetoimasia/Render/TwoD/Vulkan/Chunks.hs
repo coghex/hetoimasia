@@ -99,6 +99,7 @@ module Hetoimasia.Render.TwoD.Vulkan.Chunks
   , spendChunkGrant
   , BuildReceipt
   , chunkGrantReceipt
+  , chunkGrantReference
   , receiptNumber
   , receiptSealed
   , claimReceipt
@@ -379,6 +380,11 @@ receiptsHeld (Retained ledger) = do
         _ → False
 
 -- Seal a build's outcome into its receipt, available to one claimant.
+-- | The reference a grant reserved: the chunk's, once its build registers it; free again for another admission once a
+-- refused build has given it back.
+chunkGrantReference ∷ ChunkGrant → ChunkRef
+chunkGrantReference = grantReference
+
 sealReceipt ∷ ChunkGrant → Either BuildRefused ChunkRef → STM ()
 sealReceipt grant outcome = writeTVar (receiptCell (grantReceipt grant)) (ReceiptAvailable outcome)
 
