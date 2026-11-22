@@ -36,7 +36,6 @@ import Hetoimasia.GPU.Vulkan.Native.Uploads
   , UploadRefusal (UploadClosed)
   , UploadTicket
   , Uploads
-  , abandonUploadGrant
   , reserveUpload
   , submitUploadGranted
   , ungated
@@ -110,9 +109,8 @@ data BufferUploads = BufferUploads
     -- binding leaves the reservation to be spent or abandoned; once bound, a
     -- failed or cancelled copy, or a refusal before the upload is queued, gives
     -- its place and region back and consumes it, so abandoning it changes
-    -- nothing.
-  , abandonRoom ∷ UploadGrant → STM ()
-    -- ^ Free an unspent reservation's room.
+    -- nothing. An unspent reservation is given back through the uploads that
+    -- issued it ('returnUploadGrant'), not through this record.
   }
 
 -- | Why the uploads did not answer room or an upload: the host's uploads are
@@ -132,7 +130,6 @@ noBufferUploads =
     { roomFor = \_ → pure closed
     , reserveRoom = \_ → pure closed
     , uploadGranted = \_ _ _ → pure closed
-    , abandonRoom = \_ → pure ()
     }
   where
     closed = Left (BufferUploadRefused UploadClosed)
@@ -144,7 +141,6 @@ bufferUploadsOf uploads =
     { roomFor = fmap refused . uploadRoom uploads
     , reserveRoom = fmap refused . reserveUpload uploads
     , uploadGranted = \grant buffer bytes → refused <$> submitUploadGranted ungated uploads grant buffer bytes
-    , abandonRoom = abandonUploadGrant uploads
     }
   where
     refused ∷ Either UploadRefusal a → Either BufferUploadRefusal a

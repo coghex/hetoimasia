@@ -342,6 +342,7 @@ import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Word (Word32)
+import Hetoimasia.Foundation.Admission (Admission, AdmissionToken, admissionToken, closeAdmission, newAdmissionIO, tokenOpen)
 import Hetoimasia.Foundation.Time (Instant)
 import Foreign.Ptr (Ptr)
 import Numeric (showHex)
@@ -699,7 +700,10 @@ data State inst msgr phys dev cmd lease obligation = State
     -- ^ The owner-thread actions admitted and not yet taken (GRS-15): any
     -- thread admits; the owner's step takes and runs them, and whole-owner
     -- retirement refuses what is left.
-  , stateOwnerOpen ∷ !(TVar (TVar Bool))
+  , stateOwnerOpen ∷ !(TVar AdmissionToken)
+    -- ^ The admission in force: the controller's own until the owner's handoff, the owner's after it.
+  , statePreOwner ∷ !Admission
+    -- ^ The controller's admission before the owner exists, closed in the handoff transaction.
     -- ^ Whether the owner's admission is still open, read by every action's
     -- admission and start. The composition installs the owner's own once it
     -- exists; it closes when the owner's exit begins or its run ends.
@@ -810,7 +814,8 @@ newVulkanControllerWith
   → IO VulkanController
 newVulkanControllerWith hooks capture deviceStart capacity releaseCapacity initialEmpty uploads windowDepth ops rendering observer pointer bridge layers validation choice budgets clock poll = do
   roots ← newRoots ops budgets clock
-  ownerOpen ← newTVarIO =<< newTVarIO True
+  preOwner ← newAdmissionIO
+  ownerOpen ← newTVarIO (admissionToken preOwner)
   scenes ← newScenes initialEmpty
   actions ← newActions capacity releaseCapacity (actionGate roots ownerOpen) (sceneBarrierMet scenes)
   -- Only a host built for verification capture plans its swapchains
@@ -847,6 +852,7 @@ newVulkanControllerWith hooks capture deviceStart capacity releaseCapacity initi
       <*> pure deviceStart
       <*> pure actions
       <*> pure ownerOpen
+      <*> pure preOwner
       <*> pure scenes
       <*> newTVarIO (\_ _ → pure ())
 
@@ -1351,11 +1357,11 @@ cancelVulkanUpload (VulkanController state) = cancelRenderingUpload (stateRender
 -- | Whether an owner-thread action may be admitted or started now: refused
 -- once the session has failed, with its primary, and once the owner's
 -- admission has closed.
-actionGate ∷ Roots Quiesced inst msgr phys dev → TVar (TVar Bool) → STM (Maybe ActionRefusal)
+actionGate ∷ Roots Quiesced inst msgr phys dev → TVar AdmissionToken → STM (Maybe ActionRefusal)
 actionGate roots ownerOpen =
   reportPrimary <$> readRootsTerminal roots >>= \case
     Just primary → pure (Just (ActionSessionFailed primary))
-    Nothing → (readTVar ownerOpen >>= readTVar) <&> \open → if open then Nothing else Just ActionOwnerClosed
+    Nothing → (readTVar ownerOpen >>= tokenOpen) <&> \open → if open then Nothing else Just ActionOwnerClosed
 
 -- | Run the owner-thread actions queued when the step began — its 'Batch',
 -- fixed before the step's checkpoint and its scene adoption — one at a time,
@@ -2835,7 +2841,7 @@ withVulkanOwnerHostHooked hooks capturing logger layer rendering pointer bridge 
           atomically $ do
             writeTVar (stateHostWake state) (wakeGraphicsHost graphics)
             -- the admission before the owner closes in the transaction that hands over to the owner's own
-            readTVar (stateOwnerOpen state) >>= (`writeTVar` False)
+            closeAdmission (statePreOwner state)
             writeTVar (stateOwnerOpen state) (targetAdmission (ownerHandoff graphics))
             -- A release request is held to the scenes the owner holds for the
             -- windows the host holds, and its hook is the host's own.

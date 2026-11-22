@@ -72,6 +72,8 @@ import Hetoimasia.Render.TwoD.Vulkan.Chunks
   , chunkGrantReceipt
   , claimReceipt
   , receiptNumber
+  , receiptsHeld
+  , sweepRegistry
   , chunkRoom
   , chunkStandingSTM
   , preparedBytes
@@ -135,6 +137,9 @@ data Hands = Hands
   , handReserve ∷ PreparedChunk → STM (Either Admission Grant)
     -- ^ Reserve a prepared chunk's reference and upload room, in the caller's transaction: the decision 'ownerRoom'
     -- observes.
+  , handSweepReceipts ∷ STM [(Word64, Either BuildFailure ChunkRef)]
+    -- ^ The registry's teardown sweep: claim every sealed receipt its collector has not, with its key, read as a view
+    -- reads it.
   , handDispose ∷ ChunkRef → IO (Either Text (STM ConstructedDisposal))
     -- ^ Release a chunk's buffer and forget the chunk, answering a reading of the buffer's physical disposal: the
     -- backend destroys it once the batches that recorded it complete, and only then is it done. A chunk without a
@@ -170,6 +175,8 @@ data OwnerPorts = OwnerPorts
     -- ^ Whether the session's depth format is @D32_SFLOAT@.
   , ownerRoom ∷ PreparedChunk → STM (Either Admission ())
     -- ^ Whether a prepared chunk would be admitted now, read-only: the decision 'handReserve' makes.
+  , ownerReceiptsHeld ∷ STM (Int, Int)
+    -- ^ How many admitted builds' receipts the registry still holds unclaimed, and how many of those are sealed.
   , ownerEnded ∷ STM (Maybe Text)
     -- ^ Why the owner takes no more actions, once it does not: its session failed, or its exit began. What can no
     -- longer be disposed of ends with it as cause.
@@ -208,6 +215,7 @@ productionOwner host graphics = do
       , ownerRegionWindow = rendererRegionWindow (graphicsRenderer graphics)
       , ownerDepthQualified = rendererDepthFormat (graphicsRenderer graphics) == Just Depth32Float
       , ownerRoom = \prepared → either (Left . admission) Right <$> chunkRoom (roomFor uploads) retained (preparedBytes prepared)
+      , ownerReceiptsHeld = receiptsHeld retained
       , ownerEnded = fmap (Text.pack . show) <$> readVulkanActionGate (vulkanController host)
       }
   where
@@ -225,6 +233,7 @@ productionOwner host graphics = do
               Left refusal → Left (admission refusal)
               Right grant →
                 Right (viewGrant (constructedDisposal construction) (hostBuilders host construction) retained grant)
+        , handSweepReceipts = map (fmap (viewReceipt (constructedDisposal construction))) <$> sweepRegistry retained
         , handDispose = \chunk → do
             -- the buffer, read before the release forgets the chunk, is what is physically disposed of later
             buffer ← chunkBufferOf retained chunk

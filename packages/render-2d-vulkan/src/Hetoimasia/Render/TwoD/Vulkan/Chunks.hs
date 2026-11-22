@@ -102,6 +102,8 @@ module Hetoimasia.Render.TwoD.Vulkan.Chunks
   , receiptNumber
   , receiptSealed
   , claimReceipt
+  , sweepRegistry
+  , receiptsHeld
   , BuildSettlement (..)
   , buildSettlementOf
   , ChunkStanding (..)
@@ -123,7 +125,7 @@ import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVar, newT
 import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeAsyncException, SomeException, displayException, finally, fromException, mask_, rethrowIO, tryWithContext)
 import Control.Exception.Annotation (ExceptionAnnotation (displayExceptionAnnotation))
 import Control.Exception.Context (ExceptionContext, addExceptionAnnotation, getExceptionAnnotations)
-import Control.Monad (when)
+import Control.Monad (forM, when)
 import Data.Foldable (for_)
 import Data.Functor ((<&>))
 import Data.Maybe (isJust)
@@ -135,7 +137,7 @@ import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Word (Word32, Word64)
 import Hetoimasia.GPU.Vulkan.Native.Recording (Buffer, Refusal, releasedBufferOf)
-import Hetoimasia.GPU.Vulkan.Native.Uploads (UploadGrant, UploadPressure, UploadRefusal (..), UploadState (..), UploadTicket, readUploadTicket)
+import Hetoimasia.GPU.Vulkan.Native.Uploads (UploadGrant, UploadPressure, UploadRefusal (..), UploadState (..), UploadTicket, readUploadTicket, returnUploadGrant)
 import Hetoimasia.Render.TwoD.Chunk
   ( BoundsRequest
   , Chunk
@@ -264,7 +266,7 @@ buildRetainedChunkWith builders retained marks kind bounds records instances =
     Left refusal → pure (Left (BuildRefused refusal NoAllocation))
     Right prepared →
       mask_ $
-        atomically (admitRetainedChunk (bufferUploads builders) retained prepared) >>= \case
+        atomically (admitWith False (bufferUploads builders) retained prepared) >>= \case
           Left refusal → pure (Left (BuildRefused refusal NoAllocation))
           -- the caller is its own collector: the sealed receipt is claimed in the hand-off, whatever the exit
           Right grant → spendChunkGrant builders retained grant `finally` atomically (claimReceipt (chunkGrantReceipt grant))
@@ -352,6 +354,21 @@ claimReceipt receipt =
       pure (Just outcome)
     _ → pure Nothing
 
+-- | The registry's teardown sweep: claim every indexed receipt whose build is sealed and whose collector has not
+-- claimed it, with its number, so its owner can retire what it holds. An unsealed receipt is left for a later sweep.
+sweepRegistry ∷ Retained → STM [(Word64, Either BuildRefused ChunkRef)]
+sweepRegistry (Retained ledger) = do
+  indexed ← Map.toList . ledgerReceipts <$> readTVar ledger
+  fmap concat . forM indexed $ \(number, cell) →
+    claimReceipt (BuildReceipt number cell ledger) <&> maybe [] (\outcome → [(number, outcome)])
+
+-- | How many indexed receipts the registry holds, none of them claimed yet, and how many of those are sealed.
+receiptsHeld ∷ Retained → STM (Int, Int)
+receiptsHeld (Retained ledger) = do
+  cells ← Map.elems . ledgerReceipts <$> readTVar ledger
+  sealed ← length . filter id <$> mapM (\cell → readTVar cell <&> \case ReceiptOpen → False; _ → True) cells
+  pure (length cells, sealed)
+
 -- Seal a build's outcome into its receipt, available to one claimant.
 sealReceipt ∷ ChunkGrant → Either BuildRefused ChunkRef → STM ()
 sealReceipt grant outcome = writeTVar (receiptCell (grantReceipt grant)) (ReceiptAvailable outcome)
@@ -379,7 +396,12 @@ chunkRoom room (Retained ledger) bytes = do
 -- and 'BuildReferencesExhausted' can change, every other refusal (an oversized
 -- chunk among them) cannot.
 admitRetainedChunk ∷ BufferUploads → Retained → PreparedChunk → STM (Either BuildRefusal ChunkGrant)
-admitRetainedChunk uploads (Retained ledger) prepared = do
+admitRetainedChunk = admitWith True
+
+-- Admission, its receipt indexed in the registry for an outside collector (and the registry's teardown sweep), or not,
+-- for a caller that claims its own in the same masked handoff.
+admitWith ∷ Bool → BufferUploads → Retained → PreparedChunk → STM (Either BuildRefusal ChunkGrant)
+admitWith indexed uploads (Retained ledger) prepared = do
   held ← readTVar ledger
   case nextReference held of
     Nothing → pure (Left BuildReferencesExhausted)
@@ -394,7 +416,7 @@ admitRetainedChunk uploads (Retained ledger) prepared = do
           standing ← newTVar GrantReserved
           cell ← newTVar ReceiptOpen
           let number = ledgerReceiptNext afterwards
-          writeTVar ledger afterwards {ledgerReceipts = Map.insert number cell (ledgerReceipts afterwards), ledgerReceiptNext = number + 1}
+          writeTVar ledger afterwards {ledgerReceipts = (if indexed then Map.insert number cell else id) (ledgerReceipts afterwards), ledgerReceiptNext = number + 1}
           pure (Right (ChunkGrant reference prepared granted ledger uploads standing (BuildReceipt number cell ledger)))
 
 uploadRefusal ∷ BufferUploadRefusal → BuildRefusal
@@ -420,7 +442,7 @@ abandonChunkGrant (Retained ledger) grant =
 giveBack ∷ ChunkGrant → STM ()
 giveBack grant = do
   writeTVar (grantStanding grant) GrantSealed
-  mapM_ (abandonRoom (grantUploads grant)) (grantUpload grant)
+  mapM_ returnUploadGrant (grantUpload grant)
   modifyTVar' (grantRegistry grant) (\held → held {ledgerFree = chunkRefIndex (grantReference grant) : ledgerFree held})
 
 -- | Spend a grant on the graphics owner's thread, and settle it once, whatever the exit. The grant moves from reserved

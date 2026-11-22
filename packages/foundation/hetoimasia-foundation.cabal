@@ -37,6 +37,7 @@ source-repository head
 
 library
     exposed-modules:
+        Hetoimasia.Foundation.Admission
         Hetoimasia.Foundation.Failure
         Hetoimasia.Foundation.Log
         Hetoimasia.Foundation.Messaging.Channel

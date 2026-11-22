@@ -261,7 +261,6 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , vulkanUploadRoom
   , reserveVulkanUpload
   , submitVulkanGranted
-  , abandonVulkanGrant
   , validateUploadConfig
   , LookupEntry (..)
   , TableSampler (..)
@@ -2086,7 +2085,6 @@ retainedHost vulkan =
         { Render.roomFor = fmap answered . vulkanUploadRoom vulkan
         , Render.reserveRoom = fmap answered . reserveVulkanUpload vulkan
         , Render.uploadGranted = \grant buffer bytes → answered <$> submitVulkanGranted vulkan grant buffer bytes
-        , Render.abandonRoom = abandonVulkanGrant vulkan
         }
     answered = \case
       Left (VulkanUploadRefused refusal) → Left (Render.BufferUploadRefused refusal)

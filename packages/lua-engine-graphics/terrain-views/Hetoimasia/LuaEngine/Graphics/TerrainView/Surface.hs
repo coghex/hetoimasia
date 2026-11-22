@@ -40,6 +40,7 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView.Surface
   , surfaceAuthority
   , surfaceGeometry
   , surfaceVersion
+  , surfaceRevalidation
   , surfaceShowing
   , surfaceBind
   , surfaceUnbind
@@ -170,11 +171,12 @@ data HeldTarget = HeldTarget
   , heldFault ∷ !(TVar (Maybe HeldFault))
   }
 
--- | How a held target's version read fails, while its holder says so: it raises, waits, or is cancelled.
-data HeldFault = HeldRaises | HeldWaits | HeldCancelled
+-- | How a held target's revalidation read fails, while its holder says so: it raises, waits, or is cancelled; or
+-- its facts change right after the read.
+data HeldFault = HeldRaises | HeldWaits | HeldCancelled | HeldChanges
   deriving (Eq, Show)
 
--- | Make the held target's version read fail, or read again.
+-- | Make the held target's revalidation read fail, or read again.
 setHeldFault ∷ HeldTarget → Maybe HeldFault → STM ()
 setHeldFault held = writeTVar (heldFault held)
 
@@ -221,17 +223,25 @@ surfaceGeometry = \case
   HeldSurface held → geometryOfMetrics . factsMetrics <$> readTVar (heldFacts held)
 
 -- | The version of the target's facts now: equal versions, read in two transactions, mean no change between them.
--- A held target's read can be made to fail ('setHeldFault').
+-- It never waits.
 surfaceVersion ∷ ViewSurface → STM SurfaceVersion
 surfaceVersion = \case
   WindowSurface _ _ view _ → WindowFacts . snd <$> windowViewGeometry view
   OffscreenSurface _ _ (OffscreenFacts cell) → HeldFacts . factsVersion <$> readTVar cell
+  HeldSurface held → HeldFacts . factsVersion <$> readTVar (heldFacts held)
+
+-- | What a view's revalidation of its work reads of the target beyond its facts: nothing, but for a held target its
+-- holder has made fail ('setHeldFault'): raise, wait, be cancelled, or see the facts change right after the read.
+surfaceRevalidation ∷ ViewSurface → STM ()
+surfaceRevalidation = \case
   HeldSurface held →
     readTVar (heldFault held) >>= \case
-      Nothing → HeldFacts . factsVersion <$> readTVar (heldFacts held)
+      Nothing → pure ()
       Just HeldRaises → throwSTM (ErrorCall "the held target's facts could not be read")
       Just HeldWaits → retry
       Just HeldCancelled → throwSTM ThreadKilled
+      Just HeldChanges → changeFacts (heldFacts held) id
+  _ → pure ()
 
 -- | Whether the target holds a published scene (an M1 scene, say), whose frame is or was drawn.
 surfaceShowing ∷ ViewSurface → STM Bool

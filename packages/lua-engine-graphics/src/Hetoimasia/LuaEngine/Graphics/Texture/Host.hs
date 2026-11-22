@@ -100,7 +100,6 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , vulkanUploadRoom
   , reserveVulkanUpload
   , submitVulkanGranted
-  , abandonVulkanGrant
   , swapConstructedTexture
   , awaitVulkanAction
   )
@@ -157,7 +156,6 @@ hostBufferUploads host =
     { roomFor = fmap hostUploadAnswer . vulkanUploadRoom host
     , reserveRoom = fmap hostUploadAnswer . reserveVulkanUpload host
     , uploadGranted = \grant buffer bytes → hostUploadAnswer <$> submitVulkanGranted host grant buffer bytes
-    , abandonRoom = abandonVulkanGrant host
     }
 
 -- | The host's upload answer as a chunk's build reads it: uploads configured and awaiting the device are not ready

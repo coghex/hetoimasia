@@ -183,6 +183,7 @@ import Data.Map.Strict (Map)
 import Data.Maybe (isJust)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
+import Hetoimasia.Foundation.Admission (Admission, AdmissionToken, admissionToken, closeAdmission, newAdmissionIO, tokenOpen)
 import Hetoimasia.Foundation.Messaging.Channel
   ( ChannelControl
   , ChannelStatistics (statisticsCapacity, statisticsDepth)
@@ -449,7 +450,7 @@ data OwnerHandoff scene = OwnerHandoff
   , handoffStatus ∷ !(TVar OwnerStatus)
   , handoffTargetTerminals ∷ !(TVar (Map AttachmentId TerminalRecord))
   , handoffOwnerTerminal ∷ !(TVar OwnerTerminal)
-  , handoffAdmitting ∷ !(TVar Bool)
+  , handoffAdmitting ∷ !Admission
     -- ^ Whether the lifetime port still admits. The channel's own phase is not
     -- readable without taking from it, and a reader that had to take would be
     -- a reader that could lose an event.
@@ -478,7 +479,7 @@ newOwnerHandoff limit capacity mode scene = do
     <*> newTVarIO initialOwnerStatus
     <*> newTVarIO Map.empty
     <*> newTVarIO noOwnerTerminal
-    <*> newTVarIO True
+    <*> newAdmissionIO
 
 -- | The most observation slots the handoff holds at once.
 handoffLimit ∷ OwnerHandoff scene → Int
@@ -513,18 +514,18 @@ takeTargetEvents handoff = go []
 closeTargetEvents ∷ OwnerHandoff scene → STM ()
 closeTargetEvents handoff = do
   closeChannel (handoffEvents handoff)
-  writeTVar (handoffAdmitting handoff) False
+  closeAdmission (handoffAdmitting handoff)
 
 -- | Whether the lifetime port still admits an event, readable from any thread
 -- and taking nothing.
 targetEventsOpen ∷ OwnerHandoff scene → STM Bool
-targetEventsOpen = readTVar . handoffAdmitting
+targetEventsOpen = tokenOpen . admissionToken . handoffAdmitting
 
--- | The port's admission itself, for a consumer that must verify it as data
--- inside its own commits: 'True' until 'closeTargetEvents', then 'False' for
--- good. A later handoff has a cell of its own.
-targetAdmission ∷ OwnerHandoff scene → TVar Bool
-targetAdmission = handoffAdmitting
+-- | The port's admission as a read-only token, for a consumer that verifies it
+-- inside its own commits: open until 'closeTargetEvents', then closed for good.
+-- A later handoff has an admission of its own.
+targetAdmission ∷ OwnerHandoff scene → AdmissionToken
+targetAdmission = admissionToken . handoffAdmitting
 
 -- | End every publication into the handoff: the lifetime port, the demand
 -- snapshot, the scene snapshot, and each target's observation slot.

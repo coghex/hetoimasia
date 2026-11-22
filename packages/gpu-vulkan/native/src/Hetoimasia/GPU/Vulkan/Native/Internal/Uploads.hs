@@ -58,6 +58,7 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Uploads
   , reserveUpload
   , submitUploadGranted
   , abandonUploadGrant
+  , returnUploadGrant
 
     -- * Tickets
   , UploadTicket
@@ -84,7 +85,7 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Uploads
 
 import Control.Concurrent (ThreadId, myThreadId)
 import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVar, newTVarIO, orElse, readTVar, retry, writeTVar)
-import Control.Exception (SomeException, mask, rethrowIO, tryWithContext)
+import Control.Exception (SomeException, evaluate, mask, rethrowIO, tryWithContext)
 import Control.Monad (forM, forM_, unless, when)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
@@ -97,6 +98,7 @@ import Data.Word (Word32, Word64)
 import Numeric.Natural (Natural)
 import System.Timeout (timeout)
 
+import Hetoimasia.Foundation.Admission (AdmissionToken, tokenOpen)
 import Hetoimasia.Foundation.Time (Duration, durationNanoseconds)
 import Hetoimasia.GPU.Model
   ( HoldKind (..)
@@ -415,26 +417,26 @@ submitUpload = submitUploadGated ungated
 -- these two asks run the gate's own transaction.
 type UploadGate = STM (Either UploadRefusal UploadPermit)
 
--- | The admission a gate gave, as data: none needed, or its owner's admission
--- cell, open until the owner closes it once (a reopened admission is a cell
--- of its own). The commits that admit and queue the upload read only that
--- cell: an admission closed meanwhile refuses them.
-data UploadPermit = UploadUngated | UploadAdmitted !(TVar Bool)
+-- | The admission a gate gave, as data: none needed, or the read-only token of
+-- its owner's admission, open until the owner closes it once (a reopened
+-- admission is another). The commits that admit and queue the upload read only
+-- that token: an admission closed meanwhile refuses them.
+data UploadPermit = UploadUngated | UploadAdmitted !AdmissionToken
   deriving (Eq)
 
 -- | No gate: every upload is admitted.
 ungated ∷ UploadGate
 ungated = pure (Right UploadUngated)
 
--- | A permit under this admission cell.
-admittedWhile ∷ TVar Bool → UploadPermit
+-- | A permit under this admission.
+admittedWhile ∷ AdmissionToken → UploadPermit
 admittedWhile = UploadAdmitted
 
 -- Whether the admission a permit names is still open: a read of its cell.
 permitOpen ∷ UploadPermit → STM Bool
 permitOpen = \case
   UploadUngated → pure True
-  UploadAdmitted cell → readTVar cell
+  UploadAdmitted token → tokenOpen token
 
 -- | 'submitUpload' under a caller's gate, asked before the upload is admitted
 -- and again before it is queued. The admitting commit verifies the first
@@ -458,35 +460,41 @@ submitWith
   → IO (Either UploadRefusal UploadTicket)
 submitWith gate uploads grant request = mask $ \restore →
   -- the gate, before anything is taken: its refusal, exception or cancellation leaves everything as it was
-  restore (atomically (asked gate)) >>= \case
+  restore (atomically (asked gate) >>= forced) >>= \case
     Left refusal → pure (Left refusal)
     Right permit →
       atomically (permitOpen permit >>= \open → if open then admit uploads grant request else pure (Left UploadClosed)) >>= \case
         Left refusal → pure (Left refusal)
         Right (number, ticket, offset, pieces) → do
-          -- admitted: from here until the upload is queued, every exit gives back its place, region and target
+          -- admitted: from here until the queue takes the upload, one cleanup owns every exit (the copy, the gate's
+          -- second answer and its evaluation, the queueing commit); once queued, the cleanup leaves it to the queue
+          transferred ← tryWithContext @SomeException . restore $ do
+            writePieces uploads offset pieces
+            atomically (asked gate) >>= forced >>= \case
+              Left refusal → pure (Left refusal)
+              Right permit' → atomically (queue permit permit' number ticket)
           let cleanup = atomically (forgetAdmitting uploads number)
-          copied ← tryWithContext @SomeException (restore (writePieces uploads offset pieces >> atomically (asked gate)))
-          queued ← case copied of
-            Left failure → pure (Left failure)
-            Right (Left refusal) → pure (Right (Left refusal))
-            Right (Right permit') → tryWithContext @SomeException (atomically (queue permit permit' number ticket))
-          case queued of
+          case transferred of
             Left failure → cleanup >> rethrowIO failure
             Right (Left refusal) → Left refusal <$ cleanup
             Right (Right queuedTicket) → pure (Right queuedTicket)
   where
     asked ask = ask `orElse` pure (Left UploadGateBusy)
-    -- the upload's place, region and target pass to the queue: the second permit names the admission the first did,
-    -- still open, and the uploads are open
+    -- a gate's answer evaluated where its exception is owned: the answer and the permit it carries
+    forced answer = evaluate answer >>= either (pure . Left) (fmap Right . evaluate)
+    -- the upload's place, region and target pass to the queue: the session still running, the uploads open, and the
+    -- second permit naming the admission the first did, still open
     queue permit permit' number ticket = do
+      primary ← reportPrimary <$> readRootsTerminal (recordingRoots (framesRecording (uploadsFrames uploads)))
       state ← readTVar (uploadsState uploads)
       open ← permitOpen permit
-      if stateOpen state && open && permit' == permit
-        then do
-          modifyTVar' (uploadsState uploads) (\current → current {stateEntries = Map.adjust (\entry → entry {entryPhase = PhaseQueued}) number (stateEntries current)})
-          pure (Right ticket)
-        else pure (Left UploadClosed)
+      case primary of
+        Just failure → pure (Left (UploadSessionFailed failure))
+        Nothing
+          | stateOpen state && open && permit' == permit → do
+              modifyTVar' (uploadsState uploads) (\current → current {stateEntries = Map.adjust (\entry → entry {entryPhase = PhaseQueued}) number (stateEntries current)})
+              pure (Right ticket)
+          | otherwise → pure (Left UploadClosed)
 
 -- An admitted upload not yet queued, forgotten by the exit that ends its admission: its entry, region and target's
 -- hold. One already queued is the queue's.
@@ -737,6 +745,21 @@ submitUploadGranted
   → ByteString
   → IO (Either UploadRefusal UploadTicket)
 submitUploadGranted gate uploads grant buffer bytes = submitWith gate uploads (Just grant) (UploadBuffer buffer bytes)
+
+-- | Give a reservation back through the uploads that issued it, from any
+-- thread: its place and region are free again. It reads and writes only its
+-- issuer's state and its own cell. A spent or abandoned one changes nothing.
+returnUploadGrant ∷ UploadGrant → STM ()
+returnUploadGrant grant = do
+  state ← readTVar (grantOwner grant)
+  standing ← readTVar (uploadGrantCell grant)
+  case Map.lookup (grantNumber grant) (stateGrants state) of
+    Just held
+      | standing == GrantReserved
+      , grantCell held == uploadGrantCell grant → do
+          writeTVar (uploadGrantCell grant) GrantAbandoned
+          writeTVar (grantOwner grant) state {stateGrants = Map.delete (grantNumber grant) (stateGrants state)}
+    _ → pure ()
 
 -- | Abandon a reservation, from any thread: its place and region are free
 -- again. A spent, abandoned or foreign one changes nothing.

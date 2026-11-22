@@ -482,14 +482,15 @@ data Retiring k = Retiring
 type Held k = (k, Word64, ChunkRef)
 
 -- | A granted build not yet collected: its receipt, the target its slot is charged to, the view and the attempt (stage
--- serial) that took it and the part it builds. Relinquished to the sweep, it is collected by none but the sweep.
+-- serial) that took it and the part it builds. Relinquished to the sweep, with why, it is collected by none but the
+-- sweep.
 data PendingBuild k = PendingBuild
   { pbReceipt ∷ !Receipt
   , pbTarget ∷ !k
   , pbView ∷ !Word64
   , pbSerial ∷ !Word64
   , pbPart ∷ !PartKey
-  , pbSweep ∷ !Bool
+  , pbSweep ∷ !(Maybe Text)
   }
 
 -- | What a disposal is of: a released chunk, or the buffer a refused build made (no chunk was registered), with its
@@ -517,6 +518,16 @@ data TerrainViews k = TerrainViews
     -- ^ Terminal failures, with their causes: a chunk whose release or disposal failed keeps its identity and its slot.
   , svPending ∷ !(TVar (Map Word64 (PendingBuild k)))
     -- ^ Granted builds not yet collected, by their receipt's key: each is one build of its view and holds its slot.
+  , svSwept ∷ !(TVar (Seq (k, Word64, Text)))
+    -- ^ The latest builds the sweep collected in their views' place: target, view, what the build left and why the
+    -- sweep took it (at most 64).
+  , svOrphans ∷ !(TVar [ChunkRef])
+    -- ^ Registered chunks the registry's teardown sweep found with no pending build: released by the owner, charged to
+    -- no target.
+  , svOrphansDisposing ∷ !(TVar [(ChunkRef, STM ConstructedDisposal)])
+    -- ^ Those released, until the backend confirms their disposal.
+  , svOrphanFailures ∷ !(TVar [(ChunkRef, Text)])
+    -- ^ Those whose release or disposal failed, with the cause.
   , svOpen ∷ !(TVar Bool)
   , svScheduled ∷ !(TVar Bool)
     -- ^ A step was admitted and has not started.
@@ -606,6 +617,10 @@ newService config ports allowance = do
   disposing ← newTVarIO []
   failed ← newTVarIO []
   pending ← newTVarIO Map.empty
+  swept ← newTVarIO Seq.empty
+  orphans ← newTVarIO []
+  orphansDisposing ← newTVarIO []
+  orphanFailures ← newTVarIO []
   open ← newTVarIO True
   scheduled ← newTVarIO False
   step ← newTVarIO Nothing
@@ -626,6 +641,10 @@ newService config ports allowance = do
       , svDisposing = disposing
       , svFailed = failed
       , svPending = pending
+      , svSwept = swept
+      , svOrphans = orphans
+      , svOrphansDisposing = orphansDisposing
+      , svOrphanFailures = orphanFailures
       , svOpen = open
       , svScheduled = scheduled
       , svStep = step
@@ -839,7 +858,10 @@ drained service = do
   inHand ← readTVar (svInHand service)
   disposing ← readTVar (svDisposing service)
   pending ← readTVar (svPending service)
-  pure (Seq.null retiring && null private && null inHand && null disposing && Map.null pending)
+  orphans ← readTVar (svOrphans service)
+  orphansDisposing ← readTVar (svOrphansDisposing service)
+  (held, _) ← ownerReceiptsHeld (portOwner (svPorts service))
+  pure (Seq.null retiring && null private && null inHand && null disposing && Map.null pending && null orphans && null orphansDisposing && held == 0)
 
 -- At the service's end: chunks a failed handback protects that an adopted revision still holds go to the session's
 -- teardown, recorded with that cause; their slots stay occupied.
@@ -1215,7 +1237,7 @@ endViewSTM service vs ending =
       forM_ (Map.elems moves) (settleOnce (MoveEnded ending))
       writeTVar (vsMoves vs) Map.empty
       -- its granted builds are collected by the sweep, in place of the view
-      modifyTVar' (svPending service) (Map.map (\entry → if pbView entry == vsId vs then entry {pbSweep = True} else entry))
+      modifyTVar' (svPending service) (Map.map (\entry → if pbView entry == vsId vs then entry {pbSweep = Just "its view ended"} else entry))
       forgetReceipt (portReceipts ports) (vsId vs)
       surfaceUnbind (vtSurface target)
       writeTVar (vsPins vs) Map.empty
@@ -1596,7 +1618,7 @@ abandon service vs serial = do
 -- prepared from; and, for work that settles a move, the camera's pending jump is the one captured. Every transaction
 -- that writes a stage, changes the camera, settles a move, records a refusal or publishes asks it.
 stillCurrent ∷ TerrainViews k → ViewState k → Word64 → Basis → Maybe (Maybe JumpId) → STM Bool
-stillCurrent service vs serial basis jump = currentBy serial basis jump <$> witnessOf service vs
+stillCurrent service vs serial basis jump = currentBy serial basis jump <$> liveWitness service vs
 
 -- | Everything a view's work being current depends on, as one read gives it: the stage's serial, the view's and the
 -- service's standing, the owner's gate, the target's usability and its facts' version, the original authority, the
@@ -1618,10 +1640,15 @@ data Witness = Witness
   }
   deriving (Eq)
 
--- | Read the witness of a view's work, through the service's own cells and the target's, the leases' and the terrain
--- service's concrete readers: no caller's transaction.
+-- | A build's revalidation: the witness of the view's work, and whatever else the target's revalidation reads
+-- ('surfaceRevalidation'), in a read-only transaction of its own, outside any commit.
 witnessOf ∷ TerrainViews k → ViewState k → STM Witness
-witnessOf service vs = do
+witnessOf service vs = liveWitness service vs <* surfaceRevalidation (vtSurface (vsTarget vs))
+
+-- | The witness of a view's work as its writers' cells give it now, through the service's own cells and the target's,
+-- the leases' and the terrain service's concrete readers: no caller's transaction, and none that waits.
+liveWitness ∷ TerrainViews k → ViewState k → STM Witness
+liveWitness service vs = do
   serial ← readTVar (vsStageSerial vs)
   status ← readTVar (vsStatus vs)
   open ← readTVar (svOpen service)
@@ -2088,30 +2115,31 @@ stepBuilding service hands vs serial prep candidate
                 NextGranted grant → do
                   occupy service tkey 1
                   for_ (Seq.lookup 0 (cdPrepared c)) $ \(part, _, _, _) →
-                    modifyTVar' (svPending service) (Map.insert (receiptKey (grantReceipt grant)) (PendingBuild (grantReceipt grant) tkey (vsId vs) serial part False))
+                    modifyTVar' (svPending service) (Map.insert (receiptKey (grantReceipt grant)) (PendingBuild (grantReceipt grant) tkey (vsId vs) serial part Nothing))
                 NextBlocked → writeTVar (vsArmed vs) True
                 _ → pure ()
               pure (Just (c, next))
             _ → pure Nothing
         case decided of
           Nothing → pure (Just True)
-          Just (c, NextGranted grant) → do
+          Just (_, NextGranted grant) → do
             let key = receiptKey (grantReceipt grant)
-                -- relinquished to the sweep, before a raised exit goes on
-                relinquished failure = atomically (relinquish service key) >> rethrowIO failure
-            if Seq.null (cdPrepared c)
-              then Just False <$ atomically (grantAbandon grant >> collectBuild service vs serial basis Nothing key)
-              else
-                -- the outcome is sealed whatever the spend's exit: a synchronous exception's cause is in it
-                tryWithContext @SomeException (grantSpend grant) >>= \case
-                  Left failure@(ExceptionWithContext _ raised) | Just (_ ∷ SomeAsyncException) ← fromException raised → relinquished failure
-                  _ →
-                    -- revalidation: one read-only snapshot, its evidence strict
-                    tryWithContext @SomeException (atomically ((Just <$> witnessOf service vs) `orElse` pure Nothing)) >>= \case
-                      Left failure → relinquished failure
-                      -- the revalidation would wait: the sweep collects the build, and the step yields
-                      Right Nothing → Just False <$ atomically (relinquish service key)
-                      Right (Just evidence) → atomically (collectBuild service vs serial basis (Just evidence) key) <&> \taken → if taken then Nothing else Just False
+                -- a cancellation: the build is left to the sweep, and the cancellation goes on (the owner is ending)
+                cancelled failure@(ExceptionWithContext _ raised) = atomically (relinquish service key (Text.pack (displayException raised))) >> rethrowIO failure
+                asynchronous (ExceptionWithContext _ raised) = isJust (fromException raised ∷ Maybe SomeAsyncException)
+            -- the outcome is sealed whatever the spend's exit: a synchronous exception's cause is in it
+            tryWithContext @SomeException (grantSpend grant) >>= \case
+              Left failure | asynchronous failure → cancelled failure
+              _ →
+                -- revalidation: one read-only snapshot, its evidence strict
+                tryWithContext @SomeException (atomically ((Just <$> witnessOf service vs) `orElse` pure Nothing)) >>= \case
+                  Left failure
+                    | asynchronous failure → cancelled failure
+                    -- a revalidation that raised: the sweep collects the build, with the cause, and the step yields
+                    | ExceptionWithContext _ raised ← failure → Just False <$ atomically (relinquish service key ("its revalidation raised: " <> Text.pack (displayException raised)))
+                  -- the revalidation would wait: the sweep collects the build, and the step yields
+                  Right Nothing → Just False <$ atomically (relinquish service key "its revalidation would wait")
+                  Right (Just evidence) → atomically (collectBuild service vs serial basis evidence key) <&> \taken → if taken then Nothing else Just False
           Just (c, NextPublish) → Just <$> publish service vs serial prep c
           Just (_, NextBlocked) → pure (Just False)
           Just (_, NextFailed why) → Just False <$ atomically (refuse service vs serial basis (LimitFailure ("a chunk's upload ended without completing: " <> why)))
@@ -2128,7 +2156,7 @@ stepBuilding service hands vs serial prep candidate
 -- (no source changed since), and the candidate's head is this part; otherwise to private retirement. A failure records
 -- what it left, and, for the current attempt, its refusal. Answers whether the candidate took the part. A build already
 -- swept, or not yet sealed, is left as it is.
-collectBuild ∷ (Ord k, Show k) ⇒ TerrainViews k → ViewState k → Word64 → Basis → Maybe Witness → Word64 → STM Bool
+collectBuild ∷ (Ord k, Show k) ⇒ TerrainViews k → ViewState k → Word64 → Basis → Witness → Word64 → STM Bool
 collectBuild service vs serial basis evidence key =
   Map.lookup key <$> readTVar (svPending service) >>= \case
     Nothing → pure False
@@ -2137,8 +2165,9 @@ collectBuild service vs serial basis evidence key =
         Nothing → pure False
         Just outcome → do
           modifyTVar' (svPending service) (Map.delete key)
-          now ← witnessOf service vs
-          let current = pbSerial entry == serial && maybe False (\seen → currentBy serial basis Nothing seen && seen == now) evidence
+          -- the evidence against the writers' cells now: no source changed since the revalidation read it
+          now ← liveWitness service vs
+          let current = pbSerial entry == serial && currentBy serial basis Nothing evidence && evidence == now
           stage ← readTVar (vsStage vs)
           case (outcome, stage) of
             (Right chunk, Building p c)
@@ -2165,23 +2194,33 @@ failureLeft service entry (BuildFailed primary allocated) = case allocated of
   AllocatedDisposing identity reading → modifyTVar' (svDisposing service) (<> [(DisposeAllocation (pbTarget entry) (pbView entry) identity primary, reading)])
   AllocatedFailed why → modifyTVar' (svFailed service) (<> [(pbTarget entry, Nothing, "the build failed (" <> primary <> "), and " <> why)])
 
--- Leave a pending build to the sweep.
-relinquish ∷ TerrainViews k → Word64 → STM ()
-relinquish service key = modifyTVar' (svPending service) (Map.adjust (\entry → entry {pbSweep = True}) key)
+-- Leave a pending build to the sweep, with why.
+relinquish ∷ TerrainViews k → Word64 → Text → STM ()
+relinquish service key why = modifyTVar' (svPending service) (Map.adjust (\entry → entry {pbSweep = Just why}) key)
 
--- The sweep: every pending build left to it whose receipt is sealed is claimed in place of its view and retired. It
--- runs no caller code. Having collected any, it asks for the owner's next step (the views' work can go on). Answers
--- whether it collected any.
+-- The sweep: every pending build left to it whose receipt is sealed is claimed in place of its view and retired, and
+-- recorded with what it left and why the sweep took it. It runs no caller code. Having collected any, it asks for the
+-- owner's next step (the views' work can go on). Answers whether it collected any.
 sweepPending ∷ Ord k ⇒ TerrainViews k → STM Bool
 sweepPending service = do
   pending ← Map.toList <$> readTVar (svPending service)
   swept ←
-    fmap or . forM [(key, entry) | (key, entry) ← pending, pbSweep entry] $ \(key, entry) →
+    fmap or . forM [(key, entry, why) | (key, entry) ← pending, Just why ← [pbSweep entry]] $ \(key, entry, why) →
       receiptClaim (pbReceipt entry) >>= \case
         Nothing → pure False
-        Just outcome → True <$ (modifyTVar' (svPending service) (Map.delete key) >> retireOutcome service entry outcome)
+        Just outcome → True <$ sweptBuild service key entry outcome why
   when swept (writeTVar (svKickWanted service) True)
   pure swept
+
+-- A build the sweep collected: its pending entry goes, what it left is retired, and the record keeps both causes.
+sweptBuild ∷ Ord k ⇒ TerrainViews k → Word64 → PendingBuild k → Either BuildFailure ChunkRef → Text → STM ()
+sweptBuild service key entry outcome why = do
+  modifyTVar' (svPending service) (Map.delete key)
+  retireOutcome service entry outcome
+  let left = case outcome of
+        Right chunk → "a registered chunk (" <> Text.pack (show chunk) <> "), retired privately"
+        Left (BuildFailed primary _) → "the build failed: " <> primary
+  modifyTVar' (svSwept service) (\records → Seq.drop (Seq.length records - 63) (records |> (pbTarget entry, pbView entry, left <> "; swept because " <> why)))
 
 -- Whether a pending build is sealed: the sweep or its collector can take it now.
 anySealed ∷ TerrainViews k → STM Bool
@@ -2196,8 +2235,8 @@ orphanedBuilds service = do
     then pure False
     else do
       pending ← Map.toList <$> readTVar (svPending service)
-      sealed ← filterM (receiptSealed . pbReceipt . snd) [(key, entry) | (key, entry) ← pending, not (pbSweep entry)]
-      forM_ sealed (relinquish service . fst)
+      sealed ← filterM (receiptSealed . pbReceipt . snd) [(key, entry) | (key, entry) ← pending, isNothing (pbSweep entry)]
+      forM_ sealed (\(key, _) → relinquish service key "no owner step collected it")
       pure (not (null sealed))
 
 -- The candidate's one decision, which the owner takes (reserving through @admitNext@, with the slot, in the caller's
@@ -2383,6 +2422,15 @@ retire ∷ (Ord k, Show k) ⇒ TerrainViews k → Hands → IO Bool
 retire service hands = do
   _ ← atomically (askBarriers service)
   confirmed ← atomically (confirmDisposals service)
+  -- at the service's end, the registry's teardown sweep: every sealed receipt no view collected
+  closing ← not <$> readTVarIO (svOpen service)
+  registry ← if closing then atomically (handSweepReceipts hands >>= registrySwept service) else pure False
+  orphaned ← atomically $ do
+    orphans ← readTVar (svOrphans service)
+    ready ← filterM notUploading orphans
+    writeTVar (svOrphans service) (filter (`notElem` ready) orphans)
+    pure ready
+  forM_ orphaned releaseOrphan
   picked ← atomically $ do
     chosen ← take budget <$> disposable service
     let taken (key, view, chunk) = (key, view, chunk) `elem` chosen
@@ -2391,9 +2439,15 @@ retire service hands = do
     modifyTVar' (svInHand service) (<> chosen)
     pure chosen
   forM_ picked releaseOne
-  pure (confirmed || not (null picked))
+  pure (confirmed || registry || not (null orphaned) || not (null picked))
   where
     budget = 64
+    notUploading chunk = (/= Just ChunkUploading) <$> ownerStanding (portOwner (svPorts service)) chunk
+    releaseOrphan chunk =
+      mask $ \_ →
+        handDispose hands chunk >>= \outcome → atomically $ case outcome of
+          Right reading → modifyTVar' (svOrphansDisposing service) (<> [(chunk, reading)])
+          Left why → modifyTVar' (svOrphanFailures service) (<> [(chunk, "the orphaned chunk's release failed: " <> why)])
     releaseOne held@(key, _, chunk) =
       mask $ \_ → do
         outcome ← handDispose hands chunk
@@ -2423,10 +2477,29 @@ disposable service = do
   where
     notUploading chunk = (/= Just ChunkUploading) <$> ownerStanding (portOwner (svPorts service)) chunk
 
+-- What the registry's teardown sweep claimed: a build with a pending entry is swept in its view's place; a registered
+-- chunk with none is an orphan, released by the owner and charged to no target (a refusal with none holds nothing).
+-- Answers whether it claimed any.
+registrySwept ∷ Ord k ⇒ TerrainViews k → [(Word64, Either BuildFailure ChunkRef)] → STM Bool
+registrySwept service claimed = do
+  forM_ claimed $ \(key, outcome) →
+    Map.lookup key <$> readTVar (svPending service) >>= \case
+      Just entry → sweptBuild service key entry outcome (fromMaybe "the registry's teardown sweep found it" (pbSweep entry))
+      Nothing → case outcome of
+        Right chunk → modifyTVar' (svOrphans service) (chunk :)
+        Left _ → pure ()
+  pure (not (null claimed))
+
 -- The disposals the backend has finished: a done one frees its slot, a failed one becomes a failure with its cause and
 -- keeps its slot. Answers whether any finished.
 confirmDisposals ∷ Ord k ⇒ TerrainViews k → STM Bool
 confirmDisposals service = do
+  orphans ← readTVar (svOrphansDisposing service)
+  orphanReadings ← forM orphans $ \entry@(_, reading) → (,) entry <$> reading
+  forM_ orphanReadings $ \((chunk, _), standing) → case standing of
+    DisposalFailed why → modifyTVar' (svOrphanFailures service) (<> [(chunk, "the orphaned chunk's disposal failed: " <> why)])
+    _ → pure ()
+  writeTVar (svOrphansDisposing service) [entry | (entry, DisposalPending) ← orphanReadings]
   disposing ← readTVar (svDisposing service)
   readings ← forM disposing $ \entry@(_, reading) → (,) entry <$> reading
   forM_ readings $ \((entry, _), standing) → case standing of
@@ -2435,7 +2508,7 @@ confirmDisposals service = do
     DisposalPending → pure ()
   let pending = [entry | (entry, DisposalPending) ← readings]
   when (length pending /= length disposing) (writeTVar (svDisposing service) pending)
-  pure (length pending /= length disposing)
+  pure (length pending /= length disposing || any (\(_, standing) → standing /= DisposalPending) orphanReadings)
 
 disposalTarget ∷ Disposal k → k
 disposalTarget = \case
@@ -2454,7 +2527,12 @@ retirementReady service = do
   candidates ← disposable service
   disposing ← readTVar (svDisposing service)
   finished ← or <$> forM disposing (\(_, reading) → (/= DisposalPending) <$> reading)
-  pure (not (null candidates) || finished)
+  orphans ← readTVar (svOrphans service)
+  orphanFinished ← readTVar (svOrphansDisposing service) >>= fmap or . mapM (\(_, reading) → (/= DisposalPending) <$> reading)
+  -- at the service's end, a sealed receipt no view collected is the registry's teardown sweep's
+  closing ← not <$> readTVar (svOpen service)
+  (_, sealed) ← ownerReceiptsHeld (portOwner (svPorts service))
+  pure (not (null candidates) || finished || not (null orphans) || orphanFinished || (closing && sealed > 0))
 
 -- ---------------------------------------------------------------------------
 -- Observation
@@ -2549,6 +2627,10 @@ data ServiceReading k = ServiceReading
     -- ^ Chunks released and awaiting the backend's confirmation of their disposal (or in the owner's hand).
   , servicePending ∷ !Int
     -- ^ Granted builds not yet collected, by their views or the sweep.
+  , serviceSwept ∷ ![(k, Word64, Text)]
+    -- ^ The latest builds the sweep collected in their views' place: target, view, what each left and why it was swept.
+  , serviceOrphans ∷ ![(ChunkRef, Text)]
+    -- ^ Registered chunks no view collected whose release or disposal failed, with the cause.
   , serviceFailures ∷ ![(k, Maybe ChunkRef, Text)]
   , serviceReserved ∷ !Integer
   , servicePlanningMax ∷ !Word64
@@ -2572,6 +2654,8 @@ readTerrainViews service =
     <*> (length <$> readTVar (svPrivate service))
     <*> ((+) <$> (length <$> readTVar (svInHand service)) <*> (length <$> readTVar (svDisposing service)))
     <*> (Map.size <$> readTVar (svPending service))
+    <*> (toList <$> readTVar (svSwept service))
+    <*> readTVar (svOrphanFailures service)
     <*> readTVar (svFailed service)
     <*> pure (svReserved service)
     <*> ((\a b → max a b) <$> readTVar (svPlanningMax service) <*> readTVar (svPlanningFrame service))

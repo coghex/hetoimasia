@@ -565,6 +565,21 @@ refusalSpec = describe "refusing a build" $ do
       reference ← built setup ChunkWorldDepth [cutAt 9 1]
       reference `shouldBe` chunkRefOf 7 1
 
+  it "sweeps a sealed registration whose collector never ran at the registry's teardown: claimed once, with its chunk, and the registry holds no receipt after" $
+    bounded . withSetup $ \setup → do
+      grant ← admittedGrant setup [cutAt 0 1]
+      reference ← spendChunkGrant (trackedBuilders setup) (setupRetained setup) grant >>= either (fail . show) pure
+      -- nobody collects it
+      atomically (receiptsHeld (setupRetained setup)) `shouldReturn` (1, 1)
+      atomically (sweepRegistry (setupRetained setup)) >>= \case
+        [(_, Right swept)] → swept `shouldBe` reference
+        other → expectationFailure ("expected the registered chunk swept once, found " <> show (map snd other))
+      atomically (receiptsHeld (setupRetained setup)) `shouldReturn` (0, 0)
+      claimsOf grant `shouldReturn` []
+      -- a public build claims its own receipt, which the registry never indexes
+      _ ← built setup ChunkWorldDepth [cutAt 1 1]
+      atomically (receiptsHeld (setupRetained setup)) `shouldReturn` (0, 0)
+
   it "binds a grant to the registry that issued it: another registry can neither spend nor give it back" $
     withSetup $ \setup → do
       other ← newRetained

@@ -11,7 +11,7 @@
 module Test.LuaEngine.Graphics.TerrainViews (spec) where
 
 import Control.Concurrent.STM
-import Control.Monad (forM_, unless, void, when)
+import Control.Monad (forM, forM_, unless, void, when)
 import qualified Data.ByteString.Char8 as BC
 import Data.Bits (shiftL, (.|.))
 import qualified Data.Map.Strict as Map
@@ -70,7 +70,7 @@ import Test.Support.Bounded (bounded)
 import Test.Support.Owned (withOwnedThread)
 import Hetoimasia.GLFW.Window (Attribute (..), ContentScale (..), Extent (..))
 import Hetoimasia.LuaEngine.Graphics.Window.Host (WindowGeometry (..), geometryOfAttributes)
-import Control.Exception (AsyncException (ThreadKilled), ErrorCall (ErrorCall), SomeException, displayException, finally, fromException, throwIO, toException, try)
+import Control.Exception (AsyncException (ThreadKilled), ErrorCall (ErrorCall), ExceptionWithContext (ExceptionWithContext), SomeException, displayException, finally, rethrowIO, throwIO, toException, try, tryWithContext)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import System.Timeout (timeout)
 
@@ -128,6 +128,10 @@ data Rig = Rig
     -- ^ What the next failed build raises once sealed: its receipt is sealed, then the exception goes on.
   , rigReceiptNext ∷ !(TVar Word64)
     -- ^ The next receipt's key.
+  , rigRegistry ∷ !(TVar (Map.Map Word64 (TVar (Maybe (Either BuildFailure ChunkRef)))))
+    -- ^ The receipts the fake renderer holds unclaimed, by key: sealed once they hold an outcome.
+  , rigAfterSeal ∷ !(TVar (Maybe (STM ())))
+    -- ^ When set: run once in the next build's sealing transaction.
   , rigFault ∷ !(TVar (Maybe (HeldTarget, HeldFault, Bool)))
     -- ^ When set: the next build's seal makes this target's version read fail, for the rest of that owner step (and
     -- notes that it fired); the step's end clears it.
@@ -226,6 +230,8 @@ withRig options body =
         raising ← newTVarIO Nothing
         raiseSealed ← newTVarIO Nothing
         receiptNext ← newTVarIO 0
+        registry ← newTVarIO Map.empty
+        afterSeal ← newTVarIO Nothing
         fault ← newTVarIO Nothing
         countGate ← newTVarIO Nothing
         initial ← prepare initialGraphicsScene
@@ -256,6 +262,10 @@ withRig options body =
                 , ownerRegionWindow = optWindow options
                 , ownerDepthQualified = True
                 , ownerRoom = \_ → roomOf admission admitBudget
+                , ownerReceiptsHeld = do
+                    cells ← Map.elems <$> readTVar registry
+                    sealed ← length . filter isJust <$> mapM readTVar cells
+                    pure (length cells, sealed)
                 , ownerEnded = readTVar ownerEnded
                 }
             hooks =
@@ -292,7 +302,7 @@ withRig options body =
                     forM_ steps $ \(step, outcome) → step fakeHands >> atomically (writeTVar outcome (Just StepRan))
                     loop
               loop
-            rig views = Rig views terrain lease queue queueOpen lane laneCapacity standings chunks disposed attempts buildFailure disposeFailure next ledger claims receipts ownerEnded style account deferDisposal pendingDisposals hold entered resume styleReleases unavailable admission admitBudget grants uploading demandRefused buildAttempts failNext raising raiseSealed receiptNext fault countGate
+            rig views = Rig views terrain lease queue queueOpen lane laneCapacity standings chunks disposed attempts buildFailure disposeFailure next ledger claims receipts ownerEnded style account deferDisposal pendingDisposals hold entered resume styleReleases unavailable admission admitBudget grants uploading demandRefused buildAttempts failNext raising raiseSealed receiptNext registry afterSeal fault countGate
             fakeHands = hands (rig (error "the teardown's hands read no service"))
         withOwnedThread (when (optTeardown options /= TeardownNone) teardown) $ \_ _ →
           withTerrainViews (configOf options) ports $ \views →
@@ -354,19 +364,16 @@ hands rig =
             modifyTVar' (rigGrants rig) (+ 1)
             live ← newTVar True
             cell ← newTVar Nothing
-            claimed ← newTVar False
             key ← readTVar (rigReceiptNext rig)
             writeTVar (rigReceiptNext rig) (key + 1)
+            modifyTVar' (rigRegistry rig) (Map.insert key cell)
             let giveBack = readTVar live >>= \held → when held (writeTVar live False >> modifyTVar' (rigGrants rig) (subtract 1))
                 seal outcome = writeTVar cell (Just outcome)
                 receipt =
                   Receipt
                     { receiptKey = key
                     , receiptSealed = isJust <$> readTVar cell
-                    , receiptClaim =
-                        (,) <$> readTVar cell <*> readTVar claimed >>= \case
-                          (Just outcome, False) → Just outcome <$ writeTVar claimed True
-                          _ → pure Nothing
+                    , receiptClaim = claimRigReceipt rig key
                     }
                 abandon = readTVar live >>= \held → when held (giveBack >> seal (Left (BuildFailed "BuildAbandoned" NotAllocated)))
             raising ← readTVar (rigRaising rig)
@@ -375,6 +382,9 @@ hands rig =
               -- a constructor that raised before any buffer: sealed with its cause, then raised
               Just raised → Grant (atomically (giveBack >> seal (Left (BuildFailed (Text.pack (show (BuildRaised (Text.pack (displayException raised))))) NotAllocated))) >> throwIO raised) abandon receipt
               Nothing → Grant (spend prepared giveBack seal) abandon receipt
+    , handSweepReceipts = do
+        keys ← Map.keys <$> readTVar (rigRegistry rig)
+        concat <$> forM keys (\key → maybe [] (\outcome → [(key, outcome)]) <$> claimRigReceipt rig key)
     , handDispose = \chunk → atomically $ do
         modifyTVar' (rigAttempts rig) (Map.insertWith (+) chunk 1)
         failing ← readTVar (rigDisposeFailure rig)
@@ -403,6 +413,8 @@ hands rig =
       raised ← atomically $ do
         receipt ← built
         seal receipt
+        readTVar (rigAfterSeal rig) >>= mapM_ id
+        writeTVar (rigAfterSeal rig) Nothing
         readTVar (rigFault rig) >>= \case
           Just (faulty, failing, False) → setHeldFault faulty (Just failing) >> writeTVar (rigFault rig) (Just (faulty, failing, True))
           _ → pure ()
@@ -442,14 +454,30 @@ runOwner rig = go (100000 ∷ Int)
         next Seq.:< rest → Just next <$ writeTVar (rigQueue rig) rest) >>= \case
         Nothing → pure ()
         Just (step, outcome) → do
-          -- a target fault armed in this step lasts for this step alone
-          step (hands rig) `finally` atomically (writeTVar outcome (Just StepRan) >> disarm)
-          go (n - 1)
+          -- a target fault armed in this step lasts for this step alone; a step that raises is answered as the host
+          -- answers it (which ends the views' owner), and its exception goes on to the example
+          ran ← tryWithContext @SomeException (step (hands rig))
+          atomically disarm
+          case ran of
+            Left failure@(ExceptionWithContext _ raised) → do
+              atomically (writeTVar outcome (Just (StepRaised (Text.pack (displayException raised)))))
+              rethrowIO failure
+            Right () → atomically (writeTVar outcome (Just StepRan)) >> go (n - 1)
 
     disarm =
       readTVar (rigFault rig) >>= \case
         Just (held, _, True) → setHeldFault held Nothing >> writeTVar (rigFault rig) Nothing
         _ → pure ()
+
+-- Claim a receipt the fake renderer holds, once: its outcome, if sealed; the registry forgets it.
+claimRigReceipt ∷ Rig → Word64 → STM (Maybe (Either BuildFailure ChunkRef))
+claimRigReceipt rig key =
+  Map.lookup key <$> readTVar (rigRegistry rig) >>= \case
+    Just cell →
+      readTVar cell >>= \case
+        Just outcome → Just outcome <$ modifyTVar' (rigRegistry rig) (Map.delete key)
+        Nothing → pure Nothing
+    Nothing → pure Nothing
 
 -- The owner's exit begins: it takes no more actions, and refuses the ones queued.
 endRigOwner ∷ Rig → Text → IO ()
@@ -1865,31 +1893,24 @@ spec = describe "terrain views (TRA-9 v2)" $ do
           atomically (putTMVar (rigResume rig) () >> writeTVar stop True)
           ended
 
-    it "keeps the slot of the buffer a cancelled build's backend released across a close and reopen, and frees it once its destruction is confirmed" $
+    it "ends the views' owner when a build is cancelled after its backend released its buffer: the sweep keeps that buffer's slot while its destruction is pending and records both causes" $
       withRig defaultOptions {optProfile = smallProfile {profileSlots = 4, profileQuads = 2048}} $ \rig → do
-        let occupied = Map.findWithDefault 0 1 . serviceOccupied <$> readTerrainViews (rigViews rig)
-            wake = atomically (kick (rigViews rig)) >> runOwner rig
+        let reading = readTerrainViews (rigViews rig)
         destruction ← newTVarIO DisposalPending
-        -- the build settles with the release its construction already made, then its cancellation goes on
+        -- the build seals the release its construction already made, then its cancellation goes on
         atomically $ do
           writeTVar (rigFailNext rig) [Just (BuildFailed "BuildRaised \"thread killed\"" (AllocatedDisposing "buffer 7" (readTVar destruction)))]
           writeTVar (rigRaiseSealed rig) (Just (toException ThreadKilled))
         target ← newTarget 1
         first ← openOn rig target
         try @AsyncException (settleUntil rig (isJust . readingRefusal <$> readView first)) `shouldReturn` Left ThreadKilled
-        -- the view did not collect the cancelled build: the sweep keeps the released buffer's slot
-        atomically occupied `shouldReturn` 1
-        closeView first `shouldReturn` CloseRetiring
-        runOwner rig
-        -- a second view of the target holds three parts and waits for the fourth slot
-        second ← openOn rig target
-        settleUntil rig ((== 4) <$> occupied)
-        forM_ [1 .. 8 ∷ Int] (const wake)
-        atomically ((,) <$> (readingPublished <$> readView second) <*> (readingRefusal <$> readView second)) `shouldReturn` (Nothing, Nothing)
-        -- the destruction is confirmed: the slot frees once, and the four parts publish within the slots
-        atomically (writeTVar destruction DisposalDone)
-        settleUntil rig (publishedAtLeast second 1)
-        atomically occupied `shouldReturn` 4
+        -- the raised step ended the views' owner: the view ends, and the sweep collects the build in its place
+        eventually ((\now → servicePending now == 0 && not (null (serviceSwept now))) <$> reading)
+        atomically (readingStatus <$> readView first) >>= (`shouldSatisfy` (/= ViewOpen))
+        swept ← serviceSwept <$> atomically reading
+        [why | (1, _, why) ← swept] `shouldSatisfy` any (\why → all (`Text.isInfixOf` why) ["BuildRaised", "thread killed"])
+        -- the released buffer's slot is held until its destruction is confirmed
+        Map.findWithDefault 0 1 . serviceOccupied <$> atomically reading `shouldReturn` 1
 
     it "charges one slot for a granted build whose bound upload raised at the mapped write while its released buffer's destruction is pending, and frees it once confirmed" $
       withRig defaultOptions {optProfile = smallProfile {profileSlots = 4, profileQuads = 2048}} $ \rig → do
@@ -1916,20 +1937,19 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         atomically occupied `shouldReturn` 4
         servicePending <$> atomically (readTerrainViews (rigViews rig)) `shouldReturn` 0
 
-    it "keeps a buffer whose cleanup was cancelled charged, with the upload's refusal and the release's cause, while a competing view with its own room builds" $
+    it "keeps a buffer whose cleanup raised charged, with the upload's refusal and the release's cause, while a competing view with its own room builds" $
       withRig defaultOptions {optProfile = smallProfile {profileSlots = 4, profileQuads = 2048}} $ \rig → do
         let reading = readTerrainViews (rigViews rig)
             occupiedOn key = Map.findWithDefault 0 key . serviceOccupied <$> reading
         atomically $ do
-          writeTVar (rigFailNext rig) [Just (BuildFailed "BuildUploadRefused UploadClosed" (AllocatedFailed "the failed build's buffer 7 raised on its release: thread killed"))]
-          writeTVar (rigRaiseSealed rig) (Just (toException ThreadKilled))
+          writeTVar (rigFailNext rig) [Just (BuildFailed "BuildUploadRefused UploadClosed" (AllocatedFailed "the failed build's buffer 7 raised on its release: the release raised"))]
+          writeTVar (rigRaiseSealed rig) (Just (toException (ErrorCall "the release raised")))
         target ← newTarget 1
         first ← openOn rig target
-        try @AsyncException (settleUntil rig (isJust . readingRefusal <$> readView first)) `shouldReturn` Left ThreadKilled
-        -- the sweep, in place of the view, records what the build left
-        settleUntil rig (not . null . serviceFailures <$> reading)
+        -- the view collects the sealed failure: the failure ledger keeps the buffer, the refusal and the release's cause
+        settleUntil rig (isJust . readingRefusal <$> readView first)
         failures ← serviceFailures <$> atomically reading
-        [cause | (1, Nothing, cause) ← failures] `shouldSatisfy` any (\cause → all (`Text.isInfixOf` cause) ["buffer 7", "UploadClosed", "thread killed"])
+        [cause | (1, Nothing, cause) ← failures] `shouldSatisfy` any (\cause → all (`Text.isInfixOf` cause) ["buffer 7", "UploadClosed", "the release raised"])
         atomically (occupiedOn 1) `shouldReturn` 1
         readTVarIO (rigGrants rig) `shouldReturn` 0
         -- a competing view of another target, with its own room, builds and publishes; the failed buffer stays charged
@@ -1941,46 +1961,58 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         readTVarIO (rigGrants rig) `shouldReturn` 0
 
   describe "the settlement hand-off" $ do
-    it "leaves a refused build whose revalidation raises, waits or is cancelled to the sweep: its slot returns once, nothing stays held, and a raised cause reaches the step" $
-      forM_ [HeldRaises, HeldWaits, HeldCancelled] $ \fault →
+    it "leaves a refused build whose revalidation raises or waits to the sweep, which returns its slot once and keeps the refusal's cause and the revalidation's; the view goes on and publishes" $
+      forM_ [(HeldRaises, "its revalidation raised"), (HeldWaits, "its revalidation would wait")] $ \(fault, because) →
         withRig defaultOptions {optProfile = smallProfile {profileSlots = 4, profileQuads = 2048}} $ \rig → do
           target ← newTarget 1
           atomically $ do
             writeTVar (rigFailNext rig) [Just (BuildFailed "an injected refusal" NotAllocated)]
             writeTVar (rigFault rig) (Just (targetHeld target, fault, False))
           view ← openOn rig target
-          raised ← try @SomeException (settleUntil rig (publishedAtLeast view 1))
-          case (fault, raised) of
-            (HeldRaises, Left failure) | Just (ErrorCall _) ← fromException failure → settleUntil rig (publishedAtLeast view 1)
-            (HeldCancelled, Left failure) | Just ThreadKilled ← fromException failure → settleUntil rig (publishedAtLeast view 1)
-            (HeldWaits, Right ()) → pure ()
-            _ → expectationFailure ("unexpected outcome for " <> show fault <> ": " <> either show (const "published") raised)
+          settleUntil rig (publishedAtLeast view 1)
           -- the refused build's slot came back once: the target holds exactly the parts it lists
           reading ← atomically (readTerrainViews (rigViews rig))
           listed ← atomically (readingListed <$> readView view)
           Map.findWithDefault 0 1 (serviceOccupied reading) `shouldBe` listed
           servicePending reading `shouldBe` 0
           serviceFailures reading `shouldBe` []
+          [why | (1, _, why) ← serviceSwept reading] `shouldSatisfy` any (\why → all (`Text.isInfixOf` why) ["an injected refusal", because])
           readTVarIO (rigGrants rig) `shouldReturn` 0
+
+    it "ends the views' owner when a refused build's revalidation is cancelled: the sweep returns its slot once and keeps the refusal's cause with the cancellation's" $
+      withRig defaultOptions {optProfile = smallProfile {profileSlots = 4, profileQuads = 2048}} $ \rig → do
+        let reading = readTerrainViews (rigViews rig)
+        target ← newTarget 1
+        atomically $ do
+          writeTVar (rigFailNext rig) [Just (BuildFailed "an injected refusal" NotAllocated)]
+          writeTVar (rigFault rig) (Just (targetHeld target, HeldCancelled, False))
+        view ← openOn rig target
+        try @AsyncException (settleUntil rig (publishedAtLeast view 1)) `shouldReturn` Left ThreadKilled
+        eventually ((\now → servicePending now == 0 && not (null (serviceSwept now))) <$> reading)
+        now ← atomically reading
+        Map.findWithDefault 0 1 (serviceOccupied now) `shouldBe` 0
+        [why | (1, _, why) ← serviceSwept now] `shouldSatisfy` any (\why → all (`Text.isInfixOf` why) ["an injected refusal", "thread killed"])
+        readTVarIO (rigGrants rig) `shouldReturn` 0
 
     it "retires a registered build whose revalidation raises in place of its view: the target keeps its scene, the chunk's destruction holds a reopened view back while pending and frees its slot once" $
       withRig defaultOptions {optProfile = smallProfile {profileSlots = 4, profileQuads = 2048}} $ \rig → do
-        let occupied = Map.findWithDefault 0 1 . serviceOccupied <$> readTerrainViews (rigViews rig)
-            disposing = serviceDisposing <$> readTerrainViews (rigViews rig)
+        let reading = readTerrainViews (rigViews rig)
+            occupied = Map.findWithDefault 0 1 . serviceOccupied <$> reading
         target ← newTarget 1
         m1 ← prepare initialGraphicsScene
         atomically $ do
           void (surfacePublish (HeldSurface (targetHeld target)) m1)
           writeTVar (rigDeferDisposal rig) True
           writeTVar (rigFault rig) (Just (targetHeld target, HeldRaises, False))
+          -- once the build is sealed, the uploads' room is taken: the view waits after it
+          writeTVar (rigAfterSeal rig) (Just (writeTVar (rigAdmission rig) (Just (AdmitLater "held by the example"))))
         before ← atomically (targetScenes target)
         first ← openOn rig target
-        raised ← try @ErrorCall (settleUntil rig (publishedAtLeast first 1))
-        either (const (pure ())) (const (expectationFailure "expected the revalidation's exception")) raised
-        -- the registered chunk went to retirement in place of the view: released, its destruction pending
-        _ ← closeView first
-        settleUntil rig ((>= 1) <$> disposing)
+        -- the sweep retires the registered chunk privately; its release waits for its destruction
+        settleUntil rig ((\now → not (null (serviceSwept now)) && serviceDisposing now >= 1) <$> reading)
         map fst <$> atomically (targetScenes target) `shouldReturn` map fst before
+        _ ← closeView first
+        atomically (writeTVar (rigAdmission rig) Nothing)
         -- a reopened view holds what free slots it has, and waits for the pending one
         second ← openOn rig target
         settleUntil rig ((== 4) <$> occupied)
@@ -1990,7 +2022,49 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         atomically (forM_ (Map.elems awaiting) (`writeTVar` DisposalDone) >> writeTVar (rigDeferDisposal rig) False)
         settleUntil rig (publishedAtLeast second 1)
         atomically occupied `shouldReturn` 4
-        servicePending <$> atomically (readTerrainViews (rigViews rig)) `shouldReturn` 0
+        servicePending <$> atomically reading `shouldReturn` 0
+
+    it "collects a build whose target's facts change between its revalidation and its collection into private retirement, once, and the view goes on" $
+      withRig defaultOptions {optProfile = smallProfile {profileSlots = 4, profileQuads = 2048}} $ \rig → do
+        let reading = readTerrainViews (rigViews rig)
+        target ← newTarget 1
+        atomically (writeTVar (rigFault rig) (Just (targetHeld target, HeldChanges, False)))
+        view ← openOn rig target
+        settleUntil rig (publishedAtLeast view 1)
+        quiesce rig target
+        now ← atomically reading
+        listed ← atomically (readingListed <$> readView view)
+        -- the stale part was retired once, not swept: its slot is free again, and the target holds exactly its parts
+        Map.findWithDefault 0 1 (serviceOccupied now) `shouldBe` listed
+        (servicePending now, serviceSwept now) `shouldBe` (0, [])
+
+    it "reconciles a swept build's receipt without touching a later admission's: the successor keeps its part and its slot until its own build completes" $
+      withRig defaultOptions {optProfile = smallProfile {profileSlots = 4, profileQuads = 2048}} $ \rig → do
+        let reading = readTerrainViews (rigViews rig)
+        target ← newTarget 1
+        -- the first build is sealed and its revalidation raises; the next build is held after its admission
+        atomically $ do
+          writeTVar (rigFault rig) (Just (targetHeld target, HeldRaises, False))
+          writeTVar (rigAfterSeal rig) (Just (readTVar (rigNext rig) >>= writeTVar (rigHold rig) . Just))
+        view ← openOn rig target
+        stop ← newTVarIO False
+        let owner = do
+              runOwner rig
+              continue ← atomically ((False <$ (readTVar stop >>= check)) `orElse` (True <$ (readTVar (rigQueue rig) >>= check . not . Seq.null)))
+              when continue owner
+        withOwnedThread owner $ \_ ended → do
+          timeout 10000000 (atomically (takeTMVar (rigEntered rig))) >>= maybe (expectationFailure "no build was held") pure
+          -- the sweep reconciles the first receipt while the successor's admission is pending
+          eventually (not . null . serviceSwept <$> reading)
+          now ← atomically reading
+          servicePending now `shouldBe` 1
+          Map.findWithDefault 0 1 (serviceOccupied now) `shouldBe` 2
+          atomically (putTMVar (rigResume rig) () >> writeTVar stop True)
+          ended
+        settleUntil rig (publishedAtLeast view 1)
+        done ← atomically reading
+        listed ← atomically (readingListed <$> readView view)
+        (Map.findWithDefault 0 1 (serviceOccupied done), servicePending done) `shouldBe` (listed, 0)
 
     it "follows a held target's observed zero, then unknown geometry with no new frame, clearing its demand, and restores it with the drawing" $
       withPublished defaultOptions $ \rig target view → do
