@@ -1615,6 +1615,8 @@ reuseProblems fixture evidencePlan candidatePlan = do
       [ "-c"
       , unlines
           [ "import json, sys"
+          , -- the checkout's tools/validation is a policy root: importing from it must leave no bytecode there
+            "sys.dont_write_bytecode = True"
           , "sys.path.insert(0, sys.argv[1])"
           , "import receipts"
           , "evidence = receipts.load_plan(sys.argv[2])"
