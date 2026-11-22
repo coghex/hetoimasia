@@ -44,6 +44,9 @@ import Hetoimasia.Render.TwoD.Vulkan.Chunks (BuildRefusal (BuildRaised, BuildUpl
 import Hetoimasia.Terrain.Cell (mkMaterialId)
 import Hetoimasia.Terrain.Coordinate (AxisCoord, axisFromInteger, axisValue, tileCoord)
 import Hetoimasia.Terrain.Render2D.AtlasFixtures (AtlasStyle (..), boundPackedTextures, loadAtlasStyle)
+import qualified Hetoimasia.Terrain.Render2D.AtlasFixtures as Fixture
+import qualified Hetoimasia.Terrain.Render2D.AtlasAssets as Atlas
+import Hetoimasia.Asset.Image.DataMap (coverageHeight, coverageWidth)
 import Hetoimasia.LuaEngine.Graphics.TerrainView.Inputs (combineCopies, planInputs, plannerRuns)
 import qualified Hetoimasia.Terrain.Discovery as D
 import Hetoimasia.Terrain.Coordinate (RegionCoord (..))
@@ -2005,6 +2008,29 @@ spec = describe "terrain views (TRA-9 v2)" $ do
       answer (Left (VulkanUploadsUnavailable (UploadsRefusedBy RefusedDeviceAbsent))) `shouldBe` Left (BufferUploadsUnavailable "the device refused the uploads: RefusedDeviceAbsent")
       answer (Left (VulkanUploadRefused UploadClosed)) `shouldBe` Left (BufferUploadRefused UploadClosed)
       answer (Right ()) `shouldBe` Right ()
+
+  describe "a style's parents" $
+    it "refuses a colour parent supplied in the normal slot, each parent's kind its own, and binds parents of their roles' kinds" $ do
+      style ← loadAtlasStyle 7 [("loam", "colour.loam"), ("granite", "colour.granite")]
+      let parentOf identity atlas =
+            StyleParent
+              { parentIdentity = identity
+              , parentVersion = Atlas.parentTextureVersion atlas
+              , parentWidth = fromIntegral (coverageWidth (Atlas.parentCoverage atlas))
+              , parentHeight = fromIntegral (coverageHeight (Atlas.parentCoverage atlas))
+              , parentPlane = Atlas.parentCoverage atlas
+              , parentEncoding = Atlas.parentProfile atlas
+              , parentIsData = Atlas.parentKind atlas == Atlas.DataParent
+              , parentLevelCount = Atlas.parentLevels atlas
+              }
+          colour = parentOf 1 (Fixture.styleColour style)
+          normal = parentOf 2 (Fixture.styleNormal style)
+          checked = checkStyle maxBound (Fixture.styleManifest style) (Fixture.styleMaterialIds style) colour
+      either (Just . describeStyleRefusal) (const Nothing) (checked normal) `shouldBe` Nothing
+      -- refused, naming the normal parent as the colour it was supplied as
+      case checked normal {parentIsData = False} of
+        Left refusal → describeStyleRefusal refusal `shouldSatisfy` (\text → all (`Text.isInfixOf` text) ["normal", "ColourParent"])
+        Right _ → expectationFailure "expected the normal slot refused, found the style bound"
 
   describe "the view's reading of a build receipt" $
     it "reads a registered chunk as built, and a refusal that made no buffer as its cause with no allocation" $ do

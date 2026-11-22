@@ -156,20 +156,21 @@ checkStyle ∷ Word64 → AtlasManifest → [(MaterialId, String)] → StylePare
 checkStyle limit manifest materials colour normal = do
   let need = parentNominalBytes colour + parentNominalBytes normal
   if need > limit then Left (StyleExceedsTextureBytes need limit) else Right ()
-  let colourAtlas = atlasOf ColourParent colour
-      normalAtlas = atlasOf DataParent normal
+  -- each parent's kind is its own; the role's binding refuses a parent of the other kind
+  let colourAtlas = atlasOf colour
+      normalAtlas = atlasOf normal
   assets ← either (Left . StyleMapping) Right (atlasAssetSnapshot (parentVersion colour * 65536 + parentVersion normal) manifest colourAtlas normalAtlas materials)
   colourTexture ← either (Left . ParentNotBindable ColourRole) Right (bindColourParent colourAtlas (textureHandleOf (parentIdentity colour)))
   normalTexture ← either (Left . ParentNotBindable NormalRole) Right (bindDataParent normalAtlas (textureHandleOf (parentIdentity normal)))
   pure (assets, packedTextures colourTexture normalTexture)
   where
-    atlasOf kind parent =
+    atlasOf parent =
       ParentAtlas
         { parentTextureVersion = parentVersion parent
         , parentCoverageVersion = parentVersion parent
         , parentCoverage = parentPlane parent
         , parentProfile = parentEncoding parent
-        , parentKind = if parentIsData parent then DataParent else kind
+        , parentKind = if parentIsData parent then DataParent else ColourParent
         , -- A loaded version is issued once by the pipeline and names exactly one decode: it is the image's identity.
           parentContent = parentVersion parent
         , parentLevels = parentLevelCount parent
