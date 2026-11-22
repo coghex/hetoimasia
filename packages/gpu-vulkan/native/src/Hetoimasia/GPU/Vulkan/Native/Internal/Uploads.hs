@@ -45,6 +45,10 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Uploads
   , UploadRefusal (..)
   , UploadPressure (..)
   , submitUpload
+  , UploadGate
+  , UploadPermit (..)
+  , ungated
+  , gateOn
   , submitUploadGated
 
     -- * Reservations
@@ -79,10 +83,11 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Uploads
   ) where
 
 import Control.Concurrent (ThreadId, myThreadId)
-import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVar, newTVarIO, readTVar, retry, writeTVar)
+import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVar, newTVarIO, orElse, readTVar, retry, writeTVar)
 import Control.Exception (SomeException, mask, rethrowIO, tryWithContext)
 import Control.Monad (forM, forM_, unless, when)
 import Data.ByteString (ByteString)
+import Data.Functor ((<&>))
 import qualified Data.ByteString as ByteString
 import Data.List (sortOn)
 import Data.Map.Strict (Map)
@@ -375,6 +380,8 @@ data UploadRefusal
     -- ^ The owner's exit has begun: nothing more is admitted.
   | UploadSessionFailed !TerminalCause
     -- ^ The session has failed, and this is its primary failure.
+  | UploadGateBusy
+    -- ^ Not now: the caller's gate would have waited to answer.
   deriving (Eq, Show)
 
 -- | What an upload waits for when it is refused as backpressure.
@@ -394,51 +401,95 @@ data UploadPressure = QueueFull | StagingFull
 -- target and the ticket.
 --
 -- The bytes are then copied into the region on this thread, and the upload
--- is queued to the owner; the caller's bytes are free when this returns. A
--- copy that raised, or was cancelled, gives back every reservation and is
--- re-raised; one that finished after the owner's exit began gives them back
--- too, answering 'UploadClosed'.
+-- is queued to the owner; the caller's bytes are free when this returns. From
+-- the commit that admits it until the one that queues it, one cleanup owns
+-- every exit: a copy that raised or was cancelled, and a refusal before it is
+-- queued (admission closed meanwhile), give back every reservation; an
+-- exception goes on after it.
 submitUpload ∷ Uploads q inst msgr phys dev cmd → UploadRequest → IO (Either UploadRefusal UploadTicket)
-submitUpload = submitUploadGated (pure Nothing)
+submitUpload = submitUploadGated ungated
 
--- | 'submitUpload' under a caller's gate, read in the transaction that
--- reserves the upload and again in the one that queues it: a refusal it
--- answers in either refuses the upload, giving back every reservation. The
+-- | A caller's gate on admission: a refusal, or a permit for the admission it
+-- gives. It is asked in its own transaction before an upload is admitted, and
+-- again in its own once the bytes are copied, before the upload is queued; it
+-- may refuse, raise or wait, and a wait is answered as 'UploadGateBusy'.
+type UploadGate = STM (Either UploadRefusal UploadPermit)
+
+-- | The admission a gate gave, verified again inside the commits that admit and
+-- queue the upload: the refusal that applies now, if one does. It only reads
+-- the gate owner's own state, so it holds exactly while that admission is open
+-- and closes in the transaction that closes it. One that raises or waits
+-- refuses the commit it guards.
+newtype UploadPermit = UploadPermit (STM (Maybe UploadRefusal))
+
+-- | No gate: every upload is admitted, under a permit that always holds.
+ungated ∷ UploadGate
+ungated = pure (Right (UploadPermit (pure Nothing)))
+
+-- | A gate over the owner's own admission state: the refusal it reads now, or a
+-- permit that reads it again.
+gateOn ∷ STM (Maybe UploadRefusal) → UploadGate
+gateOn check = check <&> maybe (Right (UploadPermit check)) Left
+
+-- | 'submitUpload' under a caller's gate, asked before the upload is admitted
+-- and again before it is queued, its permit verified in both commits: a
+-- refusal from either refuses the upload, giving back every reservation. The
 -- window integration gates admission on its owner's, so no upload is queued
 -- once the owner's admission has closed.
 submitUploadGated
-  ∷ STM (Maybe UploadRefusal)
+  ∷ UploadGate
   → Uploads q inst msgr phys dev cmd
   → UploadRequest
   → IO (Either UploadRefusal UploadTicket)
 submitUploadGated gate uploads = submitWith gate uploads Nothing
 
 submitWith
-  ∷ STM (Maybe UploadRefusal)
+  ∷ UploadGate
   → Uploads q inst msgr phys dev cmd
   → Maybe UploadGrant
   → UploadRequest
   → IO (Either UploadRefusal UploadTicket)
 submitWith gate uploads grant request = mask $ \restore →
-  atomically (gate >>= maybe (admit uploads grant request) (pure . Left)) >>= \case
+  -- the gate, before anything is taken: its refusal, exception or cancellation leaves everything as it was
+  restore (atomically (asked gate)) >>= \case
     Left refusal → pure (Left refusal)
-    Right (number, ticket, offset, pieces) → do
-      written ← tryWithContext @SomeException (restore (writePieces uploads offset pieces))
-      case written of
-        Left failure → do
-          atomically (forget uploads number)
-          rethrowIO failure
-        Right () →
-          atomically $ do
-            state ← readTVar (uploadsState uploads)
-            refused ← gate
-            case refused of
-              Just refusal → Left refusal <$ forget uploads number
-              Nothing
-                | stateOpen state → do
-                    modifyTVar' (uploadsState uploads) (\current → current {stateEntries = Map.adjust (\entry → entry {entryPhase = PhaseQueued}) number (stateEntries current)})
-                    pure (Right ticket)
-                | otherwise → Left UploadClosed <$ forget uploads number
+    Right permit →
+      atomically (verified permit >>= maybe (admit uploads grant request) (pure . Left)) >>= \case
+        Left refusal → pure (Left refusal)
+        Right (number, ticket, offset, pieces) → do
+          -- admitted: from here until the upload is queued, every exit gives back its place, region and target
+          let cleanup = atomically (forgetAdmitting uploads number)
+          copied ← tryWithContext @SomeException (restore (writePieces uploads offset pieces >> atomically (asked gate)))
+          queued ← case copied of
+            Left failure → pure (Left failure)
+            Right (Left refusal) → pure (Right (Left refusal))
+            Right (Right permit') → tryWithContext @SomeException (atomically (queue permit' number ticket))
+          case queued of
+            Left failure → cleanup >> rethrowIO failure
+            Right (Left refusal) → Left refusal <$ cleanup
+            Right (Right queuedTicket) → pure (Right queuedTicket)
+  where
+    asked ask = ask `orElse` pure (Left UploadGateBusy)
+    verified (UploadPermit check) = check `orElse` pure (Just UploadGateBusy)
+    -- the upload's place, region and target pass to the queue, under the permit and the uploads' own state
+    queue permit number ticket = do
+      state ← readTVar (uploadsState uploads)
+      refused ← verified permit
+      case refused of
+        Just refusal → pure (Left refusal)
+        Nothing
+          | stateOpen state → do
+              modifyTVar' (uploadsState uploads) (\current → current {stateEntries = Map.adjust (\entry → entry {entryPhase = PhaseQueued}) number (stateEntries current)})
+              pure (Right ticket)
+          | otherwise → pure (Left UploadClosed)
+
+-- An admitted upload not yet queued, forgotten by the exit that ends its admission: its entry, region and target's
+-- hold. One already queued is the queue's.
+forgetAdmitting ∷ Uploads q inst msgr phys dev cmd → Natural → STM ()
+forgetAdmitting uploads number =
+  readTVar (uploadsState uploads) >>= \state → case Map.lookup number (stateEntries state) of
+    Just entry | entryPhase entry == PhaseAdmitting → forget uploads number
+    _ → pure ()
 
 -- | Copy the request's bytes into the staging buffer, level after level.
 writePieces ∷ Uploads q inst msgr phys dev cmd → Natural → [ByteString] → IO ()
@@ -667,13 +718,14 @@ liveGrant uploads state grant = do
 -- upload, and it spends the reservation. A refusal from that transaction
 -- (the gate, the session, misuse, a buffer of the wrong kind or size) comes
 -- before binding and leaves the reservation as it was, for its holder to
--- spend or abandon. After binding the bytes are copied: a copy that raised or
--- was cancelled, and a refusal in the transaction that queues the upload
--- (the gate or the uploads closing meanwhile), give the place and region back
+-- spend or abandon. After binding the bytes are copied and the gate is asked
+-- again: a copy that raised or was cancelled, the gate refusing, raising or
+-- waiting then, and a refusal in the transaction that queues the upload (the
+-- permit or the uploads closing meanwhile), give the place and region back
 -- to the uploads and consume the reservation, which is then stale: a later
 -- spend is misuse and an abandonment changes nothing.
 submitUploadGranted
-  ∷ STM (Maybe UploadRefusal)
+  ∷ UploadGate
   → Uploads q inst msgr phys dev cmd
   → UploadGrant
   → Buffer

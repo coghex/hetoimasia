@@ -97,6 +97,11 @@ module Hetoimasia.Render.TwoD.Vulkan.Chunks
   , admitRetainedChunk
   , abandonChunkGrant
   , spendChunkGrant
+  , BuildReceipt
+  , chunkGrantReceipt
+  , receiptNumber
+  , receiptSealed
+  , claimReceipt
   , BuildSettlement (..)
   , buildSettlementOf
   , ChunkStanding (..)
@@ -114,8 +119,8 @@ module Hetoimasia.Render.TwoD.Vulkan.Chunks
   , liveChunks
   ) where
 
-import Control.Concurrent.STM (STM, TVar, atomically, catchSTM, modifyTVar', newTVar, newTVarIO, readTVar, readTVarIO, writeTVar)
-import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeAsyncException, SomeException, displayException, fromException, mask_, rethrowIO, someExceptionContext, tryWithContext)
+import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVar, newTVarIO, readTVar, readTVarIO, writeTVar)
+import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeAsyncException, SomeException, displayException, finally, fromException, mask_, rethrowIO, tryWithContext)
 import Control.Exception.Annotation (ExceptionAnnotation (displayExceptionAnnotation))
 import Control.Exception.Context (ExceptionContext, addExceptionAnnotation, getExceptionAnnotations)
 import Control.Monad (when)
@@ -128,7 +133,7 @@ import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as Text
-import Data.Word (Word32)
+import Data.Word (Word32, Word64)
 import Hetoimasia.GPU.Vulkan.Native.Recording (Buffer, Refusal, releasedBufferOf)
 import Hetoimasia.GPU.Vulkan.Native.Uploads (UploadGrant, UploadPressure, UploadRefusal (..), UploadState (..), UploadTicket, readUploadTicket)
 import Hetoimasia.Render.TwoD.Chunk
@@ -160,6 +165,10 @@ data Ledger = Ledger
     -- ^ The indices free to reuse, with the generation they will be issued under.
   , ledgerNext ∷ !Word32
     -- ^ The next index never issued.
+  , ledgerReceipts ∷ !(Map Word64 (TVar ReceiptState))
+    -- ^ Every admitted build's receipt not yet claimed, by its number.
+  , ledgerReceiptNext ∷ !Word64
+    -- ^ The next receipt number, never reissued.
   }
 
 data Entry = Entry
@@ -172,7 +181,7 @@ data Entry = Entry
 
 -- | A registry holding no chunk.
 newRetained ∷ IO Retained
-newRetained = Retained <$> newTVarIO (Ledger Map.empty Map.empty [] 0)
+newRetained = Retained <$> newTVarIO (Ledger Map.empty Map.empty [] 0 Map.empty 0)
 
 -- | Why a chunk was not built. Nothing is held for any of them.
 data BuildRefusal
@@ -192,6 +201,8 @@ data BuildRefusal
     BuildRaised !Text
   | -- | The grant was already spent or given back, or is another registry's.
     BuildGrantSpent
+  | -- | The grant was given back unspent.
+    BuildAbandoned
   | -- | The host's uploads are configured and not yet made: their startup can
     -- make them, so a later build can succeed.
     BuildUploadsNotReady
@@ -255,7 +266,8 @@ buildRetainedChunkWith builders retained marks kind bounds records instances =
       mask_ $
         atomically (admitRetainedChunk (bufferUploads builders) retained prepared) >>= \case
           Left refusal → pure (Left (BuildRefused refusal NoAllocation))
-          Right grant → spendChunkGrant builders retained grant (\_ → pure ())
+          -- the caller is its own collector: the sealed receipt is claimed in the hand-off, whatever the exit
+          Right grant → spendChunkGrant builders retained grant `finally` atomically (claimReceipt (chunkGrantReceipt grant))
 
 -- | A chunk ready to be built: described, routed and bounded for one kind of
 -- layer, and its cutout instances encoded — before anything is reserved or made.
@@ -303,7 +315,46 @@ data ChunkGrant = ChunkGrant
   , grantUploads ∷ !BufferUploads
     -- ^ The uploads that reserved the room, which spend or free it.
   , grantStanding ∷ !(TVar GrantStanding)
+  , grantReceipt ∷ !BuildReceipt
+    -- ^ Where its sealed outcome is kept until it is claimed.
   }
+
+-- | Where an admitted build's sealed outcome is kept, in its registry, until one claimant takes it: the build's
+-- collector, or a sweep in its place. It is unique to its grant.
+data BuildReceipt = BuildReceipt
+  { receiptNumber ∷ !Word64
+  , receiptCell ∷ !(TVar ReceiptState)
+  , receiptRegistry ∷ !(TVar Ledger)
+  }
+
+-- | Open while the build is admitted and unsealed; available once sealed, with its outcome; claimed once taken.
+data ReceiptState = ReceiptOpen | ReceiptAvailable !(Either BuildRefused ChunkRef) | ReceiptClaimed
+
+-- | The receipt an admitted build's outcome is sealed into.
+chunkGrantReceipt ∷ ChunkGrant → BuildReceipt
+chunkGrantReceipt = grantReceipt
+
+-- | Whether the build is sealed: its outcome available, or already claimed.
+receiptSealed ∷ BuildReceipt → STM Bool
+receiptSealed receipt =
+  readTVar (receiptCell receipt) <&> \case
+    ReceiptOpen → False
+    _ → True
+
+-- | Claim a sealed outcome, once: the first claimant takes it and the registry forgets the receipt; an open receipt,
+-- or one already claimed, answers nothing and changes nothing.
+claimReceipt ∷ BuildReceipt → STM (Maybe (Either BuildRefused ChunkRef))
+claimReceipt receipt =
+  readTVar (receiptCell receipt) >>= \case
+    ReceiptAvailable outcome → do
+      writeTVar (receiptCell receipt) ReceiptClaimed
+      modifyTVar' (receiptRegistry receipt) (\held → held {ledgerReceipts = Map.delete (receiptNumber receipt) (ledgerReceipts held)})
+      pure (Just outcome)
+    _ → pure Nothing
+
+-- Seal a build's outcome into its receipt, available to one claimant.
+sealReceipt ∷ ChunkGrant → Either BuildRefused ChunkRef → STM ()
+sealReceipt grant outcome = writeTVar (receiptCell (grantReceipt grant)) (ReceiptAvailable outcome)
 
 -- | Where a grant stands: reserved; being spent, its capacity the spend's to
 -- settle, with the buffer it owns; or sealed (registered, or given back).
@@ -340,9 +391,11 @@ admitRetainedChunk uploads (Retained ledger) prepared = do
       case upload of
         Left refusal → pure (Left (uploadRefusal refusal))
         Right granted → do
-          writeTVar ledger afterwards
           standing ← newTVar GrantReserved
-          pure (Right (ChunkGrant reference prepared granted ledger uploads standing))
+          cell ← newTVar ReceiptOpen
+          let number = ledgerReceiptNext afterwards
+          writeTVar ledger afterwards {ledgerReceipts = Map.insert number cell (ledgerReceipts afterwards), ledgerReceiptNext = number + 1}
+          pure (Right (ChunkGrant reference prepared granted ledger uploads standing (BuildReceipt number cell ledger)))
 
 uploadRefusal ∷ BufferUploadRefusal → BuildRefusal
 uploadRefusal = \case
@@ -359,7 +412,7 @@ abandonChunkGrant ∷ Retained → ChunkGrant → STM ()
 abandonChunkGrant (Retained ledger) grant =
   when (grantRegistry grant == ledger) $
     readTVar (grantStanding grant) >>= \case
-      GrantReserved → giveBack grant
+      GrantReserved → giveBack grant >> sealReceipt grant (Left (BuildRefused BuildAbandoned NoAllocation))
       _ → pure ()
 
 -- The grant's capacity returned: its reference to its registry's free list, its
@@ -380,20 +433,18 @@ giveBack grant = do
 -- One masked finalizer settles the spend on every exit, a value, an exception or a cancellation alike: a buffer made
 -- and not registered is released once (a construction that raised after releasing its buffer has that release
 -- adopted), any outcome of the release kept, a cancellation included; then one transaction, which never waits, seals
--- the grant (registered, or its reference and any room still reserved given back) and runs @settle@ with the receipt.
--- The seal commits whatever @settle@ does: an exception from @settle@ undoes only @settle@'s own effects, and goes on
--- once the seal has committed, its receipt saying the settlement raised ('settlementRaised').
+-- the grant (registered, or its reference and any room still reserved given back) and writes the outcome into the
+-- grant's receipt ('chunkGrantReceipt'), where it waits for one claimant ('claimReceipt'). No caller code runs in it.
 -- A failure's receipt says what became of the buffer ('RefusedAllocation'): a released buffer is destroyed only once
 -- the backend confirms it, and its capacity stays occupied until then. A refusal is answered with the receipt; a
 -- raised exit goes on with the receipt attached to the exception ('buildSettlementOf'): the build's cancellation if it
--- was one, otherwise a cancellation the release raised, otherwise the settlement's exception, otherwise the build's.
+-- was one, otherwise a cancellation the release raised, otherwise the build's exception.
 spendChunkGrant
   ∷ Builders q inst msgr phys dev cmd
   → Retained
   → ChunkGrant
-  → (Either BuildRefused ChunkRef → STM ())
   → IO (Either BuildRefused ChunkRef)
-spendChunkGrant builders (Retained ledger) grant settle = mask_ $ do
+spendChunkGrant builders (Retained ledger) grant = mask_ $ do
   claimed ← atomically $
     if grantRegistry grant /= ledger
       then pure False
@@ -415,22 +466,20 @@ spendChunkGrant builders (Retained ledger) grant settle = mask_ $ do
         Right (Right held) → pure (Right held, Nothing)
         Right (Left refusal) → unregistered made refusal
         Left (ExceptionWithContext _ raised) → unregistered made (BuildRaised (raisedText raised))
-      -- the seal commits whatever the settlement does: its exception undoes only its own effects
-      (answer, settleRaised) ← atomically $ do
+      -- the seal: the grant's disposition and its receipt, in one transaction with no caller code
+      answer ← atomically $ do
         answer ← case receipt of
           Right held → Right <$> register held
           Left refused → Left refused <$ giveBack grant
-        raised ← (Nothing <$ settle answer) `catchSTM` (\(failure ∷ SomeException) → pure (Just failure))
-        pure (answer, raised)
+        answer <$ sealReceipt grant answer
       let built = either Just (const Nothing) outcome
-          settled = (\raised → ExceptionWithContext (someExceptionContext raised) raised) <$> settleRaised
-          receiptOf = BuildSettlement answer (Text.pack . displayException <$> settleRaised)
-          carrying (ExceptionWithContext context raised) = ExceptionWithContext (addExceptionAnnotation receiptOf context) raised
-      case (built, cleanupRaised, settled) of
-        (Just failure, _, _) | cancellation failure → rethrowIO (carrying failure)
-        (_, Just failure, _) | cancellation failure → rethrowIO (carrying failure)
-        (_, _, Just failure) → rethrowIO (carrying failure)
-        (Just failure, _, _) → rethrowIO (carrying failure)
+          carrying (ExceptionWithContext context raised) = case answer of
+            Left refused → ExceptionWithContext (addExceptionAnnotation (BuildSettlement refused) context) raised
+            Right _ → ExceptionWithContext context raised
+      case (built, cleanupRaised) of
+        (Just failure, _) | cancellation failure → rethrowIO (carrying failure)
+        (_, Just failure) | cancellation failure → rethrowIO (carrying failure)
+        (Just failure, _) → rethrowIO (carrying failure)
         _ → pure answer
   where
     standing = grantStanding grant
@@ -476,23 +525,18 @@ spendChunkGrant builders (Retained ledger) grant settle = mask_ $ do
 data MadeBuffer = NotMade | Made !Buffer | MadeAndReleased !Buffer
   deriving (Eq, Show)
 
--- | The settlement of a build that raised, attached to the exception it propagates.
-data BuildSettlement = BuildSettlement
-  { settlementReceipt ∷ !(Either BuildRefused ChunkRef)
-    -- ^ The sealed receipt: the cause (the build's exception, or the refusal a cancellation during cleanup
-    -- interrupted) and what became of the buffer; or the chunk, registered.
-  , settlementRaised ∷ !(Maybe Text)
-    -- ^ The caller's settlement raised, with its text: its own effects were undone, the grant's seal was not.
-  }
-  deriving (Eq, Show)
+-- | The sealed outcome of a build that raised, attached to the exception it propagates: the cause (the build's
+-- exception, or the refusal a cancellation during cleanup interrupted) and what became of its buffer.
+newtype BuildSettlement = BuildSettlement BuildRefused
+  deriving (Show)
 
 instance ExceptionAnnotation BuildSettlement where
-  displayExceptionAnnotation settlement = "the chunk build settled: " <> show settlement
+  displayExceptionAnnotation (BuildSettlement refused) = "the chunk build settled: " <> show refused
 
--- | The settlement a raised build's exception carries, if it is one.
-buildSettlementOf ∷ ExceptionContext → Maybe BuildSettlement
+-- | The sealed outcome a raised build's exception carries, if it is one.
+buildSettlementOf ∷ ExceptionContext → Maybe BuildRefused
 buildSettlementOf context = case getExceptionAnnotations context of
-  settlement : _ → Just settlement
+  BuildSettlement refused : _ → Just refused
   [] → Nothing
 
 -- | The reference the registry issues next and the ledger with it taken.

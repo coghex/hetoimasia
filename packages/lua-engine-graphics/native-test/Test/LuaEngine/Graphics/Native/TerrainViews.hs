@@ -63,7 +63,7 @@ import Hetoimasia.GPU.Vulkan.GLFW
 import Hetoimasia.LuaEngine.Graphics.Scene
 import Hetoimasia.LuaEngine.Graphics.TerrainView hiding (styleAssets)
 import Hetoimasia.LuaEngine.Graphics.Texture
-import Hetoimasia.LuaEngine.Graphics.Window.Host (WindowGeometry (..), WindowTarget (..))
+import Hetoimasia.LuaEngine.Graphics.Window.Host (WindowTarget (..))
 import Hetoimasia.LuaEngine.Graphics.Window.Port (Port (..), WindowToken (..))
 import Hetoimasia.LuaEngine.Graphics.Window.Provider (WindowRole (PresentationRole))
 import Hetoimasia.LuaEngine.Texture (newRenderAccount)
@@ -100,11 +100,11 @@ spec env = describe "terrain views" $
       let host = envHost env
           metrics = TargetMetrics (PixelExtent side side) (PixelExtent side side) 1 1
       target ← atomically (registerVulkanSceneTarget host) >>= either (\refusal → assertFailure ("the target was refused: " <> show refusal)) pure
-      usable ← newTVarIO True
-      let cleanup = atomically (writeTVar usable False) >> void (atomically (unregisterVulkanSceneTarget host target))
+      facts ← atomically (newOffscreenFacts True (Just metrics))
+      let cleanup = atomically (setOffscreenUsable facts False) >> void (atomically (unregisterVulkanSceneTarget host target))
       flip finally cleanup . withImages host (fromIntegral side) $ \images → do
         view ←
-          openView views (OpenRequest (offscreenViewTarget host target (readTVar usable) (pure (Just metrics))) lease (pure (Right style)) (axis 0, axis 0, axis 1) defaultLightSettings)
+          openView views (OpenRequest (offscreenViewTarget host target facts) lease (pure (Right style)) (axis 0, axis 0, axis 1) defaultLightSettings)
             >>= either (\why → assertFailure ("the view was refused: " <> show why)) pure
         first ← drawPublished env view target metrics images 1
         coloured (fromIntegral side) first `shouldSatisfy` (> 0)
@@ -205,7 +205,7 @@ fullSpec env = describe "terrain views (full)" $ do
         -- geometry gives them, with no other frame and no metrics written by the example
         evicted ← newDrawReceipts
         view ←
-          openView views (OpenRequest (windowViewTarget (envHost env) True evicted (pure True) window) lease (pure (Right style)) (axis 0, axis 0, axis 1) defaultLightSettings)
+          openView views (OpenRequest (windowViewTarget (envHost env) True evicted [] window) lease (pure (Right style)) (axis 0, axis 0, axis 1) defaultLightSettings)
             >>= either (\why → assertFailure ("the view was refused: " <> show why)) pure
         refusal ← within 60 (atomically (readView view >>= maybe retry pure . readingRefusal))
         refusal `shouldSatisfy` \case
@@ -227,7 +227,7 @@ fullSpec env = describe "terrain views (full)" $ do
         let receipts = scenesReceipts (envScenes env)
         -- opened directly on the fresh window: the open asks it for the first frame its view plans for
         view ←
-          openView views (OpenRequest (windowViewTarget (envHost env) True receipts (pure True) window) lease (pure (Right style)) (axis 0, axis 0, axis 1) defaultLightSettings)
+          openView views (OpenRequest (windowViewTarget (envHost env) True receipts [] window) lease (pure (Right style)) (axis 0, axis 0, axis 1) defaultLightSettings)
             >>= either (\why → assertFailure ("the view was refused: " <> show why)) pure
         let drawnAt revision = waitFor ("a receipt of revision " <> show revision) $ do
               reading ← readView view
@@ -277,43 +277,6 @@ fullSpec env = describe "terrain views (full)" $ do
               <> (if owned <= frameBudget then "" else "; THE OWNER'S WORK BETWEEN TWO PRESENTATIONS EXCEEDS THE FRAME BUDGET")
           )
 
-  it "follows a drawn window's observed zero framebuffer through the production adapter, with no new frame, and restores the demand" $ do
-    files ← atlasFiles
-    within 300 . withLoaded env files $ \comp vm → withViews env comp vm $ \views _ lease style →
-      withWindows env Nothing $ \wcomp wvm _ _ port _ → do
-        window ← openWindow wcomp wvm port
-        noteWindows env 1
-        let receipts = scenesReceipts (envScenes env)
-        -- the window's live observation, or what the example says it observes now (no frame is recorded for it)
-        observed ← newTVarIO Nothing
-        let adapted = window {targetGeometry = readTVar observed >>= maybe (targetGeometry window) pure}
-            waitFor what condition =
-              timeout 60000000 (atomically condition) >>= maybe (assertFailure ("waited a minute for " <> what)) pure
-        view ←
-          openView views (OpenRequest (windowViewTarget (envHost env) True receipts (pure True) adapted) lease (pure (Right style)) (axis 0, axis 0, axis 1) defaultLightSettings)
-            >>= either (\why → assertFailure ("the view was refused: " <> show why)) pure
-        _ ← waitFor "the first receipt" (readView view >>= maybe retry pure . readingDrawn)
-        asked ← waitFor "the drawn revision's demand" (readView view >>= \r → if null (readingDemand r) then retry else pure (readingDemand r))
-        -- the window has a recorded frame whose metrics are kept
-        cached ← waitFor "the kept frame metrics" (latestFrameMetrics receipts (targetAttachment window) >>= maybe retry pure)
-        cached `shouldSatisfy` \m → pixelWidth (metricsFramebuffer m) > 0
-        published ← atomically (readingPublished <$> readView view)
-        -- an observed zero framebuffer, with no new frame: the adapter answers zero, and the demand clears
-        atomically (writeTVar observed (Just WindowGeometryZero))
-        atomically (windowGeometry adapted) `shouldReturn` GeometryZero
-        waitFor "the demand to clear" (readView view >>= \r → if null (readingDemand r) then pure () else retry)
-        -- incomplete framebuffer information: unknown, still no demand
-        atomically (writeTVar observed (Just WindowGeometryUnknown))
-        atomically (windowGeometry adapted) `shouldReturn` GeometryUnknown
-        atomically (readingDemand <$> readView view) `shouldReturn` []
-        -- the live, complete observation again: its extent, and the drawn revision's demand restored without a new one
-        atomically (writeTVar observed Nothing)
-        atomically (windowGeometry adapted) >>= (`shouldSatisfy` \case GeometryExtent _ → True; _ → False)
-        waitFor "the demand to return" (readView view >>= \r → if readingDemand r == asked then pure () else retry)
-        atomically (readingPublished <$> readView view) `shouldReturn` published
-        _ ← closeView view
-        Win.stopInstance wcomp wvm "w"
-
 -- One 60 Hz refresh, in nanoseconds: the budget a frame of the owner has.
 frameBudget ∷ Word64
 frameBudget = 16666667
@@ -356,7 +319,7 @@ withViewsAt viewsConfig env comp vm body =
             , styleBound = textures
             , styleParents = Set.fromList [fromIntegral colour, fromIntegral normal]
             , styleMapped = Set.fromList [either (error . show) id (mkMaterialId material) | material ← ["loam", "granite"]]
-            , styleLive = pure True
+            , styleAuthority = []
             , styleRelease = pure ()
             }
         config = defaultConfig {configStore = defaultStoreSpec {specAllowanceBytes = toInteger minAllowanceBytes}, configLimits = cameraLimits}

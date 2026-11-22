@@ -409,6 +409,7 @@ import Hetoimasia.GPU.Vulkan.Native.Uploads
   , retireUploads
   , submitUploadGated
   , uploadsWaiting
+  , UploadGate
   , UploadGrant
   , uploadRoom
   , reserveUpload
@@ -1889,7 +1890,7 @@ renderingUploadsWaiting rendering =
 -- that reserve and queue it.
 submitRenderingUpload
   ∷ Rendering q inst msgr phys dev cmd
-  → STM (Maybe UploadRefusal)
+  → UploadGate
   → UploadRequest
   → IO (Either (Either UploadsUnavailable UploadRefusal) UploadTicket)
 submitRenderingUpload rendering gate request =
@@ -1904,7 +1905,7 @@ submitRenderingUpload rendering gate request =
 -- 'UploadsNotReady', which their startup can change.
 renderingUploadRoom
   ∷ Rendering q inst msgr phys dev cmd
-  → STM (Maybe UploadRefusal)
+  → UploadGate
   → Natural
   → STM (Either (Either UploadsUnavailable UploadRefusal) ())
 renderingUploadRoom rendering gate bytes = withUploads rendering gate (`uploadRoom` bytes)
@@ -1913,20 +1914,20 @@ renderingUploadRoom rendering gate bytes = withUploads rendering gate (`uploadRo
 -- gate, read in the same transaction: a refusal reserves nothing.
 reserveRenderingUpload
   ∷ Rendering q inst msgr phys dev cmd
-  → STM (Maybe UploadRefusal)
+  → UploadGate
   → Natural
   → STM (Either (Either UploadsUnavailable UploadRefusal) UploadGrant)
 reserveRenderingUpload rendering gate bytes = withUploads rendering gate (`reserveUpload` bytes)
 
 withUploads
   ∷ Rendering q inst msgr phys dev cmd
-  → STM (Maybe UploadRefusal)
+  → UploadGate
   → (Uploads q inst msgr phys dev cmd → STM (Either UploadRefusal a))
   → STM (Either (Either UploadsUnavailable UploadRefusal) a)
 withUploads rendering gate decide =
   gate >>= \case
-    Just refusal → pure (Left (Right refusal))
-    Nothing →
+    Left refusal → pure (Left (Right refusal))
+    Right _ →
       readTVar (renderingUploads rendering) >>= \case
         UploadsMade uploads → either (Left . Right) Right <$> decide uploads
         UploadsUnconfigured → pure (Left (Left UploadsNotConfigured))
@@ -1939,7 +1940,7 @@ withUploads rendering gate decide =
 -- refusal when queueing gives its place and region back and consumes it.
 submitRenderingGranted
   ∷ Rendering q inst msgr phys dev cmd
-  → STM (Maybe UploadRefusal)
+  → UploadGate
   → UploadGrant
   → Buffer
   → ByteString.ByteString

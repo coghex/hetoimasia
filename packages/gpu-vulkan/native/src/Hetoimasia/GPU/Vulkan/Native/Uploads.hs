@@ -45,6 +45,10 @@ module Hetoimasia.GPU.Vulkan.Native.Uploads
   , UploadRefusal (..)
   , UploadPressure (..)
   , submitUpload
+  , UploadGate
+  , UploadPermit (..)
+  , ungated
+  , gateOn
   , submitUploadGated
 
     -- * Reservations

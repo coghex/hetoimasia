@@ -16,9 +16,9 @@
 module Test.GPU.Vulkan.Native.Uploads (spec) where
 
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar, tryPutMVar, tryTakeMVar)
-import Control.Concurrent.STM (atomically, check, modifyTVar', newTVarIO, readTVar, readTVarIO, writeTVar)
-import Control.Exception (try)
-import Control.Monad (forM, replicateM_, void, when)
+import Control.Concurrent.STM (atomically, check, modifyTVar', newTVarIO, readTVar, readTVarIO, retry, throwSTM, writeTVar)
+import Control.Exception (AsyncException (ThreadKilled), ErrorCall (ErrorCall), SomeException, fromException, try)
+import Control.Monad (forM, forM_, replicateM_, void, when)
 import qualified Data.ByteString as ByteString
 import Data.Either (isRight)
 import Data.Functor ((<&>))
@@ -201,7 +201,7 @@ spec = describe "Uploads" $ do
       uploads ← made rig (config 64 64 4)
       texture ← textureOf rig Rgba8Linear 4 4 1
       open ← newTVarIO False
-      let gate = readTVar open <&> \opened → if opened then Nothing else Just UploadClosed
+      let gate = gateOn (readTVar open <&> \opened → if opened then Nothing else Just UploadClosed)
       fmap (const ()) <$> submitUploadGated gate uploads (UploadImage texture [level 64 1]) `shouldReturn` Left UploadClosed
       writes rig `shouldReturn` []
       atomically (writeTVar open True)
@@ -270,18 +270,18 @@ spec = describe "Uploads" $ do
       indices ← bufferOf rig IndexBuffer 16
       vertices ← bufferOf rig VertexBuffer 16
       -- refusals leave the reservation as it was
-      submitUploadGranted (pure Nothing) uploads grant wrongSize (level 32 1) >>= \case
+      submitUploadGranted ungated uploads grant wrongSize (level 32 1) >>= \case
         Left (UploadMalformed _) → pure ()
         other → expectationFailure ("a spend of other bytes than reserved was answered " <> show (fmap (const ()) other))
-      fmap (const ()) <$> submitUploadGranted (pure Nothing) uploads grant indices (level 16 1) `shouldReturn` Left UploadWrongKind
+      fmap (const ()) <$> submitUploadGranted ungated uploads grant indices (level 16 1) `shouldReturn` Left UploadWrongKind
       length . uploadsReserved <$> atomically (readUploads uploads) `shouldReturn` 1
       -- the queue holds one: the reservation's place is what the spend takes
-      ticket ← submitUploadGranted (pure Nothing) uploads grant vertices (level 16 1) >>= either (fail . show) pure
+      ticket ← submitUploadGranted ungated uploads grant vertices (level 16 1) >>= either (fail . show) pure
       atomically (readUploadTicket ticket) `shouldReturn` UploadQueued
       uploadsReserved <$> atomically (readUploads uploads) `shouldReturn` []
       -- spent: it binds nothing again, and abandoning it frees nothing of the live upload's
       again ← bufferOf rig VertexBuffer 16
-      fmap (const ()) <$> submitUploadGranted (pure Nothing) uploads grant again (level 16 1) `shouldReturn` Left (UploadMisuse (StaleIdentity ResourceIdentity))
+      fmap (const ()) <$> submitUploadGranted ungated uploads grant again (level 16 1) `shouldReturn` Left (UploadMisuse (StaleIdentity ResourceIdentity))
       atomically (abandonUploadGrant uploads grant)
       map uploadRegion . uploadsUnsettled <$> atomically (readUploads uploads) `shouldReturn` [(0, 16)]
       atomically (uploadRoom uploads 16) `shouldReturn` Left (UploadBackpressure QueueFull)
@@ -296,13 +296,13 @@ spec = describe "Uploads" $ do
       map fst . uploadsReserved <$> atomically (readUploads first) `shouldReturn` [0]
       map fst . uploadsReserved <$> atomically (readUploads second) `shouldReturn` [0]
       vertices ← bufferOf rig VertexBuffer 16
-      fmap (const ()) <$> submitUploadGranted (pure Nothing) second ours vertices (level 16 1) `shouldReturn` Left (UploadMisuse (StaleIdentity ResourceIdentity))
+      fmap (const ()) <$> submitUploadGranted ungated second ours vertices (level 16 1) `shouldReturn` Left (UploadMisuse (StaleIdentity ResourceIdentity))
       atomically (abandonUploadGrant second ours >> abandonUploadGrant first theirs)
       length . uploadsReserved <$> atomically (readUploads first) `shouldReturn` 1
       length . uploadsReserved <$> atomically (readUploads second) `shouldReturn` 1
       uploadsUnsettled <$> atomically (readUploads second) `shouldReturn` []
       -- each spends in its own
-      _ ← submitUploadGranted (pure Nothing) first ours vertices (level 16 1) >>= either (fail . show) pure
+      _ ← submitUploadGranted ungated first ours vertices (level 16 1) >>= either (fail . show) pure
       length . uploadsReserved <$> atomically (readUploads second) `shouldReturn` 1
       clean rig
 
@@ -313,8 +313,58 @@ spec = describe "Uploads" $ do
       atomically (closeUploads uploads)
       uploadsReserved <$> atomically (readUploads uploads) `shouldReturn` []
       vertices ← bufferOf rig VertexBuffer 16
-      fmap (const ()) <$> submitUploadGranted (pure Nothing) uploads grant vertices (level 16 1) `shouldReturn` Left UploadClosed
+      fmap (const ()) <$> submitUploadGranted ungated uploads grant vertices (level 16 1) `shouldReturn` Left UploadClosed
       fmap (const ()) <$> atomically (reserveUpload uploads 16) `shouldReturn` Left UploadClosed
+
+    it "returns a bound grant's place, region and target through one cleanup whatever ends it before it is queued: the copy raising, or the gate raising, waiting or cancelled after the copy; the spent grant is stale, a fresh upload takes the same room and target, and retirement finishes" $
+      forM_ [AfterCopyRaises, GateRaises, GateWaits, GateCancelled] $ \ending → do
+        rig ← newUploadRig
+        -- one queue place and the whole staging buffer: the grant takes both
+        uploads ← made rig (config 64 64 1)
+        grant ← atomically (reserveUpload uploads 64) >>= either (fail . show) pure
+        vertices ← bufferOf rig VertexBuffer 64
+        afterCopy ← newTVarIO Nothing
+        let gate =
+              readTVar afterCopy >>= \case
+                Nothing → pure (Right (UploadPermit (pure Nothing)))
+                Just GateRaises → throwSTM (ErrorCall "the gate raised")
+                Just GateWaits → retry
+                Just _ → throwSTM ThreadKilled
+        case ending of
+          AfterCopyRaises → failAt (rigRecordingStandIn rig) AtWriteMapped
+          _ → onceAt (rigRecordingStandIn rig) AtWriteMapped (atomically (writeTVar afterCopy (Just ending)))
+        outcome ← try @SomeException (submitUploadGranted gate uploads grant vertices (level 64 1))
+        case (ending, outcome) of
+          (AfterCopyRaises, Left raised) | Just (RecordingFailure AtWriteMapped) ← fromException raised → pure ()
+          (GateRaises, Left raised) | Just (ErrorCall "the gate raised") ← fromException raised → pure ()
+          (GateWaits, Right (Left UploadGateBusy)) → pure ()
+          (GateCancelled, Left raised) | Just ThreadKilled ← fromException raised → pure ()
+          _ → expectationFailure ("unexpected outcome for " <> show ending <> ": " <> either show (show . fmap (const ())) outcome)
+        succeedAt (rigRecordingStandIn rig) AtWriteMapped
+        atomically (writeTVar afterCopy Nothing)
+        uploadsUnsettled <$> atomically (readUploads uploads) `shouldReturn` []
+        fmap (const ()) <$> submitUploadGranted ungated uploads grant vertices (level 64 1) `shouldReturn` Left (UploadMisuse (StaleIdentity ResourceIdentity))
+        _ ← admitted uploads (UploadBuffer vertices (level 64 1))
+        ok (retireUploads uploads)
+
+    it "gives copied bytes to whichever commits first, the gate's closing or the queue: closed first, a refusal and the room free again; queued first, an upload the queue settles, holding its target until it does" $ do
+      rig ← newUploadRig
+      uploads ← made rig (config 64 64 1)
+      vertices ← bufferOf rig VertexBuffer 64
+      open ← newTVarIO True
+      let gate = gateOn (readTVar open <&> \opened → if opened then Nothing else Just UploadClosed)
+      -- closed first: the gate closes while the bytes are copied
+      onceAt (rigRecordingStandIn rig) AtWriteMapped (atomically (writeTVar open False))
+      fmap (const ()) <$> submitUploadGated gate uploads (UploadBuffer vertices (level 64 1)) `shouldReturn` Left UploadClosed
+      uploadsUnsettled <$> atomically (readUploads uploads) `shouldReturn` []
+      -- queued first: the gate closes once the upload is queued
+      atomically (writeTVar open True)
+      ticket ← submitUploadGated gate uploads (UploadBuffer vertices (level 64 1)) >>= either (fail . show) pure
+      atomically (writeTVar open False)
+      fmap (const ()) <$> submitUploadGated ungated uploads (UploadBuffer vertices (level 64 1)) `shouldReturn` Left UploadAlreadyTargeted
+      settleUploads rig uploads
+      atomically (readUploadTicket ticket) `shouldReturn` UploadComplete
+      clean rig
 
   describe "progress" $ do
     it "records each turn's copies at block-row boundaries under the budget, the target resting in its transfer write between batches, and completes on the final batch's fence" $ do
@@ -876,3 +926,7 @@ indices16 = ByteString.pack . concatMap (\index → [fromIntegral index, fromInt
 
 milliseconds ∷ Integer → Duration
 milliseconds n = either (error . show) id (durationFromNanoseconds AllowZero (n * 1000000))
+
+-- | What ends a granted upload between its binding and its queueing.
+data PostBind = AfterCopyRaises | GateRaises | GateWaits | GateCancelled
+  deriving (Eq, Show)

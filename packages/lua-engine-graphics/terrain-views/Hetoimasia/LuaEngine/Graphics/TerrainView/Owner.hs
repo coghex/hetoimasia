@@ -14,6 +14,7 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView.Owner
   ( Hands (..)
   , Admission (..)
   , Grant (..)
+  , Receipt (..)
   , BuildFailure (..)
   , Allocated (..)
   , OwnerPorts (..)
@@ -26,6 +27,7 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView.Owner
   ) where
 
 import Control.Concurrent.STM (STM, atomically)
+import Control.Monad (void)
 import Control.Exception (SomeAsyncException, displayException, evaluate, fromException, throwIO, try)
 import qualified Data.Map.Strict as Map
 import Data.Functor ((<&>))
@@ -55,16 +57,21 @@ import Hetoimasia.Render.TwoD.Chunk (BoundsRequest (DeriveBounds), ChunkKind (Ch
 import Hetoimasia.Render.TwoD.Material (MaterialRecord, MaterialRef)
 import Hetoimasia.Render.TwoD.Snapshot (Instance)
 import Hetoimasia.Render.TwoD.Vulkan (registerMaterial, rendererDepthFormat, rendererRegionWindow)
-import Hetoimasia.Render.TwoD.Vulkan.Builders (BufferUploads (roomFor))
+import Hetoimasia.Render.TwoD.Vulkan.Builders (BufferUploads (roomFor), Builders)
 import Hetoimasia.Render.TwoD.Vulkan.Chunks
   ( BuildRefusal (..)
   , BuildRefused (..)
+  , ChunkGrant
   , ChunkStanding
   , PreparedChunk
   , RefusedAllocation (..)
+  , Retained
   , abandonChunkGrant
   , admitRetainedChunk
   , chunkBufferOf
+  , chunkGrantReceipt
+  , claimReceipt
+  , receiptNumber
   , chunkRoom
   , chunkStandingSTM
   , preparedBytes
@@ -72,6 +79,7 @@ import Hetoimasia.Render.TwoD.Vulkan.Chunks
   , releaseChunkNow
   , spendChunkGrant
   )
+import qualified Hetoimasia.Render.TwoD.Vulkan.Chunks as Chunks
 import Hetoimasia.Render.TwoD.Vulkan.Textures (registeredMarks)
 import Hetoimasia.Terrain.Render2D.Vulkan.Material (terrainMaterial)
 
@@ -88,11 +96,22 @@ data Admission
 -- upload's room. Spent once by its build ('grantSpend'), or given back unspent ('grantAbandon'). It lives within the
 -- owner step that took it.
 data Grant = Grant
-  { grantSpend ∷ (Either BuildFailure ChunkRef → STM ()) → IO (Either BuildFailure ChunkRef)
-    -- ^ Build the part and settle it once, whatever the exit: the given settlement runs, with the build's receipt, in
-    -- the one transaction that seals the grant (registered, or its capacity given back). A refusal is answered with
-    -- that receipt; an exception or a cancellation goes on after it.
+  { grantSpend ∷ IO ()
+    -- ^ Build the part. Whatever the exit, the outcome is sealed into the grant's receipt before this returns or its
+    -- exception goes on.
   , grantAbandon ∷ STM ()
+    -- ^ Give the grant back unspent, sealing its receipt as a refusal with no allocation.
+  , grantReceipt ∷ !Receipt
+  }
+
+-- | Where a granted build's sealed outcome waits for one claimant: the view that collects it, or a sweep in its place.
+data Receipt = Receipt
+  { receiptKey ∷ !Word64
+    -- ^ Unique among the registry's receipts.
+  , receiptSealed ∷ STM Bool
+    -- ^ Whether the build's outcome is sealed (available, or already claimed).
+  , receiptClaim ∷ STM (Maybe (Either BuildFailure ChunkRef))
+    -- ^ Take the sealed outcome, once: nothing while it is unsealed or after another claimant took it.
   }
 
 -- | Why a granted build failed, with what became of the vertex buffer it made.
@@ -205,7 +224,7 @@ productionOwner host graphics = do
             admitRetainedChunk uploads retained prepared <&> \case
               Left refusal → Left (admission refusal)
               Right grant →
-                Right (viewGrant (constructedDisposal construction) (spendChunkGrant (hostBuilders host construction) retained grant) (abandonChunkGrant retained grant))
+                Right (viewGrant (constructedDisposal construction) (hostBuilders host construction) retained grant)
         , handDispose = \chunk → do
             -- the buffer, read before the release forgets the chunk, is what is physically disposed of later
             buffer ← chunkBufferOf retained chunk
@@ -228,18 +247,22 @@ admission = \case
   BuildUploadRefused (UploadOversized padded staging) → AdmitOversized ("a part needs " <> Text.pack (show padded) <> " staging bytes, and the staging buffer holds " <> Text.pack (show staging))
   refusal → AdmitNever (Text.pack (show refusal))
 
--- | A part's grant over the renderer's (the production adapter): its spend passes the view's settlement into the
--- renderer's one settlement and projects the sealed receipt; giving it back is the renderer's.
-viewGrant
-  ∷ (Buffer → STM ConstructedDisposal)
-  → ((Either BuildRefused ChunkRef → STM ()) → IO (Either BuildRefused ChunkRef))
-  → STM ()
-  → Grant
-viewGrant disposal spend abandon =
+-- | A part's grant over the renderer's (the production adapter): its spend is the renderer's, its receipt the
+-- renderer's read as a view reads it, and giving it back the renderer's.
+viewGrant ∷ (Buffer → STM ConstructedDisposal) → Builders q inst msgr phys dev cmd → Retained → ChunkGrant → Grant
+viewGrant disposal builders retained grant =
   Grant
-    { grantSpend = \settle → viewReceipt disposal <$> spend (settle . viewReceipt disposal)
-    , grantAbandon = abandon
+    { grantSpend = void (spendChunkGrant builders retained grant)
+    , grantAbandon = abandonChunkGrant retained grant
+    , grantReceipt =
+        Receipt
+          { receiptKey = receiptNumber receipt
+          , receiptSealed = Chunks.receiptSealed receipt
+          , receiptClaim = fmap (viewReceipt disposal) <$> claimReceipt receipt
+          }
     }
+  where
+    receipt = chunkGrantReceipt grant
 
 -- | A renderer's build receipt as a view reads it: the chunk, or the cause with what became of the buffer (its
 -- identity, and the reading of its destruction or why its release failed).

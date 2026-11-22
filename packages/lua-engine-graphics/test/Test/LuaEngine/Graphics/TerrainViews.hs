@@ -11,7 +11,7 @@
 module Test.LuaEngine.Graphics.TerrainViews (spec) where
 
 import Control.Concurrent.STM
-import Control.Monad (forM_, unless, when)
+import Control.Monad (forM_, unless, void, when)
 import qualified Data.ByteString.Char8 as BC
 import Data.Bits (shiftL, (.|.))
 import qualified Data.Map.Strict as Map
@@ -24,7 +24,7 @@ import qualified Data.Text as Text
 import Data.Word (Word32, Word64)
 import GHC.Stats (RTSStats (..), getRTSStats, getRTSStatsEnabled)
 import Hetoimasia.Foundation.Log (callbackSink, defaultLogFilter, mkLogger)
-import Hetoimasia.Foundation.Messaging.Payload (prepare, preparedValue)
+import Hetoimasia.Foundation.Messaging.Payload (prepare)
 import Hetoimasia.Foundation.Worker (withWorkerGroup)
 import Hetoimasia.GPU.Vulkan.GLFW (Refusal (RefusedDeviceAbsent), TicketState (..), UploadRefusal (UploadClosed), UploadState (UploadLost), UploadsUnavailable (..), VulkanUploadRefusal (..))
 import Hetoimasia.LuaEngine.Graphics.Texture.Host (hostUploadAnswer)
@@ -70,7 +70,7 @@ import Test.Support.Bounded (bounded)
 import Test.Support.Owned (withOwnedThread)
 import Hetoimasia.GLFW.Window (Attribute (..), ContentScale (..), Extent (..))
 import Hetoimasia.LuaEngine.Graphics.Window.Host (WindowGeometry (..), geometryOfAttributes)
-import Control.Exception (AsyncException (ThreadKilled), ErrorCall (ErrorCall), SomeException, displayException, finally, throwIO, toException, try)
+import Control.Exception (AsyncException (ThreadKilled), ErrorCall (ErrorCall), SomeException, displayException, finally, fromException, throwIO, toException, try)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import System.Timeout (timeout)
 
@@ -122,10 +122,15 @@ data Rig = Rig
   , rigFailNext ∷ !(TVar [Maybe BuildFailure])
     -- ^ The outcomes of the next builds, in order: a failure, or a build as usual.
   , rigRaising ∷ !(TVar (Maybe SomeException))
-    -- ^ When set: the next granted build's constructor raises it before making a buffer. That grant is the production
-    -- adapter's ('viewGrant'), whose renderer side settles once with no allocation and then raises.
-  , rigCancelSettled ∷ !(TVar Bool)
-    -- ^ Whether the next failed build is cancelled once settled: its settlement runs, then the cancellation goes on.
+    -- ^ When set: the next granted build's constructor raises it before making a buffer: sealed with no allocation and
+    -- the cause, then raised.
+  , rigRaiseSealed ∷ !(TVar (Maybe SomeException))
+    -- ^ What the next failed build raises once sealed: its receipt is sealed, then the exception goes on.
+  , rigReceiptNext ∷ !(TVar Word64)
+    -- ^ The next receipt's key.
+  , rigFault ∷ !(TVar (Maybe (HeldTarget, HeldFault, Bool)))
+    -- ^ When set: the next build's seal makes this target's version read fail, for the rest of that owner step (and
+    -- notes that it fired); the step's end clears it.
   , rigCountGate ∷ !(TVar (Maybe (Int → Bool, TMVar [RegionCoord], TMVar ())))
     -- ^ When set: the first held copy whose counted total satisfies the test names its batch here, once its total is
     -- counted, and waits until the example resumes it.
@@ -219,7 +224,9 @@ withRig options body =
         buildAttempts ← newTVarIO 0
         failNext ← newTVarIO []
         raising ← newTVarIO Nothing
-        cancelSettled ← newTVarIO False
+        raiseSealed ← newTVarIO Nothing
+        receiptNext ← newTVarIO 0
+        fault ← newTVarIO Nothing
         countGate ← newTVarIO Nothing
         initial ← prepare initialGraphicsScene
         let owner =
@@ -285,7 +292,7 @@ withRig options body =
                     forM_ steps $ \(step, outcome) → step fakeHands >> atomically (writeTVar outcome (Just StepRan))
                     loop
               loop
-            rig views = Rig views terrain lease queue queueOpen lane laneCapacity standings chunks disposed attempts buildFailure disposeFailure next ledger claims receipts ownerEnded style account deferDisposal pendingDisposals hold entered resume styleReleases unavailable admission admitBudget grants uploading demandRefused buildAttempts failNext raising cancelSettled countGate
+            rig views = Rig views terrain lease queue queueOpen lane laneCapacity standings chunks disposed attempts buildFailure disposeFailure next ledger claims receipts ownerEnded style account deferDisposal pendingDisposals hold entered resume styleReleases unavailable admission admitBudget grants uploading demandRefused buildAttempts failNext raising raiseSealed receiptNext fault countGate
             fakeHands = hands (rig (error "the teardown's hands read no service"))
         withOwnedThread (when (optTeardown options /= TeardownNone) teardown) $ \_ _ →
           withTerrainViews (configOf options) ports $ \views →
@@ -332,8 +339,8 @@ roomOf admission budget = do
 
 -- The fake hands: a part is prepared by the renderer itself; a grant comes from the fake uploads' answer, and its
 -- build makes render-2d's own description of the instances under the material's records, ready at once unless the
--- example says otherwise. A build settles once, in its own transaction, with the session's settlement, and then
--- answers (or, as the example asks, raises).
+-- example says otherwise. A build seals its outcome into its receipt in its own transaction, as the renderer does, and
+-- then returns (or, as the example asks, raises); the view collects the receipt.
 hands ∷ Rig → Hands
 hands rig =
   Hands
@@ -346,16 +353,28 @@ hands rig =
             modifyTVar' (rigAdmitBudget rig) (fmap (subtract 1))
             modifyTVar' (rigGrants rig) (+ 1)
             live ← newTVar True
+            cell ← newTVar Nothing
+            claimed ← newTVar False
+            key ← readTVar (rigReceiptNext rig)
+            writeTVar (rigReceiptNext rig) (key + 1)
             let giveBack = readTVar live >>= \held → when held (writeTVar live False >> modifyTVar' (rigGrants rig) (subtract 1))
-            readTVar (rigRaising rig) >>= \case
-              Just raised → do
-                writeTVar (rigRaising rig) Nothing
-                -- the renderer's side of a constructor that raised before any buffer: settled once, then raised
-                let renderer settle = do
-                      atomically (giveBack >> settle (Left (BuildRefused (BuildRaised (Text.pack (displayException raised))) NoAllocation)))
-                      throwIO raised
-                pure (Right (viewGrant (\_ → pure DisposalDone) renderer giveBack))
-              Nothing → pure (Right (Grant (spend prepared giveBack) giveBack))
+                seal outcome = writeTVar cell (Just outcome)
+                receipt =
+                  Receipt
+                    { receiptKey = key
+                    , receiptSealed = isJust <$> readTVar cell
+                    , receiptClaim =
+                        (,) <$> readTVar cell <*> readTVar claimed >>= \case
+                          (Just outcome, False) → Just outcome <$ writeTVar claimed True
+                          _ → pure Nothing
+                    }
+                abandon = readTVar live >>= \held → when held (giveBack >> seal (Left (BuildFailed "BuildAbandoned" NotAllocated)))
+            raising ← readTVar (rigRaising rig)
+            writeTVar (rigRaising rig) Nothing
+            pure . Right $ case raising of
+              -- a constructor that raised before any buffer: sealed with its cause, then raised
+              Just raised → Grant (atomically (giveBack >> seal (Left (BuildFailed (Text.pack (show (BuildRaised (Text.pack (displayException raised))))) NotAllocated))) >> throwIO raised) abandon receipt
+              Nothing → Grant (spend prepared giveBack seal) abandon receipt
     , handDispose = \chunk → atomically $ do
         modifyTVar' (rigAttempts rig) (Map.insertWith (+) chunk 1)
         failing ← readTVar (rigDisposeFailure rig)
@@ -375,21 +394,22 @@ hands rig =
     }
   where
     material = materialRef 11 (MaterialFacts True recordLayout (fromIntegral pushBlockBytes))
-    spend prepared giveBack settle = do
+    spend prepared giveBack seal = do
       upcoming ← readTVarIO (rigNext rig)
       held ← atomically $ do
         hold ← readTVar (rigHold rig)
         if hold == Just upcoming then True <$ (writeTVar (rigHold rig) Nothing >> putTMVar (rigEntered rig) ()) else pure False
       when held (atomically (takeTMVar (rigResume rig)))
-      (receipt, cancelled) ← atomically $ do
+      raised ← atomically $ do
         receipt ← built
-        settle receipt
-        cancelled ← case receipt of
-          Left _ → readTVar (rigCancelSettled rig) <* writeTVar (rigCancelSettled rig) False
-          Right _ → pure False
-        pure (receipt, cancelled)
-      when cancelled (throwIO ThreadKilled)
-      pure receipt
+        seal receipt
+        readTVar (rigFault rig) >>= \case
+          Just (faulty, failing, False) → setHeldFault faulty (Just failing) >> writeTVar (rigFault rig) (Just (faulty, failing, True))
+          _ → pure ()
+        case receipt of
+          Left _ → readTVar (rigRaiseSealed rig) <* writeTVar (rigRaiseSealed rig) Nothing
+          Right _ → pure Nothing
+      mapM_ throwIO raised
       where
        built = do
         modifyTVar' (rigBuildAttempts rig) (+ 1)
@@ -422,8 +442,14 @@ runOwner rig = go (100000 ∷ Int)
         next Seq.:< rest → Just next <$ writeTVar (rigQueue rig) rest) >>= \case
         Nothing → pure ()
         Just (step, outcome) → do
-          step (hands rig) `finally` atomically (writeTVar outcome (Just StepRan))
+          -- a target fault armed in this step lasts for this step alone
+          step (hands rig) `finally` atomically (writeTVar outcome (Just StepRan) >> disarm)
           go (n - 1)
+
+    disarm =
+      readTVar (rigFault rig) >>= \case
+        Just (held, _, True) → setHeldFault held Nothing >> writeTVar (rigFault rig) Nothing
+        _ → pure ()
 
 -- The owner's exit begins: it takes no more actions, and refuses the ones queued.
 endRigOwner ∷ Rig → Text → IO ()
@@ -451,50 +477,36 @@ settleUntil rig done =
     loop = do
       runOwner rig
       finished ← atomically done
+      -- a step to run, or the condition met by the views' own threads (the watcher's sweep needs no step)
       unless finished $ do
-        atomically (readTVar (rigQueue rig) >>= \q → check (not (Seq.null q)))
+        atomically ((readTVar (rigQueue rig) >>= \q → check (not (Seq.null q))) `orElse` (done >>= check))
         loop
 
--- A fake target: what it was published, newest first, with the revision the host gave each.
+-- A target held in memory (its facts set through its own transitions, what it was published newest first), and the
+-- revision the fake host adopted.
 data Target = Target
   { targetKey ∷ !Int
-  , targetScenes ∷ !(TVar [(Word64, GraphicsScene)])
-  , targetUsable ∷ !(TVar Bool)
-  , targetMetrics ∷ !(TVar (Maybe TargetMetrics))
-  , targetAccepts ∷ !(TVar Bool)
+  , targetHeld ∷ !HeldTarget
   , targetAdopted ∷ !(TVar (Maybe Word64))
-  , targetAuthority ∷ !(TVar Bool)
   }
 
 metricsOf ∷ Int → Int → TargetMetrics
 metricsOf w h = TargetMetrics (PixelExtent w h) (PixelExtent w h) 1 1
 
 newTarget ∷ Int → IO Target
-newTarget key = Target key <$> newTVarIO [] <*> newTVarIO True <*> newTVarIO (Just (metricsOf 320 240)) <*> newTVarIO True <*> newTVarIO Nothing <*> newTVarIO True
+newTarget key = Target key <$> atomically (newHeldTarget (Just (metricsOf 320 240))) <*> newTVarIO Nothing
 
 viewTarget ∷ Target → ViewTarget Int
-viewTarget target =
-  ViewTarget
-    { vtKey = targetKey target
-    , vtUsable = readTVar (targetUsable target)
-    , vtShowing = not . null <$> readTVar (targetScenes target)
-    , vtAuthority = readTVar (targetAuthority target)
-    , vtBind = pure ()
-    , vtUnbind = pure ()
-    , vtPublish = \scene → do
-        accepts ← readTVar (targetAccepts target)
-        when accepts $ do
-          held ← readTVar (targetScenes target)
-          writeTVar (targetScenes target) ((fromIntegral (length held) + 1, preparedValue scene) : held)
-        pure accepts
-    , vtDepth = True
-    , vtGeometry = geometryOfMetrics <$> readTVar (targetMetrics target)
-    }
+viewTarget target = ViewTarget (targetKey target) (HeldSurface (targetHeld target)) True
+
+-- What the target was published, newest first, with the revision it gave each.
+targetScenes ∷ Target → STM [(Word64, GraphicsScene)]
+targetScenes = heldScenes . targetHeld
 
 -- The host adopts the target's latest revision, and its frames of the one before have completed: that one is released.
 adopt ∷ Rig → Target → IO ()
 adopt rig target = do
-  (scenes, previous) ← atomically ((,) <$> readTVar (targetScenes target) <*> readTVar (targetAdopted target))
+  (scenes, previous) ← atomically ((,) <$> targetScenes target <*> readTVar (targetAdopted target))
   case scenes of
     (revision, scene) : _ | Just revision /= previous → do
       ledgerAdopted (rigLedger rig) (targetKey target) (fromIntegral revision) scene
@@ -505,7 +517,7 @@ adopt rig target = do
 -- The host adopts the latest revision while a frame of the one before is still in flight: both stay held.
 adoptHolding ∷ Rig → Target → IO ()
 adoptHolding rig target = do
-  scenes ← readTVarIO (targetScenes target)
+  scenes ← atomically (targetScenes target)
   case scenes of
     (revision, scene) : _ → do
       ledgerAdopted (rigLedger rig) (targetKey target) (fromIntegral revision) scene
@@ -535,7 +547,7 @@ quiesce rig target = do
 -- The latest world the target was published, if its latest scene is one.
 latestWorld ∷ Target → STM (Maybe SceneWorld)
 latestWorld target =
-  readTVar (targetScenes target) >>= \case
+  targetScenes target >>= \case
     (_, scene) : _ → pure (graphicsWorld scene)
     [] → pure Nothing
 
@@ -543,12 +555,13 @@ publishedAtLeast ∷ TerrainView Int → Word64 → STM Bool
 publishedAtLeast view revision = maybe False (>= revision) . readingPublished <$> readView view
 
 styleOf ∷ Rig → IO ViewStyle
-styleOf rig = styleWith rig ["loam", "granite"] (pure True)
+styleOf rig = styleWith rig ["loam", "granite"] True
 
 -- A style whose mapping gives a region to these materials, whose parents' leases are live while this says so, and
 -- whose release is counted.
-styleWith ∷ Rig → [String] → STM Bool → IO ViewStyle
+styleWith ∷ Rig → [String] → Bool → IO ViewStyle
 styleWith rig mapped live = do
+  authority ← newTVarIO live
   textures ← boundPackedTextures (rigStyle rig) (textureHandleOf colourIdentity) (textureHandleOf normalIdentity)
   pure
     ViewStyle
@@ -556,7 +569,7 @@ styleWith rig mapped live = do
       , styleBound = textures
       , styleParents = Set.fromList [colourIdentity, normalIdentity]
       , styleMapped = Set.fromList [either (error . show) id (mkMaterialId name) | name ← mapped]
-      , styleLive = live
+      , styleAuthority = [HeldAuthority authority]
       , styleRelease = atomically (modifyTVar' (rigStyleReleases rig) (+ 1))
       }
 
@@ -707,7 +720,7 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         atomically (readingRefusal <$> readView view) >>= (`shouldSatisfy` \case
           Just (LimitRecorderWindow _ 64) → True
           _ → False)
-        atomically (readTVar (targetScenes target)) `shouldReturn` []
+        atomically (targetScenes target) `shouldReturn` []
         readTVarIO (rigChunks rig) `shouldReturn` Map.empty
 
     it "refuses when the terrain service refuses the copy, and keeps the drawing" $
@@ -718,7 +731,7 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         atomically (readingRefusal <$> readView view) >>= (`shouldSatisfy` \case
           Just (LimitRuntime _) → True
           _ → False)
-        atomically (readTVar (targetScenes target)) `shouldReturn` []
+        atomically (targetScenes target) `shouldReturn` []
 
     it "refuses a candidate whose copies hold more input runs and intervals than the profile allows, across split copies, counting every column's runs" $ do
       -- one region's copy: its knowledge is one class of several runs shared by every column, which the planner is
@@ -810,7 +823,7 @@ spec = describe "terrain views (TRA-9 v2)" $ do
     it "revokes a close at once, with no owner step, even on a minimized target" $
       withPublished defaultOptions $ \rig target view → do
         atomically (writeTVar (rigQueueOpen rig) False)
-        atomically (writeTVar (targetMetrics target) (Just (metricsOf 0 0)))
+        atomically (setHeldMetrics (targetHeld target) (Just (metricsOf 0 0)))
         outcome ← closeView view
         outcome `shouldSatisfy` (`elem` [CloseRetiring, CloseDone])
         atomically (readingStatus <$> readView view) `shouldReturn` ViewEnded EndClosed
@@ -825,7 +838,7 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         atomically (readingInterests <$> ledgerReading (rigLedger rig)) `shouldReturn` Map.fromList [(colourIdentity, 1), (normalIdentity, 1)]
         _ ← closeView view
         atomically (readingInterests <$> ledgerReading (rigLedger rig)) `shouldReturn` Map.empty
-        scenes ← readTVarIO (targetScenes target)
+        scenes ← atomically (targetScenes target)
         case scenes of
           (_, scene) : _ → graphicsWorld scene `shouldBe` Nothing
           [] → expectationFailure "nothing was handed back"
@@ -888,7 +901,7 @@ spec = describe "terrain views (TRA-9 v2)" $ do
     it "ends a view whose target incarnation retired, dropping its claim" $
       withPublished defaultOptions $ \rig target view → do
         -- an idle target retires: the views notice it with no caller's kick
-        atomically (writeTVar (targetUsable target) False)
+        atomically (setHeldUsable (targetHeld target) False)
         eventually (not . Seq.null <$> readTVar (rigQueue rig))
         settleUntil rig ((== ViewEnded EndTargetGone) . readingStatus <$> readView view)
         atomically (claimOf (rigClaims rig) 1) `shouldReturn` Nothing
@@ -898,7 +911,7 @@ spec = describe "terrain views (TRA-9 v2)" $ do
       _ ← withPublished defaultOptions {optTeardown = TeardownLive} $ \rig target view → do
         quiesce rig target
         world ← atomically (latestWorld target) >>= maybe (fail "no world") pure
-        atomically (writeTVar (targetAccepts target) False)
+        atomically (setHeldAccepts (targetHeld target) False)
         _ ← closeView view
         runOwner rig
         writeIORef held (Just (rigViews rig, rigDisposed rig, world))
@@ -913,7 +926,7 @@ spec = describe "terrain views (TRA-9 v2)" $ do
       withPublished defaultOptions $ \rig target view → do
         quiesce rig target
         world ← atomically (latestWorld target) >>= maybe (fail "no world") pure
-        atomically (writeTVar (targetAccepts target) False)
+        atomically (setHeldAccepts (targetHeld target) False)
         _ ← closeView view
         runOwner rig
         meetBarriers rig
@@ -1295,13 +1308,13 @@ spec = describe "terrain views (TRA-9 v2)" $ do
     it "copies nothing and asks the runtime for nothing while nothing can be drawn, then plans once something can" $
       withRig defaultOptions $ \rig → do
         target ← newTarget 1
-        atomically (writeTVar (targetMetrics target) (Just (metricsOf 0 0)))
+        atomically (setHeldMetrics (targetHeld target) (Just (metricsOf 0 0)))
         view ← openOn rig target
         runOwner rig
         reading ← atomically (readView view)
         (readingDemand reading, readingPublished reading, readingRefusal reading) `shouldBe` ([], Nothing, Nothing)
         atomically (inspectRetainedChargesSTM (rigTerrain rig)) >>= (`shouldSatisfy` (null . snd))
-        atomically (writeTVar (targetMetrics target) (Just (metricsOf 320 240)))
+        atomically (setHeldMetrics (targetHeld target) (Just (metricsOf 320 240)))
         settleUntil rig (publishedAtLeast view 1)
 
     it "derives its runtime demand from the geometry now: present, empty when minimized, present again on restore, empty again" $
@@ -1312,7 +1325,7 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         asked `shouldSatisfy` (not . null)
         published ← atomically (readingPublished <$> readView view)
         let at metrics expected = do
-              atomically (writeTVar (targetMetrics target) (Just metrics))
+              atomically (setHeldMetrics (targetHeld target) (Just metrics))
               settleUntil rig ((== expected) . readingDemand <$> readView view)
               reading ← atomically (readView view)
               receipt ← maybe (fail "no receipt") pure (readingReceipt reading)
@@ -1332,7 +1345,7 @@ spec = describe "terrain views (TRA-9 v2)" $ do
       withRig defaultOptions {optCamera = \c → c {ccHeadroom = 400}} $ \rig → do
         target ← newTarget 1
         m1 ← prepare initialGraphicsScene
-        atomically (writeTVar (targetScenes target) [(1, preparedValue m1)])
+        atomically (void (surfacePublish (HeldSurface (targetHeld target)) m1))
         -- at the world's corner, following a cut 400 levels over the surface: every read is outside the world
         let top = 2 ^ (62 ∷ Int) - 1
         style ← styleOf rig
@@ -1373,7 +1386,7 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         quiesce rig target
         drawn ← drawLatest rig target view
         published ← atomically (readingPublished <$> readView view)
-        atomically (writeTVar (targetMetrics target) (Just (metricsOf 0 0)))
+        atomically (setHeldMetrics (targetHeld target) (Just (metricsOf 0 0)))
         settleUntil rig (null . readingDemand <$> readView view)
         Right move ← atomically (moveView view (JumpTarget (axis 70) (axis 70) (Just (axis 1))))
         settleUntil rig (isJust <$> moveSettled move)
@@ -1383,7 +1396,7 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         kept ← atomically (viewDrawn view) >>= maybe (fail "nothing drawn") pure
         (drawnPlanReceipt kept, drawnPlanCamera kept, drawnPlanMetrics kept) `shouldBe` (drawnPlanReceipt drawn, drawnPlanCamera drawn, drawnPlanMetrics drawn)
         -- restored: the landed camera is prepared and published
-        atomically (writeTVar (targetMetrics target) (Just (metricsOf 320 240)))
+        atomically (setHeldMetrics (targetHeld target) (Just (metricsOf 320 240)))
         settleUntil rig (publishedAtLeast view (maybe 1 (+ 1) published))
         camera ← drawLatest rig target view >>= maybe (fail "no camera") pure . drawnPlanCamera
         (axisValue (camAnchorX camera), axisValue (camAnchorY camera)) `shouldBe` (70, 70)
@@ -1433,7 +1446,7 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         installed ← atomically runtimeDemand
         world ← atomically (latestWorld target)
         -- the host refuses the next publication; the move's destination asks for other regions
-        atomically (writeTVar (targetAccepts target) False)
+        atomically (setHeldAccepts (targetHeld target) False)
         Right move ← atomically (moveView view far)
         settleUntil rig (isJust . readingRefusal <$> readView view)
         atomically (readingRefusal <$> readView view) `shouldReturn` Just (LimitFailure "the host refused the publication")
@@ -1448,11 +1461,11 @@ spec = describe "terrain views (TRA-9 v2)" $ do
       withPublished defaultOptions $ \rig target view → do
         quiesce rig target
         Right move ← atomically (moveView view far)
-        atomically (writeTVar (targetAuthority target) False)
+        atomically (setHeldAuthority (targetHeld target) False)
         settleUntil rig ((== ViewEnded EndRevoked) . readingStatus <$> readView view)
         atomically (moveSettled move) `shouldReturn` Just (MoveEnded EndRevoked)
         atomically (claimOf (rigClaims rig) 1) `shouldReturn` Nothing
-        atomically (readTVar (targetUsable target)) `shouldReturn` True
+        atomically (surfaceUsable (HeldSurface (targetHeld target))) `shouldReturn` True
 
     it "keeps the installed demand and its receipt when a publication's demand is unchanged" $
       withPublished defaultOptions $ \rig target view → do
@@ -1466,7 +1479,7 @@ spec = describe "terrain views (TRA-9 v2)" $ do
     it "retires a refusal whose basis no longer applies, and counts a new one once, through successive moves at zero geometry" $
       withPublished defaultOptions $ \rig target view → do
         quiesce rig target
-        atomically (writeTVar (targetMetrics target) (Just (metricsOf 0 0)))
+        atomically (setHeldMetrics (targetHeld target) (Just (metricsOf 0 0)))
         settleUntil rig (null . readingDemand <$> readView view)
         atomically (writeTVar (rigUnavailable rig) (Set.singleton (RegionCoord 4 4 0)))
         Right first ← atomically (moveView view (JumpTarget (axis 70) (axis 70) (Just (axis 1))))
@@ -1487,7 +1500,7 @@ spec = describe "terrain views (TRA-9 v2)" $ do
       withPublished defaultOptions $ \rig target view → do
         quiesce rig target
         Right first ← atomically (moveView view far)
-        atomically (writeTVar (targetAuthority target) False)
+        atomically (setHeldAuthority (targetHeld target) False)
         -- before any owner step
         fmap (either Just (const Nothing)) (atomically (moveView view (JumpTarget (axis 6) (axis 6) Nothing))) `shouldReturn` Just ControlEnded
         atomically (moveSettled first) `shouldReturn` Just (MoveEnded EndRevoked)
@@ -1518,7 +1531,7 @@ spec = describe "terrain views (TRA-9 v2)" $ do
     it "treats a target whose metrics have an infinite scale as of unknown geometry: no demand" $
       withPublished defaultOptions $ \rig target view → do
         quiesce rig target
-        atomically (writeTVar (targetMetrics target) (Just (TargetMetrics (PixelExtent 320 240) (PixelExtent 320 240) (1 / 0) 1)))
+        atomically (setHeldMetrics (targetHeld target) (Just (TargetMetrics (PixelExtent 320 240) (PixelExtent 320 240) (1 / 0) 1)))
         settleUntil rig (null . readingDemand <$> readView view)
         atomically (readingStatus <$> readView view) `shouldReturn` ViewOpen
 
@@ -1816,7 +1829,7 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         readingRefusals refused `shouldBe` 1
         before ← atomically (latestWorld target)
         -- minimized with the lease live, its withdrawal refused, and no move between
-        atomically (writeTVar (rigDemandRefused rig) (Just "the withdrawal is refused") >> writeTVar (targetMetrics target) (Just (metricsOf 0 0)))
+        atomically (writeTVar (rigDemandRefused rig) (Just "the withdrawal is refused") >> setHeldMetrics (targetHeld target) (Just (metricsOf 0 0)))
         settleUntil rig ((== 2) . readingRefusals <$> readView view)
         forM_ [1 .. 8 ∷ Int] (const wake)
         after ← atomically (readView view)
@@ -1825,7 +1838,7 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         atomically (latestWorld target) `shouldReturn` before
 
   describe "one settlement per chunk-build spend" $ do
-    it "settles a build whose constructor raises before allocating once, through the production adapter: the cause recorded, slots and grants at their baseline, and a later held build counted at close" $
+    it "settles a build whose constructor raises before allocating once: the cause recorded, slots and grants at their baseline, and a later held build counted at close" $
       withRig defaultOptions {optProfile = smallProfile {profileSlots = 4, profileQuads = 2048}} $ \rig → do
         let reading = readTerrainViews (rigViews rig)
         atomically (writeTVar (rigRaising rig) (Just (toException (ErrorCall "the constructor raised"))))
@@ -1860,11 +1873,11 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         -- the build settles with the release its construction already made, then its cancellation goes on
         atomically $ do
           writeTVar (rigFailNext rig) [Just (BuildFailed "BuildRaised \"thread killed\"" (AllocatedDisposing "buffer 7" (readTVar destruction)))]
-          writeTVar (rigCancelSettled rig) True
+          writeTVar (rigRaiseSealed rig) (Just (toException ThreadKilled))
         target ← newTarget 1
         first ← openOn rig target
         try @AsyncException (settleUntil rig (isJust . readingRefusal <$> readView first)) `shouldReturn` Left ThreadKilled
-        atomically (isJust . readingRefusal <$> readView first) `shouldReturn` True
+        -- the view did not collect the cancelled build: the sweep keeps the released buffer's slot
         atomically occupied `shouldReturn` 1
         closeView first `shouldReturn` CloseRetiring
         runOwner rig
@@ -1878,16 +1891,43 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         settleUntil rig (publishedAtLeast second 1)
         atomically occupied `shouldReturn` 4
 
+    it "charges one slot for a granted build whose bound upload raised at the mapped write while its released buffer's destruction is pending, and frees it once confirmed" $
+      withRig defaultOptions {optProfile = smallProfile {profileSlots = 4, profileQuads = 2048}} $ \rig → do
+        let occupied = Map.findWithDefault 0 1 . serviceOccupied <$> readTerrainViews (rigViews rig)
+        destruction ← newTVarIO DisposalPending
+        -- the renderer sealed the released buffer with the mapped write's cause, and the exception goes on
+        atomically $ do
+          writeTVar (rigFailNext rig) [Just (BuildFailed "BuildRaised \"the mapped write failed\"" (AllocatedDisposing "buffer 7" (readTVar destruction)))]
+          writeTVar (rigRaiseSealed rig) (Just (toException (ErrorCall "the mapped write failed")))
+        target ← newTarget 1
+        first ← openOn rig target
+        -- the view collects the sealed failure: its refusal names the cause, and the buffer's slot stays charged
+        settleUntil rig (isJust . readingRefusal <$> readView first)
+        refusal ← atomically (readingRefusal <$> readView first)
+        Text.pack (show refusal) `shouldSatisfy` Text.isInfixOf "the mapped write failed"
+        atomically occupied `shouldReturn` 1
+        _ ← closeView first
+        runOwner rig
+        second ← openOn rig target
+        settleUntil rig ((== 4) <$> occupied)
+        atomically (readingPublished <$> readView second) `shouldReturn` Nothing
+        atomically (writeTVar destruction DisposalDone)
+        settleUntil rig (publishedAtLeast second 1)
+        atomically occupied `shouldReturn` 4
+        servicePending <$> atomically (readTerrainViews (rigViews rig)) `shouldReturn` 0
+
     it "keeps a buffer whose cleanup was cancelled charged, with the upload's refusal and the release's cause, while a competing view with its own room builds" $
       withRig defaultOptions {optProfile = smallProfile {profileSlots = 4, profileQuads = 2048}} $ \rig → do
         let reading = readTerrainViews (rigViews rig)
             occupiedOn key = Map.findWithDefault 0 key . serviceOccupied <$> reading
         atomically $ do
           writeTVar (rigFailNext rig) [Just (BuildFailed "BuildUploadRefused UploadClosed" (AllocatedFailed "the failed build's buffer 7 raised on its release: thread killed"))]
-          writeTVar (rigCancelSettled rig) True
+          writeTVar (rigRaiseSealed rig) (Just (toException ThreadKilled))
         target ← newTarget 1
         first ← openOn rig target
         try @AsyncException (settleUntil rig (isJust . readingRefusal <$> readView first)) `shouldReturn` Left ThreadKilled
+        -- the sweep, in place of the view, records what the build left
+        settleUntil rig (not . null . serviceFailures <$> reading)
         failures ← serviceFailures <$> atomically reading
         [cause | (1, Nothing, cause) ← failures] `shouldSatisfy` any (\cause → all (`Text.isInfixOf` cause) ["buffer 7", "UploadClosed", "thread killed"])
         atomically (occupiedOn 1) `shouldReturn` 1
@@ -1899,6 +1939,76 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         atomically (occupiedOn 1) `shouldReturn` 1
         serviceFailures <$> atomically reading `shouldReturn` failures
         readTVarIO (rigGrants rig) `shouldReturn` 0
+
+  describe "the settlement hand-off" $ do
+    it "leaves a refused build whose revalidation raises, waits or is cancelled to the sweep: its slot returns once, nothing stays held, and a raised cause reaches the step" $
+      forM_ [HeldRaises, HeldWaits, HeldCancelled] $ \fault →
+        withRig defaultOptions {optProfile = smallProfile {profileSlots = 4, profileQuads = 2048}} $ \rig → do
+          target ← newTarget 1
+          atomically $ do
+            writeTVar (rigFailNext rig) [Just (BuildFailed "an injected refusal" NotAllocated)]
+            writeTVar (rigFault rig) (Just (targetHeld target, fault, False))
+          view ← openOn rig target
+          raised ← try @SomeException (settleUntil rig (publishedAtLeast view 1))
+          case (fault, raised) of
+            (HeldRaises, Left failure) | Just (ErrorCall _) ← fromException failure → settleUntil rig (publishedAtLeast view 1)
+            (HeldCancelled, Left failure) | Just ThreadKilled ← fromException failure → settleUntil rig (publishedAtLeast view 1)
+            (HeldWaits, Right ()) → pure ()
+            _ → expectationFailure ("unexpected outcome for " <> show fault <> ": " <> either show (const "published") raised)
+          -- the refused build's slot came back once: the target holds exactly the parts it lists
+          reading ← atomically (readTerrainViews (rigViews rig))
+          listed ← atomically (readingListed <$> readView view)
+          Map.findWithDefault 0 1 (serviceOccupied reading) `shouldBe` listed
+          servicePending reading `shouldBe` 0
+          serviceFailures reading `shouldBe` []
+          readTVarIO (rigGrants rig) `shouldReturn` 0
+
+    it "retires a registered build whose revalidation raises in place of its view: the target keeps its scene, the chunk's destruction holds a reopened view back while pending and frees its slot once" $
+      withRig defaultOptions {optProfile = smallProfile {profileSlots = 4, profileQuads = 2048}} $ \rig → do
+        let occupied = Map.findWithDefault 0 1 . serviceOccupied <$> readTerrainViews (rigViews rig)
+            disposing = serviceDisposing <$> readTerrainViews (rigViews rig)
+        target ← newTarget 1
+        m1 ← prepare initialGraphicsScene
+        atomically $ do
+          void (surfacePublish (HeldSurface (targetHeld target)) m1)
+          writeTVar (rigDeferDisposal rig) True
+          writeTVar (rigFault rig) (Just (targetHeld target, HeldRaises, False))
+        before ← atomically (targetScenes target)
+        first ← openOn rig target
+        raised ← try @ErrorCall (settleUntil rig (publishedAtLeast first 1))
+        either (const (pure ())) (const (expectationFailure "expected the revalidation's exception")) raised
+        -- the registered chunk went to retirement in place of the view: released, its destruction pending
+        _ ← closeView first
+        settleUntil rig ((>= 1) <$> disposing)
+        map fst <$> atomically (targetScenes target) `shouldReturn` map fst before
+        -- a reopened view holds what free slots it has, and waits for the pending one
+        second ← openOn rig target
+        settleUntil rig ((== 4) <$> occupied)
+        atomically (readingPublished <$> readView second) `shouldReturn` Nothing
+        awaiting ← readTVarIO (rigPendingDisposals rig)
+        -- confirmed: the slot frees once (and later disposals are immediate)
+        atomically (forM_ (Map.elems awaiting) (`writeTVar` DisposalDone) >> writeTVar (rigDeferDisposal rig) False)
+        settleUntil rig (publishedAtLeast second 1)
+        atomically occupied `shouldReturn` 4
+        servicePending <$> atomically (readTerrainViews (rigViews rig)) `shouldReturn` 0
+
+    it "follows a held target's observed zero, then unknown geometry with no new frame, clearing its demand, and restores it with the drawing" $
+      withPublished defaultOptions $ \rig target view → do
+        quiesce rig target
+        asked ← atomically (readingDemand <$> readView view)
+        published ← atomically (readingPublished <$> readView view)
+        atomically (setHeldMetrics (targetHeld target) (Just (metricsOf 0 0)))
+        settleUntil rig (null . readingDemand <$> readView view)
+        atomically (setHeldMetrics (targetHeld target) Nothing)
+        settleUntil rig (null . readingDemand <$> readView view)
+        atomically (setHeldMetrics (targetHeld target) (Just (metricsOf 320 240)))
+        settleUntil rig ((== asked) . readingDemand <$> readView view)
+        atomically (readingPublished <$> readView view) `shouldReturn` published
+
+    it "reads a window's observed geometry as the views do: zero, unknown and a complete extent" $ do
+      windowGeometryOf WindowGeometryZero `shouldBe` GeometryZero
+      windowGeometryOf WindowGeometryUnknown `shouldBe` GeometryUnknown
+      windowGeometryOf (WindowGeometryExtent (metricsOf 320 240)) `shouldBe` GeometryExtent (metricsOf 320 240)
 
   describe "settlement" $ do
     it "ends every view when the owner's exit begins: a pending move settles as ended, and controls are refused" $
@@ -1958,13 +2068,13 @@ spec = describe "terrain views (TRA-9 v2)" $ do
       withRig defaultOptions $ \rig → do
         target ← newTarget 1
         let attempt style = openView (rigViews rig) (OpenRequest (viewTarget target) (rigLease rig) (pure (Right style)) (axis 0, axis 0, axis 1) defaultLightSettings)
-        unmapped ← styleWith rig ["loam"] (pure True) >>= attempt
+        unmapped ← styleWith rig ["loam"] True >>= attempt
         either Just (const Nothing) unmapped `shouldSatisfy` \case
           Just (OpenStyle (StyleMissingMaterials [_])) → True
           _ → False
-        ended ← styleWith rig ["loam", "granite"] (pure False) >>= attempt
+        ended ← styleWith rig ["loam", "granite"] False >>= attempt
         either Just (const Nothing) ended `shouldBe` Just OpenLeaseEnded
-        atomically (writeTVar (targetAuthority target) False)
+        atomically (setHeldAuthority (targetHeld target) False)
         windowGone ← styleOf rig >>= attempt
         either Just (const Nothing) windowGone `shouldBe` Just OpenLeaseEnded
         -- each refused style was released, and no claim or GPU interest stayed
@@ -1975,12 +2085,12 @@ spec = describe "terrain views (TRA-9 v2)" $ do
     it "asks a target with no frame metrics yet for its first frame at open, and plans once it has one" $
       withRig defaultOptions $ \rig → do
         target ← newTarget 1
-        atomically (writeTVar (targetMetrics target) Nothing)
+        atomically (setHeldMetrics (targetHeld target) Nothing)
         view ← openOn rig target
-        scenes ← readTVarIO (targetScenes target)
+        scenes ← atomically (targetScenes target)
         map (graphicsWorld . snd) scenes `shouldBe` [Nothing]
         -- the frame it asked for is recorded at these metrics: the views notice them with no caller's kick
-        atomically (writeTVar (targetMetrics target) (Just (metricsOf 320 240)))
+        atomically (setHeldMetrics (targetHeld target) (Just (metricsOf 320 240)))
         eventually (not . Seq.null <$> readTVar (rigQueue rig))
         settleUntil rig (publishedAtLeast view 1)
 
@@ -1988,16 +2098,16 @@ spec = describe "terrain views (TRA-9 v2)" $ do
       withRig defaultOptions {optWindow = 64} $ \rig → do
         target ← newTarget 1
         m1 ← prepare initialGraphicsScene
-        atomically (writeTVar (targetScenes target) [(1, preparedValue m1)] >> writeTVar (targetMetrics target) Nothing)
+        atomically (void (surfacePublish (HeldSurface (targetHeld target)) m1) >> setHeldMetrics (targetHeld target) Nothing)
         view ← openOn rig target
         -- the scene it shows stays: its frame's metrics, once noticed, start the view
-        map fst <$> readTVarIO (targetScenes target) >>= (`shouldBe` [1])
-        atomically (writeTVar (targetMetrics target) (Just (metricsOf 320 240)))
+        map fst <$> atomically (targetScenes target) >>= (`shouldBe` [1])
+        atomically (setHeldMetrics (targetHeld target) (Just (metricsOf 320 240)))
         settleUntil rig (isJust . readingRefusal <$> readView view)
-        map fst <$> readTVarIO (targetScenes target) >>= (`shouldBe` [1])
+        map fst <$> atomically (targetScenes target) >>= (`shouldBe` [1])
         -- closed with its claim never published: returned directly, the M1 scene still shown
         _ ← closeView view
-        map fst <$> readTVarIO (targetScenes target) >>= (`shouldBe` [1])
+        map fst <$> atomically (targetScenes target) >>= (`shouldBe` [1])
 
   describe "the host's upload answer to a chunk's build" $
     it "is not ready while configured uploads await the device, and keeps the cause of uploads the host lacks or the device refused" $ do

@@ -478,10 +478,12 @@ import Hetoimasia.GPU.Vulkan.Native.Recording (BatchTicket, Buffer, ClearColor (
 import Hetoimasia.GPU.Vulkan.Native.Uploads
   ( CancelRefusal
   , UploadConfig
+  , UploadGate
   , UploadRefusal (UploadClosed, UploadSessionFailed)
   , UploadGrant
   , UploadRequest
   , UploadTicket
+  , gateOn
   )
 import Hetoimasia.GPU.Vulkan.Native.Generations
   ( GenerationUse
@@ -1294,12 +1296,13 @@ submitVulkanUpload (VulkanController state) request =
 
 -- | The owner's own gate, read in the transactions that reserve and queue an
 -- upload, so none is reserved or queued once quiescence has closed the owner.
-uploadGate ∷ State inst msgr phys dev cmd lease obligation → STM (Maybe UploadRefusal)
+uploadGate ∷ State inst msgr phys dev cmd lease obligation → UploadGate
 uploadGate state =
-  actionGate (stateRoots state) (stateOwnerOpen state) <&> \case
-    Just (ActionSessionFailed primary) → Just (UploadSessionFailed primary)
-    Just _ → Just UploadClosed
-    Nothing → Nothing
+  gateOn $
+    actionGate (stateRoots state) (stateOwnerOpen state) <&> \case
+      Just (ActionSessionFailed primary) → Just (UploadSessionFailed primary)
+      Just _ → Just UploadClosed
+      Nothing → Nothing
 
 -- | Whether an upload of this many bytes would be admitted now, from any
 -- thread, read-only: the decision 'reserveVulkanUpload' makes, under the

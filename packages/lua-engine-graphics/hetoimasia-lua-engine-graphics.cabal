@@ -96,6 +96,7 @@ library terrain-views
         Hetoimasia.LuaEngine.Graphics.TerrainView.Profile
         Hetoimasia.LuaEngine.Graphics.TerrainView.Session
         Hetoimasia.LuaEngine.Graphics.TerrainView.Style
+        Hetoimasia.LuaEngine.Graphics.TerrainView.Surface
         Hetoimasia.LuaEngine.Graphics.TerrainView.Target
     build-depends:
         base >=4.22 && <4.23,

@@ -12,6 +12,7 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView
   , module Hetoimasia.LuaEngine.Graphics.TerrainView.Profile
   , module Hetoimasia.LuaEngine.Graphics.TerrainView.Session
   , module Hetoimasia.LuaEngine.Graphics.TerrainView.Style
+  , module Hetoimasia.LuaEngine.Graphics.TerrainView.Surface
   , module Hetoimasia.LuaEngine.Graphics.TerrainView.Target
   , productionPorts
   ) where
@@ -23,6 +24,7 @@ import Hetoimasia.LuaEngine.Graphics.TerrainView.Owner
 import Hetoimasia.LuaEngine.Graphics.TerrainView.Profile
 import Hetoimasia.LuaEngine.Graphics.TerrainView.Session
 import Hetoimasia.LuaEngine.Graphics.TerrainView.Style
+import Hetoimasia.LuaEngine.Graphics.TerrainView.Surface
 import Hetoimasia.LuaEngine.Graphics.TerrainView.Target
 import Hetoimasia.LuaEngine.Graphics.Texture (TextureGraphics (..))
 import Hetoimasia.LuaEngine.Texture (RenderAccount)

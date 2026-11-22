@@ -39,6 +39,7 @@ import Hetoimasia.GPU.Vulkan.Native.Uploads
   , abandonUploadGrant
   , reserveUpload
   , submitUploadGranted
+  , ungated
   , uploadRoom
   )
 import Numeric.Natural (Natural)
@@ -142,7 +143,7 @@ bufferUploadsOf uploads =
   BufferUploads
     { roomFor = fmap refused . uploadRoom uploads
     , reserveRoom = fmap refused . reserveUpload uploads
-    , uploadGranted = \grant buffer bytes → refused <$> submitUploadGranted (pure Nothing) uploads grant buffer bytes
+    , uploadGranted = \grant buffer bytes → refused <$> submitUploadGranted ungated uploads grant buffer bytes
     , abandonRoom = abandonUploadGrant uploads
     }
   where

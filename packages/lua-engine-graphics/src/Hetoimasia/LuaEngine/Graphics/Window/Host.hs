@@ -40,6 +40,13 @@ module Hetoimasia.LuaEngine.Graphics.Window.Host
 
     -- * The capability a ready window yields
   , WindowTarget (..)
+  , WindowView
+  , WindowVersion
+  , windowViewId
+  , windowViewAttachment
+  , windowViewUsable
+  , windowViewGeometry
+  , windowViewPublish
   , WindowGeometry (..)
   , observedGeometry
   , geometryOfAttributes
@@ -63,7 +70,7 @@ import qualified Data.Text as Text
 import Data.Word (Word64)
 import Numeric.Natural (Natural)
 import Hetoimasia.Foundation.Messaging.Payload (Prepared, preparedValue)
-import Hetoimasia.Foundation.Messaging.Snapshot (observedValue, readSnapshot)
+import Hetoimasia.Foundation.Messaging.Snapshot (SnapshotCursor, observedCursor, observedValue, readSnapshot)
 import Hetoimasia.GLFW.Command
   ( CommandRejection (..)
   , CommandResult (..)
@@ -150,7 +157,42 @@ data WindowTarget scene = WindowTarget
     -- ^ Whether this incarnation's target is still the admitted, attached one.
   , targetGeometry ∷ STM WindowGeometry
     -- ^ The window's geometry as its latest observation gives it, read live whether or not it records frames.
+  , targetView ∷ !(WindowView scene)
+    -- ^ The same facts and publication as the host issues them, for a consumer that reads them inside its own commits.
   }
+
+-- | A window incarnation's facts and publication as its host issues them: whether it is usable, its geometry with the
+-- version of the observation it came from, and its publication. Only the host makes one, so a consumer that reads it
+-- inside a commit runs the host's own transactions and no caller's.
+data WindowView scene = WindowView
+  { wvWindow ∷ !WindowId
+  , wvAttachment ∷ !AttachmentId
+  , wvUsable ∷ STM Bool
+  , wvGeometry ∷ STM (WindowGeometry, WindowVersion)
+  , wvPublish ∷ Prepared scene → STM WindowScenePublication
+  }
+
+-- | The version of the window observation a geometry was read from: its writer advances it with every observation.
+newtype WindowVersion = WindowVersion (SnapshotCursor WindowObservation)
+  deriving (Eq)
+
+windowViewId ∷ WindowView scene → WindowId
+windowViewId = wvWindow
+
+windowViewAttachment ∷ WindowView scene → AttachmentId
+windowViewAttachment = wvAttachment
+
+-- | Whether this incarnation's target is still the admitted, attached one.
+windowViewUsable ∷ WindowView scene → STM Bool
+windowViewUsable = wvUsable
+
+-- | The window's geometry as its latest observation gives it, with that observation's version.
+windowViewGeometry ∷ WindowView scene → STM (WindowGeometry, WindowVersion)
+windowViewGeometry = wvGeometry
+
+-- | Publish an owned scene to this window alone, as a transaction that never waits.
+windowViewPublish ∷ WindowView scene → Prepared scene → STM WindowScenePublication
+windowViewPublish = wvPublish
 
 -- | A window's geometry as an observation gives it: zero when its logical or framebuffer extent is observed with a
 -- zero dimension (whatever else is missing: a minimized window); its metrics once both extents and the content scale
@@ -387,6 +429,9 @@ target vulkan var token = do
   case found of
     Just made | Just service ← madeService made → do
       current ← standing vulkan var token
+      let usable = (== StandingUsable) <$> standing vulkan var token
+          geometry = (\observed → (observedGeometry (preparedValue (observedValue observed)), WindowVersion (observedCursor observed))) <$> readSnapshot (clientObservations (madeClient made))
+          publish = publishGraphicsWindowScene (vulkanGraphicsOwner vulkan) (madeWindow made)
       pure $ case current of
         StandingUsable →
           Just
@@ -394,9 +439,10 @@ target vulkan var token = do
               { targetWindow = madeWindow made
               , targetAttachment = graphicsAttachment service
               , targetPublish = publishVulkanWindowScene vulkan (madeWindow made)
-              , targetPublishSTM = publishGraphicsWindowScene (vulkanGraphicsOwner vulkan) (madeWindow made)
-              , targetUsable = (== StandingUsable) <$> standing vulkan var token
-              , targetGeometry = observedGeometry . preparedValue . observedValue <$> readSnapshot (clientObservations (madeClient made))
+              , targetPublishSTM = publish
+              , targetUsable = usable
+              , targetGeometry = fst <$> geometry
+              , targetView = WindowView (madeWindow made) (graphicsAttachment service) usable geometry publish
               }
         _ → Nothing
     _ → pure Nothing
