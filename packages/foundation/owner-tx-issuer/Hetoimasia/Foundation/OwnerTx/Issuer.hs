@@ -2,7 +2,7 @@
 -- ownership transaction ("Hetoimasia.Foundation.OwnerTx").
 --
 -- __Who may import it.__ Only the components and modules @tools/validation/owner_tx_issuers.json@ lists. The
--- repository's import guard (@tools/validation/owner_tx_guard.py@) refuses any other importer, any unlisted component
+-- repository's import guard (@tools/owner-tx-guard@) refuses any other importer, any unlisted component
 -- that depends on this sublibrary (@hetoimasia-foundation:owner-tx-issuer@), and any re-export of this module, of
 -- 'fromIssuerSTM' or of the representation, in a listed module too. An issuer exports concrete operations on opaque
 -- handles built here, never the bridge itself.
@@ -23,7 +23,8 @@ module Hetoimasia.Foundation.OwnerTx.Issuer
   ) where
 
 import Control.Concurrent.STM (STM, readTVar, writeTVar)
-import Hetoimasia.Foundation.OwnerTx.Representation (OwnerCell (..), OwnerTx (..))
+import Hetoimasia.Foundation.OwnerTx.Cells (OwnerCell (..))
+import Hetoimasia.Foundation.OwnerTx.Representation (OwnerTx (..))
 
 -- | Embed one of the issuer's own concrete operations. It must read only issuer-controlled inputs, validate before
 -- writing, answer refusals as data, and finish without waiting or raising.
