@@ -1,11 +1,12 @@
 -- | The issuer bridge: how an issuer embeds a concrete operation over its own 'STM' and its existing state into an
 -- ownership transaction ("Hetoimasia.Foundation.OwnerTx").
 --
--- __Who may import it.__ Only the components and modules @tools/validation/owner_tx_issuers.json@ lists. The
--- repository's import guard (@tools/owner-tx-guard@) refuses any other importer, any unlisted component
--- that depends on this sublibrary (@hetoimasia-foundation:owner-tx-issuer@), and any re-export of this module, of
--- 'fromIssuerSTM' or of the representation, in a listed module too. An issuer exports concrete operations on opaque
--- handles built here, never the bridge itself.
+-- __Who may depend on it.__ Only the components @tools/validation/owner_tx_issuers.json@ lists. The repository's
+-- dependency guard (@tools/owner-tx-guard@) refuses any other component that depends on this sublibrary
+-- (@hetoimasia-foundation:owner-tx-issuer@) and any Cabal re-export or mixin of this module or of the representation,
+-- in a listed component too. Issuer review checks what a listed component's modules import and export: an issuer
+-- exports concrete operations on opaque handles built here, never the bridge itself, no conversion between a caller's
+-- 'STM' and a transaction, and no instance on 'STM' or the protected Foundation types.
 --
 -- __What an embedded path must do.__ Every 'STM' action an issuer embeds reads only issuer-controlled inputs (never a
 -- caller's transaction, callback or reader), validates every guard before its first write, answers a refusal as data,

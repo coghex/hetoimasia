@@ -185,12 +185,12 @@ library
 library internal
     visibility: private
     exposed-modules:
-        -- The ownership transaction's representation: bridge-equivalent, so only
-        -- the importers tools/validation/owner_tx_issuers.json lists may import it.
+        -- The ownership transaction's representation: bridge-equivalent, so it stays
+        -- in this private library and is reviewed with the bridge.
         Hetoimasia.Foundation.OwnerTx.Representation
         -- The cells and their safe STM operations, independent of the representation.
         Hetoimasia.Foundation.OwnerTx.Cells
-        -- The listed adapter: the STM-free operations the public module re-exports.
+        -- The adapter: the STM-free operations the public module re-exports.
         Hetoimasia.Foundation.OwnerTx.Operations
         Hetoimasia.Foundation.Resource.Internal
         Hetoimasia.Foundation.Worker.Internal
@@ -220,10 +220,10 @@ library internal
 -- The issuer bridge of the ownership transactions: the one embedding of an
 -- issuer's own STM into an OwnerTx, and the issuer-side cell updates that take
 -- functions. It is public so issuer packages can depend on it across package
--- boundaries; who may is not left to Cabal: the repository's import guard
--- (tools/validation/owner_tx_guard.py) refuses every component and module
--- tools/validation/owner_tx_issuers.json does not list, and any re-export of
--- the bridge or the representation.
+-- boundaries; who may is not left to Cabal: the repository's dependency guard
+-- (tools/owner-tx-guard) refuses every dependent component
+-- tools/validation/owner_tx_issuers.json does not list, and any Cabal re-export
+-- or mixin of the bridge or the representation.
 library owner-tx-issuer
     visibility: public
     exposed-modules:

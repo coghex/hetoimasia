@@ -9,9 +9,10 @@
 -- __Issuers.__ An issuer (a subsystem that owns state and exports ownership operations over it) keeps its own 'STM' and
 -- its existing state, and embeds a concrete operation through
 -- 'Hetoimasia.Foundation.OwnerTx.Issuer.fromIssuerSTM', in the @owner-tx-issuer@ sublibrary of this package. Only the
--- components and modules @tools/validation/owner_tx_issuers.json@ lists may import that bridge; the repository's import
--- guard (@tools/owner-tx-guard@) refuses any other importer, any unlisted dependency on the sublibrary and
--- any re-export of the bridge or the representation. Every embedded path must:
+-- components @tools/validation/owner_tx_issuers.json@ lists may depend on that sublibrary; the repository's dependency
+-- guard (@tools/owner-tx-guard@) refuses any other dependent and any Cabal re-export or mixin of the bridge or the
+-- representation, and issuer review checks what a listed component's modules import and export. Every embedded path
+-- must:
 --
 -- * read only issuer-controlled inputs (its own cells and those it was handed by value or by an opaque handle it
 --   issued), never a caller's transaction, callback or reader;
@@ -35,7 +36,7 @@
 -- to the last. A commit reads the 'Publication' and never writes it. A publication is not an owner cell.
 --
 -- __Where it comes from.__ This module imports no protected module: it re-exports the STM-free operations of the
--- listed adapter "Hetoimasia.Foundation.OwnerTx.Operations" and the cells' types, kept abstract, with their observation
+-- private adapter "Hetoimasia.Foundation.OwnerTx.Operations" and the cells' types, kept abstract, with their observation
 -- and publication operations from "Hetoimasia.Foundation.OwnerTx.Cells", which does not import the representation.
 --
 -- __State.__ The module owns none. A cell belongs to the issuer that allocated it, which exports operations on opaque

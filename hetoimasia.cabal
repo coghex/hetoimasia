@@ -201,7 +201,7 @@ executable hetoimasia
 -- Cabal's parser for the components and their dependencies, re-exports and
 -- mixins, and the allowlist tools/validation/owner_tx_issuers.json. The validation group
 -- test.owner-tx-guard runs it against the repository, workflow-tests against
--- fixtures. It is built for the pinned compiler alone.
+-- fixtures.
 executable owner-tx-guard
     import: language
     main-is: Main.hs
