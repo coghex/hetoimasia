@@ -284,3 +284,42 @@ Use deterministic gates or supplied backend states. Each example runs once and a
 | A quiet offscreen candidate’s final upload settles between watcher samples | With no frame or caller kick, completion permits first publication. A failed upload instead retires the private candidate and preserves the previous scene. |
 | Clean owner exit closes action admission while an earlier move is pending and the watcher has yet to record closure | A second move and camera or lighting configure return `ControlEnded`. The first move settles once as `MoveEnded EndStopped`. |
 | A drawn view has one recorded zoom refusal. Minimize with the lease live and deterministically refuse the demand withdrawal, with no intervening move | The refusal count goes from one to two. The last installed list and receipt survive, as does the drawing. Unchanged wakes leave the count at two. |
+
+## Approved amendment for #714 · One settlement per chunk-build spend
+
+The owner approved this section at `3e2c2755e8` with “Y” on 2026-11-21 at approximately 23:59 UTC.
+
+**Proposed #714 amendment.** Replace the mechanism in “Failure after a grant”. Each admitted build has one record of what it owns. On every exit the graphics owner settles that record before returning a value or propagating an exception. The admission decision, six guarantees and amendment F’s teardown scope still apply. [Approved admission](https://github.com/coghex/hetoimasia/issues/714#issuecomment-7068947065) · [Round 12, findings 1–4](https://github.com/coghex/hetoimasia/pull/716#issuecomment-7070130411)
+
+**Record and handoffs.** The renderer creates the record on the issuing grant in the admission transaction. It holds the private reference and optional upload grant. For a view build, the same transaction associates it with the originating view, target incarnation, candidate part and charge, and increments that view’s build count. Install the owner-thread finalizer under the admission mask. Only the issuing registry may abandon a reserved grant or claim it for spending. Once claimed, only its spend may settle it.
+
+| Handoff | Fact made durable under the mask |
+| --- | --- |
+| Start | `Reserved → Spending` in STM. The spend initially owns no buffer. An unused reservation can go directly to settlement. |
+| Construct | Record the returned buffer before another interruptible operation. Construction must account for every managed buffer it creates. If native naming raises, its `ReleasedResource` context identifies the buffer whose release it already committed. Adopt that release for either exception class. A construction refusal or exception with no managed allocation leaves the buffer field empty. |
+| Bind | The record refers to the issuing upload grant’s standing. The backend marks it spent in the same STM transaction that transfers the queue place and staging range to the copying upload. This fact is available even if copying exits before a ticket returns. Zero-byte parts skip construction and binding. |
+| Register | Insert the reference and mark it registered in one STM transaction, with the buffer and ticket when present. The registry now owns the chunk. |
+
+**Settlement.** The scoped spend runs one masked finalizer on the graphics owner thread. On failure it retains the primary refusal or original exception with its context. For an owned, unregistered buffer it requests release once, capturing success, refusal or **any** exception from cleanup, including cancellation. An adopted release already has its outcome. There is no interruptible gap from acquiring either outcome to recording it. The finalizer commits the following disposition and immutable receipt in one STM transaction that never waits for GPU work. The renderer supplies its grant and registry operations. The session composes its view-ledger transfer in that transaction. Public builds use the renderer disposition alone.
+
+| Record at settlement | Disposition |
+| --- | --- |
+| Unused or unregistered, no buffer | Return the private reference, any still-reserved upload room and the view charge. Record the build cause on failure. |
+| Unregistered buffer, release requested successfully or adopted | Return the private reference and any still-reserved upload room. Transfer the target charge, buffer identity, primary cause and disposal reading to the disposal ledger. `DisposalDone` frees the charge once. Failed destruction retains the charge, identity and both causes. |
+| Unregistered buffer, release refused or raised | Return the same unused grant capacity. Retain the charge in the failure ledger with buffer identity, primary cause and release failure. Independent cleanup can proceed. |
+| Registered | Transfer the charge and reference to the current candidate, or to private retirement if superseded. A public build hands the reference to its caller. Existing upload and FIFO frame protections govern disposal. |
+
+Every row consumes the originating view’s build count once and seals the grant as returned or registered. A sealed grant and a foreign or losing claimant have no accounting action. The upload service alone recycles room already bound to a writer or ticket. Only a still-current candidate may acquire a part or record a replacement refusal.
+
+**Public contract.** Both `buildRetainedChunk` and `buildRetainedChunkWith` project the same sealed receipt. Success returns the reference. An ordinary refusal returns `BuildRefused` with allocation and release evidence, including a synchronous cleanup failure. On a raised exit, attach the receipt as a typed, publicly readable annotation to the original exception, preserving its type and context. Propagate the build exception if it was cancellation, otherwise a cancellation raised during cleanup, otherwise the build exception. Thus cancellation during cleanup of a refused upload carries the refusal too. The receipt names any buffer, the release outcome and both causes when both operations failed.
+
+Remove the `interrupted` callback, the spend adapter’s `guarded` conversion, and the session’s `handed`, `onException` accounting and unknown-allocation `raisedBuild`. Returned values and exception handlers can report the sealed outcome without applying it again. Keep live admission, candidate revalidation, disposal observation and existing release-lane handling.
+
+**Single-run acceptance.** Use controlled backend outcomes. Each row checks ownership and the caller-visible result.
+
+| Given | Observable outcome |
+| --- | --- |
+| Production view adapter, constructor raises before allocation | The actual cause survives. Build count and target occupancy return to baseline with no lost allocation. Grant capacity is reusable. Close reports retiring while a later real build is held. |
+| Native naming is cancelled after allocation, with destruction held pending | Cancellation identifies the already-released buffer. Its slot and bytes remain unavailable across close/reopen. Confirmed destruction makes that capacity reusable once. |
+| Upload refuses before binding and release raises `ThreadKilled` | Cancellation carries the upload refusal, buffer identity and release failure. The failed buffer remains charged. A competing build with its own target room can acquire the returned reference capacity, queue place and staging range. |
+| Public `buildRetainedChunk` is cancelled after allocation and release refuses or raises synchronously | The caller catches the original cancellation and reads the exact buffer and cleanup outcome from its settlement annotation. |
