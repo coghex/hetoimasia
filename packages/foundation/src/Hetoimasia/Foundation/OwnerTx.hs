@@ -102,18 +102,27 @@ readTx (ReadOnly cell) = OwnerTx (readTVar cell)
 watch ∷ ReadOnly a → STM a
 watch (ReadOnly cell) = readTVar cell
 
--- | A fresh publisher of a prepared value, at revision 0, in the source's transaction.
+-- | A fresh publisher of a prepared value, at revision 0, in the source's transaction. The handle is selected (forced to
+-- weak head normal form, which for a prepared value is all of it, so no 'Control.DeepSeq.NFData' instance runs again)
+-- before anything is made: a selection that fails raises here, in the source's transaction.
 newPublisher ∷ Prepared a → STM (Publisher a)
-newPublisher value = Publisher <$> newTVar 0 <*> newTVar (preparedValue value)
+newPublisher value = installed value `seq` (Publisher <$> newTVar 0 <*> newTVar (installed value))
 
--- | A fresh publisher of a prepared value, at revision 0, outside any transaction.
+-- | A fresh publisher of a prepared value, at revision 0, outside any transaction, the handle selected first.
 newPublisherIO ∷ Prepared a → IO (Publisher a)
-newPublisherIO value = Publisher <$> newTVarIO 0 <*> newTVarIO (preparedValue value)
+newPublisherIO value = installed value `seq` (Publisher <$> newTVarIO 0 <*> newTVarIO (installed value))
 
 -- | Install a prepared value and advance the revision, together, in the source's own transaction: the one that changes
--- the fact it publishes, a teardown included. The revision advances even for a value equal to the last.
+-- the fact it publishes, a teardown included. The revision advances even for a value equal to the last. The handle is
+-- selected before either is written, so a selection that fails raises in the source's transaction and leaves the prior
+-- value and revision as they were.
 publish ∷ Publisher a → Prepared a → STM ()
-publish (Publisher revision cell) value = writeTVar cell (preparedValue value) >> modifyTVar' revision (+ 1)
+publish (Publisher revision cell) value = installed value `seq` (writeTVar cell (installed value) >> modifyTVar' revision (+ 1))
+
+-- The prepared value a handle carries. Forcing it forces the handle's selection, never the value's preparation again: a
+-- prepared value is already fully evaluated.
+installed ∷ Prepared a → a
+installed = preparedValue
 
 -- | What the source hands to readers.
 publication ∷ Publisher a → Publication a

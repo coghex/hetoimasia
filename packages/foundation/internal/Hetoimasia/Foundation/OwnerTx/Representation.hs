@@ -1,3 +1,5 @@
+{-# LANGUAGE RoleAnnotations #-}
+
 -- | The representation behind "Hetoimasia.Foundation.OwnerTx": an ownership transaction is an 'STM' transaction, and an
 -- owner cell, a read-only capability and a publication are its variables.
 --
@@ -31,10 +33,16 @@ newtype OwnerCell a = OwnerCell (TVar a)
 newtype ReadOnly a = ReadOnly (TVar a)
   deriving newtype (Eq)
 
--- | The source's capability over a published fact: its revision and its value, written together.
+-- | The source's capability over a published fact: its revision and its value, written together. Its payload's role is
+-- nominal, as a snapshot endpoint's is: a publisher of one type is never coerced to a publisher of another whose
+-- 'Control.DeepSeq.NFData' instance prepares less.
+type role Publisher nominal
+
 data Publisher a = Publisher !(TVar Word64) !(TVar a)
 
--- | What readers of a published fact hold.
+-- | What readers of a published fact hold. Its payload's role is nominal for the same reason.
+type role Publication nominal
+
 data Publication a = Publication !(TVar Word64) !(TVar a)
 
 instance Eq (Publication a) where

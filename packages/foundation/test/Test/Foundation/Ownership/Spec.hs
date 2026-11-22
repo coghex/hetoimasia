@@ -54,6 +54,19 @@ spec = describe "Ownership" $ do
         Right () → expectationFailure "a value whose evaluation raises was published"
       commit (readPublication (publication source)) `shouldReturn` (0, [1])
 
+    it "keeps the prior value and revision when selecting the prepared handle to publish fails, in the source's transaction" $ do
+      source ← prepare (1 ∷ Int) >>= newPublisherIO
+      prepared ← mapM (\(name, value) → (,) name <$> prepare value) [("one", 1), ("two", 2 ∷ Int)]
+      let selected name = maybe (error ("no prepared value is named " <> name)) id (lookup name prepared)
+      outcome ← try (atomically (publish source (selected "three")))
+      case outcome of
+        Left (ErrorCall why) → why `shouldBe` "no prepared value is named three"
+        Right () → expectationFailure "a failed selection was published"
+      commit (readPublication (publication source)) `shouldReturn` (0, 1)
+      -- a selection that succeeds is installed with the next revision
+      atomically (publish source (selected "two"))
+      commit (readPublication (publication source)) `shouldReturn` (1, 2)
+
   Composition.spec
   Exits.spec
   Opacity.spec

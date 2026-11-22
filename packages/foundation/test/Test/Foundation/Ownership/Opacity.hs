@@ -75,6 +75,22 @@ spec = describe "the public boundary" $ do
         rejectedBecause outcome "GHC-83865"
         clientOutput outcome `shouldContain` "ReadOnly"
 
+  forM_ ["Publisher", "Publication"] $ \endpoint →
+    it ("rejects a client that coerces a " <> endpoint <> " of one payload to a newtype of it") $
+      withClient
+        ( client
+            ["import Data.Coerce (coerce)", "import Hetoimasia.Foundation.OwnerTx"]
+            [ "newtype Shallow = Shallow [Int]"
+            , "recast ∷ " <> endpoint <> " [Int] → " <> endpoint <> " Shallow"
+            , "recast = coerce"
+            ]
+        )
+        $ \compile → do
+          outcome ← compile Typecheck
+          -- the payload's role is nominal: no coercion lifts through it
+          rejectedBecause outcome "GHC-18872"
+          clientOutput outcome `shouldContain` "Couldn't match type ‘[Int]’ with ‘Shallow’"
+
   forM_ ["modifyCell", "stateCell", "fromIssuerSTM"] $ \helper →
     it ("rejects a client that asks the public module for " <> helper) $
       withClient (client ["import Hetoimasia.Foundation.OwnerTx (" <> helper <> ")"] ["x ∷ ()", "x = ()"]) $ \compile → do
