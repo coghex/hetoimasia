@@ -162,6 +162,7 @@ the audited suite inventory, and which optional probes are local-only.
 | `test.render-2d-oracle` | `cabal test --project-file cabal.project.cpu hetoimasia-render-2d-oracle:render-2d-oracle-tests --test-show-details=direct` | no | no | any |
 | `smoke.console` | `cabal run exe:hetoimasia -- --smoke` | no | yes | any |
 | `test.workflow` | `cabal test workflow-tests --test-show-details=direct` | no | no | any |
+| `test.owner-tx-guard` | `python3 -I tools/validation/owner_tx_guard.py check` | no | no | any |
 | `test.x11-helper` | `cabal test x11-helper-tests --test-show-details=direct` | yes | no | any |
 | `test.wayland-helper` | `cabal test wayland-helper-tests --test-show-details=direct` | yes | no | any |
 | `test.lua-hazard` | `cabal test hetoimasia-scripting-lua:lua-hazard-probes --test-show-details=direct` | yes | no | any |
@@ -994,6 +995,42 @@ Optional is a selection rule; it does not imply Python, a particular executor,
 or automatic eligibility for `$test`. See the
 [classification policy](test_classification.md) before adding a new group.
 
+### The issuer bridge's import guard
+
+`test.owner-tx-guard` runs `tools/validation/owner_tx_guard.py check` against the
+repository. Foundation's `OwnerTx` is abstract; an issuer embeds its own `STM`
+through `Hetoimasia.Foundation.OwnerTx.Issuer`, in the public sublibrary
+`hetoimasia-foundation:owner-tx-issuer` (see
+[Foundation's README](../packages/foundation/README.md#ownership-transactions)).
+Cabal cannot restrict who depends on a public sublibrary, so the guard does,
+against the exact allowlist `tools/validation/owner_tx_issuers.json`: `importers`
+lists each (component, module) that may import the bridge or its
+bridge-equivalent representation (`Hetoimasia.Foundation.OwnerTx.Representation`),
+and `dependents` each component that may depend on the sublibrary, each with
+its reason. An issuer adds its adapter modules as they land.
+
+- **Refused.** An unlisted importer, in any import form (qualified before or
+  after the name, aliased, with a list or `hiding`, `safe`, package-qualified,
+  `{-# SOURCE #-}`); an unlisted dependent; a re-export of the bridge or the
+  representation, in a listed module too: an export list naming `module` of
+  either, a bridge function (`fromIssuerSTM`, `modifyCell`, `stateCell`) or a
+  representation type's constructors, a Cabal `reexported-modules` entry and a
+  `mixins` entry; and a stale entry (a listed component that does not exist, or
+  a listed module that is not its source or imports neither module).
+- **Scope.** Every component of every package `cabal.project` and
+  `cabal.project.vulkan` list, read by the planner's Cabal reader, which counts
+  both branches of a manual flag's conditional; a component's sources are its
+  `exposed-modules`, `other-modules` and `main-is` in its source directories.
+- **Fails closed.** A manifest the reader rejects, a module without a source, a
+  source other than `.hs`, an import or module header it cannot read and an
+  unreadable allowlist are errors, never a pass.
+
+The group is mandatory and not in the floor: its inputs are every package
+description and source directory the guard reads (`owner_tx_guard.py scope`
+prints them, and a `workflow-tests` example holds the group's inputs to that
+list), so any change there selects it, and `tools/validation/` selects every
+group. Its fixtures are examples in `workflow-tests` (`tools/test/OwnerTxGuard.hs`).
+
 ### The macOS confinement probe
 
 `test.macos-confinement` runs LUA-15's local feasibility proof: a confined
@@ -1492,7 +1529,7 @@ class to every execution:
 | Job | Runner class | Groups, in order |
 | --- | --- | --- |
 | `haskell-engine` | `cpu` | `build.all`, `test.engine`, `test.foundation`, `test.runtime`, `test.glfw`, `test.scripting-lua`, `test.scripting-lua-runtime`, `test.lua-engine`, `test.vulkan`, `test.vulkan-diagnostics`, `test.math`, `test.content`, `test.asset-image`, `test.render-api`, `test.render-2d`, `test.terrain`, `test.terrain-render-2d`, `test.terrain-runtime`, `smoke.console` |
-| `haskell-workflow` | `cpu` | `test.workflow` |
+| `haskell-workflow` | `cpu` | `test.workflow`, `test.owner-tx-guard` |
 | `glfw-native` | `display` | `test.glfw-native`, `test.glfw-wayland` |
 | `vulkan` | `cpu`, `display` | `test.vulkan-headless`, `test.vulkan-native`, `test.vulkan-wayland`, `test.vulkan-lua-engine-native`, `test.vulkan-run-native` |
 
