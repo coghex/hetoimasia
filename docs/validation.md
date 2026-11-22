@@ -1002,57 +1002,45 @@ Foundation's `OwnerTx` is abstract; an issuer embeds its own `STM` through
 `Hetoimasia.Foundation.OwnerTx.Issuer`, in the public sublibrary
 `hetoimasia-foundation:owner-tx-issuer` (see
 [Foundation's README](../packages/foundation/README.md#ownership-transactions)).
-Cabal cannot restrict who depends on a public sublibrary, so the guard does. It
-takes its facts from Cabal and GHC and compares them with the exact allowlist
-`tools/validation/owner_tx_issuers.json`: `importers` lists each (component,
-module) that may import the bridge or its bridge-equivalent representation
-(`Hetoimasia.Foundation.OwnerTx.Representation`), `dependents` each component
-that may depend on the sublibrary, and `exports` the reviewed typed export
-contract of every listed importer and both defining modules. An issuer adds its
-adapter modules, its component and their contract as they land, and its
-component to the group's preparation.
+Cabal cannot restrict who depends on a public sublibrary, so the guard does,
+from Cabal's facts alone. `tools/validation/owner_tx_issuers.json` lists the
+exact components (`package:kind:name`) allowed to depend on it; an issuer adds
+its component as it lands.
 
-- **The supported subset.** Linux and Darwin on x86_64 and aarch64, under every
-  combination of manual flags. Anything outside it is refused, never skipped:
-  optional, extra, remote or globbed packages; a condition on another target,
-  on a non-manual flag or on `impl`; signatures; boot files and `{-# SOURCE #-}`
-  imports; generated modules; custom preprocessors and plugins; sources other
-  than `.hs`; and CPP beyond literal object-like definitions, version macros and
-  conditionals over the target, versions and those definitions.
-- **Cabal's facts.** The local packages of both project files and their
-  imports, each description read by Cabal's own parser with common stanzas
-  expanded; every distinct configuration of every component on every target,
-  each with its own source search order; each dependency's library read apart
-  from its version range.
-- **GHC's facts.** Every source's direct imports for each target, read by GHC's
-  preprocessing (the target's macros replace the host's) and header parser with
-  its configuration's language, extensions, CPP options and include
-  directories; and the typed interface of every checked module, typechecked
-  from its resolved source path in every combination of its configuration and
-  its local dependencies' variants: each export's kind and type, and its own
-  instances.
-- **The export rule.** Outside the bridge and the representation, an export
-  whose type contains `STM`, by GHC's identity, is refused: under constraints,
-  arrows and type arguments, through synonyms and through the fields of the
-  checked tree's own types, instantiated. `OwnerTx`, `OwnerCell`, `ReadOnly`,
-  `Publisher` and `Publication` are opaque, their type arguments walked; a type
-  family it cannot resolve fails closed. An instance on a protected type needs a
-  contract entry, and one whose method lifts `STM` is refused.
-- **Refused.** An unlisted importer; an unlisted dependent; a Cabal
-  `reexported-modules` or `mixins` entry naming the bridge; a boundary
-  constructor exported outside its module; an export or protected instance its
-  contract does not list; and a stale entry.
-- **Fails closed.** A manifest Cabal refuses, a module without a source, a
-  source GHC cannot preprocess or parse, a module it cannot typecheck, a store
-  lookup that fails (`cabal path --ignore-project --store-dir`, with Cabal's own
-  diagnostic) and an unreadable allowlist are errors, never a pass.
+- **Supported inputs.** The local packages `cabal.project` and
+  `cabal.project.vulkan` list, following literal local imports; Simple
+  manifests read by Cabal's own parser, common stanzas expanded; every
+  component kind in every configuration on Linux and Darwin, x86_64 and
+  aarch64, under both values of each manual flag.
+- **Refused.** A component whose effective `build-depends` selects the
+  sublibrary in any buildable configuration, a nondefault manual flag's
+  included, and is not listed; a listed entry that depends on it nowhere; a
+  Cabal `reexported-modules` or `mixins` entry that exposes or renames the
+  bridge or the representation (`Hetoimasia.Foundation.OwnerTx.Representation`)
+  by exact module name, in a listed component too; a protected module declared
+  outside its defining component, or in a public representation library.
+- **Unsupported, in every configuration before any branch is dropped.**
+  Optional, extra, remote or globbed package selection; a condition on another
+  target, on a non-manual flag or on `impl`; signatures; and a project or
+  manifest option that changes which packages are visible. An unbuildable
+  configuration is diagnosed for these and selects nothing.
+- **Fails closed.** A manifest Cabal refuses, a library selector that names no
+  library of a local package, and an unreadable allowlist.
+
+The guard reads no Haskell source. What a listed component's modules import,
+export and instantiate is issuer review's, as
+[Foundation's README](../packages/foundation/README.md#ownership-transactions)
+sets out: no export that converts a caller's `STM` to or from `OwnerTx`,
+directly or through a wrapper, class method or re-export; no instance on `STM`
+or the protected Foundation types.
 
 The group is mandatory and not in the floor. Its inputs are everything the guard
 reads (`owner-tx-guard scope` prints them, and a `workflow-tests` example holds
-the group's inputs to that list) and the tool itself; `tools/validation/`
-selects every group. Its preparation builds the dependencies of the tool and of
-the listed dependents; the check itself runs in seconds. Its fixtures are valid
-minimal packages in `workflow-tests` (`tools/test/OwnerTxGuard.hs`), each
+the group's inputs to that list), both project files and their shared import,
+the sources of every scanned package, and the tool itself; `tools/validation/`
+selects every group. Its preparation builds the tool's dependencies; the check
+itself runs in about a second. Its fixtures are buildable minimal packages in
+`workflow-tests` (`tools/test/OwnerTxGuard.hs`), one built with Cabal, each
 negative asserting the guard's own diagnostic.
 
 ### The macOS confinement probe
