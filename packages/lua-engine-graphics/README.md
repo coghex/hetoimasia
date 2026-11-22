@@ -28,7 +28,8 @@ of it. The package is named only by `cabal.project.vulkan`.
 | `Texture.Host` | The production `Port`, over a running `VulkanHost`. |
 | `Window.*` | The window provider. |
 | `Scene.*` | Scene publication, the hold ledger and the frame of an adopted scene; `Scene.World` (a terrain view's revision as the 2D renderer's values), `Scene.Claims` (targets' exclusive claims) and `Scene.Receipts` (draw receipts). |
-| `TerrainView.*` | Terrain views, in the public sub-library `terrain-views`, the package's only component that depends on the terrain packages. |
+| `TerrainView` | Terrain views as clients reach them, the public sub-library `terrain-views`: one module whose composition is opaque. |
+| `TerrainView.*` | Their implementation, in the **private** sub-library `terrain-views-internal`, with the graphics owner's capability records, the copy hooks and the held target: only the package's composition and its own suites reach them. The two are the package's only components that depend on the terrain packages. |
 | `Facade` | The composition of the CPU facade's graphics operations. |
 | `Input` | The Lua input adapter. |
 
@@ -521,8 +522,13 @@ acknowledgement is not, because it is cleanup.
 A terrain view publishes a borrowed terrain arena to one target as retained
 world revisions. The sub-library `terrain-views`
 (`Hetoimasia.LuaEngine.Graphics.TerrainView`) is the Haskell interface a Lua
-binding wraps; it is the package's only component that depends on the terrain
-packages, and the main library imports none of them.
+binding wraps; it and its private implementation are the package's only
+components that depend on the terrain packages, and the main library imports
+none of them. A client composes the service only through `productionPorts`
+(`TerrainViewsPorts` is opaque), makes targets only through
+`windowViewTarget` and `offscreenViewTarget`, and a style's authority only as
+an exact lease (`leaseAuthority`): nothing a client supplies runs in a
+transaction that commits an ownership fact.
 
 ```haskell
 withTerrainViews ∷ (Ord k, Show k) ⇒ TerrainViewsConfig → TerrainViewsPorts k → (TerrainViews k → IO a) → IO a
@@ -557,8 +563,11 @@ the metrics of the frame that drew it. It advances only at a window frame's
 successful presentation enqueue (the renderer notes a world frame's attachment
 and slot; the host's frame observer promotes it) or once a registered offscreen
 target's batch is complete (`drawOffscreenView`'s owner action notes the
-batch's ticket; a discarded or lost batch drew nothing; the caller's fate
-changes nothing). Adoption, recording, a refused or abandoned frame and an M1
+batch's native ticket, which the receipts read through the backend's reader; a
+discarded or lost batch drew nothing; the caller's fate changes nothing). The
+observer counts frame events and presentations (`receiptsFrames`), as the
+ledger counts adoptions and releases (`ledgerChanges`); neither runs a holder's
+code. Adoption, recording, a refused or abandoned frame and an M1
 frame leave it as it was. Only a live view incarnation's receipt moves: it is
 opened at the view's commit and forgotten at its end, with whatever of it was
 recorded or noted and not yet promoted. A caller that sets
@@ -606,7 +615,9 @@ Two threads, both started and joined inside `withTerrainViews`, own nothing:
   thread is measured per owner step and per presentation interval, for its
   planning (`servicePlanningStepMax`, `servicePlanningMax`) and for all of it
   (`serviceOwnerStepMax`, `serviceOwnerMax`);
-- the **watcher** blocks on the open views' arena mark cells (`arenaMarkSTM`),
+- the **watcher** acts on the ledger's and the receipts' counts in its own
+  transaction (a change asks for a step; a presentation ends the frame's time
+  accounting), and blocks on the open views' arena mark cells (`arenaMarkSTM`),
   the terrain service's authority epoch (`authorityEpochSTM`) and each open
   view's target usability and metrics, and kicks, so an edit, a discovery, a
   lost lease, a retired target or a first frame reaches an idle view; and on
@@ -730,7 +741,13 @@ publication`, one bounded unit a step, all for the **destination camera**:
    destruction keeps the build's cause too, so a destruction that fails is
    recorded with both. A build that raised synchronously is collected the same
    way, its cause in the refusal. Only the attempt that took the grant, still
-   current, records a refusal; the sweep never does.
+   current, records a refusal; the sweep never does. The sweep records what
+   each build left and why it took it (`serviceSwept`). At the service's end
+   the registry's teardown sweep claims every sealed receipt no view
+   collected: a pending build goes to the sweep's record, a registered chunk
+   with none is released by the owner as an orphan (one at a time, its identity
+   kept until its outcome is recorded), and every such outcome is recorded with
+   its cause (`serviceUnheld`); the drain waits until the registry holds none.
 8. **Publication**, once every chunk is ready, in the transaction that rechecks
    the claim, the target, the session, the intent, the metrics and the arena's
    content and knowledge revisions, and applies the view's runtime demand under
@@ -754,7 +771,7 @@ live (open, its target usable, its original authority held, its lease live),
 and its receipt is recorded (`readingInstalls` counts installations). A
 restore reinstalls the retained revision's demand with no new publication. The
 view's original authority (the caller's window and style leases its open
-checked) is part of every check that work is still current; its loss ends the
+checked, each exact and never live again once ended) is part of every check that work is still current; its loss ends the
 view (`EndRevoked`). A preparation runs on an Extent whose accepted revision is not of
 the current basis (intent, geometry, arena incarnation, content and knowledge
 revisions) or lists a part that failed its upload. At Zero it runs only to
@@ -835,7 +852,7 @@ keeps its slot; the others go on.
 | Lease, client or arena gone, or the original window or style authority revoked | `EndRevoked`: the claim handed back, moves settled, chunks retired. |
 | Target retired | `EndTargetGone`: the claim and demand dropped. |
 | Graphics owner ends | Admission stops; every view ends (`EndStopped`), settling its pending moves; controls answer `ControlEnded` and opens `OpenStopped`; what it can no longer dispose of ends as a failure with its cause. |
-| `withTerrainViews` ends | Every view ends (`EndStopped`); the drain waits, with the owner live, for the admitted step and every chunk's holder, and closes step admission in the transaction that finds it done; the listeners go and the reservation returns; the planner and watcher are joined first. The drain's wait stays interruptible: an interruption records what was retiring as failures with that cause and is raised after the cleanup, kept beside the body's own failure. |
+| `withTerrainViews` ends | Every view ends (`EndStopped`); the drain waits, with the owner live, for the admitted step and every chunk's holder, and closes step admission in the transaction that finds it done; the reservation returns; the planner and watcher are joined first. The drain's wait stays interruptible: an interruption records what was retiring as failures with that cause and is raised after the cleanup, kept beside the body's own failure. |
 | Failure | Private builds are discarded. A failed handback keeps its scene's chunks while the service is open; at its end, those a live target still shows go to the session's teardown, recorded as failures with that cause. |
 
 ### What is ordered

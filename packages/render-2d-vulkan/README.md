@@ -173,7 +173,10 @@ in three steps a caller can also take apart:
    (an index and a generation, so a stale reference resolves to nothing),
    private until registration, and for a positive byte length the uploads'
    queue place and aligned staging region for exactly those bytes, in the
-   decision every upload shares (`BufferUploads`). A refusal reserves nothing
+   decision every upload shares (`BufferUploads`, opaque over the native
+   uploads' access: `bufferUploadsThrough`, `bufferUploadsOf`,
+   `noBufferUploads`; room and reservation are the uploads' own decisions, so
+   nothing a holder supplies runs in this commit). A refusal reserves nothing
    and makes nothing. `BuildUploadBackpressure` is the queue or staging full
    now, and `BuildUploadsNotReady` the host's uploads awaiting its startup, so
    asking again later can succeed. `BuildReferencesExhausted` frees as chunks
@@ -184,7 +187,10 @@ in three steps a caller can also take apart:
 3. **Spend** (`spendChunkGrant`): move the grant from reserved to spending in
    one transaction, then make the device-local vertex buffer, spend the
    reserved room on the upload that fills it, and register the chunk under the
-   reserved reference. A grant belongs to the registry and the uploads that
+   reserved reference (`chunkGrantReference`). The spend is the uploads' own,
+   of this grant on this buffer and these bytes; `observingSpends` only adds an
+   action before it starts and one given its answer, and never replaces the
+   spend, the buffer or the ticket. A grant belongs to the registry and the uploads that
    issued it: another registry can neither spend nor give it back, and once it
    is spending only its spend seals it. A reserved grant is given back with
    `abandonChunkGrant`, which seals it as `BuildAbandoned`.
@@ -197,7 +203,10 @@ in three steps a caller can also take apart:
   synchronous exception or a cancellation. The buffer is recorded on the grant
   as it is made. A buffer made and not registered is released at one site, at
   most once, and any outcome of that release is kept, a cancellation
-  included. A construction that raised after making and releasing its buffer
+  included. Every answer is forced, and an exception's text rendered, where
+  the build owns it: a description that itself raises is sealed as a fixed
+  text, and a cancellation met while rendering one is raised after the seal.
+  A construction that raised after making and releasing its buffer
   names it (`releasedBufferOf`), and that release is adopted. One
   transaction, which runs no caller code, then seals the grant (registered, or
   its reference and any room still reserved given back) and writes the
@@ -206,7 +215,10 @@ in three steps a caller can also take apart:
   capacity stays occupied until the backend confirms its destruction; or a
   release that raised, a cleanup failure naming the buffer and the cause
   (`AllocationReleaseRaised`). One claimant takes the outcome
-  (`claimReceipt`), once; a receipt nobody claims stays in the registry. A
+  (`claimReceipt`), once; a receipt nobody claims stays in the registry until
+  its teardown sweep (`sweepRegistry`), which gives a still-reserved grant back
+  as `BuildAbandoned`, leaves a spending one to seal and claims every sealed
+  one (`receiptsHeld` counts those held and those it can settle now). A
   refusal is answered with it as well. A raised exit goes on with it
   attached to the exception (`buildSettlementOf`), its cause `BuildRaised`:
   the build's cancellation if it was one, otherwise a cancellation the release

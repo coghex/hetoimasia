@@ -202,6 +202,7 @@ for the module that owns and writes each piece of state.
 
 | Logical module | Source path | Cabal component | Visibility | Purpose |
 | --- | --- | --- | --- | --- |
+| `Hetoimasia.Foundation.Admission` | `src/Hetoimasia/Foundation/Admission.hs` | main library | exposed | An admission its owner opens once and closes once (`Admission`, the only capability that closes it), and the read-only `AdmissionToken` others hold: they read whether it is open and compare it by identity, a read of the owner's cell and nothing more, so a commit may verify one |
 | `Hetoimasia.Foundation.Log` | `src/Hetoimasia/Foundation/Log.hs` | main library | exposed | Public logging facade; logger construction, scoped context, flushing, emission, and call-site extraction |
 | `Hetoimasia.Foundation.Log.Base` | `src/Hetoimasia/Foundation/Log/Base.hs` | main library | hidden | Levels, source locations, and the format and variable-name options |
 | `Hetoimasia.Foundation.Log.Component` | `src/Hetoimasia/Foundation/Log/Component.hs` | main library | hidden | The validated `Component`, its constructors and operations, and shared quoting |
