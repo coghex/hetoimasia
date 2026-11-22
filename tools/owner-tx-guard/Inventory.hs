@@ -39,7 +39,10 @@ import Distribution.Fields (Field (..), FieldLine (..), Name (..), readFields)
 import Distribution.Fields.ConfVar (parseConditionConfVar)
 import Distribution.ModuleName (ModuleName)
 import Distribution.PackageDescription
+import Distribution.Compat.Newtype (unpack)
 import Distribution.PackageDescription.Parsec (parseGenericPackageDescription, runParseResult)
+import Distribution.Parsec (eitherParsec)
+import Distribution.FieldGrammar.Newtypes (List, NoCommaFSep, Token')
 import Distribution.Utils.Generic (fromUTF8BS)
 import Distribution.Parsec.Warning (PWarnType (..), PWarning (..))
 import Distribution.Pretty (prettyShow)
@@ -164,35 +167,37 @@ projectPackages root project = go [project] [] [] []
                   go (rest <> relativeImports) (file : seen) (reverse (map normalise entries) <> directories) (problems <> found)
 
 -- The @packages:@ entries, @import:@ targets and unsupported forms of a project file, read by Cabal's own field parser
--- (which lowercases field and section names): continuation lines, and every section (a @package@ stanza, a conditional and its @else@)
--- walked. A condition on anything but a supported operating system or architecture is unsupported.
+-- (which lowercases field and section names): continuation lines, and every section walked. Fields, sections and options
+-- are allow-listed: anything else is unsupported, as is a condition on anything but a supported operating system or
+-- architecture.
 projectFields ∷ FilePath → ByteString.ByteString → Either String ([String], [String], [String])
 projectFields file bytes = case readFields bytes of
   Left failure → Left (file <> ": Cabal refused it: " <> show failure)
-  Right fields → Right (walk fields)
+  Right fields → Right (walk False fields)
   where
-    walk fields =
-      let results = map one fields
+    walk inPackage fields =
+      let results = map (one inPackage) fields
        in (concatMap (\(e, _, _) → e) results, concatMap (\(_, i, _) → i) results, concatMap (\(_, _, p) → p) results)
-    one = \case
+    one inPackage = \case
       Field (Name _ name) contents →
         let key = fromUTF8BS name
-            values = words (map (\c → if c == ',' then ' ' else c) (unwords [fromUTF8BS line | FieldLine _ line ← contents]))
+            text = unwords [fromUTF8BS line | FieldLine _ line ← contents]
+            values = words (map (\c → if c == ',' then ' ' else c) text)
          in case key of
-              "packages" → (values, [], entryProblems values)
-              "import" → ([], values, importProblems values)
+              "packages" | not inPackage → (values, [], entryProblems values)
+              "import" | not inPackage → ([], values, importProblems values)
               _
-                | key `elem` ["optional-packages", "extra-packages"] → ([], [], ["unsupported: " <> key <> " in " <> file])
-                | key `elem` ["ghc-options", "ghc-prof-options", "ghc-shared-options"], refused@(_ : _) ← filter visibilityOption values →
-                    ([], [], ["unsupported: the option " <> unwords refused <> " in " <> file <> ", which changes which packages are visible"])
-                | otherwise → ([], [], [])
+                | key `elem` (if inPackage then projectPackageFields else projectFieldsAllowed) →
+                    ([], [], if key `elem` optionFields then optionProblems (file <> " (" <> key <> ")") text else [])
+                | otherwise → ([], [], ["unsupported: the project field " <> key <> " in " <> file])
       Section (Name _ name) arguments inner →
         let key = fromUTF8BS name
-            (entries, imports, problems) = walk inner
          in case key of
-              "source-repository-package" → (entries, imports, ("unsupported: source-repository-package in " <> file) : problems)
-              _ | key `elem` ["if", "elif"] → (entries, imports, conditionProblems arguments <> problems)
-              _ → (entries, imports, problems)
+              "package" | not inPackage → walk True inner
+              _
+                | key `elem` ["if", "elif"] → let (e, i, p) = walk inPackage inner in (e, i, conditionProblems arguments <> p)
+                | key == "else" → walk inPackage inner
+                | otherwise → ([], [], ["unsupported: the project section " <> key <> " in " <> file])
     conditionProblems arguments = case runParseResult (parseConditionConfVar arguments) of
       (_, Left _) → ["unsupported: a condition Cabal cannot read in " <> file]
       (_, Right condition) →
@@ -209,6 +214,19 @@ projectFields file bytes = case readFields bytes of
     remote entry = any (`isInfixOf` entry) ["://", "*", "?", "[", "{"] || any (`isSuffixOf` entry) [".tar.gz", ".cabal"]
     entryProblems entries = ["unsupported: the package entry " <> entry <> " in " <> file <> " (only literal local directories)" | entry ← entries, remote entry]
     importProblems imports = ["unsupported: the project import " <> entry <> " in " <> file <> " (only literal local files)" | entry ← imports, remote entry]
+
+-- The project fields the guard supports: package selection and imports, and settings that change no package's
+-- visibility. Inside a @package@ stanza, its flags, tests, optimisation, native search paths and allow-listed options.
+projectFieldsAllowed, projectPackageFields, optionFields ∷ [String]
+projectFieldsAllowed = ["constraints", "index-state", "jobs", "optimization", "semaphore", "active-repositories", "tests", "benchmarks"]
+projectPackageFields = ["flags", "tests", "benchmarks", "optimization", "extra-include-dirs", "extra-lib-dirs"] <> optionFields
+optionFields = ["ghc-options", "ghc-prof-options", "ghc-shared-options"]
+
+-- | Every compiler option outside the allow-list, tokenized as Cabal tokenizes @ghc-options@ (quoted tokens included).
+optionProblems ∷ String → String → [String]
+optionProblems place text = case eitherParsec text ∷ Either String (List NoCommaFSep Token' String) of
+  Left _ → ["unsupported: compiler options Cabal cannot read in " <> place]
+  Right tokens → ["unsupported: the GHC option " <> option <> " in " <> place <> ", outside the guard's supported options" | option ← unpack tokens, not (supportedOption option)]
 
 conditionVariables ∷ Condition c → [c]
 conditionVariables = \case
@@ -278,7 +296,7 @@ configurations directory cabal warnings description = do
       nub $
         concat
           [ ["unsupported: signatures " <> unwords (map prettyShow sigs) <> " in " <> place | not (null sigs)]
-              <> [why <> " in " <> place | why ← visibilityProblems info]
+              <> [why <> " in " <> place | why ← optionsProblems info]
           | (place, info, sigs) ← everyNode
           ]
     selectors =
@@ -397,34 +415,17 @@ libraryLabel = \case
   LMainLibName → ""
   LSubLibName sub → unUnqualComponentName sub
 
--- | Compiler options that change which packages are visible, which only the manifest's structured dependencies may do.
-visibilityOption ∷ String → Bool
-visibilityOption option =
-  any
-    (`isPrefixOf` option)
-    [ "-package"
-    , "-hide-package"
-    , "-hide-all-packages"
-    , "-ignore-package"
-    , "-trust"
-    , "-distrust"
-    , "-distrust-all-packages"
-    , "-fpackage-trust"
-    , "-plugin-package"
-    , "-hide-all-plugin-packages"
-    , "-clear-package-db"
-    , "-global-package-db"
-    , "-no-global-package-db"
-    , "-user-package-db"
-    , "-no-user-package-db"
-    , "-this-unit-id"
-    , "-this-package-name"
-    , "-working-dir"
-    , "-unit"
-    ]
+-- | The compiler options the guard supports: warnings, optimisation, the threaded runtime and its options, parallel
+-- compilation, linker options and turning off full laziness. Every other option, the ones that change which packages are
+-- visible among them, is unsupported.
+supportedOption ∷ String → Bool
+supportedOption option =
+  option `elem` ["-w", "-O", "-O0", "-O1", "-O2", "-threaded", "-rtsopts", "-fno-full-laziness"]
+    || any (`isPrefixOf` option) ["-W", "-with-rtsopts=", "-rtsopts=", "-optl"]
+    || (take 2 option == "-j" && all (`elem` "0123456789") (drop 2 option))
 
-visibilityProblems ∷ BuildInfo → [String]
-visibilityProblems info =
-  ["unsupported: the GHC option " <> option <> ", which changes which packages are visible" | option ← concatMap ghcOf [options info, profOptions info, sharedOptions info, staticOptions info], visibilityOption option]
+optionsProblems ∷ BuildInfo → [String]
+optionsProblems info =
+  ["unsupported: the GHC option " <> option <> ", outside the guard's supported options" | option ← concatMap ghcOf [options info, profOptions info, sharedOptions info, staticOptions info], not (supportedOption option)]
   where
     ghcOf (PerCompilerFlavor ghc _) = ghc

@@ -218,7 +218,7 @@ spec = describe "The issuer bridge's dependency guard (tools/owner-tx-guard)" $ 
         ["the listed dependent vulkanpkg:lib:vulkanpkg depends on no hetoimasia-foundation:owner-tx-issuer in any supported configuration: a stale entry"]
       refused
         (changed [("vulkanpkg/vulkanpkg.cabal", native ["        ghc-options: -package hetoimasia-foundation:owner-tx-issuer"])])
-        ["unsupported: the GHC option -package, which changes which packages are visible in vulkanpkg:lib:vulkanpkg"]
+        ["unsupported: the GHC option -package, outside the guard's supported options in vulkanpkg:lib:vulkanpkg"]
 
     it "reads a dependency inherited through nested common stanzas, and a foreign library's" $ do
       refused
@@ -312,23 +312,28 @@ spec = describe "The issuer bridge's dependency guard (tools/owner-tx-guard)" $ 
     it "refuses unsupported selection and visibility forms before dropping a branch" $ do
       refused
         (changed [("cabal.project", "packages:\n  foundation\n  consumer\noptional-packages: extra\nactive-repositories: :none\n"), ("extra/extra.cabal", unlines (cabalHeader "extra" <> ["library", "    exposed-modules: Extra", "    hs-source-dirs: src"] <> common <> ["    build-depends: base"])), ("extra/src/Extra.hs", "module Extra () where\n")])
-        ["unsupported: optional-packages in cabal.project"]
+        ["unsupported: the project field optional-packages in cabal.project"]
       refused (changed [("vulkanpkg/vulkanpkg.cabal", vulkanWith [] ["    if os(freebsd)", "        build-depends: hetoimasia-foundation:owner-tx-issuer"])]) ["unsupported: condition os(freebsd)"]
       refused (changed [("vulkanpkg/vulkanpkg.cabal", vulkanWith [] ["    if impl(ghc >= 9.14)", "        build-depends: hetoimasia-foundation:owner-tx-issuer"])]) ["unsupported: condition impl(ghc >=9.14)"]
       refused (changed [("consumer/consumer.cabal", consumerWith ["    signatures: Consumer.Signature"])]) ["unsupported: signatures Consumer.Signature in consumer:lib:consumer"]
       refused
         (changed [("consumer/consumer.cabal", consumerWith ["    if os(linux) && os(darwin)", "        signatures: Demo.Signature", "        ghc-options: -hide-all-packages"])])
-        ["unsupported: signatures Demo.Signature in consumer:lib:consumer", "unsupported: the GHC option -hide-all-packages, which changes which packages are visible in consumer:lib:consumer"]
-      refused (changed [("vulkanpkg/vulkanpkg.cabal", vulkanWith [] ["    ghc-options: -package-id hetoimasia-foundation-0.1.0.0-inplace-owner-tx-issuer"])]) ["unsupported: the GHC option -package-id, which changes which packages are visible"]
+        ["unsupported: signatures Demo.Signature in consumer:lib:consumer", "unsupported: the GHC option -hide-all-packages, outside the guard's supported options in consumer:lib:consumer"]
+      refused (changed [("vulkanpkg/vulkanpkg.cabal", vulkanWith [] ["    ghc-options: -package-id hetoimasia-foundation-0.1.0.0-inplace-owner-tx-issuer"])]) ["unsupported: the GHC option -package-id, outside the guard's supported options in vulkanpkg:lib:vulkanpkg"]
+      refused (changed [("vulkanpkg/vulkanpkg.cabal", vulkanWith [] ["    ghc-options: -Wall -fplugin=Some.Plugin"])]) ["unsupported: the GHC option -fplugin=Some.Plugin, outside the guard's supported options in vulkanpkg:lib:vulkanpkg"]
       refused
         (changed [("cabal.project", "packages:\n  foundation\n  consumer\nactive-repositories: :none\npackage consumer\n  ghc-options: -package hetoimasia-foundation:owner-tx-issuer\n")])
-        ["unsupported: the option -package in cabal.project, which changes which packages are visible"]
+        ["unsupported: the GHC option -package in cabal.project (ghc-options), outside the guard's supported options"]
 
     it "reads a project as Cabal does: an imported project's field in any case, a continued option, and its conditions" $ do
       let imported text = changed [("cabal.project", "import: extra.project\npackages:\n  foundation\n  consumer\nactive-repositories: :none\n"), ("extra.project", text)] <> extraPackage
       refused (imported "Packages: extra\n") ["extra:lib:extra (linux/x86_64) depends on hetoimasia-foundation:owner-tx-issuer and is not a listed dependent"]
-      refused (imported "packages: extra\npackage consumer\n  ghc-options: -Wall\n    -package-id hetoimasia-foundation-0.1.0.0-inplace-owner-tx-issuer\n") ["unsupported: the option -package-id in extra.project, which changes which packages are visible"]
-      refused (imported "packages: extra\nghc-options: -hide-all-packages\n") ["unsupported: the option -hide-all-packages in extra.project, which changes which packages are visible"]
+      refused
+        (imported "packages: extra\npackage consumer\n  ghc-options: -Wall\n    -package-id hetoimasia-foundation-0.1.0.0-inplace-owner-tx-issuer\n")
+        ["unsupported: the GHC option -package-id in extra.project (ghc-options), outside the guard's supported options"]
+      refused (imported "packages: extra\npackage *\n  ghc-options: \"-hide-all-packages\"\n") ["unsupported: the GHC option -hide-all-packages in extra.project (ghc-options), outside the guard's supported options"]
+      refused (imported "packages: extra\nprogram-options\n  ghc-options: -Wall\n") ["unsupported: the project section program-options in extra.project"]
+      refused (imported "packages: extra\nlibrary-vanilla: False\n") ["unsupported: the project field library-vanilla in extra.project"]
       refused (imported "packages: extra\nif os(freebsd)\n  ghc-options: -Wall\n") ["unsupported: condition os(freebsd) in extra.project"]
       refused (imported "packages: extra\nif impl(ghc >= 9.14)\n  ghc-options: -Wall\n") ["unsupported: condition impl(ghc >=9.14) in extra.project"]
 
