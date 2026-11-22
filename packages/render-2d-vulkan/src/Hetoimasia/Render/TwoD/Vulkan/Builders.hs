@@ -109,12 +109,15 @@ data Builders q inst msgr phys dev cmd = Builders
 --
 -- Room and reservation are the native uploads' own decisions over their
 -- issuer's cells ('UploadAccess'), so a registry's admission commit may take
--- one: nothing a holder supplies runs in it. Only the spend, which a build
--- runs on its own thread outside every transaction, can be observed
--- ('observingSpends').
+-- one: nothing a holder supplies runs in it. The spend is the native uploads'
+-- own too, of the grant on the buffer and bytes given; a holder may only
+-- observe around it, before it starts and once it has answered, on the
+-- build's thread and outside every transaction ('observingSpends'): it never
+-- replaces the spend, its buffer or its answer.
 data BufferUploads = BufferUploads
   { bufferAccess ∷ !UploadAccess
-  , bufferSpend ∷ UploadGrant → Buffer → ByteString → IO (Either BufferUploadRefusal UploadTicket)
+  , bufferBefore ∷ IO ()
+  , bufferAfter ∷ Either BufferUploadRefusal UploadTicket → IO ()
   }
 
 -- | Whether an upload of this many bytes would be reserved now, read-only.
@@ -134,23 +137,25 @@ reserveRoom uploads bytes = either (Left . bufferRefusal) Right <$> accessReserv
 -- nothing. An unspent reservation is given back through the uploads that
 -- issued it ('returnUploadGrant'), not through this value.
 uploadGranted ∷ BufferUploads → UploadGrant → Buffer → ByteString → IO (Either BufferUploadRefusal UploadTicket)
-uploadGranted = bufferSpend
+uploadGranted uploads grant buffer bytes = do
+  bufferBefore uploads
+  answer ← either (Left . bufferRefusal) Right <$> accessSubmitGranted (bufferAccess uploads) grant buffer bytes
+  answer <$ bufferAfter uploads answer
 
--- | These uploads with their spend observed: the observer is given the spend and runs in its place, on the build's
--- thread, outside every transaction. Room and reservation are unchanged.
-observingSpends
-  ∷ ((UploadGrant → Buffer → ByteString → IO (Either BufferUploadRefusal UploadTicket)) → UploadGrant → Buffer → ByteString → IO (Either BufferUploadRefusal UploadTicket))
-  → BufferUploads
-  → BufferUploads
-observingSpends observe uploads = uploads {bufferSpend = observe (bufferSpend uploads)}
+-- | These uploads with their spend observed: the first action runs before the native spend starts (it may wait or
+-- raise, and then nothing is spent), the second is given the spend's answer once it has one (it may raise, and the
+-- spend's outcome is already the uploads'). Both run on the build's thread, outside every transaction, after any
+-- observers already there. Room, reservation and the spend itself are unchanged.
+observingSpends ∷ IO () → (Either BufferUploadRefusal UploadTicket → IO ()) → BufferUploads → BufferUploads
+observingSpends before after uploads =
+  uploads
+    { bufferBefore = bufferBefore uploads >> before
+    , bufferAfter = \answer → bufferAfter uploads answer >> after answer
+    }
 
 -- | Uploads reached through this access: room, reservation and spend all the native uploads' own.
 bufferUploadsThrough ∷ UploadAccess → BufferUploads
-bufferUploadsThrough access =
-  BufferUploads
-    { bufferAccess = access
-    , bufferSpend = \grant buffer bytes → either (Left . bufferRefusal) Right <$> accessSubmitGranted access grant buffer bytes
-    }
+bufferUploadsThrough access = BufferUploads access (pure ()) (\_ → pure ())
 
 -- The access's answer as a chunk's build reads it: uploads configured and awaiting the device are not ready (their
 -- startup can make them); none configured, or a startup the device refused, is unavailable with its cause; every

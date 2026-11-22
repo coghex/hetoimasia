@@ -13,7 +13,7 @@
 module Test.Render.TwoD.Vulkan.Retained (spec) where
 
 import Control.Concurrent (yield)
-import Control.Monad (forM_)
+import Control.Monad (forM_, when)
 import Control.Concurrent.STM (atomically, newTVarIO, readTVar, readTVarIO, retry, writeTVar)
 import Data.Maybe (catMaybes)
 import qualified Data.Map.Strict as Map
@@ -39,7 +39,7 @@ import Hetoimasia.GPU.Vulkan.Native.Recording
   , validateStorageWindow
   )
 import Hetoimasia.GPU.Vulkan.Native.TextureTable (validateTableConfig)
-import Hetoimasia.Foundation.Admission (admissionToken, newAdmissionIO)
+import Hetoimasia.Foundation.Admission (admissionToken, closeAdmission, newAdmissionIO)
 import Hetoimasia.GPU.Vulkan.Native.Uploads (UploadRefusal (..), UploadState (..), UploadsStanding (..), UploadsView (..), ownedUploadAccess, readUploads, validateUploadConfig)
 import Hetoimasia.Math.Affine2 (fromColumns)
 import Hetoimasia.Math.Vector (V2 (..))
@@ -58,7 +58,7 @@ import Hetoimasia.Render.TwoD.Target.Backend (targetRef)
 import Hetoimasia.Render.TwoD.Validation (Location (..), Reason (..), ValidSnapshot, validLayers, validateSnapshot, validateSnapshotWith)
 import qualified Hetoimasia.Render.TwoD.Validation as Validation
 import qualified Hetoimasia.Render.TwoD.Vulkan as Render
-import Hetoimasia.Render.TwoD.Vulkan.Builders (BufferUploadRefusal (..), Builders (..), bufferUploadsThrough, observingSpends, roomFor)
+import Hetoimasia.Render.TwoD.Vulkan.Builders (BufferUploads, Builders (..), bufferUploadsThrough, observingSpends, roomFor)
 import Hetoimasia.Render.TwoD.Vulkan.Chunks
 import Hetoimasia.Render.TwoD.Vulkan.Frame
 import Hetoimasia.Render.TwoD.Vulkan.Textures (MarkPolicy (..), registeredMarks)
@@ -177,14 +177,13 @@ trackedBuilders setup =
         either (const (pure ())) (\buffer → atomicModifyIORef' (trackedMade tracked) (\held → (held <> [buffer], ()))) made
         pure made
     , bufferUploads =
-        flip observingSpends base $ \spend grant buffer bytes → do
-          failing ← readIORef (trackedFail tracked)
-          if failing
-            then writeIORef (trackedFail tracked) False >> rethrowIO (ExceptionWithContext (addExceptionAnnotation (ThrowSite "the upload's admission") emptyExceptionContext) ThreadKilled)
-            else do
-              answer ← spend grant buffer bytes
-              either (const (pure ())) (const (atomicModifyIORef' (trackedUploads tracked) (\count → (count + 1, ())))) answer
-              pure answer
+        observingSpends
+          ( readIORef (trackedFail tracked) >>= \failing →
+              when failing $
+                writeIORef (trackedFail tracked) False >> rethrowIO (ExceptionWithContext (addExceptionAnnotation (ThrowSite "the upload's admission") emptyExceptionContext) ThreadKilled)
+          )
+          (either (const (pure ())) (const (atomicModifyIORef' (trackedUploads tracked) (\count → (count + 1, ())))))
+          base
     , releaseBuffer = \buffer → do
         atomicModifyIORef' (trackedReleased tracked) (\held → (held <> [buffer], ()))
         releaseBuffer (builders (setupRig setup)) buffer
@@ -196,6 +195,15 @@ trackedBuilders setup =
 -- | Build a chunk of this kind with the art marked, answering a refusal's cause.
 buildChunkOf ∷ Setup → ChunkKind → [Instance] → IO (Either BuildRefusal ChunkRef)
 buildChunkOf setup kind instances = either (Left . buildRefusal) Right <$> buildRetainedChunk (trackedBuilders setup) (setupRetained setup) artMarks kind DeriveBounds instances
+
+-- | The rig's uploads under an admission of their own that closes as a spend begins: room is reserved as usual, and
+-- every spend is refused by the backend as closed before it binds, which leaves the reservation to its holder.
+closingUploads ∷ Setup → IO BufferUploads
+closingUploads setup = do
+  admission ← newAdmissionIO
+  owner ← newTVarIO (admissionToken admission)
+  standing ← newTVarIO (UploadsMade (rigUploads (setupRig setup)))
+  pure (observingSpends (atomically (closeAdmission admission)) (\_ → pure ()) (bufferUploadsThrough (ownedUploadAccess (rigRoots (setupRig setup)) owner standing)))
 
 -- | A grant for a chunk of this depth layer, admitted into the setup's registry and uploads.
 admittedGrant ∷ Setup → [Instance] → IO ChunkGrant
@@ -413,7 +421,8 @@ refusalSpec = describe "refusing a build" $ do
       length <$> readIORef (trackedMade (setupTracked setup)) >>= (`shouldBe` 8)
       settleUploads (setupRig setup)
       -- admitted, then its upload refused after the buffer was made: that buffer released, the grant given back
-      let refusing = (trackedBuilders setup) {bufferUploads = observingSpends (\_ _ _ _ → pure (Left (BufferUploadRefused UploadClosed))) (bufferUploads (trackedBuilders setup))}
+      closing ← closingUploads setup
+      let refusing = (trackedBuilders setup) {bufferUploads = closing}
       answer ← withRecords refusing [cutAt 0 1]
       made ← readIORef (trackedMade (setupTracked setup))
       case answer of
@@ -425,10 +434,11 @@ refusalSpec = describe "refusing a build" $ do
   it "releases a failed build's buffer at one site: a release that raises is called once and answered with the buffer and the cause, through the public build too" $
     withSetup $ \setup → do
       calls ← newIORef []
+      closing ← closingUploads setup
       let raising =
             (trackedBuilders setup)
               { releaseBuffer = \buffer → atomicModifyIORef' calls (\held → (held <> [buffer], ())) >> throwIO (ErrorCall "the release raised")
-              , bufferUploads = observingSpends (\_ _ _ _ → pure (Left (BufferUploadRefused UploadClosed))) (bufferUploads (trackedBuilders setup))
+              , bufferUploads = closing
               }
       answer ← buildRetainedChunk raising (setupRetained setup) artMarks ChunkWorldDepth DeriveBounds [cutAt 0 1]
       made ← readIORef (trackedMade (setupTracked setup))
@@ -493,9 +503,10 @@ refusalSpec = describe "refusing a build" $ do
     bounded . withSetup $ \setup → do
       -- seven uploads hold seven of the queue's eight places; the grant holds the last
       _ ← mapM (\i → built setup ChunkWorldDepth [cutAt (fromIntegral (i ∷ Int)) 1]) [1 .. 7]
+      closing ← closingUploads setup
       let refusing =
             (trackedBuilders setup)
-              { bufferUploads = observingSpends (\_ _ _ _ → pure (Left (BufferUploadRefused UploadClosed))) (bufferUploads (trackedBuilders setup))
+              { bufferUploads = closing
               , releaseBuffer = \_ → throwIO ThreadKilled
               }
       -- admitted through the uploads that refuse its upload: a grant is spent by the uploads that reserved it
@@ -544,7 +555,8 @@ refusalSpec = describe "refusing a build" $ do
     bounded . withSetup $ \setup → do
       -- seven uploads hold seven of the queue's eight places; the grant holds the last
       _ ← mapM (\i → built setup ChunkWorldDepth [cutAt (fromIntegral (i ∷ Int)) 1]) [1 .. 7]
-      let refusing = (trackedBuilders setup) {bufferUploads = observingSpends (\_ _ _ _ → pure (Left (BufferUploadRefused UploadClosed))) (bufferUploads (trackedBuilders setup))}
+      closing ← closingUploads setup
+      let refusing = (trackedBuilders setup) {bufferUploads = closing}
       prepared ← either (fail . show) pure (prepareRetainedChunk artMarks ChunkWorldDepth DeriveBounds Map.empty [cutAt 0 1])
       grant ← atomically (admitRetainedChunk (bufferUploads refusing) (setupRetained setup) prepared) >>= either (fail . show) pure
       answer ← spendChunkGrant refusing (setupRetained setup) grant
@@ -585,28 +597,12 @@ refusalSpec = describe "refusing a build" $ do
       reference ← built setup ChunkWorldDepth [cutAt 9 1]
       reference `shouldBe` chunkRefOf 7 1
 
-  it "seals a spend whose upload answer raises only when evaluated: the made buffer is released, the receipt holds the cause and the room returns" $
-    bounded . withSetup $ \setup → do
-      let lazily = (trackedBuilders setup) {bufferUploads = observingSpends (\_ _ _ _ → pure (error "the upload's answer raised")) (bufferUploads (trackedBuilders setup))}
-      prepared ← either (fail . show) pure (prepareRetainedChunk artMarks ChunkWorldDepth DeriveBounds Map.empty [cutAt 0 1])
-      grant ← atomically (admitRetainedChunk (bufferUploads lazily) (setupRetained setup) prepared) >>= either (fail . show) pure
-      tryWithContext @SomeException (spendChunkGrant lazily (setupRetained setup) grant) >>= \case
-        Left (ExceptionWithContext _ raised) → show raised `shouldSatisfy` ("the upload's answer raised" `isInfixOf`)
-        Right answer → expectationFailure ("expected the answer's exception, found " <> show answer)
-      made ← readIORef (trackedMade (setupTracked setup))
-      claimsOf grant >>= \case
-        [Left (BuildRefused (BuildRaised cause) (AllocationReleased buffer (Right ())))] → do
-          Text.unpack cause `shouldSatisfy` ("the upload's answer raised" `isInfixOf`)
-          [buffer] `shouldBe` made
-        other → expectationFailure ("expected the released buffer with the cause, found " <> show other)
-      readIORef (trackedReleased (setupTracked setup)) `shouldReturn` made
-      reservedOf setup `shouldReturn` 0
-
   it "seals a refused spend whose release answer raises only when evaluated: the receipt names the buffer and the release's cause, and reading it raises nothing" $
     bounded . withSetup $ \setup → do
+      closing ← closingUploads setup
       let lazily =
             (trackedBuilders setup)
-              { bufferUploads = observingSpends (\_ _ _ _ → pure (Left (BufferUploadRefused UploadClosed))) (bufferUploads (trackedBuilders setup))
+              { bufferUploads = closing
               , releaseBuffer = \_ → pure (Left (error "the release's answer raised"))
               }
       prepared ← either (fail . show) pure (prepareRetainedChunk artMarks ChunkWorldDepth DeriveBounds Map.empty [cutAt 0 1])
@@ -619,28 +615,9 @@ refusalSpec = describe "refusing a build" $ do
         other → expectationFailure ("expected the release's cause, found " <> show other)
       reservedOf setup `shouldReturn` 0
 
-  it "refuses a spend whose upload answers another upload's ticket without spending: the buffer is released, nothing is registered and the reservation returns" $
-    bounded . withSetup $ \setup → do
-      -- a ticket of an earlier, real upload
-      earlier ← newIORef Nothing
-      let capturing = (trackedBuilders setup) {bufferUploads = observingSpends (\spend grant buffer bytes → spend grant buffer bytes >>= \answer → answer <$ either (const (pure ())) (writeIORef earlier . Just) answer) (bufferUploads (trackedBuilders setup))}
-      _ ← buildRetainedChunk capturing (setupRetained setup) artMarks ChunkWorldDepth DeriveBounds [cutAt 0 1] >>= either (fail . show) pure
-      ticket ← readIORef earlier >>= maybe (fail "no ticket was captured") pure
-      held ← liveChunks (setupRetained setup)
-      -- the next spend answers it without spending its own reservation
-      let forging = (trackedBuilders setup) {bufferUploads = observingSpends (\_ _ _ _ → pure (Right ticket)) (bufferUploads (trackedBuilders setup))}
-      prepared ← either (fail . show) pure (prepareRetainedChunk artMarks ChunkWorldDepth DeriveBounds Map.empty [cutAt 1 1])
-      grant ← atomically (admitRetainedChunk (bufferUploads forging) (setupRetained setup) prepared) >>= either (fail . show) pure
-      reservedOf setup `shouldReturn` 1
-      spendChunkGrant forging (setupRetained setup) grant >>= \case
-        Left (BuildRefused BuildUploadUnbound (AllocationReleased _ (Right ()))) → pure ()
-        other → expectationFailure ("expected the unbound answer refused with its buffer released, found " <> show other)
-      liveChunks (setupRetained setup) `shouldReturn` held
-      reservedOf setup `shouldReturn` 0
-
   it "seals a spend that raised an exception whose description itself raises with a fixed text: claimed once, the room returns, and the original exception goes on" $
     bounded . withSetup $ \setup → do
-      let raising = (trackedBuilders setup) {bufferUploads = observingSpends (\_ _ _ _ → throwIO Indescribable) (bufferUploads (trackedBuilders setup))}
+      let raising = (trackedBuilders setup) {bufferUploads = observingSpends (throwIO Indescribable) (\_ → pure ()) (bufferUploads (trackedBuilders setup))}
       prepared ← either (fail . show) pure (prepareRetainedChunk artMarks ChunkWorldDepth DeriveBounds Map.empty [cutAt 0 1])
       grant ← atomically (admitRetainedChunk (bufferUploads raising) (setupRetained setup) prepared) >>= either (fail . show) pure
       tryWithContext @Indescribable (spendChunkGrant raising (setupRetained setup) grant) >>= \case
@@ -653,7 +630,7 @@ refusalSpec = describe "refusing a build" $ do
 
   it "seals a spend whose exception's description is cancelled: the fallback text is sealed, the buffer released and the room returned before the cancellation goes on" $
     bounded . withSetup $ \setup → do
-      let raising = (trackedBuilders setup) {bufferUploads = observingSpends (\_ _ _ _ → throwIO Unspeakable) (bufferUploads (trackedBuilders setup))}
+      let raising = (trackedBuilders setup) {bufferUploads = observingSpends (throwIO Unspeakable) (\_ → pure ()) (bufferUploads (trackedBuilders setup))}
       prepared ← either (fail . show) pure (prepareRetainedChunk artMarks ChunkWorldDepth DeriveBounds Map.empty [cutAt 0 1])
       grant ← atomically (admitRetainedChunk (bufferUploads raising) (setupRetained setup) prepared) >>= either (fail . show) pure
       tryWithContext @AsyncException (spendChunkGrant raising (setupRetained setup) grant) >>= \case
@@ -666,9 +643,10 @@ refusalSpec = describe "refusing a build" $ do
 
   it "seals a refused spend whose release raised an exception whose description is cancelled: sealed with the buffer and the fallback text, the room returned, then the cancellation goes on" $
     bounded . withSetup $ \setup → do
+      closing ← closingUploads setup
       let raising =
             (trackedBuilders setup)
-              { bufferUploads = observingSpends (\_ _ _ _ → pure (Left (BufferUploadRefused UploadClosed))) (bufferUploads (trackedBuilders setup))
+              { bufferUploads = closing
               , releaseBuffer = \_ → throwIO Unspeakable
               }
       prepared ← either (fail . show) pure (prepareRetainedChunk artMarks ChunkWorldDepth DeriveBounds Map.empty [cutAt 0 1])
@@ -1355,7 +1333,7 @@ chunkRefGenerationOf = Backend.chunkRefGeneration
 boundarySpec ∷ Spec
 boundarySpec = describe "the uploads a build reserves through" $ do
   it "accepts a client that observes a build's spend" $
-    withClient (unlines ["module Client (spends) where", "import Hetoimasia.Render.TwoD.Vulkan (noBufferUploads, observingSpends)", "spends = observingSpends id noBufferUploads"]) $ \compile → do
+    withClient (unlines ["module Client (spends) where", "import Hetoimasia.Render.TwoD.Vulkan (noBufferUploads, observingSpends)", "spends = observingSpends (pure ()) (const (pure ())) noBufferUploads"]) $ \compile → do
       outcome ← compile Typecheck
       case clientStatus outcome of
         ExitSuccess → pure ()

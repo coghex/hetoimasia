@@ -138,7 +138,7 @@ import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Word (Word32, Word64)
 import Hetoimasia.GPU.Vulkan.Native.Recording (Buffer, Refusal, releasedBufferOf)
-import Hetoimasia.GPU.Vulkan.Native.Uploads (UploadGrant, UploadPressure, UploadRefusal (..), UploadState (..), UploadTicket, grantBoundAs, readUploadTicket, returnUploadGrant)
+import Hetoimasia.GPU.Vulkan.Native.Uploads (UploadGrant, UploadPressure, UploadRefusal (..), UploadState (..), UploadTicket, readUploadTicket, returnUploadGrant)
 import Hetoimasia.Render.TwoD.Chunk
   ( BoundsRequest
   , Chunk
@@ -206,9 +206,6 @@ data BuildRefusal
     BuildGrantSpent
   | -- | The grant was given back unspent.
     BuildAbandoned
-  | -- | The upload answered a ticket that is not the binding of the grant's
-    -- reservation: the reservation is given back.
-    BuildUploadUnbound
   | -- | The host's uploads are configured and not yet made: their startup can
     -- make them, so a later build can succeed.
     BuildUploadsNotReady
@@ -540,15 +537,7 @@ spendChunkGrant builders (Retained ledger) grant = mask_ $ do
           Right buffer →
             uploadGranted uploads upload buffer bytes >>= evaluate >>= \case
               Left refusal → Left . uploadRefusal <$> settled refusal
-              -- the ticket must be this reservation's own binding: an answer that did not spend it is refused, and the
-              -- cleanup releases the buffer and the seal gives the reservation back
-              Right ticket → do
-                held ← evaluate ticket
-                bound ← atomically (grantBoundAs upload held)
-                pure $
-                  if bound
-                    then Right (Just (buffer, held))
-                    else Left BuildUploadUnbound
+              Right ticket → evaluate ticket <&> \held → Right (Just (buffer, held))
     -- the buffer, recorded in the handoff that makes it; a construction that raised naming the buffer whose release it
     -- already made has that release adopted, whatever the exception
     constructed =

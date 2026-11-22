@@ -59,7 +59,6 @@ module Hetoimasia.GPU.Vulkan.Native.Uploads
   , submitUploadGranted
   , abandonUploadGrant
   , returnUploadGrant
-  , grantBoundAs
 
     -- * Tickets
   , UploadTicket
