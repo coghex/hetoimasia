@@ -15,9 +15,10 @@ module Main (main) where
 import Control.Monad (filterM, forM_, unless)
 import Data.List (isPrefixOf, nub, sort)
 import GHC.Settings.Config (cProjectVersion)
-import Inventory (Configuration (..), Package (..), readInventory)
-import Frontend (Export (..))
-import Policy (Allowlist, check, checkedModules, readAllowlist, typedExports)
+import qualified Data.Set as Set
+import Frontend (Export (..), HeaderFacts (..), Instance (..), Interface (..), withScratch)
+import Inventory (Configuration (..), Inventory (..), Package (..), Source (..), configurationId, readInventory)
+import Policy (Allowlist, check, checkedModules, headerFacts, readAllowlist, typedInterfaces)
 import System.Directory (doesDirectoryExist, doesFileExist, findExecutable, listDirectory, makeAbsolute)
 import System.Environment (getArgs)
 import System.Exit (ExitCode (..), exitWith)
@@ -46,51 +47,51 @@ run command given = do
   root ← makeAbsolute given
   projects ← filterM (\project → doesFileExist (root </> project)) ["cabal.project", "cabal.project.vulkan"]
   unless ("cabal.project" `elem` projects) (refuse (root </> "cabal.project does not exist"))
-  inventory ← readInventory root projects
-  (files, packages) ← either refuse pure inventory
+  inventory ← readInventory root projects >>= either refuse pure
   case command of
-    "scope" → mapM_ putStrLn (scope files packages)
+    "scope" → mapM_ putStrLn (scope inventory)
     "check" → do
       allowlist ← readAllowlistAt root
       libdir ← compilerLibdir
-      databases ← storeDatabases root
-      problems ← check root libdir databases allowlist packages
+      problems ←
+        storeDatabases >>= \case
+          Left why → pure [why]
+          Right databases → withScratch $ \scratch → check root libdir scratch databases allowlist inventory
       forM_ problems (hPutStrLn stderr . ("owner_tx_guard: " <>))
       exitWith (if null problems then ExitSuccess else ExitFailure 1)
     "contract" → do
       allowlist ← readAllowlistAt root
       libdir ← compilerLibdir
-      databases ← storeDatabases root
-      forM_ (checkedModules allowlist) $ \key@(component, moduleName) → do
-        outcomes ← typedExports root libdir databases packages key
-        case outcomes of
-          [] → hPutStrLn stderr ("owner_tx_guard: " <> moduleName <> " is not a source of " <> component)
-          (_, outcome) : _ → case outcome of
-            Left why → hPutStrLn stderr ("owner_tx_guard: " <> why)
-            Right exports →
-              forM_ exports $ \export →
-                putStrLn
-                  ( "{\"component\": " <> show component <> ", \"module\": " <> show moduleName <> ", \"symbol\": " <> show (exportSymbol export)
-                      <> ", \"kind\": " <> show (exportKind export) <> ", \"type\": " <> show (exportType export) <> "}"
-                  )
+      databases ← storeDatabases >>= either refuse pure
+      withScratch $ \scratch → do
+        let packages = inventoryPackages inventory
+        cppSources ←
+          headerFacts root libdir scratch databases (concatMap packageConfigurations packages) >>= \case
+            Left why → refuse why
+            Right factsOf → pure (Set.fromList [(configurationId c, sourcePath s') | p ← packages, c ← packageConfigurations p, s' ← configSources c, Just (Right h) ← [factsOf c s'], headerUsedCpp h])
+        typed ← typedInterfaces root libdir scratch databases packages cppSources (checkedModules allowlist)
+        forM_ typed $ \((component, moduleName), outcomes) →
+          case outcomes of
+            [] → hPutStrLn stderr ("owner_tx_guard: " <> moduleName <> " is not a source of " <> component)
+            (_, Left why) : _ → hPutStrLn stderr ("owner_tx_guard: " <> why)
+            (_, Right interface) : _ → do
+              forM_ (interfaceExports interface) $ \export → entry component moduleName (exportSymbol export) (exportKind export) (exportType export)
+              forM_ [i | i ← interfaceInstances interface, instanceProtected i] $ \i → entry component moduleName (instanceClass i) "instance" (instanceHead i)
     _ → refuse ("unknown command " <> command)
+  where
+    entry component moduleName symbol kind ty =
+      putStrLn ("{\"component\": " <> show component <> ", \"module\": " <> show moduleName <> ", \"symbol\": " <> show symbol <> ", \"kind\": " <> show kind <> ", \"type\": " <> show ty <> "}")
 
-scope ∷ [FilePath] → [Package] → [String]
-scope files packages =
+scope ∷ Inventory → [String]
+scope inventory =
   sort . nub $
-    ["project " <> file | file ← files]
+    ["project " <> file | file ← inventoryFiles inventory]
       <> ["description " <> packageCabal package | package ← packages]
-      <> [ "directory " <> directory
-         | package ← packages
-         , configuration ← packageConfigurations package
-         , directory ← configSourceDirectories configuration
-         ]
-      <> [ "include " <> drop 2 flag
-         | package ← packages
-         , configuration ← packageConfigurations package
-         , flag ← configFlags configuration
-         , "-I" `isPrefixOf` flag
-         ]
+      <> ["directory " <> directory | configuration ← configurations, directory ← configSourceDirectories configuration]
+      <> ["include " <> drop 2 flag | configuration ← configurations, flag ← configFlags configuration, "-I" `isPrefixOf` flag]
+  where
+    packages = inventoryPackages inventory
+    configurations = concatMap packageConfigurations packages
 
 readAllowlistAt ∷ FilePath → IO Allowlist
 readAllowlistAt root = do
@@ -113,22 +114,27 @@ compilerLibdir = do
       unless (status == ExitSuccess) (refuse "ghc --print-libdir failed")
       pure (takeWhile (/= '\n') libdir)
 
--- The package databases of cabal's store for this compiler, where a checked module's external dependencies are.
-storeDatabases ∷ FilePath → IO [FilePath]
-storeDatabases root = do
+-- The package databases of cabal's store for this compiler, where a checked module's external dependencies are. The
+-- lookup ignores the project, so it writes nothing into the checkout; a lookup that fails is reported with Cabal's
+-- own status and diagnostic.
+storeDatabases ∷ IO (Either String [FilePath])
+storeDatabases = do
   found ← findExecutable "cabal"
   case found of
-    Nothing → pure []
+    Nothing → pure (Left "uncovered: no cabal on PATH, so the store's package databases cannot be found")
     Just cabal → do
-      (status, output, _) ← readProcessWithExitCode cabal ["path", "--store-dir", "--project-dir", root] ""
-      let store = takeWhile (/= '\n') output
-      present ← doesDirectoryExist store
-      if status /= ExitSuccess || not present
-        then pure []
-        else do
-          entries ← listDirectory store
-          let prefix = "ghc-" <> cProjectVersion <> "-"
-          filterM doesDirectoryExist [store </> entry </> "package.db" | entry ← sort entries, prefix `isPrefixOf` entry]
+      (status, output, errors) ← readProcessWithExitCode cabal ["path", "--ignore-project", "--store-dir"] ""
+      case status of
+        ExitFailure code → pure (Left ("uncovered: cabal path --ignore-project --store-dir failed (" <> show code <> "): " <> unwords (lines errors)))
+        ExitSuccess → do
+          let store = takeWhile (/= '\n') output
+          present ← doesDirectoryExist store
+          if not present
+            then pure (Left ("uncovered: the store " <> store <> " cabal named does not exist"))
+            else do
+              entries ← listDirectory store
+              let prefix = "ghc-" <> cProjectVersion <> "-"
+              Right <$> filterM doesDirectoryExist [store </> entry' </> "package.db" | entry' ← sort entries, prefix `isPrefixOf` entry']
 
 refuse ∷ String → IO a
 refuse why = hPutStrLn stderr ("owner_tx_guard: " <> why) >> exitWith (ExitFailure 2)

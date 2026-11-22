@@ -1,128 +1,170 @@
 {-# LANGUAGE LambdaCase, NoOverloadedStrings #-}
 
--- | The guard's inventory, taken from Cabal: the local packages both project files list (following their project
--- imports), each package description read by Cabal's own parser with its common stanzas expanded, and every distinct
--- effective configuration of every component (libraries, sublibraries, foreign libraries, executables, test suites,
--- benchmarks) across the manual and automatic flags it declares, the operating systems and architectures its
--- conditions name, and the pinned compiler. A configuration keeps its own source search order, so a module two branches
--- provide in different directories is resolved, and read, once per branch.
+-- | The guard's inventory, taken from Cabal, over the supported subset (the design's "Guard mechanism").
+--
+-- Projects: @cabal.project@ and @cabal.project.vulkan@, their literal local imports and their literal local package
+-- directories. Optional, extra, remote and globbed package selection is unsupported.
+--
+-- Packages: Simple manifests read by Cabal's own parser, common stanzas expanded; an unknown field or section, even in
+-- an inactive branch, is unsupported. Every condition atom of every branch is validated before either branch is
+-- simplified: an operating system or architecture outside Linux and Darwin on x86_64 and aarch64, a compiler
+-- condition, and a flag that is not a declared manual flag are unsupported. Each component (library, sublibrary,
+-- foreign library, executable, exitcode test suite and benchmark) is simplified under every supported target and every
+-- assignment of the package's manual flags; each distinct result on a target is one configuration, with its own source
+-- search order, structured dependencies, mixins and re-exports, and the frontend flags its Haskell inputs are read
+-- with. Signatures, generated modules, custom preprocessors, plugins, options that change the search path or the
+-- packages in scope, sources other than @.hs@ and boot files beside them are unsupported.
 module Inventory
-  ( Package (..)
+  ( Target (..)
+  , targets
+  , targetLabel
+  , Package (..)
   , Configuration (..)
   , Source (..)
+  , Inventory (..)
   , readInventory
   , componentId
+  , configurationId
   ) where
 
 import Control.Monad (forM)
 import qualified Data.ByteString as ByteString
 import Data.Foldable (toList)
-import Data.List (intercalate, isPrefixOf, nub)
+import Data.List (intercalate, isInfixOf, isPrefixOf, isSuffixOf, nub, sort)
 import qualified Data.Map.Strict as Map
-import Distribution.Compiler (CompilerFlavor (GHC), PerCompilerFlavor (..))
+import Distribution.Compiler (PerCompilerFlavor (..))
 import Distribution.ModuleName (ModuleName, toFilePath)
 import Distribution.PackageDescription
 import Distribution.PackageDescription.Parsec (parseGenericPackageDescription, runParseResult)
+import Distribution.Parsec.Warning (PWarnType (..), PWarning (..))
 import Distribution.Pretty (prettyShow)
 import Distribution.System (Arch (..), OS (..))
 import Distribution.Utils.Path (getSymbolicPath)
-import Distribution.Version (mkVersion, withinRange)
 import qualified Language.Haskell.Extension as Extension
 import System.Directory (doesDirectoryExist, doesFileExist, listDirectory)
 import System.FilePath (normalise, takeDirectory, takeExtension, (</>))
 
--- | One local package.
+-- | One supported target.
+data Target = Target
+  { targetOS ∷ OS
+  , targetArch ∷ Arch
+  }
+  deriving (Eq, Ord, Show)
+
+-- | Linux and Darwin, each on x86_64 and aarch64.
+targets ∷ [Target]
+targets = [Target os arch | os ← [Linux, OSX], arch ← [X86_64, AArch64]]
+
+targetLabel ∷ Target → String
+targetLabel (Target os arch) = (if os == OSX then "darwin" else prettyShow os) <> "/" <> prettyShow arch
+
+-- | One local package: its distinct configurations, and the unsupported forms of its manifest as a whole.
 data Package = Package
   { packageName ∷ String
   , packageDirectory ∷ FilePath
-    -- ^ Relative to the repository root.
   , packageCabal ∷ FilePath
   , packageConfigurations ∷ [Configuration]
+  , packageProblems ∷ [String]
   }
 
--- | One distinct effective configuration of one component.
+-- | One distinct configuration of one component on one target.
 data Configuration = Configuration
   { configPackage ∷ String
   , configKind ∷ String
     -- ^ lib, flib, exe, test or bench
   , configName ∷ String
-  , configLabel ∷ String
-    -- ^ The flag, operating-system and architecture assignments that select it.
+  , configTarget ∷ Target
+  , configFlagsLabel ∷ String
+    -- ^ The manual flag assignments that select it on its target.
   , configDirectory ∷ FilePath
   , configSourceDirectories ∷ [FilePath]
-    -- ^ In search order, relative to the repository root.
   , configSources ∷ [Source]
   , configProblems ∷ [String]
   , configDependencies ∷ [(String, [String])]
-    -- ^ Each dependency's package and the libraries it selects (@""@ the main library), whatever its version range.
   , configMixins ∷ [(String, String, String)]
-    -- ^ A mixin's package, library and rendered renaming.
   , configReexports ∷ [(String, String)]
-    -- ^ A re-exported module's original name and its new name.
   , configFlags ∷ [String]
-    -- ^ What the frontend reads the sources with: the language, extensions, CPP options and include directories.
+    -- ^ The frontend flags its Haskell inputs are read with.
+  , configPragmas ∷ [String]
+    -- ^ Its language and extensions, as LANGUAGE pragma names.
   }
 
--- | One source a configuration compiles: its module (@Main@ for an entry point) and its path from the root.
 data Source = Source
   { sourceModule ∷ String
   , sourcePath ∷ FilePath
   }
   deriving (Eq, Ord, Show)
 
+-- | What the inventory found: the files it read, the packages, and every unsupported form of the projects.
+data Inventory = Inventory
+  { inventoryFiles ∷ [FilePath]
+  , inventoryPackages ∷ [Package]
+  , inventoryProblems ∷ [String]
+  }
+
 componentId ∷ Configuration → String
 componentId configuration = configPackage configuration <> ":" <> configKind configuration <> ":" <> configName configuration
 
--- | The project files read, in order, and every local package they list.
-readInventory ∷ FilePath → [FilePath] → IO (Either String ([FilePath], [Package]))
+-- | A configuration's place, for diagnostics.
+configurationId ∷ Configuration → String
+configurationId configuration =
+  componentId configuration <> " (" <> targetLabel (configTarget configuration) <> (if null (configFlagsLabel configuration) then "" else " " <> configFlagsLabel configuration) <> ")"
+
+-- | Read both projects and every package they list. A manifest Cabal refuses is an error ('Left'); every other form
+-- outside the subset is a problem.
+readInventory ∷ FilePath → [FilePath] → IO (Either String Inventory)
 readInventory root projects = do
   listed ← mapM (projectPackages root) projects
   case sequence listed of
     Left why → pure (Left why)
     Right results → do
-      let files = nub (concatMap fst results)
-          directories = nub (concatMap snd results)
-      packages ← forM directories $ \directory → readPackage root directory
-      pure ((,) files <$> sequence packages)
+      let files = nub (concatMap (\(f, _, _) → f) results)
+          directories = nub (concatMap (\(_, d, _) → d) results)
+          problems = concatMap (\(_, _, p) → p) results
+      packages ← forM directories (readPackage root)
+      pure (Inventory files <$> sequence packages <*> pure problems)
 
--- | A project file's package directories and the files read for it (itself and its imports), following @import:@.
-projectPackages ∷ FilePath → FilePath → IO (Either String ([FilePath], [FilePath]))
-projectPackages root project = go [project] [] []
+-- A project file's files read, package directories and unsupported forms, following literal local imports.
+projectPackages ∷ FilePath → FilePath → IO (Either String ([FilePath], [FilePath], [String]))
+projectPackages root project = go [project] [] [] []
   where
-    go [] seen directories = pure (Right (reverse seen, reverse directories))
-    go (file : rest) seen directories
-      | file `elem` seen = go rest seen directories
+    go [] seen directories problems = pure (Right (reverse seen, reverse directories, problems))
+    go (file : rest) seen directories problems
+      | file `elem` seen = go rest seen directories problems
       | otherwise = do
           present ← doesFileExist (root </> file)
           if not present
             then pure (Left (file <> " does not exist"))
             else do
               text ← readFile (root </> file)
-              case projectFields text of
-                Left why → pure (Left (file <> ": " <> why))
-                Right (entries, imports) → do
-                  let relativeImports = [normalise (takeDirectory file </> imported) | imported ← imports]
-                  go (rest <> relativeImports) (file : seen) (reverse (map normalise entries) <> directories)
+              let (entries, imports, found) = projectFields file text
+                  relativeImports = [normalise (takeDirectory file </> imported) | imported ← imports]
+              go (rest <> relativeImports) (file : seen) (reverse (map normalise entries) <> directories) (problems <> found)
 
--- The @packages:@ entries and @import:@ targets of a project file. A glob or a remote package is refused.
-projectFields ∷ String → Either String ([String], [String])
-projectFields text = collect (lines text) Nothing [] []
+-- The @packages:@ entries, @import:@ targets and unsupported forms of a project file.
+projectFields ∷ FilePath → String → ([String], [String], [String])
+projectFields file text = collect (lines text) Nothing [] [] []
   where
-    collect [] _ entries imports = check (reverse entries, reverse imports)
-    collect (line : rest) collecting entries imports
-      | all (`elem` " \t") line || "--" `isPrefixOf` dropWhile (== ' ') line = collect rest collecting entries imports
-      | Just indent ← collecting, leading line > indent = collect rest collecting (reverse (words' line) <> entries) imports
-      | Just value ← field "packages" line = collect rest (Just (leading line)) (reverse (words' value) <> entries) imports
-      | Just value ← field "import" line = collect rest Nothing entries (reverse (words' value) <> imports)
-      | otherwise = collect rest Nothing entries imports
+    collect [] _ entries imports problems = (reverse entries, reverse imports, reverse problems <> entryProblems (reverse entries) <> importProblems (reverse imports))
+    collect (line : rest) collecting entries imports problems
+      | all (`elem` " \t") line || "--" `isPrefixOf` dropWhile (== ' ') line = collect rest collecting entries imports problems
+      | Just indent ← collecting, leading line > indent = collect rest collecting (reverse (words' line) <> entries) imports problems
+      | Just value ← field "packages" line = collect rest (Just (leading line)) (reverse (words' value) <> entries) imports problems
+      | Just value ← field "import" line = collect rest Nothing entries (reverse (words' value) <> imports) problems
+      | Just name ← unsupportedField line = collect rest Nothing entries imports (("unsupported: " <> name <> " in " <> file) : problems)
+      | leading line == 0 && "source-repository-package" `isPrefixOf` line = collect rest Nothing entries imports (("unsupported: source-repository-package in " <> file) : problems)
+      | otherwise = collect rest Nothing entries imports problems
     leading = length . takeWhile (== ' ')
     words' = words . map (\c → if c == ',' then ' ' else c)
     field name line = case break (== ':') (dropWhile (== ' ') line) of
       (key, ':' : value) | key == name → Just value
       _ → Nothing
-    check (entries, imports)
-      | any (any (`elem` "*?[{")) entries = Left "a glob or braced package entry is not read by the guard"
-      | otherwise = Right (entries, imports)
+    unsupportedField line = case break (== ':') (dropWhile (== ' ') line) of
+      (key, ':' : _) | key `elem` ["optional-packages", "extra-packages"] → Just key
+      _ → Nothing
+    remote entry = any (`isInfixOf` entry) ["://", "*", "?", "[", "{"] || any (`isSuffixOf` entry) [".tar.gz", ".cabal"]
+    entryProblems entries = ["unsupported: the package entry " <> entry <> " in " <> file <> " (only literal local directories)" | entry ← entries, remote entry]
+    importProblems imports = ["unsupported: the project import " <> entry <> " in " <> file <> " (only literal local files)" | entry ← imports, remote entry]
 
 readPackage ∷ FilePath → FilePath → IO (Either String Package)
 readPackage root directory = do
@@ -135,140 +177,214 @@ readPackage root directory = do
         [cabal] → do
           let path = normalise (directory </> cabal)
           bytes ← ByteString.readFile (root </> path)
-          case snd (runParseResult (parseGenericPackageDescription bytes)) of
-            Left (_, errors) → pure (Left (path <> ": Cabal refused it: " <> show (toList errors)))
-            Right description → Right <$> configurations root directory path description
+          case runParseResult (parseGenericPackageDescription bytes) of
+            (_, Left (_, errors)) → pure (Left (path <> ": Cabal refused it: " <> show (toList errors)))
+            (warnings, Right description) → Right <$> configurations root directory path warnings description
         _ → pure (Left (directory <> " holds " <> show (length cabals) <> " package descriptions, not one"))
 
--- Every distinct configuration of every component.
-configurations ∷ FilePath → FilePath → FilePath → GenericPackageDescription → IO Package
-configurations root directory cabal description = do
-  configs ← forM (groups entries) $ \(selecting, built) → do
-    let Built kind componentName info modules mains reexports = built
-        labels = intercalate "; " (map label selecting)
+-- Every distinct configuration of every component, and the package's unsupported forms.
+configurations ∷ FilePath → FilePath → FilePath → [PWarning] → GenericPackageDescription → IO Package
+configurations root directory cabal warnings description = do
+  configs ← forM (groups entries) $ \(target, flagSets, built) → do
+    let flagsLabel = intercalate " | " (nub [unwords [(if on then "+" else "-") <> unFlagName flag | (flag, on) ← flags] | flags ← flagSets])
+        info = builtInfo built
         sourceDirectories = case [normalise (directory </> getSymbolicPath d) | d ← hsSourceDirs info] of
           [] → [normalise directory]
-          declared → declared
-        autogen = map prettyShow (autogenModules info)
-        where' why = cabal <> " (" <> name <> ":" <> kind <> ":" <> componentName <> ", " <> labels <> "): " <> why
-    resolved ← forM modules $ \moduleName → resolveModule root sourceDirectories autogen moduleName
-    resolvedMains ← forM mains $ \mainIs → resolveMain root directory sourceDirectories mainIs
+          declared' → declared'
+        place = name <> ":" <> builtKind built <> ":" <> builtName built <> " (" <> targetLabel target <> (if null flagsLabel then "" else " " <> flagsLabel) <> ")"
+    resolved ← forM (builtModules built) (resolveModule root sourceDirectories)
+    resolvedMains ← forM (builtMains built) (resolveMain root directory sourceDirectories)
+    let (flags, flagProblems) = frontendFlags directory info
     pure
       Configuration
         { configPackage = name
-        , configKind = kind
-        , configName = componentName
-        , configLabel = labels
+        , configKind = builtKind built
+        , configName = builtName built
+        , configTarget = target
+        , configFlagsLabel = flagsLabel
         , configDirectory = directory
         , configSourceDirectories = sourceDirectories
         , configSources = [source | Right source ← resolved <> resolvedMains]
-        , configProblems = [where' why | Left why ← resolved <> resolvedMains]
+        , configProblems = [why <> " in " <> place | why ← [w | Left w ← resolved <> resolvedMains] <> builtProblems built <> flagProblems <> unsupportedInfo info]
         , configDependencies = [(unPackageName (depPkgName dependency), map libraryLabel (toList (depLibraries dependency))) | dependency ← targetBuildDepends info]
         , configMixins = [(unPackageName (mixinPackageName mixin), libraryLabel (mixinLibraryName mixin), prettyShow (mixinIncludeRenaming mixin)) | mixin ← mixins info]
-        , configReexports = reexports
-        , configFlags = frontendFlags directory info
+        , configReexports = builtReexports built
+        , configFlags = flags
+        , configPragmas = pragmas info
         }
-  pure (Package name directory cabal configs)
+  pure (Package name directory cabal configs problems)
   where
     name = unPackageName (pkgName (package (packageDescription description)))
-    flagNames = map flagName (genPackageFlags description)
-    assignments = mapM (\flag → [(flag, True), (flag, False)]) flagNames
-    environments = [(os, arch, flags) | os ← [Linux, OSX, Windows], arch ← [X86_64, AArch64], flags ← assignments]
-    evaluate (os, arch, flags) = \case
-      OS target → Right (target == os)
-      Arch target → Right (target == arch)
+    manual = [flagName flag | flag ← genPackageFlags description, flagManual flag]
+    assignments = mapM (\flag → [(flag, True), (flag, False)]) manual
+    environments = [(target, flags) | target ← targets, flags ← assignments]
+    evaluate (Target os arch, flags) = \case
+      OS wanted → Right (wanted == os)
+      Arch wanted → Right (wanted == arch)
       PackageFlag flag → maybe (Left (PackageFlag flag)) Right (lookup flag flags)
-      Impl GHC range → Right (mkVersion [9, 14, 1] `withinRange` range)
-      Impl _ _ → Right False
-    label (os, arch, flags) =
-      unwords (["os=" <> prettyShow os, "arch=" <> prettyShow arch] <> [(if on then "+" else "-") <> unFlagName flag | (flag, on) ← flags])
-    -- one component under every environment: what it builds there, when it is buildable there
-    component ∷ Semigroup c ⇒ String → String → CondTree ConfVar [Dependency] c → (c → BuildInfo) → (c → [ModuleName]) → (c → [FilePath]) → (c → [(String, String)]) → [((OS, Arch, [(FlagName, Bool)]), Built)]
-    component kind componentName tree info modules mains reexports =
-      [ (environment, Built kind componentName (info built) (modules built) (mains built) (reexports built))
-      | environment ← environments
-      , let (_, built) = simplifyCondTree (evaluate environment) tree
-      , buildable (info built)
+      other → Left other
+    problems =
+      [cabal <> ": unsupported: build-type " <> prettyShow (buildType (packageDescription description)) | buildType (packageDescription description) /= Simple]
+        <> [cabal <> ": unsupported: " <> show kind <> ": " <> text | PWarning kind _ text ← warnings, kind `elem` [PWTUnknownField, PWTUnknownSection, PWTInvalidSubsection, PWTExtraMainIs, PWTExtraTestModule, PWTExtraBenchmarkModule]]
+        <> [cabal <> ": unsupported: condition " <> atom | atom ← nub (concatMap conditionProblems allAtoms)]
+    conditionProblems = \case
+      OS os | os `notElem` [Linux, OSX] → ["os(" <> prettyShow os <> ")"]
+      Arch arch | arch `notElem` [X86_64, AArch64] → ["arch(" <> prettyShow arch <> ")"]
+      PackageFlag flag | flag `notElem` manual → ["flag(" <> unFlagName flag <> "), not a declared manual flag"]
+      Impl flavour range → ["impl(" <> prettyShow flavour <> " " <> prettyShow range <> ")"]
+      _ → []
+    allAtoms =
+      concat
+        [ maybe [] atomsOf (condLibrary description)
+        , concatMap (atomsOf . snd) (condSubLibraries description)
+        , concatMap (atomsOf . snd) (condForeignLibs description)
+        , concatMap (atomsOf . snd) (condExecutables description)
+        , concatMap (atomsOf . snd) (condTestSuites description)
+        , concatMap (atomsOf . snd) (condBenchmarks description)
+        ]
+    atomsOf ∷ CondTree ConfVar [Dependency] c → [ConfVar]
+    atomsOf tree = concat [variables (condBranchCondition branch) <> atomsOf (condBranchIfTrue branch) <> maybe [] atomsOf (condBranchIfFalse branch) | branch ← condTreeComponents tree]
+    variables = \case
+      Var v → [v]
+      Lit _ → []
+      CNot c → variables c
+      COr a b → variables a <> variables b
+      CAnd a b → variables a <> variables b
+    -- a component whose conditions are all supported, under every environment it is buildable in
+    component ∷ Semigroup c ⇒ CondTree ConfVar [Dependency] c → (c → Built) → [((Target, [(FlagName, Bool)]), Built)]
+    component tree build =
+      [ (environment, built)
+      | null (concatMap conditionProblems (atomsOf tree))
+      , environment ← environments
+      , let built = build (snd (simplifyCondTree (evaluate environment) tree))
+      , buildable (builtInfo built)
       ]
     library componentName tree =
-      component "lib" componentName tree libBuildInfo (\lib → exposedModules lib <> otherModules (libBuildInfo lib)) (const []) $ \lib →
-        [(prettyShow (moduleReexportOriginalName reexport), prettyShow (moduleReexportName reexport)) | reexport ← reexportedModules lib]
+      component tree $ \lib →
+        Built
+          "lib"
+          componentName
+          (libBuildInfo lib)
+          (exposedModules lib <> otherModules (libBuildInfo lib))
+          []
+          [(prettyShow (moduleReexportOriginalName reexport), prettyShow (moduleReexportName reexport)) | reexport ← reexportedModules lib]
+          ["unsupported: signatures " <> unwords (map prettyShow (signatures lib)) | not (null (signatures lib))]
     entries =
       concat
         [ maybe [] (library name) (condLibrary description)
         , concat [library (unUnqualComponentName sub) tree | (sub, tree) ← condSubLibraries description]
-        , concat [component "flib" (unUnqualComponentName sub) tree foreignLibBuildInfo (otherModules . foreignLibBuildInfo) (const []) (const []) | (sub, tree) ← condForeignLibs description]
-        , concat [component "exe" (unUnqualComponentName sub) tree buildInfo (otherModules . buildInfo) (\exe → [getSymbolicPath (modulePath exe)]) (const []) | (sub, tree) ← condExecutables description]
-        , concat [component "test" (unUnqualComponentName sub) tree testBuildInfo suiteModules testMains (const []) | (sub, tree) ← condTestSuites description]
-        , concat [component "bench" (unUnqualComponentName sub) tree benchmarkBuildInfo (otherModules . benchmarkBuildInfo) benchMains (const []) | (sub, tree) ← condBenchmarks description]
+        , concat [component tree (\flib → Built "flib" (unUnqualComponentName sub) (foreignLibBuildInfo flib) (otherModules (foreignLibBuildInfo flib)) [] [] []) | (sub, tree) ← condForeignLibs description]
+        , concat [component tree (\exe → Built "exe" (unUnqualComponentName sub) (buildInfo exe) (otherModules (buildInfo exe)) [getSymbolicPath (modulePath exe)] [] []) | (sub, tree) ← condExecutables description]
+        , concat [component tree (testBuilt (unUnqualComponentName sub)) | (sub, tree) ← condTestSuites description]
+        , concat [component tree (benchBuilt (unUnqualComponentName sub)) | (sub, tree) ← condBenchmarks description]
         ]
-    -- distinct effective configurations, in the order first met, each with every environment that selects it
-    groups found = [(map fst members, built) | members@((_, built) : _) ← Map.elems (Map.fromListWith (flip (<>)) [(builtKey built, [(environment, built)]) | (environment, built) ← found])]
-    suiteModules suite = otherModules (testBuildInfo suite) <> case testInterface suite of
-      TestSuiteLibV09 _ moduleName → [moduleName]
-      _ → []
-    testMains suite = case testInterface suite of
-      TestSuiteExeV10 _ path → [getSymbolicPath path]
-      _ → []
-    benchMains bench = case benchmarkInterface bench of
-      BenchmarkExeV10 _ path → [getSymbolicPath path]
-      _ → []
+    testBuilt sub suite = case testInterface suite of
+      TestSuiteExeV10 _ path → Built "test" sub (testBuildInfo suite) (otherModules (testBuildInfo suite)) [getSymbolicPath path] [] []
+      other → Built "test" sub (testBuildInfo suite) (otherModules (testBuildInfo suite)) [] [] ["unsupported: the test interface " <> show other]
+    benchBuilt sub bench = case benchmarkInterface bench of
+      BenchmarkExeV10 _ path → Built "bench" sub (benchmarkBuildInfo bench) (otherModules (benchmarkBuildInfo bench)) [getSymbolicPath path] [] []
+      other → Built "bench" sub (benchmarkBuildInfo bench) (otherModules (benchmarkBuildInfo bench)) [] [] ["unsupported: the benchmark interface " <> show other]
+    -- distinct configurations per target, each with every flag assignment that selects it there
+    groups found =
+      [ (target, map fst members, built)
+      | ((target, _), members@((_, built) : _)) ← Map.toList (Map.fromListWith (flip (<>)) [((target, builtKey built), [(flags, built)]) | ((target, flags), built) ← found])
+      ]
 
 -- What one component builds under one environment.
-data Built = Built String String BuildInfo [ModuleName] [FilePath] [(String, String)]
+data Built = Built
+  { builtKind ∷ String
+  , builtName ∷ String
+  , builtInfo ∷ BuildInfo
+  , builtModules ∷ [ModuleName]
+  , builtMains ∷ [FilePath]
+  , builtReexports ∷ [(String, String)]
+  , builtProblems ∷ [String]
+  }
 
-builtKey ∷ Built → (String, String, String, [String], [FilePath], [(String, String)])
-builtKey (Built kind componentName info modules mains reexports) = (kind, componentName, show info, map prettyShow modules, mains, reexports)
+builtKey ∷ Built → (String, String, String, [String], [FilePath], [(String, String)], [String])
+builtKey (Built kind name info modules mains reexports problems) = (kind, name, show info, map prettyShow modules, mains, reexports, problems)
 
 libraryLabel ∷ LibraryName → String
 libraryLabel = \case
   LMainLibName → ""
   LSubLibName sub → unUnqualComponentName sub
 
--- What GHC's frontend reads a configuration's sources with.
-frontendFlags ∷ FilePath → BuildInfo → [String]
+-- The Haskell-input options outside the subset: generated modules and custom preprocessors.
+unsupportedInfo ∷ BuildInfo → [String]
+unsupportedInfo info =
+  ["unsupported: generated modules " <> unwords (map prettyShow (autogenModules info)) | not (null (autogenModules info))]
+    <> ["unsupported: the custom preprocessor " <> prettyShow tool | ExeDependency _ tool _ ← buildToolDepends info, prettyShow tool `elem` preprocessors]
+    <> ["unsupported: the custom preprocessor " <> tool | LegacyExeDependency tool _ ← buildTools info, tool `elem` preprocessors]
+  where
+    preprocessors = ["alex", "happy", "hsc2hs", "c2hs", "cpphs", "greencard", "markdown-unlit"]
+
+-- The frontend flags a configuration's Haskell inputs are read with, and the options it cannot apply. Every option
+-- that affects Haskell inputs is applied (language, extensions, CPP definitions, include directories) or refused.
+frontendFlags ∷ FilePath → BuildInfo → ([String], [String])
 frontendFlags directory info =
-  maybe [] (\language → ["-X" <> prettyShow language]) (defaultLanguage info)
-    <> ["-X" <> extensionFlag extension | extension ← defaultExtensions info <> otherExtensions info]
-    <> ["-optP" <> option | option ← cppOptions info]
-    <> ["-I" <> normalise (directory </> getSymbolicPath include) | include ← includeDirs info]
-    <> [option | option ← ghcOptions, any (`isPrefixOf` option) ["-X", "-D", "-U", "-I", "-optP", "-cpp"]]
+  ( maybe [] (\language → ["-X" <> prettyShow language]) (defaultLanguage info)
+      <> ["-X" <> extensionName extension | extension ← defaultExtensions info]
+      <> ["-optP" <> option | option ← cppOptions info, cppOption option]
+      <> ["-I" <> normalise (directory </> getSymbolicPath include) | include ← includeDirs info]
+      <> [option | option ← ghcOptions, any (`isPrefixOf` option) ["-X", "-D", "-U", "-cpp"]]
+      <> ["-optP" <> drop 5 option | option ← ghcOptions, "-optP" `isPrefixOf` option, cppOption (drop 5 option)]
+  , ["unsupported: the CPP option " <> option | option ← cppOptions info, not (cppOption option)]
+      <> ["unsupported: the GHC option " <> option | option ← ghcOptions, refused option]
+  )
   where
     PerCompilerFlavor ghcOptions _ = options info
-    extensionFlag = \case
-      Extension.EnableExtension known → show known
-      Extension.DisableExtension known → "No" <> show known
-      Extension.UnknownExtension unknown → unknown
+    -- an object-like literal definition, an undefinition or an include directory
+    cppOption option = case option of
+      '-' : 'D' : definition → objectLike definition
+      '-' : 'U' : name' → not (null name') && all identifierCharacter name'
+      '-' : 'I' : _ → True
+      _ → False
+    objectLike definition =
+      let (name', value) = break (== '=') definition
+       in not (null name') && all identifierCharacter name' && '(' `notElem` value
+    identifierCharacter c = c == '_' || c `elem` ['a' .. 'z'] || c `elem` ['A' .. 'Z'] || c `elem` ['0' .. '9']
+    refused option =
+      any (`isPrefixOf` option) ["-F", "-pgmF", "-optF", "-fplugin", "-i", "-package", "-hide-package", "-trust", "-pgmP", "-pgmL", "-optL", "-x"]
+        || ("-optP" `isPrefixOf` option && not (cppOption (drop 5 option)))
 
--- Resolve a module in a configuration's search order, as Cabal does: the first directory that holds a source of any
--- kind for it. Only a Haskell source is read; anything else, and a generated module, fails closed.
-resolveModule ∷ FilePath → [FilePath] → [String] → ModuleName → IO (Either String Source)
-resolveModule root directories autogen moduleName = go directories
+pragmas ∷ BuildInfo → [String]
+pragmas info =
+  sort . nub $
+    maybe [] (\language → [prettyShow language]) (defaultLanguage info)
+      <> [extensionName extension | extension ← defaultExtensions info]
+
+extensionName ∷ Extension.Extension → String
+extensionName = \case
+  Extension.EnableExtension known → show known
+  Extension.DisableExtension known → "No" <> show known
+  Extension.UnknownExtension unknown → unknown
+
+-- Resolve a module in a configuration's search order, as Cabal does: the first directory holding a source of any kind
+-- for it. Only a Haskell source without a boot file beside it is supported.
+resolveModule ∷ FilePath → [FilePath] → ModuleName → IO (Either String Source)
+resolveModule root directories moduleName = go directories
   where
     stem = toFilePath moduleName
     name = prettyShow moduleName
     kinds = [".hs", ".lhs", ".hsig", ".lhsig", ".hsc", ".x", ".y", ".ly", ".chs", ".gc"]
-    go [] =
-      pure . Left $
-        if name `elem` autogen
-          then "the generated module " <> name <> " has no source the guard can read"
-          else "the module " <> name <> " has no source in its source directories " <> show directories
+    go [] = pure (Left ("uncovered: the module " <> name <> " has no source in its source directories " <> show directories))
     go (directory : rest) = do
-      found ← filterM' (\kind → doesFileExist (root </> directory </> stem <> kind)) kinds
+      found ← fmap (map fst . filter snd) . forM kinds $ \kind → (,) kind <$> doesFileExist (root </> directory </> stem <> kind)
+      boot ← (||) <$> doesFileExist (root </> directory </> stem <> ".hs-boot") <*> doesFileExist (root </> directory </> stem <> ".lhs-boot")
       case found of
+        [] | boot → pure (Left ("unsupported: the boot file " <> normalise (directory </> stem <> ".hs-boot") <> " of " <> name))
         [] → go rest
-        ".hs" : _ → pure (Right (Source name (normalise (directory </> stem <> ".hs"))))
-        kind : _ → pure (Left ("the module " <> name <> " is a " <> kind <> " source, a kind the guard does not read"))
+        ".hs" : _
+          | boot → pure (Left ("unsupported: the boot file " <> normalise (directory </> stem <> ".hs-boot") <> " beside " <> name))
+          | otherwise → pure (Right (Source name (normalise (directory </> stem <> ".hs"))))
+        kind : _ → pure (Left ("unsupported: the module " <> name <> " is a " <> kind <> " source"))
 
 resolveMain ∷ FilePath → FilePath → [FilePath] → FilePath → IO (Either String Source)
 resolveMain root directory directories mainIs
-  | takeExtension mainIs /= ".hs" = pure (Left ("main-is " <> mainIs <> " is of a kind the guard does not read"))
+  | takeExtension mainIs /= ".hs" = pure (Left ("unsupported: main-is " <> mainIs <> " is not a Haskell source"))
   | otherwise = go (directories <> [directory])
   where
-    go [] = pure (Left ("main-is " <> mainIs <> " has no source in its source directories"))
+    go [] = pure (Left ("uncovered: main-is " <> mainIs <> " has no source in its source directories"))
     go (candidate : rest) = do
       present ← doesFileExist (root </> candidate </> mainIs)
       if present then pure (Right (Source "Main" (normalise (candidate </> mainIs)))) else go rest
-
-filterM' ∷ (a → IO Bool) → [a] → IO [a]
-filterM' predicate = fmap (map fst . filter snd) . mapM (\item → (,) item <$> predicate item)
