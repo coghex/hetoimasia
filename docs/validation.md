@@ -1012,27 +1012,40 @@ contract of every listed importer and both defining modules. An issuer adds its
 adapter modules, its component and their contract as they land, and its
 component to the group's preparation.
 
+- **The supported subset.** Linux and Darwin on x86_64 and aarch64, under every
+  combination of manual flags. Anything outside it is refused, never skipped:
+  optional, extra, remote or globbed packages; a condition on another target,
+  on a non-manual flag or on `impl`; signatures; boot files and `{-# SOURCE #-}`
+  imports; generated modules; custom preprocessors and plugins; sources other
+  than `.hs`; and CPP beyond literal object-like definitions, version macros and
+  conditionals over the target, versions and those definitions.
 - **Cabal's facts.** The local packages of both project files and their
   imports, each description read by Cabal's own parser with common stanzas
-  expanded; every distinct configuration of every component (libraries,
-  sublibraries, foreign libraries, executables, tests, benchmarks) across its
-  flags, operating systems and architectures, each with its own source search
-  order; each dependency's library read apart from its version range.
-- **GHC's facts.** Every source's direct imports, read by GHC's preprocessing
-  and header parser with its configuration's language, extensions, CPP options
-  and include directories, so explicit braces, CPP-made names,
-  package-qualified and `{-# SOURCE #-}` imports count; and the typechecked
-  exports of every checked module: the defining module, the kind and the type
-  with synonyms expanded of each.
+  expanded; every distinct configuration of every component on every target,
+  each with its own source search order; each dependency's library read apart
+  from its version range.
+- **GHC's facts.** Every source's direct imports for each target, read by GHC's
+  preprocessing (the target's macros replace the host's) and header parser with
+  its configuration's language, extensions, CPP options and include
+  directories; and the typed interface of every checked module, typechecked
+  from its resolved source path in every combination of its configuration and
+  its local dependencies' variants: each export's kind and type, and its own
+  instances.
+- **The export rule.** Outside the bridge and the representation, an export
+  whose type contains `STM`, by GHC's identity, is refused: under constraints,
+  arrows and type arguments, through synonyms and through the fields of the
+  checked tree's own types, instantiated. `OwnerTx`, `OwnerCell`, `ReadOnly`,
+  `Publisher` and `Publication` are opaque, their type arguments walked; a type
+  family it cannot resolve fails closed. An instance on a protected type needs a
+  contract entry, and one whose method lifts `STM` is refused.
 - **Refused.** An unlisted importer; an unlisted dependent; a Cabal
-  `reexported-modules` entry or `mixins` entry naming the bridge; an export, in
-  any checked module but the bridge's own, of a bridge function or of any value
-  that converts between `STM` and the transaction in either direction,
-  whatever it is called; a representation constructor exported outside the
-  representation; an export its contract does not list; and a stale entry.
-- **Fails closed.** A manifest Cabal refuses, a module without a source, a source
-  other than `.hs`, a source GHC cannot preprocess or parse, a module it cannot
-  typecheck and an unreadable allowlist are errors, never a pass.
+  `reexported-modules` or `mixins` entry naming the bridge; a boundary
+  constructor exported outside its module; an export or protected instance its
+  contract does not list; and a stale entry.
+- **Fails closed.** A manifest Cabal refuses, a module without a source, a
+  source GHC cannot preprocess or parse, a module it cannot typecheck, a store
+  lookup that fails (`cabal path --ignore-project --store-dir`, with Cabal's own
+  diagnostic) and an unreadable allowlist are errors, never a pass.
 
 The group is mandatory and not in the floor. Its inputs are everything the guard
 reads (`owner-tx-guard scope` prints them, and a `workflow-tests` example holds
