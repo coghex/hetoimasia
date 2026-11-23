@@ -354,13 +354,13 @@ spec = describe "The issuer bridge's textual guard (tools/owner-tx-guard)" $ do
         forM_ [file | file ← files, not ("docs/" `isPrefixOf` file)] $ \file → do
           createDirectoryIfMissing True (directory </> takeDirectory file)
           copyFile (checkout </> file) (directory </> file)
-        writeFixtureFile directory "packages/foundation/NOTES.md" "notes\n"
+        writeFixtureFile directory "docs/unconsumed/NOTES.md" "notes\n"
         void $ git settings directory ["init", "-q", "-b", "master"]
         void $ git settings directory ["add", "-A", "."]
         void $ git settings directory ["commit", "-q", "-m", "base"]
         base ← takeWhile (/= '\n') <$> git settings directory ["rev-parse", "HEAD"]
-        removeFile (directory </> "packages/foundation/NOTES.md")
-        createFileLink "hetoimasia-foundation.cabal" (directory </> "packages/foundation/NOTES.md")
+        removeFile (directory </> "docs/unconsumed/NOTES.md")
+        createFileLink "elsewhere.md" (directory </> "docs/unconsumed/NOTES.md")
         void $ git settings directory ["add", "-A", "."]
         void $ git settings directory ["commit", "-q", "-m", "head"]
         let plan revision = run settings checkout "python3" [checkout </> "tools/validation/plan.py", "--repo-root", directory, "--base", base, "--head", revision, "--json"]
