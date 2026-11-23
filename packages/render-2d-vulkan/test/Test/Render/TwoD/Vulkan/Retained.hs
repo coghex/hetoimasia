@@ -58,7 +58,7 @@ import Hetoimasia.Render.TwoD.Target.Backend (targetRef)
 import Hetoimasia.Render.TwoD.Validation (Location (..), Reason (..), ValidSnapshot, validLayers, validateSnapshot, validateSnapshotWith)
 import qualified Hetoimasia.Render.TwoD.Validation as Validation
 import qualified Hetoimasia.Render.TwoD.Vulkan as Render
-import Hetoimasia.Render.TwoD.Vulkan.Builders (BufferUploads, Builders (..), bufferUploadsThrough, observingSpends, roomFor)
+import Hetoimasia.Render.TwoD.Vulkan.Builders (BufferUploads, Builders (..), bufferUploadsThrough, observingSpends)
 import Hetoimasia.Render.TwoD.Vulkan.Chunks
 import Hetoimasia.Render.TwoD.Vulkan.Frame
 import Hetoimasia.Render.TwoD.Vulkan.Textures (MarkPolicy (..), registeredMarks)
