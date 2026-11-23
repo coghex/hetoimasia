@@ -41,8 +41,10 @@ import Hetoimasia.GPU.Model
   , SessionState (..)
   , TargetPhase (..)
   , TargetView (..)
+  , Outcome (Admitted)
   , deviceLossObserved
   , escalations
+  , noteDeviceLoss
   , sessionState
   )
 import Hetoimasia.GPU.Model.Budget (defaultBudgetRequest)
@@ -59,8 +61,10 @@ import Hetoimasia.GPU.Vulkan.Native.Generations
   )
 import Hetoimasia.GPU.Vulkan.Native.Presentation (SurfaceExtent (..))
 import Hetoimasia.GPU.Vulkan.Native.Recording (Refusal (..), recordFrame, retireRecording)
+import Hetoimasia.Foundation.OwnerTx (watchPublication)
 import Hetoimasia.GPU.Vulkan.Native.Roots
   ( Checkpoint (..)
+  , rootsFailure
   , DiagnosticAlarm (..)
   , GraphicsDeviceLost (..)
   , RootsRetained (..)
@@ -166,6 +170,23 @@ spec = describe "Terminal failure" $ do
       tornDownUnderLoss rig
 
   describe "the primary failure" $ do
+    it "publishes whether the session has failed with the write of either cell that changes it, in that write's transaction: a cause latched, or a model transition that fails the session; a later failure publishes nothing" $ do
+      rig ← newRig
+      let failure = atomically (watchPublication (rootsFailure (rigRoots rig)))
+      (revision, failed) ← failure
+      failed `shouldBe` False
+      atomically (failRootsSessionBecause (rigRoots rig) CleanupFailed "a cleanup failed")
+      failure `shouldReturn` (revision + 1, True)
+      atomically (failRootsSessionBecause (rigRoots rig) CleanupFailed "a later cleanup failed")
+      failure `shouldReturn` (revision + 1, True)
+      clean rig
+      -- the model's own: a transition that loses the device fails the session, and the roots publish it with the transition
+      rig' ← newRig
+      (revision', _) ← atomically (watchPublication (rootsFailure (rigRoots rig')))
+      inModel rig' (Admitted . noteDeviceLoss)
+      atomically (watchPublication (rootsFailure (rigRoots rig'))) `shouldReturn` (revision' + 1, True)
+      primaryIs rig' (\case TerminalDeviceLost _ → True; _ → False)
+
     it "stays pending while a failure of the owner's own holds first place in a transaction still running, then keeps it as the primary ahead of a later validation error" $ do
       rig ← newRig
       _ ← pendingPresentation rig
