@@ -176,3 +176,17 @@ delivered except R2D-13, sampling an offscreen pass's target in later passes,
 which is the deferred #446 (its read-eligibility question is Q-10 there). The
 contracts are the `render-2d`, `render-2d-vulkan` and `render-2d-oracle`
 READMEs.
+
+## Game-side designs — removed 2026-11-23
+
+Owner decision 2026-11-23: the engine is a generic library and games are
+separate projects, so the designs of game-side work leave the engine's tree.
+The terrain work they planned continues in the consumer project, Widdershins;
+the hand-off is recorded on epic #636, and the engine keeps the merged terrain
+packages, whose READMEs are the contracts.
+
+| Path under `docs/designs/` | Conclusion | Last present at |
+| --- | --- | --- |
+| `terrain_arena_design.md` | Epic #636: flat terrain with on-demand chunk loading for a procedural arena, decisions D-1 to D-61 and slices TRA-1 to TRA-23. Delivered in the engine: TRA-1 to TRA-8 and TRA-13 to TRA-23 (geometry, storage, residency, the runtime service, the 2D terrain renderer, the Lua terrain calls). Moved to the consumer unbuilt: TRA-9 to TRA-12 (retained views #645, view and camera controls in Lua #646, the authored arena #647, its qualification #648) | `cef6921d` |
+| `terrain_view_service_design.md` | Terrain views v2, approved 2026-11-20: a session-owned view of retained chunks with six ordering guarantees, in two slices (#714 publish retained terrain in the graphics session; #715 pick the drawn frame and reject stale edits). #714 reached seventeen review rounds unmerged; its branch `issue-714-terrain-views-v2` and the v1 branch `issue-645-terrain-views` stay on GitHub as reference. Its ownership-transaction amendment was delivered in the foundation by #721 | `cef6921d` |
+| `gameplay_state_design.md` | One small visible example of Lua-defined state over an engine-held store. Superseded by the owner on 2026-11-06 before any slice was drafted; its questions Q-3 to Q-9 (which state facilities ship, initial publication, what completes a tick, snapshots, ownership through reset, determinism, persistence) were never settled | `cef6921d` |

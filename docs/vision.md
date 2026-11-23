@@ -6,54 +6,54 @@ development sessions, not a claim that every feature is implemented. Detailed
 contracts remain in their owning documents; current work and coverage belong
 in the tracker and [guide reports](guide/).
 
+Revised 2026-11-23: the owner decided that Hetoimasia is a generic engine
+library with games outside it, and approved this text of V-1 and the reworded
+passages of V-5 and V-9 on the same day.
+
 New explicit owner decisions can revise this guide. Record the decision and
 reconcile affected contracts; do not silently change intent to fit new code
 or an agent recommendation. Preserve these principle IDs.
 
 ## Product and boundaries
 
-### V-1. A reusable engine, with the game outside it
+### V-1. A reusable engine library, with applications outside it
 
-Build a modular Haskell engine using Lua for game authoring and Vulkan for
-the first graphics backend, with independent 2D and 3D renderers. The generic
-executable assembles services and starts a game's Lua content without
-game-specific Haskell. The Lua game is the application: it defines game
-rules, authored data, assets and orchestration through narrow engine services.
-Engine packages never import concrete games. Use narrow services and opaque
-handles, not a universal EngineEnv, service locator or mutable global
+Hetoimasia is a generic engine library: modular Haskell packages, Lua for
+application authoring and Vulkan for the first graphics backend, with
+independent 2D and 3D renderers. An application assembles the services it
+needs. The repository's own generic executable assembles them and starts an
+application's Lua content without application-specific Haskell. Engine
+packages never import a concrete application or game. Use narrow services and
+opaque handles, not a universal EngineEnv, service locator or mutable global
 registry. An application-wide monad must not conceal dependency ownership.
 
-Owner direction of 2026-10-21: the later gameplay-state arc is engine-held
-and Lua-defined. The Lua-first textured-quad milestone deliberately has no
-gameplay state store; state-service calls report unavailability and stop
-the session. This deferral does not assign an authoritative world to Lua
-tables or promise rollback of Lua mutations. The milestone's scope and
-service contracts are in the Lua-first engine design, D-41–D-43.
+Owner decision 2026-11-23: games are separate projects that consume the
+engine's packages. The first consumer is Widdershins, which owns its game's
+renderer, world and content. The engine holds no game-specific rule, content
+or design direction, and a consumer's need reaches it as an ordinary engine
+change through the engine's own process. This supersedes the decision of
+2026-11-09 that made the engine the place where one game was rebuilt.
 
-Owner decision 2026-11-09: Hetoimasia is the engine on which Ecce Homo is
-being rebuilt, piece by piece. Synarchy is the reference: its code and behavior
-are evidence of what each system should do, not a compatibility contract and
-not a source to copy wholesale. Source compatibility, save compatibility and a
-migration date remain uncommitted. The reasons for the rebuild are a full
-lighting system that Synarchy's renderer cannot support, and uniform sprite
-assets regenerated from 3D models with `~/work/moskophoros`. This does not
-change the boundary above: engine packages never contain or import Ecce Homo.
-The current piece is the [terrain arena](designs/terrain_arena_design.md).
+Owner decision 2026-11-09: "Haskell mechanisms, Lua rules" is the general
+pattern for every system. The engine supplies reusable Haskell mechanisms
+through narrow services; the application defines its rules, recipes and
+authored choices, in Lua or in its own code, and drives those services. A
+system's design departs from this division only by an explicit owner decision
+recorded in that design.
 
-Owner decision 2026-11-09: "Haskell mechanisms, Lua rules", the division the
-terrain arena settled in its
-[D-17](designs/terrain_arena_design.md#d-17-haskell-mechanisms-lua-arena-rules),
-is the general pattern for every system, not a terrain-only choice. The engine
-supplies reusable Haskell mechanisms through narrow services; Lua defines the
-game's rules, recipes and authored choices and drives those services. Engine
-libraries hold no Ecce Homo-specific rule or content. A system's design departs
-from this division only by an explicit owner decision recorded in that design.
+The engine provides no application state store. In the Lua-first
+textured-quad milestone (owner direction of 2026-10-21) state-service calls
+report unavailability and stop the session; no authoritative world is assigned
+to Lua tables, and no rollback of Lua mutations is promised. An engine-held
+store is not a current goal: adding one needs a new owner decision. The
+milestone's scope and service contracts are in the Lua-first engine design,
+D-41–D-43.
 
-Preserve Synarchy's useful reasoning about GLFW, logging, monotonic time,
-shaders and rendering deliberately. Reuse is selective; its coupled environment
-and game managers are not the new architecture. Each rebuilt system should make
-recreating the game's behavior practical without promising source compatibility.
-See [foundation direction](engine_foundation_design.md) and [AGENTS](../AGENTS.md).
+Synarchy, the owner's earlier project, remains a source of reasoning about
+GLFW, logging, monotonic time, shaders and rendering. Reuse is selective and
+deliberate; its coupled environment and game managers are not this
+architecture. See [foundation direction](engine_foundation_design.md) and
+[AGENTS](../AGENTS.md).
 
 Owner decision 2026-09-26: use flexible subsystem-local `Base`/`Types`
 conventions, allowing dedicated type modules and explicit low-level local
@@ -141,7 +141,7 @@ deferred. This does not promise window-command progress during a Cocoa modal
 loop, or qualify rendering progress without the retained VK-16 native evidence.
 See [Vulkan decisions D-29–D-33](removed_records.md) and LIFE D-6.
 
-Lua-first M1 introduces a logical Lua tick driver, not a gameplay-state
+Lua-first M1 introduces a logical Lua tick driver, not a state
 simulation/commit service. UI publishes copied latest scenes independently
 of logical completion. Service workers, results and retirement bookkeeping
 have explicit finite ownership and admission budgets.
@@ -198,8 +198,8 @@ Compositor loss cannot manufacture GPU completion.
 ### V-9. Responsive trusted Lua domains with filtered services
 
 Own independent logical and UI/presentation execution domains with bounded
-scheduling and communication. Owner direction of 2026-10-21 treats game and
-mod Lua alike as trusted, in-process code. Both use the same filtered
+scheduling and communication. Owner direction of 2026-10-21 treats an
+application's Lua and its mods' Lua alike as trusted, in-process code. Both use the same filtered
 standard-library policy and engine-provided content services. Scripts receive
 no ambient OS, filesystem, network, process-launching or native-loader API.
 The Lua-first design specifies the removed functions, content-root access
@@ -211,8 +211,8 @@ distinct VMs and module environments are not hard execution or memory limits.
 Direct bindings cannot synchronously enter another VM owner. Dependencies
 remain held until actual completion; cancellation is not proof of retirement.
 
-Confined processes are no longer a requirement for trusted game/mod delivery
-or completion of the delivered trusted Lua arc. LUA-9–LUA-13, LUA-16 and
+Confined processes are no longer a requirement for trusted application or mod
+delivery, or for completion of the delivered trusted Lua arc. LUA-9–LUA-13, LUA-16 and
 LUA-17 are deferred outside the active roadmap by the revised trust decision.
 LUA-14/LUA-15 remain delivered feasibility investigations with inconclusive
 verdicts, not qualified containment. If hostile-code support is requested
@@ -222,7 +222,7 @@ unconfined fallback for content admitted as untrusted.
 
 An ordinary logical-role failure stops that role while a healthy UI can
 report it until exit. In M1 the UI receives lifecycle/failure status, not
-a world snapshot: there is no engine-held gameplay state to freeze or roll
+a world snapshot: there is no engine-held application state to freeze or roll
 back. UI-role failure, engine/provider/cleanup failure, or a call to the
 unavailable state service ends the session. The Lua-first startup gate and
 one-role rules define the cases where no healthy UI can continue. Callback
@@ -230,12 +230,12 @@ threads remain runtime machinery, not cancellation endpoints.
 
 Owner decision 2026-10-17 ([Lua D-23](removed_records.md)):
 deterministic authoritative simulation is a design requirement. The initial
-qualification target is identical gameplay results for identical initial state,
-content, seed, tick-assigned inputs and scheduling configuration on the same
-build and supported platform. Gameplay runs on logical ticks with explicit
-durations, stable input/effect ordering and owned seeded random streams. Real
-execution delays may slow completion but must not skip required gameplay work
-or change its time increments. UI/presentation keep independent elapsed/frame
+qualification target is identical simulation results for identical initial
+state, content, seed, tick-assigned inputs and scheduling configuration on the
+same build and supported platform. The logical domain runs on ticks with
+explicit durations, stable input/effect ordering and owned seeded random
+streams. Real execution delays may slow completion but must not skip required
+logical work or change its time increments. UI/presentation keep independent elapsed/frame
 timing and randomness. Applications own simulation and commit policy; engine
 contracts must support this requirement. Cross-platform/version identity and
 network lockstep are separate future qualifications, not current guarantees.
@@ -246,8 +246,7 @@ without skipping ticks or stretching dt. The logical VM runs ordinary Lua
 hooks and module/data loads with Lua-local state, while the UI has its own
 elapsed clock. M1 has no state store, committed-world/digest/replay API,
 engine RNG or seeded-stream guarantee; math.random and math.randomseed are
-removed in both roles. It claims no whole-session or cross-run gameplay
-determinism. The existing lua-domains sample retains its own D-23/D-48
+removed in both roles. It claims no whole-session or cross-run determinism. The existing lua-domains sample retains its own D-23/D-48
 qualification, including the limit on late independent failures. Its state
 transactions, replay and seeded streams are not M1 services.
 
@@ -257,8 +256,8 @@ exist or making shutdown succeed to avoid leaks. Lua-exposed acquisitions have
 protected engine-owned scope/lease records; failed initialization, lost handles
 and throwing or absent shutdown cannot bypass cleanup. Shared resources release
 only the instance's interest, and provider/GPU dependencies remain until safe
-retirement. This is automatic ownership, not rollback of committed game effects
-or forced interruption of non-yielding trusted Lua.
+retirement. This is automatic ownership, not rollback of committed application
+effects or forced interruption of non-yielding trusted Lua.
 
 ### V-10. Strong evidence with selective cost
 
