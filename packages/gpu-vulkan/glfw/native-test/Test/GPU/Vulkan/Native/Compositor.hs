@@ -35,15 +35,19 @@ import System.FilePath ((</>))
 import System.IO (IOMode (WriteMode), hClose, withFile)
 import System.Posix.Process (getProcessID)
 import System.Posix.Temp (mkdtemp)
-import System.Process (CreateProcess (env), ProcessHandle, getProcessExitCode, proc, terminateProcess)
+import System.Posix.Signals (sigTERM)
+import System.Process (CreateProcess (env), proc)
 import Test.Support.Subprocess
   ( Child
   , ChildSpec (specPlacement, specStderr, specStdin, specStdout)
   , Placement (CallersGroup)
   , RunBound (Within)
   , Stream (Absent, CallerHandle)
-  , childProcess
+  , ChildState (StillRunning)
+  , awaitExit
   , childSpec
+  , childState
+  , signalChild
   , waitChild
   , withScopedChild
   )
@@ -104,7 +108,7 @@ withPrivateCompositor body =
           )
   where
     awaitServed compositor environment remaining = do
-      exited ← getProcessExitCode (compositorProcess compositor)
+      exited ← compositorExit compositor
       forM_ exited $ \code → do
         logged ← compositorLog compositor
         failCase ("the private compositor exited " <> show code <> " before serving its socket: " <> logged)
@@ -145,15 +149,19 @@ enterPrivate compositor = do
   setEnv "XDG_RUNTIME_DIR" (compositorDirectory compositor)
   setEnv "WAYLAND_DISPLAY" (compositorDirectory compositor </> compositorSocket compositor)
 
--- | The compositor's process.
-compositorProcess ∷ Compositor → ProcessHandle
-compositorProcess = childProcess . compositorChild
+-- | Whether the compositor has exited, and how: a look that does not reap it (the facility that owns it does that when the
+-- compositor's scope ends).
+compositorExit ∷ Compositor → IO (Maybe ExitCode)
+compositorExit compositor = do
+  state ← childState (compositorChild compositor)
+  case state of
+    StillRunning → pure Nothing
+    _ → Just <$> awaitExit (compositorChild compositor)
 
--- | End the compositor: @SIGTERM@, then its exit, within a bound. The facility that owns it reaps it with the wait it makes here,
--- and finds it reaped when the compositor's scope ends.
+-- | End the compositor: @SIGTERM@, then its exit, within a bound. The facility that owns it reaps it when the compositor's scope ends.
 endCompositor ∷ Compositor → IO ExitCode
 endCompositor compositor = do
-  terminateProcess (compositorProcess compositor)
+  signalChild (compositorChild compositor) sigTERM
   waitChild (compositorChild compositor) (round (readinessDeadline * 1000000))
     >>= maybe (failCase "the private compositor did not exit after SIGTERM") pure
 

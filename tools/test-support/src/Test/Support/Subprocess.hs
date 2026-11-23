@@ -27,27 +27,17 @@
 -- remembered, the step retried and the cancellation raised after the release completed, with the body's failure retained
 -- beside it ('RetainedFailure'). It ends the child as the owner decided on 2026-11-02:
 --
--- * each child is started in a process group of its own ('OwnGroup', never a session of its own) and the whole group is ended,
---   so a descendant in the group goes with it. SIGTERM, a grace of 2 s, then SIGKILL, and the reap of the direct child, last,
---   is confirmed through its wait. The end of the group is defined by the group, not by its leader: a leader that exits normally or
---   on SIGTERM does not spare a descendant that ignores SIGTERM. That no process of the group remains is a separate, bounded
---   observation ('probeGroup'; a zombie awaiting its parent or the system's adopter still counts as remaining),
---   and when it is not made the call fails as unconfirmed and says so.
--- * /The identifier stays owned./ A group's identifier is reserved while its leader is unreaped: the leader, a zombie once it has
---   exited, keeps the identifier from being given to another group. The facility therefore reaps the leader last, after the final
---   signal to the group, and sends every signal to the group while it is still unreaped; no wait the facility offers reaps it
---   ('waitChild', 'awaitExit', 'signalChild' and a run to completion look without reaping, and a look that finds the leader reaped
---   is the only way the facility learns of a reap it did not make). Whether a member remains is read from the operating system's
---   process table, excluding the held leader ('probeGroup'; a table that cannot be read to its end counts as "may remain"), and
---   only decides whether there is anything to send: a group with no member but its leader is sent nothing, and a member that obeys
---   SIGTERM is not sent SIGKILL. A probe is never what makes a signal safe, and a scan that found nothing certifies nothing: once the
---   leader is reaped, any process still carrying the identifier ('probeExists') is reported as not confirmed.
--- * Every look at the leader is decided by the handle first: one the library has closed was reaped, and its number, which may be
---   another child's by then, is never put to the operating system.
--- * A leader reaped before the release, which only a body that reaped it through 'childProcess' can have done, has not held the
---   identifier: the group is sent nothing, a process found carrying the identifier, a lone leader of another group included, is
---   reported as not confirmed (it cannot be told from a group the identifier was given to), and an absent one is as good as ended.
---   A group whose end cannot be observed is never reported ended: the call fails and says so.
+-- * each child is started in a process group of its own ('OwnGroup', never a session of its own) and the whole group is ended, so a
+--   descendant in the group goes with it. A child still running is sent SIGTERM and given a grace of 2 s, observed on the leader
+--   without reaping it; its group is then sent SIGKILL, once, and the child is reaped. A child that has already exited is sent
+--   SIGKILL and reaped. A leader that exits normally or on SIGTERM does not spare a descendant that ignores SIGTERM. Whether any
+--   process of the group remains is never asked: no probe of the group decides a signal, and none certifies the end.
+-- * /The facility is the only reaper, and every group signal is sent while the leader is held./ A group's identifier is reserved while
+--   its leader is unreaped (a zombie once it has exited), so it cannot be given to another group: the leader is reaped last, after the
+--   final signal, and nothing is sent to the group after the reap. No 'ProcessHandle' of a child leaves this module: the body is lent
+--   the process identifier and calls that do not reap ('waitChild', 'awaitExit', 'childState', 'awaitUnreapedExit', 'signalChild'),
+--   and a status answered before the reap is the one the library's wait answers (eight bits of an exit code, the negated number of a
+--   signal). A process that leaves the group itself ('setsid', 'setpgid') is outside it.
 -- * Exactly two kinds of child stay in the caller's process group and are signalled by process identifier only, with the same
 --   escalation: a child that inherits the terminal for a person at the keyboard, and the nested private compositors, which stay
 --   in their owning test process's group so the outer launcher's deadline, which ends that group, still ends them
@@ -62,8 +52,7 @@
 -- 10 s, the grace 2 s ('defaultBounds'); an example of the facility itself shortens them through 'Bounds', an explicit
 -- argument, never mutable state. 'Seams' are the test-side hooks the facility's own examples use to reach windows (a failed
 -- acquisition, a parked release, a wait that does not observe the exit); production use is 'noSeams'. Nothing here sleeps to
--- coordinate threads. The one place that polls is the observation that no member of a group remains, because the operating system
--- offers no event for a zombie's adoption: it is a bounded wait for the world, never a coordination of two threads.
+-- coordinate threads.
 --
 -- = Ownership
 --
@@ -98,7 +87,9 @@ module Test.Support.Subprocess
   , withScopedChild
   , withScopedChildUsing
   , Child
-  , childProcess
+  , Leader
+  , leaderPid
+  , leaderState
   , childPid
   , childStdin
   , Output (..)
@@ -114,12 +105,11 @@ module Test.Support.Subprocess
   , ChildState (..)
   , childState
   , awaitUnreapedExit
-  , probeGroup
   , describeCommand
   , describeBound
   ) where
 
-import Control.Concurrent (threadDelay, yield)
+import Control.Concurrent (yield)
 import Control.Concurrent.STM (TVar, atomically, check, modifyTVar', newTVarIO, readTVar, readTVarIO, writeTVar)
 import Control.Exception
   ( Exception (displayException, fromException)
@@ -153,13 +143,11 @@ import Foreign.C.Types (CInt (..))
 import Foreign.Marshal.Alloc (alloca)
 import Foreign.Ptr (Ptr)
 import Foreign.Storable (peek)
-import GHC.Clock (getMonotonicTimeNSec)
 import System.Exit (ExitCode (ExitFailure, ExitSuccess))
-import System.IO.Error (isDoesNotExistError)
 import System.IO (Handle, hClose, hPutStr, hPutStrLn, hSetBinaryMode, stderr)
 import System.Posix.IO (FdOption (CloseOnExec), closeFd, fdToHandle, setFdOption)
 import qualified System.Posix.IO as Posix
-import System.Posix.Signals (Signal, nullSignal, sigKILL, sigTERM, signalProcess, signalProcessGroup)
+import System.Posix.Signals (Signal, sigKILL, sigTERM, signalProcess, signalProcessGroup)
 import System.Posix.Types (CPid (..), ProcessID)
 import System.Process
   ( CmdSpec (RawCommand, ShellCommand)
@@ -202,30 +190,22 @@ defaultBounds = Bounds {boundGrace = 2000000, boundReap = 10000000, boundDrain =
 
 -- | The test-side hooks of the facility's own examples. Production use is 'noSeams'; the command under test has none.
 data Seams = Seams
-  { seamSpawned ∷ ProcessHandle → IO ()
+  { seamSpawned ∷ Leader → IO ()
   -- ^ Run in the masked acquisition once the child exists and before the body is entered: what an example raises from to make the
   -- acquisition fail part-way.
   , seamReleasing ∷ IO ()
   -- ^ Run at the start of every attempt of the release, where it can be interrupted: where an example parks the release to deliver
   -- a cancellation into it.
-  , seamPoll ∷ ProcessHandle → IO (Maybe ExitCode)
+  , seamPoll ∷ Leader → IO (Maybe ExitCode)
   -- ^ The facility's non-blocking check whether a child that stays in the caller's group has been reaped (the library's, which reaps
-  -- one that has exited), and whether the leader of a group of its own was reaped before the release.
-  , seamWait ∷ ProcessHandle → Int → IO (Maybe ExitCode)
-  -- ^ The facility's bounded reaping wait for the direct child, in microseconds (a bound of 0 is a look that reaps an exited child):
-  -- the last step of ending a group, after its final signal. An example that makes it answer 'Nothing' injects a reap that is not confirmed.
+  -- one that has exited).
+  , seamWait ∷ Leader → Int → IO (Maybe ExitCode)
+  -- ^ The facility's bounded reaping wait for the direct child, in microseconds: the last step of ending a child, after the final
+  -- signal to its group. An example that makes it answer 'Nothing' injects a reap that is not confirmed.
   , seamExit ∷ ProcessID → Int → IO (Maybe ChildState)
   -- ^ The facility's bounded wait, in microseconds, for the leader of a group of its own to have exited, without reaping it (a bound
   -- of 0 is a look): 'Nothing' when it had not, 'Just' 'ExitedUnreaped' when it had and the identifier is still reserved, 'Just'
-  -- 'Reaped' when something else reaped it. An example that makes it answer 'Nothing' injects an exit that is not observed, and one
-  -- that makes it answer 'Just' 'Reaped' injects a leader reaped before the release.
-  , seamGroupRemains ∷ ProcessID → IO Bool
-  -- ^ Whether any process of the group other than its held leader remains ('probeGroup'). An example that makes it answer 'True'
-  -- injects a descendant whose end is not observed.
-  , seamGroupExists ∷ ProcessID → IO Bool
-  -- ^ Whether any process at all has the identifier as its group ('probeExists'), the leader included: the observation made where the
-  -- leader is no longer held (it was reaped before the release, or has been reaped by the release). It never decides a signal. An
-  -- example that makes it answer 'True' injects a group the identifier was given to.
+  -- 'Reaped' when something else reaped it. An example that makes it answer 'Nothing' injects an exit that is not observed.
   , seamDeliver ∷ Maybe (SignalTarget → Signal → IO ())
   -- ^ 'Nothing' delivers each signal. An example that must not deliver one, whatever the facility decides, supplies what records it
   -- instead: the signal is then recorded by the example and never sent ('seamSignalled' still runs first).
@@ -256,8 +236,6 @@ data CleanupStep
     CloseCallerHandles
   | -- | Signalling the child, waiting out the grace, killing it, confirming its reap.
     EndChild
-  | -- | Observing that no member of the child's group remains, and ending those that do.
-    ObserveGroup
   | -- | Closing the piped standard input, which flushes.
     DisposeStdin
   | -- | Waiting for the pipes to end.
@@ -275,11 +253,9 @@ noSeams =
   Seams
     { seamSpawned = \_ → pure ()
     , seamReleasing = pure ()
-    , seamPoll = getProcessExitCode
-    , seamWait = \handle bound → if bound <= 0 then getProcessExitCode handle else timeout bound (waitForProcess handle)
+    , seamPoll = getProcessExitCode . leaderHandle
+    , seamWait = \leader bound → if bound <= 0 then getProcessExitCode (leaderHandle leader) else timeout bound (waitForProcess (leaderHandle leader))
     , seamExit = \pid bound → if bound <= 0 then lookExit pid else awaitExitOf pid bound
-    , seamGroupRemains = probeGroup
-    , seamGroupExists = probeExists
     , seamDeliver = Nothing
     , seamDiagnostic = hPutStrLn stderr
     , seamPiped = pure ()
@@ -383,10 +359,20 @@ data Reader = Reader
   , readerFailure ∷ !(TVar (Maybe String))
   }
 
+-- | The direct child as the facility holds it. It is the only owner of the child's reap: nothing the body or an example is given can
+-- reap it, because no 'ProcessHandle' of it leaves this module. An example's seam is lent one to read the identifier ('leaderPid'),
+-- look at it ('leaderState') or hand it back to the facility's own default.
+data Leader = Leader
+  { leaderHandle ∷ !ProcessHandle
+  , leaderPid ∷ !ProcessID
+  }
+
 -- | What the body is lent.
 data Child = Child
-  { childProcess ∷ !ProcessHandle
+  { childLeader ∷ !Leader
   , childPid ∷ !ProcessID
+  , childStatus ∷ !(IORef (Maybe ExitCode))
+  -- ^ The status of the reap, once the release has made it.
   , childStdin ∷ !(Maybe Handle)
   -- ^ The write end of a piped standard input, closed by the release.
   , childOutReader ∷ !(Maybe Reader)
@@ -549,9 +535,6 @@ data Env = Env
   , envTermSent ∷ !(IORef Bool)
   , envKillSent ∷ !(IORef Bool)
   , envLeaderReaped ∷ !(IORef Bool)
-  , envGroupGone ∷ !(IORef Bool)
-  -- ^ Set once a probe, made after the leader was reaped, found no member: the identifier may belong to another group from then on, so
-  -- nothing is signalled to it again, however often the release is retried.
   , envProblems ∷ !(IORef [String])
   }
 
@@ -559,21 +542,24 @@ withProcess ∷ Bounds → Seams → ChildSpec → IORef Bool → Pipes → Mayb
 withProcess bounds seams spec entered pipes outReader errReader body = mask $ \restore → do
   (handle, pid) ← spawn spec pipes
   accounted ← newIORef False
-  let child =
+  status ← newIORef Nothing
+  let leader = Leader handle pid
+      child =
         Child
-          { childProcess = handle
+          { childLeader = leader
           , childPid = pid
+          , childStatus = status
           , childStdin = pipesInWrite pipes
           , childOutReader = outReader
           , childErrReader = errReader
           , childDrainBound = boundDrain bounds
           , childDrainAccounted = accounted
           }
-  env ← Env bounds seams spec child <$> newIORef False <*> newIORef False <*> newIORef False <*> newIORef False <*> newIORef []
+  env ← Env bounds seams spec child <$> newIORef False <*> newIORef False <*> newIORef False <*> newIORef []
   acquired ← tryWithContext @SomeException $ do
     -- The parent's copies of the child's ends go, so that the readers see the end of the stream when the last holder lets go.
     mapM_ closeQuietly (concatMap (maybe [] pure) [pipesInRead pipes, pipesOutWrite pipes, pipesErrWrite pipes])
-    seamSpawned seams handle
+    seamSpawned seams leader
     -- A cancellation sent during the acquisition may still sit in the scheduler's inbox or in this thread's queue: take it here, still
     -- masked, where the facility owns everything and the release runs. Left to arrive when the mask is lifted it could land after
     -- the body had begun, and the caller's handles would then be the caller's to close.
@@ -725,26 +711,26 @@ endChild env = seamCleaning (envSeams env) EndChild >> case specPlacement (envSp
   OwnGroup → endGroup env
   CallersGroup → endPid env
 
-handleOf ∷ Env → ProcessHandle
-handleOf = childProcess . envChild
+leaderOf ∷ Env → Leader
+leaderOf = childLeader . envChild
 
--- | Poll, then wait: whether the direct child is known to be reaped.
+-- | Record the reap: the child is known reaped and its status is the one the reap answered.
+recordReap ∷ Env → Maybe ExitCode → IO Bool
+recordReap env status = do
+  forM_ status $ \code → do
+    writeIORef (envLeaderReaped env) True
+    writeIORef (childStatus (envChild env)) (Just code)
+  pure (isJust status)
+
+-- | Poll, then wait: whether the direct child is known to be reaped. For a child that stays in the caller's group only.
 pollLeader ∷ Env → IO Bool
 pollLeader env = do
   known ← readIORef (envLeaderReaped env)
-  if known
-    then pure True
-    else do
-      status ← seamPoll (envSeams env) (handleOf env)
-      when (isJust status) $ writeIORef (envLeaderReaped env) True
-      pure (isJust status)
+  if known then pure True else seamPoll (envSeams env) (leaderOf env) >>= recordReap env
 
--- | A bounded wait for the direct child; whether the reap was confirmed.
+-- | A bounded reaping wait for the direct child; whether the reap was confirmed.
 awaitLeader ∷ Env → Int → IO Bool
-awaitLeader env microseconds = do
-  status ← seamWait (envSeams env) (handleOf env) microseconds
-  when (isJust status) $ writeIORef (envLeaderReaped env) True
-  pure (isJust status)
+awaitLeader env microseconds = seamWait (envSeams env) (leaderOf env) microseconds >>= recordReap env
 
 -- | Send a signal to the child's process or to its group, once the seam has been told. A target that is already gone is not an error.
 sendTo ∷ Env → SignalTarget → Signal → IO ()
@@ -777,85 +763,31 @@ data Held = Held
 --
 -- The leader is reaped last, after the final signal to the group. Until then it is a process, or a zombie, holding its identifier as
 -- the group's, so the operating system cannot give that identifier to another group and every signal to it reaches the child's own
--- members. A leader that was reaped before the release (through the handle the body was lent, not through the facility) has not held
--- it: the group is sent nothing, and a member found there is reported as unconfirmed, because it cannot be told from a group the
--- identifier was given to.
+-- members. A child still running is sent SIGTERM and given the grace to exit, observed on the leader without reaping it; the group is
+-- then sent SIGKILL, once, and the child reaped. A child that has already exited is sent SIGKILL and reaped. Nothing is sent after
+-- the reap. Whether any member remains is never asked: nothing else ends a descendant that ignores SIGTERM.
 endGroup ∷ Env → IO ()
 endGroup env = do
-  reaped ← readIORef (envLeaderReaped env)
-  unless reaped $ do
+  done ← readIORef (envLeaderReaped env)
+  unless done $ do
     let pid = childPid (envChild env)
         bounds = envBounds env
-        -- The numeric identifier is only asked about while the handle is open: a handle the library has closed was reaped, and
-        -- from then on the number may be another child's.
-        exitBy micro = do
-          open ← isJust <$> getPid (handleOf env)
-          if open then seamExit (envSeams env) pid micro else pure (Just Reaped)
+        exitBy = seamExit (envSeams env) pid
     seen ← exitBy 0
-    case seen of
-      Just Reaped → endUnheld env
-      Just _ → endMembers env Held
+    held ← case seen of
+      Just Reaped → pure False
+      Just _ → pure True
       Nothing → do
         signalGroup env Held sigTERM
-        exited ← exitBy (boundGrace bounds)
-        case exited of
-          Just Reaped → endUnheld env
-          Just _ → endMembers env Held
-          Nothing → do
-            signalGroup env Held sigKILL
-            confirmed ← exitBy (boundReap bounds)
-            case confirmed of
-              Just Reaped → endUnheld env
-              Just _ → endMembers env Held
-              Nothing → noteProblem env ("the child was not reaped within " <> describeBound (Within (boundReap bounds)) <> " of SIGKILL")
-
--- | The leader has exited and is still held: end the members that remain, then reap it. A group with no member other than the held
--- leader is sent nothing.
-endMembers ∷ Env → Held → IO ()
-endMembers env held = do
-  let pid = childPid (envChild env)
-      bounds = envBounds env
-      remains = probeFor env
-  seamCleaning (envSeams env) ObserveGroup
-  stillThere ← remains pid
-  when stillThere $ do
-    signalGroup env held sigTERM
-    killed ← readIORef (envKillSent env)
-    -- Members that obey SIGTERM are given the grace; ones that outlast it are killed, once, and then waited for. A group that has
-    -- already been sent SIGKILL (the leader outlasted the grace) is only waited for: its members are zombies awaiting their adopter,
-    -- and a second signal would add nothing.
-    gone ← if killed then pure False else groupGone remains pid (boundGrace bounds)
-    unless gone $ do
-      signalGroup env held sigKILL
-      vanished ← groupGone remains pid (boundReap bounds)
-      unless vanished $
-        noteProblem env ("processes of the child's process group still remained " <> describeBound (Within (boundReap bounds)) <> " after SIGKILL (a zombie awaiting its parent counts as remaining)")
-  -- The last step: the group has had its final signal, so the identifier may be released.
-  confirmed ← awaitLeader env (boundReap bounds)
-  if confirmed
-    then do
-      -- What the process table said while the group was observed is not a snapshot, so a miss never certifies the group: once the
-      -- leader is reaped any process still carrying the identifier is reported, and never signalled.
-      leftover ← seamGroupExists (envSeams env) pid
-      when leftover $ noteProblem env leftoverProblem
-    else noteProblem env ("the child was not reaped within " <> describeBound (Within (boundReap bounds)))
-
-leftoverProblem ∷ String
-leftoverProblem =
-  "a process may remain in the child's process group: one still had its identifier after the leader was reaped, and the identifier is no longer reserved, so nothing more was sent"
-
--- | The leader was reaped before the release, so its identifier is no longer reserved: nothing is signalled. The group is observed
--- once. A member found is reported, never ended: it may be a descendant of the child, or an unrelated group the identifier was given to.
-endUnheld ∷ Env → IO ()
-endUnheld env = do
-  seamCleaning (envSeams env) ObserveGroup
-  reaped ← seamPoll (envSeams env) (handleOf env)
-  when (isNothing reaped) $ noteProblem env ("the child was not reaped within " <> describeBound (Within (boundReap (envBounds env))))
-  -- Any process with the identifier counts, a lone leader included: an unrelated group of one is as present as a descendant.
-  stillThere ← seamGroupExists (envSeams env) (childPid (envChild env))
-  when stillThere $
-    noteProblem env "a process of the child's process group may remain: the child was reaped before the group could be ended, so its identifier was no longer reserved and nothing was sent to the group (a member cannot be told from an unrelated group the identifier was given to)"
-  writeIORef (envLeaderReaped env) True
+        after ← exitBy (boundGrace bounds)
+        pure (after /= Just Reaped)
+    if held
+      then do
+        signalGroup env Held sigKILL
+        confirmed ← awaitLeader env (boundReap bounds)
+        unless confirmed $ noteProblem env ("the child was not reaped within " <> describeBound (Within (boundReap bounds)) <> " of SIGKILL")
+      else
+        noteProblem env "the child was reaped outside the facility before its group could be ended, so its identifier was no longer reserved and its group was sent nothing"
 
 -- | Send a signal to the child's group, once the seam has been told. Only while the group's identifier is held ('Held'). A group that
 -- is already gone is not an error.
@@ -863,47 +795,6 @@ signalGroup ∷ Env → Held → Signal → IO ()
 signalGroup env Held signal = do
   let flag = if signal == sigKILL then envKillSent env else envTermSent env
   once flag (sendTo env ToGroup signal)
-
--- | The probe the release acts on: whether a member other than the held leader remains. The first answer of "none" is terminal:
--- nothing is left to end, so this answers "none" without asking again, however often the release is retried.
-probeFor ∷ Env → ProcessID → IO Bool
-probeFor env pgid = do
-  already ← readIORef (envGroupGone env)
-  if already
-    then pure False
-    else do
-      present ← seamGroupRemains (envSeams env) pgid
-      unless present $ writeIORef (envGroupGone env) True
-      pure present
-
--- | Whether the group has a member other than its leader, which the caller holds: the leader, a zombie once it has exited, is not
--- counted, and any other zombie (one awaiting its parent or the system's adopter) is. A member that cannot be read counts as
--- remaining, and so does an answer that cannot be had: the group is then never reported ended.
-probeGroup ∷ ProcessID → IO Bool
-probeGroup pgid = (/= 0) <$> c_groupHasOther (CPid (fromIntegral pgid)) (CPid (fromIntegral pgid))
-
--- | Whether any process at all has the identifier as its group, by a null signal: the leader, a zombie, a process that may not be
--- signalled and any unrelated group the identifier was given to all count. Only an observation, made where the leader is no longer
--- held: it never decides a signal.
-probeExists ∷ ProcessID → IO Bool
-probeExists pgid =
-  (signalProcessGroup nullSignal pgid >> pure True)
-    `catch` \(failure ∷ IOException) → pure (not (isDoesNotExistError failure))
-
--- | Wait for the group to be gone, for at most the bound. The operating system has no event for a zombie's adoption, so this is the
--- one place the facility polls; it observes the world, it coordinates no thread, and the bound is only a timeout.
-groupGone ∷ (ProcessID → IO Bool) → ProcessID → Int → IO Bool
-groupGone remains pgid microseconds = do
-  start ← getMonotonicTimeNSec
-  let limit = fromIntegral (max 0 microseconds) * 1000
-      loop = do
-        present ← remains pgid
-        if not present
-          then pure True
-          else do
-            now ← getMonotonicTimeNSec
-            if now - start >= limit then pure False else threadDelay 2000 >> loop
-  loop
 
 -- | Close the piped standard input, within the reap bound and where a cancellation can reach it. Closing flushes what the body left
 -- buffered, and that waits for whoever holds the read end: a descendant outside the group that does not read it keeps the flush
@@ -1008,29 +899,25 @@ signalChild child signal = do
   when (state == StillRunning) $ signalProcess signal (childPid child)
 
 -- | Wait, within the bound in microseconds, for the child's exit and answer its status. The wait does not reap: the child stays a
--- zombie, holding its process group's identifier, until the release has sent the group its last signal and reaps it.
+-- zombie, holding its process group's identifier, until the release has sent the group its last signal and reaps it. The status is
+-- the one the library's wait answers (an exit code of eight bits, the negated number of a signal that ended it).
 -- 'Nothing' when the bound expired.
 waitChild ∷ Child → Int → IO (Maybe ExitCode)
 waitChild child microseconds = timeout (max 0 microseconds) (awaitExit child)
 
 -- | Wait, with no bound of its own, for the child's exit and answer its status, without reaping it. A body that waits this way runs
--- inside the call's run bound and is cancellable like any other.
---
--- A child already reaped through 'childProcess' answers the status the library kept, without asking the operating system about its
--- number, which may by then be another process's. Every look of the facility (this one, 'childState', 'awaitUnreapedExit',
--- 'signalChild' and the release) is decided by the handle first. Reaping through the handle while another thread is waiting or
--- releasing is outside the contract: nothing can make that exclusive.
+-- inside the call's run bound and is cancellable like any other. Asked again after the call has ended it answers the status of the
+-- reap.
 awaitExit ∷ Child → IO ExitCode
 awaitExit child = loop
   where
-    loop = getPid (childProcess child) >>= maybe (waitForProcess (childProcess child)) (const look)
-    look =
+    loop =
       observeState (childPid child) True >>= \case
         Right (Just code) → pure code
         Right Nothing → loop
         Left errno
           | errno == eINTR → takePending >> loop
-          | errno == eCHILD → waitForProcess (childProcess child)
+          | errno == eCHILD → readIORef (childStatus child) >>= maybe (ioError (userError ("the child " <> show (childPid child) <> " was reaped by something other than the facility"))) pure
           | otherwise → ioError (userError ("waitid for process " <> show (childPid child) <> " failed with errno " <> show errno))
 
 -- | Where the child is, as a look that does not reap it.
@@ -1045,12 +932,13 @@ data ChildState
 foreign import ccall interruptible "hetoimasia_test_support_child_state"
   c_childState ∷ CPid → CInt → Ptr CInt → IO CInt
 
-foreign import ccall safe "hetoimasia_test_support_group_has_other"
-  c_groupHasOther ∷ CPid → CPid → IO CInt
-
 -- | Ask whether the child has exited, without reaping it (waitid with WNOWAIT), so a body can observe a zombie.
 childState ∷ Child → IO ChildState
-childState child = getPid (childProcess child) >>= maybe (pure Reaped) (const (fromMaybe StillRunning <$> lookExit (childPid child)))
+childState = leaderState . childLeader
+
+-- | 'childState' of a leader an example's seam was lent.
+leaderState ∷ Leader → IO ChildState
+leaderState leader = fromMaybe StillRunning <$> lookExit (leaderPid leader)
 
 -- | A non-blocking, non-reaping look at a child: 'Nothing' while it runs.
 lookExit ∷ ProcessID → IO (Maybe ChildState)
@@ -1076,7 +964,7 @@ observeState pid block = alloca $ \code → do
 
 -- | Wait, within the bound in microseconds, for the child to have exited, without reaping it. 'Nothing' when the bound expired.
 awaitUnreapedExit ∷ Child → Int → IO (Maybe ChildState)
-awaitUnreapedExit child = \microseconds → getPid (childProcess child) >>= maybe (pure (Just Reaped)) (const (awaitExitOf (childPid child) microseconds))
+awaitUnreapedExit child = awaitExitOf (childPid child)
 
 -- | 'awaitUnreapedExit' for a process identifier.
 awaitExitOf ∷ ProcessID → Int → IO (Maybe ChildState)
@@ -1111,18 +999,22 @@ runToCompletion = runToCompletionUsing defaultBounds noSeams
 -- The command's standard input is the given string, then closed. Both outputs are read as the child writes them. If the run bound
 -- expires the child is ended and the call fails naming the command and the bound.
 runToCompletionUsing ∷ Bounds → Seams → RunBound → CreateProcess → String → IO Completed
-runToCompletionUsing bounds seams bound process input =
-  withScopedChildUsing bounds seams (childSpec bound process) {specStdin = Piped} (complete input)
+runToCompletionUsing bounds seams bound process input = do
+  (child, out, err, drain) ← withScopedChildUsing bounds seams (childSpec bound process) {specStdin = Piped} (complete input)
+  -- The call returned, so the release reaped the child and confirmed it: the status is the reap's own.
+  status ← readIORef (childStatus child) >>= maybe (throwIO (SubprocessFailure (describeCommand process <> " was not reaped"))) pure
+  pure Completed {completedStatus = status, completedOut = out, completedErr = err, completedDrain = drain}
 
 -- | What a run to completion does with a child whose standard input is piped: give it the input and the end of it, wait for it to
--- exit, give up on pipes a descendant keeps open past the drain bound, and answer.
-complete ∷ String → Child → IO Completed
+-- exit (without reaping it), give up on pipes a descendant keeps open past the drain bound, and answer what was read. The status is
+-- the reap's, made by the release.
+complete ∷ String → Child → IO (Child, String, String, Drain)
 complete input child = feeding $ do
-  status ← awaitExit child
+  _ ← awaitExit child
   drain ← awaitDrain child
   out ← captured child Stdout
   err ← captured child Stderr
-  pure Completed {completedStatus = status, completedOut = out, completedErr = err, completedDrain = drain}
+  pure (child, out, err, drain)
   where
     feeding run = case childStdin child of
       Nothing → run

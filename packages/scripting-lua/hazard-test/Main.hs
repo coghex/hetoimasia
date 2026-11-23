@@ -6,12 +6,13 @@ import Control.Exception (throwIO)
 import Data.List (isInfixOf)
 import System.Directory (findExecutable)
 import System.Exit (ExitCode (ExitSuccess))
-import System.Process (CreateProcess (env), proc, terminateProcess)
+import System.Posix.Signals (sigTERM)
+import System.Process (CreateProcess (env), proc)
 import Test.Hspec (Expectation, describe, expectationFailure, it, shouldContain, shouldNotBe)
 import Test.Hspec.Runner (Config (configFailOnEmpty), defaultConfig, hspecWith)
 import Test.Support.Bounded (boundMicroseconds)
 import Test.Support.Subprocess
-  ( Line (..), Output (Stdout), RunBound (Within), Stream (Inherited), ChildSpec (specStderr, specStdin), childProcess, childSpec, nextLine, waitChild, withScopedChild )
+  ( Line (..), Output (Stdout), RunBound (Within), Stream (Inherited), ChildSpec (specStderr, specStdin), childSpec, nextLine, signalChild, waitChild, withScopedChild )
 
 main ∷ IO ()
 main = hspecWith defaultConfig { configFailOnEmpty = True } $ describe "Lua nontermination probe" $ do
@@ -45,6 +46,6 @@ withHazard arguments check = do
         reported ← nextLine hazard Stdout boundMicroseconds >>= \case
           Line text → pure text
           other → expectationFailure ("the hazard runner reported nothing: " <> show other) >> pure ""
-        terminateProcess (childProcess hazard)
+        signalChild hazard sigTERM
         status ← waitChild hazard boundMicroseconds >>= maybe (throwIO (userError "a bounded test call never returned")) pure
         check reported status

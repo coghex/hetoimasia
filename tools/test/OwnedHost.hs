@@ -57,9 +57,10 @@ import System.Exit (ExitCode (ExitFailure, ExitSuccess))
 import System.IO (Handle, hClose, hIsClosed, hIsOpen, hPutStr)
 import System.IO.Error (isDoesNotExistError)
 import System.IO.Temp (withSystemTempDirectory, withSystemTempFile)
-import System.Posix.Signals (Signal, nullSignal, sigTERM, signalProcess)
+import System.Posix.Signals (Signal, nullSignal, sigKILL, sigTERM, signalProcess)
 import System.Posix.Types (ProcessID)
-import System.Process (CreateProcess, createPipe, getPid, proc, waitForProcess)
+import System.Posix.Process (ProcessStatus, getProcessStatus)
+import System.Process (CreateProcess, createPipe, proc)
 import System.Timeout (timeout)
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldReturn, shouldSatisfy)
 import Test.Support.Bounded (bounded)
@@ -68,6 +69,7 @@ import Test.Support.Owned (withOwnedThread)
 import Test.Support.Subprocess
   ( Bounds (boundGrace, boundReap)
   , Child
+  , ChildState (ExitedUnreaped, Reaped)
   , ChildSpec (specStdin, specStdout)
   , Line (Line)
   , Output (Stdout)
@@ -80,6 +82,8 @@ import Test.Support.Subprocess
   , childPid
   , childSpec
   , defaultBounds
+  , leaderPid
+  , leaderState
   , nextLine
   , noSeams
   )
@@ -116,6 +120,17 @@ type Answer a = Either (ExceptionWithContext SomeException) a
 
 -- | The facility's bounds as the examples run it: its fixed reap and drain, and a grace short enough that a child which ignores
 -- SIGTERM does not make an example wait the fixed 2 s.
+-- | Reap a child by identifier: the rescue of an example that made the facility's reap unconfirmed (the facility is the only reaper of
+-- a child it owns, and nothing it lends could reap one).
+reapPid :: ProcessID -> IO ()
+reapPid pid = void (timeout (30 * 1000000) (try (getProcessStatus True False pid) :: IO (Either IOException (Maybe ProcessStatus))))
+
+-- | Wait, without sleeping, until a process is gone and reaped: for one the system's adopter reaps once the facility has killed it.
+awaitGone :: ProcessID -> IO Bool
+awaitGone pid = maybe False id <$> timeout (10 * 1000000) loop
+  where
+    loop = goneAndReaped pid >>= \gone -> if gone then pure True else yield >> loop
+
 quick :: Bounds
 quick = defaultBounds {boundGrace = 100000}
 
@@ -1094,17 +1109,17 @@ stoppingSpec = describe "Stopping (the stop is recorded, the worker not finished
     -- The reap of the first child is not observed (an injected wait that answers nothing); its group is killed all the same.
     target <- newIORef Nothing
     handles <- newIORef []
-    let facility = noSeams {seamDiagnostic = \_ -> pure (), seamWait = \handle bound -> do
-                              mine <- getPid handle
+    let facility = noSeams {seamDiagnostic = \_ -> pure (), seamWait = \leader bound -> do
+                              let mine = Just (leaderPid leader)
                               wanted <- readIORef target
-                              if mine == wanted then modifyIORef' handles (handle :) >> pure Nothing else seamWait noSeams handle bound}
+                              if mine == wanted then modifyIORef' handles (leaderPid leader :) >> pure Nothing else seamWait noSeams leader bound}
         setup host = do
           pid <- hosted host (readyChild hangCatcher "first" nowhere) pidBody
           writeIORef target (Just pid)
           void (hosted host (readyChild hangCatcher "second" nowhere) pidBody)
         check ending = do
           outcome <- stoppingWindow noHostSeams facility setup ending $ \_ _ gate _ -> openGate gate
-          readIORef handles >>= mapM_ (void . waitForProcess)
+          readIORef handles >>= mapM_ reapPid
           pure outcome
     plain <- check Nothing
     case plain of
@@ -1226,10 +1241,10 @@ causeSpec = describe "Cause: how a host, or a request inside it, comes to an end
     target <- newIORef Nothing
     handles <- newIORef []
     pids <- newIORef []
-    let facility = noSeams {seamDiagnostic = \_ -> pure (), seamWait = \handle bound -> do
-                              mine <- getPid handle
+    let facility = noSeams {seamDiagnostic = \_ -> pure (), seamWait = \leader bound -> do
+                              let mine = Just (leaderPid leader)
                               wanted <- readIORef target
-                              if mine == wanted then modifyIORef' handles (handle :) >> pure Nothing else seamWait noSeams handle bound}
+                              if mine == wanted then modifyIORef' handles (leaderPid leader :) >> pure Nothing else seamWait noSeams leader bound}
     outcome <- try @SubprocessFailure $
       withHostEx facility noHostSeams $ \host -> do
         first <- hosted host (readyChild hangCatcher "first" nowhere) pidBody
@@ -1241,7 +1256,7 @@ causeSpec = describe "Cause: how a host, or a request inside it, comes to an end
       Right () -> expectationFailure "an unconfirmed cleanup did not fail the scope"
     -- The other child was ended and reaped; the injected one was killed, and its reap is done here.
     assertReaped pids
-    readIORef handles >>= mapM_ (void . waitForProcess)
+    readIORef handles >>= mapM_ reapPid
 
   it "Cause: a child that fails to start tells only its own submitter, closes its handles, and leaves the host serving, however many fail in a row" $
     withHost $ \host -> do
@@ -1284,10 +1299,10 @@ causeSpec = describe "Cause: how a host, or a request inside it, comes to an end
   it "Cause: the owner's body fails or is cancelled, and every child is ended and reaped with the cleanup failure retained beside the owner's failure" $ do
     target <- newIORef Nothing
     handles <- newIORef []
-    let facility = noSeams {seamDiagnostic = \_ -> pure (), seamWait = \handle bound -> do
-                              mine <- getPid handle
+    let facility = noSeams {seamDiagnostic = \_ -> pure (), seamWait = \leader bound -> do
+                              let mine = Just (leaderPid leader)
                               wanted <- readIORef target
-                              if mine == wanted then modifyIORef' handles (handle :) >> pure Nothing else seamWait noSeams handle bound}
+                              if mine == wanted then modifyIORef' handles (leaderPid leader :) >> pure Nothing else seamWait noSeams leader bound}
     outcome <- tryWithContext @SomeException $
       withHostEx facility noHostSeams $ \host -> do
         first <- hosted host (readyChild hangCatcher "first" nowhere) pidBody
@@ -1298,7 +1313,7 @@ causeSpec = describe "Cause: how a host, or a request inside it, comes to an end
         fromException cause `shouldBe` Just Boom
         retained failure `shouldSatisfy` any ("cleanup was not confirmed" `isInfixOf`)
       Right () -> expectationFailure "the owner's failure was not raised"
-    readIORef handles >>= mapM_ (void . waitForProcess)
+    readIORef handles >>= mapM_ reapPid
 
   it "Cause: the host keeps a child that already exited by itself, and its descendants, until it ends, and then reaps the child and ends the descendants" $ do
     descendant <- newIORef 0
@@ -1314,7 +1329,7 @@ causeSpec = describe "Cause: how a host, or a request inside it, comes to an end
       (readIORef descendant >>= goneAndReaped) `shouldReturn` False
       assertAlive pids
     assertReaped pids
-    (readIORef descendant >>= goneAndReaped) `shouldReturn` True
+    (readIORef descendant >>= awaitGone) `shouldReturn` True
 
 -- | The three places an abandonment can race the worker for the handles of a request.
 racesSpec :: Spec
@@ -1341,7 +1356,7 @@ racesSpec = describe "An abandonment racing the worker (rule A)" $ do
     ran <- newIORef False
     pids <- newIORef []
     withSupplied $ \handle ->
-      withHostEx noSeams {seamSpawned = \process -> getPid process >>= maybe (pure ()) (remember pids) >> park gate} noHostSeams {hostOpen = openGate gate} $ \host ->
+      withHostEx noSeams {seamSpawned = \leader -> remember pids (leaderPid leader) >> park gate} noHostSeams {hostOpen = openGate gate} $ \host ->
         withSubmission host (supplying handle (readyChild (Within 60000000) "a" nowhere)) (flagged ran) $ \a -> do
           awaitReached gate
           cancelSubmitter a
@@ -1691,6 +1706,25 @@ capturedSpec = describe "A captured run on a host" $ do
       (status, out, err) <- hostedCaptured host hangCatcher (proc "cat" []) "typed\n"
       (status, out, err) `shouldBe` (ExitSuccess, "typed\n", "")
 
+  it "holds the child's leader unreaped until the host ends, sends its group the signal then, while it is held, and reaps it last" $ do
+    leader <- newIORef Nothing
+    sent <- newIORef []
+    let seams =
+          noSeams
+            { seamSpawned = writeIORef leader . Just
+            , seamSignalled = \target signal -> do
+                state <- readIORef leader >>= maybe (pure Reaped) leaderState
+                atomicModifyIORef' sent (\old -> (old <> [(target, signal, state)], ()))
+            }
+    withHostEx seams noHostSeams $ \host -> do
+      (status, _, _) <- hostedCaptured host hangCatcher (shell "exit 3" []) ""
+      -- The status is answered before the reap, with the leader still held and the group not yet signalled.
+      status `shouldBe` ExitFailure 3
+      readIORef sent `shouldReturn` []
+      readIORef leader >>= mapM_ (\held -> leaderState held `shouldReturn` ExitedUnreaped)
+    readIORef sent >>= (`shouldBe` [(ToGroup, sigKILL, ExitedUnreaped)])
+    readIORef leader >>= mapM_ (\held -> leaderState held `shouldReturn` Reaped)
+
   it "answers the status and what the child wrote, and leaves the child's group unended until the host ends" $ do
     descendant <- newIORef 0
     -- The leader exits at once, writing the identifier of a descendant that stays in its group.
@@ -1701,4 +1735,4 @@ capturedSpec = describe "A captured run on a host" $ do
       err `shouldBe` "oops\n"
       writeIORef descendant (read (takeWhile (/= '\n') out))
       (readIORef descendant >>= goneAndReaped) `shouldReturn` False
-    (readIORef descendant >>= goneAndReaped) `shouldReturn` True
+    (readIORef descendant >>= awaitGone) `shouldReturn` True

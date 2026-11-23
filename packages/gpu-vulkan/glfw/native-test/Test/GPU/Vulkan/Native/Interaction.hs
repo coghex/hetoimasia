@@ -85,13 +85,13 @@ import System.Environment (getEnvironment, getExecutablePath)
 import System.Exit (ExitCode (..), exitWith)
 import System.IO (hFlush, hPutStrLn, stderr, stdout)
 import System.Info (arch, compilerName, fullCompilerVersion, os)
-import System.Process (proc, waitForProcess)
+import System.Process (proc)
 import Test.Support.Subprocess
   ( ChildSpec (specPlacement, specStderr, specStdin, specStdout)
   , Placement (CallersGroup)
   , RunBound (Unbounded)
   , Stream (Inherited)
-  , childProcess
+  , awaitExit
   , childSpec
   , withScopedChild
   )
@@ -252,7 +252,7 @@ spec gate = describe "graphics-owner progress during window interactions" $
         -- this process's group and only its identifier is signalled when it is ended, and its run is stated to be unbounded because a
         -- person at the keyboard sets its pace. It is still ended and reaped if this example fails or is cancelled.
         let probe = (childSpec Unbounded (proc executable [interactionProbeFlag])) {specStdin = Inherited, specStdout = Inherited, specStderr = Inherited, specPlacement = CallersGroup}
-        withScopedChild probe (waitForProcess . childProcess) >>= \case
+        withScopedChild probe awaitExit >>= \case
           ExitSuccess → pure ()
           status → expectationFailure ("the interaction probe's process exited " <> show status)
 

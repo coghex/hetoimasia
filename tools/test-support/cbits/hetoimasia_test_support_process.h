@@ -1,8 +1,7 @@
 #ifndef HETOIMASIA_TEST_SUPPORT_PROCESS_H
 #define HETOIMASIA_TEST_SUPPORT_PROCESS_H
 
-/* Non-reaping looks at a child of this process and at its process group, for
- * Test.Support.Subprocess. */
+/* A non-reaping look at a child of this process, for Test.Support.Subprocess. */
 
 #include <sys/types.h>
 
@@ -20,15 +19,5 @@
  * have answered: the exit status, or the negated signal number of a child a
  * signal ended. */
 int hetoimasia_test_support_child_state(pid_t pid, int block, int *code);
-
-/* Whether any process of the process group pgid other than the process leader
- * (the process whose identifier is pgid; pass it so the leader, a zombie the
- * caller still holds, is not counted) is still there. A zombie counts: it is
- * still a member until it is reaped.
- *
- * Returns 1 when one is, 0 when none is, and a negative value when the answer
- * cannot be read (no process table to read on this platform, or it failed): the
- * caller must treat that as "may remain". */
-int hetoimasia_test_support_group_has_other(pid_t pgid, pid_t leader);
 
 #endif

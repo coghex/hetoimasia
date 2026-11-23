@@ -41,7 +41,7 @@ import Control.Exception (Exception (..), ExceptionWithContext (ExceptionWithCon
 import Control.Monad (forM_, unless, when)
 import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (find)
-import Data.Maybe (isJust)
+import Data.Maybe (isJust, isNothing)
 import qualified Data.Text as Text
 import GHC.Clock (getMonotonicTime)
 import Hetoimasia.Foundation.Failure
@@ -90,19 +90,23 @@ import System.Exit (ExitCode (..))
 import System.FilePath ((</>))
 import System.IO (IOMode (WriteMode), hClose, withFile)
 import System.Posix.Process (getProcessID)
-import System.Posix.Signals (signalProcess, sigCONT, sigSTOP)
+import System.Posix.Signals (signalProcess, sigCONT, sigSTOP, sigTERM)
 import System.Posix.Types (ProcessID)
 import System.Posix.Temp (mkdtemp)
 import Numeric.Natural (Natural)
-import System.Process (CreateProcess (env), ProcessHandle, getPid, getProcessExitCode, proc, terminateProcess)
+import System.Process (CreateProcess (env), proc)
 import Test.Support.Subprocess
   ( Child
   , ChildSpec (specPlacement, specStderr, specStdin, specStdout)
   , Placement (CallersGroup)
   , RunBound (Within)
   , Stream (Absent, CallerHandle)
-  , childProcess
+  , ChildState (StillRunning)
+  , awaitExit
+  , childPid
   , childSpec
+  , childState
+  , signalChild
   , waitChild
   , withScopedChild
   )
@@ -744,9 +748,7 @@ data Paused = Paused
 againstPausedCompositor ∷ (Session → IO ()) → IO Paused
 againstPausedCompositor settleWith =
   withPrivateCompositor $ \compositor → do
-    process ←
-      getPid (compositorProcess compositor)
-        >>= maybe (failCheck "the private compositor has no process id") pure
+    let process = childPid (compositorChild compositor)
     enterPrivate compositor
     withSession waylandConfig $ \session → do
       requireWayland session
@@ -894,7 +896,7 @@ withPrivateCompositor body =
           )
   where
     awaitServed compositor environment remaining = do
-      exited ← getProcessExitCode (compositorProcess compositor)
+      exited ← compositorExit compositor
       forM_ exited $ \code → do
         logged ← compositorLog compositor
         failCheck ("the private compositor exited " <> show code <> " before serving its socket: " <> logged)
@@ -935,20 +937,24 @@ enterPrivate compositor = do
   setEnv "XDG_RUNTIME_DIR" (compositorDirectory compositor)
   setEnv "WAYLAND_DISPLAY" (compositorDirectory compositor </> compositorSocket compositor)
 
--- | The compositor's process.
-compositorProcess ∷ Compositor → ProcessHandle
-compositorProcess = childProcess . compositorChild
+-- | Whether the compositor has exited, and how: a look that does not reap it (the facility that owns it does that when the
+-- compositor's scope ends).
+compositorExit ∷ Compositor → IO (Maybe ExitCode)
+compositorExit compositor = do
+  state ← childState (compositorChild compositor)
+  case state of
+    StillRunning → pure Nothing
+    _ → Just <$> awaitExit (compositorChild compositor)
 
--- | End the compositor: @SIGTERM@, then its exit, within a bound. The facility that owns it reaps it with the wait it makes here,
--- and finds it reaped when the compositor's scope ends.
+-- | End the compositor: @SIGTERM@, then its exit, within a bound. The facility that owns it reaps it when the compositor's scope ends.
 endCompositor ∷ Compositor → IO ExitCode
 endCompositor compositor = do
-  terminateProcess (compositorProcess compositor)
+  signalChild (compositorChild compositor) sigTERM
   waitChild (compositorChild compositor) (round (readinessDeadline * 1000000))
     >>= maybe (failCheck "the private compositor did not exit after SIGTERM") pure
 
 compositorRunning ∷ Compositor → IO Bool
-compositorRunning compositor = maybe True (const False) <$> getProcessExitCode (compositorProcess compositor)
+compositorRunning compositor = isNothing <$> compositorExit compositor
 
 compositorLog ∷ Compositor → IO String
 compositorLog compositor = do
