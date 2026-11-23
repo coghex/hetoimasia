@@ -753,15 +753,21 @@ spec = describe "the shared subprocess facility (Test.Support.Subprocess)" $ do
         readIORef (probePids probe) >>= (`shouldBe` [])
 
     it "does not let a body reap the child: no handle of one leaves the facility or its host" $ do
-      facility ← readFile "tools/test-support/src/Test/Support/Subprocess.hs"
-      host ← readFile "tools/test-support/src/Test/Support/Subprocess/Host.hs"
-      -- The export list of a module: the lines after its @module@ line, up to the closing parenthesis. Neither names a handle or the
-      -- field that held one.
-      let exportList source = unlines (takeWhile (not . isInfixOf ") where") (drop 1 (dropWhile (not . isPrefixOf "module Test.Support") (lines source))))
-      exportList facility `shouldSatisfy` isInfixOf "withScopedChild"
-      forM_ [facility, host] $ \source →
-        forM_ ["childProcess", "ProcessHandle", "leaderHandle", "Leader (..)"] $ \name →
-          exportList source `shouldSatisfy` (not . isInfixOf name)
+      let facilityPath = "tools/test-support/src/Test/Support/Subprocess.hs"
+          hostPath = "tools/test-support/src/Test/Support/Subprocess/Host.hs"
+      present ← and <$> mapM doesFileExist [facilityPath, hostPath]
+      if not present
+        then pendingWith "the facility's source is another package's, which a source distribution does not carry"
+        else do
+          facility ← readFile facilityPath
+          host ← readFile hostPath
+          -- The export list of a module: the lines after its @module@ line, up to the closing parenthesis. Neither names a handle or the
+          -- field that held one.
+          let exportList source = unlines (takeWhile (not . isInfixOf ") where") (drop 1 (dropWhile (not . isPrefixOf "module Test.Support") (lines source))))
+          exportList facility `shouldSatisfy` isInfixOf "withScopedChild"
+          forM_ [facility, host] $ \source →
+            forM_ ["childProcess", "ProcessHandle", "leaderHandle", "Leader (..)"] $ \name →
+              exportList source `shouldSatisfy` (not . isInfixOf name)
 
     it "negative control: reaping before the signal is delivered is rejected, and the facility then sends the group nothing" $
       withTemp $ \directory → do
@@ -804,6 +810,29 @@ spec = describe "the shared subprocess facility (Test.Support.Subprocess)" $ do
       viaReap (exitingWith 256) >>= (`shouldBe` ExitSuccess)
       viaWait signalled >>= (`shouldBe` Just (ExitFailure (negate 15)))
       viaReap signalled >>= (`shouldBe` ExitFailure (negate 15))
+
+    it "knows a reap that completed but raised: the retried release signals nothing more and every later answer is the reap's status" $ do
+      -- The seam reaps with the facility's own wait and then raises, as the library's wait does for a delegated interrupt after it has
+      -- reaped: the cancellation is remembered, the release run again, and the cancellation raised after it.
+      seen ← newIORef Nothing
+      sent ← newIORef []
+      let seams =
+            (recording seen sent)
+              { seamWait = \leader bound → seamWait noSeams leader bound >>= \_ → throwIO UserInterrupt
+              }
+      kept ← newIORef Nothing
+      outcome ←
+        try @AsyncException $
+          withScopedChildUsing quick seams (childSpec hangCatcher (shell "exit 0" [])) $ \child → do
+            writeIORef kept (Just child)
+            waitChild child (30 * 1000000) >>= (`shouldBe` Just ExitSuccess)
+      outcome `shouldBe` Left UserInterrupt
+      -- Only the one group signal of the first attempt, sent while the leader was held; the retry sent none.
+      readIORef sent >>= (`shouldBe` [(ToGroup, sigKILL, ExitedUnreaped)])
+      child ← maybe (expectationFailure "the body never ran" >> ioError (userError "unreachable")) pure =<< readIORef kept
+      childState child >>= (`shouldBe` Reaped)
+      awaitExit child >>= (`shouldBe` ExitSuccess)
+      signalChild child sigTERM
 
     it "reaps the leader only in the release, however the body waited for it" $ do
       seen ← newIORef Nothing
