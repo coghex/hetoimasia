@@ -8,11 +8,11 @@
 --
 -- __Issuers.__ An issuer (a subsystem that owns state and exports ownership operations over it) keeps its own 'STM' and
 -- its existing state, and embeds a concrete operation through
--- 'Hetoimasia.Foundation.OwnerTx.Issuer.fromIssuerSTM', in the @owner-tx-issuer@ sublibrary of this package. Only the
--- components @tools/validation/owner-tx-issuers.fields@ lists may depend on that sublibrary; the repository's dependency
--- guard (@tools/owner-tx-guard@) refuses any other dependent and any Cabal re-export or mixin of the bridge or the
--- representation, and issuer review checks what a listed component's modules import and export. Every embedded path
--- must:
+-- 'Hetoimasia.Foundation.OwnerTx.Issuer.fromIssuerSTM', in the @owner-tx-issuer@ sublibrary of this package. The
+-- sublibrary, the bridge and the representation may be named in a package description or project file only inside a
+-- stanza @tools/validation/owner-tx-issuers.fields@ lists, which the repository's textual guard
+-- (@tools/owner-tx-guard@) enforces; issuer review checks what a listed stanza's component imports and exports. Every
+-- embedded path must:
 --
 -- * read only issuer-controlled inputs (its own cells and those it was handed by value or by an opaque handle it
 --   issued), never a caller's transaction, callback or reader;

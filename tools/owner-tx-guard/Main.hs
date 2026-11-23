@@ -1,23 +1,20 @@
 {-# LANGUAGE NoOverloadedStrings #-}
 
--- | The dependency guard of the ownership transactions' issuer bridge (#721; the design's "Cabal issuer dependency
--- guard").
+-- | The issuer guard of the ownership transactions (#721; the design's "Approved amendment · Textual issuer guard").
 --
--- Cabal supplies the components, their configurations, dependencies, re-exports, mixins and declared modules
--- ("Inventory"); the guard compares those facts with the exact component allowlist
--- @tools/validation/owner-tx-issuers.fields@ ("Policy"). It reads no Haskell source and needs no compiler or store.
+-- It scans every @.cabal@ and @cabal.project*@ file in the repository for the protected texts ("Scan") and requires
+-- each to lie in a stanza @tools/validation/owner-tx-issuers.fields@ lists ("Policy"). It evaluates no Cabal semantics
+-- and needs no compiler or store.
 --
--- @owner-tx-guard check [--root DIR]@ fails (exit 1) on any problem and refuses (exit 2) what it cannot read.
--- @owner-tx-guard scope [--root DIR]@ prints every project file and package description the check reads, one
--- @kind path@ per line.
+-- @owner-tx-guard check [--root DIR]@ fails (exit 1) on any problem and refuses (exit 2) an allowlist it cannot read.
+-- @owner-tx-guard scope [--root DIR]@ prints every file the check reads, one @file path@ per line.
 module Main (main) where
 
-import Control.Monad (forM_, unless)
+import Control.Monad (forM, forM_, unless)
 import qualified Data.ByteString as ByteString
-import Data.List (nub, sort)
 import GHC.IO.Encoding (setFileSystemEncoding, setForeignEncoding, setLocaleEncoding)
-import Inventory (Inventory (..), Package (..), readInventory)
 import Policy (Allowlist, check, readAllowlist)
+import Scan (scanFile, scannedFiles)
 import System.Directory (doesFileExist, makeAbsolute)
 import System.Environment (getArgs)
 import System.Exit (ExitCode (..), exitWith)
@@ -42,25 +39,16 @@ main = do
 run ∷ String → FilePath → IO ()
 run command given = do
   root ← makeAbsolute given
-  let projects = ["cabal.project", "cabal.project.vulkan"]
-  forM_ projects $ \project → do
-    present ← doesFileExist (root </> project)
-    unless present (refuse (project <> " does not exist: the guard reads both project files"))
-  inventory ← readInventory root projects >>= either refuse pure
+  files ← scannedFiles root
   case command of
-    "scope" → mapM_ putStrLn (scope inventory)
+    "scope" → mapM_ (putStrLn . ("file " <>)) (files <> [allowlistPath])
     "check" → do
       allowlist ← readAllowlistAt root
-      let problems = check allowlist inventory
+      scanned ← forM files $ \path → (,) path . scanFile <$> ByteString.readFile (root </> path)
+      let problems = check allowlist scanned
       forM_ problems (hPutStrLn stderr . ("owner_tx_guard: " <>))
       exitWith (if null problems then ExitSuccess else ExitFailure 1)
     _ → refuse ("unknown command " <> command)
-
-scope ∷ Inventory → [String]
-scope inventory =
-  sort . nub $
-    ["project " <> file | file ← inventoryFiles inventory]
-      <> ["description " <> packageCabal package | package ← inventoryPackages inventory]
 
 readAllowlistAt ∷ FilePath → IO Allowlist
 readAllowlistAt root = do

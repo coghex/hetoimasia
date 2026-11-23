@@ -977,7 +977,7 @@
     },
     {
       "id": "test.owner-tx-guard",
-      "description": "Run the dependency guard of the ownership transactions' issuer bridge (#721), tools/owner-tx-guard, against the repository itself. Cabal's own parser supplies every component of every local package cabal.project and cabal.project.vulkan list (following project imports; libraries, sublibraries, foreign libraries, executables, tests and benchmarks; common stanzas expanded) in every configuration on Linux and Darwin, x86_64 and aarch64, under every manual flag, with each dependency's library read apart from its version range. It fails a component whose build-depends selects hetoimasia-foundation:owner-tx-issuer without being listed in tools/validation/owner-tx-issuers.fields, a stale entry, a Cabal reexported-modules or mixins entry exposing or renaming Hetoimasia.Foundation.OwnerTx.Issuer or Hetoimasia.Foundation.OwnerTx.Representation, a protected module declared outside its defining component or in a public representation library, and an unresolved library selector; it refuses optional, remote or globbed package selection, conditions outside the supported targets and manual flags, signatures and options that change which packages are visible, and fails closed on a manifest Cabal refuses or an unreadable allowlist. What a listed component's modules import, export and instantiate is checked by issuer review.",
+      "description": "Run the issuer guard of the ownership transactions (#721), tools/owner-tx-guard, against the repository itself. It scans every .cabal and cabal.project* file at any depth, split into stanzas by Cabal-syntax's readFields alone, for owner-tx-issuer, Hetoimasia.Foundation.OwnerTx.Issuer and Hetoimasia.Foundation.OwnerTx.Representation (ASCII case-insensitive, word boundaries, comments aside, every branch as written) and fails a match outside a stanza tools/validation/owner-tx-issuers.fields lists, a top-level match, a file Cabal's lexer cannot split, and a stale, duplicate, malformed or ambiguous entry. What a listed stanza's component imports, exports and instantiates is checked by issuer review.",
       "command": [
         "cabal",
         "run",
@@ -999,6 +999,7 @@
         "cabal.project",
         "cabal.project.vulkan",
         "cabal.project.common",
+        "cabal.project.cpu",
         "hetoimasia.cabal",
         "app/",
         "app-cpu/",
@@ -1017,7 +1018,10 @@
         "tools/test-support/",
         "packages/",
         "samples/",
-        "tools/owner-tx-guard/"
+        "docs/toolchain/binding-bundle-darwin/",
+        "docs/toolchain/binding-bundle-linux/",
+        "tools/owner-tx-guard/",
+        "tools/validation/owner-tx-issuers.fields"
       ],
       "framework": "none",
       "runner": "cpu",
