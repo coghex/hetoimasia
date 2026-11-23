@@ -25,15 +25,16 @@
 -- == Banks, slots and who is charged
 --
 -- Three byte banks and three counted slots are service-wide, never multiplied
--- per arena. Every cost category belongs to exactly one:
+-- per arena, and configurable through 'mkLimits' ('defaultLimits' gives the
+-- sizes below). Every cost category belongs to exactly one:
 --
--- * 'ResidentBank' (64 MiB): region metadata (256 bytes for each resident
+-- * 'ResidentBank' (256 MiB): region metadata (256 bytes for each resident
 --   region, however little of it is known), segment metadata (32 bytes each),
 --   sparse column indexes (48 bytes each) and packed payload.
--- * 'EditBank' (32 MiB): retained session edits (16 bytes for each removed
+-- * 'EditBank' (64 MiB): retained session edits (16 bytes for each removed
 --   interval and 48 for each column index entry, as "Hetoimasia.Terrain.Changes"
 --   accounts them), reserved before a removal and kept for the arena's life.
--- * 'StagingBank' (64 MiB): load scratch, interest and hold records, accepted
+-- * 'StagingBank' (128 MiB): load scratch, interest and hold records, accepted
 --   command records, the pending latest-value camera description of each view,
 --   removal staging and the temporary duplicate of a handoff.
 -- * 'LoadJobSlot' (128), 'CommandSlot' (256 accepted, unsettled commands) and
@@ -53,10 +54,16 @@
 -- afterwards, and a unit that is not admitted holds nothing. A job funded by
 -- committed victims waits only for those victims' 'VictimReleased' events
 -- ('JobWaiting'), then becomes queued. A victim cannot regain an interest.
+-- Admission reserves the byte credits a job needs but takes no load-job slot: a
+-- queued job waits for dispatch capacity, and a 'LoadJobSlot' is held from
+-- 'Dispatch' until the owner reports the job's completion ('JobCompleted'),
+-- failure ('JobFailed') or cancellation acknowledgement ('JobAcknowledged'). A
+-- full set of slots is not a refusal: 'Dispatch' answers 'NothingToDispatch' and
+-- the job stays queued.
 -- Checks run in a fixed order and the first failure is reported: permanently
 -- invalid ('Invalid', decided from the request alone: a malformed demand, more
 -- regions than the cap, a cell outside the configured extent), then exhausted
--- retained edits, then busy for the command slot, the job slot, the staging bank,
+-- retained edits, then busy for the command slot, the staging bank,
 -- the edit bank and last the resident bank with its eviction set.
 --
 -- Capacity is guaranteed by configuration, not decided per request: 'mkLimits'
@@ -89,9 +96,14 @@
 --
 -- == Eviction, holds and handoffs
 --
--- A resident region is a victim candidate only when it has no interest, no
--- hold (borrower or publication pin), no job, no pending changes and no
--- handoff in flight. A copied borrow ('Copied': data copied out of the store)
+-- A resident region is a victim candidate only when it has no hold (borrower
+-- or publication pin), no job, no pending changes, no handoff in flight, no
+-- eviction already committed and no interest that the request may not displace.
+-- An explicit request may take a region that only camera views have an interest
+-- in (camera work is best effort and yields; the view's interest is dropped and
+-- the region is pending again); an owner-requested interest protects the region
+-- from every request, and camera work never takes a region anyone has an
+-- interest in. A copied borrow ('Copied': data copied out of the store)
 -- needs no region resident, protects none and never touches recency; it keeps
 -- its arena retiring until released, like any hold. Candidates are taken in least-recently-used order of the
 -- logical clock, ties by arena and region. Retained edits are never a victim.
