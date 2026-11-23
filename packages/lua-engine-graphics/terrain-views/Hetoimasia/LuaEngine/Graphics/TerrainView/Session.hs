@@ -322,7 +322,7 @@ flightSettled = viewRequestSettled . flightRequest
 
 -- What the watcher compares of a view: its arena mark, the authority epoch, its target's usability and geometry, its
 -- original authority and each authority's revision, and its request in flight with whether it has settled.
-type Marks = (Maybe ArenaMark, Word64, Bool, ViewGeometry, Bool, [AuthorityMark], Maybe (ViewRequest, Bool))
+type Marks = (Maybe ArenaMark, Word64, Bool, Maybe SurfaceVersion, Bool, [AuthorityMark], Maybe (ViewRequest, Bool))
 
 -- The revisions of a view's original authority: the window's leases and the style's.
 authorityRevisions ∷ ViewState k → STM [AuthorityMark]
@@ -793,14 +793,15 @@ viewMarks service = do
     actionable ← if armed then buildActionable service vs else pure False
     mark ← vsMarkCell vs
     usable ← surfaceUsable (vtSurface (vsTarget vs))
-    geometry ← surfaceGeometry (vtSurface (vsTarget vs))
+    -- the target's facts as its writer stamps them (a window's geometry revision), never a recomputed geometry
+    facts ← Just <$> surfaceVersion (vtSurface (vsTarget vs))
     authority ← authorityOf vs
     revisions ← authorityRevisions vs
     -- the view's request in flight and whether it has settled: its settlement asks for the owner's step, once for each
     -- request, whether it settled before the watcher first saw it or after
     flight ← flightMark vs
     seen ← readTVar (vsSeen vs)
-    pure (vs, actionable, (mark, epoch, usable, geometry, authority, revisions, flight), seen)
+    pure (vs, actionable, (mark, epoch, usable, facts, authority, revisions, flight), seen)
 
 -- | Whether a view's marks moved or its armed candidate can go on: the watcher's wait, read-only.
 marksDue ∷ Ord k ⇒ TerrainViews k → STM Bool
@@ -1203,7 +1204,7 @@ newViewState ∷ TerrainViews k → OpenRequest k → ViewStyle → Runtime.View
 newViewState service request style rview markCell camera = do
   incarnation ← newClaimHolder (portClaims (svPorts service))
   ViewState incarnation (openTarget request) (openLease request) rview style markCell
-    <$> newTVar (Nothing, 0, True, GeometryUnknown, True, [], Nothing)
+    <$> newTVar (Nothing, 0, True, Nothing, True, [], Nothing)
     <*> newTVar ViewOpen
     <*> newTVar camera
     <*> newTVar (openLight request)

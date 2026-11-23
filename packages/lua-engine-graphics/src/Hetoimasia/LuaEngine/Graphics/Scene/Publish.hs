@@ -75,7 +75,6 @@ module Hetoimasia.LuaEngine.Graphics.Scene.Publish
   , offscreenTargetAnswer
 
   , publisherGatedBy
-  , publisherClaimedBy
 
     -- * Publishing
   , PublishResult (..)
