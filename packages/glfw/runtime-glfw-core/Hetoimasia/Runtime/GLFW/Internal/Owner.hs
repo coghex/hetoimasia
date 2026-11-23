@@ -130,6 +130,7 @@ module Hetoimasia.Runtime.GLFW.Internal.Owner
   , awaitOwnerRound
   , readOwnerDemandTaken
   , publishGraphicsWindowScene
+  , publishGraphicsWindowSceneTx
   , readGraphicsSceneRevisions
   , wakeGraphicsHost
 

@@ -21,6 +21,7 @@ module Hetoimasia.Runtime.GLFW.Internal.Owner.Observation
   , awaitOwnerRound
   , readOwnerDemandTaken
   , publishGraphicsWindowScene
+  , publishGraphicsWindowSceneTx
   , readGraphicsSceneRevisions
   , pruneWindowScenes
   ) where
@@ -30,6 +31,8 @@ import Control.Exception (ExceptionWithContext, SomeException)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Hetoimasia.Foundation.Messaging.Payload (Prepared)
+import Hetoimasia.Foundation.OwnerTx (OwnerTx)
+import Hetoimasia.Foundation.OwnerTx.Issuer (fromIssuerSTM)
 import Hetoimasia.Foundation.Worker (Worker)
 import Hetoimasia.GLFW.Internal.Attachment (Acknowledgement, AttachmentId)
 import Hetoimasia.GLFW.Window (WindowId)
@@ -161,6 +164,12 @@ publishGraphicsWindowScene ∷ GraphicsOwner scene → WindowId → Prepared sce
 publishGraphicsWindowScene owner window scene = do
   held ← ownerWindows owner
   publishOwnerWindowScene (ownerHandoff' owner) held window scene
+
+-- | 'publishGraphicsWindowScene' as an ownership operation, for a holder composing the publication with its own facts in
+-- one 'Hetoimasia.Foundation.OwnerTx.commit': it reads only the handoff's own cells and the prepared scene given,
+-- answers a refusal as data and never waits or raises.
+publishGraphicsWindowSceneTx ∷ GraphicsOwner scene → WindowId → Prepared scene → OwnerTx WindowScenePublication
+publishGraphicsWindowSceneTx owner window scene = fromIssuerSTM (publishGraphicsWindowScene owner window scene)
 
 -- | The latest published scene revision of every window the host holds, in one
 -- transaction: a window's own, or zero for one that has had no publication.

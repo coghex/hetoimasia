@@ -71,6 +71,7 @@ import Data.Word (Word64)
 import Numeric.Natural (Natural)
 import Hetoimasia.Foundation.Messaging.Payload (Prepared, preparedValue)
 import Hetoimasia.Foundation.Messaging.Snapshot (SnapshotCursor, observedCursor, observedValue, readSnapshot)
+import Hetoimasia.Foundation.OwnerTx (OwnerTx)
 import Hetoimasia.GLFW.Command
   ( CommandRejection (..)
   , CommandResult (..)
@@ -135,6 +136,7 @@ import Hetoimasia.Runtime.GLFW
   , hostCommandPort
   , hostCommandStatistics
   , publishGraphicsWindowScene
+  , publishGraphicsWindowSceneTx
   , readGraphicsService
   , readOwnerFailure
   , readTargetStanding
@@ -162,14 +164,15 @@ data WindowTarget scene = WindowTarget
   }
 
 -- | A window incarnation's facts and publication as its host issues them: whether it is usable, its geometry with the
--- version of the observation it came from, and its publication. Only the host makes one, so a consumer that reads it
--- inside a commit runs the host's own transactions and no caller's.
+-- version of the observation it came from, and its publication, the handoff's own ownership operation. Only the host
+-- makes one, so a consumer that reads it or composes its publication inside a commit runs the host's own transactions
+-- and no caller's.
 data WindowView scene = WindowView
   { wvWindow ∷ !WindowId
   , wvAttachment ∷ !AttachmentId
   , wvUsable ∷ STM Bool
   , wvGeometry ∷ STM (WindowGeometry, WindowVersion)
-  , wvPublish ∷ Prepared scene → STM WindowScenePublication
+  , wvPublish ∷ Prepared scene → OwnerTx WindowScenePublication
   }
 
 -- | The version of the window observation a geometry was read from: its writer advances it with every observation.
@@ -190,8 +193,8 @@ windowViewUsable = wvUsable
 windowViewGeometry ∷ WindowView scene → STM (WindowGeometry, WindowVersion)
 windowViewGeometry = wvGeometry
 
--- | Publish an owned scene to this window alone, as a transaction that never waits.
-windowViewPublish ∷ WindowView scene → Prepared scene → STM WindowScenePublication
+-- | Publish an owned scene to this window alone, as the handoff's ownership operation: it never waits.
+windowViewPublish ∷ WindowView scene → Prepared scene → OwnerTx WindowScenePublication
 windowViewPublish = wvPublish
 
 -- | A window's geometry as an observation gives it: zero when its logical or framebuffer extent is observed with a
@@ -432,6 +435,7 @@ target vulkan var token = do
       let usable = (== StandingUsable) <$> standing vulkan var token
           geometry = (\observed → (observedGeometry (preparedValue (observedValue observed)), WindowVersion (observedCursor observed))) <$> readSnapshot (clientObservations (madeClient made))
           publish = publishGraphicsWindowScene (vulkanGraphicsOwner vulkan) (madeWindow made)
+          publishTx = publishGraphicsWindowSceneTx (vulkanGraphicsOwner vulkan) (madeWindow made)
       pure $ case current of
         StandingUsable →
           Just
@@ -442,7 +446,7 @@ target vulkan var token = do
               , targetPublishSTM = publish
               , targetUsable = usable
               , targetGeometry = fst <$> geometry
-              , targetView = WindowView (madeWindow made) (graphicsAttachment service) usable geometry publish
+              , targetView = WindowView (madeWindow made) (graphicsAttachment service) usable geometry publishTx
               }
         _ → Nothing
     _ → pure Nothing
