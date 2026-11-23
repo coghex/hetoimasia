@@ -613,6 +613,9 @@ data Point
     PointSlotStepped !ArenaId !Text
   | -- | The slot was granted to discovery of the arena (reported after its 'PointGranted').
     PointDiscoveryGranted !ArenaId
+  | -- | The parent session's admission has closed, or a stop was asked: the owner is about to close the session,
+    -- before any of its state changes.
+    PointClosingSession
   | -- | A discovery transaction of the arena published.
     PointDiscoveryCommitted !ArenaId
   | -- | A request's pinned read delivered this many removed runs (what it kept of its columns).

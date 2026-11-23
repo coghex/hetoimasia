@@ -581,7 +581,7 @@ pickRequestWork svc st adm open holdReads = do
 perform ∷ Service → Work → IO Step
 perform svc = \case
   WStop → pure (Step False True)
-  WCloseSession → atomically (closeServiceSTM svc) >> done
+  WCloseSession → probe svc PointClosingSession >> atomically (closeServiceSTM svc) >> done
   WVictim key → releaseVictim svc key >> done
   WAck jid → do
     acknowledged <- atomically $ applyEvent svc (R.JobAcknowledged jid) >>= \case

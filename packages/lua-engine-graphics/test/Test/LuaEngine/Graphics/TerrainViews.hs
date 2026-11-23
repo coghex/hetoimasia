@@ -11,6 +11,7 @@
 module Test.LuaEngine.Graphics.TerrainViews (spec) where
 
 import Control.Concurrent (forkIO)
+import Control.Concurrent.MVar (newEmptyMVar, readMVar, takeMVar, tryPutMVar)
 import Control.Concurrent.STM
 import Control.Monad (forM, forM_, unless, void, when)
 import qualified Data.ByteString.Char8 as BC
@@ -186,10 +187,14 @@ data Options = Options
   , optCamera ∷ CameraConfig → CameraConfig
   , optNative ∷ Bool
     -- ^ Whether the hands are the renderer's registry over the native stand-in's uploads, rather than the fake's.
+  , optSession ∷ SessionAdmission
+    -- ^ The parent session's admission the terrain service checks in its commits.
+  , optProbe ∷ Probe
+    -- ^ The terrain service's probe.
   }
 
 defaultOptions ∷ Options
-defaultOptions = Options TeardownFull smallProfile 196608 id id id False
+defaultOptions = Options TeardownFull smallProfile 196608 id id id False alwaysAdmitting noProbe
 
 -- A small profile: enough for the examples' views, small enough that its caps are reachable.
 smallProfile ∷ ViewProfile
@@ -227,7 +232,7 @@ withRig options body =
     -- routine example need not wait for the loads of a whole camera's demand.
     let config = optRuntime options defaultConfig {configStore = defaultStoreSpec {specAllowanceBytes = toInteger minAllowanceBytes}, configLimits = cameraLimits}
     withWorkerGroup $ \group →
-      withTerrainService config (Ports alwaysAdmitting (standaloneSupervisor group) quiet noProbe (storagePort group storage directory)) $ \terrain → do
+      withTerrainService config (Ports (optSession options) (standaloneSupervisor group) quiet (optProbe options) (storagePort group storage directory)) $ \terrain → do
         client ← registerClient terrain >>= either (fail . show) pure
         lease ← openArena terrain client "main" source >>= either (fail . show) pure >>= await terrain >>= either (fail . show) pure
         queue ← newTVarIO Seq.empty
@@ -587,6 +592,23 @@ runOwner rig = go (100000 ∷ Int)
       readTVar (rigFault rig) >>= \case
         Just (held, _, True) → setHeldFault held Nothing >> writeTVar (rigFault rig) Nothing
         _ → pure ()
+
+-- Run the owner one queued step at a time, waiting for the next when none is queued, until the condition holds.
+stepUntil ∷ Rig → STM Bool → IO ()
+stepUntil rig done =
+  timeout 8000000 loop >>= maybe (expectationFailure "the owner's steps never reached the condition") pure
+  where
+    loop =
+      atomically done >>= \case
+        True → pure ()
+        False → do
+          (step, outcome) ← atomically $
+            Seq.viewl <$> readTVar (rigQueue rig) >>= \case
+              Seq.EmptyL → retry
+              next Seq.:< rest → next <$ writeTVar (rigQueue rig) rest
+          step (stepHands rig)
+          atomically (writeTVar outcome (Just StepRan))
+          loop
 
 -- Claim a receipt the fake renderer holds, once: its outcome, if sealed; the registry forgets it.
 claimRigReceipt ∷ Rig → Word64 → STM (Maybe (Either BuildFailure ChunkRef))
@@ -2106,6 +2128,72 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         atomically (occupiedOn 1) `shouldReturn` 1
         serviceFailures <$> atomically reading `shouldReturn` failures
         readTVarIO (rigGrants rig) `shouldReturn` 0
+
+  describe "the parent session's admission" $ do
+    it "keeps the drawn revision, its demand and receipt when the parent's admission closes before a successor's demand replacement, and refuses the demand's withdrawal and an attachment by the same token" $ do
+      admission ← newAdmissionIO
+      -- the terrain service's owner is held where it would close the session, once it has seen the closure: the views
+      -- meet the closed admission alone, before the service ends anything
+      closing ← newEmptyMVar
+      release ← newEmptyMVar
+      let held = \case
+            PointClosingSession → void (tryPutMVar closing ()) >> readMVar release
+            _ → pure ()
+      withPublished defaultOptions {optSession = AdmittedWhile (admissionToken admission), optProbe = Probe held} $ \rig target view →
+        (`finally` tryPutMVar release ()) $ do
+          quiesce rig target
+          before ← atomically (readView view)
+          shown ← atomically (map fst <$> heldScenes (targetHeld target))
+          -- a move far away, whose successor installs another demand: the owner steps until its copies and its plan
+          -- are done and it is building (its parts the drawn revision's, reused), and the parent closes then
+          Right move ← commit (moveView view far)
+          stepUntil rig (("building" `Text.isPrefixOf`) . readingStage <$> readView view)
+          atomically (closeAdmission admission)
+          takeMVar closing
+          settleUntil rig (isJust . readingRefusal <$> readView view)
+          atomically (moveSettled move) `shouldReturn` Just MoveLanded
+          after ← atomically (readView view)
+          -- the closure came first: the successor's demand was refused, so neither it nor its scene was published
+          readingStatus after `shouldBe` ViewOpen
+          (readingPublished after, readingDemand after, readingReceipt after, readingInstalls after)
+            `shouldBe` (readingPublished before, readingDemand before, readingReceipt before, readingInstalls before)
+          readingRefusal after `shouldSatisfy` \case
+            Just (LimitRuntime why) → "RefusedClosed" `Text.isInfixOf` why
+            _ → False
+          atomically (map fst <$> heldScenes (targetHeld target)) `shouldReturn` shown
+          -- the same token refuses the demand's withdrawal once the target cannot be drawn: the installed list and its
+          -- receipt stay
+          refusals ← atomically (readingRefusals <$> readView view)
+          heldMetrics (targetHeld target) (Just (metricsOf 0 0))
+          settleUntil rig ((> refusals) . readingRefusals <$> readView view)
+          withdrawn ← atomically (readView view)
+          (readingDemand withdrawn, readingReceipt withdrawn, readingInstalls withdrawn) `shouldBe` (readingDemand before, readingReceipt before, readingInstalls before)
+          -- and an attachment
+          other ← newTarget 2
+          style ← styleOf rig
+          openView (rigViews rig) (OpenRequest (viewTarget other) (rigLease rig) (pure (Right style)) (axis 0, axis 0, axis 1) defaultLightSettings) >>= \case
+            Left (OpenArena RefusedClosed) → pure ()
+            Left why → expectationFailure ("the attachment was refused otherwise: " <> show why)
+            Right _ → expectationFailure "the attachment was admitted after the parent closed"
+
+    it "commits a successor's demand and its scene together when its publication comes before the parent's closure, and the closure changes neither" $ do
+      admission ← newAdmissionIO
+      withPublished defaultOptions {optSession = AdmittedWhile (admissionToken admission)} $ \rig target view → do
+        quiesce rig target
+        before ← atomically (readView view)
+        shown ← atomically (length <$> heldScenes (targetHeld target))
+        Right move ← commit (moveView view far)
+        settleUntil rig (publishedAtLeast view (fromIntegral (maybe 0 (+ 1) (readingPublished before))))
+        atomically (moveSettled move) `shouldReturn` Just MoveLanded
+        landed ← atomically (readView view)
+        readingDemand landed `shouldNotBe` readingDemand before
+        readingInstalls landed `shouldBe` readingInstalls before + 1
+        atomically (length <$> heldScenes (targetHeld target)) `shouldReturn` shown + 1
+        atomically (closeAdmission admission)
+        runOwner rig
+        closed ← atomically (readView view)
+        (readingPublished closed, readingDemand closed, readingReceipt closed, readingInstalls closed)
+          `shouldBe` (readingPublished landed, readingDemand landed, readingReceipt landed, readingInstalls landed)
 
   describe "the settlement hand-off" $ do
     it "leaves a refused build whose revalidation raises or waits to the sweep, which returns its slot once and keeps the refusal's cause and the revalidation's; a raise reaches the owner's action as the original exception, the owner goes on, and the view publishes" $
