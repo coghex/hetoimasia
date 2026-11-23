@@ -204,6 +204,15 @@ spec = describe "Terminal failure" $ do
       atomically (failRootsSessionBecause (rigRoots rig') CleanupFailed "a later cleanup failed")
       atomically (rootsFailedCause (rigRoots rig')) `shouldReturn` fixed
 
+    it "publishes once when a failure through the model alone is ordered behind a validation error that came first" $ do
+      rig ← newRig
+      atomically (watchRootsDiagnosticsOrdered (rigRoots rig) (DiagnosticWatch (pure []) (pure ValidationFirst)))
+      (revision, _) ← atomically (watchPublication (rootsFailure (rigRoots rig)))
+      inModel rig (Admitted . noteDeviceLoss)
+      atomically (watchPublication (rootsFailure (rigRoots rig))) `shouldReturn` (revision + 1, True)
+      primaryIs rig (== TerminalValidationError)
+      clean rig
+
     it "keeps a failure through the model alone write-once: a later latch only adds evidence" $ do
       let detailed = TerminalDeviceLost (GraphicsDeviceLost "vkQueueSubmit2" "the queue reported the device lost")
       rig' ← newRig
