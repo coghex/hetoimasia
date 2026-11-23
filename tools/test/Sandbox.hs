@@ -40,9 +40,19 @@ sanitizedEnvironment = do
 
 -- | Run a command to completion through the shared subprocess facility, which owns the child: it is ended, and reaped, however the
 -- call ends. The run bound is the 30-minute budget of the group that runs these examples, a hang-catcher and not a timing assumption.
+--
+-- Every child gets exactly one @PYTHONDONTWRITEBYTECODE=1@ binding, replacing any the caller passed and leaving the rest of its
+-- environment alone. The examples run Python against the real checkout, importing modules from @tools/validation@ and
+-- @tools/native@; without the setting each of those imports leaves a @__pycache__@ there. The validation runner refuses a checkout
+-- that has gained a file under a policy root or a classified input, so a group that ran after this suite on the same worker would
+-- be refused. Setting it here, in the one helper every Python spawn goes through, covers them all, whatever environment the caller built.
 run ∷ [(String, String)] → FilePath → String → [String] → IO (ExitCode, String, String)
 run environment path executable args =
-  runCaptured (Within (1800 * 1000000)) (proc executable args) {cwd = Just path, env = Just environment} ""
+  runCaptured (Within (1800 * 1000000)) (proc executable args) {cwd = Just path, env = Just (noBytecode environment)} ""
+
+-- | The environment with a single @PYTHONDONTWRITEBYTECODE=1@ in place of any the caller had.
+noBytecode ∷ [(String, String)] → [(String, String)]
+noBytecode environment = ("PYTHONDONTWRITEBYTECODE", "1") : filter ((/= "PYTHONDONTWRITEBYTECODE") . fst) environment
 
 -- | Run Git, failing the example with its diagnostics when it does not succeed.
 git ∷ [(String, String)] → FilePath → [String] → IO String
