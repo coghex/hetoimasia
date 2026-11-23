@@ -85,7 +85,8 @@ does.
   another stream), `Inherited`, or a `CallerHandle` the caller opened (closed by
   the facility only when the start fails or the call is cancelled before the body
   is entered); the body learns the identifier, sends a signal, waits within a
-  bound of its own, and can look at a child that has exited without reaping it
+  bound of its own (`waitChild`, `awaitExit`: both answer the status and neither
+  reaps), and can look at a child that has exited without reaping it
   (`childState`, `awaitUnreapedExit`), so a zombie can be observed and the release
   reaps it. Spawning, creating the pipes, starting the readers and registering the
   release are one masked step; the body runs with the caller's interruptibility
@@ -102,9 +103,14 @@ does.
   process group of its own (never a session of its own) and the whole group is
   ended: SIGTERM, 2 s of grace, SIGKILL, so a descendant in the group goes with
   its leader, and a leader that exits does not spare one that ignores SIGTERM.
-  The group is signalled only while its identifier is still reserved (the leader
-  unreaped, or a null signal found a member), never once the leader is reaped and
-  none remains. A child can stay in the caller's group, signalled by identifier
+  A group's identifier stays owned because its leader is reaped last: every
+  signal to the group is sent while the leader is unreaped, a zombie once it has
+  exited, which keeps the identifier from being given to another group; no wait
+  the facility offers reaps it. A probe of the process table, which does not
+  count the held leader, only decides whether any member is left to send to. A
+  leader reaped before the release (through `childProcess`) held nothing: the
+  group is sent nothing and a member found there fails the call as unconfirmed.
+  A child can stay in the caller's group, signalled by identifier
   only, in exactly two cases that the caller names (`CallersGroup`): a child that
   inherits the terminal for a person at the keyboard, and the nested private
   compositors, which stay in their owning test process's group so the outer
