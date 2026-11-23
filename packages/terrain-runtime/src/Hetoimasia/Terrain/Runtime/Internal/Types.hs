@@ -46,6 +46,7 @@ module Hetoimasia.Terrain.Runtime.Internal.Types
   , Config (..)
   , ConfigError (..)
   , SessionAdmission (..)
+  , sessionOpen
   , Supervisor (..)
   , OwnerControl (..)
   , Probe (ProbeWith, Probe, probePoint, probeInterning, probeAnswer)
@@ -159,6 +160,7 @@ import Data.Text (Text)
 import Data.Unique (Unique)
 import Data.Int (Int64)
 import Data.Word (Word64)
+import Hetoimasia.Foundation.Admission (AdmissionToken, tokenOpen)
 import Hetoimasia.Foundation.Log (Logger)
 import Hetoimasia.Foundation.Worker (WorkerDefinition)
 import Hetoimasia.Terrain.Cell
@@ -518,10 +520,17 @@ data ConfigError
 
 instance Exception ConfigError
 
--- | The parent session's admission, readable inside the arbitration.
-newtype SessionAdmission = SessionAdmission
-  { sessionOpen ∷ STM Bool
-  }
+-- | The parent session's admission: always open, or open while the parent's read-only token is. The service reads the
+-- token itself, inside its own arbitration; no transaction a caller supplies ever runs there.
+data SessionAdmission
+  = AlwaysAdmitting
+  | AdmittedWhile !AdmissionToken
+
+-- | Whether the parent session is open, read inside the service's own transaction.
+sessionOpen ∷ SessionAdmission → STM Bool
+sessionOpen admission = case admission of
+  AlwaysAdmitting → pure True
+  AdmittedWhile token → tokenOpen token
 
 -- | The supervision capability: how the service starts its owner, and the
 -- control it gets back. The owner thread never holds either, and in particular

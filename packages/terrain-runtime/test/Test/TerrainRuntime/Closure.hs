@@ -2,6 +2,7 @@
 -- session's admission, each against the requests that are still waiting.
 module Test.TerrainRuntime.Closure (spec) where
 
+import Hetoimasia.Foundation.Admission (admissionToken, closeAdmission, newAdmissionIO)
 import Control.Concurrent.STM
 import Control.Monad (forM, forM_)
 import Data.Text (pack)
@@ -233,8 +234,8 @@ spec = describe "Closure and authority" $ do
 
   describe "the parent session's admission" $ do
     it "dominates every gate: new work is refused and a staged edit does not commit" $ do
-      open <- newTVarIO True
-      withServiceUsing defaultConfig (SessionAdmission (readTVar open)) noProbe $ \svc → do
+      admission <- newAdmissionIO
+      withServiceUsing defaultConfig (AdmittedWhile (admissionToken admission)) noProbe $ \svc → do
         (_, lease) <- openMain svc "main"
         client2 <- okOf (registerClient svc)
         -- A waiting acquisition, a staged edit and a waiting load.
@@ -244,7 +245,7 @@ spec = describe "Closure and authority" $ do
         let (x, y, z) = victim
         _ <- okOf (removeWith svc (hostEndpoint svc (Just lease) editing) lease (tile x y z) Nothing)
         waitFor (readTVar (hostReady editing) >>= \n → if n == 0 then retry else pure ())
-        atomically (writeTVar open False)
+        atomically (closeAdmission admission)
         awaitClosed svc
         grant editing
         grant acquisition
@@ -260,9 +261,9 @@ spec = describe "Closure and authority" $ do
         inspectInvariants svc >>= (`shouldBe` [])
 
     it "is read inside the commit arbitration" $ do
-      open <- newTVarIO True
+      admission <- newAdmissionIO
       gate <- newDisarmedGate
-      withGatedService defaultConfig (SessionAdmission (readTVar open)) (\p → case p of PointBeforeCommit _ → True; _ → False) gate $ \svc → do
+      withGatedService defaultConfig (AdmittedWhile (admissionToken admission)) (\p → case p of PointBeforeCommit _ → True; _ → False) gate $ \svc → do
         (_, lease) <- openMain svc "main"
         host <- newHost True
         let (x, y, z) = victim
@@ -270,7 +271,7 @@ spec = describe "Closure and authority" $ do
         _ <- okOf (removeWith svc (hostEndpoint svc Nothing host) lease (tile x y z) Nothing)
         awaitReached gate
         -- The owner is at the boundary with the edit ready; the session ends first.
-        atomically (writeTVar open False)
+        atomically (closeAdmission admission)
         openGate gate
         awaitClosed svc
         settledOf host `shouldReturn` [Failed ArenaClosed]
@@ -279,11 +280,11 @@ spec = describe "Closure and authority" $ do
 
   describe "asking whether the service admits work" $ do
     it "is true while it runs, and false once the parent session has ended, or the service is closing or closed" $ do
-      open <- newTVarIO True
-      withServiceUsing defaultConfig (SessionAdmission (readTVar open)) noProbe $ \svc → do
+      admission <- newAdmissionIO
+      withServiceUsing defaultConfig (AdmittedWhile (admissionToken admission)) noProbe $ \svc → do
         atomically (serviceAdmitting svc) `shouldReturn` True
         -- the parent session ends: the answer follows it at once (the owner then closes the service, which it never reopens)
-        atomically (writeTVar open False)
+        atomically (closeAdmission admission)
         atomically (serviceAdmitting svc) `shouldReturn` False
         awaitClosed svc
         atomically (serviceAdmitting svc) `shouldReturn` False

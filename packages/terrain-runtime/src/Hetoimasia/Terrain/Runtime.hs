@@ -317,8 +317,8 @@ defaultConfig =
     }
 
 -- | What the service borrows. Each is narrow: the parent session's admission as
--- a transaction the service can read inside its arbitration, the supervision
--- capability that starts the owner, a logger, and a diagnostics seam.
+-- its read-only token, which the service reads inside its own arbitration, the
+-- supervision capability that starts the owner, a logger, and a diagnostics seam.
 data Ports = Ports
   { portAdmission ∷ !SessionAdmission
   , portSupervisor ∷ !Supervisor
@@ -331,7 +331,7 @@ data Ports = Ports
 
 -- | A session that is always open.
 alwaysAdmitting ∷ SessionAdmission
-alwaysAdmitting = SessionAdmission (pure True)
+alwaysAdmitting = AlwaysAdmitting
 
 -- | The owner could not be started.
 data OwnerNotStarted = OwnerNotStarted

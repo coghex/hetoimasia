@@ -14,6 +14,7 @@
 {-# OPTIONS_GHC -fno-full-laziness #-}
 module Test.TerrainRuntime.Preparation (spec) where
 
+import Hetoimasia.Foundation.Admission (admissionToken, closeAdmission, newAdmissionIO)
 import Control.Concurrent.MVar
 import Control.Concurrent.STM
 import Control.Exception (finally)
@@ -219,16 +220,16 @@ spec = describe "Preparation outside the arbitration" $ do
     let terminal name end expected =
           it ("settles an open whose " <> name <> " after its preparation and before its arbitration once, publishing nothing, and retires what it reserved once") $ do
             counter ← newIORef 0
-            open ← newTVarIO True
+            admission ← newAdmissionIO
             gate ← newGate
             host ← newHost True
             let probe = ProbeWith (probePoint (gatedProbe (\case PointBeforeCommit _ → True; _ → False) gate)) (countingInterning counter) id
-            withServiceUsing defaultConfig (SessionAdmission (readTVar open)) probe $ \svc → (do
+            withServiceUsing defaultConfig (AdmittedWhile (admissionToken admission)) probe $ \svc → (do
               client ← okOf (registerClient svc)
               request ← okOf (openArenaWith svc (hostEndpoint svc Nothing host) client "main" (wide ()))
               awaitReached gate
               readIORef counter `shouldReturn` wideMaterials
-              _ ← end svc open request
+              _ ← end svc admission request
               openGate gate
               waitFor (readTVar (hostSettled host) >>= check . not . null)
               settledOf host `shouldReturn` [expected]
@@ -236,7 +237,7 @@ spec = describe "Preparation outside the arbitration" $ do
               -- never interned again
               readIORef counter `shouldReturn` wideMaterials) `finally` openGate gate
     terminal "request is cancelled" (\svc _ request → cancel svc request >>= (`shouldBe` CancelWon)) Cancelled
-    terminal "session ends" (\_ open _ → atomically (writeTVar open False)) Cancelled
+    terminal "session ends" (\_ admission _ → atomically (closeAdmission admission)) Cancelled
     terminal "service closes" (\svc _ _ → closeService svc) Cancelled
 
     it "settles an open whose preparation fails to intern as a definition failure, as before, publishing nothing and retiring its reservation" $ do
