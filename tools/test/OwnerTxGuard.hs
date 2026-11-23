@@ -125,7 +125,7 @@ spec = describe "The issuer bridge's textual guard (tools/owner-tx-guard)" $ do
       refused (changed [("consumer/consumer.cabal", consumer ["    ghc-options: -package-id hetoimasia-foundation-0.1.0.0-inplace-owner-tx-issuer"] [])]) [unlisted "consumer/consumer.cabal" 9 "owner-tx-issuer" "library"]
       refused (changed [("consumer/consumer.cabal", consumer ["    build-depends: HETOIMASIA-FOUNDATION:Owner-Tx-Issuer"] [])]) [unlisted "consumer/consumer.cabal" 9 "owner-tx-issuer" "library"]
       refused (changed [("consumer/consumer.cabal", consumer ["    ghc-options: -optP-Déowner-tx-issuer"] [])]) [unlisted "consumer/consumer.cabal" 9 "owner-tx-issuer" "library"]
-      checked (changed [("consumer/consumer.cabal", consumer ["    ghc-options: -optP-Downer-tx-İssuer"] [])]) >>= (`shouldBe` (ExitSuccess, ""))
+      checked (changed [("consumer/consumer.cabal", consumer ["    build-depends: hetoimasia-foundation:owner-tx-İssuer"] [])]) >>= (`shouldBe` (ExitSuccess, ""))
 
     it "refuses an unlisted match in a common stanza, a section header, a continuation line and an unreachable branch" $ do
       refused
