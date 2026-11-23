@@ -95,7 +95,7 @@ import Hetoimasia.GPU.Vulkan.Native.Presentation
   , Suspension
   , TargetGeometry
   )
-import Hetoimasia.GPU.Vulkan.Native.Roots (Roots, stateRootsModel)
+import Hetoimasia.GPU.Vulkan.Native.Internal.Roots (Roots, stateRootsModel)
 
 -- ---------------------------------------------------------------------------
 -- Records

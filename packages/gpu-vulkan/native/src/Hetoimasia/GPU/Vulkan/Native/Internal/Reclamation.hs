@@ -90,7 +90,7 @@ import Hetoimasia.GPU.Model
   )
 import Hetoimasia.GPU.Model.Identity (AllocationId, GenerationId, HoldSubject)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Roots (SubjectDisposer (..), readRootsDisposers)
-import Hetoimasia.GPU.Vulkan.Native.Roots
+import Hetoimasia.GPU.Vulkan.Native.Internal.Roots
   ( GraphicsDeviceLost
   , reclaimRoots
   , NativeFailure (..)

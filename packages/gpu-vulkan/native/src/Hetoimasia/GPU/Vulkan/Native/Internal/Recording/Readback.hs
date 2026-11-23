@@ -44,7 +44,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   , readbackBuffer
   )
 import Hetoimasia.GPU.Vulkan.Native.Internal.Allocation (flushBuffer, invalidateBuffer)
-import Hetoimasia.GPU.Vulkan.Native.Roots (stateRootsModel)
+import Hetoimasia.GPU.Vulkan.Native.Internal.Roots (stateRootsModel)
 
 -- | Read bytes a completed submission wrote. Refused unless the batch that
 -- recorded the copy was recorded as submitted ('noteBatchSubmitted') and the

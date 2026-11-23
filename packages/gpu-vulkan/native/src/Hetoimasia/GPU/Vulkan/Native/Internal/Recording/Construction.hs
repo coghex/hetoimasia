@@ -187,7 +187,7 @@ import Hetoimasia.GPU.Vulkan.Native.Naming
   , tableSetLayoutName
   )
 import Hetoimasia.GPU.Vulkan.Native.Profile (DevicePlan (..))
-import Hetoimasia.GPU.Vulkan.Native.Roots
+import Hetoimasia.GPU.Vulkan.Native.Internal.Roots
   ( NativeFailure (..)
   , deliverAfterRecord
   , diagnosisOf

@@ -41,7 +41,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Generations.Reconciliation (reconci
 import Hetoimasia.GPU.Vulkan.Native.Internal.Generations.State (Generations (..), TargetCondition (..), TargetRecord (..))
 import Hetoimasia.GPU.Vulkan.Native.Internal.Generations.Surface (releaseLostSurfaces)
 import Hetoimasia.GPU.Vulkan.Native.Presentation (TargetGeometry)
-import Hetoimasia.GPU.Vulkan.Native.Roots (stateRootsModel)
+import Hetoimasia.GPU.Vulkan.Native.Internal.Roots (stateRootsModel)
 
 -- | What one step did.
 data StepSummary = StepSummary

@@ -104,7 +104,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Generations.State
 import Hetoimasia.GPU.Vulkan.Native.Naming (NativeObjectKind (..), imageViewName, swapchainImageName, swapchainName)
 import Hetoimasia.GPU.Vulkan.Native.Presentation
 import Hetoimasia.GPU.Vulkan.Native.Profile (DevicePlan (..))
-import Hetoimasia.GPU.Vulkan.Native.Roots
+import Hetoimasia.GPU.Vulkan.Native.Internal.Roots
   ( GenerationOps (..)
   , deliverAfterRecord
   , diagnosisOf

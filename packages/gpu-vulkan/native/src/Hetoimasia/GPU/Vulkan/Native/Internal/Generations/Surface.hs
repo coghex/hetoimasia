@@ -75,7 +75,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Generations.State
   , TargetRecord (..)
   )
 import Hetoimasia.GPU.Vulkan.Native.Profile (TargetRejection (..))
-import Hetoimasia.GPU.Vulkan.Native.Roots
+import Hetoimasia.GPU.Vulkan.Native.Internal.Roots
   ( TargetSurface (..)
   , installRootSurface
   , releaseRootSurface

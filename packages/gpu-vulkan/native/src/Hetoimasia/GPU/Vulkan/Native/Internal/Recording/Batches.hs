@@ -70,7 +70,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   , releaseClaims
   , settleTicket
   )
-import Hetoimasia.GPU.Vulkan.Native.Roots (failRootsSessionBecause, readRootsDevice, rootsCall, stateRootsModel, deliverAfterRecord, diagnosisOf)
+import Hetoimasia.GPU.Vulkan.Native.Internal.Roots (failRootsSessionBecause, readRootsDevice, rootsCall, stateRootsModel, deliverAfterRecord, diagnosisOf)
 
 -- | Free the frame's slot of batches whose submission has completed. A
 -- submitted batch keeps its record, and its storage, until the submission

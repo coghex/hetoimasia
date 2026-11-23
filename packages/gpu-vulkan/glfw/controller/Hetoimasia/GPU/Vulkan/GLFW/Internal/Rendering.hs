@@ -230,16 +230,13 @@ import Hetoimasia.Foundation.Time (Instant, addDuration, deadlineReached)
 import Hetoimasia.GPU.Model
   ( GpuModel
   , NextTurn (..)
-  , Outcome (..)
   , PresentOutcome
   , TargetPhase (..)
   , TargetView (..)
-  , closeTarget
   , deviceLossObserved
   , disposalEligible
   , modelBudgets
   , progressDeadline
-  , requestRender
   , targetView
   )
 import Hetoimasia.GPU.Model.Budget (backoffSchedule, frameSlotLimit)
@@ -378,7 +375,8 @@ import Hetoimasia.GPU.Vulkan.Native.Roots
   , readRootsDevice
   , readRootsModel
   , readRootsTerminal
-  , stateRootsModel
+  , requestRootsRender
+  , closeRootsTarget
   )
 import Hetoimasia.GPU.Vulkan.Native.TextureTable
   ( TableConfig
@@ -1190,9 +1188,7 @@ planStep rendering inputs = do
                  )
           ]
     for_ wanted $ \target →
-      stateRootsModel (renderingRoots rendering) $ \model → case requestRender target model of
-        Admitted next → ((), next)
-        _ → ((), model)
+      requestRootsRender (renderingRoots rendering) target
     -- A fresh request is an opportunity now: it supersedes a retry pending
     -- from a frame that could not be made.
     writeTVar (renderingTargets rendering) $
@@ -1284,9 +1280,7 @@ requestPublished rendering targets due = do
           , movedTo record (lookup target views >>= id)
           ]
     for_ moved $ \(target, _) → do
-      stateRootsModel (renderingRoots rendering) $ \model → case requestRender target model of
-        Admitted next → ((), next)
-        _ → ((), model)
+      requestRootsRender (renderingRoots rendering) target
       editTarget rendering target $ \record →
         record {targetRetryAt = Nothing, targetAsked = active target}
     for_ due $ \(target, _) →
@@ -1737,9 +1731,7 @@ prepareTargetRetirement rendering now target =
         record ← Map.findWithDefault freshTarget target <$> readTVar (renderingTargets rendering)
         unless (targetClosing record) $ do
           editTarget rendering target (\held → held {targetClosing = True})
-          stateRootsModel (renderingRoots rendering) $ \model → case closeTarget target model of
-            Admitted next → ((), next)
-            _ → ((), model)
+          closeRootsTarget (renderingRoots rendering) target
       void (closeTargetFrames (liveFrames made) target)
       -- A frame skipped here resets its recording, which the uses read from the
       -- recording's own state.

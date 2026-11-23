@@ -80,7 +80,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   , owner
   )
 import Hetoimasia.GPU.Vulkan.Native.Naming (NativeObjectKind (ObjectFence), framelessFenceName)
-import Hetoimasia.GPU.Vulkan.Native.Roots
+import Hetoimasia.GPU.Vulkan.Native.Internal.Roots
   ( GraphicsDeviceLost
   , deliverAfterRecord
   , diagnosisOf

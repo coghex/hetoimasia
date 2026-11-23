@@ -63,7 +63,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   , checkpointed
   , owned
   )
-import Hetoimasia.GPU.Vulkan.Native.Roots (FailedSubmission (..), failSubmission, GraphicsDeviceLost, rootsCall, rootsSessionIdentity, stateRootsModel, deliverAfterRecord, diagnosisOf)
+import Hetoimasia.GPU.Vulkan.Native.Internal.Roots (FailedSubmission (..), failSubmission, GraphicsDeviceLost, rootsCall, rootsSessionIdentity, stateRootsModel, deliverAfterRecord, diagnosisOf)
 
 -- | One frame of a validated request.
 data Member cmd = Member

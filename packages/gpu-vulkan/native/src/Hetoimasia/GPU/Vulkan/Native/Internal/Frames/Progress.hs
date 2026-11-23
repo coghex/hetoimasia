@@ -53,7 +53,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Layer (FrameOps (..))
 import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Loss (releaseFramesToDeviceLoss)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.State
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State (TicketState (..), owner, settleTicket)
-import Hetoimasia.GPU.Vulkan.Native.Roots (GraphicsDeviceLost, failRootsSessionBecause, rootsCall, stateRootsModel, deliverAfterRecord, diagnosisOf)
+import Hetoimasia.GPU.Vulkan.Native.Internal.Roots (GraphicsDeviceLost, failRootsSessionBecause, rootsCall, stateRootsModel, deliverAfterRecord, diagnosisOf)
 
 -- | One bounded owner step: at most the model's progress-action limit of native
 -- calls, each recorded in the same masked step that made it.

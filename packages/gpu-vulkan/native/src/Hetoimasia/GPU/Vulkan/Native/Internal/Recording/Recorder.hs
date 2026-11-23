@@ -208,7 +208,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
 import Hetoimasia.GPU.Model.Budget (BudgetKind (FramelessBatchBudget, RingBudget), framelessBatchLimit)
 import Hetoimasia.GPU.Vulkan.Native.Naming (batchLabel, framelessBatchLabel, passLabel, targetPassLabel)
 import Hetoimasia.GPU.Vulkan.Native.Presentation (GenerationPlan (..), SurfaceExtent (..), SurfaceFormat (..), imageUsageTransferSource)
-import Hetoimasia.GPU.Vulkan.Native.Roots (Roots, readRootsInstrumentation, rootsCall, rootsSessionIdentity, stateRootsModel)
+import Hetoimasia.GPU.Vulkan.Native.Internal.Roots (Roots, readRootsInstrumentation, rootsCall, rootsSessionIdentity, stateRootsModel)
 
 data RecorderState = RecorderState
   { stateLayout ∷ !ImageLayout

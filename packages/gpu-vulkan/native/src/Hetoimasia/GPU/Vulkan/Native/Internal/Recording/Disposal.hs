@@ -64,7 +64,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
 import Hetoimasia.GPU.Vulkan.Native.Generations (Generations)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Layer (RecordingOps)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Roots (SubjectDisposer (..), registerRootsDisposer)
-import Hetoimasia.GPU.Vulkan.Native.Roots (Roots, failRootsSessionBecause, readRootsDevice, stateRootsModel, deliverAfterRecord, diagnosisOf)
+import Hetoimasia.GPU.Vulkan.Native.Internal.Roots (Roots, failRootsSessionBecause, readRootsDevice, stateRootsModel, deliverAfterRecord, diagnosisOf)
 
 -- | Destroy every released generation whose holds the model reports ended,
 -- and record the disposals with the model. A pipeline layout waits for every

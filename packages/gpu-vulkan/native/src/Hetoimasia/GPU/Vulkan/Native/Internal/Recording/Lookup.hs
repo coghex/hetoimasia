@@ -59,7 +59,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   , sessionHasFailed
   , settleSwap
   )
-import Hetoimasia.GPU.Vulkan.Native.Roots (Checkpoint (..), Roots, checkpointRoots, readRootsDevice, rootsCall, stateRootsModel)
+import Hetoimasia.GPU.Vulkan.Native.Internal.Roots (Checkpoint (..), Roots, checkpointRoots, readRootsDevice, rootsCall, stateRootsModel)
 
 -- | Whether each ring entry's version is held by a batch: its managed
 -- generation still has a recorded reference or a submitted use in the model.

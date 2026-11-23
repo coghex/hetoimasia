@@ -95,7 +95,7 @@ import Hetoimasia.GPU.Vulkan.Native.Generations (Generations)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Layer (FrameOps)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State (Recording (..), TicketState)
 import Hetoimasia.GPU.Vulkan.Native.Profile (DevicePlan (..))
-import Hetoimasia.GPU.Vulkan.Native.Roots (FailedSubmission (..), Roots, failRootsSessionBecause, failSubmission, readRootsDevice, stateRootsModel)
+import Hetoimasia.GPU.Vulkan.Native.Internal.Roots (FailedSubmission (..), Roots, failRootsSessionBecause, failSubmission, readRootsDevice, stateRootsModel)
 
 -- ---------------------------------------------------------------------------
 -- Records

@@ -61,7 +61,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   )
 import Hetoimasia.GPU.Vulkan.Native.Naming (NativeObjectKind (..), windowDepthName, windowDepthViewName)
 import Hetoimasia.GPU.Vulkan.Native.Presentation (SurfaceExtent (..))
-import Hetoimasia.GPU.Vulkan.Native.Roots (nameRootsObject, readRootsInstrumentation)
+import Hetoimasia.GPU.Vulkan.Native.Internal.Roots (nameRootsObject, readRootsInstrumentation)
 
 -- | Supply the generations with what makes and releases their depth images.
 -- It asks for them too: every generation constructed from now on owns one.

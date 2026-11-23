@@ -51,7 +51,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Reclamation (recoverAllocation, wit
 import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Layer (FrameOps (..), PresentRequest (..), PresentStatus (..))
 import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.State
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State (Refusal (..), checkpointed, owned)
-import Hetoimasia.GPU.Vulkan.Native.Roots (GraphicsDeviceLost, failRootsSessionBecause, rootsCall, stateRootsModel, deliverAfterRecord, diagnosisOf)
+import Hetoimasia.GPU.Vulkan.Native.Internal.Roots (GraphicsDeviceLost, failRootsSessionBecause, rootsCall, stateRootsModel, deliverAfterRecord, diagnosisOf)
 
 -- | What a presentation's answer establishes about its effect.
 data PresentReading

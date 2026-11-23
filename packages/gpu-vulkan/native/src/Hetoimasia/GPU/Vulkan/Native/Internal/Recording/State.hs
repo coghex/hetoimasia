@@ -172,7 +172,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Layer
   , imageKindUse
   , imageResourceKind
   )
-import Hetoimasia.GPU.Vulkan.Native.Roots (Checkpoint (..), Roots, TerminalCause, TerminalReport (reportPrimary), checkpointRoots, readRootsTerminal, rootsCall, rootsSessionIdentity, stateRootsModel)
+import Hetoimasia.GPU.Vulkan.Native.Internal.Roots (Checkpoint (..), Roots, TerminalCause, TerminalReport (reportPrimary), checkpointRoots, readRootsTerminal, rootsCall, rootsSessionIdentity, stateRootsModel)
 
 -- ---------------------------------------------------------------------------
 -- Records

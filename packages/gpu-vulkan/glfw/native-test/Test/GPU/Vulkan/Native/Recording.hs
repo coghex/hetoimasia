@@ -59,6 +59,7 @@ module Test.GPU.Vulkan.Native.Recording
   , settleInModel
   ) where
 
+import Hetoimasia.GPU.Vulkan.Native.Internal.Roots (stateRootsModel)
 import Control.Concurrent.STM (atomically, modifyTVar', newTVarIO, readTVarIO)
 import Control.Exception (SomeException, displayException, finally, throwIO, try, tryWithContext)
 import Control.Monad (unless, when)
@@ -144,7 +145,6 @@ import Hetoimasia.GPU.Vulkan.Native.Roots
   , retireRootTarget
   , retireRoots
   , startRoots
-  , stateRootsModel
   )
 import Hetoimasia.GPU.Vulkan.Native.Roots.Vulkan (instancePointer, vulkanRootOps)
 import Test.GPU.Vulkan.Native.Environment (validationFeatures)

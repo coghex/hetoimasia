@@ -236,7 +236,8 @@ module Hetoimasia.GPU.Vulkan.Native.Roots
   , rootsGenerationOps
   , rootsNativeFailure
   , rootsCall
-  , stateRootsModel
+  , requestRootsRender
+  , closeRootsTarget
   , failRootsSession
   , failRootsSessionBecause
   , FailedSubmission (..)

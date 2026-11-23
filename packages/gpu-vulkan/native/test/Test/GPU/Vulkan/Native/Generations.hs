@@ -6,6 +6,7 @@
 -- nothing creates a Vulkan object.
 module Test.GPU.Vulkan.Native.Generations (spec) where
 
+import Hetoimasia.GPU.Vulkan.Native.Internal.Roots (stateRootsModel)
 import Control.Concurrent (ThreadId, killThread, yield)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM (TVar, atomically, check, newTVarIO, readTVar, readTVarIO, writeTVar)

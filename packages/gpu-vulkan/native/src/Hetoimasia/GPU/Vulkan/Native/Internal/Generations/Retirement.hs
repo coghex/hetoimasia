@@ -35,7 +35,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Generations.State
   , endCpuUse
   , lookupGeneration
   )
-import Hetoimasia.GPU.Vulkan.Native.Roots (stateRootsModel)
+import Hetoimasia.GPU.Vulkan.Native.Internal.Roots (stateRootsModel)
 
 -- | Retire every generation of a target that is being retired: close it in the
 -- model, retire its active generation, and destroy every generation whose

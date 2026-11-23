@@ -36,7 +36,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   , owned
   , settleTicket
   )
-import Hetoimasia.GPU.Vulkan.Native.Roots (stateRootsModel)
+import Hetoimasia.GPU.Vulkan.Native.Internal.Roots (stateRootsModel)
 
 -- | Let go, under the specification's device-loss rule, of every obligation
 -- the lost device could have discharged, on every target.

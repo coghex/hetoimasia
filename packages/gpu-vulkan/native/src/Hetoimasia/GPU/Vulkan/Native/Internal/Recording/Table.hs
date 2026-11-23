@@ -101,7 +101,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
 import Hetoimasia.GPU.Vulkan.Native.Internal.Reclamation (failingAgain, recoverAllocation, withAllocationAttempt)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Uploads (UploadRequest (..), Uploads, submitUpload)
 import Hetoimasia.GPU.Vulkan.Native.Naming (NativeObjectKind (ObjectDescriptorSet), tableSetName)
-import Hetoimasia.GPU.Vulkan.Native.Roots (NativeFailure (FailedOutOfMemory), nameRootsObject, readRootsDevice, readRootsInstrumentation, rootsCall, rootsNativeFailure, stateRootsModel)
+import Hetoimasia.GPU.Vulkan.Native.Internal.Roots (NativeFailure (FailedOutOfMemory), nameRootsObject, readRootsDevice, readRootsInstrumentation, rootsCall, rootsNativeFailure, stateRootsModel)
 import Hetoimasia.GPU.Vulkan.Native.Shader.Interface (CheckedShaders)
 
 -- | Make the session's texture table from a validated configuration (D-11):

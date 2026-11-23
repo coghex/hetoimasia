@@ -69,6 +69,7 @@ module Test.GPU.Vulkan.Native.FramesRig
   , at
   ) where
 
+import Hetoimasia.GPU.Vulkan.Native.Internal.Roots (stateRootsModel)
 import Control.Concurrent (ThreadId, killThread, myThreadId, yield)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM (atomically)

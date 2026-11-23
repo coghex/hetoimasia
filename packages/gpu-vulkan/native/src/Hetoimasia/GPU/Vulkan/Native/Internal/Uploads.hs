@@ -183,7 +183,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   , tshow
   )
 import Hetoimasia.GPU.Vulkan.Native.Profile (DevicePlan (..))
-import Hetoimasia.GPU.Vulkan.Native.Roots (Roots, TerminalCause, readRootsDevice, readRootsModel, rootsFailedCause, rootsSessionIdentity)
+import Hetoimasia.GPU.Vulkan.Native.Internal.Roots (Roots, TerminalCause, readRootsDevice, readRootsModel, rootsFailedCause, rootsSessionIdentity)
 
 -- ---------------------------------------------------------------------------
 -- Configuration

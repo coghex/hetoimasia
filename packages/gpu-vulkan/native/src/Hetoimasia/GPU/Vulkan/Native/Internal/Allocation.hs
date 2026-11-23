@@ -125,7 +125,7 @@ import Hetoimasia.GPU.Vulkan.Native.Allocator
   , chooseMemoryType
   , reservationBound
   )
-import Hetoimasia.GPU.Vulkan.Native.Roots
+import Hetoimasia.GPU.Vulkan.Native.Internal.Roots
   ( Roots
   , deliverAfterRecord
   , diagnosisOf

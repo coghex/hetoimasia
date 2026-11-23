@@ -90,6 +90,8 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Roots
   , rootsNativeFailure
   , rootsCall
   , stateRootsModel
+  , requestRootsRender
+  , closeRootsTarget
   , failRootsSession
   , failRootsSessionBecause
   , FailedSubmission (..)
@@ -158,6 +160,7 @@ import Hetoimasia.GPU.Model
   , admitTarget
   , closeTarget
   , escalateSession
+  , requestRender
   , escalations
   , MemoryEffect (..)
   , MemorySettlement (MemorySettled)
@@ -1781,6 +1784,18 @@ stateRootsModel roots transition = republishFailed roots $ do
       let (answer', after') = transition current
       answer' <$ writeTVar (rootsModel roots) after'
     else answer <$ writeTVar (rootsModel roots) after
+
+-- | Ask the model for a frame of this target, when it admits the request: the controller's concrete request.
+requestRootsRender ∷ Roots q inst msgr phys dev → TargetId → STM ()
+requestRootsRender roots target = stateRootsModel roots $ \model → case requestRender target model of
+  Admitted next → ((), next)
+  _ → ((), model)
+
+-- | Close this target in the model, when it admits the close: the controller's concrete close.
+closeRootsTarget ∷ Roots q inst msgr phys dev → TargetId → STM ()
+closeRootsTarget roots target = stateRootsModel roots $ \model → case closeTarget target model of
+  Admitted next → ((), next)
+  _ → ((), model)
 
 -- | Enter the session-level safety failure: an effect whose outcome is
 -- unknown, or a cleanup that failed. Admission closes and the model's session

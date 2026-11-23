@@ -48,7 +48,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   , modelAnswer
   , owned
   )
-import Hetoimasia.GPU.Vulkan.Native.Roots (GraphicsDeviceLost, failRootsSessionBecause, rootsCall, deliverAfterRecord, diagnosisOf)
+import Hetoimasia.GPU.Vulkan.Native.Internal.Roots (GraphicsDeviceLost, failRootsSessionBecause, rootsCall, deliverAfterRecord, diagnosisOf)
 
 -- | Skip an acquired frame nothing of which has been submitted: an ordinary
 -- outcome, not a failure. The frame's capability is consumed at once — it
