@@ -9,7 +9,8 @@ module Test.GPU.Vulkan.Native.Generations (spec) where
 import Hetoimasia.GPU.Vulkan.Native.Internal.Roots (stateRootsModel)
 import Control.Concurrent (ThreadId, killThread, yield)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
-import Control.Concurrent.STM (TVar, atomically, check, newTVarIO, readTVar, readTVarIO, writeTVar)
+import Control.Concurrent.STM (TVar, check, newTVarIO, readTVar, readTVarIO, writeTVar)
+import Hetoimasia.GPU.Vulkan.Native.Atomically (atomically)
 import Control.Exception (AsyncException (ThreadKilled), Exception, SomeException, finally, fromException, try)
 import Control.Monad (forM_, void)
 import qualified Data.Map.Strict as Map
@@ -858,6 +859,17 @@ spec = describe "Generations" $ do
       forM_ [4, 5, 6] $ \instant → wantedAt rig instant `shouldReturn` []
       atomically (generationsDeadline (rigGenerations rig)) >>= (`shouldSatisfy` not . immediate)
       recoveryAttempts rig `shouldReturn` 1
+
+    it "records a swapchain creation's lost surface with the generation's failure before a cancellation met describing it goes on" $ do
+      rig ← lostAndReleased
+      -- the replacement's surface is lost as its first swapchain is made, and describing that failure raises a
+      -- cancellation: the loss is recorded first, then the cancellation goes on
+      script (rigStandIn rig) AtCreateSwapchain (AnswersOnceUndescribable FailedSurfaceLost)
+      offerReplacementSurface (rigGenerations rig) (at 3) (rigTarget rig) (surfaceNumbered (rigStandIn rig) 20) `shouldReturn` ReplacementInstalled
+      -- the step that reconciles makes the replacement's first swapchain
+      raised ← try @AsyncException (wantedAt rig 4)
+      either Just (const Nothing) raised `shouldBe` Just ThreadKilled
+      viewCondition <$> generationsOf rig `shouldReturn` SurfaceLost
 
     it "stops asking for a replacement once the clock cannot express the next attempt's delay, owing no step for it" $ do
       rig ← lostAndReleased

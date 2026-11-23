@@ -15,7 +15,8 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Generations.Step
   , generationsDeadline
   ) where
 
-import Control.Concurrent.STM (STM, atomically, readTVar, readTVarIO)
+import Control.Concurrent.STM (STM, readTVar, readTVarIO)
+import Hetoimasia.GPU.Vulkan.Native.Atomically (atomically)
 import Control.Exception (throwIO)
 import Control.Monad (forM, void, when)
 import Data.Foldable (for_)

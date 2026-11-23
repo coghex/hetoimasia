@@ -120,7 +120,8 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   ) where
 
 import Control.Concurrent (ThreadId, myThreadId)
-import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVar, newTVarIO, readTVar, readTVarIO, retry, writeTVar)
+import Control.Concurrent.STM (STM, TVar, modifyTVar', newTVar, newTVarIO, readTVar, readTVarIO, retry, writeTVar)
+import Hetoimasia.GPU.Vulkan.Native.Atomically (atomically)
 import Control.Exception (Exception (displayException), SomeAsyncException, SomeException, fromException, throwIO)
 import Control.Exception.Annotation (ExceptionAnnotation (displayExceptionAnnotation))
 import Control.Exception.Context (ExceptionContext, getExceptionAnnotations)

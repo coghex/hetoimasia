@@ -45,7 +45,7 @@ module Test.Vulkan.Proof.Bridge
 
 import Control.Concurrent (myThreadId)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
-import Control.Concurrent.STM (atomically)
+import Hetoimasia.GPU.Vulkan.Native.Atomically (atomically)
 import Control.Exception (SomeException, bracket, displayException, throwIO, try)
 import Control.Monad (unless)
 import Data.ByteString (ByteString)

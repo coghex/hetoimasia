@@ -96,6 +96,8 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Uploads
   , newUploadsCellIO
   , setUploadsStanding
   , setUploadsStandingTx
+  , PreparedStanding
+  , prepareUploadsStanding
   , readUploadsStanding
   , accessGate
   , accessRoom
@@ -114,9 +116,10 @@ import Hetoimasia.Foundation.Messaging.Payload (Prepared, preparedValue)
 import Hetoimasia.Foundation.OwnerTx (OwnerTx)
 import Hetoimasia.Foundation.OwnerTx.Issuer (fromIssuerSTM)
 import Control.Concurrent (ThreadId, myThreadId)
-import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVar, newTVarIO, orElse, readTVar, retry, writeTVar)
+import Control.Concurrent.STM (STM, TVar, modifyTVar', newTVar, newTVarIO, orElse, readTVar, retry, writeTVar)
+import Hetoimasia.GPU.Vulkan.Native.Atomically (atomically)
 import Control.Exception (SomeException, evaluate, mask, tryWithContext)
-import Control.Monad (forM, forM_, unless, when)
+import Control.Monad (forM, forM_, unless, void, when)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
 import Data.List (sortOn)
@@ -1349,16 +1352,30 @@ readOwnerAdmission (OwnerAdmission cell) = readTVar cell
 -- 'setUploadsStanding', which installs the standing evaluated (its fields are strict).
 newtype UploadsCell q inst msgr phys dev cmd = UploadsCell (TVar (UploadsStanding q inst msgr phys dev cmd))
 
--- | A cell holding this standing.
-newUploadsCellIO ∷ UploadsStanding q inst msgr phys dev cmd → IO (UploadsCell q inst msgr phys dev cmd)
-newUploadsCellIO standing = standing `seq` (UploadsCell <$> newTVarIO standing)
+-- | A standing evaluated in full, payload and all ('prepareUploadsStanding'): the only value the cell's writers install,
+-- so no later reader (a chunk decision formatting a refusal, say) is the first to evaluate any of it.
+newtype PreparedStanding q inst msgr phys dev cmd = PreparedStanding (UploadsStanding q inst msgr phys dev cmd)
 
--- | Record the uploads' standing now: evaluated before it is installed.
-setUploadsStanding ∷ UploadsCell q inst msgr phys dev cmd → UploadsStanding q inst msgr phys dev cmd → STM ()
-setUploadsStanding (UploadsCell cell) standing = standing `seq` writeTVar cell standing
+-- | Evaluate a standing in full, here in IO before any commit: the configuration, and a refusal with every field of
+-- its cause (its description included); the uploads themselves are already-made handles. A payload that raises raises
+-- here, before anything is installed.
+prepareUploadsStanding ∷ UploadsStanding q inst msgr phys dev cmd → IO (PreparedStanding q inst msgr phys dev cmd)
+prepareUploadsStanding standing = PreparedStanding standing <$ case standing of
+  UploadsUnconfigured → pure ()
+  UploadsPending config → void (evaluate (length (show config)))
+  UploadsMade made → void (evaluate made)
+  UploadsRefused refusal → void (evaluate (length (show refusal)))
+
+-- | A cell holding this standing, prepared here.
+newUploadsCellIO ∷ UploadsStanding q inst msgr phys dev cmd → IO (UploadsCell q inst msgr phys dev cmd)
+newUploadsCellIO standing = prepareUploadsStanding standing >>= \(PreparedStanding prepared) → UploadsCell <$> newTVarIO prepared
+
+-- | Record the uploads' standing now, prepared before.
+setUploadsStanding ∷ UploadsCell q inst msgr phys dev cmd → PreparedStanding q inst msgr phys dev cmd → STM ()
+setUploadsStanding (UploadsCell cell) (PreparedStanding standing) = writeTVar cell standing
 
 -- | 'setUploadsStanding' as an ownership operation: the cross-package writer of the cell.
-setUploadsStandingTx ∷ UploadsCell q inst msgr phys dev cmd → UploadsStanding q inst msgr phys dev cmd → OwnerTx ()
+setUploadsStandingTx ∷ UploadsCell q inst msgr phys dev cmd → PreparedStanding q inst msgr phys dev cmd → OwnerTx ()
 setUploadsStandingTx cell standing = fromIssuerSTM (setUploadsStanding cell standing)
 
 -- | The standing recorded now.

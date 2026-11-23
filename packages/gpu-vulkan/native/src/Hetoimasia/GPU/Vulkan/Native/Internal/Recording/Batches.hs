@@ -21,7 +21,8 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Batches
   , retireCompletedOn
   ) where
 
-import Control.Concurrent.STM (STM, atomically, modifyTVar', readTVar, readTVarIO)
+import Control.Concurrent.STM (STM, modifyTVar', readTVar, readTVarIO)
+import Hetoimasia.GPU.Vulkan.Native.Atomically (atomically)
 import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, mask_, rethrowIO, throwIO, tryWithContext)
 import Data.Foldable (for_)
 import qualified Data.Map.Strict as Map

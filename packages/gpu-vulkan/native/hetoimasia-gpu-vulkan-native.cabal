@@ -169,6 +169,7 @@ library
     -- the roots and the leaf modules they need are the roots-internal unit's: these are re-exported unchanged
     reexported-modules:
         Hetoimasia.GPU.Vulkan.Native.Allocator,
+        Hetoimasia.GPU.Vulkan.Native.Atomically,
         Hetoimasia.GPU.Vulkan.Native.Naming,
         Hetoimasia.GPU.Vulkan.Native.Presentation,
         Hetoimasia.GPU.Vulkan.Native.Profile
@@ -206,17 +207,18 @@ library
         hetoimasia-gpu-vulkan-native:shader-toolchain,
         hetoimasia-gpu-vulkan-native:roots-internal
 
--- The roots' implementation and the leaf modules it needs. Besides everything the public
+-- The roots' implementation and the leaf modules it needs, private to this package. Besides everything the public
 -- Hetoimasia.GPU.Vulkan.Native.Roots re-exports, it holds what only the native package's own layers and test rigs may
--- reach: the generic model transition (stateRootsModel) and the layers' disposer registration. Its consumers are
--- listed for review with the issuer-bridge users: this library, the native test suite, and the GLFW package's native
--- test suite (a model-only fixture). No other component depends on it.
+-- reach: the generic model transition (stateRootsModel), the raw terminal latches, the combined source operations and
+-- the layers' disposer registration. Only this library and this package's test suites depend on it.
 library roots-internal
     import: language
-    visibility: public
+    visibility: private
     hs-source-dirs: roots-internal
     exposed-modules:
         Hetoimasia.GPU.Vulkan.Native.Allocator
+        Hetoimasia.GPU.Vulkan.Native.Atomically
+        Hetoimasia.GPU.Vulkan.Native.Internal.Evidence
         Hetoimasia.GPU.Vulkan.Native.Internal.Roots
         Hetoimasia.GPU.Vulkan.Native.Naming
         Hetoimasia.GPU.Vulkan.Native.Presentation
@@ -228,6 +230,8 @@ library roots-internal
         stm >=2.5.3 && <2.6,
         text >=2.1 && <2.2,
         hetoimasia-foundation ==0.1.0.0,
+        -- the concrete diagnostic capture the roots order failures behind (watchRootsCapture)
+        hetoimasia-gpu-vulkan-diagnostics ==0.1.0.0,
         hetoimasia-gpu-vulkan-model ==0.1.0.0
 
 -- The compile configuration, the fingerprint, the checks that decide whether

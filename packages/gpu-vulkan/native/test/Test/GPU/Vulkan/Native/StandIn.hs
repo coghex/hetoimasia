@@ -24,6 +24,7 @@ module Test.GPU.Vulkan.Native.StandIn
   , StandInFailure (..)
   , StandInLoss (..)
   , StandInResult (..)
+  , StandInUndescribable (..)
 
     -- * Naming
   , offerNaming
@@ -54,8 +55,10 @@ module Test.GPU.Vulkan.Native.StandIn
   , testBudgets
   ) where
 
-import Control.Concurrent.STM (TVar, atomically, check, modifyTVar', newTVarIO, readTVar, readTVarIO, writeTVar)
-import Control.Exception (Exception, fromException, throwIO, tryWithContext, uninterruptibleMask_)
+import Control.Concurrent.STM (TVar, check, modifyTVar', newTVarIO, readTVar, readTVarIO, writeTVar)
+import Hetoimasia.GPU.Vulkan.Native.Atomically (atomically)
+import Control.Applicative ((<|>))
+import Control.Exception (AsyncException (ThreadKilled), Exception (..), fromException, throw, throwIO, tryWithContext, uninterruptibleMask_)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (isJust)
@@ -178,6 +181,18 @@ data Scripted
   | AnswersOnceThen !NativeFailure !Scripted
     -- ^ Answers this result once, and then behaves as the script given: a
     -- retry that then fails otherwise.
+  | AnswersOnceUndescribable !NativeFailure
+    -- ^ Answers this result once, raising 'StandInUndescribable': classified
+    -- as that native result, but describing it raises a cancellation.
+
+-- | A native result whose description raises a cancellation when rendered.
+newtype StandInUndescribable = StandInUndescribable NativeFailure
+
+instance Show StandInUndescribable where
+  show _ = throw ThreadKilled
+
+instance Exception StandInUndescribable where
+  displayException _ = throw ThreadKilled
 
 newtype StandInFailure = StandInFailure Step
   deriving (Eq, Show)
@@ -360,6 +375,7 @@ step standIn at call = do
         | remaining > 0 → Nothing <$ modifyTVar' (standScript standIn) (Map.insert at (SucceedsThenFails (remaining - 1)))
         | otherwise → pure (Just Fails)
       Just (AnswersOnce result) → Just (Answers result) <$ modifyTVar' (standScript standIn) (Map.delete at)
+      Just (AnswersOnceUndescribable result) → Just (AnswersOnceUndescribable result) <$ modifyTVar' (standScript standIn) (Map.delete at)
       Just (AnswersOnceThen result next) → Just (Answers result) <$ modifyTVar' (standScript standIn) (Map.insert at next)
       Just (AnswersOnceAfter remaining result)
         | remaining > 0 → Nothing <$ modifyTVar' (standScript standIn) (Map.insert at (AnswersOnceAfter (remaining - 1) result))
@@ -378,6 +394,7 @@ step standIn at call = do
     Just (AnswersOnce result) → throwIO (StandInResult (Text.pack (show at)) result)
     Just (AnswersOnceAfter _ result) → throwIO (StandInResult (Text.pack (show at)) result)
     Just (AnswersOnceThen result _) → throwIO (StandInResult (Text.pack (show at)) result)
+    Just (AnswersOnceUndescribable result) → throwIO (StandInUndescribable result)
 
 -- | Change what the loader offers in layers, and the instance extensions each provides, from now on.
 offerLayers' ∷ StandIn → [ByteString] → [(ByteString, [ByteString])] → IO ()
@@ -429,7 +446,9 @@ standInOps standIn =
         step standIn AtSupport (QueriedSupport surface)
         pure (surface /= unsupportedSurface)
     , opsDeviceLoss = \failure → isJust (fromException failure ∷ Maybe StandInLoss)
-    , opsNativeFailure = \failure → (\(StandInResult _ result) → result) <$> fromException failure
+    , opsNativeFailure = \failure →
+        ((\(StandInResult _ result) → result) <$> fromException failure)
+          <|> ((\(StandInUndescribable result) → result) <$> fromException failure)
     , opsDeviceHandle = fromIntegral
     , opsDeviceQueue = \_ family → 4 <$ record standIn (QueriedQueue family)
     , opsInstrumentation = \_ → do

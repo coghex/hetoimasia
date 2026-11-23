@@ -13,7 +13,8 @@ module Test.GPU.Vulkan.Native.Reclamation (spec) where
 
 import Control.Concurrent (killThread, myThreadId)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
-import Control.Concurrent.STM (atomically, newTVarIO, writeTVar)
+import Control.Concurrent.STM (newTVarIO, writeTVar)
+import Hetoimasia.GPU.Vulkan.Native.Atomically (atomically)
 import Control.Exception (AsyncException (ThreadKilled), ErrorCall (ErrorCall), Exception, throwIO, toException, try)
 import Control.Monad (when)
 import Data.IORef (atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)

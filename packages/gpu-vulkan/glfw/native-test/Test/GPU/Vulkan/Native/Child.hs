@@ -54,7 +54,8 @@ module Test.GPU.Vulkan.Native.Child
   ) where
 
 import Control.Concurrent (ThreadId, forkIO, forkIOWithUnmask, killThread)
-import Control.Concurrent.STM (STM, TVar, atomically, check, modifyTVar', newTVarIO, orElse, readTVar, readTVarIO, registerDelay, retry, writeTVar)
+import Control.Concurrent.STM (STM, TVar, check, modifyTVar', newTVarIO, orElse, readTVar, readTVarIO, registerDelay, retry, writeTVar)
+import Hetoimasia.GPU.Vulkan.Native.Atomically (atomically)
 import Control.Exception (SomeException, catch, finally, try)
 import Control.Monad (unless, void)
 import Data.ByteString (ByteString)

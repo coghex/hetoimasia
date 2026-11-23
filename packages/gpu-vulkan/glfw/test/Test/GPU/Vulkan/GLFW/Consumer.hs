@@ -14,7 +14,8 @@
 -- rounds that asked a fence and were answered no.
 module Test.GPU.Vulkan.GLFW.Consumer (spec) where
 
-import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, writeTVar)
+import Control.Concurrent.STM (TVar, modifyTVar', newTVarIO, readTVar, readTVarIO, writeTVar)
+import Hetoimasia.GPU.Vulkan.Native.Atomically (atomically)
 import Control.Exception (Exception (..), SomeException, throwIO, toException)
 import Control.Monad (void)
 import qualified Data.ByteString as ByteString

@@ -16,7 +16,7 @@
 module Test.GPU.Vulkan.Native.Shared (spec) where
 
 import Control.Concurrent (isCurrentThreadBound, myThreadId)
-import Control.Concurrent.STM (atomically)
+import Hetoimasia.GPU.Vulkan.Native.Atomically (atomically)
 import Control.Monad (when)
 import Data.Maybe (isJust)
 import Data.Text (Text)

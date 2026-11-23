@@ -90,6 +90,8 @@ module Hetoimasia.GPU.Vulkan.Native.Uploads
   , UploadsCell
   , newUploadsCellIO
   , setUploadsStandingTx
+  , PreparedStanding
+  , prepareUploadsStanding
   , readUploadsStanding
   , accessGate
   , accessRoom

@@ -16,14 +16,15 @@
 module Test.GPU.Vulkan.Native.Uploads (spec) where
 
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar, tryPutMVar, tryTakeMVar)
-import Control.Concurrent.STM (TVar, atomically, check, modifyTVar', newTVarIO, readTVar, readTVarIO, retry, throwSTM, writeTVar)
+import Control.Concurrent.STM (TVar, check, modifyTVar', newTVarIO, readTVar, readTVarIO, retry, throwSTM, writeTVar)
+import Hetoimasia.GPU.Vulkan.Native.Atomically (atomically)
 import Control.Concurrent (killThread, myThreadId)
 import Control.Exception (AsyncException (ThreadKilled), ErrorCall (ErrorCall), SomeException, fromException, try)
 import Hetoimasia.Foundation.Admission (Admission, admissionToken, closeAdmission, newAdmission, newAdmissionIO, tokenOpen)
 import Hetoimasia.Foundation.Messaging.Payload (prepare)
 import Hetoimasia.Foundation.OwnerTx (commit)
 import Hetoimasia.GPU.Model (SessionFailureCause (CleanupFailed))
-import Hetoimasia.GPU.Vulkan.Native.Roots (failRootsSession)
+import Hetoimasia.GPU.Vulkan.Native.Internal.Roots (TerminalCause (TerminalCleanupFailed), failRootsSession)
 import Control.Monad (forM, forM_, replicateM_, void, when)
 import qualified Data.ByteString as ByteString
 import Data.Either (isRight)
@@ -74,6 +75,19 @@ spec = describe "Uploads" $ do
       validateUploadConfig 1024 64 0 `shouldBe` Left (QueueNotPositive 0)
       validateUploadConfig 1024 64 (toInteger (maxBound ∷ Int) + 1) `shouldBe` Left (QueueUnrepresentable (toInteger (maxBound ∷ Int) + 1))
       (uploadStagingBytes <$> validateUploadConfig 1024 64 4) `shouldBe` Right 1024
+
+    it "prepares a standing in full before any commit installs it: a refusal whose cause raises raises there, and the cell keeps what it held" $ do
+      cell ← newUploadsCellIO UploadsUnconfigured
+      raised ← try @ErrorCall (prepareUploadsStanding (UploadsRefused (RefusedSessionFailed (TerminalCleanupFailed (error "the description raised")))))
+      either (const True) (const False) raised `shouldBe` True
+      atomically (readUploadsStanding cell) >>= \case
+        UploadsUnconfigured → pure ()
+        _ → expectationFailure "a standing was installed whose preparation raised"
+      prepared ← prepareUploadsStanding (UploadsRefused (RefusedSessionFailed (TerminalCleanupFailed "a cleanup failed")))
+      commit (setUploadsStandingTx cell prepared)
+      atomically (readUploadsStanding cell) >>= \case
+        UploadsRefused (RefusedSessionFailed (TerminalCleanupFailed reason)) → reason `shouldBe` "a cleanup failed"
+        _ → expectationFailure "the prepared standing was not installed"
 
     it "refuses a budget that cannot hold one block row of the widest level, and a staging buffer the device cannot make, making nothing" $ do
       rig ← newUploadRig

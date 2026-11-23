@@ -47,7 +47,8 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Generations.Surface
   , replacementSurfaceFailed
   ) where
 
-import Control.Concurrent.STM (STM, atomically, modifyTVar', readTVar, readTVarIO)
+import Control.Concurrent.STM (STM, modifyTVar', readTVar, readTVarIO)
+import Hetoimasia.GPU.Vulkan.Native.Atomically (atomically)
 import Control.Monad (forM, when)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)

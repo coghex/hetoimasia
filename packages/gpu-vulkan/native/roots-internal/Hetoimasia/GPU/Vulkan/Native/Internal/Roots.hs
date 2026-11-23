@@ -51,6 +51,7 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Roots
   , noteTeardownEvidence
   , watchRootsDiagnostics
   , watchRootsDiagnosticsOrdered
+  , watchRootsCapture
   , DiagnosticWatch (..)
   , DiagnosticOrder (..)
   , DiagnosticArrivals (..)
@@ -91,9 +92,15 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Roots
   , rootsCall
   , stateRootsModel
   , requestRootsRender
+  , acquireModelOnlyFrame
+  , settleModelOnlyFrame
   , closeRootsTarget
   , failRootsSession
   , failRootsSessionBecause
+  , PreparedFailure
+  , prepareFailure
+  , latchPreparedFailure
+  , failRootsSessionIO
   , FailedSubmission (..)
   , failSubmission
   , reclaimRoots
@@ -107,8 +114,21 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Roots
   ) where
 
 import Control.Concurrent (threadDelay, yield)
-import Control.Concurrent.STM (STM, TVar, atomically, catchSTM, modifyTVar', newTVarIO, readTVar, readTVarIO, writeTVar)
+import Control.Concurrent.STM (STM, TVar, catchSTM, modifyTVar', newTVarIO, readTVar, readTVarIO, throwSTM, writeTVar)
 import GHC.Conc (unsafeIOToSTM)
+import Hetoimasia.GPU.Vulkan.Diagnostics
+  ( CaptureAlarm (..)
+  , CaptureArrivals (..)
+  , CaptureOrder (..)
+  , DiagnosticCapture
+  , SinkFailure (sinkFailureReason)
+  , captureAlarms
+  , captureArrivals
+  , claimCaptureOrder
+  , readCaptureSinkFailure
+  )
+import Hetoimasia.GPU.Vulkan.Native.Atomically (atomically)
+import Hetoimasia.GPU.Vulkan.Native.Internal.Evidence (evidencePending)
 import Control.Exception
   ( Exception (displayException)
   , ExceptionWithContext (ExceptionWithContext)
@@ -124,6 +144,7 @@ import Control.Exception
   , tryWithContext
   )
 import Control.Monad (filterM, unless, when)
+import qualified Control.Monad
 import Data.Foldable (for_)
 import Data.IORef (IORef, atomicModifyIORef', mkWeakIORef, newIORef)
 import Data.Map.Strict (Map)
@@ -140,9 +161,16 @@ import Numeric.Natural (Natural)
 import Hetoimasia.Foundation.Messaging.Payload (Prepared, prepare)
 import Hetoimasia.Foundation.OwnerTx (Publication, Publisher, newPublisherIO, publication, watchPublication)
 import qualified Hetoimasia.Foundation.OwnerTx as OwnerTx
-import Hetoimasia.Foundation.Time (MonotonicSource, readInstant)
+import Hetoimasia.Foundation.Time (Instant, MonotonicSource, readInstant)
 import Hetoimasia.GPU.Model
-  ( DisposalResult (DisposalRefused)
+  ( AcquireOutcome (AcquiredImage)
+  , AcquireAnswer (ImageOwned)
+  , CompletionFact (UnpresentedFrameSettled)
+  , acquireImage
+  , recordCompletion
+  , reserveFrame
+  , skipUnsubmittedFrame
+  , DisposalResult (DisposalRefused)
   , EvidenceSource (disposalEvidence)
   , ReclaimReport (reclaimFailures)
   , SubmitOutcome
@@ -1122,10 +1150,12 @@ fromModel model = case sessionState model of
 -- first place before it is latched ahead of it.
 latchTerminal ∷ Roots q inst msgr phys dev → TerminalCause → STM ()
 latchTerminal roots given = do
-  -- the cause is forced before anything is written: a description that raises is replaced by a fixed one, so it can
-  -- never roll the terminal record back (its producers force it in protected IO first: 'diagnosisOf')
-  -- (a cause that cannot even be inspected is kept as a cleanup failure of that description)
-  cause ← (pure $! forcedCause given) `catchSTM` \(_ ∷ SomeException) → pure (TerminalCleanupFailed undescribedFailure)
+  -- the cause is forced before anything is written. Its producers are this package's own (exception descriptions are
+  -- rendered in protected IO first: 'diagnosisOf'; callers outside it latch a 'PreparedFailure'): a description that
+  -- still raises synchronously is replaced by a fixed one (a cause that cannot even be inspected is kept as a cleanup
+  -- failure of that description); a cancellation is never discarded: it goes on, and this transaction with it
+  cause ← (pure $! forcedCause given) `catchSTM` \(raised ∷ SomeException) →
+    if isAsynchronous raised then throwSTM raised else pure (TerminalCleanupFailed undescribedFailure)
   unless (diagnostic cause) (orderBehindDiagnostics roots)
   latchCause roots cause
   where
@@ -1171,17 +1201,23 @@ orderBehindDiagnostics roots = do
       made ← atomicModifyIORef' (rootsClaims roots) $ \claims →
         (OwnerClaims True ((attempt, held) : claimAttempts claims), claimsMade claims)
       void ← if made then not <$> claimHeld roots (Just attempt) else pure False
+      -- one look at the evidence: what is not yet readable is waited for outside this transaction
       ahead ← watchOrder watch >>= \case
         OwnerFirst arrived
-          | void → awaitArrivals watch arrived
-          | otherwise → pure []
-        ValidationFirst → pure [AlarmValidationError]
-        SinkFirst published → (\reason → [AlarmSinkFailed reason]) <$> awaitPublication published
+          | void → (\alarms → maybe (Left (Control.Monad.void (awaitArrivals watch arrived))) Right (arrivedAlarms arrived alarms)) <$> watchAlarms watch
+          | otherwise → pure (Right [])
+        ValidationFirst → pure (Right [AlarmValidationError])
+        SinkFirst published → maybe (Left (Control.Monad.void (awaitPublication published))) (\reason → Right [AlarmSinkFailed reason]) <$> published
       pure (token, ahead)
-    -- The token is written into this attempt's own log, which keeps it alive
-    -- while the attempt may still commit, and only while it may.
-    writeTVar (rootsClaimHold roots) (Just token)
-    latchAlarms roots ahead
+    case ahead of
+      -- Abandoned: nothing written, nothing published. The wait runs outside ('Native.Atomically.atomically'), and the
+      -- rerun claims over this attempt's claim, void once the attempt is gone, as any rerun of an abandoned attempt does.
+      Left await → evidencePending await
+      Right alarms → do
+        -- The token is written into this attempt's own log, which keeps it alive
+        -- while the attempt may still commit, and only while it may.
+        writeTVar (rootsClaimHold roots) (Just token)
+        latchAlarms roots alarms
 
 -- | Wait for the reason of a sink failure that claimed first place. The worker
 -- publishes it right after its claim, in one masked step that makes no native
@@ -1202,13 +1238,16 @@ awaitPublication published = published >>= maybe (yield >> awaitPublication publ
 -- callback at its next step, the sink's worker in the masked step that noted
 -- it — so this is bounded as 'awaitPublication' is, and waits the same way.
 awaitArrivals ∷ DiagnosticWatch → DiagnosticArrivals → IO [DiagnosticAlarm]
-awaitArrivals watch arrived = do
-  alarms ← watchAlarms watch
-  let errors = [AlarmValidationError | validationArrived arrived, AlarmValidationError `elem` alarms]
-      sinks = take 1 [alarm | sinkArrived arrived, alarm@(AlarmSinkFailed _) ← alarms]
-  if (validationArrived arrived && null errors) || (sinkArrived arrived && null sinks)
-    then yield >> awaitArrivals watch arrived
-    else pure (if sinkArrivedFirst arrived then sinks <> errors else errors <> sinks)
+awaitArrivals watch arrived = watchAlarms watch >>= maybe (yield >> awaitArrivals watch arrived) pure . arrivedAlarms arrived
+
+-- The alarms of the failures that had arrived, in the order they arrived, once each is readable among these alarms.
+arrivedAlarms ∷ DiagnosticArrivals → [DiagnosticAlarm] → Maybe [DiagnosticAlarm]
+arrivedAlarms arrived alarms
+  | (validationArrived arrived && null errors) || (sinkArrived arrived && null sinks) = Nothing
+  | otherwise = Just (if sinkArrivedFirst arrived then sinks <> errors else errors <> sinks)
+  where
+    errors = [AlarmValidationError | validationArrived arrived, AlarmValidationError `elem` alarms]
+    sinks = take 1 [alarm | sinkArrived arrived, alarm@(AlarmSinkFailed _) ← alarms]
 
 -- | Whether a transaction attempt that claimed the capture's order — other
 -- than this one — may still commit.
@@ -1324,6 +1363,32 @@ watchRootsDiagnostics roots alarms = writeTVar (rootsWatch roots) (DiagnosticWat
 -- | Install a diagnostic capture that keeps the order itself.
 watchRootsDiagnosticsOrdered ∷ Roots q inst msgr phys dev → DiagnosticWatch → STM ()
 watchRootsDiagnosticsOrdered roots = writeTVar (rootsWatch roots)
+
+-- | Order the roots' failures behind this diagnostic capture: every checkpoint latches its alarms, and every failure
+-- of the owner's own claims the capture's first-failure order. The watch is the roots' own, built from the capture's
+-- concrete operations; no caller code runs in a terminal publication.
+watchRootsCapture ∷ Roots q inst msgr phys dev → DiagnosticCapture → STM ()
+watchRootsCapture roots capture = watchRootsDiagnosticsOrdered roots (DiagnosticWatch (captureAlarmsOf capture) (captureOrderOf capture))
+
+captureAlarmsOf ∷ DiagnosticCapture → IO [DiagnosticAlarm]
+captureAlarmsOf capture =
+  map
+    ( \case
+        CaptureErrorLatched → AlarmValidationError
+        CaptureSinkFailed reason → AlarmSinkFailed reason
+        CaptureAlarmPending → AlarmPending
+        CaptureOwnerClaimed → AlarmOwnerClaimed
+    )
+    <$> captureAlarms capture
+
+-- Claim the capture's order for a failure of the owner's own, and say who holds it; with the owner's answer go the
+-- diagnostic failures that had arrived, read right after the claim.
+captureOrderOf ∷ DiagnosticCapture → IO DiagnosticOrder
+captureOrderOf capture =
+  claimCaptureOrder capture >>= \case
+    OwnerFailedFirst → (\arrived → OwnerFirst (DiagnosticArrivals (arrivedError arrived) (arrivedSink arrived) (arrivedSinkFirst arrived))) <$> captureArrivals capture
+    ErrorLatchedFirst → pure ValidationFirst
+    SinkFailedFirst → pure (SinkFirst (fmap sinkFailureReason <$> readCaptureSinkFailure capture))
 
 -- | A safe owner checkpoint: ask the diagnostic capture for its alarms and
 -- latch each — an error-severity report as 'TerminalValidationError', a sink
@@ -1452,14 +1517,13 @@ rootsFailure = publication . rootsFailed
 -- Write the latch or the model through this: the write, and then, in its transaction, whether the session has failed
 -- published when the write changed it.
 --
--- A write that fails the session through the model alone also latches the model's cause as the primary, in that same
--- transaction: from the publication on, the primary is a write-once fact of the latch, never derived again.
+-- Every such write is a staged source transition ('stageRootsFailure'): the outermost one fixes the primary and
+-- publishes, once, whatever it latched on the way (a model failure ordered behind a diagnostic latches the diagnostic
+-- first, and still publishes once). A write that fails the session through the model alone also latches the model's
+-- cause as the primary, in that same transaction: from the publication on, the primary is a write-once fact of the
+-- latch, never derived again.
 republishFailed ∷ Roots q inst msgr phys dev → STM a → STM a
-republishFailed roots write =
-  readTVar (rootsStaging roots) >>= \case
-    0 → republishing roots write
-    -- inside a staged source transition: the transition's own end fixes the primary and publishes, once
-    _ → write
+republishFailed = stageRootsFailure
 
 -- One source transition that writes the model and the latch together (a model transition that fails the session, and
 -- the detailed cause of the same failure): the primary is chosen as 'latchTerminal' chooses it with both writes seen,
@@ -1791,6 +1855,25 @@ requestRootsRender roots target = stateRootsModel roots $ \model → case reques
   Admitted next → ((), next)
   _ → ((), model)
 
+-- | A frame recorded in the model alone, for an owner that acquires its image outside the frames layer: a frame of
+-- this target reserved and its image 0 recorded acquired. Nothing native is made. The model's refusal is answered as
+-- data, and changes nothing.
+acquireModelOnlyFrame ∷ Roots q inst msgr phys dev → TargetId → STM (Either Text FrameSlotId)
+acquireModelOnlyFrame roots target = stateRootsModel roots $ \model → case reserveFrame target model of
+  Admitted (reserved, frame) → case acquireImage frame (AcquiredImage 0) reserved of
+    Admitted (acquired, ImageOwned _ _) → (Right frame, acquired)
+    _ → (Left "the model refused the frame's acquisition", model)
+  _ → (Left "the model refused the frame's reservation", model)
+
+-- | Everything a model-only frame ('acquireModelOnlyFrame') owes once its batch is discarded, at this instant: the
+-- skip, and (nothing native ever having been acquired) its settlement. The model's refusal changes nothing.
+settleModelOnlyFrame ∷ Roots q inst msgr phys dev → Instant → FrameSlotId → STM (Either Text ())
+settleModelOnlyFrame roots now frame = stateRootsModel roots $ \model → case skipUnsubmittedFrame frame model of
+  Admitted skipped → case recordCompletion now (UnpresentedFrameSettled frame) skipped of
+    Admitted settled → (Right (), settled)
+    _ → (Left "the model refused the frame's settlement", model)
+  _ → (Left "the model refused the skip", model)
+
 -- | Close this target in the model, when it admits the close: the controller's concrete close.
 closeRootsTarget ∷ Roots q inst msgr phys dev → TargetId → STM ()
 closeRootsTarget roots target = stateRootsModel roots $ \model → case closeTarget target model of
@@ -1808,15 +1891,49 @@ failRootsSession roots cause = failRootsSessionBecause roots cause (Text.pack (s
 -- | 'failRootsSession', saying what failed.
 failRootsSessionBecause ∷ Roots q inst msgr phys dev → SessionFailureCause → Text → STM ()
 failRootsSessionBecause roots cause given = do
-  -- the reason is forced here, where its kind is known: one that raises is replaced by a fixed description
-  reason ← (pure $! Text.length given `seq` given) `catchSTM` \(_ ∷ SomeException) → pure undescribedFailure
-  latchTerminal roots $ case cause of
-    DeviceLost → TerminalDeviceLost (GraphicsDeviceLost "a native call" reason)
-    ValidationError → TerminalValidationError
-    DiagnosticSinkFailed → TerminalSinkFailed reason
-    UnknownSubmissionEffect → TerminalUncertainEffect reason
-    CleanupFailed → TerminalCleanupFailed reason
-    RequiredTargetUnrecoverable → TerminalRequiredTarget Nothing
+  -- the reason is forced here, where its kind is known: one that raises synchronously is replaced by a fixed
+  -- description, with this kind; a cancellation is never discarded (see 'latchTerminal')
+  reason ← (pure $! Text.length given `seq` given) `catchSTM` \(raised ∷ SomeException) →
+    if isAsynchronous raised then throwSTM raised else pure undescribedFailure
+  latchTerminal roots (causeOf cause reason)
+
+-- The terminal cause of a session failure of this kind, with this description.
+causeOf ∷ SessionFailureCause → Text → TerminalCause
+causeOf cause reason = case cause of
+  DeviceLost → TerminalDeviceLost (GraphicsDeviceLost "a native call" reason)
+  ValidationError → TerminalValidationError
+  DiagnosticSinkFailed → TerminalSinkFailed reason
+  UnknownSubmissionEffect → TerminalUncertainEffect reason
+  CleanupFailed → TerminalCleanupFailed reason
+  RequiredTargetUnrecoverable → TerminalRequiredTarget Nothing
+
+-- | A session failure prepared outside any transaction: its kind, and its description rendered and forced in protected
+-- IO ('prepareFailure'). Latching it evaluates nothing.
+data PreparedFailure = PreparedFailure !SessionFailureCause !Text
+
+-- | Prepare a session failure of this kind: its description rendered and forced here, in protected IO. A description
+-- that raises is answered with a fixed text, the kind kept; a cancellation met while rendering is handed back, for the
+-- caller to deliver once the failure is latched.
+prepareFailure ∷ SessionFailureCause → Text → IO (PreparedFailure, Maybe (ExceptionWithContext SomeException))
+prepareFailure cause given =
+  tryWithContext @SomeException (evaluate (Text.length given) >> pure given) >>= \case
+    Right reason → pure (PreparedFailure cause reason, Nothing)
+    Left failure@(ExceptionWithContext _ inner)
+      | isAsynchronous inner → pure (PreparedFailure cause undescribedFailure, Just failure)
+      | otherwise → pure (PreparedFailure cause undescribedFailure, Nothing)
+
+-- | Latch a prepared session failure: the first is the primary, a later one evidence beside it.
+latchPreparedFailure ∷ Roots q inst msgr phys dev → PreparedFailure → STM ()
+latchPreparedFailure roots (PreparedFailure cause reason) = latchTerminal roots (causeOf cause reason)
+
+-- | Fail the session from outside a transaction: the description prepared in protected IO ('prepareFailure'), the
+-- failure latched (with the fixed description, its kind kept, if the description raised), and then a cancellation met
+-- while rendering goes on.
+failRootsSessionIO ∷ Roots q inst msgr phys dev → SessionFailureCause → Text → IO ()
+failRootsSessionIO roots cause given = do
+  (prepared, pending) ← prepareFailure cause given
+  atomically (latchPreparedFailure roots prepared)
+  mapM_ rethrowIO pending
 
 -- | The live instance, for the caller that leases it to a surface bridge.
 readRootsInstance ∷ Roots q inst msgr phys dev → STM (Maybe inst)

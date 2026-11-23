@@ -41,7 +41,7 @@ import Hetoimasia.GPU.Vulkan.Native.Recording
 import Hetoimasia.GPU.Vulkan.Native.TextureTable (validateTableConfig)
 import Hetoimasia.Foundation.Admission (admissionToken, closeAdmission, newAdmissionIO)
 import Hetoimasia.Foundation.OwnerTx (commit)
-import Hetoimasia.GPU.Vulkan.Native.Uploads (UploadRefusal (..), UploadState (..), UploadsStanding (..), UploadsView (..), newOwnerAdmissionIO, newUploadsCellIO, ownedUploadAccess, readUploads, setUploadsStandingTx, validateUploadConfig)
+import Hetoimasia.GPU.Vulkan.Native.Uploads (UploadRefusal (..), UploadState (..), UploadsStanding (..), UploadsView (..), prepareUploadsStanding, newOwnerAdmissionIO, newUploadsCellIO, ownedUploadAccess, readUploads, setUploadsStandingTx, validateUploadConfig)
 import Hetoimasia.Math.Affine2 (fromColumns)
 import Hetoimasia.Math.Vector (V2 (..))
 import qualified Hetoimasia.Render.Api.Texture as Api
@@ -745,7 +745,7 @@ refusalSpec = describe "refusing a build" $ do
           admit uploads = fmap (const ()) <$> commit (admitRetainedChunkTx uploads (setupRetained setup) prepared)
       admit awaiting `shouldReturn` Left BuildUploadsNotReady
       atomically (chunkRoom awaiting (setupRetained setup) prepared) `shouldReturn` Left BuildUploadsNotReady
-      commit (setUploadsStandingTx standing (UploadsMade (rigUploads rig)))
+      commit . setUploadsStandingTx standing =<< prepareUploadsStanding (UploadsMade (rigUploads rig))
       admit awaiting `shouldReturn` Right ()
       lacking UploadsUnconfigured >>= admit >>= (`shouldBe` Left (BuildUploadsUnavailable "the host configured no uploads"))
       lacking (UploadsRefused RefusedDeviceAbsent) >>= admit >>= (`shouldBe` Left (BuildUploadsUnavailable ("the device refused the uploads: " <> Text.pack (show RefusedDeviceAbsent))))

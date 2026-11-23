@@ -194,11 +194,7 @@ module Hetoimasia.GPU.Vulkan.Native.Roots
   , DiagnosticAlarm (..)
   , Checkpoint (..)
   , terminalEvidenceLimit
-  , latchTerminal
   , noteTeardownEvidence
-  , watchRootsDiagnostics
-  , watchRootsDiagnosticsOrdered
-  , DiagnosticWatch (..)
   , DiagnosticOrder (..)
   , DiagnosticArrivals (..)
   , noDiagnosticArrivals
@@ -237,12 +233,14 @@ module Hetoimasia.GPU.Vulkan.Native.Roots
   , rootsNativeFailure
   , rootsCall
   , requestRootsRender
+  , watchRootsCapture
+  , acquireModelOnlyFrame
+  , settleModelOnlyFrame
+  , PreparedFailure
+  , prepareFailure
+  , latchPreparedFailure
+  , failRootsSessionIO
   , closeRootsTarget
-  , failRootsSession
-  , failRootsSessionBecause
-  , FailedSubmission (..)
-  , failSubmission
-  , reclaimRoots
   , diagnosisOf
   , deliverAfterRecord
 

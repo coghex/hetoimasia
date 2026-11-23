@@ -59,8 +59,8 @@ module Test.GPU.Vulkan.Native.Recording
   , settleInModel
   ) where
 
-import Hetoimasia.GPU.Vulkan.Native.Internal.Roots (stateRootsModel)
-import Control.Concurrent.STM (atomically, modifyTVar', newTVarIO, readTVarIO)
+import Control.Concurrent.STM (modifyTVar', newTVarIO, readTVarIO)
+import Hetoimasia.GPU.Vulkan.Native.Atomically (atomically)
 import Control.Exception (SomeException, displayException, finally, throwIO, try, tryWithContext)
 import Control.Monad (unless, when)
 import qualified Data.ByteString.Char8 as Char8
@@ -88,16 +88,8 @@ import Hetoimasia.Foundation.Log
   )
 import Hetoimasia.Foundation.Time (DurationRequirement (AllowZero), Instant, durationFromNanoseconds, scriptedInstant, scriptedSource, zeroDuration)
 import Hetoimasia.GPU.Model
-  ( AcquireAnswer (..)
-  , AcquireOutcome (..)
-  , CompletionFact (..)
-  , HoldView (..)
-  , Outcome (..)
-  , acquireImage
+  ( HoldView (..)
   , holdView
-  , recordCompletion
-  , reserveFrame
-  , skipUnsubmittedFrame
   )
 import Hetoimasia.GPU.Model.Budget (BudgetRequest (..), defaultBudgetRequest, validateBudgets)
 import Hetoimasia.GPU.Model.Identity (BatchId, FrameSlotId, HoldSubject (..), ResourceId, TargetClass (..), TargetId, frameSlotNumber)
@@ -136,6 +128,7 @@ import Hetoimasia.GPU.Vulkan.Native.Roots
   ( Roots
   , SurfaceDestruction (..)
   , TargetSurface (..)
+  , acquireModelOnlyFrame
   , admitRootTarget
   , destroyRoots
   , newRoots
@@ -144,6 +137,7 @@ import Hetoimasia.GPU.Vulkan.Native.Roots
   , readRootsModel
   , retireRootTarget
   , retireRoots
+  , settleModelOnlyFrame
   , startRoots
   )
 import Hetoimasia.GPU.Vulkan.Native.Roots.Vulkan (instancePointer, vulkanRootOps)
@@ -445,26 +439,12 @@ everyKind journal step recording compressionBC = do
 -- | The fixture-private frame: reserve one on the target and record the
 -- acquisition of image 0 in the model alone. No native acquisition is made.
 acquireInModel ∷ VulkanRoots → TargetId → IO FrameSlotId
-acquireInModel roots target =
-  atomically (stateRootsModel roots acquire) >>= either stopWith pure
-  where
-    acquire model = case reserveFrame target model of
-      Admitted (reserved, frame) → case acquireImage frame (AcquiredImage 0) reserved of
-        Admitted (acquired, ImageOwned _ _) → (Right frame, acquired)
-        _ → (Left "the model refused the frame's acquisition", model)
-      _ → (Left "the model refused the frame's reservation", model)
+acquireInModel roots target = atomically (acquireModelOnlyFrame roots target) >>= either stopWith pure
 
 -- | Everything the fixture-private frame owes once its batch is discarded:
 -- the skip, and — since nothing native was ever acquired — its settlement.
 settleInModel ∷ VulkanRoots → FrameSlotId → IO ()
-settleInModel roots frame =
-  atomically (stateRootsModel roots settle) >>= either stopWith pure
-  where
-    settle model = case skipUnsubmittedFrame frame model of
-      Admitted skipped → case recordCompletion (at 1) (UnpresentedFrameSettled frame) skipped of
-        Admitted settled → (Right (), settled)
-        _ → (Left "the model refused the frame's settlement", model)
-      _ → (Left "the model refused the skip", model)
+settleInModel roots frame = atomically (settleModelOnlyFrame roots (at 1) frame) >>= either stopWith pure
 
 -- | The record's section.
 recordingSection ∷ RecordingOutcome → [Text]

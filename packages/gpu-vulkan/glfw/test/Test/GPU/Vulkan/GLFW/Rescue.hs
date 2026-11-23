@@ -10,7 +10,8 @@ module Test.GPU.Vulkan.GLFW.Rescue (spec) where
 
 import Control.Concurrent (ThreadId, killThread, myThreadId, yield)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
-import Control.Concurrent.STM (TVar, atomically, check, modifyTVar', newTVarIO, readTVar, readTVarIO, retry, stateTVar, writeTVar)
+import Control.Concurrent.STM (TVar, check, modifyTVar', newTVarIO, readTVar, readTVarIO, retry, stateTVar, writeTVar)
+import Hetoimasia.GPU.Vulkan.Native.Atomically (atomically)
 import Control.Exception (AsyncException (ThreadKilled), SomeException, displayException, fromException, throwIO, try, uninterruptibleMask_)
 import Control.Monad (void, when)
 import Data.Maybe (fromMaybe, isNothing)

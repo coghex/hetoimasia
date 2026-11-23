@@ -15,7 +15,8 @@ module Test.GPU.Vulkan.GLFW.Controller (spec) where
 
 import Control.Concurrent (ThreadId, myThreadId, throwTo, yield)
 import GHC.Conc (BlockReason (BlockedOnException), ThreadStatus (..), threadStatus)
-import Control.Concurrent.STM (TVar, atomically, check, newTVarIO, orElse, readTVar, registerDelay, retry, writeTVar)
+import Control.Concurrent.STM (TVar, check, newTVarIO, orElse, readTVar, registerDelay, retry, writeTVar)
+import Hetoimasia.GPU.Vulkan.Native.Atomically (atomically)
 import Control.Exception (Exception (..), ExceptionWithContext (ExceptionWithContext), SomeException, asyncExceptionFromException, asyncExceptionToException, finally, throwIO, try)
 import Control.Monad (forM_, replicateM_, unless, void, when)
 import Data.List (isSubsequenceOf, nub)

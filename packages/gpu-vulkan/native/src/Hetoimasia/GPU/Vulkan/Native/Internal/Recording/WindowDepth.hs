@@ -24,7 +24,8 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.WindowDepth
   , windowDepthOf
   ) where
 
-import Control.Concurrent.STM (STM, atomically, modifyTVar', readTVar)
+import Control.Concurrent.STM (STM, modifyTVar', readTVar)
+import Hetoimasia.GPU.Vulkan.Native.Atomically (atomically)
 import Control.Exception (onException, throwIO)
 import Control.Monad (void)
 import Data.Foldable (for_)

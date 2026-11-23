@@ -30,7 +30,8 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Table
   , RegistrationNotUndone (..)
   ) where
 
-import Control.Concurrent.STM (STM, atomically, newTVar, readTVar, readTVarIO, writeTVar)
+import Control.Concurrent.STM (STM, newTVar, readTVar, readTVarIO, writeTVar)
+import Hetoimasia.GPU.Vulkan.Native.Atomically (atomically)
 import Control.Exception (Exception, ExceptionWithContext (ExceptionWithContext), SomeException, displayException, fromException, mask, mask_, onException, rethrowIO, throwIO, try, tryWithContext)
 import Data.Text (Text)
 import qualified Data.Text as Text

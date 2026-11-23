@@ -13,7 +13,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Roots (stateRootsModel)
 import Control.Arrow ((&&&))
 import Control.Concurrent (killThread, myThreadId)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
-import Control.Concurrent.STM (atomically)
+import Hetoimasia.GPU.Vulkan.Native.Atomically (atomically)
 import Control.Exception (ErrorCall (ErrorCall), ExceptionWithContext (ExceptionWithContext), SomeException, throwIO, try, tryWithContext)
 import Control.Monad (forM_, void, when)
 import qualified Data.ByteString as ByteString

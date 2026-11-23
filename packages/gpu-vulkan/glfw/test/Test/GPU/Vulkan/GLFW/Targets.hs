@@ -23,7 +23,8 @@ module Test.GPU.Vulkan.GLFW.Targets (spec) where
 
 import Control.Concurrent (ThreadId, myThreadId, throwTo, yield)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar, tryPutMVar)
-import Control.Concurrent.STM (STM, TVar, atomically, check, modifyTVar', newTVarIO, orElse, readTVar, readTVarIO, retry, writeTVar)
+import Control.Concurrent.STM (STM, TVar, check, modifyTVar', newTVarIO, orElse, readTVar, readTVarIO, retry, writeTVar)
+import Hetoimasia.GPU.Vulkan.Native.Atomically (atomically)
 import Control.Exception (AsyncException (ThreadKilled), ErrorCall (..), Exception, ExceptionWithContext (..), SomeAsyncException, SomeException, catch, displayException, finally, fromException, rethrowIO, throwIO, try, tryWithContext)
 import Control.Monad (replicateM_, void, when)
 import Data.Foldable (for_)

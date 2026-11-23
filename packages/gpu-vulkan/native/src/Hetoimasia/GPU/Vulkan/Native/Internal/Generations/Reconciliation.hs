@@ -36,7 +36,8 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Generations.Reconciliation
   ( reconcile
   ) where
 
-import Control.Concurrent.STM (STM, atomically, modifyTVar', readTVar)
+import Control.Concurrent.STM (STM, modifyTVar', readTVar)
+import Hetoimasia.GPU.Vulkan.Native.Atomically (atomically)
 import Control.Exception
   ( Exception (displayException)
   , ExceptionWithContext (ExceptionWithContext)
@@ -468,10 +469,12 @@ reconcile generations now target geometry = do
                 _ → do
                   (described, pending) ← diagnosisOf exception
                   failed candidate described
-                  deliverAfterRecord failure pending
                   -- A creation that answered the surface lost has lost it for
-                  -- every later construction too: the surface is replaced.
+                  -- every later construction too: the surface is replaced. That
+                  -- disposition is recorded with the generation's failure, before
+                  -- a cancellation met while describing it goes on.
                   when (rootsNativeFailure roots exception == Just FailedSurfaceLost) loseSurface
+                  deliverAfterRecord failure pending
                   if isAsynchronous exception then rethrowIO failure else rethrowUnlessOrdinary failure
     -- Device loss was latched by the call that raised it and is the owner's
     -- failure; any other failure is this construction's, and is settled.

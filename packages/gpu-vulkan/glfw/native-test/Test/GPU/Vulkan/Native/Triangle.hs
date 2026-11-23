@@ -39,7 +39,8 @@ module Test.GPU.Vulkan.Native.Triangle
   ) where
 
 import Control.Concurrent (ThreadId, myThreadId)
-import Control.Concurrent.STM (STM, atomically, check, modifyTVar', newTVarIO, orElse, readTVar, readTVarIO, registerDelay, retry, writeTVar)
+import Control.Concurrent.STM (STM, check, modifyTVar', newTVarIO, orElse, readTVar, readTVarIO, registerDelay, retry, writeTVar)
+import Hetoimasia.GPU.Vulkan.Native.Atomically (atomically)
 import Control.Exception (SomeException, displayException, throwIO, try)
 import Control.Monad (forM, forM_, when)
 import Data.Bits ((.&.))

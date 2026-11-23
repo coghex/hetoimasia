@@ -42,7 +42,8 @@ module Test.GPU.Vulkan.Native.Terminal
   , injectedMessageId
   ) where
 
-import Control.Concurrent.STM (STM, atomically, check, modifyTVar', newEmptyTMVarIO, newTVarIO, orElse, readTMVar, readTVar, readTVarIO, registerDelay, retry, tryPutTMVar)
+import Control.Concurrent.STM (STM, check, modifyTVar', newEmptyTMVarIO, newTVarIO, orElse, readTMVar, readTVar, readTVarIO, registerDelay, retry, tryPutTMVar)
+import Hetoimasia.GPU.Vulkan.Native.Atomically (atomically)
 import Control.Exception (SomeException, displayException, finally, throwIO, try, tryWithContext)
 import Control.Monad (forM_, replicateM, unless, void, when)
 import Data.ByteString (ByteString)
@@ -95,17 +96,9 @@ import Hetoimasia.GPU.Vulkan.Diagnostics
   , ConsumerOutcome (..)
   , DiagnosticCapture
   , DiagnosticVerdict (..)
-  , CaptureAlarm (..)
   , Quiesced
   , VerdictIssue (..)
-  , CaptureOrder (..)
-  , SinkFailure (..)
-  , captureAlarms
-  , readCaptureSinkFailure
   , captureStatus
-  , claimCaptureOrder
-  , CaptureArrivals (..)
-  , captureArrivals
   , defaultCaptureConfig
   , diagnosticVerdict
   , verdictIssues
@@ -148,8 +141,7 @@ import Hetoimasia.GPU.Vulkan.Native.Recording
 import Hetoimasia.GPU.Vulkan.Native.Recording.Shaders (verificationShaders)
 import Hetoimasia.GPU.Vulkan.Native.Recording.Vulkan (vulkanRecordingOps)
 import Hetoimasia.GPU.Vulkan.Native.Roots
-  ( DiagnosticAlarm (..)
-  , RootStanding (..)
+  ( RootStanding (..)
   , Roots
   , RootsView (..)
   , SurfaceDestruction (..)
@@ -163,10 +155,7 @@ import Hetoimasia.GPU.Vulkan.Native.Roots
   , retireRootTarget
   , retireRoots
   , startRoots
-  , watchRootsDiagnosticsOrdered
-  , DiagnosticWatch (..)
-  , DiagnosticArrivals (..)
-  , DiagnosticOrder (..)
+  , watchRootsCapture
   )
 import Hetoimasia.GPU.Vulkan.Native.Roots.Vulkan (instancePointer, vulkanRootOps)
 import Hetoimasia.Runtime.GLFW
@@ -219,28 +208,6 @@ data Step = Step
   , stepErrors ∷ !Word64
   }
   deriving (Show)
-
--- | Claim the capture's order for a failure of the owner's own, as the
--- controller does.
-order ∷ DiagnosticCapture → IO DiagnosticOrder
-order capture =
-  claimCaptureOrder capture >>= \case
-    OwnerFailedFirst → (\arrived → OwnerFirst (DiagnosticArrivals (arrivedError arrived) (arrivedSink arrived) (arrivedSinkFirst arrived))) <$> captureArrivals capture
-    ErrorLatchedFirst → pure ValidationFirst
-    SinkFailedFirst → pure (SinkFirst (fmap sinkFailureReason <$> readCaptureSinkFailure capture))
-
--- | What the capture's latches say, as a checkpoint asks them: the error latch
--- and the sink's failure. The controller installs the same watch.
-alarms ∷ DiagnosticCapture → IO [DiagnosticAlarm]
-alarms capture =
-  map
-    ( \case
-        CaptureErrorLatched → AlarmValidationError
-        CaptureSinkFailed reason → AlarmSinkFailed reason
-        CaptureAlarmPending → AlarmPending
-        CaptureOwnerClaimed → AlarmOwnerClaimed
-    )
-    <$> captureAlarms capture
 
 -- ---------------------------------------------------------------------------
 -- A validation error during rendering
@@ -340,7 +307,7 @@ validationSession journal steps offeredAfter capture = do
   roots ← newRoots (vulkanRootOps capture) budgets (scriptedSource (pure (scriptedInstant zeroDuration)))
   -- The roots ask the capture at every checkpoint, and order the owner's own
   -- failures by its first-failure cell, as the controller has them.
-  atomically (watchRootsDiagnosticsOrdered roots (DiagnosticWatch (alarms capture) (order capture)))
+  atomically (watchRootsCapture roots capture)
   _ ← step "the instance and its messenger" (startRoots roots (InstanceRequest required ["VK_LAYER_KHRONOS_validation"] validationFeatures))
   proved ← newIORef Nothing
   let finish = do

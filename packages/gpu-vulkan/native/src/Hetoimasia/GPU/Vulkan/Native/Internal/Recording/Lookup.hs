@@ -23,7 +23,8 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Lookup
   , encodeVersion
   ) where
 
-import Control.Concurrent.STM (STM, atomically, catchSTM, modifyTVar', readTVar, readTVarIO, throwSTM, writeTVar)
+import Control.Concurrent.STM (STM, catchSTM, modifyTVar', readTVar, readTVarIO, throwSTM, writeTVar)
+import Hetoimasia.GPU.Vulkan.Native.Atomically (atomically)
 import Control.Exception (Exception)
 import Control.Monad (unless, when)
 import Data.Functor ((<&>))

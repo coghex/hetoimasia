@@ -13,7 +13,8 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Generations.Retirement
   ( retireTargetGenerations
   ) where
 
-import Control.Concurrent.STM (atomically, modifyTVar', readTVar)
+import Control.Concurrent.STM (modifyTVar', readTVar)
+import Hetoimasia.GPU.Vulkan.Native.Atomically (atomically)
 import Control.Exception (throwIO)
 import Control.Monad (unless, when)
 import Data.Foldable (for_)

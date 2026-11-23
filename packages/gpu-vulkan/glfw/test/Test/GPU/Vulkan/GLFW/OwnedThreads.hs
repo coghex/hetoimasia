@@ -14,7 +14,8 @@ module Test.GPU.Vulkan.GLFW.OwnedThreads (spec) where
 
 import Control.Concurrent (myThreadId)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, takeMVar)
-import Control.Concurrent.STM (atomically, check, newTVarIO, readTVar, retry, writeTVar)
+import Control.Concurrent.STM (check, newTVarIO, readTVar, retry, writeTVar)
+import Hetoimasia.GPU.Vulkan.Native.Atomically (atomically)
 import Control.Exception (finally)
 import Control.Monad (void, when)
 import Data.Foldable (for_)

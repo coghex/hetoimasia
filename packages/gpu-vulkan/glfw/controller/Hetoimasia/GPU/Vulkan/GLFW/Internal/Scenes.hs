@@ -144,7 +144,8 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Scenes
   , readSceneState
   ) where
 
-import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVarIO, readTVar, writeTVar)
+import Control.Concurrent.STM (STM, TVar, modifyTVar', newTVarIO, readTVar, writeTVar)
+import Hetoimasia.GPU.Vulkan.Native.Atomically (atomically)
 import Control.Exception (uninterruptibleMask_)
 import Control.Monad (filterM, forM_)
 import Data.Map.Strict (Map)

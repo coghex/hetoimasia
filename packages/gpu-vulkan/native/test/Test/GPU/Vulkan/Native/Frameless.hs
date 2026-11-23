@@ -10,7 +10,7 @@
 -- Nothing here creates a Vulkan object, and nothing waits on a clock.
 module Test.GPU.Vulkan.Native.Frameless (spec) where
 
-import Control.Concurrent.STM (atomically)
+import Hetoimasia.GPU.Vulkan.Native.Atomically (atomically)
 import Control.Exception (ErrorCall (ErrorCall), ExceptionWithContext (ExceptionWithContext), SomeException, fromException, throwIO, try)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as ByteString8

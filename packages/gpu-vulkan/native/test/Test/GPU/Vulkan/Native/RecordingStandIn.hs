@@ -38,7 +38,8 @@ module Test.GPU.Vulkan.Native.RecordingStandIn
   , standInRecordingLimits
   ) where
 
-import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, writeTVar)
+import Control.Concurrent.STM (TVar, modifyTVar', newTVarIO, readTVar, readTVarIO, writeTVar)
+import Hetoimasia.GPU.Vulkan.Native.Atomically (atomically)
 import Control.Exception (Exception, throwIO)
 import Control.Monad (when)
 import Data.ByteString (ByteString)

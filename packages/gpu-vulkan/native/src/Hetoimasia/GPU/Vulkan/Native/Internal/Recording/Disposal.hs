@@ -20,7 +20,8 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Disposal
   , retireRecording
   ) where
 
-import Control.Concurrent.STM (STM, atomically, modifyTVar', readTVar, readTVarIO)
+import Control.Concurrent.STM (STM, modifyTVar', readTVar, readTVarIO)
+import Hetoimasia.GPU.Vulkan.Native.Atomically (atomically)
 import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, mask_, rethrowIO, throwIO, tryWithContext)
 import Control.Monad (forM, unless)
 import Data.Foldable (for_)

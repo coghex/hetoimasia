@@ -12,7 +12,8 @@
 -- something /not/ to happen is labelled where it is made.
 module Test.GPU.Vulkan.GLFW.Loop (spec) where
 
-import Control.Concurrent.STM (STM, atomically, check, modifyTVar', newTVarIO, orElse, readTVar, readTVarIO, registerDelay, retry, writeTVar)
+import Control.Concurrent.STM (STM, check, modifyTVar', newTVarIO, orElse, readTVar, readTVarIO, registerDelay, retry, writeTVar)
+import Hetoimasia.GPU.Vulkan.Native.Atomically (atomically)
 import Control.Exception (Exception (..), SomeException, throwIO, toException, try)
 import Control.Monad (forM, forM_, unless, void, when)
 import Data.List (isInfixOf, isSubsequenceOf)

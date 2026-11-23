@@ -16,7 +16,8 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Loss
   ( releaseFramesToDeviceLoss
   ) where
 
-import Control.Concurrent.STM (atomically, modifyTVar', readTVar, readTVarIO)
+import Control.Concurrent.STM (modifyTVar', readTVar, readTVarIO)
+import Hetoimasia.GPU.Vulkan.Native.Atomically (atomically)
 import Control.Exception (mask_)
 import Data.Foldable (for_)
 import qualified Data.Map.Strict as Map

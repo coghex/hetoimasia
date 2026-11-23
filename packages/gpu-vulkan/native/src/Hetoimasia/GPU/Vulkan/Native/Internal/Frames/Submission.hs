@@ -16,7 +16,8 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Submission
   ( submitFrames
   ) where
 
-import Control.Concurrent.STM (atomically, modifyTVar', readTVar)
+import Control.Concurrent.STM (modifyTVar', readTVar)
+import Hetoimasia.GPU.Vulkan.Native.Atomically (atomically)
 import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, displayException, fromException, mask_, rethrowIO, throwIO, tryWithContext)
 import Control.Monad (forM, unless)
 import Data.Foldable (for_)

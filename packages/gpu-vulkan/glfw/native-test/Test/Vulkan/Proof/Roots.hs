@@ -42,7 +42,8 @@ module Test.Vulkan.Proof.Roots
   ) where
 
 import Control.Concurrent (ThreadId, myThreadId)
-import Control.Concurrent.STM (atomically, check)
+import Control.Concurrent.STM (check)
+import Hetoimasia.GPU.Vulkan.Native.Atomically (atomically)
 import Control.Exception (SomeException, displayException, throwIO, try)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as Char8

@@ -47,7 +47,8 @@ module Test.GPU.Vulkan.Native.ConnectionLoss
   , spec
   ) where
 
-import Control.Concurrent.STM (STM, atomically, check, modifyTVar', newTVarIO, orElse, readTVar, readTVarIO, registerDelay, retry, writeTVar)
+import Control.Concurrent.STM (STM, check, modifyTVar', newTVarIO, orElse, readTVar, readTVarIO, registerDelay, retry, writeTVar)
+import Hetoimasia.GPU.Vulkan.Native.Atomically (atomically)
 import Control.Exception (SomeException, displayException, fromException, throwIO, try)
 import Control.Monad (forM_, when)
 import Data.IORef (newIORef, readIORef, writeIORef)

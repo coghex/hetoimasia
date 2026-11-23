@@ -72,7 +72,8 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Allocation
   , nameAllocation
   ) where
 
-import Control.Concurrent.STM (STM, atomically)
+import Control.Concurrent.STM (STM)
+import Hetoimasia.GPU.Vulkan.Native.Atomically (atomically)
 import Control.Exception
   ( Exception (displayException)
   , ExceptionWithContext (ExceptionWithContext)

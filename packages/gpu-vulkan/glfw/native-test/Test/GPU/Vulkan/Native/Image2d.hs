@@ -47,7 +47,8 @@ module Test.GPU.Vulkan.Native.Image2d
 
 import Hetoimasia.Foundation.OwnerTx (commit)
 import Control.Concurrent (ThreadId, myThreadId)
-import Control.Concurrent.STM (STM, atomically, check, modifyTVar', newTVarIO, orElse, readTVar, readTVarIO, registerDelay, retry, writeTVar)
+import Control.Concurrent.STM (STM, check, modifyTVar', newTVarIO, orElse, readTVar, readTVarIO, registerDelay, retry, writeTVar)
+import Hetoimasia.GPU.Vulkan.Native.Atomically (atomically)
 import Control.Exception (SomeException, displayException, throwIO, try)
 import Control.Monad (when)
 import Data.IORef (newIORef, readIORef, writeIORef)

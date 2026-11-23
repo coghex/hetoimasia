@@ -134,7 +134,8 @@ module Test.GPU.Vulkan.Native.SurfaceFree
 
 import Hetoimasia.Foundation.OwnerTx (commit)
 import Control.Concurrent (ThreadId, myThreadId, threadDelay)
-import Control.Concurrent.STM (STM, TVar, atomically, check, modifyTVar', newTVarIO, orElse, readTVar, readTVarIO, registerDelay, retry)
+import Control.Concurrent.STM (STM, TVar, check, modifyTVar', newTVarIO, orElse, readTVar, readTVarIO, registerDelay, retry)
+import Hetoimasia.GPU.Vulkan.Native.Atomically (atomically)
 import Control.Exception (SomeException, displayException, throwIO, try)
 import Control.Monad (void, when)
 import Data.Functor ((<&>))

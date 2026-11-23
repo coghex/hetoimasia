@@ -320,7 +320,8 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , VulkanRequiredTargetFailed (..)
   ) where
 
-import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, retry, stateTVar, writeTVar)
+import Control.Concurrent.STM (STM, TVar, modifyTVar', newTVarIO, readTVar, readTVarIO, retry, stateTVar, writeTVar)
+import Hetoimasia.GPU.Vulkan.Native.Atomically (atomically)
 import Control.Exception
   ( Exception (displayException)
   , ExceptionWithContext (ExceptionWithContext)
@@ -335,6 +336,7 @@ import Control.Exception
   , throwIO
   , tryWithContext
   )
+import Control.Applicative ((<|>))
 import Control.Monad (forM, forM_, join, unless, void, when)
 import Control.Monad.IO.Class (liftIO)
 import Data.ByteString (ByteString)
@@ -376,7 +378,7 @@ import qualified Hetoimasia.GLFW.Window as Window
 import Hetoimasia.GPU.Model
   ( Escalation (OptionalTargetUnavailable, RequiredTargetFailedSession)
   , GpuModel
-  , SessionFailureCause (RequiredTargetUnrecoverable)
+  , SessionFailureCause (CleanupFailed, RequiredTargetUnrecoverable)
   , SessionState (SessionFailed)
   , escalations
   , modelBudgets
@@ -385,20 +387,12 @@ import Hetoimasia.GPU.Model
 import Hetoimasia.GPU.Model.Budget (Budgets, frameSlotLimit)
 import Hetoimasia.GPU.Model.Identity (GenerationId, TargetClass (..), TargetId)
 import Hetoimasia.GPU.Vulkan.Diagnostics
-  ( CaptureAlarm (..)
-  , CaptureConfig
-  , CaptureOrder (..)
+  ( CaptureConfig
   , DiagnosticCapture
   , DiagnosticVerdict
   , Quiesced
-  , SinkFailure (..)
   , afterLastCallback
-  , captureAlarms
   , captureSinkFailure
-  , readCaptureSinkFailure
-  , claimCaptureOrder
-  , CaptureArrivals (..)
-  , captureArrivals
   , retainStorage
   , withDiagnosticCapture
   )
@@ -534,8 +528,7 @@ import Hetoimasia.Foundation.Exit (Exit, IssuerStanding (..))
 import Hetoimasia.Foundation.OwnerTx (OwnerTx, commit)
 import Hetoimasia.Foundation.OwnerTx.Issuer (fromIssuerSTM)
 import Hetoimasia.GPU.Vulkan.Native.Roots
-  ( DiagnosticAlarm (..)
-  , GenerationOps (..)
+  ( GenerationOps (..)
   , RootOps (..)
   , GraphicsDeviceLost
   , RootStanding (..)
@@ -553,14 +546,15 @@ import Hetoimasia.GPU.Vulkan.Native.Roots
   , checkpointRoots
   , checkpointRootsSettled
   , terminalFailure
-  , latchTerminal
+  , PreparedFailure
+  , prepareFailure
+  , latchPreparedFailure
   , noteTeardownEvidence
   , readRootsTerminal
   , rootsFailedCause
-  , watchRootsDiagnosticsOrdered
-  , DiagnosticWatch (..)
-  , DiagnosticArrivals (..)
-  , DiagnosticOrder (..)
+  , watchRootsCapture
+  , diagnosisOf
+  , deliverAfterRecord
   , destroyRoots
   , newRoots
   , readRootTargets
@@ -1518,7 +1512,10 @@ retaining state action =
     Left failure@(ExceptionWithContext _ exception)
       | isAsynchronous exception → rethrowIO failure
       | otherwise → do
-          atomically (noteTeardownEvidence (stateRoots state) (RetainedUnverified (Text.pack (displayException exception))))
+          -- the description rendered and forced in protected IO first; a cancellation met there goes on once it is noted
+          (described, pending) ← diagnosisOf exception
+          atomically (noteTeardownEvidence (stateRoots state) (RetainedUnverified described))
+          deliverAfterRecord failure pending
           rethrowIO (failure ∷ ExceptionWithContextSome)
 
 
@@ -1591,7 +1588,9 @@ settleUnannounced state = do
         let obligations = nubBy (bridgeSameObligation bridge) (deposited <> listed)
         outcomes ← mapM (bridgeDischarge bridge) obligations
         atomically (modifyTVar' (stateUnannounced state) (Map.delete attachment))
-        atomically (latchDischarges state "an unannounced attachment's" (zip obligations outcomes))
+        prepared ← prepareDischarges state "an unannounced attachment's" (zip obligations outcomes)
+        atomically (latchDischarges state prepared)
+        deliverDischarges prepared
         case [failure | Just (ExceptionWithContext _ failure) ← map dischargeFailure outcomes] of
           failure : _ → throwIO (UnannouncedSurfaceUncertain attachment (Text.pack (displayException failure)))
           [] → pure True
@@ -1914,9 +1913,11 @@ reject
   → IO TargetHandoff
 reject state attachment reason obligations = do
   outcomes ← mapM (bridgeDischarge (stateBridge state)) obligations
+  prepared ← prepareDischarges state "a rejected target's" (zip obligations outcomes)
   atomically $ do
     retainRejection state attachment reason
-    latchDischarges state "a rejected target's" (zip obligations outcomes)
+    latchDischarges state prepared
+  deliverDischarges prepared
   let uncertain = length [() | Just _ ← map dischargeFailure outcomes]
       destroyed = length obligations - uncertain
   pure $
@@ -1970,7 +1971,9 @@ retireTarget state retiring = do
     LeaseReady lease → do
       left ← atomically (obligationsOf (stateBridge state) lease attachment)
       outcomes ← mapM (bridgeDischarge (stateBridge state)) left
-      atomically (latchDischarges state "a retired target's" (zip left outcomes))
+      prepared ← prepareDischarges state "a retired target's" (zip left outcomes)
+      atomically (latchDischarges state prepared)
+      deliverDischarges prepared
       case [failure | Just failure ← map dischargeFailure outcomes] of
         failure : _ → rethrowIO failure
         [] → pure (length left)
@@ -1994,7 +1997,9 @@ retireOwner state retiring = do
       let exempt = held <> retiringUnverified retiring
           orphans = [obligation | obligation ← listed, bridgeObligationAttachment bridge obligation `notElem` exempt]
       outcomes ← mapM (bridgeDischarge bridge) orphans
-      atomically (latchDischarges state "an orphaned" (zip orphans outcomes))
+      prepared ← prepareDischarges state "an orphaned" (zip orphans outcomes)
+      atomically (latchDischarges state prepared)
+      deliverDischarges prepared
       let uncertain = length [() | Just _ ← map dischargeFailure outcomes]
       when (uncertain > 0) (throwIO (OrphanSurfacesUncertain uncertain))
       pure (length orphans)
@@ -2037,7 +2042,9 @@ destroyOwner state = do
       -- A late surface whose destruction did not complete is a failed
       -- cleanup, whatever else failed first; the lease then still owes it,
       -- which retains the instance below.
-      atomically (latchDischarges state "a late" (zip late outcomes))
+      prepared ← prepareDischarges state "a late" (zip late outcomes)
+      atomically (latchDischarges state prepared)
+      deliverDischarges prepared
       answer ← atomically (bridgeRelease bridge lease)
       unless (answer == LeaseReleasable) (throwIO (LeaseRetained answer))
       pure (length late)
@@ -2055,15 +2062,29 @@ destroyOwner state = do
 -- destruction already raised answers 'DischargeStillUncertain' when a later
 -- pass finds it still owed, and is not latched again: what is recognised is
 -- the obligation, never a handle a later surface may reuse.
-latchDischarges ∷ State inst msgr phys dev cmd lease obligation → Text → [(obligation, Discharged)] → STM ()
-latchDischarges state what outcomes =
-  for_ [(obligation, failure) | (obligation, DischargeUncertain (ExceptionWithContext _ failure)) ← outcomes] $ \(obligation, failure) →
-    latchTerminal (stateRoots state) . TerminalCleanupFailed $
+--
+-- Each failure's description is rendered and forced first, in protected IO ('prepareDischarges'); the latches then
+-- evaluate nothing ('latchDischarges'), and a cancellation met while rendering goes on once they are committed
+-- ('deliverDischarges').
+latchDischarges ∷ State inst msgr phys dev cmd lease obligation → PreparedDischarges → STM ()
+latchDischarges state (PreparedDischarges prepared _) = for_ prepared (latchPreparedFailure (stateRoots state))
+
+-- The discharge failures of one pass, prepared, and a cancellation met while describing them.
+data PreparedDischarges = PreparedDischarges ![PreparedFailure] !(Maybe (ExceptionWithContext SomeException))
+
+prepareDischarges ∷ State inst msgr phys dev cmd lease obligation → Text → [(obligation, Discharged)] → IO PreparedDischarges
+prepareDischarges state what outcomes = do
+  prepared ← forM [(obligation, failure) | (obligation, DischargeUncertain (ExceptionWithContext _ failure)) ← outcomes] $ \(obligation, failure) →
+    prepareFailure CleanupFailed $
       "destroying " <> what <> " surface " <> hex (bridgeObligationHandle bridge obligation)
         <> " of " <> tshow (bridgeObligationAttachment bridge obligation)
         <> ": " <> Text.pack (displayException failure)
+  pure (PreparedDischarges (map fst prepared) (foldr ((<|>) . snd) Nothing prepared))
   where
     bridge = stateBridge state
+
+deliverDischarges ∷ PreparedDischarges → IO ()
+deliverDischarges (PreparedDischarges _ pending) = mapM_ rethrowIO pending
 
 obligationsOf ∷ SurfaceBridge lease obligation → lease → AttachmentId → STM [obligation]
 obligationsOf bridge lease attachment =
@@ -2531,17 +2552,6 @@ readVulkanActionGate (VulkanController state) = actionGate (stateRoots state) (s
 -- error-severity report whatever became of the report's detail, and its
 -- sink's failure — in the order they happened, so a checkpoint that learns of
 -- both latches the first as the primary.
--- | Claim the capture's order for a failure of the owner's own, and say who
--- holds it: the owner, or the error report or sink failure that came first.
--- With the owner's answer goes which diagnostic failures had arrived, read
--- right after the claim: the order point a claim over a void one takes.
-diagnosticOrder ∷ DiagnosticCapture → IO DiagnosticOrder
-diagnosticOrder capture =
-  claimCaptureOrder capture >>= \case
-    OwnerFailedFirst → (\arrived → OwnerFirst (DiagnosticArrivals (arrivedError arrived) (arrivedSink arrived) (arrivedSinkFirst arrived))) <$> captureArrivals capture
-    ErrorLatchedFirst → pure ValidationFirst
-    SinkFailedFirst → pure (SinkFirst (fmap sinkFailureReason <$> readCaptureSinkFailure capture))
-
 -- | Whether a failure the owner has not acted on asks for a round: the
 -- capture's sink has failed and nothing is latched yet — the one diagnostic
 -- failure that arrives on a thread of its own rather than inside a call the
@@ -2556,17 +2566,6 @@ failureOwed state capture = do
   latched ← isJust . reportPrimary <$> readRootsTerminal (stateRoots state)
   taken ← readTVar (stateFailureTaken state)
   pure ((failed && not latched) || (latched && not taken))
-
-diagnosticAlarms ∷ DiagnosticCapture → IO [DiagnosticAlarm]
-diagnosticAlarms capture =
-  map
-    ( \case
-        CaptureErrorLatched → AlarmValidationError
-        CaptureSinkFailed reason → AlarmSinkFailed reason
-        CaptureAlarmPending → AlarmPending
-        CaptureOwnerClaimed → AlarmOwnerClaimed
-    )
-    <$> captureAlarms capture
 
 -- | The swapchain generations of the target this attachment is, while the
 -- owner holds it.
@@ -2905,7 +2904,7 @@ withVulkanOwnerHostHooked hooks capturing logger layer rendering pointer bridge 
     -- it for that checkpoint.
     targets ← newTargets (vulkanTargetCapacity config) (vulkanScene config)
     atomically $ do
-      watchRootsDiagnosticsOrdered (stateRoots state) (DiagnosticWatch (diagnosticAlarms capture) (diagnosticOrder capture))
+      watchRootsCapture (stateRoots state) capture
       writeTVar (stateWake state) (failureOwed state capture)
     let session = do
           entered ← enter (hostSessionConfig host)

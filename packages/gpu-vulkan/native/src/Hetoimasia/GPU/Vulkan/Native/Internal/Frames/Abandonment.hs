@@ -16,7 +16,8 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Abandonment
   , cleanupSubmission
   ) where
 
-import Control.Concurrent.STM (STM, atomically, readTVar, readTVarIO)
+import Control.Concurrent.STM (STM, readTVar, readTVarIO)
+import Hetoimasia.GPU.Vulkan.Native.Atomically (atomically)
 import Control.Exception
   ( ExceptionWithContext (ExceptionWithContext)
   , SomeException

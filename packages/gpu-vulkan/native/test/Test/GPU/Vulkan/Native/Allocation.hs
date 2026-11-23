@@ -10,7 +10,7 @@
 -- creates a Vulkan object.
 module Test.GPU.Vulkan.Native.Allocation (spec) where
 
-import Control.Concurrent.STM (atomically)
+import Hetoimasia.GPU.Vulkan.Native.Atomically (atomically)
 import Control.Exception (Exception, fromException, try)
 import qualified Crypto.Hash.SHA256 as SHA256
 import qualified Data.ByteString as ByteString
@@ -31,7 +31,7 @@ import Hetoimasia.GPU.Vulkan.Native.Allocator
 import Hetoimasia.GPU.Vulkan.Native.Generations (newGenerations)
 import Hetoimasia.GPU.Vulkan.Native.Naming (readbackBufferName)
 import Hetoimasia.GPU.Vulkan.Native.Recording
-import Hetoimasia.GPU.Vulkan.Native.Roots
+import Hetoimasia.GPU.Vulkan.Native.Internal.Roots
 import Test.GPU.Vulkan.Native.AllocatorStandIn
 import Test.GPU.Vulkan.Native.RecordingStandIn (newRecordingStandIn, recordingStandInOps)
 import Test.GPU.Vulkan.Native.StandIn (Call (..), Scripted (..), StandIn (standAllocator), StandInFailure (..), StandInRoots, Step (..), calls, newStandIn, newStandInRoots, script, standardRequest)

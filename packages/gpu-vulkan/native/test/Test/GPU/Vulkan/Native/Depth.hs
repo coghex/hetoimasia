@@ -17,7 +17,7 @@
 -- Nothing here creates a Vulkan object, and nothing waits on a clock.
 module Test.GPU.Vulkan.Native.Depth (spec) where
 
-import Control.Concurrent.STM (atomically)
+import Hetoimasia.GPU.Vulkan.Native.Atomically (atomically)
 import Control.Monad (when)
 import Control.Exception (ErrorCall (ErrorCall), SomeException, throwIO, try)
 import qualified Data.ByteString as ByteString
@@ -33,7 +33,7 @@ import Hetoimasia.GPU.Model.Identity (IdentityKind (..), Misuse (..))
 import Hetoimasia.GPU.Vulkan.Native.Frames
 import Hetoimasia.GPU.Vulkan.Native.Presentation (formatB8G8R8A8Srgb)
 import Hetoimasia.GPU.Vulkan.Native.Recording
-import Hetoimasia.GPU.Vulkan.Native.Roots (failRootsSessionBecause)
+import Hetoimasia.GPU.Vulkan.Native.Internal.Roots (failRootsSessionBecause)
 import Test.GPU.Vulkan.Native.FramesRig
 import Test.GPU.Vulkan.Native.FramesStandIn
 import Test.GPU.Vulkan.Native.RecordingStandIn (RecordingCall (..), RecordingFailure, RecordingStep (AtRecord), failAt, recordingCalls, standInImageLimits, supportImages)

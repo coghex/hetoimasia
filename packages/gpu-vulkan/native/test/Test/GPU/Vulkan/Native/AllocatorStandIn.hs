@@ -56,7 +56,8 @@ module Test.GPU.Vulkan.Native.AllocatorStandIn
   , liveAllocations
   ) where
 
-import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, writeTVar)
+import Control.Concurrent.STM (STM, TVar, modifyTVar', newTVarIO, readTVar, readTVarIO, writeTVar)
+import Hetoimasia.GPU.Vulkan.Native.Atomically (atomically)
 import Control.Exception (Exception, SomeException, throwIO, toException)
 import Control.Monad (when)
 import Data.ByteString (ByteString)

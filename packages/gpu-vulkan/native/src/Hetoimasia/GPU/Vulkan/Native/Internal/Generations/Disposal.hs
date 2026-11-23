@@ -22,7 +22,8 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Generations.Disposal
   , progress
   ) where
 
-import Control.Concurrent.STM (STM, atomically, modifyTVar', readTVar)
+import Control.Concurrent.STM (STM, modifyTVar', readTVar)
+import Hetoimasia.GPU.Vulkan.Native.Atomically (atomically)
 import Control.Exception
   ( ExceptionWithContext (ExceptionWithContext)
   , mask_

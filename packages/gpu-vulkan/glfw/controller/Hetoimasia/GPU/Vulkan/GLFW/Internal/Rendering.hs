@@ -196,7 +196,8 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Rendering
 import Hetoimasia.Foundation.Messaging.Payload (Prepared)
 import Hetoimasia.Foundation.OwnerTx (OwnerTx, commit)
 import Hetoimasia.Foundation.OwnerTx.Issuer (fromIssuerSTM)
-import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, stateTVar, writeTVar)
+import Control.Concurrent.STM (STM, TVar, modifyTVar', newTVarIO, readTVar, readTVarIO, stateTVar, writeTVar)
+import Hetoimasia.GPU.Vulkan.Native.Atomically (atomically)
 import Control.Exception
   ( Exception (displayException)
   , ExceptionWithContext (ExceptionWithContext)
@@ -409,6 +410,7 @@ import Hetoimasia.GPU.Vulkan.Native.Uploads
   , UploadsCell
   , newUploadsCellIO
   , setUploadsStandingTx
+  , prepareUploadsStanding
   , readUploadsStanding
   , UploadConfig
   , UploadProgress (..)
@@ -1829,7 +1831,9 @@ makeRenderingUploads rendering =
         Nothing → pure False
         Just made → do
           made' ← newUploads (liveFrames made) config
-          True <$ commit (setUploadsStandingTx (renderingUploads rendering) (either UploadsRefused UploadsMade made'))
+          -- the standing, a refusal's cause included, evaluated in full before the commit installs it
+          standing ← prepareUploadsStanding (either UploadsRefused UploadsMade made')
+          True <$ commit (setUploadsStandingTx (renderingUploads rendering) standing)
     _ → pure False
 
 -- | One owner step's uploads, on the owner's thread, after the step has

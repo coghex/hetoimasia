@@ -256,8 +256,6 @@ test-suite vulkan-native-tests
     if os(linux)
         extra-libraries: rt m dl
     build-depends:
-        -- the roots-internal unit: test rigs that move the model directly (stateRootsModel)
-        hetoimasia-gpu-vulkan-native:roots-internal,
         array >=0.5 && <0.6,
         base >=4.22 && <4.23,
         bytestring >=0.12 && <0.13,

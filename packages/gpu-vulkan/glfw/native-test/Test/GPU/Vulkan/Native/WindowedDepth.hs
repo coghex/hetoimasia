@@ -45,7 +45,8 @@ module Test.GPU.Vulkan.Native.WindowedDepth
   ) where
 
 import Control.Concurrent (ThreadId, myThreadId)
-import Control.Concurrent.STM (STM, TVar, atomically, check, modifyTVar', newTVarIO, orElse, readTVar, readTVarIO, registerDelay, retry, writeTVar)
+import Control.Concurrent.STM (STM, TVar, check, modifyTVar', newTVarIO, orElse, readTVar, readTVarIO, registerDelay, retry, writeTVar)
+import Hetoimasia.GPU.Vulkan.Native.Atomically (atomically)
 import Control.Exception (SomeException, displayException, throwIO, try)
 import Control.Monad (forM, forM_, when)
 import Data.Bits ((.&.))

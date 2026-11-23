@@ -72,7 +72,7 @@ module Test.GPU.Vulkan.Native.FramesRig
 import Hetoimasia.GPU.Vulkan.Native.Internal.Roots (stateRootsModel)
 import Control.Concurrent (ThreadId, killThread, myThreadId, yield)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
-import Control.Concurrent.STM (atomically)
+import Hetoimasia.GPU.Vulkan.Native.Atomically (atomically)
 import Control.Exception (AsyncException (ThreadKilled), Exception, SomeException, fromException, try)
 import Control.Monad (unless, void, when)
 import Data.Functor ((<&>))

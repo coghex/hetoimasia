@@ -8,7 +8,8 @@ module Test.GPU.Vulkan.Native.Roots (spec) where
 
 import Control.Concurrent (killThread)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
-import Control.Concurrent.STM (STM, atomically, newTVarIO, writeTVar)
+import Control.Concurrent.STM (STM, newTVarIO, writeTVar)
+import Hetoimasia.GPU.Vulkan.Native.Atomically (atomically)
 import Control.Exception (AsyncException, Exception, SomeException, fromException, try)
 import Control.Monad (void)
 import Data.IORef (modifyIORef', newIORef, readIORef)
@@ -39,7 +40,7 @@ import Hetoimasia.GPU.Vulkan.Native.Profile
   , selectSurfaceFreeDevice
   , validationFeaturesExtension
   )
-import Hetoimasia.GPU.Vulkan.Native.Roots
+import Hetoimasia.GPU.Vulkan.Native.Internal.Roots
 import Test.GPU.Vulkan.Native.StandIn
 import Test.Support.Owned (withOwnedThread, withOwnedThreadOpening)
 import Test.Hspec (Spec, describe, it, shouldBe, shouldReturn, shouldSatisfy)

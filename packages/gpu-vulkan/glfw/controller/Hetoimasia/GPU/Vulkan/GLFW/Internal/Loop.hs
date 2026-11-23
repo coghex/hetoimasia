@@ -59,7 +59,8 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Loop
   , foldOwnerDeadline
   ) where
 
-import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVarIO, writeTVar)
+import Control.Concurrent.STM (TVar, modifyTVar', newTVarIO, readTVarIO, writeTVar)
+import Hetoimasia.GPU.Vulkan.Native.Atomically (atomically)
 import Control.Monad (forM, void, when)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map

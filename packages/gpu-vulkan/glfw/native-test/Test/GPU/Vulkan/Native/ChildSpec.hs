@@ -22,7 +22,8 @@ module Test.GPU.Vulkan.Native.ChildSpec (spec) where
 
 import Control.Concurrent (ThreadId, newEmptyMVar, putMVar, readMVar, takeMVar, throwTo)
 import Control.Concurrent.MVar (MVar)
-import Control.Concurrent.STM (atomically, check)
+import Control.Concurrent.STM (check)
+import Hetoimasia.GPU.Vulkan.Native.Atomically (atomically)
 import Control.Exception (SomeException, annotateIO, someExceptionContext, ErrorCall (..), throwIO, IOException, bracket, finally, fromException, try)
 import Control.Exception.Annotation (ExceptionAnnotation)
 import Control.Exception.Context (getExceptionAnnotations)

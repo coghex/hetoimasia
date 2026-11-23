@@ -46,7 +46,8 @@ module Test.GPU.Vulkan.Native.Ordering
   ) where
 
 import Control.Concurrent (threadDelay)
-import Control.Concurrent.STM (atomically, modifyTVar', newTVarIO, readTVarIO)
+import Control.Concurrent.STM (modifyTVar', newTVarIO, readTVarIO)
+import Hetoimasia.GPU.Vulkan.Native.Atomically (atomically)
 import Control.Exception (SomeException, displayException, finally, throwIO, try, tryWithContext)
 import Control.Monad (unless, when)
 import qualified Data.ByteString.Char8 as Char8

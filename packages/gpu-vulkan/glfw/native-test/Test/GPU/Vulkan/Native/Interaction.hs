@@ -68,7 +68,8 @@ module Test.GPU.Vulkan.Native.Interaction
   ) where
 
 import Control.Concurrent (threadDelay)
-import Control.Concurrent.STM (atomically, newTVarIO, readTVarIO, writeTVar)
+import Control.Concurrent.STM (newTVarIO, readTVarIO, writeTVar)
+import Hetoimasia.GPU.Vulkan.Native.Atomically (atomically)
 import Control.Exception (SomeException, displayException, mask_, try)
 import Control.Monad (forM_, unless, when)
 import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)

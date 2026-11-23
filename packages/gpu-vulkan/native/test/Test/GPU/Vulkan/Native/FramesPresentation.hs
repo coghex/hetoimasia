@@ -16,7 +16,8 @@
 -- clock.
 module Test.GPU.Vulkan.Native.FramesPresentation (spec) where
 
-import Control.Concurrent.STM (STM, atomically)
+import Control.Concurrent.STM (STM)
+import Hetoimasia.GPU.Vulkan.Native.Atomically (atomically)
 import Control.Exception (ErrorCall (ErrorCall), SomeException, toException, try)
 import Control.Monad (forM, forM_, replicateM, void)
 import Data.List (sort)
@@ -43,7 +44,7 @@ import Hetoimasia.GPU.Vulkan.Native.Frames
 import Hetoimasia.GPU.Vulkan.Native.Generations
 import Hetoimasia.GPU.Vulkan.Native.Recording (Refusal (..))
 import Hetoimasia.GPU.Vulkan.Native.Presentation (SurfaceCapabilities (..), SurfaceExtent (..), SurfaceOffer (..))
-import Hetoimasia.GPU.Vulkan.Native.Roots (TerminalCause (..), failRootsSession, retireRootTarget, retireRoots)
+import Hetoimasia.GPU.Vulkan.Native.Internal.Roots (TerminalCause (..), failRootsSession, retireRootTarget, retireRoots)
 import Test.GPU.Vulkan.Native.FramesRig
 import Test.GPU.Vulkan.Native.FramesStandIn
 import qualified Test.GPU.Vulkan.Native.StandIn as Roots

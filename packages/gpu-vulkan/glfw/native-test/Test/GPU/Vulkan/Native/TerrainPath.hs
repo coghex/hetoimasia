@@ -34,7 +34,8 @@ module Test.GPU.Vulkan.Native.TerrainPath
   , Profile (..)
   ) where
 
-import Control.Concurrent.STM (atomically, check, orElse, readTVar, registerDelay, retry)
+import Control.Concurrent.STM (check, orElse, readTVar, registerDelay, retry)
+import Hetoimasia.GPU.Vulkan.Native.Atomically (atomically)
 import Control.Exception (evaluate)
 import Control.Monad (foldM, forM)
 import Crypto.Hash.SHA256 (hash)

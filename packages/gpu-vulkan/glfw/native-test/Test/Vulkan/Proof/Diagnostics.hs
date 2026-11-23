@@ -48,7 +48,8 @@ module Test.Vulkan.Proof.Diagnostics
   , sessionConfig
   ) where
 
-import Control.Concurrent.STM (atomically, modifyTVar', newTVarIO, readTVarIO)
+import Control.Concurrent.STM (modifyTVar', newTVarIO, readTVarIO)
+import Hetoimasia.GPU.Vulkan.Native.Atomically (atomically)
 import Control.Exception (SomeException, displayException, throwIO, try)
 import Control.Monad (forM, unless)
 import Data.Bits ((.&.))

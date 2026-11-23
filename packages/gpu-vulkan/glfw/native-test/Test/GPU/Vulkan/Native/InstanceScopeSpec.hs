@@ -19,7 +19,7 @@
 -- preserves exceptions, which is the same whatever raised them.
 module Test.GPU.Vulkan.Native.InstanceScopeSpec (spec) where
 
-import Control.Concurrent.STM (atomically)
+import Hetoimasia.GPU.Vulkan.Native.Atomically (atomically)
 import Control.Exception (Exception, ExceptionWithContext (..), SomeException, annotateIO, displayException, fromException, someExceptionContext, throwIO, try)
 import Control.Exception.Annotation (ExceptionAnnotation)
 import Control.Exception.Context (getExceptionAnnotations)

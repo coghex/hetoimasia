@@ -13,7 +13,8 @@ module Test.GPU.Vulkan.Native.WindowDepth (spec) where
 
 import Control.Concurrent (killThread, myThreadId)
 import Control.Concurrent.MVar (putMVar, newEmptyMVar, takeMVar)
-import Control.Concurrent.STM (atomically, check, newTVarIO, readTVar)
+import Control.Concurrent.STM (check, newTVarIO, readTVar)
+import Hetoimasia.GPU.Vulkan.Native.Atomically (atomically)
 import qualified Data.ByteString as ByteString
 import Control.Exception (AsyncException (ThreadKilled), SomeException, fromException, try)
 import Control.Monad (void)

@@ -20,7 +20,10 @@ module Test.GPU.Vulkan.Native.Terminal (spec) where
 
 import Control.Concurrent (killThread, myThreadId, threadDelay)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar, tryPutMVar)
-import Control.Concurrent.STM (atomically, newTVarIO, readTVarIO, throwSTM, writeTVar)
+import Control.Concurrent.STM (newTVarIO, readTVarIO, throwSTM, writeTVar)
+import Hetoimasia.GPU.Vulkan.Native.Atomically (atomically)
+import qualified Control.Concurrent.STM as STM
+import Hetoimasia.GPU.Vulkan.Native.Internal.Evidence (EvidencePending)
 import Control.Exception (AsyncException (ThreadKilled), ErrorCall (ErrorCall), Exception, SomeException, fromException, mask, throw, throwIO, toException, try)
 import Control.Monad (forM_, join, void, when)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
@@ -62,7 +65,7 @@ import Hetoimasia.GPU.Vulkan.Native.Generations
 import Hetoimasia.GPU.Vulkan.Native.Presentation (SurfaceExtent (..))
 import Hetoimasia.GPU.Vulkan.Native.Recording (Refusal (..), recordFrame, retireRecording)
 import Hetoimasia.Foundation.OwnerTx (watchPublication)
-import Hetoimasia.GPU.Vulkan.Native.Roots
+import Hetoimasia.GPU.Vulkan.Native.Internal.Roots
   ( Checkpoint (..)
   , rootsFailure
   , rootsFailedCause
@@ -78,6 +81,7 @@ import Hetoimasia.GPU.Vulkan.Native.Roots
   , checkpointRoots
   , checkpointRootsSettled
   , failRootsSessionBecause
+  , failRootsSessionIO
   , readRootsTerminal
   , retireRootTarget
   , retireRoots
@@ -219,6 +223,19 @@ spec = describe "Terminal failure" $ do
         Just (TerminalDeviceLost loss) → lostDuring loss == "vkQueueSubmit2" && "description raised" `isInfixOf` show loss
         _ → False)
       clean rig
+
+    it "prepares a failure's description in protected IO: a cancelled one latches the fixed description with its kind, publishes, and then the cancellation goes on" $ do
+      rig ← newRig
+      try @AsyncException (failRootsSessionIO (rigRoots rig) CleanupFailed (throw ThreadKilled)) `shouldReturn` Left ThreadKilled
+      snd <$> atomically (watchPublication (rootsFailure (rigRoots rig))) `shouldReturn` True
+      primaryIs rig (\case TerminalCleanupFailed reason → "description raised" `isInfixOf` show reason; _ → False)
+      clean rig
+      -- the transaction's own latch never swallows a cancellation: it goes on, and its transaction records nothing
+      rig' ← newRig
+      try @AsyncException (atomically (failRootsSessionBecause (rigRoots rig') CleanupFailed (throw ThreadKilled))) `shouldReturn` Left ThreadKilled
+      snd <$> atomically (watchPublication (rootsFailure (rigRoots rig'))) `shouldReturn` False
+      atomically (rootsFailedCause (rigRoots rig')) `shouldReturn` Nothing
+      clean rig'
 
     it "latches and publishes a failure whose description raises, with a fixed description, never rolling the record back" $ do
       rig ← newRig
@@ -637,6 +654,24 @@ spec = describe "Terminal failure" $ do
         evidenceOf rig `shouldReturn` []
         viewCondition <$> generationsOn rig required `shouldNotReturn` RecoverySpent
         clean rig
+
+    it "abandons a failing transaction while the sink's reason that claimed first place is unpublished, writing and publishing nothing, then commits that primary once outside the wait" $ do
+      rig ← newRig
+      published ← newTVarIO Nothing
+      atomically (watchRootsDiagnosticsOrdered (rigRoots rig) (DiagnosticWatch (pure []) (pure (SinkFirst (readTVarIO published)))))
+      before ← atomically (watchPublication (rootsFailure (rigRoots rig)))
+      -- one attempt, as the STM runtime runs it: it does not wait for the reason, it abandons itself
+      abandoned ← try @EvidencePending (STM.atomically (failRootsSessionBecause (rigRoots rig) CleanupFailed "a cleanup failed"))
+      either (const True) (const False) abandoned `shouldBe` True
+      atomically (watchPublication (rootsFailure (rigRoots rig))) `shouldReturn` before
+      atomically (rootsFailedCause (rigRoots rig)) `shouldReturn` Nothing
+      evidenceOf rig `shouldReturn` []
+      -- once the reason is published, the failure commits with the sink's failure as the primary, published once
+      atomically (writeTVar published (Just "the sink is gone"))
+      atomically (failRootsSessionBecause (rigRoots rig) CleanupFailed "a cleanup failed")
+      atomically (watchPublication (rootsFailure (rigRoots rig))) `shouldReturn` (fst before + 1, True)
+      primaryIs rig (== TerminalSinkFailed "the sink is gone")
+      clean rig
 
     it "orders a validation error that claimed first place ahead of the exhaustion it preceded, though no checkpoint could read it yet" $ do
       rig ← newRigClassed [RequiredTarget, OptionalTarget] defaultBudgetRequest

@@ -53,7 +53,7 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Reclamation
   , recoveringCreation
   ) where
 
-import Control.Concurrent.STM (atomically)
+import Hetoimasia.GPU.Vulkan.Native.Atomically (atomically)
 import Control.Exception
   ( Exception (displayException)
   , ExceptionWithContext (ExceptionWithContext)

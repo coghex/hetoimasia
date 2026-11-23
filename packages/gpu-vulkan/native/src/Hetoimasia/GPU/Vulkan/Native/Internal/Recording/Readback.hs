@@ -20,7 +20,7 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Readback
   , fillReadback
   ) where
 
-import Control.Concurrent.STM (atomically)
+import Hetoimasia.GPU.Vulkan.Native.Atomically (atomically)
 import Control.Exception (mask_)
 import Control.Monad (unless)
 import Data.ByteString (ByteString)

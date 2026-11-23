@@ -12,7 +12,8 @@
 module Test.GPU.Vulkan.GLFW.Actions (spec) where
 
 import Control.Concurrent (myThreadId)
-import Control.Concurrent.STM (TVar, atomically, check, modifyTVar', newTVarIO, orElse, readTVar, readTVarIO, registerDelay, writeTVar)
+import Control.Concurrent.STM (TVar, check, modifyTVar', newTVarIO, orElse, readTVar, readTVarIO, registerDelay, writeTVar)
+import Hetoimasia.GPU.Vulkan.Native.Atomically (atomically)
 import Control.Exception (Exception (..), ExceptionWithContext (..), SomeException, finally, rethrowIO, throwIO, toException, try, tryWithContext)
 import Control.Exception.Annotation (ExceptionAnnotation)
 import Control.Exception.Context (addExceptionAnnotation, getExceptionAnnotations)

@@ -14,7 +14,7 @@
 -- and nothing waits on a clock.
 module Test.GPU.Vulkan.Native.Frames (spec) where
 
-import Control.Concurrent.STM (atomically)
+import Hetoimasia.GPU.Vulkan.Native.Atomically (atomically)
 import Control.Exception (ErrorCall (ErrorCall), throwIO, try)
 import Data.IORef (modifyIORef', newIORef, readIORef)
 import Data.List.NonEmpty (NonEmpty ((:|)))
@@ -53,7 +53,7 @@ import Hetoimasia.GPU.Vulkan.Native.Generations
 import Hetoimasia.GPU.Vulkan.Native.Recording
 import qualified Data.Text as Text
 import Hetoimasia.Foundation.OwnerTx (watchPublication)
-import Hetoimasia.GPU.Vulkan.Native.Roots
+import Hetoimasia.GPU.Vulkan.Native.Internal.Roots
 import Test.GPU.Vulkan.Native.FramesRig
 import Test.GPU.Vulkan.Native.FramesStandIn
 

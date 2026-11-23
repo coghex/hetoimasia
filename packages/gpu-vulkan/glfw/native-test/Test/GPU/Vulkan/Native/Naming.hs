@@ -41,7 +41,8 @@ module Test.GPU.Vulkan.Native.Naming
   , spec
   ) where
 
-import Control.Concurrent.STM (atomically, modifyTVar', newTVarIO, readTVarIO)
+import Control.Concurrent.STM (modifyTVar', newTVarIO, readTVarIO)
+import Hetoimasia.GPU.Vulkan.Native.Atomically (atomically)
 import Control.Exception (SomeException, displayException, finally, throwIO, try, tryWithContext)
 import Control.Monad (unless, when)
 import Data.ByteString (ByteString)

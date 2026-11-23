@@ -53,7 +53,8 @@ module Test.GPU.Vulkan.Native.FramesStandIn
   , fenceStandings
   ) where
 
-import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, writeTVar)
+import Control.Concurrent.STM (STM, TVar, modifyTVar', newTVarIO, readTVar, readTVarIO, writeTVar)
+import Hetoimasia.GPU.Vulkan.Native.Atomically (atomically)
 import Control.Exception (Exception, SomeException, fromException, throwIO)
 import Control.Monad (unless, when)
 import Data.Foldable (for_)

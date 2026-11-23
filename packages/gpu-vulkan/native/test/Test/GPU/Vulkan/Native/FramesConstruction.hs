@@ -14,7 +14,7 @@
 -- example picks, after the call is recorded.
 module Test.GPU.Vulkan.Native.FramesConstruction (spec) where
 
-import Control.Concurrent.STM (atomically)
+import Hetoimasia.GPU.Vulkan.Native.Atomically (atomically)
 import Control.Exception
   ( Exception
   , ExceptionWithContext (ExceptionWithContext)

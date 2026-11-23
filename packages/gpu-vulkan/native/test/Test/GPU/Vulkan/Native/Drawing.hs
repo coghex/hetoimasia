@@ -13,7 +13,7 @@
 module Test.GPU.Vulkan.Native.Drawing (spec) where
 
 import Hetoimasia.GPU.Vulkan.Native.Internal.Roots (stateRootsModel)
-import Control.Concurrent.STM (atomically)
+import Hetoimasia.GPU.Vulkan.Native.Atomically (atomically)
 import Control.Exception (AsyncException (ThreadKilled), ErrorCall (ErrorCall), throwIO, try)
 import Control.Monad (when)
 import qualified Data.ByteString as ByteString

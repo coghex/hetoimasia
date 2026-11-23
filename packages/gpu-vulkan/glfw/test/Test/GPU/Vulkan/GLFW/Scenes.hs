@@ -14,7 +14,8 @@ module Test.GPU.Vulkan.GLFW.Scenes (spec) where
 
 import Control.Concurrent (ThreadId, throwTo, yield)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
-import Control.Concurrent.STM (TVar, atomically, check, modifyTVar', newTVarIO, orElse, readTVar, readTVarIO, registerDelay, stateTVar, writeTVar)
+import Control.Concurrent.STM (TVar, check, modifyTVar', newTVarIO, orElse, readTVar, readTVarIO, registerDelay, stateTVar, writeTVar)
+import Hetoimasia.GPU.Vulkan.Native.Atomically (atomically)
 import Control.Exception (ErrorCall (..), SomeException, finally, throwIO, toException, try)
 import Control.Monad (void, when)
 import Data.List (nub, sort)

@@ -20,7 +20,8 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Acquisition
   , raiseRolledBack
   ) where
 
-import Control.Concurrent.STM (atomically, modifyTVar', readTVar, readTVarIO)
+import Control.Concurrent.STM (modifyTVar', readTVar, readTVarIO)
+import Hetoimasia.GPU.Vulkan.Native.Atomically (atomically)
 import Control.Exception
   ( ExceptionWithContext (ExceptionWithContext)
   , SomeException

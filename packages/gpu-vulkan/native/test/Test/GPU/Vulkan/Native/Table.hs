@@ -15,7 +15,7 @@
 module Test.GPU.Vulkan.Native.Table (spec) where
 
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
-import Control.Concurrent.STM (atomically)
+import Hetoimasia.GPU.Vulkan.Native.Atomically (atomically)
 import Control.Concurrent (killThread, myThreadId)
 import Control.Exception (AsyncException (ThreadKilled), ErrorCall (..), SomeException, fromException, throwIO, try)
 import Data.IORef (newIORef, readIORef, writeIORef)
@@ -36,7 +36,7 @@ import Hetoimasia.GPU.Model.Access (ResourceKind (InstanceResource))
 import Hetoimasia.GPU.Model.Budget (BudgetKind (LookupVersionBudget, RingBudget, TextureSlotBudget))
 import Hetoimasia.GPU.Model (GpuModel, HoldView (..), SessionFailureCause (CleanupFailed), SessionState (SessionFailed), holdView, sessionState)
 import Hetoimasia.GPU.Model.Identity (BatchId, HoldSubject (..), IdentityKind (..), Misuse (..), ResourceId)
-import Hetoimasia.GPU.Vulkan.Native.Roots (failRootsSessionBecause, readRootsModel)
+import Hetoimasia.GPU.Vulkan.Native.Internal.Roots (failRootsSessionBecause, readRootsModel)
 import Hetoimasia.GPU.Vulkan.Native.Frames
 import Hetoimasia.GPU.Vulkan.Native.Recording
 import Hetoimasia.GPU.Vulkan.Native.Recording.Vulkan (recordingLimitsOf)

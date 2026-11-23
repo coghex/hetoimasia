@@ -70,7 +70,8 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Recorder
   , drawIndexed
   ) where
 
-import Control.Concurrent.STM (STM, atomically, modifyTVar', readTVar, readTVarIO, writeTVar)
+import Control.Concurrent.STM (STM, modifyTVar', readTVar, readTVarIO, writeTVar)
+import Hetoimasia.GPU.Vulkan.Native.Atomically (atomically)
 import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, displayException, mask, mask_, rethrowIO, tryWithContext)
 import Control.Applicative ((<|>))
 import Control.Monad (unless, when)
