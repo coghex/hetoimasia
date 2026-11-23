@@ -191,6 +191,16 @@ leaderExitingNormally =
     , "echo \"ready $$\""
     ]
 
+-- | The leader exits by itself, normally, leaving one descendant, a single process that ignores SIGTERM: ending it leaves no member
+-- of the group behind (a shell loop's own children would outlive it).
+leaderExitingWithSleeper ∷ String
+leaderExitingWithSleeper =
+  unlines
+    [ "sh -c 'trap \"\" TERM; echo $$ > \"$1.t\"; mv \"$1.t\" \"$1\"; exec sleep 300' sh \"$1\" >/dev/null 2>&1 &"
+    , "while [ ! -e \"$1\" ]; do :; done"
+    , "echo \"ready $$\""
+    ]
+
 -- | A lone child that ignores SIGTERM.
 stubbornAlone ∷ String
 stubbornAlone = "trap '' TERM; echo \"ready $$\"; while :; do sleep 1; done"
@@ -713,6 +723,117 @@ spec = describe "the shared subprocess facility (Test.Support.Subprocess)" $ do
       outcome ← try @Boom (withScopedChildUsing quick {boundReap = 100000} seams (childSpec hangCatcher (shell obedientAlone [])) (\child → writeIORef seen (Just child) >> awaitReady child >> boom))
       outcome `shouldBe` Left Boom
       readIORef seen >>= mapM_ (\child → awaitUnreapedExit child (30 * 1000000) >> waitForProcess (childProcess child))
+
+  describe "the group's identifier, reserved until the final signal" $ do
+    -- The identifier of a group with no member left can be given to an unrelated group once its leader is reaped. The leader is
+    -- therefore reaped last, after the final signal to the group, and every signal is sent while it is still unreaped. These examples
+    -- judge exactly that, at the moment each signal is about to be sent, from what the facility's own non-reaping look answers. A
+    -- schedule in which a signal could reach an unrelated process is never run: the control for each models the superseded decision
+    -- test-side and records the signal it would send, and the schedule with a reaped leader keeps a real member of the group of
+    -- the example's own in it, so that a misdirected signal could only reach that.
+    let held states = not (null states) && all (/= Reaped) states
+        recordingStates seen sent target signal = do
+          state ← readIORef seen >>= maybe (pure Reaped) childState
+          atomicModifyIORef' sent (\old → (old <> [(target, signal, state)], ()))
+        signalsOf = map (\(target, signal, _) → (target, signal))
+        statesOf = map (\(_, _, state) → state)
+
+    it "sends SIGTERM and SIGKILL to a child that ignores SIGTERM while its leader is unreaped" $
+      withTemp $ \_ → do
+        probe ← newProbe
+        seen ← newIORef Nothing
+        sent ← newIORef []
+        let seams = noSeams {seamSignalled = recordingStates seen sent}
+        void $ withScopedChildUsing quick seams (childSpec hangCatcher (shell stubbornAlone [])) $ \child → writeIORef seen (Just child) >> remember probe (childPid child) >> awaitReady child
+        readIORef sent >>= (`shouldSatisfy` ((== [(ToGroup, sigTERM), (ToGroup, sigKILL)]) . signalsOf))
+        readIORef sent >>= (`shouldSatisfy` (held . statesOf))
+        readIORef (probePids probe) >>= mapM goneAndReaped >>= (`shouldBe` [True])
+
+    it "sends the signal to a group whose last original member was lost after a positive probe while the exited leader is still unreaped" $
+      withTemp $ \directory → do
+        probe ← newProbe
+        seen ← newIORef Nothing
+        sent ← newIORef []
+        lost ← newIORef False
+        let file = directory </> "descendant"
+            -- The first signal is about to be sent, on a probe that found the descendant: the group's last original member is lost
+            -- now, so that only the leader, a zombie the facility holds, is left.
+            loseLastMember target signal = do
+              recordingStates seen sent target signal
+              first ← atomicModifyIORef' lost (\done → (True, not done))
+              when first $ readIORef (probePids probe) >>= \case
+                descendant : _ → signalProcess sigKILL descendant >> void (awaitGone descendant)
+                [] → expectationFailure "the body never ran"
+            seams = noSeams {seamSignalled = loseLastMember}
+        void $ withScopedChildUsing quick seams (childSpec hangCatcher (shell leaderExitingWithSleeper [file])) $ \child → do
+          writeIORef seen (Just child)
+          prepare file probe True child
+          waitChild child (30 * 1000000) >>= (`shouldBe` Just ExitSuccess)
+          childState child >>= (`shouldBe` ExitedUnreaped)
+        readIORef sent >>= (`shouldSatisfy` ((== [(ToGroup, sigTERM)]) . signalsOf))
+        readIORef sent >>= (`shouldSatisfy` (held . statesOf))
+        readIORef (probePids probe) >>= mapM goneAndReaped >>= (`shouldBe` [True, True])
+
+    it "negative control: the superseded order, which reaps the leader before it probes and signals, would signal an identifier no longer reserved" $
+      withTemp $ \directory → do
+        probe ← newProbe
+        would ← newIORef []
+        let file = directory </> "descendant"
+        (do
+            outcome ←
+              try @SubprocessFailure $
+                withScopedChildUsing quick noSeams (childSpec hangCatcher (shell leaderExitingWithSleeper [file])) $ \child → do
+                  prepare file probe True child
+                  waitChild child (30 * 1000000) >>= (`shouldBe` Just ExitSuccess)
+                  -- The superseded order: reaped first, then a probe, then a signal on the probe's answer. The signal is recorded, never sent.
+                  void (waitForProcess (childProcess child))
+                  present ← probeGroup (childPid child)
+                  state ← childState child
+                  when present (atomicModifyIORef' would (\old → (old <> [state], ())))
+            -- The facility's own release, finding the leader reaped, sent nothing and said so.
+            either (const (pure ())) (const (expectationFailure "a group whose leader was reaped early was reported ended")) outcome
+            readIORef would >>= (`shouldSatisfy` (not . held)))
+          `finally` (readIORef (probePids probe) >>= rescue)
+
+    it "sends nothing to a group whose leader was reaped before the release, whatever its identifier is later given to, and says the end was not confirmed" $
+      withTemp $ \directory → do
+        probe ← newProbe
+        seen ← newIORef Nothing
+        sent ← newIORef []
+        let file = directory </> "descendant"
+            seams = noSeams {seamSignalled = recordingStates seen sent}
+        (do
+            -- A real member of the group stays in it, standing for the replacement group: were a signal misdirected it could only
+            -- reach that member, which the example ends itself.
+            outcome ←
+              try @SubprocessFailure $
+                withScopedChildUsing quick seams (childSpec hangCatcher (shell leaderExitingWithSleeper [file])) $ \child → do
+                  writeIORef seen (Just child)
+                  prepare file probe True child
+                  waitChild child (30 * 1000000) >>= (`shouldBe` Just ExitSuccess)
+                  -- The leader is reaped through the handle the body was lent, not by the facility.
+                  void (waitForProcess (childProcess child))
+            case outcome of
+              Left (SubprocessFailure message) → message `shouldContain` "no longer reserved"
+              Right () → expectationFailure "a group whose leader was reaped early was reported ended"
+            readIORef sent >>= (`shouldBe` []))
+          `finally` (readIORef (probePids probe) >>= rescue)
+
+    it "reaps the leader only in the release, however the body waited for it" $ do
+      seen ← newIORef Nothing
+      withScopedChild (childSpec hangCatcher (shell "exit 0" [])) $ \child → do
+        writeIORef seen (Just child)
+        waitChild child (30 * 1000000) >>= (`shouldBe` Just ExitSuccess)
+        awaitExit child >>= (`shouldBe` ExitSuccess)
+        signalChild child sigTERM
+        childState child >>= (`shouldBe` ExitedUnreaped)
+        goneAndReaped (childPid child) >>= (`shouldBe` False)
+      child ← maybe (expectationFailure "the body never ran" >> ioError (userError "unreachable")) pure =<< readIORef seen
+      childState child >>= (`shouldBe` Reaped)
+
+    it "answers the status of a child a signal ended as the library did" $ do
+      Completed {completedStatus = status} ← runToCompletion hangCatcher (shell "kill -KILL $$" []) ""
+      status `shouldBe` ExitFailure (negate 9)
 
   describe "the release" $ do
     it "retains the body's failure beside a cancellation delivered into it, and still reaps the child" $

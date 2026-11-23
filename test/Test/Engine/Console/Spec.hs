@@ -18,7 +18,7 @@ import Data.Maybe (mapMaybe)
 import Hetoimasia.Console.Exit (cancellationExitCode, exitOnFailure, failureExitCode, usageExitCode)
 import System.Exit (ExitCode (ExitFailure, ExitSuccess), exitWith)
 import System.IO (hClose)
-import System.Process (CreateProcess (env), createPipe, proc, waitForProcess)
+import System.Process (CreateProcess (env), createPipe, proc)
 import qualified Test.Engine.Console.Lua.Options as LuaOptions
 import qualified Test.Engine.Console.Lua.Process as LuaProcess
 import qualified Test.Engine.Console.Lua.Signals as LuaSignals
@@ -81,7 +81,7 @@ runConsoleWithBrokenStderr arguments = do
           , Facility.specStdout = Facility.Inherited
           , Facility.specStderr = Facility.CallerHandle writing
           }
-  Facility.withScopedChild child (waitForProcess . Facility.childProcess) `finally` hClose writing
+  Facility.withScopedChild child Facility.awaitExit `finally` hClose writing
 
 -- | The component of each rendered record, which is its third segment. A line
 -- that is not a record is kept whole so a failure shows it.

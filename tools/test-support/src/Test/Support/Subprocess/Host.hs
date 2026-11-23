@@ -123,7 +123,7 @@ import Data.Word (Word64)
 import GHC.Clock (getMonotonicTimeNSec)
 import System.Exit (ExitCode)
 import System.IO (Handle, hClose, hPutStr)
-import System.Process (CreateProcess, waitForProcess)
+import System.Process (CreateProcess)
 import System.Timeout (timeout)
 import Test.Support.Owned (withOwnedThread, withOwnedThreadOpening)
 import Test.Support.Subprocess
@@ -138,8 +138,8 @@ import Test.Support.Subprocess
   , Stream (CallerHandle, Piped)
   , SubprocessFailure (SubprocessFailure)
   , awaitDrain
+  , awaitExit
   , captured
-  , childProcess
   , childSpec
   , childStdin
   , defaultBounds
@@ -684,7 +684,7 @@ hostedCaptured host bound process input = do
 -- exit, give up on pipes a descendant keeps open past the drain bound, and answer.
 complete ∷ String → Child → IO (ExitCode, String, String, Drain)
 complete input child = feeding $ do
-  status ← waitForProcess (childProcess child)
+  status ← awaitExit child
   drain ← awaitDrain child
   out ← captured child Stdout
   err ← captured child Stderr
