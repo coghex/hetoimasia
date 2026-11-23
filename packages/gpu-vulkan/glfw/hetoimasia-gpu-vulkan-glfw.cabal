@@ -78,6 +78,8 @@ library
         bytestring >=0.12 && <0.13,
         stm >=2.5.3 && <2.6,
         hetoimasia-foundation ==0.1.0.0,
+        -- the issuer bridge, for the host's ownership operations (Hetoimasia.GPU.Vulkan.GLFW)
+        hetoimasia-foundation:owner-tx-issuer ==0.1.0.0,
         hetoimasia-runtime ==0.1.0.0,
         hetoimasia-glfw ==0.1.0.0,
         hetoimasia-glfw:runtime-glfw ==0.1.0.0,

@@ -370,11 +370,23 @@ module Hetoimasia.GPU.Vulkan.GLFW
   , ReplacementSurfaceUncertain (..)
   , VulkanRequiredTargetFailed (..)
   , FrameStorageRefused (..)
+
+    -- * Ownership operations
+    -- $ownership
+  , submitVulkanActionTx
+  , requestVulkanReleaseTx
+  , publishVulkanTargetSceneTx
+  , readVulkanActionTx
+  , readVulkanActionGateTx
+  , constructedDisposalTx
   ) where
 
 import Data.ByteString (ByteString)
 import Numeric.Natural (Natural)
 import Control.Concurrent.STM (STM)
+import Hetoimasia.Foundation.Messaging.Payload (Prepared)
+import Hetoimasia.Foundation.OwnerTx (OwnerTx)
+import Hetoimasia.Foundation.OwnerTx.Issuer (fromIssuerSTM)
 import Hetoimasia.Foundation.Log (Logger)
 import Hetoimasia.GLFW.Vulkan (LoaderIntegration)
 import Hetoimasia.GLFW.Window (WindowId)
@@ -701,3 +713,33 @@ replaceVulkanSurfaces host = Controller.replaceVulkanSurfaces (vulkanController 
 announceVulkanTarget ∷ VulkanHost scene → GraphicsService → IO EventAdmission
 announceVulkanTarget host = Controller.announceVulkanTarget (vulkanController host) (vulkanGraphicsOwner host)
 
+-- $ownership
+-- The host's admissions and readings as ownership operations, for a holder composing them with its own facts in one
+-- 'Hetoimasia.Foundation.OwnerTx.commit'. Each is the transaction of the same name, embedded through the issuer bridge:
+-- it reads only the controller's own cells (its roots, its owner's admission, its queues, its targets) and the handle
+-- or prepared value given, validates before it writes, answers a refusal as data and never waits or raises. An
+-- action's body runs later, on the owner's thread, in 'IO': nothing of it runs in the commit that admits it.
+
+-- | 'submitVulkanAction' in a commit.
+submitVulkanActionTx ∷ VulkanHost scene → VulkanAction r → OwnerTx (Either ActionRefusal (ActionTicket r))
+submitVulkanActionTx host action = fromIssuerSTM (submitVulkanAction host action)
+
+-- | 'requestVulkanRelease' in a commit: the barrier records the revisions current in this commit.
+requestVulkanReleaseTx ∷ VulkanHost scene → VulkanAction r → OwnerTx (Either ActionRefusal (ActionTicket r))
+requestVulkanReleaseTx host action = fromIssuerSTM (requestVulkanRelease host action)
+
+-- | 'publishVulkanTargetScene' in a commit.
+publishVulkanTargetSceneTx ∷ VulkanHost scene → OffscreenTargetId → Prepared scene → OwnerTx TargetScenePublication
+publishVulkanTargetSceneTx host target scene = fromIssuerSTM (publishVulkanTargetScene host target scene)
+
+-- | 'readVulkanAction' in a commit: read-only, 'Nothing' while the action has not ended.
+readVulkanActionTx ∷ ActionTicket r → OwnerTx (Maybe (ActionOutcome r))
+readVulkanActionTx ticket = fromIssuerSTM (readVulkanAction ticket)
+
+-- | 'readVulkanActionGate' in a commit: read-only.
+readVulkanActionGateTx ∷ VulkanController → OwnerTx (Maybe ActionRefusal)
+readVulkanActionGateTx controller = fromIssuerSTM (readVulkanActionGate controller)
+
+-- | 'constructedDisposal' in a commit: read-only.
+constructedDisposalTx ∷ Construction q inst msgr phys dev cmd → Buffer → OwnerTx ConstructedDisposal
+constructedDisposalTx construction buffer = fromIssuerSTM (constructedDisposal construction buffer)
