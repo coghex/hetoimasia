@@ -1002,80 +1002,67 @@ Foundation's `OwnerTx` is abstract; an issuer embeds its own `STM` through
 `Hetoimasia.Foundation.OwnerTx.Issuer`, in the public sublibrary
 `hetoimasia-foundation:owner-tx-issuer` (see
 [Foundation's README](../packages/foundation/README.md#ownership-transactions)).
-Cabal cannot restrict who depends on a public sublibrary, so the guard does,
-from Cabal's facts alone. `tools/validation/owner-tx-issuers.fields`, in Cabal's
-field syntax, lists the exact components allowed to depend on it, one
-`dependent` section each:
+Cabal cannot restrict who depends on a public sublibrary, so the guard does, by
+text alone, erring on the side of flagging.
+
+- **What it reads.** Every file at any depth under the root it is given whose
+  basename ends in `.cabal` or starts with `cabal.project`, whether or not a
+  project lists or imports it. It skips only `.git` (at any depth) and the
+  generated directories the catalog names at the root: `dist-newstyle`,
+  `dist-dev`, `dist-vulkan`, `dist-vulkan-proof`, `.worktrees`, `captures` and
+  `receipts`. The skip set is fixed in the tool. Cabal-syntax's `readFields`
+  only splits each file: a stanza is one outermost section, its header and
+  everything nested in it; a top-level field belongs to no stanza. A file the
+  lexer cannot split fails, and so does one it splits with a lexer warning
+  (tabs, inconsistent indentation, braces, a non-breaking space; a byte-order
+  mark aside), whose stanza boundaries are ambiguous. No file in this
+  repository draws one.
+- **What it matches.** `owner-tx-issuer`,
+  `Hetoimasia.Foundation.OwnerTx.Issuer` and
+  `Hetoimasia.Foundation.OwnerTx.Representation`, ASCII case-insensitively, each
+  end at the edge of the text or next to a character outside `[A-Za-z0-9_]`, in
+  field names, values (continuation lines joined with one space) and section
+  headers, full-line comments aside. Every branch is searched as written;
+  nothing is evaluated.
+- **What it refuses.** A match outside a listed stanza, a match at the top
+  level, an allowlist entry naming more than one stanza, and a stale entry (no
+  such file or stanza, or a stanza with no match).
+
+`tools/validation/owner-tx-issuers.fields`, in Cabal's field syntax, lists the
+allowed stanzas, one `entry` section each, keyed by the repository-relative file
+and the stanza's header (its section name and arguments as Cabal's lexer splits
+them, single spaces between, a quoted argument in quotes):
 
 ```
-dependent
-  component: hetoimasia-foundation:test:foundation-tests
-  reason: its composition example builds through the bridge
+entry
+  file: packages/foundation/hetoimasia-foundation.cabal
+  stanza: library owner-tx-issuer
+  reason: the issuer bridge's definition
 ```
 
-A component is `package:kind:name`, its kind `lib`, `flib`, `exe`, `test` or
-`bench`; a main library is named after its package (`consumer:lib:consumer`),
-a sublibrary by its own name. An issuer adds its component as it lands. A
-component listed twice, any other field or section, or a malformed component
-makes the allowlist unreadable; a listed component that does not exist or
-depends on the sublibrary nowhere is a stale entry.
+It starts with three stanzas of `packages/foundation/hetoimasia-foundation.cabal`:
+`library owner-tx-issuer` (the bridge's definition), `library internal` (its
+private representation) and `test-suite foundation-tests` (issuer
+composition). An issuer adds the file and stanza header of each component that
+needs the bridge, with its reason. An entry listed twice, an entry without exactly one
+nonempty `file`, `stanza` and `reason`, or any other field or section makes the
+allowlist unreadable.
 
-- **Projects.** Both `cabal.project` and `cabal.project.vulkan` are required,
-  each read by Cabal's own field parser with its imports, resolved relative to
-  the importing file; a cycle on the active import chain is an error, a shared
-  import is read once. The guard supports exactly the project syntax this
-  repository uses: a top-level `import:` of one unquoted literal relative
-  local file, top-level `packages:` of unquoted literal local directories, the
-  top-level fields `constraints`, `index-state`, `jobs`, `optimization`,
-  `semaphore`, `active-repositories`, `tests` and `benchmarks`, `package`
-  sections of `flags`, `tests`, `benchmarks`, `optimization`, native search
-  paths and options, and `if`/`elif`/`else` over the supported targets whose
-  branches hold only `package` sections. Package selection or an import in any
-  branch, a quoted, spaced or URI path, and any other field, section or
-  condition are unsupported.
-- **Manifests.** Simple manifests read by Cabal's own parser, common stanzas
-  expanded; every component kind in every configuration on Linux and Darwin,
-  x86_64 and aarch64, under both values of each manual flag. Compiler options,
-  in a manifest or a project, tokenized as Cabal does, are allow-listed:
-  warnings (`-W…`, `-w`), optimisation levels, `-threaded`, `-rtsopts`,
-  `-with-rtsopts=…`, `-j`, linker options (`-optl…`) and
-  `-fno-full-laziness`. Anything else is unsupported.
-- **Refused.** A component whose effective `build-depends` selects the
-  sublibrary in any buildable configuration, a nondefault manual flag's
-  included, and is not listed; a listed entry that depends on it nowhere; a
-  Cabal `reexported-modules` entry that names the bridge or the representation
-  (`Hetoimasia.Foundation.OwnerTx.Representation`) exactly, or a `mixins` entry
-  whose renaming brings either into scope (all of a library, a renaming of it,
-  or a hiding that leaves it), in a listed component too; a protected module
-  declared outside its defining component, or in a public representation
-  library.
-- **Validated before any branch is dropped.** Every node of every component's
-  conditional tree, buildable or not: condition atoms outside the supported
-  targets and manual flags, signatures and unsupported options are
-  unsupported; a library selector of a dependency or a mixin that names no
-  library of a local package, or any library of a package outside the
-  repository, and a mixin that includes no library its configuration depends
-  on, are uncovered. Each names its manifest, component and configurations,
-  or the branch no supported configuration selects. Only membership is
-  computed from the simplified configurations; an unbuildable one selects
-  nothing.
-- **Fails closed.** A missing project file, an import cycle, a project file or
-  manifest Cabal refuses, and an unreadable allowlist.
-
-The guard reads no Haskell source. What a listed component's modules import,
-export and instantiate is issuer review's, as
+The guard evaluates no Cabal semantics. What a listed stanza's component
+imports, exports and instantiates is issuer review's, as
 [Foundation's README](../packages/foundation/README.md#ownership-transactions)
 sets out: no export that converts a caller's `STM` to or from `OwnerTx`,
 directly or through a wrapper, class method or re-export; no instance on `STM`
-or the protected Foundation types.
+or the protected Foundation types; and every component importing a listed
+common stanza or affected by a listed project section is reviewed too.
 
-The group is mandatory and not in the floor. Its inputs are everything the guard
-reads (`owner-tx-guard scope` prints them, and a `workflow-tests` example holds
-the group's inputs to that list), both project files and their shared import,
-the sources of every scanned package, and the tool itself; `tools/validation/`
-selects every group. Its preparation builds the tool's dependencies; the check
-itself runs in about a second. Its fixtures are buildable minimal packages in
-`workflow-tests` (`tools/test/OwnerTxGuard.hs`), one built with Cabal, each
+The group is mandatory and not in the floor. Its inputs include everything the
+guard reads (`owner-tx-guard scope` prints them, and a `workflow-tests` example
+holds the group's inputs to cover that list): every project file and the
+`docs/toolchain` binding bundles, the sources of every scanned package, the
+allowlist and the tool itself; `tools/validation/` selects every group. Its preparation builds the
+tool's dependencies; the check itself runs in about a second. Its fixtures are
+text in `workflow-tests` (`tools/test/OwnerTxGuard.hs`), none built, each
 negative asserting the guard's own diagnostic.
 
 ### The macOS confinement probe
@@ -1221,7 +1208,10 @@ Renames and deletions count both endpoints as changed. Each changed path is then
   containing `/` is anchored at the repository root and its `*` does not cross a
   separator; a pattern without `/` matches any file with that basename. The
   declared classes are Markdown documentation, `.editorconfig`, `.gitignore`,
-  license files, and the pull-request template (as Markdown).
+  license files, and the pull-request template (as Markdown). A package
+  description or project file, any basename ending in `.cabal` or starting with
+  `cabal.project` at any depth, is never non-affecting, however it is spelled
+  (`cabal.project.notes.md` included): the issuer guard reads every one.
 - **unknown** — neither. The planner selects every non-optional group with reason
   `unknown-input` and reports the path. Unknown inputs, shared dependencies, and
   harness changes never select an optional group.
@@ -1332,9 +1322,10 @@ reads. That is exactly:
 - the `non_affecting_paths` classes the catalog already declares.
 
 A declared input outranks both, so a test-consumed Markdown file, a fixture, a
-shader, Lua, or an asset is never harmless. Neither is `cabal.project` or any
-`.cabal` file, which are refused as prose independently of how a catalog
-classifies them: packaging decides what is compiled.
+shader, Lua, or an asset is never harmless. Neither is any file whose basename
+ends in `.cabal` or starts with `cabal.project`, at any depth, which is refused
+as prose independently of how a catalog classifies it: packaging decides what
+is compiled, and the issuer guard reads every one.
 
 The group inputs this rule consults are derived from the **candidate tree
 alone**, unlike selection, which unions both revisions so a retired input still
