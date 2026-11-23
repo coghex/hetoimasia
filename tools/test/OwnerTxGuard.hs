@@ -266,6 +266,18 @@ spec = describe "The issuer bridge's dependency guard (tools/owner-tx-guard)" $ 
       errors `shouldContain` "extra:lib:extra (darwin/x86_64) depends on hetoimasia-foundation:owner-tx-issuer and is not a listed dependent"
       mentioning "extra:lib:extra (linux/" errors `shouldBe` []
 
+    it "lists a main library by its package's name and a named sublibrary by its own" $
+      checked
+        ( changed
+            [ ( "vulkanpkg/vulkanpkg.cabal"
+              , vulkanWith ["hetoimasia-foundation:owner-tx-issuer"] (["", "library adapters", "    exposed-modules: Vulkan.Adapters", "    hs-source-dirs: adapters"] <> common <> ["    build-depends: base, hetoimasia-foundation:owner-tx-issuer"])
+              )
+            , ("vulkanpkg/adapters/Vulkan/Adapters.hs", "module Vulkan.Adapters () where\n")
+            , ("tools/validation/owner-tx-issuers.fields", allowlist (baseDependents <> ["vulkanpkg:lib:vulkanpkg", "vulkanpkg:lib:adapters"]))
+            ]
+        )
+        >>= (`shouldBe` (ExitSuccess, ""))
+
     it "refuses a missing entry and a stale entry" $ do
       refused (changed [("tools/validation/owner-tx-issuers.fields", allowlist ["hetoimasia-foundation:test:foundation-tests"])]) ["consumer:lib:consumer (darwin/aarch64) depends on hetoimasia-foundation:owner-tx-issuer and is not a listed dependent"]
       refused
@@ -396,6 +408,7 @@ spec = describe "The issuer bridge's dependency guard (tools/owner-tx-guard)" $ 
         , ("importer consumer\n  component: consumer:lib:consumer\n  reason: x\n", "the section importer is not a dependent section with no arguments")
         , ("dependent\n  component: consumer:lib:consumer\n  component: consumer:test:gone\n  reason: x\n", "a dependent section needs exactly one component (package:kind:name) and one reason")
         , ("dependent\n  component: consumer\n  reason: x\n", "a dependent section needs exactly one component (package:kind:name) and one reason")
+        , ("dependent\n  component: consumer:library:consumer\n  reason: x\n", "a dependent section needs exactly one component (package:kind:name) and one reason")
         , ("{\"schema_version\": 3, \"dependents\": []}\n", "tools/validation/owner-tx-issuers.fields cannot be read")
         ]
         $ \(text, said) → do
@@ -407,6 +420,23 @@ spec = describe "The issuer bridge's dependency guard (tools/owner-tx-guard)" $ 
       refused
         (changed [("cabal.project", "import: cabal.project.common\npackages:\n  foundation\n  consumer\n  extra\n")] <> [("extra/extra.cabal", unlines (cabalHeader "extra" <> ["library", "    exposed-modules: Extra", "    hs-source-dirs: src"] <> common <> ["    build-depends: base", "    mixins: hetoimasia-foundation (Hetoimasia.Foundation.OwnerTx as PublicTx)"])), ("extra/src/Extra.hs", "module Extra () where\n")])
         ["extra/extra.cabal: uncovered: extra:lib:extra (darwin/aarch64) has the mixin hetoimasia-foundation, which names no dependency of that configuration"]
+      (flagged, flaggedSaid) ←
+        checked
+          ( changed [("cabal.project", "import: cabal.project.common\npackages:\n  foundation\n  consumer\n  extra\n")]
+              <> [ ( "extra/extra.cabal"
+                   , unlines $
+                       cabalHeader "extra"
+                         <> ["flag full", "    default: True", "    manual: True", ""]
+                         <> ["library", "    exposed-modules: Extra", "    hs-source-dirs: src"]
+                         <> common
+                         <> ["    build-depends: base", "    mixins: hetoimasia-foundation (Hetoimasia.Foundation.OwnerTx as PublicTx)", "    if flag(full)", "        build-depends: hetoimasia-foundation"]
+                   )
+                 , ("extra/src/Extra.hs", "module Extra () where\n")
+                 ]
+          )
+      flagged `shouldBe` ExitFailure 1
+      flaggedSaid `shouldContain` "extra/extra.cabal: uncovered: extra:lib:extra (linux/x86_64 -full) has the mixin hetoimasia-foundation, which names no dependency of that configuration"
+      mentioning "+full) has the mixin" flaggedSaid `shouldBe` []
       refused
         (changed [("vulkanpkg/vulkanpkg.cabal", vulkanWith ["base:missing"] [])])
         ["uncovered: vulkanpkg:lib:vulkanpkg selects base:missing, a library of a package outside this repository, which the guard cannot establish"]
