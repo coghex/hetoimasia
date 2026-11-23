@@ -281,7 +281,8 @@ only issuer-controlled inputs, validates before its first write, answers a
 refusal as data, and finishes without waiting or raising; review and the
 issuer's outcome tests check this, its callees included.
 
-**What the guard checks.** Text alone
+**What the guard checks.** Text alone, to catch accidental use of the bridge in
+this repository; deliberate evasion is issuer review's
 ([the issuer guard](../../docs/validation.md#the-issuer-bridges-import-guard)):
 `owner-tx-issuer`, `Hetoimasia.Foundation.OwnerTx.Issuer` and
 `Hetoimasia.Foundation.OwnerTx.Representation` may appear in a package
