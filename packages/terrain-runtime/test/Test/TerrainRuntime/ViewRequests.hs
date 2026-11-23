@@ -6,7 +6,6 @@ module Test.TerrainRuntime.ViewRequests (spec) where
 
 import Control.Concurrent.STM (atomically, check, retry)
 import Data.Maybe (isJust)
-import Hetoimasia.Foundation.Messaging.Payload (prepare)
 import Hetoimasia.Foundation.OwnerTx (commit)
 import Hetoimasia.Terrain.Runtime
 import Hetoimasia.Terrain.Runtime.Settlement (TakeOutcome (..))
@@ -78,22 +77,22 @@ spec = describe "a view's sealed requests" $ do
       commit (releaseRegionBorrowTx svc borrow)
       atomically (fst <$> inspectRetainedChargesSTM svc) `shouldReturn` 0
       settleChecks svc
-  it "attaches a view with its first demand together, or writes nothing: an attach under another client's lease is refused and consumes no view identity" $
+  it "decides an attachment in full before writing: an attach under another client's lease, on an arena nobody watches yet, writes nothing — no view, no identity, no mark cell" $
     withService defaultConfig $ \svc → do
       (client, lease) ← openMain svc "view"
       (_, theirs) ← openMain svc "other"
-      empty ← prepare []
-      first ← commit (attachViewTx svc client lease empty) >>= either (\why → expectationFailure ("refused: " <> show why) >> fail "unreachable") (pure . fst)
-      count ← atomically (inspectViewCountSTM svc)
-      commit (attachViewTx svc client theirs empty) >>= \case
+      first ← commit (attachViewTx svc client lease) >>= either (\why → expectationFailure ("refused: " <> show why) >> fail "unreachable") (pure . fst)
+      (count, watched) ← atomically ((,) <$> inspectViewCountSTM svc <*> inspectWatchedArenasSTM svc)
+      commit (attachViewTx svc client theirs) >>= \case
         Left RefusedAuthority → pure ()
         Left other → expectationFailure ("refused otherwise: " <> show other)
         Right _ → expectationFailure "another client's lease was accepted"
-      atomically (inspectViewCountSTM svc) `shouldReturn` count
+      atomically ((,) <$> inspectViewCountSTM svc <*> inspectWatchedArenasSTM svc) `shouldReturn` (count, watched)
       -- the next attachment takes the identity the refused one would have
-      second ← commit (attachViewTx svc client lease empty) >>= either (\why → expectationFailure ("refused: " <> show why) >> fail "unreachable") (pure . fst)
+      second ← commit (attachViewTx svc client lease) >>= either (\why → expectationFailure ("refused: " <> show why) >> fail "unreachable") (pure . fst)
       numberOf second `shouldBe` numberOf first + 1
       settleChecks svc
+
   where
     -- a view shows as View#n
     numberOf view = read (drop 5 (show view)) ∷ Int

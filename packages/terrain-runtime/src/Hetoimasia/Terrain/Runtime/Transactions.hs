@@ -39,8 +39,7 @@ module Hetoimasia.Terrain.Runtime.Transactions
   , cancelViewRequest
   ) where
 
-import Control.Concurrent.STM (STM, TMVar, atomically, catchSTM, newEmptyTMVarIO, throwSTM, tryPutTMVar, tryReadTMVar)
-import Control.Exception (Exception)
+import Control.Concurrent.STM (STM, TMVar, atomically, newEmptyTMVarIO, tryPutTMVar, tryReadTMVar)
 import Control.Monad (void)
 import Data.Word (Word64)
 import Hetoimasia.Foundation.Messaging.Payload (Prepared, preparedValue)
@@ -50,7 +49,7 @@ import Hetoimasia.Terrain.Cell (Column)
 import Hetoimasia.Terrain.Coordinate (RegionCoord)
 import Hetoimasia.Terrain.Residency (RegionDemand)
 import Hetoimasia.Terrain.Runtime (ArenaView, DemandReceipt, authorityEpochSTM, inspectArenaSTM)
-import Hetoimasia.Terrain.Runtime.Internal.Core (TakeOutcome, cancelRequest, closeViewSTM, openViewSTM, releaseRegionBorrowSTM, retireRequest, setViewDemandSTM, takeRequest)
+import Hetoimasia.Terrain.Runtime.Internal.Core (TakeOutcome, attachViewSTM, cancelRequest, closeViewSTM, openViewSTM, releaseRegionBorrowSTM, retireRequest, setViewDemandSTM, takeRequest)
 import Hetoimasia.Terrain.Runtime.Internal.Types
 import Hetoimasia.Terrain.Runtime.Settlement (regionsWith, surfaceWith)
 
@@ -59,24 +58,11 @@ import Hetoimasia.Terrain.Runtime.Settlement (regionsWith, surfaceWith)
 openViewTx ∷ Service → Client → OwnerTx (Either Refused View)
 openViewTx svc client = fromIssuerSTM (openViewSTM svc client)
 
--- | Attach a view for this client and install its first demand under this lease, as one decision: the view is made and
--- its demand installed only when every check passes (the parent session's token, the client, the lease being this
--- client's and live, the demand), and a refusal of any of them writes nothing, the view's identity included.
-attachViewTx ∷ Service → Client → ArenaLease → Prepared [RegionDemand] → OwnerTx (Either Refused (View, DemandReceipt))
-attachViewTx svc client lease demands =
-  -- staged: the attachment and the demand are installed together, or a refusal rolls both back
-  fromIssuerSTM $ (Right <$> staged) `catchSTM` \(StagedRefusal refused) → pure (Left refused)
-  where
-    staged = do
-      view ← openViewSTM svc client >>= either (throwSTM . StagedRefusal) pure
-      receipt ← setViewDemandSTM svc view lease (preparedValue demands) >>= either (throwSTM . StagedRefusal) pure
-      pure (view, receipt)
-
--- A refusal that ends a staged attachment, rolling back what it had written.
-newtype StagedRefusal = StagedRefusal Refused
-  deriving (Show)
-
-instance Exception StagedRefusal
+-- | Attach a view for this client under this lease ('Hetoimasia.Terrain.Runtime.attachViewSTM'): every check is
+-- decided from the service's state before anything is written, and a refusal writes nothing, the view's identity and
+-- the arena's mark cell included. Answers the view and its arena's mark cell.
+attachViewTx ∷ Service → Client → ArenaLease → OwnerTx (Either Refused (View, STM (Maybe ArenaMark)))
+attachViewTx svc client lease = fromIssuerSTM (attachViewSTM svc client lease)
 
 -- | Detach a view ('Hetoimasia.Terrain.Runtime.closeView'): its demand is withdrawn and it is forgotten, in this commit.
 -- Another service's view, or one already detached, changes nothing.

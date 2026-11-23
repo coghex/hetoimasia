@@ -2541,6 +2541,18 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         now ← atomically reading
         (servicePending now, servicePrivate now) `shouldBe` (0, 0)
 
+    it "writes nothing in the terrain service for an open it refuses: no runtime view and no mark cell for an arena nobody watched yet" $
+      withPublished defaultOptions $ \rig target _ → do
+        quiesce rig target
+        -- a second arena of the views' client, which no view watches
+        second ← openArena (rigTerrain rig) (rigClient rig) "second" source >>= either (fail . show) pure >>= await (rigTerrain rig) >>= either (fail . show) pure
+        before ← atomically ((,) <$> inspectViewCountSTM (rigTerrain rig) <*> inspectWatchedArenasSTM (rigTerrain rig))
+        style ← styleOf rig
+        -- the same target, claimed by the published view: refused, before the terrain service is asked for anything
+        refused ← openView (rigViews rig) (OpenRequest (viewTarget target) second (pure (Right style)) (axis 0, axis 0, axis 1) defaultLightSettings)
+        either Just (const Nothing) refused `shouldBe` Just OpenTargetClaimed
+        atomically ((,) <$> inspectViewCountSTM (rigTerrain rig) <*> inspectWatchedArenasSTM (rigTerrain rig)) `shouldReturn` before
+
     it "admits no drain step while the step the views track is running, held after its start: the drain's commit decides again" $
       withPublished defaultOptions $ \rig target view → do
         quiesce rig target

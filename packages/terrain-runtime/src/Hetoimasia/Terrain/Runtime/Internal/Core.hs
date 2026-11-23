@@ -74,6 +74,7 @@ module Hetoimasia.Terrain.Runtime.Internal.Core
     -- * Clients, views and holds
   , registerClientSTM
   , openViewSTM
+  , attachViewSTM
   , setViewDemandSTM
   , clearViewDemandSTM
   , closeViewSTM
@@ -1172,6 +1173,41 @@ openViewSTM svc client =
                 , stateClients = Map.adjust (\c → c {clientViews = Set.insert (ViewId vid) (clientViews c)}) cid (stateClients st)
                 }
               pure (Right (View (serviceTag svc) (ViewId vid)))
+
+-- | Attach a view for this client under this lease, deciding everything first from the service's state as it stands
+-- (the parent session's token, the client, the lease being this client's and live, its arena, the bound on views, the
+-- next identity) and writing only once every check passed: the view, and the arena's mark cell if none was registered
+-- yet ('arenaMarkSTM'). A refusal writes nothing, the view's identity and the mark cell included. The view starts
+-- with no demand; its first demand is installed by its first reconciliation.
+attachViewSTM ∷ Service → Client → ArenaLease → STM (Either Refused (View, STM (Maybe ArenaMark)))
+attachViewSTM svc client lease =
+  admitting svc >>= \case
+    Left refused → pure (Left refused)
+    Right st → case attachable st of
+      Left refused → pure (Left refused)
+      Right (cid, vid, arenaId, arena) → do
+        putSt svc st
+          { stateNextView = vid + 1
+          , stateViews = Map.insert (ViewId vid) (ViewRec cid) (stateViews st)
+          , stateClients = Map.adjust (\c → c {clientViews = Set.insert (ViewId vid) (clientViews c)}) cid (stateClients st)
+          }
+        cells ← readTVar (serviceArenaMarks svc)
+        cell ← case Map.lookup arenaId cells of
+          Just cell → pure cell
+          Nothing → do
+            cell ← newTVar (Just (arenaMark arena))
+            writeTVar (serviceArenaMarks svc) (Map.insert arenaId cell cells)
+            pure cell
+        pure (Right (View (serviceTag svc) (ViewId vid), readTVar cell))
+  where
+    attachable st = do
+      cid ← clientOf svc client st
+      (_, ls) ← leaseOf svc lease st
+      if leaseClient ls /= cid || not (leaseLive ls) then Left RefusedAuthority else Right ()
+      arena ← maybe (Left RefusedAuthority) Right (Map.lookup (leaseArena ls) (stateArenas st))
+      if Map.size (stateViews st) >= configMaxViews (serviceConfig svc) then Left (RefusedBusy BusyViews) else Right ()
+      vid ← allocate (stateNextView st)
+      pure (cid, vid, leaseArena ls, arena)
 
 setViewDemandSTM ∷ Service → View → ArenaLease → [RegionDemand] → STM (Either Refused DemandReceipt)
 setViewDemandSTM svc (View tag vid) lease demands =

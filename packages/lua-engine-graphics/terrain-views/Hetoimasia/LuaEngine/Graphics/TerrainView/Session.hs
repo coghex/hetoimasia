@@ -1157,17 +1157,14 @@ openView service request = mask_ $ do
               Right style → do
                 let undo = styleRelease style
                 _ ← evaluate (spineOf (styleAuthority style)) `onException` undo
-                cell ← atomically (Runtime.arenaMarkSTM (portTerrain ports) (openLease request)) `onException` undo
-                case cell of
-                  Left why → undo >> pure (Left (OpenArena why))
-                  Right markCell → do
-                    -- the runtime view is attached in the commit that takes the claim, or not at all
-                    committed ← commit (commitOpen service request style markCell camera) `onException` undo
-                    case committed of
-                      Left why → undo >> pure (Left why)
-                      Right vs → do
-                        commit (kick service)
-                        pure (Right (TerrainView service vs))
+                -- the runtime view (and its arena's mark cell) is attached in the commit that takes the claim, or not
+                -- at all
+                committed ← commit (commitOpen service request style camera) `onException` undo
+                case committed of
+                  Left why → undo >> pure (Left why)
+                  Right vs → do
+                    commit (kick service)
+                    pure (Right (TerrainView service vs))
 
 -- Every element of a list evaluated, and the list's spine: an authority's own fields are strict.
 spineOf ∷ [a] → ()
@@ -1199,12 +1196,12 @@ newViewState service request style rview markCell camera = do
     <*> newTVar False
 
 -- The view's attachment, one commit: every guard first (the service, the original authority, the target, the arena, the
--- style's materials, the target bound, the target's claim free); then the runtime view, attached for the views' client
--- (its admission checks the parent session's token); then its empty demand under the view's authority, which asks the
--- terrain service whether the client owns the arena lease (refused, the runtime view is detached again in this commit);
--- then the view itself, the claim and its interests. A refusal leaves nothing attached.
-commitOpen ∷ (Ord k, Show k) ⇒ TerrainViews k → OpenRequest k → ViewStyle → STM (Maybe ArenaMark) → CameraState → OwnerTx (Either OpenRefusal (ViewState k))
-commitOpen service request style markCell camera = do
+-- style's materials, the target bound, the target's claim free), all read-only; then the runtime view, attached for the
+-- views' client under the view's lease, which the terrain service decides in full before it writes anything (the parent
+-- session's token, the lease being the client's and live) and answers with the arena's mark cell; then the view
+-- itself, the claim and its interests. A refusal writes nothing.
+commitOpen ∷ (Ord k, Show k) ⇒ TerrainViews k → OpenRequest k → ViewStyle → CameraState → OwnerTx (Either OpenRefusal (ViewState k))
+commitOpen service request style camera = do
   let ports = svPorts service
       target = openTarget request
       key = vtKey target
@@ -1233,10 +1230,9 @@ commitOpen service request style markCell camera = do
   case refused of
     Just why → pure (Left why)
     Nothing →
-      -- the runtime view and its empty demand, staged: a refusal of either writes nothing in the runtime
-      attachViewTx terrain (portClient ports) (openLease request) (svNoDemand service) >>= \case
+      attachViewTx terrain (portClient ports) (openLease request) >>= \case
         Left why → pure (Left (OpenArena why))
-        Right (rview, _) → do
+        Right (rview, markCell) → do
           (vs, geometry) ← own $ do
             vs ← newViewState service request style rview markCell camera
             -- the claim is free: this commit read it so
