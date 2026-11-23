@@ -39,11 +39,10 @@ import Data.Functor ((<&>))
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Word (Word64)
-import Hetoimasia.Foundation.Exit (Exit (..), IssuerStanding (..), classifyExit)
+import Hetoimasia.Foundation.Exit (Exit (..))
 import Hetoimasia.Foundation.OwnerTx (OwnerTx)
 import Hetoimasia.GPU.Vulkan.GLFW
-  ( ActionOutcome (..)
-  , ActionRefusal (..)
+  ( ActionRefusal (..)
   , Buffer
   , Construction
   , ConstructedDisposal (..)
@@ -52,7 +51,7 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , UploadRefusal (UploadOversized)
   , VulkanAction (..)
   , VulkanHost (..)
-  , readVulkanAction
+  , readVulkanActionExit
   , readVulkanActionAdmission
   , readVulkanActionGate
   , readVulkanReleaseAdmission
@@ -168,13 +167,12 @@ data ScheduleRefusal = ScheduleBusy | ScheduleEnded !Text
 -- raised, classified once against the owner's standing ('classifyExit'): an exception of the step alone while the
 -- owner lives, which the owner outlives; a cancellation; or a terminal failure. The ticket keeps the original exception
 -- with its context.
-data StepOutcome = StepRan | StepRefused !Text | StepRaised !(Exit Text ())
+data StepOutcome = StepRan | StepExit !(Exit Text ())
 
 instance Show StepOutcome where
   show = \case
     StepRan → "StepRan"
-    StepRefused why → "StepRefused " <> show why
-    StepRaised exit → "StepRaised (" <> exitKind exit <> ")"
+    StepExit exit → "StepExit (" <> exitKind exit <> ")"
     where
       exitKind = \case
         Completed () → "completed"
@@ -228,25 +226,25 @@ productionOwner host graphics = do
             Left ActionDeviceNotReady → pure (Left ScheduleBusy)
             Left refusal → pure (Left (ScheduleEnded (Text.pack (show refusal))))
             Right ticket →
+              -- the host's classification, made once where the action ended, and its description rendered there
               pure . Right $
-                readVulkanAction ticket >>= \case
-                  Nothing → pure Nothing
-                  Just (ActionReturned ()) → pure (Just StepRan)
-                  Just (ActionRefused why) → pure (Just (StepRefused (Text.pack (show why))))
-                  -- classified against the owner's gate, read after the action ended: no text is made here
-                  Just (ActionRaised why) → do
-                    standing ← maybe IssuerLive (const IssuerEnded) <$> readVulkanActionGate (vulkanController host)
-                    pure (Just (StepRaised (classifyExit standing (Left why))))
+                readVulkanActionExit ticket <&> fmap (\(exit, text) → case exit of
+                  Completed () → StepRan
+                  Refused _ → StepExit (Refused text)
+                  Raised raised → StepExit (Raised raised)
+                  Cancelled raised → StepExit (Cancelled raised)
+                  Terminal (Left _) → StepExit (Terminal (Left text))
+                  Terminal (Right raised) → StepExit (Terminal (Right raised)))
       , ownerRelease = \after →
           requestVulkanReleaseTx host (VulkanAction (\_ → after)) >>= \case
             Left refusal → pure (Left (Text.pack (refusalText refusal)))
             Right ticket →
               pure . Right $
-                readVulkanAction ticket >>= \case
-                  Nothing → pure Nothing
-                  Just (ActionReturned ()) → pure (Just (Right ()))
-                  Just (ActionRefused why) → pure (Just (Left ("the release lane refused the barrier: " <> Text.pack (show why))))
-                  Just (ActionRaised why) → pure (Just (Left ("the barrier raised: " <> Text.pack (show why))))
+                readVulkanActionExit ticket <&> fmap (\(exit, text) → case exit of
+                  Completed () → Right ()
+                  Refused _ → Left ("the release lane refused the barrier: " <> text)
+                  Terminal (Left _) → Left ("the release lane refused the barrier: " <> text)
+                  _ → Left ("the barrier raised: " <> text))
       , ownerAdmits =
           readVulkanActionAdmission host <&> \case
             Just ActionQueueFull → False

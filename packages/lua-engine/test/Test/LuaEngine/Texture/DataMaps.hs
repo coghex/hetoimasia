@@ -17,6 +17,8 @@ module Test.LuaEngine.Texture.DataMaps (spec) where
 
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, tryPutMVar)
 import Control.Concurrent.STM (atomically, retry)
+import Control.Exception (throwIO)
+import Hetoimasia.Foundation.OwnerTx (commit)
 import Control.Concurrent (yield)
 import Control.Monad (unless, void)
 import qualified Data.ByteString as BS
@@ -445,11 +447,11 @@ account = describe "the injected account" $ do
     withSession ((config small files) {cfgAccountBytes = 256}) $ \session _ runtime → do
       vm ← startVm session runtime "other" OnArrival
       admitDriver session vm "i"
-      atomically (accountReserve (ssAccount session) 1) `shouldReturn` True
+      commit (accountReserveTx (ssAccount session) 1) `shouldReturn` True
       line ← awaitNewLine session "i start a " (commandWith session vm "i" "start" "a" (Just (loadWith ["coverage"] "binary3.png")))
       Text.unpack line `shouldContain` "busy:"
       charged session `shouldReturn` 1
-      atomically (accountRelease (ssAccount session) 1)
+      commit (accountReleaseTx (ssAccount session) 1) >>= either throwIO pure
       startWords session vm "i" "b" "binary3.png" ["coverage"]
       awaitUploads (ssFake session) 1
 

@@ -49,12 +49,16 @@ module Hetoimasia.Terrain.Shape
   , worldShape
   ) where
 
+import Control.DeepSeq (NFData (..), rwhnf)
 import Hetoimasia.Terrain.Internal.Shape
 
 -- | The reference's camera facings, in the reference's order. The world's
 -- stored shape is expressed as seen from 'FaceSouth'.
 data ViewFacing = FaceSouth | FaceWest | FaceNorth | FaceEast
   deriving stock (Eq, Ord, Show, Enum, Bounded)
+
+instance NFData ViewFacing where
+  rnf = rwhnf
 
 -- | Every facing, in the reference's order.
 allViewFacings ∷ [ViewFacing]

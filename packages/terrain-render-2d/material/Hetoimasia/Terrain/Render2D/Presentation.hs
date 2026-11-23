@@ -72,6 +72,7 @@ module Hetoimasia.Terrain.Render2D.Presentation
   , depthWord
   ) where
 
+import Control.DeepSeq (NFData (..))
 import qualified Data.ByteString as ByteString
 import qualified Data.ByteString.Builder as Builder
 import qualified Data.ByteString.Lazy as Lazy
@@ -93,6 +94,10 @@ data LightInput = LightInput
   }
   deriving stock (Eq, Show)
 
+-- | Every field is a strict scalar but the haze colour, whose components are forced too.
+instance NFData LightInput where
+  rnf input = rnf (inputHazeColour input)
+
 -- | The approved defaults.
 defaultLightInput ∷ LightInput
 defaultLightInput = LightInput 225 45 0.35 1 250 0.15 0.60 (0.72, 0.85, 0.95)
@@ -100,6 +105,9 @@ defaultLightInput = LightInput 225 45 0.35 1 250 0.15 0.60 (0.72, 0.85, 0.95)
 -- | Checked settings. The constructor is private: a value of this type is valid.
 newtype LightSettings = LightSettings LightInput
   deriving stock (Eq, Show)
+
+instance NFData LightSettings where
+  rnf (LightSettings input) = rnf input
 
 -- | The checked defaults.
 defaultLightSettings ∷ LightSettings

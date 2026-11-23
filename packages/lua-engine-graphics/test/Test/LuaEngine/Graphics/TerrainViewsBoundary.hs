@@ -168,8 +168,8 @@ spec = describe "the terrain views' package boundary" $ do
           , "import Hetoimasia.Foundation.Messaging.Payload (prepare)"
           , "import Hetoimasia.Foundation.OwnerTx (commit)"
           , "import Hetoimasia.LuaEngine.Graphics.TerrainView"
-          , "move view target = commit (moveView view target)"
-          , "configure view = commit (configureView view noConfigure)"
+          , "move view target = prepare target >>= commit . moveView view"
+          , "configure view = prepare noConfigure >>= commit . configureView view"
           , "metrics facts given = prepare (Just given) >>= atomically . setOffscreenMetrics facts"
           ]
       )
@@ -221,6 +221,21 @@ spec = describe "the terrain views' package boundary" $ do
         -- the bridge is the issuer sublibrary's, which a client of the public units does not depend on
         clientOutput outcome `shouldContain` "Hetoimasia.Foundation.OwnerTx.Issuer"
         clientOutput outcome `shouldNotContain` "cannot satisfy"
+
+  it "rejects a client that hands a control a raw configuration, unprepared" $
+    withCommitClient
+      ( unlines
+          [ "module Client (raw) where"
+          , "import Hetoimasia.Foundation.OwnerTx (commit)"
+          , "import Hetoimasia.LuaEngine.Graphics.TerrainView"
+          , "raw view = commit (configureView view noConfigure)"
+          ]
+      )
+      $ \compile → do
+        outcome ← compile Typecheck
+        -- a control takes only a prepared, fully evaluated command
+        rejectedBecause outcome "GHC-83865"
+        clientOutput outcome `shouldContain` "Prepared"
 
   it "rejects a client that hands an offscreen target's facts raw metrics, unprepared" $
     withCommitClient

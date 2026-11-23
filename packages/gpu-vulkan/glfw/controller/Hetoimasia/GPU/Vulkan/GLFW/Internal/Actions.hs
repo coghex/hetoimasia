@@ -87,6 +87,8 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Actions
   , ActionOutcome (..)
   , ActionTicket
   , readActionTicket
+  , readActionExit
+  , refusalStanding
   , awaitActionTicket
 
     -- * The queue
@@ -106,6 +108,9 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Actions
   , refuseRemaining
   ) where
 
+import Data.Text (Text)
+import qualified Data.Text as Text
+import Hetoimasia.Foundation.Exit (Exit, IssuerStanding (..), classifyExit)
 import Control.Concurrent.STM (STM, TVar, newTVar, newTVarIO, readTVar, retry, writeTVar)
 import Control.Exception (ExceptionWithContext, SomeException)
 import Data.Foldable (for_, toList)
@@ -168,11 +173,13 @@ data ActionOutcome r
     -- ^ It was admitted and never started: the owner's exit or the session's
     -- failure began first.
 
--- | Where one admitted action stands. It only advances.
+-- | Where one admitted action stands. It only advances. A settled one keeps, beside its outcome, the issuer's standing
+-- it ended in (the owner live, ended, or its construction escaped) and its description, rendered and forced where it
+-- ended: the one classification every reader of it gets.
 data Standing r
   = Queued
   | Running
-  | Settled !(ActionOutcome r)
+  | Settled !(ActionOutcome r) !IssuerStanding !Text
 
 -- | One admitted action's ticket, from which its outcome is read.
 data ActionTicket r = ActionTicket
@@ -180,20 +187,43 @@ data ActionTicket r = ActionTicket
   , ticketGate ∷ STM (Maybe ActionRefusal)
   }
 
--- | The outcome, once there is one. A queued action whose start the gate now
--- refuses — the owner's exit or the session's failure has begun — is settled
--- as refused here, in this transaction, so the owner never starts it.
+-- | The outcome, once there is one, read-only. A queued action whose start the gate now refuses (the owner's exit or
+-- the session's failure has begun, neither of which ends) reads as refused: the owner settles it so when it reaches it
+-- ('beginBatch' never starts it) or at its exit ('refuseRemaining'). Nothing is written here.
 readActionTicket ∷ ActionTicket r → STM (Maybe (ActionOutcome r))
 readActionTicket ticket =
   readTVar (ticketStanding ticket) >>= \case
-    Settled outcome → pure (Just outcome)
+    Settled outcome _ _ → pure (Just outcome)
     Running → pure Nothing
-    Queued →
-      ticketGate ticket >>= \case
-        Nothing → pure Nothing
-        Just refusal → do
-          writeTVar (ticketStanding ticket) (Settled (ActionRefused refusal))
-          pure (Just (ActionRefused refusal))
+    Queued → fmap ActionRefused <$> ticketGate ticket
+
+-- | The ticket's outcome classified once, where it ended ('classifyExit' against the issuer's standing then), with its
+-- description: read-only and stable. A queued action whose start the gate refuses reads as that refusal, classified by
+-- its own permanence.
+readActionExit ∷ ActionTicket r → STM (Maybe (Exit ActionRefusal r, Text))
+readActionExit ticket =
+  readTVar (ticketStanding ticket) >>= \case
+    Settled outcome standing text → pure (Just (classified outcome standing, text))
+    Running → pure Nothing
+    Queued → fmap (\refusal → (classified (ActionRefused refusal) (refusalStanding refusal), refusalText refusal)) <$> ticketGate ticket
+  where
+    classified outcome standing = case outcome of
+      ActionReturned value → classifyExit standing (Right (Right value))
+      ActionRefused refusal → classifyExit standing (Right (Left refusal))
+      ActionRaised raised → classifyExit standing (Left raised)
+
+-- | The standing a refusal leaves the owner in: a full queue or a device not ready yet can change, so the owner lives;
+-- every other refusal is its exit or its session's failure.
+refusalStanding ∷ ActionRefusal → IssuerStanding
+refusalStanding = \case
+  ActionQueueFull → IssuerLive
+  ReleaseQueueFull → IssuerLive
+  ActionDeviceNotReady → IssuerLive
+  _ → IssuerEnded
+
+-- | A refusal's description: plain data, shown.
+refusalText ∷ ActionRefusal → Text
+refusalText = Text.pack . show
 
 -- | Wait for the outcome. The wait is the caller's: nothing about admission
 -- waits.
@@ -331,7 +361,7 @@ beginBatch ∷ Actions → STM Batch
 beginBatch actions = Batch <$> readTVar (actionsAdmitted actions)
 
 -- | An action the owner has started, with what settles it.
-data Started = ∀ r. Started !(VulkanAction r) !(ActionOutcome r → STM ())
+data Started = ∀ r. Started !(VulkanAction r) !(ActionOutcome r → IssuerStanding → Text → STM ())
 
 -- | Take the next action of this batch the owner may start, marking it
 -- running, in one transaction. An entry its reader already settled is dropped.
@@ -352,7 +382,7 @@ startAction actions (Batch limit) = readTVar (actionsQueue actions) >>= scan Seq
             readTVar standing >>= \case
               Queued →
                 actionsGate actions >>= \case
-                  Just refusal → writeTVar standing (Settled (ActionRefused refusal)) >> scan kept blocked rest
+                  Just refusal → writeTVar standing (refusedWith refusal) >> scan kept blocked rest
                   Nothing → case barrier of
                     Nothing → start standing action kept rest
                     Just wanted
@@ -366,7 +396,7 @@ startAction actions (Batch limit) = readTVar (actionsQueue actions) >>= scan Seq
     start standing action kept rest = do
       writeTVar (actionsQueue actions) (kept <> rest)
       writeTVar standing Running
-      pure (Just (Started action (writeTVar standing . Settled)))
+      pure (Just (Started action (\outcome standing' text → text `seq` writeTVar standing (Settled outcome standing' text))))
 
 -- | Settle every action still queued as refused, with the gate's answer or
 -- this, and empty the queue: the owner's retirement, after which nothing
@@ -378,5 +408,9 @@ refuseRemaining actions fallback = do
   writeTVar (actionsQueue actions) Seq.empty
   for_ queue $ \(Entry _ standing _ _) →
     readTVar standing >>= \case
-      Queued → writeTVar standing (Settled (ActionRefused refusal))
+      Queued → writeTVar standing (refusedWith refusal)
       _ → pure ()
+
+-- A queued action settled as refused, classified by the refusal's own permanence.
+refusedWith ∷ ActionRefusal → Standing r
+refusedWith refusal = let text = refusalText refusal in text `seq` Settled (ActionRefused refusal) (refusalStanding refusal) text

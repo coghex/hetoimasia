@@ -59,6 +59,7 @@ module Hetoimasia.LuaEngine.Graphics.Scene.Receipts
   , noteOffscreenBatch
   , receiptObserver
   , sweepOffscreen
+  , offscreenSweepDue
   , receiptsFrames
   , watchFrameMetrics
   , unwatchFrameMetrics
@@ -173,6 +174,19 @@ sweepOffscreen receipts = do
             TicketPending → go (Set.insert (tagView tag) held) (kept |> entry) rest
             TicketComplete → noteSubmitted receipts tag metrics >> go held kept rest
             _ → go held kept rest
+
+-- | Whether 'sweepOffscreen' would note or drop any batch now, read-only: a view's first pending batch whose ticket has
+-- settled. For a reader that waits outside any commit.
+offscreenSweepDue ∷ DrawReceipts → STM Bool
+offscreenSweepDue receipts = readTVar (receiptsOffscreen receipts) >>= go Set.empty . foldr (:) []
+  where
+    go _ [] = pure False
+    go held ((ticket, tag, _) : rest)
+      | Set.member (tagView tag) held = go held rest
+      | otherwise =
+          readTicket ticket >>= \case
+            TicketPending → go (Set.insert (tagView tag) held) rest
+            _ → pure True
 
 -- | A batch that drew this revision is known to have been submitted (a host stepped by a test says so directly).
 noteSubmitted ∷ DrawReceipts → WorldTag → TargetMetrics → STM ()

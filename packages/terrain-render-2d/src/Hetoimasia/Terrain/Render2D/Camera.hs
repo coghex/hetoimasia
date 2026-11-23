@@ -101,6 +101,7 @@ module Hetoimasia.Terrain.Render2D.Camera
   , prospectiveCamera
   ) where
 
+import Control.DeepSeq (NFData (..))
 import Data.Word (Word64)
 import Hetoimasia.Terrain.Cell (Column (..))
 import Hetoimasia.Terrain.Coordinate
@@ -155,6 +156,9 @@ data JumpTarget = JumpTarget
   , jumpZ ∷ !(Maybe AxisCoord)
   }
   deriving stock (Eq, Show)
+
+instance NFData JumpTarget where
+  rnf (JumpTarget x y z) = rnf x `seq` rnf y `seq` rnf z
 
 -- | A jump waiting for its destination facts.
 data PendingJump = PendingJump

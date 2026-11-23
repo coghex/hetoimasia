@@ -310,6 +310,7 @@ module Hetoimasia.GPU.Vulkan.GLFW
   , ActionRefusal (..)
   , ActionTicket
   , readVulkanAction
+  , readVulkanActionExit
   , awaitVulkanAction
   , ActionOutcome (..)
 
@@ -383,6 +384,7 @@ module Hetoimasia.GPU.Vulkan.GLFW
   , vulkanTargetSceneAcceptsTx
   , publishVulkanTargetSceneUnlessShownTx
   , readVulkanActionTx
+  , readVulkanActionExitTx
   , readVulkanActionGateTx
   , constructedDisposalTx
   ) where
@@ -391,6 +393,8 @@ import Data.ByteString (ByteString)
 import Numeric.Natural (Natural)
 import Control.Concurrent.STM (STM)
 import Hetoimasia.Foundation.Messaging.Payload (Prepared)
+import Data.Text (Text)
+import Hetoimasia.Foundation.Exit (Exit)
 import Hetoimasia.Foundation.OwnerTx (OwnerTx)
 import Hetoimasia.Foundation.OwnerTx.Issuer (fromIssuerSTM)
 import Hetoimasia.Foundation.Log (Logger)
@@ -428,6 +432,7 @@ import Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , defaultActionCapacity
   , defaultReleaseCapacity
   , readVulkanAction
+  , readVulkanActionExit
   , Constructed
   , constructBuffer
   , constructFramelessBatch
@@ -697,7 +702,7 @@ vulkanUploadRoom host = Controller.vulkanUploadRoom (vulkanController host)
 
 -- | Reserve, in the caller's transaction, the queue place and staging region an upload of this many bytes needs,
 -- before the vertex buffer it fills is made: held for every other upload until spent or abandoned.
-reserveVulkanUpload ∷ VulkanHost scene → Natural → STM (Either VulkanUploadRefusal UploadGrant)
+reserveVulkanUpload ∷ VulkanHost scene → Natural → OwnerTx (Either VulkanUploadRefusal UploadGrant)
 reserveVulkanUpload host = Controller.reserveVulkanUpload (vulkanController host)
 
 -- | Spend a reservation on the upload that fills a fresh vertex buffer of exactly its bytes. A refusal before binding
@@ -707,7 +712,7 @@ submitVulkanGranted ∷ VulkanHost scene → UploadGrant → Buffer → ByteStri
 submitVulkanGranted host = Controller.submitVulkanGranted (vulkanController host)
 
 -- | Abandon a reservation, from any thread: its room is free again.
-abandonVulkanGrant ∷ VulkanHost scene → UploadGrant → STM ()
+abandonVulkanGrant ∷ VulkanHost scene → UploadGrant → OwnerTx ()
 abandonVulkanGrant host = Controller.abandonVulkanGrant (vulkanController host)
 
 -- | Create one window's surface on the main thread, under its attachment, and
@@ -756,6 +761,10 @@ vulkanTargetSceneAcceptsTx host target = fromIssuerSTM (vulkanTargetSceneAccepts
 -- target already shows a scene.
 publishVulkanTargetSceneUnlessShownTx ∷ VulkanHost scene → OffscreenTargetId → Prepared scene → OwnerTx (Maybe TargetScenePublication)
 publishVulkanTargetSceneUnlessShownTx host target scene = fromIssuerSTM (publishVulkanTargetSceneUnlessShown host target scene)
+
+-- | 'readVulkanActionExit' in a commit: read-only.
+readVulkanActionExitTx ∷ ActionTicket r → OwnerTx (Maybe (Exit ActionRefusal r, Text))
+readVulkanActionExitTx ticket = fromIssuerSTM (readVulkanActionExit ticket)
 
 -- | 'readVulkanAction' in a commit: read-only, 'Nothing' while the action has not ended.
 readVulkanActionTx ∷ ActionTicket r → OwnerTx (Maybe (ActionOutcome r))

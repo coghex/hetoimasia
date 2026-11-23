@@ -24,6 +24,7 @@ module Hetoimasia.Terrain.Internal.Coordinate
   , splitAxis
   ) where
 
+import Control.DeepSeq (NFData (..))
 import Data.Int (Int64)
 import Data.Word (Word8)
 
@@ -31,6 +32,9 @@ import Data.Word (Word8)
 -- @[axisMinValue, axisMaxValue]@. The constructor is private to the package.
 newtype AxisCoord = AxisCoord Int64
   deriving stock (Eq, Ord, Show)
+
+instance NFData AxisCoord where
+  rnf (AxisCoord value) = rnf value
 
 -- | Why a coordinate operation refused its input.
 data CoordinateError

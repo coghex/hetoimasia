@@ -20,6 +20,7 @@ module Hetoimasia.Render.TwoD.Vulkan.Builders
   ) where
 
 import Control.Concurrent.STM (STM)
+import Hetoimasia.Foundation.OwnerTx (OwnerTx)
 import Data.ByteString (ByteString)
 import Data.Text (Text)
 import Data.Word (Word32)
@@ -44,7 +45,7 @@ import Hetoimasia.GPU.Vulkan.Native.Uploads
   , UploadTicket
   , Uploads
   , UploadsUnavailable (..)
-  , accessReserve
+  , accessReserveTx
   , accessRoom
   , accessSubmitGranted
   , noUploadAccess
@@ -125,8 +126,8 @@ roomFor ∷ BufferUploads → Natural → STM (Either BufferUploadRefusal ())
 roomFor uploads bytes = either (Left . bufferRefusal) Right <$> accessRoom (bufferAccess uploads) bytes
 
 -- | Reserve its queue place and staging region; a refusal reserves nothing.
-reserveRoom ∷ BufferUploads → Natural → STM (Either BufferUploadRefusal UploadGrant)
-reserveRoom uploads bytes = either (Left . bufferRefusal) Right <$> accessReserve (bufferAccess uploads) bytes
+reserveRoom ∷ BufferUploads → Natural → OwnerTx (Either BufferUploadRefusal UploadGrant)
+reserveRoom uploads bytes = either (Left . bufferRefusal) Right <$> accessReserveTx (bufferAccess uploads) bytes
 
 -- | Spend the reservation on the upload that fills a fresh vertex buffer of
 -- exactly its bytes: admission copies the bytes before it returns and never

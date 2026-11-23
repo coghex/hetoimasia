@@ -248,7 +248,7 @@ fullSpec env = describe "terrain views (full)" $ do
         -- each change is drawn: a new revision presented, its pinned camera at the requested zoom
         forM_ changes $ \change → do
           before ← atomically (readingPublished <$> readView view)
-          commit (configureView view change) >>= either (\why → assertFailure ("the change was refused: " <> show why)) pure
+          prepare change >>= commit . configureView view >>= either (\why → assertFailure ("the change was refused: " <> show why)) pure
           published ← fmap (fromMaybe (Left Nothing)) . timeout 60000000 . atomically $ do
             reading ← readView view
             case (readingRefusal reading, readingPublished reading) of

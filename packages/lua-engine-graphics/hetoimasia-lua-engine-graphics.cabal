@@ -103,6 +103,7 @@ library terrain-views-internal
     build-depends:
         base >=4.22 && <4.23,
         containers >=0.8 && <0.9,
+        deepseq >=1.5.1 && <1.6,
         stm >=2.5.3 && <2.6,
         text >=2.1 && <2.2,
         hetoimasia-asset-image ==0.1.0.0,

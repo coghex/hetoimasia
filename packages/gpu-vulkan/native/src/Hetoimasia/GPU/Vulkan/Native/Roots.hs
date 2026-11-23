@@ -207,6 +207,7 @@ module Hetoimasia.GPU.Vulkan.Native.Roots
   , checkpointRootsSettled
   , readRootsTerminal
   , rootsFailure
+  , rootsFailedCause
   , terminalFailure
 
     -- * Retirement
@@ -276,7 +277,7 @@ import Data.Unique (Unique, newUnique)
 import Data.Word (Word32, Word64)
 import Numeric.Natural (Natural)
 import Hetoimasia.Foundation.Messaging.Payload (Prepared, prepare)
-import Hetoimasia.Foundation.OwnerTx (Publication, Publisher, newPublisherIO, publication)
+import Hetoimasia.Foundation.OwnerTx (Publication, Publisher, newPublisherIO, publication, watchPublication)
 import qualified Hetoimasia.Foundation.OwnerTx as OwnerTx
 import Hetoimasia.Foundation.Time (MonotonicSource, readInstant)
 import Hetoimasia.GPU.Model
@@ -1546,14 +1547,31 @@ rootsFailure = publication . rootsFailed
 
 -- Write the latch or the model through this: the write, and then, in its transaction, whether the session has failed
 -- published when the write changed it.
+--
+-- A write that fails the session through the model alone also latches the model's cause as the primary, in that same
+-- transaction: from the publication on, the primary is a write-once fact of the latch, never derived again.
 republishFailed ∷ Roots q inst msgr phys dev → STM a → STM a
 republishFailed roots write = do
   before ← isJust . reportPrimary <$> readRootsTerminal roots
   answer ← write
-  now ← isJust . reportPrimary <$> readRootsTerminal roots
-  let (failed, running) = rootsFailedValues roots
+  derived ← reportPrimary <$> readRootsTerminal roots
+  latched ← reportPrimary <$> readTVar (rootsTerminal roots)
+  case (latched, derived) of
+    (Nothing, Just cause) → modifyTVar' (rootsTerminal roots) (\report → report {reportPrimary = Just cause})
+    _ → pure ()
+  let now = isJust derived
+      (failed, running) = rootsFailedValues roots
   when (now /= before) (OwnerTx.publish (rootsFailed roots) (if now then failed else running))
   pure answer
+
+-- | The session's primary failure as the roots published it: 'Nothing' while the publication says it has not failed;
+-- once it says so, the latch's write-once primary, which the transaction that published the failure wrote. The one
+-- decision every admission, bind, queue and gate takes.
+rootsFailedCause ∷ Roots q inst msgr phys dev → STM (Maybe TerminalCause)
+rootsFailedCause roots =
+  snd <$> watchPublication (rootsFailure roots) >>= \case
+    False → pure Nothing
+    True → reportPrimary <$> readTVar (rootsTerminal roots)
 
 -- ---------------------------------------------------------------------------
 -- Retirement

@@ -247,6 +247,7 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , submitVulkanGranted
   , abandonVulkanGrant
   , readVulkanAction
+  , readVulkanActionExit
   , awaitVulkanAction
 
     -- * Consumer construction (VK-19)
@@ -325,6 +326,7 @@ import Control.Exception
   , ExceptionWithContext (ExceptionWithContext)
   , SomeAsyncException
   , SomeException
+  , evaluate
   , finally
   , fromException
   , mask
@@ -347,7 +349,7 @@ import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Word (Word32)
-import Hetoimasia.Foundation.Admission (Admission, AdmissionToken, admissionToken, closeAdmission, newAdmissionIO, tokenOpen)
+import Hetoimasia.Foundation.Admission (Admission, admissionToken, closeAdmission, newAdmissionIO, tokenOpen)
 import Hetoimasia.Foundation.Time (Instant)
 import Foreign.Ptr (Ptr)
 import Numeric (showHex)
@@ -417,6 +419,7 @@ import Hetoimasia.GPU.Vulkan.GLFW.Internal.Actions
   , newActions
   , pendingBarriers
   , readActionTicket
+  , readActionExit
   , refuseRemaining
   , startAction
   )
@@ -486,6 +489,10 @@ import Hetoimasia.GPU.Vulkan.Native.Frames (FrameOps (..))
 import Hetoimasia.GPU.Vulkan.Native.Recording (BatchTicket, Buffer, ClearColor (..), Recorder, RecordingOps (..), Refusal)
 import Hetoimasia.GPU.Vulkan.Native.Uploads
   ( CancelRefusal
+  , OwnerAdmission
+  , newOwnerAdmissionIO
+  , readOwnerAdmission
+  , setOwnerAdmission
   , UploadConfig
   , UploadGate
   , UploadRefusal
@@ -523,7 +530,8 @@ import Hetoimasia.GPU.Vulkan.Native.Naming (Instrumentation (..))
 import Hetoimasia.GPU.Vulkan.Native.Presentation (SurfaceExtent (..))
 import qualified Hetoimasia.GPU.Vulkan.Native.Presentation as Presentation
 import Hetoimasia.GPU.Vulkan.Native.Profile (InstancePlan (..), InstanceRequest (..), TargetRejection (..), ValidationChoice (..), ValidationFeature, ValidationResolution)
-import Hetoimasia.Foundation.OwnerTx (watchPublication)
+import Hetoimasia.Foundation.Exit (Exit, IssuerStanding (..))
+import Hetoimasia.Foundation.OwnerTx (OwnerTx, watchPublication)
 import Hetoimasia.GPU.Vulkan.Native.Roots
   ( DiagnosticAlarm (..)
   , GenerationOps (..)
@@ -548,6 +556,7 @@ import Hetoimasia.GPU.Vulkan.Native.Roots
   , noteTeardownEvidence
   , readRootsTerminal
   , rootsFailure
+  , rootsFailedCause
   , watchRootsDiagnosticsOrdered
   , DiagnosticWatch (..)
   , DiagnosticArrivals (..)
@@ -711,7 +720,7 @@ data State inst msgr phys dev cmd lease obligation = State
     -- ^ The owner-thread actions admitted and not yet taken (GRS-15): any
     -- thread admits; the owner's step takes and runs them, and whole-owner
     -- retirement refuses what is left.
-  , stateOwnerOpen ∷ !(TVar AdmissionToken)
+  , stateOwnerOpen ∷ !OwnerAdmission
     -- ^ The admission in force: the controller's own until the owner's handoff, the owner's after it.
   , statePreOwner ∷ !Admission
     -- ^ The controller's admission before the owner exists, closed in the handoff transaction.
@@ -826,7 +835,7 @@ newVulkanControllerWith
 newVulkanControllerWith hooks capture deviceStart capacity releaseCapacity initialEmpty uploads windowDepth ops rendering observer pointer bridge layers validation choice budgets clock poll = do
   roots ← newRoots ops budgets clock
   preOwner ← newAdmissionIO
-  ownerOpen ← newTVarIO (admissionToken preOwner)
+  ownerOpen ← newOwnerAdmissionIO (admissionToken preOwner)
   scenes ← newScenes initialEmpty
   actions ← newActions capacity releaseCapacity (actionGate roots ownerOpen) (sceneBarrierMet scenes)
   -- Only a host built for verification capture plans its swapchains
@@ -1349,7 +1358,7 @@ vulkanUploadRoom (VulkanController state) bytes =
 -- an upload of this many bytes needs, under the owner's gate: shared with
 -- every other upload, and held until spent ('submitVulkanGranted') or
 -- abandoned. A refusal reserves nothing.
-reserveVulkanUpload ∷ VulkanController → Natural → STM (Either VulkanUploadRefusal UploadGrant)
+reserveVulkanUpload ∷ VulkanController → Natural → OwnerTx (Either VulkanUploadRefusal UploadGrant)
 reserveVulkanUpload (VulkanController state) bytes =
   either (Left . either VulkanUploadsUnavailable VulkanUploadRefused) Right
     <$> reserveRenderingUpload (stateUploadAccess state) bytes
@@ -1365,7 +1374,7 @@ submitVulkanGranted (VulkanController state) grant buffer bytes =
     <$> submitRenderingGranted (stateUploadAccess state) grant buffer bytes
 
 -- | Abandon a reservation, from any thread: its room is free again.
-abandonVulkanGrant ∷ VulkanController → UploadGrant → STM ()
+abandonVulkanGrant ∷ VulkanController → UploadGrant → OwnerTx ()
 abandonVulkanGrant (VulkanController state) = abandonRenderingGrant (stateRendering state)
 
 -- | Cancel an upload from any thread, before its first copies are recorded
@@ -1377,19 +1386,28 @@ cancelVulkanUpload (VulkanController state) = cancelRenderingUpload (stateRender
 -- | Whether an owner-thread action may be admitted or started now: refused
 -- once the session has failed, with its primary, and once the owner's
 -- admission has closed.
-actionGate ∷ Roots Quiesced inst msgr phys dev → TVar AdmissionToken → STM (Maybe ActionRefusal)
+actionGate ∷ Roots Quiesced inst msgr phys dev → OwnerAdmission → STM (Maybe ActionRefusal)
 actionGate roots ownerOpen =
   -- the session's failure as the roots publish it; its primary, once it has failed, from the terminal report
   failedSession roots >>= \case
     Just primary → pure (Just (ActionSessionFailed primary))
-    Nothing → (readTVar ownerOpen >>= tokenOpen) <&> \open → if open then Nothing else Just ActionOwnerClosed
+    Nothing → (readOwnerAdmission ownerOpen >>= tokenOpen) <&> \open → if open then Nothing else Just ActionOwnerClosed
 
 -- The session's primary failure once the roots have published that it failed.
 failedSession ∷ Roots q inst msgr phys dev → STM (Maybe TerminalCause)
-failedSession roots =
-  snd <$> watchPublication (rootsFailure roots) >>= \case
-    False → pure Nothing
-    True → reportPrimary <$> readRootsTerminal roots
+failedSession = rootsFailedCause
+
+-- An exception's description, rendered and forced in protected IO: a description that itself raises is answered with a
+-- fixed text, and a cancellation met while rendering is handed back for the caller to raise after it has settled.
+renderedText ∷ ExceptionWithContext SomeException → IO (Text, Maybe (ExceptionWithContext SomeException))
+renderedText (ExceptionWithContext _ raised) =
+  tryWithContext @SomeException (evaluate (Text.pack (displayException raised)) >>= \text → text <$ evaluate (Text.length text)) >>= \case
+    Right text → pure (text, Nothing)
+    Left failure@(ExceptionWithContext _ inner)
+      | isAsynchronous inner → pure (indescribable, Just failure)
+      | otherwise → pure (indescribable, Nothing)
+  where
+    indescribable = "an exception whose description raised"
 
 -- | Run the owner-thread actions queued when the step began — its 'Batch',
 -- fixed before the step's checkpoint and its scene adoption — one at a time,
@@ -1424,14 +1442,16 @@ serviceActions state batch = go False
           Just started → True <$ run restore started
       if ran then go True else pure served
     run ∷ (∀ a. IO a → IO a) → Started → IO ()
+    -- Each exit is settled once, classified where it ends: the issuer's standing then (its construction escaped, the
+    -- session failed as the roots publish it, or live) and the description rendered and forced here, in protected IO.
     run restore (Started action settle) =
       tryWithContext (restore (lendConstruction (stateRendering state))) >>= \case
         Left failure → do
-          atomically (settle (ActionRaised failure))
+          raised failure IssuerEnded
           rethrowIO (failure ∷ ExceptionWithContextSome)
         -- A device exists whenever an action was admitted, and outlives every
         -- round; this is only what a missing one would mean.
-        Right Nothing → atomically (settle (ActionRefused ActionDeviceNotReady))
+        Right Nothing → atomically (settle (ActionRefused ActionDeviceNotReady) IssuerLive (Text.pack (show ActionDeviceNotReady)))
         Right (Just construction) → do
           -- The action's frame-less batches are submitted when it returns, in
           -- the order they were sealed, and discarded if it raises (GRS-12).
@@ -1440,17 +1460,25 @@ serviceActions state batch = go False
           case (outcome, escaped) of
             (Left failure@(ExceptionWithContext _ exception), _)
               | isAsynchronous exception → do
-                  atomically (settle (ActionRaised failure))
+                  raised failure IssuerLive
                   rethrowIO failure
             (_, Just failure) → do
-              atomically (settle (ActionRaised (either id (const failure) outcome)))
+              raised (either id (const failure) outcome) (IssuerEscaped failure)
               rethrowIO failure
             (Left failure, Nothing) → do
-              atomically (settle (ActionRaised failure))
+              ended ← atomically (snd <$> watchPublication (rootsFailure (stateRoots state)))
+              raised failure (if ended then IssuerEnded else IssuerLive)
               latched
             (Right value, Nothing) → do
-              atomically (settle (ActionReturned value))
+              atomically (settle (ActionReturned value) IssuerLive "")
               latched
+      where
+        -- a description that raises is answered with a fixed text, and a cancellation met while rendering goes on once
+        -- the action is settled
+        raised failure standing = do
+          (text, pending) ← renderedText failure
+          atomically (settle (ActionRaised failure) standing text)
+          mapM_ rethrowIO pending
     latched =
       checkpointRoots (stateRoots state) >>= \case
         CheckpointFailed primary → do
@@ -2379,10 +2407,14 @@ settleSceneReleases state = do
 
 -- | An action's outcome, once it has one: what it returned, what it raised,
 -- or that it was refused before it started — the owner's exit or the
--- session's failure began first, which this read itself settles. It never
--- waits.
+-- session's failure began first. Read-only; it never waits.
 readVulkanAction ∷ ActionTicket r → STM (Maybe (ActionOutcome r))
 readVulkanAction = readActionTicket
+
+-- | An action's exit, classified once where it ended ('classifyExit' against the owner's standing then: live, ended,
+-- or its construction escaped), with its description rendered and forced there. Read-only and stable.
+readVulkanActionExit ∷ ActionTicket r → STM (Maybe (Exit ActionRefusal r, Text))
+readVulkanActionExit = readActionExit
 
 -- | Wait for an action's outcome. The wait is explicit and the caller's: it
 -- ends when the action has run, or as soon as the owner's exit or the
@@ -2884,7 +2916,7 @@ withVulkanOwnerHostHooked hooks capturing logger layer rendering pointer bridge 
             writeTVar (stateHostWake state) (wakeGraphicsHost graphics)
             -- the admission before the owner closes in the transaction that hands over to the owner's own
             closeAdmission (statePreOwner state)
-            writeTVar (stateOwnerOpen state) (targetAdmission (ownerHandoff graphics))
+            setOwnerAdmission (stateOwnerOpen state) (targetAdmission (ownerHandoff graphics))
             -- A release request is held to the scenes the owner holds for the
             -- windows the host holds, and its hook is the host's own.
             installSceneSource

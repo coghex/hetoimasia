@@ -13,13 +13,16 @@ module Test.GPU.Vulkan.GLFW.Actions (spec) where
 
 import Control.Concurrent (myThreadId)
 import Control.Concurrent.STM (TVar, atomically, check, modifyTVar', newTVarIO, orElse, readTVar, readTVarIO, registerDelay, writeTVar)
-import Control.Exception (Exception (..), ExceptionWithContext (..), SomeException, finally, throwIO, toException, try)
+import Control.Exception (Exception (..), ExceptionWithContext (..), SomeException, finally, throwIO, toException, try, tryWithContext)
 import Control.Monad (void, when)
 import qualified Data.ByteString as ByteString
 import Data.List (isSubsequenceOf)
 import Data.Maybe (isJust, isNothing)
 import System.Timeout (timeout)
 
+import Data.Text (Text)
+import qualified Data.Text as Text
+import Hetoimasia.Foundation.Exit (Exit (..), IssuerStanding (..))
 import Hetoimasia.Foundation.Log (unsafeComponent)
 import Hetoimasia.Foundation.Recovery (Disposition (Required))
 import Hetoimasia.Foundation.Worker (awaitStopRequest, workerDefinition)
@@ -29,6 +32,7 @@ import Hetoimasia.GLFW.Window (WindowId)
 import Hetoimasia.GPU.Model.Identity (TargetClass (..))
 import Hetoimasia.GPU.Vulkan.Diagnostics (verdictIssues)
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
+import Hetoimasia.GPU.Vulkan.GLFW.Internal.Actions (Started (..), admitAction, beginBatch, newActions, readActionExit, readActionTicket, startAction)
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Loop (runVulkanOwnerLoop)
 import Hetoimasia.GPU.Vulkan.Native.Profile (TargetRejection (..))
 import Hetoimasia.GPU.Vulkan.Native.Recording
@@ -102,6 +106,10 @@ spec = describe "Vulkan surface-free sessions and owner-thread actions" $ do
     itBounded "are refused at the application's pre-drain quiescence, while a worker drains, a queued one without waiting for the owner, and a running one finishes" testQuiescenceRefusal
     itBounded "never run beside a frame's rendering: a frame asked for meanwhile follows the action" testSerialization
     itBounded "create a buffer and an image of every kind through the lent construction on the owner's thread, and release them for the owner to destroy, each view before its image" testBuffersAndImages
+
+  describe "action tickets" $ do
+    itBounded "read a queued action the gate refuses as refused without settling it: the owner settles it" testTicketReadOnly
+    itBounded "keep each exit as it was classified where it ended, before and after the gate closes" testTicketClassified
 
   describe "frame-less batches (GRS-12)" $ do
     itBounded "are recorded inside an action with no target, submitted in seal order when it returns, and complete their tickets only on fence evidence, waited on with a deadline" testFramelessBatches
@@ -321,7 +329,10 @@ testRaisingAction = do
   rig ← surfaceFreeRig 0
   (raised, after, whileRunning) ← runRig rig $ \host _ → do
     awaitReady host
-    raised ← act host (VulkanAction (\construction → constructPipelineLayout construction >> throwIO (ActionBroke "the consumer's own failure")))
+    ticket ← admitted =<< atomically (submitVulkanAction (vulkanController host) (VulkanAction (\construction → constructPipelineLayout construction >> throwIO (ActionBroke "the consumer's own failure"))))
+    raised ← atomically (awaitVulkanAction ticket)
+    -- classified where it ended, while the owner lives: the action's own failure, with its description
+    (exitKind <$> atomically (readVulkanActionExit ticket)) `shouldReturnValue` Just ("raised", True)
     after ← act host (VulkanAction (\_ → pure ("still running" ∷ String)))
     whileRunning ← journal rig
     pure (raised, after, whileRunning)
@@ -346,9 +357,13 @@ testEscapedConstruction = do
   outcome ← runRigCaught rig $ \host control → do
     _ ← superviseGraphicsOwner control (vulkanGraphicsOwner host)
     awaitReady host
-    answer ← act host (VulkanAction buildPipeline)
+    ticket ← admitted =<< atomically (submitVulkanAction (vulkanController host) (VulkanAction buildPipeline))
+    answer ← atomically (awaitVulkanAction ticket)
+    -- the construction escaped: terminal, whatever the gate reads later
+    (exitKind <$> atomically (readVulkanActionExit ticket)) `shouldReturnValue` Just ("terminal, raised", True)
     atomically (writeTVar observed (Just answer))
     atomically (readOwnerFailure (vulkanGraphicsOwner host) >>= check . isJust)
+    (exitKind <$> atomically (readVulkanActionExit ticket)) `shouldReturnValue` Just ("terminal, raised", True)
     checkRuntime control
   loss ← raisedAs @GraphicsDeviceLost outcome
   lostDuring loss `shouldBe` "vkCreateGraphicsPipelines"
@@ -451,6 +466,8 @@ testExitRefusal = do
       (atomically (writeTVar gate True))
       ( \(host, behind) → do
           refused ← atomically (awaitVulkanAction behind)
+          -- queued when the exit began: its refusal reads as terminal, read-only
+          (exitKind <$> atomically (readVulkanActionExit behind)) `shouldReturnValue` Just ("terminal, refused", True)
           late ← atomically (submitVulkanAction (vulkanController host) (VulkanAction (\_ → pure ())))
           atomically $ do
             writeTVar answers (Just (outcomeText refused, refusalOf late))
@@ -978,6 +995,61 @@ shouldReturnValue action expected = action >>= (`shouldBe` expected)
 
 -- | One example under the suite's fixture-aware bound of a minute
 -- ("Test.GPU.Vulkan.GLFW.Bound").
+-- A ticket's exit, as its kind and whether its description is non-empty.
+exitKind ∷ Maybe (Exit ActionRefusal r, Text) → Maybe (String, Bool)
+exitKind = fmap $ \(exit, text) →
+  ( case exit of
+      Completed _ → "completed"
+      Refused _ → "refused"
+      Raised _ → "raised"
+      Cancelled _ → "cancelled"
+      Terminal (Left _) → "terminal, refused"
+      Terminal (Right _) → "terminal, raised"
+  , not (Text.null text)
+  )
+
+-- Over the queue alone: a queued action whose start the gate refuses reads as refused, and nothing is written. A gate
+-- that opens again (which the owner's never does) finds it still queued, and it starts.
+testTicketReadOnly ∷ IO ()
+testTicketReadOnly = do
+  gate ← newTVarIO Nothing
+  actions ← newActions 4 4 (readTVar gate) (\_ → pure True)
+  ticket ← atomically (admitAction actions True (VulkanAction (\_ → pure ()))) >>= admitted
+  (exitKind <$> atomically (readActionExit ticket)) `shouldReturnValue` Nothing
+  atomically (writeTVar gate (Just ActionOwnerClosed))
+  (exitKind <$> atomically (readActionExit ticket)) `shouldReturnValue` Just ("terminal, refused", True)
+  (fmap outcomeText <$> atomically (readActionTicket ticket)) `shouldReturnValue` Just (outcomeText (ActionRefused @() ActionOwnerClosed))
+  atomically (writeTVar gate Nothing)
+  (fmap outcomeText <$> atomically (readActionTicket ticket)) `shouldReturnValue` Nothing
+  started ← atomically (beginBatch actions >>= startAction actions)
+  isJust started `shouldBe` True
+
+-- Over the queue alone: an action settled with the owner live raised recoverably, one settled refused for now is a
+-- refusal a later attempt can outlive, and one settled after its construction escaped is terminal; each reads the same
+-- once the gate closes.
+testTicketClassified ∷ IO ()
+testTicketClassified = do
+  gate ← newTVarIO Nothing
+  actions ← newActions 4 4 (readTVar gate) (\_ → pure True)
+  let failure = toException (ActionBroke "the consumer's own failure")
+  live ← atomically (admitAction actions True (VulkanAction (\_ → pure ()))) >>= admitted
+  transient ← atomically (admitAction actions True (VulkanAction (\_ → pure ()))) >>= admitted
+  escaped ← atomically (admitAction actions True (VulkanAction (\_ → pure ()))) >>= admitted
+  raised ← tryWithContext @SomeException (throwIO failure) >>= either pure (\() → failWith "nothing raised")
+  let settleNext ∷ (∀ r. ActionOutcome r) → IssuerStanding → Text → IO ()
+      settleNext outcome standing text =
+        atomically (beginBatch actions >>= startAction actions) >>= \case
+          Just (Started _ settle) → atomically (settle outcome standing text)
+          Nothing → failWith "no action started"
+  settleNext (ActionRaised raised) IssuerLive "the consumer's own failure"
+  settleNext (ActionRefused ActionDeviceNotReady) IssuerLive "ActionDeviceNotReady"
+  settleNext (ActionRaised raised) (IssuerEscaped raised) "the device was lost"
+  let kinds = mapM (fmap exitKind . atomically . readActionExit) [live, transient, escaped]
+      expected = [Just ("raised", True), Just ("refused", True), Just ("terminal, raised", True)]
+  kinds `shouldReturnValue` expected
+  atomically (writeTVar gate (Just ActionOwnerClosed))
+  kinds `shouldReturnValue` expected
+
 itBounded ∷ String → IO () → Spec
 itBounded = boundedIt (boundOf 60)
 

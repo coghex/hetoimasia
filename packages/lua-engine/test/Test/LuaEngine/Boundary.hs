@@ -54,6 +54,7 @@ fieldEntries header field = do
     | line ← takeWhile (not . endOfField) (drop 1 (dropWhile ((/= field) . trim) body))
     , let name = trim (takeWhile (\character → character /= ' ' && character /= ',') (trim line))
     , not (null name)
+    , not ("--" `isPrefixOf` name)
     ]
   where
     endOfField line = not (null (trim line)) && not ("        " `isPrefixOf` line)
@@ -159,7 +160,7 @@ spec = describe "the package and import boundary" $ do
     [file <> ": " <> name | (file, name) ← imported, not (permittedModules name)] `shouldBe` []
     [file <> ": " <> name | (file, name) ← imported, ".Internal" `isInfixOf` name] `shouldBe` []
 
-  it "has a texture sublibrary over the profile, the request adapter, the content package, the bounded PNG decoder, the foundation and the host's public modules, and nothing else" $ do
+  it "has a texture sublibrary over the profile, the request adapter, the content package, the bounded PNG decoder, the foundation, its issuer bridge for the account's ownership operations and the host's public modules, and nothing else" $ do
     (sort <$> fieldEntries "library texture" "build-depends:")
       `shouldReturn` [ "base"
                      , "bytestring"
@@ -168,6 +169,7 @@ spec = describe "the package and import boundary" $ do
                      , "hetoimasia-asset-image"
                      , "hetoimasia-content"
                      , "hetoimasia-foundation"
+                     , "hetoimasia-foundation:owner-tx-issuer"
                      , "hetoimasia-lua-engine"
                      , "hetoimasia-lua-engine:request"
                      , "hetoimasia-scripting-lua"
@@ -494,6 +496,9 @@ spec = describe "the package and import boundary" $ do
                  , "Hetoimasia.Content.ReadPool"
                  , "Hetoimasia.Foundation.Resource"
                  , "Hetoimasia.Foundation.Worker"
+                 , -- the account is an issuer of ownership transactions
+                   "Hetoimasia.Foundation.OwnerTx"
+                 , "Hetoimasia.Foundation.OwnerTx.Issuer"
                  , "Hetoimasia.Asset"
                  , "Hetoimasia.Asset.Image"
                  , "Hetoimasia.Asset.Image.DataMap"
@@ -582,6 +587,8 @@ spec = describe "the package and import boundary" $ do
                , "Hetoimasia.LuaEngine.Session.Pacing"
                , "Hetoimasia.LuaEngine.Session.State"
                , "Hetoimasia.LuaEngine.Texture"
+               , -- the account's operations, committed through the foundation's public commit
+                 "Hetoimasia.Foundation.OwnerTx"
                , "Hetoimasia.LuaEngine.Terrain"
                , "Hetoimasia.LuaEngine.Scene"
                , "Hetoimasia.Terrain.Cell"

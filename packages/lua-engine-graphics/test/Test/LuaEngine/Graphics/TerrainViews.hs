@@ -10,14 +10,14 @@
 -- disposed of and when it may be, how each operation settled. None asserts an order, a step count or a timing.
 module Test.LuaEngine.Graphics.TerrainViews (spec) where
 
-import Control.Concurrent (forkIO)
+import Control.Concurrent (forkIO, killThread)
 import Control.Concurrent.MVar (newEmptyMVar, readMVar, takeMVar, tryPutMVar)
 import Control.Concurrent.STM
 import Control.Monad (forM, forM_, unless, void, when)
 import qualified Data.ByteString.Char8 as BC
 import Data.Bits (shiftL, (.|.))
 import qualified Data.Map.Strict as Map
-import Data.Maybe (isJust)
+import Data.Maybe (isJust, isNothing)
 import Data.Sequence (Seq, (|>))
 import qualified Data.Sequence as Seq
 import qualified Data.Set as Set
@@ -28,7 +28,10 @@ import GHC.Stats (RTSStats (..), getRTSStats, getRTSStatsEnabled)
 import Hetoimasia.Foundation.Admission (admissionToken, closeAdmission, newAdmissionIO)
 import Hetoimasia.Foundation.Log (callbackSink, defaultLogFilter, mkLogger)
 import Hetoimasia.Foundation.Exit (IssuerStanding (..), classifyExit)
+import qualified Hetoimasia.Foundation.Exit as Exit
 import Hetoimasia.Foundation.OwnerTx (commit)
+import qualified Hetoimasia.Foundation.OwnerTx as OwnerTx
+import Hetoimasia.Foundation.OwnerTx (newPublisherIO)
 import Hetoimasia.Foundation.OwnerTx.Issuer (fromIssuerSTM)
 import Hetoimasia.Foundation.Messaging.Payload (prepare)
 import Hetoimasia.Foundation.Worker (withWorkerGroup)
@@ -81,7 +84,7 @@ import Test.Support.Bounded (bounded)
 import Test.Support.Owned (withOwnedThread)
 import Hetoimasia.GLFW.Window (Attribute (..), ContentScale (..), Extent (..))
 import Hetoimasia.LuaEngine.Graphics.Window.Host (WindowGeometry (..), geometryOfAttributes)
-import Control.Exception (AsyncException (ThreadKilled), ErrorCall (ErrorCall), ExceptionWithContext (ExceptionWithContext), SomeException, displayException, finally, rethrowIO, throwIO, toException, try, tryWithContext)
+import Control.Exception (IOException, AsyncException (ThreadKilled), ErrorCall (ErrorCall), ExceptionWithContext (ExceptionWithContext), SomeException, displayException, finally, rethrowIO, throwIO, toException, try, tryWithContext)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import System.Timeout (timeout)
 
@@ -156,7 +159,15 @@ data Rig = Rig
   , rigRequested ∷ !(TVar (Maybe (STM Bool → IO ())))
     -- ^ When set: run once on the owner's thread after the next regional request is made, before its stage is written,
     -- given a reading of whether it has settled.
+  , rigCopyFault ∷ !(TVar (Maybe CopyFault))
+    -- ^ When set: the next held copy fails here, once taken (an accounting fault lasts until the example clears it).
+  , rigClaimRaises ∷ !(TVar Bool)
+    -- ^ While set: claiming a receipt raises, in the claiming transaction.
   }
+
+-- Where a held copy fails: in the IO right after its borrow is taken (raising, or waiting there, having said so, for
+-- the example to cancel the owner), in its count, or in the transaction that accounts for it.
+data CopyFault = TakenRaises | TakenWaits !(TMVar ()) !(TMVar ()) | CountingRaises | AccountingRaises
 
 -- | An example's native stand-in: the session, the renderer's registry the production hands admit into
 -- ('registryHands'), and what the example controls of them.
@@ -277,6 +288,8 @@ withRig options body =
         countGate ← newTVarIO Nothing
         beforeCollect ← newTVarIO Nothing
         requested ← newTVarIO Nothing
+        copyFault ← newTVarIO Nothing
+        claimRaises ← newTVarIO False
         initial ← prepare initialGraphicsScene
         withNativeOf (optNative options) $ \native → do
          let owner =
@@ -321,7 +334,22 @@ withRig options body =
              hooks =
                CopyHooks
                  { hookUnavailable = readTVar unavailable
+                 , hookTaken =
+                     atomically (readTVar copyFault >>= \case
+                       Just TakenRaises → Just Nothing <$ writeTVar copyFault Nothing
+                       Just (TakenWaits arrived held) → Just (Just (arrived, held)) <$ writeTVar copyFault Nothing
+                       _ → pure Nothing) >>= \case
+                       Nothing → pure ()
+                       Just Nothing → throwIO (userError "the copy failed once taken")
+                       Just (Just (arrived, held)) → atomically (putTMVar arrived ()) >> atomically (takeTMVar held)
+                 , hookAccounting =
+                     readTVar copyFault >>= \case
+                       Just AccountingRaises → throwSTM (userError "the copy's accounting failed")
+                       _ → pure ()
                  , hookCounting = \batch total → do
+                     atomically (readTVar copyFault >>= \case
+                       Just CountingRaises → True <$ writeTVar copyFault Nothing
+                       _ → pure False) >>= \failing → when failing (throwIO (userError "the copy's count failed"))
                      gate ← atomically $
                        readTVar countGate >>= \case
                          Just (crosses, counting, resumed) | crosses total → Just (counting, resumed) <$ writeTVar countGate Nothing
@@ -355,7 +383,7 @@ withRig options body =
                      forM_ native settleNative
                      loop
                loop
-             rig views = Rig views terrain lease queue queueOpen lane laneCapacity standings chunks disposed attempts buildFailure disposeFailure next ledger claims receipts ownerEnded style account deferDisposal pendingDisposals hold entered resume styleReleases unavailable admission admitBudget grants uploading demandRefused buildAttempts failNext raising raiseSealed receiptNext registry afterSeal fault countGate native beforeCollect requested
+             rig views = Rig views terrain lease queue queueOpen lane laneCapacity standings chunks disposed attempts buildFailure disposeFailure next ledger claims receipts ownerEnded style account deferDisposal pendingDisposals hold entered resume styleReleases unavailable admission admitBudget grants uploading demandRefused buildAttempts failNext raising raiseSealed receiptNext registry afterSeal fault countGate native beforeCollect requested copyFault claimRaises
              fakeHands = stepHands (rig (error "the teardown's hands read no service"))
          withOwnedThread (when (optTeardown options /= TeardownNone) teardown) $ \_ _ →
            withTerrainViews (configOf options) ports $ \views →
@@ -388,13 +416,13 @@ settleNative native = do
 nativeHands ∷ Rig → Native → Hands
 nativeHands rig native =
   production
-    { handReserve = \prepared → fromIssuerSTM $
-        roomOf (rigAdmission rig) (rigAdmitBudget rig) >>= \case
+    { handReserve = \prepared →
+        fromIssuerSTM (roomOf (rigAdmission rig) (rigAdmitBudget rig)) >>= \case
           Left refusal → pure (Left refusal)
           Right () →
-            Chunks.admitRetainedChunk (bufferUploads builders) (nativeRetained native) prepared >>= \case
+            Chunks.admitRetainedChunkTx (bufferUploads builders) (nativeRetained native) prepared >>= \case
               Left refusal → pure (Left (viewAdmission refusal))
-              Right granted → do
+              Right granted → fromIssuerSTM $ do
                 let grant = viewGrant (standInDisposal standIn) builders (nativeRetained native) granted
                     grantedReference = Chunks.chunkGrantReference granted
                 modifyTVar' (rigAdmitBudget rig) (fmap (subtract 1))
@@ -498,7 +526,8 @@ hands rig =
                     { receiptKey = key
                     , receiptOutcome = readTVar cell
                     , receiptClaim = fromIssuerSTM (claimRigReceipt rig key)
-                    , receiptClaimable = maybe (pure False) (fmap isJust . readTVar) . Map.lookup key =<< readTVar (rigRegistry rig)
+                    -- a claim that would raise is not claimable: the watcher's sweep waits until the example disarms it
+                    , receiptClaimable = readTVar (rigClaimRaises rig) >>= \failing → if failing then pure False else maybe (pure False) (fmap isJust . readTVar) . Map.lookup key =<< readTVar (rigRegistry rig)
                     }
                 abandon = fromIssuerSTM (readTVar live >>= \held → when held (giveBack >> seal (Left (BuildFailed "BuildAbandoned" NotAllocated))))
             raising ← readTVar (rigRaising rig)
@@ -567,6 +596,13 @@ hands rig =
             modifyTVar' (rigStandings rig) (Map.insert chunk (if uploading then ChunkUploading else ChunkReady))
             pure (Right chunk)
 
+-- A camera move or a configuration, prepared (fully evaluated) at the IO boundary and committed alone.
+moveNow ∷ TerrainView Int → JumpTarget → IO (Either ControlRefusal PendingMove)
+moveNow view target = prepare target >>= commit . moveView view
+
+configureNow ∷ TerrainView Int → Configure → IO (Either ControlRefusal ())
+configureNow view change = prepare change >>= commit . configureView view
+
 -- Run the owner until the views ask for nothing more: every queued action, with the fake hands. A step that raises has
 -- run (this owner outlives it), and its exception goes on to the example.
 runOwner ∷ Rig → IO ()
@@ -589,7 +625,7 @@ runOwner rig = go (100000 ∷ Int)
             Left failure → do
               atomically $ do
                 standing ← maybe IssuerLive (const IssuerEnded) <$> readTVar (rigOwnerEnded rig)
-                writeTVar outcome (Just (StepRaised (classifyExit standing (Left failure))))
+                writeTVar outcome (Just (StepExit (classifyExit standing (Left failure))))
               rethrowIO failure
             Right () → atomically (writeTVar outcome (Just StepRan)) >> go (n - 1)
 
@@ -618,6 +654,7 @@ stepUntil rig done =
 -- Claim a receipt the fake renderer holds, once: its outcome, if sealed; the registry forgets it.
 claimRigReceipt ∷ Rig → Word64 → STM (Maybe (Either BuildFailure ChunkRef))
 claimRigReceipt rig key =
+  readTVar (rigClaimRaises rig) >>= \failing → when failing (throwSTM (userError "the claim raised")) >>
   Map.lookup key <$> readTVar (rigRegistry rig) >>= \case
     Just cell →
       readTVar cell >>= \case
@@ -631,7 +668,7 @@ endRigOwner rig why = atomically $ do
   writeTVar (rigOwnerEnded rig) (Just why)
   queued ← readTVar (rigQueue rig)
   writeTVar (rigQueue rig) Seq.empty
-  forM_ queued $ \(_, outcome) → writeTVar outcome (Just (StepRefused why))
+  forM_ queued $ \(_, outcome) → writeTVar outcome (Just (StepExit (Exit.Terminal (Left why))))
 
 -- Wait, bounded, for a condition the views' own threads bring about.
 eventually ∷ STM Bool → IO ()
@@ -771,8 +808,10 @@ styleWith rig mapped live = do
       }
 
 openOn ∷ Rig → Target → IO (TerrainView Int)
-openOn rig target = do
-  style ← styleOf rig
+openOn rig target = styleOf rig >>= openStyled rig target
+
+openStyled ∷ Rig → Target → ViewStyle → IO (TerrainView Int)
+openStyled rig target style =
   openView (rigViews rig) (OpenRequest (viewTarget target) (rigLease rig) (pure (Right style)) (axis 0, axis 0, axis 1) defaultLightSettings) >>= \case
     Left why → fail ("the view was refused: " <> show why)
     Right view → pure view
@@ -823,7 +862,7 @@ spec = describe "terrain views (TRA-9 v2)" $ do
     it "keeps every chunk of a lighting-only change: the new revision lists byte-identical regions by the same references" $
       withPublished defaultOptions $ \rig target view → do
         before ← atomically (latestWorld target) >>= maybe (fail "no world") pure
-        commit (configureView view noConfigure {configureLight = Just brighter}) `shouldReturn` Right ()
+        configureNow view (noConfigure {configureLight = Just brighter}) `shouldReturn` Right ()
         settleUntil rig (publishedAtLeast view 2)
         after ← atomically (latestWorld target) >>= maybe (fail "no world") pure
         worldChunks after `shouldBe` worldChunks before
@@ -864,7 +903,7 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         after' ← check'
         after' `shouldNotBe` before'
         -- rotated, and cut below the surface through undiscovered ground: fog conceals it, still as the oracle plans
-        commit (configureView view noConfigure {configureFacing = Just FaceWest, configureDepth = Just (axis (-10))}) `shouldReturn` Right ()
+        configureNow view (noConfigure {configureFacing = Just FaceWest, configureDepth = Just (axis (-10))}) `shouldReturn` Right ()
         settleUntil rig (publishedAtLeast view 3)
         cut ← check'
         [() | quad ← cut, quadPart quad == PartFog] `shouldSatisfy` (not . null)
@@ -882,7 +921,7 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         drawnPlanTarget drawn `shouldBe` 1
         isJust (drawnPlanPlan drawn) `shouldBe` True
         -- a successor that is accepted and adopted but never drawn leaves the receipt where it was
-        commit (configureView view noConfigure {configureLight = Just brighter}) `shouldReturn` Right ()
+        configureNow view (noConfigure {configureLight = Just brighter}) `shouldReturn` Right ()
         settleUntil rig (publishedAtLeast view 2)
         adopt rig target
         again ← atomically (viewDrawn view) >>= maybe (fail "nothing drawn") pure
@@ -897,7 +936,7 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         before ← atomically (latestWorld target)
         published ← atomically (readingPublished <$> readView view)
         -- a zoom out rebuilds every chunk: more than the slots left beside the drawn revision's
-        commit (configureView view noConfigure {configureZoom = Just 0.5}) `shouldReturn` Right ()
+        configureNow view (noConfigure {configureZoom = Just 0.5}) `shouldReturn` Right ()
         settleUntil rig (isJust . readingRefusal <$> readView view)
         reading ← atomically (readView view)
         readingRefusal reading `shouldSatisfy` \case
@@ -980,29 +1019,29 @@ spec = describe "terrain views (TRA-9 v2)" $ do
 
     it "settles a move superseded by a camera change once, and its late completion cannot move the camera" $
       withPublished defaultOptions $ \rig _ view → do
-        Right move ← commit (moveView view (JumpTarget (axis 4000) (axis 4000) Nothing))
+        Right move ← moveNow view ((JumpTarget (axis 4000) (axis 4000) Nothing))
         atomically (moveSettled move) `shouldReturn` Nothing
-        commit (configureView view noConfigure {configureZoom = Just 2}) `shouldReturn` Right ()
+        configureNow view (noConfigure {configureZoom = Just 2}) `shouldReturn` Right ()
         atomically (moveSettled move) `shouldReturn` Just MoveSuperseded
         settleUntil rig (publishedAtLeast view 2)
         atomically (moveSettled move) `shouldReturn` Just MoveSuperseded
 
     it "keeps a pending move through a lighting-only update" $
       withPublished defaultOptions $ \_ _ view → do
-        Right move ← commit (moveView view (JumpTarget (axis 4000) (axis 4000) (Just (axis 1))))
-        commit (configureView view noConfigure {configureLight = Just brighter}) `shouldReturn` Right ()
+        Right move ← moveNow view ((JumpTarget (axis 4000) (axis 4000) (Just (axis 1))))
+        configureNow view (noConfigure {configureLight = Just brighter}) `shouldReturn` Right ()
         atomically (moveSettled move) `shouldReturn` Nothing
 
     it "lands a move once its destination is copied" $
       withPublished defaultOptions $ \rig _ view → do
-        Right move ← commit (moveView view (JumpTarget (axis 70) (axis 70) Nothing))
+        Right move ← moveNow view ((JumpTarget (axis 70) (axis 70) Nothing))
         settleUntil rig (isJust <$> moveSettled move)
         atomically (moveSettled move) `shouldReturn` Just MoveLanded
 
     it "applies none of an invalid configure's fields" $
       withPublished defaultOptions $ \_ _ view → do
         before' ← atomically (readView view)
-        commit (configureView view noConfigure {configureZoom = Just (0 / 0), configureLight = Just brighter}) >>= (`shouldSatisfy` \case
+        configureNow view (noConfigure {configureZoom = Just (0 / 0), configureLight = Just brighter}) >>= (`shouldSatisfy` \case
           Left (ControlInvalid _) → True
           _ → False)
         after' ← atomically (readView view)
@@ -1014,7 +1053,7 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         target ← newTarget 1
         view ← openOn rig target
         -- no step has run: the view has no terrain facts yet
-        commit (configureView view noConfigure {configureZoom = Just 2, configureLight = Just brighter}) `shouldReturn` Left ControlBusy
+        configureNow view (noConfigure {configureZoom = Just 2, configureLight = Just brighter}) `shouldReturn` Left ControlBusy
         runOwner rig
 
     it "revokes a close at once, with no owner step, even on a minimized target" $
@@ -1305,10 +1344,10 @@ spec = describe "terrain views (TRA-9 v2)" $ do
               continue ← atomically ((False <$ (readTVar stop >>= check)) `orElse` (True <$ (readTVar (rigQueue rig) >>= check . not . Seq.null)))
               when continue owner
         -- a rebuild whose first build is held; the move arrives meanwhile, and the build is then refused
-        commit (configureView view noConfigure {configureZoom = Just 0.5}) `shouldReturn` Right ()
+        configureNow view (noConfigure {configureZoom = Just 0.5}) `shouldReturn` Right ()
         move ← withOwnedThread owner $ \_ ended → do
           timeout 10000000 (atomically (takeTMVar (rigEntered rig))) >>= maybe (expectationFailure "no build was held") pure
-          Right move ← commit (moveView view (JumpTarget (axis 70) (axis 70) (Just (axis 1))))
+          Right move ← moveNow view ((JumpTarget (axis 70) (axis 70) (Just (axis 1))))
           atomically (writeTVar (rigBuildFailure rig) (Just (BuildFailed "an injected failure" NotAllocated)) >> putTMVar (rigResume rig) ())
           atomically (writeTVar stop True)
           ended
@@ -1323,11 +1362,11 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         first ← atomically (latestWorld target) >>= maybe (fail "no world") pure
         adopt rig target
         atomically (noteSubmitted (rigReceipts rig) (worldTag first) (worldMetrics first))
-        commit (configureView view noConfigure {configureLight = Just brighter}) `shouldReturn` Right ()
+        configureNow view (noConfigure {configureLight = Just brighter}) `shouldReturn` Right ()
         settleUntil rig (publishedAtLeast view 2)
         second ← atomically (latestWorld target) >>= maybe (fail "no world") pure
         adoptHolding rig target
-        commit (configureView view noConfigure {configureLight = Just dimmer}) `shouldReturn` Right ()
+        configureNow view (noConfigure {configureLight = Just dimmer}) `shouldReturn` Right ()
         settleUntil rig ((== "building (0 to build)") . readingStage <$> readView view)
         runOwner rig
         atomically (readingPublished <$> readView view) `shouldReturn` Just (tagRevision (worldTag second))
@@ -1366,7 +1405,7 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         quiesce rig target
         before ← atomically (latestWorld target)
         published ← atomically (readingPublished <$> readView view)
-        commit (configureView view noConfigure {configureZoom = Just 0.125}) `shouldReturn` Right ()
+        configureNow view (noConfigure {configureZoom = Just 0.125}) `shouldReturn` Right ()
         settleUntil rig (isJust . readingRefusal <$> readView view)
         atomically (readingRefusal <$> readView view) `shouldReturn` Just (LimitRegions 164 163)
         atomically (readingPublished <$> readView view) `shouldReturn` published
@@ -1374,7 +1413,7 @@ spec = describe "terrain views (TRA-9 v2)" $ do
 
     it "moves between two disjoint footprints that each fit the region cap exactly" $
       withPublished defaultOptions {optProfile = smallProfile {profileRegions = 36}} $ \rig target view → do
-        Right move ← commit (moveView view far)
+        Right move ← moveNow view (far)
         settleUntil rig (isJust <$> moveSettled move)
         atomically (moveSettled move) `shouldReturn` Just MoveLanded
         settleUntil rig (publishedAtLeast view 2)
@@ -1384,7 +1423,7 @@ spec = describe "terrain views (TRA-9 v2)" $ do
 
     it "lands a move given exactly the destination's runs, though both views' together exceed them" $
       withPublished defaultOptions {optProfile = smallProfile {profileRuns = 3104}} $ \rig _ view → do
-        Right move ← commit (moveView view far)
+        Right move ← moveNow view (far)
         settleUntil rig (publishedAtLeast view 2)
         atomically (moveSettled move) `shouldReturn` Just MoveLanded
         atomically (readingRefusal <$> readView view) `shouldReturn` Nothing
@@ -1474,7 +1513,7 @@ spec = describe "terrain views (TRA-9 v2)" $ do
       withPublished defaultOptions {optRuntime = \c → c {configLimits = cameraLimitsWith 38}} $ \rig target view → do
         -- a cut at level -10 through the undiscovered ground, 12 levels below the reference, facing south from the
         -- origin: fog conceals the cut. The runtime has a place for each of F's 38 regions
-        commit (configureView view noConfigure {configureDepth = Just (axis (-10))}) `shouldReturn` Right ()
+        configureNow view (noConfigure {configureDepth = Just (axis (-10))}) `shouldReturn` Right ()
         settleUntil rig (publishedAtLeast view 2)
         drawn ← drawLatest rig target view
         plan ← maybe (fail "the drawn plan is not pinned") pure (drawnPlanPlan drawn)
@@ -1559,13 +1598,13 @@ spec = describe "terrain views (TRA-9 v2)" $ do
       withPublished defaultOptions $ \rig target view → do
         -- at the world's corner, a slice 400 levels above the reference projects every read outside the world
         let top = 2 ^ (62 ∷ Int) - 1
-        Right move ← commit (moveView view (JumpTarget (axis top) (axis top) Nothing))
+        Right move ← moveNow view ((JumpTarget (axis top) (axis top) Nothing))
         settleUntil rig (isJust <$> moveSettled move)
         atomically (moveSettled move) `shouldReturn` Just MoveLanded
         settleUntil rig (publishedAtLeast view 2)
         atomically (readingDemand <$> readView view) >>= (`shouldSatisfy` (not . null))
         reference ← drawLatest rig target view >>= maybe (fail "no camera") pure . drawnPlanCamera
-        commit (configureView view noConfigure {configureDepth = Just (axis (camRef reference + 399))}) `shouldReturn` Right ()
+        configureNow view (noConfigure {configureDepth = Just (axis (camRef reference + 399))}) `shouldReturn` Right ()
         settleUntil rig (publishedAtLeast view 3)
         world ← atomically (latestWorld target) >>= maybe (fail "no world") pure
         worldChunks world `shouldBe` Set.empty
@@ -1582,7 +1621,7 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         published ← atomically (readingPublished <$> readView view)
         heldMetrics (targetHeld target) (Just (metricsOf 0 0))
         settleUntil rig (null . readingDemand <$> readView view)
-        Right move ← commit (moveView view (JumpTarget (axis 70) (axis 70) (Just (axis 1))))
+        Right move ← moveNow view ((JumpTarget (axis 70) (axis 70) (Just (axis 1))))
         settleUntil rig (isJust <$> moveSettled move)
         atomically (moveSettled move) `shouldReturn` Just MoveLanded
         reading ← atomically (readView view)
@@ -1602,7 +1641,7 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         published ← atomically (readingPublished <$> readView view)
         -- the destination (70, 70, 1) is in region (4, 4, 0): its terrain part reads as a failed page makes it
         atomically (writeTVar (rigUnavailable rig) (Set.singleton (RegionCoord 4 4 0)))
-        Right move ← commit (moveView view (JumpTarget (axis 70) (axis 70) (Just (axis 1))))
+        Right move ← moveNow view ((JumpTarget (axis 70) (axis 70) (Just (axis 1))))
         settleUntil rig (isJust <$> moveSettled move)
         atomically (moveSettled move) `shouldReturn` Just (MovePressure (LimitFailure "the jump's destination is not ready"))
         quiesce rig target
@@ -1616,7 +1655,7 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         quiesce rig target
         before ← atomically (latestWorld target)
         published ← atomically (readingPublished <$> readView view)
-        commit (configureView view noConfigure {configureZoom = Just 0.125}) `shouldReturn` Right ()
+        configureNow view (noConfigure {configureZoom = Just 0.125}) `shouldReturn` Right ()
         settleUntil rig (isJust . readingRefusal <$> readView view)
         -- an unrelated wake: the owner is asked for a step and runs, and the target adopts
         commit (kick (rigViews rig))
@@ -1625,8 +1664,8 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         (readingRefusal reading, readingRefusals reading, readingPublished reading) `shouldBe` (Just (LimitRegions 164 163), 1, published)
         atomically (latestWorld target) `shouldReturn` before
         -- a changed intent that fits: back to unit zoom, then a move
-        commit (configureView view noConfigure {configureZoom = Just 1}) `shouldReturn` Right ()
-        Right move ← commit (moveView view far)
+        configureNow view (noConfigure {configureZoom = Just 1}) `shouldReturn` Right ()
+        Right move ← moveNow view (far)
         settleUntil rig (isJust <$> moveSettled move)
         atomically (moveSettled move) `shouldReturn` Just MoveLanded
         settleUntil rig (publishedAtLeast view (maybe 1 (+ 1) published))
@@ -1641,7 +1680,7 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         world ← atomically (latestWorld target)
         -- the host refuses the next publication; the move's destination asks for other regions
         atomically (setHeldAccepts (targetHeld target) False)
-        Right move ← commit (moveView view far)
+        Right move ← moveNow view (far)
         settleUntil rig (isJust . readingRefusal <$> readView view)
         atomically (readingRefusal <$> readView view) `shouldReturn` Just (LimitFailure "the host refused the publication")
         after ← atomically (readView view)
@@ -1654,7 +1693,7 @@ spec = describe "terrain views (TRA-9 v2)" $ do
     it "ends a view whose original window authority is revoked while its target stays usable, settling its pending move" $
       withPublished defaultOptions $ \rig target view → do
         quiesce rig target
-        Right move ← commit (moveView view far)
+        Right move ← moveNow view (far)
         atomically (setHeldAuthority (targetHeld target) False)
         settleUntil rig ((== ViewEnded EndRevoked) . readingStatus <$> readView view)
         atomically (moveSettled move) `shouldReturn` Just (MoveEnded EndRevoked)
@@ -1665,7 +1704,7 @@ spec = describe "terrain views (TRA-9 v2)" $ do
       withPublished defaultOptions $ \rig target view → do
         quiesce rig target
         before ← atomically (readView view)
-        commit (configureView view noConfigure {configureLight = Just brighter}) `shouldReturn` Right ()
+        configureNow view (noConfigure {configureLight = Just brighter}) `shouldReturn` Right ()
         settleUntil rig (publishedAtLeast view (maybe 1 (+ 1) (readingPublished before)))
         after ← atomically (readView view)
         (readingDemand after, readingReceipt after, readingInstalls after) `shouldBe` (readingDemand before, readingReceipt before, readingInstalls before)
@@ -1676,30 +1715,30 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         heldMetrics (targetHeld target) (Just (metricsOf 0 0))
         settleUntil rig (null . readingDemand <$> readView view)
         atomically (writeTVar (rigUnavailable rig) (Set.singleton (RegionCoord 4 4 0)))
-        Right first ← commit (moveView view (JumpTarget (axis 70) (axis 70) (Just (axis 1))))
+        Right first ← moveNow view ((JumpTarget (axis 70) (axis 70) (Just (axis 1))))
         settleUntil rig (isJust <$> moveSettled first)
         atomically (moveSettled first) `shouldReturn` Just (MovePressure (LimitFailure "the jump's destination is not ready"))
         atomically ((,) <$> (readingRefusal <$> readView view) <*> (readingRefusals <$> readView view)) `shouldReturn` (Just (LimitFailure "the jump's destination is not ready"), 1)
         -- a ready move elsewhere lands: the first refusal no longer applies
-        Right second ← commit (moveView view (JumpTarget (axis 6) (axis 6) (Just (axis 1))))
+        Right second ← moveNow view ((JumpTarget (axis 6) (axis 6) (Just (axis 1))))
         settleUntil rig (isJust <$> moveSettled second)
         atomically (moveSettled second) `shouldReturn` Just MoveLanded
         atomically (readingRefusal <$> readView view) `shouldReturn` Nothing
         -- a new refusal is a new entry
-        Right third ← commit (moveView view (JumpTarget (axis 70) (axis 70) (Just (axis 1))))
+        Right third ← moveNow view ((JumpTarget (axis 70) (axis 70) (Just (axis 1))))
         settleUntil rig (isJust <$> moveSettled third)
         atomically (readingRefusals <$> readView view) `shouldReturn` 2
 
     it "admits no control once the view's authority is revoked, ending its pending move as revoked before the owner steps" $
       withPublished defaultOptions $ \rig target view → do
         quiesce rig target
-        Right first ← commit (moveView view far)
+        Right first ← moveNow view (far)
         atomically (setHeldAuthority (targetHeld target) False)
         -- before any owner step
-        fmap (either Just (const Nothing)) (commit (moveView view (JumpTarget (axis 6) (axis 6) Nothing))) `shouldReturn` Just ControlEnded
+        fmap (either Just (const Nothing)) (moveNow view ((JumpTarget (axis 6) (axis 6) Nothing))) `shouldReturn` Just ControlEnded
         atomically (moveSettled first) `shouldReturn` Just (MoveEnded EndRevoked)
-        commit (configureView view noConfigure {configureZoom = Just 2}) `shouldReturn` Left ControlEnded
-        commit (configureView view noConfigure {configureLight = Just brighter}) `shouldReturn` Left ControlEnded
+        configureNow view (noConfigure {configureZoom = Just 2}) `shouldReturn` Left ControlEnded
+        configureNow view (noConfigure {configureLight = Just brighter}) `shouldReturn` Left ControlEnded
 
     it "names a failed build's buffer, the build's cause and the destruction's when its destruction fails, and keeps its slot across a close and reopen" $
       withRig defaultOptions {optProfile = smallProfile {profileSlots = 4, profileQuads = 2048}} $ \rig → do
@@ -1839,12 +1878,12 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         -- a zoom that rebuilds every part, whose first build fails after making its buffer: that buffer awaits its
         -- destruction
         atomically (writeTVar (rigFailNext rig) [Just (BuildFailed "an injected failure" (AllocatedDisposing "buffer 9" (readTVar destruction)))])
-        commit (configureView view noConfigure {configureZoom = Just 2}) `shouldReturn` Right ()
+        configureNow view (noConfigure {configureZoom = Just 2}) `shouldReturn` Right ()
         settleUntil rig (isJust . readingRefusal <$> readView view)
         atomically occupied `shouldReturn` 5
         -- the next zoom builds two of its four parts, then finds the upload room taken
         atomically (writeTVar (rigAdmitBudget rig) (Just 2))
-        commit (configureView view noConfigure {configureZoom = Just 0.5}) `shouldReturn` Right ()
+        configureNow view (noConfigure {configureZoom = Just 0.5}) `shouldReturn` Right ()
         settleUntil rig ((== 7) <$> occupied)
         refusals ← atomically (readingRefusals <$> readView view)
         attempts ← readTVarIO (rigBuildAttempts rig)
@@ -1875,7 +1914,7 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         refusals ← atomically (readingRefusals <$> readView view)
         -- a zoom that rebuilds every part, and queue pressure after one fitting part: the prefix waits
         atomically (writeTVar (rigAdmitBudget rig) (Just 1))
-        commit (configureView view noConfigure {configureZoom = Just 2}) `shouldReturn` Right ()
+        configureNow view (noConfigure {configureZoom = Just 2}) `shouldReturn` Right ()
         settleUntil rig ((== 5) <$> occupied)
         forM_ [1 .. 4 ∷ Int] (const wake)
         atomically occupied `shouldReturn` 5
@@ -1904,7 +1943,7 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         drawn ← Map.keysSet <$> readTVarIO (rigStandings rig)
         -- a zoom that rebuilds every part: one is built, still uploading, and the next waits for the uploads' room
         atomically (writeTVar (rigUploading rig) True >> writeTVar (rigAdmitBudget rig) (Just 1))
-        commit (configureView view noConfigure {configureZoom = Just 2}) `shouldReturn` Right ()
+        configureNow view (noConfigure {configureZoom = Just 2}) `shouldReturn` Right ()
         settleUntil rig ((== 5) <$> occupied)
         runOwner rig
         attempts ← readTVarIO (rigBuildAttempts rig)
@@ -1931,7 +1970,7 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         resumed ← newEmptyTMVarIO
         stop ← newTVarIO False
         atomically (writeTVar (rigCountGate rig) (Just (const True, counting, resumed)))
-        Right first ← commit (moveView view far)
+        Right first ← moveNow view (far)
         let owner = do
               runOwner rig
               continue ← atomically ((False <$ (readTVar stop >>= check)) `orElse` (True <$ (readTVar (rigQueue rig) >>= check . not . Seq.null)))
@@ -1983,7 +2022,7 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         published ← atomically (readingPublished <$> readView view)
         drawn ← Map.keysSet <$> readTVarIO (rigStandings rig)
         -- a zoom's candidate, one of whose uploads fails
-        commit (configureView view noConfigure {configureZoom = Just 2}) `shouldReturn` Right ()
+        configureNow view (noConfigure {configureZoom = Just 2}) `shouldReturn` Right ()
         settleUntil rig (allBuilt <$> readView view)
         fresh ← filter (`Set.notMember` drawn) . Map.keys <$> readTVarIO (rigStandings rig)
         case fresh of
@@ -2002,13 +2041,16 @@ spec = describe "terrain views (TRA-9 v2)" $ do
     it "refuses every control in the instant the owner's exit begins, before the watcher records it, ending the pending move once" $
       withPublished defaultOptions $ \rig target view → do
         quiesce rig target
-        Right first ← commit (moveView view far)
+        Right first ← moveNow view (far)
+        near ← prepare (JumpTarget (axis 6) (axis 6) Nothing)
+        zoomed ← prepare noConfigure {configureZoom = Just 2}
+        brightened ← prepare noConfigure {configureLight = Just brighter}
         (second, camera, light) ← commit $ do
           fromIssuerSTM (writeTVar (rigOwnerEnded rig) (Just "the owner's exit began"))
           (,,)
-            <$> (fmap (const ()) <$> moveView view (JumpTarget (axis 6) (axis 6) Nothing))
-            <*> configureView view noConfigure {configureZoom = Just 2}
-            <*> configureView view noConfigure {configureLight = Just brighter}
+            <$> (fmap (const ()) <$> moveView view near)
+            <*> configureView view zoomed
+            <*> configureView view brightened
         (second, camera, light) `shouldBe` (Left ControlEnded, Left ControlEnded, Left ControlEnded)
         atomically (moveSettled first) `shouldReturn` Just (MoveEnded EndStopped)
 
@@ -2017,7 +2059,7 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         quiesce rig target
         let wake = commit (kick (rigViews rig)) >> runOwner rig
         -- one recorded zoom refusal
-        commit (configureView view noConfigure {configureZoom = Just 0.5}) `shouldReturn` Right ()
+        configureNow view (noConfigure {configureZoom = Just 0.5}) `shouldReturn` Right ()
         settleUntil rig (isJust . readingRefusal <$> readView view)
         refused ← atomically (readView view)
         readingRefusals refused `shouldBe` 1
@@ -2039,6 +2081,8 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         atomically (writeTVar (rigRaising rig) (Just (toException (ErrorCall "the constructor raised"))))
         target ← newTarget 1
         view ← openOn rig target
+        -- the spend's own exception, while the owner lives, goes on to the owner's action once the build is collected
+        try @ErrorCall (settleUntil rig (isJust . readingRefusal <$> readView view)) `shouldReturn` Left (ErrorCall "the constructor raised")
         settleUntil rig (isJust . readingRefusal <$> readView view)
         refusal ← atomically (readingRefusal <$> readView view)
         Text.pack (show refusal) `shouldSatisfy` Text.isInfixOf "the constructor raised"
@@ -2053,7 +2097,7 @@ spec = describe "terrain views (TRA-9 v2)" $ do
               runOwner rig
               continue ← atomically ((False <$ (readTVar stop >>= check)) `orElse` (True <$ (readTVar (rigQueue rig) >>= check . not . Seq.null)))
               when continue owner
-        commit (configureView view noConfigure {configureZoom = Just 2}) `shouldReturn` Right ()
+        configureNow view (noConfigure {configureZoom = Just 2}) `shouldReturn` Right ()
         withOwnedThread owner $ \_ ended → do
           timeout 10000000 (atomically (takeTMVar (rigEntered rig))) >>= maybe (expectationFailure "no build was held") pure
           closeView view `shouldReturn` CloseRetiring
@@ -2091,7 +2135,8 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         target ← newTarget 1
         first ← openOn rig target
         -- the view collects the renderer's sealed failure: its refusal names the cause, and the released buffer's slot
-        -- stays charged while its destruction is pending
+        -- stays charged while its destruction is pending; the spend's exception goes on to the owner's action
+        try @ErrorCall (settleUntil rig (isJust . readingRefusal <$> readView first)) `shouldReturn` Left (ErrorCall "the mapped write failed")
         settleUntil rig (isJust . readingRefusal <$> readView first)
         refusal ← atomically (readingRefusal <$> readView first)
         Text.pack (show refusal) `shouldSatisfy` Text.isInfixOf "the mapped write failed"
@@ -2120,7 +2165,9 @@ spec = describe "terrain views (TRA-9 v2)" $ do
           writeTVar (rigRaiseSealed rig) (Just (toException (ErrorCall "the release raised")))
         target ← newTarget 1
         first ← openOn rig target
-        -- the view collects the sealed failure: the failure ledger keeps the buffer, the refusal and the release's cause
+        -- the view collects the sealed failure: the failure ledger keeps the buffer, the refusal and the release's cause;
+        -- the spend's exception goes on to the owner's action
+        try @ErrorCall (settleUntil rig (isJust . readingRefusal <$> readView first)) `shouldReturn` Left (ErrorCall "the release raised")
         settleUntil rig (isJust . readingRefusal <$> readView first)
         failures ← serviceFailures <$> atomically reading
         [cause | (1, Nothing, cause) ← failures] `shouldSatisfy` any (\cause → all (`Text.isInfixOf` cause) ["buffer 7", "UploadClosed", "the release raised"])
@@ -2151,7 +2198,7 @@ spec = describe "terrain views (TRA-9 v2)" $ do
           shown ← atomically (map fst <$> heldScenes (targetHeld target))
           -- a move far away, whose successor installs another demand: the owner steps until its copies and its plan
           -- are done and it is building (its parts the drawn revision's, reused), and the parent closes then
-          Right move ← commit (moveView view far)
+          Right move ← moveNow view (far)
           stepUntil rig (("building" `Text.isPrefixOf`) . readingStage <$> readView view)
           atomically (closeAdmission admission)
           takeMVar closing
@@ -2187,7 +2234,7 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         quiesce rig target
         before ← atomically (readView view)
         shown ← atomically (length <$> heldScenes (targetHeld target))
-        Right move ← commit (moveView view far)
+        Right move ← moveNow view (far)
         settleUntil rig (publishedAtLeast view (fromIntegral (maybe 0 (+ 1) (readingPublished before))))
         atomically (moveSettled move) `shouldReturn` Just MoveLanded
         landed ← atomically (readView view)
@@ -2361,6 +2408,106 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         Map.findWithDefault 0 1 (serviceOccupied now) `shouldBe` listed
         (servicePending now, servicePrivate now, serviceSwept now) `shouldBe` (0, 0, [])
 
+    it "retires a build privately, once, when a style authority ends and goes live again after its revalidation and before its collection, and the view goes on" $
+      withRig defaultOptions {optProfile = smallProfile {profileSlots = 4, profileQuads = 2048}} $ \rig → do
+        let reading = readTerrainViews (rigViews rig)
+        target ← newTarget 1
+        liveness ← prepare True >>= newPublisherIO
+        flipped ← newTVarIO Nothing
+        -- between the two boundaries: the authority's owner ends it and makes it live again, each with its revision
+        atomically . writeTVar (rigBeforeCollect rig) . Just $ do
+          built ← subtract 1 <$> readTVarIO (rigNext rig)
+          ended ← prepare False
+          live ← prepare True
+          atomically (OwnerTx.publish liveness ended)
+          atomically (OwnerTx.publish liveness live)
+          atomically (writeTVar flipped (Just (chunkRef built 1)))
+        style ← styleOf rig
+        view ← openStyled rig target style {styleAuthority = [LeaseAuthority (OwnerTx.publication liveness)]}
+        settleUntil rig (publishedAtLeast view 1)
+        quiesce rig target
+        stale ← readTVarIO flipped >>= maybe (fail "the seam never ran") pure
+        -- the live value compares equal, its revision does not: the part went to private retirement and was released once
+        filter (== stale) <$> readTVarIO (rigDisposed rig) `shouldReturn` [stale]
+        now ← atomically reading
+        listed ← atomically (readingListed <$> readView view)
+        Map.findWithDefault 0 1 (serviceOccupied now) `shouldBe` listed
+        (servicePending now, servicePrivate now, serviceSwept now) `shouldBe` (0, 0, [])
+
+    it "leaves a build whose collection raised to the sweep, once, with the cause, and the exception goes on to the owner's action" $
+      withRig defaultOptions {optProfile = smallProfile {profileSlots = 4, profileQuads = 2048}} $ \rig → do
+        let reading = readTerrainViews (rigViews rig)
+        target ← newTarget 1
+        -- between the two boundaries: the next claim raises, inside the collection's commit
+        atomically . writeTVar (rigBeforeCollect rig) . Just $ atomically (writeTVar (rigClaimRaises rig) True)
+        view ← openOn rig target
+        raised ← try @IOException (settleUntil rig (publishedAtLeast view 1))
+        either (Text.isInfixOf "the claim raised" . Text.pack . show) (const False) raised `shouldBe` True
+        -- the collection rolled back: the build is still pending, left to the sweep with the rendered cause
+        atomically (servicePending <$> reading) `shouldReturn` 1
+        atomically (writeTVar (rigClaimRaises rig) False)
+        eventually ((\now → servicePending now == 0 && not (null (serviceSwept now))) <$> reading)
+        now ← atomically reading
+        [why | (1, _, why) ← serviceSwept now, "its collection raised" `Text.isInfixOf` why] `shouldSatisfy` \case
+          [why] → "the claim raised" `Text.isInfixOf` why
+          _ → False
+        -- one retirement owner: the swept part is released once
+        disposed ← readTVarIO (rigDisposed rig)
+        length disposed `shouldBe` Set.size (Set.fromList disposed)
+
+    it "asks again for a step the owner refused for now, ending nothing, and publishes" $
+      withRig defaultOptions $ \rig → do
+        target ← newTarget 1
+        view ← openOn rig target
+        -- the first step asked for is answered as the host answers a transient refusal (its queue full), never run
+        (_, outcome) ←
+          timeout 10000000 (atomically (Seq.viewl <$> readTVar (rigQueue rig) >>= \case
+            next Seq.:< rest → next <$ writeTVar (rigQueue rig) rest
+            Seq.EmptyL → retry)) >>= maybe (fail "no step was asked for") pure
+        atomically (writeTVar outcome (Just (StepExit (Exit.Refused "the owner's queue was full"))))
+        settleUntil rig (publishedAtLeast view 1)
+        -- the views' owner did not end: a control is still accepted
+        configureNow view (noConfigure {configureZoom = Just 2}) `shouldReturn` Right ()
+
+    it "detaches the old runtime view and withdraws its demand in the commit that frees its claim" $
+      withPublished defaultOptions $ \rig target view → do
+        quiesce rig target
+        atomically (inspectViewCountSTM (rigTerrain rig)) `shouldReturn` 1
+        seen ← newEmptyTMVarIO
+        -- a successor waiting for the claim sees, in the transaction that finds it free, no view of the old one
+        withOwnedThread (atomically (claimOf (rigClaims rig) 1 >>= check . isNothing >> inspectViewCountSTM (rigTerrain rig) >>= putTMVar seen)) $ \_ ended → do
+          _ ← closeView view
+          ended
+        atomically (takeTMVar seen) `shouldReturn` 0
+
+    forM_ [("once taken", TakenRaises, "the copy failed once taken"), ("in its count", CountingRaises, "the copy's count failed"), ("in its accounting", AccountingRaises, "the copy's accounting failed")] $ \(place, fault, message) →
+      it ("returns a held copy's regional charge once when the copy fails " <> place <> ", and the exception goes on to the owner's action") $
+        withPublished defaultOptions $ \rig target view → do
+          quiesce rig target
+          atomically (writeTVar (rigCopyFault rig) (Just fault))
+          Right _ ← moveNow view far
+          raised ← try @IOException (settleUntil rig (publishedAtLeast view 2))
+          atomically (writeTVar (rigCopyFault rig) Nothing)
+          either (Text.isInfixOf message . Text.pack . show) (const False) raised `shouldBe` True
+          atomically (inspectRegionalSTM (rigTerrain rig)) `shouldReturn` []
+          atomically (inspectRetainedChargesSTM (rigTerrain rig)) >>= (`shouldSatisfy` \(bank, borrows) → bank == 0 && null borrows)
+
+    it "returns a held copy's regional charge once when the owner is cancelled right after the borrow is taken" $
+      withPublished defaultOptions $ \rig target view → do
+        quiesce rig target
+        arrived ← newEmptyTMVarIO
+        held ← newEmptyTMVarIO
+        atomically (writeTVar (rigCopyFault rig) (Just (TakenWaits arrived held)))
+        Right _ ← moveNow view far
+        withOwnedThread (void (try @SomeException (settleUntil rig (publishedAtLeast view 2)))) $ \owner ended → do
+          timeout 10000000 (atomically (takeTMVar arrived)) >>= maybe (fail "no copy was taken") pure
+          -- taken and still charged to the view, then cancelled there
+          atomically (inspectRegionalSTM (rigTerrain rig)) >>= (`shouldSatisfy` any regionalChargeTaken)
+          killThread owner
+          ended
+        atomically (inspectRegionalSTM (rigTerrain rig)) `shouldReturn` []
+        atomically (inspectRetainedChargesSTM (rigTerrain rig)) >>= (`shouldSatisfy` \(bank, borrows) → bank == 0 && null borrows)
+
     it "goes on with a candidate whose refusal before any buffer is collected stale after its target's facts moved with equal geometry: its slot settles once and the view publishes" $
       withRig defaultOptions {optProfile = smallProfile {profileSlots = 4, profileQuads = 2048}} $ \rig → do
         let reading = readTerrainViews (rigViews rig)
@@ -2446,11 +2593,11 @@ spec = describe "terrain views (TRA-9 v2)" $ do
   describe "settlement" $ do
     it "ends every view when the owner's exit begins: a pending move settles as ended, and controls are refused" $
       withPublished defaultOptions $ \rig _ view → do
-        Right move ← commit (moveView view (JumpTarget (axis 4000) (axis 4000) (Just (axis 1))))
+        Right move ← moveNow view ((JumpTarget (axis 4000) (axis 4000) (Just (axis 1))))
         endRigOwner rig "its exit began"
         eventually ((== ViewEnded EndStopped) . readingStatus <$> readView view)
         atomically (moveSettled move) `shouldReturn` Just (MoveEnded EndStopped)
-        commit (configureView view noConfigure {configureLight = Just brighter}) `shouldReturn` Left ControlEnded
+        configureNow view (noConfigure {configureLight = Just brighter}) `shouldReturn` Left ControlEnded
         target ← newTarget 2
         style ← styleOf rig
         refused ← openView (rigViews rig) (OpenRequest (viewTarget target) (rigLease rig) (pure (Right style)) (axis 0, axis 0, axis 1) defaultLightSettings)
@@ -2477,7 +2624,7 @@ spec = describe "terrain views (TRA-9 v2)" $ do
           Just (LimitRegions visible 1) → visible > 1
           _ → False)
         atomically (latestWorld target) `shouldReturn` Nothing
-        Right move ← commit (moveView view (JumpTarget (axis 70) (axis 70) Nothing))
+        Right move ← moveNow view ((JumpTarget (axis 70) (axis 70) Nothing))
         settleUntil rig (isJust <$> moveSettled move)
         atomically (moveSettled move) >>= (`shouldSatisfy` \case
           Just (MovePressure (LimitRegions _ 1)) → True
@@ -2488,7 +2635,7 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         quiesce rig target
         before ← atomically (latestWorld target)
         published ← atomically (readingPublished <$> readView view)
-        commit (configureView view noConfigure {configureZoom = Just 0.125}) `shouldReturn` Right ()
+        configureNow view (noConfigure {configureZoom = Just 0.125}) `shouldReturn` Right ()
         settleUntil rig (isJust . readingRefusal <$> readView view)
         reading ← atomically (readView view)
         readingRefusal reading `shouldSatisfy` \case
@@ -2609,7 +2756,7 @@ spec = describe "terrain views (TRA-9 v2)" $ do
 
     it "returns the terrain service's every borrow when a view closes with a copy under way" $
       withPublished defaultOptions $ \rig _ view → do
-        commit (configureView view noConfigure {configureZoom = Just 2}) `shouldReturn` Right ()
+        configureNow view (noConfigure {configureZoom = Just 2}) `shouldReturn` Right ()
         runOwner rig
         _ ← closeView view
         runOwner rig

@@ -18,8 +18,12 @@
 -- __State.__ The module owns none: a 'ViewRequest' holds the service's request and its result box, written only by
 -- that request's settlement.
 module Hetoimasia.Terrain.Runtime.Transactions
-  ( -- * Demand and borrows
-    setViewDemandTx
+  ( -- * Views
+    openViewTx
+  , closeViewTx
+
+    -- * Demand and borrows
+  , setViewDemandTx
   , releaseRegionBorrowTx
   , inspectArenaTx
   , authorityEpochTx
@@ -44,9 +48,19 @@ import Hetoimasia.Terrain.Cell (Column)
 import Hetoimasia.Terrain.Coordinate (RegionCoord)
 import Hetoimasia.Terrain.Residency (RegionDemand)
 import Hetoimasia.Terrain.Runtime (ArenaView, DemandReceipt, authorityEpochSTM, inspectArenaSTM)
-import Hetoimasia.Terrain.Runtime.Internal.Core (TakeOutcome, cancelRequest, releaseRegionBorrowSTM, retireRequest, setViewDemandSTM, takeRequest)
+import Hetoimasia.Terrain.Runtime.Internal.Core (TakeOutcome, cancelRequest, closeViewSTM, openViewSTM, releaseRegionBorrowSTM, retireRequest, setViewDemandSTM, takeRequest)
 import Hetoimasia.Terrain.Runtime.Internal.Types
 import Hetoimasia.Terrain.Runtime.Settlement (regionsWith, surfaceWith)
+
+-- | Attach a view for this client ('Hetoimasia.Terrain.Runtime.openView'), checking the parent session's token in the
+-- same commit: a closed session refuses it and nothing is made.
+openViewTx ∷ Service → Client → OwnerTx (Either Refused View)
+openViewTx svc client = fromIssuerSTM (openViewSTM svc client)
+
+-- | Detach a view ('Hetoimasia.Terrain.Runtime.closeView'): its demand is withdrawn and it is forgotten, in this commit.
+-- Another service's view, or one already detached, changes nothing.
+closeViewTx ∷ Service → View → OwnerTx ()
+closeViewTx svc view = fromIssuerSTM (closeViewSTM svc view)
 
 -- | Install, replace, restore or clear (an empty list) a view's demand ('Hetoimasia.Terrain.Runtime.setViewDemand'),
 -- prepared (fully evaluated) before the commit, checking the parent session's token in the same commit: a closed session

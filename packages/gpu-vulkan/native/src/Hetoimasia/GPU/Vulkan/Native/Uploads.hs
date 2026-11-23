@@ -55,10 +55,10 @@ module Hetoimasia.GPU.Vulkan.Native.Uploads
   , UploadGrant
   , uploadGrantBytes
   , uploadRoom
-  , reserveUpload
+  , reserveUploadTx
   , submitUploadGranted
-  , abandonUploadGrant
-  , returnUploadGrant
+  , abandonUploadGrantTx
+  , returnUploadGrantTx
 
     -- * Tickets
   , UploadTicket
@@ -83,9 +83,17 @@ module Hetoimasia.GPU.Vulkan.Native.Uploads
   , noUploadAccess
   , sessionUploadAccess
   , ownedUploadAccess
+  , OwnerAdmission
+  , newOwnerAdmissionIO
+  , setOwnerAdmission
+  , readOwnerAdmission
+  , UploadsCell
+  , newUploadsCellIO
+  , setUploadsStanding
+  , readUploadsStanding
   , accessGate
   , accessRoom
-  , accessReserve
+  , accessReserveTx
   , accessSubmitGranted
 
     -- * Observation

@@ -94,8 +94,6 @@ module Hetoimasia.Render.TwoD.Vulkan.Chunks
   , prepareRetainedChunk
   , ChunkGrant
   , chunkRoom
-  , admitRetainedChunk
-  , abandonChunkGrant
   , spendChunkGrant
   , BuildReceipt
   , chunkGrantReceipt
@@ -103,9 +101,7 @@ module Hetoimasia.Render.TwoD.Vulkan.Chunks
   , receiptNumber
   , receiptOutcome
   , receiptSealed
-  , claimReceipt
   , receiptClaimable
-  , sweepRegistry
   , receiptsHeld
   , BuildSettlement (..)
   , buildSettlementOf
@@ -151,7 +147,7 @@ import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Word (Word32, Word64)
 import Hetoimasia.GPU.Vulkan.Native.Recording (Buffer, Refusal, releasedBufferOf)
-import Hetoimasia.GPU.Vulkan.Native.Uploads (UploadGrant, UploadPressure, UploadRefusal (..), UploadState (..), UploadTicket, readUploadTicket, returnUploadGrant)
+import Hetoimasia.GPU.Vulkan.Native.Uploads (UploadGrant, UploadPressure, UploadRefusal (..), UploadState (..), UploadTicket, readUploadTicket, returnUploadGrantTx)
 import Hetoimasia.Render.TwoD.Chunk
   ( BoundsRequest
   , Chunk
@@ -168,7 +164,7 @@ import Hetoimasia.Render.TwoD.DrawPlan (CutoutMarks)
 import Hetoimasia.Render.TwoD.Encoding (encodeChunkCutouts)
 import Hetoimasia.Render.TwoD.Snapshot (Instance)
 import Hetoimasia.Render.TwoD.Vulkan.Builders (BufferUploadRefusal (..), BufferUploads, Builders (..), reserveRoom, roomFor, uploadGranted)
-import Hetoimasia.Foundation.OwnerTx (OwnerTx)
+import Hetoimasia.Foundation.OwnerTx (OwnerTx, commit)
 import Hetoimasia.Foundation.OwnerTx.Issuer (fromIssuerSTM)
 import Numeric.Natural (Natural)
 
@@ -282,7 +278,7 @@ buildRetainedChunkWith builders retained marks kind bounds records instances =
     Left refusal → pure (Left (BuildRefused refusal NoAllocation))
     Right prepared →
       mask_ $
-        atomically (admitWith False (bufferUploads builders) retained prepared) >>= \case
+        commit (admitWith False (bufferUploads builders) retained prepared) >>= \case
           Left refusal → pure (Left (BuildRefused refusal NoAllocation))
           -- the caller is its own collector: the sealed receipt is claimed in the hand-off, whatever the exit
           Right grant → spendChunkGrant builders retained grant `finally` atomically (claimReceipt (chunkGrantReceipt grant))
@@ -382,12 +378,12 @@ claimReceipt receipt = do
 -- | The registry's teardown sweep: a build still reserved (its spend never began) is given back and sealed as
 -- 'BuildAbandoned'; then every indexed receipt that is sealed and unclaimed is claimed, with its number, so its owner
 -- can retire what it holds. A build being spent is left to seal.
-sweepRegistry ∷ Retained → STM [(Word64, Either BuildRefused ChunkRef)]
+sweepRegistry ∷ Retained → OwnerTx [(Word64, Either BuildRefused ChunkRef)]
 sweepRegistry retained@(Retained ledger) = do
-  indexed ← Map.toList . ledgerReceipts <$> readTVar ledger
+  indexed ← fromIssuerSTM (Map.toList . ledgerReceipts <$> readTVar ledger)
   fmap concat . forM indexed $ \(number, grant) → do
     abandonChunkGrant retained grant
-    claimReceipt (grantReceipt grant) <&> maybe [] (\outcome → [(number, outcome)])
+    fromIssuerSTM (claimReceipt (grantReceipt grant)) <&> maybe [] (\outcome → [(number, outcome)])
 
 -- | How many indexed builds the registry holds, none of them claimed yet, and how many of those the teardown sweep can
 -- settle now (sealed, or still reserved).
@@ -438,14 +434,16 @@ chunkRoom uploads (Retained ledger) bytes = do
 -- A refusal reserves nothing: 'BuildUploadBackpressure', 'BuildUploadsNotReady'
 -- and 'BuildReferencesExhausted' can change, every other refusal (an oversized
 -- chunk among them) cannot.
-admitRetainedChunk ∷ BufferUploads → Retained → PreparedChunk → STM (Either BuildRefusal ChunkGrant)
+admitRetainedChunk ∷ BufferUploads → Retained → PreparedChunk → OwnerTx (Either BuildRefusal ChunkGrant)
 admitRetainedChunk = admitWith True
 
 -- Admission, its receipt indexed in the registry for an outside collector (and the registry's teardown sweep), or not,
 -- for a caller that claims its own in the same masked handoff.
-admitWith ∷ Bool → BufferUploads → Retained → PreparedChunk → STM (Either BuildRefusal ChunkGrant)
+-- The registry's reference is decided first; the uploads' room is reserved by the uploads' own operation, in this same
+-- commit, and only then is the reference taken: a refusal of either takes nothing.
+admitWith ∷ Bool → BufferUploads → Retained → PreparedChunk → OwnerTx (Either BuildRefusal ChunkGrant)
 admitWith indexed uploads (Retained ledger) prepared = do
-  held ← readTVar ledger
+  held ← fromIssuerSTM (readTVar ledger)
   case nextReference held of
     Nothing → pure (Left BuildReferencesExhausted)
     Just (reference, afterwards) → do
@@ -455,7 +453,7 @@ admitWith indexed uploads (Retained ledger) prepared = do
           else fmap Just <$> reserveRoom uploads (preparedBytes prepared)
       case upload of
         Left refusal → pure (Left (uploadRefusal refusal))
-        Right granted → do
+        Right granted → fromIssuerSTM $ do
           standing ← newTVar GrantReserved
           cell ← newTVar Nothing
           claimed ← newTVar False
@@ -475,20 +473,20 @@ uploadRefusal = \case
 -- reference is free again, and its upload's room, through the uploads that
 -- reserved it. A grant being spent, spent or given back, or another registry's,
 -- changes nothing.
-abandonChunkGrant ∷ Retained → ChunkGrant → STM ()
+abandonChunkGrant ∷ Retained → ChunkGrant → OwnerTx ()
 abandonChunkGrant (Retained ledger) grant =
   when (grantRegistry grant == ledger) $
-    readTVar (grantStanding grant) >>= \case
-      GrantReserved → giveBack grant >> sealReceipt grant (Left (BuildRefused BuildAbandoned NoAllocation))
+    fromIssuerSTM (readTVar (grantStanding grant)) >>= \case
+      GrantReserved → giveBack grant >> fromIssuerSTM (sealReceipt grant (Left (BuildRefused BuildAbandoned NoAllocation)))
       _ → pure ()
 
--- The grant's capacity returned: its reference to its registry's free list, its
--- upload's room to its uploads (a room the upload has spent is not freed by this).
-giveBack ∷ ChunkGrant → STM ()
+-- The grant's capacity returned: its reference to its registry's free list, and its upload's room to its uploads,
+-- through their own operation (a room the upload has spent is not freed by this).
+giveBack ∷ ChunkGrant → OwnerTx ()
 giveBack grant = do
-  writeTVar (grantStanding grant) GrantSealed
-  mapM_ returnUploadGrant (grantUpload grant)
-  modifyTVar' (grantRegistry grant) (\held → held {ledgerFree = chunkRefIndex (grantReference grant) : ledgerFree held})
+  fromIssuerSTM (writeTVar (grantStanding grant) GrantSealed)
+  mapM_ returnUploadGrantTx (grantUpload grant)
+  fromIssuerSTM (modifyTVar' (grantRegistry grant) (\held → held {ledgerFree = chunkRefIndex (grantReference grant) : ledgerFree held}))
 
 -- | Spend a grant on the graphics owner's thread, and settle it once, whatever the exit. The grant moves from reserved
 -- to spending in one transaction (a grant not reserved, or another registry's, is refused, changes nothing and settles
@@ -538,11 +536,11 @@ spendChunkGrant builders (Retained ledger) grant = mask_ $ do
           (refused, cleanup) ← unregistered made (BuildRaised text)
           pure (refused, maybe cleanup Just pending)
       -- the seal: the grant's disposition and its receipt, in one transaction with no caller code
-      answer ← atomically $ do
+      answer ← commit $ do
         answer ← case receipt of
-          Right held → Right <$> register held
+          Right held → Right <$> fromIssuerSTM (register held)
           Left refused → Left refused <$ giveBack grant
-        answer <$ sealReceipt grant answer
+        answer <$ fromIssuerSTM (sealReceipt grant answer)
       let built = either Just (const Nothing) outcome
           carrying (ExceptionWithContext context raised) = case answer of
             Left refused → ExceptionWithContext (addExceptionAnnotation (BuildSettlement refused) context) raised
@@ -790,11 +788,11 @@ chunkRoomTx uploads retained bytes = fromIssuerSTM (chunkRoom uploads retained b
 
 -- | 'admitRetainedChunk' in a commit: the reference and the upload's room reserved together, or neither.
 admitRetainedChunkTx ∷ BufferUploads → Retained → PreparedChunk → OwnerTx (Either BuildRefusal ChunkGrant)
-admitRetainedChunkTx uploads retained prepared = fromIssuerSTM (admitRetainedChunk uploads retained prepared)
+admitRetainedChunkTx = admitRetainedChunk
 
 -- | 'abandonChunkGrant' in a commit.
 abandonChunkGrantTx ∷ Retained → ChunkGrant → OwnerTx ()
-abandonChunkGrantTx retained grant = fromIssuerSTM (abandonChunkGrant retained grant)
+abandonChunkGrantTx = abandonChunkGrant
 
 -- | 'receiptOutcome' in a commit: read-only.
 receiptOutcomeTx ∷ BuildReceipt → OwnerTx (Maybe (Either BuildRefused ChunkRef))
@@ -806,7 +804,7 @@ claimReceiptTx receipt = fromIssuerSTM (claimReceipt receipt)
 
 -- | 'sweepRegistry' in a commit.
 sweepRegistryTx ∷ Retained → OwnerTx [(Word64, Either BuildRefused ChunkRef)]
-sweepRegistryTx retained = fromIssuerSTM (sweepRegistry retained)
+sweepRegistryTx = sweepRegistry
 
 -- | 'receiptsHeld' in a commit: read-only.
 receiptsHeldTx ∷ Retained → OwnerTx (Int, Int)

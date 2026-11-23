@@ -14,6 +14,9 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView.Surface
   , Authority (..)
   , leaseAuthority
   , leasesLive
+  , AuthorityMark (..)
+  , authorityMarks
+  , surfaceAuthorityMarks
   , ViewGeometry (..)
   , geometryOfMetrics
   , windowGeometryOf
@@ -110,6 +113,25 @@ data Authority = LeaseAuthority !(Publication Bool) | HeldAuthority !AdmissionTo
 -- holds the lease.
 leaseAuthority ∷ Leases → Word64 → STM Authority
 leaseAuthority table key = maybe AuthorityEnded LeaseAuthority <$> leaseLiveness table key
+
+-- | Each authority's evidence as its owner keeps it: a lease's published revision with its liveness, an admission's
+-- state (closed once, for good), or an authority already ended. Equal marks, read in two transactions, mean no change
+-- between them, a lease that ended and went live again included.
+data AuthorityMark = LeaseMark !Word64 !Bool | AdmissionMark !Bool | EndedMark
+  deriving (Eq, Show)
+
+authorityMarks ∷ [Authority] → STM [AuthorityMark]
+authorityMarks = mapM $ \case
+  LeaseAuthority liveness → uncurry LeaseMark <$> watchPublication liveness
+  HeldAuthority token → AdmissionMark <$> tokenOpen token
+  AuthorityEnded → pure EndedMark
+
+-- | The marks of the caller's original authority over the target: a window's leases. Another target's authority is a
+-- fact of its facts, whose version 'surfaceVersion' carries.
+surfaceAuthorityMarks ∷ ViewSurface → STM [AuthorityMark]
+surfaceAuthorityMarks = \case
+  WindowSurface _ _ _ leases → authorityMarks leases
+  _ → pure []
 
 -- | Whether every one of these authorities is still live, read from what their owners published or issued.
 leasesLive ∷ [Authority] → STM Bool

@@ -107,7 +107,6 @@ module Hetoimasia.Terrain.Runtime
   , DemandReceipt (..)
   , openView
   , setViewDemand
-  , setViewDemandSTM
   , clearViewDemand
   , closeView
 
@@ -165,6 +164,7 @@ module Hetoimasia.Terrain.Runtime
   , inspectStagedOverlaySTM
   , inspectModel
   , inspectModelSTM
+  , inspectViewCountSTM
   , inspectDefects
   , inspectSnapshotBytes
   , inspectRetainedChargesSTM
@@ -885,6 +885,10 @@ serviceAdmitting svc = either (const False) (const True) <$> admitting svc
 -- | The accounting model as it is now.
 inspectModel ∷ Service → IO Model
 inspectModel svc = atomically (inspectModelSTM svc)
+
+-- | How many views the service holds, read-only.
+inspectViewCountSTM ∷ Service → STM Int
+inspectViewCountSTM svc = Map.size . stateViews <$> readSt svc
 
 -- | The same as a transaction, so a wait can be on the accounting itself.
 inspectModelSTM ∷ Service → STM Model

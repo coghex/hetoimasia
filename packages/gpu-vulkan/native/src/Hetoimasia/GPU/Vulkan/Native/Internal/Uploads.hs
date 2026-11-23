@@ -83,6 +83,18 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Uploads
   , noUploadAccess
   , sessionUploadAccess
   , ownedUploadAccess
+  , reserveUploadTx
+  , returnUploadGrantTx
+  , abandonUploadGrantTx
+  , accessReserveTx
+  , OwnerAdmission
+  , newOwnerAdmissionIO
+  , setOwnerAdmission
+  , readOwnerAdmission
+  , UploadsCell
+  , newUploadsCellIO
+  , setUploadsStanding
+  , readUploadsStanding
   , accessGate
   , accessRoom
   , accessReserve
@@ -95,8 +107,10 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Uploads
   , readUploads
   ) where
 
+import Hetoimasia.Foundation.OwnerTx (OwnerTx)
+import Hetoimasia.Foundation.OwnerTx.Issuer (fromIssuerSTM)
 import Control.Concurrent (ThreadId, myThreadId)
-import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVar, newTVarIO, orElse, readTVar, readTVarIO, retry, writeTVar)
+import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVar, newTVarIO, orElse, readTVar, retry, writeTVar)
 import Control.Exception (SomeException, evaluate, mask, rethrowIO, tryWithContext)
 import Control.Monad (forM, forM_, unless, when)
 import Data.ByteString (ByteString)
@@ -165,8 +179,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   , tshow
   )
 import Hetoimasia.GPU.Vulkan.Native.Profile (DevicePlan (..))
-import Hetoimasia.Foundation.OwnerTx (watchPublication)
-import Hetoimasia.GPU.Vulkan.Native.Roots (Roots, TerminalCause, TerminalReport (reportPrimary), readRootsDevice, readRootsModel, readRootsTerminal, rootsFailure, rootsSessionIdentity)
+import Hetoimasia.GPU.Vulkan.Native.Roots (Roots, TerminalCause, readRootsDevice, readRootsModel, rootsFailedCause, rootsSessionIdentity)
 
 -- ---------------------------------------------------------------------------
 -- Configuration
@@ -502,7 +515,7 @@ submitWith gate uploads grant request = mask $ \restore →
     -- the upload's place, region and target pass to the queue: the session still running, the uploads open, and the
     -- second permit naming the admission the first did, still open
     queue permit permit' number ticket = do
-      primary ← reportPrimary <$> readRootsTerminal (recordingRoots (framesRecording (uploadsFrames uploads)))
+      primary ← rootsFailedCause (recordingRoots (framesRecording (uploadsFrames uploads)))
       state ← readTVar (uploadsState uploads)
       open ← permitOpen permit
       case primary of
@@ -539,7 +552,7 @@ admit
 admit uploads grant request = do
   state ← readTVar (uploadsState uploads)
   heldGrant ← maybe (pure (Right Nothing)) (liveGrant uploads state) grant
-  primary ← reportPrimary <$> readRootsTerminal roots
+  primary ← rootsFailedCause roots
   managed ← readTVar (recordingManaged recording)
   uploading ← readTVar (recordingUploading recording)
   filled ← readTVar (recordingFilled recording)
@@ -723,7 +736,7 @@ reserveUpload uploads bytes =
 decideRoom ∷ Uploads q inst msgr phys dev cmd → Natural → STM (Either UploadRefusal (UploadsState, (Natural, Natural)))
 decideRoom uploads bytes = do
   state ← readTVar (uploadsState uploads)
-  primary ← reportPrimary <$> readRootsTerminal (recordingRoots (framesRecording (uploadsFrames uploads)))
+  primary ← rootsFailedCause (recordingRoots (framesRecording (uploadsFrames uploads)))
   pure $ do
     maybe (Right ()) (Left . UploadSessionFailed) primary
     unless (stateOpen state) (Left UploadClosed)
@@ -1053,7 +1066,7 @@ recordTurn uploads = do
   -- owner's retirement settles them.
   planned ← atomically $ do
     state ← readTVar (uploadsState uploads)
-    primary ← reportPrimary <$> readRootsTerminal roots
+    primary ← rootsFailedCause roots
     let candidates = [(number, entry) | stateOpen state, Nothing ← [primary], (number, entry) ← Map.toList (stateEntries state), recordable entry]
         chosen = plan (uploadTurnBudget (uploadsConfig uploads)) candidates
     forM_ chosen (\item → edit (plannedNumber item) (\held → held {entryClaimed = True}))
@@ -1296,6 +1309,38 @@ data UploadsStanding q inst msgr phys dev cmd
     -- ^ The device refused them: the turn budget holds no block row of its
     -- widest level, or the staging buffer could not be made.
 
+-- | The cell an owner records its admission's token in, issued here and written only through 'setOwnerAdmission',
+-- which installs the token evaluated: every commit that reads it reads a value, never a computation its writer left.
+newtype OwnerAdmission = OwnerAdmission (TVar AdmissionToken)
+
+-- | A cell holding this token.
+newOwnerAdmissionIO ∷ AdmissionToken → IO OwnerAdmission
+newOwnerAdmissionIO token = token `seq` (OwnerAdmission <$> newTVarIO token)
+
+-- | Record the owner's admission now: the token is evaluated before it is installed.
+setOwnerAdmission ∷ OwnerAdmission → AdmissionToken → STM ()
+setOwnerAdmission (OwnerAdmission cell) token = token `seq` writeTVar cell token
+
+-- | The token recorded now.
+readOwnerAdmission ∷ OwnerAdmission → STM AdmissionToken
+readOwnerAdmission (OwnerAdmission cell) = readTVar cell
+
+-- | The cell an owner records its session's uploads' standing in, issued here and written only through
+-- 'setUploadsStanding', which installs the standing evaluated (its fields are strict).
+newtype UploadsCell q inst msgr phys dev cmd = UploadsCell (TVar (UploadsStanding q inst msgr phys dev cmd))
+
+-- | A cell holding this standing.
+newUploadsCellIO ∷ UploadsStanding q inst msgr phys dev cmd → IO (UploadsCell q inst msgr phys dev cmd)
+newUploadsCellIO standing = standing `seq` (UploadsCell <$> newTVarIO standing)
+
+-- | Record the uploads' standing now: evaluated before it is installed.
+setUploadsStanding ∷ UploadsCell q inst msgr phys dev cmd → UploadsStanding q inst msgr phys dev cmd → STM ()
+setUploadsStanding (UploadsCell cell) standing = standing `seq` writeTVar cell standing
+
+-- | The standing recorded now.
+readUploadsStanding ∷ UploadsCell q inst msgr phys dev cmd → STM (UploadsStanding q inst msgr phys dev cmd)
+readUploadsStanding (UploadsCell cell) = readTVar cell
+
 -- | Why access to a session's uploads takes no upload now.
 data UploadsUnavailable
   = UploadsNotConfigured
@@ -1313,7 +1358,7 @@ data UploadsUnavailable
 data UploadAccess
   = NoUploadAccess
   | ∀ q inst msgr phys dev cmd. SessionUploadAccess !(Uploads q inst msgr phys dev cmd)
-  | ∀ q inst msgr phys dev cmd. OwnedUploadAccess !(Roots q inst msgr phys dev) !(TVar AdmissionToken) !(TVar (UploadsStanding q inst msgr phys dev cmd))
+  | ∀ q inst msgr phys dev cmd. OwnedUploadAccess !(Roots q inst msgr phys dev) !OwnerAdmission !(UploadsCell q inst msgr phys dev cmd)
 
 -- | Access to no uploads: every upload is refused as closed.
 noUploadAccess ∷ UploadAccess
@@ -1325,7 +1370,7 @@ sessionUploadAccess = SessionUploadAccess
 
 -- | The uploads an owner records in this cell, under the admission whose token is in that cell and the session's
 -- terminal state, read through these roots.
-ownedUploadAccess ∷ Roots q inst msgr phys dev → TVar AdmissionToken → TVar (UploadsStanding q inst msgr phys dev cmd) → UploadAccess
+ownedUploadAccess ∷ Roots q inst msgr phys dev → OwnerAdmission → UploadsCell q inst msgr phys dev cmd → UploadAccess
 ownedUploadAccess = OwnedUploadAccess
 
 -- | The gate an access admits uploads under: none closed, a session's own ungated, and an owner's refusing once the
@@ -1336,13 +1381,13 @@ accessGate = \case
   SessionUploadAccess _ → ungated
   OwnedUploadAccess roots owner _ → ownerGate roots owner
 
-ownerGate ∷ Roots q inst msgr phys dev → TVar AdmissionToken → UploadGate
+ownerGate ∷ Roots q inst msgr phys dev → OwnerAdmission → UploadGate
 ownerGate roots owner =
   -- the session's failure as the roots publish it; its primary, once it has failed, from the terminal report
-  (snd <$> watchPublication (rootsFailure roots) >>= \failed → if failed then reportPrimary <$> readRootsTerminal roots else pure Nothing) >>= \case
+  rootsFailedCause roots >>= \case
     Just primary → pure (Left (UploadSessionFailed primary))
     Nothing → do
-      token ← readTVar owner
+      token ← readOwnerAdmission owner
       open ← tokenOpen token
       pure (if open then Right (UploadAdmitted token) else Left UploadClosed)
 
@@ -1366,7 +1411,7 @@ through access decide = case access of
     ownerGate roots owner >>= \case
       Left refusal → pure (Left (Right refusal))
       Right _ →
-        readTVar standing >>= \case
+        readUploadsStanding standing >>= \case
           UploadsMade uploads → either (Left . Right) Right <$> decide uploads
           other → pure (Left (Left (unavailable other)))
 
@@ -1384,7 +1429,7 @@ accessSubmitGranted access grant buffer bytes = case access of
   NoUploadAccess → pure (Left (Right UploadClosed))
   SessionUploadAccess uploads → either (Left . Right) Right <$> submitUploadGranted ungated uploads grant buffer bytes
   OwnedUploadAccess roots owner standing →
-    readTVarIO standing >>= \case
+    atomically (readUploadsStanding standing) >>= \case
       UploadsMade uploads → either (Left . Right) Right <$> submitUploadGranted (ownerGate roots owner) uploads grant buffer bytes
       other → pure (Left (Left (unavailable other)))
 
@@ -1393,3 +1438,24 @@ roundDown value granule = (value `div` granule) * granule
 
 for' ∷ Applicative f ⇒ Maybe a → (a → f ()) → f ()
 for' held action = maybe (pure ()) action held
+
+-- Ownership operations: the uploads' reservations as Foundation ownership operations, for a holder composing them with
+-- its own facts in one commit. Each is the transaction of the same name, embedded through the issuer bridge: it reads
+-- only the uploads' cells, the grant or access given and the roots' published failure, answers a refusal as data and
+-- never waits or raises.
+
+-- | 'reserveUpload' in a commit.
+reserveUploadTx ∷ Uploads q inst msgr phys dev cmd → Natural → OwnerTx (Either UploadRefusal UploadGrant)
+reserveUploadTx uploads bytes = fromIssuerSTM (reserveUpload uploads bytes)
+
+-- | 'returnUploadGrant' in a commit.
+returnUploadGrantTx ∷ UploadGrant → OwnerTx ()
+returnUploadGrantTx grant = fromIssuerSTM (returnUploadGrant grant)
+
+-- | 'abandonUploadGrant' in a commit.
+abandonUploadGrantTx ∷ Uploads q inst msgr phys dev cmd → UploadGrant → OwnerTx ()
+abandonUploadGrantTx uploads grant = fromIssuerSTM (abandonUploadGrant uploads grant)
+
+-- | 'accessReserve' in a commit.
+accessReserveTx ∷ UploadAccess → Natural → OwnerTx (Either (Either UploadsUnavailable UploadRefusal) UploadGrant)
+accessReserveTx access bytes = fromIssuerSTM (accessReserve access bytes)

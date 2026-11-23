@@ -146,8 +146,6 @@ module Hetoimasia.LuaEngine.Texture
   , m1RenderAccountBytes
   , accountLimit
   , accountCharged
-  , accountReserve
-  , accountRelease
   , accountReserveTx
   , accountReleaseTx
   , AccountDefect (..)

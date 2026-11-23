@@ -193,6 +193,8 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Rendering
   , FrameStorageRefused (..)
   ) where
 
+import Hetoimasia.Foundation.OwnerTx (OwnerTx)
+import Hetoimasia.Foundation.OwnerTx.Issuer (fromIssuerSTM)
 import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, stateTVar, writeTVar)
 import Control.Exception
   ( Exception (displayException)
@@ -395,16 +397,20 @@ import Hetoimasia.GPU.Vulkan.Native.TextureTable
   , failPendingSwaps
   , swapTexture
   )
-import Hetoimasia.Foundation.Admission (AdmissionToken)
 import Hetoimasia.GPU.Vulkan.Native.Uploads
   ( CancelRefusal (CancelUnknown)
   , UploadAccess
   , UploadsStanding (..)
   , UploadsUnavailable (..)
   , accessRoom
-  , accessReserve
+  , accessReserveTx
   , accessSubmitGranted
   , ownedUploadAccess
+  , OwnerAdmission
+  , UploadsCell
+  , newUploadsCellIO
+  , setUploadsStanding
+  , readUploadsStanding
   , UploadConfig
   , UploadProgress (..)
   , UploadRefusal
@@ -419,7 +425,7 @@ import Hetoimasia.GPU.Vulkan.Native.Uploads
   , uploadsWaiting
   , UploadGate
   , UploadGrant
-  , abandonUploadGrant
+  , abandonUploadGrantTx
   )
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Target (Adopter (..), OffscreenTargetId)
 import Hetoimasia.Runtime.GLFW (AttachmentId, OwnerDemand (..))
@@ -553,7 +559,7 @@ data Construction q inst msgr phys dev cmd = Construction
   , constructionFrameless ∷ !(Maybe (FramelessScope q inst msgr phys dev cmd))
     -- ^ The owner-thread action's frame-less scope (GRS-12): 'Nothing' for a
     -- renderer's frame, which records no frame-less batch.
-  , constructionUploads ∷ !(TVar (UploadsStanding q inst msgr phys dev cmd))
+  , constructionUploads ∷ !(UploadsCell q inst msgr phys dev cmd)
     -- ^ The session's uploads, which the texture table's placeholder is
     -- uploaded through (GRS-7).
   , constructionTargetUses ∷ !(TVar (Map BatchId TargetUse))
@@ -721,7 +727,7 @@ readConstructedReadback construction readback offset size = confined constructio
 -- that upload completes. A second is refused.
 constructTextureTable ∷ Construction q inst msgr phys dev cmd → TableConfig → IO (Either Refusal ())
 constructTextureTable construction config =
-  readTVarIO (constructionUploads construction) >>= \case
+  atomically (readUploadsStanding (constructionUploads construction)) >>= \case
     UploadsMade uploads → confined construction (createTextureTable (constructionRecording construction) uploads config)
     _ → pure (Left (RefusedIllegal "a texture table in a session whose uploads are not made: the host configures them with vulkanUploads"))
 
@@ -993,7 +999,7 @@ data Rendering q inst msgr phys dev cmd = Rendering
     -- this module makes, releases and destroys.
   , renderingEscape ∷ !(TVar (Maybe (ExceptionWithContext SomeException)))
     -- ^ The lent construction's record of a failure that escaped it.
-  , renderingUploads ∷ !(TVar (UploadsStanding q inst msgr phys dev cmd))
+  , renderingUploads ∷ !(UploadsCell q inst msgr phys dev cmd)
     -- ^ The session's uploads (GRS-6): made by the owner's progress once the
     -- recording and the frames exist; any thread admits into them.
   , renderingWindowDepth ∷ !Bool
@@ -1079,7 +1085,7 @@ newRendering roots generations ops observer captures uploads windowDepth =
     <*> pure observer
     <*> pure captures
     <*> newTVarIO Nothing
-    <*> newTVarIO (maybe UploadsUnconfigured UploadsPending uploads)
+    <*> newUploadsCellIO (maybe UploadsUnconfigured UploadsPending uploads)
     <*> pure windowDepth
     <*> newTVarIO Map.empty
     <*> newTVarIO 0
@@ -1824,13 +1830,13 @@ endCaptures rendering = do
 -- Answers whether it made, or was refused, them now.
 makeRenderingUploads ∷ Rendering q inst msgr phys dev cmd → IO Bool
 makeRenderingUploads rendering =
-  readTVarIO (renderingUploads rendering) >>= \case
+  atomically (readUploadsStanding (renderingUploads rendering)) >>= \case
     UploadsPending config →
       live rendering >>= \case
         Nothing → pure False
         Just made → do
           made' ← newUploads (liveFrames made) config
-          True <$ atomically (writeTVar (renderingUploads rendering) (either UploadsRefused UploadsMade made'))
+          True <$ atomically (setUploadsStanding (renderingUploads rendering) (either UploadsRefused UploadsMade made'))
     _ → pure False
 
 -- | One owner step's uploads, on the owner's thread, after the step has
@@ -1840,7 +1846,7 @@ makeRenderingUploads rendering =
 -- Answers whether anything was recorded or settled.
 progressRenderingUploads ∷ Rendering q inst msgr phys dev cmd → Bool → IO Bool
 progressRenderingUploads rendering open =
-  readTVarIO (renderingUploads rendering) >>= \case
+  atomically (readUploadsStanding (renderingUploads rendering)) >>= \case
     UploadsMade uploads → progressMade uploads
     _ → pure False
   where
@@ -1865,7 +1871,7 @@ refreshRenderingTable rendering =
 -- owner's wake does.
 renderingUploadsWaiting ∷ Rendering q inst msgr phys dev cmd → STM Bool
 renderingUploadsWaiting rendering =
-  readTVar (renderingUploads rendering) >>= \case
+  readUploadsStanding (renderingUploads rendering) >>= \case
     UploadsMade uploads → uploadsWaiting uploads
     _ → pure False
 
@@ -1878,7 +1884,7 @@ submitRenderingUpload
   → UploadRequest
   → IO (Either (Either UploadsUnavailable UploadRefusal) UploadTicket)
 submitRenderingUpload rendering gate request =
-  readTVarIO (renderingUploads rendering) >>= \case
+  atomically (readUploadsStanding (renderingUploads rendering)) >>= \case
     UploadsMade uploads → either (Left . Right) Right <$> submitUploadGated gate uploads request
     UploadsUnconfigured → pure (Left (Left UploadsNotConfigured))
     UploadsPending _ → pure (Left (Left UploadsNotReady))
@@ -1887,7 +1893,7 @@ submitRenderingUpload rendering gate request =
 -- | The session's uploads as a holder reaches them: the uploads this rendering records, under the owner's admission
 -- whose token is in that cell and the session's terminal state ('ownedUploadAccess'). Every decision through it is
 -- the native uploads' own, over these cells.
-renderingUploadAccess ∷ Rendering q inst msgr phys dev cmd → TVar AdmissionToken → UploadAccess
+renderingUploadAccess ∷ Rendering q inst msgr phys dev cmd → OwnerAdmission → UploadAccess
 renderingUploadAccess rendering = (\owner → ownedUploadAccess (renderingRoots rendering) owner (renderingUploads rendering))
 
 -- | Whether an upload of this many bytes would be admitted now through this access ('accessRoom'), from any thread,
@@ -1898,8 +1904,8 @@ renderingUploadRoom = accessRoom
 
 -- | Reserve the room an upload of this many bytes needs through this access ('accessReserve'), from any thread: a
 -- refusal reserves nothing.
-reserveRenderingUpload ∷ UploadAccess → Natural → STM (Either (Either UploadsUnavailable UploadRefusal) UploadGrant)
-reserveRenderingUpload = accessReserve
+reserveRenderingUpload ∷ UploadAccess → Natural → OwnerTx (Either (Either UploadsUnavailable UploadRefusal) UploadGrant)
+reserveRenderingUpload = accessReserveTx
 
 -- | Spend a reservation on the upload that fills a fresh vertex buffer of exactly its bytes through this access
 -- ('accessSubmitGranted'). Uploads that are not made, and a refusal when binding, leave the reservation spendable;
@@ -1908,16 +1914,16 @@ submitRenderingGranted ∷ UploadAccess → UploadGrant → Buffer → ByteStrin
 submitRenderingGranted = accessSubmitGranted
 
 -- | Abandon a reservation from any thread ('abandonUploadGrant'): its room is free again.
-abandonRenderingGrant ∷ Rendering q inst msgr phys dev cmd → UploadGrant → STM ()
+abandonRenderingGrant ∷ Rendering q inst msgr phys dev cmd → UploadGrant → OwnerTx ()
 abandonRenderingGrant rendering grant =
-  readTVar (renderingUploads rendering) >>= \case
-    UploadsMade uploads → abandonUploadGrant uploads grant
+  fromIssuerSTM (readUploadsStanding (renderingUploads rendering)) >>= \case
+    UploadsMade uploads → abandonUploadGrantTx uploads grant
     _ → pure ()
 
 -- | Cancel an upload from any thread ('cancelUpload').
 cancelRenderingUpload ∷ Rendering q inst msgr phys dev cmd → UploadTicket → STM (Either CancelRefusal ())
 cancelRenderingUpload rendering ticket =
-  readTVar (renderingUploads rendering) >>= \case
+  readUploadsStanding (renderingUploads rendering) >>= \case
     UploadsMade uploads → cancelUpload uploads ticket
     _ → pure (Left CancelUnknown)
 
@@ -1943,7 +1949,7 @@ retireRendering rendering now =
   readTVarIO (renderingLive rendering) >>= \case
     Nothing → pure ()
     Just made → do
-      uploads ← readTVarIO (renderingUploads rendering)
+      uploads ← atomically (readUploadsStanding (renderingUploads rendering))
       -- Uploads not yet started are cancelled before the drain, and those
       -- started are settled with the frame-less work it drains (GRS-6).
       case uploads of

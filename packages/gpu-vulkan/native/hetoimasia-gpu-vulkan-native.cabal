@@ -197,6 +197,8 @@ library
         -- Only for the VMA it compiles; no module of it is imported.
         VulkanMemoryAllocator ==0.11.1.0,
         hetoimasia-foundation ==0.1.0.0,
+        -- the issuer bridge, for the uploads' ownership operations (Internal.Uploads)
+        hetoimasia-foundation:owner-tx-issuer ==0.1.0.0,
         hetoimasia-gpu-vulkan-diagnostics ==0.1.0.0,
         hetoimasia-gpu-vulkan-model ==0.1.0.0,
         hetoimasia-gpu-vulkan-native:shader-toolchain
