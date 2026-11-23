@@ -24,7 +24,7 @@ import Hetoimasia.Foundation.Admission (Admission, admissionToken, closeAdmissio
 import Hetoimasia.Foundation.Messaging.Payload (prepare)
 import Hetoimasia.Foundation.OwnerTx (commit)
 import Hetoimasia.GPU.Model (SessionFailureCause (CleanupFailed))
-import Hetoimasia.GPU.Vulkan.Native.Internal.Roots (TerminalCause (TerminalCleanupFailed), failRootsSession)
+import Hetoimasia.GPU.Vulkan.Native.Internal.Roots (TerminalCause (TerminalCleanupFailed, TerminalRequiredTarget), failRootsSession)
 import Control.Monad (forM, forM_, replicateM_, void, when)
 import qualified Data.ByteString as ByteString
 import Data.Either (isRight)
@@ -78,7 +78,8 @@ spec = describe "Uploads" $ do
 
     it "prepares a standing in full before any commit installs it: a refusal whose cause raises raises there, and the cell keeps what it held" $ do
       cell ← newUploadsCellIO UploadsUnconfigured
-      raised ← try @ErrorCall (prepareUploadsStanding (UploadsRefused (RefusedSessionFailed (TerminalCleanupFailed (error "the description raised")))))
+      -- a field only a full evaluation reaches: the required target inside the cause
+      raised ← try @ErrorCall (prepareUploadsStanding (UploadsRefused (RefusedSessionFailed (TerminalRequiredTarget (Just (error "the target raised"))))))
       either (const True) (const False) raised `shouldBe` True
       atomically (readUploadsStanding cell) >>= \case
         UploadsUnconfigured → pure ()
