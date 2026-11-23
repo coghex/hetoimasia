@@ -192,7 +192,7 @@ rejectsFieldUpdate (reader, replacementType, extraImports) =
 -- boot library, so the build's own database resolves the whole unit graph and
 -- no dependency store has to be exposed.
 withClient ∷ FilePath → String → ((Mode → IO Client) → IO ()) → IO ()
-withClient = withPackageClient ["base", "hetoimasia-foundation", "hetoimasia-gpu-vulkan-model-0.1.0.0-inplace"]
+withClient = withPackageClient ["base", "hetoimasia-foundation-0.1.0.0-inplace", "hetoimasia-gpu-vulkan-model-0.1.0.0-inplace"]
 
 -- | The client from the issue, one field at a time: it replaces part of a
 -- validated configuration through record-update syntax, which needs only the

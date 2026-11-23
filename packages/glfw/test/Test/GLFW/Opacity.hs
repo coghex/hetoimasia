@@ -657,7 +657,7 @@ withHostClient =
     [ "base"
     , "text"
     , "stm"
-    , "hetoimasia-foundation"
+    , "hetoimasia-foundation-0.1.0.0-inplace"
     , "hetoimasia-runtime"
     , "hetoimasia-glfw-0.1.0.0-inplace"
     , "hetoimasia-glfw-0.1.0.0-inplace-runtime-glfw"
@@ -870,7 +870,7 @@ withSeamClient =
     [ "base"
     , "text"
     , "stm"
-    , "hetoimasia-foundation"
+    , "hetoimasia-foundation-0.1.0.0-inplace"
     , "hetoimasia-glfw-0.1.0.0-inplace"
     , "hetoimasia-glfw-0.1.0.0-inplace-seam"
     ]
@@ -1361,7 +1361,7 @@ privateSeamDriverClient =
 withClient ∷ FilePath → String → ((Mode → IO Client) → IO ()) → IO ()
 -- The main library is named by its local unit id: its sublibraries share its
 -- package name.
-withClient = withPackageClient ["base", "text", "stm", "hetoimasia-foundation", "hetoimasia-glfw-0.1.0.0-inplace"]
+withClient = withPackageClient ["base", "text", "stm", "hetoimasia-foundation-0.1.0.0-inplace", "hetoimasia-glfw-0.1.0.0-inplace"]
 
 -- | A client naming the session's data constructor.
 constructorClient ∷ String

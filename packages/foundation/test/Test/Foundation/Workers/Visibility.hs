@@ -71,7 +71,7 @@ spec = describe "Worker module visibility across the package boundary" $ do
         clientOutput outcome `shouldContain` abstract
 
 withClient ∷ String → ((Mode → IO Client) → IO ()) → IO ()
-withClient = withPackageClient ["base", "text", "hetoimasia-foundation"] "Client.hs"
+withClient = withPackageClient ["base", "text", "hetoimasia-foundation-0.1.0.0-inplace"] "Client.hs"
 
 -- | The public module every client below imports from.
 public ∷ String

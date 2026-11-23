@@ -37,11 +37,13 @@ source-repository head
 
 library
     exposed-modules:
+        Hetoimasia.Foundation.Exit
         Hetoimasia.Foundation.Failure
         Hetoimasia.Foundation.Log
         Hetoimasia.Foundation.Messaging.Channel
         Hetoimasia.Foundation.Messaging.Payload
         Hetoimasia.Foundation.Messaging.Snapshot
+        Hetoimasia.Foundation.OwnerTx
         Hetoimasia.Foundation.Recovery
         Hetoimasia.Foundation.Resource
         Hetoimasia.Foundation.Resource.Collection
@@ -183,6 +185,13 @@ library
 library internal
     visibility: private
     exposed-modules:
+        -- The ownership transaction's representation: bridge-equivalent, so it stays
+        -- in this private library and is reviewed with the bridge.
+        Hetoimasia.Foundation.OwnerTx.Representation
+        -- The cells and their safe STM operations, independent of the representation.
+        Hetoimasia.Foundation.OwnerTx.Cells
+        -- The adapter: the STM-free operations the public module re-exports.
+        Hetoimasia.Foundation.OwnerTx.Operations
         Hetoimasia.Foundation.Resource.Internal
         Hetoimasia.Foundation.Worker.Internal
     other-modules:
@@ -207,6 +216,25 @@ library internal
         containers >=0.8 && <0.9,
         stm >=2.5.3 && <2.6,
         text >=2.1 && <2.2
+
+-- The issuer bridge of the ownership transactions: the one embedding of an
+-- issuer's own STM into an OwnerTx, and the issuer-side cell updates that take
+-- functions. It is public so issuer packages can depend on it across package
+-- boundaries. Only issuer components depend on it: reviewers check every
+-- build-depends that names it, and the issuer's modules against the review
+-- contract in Hetoimasia.Foundation.OwnerTx.Issuer.
+library owner-tx-issuer
+    visibility: public
+    exposed-modules:
+        Hetoimasia.Foundation.OwnerTx.Issuer
+    hs-source-dirs: owner-tx-issuer
+    default-language: GHC2024
+    default-extensions: UnicodeSyntax OverloadedStrings
+    ghc-options: -Wall -Wcompat -Wincomplete-uni-patterns -Wincomplete-record-updates
+    build-depends:
+        base >=4.22 && <4.23,
+        stm >=2.5.3 && <2.6,
+        hetoimasia-foundation:internal
 
 -- The foundation's own contracts. It depends on this package, the neutral
 -- test-support library, and third-party packages alone, so it builds without
@@ -236,6 +264,10 @@ test-suite foundation-tests
         Test.Foundation.Messaging.Turns
         Test.Foundation.Messaging.Visibility
         Test.Foundation.OwnedControl
+        Test.Foundation.Ownership.Composition
+        Test.Foundation.Ownership.Exits
+        Test.Foundation.Ownership.Opacity
+        Test.Foundation.Ownership.Spec
         Test.Foundation.Recovery.Spec
         Test.Foundation.Recovery.Visibility
         Test.Foundation.Resources.Buffer
@@ -273,4 +305,5 @@ test-suite foundation-tests
         time >=1.15 && <1.16,
         hetoimasia-foundation ==0.1.0.0,
         hetoimasia-foundation:internal,
+        hetoimasia-foundation:owner-tx-issuer,
         hetoimasia-test-support ==0.1.0.0

@@ -77,7 +77,7 @@ spec = describe "Time opacity across the package boundary" $ do
                    ]
 
 withClient ∷ FilePath → String → ((Mode → IO Client) → IO ()) → IO ()
-withClient = withPackageClient ["base", "hetoimasia-foundation"]
+withClient = withPackageClient ["base", "hetoimasia-foundation-0.1.0.0-inplace"]
 
 -- | Typecheck a client and require the named rejection, with the name the
 -- client reached for in the diagnostic.

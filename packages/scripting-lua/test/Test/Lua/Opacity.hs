@@ -81,7 +81,7 @@ withClient =
     [ "base"
     , "bytestring"
     , "text"
-    , "hetoimasia-foundation"
+    , "hetoimasia-foundation-0.1.0.0-inplace"
     , "hetoimasia-scripting-lua-0.1.0.0-inplace"
     ]
 
