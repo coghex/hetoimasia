@@ -5,11 +5,11 @@ Covered beyond the boundary: none
 
 ## Next
 
-Owner disposition of the exact GUIDE-2 issue draft in the latest report (question `922udpgy49zf5q8ixg68my9zf2` in `#het-guide-followups`); then the other findings one at a time. GUIDE-1 was filed unchanged as #727 under owner approval; its solve is routed by the manager. New merged work is reviewed from this pin against the November 23 generic-library vision. Pending issue-specification audits remain explicit in coverage.
+Process GUIDE-3 next, then GUIDE-4. GUIDE-2 is deferred until the owner decides how slopes work; recheck its premise after that decision. GUIDE-1 was filed unchanged as #727 under owner approval; its solve is routed by the manager. New merged work is reviewed from this pin against the November 23 generic-library vision. Pending issue-specification audits remain explicit in coverage.
 
 ## Open findings
 
-- 2026-11-23T162528Z-b800f2f/GUIDE-2 — shape 15 public Haddock still says flat top — proposal pending
+- 2026-11-23T162528Z-b800f2f/GUIDE-2 — shape 15 public Haddock still says flat top — [deferred]: owner slope-model decision (relay `junfaykd8eiysu3qhp42d83q8n`)
 - 2026-11-23T162528Z-b800f2f/GUIDE-3 — residency Haddock contradicts budgets, dispatch slots and camera eviction — unprocessed
 - 2026-11-23T162528Z-b800f2f/GUIDE-4 — reconstructed component origins admit inconsistent aliases — unprocessed
 
