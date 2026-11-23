@@ -75,6 +75,7 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Frames.State
   , poolOf
   , freePoolOf
   , uncertain
+  , uncertainSubmission
   , frameMisuse
   ) where
 
@@ -87,14 +88,14 @@ import qualified Data.Text as Text
 import Data.Word (Word32, Word64)
 import Numeric.Natural (Natural)
 
-import Hetoimasia.GPU.Model (GpuModel, Outcome (..), PresentOutcome, SessionFailureCause, deviceLossObserved, frameView)
+import Hetoimasia.GPU.Model (GpuModel, Outcome (..), PresentOutcome, SessionFailureCause (UnknownSubmissionEffect), SubmitOutcome (SubmissionEffectUncertain), deviceLossObserved, frameView)
 import Hetoimasia.GPU.Model.Budget (BudgetKind)
 import Hetoimasia.GPU.Model.Identity (BatchId, FrameSlotId, IdentityKind (..), ImageId, Misuse (..), PresentationId, SubmissionId, TargetId, frameSlotNumber, frameTarget)
 import Hetoimasia.GPU.Vulkan.Native.Generations (Generations)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Layer (FrameOps)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State (Recording (..), TicketState)
 import Hetoimasia.GPU.Vulkan.Native.Profile (DevicePlan (..))
-import Hetoimasia.GPU.Vulkan.Native.Roots (Roots, failRootsSessionBecause, readRootsDevice, stateRootsModel)
+import Hetoimasia.GPU.Vulkan.Native.Roots (FailedSubmission (..), Roots, failRootsSessionBecause, failSubmission, readRootsDevice, stateRootsModel)
 
 -- ---------------------------------------------------------------------------
 -- Records
@@ -624,6 +625,13 @@ freePoolOf ∷ Frames q inst msgr phys dev cmd → FrameSlotId → STM ()
 freePoolOf frames frame =
   modifyTVar' (framesPool frames) $
     Map.map (\sync → if poolHolder sync == PoolHeldByFrame frame then sync {poolHolder = PoolFree} else sync)
+
+-- | A submission of these frames whose effect is unknown: each frame is retained for ever, uncertain, and the model's
+-- answer and the session's failure with this cause are one source change, published once ('failSubmission').
+uncertainSubmission ∷ Frames q inst msgr phys dev cmd → [FrameSlotId] → Text → STM ()
+uncertainSubmission frames members reason = do
+  mapM_ (\frame → editFrame frames frame (\record → record {recordStage = StageUncertain reason})) members
+  failSubmission (framesRoots frames) (FailedFrames members) SubmissionEffectUncertain UnknownSubmissionEffect (Text.pack (show members) <> ": " <> reason)
 
 -- | Enter the uncertain state for these frames: each is retained for ever, and
 -- admission closes and the session fails with the cause, in one transaction.

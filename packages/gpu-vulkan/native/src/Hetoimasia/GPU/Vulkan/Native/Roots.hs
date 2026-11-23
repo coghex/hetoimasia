@@ -239,8 +239,11 @@ module Hetoimasia.GPU.Vulkan.Native.Roots
   , stateRootsModel
   , failRootsSession
   , failRootsSessionBecause
-  , stageRootsFailure
+  , FailedSubmission (..)
+  , failSubmission
+  , reclaimRoots
   , diagnosisOf
+  , deliverAfterRecord
 
     -- * Reclamation (VK-14)
   , SubjectDisposer (..)
@@ -284,7 +287,14 @@ import Hetoimasia.Foundation.OwnerTx (Publication, Publisher, newPublisherIO, pu
 import qualified Hetoimasia.Foundation.OwnerTx as OwnerTx
 import Hetoimasia.Foundation.Time (MonotonicSource, readInstant)
 import Hetoimasia.GPU.Model
-  ( DisposalResult
+  ( DisposalResult (DisposalRefused)
+  , EvidenceSource (disposalEvidence)
+  , ReclaimReport (reclaimFailures)
+  , SubmitOutcome
+  , outcomeModel
+  , reclaimPass
+  , submitFrames
+  , submitFramelessBatch
   , Escalation (..)
   , GpuModel
   , Outcome (..)
@@ -307,7 +317,7 @@ import Hetoimasia.GPU.Model
   , targetView
   )
 import Hetoimasia.GPU.Model.Budget (Budgets)
-import Hetoimasia.GPU.Model.Identity (DeviceId, HoldSubject, SessionIdentity, TargetClass, TargetId, sessionIdentity)
+import Hetoimasia.GPU.Model.Identity (BatchId, DeviceId, FrameSlotId, HoldSubject, SessionIdentity, TargetClass, TargetId, sessionIdentity)
 import Data.ByteString (ByteString)
 import Hetoimasia.GPU.Vulkan.Native.Naming
   ( Instrumentation (..)
@@ -593,15 +603,23 @@ undescribedFailure ∷ Text
 undescribedFailure = "a failure whose description raised"
 
 -- | An exception's description for a terminal record, rendered and forced in protected IO before the transaction that
--- latches it: a description that itself raises is answered with a fixed text. A cancellation met while rendering goes
--- on.
-diagnosisOf ∷ SomeException → IO Text
+-- records it. It never raises: a description that raises is answered with a fixed text, and a cancellation met while
+-- rendering comes back with it, pending, for 'deliverAfterRecord' once the record is committed.
+diagnosisOf ∷ SomeException → IO (Text, Maybe (ExceptionWithContext SomeException))
 diagnosisOf exception =
   tryWithContext @SomeException (evaluate (Text.pack (displayException exception)) >>= \text → text <$ evaluate (Text.length text)) >>= \case
-    Right text → pure text
+    Right text → pure (text, Nothing)
     Left failure@(ExceptionWithContext _ inner)
-      | Just (_ ∷ SomeAsyncException) ← fromException inner → rethrowIO failure
-      | otherwise → pure "an exception whose description raised"
+      | Just (_ ∷ SomeAsyncException) ← fromException inner → pure (undescribedFailure, Just failure)
+      | otherwise → pure (undescribedFailure, Nothing)
+
+-- | Once the failure's record is committed: the original exception goes on as it is if it is a cancellation; otherwise
+-- a cancellation met while describing it goes on; otherwise nothing is raised here and the caller goes on with the
+-- original failure as it would.
+deliverAfterRecord ∷ ExceptionWithContext SomeException → Maybe (ExceptionWithContext SomeException) → IO ()
+deliverAfterRecord original@(ExceptionWithContext _ inner) pending
+  | isAsynchronous inner = rethrowIO original
+  | otherwise = mapM_ rethrowIO pending
 
 rootsSessionIdentity ∷ Roots q inst msgr phys dev → SessionIdentity
 rootsSessionIdentity = rootsSession
@@ -967,12 +985,13 @@ retireRootTarget roots target =
 -- permission to try again.
 settleUncertain ∷ Roots q inst msgr phys dev → TargetId → ExceptionWithContext SomeException → IO a
 settleUncertain roots target failure@(ExceptionWithContext _ exception) = do
-  reason ← diagnosisOf exception
+  (reason, pending) ← diagnosisOf exception
   atomically $ do
     modifyTVar' (rootsTargets roots) (Map.adjust (\held → held {recordUncertain = Just reason}) target)
     -- A failed cleanup is a terminal failure of its own, or evidence beside
     -- an earlier one.
     latchTerminal roots (TerminalCleanupFailed ("destroying the surface of " <> Text.pack (show target) <> ": " <> reason))
+  deliverAfterRecord failure pending
   if isAsynchronous exception
     then rethrowIO failure
     else throwIO (SurfaceDestructionFailed target reason)
@@ -1073,8 +1092,10 @@ guarded roots during call =
     Left failure@(ExceptionWithContext _ exception)
       | isAsynchronous exception → rethrowIO failure
       | opsDeviceLoss (rootsOps roots) exception → do
-          loss ← GraphicsDeviceLost during <$> diagnosisOf exception
+          (detail, pending) ← diagnosisOf exception
+          let loss = GraphicsDeviceLost during detail
           latchDeviceLoss roots loss
+          deliverAfterRecord failure pending
           throwIO loss
       | otherwise → rethrowIO failure
 
@@ -1584,13 +1605,48 @@ republishFailed roots write =
     -- inside a staged source transition: the transition's own end fixes the primary and publishes, once
     _ → write
 
--- | One source transition that writes the model and the latch together (a model transition that fails the session,
--- and the detailed cause of the same failure): the primary is chosen as 'latchTerminal' chooses it with both writes
--- seen, then fixed and published once, at the transition's end, in its transaction. A failure through the model alone
--- stays write-once as before.
+-- One source transition that writes the model and the latch together (a model transition that fails the session, and
+-- the detailed cause of the same failure): the primary is chosen as 'latchTerminal' chooses it with both writes seen,
+-- then fixed and published once, at the end of the outermost staged transition, in its transaction. A staged transition
+-- inside another publishes nothing of its own. Private: callers outside this module use the concrete operations below.
+-- A failure through the model alone stays write-once as before.
 stageRootsFailure ∷ Roots q inst msgr phys dev → STM a → STM a
 stageRootsFailure roots transition =
-  republishing roots (modifyTVar' (rootsStaging roots) (+ 1) *> transition <* modifyTVar' (rootsStaging roots) (subtract 1))
+  readTVar (rootsStaging roots) >>= \case
+    0 → republishing roots staged
+    _ → staged
+  where
+    staged = modifyTVar' (rootsStaging roots) (+ 1) *> transition <* modifyTVar' (rootsStaging roots) (subtract 1)
+
+-- | What a failed submission concerned: frames, or a frame-less batch.
+data FailedSubmission = FailedFrames ![FrameSlotId] | FailedFrameless !BatchId
+
+-- | A submission's failure as one source change: the model's answer to the submission (when the model admits that
+-- answer) and the session's failure with this detailed cause, the primary chosen with both seen and published once.
+failSubmission ∷ Roots q inst msgr phys dev → FailedSubmission → SubmitOutcome → SessionFailureCause → Text → STM ()
+failSubmission roots subject outcome cause reason = stageRootsFailure roots $ do
+  stateRootsModel roots $ \model → case outcomeModel (transition model) of
+    Admitted next → ((), next)
+    _ → ((), model)
+  failRootsSessionBecause roots cause reason
+  where
+    transition = case subject of
+      FailedFrames frames → submitFrames frames outcome
+      FailedFrameless batch → submitFramelessBatch batch outcome
+
+-- | A reclamation pass recorded as one source change: the model's pass with what each offered disposal did, and each
+-- disposal that failed latched as its own cleanup failure, named; published once. The layers forget what was disposed
+-- afterwards, in a transaction of their own.
+reclaimRoots ∷ Roots q inst msgr phys dev → [(HoldSubject, Maybe DisposalResult)] → STM ReclaimReport
+reclaimRoots roots results = stageRootsFailure roots $ do
+  report ← stateRootsModel roots $ \model →
+    let (next, answered) = reclaimPass silentEvidence {disposalEvidence = evidenceFrom} model
+     in (answered, next)
+  for_ (reclaimFailures report) $ \subject →
+    failRootsSessionBecause roots CleanupFailed ("reclaiming " <> Text.pack (show subject) <> " did not complete")
+  pure report
+  where
+    evidenceFrom subject = maybe DisposalRefused id (lookup subject results >>= id)
 
 republishing ∷ Roots q inst msgr phys dev → STM a → STM a
 republishing roots write = do
@@ -1713,16 +1769,13 @@ destroying roots slot name destroy = mask_ $
     Left failure → uncertainly roots slot name failure
 
 uncertainly ∷ Roots q inst msgr phys dev → TVar (Root a) → Text → ExceptionWithContext SomeException → IO b
-uncertainly roots slot name failure@(ExceptionWithContext _ exception)
-  | isAsynchronous exception = do
-      -- A cancellation cannot land inside the masked call, so one here was
-      -- raised by the call itself; its outcome is no better known for that.
-      atomically (settle (Text.pack (displayException exception)))
-      rethrowIO failure
-  | otherwise = do
-      reason ← diagnosisOf exception
-      atomically (settle reason)
-      throwIO (RootDestructionFailed name reason)
+uncertainly roots slot name failure@(ExceptionWithContext _ exception) = do
+  -- A cancellation cannot land inside the masked call, so one here was raised by the call itself; its outcome is no
+  -- better known for that, and it goes on once recorded
+  (reason, pending) ← diagnosisOf exception
+  atomically (settle reason)
+  deliverAfterRecord failure pending
+  throwIO (RootDestructionFailed name reason)
   where
     settle reason = do
       writeTVar slot (Uncertain reason)

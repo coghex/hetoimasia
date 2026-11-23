@@ -70,7 +70,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   , releaseClaims
   , settleTicket
   )
-import Hetoimasia.GPU.Vulkan.Native.Roots (failRootsSessionBecause, readRootsDevice, rootsCall, stateRootsModel, diagnosisOf)
+import Hetoimasia.GPU.Vulkan.Native.Roots (failRootsSessionBecause, readRootsDevice, rootsCall, stateRootsModel, deliverAfterRecord, diagnosisOf)
 
 -- | Free the frame's slot of batches whose submission has completed. A
 -- submitted batch keeps its record, and its storage, until the submission
@@ -194,10 +194,11 @@ invalidate recording storage batches discharge =
         Just handle → mask_ $
           tryWithContext @SomeException (rootsCall roots "vkResetCommandPool" (opsResetStorage (recordingOps recording) device handle)) >>= \case
             Left failure@(ExceptionWithContext _ exception) → do
-              reason ← diagnosisOf exception
+              (reason, pending) ← diagnosisOf exception
               atomically $ do
                 for_ batches (\batch → editBatch recording batch (\entry → entry {batchStanding = BatchUncertain reason}))
                 failRootsSessionBecause roots CleanupFailed ("resetting the storage of " <> Text.pack (show batches) <> " raised: " <> reason)
+              deliverAfterRecord failure pending
               if isAsynchronous exception then rethrowIO failure else throwIO (BatchInvalidationFailed batches reason)
             Right () → atomically $ do
               -- The records go only with the model's discharge: a refused

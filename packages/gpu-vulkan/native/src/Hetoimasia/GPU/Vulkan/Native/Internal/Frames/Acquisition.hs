@@ -15,9 +15,12 @@
 module Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Acquisition
   ( tryAcquireFrame
   , rollBack
+  , RolledBack (..)
+  , rolledRetains
+  , raiseRolledBack
   ) where
 
-import Control.Concurrent.STM (STM, atomically, modifyTVar', readTVar, readTVarIO)
+import Control.Concurrent.STM (atomically, modifyTVar', readTVar, readTVarIO)
 import Control.Exception
   ( ExceptionWithContext (ExceptionWithContext)
   , SomeException
@@ -26,7 +29,8 @@ import Control.Exception
   , throwIO
   , tryWithContext
   )
-import Control.Monad (forM, unless, void, when)
+import Control.Applicative ((<|>))
+import Control.Monad (forM, void, when)
 import Data.Foldable (for_)
 import Data.IORef (modifyIORef', newIORef, readIORef)
 import Data.List (find)
@@ -77,9 +81,8 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Reclamation (recoveringCreation)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State (Refusal (..), checkpointed, modelAnswer, modelEdit, owned)
 import Hetoimasia.GPU.Vulkan.Native.Naming (NativeObjectKind (..), PoolObject (..), SlotObject (..), poolObjectName, slotObjectName)
 import Hetoimasia.GPU.Vulkan.Native.Roots
-  ( Roots
+  ( deliverAfterRecord
   , diagnosisOf
-  , stageRootsFailure
   , failRootsSessionBecause
   , nameRootsObject
   , readRootsInstrumentation
@@ -295,8 +298,12 @@ prepareSlot frames device frame =
         Right sync → do
           atomically (modifyTVar' (framesSlots frames) (Map.insert key sync))
           pure (Right sync)
-        Left failure →
-          readIORef made >>= rollBack roots ("the synchronization of slot " <> Text.pack (show key)) failure destroy retain
+        Left failure → do
+          rolled ← readIORef made >>= rollBack ("the synchronization of slot " <> Text.pack (show key)) failure destroy
+          when (rolledRetains rolled) . atomically $ do
+            retain (rolledReason rolled) (rolledOutcomes rolled)
+            failRootsSessionBecause roots CleanupFailed (rolledReason rolled)
+          raiseRolledBack failure rolled
   where
     destroy object handle = case object of
       AcquisitionSemaphore → destroySemaphore handle
@@ -382,9 +389,12 @@ preparePool frames device frame = do
             Right sync → do
               atomically (modifyTVar' (framesPool frames) (Map.insert (target, number) sync))
               pure (Right number)
-            Left failure →
-              readIORef made
-                >>= rollBack roots ("the presentation-pool record " <> Text.pack (show (target, number))) failure destroy (retain number)
+            Left failure → do
+              rolled ← readIORef made >>= rollBack ("the presentation-pool record " <> Text.pack (show (target, number))) failure destroy
+              when (rolledRetains rolled) . atomically $ do
+                retain number (rolledReason rolled) (rolledOutcomes rolled)
+                failRootsSessionBecause roots CleanupFailed (rolledReason rolled)
+              raiseRolledBack failure rolled
   where
     destroy object handle = case object of
       RenderFinishedSemaphore → destroySemaphore handle
@@ -419,46 +429,61 @@ preparePool frames device frame = do
 
 -- | Roll back a synchronization construction that raised: destroy every object
 -- it made, newest first — the dependency order — each exactly once, whatever
--- the destructions before it did.
+-- the destructions before it did, and describe each failure in protected IO.
+-- Nothing is recorded here: the caller records what the answer says in its own
+-- transaction, then raises it with 'raiseRolledBack'.
 --
 -- When every destruction returns, nothing is retained and the construction's
 -- failure propagates as it was. When one raises, the object it named may
--- still exist and is never destroyed again: @retain@ publishes the record,
--- every object in it standing as its destruction left it, where retirement
--- sees and keeps it, and the session fails with 'CleanupFailed' — without
--- replacing an earlier terminal primary — before anything is raised. Either
--- way the construction's failure stays primary, and each destruction that
--- raised is retained beside it in the order it was attempted, under the
--- @vulkan frame synchronization rollback@ label.
-rollBack
-  ∷ Eq object
-  ⇒ Roots q inst msgr phys dev
-  → Text
-  → ExceptionWithContext SomeException
-  → (object → Word64 → IO ())
-  → (Text → [(object, (Word64, Maybe Text))] → STM ())
-  → [(object, Word64)]
-  → IO a
-rollBack roots what failure destroy retain made = do
+-- still exist and is never destroyed again: the caller publishes the record,
+-- every object in it standing as its destruction left it ('rolledOutcomes'),
+-- where retirement sees and keeps it, and fails the session with
+-- 'CleanupFailed' ('rolledReason') — without replacing an earlier terminal
+-- primary — before anything is raised. Either way the construction's failure
+-- stays primary, and each destruction that raised is retained beside it in the
+-- order it was attempted, under the @vulkan frame synchronization rollback@
+-- label.
+rollBack ∷ Text → ExceptionWithContext SomeException → (object → Word64 → IO ()) → [(object, Word64)] → IO (RolledBack object)
+rollBack what failure destroy made = do
   attempts ← forM made $ \(object, handle) → (,) (object, handle) <$> tryWithContext @SomeException (destroy object handle)
-  -- every description is rendered and forced here, before the transaction that records it
+  -- every description is rendered and forced here, before the transaction that records it; a cancellation met while
+  -- describing is carried for 'raiseRolledBack'
   described ← forM attempts $ \(made', attempt) → (,) made' <$> traverse describe (either Just (const Nothing) attempt)
-  primary ← describe failure
+  (primary, primaryPending) ← describe failure
   let raised = [caught | (_, Left caught) ← attempts]
-      outcomes = [(object, (handle, description)) | ((object, handle), description) ← described]
+      outcomes = [(object, (handle, fst <$> description)) | ((object, handle), description) ← described]
+      pending = foldr (<|>) primaryPending [snd =<< description | (_, description) ← described]
       reason =
         "constructing "
           <> what
           <> " raised ("
           <> primary
           <> "), and destroying what it had made raised: "
-          <> Text.intercalate "; " [description | (_, Just description) ← described]
-  unless (null raised) . atomically . stageRootsFailure roots $ do
-    retain reason outcomes
-    failRootsSessionBecause roots CleanupFailed reason
-  foldr retainOne (rethrowIO failure) (reverse raised)
+          <> Text.intercalate "; " [text | (_, Just (text, _)) ← described]
+  pure (RolledBack reason outcomes raised pending)
   where
     describe (ExceptionWithContext _ exception) = diagnosisOf exception
+
+-- | What a rollback left, for its caller to record: the cleanup failure's description, each object's standing, the
+-- destructions that raised (none: nothing to record), and a cancellation met while describing.
+data RolledBack object = RolledBack
+  { rolledReason ∷ !Text
+  , rolledOutcomes ∷ ![(object, (Word64, Maybe Text))]
+  , rolledRaised ∷ ![ExceptionWithContext SomeException]
+  , rolledPending ∷ !(Maybe (ExceptionWithContext SomeException))
+  }
+
+-- | Whether a rollback left anything to record.
+rolledRetains ∷ RolledBack object → Bool
+rolledRetains = not . null . rolledRaised
+
+-- | Once the caller recorded the rollback: the cancellation priority ('deliverAfterRecord'), then the construction's
+-- failure with each cleanup that raised retained beside it.
+raiseRolledBack ∷ ExceptionWithContext SomeException → RolledBack object → IO a
+raiseRolledBack failure rolled = do
+  deliverAfterRecord failure (rolledPending rolled)
+  foldr retainOne (rethrowIO failure) (reverse (rolledRaised rolled))
+  where
     retainOne cleanup rest = withResourceLabelled rollbackLabel (pure ()) (\() → rethrowIO cleanup) (\() → rest)
 
 -- | The cleanup label a rollback's failed destructions are retained under.

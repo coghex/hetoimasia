@@ -106,6 +106,7 @@ import Hetoimasia.GPU.Vulkan.Native.Presentation
 import Hetoimasia.GPU.Vulkan.Native.Profile (DevicePlan (..))
 import Hetoimasia.GPU.Vulkan.Native.Roots
   ( GenerationOps (..)
+  , deliverAfterRecord
   , diagnosisOf
   , GraphicsDeviceLost
   , NativeFailure (..)
@@ -465,7 +466,9 @@ reconcile generations now target geometry = do
                   noteFailure reason
                   rethrowIO failure
                 _ → do
-                  diagnosisOf exception >>= failed candidate
+                  (described, pending) ← diagnosisOf exception
+                  failed candidate described
+                  deliverAfterRecord failure pending
                   -- A creation that answered the surface lost has lost it for
                   -- every later construction too: the surface is replaced.
                   when (rootsNativeFailure roots exception == Just FailedSurfaceLost) loseSurface

@@ -63,6 +63,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Generations.State
   )
 import Hetoimasia.GPU.Vulkan.Native.Roots
   ( GenerationOps (..)
+  , deliverAfterRecord
   , diagnosisOf
   , Roots
   , SubjectDisposer (..)
@@ -205,10 +206,11 @@ destroyGeneration generations device generation native = go (reverse (genViews n
       tryWithContext (rootsCall roots name destroy) >>= \case
         Right () → Nothing <$ atomically (editGeneration generations generation record)
         Left failure@(ExceptionWithContext _ exception) → do
-          reason ← diagnosisOf exception
+          (reason, pending) ← diagnosisOf exception
           atomically $ do
             editGeneration generations generation (\entry → entry {genStanding = GenerationUncertain reason})
             failRootsSessionBecause roots CleanupFailed (name <> " of " <> Text.pack (show generation) <> " raised: " <> reason)
+          deliverAfterRecord failure pending
           if isAsynchronous exception then rethrowIO failure else pure (Just reason)
 
 -- | One model progress turn with the given disposal evidence, forgetting every

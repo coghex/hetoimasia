@@ -127,6 +127,7 @@ import Hetoimasia.GPU.Vulkan.Native.Allocator
   )
 import Hetoimasia.GPU.Vulkan.Native.Roots
   ( Roots
+  , deliverAfterRecord
   , diagnosisOf
   , failRootsSessionBecause
   , noteRootsAllocation
@@ -397,10 +398,11 @@ destroyMade roots destroyer ops memory =
       settle roots Nothing 0 events >>= traverse_ (defectFails roots call)
       noteRootsAllocation roots False
     Left failure@(ExceptionWithContext _ exception) → do
-      described ← diagnosisOf exception
+      (described, pending) ← diagnosisOf exception
       atomically $
         failRootsSessionBecause roots CleanupFailed $
           call <> " of what a failed request made raised: " <> described
+      deliverAfterRecord failure pending
       when (isJust (fromException exception ∷ Maybe SomeAsyncException)) (rethrowIO failure)
   where
     call = destroyerCall destroyer

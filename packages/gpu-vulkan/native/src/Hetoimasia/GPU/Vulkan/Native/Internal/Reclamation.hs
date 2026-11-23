@@ -78,7 +78,6 @@ import Hetoimasia.GPU.Model
   , Outcome (..)
   , ReclaimReport (..)
   , RetryVerdict (..)
-  , SessionFailureCause (CleanupFailed)
   , SessionState (SessionRunning)
   , sessionState
   , abandonAllocation
@@ -92,11 +91,10 @@ import Hetoimasia.GPU.Model
 import Hetoimasia.GPU.Model.Identity (AllocationId, GenerationId, HoldSubject)
 import Hetoimasia.GPU.Vulkan.Native.Roots
   ( GraphicsDeviceLost
-  , stageRootsFailure
+  , reclaimRoots
   , NativeFailure (..)
   , Roots
   , SubjectDisposer (..)
-  , failRootsSessionBecause
   , readRootsDisposers
   , rootsNativeFailure
   , stateRootsModel
@@ -115,17 +113,12 @@ reclaimOnce roots = do
     let (_, window) = reclaimPass silentEvidence {disposalEvidence = const DisposalCompleted} model
     (,) (reclaimDisposed window) <$> readRootsDisposers roots
   results ← forM offered $ \subject → (,) subject <$> disposeWith disposers subject
-  atomically . stageRootsFailure roots $ do
-    report ← stateRootsModel roots $ \model →
-      let (next, answered) = reclaimPass silentEvidence {disposalEvidence = evidenceFrom results} model
-       in (answered, next)
-    for_ disposers (\disposer → disposerForget disposer (reclaimDisposed report))
-    -- Each failed disposal is its own cleanup failure, named.
-    for_ (reclaimFailures report) $ \subject →
-      failRootsSessionBecause roots CleanupFailed ("reclaiming " <> Text.pack (show subject) <> " did not complete")
-    pure report
+  -- the model's pass and each failed disposal's cleanup failure, one source change published once; then the layers
+  -- forget what was disposed, in a transaction of their own, outside the one that publishes the failure
+  report ← atomically (reclaimRoots roots results)
+  atomically (for_ disposers (\disposer → disposerForget disposer (reclaimDisposed report)))
+  pure report
   where
-    evidenceFrom results subject = maybe DisposalRefused id (lookup subject results >>= id)
     disposeWith [] _ = pure Nothing
     disposeWith (disposer : rest) subject =
       disposerDispose disposer subject >>= \case

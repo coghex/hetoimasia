@@ -63,7 +63,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   )
 import Hetoimasia.GPU.Vulkan.Native.Generations (Generations)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Layer (RecordingOps)
-import Hetoimasia.GPU.Vulkan.Native.Roots (Roots, SubjectDisposer (..), failRootsSessionBecause, readRootsDevice, registerRootsDisposer, stateRootsModel, diagnosisOf)
+import Hetoimasia.GPU.Vulkan.Native.Roots (Roots, SubjectDisposer (..), failRootsSessionBecause, readRootsDevice, registerRootsDisposer, stateRootsModel, deliverAfterRecord, diagnosisOf)
 
 -- | Destroy every released generation whose holds the model reports ended,
 -- and record the disposals with the model. A pipeline layout waits for every
@@ -141,8 +141,9 @@ destroyOne recording device resource record = mask_ $
   tryWithContext @SomeException (destroyNative recording device (managedNative record)) >>= \case
     Right () → Nothing <$ atomically (editManaged recording resource (\entry → entry {managedStanding = ManagedDestroyedPending}))
     Left failure@(ExceptionWithContext _ exception) → do
-      reason ← diagnosisOf exception
+      (reason, pending) ← diagnosisOf exception
       atomically (editManaged recording resource (\entry → entry {managedStanding = ManagedUncertain reason}))
+      deliverAfterRecord failure pending
       if isAsynchronous exception then rethrowIO failure else pure (Just reason)
 
 -- | A recording over these roots and generations, owned by the calling

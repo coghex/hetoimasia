@@ -21,7 +21,7 @@ module Test.GPU.Vulkan.Native.Terminal (spec) where
 import Control.Concurrent (killThread, myThreadId, threadDelay)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar, tryPutMVar)
 import Control.Concurrent.STM (atomically, newTVarIO, readTVarIO, throwSTM, writeTVar)
-import Control.Exception (AsyncException (ThreadKilled), ErrorCall (ErrorCall), Exception, SomeException, fromException, mask, throwIO, toException, try)
+import Control.Exception (AsyncException (ThreadKilled), ErrorCall (ErrorCall), Exception, SomeException, fromException, mask, throw, throwIO, toException, try)
 import Control.Monad (forM_, join, void, when)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (isInfixOf, nub)
@@ -66,9 +66,8 @@ import Hetoimasia.GPU.Vulkan.Native.Roots
   ( Checkpoint (..)
   , rootsFailure
   , rootsFailedCause
-  , stageRootsFailure
   , latchTerminal
-  , stateRootsModel
+  , rootsCall
   , DiagnosticAlarm (..)
   , GraphicsDeviceLost (..)
   , RootsRetained (..)
@@ -201,16 +200,8 @@ spec = describe "Terminal failure" $ do
       atomically (failRootsSessionBecause (rigRoots rig') CleanupFailed "a later cleanup failed")
       atomically (rootsFailedCause (rigRoots rig')) `shouldReturn` fixed
 
-    it "keeps a combined source transition's own primary: a failing model transition and its detailed cause in one staged transaction publish the detailed cause once; after a model-only failure, a later latch only adds evidence" $ do
-      rig ← newRig
-      (revision, _) ← atomically (watchPublication (rootsFailure (rigRoots rig)))
+    it "keeps a failure through the model alone write-once: a later latch only adds evidence" $ do
       let detailed = TerminalDeviceLost (GraphicsDeviceLost "vkQueueSubmit2" "the queue reported the device lost")
-      atomically . stageRootsFailure (rigRoots rig) $ do
-        stateRootsModel (rigRoots rig) (\model → ((), noteDeviceLoss model))
-        latchTerminal (rigRoots rig) detailed
-      atomically (watchPublication (rootsFailure (rigRoots rig))) `shouldReturn` (revision + 1, True)
-      atomically (rootsFailedCause (rigRoots rig)) `shouldReturn` Just detailed
-      clean rig
       rig' ← newRig
       inModel rig' (Admitted . noteDeviceLoss)
       fixed ← atomically (rootsFailedCause (rigRoots rig'))
@@ -218,6 +209,16 @@ spec = describe "Terminal failure" $ do
       atomically (latchTerminal (rigRoots rig') detailed)
       atomically (rootsFailedCause (rigRoots rig')) `shouldReturn` fixed
       evidenceOf rig' >>= (`shouldSatisfy` elem (LaterFailure detailed))
+
+    it "latches a device loss whose description is cancelled, with the fixed description, and only then delivers the cancellation" $ do
+      rig ← newRig
+      -- a loss the native call raised, whose description raises a cancellation
+      try @AsyncException (rootsCall (rigRoots rig) "vkQueueSubmit2" (throwIO (StandInLoss (throw ThreadKilled)) ∷ IO ()))
+        `shouldReturn` Left ThreadKilled
+      atomically (rootsFailedCause (rigRoots rig)) >>= (`shouldSatisfy` \case
+        Just (TerminalDeviceLost loss) → lostDuring loss == "vkQueueSubmit2" && "description raised" `isInfixOf` show loss
+        _ → False)
+      clean rig
 
     it "latches and publishes a failure whose description raises, with a fixed description, never rolling the record back" $ do
       rig ← newRig

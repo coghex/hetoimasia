@@ -32,7 +32,7 @@ import Hetoimasia.GPU.Model
   ( FramePhase (FrameAcquired)
   , FrameView (..)
   , Outcome (..)
-  , SessionFailureCause (CleanupFailed, UnknownSubmissionEffect)
+  , SessionFailureCause (CleanupFailed)
   , SubmitAnswer (..)
   , SubmitOutcome (..)
   , frameView
@@ -63,7 +63,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   , checkpointed
   , owned
   )
-import Hetoimasia.GPU.Vulkan.Native.Roots (GraphicsDeviceLost, failRootsSessionBecause, rootsCall, rootsSessionIdentity, stateRootsModel, diagnosisOf, stageRootsFailure)
+import Hetoimasia.GPU.Vulkan.Native.Roots (FailedSubmission (..), failSubmission, GraphicsDeviceLost, rootsCall, rootsSessionIdentity, stateRootsModel, deliverAfterRecord, diagnosisOf)
 
 -- | One frame of a validated request.
 data Member cmd = Member
@@ -221,11 +221,11 @@ submitFrames frames request =
           -- fence itself is now in doubt, so it is retained for ever, and
           -- native synchronization safety being unknown, admission stops and
           -- the session fails.
-          described ← diagnosisOf exception
-          atomically . stageRootsFailure roots $ do
-            answered Model.submitFrames framesOf SubmissionFailedWithoutEffect
-            editSlot frames key (\sync → sync {syncFenceState = FenceUncertain (described)})
-            failRootsSessionBecause roots CleanupFailed ("resetting the submission fence of slot " <> Text.pack (show key) <> " raised: " <> described)
+          (described, pending) ← diagnosisOf exception
+          atomically $ do
+            editSlot frames key (\sync → sync {syncFenceState = FenceUncertain described})
+            failSubmission roots (FailedFrames framesOf) SubmissionFailedWithoutEffect CleanupFailed ("resetting the submission fence of slot " <> Text.pack (show key) <> " raised: " <> described)
+          deliverAfterRecord failure pending
           rethrowIO failure
         Right () → do
           atomically (editSlot frames key (\sync → sync {syncFenceState = FenceIdle}))
@@ -236,14 +236,15 @@ submitFrames frames request =
                   atomically (answered Model.submitFrames framesOf SubmissionFailedWithoutEffect)
                   pure (Right (SubmittedNothing (Text.pack (displayException exception))))
               | otherwise → do
-                  reason ← ("vkQueueSubmit2 raised, so whether it submitted is unknown: " <>) <$> diagnosisOf exception
-                  atomically . stageRootsFailure roots $ do
-                    answered Model.submitFrames framesOf SubmissionEffectUncertain
-                    uncertain frames UnknownSubmissionEffect framesOf reason
+                  (described, pending) ← diagnosisOf exception
+                  let reason = "vkQueueSubmit2 raised, so whether it submitted is unknown: " <> described
+                  atomically $ do
+                    uncertainSubmission frames framesOf reason
                     editSlot frames key (\sync → sync {syncFenceState = FenceUncertain reason})
                     for_ members $ \member → do
                       editSlot frames (slotOf (memberFrame member)) (\sync → sync {syncAcquireState = SemaphoreUncertain reason})
                       editPool frames (memberPool member) (\held → held {poolRenderedState = SemaphoreUncertain reason})
+                  deliverAfterRecord failure pending
                   case fromException exception ∷ Maybe GraphicsDeviceLost of
                     Just _ → rethrowIO failure
                     Nothing → throwIO (FrameEffectUncertain framesOf reason)
@@ -273,8 +274,7 @@ submitFrames frames request =
           -- recorded in a transaction of its own.
           let reason = "the model refused to record a submission the queue accepted"
           atomically $ do
-            answered Model.submitFrames framesOf SubmissionEffectUncertain
-            uncertain frames UnknownSubmissionEffect framesOf reason
+            uncertainSubmission frames framesOf reason
             editSlot frames key (\sync → sync {syncFenceState = FenceUncertain reason})
           throwIO (FrameEffectUncertain framesOf reason)
         Just submission → do

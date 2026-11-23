@@ -39,7 +39,8 @@ import Hetoimasia.GPU.Model.Budget (BudgetKind (..), BudgetRequest (..), default
 import Hetoimasia.GPU.Vulkan.Native.Frames
 import Hetoimasia.GPU.Vulkan.Native.Naming (NativeObjectKind (ObjectFence))
 import Hetoimasia.GPU.Vulkan.Native.Recording
-import Hetoimasia.GPU.Vulkan.Native.Roots (GraphicsDeviceLost (..), TerminalCause (TerminalDeviceLost))
+import Hetoimasia.Foundation.OwnerTx (watchPublication)
+import Hetoimasia.GPU.Vulkan.Native.Roots (GraphicsDeviceLost (..), TerminalCause (TerminalDeviceLost, TerminalUncertainEffect), rootsFailedCause, rootsFailure)
 import Test.GPU.Vulkan.Native.FramesRig
 import Test.GPU.Vulkan.Native.FramesStandIn
 import Test.GPU.Vulkan.Native.RecordingStandIn (RecordingCall (..), RecordingStep (AtResetStorage), duringReset, failAt, recordingCalls)
@@ -126,9 +127,15 @@ spec = describe "Frame-less batches" $ do
       rig ← newRig
       failSubmission rig 2 AtSubmit
       tickets ← newIORef []
+      (revision, _) ← atomically (watchPublication (rootsFailure (rigRoots rig)))
       outcome ← try @FramelessEffectUncertain $ scoped rig $ \scope →
         mapM_ (const (sealedIn scope >>= \ticket → modifyIORef' tickets (ticket :))) [1 ∷ Int .. 3]
       fmap (const ()) outcome `shouldSatisfy` either (const True) (const False)
+      -- one source change: one published revision, the detailed cause the primary
+      atomically (watchPublication (rootsFailure (rigRoots rig))) `shouldReturn` (revision + 1, True)
+      atomically (rootsFailedCause (rigRoots rig)) >>= (`shouldSatisfy` \case
+        Just (TerminalUncertainEffect detail) → "vkQueueSubmit2 raised" `Text.isInfixOf` detail
+        _ → False)
       states ← readIORef tickets >>= mapM (atomically . readTicket) . reverse
       -- The first was accepted, the second's effect is unknown: neither is
       -- complete, and neither is discarded.

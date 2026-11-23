@@ -51,6 +51,8 @@ import Hetoimasia.GPU.Model.Identity
 import Hetoimasia.GPU.Vulkan.Native.Frames
 import Hetoimasia.GPU.Vulkan.Native.Generations
 import Hetoimasia.GPU.Vulkan.Native.Recording
+import qualified Data.Text as Text
+import Hetoimasia.Foundation.OwnerTx (watchPublication)
 import Hetoimasia.GPU.Vulkan.Native.Roots
 import Test.GPU.Vulkan.Native.FramesRig
 import Test.GPU.Vulkan.Native.FramesStandIn
@@ -273,13 +275,17 @@ spec = describe "Frames" $ do
       frame ← owned rig
       batch ← sealed rig frame
       failFrameStep (rigStandIn rig) AtSubmit
+      (revision, _) ← atomically (watchPublication (rootsFailure (rigRoots rig)))
       outcome ← try @FrameEffectUncertain (submitFrames (rigFrames rig) (batch :| []))
       fmap (const ()) outcome `shouldSatisfy` either (const True) (const False)
       sessionState <$> modelOf rig `shouldReturn` SessionFailed UnknownSubmissionEffect
       phaseOf rig (ownedFrame frame) `shouldReturn` Just FrameUncertainEffect
       standingOf rig (ownedFrame frame) `shouldReturn'` (`shouldSatisfy` maybe False uncertainStage)
+      -- the model's answer and the detailed cause are one source change: one published revision, and the primary is
+      -- the detailed cause, not the model's own
+      atomically (watchPublication (rootsFailure (rigRoots rig))) `shouldReturn` (revision + 1, True)
       refusedPrimary rig `shouldReturn'` (`shouldSatisfy` \case
-        Just (TerminalUncertainEffect _) → True
+        Just (TerminalUncertainEffect detail) → "vkQueueSubmit2 raised" `Text.isInfixOf` detail
         _ → False)
       skipFrame (rigFrames rig) (ownedFrame frame) `shouldReturn` Left (RefusedMisuse (WrongPhase FrameIdentity))
       _ ← progress rig

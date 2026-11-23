@@ -59,7 +59,7 @@ import Hetoimasia.GPU.Model
   , submitFramelessBatch
   )
 import Hetoimasia.GPU.Model.Identity (BatchId, IdentityKind (..), Misuse (..), batchSession)
-import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Acquisition (rollBack)
+import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Acquisition (RolledBack (..), raiseRolledBack, rollBack, rolledRetains)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Layer (FrameOps (..), SubmitBatch (..), WaitStage (..))
 import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Loss (releaseFramesToDeviceLoss)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.State
@@ -82,8 +82,10 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
 import Hetoimasia.GPU.Vulkan.Native.Naming (NativeObjectKind (ObjectFence), framelessFenceName)
 import Hetoimasia.GPU.Vulkan.Native.Roots
   ( GraphicsDeviceLost
+  , deliverAfterRecord
   , diagnosisOf
-  , stageRootsFailure
+  , FailedSubmission (..)
+  , failSubmission
   , failRootsSessionBecause
   , nameRootsObject
   , readRootsInstrumentation
@@ -309,7 +311,12 @@ submitFrameless frames batch =
           -- Named once, before it is recorded; a naming that raised is
           -- rolled back as a frame slot's synchronization is.
           tryWithContext @SomeException (name slot fence) >>= \case
-            Left failure → rollBack roots ("the fence of frame-less slot " <> Text.pack (show slot)) failure (\() → destroyFence device) (retain slot fence) [((), fence)]
+            Left failure → do
+              rolled ← rollBack ("the fence of frame-less slot " <> Text.pack (show slot)) failure (\() → destroyFence device) [((), fence)]
+              when (rolledRetains rolled) . atomically $ do
+                retain slot fence (rolledReason rolled) (rolledOutcomes rolled)
+                failRootsSessionBecause roots CleanupFailed (rolledReason rolled)
+              raiseRolledBack failure rolled
             Right () → do
               let made = FramelessSync fence FenceIdle Nothing
               atomically (modifyTVar' (framesFrameless frames) (Map.insert slot made))
@@ -322,10 +329,12 @@ submitFrameless frames batch =
           else pure (Right ())
       case reset of
         Left failure@(ExceptionWithContext _ exception) → do
-          reason ← (("resetting the fence of frame-less slot " <> Text.pack (show slot) <> " raised: ") <>) <$> diagnosisOf exception
+          (described, pending) ← diagnosisOf exception
+          let reason = "resetting the fence of frame-less slot " <> Text.pack (show slot) <> " raised: " <> described
           atomically $ do
             edit (\entry → entry {framelessFenceState = FenceUncertain reason})
             failRootsSessionBecause roots CleanupFailed reason
+          deliverAfterRecord failure pending
           rethrowIO failure
         Right () → do
           atomically (edit (\entry → entry {framelessFenceState = FenceIdle}))
@@ -337,11 +346,12 @@ submitFrameless frames batch =
                   atomically (answered SubmissionFailedWithoutEffect)
                   pure (Right (SubmittedNothing (Text.pack (displayException exception))))
             Left failure@(ExceptionWithContext _ exception) → do
-              reason ← ("vkQueueSubmit2 raised, so whether it submitted is unknown: " <>) <$> diagnosisOf exception
-              atomically . stageRootsFailure roots $ do
-                answered SubmissionEffectUncertain
+              (described, pending) ← diagnosisOf exception
+              let reason = "vkQueueSubmit2 raised, so whether it submitted is unknown: " <> described
+              atomically $ do
                 edit (\entry → entry {framelessFenceState = FenceUncertain reason})
-                failRootsSessionBecause roots UnknownSubmissionEffect (Text.pack (show batch) <> ": " <> reason)
+                failSubmission roots (FailedFrameless batch) SubmissionEffectUncertain UnknownSubmissionEffect (Text.pack (show batch) <> ": " <> reason)
+              deliverAfterRecord failure pending
               case fromException exception ∷ Maybe GraphicsDeviceLost of
                 Just _ → rethrowIO failure
                 Nothing → throwIO (FramelessEffectUncertain batch reason)
@@ -361,10 +371,9 @@ submitFrameless frames batch =
       case committed of
         Nothing → do
           let reason = "the model refused to record a frame-less submission the queue accepted"
-          atomically . stageRootsFailure roots $ do
-            answered SubmissionEffectUncertain
+          atomically $ do
             modifyTVar' (framesFrameless frames) (Map.adjust (\entry → entry {framelessFenceState = FenceUncertain reason}) slot)
-            failRootsSessionBecause roots UnknownSubmissionEffect (Text.pack (show batch) <> ": " <> reason)
+            failSubmission roots (FailedFrameless batch) SubmissionEffectUncertain UnknownSubmissionEffect (Text.pack (show batch) <> ": " <> reason)
           throwIO (FramelessEffectUncertain batch reason)
         Just submission → do
           -- The model has consumed the batch, so this cannot be refused.
@@ -413,10 +422,12 @@ retireFrameless frames = owner (framesRecording frames) $ do
         tryWithContext @SomeException (rootsCall roots "vkDestroyFence" (opsDestroyFence ops handle (framelessFence sync))) >>= \case
           Right () → [] <$ atomically (modifyTVar' (framesFrameless frames) (Map.delete slot))
           Left failure@(ExceptionWithContext _ exception) → do
-            reason ← (("destroying the fence of frame-less slot " <> Text.pack (show slot) <> " raised: ") <>) <$> diagnosisOf exception
+            (described, pending) ← diagnosisOf exception
+            let reason = "destroying the fence of frame-less slot " <> Text.pack (show slot) <> " raised: " <> described
             atomically $ do
               modifyTVar' (framesFrameless frames) (Map.adjust (\entry → entry {framelessFenceState = FenceUncertain reason, framelessDestruction = Just reason}) slot)
               failRootsSessionBecause roots CleanupFailed reason
+            deliverAfterRecord failure pending
             pure [failure]
       _ → pure []
     idle lost sync
