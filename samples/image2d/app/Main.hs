@@ -52,6 +52,7 @@ import Hetoimasia.GLFW.Window (WindowConfig (..), WindowId, defaultWindowConfig)
 import Hetoimasia.GPU.Model.Identity (TargetClass (..))
 import Hetoimasia.GPU.Model.Budget (BudgetRequest (..), defaultBudgetRequest, validateBudgets)
 import Hetoimasia.GPU.Vulkan.Diagnostics (CaptureConfig (..), DiagnosticVerdict, defaultCaptureConfig, verdictIssues)
+import Hetoimasia.Foundation.OwnerTx (commit)
 import Hetoimasia.GPU.Vulkan.GLFW
   ( ActionOutcome (..)
   , BufferDescription (..)
@@ -100,9 +101,9 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , registerConstructedTexture
   , releaseConstructed
   , releaseConstructedTexture
-  , requestVulkanRelease
+  , requestVulkanReleaseTx
   , runVulkanOwnerLoop
-  , submitVulkanAction
+  , submitVulkanActionTx
   , submitVulkanUpload
   , swapConstructedTexture
   , validateUploadConfig
@@ -360,7 +361,7 @@ hostOf vulkan =
   where
     act ∷ Text → VulkanAction (Either Refusal a) → IO (Either Text a)
     act what action =
-      atomically (submitVulkanAction vulkan action) >>= \case
+      commit (submitVulkanActionTx vulkan action) >>= \case
         Left refusal → pure (Left (what <> " was refused: " <> tshow refusal))
         Right ticket →
           atomically (awaitVulkanAction ticket) >>= \case
@@ -384,11 +385,11 @@ windowHostOf windowDepth vulkan =
           WindowSceneClosed _ → pure HostClosed
           WindowScenesNotEnabled _ → pure HostSharedScenes
     , hostRequestRelease = \body →
-        atomically (requestVulkanRelease vulkan (VulkanAction (body . renderBuildersOf))) >>= \case
+        commit (requestVulkanReleaseTx vulkan (VulkanAction (body . renderBuildersOf))) >>= \case
           Left refusal → pure (Left (tshow refusal))
           Right _ → pure (Right ())
     , hostRunOnOwner = \body →
-        atomically (submitVulkanAction vulkan (VulkanAction (body . renderBuildersOf))) >>= \case
+        commit (submitVulkanActionTx vulkan (VulkanAction (body . renderBuildersOf))) >>= \case
           Left refusal → pure (Left (tshow refusal))
           Right _ → pure (Right ())
     , hostWindowDepth = windowDepth

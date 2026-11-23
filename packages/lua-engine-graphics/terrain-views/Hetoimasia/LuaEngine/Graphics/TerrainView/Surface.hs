@@ -17,6 +17,7 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView.Surface
   , AuthorityMark (..)
   , authorityMarks
   , surfaceAuthorityMarks
+  , surfaceAuthorities
   , ViewGeometry (..)
   , geometryOfMetrics
   , windowGeometryOf
@@ -125,6 +126,12 @@ authorityMarks = mapM $ \case
   LeaseAuthority liveness → uncurry LeaseMark <$> watchPublication liveness
   HeldAuthority token → AdmissionMark <$> tokenOpen token
   AuthorityEnded → pure EndedMark
+
+-- | The caller's original authority over the target: a window's leases.
+surfaceAuthorities ∷ ViewSurface → [Authority]
+surfaceAuthorities = \case
+  WindowSurface _ _ _ leases → leases
+  _ → []
 
 -- | The marks of the caller's original authority over the target: a window's leases. Another target's authority is a
 -- fact of its facts, whose version 'surfaceVersion' carries.

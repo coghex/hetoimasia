@@ -17,6 +17,7 @@
 -- recording's readback. Pixel semantics for Lua-authored output are LFE-24's.
 module Test.LuaEngine.Graphics.Native.Targets (spec) where
 
+import Hetoimasia.Foundation.OwnerTx (commit)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar, tryPutMVar)
 import Control.Exception (finally)
 import Control.Concurrent.STM (atomically, check, modifyTVar', retry)
@@ -36,12 +37,12 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , VulkanSceneState (..)
   , WindowSceneStanding (..)
   , awaitVulkanAction
-  , publishVulkanTargetScene
+  , publishVulkanTargetSceneTx
   , readVulkanSceneState
   , recordVulkanTargetBatch
-  , registerVulkanSceneTarget
-  , submitVulkanAction
-  , unregisterVulkanSceneTarget
+  , registerVulkanSceneTargetTx
+  , submitVulkanActionTx
+  , unregisterVulkanSceneTargetTx
   )
 import Hetoimasia.LuaEngine.Graphics.Scene
 import Hetoimasia.LuaEngine.Graphics.Texture
@@ -63,25 +64,25 @@ spec env = describe "an offscreen scene target on a real device (LFE-27)" $
       identity ← load comp vm "a" "k" "tiny.png"
       decoded ← decoded' (Png.asymmetric 8 4)
       atomically (hostWindowIdentities (vulkanWindowHost host)) `shouldReturn` []
-      target ← atomically (registerVulkanSceneTarget host) >>= either (\refusal → assertFailure ("the target was refused: " <> show refusal)) pure
+      target ← commit (registerVulkanSceneTargetTx host) >>= either (\refusal → assertFailure ("the target was refused: " <> show refusal)) pure
       -- The owner's gate and the target are released however the example ends — an assertion, the example's own
       -- timeout — before the surrounding composition drains: otherwise a failure leaves the owner blocked and the
       -- target holding the texture, and the drain waits for work that cannot finish.
       entered ← newEmptyMVar
       proceed ← newEmptyMVar
       let release = void (tryPutMVar proceed ())
-          cleanup = release >> void (atomically (unregisterVulkanSceneTarget host target))
+          cleanup = release >> void (commit (unregisterVulkanSceneTargetTx host target))
       flip finally cleanup $ do
         -- The owner adopts the initial scene as revision 0 on its own.
         awaitTarget host target ((== Just 0) . windowAdopted)
         -- Hold the owner inside an action, until the example lets it go.
         gate ←
-          atomically (submitVulkanAction host (VulkanAction (\_ → putMVar entered () >> takeMVar proceed)))
+          commit (submitVulkanActionTx host (VulkanAction (\_ → putMVar entered () >> takeMVar proceed)))
             >>= either (\refusal → assertFailure ("the holding action was refused: " <> show refusal)) pure
         takeMVar entered
         -- The target accepts a scene naming the texture, which the owner has not adopted.
         scene ← prepare (initialGraphicsScene {graphicsReferences = Set.singleton (fromIntegral identity)})
-        accepted ← atomically (publishVulkanTargetScene host target scene)
+        accepted ← commit (publishVulkanTargetSceneTx host target scene)
         accepted `shouldBe` TargetScenePublished target 1
         held ← atomically (readVulkanSceneState host)
         (windowPublished <$> Map.lookup (KeyOffscreen target) (sceneWindows held), windowAdopted <$> Map.lookup (KeyOffscreen target) (sceneWindows held)) `shouldBe` (Just (Just 1), Just (Just 0))
@@ -107,7 +108,7 @@ spec env = describe "an offscreen scene target on a real device (LFE-27)" $
           shootWith
             host
             (recordBound host target)
-            (void (atomically (publishVulkanTargetScene host target empty)))
+            (void (commit (publishVulkanTargetSceneTx host target empty)))
             (graphicsRenderer (envGraphics env))
             (textureHandleOf (fromIntegral identity))
             decoded
@@ -127,7 +128,7 @@ spec env = describe "an offscreen scene target on a real device (LFE-27)" $
           check (all (null . windowAwaitingRelease) (Map.elems (sceneWindows state)))
         final ← atomically (ledgerReading ledger)
         readingDefects final `shouldBe` 0
-        ended ← atomically (unregisterVulkanSceneTarget host target)
+        ended ← commit (unregisterVulkanSceneTargetTx host target)
         ended `shouldBe` True
         atomically (hostWindowIdentities (vulkanWindowHost host)) `shouldReturn` []
         evidence env ("an offscreen scene target: the texture released straight after acceptance and before adoption was retained, drawn after the Lua release (" <> tshow (shotDeterminate shot) <> " pixels judged), and freed after the recording completed; no window opened")

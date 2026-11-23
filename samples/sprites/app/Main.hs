@@ -46,6 +46,7 @@ import Hetoimasia.GLFW.Window (WindowConfig (..), defaultWindowConfig)
 import Hetoimasia.GPU.Model.Budget (BudgetRequest (..), defaultBudgetRequest, validateBudgets)
 import Hetoimasia.GPU.Model.Identity (TargetClass (..))
 import Hetoimasia.GPU.Vulkan.Diagnostics (CaptureConfig (..), DiagnosticVerdict, defaultCaptureConfig, verdictIssues)
+import Hetoimasia.Foundation.OwnerTx (commit)
 import Hetoimasia.GPU.Vulkan.GLFW
   ( ActionOutcome (..)
   , Construction
@@ -80,7 +81,7 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , registerConstructedTexture
   , swapConstructedTexture
   , runVulkanOwnerLoop
-  , submitVulkanAction
+  , submitVulkanActionTx
   , submitVulkanUpload
   , validateUploadConfig
   , vulkanHostConfig
@@ -288,7 +289,7 @@ hostOf vulkan =
   where
     act ∷ Text → VulkanAction (Either Refusal a) → IO (Either Text a)
     act what action =
-      atomically (submitVulkanAction vulkan action) >>= \case
+      commit (submitVulkanActionTx vulkan action) >>= \case
         Left refusal → pure (Left (what <> " was refused: " <> tshow refusal))
         Right ticket →
           atomically (awaitVulkanAction ticket) >>= \case

@@ -104,7 +104,9 @@ import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Encoding
 import Data.Word (Word64)
 import Hetoimasia.Foundation.Messaging.Payload (Prepared, prepare)
-import Hetoimasia.GPU.Vulkan.GLFW (OffscreenTargetId, SceneTargetKey (KeyWindow), TargetScenePublication (..), TextureHandle (..), VulkanHost, WindowScenePublication (..), publishVulkanTargetScene)
+import Hetoimasia.GPU.Vulkan.GLFW (OffscreenTargetId, SceneTargetKey (KeyWindow), TargetScenePublication (..), TextureHandle (..), VulkanHost, WindowScenePublication (..))
+-- the LFE-27 publisher runs the offscreen publication inside its own transaction
+import Hetoimasia.GPU.Vulkan.GLFW.RawWrites (publishVulkanTargetScene)
 import Hetoimasia.LuaEngine.Graphics.Scene.Claims (SceneClaims, claimOf)
 import Hetoimasia.LuaEngine.Graphics.Scene.Ledger (GraphicsScene, graphicsScene)
 import Hetoimasia.LuaEngine.Graphics.Texture.Port (TextureRef (..), textureRefOf)

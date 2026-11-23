@@ -132,6 +132,7 @@ module Test.GPU.Vulkan.Native.SurfaceFree
   , animationSpec
   ) where
 
+import Hetoimasia.Foundation.OwnerTx (commit)
 import Control.Concurrent (ThreadId, myThreadId, threadDelay)
 import Control.Concurrent.STM (STM, TVar, atomically, check, modifyTVar', newTVarIO, orElse, readTVar, readTVarIO, registerDelay, retry)
 import Control.Exception (SomeException, displayException, throwIO, try)
@@ -226,7 +227,7 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , runVulkanOwnerLoop
   , setScissor
   , setViewport
-  , submitVulkanAction
+  , submitVulkanActionTx
   , transitionResource
   , vulkanHostConfig
   , withVulkanOwnerHost
@@ -285,7 +286,7 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , beginRenderingWithDepth
   , clearDepthRect
   , depthTested
-  , requestVulkanRelease
+  , requestVulkanReleaseTx
   )
 import Hetoimasia.GPU.Vulkan.Native.Presentation (formatB8G8R8A8Srgb)
 import Hetoimasia.GPU.Vulkan.Native.Recording.ShaderInterfaces (tableSamplerOffset)
@@ -1781,7 +1782,7 @@ scene3dHost vulkan =
     deadline = either (error . show) id (durationFromNanoseconds AllowZero 30000000000)
     acting ∷ Text → VulkanAction (Either Refusal a) → IO (Either Text a)
     acting what action =
-      atomically (submitVulkanAction vulkan action) >>= \case
+      commit (submitVulkanActionTx vulkan action) >>= \case
         Left refusal → pure (Left (what <> " was refused: " <> tshow refusal))
         Right ticket →
           atomically (awaitVulkanAction ticket) >>= \case
@@ -1841,7 +1842,7 @@ spritesHost vulkan =
     deadline = either (error . show) id (durationFromNanoseconds AllowZero 30000000000)
     acting ∷ Text → VulkanAction (Either Refusal a) → IO (Either Text a)
     acting what action =
-      atomically (submitVulkanAction vulkan action) >>= \case
+      commit (submitVulkanActionTx vulkan action) >>= \case
         Left refusal → pure (Left (what <> " was refused: " <> tshow refusal))
         Right ticket →
           atomically (awaitVulkanAction ticket) >>= \case
@@ -2067,11 +2068,11 @@ retainedHost vulkan =
     { RetainedPath.retainedBase = orderedHost vulkan
     , RetainedPath.retainedUploads = uploads
     , RetainedPath.retainedRequestRelease = \body →
-        atomically (requestVulkanRelease vulkan (VulkanAction (body . RetainedPath.buildersWith uploads))) >>= \case
+        commit (requestVulkanReleaseTx vulkan (VulkanAction (body . RetainedPath.buildersWith uploads))) >>= \case
           Left refusal → pure (Left (tshow refusal))
           Right _ → pure (Right ())
     , RetainedPath.retainedRunOnOwner = \body →
-        atomically (submitVulkanAction vulkan (VulkanAction (body . RetainedPath.buildersWith uploads))) >>= \case
+        commit (submitVulkanActionTx vulkan (VulkanAction (body . RetainedPath.buildersWith uploads))) >>= \case
           Left refusal → pure (Left (tshow refusal))
           Right _ → pure (Right ())
     }
@@ -2117,7 +2118,7 @@ orderedHost vulkan =
     deadline = either (error . show) id (durationFromNanoseconds AllowZero 30000000000)
     acting ∷ Text → VulkanAction (Either Refusal a) → IO (Either Text a)
     acting what action =
-      atomically (submitVulkanAction vulkan action) >>= \case
+      commit (submitVulkanActionTx vulkan action) >>= \case
         Left refusal → pure (Left (what <> " was refused: " <> tshow refusal))
         Right ticket →
           atomically (awaitVulkanAction ticket) >>= \case
@@ -2303,7 +2304,7 @@ actOnDevice vulkan = do
 -- | Submit an owner-thread action and wait for its outcome.
 act ∷ VulkanHost () → VulkanAction r → IO (ActionOutcome r)
 act host action =
-  atomically (submitVulkanAction host action) >>= \case
+  commit (submitVulkanActionTx host action) >>= \case
     Left refusal → stopWith ("an action was refused: " <> tshow refusal)
     Right ticket → atomically (awaitVulkanAction ticket)
 

@@ -85,11 +85,11 @@ module Hetoimasia.GPU.Vulkan.Native.Uploads
   , ownedUploadAccess
   , OwnerAdmission
   , newOwnerAdmissionIO
-  , setOwnerAdmission
+  , setOwnerAdmissionTx
   , readOwnerAdmission
   , UploadsCell
   , newUploadsCellIO
-  , setUploadsStanding
+  , setUploadsStandingTx
   , readUploadsStanding
   , accessGate
   , accessRoom

@@ -76,6 +76,7 @@ import Control.Exception (Exception)
 import Control.Monad (when)
 import Data.Text (Text)
 import Data.Word (Word64)
+import Hetoimasia.Foundation.Messaging.Payload (Prepared, preparedValue)
 import Hetoimasia.Foundation.OwnerTx (OwnerTx)
 import Hetoimasia.Foundation.OwnerTx.Issuer (fromIssuerSTM)
 
@@ -120,13 +121,14 @@ accountRelease account amount = do
 
 -- | 'accountReserve' as an ownership operation, for a holder composing the charge with its own facts in one
 -- 'Hetoimasia.Foundation.OwnerTx.commit'.
-accountReserveTx ∷ RenderAccount → Word64 → OwnerTx Bool
-accountReserveTx account wanted = fromIssuerSTM (accountReserve account wanted)
+accountReserveTx ∷ RenderAccount → Prepared Word64 → OwnerTx Bool
+accountReserveTx account wanted = fromIssuerSTM (accountReserve account (preparedValue wanted))
 
 -- | 'accountRelease' as an ownership operation: a return past what the account holds is answered as the defect and
 -- changes nothing, for the holder to raise once its commit is over.
-accountReleaseTx ∷ RenderAccount → Word64 → OwnerTx (Either AccountDefect ())
-accountReleaseTx account amount = fromIssuerSTM $ do
+accountReleaseTx ∷ RenderAccount → Prepared Word64 → OwnerTx (Either AccountDefect ())
+accountReleaseTx account prepared = fromIssuerSTM $ do
+  let amount = preparedValue prepared
   held ← readTVar (accountHeld account)
   if amount > held
     then pure (Left (AccountDefect "bytes were returned that the account did not hold"))

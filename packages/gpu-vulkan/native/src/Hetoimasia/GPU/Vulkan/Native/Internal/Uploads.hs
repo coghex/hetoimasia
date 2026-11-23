@@ -90,10 +90,12 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Uploads
   , OwnerAdmission
   , newOwnerAdmissionIO
   , setOwnerAdmission
+  , setOwnerAdmissionTx
   , readOwnerAdmission
   , UploadsCell
   , newUploadsCellIO
   , setUploadsStanding
+  , setUploadsStandingTx
   , readUploadsStanding
   , accessGate
   , accessRoom
@@ -108,6 +110,7 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Uploads
   ) where
 
 import Hetoimasia.Foundation.Exit (Exit (Completed), IssuerStanding (..), classifyExit, deliverExit)
+import Hetoimasia.Foundation.Messaging.Payload (Prepared, preparedValue)
 import Hetoimasia.Foundation.OwnerTx (OwnerTx)
 import Hetoimasia.Foundation.OwnerTx.Issuer (fromIssuerSTM)
 import Control.Concurrent (ThreadId, myThreadId)
@@ -485,7 +488,10 @@ submitWith
   → Maybe UploadGrant
   → UploadRequest
   → IO (Either UploadRefusal UploadTicket)
-submitWith gate uploads grant request = mask $ \restore →
+submitWith gate uploads grant given = mask $ \restore → do
+  -- the caller's request is evaluated in full first, before the gate or any commit: every level's bytes (a request that
+  -- raises here takes nothing)
+  request ← restore (evaluate (requestForced given))
   -- the gate, before anything is taken: its refusal, exception or cancellation leaves everything as it was
   restore (atomically (asked gate) >>= forced) >>= \case
     Left refusal → pure (Left refusal)
@@ -515,6 +521,9 @@ submitWith gate uploads grant request = mask $ \restore →
             Completed queuedTicket → pure (Right queuedTicket)
             exit → atomically (forgetAdmitting uploads number) >> deliverExit exit
   where
+    requestForced request = case request of
+      UploadImage _ levels → foldr seq () levels `seq` request
+      UploadBuffer _ _ → request
     asked ask = ask `orElse` pure (Left UploadGateBusy)
     -- a gate's answer evaluated where its exception is owned: the answer and the permit it carries
     forced answer = evaluate answer >>= either (pure . Left) (fmap Right . evaluate)
@@ -1327,6 +1336,10 @@ newOwnerAdmissionIO token = token `seq` (OwnerAdmission <$> newTVarIO token)
 setOwnerAdmission ∷ OwnerAdmission → AdmissionToken → STM ()
 setOwnerAdmission (OwnerAdmission cell) token = token `seq` writeTVar cell token
 
+-- | 'setOwnerAdmission' as an ownership operation: the cross-package writer of the cell.
+setOwnerAdmissionTx ∷ OwnerAdmission → AdmissionToken → OwnerTx ()
+setOwnerAdmissionTx cell token = fromIssuerSTM (setOwnerAdmission cell token)
+
 -- | The token recorded now.
 readOwnerAdmission ∷ OwnerAdmission → STM AdmissionToken
 readOwnerAdmission (OwnerAdmission cell) = readTVar cell
@@ -1342,6 +1355,10 @@ newUploadsCellIO standing = standing `seq` (UploadsCell <$> newTVarIO standing)
 -- | Record the uploads' standing now: evaluated before it is installed.
 setUploadsStanding ∷ UploadsCell q inst msgr phys dev cmd → UploadsStanding q inst msgr phys dev cmd → STM ()
 setUploadsStanding (UploadsCell cell) standing = standing `seq` writeTVar cell standing
+
+-- | 'setUploadsStanding' as an ownership operation: the cross-package writer of the cell.
+setUploadsStandingTx ∷ UploadsCell q inst msgr phys dev cmd → UploadsStanding q inst msgr phys dev cmd → OwnerTx ()
+setUploadsStandingTx cell standing = fromIssuerSTM (setUploadsStanding cell standing)
 
 -- | The standing recorded now.
 readUploadsStanding ∷ UploadsCell q inst msgr phys dev cmd → STM (UploadsStanding q inst msgr phys dev cmd)
@@ -1451,8 +1468,8 @@ for' held action = maybe (pure ()) action held
 -- never waits or raises.
 
 -- | 'reserveUpload' in a commit.
-reserveUploadTx ∷ Uploads q inst msgr phys dev cmd → Natural → OwnerTx (Either UploadRefusal UploadGrant)
-reserveUploadTx uploads bytes = fromIssuerSTM (reserveUpload uploads bytes)
+reserveUploadTx ∷ Uploads q inst msgr phys dev cmd → Prepared Natural → OwnerTx (Either UploadRefusal UploadGrant)
+reserveUploadTx uploads bytes = fromIssuerSTM (reserveUpload uploads (preparedValue bytes))
 
 -- | 'returnUploadGrant' in a commit.
 returnUploadGrantTx ∷ UploadGrant → OwnerTx ()
@@ -1463,5 +1480,5 @@ abandonUploadGrantTx ∷ Uploads q inst msgr phys dev cmd → UploadGrant → Ow
 abandonUploadGrantTx uploads grant = fromIssuerSTM (abandonUploadGrant uploads grant)
 
 -- | 'accessReserve' in a commit.
-accessReserveTx ∷ UploadAccess → Natural → OwnerTx (Either (Either UploadsUnavailable UploadRefusal) UploadGrant)
-accessReserveTx access bytes = fromIssuerSTM (accessReserve access bytes)
+accessReserveTx ∷ UploadAccess → Prepared Natural → OwnerTx (Either (Either UploadsUnavailable UploadRefusal) UploadGrant)
+accessReserveTx access bytes = fromIssuerSTM (accessReserve access (preparedValue bytes))

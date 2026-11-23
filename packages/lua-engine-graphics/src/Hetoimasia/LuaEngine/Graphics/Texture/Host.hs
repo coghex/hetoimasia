@@ -94,14 +94,16 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , registerConstructedTexture
   , releaseConstructed
   , releaseConstructedTexture
-  , requestVulkanRelease
-  , submitVulkanAction
+  , submitVulkanActionTx
   , submitVulkanUpload
   , vulkanUploadAccess
   , swapConstructedTexture
   , awaitVulkanAction
   )
 import Hetoimasia.GPU.Vulkan.GLFW (Image, SceneTargetKey)
+-- the port's admissions run inside the texture pipeline's own transactions
+import Hetoimasia.GPU.Vulkan.GLFW.RawWrites (requestVulkanRelease, submitVulkanAction)
+import Hetoimasia.Foundation.OwnerTx (commit)
 import Hetoimasia.LuaEngine.Graphics.Scene.Ledger (SceneLedger, ledgerHeld)
 import Hetoimasia.Render.TwoD.Vulkan.Chunks (Retained, newRetained)
 import Hetoimasia.LuaEngine.Graphics.Texture.Port
@@ -196,7 +198,7 @@ bootstrapHost configuration ledger host = do
   case readiness of
     RootsFailed why → pure (Left (OwnerStartupFailed why))
     _ → do
-      submitted ← atomically (submitVulkanAction host action)
+      submitted ← commit (submitVulkanActionTx host action)
       case submitted of
         Left refusal → pure (Left (BootstrapNotRun (Text.pack (show refusal))))
         Right ticket →

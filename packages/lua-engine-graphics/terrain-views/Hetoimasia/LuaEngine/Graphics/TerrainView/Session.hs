@@ -634,10 +634,10 @@ withTerrainViews config ports body = do
         reserved ←
           if allowance > toInteger (maxBound ∷ Word64)
             then pure False
-            else commit (accountReserveTx account (fromInteger allowance))
+            else prepare (fromInteger allowance ∷ Word64) >>= commit . accountReserveTx account
         unless reserved $ throwIO (TerrainViewsAccount allowance (-1))
       -- a return past what the account holds is its defect, raised once the commit is over
-      release = commit (accountReleaseTx account (fromInteger allowance)) >>= either throwIO pure
+      release = prepare (fromInteger allowance ∷ Word64) >>= commit . accountReleaseTx account >>= either throwIO pure
   withResourceLabelled "terrain views: the account reservation" reserve (\() → release) $ \() → do
     service ← newService config ports allowance
     mask $ \restore → do
@@ -1110,13 +1110,17 @@ openView service request = mask_ $ do
         then pure (Left OpenNoDepth)
         else case newCamera (tvCamera (svConfig service)) x y z of
           Left why → pure (Left (OpenCamera why))
-          Right camera →
+          Right camera → do
+            -- the caller's authority lists are evaluated in full here, before anything is acquired or committed: a list
+            -- that raises leaves everything as it was (the style's, once acquired, releases it first)
+            _ ← evaluate (spineOf (surfaceAuthorities (vtSurface target)))
             -- masked: the style is recorded (its release attached) in the handoff that acquires it; only its own
             -- interruptible waits can be interrupted
             openStyle request >>= \case
               Left why → pure (Left (OpenStyle why))
               Right style → do
                 let undo = styleRelease style
+                _ ← evaluate (spineOf (styleAuthority style)) `onException` undo
                 cell ← atomically (Runtime.arenaMarkSTM (portTerrain ports) (openLease request)) `onException` undo
                 case cell of
                   Left why → undo >> pure (Left (OpenArena why))
@@ -1128,6 +1132,10 @@ openView service request = mask_ $ do
                       Right vs → do
                         commit (kick service)
                         pure (Right (TerrainView service vs))
+
+-- Every element of a list evaluated, and the list's spine: an authority's own fields are strict.
+spineOf ∷ [a] → ()
+spineOf = foldr seq ()
 
 newViewState ∷ TerrainViews k → OpenRequest k → ViewStyle → Runtime.View → STM (Maybe ArenaMark) → CameraState → STM (ViewState k)
 newViewState service request style rview markCell camera = do

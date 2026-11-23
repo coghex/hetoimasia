@@ -118,7 +118,6 @@ module Hetoimasia.GPU.Vulkan.GLFW
   , WindowScenePublication (..)
   , SceneLifecycle (..)
   , noSceneLifecycle
-  , requestVulkanRelease
   , readVulkanSceneState
   , readVulkanActionAdmission
   , readVulkanReleaseAdmission
@@ -129,11 +128,7 @@ module Hetoimasia.GPU.Vulkan.GLFW
   , SceneTargetKey (..)
   , OffscreenTargetId
   , SceneTargetRefusal (..)
-  , registerVulkanSceneTarget
-  , unregisterVulkanSceneTarget
-  , publishVulkanTargetScene
   , vulkanTargetSceneAccepts
-  , publishVulkanTargetSceneUnlessShown
   , TargetScenePublication (..)
   , recordVulkanTargetBatch
   , TargetBatchRefusal (..)
@@ -306,7 +301,6 @@ module Hetoimasia.GPU.Vulkan.GLFW
 
     -- * Owner-thread actions (GRS-15)
   , VulkanAction (..)
-  , submitVulkanAction
   , ActionRefusal (..)
   , ActionTicket
   , readVulkanAction
@@ -378,11 +372,17 @@ module Hetoimasia.GPU.Vulkan.GLFW
 
     -- * Ownership operations
     -- $ownership
+    --
+    -- The host's writes are these: its admissions, release requests, offscreen targets and their scene publications.
+    -- The transactions they embed are not exported here; the two compositions outside terrain that run some of them
+    -- in a transaction of their own reach them through the @raw-writes@ unit.
   , submitVulkanActionTx
   , requestVulkanReleaseTx
   , publishVulkanTargetSceneTx
   , vulkanTargetSceneAcceptsTx
   , publishVulkanTargetSceneUnlessShownTx
+  , registerVulkanSceneTargetTx
+  , unregisterVulkanSceneTargetTx
   , readVulkanActionTx
   , readVulkanActionExitTx
   , readVulkanActionGateTx
@@ -702,7 +702,7 @@ vulkanUploadRoom host = Controller.vulkanUploadRoom (vulkanController host)
 
 -- | Reserve, in the caller's transaction, the queue place and staging region an upload of this many bytes needs,
 -- before the vertex buffer it fills is made: held for every other upload until spent or abandoned.
-reserveVulkanUpload ∷ VulkanHost scene → Natural → OwnerTx (Either VulkanUploadRefusal UploadGrant)
+reserveVulkanUpload ∷ VulkanHost scene → Prepared Natural → OwnerTx (Either VulkanUploadRefusal UploadGrant)
 reserveVulkanUpload host = Controller.reserveVulkanUpload (vulkanController host)
 
 -- | Spend a reservation on the upload that fills a fresh vertex buffer of exactly its bytes. A refusal before binding
@@ -761,6 +761,14 @@ vulkanTargetSceneAcceptsTx host target = fromIssuerSTM (vulkanTargetSceneAccepts
 -- target already shows a scene.
 publishVulkanTargetSceneUnlessShownTx ∷ VulkanHost scene → OffscreenTargetId → Prepared scene → OwnerTx (Maybe TargetScenePublication)
 publishVulkanTargetSceneUnlessShownTx host target scene = fromIssuerSTM (publishVulkanTargetSceneUnlessShown host target scene)
+
+-- | 'registerVulkanSceneTarget' in a commit: a new offscreen target of the running host, or the gate's refusal.
+registerVulkanSceneTargetTx ∷ VulkanHost scene → OwnerTx (Either SceneTargetRefusal OffscreenTargetId)
+registerVulkanSceneTargetTx host = fromIssuerSTM (registerVulkanSceneTarget host)
+
+-- | 'unregisterVulkanSceneTarget' in a commit: answers whether it was registered.
+unregisterVulkanSceneTargetTx ∷ VulkanHost scene → OffscreenTargetId → OwnerTx Bool
+unregisterVulkanSceneTargetTx host target = fromIssuerSTM (unregisterVulkanSceneTarget host target)
 
 -- | 'readVulkanActionExit' in a commit: read-only.
 readVulkanActionExitTx ∷ ActionTicket r → OwnerTx (Maybe (Exit ActionRefusal r, Text))

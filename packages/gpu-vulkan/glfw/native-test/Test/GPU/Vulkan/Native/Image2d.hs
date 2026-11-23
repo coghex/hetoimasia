@@ -45,6 +45,7 @@ module Test.GPU.Vulkan.Native.Image2d
   , spec
   ) where
 
+import Hetoimasia.Foundation.OwnerTx (commit)
 import Control.Concurrent (ThreadId, myThreadId)
 import Control.Concurrent.STM (STM, atomically, check, modifyTVar', newTVarIO, orElse, readTVar, readTVarIO, registerDelay, retry, writeTVar)
 import Control.Exception (SomeException, displayException, throwIO, try)
@@ -131,9 +132,9 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , registerConstructedTexture
   , releaseConstructed
   , releaseConstructedTexture
-  , requestVulkanRelease
+  , requestVulkanReleaseTx
   , runVulkanOwnerLoop
-  , submitVulkanAction
+  , submitVulkanActionTx
   , submitVulkanUpload
   , swapConstructedTexture
   , validateUploadConfig
@@ -515,11 +516,11 @@ windowHostOf depth vulkan keep watched =
           WindowSceneClosed _ → pure HostClosed
           WindowScenesNotEnabled _ → pure HostSharedScenes
     , hostRequestRelease = \body →
-        atomically (requestVulkanRelease vulkan (VulkanAction (logged body))) >>= \case
+        commit (requestVulkanReleaseTx vulkan (VulkanAction (logged body))) >>= \case
           Left refusal → pure (Left (tshow refusal))
           Right _ → pure (Right ())
     , hostRunOnOwner = \body →
-        atomically (submitVulkanAction vulkan (VulkanAction (logged body))) >>= \case
+        commit (submitVulkanActionTx vulkan (VulkanAction (logged body))) >>= \case
           Left refusal → pure (Left (tshow refusal))
           Right _ → pure (Right ())
     , hostWindowDepth = depth
@@ -607,7 +608,7 @@ hostOf vulkan =
   where
     act ∷ Text → VulkanAction (Either Refusal a) → IO (Either Text a)
     act what action =
-      atomically (submitVulkanAction vulkan action) >>= \case
+      commit (submitVulkanActionTx vulkan action) >>= \case
         Left refusal → pure (Left (what <> " was refused: " <> tshow refusal))
         Right ticket →
           atomically (awaitVulkanAction ticket) >>= \case

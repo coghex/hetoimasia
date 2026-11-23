@@ -492,7 +492,7 @@ import Hetoimasia.GPU.Vulkan.Native.Uploads
   , OwnerAdmission
   , newOwnerAdmissionIO
   , readOwnerAdmission
-  , setOwnerAdmission
+  , setOwnerAdmissionTx
   , UploadConfig
   , UploadGate
   , UploadRefusal
@@ -531,7 +531,8 @@ import Hetoimasia.GPU.Vulkan.Native.Presentation (SurfaceExtent (..))
 import qualified Hetoimasia.GPU.Vulkan.Native.Presentation as Presentation
 import Hetoimasia.GPU.Vulkan.Native.Profile (InstancePlan (..), InstanceRequest (..), TargetRejection (..), ValidationChoice (..), ValidationFeature, ValidationResolution)
 import Hetoimasia.Foundation.Exit (Exit, IssuerStanding (..))
-import Hetoimasia.Foundation.OwnerTx (OwnerTx)
+import Hetoimasia.Foundation.OwnerTx (OwnerTx, commit)
+import Hetoimasia.Foundation.OwnerTx.Issuer (fromIssuerSTM)
 import Hetoimasia.GPU.Vulkan.Native.Roots
   ( DiagnosticAlarm (..)
   , GenerationOps (..)
@@ -1357,7 +1358,7 @@ vulkanUploadRoom (VulkanController state) bytes =
 -- an upload of this many bytes needs, under the owner's gate: shared with
 -- every other upload, and held until spent ('submitVulkanGranted') or
 -- abandoned. A refusal reserves nothing.
-reserveVulkanUpload ∷ VulkanController → Natural → OwnerTx (Either VulkanUploadRefusal UploadGrant)
+reserveVulkanUpload ∷ VulkanController → Prepared Natural → OwnerTx (Either VulkanUploadRefusal UploadGrant)
 reserveVulkanUpload (VulkanController state) bytes =
   either (Left . either VulkanUploadsUnavailable VulkanUploadRefused) Right
     <$> reserveRenderingUpload (stateUploadAccess state) bytes
@@ -2920,21 +2921,23 @@ withVulkanOwnerHostHooked hooks capturing logger layer rendering pointer bridge 
           -- From now on the owner can wake the main thread when it asks for a
           -- replacement surface, and an owner-thread action is admitted only
           -- while the owner's own admission is open.
-          atomically $ do
-            writeTVar (stateHostWake state) (wakeGraphicsHost graphics)
-            -- the admission before the owner closes in the transaction that hands over to the owner's own
-            closeAdmission (statePreOwner state)
-            setOwnerAdmission (stateOwnerOpen state) (targetAdmission (ownerHandoff graphics))
+          commit $ do
+            fromIssuerSTM $ do
+              writeTVar (stateHostWake state) (wakeGraphicsHost graphics)
+              -- the admission before the owner closes in the commit that hands over to the owner's own
+              closeAdmission (statePreOwner state)
+            setOwnerAdmissionTx (stateOwnerOpen state) (targetAdmission (ownerHandoff graphics))
             -- A release request is held to the scenes the owner holds for the
             -- windows the host holds, and its hook is the host's own.
-            installSceneSource
-              (stateScenes state)
-              SceneSource
-                { sourceMode = vulkanSceneMode config
-                , sourceHeld = (\held offscreen → map KeyWindow held <> offscreen) <$> hostWindowIdentities windows <*> targetsHeld targets
-                , sourceRevisions = Map.union . Map.mapKeysMonotonic KeyWindow <$> readGraphicsSceneRevisions graphics <*> targetsRevisions targets
-                }
-            writeTVar (stateSceneReleased state) (sceneReleased (vulkanSceneLifecycle config))
+            fromIssuerSTM $ do
+              installSceneSource
+                (stateScenes state)
+                SceneSource
+                  { sourceMode = vulkanSceneMode config
+                  , sourceHeld = (\held offscreen → map KeyWindow held <> offscreen) <$> hostWindowIdentities windows <*> targetsHeld targets
+                  , sourceRevisions = Map.union . Map.mapKeysMonotonic KeyWindow <$> readGraphicsSceneRevisions graphics <*> targetsRevisions targets
+                  }
+              writeTVar (stateSceneReleased state) (sceneReleased (vulkanSceneLifecycle config))
           use (VulkanHost windows graphics controller targets)
     -- However the host ended, an instance it did not destroy may still have
     -- a messenger naming the capture, so the capture's storage is kept rather

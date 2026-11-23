@@ -92,6 +92,21 @@ library
         hetoimasia-gpu-vulkan-native ==0.1.0.0,
         hetoimasia-gpu-vulkan-glfw:controller
 
+-- The host's raw transactions that existing non-terrain compositions run inside one transaction of their own: the
+-- texture port's action and release admission and the LFE-27 publisher's offscreen scene publication. Every other
+-- caller commits the public unit's ownership operations; terrain views do not depend on this unit.
+library raw-writes
+    import: language
+    visibility: public
+    hs-source-dirs: raw-writes
+    exposed-modules:
+        Hetoimasia.GPU.Vulkan.GLFW.RawWrites
+    build-depends:
+        base >=4.22 && <4.23,
+        stm >=2.5.3 && <2.6,
+        hetoimasia-foundation ==0.1.0.0,
+        hetoimasia-gpu-vulkan-glfw:controller
+
 -- The controller's headless examples: whole graphics hosts over the GLFW
 -- package's scripted seam, with the real owner machinery, the real controller
 -- and a stand-in native layer and surface bridge. They initialize no GLFW,

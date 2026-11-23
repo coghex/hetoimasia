@@ -55,11 +55,11 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , readConstructedReadback
   , readTicket
   , readVulkanSceneState
-  , registerVulkanSceneTarget
+  , registerVulkanSceneTargetTx
   , releaseConstructed
-  , submitVulkanAction
+  , submitVulkanActionTx
   , transitionResource
-  , unregisterVulkanSceneTarget
+  , unregisterVulkanSceneTargetTx
   )
 import Hetoimasia.LuaEngine.Graphics.Scene
 import Hetoimasia.LuaEngine.Graphics.TerrainView hiding (styleAssets)
@@ -75,7 +75,7 @@ import Hetoimasia.Terrain.Coordinate (AxisCoord, axisFromInteger, tileCoord)
 import Hetoimasia.Terrain.Render2D.AtlasFixtures (AtlasStyle (..), boundPackedTextures, findSampleDirectory, loadAtlasStyle)
 import Hetoimasia.Terrain.Render2D.Presentation (defaultLightSettings)
 import Hetoimasia.Terrain.Residency (Limits, LimitsSpec (..), mkLimits)
-import Data.Maybe (fromMaybe)
+import Data.Maybe (fromMaybe, isJust)
 import Hetoimasia.Foundation.Messaging.Payload (prepare)
 import Hetoimasia.Terrain.Cell (mkMaterialId)
 import Hetoimasia.Terrain.Render2D.Camera (camZoom)
@@ -100,9 +100,9 @@ spec env = describe "terrain views" $
     within 180 . withLoaded env files $ \comp vm → withViews env comp vm $ \views terrain lease style → do
       let host = envHost env
           metrics = TargetMetrics (PixelExtent side side) (PixelExtent side side) 1 1
-      target ← atomically (registerVulkanSceneTarget host) >>= either (\refusal → assertFailure ("the target was refused: " <> show refusal)) pure
+      target ← commit (registerVulkanSceneTargetTx host) >>= either (\refusal → assertFailure ("the target was refused: " <> show refusal)) pure
       facts ← prepare (Just metrics) >>= atomically . newOffscreenFacts True
-      let cleanup = atomically (setOffscreenUsable facts False) >> void (atomically (unregisterVulkanSceneTarget host target))
+      let cleanup = atomically (setOffscreenUsable facts False) >> void (commit (unregisterVulkanSceneTargetTx host target))
       flip finally cleanup . withImages host (fromIntegral side) $ \images → do
         view ←
           openView views (OpenRequest (offscreenViewTarget host target facts) lease (pure (Right style)) (axis 0, axis 0, axis 1) defaultLightSettings)
@@ -219,6 +219,32 @@ fullSpec env = describe "terrain views (full)" $ do
         fmap windowPublished (Map.lookup (KeyWindow (targetWindow window)) (sceneWindows state')) `shouldBe` Just (Just shown)
         Win.stopInstance wcomp wvm "w"
 
+  it "claims, publishes to and hands back the window of the capability it is given, whatever the target record's window field names" $ do
+    files ← atlasFiles
+    within 300 . withLoaded env files $ \comp vm → withViews env comp vm $ \views _ lease style →
+      withWindows env Nothing $ \wcomp wvm _ _ port _ → do
+        first ← openWindow wcomp wvm port
+        second ← openWindowNamed wcomp wvm port "b"
+        noteWindows env 2
+        m1 ← prepare initialGraphicsScene
+        shown ←
+          targetPublish first m1 >>= \case
+            WindowScenePublished _ revision → pure revision
+            other → assertFailure ("the M1 scene was not published: " <> show other)
+        -- the second window's capability, in a record whose window field names the first
+        let mixed = second {targetWindow = targetWindow first}
+        view ←
+          openView views (OpenRequest (windowViewTarget (envHost env) True (scenesReceipts (envScenes env)) [] mixed) lease (pure (Right style)) (axis 0, axis 0, axis 1) defaultLightSettings)
+            >>= either (\why → assertFailure ("the view was refused: " <> show why)) pure
+        _ ← within 60 (atomically (readView view >>= maybe retry pure . readingPublished))
+        -- the view's scene is the second window's; the first keeps its own, unclaimed
+        state ← atomically (readVulkanSceneState (envHost env))
+        fmap windowPublished (Map.lookup (KeyWindow (targetWindow first)) (sceneWindows state)) `shouldBe` Just (Just shown)
+        fmap windowPublished (Map.lookup (KeyWindow (targetWindow second)) (sceneWindows state)) `shouldSatisfy` maybe False isJust
+        targetPublish first m1 >>= (`shouldSatisfy` \case WindowScenePublished _ _ → True; _ → False)
+        closeView view >>= (`shouldSatisfy` (`elem` [CloseDone, CloseRetiring]))
+        Win.stopInstance wcomp wvm "w"
+
   it "draws a view in a real window, advances its receipt at the presentation's enqueue through camera changes, and records the owner-thread planning time within one frame against the frame budget" $ do
     files ← atlasFiles
     within 300 . withLoaded env files $ \comp vm → withViews env comp vm $ \views _ lease style →
@@ -285,12 +311,17 @@ frameBudget = 16666667
 openWindow ∷ Win.WinComp (WindowTarget GraphicsScene) → Win.WinVm (WindowTarget GraphicsScene) → Port (WindowTarget GraphicsScene) → IO (WindowTarget GraphicsScene)
 openWindow wcomp wvm port = do
   Win.admit wcomp wvm PresentationRole "w"
-  Win.commandOpen wcomp wvm "w" "a" "terrain view" (480, 320)
-  Win.command wcomp wvm "w" "wait_take" "a"
-  opened ← Win.awaitNoteContaining wcomp "w wait_take a"
+  openWindowNamed wcomp wvm port "a"
+
+-- Another window of the admitted instance, by its handle's name.
+openWindowNamed ∷ Win.WinComp (WindowTarget GraphicsScene) → Win.WinVm (WindowTarget GraphicsScene) → Port (WindowTarget GraphicsScene) → Text → IO (WindowTarget GraphicsScene)
+openWindowNamed wcomp wvm port name = do
+  Win.commandOpen wcomp wvm "w" name "terrain view" (480, 320)
+  Win.command wcomp wvm "w" "wait_take" name
+  opened ← Win.awaitNoteContaining wcomp ("w wait_take " <> name)
   opened `shouldSatisfy` Text.isInfixOf "status=success"
-  Win.command wcomp wvm "w" "use" "a"
-  line ← Win.awaitNoteContaining wcomp "w use a"
+  Win.command wcomp wvm "w" "use" name
+  line ← Win.awaitNoteContaining wcomp ("w use " <> name)
   token ← either (\_ → assertFailure ("no window identity in " <> Text.unpack line)) (pure . fst) (Text.decimal (last (Text.words line)))
   atomically (portTarget port (WindowToken token)) >>= maybe (assertFailure "the window offered no target") pure
 
@@ -391,7 +422,7 @@ axis v = either (error . show) id (axisFromInteger v)
 
 act ∷ VulkanHost GraphicsScene → Text → VulkanAction (Either e a) → IO (Either Text a)
 act host what action =
-  atomically (submitVulkanAction host action) >>= \case
+  commit (submitVulkanActionTx host action) >>= \case
     Left refusal → pure (Left (what <> " was refused: " <> tshow refusal))
     Right ticket →
       atomically (awaitVulkanAction ticket) >>= \case

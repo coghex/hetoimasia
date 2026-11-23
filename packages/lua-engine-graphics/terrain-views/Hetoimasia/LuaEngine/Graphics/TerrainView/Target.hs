@@ -39,7 +39,7 @@ import Hetoimasia.LuaEngine.Graphics.Scene.World (SceneWorld (..), WorldTag)
 import Hetoimasia.LuaEngine.Graphics.TerrainView.Surface (Authority, OffscreenFacts, ViewSurface (..), ViewTarget (..))
 import Hetoimasia.LuaEngine.Graphics.Texture (TextureGraphics (..))
 import Hetoimasia.LuaEngine.Graphics.Texture.Host (hostBuilders)
-import Hetoimasia.LuaEngine.Graphics.Window.Host (WindowTarget (..))
+import Hetoimasia.LuaEngine.Graphics.Window.Host (WindowTarget (..), windowViewId)
 import Hetoimasia.Render.TwoD.Metrics (TargetMetrics)
 
 -- | A window incarnation's target, through the capability its host issued ('targetView'). Its depth is the host's:
@@ -48,13 +48,17 @@ import Hetoimasia.Render.TwoD.Metrics (TargetMetrics)
 -- geometry is the window's live observation, whatever frame was recorded last: a recorded frame's metrics describe that
 -- frame (for drawing and picking), never the window now. Its authority is the caller's original leases (checked in the
 -- open's commit and wherever the view's work is revalidated). It shows a scene once the host holds one published for it.
+-- Its claim key is the window of that same capability ('windowViewId'), so the window claimed is the window published
+-- and handed back, whatever the record's other fields say.
 windowViewTarget ∷ VulkanHost GraphicsScene → Bool → DrawReceipts → [Authority] → WindowTarget GraphicsScene → ViewTarget SceneTargetKey
 windowViewTarget host hostDepth receipts leases target =
   ViewTarget
-    { vtKey = KeyWindow (targetWindow target)
-    , vtSurface = WindowSurface host receipts (targetView target) leases
+    { vtKey = KeyWindow (windowViewId view)
+    , vtSurface = WindowSurface host receipts view leases
     , vtDepth = hostDepth
     }
+  where
+    view = targetView target
 
 -- | A surface-free target registered with the host: usable while its registrant's facts say so, drawn with the depth
 -- image its registrant records with ('drawOffscreenView'), at the metrics its registrant sets (none is an unknown

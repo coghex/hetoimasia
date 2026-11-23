@@ -20,6 +20,7 @@ import Control.Concurrent.STM (TVar, atomically, check, modifyTVar', newTVarIO, 
 import Control.Concurrent (killThread, myThreadId)
 import Control.Exception (AsyncException (ThreadKilled), ErrorCall (ErrorCall), SomeException, fromException, try)
 import Hetoimasia.Foundation.Admission (Admission, admissionToken, closeAdmission, newAdmission, newAdmissionIO, tokenOpen)
+import Hetoimasia.Foundation.Messaging.Payload (prepare)
 import Hetoimasia.Foundation.OwnerTx (commit)
 import Hetoimasia.GPU.Model (SessionFailureCause (CleanupFailed))
 import Hetoimasia.GPU.Vulkan.Native.Roots (failRootsSession)
@@ -102,6 +103,22 @@ spec = describe "Uploads" $ do
       calls ← recordingCalls (rigRecordingStandIn rig)
       [(offset, count) | WroteMapped offset count ← calls] `shouldBe` [(0, 256), (256, 64)]
       fmap uploadPhase . uploadsUnsettled <$> atomically (readUploads uploads) `shouldReturn` [PhaseQueued]
+      clean rig
+
+    it "evaluates a request in full before it takes anything: a level list whose tail raises leaves the queued upload, the reservations and staging as they were" $ do
+      rig ← newUploadRig
+      uploads ← made rig (config 1024 64 4)
+      texture ← textureOf rig Rgba8Linear 8 8 2
+      first ← admitted uploads (UploadImage texture [level 256 1, level 64 2])
+      before ← atomically (readUploads uploads)
+      calls ← length <$> recordingCalls (rigRecordingStandIn rig)
+      try @ErrorCall (submitUpload uploads (UploadImage texture (level 256 1 : error "the level list's tail raised"))) >>= \case
+        Left (ErrorCall why) → why `shouldBe` "the level list's tail raised"
+        Right _ → expectationFailure "the request was not evaluated before admission"
+      fmap uploadPhase . uploadsUnsettled <$> atomically (readUploads uploads) `shouldReturn` fmap uploadPhase (uploadsUnsettled before)
+      uploadsReserved <$> atomically (readUploads uploads) `shouldReturn` uploadsReserved before
+      length <$> recordingCalls (rigRecordingStandIn rig) `shouldReturn` calls
+      atomically (readUploadTicket first) `shouldReturn` UploadQueued
       clean rig
 
     it "refuses, reserving and copying nothing: malformed levels and sizes, wrong kinds, a foreign or released target, and a closed queue" $ do
@@ -245,7 +262,7 @@ spec = describe "Uploads" $ do
       uploads ← made rig (config 1024 64 1)
       other ← bufferOf rig VertexBuffer 16
       atomically (uploadRoom uploads 16) `shouldReturn` Right ()
-      grant ← commit (reserveUploadTx uploads 16) >>= either (fail . show) pure
+      grant ← (prepare 16 >>= commit . reserveUploadTx uploads) >>= either (fail . show) pure
       -- the one queue place is the reservation's: observed and refused alike, nothing copied
       atomically (uploadRoom uploads 16) `shouldReturn` Left (UploadBackpressure QueueFull)
       fmap (const ()) <$> submitUpload uploads (UploadBuffer other (level 16 1)) `shouldReturn` Left (UploadBackpressure QueueFull)
@@ -258,19 +275,19 @@ spec = describe "Uploads" $ do
     it "refuses room no aligned gap holds though the free bytes suffice, and a reservation larger than the whole staging for good" $ do
       rig ← newUploadRig
       uploads ← made rig (config 64 64 8)
-      grants ← forM [1 ∷ Int .. 3] (\_ → commit (reserveUploadTx uploads 16) >>= either (fail . show) pure)
+      grants ← forM [1 ∷ Int .. 3] (\_ → (prepare 16 >>= commit . reserveUploadTx uploads) >>= either (fail . show) pure)
       -- 32 bytes are free, in two gaps of 16: a 32-byte request fits neither
       commit (abandonUploadGrantTx uploads (grants !! 1))
       atomically (uploadRoom uploads 32) `shouldReturn` Left (UploadBackpressure StagingFull)
-      fmap (const ()) <$> commit (reserveUploadTx uploads 32) `shouldReturn` Left (UploadBackpressure StagingFull)
+      fmap (const ()) <$> (prepare 32 >>= commit . reserveUploadTx uploads) `shouldReturn` Left (UploadBackpressure StagingFull)
       atomically (uploadRoom uploads 16) `shouldReturn` Right ()
-      fmap (const ()) <$> commit (reserveUploadTx uploads 65) `shouldReturn` Left (UploadOversized 80 64)
+      fmap (const ()) <$> (prepare 65 >>= commit . reserveUploadTx uploads) `shouldReturn` Left (UploadOversized 80 64)
       length . uploadsReserved <$> atomically (readUploads uploads) `shouldReturn` 2
 
     it "spends a reservation once, into a fresh vertex buffer of exactly its bytes, which then competes for nothing" $ do
       rig ← newUploadRig
       uploads ← made rig (config 1024 64 1)
-      grant ← commit (reserveUploadTx uploads 16) >>= either (fail . show) pure
+      grant ← (prepare 16 >>= commit . reserveUploadTx uploads) >>= either (fail . show) pure
       wrongSize ← bufferOf rig VertexBuffer 32
       indices ← bufferOf rig IndexBuffer 16
       vertices ← bufferOf rig VertexBuffer 16
@@ -296,8 +313,8 @@ spec = describe "Uploads" $ do
       rig ← newUploadRig
       first ← made rig (config 1024 64 4)
       second ← made rig (config 1024 64 4)
-      ours ← commit (reserveUploadTx first 16) >>= either (fail . show) pure
-      theirs ← commit (reserveUploadTx second 16) >>= either (fail . show) pure
+      ours ← (prepare 16 >>= commit . reserveUploadTx first) >>= either (fail . show) pure
+      theirs ← (prepare 16 >>= commit . reserveUploadTx second) >>= either (fail . show) pure
       map fst . uploadsReserved <$> atomically (readUploads first) `shouldReturn` [0]
       map fst . uploadsReserved <$> atomically (readUploads second) `shouldReturn` [0]
       vertices ← bufferOf rig VertexBuffer 16
@@ -314,19 +331,19 @@ spec = describe "Uploads" $ do
     it "abandons every unspent reservation when admission closes" $ do
       rig ← newUploadRig
       uploads ← made rig (config 1024 64 4)
-      grant ← commit (reserveUploadTx uploads 16) >>= either (fail . show) pure
+      grant ← (prepare 16 >>= commit . reserveUploadTx uploads) >>= either (fail . show) pure
       atomically (closeUploads uploads)
       uploadsReserved <$> atomically (readUploads uploads) `shouldReturn` []
       vertices ← bufferOf rig VertexBuffer 16
       fmap (const ()) <$> submitUploadGranted ungated uploads grant vertices (level 16 1) `shouldReturn` Left UploadClosed
-      fmap (const ()) <$> commit (reserveUploadTx uploads 16) `shouldReturn` Left UploadClosed
+      fmap (const ()) <$> (prepare 16 >>= commit . reserveUploadTx uploads) `shouldReturn` Left UploadClosed
 
     it "returns a bound grant's place, region and target through one cleanup whatever ends it before it is queued: the copy raising, or the gate raising, waiting or cancelled after the copy; the spent grant is stale, a fresh upload takes the same room and target, and retirement finishes" $
       forM_ [AfterCopyRaises, GateRaises, GateWaits, GateCancelled] $ \ending → do
         rig ← newUploadRig
         -- one queue place and the whole staging buffer: the grant takes both
         uploads ← made rig (config 64 64 1)
-        grant ← commit (reserveUploadTx uploads 64) >>= either (fail . show) pure
+        grant ← (prepare 64 >>= commit . reserveUploadTx uploads) >>= either (fail . show) pure
         vertices ← bufferOf rig VertexBuffer 64
         afterCopy ← newTVarIO Nothing
         let gate =
@@ -410,7 +427,7 @@ spec = describe "Uploads" $ do
           closeNow current = readTVar current >>= closeAdmission
       -- closed after the first ask admits, before the binding commit: nothing taken, the grant still spendable
       (rig, uploads, vertices, current) ← fresh
-      grant ← commit (reserveUploadTx uploads 64) >>= either (fail . show) pure
+      grant ← (prepare 64 >>= commit . reserveUploadTx uploads) >>= either (fail . show) pure
       let closingOnAsk = gateOver current <* closeNow current
       fmap (const ()) <$> submitUploadGranted closingOnAsk uploads grant vertices (level 64 1) `shouldReturn` Left UploadClosed
       length . uploadsReserved <$> atomically (readUploads uploads) `shouldReturn` 1
@@ -419,7 +436,7 @@ spec = describe "Uploads" $ do
       clean rig
       -- closed after the second ask admits, before the queueing commit: the room returns, the grant is spent
       (rig', uploads', vertices', current') ← fresh
-      grant' ← commit (reserveUploadTx uploads' 64) >>= either (fail . show) pure
+      grant' ← (prepare 64 >>= commit . reserveUploadTx uploads') >>= either (fail . show) pure
       asks ← newTVarIO (0 ∷ Int)
       let closingOnSecond = do
             answer ← gateOver current'

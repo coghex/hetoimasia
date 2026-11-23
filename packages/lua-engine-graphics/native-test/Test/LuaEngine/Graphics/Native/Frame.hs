@@ -19,6 +19,7 @@ module Test.LuaEngine.Graphics.Native.Frame
   , sideHeight
   ) where
 
+import Hetoimasia.Foundation.OwnerTx (commit)
 import Control.Concurrent.STM (atomically, retry)
 import Data.ByteString (ByteString)
 import Data.Maybe (catMaybes)
@@ -53,7 +54,7 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , readConstructedReadback
   , readTicket
   , releaseConstructed
-  , submitVulkanAction
+  , submitVulkanActionTx
   , transitionResource
   )
 import Hetoimasia.LuaEngine.Graphics.Texture.Host (hostBuilders)
@@ -212,7 +213,7 @@ shootProbed host record between renderer handle decoded straight =
         }
     act ∷ ∀ a. Text → VulkanAction (Either Refusal a) → IO (Either Text a)
     act what action =
-      atomically (submitVulkanAction host action) >>= \case
+      commit (submitVulkanActionTx host action) >>= \case
         Left refusal → pure (Left (what <> " was refused: " <> tshow refusal))
         Right ticket →
           atomically (awaitVulkanAction ticket) >>= \case

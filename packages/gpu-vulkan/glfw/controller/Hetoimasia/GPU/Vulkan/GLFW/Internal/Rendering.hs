@@ -193,7 +193,8 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Rendering
   , FrameStorageRefused (..)
   ) where
 
-import Hetoimasia.Foundation.OwnerTx (OwnerTx)
+import Hetoimasia.Foundation.Messaging.Payload (Prepared)
+import Hetoimasia.Foundation.OwnerTx (OwnerTx, commit)
 import Hetoimasia.Foundation.OwnerTx.Issuer (fromIssuerSTM)
 import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, stateTVar, writeTVar)
 import Control.Exception
@@ -409,7 +410,7 @@ import Hetoimasia.GPU.Vulkan.Native.Uploads
   , OwnerAdmission
   , UploadsCell
   , newUploadsCellIO
-  , setUploadsStanding
+  , setUploadsStandingTx
   , readUploadsStanding
   , UploadConfig
   , UploadProgress (..)
@@ -1836,7 +1837,7 @@ makeRenderingUploads rendering =
         Nothing → pure False
         Just made → do
           made' ← newUploads (liveFrames made) config
-          True <$ atomically (setUploadsStanding (renderingUploads rendering) (either UploadsRefused UploadsMade made'))
+          True <$ commit (setUploadsStandingTx (renderingUploads rendering) (either UploadsRefused UploadsMade made'))
     _ → pure False
 
 -- | One owner step's uploads, on the owner's thread, after the step has
@@ -1904,7 +1905,7 @@ renderingUploadRoom = accessRoom
 
 -- | Reserve the room an upload of this many bytes needs through this access ('accessReserve'), from any thread: a
 -- refusal reserves nothing.
-reserveRenderingUpload ∷ UploadAccess → Natural → OwnerTx (Either (Either UploadsUnavailable UploadRefusal) UploadGrant)
+reserveRenderingUpload ∷ UploadAccess → Prepared Natural → OwnerTx (Either (Either UploadsUnavailable UploadRefusal) UploadGrant)
 reserveRenderingUpload = accessReserveTx
 
 -- | Spend a reservation on the upload that fills a fresh vertex buffer of exactly its bytes through this access

@@ -33,7 +33,7 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView.Owner
 
 import Control.Concurrent.STM (STM)
 import Control.Monad (void)
-import Control.Exception (SomeAsyncException, displayException, evaluate, fromException, throwIO, try)
+import Control.Exception (SomeAsyncException, displayException, fromException, throwIO, try)
 import qualified Data.Map.Strict as Map
 import Data.Functor ((<&>))
 import Data.Text (Text)
@@ -271,7 +271,7 @@ productionOwner host graphics = do
         prepare instances records = do
           marks ← registeredMarks (graphicsTextures graphics)
           -- evaluated here, on this step: the description and its encoded bytes are made now
-          either (Left . Text.pack . show) Right <$> evaluate (prepareRetainedChunk marks ChunkWorldDepth DeriveBounds (Map.singleton material records) instances)
+          either (Left . Text.pack . show) Right <$> prepareRetainedChunk marks ChunkWorldDepth DeriveBounds (Map.singleton material records) instances
     refusalText = \case
       ReleaseQueueFull → "the release lane is full"
       other → show other

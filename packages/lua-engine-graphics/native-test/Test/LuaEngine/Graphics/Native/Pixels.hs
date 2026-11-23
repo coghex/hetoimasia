@@ -35,6 +35,7 @@
 -- render-2d oracle over the published window-pass scene with the managed target's own 'TargetSpec', every pixel.
 module Test.LuaEngine.Graphics.Native.Pixels (spec) where
 
+import Hetoimasia.Foundation.OwnerTx (commit)
 import Control.Concurrent (killThread)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, takeMVar, tryPutMVar, tryReadMVar)
 import Control.Concurrent.STM (TVar, atomically, check, modifyTVar', newTVarIO, readTVar, readTVarIO, retry)
@@ -62,7 +63,7 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , WindowSceneStanding (..)
   , awaitVulkanAction
   , readVulkanSceneState
-  , submitVulkanAction
+  , submitVulkanActionTx
   )
 import Hetoimasia.LuaEngine.Boot (bootCheckpointFrom)
 import Hetoimasia.LuaEngine.Facade (OutputSink (..), withOutput)
@@ -227,7 +228,7 @@ spec env = describe "Lua offscreen pixels" $ do
         proceed ← newEmptyMVar
         let letGo = void (tryPutMVar proceed ())
         gate ←
-          atomically (submitVulkanAction host (VulkanAction (\_ → putMVar entered () >> takeMVar proceed)))
+          commit (submitVulkanActionTx host (VulkanAction (\_ → putMVar entered () >> takeMVar proceed)))
             >>= either (\refusal → assertFailure ("the holding action was refused: " <> show refusal)) pure
         flip finally letGo $ do
           takeMVar entered

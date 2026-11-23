@@ -448,7 +448,7 @@ nativeHands rig native =
     production = registryHands prepareOf (standInDisposal standIn) builders (nativeRetained native)
     -- the instances' own textures marked, as the production hands mark the registered art: each part has bytes, and its
     -- build makes and fills a buffer
-    prepareOf instances records = pure (either (Left . Text.pack . show) Right (prepareRetainedChunk (cutoutMarks (Set.toList (Set.fromList (map instanceTexture instances)))) ChunkWorldDepth DeriveBounds (Map.singleton material records) instances))
+    prepareOf instances records = (either (Left . Text.pack . show) Right <$> (prepareRetainedChunk (cutoutMarks (Set.toList (Set.fromList (map instanceTexture instances)))) ChunkWorldDepth DeriveBounds (Map.singleton material records) instances))
     material = materialRef 11 (MaterialFacts True recordLayout (fromIntegral pushBlockBytes))
     held ordinal = do
       waits ← atomically $ do
@@ -507,7 +507,7 @@ hands ∷ Rig → Hands
 hands rig =
   Hands
     { handPrepare = \instances records →
-        pure (either (Left . Text.pack . show) Right (prepareRetainedChunk noCutoutMarks ChunkWorldDepth DeriveBounds (Map.singleton material records) instances))
+        (either (Left . Text.pack . show) Right <$> (prepareRetainedChunk noCutoutMarks ChunkWorldDepth DeriveBounds (Map.singleton material records) instances))
     , handReserve = \prepared → fromIssuerSTM $
         roomOf (rigAdmission rig) (rigAdmitBudget rig) >>= \case
           Left refusal → pure (Left refusal)
@@ -2468,6 +2468,21 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         settleUntil rig (publishedAtLeast view 1)
         -- the views' owner did not end: a control is still accepted
         configureNow view (noConfigure {configureZoom = Just 2}) `shouldReturn` Right ()
+
+    it "evaluates the caller's authority lists in full before an open takes anything: a list whose tail raises leaves the published view, the claims and the runtime's views as they were, and releases the style once" $
+      withPublished defaultOptions $ \rig target view → do
+        quiesce rig target
+        published ← atomically (readingPublished <$> readView view)
+        releases ← readTVarIO (rigStyleReleases rig)
+        other ← newTarget 2
+        style ← styleOf rig
+        try @ErrorCall (openStyled rig other style {styleAuthority = styleAuthority style <> error "the authority list's tail raised"}) >>= \case
+          Left (ErrorCall why) → why `shouldBe` "the authority list's tail raised"
+          Right _ → expectationFailure "the open took the unevaluated list"
+        atomically (readingPublished <$> readView view) `shouldReturn` published
+        atomically (claimOf (rigClaims rig) 2) `shouldReturn` Nothing
+        atomically (inspectViewCountSTM (rigTerrain rig)) `shouldReturn` 1
+        readTVarIO (rigStyleReleases rig) `shouldReturn` releases + 1
 
     it "detaches the old runtime view and withdraws its demand in the commit that frees its claim" $
       withPublished defaultOptions $ \rig target view → do

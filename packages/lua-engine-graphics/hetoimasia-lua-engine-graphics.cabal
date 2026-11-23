@@ -67,6 +67,8 @@ library
         hetoimasia-glfw ==0.1.0.0,
         hetoimasia-glfw:runtime-glfw ==0.1.0.0,
         hetoimasia-gpu-vulkan-glfw ==0.1.0.0,
+        -- the host's raw admissions and offscreen publication, for the texture port and the LFE-27 publisher
+        hetoimasia-gpu-vulkan-glfw:raw-writes,
         hetoimasia-gpu-vulkan-model ==0.1.0.0,
         hetoimasia-gpu-vulkan-native ==0.1.0.0,
         hetoimasia-lua-engine ==0.1.0.0,
@@ -337,6 +339,8 @@ test-suite lua-engine-graphics-native-tests
         hetoimasia-glfw:runtime-glfw ==0.1.0.0,
         hetoimasia-glfw:vulkan-interop ==0.1.0.0,
         hetoimasia-gpu-vulkan-diagnostics ==0.1.0.0,
+        -- the fake offscreen registrant (Display) is the issuer of its own book
+        hetoimasia-foundation:owner-tx-issuer ==0.1.0.0,
         hetoimasia-gpu-vulkan-glfw ==0.1.0.0,
         hetoimasia-gpu-vulkan-model ==0.1.0.0,
         hetoimasia-gpu-vulkan-native ==0.1.0.0,

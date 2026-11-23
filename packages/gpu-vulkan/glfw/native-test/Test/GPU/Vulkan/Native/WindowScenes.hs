@@ -37,6 +37,7 @@ module Test.GPU.Vulkan.Native.WindowScenes
   , spec
   ) where
 
+import qualified Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller as Controller
 import Control.Concurrent (ThreadId, myThreadId)
 import Control.Concurrent.STM (STM, atomically, check, modifyTVar', newTVarIO, orElse, readTVar, readTVarIO, registerDelay, retry, writeTVar)
 import Control.Exception (SomeException, displayException, throwIO, try)
@@ -88,7 +89,6 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , readReadiness
   , readVulkanAction
   , readVulkanGenerations
-  , requestVulkanRelease
   , runVulkanOwnerLoop
   , vulkanHostConfig
   , withVulkanOwnerHost
@@ -333,7 +333,7 @@ runWindowScenes backend journal = do
               -- waits for the revision the owner has not yet taken.
               (published, ticket) ← atomically $ do
                 p ← publishGraphicsWindowScene graphics second scene
-                t ← requestVulkanRelease vulkan (VulkanAction (\_ → keep RequestRan))
+                t ← Controller.requestVulkanRelease (vulkanController vulkan) (VulkanAction (\_ → keep RequestRan))
                 pure (p, t)
               held ← either (\refusal → stopWith ("the release request was refused: " <> tshow refusal)) pure ticket
               atomically (modifyTVar' publications (<> [published]))

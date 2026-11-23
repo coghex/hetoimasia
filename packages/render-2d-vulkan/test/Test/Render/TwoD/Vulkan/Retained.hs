@@ -41,7 +41,7 @@ import Hetoimasia.GPU.Vulkan.Native.Recording
 import Hetoimasia.GPU.Vulkan.Native.TextureTable (validateTableConfig)
 import Hetoimasia.Foundation.Admission (admissionToken, closeAdmission, newAdmissionIO)
 import Hetoimasia.Foundation.OwnerTx (commit)
-import Hetoimasia.GPU.Vulkan.Native.Uploads (UploadRefusal (..), UploadState (..), UploadsStanding (..), UploadsView (..), newOwnerAdmissionIO, newUploadsCellIO, ownedUploadAccess, readUploads, setUploadsStanding, validateUploadConfig)
+import Hetoimasia.GPU.Vulkan.Native.Uploads (UploadRefusal (..), UploadState (..), UploadsStanding (..), UploadsView (..), newOwnerAdmissionIO, newUploadsCellIO, ownedUploadAccess, readUploads, setUploadsStandingTx, validateUploadConfig)
 import Hetoimasia.Math.Affine2 (fromColumns)
 import Hetoimasia.Math.Vector (V2 (..))
 import qualified Hetoimasia.Render.Api.Texture as Api
@@ -209,7 +209,7 @@ closingUploads setup = do
 -- | A grant for a chunk of this depth layer, admitted into the setup's registry and uploads.
 admittedGrant ∷ Setup → [Instance] → IO ChunkGrant
 admittedGrant setup instances = do
-  prepared ← either (fail . show) pure (prepareRetainedChunk artMarks ChunkWorldDepth DeriveBounds Map.empty instances)
+  prepared ← prepareRetainedChunk artMarks ChunkWorldDepth DeriveBounds Map.empty instances >>= either (fail . show) pure
   commit (admitRetainedChunkTx (bufferUploads (trackedBuilders setup)) (setupRetained setup) prepared) >>= either (fail . show) pure
 
 -- | An exception whose description raises.
@@ -511,7 +511,7 @@ refusalSpec = describe "refusing a build" $ do
               , releaseBuffer = \_ → throwIO ThreadKilled
               }
       -- admitted through the uploads that refuse its upload: a grant is spent by the uploads that reserved it
-      prepared ← either (fail . show) pure (prepareRetainedChunk artMarks ChunkWorldDepth DeriveBounds Map.empty [cutAt 0 1])
+      prepared ← prepareRetainedChunk artMarks ChunkWorldDepth DeriveBounds Map.empty [cutAt 0 1] >>= either (fail . show) pure
       grant ← commit (admitRetainedChunkTx (bufferUploads refusing) (setupRetained setup) prepared) >>= either (fail . show) pure
       raised ← tryWithContext @AsyncException (spendChunkGrant refusing (setupRetained setup) grant)
       receipts ← claimsOf grant
@@ -558,7 +558,7 @@ refusalSpec = describe "refusing a build" $ do
       _ ← mapM (\i → built setup ChunkWorldDepth [cutAt (fromIntegral (i ∷ Int)) 1]) [1 .. 7]
       closing ← closingUploads setup
       let refusing = (trackedBuilders setup) {bufferUploads = closing}
-      prepared ← either (fail . show) pure (prepareRetainedChunk artMarks ChunkWorldDepth DeriveBounds Map.empty [cutAt 0 1])
+      prepared ← prepareRetainedChunk artMarks ChunkWorldDepth DeriveBounds Map.empty [cutAt 0 1] >>= either (fail . show) pure
       grant ← commit (admitRetainedChunkTx (bufferUploads refusing) (setupRetained setup) prepared) >>= either (fail . show) pure
       answer ← spendChunkGrant refusing (setupRetained setup) grant
       made ← drop 7 <$> readIORef (trackedMade (setupTracked setup))
@@ -610,7 +610,7 @@ refusalSpec = describe "refusing a build" $ do
               { bufferUploads = closing
               , releaseBuffer = \_ → pure (Left (error "the release's answer raised"))
               }
-      prepared ← either (fail . show) pure (prepareRetainedChunk artMarks ChunkWorldDepth DeriveBounds Map.empty [cutAt 0 1])
+      prepared ← prepareRetainedChunk artMarks ChunkWorldDepth DeriveBounds Map.empty [cutAt 0 1] >>= either (fail . show) pure
       grant ← commit (admitRetainedChunkTx (bufferUploads lazily) (setupRetained setup) prepared) >>= either (fail . show) pure
       _ ← tryWithContext @SomeException (spendChunkGrant lazily (setupRetained setup) grant)
       claimsOf grant >>= \case
@@ -623,7 +623,7 @@ refusalSpec = describe "refusing a build" $ do
   it "seals a spend that raised an exception whose description itself raises with a fixed text: claimed once, the room returns, and the original exception goes on" $
     bounded . withSetup $ \setup → do
       let raising = (trackedBuilders setup) {bufferUploads = observingSpends (throwIO Indescribable) (\_ → pure ()) (bufferUploads (trackedBuilders setup))}
-      prepared ← either (fail . show) pure (prepareRetainedChunk artMarks ChunkWorldDepth DeriveBounds Map.empty [cutAt 0 1])
+      prepared ← prepareRetainedChunk artMarks ChunkWorldDepth DeriveBounds Map.empty [cutAt 0 1] >>= either (fail . show) pure
       grant ← commit (admitRetainedChunkTx (bufferUploads raising) (setupRetained setup) prepared) >>= either (fail . show) pure
       tryWithContext @Indescribable (spendChunkGrant raising (setupRetained setup) grant) >>= \case
         Left _ → pure ()
@@ -636,7 +636,7 @@ refusalSpec = describe "refusing a build" $ do
   it "seals a spend whose exception's description is cancelled: the fallback text is sealed, the buffer released and the room returned before the cancellation goes on" $
     bounded . withSetup $ \setup → do
       let raising = (trackedBuilders setup) {bufferUploads = observingSpends (throwIO Unspeakable) (\_ → pure ()) (bufferUploads (trackedBuilders setup))}
-      prepared ← either (fail . show) pure (prepareRetainedChunk artMarks ChunkWorldDepth DeriveBounds Map.empty [cutAt 0 1])
+      prepared ← prepareRetainedChunk artMarks ChunkWorldDepth DeriveBounds Map.empty [cutAt 0 1] >>= either (fail . show) pure
       grant ← commit (admitRetainedChunkTx (bufferUploads raising) (setupRetained setup) prepared) >>= either (fail . show) pure
       tryWithContext @AsyncException (spendChunkGrant raising (setupRetained setup) grant) >>= \case
         Left (ExceptionWithContext _ ThreadKilled) → pure ()
@@ -654,7 +654,7 @@ refusalSpec = describe "refusing a build" $ do
               { bufferUploads = closing
               , releaseBuffer = \_ → throwIO Unspeakable
               }
-      prepared ← either (fail . show) pure (prepareRetainedChunk artMarks ChunkWorldDepth DeriveBounds Map.empty [cutAt 0 1])
+      prepared ← prepareRetainedChunk artMarks ChunkWorldDepth DeriveBounds Map.empty [cutAt 0 1] >>= either (fail . show) pure
       grant ← commit (admitRetainedChunkTx (bufferUploads raising) (setupRetained setup) prepared) >>= either (fail . show) pure
       tryWithContext @AsyncException (spendChunkGrant raising (setupRetained setup) grant) >>= \case
         Left (ExceptionWithContext _ ThreadKilled) → pure ()
@@ -713,7 +713,7 @@ refusalSpec = describe "refusing a build" $ do
     withSetup $ \setup → do
       _ ← mapM (\i → built setup ChunkWorldDepth [cutAt (fromIntegral (i ∷ Int)) 1]) [1 .. 7]
       grant ← admittedGrant setup [cutAt 0 1]
-      competing ← either (fail . show) pure (prepareRetainedChunk artMarks ChunkWorldDepth DeriveBounds Map.empty [cutAt 9 1])
+      competing ← prepareRetainedChunk artMarks ChunkWorldDepth DeriveBounds Map.empty [cutAt 9 1] >>= either (fail . show) pure
       seen ← newIORef Nothing
       -- while the spend makes its buffer (on this, the owner's thread), the grant is abandoned and a competing chunk
       -- asks for the same room
@@ -738,14 +738,14 @@ refusalSpec = describe "refusing a build" $ do
       config ← either (fail . show) pure (validateUploadConfig 1048576 262144 8)
       owner ← newAdmissionIO >>= newOwnerAdmissionIO . admissionToken
       standing ← newUploadsCellIO (UploadsPending config)
+      prepared ← prepareRetainedChunk artMarks ChunkWorldDepth DeriveBounds Map.empty [cutAt 0 1] >>= either (fail . show) pure
       let rig = setupRig setup
           awaiting = bufferUploadsThrough (ownedUploadAccess (rigRoots rig) owner standing)
           lacking held = bufferUploadsThrough . ownedUploadAccess (rigRoots rig) owner <$> newUploadsCellIO held
-          prepared = either (error . show) id (prepareRetainedChunk artMarks ChunkWorldDepth DeriveBounds Map.empty [cutAt 0 1])
           admit uploads = fmap (const ()) <$> commit (admitRetainedChunkTx uploads (setupRetained setup) prepared)
       admit awaiting `shouldReturn` Left BuildUploadsNotReady
       atomically (chunkRoom awaiting (setupRetained setup) (preparedBytes prepared)) `shouldReturn` Left BuildUploadsNotReady
-      atomically (setUploadsStanding standing (UploadsMade (rigUploads rig)))
+      commit (setUploadsStandingTx standing (UploadsMade (rigUploads rig)))
       admit awaiting `shouldReturn` Right ()
       lacking UploadsUnconfigured >>= admit >>= (`shouldBe` Left (BuildUploadsUnavailable "the host configured no uploads"))
       lacking (UploadsRefused RefusedDeviceAbsent) >>= admit >>= (`shouldBe` Left (BuildUploadsUnavailable ("the device refused the uploads: " <> Text.pack (show RefusedDeviceAbsent))))

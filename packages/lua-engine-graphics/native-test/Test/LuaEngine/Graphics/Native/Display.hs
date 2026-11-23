@@ -50,6 +50,9 @@ module Test.LuaEngine.Graphics.Native.Display
   , awaitTarget
   ) where
 
+import Hetoimasia.Foundation.OwnerTx (commit)
+-- the fake registrant is the issuer of its own book
+import Hetoimasia.Foundation.OwnerTx.Issuer (fromIssuerSTM)
 import Control.Concurrent.STM
   ( STM
   , TVar
@@ -100,11 +103,11 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , readTicket
   , readVulkanSceneState
   , recordVulkanTargetBatch
-  , registerVulkanSceneTarget
+  , registerVulkanSceneTargetTx
   , releaseConstructed
-  , submitVulkanAction
+  , submitVulkanActionTx
   , transitionResource
-  , unregisterVulkanSceneTarget
+  , unregisterVulkanSceneTargetTx
   )
 import Hetoimasia.LuaEngine.Graphics.Scene
 import Hetoimasia.LuaEngine.Graphics.Texture
@@ -151,10 +154,10 @@ portOver host var =
     { portIssueCreate = \_ _ _ →
         -- One transaction: the host's registration and this book's record of it are one step, so a target the host
         -- registered is never one nobody holds the identity of.
-        atomically $
-          registerVulkanSceneTarget host >>= \case
+        commit $
+          registerVulkanSceneTargetTx host >>= \case
             Left refusal → pure (CreateFault (Fatal (Text.pack ("the host refused the offscreen target: " <> show refusal))))
-            Right target → do
+            Right target → fromIssuerSTM $ do
               book ← readTVar var
               let number = bookNext book
                   token = WindowToken number
@@ -179,15 +182,15 @@ portOver host var =
           Just _ | Map.member token (bookClosed book) → StandingEnded
           Just _ → StandingUsable
     , portCloseRequest = \_ → pure 0
-    , portBeginClose = \token → atomically $ do
-        book ← readTVar var
+    , portBeginClose = \token → commit $ do
+        book ← fromIssuerSTM (readTVar var)
         case Map.lookup token (bookTargets book) of
           Nothing → pure CloseGone
           Just target
             | Map.member token (bookClosed book) → pure CloseBegun
             | otherwise → do
-                void (unregisterVulkanSceneTarget host target)
-                writeTVar var book {bookClosed = Map.insert token () (bookClosed book)}
+                void (unregisterVulkanSceneTargetTx host target)
+                fromIssuerSTM (writeTVar var book {bookClosed = Map.insert token () (bookClosed book)})
                 pure CloseBegun
     , portRetirement = \token → do
         book ← readTVar var
@@ -409,7 +412,7 @@ renderTarget env target facts between =
 
     act ∷ ∀ a. Text → VulkanAction (Either Refusal a) → IO (Either Text a)
     act what action =
-      atomically (submitVulkanAction host action) >>= \case
+      commit (submitVulkanActionTx host action) >>= \case
         Left refusal → pure (Left (what <> " was refused: " <> tshow refusal))
         Right ticket →
           atomically (awaitVulkanAction ticket) >>= \case

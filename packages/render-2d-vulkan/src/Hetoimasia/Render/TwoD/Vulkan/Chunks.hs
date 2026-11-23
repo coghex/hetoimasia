@@ -164,6 +164,7 @@ import Hetoimasia.Render.TwoD.DrawPlan (CutoutMarks)
 import Hetoimasia.Render.TwoD.Encoding (encodeChunkCutouts)
 import Hetoimasia.Render.TwoD.Snapshot (Instance)
 import Hetoimasia.Render.TwoD.Vulkan.Builders (BufferUploadRefusal (..), BufferUploads, Builders (..), reserveRoom, roomFor, uploadGranted)
+import Hetoimasia.Foundation.Messaging.Payload (Prepared, prepare)
 import Hetoimasia.Foundation.OwnerTx (OwnerTx, commit)
 import Hetoimasia.Foundation.OwnerTx.Issuer (fromIssuerSTM)
 import Numeric.Natural (Natural)
@@ -274,7 +275,7 @@ buildRetainedChunkWith
   → [Instance]
   → IO (Either BuildRefused ChunkRef)
 buildRetainedChunkWith builders retained marks kind bounds records instances =
-  case prepareRetainedChunk marks kind bounds records instances of
+  prepareRetainedChunk marks kind bounds records instances >>= \case
     Left refusal → pure (Left (BuildRefused refusal NoAllocation))
     Right prepared →
       mask_ $
@@ -289,6 +290,8 @@ data PreparedChunk = PreparedChunk
   { preparedChunk ∷ !Chunk
     -- ^ Its immutable description.
   , preparedEncoded ∷ !ByteString.ByteString
+  , preparedRoom ∷ !(Prepared Natural)
+    -- ^ The room its upload reserves ('preparedBytes'), prepared with it: what admission hands the uploads.
   }
 
 -- | The exact bytes its vertex buffer and upload hold: zero for a chunk with no
@@ -297,22 +300,23 @@ preparedBytes ∷ PreparedChunk → Natural
 preparedBytes = fromIntegral . ByteString.length . preparedEncoded
 
 -- | Prepare a chunk, refusing the instances, the records or the bounds that do
--- not validate, with every reason. Pure, and evaluated when its answer is: a
--- prepared chunk's description and encoded bytes are computed by then, so
--- admission reads only their size. Nothing is reserved.
+-- not validate, with every reason. Its description, its encoded bytes and the
+-- room its upload reserves are computed here, in 'IO', before any commit, so
+-- admission hands the uploads a prepared amount. Nothing is reserved.
 prepareRetainedChunk
   ∷ CutoutMarks
   → ChunkKind
   → BoundsRequest
   → Map MaterialRef [MaterialRecord]
   → [Instance]
-  → Either BuildRefusal PreparedChunk
+  → IO (Either BuildRefusal PreparedChunk)
 prepareRetainedChunk marks kind bounds records instances =
   case buildChunkWith marks kind bounds records instances of
-    Left refusals → Left (BuildInvalid refusals)
-    Right described →
-      let prepared = PreparedChunk described (encodeChunkCutouts described)
-       in prepared `seq` Right prepared
+    Left refusals → pure (Left (BuildInvalid refusals))
+    Right described → do
+      let encoded = encodeChunkCutouts described
+      room ← encoded `seq` prepare (fromIntegral (ByteString.length encoded) ∷ Natural)
+      pure (Right (PreparedChunk described encoded room))
 
 -- | A prepared chunk's admission: a reference, private until the chunk is
 -- registered under it, and for a chunk with bytes the upload's reserved room.
@@ -450,7 +454,7 @@ admitWith indexed uploads (Retained ledger) prepared = do
       upload ←
         if preparedBytes prepared == 0
           then pure (Right Nothing)
-          else fmap Just <$> reserveRoom uploads (preparedBytes prepared)
+          else fmap Just <$> reserveRoom uploads (preparedRoom prepared)
       case upload of
         Left refusal → pure (Left (uploadRefusal refusal))
         Right granted → fromIssuerSTM $ do
