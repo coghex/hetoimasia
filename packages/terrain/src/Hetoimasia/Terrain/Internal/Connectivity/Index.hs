@@ -177,8 +177,9 @@ keyParameters (ComponentKey _ x y z) = [(axis, v) | (axis, Just v) ← [(AxisX, 
 -- (X before Y before Z, each at most once), as 'keyParameters' lists them, and any
 -- other list is refused. It is for the temporary store's codec (TRA-20) to decode a
 -- record it wrote; a key it rebuilds names a component only if the compiled source
--- has one, which the discovery model checks (@UnknownComponent@) and this function
--- does not.
+-- has one, with the canonical origin of its class (a key with any other origin is
+-- refused by every source query), which the discovery model checks
+-- (@UnknownComponent@) and this function does not.
 mkComponentKey ∷ TileCoord → [(Axis, AxisCoord)] → Maybe ComponentKey
 mkComponentKey origin params
   | ascending (map fst params) = Just (ComponentKey origin (pick AxisX) (pick AxisY) (pick AxisZ))
@@ -342,38 +343,39 @@ componentOf c tile = case lookupVoid c tile 0 of
   InComponent key → Just key
   _ → Nothing
 
--- | Resolve a key to its representative node and the nodes of its class, or
--- 'Nothing' for a key that names no component of this result.
-resolve ∷ Connectivity → ComponentKey → Maybe (Node, [Node])
-resolve c key@(ComponentKey origin _ _ _) = do
+-- | The representative node of a key's class, when the key is one 'keyOf' can
+-- produce: its origin is the exact canonical origin of the representative's box
+-- (not merely a tile inside it) and its parameters fit the box. A rebuilt key with
+-- any other origin names no component, so no query accepts a second identity for
+-- one. It reads the representative alone and visits no member and no cell.
+canonicalRep ∷ Connectivity → ComponentKey → Maybe (Int, Node)
+canonicalRep c (ComponentKey origin px py pz) = do
   (nid, rep) ← tileNode c origin
   _ ← if nodeClass rep == nid then Just () else Nothing
-  members ← IntMap.lookup nid (cMembers c)
-  nodes ← mapM (`IntMap.lookup` cNodes c) members
+  canonical ← nodeOrigin c rep
+  _ ← if canonical == origin then Just () else Nothing
   range ← nodeRange c rep
   let ok axis lo hi param
         | nodeAxes rep .&. axisBit axis /= 0 = maybe False (\v → toInteger (axisValue v) >= lo && toInteger (axisValue v) < hi) param
         | otherwise = param == Nothing
-      ComponentKey _ px py pz = key
   if ok 0 (rangeXLo range) (rangeXHi range) px && ok 1 (rangeYLo range) (rangeYHi range) py && ok 2 (rangeZLo range) (rangeZHi range) pz
-    then Just (rep, nodes)
+    then Just (nid, rep)
     else Nothing
+
+-- | Resolve a key to its representative node and the nodes of its class, or
+-- 'Nothing' for a key that names no component of this result.
+resolve ∷ Connectivity → ComponentKey → Maybe (Node, [Node])
+resolve c key = do
+  (nid, rep) ← canonicalRep c key
+  members ← IntMap.lookup nid (cMembers c)
+  nodes ← mapM (`IntMap.lookup` cNodes c) members
+  pure (rep, nodes)
 
 -- | The representative node of a key's class, when the key names a component of
 -- this result. It validates the key against the representative alone: it does
 -- not visit the members of the class.
 resolveRep ∷ Connectivity → ComponentKey → Maybe Node
-resolveRep c key@(ComponentKey origin _ _ _) = do
-  (nid, rep) ← tileNode c origin
-  _ ← if nodeClass rep == nid then Just () else Nothing
-  range ← nodeRange c rep
-  let ok axis lo hi param
-        | nodeAxes rep .&. axisBit axis /= 0 = maybe False (\v → toInteger (axisValue v) >= lo && toInteger (axisValue v) < hi) param
-        | otherwise = param == Nothing
-      ComponentKey _ px py pz = key
-  if ok 0 (rangeXLo range) (rangeXHi range) px && ok 1 (rangeYLo range) (rangeYHi range) py && ok 2 (rangeZLo range) (rangeZHi range) pz
-    then Just rep
-    else Nothing
+resolveRep c key = snd <$> canonicalRep c key
 
 -- | Whether the component is initially exterior: connected through positive-area
 -- openings to the upper Z boundary. 'Nothing' for a key that names no component.

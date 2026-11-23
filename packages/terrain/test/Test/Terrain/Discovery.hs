@@ -18,11 +18,12 @@ import Data.Word (Word64)
 import GHC.Stats (RTSStats (allocated_bytes), getRTSStats, getRTSStatsEnabled)
 import System.Mem (performMajorGC)
 import Data.Maybe (fromMaybe)
+import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import Hetoimasia.Terrain.Cell (Column (..), mkColumn)
-import Hetoimasia.Terrain.Connectivity (BoundaryFace, ComponentKey, componentBoundary, componentOf, defaultConnectivityLimits)
+import Hetoimasia.Terrain.Connectivity (BoundaryFace, ComponentKey, componentBoundary, componentOf, defaultConnectivityLimits, keyOrigin, keyParameters, mkComponentKey)
 import Hetoimasia.Terrain.Changes (ChangeLimits (..), changesFromIntervals, removedIntervals)
-import Hetoimasia.Terrain.Coordinate (TileCoord, axisFromInteger)
+import Hetoimasia.Terrain.Coordinate (TileCoord (..), axisFromInteger, axisValue)
 import Hetoimasia.Terrain.Discovery
 import Hetoimasia.Terrain.Query (cellAt)
 import Hetoimasia.Terrain.Residency (ArenaId (..), Revision (..))
@@ -199,6 +200,7 @@ spec = describe "Discovery" $ do
   controlSpecs
   evidenceSpecs
   readSetSpecs
+  aliasSpecs
 
 -- ---------------------------------------------------------------------------
 
@@ -1388,3 +1390,34 @@ readSetSpecs = describe "the read set: what the provider answered, never what th
                 other → expectationFailure ("unexpected " <> show other) >> pure n
     stalls ← loopStep [] 0
     stalls `shouldSatisfy` (> 0)
+
+-- ---------------------------------------------------------------------------
+
+-- | A component key rebuilt with an origin inside its representative box but not
+-- the class's canonical origin names no component, so discovery refuses it rather
+-- than accept a second identity as an implicit root. The provider confirms the
+-- key has no stored link ('Absent'), so the answer comes from the source.
+aliasSpecs ∷ Spec
+aliasSpecs = describe "a rebuilt component key with a noncanonical origin" $ do
+  let scene = Scene "wholly air" (SourceSpec ["stone", "slab"] [] []) (Window (0, 4) (0, 4) (0, 4)) Nothing
+      rig = newRig (limitsWith 64) scene
+      provider = recordProvider Map.empty
+      canonical = componentOf (fst (mustCompile defaultConnectivityLimits (sceneSpec scene))) (mustTile 0 0 0)
+      nudge key = do
+        let origin = keyOrigin key
+        x ← either (const Nothing) Just (axisFromInteger (toInteger (axisValue (tileX origin)) + 1))
+        mkComponentKey origin {tileX = x} (keyParameters key)
+  it "is Inconsistent (UnknownComponent) for the node class and for knownness" $
+    case canonical >>= \key → (,) key <$> nudge key of
+      Nothing → expectationFailure "a key and its alias are expected"
+      Just (key, alias) → do
+        alias `shouldNotBe` key
+        observedValue (queryNodeClass (rigEnv rig) provider (SrcNode alias)) `shouldBe` Left (Inconsistent (UnknownComponent alias))
+        observedValue (queryComponentKnown (rigEnv rig) provider alias) `shouldBe` Left (Inconsistent (UnknownComponent alias))
+  it "leaves the canonical key an exterior root and known" $
+    case canonical of
+      Nothing → expectationFailure "a key is expected"
+      Just key → do
+        observedValue (queryNodeClass (rigEnv rig) provider (SrcNode key)) `shouldBe` Right (SrcNode key)
+        observedValue (queryComponentKnown (rigEnv rig) provider key) `shouldBe` Right True
+        mkComponentKey (keyOrigin key) (keyParameters key) `shouldBe` Just key
