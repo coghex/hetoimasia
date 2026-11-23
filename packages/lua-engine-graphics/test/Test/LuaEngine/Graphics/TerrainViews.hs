@@ -2434,6 +2434,26 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         Map.findWithDefault 0 1 (serviceOccupied now) `shouldBe` listed
         (servicePending now, servicePrivate now, serviceSwept now) `shouldBe` (0, 0, [])
 
+    it "retires a build privately, once, when the view's intent advances after its revalidation and before its collection: the collection compares the captured stamps, and the view goes on" $
+      withRig defaultOptions {optProfile = smallProfile {profileSlots = 4, profileQuads = 2048}} $ \rig → do
+        let reading = readTerrainViews (rigViews rig)
+        target ← newTarget 1
+        view ← openOn rig target
+        configured ← newTVarIO Nothing
+        -- between the two boundaries: a configuration, which advances the view's intent revision
+        atomically . writeTVar (rigBeforeCollect rig) . Just $ do
+          built ← subtract 1 <$> readTVarIO (rigNext rig)
+          configureNow view (noConfigure {configureZoom = Just 2}) `shouldReturn` Right ()
+          atomically (writeTVar configured (Just (chunkRef built 1)))
+        settleUntil rig (publishedAtLeast view 1)
+        quiesce rig target
+        stale ← readTVarIO configured >>= maybe (fail "the seam never ran") pure
+        filter (== stale) <$> readTVarIO (rigDisposed rig) `shouldReturn` [stale]
+        now ← atomically reading
+        listed ← atomically (readingListed <$> readView view)
+        Map.findWithDefault 0 1 (serviceOccupied now) `shouldBe` listed
+        (servicePending now, servicePrivate now, serviceSwept now) `shouldBe` (0, 0, [])
+
     it "leaves a build whose collection raised to the sweep, once, with the cause, and the exception goes on to the owner's action" $
       withRig defaultOptions {optProfile = smallProfile {profileSlots = 4, profileQuads = 2048}} $ \rig → do
         let reading = readTerrainViews (rigViews rig)

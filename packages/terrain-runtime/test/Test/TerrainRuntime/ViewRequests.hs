@@ -6,6 +6,7 @@ module Test.TerrainRuntime.ViewRequests (spec) where
 
 import Control.Concurrent.STM (atomically, check, retry)
 import Data.Maybe (isJust)
+import Hetoimasia.Foundation.Messaging.Payload (prepare)
 import Hetoimasia.Foundation.OwnerTx (commit)
 import Hetoimasia.Terrain.Runtime
 import Hetoimasia.Terrain.Runtime.Settlement (TakeOutcome (..))
@@ -77,7 +78,25 @@ spec = describe "a view's sealed requests" $ do
       commit (releaseRegionBorrowTx svc borrow)
       atomically (fst <$> inspectRetainedChargesSTM svc) `shouldReturn` 0
       settleChecks svc
+  it "attaches a view with its first demand together, or writes nothing: an attach under another client's lease is refused and consumes no view identity" $
+    withService defaultConfig $ \svc → do
+      (client, lease) ← openMain svc "view"
+      (_, theirs) ← openMain svc "other"
+      empty ← prepare []
+      first ← commit (attachViewTx svc client lease empty) >>= either (\why → expectationFailure ("refused: " <> show why) >> fail "unreachable") (pure . fst)
+      count ← atomically (inspectViewCountSTM svc)
+      commit (attachViewTx svc client theirs empty) >>= \case
+        Left RefusedAuthority → pure ()
+        Left other → expectationFailure ("refused otherwise: " <> show other)
+        Right _ → expectationFailure "another client's lease was accepted"
+      atomically (inspectViewCountSTM svc) `shouldReturn` count
+      -- the next attachment takes the identity the refused one would have
+      second ← commit (attachViewTx svc client lease empty) >>= either (\why → expectationFailure ("refused: " <> show why) >> fail "unreachable") (pure . fst)
+      numberOf second `shouldBe` numberOf first + 1
+      settleChecks svc
   where
+    -- a view shows as View#n
+    numberOf view = read (drop 5 (show view)) ∷ Int
     borrowOf = \case
       Succeeded (ARegions borrow) → Just borrow
       _ → Nothing

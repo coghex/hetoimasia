@@ -20,6 +20,7 @@
 module Hetoimasia.Terrain.Runtime.Transactions
   ( -- * Views
     openViewTx
+  , attachViewTx
   , closeViewTx
 
     -- * Demand and borrows
@@ -38,7 +39,8 @@ module Hetoimasia.Terrain.Runtime.Transactions
   , cancelViewRequest
   ) where
 
-import Control.Concurrent.STM (STM, TMVar, atomically, newEmptyTMVarIO, tryPutTMVar, tryReadTMVar)
+import Control.Concurrent.STM (STM, TMVar, atomically, catchSTM, newEmptyTMVarIO, throwSTM, tryPutTMVar, tryReadTMVar)
+import Control.Exception (Exception)
 import Control.Monad (void)
 import Data.Word (Word64)
 import Hetoimasia.Foundation.Messaging.Payload (Prepared, preparedValue)
@@ -56,6 +58,25 @@ import Hetoimasia.Terrain.Runtime.Settlement (regionsWith, surfaceWith)
 -- same commit: a closed session refuses it and nothing is made.
 openViewTx ∷ Service → Client → OwnerTx (Either Refused View)
 openViewTx svc client = fromIssuerSTM (openViewSTM svc client)
+
+-- | Attach a view for this client and install its first demand under this lease, as one decision: the view is made and
+-- its demand installed only when every check passes (the parent session's token, the client, the lease being this
+-- client's and live, the demand), and a refusal of any of them writes nothing, the view's identity included.
+attachViewTx ∷ Service → Client → ArenaLease → Prepared [RegionDemand] → OwnerTx (Either Refused (View, DemandReceipt))
+attachViewTx svc client lease demands =
+  -- staged: the attachment and the demand are installed together, or a refusal rolls both back
+  fromIssuerSTM $ (Right <$> staged) `catchSTM` \(StagedRefusal refused) → pure (Left refused)
+  where
+    staged = do
+      view ← openViewSTM svc client >>= either (throwSTM . StagedRefusal) pure
+      receipt ← setViewDemandSTM svc view lease (preparedValue demands) >>= either (throwSTM . StagedRefusal) pure
+      pure (view, receipt)
+
+-- A refusal that ends a staged attachment, rolling back what it had written.
+newtype StagedRefusal = StagedRefusal Refused
+  deriving (Show)
+
+instance Exception StagedRefusal
 
 -- | Detach a view ('Hetoimasia.Terrain.Runtime.closeView'): its demand is withdrawn and it is forgotten, in this commit.
 -- Another service's view, or one already detached, changes nothing.

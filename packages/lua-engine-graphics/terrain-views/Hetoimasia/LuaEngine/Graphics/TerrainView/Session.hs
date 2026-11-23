@@ -159,7 +159,7 @@ import Hetoimasia.Terrain.Residency (ArenaId (..), RegionDemand (..), Revision (
 import Hetoimasia.Terrain.Runtime (ArenaMark (..), ArenaView (viewGeneration, viewKnowledgeRevision, viewPalette, viewRevision), Settlement (..))
 import qualified Hetoimasia.Terrain.Runtime as Runtime
 import Hetoimasia.Terrain.Runtime.Settlement (TakeOutcome (..))
-import Hetoimasia.Terrain.Runtime.Transactions (ViewRequest, cancelViewRequest, closeViewTx, openViewTx, releaseRegionBorrowTx, requestViewRegions, requestViewSurface, retireViewRequestTx, setViewDemandTx, takeViewRequestTx, viewRequestSettled)
+import Hetoimasia.Terrain.Runtime.Transactions (ViewRequest, cancelViewRequest, attachViewTx, closeViewTx, releaseRegionBorrowTx, requestViewRegions, requestViewSurface, retireViewRequestTx, setViewDemandTx, takeViewRequestTx, viewRequestSettled)
 import Hetoimasia.Terrain.Shape (ViewFacing)
 import Numeric.Natural (Natural)
 
@@ -1197,26 +1197,24 @@ commitOpen service request style markCell camera = do
   case refused of
     Just why → pure (Left why)
     Nothing →
-      openViewTx terrain (portClient ports) >>= \case
+      -- the runtime view and its empty demand, staged: a refusal of either writes nothing in the runtime
+      attachViewTx terrain (portClient ports) (openLease request) (svNoDemand service) >>= \case
         Left why → pure (Left (OpenArena why))
-        Right rview →
-          setViewDemandTx terrain rview (openLease request) (svNoDemand service) >>= \case
-            Left why → Left (OpenArena why) <$ closeViewTx terrain rview
-            Right _ → do
-              (vs, geometry) ← own $ do
-                vs ← newViewState service request style rview markCell camera
-                -- the claim is free: this commit read it so
-                _ ← takeClaim (portClaims ports) key (vsId vs)
-                forM_ (Set.toList (styleParents style)) (ledgerRetainInterest (portLedger ports))
-                modifyTVar' (svViews service) (Map.insert (vsId vs) vs)
-                openReceipt (portReceipts ports) (vsId vs)
-                surfaceBind (vtSurface target)
-                (,) vs <$> surfaceGeometry (vtSurface target)
-              -- a target that shows nothing yet is asked for its first frame with the real empty revision; one that
-              -- shows a scene keeps it until the view's first revision replaces it (its frame gives the metrics): its
-              -- host decides
-              when (geometry == GeometryUnknown) (surfacePublishUnlessShown (vtSurface target) (portInitial ports))
-              pure (Right vs)
+        Right (rview, _) → do
+          (vs, geometry) ← own $ do
+            vs ← newViewState service request style rview markCell camera
+            -- the claim is free: this commit read it so
+            _ ← takeClaim (portClaims ports) key (vsId vs)
+            forM_ (Set.toList (styleParents style)) (ledgerRetainInterest (portLedger ports))
+            modifyTVar' (svViews service) (Map.insert (vsId vs) vs)
+            openReceipt (portReceipts ports) (vsId vs)
+            surfaceBind (vtSurface target)
+            (,) vs <$> surfaceGeometry (vtSurface target)
+          -- a target that shows nothing yet is asked for its first frame with the real empty revision; one that
+          -- shows a scene keeps it until the view's first revision replaces it (its frame gives the metrics): its
+          -- host decides
+          when (geometry == GeometryUnknown) (surfacePublishUnlessShown (vtSurface target) (portInitial ports))
+          pure (Right vs)
 
 -- ---------------------------------------------------------------------------
 -- Controls
@@ -1831,25 +1829,53 @@ abandon service vs serial = do
 stillCurrent ∷ TerrainViews k → ViewState k → Word64 → Basis → Maybe (Maybe JumpId) → STM Bool
 stillCurrent service vs serial basis jump = currentBy serial basis jump <$> liveWitness service vs
 
--- | Everything a view's work being current depends on, as one read gives it: the stage's serial, the view's and the
--- service's standing, the owner's gate, the target's usability and its facts' version, the original authority, the
--- arena lease, the full basis and the camera's pending jump. Strict: a read is evidence, compared whole with a later
--- one, so a change between them is seen even if it was changed back.
+-- | The writer-maintained stamps a view's work rests on: the identities and revisions its writers advance, read as they
+-- stand and computed from nothing: the stage's serial, the view's and the service's lifecycle, the owner's gate, the
+-- target's standing and its facts' version, each original authority's mark, the arena's mark, the view's intent
+-- revision and the camera's pending jump. Strict: equal stamps, read in two transactions, mean none of them changed
+-- between them, a change made and undone included. A build's collection compares only these.
+data Stamps = Stamps
+  { stampSerial ∷ !Word64
+  , stampStatus ∷ !ViewStatus
+  , stampOpen ∷ !Bool
+  , stampEnded ∷ !Bool
+  , stampGone ∷ !Bool
+  , stampUsable ∷ !Bool
+  , _stampAuthorities ∷ ![AuthorityMark]
+    -- ^ This and the next three are compared only as part of the whole.
+  , _stampFacts ∷ !SurfaceVersion
+  , _stampArena ∷ !(Maybe ArenaMark)
+  , _stampIntent ∷ !Word64
+  , stampPending ∷ !(Maybe JumpId)
+  }
+  deriving (Eq)
+
+-- | The stamps as their writers' cells hold them now: reads of the service's own cells, the target's and the leases'
+-- issued readers and the terrain service's mark cell. Nothing waits, and nothing is derived.
+stampsOf ∷ TerrainViews k → ViewState k → STM Stamps
+stampsOf service vs =
+  Stamps
+    <$> readTVar (vsStageSerial vs)
+    <*> readTVar (vsStatus vs)
+    <*> readTVar (svOpen service)
+    <*> (isJust <$> readTVar (svEnded service))
+    -- the graphics owner's own gate, live: work an owner step carries past its exit's start is stale
+    <*> (isJust <$> ownerEnded (portOwner (svPorts service)))
+    <*> surfaceUsable (vtSurface (vsTarget vs))
+    <*> authorityRevisions vs
+    <*> surfaceVersion (vtSurface (vsTarget vs))
+    <*> vsMarkCell vs
+    <*> readTVar (vsIntent vs)
+    <*> (fmap pendingId . camPending <$> readTVar (vsCamera vs))
+
+-- | A view's work, revalidated: its stamps, and what the work's preparation is checked against (the original
+-- authority live, the arena held, the full basis). Captured in one read-only transaction outside any commit and forced
+-- there; a collection then compares the stamps alone.
 data Witness = Witness
-  { witnessSerial ∷ !Word64
-  , witnessStatus ∷ !ViewStatus
-  , witnessOpen ∷ !Bool
-  , witnessEnded ∷ !Bool
-  , witnessGone ∷ !Bool
-  , witnessUsable ∷ !Bool
+  { witnessStamps ∷ !Stamps
   , witnessAuthority ∷ !Bool
-  , _witnessAuthorities ∷ ![AuthorityMark]
-    -- ^ Each authority's revision: compared only as part of the whole witness.
   , witnessArena ∷ !Bool
   , witnessBasis ∷ !Basis
-  , _witnessFacts ∷ !SurfaceVersion
-    -- ^ Compared only as part of the whole witness.
-  , witnessPending ∷ !(Maybe JumpId)
   }
   deriving (Eq)
 
@@ -1861,36 +1887,29 @@ witnessOf service vs = liveWitness service vs <* surfaceRevalidation (vtSurface 
 -- | The witness of a view's work as its writers' cells give it now, through the service's own cells and the target's,
 -- the leases' and the terrain service's concrete readers: no caller's transaction, and none that waits.
 liveWitness ∷ TerrainViews k → ViewState k → STM Witness
-liveWitness service vs = do
-  serial ← readTVar (vsStageSerial vs)
-  status ← readTVar (vsStatus vs)
-  open ← readTVar (svOpen service)
-  ended ← isJust <$> readTVar (svEnded service)
-  -- the graphics owner's own gate, live: work an owner step carries past its exit's start is stale
-  gone ← isJust <$> ownerEnded (portOwner (svPorts service))
-  usable ← surfaceUsable (vtSurface (vsTarget vs))
-  authority ← authorityOf vs
-  marks ← authorityRevisions vs
-  arena ← isJust <$> Runtime.inspectArenaSTM (portTerrain (svPorts service)) (vsLease vs)
-  now ← currentBasis service vs
-  facts ← surfaceVersion (vtSurface (vsTarget vs))
-  pending ← fmap pendingId . camPending <$> readTVar (vsCamera vs)
-  pure (Witness serial status open ended gone usable authority marks arena now facts pending)
+liveWitness service vs =
+  Witness
+    <$> stampsOf service vs
+    <*> authorityOf vs
+    <*> (isJust <$> Runtime.inspectArenaSTM (portTerrain (svPorts service)) (vsLease vs))
+    <*> currentBasis service vs
 
 -- | Whether a witness finds the work of this stage serial and basis current (and, for work that settles a move, the
 -- camera's pending jump the one captured).
 currentBy ∷ Word64 → Basis → Maybe (Maybe JumpId) → Witness → Bool
 currentBy serial basis jump witness =
-  witnessSerial witness == serial
-    && witnessStatus witness == ViewOpen
-    && witnessOpen witness
-    && not (witnessEnded witness)
-    && not (witnessGone witness)
-    && witnessUsable witness
+  stampSerial stamps == serial
+    && stampStatus stamps == ViewOpen
+    && stampOpen stamps
+    && not (stampEnded stamps)
+    && not (stampGone stamps)
+    && stampUsable stamps
     && witnessAuthority witness
     && witnessArena witness
     && witnessBasis witness == basis
-    && maybe True (== witnessPending witness) jump
+    && maybe True (== stampPending stamps) jump
+  where
+    stamps = witnessStamps witness
 
 -- | The view's original authority, as its open checked it: the caller's lease of the target and of the style's parents.
 authorityOf ∷ ViewState k → STM Bool
@@ -2436,9 +2455,10 @@ collectBuild service vs serial basis evidence key = do
            Nothing → pure False
            Just outcome → own $ do
              modifyTVar' (svPending service) (Map.delete key)
-             -- the evidence against the writers' cells now: no source changed since the revalidation read it
-             now ← liveWitness service vs
-             let current = pbSerial entry == serial && currentBy serial basis Nothing evidence && evidence == now
+             -- the revalidation's captured stamps against the writers' stamps now: identities and revisions only, nothing
+             -- recomputed (the evidence itself was checked against the basis when it was captured)
+             now ← stampsOf service vs
+             let current = pbSerial entry == serial && currentBy serial basis Nothing evidence && witnessStamps evidence == now
              stage ← readTVar (vsStage vs)
              case (outcome, stage) of
                (Right chunk, Building p c)
