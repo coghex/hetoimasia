@@ -37,18 +37,24 @@ int hetoimasia_test_support_child_state(pid_t pid, int block, int *code) {
 #if defined(__APPLE__)
 
 int hetoimasia_test_support_group_has_other(pid_t pgid, pid_t leader) {
-  /* proc_listpids answers the bytes it filled, so a full buffer may have cut the
-   * list short: grow it until it is not full. */
+  /* proc_listpids answers the bytes it filled: zero is an empty group or a failure, which only errno tells apart (an undersized
+   * buffer fails with ENOMEM), and a full buffer may have cut the list short. Grow it until the answer is neither. */
   int capacity = 256;
   for (;;) {
     pid_t *members = malloc((size_t)capacity * sizeof *members);
     if (members == NULL) {
       return -ENOMEM;
     }
+    errno = 0;
     int bytes = proc_listpids(PROC_PGRP_ONLY, (uint32_t)pgid, members, capacity * (int)sizeof *members);
-    if (bytes < 0) {
+    int failure = errno;
+    if (bytes < 0 || (bytes == 0 && failure != 0)) {
       free(members);
-      return -EIO;
+      if (failure == ENOMEM && capacity < (1 << 20)) {
+        capacity *= 4;
+        continue;
+      }
+      return -(failure != 0 ? failure : EIO);
     }
     int count = bytes / (int)sizeof *members;
     if (count < capacity) {
@@ -63,33 +69,39 @@ int hetoimasia_test_support_group_has_other(pid_t pgid, pid_t leader) {
       return found;
     }
     free(members);
+    if (capacity >= (1 << 20)) {
+      return -ENOMEM;
+    }
     capacity *= 4;
   }
 }
 
 #elif defined(__linux__)
 
-/* The process group of /proc/<pid>/stat, or -1: the fields after the command name, which is
- * parenthesised and may itself hold parentheses and spaces, are "state ppid pgrp". */
+/* The process group of /proc/<pid>/stat: a group (>= 0), -1 when the process is gone (not a member), -2 when it cannot be read.
+ * The whole file is read, not a line: the command name is parenthesised and may hold parentheses, spaces and newlines, so the fields
+ * "state ppid pgrp" are found after the last ')'. */
 static int group_of(const char *entry) {
   char path[64];
   snprintf(path, sizeof path, "/proc/%s/stat", entry);
   FILE *stat = fopen(path, "r");
   if (stat == NULL) {
-    return -1;
+    return (errno == ENOENT || errno == ESRCH) ? -1 : -2;
   }
-  char line[1024];
-  char *read = fgets(line, sizeof line, stat);
+  char text[4096];
+  size_t length = fread(text, 1, sizeof text - 1, stat);
+  int failure = ferror(stat) ? errno : 0;
   fclose(stat);
-  if (read == NULL) {
-    return -1;
+  if (failure != 0) {
+    return failure == ESRCH ? -1 : -2;
   }
-  char *close = strrchr(line, ')');
+  text[length] = '\0';
+  char *close = strrchr(text, ')');
   int ppid = 0;
   int group = 0;
   char state = 0;
   if (close == NULL || sscanf(close + 1, " %c %d %d", &state, &ppid, &group) != 3) {
-    return -1;
+    return -2;
   }
   return group;
 }
@@ -100,19 +112,35 @@ int hetoimasia_test_support_group_has_other(pid_t pgid, pid_t leader) {
     return -errno;
   }
   int found = 0;
+  int unknown = 0;
   struct dirent *entry;
+  errno = 0;
   while (!found && (entry = readdir(table)) != NULL) {
     if (!isdigit((unsigned char)entry->d_name[0])) {
       continue;
     }
     pid_t candidate = (pid_t)atoi(entry->d_name);
-    /* An entry that vanished while the table was being read is a process that is gone: not a member. */
-    if (candidate != leader && group_of(entry->d_name) == (int)pgid) {
-      found = 1;
+    if (candidate == leader) {
+      continue;
     }
+    int group = group_of(entry->d_name);
+    if (group == (int)pgid) {
+      found = 1;
+    } else if (group == -2) {
+      unknown = 1;
+    }
+    errno = 0;
   }
+  int failure = errno;
   closedir(table);
-  return found;
+  if (found) {
+    return 1;
+  }
+  /* A miss certifies nothing when a process could not be read or the table could not be walked to its end. */
+  if (failure != 0) {
+    return -failure;
+  }
+  return unknown ? -EIO : 0;
 }
 
 #else
