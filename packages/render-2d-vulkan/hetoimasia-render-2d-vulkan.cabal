@@ -81,6 +81,9 @@ library
         template-haskell >=2.24 && <2.25,
         text >=2.1 && <2.2,
         hetoimasia-asset ==0.1.0.0,
+        hetoimasia-foundation ==0.1.0.0,
+        -- the issuer bridge, for the registry's ownership operations (Chunks)
+        hetoimasia-foundation:owner-tx-issuer ==0.1.0.0,
         hetoimasia-gpu-vulkan-native ==0.1.0.0,
         hetoimasia-math ==0.1.0.0,
         hetoimasia-render-2d ==0.1.0.0,

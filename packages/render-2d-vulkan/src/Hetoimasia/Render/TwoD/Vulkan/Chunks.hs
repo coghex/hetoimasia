@@ -121,6 +121,17 @@ module Hetoimasia.Render.TwoD.Vulkan.Chunks
   , isChunkReleased
   , releaseChunkNow
   , liveChunks
+
+    -- * Ownership operations
+    -- $ownership
+  , chunkRoomTx
+  , admitRetainedChunkTx
+  , abandonChunkGrantTx
+  , receiptOutcomeTx
+  , claimReceiptTx
+  , sweepRegistryTx
+  , receiptsHeldTx
+  , chunkStandingTx
   ) where
 
 import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVar, newTVarIO, readTVar, readTVarIO, writeTVar)
@@ -155,7 +166,9 @@ import Hetoimasia.Render.TwoD.Chunk.Backend (chunkRef, chunkRefGeneration, chunk
 import Hetoimasia.Render.TwoD.DrawPlan (CutoutMarks)
 import Hetoimasia.Render.TwoD.Encoding (encodeChunkCutouts)
 import Hetoimasia.Render.TwoD.Snapshot (Instance)
-import Hetoimasia.Render.TwoD.Vulkan.Builders (BufferUploadRefusal (..), BufferUploads, Builders (..), reserveRoom, uploadGranted)
+import Hetoimasia.Render.TwoD.Vulkan.Builders (BufferUploadRefusal (..), BufferUploads, Builders (..), reserveRoom, roomFor, uploadGranted)
+import Hetoimasia.Foundation.OwnerTx (OwnerTx)
+import Hetoimasia.Foundation.OwnerTx.Issuer (fromIssuerSTM)
 import Numeric.Natural (Natural)
 
 -- | The registry of retained chunks.
@@ -403,16 +416,16 @@ data GrantStanding = GrantReserved | GrantSpending !MadeBuffer | GrantSealed
   deriving (Eq, Show)
 
 -- | Whether a chunk of this many bytes would be admitted now, read-only: the
--- decision 'admitRetainedChunk' makes, with the uploads' room observed through
--- this reading.
-chunkRoom ∷ (Natural → STM (Either BufferUploadRefusal ())) → Retained → Natural → STM (Either BuildRefusal ())
-chunkRoom room (Retained ledger) bytes = do
+-- decision 'admitRetainedChunk' makes, with the room of these uploads observed
+-- ('roomFor').
+chunkRoom ∷ BufferUploads → Retained → Natural → STM (Either BuildRefusal ())
+chunkRoom uploads (Retained ledger) bytes = do
   held ← readTVar ledger
   case nextReference held of
     Nothing → pure (Left BuildReferencesExhausted)
     Just _
       | bytes == 0 → pure (Right ())
-      | otherwise → either (Left . uploadRefusal) Right <$> room bytes
+      | otherwise → either (Left . uploadRefusal) Right <$> roomFor uploads bytes
 
 -- | Admit a prepared chunk in one transaction: its reference, and for a chunk
 -- with bytes its upload's room, reserved in the decision every upload shares.
@@ -757,3 +770,42 @@ releaseChunkNow builders (Retained ledger) reference = do
             , ledgerGenerations = generations
             , ledgerFree = if next == 0 then ledgerFree current else ledgerFree current <> [index]
             }
+
+-- $ownership
+-- The registry's decisions as ownership operations, for a holder composing them with its own facts in one
+-- 'Hetoimasia.Foundation.OwnerTx.commit'. Each is the transaction of the same name, embedded through the issuer bridge:
+-- it reads only the registry's cells, the grant and receipt handles it issued and the uploads' own decisions over
+-- 'BufferUploads' (data, no holder code: the native uploads' room, reservation and return), validates before it
+-- writes, answers a refusal as data and never waits or raises.
+
+-- | 'chunkRoom' in a commit: read-only.
+chunkRoomTx ∷ BufferUploads → Retained → Natural → OwnerTx (Either BuildRefusal ())
+chunkRoomTx uploads retained bytes = fromIssuerSTM (chunkRoom uploads retained bytes)
+
+-- | 'admitRetainedChunk' in a commit: the reference and the upload's room reserved together, or neither.
+admitRetainedChunkTx ∷ BufferUploads → Retained → PreparedChunk → OwnerTx (Either BuildRefusal ChunkGrant)
+admitRetainedChunkTx uploads retained prepared = fromIssuerSTM (admitRetainedChunk uploads retained prepared)
+
+-- | 'abandonChunkGrant' in a commit.
+abandonChunkGrantTx ∷ Retained → ChunkGrant → OwnerTx ()
+abandonChunkGrantTx retained grant = fromIssuerSTM (abandonChunkGrant retained grant)
+
+-- | 'receiptOutcome' in a commit: read-only.
+receiptOutcomeTx ∷ BuildReceipt → OwnerTx (Maybe (Either BuildRefused ChunkRef))
+receiptOutcomeTx receipt = fromIssuerSTM (receiptOutcome receipt)
+
+-- | 'claimReceipt' in a commit.
+claimReceiptTx ∷ BuildReceipt → OwnerTx (Maybe (Either BuildRefused ChunkRef))
+claimReceiptTx receipt = fromIssuerSTM (claimReceipt receipt)
+
+-- | 'sweepRegistry' in a commit.
+sweepRegistryTx ∷ Retained → OwnerTx [(Word64, Either BuildRefused ChunkRef)]
+sweepRegistryTx retained = fromIssuerSTM (sweepRegistry retained)
+
+-- | 'receiptsHeld' in a commit: read-only.
+receiptsHeldTx ∷ Retained → OwnerTx (Int, Int)
+receiptsHeldTx retained = fromIssuerSTM (receiptsHeld retained)
+
+-- | 'chunkStandingSTM' in a commit: read-only.
+chunkStandingTx ∷ Retained → ChunkRef → OwnerTx (Maybe ChunkStanding)
+chunkStandingTx retained reference = fromIssuerSTM (chunkStandingSTM retained reference)

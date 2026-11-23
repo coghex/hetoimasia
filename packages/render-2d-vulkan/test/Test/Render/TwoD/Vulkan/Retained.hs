@@ -743,7 +743,7 @@ refusalSpec = describe "refusing a build" $ do
           prepared = either (error . show) id (prepareRetainedChunk artMarks ChunkWorldDepth DeriveBounds Map.empty [cutAt 0 1])
           admit uploads = fmap (const ()) <$> atomically (admitRetainedChunk uploads (setupRetained setup) prepared)
       admit awaiting `shouldReturn` Left BuildUploadsNotReady
-      atomically (chunkRoom (roomFor awaiting) (setupRetained setup) (preparedBytes prepared)) `shouldReturn` Left BuildUploadsNotReady
+      atomically (chunkRoom awaiting (setupRetained setup) (preparedBytes prepared)) `shouldReturn` Left BuildUploadsNotReady
       atomically (writeTVar standing (UploadsMade (rigUploads rig)))
       admit awaiting `shouldReturn` Right ()
       lacking UploadsUnconfigured >>= admit >>= (`shouldBe` Left (BuildUploadsUnavailable "the host configured no uploads"))

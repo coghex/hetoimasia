@@ -148,6 +148,8 @@ module Hetoimasia.LuaEngine.Texture
   , accountCharged
   , accountReserve
   , accountRelease
+  , accountReserveTx
+  , accountReleaseTx
   , AccountDefect (..)
 
     -- * The backend

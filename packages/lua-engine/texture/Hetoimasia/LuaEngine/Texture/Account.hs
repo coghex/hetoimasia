@@ -55,6 +55,8 @@ module Hetoimasia.LuaEngine.Texture.Account
   , accountCharged
   , accountReserve
   , accountRelease
+  , accountReserveTx
+  , accountReleaseTx
   , AccountDefect (..)
 
     -- * One request's hold
@@ -74,6 +76,8 @@ import Control.Exception (Exception)
 import Control.Monad (when)
 import Data.Text (Text)
 import Data.Word (Word64)
+import Hetoimasia.Foundation.OwnerTx (OwnerTx)
+import Hetoimasia.Foundation.OwnerTx.Issuer (fromIssuerSTM)
 
 -- | The shared allowance: a limit and what is charged to it.
 data RenderAccount = RenderAccount
@@ -113,6 +117,20 @@ accountRelease account amount = do
   held ← readTVar (accountHeld account)
   when (amount > held) $ throwSTM (AccountDefect "bytes were returned that the account did not hold")
   writeTVar (accountHeld account) (held - amount)
+
+-- | 'accountReserve' as an ownership operation, for a holder composing the charge with its own facts in one
+-- 'Hetoimasia.Foundation.OwnerTx.commit'.
+accountReserveTx ∷ RenderAccount → Word64 → OwnerTx Bool
+accountReserveTx account wanted = fromIssuerSTM (accountReserve account wanted)
+
+-- | 'accountRelease' as an ownership operation: a return past what the account holds is answered as the defect and
+-- changes nothing, for the holder to raise once its commit is over.
+accountReleaseTx ∷ RenderAccount → Word64 → OwnerTx (Either AccountDefect ())
+accountReleaseTx account amount = fromIssuerSTM $ do
+  held ← readTVar (accountHeld account)
+  if amount > held
+    then pure (Left (AccountDefect "bytes were returned that the account did not hold"))
+    else Right () <$ writeTVar (accountHeld account) (held - amount)
 
 -- | An accounting failure: a return past what was held, or a hold used out of order.
 newtype AccountDefect = AccountDefect Text
