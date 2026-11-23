@@ -45,7 +45,8 @@
 -- * __Identity.__ A 'ComponentKey' is the origin of the component's class and
 --   the values of the class's remaining parameters. It depends on the validated
 --   source and the member's parameters only, never on chunk load order, query
---   order or how the preparation was divided into quanta. The module promises
+--   order or how the preparation was divided into quanta. A rebuilt key names a
+--   component only with its class's exact origin; no query accepts another. The module promises
 --   no public disk encoding and no equivalence between differently authored but
 --   semantically equal recipes.
 --

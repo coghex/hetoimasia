@@ -19,7 +19,7 @@ import Control.Monad (forM_)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (isJust)
 import Hetoimasia.Terrain.Connectivity
-import Hetoimasia.Terrain.Coordinate (axisFromInteger)
+import Hetoimasia.Terrain.Coordinate (TileCoord (..), axisFromInteger, axisValue)
 import Hetoimasia.Terrain.Source (CellSpec (..), LayerSpec (..), PatchSpec (..), SourceSpec (..))
 import Test.Hspec
 import Test.Terrain.ConnectivityFixtures
@@ -80,6 +80,71 @@ spec = describe "Source connectivity" $ do
       sameKey c (0, 0, 0) (lowest, highest, highest) `shouldBe` True
       exteriorAt c (3, 3, lowest) `shouldBe` Just True
 
+  describe "reconstructed component keys" $ do
+    let nudged key = do
+          origin ← Just (keyOrigin key)
+          x ← either (const Nothing) Just (axisFromInteger (toInteger (axisValue (tileX origin)) + 1))
+          mkComponentKey origin {tileX = x} (keyParameters key)
+        -- Every source query refuses the key, whichever way it resolves it.
+        refused c k = do
+          isExterior c k `shouldBe` Nothing
+          componentRanges c k `shouldBe` Nothing
+          componentRelations c k `shouldBe` Nothing
+          componentBoundary c k `shouldBe` Nothing
+        accepted c k = do
+          fmap (const ()) (isExterior c k) `shouldBe` Just ()
+          fmap (const ()) (componentRanges c k) `shouldBe` Just ()
+          fmap (const ()) (componentRelations c k) `shouldBe` Just ()
+          fmap (const ()) (componentBoundary c k) `shouldBe` Just ()
+        tileOf (x, y, z) = mustTile x y z
+    it "accepts a valid reconstruction of a wholly air key with its original results" $ do
+      let c = compiled (world [] [])
+      case keyAt c (0, 0, 0) of
+        Nothing → expectationFailure "a key is expected"
+        Just key → do
+          let rebuilt = mkComponentKey (keyOrigin key) (keyParameters key)
+          rebuilt `shouldBe` Just key
+          forM_ rebuilt $ \k → do
+            accepted c k
+            isExterior c k `shouldBe` isExterior c key
+            componentRanges c k `shouldBe` componentRanges c key
+            componentContains c k (tileOf (0, 0, 0)) `shouldBe` True
+    it "refuses an interior-origin alias of a wholly air key on every query" $ do
+      let c = compiled (world [] [])
+      case keyAt c (0, 0, 0) >>= \key → (,) key <$> nudged key of
+        Nothing → expectationFailure "an alias is expected"
+        Just (key, alias) → do
+          alias `shouldNotBe` key
+          refused c alias
+          componentContains c alias (tileOf (0, 0, 0)) `shouldBe` False
+    forM_ spans $ \l → do
+      let c = compiled (world (cover 0 l 1) [])
+          mid = l `div` 2
+      it ("accepts a valid reconstruction of a parameterized key and refuses its interior-origin alias, over " <> show l <> " levels") $
+        case keyAt c (0, 3, mid) of
+          Nothing → expectationFailure "a key is expected"
+          Just key → do
+            map fst (keyParameters key) `shouldBe` [AxisY, AxisZ]
+            let rebuilt = mkComponentKey (keyOrigin key) (keyParameters key)
+            rebuilt `shouldBe` Just key
+            forM_ rebuilt $ \k → do
+              accepted c k
+              componentRanges c k `shouldBe` componentRanges c key
+              componentContains c k (tileOf (0, 3, mid)) `shouldBe` True
+            case nudged key of
+              Nothing → expectationFailure "an alias is expected"
+              Just alias → do
+                alias `shouldNotBe` key
+                refused c alias
+                componentContains c alias (tileOf (0, 3, mid)) `shouldBe` False
+      it ("refuses a parameterized key with missing, extra or out-of-range parameters, over " <> show l <> " levels") $
+        case keyAt c (0, 3, mid) of
+          Nothing → expectationFailure "a key is expected"
+          Just key → do
+            let ax n = either (error . show) id (axisFromInteger n)
+                origin = keyOrigin key
+            forM_ [mkComponentKey origin [], mkComponentKey origin (take 1 (keyParameters key)), mkComponentKey origin ((AxisX, ax 0) : keyParameters key), mkComponentKey origin [(AxisY, ax 3), (AxisZ, ax (l + 5))]] $ \rebuilt →
+              forM_ rebuilt (refused c)
   describe "covered air" $ do
     forM_ spans $ \g → do
       let slab patches = compiled (world [stoneLayer Nothing (Just (negate g)), stoneLayer (Just g) Nothing] patches)
