@@ -48,6 +48,20 @@ spec = describe "releasing" $ do
       _ ← awaitScheduledTerminal control owner
       releases <$> history fixture >>= (`shouldBe` ["release early.b", "release early.a", "release kept.b", "release kept.a"])
 
+  it "publishes a handle's liveness with every change: live once registered, ended in the transaction that begins its release" $ bounded $ do
+    fixture ← newLFix 4
+    let base = lfBase fixture
+    withBoundary $ \control runtime → do
+      owner ← startLeased fixture runtime "watched" [watchesLiveness] leaseConfig requiredPolicy
+      _ ← admit base owner "a" (moduleNamed "watcheslive")
+      awaitPhase base owner "a" Active
+      -- the reservation made it unpublished (revision 0); its registration published it live, and the release's
+      -- beginning ended it
+      filter (Text.isPrefixOf "liveness ") <$> history fixture >>= (`shouldBe` ["liveness (1,True)", "liveness (2,False)"])
+      retireScheduled owner
+      _ ← awaitScheduledTerminal control owner
+      pure ()
+
   it "refuses every other use of a retired handle before the binding's action runs" $ bounded $ do
     fixture ← newLFix 4
     let base = lfBase fixture

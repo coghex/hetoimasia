@@ -33,6 +33,7 @@ module Test.LuaRuntime.Instance.Lease.Support
   , overwrites
   , losesTheHandle
   , releasesEarly
+  , watchesLiveness
   , usesRetired
   , failingConstructor
   , unpublishable
@@ -87,6 +88,7 @@ import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as Text
+import Hetoimasia.Foundation.OwnerTx (Publication, watchPublication)
 import Hetoimasia.Foundation.Resource (Assembly, acquirePart, releaseRank, restoredStep)
 import Hetoimasia.Runtime.Supervision (WorkerPolicy, WorkerStatus (WorkerLive, WorkerStopped))
 import Hetoimasia.Scripting.Lua.Instance
@@ -131,6 +133,8 @@ data LFix = LFix
     -- ^ Opened by the example to let a release at its gate go on.
   , lfThrowing ∷ !(TVar (Map Text QueryFault))
     -- ^ The resources whose provider's query of where its retirement has got to fails, and how.
+  , lfWatched ∷ !(IORef (Maybe (Publication Bool)))
+    -- ^ The liveness publication of the first handle the script watched ('watchesLiveness').
   }
 
 -- | Every gate of the fixture opens: the instance fixture's, and the one a release waits at.
@@ -143,7 +147,7 @@ newLFix capacity = do
   base ← newIFixture
   lending ← newLending
   leases ← newLeases lending capacity
-  LFix base lending leases <$> newIORef Set.empty <*> newIORef Map.empty <*> newIORef Map.empty <*> newIORef Set.empty <*> newEmptyMVar <*> newEmptyMVar <*> newTVarIO Map.empty
+  LFix base lending leases <$> newIORef Set.empty <*> newIORef Map.empty <*> newIORef Map.empty <*> newIORef Set.empty <*> newEmptyMVar <*> newEmptyMVar <*> newTVarIO Map.empty <*> newIORef Nothing
 
 -- | Record that something happened, in the order the hooks and the fakes share.
 note ∷ LFix → Text → IO ()
@@ -408,6 +412,25 @@ leaseNamespace fixture =
           answer ← withLeaseOr (lfLeases fixture) (capabilityKey handle) (pure . ("refused: " <>)) (\name → pure ("ok " <> (name ∷ Text)))
           pure [VText answer]
         _ → pure []
+    , -- The handle's liveness as its table publishes it: the first call keeps the publication, and every call records
+      -- what it reads now, its revision and its value.
+      stateOperation "liveness" [SCapability "res"] [SText] $ \arguments → case arguments of
+        [VCapability handle] → do
+          kept ← readIORef (lfWatched fixture) >>= \case
+            Just publication → pure (Just publication)
+            Nothing → do
+              found ← atomically (leaseLiveness (lfLeases fixture) (capabilityKey handle))
+              atomicModifyIORef' (lfWatched fixture) (const (found, ()))
+              pure found
+          reading ← maybe (pure "absent") (fmap (Text.pack . show) . atomically . watchPublication) kept
+          note fixture ("liveness " <> reading)
+          pure [VText reading]
+        _ → pure []
+    , -- The kept publication read again, with no handle: one released is refused to every binding but the release.
+      stateOperation "watched" [] [SText] $ \_ → do
+        reading ← readIORef (lfWatched fixture) >>= maybe (pure "absent") (fmap (Text.pack . show) . atomically . watchPublication)
+        note fixture ("liveness " <> reading)
+        pure [VText reading]
     , releaseOperation "release" "res" [SText] $ \arguments → case arguments of
         [VCapability handle] → do
           answer ← releaseLease (lfLeases fixture) (capabilityKey handle)
@@ -575,6 +598,19 @@ releasesEarly =
     , "  " <> record <> "('third ' .. lease.release(h))"
     , "end"
     , "function shutdown(self, reason) " <> record <> "('shutdown ' .. self.id) end"
+    ]
+
+-- | Watches a handle's liveness publication before and after its early release.
+watchesLiveness ∷ ModuleSource
+watchesLiveness =
+  hooksModule
+    "watcheslive"
+    [ "function init(self, api)"
+    , "  local h = lease.open('watched')"
+    , "  lease.liveness(h)"
+    , "  lease.release(h)"
+    , "  lease.watched()"
+    , "end"
     ]
 
 -- | Releases a handle and then uses it, which every operation but the release refuses.
