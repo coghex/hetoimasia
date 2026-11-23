@@ -13,6 +13,7 @@ module Test.GPU.Vulkan.Diagnostics.Support
   , awaitEntered
   , gatedLogger
   , failingLogger
+  , undescribableLogger
   , switchedLogger
   , SinkFailure (..)
 
@@ -49,7 +50,7 @@ import Control.Concurrent.STM
   , readTVarIO
   , writeTVar
   )
-import Control.Exception (Exception, throwIO)
+import Control.Exception (AsyncException (ThreadKilled), Exception (..), throw, throwIO)
 import Control.Exception.Annotation (ExceptionAnnotation)
 import qualified Data.Map.Strict as Map
 import Data.Word (Word64)
@@ -156,6 +157,19 @@ failingLogger = do
         atomically (modifyTVar' attempts (+ 1))
         throwIO SinkFailure
   pure (mkLoggerWith everythingFilter fixedMetadata sink, attempts)
+
+-- | What a sink throws whose description raises a cancellation when it is rendered.
+data UndescribableSinkFailure = UndescribableSinkFailure
+
+instance Show UndescribableSinkFailure where
+  show _ = throw ThreadKilled
+
+instance Exception UndescribableSinkFailure where
+  displayException _ = throw ThreadKilled
+
+-- | A logger whose sink fails every write with a failure that cannot be described.
+undescribableLogger ∷ IO Logger
+undescribableLogger = pure (mkLoggerWith everythingFilter fixedMetadata (callbackSink (\_ → throwIO UndescribableSinkFailure)))
 
 -- | A sink that delivers until its switch is set, and fails every write after.
 switchedLogger ∷ IO (Logger, TVar Bool)

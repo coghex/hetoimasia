@@ -13,7 +13,7 @@ module Test.GPU.Vulkan.Diagnostics.Lifetime (spec) where
 import Control.Concurrent (killThread, throwTo, yield)
 import Control.Monad (forM_, replicateM_, when)
 import Data.Word (Word64)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, takeMVar)
 import Control.Concurrent.STM (atomically, check, modifyTVar', newTVarIO, readTVar, readTVarIO, retry, writeTVar)
 import Control.Exception
   ( AsyncException (ThreadKilled, UserInterrupt)
@@ -282,6 +282,17 @@ spec = describe "Lifetime" $ do
       verdictIssues verdict `shouldBe` [RecordsUndelivered 3, ConsumerUnsuccessful]
       -- One write reached the sink and failed; nothing was written about it.
       readTVarIO attempts `shouldReturn` 1
+
+    it "publishes a fixed reason, still a sink failure, when the failure's description raises a cancellation" $ do
+      logger ← undescribableLogger
+      seen ← newEmptyMVar
+      _ ← try @SomeException $
+        capturing logger $ \capture → do
+          offerTo capture (plainOffer SeverityWarning "the first report")
+          requestDrain capture
+          bounded (atomically (captureSinkFailure capture >>= maybe retry pure)) >>= putMVar seen
+      reason ← sinkFailureReason <$> takeMVar seen
+      reason `shouldSatisfy` Text.isInfixOf "describing its failure raised"
 
     it "is observable while the lifetime still captures, from the moment the worker meets it" $ do
       (logger, _) ← failingLogger

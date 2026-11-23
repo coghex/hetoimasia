@@ -168,6 +168,7 @@ import Control.Exception
   , ExceptionWithContext (ExceptionWithContext)
   , SomeAsyncException
   , SomeException
+  , evaluate
   , fromException
   , mask
   , mask_
@@ -413,6 +414,10 @@ captureSinkFailure = readTVar . handleSinkFailure
 -- read it inside one of its own transactions.
 readCaptureSinkFailure ∷ DiagnosticCapture → IO (Maybe SinkFailure)
 readCaptureSinkFailure = readTVarIO . handleSinkFailure
+
+-- The reason published for a sink failure whose own description raised.
+undescribedSinkFailure ∷ Text
+undescribedSinkFailure = "the diagnostic sink failed, and describing its failure raised"
 
 -- | A sink failure as the worker met it.
 newtype SinkFailure = SinkFailure
@@ -957,7 +962,17 @@ drainWorker config logger storage capture =
                             -- known; then it is published, so an owner's
                             -- checkpoint sees it while the lifetime runs.
                             noteSinkFailure (handleUserData capture)
-                            atomically (writeTVar (handleSinkFailure capture) (Just (SinkFailure (Text.pack (displayException exception)))))
+                            -- The reason is rendered and forced here, in protected IO, after the claim: one whose
+                            -- description raises is published as a fixed one, still a sink failure, and a cancellation
+                            -- met while rendering it goes on once that is published. No reader evaluates it later.
+                            rendered ← tryWithContext @SomeException (evaluate (Text.pack (displayException exception)) >>= \text → text <$ evaluate (Text.length text))
+                            let (reason, pending) = case rendered of
+                                  Right text → (text, Nothing)
+                                  Left raised@(ExceptionWithContext _ inner)
+                                    | isJust (fromException inner ∷ Maybe SomeAsyncException) → (undescribedSinkFailure, Just raised)
+                                    | otherwise → (undescribedSinkFailure, Nothing)
+                            atomically (writeTVar (handleSinkFailure capture) (Just (SinkFailure reason)))
+                            mapM_ rethrowIO pending
                 pass
           loop = do
             final ← readTVarIO (handleFinal capture)

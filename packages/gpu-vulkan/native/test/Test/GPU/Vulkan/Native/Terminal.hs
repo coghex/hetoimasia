@@ -82,6 +82,8 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Roots
   , checkpointRootsSettled
   , failRootsSessionBecause
   , failRootsSessionIO
+  , prepareFailure
+  , latchDeviceLoss
   , readRootsTerminal
   , retireRootTarget
   , retireRoots
@@ -246,6 +248,17 @@ spec = describe "Terminal failure" $ do
       atomically (rootsFailedCause (rigRoots rig')) `shouldReturn` Nothing
       clean rig'
 
+    it "prepares a failure's kind and description in full before preparation returns: a kind that raises raises there" $ do
+      try @ErrorCall (void (prepareFailure (error "undefined kind") "prepared detail")) `shouldReturn` Left (ErrorCall "undefined kind")
+
+    it "latches a device loss whose detail is cancelled as a device loss with a fixed description, and only then delivers the cancellation" $ do
+      rig ← newRig
+      try @AsyncException (latchDeviceLoss (rigRoots rig) (GraphicsDeviceLost "vkQueueSubmit2" (throw ThreadKilled))) `shouldReturn` Left ThreadKilled
+      atomically (rootsFailedCause (rigRoots rig)) >>= (`shouldSatisfy` \case
+        Just (TerminalDeviceLost loss) → "description raised" `isInfixOf` show loss
+        _ → False)
+      clean rig
+
     it "latches and publishes a failure whose description raises, with a fixed description, never rolling the record back" $ do
       rig ← newRig
       atomically (failRootsSessionBecause (rigRoots rig) CleanupFailed (error "the formatter raised"))
@@ -327,6 +340,21 @@ spec = describe "Terminal failure" $ do
       afterNextAlarms capture (publishSinkFailure capture "the sink is gone")
       atomically (failRootsSessionBecause (rigRoots rig) CleanupFailed "a later cleanup failed")
       primaryIs rig (== TerminalSinkFailed "the sink is gone")
+      evidenceOf rig `shouldReturn` [LaterFailure (TerminalCleanupFailed "a later cleanup failed")]
+      clean rig
+
+    it "keeps a claim's ordering point through the wait for evidence: a validation error that arrives during it comes after the owner's failure" $ do
+      rig ← newRig
+      capture ← newFakeCapture
+      atomically (watchRootsDiagnosticsOrdered (rigRoots rig) (fakeWatch capture))
+      abandonClaim rig
+      -- the sink has failed behind the void claim and not yet published why: the owner's failure waits outside its
+      -- transaction, and during that wait a validation error arrives and the sink publishes
+      noteSinkFailure capture
+      afterNextAlarms capture (reportValidationError capture >> publishSinkFailure capture "the sink is gone")
+      atomically (failRootsSessionBecause (rigRoots rig) CleanupFailed "a later cleanup failed")
+      primaryIs rig (== TerminalSinkFailed "the sink is gone")
+      -- ordered at the claim's point: the sink, then the owner's failure; the validation error came after both
       evidenceOf rig `shouldReturn` [LaterFailure (TerminalCleanupFailed "a later cleanup failed")]
       clean rig
 

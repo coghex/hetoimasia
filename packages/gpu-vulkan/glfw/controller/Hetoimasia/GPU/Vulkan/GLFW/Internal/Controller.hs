@@ -344,7 +344,7 @@ import qualified Data.ByteString.Char8 as Char8
 import Data.Foldable (for_)
 import Data.Functor ((<&>))
 import Data.IORef (newIORef, readIORef, writeIORef)
-import Data.Maybe (isJust, isNothing)
+import Data.Maybe (isJust, isNothing, listToMaybe)
 import Data.List (nubBy)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
@@ -548,7 +548,7 @@ import Hetoimasia.GPU.Vulkan.Native.Roots
   , terminalFailure
   , PreparedFailure
   , prepareFailure
-  , latchPreparedFailure
+  , latchPreparedFailures
   , noteTeardownEvidence
   , readRootsTerminal
   , rootsFailedCause
@@ -1589,7 +1589,7 @@ settleUnannounced state = do
         outcomes ← mapM (bridgeDischarge bridge) obligations
         atomically (modifyTVar' (stateUnannounced state) (Map.delete attachment))
         prepared ← prepareDischarges state "an unannounced attachment's" (zip obligations outcomes)
-        atomically (latchDischarges state prepared)
+        latchDischarges state prepared
         deliverDischarges prepared
         case [failure | Just (ExceptionWithContext _ failure) ← map dischargeFailure outcomes] of
           failure : _ → throwIO (UnannouncedSurfaceUncertain attachment (Text.pack (displayException failure)))
@@ -1914,9 +1914,10 @@ reject
 reject state attachment reason obligations = do
   outcomes ← mapM (bridgeDischarge (stateBridge state)) obligations
   prepared ← prepareDischarges state "a rejected target's" (zip obligations outcomes)
-  atomically $ do
-    retainRejection state attachment reason
-    latchDischarges state prepared
+  -- the rejection is retained, and then the discharge failures are latched through the roots' own entry, which waits
+  -- outside its transaction for any diagnostic evidence their ordering needs
+  atomically (retainRejection state attachment reason)
+  latchDischarges state prepared
   deliverDischarges prepared
   let uncertain = length [() | Just _ ← map dischargeFailure outcomes]
       destroyed = length obligations - uncertain
@@ -1972,7 +1973,7 @@ retireTarget state retiring = do
       left ← atomically (obligationsOf (stateBridge state) lease attachment)
       outcomes ← mapM (bridgeDischarge (stateBridge state)) left
       prepared ← prepareDischarges state "a retired target's" (zip left outcomes)
-      atomically (latchDischarges state prepared)
+      latchDischarges state prepared
       deliverDischarges prepared
       case [failure | Just failure ← map dischargeFailure outcomes] of
         failure : _ → rethrowIO failure
@@ -1998,7 +1999,7 @@ retireOwner state retiring = do
           orphans = [obligation | obligation ← listed, bridgeObligationAttachment bridge obligation `notElem` exempt]
       outcomes ← mapM (bridgeDischarge bridge) orphans
       prepared ← prepareDischarges state "an orphaned" (zip orphans outcomes)
-      atomically (latchDischarges state prepared)
+      latchDischarges state prepared
       deliverDischarges prepared
       let uncertain = length [() | Just _ ← map dischargeFailure outcomes]
       when (uncertain > 0) (throwIO (OrphanSurfacesUncertain uncertain))
@@ -2043,7 +2044,7 @@ destroyOwner state = do
       -- cleanup, whatever else failed first; the lease then still owes it,
       -- which retains the instance below.
       prepared ← prepareDischarges state "a late" (zip late outcomes)
-      atomically (latchDischarges state prepared)
+      latchDischarges state prepared
       deliverDischarges prepared
       answer ← atomically (bridgeRelease bridge lease)
       unless (answer == LeaseReleasable) (throwIO (LeaseRetained answer))
@@ -2064,13 +2065,15 @@ destroyOwner state = do
 -- the obligation, never a handle a later surface may reuse.
 --
 -- Each failure's description is rendered and forced first, in protected IO ('prepareDischarges'); the latches then
--- evaluate nothing ('latchDischarges'), and a cancellation met while rendering goes on once they are committed
--- ('deliverDischarges').
-latchDischarges ∷ State inst msgr phys dev cmd lease obligation → PreparedDischarges → STM ()
-latchDischarges state (PreparedDischarges prepared _) = for_ prepared (latchPreparedFailure (stateRoots state))
+-- evaluate nothing ('latchDischarges'), and then a cancellation goes on ('deliverDischarges'): a discharge that was
+-- itself cancelled first, else one met while rendering.
+latchDischarges ∷ State inst msgr phys dev cmd lease obligation → PreparedDischarges → IO ()
+latchDischarges state (PreparedDischarges prepared _ _) = latchPreparedFailures (stateRoots state) prepared
 
--- The discharge failures of one pass, prepared, and a cancellation met while describing them.
-data PreparedDischarges = PreparedDischarges ![PreparedFailure] !(Maybe (ExceptionWithContext SomeException))
+-- The discharge failures of one pass, prepared; an original discharge failure that was a cancellation; and a
+-- cancellation met while describing them.
+data PreparedDischarges
+  = PreparedDischarges ![PreparedFailure] !(Maybe (ExceptionWithContext SomeException)) !(Maybe (ExceptionWithContext SomeException))
 
 prepareDischarges ∷ State inst msgr phys dev cmd lease obligation → Text → [(obligation, Discharged)] → IO PreparedDischarges
 prepareDischarges state what outcomes = do
@@ -2079,12 +2082,13 @@ prepareDischarges state what outcomes = do
       "destroying " <> what <> " surface " <> hex (bridgeObligationHandle bridge obligation)
         <> " of " <> tshow (bridgeObligationAttachment bridge obligation)
         <> ": " <> Text.pack (displayException failure)
-  pure (PreparedDischarges (map fst prepared) (foldr ((<|>) . snd) Nothing prepared))
+  let cancelled = [failure | Just failure@(ExceptionWithContext _ inner) ← map (dischargeFailure . snd) outcomes, isJust (fromException inner ∷ Maybe SomeAsyncException)]
+  pure (PreparedDischarges (map fst prepared) (listToMaybe cancelled) (foldr ((<|>) . snd) Nothing prepared))
   where
     bridge = stateBridge state
 
 deliverDischarges ∷ PreparedDischarges → IO ()
-deliverDischarges (PreparedDischarges _ pending) = mapM_ rethrowIO pending
+deliverDischarges (PreparedDischarges _ original pending) = mapM_ rethrowIO (original <|> pending)
 
 obligationsOf ∷ SurfaceBridge lease obligation → lease → AttachmentId → STM [obligation]
 obligationsOf bridge lease attachment =

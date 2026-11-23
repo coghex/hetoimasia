@@ -100,6 +100,7 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Roots
   , PreparedFailure
   , prepareFailure
   , latchPreparedFailure
+  , latchPreparedFailures
   , failRootsSessionIO
   , FailedSubmission (..)
   , failSubmission
@@ -113,7 +114,7 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Roots
   , readRootsDisposers
   ) where
 
-import Control.Concurrent (threadDelay, yield)
+import Control.Concurrent (ThreadId, myThreadId, threadDelay, yield)
 import Control.Concurrent.STM (STM, TVar, catchSTM, modifyTVar', newTVarIO, readTVar, readTVarIO, throwSTM, writeTVar)
 import GHC.Conc (unsafeIOToSTM)
 import Hetoimasia.GPU.Vulkan.Diagnostics
@@ -146,11 +147,11 @@ import Control.Exception
 import Control.Monad (filterM, unless, when)
 import qualified Control.Monad
 import Data.Foldable (for_)
-import Data.IORef (IORef, atomicModifyIORef', mkWeakIORef, newIORef)
+import Data.IORef (IORef, atomicModifyIORef', mkWeakIORef, newIORef, readIORef)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.List ((\\))
-import Data.Maybe (isJust, isNothing)
+import Data.Maybe (fromMaybe, isJust, isNothing)
 import System.Mem (performMajorGC)
 import System.Mem.Weak (Weak, deRefWeak)
 import Data.Text (Text)
@@ -426,6 +427,11 @@ data Roots q inst msgr phys dev = Roots
   , rootsClaimHold ∷ !(TVar (Maybe (IORef ())))
     -- ^ Written by each claiming attempt with its own token, which its
     -- transaction's log then keeps alive until it commits or is discarded.
+  , rootsPinnedOrder ∷ !(IORef (Map ThreadId DiagnosticArrivals))
+    -- ^ The ordering point of a claim over a void one whose attempt was abandoned to wait for evidence outside its
+    -- transaction, by the thread that waits: its rerun orders behind exactly what had arrived then, not what arrived
+    -- during the wait. Not transactional, as the claims are not; written only by that thread's own attempts, and read
+    -- only while no primary is latched.
   , rootsDebugUtils ∷ !(TVar Bool)
     -- ^ Whether the instance was created with @VK_EXT_debug_utils@.
   , rootsNamed ∷ !(TVar Bool)
@@ -473,6 +479,7 @@ newRoots ops budgets clock = do
     <*> newTVarIO (DiagnosticWatch (pure []) (pure (OwnerFirst noDiagnosticArrivals)))
     <*> newIORef (OwnerClaims False [])
     <*> newTVarIO Nothing
+    <*> newIORef Map.empty
     <*> newTVarIO False
     <*> newTVarIO False
     <*> newTVarIO []
@@ -990,8 +997,23 @@ isAsynchronous exception = isJust (fromException exception ∷ Maybe SomeAsyncEx
 -- the loss in it, in one transaction. The first loss is kept, and so is any
 -- earlier primary failure: the loss is then recorded beside it, and what it
 -- changes is the rules the teardown follows.
+--
+-- The loss is evaluated in protected IO first, masked through its commit: one that raises (its fields are strict, so
+-- any of them) is latched as a device loss with a fixed description, and a cancellation met while evaluating it goes on
+-- once the loss is latched.
 latchDeviceLoss ∷ Roots q inst msgr phys dev → GraphicsDeviceLost → IO ()
-latchDeviceLoss roots loss = atomically (latchTerminal roots (TerminalDeviceLost loss))
+latchDeviceLoss roots given = mask_ $ do
+  (loss, pending) ← prepareLoss given
+  atomically (latchTerminal roots (TerminalDeviceLost loss))
+  mapM_ rethrowIO pending
+
+-- A device loss evaluated in full, or its fallback, and a cancellation met while evaluating it.
+prepareLoss ∷ GraphicsDeviceLost → IO (GraphicsDeviceLost, Maybe (ExceptionWithContext SomeException))
+prepareLoss given =
+  tryWithContext @SomeException (evaluate given >>= \loss → loss <$ evaluate (Text.length (lostDuring loss) + Text.length (lostDetail loss))) >>= \case
+    Right loss → pure (loss, Nothing)
+    Left failure@(ExceptionWithContext _ inner) →
+      pure (GraphicsDeviceLost "a native call" undescribedFailure, if isAsynchronous inner then Just failure else Nothing)
 
 -- | A checkpoint that raises: the latched primary failure, if there is one —
 -- the loss as itself, anything else as 'GraphicsSessionFailed'. It is what a
@@ -1204,7 +1226,17 @@ orderBehindDiagnostics roots = do
       -- one look at the evidence: what is not yet readable is waited for outside this transaction
       ahead ← watchOrder watch >>= \case
         OwnerFirst arrived
-          | void → (\alarms → maybe (Left (Control.Monad.void (awaitArrivals watch arrived))) Right (arrivedAlarms arrived alarms)) <$> watchAlarms watch
+          | void → do
+              -- the ordering point: this claim's arrivals, or, for a rerun of this thread's attempt abandoned to wait,
+              -- the point that attempt took (what arrived during the wait comes after it)
+              me ← myThreadId
+              point ← fromMaybe arrived . Map.lookup me <$> readIORef (rootsPinnedOrder roots)
+              alarms ← watchAlarms watch
+              case arrivedAlarms point alarms of
+                Just ordered → pure (Right ordered)
+                Nothing → do
+                  atomicModifyIORef' (rootsPinnedOrder roots) (\pinned → (Map.insert me point pinned, ()))
+                  pure (Left (Control.Monad.void (awaitArrivals watch point)))
           | otherwise → pure (Right [])
         ValidationFirst → pure (Right [AlarmValidationError])
         SinkFirst published → maybe (Left (Control.Monad.void (awaitPublication published))) (\reason → Right [AlarmSinkFailed reason]) <$> published
@@ -1915,22 +1947,36 @@ data PreparedFailure = PreparedFailure !SessionFailureCause !Text
 -- that raises is answered with a fixed text, the kind kept; a cancellation met while rendering is handed back, for the
 -- caller to deliver once the failure is latched.
 prepareFailure ∷ SessionFailureCause → Text → IO (PreparedFailure, Maybe (ExceptionWithContext SomeException))
-prepareFailure cause given =
-  tryWithContext @SomeException (evaluate (Text.length given) >> pure given) >>= \case
-    Right reason → pure (PreparedFailure cause reason, Nothing)
-    Left failure@(ExceptionWithContext _ inner)
-      | isAsynchronous inner → pure (PreparedFailure cause undescribedFailure, Just failure)
-      | otherwise → pure (PreparedFailure cause undescribedFailure, Nothing)
+prepareFailure cause given = do
+  -- the kind first: a kind that raises raises here, before anything is prepared
+  kind ← evaluate cause
+  (reason, pending) ←
+    tryWithContext @SomeException (evaluate (Text.length given) >> pure given) >>= \case
+      Right reason → pure (reason, Nothing)
+      Left failure@(ExceptionWithContext _ inner)
+        | isAsynchronous inner → pure (undescribedFailure, Just failure)
+        | otherwise → pure (undescribedFailure, Nothing)
+  -- the complete value, evaluated before preparation returns
+  prepared ← evaluate (PreparedFailure kind reason)
+  pure (prepared, pending)
 
--- | Latch a prepared session failure: the first is the primary, a later one evidence beside it.
+-- | Latch a prepared session failure: the first is the primary, a later one evidence beside it. Package-internal: a
+-- transaction that latches may be abandoned to wait for diagnostic evidence, which only
+-- 'Hetoimasia.GPU.Vulkan.Native.Atomically.atomically' handles; callers outside use 'latchPreparedFailures'.
 latchPreparedFailure ∷ Roots q inst msgr phys dev → PreparedFailure → STM ()
 latchPreparedFailure roots (PreparedFailure cause reason) = latchTerminal roots (causeOf cause reason)
+
+-- | Latch these prepared session failures, in one transaction, through the entry that waits for any diagnostic
+-- evidence their ordering needs outside it.
+latchPreparedFailures ∷ Roots q inst msgr phys dev → [PreparedFailure] → IO ()
+latchPreparedFailures roots prepared = atomically (mapM_ (latchPreparedFailure roots) prepared)
 
 -- | Fail the session from outside a transaction: the description prepared in protected IO ('prepareFailure'), the
 -- failure latched (with the fixed description, its kind kept, if the description raised), and then a cancellation met
 -- while rendering goes on.
 failRootsSessionIO ∷ Roots q inst msgr phys dev → SessionFailureCause → Text → IO ()
-failRootsSessionIO roots cause given = do
+failRootsSessionIO roots cause given = mask_ $ do
+  -- masked across the preparation and the commit: a cancellation cannot fall between them
   (prepared, pending) ← prepareFailure cause given
   atomically (latchPreparedFailure roots prepared)
   mapM_ rethrowIO pending

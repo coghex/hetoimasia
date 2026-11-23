@@ -291,9 +291,9 @@ instance Eq Basis where
 -- window's geometry revision, advanced only by a geometry change; a held or offscreen target's facts version) and the
 -- arena's mark (its content and knowledge revisions and residency generation, 'Nothing' once it has ended).
 --
--- Stamps compare by the facts a basis rests on: the residency generation an arena mark carries is kept for the
--- camera's settlement, which reads it from the captured stamp, but a residency-only change leaves the stamp the same.
--- Collection compares the full marks ('Stamps').
+-- Stamps compare by the facts a basis rests on: a residency-only change leaves the stamp the same, so a decision that
+-- needs the residency generation reads it from the mark cell in its own commit. Collection compares the full marks
+-- ('Stamps').
 data BasisStamp = BasisStamp !Word64 !SurfaceVersion !(Maybe ArenaMark)
 
 instance Eq BasisStamp where
@@ -302,9 +302,6 @@ instance Eq BasisStamp where
     where
       revisions m = (markContent m, markKnowledge m)
 
--- | The residency generation the stamp's arena mark was read at.
-stampGeneration ∷ BasisStamp → Maybe Word64
-stampGeneration (BasisStamp _ _ mark) = markGeneration <$> mark
 
 instance Show BasisStamp where
   show (BasisStamp intent _ mark) = "BasisStamp " <> show intent <> " " <> show mark
@@ -2252,9 +2249,9 @@ settleWith service vs serial prep inputs =
                   -- a drawable footprint that reads nothing: the planner's own empty plan (readiness-only copies draw nothing)
                   (Just metrics, _)
                     | null (prepFootprint prep) → do
-                        -- the residency generation the basis was captured at, as its stamp holds it (the commit checks
-                        -- that stamp); nothing is projected from a freshly read arena
-                        let residency = stampGeneration (basisStamp basis)
+                        -- the residency generation as the arena's writer holds it now, in this settlement's commit: the
+                        -- basis stamp leaves residency out, so the captured one may be stale
+                        residency ← own (fmap markGeneration <$> vsMarkCell vs)
                         case basisArena basis of
                           Nothing → False <$ discardStale service vs serial
                           Just (arena, content, knowledge) → do

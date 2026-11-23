@@ -238,7 +238,7 @@ module Hetoimasia.GPU.Vulkan.Native.Roots
   , settleModelOnlyFrame
   , PreparedFailure
   , prepareFailure
-  , latchPreparedFailure
+  , latchPreparedFailures
   , failRootsSessionIO
   , closeRootsTarget
   , diagnosisOf
