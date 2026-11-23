@@ -281,20 +281,22 @@ only issuer-controlled inputs, validates before its first write, answers a
 refusal as data, and finishes without waiting or raising; review and the
 issuer's outcome tests check this, its callees included.
 
-**What the guard checks.** From Cabal's facts alone
-([the import guard](../../docs/validation.md#the-issuer-bridges-import-guard)):
-the components that depend on the `owner-tx-issuer` sublibrary in any
-buildable configuration are exactly those `tools/validation/owner-tx-issuers.fields`
-lists; no Cabal `reexported-modules` or `mixins` entry exposes or renames
-`OwnerTx.Issuer` or `OwnerTx.Representation`, in a listed component too; and
-neither module is declared anywhere but here, the representation's library
-private. Package visibility then keeps the bridge out of reach of every client
-built against the main library.
+**What the guard checks.** Text alone
+([the issuer guard](../../docs/validation.md#the-issuer-bridges-import-guard)):
+`owner-tx-issuer`, `Hetoimasia.Foundation.OwnerTx.Issuer` and
+`Hetoimasia.Foundation.OwnerTx.Representation` may appear in a package
+description or project file only inside a stanza
+`tools/validation/owner-tx-issuers.fields` lists. Here those are this package's
+`library owner-tx-issuer`, `library internal` and `test-suite foundation-tests`.
+Package visibility then keeps the bridge out of reach of every client built
+against the main library.
 
-**What issuer review checks.** Within a listed component any module may import
-the bridge, so review reads that component's modules, and Foundation's own
-consumers of the representation, for where issuer code runs and what reaches
-its clients:
+**What issuer review checks.** Within a listed stanza's component any module
+may import the bridge, so review confirms each listed stanza names the intended
+component for its stated reason, and reads that component's modules, every
+component importing a listed common stanza or affected by a listed project
+section, and Foundation's own consumers of the representation, for where issuer
+code runs and what reaches its clients:
 
 - no export, outside the bridge and the representation, that converts a
   caller's `STM` to or from `OwnerTx`, directly or through a wrapper, a class
