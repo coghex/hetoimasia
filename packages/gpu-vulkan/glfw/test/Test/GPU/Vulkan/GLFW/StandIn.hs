@@ -1417,6 +1417,7 @@ renderingLayers rescued events rendering clock =
         , opsDestroyStorage = \_ _ → pure ()
         , opsReadMapped = \_ _ size → pure (ByteString.replicate (fromIntegral size) readbackByte)
         , opsWriteMapped = \_ _ _ → pure ()
+        , opsUploadQueued = pure ()
         , opsBeginCommands = \_ →
             readTVarIO (renderingRecordLoss rendering) >>= \losing →
               when losing (throwIO (StandInLoss "vkBeginCommandBuffer"))

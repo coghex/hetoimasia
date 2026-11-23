@@ -743,6 +743,9 @@ data RecordingOps dev cmd = RecordingOps
     -- buffer and a size. The buffer's memory, its mapping and its maintenance
     -- are the device allocator's.
   , opsWriteMapped ∷ ReadbackAllocation → Natural → ByteString → IO ()
+  , opsUploadQueued ∷ IO ()
+    -- ^ An upload's queueing has committed, inside its submitter's protected hand-off, before its ticket is delivered.
+    -- No Vulkan call: the production layer does nothing here; a stand-in may meet the submitter there.
   , opsBeginCommands ∷ cmd → IO ()
     -- ^ Begin the command buffer for one submission.
   , opsEndCommands ∷ cmd → IO ()

@@ -472,6 +472,7 @@ recordingOps offered commands writes pipelines layouts memory handles writing =
     , opsReadMapped = \allocation offset size → do
         bytes ← Map.findWithDefault ByteString.empty (allocationMapped allocation) <$> readTVarIO memory
         pure (ByteString.take (fromIntegral size) (ByteString.drop (fromIntegral offset) bytes))
+    , opsUploadQueued = pure ()
     , opsWriteMapped = \allocation offset bytes → atomically (readTVar writing <* writeTVar writing Nothing) >>= mapM_ throwIO >> atomically (do
         modifyTVar' writes ((allocationMapped allocation, offset, bytes) :)
         modifyTVar' memory $

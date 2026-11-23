@@ -79,6 +79,8 @@ data RecordingCall
   | DestroyedStorage !Word64
   | ReadMapped !Natural !Natural
   | WroteMapped !Natural !Natural
+  | QueuedUpload
+    -- ^ An upload's queueing committed, before its ticket was delivered.
   | Began !Word64
   | Ended !Word64
   | Recorded !Word64 !NativeCommand
@@ -118,6 +120,8 @@ data RecordingStep
   | AtDestroyView
   | AtWriteMapped
     -- ^ A write into mapped memory: one that fails writes nothing.
+  | AtUploadQueued
+    -- ^ An upload's queueing committed, inside its submitter's hand-off: the rendezvous before its ticket's delivery.
   | AtCreateSampler
   | AtDestroySampler
   | AtCreateSetLayout
@@ -306,6 +310,7 @@ recordingStandInOps standIn =
         journal standIn (ReadMapped offset size)
         bytes ← Map.findWithDefault ByteString.empty (allocationMapped allocation) <$> readTVarIO (recordingMemory standIn)
         pure (ByteString.take (fromIntegral size) (ByteString.drop (fromIntegral offset) bytes))
+    , opsUploadQueued = step standIn AtUploadQueued QueuedUpload
     , opsWriteMapped = \allocation offset bytes → do
         step standIn AtWriteMapped (WroteMapped offset (fromIntegral (ByteString.length bytes)))
         atomically $ modifyTVar' (recordingMemory standIn) $

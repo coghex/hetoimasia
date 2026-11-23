@@ -17,6 +17,7 @@ module Test.GPU.Vulkan.Native.Uploads (spec) where
 
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar, tryPutMVar, tryTakeMVar)
 import Control.Concurrent.STM (TVar, atomically, check, modifyTVar', newTVarIO, readTVar, readTVarIO, retry, throwSTM, writeTVar)
+import Control.Concurrent (killThread, myThreadId)
 import Control.Exception (AsyncException (ThreadKilled), ErrorCall (ErrorCall), SomeException, fromException, try)
 import Hetoimasia.Foundation.Admission (Admission, admissionToken, closeAdmission, newAdmission, newAdmissionIO, tokenOpen)
 import Hetoimasia.GPU.Model (SessionFailureCause (CleanupFailed))
@@ -45,7 +46,7 @@ import Test.GPU.Vulkan.Native.FramesStandIn (FrameCall (Submitted), FrameStep (A
 import Test.GPU.Vulkan.Native.RecordingStandIn
   ( RecordingCall (..)
   , RecordingFailure (..)
-  , RecordingStep (AtWriteMapped)
+  , RecordingStep (AtUploadQueued, AtWriteMapped)
   , duringRecord
   , failAt
   , limitRecording
@@ -368,6 +369,34 @@ spec = describe "Uploads" $ do
       fmap (const ()) <$> submitUploadGated ungated uploads (UploadBuffer vertices (level 64 1)) `shouldReturn` Left UploadAlreadyTargeted
       settleUploads rig uploads
       atomically (readUploadTicket ticket) `shouldReturn` UploadComplete
+      clean rig
+
+    it "leaves an upload the queue took to the queue when its submitter is cancelled after the queueing commit and before its ticket's delivery: its place, range and target stay held through settlement, its place and range are reusable once, and retirement completes" $ do
+      rig ← newUploadRig
+      uploads ← made rig (config 64 64 1)
+      vertices ← bufferOf rig VertexBuffer 64
+      submitter ← myThreadId
+      fire ← newEmptyMVar
+      withOwnedThread (takeMVar fire >> killThread submitter) $ \killer _ → do
+        -- the rendezvous: inside the submitter's protected hand-off, the queue's commit made, the ticket not yet handed
+        -- back; the cancellation is aimed at the submitter from there
+        onceAt (rigRecordingStandIn rig) AtUploadQueued (putMVar fire () >> awaitThrowing killer)
+        try (submitUpload uploads (UploadBuffer vertices (level 64 1))) >>= \case
+          Left raised | Just ThreadKilled ← fromException raised → pure ()
+          Left raised → expectationFailure ("the submitter ended otherwise: " <> show (raised ∷ SomeException))
+          Right answer → expectationFailure ("the cancellation was not delivered: " <> show (fmap (const ()) answer))
+      -- the queue holds the upload: its place and staging range, and its target, which takes no other upload
+      length . uploadsUnsettled <$> atomically (readUploads uploads) `shouldReturn` 1
+      fmap (const ()) <$> submitUpload uploads (UploadBuffer vertices (level 64 1)) `shouldReturn` Left UploadAlreadyTargeted
+      -- settled by the queue, which fills the target once; then the place and the whole staging range are free again,
+      -- for another target's upload of the same size, and retirement completes
+      settleUploads rig uploads
+      uploadsUnsettled <$> atomically (readUploads uploads) `shouldReturn` []
+      fmap (const ()) <$> submitUpload uploads (UploadBuffer vertices (level 64 1)) `shouldReturn` Left UploadNotFresh
+      another ← bufferOf rig VertexBuffer 64
+      _ ← admitted uploads (UploadBuffer another (level 64 1))
+      settleUploads rig uploads
+      ok (retireUploads uploads)
       clean rig
 
     it "refuses an upload whose permit's admission closed after the gate admitted it and before the commit that binds or queues it, and one whose admission was closed and reopened while its bytes were copied" $ do

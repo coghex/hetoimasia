@@ -153,6 +153,7 @@ vulkanRecordingOps physical = do
       , opsWriteMapped = \allocation offset bytes →
           Unsafe.unsafeUseAsCStringLen bytes $ \(source, count) →
             copyBytes (castPtr (mapped allocation `plusPtr` fromIntegral offset)) source count
+      , opsUploadQueued = pure ()
       , opsBeginCommands = \commands →
           beginCommandBufferUnsafe commands CommandBufferBeginInfo {next = (), flags = COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, inheritanceInfo = Nothing}
       , opsEndCommands = endCommandBufferUnsafe

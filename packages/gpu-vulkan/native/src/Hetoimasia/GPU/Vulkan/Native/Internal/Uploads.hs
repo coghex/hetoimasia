@@ -484,7 +484,11 @@ submitWith gate uploads grant request = mask $ \restore →
             writePieces uploads offset pieces
             atomically (asked gate) >>= forced >>= \case
               Left refusal → pure (Left refusal)
-              Right permit' → atomically (queue permit permit' number ticket)
+              Right permit' → do
+                queued ← atomically (queue permit permit' number ticket)
+                -- queued: the queue owns it now, whatever ends this hand-off before its ticket is delivered
+                either (const (pure ())) (\_ → opsUploadQueued (recordingOps (framesRecording (uploadsFrames uploads)))) queued
+                pure queued
           let cleanup = atomically (forgetAdmitting uploads number)
           case transferred of
             Left failure → cleanup >> rethrowIO failure
