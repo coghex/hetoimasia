@@ -1021,15 +1021,14 @@
         "docs/toolchain/binding-bundle-darwin/",
         "docs/toolchain/binding-bundle-linux/",
         "tools/owner-tx-guard/",
-        "tools/validation/owner-tx-issuers.fields",
-        "*.cabal",
-        "cabal.project*"
+        "tools/validation/owner-tx-issuers.fields"
       ],
       "framework": "none",
       "runner": "cpu",
       "timeout_seconds": 300,
       "category": "test",
-      "optional": false
+      "optional": false,
+      "package_files": true
     },
     {
       "id": "test.x11-helper",

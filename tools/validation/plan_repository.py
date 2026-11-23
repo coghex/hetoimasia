@@ -41,10 +41,7 @@ def join_path(*parts: str) -> str:
 
 
 def matches_input(path: str, entry: str) -> bool:
-    """An input entry is a directory prefix when it ends in ``/``, a basename class when it contains ``*`` (as
-    `matches_class` reads one: without ``/`` it matches that basename at any depth), else an exact path."""
-    if "*" in entry:
-        return matches_class(path, entry)
+    """An input entry is a directory prefix when it ends in ``/``, else an exact path."""
     if entry.endswith("/"):
         return path == entry[:-1] or path.startswith(entry)
     if entry == "":

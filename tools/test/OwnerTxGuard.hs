@@ -1,3 +1,5 @@
+{-# LANGUAGE MultiWayIf #-}
+
 -- | Hspec coverage for the issuer guard of the ownership transactions (#721; the design's "Approved amendment · Textual
 -- issuer guard").
 --
@@ -16,7 +18,7 @@ import Control.Monad (forM_, void)
 import Data.List (isPrefixOf)
 import Json (Json (..), asArray, asString, entryFor, field, parseJson)
 import Sandbox (git, run, sanitizedEnvironment, writeFixtureFile)
-import System.Directory (copyFile, createDirectoryIfMissing, createDirectoryLink, createFileLink, doesFileExist, getCurrentDirectory, getPermissions, setOwnerWritable, setPermissions)
+import System.Directory (copyFile, createDirectoryIfMissing, createDirectoryLink, createFileLink, doesFileExist, removeFile, getCurrentDirectory, getPermissions, setOwnerWritable, setPermissions)
 import System.Exit (ExitCode (..))
 import System.FilePath (takeDirectory, (</>))
 import System.IO.Temp (withSystemTempDirectory)
@@ -182,14 +184,24 @@ spec = describe "The issuer bridge's textual guard (tools/owner-tx-guard)" $ do
         ["cabal.project.common: unsupported: a quoted section argument at line 2"]
       refused (changed [("consumer/consumer.cabal", consumer ["    build-dépends: base"] [])]) ["consumer/consumer.cabal: unsupported: a non-ASCII field name or section header at line 9"]
       refused (changed [("consumer/consumer.cabal", consumer [] ["", "common brídge", "    build-depends: base"])]) ["consumer/consumer.cabal: unsupported: a non-ASCII field name or section header at line 10"]
+      let nested extra = foundation <> unlines extra
+      refused (changed [("foundation/hetoimasia-foundation.cabal", nested ["    if flag(fást)", "        ghc-options: -Wall"])]) ["foundation/hetoimasia-foundation.cabal: unsupported: a non-ASCII field name or section header at line 27"]
+      refused (changed [("foundation/hetoimasia-foundation.cabal", nested ["    if os(\"linux\")", "        ghc-options: -Wall"])]) ["foundation/hetoimasia-foundation.cabal: unsupported: a quoted section argument at line 27"]
       withSystemTempDirectory "hetoimasia-owner-tx-outside" $ \outside → do
         writeFixtureFile outside "linked.cabal" (unlines (header "linked" <> ["library", "    build-depends: hetoimasia-foundation:owner-tx-issuer"]))
         withSystemTempDirectory "hetoimasia-owner-tx-guard" $ \directory → do
           forM_ baseTree (uncurry (writeFixtureFile directory))
           createFileLink (outside </> "linked.cabal") (directory </> "consumer" </> "linked.cabal")
+          createFileLink (outside </> "linked.cabal") (directory </> "consumer" </> "notes")
+          createDirectoryLink outside (directory </> "dist-newstyle")
           settings ← sanitizedEnvironment
           (result, _, errors) ← run settings directory "owner-tx-guard" ["check", "--root", directory]
-          (result, errors) `shouldBe` (ExitFailure 1, "owner_tx_guard: consumer/linked.cabal: unsupported: a symbolic link, which the guard never follows\n")
+          result `shouldBe` ExitFailure 1
+          lines errors
+            `shouldBe` [ "owner_tx_guard: consumer/linked.cabal: unsupported: a symbolic link, which the guard never follows"
+                       , "owner_tx_guard: consumer/notes: unsupported: a symbolic link, which the guard never follows"
+                       , "owner_tx_guard: dist-newstyle: unsupported: a symbolic link, which the guard never follows"
+                       ]
       withSystemTempDirectory "hetoimasia-owner-tx-outside" $ \outside → do
         writeFixtureFile outside "elsewhere/elsewhere.cabal" (unlines (header "elsewhere" <> ["library", "    build-depends: hetoimasia-foundation:owner-tx-issuer"]))
         withSystemTempDirectory "hetoimasia-owner-tx-guard" $ \directory → do
@@ -297,7 +309,7 @@ spec = describe "The issuer bridge's textual guard (tools/owner-tx-guard)" $ do
     it "selects its group and changes the input identity for a project file anywhere, however it is spelled, another group's prefix included" $ inCheckout $ \checkout → do
       settings ← sanitizedEnvironment
       files ← lines <$> git settings checkout ["-c", "safe.directory=*", "ls-files", "*.cabal", "cabal.project*", "tools/validation/catalog.json"]
-      forM_ ["cabal.project.notes.md", "docs/elsewhere/cabal.project", "docs/elsewhere/stray.cabal", "tools/terrain-storage/cabal.project.extra"] $ \path →
+      forM_ ["cabal.project.notes.md", "docs/elsewhere/cabal.project", "docs/elsewhere/stray.cabal", "tools/terrain-storage/cabal.project.extra", "cabal.project.freeze"] $ \path →
         withSystemTempDirectory "hetoimasia-owner-tx-plan" $ \directory → do
           forM_ [file | file ← files, not ("docs/" `isPrefixOf` file)] $ \file → do
             createDirectoryIfMissing True (directory </> takeDirectory file)
@@ -319,6 +331,42 @@ spec = describe "The issuer bridge's textual guard (tools/owner-tx-guard)" $ do
             Just entry → (field "selected" entry, field "reason" entry) `shouldBe` (Just (JBool True), Just (JString "affected"))
           (parseJson output >>= field "changed_paths" >>= entryFor "path" path >>= field "classification") `shouldSatisfy` (/= Just (JString "non-affecting"))
           (parseJson output >>= field "input_identity") `shouldSatisfy` (\identity → identity /= Nothing && identity /= (parseJson baseOutput >>= field "input_identity"))
+          let classification = parseJson output >>= field "changed_paths" >>= entryFor "path" path
+              groupEntry identifier = parseJson output >>= field "groups" >>= entryFor "id" identifier
+          (classification >>= field "consumers" >>= asArray >>= traverse asString) `shouldSatisfy` maybe False ("test.owner-tx-guard" `elem`)
+          if
+            | path == "tools/terrain-storage/cabal.project.extra" → do
+                -- the probe's consumer status and optionality are its own
+                (classification >>= field "classification") `shouldBe` Just (JString "consumed")
+                (classification >>= field "consumers" >>= asArray >>= traverse asString) `shouldSatisfy` maybe False ("test.terrain-storage-qualification" `elem`)
+                (groupEntry "test.terrain-storage-qualification" >>= \g → (,,) <$> field "optional" g <*> field "selected" g <*> field "inputs_changed" g)
+                  `shouldBe` Just (JBool True, JBool False, JBool True)
+                (groupEntry "test.owner-tx-guard" >>= field "inputs_changed") `shouldBe` Just (JBool True)
+            | otherwise → do
+                -- the rule adds the guard and narrows nothing: no other consumer leaves the path unknown
+                (classification >>= field "classification") `shouldBe` Just (JString "unknown")
+                (groupEntry "test.workflow" >>= \g → (,) <$> field "selected" g <*> field "reason" g) `shouldBe` Just (JBool True, JString "unknown-input")
+
+    it "changes the input identity when a tracked Markdown file becomes a symbolic link" $ inCheckout $ \checkout → do
+      settings ← sanitizedEnvironment
+      files ← lines <$> git settings checkout ["-c", "safe.directory=*", "ls-files", "*.cabal", "cabal.project*", "tools/validation/catalog.json"]
+      withSystemTempDirectory "hetoimasia-owner-tx-plan" $ \directory → do
+        forM_ [file | file ← files, not ("docs/" `isPrefixOf` file)] $ \file → do
+          createDirectoryIfMissing True (directory </> takeDirectory file)
+          copyFile (checkout </> file) (directory </> file)
+        writeFixtureFile directory "packages/foundation/NOTES.md" "notes\n"
+        void $ git settings directory ["init", "-q", "-b", "master"]
+        void $ git settings directory ["add", "-A", "."]
+        void $ git settings directory ["commit", "-q", "-m", "base"]
+        base ← takeWhile (/= '\n') <$> git settings directory ["rev-parse", "HEAD"]
+        removeFile (directory </> "packages/foundation/NOTES.md")
+        createFileLink "hetoimasia-foundation.cabal" (directory </> "packages/foundation/NOTES.md")
+        void $ git settings directory ["add", "-A", "."]
+        void $ git settings directory ["commit", "-q", "-m", "head"]
+        let plan revision = run settings checkout "python3" [checkout </> "tools/validation/plan.py", "--repo-root", directory, "--base", base, "--head", revision, "--json"]
+        (_, output, _) ← plan "HEAD"
+        (_, baseOutput, _) ← plan base
+        (parseJson output >>= field "input_identity") `shouldSatisfy` (\identity → identity /= Nothing && identity /= (parseJson baseOutput >>= field "input_identity"))
 
 -- | Run an example against the checkout, or leave it pending where this is not a checkout of the whole repository.
 inCheckout ∷ (FilePath → IO ()) → IO ()

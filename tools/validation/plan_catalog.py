@@ -82,6 +82,12 @@ GROUP_KEYS = {
 OPTIONAL_GROUP_KEYS = {
     "platforms": list,
     "preparation": dict,
+    # Every changed package description or project file (a basename ending in
+    # ``.cabal`` or starting with ``cabal.project``, at any depth) affects a
+    # group declaring this, besides whatever else consumes the path. It adds the
+    # group and narrows nothing: such a path no declared or derived input
+    # consumes stays an unknown input.
+    "package_files": bool,
 }
 
 # A preparation stage: a command the runner executes to completion before the

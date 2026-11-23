@@ -17,6 +17,10 @@ IDENTITY_SCHEMA_VERSION = 1
 # Packaging inputs decide what is compiled, so they are never prose however a
 # catalog classifies them. Every other exclusion is derived from the declared
 # inputs and the declared non-affecting classes rather than hard-coded here.
+# Git's mode for a symbolic link.
+SYMLINK_MODE = "120000"
+
+
 def never_harmless(path: str) -> bool:
     """A package description or project file, wherever it sits and however it is spelled.
 
@@ -150,7 +154,11 @@ def input_identity(
     a timestamp, so two commits with identical trees are the same candidate.
     """
     consumed = consumed_entries(catalog, packages)
-    included = [list(entry) for entry in entries if not harmless_prose(entry[0], consumed, catalog)]
+    # A symbolic link is never prose, whatever its name: a tracked file turned
+    # into a link changes what the issuer guard reads, and so its outcome.
+    included = [
+        list(entry) for entry in entries if entry[1] == SYMLINK_MODE or not harmless_prose(entry[0], consumed, catalog)
+    ]
     return digest(
         {
             "identity_schema_version": IDENTITY_SCHEMA_VERSION,

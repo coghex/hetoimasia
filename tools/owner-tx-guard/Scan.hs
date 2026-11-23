@@ -61,9 +61,10 @@ data Scanned = Scanned
 
 -- | Every file to scan, repository-relative and sorted: at any depth, except under version-control metadata (@.git@,
 -- at any depth) and the generated directories the validation catalog names at the repository's root. The skip set is
--- fixed here; no scanned file or allowlist entry extends it.
+-- fixed here; no scanned file or allowlist entry extends it. A symbolic link below the root is reported wherever the
+-- walk lists it, before any skip by name and whatever it points to, and never followed; the root is used as given.
 scannedFiles ∷ FilePath → IO ([FilePath], [String])
-scannedFiles root = (\(files, problems) → (sort files, problems)) <$> go ""
+scannedFiles root = (\(files, problems) → (sort files, sort problems)) <$> go ""
   where
     skipped relative entry = entry == ".git" || (null relative && entry `elem` generatedDirectories)
     go relative = do
@@ -75,8 +76,8 @@ scannedFiles root = (\(files, problems) → (sort files, problems)) <$> go ""
               link ← pathIsSymbolicLink (root </> path)
               directory ← if link then pure False else doesDirectoryExist (root </> path)
               if
-                | skipped relative entry → pure ([], [])
                 | link → pure ([], [path <> ": unsupported: a symbolic link, which the guard never follows"])
+                | skipped relative entry → pure ([], [])
                 | directory → go path
                 | ".cabal" `isSuffixOf` entry || "cabal.project" `isPrefixOf` entry → pure ([path], [])
                 | otherwise → pure ([], [])
