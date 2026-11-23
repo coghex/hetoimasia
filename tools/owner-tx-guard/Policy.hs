@@ -42,7 +42,9 @@ readAllowlist bytes = do
           others = [fromUTF8BS name | Field (Name _ name) _ ← inner, fromUTF8BS name `notElem` ["file", "stanza", "reason"]] <> ["a section" | Section {} ← inner]
       case (values "file", map (unwords . words) (values "stanza"), values "reason", others) of
         ([file], [stanza], [reason], [])
-          | not (null (words file)) && not (any (`elem` " \t") file) && not (null stanza) && not (null (words reason)) →
+          | any (`elem` " \t\"'") file || any (`elem` "\"'") stanza →
+              Left ("unsupported: a file or stanza with a space or a quote: " <> show (file, stanza))
+          | not (null file) && not (null stanza) && not (null (words reason)) →
               Right (Entry file stanza)
         _ → Left ("an entry needs exactly one nonempty file, stanza and reason, and nothing else: " <> show (values "file", values "stanza", others))
     Section (Name _ name) _ _ → Left ("the section " <> fromUTF8BS name <> " is not an entry section with no arguments")
@@ -59,7 +61,7 @@ check allowlist files =
   where
     entries = allowedStanzas allowlist
     scanned = Map.fromList [(path, result) | (path, Right result) ← files]
-    unreadable = [path <> ": unreadable: " <> why | (path, Left why) ← files]
+    unreadable = [path <> ": " <> why | (path, Left why) ← files]
     listed path stanza = Entry path (stanzaHeader stanza) `elem` entries
     outside =
       concat

@@ -16,7 +16,7 @@ import Control.Monad (forM_, void)
 import Data.List (isPrefixOf)
 import Json (Json (..), asArray, asString, entryFor, field, parseJson)
 import Sandbox (git, run, sanitizedEnvironment, writeFixtureFile)
-import System.Directory (copyFile, createDirectoryIfMissing, doesFileExist, getCurrentDirectory, getPermissions, setOwnerWritable, setPermissions)
+import System.Directory (copyFile, createDirectoryIfMissing, createDirectoryLink, doesFileExist, getCurrentDirectory, getPermissions, setOwnerWritable, setPermissions)
 import System.Exit (ExitCode (..))
 import System.FilePath (takeDirectory, (</>))
 import System.IO.Temp (withSystemTempDirectory)
@@ -132,7 +132,7 @@ spec = describe "The issuer bridge's textual guard (tools/owner-tx-guard)" $ do
       refused (changed [("consumer/consumer.cabal", consumer [] ["", "library owner-tx-issuer", "    exposed-modules: Consumer.Bridge"])]) [unlisted "consumer/consumer.cabal" 10 "owner-tx-issuer" "library owner-tx-issuer"]
       refused
         (changed [("consumer/consumer.cabal", consumer ["    build-depends:", "        base,", "        hetoimasia-foundation:owner-tx-issuer"] [])])
-        [unlisted "consumer/consumer.cabal" 10 "owner-tx-issuer" "library"]
+        [unlisted "consumer/consumer.cabal" 11 "owner-tx-issuer" "library"]
       refused
         (changed [("consumer/consumer.cabal", consumer ["    if os(linux) && os(darwin)", "        build-depends: hetoimasia-foundation:owner-tx-issuer"] [])])
         [unlisted "consumer/consumer.cabal" 10 "owner-tx-issuer" "library"]
@@ -165,10 +165,25 @@ spec = describe "The issuer bridge's textual guard (tools/owner-tx-guard)" $ do
       unreadableAllowlist (unlines (foundationEntries <> ["entry", "  file: consumer/consumer.cabal", "  stanza: library", "  reason: x", "  component: consumer:lib:consumer"])) "an entry needs exactly one nonempty file, stanza and reason, and nothing else"
       unreadableAllowlist (unlines (foundationEntries <> ["entry", "  file: consumer/consumer.cabal", "  file: other.cabal", "  stanza: library", "  reason: x"])) "an entry needs exactly one nonempty file, stanza and reason, and nothing else"
       unreadableAllowlist (unlines ("version: 4" : foundationEntries)) "the field version is outside an entry section"
+      unreadableAllowlist (unlines (foundationEntries <> allowed "docs/tool sets/cabal.project" "package consumer")) "unsupported: a file or stanza with a space or a quote"
+      unreadableAllowlist (unlines (foundationEntries <> allowed "cabal.project" "package \"a b\"")) "unsupported: a file or stanza with a space or a quote"
       unreadableAllowlist (unlines (["dependent", "  component: consumer:lib:consumer", "  reason: x", ""] <> foundationEntries)) "the section dependent is not an entry section with no arguments"
       (missing, missingSaid) ← checked [file | file@(path, _) ← baseTree, path /= allowlistFile]
       missing `shouldBe` ExitFailure 2
       missingSaid `shouldContain` (allowlistFile <> " cannot be read: it does not exist")
+
+    it "refuses a quoted section argument and a symbolic link as unsupported, never following the link" $ do
+      refused
+        (changed [("cabal.project.common", "jobs: $ncpus\npackage \"consumer\"\n  ghc-options: -Wall\n")])
+        ["cabal.project.common: unsupported: a quoted section argument at line 2"]
+      withSystemTempDirectory "hetoimasia-owner-tx-outside" $ \outside → do
+        writeFixtureFile outside "elsewhere/elsewhere.cabal" (unlines (header "elsewhere" <> ["library", "    build-depends: hetoimasia-foundation:owner-tx-issuer"]))
+        withSystemTempDirectory "hetoimasia-owner-tx-guard" $ \directory → do
+          forM_ baseTree (uncurry (writeFixtureFile directory))
+          createDirectoryLink (outside </> "elsewhere") (directory </> "linked")
+          settings ← sanitizedEnvironment
+          (result, _, errors) ← run settings directory "owner-tx-guard" ["check", "--root", directory]
+          (result, errors) `shouldBe` (ExitFailure 1, "owner_tx_guard: linked: unsupported: a symbolic link, which the guard never follows\n")
 
     it "refuses input Cabal's lexer cannot split, or splits with an ambiguous boundary" $ do
       refused (changed [("consumer/consumer.cabal", "library {\n  build-depends: base }\n")]) ["consumer/consumer.cabal: unreadable: Cabal's lexer cannot split it"]
@@ -210,8 +225,16 @@ spec = describe "The issuer bridge's textual guard (tools/owner-tx-guard)" $ do
             Just entries → any (matches path) entries
             Nothing → False
           matches path entry
+            | '*' `elem` entry && '/' `notElem` entry = glob entry (reverse (takeWhile (/= '/') (reverse path)))
             | not (null entry) && last entry == '/' = path == init entry || entry `isPrefixOf` path
             | otherwise = path == entry
+          -- the catalog's basename classes: '*' matches any run of characters
+          glob pattern text = case pattern of
+            [] → null text
+            '*' : rest → any (glob rest) [drop n text | n ← [0 .. length text]]
+            c : rest → case text of
+              t : more → c == t && glob rest more
+              [] → False
           missing =
             [ path
             | line ← lines scope
@@ -257,10 +280,10 @@ spec = describe "The issuer bridge's textual guard (tools/owner-tx-guard)" $ do
               (field "selected" entry, field "reason" entry) `shouldBe` (Just (JBool True), Just (JString "affected"))
               field "inputs_changed" entry `shouldBe` Just (JBool True)
 
-    it "selects its group and changes the input identity for a project file anywhere, however it is spelled" $ inCheckout $ \checkout → do
+    it "selects its group and changes the input identity for a project file anywhere, however it is spelled, another group's prefix included" $ inCheckout $ \checkout → do
       settings ← sanitizedEnvironment
       files ← lines <$> git settings checkout ["-c", "safe.directory=*", "ls-files", "*.cabal", "cabal.project*", "tools/validation/catalog.json"]
-      forM_ ["cabal.project.notes.md", "docs/elsewhere/cabal.project", "docs/elsewhere/stray.cabal"] $ \path →
+      forM_ ["cabal.project.notes.md", "docs/elsewhere/cabal.project", "docs/elsewhere/stray.cabal", "tools/terrain-storage/cabal.project.extra"] $ \path →
         withSystemTempDirectory "hetoimasia-owner-tx-plan" $ \directory → do
           forM_ [file | file ← files, not ("docs/" `isPrefixOf` file)] $ \file → do
             createDirectoryIfMissing True (directory </> takeDirectory file)
@@ -279,7 +302,7 @@ spec = describe "The issuer bridge's textual guard (tools/owner-tx-guard)" $ do
           (baseResult, baseErrors) `shouldBe` (ExitSuccess, "")
           case parseJson output >>= field "groups" >>= entryFor "id" "test.owner-tx-guard" of
             Nothing → expectationFailure ("the plan for " <> path <> " has no test.owner-tx-guard group")
-            Just entry → field "selected" entry `shouldBe` Just (JBool True)
+            Just entry → (field "selected" entry, field "reason" entry) `shouldBe` (Just (JBool True), Just (JString "affected"))
           (parseJson output >>= field "changed_paths" >>= entryFor "path" path >>= field "classification") `shouldSatisfy` (/= Just (JString "non-affecting"))
           (parseJson output >>= field "input_identity") `shouldSatisfy` (\identity → identity /= Nothing && identity /= (parseJson baseOutput >>= field "input_identity"))
 

@@ -39,13 +39,13 @@ main = do
 run ∷ String → FilePath → IO ()
 run command given = do
   root ← makeAbsolute given
-  files ← scannedFiles root
+  (files, walkProblems) ← scannedFiles root
   case command of
     "scope" → mapM_ (putStrLn . ("file " <>)) (files <> [allowlistPath])
     "check" → do
       allowlist ← readAllowlistAt root
       scanned ← forM files $ \path → (,) path . scanFile <$> ByteString.readFile (root </> path)
-      let problems = check allowlist scanned
+      let problems = walkProblems <> check allowlist scanned
       forM_ problems (hPutStrLn stderr . ("owner_tx_guard: " <>))
       exitWith (if null problems then ExitSuccess else ExitFailure 1)
     _ → refuse ("unknown command " <> command)

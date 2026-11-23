@@ -1021,7 +1021,9 @@
         "docs/toolchain/binding-bundle-darwin/",
         "docs/toolchain/binding-bundle-linux/",
         "tools/owner-tx-guard/",
-        "tools/validation/owner-tx-issuers.fields"
+        "tools/validation/owner-tx-issuers.fields",
+        "*.cabal",
+        "cabal.project*"
       ],
       "framework": "none",
       "runner": "cpu",
