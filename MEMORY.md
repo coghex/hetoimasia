@@ -18,11 +18,11 @@ checks merged work and changed issues against it and resumes from
   active delivery, not implemented. The [Lua-first engine design](docs/removed_records.md)
   defined M1, a Lua-driven textured quad in a window with a real logical VM and
   no gameplay state store or mod activation. M1 is delivered: epic #514 closed
-  2026-11-01 with all 28 slices merged. The gameplay-state example designed next
-  ([gameplay_state_design.md](docs/designs/gameplay_state_design.md)) was
-  superseded by the owner on 2026-11-06.
-- Current arc: the [terrain arena](docs/designs/terrain_arena_design.md)
-  (epic #636), the first piece of Ecce Homo rebuilt on the engine.
+  2026-11-01 with all 28 slices merged.
+- Terrain: the engine keeps the terrain packages (`terrain`, `terrain-runtime`,
+  `terrain-render-2d`, `terrain-render-2d-vulkan`). The game-side terrain work
+  of epic #636 (views, the authored arena) moved to the consumer project on
+  2026-11-23; its designs are in [removed records](docs/removed_records.md).
 - Rendering: the [2D renderer design](docs/removed_records.md) is delivered
   except deferred #446; [GPU backend contract](docs/gpu_backend.md);
   [samples](samples/README.md).
@@ -62,20 +62,20 @@ checks merged work and changed issues against it and resumes from
 - Vulkan: 1.3 minimum, one shared loader, managed retention, present-fence
   retirement, two frame slots by default.
 - Never weaken isolation to turn an inconclusive confinement proof into support.
-- 2026-11-09, [vision](docs/vision.md) V-1: Hetoimasia is the engine on which
-  Ecce Homo is being rebuilt, piece by piece. Synarchy is the reference: its
-  code and behavior are evidence of what each system should do, not a
-  compatibility contract and not a source to copy wholesale. The reasons are a
-  full lighting system that Synarchy's renderer cannot support, and uniform
-  sprite assets regenerated from 3D models with `~/work/moskophoros`.
-- 2026-11-09, [vision](docs/vision.md) V-1: "Haskell mechanisms, Lua rules"
-  (terrain arena D-17) is the general pattern for every system, not a
-  terrain-only choice. The engine supplies reusable Haskell mechanisms through
-  narrow services; Lua defines the game's rules, recipes and authored choices.
-  A system's design departs from it only by an explicit owner decision.
-- Not committed: a game save schema, source or save compatibility with
-  Synarchy, a migration date, permanent RTS tuning, an engine-wide rendering
-  abstraction.
+- 2026-11-23, [vision](docs/vision.md) V-1: Hetoimasia is a generic engine
+  library. Games are separate projects that consume its packages; the first
+  consumer is Widdershins, which owns its game's renderer, world and content.
+  The engine holds no game-specific rule, content or design direction, and a
+  consumer's need arrives as an ordinary engine change through the engine's own
+  process. This supersedes the 2026-11-09 decision that one game was rebuilt
+  on the engine.
+- 2026-11-09, [vision](docs/vision.md) V-1: "Haskell mechanisms, Lua rules" is
+  the general pattern for every system. The engine supplies reusable Haskell
+  mechanisms through narrow services; the application defines its rules,
+  recipes and authored choices, in Lua or in its own code. A system's design
+  departs from it only by an explicit owner decision.
+- Not committed: an application save schema, permanent RTS tuning, an
+  engine-wide rendering abstraction.
 
 ## Open owner decisions
 
