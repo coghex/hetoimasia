@@ -1003,25 +1003,43 @@ Foundation's `OwnerTx` is abstract; an issuer embeds its own `STM` through
 `hetoimasia-foundation:owner-tx-issuer` (see
 [Foundation's README](../packages/foundation/README.md#ownership-transactions)).
 Cabal cannot restrict who depends on a public sublibrary, so the guard does,
-from Cabal's facts alone. `tools/validation/owner_tx_issuers.json` lists the
-exact components (`package:kind:name`) allowed to depend on it; an issuer adds
-its component as it lands.
+from Cabal's facts alone. `tools/validation/owner-tx-issuers.fields`, in Cabal's
+field syntax, lists the exact components allowed to depend on it, one
+`dependent` section each:
 
-- **Supported inputs.** The local packages `cabal.project` and
-  `cabal.project.vulkan` list, following literal local imports, each project
-  file read by Cabal's own field parser; Simple manifests read by Cabal's own
-  parser, common stanzas expanded; every component kind in every configuration
-  on Linux and Darwin, x86_64 and aarch64, under both values of each manual
-  flag.
-- **Allow-listed.** Project fields: `packages` and `import` (literal local
-  directories and files only), `constraints`, `index-state`, `jobs`,
-  `optimization`, `semaphore`, `active-repositories`, `tests` and
-  `benchmarks`; sections: `package` (its `flags`, `tests`, `benchmarks`,
-  `optimization`, native search paths and options) and conditionals on the
-  supported targets. Compiler options, in a manifest or a
-  project, tokenized as Cabal does: warnings (`-W…`, `-w`), optimisation
-  levels, `-threaded`, `-rtsopts`, `-with-rtsopts=…`, `-j`, linker options
-  (`-optl…`) and `-fno-full-laziness`. Anything else is unsupported.
+```
+dependent
+  component: hetoimasia-foundation:test:foundation-tests
+  reason: its composition example builds through the bridge
+```
+
+A component is `package:kind:name`, its kind `lib`, `flib`, `exe`, `test` or
+`bench`; a main library is named after its package (`consumer:lib:consumer`),
+a sublibrary by its own name. An issuer adds its component as it lands. A
+component listed twice, any other field or section, or a malformed component
+makes the allowlist unreadable; a listed component that does not exist or
+depends on the sublibrary nowhere is a stale entry.
+
+- **Projects.** Both `cabal.project` and `cabal.project.vulkan` are required,
+  each read by Cabal's own field parser with its imports, resolved relative to
+  the importing file; a cycle on the active import chain is an error, a shared
+  import is read once. The guard supports exactly the project syntax this
+  repository uses: a top-level `import:` of one unquoted literal relative
+  local file, top-level `packages:` of unquoted literal local directories, the
+  top-level fields `constraints`, `index-state`, `jobs`, `optimization`,
+  `semaphore`, `active-repositories`, `tests` and `benchmarks`, `package`
+  sections of `flags`, `tests`, `benchmarks`, `optimization`, native search
+  paths and options, and `if`/`elif`/`else` over the supported targets whose
+  branches hold only `package` sections. Package selection or an import in any
+  branch, a quoted, spaced or URI path, and any other field, section or
+  condition are unsupported.
+- **Manifests.** Simple manifests read by Cabal's own parser, common stanzas
+  expanded; every component kind in every configuration on Linux and Darwin,
+  x86_64 and aarch64, under both values of each manual flag. Compiler options,
+  in a manifest or a project, tokenized as Cabal does, are allow-listed:
+  warnings (`-W…`, `-w`), optimisation levels, `-threaded`, `-rtsopts`,
+  `-with-rtsopts=…`, `-j`, linker options (`-optl…`) and
+  `-fno-full-laziness`. Anything else is unsupported.
 - **Refused.** A component whose effective `build-depends` selects the
   sublibrary in any buildable configuration, a nondefault manual flag's
   included, and is not listed; a listed entry that depends on it nowhere; a
@@ -1034,12 +1052,15 @@ its component as it lands.
 - **Validated before any branch is dropped.** Every node of every component's
   conditional tree, buildable or not: condition atoms outside the supported
   targets and manual flags, signatures and unsupported options are
-  unsupported, and a library selector of a dependency or a mixin that names no
-  library of a local package fails closed. Only membership is computed from
-  the simplified configurations; an unbuildable one selects nothing.
-- **Fails closed.** A project file or manifest Cabal refuses, and an allowlist
-  that is not strict JSON (a repeated key, a malformed or non-integer number)
-  or not schema 3.
+  unsupported; a library selector of a dependency or a mixin that names no
+  library of a local package, or any library of a package outside the
+  repository, and a mixin that includes no library its configuration depends
+  on, are uncovered. Each names its manifest, component and configurations,
+  or the branch no supported configuration selects. Only membership is
+  computed from the simplified configurations; an unbuildable one selects
+  nothing.
+- **Fails closed.** A missing project file, an import cycle, a project file or
+  manifest Cabal refuses, and an unreadable allowlist.
 
 The guard reads no Haskell source. What a listed component's modules import,
 export and instantiate is issuer review's, as

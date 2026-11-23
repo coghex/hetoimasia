@@ -284,7 +284,7 @@ issuer's outcome tests check this, its callees included.
 **What the guard checks.** From Cabal's facts alone
 ([the import guard](../../docs/validation.md#the-issuer-bridges-import-guard)):
 the components that depend on the `owner-tx-issuer` sublibrary in any
-buildable configuration are exactly those `tools/validation/owner_tx_issuers.json`
+buildable configuration are exactly those `tools/validation/owner-tx-issuers.fields`
 lists; no Cabal `reexported-modules` or `mixins` entry exposes or renames
 `OwnerTx.Issuer` or `OwnerTx.Representation`, in a listed component too; and
 neither module is declared anywhere but here, the representation's library
