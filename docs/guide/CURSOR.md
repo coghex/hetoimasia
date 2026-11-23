@@ -5,7 +5,7 @@ Covered beyond the boundary: none
 
 ## Next
 
-Owner disposition of the exact GUIDE-2 issue draft in the latest report; then the other findings one at a time. GUIDE-1 was filed unchanged as #727 under owner approval; its solve is routed by the manager. New merged work is reviewed from this pin against the November 23 generic-library vision. Pending issue-specification audits remain explicit in coverage.
+Owner disposition of the exact GUIDE-2 issue draft in the latest report (question `922udpgy49zf5q8ixg68my9zf2` in `#het-guide-followups`); then the other findings one at a time. GUIDE-1 was filed unchanged as #727 under owner approval; its solve is routed by the manager. New merged work is reviewed from this pin against the November 23 generic-library vision. Pending issue-specification audits remain explicit in coverage.
 
 ## Open findings
 
