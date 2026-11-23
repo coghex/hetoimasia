@@ -123,6 +123,18 @@ spec = describe "the terrain views' package boundary" $ do
         rejectedBecause outcome "GHC-61689"
         clientOutput outcome `shouldContain` capability
 
+  it "accepts a client that makes the scene ledger and the draw receipts (the control for the refusals below)" $
+    withSessionClient
+      ( unlines
+          [ "module Client (ledger, receipts) where"
+          , "import Hetoimasia.LuaEngine.Graphics.Scene.Ledger (newSceneLedger)"
+          , "import Hetoimasia.LuaEngine.Graphics.Scene.Receipts (newDrawReceipts)"
+          , "ledger = newSceneLedger"
+          , "receipts = newDrawReceipts"
+          ]
+      )
+      accepted
+
   -- the scene ledger and the receipts, whose commits the views watch: no client code runs in them
   forM_ [("Hetoimasia.LuaEngine.Graphics.Scene.Ledger", "ledgerListen"), ("Hetoimasia.LuaEngine.Graphics.Scene.Receipts", "receiptsListen")] $ \(moduleName, listener) →
     it ("rejects a client that asks " <> moduleName <> " for a listener (" <> listener <> ")") $
@@ -146,12 +158,77 @@ spec = describe "the terrain views' package boundary" $ do
         rejectedBecause outcome "GHC-83865"
         clientOutput outcome `shouldContain` "BatchTicket"
 
+  -- the ownership commits a client composes: the public controls through Foundation's commit, with the same
+  -- dependencies for the control and for each refusal
+  it "accepts a client that commits the public controls and installs prepared metrics (the control for the refusals below)" $
+    withCommitClient
+      ( unlines
+          [ "module Client (move, configure, metrics) where"
+          , "import Control.Concurrent.STM (atomically)"
+          , "import Hetoimasia.Foundation.Messaging.Payload (prepare)"
+          , "import Hetoimasia.Foundation.OwnerTx (commit)"
+          , "import Hetoimasia.LuaEngine.Graphics.TerrainView"
+          , "move view target = commit (moveView view target)"
+          , "configure view = commit (configureView view noConfigure)"
+          , "metrics facts given = prepare (Just given) >>= atomically . setOffscreenMetrics facts"
+          ]
+      )
+      accepted
+
+  it "rejects a client that lifts its own retry into a control's commit" $
+    withCommitClient
+      ( unlines
+          [ "module Client (stalled) where"
+          , "import Control.Concurrent.STM (retry)"
+          , "import Hetoimasia.Foundation.OwnerTx (commit)"
+          , "import Hetoimasia.LuaEngine.Graphics.TerrainView"
+          , "stalled view target = commit (moveView view target >> retry)"
+          ]
+      )
+      $ \compile → do
+        outcome ← compile Typecheck
+        -- an ownership transaction is not an STM transaction: no caller STM sequences into it
+        rejectedBecause outcome "GHC-83865"
+        clientOutput outcome `shouldContain` "OwnerTx"
+
+  it "rejects a client that runs a control inside a transaction of its own" $
+    withCommitClient
+      ( unlines
+          [ "module Client (inline) where"
+          , "import Control.Concurrent.STM (atomically)"
+          , "import Hetoimasia.LuaEngine.Graphics.TerrainView"
+          , "inline view = atomically (configureView view noConfigure)"
+          ]
+      )
+      $ \compile → do
+        outcome ← compile Typecheck
+        rejectedBecause outcome "GHC-83865"
+        clientOutput outcome `shouldContain` "OwnerTx"
+
+  it "rejects a client that reaches for the issuer bridge to lift its own STM" $
+    withCommitClient
+      ( unlines
+          [ "module Client (lifted) where"
+          , "import Hetoimasia.Foundation.OwnerTx.Issuer (fromIssuerSTM)"
+          , "lifted = fromIssuerSTM"
+          ]
+      )
+      $ \compile → do
+        outcome ← compile Typecheck
+        case clientStatus outcome of
+          ExitFailure _ → pure ()
+          ExitSuccess → expectationFailure ("the client compiled, so the bridge is reachable:\n" <> clientOutput outcome)
+        -- the bridge is the issuer sublibrary's, which a client of the public units does not depend on
+        clientOutput outcome `shouldContain` "Hetoimasia.Foundation.OwnerTx.Issuer"
+        clientOutput outcome `shouldNotContain` "cannot satisfy"
+
   it "rejects a client that hands an offscreen target's facts raw metrics, unprepared" $
-    withClient
+    withCommitClient
       ( unlines
           [ "module Client (raw) where"
+          , "import Control.Concurrent.STM (atomically)"
           , "import Hetoimasia.LuaEngine.Graphics.TerrainView"
-          , "raw facts metrics = setOffscreenMetrics facts (Just metrics)"
+          , "raw facts metrics = atomically (setOffscreenMetrics facts (Just metrics))"
           ]
       )
       $ \compile → do
@@ -160,6 +237,34 @@ spec = describe "the terrain views' package boundary" $ do
         rejectedBecause outcome "GHC-83865"
         clientOutput outcome `shouldContain` "Prepared"
 
+  -- the parent session's admission the terrain service checks inside its commits: a read-only token, never a reader
+  it "accepts a client that installs a parent session's admission by its token (the control for the refusal below)" $
+    withRuntimeClient
+      ( unlines
+          [ "module Client (admitted) where"
+          , "import Hetoimasia.Foundation.Admission (Admission, admissionToken)"
+          , "import Hetoimasia.Terrain.Runtime (SessionAdmission (..))"
+          , "admitted ∷ Admission → SessionAdmission"
+          , "admitted admission = AdmittedWhile (admissionToken admission)"
+          ]
+      )
+      accepted
+
+  it "rejects a client that installs a reader of its own as the parent session's admission" $
+    withRuntimeClient
+      ( unlines
+          [ "module Client (reading) where"
+          , "import Control.Concurrent.STM (STM)"
+          , "import Hetoimasia.Terrain.Runtime (SessionAdmission (..))"
+          , "reading ∷ SessionAdmission"
+          , "reading = AdmittedWhile (pure True ∷ STM Bool)"
+          ]
+      )
+      $ \compile → do
+        outcome ← compile Typecheck
+        rejectedBecause outcome "GHC-83865"
+        clientOutput outcome `shouldContain` "AdmissionToken"
+
   forM_ ["TerrainViewsPorts", "ViewTarget"] $ \constructor →
     it ("rejects a client that forges the public module's opaque " <> constructor) $
       withClient (unlines ["module Client (forged) where", "import " <> publicModule, "forged = " <> constructor]) $ \compile → do
@@ -167,6 +272,23 @@ spec = describe "the terrain views' package boundary" $ do
         -- no data constructor of that name is in scope: only the type is exported
         rejectedBecause outcome "GHC-01928"
         clientOutput outcome `shouldContain` constructor
+
+-- A supported client compiles.
+accepted ∷ (Mode → IO Client) → IO ()
+accepted compile = do
+  outcome ← compile Typecheck
+  case clientStatus outcome of
+    ExitSuccess → pure ()
+    status → expectationFailure ("the supported client must compile, but the compiler exited with " <> show status <> ":\n" <> clientOutput outcome)
+
+-- The public views' unit with the Foundation's public library and STM: how a client composes the views' ownership
+-- operations into commits of its own.
+withCommitClient ∷ String → ((Mode → IO Client) → IO ()) → IO ()
+withCommitClient = withStorePackageClient ["base", "stm", "hetoimasia-foundation-0.1.0.0-inplace", "hetoimasia-lua-engine-graphics-0.1.0.0-inplace-terrain-views"] "Client.hs"
+
+-- The terrain service's public library with the Foundation's: how a composition installs the parent session.
+withRuntimeClient ∷ String → ((Mode → IO Client) → IO ()) → IO ()
+withRuntimeClient = withStorePackageClient ["base", "stm", "hetoimasia-foundation-0.1.0.0-inplace", "hetoimasia-terrain-runtime-0.1.0.0-inplace"] "Client.hs"
 
 -- The main library's unit, by its in-place id: the scene ledger and receipts as a client reaches them.
 withSessionClient ∷ String → ((Mode → IO Client) → IO ()) → IO ()
