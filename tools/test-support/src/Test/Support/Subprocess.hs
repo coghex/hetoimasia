@@ -208,8 +208,8 @@ data Seams = Seams
   -- ^ The facility's non-blocking check whether a child that stays in the caller's group has been reaped (the library's, which reaps
   -- one that has exited), and whether the leader of a group of its own was reaped before the release.
   , seamWait ∷ ProcessHandle → Int → IO (Maybe ExitCode)
-  -- ^ The facility's bounded reaping wait for the direct child, in microseconds: the last step of ending a group, after its final
-  -- signal. An example that makes it answer 'Nothing' injects a reap that is not confirmed.
+  -- ^ The facility's bounded reaping wait for the direct child, in microseconds (a bound of 0 is a look that reaps an exited child):
+  -- the last step of ending a group, after its final signal. An example that makes it answer 'Nothing' injects a reap that is not confirmed.
   , seamExit ∷ ProcessID → Int → IO (Maybe ChildState)
   -- ^ The facility's bounded wait, in microseconds, for the leader of a group of its own to have exited, without reaping it (a bound
   -- of 0 is a look): 'Nothing' when it had not, 'Just' 'ExitedUnreaped' when it had and the identifier is still reserved, 'Just'
@@ -265,7 +265,7 @@ noSeams =
     { seamSpawned = \_ → pure ()
     , seamReleasing = pure ()
     , seamPoll = getProcessExitCode
-    , seamWait = \handle bound → timeout (max 0 bound) (waitForProcess handle)
+    , seamWait = \handle bound → if bound <= 0 then getProcessExitCode handle else timeout bound (waitForProcess handle)
     , seamExit = \pid bound → if bound <= 0 then lookExit pid else awaitExitOf pid bound
     , seamGroupRemains = probeGroup
     , seamDiagnostic = hPutStrLn stderr
