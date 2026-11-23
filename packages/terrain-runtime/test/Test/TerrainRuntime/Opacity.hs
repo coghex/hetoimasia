@@ -109,7 +109,7 @@ spec = describe "Terrain runtime opacity across the package boundary" $ do
 withClient ∷ FilePath → String → ((Mode → IO Client) → IO ()) → IO ()
 withClient =
   withPackageClient
-    ["base", "bytestring", "text", "stm", "hetoimasia-foundation", "hetoimasia-runtime", "hetoimasia-terrain", "hetoimasia-terrain-runtime-0.1.0.0-inplace"]
+    ["base", "bytestring", "text", "stm", "hetoimasia-foundation-0.1.0.0-inplace", "hetoimasia-runtime", "hetoimasia-terrain", "hetoimasia-terrain-runtime-0.1.0.0-inplace"]
 
 hidden ∷ [String]
 hidden =

@@ -2,18 +2,39 @@
 
 -- | How an operation over an issuer's capability ended, classified once for every adapter that delivers it.
 --
--- An operation answers a value or a refusal, or raises. 'classifyExit' reads that result beside the issuer's
--- terminal standing, read after the operation, and tells apart:
+-- An operation answers a value or a refusal, or raises. 'classifyExit' reads that result beside the issuer's standing,
+-- read once the operation has ended, and gives one 'Exit'.
 --
--- * 'Completed': the operation's value;
--- * 'Refused': a refusal while the issuer lives, a transient answer a later attempt can outlive;
--- * 'Raised': a synchronous exception while the issuer lives, a recoverable failure of this operation alone;
--- * 'Cancelled': an asynchronous exception, whatever the issuer's standing;
--- * 'Terminal': a refusal or a synchronous exception once the issuer has ended (its backend failed, its owner
---   exited, or its construction escaped), which no later attempt outlives.
+-- = The decision table
 --
--- The original exception keeps its context in every class that carries one, so the adapter that delivers it
--- ('deliverExit', or the host's action ticket) rethrows or reports the exception it caught, not a description of it.
+-- Rows are what the operation did; columns are the issuer's standing. A raise is synchronous or asynchronous by the
+-- exception's type ('Control.Exception.SomeAsyncException'), as everywhere in this package: a cancellation is an
+-- asynchronous exception and is never reclassified.
+--
+-- +---------------------------+---------------------+---------------------------+-------------------------------+
+-- | The operation             | 'IssuerLive'        | 'IssuerEnded'             | @'IssuerEscaped' e@           |
+-- +===========================+=====================+===========================+===============================+
+-- | returned a value @a@      | @'Completed' a@     | @'Completed' a@           | @'Terminal' ('Right' e)@      |
+-- +---------------------------+---------------------+---------------------------+-------------------------------+
+-- | returned a refusal @r@    | @'Refused' r@       | @'Terminal' ('Left' r)@   | @'Terminal' ('Right' e)@      |
+-- +---------------------------+---------------------+---------------------------+-------------------------------+
+-- | raised synchronously @x@  | @'Raised' x@        | @'Terminal' ('Right' x)@  | @'Terminal' ('Right' x)@      |
+-- +---------------------------+---------------------+---------------------------+-------------------------------+
+-- | raised asynchronously @x@ | @'Cancelled' x@     | @'Cancelled' x@           | @'Cancelled' x@               |
+-- +---------------------------+---------------------+---------------------------+-------------------------------+
+--
+-- * A refusal from a live issuer is a refusal, a transient answer a later attempt can outlive; once the issuer has
+--   ended it is terminal, and keeps the refusal value.
+-- * A synchronous raise from a live issuer is a recoverable failure of this operation alone; once the issuer has ended
+--   it is terminal.
+-- * A cancellation is a cancellation whatever the issuer's standing: it has priority over an escape.
+-- * An escaped fatal construction ('IssuerEscaped': a failure the issuer recorded as escaping a construction the
+--   operation was lent, which ends the issuer however the operation handled it) is terminal. When the operation
+--   caught it and returned normally (a value or a refusal), the escape is the terminal failure, with its own original
+--   context; when the operation raised its own synchronous exception, that exception is.
+--
+-- Every exception an 'Exit' carries is the one the operation raised or the issuer recorded, with its original context,
+-- unchanged; a refusal is the operation's refusal value, unchanged.
 --
 -- __State.__ The module owns none.
 module Hetoimasia.Foundation.Exit
@@ -22,42 +43,52 @@ module Hetoimasia.Foundation.Exit
   , classifyExit
   , tryExit
   , deliverExit
-  , exitRecoverable
   ) where
 
 import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeAsyncException, SomeException, fromException, rethrowIO, tryWithContext)
 
--- | Whether the issuer an operation ran against still lives, read once the operation ended.
-data IssuerStanding = IssuerLive | IssuerEnded
-  deriving (Eq, Show)
+-- | The issuer's standing once the operation ended: live; ended (its backend failed or its owner exited); or ended by a
+-- construction failure that escaped the construction the operation was lent, recorded with its original context.
+data IssuerStanding
+  = IssuerLive
+  | IssuerEnded
+  | IssuerEscaped !(ExceptionWithContext SomeException)
 
 -- | How one operation ended.
 data Exit r a
-  = Completed a
-  | Refused r
-  | Raised (ExceptionWithContext SomeException)
-  | Cancelled (ExceptionWithContext SomeException)
-  | Terminal (Either r (ExceptionWithContext SomeException))
+  = -- | Its value.
+    Completed a
+  | -- | Its refusal, while the issuer lives: a later attempt can outlive it.
+    Refused r
+  | -- | Its synchronous exception, while the issuer lives: a failure of this operation alone.
+    Raised !(ExceptionWithContext SomeException)
+  | -- | An asynchronous exception, whatever the issuer's standing.
+    Cancelled !(ExceptionWithContext SomeException)
+  | -- | The end no later attempt outlives: the refusal a terminal issuer answered, or the exception the operation raised
+    -- once the issuer had ended, or the issuer's escaped construction failure.
+    Terminal !(Either r (ExceptionWithContext SomeException))
 
--- | Classify an operation's result by its issuer's standing. An asynchronous exception is a cancellation whatever
--- the standing; a refusal or a synchronous exception is terminal once the issuer has ended, and transient or
--- recoverable while it lives.
+-- | Classify an operation's result by its issuer's standing (the decision table above).
 classifyExit ∷ IssuerStanding → Either (ExceptionWithContext SomeException) (Either r a) → Exit r a
 classifyExit standing = \case
   Left raised@(ExceptionWithContext _ exception)
     | Just (_ ∷ SomeAsyncException) ← fromException exception → Cancelled raised
-    | standing == IssuerEnded → Terminal (Right raised)
-    | otherwise → Raised raised
-  Right (Left refusal)
-    | standing == IssuerEnded → Terminal (Left refusal)
-    | otherwise → Refused refusal
-  Right (Right value) → Completed value
+    | otherwise → case standing of
+        IssuerLive → Raised raised
+        _ → Terminal (Right raised)
+  Right (Left refusal) → case standing of
+    IssuerLive → Refused refusal
+    IssuerEnded → Terminal (Left refusal)
+    IssuerEscaped escape → Terminal (Right escape)
+  Right (Right value) → case standing of
+    IssuerEscaped escape → Terminal (Right escape)
+    _ → Completed value
 
 -- | Run an operation, keeping a raised exception with its context.
 tryExit ∷ IO (Either r a) → IO (Either (ExceptionWithContext SomeException) (Either r a))
 tryExit = tryWithContext
 
--- | Deliver a classified exit to the caller: a value or a refusal answered, an exception rethrown with its original
+-- | Deliver a classified exit to its caller: a value or a refusal answered, an exception rethrown with its original
 -- context.
 deliverExit ∷ Exit r a → IO (Either r a)
 deliverExit = \case
@@ -67,12 +98,3 @@ deliverExit = \case
   Cancelled raised → rethrowIO raised
   Terminal (Left refusal) → pure (Left refusal)
   Terminal (Right raised) → rethrowIO raised
-
--- | Whether a later attempt can outlive this exit: a value, a transient refusal or a recoverable exception.
-exitRecoverable ∷ Exit r a → Bool
-exitRecoverable = \case
-  Completed _ → True
-  Refused _ → True
-  Raised _ → True
-  Cancelled _ → False
-  Terminal _ → False

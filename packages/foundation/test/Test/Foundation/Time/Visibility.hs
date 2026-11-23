@@ -62,7 +62,7 @@ spec = describe "Time module visibility across the package boundary" $ do
         clientOutput outcome `shouldNotContain` "Could not find module"
 
 withClient ∷ String → ((Mode → IO Client) → IO ()) → IO ()
-withClient = withPackageClient ["base", "hetoimasia-foundation"] "Client.hs"
+withClient = withPackageClient ["base", "hetoimasia-foundation-0.1.0.0-inplace"] "Client.hs"
 
 -- | The modules hidden inside the main library.
 hidden ∷ [String]

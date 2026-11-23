@@ -1,27 +1,49 @@
--- | Ownership transactions: the only way an owner's cells change, and a vocabulary that admits no code but the
--- issuers' own.
+-- | Ownership transactions: the transactions that commit an owner's facts, with no caller 'STM' or 'IO' inside them.
 --
--- An 'OwnerTx' is built from three things and nothing else: allocating, reading and replacing 'OwnerCell's;
--- reading a 'ReadOnly' capability another owner issued over one of its cells; and pure sequencing. 'commit' runs one
--- atomically. There is no way to lift an 'STM' or 'IO' action into one, to wait or retry inside one, to throw from
--- one, or to run one as part of a larger 'STM' transaction, so a commit runs only the reads and writes its issuers
--- wrote, and it neither blocks nor raises (beyond what a value forced inside it raises: values are written forced,
--- so a commit's issuer forces only what it built).
+-- An 'OwnerTx' is abstract. What this module offers to build one is closed: allocating, reading and replacing
+-- 'OwnerCell's by value, reading a 'ReadOnly' capability or a 'Publication' another owner issued, and pure sequencing.
+-- 'commit' runs one atomically. Nothing here lifts an 'STM' or 'IO' action into one, waits or retries inside one, throws
+-- from one, runs one as part of a larger 'STM' transaction, or takes an effectful function to run inside one.
 --
--- __Discipline.__ A compound transition reads and validates every guard before it writes, and answers a refusal as
--- a value. Writes force the written value to weak head normal form; a value that must be fully evaluated crosses
--- into a commit 'Hetoimasia.Foundation.Messaging.Payload.Prepared'.
+-- Pure sequencing and by-value writes can still evaluate caller expressions during a commit: a continuation may
+-- compute a replacement from a cell it just read, and 'writeCell' forces that replacement inside the transaction, so
+-- a partial expression there (a missing map lookup, say) raises in 'commit' and rolls the whole transaction back. A
+-- caller prepares every fallible input, and decides every refusal, before committing.
 --
--- __Waiting.__ A reader that must wait for a change waits outside every commit: 'watch' reads a 'ReadOnly' in an
--- ordinary 'STM' transaction, where it may retry, and then asks the owner for a fresh decision in a commit of its
+-- __Issuers.__ An issuer (a subsystem that owns state and exports ownership operations over it) keeps its own 'STM' and
+-- its existing state, and embeds a concrete operation through
+-- 'Hetoimasia.Foundation.OwnerTx.Issuer.fromIssuerSTM', in the @owner-tx-issuer@ sublibrary of this package. Only issuer
+-- components depend on that sublibrary: reviewers check every @build-depends@ that names it, and what the issuer's
+-- modules import and export, against the review contract below and in the bridge's own documentation. Every embedded
+-- path must:
+--
+-- * read only issuer-controlled inputs (its own cells and those it was handed by value or by an opaque handle it
+--   issued), never a caller's transaction, callback or reader;
+-- * validate every guard before its first write;
+-- * answer a refusal as data;
+-- * finish without waiting ('retry') and without raising.
+--
+-- GHC checks the public types; review and each issuer's outcome tests check those four properties inside the issuer,
+-- its callees included.
+--
+-- __Values.__ A cell's write forces the value to weak head normal form. A value that must be fully evaluated crosses
+-- into a commit 'Prepared': a publication accepts nothing else.
+--
+-- __Waiting.__ A reader that must wait for a change waits outside every commit: 'watch' and 'watchPublication' read
+-- in an ordinary 'STM' transaction, where it may retry, and the reader then asks for a fresh decision in a commit of its
 -- own.
 --
--- __Published facts.__ A fact an independent source owns, which a commit only verifies (a lease's liveness, a
--- window's showing, a device's end), is published: the source writes a 'Publisher' in its own transaction, fully
--- evaluated, and a commit reads the 'Publication'. A publication is never an owner cell, and no commit writes one.
+-- __Publications.__ A fact an independent source owns and a commit only verifies (a lease's liveness, a window's
+-- showing, a device's end) is published. The source prepares the value in 'IO', then installs it and advances the
+-- revision in its own transaction, the one that changes the fact (its teardown included), even when the value is equal
+-- to the last. A commit reads the 'Publication' and never writes it. A publication is not an owner cell.
 --
--- __State.__ The module owns none. Each cell is owned by the issuer that allocated it, which exports operations on
--- opaque handles and never the cell itself; a 'ReadOnly' is a capability the issuer hands out to readers.
+-- __Where it comes from.__ This module imports no protected module: it re-exports the STM-free operations of the
+-- private adapter "Hetoimasia.Foundation.OwnerTx.Operations" and the cells' types, kept abstract, with their observation
+-- and publication operations from "Hetoimasia.Foundation.OwnerTx.Cells", which does not import the representation.
+--
+-- __State.__ The module owns none. A cell belongs to the issuer that allocated it, which exports operations on opaque
+-- handles and never the cell; a 'ReadOnly' or a 'Publication' is a capability its owner hands to readers.
 module Hetoimasia.Foundation.OwnerTx
   ( -- * Transactions
     OwnerTx
@@ -33,8 +55,6 @@ module Hetoimasia.Foundation.OwnerTx
   , newCellIO
   , readCell
   , writeCell
-  , modifyCell
-  , stateCell
 
     -- * Read-only capabilities
   , ReadOnly
@@ -50,107 +70,42 @@ module Hetoimasia.Foundation.OwnerTx
   , publish
   , publication
   , readPublication
-  , publicationRevision
   , watchPublication
   ) where
 
-import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVar, newTVarIO, readTVar, writeTVar)
-import Control.DeepSeq (NFData, force, rnf)
-import Control.Exception (evaluate)
-import Data.Word (Word64)
+import Control.Concurrent.STM (STM, modifyTVar', newTVar, newTVarIO, writeTVar)
+import Hetoimasia.Foundation.Messaging.Payload (Prepared, preparedValue)
+import Hetoimasia.Foundation.OwnerTx.Cells
+  ( OwnerCell
+  , Publication
+  , Publisher (..)
+  , ReadOnly
+  , newCellIO
+  , publication
+  , readOnly
+  , watch
+  , watchPublication
+  )
+import Hetoimasia.Foundation.OwnerTx.Operations (OwnerTx, commit, newCell, readCell, readPublication, readTx, writeCell)
 
--- | One ownership transaction, run by 'commit'.
-newtype OwnerTx a = OwnerTx (STM a)
-  deriving newtype (Functor, Applicative, Monad)
+-- | A fresh publisher of a prepared value, at revision 0, in the source's transaction. The handle is selected (forced to
+-- weak head normal form, which for a prepared value is all of it, so no 'Control.DeepSeq.NFData' instance runs again)
+-- before anything is made: a selection that fails raises here, in the source's transaction.
+newPublisher ∷ Prepared a → STM (Publisher a)
+newPublisher value = installed value `seq` (Publisher <$> newTVar 0 <*> newTVar (installed value))
 
--- | Run one ownership transaction atomically. It never waits.
-commit ∷ OwnerTx a → IO a
-commit (OwnerTx transaction) = atomically transaction
+-- | A fresh publisher of a prepared value, at revision 0, outside any transaction, the handle selected first.
+newPublisherIO ∷ Prepared a → IO (Publisher a)
+newPublisherIO value = installed value `seq` (Publisher <$> newTVarIO 0 <*> newTVarIO (installed value))
 
--- | A cell its issuer owns: read and replaced only in ownership transactions.
-newtype OwnerCell a = OwnerCell (TVar a)
-  deriving newtype (Eq)
+-- | Install a prepared value and advance the revision, together, in the source's own transaction: the one that changes
+-- the fact it publishes, a teardown included. The revision advances even for a value equal to the last. The handle is
+-- selected before either is written, so a selection that fails raises in the source's transaction and leaves the prior
+-- value and revision as they were.
+publish ∷ Publisher a → Prepared a → STM ()
+publish (Publisher revision cell) value = installed value `seq` (writeTVar cell (installed value) >> modifyTVar' revision (+ 1))
 
--- | A fresh cell holding this value.
-newCell ∷ a → OwnerTx (OwnerCell a)
-newCell value = value `seq` OwnerTx (OwnerCell <$> newTVar value)
-
--- | A fresh cell holding this value, outside any transaction.
-newCellIO ∷ a → IO (OwnerCell a)
-newCellIO value = value `seq` (OwnerCell <$> newTVarIO value)
-
-readCell ∷ OwnerCell a → OwnerTx a
-readCell (OwnerCell cell) = OwnerTx (readTVar cell)
-
--- | Replace the cell's value, forced to weak head normal form.
-writeCell ∷ OwnerCell a → a → OwnerTx ()
-writeCell (OwnerCell cell) value = value `seq` OwnerTx (writeTVar cell value)
-
--- | Replace the cell's value by a function of it, forced to weak head normal form.
-modifyCell ∷ OwnerCell a → (a → a) → OwnerTx ()
-modifyCell cell change = readCell cell >>= writeCell cell . change
-
--- | Replace the cell's value by a function of it that also answers.
-stateCell ∷ OwnerCell a → (a → (b, a)) → OwnerTx b
-stateCell cell change = do
-  (answer, value) ← change <$> readCell cell
-  writeCell cell value
-  pure answer
-
--- | A capability to read one owner's cell. Equal only to a capability over the same cell.
-newtype ReadOnly a = ReadOnly (TVar a)
-  deriving newtype (Eq)
-
--- | The read-only capability over a cell.
-readOnly ∷ OwnerCell a → ReadOnly a
-readOnly (OwnerCell cell) = ReadOnly cell
-
--- | Read through the capability inside an ownership transaction.
-readTx ∷ ReadOnly a → OwnerTx a
-readTx (ReadOnly cell) = OwnerTx (readTVar cell)
-
--- | Read through the capability in an ordinary transaction, which may wait on it. Never part of a commit.
-watch ∷ ReadOnly a → STM a
-watch (ReadOnly cell) = readTVar cell
-
--- | A fact an independent source owns and publishes, with its revision, for commits to verify. The source keeps the
--- 'Publisher' and writes it in its own transactions, in the one that changes the fact; readers hold the
--- 'Publication', which a commit reads and never writes.
-data Publisher a = Publisher !(TVar Word64) !(TVar a)
-
--- | What readers of a published fact hold. Equal only to the publication of the same publisher.
-data Publication a = Publication !(TVar Word64) !(TVar a)
-
-instance Eq (Publication a) where
-  Publication left _ == Publication right _ = left == right
-
--- | A fresh publisher of this value, fully evaluated, at revision 0.
-newPublisher ∷ NFData a ⇒ a → STM (Publisher a)
-newPublisher value = rnf value `seq` (Publisher <$> newTVar 0 <*> newTVar value)
-
--- | A fresh publisher of this value, fully evaluated, at revision 0, outside any transaction.
-newPublisherIO ∷ NFData a ⇒ a → IO (Publisher a)
-newPublisherIO value = do
-  forced ← evaluate (force value)
-  Publisher <$> newTVarIO 0 <*> newTVarIO forced
-
--- | Publish a new value, fully evaluated, and move the revision, in the source's own transaction. A value whose
--- evaluation raises raises here, in the publishing transaction, and the publication keeps its prior value.
-publish ∷ NFData a ⇒ Publisher a → a → STM ()
-publish (Publisher revision cell) value = rnf value `seq` (writeTVar cell value >> modifyTVar' revision (+ 1))
-
--- | What readers hold.
-publication ∷ Publisher a → Publication a
-publication (Publisher revision cell) = Publication revision cell
-
--- | The published value, inside an ownership transaction. It never waits.
-readPublication ∷ Publication a → OwnerTx a
-readPublication (Publication _ cell) = OwnerTx (readTVar cell)
-
--- | The publication's revision, inside an ownership transaction.
-publicationRevision ∷ Publication a → OwnerTx Word64
-publicationRevision (Publication revision _) = OwnerTx (readTVar revision)
-
--- | The published value and its revision in an ordinary transaction, which may wait on them. Never part of a commit.
-watchPublication ∷ Publication a → STM (Word64, a)
-watchPublication (Publication revision cell) = (,) <$> readTVar revision <*> readTVar cell
+-- The prepared value a handle carries. Forcing it forces the handle's selection, never the value's preparation again: a
+-- prepared value is already fully evaluated.
+installed ∷ Prepared a → a
+installed = preparedValue

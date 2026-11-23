@@ -200,9 +200,24 @@ each other. See [docs/workers.md](../../docs/workers.md#module-structure) for
 their dependency direction and [its state table](../../docs/workers.md#state)
 for the module that owns and writes each piece of state.
 
+Ownership transactions have two public modules, `OwnerTx` and `Exit`, in the
+main library. The private `internal` sublibrary holds the representation,
+`OwnerTx.Representation`; the cells, `OwnerTx.Cells`, which do not import it;
+and `OwnerTx.Operations`, the adapter of the STM-free operations the
+public module re-exports. The issuer bridge, `OwnerTx.Issuer`, is the public
+`owner-tx-issuer` sublibrary's one module. The representation and the bridge are
+the defining modules; who may depend on the bridge, and what review checks
+outside them, is in [Ownership transactions](#ownership-transactions).
+
 | Logical module | Source path | Cabal component | Visibility | Purpose |
 | --- | --- | --- | --- | --- |
 | `Hetoimasia.Foundation.Admission` | `src/Hetoimasia/Foundation/Admission.hs` | main library | exposed | An admission its owner opens once and closes once (`Admission`, the only capability that closes it), and the read-only `AdmissionToken` others hold: they read whether it is open and compare it by identity, a read of the owner's cell and nothing more, so a commit may verify one |
+| `Hetoimasia.Foundation.OwnerTx` | `src/Hetoimasia/Foundation/OwnerTx.hs` | main library | exposed | The abstract ownership transaction and `commit`; owner cells by value, read-only capabilities, and revisioned publications of prepared values |
+| `Hetoimasia.Foundation.Exit` | `src/Hetoimasia/Foundation/Exit.hs` | main library | exposed | `classifyExit`, the one classification of an operation's end by its issuer's standing, with its decision table; `tryExit` and `deliverExit` |
+| `Hetoimasia.Foundation.OwnerTx.Representation` | `internal/Hetoimasia/Foundation/OwnerTx/Representation.hs` | `internal` sublibrary | package-private, defining module | The transaction's representation; bridge-equivalent |
+| `Hetoimasia.Foundation.OwnerTx.Cells` | `internal/Hetoimasia/Foundation/OwnerTx/Cells.hs` | `internal` sublibrary | package-private | The cells' representations and the reads waiting readers make in ordinary `STM`; no transaction |
+| `Hetoimasia.Foundation.OwnerTx.Operations` | `internal/Hetoimasia/Foundation/OwnerTx/Operations.hs` | `internal` sublibrary | package-private | `commit` and the transaction's cell, capability and publication reads and writes, STM-free in their types |
+| `Hetoimasia.Foundation.OwnerTx.Issuer` | `owner-tx-issuer/Hetoimasia/Foundation/OwnerTx/Issuer.hs` | `owner-tx-issuer` sublibrary | public, defining module | The issuer bridge: `fromIssuerSTM` and the issuer-side cell updates that take functions |
 | `Hetoimasia.Foundation.Log` | `src/Hetoimasia/Foundation/Log.hs` | main library | exposed | Public logging facade; logger construction, scoped context, flushing, emission, and call-site extraction |
 | `Hetoimasia.Foundation.Log.Base` | `src/Hetoimasia/Foundation/Log/Base.hs` | main library | hidden | Levels, source locations, and the format and variable-name options |
 | `Hetoimasia.Foundation.Log.Component` | `src/Hetoimasia/Foundation/Log/Component.hs` | main library | hidden | The validated `Component`, its constructors and operations, and shared quoting |
@@ -245,12 +260,62 @@ for the module that owns and writes each piece of state.
 | `Hetoimasia.Foundation.Worker.Startup` | `internal/Hetoimasia/Foundation/Worker/Startup.hs` | `internal` sublibrary | hidden | Registration, the fork and startup handoff, the child thread, and terminal publication |
 | `Hetoimasia.Foundation.Worker.Group` | `internal/Hetoimasia/Foundation/Worker/Group.hs` | `internal` sublibrary | hidden | The group lifetime boundary, closing, the report, and the protected drain |
 
+## Ownership transactions
+
+A transaction that commits an owner's facts runs no caller code: no caller
+`STM`, no callback, no waiting read. `OwnerTx` is abstract, and the main
+library builds one from cells (read and written by value), read-only
+capabilities, publications and pure sequencing; `commit` runs it atomically and
+never waits. A reader that must wait reads in ordinary `STM` (`watch`,
+`watchPublication`) and then commits a fresh decision.
+
+| Piece | Who holds it | Writes | Reads |
+| --- | --- | --- | --- |
+| `OwnerCell` | its issuer, never exported | its issuer's commits, by value | its issuer's commits |
+| `ReadOnly` | readers the issuer hands it to | none | commits (`readTx`), waiting readers (`watch`) |
+| `Publisher` | an independent source | the source's own transaction, with the fact's change (teardown included), a `Prepared` value (its handle selected before anything is written) and the next revision together; its payload's role is nominal | none |
+| `Publication` | readers | none | commits (`readPublication`), waiting readers (`watchPublication`) |
+
+An issuer keeps its own `STM` and state and embeds a concrete operation with
+`fromIssuerSTM` from the `owner-tx-issuer` sublibrary. Every embedded path reads
+only issuer-controlled inputs, validates before its first write, answers a
+refusal as data, and finishes without waiting or raising; review and the
+issuer's outcome tests check this, its callees included.
+
+**Who may depend on the bridge.** Only issuer components may depend on
+`hetoimasia-foundation:owner-tx-issuer`. Every pull request adding that
+dependency names each affected component in its body, and issuer review checks
+its Cabal `build-depends`, including every component that inherits the
+dependency through a common stanza, directly or transitively. Package
+visibility keeps the bridge out of reach of every client built against the main
+library; no automated check stands in for review. Review reads the named
+components' modules, and Foundation's own consumers of the representation, for
+where issuer code runs and what reaches its clients. Outside the defining
+modules:
+
+- no export that converts a caller's `STM` to or from `OwnerTx`, directly or
+  through a wrapper, a class method or a re-export;
+- no adapter instance on `STM` or on `OwnerTx`, `OwnerCell`, `ReadOnly`,
+  `Publisher` or `Publication`, and no re-export equivalent to the bridge or
+  the representation;
+- the cells and operations stay split as above, handles stay opaque,
+  publication payloads nominal, writes prepared, and `Exit` keeps the original
+  context. Safe observation and publication through `STM` stay public.
+
+`classifyExit` reads an operation's result beside its issuer's standing, live,
+ended, or ended by an escaped construction failure, and answers one `Exit`: a
+value; a refusal from a live issuer; a recoverable raise from a live issuer; a
+cancellation, whatever the standing; or a terminal end (a refusal or a raise
+once the issuer ended, or the escape, which wins over a normal return). Every
+exception keeps its original context. The full table is in the module's
+documentation.
+
 ## Tests
 
 `foundation-tests` owns this package's contracts. Its sources live in `test/`
 alone: `Main.hs`, the composer `Test.Foundation.Spec`, and one component tree
 each for `Logging`, `Resources`, `Failures`, `Recovery`, `Workers`,
-`Messaging`, and `Time`, with that component's own helpers beside its specs. A new example
+`Messaging`, `Time`, and `Ownership`, with that component's own helpers beside its specs. A new example
 belongs in the component spec whose contract it asserts. It may use only this
 package, the neutral `hetoimasia-test-support` library, and third-party
 packages; an example that needs the runtime, GLFW, or the console belongs to the

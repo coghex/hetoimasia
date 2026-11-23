@@ -66,7 +66,7 @@ spec = describe "Logging and failure opacity across the package boundary" $ do
         clientOutput outcome `shouldContain` abstract
 
 withClient ∷ String → ((Mode → IO Client) → IO ()) → IO ()
-withClient = withPackageClient ["base", "hetoimasia-foundation"] "Client.hs"
+withClient = withPackageClient ["base", "hetoimasia-foundation-0.1.0.0-inplace"] "Client.hs"
 
 -- | Every module the two families keep private to the main library.
 hiddenModules ∷ [String]

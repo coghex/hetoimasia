@@ -76,7 +76,7 @@ supervisedSpec = describe "Supervised worker opacity across the package boundary
 
 withClient ∷ FilePath → String → ((Mode → IO Client) → IO ()) → IO ()
 withClient =
-  withPackageClient ["base", "text", "stm", "hetoimasia-foundation", "hetoimasia-runtime"]
+  withPackageClient ["base", "text", "stm", "hetoimasia-foundation-0.1.0.0-inplace", "hetoimasia-runtime"]
 
 -- | The client from the issue: it pairs one handle's supervision state with
 -- another handle's worker through record-update syntax, which needs only the

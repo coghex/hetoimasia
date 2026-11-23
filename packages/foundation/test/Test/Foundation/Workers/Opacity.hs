@@ -69,7 +69,7 @@ spec = describe "Probe opacity across the package boundary" $ do
       lines out `shouldBe` ["open [\"waiting\"]", "closed []"]
 
 withClient ∷ FilePath → String → ((Mode → IO Client) → IO ()) → IO ()
-withClient = withPackageClient ["base", "stm", "text", "hetoimasia-foundation"]
+withClient = withPackageClient ["base", "stm", "text", "hetoimasia-foundation-0.1.0.0-inplace"]
 
 publicProbeClient ∷ String
 publicProbeClient =

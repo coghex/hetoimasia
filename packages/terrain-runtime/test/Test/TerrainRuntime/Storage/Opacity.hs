@@ -65,7 +65,7 @@ spec = describe "Storage backend opacity across the package boundary" $ do
 withClient ∷ FilePath → String → ((Mode → IO Client) → IO ()) → IO ()
 withClient =
   withPackageClient
-    ["base", "text", "stm", "bytestring", "hetoimasia-foundation", "hetoimasia-runtime", "hetoimasia-terrain", "hetoimasia-terrain-runtime-0.1.0.0-inplace"]
+    ["base", "text", "stm", "bytestring", "hetoimasia-foundation-0.1.0.0-inplace", "hetoimasia-runtime", "hetoimasia-terrain", "hetoimasia-terrain-runtime-0.1.0.0-inplace"]
 
 importing ∷ [String] → [String] → String
 importing imports body = unlines (["module Client () where", ""] <> imports <> [""] <> body)
