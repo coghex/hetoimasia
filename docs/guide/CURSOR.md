@@ -5,7 +5,7 @@ Covered beyond the boundary: none
 
 ## Next
 
-Owner disposition of the exact GUIDE-3 issue draft in the latest report, then GUIDE-4. GUIDE-2 is deferred until the owner decides how slopes work; recheck its premise after that decision. GUIDE-1 was filed unchanged as #727 under owner approval; its solve is routed by the manager. New merged work is reviewed from this pin against the November 23 generic-library vision. Pending issue-specification audits remain explicit in coverage.
+Owner disposition of the exact GUIDE-3 issue draft in the latest report (question `drhn2c8saqfn4w4yhhzqa83qz2` in `#het-guide-followups`), then GUIDE-4. GUIDE-2 is deferred until the owner decides how slopes work; recheck its premise after that decision. GUIDE-1 was filed unchanged as #727 under owner approval; its solve is routed by the manager. New merged work is reviewed from this pin against the November 23 generic-library vision. Pending issue-specification audits remain explicit in coverage.
 
 ## Open findings
 
