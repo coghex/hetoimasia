@@ -2504,6 +2504,18 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         atomically (inspectViewCountSTM (rigTerrain rig)) `shouldReturn` 1
         readTVarIO (rigStyleReleases rig) `shouldReturn` releases + 1
 
+    it "admits one step when a competing kick lands between a wait that found a step due and its admitting commit" $
+      withPublished defaultOptions $ \rig target _ → do
+        quiesce rig target
+        let views = rigViews rig
+        -- the wait has found a step due; before its commit, a competing kick queues one
+        commit (kick views)
+        atomically (Seq.length <$> readTVar (rigQueue rig)) `shouldReturn` 1
+        -- the admitting commit decides again: that step is queued, so it admits nothing
+        commit (admitDue views (pure True)) `shouldReturn` False
+        atomically (Seq.length <$> readTVar (rigQueue rig)) `shouldReturn` 1
+        quiesce rig target
+
     it "detaches the old runtime view and withdraws its demand in the commit that frees its claim" $
       withPublished defaultOptions $ \rig target view → do
         quiesce rig target

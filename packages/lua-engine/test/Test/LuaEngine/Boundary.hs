@@ -496,8 +496,9 @@ spec = describe "the package and import boundary" $ do
                  , "Hetoimasia.Content.ReadPool"
                  , "Hetoimasia.Foundation.Resource"
                  , "Hetoimasia.Foundation.Worker"
-                 , -- the account is an issuer of ownership transactions
-                   "Hetoimasia.Foundation.OwnerTx"
+                 , -- the account is an issuer of ownership transactions, over prepared amounts
+                   "Hetoimasia.Foundation.Messaging.Payload"
+                 , "Hetoimasia.Foundation.OwnerTx"
                  , "Hetoimasia.Foundation.OwnerTx.Issuer"
                  , "Hetoimasia.Asset"
                  , "Hetoimasia.Asset.Image"
@@ -587,8 +588,9 @@ spec = describe "the package and import boundary" $ do
                , "Hetoimasia.LuaEngine.Session.Pacing"
                , "Hetoimasia.LuaEngine.Session.State"
                , "Hetoimasia.LuaEngine.Texture"
-               , -- the account's operations, committed through the foundation's public commit
-                 "Hetoimasia.Foundation.OwnerTx"
+               , -- the account's operations, committed through the foundation's public commit over prepared amounts
+                 "Hetoimasia.Foundation.Messaging.Payload"
+               , "Hetoimasia.Foundation.OwnerTx"
                , "Hetoimasia.LuaEngine.Terrain"
                , "Hetoimasia.LuaEngine.Scene"
                , "Hetoimasia.Terrain.Cell"

@@ -196,8 +196,9 @@ spec = describe "the terrain views' package boundary" $ do
       ( unlines
           [ "module Client (inline) where"
           , "import Control.Concurrent.STM (atomically)"
+          , "import Hetoimasia.Foundation.Messaging.Payload (prepare)"
           , "import Hetoimasia.LuaEngine.Graphics.TerrainView"
-          , "inline view = atomically (configureView view noConfigure)"
+          , "inline view = prepare noConfigure >>= atomically . configureView view"
           ]
       )
       $ \compile → do

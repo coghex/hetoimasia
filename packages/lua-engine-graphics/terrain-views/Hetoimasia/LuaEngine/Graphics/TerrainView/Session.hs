@@ -49,6 +49,7 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView.Session
   , withTerrainViews
   , stepOwner
   , kick
+  , admitDue
   , ledgerNoticed
 
     -- * Targets and styles
@@ -752,13 +753,15 @@ watch service stopping = loop
       swept ← offscreenSweepDue (portReceipts (svPorts service))
       askable ← barriersDue service
       queued ← stepQueued service
-      wanted ← (||) <$> readTVar (svKickWanted service) <*> stepRefusedForNow service
-      ready ← if queued then pure False else retirementReady service
+      let wanting = (||) <$> readTVar (svKickWanted service) <*> stepRefusedForNow service
+          stepDue = (||) <$> wanting <*> retirementReady service
+      wanted ← if queued then pure False else stepDue
       admits ← ownerAdmits (portOwner (svPorts service))
       if
         | noticed || swept → pure (commit (own ((||) <$> notice service <*> sweepOffscreen (portReceipts (svPorts service))) >>= \moved → when moved (kick service)))
         | askable → pure (commit (askBarriers service >>= \asked → when asked (kick service)))
-        | not queued && (wanted || ready) && admits → pure (void (commit (admit service)))
+        -- the decision is taken again in the admitting commit
+        | wanted && admits → pure (void (commit (admitDue service stepDue)))
         | otherwise → retry
 
 -- Each open view's marks as the watcher compares them, with whether its armed candidate can go on and what the
@@ -868,6 +871,15 @@ kick ∷ (Ord k, Show k) ⇒ TerrainViews k → OwnerTx ()
 kick service = do
   (queued, ended) ← own ((,) <$> stepQueued service <*> readTVar (svEnded service))
   unless (queued || isJust ended) (void (admit service))
+
+-- | Admit one step if, in this commit, none is queued, the owner has not ended, and the work its waiter found is still
+-- due: a waiter decides to admit outside any commit, and a kick may have queued a step before its commit. Never two
+-- queued steps.
+admitDue ∷ (Ord k, Show k) ⇒ TerrainViews k → STM Bool → OwnerTx Bool
+admitDue service due =
+  own ((,,) <$> stepQueued service <*> readTVar (svEnded service) <*> due) >>= \case
+    (False, Nothing, True) → admit service
+    _ → pure False
 
 -- Admit one step, through the owner's own admission. Answers whether anything changed: a step admitted, or the owner
 -- found ended (a full queue or a device not yet ready leaves the kick wanted, for the watcher to admit once the queue
@@ -1001,7 +1013,7 @@ shutdown service = do
           unless closed drain
         DrainAgain → drain
         DrainBarriers → commit (askBarriers service) >> drain
-        DrainAdmit → commit (admit service) >> drain
+        DrainAdmit → commit (admitDue service ((||) <$> retirementReady service <*> stepRefusedForNow service)) >> drain
 
 -- What the drain's wait found due.
 data Drain = DrainAbandon | DrainHandOff | DrainFinish | DrainAgain | DrainBarriers | DrainAdmit
