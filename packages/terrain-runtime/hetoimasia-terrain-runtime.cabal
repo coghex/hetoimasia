@@ -233,6 +233,7 @@ test-suite terrain-runtime-tests
         Test.TerrainRuntime.Regional
         Test.TerrainRuntime.Revalidation
         Test.TerrainRuntime.Usage
+        Test.TerrainRuntime.ViewRequests
         Test.TerrainRuntime.Spec
         Test.TerrainRuntime.Store.AdmissionSpec
         Test.TerrainRuntime.Store.Allowance

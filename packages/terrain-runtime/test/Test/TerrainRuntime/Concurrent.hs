@@ -43,6 +43,7 @@ import qualified Test.TerrainRuntime.Oracle as Oracle
 import qualified Test.TerrainRuntime.Races as Races
 import qualified Test.TerrainRuntime.Preparation as Preparation
 import qualified Test.TerrainRuntime.Regional as Regional
+import qualified Test.TerrainRuntime.ViewRequests as ViewRequests
 import qualified Test.TerrainRuntime.Revalidation as Revalidation
 import qualified Test.TerrainRuntime.Storage.Classes as StorageClasses
 import qualified Test.TerrainRuntime.Storage.Growth as StorageGrowth
@@ -141,6 +142,7 @@ entries =
   , Entry "Backed.Sweep" (Concurrent "a physical-truth sweep after every step of a removal, on the service") BackedSweep.spec
   , Entry "Backed.Txn" (Concurrent "the session's one mutating transaction, on the service") BackedTxn.spec
   , Entry "Regional" (Concurrent "regional snapshots admitted, built, settled, taken and delivered through the owner and the workers, ordered by gates; its retention examples walk a build's own value, not the process's heap") Regional.spec
+  , Entry "ViewRequests" (Concurrent "a view's sealed requests: one settlement into the view's box, taken or retired by its handle, against the lease's closure") ViewRequests.spec
   , Entry "Store.Keys" (Alone pureStore) StoreKeys.spec
   , Entry "Store.Memory" (Alone measures) StoreMemory.spec
   , Entry "Store.Depth" (Alone measures) StoreDepth.spec
