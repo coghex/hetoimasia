@@ -33,7 +33,7 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView.Owner
 
 import Control.Concurrent.STM (STM)
 import Control.Monad (void)
-import Control.Exception (SomeAsyncException, displayException, fromException, throwIO, try)
+import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeAsyncException, SomeException, displayException, evaluate, fromException, throwIO, try, tryWithContext)
 import qualified Data.Map.Strict as Map
 import Data.Functor ((<&>))
 import Data.Text (Text)
@@ -152,7 +152,9 @@ data Hands = Hands
   , handSweepReceipts ∷ OwnerTx [(Word64, Either BuildFailure ChunkRef)]
     -- ^ The registry's teardown sweep: claim every sealed receipt its collector has not, with its key, read as a view
     -- reads it.
-  , handDispose ∷ ChunkRef → IO (Either Text (STM ConstructedDisposal))
+  , handDispose ∷ ChunkRef → IO (Either Text (STM ConstructedDisposal), Maybe (ExceptionWithContext SomeException))
+    -- ^ The release's outcome, its failure's text rendered in protected IO, and a cancellation met while rendering it,
+    -- for the caller to raise once it has recorded the outcome.
     -- ^ Release a chunk's buffer and forget the chunk, answering a reading of the buffer's physical disposal: the
     -- backend destroys it once the batches that recorded it complete, and only then is it done. A chunk without a
     -- buffer is done at once.
@@ -297,10 +299,13 @@ registryHands prepare disposal builders retained =
     , handDispose = \chunk → do
         -- the buffer, read before the release forgets the chunk, is what is physically disposed of later
         buffer ← chunkBufferOf retained chunk
-        guarded (releaseChunkNow builders retained chunk) >>= pure . \case
-          Left raised → Left raised
-          Right (Left refusal) → Left (Text.pack (show refusal))
-          Right (Right ()) → Right (maybe (pure DisposalDone) disposal buffer)
+        guarded (releaseChunkNow builders retained chunk) <&> \(released, pending) →
+          ( case released of
+              Left raised → Left raised
+              Right (Left refusal) → Left (Text.pack (show refusal))
+              Right (Right ()) → Right (maybe (pure DisposalDone) disposal buffer)
+          , pending
+          )
     }
 
 -- | Whether a prepared part would be admitted into this registry and these uploads now, read-only: the decision
@@ -348,10 +353,18 @@ viewReceipt disposal = \case
       AllocationReleased buffer (Left why) → AllocatedFailed ("the failed build's buffer " <> Text.pack (show buffer) <> " could not be released: " <> Text.pack (show why))
       AllocationReleaseRaised buffer why → AllocatedFailed ("the failed build's buffer " <> Text.pack (show buffer) <> " raised on its release: " <> why)
 
--- A synchronous failure as its text; an asynchronous one goes on.
-guarded ∷ IO a → IO (Either Text a)
+-- A synchronous failure as its text, rendered and forced here (a description that raises is answered with a fixed
+-- text), with a cancellation met while rendering it handed back; an asynchronous failure goes on.
+guarded ∷ IO a → IO (Either Text a, Maybe (ExceptionWithContext SomeException))
 guarded action =
   try action >>= \case
     Left failure | Just (_ ∷ SomeAsyncException) ← fromException failure → throwIO failure
-    Left failure → pure (Left (Text.pack (displayException failure)))
-    Right value → pure (Right value)
+    Left failure →
+      tryWithContext @SomeException (evaluate (Text.pack (displayException failure)) >>= \text → text <$ evaluate (Text.length text)) <&> \case
+        Right text → (Left text, Nothing)
+        Left rendering@(ExceptionWithContext _ inner)
+          | Just (_ ∷ SomeAsyncException) ← fromException inner → (Left indescribable, Just rendering)
+          | otherwise → (Left indescribable, Nothing)
+    Right value → pure (Right value, Nothing)
+  where
+    indescribable = "an exception whose description raised"

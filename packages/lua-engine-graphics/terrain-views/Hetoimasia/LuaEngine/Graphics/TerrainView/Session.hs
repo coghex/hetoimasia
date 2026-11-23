@@ -861,9 +861,11 @@ submitJob service vs work box =
     result ←
       try (evaluate (work ())) >>= \case
         Left failure | Just (_ ∷ SomeAsyncException) ← fromException failure → throwIO failure
-        Left failure → pure (Left (LimitFailure ("the planner raised: " <> Text.pack (displayException failure))))
-        Right value → pure value
-    commit (own (void (tryPutTMVar box result)) >> kick service)
+        -- rendered here, in protected IO: a cancellation met while rendering goes on once the result is handed over
+        Left failure → describedText failure <&> \(why, pending) → (Left (LimitFailure ("the planner raised: " <> why)), pending)
+        Right value → pure (value, Nothing)
+    commit (own (void (tryPutTMVar box (fst result))) >> kick service)
+    mapM_ rethrowIO (snd result)
 
 -- | Ask for the owner's next step: one admission, unless one is already queued or the owner has ended. Never waits.
 kick ∷ (Ord k, Show k) ⇒ TerrainViews k → OwnerTx ()
@@ -991,12 +993,17 @@ shutdown service = do
     writeTVar (svOpen service) False
     Map.elems <$> readTVar (svViews service)
   endings ← forM views $ \vs → try (endView service vs EndStopped)
-  drainedOrNot ← try drain
+  drainedOrNot ← tryWithContext @SomeException drain
   case drainedOrNot of
     Right () → pure ()
-    Left interruption → atomically (abandonRetirements service ("the drain was interrupted: " <> Text.pack (displayException (interruption ∷ SomeException))))
+    Left (ExceptionWithContext _ raised) → do
+      -- rendered in protected IO before the record; then the original cancellation goes on as below, or else a
+      -- cancellation met while rendering goes on first
+      (why, pending) ← describedText raised
+      atomically (abandonRetirements service ("the drain was interrupted: " <> why))
+      unless (isJust (fromException raised ∷ Maybe SomeAsyncException)) (mapM_ rethrowIO pending)
   forM_ [failure | Left failure ← endings] (throwIO ∷ SomeException → IO ())
-  either throwIO pure drainedOrNot
+  either rethrowIO pure drainedOrNot
   where
     drain = do
       -- the views' builds were left to the sweep when they ended: in-flight ones are swept once they seal
@@ -2393,7 +2400,13 @@ stepBuilding service hands vs serial prep candidate
           Just (_, NextGranted grant) → do
             let key = receiptKey (grantReceipt grant)
                 -- a cancellation: the build is left to the sweep, and the cancellation goes on (the owner is ending)
-                cancelled failure@(ExceptionWithContext _ raised) = describedText raised >>= atomically . relinquish service key . fst >> rethrowIO failure
+                -- recorded first; then the original cancellation goes on, or else (a terminal synchronous exit) a cancellation
+                -- met while describing it, or else the original failure
+                cancelled failure@(ExceptionWithContext _ raised) = do
+                  (why, pending) ← describedText raised
+                  atomically (relinquish service key why)
+                  unless (asynchronous failure) (mapM_ rethrowIO pending)
+                  rethrowIO failure
                 asynchronous (ExceptionWithContext _ raised) = isJust (fromException raised ∷ Maybe SomeAsyncException)
             -- the outcome is sealed whatever the spend's exit: a synchronous exception's cause is in it. The spend's exit
             -- is classified where it ends, against the owner's standing then: a cancellation (or an exit once the owner
@@ -2820,14 +2833,17 @@ retire service hands = do
   where
     releaseOrphan chunk =
       mask $ \_ →
-        handDispose hands chunk >>= \outcome → atomically $ do
-          writeTVar (svOrphanInHand service) Nothing
-          case outcome of
-            Right reading → modifyTVar' (svOrphansDisposing service) (<> [(Text.pack (show chunk), reading)])
-            Left why → modifyTVar' (svOrphanFailures service) (<> [(Text.pack (show chunk), "the orphaned chunk's release failed: " <> why)])
+        handDispose hands chunk >>= \(outcome, pending) → do
+          atomically $ do
+            writeTVar (svOrphanInHand service) Nothing
+            case outcome of
+              Right reading → modifyTVar' (svOrphansDisposing service) (<> [(Text.pack (show chunk), reading)])
+              Left why → modifyTVar' (svOrphanFailures service) (<> [(Text.pack (show chunk), "the orphaned chunk's release failed: " <> why)])
+          -- recorded: a cancellation met while describing the failure goes on now
+          mapM_ rethrowIO pending
     releaseOne held@(key, _, chunk) =
       mask $ \_ → do
-        outcome ← handDispose hands chunk
+        (outcome, pending) ← handDispose hands chunk
         atomically $ do
           inHand ← readTVar (svInHand service)
           -- a chunk abandoned meanwhile (the owner's end, an interrupted drain) is already accounted for
@@ -2836,6 +2852,8 @@ retire service hands = do
             case outcome of
               Right reading → modifyTVar' (svDisposing service) (<> [(DisposeChunk held, reading)])
               Left why → modifyTVar' (svFailed service) (<> [(key, Just chunk, "the chunk's release failed: " <> why)])
+        -- recorded: a cancellation met while describing the failure goes on now
+        mapM_ rethrowIO pending
 
 -- What can be released now: private builds whose upload has ended, and chunks of met retirements that no adopted
 -- revision holds (a failed handback's while the service is open excepted).

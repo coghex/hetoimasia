@@ -84,7 +84,7 @@ import Test.Support.Bounded (bounded)
 import Test.Support.Owned (withOwnedThread)
 import Hetoimasia.GLFW.Window (Attribute (..), ContentScale (..), Extent (..))
 import Hetoimasia.LuaEngine.Graphics.Window.Host (WindowGeometry (..), geometryOfAttributes)
-import Control.Exception (IOException, AsyncException (ThreadKilled), ErrorCall (ErrorCall), ExceptionWithContext (ExceptionWithContext), SomeException, displayException, finally, rethrowIO, throwIO, toException, try, tryWithContext)
+import Control.Exception (IOException, AsyncException (ThreadKilled), ErrorCall (ErrorCall), Exception (displayException), ExceptionWithContext (ExceptionWithContext), SomeException, finally, rethrowIO, throw, throwIO, toException, try, tryWithContext)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import System.Timeout (timeout)
 
@@ -166,6 +166,15 @@ data Rig = Rig
   , rigClient ∷ !Client
     -- ^ The views' terrain client, whose leases a view may be opened under.
   }
+
+-- An exception a spend raises whose description is cancelled.
+data SpendUnspeakable = SpendUnspeakable
+
+instance Show SpendUnspeakable where
+  show _ = "SpendUnspeakable"
+
+instance Exception SpendUnspeakable where
+  displayException _ = throw ThreadKilled
 
 -- Where a held copy fails: in the IO right after its borrow is taken (raising, or waiting there, having said so, for
 -- the example to cancel the owner), in its count, or in the transaction that accounts for it.
@@ -541,7 +550,7 @@ hands rig =
     , handSweepReceipts = fromIssuerSTM $ do
         keys ← Map.keys <$> readTVar (rigRegistry rig)
         concat <$> forM keys (\key → maybe [] (\outcome → [(key, outcome)]) <$> claimRigReceipt rig key)
-    , handDispose = \chunk → atomically $ do
+    , handDispose = \chunk → fmap (\outcome → (outcome, Nothing)) . atomically $ do
         modifyTVar' (rigAttempts rig) (Map.insertWith (+) chunk 1)
         failing ← readTVar (rigDisposeFailure rig)
         if failing
@@ -2552,6 +2561,22 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         refused ← openView (rigViews rig) (OpenRequest (viewTarget target) second (pure (Right style)) (axis 0, axis 0, axis 1) defaultLightSettings)
         either Just (const Nothing) refused `shouldBe` Just OpenTargetClaimed
         atomically ((,) <$> inspectViewCountSTM (rigTerrain rig) <*> inspectWatchedArenasSTM (rigTerrain rig)) `shouldReturn` before
+
+    it "leaves a build to the sweep with the fixed cause when its spend raises, once the owner has ended, an exception whose description is cancelled; only then does the cancellation go on" $
+      withRig defaultOptions {optProfile = smallProfile {profileSlots = 4, profileQuads = 2048}} $ \rig → do
+        let reading = readTerrainViews (rigViews rig)
+        atomically $ do
+          writeTVar (rigFailNext rig) [Just (BuildFailed "an injected refusal" NotAllocated)]
+          -- the owner's exit begins in the build's seal; the spend then raises an exception whose description is
+          -- cancelled: a terminal exit, recorded with the fixed text before the cancellation goes on
+          writeTVar (rigAfterSeal rig) (Just (writeTVar (rigOwnerEnded rig) (Just "the owner's exit began")))
+          writeTVar (rigRaiseSealed rig) (Just (toException SpendUnspeakable))
+        target ← newTarget 1
+        view ← openOn rig target
+        try @AsyncException (settleUntil rig (isJust . readingRefusal <$> readView view)) `shouldReturn` Left ThreadKilled
+        eventually ((\now → servicePending now == 0 && not (null (serviceSwept now))) <$> reading)
+        swept ← serviceSwept <$> atomically reading
+        [why | (1, _, why) ← swept] `shouldSatisfy` any ("an exception whose description raised" `Text.isInfixOf`)
 
     it "admits no drain step while the step the views track is running, held after its start: the drain's commit decides again" $
       withPublished defaultOptions $ \rig target view → do
