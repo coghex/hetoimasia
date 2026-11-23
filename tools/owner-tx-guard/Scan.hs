@@ -15,6 +15,7 @@ module Scan
   , Scanned (..)
   , protectedTexts
   , scannedFiles
+  , generatedDirectories
   , scanFile
   , headerOf
   , matchesIn
@@ -54,10 +55,13 @@ data Scanned = Scanned
   , scannedTopLevel ∷ [Match]
   }
 
--- | Every file to scan, repository-relative and sorted: at any depth, the version-control directory aside.
+-- | Every file to scan, repository-relative and sorted: at any depth, except under version-control metadata (@.git@,
+-- at any depth) and the generated directories the validation catalog names at the repository's root. The skip set is
+-- fixed here; no scanned file or allowlist entry extends it.
 scannedFiles ∷ FilePath → IO [FilePath]
 scannedFiles root = sort <$> go ""
   where
+    skipped relative entry = entry == ".git" || (null relative && entry `elem` generatedDirectories)
     go relative = do
       entries ← listDirectory (root </> relative)
       concat
@@ -66,10 +70,15 @@ scannedFiles root = sort <$> go ""
               let path = if null relative then entry else relative </> entry
               directory ← doesDirectoryExist (root </> path)
               if directory
-                then if entry == ".git" then pure [] else go path
+                then if skipped relative entry then pure [] else go path
                 else pure [path | ".cabal" `isSuffixOf` entry || "cabal.project" `isPrefixOf` entry]
           )
           entries
+
+-- | The generated directories the validation catalog names (@generated_paths@), which hold build output and nested
+-- worktrees rather than repository files.
+generatedDirectories ∷ [FilePath]
+generatedDirectories = ["dist-newstyle", "dist-dev", "dist-vulkan", "dist-vulkan-proof", ".worktrees", "captures", "receipts"]
 
 -- | Split one file into stanzas and top-level fields and find every protected text, or say why it cannot be read.
 scanFile ∷ ByteString.ByteString → Either String Scanned

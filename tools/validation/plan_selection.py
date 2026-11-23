@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import receipts
 from plan_cabal import Package, component_inputs
-from plan_identity import digest
+from plan_identity import digest, never_harmless
 from plan_repository import GitTree, PlannerError, changed_paths, matches_class, matches_input
 from plan_request import ALL_HSPEC
 
@@ -94,7 +94,8 @@ def build_plan(
             # test-consumed Markdown file still invalidates its consumers.
             classification = "consumed"
             affected.update(consumers)
-        elif any(matches_class(path, pattern) for pattern in catalog["non_affecting_paths"]):
+        elif not never_harmless(path) and any(matches_class(path, pattern) for pattern in catalog["non_affecting_paths"]):
+            # A package description or project file is never non-affecting, however it is spelled.
             classification = "non-affecting"
         else:
             classification = "unknown"

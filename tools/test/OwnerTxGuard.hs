@@ -105,7 +105,7 @@ spec = describe "The issuer bridge's textual guard (tools/owner-tx-guard)" $ do
       checked baseTree >>= (`shouldBe` (ExitSuccess, ""))
       checked
         ( changed
-            [ ("cabal.project.common", "jobs: $ncpus\npackage consumer\n  ghc-options: -Wall\n  -- owner-tx-issuer in a comment\n  flags: +owner-tx-issuers +owner_tx_issuer_x\n")
+            [ ("cabal.project.common", "jobs: $ncpus\npackage consumer\n  ghc-options: -Wall\n  -- owner-tx-issuer in a comment\n  flags: +owner-tx-issuers +owner-tx-issuer_x +xowner-tx-issuer\n")
             , ("consumer/consumer.cabal", consumer ["    -- build-depends: hetoimasia-foundation:owner-tx-issuer", "    other-modules: Hetoimasia.Foundation.OwnerTx.IssuerX"] [])
             ]
         )
@@ -175,6 +175,12 @@ spec = describe "The issuer bridge's textual guard (tools/owner-tx-guard)" $ do
       refused (changed [("consumer/consumer.cabal", "library\n\tbuild-depends: base\n")]) ["consumer/consumer.cabal: unreadable: an ambiguous stanza boundary (LexWarningTab) at line 2"]
       refused (changed [("consumer/consumer.cabal", "library foo\n  build-depends: base\n library-bad\n")]) ["consumer/consumer.cabal: unreadable: an ambiguous stanza boundary (LexInconsistentIndentation) at line 3"]
 
+    it "skips version-control metadata and the catalog's generated directories, and nothing else" $ do
+      let copy path = (path, foundation `withExtra` "    build-depends: hetoimasia-foundation:owner-tx-issuer")
+          withExtra text line = text <> line <> "\n"
+      checked (changed [copy ".git/modules/x/x.cabal", copy "dist-newstyle/src/x/x.cabal", copy ".worktrees/copy/packages/foundation/hetoimasia-foundation.cabal", copy "dist-vulkan/x.cabal"]) >>= (`shouldBe` (ExitSuccess, ""))
+      refused (changed [copy "packages/dist-newstyle/x.cabal"]) [unlisted "packages/dist-newstyle/x.cabal" 15 "Hetoimasia.Foundation.OwnerTx.Representation" "library internal"]
+
     it "checks a read-only checkout without writing into it" $
       withSystemTempDirectory "hetoimasia-owner-tx-readonly" $ \directory → do
         forM_ baseTree (uncurry (writeFixtureFile directory))
@@ -185,7 +191,7 @@ spec = describe "The issuer bridge's textual guard (tools/owner-tx-guard)" $ do
         (result, errors) `shouldBe` (ExitSuccess, "")
 
   describe "this repository" $ do
-    it "passes the guard" $ inCheckout $ \checkout → do
+    it "passes the guard" $ inCheckoutWith "packages/foundation/hetoimasia-foundation.cabal" $ \checkout → do
       settings ← sanitizedEnvironment
       (result, _, errors) ← run settings checkout "owner-tx-guard" ["check", "--root", checkout]
       (result, errors) `shouldBe` (ExitSuccess, "")
@@ -251,9 +257,39 @@ spec = describe "The issuer bridge's textual guard (tools/owner-tx-guard)" $ do
               (field "selected" entry, field "reason" entry) `shouldBe` (Just (JBool True), Just (JString "affected"))
               field "inputs_changed" entry `shouldBe` Just (JBool True)
 
+    it "selects its group and changes the input identity for a project file anywhere, however it is spelled" $ inCheckout $ \checkout → do
+      settings ← sanitizedEnvironment
+      files ← lines <$> git settings checkout ["-c", "safe.directory=*", "ls-files", "*.cabal", "cabal.project*", "tools/validation/catalog.json"]
+      forM_ ["cabal.project.notes.md", "docs/elsewhere/cabal.project", "docs/elsewhere/stray.cabal"] $ \path →
+        withSystemTempDirectory "hetoimasia-owner-tx-plan" $ \directory → do
+          forM_ [file | file ← files, not ("docs/" `isPrefixOf` file)] $ \file → do
+            createDirectoryIfMissing True (directory </> takeDirectory file)
+            copyFile (checkout </> file) (directory </> file)
+          writeFixtureFile directory path "-- before\n"
+          void $ git settings directory ["init", "-q", "-b", "master"]
+          void $ git settings directory ["add", "-A", "."]
+          void $ git settings directory ["commit", "-q", "-m", "base"]
+          base ← takeWhile (/= '\n') <$> git settings directory ["rev-parse", "HEAD"]
+          appendFile (directory </> path) "-- after\n"
+          void $ git settings directory ["commit", "-q", "-a", "-m", "head"]
+          let plan revision = run settings checkout "python3" [checkout </> "tools/validation/plan.py", "--repo-root", directory, "--base", base, "--head", revision, "--json"]
+          (result, output, errors) ← plan "HEAD"
+          (result, errors) `shouldBe` (ExitSuccess, "")
+          (baseResult, baseOutput, baseErrors) ← plan base
+          (baseResult, baseErrors) `shouldBe` (ExitSuccess, "")
+          case parseJson output >>= field "groups" >>= entryFor "id" "test.owner-tx-guard" of
+            Nothing → expectationFailure ("the plan for " <> path <> " has no test.owner-tx-guard group")
+            Just entry → field "selected" entry `shouldBe` Just (JBool True)
+          (parseJson output >>= field "changed_paths" >>= entryFor "path" path >>= field "classification") `shouldSatisfy` (/= Just (JString "non-affecting"))
+          (parseJson output >>= field "input_identity") `shouldSatisfy` (\identity → identity /= Nothing && identity /= (parseJson baseOutput >>= field "input_identity"))
+
 -- | Run an example against the checkout, or leave it pending where this is not a checkout of the whole repository.
 inCheckout ∷ (FilePath → IO ()) → IO ()
-inCheckout example = do
+inCheckout = inCheckoutWith "cabal.project"
+
+-- | Run an example against the checkout, or leave it pending where this checkout-only file is absent.
+inCheckoutWith ∷ FilePath → (FilePath → IO ()) → IO ()
+inCheckoutWith marker example = do
   checkout ← getCurrentDirectory
-  present ← doesFileExist (checkout </> "cabal.project")
-  if present then example checkout else pendingWith "this is not a checkout of the whole repository (no cabal.project)"
+  present ← doesFileExist (checkout </> marker)
+  if present then example checkout else pendingWith ("this is not a checkout of the whole repository (no " <> marker <> ")")

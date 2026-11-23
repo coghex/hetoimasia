@@ -120,6 +120,7 @@ checkoutOnly =
   , ("packages/lua-engine-graphics/test/Main.hs", "VulkanProof.hs checks the adapter's suite fails an empty selection, as a sibling package's source")
   , ("packages/lua-engine-graphics/native-test/Test/LuaEngine/Graphics/Native/Session.hs", "VulkanProof.hs checks the adapter's native suite runs its complete profile without configuration reading, as a sibling package's source")
   , ("cabal.project.common", "VulkanProof.hs reads the warning policy it declares for the adapter beside the project files it is included by")
+  , ("packages/foundation/hetoimasia-foundation.cabal", "OwnerTxGuard.hs runs the issuer guard on the checkout, whose allowlist names this sibling package's stanzas")
   , ( "packages/glfw/hetoimasia-glfw.cabal"
     , "VulkanProof.hs reads the GLFW package's interop flag and dependencies beside the ordinary projects, as a sibling package"
     )
