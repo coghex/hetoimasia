@@ -43,6 +43,7 @@ module Hetoimasia.Terrain.Internal.Residency.Coverage
   , checkedMul
   ) where
 
+import Control.DeepSeq (NFData (..))
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Set (Set)
@@ -55,6 +56,9 @@ import Hetoimasia.Terrain.Resident (columnIndexBytes)
 -- | A set of cells inside one region.
 newtype Coverage = Coverage (Map (Int, Int) [(Int, Int)])
   deriving stock (Eq, Ord, Show)
+
+instance NFData Coverage where
+  rnf (Coverage spans) = rnf spans
 
 -- | Why a box was refused.
 data CoverageError

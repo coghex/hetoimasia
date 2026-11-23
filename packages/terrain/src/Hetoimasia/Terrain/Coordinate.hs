@@ -54,6 +54,7 @@ module Hetoimasia.Terrain.Coordinate
   , cutawayPlaneElevation
   ) where
 
+import Control.DeepSeq (NFData (..), rwhnf)
 import Data.Int (Int64)
 import Data.Word (Word8)
 import Hetoimasia.Terrain.Internal.Coordinate
@@ -102,6 +103,10 @@ data RegionCoord = RegionCoord
   , regionZ ∷ !Int64
   }
   deriving stock (Eq, Ord, Show)
+
+-- | Its fields are strict scalars: weak head normal form is all of it.
+instance NFData RegionCoord where
+  rnf = rwhnf
 
 -- | The local X offset, @0..15@.
 localX ∷ LocalCoord → Word8

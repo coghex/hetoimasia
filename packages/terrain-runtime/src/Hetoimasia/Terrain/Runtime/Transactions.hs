@@ -37,6 +37,7 @@ module Hetoimasia.Terrain.Runtime.Transactions
 import Control.Concurrent.STM (STM, TMVar, atomically, newEmptyTMVarIO, tryPutTMVar, tryReadTMVar)
 import Control.Monad (void)
 import Data.Word (Word64)
+import Hetoimasia.Foundation.Messaging.Payload (Prepared, preparedValue)
 import Hetoimasia.Foundation.OwnerTx (OwnerTx)
 import Hetoimasia.Foundation.OwnerTx.Issuer (fromIssuerSTM)
 import Hetoimasia.Terrain.Cell (Column)
@@ -47,10 +48,11 @@ import Hetoimasia.Terrain.Runtime.Internal.Core (TakeOutcome, cancelRequest, rel
 import Hetoimasia.Terrain.Runtime.Internal.Types
 import Hetoimasia.Terrain.Runtime.Settlement (regionsWith, surfaceWith)
 
--- | Install, replace or clear (an empty list) a view's demand ('Hetoimasia.Terrain.Runtime.setViewDemand'), checking
--- the parent session's token in the same commit: a closed session refuses it and changes nothing.
-setViewDemandTx ∷ Service → View → ArenaLease → [RegionDemand] → OwnerTx (Either Refused DemandReceipt)
-setViewDemandTx svc view lease demands = fromIssuerSTM (setViewDemandSTM svc view lease demands)
+-- | Install, replace, restore or clear (an empty list) a view's demand ('Hetoimasia.Terrain.Runtime.setViewDemand'),
+-- prepared (fully evaluated) before the commit, checking the parent session's token in the same commit: a closed session
+-- refuses it and changes nothing.
+setViewDemandTx ∷ Service → View → ArenaLease → Prepared [RegionDemand] → OwnerTx (Either Refused DemandReceipt)
+setViewDemandTx svc view lease demands = fromIssuerSTM (setViewDemandSTM svc view lease (preparedValue demands))
 
 -- | Give back a regional borrow the holder took ('Hetoimasia.Terrain.Runtime.releaseRegionBorrow'). Idempotent.
 releaseRegionBorrowTx ∷ Service → RegionBorrow → OwnerTx ()

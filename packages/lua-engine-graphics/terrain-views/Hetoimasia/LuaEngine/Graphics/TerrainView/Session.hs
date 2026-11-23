@@ -273,6 +273,8 @@ data Accepted = Accepted
   { accRevision ∷ !Word64
   , accBasis ∷ !Basis
   , accDemand ∷ ![RegionCoord]
+  , accPrepared ∷ !(Prepared [RegionDemand])
+    -- ^ Its runtime demand, prepared before the commit that installs it.
   , accParts ∷ !Int
   }
 
@@ -383,6 +385,8 @@ data Candidate = Candidate
   , cdDemand ∷ ![RegionCoord]
     -- ^ The runtime demand its publication applies: F nearest the anchor first, then the prefetch, cut at the
     -- service's camera regions.
+  , cdDemandPrepared ∷ !(Prepared [RegionDemand])
+    -- ^ That demand, prepared on the owner before the commits that install it.
   }
 
 -- The next part's admission, decided in one transaction by the owner (which reserves its room) and by the watcher
@@ -586,6 +590,8 @@ data TerrainViews k = TerrainViews
     -- job's inputs are released before another preparation's copies are taken.
     -- ^ The planner's queue: each view's latest job, which a newer one replaces before it starts.
   , svReserved ∷ !Integer
+  , svNoDemand ∷ !(Prepared [RegionDemand])
+    -- ^ The empty demand, prepared once: a view's attachment and its withdrawal install it.
   }
 
 -- ---------------------------------------------------------------------------
@@ -636,6 +642,7 @@ withTerrainViews config ports body = do
 
 newService ∷ TerrainViewsConfig → TerrainViewsPorts k → Integer → IO (TerrainViews k)
 newService config ports allowance = do
+  noDemand ← prepare []
   views ← newTVarIO Map.empty
   slots ← newTVarIO Map.empty
   retiring ← newTVarIO Seq.empty
@@ -693,6 +700,7 @@ newService config ports allowance = do
       , svJobs = jobs
       , svRunning = running
       , svReserved = allowance
+      , svNoDemand = noDemand
       }
 
 -- The watcher: signals only. It blocks until a view's arena mark, the authority epoch, its target's usability or its
@@ -1100,7 +1108,7 @@ commitOpen service vs = do
   case refused of
     Just why → pure (Left why)
     Nothing →
-      setViewDemandTx (portTerrain ports) (vsRuntime vs) (vsLease vs) [] >>= \case
+      setViewDemandTx (portTerrain ports) (vsRuntime vs) (vsLease vs) (svNoDemand service) >>= \case
         Left why → pure (Left (OpenArena why))
         Right _ → do
           (geometry, shown) ← own $ do
@@ -1483,8 +1491,8 @@ reconcileDemand ∷ (Ord k, Show k) ⇒ TerrainViews k → ViewState k → Owner
 reconcileDemand service vs =
   own (demandDue service vs) >>= \case
     Nothing → pure False
-    Just (desired, basis) →
-      install desired >>= \case
+    Just (desired, prepared, basis) →
+      install desired prepared >>= \case
         Right receipt → own (True <$ (writeTVar (vsAsked vs) desired >> writeTVar (vsReceipt vs) (Just receipt) >> modifyTVar' (vsInstalls vs) (+ 1)))
         Left why → own $ do
           let limit = LimitRuntime ("the terrain service refused the view's demand: " <> why)
@@ -1492,14 +1500,14 @@ reconcileDemand service vs =
           recordRefusal vs limit (RefusedAt basis Nothing (Just desired))
           pure True
   where
-    install desired =
+    install desired prepared =
       own (hookDemandRefused (portCopyHooks (svPorts service)) desired) >>= \case
         Just why → pure (Left why)
-        Nothing → either (Left . Text.pack . show) Right <$> setViewDemandTx (portTerrain (svPorts service)) (vsRuntime vs) (vsLease vs) (demandsOf desired)
+        Nothing → either (Left . Text.pack . show) Right <$> setViewDemandTx (portTerrain (svPorts service)) (vsRuntime vs) (vsLease vs) prepared
 
 -- The demand a view's state prescribes, when it differs from the installed one and no current refusal suppresses it,
--- with the basis it is asked at.
-demandDue ∷ TerrainViews k → ViewState k → STM (Maybe ([RegionCoord], Basis))
+-- prepared, with the basis it is asked at.
+demandDue ∷ TerrainViews k → ViewState k → STM (Maybe ([RegionCoord], Prepared [RegionDemand], Basis))
 demandDue service vs = do
   status ← readTVar (vsStatus vs)
   open ← readTVar (svOpen service)
@@ -1511,9 +1519,9 @@ demandDue service vs = do
   geometry ← surfaceGeometry (vtSurface (vsTarget vs))
   accepted ← readTVar (vsPublished vs)
   installed ← readTVar (vsAsked vs)
-  let desired = case geometry of
-        GeometryExtent _ → maybe [] accDemand accepted
-        _ → []
+  let (desired, prepared) = case geometry of
+        GeometryExtent _ | Just held ← accepted → (accDemand held, accPrepared held)
+        _ → ([], svNoDemand service)
       -- an ending (a revoked authority or lease, a retired target) is the step's to settle, never a demand refusal
       live = status == ViewOpen && open && isNothing ended && isNothing gone && usable && authority && isJust arena
   if not live || desired == installed
@@ -1524,7 +1532,7 @@ demandDue service vs = do
       let suppressed = case refused of
             Just (_, RefusedAt at _ (Just list)) → at == basis && list == desired
             _ → False
-      pure (if suppressed then Nothing else Just (desired, basis))
+      pure (if suppressed then Nothing else Just (desired, prepared, basis))
 
 -- The runtime demand of a list of regions: each whole.
 demandsOf ∷ [RegionCoord] → [RegionDemand]
@@ -2106,13 +2114,14 @@ stepPlanning service vs serial prep copies camera box =
             kept = Map.mapMaybe id (Map.intersectionWith (\part (instances, records) → if partInstances part == instances && partRecords part == records then Just part else Nothing) parts byKey)
             fresh = [w | w@(key, _, _) ← wanted, Map.notMember key kept]
          in Map.size kept `seq` length fresh `seq` (kept, fresh)
+      prepared ← prepare (demandsOf demand)
       commit $ do
         recoverable ← own (recoverableSlots service vs)
         if length toBuild > recoverable
           then False <$ refuse service vs serial (prepBasis prep) (LimitSlots (length toBuild) recoverable)
           else case prepMetrics prep of
             Nothing → False <$ refuse service vs serial (prepBasis prep) (LimitFailure "a plan was made without a drawable extent")
-            Just metrics → writeBack service vs serial (prepBasis prep) (Building prep (Candidate plan copies (plannedAdapted planned) toBuild Seq.empty (length toBuild) Nothing Map.empty reused camera metrics demand))
+            Just metrics → writeBack service vs serial (prepBasis prep) (Building prep (Candidate plan copies (plannedAdapted planned) toBuild Seq.empty (length toBuild) Nothing Map.empty reused camera metrics demand prepared))
 
 -- The element with the greatest key, if any, every comparison made as the list is walked (no deferred chain).
 maximumOn ∷ Ord b ⇒ (a → b) → [a] → Maybe a
@@ -2511,7 +2520,7 @@ publish service vs serial prep candidate = do
                   | installed == cdDemand candidate → pure (Right Nothing)
                   | otherwise →
                       either (Left . LimitRuntime . ("the terrain service refused the view's demand: " <>) . Text.pack . show) (Right . Just)
-                        <$> setViewDemandTx (portTerrain ports) (vsRuntime vs) (vsLease vs) (demandsOf (cdDemand candidate))
+                        <$> setViewDemandTx (portTerrain ports) (vsRuntime vs) (vsLease vs) (cdDemandPrepared candidate)
               case demand of
                 Left limit → False <$ refuse service vs serial (prepBasis prep) limit
                 Right receipt → do
@@ -2531,7 +2540,7 @@ publish service vs serial prep candidate = do
                       unless (null superseded) $
                         modifyTVar' (svRetiring service) (|> Retiring (vtKey (vsTarget vs)) (vsId vs) superseded Unasked False)
                       writeTVar (vsParts vs) parts
-                      writeTVar (vsPublished vs) (Just (Accepted revision (prepBasis prep) (cdDemand candidate) (Map.size parts)))
+                      writeTVar (vsPublished vs) (Just (Accepted revision (prepBasis prep) (cdDemand candidate) (cdDemandPrepared candidate) (Map.size parts)))
                       writeTVar (vsRefused vs) Nothing
                       writeTVar (vsStage vs) Idle
                       -- the pins: those of the revisions that can still be drawn, and this successor's

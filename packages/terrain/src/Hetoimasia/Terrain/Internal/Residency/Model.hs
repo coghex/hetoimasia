@@ -56,6 +56,7 @@ module Hetoimasia.Terrain.Internal.Residency.Model
   , modelInvariants
   ) where
 
+import Control.DeepSeq (NFData (..))
 import Data.List (sortOn)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
@@ -109,6 +110,10 @@ data RegionDemand = RegionDemand
   , demandCoverage ∷ !Coverage
   }
   deriving stock (Eq, Show)
+
+-- | A demand is fully evaluated with its coverage's spans.
+instance NFData RegionDemand where
+  rnf (RegionDemand region coverage) = rnf region `seq` rnf coverage
 
 -- ---------------------------------------------------------------------------
 -- Events
