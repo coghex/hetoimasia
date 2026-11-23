@@ -1323,8 +1323,9 @@ handoff, aging, and the negative controls) is in
 The reference is Synarchy at `3777d437ea00e1302bf55162ad5693fee4879187`. It
 fixes some details of this contract and leaves others open; the library selects
 the open ones. The design records Synarchy's face map as reference artwork
-machinery, not a selected geometry specification for Hetoimasia
-(`docs/designs/terrain_arena_design.md:146-148`). Nothing
+machinery, not a selected geometry specification for Hetoimasia (the terrain
+arena design, lines 146-148 at `cef6921d`, listed in
+[removed records](../../docs/removed_records.md)). Nothing
 in the library or the suite reads a Synarchy checkout, a PNG or any other asset;
 the reference's relevant arithmetic is restated in the fixtures with provenance.
 

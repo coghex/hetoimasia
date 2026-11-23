@@ -148,8 +148,7 @@ settled its first shape (#348, under that arc's
 [The package's contract](../packages/math/README.md) is the authority for the
 details. Everything else stays open until a consumer needs it: quaternions, 3×3
 matrices, `Double` precision, SIMD or unboxed storage, and geometry and topology
-types. Nothing here selects how Ecce Homo's systems are rebuilt. Native storage
-adapters stay outside the math contract.
+types. Native storage adapters stay outside the math contract.
 
 Owner sequencing decision on 2026-09-26: first refactor existing code to establish
 the flexible `Base`/`Types` dependency layers, preserving cohesive dedicated

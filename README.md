@@ -1,9 +1,9 @@
 # Hetoimasia
 
-A modular Haskell/Vulkan game engine with Lua scripting and planned separate
-2D and 3D rendering modules. Ecce Homo is being rebuilt on it piece by piece,
-with Synarchy as the reference: evidence of what each system should do, not a
-compatibility contract and not a source to copy wholesale.
+A generic game engine library: modular Haskell packages with Vulkan rendering,
+Lua scripting and separate 2D and 3D rendering modules. Games are separate
+projects that consume its packages; the first consumer is Widdershins. The
+engine holds no game-specific rule or content ([vision](docs/vision.md) V-1).
 
 **Current implementation:** logging, scoped CPU resources, failures and bounded
 recovery, monotonic scheduling, application composition, supervised workers,
@@ -61,7 +61,7 @@ production mod-process work needs the deployment decision required by D-11.
 
 Toolchain: GHC **9.14.1**, Cabal **3.18.1.0**, qualified and pinned in
 [docs/toolchain.md](docs/toolchain.md). Console execution needs no
-Vulkan, display, or Synarchy process; the `lua` subcommand links the Lua interpreter
+Vulkan or display; the `lua` subcommand links the Lua interpreter
 the `lua` package bundles, never one on the machine. Building all components requires
 the pinned GLFW dependency: follow the
 [native prerequisites](docs/validation.md#developer-prerequisites-and-macos)
@@ -198,7 +198,7 @@ once. The options, the grammar of the numbers, the signal rule and the examples 
 | `packages/runtime/` | Application composition, reporting, supervision and inbox services | Buildable |
 | `packages/math/` | Vectors, 4×4 matrices, transforms, 2×3 affine transforms, look-at and perspective; depends on `base` alone | Buildable |
 | `packages/terrain/` | Terrain tile coordinates with a checked signed 64-bit range, region and local decomposition, the 16-shape catalog with exact quarter turns, and the canonical unit-cell solid with exact membership and ray intersection; depends on `base` and `containers` | Buildable |
-| `packages/terrain-render-2d/` | The pure half of the terrain arena's 2D view: exact rebased isometric projection in four facings, the follow and manual cutaway camera, whole-cell quads over atlas-region coverage with missing-data demand and exact 24-bit depth-key ordering, coverage-based picking, the deterministic terrain atlases with their region manifest, and the lit and depth-shaded terrain material's pure half; depends on the pure terrain, math, asset-image, render-2d and render-api packages | Buildable |
+| `packages/terrain-render-2d/` | The pure half of terrain's 2D view: exact rebased isometric projection in four facings, the follow and manual cutaway camera, whole-cell quads over atlas-region coverage with missing-data demand and exact 24-bit depth-key ordering, coverage-based picking, the deterministic terrain atlases with their region manifest, and the lit and depth-shaded terrain material's pure half; depends on the pure terrain, math, asset-image, render-2d and render-api packages | Buildable |
 | `packages/content/` | Anchored native content roots: a launch path resolved once, directory-relative no-follow opens with the type checked on the opened object, bounded strict reads and enumeration, and a root that closes only after every borrowing operation has retired; depends on the foundation and boot libraries | Buildable |
 | `packages/asset/` | Asset identity and provenance, decoded-asset types and the pure decoder interface; no codecs | Buildable |
 | `packages/asset-image/` | Image codecs: PNG to upload-ready RGBA8, premultiplied in linear light for colour, with the cutout mark | Buildable |
@@ -216,7 +216,7 @@ once. The options, the grammar of the numbers, the signal rule and the examples 
 | `packages/scripting-lua/` | Lua binding, protocol model, and confinement experiments | Binding/model buildable; production runtime planned |
 | `samples/triangle/` | Independent two-window triangle consumer | Buildable only through `cabal.project.vulkan`; required native profile recorded on macOS and Linux |
 | `samples/image2d/` | A decoded PNG in a world and a UI layer with a KTX2 image beside it, through the 2D renderer and its host adapter | Buildable only through `cabal.project.vulkan`; evidence and lifecycle proven by the native case `r2d8-image`; windowed mode launched by hand |
-| `integrations/` | Game adapters | Planned |
+| `integrations/` | Application adapters | Planned |
 | `packages/foundation/test/` | Foundation-owned headless Hspec contracts | Buildable without GLFW through `cabal.project.cpu` |
 | `packages/runtime/test/`, `packages/glfw/test/` | Package-owned runtime and headless GLFW contracts | Buildable |
 | `packages/scripting-lua/test/`, `packages/lua-engine/test/`, `packages/gpu-vulkan/model/test/`, `packages/math/test/`, `packages/terrain/test/`, `packages/terrain-render-2d/test/`, `packages/content/test/`, `packages/asset-image/test/`, `packages/render-api/test/`, `packages/render-2d/test/`, `packages/render-2d-oracle/test/` | Package-owned Lua, Lua-engine manifest and profile, GPU model, math, image-decoding, texture-handle, 2D frame and 2D oracle contracts | Buildable without GLFW through `cabal.project.cpu` |
