@@ -202,10 +202,13 @@ data CopyHooks = CopyHooks
   , hookCounting ∷ [RegionCoord] → Int → IO ()
   , hookDemandRefused ∷ [RegionCoord] → STM (Maybe Text)
   , hookCollecting ∷ IO ()
+  , hookRequested ∷ STM Bool → IO ()
+    -- ^ A regional request was made and its stage is not yet written: the seam where a request settles first, given
+    -- a reading of whether it has (nothing in production).
   }
 
 noCopyHooks ∷ CopyHooks
-noCopyHooks = CopyHooks (pure Set.empty) (\_ _ → pure ()) (\_ → pure Nothing) (pure ())
+noCopyHooks = CopyHooks (pure Set.empty) (\_ _ → pure ()) (\_ → pure Nothing) (pure ()) (\_ → pure ())
 
 -- | Why the service could not be made. Nothing was reserved or started.
 data TerrainViewsRefused
@@ -1912,6 +1915,7 @@ stepCopying service vs serial prep batches taken = \case
           Left why → False <$ commit (refuse service vs serial (prepBasis prep) (LimitRuntime (Text.pack (show why))))
           Right request → do
             let flight = InFlight request
+            hookRequested (portCopyHooks (svPorts service)) (isJust <$> flightSettled flight)
             kept ← commit (writeBack service vs serial (prepBasis prep) (Copying prep rest taken (Just (batch, flight))))
             unless kept (abandonFlight service flight)
             pure False

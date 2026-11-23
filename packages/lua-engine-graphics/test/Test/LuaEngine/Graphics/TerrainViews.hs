@@ -153,6 +153,9 @@ data Rig = Rig
     -- ^ The native stand-in, for an example whose hands are the renderer's registry over the backend's own uploads.
   , rigBeforeCollect ∷ !(TVar (Maybe (IO ())))
     -- ^ When set: run once on the owner's thread after the next build's revalidation succeeded, before its collection.
+  , rigRequested ∷ !(TVar (Maybe (STM Bool → IO ())))
+    -- ^ When set: run once on the owner's thread after the next regional request is made, before its stage is written,
+    -- given a reading of whether it has settled.
   }
 
 -- | An example's native stand-in: the session, the renderer's registry the production hands admit into
@@ -273,6 +276,7 @@ withRig options body =
         fault ← newTVarIO Nothing
         countGate ← newTVarIO Nothing
         beforeCollect ← newTVarIO Nothing
+        requested ← newTVarIO Nothing
         initial ← prepare initialGraphicsScene
         withNativeOf (optNative options) $ \native → do
          let owner =
@@ -325,6 +329,7 @@ withRig options body =
                      forM_ gate $ \(counting, resumed) → atomically (putTMVar counting batch) >> atomically (takeTMVar resumed)
                  , hookDemandRefused = \_ → readTVar demandRefused
                  , hookCollecting = atomically (readTVar beforeCollect <* writeTVar beforeCollect Nothing) >>= sequence_
+                 , hookRequested = \settled → atomically (readTVar requested <* writeTVar requested Nothing) >>= mapM_ ($ settled)
                  }
              ports = TerrainViewsPorts owner ledger claims receipts initial terrain client account hooks
          ending ← newTVarIO False
@@ -350,7 +355,7 @@ withRig options body =
                      forM_ native settleNative
                      loop
                loop
-             rig views = Rig views terrain lease queue queueOpen lane laneCapacity standings chunks disposed attempts buildFailure disposeFailure next ledger claims receipts ownerEnded style account deferDisposal pendingDisposals hold entered resume styleReleases unavailable admission admitBudget grants uploading demandRefused buildAttempts failNext raising raiseSealed receiptNext registry afterSeal fault countGate native beforeCollect
+             rig views = Rig views terrain lease queue queueOpen lane laneCapacity standings chunks disposed attempts buildFailure disposeFailure next ledger claims receipts ownerEnded style account deferDisposal pendingDisposals hold entered resume styleReleases unavailable admission admitBudget grants uploading demandRefused buildAttempts failNext raising raiseSealed receiptNext registry afterSeal fault countGate native beforeCollect requested
              fakeHands = stepHands (rig (error "the teardown's hands read no service"))
          withOwnedThread (when (optTeardown options /= TeardownNone) teardown) $ \_ _ →
            withTerrainViews (configOf options) ports $ \views →
@@ -2194,6 +2199,21 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         closed ← atomically (readView view)
         (readingPublished closed, readingDemand closed, readingReceipt closed, readingInstalls closed)
           `shouldBe` (readingPublished landed, readingDemand landed, readingReceipt landed, readingInstalls landed)
+
+  describe "a view's request" $
+    it "is reconciled once when it settled before its stage held it: the watcher sees it settled and asks for the owner's step, with no other caller action" $
+      withRig defaultOptions $ \rig → do
+        -- the first regional request settles before the stage that holds it is written
+        atomically (writeTVar (rigRequested rig) (Just (\settled → atomically (settled >>= check))))
+        target ← newTarget 1
+        view ← openOn rig target
+        -- no caller kick: only the owner's queued steps run, and the watcher admits them
+        settleUntil rig (publishedAtLeast view 1)
+        -- the seam was met: the request was settled when its stage first held it
+        atomically (maybe True (const False) <$> readTVar (rigRequested rig)) `shouldReturn` True
+        -- the settled copy was taken once and its borrow returned once
+        atomically (fst <$> inspectRetainedChargesSTM (rigTerrain rig)) `shouldReturn` 0
+        atomically (readingStatus <$> readView view) `shouldReturn` ViewOpen
 
   describe "the settlement hand-off" $ do
     it "leaves a refused build whose revalidation raises or waits to the sweep, which returns its slot once and keeps the refusal's cause and the revalidation's; a raise reaches the owner's action as the original exception, the owner goes on, and the view publishes" $
