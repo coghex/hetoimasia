@@ -111,7 +111,6 @@ module Test.Support.Subprocess
   ) where
 
 import Control.Concurrent (yield)
-import Control.Concurrent.MVar (MVar, newMVar, withMVar)
 import Control.Concurrent.STM (TVar, atomically, check, modifyTVar', newTVarIO, readTVar, readTVarIO, writeTVar)
 import Control.Exception
   ( Exception (displayException, fromException)
@@ -119,6 +118,7 @@ import Control.Exception
   , IOException
   , SomeAsyncException
   , SomeException
+  , bracket_
   , catch
   , finally
   , interruptible
@@ -177,7 +177,7 @@ data RunBound
   deriving (Eq, Show)
 
 -- | The facility's own fixed values, in microseconds: how long a child terminated has to exit before its group is killed, how long
--- the reap and the observation that a group is gone are given, and how long the pipes are given to end.
+-- the reap of the direct child is given, and how long the pipes are given to end.
 data Bounds = Bounds
   { boundGrace ∷ !Int
   , boundReap ∷ !Int
@@ -369,16 +369,44 @@ data Leader = Leader
   , leaderPid ∷ !ProcessID
   }
 
+-- | Who may put the child's process identifier to the system. The identifier is the child's own only while it is unreaped, and the
+-- facility reaps it last: a body-side call (a wait, a look, a signal) holds the guard shared for as long as it uses the identifier,
+-- and the reap holds it exclusively, so a reap never overlaps one and a call that finds no recorded reap knows there is none for as
+-- long as it holds the guard. Shared holders never wait for each other, so a body can wait in one thread and signal in another.
+data Guard = Guard
+  !(TVar Int)
+  -- ^ How many uses are in progress.
+  !(TVar Bool)
+  -- ^ Whether the reap holds the guard, or waits for the uses to end.
+
+newGuard ∷ IO Guard
+newGuard = Guard <$> newTVarIO 0 <*> newTVarIO False
+
+-- | Run a use of the child's process identifier, shared with other uses and excluded by the reap.
+sharedOp ∷ Child → IO a → IO a
+sharedOp child = bracket_ enter leave
+  where
+    Guard users reaping = childGuard child
+    enter = atomically (readTVar reaping >>= check . not >> modifyTVar' users (+ 1))
+    leave = atomically (modifyTVar' users (subtract 1))
+
+-- | Run the reap with no use of the identifier in progress and none started until it is done. A use already running is waited for;
+-- it ends when the leader has exited, which the group's last signal has seen to.
+exclusiveReap ∷ Child → IO a → IO a
+exclusiveReap child = bracket_ enter leave
+  where
+    Guard users reaping = childGuard child
+    enter = atomically (writeTVar reaping True) >> atomically (readTVar users >>= check . (== 0))
+    leave = atomically (writeTVar reaping False)
+
 -- | What the body is lent.
 data Child = Child
   { childLeader ∷ !Leader
-  , childPid ∷ !ProcessID
   , childStatus ∷ !(IORef (Maybe ExitCode))
   -- ^ The status of the reap, once the release has made it. Once it is set the child is reaped for good: every call that takes the
   -- 'Child' answers from it and none puts the saved process identifier, which may by then be another process's, to the system.
-  , childLock ∷ !(MVar ())
-  -- ^ Orders a body-side signal ('signalChild') against the facility's own reap, so that a signal is sent while the child is unreaped
-  -- or not at all.
+  , childGuard ∷ !Guard
+  -- ^ Orders every body-side use of the child's process identifier against the facility's own reap ('sharedOp', 'exclusiveReap').
   , childStdin ∷ !(Maybe Handle)
   -- ^ The write end of a piped standard input, closed by the release.
   , childOutReader ∷ !(Maybe Reader)
@@ -386,6 +414,10 @@ data Child = Child
   , childDrainBound ∷ !Int
   , childDrainAccounted ∷ !(IORef Bool)
   }
+
+-- | The child's process identifier: read from the facility's own record of its leader, never from a value a caller could rebuild.
+childPid ∷ Child → ProcessID
+childPid = leaderPid . childLeader
 
 -- | The parent's and the child's ends of the pipes a call created.
 data Pipes = Pipes
@@ -549,14 +581,13 @@ withProcess bounds seams spec entered pipes outReader errReader body = mask $ \r
   (handle, pid) ← spawn spec pipes
   accounted ← newIORef False
   status ← newIORef Nothing
-  lock ← newMVar ()
+  guard ← newGuard
   let leader = Leader handle pid
       child =
         Child
           { childLeader = leader
-          , childPid = pid
           , childStatus = status
-          , childLock = lock
+          , childGuard = guard
           , childStdin = pipesInWrite pipes
           , childOutReader = outReader
           , childErrReader = errReader
@@ -683,7 +714,7 @@ retain ∷ String → ExceptionWithContext SomeException → ExceptionWithContex
 retain label (ExceptionWithContext context inner) replacement =
   foldl (flip annotate) (annotate (RetainedFailure label (displayException inner)) replacement) (getExceptionAnnotations context)
 
--- | End the child, observe the group, wait for the pipes; answer what could not be confirmed and the first cancellation that
+-- | End the child (its group, then the reap), wait for the pipes; answer what could not be confirmed and the first cancellation that
 -- interrupted the waits (the steps are run again until they complete).
 release ∷ Env → IO ([String], Maybe (ExceptionWithContext SomeException))
 release env = do
@@ -735,7 +766,7 @@ recordReap env status = do
 -- after it has closed the handle and kept the status) or is cut by its bound or a cancellation leaves the record set, so a retry of the
 -- release signals nothing and answers the reap's own status.
 reapStep ∷ Env → IO (Maybe ExitCode) → IO Bool
-reapStep env act = withMVar (childLock (envChild env)) $ \_ → do
+reapStep env act = exclusiveReap (envChild env) $ do
   answered ← act `onException` settleReap env
   done ← recordReap env answered
   unless done (settleReap env)
@@ -922,7 +953,7 @@ awaitDrain child = do
 -- has been reaped, when the identifier may be another process's: once the reap is recorded nothing is sent, and the facility orders
 -- the signal against its own reap, so a signal is sent while the child is unreaped or not at all. The look does not reap.
 signalChild ∷ Child → Signal → IO ()
-signalChild child signal = withMVar (childLock child) $ \_ → do
+signalChild child signal = sharedOp child $ do
   recorded ← readIORef (childStatus child)
   when (isNothing recorded) $ do
     state ← fromMaybe StillRunning <$> lookExit (childPid child)
@@ -933,22 +964,23 @@ signalChild child signal = withMVar (childLock child) $ \_ → do
 -- the one the library's wait answers (an exit code of eight bits, the negated number of a signal that ended it).
 -- 'Nothing' when the bound expired.
 waitChild ∷ Child → Int → IO (Maybe ExitCode)
-waitChild child microseconds = timeout (max 0 microseconds) (awaitExit child)
+waitChild child microseconds = readIORef (childStatus child) >>= maybe (timeout (max 0 microseconds) (awaitExit child)) (pure . Just)
 
 -- | Wait, with no bound of its own, for the child's exit and answer its status, without reaping it. A body that waits this way runs
 -- inside the call's run bound and is cancellable like any other. Asked again after the call has ended it answers the status of the
 -- reap.
 awaitExit ∷ Child → IO ExitCode
-awaitExit child = loop
+awaitExit child = sharedOp child $ readIORef (childStatus child) >>= maybe look pure
   where
-    loop = readIORef (childStatus child) >>= maybe look pure
+    -- Holding the guard, no reap can happen while the identifier is put to the system, so it is still the child's own, and a child
+    -- the system no longer knows was reaped by something other than the facility.
     look =
       observeState (childPid child) True >>= \case
         Right (Just code) → pure code
-        Right Nothing → loop
+        Right Nothing → look
         Left errno
-          | errno == eINTR → takePending >> loop
-          | errno == eCHILD → readIORef (childStatus child) >>= maybe (ioError (userError ("the child " <> show (childPid child) <> " was reaped by something other than the facility"))) pure
+          | errno == eINTR → takePending >> look
+          | errno == eCHILD → ioError (userError ("the child " <> show (childPid child) <> " was reaped by something other than the facility"))
           | otherwise → ioError (userError ("waitid for process " <> show (childPid child) <> " failed with errno " <> show errno))
 
 -- | Where the child is, as a look that does not reap it.
@@ -965,7 +997,7 @@ foreign import ccall interruptible "hetoimasia_test_support_child_state"
 
 -- | Ask whether the child has exited, without reaping it (waitid with WNOWAIT), so a body can observe a zombie.
 childState ∷ Child → IO ChildState
-childState child = readIORef (childStatus child) >>= maybe (leaderState (childLeader child)) (const (pure Reaped))
+childState child = sharedOp child (readIORef (childStatus child) >>= maybe (leaderState (childLeader child)) (const (pure Reaped)))
 
 -- | 'childState' of a leader an example's seam was lent.
 leaderState ∷ Leader → IO ChildState
@@ -995,7 +1027,7 @@ observeState pid block = alloca $ \code → do
 
 -- | Wait, within the bound in microseconds, for the child to have exited, without reaping it. 'Nothing' when the bound expired.
 awaitUnreapedExit ∷ Child → Int → IO (Maybe ChildState)
-awaitUnreapedExit child microseconds = readIORef (childStatus child) >>= maybe (awaitExitOf (childPid child) microseconds) (const (pure (Just Reaped)))
+awaitUnreapedExit child microseconds = sharedOp child (readIORef (childStatus child) >>= maybe (awaitExitOf (childPid child) microseconds) (const (pure (Just Reaped))))
 
 -- | 'awaitUnreapedExit' for a process identifier.
 awaitExitOf ∷ ProcessID → Int → IO (Maybe ChildState)

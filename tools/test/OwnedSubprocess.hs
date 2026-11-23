@@ -834,6 +834,14 @@ spec = describe "the shared subprocess facility (Test.Support.Subprocess)" $ do
       awaitExit child >>= (`shouldBe` ExitSuccess)
       signalChild child sigTERM
 
+    it "lets a body wait for the child in one thread and signal it in another: uses of the identifier never wait for each other" $ do
+      status ← newEmptyMVar
+      void $ withScopedChild (childSpec hangCatcher (shell obedientAlone [])) $ \child → do
+        awaitReady child
+        withOwnedThread (awaitExit child >>= putMVar status) $ \_ _ → do
+          signalChild child sigTERM
+          bounded (readMVar status) >>= (`shouldBe` ExitSuccess)
+
     it "reaps the leader only in the release, however the body waited for it" $ do
       seen ← newIORef Nothing
       withScopedChild (childSpec hangCatcher (shell "exit 0" [])) $ \child → do
@@ -845,8 +853,9 @@ spec = describe "the shared subprocess facility (Test.Support.Subprocess)" $ do
         goneAndReaped (childPid child) >>= (`shouldBe` False)
       child ← maybe (expectationFailure "the body never ran" >> ioError (userError "unreachable")) pure =<< readIORef seen
       childState child >>= (`shouldBe` Reaped)
-      -- Asked again once the call has ended, the wait answers the reap's own status.
+      -- Asked again once the call has ended, the wait answers the reap's own status, and a wait with no time left does too.
       awaitExit child >>= (`shouldBe` ExitSuccess)
+      waitChild child 0 >>= (`shouldBe` Just ExitSuccess)
 
   describe "the release" $ do
     it "retains the body's failure beside a cancellation delivered into it, and still reaps the child" $
