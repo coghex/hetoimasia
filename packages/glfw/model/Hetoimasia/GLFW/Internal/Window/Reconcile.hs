@@ -71,7 +71,7 @@ import Hetoimasia.GLFW.Internal.Mode (AppliedMode (..), deriveApplied, modeAppli
 import Hetoimasia.GLFW.Internal.Session (currentSessionMonitors, liveMonitors, sessionClaims)
 import Hetoimasia.GLFW.Internal.Window.Callbacks (rethrowFault)
 import Hetoimasia.GLFW.Internal.Window.Identity (WindowId, windowLocalIdentity)
-import Hetoimasia.GLFW.Internal.Window.Observation (CloseRequest (..), WindowObservation (..))
+import Hetoimasia.GLFW.Internal.Window.Observation (CloseRequest (..), WindowObservation (..), nextRevision)
 import Hetoimasia.GLFW.Internal.Window.Revisit (Revisit, armedBy)
 import Hetoimasia.GLFW.Internal.Window.Sample (Sample (..))
 import Hetoimasia.GLFW.Internal.Window.State
@@ -170,7 +170,7 @@ reconcileFollowing forced settle adjust interruption window sample = do
   let (reconciledObservation, issued') = reconciled (windowId window) sample pending current issued
       folded = adjust (derived reconciledObservation)
       signalled = capturedRefresh pending || capturedCloses pending > 0
-      next = folded {obsRevision = obsRevision current + 1}
+      next = nextRevision current folded
   prepared ← if forced || folded /= current || signalled then Just <$> prepare next else pure Nothing
   interruption
   committed ← mask_ $ do

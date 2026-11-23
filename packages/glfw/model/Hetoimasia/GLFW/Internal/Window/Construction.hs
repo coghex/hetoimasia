@@ -121,7 +121,7 @@ import Hetoimasia.GLFW.Internal.Window.Callbacks (raiseFault, rethrowFault, take
 import Hetoimasia.GLFW.Internal.Window.Config (Request (..), WindowConfig (..), validRequest)
 import Hetoimasia.GLFW.Internal.Window.Identity (WindowId, issuedWindowId)
 import Hetoimasia.GLFW.Internal.Window.ModeTransition (startWindowMode)
-import Hetoimasia.GLFW.Internal.Window.Observation (WindowObservation (..), WindowPhase (..))
+import Hetoimasia.GLFW.Internal.Window.Observation (WindowObservation (..), WindowPhase (..), nextRevision)
 import Hetoimasia.GLFW.Internal.Window.Reconcile (reconciled)
 import Hetoimasia.GLFW.Internal.Window.Revisit (Revisit (..))
 import Hetoimasia.GLFW.Internal.Window.Sample (Sample (..), sampleAll, sampleOperation)
@@ -226,6 +226,7 @@ blankObservation identity sample record =
   WindowObservation
     { obsWindow = identity
     , obsRevision = 0
+    , obsGeometryRevision = 0
     , obsPhase = WindowOpen
     , obsLogical = sampleLogical sample
     , obsFramebuffer = sampleFramebuffer sample
@@ -335,11 +336,7 @@ closeObservations session local live certain failed ownerState publisher = do
   failing ← readIORef failed
   atomicModifyIORef' (sessionClaims session) (\claims → (disposeClaims local (safe && not failing) claims, ()))
   OwnerState current issued ← readIORef ownerState
-  let final =
-        current
-          { obsRevision = obsRevision current + 1
-          , obsPhase = terminalPhase safe failing
-          }
+  let final = nextRevision current current {obsPhase = terminalPhase safe failing}
   prepared ← prepare final
   atomically (publish publisher prepared >> closeSnapshot publisher)
   writeIORef ownerState (OwnerState final issued)

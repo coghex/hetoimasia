@@ -61,7 +61,7 @@ import Hetoimasia.GLFW.Internal.Session
   , sessionTrace
   )
 import Hetoimasia.GLFW.Internal.Trace (PumpMode (..), recordingPump)
-import Hetoimasia.GLFW.Internal.Window.Observation (CloseRequest, WindowObservation (..), WindowPhase (..))
+import Hetoimasia.GLFW.Internal.Window.Observation (CloseRequest, WindowObservation (..), WindowPhase (..), nextRevision)
 import Hetoimasia.GLFW.Internal.Window.Reconcile (commitObservation, raiseLatchedFault, reconcileFollowing, reconcileWindow)
 import Hetoimasia.GLFW.Internal.Window.Revisit (Revisit (..), afterReread, rereadDue, stampsAfterFalse)
 import Hetoimasia.GLFW.Internal.Window.Sample (sampleAll, sampleVisibility)
@@ -183,7 +183,7 @@ rejectCloseRequest window request =
    OwnerState current issued ← readIORef (windowOwnerState window)
    if obsCloseRequest current == Just request
      then do
-       let next = current {obsRevision = obsRevision current + 1, obsCloseRequest = Nothing}
+       let next = nextRevision current current {obsCloseRequest = Nothing}
        prepared ← prepare next
        mask_ (commitObservation window next issued prepared)
        pure True
@@ -213,7 +213,7 @@ beginWindowClosing interruption commit window =
    if obsPhase current /= WindowOpen
      then pure False
      else do
-       let next = current {obsRevision = obsRevision current + 1, obsPhase = WindowClosing}
+       let next = nextRevision current current {obsPhase = WindowClosing}
        prepared ← prepare next
        interruption
        mask_ $ do

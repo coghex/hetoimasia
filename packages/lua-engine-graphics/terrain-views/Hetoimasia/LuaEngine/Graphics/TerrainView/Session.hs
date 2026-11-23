@@ -272,13 +272,32 @@ data Basis = Basis
   , basisGeometry ∷ !ViewGeometry
   , basisArena ∷ !(Maybe (ArenaId, Revision, Revision))
     -- ^ The arena's incarnation and its content and knowledge revisions.
+  , basisStamp ∷ !BasisStamp
+    -- ^ The writer-maintained stamps the basis was read at. Two bases are the same basis when their stamps are: every
+    -- decision about whether work is current compares stamps, never a recomputed geometry or arena.
   }
-  deriving (Eq, Show)
+  deriving (Show)
+
+instance Eq Basis where
+  left == right = basisStamp left == basisStamp right
+
+-- | The stamps a basis rests on, each kept by its writer: the view's intent revision, the target's facts version (a
+-- window's geometry revision, advanced only by a geometry change; a held or offscreen target's facts version) and the
+-- arena's mark (its content and knowledge revisions and residency generation, 'Nothing' once it has ended).
+data BasisStamp = BasisStamp !Word64 !SurfaceVersion !(Maybe ArenaMark)
+  deriving (Eq)
+
+instance Show BasisStamp where
+  show (BasisStamp intent _ mark) = "BasisStamp " <> show intent <> " " <> show mark
+
+-- | The basis stamps as their writers' cells hold them now: reads only.
+basisStampOf ∷ ViewState k → STM BasisStamp
+basisStampOf vs = BasisStamp <$> readTVar (vsIntent vs) <*> surfaceVersion (vtSurface (vsTarget vs)) <*> vsMarkCell vs
 
 -- | What a refusal is keyed by: the attempt's basis; for a refusal over the target's free slots, the slots the attempt
 -- needed (a change of the target's free slots to that many is the one other input that can make it fit); and for a
 -- refused demand replacement, the list refused (suppressed while the basis and the desired list stay as they were).
-data RefusedAt = RefusedAt !Basis !(Maybe Int) !(Maybe [RegionCoord])
+data RefusedAt = RefusedAt !BasisStamp !(Maybe Int) !(Maybe [RegionCoord])
   deriving (Eq, Show)
 
 -- | The terrain revision the view's target accepted: its basis, its runtime demand (the visible-first prefix it was
@@ -1601,12 +1620,15 @@ stepView service hands vs = do
   where
     stale prep basis = prepBasis prep /= basis
 
+-- The basis a preparation starts from, read outside any commit: what its inputs need (the geometry, the arena's
+-- revisions) and the stamps they were read at, in one transaction. Commits compare the stamps alone.
 currentBasis ∷ TerrainViews k → ViewState k → STM Basis
 currentBasis service vs = do
   intent ← readTVar (vsIntent vs)
   geometry ← surfaceGeometry (vtSurface (vsTarget vs))
   arena ← Runtime.inspectArenaSTM (portTerrain (svPorts service)) (vsLease vs)
-  pure (Basis intent geometry ((\a → (Runtime.viewIncarnation a, viewRevision a, viewKnowledgeRevision a)) <$> arena))
+  stamp ← basisStampOf vs
+  pure (Basis intent geometry ((\a → (Runtime.viewIncarnation a, viewRevision a, viewKnowledgeRevision a)) <$> arena) stamp)
 
 currentResidency ∷ TerrainViews k → ViewState k → STM (Maybe Word64)
 currentResidency service vs = fmap (fromIntegral . viewGeneration) <$> Runtime.inspectArenaSTM (portTerrain (svPorts service)) (vsLease vs)
@@ -1632,13 +1654,13 @@ reconcileDemand ∷ (Ord k, Show k) ⇒ TerrainViews k → ViewState k → Owner
 reconcileDemand service vs =
   own (demandDue service vs) >>= \case
     Nothing → pure False
-    Just (desired, prepared, basis) →
+    Just (desired, prepared, stamp) →
       install desired prepared >>= \case
         Right receipt → own (True <$ (writeTVar (vsAsked vs) desired >> writeTVar (vsReceipt vs) (Just receipt) >> modifyTVar' (vsInstalls vs) (+ 1)))
         Left why → own $ do
           let limit = LimitRuntime ("the terrain service refused the view's demand: " <> why)
           pressure vs limit
-          recordRefusal vs limit (RefusedAt basis Nothing (Just desired))
+          recordRefusal vs limit (RefusedAt stamp Nothing (Just desired))
           pure True
   where
     install desired prepared =
@@ -1648,14 +1670,15 @@ reconcileDemand service vs =
 
 -- The demand a view's state prescribes, when it differs from the installed one and no current refusal suppresses it,
 -- prepared, with the basis it is asked at.
-demandDue ∷ TerrainViews k → ViewState k → STM (Maybe ([RegionCoord], Prepared [RegionDemand], Basis))
+demandDue ∷ TerrainViews k → ViewState k → STM (Maybe ([RegionCoord], Prepared [RegionDemand], BasisStamp))
 demandDue service vs = do
   status ← readTVar (vsStatus vs)
   open ← readTVar (svOpen service)
   ended ← readTVar (svEnded service)
   usable ← surfaceUsable (vtSurface (vsTarget vs))
   authority ← authorityOf vs
-  arena ← Runtime.inspectArenaSTM (portTerrain (svPorts service)) (vsLease vs)
+  -- the lease and its arena as their writers keep them: the lease live, the arena's mark present
+  arena ← (&&) <$> Runtime.leaseLiveSTM (portTerrain (svPorts service)) (vsLease vs) <*> (isJust <$> vsMarkCell vs)
   gone ← ownerEnded (portOwner (svPorts service))
   geometry ← surfaceGeometry (vtSurface (vsTarget vs))
   accepted ← readTVar (vsPublished vs)
@@ -1664,16 +1687,16 @@ demandDue service vs = do
         GeometryExtent _ | Just held ← accepted → (accDemand held, accPrepared held)
         _ → ([], svNoDemand service)
       -- an ending (a revoked authority or lease, a retired target) is the step's to settle, never a demand refusal
-      live = status == ViewOpen && open && isNothing ended && isNothing gone && usable && authority && isJust arena
+      live = status == ViewOpen && open && isNothing ended && isNothing gone && usable && authority && arena
   if not live || desired == installed
     then pure Nothing
     else do
-      basis ← currentBasis service vs
+      stamp ← basisStampOf vs
       refused ← readTVar (vsRefused vs)
       let suppressed = case refused of
-            Just (_, RefusedAt at _ (Just list)) → at == basis && list == desired
+            Just (_, RefusedAt at _ (Just list)) → at == stamp && list == desired
             _ → False
-      pure (if suppressed then Nothing else Just (desired, prepared, basis))
+      pure (if suppressed then Nothing else Just (desired, prepared, stamp))
 
 -- The runtime demand of a list of regions: each whole.
 demandsOf ∷ [RegionCoord] → [RegionDemand]
@@ -1723,7 +1746,7 @@ startIfDue service vs serial basis = do
           Nothing → False
         moving = isJust (camPending camera)
         stillRefused = case refused of
-          Just (_, RefusedAt at need _) → at == basis && maybe True (> free) need
+          Just (_, RefusedAt at need _) → at == basisStamp basis && maybe True (> free) need
           Nothing → False
         metrics = case basisGeometry basis of
           GeometryExtent m | not current → Just (Just m)
@@ -1869,7 +1892,31 @@ abandon service vs serial = do
 -- prepared from; and, for work that settles a move, the camera's pending jump is the one captured. Every transaction
 -- that writes a stage, changes the camera, settles a move, records a refusal or publishes asks it.
 stillCurrent ∷ TerrainViews k → ViewState k → Word64 → Basis → Maybe (Maybe JumpId) → STM Bool
-stillCurrent service vs serial basis jump = currentBy serial basis jump <$> liveWitness service vs
+stillCurrent service vs serial basis jump = do
+  -- the facts this decision depends on, each as its writer keeps it: the stage's serial, the view's and the service's
+  -- lifecycle, the owner's gate, the target's standing, the original authority, the exact terrain lease, the basis
+  -- stamps the work was prepared at and, for work that settles a move, the pending jump; nothing is recomputed
+  current ← (== serial) <$> readTVar (vsStageSerial vs)
+  live ← standingLive service vs
+  stamp ← basisStampOf vs
+  pending ← fmap pendingId . camPending <$> readTVar (vsCamera vs)
+  pure (current && live && stamp == basisStamp basis && maybe True (== pending) jump)
+
+-- Whether the view, the service, the owner, the target, the original authority and the view's own terrain lease all
+-- stand as live, read from their writers' cells.
+standingLive ∷ TerrainViews k → ViewState k → STM Bool
+standingLive service vs =
+  and
+    <$> sequence
+      [ (== ViewOpen) <$> readTVar (vsStatus vs)
+      , readTVar (svOpen service)
+      , isNothing <$> readTVar (svEnded service)
+      , isNothing <$> ownerEnded (portOwner (svPorts service))
+      , surfaceUsable (vtSurface (vsTarget vs))
+      , authorityOf vs
+      , Runtime.leaseLiveSTM (portTerrain (svPorts service)) (vsLease vs)
+      , isJust <$> vsMarkCell vs
+      ]
 
 -- | The writer-maintained stamps a view's work rests on: the identities and revisions its writers advance, read as they
 -- stand and computed from nothing: the stage's serial, the view's and the service's lifecycle, the owner's gate, the
@@ -2005,15 +2052,15 @@ enterRefusal service vs basis limit = do
   let need = case limit of
         LimitSlots wanted _ → Just wanted
         _ → Nothing
-  recordRefusal vs limit (RefusedAt basis need Nothing)
+  recordRefusal vs limit (RefusedAt (basisStamp basis) need Nothing)
 
 -- Record a refusal: a new entry (no record, or one of another basis or desired list) is reported once; the same
 -- refusal again adds nothing.
 recordRefusal ∷ ViewState k → BindingLimit → RefusedAt → STM ()
-recordRefusal vs limit at@(RefusedAt basis _ list) = do
+recordRefusal vs limit at@(RefusedAt stamp _ list) = do
   before ← readTVar (vsRefused vs)
   let same = case before of
-        Just (_, RefusedAt basis' _ list') → basis' == basis && list' == list
+        Just (_, RefusedAt stamp' _ list') → stamp' == stamp && list' == list
         Nothing → False
   unless same (modifyTVar' (vsRefusals vs) (+ 1))
   writeTVar (vsRefused vs) (Just (limit, at))
@@ -2650,9 +2697,9 @@ nextCandidateWork service vs = do
   case (status, stage) of
     (ViewEnded _, _) → pure CandidateEnded
     (ViewOpen, Building prep candidate) → do
-      basis ← currentBasis service vs
+      stamp ← basisStampOf vs
       if
-        | prepBasis prep /= basis → pure CandidateRunnable
+        | basisStamp (prepBasis prep) /= stamp → pure CandidateRunnable
         | not (null (cdWanted candidate)) → pure CandidateRunnable
         | otherwise →
             nextPart id service vs candidate (fmap (fmap (const ())) . ownerRoom (portOwner (svPorts service))) <&> \case

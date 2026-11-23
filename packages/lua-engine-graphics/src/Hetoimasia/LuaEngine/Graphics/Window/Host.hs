@@ -72,7 +72,7 @@ import qualified Data.Text as Text
 import Data.Word (Word64)
 import Numeric.Natural (Natural)
 import Hetoimasia.Foundation.Messaging.Payload (Prepared, preparedValue)
-import Hetoimasia.Foundation.Messaging.Snapshot (SnapshotCursor, observedCursor, observedValue, readSnapshot)
+import Hetoimasia.Foundation.Messaging.Snapshot (observedValue, readSnapshot)
 import Hetoimasia.Foundation.OwnerTx (OwnerTx)
 import Hetoimasia.GLFW.Command
   ( CommandRejection (..)
@@ -105,6 +105,7 @@ import Hetoimasia.GLFW.Window
   , observedCloseRequest
   , observedContentScale
   , observedFramebufferExtent
+  , observedGeometryRevision
   , observedLogicalExtent
   , observedPhase
   )
@@ -181,8 +182,9 @@ data WindowView scene = WindowView
   , wvPublishUnlessShown ∷ Prepared scene → OwnerTx (Maybe WindowScenePublication)
   }
 
--- | The version of the window observation a geometry was read from: its writer advances it with every observation.
-newtype WindowVersion = WindowVersion (SnapshotCursor WindowObservation)
+-- | The geometry revision of the window observation a geometry was read from: its writer advances it in the same write
+-- as every geometry change, and never for a cursor, focus or other change.
+newtype WindowVersion = WindowVersion Natural
   deriving (Eq)
 
 windowViewId ∷ WindowView scene → WindowId
@@ -448,7 +450,7 @@ target vulkan var token = do
     Just made | Just service ← madeService made → do
       current ← standing vulkan var token
       let usable = (== StandingUsable) <$> standing vulkan var token
-          geometry = (\observed → (observedGeometry (preparedValue (observedValue observed)), WindowVersion (observedCursor observed))) <$> readSnapshot (clientObservations (madeClient made))
+          geometry = (\observed → (observedGeometry (preparedValue (observedValue observed)), WindowVersion (observedGeometryRevision (preparedValue (observedValue observed))))) <$> readSnapshot (clientObservations (madeClient made))
           publish = publishGraphicsWindowScene (vulkanGraphicsOwner vulkan) (madeWindow made)
           publishTx = publishGraphicsWindowSceneTx (vulkanGraphicsOwner vulkan) (madeWindow made)
           acceptsTx = graphicsWindowSceneAcceptsTx (vulkanGraphicsOwner vulkan) (madeWindow made)

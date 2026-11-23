@@ -41,13 +41,19 @@ import Hetoimasia.GLFW.Internal.Seam
   )
 import Hetoimasia.GLFW.Internal.Window (attachWindowInputFeed, inputStagingCapacity)
 import Hetoimasia.GLFW.Window
-  ( Window
+  ( Attribute (..)
+  , Extent (..)
+  , Window
   , WindowId
   , WindowObservation
   , WindowResult (..)
   , hiddenTestWindowConfig
   , observedCursorPosition
   , observedCursorInside
+  , observedFramebufferExtent
+  , observedGeometryRevision
+  , observedLogicalExtent
+  , observedRevision
   , windowIdentity
   , windowObservations
   , withWindow
@@ -103,6 +109,8 @@ spec = describe "GLFW input feeds" $ do
       (boundedExample testCallbackEvents)
     it "keeps a button event's captured coordinates after later cursor motion through callbacks"
       (boundedExample testCallbackButtonPosition)
+    it "advances the geometry revision with every geometry change, a resize away and back included, and never for cursor or focus changes"
+      (boundedExample testGeometryRevision)
     it "keeps a button event's captured coordinates when motion and the button occur in separate owner turns"
       (boundedExample testCallbackButtonAcrossTurns)
     it "sets the staging loss latch while the buffer is full and begins the same reset, replaying no captured prefix"
@@ -763,6 +771,36 @@ testCallbackEvents =
                  ]
     map inputWindow events `shouldBe` replicate 7 (windowIdentity window)
     map (epochNumber . inputEpoch) events `shouldBe` replicate 7 1
+
+testGeometryRevision ∷ Expectation
+testGeometryRevision =
+  withLiveFeed 8 $ \seam window _ → do
+    before ← currentObservation window
+    -- cursor motion and a focus change: the observation moves, its geometry revision does not
+    drive seam window [CursorMovedTo 3 4, CursorEnterChanged True, FocusChanged False]
+    moved ← currentObservation window
+    observedRevision moved `shouldSatisfy` (> observedRevision before)
+    observedGeometryRevision moved `shouldBe` observedGeometryRevision before
+    -- a resize away, then back: two geometry changes, two advances, though the geometry ends as it began
+    drive seam window [ResizedTo 321 123, FramebufferResizedTo 321 123]
+    away ← currentObservation window
+    observedLogicalExtent away `shouldNotBe` observedLogicalExtent before
+    observedGeometryRevision away `shouldBe` observedGeometryRevision before + 1
+    drive seam window [ResizedTo (extentWidthOf before) (extentHeightOf before), FramebufferResizedTo (framebufferWidthOf before) (framebufferHeightOf before)]
+    back ← currentObservation window
+    (observedLogicalExtent back, observedFramebufferExtent back) `shouldBe` (observedLogicalExtent before, observedFramebufferExtent before)
+    observedGeometryRevision back `shouldBe` observedGeometryRevision before + 2
+  where
+    extentWidthOf = observedWidth . observedLogicalExtent
+    extentHeightOf = observedHeight . observedLogicalExtent
+    framebufferWidthOf = observedWidth . observedFramebufferExtent
+    framebufferHeightOf = observedHeight . observedFramebufferExtent
+    observedWidth = \case
+      Observed (Extent w _) → w
+      Unavailable → 0
+    observedHeight = \case
+      Observed (Extent _ h) → h
+      Unavailable → 0
 
 testCallbackButtonPosition ∷ Expectation
 testCallbackButtonPosition =

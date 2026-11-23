@@ -50,6 +50,8 @@ module Hetoimasia.GLFW.Internal.Window.Observation
   , WindowObservation (..)
   , observedWindow
   , observedRevision
+  , observedGeometryRevision
+  , nextRevision
   , observedPhase
   , observedLogicalExtent
   , observedFramebufferExtent
@@ -131,6 +133,9 @@ data WindowObservation = WindowObservation
     -- ^ Latest cursor callback; 'Nothing' until one has run.
   , obsCursorInside ∷ !(Maybe Bool)
     -- ^ Latest enter/leave callback; 'Nothing' until one has run.
+  , obsGeometryRevision ∷ !Natural
+    -- ^ Advanced in the same write as every change of the logical extent, the framebuffer extent or the content
+    -- scale, and by nothing else: a resize away and back advances it twice, cursor or focus changes never.
   }
   deriving (Eq, Show)
 
@@ -153,6 +158,7 @@ instance NFData WindowObservation where
       `seq` rnf (obsMode observation)
       `seq` rnf (obsCursor observation)
       `seq` rnf (obsCursorInside observation)
+      `seq` rnf (obsGeometryRevision observation)
 
 -- | The window observed.
 observedWindow ∷ WindowObservation → WindowId
@@ -162,6 +168,23 @@ observedWindow = obsWindow
 -- snapshot's revision for every later one.
 observedRevision ∷ WindowObservation → Natural
 observedRevision = obsRevision
+
+-- | The observation's geometry revision: zero for the initial observation, advanced by every later revision whose
+-- logical extent, framebuffer extent or content scale differs from the one before it.
+observedGeometryRevision ∷ WindowObservation → Natural
+observedGeometryRevision = obsGeometryRevision
+
+-- | The next revision of an observation, from the current one: its revision advanced, and its geometry revision
+-- advanced when the geometry it reports changed. Every writer of a new revision goes through this.
+nextRevision ∷ WindowObservation → WindowObservation → WindowObservation
+nextRevision current next =
+  next
+    { obsRevision = obsRevision current + 1
+    , obsGeometryRevision =
+        if (obsLogical next, obsFramebuffer next, obsScale next) == (obsLogical current, obsFramebuffer current, obsScale current)
+          then obsGeometryRevision current
+          else obsGeometryRevision current + 1
+    }
 
 observedPhase ∷ WindowObservation → WindowPhase
 observedPhase = obsPhase

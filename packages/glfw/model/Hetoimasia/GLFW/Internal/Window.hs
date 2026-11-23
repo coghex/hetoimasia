@@ -80,6 +80,7 @@ module Hetoimasia.GLFW.Internal.Window
   , WindowObservation
   , observedWindow
   , observedRevision
+  , observedGeometryRevision
   , observedPhase
   , observedLogicalExtent
   , observedFramebufferExtent
@@ -178,6 +179,7 @@ import Hetoimasia.GLFW.Internal.Window.Observation
   , observedPhase
   , observedPlacement
   , observedRevision
+  , observedGeometryRevision
   , observedVisible
   , observedWindow
   )
