@@ -131,6 +131,7 @@ module Hetoimasia.Runtime.GLFW.Internal.Owner
   , readOwnerDemandTaken
   , publishGraphicsWindowScene
   , publishGraphicsWindowSceneTx
+  , graphicsWindowSceneAcceptsTx
   , readGraphicsSceneRevisions
   , wakeGraphicsHost
 

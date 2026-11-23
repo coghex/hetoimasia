@@ -130,6 +130,7 @@ module Hetoimasia.GPU.Vulkan.GLFW
   , registerVulkanSceneTarget
   , unregisterVulkanSceneTarget
   , publishVulkanTargetScene
+  , vulkanTargetSceneAccepts
   , TargetScenePublication (..)
   , recordVulkanTargetBatch
   , TargetBatchRefusal (..)
@@ -376,6 +377,7 @@ module Hetoimasia.GPU.Vulkan.GLFW
   , submitVulkanActionTx
   , requestVulkanReleaseTx
   , publishVulkanTargetSceneTx
+  , vulkanTargetSceneAcceptsTx
   , readVulkanActionTx
   , readVulkanActionGateTx
   , constructedDisposalTx
@@ -412,6 +414,7 @@ import Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , TargetScenePublication (..)
   , defaultTargetCapacity
   , publishVulkanTargetScene
+  , vulkanTargetSceneAccepts
   , recordVulkanTargetBatch
   , registerVulkanSceneTarget
   , unregisterVulkanSceneTarget
@@ -731,6 +734,10 @@ requestVulkanReleaseTx host action = fromIssuerSTM (requestVulkanRelease host ac
 -- | 'publishVulkanTargetScene' in a commit.
 publishVulkanTargetSceneTx ∷ VulkanHost scene → OffscreenTargetId → Prepared scene → OwnerTx TargetScenePublication
 publishVulkanTargetSceneTx host target scene = fromIssuerSTM (publishVulkanTargetScene host target scene)
+
+-- | 'vulkanTargetSceneAccepts' in a commit: read-only, the guards 'publishVulkanTargetSceneTx' checks.
+vulkanTargetSceneAcceptsTx ∷ VulkanHost scene → OffscreenTargetId → OwnerTx Bool
+vulkanTargetSceneAcceptsTx host target = fromIssuerSTM (vulkanTargetSceneAccepts host target)
 
 -- | 'readVulkanAction' in a commit: read-only, 'Nothing' while the action has not ended.
 readVulkanActionTx ∷ ActionTicket r → OwnerTx (Maybe (ActionOutcome r))

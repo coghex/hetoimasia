@@ -41,6 +41,7 @@ module Hetoimasia.LuaEngine.Graphics.Window.Host
     -- * The capability a ready window yields
   , WindowTarget (..)
   , WindowView
+  , windowViewAccepts
   , WindowVersion
   , windowViewId
   , windowViewAttachment
@@ -137,6 +138,7 @@ import Hetoimasia.Runtime.GLFW
   , hostCommandStatistics
   , publishGraphicsWindowScene
   , publishGraphicsWindowSceneTx
+  , graphicsWindowSceneAcceptsTx
   , readGraphicsService
   , readOwnerFailure
   , readTargetStanding
@@ -173,6 +175,7 @@ data WindowView scene = WindowView
   , wvUsable ∷ STM Bool
   , wvGeometry ∷ STM (WindowGeometry, WindowVersion)
   , wvPublish ∷ Prepared scene → OwnerTx WindowScenePublication
+  , wvAccepts ∷ OwnerTx Bool
   }
 
 -- | The version of the window observation a geometry was read from: its writer advances it with every observation.
@@ -192,6 +195,10 @@ windowViewUsable = wvUsable
 -- | The window's geometry as its latest observation gives it, with that observation's version.
 windowViewGeometry ∷ WindowView scene → STM (WindowGeometry, WindowVersion)
 windowViewGeometry = wvGeometry
+
+-- | Whether 'windowViewPublish' would accept a publication now, read-only in a commit: the handoff's same guards.
+windowViewAccepts ∷ WindowView scene → OwnerTx Bool
+windowViewAccepts = wvAccepts
 
 -- | Publish an owned scene to this window alone, as the handoff's ownership operation: it never waits.
 windowViewPublish ∷ WindowView scene → Prepared scene → OwnerTx WindowScenePublication
@@ -436,6 +443,7 @@ target vulkan var token = do
           geometry = (\observed → (observedGeometry (preparedValue (observedValue observed)), WindowVersion (observedCursor observed))) <$> readSnapshot (clientObservations (madeClient made))
           publish = publishGraphicsWindowScene (vulkanGraphicsOwner vulkan) (madeWindow made)
           publishTx = publishGraphicsWindowSceneTx (vulkanGraphicsOwner vulkan) (madeWindow made)
+          acceptsTx = graphicsWindowSceneAcceptsTx (vulkanGraphicsOwner vulkan) (madeWindow made)
       pure $ case current of
         StandingUsable →
           Just
@@ -446,7 +454,7 @@ target vulkan var token = do
               , targetPublishSTM = publish
               , targetUsable = usable
               , targetGeometry = fst <$> geometry
-              , targetView = WindowView (madeWindow made) (graphicsAttachment service) usable geometry publishTx
+              , targetView = WindowView (madeWindow made) (graphicsAttachment service) usable geometry publishTx acceptsTx
               }
         _ → Nothing
     _ → pure Nothing

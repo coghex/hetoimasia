@@ -230,6 +230,7 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , registerVulkanSceneTarget
   , unregisterVulkanSceneTarget
   , publishVulkanTargetScene
+  , vulkanTargetSceneAccepts
   , recordVulkanTargetBatch
   , defaultTargetCapacity
 
@@ -448,6 +449,7 @@ import Hetoimasia.GPU.Vulkan.GLFW.Internal.Targets
   , newTargets
   , pendingScenes
   , publishTarget
+  , targetAccepts
   , recordAdopted
   , registerTarget
   , retireAllTargets
@@ -1245,6 +1247,12 @@ unregisterVulkanSceneTarget host = unregisterTarget (vulkanTargets host)
 publishVulkanTargetScene ∷ VulkanHost scene → OffscreenTargetId → Prepared scene → STM TargetScenePublication
 publishVulkanTargetScene host = case vulkanController host of
   VulkanController state → publishTarget (vulkanTargets host) (actionGate (stateRoots state) (stateOwnerOpen state))
+
+-- | Whether 'publishVulkanTargetScene' would accept a publication to this target now, read-only: the same guards
+-- (the host's gate, the target registered).
+vulkanTargetSceneAccepts ∷ VulkanHost scene → OffscreenTargetId → STM Bool
+vulkanTargetSceneAccepts host = case vulkanController host of
+  VulkanController state → targetAccepts (vulkanTargets host) (actionGate (stateRoots state) (stateOwnerOpen state))
 
 -- | Why a batch was not recorded for an offscreen target.
 data TargetBatchRefusal

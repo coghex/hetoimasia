@@ -85,6 +85,7 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Targets
   , registerTarget
   , unregisterTarget
   , publishTarget
+  , targetAccepts
   , targetsHeld
   , targetsRevisions
 
@@ -218,18 +219,29 @@ unregisterTarget targets identity = do
 -- | Publish a scene to a target as its latest value, given the host's gate.
 publishTarget ∷ Targets scene → STM (Maybe ActionRefusal) → OffscreenTargetId → Prepared scene → STM TargetScenePublication
 publishTarget targets gate identity scene =
+  targetRefusal targets gate identity >>= \case
+    Left refusal → pure refusal
+    Right (standing, cell) → do
+      let revision = cellRevision cell + 1
+      writeTVar
+        (targetsStanding targets)
+        standing {standingLive = Map.insert identity cell {cellLatest = scene, cellRevision = revision} (standingLive standing)}
+      pure (TargetScenePublished identity revision)
+
+-- | Whether 'publishTarget' would accept a publication to this target now, given the host's gate, read-only: the same
+-- guards, so a transaction that finds it accepting and then publishes, with nothing between, has it accepted.
+targetAccepts ∷ Targets scene → STM (Maybe ActionRefusal) → OffscreenTargetId → STM Bool
+targetAccepts targets gate identity = either (const False) (const True) <$> targetRefusal targets gate identity
+
+-- Why a publication to this target would be refused now, or its live cell: the one decision the publication and its
+-- read-only check share.
+targetRefusal ∷ Targets scene → STM (Maybe ActionRefusal) → OffscreenTargetId → STM (Either TargetScenePublication (Standing scene, Cell scene))
+targetRefusal targets gate identity =
   gate >>= \case
-    Just _ → pure (TargetSceneClosed identity)
+    Just _ → pure (Left (TargetSceneClosed identity))
     Nothing → do
       standing ← readTVar (targetsStanding targets)
-      case Map.lookup identity (standingLive standing) of
-        Nothing → pure (TargetSceneUnknown identity)
-        Just cell → do
-          let revision = cellRevision cell + 1
-          writeTVar
-            (targetsStanding targets)
-            standing {standingLive = Map.insert identity cell {cellLatest = scene, cellRevision = revision} (standingLive standing)}
-          pure (TargetScenePublished identity revision)
+      pure (maybe (Left (TargetSceneUnknown identity)) (Right . (,) standing) (Map.lookup identity (standingLive standing)))
 
 -- | The scene targets this registry holds, for the barrier.
 targetsHeld ∷ Targets scene → STM [SceneTargetKey]

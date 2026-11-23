@@ -22,6 +22,7 @@ module Hetoimasia.Runtime.GLFW.Internal.Owner.Observation
   , readOwnerDemandTaken
   , publishGraphicsWindowScene
   , publishGraphicsWindowSceneTx
+  , graphicsWindowSceneAcceptsTx
   , readGraphicsSceneRevisions
   , pruneWindowScenes
   ) where
@@ -47,6 +48,7 @@ import Hetoimasia.Runtime.GLFW.Internal.Owner.Handoff
   , WindowScenePublication
   , handoffSceneMode
   , ownerTerminal
+  , ownerWindowSceneAccepts
   , publishOwnerWindowScene
   , pruneOwnerWindowScenes
   , readOwnerDemandAt
@@ -170,6 +172,13 @@ publishGraphicsWindowScene owner window scene = do
 -- answers a refusal as data and never waits or raises.
 publishGraphicsWindowSceneTx ∷ GraphicsOwner scene → WindowId → Prepared scene → OwnerTx WindowScenePublication
 publishGraphicsWindowSceneTx owner window scene = fromIssuerSTM (publishGraphicsWindowScene owner window scene)
+
+-- | Whether 'publishGraphicsWindowSceneTx' would accept a publication to this window in this commit, read-only: the
+-- same guards over the handoff's own cells.
+graphicsWindowSceneAcceptsTx ∷ GraphicsOwner scene → WindowId → OwnerTx Bool
+graphicsWindowSceneAcceptsTx owner window = fromIssuerSTM $ do
+  held ← ownerWindows owner
+  ownerWindowSceneAccepts (ownerHandoff' owner) held window
 
 -- | The latest published scene revision of every window the host holds, in one
 -- transaction: a window's own, or zero for one that has had no publication.

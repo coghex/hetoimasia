@@ -125,6 +125,7 @@ module Hetoimasia.Runtime.GLFW.Internal.Owner.Handoff
   , readOwnerSceneAt
   , WindowScenePublication (..)
   , publishOwnerWindowScene
+  , ownerWindowSceneAccepts
   , readOwnerWindowSceneAt
   , readOwnerWindowScenes
   , pruneOwnerWindowScenes
@@ -709,27 +710,40 @@ data WindowScenePublication
 -- the owner's rounds.
 publishOwnerWindowScene
   ∷ OwnerHandoff scene → [WindowId] → WindowId → Prepared scene → STM WindowScenePublication
-publishOwnerWindowScene handoff held window scene = case handoffSceneMode' handoff of
-  SharedScene → pure (WindowScenesNotEnabled window)
+publishOwnerWindowScene handoff held window scene =
+  windowSceneRefusal handoff held window >>= \case
+    Just refusal → pure refusal
+    Nothing → do
+      cells ← readTVar (handoffWindowScenes handoff)
+      let revision = maybe 0 (\(WindowSceneCell _ held') → held') (Map.lookup window cells) + 1
+      -- A publication forgets those of the windows the host no longer
+      -- holds, read in this same transaction, so the table is bounded by
+      -- the host's windows however long the owner is occupied and
+      -- however many windows come and go meanwhile.
+      writeTVar
+        (handoffWindowScenes handoff)
+        (Map.insert window (WindowSceneCell scene revision) (Map.filterWithKey (\at _ → at `elem` held) cells))
+      modifyTVar' (handoffSceneStamp handoff) (+ 1)
+      pure (WindowScenePublished window revision)
+
+-- | Whether 'publishOwnerWindowScene' would accept a publication to this window now, read-only: the same guards, so a
+-- transaction that finds it accepting and then publishes, with nothing between, has it accepted.
+ownerWindowSceneAccepts ∷ OwnerHandoff scene → [WindowId] → WindowId → STM Bool
+ownerWindowSceneAccepts handoff held window = null <$> windowSceneRefusal handoff held window
+
+-- Why a publication to this window would be refused now, if it would: the one decision the publication and its
+-- read-only check share.
+windowSceneRefusal ∷ OwnerHandoff scene → [WindowId] → WindowId → STM (Maybe WindowScenePublication)
+windowSceneRefusal handoff held window = case handoffSceneMode' handoff of
+  SharedScene → pure (Just (WindowScenesNotEnabled window))
   PerWindowScenes → do
     open ← readTVar (handoffScenesOpen handoff)
-    if not open
-      then pure (WindowSceneClosed window)
-      else
-        if window `notElem` held
-          then pure (WindowSceneUnknown window)
-          else do
-            cells ← readTVar (handoffWindowScenes handoff)
-            let revision = maybe 0 (\(WindowSceneCell _ held') → held') (Map.lookup window cells) + 1
-            -- A publication forgets those of the windows the host no longer
-            -- holds, read in this same transaction, so the table is bounded by
-            -- the host's windows however long the owner is occupied and
-            -- however many windows come and go meanwhile.
-            writeTVar
-              (handoffWindowScenes handoff)
-              (Map.insert window (WindowSceneCell scene revision) (Map.filterWithKey (\at _ → at `elem` held) cells))
-            modifyTVar' (handoffSceneStamp handoff) (+ 1)
-            pure (WindowScenePublished window revision)
+    pure (refusedWhen open)
+  where
+    refusedWhen open
+      | not open = Just (WindowSceneClosed window)
+      | window `notElem` held = Just (WindowSceneUnknown window)
+      | otherwise = Nothing
 
 -- | One window's scene beside its revision: its latest publication, or the
 -- initial scene at revision 0 when it has had none.
