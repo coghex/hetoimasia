@@ -5,11 +5,10 @@ Covered beyond the boundary: none
 
 ## Next
 
-Owner disposition of the exact GUIDE-1 issue draft in the latest report; then the other findings one at a time. New merged work is reviewed from this pin against the November 23 generic-library vision. Pending issue-specification audits remain explicit in coverage.
+Process GUIDE-2 next, then the other findings one at a time. GUIDE-1 was filed unchanged as #727 under owner approval; its solve is routed by the manager. New merged work is reviewed from this pin against the November 23 generic-library vision. Pending issue-specification audits remain explicit in coverage.
 
 ## Open findings
 
-- 2026-11-23T162528Z-b800f2f/GUIDE-1 — subprocess group identity can be reused before cleanup signals — proposal pending
 - 2026-11-23T162528Z-b800f2f/GUIDE-2 — shape 15 public Haddock still says flat top — unprocessed
 - 2026-11-23T162528Z-b800f2f/GUIDE-3 — residency Haddock contradicts budgets, dispatch slots and camera eviction — unprocessed
 - 2026-11-23T162528Z-b800f2f/GUIDE-4 — reconstructed component origins admit inconsistent aliases — unprocessed
@@ -18,7 +17,7 @@ Owner disposition of the exact GUIDE-1 issue draft in the latest report; then th
 
 - All 63 merged PR items have recorded conclusions at stated depths (six docs exclusions); broad changes are targeted, not exhaustive rereviews. 41/89 issue snapshots complete or inherited; the 48 unfinished full body/comment audits are enumerated in the report and coverage.
 - Widdershins owns game renderer/world/content and #636's transferred unfinished work. Four terrain packages stay in Hetoimasia by explicit owner decision; #645/#714 were not merged. Ecce-homo assets await agreed provenance import/removal. No engine application-state-store successor is approved or currently a goal.
-- Open known work: #563, #702, #708, #712, #718, #720, #723; #446 remains deferred on its named consumer/Q-10. M1 still promises no state/RNG/replay/whole-session determinism or hostile containment.
+- Open known work: #563, #702, #708, #712, #718, #720, #723, #727; #446 remains deferred on its named consumer/Q-10. M1 still promises no state/RNG/replay/whole-session determinism or hostile containment.
 - Owner-approved #586 optional init watchdog is a narrow exception beside V-3's general deadline wording; docs-push supersedes V-11's old docs-in-PR sentence. These are reconciliation notes, not defects.
 - End recheck 2026-11-23T17:22:00Z: no head/vision/PR/issue movement. Static owned-start guard passed; no builds, executable tests, probes or desktop runs. Clean run checkout removed; old unfinished October 21 evidence left untouched.
 
