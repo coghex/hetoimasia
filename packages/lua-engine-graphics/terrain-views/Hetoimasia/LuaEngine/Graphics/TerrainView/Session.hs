@@ -158,7 +158,7 @@ import Hetoimasia.Terrain.Render2D.Presentation (LightSettings)
 import Hetoimasia.Terrain.Render2D.Projection (ViewSetup (..))
 import Hetoimasia.Terrain.Query (Occupied (..))
 import Hetoimasia.Terrain.Residency (ArenaId (..), RegionDemand (..), Revision (..), coverageBox, limitCameraRegions, limitHoldRegions, limitQueryRegions)
-import Hetoimasia.Terrain.Runtime (ArenaMark (..), ArenaView (viewGeneration, viewKnowledgeRevision, viewPalette, viewRevision), Settlement (..))
+import Hetoimasia.Terrain.Runtime (ArenaMark (..), ArenaView (viewKnowledgeRevision, viewPalette, viewRevision), Settlement (..))
 import qualified Hetoimasia.Terrain.Runtime as Runtime
 import Hetoimasia.Terrain.Runtime.Settlement (TakeOutcome (..))
 import Hetoimasia.Terrain.Runtime.Transactions (ViewRequest, cancelViewRequest, attachViewTx, closeViewTx, releaseRegionBorrowTx, requestViewRegions, requestViewSurface, retireViewRequestTx, setViewDemandTx, takeViewRequestTx, viewRequestSettled)
@@ -273,19 +273,38 @@ data Basis = Basis
   , basisArena ∷ !(Maybe (ArenaId, Revision, Revision))
     -- ^ The arena's incarnation and its content and knowledge revisions.
   , basisStamp ∷ !BasisStamp
-    -- ^ The writer-maintained stamps the basis was read at. Two bases are the same basis when their stamps are: every
-    -- decision about whether work is current compares stamps, never a recomputed geometry or arena.
+    -- ^ The writer-maintained stamps the basis was read at, which the commits compare ('stillCurrent').
   }
   deriving (Show)
 
+-- | Two bases are the same basis when the facts a drawing depends on are: the intent, the geometry, and the arena's
+-- incarnation with its content and knowledge revisions. Accepted-scene reuse compares these, so a residency-only change
+-- or the target's facts returning to the accepted metrics keeps the accepted drawing. In-flight work, its witnesses and
+-- the commits compare the stamps ('BasisStamp'), so every decision about work in flight is the same one.
 instance Eq Basis where
-  left == right = basisStamp left == basisStamp right
+  left == right =
+    basisIntent left == basisIntent right
+      && basisGeometry left == basisGeometry right
+      && basisArena left == basisArena right
 
 -- | The stamps a basis rests on, each kept by its writer: the view's intent revision, the target's facts version (a
 -- window's geometry revision, advanced only by a geometry change; a held or offscreen target's facts version) and the
 -- arena's mark (its content and knowledge revisions and residency generation, 'Nothing' once it has ended).
+--
+-- Stamps compare by the facts a basis rests on: the residency generation an arena mark carries is kept for the
+-- camera's settlement, which reads it from the captured stamp, but a residency-only change leaves the stamp the same.
+-- Collection compares the full marks ('Stamps').
 data BasisStamp = BasisStamp !Word64 !SurfaceVersion !(Maybe ArenaMark)
-  deriving (Eq)
+
+instance Eq BasisStamp where
+  BasisStamp intent facts mark == BasisStamp intent' facts' mark' =
+    intent == intent' && facts == facts' && fmap revisions mark == fmap revisions mark'
+    where
+      revisions m = (markContent m, markKnowledge m)
+
+-- | The residency generation the stamp's arena mark was read at.
+stampGeneration ∷ BasisStamp → Maybe Word64
+stampGeneration (BasisStamp _ _ mark) = markGeneration <$> mark
 
 instance Show BasisStamp where
   show (BasisStamp intent _ mark) = "BasisStamp " <> show intent <> " " <> show mark
@@ -764,9 +783,15 @@ watch service stopping = loop
     wake =
       ownerGoneReading service >>= \case
         Just _ → do
-          -- admission is stopped: every view ends, which settles its pending moves
+          -- admission is stopped: every view ends, which settles its pending moves. The views ended are those of the
+          -- durable decision's own transaction; a recheck that finds the owner live after all ends none, and the
+          -- watcher waits again.
           views ← Map.elems <$> readTVar (svViews service)
-          if null views then retry else pure (atomically (void (ownerGone service)) >> forM_ views (\vs → endView service vs EndStopped))
+          if null views
+            then retry
+            else pure $
+              atomically (ownerGone service >>= maybe (pure []) (const (Map.elems <$> readTVar (svViews service))))
+                >>= mapM_ (\vs → endView service vs EndStopped)
         Nothing → (commit (applyMarks service) <$ (marksDue service >>= check)) `orElse` work
     work = do
       noticed ← noticeDue service
@@ -908,7 +933,8 @@ admitDue service admitter =
     False → pure False
   where
     decision = do
-      ended ← isJust <$> readTVar (svEnded service)
+      -- the latest step's terminal evidence is latched here, before this commit could replace that step's ticket
+      ended ← isJust <$> ownerGone service
       case admitter of
         WatcherAdmits → do
           queued ← stepQueued service
@@ -930,16 +956,23 @@ drainDue service = (||) <$> retirementReady service <*> stepRefusedForNow servic
 -- Admit one step, through the owner's own admission. Answers whether anything changed: a step admitted, or the owner
 -- found ended (a full queue or a device not yet ready leaves the kick wanted, for the watcher to admit once the queue
 -- changes).
+--
+-- The one writer of the step's ticket: before any replacement, the latest ticket's terminal evidence is latched as the
+-- owner's end ('ownerGone'), and then nothing is admitted, whichever path (a kick, the watcher, the drain) asked.
 admit ∷ (Ord k, Show k) ⇒ TerrainViews k → OwnerTx Bool
 admit service =
-  ownerSchedule (portOwner (svPorts service)) (stepOwner service) >>= \case
-    Right reading → own $ do
-      writeTVar (svScheduled service) True
-      writeTVar (svStep service) (Just reading)
-      writeTVar (svKickWanted service) False
-      pure True
-    Left ScheduleBusy → own (False <$ writeTVar (svKickWanted service) True)
-    Left (ScheduleEnded why) → own (True <$ endOwner service ("the graphics owner takes no more steps: " <> why))
+  own (ownerGone service) >>= \case
+    Just _ → pure True
+    Nothing → schedule
+  where
+    schedule = ownerSchedule (portOwner (svPorts service)) (stepOwner service) >>= \case
+      Right reading → own $ do
+        writeTVar (svScheduled service) True
+        writeTVar (svStep service) (Just reading)
+        writeTVar (svKickWanted service) False
+        pure True
+      Left ScheduleBusy → own (False <$ writeTVar (svKickWanted service) True)
+      Left (ScheduleEnded why) → own (True <$ endOwner service ("the graphics owner takes no more steps: " <> why))
 
 -- Whether an admitted step has not yet started (a step the owner refused before it ran has ended).
 stepQueued ∷ TerrainViews k → STM Bool
@@ -1052,7 +1085,10 @@ shutdown service = do
                     | ready && admits → pure DrainAdmit
                     | otherwise → retry
       case due of
-        DrainAbandon → void . atomically $ ownerGone service >>= traverse (\why → abandonRetirements service ("the graphics owner ended before disposal: " <> why))
+        DrainAbandon →
+          -- the durable decision abandons; a recheck that finds the owner live after all goes on draining
+          atomically (ownerGone service >>= traverse (\why → abandonRetirements service ("the graphics owner ended before disposal: " <> why)))
+            >>= maybe drain (const (pure ()))
         DrainHandOff → atomically (handOffProtected service) >> drain
         DrainFinish → do
           -- the final commit closes step admission only while the drain is still done there: no kick queues a step
@@ -1243,13 +1279,18 @@ commitOpen service request style camera = do
     usable ← surfaceUsable (vtSurface target)
     views ← readTVar (svViews service)
     slots ← readTVar (svSlots service)
+    -- the graphics owner's terminal fact, in this same commit: an owner that ended (its session failed, its admission
+    -- closed, or a step's terminal exit not yet recorded) admits no view, whatever the watcher has recorded yet
+    gone ← isJust <$> ownerGoneReading service
+    -- the open guard reads the arena for its palette, to validate the style's materials before anything is taken; the
+    -- view's liveness afterwards is its lease and mark cell ('arenaLive'), and collection its stamps
     arena ← Runtime.inspectArenaSTM terrain (openLease request)
     claimed ← isJust <$> claimOf (portClaims ports) key
     let inUse = Set.fromList (map (vtKey . vsTarget) (Map.elems views)) <> Map.keysSet slots
         unmapped = maybe [] (filter (`Set.notMember` styleMapped style) . paletteMaterials . viewPalette) arena
     pure $
       if
-        | not open || isJust ended → Just OpenStopped
+        | not open || isJust ended || gone → Just OpenStopped
         | not authority → Just OpenLeaseEnded
         | not usable → Just OpenTargetUnusable
         | isNothing arena → Just (OpenArena Runtime.RefusedAuthority)
@@ -1401,13 +1442,13 @@ controlEnding service vs = do
   gone ← ownerEnded (portOwner (svPorts service))
   usable ← surfaceUsable (vtSurface (vsTarget vs))
   authority ← authorityOf vs
-  arena ← Runtime.inspectArenaSTM (portTerrain (svPorts service)) (vsLease vs)
+  arena ← arenaLive service vs
   let ending = case status of
         ViewEnded why → Just why
         ViewOpen
           | not open || isJust ended || isJust gone → Just EndStopped
           | not usable → Just EndTargetGone
-          | not authority || isNothing arena → Just EndRevoked
+          | not authority || not arena → Just EndRevoked
           | otherwise → Nothing
   for_ ending $ \why → do
     moves ← readTVar (vsMoves vs)
@@ -1578,18 +1619,17 @@ stepOwner service hands = do
 -- Whether the view did something a further step can continue at once.
 stepView ∷ (Ord k, Show k) ⇒ TerrainViews k → Hands → ViewState k → IO Bool
 stepView service hands vs = do
-  let ports = svPorts service
-      target = vsTarget vs
+  let target = vsTarget vs
   ending ← atomically $ do
     status ← readTVar (vsStatus vs)
     usable ← surfaceUsable (vtSurface target)
     authority ← authorityOf vs
-    arena ← Runtime.inspectArenaSTM (portTerrain ports) (vsLease vs)
+    arena ← arenaLive service vs
     pure $ case status of
       ViewEnded _ → Just Nothing
       ViewOpen
         | not usable → Just (Just EndTargetGone)
-        | not authority || isNothing arena → Just (Just EndRevoked)
+        | not authority || not arena → Just (Just EndRevoked)
         | otherwise → Nothing
   case ending of
     Just Nothing → pure False
@@ -1601,7 +1641,7 @@ stepView service hands vs = do
       case stage of
         Idle → (demanded ||) <$> startIfDue service vs serial basis
         Surfacing at metrics column flight
-          | at /= basis → abandon service vs serial >> pure True
+          | basisStamp at /= basisStamp basis → abandon service vs serial >> pure True
           | otherwise → stepSurfacing service vs serial at metrics column flight
         Footprinting prep box
           | stale prep basis → abandon service vs serial >> pure True
@@ -1619,7 +1659,9 @@ stepView service hands vs = do
           | stale prep basis → abandon service vs serial >> pure True
           | otherwise → stepBuilding service hands vs serial prep candidate
   where
-    stale prep basis = prepBasis prep /= basis
+    -- in-flight work goes on while its stamps hold, as the commits that act on it decide ('stillCurrent'): a
+    -- residency-only change keeps a preparation's coherent copies
+    stale prep basis = basisStamp (prepBasis prep) /= basisStamp basis
 
 -- The basis a preparation starts from, read outside any commit: what its inputs need (the geometry, the arena's
 -- revisions) and the stamps they were read at, in one transaction. Commits compare the stamps alone.
@@ -1631,8 +1673,10 @@ currentBasis service vs = do
   stamp ← basisStampOf vs
   pure (Basis intent geometry ((\a → (Runtime.viewIncarnation a, viewRevision a, viewKnowledgeRevision a)) <$> arena) stamp)
 
-currentResidency ∷ TerrainViews k → ViewState k → STM (Maybe Word64)
-currentResidency service vs = fmap (fromIntegral . viewGeneration) <$> Runtime.inspectArenaSTM (portTerrain (svPorts service)) (vsLease vs)
+-- Whether the view's arena stands live for it: its own lease, and the arena's mark cell (which its writer empties once
+-- the arena ends). Existence only; nothing of the arena is read.
+arenaLive ∷ TerrainViews k → ViewState k → STM Bool
+arenaLive service vs = (&&) <$> Runtime.leaseLiveSTM (portTerrain (svPorts service)) (vsLease vs) <*> (isJust <$> vsMarkCell vs)
 
 -- A published revision whose chunk failed its upload can never draw: its parts are dropped, so the accepted revision
 -- is no longer valid (it lists more parts than are left) and the view prepares again.
@@ -1679,7 +1723,7 @@ demandDue service vs = do
   usable ← surfaceUsable (vtSurface (vsTarget vs))
   authority ← authorityOf vs
   -- the lease and its arena as their writers keep them: the lease live, the arena's mark present
-  arena ← (&&) <$> Runtime.leaseLiveSTM (portTerrain (svPorts service)) (vsLease vs) <*> (isJust <$> vsMarkCell vs)
+  arena ← arenaLive service vs
   gone ← ownerEnded (portOwner (svPorts service))
   geometry ← surfaceGeometry (vtSurface (vsTarget vs))
   accepted ← readTVar (vsPublished vs)
@@ -1984,7 +2028,7 @@ liveWitness service vs =
   Witness
     <$> stampsOf service vs
     <*> authorityOf vs
-    <*> (isJust <$> Runtime.inspectArenaSTM (portTerrain (svPorts service)) (vsLease vs))
+    <*> arenaLive service vs
     <*> currentBasis service vs
 
 -- | Whether a witness finds the work of this stage serial and basis current (and, for work that settles a move, the
@@ -1999,7 +2043,7 @@ currentBy serial basis jump witness =
     && stampUsable stamps
     && witnessAuthority witness
     && witnessArena witness
-    && witnessBasis witness == basis
+    && basisStamp (witnessBasis witness) == basisStamp basis
     && maybe True (== stampPending stamps) jump
   where
     stamps = witnessStamps witness
@@ -2208,7 +2252,9 @@ settleWith service vs serial prep inputs =
                   -- a drawable footprint that reads nothing: the planner's own empty plan (readiness-only copies draw nothing)
                   (Just metrics, _)
                     | null (prepFootprint prep) → do
-                        residency ← own (currentResidency service vs)
+                        -- the residency generation the basis was captured at, as its stamp holds it (the commit checks
+                        -- that stamp); nothing is projected from a freshly read arena
+                        let residency = stampGeneration (basisStamp basis)
                         case basisArena basis of
                           Nothing → False <$ discardStale service vs serial
                           Just (arena, content, knowledge) → do
@@ -2731,7 +2777,9 @@ publish service vs serial prep candidate = do
       chunks = map partChunk (Map.elems parts)
       material = ownerMaterial (portOwner ports)
       plan = cdPlan candidate
-  revision ← atomically (stateTVar (vsNextRevision vs) (\r → (r, r + 1)))
+  -- the prospective tag: read for the scene's preparation, and taken only by the commit that publishes it (a refused,
+  -- pin-blocked or overtaken attempt consumes none)
+  revision ← readTVarIO (vsNextRevision vs)
   case terrainView plan (cdAdapted candidate) [(material, MaterialData [] (adaptedPush (cdAdapted candidate)))] [WorldLayerWith DepthEnabled chunks []] of
     Left why → False <$ commit (refuse service vs serial (prepBasis prep) (LimitFailure ("the view could not be made: " <> Text.pack (show why))))
     Right view → do
@@ -2750,7 +2798,8 @@ publish service vs serial prep candidate = do
           keep ← pinsKept service vs
           live ← stillCurrent service vs serial (prepBasis prep) Nothing
           claim ← claimOf (portClaims ports) (vtKey (vsTarget vs))
-          pure (keep, live, fmap claimView claim == Just (vsId vs))
+          tagged ← (== revision) <$> readTVar (vsNextRevision vs)
+          pure (keep, live && tagged, fmap claimView claim == Just (vsId vs))
         if
           | not live || not mine →
               -- overtaken: the private builds go, and the newer state is prepared next
@@ -2786,6 +2835,8 @@ publish service vs serial prep candidate = do
                   if not published
                     then False <$ refuse service vs serial (prepBasis prep) (LimitFailure "the host refused the publication")
                     else own $ do
+                      -- the tag is taken with the publication that carries it
+                      writeTVar (vsNextRevision vs) (revision + 1)
                       _ ← markClaimPublished (portClaims ports) (vtKey (vsTarget vs)) (vsId vs)
                       old ← readTVar (vsParts vs)
                       let superseded = [partChunk part | (key, part) ← Map.toList old, Map.notMember key (cdReused candidate)]

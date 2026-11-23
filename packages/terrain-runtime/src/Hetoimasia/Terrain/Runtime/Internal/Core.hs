@@ -1221,9 +1221,10 @@ setViewDemandSTM svc (View tag vid) lease demands =
             | not (leaseLive ls) → pure (Left RefusedAuthority)
             | otherwise → do
                 outcome <- applyEvent svc (R.SetCameraDemand vid (leaseArena ls) demands)
-                modifySt svc (\cur → cur {stateDispatchIdle = False})
                 case outcome of
                   Right report → do
+                    -- only an accepted demand wakes dispatch; a refusal writes nothing
+                    modifySt svc (\cur → cur {stateDispatchIdle = False})
                     let given = fromMaybe (DemandReceipt [] [] [] [] []) (receipt (R.reportDecision report))
                         described = Set.size (Set.fromList (receiptAdmitted given <> receiptPending given))
                     modifySt svc (\cur → cur {stateWork = (stateWork cur) {rwViews = (if described == 0 then Map.delete vid else Map.insert vid (fromIntegral described)) (rwViews (stateWork cur))}})

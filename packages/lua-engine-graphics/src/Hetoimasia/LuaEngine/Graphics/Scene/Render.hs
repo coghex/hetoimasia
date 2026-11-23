@@ -57,6 +57,7 @@ module Hetoimasia.LuaEngine.Graphics.Scene.Render
 import Control.Concurrent.STM (TVar, atomically, newTVarIO, readTVarIO, writeTVar)
 import qualified Data.Map.Strict as Map
 import Data.Functor ((<&>))
+import Hetoimasia.Foundation.Messaging.Payload (prepare)
 import Data.List.NonEmpty (NonEmpty)
 import qualified Data.Set as Set
 import qualified Data.Text as Text
@@ -171,9 +172,11 @@ readRenderSlot (RenderSlot var) = readTVarIO var
 sceneRenderer ∷ DrawReceipts → RenderSlot → VulkanRenderer GraphicsScene
 sceneRenderer receipts slot = VulkanRenderer $ \scene request construction recorder → do
   let SurfaceExtent width height = requestExtent request
+  -- the frame's metrics prepared before the transaction that notes them
+  framed ← traverse prepare (either (const Nothing) Just (frameMetrics (FrameFacts (width, height) (requestLogicalExtent request) (requestContentScale request))))
   atomically $ do
     noteUnrecorded receipts (requestAttachment request) (requestFrame request)
-    either (const (pure ())) (noteFrameMetrics receipts (requestAttachment request)) (frameMetrics (FrameFacts (width, height) (requestLogicalExtent request) (requestContentScale request)))
+    mapM_ (noteFrameMetrics receipts (requestAttachment request)) framed
   readRenderSlot slot >>= \case
     Nothing → pure (Left (RefusedIllegal "the scene renderer has no session yet, so the frame is skipped"))
     Just session → case graphicsWorld scene of
@@ -233,7 +236,7 @@ renderWorldFrame session receipts builders world request recorder =
     (Left skip, _) → pure (Left (RefusedIllegal (Text.pack ("the frame is skipped: " <> show skip))))
     (_, Nothing) → pure (Left (RefusedIllegal "the world frame is skipped: the target supplied no depth image"))
     (Right metrics, Just depth) → do
-      atomically (noteRecorded receipts (requestAttachment request) (requestFrame request) (worldTag world) metrics)
+      atomically . noteRecorded receipts (requestAttachment request) (requestFrame request) (worldTag world) =<< prepare metrics
       recordWorld session builders (worldSnapshot world) world recorder $ \valid marks buffers →
         FrameInput
           { frameSnapshot = valid

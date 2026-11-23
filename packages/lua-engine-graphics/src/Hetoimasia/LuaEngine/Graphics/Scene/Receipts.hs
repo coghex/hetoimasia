@@ -77,6 +77,7 @@ import qualified Data.Sequence as Seq
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Word (Word64)
+import Hetoimasia.Foundation.Messaging.Payload (Prepared, preparedValue)
 import Hetoimasia.GPU.Model.Identity (FrameSlotId)
 import Hetoimasia.GPU.Vulkan.GLFW (BatchTicket, FrameEvent (..), FrameObserver, TicketState (..), readTicket)
 import Hetoimasia.LuaEngine.Graphics.Scene.World (WorldTag (..))
@@ -93,10 +94,16 @@ data Drawn = Drawn
   }
   deriving (Eq, Show)
 
+-- What a recorded frame will have drawn: stored evaluated, its metrics prepared by the writer.
+data Recorded = Recorded !WorldTag !TargetMetrics
+
+-- An offscreen batch noted for promotion: stored evaluated, its metrics prepared by the writer.
+data Noted = Noted !BatchTicket !WorldTag !TargetMetrics
+
 -- | The session's receipts.
 data DrawReceipts = DrawReceipts
-  { receiptsRecorded ∷ !(TVar (Map (AttachmentId, FrameSlotId) (WorldTag, TargetMetrics)))
-  , receiptsOffscreen ∷ !(TVar (Seq (BatchTicket, WorldTag, TargetMetrics)))
+  { receiptsRecorded ∷ !(TVar (Map (AttachmentId, FrameSlotId) Recorded))
+  , receiptsOffscreen ∷ !(TVar (Seq Noted))
     -- ^ Offscreen batches noted and not yet settled, in the order they were noted.
   , receiptsDrawn ∷ !(TVar (Map Word64 Drawn))
   , receiptsLive ∷ !(TVar (Set Word64))
@@ -131,16 +138,17 @@ forgetReceipt ∷ DrawReceipts → Word64 → STM ()
 forgetReceipt receipts view = do
   modifyTVar' (receiptsLive receipts) (Set.delete view)
   modifyTVar' (receiptsDrawn receipts) (Map.delete view)
-  modifyTVar' (receiptsRecorded receipts) (Map.filter (\(tag, _) → tagView tag /= view))
-  modifyTVar' (receiptsOffscreen receipts) (Seq.filter (\(_, tag, _) → tagView tag /= view))
+  modifyTVar' (receiptsRecorded receipts) (Map.filter (\(Recorded tag _) → tagView tag /= view))
+  modifyTVar' (receiptsOffscreen receipts) (Seq.filter (\(Noted _ tag _) → tagView tag /= view))
 
 -- | A frame of a world scene was recorded for this attachment and slot: what it will have drawn if its presentation
--- is enqueued. Called by the renderer on the graphics owner's thread.
-noteRecorded ∷ DrawReceipts → AttachmentId → FrameSlotId → WorldTag → TargetMetrics → STM ()
+-- is enqueued. Called by the renderer on the graphics owner's thread, with the metrics prepared (evaluated in full) before
+-- its transaction: no later promotion, sweep or pin lookup is the first to evaluate them.
+noteRecorded ∷ DrawReceipts → AttachmentId → FrameSlotId → WorldTag → Prepared TargetMetrics → STM ()
 noteRecorded receipts attachment slot tag metrics = do
   live ← Set.member (tagView tag) <$> readTVar (receiptsLive receipts)
   if live
-    then modifyTVar' (receiptsRecorded receipts) (Map.insert (attachment, slot) (tag, metrics))
+    then modifyTVar' (receiptsRecorded receipts) (Map.insert (attachment, slot) (Recorded tag (preparedValue metrics)))
     else noteUnrecorded receipts attachment slot
 
 -- | A frame of anything but a live view's world scene was recorded for this attachment and slot: it draws nothing a
@@ -149,11 +157,13 @@ noteUnrecorded ∷ DrawReceipts → AttachmentId → FrameSlotId → STM ()
 noteUnrecorded receipts attachment slot = modifyTVar' (receiptsRecorded receipts) (Map.delete (attachment, slot))
 
 -- | A batch recording this revision into a registered offscreen target, noted by the owner action that recorded it,
--- with the reading of its ticket. It is promoted once the batch is complete.
-noteOffscreenBatch ∷ DrawReceipts → BatchTicket → WorldTag → TargetMetrics → STM ()
+-- with the reading of its ticket and its metrics prepared. It is promoted once the batch is complete.
+noteOffscreenBatch ∷ DrawReceipts → BatchTicket → WorldTag → Prepared TargetMetrics → STM ()
 noteOffscreenBatch receipts ticket tag metrics = do
   live ← Set.member (tagView tag) <$> readTVar (receiptsLive receipts)
-  when live (modifyTVar' (receiptsOffscreen receipts) (|> (ticket, tag, metrics)))
+  when live $ do
+    let !noted = Noted ticket tag (preparedValue metrics)
+    modifyTVar' (receiptsOffscreen receipts) (|> noted)
 
 -- | Promote the offscreen batches noted so far, in their order: a complete batch advances its view's receipt, a
 -- discarded or lost one is dropped, and the first one still pending holds back the later ones of its view. Answers
@@ -167,12 +177,12 @@ sweepOffscreen receipts = do
   pure changed
   where
     go _ kept [] = pure kept
-    go held kept (entry@(ticket, tag, metrics) : rest)
+    go held kept (entry@(Noted ticket tag metrics) : rest)
       | Set.member (tagView tag) held = go held (kept |> entry) rest
       | otherwise =
           readTicket ticket >>= \case
             TicketPending → go (Set.insert (tagView tag) held) (kept |> entry) rest
-            TicketComplete → noteSubmitted receipts tag metrics >> go held kept rest
+            TicketComplete → submitted receipts tag metrics >> go held kept rest
             _ → go held kept rest
 
 -- | Whether 'sweepOffscreen' would note or drop any batch now, read-only: a view's first pending batch whose ticket has
@@ -181,16 +191,21 @@ offscreenSweepDue ∷ DrawReceipts → STM Bool
 offscreenSweepDue receipts = readTVar (receiptsOffscreen receipts) >>= go Set.empty . foldr (:) []
   where
     go _ [] = pure False
-    go held ((ticket, tag, _) : rest)
+    go held (Noted ticket tag _ : rest)
       | Set.member (tagView tag) held = go held rest
       | otherwise =
           readTicket ticket >>= \case
             TicketPending → go (Set.insert (tagView tag) held) rest
             _ → pure True
 
--- | A batch that drew this revision is known to have been submitted (a host stepped by a test says so directly).
-noteSubmitted ∷ DrawReceipts → WorldTag → TargetMetrics → STM ()
-noteSubmitted receipts tag metrics = do
+-- | A batch that drew this revision is known to have been submitted (a host stepped by a test says so directly), with
+-- its metrics prepared.
+noteSubmitted ∷ DrawReceipts → WorldTag → Prepared TargetMetrics → STM ()
+noteSubmitted receipts tag = submitted receipts tag . preparedValue
+
+-- The receipt advances: the metrics are a value a writer prepared, and the entry is stored evaluated.
+submitted ∷ DrawReceipts → WorldTag → TargetMetrics → STM ()
+submitted receipts tag metrics = do
   live ← Set.member (tagView tag) <$> readTVar (receiptsLive receipts)
   when live $ do
     drawn ← readTVar (receiptsDrawn receipts)
@@ -205,9 +220,9 @@ receiptObserver receipts event = atomically $ do
   presented ← case event of
     FramePresented attachment slot _ _ → do
       recorded ← readTVar (receiptsRecorded receipts)
-      for_ (Map.lookup (attachment, slot) recorded) $ \(tag, metrics) → do
+      for_ (Map.lookup (attachment, slot) recorded) $ \(Recorded tag metrics) → do
         writeTVar (receiptsRecorded receipts) (Map.delete (attachment, slot) recorded)
-        noteSubmitted receipts tag metrics
+        submitted receipts tag metrics
       pure True
     FrameAbandoned attachment slot _ → False <$ modifyTVar' (receiptsRecorded receipts) (Map.delete (attachment, slot))
     _ → pure False
@@ -229,15 +244,17 @@ unwatchFrameMetrics receipts attachment = modifyTVar' (receiptsWatched receipts)
 
 -- | A frame of this window attachment is recorded with these metrics: written only when they change. Beyond
 -- 'metricsKept' unwatched attachments, the least recently drawn one's are forgotten.
-noteFrameMetrics ∷ DrawReceipts → AttachmentId → TargetMetrics → STM ()
-noteFrameMetrics receipts attachment metrics = do
+noteFrameMetrics ∷ DrawReceipts → AttachmentId → Prepared TargetMetrics → STM ()
+noteFrameMetrics receipts attachment prepared = do
+  let metrics = preparedValue prepared
   held ← readTVar (receiptsMetrics receipts)
   case Map.lookup attachment held of
     Just (same, _) | same == metrics → pure ()
     _ → do
       now ← stateTVar (receiptsClock receipts) (\t → (t, t + 1))
       watched ← readTVar (receiptsWatched receipts)
-      let updated = Map.insert attachment (metrics, now) held
+      let !entry = (metrics, now)
+          updated = Map.insert attachment entry held
           unwatched = [(at, a) | (a, (_, at)) ← Map.toList updated, Map.notMember a watched]
           evicted
             | length unwatched > metricsKept = maybe updated (\(_, a) → Map.delete a updated) (minimumMaybe unwatched)

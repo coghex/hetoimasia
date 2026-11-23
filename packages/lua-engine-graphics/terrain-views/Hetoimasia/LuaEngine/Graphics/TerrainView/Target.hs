@@ -13,6 +13,7 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView.Target
   ) where
 
 import Control.Concurrent.STM (atomically)
+import Hetoimasia.Foundation.Messaging.Payload (prepare)
 import Hetoimasia.Foundation.OwnerTx (commit)
 import Data.Functor ((<&>))
 import Data.Text (Text)
@@ -102,7 +103,7 @@ drawOffscreenView host graphics receipts target metrics image format depth after
                     Right () → Right (worldTag world)
         -- on the owner's thread, before the action returns and its batch is submitted
         case recorded of
-          Right (batch, Right tag) → atomically (noteOffscreenBatch receipts batch tag metrics)
+          Right (batch, Right tag) → atomically . noteOffscreenBatch receipts batch tag =<< prepare metrics
           _ → pure ()
         pure recorded
   commit (submitVulkanActionTx host action) >>= \case

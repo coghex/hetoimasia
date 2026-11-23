@@ -85,6 +85,7 @@ import Test.Support.Owned (withOwnedThread)
 import Hetoimasia.GLFW.Window (Attribute (..), ContentScale (..), Extent (..))
 import Hetoimasia.LuaEngine.Graphics.Window.Host (WindowGeometry (..), geometryOfAttributes)
 import Control.Exception (IOException, AsyncException (ThreadKilled), ErrorCall (ErrorCall), Exception (displayException), ExceptionWithContext (ExceptionWithContext), SomeException, finally, rethrowIO, throw, throwIO, toException, try, tryWithContext)
+import Control.Exception.Context (emptyExceptionContext)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import System.Timeout (timeout)
 
@@ -898,7 +899,7 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         let check' = do
               runOwner rig
               world ← atomically (latestWorld target) >>= maybe (fail "no world") pure
-              atomically (noteSubmitted (rigReceipts rig) (worldTag world) (worldMetrics world))
+              atomically . noteSubmitted (rigReceipts rig) (worldTag world) =<< prepare (worldMetrics world)
               drawn ← atomically (viewDrawn view) >>= maybe (fail "nothing drawn") pure
               plan ← maybe (fail "the drawn plan is not pinned") pure (drawnPlanPlan drawn)
               independent ← independentPlan rig drawn
@@ -926,7 +927,7 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         adopt rig target
         atomically (readingDrawn <$> readView view) `shouldReturn` Nothing
         world ← atomically (latestWorld target) >>= maybe (fail "no world") pure
-        atomically (noteSubmitted (rigReceipts rig) (worldTag world) (worldMetrics world))
+        atomically . noteSubmitted (rigReceipts rig) (worldTag world) =<< prepare (worldMetrics world)
         drawn ← atomically (viewDrawn view) >>= maybe (fail "nothing drawn") pure
         drawnTag (drawnPlanReceipt drawn) `shouldBe` worldTag world
         drawnPlanTarget drawn `shouldBe` 1
@@ -1372,7 +1373,7 @@ spec = describe "terrain views (TRA-9 v2)" $ do
       withPublished defaultOptions $ \rig target view → do
         first ← atomically (latestWorld target) >>= maybe (fail "no world") pure
         adopt rig target
-        atomically (noteSubmitted (rigReceipts rig) (worldTag first) (worldMetrics first))
+        atomically . noteSubmitted (rigReceipts rig) (worldTag first) =<< prepare (worldMetrics first)
         configureNow view (noConfigure {configureLight = Just brighter}) `shouldReturn` Right ()
         settleUntil rig (publishedAtLeast view 2)
         second ← atomically (latestWorld target) >>= maybe (fail "no world") pure
@@ -1382,12 +1383,14 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         runOwner rig
         atomically (readingPublished <$> readView view) `shouldReturn` Just (tagRevision (worldTag second))
         -- a frame draws the adopted successor: its plan is still pinned, and the third revision follows
-        atomically (noteSubmitted (rigReceipts rig) (worldTag second) (worldMetrics second))
+        atomically . noteSubmitted (rigReceipts rig) (worldTag second) =<< prepare (worldMetrics second)
         drawn ← atomically (viewDrawn view) >>= maybe (fail "nothing drawn") pure
         drawnTag (drawnPlanReceipt drawn) `shouldBe` worldTag second
         isJust (drawnPlanPlan drawn) `shouldBe` True
         commit (kick (rigViews rig))
         settleUntil rig (publishedAtLeast view (tagRevision (worldTag second) + 1))
+        -- the attempts the pins held back took no tag: the third revision carries the next one
+        atomically (readingPublished <$> readView view) `shouldReturn` Just (tagRevision (worldTag second) + 1)
         again ← atomically (viewDrawn view) >>= maybe (fail "nothing drawn") pure
         isJust (drawnPlanPlan again) `shouldBe` True
 
@@ -1396,7 +1399,7 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         world ← atomically (latestWorld target) >>= maybe (fail "no world") pure
         -- the batches are the backend's own, their tickets read through its reader
         let receipts = rigReceipts rig
-            note batch = atomically (noteOffscreenBatch receipts batch (worldTag world) (worldMetrics world))
+            note batch = atomically . noteOffscreenBatch receipts batch (worldTag world) =<< prepare (worldMetrics world)
         discardedBatch standIn >>= note
         atomically (readingDrawn <$> readView view) `shouldReturn` Nothing
         submittedBatch standIn >>= note
@@ -1406,7 +1409,7 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         submittedBatch standIn >>= note
         _ ← closeView view
         completeBatches standIn
-        atomically (noteSubmitted receipts (worldTag world) (worldMetrics world))
+        atomically . noteSubmitted receipts (worldTag world) =<< prepare (worldMetrics world)
         _ ← atomically (sweepOffscreen receipts)
         atomically (readReceipt receipts (viewIncarnation view)) `shouldReturn` Nothing
 
@@ -2515,6 +2518,22 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         atomically (inspectViewCountSTM (rigTerrain rig)) `shouldReturn` 1
         readTVarIO (rigStyleReleases rig) `shouldReturn` releases + 1
 
+    it "latches a step's terminal exit before a competing kick could replace its ticket: the owner ends with it, and nothing more is queued" $
+      withPublished defaultOptions $ \rig target view → do
+        quiesce rig target
+        let views = rigViews rig
+        commit (kick views)
+        (_, outcome) ←
+          timeout 10000000 (atomically (Seq.viewl <$> readTVar (rigQueue rig) >>= \case
+            next Seq.:< rest → next <$ writeTVar (rigQueue rig) rest
+            Seq.EmptyL → retry)) >>= maybe (fail "no step was asked for") pure
+        -- in one commit, before any watcher reads it: the step's ticket answers a cancellation, and a kick follows
+        commit $ do
+          fromIssuerSTM (writeTVar outcome (Just (StepExit (Exit.Cancelled (ExceptionWithContext emptyExceptionContext (toException ThreadKilled))))))
+          kick views
+        atomically (Seq.length <$> readTVar (rigQueue rig)) `shouldReturn` 0
+        eventually ((== ViewEnded EndStopped) . readingStatus <$> readView view)
+
     it "admits one step when a competing kick lands between a wait that found a step due and its admitting commit" $
       withPublished defaultOptions $ \rig target _ → do
         quiesce rig target
@@ -2714,6 +2733,9 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         settleUntil rig (null . readingDemand <$> readView view)
         heldMetrics (targetHeld target) (Just (metricsOf 320 240))
         settleUntil rig ((== asked) . readingDemand <$> readView view)
+        -- settled, so a successor could have published: back at the accepted metrics, the accepted drawing is the
+        -- basis's, and none does
+        quiesce rig target
         atomically (readingPublished <$> readView view) `shouldReturn` published
 
     it "reads a window's observed geometry as the views do: zero, unknown and a complete extent" $ do
@@ -2733,6 +2755,16 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         style ← styleOf rig
         refused ← openView (rigViews rig) (OpenRequest (viewTarget target) (rigLease rig) (pure (Right style)) (axis 0, axis 0, axis 1) defaultLightSettings)
         either Just (const Nothing) refused `shouldBe` Just OpenStopped
+
+    it "refuses an open once the owner's exit has begun, though no view is left for the watcher to end" $
+      withRig defaultOptions $ \rig → do
+        -- no view: the watcher records nothing, and the open's own commit reads the owner's terminal fact
+        endRigOwner rig "its exit began"
+        target ← newTarget 1
+        style ← styleOf rig
+        refused ← openView (rigViews rig) (OpenRequest (viewTarget target) (rigLease rig) (pure (Right style)) (axis 0, axis 0, axis 1) defaultLightSettings)
+        either Just (const Nothing) refused `shouldBe` Just OpenStopped
+        atomically (inspectViewCountSTM (rigTerrain rig)) `shouldReturn` 0
 
     it "ends a refused barrier's retirement with the host's cause, and the service still drains" $
       withPublished defaultOptions $ \rig target view → do
@@ -2957,7 +2989,7 @@ far = JumpTarget (axis 192) (axis 192) Nothing
 drawLatest ∷ Rig → Target → TerrainView Int → IO (DrawnPlan Int)
 drawLatest rig target view = do
   world ← atomically (latestWorld target) >>= maybe (fail "no world") pure
-  atomically (noteSubmitted (rigReceipts rig) (worldTag world) (worldMetrics world))
+  atomically . noteSubmitted (rigReceipts rig) (worldTag world) =<< prepare (worldMetrics world)
   atomically (viewDrawn view) >>= maybe (fail "nothing drawn") pure
 
 -- The plan the planner makes from fresh copies of the drawn plan's regions, at its camera and metrics: what the view
