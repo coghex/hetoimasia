@@ -49,6 +49,7 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView.Session
   , withTerrainViews
   , stepOwner
   , kick
+  , Admitter (..)
   , admitDue
   , ledgerNoticed
 
@@ -753,15 +754,13 @@ watch service stopping = loop
       swept ← offscreenSweepDue (portReceipts (svPorts service))
       askable ← barriersDue service
       queued ← stepQueued service
-      let wanting = (||) <$> readTVar (svKickWanted service) <*> stepRefusedForNow service
-          stepDue = (||) <$> wanting <*> retirementReady service
-      wanted ← if queued then pure False else stepDue
+      wanted ← if queued then pure False else watcherDue service
       admits ← ownerAdmits (portOwner (svPorts service))
       if
         | noticed || swept → pure (commit (own ((||) <$> notice service <*> sweepOffscreen (portReceipts (svPorts service))) >>= \moved → when moved (kick service)))
         | askable → pure (commit (askBarriers service >>= \asked → when asked (kick service)))
         -- the decision is taken again in the admitting commit
-        | wanted && admits → pure (void (commit (admitDue service stepDue)))
+        | wanted && admits → pure (void (commit (admitDue service WatcherAdmits)))
         | otherwise → retry
 
 -- Each open view's marks as the watcher compares them, with whether its armed candidate can go on and what the
@@ -872,14 +871,39 @@ kick service = do
   (queued, ended) ← own ((,) <$> stepQueued service <*> readTVar (svEnded service))
   unless (queued || isJust ended) (void (admit service))
 
--- | Admit one step if, in this commit, none is queued, the owner has not ended, and the work its waiter found is still
--- due: a waiter decides to admit outside any commit, and a kick may have queued a step before its commit. Never two
--- queued steps.
-admitDue ∷ (Ord k, Show k) ⇒ TerrainViews k → STM Bool → OwnerTx Bool
-admitDue service due =
-  own ((,,) <$> stepQueued service <*> readTVar (svEnded service) <*> due) >>= \case
-    (False, Nothing, True) → admit service
-    _ → pure False
+-- | The waits that admit a step, outside any commit: the watcher, and the drain of the views' retirements.
+data Admitter = WatcherAdmits | DrainAdmits
+  deriving (Eq, Show)
+
+-- | Admit one step if, in this commit, the waiter's own decision still holds: a waiter decides to admit outside any
+-- commit, and a kick may have queued (and the owner started) a step before its commit. The owner must not have ended,
+-- and the waiter's work must still be due. The watcher admits behind a running step but never beside a queued one; the
+-- drain admits only when no step is queued or running, so the step 'svStep' tracks is never overwritten while it runs.
+admitDue ∷ (Ord k, Show k) ⇒ TerrainViews k → Admitter → OwnerTx Bool
+admitDue service admitter =
+  own decision >>= \case
+    True → admit service
+    False → pure False
+  where
+    decision = do
+      ended ← isJust <$> readTVar (svEnded service)
+      case admitter of
+        WatcherAdmits → do
+          queued ← stepQueued service
+          due ← watcherDue service
+          pure (not ended && not queued && due)
+        DrainAdmits → do
+          unsettled ← stepUnsettled service
+          due ← drainDue service
+          pure (not ended && not unsettled && due)
+
+-- What the watcher admits a step for: a kick kept wanted, a step refused for now, or retirement work ready.
+watcherDue ∷ Ord k ⇒ TerrainViews k → STM Bool
+watcherDue service = or <$> sequence [readTVar (svKickWanted service), stepRefusedForNow service, retirementReady service]
+
+-- What the drain admits a step for: retirement work ready, or a step refused for now.
+drainDue ∷ Ord k ⇒ TerrainViews k → STM Bool
+drainDue service = (||) <$> retirementReady service <*> stepRefusedForNow service
 
 -- Admit one step, through the owner's own admission. Answers whether anything changed: a step admitted, or the owner
 -- found ended (a full queue or a device not yet ready leaves the kick wanted, for the watcher to admit once the queue
@@ -993,7 +1017,7 @@ shutdown service = do
               | otherwise → do
                   sweepable ← anySealed service
                   askable ← barriersDue service
-                  ready ← (||) <$> retirementReady service <*> stepRefusedForNow service
+                  ready ← drainDue service
                   admits ← ownerAdmits (portOwner (svPorts service))
                   if
                     | sweepable → pure DrainAgain
@@ -1013,7 +1037,7 @@ shutdown service = do
           unless closed drain
         DrainAgain → drain
         DrainBarriers → commit (askBarriers service) >> drain
-        DrainAdmit → commit (admitDue service ((||) <$> retirementReady service <*> stepRefusedForNow service)) >> drain
+        DrainAdmit → commit (admitDue service DrainAdmits) >> drain
 
 -- What the drain's wait found due.
 data Drain = DrainAbandon | DrainHandOff | DrainFinish | DrainAgain | DrainBarriers | DrainAdmit
@@ -1843,8 +1867,8 @@ stillCurrent service vs serial basis jump = currentBy serial basis jump <$> live
 
 -- | The writer-maintained stamps a view's work rests on: the identities and revisions its writers advance, read as they
 -- stand and computed from nothing: the stage's serial, the view's and the service's lifecycle, the owner's gate, the
--- target's standing and its facts' version, each original authority's mark, the arena's mark, the view's intent
--- revision and the camera's pending jump. Strict: equal stamps, read in two transactions, mean none of them changed
+-- target's standing, the view's own arena lease's liveness, each original authority's mark, the target's facts'
+-- version, the arena's mark, the view's intent revision and the camera's pending jump. Strict: equal stamps, read in two transactions, mean none of them changed
 -- between them, a change made and undone included. A build's collection compares only these.
 data Stamps = Stamps
   { stampSerial ∷ !Word64
@@ -1853,8 +1877,10 @@ data Stamps = Stamps
   , stampEnded ∷ !Bool
   , stampGone ∷ !Bool
   , stampUsable ∷ !Bool
+  , _stampLease ∷ !Bool
+    -- ^ The view's own arena lease, live: the arena's mark says nothing of it. This and the next four are compared only
+    -- as part of the whole.
   , _stampAuthorities ∷ ![AuthorityMark]
-    -- ^ This and the next three are compared only as part of the whole.
   , _stampFacts ∷ !SurfaceVersion
   , _stampArena ∷ !(Maybe ArenaMark)
   , _stampIntent ∷ !Word64
@@ -1874,6 +1900,7 @@ stampsOf service vs =
     -- the graphics owner's own gate, live: work an owner step carries past its exit's start is stale
     <*> (isJust <$> ownerEnded (portOwner (svPorts service)))
     <*> surfaceUsable (vtSurface (vsTarget vs))
+    <*> Runtime.leaseLiveSTM (portTerrain (svPorts service)) (vsLease vs)
     <*> authorityRevisions vs
     <*> surfaceVersion (vtSurface (vsTarget vs))
     <*> vsMarkCell vs

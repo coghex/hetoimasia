@@ -165,6 +165,7 @@ module Hetoimasia.Terrain.Runtime
   , inspectModel
   , inspectModelSTM
   , inspectViewCountSTM
+  , leaseLiveSTM
   , inspectDefects
   , inspectSnapshotBytes
   , inspectRetainedChargesSTM
@@ -1044,6 +1045,11 @@ arenaMarkSTM svc lease = do
                 writeTVar (serviceArenaMarks svc) (Map.insert (leaseArena ls) cell cells)
                 pure cell
             pure (Right (readTVar cell))
+
+-- | Whether this exact lease is live, as the service keeps it: read-only, and never waiting. A lease, once released,
+-- closed or ended, is never live again, whatever happens to its arena.
+leaseLiveSTM ∷ Service → ArenaLease → STM Bool
+leaseLiveSTM svc lease = either (const False) (leaseLive . snd) . leaseOf svc lease <$> readSt svc
 
 inspectArenaSTM ∷ Service → ArenaLease → STM (Maybe ArenaView)
 inspectArenaSTM svc lease = do

@@ -89,13 +89,12 @@ import Hetoimasia.GPU.Model
   , silentEvidence
   )
 import Hetoimasia.GPU.Model.Identity (AllocationId, GenerationId, HoldSubject)
+import Hetoimasia.GPU.Vulkan.Native.Internal.Roots (SubjectDisposer (..), readRootsDisposers)
 import Hetoimasia.GPU.Vulkan.Native.Roots
   ( GraphicsDeviceLost
   , reclaimRoots
   , NativeFailure (..)
   , Roots
-  , SubjectDisposer (..)
-  , readRootsDisposers
   , rootsNativeFailure
   , stateRootsModel
   )

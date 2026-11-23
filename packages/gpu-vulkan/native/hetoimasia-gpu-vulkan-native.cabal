@@ -146,6 +146,7 @@ library
         Hetoimasia.GPU.Vulkan.Native.Internal.Frames.State
         Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Submission
         Hetoimasia.GPU.Vulkan.Native.Internal.Reclamation
+        Hetoimasia.GPU.Vulkan.Native.Internal.Roots
         Hetoimasia.GPU.Vulkan.Native.Internal.Generations.Disposal
         Hetoimasia.GPU.Vulkan.Native.Internal.Generations.Observation
         Hetoimasia.GPU.Vulkan.Native.Internal.Generations.Reconciliation

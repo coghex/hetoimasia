@@ -61,14 +61,13 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Generations.State
   , makeGenerations
   , releaseGenerationDepth
   )
+import Hetoimasia.GPU.Vulkan.Native.Internal.Roots (SubjectDisposer (..), registerRootsDisposer)
 import Hetoimasia.GPU.Vulkan.Native.Roots
   ( GenerationOps (..)
   , deliverAfterRecord
   , diagnosisOf
   , Roots
-  , SubjectDisposer (..)
   , failRootsSessionBecause
-  , registerRootsDisposer
   , readRootsDevice
   , rootsCall
   , rootsGenerationOps

@@ -163,6 +163,8 @@ data Rig = Rig
     -- ^ When set: the next held copy fails here, once taken (an accounting fault lasts until the example clears it).
   , rigClaimRaises ∷ !(TVar Bool)
     -- ^ While set: claiming a receipt raises, in the claiming transaction.
+  , rigClient ∷ !Client
+    -- ^ The views' terrain client, whose leases a view may be opened under.
   }
 
 -- Where a held copy fails: in the IO right after its borrow is taken (raising, or waiting there, having said so, for
@@ -383,7 +385,7 @@ withRig options body =
                      forM_ native settleNative
                      loop
                loop
-             rig views = Rig views terrain lease queue queueOpen lane laneCapacity standings chunks disposed attempts buildFailure disposeFailure next ledger claims receipts ownerEnded style account deferDisposal pendingDisposals hold entered resume styleReleases unavailable admission admitBudget grants uploading demandRefused buildAttempts failNext raising raiseSealed receiptNext registry afterSeal fault countGate native beforeCollect requested copyFault claimRaises
+             rig views = Rig views terrain lease queue queueOpen lane laneCapacity standings chunks disposed attempts buildFailure disposeFailure next ledger claims receipts ownerEnded style account deferDisposal pendingDisposals hold entered resume styleReleases unavailable admission admitBudget grants uploading demandRefused buildAttempts failNext raising raiseSealed receiptNext registry afterSeal fault countGate native beforeCollect requested copyFault claimRaises client
              fakeHands = stepHands (rig (error "the teardown's hands read no service"))
          withOwnedThread (when (optTeardown options /= TeardownNone) teardown) $ \_ _ →
            withTerrainViews (configOf options) ports $ \views →
@@ -2512,8 +2514,53 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         commit (kick views)
         atomically (Seq.length <$> readTVar (rigQueue rig)) `shouldReturn` 1
         -- the admitting commit decides again: that step is queued, so it admits nothing
-        commit (admitDue views (pure True)) `shouldReturn` False
+        commit (admitDue views WatcherAdmits) `shouldReturn` False
         atomically (Seq.length <$> readTVar (rigQueue rig)) `shouldReturn` 1
+        quiesce rig target
+
+    it "retires a build privately, once, when the view's own arena lease is released after its revalidation and before its collection while another lease keeps the arena live" $
+      withRig defaultOptions {optProfile = smallProfile {profileSlots = 4, profileQuads = 2048}} $ \rig → do
+        let reading = readTerrainViews (rigViews rig)
+        target ← newTarget 1
+        -- an attached lease of the same arena: the rig's owner lease keeps the arena live when it is released
+        attached ← attachArena (rigTerrain rig) (rigClient rig) "main" >>= either (fail . show) pure >>= await (rigTerrain rig) >>= either (fail . show) pure
+        released ← newTVarIO Nothing
+        -- between the two boundaries: the view's own lease is released; the arena and its mark stay as they were
+        atomically . writeTVar (rigBeforeCollect rig) . Just $ do
+          built ← subtract 1 <$> readTVarIO (rigNext rig)
+          releaseLease (rigTerrain rig) attached >>= either (fail . show) pure
+          atomically (writeTVar released (Just (chunkRef built 1)))
+        style ← styleOf rig
+        _ ← openView (rigViews rig) (OpenRequest (viewTarget target) attached (pure (Right style)) (axis 0, axis 0, axis 1) defaultLightSettings)
+          >>= either (\why → fail ("the view was refused: " <> show why)) pure
+        settleUntil rig ((\seam now → isJust seam && servicePending now == 0) <$> readTVar released <*> reading)
+        quiesce rig target
+        stale ← readTVarIO released >>= maybe (fail "the seam never ran") pure
+        -- the lease's revision the collection compares changed: the part was never adopted, and was released once
+        filter (== stale) <$> readTVarIO (rigDisposed rig) `shouldReturn` [stale]
+        now ← atomically reading
+        (servicePending now, servicePrivate now) `shouldBe` (0, 0)
+
+    it "admits no drain step while the step the views track is running, held after its start: the drain's commit decides again" $
+      withPublished defaultOptions $ \rig target view → do
+        quiesce rig target
+        index ← readTVarIO (rigNext rig)
+        atomically (writeTVar (rigHold rig) (Just index))
+        stop ← newTVarIO False
+        let owner = do
+              runOwner rig
+              continue ← atomically ((False <$ (readTVar stop >>= check)) `orElse` (True <$ (readTVar (rigQueue rig) >>= check . not . Seq.null)))
+              when continue owner
+        configureNow view (noConfigure {configureZoom = Just 2}) `shouldReturn` Right ()
+        withOwnedThread owner $ \_ ended → do
+          timeout 10000000 (atomically (takeTMVar (rigEntered rig))) >>= maybe (expectationFailure "no build was held") pure
+          -- the tracked step has started and is held inside its build: the drain's admission admits nothing, and
+          -- leaves the queue as it was
+          before ← atomically (Seq.length <$> readTVar (rigQueue rig))
+          commit (admitDue (rigViews rig) DrainAdmits) `shouldReturn` False
+          atomically (Seq.length <$> readTVar (rigQueue rig)) `shouldReturn` before
+          atomically (putTMVar (rigResume rig) () >> writeTVar stop True)
+          ended
         quiesce rig target
 
     it "detaches the old runtime view and withdraws its demand in the commit that frees its claim" $
