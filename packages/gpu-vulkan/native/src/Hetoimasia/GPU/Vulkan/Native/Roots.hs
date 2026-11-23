@@ -206,6 +206,7 @@ module Hetoimasia.GPU.Vulkan.Native.Roots
   , syncRootsDiagnostics
   , checkpointRootsSettled
   , readRootsTerminal
+  , rootsFailure
   , terminalFailure
 
     -- * Retirement
@@ -274,6 +275,9 @@ import qualified Data.Text as Text
 import Data.Unique (Unique, newUnique)
 import Data.Word (Word32, Word64)
 import Numeric.Natural (Natural)
+import Hetoimasia.Foundation.Messaging.Payload (Prepared, prepare)
+import Hetoimasia.Foundation.OwnerTx (Publication, Publisher, newPublisherIO, publication)
+import qualified Hetoimasia.Foundation.OwnerTx as OwnerTx
 import Hetoimasia.Foundation.Time (MonotonicSource, readInstant)
 import Hetoimasia.GPU.Model
   ( DisposalResult
@@ -533,6 +537,11 @@ data Roots q inst msgr phys dev = Roots
     -- as the layer is made.
   , rootsSession ∷ !SessionIdentity
   , rootsDeviceIdentity ∷ !DeviceId
+  , rootsFailed ∷ !(Publisher Bool)
+    -- ^ Whether the session has a primary failure ('readRootsTerminal': the latch's, else the model's), published
+    -- with every write of the latch or the model that changes it, in that write's transaction ('republishFailed').
+  , rootsFailedValues ∷ !(Prepared Bool, Prepared Bool)
+    -- ^ The two values it is published as, prepared once: failed, and not.
   }
 
 -- | Empty roots over a native layer. Nothing native happens until
@@ -545,6 +554,9 @@ newRoots ∷ RootOps q inst msgr phys dev → Budgets → MonotonicSource → IO
 newRoots ops budgets clock = do
   session ← sessionIdentity <$> newUnique
   let (model, device) = newGpuModel session budgets
+  failed ← prepare True
+  running ← prepare False
+  failure ← newPublisherIO running
   Roots ops clock
     <$> newTVarIO Absent
     <*> newTVarIO Absent
@@ -565,6 +577,8 @@ newRoots ops budgets clock = do
     <*> newTVarIO []
     <*> pure session
     <*> pure device
+    <*> pure failure
+    <*> pure (failed, running)
 
 rootsSessionIdentity ∷ Roots q inst msgr phys dev → SessionIdentity
 rootsSessionIdentity = rootsSession
@@ -849,7 +863,7 @@ admitRootTarget roots classification surface = do
             case admitTarget classification model of
               Admitted (next, admitted)
                 | admitted == target → do
-                    writeTVar (rootsModel roots) next
+                    republishFailed roots (writeTVar (rootsModel roots) next)
                     modifyTVar' (rootsTargets roots) $
                       Map.insert target (TargetRecord classification handle (Just (targetSurfaceDestroy surface)) Nothing)
                     pure (Just (Right target))
@@ -906,7 +920,7 @@ retireRootTarget roots target =
         now ← readInstant (rootsClock roots)
         let forget = atomically $ do
               modifyTVar' (rootsTargets roots) (Map.delete target)
-              modifyTVar' (rootsModel roots) $ \model → case closeTarget target model of
+              republishFailed roots . modifyTVar' (rootsModel roots) $ \model → case closeTarget target model of
                 -- The model forgets a retiring target with nothing left at
                 -- its next progress turn, which frees its record for a later
                 -- one.
@@ -1323,7 +1337,7 @@ data OwnerClaims = OwnerClaims
   }
 
 latchCause ∷ Roots q inst msgr phys dev → TerminalCause → STM ()
-latchCause roots cause = do
+latchCause roots cause = republishFailed roots $ do
   model ← readTVar (rootsModel roots)
   report ← readTVar (rootsTerminal roots)
   case reportPrimary report of
@@ -1523,6 +1537,23 @@ readRootsTerminal roots = do
   report ← readTVar (rootsTerminal roots)
   model ← readTVar (rootsModel roots)
   pure (maybe report {reportPrimary = fromModel model} (const report) (reportPrimary report))
+
+-- | Whether the session has a primary failure, as the roots publish it with every change ('readRootsTerminal''s
+-- primary present): for an owner that verifies the session's standing inside its own commit, and a reader that waits
+-- on it. The failure itself is the terminal report's.
+rootsFailure ∷ Roots q inst msgr phys dev → Publication Bool
+rootsFailure = publication . rootsFailed
+
+-- Write the latch or the model through this: the write, and then, in its transaction, whether the session has failed
+-- published when the write changed it.
+republishFailed ∷ Roots q inst msgr phys dev → STM a → STM a
+republishFailed roots write = do
+  before ← isJust . reportPrimary <$> readRootsTerminal roots
+  answer ← write
+  now ← isJust . reportPrimary <$> readRootsTerminal roots
+  let (failed, running) = rootsFailedValues roots
+  when (now /= before) (OwnerTx.publish (rootsFailed roots) (if now then failed else running))
+  pure answer
 
 -- ---------------------------------------------------------------------------
 -- Retirement
@@ -1774,7 +1805,7 @@ stateRootsModel ∷ Roots q inst msgr phys dev → (GpuModel → (a, GpuModel)) 
 -- ('orderBehindDiagnostics'): when a diagnostic failure came before it, that
 -- failure is latched and the transition is taken on the failed session
 -- instead, where it fails nothing further.
-stateRootsModel roots transition = do
+stateRootsModel roots transition = republishFailed roots $ do
   before ← readTVar (rootsModel roots)
   let (answer, after) = transition before
   if sessionState before == SessionRunning && sessionState after /= SessionRunning

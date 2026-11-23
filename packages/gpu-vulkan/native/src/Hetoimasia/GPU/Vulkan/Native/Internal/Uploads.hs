@@ -165,7 +165,8 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   , tshow
   )
 import Hetoimasia.GPU.Vulkan.Native.Profile (DevicePlan (..))
-import Hetoimasia.GPU.Vulkan.Native.Roots (Roots, TerminalCause, TerminalReport (reportPrimary), readRootsDevice, readRootsModel, readRootsTerminal, rootsSessionIdentity)
+import Hetoimasia.Foundation.OwnerTx (watchPublication)
+import Hetoimasia.GPU.Vulkan.Native.Roots (Roots, TerminalCause, TerminalReport (reportPrimary), readRootsDevice, readRootsModel, readRootsTerminal, rootsFailure, rootsSessionIdentity)
 
 -- ---------------------------------------------------------------------------
 -- Configuration
@@ -1337,7 +1338,8 @@ accessGate = \case
 
 ownerGate ∷ Roots q inst msgr phys dev → TVar AdmissionToken → UploadGate
 ownerGate roots owner =
-  reportPrimary <$> readRootsTerminal roots >>= \case
+  -- the session's failure as the roots publish it; its primary, once it has failed, from the terminal report
+  (snd <$> watchPublication (rootsFailure roots) >>= \failed → if failed then reportPrimary <$> readRootsTerminal roots else pure Nothing) >>= \case
     Just primary → pure (Left (UploadSessionFailed primary))
     Nothing → do
       token ← readTVar owner

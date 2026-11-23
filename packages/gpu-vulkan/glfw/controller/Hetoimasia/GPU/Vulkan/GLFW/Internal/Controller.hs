@@ -521,6 +521,7 @@ import Hetoimasia.GPU.Vulkan.Native.Naming (Instrumentation (..))
 import Hetoimasia.GPU.Vulkan.Native.Presentation (SurfaceExtent (..))
 import qualified Hetoimasia.GPU.Vulkan.Native.Presentation as Presentation
 import Hetoimasia.GPU.Vulkan.Native.Profile (InstancePlan (..), InstanceRequest (..), TargetRejection (..), ValidationChoice (..), ValidationFeature, ValidationResolution)
+import Hetoimasia.Foundation.OwnerTx (watchPublication)
 import Hetoimasia.GPU.Vulkan.Native.Roots
   ( DiagnosticAlarm (..)
   , GenerationOps (..)
@@ -544,6 +545,7 @@ import Hetoimasia.GPU.Vulkan.Native.Roots
   , latchTerminal
   , noteTeardownEvidence
   , readRootsTerminal
+  , rootsFailure
   , watchRootsDiagnosticsOrdered
   , DiagnosticWatch (..)
   , DiagnosticArrivals (..)
@@ -1370,9 +1372,17 @@ cancelVulkanUpload (VulkanController state) = cancelRenderingUpload (stateRender
 -- admission has closed.
 actionGate ∷ Roots Quiesced inst msgr phys dev → TVar AdmissionToken → STM (Maybe ActionRefusal)
 actionGate roots ownerOpen =
-  reportPrimary <$> readRootsTerminal roots >>= \case
+  -- the session's failure as the roots publish it; its primary, once it has failed, from the terminal report
+  failedSession roots >>= \case
     Just primary → pure (Just (ActionSessionFailed primary))
     Nothing → (readTVar ownerOpen >>= tokenOpen) <&> \open → if open then Nothing else Just ActionOwnerClosed
+
+-- The session's primary failure once the roots have published that it failed.
+failedSession ∷ Roots q inst msgr phys dev → STM (Maybe TerminalCause)
+failedSession roots =
+  snd <$> watchPublication (rootsFailure roots) >>= \case
+    False → pure Nothing
+    True → reportPrimary <$> readRootsTerminal roots
 
 -- | Run the owner-thread actions queued when the step began — its 'Batch',
 -- fixed before the step's checkpoint and its scene adoption — one at a time,
