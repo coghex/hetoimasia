@@ -289,7 +289,7 @@ spec = describe "The unowned-start guard (tools/validation/owned_starts.py)" $ d
         forM_ modules $ \name → copyFile (checkout </> "tools/validation" </> name) (copy </> "tools/validation" </> name)
         withTree (tree plainConfig [] [("pkg/test/Main.hs", source ["main :: IO ()", "main = pure ()"])]) $ \fixture → do
           settings ← sanitizedEnvironment
-          -- No PYTHONDONTWRITEBYTECODE: the guard has to switch it off itself, since -I ignores the variable anyway.
+          -- The guard has to switch bytecode off itself: -I ignores PYTHONDONTWRITEBYTECODE, which Sandbox.run sets for every child.
           (result, _, errors) ← run settings copy "python3" ["-I", "-W", "error", copy </> "tools/validation/owned_starts.py", "--root", fixture, "check"]
           (result, errors) `shouldBe` (ExitSuccess, "")
           listDirectory (copy </> "tools/validation") >>= (`shouldNotContain` ["__pycache__"])
