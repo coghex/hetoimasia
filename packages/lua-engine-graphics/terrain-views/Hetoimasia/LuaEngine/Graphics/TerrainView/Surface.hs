@@ -45,6 +45,7 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView.Surface
   , surfaceShowing
   , surfaceBind
   , surfaceUnbind
+  , surfaceAccepts
   , surfacePublish
   ) where
 
@@ -64,7 +65,8 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , VulkanSceneState (..)
   , WindowScenePublication (..)
   , WindowSceneStanding (..)
-  , publishVulkanTargetScene
+  , publishVulkanTargetSceneTx
+  , vulkanTargetSceneAcceptsTx
   , readVulkanSceneState
   )
 import Hetoimasia.LuaEngine.Graphics.Scene.Ledger (GraphicsScene)
@@ -73,6 +75,7 @@ import Hetoimasia.LuaEngine.Graphics.Window.Host
   ( WindowGeometry (..)
   , WindowVersion
   , WindowView
+  , windowViewAccepts
   , windowViewAttachment
   , windowViewGeometry
   , windowViewId
@@ -81,6 +84,8 @@ import Hetoimasia.LuaEngine.Graphics.Window.Host
   )
 import Hetoimasia.Render.TwoD.Metrics (PixelExtent (..), TargetMetrics (..), validMetrics)
 import Hetoimasia.Foundation.Admission (AdmissionToken, tokenOpen)
+import Hetoimasia.Foundation.OwnerTx (OwnerTx)
+import Hetoimasia.Foundation.OwnerTx.Issuer (fromIssuerSTM)
 import Hetoimasia.Scripting.Lua.Lease (Leases, leaseLiveSTM)
 
 -- | A target a view attaches to: its incarnation's key, the target itself, and whether its frames carry the qualified
@@ -279,18 +284,27 @@ surfaceUnbind = \case
   WindowSurface _ receipts view _ → unwatchFrameMetrics receipts (windowViewAttachment view)
   _ → pure ()
 
--- | Publish a scene to the target, as its host's own transaction: whether it was accepted.
-surfacePublish ∷ ViewSurface → Prepared GraphicsScene → STM Bool
+-- | Whether the target would accept a publication now, read-only in a commit: its host's own guards, the ones
+-- 'surfacePublish' meets, so a commit that finds it accepting and then publishes, with nothing between, has it accepted.
+surfaceAccepts ∷ ViewSurface → OwnerTx Bool
+surfaceAccepts = \case
+  WindowSurface _ _ view _ → windowViewAccepts view
+  OffscreenSurface host target _ → vulkanTargetSceneAcceptsTx host target
+  HeldSurface held → fromIssuerSTM (readTVar (heldAccepting held))
+
+-- | Publish a scene to the target, as its host's own ownership operation: whether it was accepted.
+surfacePublish ∷ ViewSurface → Prepared GraphicsScene → OwnerTx Bool
 surfacePublish surface scene = case surface of
   WindowSurface _ _ view _ →
     windowViewPublish view scene <&> \case
       WindowScenePublished _ _ → True
       _ → False
   OffscreenSurface host target _ →
-    publishVulkanTargetScene host target scene <&> \case
+    publishVulkanTargetSceneTx host target scene <&> \case
       TargetScenePublished _ _ → True
       _ → False
-  HeldSurface held → do
+  -- a held target is the views' own (a test's), its publication this module's transaction
+  HeldSurface held → fromIssuerSTM $ do
     accepts ← readTVar (heldAccepting held)
     when accepts $ do
       published ← readTVar (heldPublished held)

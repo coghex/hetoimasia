@@ -5,8 +5,10 @@
 -- between frames. That action lends 'Hands': prepare a chunk, reserve its admission into the session's one retained
 -- registry and the host's uploads (spent once by its build, which makes the buffer only then), release a chunk's
 -- buffer. Outside a step the views only admit the next step, ask the host's release lane for a barrier, observe a
--- part's admission and a chunk's upload, and read the host's end; each is one transaction that never waits
--- ('OwnerPorts').
+-- part's admission and a chunk's upload, and read the host's end ('OwnerPorts'). What changes an owner's facts (a step
+-- or a barrier admitted, a part reserved or given back, a receipt claimed or swept) is that owner's own ownership
+-- operation ('OwnerTx'), composed into the view's commit; what only reads (an admission's room, a chunk's upload, a
+-- receipt's outcome, the owner's end) is a read-only transaction that never waits.
 --
 -- The production capabilities ('productionOwner') are the host's own: no barrier, scene key, device, thread or
 -- session of their own. A suite without a device injects its own, whose owner it steps itself.
@@ -29,7 +31,7 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView.Owner
   , viewReceipt
   ) where
 
-import Control.Concurrent.STM (STM, atomically)
+import Control.Concurrent.STM (STM)
 import Control.Monad (void)
 import Control.Exception (SomeAsyncException, displayException, evaluate, fromException, throwIO, try)
 import qualified Data.Map.Strict as Map
@@ -38,6 +40,7 @@ import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Word (Word64)
 import Hetoimasia.Foundation.Exit (Exit (..), IssuerStanding (..), classifyExit)
+import Hetoimasia.Foundation.OwnerTx (OwnerTx)
 import Hetoimasia.GPU.Vulkan.GLFW
   ( ActionOutcome (..)
   , ActionRefusal (..)
@@ -50,9 +53,11 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , VulkanAction (..)
   , VulkanHost (..)
   , readVulkanAction
+  , readVulkanActionAdmission
   , readVulkanActionGate
-  , requestVulkanRelease
-  , submitVulkanAction
+  , readVulkanReleaseAdmission
+  , requestVulkanReleaseTx
+  , submitVulkanActionTx
   )
 import Hetoimasia.LuaEngine.Graphics.Scene.Ledger (GraphicsScene)
 import Hetoimasia.LuaEngine.Graphics.Texture (TextureGraphics (..))
@@ -61,7 +66,7 @@ import Hetoimasia.Render.TwoD.Chunk (BoundsRequest (DeriveBounds), ChunkKind (Ch
 import Hetoimasia.Render.TwoD.Material (MaterialRecord, MaterialRef)
 import Hetoimasia.Render.TwoD.Snapshot (Instance)
 import Hetoimasia.Render.TwoD.Vulkan (registerMaterial, rendererDepthFormat, rendererRegionWindow)
-import Hetoimasia.Render.TwoD.Vulkan.Builders (Builders (bufferUploads), BufferUploads, roomFor)
+import Hetoimasia.Render.TwoD.Vulkan.Builders (Builders (bufferUploads), BufferUploads)
 import Hetoimasia.Render.TwoD.Vulkan.Chunks
   ( BuildRefusal (..)
   , BuildRefused (..)
@@ -70,14 +75,14 @@ import Hetoimasia.Render.TwoD.Vulkan.Chunks
   , PreparedChunk
   , RefusedAllocation (..)
   , Retained
-  , abandonChunkGrant
-  , admitRetainedChunk
+  , abandonChunkGrantTx
+  , admitRetainedChunkTx
   , chunkBufferOf
   , chunkGrantReceipt
-  , claimReceipt
+  , claimReceiptTx
   , receiptNumber
   , receiptsHeld
-  , sweepRegistry
+  , sweepRegistryTx
   , chunkRoom
   , chunkStandingSTM
   , preparedBytes
@@ -105,7 +110,7 @@ data Grant = Grant
   { grantSpend ∷ IO ()
     -- ^ Build the part. Whatever the exit, the outcome is sealed into the grant's receipt before this returns or its
     -- exception goes on.
-  , grantAbandon ∷ STM ()
+  , grantAbandon ∷ OwnerTx ()
     -- ^ Give the grant back unspent, sealing its receipt as a refusal with no allocation.
   , grantReceipt ∷ !Receipt
   }
@@ -117,7 +122,7 @@ data Receipt = Receipt
   , receiptOutcome ∷ STM (Maybe (Either BuildFailure ChunkRef))
     -- ^ The build's sealed outcome, the one projection every reader uses: nothing while it is unsealed, then the
     -- outcome, before and after its claim.
-  , receiptClaim ∷ STM (Maybe (Either BuildFailure ChunkRef))
+  , receiptClaim ∷ OwnerTx (Maybe (Either BuildFailure ChunkRef))
     -- ^ Take the sealed outcome's ownership, once: nothing while it is unsealed or after another claimant took it.
   }
 
@@ -139,10 +144,10 @@ data Hands = Hands
   { handPrepare ∷ [Instance] → [MaterialRecord] → IO (Either Text PreparedChunk)
     -- ^ Prepare one chunk of a depth-enabled world layer: its instances (each naming the terrain material) and the
     -- records they index, routed and encoded, its exact upload bytes known. Nothing is reserved or made.
-  , handReserve ∷ PreparedChunk → STM (Either Admission Grant)
-    -- ^ Reserve a prepared chunk's reference and upload room, in the caller's transaction: the decision 'ownerRoom'
+  , handReserve ∷ PreparedChunk → OwnerTx (Either Admission Grant)
+    -- ^ Reserve a prepared chunk's reference and upload room, in the view's commit: the decision 'ownerRoom'
     -- observes.
-  , handSweepReceipts ∷ STM [(Word64, Either BuildFailure ChunkRef)]
+  , handSweepReceipts ∷ OwnerTx [(Word64, Either BuildFailure ChunkRef)]
     -- ^ The registry's teardown sweep: claim every sealed receipt its collector has not, with its key, read as a view
     -- reads it.
   , handDispose ∷ ChunkRef → IO (Either Text (STM ConstructedDisposal))
@@ -175,15 +180,22 @@ instance Show StepOutcome where
         Cancelled _ → "cancelled"
         Terminal _ → "terminal"
 
--- | What the views use of the owner and its host from any thread: each a transaction that never waits.
+-- | What the views use of the owner and its host from any thread: each an ownership operation of the owner's, or a
+-- read-only transaction, that never waits.
 data OwnerPorts = OwnerPorts
-  { ownerSchedule ∷ (Hands → IO ()) → STM (Either ScheduleRefusal (STM (Maybe StepOutcome)))
+  { ownerSchedule ∷ (Hands → IO ()) → OwnerTx (Either ScheduleRefusal (STM (Maybe StepOutcome)))
     -- ^ Admit one owner action that runs this step with the owner's hands, answering a reading of how it ended
-    -- ('Nothing' while it is queued or running).
-  , ownerRelease ∷ STM () → STM (Either Text (STM (Maybe (Either Text ()))))
-    -- ^ Ask the host's FIFO release lane for a barrier: the action runs, with this transaction, once every revision
+    -- ('Nothing' while it is queued or running). The step runs later, on the owner's thread, in 'IO'.
+  , ownerRelease ∷ IO () → OwnerTx (Either Text (STM (Maybe (Either Text ()))))
+    -- ^ Ask the host's FIFO release lane for a barrier: the action runs, on the owner's thread, once every revision
     -- published before the request has been adopted. The reading is 'Nothing' while it waits, @Just (Right ())@ once
     -- met and @Just (Left why)@, with the host's answer, when the owner will never meet it. A full lane is a 'Left'.
+  , ownerAdmits ∷ STM Bool
+    -- ^ Whether 'ownerSchedule' would change anything now (admit a step, or answer the owner's end), read-only: the
+    -- owner's own decision, for the watcher to wait on outside any commit while its queue is full or its device not
+    -- ready.
+  , ownerReleaseAdmits ∷ STM Bool
+    -- ^ The same for 'ownerRelease': 'False' only while the release lane is full or the device not ready.
   , ownerStanding ∷ ChunkRef → STM (Maybe ChunkStanding)
     -- ^ A chunk's upload: uploading, ready or failed; 'Nothing' for one never built or since released.
   , ownerMaterial ∷ !MaterialRef
@@ -208,7 +220,7 @@ productionOwner host graphics = do
   pure
     OwnerPorts
       { ownerSchedule = \step →
-          submitVulkanAction host (VulkanAction (\construction → step (hands material construction))) >>= \case
+          submitVulkanActionTx host (VulkanAction (\construction → step (hands material construction))) >>= \case
             Left ActionQueueFull → pure (Left ScheduleBusy)
             Left ActionDeviceNotReady → pure (Left ScheduleBusy)
             Left refusal → pure (Left (ScheduleEnded (Text.pack (show refusal))))
@@ -223,7 +235,7 @@ productionOwner host graphics = do
                     standing ← maybe IssuerLive (const IssuerEnded) <$> readVulkanActionGate (vulkanController host)
                     pure (Just (StepRaised (classifyExit standing (Left why))))
       , ownerRelease = \after →
-          requestVulkanRelease host (VulkanAction (\_ → atomically after)) >>= \case
+          requestVulkanReleaseTx host (VulkanAction (\_ → after)) >>= \case
             Left refusal → pure (Left (Text.pack (refusalText refusal)))
             Right ticket →
               pure . Right $
@@ -232,6 +244,16 @@ productionOwner host graphics = do
                   Just (ActionReturned ()) → pure (Just (Right ()))
                   Just (ActionRefused why) → pure (Just (Left ("the release lane refused the barrier: " <> Text.pack (show why))))
                   Just (ActionRaised why) → pure (Just (Left ("the barrier raised: " <> Text.pack (show why))))
+      , ownerAdmits =
+          readVulkanActionAdmission host <&> \case
+            Just ActionQueueFull → False
+            Just ActionDeviceNotReady → False
+            _ → True
+      , ownerReleaseAdmits =
+          readVulkanReleaseAdmission host <&> \case
+            Just ReleaseQueueFull → False
+            Just ActionDeviceNotReady → False
+            _ → True
       , ownerStanding = chunkStandingSTM retained
       , ownerMaterial = material
       , ownerRegionWindow = rendererRegionWindow (graphicsRenderer graphics)
@@ -267,10 +289,10 @@ registryHands prepare disposal builders retained =
   Hands
     { handPrepare = prepare
     , handReserve = \prepared →
-        admitRetainedChunk (bufferUploads builders) retained prepared <&> \case
+        admitRetainedChunkTx (bufferUploads builders) retained prepared <&> \case
           Left refusal → Left (viewAdmission refusal)
           Right grant → Right (viewGrant disposal builders retained grant)
-    , handSweepReceipts = map (fmap (viewReceipt disposal)) <$> sweepRegistry retained
+    , handSweepReceipts = map (fmap (viewReceipt disposal)) <$> sweepRegistryTx retained
     , handDispose = \chunk → do
         -- the buffer, read before the release forgets the chunk, is what is physically disposed of later
         buffer ← chunkBufferOf retained chunk
@@ -283,7 +305,7 @@ registryHands prepare disposal builders retained =
 -- | Whether a prepared part would be admitted into this registry and these uploads now, read-only: the decision
 -- 'registryHands' makes.
 registryRoom ∷ BufferUploads → Retained → PreparedChunk → STM (Either Admission ())
-registryRoom uploads retained prepared = either (Left . viewAdmission) Right <$> chunkRoom (roomFor uploads) retained (preparedBytes prepared)
+registryRoom uploads retained prepared = either (Left . viewAdmission) Right <$> chunkRoom uploads retained (preparedBytes prepared)
 
 -- | What the renderer's admission refusal means to a view: room that can come free, a part no staging holds, or an end.
 viewAdmission ∷ BuildRefusal → Admission
@@ -301,12 +323,12 @@ viewGrant ∷ (Buffer → STM ConstructedDisposal) → Builders q inst msgr phys
 viewGrant disposal builders retained grant =
   Grant
     { grantSpend = void (spendChunkGrant builders retained grant)
-    , grantAbandon = abandonChunkGrant retained grant
+    , grantAbandon = abandonChunkGrantTx retained grant
     , grantReceipt =
         Receipt
           { receiptKey = receiptNumber receipt
           , receiptOutcome = fmap (viewReceipt disposal) <$> Chunks.receiptOutcome receipt
-          , receiptClaim = fmap (viewReceipt disposal) <$> claimReceipt receipt
+          , receiptClaim = fmap (viewReceipt disposal) <$> claimReceiptTx receipt
           }
     }
   where

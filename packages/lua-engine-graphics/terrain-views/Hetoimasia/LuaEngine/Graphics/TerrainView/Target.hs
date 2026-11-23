@@ -13,6 +13,7 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView.Target
   ) where
 
 import Control.Concurrent.STM (atomically)
+import Hetoimasia.Foundation.OwnerTx (commit)
 import Data.Functor ((<&>))
 import Data.Text (Text)
 import qualified Data.Text as Text
@@ -29,7 +30,7 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , VulkanHost
   , awaitVulkanAction
   , recordVulkanTargetBatch
-  , submitVulkanAction
+  , submitVulkanActionTx
   )
 import Hetoimasia.LuaEngine.Graphics.Scene.Ledger (GraphicsScene (..))
 import Hetoimasia.LuaEngine.Graphics.Scene.Receipts (DrawReceipts, noteOffscreenBatch)
@@ -100,7 +101,7 @@ drawOffscreenView host graphics receipts target metrics image format depth after
           Right (batch, Right tag) → atomically (noteOffscreenBatch receipts batch tag metrics)
           _ → pure ()
         pure recorded
-  atomically (submitVulkanAction host action) >>= \case
+  commit (submitVulkanActionTx host action) >>= \case
     Left refusal → pure (Left (Text.pack (show refusal)))
     Right ticket →
       atomically (awaitVulkanAction ticket) >>= \case

@@ -107,6 +107,8 @@ library terrain-views-internal
         text >=2.1 && <2.2,
         hetoimasia-asset-image ==0.1.0.0,
         hetoimasia-foundation ==0.1.0.0,
+        -- the issuer bridge: the views' commits embed their own transactions (Session, Surface)
+        hetoimasia-foundation:owner-tx-issuer ==0.1.0.0,
         hetoimasia-gpu-vulkan-glfw ==0.1.0.0,
         hetoimasia-lua-engine-graphics,
         hetoimasia-lua-engine:texture,
