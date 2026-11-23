@@ -9,8 +9,10 @@
 -- aside, for the protected texts, ASCII case-insensitively (only @A@ to @Z@ fold), each end at the text's edge or next
 -- to a character outside @[A-Za-z0-9_]@, each match located on its own line. Every branch is searched as written:
 -- nothing is evaluated. A file Cabal's lexer cannot read, or reads with an ambiguous layout (tabs, inconsistent
--- indentation, braces, a non-breaking space), is unreadable; a quoted section argument and a symbolic link met in the
--- walk (never followed) are unsupported.
+-- indentation, braces, a non-breaking space), is unreadable; a quoted section argument, a non-ASCII field name or section
+-- header, and a symbolic link met in the walk (never followed) are unsupported. Field values and comments may hold
+-- non-ASCII text, and a non-ASCII character is a boundary. The guard catches accidental use of the bridge in this
+-- repository; deliberate evasion is issuer review's.
 module Scan
   ( Stanza (..)
   , Match (..)
@@ -88,15 +90,16 @@ generatedDirectories ∷ [FilePath]
 generatedDirectories = ["dist-newstyle", "dist-dev", "dist-vulkan", "dist-vulkan-proof", ".worktrees", "captures", "receipts"]
 
 -- | Split one file into stanzas and top-level fields and find every protected text, or say why it cannot be read or is
--- unsupported: a quoted section argument anywhere is unsupported.
+-- unsupported: a quoted section argument, or a non-ASCII field name or section header, anywhere is unsupported.
 scanFile ∷ ByteString.ByteString → Either String Scanned
 scanFile bytes = case readFields' bytes of
   Left failure → Left ("unreadable: Cabal's lexer cannot split it: " <> show failure)
   Right (fields, warnings) → case [warning | warning@(LexWarning kind _) ← warnings, kind /= LexWarningBOM] of
     LexWarning kind (Position line column) : _ → Left ("unreadable: an ambiguous stanza boundary (" <> show kind <> ") at line " <> show line <> ", column " <> show column)
-    [] → case concatMap quoted fields of
-      line : _ → Left ("unsupported: a quoted section argument at line " <> show line)
-      [] →
+    [] → case (concatMap quoted fields, concatMap nonAscii fields) of
+      (line : _, _) → Left ("unsupported: a quoted section argument at line " <> show line)
+      (_, line : _) → Left ("unsupported: a non-ASCII field name or section header at line " <> show line)
+      ([], []) →
         Right
           Scanned
             { scannedStanzas = [Stanza (headerOf name arguments) (lineOf name) (matchesOf field) | field@(Section name arguments _) ← fields]
@@ -107,6 +110,10 @@ scanFile bytes = case readFields' bytes of
     quoted = \case
       Field _ _ → []
       Section _ arguments inner → [line | SecArgStr (Position line _) _ ← arguments] <> concatMap quoted inner
+    -- field values and comments may hold non-ASCII text; names and headers may not
+    nonAscii = \case
+      Field name@(Name (Position line _) _) _ → [line | any (> '\DEL') (headerOf name [])]
+      Section name@(Name (Position line _) _) arguments inner → [line | any (> '\DEL') (headerOf name arguments)] <> concatMap nonAscii inner
 
 -- | A section's header: its name and arguments as Cabal's lexer splits them, single spaces between.
 headerOf ∷ Name Position → [SectionArg Position] → String

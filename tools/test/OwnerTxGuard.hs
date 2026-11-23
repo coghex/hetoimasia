@@ -16,7 +16,7 @@ import Control.Monad (forM_, void)
 import Data.List (isPrefixOf)
 import Json (Json (..), asArray, asString, entryFor, field, parseJson)
 import Sandbox (git, run, sanitizedEnvironment, writeFixtureFile)
-import System.Directory (copyFile, createDirectoryIfMissing, createDirectoryLink, doesFileExist, getCurrentDirectory, getPermissions, setOwnerWritable, setPermissions)
+import System.Directory (copyFile, createDirectoryIfMissing, createDirectoryLink, createFileLink, doesFileExist, getCurrentDirectory, getPermissions, setOwnerWritable, setPermissions)
 import System.Exit (ExitCode (..))
 import System.FilePath (takeDirectory, (</>))
 import System.IO.Temp (withSystemTempDirectory)
@@ -124,6 +124,8 @@ spec = describe "The issuer bridge's textual guard (tools/owner-tx-guard)" $ do
       refused (changed [("consumer/consumer.cabal", consumer ["    reexported-modules: Hetoimasia.Foundation.OwnerTx.Representation as Consumer.Raw"] [])]) [unlisted "consumer/consumer.cabal" 9 "Hetoimasia.Foundation.OwnerTx.Representation" "library"]
       refused (changed [("consumer/consumer.cabal", consumer ["    ghc-options: -package-id hetoimasia-foundation-0.1.0.0-inplace-owner-tx-issuer"] [])]) [unlisted "consumer/consumer.cabal" 9 "owner-tx-issuer" "library"]
       refused (changed [("consumer/consumer.cabal", consumer ["    build-depends: HETOIMASIA-FOUNDATION:Owner-Tx-Issuer"] [])]) [unlisted "consumer/consumer.cabal" 9 "owner-tx-issuer" "library"]
+      refused (changed [("consumer/consumer.cabal", consumer ["    ghc-options: -optP-Déowner-tx-issuer"] [])]) [unlisted "consumer/consumer.cabal" 9 "owner-tx-issuer" "library"]
+      checked (changed [("consumer/consumer.cabal", consumer ["    ghc-options: -optP-Downer-tx-İssuer"] [])]) >>= (`shouldBe` (ExitSuccess, ""))
 
     it "refuses an unlisted match in a common stanza, a section header, a continuation line and an unreachable branch" $ do
       refused
@@ -160,22 +162,34 @@ spec = describe "The issuer bridge's textual guard (tools/owner-tx-guard)" $ do
         ["cabal.project.vulkan: the allowlist entry for package consumer names 2 stanzas (lines 5, 7)"]
 
     it "refuses a duplicate or malformed allowlist entry, and a missing allowlist" $ do
-      unreadableAllowlist (unlines (foundationEntries <> allowed "foundation/hetoimasia-foundation.cabal" "library  internal")) "an entry listed more than once: foundation/hetoimasia-foundation.cabal (library internal)"
+      unreadableAllowlist (unlines (foundationEntries <> allowed "foundation/hetoimasia-foundation.cabal" "library internal")) "an entry listed more than once: foundation/hetoimasia-foundation.cabal (library internal)"
+      unreadableAllowlist (unlines (foundationEntries <> allowed "foundation/hetoimasia-foundation.cabal" "library  internal")) "unsupported: a file with a space or a quote, or a stanza with a quote or a space"
       unreadableAllowlist (unlines (foundationEntries <> ["entry", "  file: consumer/consumer.cabal", "  stanza: library"])) "an entry needs exactly one nonempty file, stanza and reason, and nothing else"
       unreadableAllowlist (unlines (foundationEntries <> ["entry", "  file: consumer/consumer.cabal", "  stanza: library", "  reason: x", "  component: consumer:lib:consumer"])) "an entry needs exactly one nonempty file, stanza and reason, and nothing else"
       unreadableAllowlist (unlines (foundationEntries <> ["entry", "  file: consumer/consumer.cabal", "  file: other.cabal", "  stanza: library", "  reason: x"])) "an entry needs exactly one nonempty file, stanza and reason, and nothing else"
       unreadableAllowlist (unlines ("version: 4" : foundationEntries)) "the field version is outside an entry section"
-      unreadableAllowlist (unlines (foundationEntries <> allowed "docs/tool sets/cabal.project" "package consumer")) "unsupported: a file or stanza with a space or a quote"
-      unreadableAllowlist (unlines (foundationEntries <> allowed "cabal.project" "package \"a b\"")) "unsupported: a file or stanza with a space or a quote"
+      unreadableAllowlist (unlines (foundationEntries <> allowed "docs/tool sets/cabal.project" "package consumer")) "unsupported: a file with a space or a quote"
+      unreadableAllowlist (unlines (foundationEntries <> allowed "docs/\"quoted\".cabal" "library")) "unsupported: a file with a space or a quote"
+      unreadableAllowlist (unlines (foundationEntries <> allowed "cabal.project" "package \"a b\"")) "unsupported: a file with a space or a quote, or a stanza with a quote"
       unreadableAllowlist (unlines (["dependent", "  component: consumer:lib:consumer", "  reason: x", ""] <> foundationEntries)) "the section dependent is not an entry section with no arguments"
       (missing, missingSaid) ← checked [file | file@(path, _) ← baseTree, path /= allowlistFile]
       missing `shouldBe` ExitFailure 2
       missingSaid `shouldContain` (allowlistFile <> " cannot be read: it does not exist")
 
-    it "refuses a quoted section argument and a symbolic link as unsupported, never following the link" $ do
+    it "refuses a quoted section argument, a non-ASCII field name or header, and file and directory links, never following them" $ do
       refused
         (changed [("cabal.project.common", "jobs: $ncpus\npackage \"consumer\"\n  ghc-options: -Wall\n")])
         ["cabal.project.common: unsupported: a quoted section argument at line 2"]
+      refused (changed [("consumer/consumer.cabal", consumer ["    build-dépends: base"] [])]) ["consumer/consumer.cabal: unsupported: a non-ASCII field name or section header at line 9"]
+      refused (changed [("consumer/consumer.cabal", consumer [] ["", "common brídge", "    build-depends: base"])]) ["consumer/consumer.cabal: unsupported: a non-ASCII field name or section header at line 10"]
+      withSystemTempDirectory "hetoimasia-owner-tx-outside" $ \outside → do
+        writeFixtureFile outside "linked.cabal" (unlines (header "linked" <> ["library", "    build-depends: hetoimasia-foundation:owner-tx-issuer"]))
+        withSystemTempDirectory "hetoimasia-owner-tx-guard" $ \directory → do
+          forM_ baseTree (uncurry (writeFixtureFile directory))
+          createFileLink (outside </> "linked.cabal") (directory </> "consumer" </> "linked.cabal")
+          settings ← sanitizedEnvironment
+          (result, _, errors) ← run settings directory "owner-tx-guard" ["check", "--root", directory]
+          (result, errors) `shouldBe` (ExitFailure 1, "owner_tx_guard: consumer/linked.cabal: unsupported: a symbolic link, which the guard never follows\n")
       withSystemTempDirectory "hetoimasia-owner-tx-outside" $ \outside → do
         writeFixtureFile outside "elsewhere/elsewhere.cabal" (unlines (header "elsewhere" <> ["library", "    build-depends: hetoimasia-foundation:owner-tx-issuer"]))
         withSystemTempDirectory "hetoimasia-owner-tx-guard" $ \directory → do

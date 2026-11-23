@@ -40,10 +40,10 @@ readAllowlist bytes = do
     Section (Name _ section) [] inner | fromUTF8BS section == "entry" → do
       let values key = [unwords [fromUTF8BS line | FieldLine _ line ← contents] | Field (Name _ name) contents ← inner, fromUTF8BS name == key]
           others = [fromUTF8BS name | Field (Name _ name) _ ← inner, fromUTF8BS name `notElem` ["file", "stanza", "reason"]] <> ["a section" | Section {} ← inner]
-      case (values "file", map (unwords . words) (values "stanza"), values "reason", others) of
+      case (values "file", values "stanza", values "reason", others) of
         ([file], [stanza], [reason], [])
-          | any (`elem` " \t\"'") file || any (`elem` "\"'") stanza →
-              Left ("unsupported: a file or stanza with a space or a quote: " <> show (file, stanza))
+          | any (`elem` " \t\"'") file || any (`elem` "\"'") stanza || stanza /= unwords (words stanza) →
+              Left ("unsupported: a file with a space or a quote, or a stanza with a quote or a space that is not one separator between tokens: " <> show (file, stanza))
           | not (null file) && not (null stanza) && not (null (words reason)) →
               Right (Entry file stanza)
         _ → Left ("an entry needs exactly one nonempty file, stanza and reason, and nothing else: " <> show (values "file", values "stanza", others))
