@@ -51,7 +51,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Reclamation (recoverAllocation, wit
 import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Layer (FrameOps (..), PresentRequest (..), PresentStatus (..))
 import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.State
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State (Refusal (..), checkpointed, owned)
-import Hetoimasia.GPU.Vulkan.Native.Roots (GraphicsDeviceLost, failRootsSessionBecause, rootsCall, stateRootsModel)
+import Hetoimasia.GPU.Vulkan.Native.Roots (GraphicsDeviceLost, failRootsSessionBecause, rootsCall, stateRootsModel, diagnosisOf)
 
 -- | What a presentation's answer establishes about its effect.
 data PresentReading
@@ -233,9 +233,10 @@ presentFrame frames frame =
           -- Nothing was presented and the frame is still submitted; but the
           -- fence itself is in doubt, so it is retained for ever with its
           -- record, and admission stops.
+          described ← diagnosisOf exception
           atomically $ do
-            editPool frames key (\entry → entry {poolFenceState = FenceUncertain (Text.pack (displayException exception))})
-            failRootsSessionBecause roots CleanupFailed ("resetting the present fence of " <> Text.pack (show key) <> " raised: " <> Text.pack (displayException exception))
+            editPool frames key (\entry → entry {poolFenceState = FenceUncertain described})
+            failRootsSessionBecause roots CleanupFailed ("resetting the present fence of " <> Text.pack (show key) <> " raised: " <> described)
           rethrowIO failure
         Right () → do
           atomically (editPool frames key (\entry → entry {poolFenceState = FenceIdle}))

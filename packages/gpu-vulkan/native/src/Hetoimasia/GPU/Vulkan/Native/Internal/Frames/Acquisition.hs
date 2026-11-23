@@ -21,7 +21,6 @@ import Control.Concurrent.STM (STM, atomically, modifyTVar', readTVar, readTVarI
 import Control.Exception
   ( ExceptionWithContext (ExceptionWithContext)
   , SomeException
-  , displayException
   , mask_
   , rethrowIO
   , throwIO
@@ -79,6 +78,8 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State (Refusal (..), chec
 import Hetoimasia.GPU.Vulkan.Native.Naming (NativeObjectKind (..), PoolObject (..), SlotObject (..), poolObjectName, slotObjectName)
 import Hetoimasia.GPU.Vulkan.Native.Roots
   ( Roots
+  , diagnosisOf
+  , stageRootsFailure
   , failRootsSessionBecause
   , nameRootsObject
   , readRootsInstrumentation
@@ -440,21 +441,24 @@ rollBack
   → IO a
 rollBack roots what failure destroy retain made = do
   attempts ← forM made $ \(object, handle) → (,) (object, handle) <$> tryWithContext @SomeException (destroy object handle)
+  -- every description is rendered and forced here, before the transaction that records it
+  described ← forM attempts $ \(made', attempt) → (,) made' <$> traverse describe (either Just (const Nothing) attempt)
+  primary ← describe failure
   let raised = [caught | (_, Left caught) ← attempts]
-      outcomes = [(object, (handle, either (Just . describe) (const Nothing) attempt)) | ((object, handle), attempt) ← attempts]
+      outcomes = [(object, (handle, description)) | ((object, handle), description) ← described]
       reason =
         "constructing "
           <> what
           <> " raised ("
-          <> describe failure
+          <> primary
           <> "), and destroying what it had made raised: "
-          <> Text.intercalate "; " (map describe raised)
-  unless (null raised) . atomically $ do
+          <> Text.intercalate "; " [description | (_, Just description) ← described]
+  unless (null raised) . atomically . stageRootsFailure roots $ do
     retain reason outcomes
     failRootsSessionBecause roots CleanupFailed reason
   foldr retainOne (rethrowIO failure) (reverse raised)
   where
-    describe (ExceptionWithContext _ exception) = Text.pack (displayException exception)
+    describe (ExceptionWithContext _ exception) = diagnosisOf exception
     retainOne cleanup rest = withResourceLabelled rollbackLabel (pure ()) (\() → rethrowIO cleanup) (\() → rest)
 
 -- | The cleanup label a rollback's failed destructions are retained under.

@@ -189,6 +189,7 @@ import Hetoimasia.GPU.Vulkan.Native.Naming
 import Hetoimasia.GPU.Vulkan.Native.Profile (DevicePlan (..))
 import Hetoimasia.GPU.Vulkan.Native.Roots
   ( NativeFailure (..)
+  , diagnosisOf
   , Roots
   , failRootsSessionBecause
   , nameRootsObject
@@ -915,7 +916,8 @@ undoing roots what cleanup =
   tryWithContext @SomeException cleanup >>= \case
     Right () → pure ()
     Left failure@(ExceptionWithContext _ exception) → do
-      atomically (failRootsSessionBecause roots CleanupFailed (what <> " raised: " <> Text.pack (displayException exception)))
+      described ← diagnosisOf exception
+      atomically (failRootsSessionBecause roots CleanupFailed (what <> " raised: " <> described))
       when (isAsynchronous exception) (rethrowIO failure)
 
 -- | The naming call a pipeline's shader modules are given: under the

@@ -24,8 +24,7 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Generations.Disposal
 
 import Control.Concurrent.STM (STM, atomically, modifyTVar', readTVar)
 import Control.Exception
-  ( Exception (displayException)
-  , ExceptionWithContext (ExceptionWithContext)
+  ( ExceptionWithContext (ExceptionWithContext)
   , mask_
   , rethrowIO
   , tryWithContext
@@ -64,6 +63,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Generations.State
   )
 import Hetoimasia.GPU.Vulkan.Native.Roots
   ( GenerationOps (..)
+  , diagnosisOf
   , Roots
   , SubjectDisposer (..)
   , failRootsSessionBecause
@@ -205,7 +205,7 @@ destroyGeneration generations device generation native = go (reverse (genViews n
       tryWithContext (rootsCall roots name destroy) >>= \case
         Right () → Nothing <$ atomically (editGeneration generations generation record)
         Left failure@(ExceptionWithContext _ exception) → do
-          let reason = Text.pack (displayException exception)
+          reason ← diagnosisOf exception
           atomically $ do
             editGeneration generations generation (\entry → entry {genStanding = GenerationUncertain reason})
             failRootsSessionBecause roots CleanupFailed (name <> " of " <> Text.pack (show generation) <> " raised: " <> reason)

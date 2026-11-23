@@ -22,7 +22,6 @@ import Control.Concurrent.STM (STM, atomically, modifyTVar', readTVar, readTVarI
 import Control.Exception
   ( ExceptionWithContext (ExceptionWithContext)
   , SomeException
-  , displayException
   , fromException
   , mask_
   , rethrowIO
@@ -54,7 +53,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Layer (FrameOps (..))
 import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Loss (releaseFramesToDeviceLoss)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.State
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State (TicketState (..), owner, settleTicket)
-import Hetoimasia.GPU.Vulkan.Native.Roots (GraphicsDeviceLost, failRootsSessionBecause, rootsCall, stateRootsModel)
+import Hetoimasia.GPU.Vulkan.Native.Roots (GraphicsDeviceLost, failRootsSessionBecause, rootsCall, stateRootsModel, diagnosisOf)
 
 -- | One bounded owner step: at most the model's progress-action limit of native
 -- calls, each recorded in the same masked step that made it.
@@ -129,7 +128,7 @@ progressFrames frames now = owner recording $ do
             for_ fence $ \native →
               observe handle native $ \case
                 Left failure → do
-                  let reason = "vkGetFenceStatus raised: " <> describe failure
+                  reason ← ("vkGetFenceStatus raised: " <>) <$> describe failure
                   atomically $ do
                     uncertain frames CleanupFailed (submissionFrames record) reason
                     editSlot frames (submissionSlot record) (\sync → sync {syncFenceState = FenceUncertain reason})
@@ -156,7 +155,7 @@ progressFrames frames now = owner recording $ do
                   -- can still let it go; its uncertain fence is never asked
                   -- again, and retains it, and the device, otherwise.
                   | otherwise → do
-                      let reason = "vkGetFenceStatus raised: " <> describe failure
+                      reason ← ("vkGetFenceStatus raised: " <>) <$> describe failure
                       atomically $ do
                         modifyTVar' (framesFrameless frames) (Map.adjust (\entry → entry {framelessFenceState = FenceUncertain reason}) (framelessSlot record))
                         failRootsSessionBecause roots CleanupFailed (Text.pack (show submission) <> ": " <> reason)
@@ -173,7 +172,7 @@ progressFrames frames now = owner recording $ do
             for_ pool $ \held →
               observe handle (poolFence held) $ \case
                 Left failure → do
-                  let reason = "vkGetFenceStatus raised: " <> describe failure
+                  reason ← ("vkGetFenceStatus raised: " <>) <$> describe failure
                   atomically $ do
                     modifyTVar' (framesPresentations frames) (Map.adjust (\entry → entry {presentedStanding = PresentUncertain reason}) presentation)
                     editPool frames key (\entry → entry {poolFenceState = FenceUncertain reason})
@@ -202,7 +201,7 @@ progressFrames frames now = owner recording $ do
               FencePending →
                 observe handle (syncCleanup held) $ \case
                   Left failure → do
-                    let reason = "vkGetFenceStatus raised: " <> describe failure
+                    reason ← ("vkGetFenceStatus raised: " <>) <$> describe failure
                     atomically $ do
                       editFrame frames frame (\entry → entry {recordStage = StageFailed reason})
                       editSlot frames (slotOf frame) (\entry → entry {syncCleanupState = FenceUncertain reason})
@@ -295,7 +294,7 @@ progressFrames frames now = owner recording $ do
       let index = fromIntegral (imageIndex (recordImage record)) ∷ Word32
       tryWithContext @SomeException (rootsCall roots "vkReleaseSwapchainImagesEXT" (opsReleaseImages ops handle (recordSwapchain record) [index])) >>= \case
         Left failure → do
-          let reason = "vkReleaseSwapchainImagesEXT raised: " <> describe failure
+          reason ← ("vkReleaseSwapchainImagesEXT raised: " <>) <$> describe failure
           atomically $ do
             editFrame frames frame (\entry → entry {recordStage = StageFailed reason})
             failRootsSessionBecause roots CleanupFailed (Text.pack (show frame) <> ": " <> reason)
@@ -320,7 +319,7 @@ progressFrames frames now = owner recording $ do
     pendingFence = \case
       FencePending → True
       _ → False
-    describe (ExceptionWithContext _ exception) = Text.pack (displayException exception)
+    describe (ExceptionWithContext _ exception) = diagnosisOf exception
     unlessLoss (ExceptionWithContext _ exception) replacement = case fromException exception ∷ Maybe GraphicsDeviceLost of
       Just _ → exception
       Nothing → toException replacement
@@ -407,7 +406,7 @@ retireTargetFrames frames target = owner (framesRecording frames) $ do
       case outcome of
         Right () → [] <$ atomically (modifyTVar' (framesSlots frames) (Map.delete key))
         Left failure@(ExceptionWithContext _ exception) → do
-          let reason = "destroying the synchronization of slot " <> Text.pack (show key) <> " raised: " <> Text.pack (displayException exception)
+          reason ← (("destroying the synchronization of slot " <> Text.pack (show key) <> " raised: ") <>) <$> diagnosisOf exception
           atomically $ do
             editSlot frames key (\entry → entry {syncFenceState = FenceUncertain reason, syncCleanupState = FenceUncertain reason, syncDestruction = Just reason})
             failRootsSessionBecause roots CleanupFailed reason
@@ -422,7 +421,7 @@ retireTargetFrames frames target = owner (framesRecording frames) $ do
       case outcome of
         Right () → [] <$ atomically (modifyTVar' (framesPool frames) (Map.delete key))
         Left failure@(ExceptionWithContext _ exception) → do
-          let reason = "destroying the presentation-pool record " <> Text.pack (show key) <> " raised: " <> Text.pack (displayException exception)
+          reason ← (("destroying the presentation-pool record " <> Text.pack (show key) <> " raised: ") <>) <$> diagnosisOf exception
           atomically $ do
             editPool frames key (\entry → entry {poolFenceState = FenceUncertain reason, poolRenderedState = SemaphoreUncertain reason, poolDestruction = Just reason})
             failRootsSessionBecause roots CleanupFailed reason

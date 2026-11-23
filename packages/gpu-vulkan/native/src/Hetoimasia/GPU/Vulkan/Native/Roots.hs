@@ -239,6 +239,8 @@ module Hetoimasia.GPU.Vulkan.Native.Roots
   , stateRootsModel
   , failRootsSession
   , failRootsSessionBecause
+  , stageRootsFailure
+  , diagnosisOf
 
     -- * Reclamation (VK-14)
   , SubjectDisposer (..)
@@ -247,13 +249,14 @@ module Hetoimasia.GPU.Vulkan.Native.Roots
   ) where
 
 import Control.Concurrent (threadDelay, yield)
-import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, writeTVar)
+import Control.Concurrent.STM (STM, TVar, atomically, catchSTM, modifyTVar', newTVarIO, readTVar, readTVarIO, writeTVar)
 import GHC.Conc (unsafeIOToSTM)
 import Control.Exception
   ( Exception (displayException)
   , ExceptionWithContext (ExceptionWithContext)
   , SomeAsyncException
   , SomeException
+  , evaluate
   , fromException
   , mask
   , mask_
@@ -543,6 +546,9 @@ data Roots q inst msgr phys dev = Roots
     -- with every write of the latch or the model that changes it, in that write's transaction ('republishFailed').
   , rootsFailedValues ∷ !(Prepared Bool, Prepared Bool)
     -- ^ The two values it is published as, prepared once: failed, and not.
+  , rootsStaging ∷ !(TVar Int)
+    -- ^ How deep the running transaction is inside 'stageRootsFailure': raised and lowered within one transaction, so
+    -- every other transaction reads 0.
   }
 
 -- | Empty roots over a native layer. Nothing native happens until
@@ -580,6 +586,22 @@ newRoots ops budgets clock = do
     <*> pure device
     <*> pure failure
     <*> pure (failed, running)
+    <*> newTVarIO 0
+
+-- The description a terminal record keeps for a failure whose own description raised.
+undescribedFailure ∷ Text
+undescribedFailure = "a failure whose description raised"
+
+-- | An exception's description for a terminal record, rendered and forced in protected IO before the transaction that
+-- latches it: a description that itself raises is answered with a fixed text. A cancellation met while rendering goes
+-- on.
+diagnosisOf ∷ SomeException → IO Text
+diagnosisOf exception =
+  tryWithContext @SomeException (evaluate (Text.pack (displayException exception)) >>= \text → text <$ evaluate (Text.length text)) >>= \case
+    Right text → pure text
+    Left failure@(ExceptionWithContext _ inner)
+      | Just (_ ∷ SomeAsyncException) ← fromException inner → rethrowIO failure
+      | otherwise → pure "an exception whose description raised"
 
 rootsSessionIdentity ∷ Roots q inst msgr phys dev → SessionIdentity
 rootsSessionIdentity = rootsSession
@@ -945,7 +967,7 @@ retireRootTarget roots target =
 -- permission to try again.
 settleUncertain ∷ Roots q inst msgr phys dev → TargetId → ExceptionWithContext SomeException → IO a
 settleUncertain roots target failure@(ExceptionWithContext _ exception) = do
-  let reason = Text.pack (displayException exception)
+  reason ← diagnosisOf exception
   atomically $ do
     modifyTVar' (rootsTargets roots) (Map.adjust (\held → held {recordUncertain = Just reason}) target)
     -- A failed cleanup is a terminal failure of its own, or evidence beside
@@ -1051,7 +1073,7 @@ guarded roots during call =
     Left failure@(ExceptionWithContext _ exception)
       | isAsynchronous exception → rethrowIO failure
       | opsDeviceLoss (rootsOps roots) exception → do
-          let loss = GraphicsDeviceLost during (Text.pack (displayException exception))
+          loss ← GraphicsDeviceLost during <$> diagnosisOf exception
           latchDeviceLoss roots loss
           throwIO loss
       | otherwise → rethrowIO failure
@@ -1222,10 +1244,15 @@ fromModel model = case sessionState model of
 -- ('orderBehindDiagnostics'): a validation error or sink failure that claimed
 -- first place before it is latched ahead of it.
 latchTerminal ∷ Roots q inst msgr phys dev → TerminalCause → STM ()
-latchTerminal roots cause = do
+latchTerminal roots given = do
+  -- the cause is forced before anything is written: a description that raises is replaced by a fixed one, so it can
+  -- never roll the terminal record back (its producers force it in protected IO first: 'diagnosisOf')
+  -- (a cause that cannot even be inspected is kept as a cleanup failure of that description)
+  cause ← (pure $! forcedCause given) `catchSTM` \(_ ∷ SomeException) → pure (TerminalCleanupFailed undescribedFailure)
   unless (diagnostic cause) (orderBehindDiagnostics roots)
   latchCause roots cause
   where
+    forcedCause cause = length (show cause) `seq` cause
     diagnostic = \case
       TerminalValidationError → True
       TerminalSinkFailed _ → True
@@ -1551,7 +1578,22 @@ rootsFailure = publication . rootsFailed
 -- A write that fails the session through the model alone also latches the model's cause as the primary, in that same
 -- transaction: from the publication on, the primary is a write-once fact of the latch, never derived again.
 republishFailed ∷ Roots q inst msgr phys dev → STM a → STM a
-republishFailed roots write = do
+republishFailed roots write =
+  readTVar (rootsStaging roots) >>= \case
+    0 → republishing roots write
+    -- inside a staged source transition: the transition's own end fixes the primary and publishes, once
+    _ → write
+
+-- | One source transition that writes the model and the latch together (a model transition that fails the session,
+-- and the detailed cause of the same failure): the primary is chosen as 'latchTerminal' chooses it with both writes
+-- seen, then fixed and published once, at the transition's end, in its transaction. A failure through the model alone
+-- stays write-once as before.
+stageRootsFailure ∷ Roots q inst msgr phys dev → STM a → STM a
+stageRootsFailure roots transition =
+  republishing roots (modifyTVar' (rootsStaging roots) (+ 1) *> transition <* modifyTVar' (rootsStaging roots) (subtract 1))
+
+republishing ∷ Roots q inst msgr phys dev → STM a → STM a
+republishing roots write = do
   before ← isJust . reportPrimary <$> readRootsTerminal roots
   answer ← write
   derived ← reportPrimary <$> readRootsTerminal roots
@@ -1610,7 +1652,7 @@ retireAllocator roots =
       when (remaining > 0) (throwIO (AllocationsRemain remaining))
       mask_ $
         tryWithContext (allocatorDestroy allocator) >>= \case
-          Right events → atomically $ do
+          Right events → atomically . stageRootsFailure roots $ do
             writeTVar (rootsAllocator roots) Destroyed
             settlement ← stateRootsModel roots $ \model → case settleDeviceMemory Nothing (MemoryEffect (eventsOpenedBytes events) (eventsFreedBytes events)) model of
               Admitted (next, settled) → (settled, next)
@@ -1678,7 +1720,7 @@ uncertainly roots slot name failure@(ExceptionWithContext _ exception)
       atomically (settle (Text.pack (displayException exception)))
       rethrowIO failure
   | otherwise = do
-      let reason = Text.pack (displayException exception)
+      reason ← diagnosisOf exception
       atomically (settle reason)
       throwIO (RootDestructionFailed name reason)
   where
@@ -1844,13 +1886,16 @@ failRootsSession roots cause = failRootsSessionBecause roots cause (Text.pack (s
 
 -- | 'failRootsSession', saying what failed.
 failRootsSessionBecause ∷ Roots q inst msgr phys dev → SessionFailureCause → Text → STM ()
-failRootsSessionBecause roots cause reason = latchTerminal roots $ case cause of
-  DeviceLost → TerminalDeviceLost (GraphicsDeviceLost "a native call" reason)
-  ValidationError → TerminalValidationError
-  DiagnosticSinkFailed → TerminalSinkFailed reason
-  UnknownSubmissionEffect → TerminalUncertainEffect reason
-  CleanupFailed → TerminalCleanupFailed reason
-  RequiredTargetUnrecoverable → TerminalRequiredTarget Nothing
+failRootsSessionBecause roots cause given = do
+  -- the reason is forced here, where its kind is known: one that raises is replaced by a fixed description
+  reason ← (pure $! Text.length given `seq` given) `catchSTM` \(_ ∷ SomeException) → pure undescribedFailure
+  latchTerminal roots $ case cause of
+    DeviceLost → TerminalDeviceLost (GraphicsDeviceLost "a native call" reason)
+    ValidationError → TerminalValidationError
+    DiagnosticSinkFailed → TerminalSinkFailed reason
+    UnknownSubmissionEffect → TerminalUncertainEffect reason
+    CleanupFailed → TerminalCleanupFailed reason
+    RequiredTargetUnrecoverable → TerminalRequiredTarget Nothing
 
 -- | The live instance, for the caller that leases it to a surface bridge.
 readRootsInstance ∷ Roots q inst msgr phys dev → STM (Maybe inst)

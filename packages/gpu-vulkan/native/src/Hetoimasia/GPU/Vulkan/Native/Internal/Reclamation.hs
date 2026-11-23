@@ -92,6 +92,7 @@ import Hetoimasia.GPU.Model
 import Hetoimasia.GPU.Model.Identity (AllocationId, GenerationId, HoldSubject)
 import Hetoimasia.GPU.Vulkan.Native.Roots
   ( GraphicsDeviceLost
+  , stageRootsFailure
   , NativeFailure (..)
   , Roots
   , SubjectDisposer (..)
@@ -114,7 +115,7 @@ reclaimOnce roots = do
     let (_, window) = reclaimPass silentEvidence {disposalEvidence = const DisposalCompleted} model
     (,) (reclaimDisposed window) <$> readRootsDisposers roots
   results ← forM offered $ \subject → (,) subject <$> disposeWith disposers subject
-  atomically $ do
+  atomically . stageRootsFailure roots $ do
     report ← stateRootsModel roots $ \model →
       let (next, answered) = reclaimPass silentEvidence {disposalEvidence = evidenceFrom results} model
        in (answered, next)

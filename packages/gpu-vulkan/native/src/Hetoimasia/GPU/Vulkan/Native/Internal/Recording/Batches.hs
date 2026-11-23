@@ -22,7 +22,7 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Batches
   ) where
 
 import Control.Concurrent.STM (STM, atomically, modifyTVar', readTVar, readTVarIO)
-import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, displayException, mask_, rethrowIO, throwIO, tryWithContext)
+import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, mask_, rethrowIO, throwIO, tryWithContext)
 import Data.Foldable (for_)
 import qualified Data.Map.Strict as Map
 import qualified Data.Text as Text
@@ -70,7 +70,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   , releaseClaims
   , settleTicket
   )
-import Hetoimasia.GPU.Vulkan.Native.Roots (failRootsSessionBecause, readRootsDevice, rootsCall, stateRootsModel)
+import Hetoimasia.GPU.Vulkan.Native.Roots (failRootsSessionBecause, readRootsDevice, rootsCall, stateRootsModel, diagnosisOf)
 
 -- | Free the frame's slot of batches whose submission has completed. A
 -- submitted batch keeps its record, and its storage, until the submission
@@ -194,7 +194,7 @@ invalidate recording storage batches discharge =
         Just handle → mask_ $
           tryWithContext @SomeException (rootsCall roots "vkResetCommandPool" (opsResetStorage (recordingOps recording) device handle)) >>= \case
             Left failure@(ExceptionWithContext _ exception) → do
-              let reason = Text.pack (displayException exception)
+              reason ← diagnosisOf exception
               atomically $ do
                 for_ batches (\batch → editBatch recording batch (\entry → entry {batchStanding = BatchUncertain reason}))
                 failRootsSessionBecause roots CleanupFailed ("resetting the storage of " <> Text.pack (show batches) <> " raised: " <> reason)

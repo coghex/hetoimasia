@@ -63,7 +63,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   , checkpointed
   , owned
   )
-import Hetoimasia.GPU.Vulkan.Native.Roots (GraphicsDeviceLost, failRootsSessionBecause, rootsCall, rootsSessionIdentity, stateRootsModel)
+import Hetoimasia.GPU.Vulkan.Native.Roots (GraphicsDeviceLost, failRootsSessionBecause, rootsCall, rootsSessionIdentity, stateRootsModel, diagnosisOf, stageRootsFailure)
 
 -- | One frame of a validated request.
 data Member cmd = Member
@@ -221,10 +221,11 @@ submitFrames frames request =
           -- fence itself is now in doubt, so it is retained for ever, and
           -- native synchronization safety being unknown, admission stops and
           -- the session fails.
-          atomically $ do
+          described ← diagnosisOf exception
+          atomically . stageRootsFailure roots $ do
             answered Model.submitFrames framesOf SubmissionFailedWithoutEffect
-            editSlot frames key (\sync → sync {syncFenceState = FenceUncertain (Text.pack (displayException exception))})
-            failRootsSessionBecause roots CleanupFailed ("resetting the submission fence of slot " <> Text.pack (show key) <> " raised: " <> Text.pack (displayException exception))
+            editSlot frames key (\sync → sync {syncFenceState = FenceUncertain (described)})
+            failRootsSessionBecause roots CleanupFailed ("resetting the submission fence of slot " <> Text.pack (show key) <> " raised: " <> described)
           rethrowIO failure
         Right () → do
           atomically (editSlot frames key (\sync → sync {syncFenceState = FenceIdle}))
@@ -235,8 +236,8 @@ submitFrames frames request =
                   atomically (answered Model.submitFrames framesOf SubmissionFailedWithoutEffect)
                   pure (Right (SubmittedNothing (Text.pack (displayException exception))))
               | otherwise → do
-                  let reason = "vkQueueSubmit2 raised, so whether it submitted is unknown: " <> Text.pack (displayException exception)
-                  atomically $ do
+                  reason ← ("vkQueueSubmit2 raised, so whether it submitted is unknown: " <>) <$> diagnosisOf exception
+                  atomically . stageRootsFailure roots $ do
                     answered Model.submitFrames framesOf SubmissionEffectUncertain
                     uncertain frames UnknownSubmissionEffect framesOf reason
                     editSlot frames key (\sync → sync {syncFenceState = FenceUncertain reason})

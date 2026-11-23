@@ -20,7 +20,6 @@ import Control.Concurrent.STM (STM, atomically, readTVar, readTVarIO)
 import Control.Exception
   ( ExceptionWithContext (ExceptionWithContext)
   , SomeException
-  , displayException
   , fromException
   , mask_
   , rethrowIO
@@ -49,7 +48,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   , modelAnswer
   , owned
   )
-import Hetoimasia.GPU.Vulkan.Native.Roots (GraphicsDeviceLost, failRootsSessionBecause, rootsCall)
+import Hetoimasia.GPU.Vulkan.Native.Roots (GraphicsDeviceLost, failRootsSessionBecause, rootsCall, diagnosisOf)
 
 -- | Skip an acquired frame nothing of which has been submitted: an ordinary
 -- outcome, not a failure. The frame's capability is consumed at once — it
@@ -196,7 +195,7 @@ cleanupSubmission frames device family frame semaphore stage waiting = do
             waiting
           pure Nothing
         Left failure@(ExceptionWithContext context exception) → do
-          let reason = "the cleanup submission raised: " <> Text.pack (displayException exception)
+          reason ← ("the cleanup submission raised: " <>) <$> diagnosisOf exception
           atomically $ do
             editFrame frames frame (\record → record {recordStage = StageFailed reason})
             editSlot frames key (\entry → entry {syncCleanupState = FenceUncertain reason})

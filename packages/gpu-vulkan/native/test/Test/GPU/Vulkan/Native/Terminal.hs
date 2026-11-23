@@ -66,6 +66,9 @@ import Hetoimasia.GPU.Vulkan.Native.Roots
   ( Checkpoint (..)
   , rootsFailure
   , rootsFailedCause
+  , stageRootsFailure
+  , latchTerminal
+  , stateRootsModel
   , DiagnosticAlarm (..)
   , GraphicsDeviceLost (..)
   , RootsRetained (..)
@@ -197,6 +200,31 @@ spec = describe "Terminal failure" $ do
       fixed `shouldSatisfy` \case Just (TerminalDeviceLost _) → True; _ → False
       atomically (failRootsSessionBecause (rigRoots rig') CleanupFailed "a later cleanup failed")
       atomically (rootsFailedCause (rigRoots rig')) `shouldReturn` fixed
+
+    it "keeps a combined source transition's own primary: a failing model transition and its detailed cause in one staged transaction publish the detailed cause once; after a model-only failure, a later latch only adds evidence" $ do
+      rig ← newRig
+      (revision, _) ← atomically (watchPublication (rootsFailure (rigRoots rig)))
+      let detailed = TerminalDeviceLost (GraphicsDeviceLost "vkQueueSubmit2" "the queue reported the device lost")
+      atomically . stageRootsFailure (rigRoots rig) $ do
+        stateRootsModel (rigRoots rig) (\model → ((), noteDeviceLoss model))
+        latchTerminal (rigRoots rig) detailed
+      atomically (watchPublication (rootsFailure (rigRoots rig))) `shouldReturn` (revision + 1, True)
+      atomically (rootsFailedCause (rigRoots rig)) `shouldReturn` Just detailed
+      clean rig
+      rig' ← newRig
+      inModel rig' (Admitted . noteDeviceLoss)
+      fixed ← atomically (rootsFailedCause (rigRoots rig'))
+      fixed `shouldSatisfy` maybe False (/= detailed)
+      atomically (latchTerminal (rigRoots rig') detailed)
+      atomically (rootsFailedCause (rigRoots rig')) `shouldReturn` fixed
+      evidenceOf rig' >>= (`shouldSatisfy` elem (LaterFailure detailed))
+
+    it "latches and publishes a failure whose description raises, with a fixed description, never rolling the record back" $ do
+      rig ← newRig
+      atomically (failRootsSessionBecause (rigRoots rig) CleanupFailed (error "the formatter raised"))
+      snd <$> atomically (watchPublication (rootsFailure (rigRoots rig))) `shouldReturn` True
+      primaryIs rig (\cause → "description raised" `isInfixOf` show cause)
+      clean rig
 
     it "stays pending while a failure of the owner's own holds first place in a transaction still running, then keeps it as the primary ahead of a later validation error" $ do
       rig ← newRig

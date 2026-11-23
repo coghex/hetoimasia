@@ -82,6 +82,8 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
 import Hetoimasia.GPU.Vulkan.Native.Naming (NativeObjectKind (ObjectFence), framelessFenceName)
 import Hetoimasia.GPU.Vulkan.Native.Roots
   ( GraphicsDeviceLost
+  , diagnosisOf
+  , stageRootsFailure
   , failRootsSessionBecause
   , nameRootsObject
   , readRootsInstrumentation
@@ -320,7 +322,7 @@ submitFrameless frames batch =
           else pure (Right ())
       case reset of
         Left failure@(ExceptionWithContext _ exception) → do
-          let reason = "resetting the fence of frame-less slot " <> Text.pack (show slot) <> " raised: " <> Text.pack (displayException exception)
+          reason ← (("resetting the fence of frame-less slot " <> Text.pack (show slot) <> " raised: ") <>) <$> diagnosisOf exception
           atomically $ do
             edit (\entry → entry {framelessFenceState = FenceUncertain reason})
             failRootsSessionBecause roots CleanupFailed reason
@@ -335,8 +337,8 @@ submitFrameless frames batch =
                   atomically (answered SubmissionFailedWithoutEffect)
                   pure (Right (SubmittedNothing (Text.pack (displayException exception))))
             Left failure@(ExceptionWithContext _ exception) → do
-              let reason = "vkQueueSubmit2 raised, so whether it submitted is unknown: " <> Text.pack (displayException exception)
-              atomically $ do
+              reason ← ("vkQueueSubmit2 raised, so whether it submitted is unknown: " <>) <$> diagnosisOf exception
+              atomically . stageRootsFailure roots $ do
                 answered SubmissionEffectUncertain
                 edit (\entry → entry {framelessFenceState = FenceUncertain reason})
                 failRootsSessionBecause roots UnknownSubmissionEffect (Text.pack (show batch) <> ": " <> reason)
@@ -359,7 +361,7 @@ submitFrameless frames batch =
       case committed of
         Nothing → do
           let reason = "the model refused to record a frame-less submission the queue accepted"
-          atomically $ do
+          atomically . stageRootsFailure roots $ do
             answered SubmissionEffectUncertain
             modifyTVar' (framesFrameless frames) (Map.adjust (\entry → entry {framelessFenceState = FenceUncertain reason}) slot)
             failRootsSessionBecause roots UnknownSubmissionEffect (Text.pack (show batch) <> ": " <> reason)
@@ -411,7 +413,7 @@ retireFrameless frames = owner (framesRecording frames) $ do
         tryWithContext @SomeException (rootsCall roots "vkDestroyFence" (opsDestroyFence ops handle (framelessFence sync))) >>= \case
           Right () → [] <$ atomically (modifyTVar' (framesFrameless frames) (Map.delete slot))
           Left failure@(ExceptionWithContext _ exception) → do
-            let reason = "destroying the fence of frame-less slot " <> Text.pack (show slot) <> " raised: " <> Text.pack (displayException exception)
+            reason ← (("destroying the fence of frame-less slot " <> Text.pack (show slot) <> " raised: ") <>) <$> diagnosisOf exception
             atomically $ do
               modifyTVar' (framesFrameless frames) (Map.adjust (\entry → entry {framelessFenceState = FenceUncertain reason, framelessDestruction = Just reason}) slot)
               failRootsSessionBecause roots CleanupFailed reason
