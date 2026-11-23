@@ -110,7 +110,6 @@ Each group declares:
 | `optional` | boolean | Required. An optional group runs only when explicitly requested. |
 | `platforms` | array of strings, optional | The `runner_os` values whose workers build this group's components. Omitting the key declares the group applicable everywhere, which is the ordinary case; a declaration narrows and can never widen. A plan taken on a platform the list does not name omits the group as [`platform-inapplicable`](#reasons-and-inputs_changed). Entries must be non-empty, distinct, and match the plan's `runner_os` exactly (`Linux`, `Darwin`), the way the [image](#the-linux-ci-image) compares it. A `floor` group may not declare it: the mandatory floor is selected on every platform. |
 | `preparation` | object, optional | A stage executed to completion **before** `command`, under a budget of its own: `{"command": [...], "timeout_seconds": N}`, both required and nothing else allowed, with the same rules as the group's own `command` and `timeout_seconds`. It exists for a group whose `timeout_seconds` is a measurement rather than a ceiling — a native check whose budget counts its display, fixture, examples and teardown but not the compilation that produced its executable. The plan copies it into the group's entry (`null` when absent), the [plan identity](#receipts) binds it, and a receipt records how it ended apart from the execution it prepared. A group whose preparation did not pass never runs its command and never passes; see [Preparation and the watchdog](#preparation-and-the-watchdog). |
-| `package_files` | boolean, optional | When `true`, every changed package description or project file (a basename ending in `.cabal` or starting with `cabal.project`, at any depth, either endpoint of a rename or a deletion included) affects the group, besides whatever else consumes the path. It adds the group and narrows nothing: such a path no declared or derived input consumes stays an unknown input. The issuer guard declares it. |
 
 Observed durations and pass/fail history are deliberately absent: the catalog
 declares what a group is, not how it has behaved.
@@ -163,7 +162,6 @@ the audited suite inventory, and which optional probes are local-only.
 | `test.render-2d-oracle` | `cabal test --project-file cabal.project.cpu hetoimasia-render-2d-oracle:render-2d-oracle-tests --test-show-details=direct` | no | no | any |
 | `smoke.console` | `cabal run exe:hetoimasia -- --smoke` | no | yes | any |
 | `test.workflow` | `cabal test workflow-tests --test-show-details=direct` | no | no | any |
-| `test.owner-tx-guard` | `cabal run owner-tx-guard -- check` | no | no | any |
 | `test.x11-helper` | `cabal test x11-helper-tests --test-show-details=direct` | yes | no | any |
 | `test.wayland-helper` | `cabal test wayland-helper-tests --test-show-details=direct` | yes | no | any |
 | `test.lua-hazard` | `cabal test hetoimasia-scripting-lua:lua-hazard-probes --test-show-details=direct` | yes | no | any |
@@ -996,86 +994,6 @@ Optional is a selection rule; it does not imply Python, a particular executor,
 or automatic eligibility for `$test`. See the
 [classification policy](test_classification.md) before adding a new group.
 
-### The issuer bridge's import guard
-
-`test.owner-tx-guard` runs `tools/owner-tx-guard` against the repository.
-Foundation's `OwnerTx` is abstract; an issuer embeds its own `STM` through
-`Hetoimasia.Foundation.OwnerTx.Issuer`, in the public sublibrary
-`hetoimasia-foundation:owner-tx-issuer` (see
-[Foundation's README](../packages/foundation/README.md#ownership-transactions)).
-Cabal cannot restrict who depends on a public sublibrary, so the guard does, by
-text alone, erring on the side of flagging. It catches accidental use of the
-bridge in this repository's manifests and project files; deliberate evasion is
-issuer review's.
-
-- **What it reads.** Every file at any depth under the root it is given whose
-  basename ends in `.cabal` or starts with `cabal.project`, whether or not a
-  project lists or imports it. It skips only `.git` (at any depth) and the
-  generated directories the catalog names at the root: `dist-newstyle`,
-  `dist-dev`, `dist-vulkan`, `dist-vulkan-proof`, `.worktrees`, `captures` and
-  `receipts`. The skip set is fixed in the tool. A file or directory symbolic
-  link met in the walk is unsupported, named, and never followed.
-  Cabal-syntax's `readFields`
-  only splits each file: a stanza is one outermost section, its header and
-  everything nested in it; a top-level field belongs to no stanza. A file the
-  lexer cannot split fails, and so does one it splits with a lexer warning
-  (tabs, inconsistent indentation, braces, a non-breaking space; a byte-order
-  mark aside), whose stanza boundaries are ambiguous. A quoted section
-  argument, and a non-ASCII field name or section header, are unsupported;
-  field values and comments may hold non-ASCII text. No file in this
-  repository draws any of these.
-- **What it matches.** `owner-tx-issuer`,
-  `Hetoimasia.Foundation.OwnerTx.Issuer` and
-  `Hetoimasia.Foundation.OwnerTx.Representation`, folding only ASCII `A` to `Z`,
-  each end at the edge of the text or next to a character outside
-  `[A-Za-z0-9_]` (a non-ASCII character included, so `éowner-tx-issuer` matches
-  and `owner-tx-İssuer` does not), in decoded field names, each physical value
-  line and section headers, full-line comments aside. Each match is reported on
-  the line that holds it. Every branch is searched as written; nothing is
-  evaluated.
-- **What it refuses.** A match outside a listed stanza, a match at the top
-  level, an allowlist entry naming more than one stanza, and a stale entry (no
-  such file or stanza, or a stanza with no match).
-
-`tools/validation/owner-tx-issuers.fields`, in Cabal's field syntax, lists the
-allowed stanzas, one `entry` section each, keyed by the repository-relative file
-and the stanza's header (its section name and arguments as Cabal's lexer splits
-them, exactly one space between tokens). A space or a quote in the file, and a
-quote or any other space in the header, are unsupported:
-
-```
-entry
-  file: packages/foundation/hetoimasia-foundation.cabal
-  stanza: library owner-tx-issuer
-  reason: the issuer bridge's definition
-```
-
-It starts with three stanzas of `packages/foundation/hetoimasia-foundation.cabal`:
-`library owner-tx-issuer` (the bridge's definition), `library internal` (its
-private representation) and `test-suite foundation-tests` (issuer
-composition). An issuer adds the file and stanza header of each component that
-needs the bridge, with its reason. An entry listed twice, an entry without exactly one
-nonempty `file`, `stanza` and `reason`, or any other field or section makes the
-allowlist unreadable.
-
-The guard evaluates no Cabal semantics. What a listed stanza's component
-imports, exports and instantiates is issuer review's, as
-[Foundation's README](../packages/foundation/README.md#ownership-transactions)
-sets out: no export that converts a caller's `STM` to or from `OwnerTx`,
-directly or through a wrapper, class method or re-export; no instance on `STM`
-or the protected Foundation types; and every component importing a listed
-common stanza or affected by a listed project section is reviewed too.
-
-The group is mandatory and not in the floor. Its inputs include everything the
-guard reads (`owner-tx-guard scope` prints them, and a `workflow-tests` example
-holds the group's inputs to cover that list): the project files and the
-`docs/toolchain` binding bundles, the sources of every scanned package, the
-allowlist and the tool itself. It declares `package_files`, so any changed
-package description or project file selects it wherever it sits; `tools/validation/` selects every group. Its preparation builds the
-tool's dependencies; the check itself runs in about a second. Its fixtures are
-text in `workflow-tests` (`tools/test/OwnerTxGuard.hs`), none built, each
-negative asserting the guard's own diagnostic.
-
 ### The macOS confinement probe
 
 `test.macos-confinement` runs LUA-15's local feasibility proof: a confined
@@ -1219,17 +1137,7 @@ Renames and deletions count both endpoints as changed. Each changed path is then
   containing `/` is anchored at the repository root and its `*` does not cross a
   separator; a pattern without `/` matches any file with that basename. The
   declared classes are Markdown documentation, `.editorconfig`, `.gitignore`,
-  license files, and the pull-request template (as Markdown). A package
-  description or project file, any basename ending in `.cabal` or starting with
-  `cabal.project` at any depth, is never non-affecting, however it is spelled
-  (`cabal.project.notes.md` included).
-
-Independently of its classification, such a path, either endpoint of a rename
-or a deletion included, affects every group that declares `package_files`
-(the issuer guard), even under another group's prefix. The rule adds those
-groups and narrows nothing: a package description or project file no declared
-or derived input consumes, such as a new root `cabal.project.freeze`, stays an
-unknown input and selects every non-optional group.
+  license files, and the pull-request template (as Markdown).
 - **unknown** — neither. The planner selects every non-optional group with reason
   `unknown-input` and reports the path. Unknown inputs, shared dependencies, and
   harness changes never select an optional group.
@@ -1340,12 +1248,9 @@ reads. That is exactly:
 - the `non_affecting_paths` classes the catalog already declares.
 
 A declared input outranks both, so a test-consumed Markdown file, a fixture, a
-shader, Lua, or an asset is never harmless. Neither is any file whose basename
-ends in `.cabal` or starts with `cabal.project`, at any depth, which is refused
-as prose independently of how a catalog classifies it: packaging decides what
-is compiled, and the issuer guard reads every one. Nor is a symbolic link,
-whatever its name: a tracked file turned into a link changes what the issuer
-guard reads.
+shader, Lua, or an asset is never harmless. Neither is `cabal.project` or any
+`.cabal` file, which are refused as prose independently of how a catalog
+classifies them: packaging decides what is compiled.
 
 The group inputs this rule consults are derived from the **candidate tree
 alone**, unlike selection, which unions both revisions so a retired input still
@@ -1587,7 +1492,7 @@ class to every execution:
 | Job | Runner class | Groups, in order |
 | --- | --- | --- |
 | `haskell-engine` | `cpu` | `build.all`, `test.engine`, `test.foundation`, `test.runtime`, `test.glfw`, `test.scripting-lua`, `test.scripting-lua-runtime`, `test.lua-engine`, `test.vulkan`, `test.vulkan-diagnostics`, `test.math`, `test.content`, `test.asset-image`, `test.render-api`, `test.render-2d`, `test.terrain`, `test.terrain-render-2d`, `test.terrain-runtime`, `smoke.console` |
-| `haskell-workflow` | `cpu` | `test.workflow`, `test.owner-tx-guard` |
+| `haskell-workflow` | `cpu` | `test.workflow` |
 | `glfw-native` | `display` | `test.glfw-native`, `test.glfw-wayland` |
 | `vulkan` | `cpu`, `display` | `test.vulkan-headless`, `test.vulkan-native`, `test.vulkan-wayland`, `test.vulkan-lua-engine-native`, `test.vulkan-run-native` |
 

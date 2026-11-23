@@ -160,7 +160,7 @@ cabal test hetoimasia-tests --test-show-details=direct
 
 - Tests belong to the package whose contract they assert. `foundation-tests`
   (`packages/foundation/test/`) owns the `Logging`, `Resources`, `Failures`,
-  `Recovery`, `Workers`, `Messaging`, and `Time` components, composed by
+  `Recovery`, `Workers`, `Messaging`, `Time`, and `Ownership` components, composed by
   `Test.Foundation.Spec`; it depends on no runtime, GLFW, or console code.
   `runtime-tests` (`packages/runtime/test/`) owns the `Runtime` group, composed
   by `Test.Runtime.Spec`: the runner and application lifecycle, logging
