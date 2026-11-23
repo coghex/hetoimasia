@@ -24,7 +24,7 @@ import Control.Concurrent.STM (atomically, newTVarIO, readTVarIO, throwSTM, writ
 import Control.Exception (AsyncException (ThreadKilled), ErrorCall (ErrorCall), Exception, SomeException, fromException, mask, throwIO, toException, try)
 import Control.Monad (forM_, join, void, when)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
-import Data.List (nub)
+import Data.List (isInfixOf, nub)
 import Data.Maybe (fromMaybe, isJust)
 import Data.List.NonEmpty (NonEmpty ((:|)))
 import Data.Text (Text)
@@ -65,6 +65,7 @@ import Hetoimasia.Foundation.OwnerTx (watchPublication)
 import Hetoimasia.GPU.Vulkan.Native.Roots
   ( Checkpoint (..)
   , rootsFailure
+  , rootsFailedCause
   , DiagnosticAlarm (..)
   , GraphicsDeviceLost (..)
   , RootsRetained (..)
@@ -175,10 +176,15 @@ spec = describe "Terminal failure" $ do
       let failure = atomically (watchPublication (rootsFailure (rigRoots rig)))
       (revision, failed) ← failure
       failed `shouldBe` False
+      atomically (rootsFailedCause (rigRoots rig)) `shouldReturn` Nothing
       atomically (failRootsSessionBecause (rigRoots rig) CleanupFailed "a cleanup failed")
       failure `shouldReturn` (revision + 1, True)
+      -- the cause the deciders read is the one the failing transaction fixed beside the publication
+      first ← atomically (rootsFailedCause (rigRoots rig))
+      fmap show first `shouldSatisfy` maybe False ("a cleanup failed" `isInfixOf`)
       atomically (failRootsSessionBecause (rigRoots rig) CleanupFailed "a later cleanup failed")
       failure `shouldReturn` (revision + 1, True)
+      atomically (rootsFailedCause (rigRoots rig)) `shouldReturn` first
       clean rig
       -- the model's own: a transition that loses the device fails the session, and the roots publish it with the transition
       rig' ← newRig
@@ -186,6 +192,11 @@ spec = describe "Terminal failure" $ do
       inModel rig' (Admitted . noteDeviceLoss)
       atomically (watchPublication (rootsFailure (rigRoots rig'))) `shouldReturn` (revision' + 1, True)
       primaryIs rig' (\case TerminalDeviceLost _ → True; _ → False)
+      -- a failure through the model alone fixes its cause as the primary in that same transaction: a later latch keeps it
+      fixed ← atomically (rootsFailedCause (rigRoots rig'))
+      fixed `shouldSatisfy` \case Just (TerminalDeviceLost _) → True; _ → False
+      atomically (failRootsSessionBecause (rigRoots rig') CleanupFailed "a later cleanup failed")
+      atomically (rootsFailedCause (rigRoots rig')) `shouldReturn` fixed
 
     it "stays pending while a failure of the owner's own holds first place in a transaction still running, then keeps it as the primary ahead of a later validation error" $ do
       rig ← newRig
