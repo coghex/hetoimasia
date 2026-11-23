@@ -1703,6 +1703,12 @@ spec = describe "terrain views (TRA-9 v2)" $ do
         atomically (latestWorld target) `shouldReturn` world
         -- the move landed at its eligibility; the later publication refusal keeps that result
         atomically (moveSettled move) `shouldReturn` Just MoveLanded
+        -- the refused attempt took no tag: once the host accepts again, the next revision carries the next one
+        atomically (setHeldAccepts (targetHeld target) True)
+        configureNow view (noConfigure {configureLight = Just brighter}) `shouldReturn` Right ()
+        let next = maybe 1 (+ 1) (readingPublished before)
+        settleUntil rig (publishedAtLeast view next)
+        atomically (readingPublished <$> readView view) `shouldReturn` Just next
 
     it "ends a view whose original window authority is revoked while its target stays usable, settling its pending move" $
       withPublished defaultOptions $ \rig target view → do
