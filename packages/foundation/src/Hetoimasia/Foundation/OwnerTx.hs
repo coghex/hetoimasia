@@ -1,10 +1,14 @@
--- | Ownership transactions: the transactions that commit an owner's facts, with no caller code inside them.
+-- | Ownership transactions: the transactions that commit an owner's facts, with no caller 'STM' or 'IO' inside them.
 --
 -- An 'OwnerTx' is abstract. What this module offers to build one is closed: allocating, reading and replacing
 -- 'OwnerCell's by value, reading a 'ReadOnly' capability or a 'Publication' another owner issued, and pure sequencing.
 -- 'commit' runs one atomically. Nothing here lifts an 'STM' or 'IO' action into one, waits or retries inside one, throws
--- from one, runs one as part of a larger 'STM' transaction, or takes a function to run inside one: a commit built from
--- this module runs only reads and writes of values its caller has already made.
+-- from one, runs one as part of a larger 'STM' transaction, or takes an effectful function to run inside one.
+--
+-- Pure sequencing and by-value writes can still evaluate caller expressions during a commit: a continuation may
+-- compute a replacement from a cell it just read, and 'writeCell' forces that replacement inside the transaction, so
+-- a partial expression there (a missing map lookup, say) raises in 'commit' and rolls the whole transaction back. A
+-- caller prepares every fallible input, and decides every refusal, before committing.
 --
 -- __Issuers.__ An issuer (a subsystem that owns state and exports ownership operations over it) keeps its own 'STM' and
 -- its existing state, and embeds a concrete operation through
