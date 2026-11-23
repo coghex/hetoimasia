@@ -736,6 +736,7 @@ module Hetoimasia.Runtime.GLFW
   , publishGraphicsWindowScene
   , publishGraphicsWindowSceneTx
   , graphicsWindowSceneAcceptsTx
+  , publishGraphicsWindowSceneUnlessShownTx
   , readOwnerWindowSceneAt
   , readOwnerWindowScenes
   , readGraphicsSceneRevisions

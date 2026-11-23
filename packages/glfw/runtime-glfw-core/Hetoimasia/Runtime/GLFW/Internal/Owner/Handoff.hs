@@ -126,6 +126,7 @@ module Hetoimasia.Runtime.GLFW.Internal.Owner.Handoff
   , WindowScenePublication (..)
   , publishOwnerWindowScene
   , ownerWindowSceneAccepts
+  , publishOwnerWindowSceneUnlessShown
   , readOwnerWindowSceneAt
   , readOwnerWindowScenes
   , pruneOwnerWindowScenes
@@ -725,6 +726,14 @@ publishOwnerWindowScene handoff held window scene =
         (Map.insert window (WindowSceneCell scene revision) (Map.filterWithKey (\at _ → at `elem` held) cells))
       modifyTVar' (handoffSceneStamp handoff) (+ 1)
       pure (WindowScenePublished window revision)
+
+-- | 'publishOwnerWindowScene' unless the window already shows a published scene: 'Nothing', changing nothing, when it
+-- does. The decision is the handoff's own, in the publication's transaction.
+publishOwnerWindowSceneUnlessShown
+  ∷ OwnerHandoff scene → [WindowId] → WindowId → Prepared scene → STM (Maybe WindowScenePublication)
+publishOwnerWindowSceneUnlessShown handoff held window scene = do
+  shown ← Map.member window <$> readTVar (handoffWindowScenes handoff)
+  if shown && window `elem` held then pure Nothing else Just <$> publishOwnerWindowScene handoff held window scene
 
 -- | Whether 'publishOwnerWindowScene' would accept a publication to this window now, read-only: the same guards, so a
 -- transaction that finds it accepting and then publishes, with nothing between, has it accepted.

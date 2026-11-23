@@ -85,6 +85,7 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Targets
   , registerTarget
   , unregisterTarget
   , publishTarget
+  , publishTargetUnlessShown
   , targetAccepts
   , targetsHeld
   , targetsRevisions
@@ -227,6 +228,14 @@ publishTarget targets gate identity scene =
         (targetsStanding targets)
         standing {standingLive = Map.insert identity cell {cellLatest = scene, cellRevision = revision} (standingLive standing)}
       pure (TargetScenePublished identity revision)
+
+-- | 'publishTarget' unless the target already shows a published scene ('Nothing', changing nothing): the registry
+-- decides it in the publication's own transaction.
+publishTargetUnlessShown ∷ Targets scene → STM (Maybe ActionRefusal) → OffscreenTargetId → Prepared scene → STM (Maybe TargetScenePublication)
+publishTargetUnlessShown targets gate identity scene =
+  targetRefusal targets gate identity >>= \case
+    Right (_, cell) | cellRevision cell > 0 → pure Nothing
+    _ → Just <$> publishTarget targets gate identity scene
 
 -- | Whether 'publishTarget' would accept a publication to this target now, given the host's gate, read-only: the same
 -- guards, so a transaction that finds it accepting and then publishes, with nothing between, has it accepted.

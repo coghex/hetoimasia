@@ -133,6 +133,7 @@ module Hetoimasia.GPU.Vulkan.GLFW
   , unregisterVulkanSceneTarget
   , publishVulkanTargetScene
   , vulkanTargetSceneAccepts
+  , publishVulkanTargetSceneUnlessShown
   , TargetScenePublication (..)
   , recordVulkanTargetBatch
   , TargetBatchRefusal (..)
@@ -380,6 +381,7 @@ module Hetoimasia.GPU.Vulkan.GLFW
   , requestVulkanReleaseTx
   , publishVulkanTargetSceneTx
   , vulkanTargetSceneAcceptsTx
+  , publishVulkanTargetSceneUnlessShownTx
   , readVulkanActionTx
   , readVulkanActionGateTx
   , constructedDisposalTx
@@ -417,6 +419,7 @@ import Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , defaultTargetCapacity
   , publishVulkanTargetScene
   , vulkanTargetSceneAccepts
+  , publishVulkanTargetSceneUnlessShown
   , recordVulkanTargetBatch
   , registerVulkanSceneTarget
   , unregisterVulkanSceneTarget
@@ -748,6 +751,11 @@ publishVulkanTargetSceneTx host target scene = fromIssuerSTM (publishVulkanTarge
 -- | 'vulkanTargetSceneAccepts' in a commit: read-only, the guards 'publishVulkanTargetSceneTx' checks.
 vulkanTargetSceneAcceptsTx ∷ VulkanHost scene → OffscreenTargetId → OwnerTx Bool
 vulkanTargetSceneAcceptsTx host target = fromIssuerSTM (vulkanTargetSceneAccepts host target)
+
+-- | 'publishVulkanTargetSceneUnlessShown' in a commit: the registry decides, in its own transaction, whether the
+-- target already shows a scene.
+publishVulkanTargetSceneUnlessShownTx ∷ VulkanHost scene → OffscreenTargetId → Prepared scene → OwnerTx (Maybe TargetScenePublication)
+publishVulkanTargetSceneUnlessShownTx host target scene = fromIssuerSTM (publishVulkanTargetSceneUnlessShown host target scene)
 
 -- | 'readVulkanAction' in a commit: read-only, 'Nothing' while the action has not ended.
 readVulkanActionTx ∷ ActionTicket r → OwnerTx (Maybe (ActionOutcome r))

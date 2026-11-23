@@ -42,6 +42,7 @@ module Hetoimasia.LuaEngine.Graphics.Window.Host
   , WindowTarget (..)
   , WindowView
   , windowViewAccepts
+  , windowViewPublishUnlessShown
   , WindowVersion
   , windowViewId
   , windowViewAttachment
@@ -139,6 +140,7 @@ import Hetoimasia.Runtime.GLFW
   , publishGraphicsWindowScene
   , publishGraphicsWindowSceneTx
   , graphicsWindowSceneAcceptsTx
+  , publishGraphicsWindowSceneUnlessShownTx
   , readGraphicsService
   , readOwnerFailure
   , readTargetStanding
@@ -176,6 +178,7 @@ data WindowView scene = WindowView
   , wvGeometry ∷ STM (WindowGeometry, WindowVersion)
   , wvPublish ∷ Prepared scene → OwnerTx WindowScenePublication
   , wvAccepts ∷ OwnerTx Bool
+  , wvPublishUnlessShown ∷ Prepared scene → OwnerTx (Maybe WindowScenePublication)
   }
 
 -- | The version of the window observation a geometry was read from: its writer advances it with every observation.
@@ -195,6 +198,11 @@ windowViewUsable = wvUsable
 -- | The window's geometry as its latest observation gives it, with that observation's version.
 windowViewGeometry ∷ WindowView scene → STM (WindowGeometry, WindowVersion)
 windowViewGeometry = wvGeometry
+
+-- | 'windowViewPublish' unless the window already shows a published scene ('Nothing', changing nothing): the handoff
+-- decides it in the publication's own transaction.
+windowViewPublishUnlessShown ∷ WindowView scene → Prepared scene → OwnerTx (Maybe WindowScenePublication)
+windowViewPublishUnlessShown = wvPublishUnlessShown
 
 -- | Whether 'windowViewPublish' would accept a publication now, read-only in a commit: the handoff's same guards.
 windowViewAccepts ∷ WindowView scene → OwnerTx Bool
@@ -444,6 +452,7 @@ target vulkan var token = do
           publish = publishGraphicsWindowScene (vulkanGraphicsOwner vulkan) (madeWindow made)
           publishTx = publishGraphicsWindowSceneTx (vulkanGraphicsOwner vulkan) (madeWindow made)
           acceptsTx = graphicsWindowSceneAcceptsTx (vulkanGraphicsOwner vulkan) (madeWindow made)
+          initialTx = publishGraphicsWindowSceneUnlessShownTx (vulkanGraphicsOwner vulkan) (madeWindow made)
       pure $ case current of
         StandingUsable →
           Just
@@ -454,7 +463,7 @@ target vulkan var token = do
               , targetPublishSTM = publish
               , targetUsable = usable
               , targetGeometry = fst <$> geometry
-              , targetView = WindowView (madeWindow made) (graphicsAttachment service) usable geometry publishTx acceptsTx
+              , targetView = WindowView (madeWindow made) (graphicsAttachment service) usable geometry publishTx acceptsTx initialTx
               }
         _ → Nothing
     _ → pure Nothing

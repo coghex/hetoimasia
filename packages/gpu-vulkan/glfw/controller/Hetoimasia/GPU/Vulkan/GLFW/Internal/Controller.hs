@@ -233,6 +233,7 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , unregisterVulkanSceneTarget
   , publishVulkanTargetScene
   , vulkanTargetSceneAccepts
+  , publishVulkanTargetSceneUnlessShown
   , recordVulkanTargetBatch
   , defaultTargetCapacity
 
@@ -452,6 +453,7 @@ import Hetoimasia.GPU.Vulkan.GLFW.Internal.Targets
   , newTargets
   , pendingScenes
   , publishTarget
+  , publishTargetUnlessShown
   , targetAccepts
   , recordAdopted
   , registerTarget
@@ -1252,6 +1254,11 @@ unregisterVulkanSceneTarget host = unregisterTarget (vulkanTargets host)
 publishVulkanTargetScene ∷ VulkanHost scene → OffscreenTargetId → Prepared scene → STM TargetScenePublication
 publishVulkanTargetScene host = case vulkanController host of
   VulkanController state → publishTarget (vulkanTargets host) (actionGate (stateRoots state) (stateOwnerOpen state))
+
+-- | 'publishVulkanTargetScene' unless the target already shows a published scene ('Nothing', changing nothing).
+publishVulkanTargetSceneUnlessShown ∷ VulkanHost scene → OffscreenTargetId → Prepared scene → STM (Maybe TargetScenePublication)
+publishVulkanTargetSceneUnlessShown host = case vulkanController host of
+  VulkanController state → publishTargetUnlessShown (vulkanTargets host) (actionGate (stateRoots state) (stateOwnerOpen state))
 
 -- | Whether 'publishVulkanTargetScene' would accept a publication to this target now, read-only: the same guards
 -- (the host's gate, the target registered).

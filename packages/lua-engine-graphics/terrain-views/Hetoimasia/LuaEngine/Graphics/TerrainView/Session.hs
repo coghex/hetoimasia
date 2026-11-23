@@ -1114,17 +1114,17 @@ commitOpen service vs = do
       setViewDemandTx (portTerrain ports) (vsRuntime vs) (vsLease vs) (svNoDemand service) >>= \case
         Left why → pure (Left (OpenArena why))
         Right _ → do
-          (geometry, shown) ← own $ do
+          geometry ← own $ do
             -- the claim is free: this commit read it so
             _ ← takeClaim (portClaims ports) key (vsId vs)
             forM_ (Set.toList (styleParents style)) (ledgerRetainInterest (portLedger ports))
             modifyTVar' (svViews service) (Map.insert (vsId vs) vs)
             openReceipt (portReceipts ports) (vsId vs)
             surfaceBind (vtSurface target)
-            (,) <$> surfaceGeometry (vtSurface target) <*> surfaceShowing (vtSurface target)
+            surfaceGeometry (vtSurface target)
           -- a target that shows nothing yet is asked for its first frame with the real empty revision; one that shows
-          -- a scene keeps it until the view's first revision replaces it (its frame gives the metrics)
-          when (geometry == GeometryUnknown && not shown) (void (surfacePublish (vtSurface target) (portInitial ports)))
+          -- a scene keeps it until the view's first revision replaces it (its frame gives the metrics): its host decides
+          when (geometry == GeometryUnknown) (surfacePublishUnlessShown (vtSurface target) (portInitial ports))
           pure (Right ())
 
 -- ---------------------------------------------------------------------------

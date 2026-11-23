@@ -42,7 +42,7 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView.Surface
   , surfaceGeometry
   , surfaceVersion
   , surfaceRevalidation
-  , surfaceShowing
+  , surfacePublishUnlessShown
   , surfaceBind
   , surfaceUnbind
   , surfaceAccepts
@@ -51,23 +51,18 @@ module Hetoimasia.LuaEngine.Graphics.TerrainView.Surface
 
 import Control.Concurrent.STM (STM, TVar, modifyTVar', newTVar, readTVar, retry, throwSTM, writeTVar)
 import Control.Exception (AsyncException (ThreadKilled), ErrorCall (ErrorCall), Exception (displayException), throw)
-import Control.Monad (when)
+import Control.Monad (void, when)
 import Data.Functor ((<&>))
-import qualified Data.Map.Strict as Map
-import Data.Maybe (fromMaybe)
 import Data.Word (Word64)
 import Hetoimasia.Foundation.Messaging.Payload (Prepared, preparedValue)
 import Hetoimasia.GPU.Vulkan.GLFW
   ( OffscreenTargetId
-  , SceneTargetKey (..)
   , TargetScenePublication (..)
   , VulkanHost
-  , VulkanSceneState (..)
   , WindowScenePublication (..)
-  , WindowSceneStanding (..)
   , publishVulkanTargetSceneTx
+  , publishVulkanTargetSceneUnlessShownTx
   , vulkanTargetSceneAcceptsTx
-  , readVulkanSceneState
   )
 import Hetoimasia.LuaEngine.Graphics.Scene.Ledger (GraphicsScene)
 import Hetoimasia.LuaEngine.Graphics.Scene.Receipts (DrawReceipts, unwatchFrameMetrics, watchFrameMetrics)
@@ -76,9 +71,9 @@ import Hetoimasia.LuaEngine.Graphics.Window.Host
   , WindowVersion
   , WindowView
   , windowViewAccepts
+  , windowViewPublishUnlessShown
   , windowViewAttachment
   , windowViewGeometry
-  , windowViewId
   , windowViewPublish
   , windowViewUsable
   )
@@ -268,12 +263,18 @@ surfaceRevalidation = \case
       Just HeldRaisesUnspeakable → throwSTM Unspeakable
   _ → pure ()
 
--- | Whether the target holds a published scene (an M1 scene, say), whose frame is or was drawn.
-surfaceShowing ∷ ViewSurface → STM Bool
-surfaceShowing = \case
-  WindowSurface host _ view _ → showing host (KeyWindow (windowViewId view))
-  OffscreenSurface host target _ → showing host (KeyOffscreen target)
-  HeldSurface held → not . null <$> readTVar (heldPublished held)
+-- | Publish a scene to the target unless it already shows one (an M1 scene, say, whose frame is or was drawn), as its
+-- host's own ownership operation: the host decides, in the publication's own transaction.
+surfacePublishUnlessShown ∷ ViewSurface → Prepared GraphicsScene → OwnerTx ()
+surfacePublishUnlessShown surface scene = case surface of
+  WindowSurface _ _ view _ → void (windowViewPublishUnlessShown view scene)
+  OffscreenSurface host target _ → void (publishVulkanTargetSceneUnlessShownTx host target scene)
+  -- a held target is the views' own (a test's), its publication this module's transaction
+  HeldSurface held → fromIssuerSTM $ do
+    published ← readTVar (heldPublished held)
+    accepts ← readTVar (heldAccepting held)
+    when (null published && accepts) $
+      writeTVar (heldPublished held) [(1, preparedValue scene)]
 
 -- | Watch the target's frame metrics, from the view's open.
 surfaceBind ∷ ViewSurface → STM ()
@@ -313,7 +314,3 @@ surfacePublish surface scene = case surface of
       published ← readTVar (heldPublished held)
       writeTVar (heldPublished held) ((fromIntegral (length published) + 1, preparedValue scene) : published)
     pure accepts
-
--- Whether the host holds a scene published for this target.
-showing ∷ VulkanHost GraphicsScene → SceneTargetKey → STM Bool
-showing host key = maybe False ((> 0) . fromMaybe 0 . windowPublished) . Map.lookup key . sceneWindows <$> readVulkanSceneState host
