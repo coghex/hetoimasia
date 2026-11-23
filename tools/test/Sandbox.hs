@@ -40,16 +40,9 @@ sanitizedEnvironment = do
 
 -- | Run a command to completion through the shared subprocess facility, which owns the child: it is ended, and reaped, however the
 -- call ends. The run bound is the 30-minute budget of the group that runs these examples, a hang-catcher and not a timing assumption.
---
--- Every command runs with @PYTHONDONTWRITEBYTECODE=1@, whatever environment it is given: an interpreter these examples
--- start, directly or through a script, never writes bytecode beside a module it imports, so the checkout's policy roots
--- and classified inputs are unchanged after the suite. A tool run with @-I@ ignores the variable and turns bytecode off
--- itself, as every entry point under @tools/@ does.
 run ∷ [(String, String)] → FilePath → String → [String] → IO (ExitCode, String, String)
 run environment path executable args =
-  runCaptured (Within (1800 * 1000000)) (proc executable args) {cwd = Just path, env = Just (noBytecode environment)} ""
-  where
-    noBytecode settings = ("PYTHONDONTWRITEBYTECODE", "1") : filter ((/= "PYTHONDONTWRITEBYTECODE") . fst) settings
+  runCaptured (Within (1800 * 1000000)) (proc executable args) {cwd = Just path, env = Just environment} ""
 
 -- | Run Git, failing the example with its diagnostics when it does not succeed.
 git ∷ [(String, String)] → FilePath → [String] → IO String
