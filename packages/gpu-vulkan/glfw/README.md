@@ -65,8 +65,7 @@ and the suites' verification capture.
   owner's exit began, no device exists or `vulkanTargetCapacity` targets are
   accounted for) and `unregisterVulkanSceneTarget` ends it. `publishVulkanTargetScene`
   is its latest-value publication, a transaction that never waits and answers a target
-  the host does not hold naming it; `vulkanTargetSceneAccepts` reads its guards without publishing, and
-  `publishVulkanTargetSceneUnlessShown` publishes only to a target that shows no published scene yet. A release request waits for the target's
+  the host does not hold naming it. A release request waits for the target's
   accepted revision as for a window's. `recordVulkanTargetBatch` is the production
   recording boundary: inside an owner-thread action it records a frame-less batch
   with the exact scene the host adopted for the target, binds the batch's use of the
@@ -74,15 +73,6 @@ and the suites' verification capture.
   released only after every such batch was discarded or completed. `WindowId` is not
   widened or minted: an offscreen target is never a window
   ([Offscreen scene targets](../../../docs/gpu_backend.md#offscreen-scene-targets)).
-- Ownership operations: for a holder composing the host's decisions with its own facts in one Foundation `commit`, the
-  admissions and readings are also `OwnerTx` operations embedded through the issuer bridge (`submitVulkanActionTx`,
-  `requestVulkanReleaseTx`, `publishVulkanTargetSceneTx`, `vulkanTargetSceneAcceptsTx`,
-  `publishVulkanTargetSceneUnlessShownTx`, `readVulkanActionTx`, `readVulkanActionGateTx`, `constructedDisposalTx`).
-  Each reads only the controller's own cells and the handle or prepared value given, answers a refusal as data and never
-  waits or raises; an action's body runs later, on the owner's thread. A reader that waits for the owner's queue or its
-  release lane to have room reads the admission's own decision (`readVulkanActionAdmission`,
-  `readVulkanReleaseAdmission`) outside any commit. The action gate decides a failed session from the roots' published
-  failure (`rootsFailure`).
 - The renderer is the consumer's (VK-19). Each frame's `FrameRequest` names
   its target, slot and image and the image's extent and color format before
   anything of the renderer's is recorded, and the renderer is lent the
