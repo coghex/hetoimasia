@@ -85,6 +85,7 @@ module Hetoimasia.Scripting.Lua.Lease.State
 
     -- * Reading
   , liveKey
+  , livenessOf
   , lookupSlot
   , ScopeSummary (..)
   , summarize
@@ -122,7 +123,6 @@ import Control.Concurrent.STM
   ( STM
   , TVar
   , atomically
-  , modifyTVar'
   , newTVarIO
   , readTVar
   , retry
@@ -141,6 +141,8 @@ import qualified Data.Text as Text
 import Data.Typeable (Typeable)
 import Data.Word (Word64)
 import GHC.Stack (HasCallStack)
+import Hetoimasia.Foundation.Messaging.Payload (Prepared, prepare)
+import Hetoimasia.Foundation.OwnerTx (Publication, Publisher, newPublisher, publication, publish)
 import Hetoimasia.Foundation.Resource (Assembly, cleanupFailureException, cleanupFailureLabel, cleanupFailuresInContext)
 import Hetoimasia.Foundation.Resource.OwnedCollection
   ( Member
@@ -166,6 +168,9 @@ data Leases = Leases
     -- ^ What one instance may have charged at once: the resources it holds and the
     -- retirements its released ones still await.
   , leasesState ∷ !(TVar LeaseState)
+  , leasesLive ∷ !(Prepared Bool)
+  , leasesEnded ∷ !(Prepared Bool)
+    -- ^ The two values a lease's liveness is published as, prepared once.
   , leasesRunning ∷ !(IORef (Maybe (IO (Maybe Word64))))
     -- ^ How a binding asks which instance's Lua is running: the owner's, set when it
     -- takes the handle.
@@ -177,7 +182,40 @@ newLeasesHandle ∷ Lending → Int → IO Leases
 newLeasesHandle lending capacity =
   Leases lending capacity
     <$> newTVarIO (LeaseState 1 Map.empty Map.empty [])
+    <*> prepare True
+    <*> prepare False
     <*> newIORef Nothing
+
+-- Every write of the state: the new state, and the liveness of each lease it changes published
+-- with it, in the same transaction. A slot that becomes live, stops being live, or goes while
+-- live publishes its new liveness; nothing else publishes.
+putState ∷ Leases → LeaseState → STM ()
+putState leases after = do
+  before ← readTVar (leasesState leases)
+  after `seq` writeTVar (leasesState leases) after
+  forM_ (changedLiveness (lsSlots before) (lsSlots after)) $ \(publisher, live) →
+    publish publisher (if live then leasesLive leases else leasesEnded leases)
+
+modifyState ∷ Leases → (LeaseState → LeaseState) → STM ()
+modifyState leases change = readTVar (leasesState leases) >>= putState leases . change
+
+-- The leases whose liveness differs between two states, with their publisher and liveness now.
+changedLiveness ∷ Map Word64 Slot → Map Word64 Slot → [(Publisher Bool, Bool)]
+changedLiveness before after = Map.elems (Map.mergeWithKey both gone came before after)
+  where
+    live slot = case slotPhase slot of
+      SlotLive → True
+      _ → False
+    both _ old new
+      | live old /= live new = Just (slotLiveness new, live new)
+      | otherwise = Nothing
+    gone = Map.mapMaybe (\old → if live old then Just (slotLiveness old, False) else Nothing)
+    came = Map.mapMaybe (\new → if live new then Just (slotLiveness new, True) else Nothing)
+
+-- | A lease's liveness as its owner publishes it ('liveKey', with every change), for a reader
+-- that verifies it inside another owner's commit. 'Nothing' for a key the table no longer holds.
+livenessOf ∷ Leases → Word64 → STM (Maybe (Publication Bool))
+livenessOf leases key = fmap (publication . slotLiveness) . Map.lookup key . lsSlots <$> readTVar (leasesState leases)
 
 -- | Take the handle for an owner, telling it how to find the instance whose Lua is
 -- running. A handle serves one owner because the 'Lending' it is made over does: the
@@ -230,6 +268,9 @@ data Slot = Slot
     -- ^ The retirements it awaits, and the disposals of what they need, handed over by the
     -- assembly's releases: run, in order, once every one of them has completed, and never
     -- if one fails.
+  , slotLiveness ∷ !(Publisher Bool)
+    -- ^ Whether it is live ('liveKey'), published with every change of its phase, its
+    -- removal included, in the transaction that makes the change ('putState').
   }
 
 -- | An instance's scope.
@@ -318,14 +359,14 @@ instance Exception LeasesRefused
 -- | Give an instance its scope. Idempotent.
 openScope ∷ Leases → Word64 → STM ()
 openScope leases number =
-  modifyTVar' (leasesState leases) $ \state →
+  modifyState leases $ \state →
     state {lsScopes = Map.insertWith (\_ held → held) number (Scope True 0 0 0 []) (lsScopes state)}
 
 -- | Take an instance's scope away, once it has settled. What it still has charged
 -- is not: the slots are the owner's to poll and retain.
 dissolveScope ∷ Leases → Word64 → STM ()
 dissolveScope leases number =
-  modifyTVar' (leasesState leases) $ \state →
+  modifyState leases $ \state →
     state {lsScopes = Map.delete number (lsScopes state)}
 
 -- | How many slots an instance has charged.
@@ -344,9 +385,10 @@ reserve leases number ownership = do
       | charged >= leasesCapacity leases → pure (Left (CapacityExhausted (leasesCapacity leases) charged))
       | otherwise → do
           let key = lsNext state
-          writeTVar (leasesState leases) state
+          liveness ← newPublisher (leasesEnded leases)
+          putState leases state
             { lsNext = key + 1
-            , lsSlots = Map.insert key (Slot number ownership SlotConstructing Nothing noRetained) (lsSlots state)
+            , lsSlots = Map.insert key (Slot number ownership SlotConstructing Nothing noRetained liveness) (lsSlots state)
             }
           pure (Right key)
       where
@@ -356,7 +398,7 @@ reserve leases number ownership = do
 -- to Lua. Runs in the step that registered the member, masked.
 register ∷ Leases → Word64 → Holding → STM ()
 register leases key holding =
-  modifyTVar' (leasesState leases) $ \state →
+  modifyState leases $ \state →
     state {lsSlots = Map.adjust (\slot → slot {slotPhase = SlotLive, slotHolding = Just holding}) key (lsSlots state)}
 
 -- | Give back a reservation whose acquisition did not complete. A slot that is
@@ -364,7 +406,7 @@ register leases key holding =
 -- that has retirements pending keeps its charge until they complete.
 abandon ∷ Leases → Word64 → STM ()
 abandon leases key =
-  modifyTVar' (leasesState leases) $ \state →
+  modifyState leases $ \state →
     state {lsSlots = Map.update undo key (lsSlots state)}
   where
     undo slot = case slotPhase slot of
@@ -379,7 +421,7 @@ abandon leases key =
 -- resource) stays charged with it. The failure is the evidence.
 retainFailed ∷ Leases → Word64 → ExceptionWithContext SomeException → STM ()
 retainFailed leases key failure =
-  modifyTVar' (leasesState leases) $ \state →
+  modifyState leases $ \state →
     state {lsSlots = Map.adjust (\slot → slot {slotPhase = SlotFailed failure, slotHolding = Nothing}) key (lsSlots state)}
 
 -- | Whether a slot is still charged: reserved, live, releasing, or released with a provider's retirement
@@ -392,7 +434,7 @@ slotPresent leases key = Map.member key . lsSlots <$> readTVar (leasesState leas
 -- still awaited, as an orphan.
 recordRetirement ∷ Leases → Word64 → Text → STM RetirementState → STM ()
 recordRetirement leases key label poll =
-  modifyTVar' (leasesState leases) $ \state →
+  modifyState leases $ \state →
     let obligation = Obligation label poll
      in case Map.lookup key (lsSlots state) of
           Just slot →
@@ -408,7 +450,7 @@ deferDisposal leases key disposal = do
   case Map.lookup key (lsSlots state) of
     Just slot → do
       let (held, now) = defer disposal (slotRetained slot)
-      writeTVar (leasesState leases) state {lsSlots = Map.insert key slot {slotRetained = held} (lsSlots state)}
+      putState leases state {lsSlots = Map.insert key slot {slotRetained = held} (lsSlots state)}
       pure now
     Nothing → pure (Just disposal)
 
@@ -474,7 +516,7 @@ readScope leases number = Map.lookup number . lsScopes <$> readTVar (leasesState
 -- | Note a failure on an instance's scope: bounded, oldest first.
 noteScope ∷ Leases → Word64 → Text → STM ()
 noteScope leases number note =
-  modifyTVar' (leasesState leases) $ \state →
+  modifyState leases $ \state →
     state {lsScopes = Map.adjust bump number (lsScopes state)}
   where
     bump scope =
@@ -515,7 +557,7 @@ beginRelease leases caller key = do
       | caller /= Just (slotInstance slot) → pure (StartRefused NotTheOwner)
       | otherwise → case (slotPhase slot, slotHolding slot) of
           (SlotLive, Just holding) → do
-            writeTVar (leasesState leases) state
+            putState leases state
               { lsSlots = Map.insert key slot {slotPhase = SlotReleasing} (lsSlots state)
               }
             pure (StartLive holding)
@@ -542,13 +584,13 @@ endRelease leases key outcome = do
     Nothing → pure EndedWhole
     Just slot → case outcome of
       Left failure → do
-        writeTVar (leasesState leases) state
+        putState leases state
           { lsSlots = Map.insert key slot {slotPhase = SlotFailed failure, slotHolding = Nothing} (lsSlots state)
           }
         pure (EndedFailed failure)
       Right () → do
         let pending = retainedPending (slotRetained slot)
-        writeTVar (leasesState leases) state
+        putState leases state
           { lsSlots =
               if pending
                 then Map.insert key slot {slotPhase = SlotReleased, slotHolding = Nothing} (lsSlots state)
@@ -560,7 +602,7 @@ endRelease leases key outcome = do
 -- nothing of it has ended.
 restoreLive ∷ Leases → Word64 → STM ()
 restoreLive leases key =
-  modifyTVar' (leasesState leases) $ \state →
+  modifyState leases $ \state →
     state {lsSlots = Map.adjust (\slot → case slotPhase slot of SlotReleasing → slot {slotPhase = SlotLive}; _ → slot) key (lsSlots state)}
 
 -- The owner's side ------------------------------------------------------------------------
@@ -595,7 +637,7 @@ drainScope ∷ LeaseHost → Word64 → IO DrainReport
 drainScope host number = mask_ $ do
   let leases = lhLeases host
   keys ← atomically $ do
-    modifyTVar' (leasesState leases) $ \state →
+    modifyState leases $ \state →
       state {lsScopes = Map.adjust (\scope → scope {scopeOpen = False}) number (lsScopes state)}
     state ← readTVar (leasesState leases)
     pure
@@ -607,7 +649,7 @@ drainScope host number = mask_ $ do
   results ← forM keys (releaseKey host number)
   let failures = [failure | Left failure ← results]
       released = length [() | Right () ← results]
-  atomically $ modifyTVar' (leasesState leases) $ \state →
+  atomically $ modifyState leases $ \state →
     state {lsScopes = Map.adjust (\scope → scope {scopeDrained = scopeDrained scope + released}) number (lsScopes state)}
   pure (DrainReport released failures)
   where
@@ -707,7 +749,7 @@ data Disposals = Disposals
 -- failure of the first that did not, which every later release of it answers.
 finishDisposals ∷ Leases → Word64 → Maybe (ExceptionWithContext SomeException) → STM ()
 finishDisposals leases key failure =
-  modifyTVar' (leasesState leases) $ \state →
+  modifyState leases $ \state →
     state {lsSlots = Map.update settle key (lsSlots state)}
   where
     settle slot = case (failure, slotPhase slot) of
@@ -754,7 +796,7 @@ serviceRetirements leases = do
   (orphans, endedOrphans') ← pollAll (lsOrphans state)
   let endedOrphans = [(finishedLabel done, finishedFailure done) | done ← endedOrphans']
       ended = concat [completions | (_, completions, _) ← swept] <> [RetirementEnd Nothing label failure | (label, failure) ← endedOrphans]
-  writeTVar (leasesState leases) state
+  putState leases state
     { lsSlots = Map.fromList [(key, slot) | ((key, Just slot), _, _) ← swept]
     , lsOrphans = orphans
     , lsScopes = foldr bumpScope (lsScopes state) ended

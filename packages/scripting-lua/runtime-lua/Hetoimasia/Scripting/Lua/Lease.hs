@@ -192,6 +192,7 @@ module Hetoimasia.Scripting.Lua.Lease
     -- * The application's check
   , leaseLive
   , leaseLiveSTM
+  , leaseLiveness
   , leaseCapabilityType
 
     -- * Reading
@@ -212,6 +213,7 @@ import Hetoimasia.Foundation.Resource (Assembly, acquirePart, cleanupFailureExce
 import Hetoimasia.Foundation.Resource.OwnedCollection (MemberStatus (MemberLive), Retirement (AlreadyRetired, Retired, RetirementInUse), memberStatus)
 import Hetoimasia.Scripting.Lua.Instance.Types (InstanceId (instanceLocal))
 import Hetoimasia.Scripting.Lua.Internal.Fault (CallRefusal (CallRefusal))
+import Hetoimasia.Foundation.OwnerTx (Publication)
 import Hetoimasia.Scripting.Lua.Lease.State
 import Hetoimasia.Scripting.Lua.Lending
   ( Lending
@@ -408,6 +410,12 @@ leaseLive leases key = atomically (liveKey leases key)
 -- begins after it cannot be missed.
 leaseLiveSTM ∷ Leases → Word64 → STM Bool
 leaseLiveSTM = liveKey
+
+-- | The lease's liveness as this table publishes it, with every change of it, in the transaction
+-- that makes the change: for an owner that verifies a lease inside its own commit. 'Nothing' for a
+-- key the table does not hold.
+leaseLiveness ∷ Leases → Word64 → STM (Maybe (Publication Bool))
+leaseLiveness = livenessOf
 
 -- | A capability type for lease handles, named, whose liveness is the lease's.
 leaseCapabilityType ∷ Leases → Text → CapabilityType

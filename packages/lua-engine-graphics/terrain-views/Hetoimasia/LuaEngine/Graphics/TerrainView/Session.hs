@@ -235,9 +235,12 @@ data ViewStyle = ViewStyle
 -- | The style of an owning instance's two retained parents ("Hetoimasia.LuaEngine.Graphics.TerrainView.Style").
 retainedStyle ∷ StyleRequest → IO (Either StyleRefusal ViewStyle)
 retainedStyle request =
-  acquireStyle request >>= pure . fmap (\style → ViewStyle (styleAssets style) (styleTextures style) (styleIdentities style) (styleMappedMaterials style) leases (releaseStyle style))
-  where
-    leases = [LeaseAuthority (styleLeases request) (styleColourLease request), LeaseAuthority (styleLeases request) (styleNormalLease request)]
+  acquireStyle request >>= \case
+    Left refusal → pure (Left refusal)
+    Right style → do
+      -- the parents' leases as their table publishes them: a lease gone meanwhile is an authority already ended
+      leases ← atomically (mapM (leaseAuthority (styleLeases request)) [styleColourLease request, styleNormalLease request])
+      pure (Right (ViewStyle (styleAssets style) (styleTextures style) (styleIdentities style) (styleMappedMaterials style) leases (releaseStyle style)))
 
 -- ---------------------------------------------------------------------------
 -- State

@@ -84,9 +84,9 @@ import Hetoimasia.LuaEngine.Graphics.Window.Host
   )
 import Hetoimasia.Render.TwoD.Metrics (PixelExtent (..), TargetMetrics (..), validMetrics)
 import Hetoimasia.Foundation.Admission (AdmissionToken, tokenOpen)
-import Hetoimasia.Foundation.OwnerTx (OwnerTx)
+import Hetoimasia.Foundation.OwnerTx (OwnerTx, Publication, watchPublication)
 import Hetoimasia.Foundation.OwnerTx.Issuer (fromIssuerSTM)
-import Hetoimasia.Scripting.Lua.Lease (Leases, leaseLiveSTM)
+import Hetoimasia.Scripting.Lua.Lease (Leases, leaseLiveness)
 
 -- | A target a view attaches to: its incarnation's key, the target itself, and whether its frames carry the qualified
 -- depth image.
@@ -105,22 +105,25 @@ data ViewSurface
   | -- | A target held in memory.
     HeldSurface !HeldTarget
 
--- | An original authority the caller holds, live until it ends, once: a lease (exact and never reissued), or an
--- admission held in memory, whose closing is permanent. Neither can go live again once ended, so the views' evidence
--- of it is a Boolean. Clients make only a lease authority ('leaseAuthority').
-data Authority = LeaseAuthority !Leases !Word64 | HeldAuthority !AdmissionToken
+-- | An original authority the caller holds, live until it ends: a lease's liveness as its table publishes it with every
+-- change (a release begun, undone or finished, the lease gone), an admission held in memory, whose closing is permanent,
+-- or one already ended when it was taken. A commit verifies each by reading what its owner published or issued, never
+-- by running the owner's transaction. Clients make only a lease authority ('leaseAuthority').
+data Authority = LeaseAuthority !(Publication Bool) | HeldAuthority !AdmissionToken | AuthorityEnded
 
--- | The authority of this exact lease of the table.
-leaseAuthority ∷ Leases → Word64 → Authority
-leaseAuthority = LeaseAuthority
+-- | The authority of this exact lease of the table, as the table publishes it: ended already when the table no longer
+-- holds the lease.
+leaseAuthority ∷ Leases → Word64 → STM Authority
+leaseAuthority table key = maybe AuthorityEnded LeaseAuthority <$> leaseLiveness table key
 
--- | Whether every one of these authorities is still live.
+-- | Whether every one of these authorities is still live, read from what their owners published or issued.
 leasesLive ∷ [Authority] → STM Bool
 leasesLive = fmap and . mapM live
   where
     live = \case
-      LeaseAuthority table key → leaseLiveSTM table key
+      LeaseAuthority liveness → snd <$> watchPublication liveness
       HeldAuthority token → tokenOpen token
+      AuthorityEnded → pure False
 
 -- | A target's geometry as observed now: unknown (incomplete), zero (an observed zero dimension, logical or
 -- framebuffer, whatever else is missing), or a complete positive extent.
