@@ -2346,11 +2346,11 @@ sweepPending service = do
     when (CandidateRunnable `elem` decisions) (writeTVar (svKickWanted service) True)
   pure (not (null swept))
 
--- Whether the sweep would collect a build now: a pending build left to it whose receipt is sealed. Read-only, for the
--- watcher to wait on outside any commit.
+-- Whether the sweep would collect a build now: a pending build left to it whose receipt its claim would take. Read-only,
+-- for the watcher to wait on outside any commit.
 sweepDue ∷ TerrainViews k → STM Bool
 sweepDue service =
-  readTVar (svPending service) >>= fmap or . mapM (\entry → if isJust (pbSweep entry) then isJust <$> receiptOutcome (pbReceipt entry) else pure False) . Map.elems
+  readTVar (svPending service) >>= fmap or . mapM (\entry → if isJust (pbSweep entry) then receiptClaimable (pbReceipt entry) else pure False) . Map.elems
 
 -- A build the sweep collected: its pending entry goes, what it left is retired, and the record keeps both causes.
 sweptBuild ∷ Ord k ⇒ TerrainViews k → Word64 → PendingBuild k → Either BuildFailure ChunkRef → Text → STM ()
@@ -2362,9 +2362,9 @@ sweptBuild service key entry outcome why = do
         Left (BuildFailed primary _) → "the build failed: " <> primary
   modifyTVar' (svSwept service) (\records → Seq.drop (Seq.length records - 63) (records |> (pbTarget entry, pbView entry, left <> "; swept because " <> why)))
 
--- Whether a pending build is sealed: the sweep or its collector can take it now.
+-- Whether a pending build's receipt can be claimed: the sweep or its collector can take it now.
 anySealed ∷ TerrainViews k → STM Bool
-anySealed service = readTVar (svPending service) >>= fmap or . mapM (fmap isJust . receiptOutcome . pbReceipt) . Map.elems
+anySealed service = readTVar (svPending service) >>= fmap or . mapM (receiptClaimable . pbReceipt) . Map.elems
 
 -- Builds no step will collect: once no owner step is queued or running, every sealed pending build is left to the
 -- sweep. Answers whether it left any.

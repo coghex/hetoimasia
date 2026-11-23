@@ -234,6 +234,8 @@ test-suite lua-engine-graphics-tests
         hetoimasia-asset-image ==0.1.0.0,
         hetoimasia-content ==0.1.0.0,
         hetoimasia-foundation ==0.1.0.0,
+        -- the issuer bridge: the terrain views' fake owner and hands are their own issuers (TerrainViews)
+        hetoimasia-foundation:owner-tx-issuer ==0.1.0.0,
         hetoimasia-glfw ==0.1.0.0,
         hetoimasia-glfw:runtime-glfw ==0.1.0.0,
         hetoimasia-gpu-vulkan-diagnostics ==0.1.0.0,

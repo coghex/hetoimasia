@@ -104,6 +104,7 @@ module Hetoimasia.Render.TwoD.Vulkan.Chunks
   , receiptOutcome
   , receiptSealed
   , claimReceipt
+  , receiptClaimable
   , sweepRegistry
   , receiptsHeld
   , BuildSettlement (..)
@@ -359,6 +360,11 @@ receiptOutcome = readTVar . receiptCell
 -- | Whether the build is sealed.
 receiptSealed ∷ BuildReceipt → STM Bool
 receiptSealed receipt = isJust <$> receiptOutcome receipt
+
+-- | Whether 'claimReceipt' would take the outcome now, read-only: sealed and not yet claimed. The decision the claim
+-- takes, for a reader waiting outside any commit.
+receiptClaimable ∷ BuildReceipt → STM Bool
+receiptClaimable receipt = (&&) <$> receiptSealed receipt <*> (not <$> readTVar (receiptClaimed receipt))
 
 -- | Take the ownership of a sealed outcome, once: the first claimant gets the outcome ('receiptOutcome') and the
 -- registry forgets the receipt; an unsealed receipt, or one already claimed, answers nothing and changes nothing. The

@@ -124,6 +124,9 @@ data Receipt = Receipt
     -- outcome, before and after its claim.
   , receiptClaim ∷ OwnerTx (Maybe (Either BuildFailure ChunkRef))
     -- ^ Take the sealed outcome's ownership, once: nothing while it is unsealed or after another claimant took it.
+  , receiptClaimable ∷ STM Bool
+    -- ^ Whether 'receiptClaim' would take it now, read-only: the claim's own decision, for a reader waiting outside any
+    -- commit.
   }
 
 -- | Why a granted build failed, with what became of the vertex buffer it made.
@@ -329,6 +332,7 @@ viewGrant disposal builders retained grant =
           { receiptKey = receiptNumber receipt
           , receiptOutcome = fmap (viewReceipt disposal) <$> Chunks.receiptOutcome receipt
           , receiptClaim = fmap (viewReceipt disposal) <$> claimReceiptTx receipt
+          , receiptClaimable = Chunks.receiptClaimable receipt
           }
     }
   where

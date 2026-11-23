@@ -28,6 +28,7 @@ import Test.HUnit.Lang (assertFailure)
 import Test.Hspec hiding (before)
 
 import Hetoimasia.Foundation.Log (callbackSink, defaultLogFilter, mkLogger)
+import Hetoimasia.Foundation.OwnerTx (commit)
 import Hetoimasia.Foundation.Worker (withWorkerGroup)
 import Hetoimasia.GPU.Vulkan.GLFW
   ( ActionOutcome (..)
@@ -247,7 +248,7 @@ fullSpec env = describe "terrain views (full)" $ do
         -- each change is drawn: a new revision presented, its pinned camera at the requested zoom
         forM_ changes $ \change → do
           before ← atomically (readingPublished <$> readView view)
-          atomically (configureView view change) >>= either (\why → assertFailure ("the change was refused: " <> show why)) pure
+          commit (configureView view change) >>= either (\why → assertFailure ("the change was refused: " <> show why)) pure
           published ← fmap (fromMaybe (Left Nothing)) . timeout 60000000 . atomically $ do
             reading ← readView view
             case (readingRefusal reading, readingPublished reading) of
