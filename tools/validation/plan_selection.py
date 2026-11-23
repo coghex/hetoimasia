@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import receipts
 from plan_cabal import Package, component_inputs
-from plan_identity import digest, never_harmless
+from plan_identity import digest
 from plan_repository import GitTree, PlannerError, changed_paths, matches_class, matches_input
 from plan_request import ALL_HSPEC
 
@@ -78,14 +78,6 @@ def build_plan(
             )
         requested.update(hspec)
 
-    # Groups every changed package description or project file affects, from
-    # both revisions' declarations.
-    package_file_groups = {group["id"] for group in groups if group.get("package_files")}
-    if base_catalog is not None:
-        package_file_groups |= {
-            group["id"] for group in base_catalog["groups"] if group.get("package_files") and group["id"] in groups_by_id
-        }
-
     changes = changed_paths(root, base, head)
     affected: set[str] = set()
     classified: list[dict] = []
@@ -97,25 +89,17 @@ def build_plan(
             for identifier, entries in inputs_by_group.items()
             if any(matches_input(path, entry) for entry in entries)
         )
-        # A package description or project file, however it is spelled and
-        # wherever it sits, affects the groups that declare `package_files`; it
-        # is never non-affecting, and that rule narrows nothing: with no other
-        # consumer it stays an unknown input.
-        package_file = never_harmless(path)
-        if package_file:
-            affected.update(package_file_groups)
         if consumers:
             # An explicitly consumed input outranks a non-affecting class, so a
             # test-consumed Markdown file still invalidates its consumers.
             classification = "consumed"
             affected.update(consumers)
-        elif not package_file and any(matches_class(path, pattern) for pattern in catalog["non_affecting_paths"]):
+        elif any(matches_class(path, pattern) for pattern in catalog["non_affecting_paths"]):
             classification = "non-affecting"
         else:
             classification = "unknown"
             unknown_inputs.append(path)
-        reported = sorted(set(consumers) | (package_file_groups if package_file else set()))
-        classified.append({**change, "classification": classification, "consumers": reported})
+        classified.append({**change, "classification": classification, "consumers": consumers})
 
     floor = set(catalog["floor"])
     fallback = bool(unknown_inputs)

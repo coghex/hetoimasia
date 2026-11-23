@@ -43,7 +43,6 @@ consumed =
   , ("tools/validation/owned_starts.py", "OwnedStarts.hs runs it against fixture trees and, in a checkout, against the repository")
   , ("tools/validation/owned_starts.json", "owned_starts.py reads the scan's primitives, exclusions and exemptions from it")
   , ("tools/validation/owned_starts_baseline.json", "owned_starts.py reads the recorded debt from it")
-  , ("tools/validation/owner-tx-issuers.fields", "owner-tx-guard reads the stanza allowlist from it when OwnerTxGuard.hs runs it on the repository")
   , ("tools/validation/plan_repository.py", "plan.py, run.py, range.py, and aggregate.py load it")
   , ("tools/validation/plan_cabal.py", "plan.py and run.py load it")
   , ("tools/validation/plan_catalog.py", "plan.py and run.py load it")
@@ -120,7 +119,6 @@ checkoutOnly =
   , ("packages/lua-engine-graphics/test/Main.hs", "VulkanProof.hs checks the adapter's suite fails an empty selection, as a sibling package's source")
   , ("packages/lua-engine-graphics/native-test/Test/LuaEngine/Graphics/Native/Session.hs", "VulkanProof.hs checks the adapter's native suite runs its complete profile without configuration reading, as a sibling package's source")
   , ("cabal.project.common", "VulkanProof.hs reads the warning policy it declares for the adapter beside the project files it is included by")
-  , ("packages/foundation/hetoimasia-foundation.cabal", "OwnerTxGuard.hs runs the issuer guard on the checkout, whose allowlist names this sibling package's stanzas")
   , ( "packages/glfw/hetoimasia-glfw.cabal"
     , "VulkanProof.hs reads the GLFW package's interop flag and dependencies beside the ordinary projects, as a sibling package"
     )

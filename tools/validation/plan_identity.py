@@ -17,19 +17,8 @@ IDENTITY_SCHEMA_VERSION = 1
 # Packaging inputs decide what is compiled, so they are never prose however a
 # catalog classifies them. Every other exclusion is derived from the declared
 # inputs and the declared non-affecting classes rather than hard-coded here.
-# Git's mode for a symbolic link.
-SYMLINK_MODE = "120000"
-
-
-def never_harmless(path: str) -> bool:
-    """A package description or project file, wherever it sits and however it is spelled.
-
-    The issuer guard reads every file whose basename ends in ``.cabal`` or starts
-    with ``cabal.project`` (a nested project, ``cabal.project.notes.md``), so no
-    such file is ever prose or a non-affecting class.
-    """
-    basename = path.rsplit("/", 1)[-1]
-    return basename.startswith("cabal.project") or basename.endswith(".cabal")
+NEVER_HARMLESS_PATHS = ("cabal.project",)
+NEVER_HARMLESS_SUFFIXES = (".cabal",)
 
 # The policy roots a candidate can never exempt itself from. `policy_inputs` is
 # catalog data, and the catalog is one of the files it governs: a candidate that
@@ -129,7 +118,7 @@ def harmless_prose(path: str, consumed: set[str], catalog: dict) -> bool:
     a test-consumed Markdown file, a fixture, a shader, an asset, or any
     packaging description is never harmless however it is spelled.
     """
-    if never_harmless(path):
+    if path in NEVER_HARMLESS_PATHS or path.endswith(NEVER_HARMLESS_SUFFIXES):
         return False
     if any(matches_input(path, entry) for entry in consumed):
         return False
@@ -154,11 +143,7 @@ def input_identity(
     a timestamp, so two commits with identical trees are the same candidate.
     """
     consumed = consumed_entries(catalog, packages)
-    # A symbolic link is never prose, whatever its name: a tracked file turned
-    # into a link changes what the issuer guard reads, and so its outcome.
-    included = [
-        list(entry) for entry in entries if entry[1] == SYMLINK_MODE or not harmless_prose(entry[0], consumed, catalog)
-    ]
+    included = [list(entry) for entry in entries if not harmless_prose(entry[0], consumed, catalog)]
     return digest(
         {
             "identity_schema_version": IDENTITY_SCHEMA_VERSION,

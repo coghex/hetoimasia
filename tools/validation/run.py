@@ -517,7 +517,7 @@ def generated(repository, identity, path: str, catalog: dict, consumed: set[str]
     already uses, and anything else is an exact repository-relative path. A
     catalog that declares none exempts nothing.
     """
-    if identity.never_harmless(path):
+    if path in identity.NEVER_HARMLESS_PATHS or path.endswith(identity.NEVER_HARMLESS_SUFFIXES):
         return False
     if any(repository.matches_input(path, entry) for entry in consumed):
         return False

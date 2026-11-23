@@ -220,10 +220,9 @@ library internal
 -- The issuer bridge of the ownership transactions: the one embedding of an
 -- issuer's own STM into an OwnerTx, and the issuer-side cell updates that take
 -- functions. It is public so issuer packages can depend on it across package
--- boundaries; who may is not left to Cabal: the repository's textual guard
--- (tools/owner-tx-guard) refuses its name, or the bridge's or the
--- representation's module, in any stanza of any package description or project
--- file that tools/validation/owner-tx-issuers.fields does not list.
+-- boundaries. Only issuer components depend on it: reviewers check every
+-- build-depends that names it, and the issuer's modules against the review
+-- contract in Hetoimasia.Foundation.OwnerTx.Issuer.
 library owner-tx-issuer
     visibility: public
     exposed-modules:

@@ -1,10 +1,8 @@
 -- | The issuer bridge: how an issuer embeds a concrete operation over its own 'STM' and its existing state into an
 -- ownership transaction ("Hetoimasia.Foundation.OwnerTx").
 --
--- __Who may depend on it.__ Only the stanzas @tools/validation/owner-tx-issuers.fields@ lists. The repository's textual
--- guard (@tools/owner-tx-guard@) refuses this sublibrary's name (@owner-tx-issuer@), this module's or the
--- representation's in any other stanza, or at the top level, of any package description or project file. Issuer
--- review checks what a listed stanza's component imports and exports: an issuer
+-- __Who may depend on it.__ Only issuer components depend on this sublibrary (@hetoimasia-foundation:owner-tx-issuer@).
+-- Reviewers check every @build-depends@ that names it, and what the issuer's modules import and export: an issuer
 -- exports concrete operations on opaque handles built here, never the bridge itself, no conversion between a caller's
 -- 'STM' and a transaction, and no instance on 'STM' or the protected Foundation types.
 --

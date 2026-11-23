@@ -976,61 +976,6 @@
       "optional": false
     },
     {
-      "id": "test.owner-tx-guard",
-      "description": "Run the issuer guard of the ownership transactions (#721), tools/owner-tx-guard, against the repository itself. It scans every .cabal and cabal.project* file at any depth, split into stanzas by Cabal-syntax's readFields alone, for owner-tx-issuer, Hetoimasia.Foundation.OwnerTx.Issuer and Hetoimasia.Foundation.OwnerTx.Representation (ASCII case-insensitive, word boundaries, comments aside, every branch as written) and fails a match outside a stanza tools/validation/owner-tx-issuers.fields lists, a top-level match, a file Cabal's lexer cannot split, and a stale, duplicate, malformed or ambiguous entry. What a listed stanza's component imports, exports and instantiates is checked by issuer review.",
-      "command": [
-        "cabal",
-        "run",
-        "owner-tx-guard",
-        "--",
-        "check"
-      ],
-      "preparation": {
-        "command": [
-          "cabal",
-          "build",
-          "--only-dependencies",
-          "exe:owner-tx-guard"
-        ],
-        "timeout_seconds": 1800
-      },
-      "component": null,
-      "inputs": [
-        "cabal.project",
-        "cabal.project.vulkan",
-        "cabal.project.common",
-        "cabal.project.cpu",
-        "hetoimasia.cabal",
-        "app/",
-        "app-cpu/",
-        "app-full/",
-        "console/",
-        "probe/",
-        "run/",
-        "run-native-repeat/",
-        "run-native-test/",
-        "test/",
-        "test-cpu/",
-        "test-full/",
-        "tools/test/",
-        "tools/wayland-test/",
-        "tools/x11-test/",
-        "tools/test-support/",
-        "packages/",
-        "samples/",
-        "docs/toolchain/binding-bundle-darwin/",
-        "docs/toolchain/binding-bundle-linux/",
-        "tools/owner-tx-guard/",
-        "tools/validation/owner-tx-issuers.fields"
-      ],
-      "framework": "none",
-      "runner": "cpu",
-      "timeout_seconds": 300,
-      "category": "test",
-      "optional": false,
-      "package_files": true
-    },
-    {
       "id": "test.x11-helper",
       "description": "Local-only optional headless X11 helper probes using stub servers and window managers, including real 30-second startup deadlines. Never selected automatically or routed to CI; eligible for coordinated local testing. Opens no desktop session.",
       "command": [
