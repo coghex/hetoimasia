@@ -1,6 +1,7 @@
 # Working agreements
 
-Hetoimasia is a modular Haskell game-engine project. Read [MEMORY.md](MEMORY.md)
+Hetoimasia is a generic, modular Haskell game-engine library; games are separate
+projects that consume its packages. Read [MEMORY.md](MEMORY.md)
 for continuity, [the foundation design](docs/engine_foundation_design.md) for
 boundaries, and [workflow.md](docs/workflow.md) for Kanban delivery.
 The durable owner direction is [vision.md](docs/vision.md); `$guide` (`/guide`
@@ -157,8 +158,7 @@ this repository:
   and scratch data untracked. Retain requested evidence deliberately with its
   issue; an ignored capture alone is not a delivered artifact.
 - Tests that write files use temporary locations and must not mutate personal
-  configuration. Preserve authored asset and saved-content identifiers when
-  migrating game content; game save schemas remain game-owned.
+  configuration. Save schemas remain application-owned.
 - Asset placeholders used for an explicit technical experiment must be labeled
   as such. Do not present them as approved production art.
 - Implementation pull requests do not edit MEMORY.md; owner-requested changes
