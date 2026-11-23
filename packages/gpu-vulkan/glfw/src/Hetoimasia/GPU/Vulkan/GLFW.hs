@@ -120,6 +120,8 @@ module Hetoimasia.GPU.Vulkan.GLFW
   , noSceneLifecycle
   , requestVulkanRelease
   , readVulkanSceneState
+  , readVulkanActionAdmission
+  , readVulkanReleaseAdmission
   , VulkanSceneState (..)
   , WindowSceneStanding (..)
 
@@ -655,6 +657,14 @@ submitVulkanAction host = Controller.submitVulkanAction (vulkanController host)
 -- already met runs at the next owner step.
 requestVulkanRelease ∷ VulkanHost scene → VulkanAction r → STM (Either ActionRefusal (ActionTicket r))
 requestVulkanRelease host = Controller.requestVulkanRelease (vulkanController host)
+
+-- | What 'submitVulkanAction' would be refused with now, read-only, for a reader waiting outside any commit.
+readVulkanActionAdmission ∷ VulkanHost scene → STM (Maybe ActionRefusal)
+readVulkanActionAdmission host = Controller.readVulkanActionAdmission (vulkanController host)
+
+-- | What 'requestVulkanRelease' would be refused with now, read-only, for a reader waiting outside any commit.
+readVulkanReleaseAdmission ∷ VulkanHost scene → STM (Maybe ActionRefusal)
+readVulkanReleaseAdmission host = Controller.readVulkanReleaseAdmission (vulkanController host)
 
 -- | Each window's latest published and adopted scene revision, the revisions
 -- awaiting release, and the release requests still queued with the revisions

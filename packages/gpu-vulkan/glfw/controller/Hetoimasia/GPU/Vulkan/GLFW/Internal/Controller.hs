@@ -218,6 +218,8 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , noSceneLifecycle
   , requestVulkanRelease
   , readVulkanSceneState
+  , readVulkanActionAdmission
+  , readVulkanReleaseAdmission
   , VulkanSceneState (..)
   , WindowSceneStanding (..)
 
@@ -408,6 +410,7 @@ import Hetoimasia.GPU.Vulkan.GLFW.Internal.Actions
   , actionsWaiting
   , admitAction
   , admitRelease
+  , admissionRefusal
   , awaitActionTicket
   , beginBatch
   , newActions
@@ -2331,6 +2334,20 @@ requestVulkanRelease (VulkanController state) action = do
 -- awaits of each window.
 readVulkanSceneState ∷ VulkanController → STM VulkanSceneState
 readVulkanSceneState (VulkanController state) = readSceneState (stateScenes state) (pendingBarriers (stateActions state))
+
+-- | What 'submitVulkanAction' would be refused with now, read-only: its own decision, for a reader that waits outside
+-- any commit for the owner to have room.
+readVulkanActionAdmission ∷ VulkanController → STM (Maybe ActionRefusal)
+readVulkanActionAdmission (VulkanController state) = do
+  device ← isJust <$> readRootsDevice (stateRoots state)
+  admissionRefusal (stateActions state) device False
+
+-- | What 'requestVulkanRelease' would be refused with now, read-only: its own decision, for a reader that waits
+-- outside any commit for the release lane to have room.
+readVulkanReleaseAdmission ∷ VulkanController → STM (Maybe ActionRefusal)
+readVulkanReleaseAdmission (VulkanController state) = do
+  device ← isJust <$> readRootsDevice (stateRoots state)
+  admissionRefusal (stateActions state) device True
 
 -- | Release every adopted scene revision that may be, with the lifecycle's own
 -- hook, and answer whether any was.

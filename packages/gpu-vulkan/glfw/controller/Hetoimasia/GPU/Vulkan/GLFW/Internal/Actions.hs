@@ -95,6 +95,7 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Actions
   , newActions
   , admitAction
   , admitRelease
+  , admissionRefusal
   , pendingBarriers
   , actionsWaiting
   , actionsCount
@@ -253,25 +254,34 @@ admitRelease actions device barrier = admitWith actions device (Just barrier)
 
 admitWith ∷ Actions → Bool → Maybe (STM Barrier) → VulkanAction r → STM (Either ActionRefusal (ActionTicket r))
 admitWith actions device barrier action =
-  actionsGate actions >>= \case
+  admissionRefusal actions device (isJust barrier) >>= \case
     Just refusal → pure (Left refusal)
+    Nothing → do
+      queue ← readTVar (actionsQueue actions)
+      held ← traverse id barrier
+      standing ← newTVar Queued
+      place ← readTVar (actionsAdmitted actions)
+      writeTVar (actionsAdmitted actions) (place + 1)
+      writeTVar (actionsQueue actions) (queue |> Entry place standing action held)
+      pure (Right (ActionTicket standing (actionsGate actions)))
+
+-- | What an admission would be refused with now, given whether the session's device exists, read-only: an action's
+-- ('False') against the action capacity, a release request's ('True') against the release capacity. The one decision
+-- 'admitAction' and 'admitRelease' take, so a reader waiting for room waits on exactly what they check.
+admissionRefusal ∷ Actions → Bool → Bool → STM (Maybe ActionRefusal)
+admissionRefusal actions device release =
+  actionsGate actions >>= \case
+    Just refusal → pure (Just refusal)
     Nothing
-      | not device → pure (Left ActionDeviceNotReady)
+      | not device → pure (Just ActionDeviceNotReady)
       | otherwise → do
           queue ← readTVar (actionsQueue actions)
-          let (capacity, refusal) = case barrier of
-                Nothing → (actionsCapacity actions, ActionQueueFull)
-                Just _ → (actionsReleaseCapacity actions, ReleaseQueueFull)
-              sameClass (Entry _ _ _ held) = isJust held == isJust barrier
-          if fromIntegral (length (filter sameClass (toList queue))) >= capacity
-            then pure (Left refusal)
-            else do
-              held ← traverse id barrier
-              standing ← newTVar Queued
-              place ← readTVar (actionsAdmitted actions)
-              writeTVar (actionsAdmitted actions) (place + 1)
-              writeTVar (actionsQueue actions) (queue |> Entry place standing action held)
-              pure (Right (ActionTicket standing (actionsGate actions)))
+          let (capacity, refusal) =
+                if release
+                  then (actionsReleaseCapacity actions, ReleaseQueueFull)
+                  else (actionsCapacity actions, ActionQueueFull)
+              sameClass (Entry _ _ _ held) = isJust held == release
+          pure (if fromIntegral (length (filter sameClass (toList queue))) >= capacity then Just refusal else Nothing)
 
 -- | The barriers of the release requests still queued, in the order they were
 -- made.
