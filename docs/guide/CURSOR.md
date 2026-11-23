@@ -5,12 +5,12 @@ Covered beyond the boundary: none
 
 ## Next
 
-Process GUIDE-4 next. GUIDE-3 is filed unchanged as #728; the manager routes review, solve and merge. GUIDE-2 is deferred until the owner decides how slopes work; recheck its premise after that decision. GUIDE-1 was filed unchanged as #727 under owner approval; its solve is routed by the manager. New merged work is reviewed from this pin against the November 23 generic-library vision. Pending issue-specification audits remain explicit in coverage.
+Owner disposition of the exact GUIDE-4 issue draft in the latest report. GUIDE-3 is filed unchanged as #728; the manager routes review, solve and merge. GUIDE-2 is deferred until the owner decides how slopes work; recheck its premise after that decision. GUIDE-1 was filed unchanged as #727 under owner approval; its solve is routed by the manager. New merged work is reviewed from this pin against the November 23 generic-library vision. Pending issue-specification audits remain explicit in coverage.
 
 ## Open findings
 
 - 2026-11-23T162528Z-b800f2f/GUIDE-2 — shape 15 public Haddock still says flat top — [deferred]: owner slope-model decision (relay `junfaykd8eiysu3qhp42d83q8n`)
-- 2026-11-23T162528Z-b800f2f/GUIDE-4 — reconstructed component origins admit inconsistent aliases — unprocessed
+- 2026-11-23T162528Z-b800f2f/GUIDE-4 — reconstructed component origins admit inconsistent aliases — proposal pending; all-air case independent of slope geometry
 
 ## Pending handoff
 
