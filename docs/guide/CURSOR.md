@@ -5,11 +5,11 @@ Covered beyond the boundary: none
 
 ## Next
 
-Process GUIDE-2 next, then the other findings one at a time. GUIDE-1 was filed unchanged as #727 under owner approval; its solve is routed by the manager. New merged work is reviewed from this pin against the November 23 generic-library vision. Pending issue-specification audits remain explicit in coverage.
+Owner disposition of the exact GUIDE-2 issue draft in the latest report; then the other findings one at a time. GUIDE-1 was filed unchanged as #727 under owner approval; its solve is routed by the manager. New merged work is reviewed from this pin against the November 23 generic-library vision. Pending issue-specification audits remain explicit in coverage.
 
 ## Open findings
 
-- 2026-11-23T162528Z-b800f2f/GUIDE-2 — shape 15 public Haddock still says flat top — unprocessed
+- 2026-11-23T162528Z-b800f2f/GUIDE-2 — shape 15 public Haddock still says flat top — proposal pending
 - 2026-11-23T162528Z-b800f2f/GUIDE-3 — residency Haddock contradicts budgets, dispatch slots and camera eviction — unprocessed
 - 2026-11-23T162528Z-b800f2f/GUIDE-4 — reconstructed component origins admit inconsistent aliases — unprocessed
 
