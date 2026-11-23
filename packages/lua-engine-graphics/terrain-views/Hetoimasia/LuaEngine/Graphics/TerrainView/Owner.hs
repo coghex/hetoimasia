@@ -84,7 +84,6 @@ import Hetoimasia.Render.TwoD.Vulkan.Chunks
   , sweepRegistryTx
   , chunkRoom
   , chunkStandingSTM
-  , preparedBytes
   , prepareRetainedChunk
   , releaseChunkNow
   , spendChunkGrant
@@ -311,7 +310,7 @@ registryHands prepare disposal builders retained =
 -- | Whether a prepared part would be admitted into this registry and these uploads now, read-only: the decision
 -- 'registryHands' makes.
 registryRoom ∷ BufferUploads → Retained → PreparedChunk → STM (Either Admission ())
-registryRoom uploads retained prepared = either (Left . viewAdmission) Right <$> chunkRoom uploads retained (preparedBytes prepared)
+registryRoom uploads retained prepared = either (Left . viewAdmission) Right <$> chunkRoom uploads retained prepared
 
 -- | What the renderer's admission refusal means to a view: room that can come free, a part no staging holds, or an end.
 viewAdmission ∷ BuildRefusal → Admission

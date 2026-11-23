@@ -164,7 +164,7 @@ import Hetoimasia.Render.TwoD.DrawPlan (CutoutMarks)
 import Hetoimasia.Render.TwoD.Encoding (encodeChunkCutouts)
 import Hetoimasia.Render.TwoD.Snapshot (Instance)
 import Hetoimasia.Render.TwoD.Vulkan.Builders (BufferUploadRefusal (..), BufferUploads, Builders (..), reserveRoom, roomFor, uploadGranted)
-import Hetoimasia.Foundation.Messaging.Payload (Prepared, prepare)
+import Hetoimasia.Foundation.Messaging.Payload (Prepared, prepare, preparedValue)
 import Hetoimasia.Foundation.OwnerTx (OwnerTx, commit)
 import Hetoimasia.Foundation.OwnerTx.Issuer (fromIssuerSTM)
 import Numeric.Natural (Natural)
@@ -421,11 +421,12 @@ sealReceipt grant outcome =
 data GrantStanding = GrantReserved | GrantSpending !MadeBuffer | GrantSealed
   deriving (Eq, Show)
 
--- | Whether a chunk of this many bytes would be admitted now, read-only: the
+-- | Whether this prepared chunk would be admitted now, read-only: the
 -- decision 'admitRetainedChunk' makes, with the room of these uploads observed
--- ('roomFor').
-chunkRoom ∷ BufferUploads → Retained → Natural → STM (Either BuildRefusal ())
-chunkRoom uploads (Retained ledger) bytes = do
+-- ('roomFor') for the room the chunk was prepared with.
+chunkRoom ∷ BufferUploads → Retained → PreparedChunk → STM (Either BuildRefusal ())
+chunkRoom uploads (Retained ledger) prepared = do
+  let bytes = preparedValue (preparedRoom prepared)
   held ← readTVar ledger
   case nextReference held of
     Nothing → pure (Left BuildReferencesExhausted)
@@ -787,8 +788,8 @@ releaseChunkNow builders (Retained ledger) reference = do
 -- writes, answers a refusal as data and never waits or raises.
 
 -- | 'chunkRoom' in a commit: read-only.
-chunkRoomTx ∷ BufferUploads → Retained → Natural → OwnerTx (Either BuildRefusal ())
-chunkRoomTx uploads retained bytes = fromIssuerSTM (chunkRoom uploads retained bytes)
+chunkRoomTx ∷ BufferUploads → Retained → PreparedChunk → OwnerTx (Either BuildRefusal ())
+chunkRoomTx uploads retained prepared = fromIssuerSTM (chunkRoom uploads retained prepared)
 
 -- | 'admitRetainedChunk' in a commit: the reference and the upload's room reserved together, or neither.
 admitRetainedChunkTx ∷ BufferUploads → Retained → PreparedChunk → OwnerTx (Either BuildRefusal ChunkGrant)

@@ -338,8 +338,8 @@ spec = describe "Uploads" $ do
       fmap (const ()) <$> submitUploadGranted ungated uploads grant vertices (level 16 1) `shouldReturn` Left UploadClosed
       fmap (const ()) <$> (prepare 16 >>= commit . reserveUploadTx uploads) `shouldReturn` Left UploadClosed
 
-    it "returns a bound grant's place, region and target through one cleanup whatever ends it before it is queued: the copy raising, or the gate raising, waiting or cancelled after the copy; the spent grant is stale, a fresh upload takes the same room and target, and retirement finishes" $
-      forM_ [AfterCopyRaises, GateRaises, GateWaits, GateCancelled] $ \ending → do
+    it "returns a bound grant's place, region and target through one cleanup whatever ends it before it is queued: the copy raising, or the gate raising, waiting, cancelled or answering a refusal whose payload raises after the copy; the spent grant is stale, a fresh upload takes the same room and target, and retirement finishes" $
+      forM_ [AfterCopyRaises, GateRaises, GateWaits, GateCancelled, GateRefusalRaises] $ \ending → do
         rig ← newUploadRig
         -- one queue place and the whole staging buffer: the grant takes both
         uploads ← made rig (config 64 64 1)
@@ -351,6 +351,8 @@ spec = describe "Uploads" $ do
                 Nothing → ungated
                 Just GateRaises → throwSTM (ErrorCall "the gate raised")
                 Just GateWaits → retry
+                -- the refusal is evaluated where the submission owns its exception, after the admission's cleanup
+                Just GateRefusalRaises → pure (Left (UploadMalformed (error "the refusal's payload raised")))
                 Just _ → throwSTM ThreadKilled
         case ending of
           AfterCopyRaises → failAt (rigRecordingStandIn rig) AtWriteMapped
@@ -361,6 +363,7 @@ spec = describe "Uploads" $ do
           (GateRaises, Left raised) | Just (ErrorCall "the gate raised") ← fromException raised → pure ()
           (GateWaits, Right (Left UploadGateBusy)) → pure ()
           (GateCancelled, Left raised) | Just ThreadKilled ← fromException raised → pure ()
+          (GateRefusalRaises, Left raised) | Just (ErrorCall "the refusal's payload raised") ← fromException raised → pure ()
           _ → expectationFailure ("unexpected outcome for " <> show ending <> ": " <> either show (show . fmap (const ())) outcome)
         succeedAt (rigRecordingStandIn rig) AtWriteMapped
         atomically (writeTVar afterCopy Nothing)
@@ -1054,7 +1057,7 @@ milliseconds ∷ Integer → Duration
 milliseconds n = either (error . show) id (durationFromNanoseconds AllowZero (n * 1000000))
 
 -- | What ends a granted upload between its binding and its queueing.
-data PostBind = AfterCopyRaises | GateRaises | GateWaits | GateCancelled
+data PostBind = AfterCopyRaises | GateRaises | GateWaits | GateCancelled | GateRefusalRaises
   deriving (Eq, Show)
 
 -- | A gate over the admission an example holds now: open while that admission is.

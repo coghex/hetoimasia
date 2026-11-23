@@ -525,8 +525,9 @@ submitWith gate uploads grant given = mask $ \restore → do
       UploadImage _ levels → foldr seq () levels `seq` request
       UploadBuffer _ _ → request
     asked ask = ask `orElse` pure (Left UploadGateBusy)
-    -- a gate's answer evaluated where its exception is owned: the answer and the permit it carries
-    forced answer = evaluate answer >>= either (pure . Left) (fmap Right . evaluate)
+    -- a gate's answer evaluated in full where its exception is owned, either alternative: the refusal with everything it
+    -- carries, or the permit; one that raises raises in the submitting call (after the admission's cleanup, once admitted)
+    forced answer = evaluate answer >>= either (\refusal → Left refusal <$ evaluate (length (show refusal))) (fmap Right . evaluate)
     -- the upload's place, region and target pass to the queue: the session still running, the uploads open, and the
     -- second permit naming the admission the first did, still open
     queue permit permit' number ticket = do

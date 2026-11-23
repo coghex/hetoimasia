@@ -744,7 +744,7 @@ refusalSpec = describe "refusing a build" $ do
           lacking held = bufferUploadsThrough . ownedUploadAccess (rigRoots rig) owner <$> newUploadsCellIO held
           admit uploads = fmap (const ()) <$> commit (admitRetainedChunkTx uploads (setupRetained setup) prepared)
       admit awaiting `shouldReturn` Left BuildUploadsNotReady
-      atomically (chunkRoom awaiting (setupRetained setup) (preparedBytes prepared)) `shouldReturn` Left BuildUploadsNotReady
+      atomically (chunkRoom awaiting (setupRetained setup) prepared) `shouldReturn` Left BuildUploadsNotReady
       commit (setUploadsStandingTx standing (UploadsMade (rigUploads rig)))
       admit awaiting `shouldReturn` Right ()
       lacking UploadsUnconfigured >>= admit >>= (`shouldBe` Left (BuildUploadsUnavailable "the host configured no uploads"))

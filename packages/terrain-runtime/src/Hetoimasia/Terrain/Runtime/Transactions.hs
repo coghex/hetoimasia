@@ -40,6 +40,8 @@ module Hetoimasia.Terrain.Runtime.Transactions
   ) where
 
 import Control.Concurrent.STM (STM, TMVar, atomically, newEmptyTMVarIO, tryPutTMVar, tryReadTMVar)
+import Control.DeepSeq (force)
+import Control.Exception (evaluate)
 import Control.Monad (void)
 import Data.Word (Word64)
 import Hetoimasia.Foundation.Messaging.Payload (Prepared, preparedValue)
@@ -96,11 +98,17 @@ instance Eq ViewRequest where
 -- | Ask for a regional snapshot of these regions for a view ('Hetoimasia.Terrain.Runtime.requestRegionSnapshot'),
 -- with the service's own endpoint.
 requestViewRegions ∷ Service → ArenaLease → [RegionCoord] → IO (Either Refused ViewRequest)
-requestViewRegions svc lease regions = sealed (\endpoint → regionsWith svc endpoint lease regions)
+requestViewRegions svc lease given = do
+  -- evaluated in full here, before the request is validated in the service's transaction
+  regions ← evaluate (force given)
+  sealed (\endpoint → regionsWith svc endpoint lease regions)
 
 -- | Ask for a column's surface for a view ('Hetoimasia.Terrain.Runtime.surfaceAt'), with the service's own endpoint.
 requestViewSurface ∷ Service → ArenaLease → Column → IO (Either Refused ViewRequest)
-requestViewSurface svc lease column = sealed (\endpoint → surfaceWith svc endpoint lease column)
+requestViewSurface svc lease given = do
+  -- evaluated here, before the request is validated in the service's transaction
+  column ← evaluate given
+  sealed (\endpoint → surfaceWith svc endpoint lease column)
 
 sealed ∷ (Endpoint → IO (Either Refused Request)) → IO (Either Refused ViewRequest)
 sealed submit = do

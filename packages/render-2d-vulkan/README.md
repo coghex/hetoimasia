@@ -183,7 +183,7 @@ in three steps a caller can also take apart:
    are released. `BuildUploadsUnavailable` is uploads the host lacks or whose
    startup failed, with the cause; `BuildUploadRefused` is every other
    refusal; for `UploadOversized`, build smaller chunks. `chunkRoom` reads
-   this decision without reserving, from any thread.
+   this decision without reserving, from any thread, over the same `BufferUploads`.
 3. **Spend** (`spendChunkGrant`): move the grant from reserved to spending in
    one transaction, then make the device-local vertex buffer, spend the
    reserved room on the upload that fills it, and register the chunk under the
@@ -215,7 +215,7 @@ in three steps a caller can also take apart:
   capacity stays occupied until the backend confirms its destruction; or a
   release that raised, a cleanup failure naming the buffer and the cause
   (`AllocationReleaseRaised`). One claimant takes the outcome
-  (`claimReceipt`), once; a receipt nobody claims stays in the registry until
+  (`claimReceipt`), once (`receiptClaimable` reads that decision without taking it); a receipt nobody claims stays in the registry until
   its teardown sweep (`sweepRegistry`), which gives a still-reserved grant back
   as `BuildAbandoned`, leaves a spending one to seal and claims every sealed
   one (`receiptsHeld` counts those held and those it can settle now). A
@@ -226,6 +226,12 @@ in three steps a caller can also take apart:
   `buildRetainedChunkWith` claim their own receipt in their masked handoff
   and answer the same way. `BuildBufferRefused` is the backend refusing the
   buffer itself.
+
+**Ownership operations.** For a holder composing the registry's decisions with its own facts in one Foundation
+`commit`, each is also an ownership operation (`OwnerTx`) embedded through the issuer bridge: `chunkRoomTx`,
+`admitRetainedChunkTx`, `abandonChunkGrantTx`, `receiptOutcomeTx`, `claimReceiptTx`, `sweepRegistryTx`,
+`receiptsHeldTx` and `chunkStandingTx`. Each reads only the registry's cells, the grant or receipt it issued and the
+uploads' own decisions over `BufferUploads`, answers a refusal as data and never waits or raises.
 
 **Standing.** `chunkStanding` reads, from any thread, `ChunkUploading`,
 `ChunkReady` (at once for a chunk with no cutout instance) or `ChunkFailed`

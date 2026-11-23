@@ -14,7 +14,8 @@ dependency is the storage backend's small C shim (see
 [the storage backend](#the-storage-backend-tra-21)), through which the service writes and
 reads every arena. It has no global registry and no universal environment: everything it borrows is
 injected through `Ports` (the parent session's admission, a supervision
-capability, a logger and a diagnostics seam). The Lua request endpoint is TRA-5;
+capability, a logger and a diagnostics seam). The admission is data, never a reader: `alwaysAdmitting`, or
+`AdmittedWhile` the read-only token of a Foundation `Admission`, open until its owner closes it once. The Lua request endpoint is TRA-5;
 this package supplies a Lua-independent settlement seam it can attach to.
 
 Every removal the service acknowledges is in the arena's store, written to its private file
@@ -61,7 +62,8 @@ definition) is admitted as a request that is settled at once.
 ## The settlement seam
 
 `Hetoimasia.Terrain.Runtime.Settlement` is the narrow, Lua-independent seam TRA-5
-attaches its request endpoint to. A host supplies an `Endpoint` per request:
+attaches its request endpoint to. A host supplies an `Endpoint` per request (a terrain view supplies none:
+[a view's requests](#ownership-operations-and-a-views-requests) are the service's own):
 
 | Operation | Meaning | When the service calls it |
 | --- | --- | --- |
@@ -84,6 +86,28 @@ prepared transaction in place of `endpointSettle`. A callback that throws
 is a provider defect: the transaction is abandoned with nothing committed, the
 request ends without a second call into the host, and the defect reaches
 supervision (the owner ends).
+
+### Ownership operations and a view's requests
+
+`Hetoimasia.Terrain.Runtime.Transactions` is the service as an issuer of ownership operations (Foundation `OwnerTx`), for a
+holder composing them with its own facts in one `commit`. Each embeds one of the service's transactions through the issuer
+bridge: it reads only the service's state, the handle it was given, its prepared input and the parent session's token,
+answers a refusal as data, and never waits or raises.
+
+| Operation | Effect | Refusal (nothing changes) |
+| --- | --- | --- |
+| `setViewDemandTx view lease demand` | install, replace or clear (an empty list) the view's demand, `Prepared` before the commit | `RefusedClosed` once the parent's admission has closed; `RefusedAuthority` for a lease not the view's client's or not live |
+| `takeViewRequestTx request` | retire a settled request and hand its regional borrow over while the request still owns it | `TakeReleased`: the borrow was released first (lease, client, arena or service ended), never handed over |
+| `retireViewRequestTx request` | retire a settled request, releasing a borrow nobody took | — |
+| `releaseRegionBorrowTx borrow` | release a taken borrow, once (idempotent) | — |
+| `inspectArenaTx`, `authorityEpochTx` | read-only | — |
+
+A view never supplies an `Endpoint`. `requestViewRegions` and `requestViewSurface` build it: ready a no-op, eligibility
+always granted, settlement a non-waiting put into the request's own box inside the arbitration's transaction. They answer a
+sealed `ViewRequest`, which the view takes, retires or cancels (`cancelViewRequest`) by the handle alone. The view's watcher
+waits on the box (`viewRequestSettled`) outside every commit; the settlement arrives once. Whichever commits first of the
+view's take and the lease's closure decides a regional borrow: the closure first discards it with the lease; the take first
+keeps it charged to the service until the view releases it, once.
 
 An open may name its arena's allowance: `openArenaWithOptions` takes `OpenOptions`, and `openArenaWith` is it with
 `defaultOpenOptions`, the service's own allowance. The allowance feeds the arena's reservation and its first store, as the service's own
@@ -400,9 +424,9 @@ Closure order: close admission first, withdraw demand, settle or cancel pending
 requests at bounded safe points, retire outstanding work, join the owner, and release
 the stores only after the borrowers finish.
 
-* The parent session's admission dominates every gate. It is read at admission and
-  inside the commit arbitration; when it closes the owner closes the service and
-  every accepted request ends with one terminal outcome.
+* The parent session's admission dominates every gate. It is read at admission, in every ownership operation that
+  admits (`setViewDemandTx` included) and inside the commit arbitration; when it closes the owner closes the service
+  (reporting `PointClosingSession` to the probe first) and every accepted request ends with one terminal outcome.
 * **Effect and record are not separated by an asynchronous exception.** The owner's loop
   runs masked; only its deliberate wait for work is interruptible. Each storage effect (a
   job submitted, cancelled or taken, a backing opened or closed) and its record in the

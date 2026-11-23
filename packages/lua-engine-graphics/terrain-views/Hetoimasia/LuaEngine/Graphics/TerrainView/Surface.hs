@@ -193,10 +193,12 @@ newtype OffscreenFacts = OffscreenFacts (TVar Facts)
 
 -- | Facts for a registration: usable or not, and its metrics, if known, prepared by the registrant.
 newOffscreenFacts ∷ Bool → Prepared (Maybe TargetMetrics) → STM OffscreenFacts
-newOffscreenFacts usable metrics = OffscreenFacts <$> newTVar (Facts 0 usable usable (preparedValue metrics))
+newOffscreenFacts usable metrics = usable `seq` (OffscreenFacts <$> newTVar (Facts 0 usable usable (preparedValue metrics)))
 
 setOffscreenUsable ∷ OffscreenFacts → Bool → STM ()
-setOffscreenUsable (OffscreenFacts cell) usable = changeFacts cell (\facts → facts {factsUsable = usable, factsAuthority = usable})
+setOffscreenUsable (OffscreenFacts cell) usable =
+  -- evaluated here, in the registrant's own transaction: no view's commit ever evaluates a registrant's value
+  usable `seq` changeFacts cell (\facts → facts {factsUsable = usable, factsAuthority = usable})
 
 -- | Install the registrant's metrics, prepared (fully evaluated) before this transaction, with the facts' next version:
 -- a value whose evaluation raises raised at its preparation, and the facts keep their value and version.

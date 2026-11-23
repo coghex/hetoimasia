@@ -121,7 +121,7 @@ import qualified Hetoimasia.Foundation.Exit as Exit
 import Hetoimasia.Foundation.Exit (IssuerStanding (..))
 import Hetoimasia.Foundation.OwnerTx (OwnerTx, commit)
 import Hetoimasia.Foundation.OwnerTx.Issuer (fromIssuerSTM)
-import Control.DeepSeq (NFData (..))
+import Control.DeepSeq (NFData (..), force)
 import Hetoimasia.Foundation.Messaging.Payload (Prepared, prepare, preparedValue)
 import Hetoimasia.Foundation.Resource (composeCleanup, withResourceLabelled)
 import Hetoimasia.Foundation.Worker (StartOutcome (..), closeWorkerGroup, requestStop, startWorker, stopRequested, withWorkerGroup, workerDefinition)
@@ -1154,9 +1154,12 @@ openView service request = mask_ $ do
         else case newCamera (tvCamera (svConfig service)) x y z of
           Left why → pure (Left (OpenCamera why))
           Right camera → do
-            -- the caller's authority lists are evaluated in full here, before anything is acquired or committed: a list
-            -- that raises leaves everything as it was (the style's, once acquired, releases it first)
+            -- the caller's data is evaluated in full here, before anything is acquired or committed: the target's
+            -- authority list, the anchor and the light (the style's list once it is acquired, which it then releases
+            -- if that raises); a value that raises leaves everything as it was
             _ ← evaluate (spineOf (surfaceAuthorities (vtSurface target)))
+            _ ← evaluate (force (x, y, z))
+            _ ← evaluate (force (openLight request))
             -- masked: the style is recorded (its release attached) in the handoff that acquires it; only its own
             -- interruptible waits can be interrupted
             openStyle request >>= \case
