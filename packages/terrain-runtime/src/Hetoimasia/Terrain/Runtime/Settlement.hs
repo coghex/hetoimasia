@@ -116,8 +116,9 @@ knowledgeWith svc ep lease tile = atomically (admit svc ep (SubKnowledge lease t
 
 -- | A regional terrain-and-knowledge snapshot of some regions (#690), built from one committed version
 -- and settled labelled with its identities. Its borrow is the service's until the host takes it
--- ('retire' or 'retireSTM', which take it in the transaction that retires the result), then the host's
--- until it releases it ('Hetoimasia.Terrain.Runtime.releaseRegionBorrow').
+-- ('takeSTM', which hands it over in the transaction that retires the result, while the request still
+-- owns it), then the host's until it releases it ('Hetoimasia.Terrain.Runtime.releaseRegionBorrow').
+-- Retiring the result without taking it ('retire', 'retireSTM') releases a borrow nobody took.
 regionsWith ∷ Service → Endpoint → ArenaLease → [RegionCoord] → IO (Either Refused Request)
 regionsWith svc ep lease regions = atomically (admit svc ep (SubRegions lease regions))
 
