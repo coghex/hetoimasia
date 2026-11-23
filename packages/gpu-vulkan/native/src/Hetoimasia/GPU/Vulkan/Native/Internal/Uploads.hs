@@ -107,11 +107,12 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Uploads
   , readUploads
   ) where
 
+import Hetoimasia.Foundation.Exit (Exit (Completed), IssuerStanding (..), classifyExit, deliverExit)
 import Hetoimasia.Foundation.OwnerTx (OwnerTx)
 import Hetoimasia.Foundation.OwnerTx.Issuer (fromIssuerSTM)
 import Control.Concurrent (ThreadId, myThreadId)
 import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVar, newTVarIO, orElse, readTVar, retry, writeTVar)
-import Control.Exception (SomeException, evaluate, mask, rethrowIO, tryWithContext)
+import Control.Exception (SomeException, evaluate, mask, tryWithContext)
 import Control.Monad (forM, forM_, unless, when)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
@@ -503,11 +504,16 @@ submitWith gate uploads grant request = mask $ \restore →
                 -- queued: the queue owns it now, whatever ends this hand-off before its ticket is delivered
                 either (const (pure ())) (\_ → opsUploadQueued (recordingOps (framesRecording (uploadsFrames uploads)))) queued
                 pure queued
-          let cleanup = atomically (forgetAdmitting uploads number)
-          case transferred of
-            Left failure → cleanup >> rethrowIO failure
-            Right (Left refusal) → Left refusal <$ cleanup
-            Right (Right queuedTicket) → pure (Right queuedTicket)
+          -- the hand-off's exit, classified against the uploads' standing where it ended (the session failed, or the
+          -- uploads closed: ended); every exit but a queued upload forgets the admission, then is delivered as
+          -- 'classifyExit' decides, its exception with its context
+          standing ← atomically $ do
+            failed ← maybe False (const True) <$> rootsFailedCause (recordingRoots (framesRecording (uploadsFrames uploads)))
+            open ← stateOpen <$> readTVar (uploadsState uploads)
+            pure (if failed || not open then IssuerEnded else IssuerLive)
+          case classifyExit standing transferred of
+            Completed queuedTicket → pure (Right queuedTicket)
+            exit → atomically (forgetAdmitting uploads number) >> deliverExit exit
   where
     asked ask = ask `orElse` pure (Left UploadGateBusy)
     -- a gate's answer evaluated where its exception is owned: the answer and the permit it carries

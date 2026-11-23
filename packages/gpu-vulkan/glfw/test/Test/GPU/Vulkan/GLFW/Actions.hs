@@ -13,7 +13,9 @@ module Test.GPU.Vulkan.GLFW.Actions (spec) where
 
 import Control.Concurrent (myThreadId)
 import Control.Concurrent.STM (TVar, atomically, check, modifyTVar', newTVarIO, orElse, readTVar, readTVarIO, registerDelay, writeTVar)
-import Control.Exception (Exception (..), ExceptionWithContext (..), SomeException, finally, throwIO, toException, try, tryWithContext)
+import Control.Exception (Exception (..), ExceptionWithContext (..), SomeException, finally, rethrowIO, throwIO, toException, try, tryWithContext)
+import Control.Exception.Annotation (ExceptionAnnotation)
+import Control.Exception.Context (addExceptionAnnotation, getExceptionAnnotations)
 import Control.Monad (void, when)
 import qualified Data.ByteString as ByteString
 import Data.List (isSubsequenceOf)
@@ -103,6 +105,7 @@ spec = describe "Vulkan surface-free sessions and owner-thread actions" $ do
     itBounded "settle the ticket with a failure setting the construction up before that failure ends the owner's run" testSetupFailure
     itBounded "are refused after the session's terminal failure, including one queued before it that never started" testTerminalRefusal
     itBounded "are refused once the owner's exit begins, including one queued behind a running action, which finishes" testExitRefusal
+    itBounded "settle an action that raises once the owner's exit has closed its gate as terminal, with the original exception and its context" testClosureDuringAction
     itBounded "are refused at the application's pre-drain quiescence, while a worker drains, a queued one without waiting for the owner, and a running one finishes" testQuiescenceRefusal
     itBounded "never run beside a frame's rendering: a frame asked for meanwhile follows the action" testSerialization
     itBounded "create a buffer and an image of every kind through the lent construction on the owner's thread, and release them for the owner to destroy, each view before its image" testBuffersAndImages
@@ -329,7 +332,7 @@ testRaisingAction = do
   rig ← surfaceFreeRig 0
   (raised, after, whileRunning) ← runRig rig $ \host _ → do
     awaitReady host
-    ticket ← admitted =<< atomically (submitVulkanAction (vulkanController host) (VulkanAction (\construction → constructPipelineLayout construction >> throwIO (ActionBroke "the consumer's own failure"))))
+    ticket ← admitted =<< atomically (submitVulkanAction (vulkanController host) (VulkanAction (\construction → constructPipelineLayout construction >> marked (ActionBroke "the consumer's own failure"))))
     raised ← atomically (awaitVulkanAction ticket)
     -- classified where it ended, while the owner lives: the action's own failure, with its description
     (exitKind <$> atomically (readVulkanActionExit ticket)) `shouldReturnValue` Just ("raised", True)
@@ -337,7 +340,10 @@ testRaisingAction = do
     whileRunning ← journal rig
     pure (raised, after, whileRunning)
   case raised of
-    ActionRaised (ExceptionWithContext _ inner) → fromException inner `shouldBe` Just (ActionBroke "the consumer's own failure")
+    -- the original exception, with the context it was raised with
+    ActionRaised (ExceptionWithContext context inner) → do
+      fromException inner `shouldBe` Just (ActionBroke "the consumer's own failure")
+      length (getExceptionAnnotations context ∷ [ActionMark]) `shouldBe` 1
     _ → failWith "the action's failure did not reach its caller"
   outcomeValue after `shouldBe` Right "still running"
   -- What it built before it raised was not destroyed while the host ran, and
@@ -489,6 +495,52 @@ testExitRefusal = do
   fmap outcomeValue finished `shouldBe` Just (Right ())
   after ← atomically (submitVulkanAction (vulkanController host) (VulkanAction (\_ → pure ())))
   refusalOf after `shouldBe` Just ActionOwnerClosed
+
+-- | An action running when the owner's exit begins, which raises once the gate has closed: its exit is classified
+-- against the owner's standing then (ended), and its ticket keeps the original exception with its context.
+testClosureDuringAction ∷ IO ()
+testClosureDuringAction = do
+  rig ← surfaceFreeRig 0
+  gate ← newTVarIO False
+  running ← newTVarIO False
+  let raising = VulkanAction $ \_ → do
+        atomically (writeTVar running True)
+        atomically (readTVar gate >>= check)
+        marked (ActionBroke "raised once the owner's exit began")
+  held ←
+    withRunHelper
+      (atomically (writeTVar gate True))
+      ( \behind → do
+          -- the one queued behind is refused: the exit has begun and the gate is closed
+          _ ← atomically (awaitVulkanAction behind)
+          atomically (writeTVar gate True)
+      )
+      $ \supply → runRig rig $ \host _ → do
+    awaitReady host
+    held ← admitted =<< atomically (submitVulkanAction (vulkanController host) raising)
+    atomically (readTVar running >>= check)
+    behind ← admitted =<< atomically (submitVulkanAction (vulkanController host) (VulkanAction (\_ → pure ())))
+    supply behind
+    pure held
+  atomically (readVulkanActionExit held) >>= \case
+    Just (Terminal (Right (ExceptionWithContext context inner)), text) → do
+      fromException inner `shouldBe` Just (ActionBroke "raised once the owner's exit began")
+      length (getExceptionAnnotations context ∷ [ActionMark]) `shouldBe` 1
+      Text.null text `shouldBe` False
+    other → failWith ("the action was not settled as terminal with its exception: " <> show (exitKind other))
+
+-- An identifiable annotation on the exception an action raises.
+data ActionMark = ActionMark
+  deriving (Show)
+
+instance ExceptionAnnotation ActionMark
+
+-- Raise this exception with an 'ActionMark' in its context.
+marked ∷ Exception e ⇒ e → IO a
+marked failure =
+  tryWithContext @SomeException (throwIO failure) >>= \case
+    Left (ExceptionWithContext context inner) → rethrowIO (ExceptionWithContext (addExceptionAnnotation ActionMark context) inner)
+    Right () → failWith "nothing was raised"
 
 -- | The application's own pre-drain quiescence is the boundary that refuses
 -- owner-thread actions, not the protected exit after the ordinary drain.

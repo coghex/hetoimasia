@@ -531,7 +531,7 @@ import Hetoimasia.GPU.Vulkan.Native.Presentation (SurfaceExtent (..))
 import qualified Hetoimasia.GPU.Vulkan.Native.Presentation as Presentation
 import Hetoimasia.GPU.Vulkan.Native.Profile (InstancePlan (..), InstanceRequest (..), TargetRejection (..), ValidationChoice (..), ValidationFeature, ValidationResolution)
 import Hetoimasia.Foundation.Exit (Exit, IssuerStanding (..))
-import Hetoimasia.Foundation.OwnerTx (OwnerTx, watchPublication)
+import Hetoimasia.Foundation.OwnerTx (OwnerTx)
 import Hetoimasia.GPU.Vulkan.Native.Roots
   ( DiagnosticAlarm (..)
   , GenerationOps (..)
@@ -555,7 +555,6 @@ import Hetoimasia.GPU.Vulkan.Native.Roots
   , latchTerminal
   , noteTeardownEvidence
   , readRootsTerminal
-  , rootsFailure
   , rootsFailedCause
   , watchRootsDiagnosticsOrdered
   , DiagnosticWatch (..)
@@ -1442,12 +1441,15 @@ serviceActions state batch = go False
           Just started → True <$ run restore started
       if ran then go True else pure served
     run ∷ (∀ a. IO a → IO a) → Started → IO ()
-    -- Each exit is settled once, classified where it ends: the issuer's standing then (its construction escaped, the
-    -- session failed as the roots publish it, or live) and the description rendered and forced here, in protected IO.
+    -- Each exit is settled once, classified where it ends: the issuer's standing then (its construction escaped; the
+    -- owner's gate refusing, for the session's failure or the owner's exit, however it closed; or live), the original
+    -- exception with its context, and its description rendered and forced here, in protected IO. Then it goes on with
+    -- the approved priority: an original cancellation first, then a cancellation met while describing, then the
+    -- original exception.
     run restore (Started action settle) =
       tryWithContext (restore (lendConstruction (stateRendering state))) >>= \case
         Left failure → do
-          raised failure IssuerEnded
+          raised failure IssuerEnded >>= goesOn failure
           rethrowIO (failure ∷ ExceptionWithContextSome)
         -- A device exists whenever an action was admitted, and outlives every
         -- round; this is only what a missing one would mean.
@@ -1457,28 +1459,34 @@ serviceActions state batch = go False
           -- the order they were sealed, and discarded if it raises (GRS-12).
           outcome ← tryWithContext (restore (framelessScoped (stateRendering state) construction (runVulkanAction action)))
           escaped ← atomically (constructionEscaped construction)
+          standing ← case escaped of
+            Just failure → pure (IssuerEscaped failure)
+            Nothing → maybe IssuerLive (const IssuerEnded) <$> atomically (actionGate (stateRoots state) (stateOwnerOpen state))
           case (outcome, escaped) of
             (Left failure@(ExceptionWithContext _ exception), _)
               | isAsynchronous exception → do
-                  raised failure IssuerLive
+                  raised failure standing >>= goesOn failure
                   rethrowIO failure
             (_, Just failure) → do
-              raised (either id (const failure) outcome) (IssuerEscaped failure)
+              raised (either id (const failure) outcome) standing >>= goesOn failure
               rethrowIO failure
             (Left failure, Nothing) → do
-              ended ← atomically (snd <$> watchPublication (rootsFailure (stateRoots state)))
-              raised failure (if ended then IssuerEnded else IssuerLive)
+              raised failure standing >>= goesOn failure
               latched
             (Right value, Nothing) → do
-              atomically (settle (ActionReturned value) IssuerLive "")
+              atomically (settle (ActionReturned value) standing "")
               latched
       where
-        -- a description that raises is answered with a fixed text, and a cancellation met while rendering goes on once
-        -- the action is settled
+        -- settled with the original exception, its context kept, and the description rendered here: one that raises is
+        -- answered with a fixed text, and a cancellation met while rendering is handed back
         raised failure standing = do
           (text, pending) ← renderedText failure
-          atomically (settle (ActionRaised failure) standing text)
-          mapM_ rethrowIO pending
+          pending <$ atomically (settle (ActionRaised failure) standing text)
+        -- the priority after settlement: an original cancellation goes on as it is; otherwise a cancellation met while
+        -- describing goes on before the original exception
+        goesOn (ExceptionWithContext _ original) pending
+          | isAsynchronous original = pure ()
+          | otherwise = mapM_ rethrowIO pending
     latched =
       checkpointRoots (stateRoots state) >>= \case
         CheckpointFailed primary → do
