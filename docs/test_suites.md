@@ -348,10 +348,10 @@ cabal test hetoimasia-tests --test-show-details=direct
   scope ends (a return, an exception, the run bound, a cancellation in the body,
   a failure after the child exists, a cancellation delivered while the release is
   parked) with its descendant in the group; a leader that exits on SIGTERM or by
-  itself while a descendant ignores it; the escalation (SIGTERM, the grace
-  observed on the leader, then SIGKILL to the group; SIGKILL alone for a child that
-  already exited; every signal sent while the leader is unreaped); a reap that is
-  not confirmed, injected through the facility's test-side seams; the stream choices and the handles the caller
+  itself while a descendant ignores it; the escalation (SIGTERM then SIGKILL to
+  the group, no SIGKILL to a child that obeys, nothing to a child that left no
+  member); a reap or a group's end that is not confirmed, injected through the
+  facility's test-side seams; the stream choices and the handles the caller
   opened; a child that has exited and not been reaped; where a child is placed (a
   group of its own in the caller's session, or the caller's group with only its
   identifier signalled); a call that states no bound and is unbounded; and a test-owner

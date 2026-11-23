@@ -85,8 +85,7 @@ does.
   another stream), `Inherited`, or a `CallerHandle` the caller opened (closed by
   the facility only when the start fails or the call is cancelled before the body
   is entered); the body learns the identifier, sends a signal, waits within a
-  bound of its own (`waitChild`, `awaitExit`: both answer the status and neither
-  reaps), and can look at a child that has exited without reaping it
+  bound of its own, and can look at a child that has exited without reaping it
   (`childState`, `awaitUnreapedExit`), so a zombie can be observed and the release
   reaps it. Spawning, creating the pipes, starting the readers and registering the
   release are one masked step; the body runs with the caller's interruptibility
@@ -96,20 +95,16 @@ does.
   readers are stopped and joined before the call returns or raises. A
   cancellation that arrives in the release is remembered and raised after it,
   with the body's failure retained beside it in the exception's context
-  (`RetainedFailure`); a child that cannot be confirmed reaped, or pipes that do
-  not end, fail an otherwise passing call and say which.
+  (`RetainedFailure`); a child that cannot be confirmed reaped, a process group
+  that is not observed to be gone, or pipes that do not end fail an otherwise
+  passing call and say which.
   The owner decisions of 2026-11-02 are fixed in it. Each child starts in a
   process group of its own (never a session of its own) and the whole group is
   ended: SIGTERM, 2 s of grace, SIGKILL, so a descendant in the group goes with
   its leader, and a leader that exits does not spare one that ignores SIGTERM.
-  The facility is the only reaper, and every group signal is sent while the
-  leader is held: the leader, a zombie once it has exited, keeps the group's
-  identifier from being given to another group, so it is reaped last, after the
-  final signal, and no handle of a child leaves the facility. A running child is
-  sent SIGTERM and, once the grace has been observed on the leader without
-  reaping it, its group SIGKILL; an exited one its group SIGKILL; then the reap.
-  Nothing asks whether the group has members left.
-  A child can stay in the caller's group, signalled by identifier
+  The group is signalled only while its identifier is still reserved (the leader
+  unreaped, or a null signal found a member), never once the leader is reaped and
+  none remains. A child can stay in the caller's group, signalled by identifier
   only, in exactly two cases that the caller names (`CallersGroup`): a child that
   inherits the terminal for a person at the keyboard, and the nested private
   compositors, which stay in their owning test process's group so the outer
@@ -120,8 +115,8 @@ does.
   (`DrainGivenUp`). `Bounds` and `Seams` are explicit arguments for the facility's
   own examples (a shorter grace, a failed acquisition, a parked release, a wait
   that does not observe the exit); production use is `noSeams`. It needs `base`,
-  `bytestring`, `stm`, `text` and `unix`, and a small C file for the non-reaping
-  look at a child.
+  `bytestring`, `stm`, `text` and `unix`, a small C file for the non-reaping look
+  at a child, and the bounded wait for a group's end is the one place it polls.
 
 - `Test.Support.Subprocess.Host` is the hosted subprocess (#608), the one thing the
   single-child scopes cannot do: a child whose process group is *not* ended when the
