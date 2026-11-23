@@ -116,7 +116,7 @@ payloadSpec = describe "Prepared payload opacity across the package boundary" $ 
                    ]
 
 packages ∷ [String]
-packages = ["base", "deepseq", "hetoimasia-foundation"]
+packages = ["base", "deepseq", "hetoimasia-foundation-0.1.0.0-inplace"]
 
 channelSpec ∷ Spec
 channelSpec = describe "Channel endpoint authority across the package boundary" $ do
@@ -190,7 +190,7 @@ channelSpec = describe "Channel endpoint authority across the package boundary" 
                    ]
 
 channelPackages ∷ [String]
-channelPackages = ["base", "deepseq", "stm", "hetoimasia-foundation"]
+channelPackages = ["base", "deepseq", "stm", "hetoimasia-foundation-0.1.0.0-inplace"]
 
 withChannelClient ∷ String → ((Mode → IO Client) → IO ()) → IO ()
 withChannelClient = withPackageClient channelPackages "Client.hs"

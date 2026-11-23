@@ -17,6 +17,12 @@ import Test.Support.ExternalClient (Client (..), Mode (..), rejectedBecause, wit
 withClient ∷ String → ((Mode → IO Client) → IO ()) → IO ()
 withClient = withStorePackageClient ["base", "stm", "hetoimasia-foundation-0.1.0.0-inplace"] "Client.hs"
 
+-- The lines of the role client's control coercion and of its handle coercion: the module line, two imports, two
+-- newtypes and the control's signature come first.
+controlLine, recastLine ∷ Int
+controlLine = 7
+recastLine = 9
+
 client ∷ [String] → [String] → String
 client imports body = unlines (["module Client where"] <> imports <> body)
 
@@ -76,12 +82,15 @@ spec = describe "the public boundary" $ do
         clientOutput outcome `shouldContain` "ReadOnly"
 
   forM_ ["Publisher", "Publication"] $ \endpoint →
-    it ("rejects a client that coerces a " <> endpoint <> " of one payload to a newtype of it") $
+    it ("rejects a client that coerces a " <> endpoint <> " between two newtypes of one representation, which coerce themselves") $
       withClient
         ( client
             ["import Data.Coerce (coerce)", "import Hetoimasia.Foundation.OwnerTx"]
-            [ "newtype Shallow = Shallow [Int]"
-            , "recast ∷ " <> endpoint <> " [Int] → " <> endpoint <> " Shallow"
+            [ "newtype Metres = Metres Double"
+            , "newtype Feet = Feet Double"
+            , "feet ∷ Metres → Feet"
+            , "feet = coerce"
+            , "recast ∷ " <> endpoint <> " Metres → " <> endpoint <> " Feet"
             , "recast = coerce"
             ]
         )
@@ -89,7 +98,11 @@ spec = describe "the public boundary" $ do
           outcome ← compile Typecheck
           -- the payload's role is nominal: no coercion lifts through it
           rejectedBecause outcome "GHC-18872"
-          clientOutput outcome `shouldContain` "Couldn't match type ‘[Int]’ with ‘Shallow’"
+          clientOutput outcome `shouldContain` "Couldn't match type ‘Metres’ with ‘Feet’"
+          clientOutput outcome `shouldContain` ("Client.hs:" <> show recastLine <> ":")
+          -- the control coercion between the newtypes themselves is accepted, so only the handle's role can have
+          -- caused the rejection
+          clientOutput outcome `shouldNotContain` ("Client.hs:" <> show controlLine <> ":")
 
   forM_ ["modifyCell", "stateCell", "fromIssuerSTM"] $ \helper →
     it ("rejects a client that asks the public module for " <> helper) $

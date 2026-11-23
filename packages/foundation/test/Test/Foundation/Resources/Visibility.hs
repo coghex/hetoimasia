@@ -62,7 +62,7 @@ spec = describe "Resource module visibility across the package boundary" $ do
       output `shouldNotContain` "hetoimasia-foundation-0.1.0.0:internal"
 
 withClient ∷ String → ((Mode → IO Client) → IO ()) → IO ()
-withClient = withPackageClient ["base", "text", "hetoimasia-foundation"] "Client.hs"
+withClient = withPackageClient ["base", "text", "hetoimasia-foundation-0.1.0.0-inplace"] "Client.hs"
 
 -- | Compile a client importing @hidden@, require the compiler to have found it
 -- and refused it as hidden, and return what the compiler said so the caller

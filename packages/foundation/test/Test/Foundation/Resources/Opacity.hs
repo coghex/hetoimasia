@@ -262,7 +262,7 @@ collectionSpec =
 -- The foundation's clients see exactly @base@, @text@, and
 -- @hetoimasia-foundation@.
 withClient ∷ FilePath → String → ((Mode → IO Client) → IO ()) → IO ()
-withClient = withPackageClient ["base", "text", "hetoimasia-foundation"]
+withClient = withPackageClient ["base", "text", "hetoimasia-foundation-0.1.0.0-inplace"]
 
 -- | The client from the issue: it replaces a scope's continuation through
 -- record-update syntax, which needs only the field label in scope.
