@@ -231,14 +231,9 @@ data TerrainFacade = TerrainFacade
   -- every open request has its own identity) that hold it back: shared by every VM of the service, so that an attach, whichever VM
   -- makes it, is not eligible while the arena it would find is not yet the open's settled result. An open lets go only of its own
   -- entry, so a late cleanup of an earlier open of the name never shows a later open's arena before it has settled.
-  , tfPublished ∷ !(Maybe Published)
-  -- ^ The arena the host published to one content root of the session ('terrainInjectionWithArena'): what @api.terrain.attach_host@ of
-  -- an instance of that root is issued an attachment to. Nothing for 'newTerrainFacade' and for the composition 'terrainInjection' makes
-  -- of it. It is set only on the copy 'terrainInjectionWithArena' composes, so the original facade and every injection made from it keep
-  -- their behavior, and the copy shares every table of the original.
   }
 
--- | The host's publication of one arena: the content root it is published to and the host's creator lease, which the facade borrows and
+-- | The host's publication of one arena: the content root it is published to and the host's creator lease, which the injection borrows and
 -- never owns. The host keeps the lease and releases it with its own scope; closing the last creator lease closes the arena, whatever
 -- is attached to it. Written once, at composition, and read by every VM of the session: no state, no reset.
 data Published = Published !RootKey !ArenaLease
@@ -313,7 +308,7 @@ newTerrainFacade profile svc = do
   offered ← newTVarIO Map.empty
   failed ← newTVarIO Map.empty
   lock ← newMVar ()
-  pure (TerrainFacade profile svc config picks noTerrainHooks [] claims failed lock offered Nothing)
+  pure (TerrainFacade profile svc config picks noTerrainHooks [] claims failed lock offered)
 
 -- | The windows a test may hold or fail: told, never consulted for an answer.
 data TerrainHooks = TerrainHooks
@@ -522,6 +517,9 @@ data Env = Env
   , envIssued ∷ !(TVar (Map Text (Set Word64)))
   -- ^ The arena handles each live instance was issued: ownership is positive, so another instance's handle is refused for as long
   -- as the caller lives, whether or not the issuing instance does. The memory is the handles the instance issued, ended with it.
+  , envPublished ∷ !(Maybe Published)
+  -- ^ The arena the host published to one content root of the session ('terrainInjectionWithArena'): what @api.terrain.attach_host()@ of an
+  -- instance of that root is issued an attachment to. Nothing in the injection of 'terrainInjection'. Fixed at composition, never written.
   }
 
 service ∷ Env → Service
@@ -545,19 +543,23 @@ terrainInjectionWithArena ∷ TerrainFacade → RootKey → ArenaLease → IO (E
 terrainInjectionWithArena facade root lease =
   atomically (Terrain.creatorLeaseSTM (tfService facade) lease) <&> \case
     Left refused → Left refused
-    Right () → Right (terrainInjection facade {tfPublished = Just (Published root lease)})
+    Right () → Right (injectionOver (Just (Published root lease)) facade)
 
 -- | The injection a session is composed with: for each role's VM, its own client table over the shared service, in the VM's own
 -- lending and lease scope.
 terrainInjection ∷ TerrainFacade → TerrainInjection
-terrainInjection config =
+terrainInjection = injectionOver Nothing
+
+-- | The injection over a facade, with the arena the host published, if any: what every VM's environment is made with.
+injectionOver ∷ Maybe Published → TerrainFacade → TerrainInjection
+injectionOver publication config =
   TerrainInjection
     { tiLeaseCapacity = \profile → terrainLeaseCapacity profile (tfService config)
     , injectTerrain = \vm → do
         clients ← newTVarIO Map.empty
         asks ← newTVarIO (1, Map.empty)
         issued ← newTVarIO Map.empty
-        let env = Env config vm (hashUnique (tvSession vm)) clients asks issued
+        let env = Env config vm (hashUnique (tvSession vm)) clients asks issued publication
         pure (services env)
     }
 
@@ -577,16 +579,30 @@ services env =
         client ← clientOf env identity
         start env context openName openAsk (AskOpen client (nameKey env root name) (sourceSpec definition) (OpenOptions (toInteger <$> bytes)))
     , tsAttachCheck = \_ _ _ owner values → permanent env (const attachAsk) owner values
-    , tsAttachStart = \identity root name context →
-        withAttachClient env identity $ \client →
-          start env context attachName attachAsk (AskAttach client (nameKey env root name))
+    , tsAttachStart = \identity root name context → do
+        attachClientOf env identity >>= \case
+          Left refusal → pure refusal
+          Right (client, fresh) → do
+            -- A client made for this attach is the attach's to give back when it is not accepted: nothing stays charged for a request
+            -- that was refused (busy in the host's banks or the service's), and an exception leaves none behind either.
+            let giveBack = when fresh $ do
+                  atomically (modifyTVar' (envClients env) (Map.adjust (\clients → clients {clAttach = Nothing}) identity))
+                  endClient (service env) client
+            started ← start env context attachName attachAsk (AskAttach client (nameKey env root name)) `onException` giveBack
+            case started of
+              TerrainStarted (M1Busy _) → giveBack
+              TerrainRefused _ → giveBack
+              _ → pure ()
+            pure started
     , tsAttachHostCheck = \_ _ owner values → permanent env (const attachHostAsk) owner values
-    , tsAttachHostStart = \identity root context → case published (envFacade env) root of
+    , tsAttachHostStart = \identity root context → case published env root of
         -- no arena is published to this instance's root: the request settles not_found at its hand-off, with no client made for it
         Nothing → start env context attachHostName attachHostAsk (AskAttachHost Nothing)
-        Just source →
-          withAttachClient env identity $ \client →
-            start env context attachHostName attachHostAsk (AskAttachHost (Just (client, source)))
+        -- the instance's own client: the service issues the attachment as a nonowner lease whichever client asks, so it needs no client
+        -- of its own to keep the creator-owner rule apart, and one the instance holds already cannot be refused as the bank filling
+        Just source → do
+          client ← clientOf env identity
+          start env context attachHostName attachHostAsk (AskAttachHost (Just (client, source)))
     , tsCellCheck = \identity key cell owner values →
         firstRefusal
           [ leaseCheck env identity key readAsk owner values
@@ -738,28 +754,10 @@ attachClientOf env identity = do
           atomically (modifyTVar' (envClients env) (Map.insert identity clients {clAttach = Just made}))
           pure (Right (made, True))
 
--- | Start an attachment as the instance's attach client. A client made for this attach is the attach's to give back when it is not
--- accepted: nothing stays charged for a request that was refused (busy in the host's banks or the service's), and an exception leaves
--- none behind either.
-withAttachClient ∷ Env → Text → (Client → IO TerrainStart) → IO TerrainStart
-withAttachClient env identity begin =
-  attachClientOf env identity >>= \case
-    Left refusal → pure refusal
-    Right (client, fresh) → do
-      let giveBack = when fresh $ do
-            atomically (modifyTVar' (envClients env) (Map.adjust (\clients → clients {clAttach = Nothing}) identity))
-            endClient (service env) client
-      started ← begin client `onException` giveBack
-      case started of
-        TerrainStarted (M1Busy _) → giveBack
-        TerrainRefused _ → giveBack
-        _ → pure ()
-      pure started
-
 -- | The creator lease the host published to the content root of an instance, if any: the root's text is the one the facade issued the
 -- instance, and the published root is its UTF-8 encoding exactly (the rule the content facade applies to a root).
-published ∷ TerrainFacade → Text → Maybe ArenaLease
-published facade root = case tfPublished facade of
+published ∷ Env → Text → Maybe ArenaLease
+published env root = case envPublished env of
   Just (Published key lease) | rootKeyBytes key == Text.encodeUtf8 root → Just lease
   _ → Nothing
 

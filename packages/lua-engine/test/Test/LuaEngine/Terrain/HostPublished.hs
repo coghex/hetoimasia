@@ -23,7 +23,9 @@ import Hetoimasia.Terrain.Query (Occupied (..), Run (..))
 import Hetoimasia.Terrain.Residency (RegionDemand (..), Revision (..), coverageTile)
 import Hetoimasia.Terrain.Runtime
 import Hetoimasia.Terrain.Source (LayerSpec (..), SourceSpec (..))
+import Control.Concurrent.STM (atomically, retry)
 import Test.Hspec
+import Test.Support.Bounded (bounded)
 import Test.LuaEngine.Facade.Support
 import Test.LuaEngine.Terrain.Support
 
@@ -87,6 +89,15 @@ nativeDigests service lease = do
       Air → "air"
       Solid material _ → Text.pack (materialIdString material)
     runText (Run zs cell) = Text.pack (show (toInteger (zRangeLo zs))) <> ":" <> Text.pack (show (toInteger (zRangeHi zs))) <> ":" <> materialOf cell
+
+-- | Wait, bounded, until the arena's discovery is idle: the removal's content commit is the awaited request's, but the knowledge it
+-- discovers is committed after, by the owner, and a status read before it is a different reading from one after.
+awaitDiscoveryIdle ∷ Service → ArenaLease → IO ()
+awaitDiscoveryIdle service lease =
+  bounded . atomically $
+    arenaStatusSTM service lease >>= \case
+      Right status | statusDiscovery status == DiscoveryIdle → pure ()
+      _ → retry
 
 -- | The native client's demand through its creator lease and its own view: one cell of the arena's first region.
 demandsNatively ∷ Service → Host → IO ()
@@ -170,12 +181,14 @@ spec = describe "host-published arena" $ do
       withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource agreeing)]) $ \world _ runtime →
         withFvm world runtime (presentationWith rig (hostInjection host)) $ \fvm → (`finally` signalRig rig "edited") $ do
           _ ← spawn world fvm "modules-test" mainPath
+          awaitDiscoveryIdle service (hostLease host)
           nativeBefore ← nativeDigests service (hostLease host)
           demandsNatively service host
           untilPrinted world "status0\tsuccess\t0 0"
           -- the native client edits through its own creator lease
           Right removing ← removeAt service (hostLease host) (either (error . show) id (tileCoord 0 0 0)) Nothing
           void (either (\settled → fail ("the native removal settled " <> show settled)) pure =<< await service removing)
+          awaitDiscoveryIdle service (hostLease host)
           nativeAfter ← nativeDigests service (hostLease host)
           demandsNatively service host
           signalRig rig "edited"
@@ -367,8 +380,22 @@ spec = describe "host-published arena" $ do
           untilPrinted world "done"
           outLines world >>= (`shouldBe` ["first\tsuccess", "second\ttrue\tbusy", "released\tdone", "third\tsuccess", "done"])
           limitHeld service "leases" `shouldReturn` 2
-          -- the refused attach made no client of its own: the host's, the instance's and its one attach client are all that is held
-          limitHeld service "clients" `shouldReturn` 3
+          -- the attachment is the instance's own client's: the host's and the instance's are all that is held
+          limitHeld service "clients" `shouldReturn` 2
+
+  it "attaches with the service's client bank full: the instance's own client issues the attachment" $
+    withRigConfig defaultConfig {configMaxClients = 2} $ \rig → do
+      host ← publish rig "modules-test"
+      withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource (hostSteps (readsLabelled "0")))]) $ \world _ runtime →
+        withFvm world runtime (presentationWith rig (hostInjection host)) $ \fvm → do
+          _ ← spawn world fvm "modules-test" mainPath
+          stepUntil world (elem "done" <$> outLinesSTM world)
+          digests ← nativeDigests (rgService rig) (hostLease host)
+          printed ← outLines world
+          -- the host's client and the instance's fill the bank, and the grant is still live and the lease bank has room
+          printed `shouldBe` (["attach\tsuccess\tnil"] <> linesFor "0" digests <> ["done"])
+          limitHeld (rgService rig) "clients" `shouldReturn` 2
+          limitHeld (rgService rig) "leases" `shouldReturn` 2
 
   it "refuses an argument as an ordinary error, before anything is reserved" $
     withRig $ \rig → do

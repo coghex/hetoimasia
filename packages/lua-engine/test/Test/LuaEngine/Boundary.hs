@@ -238,10 +238,11 @@ spec = describe "the package and import boundary" $ do
     [file <> ": " <> name | (file, name) ← imported, not (permittedFacade name)] `shouldBe` []
     [file <> ": " <> name | (file, name) ← imported, ".Internal" `isInfixOf` name] `shouldBe` []
 
-  it "has a terrain sublibrary over the facade, the request adapter, the terrain packages, the foundation and the host's public modules, and nothing else" $ do
+  it "has a terrain sublibrary over the facade, the request adapter, the terrain packages, the content package's root key, the foundation and the host's public modules, and nothing else" $ do
     (sort <$> fieldEntries "library terrain" "build-depends:")
       `shouldReturn` [ "base"
                      , "containers"
+                     , "hetoimasia-content"
                      , "hetoimasia-foundation"
                      , "hetoimasia-lua-engine"
                      , "hetoimasia-lua-engine:facade"
@@ -256,7 +257,7 @@ spec = describe "the package and import boundary" $ do
                      ]
     fieldEntries "library terrain" "exposed-modules:" `shouldReturn` ["Hetoimasia.LuaEngine.Terrain"]
 
-  it "imports, in the terrain sublibrary, only the configuration boundary, the facade and the request adapter, the terrain packages' and the foundation's public modules, the host's public modules and base libraries: no private module, content, window, GPU, GLFW, Vulkan, console, sample or game" $ do
+  it "imports, in the terrain sublibrary, only the configuration boundary, the facade and the request adapter, the terrain packages' and the foundation's public modules, the content package's root key, the host's public modules and base libraries: no private module, other content module, window, GPU, GLFW, Vulkan, console, sample or game" $ do
     sources ← sourcesUnder "terrain"
     sources `shouldSatisfy` ((>= 1) . length)
     imported ← importedBy sources
@@ -465,6 +466,8 @@ spec = describe "the package and import boundary" $ do
         || name == "Hetoimasia.LuaEngine.Terrain"
         || name
           `elem` [ "Hetoimasia.LuaEngine.Facade"
+                 , -- the published root's key, which a host names the content root of an arena it publishes by
+                   "Hetoimasia.Content.Identity"
                  , "Hetoimasia.LuaEngine.Profile"
                  , "Hetoimasia.LuaEngine.Request"
                  , "Hetoimasia.Foundation.Resource"
