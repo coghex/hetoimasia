@@ -131,6 +131,8 @@ found.
 | `catchstm-composition/README.md` | #700, PR #701: GHC 9.14.1's `catchSTM` reruns only its guarded action when the nested commit fails, so an allocation-free action against a stale enclosing transaction loops forever; the repair is `catchSTMRestarting` in `Hetoimasia.Foundation.Failure` |
 | `reclaim-after-release/README.md` | #703, PR #704: an idle mark stamped at the store's state when the transaction ended, not at the store the plan was given, left retired pages unreclaimed after the last reader pin was released; the repair is `slotBasis` |
 | `lua-capability-pass/README.md` | #692, PR #707: `lua-engine-tests` runs its terrain set again on 2 capabilities behind a pump that wakes one update at a time; six test mechanisms repaired, the three defects above found; the lab trials were dropped by the owner and no lab result is claimed |
+| `tra9/` (`README.md` and the `full/` captures) | #645, PR closed unmerged 2026-11-23 (terrain views v1 moved to the consumer): the judged results of the terrain-view adapter on a real device and the headless examples, with the full-matrix pixel and pick captures; the code was never merged and the branch `issue-645-terrain-views` stays on GitHub; last commit `acebd223` |
+| `tra9-v2-a.md` | #714, PR closed unmerged 2026-11-23 after sixteen review rounds (terrain views v2 slice A moved to the consumer): native, headless and planning-time results at code head `e34edcf7`; the code was never merged and the branch `issue-714-terrain-views-v2` stays on GitHub; last commit `8e479480` |
 
 ## Per-issue Vulkan records — last present at `18c3a659` (removed 2026-11-13)
 

@@ -606,16 +606,6 @@ cabal test hetoimasia-tests --test-show-details=direct
   sites are covered by their examples still passing in `test.vulkan-lua-engine-native` and by the baseline guard; the live-window
   cancellation is the probe `bash tools/vulkan/run.sh native hetoimasia-lua-engine-graphics:test:lua-engine-graphics-native-tests --
   --probe-cancel-loop` (a window-opening run, so the desktop opt-in on that one command; it is not part of the catalog group).
-  Its `terrain views` subgroup (TRA-9; `-- --match 'terrain views'`, part of `--complete`) opens no window: a terrain view of a real
-  terrain service's arena, styled by the two atlas parents loaded through the pipeline, publishes to a surface-free target, which is
-  drawn through the production world recording with a `D32_SFLOAT` depth image and read back; an edit is drawn again, and the close
-  hands a real empty revision back and retires every chunk. The terrain views in a real window are the separate mode
-  `HETOIMASIA_NATIVE_SESSION=desktop bash tools/vulkan/run.sh native hetoimasia-lua-engine-graphics:test:lua-engine-graphics-native-tests -- --terrain-views-full`,
-  accepted alone on a host whose windows carry the world depth image, run directly with the same checks and not part of the catalog
-  group: a view opened directly on a fresh window and drawn at the presentation's enqueue through zoom changes, with the owner-thread planning time recorded against the
-  frame budget. The headless counterpart is the `terrain views (TRA-9 v2)` group of `lua-engine-graphics-tests`
-  (`test.vulkan-headless`), over the real terrain service with the graphics owner, the release lane and the target stepped by the
-  example.
   Its scene publication (LFE-20) has a second native subgroup, `scene retention`:
   a published scene adopted by the real owner, its texture protected and recorded
   again after Lua released it, a publication naming the released lease refused,

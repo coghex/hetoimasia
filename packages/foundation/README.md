@@ -211,7 +211,6 @@ outside them, is in [Ownership transactions](#ownership-transactions).
 
 | Logical module | Source path | Cabal component | Visibility | Purpose |
 | --- | --- | --- | --- | --- |
-| `Hetoimasia.Foundation.Admission` | `src/Hetoimasia/Foundation/Admission.hs` | main library | exposed | An admission its owner opens once and closes once (`Admission`, the only capability that closes it), and the read-only `AdmissionToken` others hold: they read whether it is open and compare it by identity, a read of the owner's cell and nothing more, so a commit may verify one |
 | `Hetoimasia.Foundation.OwnerTx` | `src/Hetoimasia/Foundation/OwnerTx.hs` | main library | exposed | The abstract ownership transaction and `commit`; owner cells by value, read-only capabilities, and revisioned publications of prepared values |
 | `Hetoimasia.Foundation.Exit` | `src/Hetoimasia/Foundation/Exit.hs` | main library | exposed | `classifyExit`, the one classification of an operation's end by its issuer's standing, with its decision table; `tryExit` and `deliverExit` |
 | `Hetoimasia.Foundation.OwnerTx.Representation` | `internal/Hetoimasia/Foundation/OwnerTx/Representation.hs` | `internal` sublibrary | package-private, defining module | The transaction's representation; bridge-equivalent |

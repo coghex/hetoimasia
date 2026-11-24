@@ -544,12 +544,6 @@ part; `cdPrefetch` is the existing horizontal chunk margin, empty until the visi
 work is settled and bounded by what the visible demand left of each limit, so
 prefetch never takes capacity visible work needs. `cdTruncated` says a demand bound
 cut a listing short. Admission, queueing and priority belong to the runtime.
-`cellPrefetchRegions` lists, from a settled plan's visible chunks, a bounded prefix
-of distinct region keys outside a given footprint. It walks the ring chunk by chunk
-within the chunk, interval, per-chunk region and work allowances and a number of
-places, and stops at the first exhausted bound. `planEmptyFootprint` makes the
-clear plan of a camera whose read footprint (`cellReadFootprint`) is empty: no
-quad, pending span or demand, at the request's versions.
 
 ### Picking
 

@@ -2082,8 +2082,7 @@ instance while its owner lives is `BindingRefused`.
 ### Using a handle
 
 Declare the type with `leaseCapabilityType`, so the value boundary checks
-liveness through `leaseLive` (`leaseLiveSTM` inside a caller's transaction, so
-a check and what it authorises are one step). `withLease leases key action` borrows the
+liveness through `leaseLive`. `withLease leases key action` borrows the
 resource for the action and is refused for a lease of another type or
 instance. `withLeaseOr leases key refused action` hands the same refusal back
 as data, so a binding opted in to

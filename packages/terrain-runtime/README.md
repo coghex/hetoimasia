@@ -108,14 +108,6 @@ TRA-5 (#641) at the manager's authorization under the owner's 2026-11-09 decisio
   host that composes over a service asks it, instead of being handed a configuration that might differ from the one the service enforces
   (the Lua adapter reads every limit it applies from it, and refuses a service configured above the caps Lua is promised). A terrain-runtime
   example reports the limits a service was built with whatever configuration a caller holds.
-* `authorityEpochSTM service` and `arenaMarkSTM service lease` are cells a holder waits on instead of the state, which every load
-  writes. The epoch moves only in the transactions that end a lease's validity (an arena's close, a lease's release, the service's end).
-  An arena's mark (`ArenaMark`: its content and knowledge revisions and its residency generation) is resolved through a live lease once
-  and written by the state's one write (`putSt`) only when one of them moves; it is `Nothing` once the arena has ended, and says nothing
-  of the lease, whose end the epoch reports. `retainedBankUseSTM` and `capacityFreedSTM` are such cells too: the retained bank's use,
-  written only when it changes, and a count bumped by every event that may free capacity, which a holder refused for a model capacity
-  waits on. `regionalFitsSTM service n` reads the retained bank's cell and answers whether a regional request of `n` regions fits it now,
-  by the one predicate (`regionalFits`) a regional request is refused `BusyRetained` by, so a holder refused it waits for exactly that.
 * `retireSTM service request` and `releaseArenaLeaseSTM service lease` are `retire` and `releaseLease` as transactions (`Settlement`): the same functions, writing the same
   state, for a host that gives a result or a lease back from inside a transaction of its own. The Lua host gives a request's credit back in the
   transaction that takes the result or accounts its work, on whichever thread does, so it retires the result in that transaction instead of
@@ -123,9 +115,7 @@ TRA-5 (#641) at the manager's authorization under the owner's 2026-11-09 decisio
 
 ## State, owner, thread and lifetime
 
-All mutable state is one record behind one `TVar`, written only through `putSt`,
-which also brings each arena's identity cell (`arenaMarkSTM`) up to the state it
-writes. Admission, cancellation, release
+All mutable state is one record behind one `TVar`. Admission, cancellation, release
 and closure run as transactions on the caller's thread and write only
 **bookkeeping**: the request table, leases, names, views and the accounting model.
 The owner thread is the **sole writer of arena contents**: the resident detail, the
@@ -203,19 +193,10 @@ model itself. The registered clients are bounded too (`configMaxClients`, 256).
 
 Removing air is a no-op: `changed = false` and the unchanged revision. A removal
 whose staged revision was superseded is recomputed against the current revision and
-committed in order; it is not rejected. A supplied precondition (the incarnation
-plus the committed content revision a displayed view was built from, optionally its
-knowledge revision, and optionally the holder's guard) that no longer holds answers
-`stale_view`, even for a cell already air, with nothing changed. Admission judges the
-revisions; the decision judges them again with the guard, in the transaction that
-commits (`preconditionStale`). A guard (`PreconditionGuard`) is the holder's own
-transaction, a pure read that never waits (one that retries is read as not holding),
-with an identity for equality and display; it carries nothing of the holder into the
-service. A guard may be bound to the service its holder read from (`guardService`,
-`serviceIdentity`): bound to another service it is stale before its transaction is read,
-since equal arena and revision numbers in two services name different terrain. A terrain
-view's pick guards, bound to its own service, that the view still holds its target and
-that the revision it was picked from is still the one adopted.
+committed in order; it is not rejected. A supplied content precondition (the
+incarnation plus the committed revision a displayed view was built from) that
+differs from the arena's current state answers `stale_view`, even for a cell already
+air, with nothing changed.
 
 **Ordering.** Among the eligible commands of one arena the owner commits in
 admission order. A command that is not yet eligible does not hold up the others; a
@@ -337,10 +318,6 @@ incarnation is its identity); and for each held region two parts, each `PartRead
   `changesFromIntervals` turns them into `Changes`;
 * knowledge (`regionKnowledge`): what #661 knows of every cell (`queryCell`, as `knowledgeAt` answers at
   the copy's knowledge revision) as compressed column runs; a uniform region is one class of one run.
-
-`regionInputCounts` reads a held region's input counts from its packed parts without unpacking them: its
-removed intervals, and the knowledge runs a consumer expanding its classes is handed (one for a uniform
-region, otherwise each column's class's runs). An unavailable part counts zero.
 
 `regionCell` and `regionCellKnowledge` answer one cell. Both parts are packed, so what a copy holds grows
 with a region's intervals and knowledge runs, never with its cells (`regionSnapshotFootprint`, every heap
@@ -514,14 +491,14 @@ the stores only after the borrowers finish.
 | Duplicate name | `NameInUse` (settled) |
 | Absent name, or a pending open, on attach | `NotFound` (settled) |
 | Arena incarnation closed, through a well-formed lease | `ArenaClosed` (settled), no work admitted |
-| Stale precondition: incarnation, content or knowledge revision, or a guard that does not hold at the decision | `StaleView` (settled), nothing changed |
+| Stale content precondition | `StaleView` (settled), nothing changed |
 | Invalid source definition | `Definition` (settled), no name claimed |
 | Column answer over 1,024 runs | `TooLarge` (settled), never truncated |
 | Column range over 8,192 levels (refused in constant time, before any region is enumerated), a name that is empty or over 256 characters, a borrow naming more regions than a hold may, coordinates outside the extent | `RefusedInvalid` before admission |
 | A regional snapshot naming no region, a region twice, a region of unsupported coordinates or more regions than a hold may | `RefusedInvalid` before admission |
 | A page a regional snapshot's build needs fails or reads back invalid | The parts that needed it `PartUnavailable` (never air, fog or the source), the arena paused for the cause as for any read, the snapshot settled; other regions unaffected |
 | Forged, foreign, released or wrong-service authority | `RefusedAuthority` before admission |
-| Bank, slot, arena, lease or view cap; an outside staging account that cannot take a step's increase | `RefusedBusy`, nothing created |
+| Bank, slot, arena, lease or view cap | `RefusedBusy`, nothing created |
 | An identity, or a content, knowledge or store revision, that would wrap | `RefusedExhausted` before admission; internal work whose next commit would wrap stops |
 | The arena's allowance cannot take the next transaction beside the protected reserve; a page write or read fails; a page reads back invalid | `storage_full` / `storage_io` / `storage_integrity`: the arena pauses for that cause, its uncommitted removals settle with it and new ones at once while it holds, its committed terrain stays readable, other arenas continue; growth clears only `storage_full`, an explicit retry re-tests the recorded pages (a read again, a write by a probe it abandons) and clears, at its own publication, what it verified, and no failed removal is ever repeated |
 | An open on an unqualified filesystem; a reservation that fails; a source past a compile bound | `storage_unsupported` / `reservation_failed` / `source_complexity` (settled), nothing published, the name released |
@@ -552,28 +529,6 @@ of connectivity plus 32 bytes per node: 18 MiB) plus one compilation's 48 MiB pe
 for four arenas, and a configuration it cannot hold is refused. A source the compiler
 accepted before can now be refused at that bound: a column of 1,024 one-level patches two
 levels apart compiles to 16,777,224 bytes and is `source_complexity`.
-**An outside staging account.** With `configStagingAccount` set (a terrain-enabled
-composition gives the session's one CPU render/staging account), every step of the
-accounting model charges the account the change it made to the model's staging use
-(occupied plus reserved), in the step's own transaction (`applyEvent`): an increase the
-account cannot reserve refuses the step as the model's own full staging bank would
-(`RefusedBusy`, nothing changed); a decrease is returned. The model, its admission order
-and its invariants are unchanged; an explicit request stays one all-or-nothing unit, and a
-camera demand is refused whole while the account rather than the model is the binding
-limit (its holder sends it again). A step that raises nothing (clearing or withdrawing
-a demand, closing a view, releasing a hold or borrow, a job, victim or commit report) is
-never refused by the account. The owner's wait reads the account's charge, so a
-release by another consumer wakes queued work. The snapshot backing bank
-(`configRetainedBytes`), which the ports charge outside the model's steps (snapshot
-backing, regional snapshot reservations and footprints, request result records), is held
-in the account as a fixed carve-out for the service's whole life: reserved in one
-transaction before anything starts, or the service is refused (`ConfigStagingAccount`)
-with nothing started and nothing reserved, and returned after the drain. So the model's
-staging and the backing bank together never exceed what the account granted, and a
-regional snapshot is never funded outside it. The rest of what the service holds is
-returned after its drain. Without an account the service keeps its internal bank and
-charges nothing outside.
-
 The service adds the approved caps of four arenas, 64 arena leases and eight views,
 a snapshot backing bank carved from the staging bank (see Snapshots; a regional snapshot names at most
 `specHoldRegions` regions and is charged there too),

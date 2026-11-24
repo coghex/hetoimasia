@@ -19,9 +19,7 @@ and the suites' verification capture.
   required or optional target — or, once the session has failed, refuses naming
   its primary failure. `readVulkanTerminal` reads the session's terminal latch:
   that primary, the device's loss if it was observed, and what teardown found
-  and retained beside it; `readVulkanActionGate` reads, as admission does,
-  whether the owner takes actions now (refused once its session failed or its
-  exit began). `replaceVulkanSurfaces` creates, on the main
+  and retained beside it. `replaceVulkanSurfaces` creates, on the main
   thread, the replacement surface the owner asked for to recover a lost one,
   under the same attachment (VK-14); `readVulkanUnavailability` reports an
   optional target that could not be recovered, and a required one fails the
@@ -79,8 +77,7 @@ and the suites' verification capture.
   session's `Construction`: on the graphics owner's thread it builds pipeline
   layouts and graphics pipelines over embedded shaders
   (`constructPipelineLayout`, `constructPipeline`), replaces and releases them
-  (`replaceConstructedPipeline`, `releaseConstructed`; `constructedDisposal`
-  reads whether a released buffer has been destroyed), and binds one built for
+  (`replaceConstructedPipeline`, `releaseConstructed`), and binds one built for
   the frame's format inside the dynamic rendering it begins and ends. Any other
   thread is refused before anything native happens, a pipeline built for
   another format is refused at its binding, and it never holds a native
@@ -102,22 +99,7 @@ and the suites' verification capture.
 - A host configured with `DeviceSurfaceFree` (`vulkanDeviceStart`) creates
   the session's device in the owner's startup, with no surface and before any
   window; a window handed over later is admitted only if the chosen queue
-  family presents to it. `vulkanActionRoom`, `vulkanReleaseRoom`,
-  `vulkanOwnerEnded` and `vulkanUploadRoom` answer whether an action, a
-  release request or an upload of a size would be admitted now, and whether
-  the owner takes no more, reading only the owner's gate, the device and the
-  action queue (or the uploads' own state): never a
-  barrier, a scene or a target, so a consumer that waits on them wakes for
-  that change alone. `reserveVulkanUpload` takes the room `vulkanUploadRoom`
-  reads, in the caller's transaction, for a vertex buffer not yet made;
-  `submitVulkanGranted` spends it once and `abandonVulkanGrant` frees it. The
-  owner's gate answers a permit that the transactions binding and queueing the
-  upload verify. A refusal before binding leaves the reservation spendable;
-  once bound, a failed or cancelled copy, or the owner's gate closing before
-  the upload is queued, gives its place and region back and consumes it. An owner round that takes no action writes no queue.
-  `vulkanHostIdentity` names the host, which every offscreen registration
-  carries; `vulkanSceneTargetRegistered` answers whether this host holds an
-  exact registration now. With or without windows, `submitVulkanAction` hands
+  family presents to it. With or without windows, `submitVulkanAction` hands
   the owner a bounded `VulkanAction` from any thread, run once on the owner's
   thread with the same `Construction`, never beside a frame; admission refuses
   at once — a full queue, no device yet, a failed session, a closed owner —
@@ -156,17 +138,6 @@ and the suites' verification capture.
   the swapchains it did before and refuses every request. A surface offering
   no transfer-source usage is still admitted, and its capture is refused with
   a typed reason.
-- The test-only completion hold is public, unlike verification capture,
-  because another package's suite needs it (#645's overlap witness):
-  `vulkanCompletionHold`, `Nothing` by default and in every production
-  configuration, set by no library or executable, and fixed when the host is
-  made. It holds frame-less batches
-  only, at the one place their completion is recognized: a held batch's fence
-  is not asked, so it stays pending for every reader and everything it uses
-  stays held; letting go completes nothing until a later step observes the
-  fence signalled. It is the one exception to the rule that tests never own a
-  production lifecycle; [`docs/gpu_backend.md`](../../../docs/gpu_backend.md#frame-less-batches)
-  states it in full.
 
 Every Vulkan object is created and destroyed on the graphics owner's thread;
 the controller makes no GLFW call. [`docs/gpu_backend.md`](../../../docs/gpu_backend.md)

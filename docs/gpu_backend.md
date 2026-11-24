@@ -467,10 +467,8 @@ is named and nothing fails.
   `resource <n>.<generation> pipeline`.
 - A naming call that raised is a failure of the thing being named, by that
   thing's own rules: a surface is not admitted, a generation fails its
-  construction, a managed resource is released and its handle never returned;
-  the exception it raises names the released resource in its context
-  (`releasedResourceOf`, `releasedBufferOf`), so a caller can follow it to its
-  destruction. Nothing is published as named that was not.
+  construction, a managed resource is released and its handle never returned.
+  Nothing is published as named that was not.
 - **Two objects are never named.** The instance, because naming requires
   external synchronization and the main thread uses the instance through the
   surface bridge's lease. The debug messenger, because the pinned loader
@@ -691,10 +689,7 @@ renderer can draw into the window with a depth test.
 **The setting.** `VulkanHostConfig`'s `vulkanWindowDepth` is `False` by
 default, and nothing then changes: no generation has a depth image, no
 `FrameRequest` names one (`requestDepth` is `Nothing`) and the device is asked
-nothing about depth. A terrain-enabled composition of the Lua-first engine sets
-it host-wide (`configureWorldDepth`, TRA-9): every window on that host gets the
-image its terrain views draw with, and its M1 scenes, which name no
-depth-enabled layer, draw as before. When it is `True`, the controller asks the generations
+nothing about depth. When it is `True`, the controller asks the generations
 for a depth image with every generation (`requireWindowDepth`), and **no
 generation is constructed** until the recording supplies what makes the images
 (`supplyRecordingWindowDepth`). The owner's step makes the recording before
@@ -889,59 +884,10 @@ order:
 8. the queue and staging have room now (`UploadBackpressure`, as `QueueFull`
    or `StagingFull`).
 
-A caller's gate (`submitUploadGated`, an `UploadGate`) is asked in its own
-transaction before this one and again after the copy; it may refuse, raise or
-wait, and a wait answers `UploadGateBusy`, a refusal that can change. Only
-these asks run the gate's own transaction, and each answer is evaluated inside
-the cleanup that owns the upload. An admitting answer carries an
-`UploadPermit` as data: the read-only token of its owner's admission
-(`admittedWhile`, a foundation `AdmissionToken`), which its owner closes once
-and which never reopens (a reopened admission is another). The commit that
-admits the upload reads that token; the commit that queues it requires the
-session not to have failed (`UploadSessionFailed`) and the second answer to
-name the same admission, still open. An admission closed after either ask, or
-replaced during the copy, refuses the upload. `ungated` admits everything.
-
 The transaction reserves the target, the queue place and the staging region
 and makes the ticket. The caller's thread then copies the bytes into the
-region, so its bytes are free when admission returns. From that commit until
-the one that queues the upload, one cleanup owns every exit: a copy that
-raised or was cancelled, the gate refusing, raising or waiting after it, and a
-refusal in the queueing transaction each give back every reservation, and an
-exception goes on after it. Retirement waits for copies under way, so the
-staging buffer is never unmapped under a writer.
-
-**Reservations.** A caller that must know there is room before it makes a
-vertex buffer reserves it first: `reserveUpload uploads bytes`, in the
-caller's transaction (`reserveVulkanUpload` through the host, under the
-owner's gate). It makes steps 1, 7 and 8 above, with the same placement rule,
-and on a grant occupies one queue place and one aligned staging region for
-every other caller, admitted uploads and reservations alike.
-`uploadRoom uploads bytes` reads the same decision without reserving
-(`vulkanUploadRoom`). A grant belongs to the uploads that issued it. While it
-is reserved it is spent once, by `submitUploadGranted` for a fresh vertex
-buffer of exactly its bytes, which takes its place and region and competes for
-nothing again, or abandoned (`abandonUploadGrant`). Binding is the transaction
-that admits the upload, and it spends the grant. A refusal before it (the
-gate, the session, misuse, a buffer of the wrong kind or size) leaves the
-grant reserved. After binding, every exit before the upload is queued (the
-copy raising or cancelled, the gate refusing, raising or waiting, the permit
-or admission closing) gives the place and region back and consumes the
-grant. A
-spent, abandoned or foreign grant changes nothing, and closing admission
-abandons every grant not yet spent. `returnUploadGrant` gives a reserved grant
-back through the state of the uploads that issued it and its own cell, with no
-handle to them.
-
-**Access.** A holder reaches a session's uploads through an `UploadAccess`,
-closed data over the issuer's cells: none (`noUploadAccess`), a session's own
-uploads, ungated (`sessionUploadAccess`), or the uploads an owner records in
-its cell (`UploadsStanding`) under the admission token in its cell and the
-session's terminal state (`ownedUploadAccess`; the host's is
-`vulkanUploadAccess`). Room (`accessRoom`), reservation (`accessReserve`), the
-gate (`accessGate`) and the spend of a reservation (`accessSubmitGranted`) are
-the uploads' own decisions over those cells, so a holder's transaction may
-reserve through it: it runs no holder's code.
+region, so its bytes are free when admission returns. If the copy raises or is
+cancelled, every reservation is given back.
 
 **The exclusive target.** From admission until its upload settles, a target
 belongs to the upload alone: every other batch's use of it is
@@ -1315,9 +1261,6 @@ a signalled cleanup fence followed by a returned release is
 `UnpresentedFrameSettled`. Nothing else (elapsed time, a returned call, a
 cancellation, a reset fence) becomes any of them. Completions are also
 appended to a log (`readCompletedSubmissions`, `takeCompletedSubmissions`).
-The one exception to when a fence is asked is the test-only completion hold
-(see [Frame-less batches](#frame-less-batches)): it keeps a held frame-less
-batch's fence from being asked at all, and so completes nothing itself.
 
 A step makes at most the model's progress-action limit of native calls and
 starts one place further along its work each time, so a fence that never
@@ -1775,9 +1718,7 @@ A fence is asked only when the model's schedule says a poll is due
 frame is to be attempted this step. A round something unrelated woke asks no
 fence and takes no model turn. The backoff moves on once per poll: 5, 10, 20,
 40, 80 and then 100 ms. New demand, a new obligation, an observed completion
-or a close transition restarts it. A frame-less batch the test-only completion
-hold holds is passed over at every poll, and asked again only at a poll after
-the hold lets it go.
+or a close transition restarts it.
 
 ### Pacing, suspension and fairness
 
@@ -1927,24 +1868,6 @@ own submission and completion. The model's rules are
   most a hundred), for each outstanding frame-less fence. One still
   outstanding without device-loss evidence is retained (`FramelessRetained`),
   and so is the device.
-- **The test-only completion hold.** `vulkanCompletionHold`, `Nothing` by
-  default and in every production configuration, is the one test-owned
-  lifecycle addition (#645's overlap witness, owner decision 2026-11-16). Only
-  a test suite sets it; no library or executable does. It holds frame-less
-  batches only; window frames, present fences and cleanup fences are never
-  held. While its `holdsBatch` answers `True` for a frame-less batch, the
-  owner's progress step does not ask that batch's fence, so every reader sees
-  it pending together: the model's completion, its frame-less slot, its ticket
-  (`TicketPending`), the completion log, and so the scene ledger's release of
-  the revision it used, and everything it uses stays held. `heldObserved` runs
-  in the step's transaction each time a step passes over a held batch, so the
-  test knows a step saw it. Letting go completes nothing: a later step asks the
-  fence and records the completion only once it is signalled. A batch still
-  held at whole-owner retirement is retained like any outstanding frame-less
-  batch, and device loss settles it lost; the hold adds no bypass, timeout or
-  automatic release. The hold is given when the host is made and fixed for
-  the frames' life (`newFramesWith`); production has none, holds no cell for
-  it and reads nothing more.
 
 ## Destruction order
 
