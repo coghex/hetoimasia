@@ -41,12 +41,14 @@
 -- enforces the child's deadline from outside; an expiry or a forced
 -- termination fails the case.
 --
--- Whether a surface is created after the loss is not asserted: the session
+-- Whether a surface is created after the loss is not asserted. The session
 -- latches the loss in event processing and raises it again from every later
--- processing ('Hetoimasia.GLFW.Internal.Session.requireConnection'), and the
--- loop has no handler, so none follows. A surface the adapter serves in the
--- turn that ended the compositor precedes the confirmation, so it says
--- nothing about reconnection.
+-- processing ('Hetoimasia.GLFW.Internal.Session.requireConnection'), so a
+-- confirmed loss leaves event processing before the turn's update, where the
+-- adapter serves replacement surfaces. The loop's only handler, its final
+-- reporting, runs once and rethrows the primary failure; it never resumes the
+-- loop. A surface the adapter serves in the turn that ended the compositor
+-- precedes the confirmation, so it says nothing about reconnection.
 module Test.GPU.Vulkan.Native.ConnectionLoss
   ( LossOutcome (..)
   , runConnectionLoss
