@@ -71,7 +71,7 @@ cabal test hetoimasia-tests --test-show-details=direct
   `hetoimasia-test-support`.
 - `terrain-render-2d-tests` (`packages/terrain-render-2d/test/`, group `test.terrain-render-2d`, the CPU project) owns the
   pure planner and picker (TRA-7), the terrain material's pure model, presentation settings and atlas adaptation (TRA-17) and, in `Test.TerrainRender2D.MapAssets` (TRA-14),
-  the canonical cutout and unit-normal map assets: the committed catalog under `samples/ecce-homo/content/textures/facemap/`
+  the canonical cutout and unit-normal map assets: the committed catalog under `packages/terrain-render-2d/test-data/content/textures/facemap/`
   against an independent reference worked from the P-9 height table with hand-stated normal bytes, the rotated lookup, the
   tie rule, joined cells, the sampling and colour-coverage model and the reproduced N/E reference defect, and the generator
   `terrain-mapgen` through its command-line function (read-only `--check`, two temporary regenerations, negative controls).
@@ -474,7 +474,7 @@ cabal test hetoimasia-tests --test-show-details=direct
     bash tools/vulkan/run.sh native hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests -- --private-roots tra17-terrain
   ```
 
-  It reads the committed atlases under `samples/ecce-homo/content/textures/terrain-atlas/`
+  It reads the committed atlases under `packages/terrain-render-2d/test-data/content/textures/terrain-atlas/`
   through the bounded decoder. The terrain case's own upload configuration allows a
   4 MiB single upload request (the packed normal atlas is 1,179,648 bytes); it is
   the harness's staging bound, not a texture-admission bank. Its evidence is under
