@@ -366,7 +366,10 @@ footprint, kept until the release. The borrow counts among the borrowers service
 was taken, retired or released with its lease, client, arena or the service). `await` and
 `withRegionSnapshot` take in the transaction that reads the settlement; a regional result given up before
 it was taken answers `Cancelled`, and its released borrow is never returned. A host that settles through
-the seam uses a regional answer only on `Taken`.
+the seam uses a regional answer only on `Taken`. `borrowHeldSTM` answers whether the service still holds a
+borrow charged to a request: pending, staged or untaken, or orphaned until the owner's safe point when the
+request ended while its build or delivery ran. It is read-only; a host reads it to prove its work on the
+request over, because the request's own record can be gone while its charge is not.
 
 A release is idempotent: the borrow is found and released once, in one place (`releaseRegionalSTM`),
 whichever path finds it first.
@@ -387,6 +390,11 @@ the stores only after the borrowers finish.
   has recorded every job it started; while its slot's run holds a job in flight (a write
   holds page images under the transaction's staging credit) the slot and its credit stay
   reserved.
+* An attach through a creator lease (`attachArenaFrom`, `attachArenaFromWith`) gives the requesting client its own lease on the arena
+  incarnation the source names, with no name to resolve. The source must be a live owner lease of the same service, checked when the
+  request is admitted and again where the lease is issued. The new lease is never an owner lease, whichever client asks: releasing it
+  never closes the arena, and growth and retry through it are refused. It counts against the lease bank as any attach does, and a
+  declined or cancelled request leaves no reservation and no lease. `creatorLeaseSTM` answers whether a lease is now a live creator lease.
 * Releasing a lease cancels the requests made through it. Releasing the creator's
   final owner lease, or ending the creator, closes the arena even if attached leases
   remain: other clients' requests settle `arena_closed` and their leases answer
@@ -490,6 +498,8 @@ the stores only after the borrowers finish.
 | --- | --- |
 | Duplicate name | `NameInUse` (settled) |
 | Absent name, or a pending open, on attach | `NotFound` (settled) |
+| Source lease of an attach-from-lease that is gone, ended, or whose arena closed (at admission or at the commit that issues the lease) | `NotFound` (settled) |
+| Source lease of an attach-from-lease that is another service's, or a live lease that is not an owner lease | `RefusedAuthority` |
 | Arena incarnation closed, through a well-formed lease | `ArenaClosed` (settled), no work admitted |
 | Stale content precondition | `StaleView` (settled), nothing changed |
 | Invalid source definition | `Definition` (settled), no name claimed |

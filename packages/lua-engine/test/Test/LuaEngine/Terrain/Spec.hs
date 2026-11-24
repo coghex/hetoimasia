@@ -41,6 +41,7 @@ import qualified Test.LuaEngine.Terrain.Ownership as Ownership
 import qualified Test.LuaEngine.Terrain.Picks as Picks
 import qualified Test.LuaEngine.Terrain.Pump as Pump
 import qualified Test.LuaEngine.Terrain.Races as Races
+import qualified Test.LuaEngine.Terrain.Region as Region
 import qualified Test.LuaEngine.Terrain.Storage as Storage
 import qualified Test.LuaEngine.Terrain.StorageFaults as StorageFaults
 import qualified Test.LuaEngine.Terrain.Validation as Validation
@@ -67,6 +68,7 @@ entries =
   , Entry "HostPublished" (rig <> ", an arena the host published, with its windows held by gates and hooks") HostPublished.spec
   , Entry "Races" (rig <> ", ordered by gates") Races.spec
   , Entry "Limits" rig Limits.spec
+  , Entry "Region" (rig <> ", a regional copy against the native snapshot, with the storage seam and gates held") Region.spec
   , Entry "Isolation" rig Isolation.spec
   , Entry "Picks" rig Picks.spec
   , Entry "Windows" (rig <> ", held at the adapter's hooks") Windows.spec

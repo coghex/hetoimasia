@@ -408,14 +408,13 @@ spec = describe "host-published arena" $ do
           limitHeld (rgService rig) "leases" `shouldReturn` 0
           inspectInvariants (rgService rig) `shouldReturn` []
 
-  it "refuses attach_host as an ordinary error for a provider that declares no host attachment, without calling it, and leaves its named attach alone" $
+  it "refuses attach_host as an ordinary error for a provider that declares no host attachment: the instance goes on, nothing is admitted or reserved, and the provider is never asked" $
     withRig $ \rig → do
       host ← publish rig "modules-test"
       asked ← newIORef ([] ∷ [Text])
-      -- a provider as the original constructor gave it: the adapter's services without the host attachment endpoint, whose named-attach
-      -- callbacks enforce the whole name bound (a name is nonempty and at most 128 characters) and record every name they are asked for
+      -- a provider as the original constructor gave it: the adapter's services without the host attachment endpoint, whose attach callbacks
+      -- record every name they are asked for
       let noted name = atomicModifyIORef' asked (\seen → (name : seen, ()))
-          bounded' name = Text.null name || Text.length name > 128
           original = TerrainInjection
             { tiLeaseCapacity = tiLeaseCapacity (hostInjection host)
             , injectTerrain = \vm → do
@@ -425,23 +424,28 @@ spec = describe "host-published arena" $ do
                     { tsEndpoints = filter ((/= terrainHostAttachEndpoint) . endpointName) (tsEndpoints services)
                     , tsAttachCheck = \identity root name owner values → do
                         noted name
-                        if bounded' name then pure (Just "an arena name is out of bounds") else tsAttachCheck services identity root name owner values
+                        tsAttachCheck services identity root name owner values
                     , tsAttachStart = \identity root name ctx → do
                         noted name
                         tsAttachStart services identity root name ctx
                     }
             }
-      withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource namedAndHost)]) $ \world _ runtime →
+      withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource refusedHost)]) $ \world _ runtime →
         withFvm world runtime (presentationWith rig original) $ \fvm → do
           _ ← spawn world fvm "modules-test" mainPath
           stepUntil world (elem "done" <$> outLinesSTM world)
           printed ← outLines world
+          -- a catchable ordinary error naming the missing publication, after which the instance runs on (its next update printed)
           printed `shouldSatisfy` any (Text.isPrefixOf "host => false ; ")
           printed `shouldSatisfy` any (Text.isInfixOf "publishes no arena")
-          -- the named attach reached the provider's callbacks (the check and the start), the host attach never did
-          names ← readIORef asked
-          names `shouldBe` ["nothing", "nothing"]
+          printed `shouldSatisfy` elem "after"
+          -- no request was admitted and nothing was reserved: the service holds no request, and the host's lease is its only lease
+          census ← atomically (inspectCensusSTM (rgService rig))
+          length (censusRequests census) `shouldBe` 0
           limitHeld (rgService rig) "leases" `shouldReturn` 1
+          limitHeld (rgService rig) "clients" `shouldReturn` 2
+          -- the provider's callbacks were never asked, by the check or the start
+          readIORef asked `shouldReturn` []
 
   it "attaches with the service's client bank full: the instance's own client issues the attachment" $
     withRigConfig defaultConfig {configMaxClients = 2} $ \rig → do
@@ -566,17 +570,15 @@ pressed =
         ]
     }
 
--- | An instance that calls @attach_host@ (refused) and then a named attach of a name nothing holds (a request that settles not_found).
-namedAndHost ∷ Script
-namedAndHost =
+-- | An instance that calls @attach_host@ (refused), and goes on: its next update prints @after@ and then @done@.
+refusedHost ∷ Script
+refusedHost =
   script
     { scPrelude = terrainPrelude
-    , scInit = ["self.s = 0", "try('host', api.terrain.attach_host)", "self.q = api.terrain.attach('nothing')"]
+    , scInit = ["self.s = 0", "try('host', api.terrain.attach_host)"]
     , scUpdate =
-        [ "if self.s == 0 then"
-        , "  local t = settle(api, self.q)"
-        , "  if t then print('named', t.status, t.error and t.error.code) print('done') self.s = 1 end"
-        , "end"
+        [ "if self.s == 0 then print('after') self.s = 1"
+        , "elseif self.s == 1 then print('done') self.s = 2 end"
         ]
     }
 

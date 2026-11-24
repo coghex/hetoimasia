@@ -1,7 +1,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 
--- | @api.terrain.open@, @attach@, @cell@, @column@, @surface@, @remove@, @status@, @grow_storage@, @retry_storage@ and
--- @release@: the terrain calls of the M1 facade (TRA-5, TRA-23), bound over the terrain operations a composition injects
+-- | @api.terrain.open@, @attach@, @cell@, @column@, @surface@, @remove@, @status@, @grow_storage@, @retry_storage@, @region@
+-- and @release@: the terrain calls of the M1 facade (TRA-5, TRA-23), bound over the terrain operations a composition injects
 -- ('TerrainServices').
 --
 -- = What this module decides, and what it leaves to the service
@@ -77,6 +77,7 @@ terrainHandleTypes facade =
       , terrainStatusRequestType
       , terrainGrowRequestType
       , terrainRetryRequestType
+      , terrainRegionRequestType
       ]
   ]
 
@@ -106,7 +107,8 @@ definitionSchema =
         , ("value", SRecord [("air", SOptional SBoolean), ("material", SOptional SText), ("shape", SOptional SInteger)])
         ]
 
-cellSchema, columnSchema, surfaceSchema ∷ Schema
+cellSchema, columnSchema, surfaceSchema, regionSchema ∷ Schema
+regionSchema = SRecord [("x", SInteger), ("y", SInteger), ("z", SInteger)]
 cellSchema = SRecord [("x", SInteger), ("y", SInteger), ("z", SInteger)]
 columnSchema = SRecord [("x", SInteger), ("y", SInteger), ("z_min", SInteger), ("z_max", SInteger)]
 surfaceSchema = SRecord [("x", SInteger), ("y", SInteger)]
@@ -269,6 +271,22 @@ decodeColumn = \case
           else Right (TerrainColumnAsk x y lo hi)
   _ → Left "a column must be a table with x, y, z_min and z_max"
 
+-- | A region: three region indices, each one whose every cell is a supported coordinate.
+decodeRegion ∷ Value → Either Text TerrainRegion
+decodeRegion = \case
+  VRecord fields → do
+    x ← requiredField "x" fields >>= regionIndex "x" terrainRegionColumnsLow terrainRegionColumnsHigh
+    y ← requiredField "y" fields >>= regionIndex "y" terrainRegionColumnsLow terrainRegionColumnsHigh
+    z ← requiredField "z" fields >>= regionIndex "z" terrainRegionLevelsLow terrainRegionLevelsHigh
+    Right (TerrainRegion x y z)
+  _ → Left "a region must be a table with x, y and z"
+  where
+    regionIndex name low high value = do
+      found ← integer name value
+      if found < low || found > high
+        then Left (name <> " is outside the supported region indices " <> Text.pack (show low) <> " .. " <> Text.pack (show high))
+        else Right found
+
 decodeSurface ∷ Value → Either Text (Int64, Int64)
 decodeSurface = \case
   VRecord fields → do
@@ -304,6 +322,8 @@ terrainBindings facade services =
       asynchronousNativeRequestIn "terrain_grow_storage" [arena, SInteger] (m1StartSchemas terrainGrowRequestType) growAct
   , withArgumentCheck retryCheck $
       asynchronousNativeRequestIn "terrain_retry_storage" [arena] (m1StartSchemas terrainRetryRequestType) retryAct
+  , withArgumentCheck regionCheck $
+      asynchronousNativeRequestIn "terrain_region" [arena, regionSchema] (m1StartSchemas terrainRegionRequestType) regionAct
   , -- A release is allowed wherever an instance's finite hook runs, shutdown and after a quit included, so the session's
     -- admission is deliberately not read. It never waits and it is never a module's top-level service.
     withPrecondition instanceOnly $
@@ -437,6 +457,13 @@ terrainBindings facade services =
 
     retryCheck = checked "a terrain storage retry" arenaTarget $ \caller key → tsRetryCheck services (identityOf caller) key
     retryAct = starting "a terrain storage retry" terrainRetryRequestType arenaTarget $ \caller key → tsRetryStart services (identityOf caller) key
+
+    -- region --------------------------------------------------------------------------------------------
+    regionTarget = \case
+      [VCapability handle, region] → (,) (capabilityKey handle) <$> decodeRegion region
+      _ → Left "an arena and a region are required"
+    regionCheck = checked "a terrain region read" regionTarget $ \caller (key, region) → tsRegionCheck services (identityOf caller) key region
+    regionAct = starting "a terrain region read" terrainRegionRequestType regionTarget $ \caller (key, region) → tsRegionStart services (identityOf caller) key region
 
     -- release -------------------------------------------------------------------------------------------
     -- Another instance's handle and a handle of another kind are ordinary errors before any service is asked; a handle that

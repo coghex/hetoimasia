@@ -43,6 +43,8 @@ import Hetoimasia.LuaEngine.Facade.Types
   , terrainGrowValueSchema
   , terrainRetryRequestType
   , terrainRetryValueSchema
+  , terrainRegionRequestType
+  , terrainRegionValueSchema
   , terrainSurfaceRequestType
   , terrainSurfaceValueSchema
   , graphicsTextureRequestType
@@ -81,9 +83,9 @@ requestBindings facade =
     <> maybe [] (const graphicsOperations) (fcGraphics facade)
     <> maybe [] (const terrainOperations) (fcTerrain facade)
   where
-    -- The terrain results are eight kinds, each with its own handle type and value, so that @api.request@ dispatches by the kind
-    -- of the handle (TRA-5, TRA-23): an arena lease (open and attach), a cell, a column, a surface, a removal, a status, a growth
-    -- and a retry. A facade with no terrain has no such operation and no such handle.
+    -- The terrain results are nine kinds, each with its own handle type and value, so that @api.request@ dispatches by the kind
+    -- of the handle (TRA-5, TRA-23): an arena lease (open and attach), a cell, a column, a surface, a removal, a status, a growth,
+    -- a retry and a regional read. A facade with no terrain has no such operation and no such handle.
     terrainOperations =
       operations facade "terrain_arena" terrainArenaRequestType terrainArenaValueSchema
         <> operations facade "terrain_cell" terrainCellRequestType terrainCellValueSchema
@@ -93,6 +95,7 @@ requestBindings facade =
         <> operations facade "terrain_status" terrainStatusRequestType terrainStatusValueSchema
         <> operations facade "terrain_grow" terrainGrowRequestType terrainGrowValueSchema
         <> operations facade "terrain_retry" terrainRetryRequestType terrainRetryValueSchema
+        <> operations facade "terrain_region" terrainRegionRequestType terrainRegionValueSchema
     -- A texture request's value and a window request's are different things again, so the injected graphics add
     -- their own pair of kinds (LFE-21); a facade with no graphics has no such operation and no such handle.
     graphicsOperations =

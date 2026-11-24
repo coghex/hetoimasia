@@ -108,6 +108,7 @@ module Hetoimasia.LuaEngine.Facade
   , TerrainStart (..)
   , TerrainCell (..)
   , TerrainColumnAsk (..)
+  , TerrainRegion (..)
   , TerrainDefinition (..)
   , TerrainLayer (..)
   , TerrainPatch (..)
@@ -122,6 +123,7 @@ module Hetoimasia.LuaEngine.Facade
   , terrainStatusRequestType
   , terrainGrowRequestType
   , terrainRetryRequestType
+  , terrainRegionRequestType
   , terrainArenaValueSchema
   , terrainCellValueSchema
   , terrainColumnValueSchema
@@ -130,6 +132,8 @@ module Hetoimasia.LuaEngine.Facade
   , terrainStatusValueSchema
   , terrainGrowValueSchema
   , terrainRetryValueSchema
+  , terrainRegionValueSchema
+  , terrainRegionCells
   , terrainStorageMinimum
   , terrainHostAttachEndpoint
   , terrainHostAttachName

@@ -1137,15 +1137,20 @@ ownershipSpec = describe "ownership" $ do
       waiting ← newHost False
       first ← okOf (regionsWith svc (hostEndpoint svc Nothing waiting) lease [region 5 5 (-1)])
       waitFor (readTVar (hostReady waiting) >>= check . (>= 1))
+      -- a request the service holds a borrow for, until the borrow is released
+      atomically (borrowHeldSTM svc first) >>= (`shouldBe` True)
       cancel svc first >>= (`shouldBe` CancelWon)
       settledOf waiting >>= (`shouldBe` [Cancelled])
+      atomically (borrowHeldSTM svc first) >>= (`shouldBe` False)
       accountsOf svc >>= \(use, regional, _, holds) → (use, regional, holds) `shouldBe` (base, [], 0)
       -- settled, never taken: retired
       eligible ← newHost True
       second ← okOf (regionsWith svc (hostEndpoint svc Nothing eligible) lease [region 5 5 (-1)])
       _ ← settlementOf eligible >>= borrowIn
       map regionalChargeTaken <$> atomically (inspectRegionalSTM svc) >>= (`shouldBe` [False])
+      atomically (borrowHeldSTM svc second) >>= (`shouldBe` True)
       atomically (retireSTM svc second)
+      atomically (borrowHeldSTM svc second) >>= (`shouldBe` False)
       accountsOf svc >>= \(use, regional, _, holds) → (use, regional, holds) `shouldBe` (base, [], 0)
       atomically (retireSTM svc second)
       accountsOf svc >>= \(use, _, _, _) → use `shouldBe` base
@@ -1269,6 +1274,8 @@ settlementChargeSpec =
       accountsOf svc >>= \(use, _, _, _) → use `shouldBe` base + footprint + record + reservation + record
       -- the first is taken: its record returns, its footprint moves to its holder
       atomically (takeSTM svc first) >>= (`shouldBe` Taken)
+      -- a taken borrow is its holder's, not held for the request
+      atomically (borrowHeldSTM svc first) >>= (`shouldBe` False)
       _ ← keep taken borrow
       map (\c → (regionalChargeFootprint c, regionalChargeTaken c)) . take 1 <$> atomically (inspectRegionalSTM svc) >>= (`shouldBe` [(Just footprint, True)])
       grant host'

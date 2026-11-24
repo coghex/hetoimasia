@@ -472,7 +472,10 @@ spec = describe "the package and import boundary" $ do
                  , "Hetoimasia.LuaEngine.Request"
                  , "Hetoimasia.Foundation.Resource"
                  , "Hetoimasia.Terrain.Cell"
+                 , -- a regional read's removed intervals and the knowledge of its cells, through the terrain package's public modules
+                   "Hetoimasia.Terrain.Changes"
                  , "Hetoimasia.Terrain.Coordinate"
+                 , "Hetoimasia.Terrain.Discovery"
                  , "Hetoimasia.Terrain.Query"
                  , "Hetoimasia.Terrain.Residency"
                  , "Hetoimasia.Terrain.Runtime"
@@ -589,10 +592,13 @@ spec = describe "the package and import boundary" $ do
                , "Hetoimasia.LuaEngine.Scene"
                , "Hetoimasia.Terrain.Cell"
                , "Hetoimasia.Terrain.Coordinate"
+               , -- the regional examples read the native snapshot's cells and knowledge through the terrain package's public modules
+                 "Hetoimasia.Terrain.Discovery"
                , "Hetoimasia.Terrain.Query"
                , "Hetoimasia.Terrain.Residency"
                , "Hetoimasia.Terrain.Runtime"
                , "Hetoimasia.Terrain.Runtime.Settlement"
+               , "Hetoimasia.Terrain.Shape"
                -- the terrain runtime's public storage inputs: the rig names its volume and sizes its
                -- allowance (#665's explicit storage inputs)
                , "Hetoimasia.Terrain.Runtime.Storage"
