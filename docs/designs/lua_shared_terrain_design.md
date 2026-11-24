@@ -7,7 +7,7 @@ Status legend: `[ ]` unprocessed · `[x]` linked to an issue.
 ## Processing status
 
 - [x] EPIC. Share live terrain and coherent regional reads with Lua — [#743]
-- [ ] LUA-TERR-1. Attach a Lua instance to a host-published arena
+- [x] LUA-TERR-1. Attach a Lua instance to a host-published arena — [#744]
 - [ ] LUA-TERR-2. Copy one regional terrain and discovery snapshot to Lua
 
 ## Epic contract and evidence
