@@ -176,7 +176,9 @@ specPureAt depth = describe "TRA-20 evidence" $ do
         go acc (y : ys) = f acc y >>= \acc' → go acc' ys
     fmap' p = case p of Planned _ → "Planned"; NoWork → "NoWork"; Pending _ → "Pending"; PendingProbes _ → "Pending"; Checkpoint _ → "Checkpoint"; Refused r → "Refused " <> show r; BlockedByReader _ _ → "Blocked"
 
--- | The observation of allocated bytes: process-wide, so valid only beside nothing else (a sequential example).
+-- | The observation of allocated bytes: each figure is the measuring thread's own allocation, the difference of two readings
+-- of its allocation counter around the forced computation ('Test.TerrainRuntime.Store.Bounds.allocationRatios'), so no other
+-- thread or collection is in it. It stays a sequential example beside the process measurements of its module.
 measuredSpec = describe "TRA-20 evidence" $
   it "allocation: work independent of the history" $ do
     (h, keys) ← readFixture wide20000
