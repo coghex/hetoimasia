@@ -86,7 +86,7 @@ manifest inputs pngs =
     , ("sharedBytes", JArray [JObject [("sha256", JString digest), ("maps", JArray (map JString ids))] | (digest, ids) ← shared])
     , ("lookup", JArray (map lookupEntry allLookups))
     , ("colourArt", JArray [colourEntry art bytes | (art, bytes, _) ← inputColour inputs])
-    , ("provenance", JString "samples/ecce-homo/content/textures/provenance.json")
+    , ("provenance", JString "content/textures/provenance.json")
     ]
   where
     fileBytes = Map.fromList pngs
@@ -120,7 +120,7 @@ manifest inputs pngs =
     colourEntry art bytes =
       JObject
         [ ("name", JString (artName art))
-        , ("path", JString ("samples/ecce-homo/content/textures/" <> artFile art))
+        , ("path", JString ("content/textures/" <> artFile art))
         , ("width", JNumber (toInteger canvasWidth))
         , ("height", JNumber (toInteger canvasHeight))
         , ("sha256", JString (sha256Hex bytes))

@@ -6,7 +6,9 @@ module Test.TerrainRender2D.Art
   , Json (..)
   , parseJson
   , field
+  , fixtureDirectory
   , texturesDirectory
+  , loadFixture
   , findUpwards
   ) where
 
@@ -18,9 +20,14 @@ import Numeric (showHex)
 import System.Directory (doesPathExist, getCurrentDirectory)
 import System.FilePath (takeDirectory, (</>))
 
--- | The directory the approved artwork is committed in, relative to the repository root.
+-- | The package-owned engine test fixtures, relative to the repository root: the colour art, the
+-- committed face-map catalog and atlases, and the reference masks. Test inputs, not production art.
+fixtureDirectory ∷ FilePath
+fixtureDirectory = "packages/terrain-render-2d/test-data"
+
+-- | The directory of the committed textures, relative to the repository root.
 texturesDirectory ∷ FilePath
-texturesDirectory = "samples/ecce-homo/content/textures"
+texturesDirectory = fixtureDirectory </> "content" </> "textures"
 
 -- | A path found under the working directory or one of its parents: the suite runs
 -- from a package directory (@cabal test@) or from the repository root.
@@ -38,6 +45,10 @@ findUpwards relative = getCurrentDirectory >>= go
 -- | The bytes of a file of the repository, by path from its root.
 loadFile ∷ FilePath → IO ByteString.ByteString
 loadFile relative = findUpwards relative >>= ByteString.readFile
+
+-- | The bytes of a file named relative to the fixture directory, as the manifests record paths.
+loadFixture ∷ FilePath → IO ByteString.ByteString
+loadFixture relative = loadFile (fixtureDirectory </> relative)
 
 sha256Hex ∷ ByteString.ByteString → String
 sha256Hex = concatMap two . ByteString.unpack . hash

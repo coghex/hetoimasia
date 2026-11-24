@@ -1,6 +1,6 @@
 -- | The committed packed atlases as the evidence and the CPU suites load them (TRA-17).
 --
--- One call finds the sample directory above the working directory, parses the region manifest,
+-- One call finds the package-owned fixture directory (@packages/terrain-render-2d/test-data@) above the working directory, parses the region manifest,
 -- decodes each parent image once through the bounded PNG decoder (the colour parent as colour, the
 -- normal parent as data), and builds, from that one decode, everything the callers need:
 -- the shared coverage plane of each parent (through the generic data-map functions, with the
@@ -21,7 +21,7 @@ module Hetoimasia.Terrain.Render2D.AtlasFixtures
   , loadSingleImages
   , bindSingleImages
   , boundPackedTextures
-  , findSampleDirectory
+  , findFixtureDirectory
   , materialIdOf
   ) where
 
@@ -68,18 +68,19 @@ data AtlasStyle = AtlasStyle
   -- ^ The source canvases, decoded independently of the atlases.
   }
 
--- | The nearest @samples/ecce-homo@ at or above the working directory.
-findSampleDirectory ∷ IO FilePath
-findSampleDirectory = getCurrentDirectory >>= go
+-- | The nearest @packages/terrain-render-2d/test-data@ at or above the working directory: the
+-- package-owned engine test fixtures. The manifest's source paths are relative to it.
+findFixtureDirectory ∷ IO FilePath
+findFixtureDirectory = getCurrentDirectory >>= go
   where
     go directory = do
-      let candidate = directory </> "samples" </> "ecce-homo"
+      let candidate = directory </> "packages" </> "terrain-render-2d" </> "test-data"
       found ← doesDirectoryExist candidate
       if found
         then pure candidate
         else
           let parent = takeDirectory directory
-           in if parent == directory then ioError (userError "no samples/ecce-homo above the working directory") else go parent
+           in if parent == directory then ioError (userError "no packages/terrain-render-2d/test-data above the working directory") else go parent
 
 -- | The material identity of an authored name.
 materialIdOf ∷ String → IO MaterialId
@@ -89,9 +90,8 @@ materialIdOf name = either (\e → ioError (userError (show e))) pure (mkMateria
 -- listed colour regions (an authored name and a colour identity such as @colour.loam@).
 loadAtlasStyle ∷ Word64 → [(String, String)] → IO AtlasStyle
 loadAtlasStyle version materials = do
-  sample ← findSampleDirectory
-  let atlasDirectory = sample </> "content" </> "textures" </> "terrain-atlas"
-      repositoryRoot = takeDirectory (takeDirectory sample)
+  fixtures ← findFixtureDirectory
+  let atlasDirectory = fixtures </> "content" </> "textures" </> "terrain-atlas"
       failWith what why = ioError (userError (what <> ": " <> why))
   manifestBytes ← ByteString.readFile (atlasDirectory </> "manifest.json")
   manifest ← either (failWith "the atlas manifest" . unlines) pure (parseManifest manifestBytes)
@@ -116,10 +116,10 @@ loadAtlasStyle version materials = do
   (_, normalAsColour) ← parent "normal.png" DecodeColour Nothing
   ids ← forM materials $ \(name, regionName) → (\identity → (identity, regionName)) <$> materialIdOf name
   assets ← either (failWith "the atlas assets" . show) pure (atlasAssetSnapshot version manifest colour normal ids)
-  -- The source canvases, from the paths the manifest records, decoded on their own.
+  -- The source canvases, from the fixture-relative paths the manifest records, decoded on their own.
   let sources = [(regionId r, regionSourcePath r) | a ← manifestAtlases manifest, r ← atlasRegions a]
   canvases ← forM sources $ \(identity, path) → do
-    bytes ← ByteString.readFile (repositoryRoot </> path)
+    bytes ← ByteString.readFile (fixtures </> path)
     (_, _, texels) ← either (failWith path) pure (decodeRgba bytes)
     pure (identity, texels)
   let table = Map.fromList canvases
@@ -165,15 +165,14 @@ data SingleImages = SingleImages
 -- | Load the single-image style at one snapshot version.
 loadSingleImages ∷ Word64 → [(String, String)] → IO SingleImages
 loadSingleImages version materials = do
-  sample ← findSampleDirectory
-  let atlasDirectory = sample </> "content" </> "textures" </> "terrain-atlas"
-      repositoryRoot = takeDirectory (takeDirectory sample)
+  fixtures ← findFixtureDirectory
+  let atlasDirectory = fixtures </> "content" </> "textures" </> "terrain-atlas"
       failWith what why = ioError (userError (what <> ": " <> why))
       account = PayloadAccount (\_ n → pure (n <= m1WorkspaceBytes)) (\_ _ → pure ())
   manifest ← ByteString.readFile (atlasDirectory </> "manifest.json") >>= either (failWith "the atlas manifest" . unlines) pure . parseManifest
   let sources = [(regionId r, regionSourcePath r) | a ← manifestAtlases manifest, r ← atlasRegions a]
   loaded ← forM (zip [0 ∷ Int ..] sources) $ \(index, (identity, path)) → do
-    bytes ← ByteString.readFile (repositoryRoot </> path)
+    bytes ← ByteString.readFile (fixtures </> path)
     let isColour = take 7 identity == "colour."
     preflighted ← either (failWith identity . show) pure (preflightPng m1PngLimits (Asset (AssetId (Text.pack identity)) (FromFile path)) bytes)
     image ← decodeBoundedWith (if isColour then DecodeColour else DecodeData) account preflighted >>= either (failWith identity . show) pure

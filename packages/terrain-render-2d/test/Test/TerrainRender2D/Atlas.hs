@@ -1,7 +1,7 @@
 -- | TRA-17: the terrain atlases, their region manifest and the generator's atlas modes, proved
 -- independently of the packer that makes them.
 --
--- The committed atlas PNGs under @samples/ecce-homo/content/textures/terrain-atlas/@ are decoded
+-- The committed atlas PNGs under @packages/terrain-render-2d/test-data/content/textures/terrain-atlas/@ are decoded
 -- with JuicyPixels (not the packer's own lookup), and each manifest rectangle is cropped and
 -- compared byte for byte with the independently decoded source image it was extracted from, for
 -- the three colour sources and all 46 catalog maps. A matching regenerated hash alone is never
@@ -25,7 +25,7 @@ import System.Directory (copyFile, createDirectoryIfMissing, doesFileExist, remo
 import System.FilePath (takeDirectory, (</>))
 import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec
-import Test.TerrainRender2D.Art (findUpwards, loadFile, sha256Hex, texturesDirectory)
+import Test.TerrainRender2D.Art (findUpwards, fixtureDirectory, loadFile, loadFixture, sha256Hex, texturesDirectory)
 
 spec ∷ Spec
 spec = describe "Atlas" $ do
@@ -151,7 +151,7 @@ committedSpec = describe "the committed atlases" $ do
       (width, height, texels) ← decodeAt (atlasDirectory </> atlasFile atlas)
       (width, height) `shouldBe` (fromIntegral (atlasWidth atlas), fromIntegral (atlasHeight atlas))
       forM_ (atlasRegions atlas) $ \region → do
-        source ← loadFile (regionSourcePath region)
+        source ← loadFixture (regionSourcePath region)
         sha256Hex source `shouldBe` regionSourceSha256 region
         (sw, sh, sourceTexels) ← either (\why → expectationFailure why >> pure (0, 0, ByteString.empty)) pure (decodeRgba source)
         (sw, sh) `shouldBe` (96, 64)
@@ -180,7 +180,7 @@ committedSpec = describe "the committed atlases" $ do
     let moved = [a {atlasRegions = [if regionId r == "shape.01" then r {regionX = regionX r + 1} else r | r ← atlasRegions a]} | a ← manifestAtlases manifest]
     layoutIdentity moved `shouldNotBe` layoutIdentity (manifestAtlases manifest)
   it "regenerates the same files the repository commits" $ do
-    sample ← findUpwards "samples/ecce-homo"
+    sample ← findUpwards fixtureDirectory
     loaded ← loadInputs sample
     case loaded of
       Left problems → expectationFailure (unlines problems)
@@ -277,11 +277,11 @@ manifestSpec = describe "the manifest's checks" $ do
 -- ---------------------------------------------------------------------------
 -- The generator's atlas modes
 
--- | A minimal sample directory holding only what the generator reads, copied from the
+-- | A minimal fixture directory holding only what the generator reads, copied from the
 -- repository's own: the colour art and the sixteen reference masks.
 withSample ∷ (FilePath → IO a) → IO a
 withSample action = withSystemTempDirectory "tra17-sample" $ \directory → do
-  sample ← findUpwards "samples/ecce-homo"
+  sample ← findUpwards fixtureDirectory
   forM_ [(textureDirectory </> artFile art) | art ← pinnedColourArt] $ \relative → copyInto sample directory relative
   forM_ [(referenceDirectory </> referenceFile mask) | mask ← referenceMasks] $ \relative → copyInto sample directory relative
   action directory
@@ -293,30 +293,31 @@ withSample action = withSystemTempDirectory "tra17-sample" $ \directory → do
 commandSpec ∷ Spec
 commandSpec = describe "terrain-mapgen --atlas-output and --check-atlases" $ do
   it "checks the committed atlases against a regeneration" $ do
-    outcome ← runCli ["--check-atlases"]
+    fixtures ← findUpwards fixtureDirectory
+    outcome ← runCli ["--check-atlases", "--fixtures", fixtures]
     (outcomeExit outcome, outcomeErr outcome) `shouldBe` (0, [])
   it "writes a directory that checks clean, and writes only the three derivative files" $
     withSample $ \sample → withSystemTempDirectory "tra17-out" $ \out → do
-      written ← runCli ["--atlas-output", out, "--sample", sample]
+      written ← runCli ["--atlas-output", out, "--fixtures", sample]
       outcomeExit written `shouldBe` 0
       forM_ [atlasManifestName, colourAtlasFile, normalAtlasFile] $ \name → doesFileExist (out </> name) >>= (`shouldBe` True)
-      checked ← runCli ["--check-atlases", "--atlas-dir", out, "--sample", sample]
+      checked ← runCli ["--check-atlases", "--atlas-dir", out, "--fixtures", sample]
       (outcomeExit checked, outcomeErr checked) `shouldBe` (0, [])
   it "writes the same bytes twice" $
     withSample $ \sample → withSystemTempDirectory "tra17-a" $ \first → withSystemTempDirectory "tra17-b" $ \second → do
-      _ ← runCli ["--atlas-output", first, "--sample", sample]
-      _ ← runCli ["--atlas-output", second, "--sample", sample]
+      _ ← runCli ["--atlas-output", first, "--fixtures", sample]
+      _ ← runCli ["--atlas-output", second, "--fixtures", sample]
       forM_ [atlasManifestName, colourAtlasFile, normalAtlasFile] $ \name → do
         a ← ByteString.readFile (first </> name)
         b ← ByteString.readFile (second </> name)
         (name, a == b) `shouldBe` (name, True)
   it "fails, naming each affected file, on a changed, missing or unexpected file, and never writes there" $
     withSample $ \sample → withSystemTempDirectory "tra17-bad" $ \out → do
-      _ ← runCli ["--atlas-output", out, "--sample", sample]
+      _ ← runCli ["--atlas-output", out, "--fixtures", sample]
       ByteString.appendFile (out </> colourAtlasFile) (ByteString.pack [0])
       removeFile (out </> atlasManifestName)
       ByteString.writeFile (out </> "extra.txt") (Char8.pack "x")
-      outcome ← runCli ["--check-atlases", "--atlas-dir", out, "--sample", sample]
+      outcome ← runCli ["--check-atlases", "--atlas-dir", out, "--fixtures", sample]
       outcomeExit outcome `shouldBe` 1
       let text = unlines (outcomeErr outcome)
       forM_ ["changed: colour.png", "missing: manifest.json", "unexpected: extra.txt"] $ \needle →
@@ -326,15 +327,16 @@ commandSpec = describe "terrain-mapgen --atlas-output and --check-atlases" $ do
       ByteString.length <$> ByteString.readFile (out </> "extra.txt") >>= (`shouldBe` 1)
   it "resolves the default atlas directory under the selected sample" $
     withSample $ \sample → do
-      absent ← runCli ["--check-atlases", "--sample", sample]
+      absent ← runCli ["--check-atlases", "--fixtures", sample]
       outcomeExit absent `shouldBe` 1
       let target = sample </> textureDirectory </> "terrain-atlas"
-      written ← runCli ["--atlas-output", target, "--sample", sample]
+      written ← runCli ["--atlas-output", target, "--fixtures", sample]
       outcomeExit written `shouldBe` 0
-      present ← runCli ["--check-atlases", "--sample", sample]
+      present ← runCli ["--check-atlases", "--fixtures", sample]
       outcomeExit present `shouldBe` 0
   it "keeps --check on the facemap catalog, which the atlas directory does not disturb" $ do
-    outcome ← runCli ["--check"]
+    fixtures ← findUpwards fixtureDirectory
+    outcome ← runCli ["--check", "--fixtures", fixtures]
     (outcomeExit outcome, outcomeErr outcome) `shouldBe` (0, [])
   it "accepts exactly one mode, with the usage status 2" $ do
     forM_
@@ -347,6 +349,6 @@ commandSpec = describe "terrain-mapgen --atlas-output and --check-atlases" $ do
       $ \arguments → outcomeExit <$> runCli arguments >>= (`shouldBe` 2)
   it "reports the generated inventory with the written file count" $
     withSample $ \sample → withSystemTempDirectory "tra17-inv" $ \out → do
-      outcome ← runCli ["--atlas-output", out, "--sample", sample]
+      outcome ← runCli ["--atlas-output", out, "--fixtures", sample]
       length (outcomeOut outcome) `shouldBe` 4
       outcomeOut outcome `shouldSatisfy` (any ("wrote 3 files" `isInfixOf`))

@@ -132,9 +132,10 @@ library terrain-mapgen-core
         hetoimasia-terrain-render-2d:terrain-atlas ==0.1.0.0,
         hetoimasia-terrain-render-2d:terrain-mapbake ==0.1.0.0
 
--- The offline generator of the cutout and normal-map catalog (TRA-14). It runs
--- from the repository root as `cabal run exe:terrain-mapgen -- --check`, and
--- it is not part of any engine or game library.
+-- The offline generator of the cutout and normal-map catalog (TRA-14). Every
+-- mode takes its input directory explicitly, for instance `cabal run
+-- exe:terrain-mapgen -- --check --fixtures packages/terrain-render-2d/test-data`
+-- from the repository root, and it is not part of any engine or game library.
 executable terrain-mapgen
     import: language
     main-is: Main.hs

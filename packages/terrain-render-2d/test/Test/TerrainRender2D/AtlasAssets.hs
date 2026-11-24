@@ -23,7 +23,7 @@ import Hetoimasia.Terrain.Render2D.CellPick (CellHit (..), CellPickResult (..))
 import Hetoimasia.Terrain.Render2D.Cells
 import Hetoimasia.Terrain.Shape (ViewFacing (..))
 import Test.Hspec
-import Test.TerrainRender2D.Art (loadFile)
+import Test.TerrainRender2D.Art (loadFixture)
 import Test.TerrainRender2D.CellFixtures
 
 spec ∷ Spec
@@ -34,10 +34,10 @@ spec = describe "AtlasAssets" $ do
   refusalSpec
 
 -- | The covered texels of a source image: alpha 255. The source is decoded with JuicyPixels from
--- the repository path the manifest records, never read back through the atlas.
+-- the fixture-relative path the manifest records, never read back through the atlas.
 sourceCoverage ∷ FilePath → IO (Int → Int → Bool)
 sourceCoverage path = do
-  bytes ← loadFile path
+  bytes ← loadFixture path
   case decodeRgba bytes of
     Right (96, 64, texels) → pure (\x y → ByteString.index texels (4 * (y * 96 + x) + 3) == 255)
     _ → fail (path <> " is not a 96 x 64 RGBA8 PNG")

@@ -1,7 +1,7 @@
 -- | TRA-14: the canonical cutout and unit-normal map assets, proved
 -- independently of the code that bakes them.
 --
--- The committed PNGs under @samples/ecce-homo/content/textures/facemap/@ are
+-- The committed PNGs under @packages/terrain-render-2d/test-data/content/textures/facemap/@ are
 -- decoded and compared texel by texel with "Test.TerrainRender2D.MapAssets.Reference",
 -- which works from the P-9 height table by its own method and states every
 -- expected byte by hand. The baker's pure evaluation is compared with it at
@@ -65,7 +65,7 @@ import System.Directory (copyFile, createDirectoryIfMissing, doesFileExist, list
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec
-import Test.TerrainRender2D.Art (Json (..), field, findUpwards, loadFile, parseJson, sha256Hex, texturesDirectory)
+import Test.TerrainRender2D.Art (Json (..), field, findUpwards, fixtureDirectory, loadFile, loadFixture, parseJson, sha256Hex, texturesDirectory)
 import Test.TerrainRender2D.MapAssets.Reference
 
 -- ---------------------------------------------------------------------------
@@ -614,13 +614,17 @@ samplingSpec = describe "downstream sampling, colour coverage and the cover colo
       Right (96, 64, back) → back `shouldBe` sample
       other → expectationFailure ("the PNG round trip failed: " <> show (fmap (\(w, h, _) → (w, h)) other))
     opaqueNormalValid (0, 255, 0) `shouldBe` False
-    legacyE ← loadPlain ("samples/ecce-homo/reference/synarchy-3777d437/facemap/isoface_slope_e.png")
+    legacyE ← loadPlain (referenceMaskPath "isoface_slope_e.png")
     texel legacyE 48 2 `shouldBe` (0, 255, 0, 255)
     canvasProblems legacyE `shouldSatisfy` (not . null)
     forM_ allShapeIds $ \shape → do
       let name = legacyFile (shapeIdValue shape)
-      legacy ← loadPlain ("samples/ecce-homo/reference/synarchy-3777d437/facemap/" <> name)
+      legacy ← loadPlain (referenceMaskPath name)
       canvasProblems legacy `shouldSatisfy` (not . null)
+
+-- | A retained reference mask, by file name, relative to the repository root.
+referenceMaskPath ∷ FilePath → FilePath
+referenceMaskPath name = fixtureDirectory </> "reference" </> "synarchy-3777d437" </> "facemap" </> name
 
 legacyFile ∷ Int → FilePath
 legacyFile 0 = "isoface.png"
@@ -632,8 +636,8 @@ legacyFile n = "isoface_slope_" <> (["n", "e", "ne", "s", "ns", "es", "nes", "w"
 defectSpec ∷ Spec
 defectSpec = describe "the reproduced reference defect (issue #655's N/E counterexample)" $ do
   it "has the pinned E and N masks, E texel (48,2) opaque face-weight green and N's first opaque rows 39,39,38,38,37,37,36,36" $ do
-    eBytes ← loadFile "samples/ecce-homo/reference/synarchy-3777d437/facemap/isoface_slope_e.png"
-    nBytes ← loadFile "samples/ecce-homo/reference/synarchy-3777d437/facemap/isoface_slope_n.png"
+    eBytes ← loadFile (referenceMaskPath "isoface_slope_e.png")
+    nBytes ← loadFile (referenceMaskPath "isoface_slope_n.png")
     sha256Hex eBytes `shouldBe` "b63967d34e447e487a504ddf97b723d4c4f7cd642b1a319f44fe88eb55ab2c1d"
     sha256Hex nBytes `shouldBe` "1e0d2e7e559a004821d3b02150ed650ebfa6360fd77648164010efb9fb3c6310"
     e ← decodeTexels "e" eBytes
@@ -642,7 +646,7 @@ defectSpec = describe "the reproduced reference defect (issue #655's N/E counter
     [head' [j | j ← [0 .. 63], let (_, _, _, a) = texel n c j, a == 255] | c ← [0 .. 7]] `shouldBe` [39, 39, 38, 38, 37, 37, 36, 36]
 
   it "has the unit-cell surface E shows at texel (48,2), turned three quarter turns, fall in N's projection [0,6] x [23.5,27] where N is transparent" $ do
-    nBytes ← loadFile "samples/ecce-homo/reference/synarchy-3777d437/facemap/isoface_slope_n.png"
+    nBytes ← loadFile (referenceMaskPath "isoface_slope_n.png")
     n ← decodeTexels "n" nBytes
     let eShape = shapeFromSides [East]
         samples = [(48 + fromIntegral a / 4, 2 + fromIntegral b / 4) | a ← [0 .. 4 ∷ Int], b ← [0 .. 4 ∷ Int]] ∷ [(Rational, Rational)]
@@ -676,7 +680,7 @@ copyCatalog destination = do
   forM_ names $ \name → copyFile (source </> name) (destination </> name)
 
 sampleDirectory ∷ IO FilePath
-sampleDirectory = findUpwards "samples/ecce-homo"
+sampleDirectory = findUpwards fixtureDirectory
 
 readAll ∷ FilePath → IO [(FilePath, ByteString.ByteString)]
 readAll directory = do
@@ -685,10 +689,11 @@ readAll directory = do
 
 generatorSpec ∷ Spec
 generatorSpec = describe "the generator" $ do
-  it "passes its read-only check against the committed catalog without being told where the repository is, and rewrites nothing" $ do
+  it "passes its read-only check against the committed catalog from the fixture directory it is told, and rewrites nothing" $ do
     committed ← findUpwards catalogDirectory
     filesBefore ← readAll committed
-    outcome ← runCli ["--check"]
+    fixtures ← sampleDirectory
+    outcome ← runCli ["--check", "--fixtures", fixtures]
     outcomeExit outcome `shouldBe` 0
     filesAfter ← readAll committed
     filesAfter `shouldBe` filesBefore
@@ -696,8 +701,8 @@ generatorSpec = describe "the generator" $ do
   it "regenerates, in two independent temporary runs, identical files that equal the committed catalog byte for byte" $
     withSystemTempDirectory "tra14-a" $ \first → withSystemTempDirectory "tra14-b" $ \second → do
       sample ← sampleDirectory
-      one ← runCli ["--output", first, "--sample", sample]
-      two' ← runCli ["--output", second, "--sample", sample]
+      one ← runCli ["--output", first, "--fixtures", sample]
+      two' ← runCli ["--output", second, "--fixtures", sample]
       outcomeExit one `shouldBe` 0
       outcomeExit two' `shouldBe` 0
       a ← readAll first
@@ -728,6 +733,23 @@ generatorSpec = describe "the generator" $ do
         map fst files `shouldSatisfy` ("evidence-index.json" `elem`)
         evidenceFiles inputs `shouldBe` files
 
+  it "refuses every mode that is not told its input directory, with the usage status and a line naming --fixtures, and reads and writes nothing" $
+    withSystemTempDirectory "tra33-refusal" $ \scratch → do
+      forM_
+        [ ["--check"]
+        , ["--check", "--catalog", scratch]
+        , ["--output", scratch </> "out"]
+        , ["--evidence", scratch </> "evidence"]
+        , ["--atlas-output", scratch </> "atlas"]
+        , ["--check-atlases"]
+        , ["--check-atlases", "--atlas-dir", scratch]
+        ]
+        $ \arguments → do
+          outcome ← runCli arguments
+          (arguments, outcomeExit outcome, outcomeOut outcome) `shouldBe` (arguments, 2, [])
+          (arguments, any ("--fixtures" `isInfixOf'`) (outcomeErr outcome)) `shouldBe` (arguments, True)
+      listDirectory scratch >>= (`shouldBe` [])
+
   it "refuses usage it cannot satisfy: no mode, two modes and an unknown argument" $ do
     outcomeExit <$> runCli [] >>= (`shouldBe` 2)
     outcomeExit <$> runCli ["--check", "--output", "x"] >>= (`shouldBe` 2)
@@ -748,7 +770,7 @@ generatorSpec = describe "the generator" $ do
       manifest ← ByteString.readFile (directory </> "manifest.json")
       ByteString.writeFile (directory </> "manifest.json") (replaceBytes "\"id\": \"shape.03\"" "\"id\": \"shape.33\"" manifest)
       filesBefore ← readAll directory
-      outcome ← runCli ["--check", "--catalog", directory, "--sample", sample]
+      outcome ← runCli ["--check", "--catalog", directory, "--fixtures", sample]
       outcomeExit outcome `shouldBe` 1
       let report = unlines (outcomeErr outcome)
       report `shouldContain` "changed: shape_05_ns.png"
@@ -779,20 +801,20 @@ generatorSpec = describe "the generator" $ do
       canvasProblems (setTexel 0 0 [9, 9, 9, 0]) `shouldBe` []
       -- The same fixture as a committed file is a changed file.
       ByteString.writeFile (directory </> "shape_08_w.png") (encodeRgba 96 64 zeroChannel)
-      outcome ← runCli ["--check", "--catalog", directory, "--sample", sample]
+      outcome ← runCli ["--check", "--catalog", directory, "--fixtures", sample]
       outcomeExit outcome `shouldBe` 1
       unlines (outcomeErr outcome) `shouldContain` "changed: shape_08_w.png"
 
   it "refuses an input that is missing or has another hash, naming it, and writes nothing" $
     withSystemTempDirectory "tra14-inputs" $ \directory → do
-      outcome ← runCli ["--check", "--sample", directory]
+      outcome ← runCli ["--check", "--fixtures", directory]
       outcomeExit outcome `shouldBe` 1
       unlines (outcomeErr outcome) `shouldContain` "missing input"
       sample ← sampleDirectory
       copyTree sample directory
       removeFile (directory </> "content" </> "textures" </> "blanktexture.png")
       ByteString.writeFile (directory </> "content" </> "textures" </> "loam.png") (ByteString.pack [0])
-      second ← runCli ["--check", "--sample", directory]
+      second ← runCli ["--check", "--fixtures", directory]
       outcomeExit second `shouldBe` 1
       unlines (outcomeErr second) `shouldContain` "blanktexture.png"
       unlines (outcomeErr second) `shouldContain` "loam.png has SHA-256"
@@ -894,9 +916,9 @@ provenanceSpec = describe "the manifest and provenance record" $ do
     length masks `shouldBe` 16
     forM_ masks $ \mask → case (field "destination" mask, field "sha256" mask, field "sourcePath" mask) of
       (Just (JString destination), Just (JString digest), Just (JString source)) → do
-        bytes ← loadFile destination
+        bytes ← loadFixture destination
         sha256Hex bytes `shouldBe` digest
-        ("samples/ecce-homo/reference/" `isInfixOf'` destination) `shouldBe` True
+        (take (length "reference/") destination == "reference/") `shouldBe` True
         ("facemap/" `isInfixOf'` source) `shouldBe` True
         -- Reference only: the generated manifest never names it.
         (reverse (takeWhile (/= '/') (reverse destination)) `isInfixOf'` map (toEnum . fromIntegral) (ByteString.unpack manifestBytes)) `shouldBe` False
