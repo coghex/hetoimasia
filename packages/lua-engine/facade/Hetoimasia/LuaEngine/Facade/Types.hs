@@ -569,9 +569,8 @@ terrainRetryValueSchema =
 -- | The smallest arena allowance a script may name (64 MiB), and the unit every allowance is a whole number of (1 MiB).
 -- | The endpoint a provider declares ('tsEndpoints') to take part in host attachment, and the name @api.terrain.attach_host()@ then asks its
 -- attach operations ('tsAttachCheck', 'tsAttachStart') for: the empty name, which no script can pass (an arena name is never empty), so it
--- cannot be confused with a named arena. A provider that declares no such endpoint is never asked for it: @attach_host()@ asks it, as
--- the original attach does, for a valid name no script can hold (longer than a script may name, 'terrainNameLimit'), which a provider that
--- knows nothing of publication answers as a name nothing holds, @not_found@.
+-- cannot be confused with a named arena. A provider that declares no such endpoint has no host publication, and is never asked anything for
+-- it: @attach_host()@ is an ordinary refusal at the call's check, before admission, naming that.
 terrainHostAttachEndpoint ∷ Text
 terrainHostAttachEndpoint = "terrain_attach_host"
 

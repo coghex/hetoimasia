@@ -408,13 +408,15 @@ spec = describe "host-published arena" $ do
           limitHeld (rgService rig) "leases" `shouldReturn` 0
           inspectInvariants (rgService rig) `shouldReturn` []
 
-  it "leaves a provider that declares no host attachment its original attach: it is asked for a name no script can hold, and settles not_found" $
+  it "refuses attach_host as an ordinary error for a provider that declares no host attachment, without calling it, and leaves its named attach alone" $
     withRig $ \rig → do
       host ← publish rig "modules-test"
       asked ← newIORef ([] ∷ [Text])
       -- a provider as the original constructor gave it: the adapter's services without the host attachment endpoint, whose named-attach
-      -- check refuses an empty name, and which records the names it is asked for
-      let original = TerrainInjection
+      -- callbacks enforce the whole name bound (a name is nonempty and at most 128 characters) and record every name they are asked for
+      let noted name = atomicModifyIORef' asked (\seen → (name : seen, ()))
+          bounded' name = Text.null name || Text.length name > 128
+          original = TerrainInjection
             { tiLeaseCapacity = tiLeaseCapacity (hostInjection host)
             , injectTerrain = \vm → do
                 services ← injectTerrain (hostInjection host) vm
@@ -422,21 +424,23 @@ spec = describe "host-published arena" $ do
                   services
                     { tsEndpoints = filter ((/= terrainHostAttachEndpoint) . endpointName) (tsEndpoints services)
                     , tsAttachCheck = \identity root name owner values → do
-                        atomicModifyIORef' asked (\seen → (name : seen, ()))
-                        if Text.null name then pure (Just "an arena name is empty") else tsAttachCheck services identity root name owner values
+                        noted name
+                        if bounded' name then pure (Just "an arena name is out of bounds") else tsAttachCheck services identity root name owner values
                     , tsAttachStart = \identity root name ctx → do
-                        atomicModifyIORef' asked (\seen → (name : seen, ()))
+                        noted name
                         tsAttachStart services identity root name ctx
                     }
             }
-      withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource (hostSteps (readsLabelled "0")))]) $ \world _ runtime →
+      withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource namedAndHost)]) $ \world _ runtime →
         withFvm world runtime (presentationWith rig original) $ \fvm → do
           _ ← spawn world fvm "modules-test" mainPath
           stepUntil world (elem "done" <$> outLinesSTM world)
-          outLines world >>= (`shouldBe` ["attach\tfailure\tnot_found", "done"])
+          printed ← outLines world
+          printed `shouldSatisfy` any (Text.isPrefixOf "host => false ; ")
+          printed `shouldSatisfy` any (Text.isInfixOf "publishes no arena")
+          -- the named attach reached the provider's callbacks (the check and the start), the host attach never did
           names ← readIORef asked
-          length names `shouldBe` 2
-          names `shouldSatisfy` all (\name → not (Text.null name) && Text.length name > 128)
+          names `shouldBe` ["nothing", "nothing"]
           limitHeld (rgService rig) "leases" `shouldReturn` 1
 
   it "attaches with the service's client bank full: the instance's own client issues the attachment" $
@@ -558,6 +562,20 @@ pressed =
         , "elseif self.s == 1 then"
         , "  local t = settle(api, self.q)"
         , "  if t then print('third', t.status) print('done') self.s = 2 end"
+        , "end"
+        ]
+    }
+
+-- | An instance that calls @attach_host@ (refused) and then a named attach of a name nothing holds (a request that settles not_found).
+namedAndHost ∷ Script
+namedAndHost =
+  script
+    { scPrelude = terrainPrelude
+    , scInit = ["self.s = 0", "try('host', api.terrain.attach_host)", "self.q = api.terrain.attach('nothing')"]
+    , scUpdate =
+        [ "if self.s == 0 then"
+        , "  local t = settle(api, self.q)"
+        , "  if t then print('named', t.status, t.error and t.error.code) print('done') self.s = 1 end"
         , "end"
         ]
     }

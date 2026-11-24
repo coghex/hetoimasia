@@ -379,13 +379,16 @@ terrainBindings facade services =
     attachHostTarget = \case
       [] → Right ()
       _ → Left "attach_host takes no arguments"
-    -- A provider opts in by declaring the host attach endpoint; any other is asked, as the original attach asks it, for a valid name that
-    -- no script can hold (past the length a script may name), which it answers as a name nothing holds: not_found.
-    hostName
-      | any ((== terrainHostAttachEndpoint) . endpointName) (tsEndpoints services) = terrainHostAttachName
-      | otherwise = Text.replicate (terrainNameLimit + 1) "~"
-    attachHostCheck = checked "a terrain host attach" attachHostTarget $ \caller () owner _ → tsAttachCheck services (identityOf caller) (rootOf caller) hostName owner [VText hostName]
-    attachHostAct = starting "a terrain host attach" terrainArenaRequestType attachHostTarget $ \caller () → tsAttachStart services (identityOf caller) (rootOf caller) hostName
+    -- A provider opts in by declaring the host attach endpoint. Any other has no host publication: the call is refused at its check, with
+    -- no call into the provider, and its action (which a refused check never reaches) refuses the same way.
+    hostOptedIn = any ((== terrainHostAttachEndpoint) . endpointName) (tsEndpoints services)
+    noPublication = "this terrain provider publishes no arena to attach to"
+    attachHostCheck
+      | hostOptedIn = checked "a terrain host attach" attachHostTarget $ \caller () → tsAttachCheck services (identityOf caller) (rootOf caller) terrainHostAttachName
+      | otherwise = checked "a terrain host attach" attachHostTarget $ \_ () _ _ → pure (refuseText noPublication)
+    attachHostAct
+      | hostOptedIn = starting "a terrain host attach" terrainArenaRequestType attachHostTarget $ \caller () → tsAttachStart services (identityOf caller) (rootOf caller) terrainHostAttachName
+      | otherwise = starting "a terrain host attach" terrainArenaRequestType attachHostTarget $ \_ () _ → pure (TerrainRefused noPublication)
 
     -- cell, column and surface ----------------------------------------------------------------------------
     cellTarget = \case
