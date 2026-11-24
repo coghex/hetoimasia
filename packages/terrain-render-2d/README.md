@@ -207,7 +207,7 @@ full-image region. `terrain-mapgen --atlas-output DIR` writes, deterministically
 without altering any 96 x 64 canvas, one **colour atlas** (`colour.png`: loam,
 granite, blank; 288 x 64) and one **normal atlas** (`normal.png`: the 46 catalog
 maps, eight to a row in catalog order; 768 x 384) and a versioned region manifest
-(`manifest.json`) under `samples/ecce-homo/content/textures/terrain-atlas/`.
+(`manifest.json`) under `test-data/content/textures/terrain-atlas/` (the package-owned engine test fixtures, below).
 `--check-atlases` regenerates in temporary storage and compares without writing,
 failing nonzero on a missing, changed or unexpected file. Unused grid cells are
 zero (zero alpha). Runtime packs nothing; it loads the two parents through the
@@ -297,20 +297,22 @@ lighting and GPU qualification (TRA-17) are separate slices.
 | `terrain-mapgen` (executable) | `tool/` | A thin shell over `runCli`. |
 
 ```sh
-cabal run --project-file cabal.project.cpu exe:terrain-mapgen -- --check              # regenerate in temporary storage, compare, write nothing
-cabal run --project-file cabal.project.cpu exe:terrain-mapgen -- --output DIR          # generate the catalog and manifest into DIR
-cabal run --project-file cabal.project.cpu exe:terrain-mapgen -- --evidence DIR        # the CPU comparison sheets and index
+F=packages/terrain-render-2d/test-data    # the fixture directory, from the repository root
+cabal run --project-file cabal.project.cpu exe:terrain-mapgen -- --check --fixtures $F       # regenerate in temporary storage, compare, write nothing
+cabal run --project-file cabal.project.cpu exe:terrain-mapgen -- --output DIR --fixtures $F  # generate the catalog and manifest into DIR
+cabal run --project-file cabal.project.cpu exe:terrain-mapgen -- --evidence DIR --fixtures $F  # the CPU comparison sheets and index
 ```
 
-`--sample DIR` names the `samples/ecce-homo` directory and `--catalog DIR` the
-committed catalog `--check` compares (defaults: the sample found at or above the
-working directory, and `content/textures/facemap` under it), so the command does
-not depend on where it is started. `--check` reports every missing, changed and
+`--fixtures DIR` names the fixture directory and every mode requires it: a run
+without it exits 2 with the usage text and a line naming the option, and nothing
+is discovered from the working directory. `--catalog DIR` names the committed
+catalog `--check` compares (default `content/textures/facemap` under the fixture
+directory). `--check` reports every missing, changed and
 unexpected file by path, and the first differing manifest line by identity; it
 never writes to the committed directory. Exactly one mode is accepted.
 
 **The maps.** Each is a full 96 x 64 RGBA8 PNG, top row first, under
-`samples/ecce-homo/content/textures/facemap/` (`manifest.json` describes them):
+`test-data/content/textures/facemap/` (`manifest.json` describes them):
 the 16 ordinary shape maps (`shape_NN_name.png`) and, for each of the 15 nonflat
 shapes, a known-solid and a cover part (`mixed_NN_name_known.png`, `_fog.png`).
 That is at most 46 authored maps, never one per cell; generic full-cell fog is
@@ -327,7 +329,7 @@ linear data with no gamma, no premultiplication and no averaging across creases.
 Consumers load them as `kind="data"`, `coverage="binary"`,
 `normal_encoding="unit-normal-rgb-v1"` (TRA-15). The legacy face-weight masks of
 Synarchy are never this encoding: they are retained only under
-`samples/ecce-homo/reference/` as reference-only fixtures (a face-weight `(0,255,0)`
+`test-data/reference/` as reference-only fixtures (a face-weight `(0,255,0)`
 is refused as a normal because its R is 0).
 
 **The tie rule.** The solid is closed, so a ray that only touches it is covered. A
@@ -359,13 +361,13 @@ East 1 positive quarter turns (`viewShape`; North to East to South to West;
 world identities under all four facings (ordinary, known, cover and full-fog
 entries); nothing is baked per camera.
 
-**Inputs and provenance.** `loam.png` and `granite.png` are unchanged; the generic
+**Inputs and provenance.** Everything the tests and the generator read lives in `test-data/`, the package-owned engine test fixtures: not production or game art, which belongs to the consumer. `loam.png` and `granite.png` are unchanged; the generic
 `blanktexture.png` (the fog cover colour, opaque `(66,63,64)`) is a byte copy of
 Synarchy `3777d437ea00e1302bf55162ad5693fee4879187`. The generator verifies each
 input's SHA-256 and refuses a missing or altered one. PNG bytes come only from
 JuicyPixels over the project's bundled zlib (`cabal.project.common` forces
 `zlib +bundled-c-zlib -pkg-config`), so the committed hashes are the same on Linux
-and macOS. `samples/ecce-homo/content/textures/provenance.json` records the colour
+and macOS. `test-data/content/textures/provenance.json` records the colour
 art, the sixteen reference-only masks with their Synarchy paths, git blobs and
 SHA-256 and how Synarchy selects each, and the generated maps.
 
