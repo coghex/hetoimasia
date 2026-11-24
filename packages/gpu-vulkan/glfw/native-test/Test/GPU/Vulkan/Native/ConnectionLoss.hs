@@ -32,9 +32,16 @@
 -- adapter's service of replacement surfaces, and only the next turn's event
 -- processing probes the connection. A surface operation in that gap precedes
 -- the confirmation, so it is no reconnection after a confirmed loss. The
--- case judges "nothing reconnects" from the confirmation, which the loop
--- carries to the application as the 'ConnectionFailed' it ends with, through
--- the protected teardown; the operations in the gap are reported, not judged.
+-- case judges "nothing reconnects" from the confirmation through the
+-- protected teardown; the operations in the gap are reported, not judged.
+--
+-- The latch is internal to the session, so the boundary is the start of the
+-- turn that latched it: the loop asks the application's readiness once per
+-- turn before its event processing, where the loss is probed and latched, and
+-- the loop ends there. Event processing creates no surface, so every
+-- operation after that readiness query is at or after the latch, and none
+-- before it is. The boundary can include more than the latch's own, never
+-- less.
 --
 -- The case asserts that rendering was verified before the loss; that the
 -- session ended with the loss, a transport closure or protocol failure, as the
@@ -58,12 +65,11 @@ module Test.GPU.Vulkan.Native.ConnectionLoss
   ) where
 
 import Control.Concurrent.STM (STM, atomically, check, modifyTVar', newTVarIO, orElse, readTVar, readTVarIO, registerDelay, retry, writeTVar)
-import Control.Exception (SomeException, catch, displayException, fromException, throwIO, try)
+import Control.Exception (SomeException, displayException, fromException, throwIO, try)
 import Control.Monad (forM_, when)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.List (isSubsequenceOf)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (isJust)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Time.Clock (addUTCTime, getCurrentTime)
@@ -101,7 +107,8 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , withVulkanOwnerHost
   )
 import Hetoimasia.Runtime.GLFW
-  ( ScheduledStep (..)
+  ( ScheduledHooks (..)
+  , ScheduledStep (..)
   , TargetStanding (..)
   , UpdateSchedule (..)
   , defaultHostConfig
@@ -138,11 +145,9 @@ data LossFacts = LossFacts
     -- ^ How the application ended, as displayed.
   , factsConnection ∷ !(Maybe ConnectionFailed)
     -- ^ The loss, when the application's failure was it.
-  , factsConfirmed ∷ !(Maybe Int)
-    -- ^ How many native calls had returned when the loop ended with the
-    -- loss's 'ConnectionFailed': the first moment the application saw the
-    -- confirmation, and nothing the loop does after the latch runs before it.
-    -- 'Nothing' when the loop ended with no such failure.
+  , factsTurnCalls ∷ !(Maybe Int)
+    -- ^ How many native calls had returned when the loop's last turn began,
+    -- the turn whose event processing ended it. 'Nothing' when no turn began.
   , factsEvents ∷ ![FrameEvent]
     -- ^ Every frame event, oldest first.
   , factsCalls ∷ ![NativeCall]
@@ -174,7 +179,7 @@ session journal compositor = do
   logged ← newTVarIO []
   verdictHeld ← newIORef Nothing
   lossHeld ← newIORef Nothing
-  confirmedHeld ← newIORef Nothing
+  turnHeld ← newIORef Nothing
   scene ← prepare ()
   budgets ← either (stopWith . tshow) pure (validateBudgets defaultBudgetRequest)
   let window = (hiddenTestWindowConfig "hetoimasia WL-4 connection loss" 160 120) {windowVisible = True}
@@ -200,12 +205,12 @@ session journal compositor = do
           )
           vulkanWindowHost
           (\vulkan _ → pure vulkan)
-          (\vulkan control → body vulkan control recorded events lossHeld confirmedHeld)
+          (\vulkan control → body vulkan control recorded events lossHeld turnHeld)
   -- The host returns its verdict only when it returns; a host the loss ended
   -- attaches it to the failure instead.
   verdict ← maybe (either diagnosticVerdict (const Nothing) outcome) Just <$> readIORef verdictHeld
   calls ← reverse <$> readIORef recorded
-  confirmed ← readIORef confirmedHeld
+  turnCalls ← readIORef turnHeld
   entries ← readTVarIO logged
   seen ← reverse <$> readTVarIO events
   let errors =
@@ -234,14 +239,14 @@ session journal compositor = do
           , factsLoss = loss
           , factsFailure = failure
           , factsConnection = connection
-          , factsConfirmed = confirmed
+          , factsTurnCalls = turnCalls
           , factsEvents = seen
           , factsCalls = calls
           , factsVerdict = verdict
           , factsErrors = errors
           }
   where
-    body vulkan control recorded events lossHeld confirmedHeld = do
+    body vulkan control recorded events lossHeld turnHeld = do
       notePlatform journal (Just Wayland)
       let controller = vulkanController vulkan
           windowHost = vulkanWindowHost vulkan
@@ -282,14 +287,11 @@ session journal compositor = do
             seen ← readTVarIO events
             pure (not (null [() | PresentationRetired presentation ← seen, presentation `elem` [made | FramePresented _ _ made _ ← seen]]))
       deadline ← addUTCTime 15 <$> getCurrentTime
-      -- The loop ends with the loss the moment its event processing latches
-      -- it, before any other turn work, so the calls returned when it ends are
-      -- the calls returned at the confirmation. The failure is passed on.
-      let confirming failure = do
-            when (isJust (fromException failure ∷ Maybe ConnectionFailed)) $
-              readIORef recorded >>= writeIORef confirmedHeld . Just . length
-            throwIO failure
-      (`catch` confirming) . runVulkanOwnerLoop vulkan control . defaultScheduledHooks quiet $ \_ → do
+      -- Asked once per turn, before the turn's event processing, so the last
+      -- count is the start of the turn that ended the loop. It answers that
+      -- nothing is ready, as the default hooks do.
+      let startOfTurn hooks = hooks {scheduledReady = False <$ (readIORef recorded >>= writeIORef turnHeld . Just . length)}
+      runVulkanOwnerLoop vulkan control . startOfTurn . defaultScheduledHooks quiet $ \_ → do
         now ← getCurrentTime
         when (now > deadline) (stopWith "the loss was not confirmed within 15 seconds")
         demand
@@ -324,7 +326,7 @@ lossSection = \case
     , "- the application ended: " <> factsFailure facts
     , "- the loss: " <> maybe "not a connection failure" (\failure → tshow (connectionCause failure) <> ", " <> tshow (connectionBoundary failure)) (factsConnection facts)
     , "- surface operations between ending the compositor and the confirmation (not judged): " <> tshow (length (surfaceOperations (between facts)))
-    , "- surface creations attempted from the confirmation through the teardown: " <> maybe "the loop did not end with the confirmation" (tshow . length . surfaceOperations) (callsAfter facts)
+    , "- surface creations attempted from the confirmation through the teardown: " <> maybe "no confirmed loss" (tshow . length . surfaceOperations) (callsAfter facts)
     , "- swapchains created and destroyed: " <> tshow (countCalls "vkCreateSwapchainKHR" facts) <> " and " <> tshow (countCalls "vkDestroySwapchainKHR" facts)
     , "- verdict issues: " <> maybe "no verdict" (tshow . verdictIssues) (factsVerdict facts)
     , "- error reports: " <> tshow (length (factsErrors facts))
@@ -338,16 +340,31 @@ before, after ∷ LossFacts → [FrameEvent]
 before facts = take (lossEvents (factsLoss facts)) (factsEvents facts)
 after facts = drop (lossEvents (factsLoss facts)) (factsEvents facts)
 
--- | The native calls after the confirmation, through the protected teardown,
--- when the loop ended with one.
+-- | How many native calls had returned at the confirmed loss's boundary, the
+-- start of the turn that latched it, when the application ended with a
+-- confirmed loss. A probe that could not establish the status at all is not a
+-- confirmed loss, and gives no boundary.
+confirmedAt ∷ LossFacts → Maybe Int
+confirmedAt facts = case factsConnection facts of
+  Just failure | confirmed (connectionCause failure) → factsTurnCalls facts
+  _ → Nothing
+
+-- | The native calls after the confirmation, through the protected teardown.
 callsAfter ∷ LossFacts → Maybe [NativeCall]
-callsAfter facts = (`drop` factsCalls facts) <$> factsConfirmed facts
+callsAfter facts = (`drop` factsCalls facts) <$> confirmedAt facts
 
 -- | The native calls after the compositor was ended and before the
 -- confirmation.
 between ∷ LossFacts → [NativeCall]
 between facts =
-  take (maybe 0 (subtract (lossCalls (factsLoss facts))) (factsConfirmed facts)) (drop (lossCalls (factsLoss facts)) (factsCalls facts))
+  take (maybe 0 (subtract (lossCalls (factsLoss facts))) (confirmedAt facts)) (drop (lossCalls (factsLoss facts)) (factsCalls facts))
+
+-- | The probe found the connection gone.
+confirmed ∷ ConnectionCause → Bool
+confirmed = \case
+  TransportClosed _ → True
+  ProtocolFailure → True
+  ProbeFailure _ → False
 
 -- | The calls of a surface-creating operation, whether or not it succeeded.
 -- The name is the bridge operation's own, recorded after it returns, so an
@@ -371,7 +388,7 @@ spec outcome = describe "WL-4 connection loss during rendering" $ do
         Nothing → expectationFailure ("the application did not end with the connection's loss: " <> Text.unpack (factsFailure facts))
         Just failure → connectionCause failure `shouldSatisfy` confirmed
       case callsAfter facts of
-        Nothing → expectationFailure "the loop did not end with the loss's confirmation, so no boundary for the reconnection check exists"
+        Nothing → expectationFailure "no confirmed loss bounds the reconnection check"
         Just afterwards → map (.callName) (surfaceOperations afterwards) `shouldBe` []
 
   it "recorded no fence, completion or device loss for work the lost connection interrupted" $
@@ -397,12 +414,6 @@ spec outcome = describe "WL-4 connection loss during rendering" $ do
     on = \case
       LossFailed reason → const (expectationFailure (Text.unpack reason))
       LossRecorded facts → ($ facts)
-    -- The probe found the connection gone; a probe that could not establish
-    -- the status at all is not a confirmed loss.
-    confirmed = \case
-      TransportClosed _ → True
-      ProtocolFailure → True
-      ProbeFailure _ → False
 
 -- ---------------------------------------------------------------------------
 -- Helpers
