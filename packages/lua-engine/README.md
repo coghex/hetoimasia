@@ -1357,6 +1357,7 @@ module. Every call is a dot call with exactly its declared arguments; a request-
 | `api.terrain.column(arena, {x=, y=, z_min=, z_max=})` | the complete coalesced runs, air included, of the half-open range `[z_min, z_max)` at one revision; more than 1,024 runs settles `too_large`, never a truncated answer |
 | `api.terrain.surface(arena, {x=, y=})` | the highest occupied cell after edits, explicitly absent for an empty column |
 | `api.terrain.remove(arena, {x=, y=, z=} [, pick])` | remove one whole cell, a buried cell or a slope included; air is a no-op; an optional `pick` carries displayed-snapshot consistency |
+| `api.terrain.region(arena, {x=, y=, z=})` | one 16 × 16 × 32 region, named by its region indices, copied whole: terrain and discovery at one pair of revisions (see [a regional read](#a-regional-read)) |
 | `api.terrain.status(arena)` | a bounded, copied, advisory snapshot of the arena's storage and discovery, through any of this instance's leases of it |
 | `api.terrain.grow_storage(arena, new_bytes)` | creator lease only: commit a larger allowance; the size already committed is an idempotent success, a smaller one settles `storage_size_not_increased`; never a shrink |
 | `api.terrain.retry_storage(arena)` | creator lease only: one explicit, bounded re-test of what paused the arena; a ready arena is an idempotent success |
@@ -1364,7 +1365,7 @@ module. Every call is a dot call with exactly its declared arguments; a request-
 
 **Results** (`api.request.take`, `{status = "success", value = V}`; a failure is `{status = "failure", error = {code, message}}`;
 the kinds are `terrain_arena`, `terrain_cell`, `terrain_column`, `terrain_surface`, `terrain_remove`, `terrain_status`,
-`terrain_grow` and `terrain_retry`, each with its own handle type, so `ready`, `take`, `cancel` and `wait` dispatch by kind as for every
+`terrain_grow`, `terrain_retry` and `terrain_region`, each with its own handle type, so `ready`, `take`, `cancel` and `wait` dispatch by kind as for every
 other request):
 
 | Kind | `value` |
@@ -1377,6 +1378,7 @@ other request):
 | status | `{storage = {state = "ready"\|"paused", reason = TEXT?, reserved_bytes = INT, used_bytes = INT, pending_reclaim_bytes = INT, pending_reserved_bytes = INT}, discovery = {state = "idle"\|"pending"\|"paused", pending_items = INT}, content_revision = INT, knowledge_revision = INT}` |
 | grow | `{changed = BOOL, reserved_bytes = INT, storage = {state = TEXT, reason = TEXT?}}` |
 | retry | `{changed = BOOL, cleared = {TEXT...}, remaining = {TEXT...}, until_closed = {TEXT...}, storage = {state = TEXT, reason = TEXT?}, discovery = {state = TEXT}}` |
+| region | `{content_revision = INT, knowledge_revision = INT, terrain = PART, knowledge = PART}`; a `PART` is `{state = "ready", cells = {...}}` or `{state = "unavailable"}` |
 
 Records are fresh copies; material identifiers are the authored text and shapes are the authored identities 0 to 15 (0 and 15
 distinct). A content revision that does not fit a Lua integer is a host defect, never a wrapped value.
@@ -1414,6 +1416,7 @@ with (`terrainCodesFor`); one it does not declare is a defect there:
 | status | none (its only expected failure is `arena_closed`) |
 | grow_storage | `storage_unsupported`, `reservation_failed`, `storage_io`, `storage_size_not_increased` (and `arena_closed`) |
 | retry_storage | `storage_io`, an earlier extra's failed release (and `arena_closed`) |
+| region | none (its only expected failure is `arena_closed`) |
 
 The seven earlier codes are declared as before by the calls that had them.
 Terrain requests are `OptionalRequest`s: these settle as structured results and do not fail the instance, read or unread. A lease
@@ -1479,6 +1482,39 @@ of each condition (a read again, a write by a probe it abandons) and clears, in 
 `remaining` and `until_closed` (conditions no retry can clear) list codes most severe first, and `changed` says whether it cleared
 anything. Growth clears only `storage_full`; neither repeats a failed removal, resets the arena or replays anything.
 
+#### A regional read
+
+`api.terrain.region(arena, {x = rx, y = ry, z = rz})`, in either role and through any of the caller's live leases, requests exactly one
+region by its region indices (a region is 16 × 16 × 32 cells; each index must name a region whose every cell is a supported
+coordinate). The reply is a fresh record from one native regional snapshot (`regionsWith`): `content_revision` and `knowledge_revision`
+are the two revisions of the one committed version the service's build pinned, and the only statement of which version the copy is. The
+copy is never recomputed or re-read at its logical position, so the call promises no order against another request of the same tick.
+`terrain` and `knowledge` are independent: each is `{state = "ready", cells = ...}` or `{state = "unavailable"}`, with no `cells`. A part is
+unavailable when a page its build needed failed or read back invalid; that is not a failure of the request, and the arena is paused for
+the cause as for any read. A ready unknown void is distinct from unavailable knowledge and from air.
+
+`cells` is a dense list of 8,192 entries; for zero-based local coordinates the Lua index is `1 + x + 16 * y + 256 * z`. A terrain cell is
+the stock cell without its revision, `{air = BOOL, material = TEXT?, shape = INT?}` (material and shape present exactly when `air` is
+false). A knowledge cell is exactly `{solid = K, void = K}` with `K` one of `"none"`, `"known"` or `"unknown"`
+(`NoSolid`/`SolidKnown`/`SolidUnknown`, `NoVoidHere`/`VoidKnown`/`VoidUnknown`). No other field is added: a worst-case region is
+57,355 of the fixed M1 profile's 65,536 elements, at depth 5 of 8 and about 1.5 MB of 16 MiB.
+
+| Condition | Outcome |
+| --- | --- |
+| An index outside the supported region indices, a malformed record, a foreign, forged, wrong-kind or released handle, a service whose extent is not a whole region or whose hold admits no region, a worst-case reply the VM's copied-value limits cannot carry | an ordinary error before any bank is asked: no request, place, lease or charge (the reply is judged by `m1ReplyCheck` as for every call, over the worst region) |
+| The request places, or the service's retained bank or hold records, are full | `nil, busy`; nothing is reserved |
+| The arena closed (the creator's final owner lease released, the service closed) before the copy settled | the request settles `arena_closed`, once |
+| The script cancels, releases the lease, or the instance ends | the request settles cancelled, once; the borrow is released |
+| A revision that is not a Lua integer | the host defect every terrain answer has |
+
+**The borrow.** The service owns the borrow from admission. The copy into Lua values is made by the service's owner in the settlement
+preparation (`endpointPrepare`), outside every transaction and while the request still owns the borrow; it is neither a Lua thread nor a
+new pool. The transaction that commits the request then takes the borrow (`takeSTM`), settles the copy and releases the borrow
+(`releaseRegionBorrowSTM`), so its charge is back before Lua takes the result, and an untaken result holds nothing of the snapshot. A
+borrow the service released before that take (`TakeReleased`) is never read or partly delivered: the request settles `arena_closed`. The
+take needs the service's request, which the hand-off records after admission, so the request is not eligible before it is recorded. A
+completed copy is plain data: it stays coherent through later edits and the arena's closure.
+
 **The commit point.** The service's `Endpoint` is attached to the host's `Settling` seam: the service reads the request's
 eligibility, commits the edit and delivers the settlement in one transaction that also decides cancellation, the parent session's
 admission and the arena's closure, so exactly one of a script's cancel and the commit wins: cancel first leaves no edit, commit first
@@ -1533,6 +1569,7 @@ and no view, camera or picking: TRA-10 issues the real token. The adapter's `iss
 | the typed ask of a request in flight | the adapter, by ticket | from the binding's start to the hand-off |
 | an offered lease | the adapter until adopted or released | `Offered`, then `Adopted`, or `Revoking` and `Disposed` |
 | the service's untaken result of a request | the service | until the host's record is taken or discarded and its work is over (`tsDrain` returns it) |
+| a regional read's borrow and its copy | the service until the settling transaction takes it; the copy is made by the service's owner in the settlement preparation | the borrow ends in the settling transaction (take, then release), or at the request's end; the copy is the host's result and holds no snapshot |
 
 The lease capacity one instance needs in the shared scope is `configMaxLeases + RequestsPerInstance + 1` (`terrainLeaseCapacity`):
 every lease the service can hold at once, the places that reserve one before the service admits it, and one of headroom. With
