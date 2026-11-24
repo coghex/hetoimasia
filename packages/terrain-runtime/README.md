@@ -366,7 +366,10 @@ footprint, kept until the release. The borrow counts among the borrowers service
 was taken, retired or released with its lease, client, arena or the service). `await` and
 `withRegionSnapshot` take in the transaction that reads the settlement; a regional result given up before
 it was taken answers `Cancelled`, and its released borrow is never returned. A host that settles through
-the seam uses a regional answer only on `Taken`.
+the seam uses a regional answer only on `Taken`. `borrowHeldSTM` answers whether the service still holds a
+borrow charged to a request: pending, staged or untaken, or orphaned until the owner's safe point when the
+request ended while its build or delivery ran. It is read-only; a host reads it to prove its work on the
+request over, because the request's own record can be gone while its charge is not.
 
 A release is idempotent: the borrow is found and released once, in one place (`releaseRegionalSTM`),
 whichever path finds it first.
