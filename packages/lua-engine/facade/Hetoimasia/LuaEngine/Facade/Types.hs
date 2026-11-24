@@ -91,6 +91,8 @@ module Hetoimasia.LuaEngine.Facade.Types
   , terrainRegionValueSchema
   , terrainRegionCells
   , terrainStorageMinimum
+  , terrainHostAttachEndpoint
+  , terrainHostAttachName
   , terrainStorageUnit
   , terrainNameLimit
   , terrainMaterialBytesLimit
@@ -599,6 +601,16 @@ terrainRegionCells ∷ Int
 terrainRegionCells = 16 * 16 * 32
 
 -- | The smallest arena allowance a script may name (64 MiB), and the unit every allowance is a whole number of (1 MiB).
+-- | The endpoint a provider declares ('tsEndpoints') to take part in host attachment, and the name @api.terrain.attach_host()@ then asks its
+-- attach operations ('tsAttachCheck', 'tsAttachStart') for: the empty name, which no script can pass (an arena name is never empty), so it
+-- cannot be confused with a named arena. A provider that declares no such endpoint has no host publication, and is never asked anything for
+-- it: @attach_host()@ is an ordinary refusal at the call's check, before admission, naming that.
+terrainHostAttachEndpoint ∷ Text
+terrainHostAttachEndpoint = "terrain_attach_host"
+
+terrainHostAttachName ∷ Text
+terrainHostAttachName = ""
+
 terrainStorageMinimum, terrainStorageUnit ∷ Int64
 terrainStorageMinimum = 64 * 1024 * 1024
 terrainStorageUnit = 1024 * 1024
@@ -733,6 +745,8 @@ data TerrainServices = TerrainServices
   , tsOpenStart ∷ Text → Text → Text → TerrainDefinition → Maybe Int64 → RequestContext → IO TerrainStart
   , tsAttachCheck ∷ Text → Text → Text → ArgumentCheck
   , tsAttachStart ∷ Text → Text → Text → RequestContext → IO TerrainStart
+  -- ^ Instance, root, name. A provider that declares the endpoint 'terrainHostAttachEndpoint' is also asked, by the name
+  -- 'terrainHostAttachName', for the arena the host published to the root instead of a named one.
   , tsCellCheck ∷ Text → Word64 → TerrainCell → ArgumentCheck
   -- ^ Instance, arena handle key, cell: whether the handle is refused (another instance's, of another kind, forged, or the
   -- caller's own already released): the text of an ordinary error, before any provider is asked. A lease whose arena was

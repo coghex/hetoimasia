@@ -30,6 +30,7 @@ module Hetoimasia.Terrain.Runtime.Settlement
   , defaultOpenOptions
   , openArenaWithOptions
   , attachArenaWith
+  , attachArenaFromWith
   , cellWith
   , columnWith
   , surfaceWith
@@ -97,6 +98,13 @@ openStoreConfig svc options = case openAllowanceBytes options of
 -- | Obtain a lease on an existing arena of the same service, by name.
 attachArenaWith ∷ Service → Endpoint → Client → Text → IO (Either Refused Request)
 attachArenaWith svc ep client name = atomically (admit svc ep (SubAttach client name))
+
+-- | Obtain a lease of this client on the arena a live creator lease of the same service holds. The source is validated when it is
+-- admitted and again where the lease is issued: a lease of another service, or one that is not an owner lease, is refused
+-- ('RefusedAuthority'); a source that was released, whose client ended or whose arena closed settles 'NotFound'. The new lease is never
+-- an owner lease, whichever client asks: releasing it never closes the arena, and growth and retry through it are refused.
+attachArenaFromWith ∷ Service → Endpoint → Client → ArenaLease → IO (Either Refused Request)
+attachArenaFromWith svc ep client source = atomically (admit svc ep (SubAttachFrom client source))
 
 cellWith ∷ Service → Endpoint → ArenaLease → TileCoord → IO (Either Refused Request)
 cellWith svc ep lease tile = atomically (admit svc ep (SubCell lease tile))

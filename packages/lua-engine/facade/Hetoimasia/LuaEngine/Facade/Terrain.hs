@@ -48,6 +48,7 @@ import Hetoimasia.LuaEngine.Facade.Bindings
 import Hetoimasia.LuaEngine.Facade.Caller (Caller (..), Stage (..), requireInstance, whoIsCalling)
 import Hetoimasia.LuaEngine.Facade.Types
 import Hetoimasia.LuaEngine.Request (m1HandleType, m1StartResults, m1StartSchemas)
+import Hetoimasia.Scripting.Lua.Provider (RequestEndpoint (endpointName))
 import Hetoimasia.Scripting.Lua.Registration
   ( ArgumentCheck
   , Binding
@@ -296,7 +297,7 @@ decodeSurface = \case
 
 -- The bindings ------------------------------------------------------------------------------------------
 
--- | The bindings of the hidden namespace, in their own spellings: @terrain_open@, @terrain_attach@, @terrain_cell@,
+-- | The bindings of the hidden namespace, in their own spellings: @terrain_open@, @terrain_attach@, @terrain_attach_host@, @terrain_cell@,
 -- @terrain_column@, @terrain_surface@, @terrain_remove@ and @terrain_release@. The initial chunk wraps each in the facade's
 -- own closure. The services' own extra bindings (a test fixture's) follow.
 terrainBindings ∷ Facade → TerrainServices → [Binding]
@@ -305,6 +306,8 @@ terrainBindings facade services =
       asynchronousNativeRequestIn "terrain_open" [SText, definitionSchema, SOptional openOptionsSchema] (m1StartSchemas terrainArenaRequestType) openAct
   , withArgumentCheck attachCheck $
       asynchronousNativeRequestIn "terrain_attach" [SText] (m1StartSchemas terrainArenaRequestType) attachAct
+  , withArgumentCheck attachHostCheck $
+      asynchronousNativeRequestIn "terrain_attach_host" [] (m1StartSchemas terrainArenaRequestType) attachHostAct
   , withArgumentCheck cellCheck $
       asynchronousNativeRequestIn "terrain_cell" [arena, cellSchema] (m1StartSchemas terrainCellRequestType) cellAct
   , withArgumentCheck columnCheck $
@@ -391,6 +394,21 @@ terrainBindings facade services =
       _ → Left "an arena name is required"
     attachCheck = checked "a terrain attach" attachTarget $ \caller name → tsAttachCheck services (identityOf caller) (rootOf caller) name
     attachAct = starting "a terrain attach" terrainArenaRequestType attachTarget $ \caller name → tsAttachStart services (identityOf caller) (rootOf caller) name
+
+    -- attach_host -----------------------------------------------------------------------------------------
+    attachHostTarget = \case
+      [] → Right ()
+      _ → Left "attach_host takes no arguments"
+    -- A provider opts in by declaring the host attach endpoint. Any other has no host publication: the call is refused at its check, with
+    -- no call into the provider, and its action (which a refused check never reaches) refuses the same way.
+    hostOptedIn = any ((== terrainHostAttachEndpoint) . endpointName) (tsEndpoints services)
+    noPublication = "this terrain provider publishes no arena to attach to"
+    attachHostCheck
+      | hostOptedIn = checked "a terrain host attach" attachHostTarget $ \caller () → tsAttachCheck services (identityOf caller) (rootOf caller) terrainHostAttachName
+      | otherwise = checked "a terrain host attach" attachHostTarget $ \_ () _ _ → pure (refuseText noPublication)
+    attachHostAct
+      | hostOptedIn = starting "a terrain host attach" terrainArenaRequestType attachHostTarget $ \caller () → tsAttachStart services (identityOf caller) (rootOf caller) terrainHostAttachName
+      | otherwise = starting "a terrain host attach" terrainArenaRequestType attachHostTarget $ \_ () _ → pure (TerrainRefused noPublication)
 
     -- cell, column and surface ----------------------------------------------------------------------------
     cellTarget = \case

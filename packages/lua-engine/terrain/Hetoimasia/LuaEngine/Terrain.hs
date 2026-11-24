@@ -48,6 +48,7 @@ module Hetoimasia.LuaEngine.Terrain
   , TerrainHooks (..)
   , noTerrainHooks
   , terrainInjection
+  , terrainInjectionWithArena
   , terrainLeaseCapacity
   , TerrainCompositionRefused (..)
   , terrainCodes
@@ -78,8 +79,10 @@ import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as Text
+import qualified Data.Text.Encoding as Text
 import Data.Unique (Unique, hashUnique, newUnique)
 import Data.Word (Word64)
+import Hetoimasia.Content.Identity (RootKey, rootKeyBytes)
 import Hetoimasia.Foundation.Resource (acquirePart, releaseRank)
 import Hetoimasia.LuaEngine.Facade
   ( TerrainCell (..)
@@ -104,6 +107,8 @@ import Hetoimasia.LuaEngine.Facade
   , terrainGrowValueSchema
   , terrainStatusValueSchema
   , terrainStorageMinimum
+  , terrainHostAttachEndpoint
+  , terrainHostAttachName
   , terrainStorageUnit
   , terrainSurfaceValueSchema
   )
@@ -196,6 +201,7 @@ import Hetoimasia.Terrain.Runtime.Settlement
   ( Endpoint (..)
   , PreparedSettlement (..)
   , TakeOutcome (..)
+  , attachArenaFromWith
   , attachArenaWith
   , cancel
   , cellWith
@@ -248,6 +254,11 @@ data TerrainFacade = TerrainFacade
   -- makes it, is not eligible while the arena it would find is not yet the open's settled result. An open lets go only of its own
   -- entry, so a late cleanup of an earlier open of the name never shows a later open's arena before it has settled.
   }
+
+-- | The host's publication of one arena: the content root it is published to and the host's creator lease, which the injection borrows and
+-- never owns. The host keeps the lease and releases it with its own scope; closing the last creator lease closes the arena, whatever
+-- is attached to it. Written once, at composition, and read by every VM of the session: no state, no reset.
+data Published = Published !RootKey !ArenaLease
 
 -- | An open's name is held back from attach, from the service's commit of the open until the host has adopted or let go of its lease.
 holdBack ∷ TerrainFacade → Text → Link → STM ()
@@ -399,7 +410,7 @@ terrainCodes =
 terrainCodesFor ∷ Text → [Text]
 terrainCodesFor name
   | name == openName = base <> ["source_complexity", "storage_unsupported", "reservation_failed", "storage_io"]
-  | name == attachName = base
+  | name `elem` [attachName, attachHostName] = base
   | name == removeName = base <> ["storage_full", "storage_io", "storage_integrity"]
   | name `elem` [cellName, columnName, surfaceName] = base <> ["storage_io", "storage_integrity"]
   | name == statusName = ["arena_closed"]
@@ -503,6 +514,9 @@ data Link = Link
 data Ask
   = AskOpen !Client !Text !SourceSpec !OpenOptions
   | AskAttach !Client !Text
+  | -- | An attachment to the arena the host published, through the host's creator lease and as this client; nothing when no arena is
+    -- published to the instance's root, which settles at the hand-off like a status, with no work of the service's.
+    AskAttachHost !(Maybe (Client, ArenaLease))
   | AskCell !ArenaLease !TileCoord
   | AskColumn !ArenaLease !Column !ZRange
   | AskSurface !ArenaLease !Column
@@ -538,6 +552,9 @@ data Env = Env
   , envIssued ∷ !(TVar (Map Text (Set Word64)))
   -- ^ The arena handles each live instance was issued: ownership is positive, so another instance's handle is refused for as long
   -- as the caller lives, whether or not the issuing instance does. The memory is the handles the instance issued, ended with it.
+  , envPublished ∷ !(Maybe Published)
+  -- ^ The arena the host published to one content root of the session ('terrainInjectionWithArena'): what @api.terrain.attach_host()@ of an
+  -- instance of that root is issued an attachment to. Nothing in the injection of 'terrainInjection'. Fixed at composition, never written.
   }
 
 service ∷ Env → Service
@@ -546,17 +563,38 @@ service = tfService . envFacade
 hooks ∷ Env → TerrainHooks
 hooks = tfHooks . envFacade
 
+-- | The injection a session is composed with, publishing one arena of the host's to one content root: the 'terrainInjection' of the same
+-- facade, whose instances of that root can also take @api.terrain.attach_host()@, an attachment of their own to the arena the lease
+-- opened, whatever name it was opened under.
+--
+-- The lease must be, now, a live creator (owner) lease of a live arena of the facade's service: one that is another service's, an
+-- attachment, or already released or closed is refused ('RefusedAuthority'), as is a closed service ('RefusedClosed'). The injection
+-- BORROWS it: it acquires no lease, never releases the host's and keeps no arena alive. The host's lease stays the host's, with its
+-- native view; it is released with the host's scope, and releasing the arena's last creator lease closes the arena with Lua attached.
+-- A lease that ends later is not an error of the injection: an attachment that would be issued from it settles @not_found@. The facade
+-- and every injection made from it before keep their behavior and their tables; the root that matches no root of the session is not
+-- refused either, since every instance of the session is then in an unpublished root.
+terrainInjectionWithArena ∷ TerrainFacade → RootKey → ArenaLease → IO (Either Refused TerrainInjection)
+terrainInjectionWithArena facade root lease =
+  atomically (Terrain.creatorLeaseSTM (tfService facade) lease) <&> \case
+    Left refused → Left refused
+    Right () → Right (injectionOver (Just (Published root lease)) facade)
+
 -- | The injection a session is composed with: for each role's VM, its own client table over the shared service, in the VM's own
 -- lending and lease scope.
 terrainInjection ∷ TerrainFacade → TerrainInjection
-terrainInjection config =
+terrainInjection = injectionOver Nothing
+
+-- | The injection over a facade, with the arena the host published, if any: what every VM's environment is made with.
+injectionOver ∷ Maybe Published → TerrainFacade → TerrainInjection
+injectionOver publication config =
   TerrainInjection
     { tiLeaseCapacity = \profile → terrainLeaseCapacity profile (tfService config)
     , injectTerrain = \vm → do
         clients ← newTVarIO Map.empty
         asks ← newTVarIO (1, Map.empty)
         issued ← newTVarIO Map.empty
-        let env = Env config vm (hashUnique (tvSession vm)) clients asks issued
+        let env = Env config vm (hashUnique (tvSession vm)) clients asks issued publication
         pure (services env)
     }
 
@@ -576,21 +614,33 @@ services env =
         client ← clientOf env identity
         start env context openName openAsk (AskOpen client (nameKey env root name) (sourceSpec definition) (OpenOptions (toInteger <$> bytes)))
     , tsAttachCheck = \_ _ _ owner values → permanent env (const attachAsk) owner values
-    , tsAttachStart = \identity root name context → do
-        attachClientOf env identity >>= \case
-          Left refusal → pure refusal
-          Right (client, fresh) → do
-            -- A client made for this attach is the attach's to give back when it is not accepted: nothing stays charged for a request
-            -- that was refused (busy in the host's banks or the service's), and an exception leaves none behind either.
-            let giveBack = when fresh $ do
-                  atomically (modifyTVar' (envClients env) (Map.adjust (\clients → clients {clAttach = Nothing}) identity))
-                  endClient (service env) client
-            started ← start env context attachName attachAsk (AskAttach client (nameKey env root name)) `onException` giveBack
-            case started of
-              TerrainStarted (M1Busy _) → giveBack
-              TerrainRefused _ → giveBack
-              _ → pure ()
-            pure started
+    , tsAttachStart = \identity root name context →
+        if name == terrainHostAttachName
+          then -- the name no script can pass asks for the arena the host published to this instance's root
+            case published env root of
+              -- no arena is published to this instance's root: the request settles not_found at its hand-off, with no client made
+              Nothing → start env context attachHostName attachHostAsk (AskAttachHost Nothing)
+              -- the instance's own client: the service issues the attachment as a nonowner lease whichever client asks, so it needs no
+              -- client of its own to keep the creator-owner rule apart, and one the instance holds already cannot be refused as the bank
+              -- filling
+              Just source → do
+                client ← clientOf env identity
+                start env context attachHostName attachHostAsk (AskAttachHost (Just (client, source)))
+          else
+            attachClientOf env identity >>= \case
+              Left refusal → pure refusal
+              Right (client, fresh) → do
+                -- A client made for this attach is the attach's to give back when it is not accepted: nothing stays charged for a request
+                -- that was refused (busy in the host's banks or the service's), and an exception leaves none behind either.
+                let giveBack = when fresh $ do
+                      atomically (modifyTVar' (envClients env) (Map.adjust (\clients → clients {clAttach = Nothing}) identity))
+                      endClient (service env) client
+                started ← start env context attachName attachAsk (AskAttach client (nameKey env root name)) `onException` giveBack
+                case started of
+                  TerrainStarted (M1Busy _) → giveBack
+                  TerrainRefused _ → giveBack
+                  _ → pure ()
+                pure started
     , tsCellCheck = \identity key cell owner values →
         firstRefusal
           [ leaseCheck env identity key readAsk owner values
@@ -677,6 +727,8 @@ services env =
     endpoints =
       [ endpoint env openName SNil
       , endpoint env attachName SNil
+      , -- the opt-in of host attachment: the facade asks this provider for the published arena, and not for a name nothing holds
+        endpoint env attachHostName SNil
       , endpoint env cellName terrainCellValueSchema
       , endpoint env columnName terrainColumnValueSchema
       , endpoint env surfaceName terrainSurfaceValueSchema
@@ -692,9 +744,10 @@ services env =
       AlreadyReleased → "already_released"
 
 -- | The endpoint names of the requests.
-openName, attachName, cellName, columnName, surfaceName, removeName, statusName, growName, retryName, regionName ∷ Text
+openName, attachName, attachHostName, cellName, columnName, surfaceName, removeName, statusName, growName, retryName, regionName ∷ Text
 openName = "terrain_open"
 attachName = "terrain_attach"
+attachHostName = terrainHostAttachEndpoint
 cellName = "terrain_cell"
 columnName = "terrain_column"
 surfaceName = "terrain_surface"
@@ -753,6 +806,13 @@ attachClientOf env identity = do
           atomically (modifyTVar' (envClients env) (Map.insert identity clients {clAttach = Just made}))
           pure (Right (made, True))
 
+-- | The creator lease the host published to the content root of an instance, if any: the root's text is the one the facade issued the
+-- instance, and the published root is its UTF-8 encoding exactly (the rule the content facade applies to a root).
+published ∷ Env → Text → Maybe ArenaLease
+published env root = case envPublished env of
+  Just (Published key lease) | rootKeyBytes key == Text.encodeUtf8 root → Just lease
+  _ → Nothing
+
 -- | The name the service holds for an instance's name: in the session's and the instance's content root's namespace. It cannot exceed
 -- the 256 characters the service holds: a session's identity is at most 19 digits, a content root at most 64 characters
 -- ('validRootId') and a script's name at most 128, and the two separators and the prefix add three, so at most 214.
@@ -768,9 +828,10 @@ drainRetired env = atomically (pruneClaims (names (envFacade env)) >> pruneFaile
 -- The asks ------------------------------------------------------------------------------------------------------
 
 -- | Each request's ask, declaring exactly the expected codes its endpoint can settle with ('terrainCodesFor').
-openAsk, attachAsk, readAsk, removeAsk, statusAsk, growAsk, retryAsk, regionAsk ∷ M1Ask
+openAsk, attachAsk, attachHostAsk, readAsk, removeAsk, statusAsk, growAsk, retryAsk, regionAsk ∷ M1Ask
 openAsk = leaseAsk "terrain open" (terrainCodesFor openName)
 attachAsk = leaseAsk "terrain attach" (terrainCodesFor attachName)
+attachHostAsk = leaseAsk "terrain host attach" (terrainCodesFor attachHostName)
 readAsk = (m1Ask OptionalRequest "terrain read") {askCodes = terrainCodesFor cellName}
 removeAsk = (m1Ask OptionalRequest "terrain removal") {askCodes = terrainCodesFor removeName}
 statusAsk = (m1Ask OptionalRequest "terrain status") {askCodes = terrainCodesFor statusName}
@@ -1278,6 +1339,7 @@ submit env submission = mask_ $ do
       throwIO (DeclinedRefused "the VM's copied-value limits cannot carry the answer of this call: narrow the range")
   case pdAsk found of
     AskStatus lease → submitStatus env settling lease
+    AskAttachHost Nothing → submitNotFound env settling
     _ → submitToService env submission found settling
 
 -- | A status is no work of the service's: one coherent read of the arena's own state, in one transaction, settled at the hand-off
@@ -1296,6 +1358,19 @@ submitStatus env settling lease = do
             Left RefusedAuthority → ProviderExpected closedFailure
             Left other → ProviderFailure ("terrain: a status was refused: " <> Text.take 200 (Text.pack (show other)))
     void (settlingSettle settling reply)
+  pure ProviderWork {workCancel = pure (), workRetirement = pure ProviderComplete}
+
+-- | A request with no arena to reach: settled at the hand-off, @not_found@, and nothing of the service's is touched, reserved or held. The
+-- service's admission is still decided at the hand-off, in the very transaction that settles it: a service that closed since the host's
+-- precheck is the permanent closed-service refusal every other request gets ('declination'), with the host's reservations taken back.
+submitNotFound ∷ Env → Settling → IO ProviderWork
+submitNotFound env settling = do
+  hookSubmitting (hooks env)
+  admitting ← atomically $ do
+    open ← Terrain.serviceAdmitting (service env)
+    when open (void (settlingSettle settling (failureReply NotFound)))
+    pure open
+  unless admitting (throwIO (declination RefusedClosed))
   pure ProviderWork {workCancel = pure (), workRetirement = pure ProviderComplete}
 
 -- | Hand a request that is the service's work to it.
@@ -1324,6 +1399,7 @@ submitToService env submission found settling = do
           then pure False
           else case pdAsk found of
             AskAttach {} → pure True
+            AskAttachHost {} → pure True
             AskOpen {} → pure True
             -- a growth or a retry hands no revision to Lua
             AskGrow {} → pure True
@@ -1378,6 +1454,8 @@ submitToService env submission found settling = do
   let admitAsk = case pdAsk found of
         AskOpen client name spec options → openArenaWithOptions (service env) ep client name spec options
         AskAttach client name → attachArenaWith (service env) ep client name
+        AskAttachHost (Just (client, source)) → attachArenaFromWith (service env) ep client source
+        AskAttachHost Nothing → throwIO (TerrainCompositionRefused "an attachment with no published arena reached the service's admission")
         AskCell lease tile → cellWith (service env) ep lease tile
         AskColumn lease column range → columnWith (service env) ep lease column range
         AskSurface lease column → surfaceWith (service env) ep lease column

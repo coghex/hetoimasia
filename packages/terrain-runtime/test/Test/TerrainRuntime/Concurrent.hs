@@ -35,6 +35,7 @@ import qualified Test.TerrainRuntime.Closure as Closure
 import qualified Test.TerrainRuntime.Credits as Credits
 import qualified Test.TerrainRuntime.Hardening as Hardening
 import qualified Test.TerrainRuntime.Interleaving as Interleaving
+import qualified Test.TerrainRuntime.HostPublished as HostPublished
 import qualified Test.TerrainRuntime.Lifecycle as Lifecycle
 import qualified Test.TerrainRuntime.Limits as Limits
 import qualified Test.TerrainRuntime.Offload as Offload
@@ -118,6 +119,7 @@ entries =
   , Entry "Oracle" (Concurrent "the service against an independent model, through the owner") Oracle.spec
   , Entry "Interleaving" (Concurrent "orders of the owner's work, ordered by gates") Interleaving.spec
   , Entry "Closure" (Concurrent "closure against pending work, ordered by gates") Closure.spec
+  , Entry "HostPublished" (Concurrent "an attachment issued through a creator lease, against closure and cancellation, ordered by a host that is not yet eligible") HostPublished.spec
   , Entry "Store.Codec" (Alone pureStore) StoreCodec.spec
   , Entry "Store.Replay" (Alone pureStore) StoreReplay.spec
   , Entry "Store.Faults" (Alone pureStore) StoreFaults.spec

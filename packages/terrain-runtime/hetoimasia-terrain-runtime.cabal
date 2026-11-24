@@ -212,6 +212,7 @@ test-suite terrain-runtime-tests
         Test.TerrainRuntime.Credits
         Test.TerrainRuntime.Fixtures
         Test.TerrainRuntime.Hardening
+        Test.TerrainRuntime.HostPublished
         Test.TerrainRuntime.Interleaving
         Test.TerrainRuntime.Lifecycle
         Test.TerrainRuntime.Limits

@@ -280,6 +280,8 @@ data Submission
     SubOpen !Client !Text !Source !StoreConfig
   | SubOpenInvalid !Client !SourceError
   | SubAttach !Client !Text
+  | -- | An attach through a live creator lease of this service: the destination client and the source lease.
+    SubAttachFrom !Client !ArenaLease
   | SubCell !ArenaLease !TileCoord
   | SubColumn !ArenaLease !Column !ZRange
   | SubSurface !ArenaLease !Column
@@ -373,6 +375,7 @@ commandRanges limits source surfaceWindow = \case
   CRegions {} → []
   COpen {} → []
   CAttach {} → []
+  CAttachFrom {} → []
   CGrow {} → []
   CRetry → []
 
@@ -447,7 +450,7 @@ isOpenCmd ∷ Req → Bool
 isOpenCmd req = case reqCmd req of COpen {} → True; _ → False
 
 isAcquisition ∷ Req → Bool
-isAcquisition req = case reqCmd req of COpen {} → True; CAttach {} → True; _ → False
+isAcquisition req = case reqCmd req of COpen {} → True; CAttach {} → True; CAttachFrom {} → True; _ → False
 
 isRemoval ∷ Req → Bool
 isRemoval req = case reqCmd req of CRemove {} → True; _ → False
@@ -575,6 +578,7 @@ waitingReadmission ∷ Req → Bool
 waitingReadmission req = case (reqCmd req, reqPhase req) of
   (COpen {}, _) → False
   (CAttach {}, _) → False
+  (CAttachFrom {}, _) → False
   (CGrow {}, _) → False
   (CRetry, _) → False
   -- a regional snapshot is never admitted again: its slot is counted once, as a pending regional request
@@ -638,6 +642,21 @@ decide svc st rid = \case
     when (leaseUse >= configMaxLeases config) (Left (ShortRefused (RefusedBusy BusyLeases)))
     forM_ (capacityRefusal config st True) (Left . busyWhy)
     Right (Insertion (CAttach name cid) Nothing cid Nothing False [] Nothing)
+  -- AN ATTACH THROUGH A CREATOR LEASE validates its source here and again where the destination lease is issued: a lease of another
+  -- service, or a live lease that is not an owner lease, is not authority (a refusal); a lease that is gone, ended or whose arena has
+  -- closed is an expired grant, settled not_found at once (no request, claim or lease is held for it).
+  SubAttachFrom client (ArenaLease tag lid) → pure $ do
+    cid <- first' ShortRefused (clientOf svc client st)
+    when (tag /= serviceTag svc) (Left (ShortRefused RefusedAuthority))
+    case Map.lookup lid (stateLeases st) of
+      Nothing → Left (ShortFailed NotFound)
+      Just ls
+        | not (leaseLive ls) || not (Map.member (leaseArena ls) (stateArenas st)) → Left (ShortFailed NotFound)
+        | not (leaseOwner ls) → Left (ShortRefused RefusedAuthority)
+        | otherwise → Right ()
+    when (leaseUse >= configMaxLeases config) (Left (ShortRefused (RefusedBusy BusyLeases)))
+    forM_ (capacityRefusal config st True) (Left . busyWhy)
+    Right (Insertion (CAttachFrom lid cid) Nothing cid Nothing False [] Nothing)
   SubCell lease tile → dataCommand lease (CCell tile)
   SubColumn lease column range
     -- Before any region is enumerated: a range of any length is refused here, in

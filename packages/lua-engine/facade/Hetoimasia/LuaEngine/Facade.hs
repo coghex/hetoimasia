@@ -135,6 +135,8 @@ module Hetoimasia.LuaEngine.Facade
   , terrainRegionValueSchema
   , terrainRegionCells
   , terrainStorageMinimum
+  , terrainHostAttachEndpoint
+  , terrainHostAttachName
   , terrainStorageUnit
   , terrainNameLimit
   , terrainMaterialBytesLimit

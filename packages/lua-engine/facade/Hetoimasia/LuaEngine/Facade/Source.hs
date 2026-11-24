@@ -123,6 +123,7 @@ engineChunk graphics input terrain limit = Text.encodeUtf8 (Text.unlines (prelud
     terrainLocals
       | terrain =
           [ "local terrain_open, terrain_attach, terrain_cell, terrain_column = E.terrain_open, E.terrain_attach, E.terrain_cell, E.terrain_column"
+          , "local terrain_attach_host = E.terrain_attach_host"
           , "local terrain_surface, terrain_remove, terrain_release = E.terrain_surface, E.terrain_remove, E.terrain_release"
           , "local terrain_arena_ops = { ready = E.ready_terrain_arena, take = E.take_terrain_arena, cancel = E.cancel_terrain_arena, wait = E.wait_terrain_arena }"
           , "local terrain_cell_ops = { ready = E.ready_terrain_cell, take = E.take_terrain_cell, cancel = E.cancel_terrain_cell, wait = E.wait_terrain_cell }"
@@ -149,6 +150,7 @@ engineChunk graphics input terrain limit = Text.encodeUtf8 (Text.unlines (prelud
           , "        return request, refusal"
           , "      end,"
           , "      attach = starter1(terrain_attach, terrain_arena_ops),"
+          , "      attach_host = starter1(terrain_attach_host, terrain_arena_ops),"
           , "      cell = starter1(terrain_cell, terrain_cell_ops),"
           , "      column = starter1(terrain_column, terrain_column_ops),"
           , "      surface = starter1(terrain_surface, terrain_surface_ops),"
