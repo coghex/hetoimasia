@@ -667,6 +667,8 @@ data Cmd
     -- (the service's own, or the one the open named, validated by the same rules at admission).
     COpen !Text !Source !Word64 !StoreConfig
   | CAttach !Text !Word64
+  | -- | An attach through a live creator lease (its identity) rather than a name, for this client: it issues a nonowner lease.
+    CAttachFrom !Word64 !Word64
   | CCell !TileCoord
   | CColumn !Column !ZRange
   | CSurface !Column

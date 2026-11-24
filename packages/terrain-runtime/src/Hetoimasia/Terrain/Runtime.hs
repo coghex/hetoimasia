@@ -78,6 +78,8 @@ module Hetoimasia.Terrain.Runtime
   , defaultOpenOptions
   , openArenaOptions
   , attachArena
+  , attachArenaFrom
+  , creatorLeaseSTM
   , cellAt
   , columnAt
   , surfaceAt
@@ -471,6 +473,24 @@ openArenaOptions svc client name spec options = arrival (\case AOpened lease →
 
 attachArena ∷ Service → Client → Text → IO (Either Refused (Pending ArenaLease))
 attachArena svc client name = arrival (\case AAttached lease → Just lease; _ → Nothing) (\ep → attachArenaWith svc ep client name)
+
+-- | 'attachArenaWith' for 'attachArenaFromWith': a lease for this client through a live creator lease, never an owner lease.
+attachArenaFrom ∷ Service → Client → ArenaLease → IO (Either Refused (Pending ArenaLease))
+attachArenaFrom svc client source = arrival (\case AAttached lease → Just lease; _ → Nothing) (\ep → attachArenaFromWith svc ep client source)
+
+-- | Whether a lease is, now, a live creator (owner) lease of a live arena of this service: 'RefusedClosed' for a service that no longer
+-- admits, 'RefusedAuthority' for anything else (another service's lease, a released or ended one, an attachment, a closed arena).
+creatorLeaseSTM ∷ Service → ArenaLease → STM (Either Refused ())
+creatorLeaseSTM svc lease =
+  fmap
+    ( \case
+        Left refused → Left refused
+        Right st → case leaseOf svc lease st of
+          Right (_, ls)
+            | leaseLive ls && leaseOwner ls && Map.member (leaseArena ls) (stateArenas st) → Right ()
+          _ → Left RefusedAuthority
+    )
+    (admitting svc)
 
 cellAt ∷ Service → ArenaLease → TileCoord → IO (Either Refused (Pending CellAnswer))
 cellAt svc lease tile = arrival (\case ACell a → Just a; _ → Nothing) (\ep → cellWith svc ep lease tile)

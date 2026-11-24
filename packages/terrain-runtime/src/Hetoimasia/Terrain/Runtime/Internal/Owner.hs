@@ -533,6 +533,7 @@ pickRequestWork svc st adm open holdReads = do
     notStarted rid req = case reqCmd req of
       COpen {} → not (Map.member rid (stateOpens st))
       CAttach {} → True
+      CAttachFrom {} → True
       CGrow {} → True
       -- a retry with its probe in flight is started work; one that must probe starts it as any read does
       CRetry → not (Map.member (GatherRequest rid) (stateGathers st)) && case reqArena req >>= \aid → (,) aid <$> Map.lookup aid (stateArenas st) of
@@ -544,6 +545,7 @@ pickRequestWork svc st adm open holdReads = do
     satisfied rid req = case reqCmd req of
       COpen {} → True
       CAttach {} → True
+      CAttachFrom {} → True
       CGrow {} → True
       CRetry → True
       CRegions {} → True
@@ -1021,6 +1023,7 @@ prepareReq svc rid = do
    Just req → case reqCmd req of
     COpen _ source _ store → not (Map.member rid (stateOpens st)) <$ atomically (beginOpen svc rid source store)
     CAttach {} → stage svc rid Nothing (Revision 0) StagedControl
+    CAttachFrom {} → stage svc rid Nothing (Revision 0) StagedControl
     CGrow bytes → withArena req $ \(aid, arena) →
       -- the store's pure proposal against the allowance as it is now: equal is an idempotent success,
       -- smaller is storage_size_not_increased, larger takes the slot when the host is eligible
@@ -1187,6 +1190,7 @@ commitWaits st open rid req sg
         | Left _ <- prepared → False
         | otherwise → maybe True (\(aid, _, _, _, _) → not (openOrderAllows st aid)) (openReady st rid)
       (CAttach {}, StagedControl) → False
+      (CAttachFrom {}, StagedControl) → False
       -- a regional snapshot settles with the version it read, whatever has committed since
       (CRegions {}, StagedAnswer _) → False
       -- a removal that changes content takes the slot; one of air commits here
@@ -1207,6 +1211,7 @@ commitStaged ∷ Service → St → RequestId → Req → Staged → STM CommitR
 commitStaged svc st rid req sg = case (reqCmd req, stagedWork sg) of
   (COpen name source cid _, StagedOpen prepared) → commitOpen name source cid prepared
   (CAttach name cid, StagedControl) → commitAttach name cid
+  (CAttachFrom source cid, StagedControl) → commitAttachFrom source cid
   (CRemove _ precondition, StagedRemoval prepared)
     | not (preparedChanged prepared) → withFresh $ \aid arena → commitAir aid arena precondition
     | otherwise → pure CommitWaiting
@@ -1302,6 +1307,28 @@ commitStaged svc st rid req sg = case (reqCmd req, stagedWork sg) of
             endpointSettle ep (Succeeded (AAttached (ArenaLease tag lid)))
             pure (CommitDone Nothing Nothing)
       -- A pending open is not visible until it has settled, and an absent name is absent.
+      _ → settleFailure NotFound
+    -- The destination lease is issued only while the source is still a live owner lease of a live arena (an expired grant is not_found),
+    -- and is never an owner lease, whoever asks: releasing it ends its client's interest only.
+    commitAttachFrom source cid = case Map.lookup source (stateLeases st) of
+      Just ls
+        | leaseLive ls
+        , leaseOwner ls
+        , Just _ <- Map.lookup (leaseArena ls) (stateArenas st)
+        , Map.member cid (stateClients st)
+        , stateNextLease st /= maxBound → do
+            let lid = stateNextLease st
+                aid = leaseArena ls
+            modifySt svc $ \s →
+              s
+                { stateNextLease = lid + 1
+                , stateLeases = Map.insert lid (LeaseRec cid aid False True) (stateLeases s)
+                , stateClients = Map.adjust (\c → c {clientLeases = Set.insert lid (clientLeases c)}) cid (stateClients s)
+                , stateArenas = Map.adjust (\a → a {arenaLeases = Set.insert lid (arenaLeases a)}) aid (stateArenas s)
+                , stateRequests = Map.delete rid (stateRequests s)
+                }
+            endpointSettle ep (Succeeded (AAttached (ArenaLease tag lid)))
+            pure (CommitDone Nothing Nothing)
       _ → settleFailure NotFound
     settleFailure failure = do
       terminateWith False svc rid (Failed failure)

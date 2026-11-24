@@ -687,6 +687,12 @@ data TerrainServices = TerrainServices
   , tsOpenStart ∷ Text → Text → Text → TerrainDefinition → Maybe Int64 → RequestContext → IO TerrainStart
   , tsAttachCheck ∷ Text → Text → Text → ArgumentCheck
   , tsAttachStart ∷ Text → Text → Text → RequestContext → IO TerrainStart
+  , tsAttachHostCheck ∷ Text → Text → ArgumentCheck
+  -- ^ Instance, root: whether the attachment to the arena the host published is refused for good (an ended owner, a closed service).
+  -- Whether anything is published to the root is not a refusal: it settles @not_found@.
+  , tsAttachHostStart ∷ Text → Text → RequestContext → IO TerrainStart
+  -- ^ Instance, root: request this instance's own attachment to the arena the host published to the root, issued by the service from the
+  -- host's creator lease at the point the lease is made. Nothing published to the root, or a grant that has expired, settles @not_found@.
   , tsCellCheck ∷ Text → Word64 → TerrainCell → ArgumentCheck
   -- ^ Instance, arena handle key, cell: whether the handle is refused (another instance's, of another kind, forged, or the
   -- caller's own already released): the text of an ordinary error, before any provider is asked. A lease whose arena was

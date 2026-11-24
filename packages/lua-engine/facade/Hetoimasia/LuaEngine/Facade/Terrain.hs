@@ -278,7 +278,7 @@ decodeSurface = \case
 
 -- The bindings ------------------------------------------------------------------------------------------
 
--- | The bindings of the hidden namespace, in their own spellings: @terrain_open@, @terrain_attach@, @terrain_cell@,
+-- | The bindings of the hidden namespace, in their own spellings: @terrain_open@, @terrain_attach@, @terrain_attach_host@, @terrain_cell@,
 -- @terrain_column@, @terrain_surface@, @terrain_remove@ and @terrain_release@. The initial chunk wraps each in the facade's
 -- own closure. The services' own extra bindings (a test fixture's) follow.
 terrainBindings ∷ Facade → TerrainServices → [Binding]
@@ -287,6 +287,8 @@ terrainBindings facade services =
       asynchronousNativeRequestIn "terrain_open" [SText, definitionSchema, SOptional openOptionsSchema] (m1StartSchemas terrainArenaRequestType) openAct
   , withArgumentCheck attachCheck $
       asynchronousNativeRequestIn "terrain_attach" [SText] (m1StartSchemas terrainArenaRequestType) attachAct
+  , withArgumentCheck attachHostCheck $
+      asynchronousNativeRequestIn "terrain_attach_host" [] (m1StartSchemas terrainArenaRequestType) attachHostAct
   , withArgumentCheck cellCheck $
       asynchronousNativeRequestIn "terrain_cell" [arena, cellSchema] (m1StartSchemas terrainCellRequestType) cellAct
   , withArgumentCheck columnCheck $
@@ -371,6 +373,13 @@ terrainBindings facade services =
       _ → Left "an arena name is required"
     attachCheck = checked "a terrain attach" attachTarget $ \caller name → tsAttachCheck services (identityOf caller) (rootOf caller) name
     attachAct = starting "a terrain attach" terrainArenaRequestType attachTarget $ \caller name → tsAttachStart services (identityOf caller) (rootOf caller) name
+
+    -- attach_host -----------------------------------------------------------------------------------------
+    attachHostTarget = \case
+      [] → Right ()
+      _ → Left "attach_host takes no arguments"
+    attachHostCheck = checked "a terrain host attach" attachHostTarget $ \caller () → tsAttachHostCheck services (identityOf caller) (rootOf caller)
+    attachHostAct = starting "a terrain host attach" terrainArenaRequestType attachHostTarget $ \caller () → tsAttachHostStart services (identityOf caller) (rootOf caller)
 
     -- cell, column and surface ----------------------------------------------------------------------------
     cellTarget = \case

@@ -266,6 +266,7 @@ library terrain
         containers >=0.8 && <0.9,
         stm >=2.5.3 && <2.6,
         text >=2.1 && <2.2,
+        hetoimasia-content ==0.1.0.0,
         hetoimasia-foundation ==0.1.0.0,
         hetoimasia-lua-engine ==0.1.0.0,
         hetoimasia-lua-engine:facade,
@@ -485,6 +486,7 @@ test-suite lua-engine-tests
         Test.LuaEngine.Terrain.Composition
         Test.LuaEngine.Terrain.Domain
         Test.LuaEngine.Terrain.Fixture
+        Test.LuaEngine.Terrain.HostPublished
         Test.LuaEngine.Terrain.Isolation
         Test.LuaEngine.Terrain.Limits
         Test.LuaEngine.Terrain.Matrix
