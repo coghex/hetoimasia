@@ -133,6 +133,8 @@ engineChunk graphics input terrain limit = Text.encodeUtf8 (Text.unlines (prelud
           , "local terrain_status_ops = { ready = E.ready_terrain_status, take = E.take_terrain_status, cancel = E.cancel_terrain_status, wait = E.wait_terrain_status }"
           , "local terrain_grow_ops = { ready = E.ready_terrain_grow, take = E.take_terrain_grow, cancel = E.cancel_terrain_grow, wait = E.wait_terrain_grow }"
           , "local terrain_retry_ops = { ready = E.ready_terrain_retry, take = E.take_terrain_retry, cancel = E.cancel_terrain_retry, wait = E.wait_terrain_retry }"
+          , "local terrain_region = E.terrain_region"
+          , "local terrain_region_ops = { ready = E.ready_terrain_region, take = E.take_terrain_region, cancel = E.cancel_terrain_region, wait = E.wait_terrain_region }"
           ]
       | otherwise = []
     terrainMembers ∷ [Text]
@@ -160,6 +162,7 @@ engineChunk graphics input terrain limit = Text.encodeUtf8 (Text.unlines (prelud
           , "      status = starter1(terrain_status, terrain_status_ops),"
           , "      grow_storage = starter1(terrain_grow_storage, terrain_grow_ops),"
           , "      retry_storage = starter1(terrain_retry_storage, terrain_retry_ops),"
+          , "      region = starter1(terrain_region, terrain_region_ops),"
           , "      release = guard(terrain_release),"
           , "    },"
           ]

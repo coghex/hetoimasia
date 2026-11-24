@@ -64,6 +64,7 @@ module Hetoimasia.LuaEngine.Facade.Types
   , TerrainStart (..)
   , TerrainCell (..)
   , TerrainColumnAsk (..)
+  , TerrainRegion (..)
   , TerrainDefinition (..)
   , TerrainLayer (..)
   , TerrainPatch (..)
@@ -78,6 +79,7 @@ module Hetoimasia.LuaEngine.Facade.Types
   , terrainStatusRequestType
   , terrainGrowRequestType
   , terrainRetryRequestType
+  , terrainRegionRequestType
   , terrainArenaValueSchema
   , terrainCellValueSchema
   , terrainColumnValueSchema
@@ -86,6 +88,8 @@ module Hetoimasia.LuaEngine.Facade.Types
   , terrainStatusValueSchema
   , terrainGrowValueSchema
   , terrainRetryValueSchema
+  , terrainRegionValueSchema
+  , terrainRegionCells
   , terrainStorageMinimum
   , terrainStorageUnit
   , terrainNameLimit
@@ -93,6 +97,10 @@ module Hetoimasia.LuaEngine.Facade.Types
   , terrainCellLow
   , terrainCellHigh
   , terrainEndpointHigh
+  , terrainRegionColumnsLow
+  , terrainRegionColumnsHigh
+  , terrainRegionLevelsLow
+  , terrainRegionLevelsHigh
     -- * Injected input
   , graphicsInputResetType
   , InputServices (..)
@@ -492,6 +500,10 @@ terrainStatusRequestType = "terrain_status_request"
 terrainGrowRequestType = "terrain_grow_request"
 terrainRetryRequestType = "terrain_retry_request"
 
+-- | The request handle type of a regional read (@api.terrain.region@).
+terrainRegionRequestType ∷ Text
+terrainRegionRequestType = "terrain_region_request"
+
 -- | What @take@ hands as the success value of an open or an attach: the arena handle itself.
 terrainArenaValueSchema ∷ Schema
 terrainArenaValueSchema = SCapability terrainArenaType
@@ -564,6 +576,28 @@ terrainRetryValueSchema =
     , ("discovery", SRecord [("state", SText)])
     ]
 
+-- | What a regional read is (@api.terrain.region@): the content and knowledge revisions of the one committed version the copy was
+-- read from, and the terrain and the knowledge of its one 16 × 16 × 32 region, each part available or not on its own.
+-- @{content_revision = INTEGER, knowledge_revision = INTEGER, terrain = PART, knowledge = PART}@, where a part is
+-- @{state = "ready", cells = LIST}@ or @{state = "unavailable"}@. A list has 'terrainRegionCells' entries, in the order
+-- @1 + x + 16 * y + 256 * z@ of the zero-based local coordinates. A terrain cell is the stock cell without its revision,
+-- @{air = BOOLEAN, material = TEXT?, shape = INTEGER?}@ (the material and shape present exactly when @air@ is false); a
+-- knowledge cell is @{solid = KNOWN, void = KNOWN}@ with each of the two @"none"@, @"known"@ or @"unknown"@.
+terrainRegionValueSchema ∷ Schema
+terrainRegionValueSchema =
+  SRecord
+    [ ("content_revision", SInteger)
+    , ("knowledge_revision", SInteger)
+    , ("terrain", part (SRecord [("air", SBoolean), ("material", SOptional SText), ("shape", SOptional SInteger)]))
+    , ("knowledge", part (SRecord [("solid", SText), ("void", SText)]))
+    ]
+  where
+    part cell = SRecord [("state", SText), ("cells", SOptional (SList cell))]
+
+-- | The cells of one region: 16 columns on X, 16 on Y and 32 levels on Z.
+terrainRegionCells ∷ Int
+terrainRegionCells = 16 * 16 * 32
+
 -- | The smallest arena allowance a script may name (64 MiB), and the unit every allowance is a whole number of (1 MiB).
 terrainStorageMinimum, terrainStorageUnit ∷ Int64
 terrainStorageMinimum = 64 * 1024 * 1024
@@ -584,6 +618,13 @@ terrainCellLow = negate (2 ^ (62 ∷ Int))
 terrainCellHigh = 2 ^ (62 ∷ Int) - 1
 terrainEndpointHigh = 2 ^ (62 ∷ Int)
 
+-- | The lowest and highest region index on the horizontal axes (16 cells) and on Z (32 levels) whose every cell is supported.
+terrainRegionColumnsLow, terrainRegionColumnsHigh, terrainRegionLevelsLow, terrainRegionLevelsHigh ∷ Int64
+terrainRegionColumnsLow = terrainCellLow `div` 16
+terrainRegionColumnsHigh = terrainCellHigh `div` 16
+terrainRegionLevelsLow = terrainCellLow `div` 32
+terrainRegionLevelsHigh = terrainCellHigh `div` 32
+
 -- | A cell coordinate, as the facade read it: three checked Lua integers within @[-2^62, 2^62 - 1]@.
 data TerrainCell = TerrainCell !Int64 !Int64 !Int64
   deriving (Eq, Show)
@@ -591,6 +632,11 @@ data TerrainCell = TerrainCell !Int64 !Int64 !Int64
 -- | A column request: the column and the half-open range of levels @[z_min, z_max)@, the range checked to be a valid interval
 -- and the corners within the supported bounds. The range's length is the service's to bound (8,192 levels).
 data TerrainColumnAsk = TerrainColumnAsk !Int64 !Int64 !Int64 !Int64
+  deriving (Eq, Show)
+
+-- | A region request: the region's indices on each axis (a region is 16 × 16 × 32 cells), every one of whose cells is a
+-- supported cell coordinate.
+data TerrainRegion = TerrainRegion !Int64 !Int64 !Int64
   deriving (Eq, Show)
 
 -- | What a copied definition is, after the facade's decode checks: nothing about overlap, order or whether a material is
@@ -710,6 +756,11 @@ data TerrainServices = TerrainServices
   , tsRetryCheck ∷ Text → Word64 → ArgumentCheck
   -- ^ Instance, arena handle key: whether the retry is refused (not the caller's creator lease).
   , tsRetryStart ∷ Text → Word64 → RequestContext → IO TerrainStart
+  , tsRegionCheck ∷ Text → Word64 → TerrainRegion → ArgumentCheck
+  -- ^ Instance, arena handle key, region indices: whether the read is refused for good (the handle is not one of the caller's own
+  -- live leases, creator or attachment; a service whose extent is smaller than a region or whose hold admits none; a worst-case
+  -- reply the VM's value limits could never carry), as an ordinary error before any bank is asked. Nothing is reserved.
+  , tsRegionStart ∷ Text → Word64 → TerrainRegion → RequestContext → IO TerrainStart
   , tsReleaseCheck ∷ Text → Word64 → IO (Maybe Text)
   -- ^ Whether this instance may release this arena handle: refused before any provider is asked for a handle another instance
   -- was issued (alive, retiring or completely retired) and a lease of another kind. A lease of the calling instance that has

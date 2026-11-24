@@ -86,6 +86,7 @@ import Hetoimasia.LuaEngine.Facade
   , TerrainColumnAsk (..)
   , TerrainDefinition (..)
   , TerrainInjection (..)
+  , TerrainRegion (..)
   , TerrainLayer (..)
   , TerrainPatch (..)
   , TerrainPatchValue (..)
@@ -96,6 +97,8 @@ import Hetoimasia.LuaEngine.Facade
   , terrainCellValueSchema
   , terrainColumnValueSchema
   , terrainPickType
+  , terrainRegionCells
+  , terrainRegionValueSchema
   , terrainRemoveValueSchema
   , terrainRetryValueSchema
   , terrainGrowValueSchema
@@ -136,9 +139,11 @@ import Hetoimasia.Scripting.Lua.Provider
 import Hetoimasia.Scripting.Lua.Registration (ArgumentCheck, Binding, RequestContext, capabilityType)
 import Hetoimasia.Scripting.Lua.Value (Schema (SNil), Value (..), capability)
 import Hetoimasia.Terrain.Cell (Cell (..), Column, IntervalError, MaterialId, ZRange, materialIdString, maxMaterialIdBytes, mkColumn, mkZRange, zRangeHi, zRangeLo)
-import Hetoimasia.Terrain.Coordinate (TileCoord, axisValue, decomposeTile, localX, localY, localZ, regionLevels, tileCoord)
-import Hetoimasia.Terrain.Query (Occupied (..), QueryLimits (..), Run (..), defaultQueryLimits)
-import Hetoimasia.Terrain.Residency (Revision (..), limitExtent, limitQueryRegions)
+import Hetoimasia.Terrain.Changes (ChangeLimits (..), changesFromIntervals)
+import Hetoimasia.Terrain.Coordinate (RegionCoord (..), TileCoord, axisValue, composeTile, decomposeTile, localX, localY, localZ, mkLocalCoord, regionLevels, tileCoord)
+import Hetoimasia.Terrain.Discovery (CellKnowledge (..), SolidKnowledge (..), VoidKnowledge (..), regionKnowledgeAt)
+import Hetoimasia.Terrain.Query (Occupied (..), QueryLimits (..), Run (..), cellAt, defaultQueryLimits)
+import Hetoimasia.Terrain.Residency (Revision (..), limitExtent, limitHoldRegions, limitQueryRegions)
 import Hetoimasia.LuaEngine.Terrain.Internal.Arbitration
   ( ArbitrationHooks (..)
   , Claim (..)
@@ -167,18 +172,30 @@ import Hetoimasia.Terrain.Runtime
   , Precondition (..)
   , RemoveAnswer (..)
   , Refused (..)
+  , RegionBorrow
+  , RegionPart (..)
+  , RegionSnapshot
   , Request
   , Service
   , Settlement (..)
   , SurfaceAnswer (..)
   , endClient
   , inspectConfig
+  , regionBorrowSnapshot
+  , regionKnowledge
+  , regionSnapshotContentRevision
+  , regionSnapshotKnowledgeRevision
+  , regionSnapshotRegions
+  , regionSnapshotSource
+  , regionTerrain
   , registerClient
+  , releaseRegionBorrowSTM
   )
 import qualified Hetoimasia.Terrain.Runtime as Terrain
 import Hetoimasia.Terrain.Runtime.Settlement
   ( Endpoint (..)
   , PreparedSettlement (..)
+  , TakeOutcome (..)
   , attachArenaWith
   , cancel
   , cellWith
@@ -188,8 +205,10 @@ import Hetoimasia.Terrain.Runtime.Settlement
   , removeWith
   , retryWith
   , releaseArenaLeaseSTM
+  , regionsWith
   , retireSTM
   , surfaceWith
+  , takeSTM
   )
 import Hetoimasia.Terrain.Shape (shapeIdValue)
 import Hetoimasia.Terrain.Source (CellSpec (..), LayerSpec (..), PatchSpec (..), SourceLimits (..), SourceSpec (..), defaultSourceLimits)
@@ -372,7 +391,7 @@ terrainCodes =
 -- the pages it reads; a removal meets every pause (and settles at once with it while the arena holds); a growth meets its
 -- reservation's refusals, an I/O failure (its allocation, or the release of an earlier extra) and a smaller size; a retry meets the
 -- I/O failure of an extra's release (its probes' failures are recorded as pauses, never its settlement). An attach meets none, and a
--- status, which the adapter settles itself, only its arena's closure. A storage code an endpoint does not declare is a defect there.
+-- status, which the adapter settles itself, only its arena's closure, and a regional read the same. A storage code an endpoint does not declare is a defect there.
 terrainCodesFor ∷ Text → [Text]
 terrainCodesFor name
   | name == openName = base <> ["source_complexity", "storage_unsupported", "reservation_failed", "storage_io"]
@@ -382,6 +401,9 @@ terrainCodesFor name
   | name == statusName = ["arena_closed"]
   | name == growName = ["arena_closed", "storage_unsupported", "reservation_failed", "storage_io", "storage_size_not_increased"]
   | name == retryName = ["arena_closed", "storage_io"]
+  -- A regional read has one expected failure. A page that fails or reads back invalid during the build is not a failure of the request: it
+  -- settles with the affected part unavailable, so no storage code is declared.
+  | name == regionName = ["arena_closed"]
   | otherwise = []
   where
     base = take 7 terrainCodes
@@ -464,6 +486,9 @@ data Link = Link
   , lkArena ∷ !(Maybe ArenaLease)
   -- ^ The creator lease a growth or a retry names: its success reports the arena's storage state as its commit left it, read in the
   -- transaction that settles it.
+  , lkRequest ∷ !(TVar (Maybe Request))
+  -- ^ The service's request, once the hand-off has recorded it: a regional read takes its borrow in the transaction that settles it, which
+  -- needs the request, so such a request is not eligible before this is known.
   }
 
 -- The per-VM state ----------------------------------------------------------------------------------------
@@ -480,6 +505,8 @@ data Ask
     AskStatus !ArenaLease
   | AskGrow !ArenaLease !Integer
   | AskRetry !ArenaLease
+  | -- | One whole region's terrain and knowledge, copied from the one version the service's build pinned.
+    AskRegion !ArenaLease !RegionCoord
 
 -- | An instance's two terrain clients. The service makes the lease of an attach by the arena's own creator an /owner/ lease, but
 -- an attach always yields a nonowner attachment (the lease of the open is the arena's only owner lease, and releasing it closes
@@ -617,6 +644,17 @@ services env =
           , m1ReplyCheck (tvRequests (envVm env)) retryAsk terrainRetryValueSchema (largestReply env LargestRetry) owner values
           ]
     , tsRetryStart = \_ key context → withArena env key $ \lease → start env context retryName retryAsk (AskRetry lease)
+    , tsRegionCheck = \identity key _ owner values →
+        firstRefusal
+          [ leaseCheck env identity key regionAsk owner values
+          , pure (regionRefusal env)
+          , m1ReplyCheck (tvRequests (envVm env)) regionAsk terrainRegionValueSchema (largestReply env LargestRegion) owner values
+          ]
+    , tsRegionStart = \_ key (TerrainRegion x y z) context → withArena env key $ \lease →
+        let region = RegionCoord x y z
+         in if wholeRegionSupported region
+              then start env context regionName regionAsk (AskRegion lease region)
+              else pure (TerrainRefused "the region is outside the supported range")
     , tsReleaseCheck = releaseCheck env
     , tsRelease = \key → releaseWord <$> releaseLease leases key
     , tsIssued = \identity key → atomically (modifyTVar' (envIssued env) (Map.insertWith Set.union identity (Set.singleton key)))
@@ -640,6 +678,7 @@ services env =
       , endpoint env statusName terrainStatusValueSchema
       , endpoint env growName terrainGrowValueSchema
       , endpoint env retryName terrainRetryValueSchema
+      , endpoint env regionName terrainRegionValueSchema
       ]
     releaseWord = \case
       Released → "done"
@@ -647,7 +686,7 @@ services env =
       AlreadyReleased → "already_released"
 
 -- | The endpoint names of the requests.
-openName, attachName, cellName, columnName, surfaceName, removeName, statusName, growName, retryName ∷ Text
+openName, attachName, cellName, columnName, surfaceName, removeName, statusName, growName, retryName, regionName ∷ Text
 openName = "terrain_open"
 attachName = "terrain_attach"
 cellName = "terrain_cell"
@@ -657,6 +696,7 @@ removeName = "terrain_remove"
 statusName = "terrain_status"
 growName = "terrain_grow_storage"
 retryName = "terrain_retry_storage"
+regionName = "terrain_region"
 
 -- Declaring ---------------------------------------------------------------------------------------------------
 
@@ -722,7 +762,7 @@ drainRetired env = atomically (pruneClaims (names (envFacade env)) >> pruneFaile
 -- The asks ------------------------------------------------------------------------------------------------------
 
 -- | Each request's ask, declaring exactly the expected codes its endpoint can settle with ('terrainCodesFor').
-openAsk, attachAsk, readAsk, removeAsk, statusAsk, growAsk, retryAsk ∷ M1Ask
+openAsk, attachAsk, readAsk, removeAsk, statusAsk, growAsk, retryAsk, regionAsk ∷ M1Ask
 openAsk = leaseAsk "terrain open" (terrainCodesFor openName)
 attachAsk = leaseAsk "terrain attach" (terrainCodesFor attachName)
 readAsk = (m1Ask OptionalRequest "terrain read") {askCodes = terrainCodesFor cellName}
@@ -730,6 +770,7 @@ removeAsk = (m1Ask OptionalRequest "terrain removal") {askCodes = terrainCodesFo
 statusAsk = (m1Ask OptionalRequest "terrain status") {askCodes = terrainCodesFor statusName}
 growAsk = (m1Ask OptionalRequest "terrain storage growth") {askCodes = terrainCodesFor growName}
 retryAsk = (m1Ask OptionalRequest "terrain storage retry") {askCodes = terrainCodesFor retryName}
+regionAsk = (m1Ask OptionalRequest "terrain region read") {askCodes = terrainCodesFor regionName}
 
 leaseAsk ∷ Text → [Text] → M1Ask
 leaseAsk source codes =
@@ -745,7 +786,7 @@ firstRefusal = \case
   decide : more → decide >>= maybe (firstRefusal more) (pure . Just)
 
 -- | The shape of the largest answer a call can have.
-data Largest = LargestCell | LargestColumn !Int | LargestSurface | LargestRemove | LargestStatus | LargestGrow | LargestRetry
+data Largest = LargestCell | LargestColumn !Int | LargestSurface | LargestRemove | LargestStatus | LargestGrow | LargestRetry | LargestRegion
 
 -- | The levels a column ask spans.
 levelsOf ∷ TerrainColumnAsk → Int
@@ -777,6 +818,24 @@ rangeRefusal env ask
   | otherwise = Nothing
   where
     config = tfConfig (envFacade env)
+
+-- | The service's own permanent refusals of a regional set, decided from its configuration before any bank is asked, as 'extentRefusal'
+-- and 'rangeRefusal' decide theirs (so neither can read as busy behind a full bank): a copy covers whole regions, so a service whose
+-- extent is not a whole region refuses every one, and a service whose hold admits no region refuses every set.
+regionRefusal ∷ Env → Maybe Text
+regionRefusal env
+  | limitExtent limits /= (16, 16, 32) = Just "the service's extent is not a whole region: it copies none"
+  | limitHoldRegions limits < 1 = Just "the service's hold admits no region: it copies none"
+  | otherwise = Nothing
+  where
+    limits = configLimits (tfConfig (envFacade env))
+
+-- | Whether every cell of the region is a supported coordinate (the facade decoded the same indices; the service's admission decides it
+-- again).
+wholeRegionSupported ∷ RegionCoord → Bool
+wholeRegionSupported region = case (mkLocalCoord 0 0 0, mkLocalCoord 15 15 31) of
+  (Right low, Right high) → either (const False) (const True) (composeTile region low) && either (const False) (const True) (composeTile region high)
+  _ → False
 
 -- | What a cell asks of its region: its column's place and the levels it needs.
 cellPlaces ∷ TileCoord → [(Int, Int, Int)]
@@ -1127,12 +1186,65 @@ answerReply ceiling' = \case
   AGrown _ → ProviderFailure "terrain: a growth answer reached the value conversion without its arena's status"
   ARetried _ → ProviderFailure "terrain: a retry answer reached the value conversion without its arena's status"
   AKnowledge _ → ProviderFailure "terrain: a knowledge answer reached the value conversion (no Lua schema in this slice)"
-  ARegions _ → ProviderFailure "terrain: a regional snapshot reached the value conversion (no Lua schema in this slice)"
+  ARegions borrow → regionReply ceiling' (regionBorrowSnapshot borrow)
   AAttached _ → ProviderFailure "terrain: a lease answer reached the value conversion"
   where
     withRevision revision build = case revisionOf ceiling' revision of
       Just found → ProviderResult (build found)
       Nothing → ProviderFailure "terrain: a content revision is not a Lua integer"
+
+-- | A regional snapshot as the reply the host takes: a fresh record of the two revisions it was labelled with and its two parts, each
+-- ready with the dense cells of the region in the order @1 + x + 16 * y + 256 * z@, or unavailable. Nothing in it names the snapshot: every
+-- value is an integer, a boolean or a text made here. A revision that is not a Lua integer, or a snapshot that does not hold exactly one
+-- region, is a defect of the host, as for every other terrain answer.
+regionReply ∷ Word64 → RegionSnapshot → ProviderReply
+regionReply ceiling' snapshot = maybe (ProviderFailure "terrain: a regional snapshot is not one a script can be handed") ProviderResult $ do
+  region ← case regionSnapshotRegions snapshot of
+    [only] → Just only
+    _ → Nothing
+  content ← revisionOf ceiling' (regionSnapshotContentRevision snapshot)
+  knowledge ← revisionOf ceiling' (regionSnapshotKnowledgeRevision snapshot)
+  tiles ← traverse (\(x, y, z) → either (const Nothing) Just (mkLocalCoord x y z >>= composeTile region)) locals
+  terrain ← case regionTerrain snapshot region of
+    PartReady intervals → do
+      changes ← either (const Nothing) Just (changesFromIntervals (ChangeLimits maxBound) intervals)
+      Just (readyPart [VRecord (cellFields (cellAt (regionSnapshotSource snapshot) changes tile)) | tile ← tiles])
+    PartUnavailable → Just unavailablePart
+    PartNotHeld → Nothing
+  known ← case regionKnowledge snapshot region of
+    PartReady regional → case traverse (regionKnowledgeAt regional) tiles of
+      Just cells → Just (readyPart [VRecord [("solid", VText (solidText (cellSolid cell))), ("void", VText (voidText (cellVoid cell)))] | cell ← cells])
+      -- a cell the knowledge does not describe is never delivered in part: the part is as if it could not be read
+      Nothing → Just unavailablePart
+    PartUnavailable → Just unavailablePart
+    PartNotHeld → Nothing
+  Just (VRecord [("content_revision", VInteger content), ("knowledge_revision", VInteger knowledge), ("terrain", terrain), ("knowledge", known)])
+  where
+    -- the zero-based local coordinates in the order of the Lua index: x fastest, then y, then z
+    locals = [(x, y, z) | z ← [0 .. toInteger regionLevels - 1], y ← [0 .. 15], x ← [0 .. 15]]
+    readyPart cells = VRecord [("state", VText "ready"), ("cells", VList cells)]
+    unavailablePart = VRecord [("state", VText "unavailable")]
+    solidText = \case
+      NoSolid → "none"
+      SolidKnown → "known"
+      SolidUnknown → "unknown"
+    voidText = \case
+      NoVoidHere → "none"
+      VoidKnown → "known"
+      VoidUnknown → "unknown"
+
+-- | The settlement of a regional read, in the one transaction that commits it: the request's borrow is taken (it is still the request's
+-- here, and the copy was made under it), the reply the copy made is settled, and the borrow is released, so nothing of the snapshot is
+-- charged once the request is settled, whether or not the script ever takes the result. A borrow the service released before this take
+-- ('TakeReleased') is never read: the request settles as its arena's closure, once. The take needs the service's request; the request is
+-- not eligible before the hand-off has recorded it.
+settleRegion ∷ Env → Link → RegionBorrow → STM ReplyAnswer → STM ()
+settleRegion env link borrow settle = do
+  taken ← readTVar (lkRequest link) >>= maybe (pure TakeReleased) (takeSTM (service env))
+  case taken of
+    Taken → void settle >> releaseRegionBorrowSTM (service env) borrow
+    TakeReleased → void (settlingSettle (lkSettling link) (ProviderExpected closedFailure))
+  writeTVar (lkTerminal link) True
 
 -- The service's endpoint ------------------------------------------------------------------------------------------
 
@@ -1194,6 +1306,7 @@ submitToService env submission found settling = do
       <*> pure (pdDropped found)
       <*> newUnique
       <*> pure (case pdAsk found of AskGrow lease _ → Just lease; AskRetry lease → Just lease; _ → Nothing)
+      <*> pure (pdRequest found)
   noted ← newTVarIO False
   let -- What decides a commit, read in the transaction that makes it: the session still takes new work, the request is still
       -- waiting (and its tick granted, on logical time), and a read or removal does not need a revision no Lua integer holds.
@@ -1208,6 +1321,12 @@ submitToService env submission found settling = do
             -- a growth or a retry hands no revision to Lua
             AskGrow {} → pure True
             AskRetry {} → pure True
+            -- a regional read takes its borrow when it settles, and needs the service's request for it: the owner waits (it reads this
+            -- cell) until the hand-off has recorded it
+            AskRegion {} → do
+              known ← isJust <$> readTVar (pdRequest found)
+              representable ← fromMaybe False <$> representableNow
+              pure (known && representable)
             _ → fromMaybe False <$> representableNow
       -- Whether the revision this request will hand to Lua is one a Lua integer holds, from the arena as the service has it. A read hands
       -- the arena's revision; a removal hands the next one when it changes content and the same one when it removes air, which only the
@@ -1215,19 +1334,21 @@ submitToService env submission found settling = do
       representableNow ∷ STM (Maybe Bool)
       representableNow = do
         needs ← case pdAsk found of
-          AskCell lease _ → pure (Just (lease, 0))
-          AskColumn lease _ _ → pure (Just (lease, 0))
-          AskSurface lease _ → pure (Just (lease, 0))
+          AskCell lease _ → pure (Just (lease, 0, False))
+          AskColumn lease _ _ → pure (Just (lease, 0, False))
+          AskSurface lease _ → pure (Just (lease, 0, False))
+          -- a regional read hands both revisions of the version it pinned, neither above the arena's current ones
+          AskRegion lease _ → pure (Just (lease, 0, True))
           AskRemove lease _ _ →
             readTVar (pdRequest found) >>= \case
               Nothing → pure Nothing
-              Just request → fmap (\changes → (lease, if changes then 1 else 0)) <$> Terrain.stagedRemovalChanges (service env) request
+              Just request → fmap (\changes → (lease, if changes then 1 else 0, False)) <$> Terrain.stagedRemovalChanges (service env) request
           _ → pure Nothing
         case needs of
           Nothing → pure Nothing
-          Just (lease, advance) →
+          Just (lease, advance, knowledge) →
             Terrain.inspectArenaSTM (service env) lease >>= \case
-              Just view → pure (Just (not (Terrain.viewRevision view `exceeds` advance)))
+              Just view → pure (Just (not (Terrain.viewRevision view `exceeds` advance) && not (knowledge && Terrain.viewKnowledgeRevision view `exceeds` 0)))
               Nothing → pure (Just True)
       exceeds (Revision w) advance = w > min (tvIntegerCeiling (envVm env)) (fromIntegral (maxBound ∷ Int64)) - advance
       -- A revision that cannot be handed to Lua is the host's defect, and it is recorded where it is first known: when the service stages
@@ -1259,6 +1380,7 @@ submitToService env submission found settling = do
         AskRemove lease tile precondition → removeWith (service env) ep lease tile precondition
         AskGrow lease bytes → growWith (service env) ep lease bytes
         AskRetry lease → retryWith (service env) ep lease
+        AskRegion lease region → regionsWith (service env) ep lease [region]
         -- settled at the hand-off ('submitStatus'), never the service's
         AskStatus _ → throwIO (TerrainCompositionRefused "a status reached the service's admission")
       -- What follows the service's admission of a request: the host's record of it, and for an open the claim of its name, which is found
@@ -1317,6 +1439,7 @@ largestReply env = \case
           ]
       )
   LargestGrow → ProviderResult (VRecord [("changed", VBoolean True), ("reserved_bytes", greatest), ("storage", VRecord pausedFields)])
+  LargestRegion → largestRegionReply
   LargestRetry →
     ProviderResult
       ( VRecord
@@ -1335,6 +1458,21 @@ largestReply env = \case
     longest = VText (Text.replicate maxMaterialIdBytes "m")
     solid = [("air", VBoolean False), ("material", longest), ("shape", greatest)]
 
+-- | The largest regional read: every cell of both parts present at its widest (a solid of the longest material and the greatest shape,
+-- a known solid over an unknown void), and both revisions at the greatest integer. It depends on no configuration, so it is built once.
+largestRegionReply ∷ ProviderReply
+largestRegionReply =
+  ProviderResult
+    ( VRecord
+        [ ("content_revision", VInteger maxBound)
+        , ("knowledge_revision", VInteger maxBound)
+        , ("terrain", readyPart (VRecord [("air", VBoolean False), ("material", VText (Text.replicate maxMaterialIdBytes "m")), ("shape", VInteger maxBound)]))
+        , ("knowledge", readyPart (VRecord [("solid", VText "unknown"), ("void", VText "unknown")]))
+        ]
+    )
+  where
+    readyPart cell = VRecord [("state", VText "ready"), ("cells", VList (replicate terrainRegionCells cell))]
+
 -- | The largest answer of a request the host was handed, for the hand-off's own judgement (the check before the banks decided the same
 -- thing already; this is the belt to that brace).
 worstReply ∷ Env → Ask → Maybe ProviderReply
@@ -1346,6 +1484,7 @@ worstReply env = \case
   AskStatus {} → Just (largestReply env LargestStatus)
   AskGrow {} → Just (largestReply env LargestGrow)
   AskRetry {} → Just (largestReply env LargestRetry)
+  AskRegion {} → Just (largestReply env LargestRegion)
   _ → Nothing
 
 -- | The host has settled the request without the service's telling, and the offered lease (if any) was not adopted.
@@ -1390,6 +1529,12 @@ prepareInto env link answer = case answer of
   ACell _ → prepared
   AColumn _ → prepared
   ASurface _ → prepared
+  -- THE COPY OF A REGION IS MADE HERE, outside every transaction and on the thread of the service's owner that stages the answer (never a
+  -- Lua thread, and no pool of its own): the request still owns the borrow, which the snapshot is charged under until the transaction that
+  -- settles it takes it and releases it ('settleRegion'), so the copy is complete before the borrow ends and nothing of it names the
+  -- snapshot.
+  ARegions borrow → PreparedSettlement (settlingPrepare (lkSettling link) (regionReply (tvIntegerCeiling (envVm env)) (regionBorrowSnapshot borrow))) $ \reply →
+    settleRegion env link borrow (settlePrepared reply)
   _ → PreparedSettlement () (\() → settleInto env link (Succeeded answer))
   where
     prepared = PreparedSettlement (settlingPrepare (lkSettling link) (answerReply (tvIntegerCeiling (envVm env)) answer)) $ \reply →
@@ -1425,6 +1570,7 @@ settleInto env link = \case
           _ ← settlingSettle (lkSettling link) (failureReply NotFound)
           writeTVar (lkTerminal link) True
         else offer lease
+    ARegions borrow → settleRegion env link borrow (settlingSettle (lkSettling link) (regionReply ceiling' (regionBorrowSnapshot borrow)))
     AGrown grown → creatorSettled (\status → growReply ceiling' grown status)
     ARetried retried → creatorSettled (\status → retryReply ceiling' retried status)
     other → do
