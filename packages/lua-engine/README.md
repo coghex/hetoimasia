@@ -1513,8 +1513,12 @@ preparation (`endpointPrepare`), outside every transaction and while the request
 new pool. The transaction that commits the request then takes the borrow (`takeSTM`), settles the copy and releases the borrow
 (`releaseRegionBorrowSTM`), so its charge is back before Lua takes the result, and an untaken result holds nothing of the snapshot. A
 borrow the service released before that take (`TakeReleased`) is never read or partly delivered: the request settles `arena_closed`. The
-take needs the service's request, which the hand-off records after admission, so the request is not eligible before it is recorded. A
-completed copy is plain data: it stays coherent through later edits and the arena's closure.
+take needs the service's request, which the hand-off records after admission, so the request is not eligible before it is recorded.
+Nothing else gates its commit: the revisions of the copy are the pinned snapshot's, judged in its reply (one that is not a Lua integer is
+the host defect every terrain answer has), never the live arena's, so an arena that moved on after the copy was staged does not keep it
+from settling. A request that ends while its build or delivery runs leaves its borrow with the service until the owner's safe point
+(`borrowHeldSTM`): the request's places are not returned, and its work is not reported over, before that release. A completed copy is plain
+data: it stays coherent through later edits and the arena's closure.
 
 **The commit point.** The service's `Endpoint` is attached to the host's `Settling` seam: the service reads the request's
 eligibility, commits the edit and delivers the settlement in one transaction that also decides cancellation, the parent session's
