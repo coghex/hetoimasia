@@ -84,6 +84,7 @@ import Hetoimasia.Scripting.Lua.Request (requestHandleValue, startRequest)
 import Hetoimasia.Scripting.Lua.Runtime (LuaRuntime)
 import Hetoimasia.Scripting.Lua.Scheduled hiding (Policy (..))
 import Hetoimasia.Scripting.Lua.Value
+import System.IO.Unsafe (unsafePerformIO)
 import Test.LuaRuntime.Instance.Support
 import Test.LuaRuntime.Request.Support
 import Test.LuaRuntime.Scheduled.Support (SFixture (sfLog), defaultSchedulerBounds, schedRegistration, startScheduled)
@@ -107,13 +108,16 @@ data Policy = Policy
     -- ^ How the value a script is handed for an adopted resource holds its lease's handle.
   , polReplyBytes ∷ !Int
     -- ^ The bytes a reply's record may take beside the owner's limits.
+  , polFramed ∷ !(IO ())
+    -- ^ Run each time the admission's success frame is applied to a value, which is a step of judging a reply: the way an example sees
+    -- that, and in which context, a reply was judged. Never part of a transaction's state, so a transaction that re-runs cannot change it.
   }
 
 -- | A required request with the failure codes @not_found@ and @io_error@, no credit and no
 -- lease, four per instance and eight per VM, and the numeric ceiling of the profile.
 defaultPolicy ∷ Policy
 defaultPolicy =
-  Policy RequiredRequest ["not_found", "io_error"] [] Nothing 4 8 9223372036854775807 "example" Nothing (Just (\value key → VRecord [("v", value), ("lease", VCapability (capability "res" key))])) 65536
+  Policy RequiredRequest ["not_found", "io_error"] [] Nothing 4 8 9223372036854775807 "example" Nothing (Just (\value key → VRecord [("v", value), ("lease", VCapability (capability "res" key))])) 65536 (pure ())
 
 -- | The instance fixture, the handles the owner leases and answers liveness through, the fake
 -- provider and the policy.
@@ -247,12 +251,18 @@ admissionOf fixture offset = do
       , admitCredits = polCredits policy
       , admitLease = polLease policy
       , admitCombine = polCombine policy
-      , admitSuccessFrame = \value → [("status", VText "success"), ("value", value)]
+      , admitSuccessFrame = framed (polFramed policy)
       , admitFailureFrame = \found →
           [ ("status", VText "failure")
           , ("error", VRecord ([("code", VText (expectedCode found)), ("message", VText (expectedMessage found))] <> [("root", VText r) | Just r ← [expectedRoot found]] <> [("path", VText p) | Just p ← [expectedPath found]]))
           ]
       }
+
+-- | The record a script is handed for a success of the value, which runs this first each time it is applied. NOINLINE, and dependent on the
+-- value, so that each application is its own run.
+{-# NOINLINE framed #-}
+framed ∷ IO () → Value → [(Text, Value)]
+framed noting value = unsafePerformIO (noting >> pure [("status", VText "success"), ("value", value)])
 
 -- | The offset a start's third argument carries.
 offsetOf ∷ [Value] → Maybe Int
