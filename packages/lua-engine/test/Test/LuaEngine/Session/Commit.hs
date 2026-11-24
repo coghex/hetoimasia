@@ -334,7 +334,13 @@ facts = describe "the facts a commit carries" $ do
             awaitPoint recorder (Resumed (InstanceKey Presentation 0))
             pumpUntil world (elem "init presentation" <$> outLines world)
             awaitRegistration world 1000000
-            passTime world 1000000000 (maybe False roleFailed . presentationOf <$> statusNow session)
+            -- the refresh failed, and the failed instance's own @shutdown@ has run: it begins a segment, which reads the clock, on the
+            -- presentation owner's thread, and that thread is not told by the failure. Waiting for the line it prints is what puts
+            -- the break after that reading, so the only readings that fail are the ones of the teardown this example is about
+            passTime world 1000000000 $ do
+              failed ← maybe False roleFailed . presentationOf <$> statusNow session
+              ended ← elem "shutdown presentation failed" <$> outLines world
+              pure (failed && ended)
             -- from here every reading of the clock fails, while the session is torn down
             atomically (writeTVar broken True)
             throwTo self ThreadKilled

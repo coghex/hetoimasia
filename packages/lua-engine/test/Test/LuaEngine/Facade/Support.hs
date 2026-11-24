@@ -50,6 +50,7 @@ module Test.LuaEngine.Facade.Support
   , liveTimers
   , liveRegistrations
   , awaitTimers
+  , awaitTimerOf
   , armedTimers
   , awaitArmed
   , awaitWaiting
@@ -511,6 +512,13 @@ awaitTimers world wanted = bounded loop
     loop = do
       live ← liveTimers world
       if live >= wanted then pure () else yield >> loop
+
+-- | Block, in STM, until a registration armed for this many microseconds is live: an owner has placed the deadline it waits for, from
+-- its reading of the clock, and armed its timer for it.
+awaitTimerOf ∷ World → Int → IO ()
+awaitTimerOf world microseconds = bounded . atomically $ do
+  live ← liveList (wTimer world)
+  when (all ((/= microseconds) . regMicros) live) retry
 
 -- | How many registrations the owner has armed in all.
 armedTimers ∷ World → IO Int

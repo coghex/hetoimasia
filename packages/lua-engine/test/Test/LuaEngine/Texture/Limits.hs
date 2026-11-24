@@ -5,7 +5,7 @@
 -- made before anything is read, and concurrent admissions that cannot take capacity from one another.
 module Test.LuaEngine.Texture.Limits (spec) where
 
-import Control.Exception (ExceptionWithContext (ExceptionWithContext), throwIO)
+import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, rethrowIO, throwIO, tryWithContext)
 import Control.Monad (forM_, void, when)
 import Data.Text (Text)
 import Data.Word (Word64)
@@ -367,9 +367,12 @@ refusals = describe "permanent refusals" $ do
       -- Nothing stays reserved anywhere: the admission was taken back whole.
       ownerNow vm "i" >>= (`shouldBe` OwnerReading 0 0)
       sessionNow session `shouldReturn` 0
+      -- The credits are back (above) before the request's prepared entry is dropped: the start call drops it as the failure leaves it,
+      -- on the owner's thread, and the owner's failure is told only after that. The failure is taken here, as a value, so that the
+      -- pipeline is read once the hand-over has finished, and raised again at the end
+      ended ← tryWithContext @SomeException (awaitEnd control vm)
       pipelineNow session >>= \reading → (readingReserved reading, readingJobs reading, readingPrepared reading) `shouldBe` (0, 0, 0)
       statusReserved <$> poolReading session `shouldReturn` 0
       readsStarted (ssProbe session) `shouldReturn` 0
-      _ ← awaitEnd control vm
-      pure ()
+      either rethrowIO (const (pure ())) ended
     show failure `shouldSatisfy` Text.isInfixOf "the provider refused the hand-over" . Text.pack
