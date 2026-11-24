@@ -676,9 +676,11 @@ explainSteps world = do
       )
 
 -- | Fire the live registrations until the condition holds. Firing is idempotent for the owner, which
--- looks at its clock at each wake, so how often it happens is not what an example depends on.
+-- looks at its clock at each wake, so how often it happens is not what an example depends on. It never moves a clock: an example
+-- that needs an update to be due advances it in the condition, or uses 'stepUntil'. When the bound ends it, it prints what the
+-- step prints ('explainSteps'), so the log names the state the wait stopped in.
 pumpUntil ∷ World → IO Bool → IO ()
-pumpUntil world condition = bounded loop
+pumpUntil world condition = bounded loop `onException` explainSteps world
   where
     loop = do
       done ← condition
