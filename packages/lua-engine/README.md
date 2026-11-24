@@ -1353,10 +1353,12 @@ module. Every call is a dot call with exactly its declared arguments; a request-
 | --- | --- |
 | `api.terrain.open(name, definition [, options])` | request a session- and content-root-local named arena. The result is this instance's **owner** lease, the arena's only owner lease, settled only after the source is prepared, its file reserved and its first roots written. `options` is omitted, `nil` or a record whose only field is an optional `storage_bytes`: the arena's allowance (see [storage](#storage-status-growth-and-recovery-tra-23)) |
 | `api.terrain.attach(name)` | request this instance's **attachment** lease to an existing arena of the same session and content root, including when the instance is the creator. A missing arena and a pending open answer `not_found`, without waiting |
+| `api.terrain.attach_host()` | request this instance's **attachment** lease to the one arena the host published to this instance's content root ([the host's publication](#the-host-published-arena)). Takes no arguments. Nothing published to the root (including a session composed with the plain `terrainInjection`) and a grant that has expired settle `not_found`; an arena the host closed after the lease was issued and before it was published settles `arena_closed`. Either role; the success value is an ordinary arena handle |
 | `api.terrain.cell(arena, {x=, y=, z=})` | the content revision, and air or an authored material and shape |
 | `api.terrain.column(arena, {x=, y=, z_min=, z_max=})` | the complete coalesced runs, air included, of the half-open range `[z_min, z_max)` at one revision; more than 1,024 runs settles `too_large`, never a truncated answer |
 | `api.terrain.surface(arena, {x=, y=})` | the highest occupied cell after edits, explicitly absent for an empty column |
 | `api.terrain.remove(arena, {x=, y=, z=} [, pick])` | remove one whole cell, a buried cell or a slope included; air is a no-op; an optional `pick` carries displayed-snapshot consistency |
+| `api.terrain.region(arena, {x=, y=, z=})` | one 16 × 16 × 32 region, named by its region indices, copied whole: terrain and discovery at one pair of revisions (see [a regional read](#a-regional-read)) |
 | `api.terrain.status(arena)` | a bounded, copied, advisory snapshot of the arena's storage and discovery, through any of this instance's leases of it |
 | `api.terrain.grow_storage(arena, new_bytes)` | creator lease only: commit a larger allowance; the size already committed is an idempotent success, a smaller one settles `storage_size_not_increased`; never a shrink |
 | `api.terrain.retry_storage(arena)` | creator lease only: one explicit, bounded re-test of what paused the arena; a ready arena is an idempotent success |
@@ -1364,7 +1366,7 @@ module. Every call is a dot call with exactly its declared arguments; a request-
 
 **Results** (`api.request.take`, `{status = "success", value = V}`; a failure is `{status = "failure", error = {code, message}}`;
 the kinds are `terrain_arena`, `terrain_cell`, `terrain_column`, `terrain_surface`, `terrain_remove`, `terrain_status`,
-`terrain_grow` and `terrain_retry`, each with its own handle type, so `ready`, `take`, `cancel` and `wait` dispatch by kind as for every
+`terrain_grow`, `terrain_retry` and `terrain_region`, each with its own handle type, so `ready`, `take`, `cancel` and `wait` dispatch by kind as for every
 other request):
 
 | Kind | `value` |
@@ -1377,6 +1379,7 @@ other request):
 | status | `{storage = {state = "ready"\|"paused", reason = TEXT?, reserved_bytes = INT, used_bytes = INT, pending_reclaim_bytes = INT, pending_reserved_bytes = INT}, discovery = {state = "idle"\|"pending"\|"paused", pending_items = INT}, content_revision = INT, knowledge_revision = INT}` |
 | grow | `{changed = BOOL, reserved_bytes = INT, storage = {state = TEXT, reason = TEXT?}}` |
 | retry | `{changed = BOOL, cleared = {TEXT...}, remaining = {TEXT...}, until_closed = {TEXT...}, storage = {state = TEXT, reason = TEXT?}, discovery = {state = TEXT}}` |
+| region | `{content_revision = INT, knowledge_revision = INT, terrain = PART, knowledge = PART}`; a `PART` is `{state = "ready", cells = {...}}` or `{state = "unavailable"}` |
 
 Records are fresh copies; material identifiers are the authored text and shapes are the authored identities 0 to 15 (0 and 15
 distinct). A content revision that does not fit a Lua integer is a host defect, never a wrapped value.
@@ -1408,12 +1411,13 @@ with (`terrainCodesFor`); one it does not declare is a defect there:
 | Request | Storage codes it declares |
 | --- | --- |
 | open | `source_complexity`, `storage_unsupported`, `reservation_failed`, `storage_io` |
-| attach | none |
+| attach, attach_host | none |
 | cell, column, surface | `storage_io`, `storage_integrity` |
 | remove | `storage_full`, `storage_io`, `storage_integrity` |
 | status | none (its only expected failure is `arena_closed`) |
 | grow_storage | `storage_unsupported`, `reservation_failed`, `storage_io`, `storage_size_not_increased` (and `arena_closed`) |
 | retry_storage | `storage_io`, an earlier extra's failed release (and `arena_closed`) |
+| region | none (its only expected failure is `arena_closed`) |
 
 The seven earlier codes are declared as before by the calls that had them.
 Terrain requests are `OptionalRequest`s: these settle as structured results and do not fail the instance, read or unread. A lease
@@ -1479,13 +1483,46 @@ of each condition (a read again, a write by a probe it abandons) and clears, in 
 `remaining` and `until_closed` (conditions no retry can clear) list codes most severe first, and `changed` says whether it cleared
 anything. Growth clears only `storage_full`; neither repeats a failed removal, resets the arena or replays anything.
 
+#### A regional read
+
+`api.terrain.region(arena, {x = rx, y = ry, z = rz})`, in either role and through any of the caller's live leases, requests exactly one
+region by its region indices (a region is 16 × 16 × 32 cells; each index must name a region whose every cell is a supported
+coordinate). The reply is a fresh record from one native regional snapshot (`regionsWith`): `content_revision` and `knowledge_revision`
+are the two revisions of the one committed version the service's build pinned, and the only statement of which version the copy is. The
+copy is never recomputed or re-read at its logical position, so the call promises no order against another request of the same tick.
+`terrain` and `knowledge` are independent: each is `{state = "ready", cells = ...}` or `{state = "unavailable"}`, with no `cells`. A part is
+unavailable when a page its build needed failed or read back invalid; that is not a failure of the request, and the arena is paused for
+the cause as for any read. A ready unknown void is distinct from unavailable knowledge and from air.
+
+`cells` is a dense list of 8,192 entries; for zero-based local coordinates the Lua index is `1 + x + 16 * y + 256 * z`. A terrain cell is
+the stock cell without its revision, `{air = BOOL, material = TEXT?, shape = INT?}` (material and shape present exactly when `air` is
+false). A knowledge cell is exactly `{solid = K, void = K}` with `K` one of `"none"`, `"known"` or `"unknown"`
+(`NoSolid`/`SolidKnown`/`SolidUnknown`, `NoVoidHere`/`VoidKnown`/`VoidUnknown`). No other field is added: a worst-case region is
+57,355 of the fixed M1 profile's 65,536 elements, at depth 5 of 8 and about 1.5 MB of 16 MiB.
+
+| Condition | Outcome |
+| --- | --- |
+| An index outside the supported region indices, a malformed record, a foreign, forged, wrong-kind or released handle, a service whose extent is not a whole region or whose hold admits no region, a worst-case reply the VM's copied-value limits cannot carry | an ordinary error before any bank is asked: no request, place, lease or charge (the reply is judged by `m1ReplyCheck` as for every call, over the worst region) |
+| The request places, or the service's retained bank or hold records, are full | `nil, busy`; nothing is reserved |
+| The arena closed (the creator's final owner lease released, the service closed) before the copy settled | the request settles `arena_closed`, once |
+| The script cancels, releases the lease, or the instance ends | the request settles cancelled, once; the borrow is released |
+| A revision that is not a Lua integer | the host defect every terrain answer has |
+
+**The borrow.** The service owns the borrow from admission. The copy into Lua values is made by the service's owner in the settlement
+preparation (`endpointPrepare`), outside every transaction and while the request still owns the borrow; it is neither a Lua thread nor a
+new pool. The transaction that commits the request then takes the borrow (`takeSTM`), settles the copy and releases the borrow
+(`releaseRegionBorrowSTM`), so its charge is back before Lua takes the result, and an untaken result holds nothing of the snapshot. A
+borrow the service released before that take (`TakeReleased`) is never read or partly delivered: the request settles `arena_closed`. The
+take needs the service's request, which the hand-off records after admission, so the request is not eligible before it is recorded. A
+completed copy is plain data: it stays coherent through later edits and the arena's closure.
+
 **The commit point.** The service's `Endpoint` is attached to the host's `Settling` seam: the service reads the request's
 eligibility, commits the edit and delivers the settlement in one transaction that also decides cancellation, the parent session's
 admission and the arena's closure, so exactly one of a script's cancel and the commit wins: cancel first leaves no edit, commit first
 answers `already_settled`. Nothing runs Lua or terrain IO inside the host's STM and nothing waits for the terrain owner on a Lua
 thread.
 
-**Leases and names.** A successful open or attach offers the service's lease to the request; the host builds it into the lease the
+**Leases and names.** A successful open, attach or host attach offers the service's lease to the request; the host builds it into the lease the
 request reserved (the adoption) on the owner's thread and settles then. A request cancelled or ended between the offer and the build
 leaves the offered lease with the adapter, which releases it at that very cancel: no arena, name or lease is left to Lua's
 collection, a finalizer, `shutdown` or a successful `take`. The creator's owner lease is the only owner lease: the service marks an
@@ -1512,6 +1549,23 @@ that exists only under another root or session is `not_found` and says nothing o
 
 **A closed service.** A service that is closed, or whose parent session has ended, is a permanent refusal decided in the call's permanent checks (`Terrain.serviceAdmitting`, a read-only query), before any of the host's own banks: a closed service never reads as busy because a bank of the host's is full. It is a precheck only: the service decides its own admission again, atomically with it, and a service that closes between the check and the hand-off refuses the hand-off the same way and leaves nothing reserved.
 
+<a id="the-host-published-arena"></a>
+**The host-published arena.** `terrainInjectionWithArena ∷ TerrainFacade → RootKey → ArenaLease → IO (Either Refused TerrainInjection)` is
+the `terrainInjection` of the same facade whose instances of one content root can also call `api.terrain.attach_host()`. It validates the
+host's lease against the facade's service and borrows it: the lease must be, then, a live creator (owner) lease of a live arena, and one
+of another service, an attachment, or one already released or closed is refused (`RefusedAuthority`; a closed service `RefusedClosed`).
+It acquires no lease, never releases the host's and keeps no arena alive; closing the arena's last creator lease closes it with Lua
+attached, and the attachments' requests settle `arena_closed`. The key names the root exactly: an instance is in it when the UTF-8
+encoding of its content root equals `rootKeyBytes`; a key matching no root of the session refuses nothing, and every instance there is
+in an unpublished root. The facade and the injections made from it before keep their behavior and tables; names keep their scoped
+meaning. An attachment issued this way belongs to the calling instance (issued through the instance's own client: the service never makes it an owner lease, so no attach client is needed) and is never an owner lease, so
+releasing it, or the instance's end, ends only that interest, and `grow_storage` and `retry_storage` through it are ordinary errors as
+for any attachment. The service validates the source lease when the request is admitted and again where the destination lease is issued
+(`attachArenaFrom`, [terrain runtime](../terrain-runtime/README.md)): a grant that expired (released, its client ended, its arena closed)
+settles `not_found`, however it is found, and a reused name cannot redirect it. A declined (busy) or cancelled request holds no
+reservation and no lease. An unpublished root settles `not_found` at the hand-off, with no client made and nothing of the service's
+touched.
+
 **Visibility of a pending open.** Every open request is its own incarnation of its name: what holds a name back from attach, from the service's commit of the open until the host has adopted or let go of its lease, is that incarnation's entry. An open lets go only of its own, so the late cleanup of an earlier open of the name (the release of an arena the script let go of, a cancelled open's revocation) never shows a later open's arena before it has settled.
 
 **An open stays revocable until it is published.** The host's build moves the offered lease to *adopting*; only the settling transaction's last look makes it *adopted* (published). Until then a cancellation that wins (a script's cancel, an epoch, the instance's end) can still revoke the lease and free the name, whoever finds the host's settlement first, so another VM's open of the name never waits for the first owner's next boundary. **Retirement follows the service.** A request cancelled while the owner prepares its answer is retained by the service as a ghost, with its borrowed data and credits, until the owner's safe point; the adapter reports its work over only when the service holds no ghost (the census, public), so a cancelled and taken request keeps its place charged until then. The census does not say which request a ghost is: any ghost holds every retirement back, never early.
@@ -1530,9 +1584,11 @@ and no view, camera or picking: TRA-10 issues the real token. The adapter's `iss
 | the terrain `Service`, its owner thread | the assembly | borrowed; closed after the session |
 | the VM's lending and lease scope | the session, one per VM, shared with graphics | the owner's |
 | an instance's terrain clients (owner, attach) | the adapter; written when the facade declares and forgets the instance | the instance's |
+| the host's publication (a content root and the host's creator lease) | the host, once, at composition (`terrainInjectionWithArena`); read by every VM of the session | the composition's; the facade borrows the lease and never releases it |
 | the typed ask of a request in flight | the adapter, by ticket | from the binding's start to the hand-off |
 | an offered lease | the adapter until adopted or released | `Offered`, then `Adopted`, or `Revoking` and `Disposed` |
 | the service's untaken result of a request | the service | until the host's record is taken or discarded and its work is over (`tsDrain` returns it) |
+| a regional read's borrow and its copy | the service until the settling transaction takes it; the copy is made by the service's owner in the settlement preparation | the borrow ends in the settling transaction (take, then release), or at the request's end; the copy is the host's result and holds no snapshot |
 
 The lease capacity one instance needs in the shared scope is `configMaxLeases + RequestsPerInstance + 1` (`terrainLeaseCapacity`):
 every lease the service can hold at once, the places that reserve one before the service admits it, and one of headroom. With
