@@ -54,6 +54,7 @@ import Test.GLFW.Owner.Fixture.Rig
   )
 import Test.GLFW.Support (Scope, at, boundedExample, cutExamples, millis, quietLogger, unexpected, windowNamed)
 import Test.Hspec (Spec, it, shouldBe, shouldReturn, shouldSatisfy)
+import Test.Support.Bounded (bounded)
 import Test.Support.Owned (withOwnedThread, withOwnedThreadOpening)
 
 spec ∷ Spec
@@ -128,11 +129,14 @@ testIndividualRelease = do
               secondAttachment = graphicsAttachment secondService
           awaitConstructed rig (Text.pack (show second))
           _ ← releaseGraphicsTarget host owner firstService
-          _ ← awaitTerminal owner firstService
           -- The released target's attachment retires and its window may be
           -- released; the other one is untouched and the owner is still live.
-          pumpUntil host _control "the second attachment alone pending" $
-            (== [secondAttachment]) <$> atomically (hostPendingAttachments host)
+          -- The wait is the shared bound's, so a missing acknowledgement fails
+          -- here instead of at the example's own, longer limit.
+          bounded $ do
+            _ ← awaitTerminal owner firstService
+            pumpUntil host _control "the second attachment alone pending" $
+              (== [secondAttachment]) <$> atomically (hostPendingAttachments host)
           settled ← atomically (Worker.pollCompletion (graphicsOwnerWorker owner))
           retirements ← readTVarIO (fakeRetirements (rigFake rig))
           pendingAfter ← atomically (hostPendingAttachments host)
