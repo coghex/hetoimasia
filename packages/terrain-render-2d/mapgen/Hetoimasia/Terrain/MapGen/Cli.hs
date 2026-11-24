@@ -1,10 +1,10 @@
 -- | The @terrain-mapgen@ command line as a function of its arguments (TRA-14).
 --
--- > terrain-mapgen --output DIR [--sample DIR]
--- > terrain-mapgen --check [--catalog DIR] [--sample DIR]
--- > terrain-mapgen --evidence DIR [--sample DIR]
--- > terrain-mapgen --atlas-output DIR [--sample DIR]
--- > terrain-mapgen --check-atlases [--atlas-dir DIR] [--sample DIR]
+-- > terrain-mapgen --output DIR --fixtures DIR
+-- > terrain-mapgen --check [--catalog DIR] --fixtures DIR
+-- > terrain-mapgen --evidence DIR --fixtures DIR
+-- > terrain-mapgen --atlas-output DIR --fixtures DIR
+-- > terrain-mapgen --check-atlases [--atlas-dir DIR] --fixtures DIR
 --
 -- @--output@ generates the catalog and its manifest into an explicit directory.
 -- @--check@ regenerates in temporary storage and compares with the committed
@@ -15,11 +15,11 @@
 -- @--check-atlases@ regenerates them in temporary storage and compares with the committed
 -- atlas directory, which it only reads, failing on a missing, changed or unexpected file.
 -- Neither atlas mode reads or writes the facemap catalog, and @--output@ and @--check@
--- read and write only the facemap catalog. The sample directory defaults to the
--- @samples/ecce-homo@ found at or above the working directory, and the
--- committed catalog to @content/textures/facemap@ (the atlases to
--- @content/textures/terrain-atlas@) under it, so none depends on which directory the
--- command is started in. Exactly one mode is accepted.
+-- read and write only the facemap catalog. Every mode takes its input explicitly:
+-- @--fixtures@ names the fixture directory holding the pinned colour art and reference
+-- masks, and a run without it is a usage error. The committed catalog defaults to
+-- @content/textures/facemap@ (the atlases to @content/textures/terrain-atlas@) under that
+-- directory. Exactly one mode is accepted.
 --
 -- The function returns what it would print and its exit status (0 success, 1 a
 -- failed check or unreadable input, 2 a usage error) rather than performing
@@ -38,8 +38,7 @@ import Hetoimasia.Terrain.MapGen.Atlas (atlasDirectoryRelative, checkAtlases, ge
 import Hetoimasia.Terrain.MapGen.Evidence (writeEvidence)
 import Hetoimasia.Terrain.MapGen.Generate (checkCatalog, describeDiscrepancy, generate, inventory, writeCatalog)
 import Hetoimasia.Terrain.MapGen.Inputs (loadInputs, textureDirectory)
-import System.Directory (doesDirectoryExist, getCurrentDirectory)
-import System.FilePath (takeDirectory, (</>))
+import System.FilePath ((</>))
 
 -- | What a run prints and how it ends.
 data Outcome = Outcome
@@ -49,11 +48,11 @@ data Outcome = Outcome
   }
   deriving stock (Eq, Show)
 
--- | The committed catalog directory under the sample directory.
+-- | The committed catalog directory under the fixture directory.
 defaultCatalogRelative ∷ FilePath
 defaultCatalogRelative = textureDirectory </> "facemap"
 
--- | The committed atlas directory under the sample directory.
+-- | The committed atlas directory under the fixture directory.
 defaultAtlasRelative ∷ FilePath
 defaultAtlasRelative = atlasDirectoryRelative
 
@@ -61,18 +60,18 @@ data Mode = Output FilePath | Check | Evidence FilePath | AtlasOutput FilePath |
 
 data Options = Options
   { optMode ∷ !(Maybe Mode)
-  , optSample ∷ !(Maybe FilePath)
+  , optFixtures ∷ !(Maybe FilePath)
   , optCatalog ∷ !(Maybe FilePath)
   , optAtlasDir ∷ !(Maybe FilePath)
   }
 
 usage ∷ [String]
 usage =
-  [ "usage: terrain-mapgen --output DIR [--sample DIR]"
-  , "       terrain-mapgen --check [--catalog DIR] [--sample DIR]"
-  , "       terrain-mapgen --evidence DIR [--sample DIR]"
-  , "       terrain-mapgen --atlas-output DIR [--sample DIR]"
-  , "       terrain-mapgen --check-atlases [--atlas-dir DIR] [--sample DIR]"
+  [ "usage: terrain-mapgen --output DIR --fixtures DIR"
+  , "       terrain-mapgen --check [--catalog DIR] --fixtures DIR"
+  , "       terrain-mapgen --evidence DIR --fixtures DIR"
+  , "       terrain-mapgen --atlas-output DIR --fixtures DIR"
+  , "       terrain-mapgen --check-atlases [--atlas-dir DIR] --fixtures DIR"
   ]
 
 parse ∷ [String] → Either String Options
@@ -84,11 +83,11 @@ parse = go (Options Nothing Nothing Nothing Nothing)
     go options ("--atlas-output" : directory : rest) = setMode options (AtlasOutput directory) rest
     go options ("--check" : rest) = setMode options Check rest
     go options ("--check-atlases" : rest) = setMode options CheckAtlases rest
-    go options ("--sample" : directory : rest) = go options {optSample = Just directory} rest
+    go options ("--fixtures" : directory : rest) = go options {optFixtures = Just directory} rest
     go options ("--catalog" : directory : rest) = go options {optCatalog = Just directory} rest
     go options ("--atlas-dir" : directory : rest) = go options {optAtlasDir = Just directory} rest
     go _ (flag : _)
-      | flag `elem` ["--output", "--evidence", "--atlas-output", "--sample", "--catalog", "--atlas-dir"] = Left (flag <> " needs a directory")
+      | flag `elem` ["--output", "--evidence", "--atlas-output", "--fixtures", "--catalog", "--atlas-dir"] = Left (flag <> " needs a directory")
       | otherwise = Left ("unknown argument: " <> flag)
     setMode options mode rest = case optMode options of
       Nothing → go options {optMode = Just mode} rest
@@ -97,16 +96,10 @@ parse = go (Options Nothing Nothing Nothing Nothing)
 modeRule ∷ String
 modeRule = "give exactly one of --output, --check, --evidence, --atlas-output and --check-atlases"
 
--- | The nearest @samples/ecce-homo@ at or above a directory.
-findSample ∷ FilePath → IO (Maybe FilePath)
-findSample directory = do
-  let candidate = directory </> "samples" </> "ecce-homo"
-  found ← doesDirectoryExist candidate
-  if found
-    then pure (Just candidate)
-    else
-      let parent = takeDirectory directory
-       in if parent == directory then pure Nothing else findSample parent
+-- | A run with no usable input directory: absent, or an empty argument (which would otherwise
+-- name the working directory, as an unset shell variable does).
+missingFixtures ∷ Outcome
+missingFixtures = Outcome 2 [] ("terrain-mapgen: the input directory is required; pass --fixtures DIR" : usage)
 
 -- | Run the command.
 runCli ∷ [String] → IO Outcome
@@ -115,11 +108,9 @@ runCli arguments = case parse arguments of
   Right options → case optMode options of
     Nothing → pure (Outcome 2 [] (("terrain-mapgen: " <> modeRule) : usage))
     Just mode → do
-      sample ← case optSample options of
-        Just directory → pure (Just directory)
-        Nothing → getCurrentDirectory >>= findSample
-      case sample of
-        Nothing → pure (Outcome 1 [] ["terrain-mapgen: no samples/ecce-homo at or above the working directory; pass --sample DIR"])
+      case optFixtures options of
+        Nothing → pure missingFixtures
+        Just "" → pure missingFixtures
         Just directory → do
           loaded ← loadInputs directory
           case loaded of

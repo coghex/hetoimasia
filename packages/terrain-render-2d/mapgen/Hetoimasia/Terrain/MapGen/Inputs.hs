@@ -1,7 +1,7 @@
 -- | The pinned inputs of the generator (TRA-14): the unchanged colour artwork,
 -- the imported blank, and the retained reference-only Synarchy masks.
 --
--- Everything is read from the sample's own committed files and checked against
+-- Everything is read from the fixture directory's own committed files and checked against
 -- the SHA-256 recorded here, which are the values of the Synarchy revision
 -- 'sourceRevision'. Nothing reads a sibling Synarchy checkout or the network.
 -- The reference masks are legacy face-weight maps; they feed the original
@@ -41,11 +41,11 @@ sha256Hex = concatMap two . ByteString.unpack . hash
   where
     two byte = (if byte < 16 then "0" else "") <> showHex byte ""
 
--- | Where the colour artwork lives under the sample directory.
+-- | Where the colour artwork lives under the fixture directory.
 textureDirectory ∷ FilePath
 textureDirectory = "content" </> "textures"
 
--- | Where the reference-only masks live under the sample directory.
+-- | Where the reference-only masks live under the fixture directory.
 referenceDirectory ∷ FilePath
 referenceDirectory = "reference" </> "synarchy-3777d437" </> "facemap"
 
@@ -109,15 +109,15 @@ data Inputs = Inputs
   -- ^ The mask, its file bytes and its 96 × 64 RGBA8 texels.
   }
 
--- | Read and verify every input under the sample directory. A missing file, a
+-- | Read and verify every input under the fixture directory. A missing file, a
 -- hash other than the pinned one or a canvas that is not 96 × 64 RGBA8 is
 -- reported by path; nothing is repaired.
 loadInputs ∷ FilePath → IO (Either [String] Inputs)
-loadInputs sample = do
+loadInputs fixtures = do
   colour ← forM pinnedColourArt $ \art →
-    load (sample </> textureDirectory </> artFile art) (artSha256 art) (\bytes texels → (art, bytes, texels))
+    load (fixtures </> textureDirectory </> artFile art) (artSha256 art) (\bytes texels → (art, bytes, texels))
   reference ← forM referenceMasks $ \mask →
-    load (sample </> referenceDirectory </> referenceFile mask) (referenceSha256 mask) (\bytes texels → (mask, bytes, texels))
+    load (fixtures </> referenceDirectory </> referenceFile mask) (referenceSha256 mask) (\bytes texels → (mask, bytes, texels))
   let (colourBad, colourGood) = partitionEithers colour
       (referenceBad, referenceGood) = partitionEithers reference
   pure $ case colourBad <> referenceBad of

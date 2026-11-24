@@ -25,7 +25,7 @@ import Hetoimasia.Terrain.Render2D.Scenes
 import Hetoimasia.Terrain.MapGen.Png (decodeRgba)
 import Hetoimasia.Terrain.Shape (ViewFacing (..))
 import Test.Hspec
-import Test.TerrainRender2D.Art (loadFile)
+import Test.TerrainRender2D.Art (loadFixture)
 import Hetoimasia.Terrain.Render2D.AtlasFixtures (AtlasStyle (..), holedStyle, loadAtlasStyle)
 import Test.TerrainRender2D.CellFixtures (loadAtlasParents, pickPixel)
 import Test.TerrainRender2D.Fixtures (tileAt)
@@ -160,7 +160,7 @@ loadArt manifest = do
   let load identity = case findRegion manifest identity of
         Nothing → fail ("no region " <> identity)
         Just (_, region) → do
-          bytes ← loadFile (regionSourcePath region)
+          bytes ← loadFixture (regionSourcePath region)
           either (\why → fail (identity <> ": " <> why)) (\(_, _, texels) → pure texels) (decodeRgba bytes)
       colourIds = [("loam", "colour.loam"), ("granite", "colour.granite"), ("blanktexture", "colour.blanktexture")]
   colours ← forM colourIds $ \(name, identity) → (,) name <$> load identity

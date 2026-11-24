@@ -140,9 +140,9 @@
     {"facing": "east", "world": 15, "view": 15, "ordinary": "shape.15", "known": "mixed.15.known", "fog": "mixed.15.fog", "fullFog": "shape.00"}
   ],
   "colourArt": [
-    {"name": "loam", "path": "samples/ecce-homo/content/textures/loam.png", "width": 96, "height": 64, "sha256": "f449a06bc3aa76fdf56607c4e4d23ac1cc8c1a67245b8ae5b295dbff621105e1", "sourcePath": "assets/textures/world/loam/loam.png", "sourceRevision": "3777d437ea00e1302bf55162ad5693fee4879187", "treatment": "colour art, sRGB, binary alpha; imported byte for byte, never normal data"},
-    {"name": "granite", "path": "samples/ecce-homo/content/textures/granite.png", "width": 96, "height": 64, "sha256": "776a28d3ee45f656ee8f024444c0f2529b4d176da455902e4ac9bfb329d79d1c", "sourcePath": "assets/textures/world/granite/granite.png", "sourceRevision": "3777d437ea00e1302bf55162ad5693fee4879187", "treatment": "colour art, sRGB, binary alpha; imported byte for byte, never normal data"},
-    {"name": "blanktexture", "path": "samples/ecce-homo/content/textures/blanktexture.png", "width": 96, "height": 64, "sha256": "c747223e0f788c942d1e8699735ac4a26a011599b6442c707b91c29f42f2f90e", "sourcePath": "assets/textures/utility/blanktexture.png", "sourceRevision": "3777d437ea00e1302bf55162ad5693fee4879187", "treatment": "colour art, sRGB, binary alpha; imported byte for byte, never normal data"}
+    {"name": "loam", "path": "content/textures/loam.png", "width": 96, "height": 64, "sha256": "f449a06bc3aa76fdf56607c4e4d23ac1cc8c1a67245b8ae5b295dbff621105e1", "sourcePath": "assets/textures/world/loam/loam.png", "sourceRevision": "3777d437ea00e1302bf55162ad5693fee4879187", "treatment": "colour art, sRGB, binary alpha; imported byte for byte, never normal data"},
+    {"name": "granite", "path": "content/textures/granite.png", "width": 96, "height": 64, "sha256": "776a28d3ee45f656ee8f024444c0f2529b4d176da455902e4ac9bfb329d79d1c", "sourcePath": "assets/textures/world/granite/granite.png", "sourceRevision": "3777d437ea00e1302bf55162ad5693fee4879187", "treatment": "colour art, sRGB, binary alpha; imported byte for byte, never normal data"},
+    {"name": "blanktexture", "path": "content/textures/blanktexture.png", "width": 96, "height": 64, "sha256": "c747223e0f788c942d1e8699735ac4a26a011599b6442c707b91c29f42f2f90e", "sourcePath": "assets/textures/utility/blanktexture.png", "sourceRevision": "3777d437ea00e1302bf55162ad5693fee4879187", "treatment": "colour art, sRGB, binary alpha; imported byte for byte, never normal data"}
   ],
-  "provenance": "samples/ecce-homo/content/textures/provenance.json"
+  "provenance": "content/textures/provenance.json"
 }

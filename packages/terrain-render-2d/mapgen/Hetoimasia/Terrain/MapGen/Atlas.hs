@@ -39,9 +39,9 @@ import System.IO.Temp (withSystemTempDirectory)
 
 -- | The atlas recipe: any change to the layout, the packing or the manifest's text raises it.
 atlasRecipeVersion ∷ String
-atlasRecipeVersion = "terrain-mapgen/atlas-1"
+atlasRecipeVersion = "terrain-mapgen/atlas-2"
 
--- | The committed atlas directory under the sample directory, beside the facemap catalog.
+-- | The committed atlas directory under the fixture directory, beside the facemap catalog.
 atlasDirectoryRelative ∷ FilePath
 atlasDirectoryRelative = textureDirectory </> "terrain-atlas"
 
@@ -50,8 +50,9 @@ atlasManifestName = "manifest.json"
 colourAtlasFile = "colour.png"
 normalAtlasFile = "normal.png"
 
-repositoryTextures ∷ String
-repositoryTextures = "samples/ecce-homo/content/textures/"
+-- | The colour art and the facemap catalog, as the manifest names them: relative to the fixture directory.
+fixtureTextures ∷ String
+fixtureTextures = "content/textures/"
 
 -- | Every generated file, by name relative to the atlas directory: the two PNGs, then the
 -- manifest. Fails only if the inputs cannot be packed (a canvas of the wrong size).
@@ -74,12 +75,12 @@ atlasManifestOf inputs = do
   pure (manifest, [(colourAtlasFile, colourPng), (normalAtlasFile, normalPng), (atlasManifestName, renderJson (manifestJson manifest))])
   where
     colourCanvases = [Canvas (colourRegionId (artName art)) texels | (art, _, texels) ← inputColour inputs]
-    colourSources = Map.fromList [(colourRegionId (artName art), (repositoryTextures <> artFile art, artSha256 art)) | (art, _, _) ← inputColour inputs]
+    colourSources = Map.fromList [(colourRegionId (artName art), (fixtureTextures <> artFile art, artSha256 art)) | (art, _, _) ← inputColour inputs]
     normalCanvases = [Canvas (mapIdentifier key) (mapBytes key) | key ← catalogKeys]
     facemapPngs = Map.fromList (generate inputs)
     normalSources =
       Map.fromList
-        [ (mapIdentifier key, (repositoryTextures <> "facemap/" <> mapFileName key, maybe "" sha256Hex (Map.lookup (mapFileName key) facemapPngs)))
+        [ (mapIdentifier key, (fixtureTextures <> "facemap/" <> mapFileName key, maybe "" sha256Hex (Map.lookup (mapFileName key) facemapPngs)))
         | key ← catalogKeys
         ]
     png packed = encodeRgba (fromIntegral (packedWidth packed)) (fromIntegral (packedHeight packed)) (packedTexels packed)

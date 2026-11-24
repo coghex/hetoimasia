@@ -5,11 +5,10 @@
 -- Knowledge is /not/ terrain truth and /not/ residency. Terrain truth is the
 -- layered source with its retained removals ("Hetoimasia.Terrain.Render2D.Facts"),
 -- residency is the availability of its detail, and knowledge is what the
--- player has discovered. This module is the narrow, pure, immutable input the
--- live discovery service (a later slice, revised #645) adapts its retained
--- knowledge into; the planner never writes it, never asks a service for it
--- and never derives discovery from a camera, a cutaway or a query. Nothing
--- here is I/O.
+-- player has discovered. This module is the narrow, pure, immutable input a
+-- consumer's discovery service adapts its retained knowledge into; the planner
+-- never writes it, never asks a service for it and never derives discovery from
+-- a camera, a cutaway or a query. Nothing here is I/O.
 --
 -- == The four states of one cell
 --
