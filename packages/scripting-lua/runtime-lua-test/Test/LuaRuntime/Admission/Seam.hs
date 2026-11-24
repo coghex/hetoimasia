@@ -8,17 +8,15 @@ import Control.Exception (ExceptionWithContext (ExceptionWithContext), fromExcep
 import Control.Exception (evaluate, throwIO)
 import Data.Text (Text)
 import qualified Data.Text as Text
-import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
+import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Control.Monad (forM_, unless, void, when)
-import GHC.Conc (unsafeIOToSTM)
 import Hetoimasia.Scripting.Lua.Admission
 import Hetoimasia.Scripting.Lua.Instance
 import Hetoimasia.Scripting.Lua.Lease (Ownership (..))
 import Hetoimasia.Scripting.Lua.Provider
 import Hetoimasia.Scripting.Lua.Scheduled (grantScheduledStep, scheduledEndpoint)
 import Hetoimasia.Scripting.Lua.Value (Value (VInteger, VText))
-import System.IO.Unsafe (unsafePerformIO)
-import Test.Hspec (Spec, describe, it, shouldBe, shouldReturn, shouldSatisfy)
+import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Admission.Support
 import Test.LuaRuntime.Instance.Support (awaitSettled, expectControl, failureOf', grantOne)
 import Test.LuaRuntime.Request.Support (awaitDiagnostic, diagnostics, finishWork, onSubmit, submissions)
@@ -38,10 +36,18 @@ requestFailure settlement = do
     ErrorRequest endpoint why → Just (endpoint, why)
     _ → Nothing
 
--- | A value that ticks a counter when it is evaluated. NOINLINE so that each application is its own thunk.
-{-# NOINLINE ticked #-}
-ticked ∷ IORef Int → a → a
-ticked counter value = unsafePerformIO (atomicModifyIORef' counter (\n → (n + 1, ())) >> pure value)
+-- | Where a reply is judged: when it is prepared, or when its settlement is made.
+data JudgedAt = AtPreparation | AtSettlement
+  deriving (Eq, Show)
+
+-- | Make the admissions that follow note where a reply is judged each time one is, and answer what has been noted. Where is the example's own,
+-- set outside any transaction, and no note is read inside one: a transaction that re-runs may note more, never otherwise.
+watchJudging ∷ AFix → IO (IORef JudgedAt, IO [JudgedAt], IO ())
+watchJudging fixture = do
+  context ← newIORef AtPreparation
+  noted ← newIORef []
+  setPolicy fixture (\held → held {polFramed = readIORef context >>= \now → modifyIORef' noted (now :)})
+  pure (context, readIORef noted, writeIORef noted [])
 
 spec ∷ Spec
 spec = describe "the settlement seam and the declining hand-off" $ do
@@ -113,28 +119,32 @@ spec = describe "the settlement seam and the declining hand-off" $ do
     fixture ← newAFix 4
     withBoundary $ \_ runtime → settleAll fixture $ do
       owner ← startAdmitting fixture runtime "prepares" [admitter] aConfig (admissionGrant fixture 8 SettleOnArrival) requiredPolicy
+      -- the example sees where a reply is judged (the admission notes it), so what it asserts never depends on how often a transaction runs
+      (context, judgedIn, forget) ← watchJudging fixture
       admitAdmitter fixture owner "i" "admitter"
       seam ← newIORef Nothing
       onSubmit (afFake fixture) (captured seam)
       acommand fixture owner "i" "start" "a"
       awaitNote fixture "cmd start a started"
       Just settling ← readIORef seam
-      judged ← newIORef 0
-      -- the judgement evaluates the reply's value: it is done when the prepared reply is evaluated, here, in no transaction
-      prepared ← evaluate (settlingPrepare settling (ProviderResult (ticked judged (VInteger 7))))
-      readIORef judged `shouldReturn` 1
-      -- the settlement applies that verdict: nothing of the reply is evaluated inside the transaction
-      atomically (do answer ← settlePrepared prepared; seen ← unsafeIOToSTM (readIORef judged); pure (answer, seen)) >>= (`shouldBe` (ReplySettled, 1))
-      readIORef judged `shouldReturn` 1
+      -- the judgement is done when the prepared reply is evaluated, here, in no transaction
+      writeIORef context AtPreparation
+      prepared ← evaluate (settlingPrepare settling (ProviderResult (VInteger 7)))
+      judgedIn >>= (`shouldSatisfy` \found → not (null found) && all (== AtPreparation) found)
+      -- the settlement applies that verdict: nothing of the reply is judged again, in the transaction or anywhere
+      writeIORef context AtSettlement
+      atomically (settlePrepared prepared) >>= (`shouldBe` ReplySettled)
+      judgedIn >>= (`shouldSatisfy` notElem AtSettlement)
       acommand fixture owner "i" "take" "a"
       awaitNote fixture "cmd take a {status=success,value={v=7}}"
-      -- the control: the unprepared settlement judges the reply inside its transaction
+      -- the control: the unprepared settlement judges the reply inside its transaction, which the example sees
+      forget
       onSubmit (afFake fixture) (captured seam)
       acommand fixture owner "i" "start" "b"
       awaitNote fixture "cmd start b started"
       Just second ← readIORef seam
-      inside ← newIORef 0
-      atomically (do before' ← unsafeIOToSTM (readIORef inside); answer ← settlingSettle second (ProviderResult (ticked inside (VInteger 8))); after ← unsafeIOToSTM (readIORef inside); pure (before', answer, after)) >>= (`shouldBe` (0, ReplySettled, 1))
+      atomically (settlingSettle second (ProviderResult (VInteger 8))) >>= (`shouldBe` ReplySettled)
+      judgedIn >>= (`shouldSatisfy` \found → not (null found) && all (== AtSettlement) found)
       -- a prepared reply decides what the unprepared one does: a request the script cancelled first answers the same to both
       onSubmit (afFake fixture) (captured seam)
       acommand fixture owner "i" "start" "c"
