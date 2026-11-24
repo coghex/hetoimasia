@@ -494,6 +494,7 @@ test-suite lua-engine-tests
         Test.LuaEngine.Terrain.Picks
         Test.LuaEngine.Terrain.Pump
         Test.LuaEngine.Terrain.Races
+        Test.LuaEngine.Terrain.Region
         Test.LuaEngine.Terrain.Seam
         Test.LuaEngine.Terrain.Spec
         Test.LuaEngine.Terrain.Storage
