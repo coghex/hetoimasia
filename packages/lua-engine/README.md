@@ -1569,6 +1569,9 @@ for any attachment. The service validates the source lease when the request is a
 settles `not_found`, however it is found, and a reused name cannot redirect it. A declined (busy) or cancelled request holds no
 reservation and no lease. An unpublished root settles `not_found` at the hand-off, with no client made and nothing of the service's
 touched.
+That `not_found` is the stock adapter's: a provider composed through `TerrainServices` takes part in host attachment only by declaring the
+`terrain_attach_host` endpoint (`terrainHostAttachEndpoint`), and one that does not has no host publication, so `attach_host()` is an ordinary
+refusal at the call's check, before admission, with no call into the provider.
 
 **Visibility of a pending open.** Every open request is its own incarnation of its name: what holds a name back from attach, from the service's commit of the open until the host has adopted or let go of its lease, is that incarnation's entry. An open lets go only of its own, so the late cleanup of an earlier open of the name (the release of an arena the script let go of, a cancelled open's revocation) never shows a later open's arena before it has settled.
 
