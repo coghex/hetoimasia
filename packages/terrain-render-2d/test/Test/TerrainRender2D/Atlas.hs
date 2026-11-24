@@ -338,15 +338,18 @@ commandSpec = describe "terrain-mapgen --atlas-output and --check-atlases" $ do
     fixtures ← findUpwards fixtureDirectory
     outcome ← runCli ["--check", "--fixtures", fixtures]
     (outcomeExit outcome, outcomeErr outcome) `shouldBe` (0, [])
-  it "accepts exactly one mode, with the usage status 2" $ do
+  it "accepts exactly one mode, with the usage status 2 and the reason named, given a valid fixture directory" $ do
+    fixtures ← findUpwards fixtureDirectory
     forM_
-      [ ["--atlas-output", "x", "--check-atlases"]
-      , ["--check-atlases", "--check"]
-      , ["--atlas-output"]
-      , ["--atlas-dir"]
-      , ["--output", "x", "--atlas-output", "y"]
+      [ (["--atlas-output", "x", "--check-atlases"], "give exactly one of")
+      , (["--check-atlases", "--check"], "give exactly one of")
+      , (["--atlas-output"], "needs a directory")
+      , (["--atlas-dir"], "needs a directory")
+      , (["--output", "x", "--atlas-output", "y"], "give exactly one of")
       ]
-      $ \arguments → outcomeExit <$> runCli arguments >>= (`shouldBe` 2)
+      $ \(arguments, reason) → do
+        outcome ← runCli (["--fixtures", fixtures] <> arguments)
+        (arguments, outcomeExit outcome, any (reason `isInfixOf`) (outcomeErr outcome)) `shouldBe` (arguments, 2, True)
   it "reports the generated inventory with the written file count" $
     withSample $ \sample → withSystemTempDirectory "tra17-inv" $ \out → do
       outcome ← runCli ["--atlas-output", out, "--fixtures", sample]

@@ -96,6 +96,11 @@ parse = go (Options Nothing Nothing Nothing Nothing)
 modeRule ∷ String
 modeRule = "give exactly one of --output, --check, --evidence, --atlas-output and --check-atlases"
 
+-- | A run with no usable input directory: absent, or an empty argument (which would otherwise
+-- name the working directory, as an unset shell variable does).
+missingFixtures ∷ Outcome
+missingFixtures = Outcome 2 [] ("terrain-mapgen: the input directory is required; pass --fixtures DIR" : usage)
+
 -- | Run the command.
 runCli ∷ [String] → IO Outcome
 runCli arguments = case parse arguments of
@@ -104,7 +109,8 @@ runCli arguments = case parse arguments of
     Nothing → pure (Outcome 2 [] (("terrain-mapgen: " <> modeRule) : usage))
     Just mode → do
       case optFixtures options of
-        Nothing → pure (Outcome 2 [] ("terrain-mapgen: the input directory is required; pass --fixtures DIR" : usage))
+        Nothing → pure missingFixtures
+        Just "" → pure missingFixtures
         Just directory → do
           loaded ← loadInputs directory
           case loaded of

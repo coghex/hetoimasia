@@ -750,10 +750,19 @@ generatorSpec = describe "the generator" $ do
           (arguments, any ("--fixtures" `isInfixOf'`) (outcomeErr outcome)) `shouldBe` (arguments, True)
       listDirectory scratch >>= (`shouldBe` [])
 
-  it "refuses usage it cannot satisfy: no mode, two modes and an unknown argument" $ do
-    outcomeExit <$> runCli [] >>= (`shouldBe` 2)
-    outcomeExit <$> runCli ["--check", "--output", "x"] >>= (`shouldBe` 2)
-    outcomeExit <$> runCli ["--frobnicate"] >>= (`shouldBe` 2)
+  it "refuses an empty --fixtures argument as it refuses a missing one, so an unset shell variable never names the working directory" $ do
+    outcome ← runCli ["--check", "--fixtures", ""]
+    (outcomeExit outcome, outcomeOut outcome) `shouldBe` (2, [])
+    any ("--fixtures" `isInfixOf'`) (outcomeErr outcome) `shouldBe` True
+
+  it "refuses usage it cannot satisfy, with each reason named: no mode, two modes and an unknown argument" $ do
+    fixtures ← sampleDirectory
+    let refusedWith needle arguments = do
+          outcome ← runCli arguments
+          (arguments, outcomeExit outcome, any (needle `isInfixOf'`) (outcomeErr outcome)) `shouldBe` (arguments, 2, True)
+    refusedWith "give exactly one of" ["--fixtures", fixtures]
+    refusedWith "give exactly one of" ["--check", "--output", "x", "--fixtures", fixtures]
+    refusedWith "unknown argument: --frobnicate" ["--frobnicate", "--fixtures", fixtures]
 
   it "detects, by identity and path and without rewriting, a changed map, a missing map, an unexpected file and a changed manifest entry" $
     withSystemTempDirectory "tra14-check" $ \directory → do

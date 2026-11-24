@@ -22,6 +22,7 @@ module Hetoimasia.Terrain.Render2D.AtlasFixtures
   , bindSingleImages
   , boundPackedTextures
   , findFixtureDirectory
+  , findSampleDirectory
   , materialIdOf
   ) where
 
@@ -81,6 +82,12 @@ findFixtureDirectory = getCurrentDirectory >>= go
         else
           let parent = takeDirectory directory
            in if parent == directory then ioError (userError "no packages/terrain-render-2d/test-data above the working directory") else go parent
+
+-- | The former name of 'findFixtureDirectory', kept so existing clients still compile. It now
+-- finds the package-owned fixtures; no sample directory exists.
+findSampleDirectory ∷ IO FilePath
+findSampleDirectory = findFixtureDirectory
+{-# DEPRECATED findSampleDirectory "use findFixtureDirectory" #-}
 
 -- | The material identity of an authored name.
 materialIdOf ∷ String → IO MaterialId
