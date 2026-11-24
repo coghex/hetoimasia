@@ -54,6 +54,7 @@ import Test.GLFW.Owner.Fixture.Rig
   )
 import Test.GLFW.Support (Scope, at, boundedExample, cutExamples, millis, quietLogger, unexpected, windowNamed)
 import Test.Hspec (Spec, it, shouldBe, shouldReturn, shouldSatisfy)
+import Test.Support.Bounded (bounded)
 import Test.Support.Owned (withOwnedThread, withOwnedThreadOpening)
 
 spec ∷ Spec
@@ -103,6 +104,12 @@ testExitOrder = do
     ]
 
 -- | An individual release retires one target and leaves everything else live.
+--
+-- The outcome awaited is the host's own: its pending set holds the second
+-- attachment alone, so the first has validated every fact its retirement
+-- established. The owner forgets a validated target's terminal record in the
+-- same round, so the record is not read afterwards; the retirement is counted
+-- where the fixture recorded it, by attachment.
 testIndividualRelease ∷ IO ()
 testIndividualRelease = do
   rig ← newRigWith id
@@ -111,27 +118,34 @@ testIndividualRelease = do
         (ownerSettings clock)
           { hostWindowConfigs = [windowNamed (Text.pack "first"), windowNamed (Text.pack "second")]
           }
-  (livingWorker, terminals, secondStillPending) ←
+  (firstAttachment, secondAttachment, livingWorker, retired, pendingAfter, secondStillPending) ←
     ownedHost (rigSeam rig) config (rigOwnerConfig rig) $ \host owner _control → do
       windows ← atomically (hostWindowIdentities host)
       case windows of
         [first, second] → do
           firstService ← handedOver host owner first
-          _second ← handedOver host owner second
+          secondService ← handedOver host owner second
+          let firstAttachment = graphicsAttachment firstService
+              secondAttachment = graphicsAttachment secondService
           awaitConstructed rig (Text.pack (show second))
           _ ← releaseGraphicsTarget host owner firstService
-          _ ← awaitTerminal owner firstService
           -- The released target's attachment retires and its window may be
           -- released; the other one is untouched and the owner is still live.
-          pumpUntil host _control "one retired attachment" $
-            (== 1) . length <$> atomically (hostPendingAttachments host)
+          -- The wait is the shared bound's, so a missing acknowledgement fails
+          -- here instead of at the example's own, longer limit.
+          bounded $ do
+            _ ← awaitTerminal owner firstService
+            pumpUntil host _control "the second attachment alone pending" $
+              (== [secondAttachment]) <$> atomically (hostPendingAttachments host)
           settled ← atomically (Worker.pollCompletion (graphicsOwnerWorker owner))
-          records ← atomically (readTargetTerminalsNow owner)
+          retirements ← readTVarIO (fakeRetirements (rigFake rig))
+          pendingAfter ← atomically (hostPendingAttachments host)
           pending ← atomically (windowGraphicsStatus host second)
-          pure (isNothing settled, Map.keys records, pending)
+          pure (firstAttachment, secondAttachment, isNothing settled, map retiringTarget retirements, pendingAfter, pending)
         other → unexpected ("the host created " <> show (length other) <> " windows")
   livingWorker `shouldBe` True
-  length terminals `shouldBe` 1
+  retired `shouldBe` [firstAttachment]
+  pendingAfter `shouldBe` [secondAttachment]
   secondStillPending `shouldSatisfy` \case
     GraphicsPresent observation → observedSlot observation == SlotAttached
     _ → False
