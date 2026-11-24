@@ -21,7 +21,7 @@ import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Word (Word64)
 import Hetoimasia.LuaEngine.Profile (Count (Count), CountLimit (CopiedValueElements, LuaIntegerMaximum, SceneSprites), Profile, ProfileSpec (specCounts), fixedM1Profile, profileSpec, validateProfile)
-import Hetoimasia.LuaEngine.Terrain (noTerrainHooks, terrainCodesFor)
+import Hetoimasia.LuaEngine.Terrain (TerrainHooks (hookAdmitted), noTerrainHooks, terrainCodesFor)
 import Hetoimasia.Terrain.Cell (Cell (..), materialIdString)
 import Hetoimasia.Terrain.Coordinate (RegionCoord (..), TileCoord, composeTile, mkLocalCoord, tileCoord)
 import qualified Hetoimasia.Terrain.Discovery as D
@@ -29,6 +29,7 @@ import Hetoimasia.Terrain.Residency (LimitsSpec (..), Revision (..), mkLimits)
 import Hetoimasia.Terrain.Runtime
 import Hetoimasia.Terrain.Runtime.Testing (NativeOp (OpReadAt))
 import Hetoimasia.Terrain.Shape (shapeIdValue)
+import Hetoimasia.Terrain.Source (LayerSpec (..), SourceSpec (..))
 import Test.Hspec
 import Test.LuaEngine.Facade.Support
 import Test.LuaEngine.Request.Profiles (counts)
@@ -245,6 +246,7 @@ spec = describe "Lua regional read" $ do
   windowSpec
   ceilingSpec
   retirementSpec
+  admissionSpec
 
 -- | The copy itself: a fresh record equal to the native snapshot, at the revisions it reports, in either role.
 copySpec ∷ Spec
@@ -726,3 +728,63 @@ retirementSpec =
         openGate gate
         bounded (atomically (inspectRegionalSTM svc >>= check . null))
         balancedAt svc baseline
+
+-- | The window between the service's admission of a regional request and the host's record of it: the arena closes there, while the
+-- service's gather still holds the borrow, and the request is failed and taken before the host can ask about its borrow.
+admissionSpec ∷ Spec
+admissionSpec =
+  it "keeps the place of a regional request that the arena's closure failed before the host recorded it, until the service has released its borrow" $ do
+    admitted ← newGate
+    owner ← newGate
+    disarmGate admitted
+    disarmGate owner
+    withRigHooks defaultConfig (gatedProbe (\case PointPrepared _ → True; _ → False) owner) noTerrainHooks {hookAdmitted = holdAt admitted} $ \rig → do
+      let svc = rgService rig
+          attached =
+            script
+              { scPrelude = terrainPrelude
+              , scInit = ["self.s = 0", "self.q = api.terrain.attach('shared')", "self.cells = {}"]
+              , scUpdate =
+                  [ "if self.s == 0 then"
+                  , "  local t = settle(api, self.q)"
+                  , "  if t then self.arena = t.value print('attached') self.s = 1 end"
+                  , "elseif self.s == 1 then"
+                  , "  TEST_WAIT('go')"
+                  , "  self.r = api.terrain.region(self.arena, {x = 0, y = 0, z = 0})"
+                  , "  print('issued') self.s = 2"
+                  , "elseif self.s == 2 then"
+                  , "  local t = settle(api, self.r)"
+                  , "  if t then"
+                  , "    print('taken', t.status, t.error and t.error.code)"
+                  , "    local accepted = 0"
+                  , "    for i = 1, 16 do"
+                  , "      local r = api.terrain.cell(self.arena, {x = i, y = 0, z = 0})"
+                  , "      if r ~= nil then accepted = accepted + 1 self.cells[accepted] = r end"
+                  , "    end"
+                  , "    print('accepted while the borrow is held', accepted)"
+                  , "    for _, r in ipairs(self.cells) do api.request.cancel(r) end"
+                  , "    print('done') self.s = 3"
+                  , "  end"
+                  , "end"
+                  ]
+              }
+      -- the host creates the arena, whose creator lease is what closes it; the Lua instance attaches
+      client ← registerClient svc >>= either (fail . show) pure
+      opening ← openArena svc client (arenaName rig "modules-test" "shared") (SourceSpec ["soil"] [LayerSpec Nothing (Just 10) "soil" 0] []) >>= either (fail . show) pure
+      creator ← await svc opening >>= either (fail . show) pure
+      withScript rig fixedM1Profile presentationOver attached $ \world _ → (`finally` (openGate admitted >> openGate owner)) $ do
+        untilPrinted world "attached"
+        stepUntil world (elem "entered go" <$> readTVar (rgTrace rig))
+        armGate admitted
+        armGate owner
+        signalRig rig "go"
+        -- the service's gather has built the copy and is held; the host has not recorded the request
+        awaitReached owner
+        releaseLease svc creator >>= either (fail . show) pure
+        openGate admitted
+        untilPrinted world "done"
+        printed ← outLines world
+        printed `shouldContain` ["taken\tfailure\tarena_closed", "accepted while the borrow is held\t15"]
+        openGate owner
+        bounded (atomically (inspectRegionalSTM svc >>= check . null))
+        nothingHeld svc

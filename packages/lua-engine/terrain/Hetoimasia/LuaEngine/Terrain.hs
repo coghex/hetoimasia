@@ -343,6 +343,9 @@ data TerrainHooks = TerrainHooks
   , hookSubmitting ∷ IO ()
   -- ^ The host admitted a request (its places are reserved) and the hand-off is about to ask the service, masked: the window between a
   -- permanent precheck and the service's own admission, in which the service can close.
+  , hookAdmitted ∷ IO ()
+  -- ^ The service admitted a request and the host has not yet recorded it: the window in which the service can already act on the request
+  -- (its arena can close) while the host cannot yet ask about it.
   , hookRevoked ∷ IO ()
   -- ^ The service has released the lease of an open (the script's release of its arena, or a cancelled open's revocation) and the open
   -- has not yet let go of its hold on the name (the name is free for the service's next open): the window in which a later open of the
@@ -350,7 +353,7 @@ data TerrainHooks = TerrainHooks
   }
 
 noTerrainHooks ∷ TerrainHooks
-noTerrainHooks = TerrainHooks (pure ()) (pure ()) (pure ()) (pure ()) (pure ()) (pure ()) (pure ()) (pure ()) (pure ())
+noTerrainHooks = TerrainHooks (pure ()) (pure ()) (pure ()) (pure ()) (pure ()) (pure ()) (pure ()) (pure ()) (pure ()) (pure ())
 
 -- | Why a VM's terrain could not be composed: a failure of the composition, never a script's.
 newtype TerrainCompositionRefused = TerrainCompositionRefused Text
@@ -490,6 +493,8 @@ data Link = Link
   , lkRequest ∷ !(TVar (Maybe Request))
   -- ^ The service's request, once the hand-off has recorded it: a regional read takes its borrow in the transaction that settles it, which
   -- needs the request, so such a request is not eligible before this is known.
+  , lkRegional ∷ !Bool
+  -- ^ Whether this is a regional read, whose native borrow can outlive its request ('workHeld').
   }
 
 -- The per-VM state ----------------------------------------------------------------------------------------
@@ -1308,6 +1313,7 @@ submitToService env submission found settling = do
       <*> newUnique
       <*> pure (case pdAsk found of AskGrow lease _ → Just lease; AskRetry lease → Just lease; _ → Nothing)
       <*> pure (pdRequest found)
+      <*> pure (case pdAsk found of AskRegion {} → True; _ → False)
   noted ← newTVarIO False
   let -- What decides a commit, read in the transaction that makes it: the session still takes new work, the request is still
       -- waiting (and its tick granted, on logical time), and a read or removal does not need a revision no Lua integer holds.
@@ -1392,6 +1398,8 @@ submitToService env submission found settling = do
         hookSubmitted (hooks env)
       admitted = do
         found' ← admitAsk
+        -- the window between the service's admission and the host's record of the request
+        forM_ (either (const Nothing) Just found') (\_ → hookAdmitted (hooks env))
         forM_ (either (const Nothing) Just found') afterAdmission
         pure found'
   -- An open's name is arbitrated by 'arbitrateOpen': the release of the stale claims, the consultation of the failed opens, the admission and
@@ -1707,7 +1715,9 @@ retirement env link = do
 workHeld ∷ Env → Link → STM Bool
 workHeld env link = do
   ghosts ← any Terrain.censusGhost . Terrain.censusRequests <$> Terrain.inspectCensusSTM (service env)
-  borrowed ← readTVar (lkRequest link) >>= maybe (pure False) (borrowHeldSTM (service env))
+  -- A regional request the hand-off has not yet recorded (the service admitted it and the arena closed before the record was made) cannot
+  -- be asked about its borrow, which the service may still hold for a gather in flight: until it is recorded, the borrow is presumed held.
+  borrowed ← readTVar (lkRequest link) >>= maybe (pure (lkRegional link)) (borrowHeldSTM (service env))
   pure (ghosts || borrowed)
 
 -- The start ------------------------------------------------------------------------------------------------------
