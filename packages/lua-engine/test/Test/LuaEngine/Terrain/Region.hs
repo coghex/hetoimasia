@@ -10,19 +10,20 @@
 -- charges and its retained bank.
 module Test.LuaEngine.Terrain.Region (spec) where
 
+import Control.Concurrent.MVar (newEmptyMVar, takeMVar, tryPutMVar)
 import Control.Concurrent.STM (STM, atomically, check, readTVar)
 import Control.Exception (evaluate, finally, onException)
-import Control.Monad (forM_)
-import Data.IORef (modifyIORef', newIORef, readIORef)
+import Control.Monad (forM_, void, when)
+import Data.IORef (atomicModifyIORef', modifyIORef', newIORef, readIORef)
 import Data.List (group)
 import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Word (Word64)
-import Hetoimasia.LuaEngine.Profile (Count (Count), CountLimit (CopiedValueElements, SceneSprites), Profile, ProfileSpec (specCounts), fixedM1Profile, profileSpec, validateProfile)
+import Hetoimasia.LuaEngine.Profile (Count (Count), CountLimit (CopiedValueElements, LuaIntegerMaximum, SceneSprites), Profile, ProfileSpec (specCounts), fixedM1Profile, profileSpec, validateProfile)
 import Hetoimasia.LuaEngine.Terrain (noTerrainHooks, terrainCodesFor)
 import Hetoimasia.Terrain.Cell (Cell (..), materialIdString)
-import Hetoimasia.Terrain.Coordinate (RegionCoord (..), TileCoord, composeTile, mkLocalCoord)
+import Hetoimasia.Terrain.Coordinate (RegionCoord (..), TileCoord, composeTile, mkLocalCoord, tileCoord)
 import qualified Hetoimasia.Terrain.Discovery as D
 import Hetoimasia.Terrain.Residency (LimitsSpec (..), Revision (..), mkLimits)
 import Hetoimasia.Terrain.Runtime
@@ -30,6 +31,7 @@ import Hetoimasia.Terrain.Runtime.Testing (NativeOp (OpReadAt))
 import Hetoimasia.Terrain.Shape (shapeIdValue)
 import Test.Hspec
 import Test.LuaEngine.Facade.Support
+import Test.LuaEngine.Request.Profiles (counts)
 import Test.LuaEngine.Terrain.Seam
 import Test.LuaEngine.Terrain.Support
 import Test.Support.Bounded (bounded)
@@ -66,7 +68,7 @@ nativeDigest snapshot region =
       PartReady (Solid material shape) → Text.pack (materialIdString material) <> ":" <> Text.pack (show (shapeIdValue shape))
       _ → "missing"
     knowledgeKey = \case
-      PartReady (D.CellKnowledge solid void) → solidText solid <> "/" <> voidText void
+      PartReady (D.CellKnowledge solid hollow) → solidText solid <> "/" <> voidText hollow
       _ → "missing"
     solidText = \case D.NoSolid → "none"; D.SolidKnown → "known"; D.SolidUnknown → "unknown"
     voidText = \case D.NoVoidHere → "none"; D.VoidKnown → "known"; D.VoidUnknown → "unknown"
@@ -241,6 +243,8 @@ spec = describe "Lua regional read" $ do
   ownershipSpec
   balanceSpec
   windowSpec
+  ceilingSpec
+  retirementSpec
 
 -- | The copy itself: a fresh record equal to the native snapshot, at the revisions it reports, in either role.
 copySpec ∷ Spec
@@ -282,17 +286,20 @@ copySpec =
 -- | A failed page makes unavailable each part that needed it, independently of the other, in the copy as in the native snapshot.
 unavailableSpec ∷ Spec
 unavailableSpec =
-  it "reports each part a failed page was needed for as unavailable, as the native snapshot does, and both ready once the page reads again" $ do
+  it "reports the knowledge unavailable beside a ready terrain when a page only it needed fails, as the native snapshot does, and both ready once the page reads again" $ do
     faults ← newFaults
     seen ← newIORef []
     withRigPort defaultConfig noProbe noTerrainHooks (seamPort faults) $ \rig → do
-      let removals = [Step ("remove " <> Text.pack (show (x, y))) ("return api.terrain.remove(A, {x = " <> Text.pack (show x) <> ", y = " <> Text.pack (show y) <> ", z = 0})") "return ''" | y ← [0 .. 3 ∷ Int], x ← [0 .. 15 ∷ Int]]
+      let -- one removal in each of the 64 columns beside the region: the knowledge of the region reads their runs and its terrain does not
+          ring ∷ [(Int, Int)]
+          ring = [(-1, y) | y ← [0 .. 15]] <> [(16, y) | y ← [0 .. 15]] <> [(x, -1) | x ← [0 .. 15]] <> [(x, 16) | x ← [0 .. 15]]
+          removals = [Step ("remove " <> Text.pack (show (x, y))) ("return api.terrain.remove(A, {x = " <> Text.pack (show x) <> ", y = " <> Text.pack (show y) <> ", z = 0})") "return ''" | (x, y) ← ring]
           steps =
             stepsScript
               "SHAPED"
               (reportPrelude <> shapedPrelude)
-              ( shaftSteps
-                  <> removals
+              ( removals
+                  <> shaftSteps
                   <> [ quietStep "quiet"
                      , Step "faulted" "TEST_WAIT('fault') return api.terrain.region(A, R0)" "return report(v)"
                      , Step "healed" "TEST_WAIT('heal') return api.terrain.region(A, R0)" "return report(v)"
@@ -318,14 +325,10 @@ unavailableSpec =
             clearRules faults
             modifyIORef' seen ((page, (unavailable "T" digest, unavailable "K" digest)) :)
           readIORef seen
-        -- a page whose failure leaves one part ready and the other unavailable shows the parts are independent; otherwise any page that
-        -- makes a part unavailable will do
-        let independent = [page | (page, (t, k)) ← outcomes, t /= k]
-            harmful = [page | (page, (t, k)) ← outcomes, t || k]
-        harmful `shouldSatisfy` (not . null)
-        page ← case independent <> harmful of
+        -- the parts are independent: a page only the knowledge needed leaves the terrain ready and the knowledge unavailable
+        page ← case [candidate | (candidate, (False, True)) ← outcomes] of
           found : _ → pure found
-          [] → fail "no page of the region's build makes a part unavailable"
+          [] → fail ("no page of the region's build leaves the terrain ready and the knowledge unavailable: " <> show outcomes)
         faulted ← atWait rig go "fault" $ do
           failing page
           withNative rig $ \svc lease → digestOfRegion svc lease (RegionCoord 0 0 0)
@@ -338,8 +341,8 @@ unavailableSpec =
         -- the fault made something unavailable and the page that reads again made nothing so
         "unavailable" `Text.isInfixOf` faulted `shouldBe` True
         "unavailable" `Text.isInfixOf` healed `shouldBe` False
-        -- the part states are the native snapshot's, whichever of the two the page was needed for
-        Just (unavailable "T" faulted, unavailable "K" faulted) `shouldBe` lookup page outcomes
+        -- the ready terrain part is the native snapshot's, cell for cell, beside the unavailable knowledge (the digests above carry both)
+        (unavailable "T" faulted, unavailable "K" faulted) `shouldBe` (False, True)
 
 -- | The worst-case region on the stock profile, and a profile too tight for it.
 limitsSpec ∷ Spec
@@ -629,4 +632,97 @@ windowSpec =
             printed ← outLines world
             -- one terminal outcome, and not a success: the script ended the request first
             [line | line ← printed, "taken\t" `Text.isPrefixOf` line] `shouldSatisfy` \taken → length taken == 1 && taken /= ["taken\tsuccess"]
+            -- a borrow whose request ended while its copy was made is released at the owner's safe point: wait for that release, then read
+            bounded (atomically (inspectRegionalSTM svc >>= check . null))
             balancedAt svc baseline
+
+-- | A copy staged at the revision ceiling settles with its pinned revisions after the arena has moved past it: the revisions that count
+-- are the snapshot's, never the live arena's.
+ceilingSpec ∷ Spec
+ceilingSpec =
+  it "settles a copy staged at the profile's integer ceiling when the arena has advanced past the ceiling before its tick, with the revisions of the copy" $ do
+    prepared ← newEmptyMVar
+    answers ← newIORef (0 ∷ Int)
+    let -- the open's answer is the first the Lua endpoints prepare and the region's the second
+        probe = Probe $ \point → case point of
+          PointPrepared _ → do
+            n ← atomicModifyIORef' answers (\seen → (seen + 1, seen + 1))
+            when (n == 2) (void (tryPutMVar prepared ()))
+          _ → pure ()
+        reader =
+          script
+            { scPrelude = terrainPrelude <> reportPrelude
+            , scInit = ["self.s = 0", "self.q = api.terrain.open('main', DEF)"]
+            , scUpdate =
+                [ "if self.s == 0 then"
+                , "  local t = settle(api, self.q)"
+                , "  if t then self.r = api.terrain.region(t.value, R0) print('issued') self.s = 1 end"
+                , "elseif self.s == 1 then"
+                , "  local t = settle(api, self.r)"
+                , "  if t then print('region', t.status, t.status == 'success' and report(t.value) or t.error.code) print('done') self.s = 2 end"
+                , "end"
+                ]
+            }
+    withRigProbe defaultConfig {configFirstRevision = 40} probe $ \rig →
+      withWorld (counts [(LuaIntegerMaximum, 40)]) (Layout [("lua/main.lua", scriptSource reader)]) $ \world _ runtime →
+        withFvm world runtime (gameplayOver rig) $ \fvm → do
+          _ ← spawn world fvm "modules-test" mainPath
+          tickUntil fvm (elem "issued" <$> outLinesSTM world)
+          -- the copy has been made at revision 40, the ceiling; the arena then moves to 41, which no Lua integer of this VM holds
+          bounded (takeMVar prepared)
+          withNative rig $ \svc lease → do
+            removal ← removeAt svc lease (either (error . show) id (tileCoord 0 0 0)) Nothing >>= either (fail . show) pure
+            _ ← await svc removal >>= either (fail . show) pure
+            pure ()
+          tickUntil fvm (elem "done" <$> outLinesSTM world)
+          printed ← outLines world
+          [line | line ← printed, "region\tsuccess\t40 " `Text.isPrefixOf` line] `shouldSatisfy` (not . null)
+
+-- | A request that ended while its copy was made keeps its place until the service has released its borrow.
+retirementSpec ∷ Spec
+retirementSpec =
+  it "keeps the place of a cancelled and taken request charged until the service has released its borrow, and gives it back after" $ do
+    gate ← newGate
+    disarmGate gate
+    withRigProbe defaultConfig (gatedProbe (\case PointPrepared _ → True; _ → False) gate) $ \rig → do
+      let held =
+            script
+              { scPrelude = terrainPrelude
+              , scInit = ["self.s = 0", "self.q = api.terrain.open('main', DEF)", "self.cells = {}"]
+              , scUpdate =
+                  [ "if self.s == 0 then"
+                  , "  local t = settle(api, self.q)"
+                  , "  if t then self.arena = t.value print('opened') self.s = 1 end"
+                  , "elseif self.s == 1 then"
+                  , "  TEST_WAIT('go')"
+                  , "  self.r = api.terrain.region(self.arena, {x = 0, y = 0, z = 0})"
+                  , "  print('issued') self.s = 2"
+                  , "elseif self.s == 2 then"
+                  , "  api.request.cancel(self.r)"
+                  , "  print('taken', api.request.take(self.r).status)"
+                  , "  local accepted = 0"
+                  , "  for i = 1, 16 do"
+                  , "    local r = api.terrain.cell(self.arena, {x = i, y = 0, z = 0})"
+                  , "    if r ~= nil then accepted = accepted + 1 self.cells[accepted] = r end"
+                  , "  end"
+                  , "  print('accepted while the borrow is held', accepted)"
+                  , "  for _, r in ipairs(self.cells) do api.request.cancel(r) end"
+                  , "  print('done') self.s = 3"
+                  , "end"
+                  ]
+              }
+          svc = rgService rig
+      withScript rig fixedM1Profile presentationOver held $ \world _ → (`finally` openGate gate) $ do
+        untilPrinted world "opened"
+        baseline ← retainedUse svc
+        armGate gate
+        signalRig rig "go"
+        untilPrinted world "issued"
+        awaitReached gate
+        untilPrinted world "done"
+        printed ← outLines world
+        -- the cancelled request's place is not given back while the owner still holds the borrow: one of the sixteen is taken
+        printed `shouldContain` ["accepted while the borrow is held\t15"]
+        openGate gate
+        bounded (atomically (inspectRegionalSTM svc >>= check . null))
+        balancedAt svc baseline

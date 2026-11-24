@@ -44,6 +44,7 @@ module Hetoimasia.Terrain.Runtime.Settlement
   , retire
   , retireSTM
   , takeSTM
+  , borrowHeldSTM
   , TakeOutcome (..)
   , releaseArenaLeaseSTM
   ) where
@@ -159,6 +160,13 @@ retireSTM = retireRequest
 -- 'Taken'.
 takeSTM ∷ Service → Request → STM TakeOutcome
 takeSTM = takeRequest
+
+-- | Whether the service still holds a regional borrow charged to this request: while the request is pending, its result untaken, or
+-- (when the request ended while its build read or its copies were being turned into the snapshot) until the owner's safe point. It is
+-- what a host reads to prove its work on a regional request over: the borrow's charge is back, not only the request's own record. A borrow
+-- the host took ('takeSTM') is the host's and is not held for the request.
+borrowHeldSTM ∷ Service → Request → STM Bool
+borrowHeldSTM = requestBorrowHeld
 
 -- | 'Hetoimasia.Terrain.Runtime.releaseLease' as a transaction, for a host that gives a lease back from inside one (the Lua host does, for a
 -- lease the service made for an open it then settled instead of publishing): the lease is released in that transaction and never left

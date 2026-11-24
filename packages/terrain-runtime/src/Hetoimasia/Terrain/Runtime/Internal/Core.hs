@@ -62,6 +62,7 @@ module Hetoimasia.Terrain.Runtime.Internal.Core
   , cancelRequest
   , retireRequest
   , takeRequest
+  , requestBorrowHeld
   , TakeOutcome (..)
 
     -- * Closure
@@ -1042,6 +1043,19 @@ takeRequest svc (Request tag rid)
           releaseReq svc rid req
           pure outcome
         _ → pure TakeReleased
+
+-- | Whether the service still holds a regional borrow charged to this request: pending, staged or untaken, or its request ended while
+-- its build or its delivery was running, so that the borrow waits for the owner's safe point ('regionalRequestEnded'). A borrow its holder
+-- took is the holder's, and a borrow already released is not found. A request of another service, or one with no borrow, holds none.
+requestBorrowHeld ∷ Service → Request → STM Bool
+requestBorrowHeld svc (Request tag rid)
+  | tag /= serviceTag svc = pure False
+  | otherwise = any charged . Map.elems . stateRegional <$> readSt svc
+  where
+    charged rec = case regionalOwner rec of
+      OwnedByRequest owner → owner == rid
+      Orphaned owner → owner == rid
+      OwnedByHolder → False
 
 -- ---------------------------------------------------------------------------
 -- Closure

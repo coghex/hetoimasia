@@ -204,6 +204,7 @@ import Hetoimasia.Terrain.Runtime.Settlement
   , openArenaWithOptions
   , removeWith
   , retryWith
+  , borrowHeldSTM
   , releaseArenaLeaseSTM
   , regionsWith
   , retireSTM
@@ -1323,10 +1324,9 @@ submitToService env submission found settling = do
             AskRetry {} → pure True
             -- a regional read takes its borrow when it settles, and needs the service's request for it: the owner waits (it reads this
             -- cell) until the hand-off has recorded it
-            AskRegion {} → do
-              known ← isJust <$> readTVar (pdRequest found)
-              representable ← fromMaybe False <$> representableNow
-              pure (known && representable)
+            -- (its revisions are the pinned snapshot's, judged in its reply ('regionReply'), never the live arena's: an arena that has
+            -- moved on since the copy was staged must not keep the staged copy from settling)
+            AskRegion {} → isJust <$> readTVar (pdRequest found)
             _ → fromMaybe False <$> representableNow
       -- Whether the revision this request will hand to Lua is one a Lua integer holds, from the arena as the service has it. A read hands
       -- the arena's revision; a removal hands the next one when it changes content and the same one when it removes air, which only the
@@ -1334,21 +1334,19 @@ submitToService env submission found settling = do
       representableNow ∷ STM (Maybe Bool)
       representableNow = do
         needs ← case pdAsk found of
-          AskCell lease _ → pure (Just (lease, 0, False))
-          AskColumn lease _ _ → pure (Just (lease, 0, False))
-          AskSurface lease _ → pure (Just (lease, 0, False))
-          -- a regional read hands both revisions of the version it pinned, neither above the arena's current ones
-          AskRegion lease _ → pure (Just (lease, 0, True))
+          AskCell lease _ → pure (Just (lease, 0))
+          AskColumn lease _ _ → pure (Just (lease, 0))
+          AskSurface lease _ → pure (Just (lease, 0))
           AskRemove lease _ _ →
             readTVar (pdRequest found) >>= \case
               Nothing → pure Nothing
-              Just request → fmap (\changes → (lease, if changes then 1 else 0, False)) <$> Terrain.stagedRemovalChanges (service env) request
+              Just request → fmap (\changes → (lease, if changes then 1 else 0)) <$> Terrain.stagedRemovalChanges (service env) request
           _ → pure Nothing
         case needs of
           Nothing → pure Nothing
-          Just (lease, advance, knowledge) →
+          Just (lease, advance) →
             Terrain.inspectArenaSTM (service env) lease >>= \case
-              Just view → pure (Just (not (Terrain.viewRevision view `exceeds` advance) && not (knowledge && Terrain.viewKnowledgeRevision view `exceeds` 0)))
+              Just view → pure (Just (not (Terrain.viewRevision view `exceeds` advance)))
               Nothing → pure (Just True)
       exceeds (Revision w) advance = w > min (tvIntegerCeiling (envVm env)) (fromIntegral (maxBound ∷ Int64)) - advance
       -- A revision that cannot be handed to Lua is the host's defect, and it is recorded where it is first known: when the service stages
@@ -1550,7 +1548,7 @@ settleInto env link = \case
     -- the service closed) keeps the request as a ghost, which the withdrawal that precedes this settlement has just made. Its work is not
     -- over because it has answered: the settlement does not prove it so, and the retirement obligation stays ('retirement'). Without a ghost
     -- the settlement proves the work over, as every other does.
-    ghosts ← any Terrain.censusGhost . Terrain.censusRequests <$> Terrain.inspectCensusSTM (service env)
+    ghosts ← workHeld env link
     _ ← (if ghosts then settlingSettleKeeping else settlingSettle) (lkSettling link) (failureReply failure)
     -- An open the service failed holds no claim of its own: the adapter holds its name until the host has settled it.
     case failure of
@@ -1693,14 +1691,24 @@ retirement ∷ Env → Link → STM RetirementState
 retirement env link = do
   terminal ← readTVar (lkTerminal link)
   held ← readTVar (lkLease link)
-  ghosts ← any Terrain.censusGhost . Terrain.censusRequests <$> Terrain.inspectCensusSTM (service env)
-  pure (if terminal && not (isOffered held) && not ghosts then ProviderComplete else ProviderPending)
+  retained ← workHeld env link
+  pure (if terminal && not (isOffered held) && not retained then ProviderComplete else ProviderPending)
   where
     isOffered = \case
       Offered _ → True
       Adopting _ → True
       Revoking _ → True
       _ → False
+
+-- | Whether the service still holds something this request borrowed: a ghost (the census does not say which request one is, so any ghost
+-- holds every request back), or this request's regional borrow, which a request that ended while its build or its delivery ran leaves with
+-- the service until the owner's safe point ('Terrain.borrowHeldSTM'). The request's work is not over, and its places are not returned,
+-- before both are gone.
+workHeld ∷ Env → Link → STM Bool
+workHeld env link = do
+  ghosts ← any Terrain.censusGhost . Terrain.censusRequests <$> Terrain.inspectCensusSTM (service env)
+  borrowed ← readTVar (lkRequest link) >>= maybe (pure False) (borrowHeldSTM (service env))
+  pure (ghosts || borrowed)
 
 -- The start ------------------------------------------------------------------------------------------------------
 
