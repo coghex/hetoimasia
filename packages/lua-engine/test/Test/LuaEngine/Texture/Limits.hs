@@ -367,6 +367,9 @@ refusals = describe "permanent refusals" $ do
       -- Nothing stays reserved anywhere: the admission was taken back whole.
       ownerNow vm "i" >>= (`shouldBe` OwnerReading 0 0)
       sessionNow session `shouldReturn` 0
+      -- The credits are back (above) before the request's prepared entry is dropped: the start call drops it as the failure leaves it,
+      -- on the owner's thread, so the owner is ended only after that, and the pipeline is read once it is
+      awaitOwnerEnded vm
       pipelineNow session >>= \reading → (readingReserved reading, readingJobs reading, readingPrepared reading) `shouldBe` (0, 0, 0)
       statusReserved <$> poolReading session `shouldReturn` 0
       readsStarted (ssProbe session) `shouldReturn` 0

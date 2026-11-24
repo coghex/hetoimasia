@@ -156,6 +156,10 @@ spec = describe "requests" $ do
         }
       files
       $ \world _ _ _ → do
+        -- the instance is active before its first update's deadline is set (it is one interval after the owner's reading of the
+        -- clock, taken after the phase is published), so the clock moves on only once the owner has armed its timer for that
+        -- deadline: moved earlier, the deadline is set from the moved clock and the update is a second further off
+        awaitTimerOf world 1000000
         advanceClockPast world
         pumpUntil world (elem "arrived success" <$> outLines world)
   describe "admission" $ do
