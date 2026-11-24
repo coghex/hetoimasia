@@ -17,6 +17,7 @@ import Control.Monad (foldM, forM_)
 import qualified Data.ByteString as BS
 import qualified Data.Map.Strict as Map
 import Data.Word (Word64)
+import GHC.Conc (getAllocationCounter)
 import GHC.Stats (RTSStats (..), GCDetails (..), getRTSStats, getRTSStatsEnabled)
 import Hetoimasia.Terrain.Discovery (Record, RecordKey (..), maxBatchUpdates)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Format
@@ -60,24 +61,21 @@ wide n = do
 spread ∷ [RecordKey] → Int → Int → Int → [(RecordKey, Maybe Record)]
 spread keys stride offset k = [(key, Just (runRec 30)) | i ← [0 .. k - 1], let key = keys !! (offset + i * stride)]
 
-allocated ∷ IO Word64
-allocated = allocated_bytes <$> getRTSStats
-
 -- | The live heap after a major collection.
 liveBytes ∷ IO Word64
 liveBytes = assertSequential "a live-heap reading" >> performMajorGC >> (gcdetails_live_bytes . gc <$> getRTSStats)
 
--- | The bytes a forced computation allocates.
+-- | The bytes a forced computation allocates on the calling thread: the difference between two readings of the thread's own
+-- allocation counter around it, which counts down as the thread allocates. The computation must be forced inside the action
+-- (each caller 'evaluate's its result), so the work is inside the window. Another thread's allocation, a collection and the
+-- runtime's own work are not this thread's allocation and never enter the figure.
 measure ∷ IO a → IO Word64
 measure act = do
   assertSequential "an allocation measurement"
-  performMajorGC
-  start ← allocated
+  start ← getAllocationCounter
   _ ← act
-  -- the counter is brought up to date by a collection
-  performMajorGC
-  end ← allocated
-  pure (end - start)
+  end ← getAllocationCounter
+  pure (fromIntegral (start - end))
 
 -- | A plan that writes exactly 256 pages, and the page count one more write needs (past
 -- the bound, so refused), found by bisecting the writes spread one per leaf.
@@ -111,7 +109,8 @@ findExact256 h keys = case [r | off ← [0, 7, 13, 29, 41, 53, 3, 19, 31, 47], R
         _ → Right Nothing
 
 -- | The bytes one forced computation allocates for an edit plan, a pinned point read and
--- a usage report, over a small and a large history: the figures the observation compares.
+-- a usage report, over a small and a large history: the figures the observation compares,
+-- each the calling thread's own allocation ('measure').
 allocationRatios ∷ H → [RecordKey] → IO [(String, Word64, Word64)]
 allocationRatios hBig keysBig = do
   (hSmall, keysSmall) ← must (wide 500)
@@ -143,6 +142,8 @@ allocationRatios hBig keysBig = do
   -- warm up so first-use costs do not decide
   _ ← edit hSmall keysSmall
   _ ← edit hBig keysBig
+  _ ← usageStep hSmall
+  _ ← usageStep hBig
   e1 ← measure (edit hSmall keysSmall)
   e2 ← measure (edit hBig keysBig)
   r1 ← measure (readOne hSmall keysSmall)
@@ -438,8 +439,6 @@ spec = describe "transaction bounds, exactly and one past, and work independent 
     worstUpdatePages (maxLevel + 1) `shouldBe` 17
     bookkeepingReserve `shouldBe` 68
   it "allocates no more for an edit, a read, a reclamation step or a usage report in a history forty times larger" $ do
-    enabled ← getRTSStatsEnabled
-    enabled `shouldBe` True
     (hBig, keysBig) ← readFixture wide20000
     rows ← allocationRatios hBig keysBig
     forM_ rows $ \(name, small, big) → do
