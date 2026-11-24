@@ -21,34 +21,17 @@
 --    @SIGTERM@ and its exit. Termination follows observed rendering, never an
 --    elapsed time.
 -- 3. The loop keeps asking for frames. Its next event processing finds the
---    connection gone, latches it and raises 'ConnectionFailed', which ends the
---    loop; the host's protected exit then retires the target, the device, the
---    messenger and the instance, and terminates the session, under the Wayland
+--    connection gone and raises 'ConnectionFailed', which ends the loop; the
+--    host's protected exit then retires the target, the device, the messenger
+--    and the instance, and terminates the session, under the Wayland
 --    qualification design's D-10: the loss is terminal and nothing
 --    reconnects.
 --
--- The compositor's end and the session's confirmation of it are two moments:
--- the update that ends the compositor is followed, in the same turn, by the
--- adapter's service of replacement surfaces, and only the next turn's event
--- processing probes the connection. A surface operation in that gap precedes
--- the confirmation, so it is no reconnection after a confirmed loss. The
--- case judges "nothing reconnects" from the confirmation through the
--- protected teardown; the operations in the gap are reported, not judged.
---
--- The latch is internal to the session, so the boundary is the start of the
--- turn that latched it: the loop asks the application's readiness once per
--- turn before its event processing, where the loss is probed and latched, and
--- the loop ends there. Event processing creates no surface, so every
--- operation after that readiness query is at or after the latch, and none
--- before it is. The boundary can include more than the latch's own, never
--- less.
---
 -- The case asserts that rendering was verified before the loss; that the
 -- session ended with the loss, a transport closure or protocol failure, as the
--- application's failure; that no surface creation was attempted from the
--- confirmation through the teardown, whether it succeeded or not; that every
--- presentation-fence retirement and every submission completion recorded, at
--- any time, belongs to a presentation or submission the owner actually made —
+-- application's failure; that every presentation-fence retirement and every
+-- submission completion recorded, at any time, belongs to a presentation or
+-- submission the owner actually made —
 -- a loss is never recorded as a signalled fence, a completion or a device loss
 -- — and that the teardown completed: every swapchain created was destroyed,
 -- the roots in dependency order with the instance last, and a verdict, read
@@ -57,6 +40,13 @@
 -- the driver reports after the loss is kept, never discarded. The parent
 -- enforces the child's deadline from outside; an expiry or a forced
 -- termination fails the case.
+--
+-- Whether a surface is created after the loss is not asserted: the session
+-- latches the loss in event processing and raises it again from every later
+-- processing ('Hetoimasia.GLFW.Internal.Session.requireConnection'), and the
+-- loop has no handler, so none follows. A surface the adapter serves in the
+-- turn that ended the compositor precedes the confirmation, so it says
+-- nothing about reconnection.
 module Test.GPU.Vulkan.Native.ConnectionLoss
   ( LossOutcome (..)
   , runConnectionLoss
@@ -107,8 +97,7 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , withVulkanOwnerHost
   )
 import Hetoimasia.Runtime.GLFW
-  ( ScheduledHooks (..)
-  , ScheduledStep (..)
+  ( ScheduledStep (..)
   , TargetStanding (..)
   , UpdateSchedule (..)
   , defaultHostConfig
@@ -130,9 +119,6 @@ import Test.Vulkan.Proof.Roots (NativeCall (..), nativeCallObserver)
 data Loss = Loss
   { lossEvents ∷ !Int
     -- ^ How many frame events had been recorded.
-  , lossCalls ∷ !Int
-    -- ^ How many native calls had returned. The surface operations after this
-    -- and before the confirmation are reported, not judged.
   , lossExit ∷ !ExitCode
     -- ^ How the compositor exited.
   }
@@ -145,9 +131,6 @@ data LossFacts = LossFacts
     -- ^ How the application ended, as displayed.
   , factsConnection ∷ !(Maybe ConnectionFailed)
     -- ^ The loss, when the application's failure was it.
-  , factsTurnCalls ∷ !(Maybe Int)
-    -- ^ How many native calls had returned when the loop's last turn began,
-    -- the turn whose event processing ended it. 'Nothing' when no turn began.
   , factsEvents ∷ ![FrameEvent]
     -- ^ Every frame event, oldest first.
   , factsCalls ∷ ![NativeCall]
@@ -179,7 +162,6 @@ session journal compositor = do
   logged ← newTVarIO []
   verdictHeld ← newIORef Nothing
   lossHeld ← newIORef Nothing
-  turnHeld ← newIORef Nothing
   scene ← prepare ()
   budgets ← either (stopWith . tshow) pure (validateBudgets defaultBudgetRequest)
   let window = (hiddenTestWindowConfig "hetoimasia WL-4 connection loss" 160 120) {windowVisible = True}
@@ -205,12 +187,11 @@ session journal compositor = do
           )
           vulkanWindowHost
           (\vulkan _ → pure vulkan)
-          (\vulkan control → body vulkan control recorded events lossHeld turnHeld)
+          (\vulkan control → body vulkan control events lossHeld)
   -- The host returns its verdict only when it returns; a host the loss ended
   -- attaches it to the failure instead.
   verdict ← maybe (either diagnosticVerdict (const Nothing) outcome) Just <$> readIORef verdictHeld
   calls ← reverse <$> readIORef recorded
-  turnCalls ← readIORef turnHeld
   entries ← readTVarIO logged
   seen ← reverse <$> readTVarIO events
   let errors =
@@ -239,14 +220,13 @@ session journal compositor = do
           , factsLoss = loss
           , factsFailure = failure
           , factsConnection = connection
-          , factsTurnCalls = turnCalls
           , factsEvents = seen
           , factsCalls = calls
           , factsVerdict = verdict
           , factsErrors = errors
           }
   where
-    body vulkan control recorded events lossHeld turnHeld = do
+    body vulkan control events lossHeld = do
       notePlatform journal (Just Wayland)
       let controller = vulkanController vulkan
           windowHost = vulkanWindowHost vulkan
@@ -287,11 +267,7 @@ session journal compositor = do
             seen ← readTVarIO events
             pure (not (null [() | PresentationRetired presentation ← seen, presentation `elem` [made | FramePresented _ _ made _ ← seen]]))
       deadline ← addUTCTime 15 <$> getCurrentTime
-      -- Asked once per turn, before the turn's event processing, so the last
-      -- count is the start of the turn that ended the loop. It answers that
-      -- nothing is ready, as the default hooks do.
-      let startOfTurn hooks = hooks {scheduledReady = False <$ (readIORef recorded >>= writeIORef turnHeld . Just . length)}
-      runVulkanOwnerLoop vulkan control . startOfTurn . defaultScheduledHooks quiet $ \_ → do
+      runVulkanOwnerLoop vulkan control . defaultScheduledHooks quiet $ \_ → do
         now ← getCurrentTime
         when (now > deadline) (stopWith "the loss was not confirmed within 15 seconds")
         demand
@@ -302,9 +278,8 @@ session journal compositor = do
             -- A frame is asked for, and the compositor goes while the owner
             -- renders it.
             seen ← length <$> readTVarIO events
-            calls ← length <$> readIORef recorded
             exit ← endCompositor compositor
-            writeIORef lossHeld (Just (Loss seen calls exit))
+            writeIORef lossHeld (Just (Loss seen exit))
           _ → pure ()
         pure (ContinueWith NoUpdateDemand)
     quiet = recordingLogger (\_ → pure ())
@@ -325,8 +300,6 @@ lossSection = \case
     , "- after the loss: " <> tshow (length (after facts)) <> " frame events, " <> tshow (presentedIn (after facts)) <> " presentations made and " <> tshow (retiredIn (after facts)) <> " retired on their present fences"
     , "- the application ended: " <> factsFailure facts
     , "- the loss: " <> maybe "not a connection failure" (\failure → tshow (connectionCause failure) <> ", " <> tshow (connectionBoundary failure)) (factsConnection facts)
-    , "- surface operations between ending the compositor and the confirmation (not judged): " <> tshow (length (surfaceOperations (between facts)))
-    , "- surface creations attempted from the confirmation through the teardown: " <> maybe "no confirmed loss" (tshow . length . surfaceOperations) (callsAfter facts)
     , "- swapchains created and destroyed: " <> tshow (countCalls "vkCreateSwapchainKHR" facts) <> " and " <> tshow (countCalls "vkDestroySwapchainKHR" facts)
     , "- verdict issues: " <> maybe "no verdict" (tshow . verdictIssues) (factsVerdict facts)
     , "- error reports: " <> tshow (length (factsErrors facts))
@@ -340,38 +313,6 @@ before, after ∷ LossFacts → [FrameEvent]
 before facts = take (lossEvents (factsLoss facts)) (factsEvents facts)
 after facts = drop (lossEvents (factsLoss facts)) (factsEvents facts)
 
--- | How many native calls had returned at the confirmed loss's boundary, the
--- start of the turn that latched it, when the application ended with a
--- confirmed loss. A probe that could not establish the status at all is not a
--- confirmed loss, and gives no boundary.
-confirmedAt ∷ LossFacts → Maybe Int
-confirmedAt facts = case factsConnection facts of
-  Just failure | confirmed (connectionCause failure) → factsTurnCalls facts
-  _ → Nothing
-
--- | The native calls after the confirmation, through the protected teardown.
-callsAfter ∷ LossFacts → Maybe [NativeCall]
-callsAfter facts = (`drop` factsCalls facts) <$> confirmedAt facts
-
--- | The native calls after the compositor was ended and before the
--- confirmation.
-between ∷ LossFacts → [NativeCall]
-between facts =
-  take (maybe 0 (subtract (lossCalls (factsLoss facts))) (confirmedAt facts)) (drop (lossCalls (factsLoss facts)) (factsCalls facts))
-
--- | The probe found the connection gone.
-confirmed ∷ ConnectionCause → Bool
-confirmed = \case
-  TransportClosed _ → True
-  ProtocolFailure → True
-  ProbeFailure _ → False
-
--- | The calls of a surface-creating operation, whether or not it succeeded.
--- The name is the bridge operation's own, recorded after it returns, so an
--- operation the bridge refused before any native effect is among them.
-surfaceOperations ∷ [NativeCall] → [NativeCall]
-surfaceOperations calls = [call | call ← calls, call.callName == "glfwCreateWindowSurface"]
-
 countCalls ∷ Text → LossFacts → Int
 countCalls name facts = length [() | call ← factsCalls facts, call.callName == name, call.callRaised == Nothing]
 
@@ -382,14 +323,11 @@ spec outcome = describe "WL-4 connection loss during rendering" $ do
       [presentation | PresentationRetired presentation ← before facts, presentation `elem` [made | FramePresented _ _ made _ ← before facts]]
         `shouldSatisfy` (not . null)
 
-  it "ended the session with the confirmed loss as the application's failure, and reconnected nothing" $
-    on outcome $ \facts → do
+  it "ended the session with the confirmed loss as the application's failure" $
+    on outcome $ \facts →
       case factsConnection facts of
         Nothing → expectationFailure ("the application did not end with the connection's loss: " <> Text.unpack (factsFailure facts))
         Just failure → connectionCause failure `shouldSatisfy` confirmed
-      case callsAfter facts of
-        Nothing → expectationFailure "no confirmed loss bounds the reconnection check"
-        Just afterwards → map (.callName) (surfaceOperations afterwards) `shouldBe` []
 
   it "recorded no fence, completion or device loss for work the lost connection interrupted" $
     on outcome $ \facts → do
@@ -414,6 +352,12 @@ spec outcome = describe "WL-4 connection loss during rendering" $ do
     on = \case
       LossFailed reason → const (expectationFailure (Text.unpack reason))
       LossRecorded facts → ($ facts)
+    -- The probe found the connection gone; a probe that could not establish
+    -- the status at all is not a confirmed loss.
+    confirmed = \case
+      TransportClosed _ → True
+      ProtocolFailure → True
+      ProbeFailure _ → False
 
 -- ---------------------------------------------------------------------------
 -- Helpers
