@@ -48,6 +48,7 @@ import Hetoimasia.LuaEngine.Facade.Bindings
 import Hetoimasia.LuaEngine.Facade.Caller (Caller (..), Stage (..), requireInstance, whoIsCalling)
 import Hetoimasia.LuaEngine.Facade.Types
 import Hetoimasia.LuaEngine.Request (m1HandleType, m1StartResults, m1StartSchemas)
+import Hetoimasia.Scripting.Lua.Provider (RequestEndpoint (endpointName))
 import Hetoimasia.Scripting.Lua.Registration
   ( ArgumentCheck
   , Binding
@@ -378,8 +379,13 @@ terrainBindings facade services =
     attachHostTarget = \case
       [] → Right ()
       _ → Left "attach_host takes no arguments"
-    attachHostCheck = checked "a terrain host attach" attachHostTarget $ \caller () → tsAttachCheck services (identityOf caller) (rootOf caller) terrainHostAttachName
-    attachHostAct = starting "a terrain host attach" terrainArenaRequestType attachHostTarget $ \caller () → tsAttachStart services (identityOf caller) (rootOf caller) terrainHostAttachName
+    -- A provider opts in by declaring the host attach endpoint; any other is asked, as the original attach asks it, for a valid name that
+    -- no script can hold (past the length a script may name), which it answers as a name nothing holds: not_found.
+    hostName
+      | any ((== terrainHostAttachEndpoint) . endpointName) (tsEndpoints services) = terrainHostAttachName
+      | otherwise = Text.replicate (terrainNameLimit + 1) "~"
+    attachHostCheck = checked "a terrain host attach" attachHostTarget $ \caller () owner _ → tsAttachCheck services (identityOf caller) (rootOf caller) hostName owner [VText hostName]
+    attachHostAct = starting "a terrain host attach" terrainArenaRequestType attachHostTarget $ \caller () → tsAttachStart services (identityOf caller) (rootOf caller) hostName
 
     -- cell, column and surface ----------------------------------------------------------------------------
     cellTarget = \case

@@ -24,7 +24,8 @@ import Hetoimasia.Terrain.Residency (RegionDemand (..), Revision (..), coverageT
 import Hetoimasia.Terrain.Runtime
 import Hetoimasia.Terrain.Source (LayerSpec (..), SourceSpec (..))
 import Control.Concurrent.STM (atomically, retry)
-import Data.IORef (atomicModifyIORef', newIORef, writeIORef)
+import Data.IORef (atomicModifyIORef', newIORef, readIORef, writeIORef)
+import Hetoimasia.Scripting.Lua.Provider (RequestEndpoint (endpointName))
 import Control.Monad (when)
 import Test.Hspec
 import Test.Support.Bounded (bounded)
@@ -406,6 +407,37 @@ spec = describe "host-published arena" $ do
           outLines world >>= (`shouldContain` ["call\tfalse\ttrue"])
           limitHeld (rgService rig) "leases" `shouldReturn` 0
           inspectInvariants (rgService rig) `shouldReturn` []
+
+  it "leaves a provider that declares no host attachment its original attach: it is asked for a name no script can hold, and settles not_found" $
+    withRig $ \rig → do
+      host ← publish rig "modules-test"
+      asked ← newIORef ([] ∷ [Text])
+      -- a provider as the original constructor gave it: the adapter's services without the host attachment endpoint, whose named-attach
+      -- check refuses an empty name, and which records the names it is asked for
+      let original = TerrainInjection
+            { tiLeaseCapacity = tiLeaseCapacity (hostInjection host)
+            , injectTerrain = \vm → do
+                services ← injectTerrain (hostInjection host) vm
+                pure
+                  services
+                    { tsEndpoints = filter ((/= terrainHostAttachEndpoint) . endpointName) (tsEndpoints services)
+                    , tsAttachCheck = \identity root name owner values → do
+                        atomicModifyIORef' asked (\seen → (name : seen, ()))
+                        if Text.null name then pure (Just "an arena name is empty") else tsAttachCheck services identity root name owner values
+                    , tsAttachStart = \identity root name ctx → do
+                        atomicModifyIORef' asked (\seen → (name : seen, ()))
+                        tsAttachStart services identity root name ctx
+                    }
+            }
+      withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource (hostSteps (readsLabelled "0")))]) $ \world _ runtime →
+        withFvm world runtime (presentationWith rig original) $ \fvm → do
+          _ ← spawn world fvm "modules-test" mainPath
+          stepUntil world (elem "done" <$> outLinesSTM world)
+          outLines world >>= (`shouldBe` ["attach\tfailure\tnot_found", "done"])
+          names ← readIORef asked
+          length names `shouldBe` 2
+          names `shouldSatisfy` all (\name → not (Text.null name) && Text.length name > 128)
+          limitHeld (rgService rig) "leases" `shouldReturn` 1
 
   it "attaches with the service's client bank full: the instance's own client issues the attachment" $
     withRigConfig defaultConfig {configMaxClients = 2} $ \rig → do

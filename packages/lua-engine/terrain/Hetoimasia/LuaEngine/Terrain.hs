@@ -104,6 +104,7 @@ import Hetoimasia.LuaEngine.Facade
   , terrainGrowValueSchema
   , terrainStatusValueSchema
   , terrainStorageMinimum
+  , terrainHostAttachEndpoint
   , terrainHostAttachName
   , terrainStorageUnit
   , terrainSurfaceValueSchema
@@ -386,7 +387,7 @@ terrainCodes =
 terrainCodesFor ∷ Text → [Text]
 terrainCodesFor name
   | name == openName = base <> ["source_complexity", "storage_unsupported", "reservation_failed", "storage_io"]
-  | name == attachName = base
+  | name `elem` [attachName, attachHostName] = base
   | name == removeName = base <> ["storage_full", "storage_io", "storage_integrity"]
   | name `elem` [cellName, columnName, surfaceName] = base <> ["storage_io", "storage_integrity"]
   | name == statusName = ["arena_closed"]
@@ -585,13 +586,13 @@ services env =
           then -- the name no script can pass asks for the arena the host published to this instance's root
             case published env root of
               -- no arena is published to this instance's root: the request settles not_found at its hand-off, with no client made
-              Nothing → start env context attachName attachAsk (AskAttachHost Nothing)
+              Nothing → start env context attachHostName attachHostAsk (AskAttachHost Nothing)
               -- the instance's own client: the service issues the attachment as a nonowner lease whichever client asks, so it needs no
               -- client of its own to keep the creator-owner rule apart, and one the instance holds already cannot be refused as the bank
               -- filling
               Just source → do
                 client ← clientOf env identity
-                start env context attachName attachAsk (AskAttachHost (Just (client, source)))
+                start env context attachHostName attachHostAsk (AskAttachHost (Just (client, source)))
           else
             attachClientOf env identity >>= \case
               Left refusal → pure refusal
@@ -682,6 +683,8 @@ services env =
     endpoints =
       [ endpoint env openName SNil
       , endpoint env attachName SNil
+      , -- the opt-in of host attachment: the facade asks this provider for the published arena, and not for a name nothing holds
+        endpoint env attachHostName SNil
       , endpoint env cellName terrainCellValueSchema
       , endpoint env columnName terrainColumnValueSchema
       , endpoint env surfaceName terrainSurfaceValueSchema
@@ -696,9 +699,10 @@ services env =
       AlreadyReleased → "already_released"
 
 -- | The endpoint names of the requests.
-openName, attachName, cellName, columnName, surfaceName, removeName, statusName, growName, retryName ∷ Text
+openName, attachName, attachHostName, cellName, columnName, surfaceName, removeName, statusName, growName, retryName ∷ Text
 openName = "terrain_open"
 attachName = "terrain_attach"
+attachHostName = terrainHostAttachEndpoint
 cellName = "terrain_cell"
 columnName = "terrain_column"
 surfaceName = "terrain_surface"
@@ -778,9 +782,10 @@ drainRetired env = atomically (pruneClaims (names (envFacade env)) >> pruneFaile
 -- The asks ------------------------------------------------------------------------------------------------------
 
 -- | Each request's ask, declaring exactly the expected codes its endpoint can settle with ('terrainCodesFor').
-openAsk, attachAsk, readAsk, removeAsk, statusAsk, growAsk, retryAsk ∷ M1Ask
+openAsk, attachAsk, attachHostAsk, readAsk, removeAsk, statusAsk, growAsk, retryAsk ∷ M1Ask
 openAsk = leaseAsk "terrain open" (terrainCodesFor openName)
 attachAsk = leaseAsk "terrain attach" (terrainCodesFor attachName)
+attachHostAsk = leaseAsk "terrain host attach" (terrainCodesFor attachHostName)
 readAsk = (m1Ask OptionalRequest "terrain read") {askCodes = terrainCodesFor cellName}
 removeAsk = (m1Ask OptionalRequest "terrain removal") {askCodes = terrainCodesFor removeName}
 statusAsk = (m1Ask OptionalRequest "terrain status") {askCodes = terrainCodesFor statusName}
