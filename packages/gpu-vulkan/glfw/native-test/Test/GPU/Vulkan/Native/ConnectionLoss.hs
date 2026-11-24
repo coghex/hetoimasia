@@ -21,15 +21,25 @@
 --    @SIGTERM@ and its exit. Termination follows observed rendering, never an
 --    elapsed time.
 -- 3. The loop keeps asking for frames. Its next event processing finds the
---    connection gone and raises 'ConnectionFailed', which ends the loop; the
---    host's protected exit then retires the target, the device, the messenger
---    and the instance, and terminates the session, under the Wayland
+--    connection gone, latches it and raises 'ConnectionFailed', which ends the
+--    loop; the host's protected exit then retires the target, the device, the
+--    messenger and the instance, and terminates the session, under the Wayland
 --    qualification design's D-10: the loss is terminal and nothing
 --    reconnects.
 --
+-- The compositor's end and the session's confirmation of it are two moments:
+-- the update that ends the compositor is followed, in the same turn, by the
+-- adapter's service of replacement surfaces, and only the next turn's event
+-- processing probes the connection. A surface operation in that gap precedes
+-- the confirmation, so it is no reconnection after a confirmed loss. The
+-- case judges "nothing reconnects" from the confirmation, which the loop
+-- carries to the application as the 'ConnectionFailed' it ends with, through
+-- the protected teardown; the operations in the gap are reported, not judged.
+--
 -- The case asserts that rendering was verified before the loss; that the
 -- session ended with the loss, a transport closure or protocol failure, as the
--- application's failure; that no surface was created after it; that every
+-- application's failure; that no surface creation was attempted from the
+-- confirmation through the teardown, whether it succeeded or not; that every
 -- presentation-fence retirement and every submission completion recorded, at
 -- any time, belongs to a presentation or submission the owner actually made —
 -- a loss is never recorded as a signalled fence, a completion or a device loss
@@ -48,11 +58,12 @@ module Test.GPU.Vulkan.Native.ConnectionLoss
   ) where
 
 import Control.Concurrent.STM (STM, atomically, check, modifyTVar', newTVarIO, orElse, readTVar, readTVarIO, registerDelay, retry, writeTVar)
-import Control.Exception (SomeException, displayException, fromException, throwIO, try)
+import Control.Exception (SomeException, catch, displayException, fromException, throwIO, try)
 import Control.Monad (forM_, when)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.List (isSubsequenceOf)
 import qualified Data.Map.Strict as Map
+import Data.Maybe (isJust)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Time.Clock (addUTCTime, getCurrentTime)
@@ -113,7 +124,8 @@ data Loss = Loss
   { lossEvents ∷ !Int
     -- ^ How many frame events had been recorded.
   , lossCalls ∷ !Int
-    -- ^ How many native calls had returned.
+    -- ^ How many native calls had returned. The surface operations after this
+    -- and before the confirmation are reported, not judged.
   , lossExit ∷ !ExitCode
     -- ^ How the compositor exited.
   }
@@ -126,6 +138,11 @@ data LossFacts = LossFacts
     -- ^ How the application ended, as displayed.
   , factsConnection ∷ !(Maybe ConnectionFailed)
     -- ^ The loss, when the application's failure was it.
+  , factsConfirmed ∷ !(Maybe Int)
+    -- ^ How many native calls had returned when the loop ended with the
+    -- loss's 'ConnectionFailed': the first moment the application saw the
+    -- confirmation, and nothing the loop does after the latch runs before it.
+    -- 'Nothing' when the loop ended with no such failure.
   , factsEvents ∷ ![FrameEvent]
     -- ^ Every frame event, oldest first.
   , factsCalls ∷ ![NativeCall]
@@ -157,6 +174,7 @@ session journal compositor = do
   logged ← newTVarIO []
   verdictHeld ← newIORef Nothing
   lossHeld ← newIORef Nothing
+  confirmedHeld ← newIORef Nothing
   scene ← prepare ()
   budgets ← either (stopWith . tshow) pure (validateBudgets defaultBudgetRequest)
   let window = (hiddenTestWindowConfig "hetoimasia WL-4 connection loss" 160 120) {windowVisible = True}
@@ -182,11 +200,12 @@ session journal compositor = do
           )
           vulkanWindowHost
           (\vulkan _ → pure vulkan)
-          (\vulkan control → body vulkan control recorded events lossHeld)
+          (\vulkan control → body vulkan control recorded events lossHeld confirmedHeld)
   -- The host returns its verdict only when it returns; a host the loss ended
   -- attaches it to the failure instead.
   verdict ← maybe (either diagnosticVerdict (const Nothing) outcome) Just <$> readIORef verdictHeld
   calls ← reverse <$> readIORef recorded
+  confirmed ← readIORef confirmedHeld
   entries ← readTVarIO logged
   seen ← reverse <$> readTVarIO events
   let errors =
@@ -215,13 +234,14 @@ session journal compositor = do
           , factsLoss = loss
           , factsFailure = failure
           , factsConnection = connection
+          , factsConfirmed = confirmed
           , factsEvents = seen
           , factsCalls = calls
           , factsVerdict = verdict
           , factsErrors = errors
           }
   where
-    body vulkan control recorded events lossHeld = do
+    body vulkan control recorded events lossHeld confirmedHeld = do
       notePlatform journal (Just Wayland)
       let controller = vulkanController vulkan
           windowHost = vulkanWindowHost vulkan
@@ -262,7 +282,14 @@ session journal compositor = do
             seen ← readTVarIO events
             pure (not (null [() | PresentationRetired presentation ← seen, presentation `elem` [made | FramePresented _ _ made _ ← seen]]))
       deadline ← addUTCTime 15 <$> getCurrentTime
-      runVulkanOwnerLoop vulkan control . defaultScheduledHooks quiet $ \_ → do
+      -- The loop ends with the loss the moment its event processing latches
+      -- it, before any other turn work, so the calls returned when it ends are
+      -- the calls returned at the confirmation. The failure is passed on.
+      let confirming failure = do
+            when (isJust (fromException failure ∷ Maybe ConnectionFailed)) $
+              readIORef recorded >>= writeIORef confirmedHeld . Just . length
+            throwIO failure
+      (`catch` confirming) . runVulkanOwnerLoop vulkan control . defaultScheduledHooks quiet $ \_ → do
         now ← getCurrentTime
         when (now > deadline) (stopWith "the loss was not confirmed within 15 seconds")
         demand
@@ -296,7 +323,8 @@ lossSection = \case
     , "- after the loss: " <> tshow (length (after facts)) <> " frame events, " <> tshow (presentedIn (after facts)) <> " presentations made and " <> tshow (retiredIn (after facts)) <> " retired on their present fences"
     , "- the application ended: " <> factsFailure facts
     , "- the loss: " <> maybe "not a connection failure" (\failure → tshow (connectionCause failure) <> ", " <> tshow (connectionBoundary failure)) (factsConnection facts)
-    , "- surfaces created after the loss: " <> tshow (length [() | call ← callsAfter facts, call.callName == "glfwCreateWindowSurface"])
+    , "- surface operations between ending the compositor and the confirmation (not judged): " <> tshow (length (surfaceOperations (between facts)))
+    , "- surface creations attempted from the confirmation through the teardown: " <> maybe "the loop did not end with the confirmation" (tshow . length . surfaceOperations) (callsAfter facts)
     , "- swapchains created and destroyed: " <> tshow (countCalls "vkCreateSwapchainKHR" facts) <> " and " <> tshow (countCalls "vkDestroySwapchainKHR" facts)
     , "- verdict issues: " <> maybe "no verdict" (tshow . verdictIssues) (factsVerdict facts)
     , "- error reports: " <> tshow (length (factsErrors facts))
@@ -310,8 +338,22 @@ before, after ∷ LossFacts → [FrameEvent]
 before facts = take (lossEvents (factsLoss facts)) (factsEvents facts)
 after facts = drop (lossEvents (factsLoss facts)) (factsEvents facts)
 
-callsAfter ∷ LossFacts → [NativeCall]
-callsAfter facts = drop (lossCalls (factsLoss facts)) (factsCalls facts)
+-- | The native calls after the confirmation, through the protected teardown,
+-- when the loop ended with one.
+callsAfter ∷ LossFacts → Maybe [NativeCall]
+callsAfter facts = (`drop` factsCalls facts) <$> factsConfirmed facts
+
+-- | The native calls after the compositor was ended and before the
+-- confirmation.
+between ∷ LossFacts → [NativeCall]
+between facts =
+  take (maybe 0 (subtract (lossCalls (factsLoss facts))) (factsConfirmed facts)) (drop (lossCalls (factsLoss facts)) (factsCalls facts))
+
+-- | The calls of a surface-creating operation, whether or not it succeeded.
+-- The name is the bridge operation's own, recorded after it returns, so an
+-- operation the bridge refused before any native effect is among them.
+surfaceOperations ∷ [NativeCall] → [NativeCall]
+surfaceOperations calls = [call | call ← calls, call.callName == "glfwCreateWindowSurface"]
 
 countCalls ∷ Text → LossFacts → Int
 countCalls name facts = length [() | call ← factsCalls facts, call.callName == name, call.callRaised == Nothing]
@@ -328,7 +370,9 @@ spec outcome = describe "WL-4 connection loss during rendering" $ do
       case factsConnection facts of
         Nothing → expectationFailure ("the application did not end with the connection's loss: " <> Text.unpack (factsFailure facts))
         Just failure → connectionCause failure `shouldSatisfy` confirmed
-      [call.callName | call ← callsAfter facts, call.callName == "glfwCreateWindowSurface"] `shouldBe` []
+      case callsAfter facts of
+        Nothing → expectationFailure "the loop did not end with the loss's confirmation, so no boundary for the reconnection check exists"
+        Just afterwards → map (.callName) (surfaceOperations afterwards) `shouldBe` []
 
   it "recorded no fence, completion or device loss for work the lost connection interrupted" $
     on outcome $ \facts → do
