@@ -104,6 +104,7 @@ import Hetoimasia.LuaEngine.Facade
   , terrainGrowValueSchema
   , terrainStatusValueSchema
   , terrainStorageMinimum
+  , terrainHostAttachName
   , terrainStorageUnit
   , terrainSurfaceValueSchema
   )
@@ -385,7 +386,7 @@ terrainCodes =
 terrainCodesFor ∷ Text → [Text]
 terrainCodesFor name
   | name == openName = base <> ["source_complexity", "storage_unsupported", "reservation_failed", "storage_io"]
-  | name `elem` [attachName, attachHostName] = base
+  | name == attachName = base
   | name == removeName = base <> ["storage_full", "storage_io", "storage_integrity"]
   | name `elem` [cellName, columnName, surfaceName] = base <> ["storage_io", "storage_integrity"]
   | name == statusName = ["arena_closed"]
@@ -579,30 +580,33 @@ services env =
         client ← clientOf env identity
         start env context openName openAsk (AskOpen client (nameKey env root name) (sourceSpec definition) (OpenOptions (toInteger <$> bytes)))
     , tsAttachCheck = \_ _ _ owner values → permanent env (const attachAsk) owner values
-    , tsAttachStart = \identity root name context → do
-        attachClientOf env identity >>= \case
-          Left refusal → pure refusal
-          Right (client, fresh) → do
-            -- A client made for this attach is the attach's to give back when it is not accepted: nothing stays charged for a request
-            -- that was refused (busy in the host's banks or the service's), and an exception leaves none behind either.
-            let giveBack = when fresh $ do
-                  atomically (modifyTVar' (envClients env) (Map.adjust (\clients → clients {clAttach = Nothing}) identity))
-                  endClient (service env) client
-            started ← start env context attachName attachAsk (AskAttach client (nameKey env root name)) `onException` giveBack
-            case started of
-              TerrainStarted (M1Busy _) → giveBack
-              TerrainRefused _ → giveBack
-              _ → pure ()
-            pure started
-    , tsAttachHostCheck = \_ _ owner values → permanent env (const attachHostAsk) owner values
-    , tsAttachHostStart = \identity root context → case published env root of
-        -- no arena is published to this instance's root: the request settles not_found at its hand-off, with no client made for it
-        Nothing → start env context attachHostName attachHostAsk (AskAttachHost Nothing)
-        -- the instance's own client: the service issues the attachment as a nonowner lease whichever client asks, so it needs no client
-        -- of its own to keep the creator-owner rule apart, and one the instance holds already cannot be refused as the bank filling
-        Just source → do
-          client ← clientOf env identity
-          start env context attachHostName attachHostAsk (AskAttachHost (Just (client, source)))
+    , tsAttachStart = \identity root name context →
+        if name == terrainHostAttachName
+          then -- the name no script can pass asks for the arena the host published to this instance's root
+            case published env root of
+              -- no arena is published to this instance's root: the request settles not_found at its hand-off, with no client made
+              Nothing → start env context attachName attachAsk (AskAttachHost Nothing)
+              -- the instance's own client: the service issues the attachment as a nonowner lease whichever client asks, so it needs no
+              -- client of its own to keep the creator-owner rule apart, and one the instance holds already cannot be refused as the bank
+              -- filling
+              Just source → do
+                client ← clientOf env identity
+                start env context attachName attachAsk (AskAttachHost (Just (client, source)))
+          else
+            attachClientOf env identity >>= \case
+              Left refusal → pure refusal
+              Right (client, fresh) → do
+                -- A client made for this attach is the attach's to give back when it is not accepted: nothing stays charged for a request
+                -- that was refused (busy in the host's banks or the service's), and an exception leaves none behind either.
+                let giveBack = when fresh $ do
+                      atomically (modifyTVar' (envClients env) (Map.adjust (\clients → clients {clAttach = Nothing}) identity))
+                      endClient (service env) client
+                started ← start env context attachName attachAsk (AskAttach client (nameKey env root name)) `onException` giveBack
+                case started of
+                  TerrainStarted (M1Busy _) → giveBack
+                  TerrainRefused _ → giveBack
+                  _ → pure ()
+                pure started
     , tsCellCheck = \identity key cell owner values →
         firstRefusal
           [ leaseCheck env identity key readAsk owner values
@@ -678,7 +682,6 @@ services env =
     endpoints =
       [ endpoint env openName SNil
       , endpoint env attachName SNil
-      , endpoint env attachHostName SNil
       , endpoint env cellName terrainCellValueSchema
       , endpoint env columnName terrainColumnValueSchema
       , endpoint env surfaceName terrainSurfaceValueSchema
@@ -693,10 +696,9 @@ services env =
       AlreadyReleased → "already_released"
 
 -- | The endpoint names of the requests.
-openName, attachName, attachHostName, cellName, columnName, surfaceName, removeName, statusName, growName, retryName ∷ Text
+openName, attachName, cellName, columnName, surfaceName, removeName, statusName, growName, retryName ∷ Text
 openName = "terrain_open"
 attachName = "terrain_attach"
-attachHostName = "terrain_attach_host"
 cellName = "terrain_cell"
 columnName = "terrain_column"
 surfaceName = "terrain_surface"
@@ -776,10 +778,9 @@ drainRetired env = atomically (pruneClaims (names (envFacade env)) >> pruneFaile
 -- The asks ------------------------------------------------------------------------------------------------------
 
 -- | Each request's ask, declaring exactly the expected codes its endpoint can settle with ('terrainCodesFor').
-openAsk, attachAsk, attachHostAsk, readAsk, removeAsk, statusAsk, growAsk, retryAsk ∷ M1Ask
+openAsk, attachAsk, readAsk, removeAsk, statusAsk, growAsk, retryAsk ∷ M1Ask
 openAsk = leaseAsk "terrain open" (terrainCodesFor openName)
 attachAsk = leaseAsk "terrain attach" (terrainCodesFor attachName)
-attachHostAsk = leaseAsk "terrain host attach" (terrainCodesFor attachHostName)
 readAsk = (m1Ask OptionalRequest "terrain read") {askCodes = terrainCodesFor cellName}
 removeAsk = (m1Ask OptionalRequest "terrain removal") {askCodes = terrainCodesFor removeName}
 statusAsk = (m1Ask OptionalRequest "terrain status") {askCodes = terrainCodesFor statusName}
@@ -1215,7 +1216,7 @@ submit env submission = mask_ $ do
       throwIO (DeclinedRefused "the VM's copied-value limits cannot carry the answer of this call: narrow the range")
   case pdAsk found of
     AskStatus lease → submitStatus env settling lease
-    AskAttachHost Nothing → submitNotFound settling
+    AskAttachHost Nothing → submitNotFound env settling
     _ → submitToService env submission found settling
 
 -- | A status is no work of the service's: one coherent read of the arena's own state, in one transaction, settled at the hand-off
@@ -1236,10 +1237,17 @@ submitStatus env settling lease = do
     void (settlingSettle settling reply)
   pure ProviderWork {workCancel = pure (), workRetirement = pure ProviderComplete}
 
--- | A request with no arena to reach: settled at the hand-off, @not_found@, and nothing of the service's is touched, reserved or held.
-submitNotFound ∷ Settling → IO ProviderWork
-submitNotFound settling = do
-  atomically (void (settlingSettle settling (failureReply NotFound)))
+-- | A request with no arena to reach: settled at the hand-off, @not_found@, and nothing of the service's is touched, reserved or held. The
+-- service's admission is still decided at the hand-off, in the very transaction that settles it: a service that closed since the host's
+-- precheck is the permanent closed-service refusal every other request gets ('declination'), with the host's reservations taken back.
+submitNotFound ∷ Env → Settling → IO ProviderWork
+submitNotFound env settling = do
+  hookSubmitting (hooks env)
+  admitting ← atomically $ do
+    open ← Terrain.serviceAdmitting (service env)
+    when open (void (settlingSettle settling (failureReply NotFound)))
+    pure open
+  unless admitting (throwIO (declination RefusedClosed))
   pure ProviderWork {workCancel = pure (), workRetirement = pure ProviderComplete}
 
 -- | Hand a request that is the service's work to it.

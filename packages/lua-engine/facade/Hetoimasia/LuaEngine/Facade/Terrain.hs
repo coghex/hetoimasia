@@ -378,8 +378,8 @@ terrainBindings facade services =
     attachHostTarget = \case
       [] → Right ()
       _ → Left "attach_host takes no arguments"
-    attachHostCheck = checked "a terrain host attach" attachHostTarget $ \caller () → tsAttachHostCheck services (identityOf caller) (rootOf caller)
-    attachHostAct = starting "a terrain host attach" terrainArenaRequestType attachHostTarget $ \caller () → tsAttachHostStart services (identityOf caller) (rootOf caller)
+    attachHostCheck = checked "a terrain host attach" attachHostTarget $ \caller () → tsAttachCheck services (identityOf caller) (rootOf caller) terrainHostAttachName
+    attachHostAct = starting "a terrain host attach" terrainArenaRequestType attachHostTarget $ \caller () → tsAttachStart services (identityOf caller) (rootOf caller) terrainHostAttachName
 
     -- cell, column and surface ----------------------------------------------------------------------------
     cellTarget = \case

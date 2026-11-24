@@ -24,6 +24,8 @@ import Hetoimasia.Terrain.Residency (RegionDemand (..), Revision (..), coverageT
 import Hetoimasia.Terrain.Runtime
 import Hetoimasia.Terrain.Source (LayerSpec (..), SourceSpec (..))
 import Control.Concurrent.STM (atomically, retry)
+import Data.IORef (atomicModifyIORef', newIORef, writeIORef)
+import Control.Monad (when)
 import Test.Hspec
 import Test.Support.Bounded (bounded)
 import Test.LuaEngine.Facade.Support
@@ -383,6 +385,28 @@ spec = describe "host-published arena" $ do
           -- the attachment is the instance's own client's: the host's and the instance's are all that is held
           limitHeld service "clients" `shouldReturn` 2
 
+  it "answers a service that closed between the host's precheck and the hand-off of an unpublished attach as the closed-service refusal, with nothing reserved" $ do
+    gate ← newGate
+    armed ← newIORef False
+    let holdFirst = do
+          go ← atomicModifyIORef' armed (\a → (False, a))
+          when go (holdAt gate)
+    withRigHooks defaultConfigForRaces noProbeForRaces noTerrainHooks {hookSubmitting = holdFirst} $ \rig →
+      withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource closesBeforeHandOff)]) $ \world _ runtime →
+        -- the plain injection publishes nothing: the request would settle not_found at the hand-off
+        withFvm world runtime (presentationOver rig) $ \fvm → (`finally` openGate gate) $ do
+          _ ← spawn world fvm "modules-test" mainPath
+          untilPrinted world "ready"
+          writeIORef armed True
+          pumpUntilReached world gate
+          closeService (rgService rig)
+          openGate gate
+          untilPrinted world "done"
+          -- an ordinary error that names the closure, not a request settled not_found
+          outLines world >>= (`shouldContain` ["call\tfalse\ttrue"])
+          limitHeld (rgService rig) "leases" `shouldReturn` 0
+          inspectInvariants (rgService rig) `shouldReturn` []
+
   it "attaches with the service's client bank full: the instance's own client issues the attachment" $
     withRigConfig defaultConfig {configMaxClients = 2} $ \rig → do
       host ← publish rig "modules-test"
@@ -434,6 +458,22 @@ spec = describe "host-published arena" $ do
         Right foreignOpening ← openArena (rgService foreignRig) foreignClient "host/native" soilOverStoneSpec
         Right foreignLease ← await (rgService foreignRig) foreignOpening
         refusal foreignLease `shouldReturn` Just RefusedAuthority
+
+-- | An instance that calls @attach_host@ once the example says to (it is ready), and says whether the call raised a closed-service error.
+closesBeforeHandOff ∷ Script
+closesBeforeHandOff =
+  script
+    { scPrelude = terrainPrelude
+    , scInit = ["self.s = 0"]
+    , scUpdate =
+        [ "if self.s == 0 then print('ready') self.s = 1"
+        , "elseif self.s == 1 then"
+        , "  local ok, e = pcall(api.terrain.attach_host)"
+        , "  print('call', ok, string.find(tostring(e), 'closed', 1, true) ~= nil)"
+        , "  print('done') self.s = 2"
+        , "end"
+        ]
+    }
 
 -- | An instance that removes through its attachment, tries the creator's calls, and releases twice.
 authority ∷ Script
