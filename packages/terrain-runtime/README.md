@@ -2527,8 +2527,8 @@ the seam directly.
 
 ## Consumers
 
-TRA-5 attaches the Lua request endpoint through the settlement seam. TRA-9 and the
-view adapters supply view demand and consume snapshots. The package owns each arena's
+TRA-5 attaches the Lua request endpoint through the settlement seam. A consumer's
+view adapter supplies view demand and consumes snapshots. The package owns each arena's
 session-only reserved store; cross-run saves, root recovery and a public save format are
 not part of it, nor are input, camera and picking implementation, GPU upload and
 retirement, arena artwork, general gameplay state and `api.state`.

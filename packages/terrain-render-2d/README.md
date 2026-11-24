@@ -15,8 +15,8 @@ labelled history of that model).
 
 It plans; it does not draw. The Vulkan half is
 [`hetoimasia-terrain-render-2d-vulkan`](../terrain-render-2d-vulkan/README.md).
-Retained uploads, adoption and live publication are TRA-9; the Lua pick and
-removal connection is TRA-10. Nothing
+It provides no retained uploads, adoption, live publication or Lua pick and
+removal connection: a consumer builds those on its plans. Nothing
 here edits terrain, takes a lease, reads mutable state, launches a worker or
 keeps a cache.
 
@@ -62,8 +62,8 @@ Every value is immutable and every function is pure, so there is no state to own
   transition's result, and owns the `Source`, `Changes` and `Availability` values
   a `TerrainFacts` names. The residency owner is the writer of availability.
 - A `CellPlan` is a whole immutable value. Planning again returns a new one; a
-  retained older plan is never changed. The renderer-side adoption and lifetime
-  of a plan belong to TRA-9.
+  retained older plan is never changed. The adoption and lifetime of a plan
+  belong to its consumer.
 - The package owns no thread, process, queue, cache or other resource, and has
   nothing to reset or dispose.
 
@@ -278,8 +278,8 @@ blue depth tint are reference behaviour; see the evidence).
 The device proof is the `tra17-terrain` scenario of `vulkan-native-tests` (the
 complete Q-13 matrix, run directly) and its bounded required selection
 `tra17-terrain-ci`; the retained records, captures and the measured verdict are
-under `docs/evidence/terrain/tra17/`. Live view ownership, streaming and final
-visual acceptance remain #645 to #648.
+under `docs/evidence/terrain/tra17/`. Live view ownership, streaming and
+visual acceptance of a whole game view are the consumer's.
 
 ## The canonical cutout and normal-map assets (TRA-14)
 
@@ -400,7 +400,7 @@ immutable snapshot and returns values.
 | Assets | `Assets` | The colour artwork and map **coverage planes** (TRA-15 `CoveragePlane`, 96 x 64) of one adopted style, each with its texture and coverage version. |
 | Camera, setup, configuration | `Camera`, `Projection`, `Cells` | The existing camera and view setup; a `CellConfig` with the 250-level band, slack, prefetch margin and `CellLimits`. |
 
-`Knowledge` is the narrow contract revised #645 adapts live discovery into. It
+`Knowledge` is the narrow contract a consumer adapts live discovery into. It
 lists no cell: a long buried or aerial span is one run. The combination P-14 does
 not define, a discovered empty component whose solid boundary is not known, has no
 state and is unrepresentable (a discovery publication records the void and its
@@ -599,7 +599,7 @@ No thread, process, lease, cache, global or I/O.
 The device's raster edges, depth keys, region sampling, lighting and depth effects
 were qualified by TRA-17 (`docs/evidence/terrain/tra17/`); the retained resources
 and their interests under a live view, live discovery, adoption and the Lua pick
-result are #645 and #646; a counterexample found there is a Q-13 stop, not
+result belong to the consumer; a counterexample found there is a Q-13 stop, not
 a reason to change an order, threshold or rule here. The reproducible CPU evidence
 is under `docs/evidence/terrain/tra16/`.
 
