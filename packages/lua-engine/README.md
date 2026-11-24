@@ -1558,7 +1558,7 @@ It acquires no lease, never releases the host's and keeps no arena alive; closin
 attached, and the attachments' requests settle `arena_closed`. The key names the root exactly: an instance is in it when the UTF-8
 encoding of its content root equals `rootKeyBytes`; a key matching no root of the session refuses nothing, and every instance there is
 in an unpublished root. The facade and the injections made from it before keep their behavior and tables; names keep their scoped
-meaning. An attachment issued this way belongs to the calling instance (through its attach client) and is never an owner lease, so
+meaning. An attachment issued this way belongs to the calling instance (issued through the instance's own client: the service never makes it an owner lease, so no attach client is needed) and is never an owner lease, so
 releasing it, or the instance's end, ends only that interest, and `grow_storage` and `retry_storage` through it are ordinary errors as
 for any attachment. The service validates the source lease when the request is admitted and again where the destination lease is issued
 (`attachArenaFrom`, [terrain runtime](../terrain-runtime/README.md)): a grant that expired (released, its client ended, its arena closed)
