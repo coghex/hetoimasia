@@ -425,8 +425,7 @@ spec = describe "graphics calls" $ do
         countOf gx "start" `shouldReturn` 0
         -- The bank has room again: Lua alone retries, on a later update, and the request is accepted and started once.
         writeIORef (gxBusy gx) False
-        advanceClock world 2000000000
-        pumpUntil world (elem "retry\ttrue\ttrue" <$> outLines world)
+        stepUntil world (elem "retry\ttrue\ttrue" <$> outLinesSTM world)
         countOf gx "start texture" `shouldReturn` 1
         finishAll gx
       )
@@ -503,9 +502,8 @@ spec = describe "graphics calls" $ do
       awaitHanded gx 2
       answerTexture gx 0
       answerWindow gx 1
-      -- The presentation cadence is the injected clock's: move it past one period and let the owner look at it.
-      advanceClock world 2000000000
-      pumpUntil world (any (== "release\tdone\talready_released") <$> outLines world)
+      -- The presentation cadence is the injected clock's: step to the owner's first update, once its timer is armed.
+      stepUntil world (any (== "release\tdone\talready_released") <$> outLinesSTM world)
       outLines world >>= \printed → do
         printed `shouldSatisfy` any (== "pending\tpending\tpending")
         printed `shouldSatisfy` any (Text.isPrefixOf "result\tsuccess\tinteger\tinteger\t4\t2\twindow\tuserdata")
@@ -545,11 +543,11 @@ spec = describe "graphics calls" $ do
         awaitHanded gx 2
         answerTexture gx 0
         answerWindow gx 1
-        advanceClock world 2000000000
-        pumpUntil world (elem "got" <$> outLines world)
+        -- Each step decides its stop condition before it wakes the VM, so the update after the one that printed "got" is not
+        -- woken until the admission below is set; and a step waits for the cadence timer, so it never races the owner arming it.
+        stepUntil world (elem "got" <$> outLinesSTM world)
         setAdmission world AdmissionStopping
-        advanceClock world 2000000000
-        pumpUntil world (elem "cased" <$> outLines world)
+        stepUntil world (elem "cased" <$> outLinesSTM world)
         outLines world >>= checkCases stopped
         countOf gx "start" `shouldReturn` 2
         countOf gx "publish" `shouldReturn` 0
