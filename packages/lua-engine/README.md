@@ -1353,6 +1353,7 @@ module. Every call is a dot call with exactly its declared arguments; a request-
 | --- | --- |
 | `api.terrain.open(name, definition [, options])` | request a session- and content-root-local named arena. The result is this instance's **owner** lease, the arena's only owner lease, settled only after the source is prepared, its file reserved and its first roots written. `options` is omitted, `nil` or a record whose only field is an optional `storage_bytes`: the arena's allowance (see [storage](#storage-status-growth-and-recovery-tra-23)) |
 | `api.terrain.attach(name)` | request this instance's **attachment** lease to an existing arena of the same session and content root, including when the instance is the creator. A missing arena and a pending open answer `not_found`, without waiting |
+| `api.terrain.attach_host()` | request this instance's **attachment** lease to the one arena the host published to this instance's content root ([the host's publication](#the-host-published-arena)). Takes no arguments. Nothing published to the root (including a session composed with the plain `terrainInjection`) and a grant that has expired settle `not_found`; an arena the host closed after the lease was issued and before it was published settles `arena_closed`. Either role; the success value is an ordinary arena handle |
 | `api.terrain.cell(arena, {x=, y=, z=})` | the content revision, and air or an authored material and shape |
 | `api.terrain.column(arena, {x=, y=, z_min=, z_max=})` | the complete coalesced runs, air included, of the half-open range `[z_min, z_max)` at one revision; more than 1,024 runs settles `too_large`, never a truncated answer |
 | `api.terrain.surface(arena, {x=, y=})` | the highest occupied cell after edits, explicitly absent for an empty column |
@@ -1410,7 +1411,7 @@ with (`terrainCodesFor`); one it does not declare is a defect there:
 | Request | Storage codes it declares |
 | --- | --- |
 | open | `source_complexity`, `storage_unsupported`, `reservation_failed`, `storage_io` |
-| attach | none |
+| attach, attach_host | none |
 | cell, column, surface | `storage_io`, `storage_integrity` |
 | remove | `storage_full`, `storage_io`, `storage_integrity` |
 | status | none (its only expected failure is `arena_closed`) |
@@ -1521,7 +1522,7 @@ admission and the arena's closure, so exactly one of a script's cancel and the c
 answers `already_settled`. Nothing runs Lua or terrain IO inside the host's STM and nothing waits for the terrain owner on a Lua
 thread.
 
-**Leases and names.** A successful open or attach offers the service's lease to the request; the host builds it into the lease the
+**Leases and names.** A successful open, attach or host attach offers the service's lease to the request; the host builds it into the lease the
 request reserved (the adoption) on the owner's thread and settles then. A request cancelled or ended between the offer and the build
 leaves the offered lease with the adapter, which releases it at that very cancel: no arena, name or lease is left to Lua's
 collection, a finalizer, `shutdown` or a successful `take`. The creator's owner lease is the only owner lease: the service marks an
@@ -1548,6 +1549,23 @@ that exists only under another root or session is `not_found` and says nothing o
 
 **A closed service.** A service that is closed, or whose parent session has ended, is a permanent refusal decided in the call's permanent checks (`Terrain.serviceAdmitting`, a read-only query), before any of the host's own banks: a closed service never reads as busy because a bank of the host's is full. It is a precheck only: the service decides its own admission again, atomically with it, and a service that closes between the check and the hand-off refuses the hand-off the same way and leaves nothing reserved.
 
+<a id="the-host-published-arena"></a>
+**The host-published arena.** `terrainInjectionWithArena ∷ TerrainFacade → RootKey → ArenaLease → IO (Either Refused TerrainInjection)` is
+the `terrainInjection` of the same facade whose instances of one content root can also call `api.terrain.attach_host()`. It validates the
+host's lease against the facade's service and borrows it: the lease must be, then, a live creator (owner) lease of a live arena, and one
+of another service, an attachment, or one already released or closed is refused (`RefusedAuthority`; a closed service `RefusedClosed`).
+It acquires no lease, never releases the host's and keeps no arena alive; closing the arena's last creator lease closes it with Lua
+attached, and the attachments' requests settle `arena_closed`. The key names the root exactly: an instance is in it when the UTF-8
+encoding of its content root equals `rootKeyBytes`; a key matching no root of the session refuses nothing, and every instance there is
+in an unpublished root. The facade and the injections made from it before keep their behavior and tables; names keep their scoped
+meaning. An attachment issued this way belongs to the calling instance (through its attach client) and is never an owner lease, so
+releasing it, or the instance's end, ends only that interest, and `grow_storage` and `retry_storage` through it are ordinary errors as
+for any attachment. The service validates the source lease when the request is admitted and again where the destination lease is issued
+(`attachArenaFrom`, [terrain runtime](../terrain-runtime/README.md)): a grant that expired (released, its client ended, its arena closed)
+settles `not_found`, however it is found, and a reused name cannot redirect it. A declined (busy) or cancelled request holds no
+reservation and no lease. An unpublished root settles `not_found` at the hand-off, with no client made and nothing of the service's
+touched.
+
 **Visibility of a pending open.** Every open request is its own incarnation of its name: what holds a name back from attach, from the service's commit of the open until the host has adopted or let go of its lease, is that incarnation's entry. An open lets go only of its own, so the late cleanup of an earlier open of the name (the release of an arena the script let go of, a cancelled open's revocation) never shows a later open's arena before it has settled.
 
 **An open stays revocable until it is published.** The host's build moves the offered lease to *adopting*; only the settling transaction's last look makes it *adopted* (published). Until then a cancellation that wins (a script's cancel, an epoch, the instance's end) can still revoke the lease and free the name, whoever finds the host's settlement first, so another VM's open of the name never waits for the first owner's next boundary. **Retirement follows the service.** A request cancelled while the owner prepares its answer is retained by the service as a ghost, with its borrowed data and credits, until the owner's safe point; the adapter reports its work over only when the service holds no ghost (the census, public), so a cancelled and taken request keeps its place charged until then. The census does not say which request a ghost is: any ghost holds every retirement back, never early.
@@ -1566,6 +1584,7 @@ and no view, camera or picking: TRA-10 issues the real token. The adapter's `iss
 | the terrain `Service`, its owner thread | the assembly | borrowed; closed after the session |
 | the VM's lending and lease scope | the session, one per VM, shared with graphics | the owner's |
 | an instance's terrain clients (owner, attach) | the adapter; written when the facade declares and forgets the instance | the instance's |
+| the host's publication (a content root and the host's creator lease) | the host, once, at composition (`terrainInjectionWithArena`); read by every VM of the session | the composition's; the facade borrows the lease and never releases it |
 | the typed ask of a request in flight | the adapter, by ticket | from the binding's start to the hand-off |
 | an offered lease | the adapter until adopted or released | `Offered`, then `Adopted`, or `Revoking` and `Disposed` |
 | the service's untaken result of a request | the service | until the host's record is taken or discarded and its work is over (`tsDrain` returns it) |
