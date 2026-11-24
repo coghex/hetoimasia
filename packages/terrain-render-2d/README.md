@@ -203,12 +203,14 @@ availability's intervals; a long gap of air, solid or removed cells is one run.
 ## Terrain atlases and checked regions (TRA-17)
 
 Every terrain texture is an **atlas**: a single image is the same contract with one
-full-image region. `terrain-mapgen --atlas-output DIR` writes, deterministically and
+full-image region. `terrain-mapgen --atlas-output DIR --fixtures FIXTURES` reads the
+colour art and reference masks from `FIXTURES` (`test-data`, the package-owned engine
+test fixtures) and writes, deterministically and into `DIR`,
 without altering any 96 x 64 canvas, one **colour atlas** (`colour.png`: loam,
 granite, blank; 288 x 64) and one **normal atlas** (`normal.png`: the 46 catalog
 maps, eight to a row in catalog order; 768 x 384) and a versioned region manifest
-(`manifest.json`) under `test-data/content/textures/terrain-atlas/` (the package-owned engine test fixtures, below).
-`--check-atlases` regenerates in temporary storage and compares without writing,
+(`manifest.json`); the committed copy is `test-data/content/textures/terrain-atlas/`.
+`--check-atlases --fixtures FIXTURES` regenerates in temporary storage and compares without writing,
 failing nonzero on a missing, changed or unexpected file. Unused grid cells are
 zero (zero alpha). Runtime packs nothing; it loads the two parents through the
 bounded decoder (colour as colour, the normal parent as data with
