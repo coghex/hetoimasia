@@ -1592,7 +1592,7 @@ and no view, camera or picking: TRA-10 issues the real token. The adapter's `iss
 | the typed ask of a request in flight | the adapter, by ticket | from the binding's start to the hand-off |
 | an offered lease | the adapter until adopted or released | `Offered`, then `Adopted`, or `Revoking` and `Disposed` |
 | the service's untaken result of a request | the service | until the host's record is taken or discarded and its work is over (`tsDrain` returns it) |
-| a regional read's borrow and its copy | the service until the settling transaction takes it; the copy is made by the service's owner in the settlement preparation | the borrow ends in the settling transaction (take, then release), or at the request's end; the copy is the host's result and holds no snapshot |
+| a regional read's borrow and its copy | the service until the settling transaction takes it; the copy is made by the service's owner in the settlement preparation | the borrow ends in the settling transaction (take, then release). A request that ends earlier (a cancel, a lease release, the arena's closure) releases it at once, unless its build or delivery is running: then it stays charged until the owner drains the build or finishes the delivery, and the request's places return only then. The copy is the host's result and holds no snapshot |
 
 The lease capacity one instance needs in the shared scope is `configMaxLeases + RequestsPerInstance + 1` (`terrainLeaseCapacity`):
 every lease the service can hold at once, the places that reserve one before the service admits it, and one of headroom. With
