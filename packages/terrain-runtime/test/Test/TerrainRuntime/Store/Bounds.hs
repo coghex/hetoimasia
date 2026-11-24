@@ -142,8 +142,11 @@ allocationRatios hBig keysBig = do
   -- warm up so first-use costs do not decide
   _ ← edit hSmall keysSmall
   _ ← edit hBig keysBig
-  _ ← usageStep hSmall
-  _ ← usageStep hBig
+  -- the stores and their keys are prepared before the first reading; the usage report is not run here, so whatever it demands of
+  -- the store is demanded inside its own window
+  _ ← evaluate hSmall
+  _ ← evaluate hBig
+  _ ← evaluate (length keysSmall + length keysBig)
   e1 ← measure (edit hSmall keysSmall)
   e2 ← measure (edit hBig keysBig)
   r1 ← measure (readOne hSmall keysSmall)
