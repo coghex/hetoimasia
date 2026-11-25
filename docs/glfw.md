@@ -465,6 +465,11 @@ counted) rather than unwinding into C.
 - Key, character, button, scroll and focus transitions are staged in a bounded
   buffer of 256 events and never coalesced. A button copies the cursor sample
   at that moment.
+- Each held button keeps one excursion witness in the capture latch: a press
+  starts it from the cursor sample known then, every cursor position callback
+  widens it, a cursor-leave callback marks it, the release stages it with the
+  release, and a focus loss discards it. It survives boundaries, because a hold
+  spans polls, and costs one record per button in the held-state domain.
 - Overflow of the staging buffer sets a loss latch. At the next boundary the
   ambiguous batch is discarded and the attached feed begins an overflow reset
   ([Input feeds](#input-feeds)). A window with no feed discards staged input.
@@ -876,6 +881,23 @@ admitted whenever admission is enabled.
 release of anything not held is suppressed as unpaired. An admitted focus
 loss, every reset and closure clear the baseline, so each epoch begins with
 nothing held.
+
+**Excursion witness.** Cursor motion coalesces, so a release that pairs with an
+admitted press carries `buttonExcursion`: a `ButtonExcursion` holding the
+bounding box (`excursionBox`, a low and a high `CursorPosition`) of every cursor
+position the native layer reported from the press through the release, the
+positions captured for the press and the release included, and
+`excursionLeftWindow`, set when a cursor-enter callback reported the cursor
+outside the content area during the hold, even if it re-entered. The box is
+`Nothing` only when no position was ever reported. A press and an unpaired
+release carry none; an unpaired release is not delivered. The witness is
+computed when the callbacks run, so it does not depend on when the consumer
+reads the event or how many polls the hold spanned, and it ends with the hold:
+the release, a focus loss, a reset or closure discards it (an owner boundary
+drops the witness of any button the feed no longer holds), and a fresh press
+starts a new one. `produceButton` keeps the same witness from the samples
+`recordCursor` is given, and reports no leave. The engine applies no click
+threshold, drag classification or selection policy.
 
 **Reset.** An overflow (the channel full at admission, or native staging full)
 commits one transaction that aborts the channel, records what it discarded,
