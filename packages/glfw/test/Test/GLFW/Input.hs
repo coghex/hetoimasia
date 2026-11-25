@@ -69,8 +69,6 @@ spec = describe "GLFW input feeds" $ do
       (boundedExample testDistinctEvents)
     it "gates input before readiness and while unfocused, needs no reset to stay disabled before readiness, and delivers the focus loss that closes the focus gate"
       (boundedExample testGates)
-    it "keeps a button event's captured cursor position and modifiers after later cursor motion"
-      (boundedExample testButtonPosition)
     it "clears held state on focus loss, so a later repeat or release is unpaired until a fresh press"
       (boundedExample testFocusLossClearsHeld)
 
@@ -107,6 +105,8 @@ spec = describe "GLFW input feeds" $ do
       (boundedExample testCallbackEvents)
     it "keeps a button event's captured coordinates after later cursor motion through callbacks"
       (boundedExample testCallbackButtonPosition)
+    it "delivers a click's captured position and modifiers with its single-point witness, whatever motion follows"
+      (boundedExample testButtonPosition)
     it "keeps a button event's captured coordinates when motion and the button occur in separate owner turns"
       (boundedExample testCallbackButtonAcrossTurns)
     it "sets the staging loss latch while the buffer is full and begins the same reset, replaying no captured prefix"
@@ -170,8 +170,7 @@ testDistinctEvents = do
   let shifted = noModifiers {modifierShift = True}
   produceInput feed (KeyInput (KeyEvent 65 38 KeyPressed shifted)) `shouldReturn` ProductionAdmitted
   produceInput feed (TextInput 'A') `shouldReturn` ProductionAdmitted
-  recordCursor feed (CursorPosition 3 4)
-  produceButton feed 1 ButtonPressed noModifiers `shouldReturn` ProductionAdmitted
+  produceInput feed (ButtonInput (ButtonEvent 1 ButtonPressed (Just (CursorPosition 3 4)) noModifiers Nothing)) `shouldReturn` ProductionAdmitted
   produceInput feed (ScrollInput (ScrollEvent 0 1)) `shouldReturn` ProductionAdmitted
   produceInput feed (ScrollInput (ScrollEvent 0 1)) `shouldReturn` ProductionAdmitted
   produceInput feed (TextInput 'A') `shouldReturn` ProductionAdmitted
@@ -213,35 +212,18 @@ testGates = do
   after ← statisticsOf feed
   (statisticsGated after, statisticsResets after, statisticsFocused after) `shouldBe` (4, 0, True)
 
-testButtonPosition ∷ Expectation
-testButtonPosition = do
-  feed ← readyFeed 8
-  let shifted = noModifiers {modifierShift = True}
-  produceButton feed 0 ButtonPressed shifted `shouldReturn` ProductionAdmitted
-  recordCursor feed (CursorPosition 1 2)
-  produceButton feed 0 ButtonReleased shifted `shouldReturn` ProductionAdmitted
-  produceButton feed 0 ButtonPressed noModifiers `shouldReturn` ProductionAdmitted
-  recordCursor feed (CursorPosition 50 60)
-  recordCursor feed (CursorPosition 70 80)
-  (events, _) ← drain (feedReader feed)
-  map inputPayload events
-    `shouldBe` [ ButtonInput (ButtonEvent 0 ButtonPressed Nothing shifted Nothing)
-               , ButtonInput (ButtonEvent 0 ButtonReleased (Just (CursorPosition 1 2)) shifted Nothing)
-               , ButtonInput (ButtonEvent 0 ButtonPressed (Just (CursorPosition 1 2)) noModifiers Nothing)
-               ]
-
 testFocusLossClearsHeld ∷ Expectation
 testFocusLossClearsHeld = do
   feed ← readyFeed 16
   produceInput feed (key 65 KeyPressed) `shouldReturn` ProductionAdmitted
-  produceButton feed 2 ButtonPressed noModifiers `shouldReturn` ProductionAdmitted
+  produceInput feed (buttonPayload 2 ButtonPressed) `shouldReturn` ProductionAdmitted
   statisticsHeld <$> statisticsOf feed `shouldReturn` 2
   produceInput feed (FocusInput False) `shouldReturn` ProductionAdmitted
   statisticsHeld <$> statisticsOf feed `shouldReturn` 0
   produceInput feed (FocusInput True) `shouldReturn` ProductionAdmitted
   produceInput feed (key 65 KeyRepeated) `shouldReturn` ProductionUnpaired
   produceInput feed (key 65 KeyReleased) `shouldReturn` ProductionUnpaired
-  produceButton feed 2 ButtonReleased noModifiers `shouldReturn` ProductionUnpaired
+  produceInput feed (buttonPayload 2 ButtonReleased) `shouldReturn` ProductionUnpaired
   produceInput feed (key 65 KeyPressed) `shouldReturn` ProductionAdmitted
   produceInput feed (key 65 KeyRepeated) `shouldReturn` ProductionAdmitted
   produceInput feed (key 65 KeyReleased) `shouldReturn` ProductionAdmitted
@@ -251,7 +233,7 @@ testFocusLossClearsHeld = do
   (events, _) ← drain (feedReader feed)
   map inputPayload events
     `shouldBe` [ key 65 KeyPressed
-               , ButtonInput (ButtonEvent 2 ButtonPressed Nothing noModifiers Nothing)
+               , buttonPayload 2 ButtonPressed
                , FocusInput False
                , FocusInput True
                , key 65 KeyPressed
@@ -453,7 +435,7 @@ testHeldAcrossReset ∷ Expectation
 testHeldAcrossReset = do
   feed ← readyFeed 3
   produceInput feed (key 65 KeyPressed) `shouldReturn` ProductionAdmitted
-  produceButton feed 0 ButtonPressed noModifiers `shouldReturn` ProductionAdmitted
+  produceInput feed (buttonPayload 0 ButtonPressed) `shouldReturn` ProductionAdmitted
   produceInput feed (key 65 KeyRepeated) `shouldReturn` ProductionAdmitted
   -- The held key's repeat is what overflows.
   ProductionOverflowed token ← produceInput feed (key 65 KeyRepeated)
@@ -463,7 +445,7 @@ testHeldAcrossReset = do
   resumeInput feed `shouldReturn` Resumed (resetEpoch token)
   produceInput feed (key 65 KeyRepeated) `shouldReturn` ProductionUnpaired
   produceInput feed (key 65 KeyReleased) `shouldReturn` ProductionUnpaired
-  produceButton feed 0 ButtonReleased noModifiers `shouldReturn` ProductionUnpaired
+  produceInput feed (buttonPayload 0 ButtonReleased) `shouldReturn` ProductionUnpaired
   readNow feed `shouldReturn` InputEmpty
   produceInput feed (key 65 KeyPressed) `shouldReturn` ProductionAdmitted
   produceInput feed (key 65 KeyReleased) `shouldReturn` ProductionAdmitted
@@ -607,11 +589,11 @@ testSuspendBetweenPressAndRelease = do
   let control = feedControl feed
       reader = feedReader feed
   produceInput feed (key 65 KeyPressed) `shouldReturn` ProductionAdmitted
-  produceButton feed 0 ButtonPressed noModifiers `shouldReturn` ProductionAdmitted
+  produceInput feed (buttonPayload 0 ButtonPressed) `shouldReturn` ProductionAdmitted
   token ← suspended control
   resetReason token `shouldBe` AdmissionSuspended
   produceInput feed (key 65 KeyReleased) `shouldReturn` ProductionSuppressed
-  produceButton feed 0 ButtonReleased noModifiers `shouldReturn` ProductionSuppressed
+  produceInput feed (buttonPayload 0 ButtonReleased) `shouldReturn` ProductionSuppressed
   atomically (enableInput control) `shouldReturn` AdmissionOpened
   readNow feed `shouldReturn` InputResetRequired token
   resumeInput feed `shouldReturn` ResumeAwaitingAcknowledgement
@@ -625,7 +607,7 @@ testSuspendBetweenPressAndRelease = do
   readNow feed `shouldReturn` InputEmpty
   produceInput feed (key 65 KeyRepeated) `shouldReturn` ProductionUnpaired
   produceInput feed (key 65 KeyReleased) `shouldReturn` ProductionUnpaired
-  produceButton feed 0 ButtonReleased noModifiers `shouldReturn` ProductionUnpaired
+  produceInput feed (buttonPayload 0 ButtonReleased) `shouldReturn` ProductionUnpaired
   readNow feed `shouldReturn` InputEmpty
   produceInput feed (key 65 KeyPressed) `shouldReturn` ProductionAdmitted
   (events, _) ← drain reader
@@ -802,6 +784,18 @@ testCallbackButtonPosition =
                  , ButtonInput (ButtonEvent 0 ButtonReleased (Just (CursorPosition 70 80)) (noModifiers {modifierShift = True}) (Just (ButtonExcursion (Just (CursorBox (CursorPosition 1 2) (CursorPosition 70 80))) False)))
                  ]
     observedCursorPosition <$> currentObservation window `shouldReturn` Just (CursorPosition 70 80)
+
+testButtonPosition ∷ Expectation
+testButtonPosition =
+  withLiveFeed 8 $ \seam window feed → do
+    let shifted = noModifiers {modifierShift = True}
+    drive seam window [CursorMovedTo 1 2, ButtonEventAt 0 1 1, ButtonEventAt 0 0 1, ButtonEventAt 0 1 0, CursorMovedTo 50 60, CursorMovedTo 70 80]
+    (events, _) ← drain (feedReader feed)
+    map inputPayload events
+      `shouldBe` [ ButtonInput (ButtonEvent 0 ButtonPressed (Just (CursorPosition 1 2)) shifted Nothing)
+                 , ButtonInput (ButtonEvent 0 ButtonReleased (Just (CursorPosition 1 2)) shifted (witnessOf (1, 2) (1, 2) False))
+                 , ButtonInput (ButtonEvent 0 ButtonPressed (Just (CursorPosition 1 2)) noModifiers Nothing)
+                 ]
 
 testCallbackButtonAcrossTurns ∷ Expectation
 testCallbackButtonAcrossTurns =
@@ -1145,6 +1139,9 @@ enabled ∷ InputFeed → IO InputFeed
 enabled feed = do
   atomically (enableInput (feedControl feed)) `shouldReturn` AdmissionOpened
   pure feed
+
+buttonPayload ∷ Int → ButtonAction → InputPayload
+buttonPayload number action = ButtonInput (ButtonEvent number action Nothing noModifiers Nothing)
 
 key ∷ Int → KeyAction → InputPayload
 key code action = KeyInput (KeyEvent code 0 action noModifiers)

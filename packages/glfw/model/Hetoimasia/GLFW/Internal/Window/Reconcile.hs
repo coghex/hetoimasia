@@ -18,8 +18,8 @@
 -- history. Ordered input — key, character, button, scroll, and focus
 -- transitions — is staged in a bounded buffer of 'inputStagingCapacity' events
 -- and is never coalesced. Cursor position is not an input event: it coalesces
--- into the observation and updates the feed's cursor sample, so a later button
--- still carries the coordinates copied when that button callback ran. The
+-- into the observation, and a button still carries the coordinates copied when
+-- that button callback ran. The
 -- commit leaves the cursor, cursor-inside, and held-button excursion captures
 -- latched, since each outlives the boundary that publishes input. A
 -- refresh or a close request always publishes a new revision, even when every
@@ -69,7 +69,6 @@ import Hetoimasia.GLFW.Internal.Input
   ( InputPayload (..)
   , heldButtons
   , produceInput
-  , recordCursor
   , resetFromStagingOverflow
   )
 import Hetoimasia.GLFW.Internal.Mode (AppliedMode (..), deriveApplied, modeApplied, pruneClaims, recordApplied, settleClaims)
@@ -238,14 +237,12 @@ commitObservation window next issued prepared = do
 
 -- | Publish staged input into the attached feed, if any. Loss is checked
 -- before any captured prefix is admitted: a latched overflow discards the
--- batch and starts the same reset a full channel would. Cursor samples update
--- the feed even when the batch is discarded, so a later button still has a
--- position after resumption.
+-- batch and starts the same reset a full channel would. Afterwards a witness
+-- stays only for a button the feed still holds.
 publishCapturedInput ∷ Window → Captures → IO ()
 publishCapturedInput window pending = do
   feed ← readIORef (windowFeed window)
   forM_ feed $ \attached → do
-    forM_ (capturedCursor pending) (recordCursor attached)
     if capturedInputLoss pending
       then do
         let lost = capturedInputLost pending + fromIntegral (capturedInputCount pending)

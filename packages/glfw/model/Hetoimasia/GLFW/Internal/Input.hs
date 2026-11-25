@@ -36,9 +36,8 @@
 -- for each reset, and are 'Natural', so they never wrap. Scroll offsets, key
 -- transitions (with key code and scancode), and Unicode characters are distinct
 -- payloads, and a key transition is not a text decoder. A button transition
--- carries the cursor position and modifiers captured when it was produced:
--- 'produceButton' copies the producer's latest cursor sample at that moment,
--- so later cursor motion does not change an event already produced. Scroll,
+-- carries the cursor position and modifiers the window's callback captured with
+-- it, so later cursor motion does not change an event already produced. Scroll,
 -- text, button and key transitions, and focus transitions are never coalesced.
 --
 -- Cursor motion itself does coalesce, so a release also carries a bounded
@@ -194,9 +193,6 @@
 -- | Focus gate and     | The feed    | Production writes; resumption reads; | Owner              | The feed          | Baseline cleared by focus     |
 -- | held baseline      |             | reset and closure clear the baseline |                    |                   | loss, reset, and closure      |
 -- +--------------------+-------------+--------------------------------------+--------------------+-------------------+-------------------------------+
--- | Latest cursor      | The feed    | 'recordCursor' writes;               | Owner              | The feed          | Replaced by the next sample   |
--- | sample             |             | 'produceButton' copies it            |                    |                   |                               |
--- +--------------------+-------------+--------------------------------------+--------------------+-------------------+-------------------------------+
 -- | Counters           | The feed    | Every transition adds; statistics    | Any                | The feed          | Cumulative; never reset, never|
 -- |                    |             | read                                 |                    |                   | wrap                          |
 -- +--------------------+-------------+--------------------------------------+--------------------+-------------------+-------------------------------+
@@ -270,8 +266,6 @@ module Hetoimasia.GLFW.Internal.Input
   , feedStatistics
   , Production (..)
   , produceInput
-  , recordCursor
-  , produceButton
   , heldButtons
   , resetFromStagingOverflow
   , WarningAttempt (..)
@@ -295,7 +289,6 @@ import Control.Exception
   , rethrowIO
   , tryWithContext
   )
-import Data.IORef (IORef, atomicWriteIORef, newIORef, readIORef)
 import Data.IntSet (IntSet)
 import qualified Data.IntSet as IntSet
 import Data.Maybe (isJust)
@@ -377,13 +370,12 @@ data ButtonAction = ButtonPressed | ButtonReleased
 instance NFData ButtonAction
 
 -- | A mouse button transition, with the cursor position and modifiers captured
--- for this event. The position is 'Nothing' when the producer had no cursor
--- sample yet.
+-- for this event. The position is 'Nothing' when the window had reported no
+-- cursor position yet.
 --
 -- 'buttonExcursion' is the witness for the hold a delivered release ends:
--- 'Nothing' on a press, and on a release produced directly with
--- 'produceButton', which sees no cursor motion between its calls. A release the
--- feed finds unpaired is not delivered at all.
+-- 'Nothing' on a press. A release the feed finds unpaired is not delivered at
+-- all. The window's callbacks are the witness's only producer.
 data ButtonEvent = ButtonEvent
   { buttonNumber ∷ !Int
   , buttonAction ∷ !ButtonAction
@@ -558,7 +550,6 @@ data InputFeed = InputFeed
   , feedWindow ∷ !WindowId
   , feedCapacity ∷ !Integer
   , feedState ∷ !(TVar FeedState)
-  , feedCursor ∷ !(IORef (Maybe CursorPosition))
   }
 
 -- | The consumer's read and acknowledgement capability.
@@ -697,7 +688,7 @@ newInputFeed window capacity focused = do
         , stateEpisode = Nothing
         , stateCounters = Counters 0 0 0 0 0 0 0 0 0 1
         }
-  InputFeed key window capacity state <$> newIORef Nothing
+  pure (InputFeed key window capacity state)
 
 feedReader ∷ InputFeed → InputReader
 feedReader = InputReader
@@ -917,19 +908,6 @@ produceInput feed payload = do
   epoch ← stateEpoch <$> readTVarIO (feedState feed)
   prepared ← prepare (InputEvent (feedWindow feed) (InputEpoch epoch) payload)
   atomically (admitInput feed epoch payload prepared) >>= maybe (produceInput feed payload) pure
-
--- | Record the producer's latest cursor sample. Samples coalesce: only the latest
--- is kept, and none is an event.
-recordCursor ∷ InputFeed → CursorPosition → IO ()
-recordCursor feed = atomicWriteIORef (feedCursor feed) . Just
-
--- | Produce a button transition carrying the latest cursor sample and the given
--- modifiers, copied now, and no excursion witness: only the window's callbacks
--- observe cursor motion between a press and its release.
-produceButton ∷ InputFeed → Int → ButtonAction → Modifiers → IO Production
-produceButton feed button action modifiers = do
-  position ← readIORef (feedCursor feed)
-  produceInput feed (ButtonInput (ButtonEvent button action position modifiers Nothing))
 
 -- | The buttons in the producer's held-state baseline: the holds whose
 -- excursion witnesses can still be delivered.
