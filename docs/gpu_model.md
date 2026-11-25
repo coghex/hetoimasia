@@ -302,7 +302,9 @@ no candidate instant fits the clock's representation). A recovery delay that
 overflows is kept as `AttemptUnschedulable`, never treated as no delay.
 
 The backoff is 5, 10, 20, 40, 80 ms and then the configured cap. A turn that
-made progress restarts the whole schedule. A suspended target contributes no
+made progress restarts the whole schedule. A turn that made none and runs
+before the anchored poll is due (a window observation, a recovery deadline)
+leaves the deadline and the step where they were. A suspended target contributes no
 render deadline and keeps every obligation.
 
 ## Frame-less batches
