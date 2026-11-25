@@ -16,7 +16,7 @@ import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM (STM, atomically, orElse)
 import Control.Exception (AsyncException (ThreadKilled), IOException, SomeException, fromException, throwIO, try)
 import Control.Monad (forM, forM_, replicateM, replicateM_, when)
-import Data.IORef (atomicModifyIORef', newIORef, readIORef)
+import Data.IORef (atomicModifyIORef', newIORef, readIORef, writeIORef)
 import qualified Data.IntMap.Strict as IntMap
 import qualified Data.Map.Strict as Map
 import Hetoimasia.Foundation.Log
@@ -37,12 +37,13 @@ import Hetoimasia.GLFW.Internal.Seam
   , asProcessMainThread
   , defaultScript
   , newSeam
+  , SeamScript (..)
+  , seamDeliverToAttached
   , seamDrive
   , seamDriveWith
   )
 import Hetoimasia.GLFW.Internal.Window (attachWindowInputFeed, inputStagingCapacity)
-import Hetoimasia.GLFW.Internal.Window.Callbacks (takeCaptures)
-import Hetoimasia.GLFW.Internal.Window.State (Captures (..), Window (windowCaptures), noCaptures)
+import Hetoimasia.GLFW.Internal.Window.State (Captures (capturedExcursions), Window (windowCaptures))
 import Hetoimasia.GLFW.Window
   ( WindowId
   , WindowObservation
@@ -144,10 +145,8 @@ spec = describe "GLFW input feeds" $ do
       (boundedExample testExcursionLatchPruned)
     it "keeps one box of extrema through a long hold"
       (boundedExample testExcursionLongHold)
-    it "ends a direct producer's witness with its hold, so a fresh hold reports only its own excursion"
-      (boundedExample testDirectExcursionLifetime)
-    it "keeps the latest cursor sample when the construction boundary takes the captures"
-      (boundedExample testConstructionKeepsCursor)
+    it "reports a cursor position that arrived during window construction as the first click's single-point box"
+      (boundedExample testExcursionFirstClickAfterConstruction)
 
   describe "application suspension" $ do
     it "leaves no backlog or held state after press, suspend, suppressed release, and enable, and needs acknowledgement, resumption, and a fresh press"
@@ -227,7 +226,7 @@ testButtonPosition = do
   (events, _) ← drain (feedReader feed)
   map inputPayload events
     `shouldBe` [ ButtonInput (ButtonEvent 0 ButtonPressed Nothing shifted Nothing)
-               , ButtonInput (ButtonEvent 0 ButtonReleased (Just (CursorPosition 1 2)) shifted (witnessOf (1, 2) (1, 2) False))
+               , ButtonInput (ButtonEvent 0 ButtonReleased (Just (CursorPosition 1 2)) shifted Nothing)
                , ButtonInput (ButtonEvent 0 ButtonPressed (Just (CursorPosition 1 2)) noModifiers Nothing)
                ]
 
@@ -1071,31 +1070,28 @@ testExcursionLongHold =
     (events, _) ← drain (feedReader feed)
     releaseWitnesses events `shouldBe` [(0, witnessOf (0, 0) (49, 69) False)]
 
-testDirectExcursionLifetime ∷ Expectation
-testDirectExcursionLifetime = do
-  feed ← readyFeed 16
-  recordCursor feed (CursorPosition 1 1)
-  produceButton feed 0 ButtonPressed noModifiers `shouldReturn` ProductionAdmitted
-  recordCursor feed (CursorPosition 90 90)
-  produceInput feed (FocusInput False) `shouldReturn` ProductionAdmitted
-  produceInput feed (FocusInput True) `shouldReturn` ProductionAdmitted
-  produceButton feed 0 ButtonReleased noModifiers `shouldReturn` ProductionUnpaired
-  recordCursor feed (CursorPosition 5 5)
-  produceButton feed 0 ButtonPressed noModifiers `shouldReturn` ProductionAdmitted
-  recordCursor feed (CursorPosition 6 7)
-  produceButton feed 0 ButtonReleased noModifiers `shouldReturn` ProductionAdmitted
-  (events, _) ← drain (feedReader feed)
-  releaseWitnesses events `shouldBe` [(0, witnessOf (5, 5) (6, 7) False)]
-
-testConstructionKeepsCursor ∷ Expectation
-testConstructionKeepsCursor = do
-  latch ← newIORef (noCaptures {capturedCursor = Just (CursorPosition 3 4), capturedCursorInside = Just True, capturedFocused = Just True})
-  pending ← takeCaptures latch
-  (capturedCursor pending, capturedCursorInside pending, capturedFocused pending)
-    `shouldBe` (Just (CursorPosition 3 4), Just True, Just True)
-  kept ← readIORef latch
-  (capturedCursor kept, capturedCursorInside kept, capturedFocused kept)
-    `shouldBe` (Just (CursorPosition 3 4), Just True, Nothing)
+testExcursionFirstClickAfterConstruction ∷ Expectation
+testExcursionFirstClickAfterConstruction = do
+  seamRef ← newIORef Nothing
+  fired ← newIORef False
+  -- The first scripted size query runs while the window is being constructed,
+  -- after its callbacks are attached: the cursor is reported there, once.
+  let script =
+        defaultScript
+          { scriptWindowSize = \_ → do
+              first ← atomicModifyIORef' fired (\already → (True, not already))
+              when first (readIORef seamRef >>= mapM_ (`seamDeliverToAttached` [CursorMovedTo 3 4]))
+              pure (800, 600)
+          }
+  seam ← newSeam script
+  writeIORef seamRef (Just seam)
+  asProcessMainThread seam . entered seam $ \session →
+    withWindow session (hiddenTestWindowConfig "input" 64 48) $ \window → do
+      feed ← attached window 16
+      observedCursorPosition <$> currentObservation window `shouldReturn` Just (CursorPosition 3 4)
+      drive seam window [ButtonEventAt 0 1 0, ButtonEventAt 0 0 0]
+      (events, _) ← drain (feedReader feed)
+      releaseWitnesses events `shouldBe` [(0, witnessOf (3, 4) (3, 4) False)]
 
 -- ---------------------------------------------------------------------------
 -- Support

@@ -133,6 +133,7 @@ module Hetoimasia.GLFW.Internal.Seam
   , seamDrive
   , seamDriveWith
   , seamDriveCancelledBeforeCommit
+  , seamDeliverToAttached
   , seamQueueEvents
   , seamQueueControlEvents
   , seamRejectCloseRequest
@@ -752,6 +753,15 @@ driveWith interruption seam window originName events = do
   requireSeamWindow seam window
   windowStepWith interruption window (operation originName) $ \handle →
     deliverTo seam (windowKey handle) events
+
+-- | Deliver events at once, from the calling thread, to the callbacks of every
+-- window this seam has attached them for. A scripted native step uses it to
+-- deliver callbacks while a window is still being constructed, before the
+-- owner has a 'Window' to name; events for no attached window are dropped.
+seamDeliverToAttached ∷ Seam → [WindowEvent] → IO ()
+seamDeliverToAttached seam events = do
+  attached ← readIORef (seamAttachedWindows seam)
+  forM_ attached $ \(key, _) → deliverTo seam key events
 
 -- | Queue events for a window's attached callbacks. The next poll or finite
 -- wait over this seam's native table delivers them from inside that call, as
