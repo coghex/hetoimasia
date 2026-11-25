@@ -261,7 +261,13 @@ latchFault name caught latched = case capturedFault latched of
 takeCaptures ∷ IORef Captures → IO Captures
 takeCaptures captures =
   atomicModifyIORef' captures $ \latched →
-    (noCaptures {capturedGeneration = capturedGeneration latched}, latched)
+    ( noCaptures
+        { capturedGeneration = capturedGeneration latched
+        , capturedCursor = capturedCursor latched
+        , capturedCursorInside = capturedCursorInside latched
+        }
+    , latched
+    )
 
 raiseFault ∷ WindowId → Captures → IO ()
 raiseFault identity pending = mapM_ (rethrowFault (windowIdentifiers identity)) (capturedFault pending)

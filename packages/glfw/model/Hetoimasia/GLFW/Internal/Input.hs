@@ -284,7 +284,7 @@ module Hetoimasia.GLFW.Internal.Input
   , inputComponent
   ) where
 
-import Control.Concurrent.STM (STM, TVar, atomically, newTVarIO, readTVar, readTVarIO, retry, writeTVar)
+import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, retry, writeTVar)
 import Control.DeepSeq (NFData (rnf))
 import Control.Exception
   ( Exception
@@ -296,8 +296,7 @@ import Control.Exception
   , rethrowIO
   , tryWithContext
   )
-import Control.Monad (when)
-import Data.IORef (IORef, atomicModifyIORef', atomicWriteIORef, newIORef, readIORef)
+import Data.IORef (IORef, atomicWriteIORef, newIORef, readIORef)
 import Data.IntMap.Strict (IntMap)
 import qualified Data.IntMap.Strict as IntMap
 import Data.IntSet (IntSet)
@@ -562,9 +561,6 @@ data InputFeed = InputFeed
   , feedCapacity ∷ !Integer
   , feedState ∷ !(TVar FeedState)
   , feedCursor ∷ !(IORef (Maybe CursorPosition))
-  , feedExcursions ∷ !(IORef (IntMap ButtonExcursion))
-    -- ^ The witnesses of the holds 'produceButton' admitted, widened by
-    -- 'recordCursor'.
   }
 
 -- | The consumer's read and acknowledgement capability.
@@ -582,6 +578,12 @@ data FeedState = FeedState
   , stateFocused ∷ !Bool
   , stateHeldKeys ∷ !IntSet
   , stateHeldButtons ∷ !IntSet
+  , stateExcursions ∷ !(IntMap ButtonExcursion)
+    -- ^ The excursion witness of each held button, from the cursor sample its
+    -- press carried and widened by 'recordCursor'. It changes in the same
+    -- transaction as 'stateHeldButtons', so it lives exactly as long as the
+    -- hold. 'produceButton' delivers it with a paired release; a window's
+    -- callbacks, which see every cursor position, stage a finer one of their own.
   , stateEpisode ∷ !(Maybe ResetSummary)
     -- ^ The latest reset.
   , stateCounters ∷ !Counters
@@ -700,10 +702,11 @@ newInputFeed window capacity focused = do
         , stateFocused = focused
         , stateHeldKeys = IntSet.empty
         , stateHeldButtons = IntSet.empty
+        , stateExcursions = IntMap.empty
         , stateEpisode = Nothing
         , stateCounters = Counters 0 0 0 0 0 0 0 0 0 1
         }
-  InputFeed key window capacity state <$> newIORef Nothing <*> newIORef IntMap.empty
+  InputFeed key window capacity state <$> newIORef Nothing
 
 feedReader ∷ InputFeed → InputReader
 feedReader = InputReader
@@ -716,6 +719,11 @@ inputReaderWindow (InputReader feed) = feedWindow feed
 
 inputControlWindow ∷ InputControl → WindowId
 inputControlWindow (InputControl feed) = feedWindow feed
+
+-- | Forget every held key and button, and the witnesses that belong to them.
+clearHolds ∷ FeedState → FeedState
+clearHolds state =
+  state {stateHeldKeys = IntSet.empty, stateHeldButtons = IntSet.empty, stateExcursions = IntMap.empty}
 
 modifyCounters ∷ (Counters → Counters) → FeedState → FeedState
 modifyCounters change state = state {stateCounters = change (stateCounters state)}
@@ -855,13 +863,13 @@ beginReset feed reason unadmitted state = do
             , countResets = countResets counts + 1
             }
       )
-      state
-        { statePhase = InputResetPending
-        , stateChannel = Nothing
-        , stateHeldKeys = IntSet.empty
-        , stateHeldButtons = IntSet.empty
-        , stateEpisode = Just summary
-        }
+      ( clearHolds
+          state
+            { statePhase = InputResetPending
+            , stateChannel = Nothing
+            , stateEpisode = Just summary
+            }
+      )
   pure summary
 
 -- ---------------------------------------------------------------------------
@@ -929,9 +937,8 @@ produceInput feed payload = do
 recordCursor ∷ InputFeed → CursorPosition → IO ()
 recordCursor feed position = do
   atomicWriteIORef (feedCursor feed) (Just position)
-  held ← stateHeldButtons <$> readTVarIO (feedState feed)
-  atomicModifyIORef' (feedExcursions feed) $ \witnesses →
-    (IntMap.map (widenExcursion position) (IntMap.restrictKeys witnesses held), ())
+  atomically . modifyTVar' (feedState feed) $ \state →
+    state {stateExcursions = IntMap.map (widenExcursion position) (stateExcursions state)}
 
 -- | Produce a button transition carrying the latest cursor sample and the given
 -- modifiers, copied now. An admitted press starts the button's excursion
@@ -941,18 +948,10 @@ recordCursor feed position = do
 produceButton ∷ InputFeed → Int → ButtonAction → Modifiers → IO Production
 produceButton feed button action modifiers = do
   position ← readIORef (feedCursor feed)
-  case action of
-    ButtonPressed → do
-      production ← produceInput feed (ButtonInput (ButtonEvent button action position modifiers Nothing))
-      when (production == ProductionAdmitted && button >= 0 && button <= buttonDomainLast) $
-        atomicModifyIORef' (feedExcursions feed) (\witnesses → (IntMap.insert button (beginExcursion position) witnesses, ()))
-      pure production
-    ButtonReleased → do
-      witness ← IntMap.lookup button <$> readIORef (feedExcursions feed)
-      production ← produceInput feed (ButtonInput (ButtonEvent button action position modifiers witness))
-      -- Whatever became of the release, the hold it named has ended.
-      atomicModifyIORef' (feedExcursions feed) (\witnesses → (IntMap.delete button witnesses, ()))
-      pure production
+  witness ← case action of
+    ButtonPressed → pure Nothing
+    ButtonReleased → IntMap.lookup button . stateExcursions <$> readTVarIO (feedState feed)
+  produceInput feed (ButtonInput (ButtonEvent button action position modifiers witness))
 
 -- | The buttons in the producer's held-state baseline: the holds whose
 -- excursion witnesses can still be delivered.
@@ -983,7 +982,7 @@ resetFromStagingOverflow feed lost focus = atomically $ do
     withFocus update current = case update of
       Nothing → current
       Just True → current {stateFocused = True}
-      Just False → current {stateFocused = False, stateHeldKeys = IntSet.empty, stateHeldButtons = IntSet.empty}
+      Just False → clearHolds current {stateFocused = False}
 
 -- | The admission transaction. 'Nothing' when the running epoch is no longer the
 -- one the event was prepared for.
@@ -1007,7 +1006,7 @@ admitInput feed epoch payload prepared = do
     focusChanged state = case payload of
       FocusInput focused
         | focused → state {stateFocused = True}
-        | otherwise → state {stateFocused = False, stateHeldKeys = IntSet.empty, stateHeldButtons = IntSet.empty}
+        | otherwise → clearHolds state {stateFocused = False}
       _ → state
 
     running state
@@ -1021,10 +1020,14 @@ admitInput feed epoch payload prepared = do
             KeyRepeated → sendWith state
             KeyReleased → sendWith state {stateHeldKeys = IntSet.delete (keyCode key) (stateHeldKeys state)}
           ButtonInput button → case buttonAction button of
-            ButtonPressed → sendWith (holdButton (buttonNumber button) state)
+            ButtonPressed → sendWith (holdButton (buttonNumber button) (buttonCursor button) state)
             ButtonReleased
               | inButtonDomain (buttonNumber button) && IntSet.member (buttonNumber button) (stateHeldButtons state) →
-                  sendWith state {stateHeldButtons = IntSet.delete (buttonNumber button) (stateHeldButtons state)}
+                  sendWith
+                    state
+                      { stateHeldButtons = IntSet.delete (buttonNumber button) (stateHeldButtons state)
+                      , stateExcursions = IntMap.delete (buttonNumber button) (stateExcursions state)
+                      }
               | otherwise → unpaired state
           TextInput _ → sendWith state
           ScrollInput _ → sendWith state
@@ -1051,8 +1054,12 @@ admitInput feed epoch payload prepared = do
     holdKey code state
       | inKeyDomain code = state {stateHeldKeys = IntSet.insert code (stateHeldKeys state)}
       | otherwise = state
-    holdButton number state
-      | inButtonDomain number = state {stateHeldButtons = IntSet.insert number (stateHeldButtons state)}
+    holdButton number position state
+      | inButtonDomain number =
+          state
+            { stateHeldButtons = IntSet.insert number (stateHeldButtons state)
+            , stateExcursions = IntMap.insert number (beginExcursion position) (stateExcursions state)
+            }
       | otherwise = state
     inKeyDomain code = code >= 0 && code <= keyDomainLast
     inButtonDomain number = number >= 0 && number <= buttonDomainLast
@@ -1184,9 +1191,9 @@ closeInputFeed feed = do
       writeTVar (feedState feed) $
         modifyCounters
           (\counts → counts {countDiscardedAtClose = countDiscardedAtClose counts + discarded})
-          state
-            { statePhase = InputFeedClosed
-            , stateChannel = Nothing
-            , stateHeldKeys = IntSet.empty
-            , stateHeldButtons = IntSet.empty
-            }
+          ( clearHolds
+              state
+                { statePhase = InputFeedClosed
+                , stateChannel = Nothing
+                }
+          )
