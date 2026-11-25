@@ -12,7 +12,7 @@
 module Test.GPU.Vulkan.GLFW.Actions (spec) where
 
 import Control.Concurrent (myThreadId)
-import Control.Concurrent.STM (TVar, atomically, check, modifyTVar', newTVarIO, orElse, readTVar, readTVarIO, registerDelay, writeTVar)
+import Control.Concurrent.STM (TVar, atomically, check, modifyTVar', newTVarIO, orElse, readTVar, readTVarIO, registerDelay, retry, writeTVar)
 import Control.Exception (Exception (..), ExceptionWithContext (..), SomeException, finally, throwIO, toException, try)
 import Control.Monad (replicateM_, void, when)
 import qualified Data.ByteString as ByteString
