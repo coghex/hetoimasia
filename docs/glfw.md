@@ -893,9 +893,11 @@ outside the content area during the hold, even if it re-entered. The box is
 release carry none; an unpaired release is not delivered. The witness is
 computed when the callbacks run, so it does not depend on when the consumer
 reads the event or how many polls the hold spanned, and it ends with the hold:
-the release, a focus loss, a reset or closure discards it, and a fresh press
-starts a new one. Events made through `produceButton` carry none. The engine
-applies no click threshold, drag classification or selection policy.
+the release, a focus loss, a reset or closure discards it (an owner boundary
+drops the witness of any button the feed no longer holds), and a fresh press
+starts a new one. `produceButton` keeps the same witness from the samples
+`recordCursor` is given, and reports no leave. The engine applies no click
+threshold, drag classification or selection policy.
 
 **Reset.** An overflow (the channel full at admission, or native staging full)
 commits one transaction that aborts the channel, records what it discarded,
