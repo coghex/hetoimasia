@@ -17,6 +17,7 @@ import Control.Concurrent.STM (STM, atomically, orElse)
 import Control.Exception (AsyncException (ThreadKilled), IOException, SomeException, fromException, throwIO, try)
 import Control.Monad (forM, forM_, replicateM, replicateM_, when)
 import Data.IORef (atomicModifyIORef', newIORef, readIORef)
+import qualified Data.IntMap.Strict as IntMap
 import qualified Data.Map.Strict as Map
 import Hetoimasia.Foundation.Log
   ( LogEntry (..)
@@ -40,9 +41,9 @@ import Hetoimasia.GLFW.Internal.Seam
   , seamDriveWith
   )
 import Hetoimasia.GLFW.Internal.Window (attachWindowInputFeed, inputStagingCapacity)
+import Hetoimasia.GLFW.Internal.Window.State (Captures (capturedExcursions), Window (windowCaptures))
 import Hetoimasia.GLFW.Window
-  ( Window
-  , WindowId
+  ( WindowId
   , WindowObservation
   , WindowResult (..)
   , hiddenTestWindowConfig
@@ -138,6 +139,10 @@ spec = describe "GLFW input feeds" $ do
       (boundedExample testExcursionAcrossReset)
     it "discards a witness with the hold on focus loss"
       (boundedExample testExcursionFocusLoss)
+    it "stops tracking a hold that an application suspension or a staging overflow cleared, before any release arrives"
+      (boundedExample testExcursionLatchPruned)
+    it "keeps one box of extrema through a long hold"
+      (boundedExample testExcursionLongHold)
 
   describe "application suspension" $ do
     it "leaves no backlog or held state after press, suspend, suppressed release, and enable, and needs acknowledgement, resumption, and a fresh press"
@@ -217,7 +222,7 @@ testButtonPosition = do
   (events, _) ← drain (feedReader feed)
   map inputPayload events
     `shouldBe` [ ButtonInput (ButtonEvent 0 ButtonPressed Nothing shifted Nothing)
-               , ButtonInput (ButtonEvent 0 ButtonReleased (Just (CursorPosition 1 2)) shifted Nothing)
+               , ButtonInput (ButtonEvent 0 ButtonReleased (Just (CursorPosition 1 2)) shifted (witnessOf (1, 2) (1, 2) False))
                , ButtonInput (ButtonEvent 0 ButtonPressed (Just (CursorPosition 1 2)) noModifiers Nothing)
                ]
 
@@ -1027,6 +1032,39 @@ testExcursionFocusLoss =
     drive seam window [CursorMovedTo 20 30, ButtonEventAt 0 1 0, ButtonEventAt 0 0 0]
     (events, _) ← drain (feedReader feed)
     releaseWitnesses events `shouldBe` [(0, witnessOf (20, 30) (20, 30) False)]
+
+testExcursionLatchPruned ∷ Expectation
+testExcursionLatchPruned =
+  withLiveFeed 16 $ \seam window feed → do
+    let tracked = IntMap.keys . capturedExcursions <$> readIORef (windowCaptures window)
+    drive seam window [CursorMovedTo 10 10, ButtonEventAt 0 1 0, CursorMovedTo 20 20]
+    tracked `shouldReturn` [0]
+    -- An application suspension clears the held state; the next boundary drops the witness.
+    _ ← suspended (feedControl feed)
+    drive seam window [CursorMovedTo 90 90]
+    tracked `shouldReturn` []
+    -- A staging overflow does the same, for a hold admitted in an earlier epoch.
+    token ← readNow feed >>= \case
+      InputResetRequired reset → pure reset
+      other → unexpected ("no suspension reset was pending: " <> show other)
+    atomically (acknowledgeReset (feedReader feed) token) `shouldReturn` Right Acknowledged
+    atomically (enableInput (feedControl feed)) `shouldReturn` AdmissionOpened
+    resumeInput feed `shouldReturn` Resumed (resetEpoch token)
+    drive seam window [ButtonEventAt 1 1 0]
+    tracked `shouldReturn` [1]
+    drive seam window (replicate (inputStagingCapacity + 1) (CharEventAt (fromEnum 'x')))
+    drive seam window [CursorMovedTo 95 95]
+    tracked `shouldReturn` []
+
+testExcursionLongHold ∷ Expectation
+testExcursionLongHold =
+  withLiveFeed 16 $ \seam window feed → do
+    drive seam window [CursorMovedTo 0 0, ButtonEventAt 0 1 0]
+    forM_ [1 .. 2000 ∷ Int] $ \step →
+      drive seam window [CursorMovedTo (fromIntegral (step `mod` 50)) (fromIntegral (step `mod` 70))]
+    drive seam window [ButtonEventAt 0 0 0]
+    (events, _) ← drain (feedReader feed)
+    releaseWitnesses events `shouldBe` [(0, witnessOf (0, 0) (49, 69) False)]
 
 -- ---------------------------------------------------------------------------
 -- Support

@@ -59,12 +59,15 @@ import Control.Concurrent.STM (atomically)
 import Control.Exception (mask_, uninterruptibleMask_)
 import Control.Monad (forM_, unless, void, when)
 import Data.IORef (atomicModifyIORef', readIORef, writeIORef)
+import qualified Data.IntMap.Strict as IntMap
+import qualified Data.IntSet as IntSet
 import Data.Maybe (isJust)
 import Hetoimasia.Foundation.Messaging.Payload (Prepared, prepare)
 import Hetoimasia.Foundation.Messaging.Snapshot (publish)
 import Hetoimasia.GLFW.Internal.Attribute (Attribute (..))
 import Hetoimasia.GLFW.Internal.Input
   ( InputPayload (..)
+  , heldButtons
   , produceInput
   , recordCursor
   , resetFromStagingOverflow
@@ -248,6 +251,11 @@ publishCapturedInput window pending = do
         let lost = capturedInputLost pending + fromIntegral (capturedInputCount pending)
         void (resetFromStagingOverflow attached lost (capturedFocused pending))
       else mapM_ (admitStaged attached) (reverse (capturedInput pending))
+  -- A witness belongs to a hold the feed still has: a reset, a suspension, or a
+  -- focus loss cleared the others, and with no feed there is no hold.
+  held ← maybe (pure IntSet.empty) heldButtons feed
+  atomicModifyIORef' (windowCaptures window) $ \latched →
+    (latched {capturedExcursions = IntMap.restrictKeys (capturedExcursions latched) held}, ())
   where
     admitStaged feed = \case
       StagedKey event → void (produceInput feed (KeyInput event))

@@ -46,10 +46,13 @@
 -- cursor position the native layer reported from the press through the release,
 -- and whether the cursor left the content area meanwhile. The window's callbacks
 -- accumulate it per held button, beside the capture latch that stages input, and
--- attach it to the release they stage; the feed delivers it only with a release
--- that pairs with an admitted press, so an unpaired release, which is never
--- delivered, discards it. The engine applies no click threshold or drag
--- classification to it.
+-- attach it to the release they stage; the owner boundary drops the witness of
+-- any button the feed no longer holds, as a reset, suspension, or focus loss
+-- clears the baseline. The feed delivers it only with a release that pairs with
+-- an admitted press, so an unpaired release, which is never delivered, discards
+-- it. 'produceButton' and 'recordCursor' keep the same witness for the owner's
+-- direct producer. The engine applies no click threshold or drag classification
+-- to it.
 --
 -- The producer prepares each event to normal form in 'IO' before admission.
 -- Every transaction here only reads and writes state: none evaluates a payload,
@@ -270,6 +273,7 @@ module Hetoimasia.GLFW.Internal.Input
   , produceInput
   , recordCursor
   , produceButton
+  , heldButtons
   , resetFromStagingOverflow
   , WarningAttempt (..)
   , attemptOverflowWarning
@@ -292,7 +296,10 @@ import Control.Exception
   , rethrowIO
   , tryWithContext
   )
-import Data.IORef (IORef, atomicWriteIORef, newIORef, readIORef)
+import Control.Monad (when)
+import Data.IORef (IORef, atomicModifyIORef', atomicWriteIORef, newIORef, readIORef)
+import Data.IntMap.Strict (IntMap)
+import qualified Data.IntMap.Strict as IntMap
 import Data.IntSet (IntSet)
 import qualified Data.IntSet as IntSet
 import Data.Maybe (isJust)
@@ -378,9 +385,8 @@ instance NFData ButtonAction
 -- sample yet.
 --
 -- 'buttonExcursion' is the witness for the hold a delivered release ends:
--- 'Nothing' on a press, and on any release the window's callbacks did not
--- witness, such as one produced directly with 'produceButton'. A release the
--- feed finds unpaired is not delivered at all.
+-- 'Nothing' on a press. A release the feed finds unpaired is not delivered at
+-- all.
 data ButtonEvent = ButtonEvent
   { buttonNumber ∷ !Int
   , buttonAction ∷ !ButtonAction
@@ -425,10 +431,13 @@ beginExcursion position = ButtonExcursion (pointBox <$> position) False
   where
     pointBox point = CursorBox point point
 
--- | Extend a witness by one reported cursor position.
+-- | Extend a witness by one reported cursor position. The new box is evaluated
+-- before it is stored.
 widenExcursion ∷ CursorPosition → ButtonExcursion → ButtonExcursion
-widenExcursion (CursorPosition x y) excursion = excursion {excursionBox = Just (maybe point widened (excursionBox excursion))}
+widenExcursion (CursorPosition x y) excursion = excursion {excursionBox = Just $! maybe point widened (excursionBox excursion)}
   where
+    -- Forced before it is stored, so a long hold keeps only the current extrema
+    -- and not a chain of the samples that produced them.
     point = CursorBox (CursorPosition x y) (CursorPosition x y)
     widened (CursorBox (CursorPosition lowX lowY) (CursorPosition highX highY)) =
       CursorBox (CursorPosition (min lowX x) (min lowY y)) (CursorPosition (max highX x) (max highY y))
@@ -553,6 +562,9 @@ data InputFeed = InputFeed
   , feedCapacity ∷ !Integer
   , feedState ∷ !(TVar FeedState)
   , feedCursor ∷ !(IORef (Maybe CursorPosition))
+  , feedExcursions ∷ !(IORef (IntMap ButtonExcursion))
+    -- ^ The witnesses of the holds 'produceButton' admitted, widened by
+    -- 'recordCursor'.
   }
 
 -- | The consumer's read and acknowledgement capability.
@@ -691,7 +703,7 @@ newInputFeed window capacity focused = do
         , stateEpisode = Nothing
         , stateCounters = Counters 0 0 0 0 0 0 0 0 0 1
         }
-  InputFeed key window capacity state <$> newIORef Nothing
+  InputFeed key window capacity state <$> newIORef Nothing <*> newIORef IntMap.empty
 
 feedReader ∷ InputFeed → InputReader
 feedReader = InputReader
@@ -915,15 +927,37 @@ produceInput feed payload = do
 -- | Record the producer's latest cursor sample. Samples coalesce: only the latest
 -- is kept, and none is an event.
 recordCursor ∷ InputFeed → CursorPosition → IO ()
-recordCursor feed = atomicWriteIORef (feedCursor feed) . Just
+recordCursor feed position = do
+  atomicWriteIORef (feedCursor feed) (Just position)
+  held ← stateHeldButtons <$> readTVarIO (feedState feed)
+  atomicModifyIORef' (feedExcursions feed) $ \witnesses →
+    (IntMap.map (widenExcursion position) (IntMap.restrictKeys witnesses held), ())
 
 -- | Produce a button transition carrying the latest cursor sample and the given
--- modifiers, copied now, and no excursion witness: only the window's callbacks
--- observe cursor motion between a press and its release.
+-- modifiers, copied now. An admitted press starts the button's excursion
+-- witness from that sample, 'recordCursor' widens it while the button stays
+-- held, and a release that pairs with it carries it. This direct producer sees
+-- only the samples it is given, so it never reports a cursor leave.
 produceButton ∷ InputFeed → Int → ButtonAction → Modifiers → IO Production
 produceButton feed button action modifiers = do
   position ← readIORef (feedCursor feed)
-  produceInput feed (ButtonInput (ButtonEvent button action position modifiers Nothing))
+  case action of
+    ButtonPressed → do
+      production ← produceInput feed (ButtonInput (ButtonEvent button action position modifiers Nothing))
+      when (production == ProductionAdmitted && button >= 0 && button <= buttonDomainLast) $
+        atomicModifyIORef' (feedExcursions feed) (\witnesses → (IntMap.insert button (beginExcursion position) witnesses, ()))
+      pure production
+    ButtonReleased → do
+      witness ← IntMap.lookup button <$> readIORef (feedExcursions feed)
+      production ← produceInput feed (ButtonInput (ButtonEvent button action position modifiers witness))
+      -- Whatever became of the release, the hold it named has ended.
+      atomicModifyIORef' (feedExcursions feed) (\witnesses → (IntMap.delete button witnesses, ()))
+      pure production
+
+-- | The buttons in the producer's held-state baseline: the holds whose
+-- excursion witnesses can still be delivered.
+heldButtons ∷ InputFeed → IO IntSet
+heldButtons feed = stateHeldButtons <$> readTVarIO (feedState feed)
 
 -- | Begin the overflow reset because native staging overflowed, without
 -- presenting an event to the channel. @lost@ is the exact number of staged
