@@ -25,6 +25,15 @@
 -- counted. The focus callback is the one owner of focus: it coalesces the
 -- latest flag into the observation and stages an ordered focus event for the
 -- input feed. There is no second focus callback.
+--
+-- Cursor motion coalesces, so the button, cursor position, cursor enter, and
+-- focus callbacks also keep one excursion witness per held button in the
+-- latch ('capturedExcursions'). A press starts it from the cursor position
+-- known then, each position callback widens it, a cursor-leave callback marks
+-- it, and the release callback ends it and stages it with the release. A focus
+-- loss discards every witness, as it clears the feed's held state. The witness
+-- survives owner boundaries, because a hold spans polls, and the feed delivers
+-- it only with a release that pairs with an admitted press.
 module Hetoimasia.GLFW.Internal.Window.Callbacks
   ( windowCallbacks
   , takeCaptures
@@ -37,6 +46,7 @@ import Control.Monad (when)
 import Data.Bits (testBit)
 import Data.Char (chr)
 import Data.IORef (IORef, atomicModifyIORef')
+import qualified Data.IntMap.Strict as IntMap
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Foreign.C.Types (CInt)
@@ -46,10 +56,15 @@ import Hetoimasia.GLFW.Internal.Control (WindowCapabilities, WindowReport (..), 
 import Hetoimasia.GLFW.Internal.Input
   ( ButtonAction (..)
   , ButtonEvent (..)
+  , ButtonExcursion
   , KeyAction (..)
   , KeyEvent (..)
   , Modifiers (..)
   , ScrollEvent (..)
+  , beginExcursion
+  , buttonDomainLast
+  , leaveExcursion
+  , widenExcursion
   )
 import Hetoimasia.GLFW.Internal.Session (WindowCallbacks (..), glfwComponent)
 import Hetoimasia.GLFW.Internal.Trace (Trace, TraceEvent (..), recordTrace)
@@ -89,7 +104,7 @@ windowCallbacks capabilities trace label captures =
     , onWindowFocus = \focused →
         reported FocusedReport . contained "window focus" $ do
           flag ← flagOf focused
-          pure (\latched → stageInput (StagedFocus flag) (latched {capturedFocused = Just flag}))
+          pure (\latched → stageInput (StagedFocus flag) (endHoldsOnLoss flag (latched {capturedFocused = Just flag})))
     , onWindowIconify = \iconified →
         reported IconifiedReport . contained "window iconify" $ do
           flag ← flagOf iconified
@@ -116,17 +131,20 @@ windowCallbacks capabilities trace label captures =
           decodedMods ← modifiersOf mods
           decodedButton ← evaluate (fromIntegral button)
           pure $ \latched →
-            stageInput
-              (StagedButton (ButtonEvent decodedButton decodedAction (capturedCursor latched) decodedMods))
-              latched
+            let (excursion, held) = case decodedAction of
+                  ButtonPressed → (Nothing, beginHold decodedButton (capturedCursor latched) latched)
+                  ButtonReleased → endHold decodedButton latched
+             in stageInput
+                  (StagedButton (ButtonEvent decodedButton decodedAction (capturedCursor latched) decodedMods excursion))
+                  held
     , onCursorPos = \x y →
         contained "window cursor position" $ do
           position ← CursorPosition <$> evaluate (realToFrac x) <*> evaluate (realToFrac y)
-          pure (\latched → latched {capturedCursor = Just position})
+          pure (\latched → widenHolds position (latched {capturedCursor = Just position}))
     , onCursorEnter = \entered →
         contained "window cursor enter" $ do
           flag ← flagOf entered
-          pure (\latched → latched {capturedCursorInside = Just flag})
+          pure (\latched → (if flag then id else leaveHolds) (latched {capturedCursorInside = Just flag}))
     , onScroll = \x y →
         contained "window scroll" $ do
           decoded ← ScrollEvent <$> evaluate (realToFrac x) <*> evaluate (realToFrac y)
@@ -187,6 +205,39 @@ windowCallbacks capabilities trace label captures =
       let code = fromIntegral codepoint ∷ Int
       evaluate (chr code)
 
+-- | Begin the excursion witness of a button press, from the cursor position
+-- known now. A button outside the held-state domain is never held, so it gets
+-- none, and a press restarts the witness of a button already tracked: the
+-- feed's held state follows the latest press the same way.
+beginHold ∷ Int → Maybe CursorPosition → Captures → Captures
+beginHold button position latched
+  | button >= 0 && button <= buttonDomainLast =
+      latched {capturedExcursions = IntMap.insert button (beginExcursion position) (capturedExcursions latched)}
+  | otherwise = latched
+
+-- | End a button's witness at its release, answering it with the captures that
+-- no longer track it.
+endHold ∷ Int → Captures → (Maybe ButtonExcursion, Captures)
+endHold button latched =
+  ( IntMap.lookup button (capturedExcursions latched)
+  , latched {capturedExcursions = IntMap.delete button (capturedExcursions latched)}
+  )
+
+-- | Extend every held button's witness by one reported cursor position.
+widenHolds ∷ CursorPosition → Captures → Captures
+widenHolds position latched =
+  latched {capturedExcursions = IntMap.map (widenExcursion position) (capturedExcursions latched)}
+
+-- | Mark every held button's witness as having left the content area.
+leaveHolds ∷ Captures → Captures
+leaveHolds latched = latched {capturedExcursions = IntMap.map leaveExcursion (capturedExcursions latched)}
+
+-- | A focus loss clears the feed's held state, so it discards every witness.
+endHoldsOnLoss ∷ Bool → Captures → Captures
+endHoldsOnLoss focused latched
+  | focused = latched
+  | otherwise = latched {capturedExcursions = IntMap.empty}
+
 -- | Stage one ordered event, or set the loss latch when the buffer is full.
 -- Later events while the latch is set are counted and not stored.
 stageInput ∷ StagedInput → Captures → Captures
@@ -210,7 +261,13 @@ latchFault name caught latched = case capturedFault latched of
 takeCaptures ∷ IORef Captures → IO Captures
 takeCaptures captures =
   atomicModifyIORef' captures $ \latched →
-    (noCaptures {capturedGeneration = capturedGeneration latched}, latched)
+    ( noCaptures
+        { capturedGeneration = capturedGeneration latched
+        , capturedCursor = capturedCursor latched
+        , capturedCursorInside = capturedCursorInside latched
+        }
+    , latched
+    )
 
 raiseFault ∷ WindowId → Captures → IO ()
 raiseFault identity pending = mapM_ (rethrowFault (windowIdentifiers identity)) (capturedFault pending)

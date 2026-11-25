@@ -16,7 +16,8 @@ import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM (STM, atomically, orElse)
 import Control.Exception (AsyncException (ThreadKilled), IOException, SomeException, fromException, throwIO, try)
 import Control.Monad (forM, forM_, replicateM, replicateM_, when)
-import Data.IORef (atomicModifyIORef', newIORef, readIORef)
+import Data.IORef (atomicModifyIORef', newIORef, readIORef, writeIORef)
+import qualified Data.IntMap.Strict as IntMap
 import qualified Data.Map.Strict as Map
 import Hetoimasia.Foundation.Log
   ( LogEntry (..)
@@ -36,18 +37,21 @@ import Hetoimasia.GLFW.Internal.Seam
   , asProcessMainThread
   , defaultScript
   , newSeam
+  , SeamScript (..)
+  , seamDeliverToAttached
   , seamDrive
   , seamDriveWith
   )
 import Hetoimasia.GLFW.Internal.Window (attachWindowInputFeed, inputStagingCapacity)
+import Hetoimasia.GLFW.Internal.Window.State (Captures (capturedExcursions), Window (windowCaptures))
 import Hetoimasia.GLFW.Window
-  ( Window
-  , WindowId
+  ( WindowId
   , WindowObservation
   , WindowResult (..)
   , hiddenTestWindowConfig
   , observedCursorPosition
   , observedCursorInside
+  , observedRevision
   , windowIdentity
   , windowObservations
   , withWindow
@@ -65,8 +69,6 @@ spec = describe "GLFW input feeds" $ do
       (boundedExample testDistinctEvents)
     it "gates input before readiness and while unfocused, needs no reset to stay disabled before readiness, and delivers the focus loss that closes the focus gate"
       (boundedExample testGates)
-    it "keeps a button event's captured cursor position and modifiers after later cursor motion"
-      (boundedExample testButtonPosition)
     it "clears held state on focus loss, so a later repeat or release is unpaired until a fresh press"
       (boundedExample testFocusLossClearsHeld)
 
@@ -103,6 +105,8 @@ spec = describe "GLFW input feeds" $ do
       (boundedExample testCallbackEvents)
     it "keeps a button event's captured coordinates after later cursor motion through callbacks"
       (boundedExample testCallbackButtonPosition)
+    it "delivers a click's captured position and modifiers with its single-point witness, whatever motion follows"
+      (boundedExample testButtonPosition)
     it "keeps a button event's captured coordinates when motion and the button occur in separate owner turns"
       (boundedExample testCallbackButtonAcrossTurns)
     it "sets the staging loss latch while the buffer is full and begins the same reset, replaying no captured prefix"
@@ -119,6 +123,30 @@ spec = describe "GLFW input feeds" $ do
       (boundedExample testCallbackIndependentWindows)
     it "delivers focus loss and gain in native order, and a focus transition that cannot be admitted starts the reset"
       (boundedExample testCallbackFocus)
+
+  describe "button excursion witness" $ do
+    it "reports a drag that returned to its start, with the box covering the excursion, while the observation stays unchanged"
+      (boundedExample testExcursionReturnsToStart)
+    it "reports the single point of a click and the small box of jitter"
+      (boundedExample testExcursionClickAndJitter)
+    it "sets the left-window flag when the cursor leaves and re-enters during the hold"
+      (boundedExample testExcursionLeaveAndReenter)
+    it "reports the same witness however the hold is split across polls"
+      (boundedExample testExcursionAcrossPolls)
+    it "keeps a separate witness for each of two overlapping holds"
+      (boundedExample testExcursionOverlappingHolds)
+    it "reports no extent, and the left flag, for a hold that saw a leave but no cursor position"
+      (boundedExample testExcursionWithoutPositions)
+    it "gives a release across a reset no witness, and a fresh hold only its own excursion"
+      (boundedExample testExcursionAcrossReset)
+    it "discards a witness with the hold on focus loss"
+      (boundedExample testExcursionFocusLoss)
+    it "stops tracking a hold that an application suspension or a staging overflow cleared, before any release arrives"
+      (boundedExample testExcursionLatchPruned)
+    it "keeps one box of extrema through a long hold"
+      (boundedExample testExcursionLongHold)
+    it "reports a cursor position that arrived during window construction as the first click's single-point box"
+      (boundedExample testExcursionFirstClickAfterConstruction)
 
   describe "application suspension" $ do
     it "leaves no backlog or held state after press, suspend, suppressed release, and enable, and needs acknowledgement, resumption, and a fresh press"
@@ -142,8 +170,7 @@ testDistinctEvents = do
   let shifted = noModifiers {modifierShift = True}
   produceInput feed (KeyInput (KeyEvent 65 38 KeyPressed shifted)) `shouldReturn` ProductionAdmitted
   produceInput feed (TextInput 'A') `shouldReturn` ProductionAdmitted
-  recordCursor feed (CursorPosition 3 4)
-  produceButton feed 1 ButtonPressed noModifiers `shouldReturn` ProductionAdmitted
+  produceInput feed (ButtonInput (ButtonEvent 1 ButtonPressed (Just (CursorPosition 3 4)) noModifiers Nothing)) `shouldReturn` ProductionAdmitted
   produceInput feed (ScrollInput (ScrollEvent 0 1)) `shouldReturn` ProductionAdmitted
   produceInput feed (ScrollInput (ScrollEvent 0 1)) `shouldReturn` ProductionAdmitted
   produceInput feed (TextInput 'A') `shouldReturn` ProductionAdmitted
@@ -152,7 +179,7 @@ testDistinctEvents = do
   map inputPayload events
     `shouldBe` [ KeyInput (KeyEvent 65 38 KeyPressed shifted)
                , TextInput 'A'
-               , ButtonInput (ButtonEvent 1 ButtonPressed (Just (CursorPosition 3 4)) noModifiers)
+               , ButtonInput (ButtonEvent 1 ButtonPressed (Just (CursorPosition 3 4)) noModifiers Nothing)
                , ScrollInput (ScrollEvent 0 1)
                , ScrollInput (ScrollEvent 0 1)
                , TextInput 'A'
@@ -185,35 +212,18 @@ testGates = do
   after ← statisticsOf feed
   (statisticsGated after, statisticsResets after, statisticsFocused after) `shouldBe` (4, 0, True)
 
-testButtonPosition ∷ Expectation
-testButtonPosition = do
-  feed ← readyFeed 8
-  let shifted = noModifiers {modifierShift = True}
-  produceButton feed 0 ButtonPressed shifted `shouldReturn` ProductionAdmitted
-  recordCursor feed (CursorPosition 1 2)
-  produceButton feed 0 ButtonReleased shifted `shouldReturn` ProductionAdmitted
-  produceButton feed 0 ButtonPressed noModifiers `shouldReturn` ProductionAdmitted
-  recordCursor feed (CursorPosition 50 60)
-  recordCursor feed (CursorPosition 70 80)
-  (events, _) ← drain (feedReader feed)
-  map inputPayload events
-    `shouldBe` [ ButtonInput (ButtonEvent 0 ButtonPressed Nothing shifted)
-               , ButtonInput (ButtonEvent 0 ButtonReleased (Just (CursorPosition 1 2)) shifted)
-               , ButtonInput (ButtonEvent 0 ButtonPressed (Just (CursorPosition 1 2)) noModifiers)
-               ]
-
 testFocusLossClearsHeld ∷ Expectation
 testFocusLossClearsHeld = do
   feed ← readyFeed 16
   produceInput feed (key 65 KeyPressed) `shouldReturn` ProductionAdmitted
-  produceButton feed 2 ButtonPressed noModifiers `shouldReturn` ProductionAdmitted
+  produceInput feed (buttonPayload 2 ButtonPressed) `shouldReturn` ProductionAdmitted
   statisticsHeld <$> statisticsOf feed `shouldReturn` 2
   produceInput feed (FocusInput False) `shouldReturn` ProductionAdmitted
   statisticsHeld <$> statisticsOf feed `shouldReturn` 0
   produceInput feed (FocusInput True) `shouldReturn` ProductionAdmitted
   produceInput feed (key 65 KeyRepeated) `shouldReturn` ProductionUnpaired
   produceInput feed (key 65 KeyReleased) `shouldReturn` ProductionUnpaired
-  produceButton feed 2 ButtonReleased noModifiers `shouldReturn` ProductionUnpaired
+  produceInput feed (buttonPayload 2 ButtonReleased) `shouldReturn` ProductionUnpaired
   produceInput feed (key 65 KeyPressed) `shouldReturn` ProductionAdmitted
   produceInput feed (key 65 KeyRepeated) `shouldReturn` ProductionAdmitted
   produceInput feed (key 65 KeyReleased) `shouldReturn` ProductionAdmitted
@@ -223,7 +233,7 @@ testFocusLossClearsHeld = do
   (events, _) ← drain (feedReader feed)
   map inputPayload events
     `shouldBe` [ key 65 KeyPressed
-               , ButtonInput (ButtonEvent 2 ButtonPressed Nothing noModifiers)
+               , buttonPayload 2 ButtonPressed
                , FocusInput False
                , FocusInput True
                , key 65 KeyPressed
@@ -425,7 +435,7 @@ testHeldAcrossReset ∷ Expectation
 testHeldAcrossReset = do
   feed ← readyFeed 3
   produceInput feed (key 65 KeyPressed) `shouldReturn` ProductionAdmitted
-  produceButton feed 0 ButtonPressed noModifiers `shouldReturn` ProductionAdmitted
+  produceInput feed (buttonPayload 0 ButtonPressed) `shouldReturn` ProductionAdmitted
   produceInput feed (key 65 KeyRepeated) `shouldReturn` ProductionAdmitted
   -- The held key's repeat is what overflows.
   ProductionOverflowed token ← produceInput feed (key 65 KeyRepeated)
@@ -435,7 +445,7 @@ testHeldAcrossReset = do
   resumeInput feed `shouldReturn` Resumed (resetEpoch token)
   produceInput feed (key 65 KeyRepeated) `shouldReturn` ProductionUnpaired
   produceInput feed (key 65 KeyReleased) `shouldReturn` ProductionUnpaired
-  produceButton feed 0 ButtonReleased noModifiers `shouldReturn` ProductionUnpaired
+  produceInput feed (buttonPayload 0 ButtonReleased) `shouldReturn` ProductionUnpaired
   readNow feed `shouldReturn` InputEmpty
   produceInput feed (key 65 KeyPressed) `shouldReturn` ProductionAdmitted
   produceInput feed (key 65 KeyReleased) `shouldReturn` ProductionAdmitted
@@ -579,11 +589,11 @@ testSuspendBetweenPressAndRelease = do
   let control = feedControl feed
       reader = feedReader feed
   produceInput feed (key 65 KeyPressed) `shouldReturn` ProductionAdmitted
-  produceButton feed 0 ButtonPressed noModifiers `shouldReturn` ProductionAdmitted
+  produceInput feed (buttonPayload 0 ButtonPressed) `shouldReturn` ProductionAdmitted
   token ← suspended control
   resetReason token `shouldBe` AdmissionSuspended
   produceInput feed (key 65 KeyReleased) `shouldReturn` ProductionSuppressed
-  produceButton feed 0 ButtonReleased noModifiers `shouldReturn` ProductionSuppressed
+  produceInput feed (buttonPayload 0 ButtonReleased) `shouldReturn` ProductionSuppressed
   atomically (enableInput control) `shouldReturn` AdmissionOpened
   readNow feed `shouldReturn` InputResetRequired token
   resumeInput feed `shouldReturn` ResumeAwaitingAcknowledgement
@@ -597,7 +607,7 @@ testSuspendBetweenPressAndRelease = do
   readNow feed `shouldReturn` InputEmpty
   produceInput feed (key 65 KeyRepeated) `shouldReturn` ProductionUnpaired
   produceInput feed (key 65 KeyReleased) `shouldReturn` ProductionUnpaired
-  produceButton feed 0 ButtonReleased noModifiers `shouldReturn` ProductionUnpaired
+  produceInput feed (buttonPayload 0 ButtonReleased) `shouldReturn` ProductionUnpaired
   readNow feed `shouldReturn` InputEmpty
   produceInput feed (key 65 KeyPressed) `shouldReturn` ProductionAdmitted
   (events, _) ← drain reader
@@ -755,7 +765,7 @@ testCallbackEvents =
     map inputPayload events
       `shouldBe` [ KeyInput (KeyEvent 65 38 KeyPressed (noModifiers {modifierShift = True}))
                  , TextInput 'A'
-                 , ButtonInput (ButtonEvent 1 ButtonPressed (Just (CursorPosition 3 4)) noModifiers)
+                 , ButtonInput (ButtonEvent 1 ButtonPressed (Just (CursorPosition 3 4)) noModifiers Nothing)
                  , ScrollInput (ScrollEvent 0 1)
                  , ScrollInput (ScrollEvent 0 1)
                  , TextInput 'A'
@@ -770,10 +780,24 @@ testCallbackButtonPosition =
     drive seam window [CursorMovedTo 1 2, ButtonEventAt 0 1 1, CursorMovedTo 50 60, CursorMovedTo 70 80, ButtonEventAt 0 0 1]
     (events, _) ← drain (feedReader feed)
     map inputPayload events
-      `shouldBe` [ ButtonInput (ButtonEvent 0 ButtonPressed (Just (CursorPosition 1 2)) (noModifiers {modifierShift = True}))
-                 , ButtonInput (ButtonEvent 0 ButtonReleased (Just (CursorPosition 70 80)) (noModifiers {modifierShift = True}))
+      `shouldBe` [ ButtonInput (ButtonEvent 0 ButtonPressed (Just (CursorPosition 1 2)) (noModifiers {modifierShift = True}) Nothing)
+                 , ButtonInput (ButtonEvent 0 ButtonReleased (Just (CursorPosition 70 80)) (noModifiers {modifierShift = True}) (Just (ButtonExcursion (Just (CursorBox (CursorPosition 1 2) (CursorPosition 70 80))) False)))
                  ]
     observedCursorPosition <$> currentObservation window `shouldReturn` Just (CursorPosition 70 80)
+
+testButtonPosition ∷ Expectation
+testButtonPosition =
+  withLiveFeed 8 $ \seam window feed → do
+    let shifted = noModifiers {modifierShift = True}
+    -- The first press has no known cursor position; the first sample, (1, 2),
+    -- arrives during the hold and is the whole of its box.
+    drive seam window [ButtonEventAt 0 1 1, CursorMovedTo 1 2, ButtonEventAt 0 0 1, ButtonEventAt 0 1 0, CursorMovedTo 50 60, CursorMovedTo 70 80]
+    (events, _) ← drain (feedReader feed)
+    map inputPayload events
+      `shouldBe` [ ButtonInput (ButtonEvent 0 ButtonPressed Nothing shifted Nothing)
+                 , ButtonInput (ButtonEvent 0 ButtonReleased (Just (CursorPosition 1 2)) shifted (witnessOf (1, 2) (1, 2) False))
+                 , ButtonInput (ButtonEvent 0 ButtonPressed (Just (CursorPosition 1 2)) noModifiers Nothing)
+                 ]
 
 testCallbackButtonAcrossTurns ∷ Expectation
 testCallbackButtonAcrossTurns =
@@ -782,7 +806,7 @@ testCallbackButtonAcrossTurns =
     drive seam window [ButtonEventAt 0 1 0]
     (events, _) ← drain (feedReader feed)
     map inputPayload events
-      `shouldBe` [ButtonInput (ButtonEvent 0 ButtonPressed (Just (CursorPosition 9 10)) noModifiers)]
+      `shouldBe` [ButtonInput (ButtonEvent 0 ButtonPressed (Just (CursorPosition 9 10)) noModifiers Nothing)]
 
 testStagingOverflow ∷ Expectation
 testStagingOverflow =
@@ -894,6 +918,178 @@ testCallbackFocus =
       other → unexpected ("a focus transition into a full feed did not reset: " <> show other)
 
 -- ---------------------------------------------------------------------------
+-- Button excursion witness
+
+-- | The witness every delivered release carried, by button.
+releaseWitnesses ∷ [InputEvent] → [(Int, Maybe ButtonExcursion)]
+releaseWitnesses events =
+  [ (buttonNumber button, buttonExcursion button)
+  | ButtonInput button ← map inputPayload events
+  , buttonAction button == ButtonReleased
+  ]
+
+-- | A witness over the box from (lowX, lowY) to (highX, highY).
+witnessOf ∷ (Double, Double) → (Double, Double) → Bool → Maybe ButtonExcursion
+witnessOf (lowX, lowY) (highX, highY) left =
+  Just (ButtonExcursion (Just (CursorBox (CursorPosition lowX lowY) (CursorPosition highX highY))) left)
+
+testExcursionReturnsToStart ∷ Expectation
+testExcursionReturnsToStart =
+  withLiveFeed 16 $ \seam window feed → do
+    -- A is established in the observation first; B has a lower x and a higher y.
+    drive seam window [CursorMovedTo 10 10]
+    before ← currentObservation window
+    observedCursorPosition before `shouldBe` Just (CursorPosition 10 10)
+    drive seam window [ButtonEventAt 0 1 0, CursorMovedTo 4 25, CursorMovedTo 10 10, ButtonEventAt 0 0 0]
+    (events, _) ← drain (feedReader feed)
+    releaseWitnesses events `shouldBe` [(0, witnessOf (4, 10) (10, 25) False)]
+    after ← currentObservation window
+    observedCursorPosition after `shouldBe` Just (CursorPosition 10 10)
+    observedRevision after `shouldBe` observedRevision before
+
+testExcursionClickAndJitter ∷ Expectation
+testExcursionClickAndJitter =
+  withLiveFeed 16 $ \seam window feed → do
+    drive seam window [CursorMovedTo 10 10]
+    drive seam window [ButtonEventAt 0 1 0, ButtonEventAt 0 0 0]
+    (clicked, _) ← drain (feedReader feed)
+    releaseWitnesses clicked `shouldBe` [(0, witnessOf (10, 10) (10, 10) False)]
+    drive seam window [ButtonEventAt 0 1 0, CursorMovedTo 11 9, CursorMovedTo 10.5 10.5, ButtonEventAt 0 0 0]
+    (jittered, _) ← drain (feedReader feed)
+    releaseWitnesses jittered `shouldBe` [(0, witnessOf (10, 9) (11, 10.5) False)]
+
+testExcursionLeaveAndReenter ∷ Expectation
+testExcursionLeaveAndReenter =
+  withLiveFeed 16 $ \seam window feed → do
+    drive seam window [CursorMovedTo 10 10, CursorEnterChanged True]
+    drive seam window [ButtonEventAt 0 1 0, CursorEnterChanged False, CursorEnterChanged True, ButtonEventAt 0 0 0]
+    (events, _) ← drain (feedReader feed)
+    releaseWitnesses events `shouldBe` [(0, witnessOf (10, 10) (10, 10) True)]
+
+testExcursionAcrossPolls ∷ Expectation
+testExcursionAcrossPolls =
+  withLiveFeed 16 $ \seam window feed → do
+    drive seam window [CursorMovedTo 10 10]
+    drive seam window [ButtonEventAt 0 1 0]
+    drive seam window [CursorMovedTo 4 25]
+    drive seam window [CursorMovedTo 10 10]
+    drive seam window [ButtonEventAt 0 0 0]
+    (events, _) ← drain (feedReader feed)
+    releaseWitnesses events `shouldBe` [(0, witnessOf (4, 10) (10, 25) False)]
+
+testExcursionOverlappingHolds ∷ Expectation
+testExcursionOverlappingHolds =
+  withLiveFeed 16 $ \seam window feed → do
+    drive seam window [CursorMovedTo 10 10]
+    drive seam window
+      [ ButtonEventAt 0 1 0
+      , CursorMovedTo 4 25
+      , ButtonEventAt 1 1 0
+      , CursorMovedTo 40 30
+      , ButtonEventAt 1 0 0
+      , CursorMovedTo 10 10
+      , ButtonEventAt 0 0 0
+      ]
+    (events, _) ← drain (feedReader feed)
+    Map.fromList (releaseWitnesses events)
+      `shouldBe` Map.fromList
+        [ (1, witnessOf (4, 25) (40, 30) False)
+        , (0, witnessOf (4, 10) (40, 30) False)
+        ]
+
+testExcursionWithoutPositions ∷ Expectation
+testExcursionWithoutPositions =
+  withLiveFeed 16 $ \seam window feed → do
+    observedCursorPosition <$> currentObservation window `shouldReturn` Nothing
+    drive seam window [ButtonEventAt 0 1 0, CursorEnterChanged False, ButtonEventAt 0 0 0]
+    (events, _) ← drain (feedReader feed)
+    releaseWitnesses events `shouldBe` [(0, Just (ButtonExcursion Nothing True))]
+
+testExcursionAcrossReset ∷ Expectation
+testExcursionAcrossReset =
+  withLiveFeed 16 $ \seam window feed → do
+    drive seam window [CursorMovedTo 10 10, ButtonEventAt 0 1 0, CursorMovedTo 90 90]
+    token ← suspended (feedControl feed)
+    atomically (acknowledgeReset (feedReader feed) token) `shouldReturn` Right Acknowledged
+    atomically (enableInput (feedControl feed)) `shouldReturn` AdmissionOpened
+    resumeInput feed `shouldReturn` Resumed (resetEpoch token)
+    unpairedBefore ← statisticsUnpaired <$> statisticsOf feed
+    drive seam window [ButtonEventAt 0 0 0]
+    readNow feed `shouldReturn` InputEmpty
+    statisticsUnpaired <$> statisticsOf feed `shouldReturn` unpairedBefore + 1
+    drive seam window [CursorMovedTo 20 30, ButtonEventAt 0 1 0, ButtonEventAt 0 0 0]
+    (events, _) ← drain (feedReader feed)
+    releaseWitnesses events `shouldBe` [(0, witnessOf (20, 30) (20, 30) False)]
+
+testExcursionFocusLoss ∷ Expectation
+testExcursionFocusLoss =
+  withLiveFeed 16 $ \seam window feed → do
+    drive seam window [CursorMovedTo 10 10, ButtonEventAt 0 1 0, CursorMovedTo 90 90, FocusChanged False, FocusChanged True]
+    statisticsHeld <$> statisticsOf feed `shouldReturn` 0
+    unpairedBefore ← statisticsUnpaired <$> statisticsOf feed
+    drive seam window [ButtonEventAt 0 0 0]
+    statisticsUnpaired <$> statisticsOf feed `shouldReturn` unpairedBefore + 1
+    drive seam window [CursorMovedTo 20 30, ButtonEventAt 0 1 0, ButtonEventAt 0 0 0]
+    (events, _) ← drain (feedReader feed)
+    releaseWitnesses events `shouldBe` [(0, witnessOf (20, 30) (20, 30) False)]
+
+testExcursionLatchPruned ∷ Expectation
+testExcursionLatchPruned =
+  withLiveFeed 16 $ \seam window feed → do
+    let tracked = IntMap.keys . capturedExcursions <$> readIORef (windowCaptures window)
+    drive seam window [CursorMovedTo 10 10, ButtonEventAt 0 1 0, CursorMovedTo 20 20]
+    tracked `shouldReturn` [0]
+    -- An application suspension clears the held state; the next boundary drops the witness.
+    _ ← suspended (feedControl feed)
+    drive seam window [CursorMovedTo 90 90]
+    tracked `shouldReturn` []
+    -- A staging overflow does the same, for a hold admitted in an earlier epoch.
+    token ← readNow feed >>= \case
+      InputResetRequired reset → pure reset
+      other → unexpected ("no suspension reset was pending: " <> show other)
+    atomically (acknowledgeReset (feedReader feed) token) `shouldReturn` Right Acknowledged
+    atomically (enableInput (feedControl feed)) `shouldReturn` AdmissionOpened
+    resumeInput feed `shouldReturn` Resumed (resetEpoch token)
+    drive seam window [ButtonEventAt 1 1 0]
+    tracked `shouldReturn` [1]
+    drive seam window (replicate (inputStagingCapacity + 1) (CharEventAt (fromEnum 'x')))
+    drive seam window [CursorMovedTo 95 95]
+    tracked `shouldReturn` []
+
+testExcursionLongHold ∷ Expectation
+testExcursionLongHold =
+  withLiveFeed 16 $ \seam window feed → do
+    drive seam window [CursorMovedTo 0 0, ButtonEventAt 0 1 0]
+    forM_ [1 .. 2000 ∷ Int] $ \step →
+      drive seam window [CursorMovedTo (fromIntegral (step `mod` 50)) (fromIntegral (step `mod` 70))]
+    drive seam window [ButtonEventAt 0 0 0]
+    (events, _) ← drain (feedReader feed)
+    releaseWitnesses events `shouldBe` [(0, witnessOf (0, 0) (49, 69) False)]
+
+testExcursionFirstClickAfterConstruction ∷ Expectation
+testExcursionFirstClickAfterConstruction = do
+  seamRef ← newIORef Nothing
+  fired ← newIORef False
+  -- The first scripted size query runs while the window is being constructed,
+  -- after its callbacks are attached: the cursor is reported there, once.
+  let script =
+        defaultScript
+          { scriptWindowSize = \_ → do
+              first ← atomicModifyIORef' fired (\already → (True, not already))
+              when first (readIORef seamRef >>= mapM_ (`seamDeliverToAttached` [CursorMovedTo 3 4]))
+              pure (800, 600)
+          }
+  seam ← newSeam script
+  writeIORef seamRef (Just seam)
+  asProcessMainThread seam . entered seam $ \session →
+    withWindow session (hiddenTestWindowConfig "input" 64 48) $ \window → do
+      feed ← attached window 16
+      observedCursorPosition <$> currentObservation window `shouldReturn` Just (CursorPosition 3 4)
+      drive seam window [ButtonEventAt 0 1 0, ButtonEventAt 0 0 0]
+      (events, _) ← drain (feedReader feed)
+      releaseWitnesses events `shouldBe` [(0, witnessOf (3, 4) (3, 4) False)]
+
+-- ---------------------------------------------------------------------------
 -- Support
 
 withLiveFeed ∷ Integer → (Seam → Window → InputFeed → IO a) → IO a
@@ -945,6 +1141,9 @@ enabled ∷ InputFeed → IO InputFeed
 enabled feed = do
   atomically (enableInput (feedControl feed)) `shouldReturn` AdmissionOpened
   pure feed
+
+buttonPayload ∷ Int → ButtonAction → InputPayload
+buttonPayload number action = ButtonInput (ButtonEvent number action Nothing noModifiers Nothing)
 
 key ∷ Int → KeyAction → InputPayload
 key code action = KeyInput (KeyEvent code 0 action noModifiers)

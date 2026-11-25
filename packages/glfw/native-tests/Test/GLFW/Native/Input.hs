@@ -86,7 +86,7 @@ spec shared = describe "native input callbacks" $ do
     payloads
       `shouldBe` [ KeyInput (KeyEvent 65 38 KeyPressed (noModifiers {modifierShift = True}))
                  , TextInput 'A'
-                 , ButtonInput (ButtonEvent 1 ButtonPressed (Just (CursorPosition 3 4)) noModifiers)
+                 , ButtonInput (ButtonEvent 1 ButtonPressed (Just (CursorPosition 3 4)) noModifiers Nothing)
                  , ScrollInput (ScrollEvent 0 1)
                  , ScrollInput (ScrollEvent 0 1)
                  , TextInput 'A'
@@ -106,7 +106,7 @@ spec shared = describe "native input callbacks" $ do
           inject window $ \handle → injectMouseButtonForCheck handle 0 glfwPress 0
           (events, _) ← drain feed
           pure (map inputPayload events)
-    payloads `shouldBe` [ButtonInput (ButtonEvent 0 ButtonPressed (Just (CursorPosition 9 10)) noModifiers)]
+    payloads `shouldBe` [ButtonInput (ButtonEvent 0 ButtonPressed (Just (CursorPosition 9 10)) noModifiers Nothing)]
 
   it "keeps a button event's captured coordinates after later cursor motion" $ do
     payloads ←
@@ -122,8 +122,8 @@ spec shared = describe "native input callbacks" $ do
           (events, _) ← drain feed
           pure (map inputPayload events)
     payloads
-      `shouldBe` [ ButtonInput (ButtonEvent 0 ButtonPressed (Just (CursorPosition 1 2)) (noModifiers {modifierShift = True}))
-                 , ButtonInput (ButtonEvent 0 ButtonReleased (Just (CursorPosition 70 80)) (noModifiers {modifierShift = True}))
+      `shouldBe` [ ButtonInput (ButtonEvent 0 ButtonPressed (Just (CursorPosition 1 2)) (noModifiers {modifierShift = True}) Nothing)
+                 , ButtonInput (ButtonEvent 0 ButtonReleased (Just (CursorPosition 70 80)) (noModifiers {modifierShift = True}) (Just (ButtonExcursion (Just (CursorBox (CursorPosition 1 2) (CursorPosition 70 80))) False)))
                  ]
 
   it "saturates the feed from real callbacks, acknowledges, and delivers a fresh press but no press for a key still held" $ do
