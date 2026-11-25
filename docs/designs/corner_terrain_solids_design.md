@@ -11,7 +11,7 @@ Design state: `ready for issue processing`
 - [x] COR-2. Derive portals from the union of solid pieces — [#754]
 - [x] COR-3. Carry the shape family through packed terrain segments — [#755]
 - [x] COR-4. Admit corner cells through source, discovery and snapshot reads — [#756]
-- [ ] COR-5. Author corner masks through Lua terrain definitions
+- [x] COR-5. Author corner masks through Lua terrain definitions — [#757]
 
 An unchecked entry awaits processing. A checked entry links its tracker issue.
 
