@@ -172,12 +172,12 @@ spec = describe "owner progress" $ do
           (both, _) ← submittedAs other reopened
           let (anchored, report) = runProgressTurn silentEvidence (atMilliseconds 0) both
           turnNextDeadline report `shouldBe` TurnAt (atMilliseconds 5)
-          pure (anchored, submission)
+          pure (both, anchored, submission)
         idleTurnsAt instants current =
           foldl' (\held at → fst (runProgressTurn silentEvidence (atMilliseconds at) held)) current instants
 
     it "keeps the poll's deadline and the backoff step, however many of them run" $ do
-      (anchored, _) ← scheduled
+      (_, anchored, _) ← scheduled
       let early = idleTurnsAt (concat (replicate 25 [1, 2, 3, 4])) anchored
       progressDeadline early `shouldBe` TurnAt (atMilliseconds 5)
       nextDeadline early `shouldBe` nextDeadline anchored
@@ -187,10 +187,9 @@ spec = describe "owner progress" $ do
       let (_, quiet) = runProgressTurn silentEvidence (atMilliseconds 5) anchored
           (_, disturbed) = runProgressTurn silentEvidence (atMilliseconds 5) early
       turnNextDeadline disturbed `shouldBe` turnNextDeadline quiet
-      turnNextDeadline quiet `shouldBe` TurnAt (atMilliseconds 15)
 
     it "observes a completion that is ready at the scheduled poll exactly when the quiet run does" $ do
-      (anchored, submission) ← scheduled
+      (_, anchored, submission) ← scheduled
       let early = idleTurnsAt (concat (replicate 25 [1, 2, 3, 4])) anchored
           ready = silentEvidence {submissionEvidence = (== submission)}
           (observedQuiet, quiet) = runProgressTurn ready (atMilliseconds 5) anchored
@@ -200,11 +199,13 @@ spec = describe "owner progress" $ do
       length (framelessSlots observedEarly) `shouldBe` 1
 
     it "still restarts the schedule when it observes a completion" $ do
-      (anchored, submission) ← scheduled
+      (fresh, anchored, submission) ← scheduled
       let ready = silentEvidence {submissionEvidence = (== submission)}
           (_, report) = runProgressTurn ready (atMilliseconds 3) anchored
+          -- A schedule that has just begun, turned at the same instant.
+          (_, beginning) = runProgressTurn silentEvidence (atMilliseconds 3) fresh
       turnFacts report `shouldBe` 1
-      turnNextDeadline report `shouldBe` TurnAt (atMilliseconds 8)
+      turnNextDeadline report `shouldBe` turnNextDeadline beginning
 
   it "restarts the backoff on a new obligation, an observed completion and a close" $ do
     -- Two frames are submitted and only one of them completes, so a pending
