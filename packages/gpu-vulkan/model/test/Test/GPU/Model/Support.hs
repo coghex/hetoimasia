@@ -32,6 +32,7 @@ module Test.GPU.Model.Support
   , activeTargetWith
   , acquiredFrame
   , aResource
+  , submittedAs
   ) where
 
 import Data.Unique (newUnique)
@@ -185,3 +186,10 @@ aResource ∷ HasCallStack ⇒ Natural → GpuModel → IO (GpuModel, ResourceId
 aResource bytes model = do
   (reserved, allocation) ← admitted "reserving an allocation" (beginAllocation bytes 1 model)
   admitted "creating a resource" (createResource allocation reserved)
+
+-- | Submit a frame-less batch, accepted, answering its submission.
+submittedAs ∷ BatchId → GpuModel → IO (GpuModel, SubmissionId)
+submittedAs batch model =
+  admitted "the submission" (submitFramelessBatch batch SubmissionAccepted model) >>= \case
+    (next, SubmissionRecorded submission) → pure (next, submission)
+    (_, other) → fail ("the submission answered " <> show other)

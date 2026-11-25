@@ -351,8 +351,17 @@ advanceBackoff budgets state
 -- announces is the one it is at, and the step it stores is the one after it —
 -- storing the step it announced would spend that interval twice and turn the
 -- schedule into 5, 5, 10, 20 rather than 5, 10, 20, 40.
+--
+-- A turn that made no progress and ran before the poll it was anchored for is
+-- due leaves the schedule exactly as it was: the deadline stays where it is and
+-- the step does not advance. Such a turn is somebody else's opportunity — a
+-- window observation, a recovery deadline — and re-anchoring on it would let a
+-- stream of them postpone the poll for as long as it lasted. This is the one
+-- place every owner turn passes through, so every early-turn caller is covered.
 scheduleNextPoll ∷ Budgets → Instant → Bool → BackoffState → BackoffState
-scheduleNextPoll budgets now progressed state = anchor (if progressed then freshBackoff else state)
+scheduleNextPoll budgets now progressed state
+  | not progressed, DueAt due ← backoffDueAt state, now < due = state
+  | otherwise = anchor (if progressed then freshBackoff else state)
   where
     anchor from =
       BackoffState
