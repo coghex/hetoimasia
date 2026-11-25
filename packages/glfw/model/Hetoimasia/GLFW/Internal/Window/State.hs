@@ -28,6 +28,10 @@
 -- |                     |               | the owner boundary         | owner       |                     | published, then emptied  |
 -- |                     |               | publishes or discards      | publishes   |                     |                          |
 -- +---------------------+---------------+----------------------------+-------------+---------------------+--------------------------+
+-- | Held-button         | The window    | Callbacks write; the       | Callbacks:  | The window          | Ended by the release,    |
+-- | excursions          |               | owner boundary keeps       | owner       |                     | or a focus loss; taken   |
+-- |                     |               | them                       |             |                     | whole at release         |
+-- +---------------------+---------------+----------------------------+-------------+---------------------+--------------------------+
 -- | Attached input feed | The window    | The host attaches it;      | Owner       | From attachment     | Closed with the window   |
 -- |                     |               | the owner boundary         |             | until the window    |                          |
 -- |                     |               | publishes into it          |             | ends                |                          |
@@ -117,6 +121,8 @@ module Hetoimasia.GLFW.Internal.Window.State
 
 import Control.Exception (ExceptionWithContext, SomeException)
 import Data.IORef (IORef, atomicModifyIORef', atomicWriteIORef, readIORef)
+import Data.IntMap.Strict (IntMap)
+import qualified Data.IntMap.Strict as IntMap
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Foreign.Ptr (Ptr)
@@ -124,7 +130,7 @@ import Hetoimasia.Foundation.Failure (Operation, operation)
 import Hetoimasia.Foundation.Messaging.Snapshot (SnapshotPublisher, SnapshotReader, snapshotReader)
 import Hetoimasia.GLFW.Internal.Attribute (ContentScale (..), CursorPosition (..), Extent (..), Placement (..))
 import Hetoimasia.GLFW.Internal.Control (ConstraintState (..))
-import Hetoimasia.GLFW.Internal.Input (ButtonEvent (..), InputFeed, KeyEvent (..), ScrollEvent (..))
+import Hetoimasia.GLFW.Internal.Input (ButtonEvent (..), ButtonExcursion, InputFeed, KeyEvent (..), ScrollEvent (..))
 import Hetoimasia.GLFW.Internal.Mode (NativeConstraints (..))
 import Hetoimasia.GLFW.Internal.Session (NativeWindow, Session)
 import Hetoimasia.GLFW.Internal.Window.Identity (WindowId, windowLocalIdentity)
@@ -219,6 +225,12 @@ data Captures = Captures
     -- recorded anything since the captures it folded were read.
   , capturedCursor ∷ !(Maybe CursorPosition)
   , capturedCursorInside ∷ !(Maybe Bool)
+  , capturedExcursions ∷ !(IntMap ButtonExcursion)
+    -- ^ The witness of each button held since its press callback, by button
+    -- number, at most one per button in the held-state domain. A press starts
+    -- it, cursor callbacks extend it, and the release callback or a focus loss
+    -- ends it. It survives owner boundaries, like 'capturedCursor', because a
+    -- hold spans polls.
   , capturedInput ∷ ![StagedInput]
     -- ^ Ordered input, newest first, at most 'inputStagingCapacity'.
   , capturedInputCount ∷ !Int
@@ -260,6 +272,7 @@ noCaptures =
     , capturedGeneration = 0
     , capturedCursor = Nothing
     , capturedCursorInside = Nothing
+    , capturedExcursions = IntMap.empty
     , capturedInput = []
     , capturedInputCount = 0
     , capturedInputLost = 0

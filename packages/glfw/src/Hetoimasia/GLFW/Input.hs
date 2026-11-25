@@ -13,7 +13,10 @@
 -- a key transition, a Unicode character, a button transition with the cursor
 -- position and modifiers captured for it, scroll offsets, or a focus transition.
 -- Native callbacks copy those payloads and return; the owner boundary publishes
--- them into the feed. Cursor motion coalesces into the window observation.
+-- them into the feed. Cursor motion coalesces into the window observation, so a
+-- delivered release also carries a 'ButtonExcursion': the bounding box of the
+-- cursor positions reported during its hold, and whether the cursor left the
+-- window, which tells a click from a drag that returned to its start.
 -- When ordered admission is full, or input is suspended, the feed discards its
 -- backlog and every read answers 'InputResetRequired' until the consumer —
 -- having finished or abandoned its current handler and cleared its own held keys,
@@ -59,6 +62,8 @@ module Hetoimasia.GLFW.Input
   , KeyAction (..)
   , ButtonEvent (..)
   , ButtonAction (..)
+  , ButtonExcursion (..)
+  , CursorBox (..)
   , ScrollEvent (..)
   , CursorPosition (..)
   , Modifiers (..)

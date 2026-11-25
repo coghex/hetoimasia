@@ -41,6 +41,16 @@
 -- so later cursor motion does not change an event already produced. Scroll,
 -- text, button and key transitions, and focus transitions are never coalesced.
 --
+-- Cursor motion itself does coalesce, so a release also carries a bounded
+-- excursion witness for its hold ('ButtonExcursion'): the bounding box of every
+-- cursor position the native layer reported from the press through the release,
+-- and whether the cursor left the content area meanwhile. The window's callbacks
+-- accumulate it per held button, beside the capture latch that stages input, and
+-- attach it to the release they stage; the feed delivers it only with a release
+-- that pairs with an admitted press, so an unpaired release, which is never
+-- delivered, discards it. The engine applies no click threshold or drag
+-- classification to it.
+--
 -- The producer prepares each event to normal form in 'IO' before admission.
 -- Every transaction here only reads and writes state: none evaluates a payload,
 -- makes a native call, logs, or runs a handler.
@@ -206,6 +216,11 @@ module Hetoimasia.GLFW.Internal.Input
   , KeyAction (..)
   , ButtonEvent (..)
   , ButtonAction (..)
+  , ButtonExcursion (..)
+  , CursorBox (..)
+  , beginExcursion
+  , widenExcursion
+  , leaveExcursion
   , ScrollEvent (..)
   , CursorPosition (..)
   , Modifiers (..)
@@ -361,15 +376,66 @@ instance NFData ButtonAction
 -- | A mouse button transition, with the cursor position and modifiers captured
 -- for this event. The position is 'Nothing' when the producer had no cursor
 -- sample yet.
+--
+-- 'buttonExcursion' is the witness for the hold a delivered release ends:
+-- 'Nothing' on a press, and on any release the window's callbacks did not
+-- witness, such as one produced directly with 'produceButton'. A release the
+-- feed finds unpaired is not delivered at all.
 data ButtonEvent = ButtonEvent
   { buttonNumber ∷ !Int
   , buttonAction ∷ !ButtonAction
   , buttonCursor ∷ !(Maybe CursorPosition)
   , buttonModifiers ∷ !Modifiers
+  , buttonExcursion ∷ !(Maybe ButtonExcursion)
   }
   deriving (Eq, Show, Generic)
 
 instance NFData ButtonEvent
+
+-- | The axis-aligned bounding box of cursor positions: the lowest x and y in
+-- 'boxLow', the highest in 'boxHigh', in the window's cursor coordinates.
+data CursorBox = CursorBox
+  { boxLow ∷ !CursorPosition
+  , boxHigh ∷ !CursorPosition
+  }
+  deriving (Eq, Show, Generic)
+
+instance NFData CursorBox
+
+-- | What the cursor did while one button was held, from the press through its
+-- release. Cursor motion coalesces into the window observation, so this is the
+-- only record of a drag that returned to where it began.
+data ButtonExcursion = ButtonExcursion
+  { excursionBox ∷ !(Maybe CursorBox)
+    -- ^ Every cursor position reported from the press through the release,
+    -- including the positions captured for the press and the release: the one
+    -- known at the press, if any, and each position reported since. 'Nothing'
+    -- only when none was ever reported.
+  , excursionLeftWindow ∷ !Bool
+    -- ^ A cursor-enter callback reported the cursor outside the content area at
+    -- least once during the hold, even if it re-entered.
+  }
+  deriving (Eq, Show, Generic)
+
+instance NFData ButtonExcursion
+
+-- | The witness a press begins, from the cursor position known at that moment.
+beginExcursion ∷ Maybe CursorPosition → ButtonExcursion
+beginExcursion position = ButtonExcursion (pointBox <$> position) False
+  where
+    pointBox point = CursorBox point point
+
+-- | Extend a witness by one reported cursor position.
+widenExcursion ∷ CursorPosition → ButtonExcursion → ButtonExcursion
+widenExcursion (CursorPosition x y) excursion = excursion {excursionBox = Just (maybe point widened (excursionBox excursion))}
+  where
+    point = CursorBox (CursorPosition x y) (CursorPosition x y)
+    widened (CursorBox (CursorPosition lowX lowY) (CursorPosition highX highY)) =
+      CursorBox (CursorPosition (min lowX x) (min lowY y)) (CursorPosition (max highX x) (max highY y))
+
+-- | Record that the cursor was reported outside the content area.
+leaveExcursion ∷ ButtonExcursion → ButtonExcursion
+leaveExcursion excursion = excursion {excursionLeftWindow = True}
 
 -- | Scroll offsets on both axes.
 data ScrollEvent = ScrollEvent
@@ -852,11 +918,12 @@ recordCursor ∷ InputFeed → CursorPosition → IO ()
 recordCursor feed = atomicWriteIORef (feedCursor feed) . Just
 
 -- | Produce a button transition carrying the latest cursor sample and the given
--- modifiers, copied now.
+-- modifiers, copied now, and no excursion witness: only the window's callbacks
+-- observe cursor motion between a press and its release.
 produceButton ∷ InputFeed → Int → ButtonAction → Modifiers → IO Production
 produceButton feed button action modifiers = do
   position ← readIORef (feedCursor feed)
-  produceInput feed (ButtonInput (ButtonEvent button action position modifiers))
+  produceInput feed (ButtonInput (ButtonEvent button action position modifiers Nothing))
 
 -- | Begin the overflow reset because native staging overflowed, without
 -- presenting an event to the channel. @lost@ is the exact number of staged

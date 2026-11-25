@@ -19,7 +19,9 @@
 -- transitions — is staged in a bounded buffer of 'inputStagingCapacity' events
 -- and is never coalesced. Cursor position is not an input event: it coalesces
 -- into the observation and updates the feed's cursor sample, so a later button
--- still carries the coordinates copied when that button callback ran. A
+-- still carries the coordinates copied when that button callback ran. The
+-- commit leaves the cursor, cursor-inside, and held-button excursion captures
+-- latched, since each outlives the boundary that publishes input. A
 -- refresh or a close request always publishes a new revision, even when every
 -- sampled attribute is unchanged. Preparation runs in 'IO', outside the
 -- trampoline and outside 'STM'. Nothing changes until the commit: after
@@ -182,6 +184,7 @@ reconcileFollowing forced settle adjust interruption window sample = do
               , capturedFault = capturedFault latched
               , capturedCursor = capturedCursor latched
               , capturedCursorInside = capturedCursorInside latched
+              , capturedExcursions = capturedExcursions latched
               }
           , True
           )

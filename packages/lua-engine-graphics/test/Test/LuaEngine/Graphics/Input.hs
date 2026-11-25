@@ -97,9 +97,9 @@ translationSpec = describe "translation" $ do
       `shouldBe` map BodyText [65, 233, 0x1F600, 0xD800, 0xDFFF, 0x10FFFF]
 
   it "keeps a button's captured cursor and modifiers, whether or not it had a cursor, and both signed fractional scroll offsets without modifiers" $ do
-    bodyOf (translateEvent (2, Glfw.ButtonInput (Glfw.ButtonEvent 1 Glfw.ButtonPressed (Just (CursorPosition 0.1 (-300.75))) Glfw.noModifiers {Glfw.modifierControl = True})))
+    bodyOf (translateEvent (2, Glfw.ButtonInput (Glfw.ButtonEvent 1 Glfw.ButtonPressed (Just (CursorPosition 0.1 (-300.75))) Glfw.noModifiers {Glfw.modifierControl = True} Nothing)))
       `shouldBe` BodyButton 1 ButtonActionPress (Just (0.1, -300.75)) none {modControl = True}
-    bodyOf (translateEvent (2, Glfw.ButtonInput (Glfw.ButtonEvent 0 Glfw.ButtonReleased Nothing Glfw.noModifiers)))
+    bodyOf (translateEvent (2, Glfw.ButtonInput (Glfw.ButtonEvent 0 Glfw.ButtonReleased Nothing Glfw.noModifiers Nothing)))
       `shouldBe` BodyButton 0 ButtonActionRelease Nothing none
     bodyOf (translateEvent (2, Glfw.ScrollInput (Glfw.ScrollEvent (-2.5) 0.125))) `shouldBe` BodyScroll (-2.5) 0.125
     bodyOf (translateEvent (2, Glfw.FocusInput False)) `shouldBe` BodyFocus False
