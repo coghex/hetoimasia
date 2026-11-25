@@ -84,8 +84,8 @@ spec = describe "owner progress" $ do
 
     -- New render demand schedules an immediate opportunity and starts over.
     let (stepped, _) = runProgressTurn silentEvidence (atMilliseconds 0) loaded
-        (steppedAgain, _) = runProgressTurn silentEvidence (atMilliseconds 0) stepped
-    nextDeadline steppedAgain `shouldBe` TurnAt (atMilliseconds 10)
+        (steppedAgain, _) = runProgressTurn silentEvidence (atMilliseconds 5) stepped
+    nextDeadline steppedAgain `shouldBe` TurnAt (atMilliseconds 15)
     demanded ← admitted_ "requesting a render" (requestRender target steppedAgain)
     nextDeadline demanded `shouldBe` TurnNow
     let (served, _) = runProgressTurn silentEvidence (atMilliseconds 0) demanded
@@ -119,14 +119,14 @@ spec = describe "owner progress" $ do
 
     -- Back off a long way first, so a reset that only half happened is visible.
     let backedOff = walk 4 loaded
-    nextDeadline backedOff `shouldBe` TurnAt (atMilliseconds 40)
+    nextDeadline backedOff `shouldBe` TurnAt (atMilliseconds 75)
 
     -- A turn that applies a completion is progress: the schedule starts again at
     -- its first interval.
     let observed = silentEvidence {submissionEvidence = (`elem` take 1 submissions)}
-        (progressed, report) = runProgressTurn observed (atMilliseconds 0) backedOff
+        (progressed, report) = runProgressTurn observed (atMilliseconds 75) backedOff
     turnFacts report `shouldBe` 1
-    turnNextDeadline report `shouldBe` TurnAt (atMilliseconds 5)
+    turnNextDeadline report `shouldBe` TurnAt (atMilliseconds 80)
 
     -- And it really is the whole schedule, not only its first step. A turn that
     -- announces an interval must store the step after it; announcing five and
@@ -134,8 +134,8 @@ spec = describe "owner progress" $ do
     let poll (current, announced) at =
           let (next, polled) = runProgressTurn silentEvidence at current
            in (next, announced ++ [turnNextDeadline polled])
-        (_, deadlines) = foldl poll (progressed, []) (map atMilliseconds [5, 15, 35, 75])
-    deadlines `shouldBe` map (TurnAt . atMilliseconds) [15, 35, 75, 155]
+        (_, deadlines) = foldl poll (progressed, []) (map atMilliseconds [80, 90, 110, 150])
+    deadlines `shouldBe` map (TurnAt . atMilliseconds) [90, 110, 150, 230]
 
   it "answers the same deadline however long after the model last changed it is read" $ do
     model ← freshModelWith defaultBudgetRequest {requestedFrameSlots = 2}
@@ -160,6 +160,52 @@ spec = describe "owner progress" $ do
     let (anchored, _) = runProgressTurn silentEvidence (atMilliseconds 0) failed
     replicate 3 (nextDeadline anchored) `shouldBe` replicate 3 (TurnAt (atMilliseconds 5))
 
+  describe "a turn before the scheduled poll is due" $ do
+    -- Two frame-less batches are submitted and the first turn, at 0 ms, finds
+    -- nothing and schedules the poll at D = 5 ms. Pointer-only window observations then
+    -- give the owner turns before D; none of them may postpone that poll.
+    let scheduled = do
+          model ← freshModel
+          (opened, (batch, _)) ← admitted "a batch" (openFramelessBatch [] model)
+          (submitted, submission) ← submittedAs batch opened
+          (reopened, (other, _)) ← admitted "another batch" (openFramelessBatch [] submitted)
+          (both, _) ← submittedAs other reopened
+          let (anchored, report) = runProgressTurn silentEvidence (atMilliseconds 0) both
+          turnNextDeadline report `shouldBe` TurnAt (atMilliseconds 5)
+          pure (anchored, submission)
+        idleTurnsAt instants current =
+          foldl' (\held at → fst (runProgressTurn silentEvidence (atMilliseconds at) held)) current instants
+
+    it "keeps the poll's deadline and the backoff step, however many of them run" $ do
+      (anchored, _) ← scheduled
+      let early = idleTurnsAt (concat (replicate 25 [1, 2, 3, 4])) anchored
+      progressDeadline early `shouldBe` TurnAt (atMilliseconds 5)
+      nextDeadline early `shouldBe` nextDeadline anchored
+
+      -- The step is observed through what the poll at D announces next, which a
+      -- step advanced silently by the early turns would change.
+      let (_, quiet) = runProgressTurn silentEvidence (atMilliseconds 5) anchored
+          (_, disturbed) = runProgressTurn silentEvidence (atMilliseconds 5) early
+      turnNextDeadline disturbed `shouldBe` turnNextDeadline quiet
+      turnNextDeadline quiet `shouldBe` TurnAt (atMilliseconds 15)
+
+    it "observes a completion that is ready at the scheduled poll exactly when the quiet run does" $ do
+      (anchored, submission) ← scheduled
+      let early = idleTurnsAt (concat (replicate 25 [1, 2, 3, 4])) anchored
+          ready = silentEvidence {submissionEvidence = (== submission)}
+          (observedQuiet, quiet) = runProgressTurn ready (atMilliseconds 5) anchored
+          (observedEarly, disturbed) = runProgressTurn ready (atMilliseconds 5) early
+      (turnFacts quiet, turnFacts disturbed) `shouldBe` (1, 1)
+      framelessSlots observedEarly `shouldBe` framelessSlots observedQuiet
+      length (framelessSlots observedEarly) `shouldBe` 1
+
+    it "still restarts the schedule when it observes a completion" $ do
+      (anchored, submission) ← scheduled
+      let ready = silentEvidence {submissionEvidence = (== submission)}
+          (_, report) = runProgressTurn ready (atMilliseconds 3) anchored
+      turnFacts report `shouldBe` 1
+      turnNextDeadline report `shouldBe` TurnAt (atMilliseconds 8)
+
   it "restarts the backoff on a new obligation, an observed completion and a close" $ do
     -- Two frames are submitted and only one of them completes, so a pending
     -- obligation survives every step below and the deadline is never absent for
@@ -172,7 +218,7 @@ spec = describe "owner progress" $ do
       [] → fail "the fixture should have made two submissions" 
 
     let backedOff = walk 3 loaded
-    nextDeadline backedOff `shouldBe` TurnAt (atMilliseconds 20)
+    nextDeadline backedOff `shouldBe` TurnAt (atMilliseconds 35)
 
     -- A new obligation.
     (obliged, _) ← admitted "reserving another frame" (reserveFrame target backedOff)
@@ -180,13 +226,13 @@ spec = describe "owner progress" $ do
 
     -- An observed completion.
     let backedOffAgain = walk 3 obliged
-    nextDeadline backedOffAgain `shouldBe` TurnAt (atMilliseconds 20)
+    nextDeadline backedOffAgain `shouldBe` TurnAt (atMilliseconds 35)
     completed ← admitted_ "completing" (recordCompletion (atMilliseconds 1) (SubmissionCompleted submission) backedOffAgain)
     nextDeadline completed `shouldBe` TurnNow
 
     -- A close transition.
     let backedOffOnceMore = walk 3 completed
-    nextDeadline backedOffOnceMore `shouldBe` TurnAt (atMilliseconds 20)
+    nextDeadline backedOffOnceMore `shouldBe` TurnAt (atMilliseconds 35)
     closed ← admitted_ "closing" (closeTarget target backedOffOnceMore)
     nextDeadline closed `shouldBe` TurnNow
 
@@ -202,7 +248,7 @@ spec = describe "owner progress" $ do
     (resourced, resource) ← aResource 1024 loaded
 
     let backedOff = walk 3 resourced
-    nextDeadline backedOff `shouldBe` TurnAt (atMilliseconds 20)
+    nextDeadline backedOff `shouldBe` TurnAt (atMilliseconds 35)
     retired ← admitted_ "retiring a generation" (retireGeneration generation backedOff)
     nextDeadline retired `shouldBe` TurnNow
 
@@ -211,9 +257,9 @@ spec = describe "owner progress" $ do
     -- obligation, so it is no more disposable than it was, and the deadline
     -- stands. Rousing here would be rousing for a fact rather than for work.
     let backedOffAgain = walk 3 retired
-    nextDeadline backedOffAgain `shouldBe` TurnAt (atMilliseconds 20)
+    nextDeadline backedOffAgain `shouldBe` TurnAt (atMilliseconds 35)
     ended ← admitted_ "ending the generation's CPU use" (endGenerationCpuUse generation backedOffAgain)
-    nextDeadline ended `shouldBe` TurnAt (atMilliseconds 20)
+    nextDeadline ended `shouldBe` TurnAt (atMilliseconds 35)
     maybe [] viewOutstanding (holdView (GenerationSubject generation) ended)
       `shouldBe` [SubmittedUseOwed, PresentationObligationOwed]
 
@@ -226,9 +272,9 @@ spec = describe "owner progress" $ do
     -- on from where the schedule already was rather than starting over: 40, 80,
     -- then the 100 ms cap it stays at.
     let backedOffOnceMore = walk 3 ended
-    nextDeadline backedOffOnceMore `shouldBe` TurnAt (atMilliseconds 100)
+    nextDeadline backedOffOnceMore `shouldBe` TurnAt (atMilliseconds 255)
     released ← admitted_ "releasing a resource" (releaseResource resource backedOffOnceMore)
-    nextDeadline released `shouldBe` TurnAt (atMilliseconds 100)
+    nextDeadline released `shouldBe` TurnAt (atMilliseconds 255)
 
     -- Ending its CPU use settles the last hold and makes it disposable. That is
     -- work, and it restarts the schedule.
@@ -242,7 +288,7 @@ spec = describe "owner progress" $ do
     (constructing, candidate) ← admitted "constructing a replacement" (beginGeneration target (Just generation) loaded)
 
     let backedOff = walk 3 constructing
-    nextDeadline backedOff `shouldBe` TurnAt (atMilliseconds 20)
+    nextDeadline backedOff `shouldBe` TurnAt (atMilliseconds 35)
     failed ← admitted_ "failing the construction" (failGenerationConstruction candidate backedOff)
     nextDeadline failed `shouldBe` TurnNow
 
@@ -253,7 +299,7 @@ spec = describe "owner progress" $ do
       admitted "constructing another replacement" (beginGeneration secondTarget (Just secondGeneration) secondLoaded)
     closed ← admitted_ "closing the target" (closeTarget secondTarget secondConstructing)
     let secondBackedOff = walk 3 closed
-    nextDeadline secondBackedOff `shouldBe` TurnAt (atMilliseconds 20)
+    nextDeadline secondBackedOff `shouldBe` TurnAt (atMilliseconds 35)
     (superseded, answer) ← admitted "publishing after the close" (publishGeneration secondCandidate 2 secondBackedOff)
     answer `shouldBe` PublicationSuperseded
     nextDeadline superseded `shouldBe` TurnNow
@@ -529,17 +575,17 @@ spec = describe "owner progress" $ do
     nextDeadline closed `shouldBe` TurnNow
     -- The cleanup that close started backs off like any other pending work.
     let backedOff = walk 3 closed
-    nextDeadline backedOff `shouldBe` TurnAt (atMilliseconds 20)
+    nextDeadline backedOff `shouldBe` TurnAt (atMilliseconds 35)
 
     -- A second close transitions nothing. Resetting here would mean a repeated
     -- close notification could hold the backoff at its first interval for ever,
     -- which is exactly the unchanged-work case the schedule exists to pace.
     again ← admitted_ "closing it again" (closeTarget target backedOff)
-    nextDeadline again `shouldBe` TurnAt (atMilliseconds 20)
+    nextDeadline again `shouldBe` TurnAt (atMilliseconds 35)
     fmap viewTargetPhase (targetView target again) `shouldBe` Just TargetRetiring
     -- Repeating it changes nothing however often it arrives.
     let repeated = iterate (\current → either error id (closeOnce target current)) again !! 4
-    nextDeadline repeated `shouldBe` TurnAt (atMilliseconds 20)
+    nextDeadline repeated `shouldBe` TurnAt (atMilliseconds 35)
 
   it "has no deadline at all once nothing is pending" $ do
     model ← freshModel
@@ -575,9 +621,15 @@ spec = describe "owner progress" $ do
     closeOnce target current = case closeTarget target current of
       Admitted next → Right next
       other → Left ("closing again should have been admitted, got " ++ show (fmap (const ()) other))
+    -- Idle turns, each taken at the deadline the model announced for it (and at
+    -- time zero while it owes one now): a turn taken earlier is somebody else's
+    -- opportunity and leaves the schedule where it was.
     walk count model = iterate step model !! (count ∷ Int)
       where
-        step current = fst (runProgressTurn silentEvidence (atMilliseconds 0) current)
+        step current = fst (runProgressTurn silentEvidence (turnInstant current) current)
+    turnInstant model = case progressDeadline model of
+      TurnAt at → at
+      _ → atMilliseconds 0
     submissionOf = \case
       SubmissionRecorded identity → pure identity
       other → fail ("expected a submission record, got " ++ show other)

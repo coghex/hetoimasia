@@ -224,10 +224,3 @@ spec = describe "frame-less batches" $ do
   where
     recordedOn model resource = maybe [] viewRecorded (holdView (ResourceSubject resource) model)
     submittedOn model resource = maybe [] viewSubmitted (holdView (ResourceSubject resource) model)
-
--- | Submit a frame-less batch, accepted, answering its submission.
-submittedAs ∷ BatchId → GpuModel → IO (GpuModel, SubmissionId)
-submittedAs batch model =
-  admitted "the submission" (submitFramelessBatch batch SubmissionAccepted model) >>= \case
-    (next, SubmissionRecorded submission) → pure (next, submission)
-    (_, other) → fail ("the submission answered " <> show other)

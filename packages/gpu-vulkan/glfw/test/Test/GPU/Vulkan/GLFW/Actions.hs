@@ -14,7 +14,7 @@ module Test.GPU.Vulkan.GLFW.Actions (spec) where
 import Control.Concurrent (myThreadId)
 import Control.Concurrent.STM (TVar, atomically, check, modifyTVar', newTVarIO, orElse, readTVar, readTVarIO, registerDelay, writeTVar)
 import Control.Exception (Exception (..), ExceptionWithContext (..), SomeException, finally, throwIO, toException, try)
-import Control.Monad (void, when)
+import Control.Monad (replicateM_, void, when)
 import qualified Data.ByteString as ByteString
 import Data.List (isSubsequenceOf)
 import Data.Maybe (isJust, isNothing)
@@ -115,6 +115,9 @@ spec = describe "Vulkan surface-free sessions and owner-thread actions" $ do
     itBounded "disposes of a released resource with no target, recording no frame, before the host exits" testZeroTargetDisposal
     itBounded "keeps making progress after the last target closes, the device serving later actions" testAfterLastTarget
     itBounded "names no deadline once nothing is owed, sleeping until an action wakes it rather than polling" testIdleSleeps
+
+  describe "window observations" $ do
+    itBounded "never postpone the poll already scheduled for a frame-less completion, however many pointer-only revisions the owner takes first" testObservationsKeepPoll
 
 -- ---------------------------------------------------------------------------
 -- Surface-free startup
@@ -887,6 +890,43 @@ testIdleSleeps = do
     -- An action still wakes it.
     act host (VulkanAction (\_ → pure ("woken" ∷ String)))
   outcomeValue answer `shouldBe` Right "woken"
+
+-- | A frame-less batch is submitted and its first poll, which finds the fence
+-- unsignalled, schedules the next at a deadline D. Pointer-only observation
+-- revisions then reach the owner, each a round that takes no demand and no
+-- geometry change; none of them may move D. The fence then signals, the scripted
+-- clock stands at D, and the ticket completes there. Nothing here follows a
+-- replacement deadline, which would hide a postponed one.
+testObservationsKeepPoll ∷ IO ()
+testObservationsKeepPoll = do
+  rig ← scriptedRigOf 1
+  submissionsComplete rig False
+  (scheduled, kept, state) ← runRig rig $ \host _ → do
+    [window] ← windowsOf host
+    awaitReady host
+    service ← handedOver host window RequiredTarget
+    TargetUsable ← awaitStanding host service
+    publishObservation host service window
+    awaitObservationsFolded host [service]
+    ticket ←
+      returned =<< act host (VulkanAction (\construction →
+        constructFramelessBatch construction (\_ → pure ()) >>= \case
+          Right (batch, ()) → pure batch
+          other → failWith ("the frame-less batch was refused: " <> show (fmap (const ()) other))))
+    let owner = vulkanGraphicsOwner host
+    start ← clockNow rig
+    due ← atomically $
+      readOwnerStatusNow owner >>= \status → case statusNextDeadline status of
+        Just at | at > start → pure at
+        _ → retry
+    replicateM_ 6 (awaitOwnerQuiet rig host service window)
+    kept ← statusNextDeadline <$> atomically (readOwnerStatusNow owner)
+    submissionsComplete rig True
+    setClock rig due
+    state ← awaitTicket ticket (millisecondsOf 30000)
+    pure (due, kept, state)
+  kept `shouldSatisfy` maybe False (<= scheduled)
+  state `shouldBe` Right TicketComplete
 
 -- ---------------------------------------------------------------------------
 -- Helpers
