@@ -8,7 +8,7 @@ Design state: `ready for issue processing`
 
 - [x] EPIC. Support corner-defined terrain solids — [#752]
 - [x] COR-1. Resolve corner masks to exact solid pieces and boundary facets — [#753]
-- [ ] COR-2. Derive portals from the union of solid pieces
+- [x] COR-2. Derive portals from the union of solid pieces — [#754]
 - [ ] COR-3. Carry the shape family through packed terrain segments
 - [ ] COR-4. Admit corner cells through source, discovery and snapshot reads
 - [ ] COR-5. Author corner masks through Lua terrain definitions
