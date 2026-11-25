@@ -789,10 +789,12 @@ testButtonPosition ∷ Expectation
 testButtonPosition =
   withLiveFeed 8 $ \seam window feed → do
     let shifted = noModifiers {modifierShift = True}
-    drive seam window [CursorMovedTo 1 2, ButtonEventAt 0 1 1, ButtonEventAt 0 0 1, ButtonEventAt 0 1 0, CursorMovedTo 50 60, CursorMovedTo 70 80]
+    -- The first press has no known cursor position; the first sample, (1, 2),
+    -- arrives during the hold and is the whole of its box.
+    drive seam window [ButtonEventAt 0 1 1, CursorMovedTo 1 2, ButtonEventAt 0 0 1, ButtonEventAt 0 1 0, CursorMovedTo 50 60, CursorMovedTo 70 80]
     (events, _) ← drain (feedReader feed)
     map inputPayload events
-      `shouldBe` [ ButtonInput (ButtonEvent 0 ButtonPressed (Just (CursorPosition 1 2)) shifted Nothing)
+      `shouldBe` [ ButtonInput (ButtonEvent 0 ButtonPressed Nothing shifted Nothing)
                  , ButtonInput (ButtonEvent 0 ButtonReleased (Just (CursorPosition 1 2)) shifted (witnessOf (1, 2) (1, 2) False))
                  , ButtonInput (ButtonEvent 0 ButtonPressed (Just (CursorPosition 1 2)) noModifiers Nothing)
                  ]
