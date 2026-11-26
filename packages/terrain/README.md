@@ -18,8 +18,8 @@ transactional ownership, revisions and live offload (TRA-4), Lua copying
 | Module | Purpose |
 | --- | --- |
 | `Hetoimasia.Terrain.Coordinate` | Checked tile identity, region/local decomposition, cutaway |
-| `Hetoimasia.Terrain.Shape` | The 16-shape catalog, sides, quarter turns, view facings |
-| `Hetoimasia.Terrain.Geometry` | The canonical unit-cell solid, face coverage, membership, ray and segment queries |
+| `Hetoimasia.Terrain.Shape` | The 16-shape side catalog, corner masks and shape keys, sides, quarter turns, view facings |
+| `Hetoimasia.Terrain.Geometry` | The canonical unit-cell solid, face coverage, membership, ray and segment queries, and the convex pieces, external facets and surface height of every shape key |
 | `Hetoimasia.Terrain.Opening` | The exact empty components of a cell, their portals on the six faces, and the connections between neighbors |
 | `Hetoimasia.Terrain.Connectivity` | The exact, bounded, resumable compilation of a source's empty-space connectivity: component families, canonical keys, ranges, portal relations, compressed boundaries, initial upper-Z exterior |
 | `Hetoimasia.Terrain.Discovery` | The pure discovery model: retained removed runs, a connectivity forest with known/unknown classes, paired removal-plus-obligation candidates, bounded resumable discovery batches, knowledge queries, replay from records, validated limits and allowances |
@@ -122,8 +122,9 @@ East toward positive X.
 - Identities 0 and 15 are distinct authored identities with distinct solids:
   0 is the full block and 15 the central half-height peak. NS and EW are distinct
   opposite-direction forms.
-- Arbitrary fractional slabs and new identities need a later, explicit
-  extension.
+- The side catalog is closed. Arbitrary fractional slabs and new side
+  identities need a later, explicit extension; corner masks are a separate
+  family (below), never a side identity.
 
 ### Quarter turns
 
@@ -157,6 +158,27 @@ quarter turns each applies:
 
 This is checked against the reference's own view mapping (below) for all 16
 identities in all four facings.
+
+### Corner masks and shape keys
+
+A `CornerMask` is `0..15`. Each set bit is a corner of the cell that reaches
+the next level, with X east and Y south: north-west 1, north-east 2, south-east
+4, south-west 8. `mkCornerMask` refuses any other value with
+`UnsupportedCornerMask`, and `mkShapeId` keeps refusing a side identity outside
+`0..15` with `UnsupportedShapeId`. Both constructors are private.
+
+A `ShapeKey` identifies one occupied shape by family and value: `sideKey` of a
+side identity, or the key `resolveCorner` returns for a nonzero mask. Mask 0 has
+no solid and resolves to `Nothing`, which is air. `allShapeKeys` lists the 31
+occupied keys, the 16 side identities and the 15 nonzero masks, once each; its
+order carries no identity, so a consumer keys its tables by `ShapeKey`. A side
+key never equals a corner key: side 0 and corner mask 15 are different full
+blocks, and side 15 keeps its apex at height one half.
+
+One positive quarter turn moves each set corner north-west to north-east to
+south-east to south-west, the left rotation of the four-bit mask, and
+`rotateKey` applies it. It is `rotateShape` on a side key, four turns restore a
+key, and a local point turns as `rotatePoint` says.
 
 ## Geometry
 
@@ -253,6 +275,50 @@ Tie-breaking is by fixed rules, not tolerance:
   ridge, along a face, and one that touches only a vertex.
 - A segment that ends exactly on the boundary `Grazes` there; one that stops short
   misses.
+
+### Corner solids
+
+A corner key's surface is folded along one diagonal of the footprint and is
+planar on each of the two triangles. The height at each corner is 0 or 1
+according to the mask bit, and the height inside a triangle interpolates its
+three corners. The crease joins the two neighbors of a lone high corner and of a
+lone low corner, and joins the two low corners when two opposite corners are
+high; every other mask is coplanar under either diagonal. The surface is
+continuous across the crease. A single high corner gives `h = max(0, 1 - x - y)`
+for the north-west mask, so the far half of the footprint stays at the base; the
+two opposite-high masks give `|x + y - 1|` and `|x - y|`, two wedges that meet
+along the crease; a lone low corner gives `h = min(1, x + y)` for the
+north-west mask.
+
+| Function | Result |
+| --- | --- |
+| `surfaceHeight key x y` | The exact normalized height at a point of the closed unit square, `Nothing` for air |
+| `convexPieces key` | The closed convex pieces of positive volume whose union is the solid |
+| `piecePlanes piece` | The piece's half-spaces `n . p <= d`, normals pointing out |
+| `boundaryFaces key` | The external facets, each with its plane and corners counter-clockwise from outside |
+
+A side key has one piece, the convex solid of `shapeSolid`, and its facets are
+`solidFaces`. A corner key has one piece for each triangle with a corner above
+the base: one for a bank, two for a valley or a three-high mask. No piece lies
+under the flat half of a bank, so a ray cannot meet a phantom floor there, and
+`surfaceHeight` still reports zero. The pieces are never merged, so the
+partition two pieces share is internal: it is in no facet, and neither is a
+face of no area. The top facets of two pieces in one plane stay two facets.
+
+A consumer clips a line against the union. It computes each piece's parameter
+interval from `piecePlanes`, unions the intervals of all pieces, merging those
+that touch, and reads entry and exit from the union: a line that crosses a
+partition has one interval, not an exit and a re-entry. The engine owns no hit
+policy. For a side key `surfaceHeight` is the top of its solid: 1 for identity 0
+and otherwise the lowest ramp its bits name, so identity 15 is one half at the
+centre.
+
+| Input | Result |
+| --- | --- |
+| A point outside `[0, 1]^2`, for any key or air | `Left OutsideCellSquare`, decided before the air case |
+| Air at a point inside the square | `Right Nothing` |
+| The flat half of a bank, or a valley's crease | `Right (Just 0)` |
+| A mask outside `0..15` | `Left (UnsupportedCornerMask n)` |
 
 ### Exactness and invalid input
 
