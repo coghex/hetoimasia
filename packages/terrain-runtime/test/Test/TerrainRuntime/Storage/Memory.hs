@@ -167,25 +167,34 @@ noiseFloor = do
   lst ← batches listOnce
   pure (max (median aa) (median lst), maximum (aa <> lst), median aa)
 
--- | The floor every row is held against, measured once in the process, at the start of the Memory group ('settleFloor').
+-- | The one measurement of the floor in the process, taken at the start of the Memory group ('settleFloor'): the floor, the largest single
+-- difference of any sample, and the median of the two-reading series alone. Every row is held against the first, and 'floorSpec' prints all three:
+-- the example reads this measurement instead of taking a second one inside its bounded body.
+theMeasurement ∷ (Double, Double, Double)
+theMeasurement = unsafePerformIO noiseFloor
+{-# NOINLINE theMeasurement #-}
+
+-- | The floor every row is held against.
 theFloor ∷ Double
-theFloor = unsafePerformIO ((\(f, _, _) → f) <$> noiseFloor)
-{-# NOINLINE theFloor #-}
+theFloor = (\(f, _, _) → f) theMeasurement
 
--- | Forces the floor before the first example of a describe runs: the first describe of the Memory group to run pays for the measurement.
+-- | Forces the measurement before the first example of a describe runs: the first describe of the Memory group to run pays for the measurement.
 settleFloor ∷ SpecWith a → SpecWith a
-settleFloor = beforeAll_ (void (evaluate theFloor))
+settleFloor = beforeAll_ (void (evaluate theMeasurement))
 
+-- | Prints the floor ('theMeasurement', taken before this example's body) and observes what an open and close leaves. Nothing here is asserted.
+-- The observation is 100 file-backed open and close cycles between live readings: its total cost follows the host (disk, scheduler, collector) and
+-- is not something a bound should cap, so the body is not under the harness's whole-body bound ('eoUnbounded'). A stalled storage call still fails:
+-- each cycle's open and close is its own 'bounded' call.
 floorSpec ∷ Spec
 floorSpec = describe "Storage backend: the live-heap reading's noise floor" $ settleFloor $
   it "is measured, with nothing between two readings and around a change that leaves nothing" $
-    withEnv $ \env → do
-      (fl, worst, aaMedian) ← noiseFloor
+    withEnvWith defaultOptions {eoUnbounded = True} $ \env → do
+      let (fl, worst, aaMedian) = theMeasurement
       discarded ← readIORef discardedReadings
       oc ← replicateM 100 $ do
         a ← live
-        b ← openBacking env ident (hCfg h0)
-        _ ← closeBacking (envSvc env) b
+        bounded (openBacking env ident (hCfg h0) >>= void . closeBacking (envSvc env))
         c ← live
         pure (fromIntegral c - fromIntegral a ∷ Double)
       putStrLn ("memory floor | two settled readings, nothing between | median of batch maxima " <> show (round aaMedian ∷ Integer))

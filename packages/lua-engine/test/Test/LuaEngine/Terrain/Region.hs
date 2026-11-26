@@ -354,7 +354,7 @@ attachShared ∷ Script → Script
 attachShared steps = steps {scInit = ["self.s = 0", "self.q = api.terrain.attach('shared')"]}
 
 -- | A Lua instance attached to an arena the host opened from a Haskell source, for the body, which is given the host's own lease on it.
--- The corner form is authored only here: the Lua input form is another slice.
+-- The corner form is authored natively here, as a Haskell source; "Test.LuaEngine.Terrain.Corners" authors it from Lua.
 withHostedArena ∷ Rig → SourceSpec → Script → (World → ArenaLease → IO a) → IO a
 withHostedArena rig source steps body = do
   let svc = rgService rig

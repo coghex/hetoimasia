@@ -230,6 +230,10 @@ diagnostic that cannot be written never replaces what it reports.
   hands the owner back to its application's own protected exit, which performs the verified destruction of the windows the loop could not.
   The session, whose providers then see a finished owner, settles, and the command joins it *after* the application has torn down,
   retaining the session's failure beside the loop's (once, however often it is asked).
+* **The session's closing note.** The command runs its session with the engine's `CloseDelivered`: `runSession` returns only after the
+  diagnostics writer has handed the logger every note (the stderr record of an orderly stop ends with `session ended`) or has ended
+  because the sink refused one, so a healthy stderr never loses it. A sink that never returns holds the stop until a second signal
+  leaves at once or the application's quit watchdog ends the process.
 * **The session's diagnostics writer** may outlive `runSession` and borrows the logger, so it is joined before the logging lifetime
   releases the logger, after every scope the session used has unwound, on a failure as well as a success. A cancellation during that
   join does not hide the failure of what was being run: both are raised together.

@@ -113,6 +113,7 @@ module Hetoimasia.LuaEngine.Facade
   , TerrainLayer (..)
   , TerrainPatch (..)
   , TerrainPatchValue (..)
+  , TerrainShape (..)
   , terrainArenaType
   , terrainPickType
   , terrainArenaRequestType

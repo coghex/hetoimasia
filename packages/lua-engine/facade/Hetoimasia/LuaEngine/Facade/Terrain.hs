@@ -11,7 +11,7 @@
 -- is contiguous, a record has exactly its fields, nothing is copied past the bounds); then the caller (an instance of this
 -- facade, never a module's top level and never another instance's captured facade), its phase (acquisition and queries are
 -- refused in @shutdown@), the session's admission (a stopping or closed session takes no new work, and that is an error, never
--- @busy@); then the decode of the copied values: names and material identifiers (length), coordinate and shape ranges, and the
+-- @busy@); then the decode of the copied values: names and material identifiers (length), coordinate, shape and corner-mask ranges, and the
 -- one place each interval endpoint may sit. Only then are the injected checks asked for the service's own permanent facts (a
 -- foreign, wrong-kind, forged or released handle, an ended owner).
 --
@@ -21,11 +21,14 @@
 -- ordinary error raised before admission, with no request, arena or credit left behind. They are: wrong arity or fields, a
 -- sparse list, a metatable, a cycle, a function, a value of the wrong type or of the float subtype, an invalid UTF-8 string, an
 -- arena name that is empty or over 128 characters, a material identifier that is empty or over 64 bytes, a cell coordinate outside
--- @[-2^62, 2^62 - 1]@, a lower interval endpoint outside it, an upper endpoint above @2^62@, a shape outside @0..15@, an open's
+-- @[-2^62, 2^62 - 1]@, a lower interval endpoint outside it, an upper endpoint above @2^62@, a shape or a corner mask outside @0..15@,
+-- a layer or patch value that supplies both a @shape@ and a @corner_mask@ or neither, a @corner_mask@ without a @material@, an air patch
+-- value that carries a @material@, @shape@ or @corner_mask@, an open's
 -- options that are not @nil@ or a record of at most @storage_bytes@, an allowance (@storage_bytes@, @grow_storage@'s @new_bytes@)
 -- below 64 MiB or not a whole number of MiB, and a copy over the bounds of 'argumentLimits'. What is left to the terrain validator, and is the expected @definition@ failure when it
 -- refuses a definition that decoded completely: an empty or inverted interval, overlapping or unordered layers, overlapping
--- patches, a material no layer declares, a duplicate material identifier, a material identifier with a control character, and a
+-- patches, a material no layer declares (a zero corner mask's included: it is air only once its material, interval and overlaps have
+-- been checked), a duplicate material identifier, a material identifier with a control character, and a
 -- definition over the validator's 256 KiB or 8,192 authored runs.
 --
 -- Nothing here is a service locator: every operation is a field of the one facade's 'TerrainServices', reached by a closure
@@ -97,14 +100,21 @@ definitionSchema =
     , ("patches", SOptional (SList patchSchema))
     ]
   where
-    layerSchema = SRecord [("z_min", SOptional SInteger), ("z_max", SOptional SInteger), ("material", SText), ("shape", SInteger)]
+    layerSchema =
+      SRecord
+        [ ("z_min", SOptional SInteger)
+        , ("z_max", SOptional SInteger)
+        , ("material", SText)
+        , ("shape", SOptional SInteger)
+        , ("corner_mask", SOptional SInteger)
+        ]
     patchSchema =
       SRecord
         [ ("x", SInteger)
         , ("y", SInteger)
         , ("z_min", SInteger)
         , ("z_max", SInteger)
-        , ("value", SRecord [("air", SOptional SBoolean), ("material", SOptional SText), ("shape", SOptional SInteger)])
+        , ("value", SRecord [("air", SOptional SBoolean), ("material", SOptional SText), ("shape", SOptional SInteger), ("corner_mask", SOptional SInteger)])
         ]
 
 cellSchema, columnSchema, surfaceSchema, regionSchema ∷ Schema
@@ -159,6 +169,21 @@ shapeId ∷ Text → Value → Either Text Int64
 shapeId name value = do
   found ← integer name value
   if found < 0 || found > 15 then Left (name <> " must be a shape identity 0 .. 15") else Right found
+
+-- | A corner mask: an integer in @0..15@ (NW = 1, NE = 2, SE = 4, SW = 8). Zero is air, which the terrain validator normalizes.
+cornerMask ∷ Text → Value → Either Text Int64
+cornerMask name value = do
+  found ← integer name value
+  if found < 0 || found > 15 then Left (name <> " must be a corner mask 0 .. 15") else Right found
+
+-- | The family a solid record selects its shape from: exactly one of @shape@ and @corner_mask@, each checked for its own range.
+-- The record is named for the message (@a layer@, @a patch's value@).
+solidShape ∷ Text → Maybe Value → Maybe Value → Either Text TerrainShape
+solidShape owner shape corner = case (shape, corner) of
+  (Just _, Just _) → Left (owner <> " supplies both a shape and a corner_mask: a solid names one family")
+  (Just found, Nothing) → ShapeSide <$> shapeId (owner <> "'s shape") found
+  (Nothing, Just found) → ShapeCorner <$> cornerMask (owner <> "'s corner_mask") found
+  (Nothing, Nothing) → Left (owner <> " needs a shape or a corner_mask")
 
 materialId ∷ Text → Value → Either Text Text
 materialId name = \case
@@ -221,7 +246,7 @@ decodeDefinition = \case
         lo ← traverse (lowerEnd "a layer's z_min") (optionalField "z_min" fields)
         hi ← traverse (upperEnd "a layer's z_max") (optionalField "z_max" fields)
         material ← requiredField "material" fields >>= materialId "a layer's material"
-        shape ← requiredField "shape" fields >>= shapeId "a layer's shape"
+        shape ← solidShape "a layer" (optionalField "shape" fields) (optionalField "corner_mask" fields)
         Right (TerrainLayer lo hi material shape)
       _ → Left "a layer must be a table"
     decodePatch = \case
@@ -233,16 +258,20 @@ decodeDefinition = \case
         value ← requiredField "value" fields >>= decodePatchValue
         Right (TerrainPatch x y lo hi value)
       _ → Left "a patch must be a table"
-    -- A value is air (@{air = true}@) or a solid (@{material = TEXT, shape = INTEGER}@): never both, never neither, and
-    -- @air = false@ with no material is neither.
+    -- A value is air (@{air = true}@) or a solid (@{material = TEXT, shape = INTEGER}@ or @{material = TEXT, corner_mask = INTEGER}@):
+    -- never both, never neither, a solid names exactly one family, and @air = false@ with no material is neither.
     decodePatchValue = \case
-      VRecord fields → case (optionalField "air" fields, optionalField "material" fields, optionalField "shape" fields) of
-        (Just (VBoolean True), Nothing, Nothing) → Right PatchAir
-        (Just (VBoolean True), _, _) → Left "a patch value that is air carries no material or shape"
-        (air, Just material, Just shape)
-          | air == Nothing || air == Just (VBoolean False) → PatchSolid <$> materialId "a patch's material" material <*> shapeId "a patch's shape" shape
-          | otherwise → Left "a patch value is air or a material with a shape"
-        _ → Left "a patch value is {air = true} or {material = TEXT, shape = INTEGER}"
+      VRecord fields →
+        let shape = optionalField "shape" fields
+            corner = optionalField "corner_mask" fields
+         in case (optionalField "air" fields, optionalField "material" fields) of
+              (Just (VBoolean True), Nothing)
+                | shape == Nothing && corner == Nothing → Right PatchAir
+              (Just (VBoolean True), _) → Left "a patch value that is air carries no material, shape or corner_mask"
+              (air, Just material)
+                | air == Nothing || air == Just (VBoolean False) → PatchSolid <$> materialId "a patch's material" material <*> solidShape "a patch value" shape corner
+                | otherwise → Left "a patch value is air or a material with a shape"
+              _ → Left "a patch value is {air = true}, {material = TEXT, shape = INTEGER} or {material = TEXT, corner_mask = INTEGER}"
       _ → Left "a patch value must be a table"
 
 -- | A cell: three checked coordinates.
