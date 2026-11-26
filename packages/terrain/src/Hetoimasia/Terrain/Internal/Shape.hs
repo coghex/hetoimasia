@@ -1,15 +1,24 @@
 -- | The shape catalog's representation behind "Hetoimasia.Terrain.Shape".
 --
--- Private to the package: the constructor of 'ShapeId' is reachable only from
--- here and from the geometry that derives a solid from an identity. A client
--- obtains a 'ShapeId' only through 'mkShapeId', which refuses every identity
--- outside the 16-shape catalog; nothing normalizes an unsupported identity to
--- flat.
+-- Private to the package: the constructors of 'ShapeId', 'CornerMask' and
+-- 'ShapeKey' are reachable only from here and from the geometry that derives a
+-- solid from them. A client obtains a 'ShapeId' only through 'mkShapeId', which
+-- refuses every identity outside the 16-shape catalog, and a 'CornerMask' only
+-- through 'mkCornerMask', which refuses every mask outside @0..15@; nothing
+-- normalizes an unsupported value to flat or to air.
 --
 -- State, ownership and lifetime: none. Pure, immutable values.
 module Hetoimasia.Terrain.Internal.Shape
   ( ShapeId (..)
   , ShapeError (..)
+  , CornerMask (..)
+  , mkCornerMask
+  , cornerMaskValue
+  , ShapeKey (..)
+  , sideKey
+  , resolveCorner
+  , allShapeKeys
+  , rotateKey
   , Side (..)
   , allSides
   , sideBit
@@ -28,16 +37,68 @@ module Hetoimasia.Terrain.Internal.Shape
   , rotateShape
   ) where
 
-import Data.Bits (shiftL, (.&.), (.|.))
+import Data.Bits (shiftL, shiftR, (.&.), (.|.))
 import Data.Word (Word8)
 
 -- | One of the 16 catalog identities, @0..15@. The constructor is private.
 newtype ShapeId = ShapeId Word8
   deriving stock (Eq, Ord, Show)
 
--- | Why a shape identity was refused.
-newtype ShapeError = UnsupportedShapeId Int
+-- | Why a shape identity or corner mask was refused.
+data ShapeError
+  = -- | A side identity outside @0..15@.
+    UnsupportedShapeId Int
+  | -- | A corner mask outside @0..15@.
+    UnsupportedCornerMask Int
   deriving stock (Eq, Show)
+
+-- | A checked corner mask, @0..15@: bit 1 is the north-west corner, 2 the
+-- north-east, 4 the south-east and 8 the south-west, and a set bit is a corner
+-- that reaches the next level. The constructor is private.
+newtype CornerMask = CornerMask Word8
+  deriving stock (Eq, Ord, Show)
+
+-- | Check a corner mask against @0..15@.
+mkCornerMask ∷ Int → Either ShapeError CornerMask
+mkCornerMask value
+  | value < 0 || value > 15 = Left (UnsupportedCornerMask value)
+  | otherwise = Right (CornerMask (fromIntegral value))
+
+-- | The numeric mask, @0..15@.
+cornerMaskValue ∷ CornerMask → Int
+cornerMaskValue (CornerMask value) = fromIntegral value
+
+-- | The identity of one occupied shape: a family and a value within it. The
+-- constructors are private, so every key is a side identity or a nonzero
+-- corner mask, and a side identity never equals a corner mask. Side @0@ and
+-- corner mask @15@ are two different full blocks, and side @15@ keeps its
+-- apex.
+data ShapeKey = SideKey !ShapeId | CornerKey !CornerMask
+  deriving stock (Eq, Ord, Show)
+
+-- | The key of a side identity.
+sideKey ∷ ShapeId → ShapeKey
+sideKey = SideKey
+
+-- | The key of a corner mask: 'Nothing' for mask zero, which is air, and the
+-- tagged key of every other mask.
+resolveCorner ∷ CornerMask → Maybe ShapeKey
+resolveCorner (CornerMask 0) = Nothing
+resolveCorner mask = Just (CornerKey mask)
+
+-- | Every occupied key exactly once: the 16 side identities, then the 15
+-- nonzero corner masks. The order carries no identity.
+allShapeKeys ∷ [ShapeKey]
+allShapeKeys = map SideKey allShapeIds <> map CornerKey [CornerMask mask | mask ← [1 .. 15]]
+
+-- | Rotate a key by quarter turns. A side key rotates as 'rotateShape' does. A
+-- corner key moves each set corner one place per turn, north-west to
+-- north-east to south-east to south-west, which is the left rotation of the
+-- four-bit mask. Four turns restore the key.
+rotateKey ∷ Turns → ShapeKey → ShapeKey
+rotateKey count (SideKey shape) = SideKey (rotateShape count shape)
+rotateKey (Turns count) (CornerKey (CornerMask mask)) =
+  CornerKey (CornerMask (((mask `shiftL` count) .|. (mask `shiftR` (4 - count))) .&. 15))
 
 -- | A cardinal side of a cell. North is toward negative Y and East toward
 -- positive X, so South is positive Y and West negative X.

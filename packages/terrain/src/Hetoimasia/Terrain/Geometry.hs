@@ -36,6 +36,27 @@
 -- solid leaves on each cell face are the business of "Hetoimasia.Terrain.Opening",
 -- which derives them from this module's 'Solid' so the two cannot disagree.
 --
+-- = Corner solids
+--
+-- A corner mask (see "Hetoimasia.Terrain.Shape") assigns each corner of the
+-- footprint the height 0 or 1. The surface is folded along one diagonal and is
+-- planar on each of the two triangles: a lone high or low corner is joined to
+-- its two neighbours, two opposite high corners are separated by the line
+-- joining the two lows, and every other mask is the same under either
+-- diagonal. Its height is 'surfaceHeight'. A solid of a corner key is the
+-- union of its 'convexPieces': one closed convex piece for each triangle with a
+-- corner above the base, so a bank leaves half its footprint empty and a valley
+-- is two wedges that touch along the crease. A side key has the one piece of
+-- its 'Solid'.
+--
+-- A piece supplies its half-spaces through 'piecePlanes'. A ray meets the union
+-- of its pieces over the union of its per-piece parameter intervals: the
+-- intervals of two pieces that share a partition touch there, and entry and exit
+-- belong to the union, not to a piece. The external facets, 'boundaryFaces',
+-- leave out that internal partition and every face of no area, so clipping
+-- cannot meet a phantom floor under the flat half of a bank. The query
+-- 'surfaceHeight' still reports height zero there.
+--
 -- = Exactness and conventions
 --
 -- Every value is an exact 'Rational'; there is no floating-point arithmetic
@@ -68,6 +89,13 @@ module Hetoimasia.Terrain.Geometry
   , Face (..)
   , faceFootprintArea
 
+    -- * Pieces and facets of a shape key
+  , ConvexPiece
+  , convexPieces
+  , piecePlanes
+  , boundaryFaces
+  , surfaceHeight
+
     -- * Face coverage
   , Coverage (..)
   , sideCoverageArea
@@ -90,8 +118,10 @@ module Hetoimasia.Terrain.Geometry
   ) where
 
 import Data.List (sortOn)
+import qualified Data.Map.Strict as Map
 import Data.Maybe (listToMaybe)
 import Hetoimasia.Terrain.Coordinate (TileCoord (..), axisValue)
+import Hetoimasia.Terrain.Internal.Corner
 import Hetoimasia.Terrain.Internal.Polytope
 import Hetoimasia.Terrain.Internal.Shape
 
@@ -101,6 +131,8 @@ data GeometryError
     NonFiniteComponent
   | -- | A ray direction or a segment with no length.
     ZeroLengthDirection
+  | -- | A footprint sample outside the closed unit square @[0,1]²@.
+    OutsideCellSquare
   deriving stock (Eq, Show)
 
 -- | A floating-point triple as an exact point, refusing NaN and infinity.
@@ -209,6 +241,80 @@ taggedPlanes shape =
     ramp East = Plane (V3 1 0 1) 1
     ramp South = Plane (V3 0 1 1) 1
     ramp West = Plane (V3 (-1) 0 1) 0
+
+-- | One closed convex piece of a shape's solid, with positive volume. Obtain
+-- pieces with 'convexPieces'.
+--
+-- The type is positional, with a plain accessor function rather than a field
+-- label, as 'Solid' is: a client cannot rewrite the planes of a piece. Each plane
+-- carries the kind of face it can bound, or none when it is a partition shared
+-- with another piece.
+data ConvexPiece = ConvexPiece ![(Maybe FaceKind, Plane)] ![V3]
+  deriving stock (Eq, Show)
+
+-- | The bounding half-spaces of a piece, @normal · p <= offset@ with the normal
+-- pointing out of the piece. A face of no area is still a plane here.
+piecePlanes ∷ ConvexPiece → [Plane]
+piecePlanes (ConvexPiece tagged _) = map snd tagged
+
+-- | The faces of a piece that lie on the external boundary of the solid, in
+-- canonical order. The partition a piece shares with another is not one.
+pieceFaces ∷ ConvexPiece → [Face]
+pieceFaces (ConvexPiece tagged vertices) =
+  sortOn
+    faceKind
+    [ Face kind plane polygon
+    | (Just kind, plane) ← tagged
+    , Just polygon ← [facePolygon plane vertices]
+    ]
+
+-- | The closed convex pieces whose union is the solid of a key, each of
+-- positive volume. A side key has one piece, the convex solid of 'shapeSolid'.
+-- A corner key has one piece for each triangle of its folded surface that rises
+-- above the base, so a bank with one high corner has one, a valley has two, and
+-- no piece lies under the flat half of a bank. The order carries no identity.
+convexPieces ∷ ShapeKey → [ConvexPiece]
+convexPieces key = Map.findWithDefault [] key pieceTable
+
+pieceTable ∷ Map.Map ShapeKey [ConvexPiece]
+pieceTable = Map.fromList [(key, build key) | key ← allShapeKeys]
+  where
+    build (SideKey shape) = [piece [(Just kind, plane) | (kind, plane) ← taggedPlanes shape]]
+    build (CornerKey mask) = [piece (wedgePlanes w) | w ← cornerWedges mask, wedgeHasVolume w]
+    wedgePlanes w =
+      [(fmap WallFace side, plane) | (side, plane) ← wedgeWalls w]
+        <> [(Just BottomFace, Plane (V3 0 0 (-1)) 0), (Just TopFace, wedgeTop w)]
+    piece tagged = ConvexPiece tagged (polytopeVertices (map snd tagged))
+
+-- | The faces on the external boundary of a key's solid, in canonical order
+-- (top surfaces, the walls North, East, South, West, then the bottom), each with
+-- its supporting plane and its corners counter-clockwise seen from outside. A
+-- partition between two pieces is internal and is not returned, and neither is a
+-- face of no area. The top faces of two pieces in one plane stay two faces.
+boundaryFaces ∷ ShapeKey → [Face]
+boundaryFaces = sortOn faceKind . concatMap pieceFaces . convexPieces
+
+-- | The exact height of a key's surface, normalized so the level is one, at a
+-- footprint point @(x, y)@ of the closed unit square. A point outside the square
+-- is refused for every key, air included; inside it, air (@Nothing@) has no
+-- height. A side key's height is the top of its solid: 1 for identity 0 and
+-- otherwise the lowest of the ramps its bits name, so identity 15 reports one
+-- half at the centre. A corner key's height is that of its folded surface; the
+-- flat half of a bank and the crease of a valley are height zero, which is a
+-- height and not the absence of one.
+surfaceHeight ∷ Maybe ShapeKey → Rational → Rational → Either GeometryError (Maybe Rational)
+surfaceHeight key x y
+  | x < 0 || x > 1 || y < 0 || y > 1 = Left OutsideCellSquare
+  | otherwise = Right (fmap height key)
+  where
+    height (CornerKey mask) = cornerHeight mask x y
+    height (SideKey shape) = case shapeSides shape of
+      [] → 1
+      sides → minimum (map ramp sides)
+    ramp North = y
+    ramp East = 1 - x
+    ramp South = 1 - y
+    ramp West = x
 
 -- | The area of a face's projection on its kind's own plane: the footprint for
 -- a top or bottom face, the wall's own plane for a wall. Exact.

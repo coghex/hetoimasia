@@ -13,6 +13,7 @@ module Hetoimasia.Terrain.Internal.Polytope
   , plus
   , minus
   , scaleBy
+  , cross
   , Plane (..)
   , planeValue
   , polytopeVertices
