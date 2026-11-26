@@ -1,8 +1,9 @@
 -- | The content kinds the connectivity compiler distinguishes, and the table of
 -- which pairs of face-adjacent kinds connect.
 --
--- A /kind/ is air, a full block (shape 0) or one of the fifteen nonflat shapes:
--- 17 kinds. Materials never matter to connectivity. Every figure here is derived
+-- A /kind/ is air or one occupied shape key: the sixteen side identities, whose
+-- identity 0 is the full block, and the fifteen nonzero corner masks, whose mask
+-- 15 is a second full block: 32 kinds. Materials never matter to connectivity. Every figure here is derived
 -- from "Hetoimasia.Terrain.Opening", the one authority for where empty space can
 -- pass: whether two neighbouring cells connect, whether a cell has any void, and
 -- whether its top face opens over positive area are all answered by asking that
@@ -34,24 +35,26 @@ module Hetoimasia.Terrain.Internal.Connectivity.Kind
 import Data.Array (Array, listArray, (!))
 import Hetoimasia.Terrain.Coordinate (tileCoord)
 import Hetoimasia.Terrain.Geometry (FaceKind (TopFace))
-import Hetoimasia.Terrain.Internal.Cell (Cell (..))
-import Hetoimasia.Terrain.Internal.Shape (allShapeIds, shapeIdValue)
+import Hetoimasia.Terrain.Internal.Cell (Cell, cellShapeKey)
+import Hetoimasia.Terrain.Internal.Shape (ShapeKey (..), allShapeIds, allShapeKeys, cornerMaskValue, shapeIdValue)
 import Hetoimasia.Terrain.Opening
   ( CellOpenings
   , airOpenings
   , cellComponents
   , cellPortals
   , connectCells
+  , keyOpenings
   , portalFace
-  , shapeOpenings
   )
 
--- | A content kind: 0 for air, 1 for the full block and @1 + n@ for shape @n@.
+-- | A content kind: 0 for air and @1 + i@ for the key at index @i@ of
+-- 'allShapeKeys', so side identity @n@ is @1 + n@ (identity 0 is the full block,
+-- kind 1) and corner mask @m@ is @16 + m@.
 type Kind = Int
 
--- | The number of kinds: air and the sixteen catalog identities.
+-- | The number of kinds: air and every occupied shape key.
 kindCount ∷ Int
-kindCount = 17
+kindCount = 1 + length allShapeKeys
 
 kindAir, kindBlock ∷ Kind
 kindAir = 0
@@ -59,13 +62,17 @@ kindBlock = 1
 
 -- | The kind of a cell, whatever its material.
 kindOfCell ∷ Cell → Kind
-kindOfCell Air = kindAir
-kindOfCell (Solid _ shape) = 1 + shapeIdValue shape
+kindOfCell = maybe kindAir kindOfKey . cellShapeKey
+
+-- | The kind of an occupied shape key.
+kindOfKey ∷ ShapeKey → Kind
+kindOfKey (SideKey shape) = 1 + shapeIdValue shape
+kindOfKey (CornerKey mask) = length allShapeIds + cornerMaskValue mask
 
 openingsOf ∷ Kind → CellOpenings
 openingsOf 0 = airOpenings
-openingsOf kind = case drop (kind - 1) allShapeIds of
-  (shape : _) → shapeOpenings shape
+openingsOf kind = case drop (kind - 1) allShapeKeys of
+  (key : _) → keyOpenings key
   [] → airOpenings
 
 -- | The number of empty components in a cell of this kind.
@@ -78,7 +85,7 @@ kindHasVoid kind = kindVoidCount kind > 0
 
 -- | A kind whose cell has more than one empty component. The compiler addresses
 -- one component per cell, so such a kind cannot be compiled yet (the current
--- catalog has none).
+-- catalog has none: every key's empty region lies above a height field).
 unsupportedKind ∷ Kind → Bool
 unsupportedKind kind = kindVoidCount kind > 1
 
@@ -87,7 +94,7 @@ unsupportedKind kind = kindVoidCount kind > 1
 kindTopOpens ∷ Kind → Bool
 kindTopOpens kind = any ((== TopFace) . portalFace) (cellPortals (openingsOf kind))
 
--- | The number of entries of the connection table: three axes, 17 kinds twice.
+-- | The number of entries of the connection table: three axes, every kind twice.
 tableSize ∷ Int
 tableSize = 3 * kindCount * kindCount
 

@@ -12,11 +12,12 @@
 -- material the palette does not hold, an index it has not assigned, bits above
 -- the tag, an air index carrying any other bit, or a corner value of zero.
 --
--- A 'Cell' has no corner constructor yet, so 'unpackCell' refuses a corner
--- value with 'CornerCell' and never returns a side solid for it; 'unpackKey'
--- decodes either family to its material and key. The legacy 16-bit word
--- ('packedWord') exists only for a side value; a corner value has no such
--- word, and 'packedBits' is the full 17-bit value.
+-- 'unpackCell' decodes a side value to 'Solid' and a corner value to
+-- 'CornerSolid'; 'unpackKey' decodes either family to its material and key. A
+-- @'CornerSolid' _ 0@ is air and has no packed form, so 'packCell' refuses it
+-- with 'PackedCornerZero'. The legacy 16-bit word ('packedWord') exists only
+-- for a side value; a corner value has no such word, and 'packedBits' is the
+-- full 17-bit value.
 --
 -- This packing is internal to terrain storage. It is not a Lua numeric
 -- identifier, a save-file format or a promise of compatibility with another
@@ -119,8 +120,6 @@ data PaletteError
     UnknownTagBits !Word32
   | -- | A corner value of zero, which is air and has no packed form.
     PackedCornerZero
-  | -- | A corner value met where only a side 'Cell' can be returned.
-    CornerCell !Word16
   deriving stock (Eq, Show)
 
 -- | The most materials a palette holds: the non-air indices of 12 bits.
@@ -198,11 +197,13 @@ internSourceMaterials source palette0 = go palette0 (sourceMaterials source)
 packCell ∷ Palette → Cell → Either PaletteError PackedCell
 packCell _ Air = Right packedAir
 packCell palette (Solid material shape) = packKey palette material (sideKey shape)
+packCell palette (CornerSolid material mask) = packCorner palette material mask
 
 -- | Pack a cell, interning its material first.
 internCell ∷ Cell → Palette → Either PaletteError (PackedCell, Palette)
 internCell Air palette = Right (packedAir, palette)
 internCell (Solid material shape) palette = internKey material (sideKey shape) palette
+internCell (CornerSolid material mask) palette = internCorner material mask palette
 
 -- | Pack a material and a shape key of either family against a palette that
 -- already holds the material.
@@ -261,12 +262,13 @@ unpackKey palette packed@(PackedCell w)
       | packedIsCorner packed = CornerKey (CornerMask value)
       | otherwise = SideKey (ShapeId value)
 
--- | Decode a packed value against a palette, refusing an index the palette has
--- not assigned, a noncanonical air and a corner value, which has no 'Cell'.
+-- | Decode a packed value against a palette to its 'Cell': a side value to
+-- 'Solid' and a corner value to 'CornerSolid'. An index the palette has not
+-- assigned and a noncanonical encoding are refused.
 unpackCell ∷ Palette → PackedCell → Either PaletteError Cell
 unpackCell palette packed = do
   decoded ← unpackKey palette packed
   case decoded of
     Nothing → Right Air
     Just (material, SideKey shape) → Right (Solid material shape)
-    Just (_, CornerKey _) → Left (CornerCell (packedShape packed))
+    Just (material, CornerKey mask) → Right (CornerSolid material mask)

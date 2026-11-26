@@ -41,6 +41,36 @@ spec = describe "#661's records replayed through the page-resident store" $ do
     -- the cave is known, the side branch too; a sealed wall beyond is still unknown
     must (knowledgeThrough (runH r2) (\p → queryCell (runEnv r2) p (tileAt 5 3 5)))
       `shouldReturn` CellKnowledge NoSolid VoidKnown
+  it "replays mixed-family sources: edits and fresh windows agree with the reference, known solid and void included" $ do
+    let run0 = newRun smallSpec mixedFamilies 64
+        known p = queryCell (runEnv run0) p
+    r1 ← must (cellsOf mixedWallA [] run0)
+    must (compareKnowledge r1 [tileAt x y z | (x, y, z) ← probes])
+    (r2, _) ← must (drain r1)
+    pendingObligations (storeHeader (hStore (runH r2))) `shouldBe` 0
+    must (compareKnowledge r2 [tileAt x y z | (x, y, z) ← probes])
+    -- a fresh window holds no page: the cells the mixed edit touched read as unavailable (a record the provider has not supplied), never
+    -- as unknown or as air, and the same reads match the pure reference once the pages are supplied
+    let held = runH r2
+        freshProvider = either (error . show) id (providerAt (hStore held) (storeWindow (hStore held)))
+        withheld tile = observedValue (queryCell (runEnv r2) freshProvider tile)
+        isUnavailable = \case Left (MissingRecord _) → True; _ → False
+    [t | (x, y, z) ← probes, let t = tileAt x y z, isUnavailable (withheld t)] `shouldSatisfy` (not . null)
+    forM_ [tileAt 2 0 5, tileAt 4 0 4] $ \t → withheld t `shouldSatisfy` isUnavailable
+    must (compareKnowledge r2 [tileAt 2 0 5, tileAt 4 0 4, tileAt 1 0 5, tileAt 1 0 6, tileAt 1 0 7])
+    -- the cave behind the opened west wall is a known void, and the corner bank in its floor is a known
+    -- solid under a known void
+    must (knowledgeThrough (runH r2) (\p → known p (tileAt 2 0 5))) `shouldReturn` CellKnowledge NoSolid VoidKnown
+    must (knowledgeThrough (runH r2) (\p → known p (tileAt 4 0 4))) `shouldReturn` CellKnowledge SolidKnown VoidKnown
+    -- removing the east wall's corner zero changes nothing: it is air, and a real corner cell beside it is removed
+    let v2 = storeVersion (hStore (runH r2))
+    r3 ← must (removeCell r2 (tileAt 9 0 7))
+    storeVersion (hStore (runH r3)) `shouldBe` v2
+    r4 ← must (cellsOf mixedWallB [] r3)
+    (r5, _) ← must (drain r4)
+    pendingObligations (storeHeader (hStore (runH r5))) `shouldBe` 0
+    must (compareKnowledge r5 [tileAt x y z | (x, y, z) ← probes])
+    isRight (checkH (runH r5)) `shouldBe` True
   it "keeps the known, unknown and pending distinction before any batch runs" $ do
     let run0 = newRun smallSpec twoOpenings 64
     r1 ← must (cellsOf openingA [] run0)

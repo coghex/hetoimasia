@@ -9,7 +9,7 @@ import Hetoimasia.Terrain.Cell
 import Hetoimasia.Terrain.Changes
 import Hetoimasia.Terrain.Coordinate (axisValue)
 import Hetoimasia.Terrain.Query
-import Hetoimasia.Terrain.Shape (shapeIdValue)
+import Hetoimasia.Terrain.Shape (cornerMaskValue, keyCorner, keySide, shapeIdValue)
 import Hetoimasia.Terrain.Source
 import Test.Hspec
 import Test.QuickCheck
@@ -36,7 +36,12 @@ runsOf source changes x y lo hi =
 highestOf ∷ Source → Changes → Integer → Integer → Maybe (Integer, (String, Int))
 highestOf source changes x y = case highestOccupied source changes (mustColumn x y) of
   Nothing → Nothing
-  Just o → Just (toInteger (axisValue (occupiedLevel o)), (materialIdString (occupiedMaterial o), shapeIdValue (occupiedShape o)))
+  Just o → Just (toInteger (axisValue (occupiedLevel o)), (materialIdString (occupiedMaterial o), modelValue (occupiedShape o)))
+  where
+    modelValue key = case (keySide key, keyCorner key) of
+      (Just shape, _) → shapeIdValue shape
+      (Nothing, Just mask) → 16 + cornerMaskValue mask
+      (Nothing, Nothing) → error "a key has a family"
 
 spec ∷ Spec
 spec = describe "Queries and removals" $ do

@@ -91,6 +91,7 @@ nativeDigests service lease = do
     materialOf = \case
       Air → "air"
       Solid material _ → Text.pack (materialIdString material)
+      CornerSolid material _ → Text.pack (materialIdString material)
     runText (Run zs cell) = Text.pack (show (toInteger (zRangeLo zs))) <> ":" <> Text.pack (show (toInteger (zRangeHi zs))) <> ":" <> materialOf cell
 
 -- | Wait, bounded, until the arena's discovery is idle: the removal's content commit is the awaited request's, but the knowledge it

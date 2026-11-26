@@ -92,3 +92,4 @@ highestIn view = go topExclusive
            in case cell of
                 Air → go lo
                 Solid {} → Just (z, cell)
+                CornerSolid {} → Just (z, cell)

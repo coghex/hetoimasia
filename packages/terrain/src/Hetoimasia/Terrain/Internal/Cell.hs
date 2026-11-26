@@ -20,6 +20,9 @@ module Hetoimasia.Terrain.Internal.Cell
 
     -- * Cells
   , Cell (..)
+  , cornerCell
+  , cellShapeKey
+  , cellOccupant
 
     -- * Z intervals
   , ZRange (..)
@@ -39,7 +42,7 @@ module Hetoimasia.Terrain.Internal.Cell
 import Data.Char (isControl)
 import Data.Int (Int64)
 import Hetoimasia.Terrain.Internal.Coordinate
-import Hetoimasia.Terrain.Internal.Shape (ShapeId)
+import Hetoimasia.Terrain.Internal.Shape (CornerMask, ShapeId, ShapeKey, resolveCorner, sideKey)
 
 -- | A validated authored material identifier: nonempty text of at most
 -- 'maxMaterialIdBytes' UTF-8 bytes with no control character and no surrogate
@@ -107,12 +110,39 @@ utf8LengthCapped cap = go 0
       | used >= cap = cap
       | otherwise = go (used + charBytes c) cs
 
--- | What one cell holds: empty space, or a material with a shape. Air is a
--- value, never a material that needs an allocation.
+-- | What one cell holds: empty space, or a material with a shape of one of the
+-- two families. 'Solid' carries a side identity; 'CornerSolid' carries a
+-- corner mask. Air is a value, never a material that needs an allocation, and
+-- corner mask zero is air: no source, query or snapshot produces a
+-- @'CornerSolid' _ 0@, which 'cornerCell' resolves to 'Air'. Side 0 and corner
+-- 15 are different full blocks, so the two constructors never compare equal.
 data Cell
   = Air
   | Solid !MaterialId !ShapeId
+  | CornerSolid !MaterialId !CornerMask
   deriving stock (Eq, Ord, Show)
+
+-- | The cell of a material and a corner mask. Mask zero has no solid, so it is
+-- 'Air' whatever the material.
+cornerCell ∷ MaterialId → CornerMask → Cell
+cornerCell material mask = case resolveCorner mask of
+  Nothing → Air
+  Just _ → CornerSolid material mask
+
+-- | The tagged shape key of a stored cell, the key 'allShapeKeys' lists for
+-- its shape; air has none. A side cell yields its side key and a corner cell
+-- its corner key, so side 0 and corner 15 stay distinct.
+cellShapeKey ∷ Cell → Maybe ShapeKey
+cellShapeKey Air = Nothing
+cellShapeKey (Solid _ shape) = Just (sideKey shape)
+cellShapeKey (CornerSolid _ mask) = resolveCorner mask
+
+-- | The material and tagged shape key of a solid cell, and 'Nothing' for air.
+cellOccupant ∷ Cell → Maybe (MaterialId, ShapeKey)
+cellOccupant cell = case cell of
+  Air → Nothing
+  Solid material _ → (,) material <$> cellShapeKey cell
+  CornerSolid material _ → (,) material <$> cellShapeKey cell
 
 -- | A half-open Z interval @[lo, hi)@ of cell levels inside the supported
 -- range. The lower endpoint is a supported level; the exclusive upper endpoint

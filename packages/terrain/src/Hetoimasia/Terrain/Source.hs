@@ -11,11 +11,22 @@
 -- game-specific generator: soil over stone is an ordinary pair of layers a
 -- caller supplies, for example @stone [-inf, -3)@ under @soil [-3, 1)@.
 --
+-- A layer or patch selects its shape from one of two families. The historic
+-- forms, 'LayerSpec' and 'SpecSolid', take a numeric side identity @0..15@ and
+-- keep their meaning and refusals. The explicit corner forms, 'CornerLayerSpec'
+-- and 'SpecCorner', take a corner mask @0..15@: a nonzero mask is a
+-- 'Hetoimasia.Terrain.Cell.CornerSolid', and mask zero is air. A corner-zero
+-- record is still a record: its interval, order, overlap and material are
+-- checked and it counts as an authored run, and its cells read as air. A mask
+-- outside @0..15@ is refused with 'InvalidCornerMask', and the whole definition
+-- with it.
+--
 -- 'mkSource' validates the whole definition and returns a 'Source' or the first
 -- refusal; no partial source exists. It refuses an overlapping layer (and a
 -- layer out of order), overlapping patches in one column, an invalid or empty
 -- interval, a coordinate outside the supported range, a duplicate or unknown
--- material, a shape outside @0..15@ and an oversized definition. Creating a
+-- material, a side identity or a corner mask outside @0..15@ and an oversized
+-- definition. Creating a
 -- source instantiates no column and no buried cell; its size is its authored
 -- records.
 --

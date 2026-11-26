@@ -69,7 +69,7 @@ import Hetoimasia.Terrain.Cell
 import Hetoimasia.Terrain.Changes (Changes)
 import Hetoimasia.Terrain.Coordinate (AxisCoord, axisValue)
 import Hetoimasia.Terrain.Query
-import Hetoimasia.Terrain.Shape (ShapeId)
+import Hetoimasia.Terrain.Shape (ShapeKey)
 import Hetoimasia.Terrain.Source (Source)
 
 -- | The three version identities one coherent plan carries: the arena
@@ -170,8 +170,9 @@ data FKind
     FUnknown
   | -- | Known air.
     FAir
-  | -- | Known solid of a material and a /world/ shape identity.
-    FSolid !MaterialId !ShapeId
+  | -- | Known solid of a material and a /world/ shape key, of either family:
+    -- side 0 and corner 15 are different kinds and never coalesce.
+    FSolid !MaterialId !ShapeKey
   deriving stock (Eq, Show)
 
 -- | A maximal stretch of one kind, @[lo, hi)@.
@@ -206,8 +207,7 @@ columnFacts limits facts column lo hi
       Right range → do
         runs ← columnRuns limits (factsSource facts) (factsChanges facts) column range
         pure [FRun (zRangeLo r) (zRangeHi r) (kindOf cell) | Run r cell ← runs]
-    kindOf Air = FAir
-    kindOf (Solid material shape) = FSolid material shape
+    kindOf cell = maybe FAir (uncurry FSolid) (cellOccupant cell)
 
 coalesceRuns ∷ [FRun] → [FRun]
 coalesceRuns (FRun a b k : FRun c d l : rest)

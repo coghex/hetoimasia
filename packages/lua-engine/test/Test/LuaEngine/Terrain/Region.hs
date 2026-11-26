@@ -28,8 +28,8 @@ import qualified Hetoimasia.Terrain.Discovery as D
 import Hetoimasia.Terrain.Residency (LimitsSpec (..), Revision (..), mkLimits)
 import Hetoimasia.Terrain.Runtime
 import Hetoimasia.Terrain.Runtime.Testing (NativeOp (OpReadAt))
-import Hetoimasia.Terrain.Shape (shapeIdValue)
-import Hetoimasia.Terrain.Source (LayerSpec (..), SourceSpec (..))
+import Hetoimasia.Terrain.Shape (cornerMaskValue, shapeIdValue)
+import Hetoimasia.Terrain.Source (CellSpec (..), LayerSpec (..), PatchSpec (..), SourceSpec (..))
 import Test.Hspec
 import Test.LuaEngine.Facade.Support
 import Test.LuaEngine.Request.Profiles (counts)
@@ -67,6 +67,7 @@ nativeDigest snapshot region =
     terrainKey = \case
       PartReady Air → "air"
       PartReady (Solid material shape) → Text.pack (materialIdString material) <> ":" <> Text.pack (show (shapeIdValue shape))
+      PartReady (CornerSolid material mask) → Text.pack (materialIdString material) <> ":c" <> Text.pack (show (cornerMaskValue mask))
       _ → "missing"
     knowledgeKey = \case
       PartReady (D.CellKnowledge solid hollow) → solidText solid <> "/" <> voidText hollow
@@ -137,8 +138,8 @@ holdings svc = do
 -- The scripts -------------------------------------------------------------------------------------------------
 
 -- | The Lua every region script shares: the report of a reply, which is the digest 'nativeDigest' makes, and whether the reply's shape
--- is exactly the contract's (its four fields, the two keys of a ready part, a terrain cell with exactly its air, material and shape,
--- a knowledge cell with exactly its two).
+-- is exactly the contract's (its four fields, the two keys of a ready part, a terrain cell with exactly its air, material and one
+-- discriminator, @shape@ for a side solid or @corner_mask@ for a corner solid, and a knowledge cell with exactly its two).
 reportPrelude ∷ [Text]
 reportPrelude =
   [ "local function nkeys(t) local n = 0 for _ in pairs(t) do n = n + 1 end return n end"
@@ -154,7 +155,7 @@ reportPrelude =
   , "  if prev then out[#out + 1] = n .. 'x' .. prev end"
   , "  return table.concat(out, ' ')"
   , "end"
-  , "local function tkey(c) if c.air then return 'air' end return c.material .. ':' .. c.shape end"
+  , "local function tkey(c) if c.air then return 'air' end if c.corner_mask then return c.material .. ':c' .. c.corner_mask end return c.material .. ':' .. c.shape end"
   , "local function kkey(c) return c.solid .. '/' .. c.void end"
   , "local function part(p, key) if p.state == 'ready' then return #p.cells .. '[' .. rle(p.cells, key) .. ']' end return p.state .. tostring(p.cells) end"
   , "local function wellformed(v)"
@@ -163,7 +164,7 @@ reportPrelude =
   , "    if p.state == 'ready' then if nkeys(p) ~= 2 or #p.cells ~= 8192 then return false end"
   , "    elseif p.state ~= 'unavailable' or nkeys(p) ~= 1 then return false end"
   , "  end"
-  , "  for _, c in ipairs(v.terrain.cells or {}) do if nkeys(c) ~= (c.air and 1 or 3) then return false end end"
+  , "  for _, c in ipairs(v.terrain.cells or {}) do if nkeys(c) ~= (c.air and 1 or 3) or (not c.air and (c.shape == nil) == (c.corner_mask == nil)) then return false end end"
   , "  for _, c in ipairs(v.knowledge.cells or {}) do if nkeys(c) ~= 2 then return false end end"
   , "  return true"
   , "end"
@@ -238,6 +239,7 @@ finished world = do
 spec ∷ Spec
 spec = describe "Lua regional read" $ do
   copySpec
+  cornerSpec
   unavailableSpec
   limitsSpec
   refusalSpec
@@ -284,6 +286,99 @@ copySpec =
           edited `shouldNotBe` origin
           -- the ramp is a known solid over an unknown void in what Lua read, as it is in the native snapshots
           [origin, edited] `shouldSatisfy` all ("known/unknown" `Text.isInfixOf`)
+
+-- | Side and corner solids authored from Haskell (the Lua input form is another slice): a corner slope, a side slope, a corner full block,
+-- a side full block and an authored corner zero side by side at level 5, and a stack at (3, 6) that alternates side and corner full blocks.
+cornerSource ∷ SourceSpec
+cornerSource =
+  SourceSpec
+    ["stone", "slab"]
+    [LayerSpec Nothing (Just 8) "stone" 0]
+    ( [ PatchSpec 3 5 5 6 (SpecCorner "slab" 9)
+      , PatchSpec 4 5 5 6 (SpecSolid "slab" 3)
+      , PatchSpec 5 5 5 6 (SpecCorner "slab" 15)
+      , PatchSpec 6 5 5 6 (SpecSolid "slab" 0)
+      , PatchSpec 7 5 5 6 (SpecCorner "slab" 0)
+      ]
+        <> [PatchSpec 3 6 z (z + 1) c | (z, c) ← zip [5 ..] [SpecSolid "slab" 0, SpecCorner "slab" 15, SpecSolid "slab" 15, SpecCorner "slab" 15]]
+    )
+
+-- | A corner solid replies with @material@ and @corner_mask@ and no @shape@, a side solid with @material@ and @shape@ and no
+-- @corner_mask@, and air with neither, on a cell, a column, a surface and a region read alike; the region copy equals the native snapshot's.
+cornerSpec ∷ Spec
+cornerSpec =
+  it "replies with corner_mask for a corner solid and shape for a side solid, on cell, column, surface and region reads, equal to the native snapshot" $
+    withRig $ \rig → do
+      let svc = rgService rig
+          cellStep ∷ Text → Int → Int → Int → Step
+          cellStep label x y z = Step label ("return api.terrain.cell(A, {x = " <> n x <> ", y = " <> n y <> ", z = " <> n z <> "})") "return ctext(v)"
+          n = Text.pack . show
+          steps =
+            stepsScript "nil" (reportPrelude <> cornerPrelude) (
+              [ cellStep "corner slope" 3 5 5
+              , cellStep "side slope" 4 5 5
+              , cellStep "corner block" 5 5 5
+              , cellStep "side block" 6 5 5
+              , cellStep "corner zero" 7 5 5
+              , Step "column" "return api.terrain.column(A, {x = 3, y = 6, z_min = 4, z_max = 10})" "return runtext(v)"
+              , Step "surface" "return api.terrain.surface(A, {x = 3, y = 6})" "return stext(v)"
+              , Step "surface of a side column" "return api.terrain.surface(A, {x = 4, y = 5})" "return stext(v)"
+              , readStep "region" "R0"
+              ])
+      withHostedArena rig cornerSource steps $ \world creator → do
+        printed ← finished world
+        native ← digestOfRegion svc creator (RegionCoord 0 0 0)
+        let line label text = label <> "\tsuccess\t" <> text
+        printed `shouldContain` [line "corner slope" "false slab nil 9 4"]
+        printed `shouldContain` [line "side slope" "false slab 3 nil 4"]
+        printed `shouldContain` [line "corner block" "false slab nil 15 4"]
+        printed `shouldContain` [line "side block" "false slab 0 nil 4"]
+        printed `shouldContain` [line "corner zero" "true nil nil nil 2"]
+        -- side 0, corner 15, side 15 and corner 15 again are four runs, never joined
+        printed
+          `shouldContain` [ line
+                              "column"
+                              "4:5:false:stone:0:nil:5 5:6:false:slab:0:nil:5 6:7:false:slab:nil:15:5 7:8:false:slab:15:nil:5 8:9:false:slab:nil:15:5 9:10:true:nil:nil:nil:3"
+                          ]
+        printed `shouldContain` [line "surface" "true 8 slab nil 15 5"]
+        -- a column that tops out at the stone layer reports its side identity 0, not a corner mask
+        printed `shouldContain` [line "surface of a side column" "true 7 stone 0 nil 5"]
+        -- the region copy equals what the native snapshot holds, a corner solid keyed by its mask
+        printed `shouldContain` [readLine "region" native]
+        native `shouldSatisfy` ("xslab:c9" `Text.isInfixOf`)
+        native `shouldSatisfy` ("xslab:c15" `Text.isInfixOf`)
+        native `shouldSatisfy` ("xslab:3" `Text.isInfixOf`)
+
+-- | A script that attaches the arena the host created, named @shared@, instead of opening one of its own.
+attachShared ∷ Script → Script
+attachShared steps = steps {scInit = ["self.s = 0", "self.q = api.terrain.attach('shared')"]}
+
+-- | A Lua instance attached to an arena the host opened from a Haskell source, for the body, which is given the host's own lease on it.
+-- The corner form is authored only here: the Lua input form is another slice.
+withHostedArena ∷ Rig → SourceSpec → Script → (World → ArenaLease → IO a) → IO a
+withHostedArena rig source steps body = do
+  let svc = rgService rig
+  client ← registerClient svc >>= either (fail . show) pure
+  ( do
+      opening ← openArena svc client (arenaName rig "modules-test" "shared") source >>= either (fail . show) pure
+      creator ← await svc opening >>= either (fail . show) pure
+      withScript rig fixedM1Profile presentationOver (attachShared steps) (\world _ → body world creator)
+    )
+    `finally` endClient svc client
+
+-- | The Lua that reads a corner reply: the discriminators a record carries, and its keys.
+cornerPrelude ∷ [Text]
+cornerPrelude =
+  [ "local function ctext(c) return tostring(c.air) .. ' ' .. tostring(c.material) .. ' ' .. tostring(c.shape) .. ' ' .. tostring(c.corner_mask) .. ' ' .. nkeys(c) end"
+  , "local function runtext(v)"
+  , "  local out = {}"
+  , "  for _, r in ipairs(v.runs) do"
+  , "    out[#out + 1] = r.z_min .. ':' .. r.z_max .. ':' .. tostring(r.air) .. ':' .. tostring(r.material) .. ':' .. tostring(r.shape) .. ':' .. tostring(r.corner_mask) .. ':' .. nkeys(r)"
+  , "  end"
+  , "  return table.concat(out, ' ')"
+  , "end"
+  , "local function stext(v) return tostring(v.occupied) .. ' ' .. tostring(v.z) .. ' ' .. tostring(v.material) .. ' ' .. tostring(v.shape) .. ' ' .. tostring(v.corner_mask) .. ' ' .. nkeys(v) end"
+  ]
 
 -- | A failed page makes unavailable each part that needed it, independently of the other, in the copy as in the native snapshot.
 unavailableSpec ∷ Spec
@@ -363,6 +458,15 @@ limitsSpec = do
         printed `shouldContain` [readLine "region" native]
         -- all 8,192 cells of the terrain part are the one solid
         native `shouldSatisfy` Text.isInfixOf ("T 8192[8192x" <> Text.replicate 64 "m" <> ":15]")
+  it "carries a worst-case corner region on the stock profile: every cell a corner solid of the longest material, whose longer discriminator name admission judged" $
+    withRig $ \rig → do
+      let big = replicate 64 'm'
+          steps = stepsScript "nil" reportPrelude [readStep "region" "R0"]
+      withHostedArena rig (SourceSpec [big] [CornerLayerSpec Nothing Nothing big 15] []) steps $ \world creator → do
+        printed ← finished world
+        native ← digestOfRegion (rgService rig) creator (RegionCoord 0 0 0)
+        printed `shouldContain` [readLine "region" native]
+        native `shouldSatisfy` Text.isInfixOf ("T 8192[8192x" <> Text.replicate 64 "m" <> ":c15]")
   it "refuses a region before admission, as an ordinary error that takes no request place, on a profile whose copied-value limits cannot carry the worst reply" $
     withRig $ \rig → do
       let checks =

@@ -217,7 +217,7 @@ import Hetoimasia.Terrain.Runtime.Settlement
   , surfaceWith
   , takeSTM
   )
-import Hetoimasia.Terrain.Shape (shapeIdValue)
+import Hetoimasia.Terrain.Shape (CornerMask, ShapeId, ShapeKey, cornerMaskValue, keyCorner, keySide, shapeIdValue)
 import Hetoimasia.Terrain.Source (CellSpec (..), LayerSpec (..), PatchSpec (..), SourceLimits (..), SourceSpec (..), defaultSourceLimits)
 import Hetoimasia.Terrain.Runtime.Store (StoreSpec (..), allowanceUnitBytes, minAllowanceBytes, mkStoreConfig)
 
@@ -1221,10 +1221,26 @@ revisionOf ceiling' (Revision w)
   | w <= min ceiling' (fromIntegral (maxBound ∷ Int64)) = Just (fromIntegral w)
   | otherwise = Nothing
 
+-- | The fields of a cell. Air has neither discriminator. A side solid has @material@ and @shape@ (@0..15@) and no @corner_mask@; a corner
+-- solid has @material@ and @corner_mask@ (its authored mask, @1..15@) and no @shape@, so every solid keeps three keys.
 cellFields ∷ Cell → [(Text, Value)]
 cellFields = \case
   Air → [("air", VBoolean True)]
-  Solid material shape → [("air", VBoolean False), ("material", VText (materialText material)), ("shape", VInteger (fromIntegral (shapeIdValue shape)))]
+  Solid material shape → [("air", VBoolean False), ("material", VText (materialText material)), shapeField (Left shape)]
+  CornerSolid material corners → [("air", VBoolean False), ("material", VText (materialText material)), shapeField (Right corners)]
+
+-- | The one discriminator field of a solid's shape: @shape@ for a side identity and @corner_mask@ for a corner mask.
+shapeField ∷ Either ShapeId CornerMask → (Text, Value)
+shapeField = \case
+  Left shape → ("shape", VInteger (fromIntegral (shapeIdValue shape)))
+  Right corners → ("corner_mask", VInteger (fromIntegral (cornerMaskValue corners)))
+
+-- | The discriminator field of a tagged shape key. A key is a side identity or a nonzero corner mask, never neither.
+keyField ∷ ShapeKey → [(Text, Value)]
+keyField key = case (keySide key, keyCorner key) of
+  (Just shape, _) → [shapeField (Left shape)]
+  (Nothing, Just corners) → [shapeField (Right corners)]
+  (Nothing, Nothing) → []
 
 materialText ∷ MaterialId → Text
 materialText = Text.pack . materialIdString
@@ -1242,12 +1258,13 @@ answerReply ceiling' = \case
     Nothing → VRecord [("revision", VInteger revision), ("occupied", VBoolean False)]
     Just (Occupied level material shape) →
       VRecord
-        [ ("revision", VInteger revision)
-        , ("occupied", VBoolean True)
-        , ("z", VInteger (axisValue level))
-        , ("material", VText (materialText material))
-        , ("shape", VInteger (fromIntegral (shapeIdValue shape)))
-        ]
+        ( [ ("revision", VInteger revision)
+          , ("occupied", VBoolean True)
+          , ("z", VInteger (axisValue level))
+          , ("material", VText (materialText material))
+          ]
+            <> keyField shape
+        )
   ARemoved answer → withRevision (removeRevision answer) $ \revision → VRecord [("changed", VBoolean (removeChangedFlag answer)), ("revision", VInteger revision)]
   AOpened _ → ProviderFailure "terrain: a lease answer reached the value conversion"
   AGrown _ → ProviderFailure "terrain: a growth answer reached the value conversion without its arena's status"
@@ -1502,6 +1519,11 @@ submitToService env submission found settling = do
           , workRetirement = retirement env link
           }
 
+-- | The widest discriminator a solid can carry: the larger of the side @shape@ and the corner @corner_mask@ encodings. Both are one integer at
+-- the greatest value, and the corner key is the longer name, so every corner reply fits what admission judged for this one.
+widestShapeField ∷ (Text, Value)
+widestShapeField = ("corner_mask", VInteger maxBound)
+
 -- | The largest answer a read or a removal can have, as the reply the host judges: a revision at the greatest integer, every field
 -- present, and for a column as many runs as the range has levels and the service returns (more is @too_large@, a failure that
 -- carries no answer).
@@ -1511,7 +1533,7 @@ largestReply env = \case
   LargestColumn levels →
     let runs = max 1 (min (limitReturnedRuns (configQueryLimits (tfConfig (envFacade env)))) levels)
      in ProviderResult (VRecord [("revision", greatest), ("runs", VList (replicate runs (VRecord ([("z_min", greatest), ("z_max", greatest)] <> solid))))])
-  LargestSurface → ProviderResult (VRecord [("revision", greatest), ("occupied", VBoolean True), ("z", greatest), ("material", longest), ("shape", greatest)])
+  LargestSurface → ProviderResult (VRecord [("revision", greatest), ("occupied", VBoolean True), ("z", greatest), ("material", longest), widestShapeField])
   LargestRemove → ProviderResult (VRecord [("changed", VBoolean True), ("revision", greatest)])
   LargestStatus →
     ProviderResult
@@ -1540,7 +1562,8 @@ largestReply env = \case
     every = VList [VText (conditionCode c) | c ← [minBound .. maxBound]]
     greatest = VInteger maxBound
     longest = VText (Text.replicate maxMaterialIdBytes "m")
-    solid = [("air", VBoolean False), ("material", longest), ("shape", greatest)]
+    solid = [("air", VBoolean False), ("material", longest), widestShapeField]
+
 
 -- | The largest regional read: every cell of both parts present at its widest (a solid of the longest material and the greatest shape,
 -- a known solid over an unknown void), and both revisions at the greatest integer. It depends on no configuration, so it is built once.
@@ -1550,7 +1573,7 @@ largestRegionReply =
     ( VRecord
         [ ("content_revision", VInteger maxBound)
         , ("knowledge_revision", VInteger maxBound)
-        , ("terrain", readyPart (VRecord [("air", VBoolean False), ("material", VText (Text.replicate maxMaterialIdBytes "m")), ("shape", VInteger maxBound)]))
+        , ("terrain", readyPart (VRecord [("air", VBoolean False), ("material", VText (Text.replicate maxMaterialIdBytes "m")), widestShapeField]))
         , ("knowledge", readyPart (VRecord [("solid", VText "unknown"), ("void", VText "unknown")]))
         ]
     )

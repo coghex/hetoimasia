@@ -34,22 +34,33 @@ import Hetoimasia.Terrain.Internal.Coordinate
 import Hetoimasia.Terrain.Internal.Interval
 import Hetoimasia.Terrain.Internal.Shape
 
--- | What a patch holds: air, or a declared material with a shape identity.
+-- | What a patch holds: air, a declared material with a side identity, or a
+-- declared material with a corner mask. Corner mask zero is air.
 data CellSpec
   = SpecAir
   | SpecSolid String Int
+  | SpecCorner String Int
   deriving stock (Eq, Show)
 
 -- | A base layer shared by every column: @[layerMin, layerMax)@ of one
 -- material and shape. An omitted lower end means the lowest supported level;
 -- an omitted upper end means one past the highest, so the last supported cell
--- is covered.
-data LayerSpec = LayerSpec
-  { layerMin ∷ Maybe Integer
-  , layerMax ∷ Maybe Integer
-  , layerMaterial ∷ String
-  , layerShape ∷ Int
-  }
+-- is covered. 'LayerSpec' selects a side identity (@0..15@) with
+-- 'layerShape'; 'CornerLayerSpec' selects a corner mask (@0..15@) with
+-- 'layerCorner', and mask zero is air.
+data LayerSpec
+  = LayerSpec
+      { layerMin ∷ Maybe Integer
+      , layerMax ∷ Maybe Integer
+      , layerMaterial ∷ String
+      , layerShape ∷ Int
+      }
+  | CornerLayerSpec
+      { layerMin ∷ Maybe Integer
+      , layerMax ∷ Maybe Integer
+      , layerMaterial ∷ String
+      , layerCorner ∷ Int
+      }
   deriving stock (Eq, Show)
 
 -- | A bounded override of one column's span: @[patchMin, patchMax)@ at
@@ -110,6 +121,8 @@ data SourceError
     UnknownMaterial !RecordRef String
   | -- | A shape identity outside @0..15@.
     InvalidShape !RecordRef !Int
+  | -- | A corner mask outside @0..15@.
+    InvalidCornerMask !RecordRef !Int
   | InvalidInterval !RecordRef !IntervalError
   | -- | A layer that begins before the previous layer begins.
     LayersOutOfOrder !Int
@@ -203,13 +216,29 @@ buildMaterials = foldM step Map.empty . zip [0 ..]
         then Left (DuplicateMaterialId index text)
         else pure (Map.insert identifier index table)
 
+-- | A declared material, checked against the table.
+resolveMaterial ∷ MaterialTable → RecordRef → String → Either SourceError MaterialId
+resolveMaterial table ref material = do
+  identifier ← either (const (Left (UnknownMaterial ref material))) Right (mkMaterialId material)
+  if Map.member identifier table
+    then Right identifier
+    else Left (UnknownMaterial ref material)
+
+-- | The cell of a side identity. The shape is checked before the material, as
+-- it always was.
 resolveCell ∷ MaterialTable → RecordRef → String → Int → Either SourceError Cell
 resolveCell table ref material shape = do
   shapeId ← either (const (Left (InvalidShape ref shape))) Right (mkShapeId shape)
-  identifier ← either (const (Left (UnknownMaterial ref material))) Right (mkMaterialId material)
-  if Map.member identifier table
-    then Right (Solid identifier shapeId)
-    else Left (UnknownMaterial ref material)
+  identifier ← resolveMaterial table ref material
+  pure (Solid identifier shapeId)
+
+-- | The cell of a corner mask: air for mask zero, which still names a declared
+-- material and so is validated like any other record.
+resolveCornerCell ∷ MaterialTable → RecordRef → String → Int → Either SourceError Cell
+resolveCornerCell table ref material mask = do
+  cornerMask ← either (const (Left (InvalidCornerMask ref mask))) Right (mkCornerMask mask)
+  identifier ← resolveMaterial table ref material
+  pure (cornerCell identifier cornerMask)
 
 buildLayers ∷ MaterialTable → [LayerSpec] → Either SourceError (IntervalMap Cell)
 buildLayers table specs = fst <$> foldM step (Map.empty, Nothing) (zip [0 ..] specs)
@@ -219,7 +248,9 @@ buildLayers table specs = fst <$> foldM step (Map.empty, Nothing) (zip [0 ..] sp
           lo = fromMaybe axisMinValue (layerMin layer)
           hi = fromMaybe (axisMaxValue + 1) (layerMax layer)
       range ← either (Left . InvalidInterval ref) Right (mkZRange lo hi)
-      cell ← resolveCell table ref (layerMaterial layer) (layerShape layer)
+      cell ← case layer of
+        LayerSpec {} → resolveCell table ref (layerMaterial layer) (layerShape layer)
+        CornerLayerSpec {} → resolveCornerCell table ref (layerMaterial layer) (layerCorner layer)
       let ZRange l h = range
       case previous of
         Just (prevLo, prevHi)
@@ -238,6 +269,7 @@ buildPatches table = foldM step Map.empty . zip [0 ..]
       cell ← case patchValue patch of
         SpecAir → Right Air
         SpecSolid material shape → resolveCell table ref material shape
+        SpecCorner material mask → resolveCornerCell table ref material mask
       let existing = Map.findWithDefault Map.empty column acc
       case insertDisjoint l h cell existing of
         Nothing → Left (OverlappingPatches index)

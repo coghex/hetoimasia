@@ -101,6 +101,7 @@ test-suite terrain-tests
         Test.Terrain.ConnectivityOracle
         Test.Terrain.Coordinate
         Test.Terrain.Corner
+        Test.Terrain.CornerAdmission
         Test.Terrain.CornerOracle
         Test.Terrain.Discovery
         Test.Terrain.DiscoveryHarness

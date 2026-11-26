@@ -71,7 +71,7 @@ import Hetoimasia.Terrain.Render2D.Camera
 import Hetoimasia.Terrain.Render2D.Facts
 import Hetoimasia.Terrain.Render2D.Knowledge
 import Hetoimasia.Terrain.Render2D.Projection
-import Hetoimasia.Terrain.Shape (ShapeId, ViewFacing, mkShapeId)
+import Hetoimasia.Terrain.Shape (ShapeId, ShapeKey, ViewFacing, keySide, mkShapeId)
 
 -- ---------------------------------------------------------------------------
 -- Configuration
@@ -329,6 +329,11 @@ data CellError
     CellMissingMaterialColour !MaterialId
   | -- | Knowledge says a solid is known where the terrain holds air.
     CellInconsistentKnowledge !Column !Integer
+  | -- | Known solid whose shape key the side-only map catalog has no entry
+    -- for, a corner key; drawing such a cell produces no quad and refuses the request, while a corner cell that is not drawn, or is
+    -- only a neighbour whose occlusion is asked about, refuses nothing. The map keeps
+    -- its side entries, so a side key never raises this.
+    CellUnsupportedShapeKey !ShapeKey
   | -- | A value could not be represented in the target.
     CellUnrepresentable !String
   deriving stock (Eq, Show)
@@ -584,6 +589,9 @@ data CState
   | SPend
   | SOrd !MaterialId !ShapeId
   | SMix !MaterialId !ShapeId
+  | -- A known solid whose key the side-only catalog has no map for: it proves no occlusion, and is refused only
+    -- where a quad of it would be drawn.
+    SUnsupported !ShapeKey
   deriving stock (Eq, Show)
 
 data SRun = SRun !Integer !Integer !CState
@@ -704,11 +712,16 @@ evaluateColumn inputs st env (v, u) budget
       | otherwise = cur
 
     admit cur unit = case unit of
+      -- A cell the plan has no room for halts before its map is asked for, so
+      -- a corner key waiting behind the limit stays unresolved and the quads
+      -- already admitted survive. An unsupported cell draws at least one quad.
+      UCell _ s
+        | prLevels cur + 1 > clLevels limits → pure (Left HaltLevels)
+        | unsupported s && prCount cur + 1 > clInstances limits → pure (Left HaltInstances)
       UCell z s → do
         quads ← partsOf inputs cur env (rx, ry) (z, s)
         pure $
           if
-            | prLevels cur + 1 > clLevels limits → Left HaltLevels
             | prCount cur + length quads > clInstances limits → Left HaltInstances
             | otherwise →
                 Right
@@ -738,10 +751,15 @@ evaluateColumn inputs st env (v, u) budget
                   , 1
                   )
 
+unsupported ∷ CState → Bool
+unsupported (SUnsupported _) = True
+unsupported _ = False
+
 emits ∷ CState → Bool
 emits SFog = True
 emits (SOrd _ _) = True
 emits (SMix _ _) = True
+emits (SUnsupported _) = True
 emits _ = False
 
 -- Whether a state's drawn coverage is proved to be the whole hexagon, so that
@@ -823,9 +841,11 @@ statesOf inputs camera offset lo hi
     classify _ _ (FRun a b FUnknown) = Right (SRun a b SPend)
     classify _ CellDiscovered (FRun a b FAir) = Right (SRun a b SAir)
     classify column _ (FRun a _ FAir) = Left (CellInconsistentKnowledge column a)
-    classify _ CellDiscovered (FRun a b (FSolid m s)) = Right (SRun a b (SOrd m s))
-    classify _ _ (FRun a b (FSolid m s)) =
-      Right (SRun a b (if isJust (lookupMixed (lookupFor facing s)) then SMix m s else SOrd m s))
+    classify _ state (FRun a b (FSolid m key)) = case keySide key of
+      Nothing → Right (SRun a b (SUnsupported key))
+      Just s
+        | state == CellDiscovered → Right (SRun a b (SOrd m s))
+        | otherwise → Right (SRun a b (if isJust (lookupMixed (lookupFor facing s)) then SMix m s else SOrd m s))
 
 coalesceStates ∷ [SRun] → [SRun]
 coalesceStates (SRun a b s : SRun c d t : rest)
@@ -844,6 +864,7 @@ fogShape = either (error . ("Hetoimasia.Terrain.Render2D.Cells: " <>) . show) id
 partsOf ∷ CellInputs → CellPrep → Envelope → Offset → (Integer, CState) → Either CellError [RawQuad]
 partsOf inputs st env (rx, ry) (z, state) = case state of
   SFog → one PartFog Nothing ColourBlank (lookupFullFog (lookupFor facing fogShape)) 0
+  SUnsupported key → Left (CellUnsupportedShapeKey key)
   SOrd m shape → do
     needColour m
     one PartOrdinary (Just m) (ColourMaterial m) (lookupOrdinary (lookupFor facing shape)) 1

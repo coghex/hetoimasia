@@ -115,14 +115,15 @@ data RemoveOutcome = RemoveOutcome
 -- column's removed intervals, coalescing with a neighbour. A result that would
 -- exceed the limit is refused and nothing is recorded.
 removeCell ∷ ChangeLimits → Source → TileCoord → Changes → Either ChangeError RemoveOutcome
-removeCell limits source (TileCoord x y z) changes = case cellIn view level of
-  Air → Right (RemoveOutcome False changes)
-  Solid {} →
+removeCell limits source (TileCoord x y z) changes = case occupiedKey of
+  Nothing → Right (RemoveOutcome False changes)
+  Just _ →
     let updated = addRemoval column level (level + 1) changes
      in if changeIntervals updated > limitRemovedIntervals limits
           then Left (TooManyRemovedIntervals (limitRemovedIntervals limits))
           else Right (RemoveOutcome True updated)
   where
+    occupiedKey = cellShapeKey (cellIn view level)
     column = Column x y
     level = axisValue z
     view = columnView source changes column

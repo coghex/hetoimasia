@@ -6,7 +6,8 @@
 -- resident, and the answer does not depend on the order or the history of
 -- earlier requests.
 --
--- * 'cellAt' answers one cell: 'Air' or a material with a shape.
+-- * 'cellAt' answers one cell: 'Air' or a material with a shape of either
+--   family; 'cellShapeKey' gives the cell's tagged key.
 --
 -- * 'columnRuns' answers a complete finite half-open range of one column as
 --   coalesced runs. The runs cover the whole requested interval, air included,
@@ -14,8 +15,8 @@
 --   'limitRangeLevels', or one that would return more than 'limitReturnedRuns'
 --   runs, is refused with the limit; it is never truncated.
 --
--- * 'highestOccupied' answers the highest level holding a solid cell, or
---   'Nothing' for a column with none.
+-- * 'highestOccupied' answers the highest level holding a solid cell with its
+--   tagged shape key, or 'Nothing' for a column with none.
 --
 -- == Cost
 --
@@ -46,7 +47,7 @@ import Hetoimasia.Terrain.Internal.Cell (ZRange (..))
 import Hetoimasia.Terrain.Internal.Column
 import Hetoimasia.Terrain.Internal.Coordinate (AxisCoord (..))
 import Hetoimasia.Terrain.Internal.Source (Source)
-import Hetoimasia.Terrain.Shape (ShapeId)
+import Hetoimasia.Terrain.Shape (ShapeKey)
 
 -- | The caller's bounds on a range answer.
 data QueryLimits = QueryLimits
@@ -75,11 +76,13 @@ data Run = Run
   }
   deriving stock (Eq, Show)
 
--- | The highest solid cell of a column.
+-- | The highest solid cell of a column: its level, its material and its tagged
+-- shape key, the key 'cellShapeKey' gives for that cell. A side solid and a
+-- corner solid of one material are different keys.
 data Occupied = Occupied
   { occupiedLevel ∷ !AxisCoord
   , occupiedMaterial ∷ !MaterialId
-  , occupiedShape ∷ !ShapeId
+  , occupiedShape ∷ !ShapeKey
   }
   deriving stock (Eq, Show)
 
@@ -105,5 +108,7 @@ columnRuns limits source changes column range@(ZRange lo hi)
 -- | The highest solid cell of a column, or 'Nothing' for an empty column.
 highestOccupied ∷ Source → Changes → Column → Maybe Occupied
 highestOccupied source changes column = case highestIn (columnView source changes column) of
-  Just (level, Solid material shape) → Just (Occupied (AxisCoord level) material shape)
-  _ → Nothing
+  Just (level, cell) → do
+    (material, key) ← cellOccupant cell
+    Just (Occupied (AxisCoord level) material key)
+  Nothing → Nothing

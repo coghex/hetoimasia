@@ -19,7 +19,7 @@
 -- 'ShapeKey'. A 'ShapeKey' names one occupied shape by family and value, so
 -- side identity 0 and corner mask 15 are two different full blocks, and
 -- 'allShapeKeys' lists the 31 occupied keys. A mask outside @0..15@ is refused
--- by 'mkCornerMask'. A positive quarter turn moves each set corner north-west
+-- by 'mkCornerMask'. 'keySide' and 'keyCorner' take a key apart by family. A positive quarter turn moves each set corner north-west
 -- to north-east to south-east to south-west ('rotateKey').
 --
 -- Rotation permutes the four bits. A positive quarter turn takes North to East
@@ -43,6 +43,8 @@ module Hetoimasia.Terrain.Shape
   , cornerMaskValue
   , ShapeKey
   , sideKey
+  , keySide
+  , keyCorner
   , resolveCorner
   , allShapeKeys
   , rotateKey
