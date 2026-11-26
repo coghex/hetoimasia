@@ -52,7 +52,7 @@ import Data.Word (Word64)
 import Hetoimasia.Terrain.Changes (changeColumnBytes, changeIntervalBytes, runsMeetingLevels)
 import Hetoimasia.Terrain.Coordinate (LocalCoord, localX, localY, localZ)
 import Hetoimasia.Terrain.Resident (columnIndexBytes)
-import Hetoimasia.Terrain.Segment (decodedCellBytes, maxSegmentPayloadBytes)
+import Hetoimasia.Terrain.Segment (decodedCellBytes, maxSegmentLevels, maxSegmentPayloadBytes)
 
 -- | A set of cells inside one region.
 newtype Coverage = Coverage (Map (Int, Int) [(Int, Int)])
@@ -240,10 +240,16 @@ descriptionBytes ∷ Word64 → Word64
 descriptionBytes n = 128 + 64 * n
 
 -- | The scratch a load of @delta@ needs (staging), for the load's whole life, in a region whose
--- loadable extent is @levels@ high: a fixed frame, a full extra copy of its cells at 'cellsScratchBytes' (four bytes each, a decoded cell),
+-- loadable extent is @levels@ high: a fixed frame, a full extra copy of the cells it decodes, 'decodedCells' (the whole segment each interval merges into, not only the cells it adds), at 'cellsScratchBytes' (four bytes each, a decoded cell),
 -- and the removed runs the load reads of the columns it touches ('loadRunsBytes').
 scratchBytes ∷ Word64 → Coverage → Word64
-scratchBytes levels delta = 256 + cellsScratchBytes (coverageCells delta) + loadRunsBytes levels (coverageColumns delta)
+scratchBytes levels delta = 256 + cellsScratchBytes (decodedCells levels delta) + loadRunsBytes levels (coverageColumns delta)
+
+-- | The most cells a load of @delta@ decodes, in a region whose loadable extent is @levels@ high: it
+-- rebuilds the whole segment each interval merges into, not only the cells it adds. That is at most
+-- one segment of 'maxSegmentLevels' cells per interval and at most the extent's levels in each column.
+decodedCells ∷ Word64 → Coverage → Word64
+decodedCells levels delta = min (coverageColumns delta * levels) (fromIntegral maxSegmentLevels * coverageSegments delta)
 
 -- | The scratch bytes of a decoded copy of @cells@ cells: 'decodedCellBytes' each.
 cellsScratchBytes ∷ Word64 → Word64

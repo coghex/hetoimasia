@@ -54,6 +54,7 @@ import Hetoimasia.Terrain.Internal.Residency.Coverage
   , removalRetainedBytes
   , removalStagingBytes
   )
+import Hetoimasia.Terrain.Segment (maxSegmentLevels)
 
 -- | The three service-wide byte banks. Each cost category the model charges
 -- belongs to exactly one of them (see "Hetoimasia.Terrain.Residency").
@@ -264,7 +265,7 @@ explicitMinimumBytes spec bank = case bank of
   StagingBank →
     maximum
       [ toInteger (commandRecordBytes 0) + 32 * queryN + interest * queryN + queryN * scratch
-      , toInteger (commandRecordBytes 1) + toInteger removalStagingBytes + interest + 256 + toInteger (cellsScratchBytes 1) + toInteger (loadRunsBytes (fromInteger z) 1)
+      , toInteger (commandRecordBytes 1) + toInteger removalStagingBytes + interest + 256 + toInteger (cellsScratchBytes (fromInteger (min z (toInteger maxSegmentLevels)))) + toInteger (loadRunsBytes (fromInteger z) 1)
       , stored
       ]
   where
