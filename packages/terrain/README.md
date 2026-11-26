@@ -27,7 +27,7 @@ transactional ownership, revisions and live offload (TRA-4), Lua copying
 | `Hetoimasia.Terrain.Source` | The declarative layered source: definition, validation, limits and byte accounting |
 | `Hetoimasia.Terrain.Changes` | Retained removals: canonical intervals, whole-cell removal, merge and restore |
 | `Hetoimasia.Terrain.Query` | Cell, complete column-range and highest-occupied queries over source plus changes |
-| `Hetoimasia.Terrain.Palette` | The 12-bit material palette and the 16-bit packed cell |
+| `Hetoimasia.Terrain.Palette` | The 12-bit material palette and the 17-bit tagged packed cell |
 | `Hetoimasia.Terrain.Segment` | One known segment of at most 32 levels in uniform, runs or dense encoding |
 | `Hetoimasia.Terrain.Resident` | Sparse resident detail: explicit coverage, materialization, discard, accounting |
 | `Hetoimasia.Terrain.Residency` | The pure residency and admission model: validated limits, banks, admission, eviction, edit reservations, scheduling |
@@ -935,14 +935,25 @@ a batch. This module starts no thread, allocates no identity and owns no resourc
 
 ### Cell value and palette
 
-A packed cell is 16 bits: a 12-bit palette index over a 4-bit shape. Index 0 is
-air, canonically the all-zero value, so a solid of shape 0 is distinct from air;
-indices `1..4095` map to stable authored identifiers, and shapes 0 and 15 stay
-distinct. Packing refuses rather than truncates: a full palette
-(`PaletteFull`), a material not in the palette, an unassigned index and an air
-index carrying a nonzero shape (`NonCanonicalAir`). Assigned indices are never
+A packed cell is 17 bits. Bit 16 is the family tag, clear for a side key and set
+for a corner key; bits 4 to 15 are a 12-bit palette index and bits 0 to 3 the value
+within the family (a side identity `0..15`, or a nonzero corner mask `1..15`). A
+valid historic 16-bit word is a side key with a clear tag, so it zero-extends to
+itself and keeps its meaning. Index 0 is air, canonically the all-zero value, so a
+solid of side 0 is distinct from air; indices `1..4095` map to stable authored
+identifiers, and side 0, side 15 and corner 15 of one material stay distinct
+occupied keys. Packing refuses rather than truncates: a full palette
+(`PaletteFull`), a material not in the palette, an unassigned index, an air index
+carrying any other bit (`NonCanonicalAir`), a bit above the tag (`UnknownTagBits`)
+and a corner value of zero (`PackedCornerZero`). `mkPackedCell` checks a historic
+word and `mkPackedBits` a 17-bit value; `packKey`, `internKey`, `packCorner`,
+`internCorner` and `packIndexed` build a cell of either family, and `unpackKey`
+decodes one to its material and `ShapeKey`. `Cell` has no corner constructor yet,
+so `unpackCell` (and `residentCell`) returns `CornerCell` for a corner value and
+never a side solid. `packedWord`, the historic word, is `Nothing` for a corner
+value; `packedBits` is the whole 17-bit value. Assigned indices are never
 reassigned. This packing is internal: it is not a Lua numeric identifier or a
-save-format promise.
+save-format promise, and the v1 page store never serializes a packed word.
 
 ### Segments and encodings
 
@@ -952,14 +963,19 @@ adjacent values the encoding is chosen once, by:
 
 | Condition | Encoding | Payload bytes |
 | --- | --- | --- |
-| `R = 1` | Uniform: one 16-bit value | 2 |
-| otherwise `4R < 2N` | Runs: one 32-bit word per run, exclusive end offset in the high half and value in the low half, ascending and coalesced | `4R` |
-| otherwise | Dense: exactly `N` 16-bit values (a tie goes to direct indexing) | `2N` |
+| `R = 1` | Uniform: one value | 2 (3 for a corner) |
+| otherwise `4R < D` | Runs: one 32-bit word per run, the exclusive end offset from bit 17 up and the 17-bit value, tag included, below it, ascending and coalesced | `4R` |
+| otherwise | Dense: the `N` 16-bit words and, only when some cell is a corner, one tag bit per cell (a tie goes to direct indexing) | `D = 2N`, or `2N + ceil(N / 8)` with a corner |
 
-Uniform and dense lookups index directly; runs use binary search, with at most 15
-runs in a nonuniform 32-cell segment. The suite pins one requested surface cell
-at 2 bytes, 32 identical cells at 2, two runs at 8, three runs at 12, 15 runs at
-60, and 16 runs or 32 alternating cells at 64. Payload bytes count the values
+The tag is part of the value, so side 15 and corner 15 of one material are two
+runs. A segment holding no corner is encoded and charged as it was when a cell was
+16 bits. The most any segment holds is `maxSegmentPayloadBytes`, 68: a dense
+32-cell segment with a corner. Uniform and dense lookups index directly; runs use
+binary search, with at most 15 runs in a nonuniform side-only 32-cell segment and 16
+with a corner. The suite pins one requested surface cell at 2 bytes, 32 identical
+cells at 2 (3 for a corner), two runs at 8, three runs at 12, 15 runs at 60, 16
+runs or 32 alternating cells at 64 (side only) or 16 runs at 64 and 17 or 32
+alternating cells at 68 (with a corner). `segmentRunWords` exposes the run layout above. Payload bytes count the values
 only: the segment's start, length and tag are metadata (`segmentMetadataBytes`,
 32 accounted bytes), and the Haskell heap costs are neither, so they are
 measured, not read from these figures. `updateSegment` decodes at most 32 values
@@ -1123,9 +1139,9 @@ state:
   `specExtentY` x `specExtentZ` of its region, at most the region's 16 x 16 x 32
   (`OutsideExtent`). The extent is the storage format's maximum per-region cost:
   whatever sequence of requests and edits made a region, it occupies at most
-  `256 + 48 c + 34 n` bytes, with `c` columns and `n` cells (every cell its own
-  segment of 32 bytes of metadata and two payload bytes, which removals can make of
-  it), and a job over the extent reserves at most `48 c + 96 s` beyond it, `s` being
+  `256 + 48 c + 35 n` bytes, with `c` columns and `n` cells (every cell its own
+  segment of 32 bytes of metadata and up to three payload bytes, which removals can make of
+  it), and a job over the extent reserves at most `48 c + 100 s` beyond it, `s` being
   its separate intervals. The model charges a region for its own column entries once
   each (the columns its coverage gains, whatever the data layer reports) and refuses
   a completion that would take a region past that maximum (`RegionExceedsMaximum`),
@@ -1144,7 +1160,7 @@ exact integer arithmetic):
 
 | Bank | Worst-case footprint it must hold |
 | --- | --- |
-| Resident | the most of: a query's regions, a removal; each region may already hold its stored maximum and then load the largest job beyond it (a removal: the stored maximum, one cell's 144 and its 62 of growth). Camera work and holds leave this much out of their reach. Beside it, the largest camera unit: the largest hold (its regions at the stored maximum) or one region's camera job (the stored maximum plus the largest job), whichever is larger |
+| Resident | the most of: a query's regions, a removal; each region may already hold its stored maximum and then load the largest job beyond it (a removal: the stored maximum, one cell's 148 and its 66 of growth). Camera work and holds leave this much out of their reach. Beside it, the largest camera unit: the largest hold (its regions at the stored maximum) or one region's camera job (the stored maximum plus the largest job), whichever is larger |
 | Staging | the most of: a query (command 128 + 32 per region, an interest and the scratch of the whole extent for each region), a removal (command, its 512 and one cell's scratch) and a handoff duplicate of a region at its stored maximum; this is the headroom camera work and holds leave free. Beside it the larger of the largest hold's records (64 per region) and one camera region (a one-region description, its interest and its scratch) |
 | Edit | one removal's retained growth, 64 |
 | Load jobs | one: a slot is taken at dispatch |
@@ -1166,14 +1182,14 @@ exact integer arithmetic):
 | Region extent (columns, rows, levels) | 16 x 16 x 32 |
 | Aging threshold (dispatches an eligible job may be passed over) | 8 |
 
-Their worst cases (computed in the tests): a region stores at most 291,072 bytes at
-that extent and its largest job reserves 405,504 more, so a 257-region query needs
-179,020,032 of the 268,435,456 resident bytes and 25,354,720 of the 134,217,728
-staging bytes (command 128 + 32 x 257, an interest each, and 98,560 of scratch per
-region), which camera work and holds leave free, plus 98,816 for one camera region or
-16,384 for the records of the largest hold (256 regions), and 74,514,432 resident bytes
+Their worst cases (computed in the tests): a region stores at most 299,264 bytes at
+that extent and its largest job reserves 421,888 more, so a 257-region query needs
+185,336,064 of the 268,435,456 resident bytes and 25,617,888 of the 134,217,728
+staging bytes (command 128 + 32 x 257, an interest each, and 99,584 of scratch per
+region), which camera work and holds leave free, plus 99,840 for one camera region or
+16,384 for the records of the largest hold (256 regions), and 76,611,584 resident bytes
 for the held regions at their stored maximum (larger than one region's camera job,
-696,576): 253,534,464 of the 268,435,456 in all; a removal needs 64 edit bytes of 67,108,864; a query needs one
+721,152): 261,947,648 of the 268,435,456 in all; a removal needs 64 edit bytes of 67,108,864; a query needs one
 load-job slot of 128. These are engineering defaults for the initial profile, not
 measured capacity.
 
@@ -1191,10 +1207,10 @@ Each cost category is assigned to exactly one bank or slot:
 | Region metadata, for every resident region however little of it is known | Resident | 256 bytes |
 | Sparse column index entries, charged to each region for its own columns | Resident | 48 bytes each |
 | Segment metadata | Resident | 32 bytes each |
-| Packed detail payload | Resident | the encoded bytes stored; reserved at the dense bound, 64 per interval |
-| A removal's rebuilt segment (its payload is between 2 and 64 bytes) | Resident | 62 reserved; the growth actually stored is charged at the commit |
+| Packed detail payload | Resident | the encoded bytes stored; reserved at the payload bound, 68 per interval |
+| A removal's rebuilt segment (its payload is between 2 and 68 bytes) | Resident | 66 reserved; the growth actually stored is charged at the commit |
 | Retained removals | Edit | 16 per interval and 48 per column entry (worst case for one removal: 64) |
-| Load scratch | Staging | 256 + 2 per cell, and the removed runs of every column it touches over the extent's height h: h / 2 + 1 runs of 16 and 48 a column (320 a column at 32 levels; 81,920 for a default region) |
+| Load scratch | Staging | 256 + 2 per cell and one tag bit per cell, and the removed runs of every column it touches over the extent's height h: h / 2 + 1 runs of 16 and 48 a column (320 a column at 32 levels; 81,920 for a default region) |
 | Interest records | Staging | 64 each |
 | Hold records (borrowers and publication pins) | Staging | 64 per region held |
 | Accepted command records | Staging | 128 + 32 per region |
@@ -1207,12 +1223,12 @@ A region count or payload-only estimate is never enough: because region
 metadata is charged, vertical regions holding almost no cells still consume the
 resident bank, and descending cannot grow residency without bound while the
 horizontal column count stays fixed. A one-cell job therefore reserves 256 + 48 +
-32 + 64 = 400 resident bytes and, when its cell needs two payload bytes, stores 338.
+32 + 68 = 404 resident bytes and, when its cell needs two payload bytes, stores 338.
 
 The reservation bounds the growth whatever else is or becomes known in the region
 and in whatever order other work completes or is canceled: merging cells into an
 existing segment can raise that segment's payload (a uniform 31-cell segment is two
-bytes, the merged dense segment 64), so a figure proportional to the new cells alone
+bytes, the merged dense segment 68), so a figure proportional to the new cells alone
 would not bound it, and a job never depends on another job to fund its column. The
 data layer keeps one index entry per column across all vertical regions; the model
 charges each region for its own columns and keeps that charge until the region is
@@ -1223,7 +1239,7 @@ shared index's growth) and whose segments and payload are what it stored there; 
 larger figure than reserved, or arithmetic that does not fit 64 bits, is a contract
 failure, never silent growth or a retroactive busy. A removal's commit reports the
 growth of the rebuilt segment the same way (`RemovalCommitted`'s last argument,
-at most the 62 reserved); the removal's growth is funded like a job's and the commit
+at most the 66 reserved); the removal's growth is funded like a job's and the commit
 is refused (`EditNotFunded`) while it still waits for a victim's release.
 
 ### Admission

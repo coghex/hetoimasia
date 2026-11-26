@@ -248,7 +248,7 @@ short, and keeping more is a defect. Its window pins only what the reader's pin 
 leaves beside those runs, so the two never pass the one credit, and construction refuses query limits
 whose widest read would leave fewer than the 9 pages one read step needs (`ConfigQueryKeep`:
 `limitRangeLevels` at most 12,321). A staged removal's overlay is one of the four parts of its
-512-byte staging reservation (the decoded segment 64, its rebuilt copy 64, the overlay 176, the
+512-byte staging reservation (the decoded segment 68, its rebuilt copy 68, the overlay 176, the
 settlement's record 160), which construction checks against the constant (`ConfigRemovalStaging`).
 
 `arenaStatus` answers the arena's storage (ready, or paused with its cause), its reserved,
@@ -645,16 +645,16 @@ transaction of the model event it mirrors, and no production decision reads it:
 
 * **every accepted load job**, from its admission to its report (completed, failed or acknowledged),
   whether it is running, queued or waiting for victims: the resident reservation and the scratch the
-  model **granted** it at that moment (400 and 578 for a one-cell read in a fresh region), so a later
+  model **granted** it at that moment (404 and 579 for a one-cell read in a fresh region), so a later
   reduction while the job still holds them is seen (a stability check of the model against its own grant,
   not an expectation); and, once the owner **runs** it, the **least the job holds**, worked out from the
   coverage the owner is given to load and the data layer's own sizes and not from the model's cost
   functions (a column index entry is 48 bytes, a segment 32 of metadata and at least 2 of payload, the
-  scratch a 256-byte frame, two bytes a cell and the removed runs of every column it touches over the
-  region's 32 levels, 17 runs of 16 and a column entry of 48 for one cell: 82 and 578) together with the load-job slot (1 from its
+  scratch a 256-byte frame, two bytes and a tag bit a cell and the removed runs of every column it touches over the
+  region's 32 levels, 17 runs of 16 and a column entry of 48 for one cell: 82 and 579) together with the load-job slot (1 from its
   dispatch, 0 while it waits: a waiting job holds only a promise, so it contributes no expectation). The
   owner marks a job it runs and ends it with its report, so a model that forgets a running job is seen;
-* the **preparation** the owner is running (a removal's resident growth, 62 bytes, staging, 512, and
+* the **preparation** the owner is running (a removal's resident growth, 66 bytes, staging, 512, and
   edit record, 64, and the command record it reads under), from its start to the owner's safe point;
 * each outstanding **borrow**, the regions the snapshot handed out covers and the **accounted bytes it backs**
   (its payload, segment metadata and column index entries, measured on the snapshot value at hand-out, never
@@ -670,7 +670,7 @@ scheduling. The check requires: each region charged at least what its detail
 holds, and no region held by the service with no model record (nor charged, unless
 evicting, when the service holds none); the model charging no handoff duplicate for any region
 (nothing is transferred); a removal's resident growth at
-least the worst case of a segment (two bytes a cell for a dense segment, less the two bytes
+least the worst case of a segment (two bytes and a tag bit a cell for a dense segment, 68, less the two bytes
 of a uniform one) and its edit and staging reservations as stated; the staging bank's
 request records exactly what the service's requests hold; the command slots exactly the
 service's requests that hold a model record; and the snapshot holds exactly the service's
@@ -693,8 +693,8 @@ client end, before the owner resumes. The property ends with every bank, occupie
 every slot and every arena at zero: no charge outlives its holder.
 `Test.TerrainRuntime.Oracle` pins the record's literal amounts at a gated job (running and waiting),
 preparation, borrow and view, and holds the controls that must fail: a model that charges the running job
-1 byte of resident and 1 of scratch instead of 400 and 578 (and one byte short of each figure), a waiting job
-whose 400 and 578 were released while another job runs (and one byte short), a job the model forgot while it
+1 byte of resident and 1 of scratch instead of 404 and 579 (and one byte short of each figure), a waiting job
+whose 404 and 579 were released while another job runs (and one byte short), a job the model forgot while it
 runs, a 64-byte handoff duplicate charged that the owner never holds, a preparation whose request the model dropped
 or for which it reserved no growth, a borrow's hold shortened from two regions to one (the staging charge with
 it) or dropped, a view's description shortened or dropped, a model rebuilt without the arena beside the
