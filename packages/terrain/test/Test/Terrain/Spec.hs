@@ -5,6 +5,7 @@ import Test.Hspec (Spec, describe)
 import qualified Test.Terrain.Connectivity as Connectivity
 import qualified Test.Terrain.ConnectivityBounds as ConnectivityBounds
 import qualified Test.Terrain.Coordinate as Coordinate
+import qualified Test.Terrain.Corner as Corner
 import qualified Test.Terrain.Discovery as Discovery
 import qualified Test.Terrain.DiscoveryRegion as DiscoveryRegion
 import qualified Test.Terrain.Geometry as Geometry
@@ -27,6 +28,7 @@ spec = describe "Terrain" $ do
   Coordinate.spec
   Shape.spec
   Geometry.spec
+  Corner.spec
   Opening.spec
   Reference.spec
   Source.spec

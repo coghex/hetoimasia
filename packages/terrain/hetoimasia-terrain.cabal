@@ -4,10 +4,12 @@ version: 0.1.0.0
 synopsis: Checked terrain tile identity and canonical shape geometry for Hetoimasia
 description:
     Tile coordinates on three axes with a checked signed 64-bit range, exact
-    region and local decomposition by floor division, the sixteen-shape catalog
-    with exact quarter-turn rotation, and the canonical unit-cell solid of every
-    shape (identity 15 the central half-height peak) with its faces, face
-    coverage, point membership and ray and segment intersection, and the exact
+    region and local decomposition by floor division, the sixteen-shape side
+    catalog and the fifteen occupied corner masks with exact quarter-turn
+    rotation, and the canonical unit-cell solid of every side shape (identity
+    15 the central half-height peak) with its faces, face coverage, point
+    membership and ray and segment intersection, the convex pieces, external
+    facets and exact surface height of every occupied shape, and the exact
     empty components and portals of every shape with the connections between
     neighboring cells, all in exact rational arithmetic; the layered source, packed
     sparse resident detail and retained removals over them; and the pure
@@ -63,6 +65,7 @@ library
         Hetoimasia.Terrain.Internal.Connectivity.Limits
         Hetoimasia.Terrain.Internal.Connectivity.Prepare
         Hetoimasia.Terrain.Internal.Coordinate
+        Hetoimasia.Terrain.Internal.Corner
         Hetoimasia.Terrain.Internal.Discovery.Core
         Hetoimasia.Terrain.Internal.Discovery.Limits
         Hetoimasia.Terrain.Internal.Discovery.Records
@@ -97,6 +100,8 @@ test-suite terrain-tests
         Test.Terrain.ConnectivityFixtures
         Test.Terrain.ConnectivityOracle
         Test.Terrain.Coordinate
+        Test.Terrain.Corner
+        Test.Terrain.CornerOracle
         Test.Terrain.Discovery
         Test.Terrain.DiscoveryHarness
         Test.Terrain.DiscoveryRegion

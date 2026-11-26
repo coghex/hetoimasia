@@ -17,15 +17,17 @@
 -- boundary holding:
 --
 -- * the constructor of a checked value (an axis coordinate, a local offset, a
---   shape identity, a rotation count, a ray, a solid, an opening region, a cell's
+--   shape identity, a corner mask, a shape key, a rotation count, a convex
+--   piece, a ray, a solid, an opening region, a cell's
 --   openings, a component, a portal, a placed portal, a component reference, a
 --   portal connection, validated limits, the residency model or a coverage)
 --   cannot be named, so a
 --   client cannot build an out-of-range coordinate, an unsupported identity, an
 --   unnormalized turn, a ray with no direction or a forged solid: @GHC-10237@
 --   for an import, and @GHC-01928@ (an illegal term-level use of the type
---   constructor) for a use of the constructor in an expression;
--- * an exported accessor of a checked value (a solid or a ray) is a function,
+--   constructor) for a use of the constructor in an expression, and @GHC-88464@
+--   for a shape key's own constructors, which share no name with the type;
+-- * an exported accessor of a checked value (a solid, a convex piece or a ray) is a function,
 --   never a field label, and the fields of validated limits and of the model are
 --   not exported at all, so record-update syntax cannot rewrite one;
 -- * each private module is refused as a hidden module of the package's main
@@ -81,6 +83,16 @@ spec = describe "Terrain opacity across the package boundary" $ do
         clientOutput outcome `shouldContain` "Illegal term-level use of the type constructor"
         clientOutput outcome `shouldContain` name
 
+  -- A shape key has two constructors with names of their own, so a client that
+  -- imports only the type and applies one finds no such data constructor.
+  forM_ [("SideKey", "sideOf :: ShapeId → ShapeKey", "sideOf = SideKey"), ("CornerKey", "cornerOf :: CornerMask → ShapeKey", "cornerOf = CornerKey")] $ \(name, signature, definition) →
+    it ("rejects a client that forges a shape key with the constructor " <> name) $
+      withClient "Client.hs" (clientImporting ["import Hetoimasia.Terrain.Shape (CornerMask, ShapeId, ShapeKey)"] [signature, definition]) $ \compile → do
+        outcome ← compile Typecheck
+        rejectedBecause outcome "GHC-88464"
+        clientOutput outcome `shouldContain` "Data constructor not in scope"
+        clientOutput outcome `shouldContain` name
+
   forM_ recordUpdates $ \(name, imports, source) →
     it ("rejects a client that rewrites " <> name <> " with record-update syntax") $
       withClient "Client.hs" (clientImporting imports source) $ \compile → do
@@ -131,6 +143,7 @@ hidden =
   , "Hetoimasia.Terrain.Internal.Connectivity.Limits"
   , "Hetoimasia.Terrain.Internal.Connectivity.Prepare"
   , "Hetoimasia.Terrain.Internal.Coordinate"
+  , "Hetoimasia.Terrain.Internal.Corner"
   , "Hetoimasia.Terrain.Internal.Discovery.Core"
   , "Hetoimasia.Terrain.Internal.Discovery.Limits"
   , "Hetoimasia.Terrain.Internal.Discovery.Records"
@@ -155,7 +168,10 @@ constructors =
   [ ("AxisCoord", ["import Hetoimasia.Terrain.Coordinate (AxisCoord (AxisCoord))"], [])
   , ("LocalCoord", ["import Hetoimasia.Terrain.Coordinate (LocalCoord (LocalCoord))"], [])
   , ("ShapeId", ["import Hetoimasia.Terrain.Shape (ShapeId (ShapeId))"], [])
+  , ("CornerMask", ["import Hetoimasia.Terrain.Shape (CornerMask (CornerMask))"], [])
+  , ("ShapeKey", ["import Hetoimasia.Terrain.Shape (ShapeKey (CornerKey))"], [])
   , ("Turns", ["import Hetoimasia.Terrain.Shape (Turns (Turns))"], [])
+  , ("ConvexPiece", ["import Hetoimasia.Terrain.Geometry (ConvexPiece (ConvexPiece))"], [])
   , ("Ray", ["import Hetoimasia.Terrain.Geometry (Ray (Ray))"], [])
   , ("Solid", ["import Hetoimasia.Terrain.Geometry (Solid (Solid))"], [])
   , ("Opening", ["import Hetoimasia.Terrain.Opening (Opening (Opening))"], [])
@@ -191,7 +207,9 @@ forged ∷ [(String, [String], [String])]
 forged =
   [ ("AxisCoord", ["import Hetoimasia.Terrain.Coordinate (AxisCoord, TileCoord (..))"], ["outOfRange :: TileCoord", "outOfRange = TileCoord (AxisCoord 4611686018427387904) (AxisCoord 0) (AxisCoord 0)"])
   , ("ShapeId", ["import Hetoimasia.Terrain.Shape (ShapeId)"], ["unsupported :: ShapeId", "unsupported = ShapeId 99"])
+  , ("CornerMask", ["import Hetoimasia.Terrain.Shape (CornerMask)"], ["unsupported :: CornerMask", "unsupported = CornerMask 99"])
   , ("Turns", ["import Hetoimasia.Terrain.Shape (Turns)"], ["unnormalized :: Turns", "unnormalized = Turns 7"])
+  , ("ConvexPiece", ["import Hetoimasia.Terrain.Geometry (ConvexPiece)"], ["thin :: ConvexPiece", "thin = ConvexPiece [] []"])
   , ("Ray", ["import Hetoimasia.Terrain.Geometry (Ray, V3 (..))"], ["noDirection :: Ray", "noDirection = Ray (V3 0 0 0) (V3 0 0 0)"])
   , ("MaterialId", ["import Hetoimasia.Terrain.Cell (MaterialId)"], ["unchecked :: MaterialId", "unchecked = MaterialId \"\""])
   , ("ZRange", ["import Hetoimasia.Terrain.Cell (ZRange)"], ["inverted :: ZRange", "inverted = ZRange 5 5"])
@@ -233,6 +251,7 @@ recordUpdates =
   , ("solidFaces", ["import Hetoimasia.Terrain.Geometry (Solid, solidFaces)"], ["emptied :: Solid → Solid", "emptied s = s {solidFaces = []}"])
   , ("solidVertices", ["import Hetoimasia.Terrain.Geometry (Solid, solidVertices)"], ["emptied :: Solid → Solid", "emptied s = s {solidVertices = []}"])
   , ("solidShape", ["import Hetoimasia.Terrain.Geometry (Solid, solidShape)"], ["swapped :: Solid → Solid", "swapped s = s {solidShape = solidShape s}"])
+  , ("piecePlanes", ["import Hetoimasia.Terrain.Geometry (ConvexPiece, piecePlanes)"], ["emptied :: ConvexPiece → ConvexPiece", "emptied p = p {piecePlanes = []}"])
   , -- Opening values are read through functions only: no field label rewrites an
     -- opening, a component, a portal or the area of a connection.
     ("portalOpening", ["import Hetoimasia.Terrain.Opening (Portal, portalOpening)"], ["widened :: Portal → Portal", "widened p = p {portalOpening = undefined}"])
@@ -284,6 +303,14 @@ supportedClient =
     , "  print (axisFromInteger 4611686018427387904)"
     , "  print (fmap shapeIdValue (mkShapeId 15))"
     , "  print (mkShapeId 16)"
+    , "  print (mkCornerMask 16)"
+    , "  case mkCornerMask 5 of"
+    , "    Left e -> print e"
+    , "    Right m -> do"
+    , "      print (fmap (length . convexPieces) (resolveCorner m))"
+    , "      print (surfaceHeight (resolveCorner m) (1/2) (1/2))"
+    , "      print (surfaceHeight (resolveCorner m) 2 0)"
+    , "  print (length allShapeKeys)"
     , "  case tileCoord (-1) 0 (-33) of"
     , "    Left e -> print e"
     , "    Right t -> let (RegionCoord rx _ rz, l) = decomposeTile t in print (rx, rz, localX l, localZ l)"
@@ -327,6 +354,11 @@ supportedOutput =
   , "Left (AxisOutOfRange 4611686018427387904)"
   , "Right 15"
   , "Left (UnsupportedShapeId 16)"
+  , "Left (UnsupportedCornerMask 16)"
+  , "Just 2"
+  , "Right (Just (0 % 1))"
+  , "Left OutsideCellSquare"
+  , "31"
   , "(-1,-2,15,31)"
   , "5"
   , "Interior"

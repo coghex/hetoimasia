@@ -4,11 +4,23 @@
 -- slope set: bit 1 is North, 2 East, 4 South and 8 West, with North toward
 -- negative Y and East toward positive X. The canonical names are
 -- @0 Flat; 1 N; 2 E; 3 NE; 4 S; 5 NS; 6 ES; 7 NES; 8 W; 9 NW; 10 EW;
--- 11 NEW; 12 SW; 13 NSW; 14 ESW; 15 NESW@. Identities 0 and 15 stay distinct
--- authored identities even though both have a flat top, and NS and EW stay
--- distinct from each other. An identity outside @0..15@ is refused by
--- 'mkShapeId'; it is never normalized to flat, and no other catalog is
--- substituted.
+-- 11 NEW; 12 SW; 13 NSW; 14 ESW; 15 NESW@. Identity 0 is the full block with a
+-- flat top. Identity 15 is the four-sided peak: its edges are at the base and
+-- its apex, at the centre, is at height one half. NS and EW stay distinct from
+-- each other. An identity outside @0..15@ is refused by 'mkShapeId'; it is
+-- never normalized to flat, and no other catalog is substituted.
+--
+-- = Corner masks and shape keys
+--
+-- A 'CornerMask' is the second, independent family: a four-bit set of the
+-- corners of a cell that reach the next level, bit 1 the north-west corner, 2
+-- the north-east, 4 the south-east and 8 the south-west. Mask 0 has no solid,
+-- so 'resolveCorner' gives air for it, and every other mask has its own
+-- 'ShapeKey'. A 'ShapeKey' names one occupied shape by family and value, so
+-- side identity 0 and corner mask 15 are two different full blocks, and
+-- 'allShapeKeys' lists the 31 occupied keys. A mask outside @0..15@ is refused
+-- by 'mkCornerMask'. A positive quarter turn moves each set corner north-west
+-- to north-east to south-east to south-west ('rotateKey').
 --
 -- Rotation permutes the four bits. A positive quarter turn takes North to East
 -- to South to West; four turns restore the starting shape. The world identity
@@ -24,6 +36,16 @@ module Hetoimasia.Terrain.Shape
   , shapeIdValue
   , allShapeIds
   , shapeName
+
+    -- * Corner masks and shape keys
+  , CornerMask
+  , mkCornerMask
+  , cornerMaskValue
+  , ShapeKey
+  , sideKey
+  , resolveCorner
+  , allShapeKeys
+  , rotateKey
 
     -- * Sides and the mask
   , Side (..)
