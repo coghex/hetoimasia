@@ -10,7 +10,7 @@ description:
     15 the central half-height peak) with its faces, face coverage, point
     membership and ray and segment intersection, the convex pieces, external
     facets and exact surface height of every occupied shape, and the exact
-    empty components and portals of every shape with the connections between
+    empty components and portals of every side shape with the connections between
     neighboring cells, all in exact rational arithmetic; the layered source, packed
     sparse resident detail and retained removals over them; and the pure
     residency and admission model that decides, under validated bounded limits,
