@@ -750,8 +750,8 @@ cornerCatalogSpec = describe "the openings of the corner keys" $ do
       length (cellComponents ops) `shouldBe` 1
       forM_ (cellComponents ops) $ \component → do
         map portalComponent (componentPortals component) `shouldSatisfy` all (== componentIndex component)
-        map portalFace (componentPortals component) `shouldBe` [face | face ← faceOrder, faceArea ops face > 0]
-      concatMap componentPortals (cellComponents ops) `shouldBe` cellPortals ops
+        sort (map portalFace (componentPortals component)) `shouldBe` sort [face | face ← faceOrder, faceArea ops face > 0]
+      sort (map portalFace (concatMap componentPortals (cellComponents ops))) `shouldBe` sort (map portalFace (cellPortals ops))
   it "splits every corner opening into convex pieces with area and no common interior" $
     forM_ [1 .. 15] $ \mask →
       forM_ (cellPortals (cornerOps mask)) $ \portal → do
@@ -760,14 +760,16 @@ cornerCatalogSpec = describe "the openings of the corner keys" $ do
           length piece `shouldSatisfy` (>= 3)
           signedArea piece `shouldSatisfy` (> 0)
         sum (map signedArea pieces) `shouldBe` openingArea (portalOpening portal)
-        [p | p ← lattice, length [() | piece ← pieces, inside piece p] > 1] `shouldBe` []
+        -- No sample point is strictly inside two pieces; a point on the seam between
+        -- two pieces belongs to both closed pieces and is not an overlap.
+        [p | p ← lattice, length [() | piece ← pieces, strictlyInside piece p] > 1] `shouldBe` []
   it "turns with rotateOpenings: the turned key's openings, four turns restoring the original, and every open point on the turned face" $
     forM_ [1 .. 15] $ \mask → do
-      rotateOpenings (turns 4) (cornerOps mask) `shouldBe` cornerOps mask
+      observe (rotateOpenings (turns 4) (cornerOps mask)) `shouldBe` observe (cornerOps mask)
       forM_ [0 .. 3] $ \count → do
-        rotateOpenings (turns count) (cornerOps mask) `shouldBe` cornerOps (turnMask count mask)
-        rotateOpenings (turns 1) (rotateOpenings (turns count) (cornerOps mask))
-          `shouldBe` rotateOpenings (turns (count + 1)) (cornerOps mask)
+        observe (rotateOpenings (turns count) (cornerOps mask)) `shouldBe` observe (cornerOps (turnMask count mask))
+        observe (rotateOpenings (turns 1) (rotateOpenings (turns count) (cornerOps mask)))
+          `shouldBe` observe (rotateOpenings (turns (count + 1)) (cornerOps mask))
       forM_ [1 .. 3] $ \count →
         forM_ faceOrder $ \face → do
           let turnedOps = rotateOpenings (turns count) (cornerOps mask)
@@ -780,8 +782,19 @@ cornerCatalogSpec = describe "the openings of the corner keys" $ do
         `shouldBe` []
   where
     signedArea piece = sum (zipWith (\(a, b) (c, d) → a * d - b * c) piece (drop 1 piece <> take 1 piece)) / 2
-    inside piece p = all (\(a, b) → turnOf a b p >= 0) (zip piece (drop 1 piece <> take 1 piece))
+    strictlyInside piece p = all (\(a, b) → turnOf a b p > 0) (zip piece (drop 1 piece <> take 1 piece))
     turnOf (ax, ay) (bx, by) (cx, cy) = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
+
+-- | The observable content of a cell's openings: its key, and for each face the
+-- area and the open lattice and grid points, plus which faces each component
+-- owns. Decomposition into convex pieces and enumeration order are not part of
+-- it, so two decompositions of one region are equal here.
+observe ∷ CellOpenings → (Maybe ShapeKey, [(FaceKind, Rational, [P2])], [[FaceKind]])
+observe ops =
+  ( openingsKey ops
+  , [(face, faceArea ops face, [p | p ← lattice <> boundaryGrid, faceHolds ops face p]) | face ← faceOrder]
+  , sort (map (sort . map portalFace . componentPortals) (cellComponents ops))
+  )
 
 -- | The worked examples of D-4: the bank, the valleys, the plateau and the open
 -- space under and above them.
