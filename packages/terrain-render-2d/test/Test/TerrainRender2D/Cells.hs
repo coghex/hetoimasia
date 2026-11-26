@@ -179,6 +179,13 @@ cornerKeys = describe "a corner key against the side-only map catalog" $ do
     it ("still covers an undiscovered corner cell with generic full fog at " <> show facing <> ", whose truth is never read") $ \assets → do
       let plan = planScene assets (cornerScene facing CellUndiscovered 6)
       map summary (cellPlanQuads plan) `shouldBe` [(PartFog, Nothing, ColourBlank, MapKey Ordinary (shapeNo 0))]
+  it "refuses nothing for a corner cell that is not drawn: one past the viewport edge leaves a visible side block's plan as it was" $ \assets → do
+    let plan cell =
+          sceneFrom FaceSouth 0 0 0 (source (SourceSpec ["stone"] [] [PatchSpec 0 0 0 1 (SpecSolid "stone" 0), PatchSpec 3 (-2) 0 1 cell]))
+            (knowledgeOf 1 CellDiscovered [(0, 0, 0, CellDiscovered), (3, -2, 0, CellDiscovered)]) AllKnown
+        quads cell = map summary . cellPlanQuads <$> planSceneWith assets (plan cell)
+    quads (SpecCorner "stone" 1) `shouldBe` quads (SpecSolid "stone" 0)
+    quads (SpecCorner "stone" 1) `shouldSatisfy` either (const False) ((== 1) . length)
   it "refuses the whole request when one corner cell shares it with side cells, and leaves an all-side request as it was" $ \assets → do
     let mixed =
           sceneFrom FaceSouth 0 0 0 (source (SourceSpec ["stone"] [] [PatchSpec 0 0 0 1 (SpecSolid "stone" 3), PatchSpec 1 0 0 1 (SpecCorner "stone" 9)]))

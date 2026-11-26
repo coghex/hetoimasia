@@ -330,7 +330,8 @@ data CellError
   | -- | Knowledge says a solid is known where the terrain holds air.
     CellInconsistentKnowledge !Column !Integer
   | -- | Known solid whose shape key the side-only map catalog has no entry
-    -- for, a corner key; no quad is produced for the request. The map keeps
+    -- for, a corner key; drawing such a cell produces no quad and refuses the request, while a corner cell that is not drawn, or is
+    -- only a neighbour whose occlusion is asked about, refuses nothing. The map keeps
     -- its side entries, so a side key never raises this.
     CellUnsupportedShapeKey !ShapeKey
   | -- | A value could not be represented in the target.
@@ -588,6 +589,9 @@ data CState
   | SPend
   | SOrd !MaterialId !ShapeId
   | SMix !MaterialId !ShapeId
+  | -- A known solid whose key the side-only catalog has no map for: it proves no occlusion, and is refused only
+    -- where a quad of it would be drawn.
+    SUnsupported !ShapeKey
   deriving stock (Eq, Show)
 
 data SRun = SRun !Integer !Integer !CState
@@ -746,6 +750,7 @@ emits ∷ CState → Bool
 emits SFog = True
 emits (SOrd _ _) = True
 emits (SMix _ _) = True
+emits (SUnsupported _) = True
 emits _ = False
 
 -- Whether a state's drawn coverage is proved to be the whole hexagon, so that
@@ -828,7 +833,7 @@ statesOf inputs camera offset lo hi
     classify _ CellDiscovered (FRun a b FAir) = Right (SRun a b SAir)
     classify column _ (FRun a _ FAir) = Left (CellInconsistentKnowledge column a)
     classify _ state (FRun a b (FSolid m key)) = case keySide key of
-      Nothing → Left (CellUnsupportedShapeKey key)
+      Nothing → Right (SRun a b (SUnsupported key))
       Just s
         | state == CellDiscovered → Right (SRun a b (SOrd m s))
         | otherwise → Right (SRun a b (if isJust (lookupMixed (lookupFor facing s)) then SMix m s else SOrd m s))
@@ -850,6 +855,7 @@ fogShape = either (error . ("Hetoimasia.Terrain.Render2D.Cells: " <>) . show) id
 partsOf ∷ CellInputs → CellPrep → Envelope → Offset → (Integer, CState) → Either CellError [RawQuad]
 partsOf inputs st env (rx, ry) (z, state) = case state of
   SFog → one PartFog Nothing ColourBlank (lookupFullFog (lookupFor facing fogShape)) 0
+  SUnsupported key → Left (CellUnsupportedShapeKey key)
   SOrd m shape → do
     needColour m
     one PartOrdinary (Just m) (ColourMaterial m) (lookupOrdinary (lookupFor facing shape)) 1

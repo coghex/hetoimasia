@@ -49,6 +49,15 @@ spec = describe "#661's records replayed through the page-resident store" $ do
     (r2, _) ← must (drain r1)
     pendingObligations (storeHeader (hStore (runH r2))) `shouldBe` 0
     must (compareKnowledge r2 [tileAt x y z | (x, y, z) ← probes])
+    -- a fresh window holds no page: the cells the mixed edit touched read as unavailable (a record the provider has not supplied), never
+    -- as unknown or as air, and the same reads match the pure reference once the pages are supplied
+    let held = runH r2
+        freshProvider = either (error . show) id (providerAt (hStore held) (storeWindow (hStore held)))
+        withheld tile = observedValue (queryCell (runEnv r2) freshProvider tile)
+        isUnavailable = \case Left (MissingRecord _) → True; _ → False
+    [t | (x, y, z) ← probes, let t = tileAt x y z, isUnavailable (withheld t)] `shouldSatisfy` (not . null)
+    forM_ [tileAt 2 0 5, tileAt 4 0 4] $ \t → withheld t `shouldSatisfy` isUnavailable
+    must (compareKnowledge r2 [tileAt 2 0 5, tileAt 4 0 4, tileAt 1 0 5, tileAt 1 0 6, tileAt 1 0 7])
     -- the cave behind the opened west wall is a known void, and the corner bank in its floor is a known
     -- solid under a known void
     must (knowledgeThrough (runH r2) (\p → known p (tileAt 2 0 5))) `shouldReturn` CellKnowledge NoSolid VoidKnown
