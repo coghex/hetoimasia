@@ -1651,17 +1651,24 @@ finish env restore result = do
         void (guarded (restore (forwardFinal env)))
     else do
       unless cancelled ended
-      -- (a negative control: the call waits for the writer to write the queue, as a blocking wait; a composition that
-      -- asked for the delivery of the closing notes waits the same way, unless the caller was cancelled)
-      if removed env ProtectAbandon || (envClosing env == CloseDelivered && not cancelled)
-        then probeAt env WriterWait >> void (guarded (True <$ restore (awaitWritten env)))
-        else unless cancelled (grace env)
-      -- the cut-off: one commit closes the queue and records what was not acknowledged; then the writer is cancelled, and
-      -- nothing waits for it. A cancellation that arrived during the wait is the cause as much as one that came before.
-      cancelledNow ← any (isAsync . rtCaught) <$> readIORef (envRetained env)
-      boundary env CuttingOff
-      void . commit session . DiagCutOff $
-        if cancelledNow then "the caller was cancelled" else "the session returned with the diagnostics writer still working"
+      -- (a negative control: the call waits for the writer to write the queue, as a blocking wait, and then cuts off in a
+      -- transaction of its own)
+      when (removed env ProtectAbandon) $ void (guarded (True <$ (probeAt env WriterWait >> restore (awaitWritten env))))
+      -- A composition that asked for the delivery of its closing notes waits for the writer and cuts the queue off in the
+      -- same transaction that finds it empty (or the writer ended), so that a note accepted meanwhile is not cut off
+      -- undelivered. A cancellation, at the probe or in the wait, is retained, and the plain cut-off below is made at once.
+      cutOff ←
+        if envClosing env == CloseDelivered && not cancelled && not (removed env ProtectAbandon)
+          then guarded (True <$ (probeAt env WriterWait >> restore (atomically settledCutOff)))
+          else False <$ unless (cancelled || removed env ProtectAbandon) (grace env)
+      unless cutOff $ do
+        -- the cut-off: one commit closes the queue and records what was not acknowledged. A cancellation that arrived
+        -- during the wait is the cause as much as one that came before.
+        cancelledNow ← any (isAsync . rtCaught) <$> readIORef (envRetained env)
+        boundary env CuttingOff
+        void . commit session . DiagCutOff $
+          if cancelledNow then "the caller was cancelled" else "the session returned with the diagnostics writer still working"
+      -- then the writer is cancelled, and nothing waits for it
       abandonWriter env
   raiseRetained env
   atomically (outcomeOf <$> readTVar (sessionState session))
@@ -1669,6 +1676,12 @@ finish env restore result = do
     session = envSession env
     -- an exception that lands outside the forwarding itself is retained like any other, and ends the forwarding
     guarded action = tryWithContext @SomeException action >>= either (\failure → False <$ retain env failure) pure
+    -- the queue is empty (every note acknowledged) or the writer has ended: cut the queue off in that same transaction
+    settledCutOff = do
+      over ← readTVar (wrEnded (envWriter env))
+      state ← readTVar (sessionState session)
+      check (over || not (diagnosticsUnsettled state))
+      void (commitSTM session (DiagCutOff "the session returned with the diagnostics writer still working"))
     -- the verdict is said once everything before it has been done
     ended = do
       outcome ← atomically (outcomeOf <$> readTVar (sessionState session))

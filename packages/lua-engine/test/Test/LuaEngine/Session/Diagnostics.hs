@@ -258,6 +258,25 @@ closingNotes = describe "the closing notes of the session" $ do
       awaitWriterEnd session
       letGo held
 
+  it "still cut the writer off and say why when the cancellation arrives while the driver is held at the point before the wait" $
+    withSetup (setup (roleScript printScript)) $ \env → do
+      held ← holding ["start gate opened"]
+      recorder ← newRecorder
+      holdAt recorder WriterWait
+      (ended, session) ← runCaughtWith CloseDelivered (loggedBy held env) (recordingHarness recorder noHarness) $ \driver session → (`onException` (letGo held >> releaseHold recorder WriterWait)) $ do
+        awaitEntered held "start gate opened"
+        requestStop session StopQuit
+        awaitPoint recorder WriterWait
+        throwTo driver ThreadKilled
+        releaseHold recorder WriterWait
+      raisedKilled ended `shouldBe` True
+      found ← outcomeNow session
+      outRetired found `shouldBe` True
+      deCause (outDiagnostics found) `shouldBe` Just "the caller was cancelled"
+      undelivered found `shouldSatisfy` elem "session ended"
+      awaitWriterEnd session
+      letGo held
+
 -- The classes of site ------------------------------------------------------------------------------------------------
 
 classes ∷ Spec

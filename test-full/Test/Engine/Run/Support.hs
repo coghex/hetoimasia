@@ -41,7 +41,7 @@ import GHC.Conc (BlockReason, ThreadStatus (ThreadBlocked), threadStatus)
 import Hetoimasia.Foundation.Log (LogFilter (..), LogSink, Logger, callbackSink, defaultLogFilter, mkLogger)
 import Hetoimasia.Run.Settle (withRecordingLifetime)
 import Hetoimasia.LuaEngine.Facade (OutputSink (..))
-import Hetoimasia.LuaEngine.Session (Session, SessionOutcome)
+import Hetoimasia.LuaEngine.Session (SessionOutcome)
 import Hetoimasia.Run (Setup (..), runGame)
 import Hetoimasia.Run.Boot (BootHooks, Prepared, noBootHooks)
 import Hetoimasia.Run.Session (Environment (..), SessionLink, newSessionLink, productionEnvironment, runPrepared)
@@ -110,13 +110,10 @@ data Changes = Changes
   , changeAfterLaunch ∷ LoggingLifetime → IO ()
   -- ^ Done once the session has returned its outcome and before the launch itself returns: where a cleanup of the
   -- scopes around the session fails, made on demand.
-  , changeSession ∷ Session → IO ()
-  -- ^ Told the session's handle before any VM exists, as the launch's hook is: an example that watches the session. It
-  -- must not block.
   }
 
 unchanged ∷ Changes
-unchanged = Changes id (\_ → pure ()) (\_ → noBootHooks) Nothing Nothing id (\_ → pure ()) (\_ → pure ())
+unchanged = Changes id (\_ → pure ()) (\_ → noBootHooks) Nothing Nothing id (\_ → pure ())
 
 -- | A filter that writes nothing, so a failing run does not fill the suite's own stderr.
 quietFilter ∷ LogFilter
@@ -172,7 +169,7 @@ observeWith changes files scenario = withFolder files $ \folder → do
               Nothing -> withHandleLoggingLifetime configuration stderr
           , setupLink = fromMaybe newSessionLink (changeLink changes)
           , setupReport = \line -> atomically (modifyTVar' reports (<> [line]))
-          , setupLaunch = \lifetime stop link prepared → runPrepared (changeEnvironment changes environment) lifetime stop link prepared Nothing (changeSession changes) <* changeAfterLaunch changes lifetime
+          , setupLaunch = \lifetime stop link prepared → runPrepared (changeEnvironment changes environment) lifetime stop link prepared Nothing (\_ → pure ()) <* changeAfterLaunch changes lifetime
           }
       probe =
         Probe

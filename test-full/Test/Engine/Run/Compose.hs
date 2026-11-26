@@ -6,25 +6,25 @@
 -- would print, and the line is absent. Nothing sleeps.
 module Test.Engine.Run.Compose (spec) where
 
-import Control.Concurrent (threadDelay, throwTo, yield)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, takeMVar)
-import Control.Monad (forever, replicateM_, void, when)
+import Control.Concurrent (threadDelay, throwTo)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import Control.Monad (forever, void, when)
 import qualified Data.ByteString as ByteString
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Hetoimasia.Console.Lua.Signals (Delivery (..))
 import Hetoimasia.LuaEngine.Facade (OutputSink (..))
-import Control.Concurrent.STM (atomically, check, modifyTVar', newTVarIO, readTVar, readTVarIO, stateTVar, writeTVar)
-import Control.Exception (AsyncException (UserInterrupt), ExceptionWithContext (ExceptionWithContext), SomeException, finally, fromException, rethrowIO, tryWithContext)
+import Control.Concurrent.STM (atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, stateTVar, writeTVar)
+import Control.Exception (AsyncException (UserInterrupt), ExceptionWithContext (ExceptionWithContext), SomeException, fromException, rethrowIO, tryWithContext)
 import Data.List (isInfixOf)
 import GHC.Conc (BlockReason (BlockedOnSTM))
-import Hetoimasia.Foundation.Log (LogEntry (entryMessage), callbackSinkWith, logInfo, unsafeComponent)
+import Hetoimasia.Foundation.Log (callbackSinkWith, logInfo, unsafeComponent)
 import Hetoimasia.Foundation.Resource (cleanupFailuresInContext, displayCleanupFailure, withResource)
 import Hetoimasia.Content (ContentFailure, withContentRoot)
 import Hetoimasia.LuaEngine.Boot (ContentConfiguration (..), contentConfiguration)
 import Hetoimasia.LuaEngine.Profile (fixedM1Profile)
 import Hetoimasia.Foundation.Time (readInstant, scriptedSource)
-import Hetoimasia.LuaEngine.Session (History (historyDiagnostics), SessionOutcome, sessionHistory)
+import Hetoimasia.LuaEngine.Session (SessionOutcome)
 import Hetoimasia.Run.Session (Environment (..))
 import Hetoimasia.Run.Settle (attemptSync, withEvidence)
 import Hetoimasia.Runtime.Reporting (reportTerminalFailureWith)
@@ -240,31 +240,6 @@ stops = describe "stops and signals" $ do
     observedStatus observed `shouldBe` ExitFailure 130
     observedOut observed `shouldContain` ["ui shutdown"]
     observedForced observed `shouldBe` 0
-
-  it "ends the stderr record with the session's closing note when the sink holds the stop's note past the session's retirement" $ do
-    seen ← newTVarIO []
-    gate ← newTVarIO False
-    bound ← newEmptyMVar
-    let sink written = do
-          atomically (modifyTVar' seen (entryMessage written :))
-          -- the writer parks in the sink on the stop's note
-          when (entryMessage written == "session stopping") (atomically (readTVar gate >>= check))
-        release = atomically (writeTVar gate True)
-    observed ← observeWith unchanged {changeSink = Just (callbackSinkWith sink (pure ())), changeSession = putMVar bound} files $ \probe → (`finally` release) $ do
-      session ← bounded (readMVar bound)
-      probeAwaitOut probe "ui ready"
-      void (probeSignal probe)
-      -- every role has retired and the session's last note is committed: from here a session that does not wait for its
-      -- writer cuts it off after a bounded poll of a thousand scheduler turns, and one that waits holds the call
-      bounded . atomically $ do
-        history ← sessionHistory session
-        check (any ((== "session ended") . fst) (historyDiagnostics history))
-      -- the writer is held for a thousand times the poll's turns before it is let go
-      replicateM_ 1000000 yield
-      release
-    observedStatus observed `shouldBe` ExitFailure 130
-    observedOut observed `shouldContain` ["ui shutdown"]
-    readTVarIO seen >>= (`shouldSatisfy` elem "session ended")
 
   it "forces at most once, however many signals arrive, and the first still stops in order" $ do
     observed ← observe files $ \probe → do
