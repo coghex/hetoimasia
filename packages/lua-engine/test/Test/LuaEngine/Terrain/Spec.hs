@@ -29,6 +29,7 @@ import Test.Hspec (Spec, around_, beforeAll_, describe, runIO)
 import Test.Support.Capabilities (PassSetting, enterPass, inPass, passLine)
 import qualified Test.LuaEngine.Terrain.Basics as Basics
 import qualified Test.LuaEngine.Terrain.Composition as Composition
+import qualified Test.LuaEngine.Terrain.Corners as Corners
 import qualified Test.LuaEngine.Terrain.Domain as Domain
 import qualified Test.LuaEngine.Terrain.Fixture as Fixture
 import qualified Test.LuaEngine.Terrain.HostPublished as HostPublished
@@ -62,6 +63,7 @@ entries =
   , Entry "Fixture" rig Fixture.spec
   , Entry "Composition" rig Composition.spec
   , Entry "Validation" rig Validation.spec
+  , Entry "Corners" (rig <> ", a corner-mask definition authored in Lua against the native reads") Corners.spec
   , Entry "Domain" rig Domain.spec
   , Entry "Ownership" rig Ownership.spec
   , Entry "Names" rig Names.spec

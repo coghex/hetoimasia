@@ -94,6 +94,7 @@ import Hetoimasia.LuaEngine.Facade
   , TerrainPatch (..)
   , TerrainPatchValue (..)
   , TerrainServices (..)
+  , TerrainShape (..)
   , TerrainStart (..)
   , TerrainVm (..)
   , terrainArenaType
@@ -1068,11 +1069,14 @@ sourceSpec definition =
     , specPatches = map patch (tdPatches definition)
     }
   where
-    layer l = LayerSpec (toInteger <$> tlMin l) (toInteger <$> tlMax l) (Text.unpack (tlMaterial l)) (fromIntegral (tlShape l))
+    layer l = case tlShape l of
+      ShapeSide shape → LayerSpec (toInteger <$> tlMin l) (toInteger <$> tlMax l) (Text.unpack (tlMaterial l)) (fromIntegral shape)
+      ShapeCorner corners → CornerLayerSpec (toInteger <$> tlMin l) (toInteger <$> tlMax l) (Text.unpack (tlMaterial l)) (fromIntegral corners)
     patch p = PatchSpec (toInteger (tpX p)) (toInteger (tpY p)) (toInteger (tpMin p)) (toInteger (tpMax p)) (value (tpValue p))
     value = \case
       PatchAir → SpecAir
-      PatchSolid material shape → SpecSolid (Text.unpack material) (fromIntegral shape)
+      PatchSolid material (ShapeSide shape) → SpecSolid (Text.unpack material) (fromIntegral shape)
+      PatchSolid material (ShapeCorner corners) → SpecCorner (Text.unpack material) (fromIntegral corners)
 
 tileOf ∷ TerrainCell → Either Text TileCoord
 tileOf (TerrainCell x y z) = either (const (Left "the cell is outside the supported range")) Right (tileCoord (toInteger x) (toInteger y) (toInteger z))
