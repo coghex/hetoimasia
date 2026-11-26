@@ -712,11 +712,16 @@ evaluateColumn inputs st env (v, u) budget
       | otherwise = cur
 
     admit cur unit = case unit of
+      -- A cell the plan has no room for halts before its map is asked for, so
+      -- a corner key waiting behind the limit stays unresolved and the quads
+      -- already admitted survive. An unsupported cell draws at least one quad.
+      UCell _ s
+        | prLevels cur + 1 > clLevels limits → pure (Left HaltLevels)
+        | unsupported s && prCount cur + 1 > clInstances limits → pure (Left HaltInstances)
       UCell z s → do
         quads ← partsOf inputs cur env (rx, ry) (z, s)
         pure $
           if
-            | prLevels cur + 1 > clLevels limits → Left HaltLevels
             | prCount cur + length quads > clInstances limits → Left HaltInstances
             | otherwise →
                 Right
@@ -745,6 +750,10 @@ evaluateColumn inputs st env (v, u) budget
                       }
                   , 1
                   )
+
+unsupported ∷ CState → Bool
+unsupported (SUnsupported _) = True
+unsupported _ = False
 
 emits ∷ CState → Bool
 emits SFog = True

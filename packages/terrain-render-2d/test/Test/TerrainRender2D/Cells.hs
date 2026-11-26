@@ -186,6 +186,15 @@ cornerKeys = describe "a corner key against the side-only map catalog" $ do
         quads cell = map summary . cellPlanQuads <$> planSceneWith assets (plan cell)
     quads (SpecCorner "stone" 1) `shouldBe` quads (SpecSolid "stone" 0)
     quads (SpecCorner "stone" 1) `shouldSatisfy` either (const False) ((== 1) . length)
+  it "halts at an exhausted level or instance limit before a corner cell's map is asked for, keeping the quads already admitted" $ \assets → do
+    let scene cell =
+          sceneFrom FaceSouth 0 0 0 (source (SourceSpec ["stone"] [] [PatchSpec 1 0 0 1 (SpecSolid "stone" 0), PatchSpec 0 0 0 1 cell]))
+            (knowledgeOf 1 CellDiscovered [(1, 0, 0, CellDiscovered), (0, 0, 0, CellDiscovered)]) AllKnown
+        limited f s = s {sceneConfig = (sceneConfig s) {ccLimits = f (ccLimits (sceneConfig s))}}
+        outcome limit cell = fmap (\plan → (cellPlanProgress plan, map summary (cellPlanQuads plan))) (planSceneWith assets (limited limit (scene cell)))
+    forM_ [("levels", \l → l {clLevels = 1}, HaltLevels), ("instances", \l → l {clInstances = 1}, HaltInstances)] $ \(_, limit, halt) → do
+      outcome limit (SpecCorner "stone" 1) `shouldBe` outcome limit (SpecSolid "stone" 0)
+      outcome limit (SpecCorner "stone" 1) `shouldSatisfy` either (const False) (\(progress, quads) → progress == Halted halt && length quads == 1)
   it "refuses the whole request when one corner cell shares it with side cells, and leaves an all-side request as it was" $ \assets → do
     let mixed =
           sceneFrom FaceSouth 0 0 0 (source (SourceSpec ["stone"] [] [PatchSpec 0 0 0 1 (SpecSolid "stone" 3), PatchSpec 1 0 0 1 (SpecCorner "stone" 9)]))
