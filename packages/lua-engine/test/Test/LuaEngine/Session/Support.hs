@@ -33,6 +33,7 @@ module Test.LuaEngine.Session.Support
   , letScenarioGo
   , withOwnedThreadsOpening
   , runCaught
+  , runCaughtWith
   , Caught
   , historyNow
   , outcomeMessages
@@ -330,13 +331,17 @@ type Caught = ExceptionWithContext SomeException
 -- always waited for, and what it raises is raised here: a failed assertion in it is never swallowed. A session that
 -- never exposed its handle (its entry was refused) cannot be run with this.
 runCaught ∷ SessionEnv → Harness → (ThreadId → Session → IO ()) → IO (Either Caught SessionOutcome, Session)
-runCaught env harness scenario = do
+runCaught = runCaughtWith CloseBounded
+
+-- | 'runCaught' for a session that ends as this 'Closing' says.
+runCaughtWith ∷ Closing → SessionEnv → Harness → (ThreadId → Session → IO ()) → IO (Either Caught SessionOutcome, Session)
+runCaughtWith closing env harness scenario = do
   driver ← myThreadId
   handleVar ← newEmptyMVar
   resultVar ← newEmptyMVar
   -- Owned by the call (#599): ended and joined however the call ends, with the held sink and the reader's gates let go first.
   ended ← withOwnedThreadOpening (letScenarioGo env) (scenarioThread driver handleVar resultVar) $ \thread terminated → do
-    ended ← tryWithContext @SomeException (runSession (scenarioSpec env harness) (putMVar handleVar))
+    ended ← tryWithContext @SomeException (runSessionWith closing (scenarioSpec env harness) (putMVar handleVar))
     finished ← try (bounded (readMVar resultVar))
     case finished of
       Left (ErrorCall why) → do

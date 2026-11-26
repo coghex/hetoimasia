@@ -93,6 +93,7 @@ module Hetoimasia.LuaEngine.Session.State
   , Diag (..)
   , pendingDiagnostics
   , diagnosticsOutstanding
+  , diagnosticsUnsettled
   , quiet
 
     -- * Transitions
@@ -376,6 +377,11 @@ pendingDiagnostics state = [diag | diag ← toList (stDiags state), dgState diag
 -- it is kept as data, counted as undelivered at the cut-off, and is not written again.
 diagnosticsOutstanding ∷ SessionState → Bool
 diagnosticsOutstanding state = any ((`elem` [DiagPending, DiagInFlight]) . dgState) (toList (stDiags state))
+
+-- | Whether any diagnostic is still in the queue in any state: only an acknowledged one leaves it, so a failed or an
+-- interrupted one (which the writer then records and ends on) is unsettled until the writer has ended.
+diagnosticsUnsettled ∷ SessionState → Bool
+diagnosticsUnsettled = not . null . stDiags
 
 -- Transitions ---------------------------------------------------------------------------------------
 

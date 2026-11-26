@@ -65,7 +65,8 @@ import Hetoimasia.Foundation.Time (MonotonicSource, monotonicSource)
 import Hetoimasia.LuaEngine.Facade (GraphicsInjection, OutputSink, withOutput)
 import Hetoimasia.LuaEngine.Profile (Count (Count), CountLimit (IoWorkers), countLimit)
 import Hetoimasia.LuaEngine.Session
-  ( RoleFailure
+  ( Closing (CloseDelivered)
+  , RoleFailure
   , Session
   , SessionOutcome
   , SessionSpec (..)
@@ -73,7 +74,7 @@ import Hetoimasia.LuaEngine.Session
   , latchTerminalFailure
   , noHarness
   , requestStop
-  , runSession
+  , runSessionWith
   , sessionDiagnosticsEnded
   )
 import Hetoimasia.LuaEngine.Texture
@@ -260,4 +261,4 @@ runPrepared environment lifetime stop link prepared graphics hook =
                   thread ← forkIO (atomically (stop >>= check) >> requestStop session StopInterrupt)
                   writeIORef forwarder (Just thread)
               endForwarder = readIORef forwarder >>= mapM_ killThread
-          runSession spec callback `finally` endForwarder
+          runSessionWith CloseDelivered spec callback `finally` endForwarder
