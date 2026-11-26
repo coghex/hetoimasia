@@ -657,6 +657,7 @@ runCore rig shape scenario = do
                     , sxHarness = noHarness
                     , sxGraphics = Just injection
                     , sxTerrain = Nothing
+                    , sxClosing = CloseBounded
                     }
             -- Both threads are owned by the call (#599). The main-step loop supplies what the session's exit needs (the windows'
             -- steps), so its scope encloses the session's run and is ended and joined after it; the scenario's thread is let

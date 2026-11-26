@@ -1643,8 +1643,9 @@ finish env restore result = do
         void (guarded (restore (forwardFinal env)))
     else do
       unless cancelled ended
-      -- (a negative control: the call waits for the writer to write the queue, as a blocking wait)
-      if removed env ProtectAbandon
+      -- (a negative control: the call waits for the writer to write the queue, as a blocking wait; a composition that
+      -- asked for the delivery of the closing notes waits the same way, unless the caller was cancelled)
+      if removed env ProtectAbandon || (sxClosing (envSpec env) == CloseDelivered && not cancelled)
         then probeAt env WriterWait >> void (guarded (True <$ restore (awaitWritten env)))
         else unless cancelled (grace env)
       -- the cut-off: one commit closes the queue and records what was not acknowledged; then the writer is cancelled, and

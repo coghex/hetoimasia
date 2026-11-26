@@ -215,6 +215,7 @@ withSetup found body =
               , sxHarness = suHarness found
               , sxGraphics = Nothing
               , sxTerrain = Nothing
+              , sxClosing = CloseBounded
               }
         }
   where

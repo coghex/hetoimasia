@@ -207,8 +207,8 @@ data Point
   | -- | The writer has acknowledged a write and is about to wait for the next, on its own thread: the point between two
     -- of its states.
     WriterBetween
-  | -- | Only with 'ProtectAbandon' removed: the call is about to wait, by itself, for the diagnostics writer to write the
-    -- queue.
+  | -- | Only with 'ProtectAbandon' removed, or in a composition that asked for its closing notes to be delivered: the call
+    -- is about to wait, by itself, for the diagnostics writer to write the queue.
     WriterWait
   | -- | Only with 'ProtectGrantAtomic' removed: the check was made in one transaction and the grant is about to be
     -- issued in another.

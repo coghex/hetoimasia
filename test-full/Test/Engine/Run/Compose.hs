@@ -6,9 +6,9 @@
 -- would print, and the line is absent. Nothing sleeps.
 module Test.Engine.Run.Compose (spec) where
 
-import Control.Concurrent (threadDelay, throwTo)
+import Control.Concurrent (threadDelay, throwTo, yield)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
-import Control.Monad (forever, void, when)
+import Control.Monad (forever, replicateM_, void, when)
 import qualified Data.ByteString as ByteString
 import Data.Text (Text)
 import qualified Data.Text as Text
@@ -18,7 +18,7 @@ import Control.Concurrent.STM (atomically, modifyTVar', newTVarIO, readTVar, rea
 import Control.Exception (AsyncException (UserInterrupt), ExceptionWithContext (ExceptionWithContext), SomeException, fromException, rethrowIO, tryWithContext)
 import Data.List (isInfixOf)
 import GHC.Conc (BlockReason (BlockedOnSTM))
-import Hetoimasia.Foundation.Log (callbackSinkWith, logInfo, unsafeComponent)
+import Hetoimasia.Foundation.Log (LogEntry (entryMessage), callbackSinkWith, logInfo, unsafeComponent)
 import Hetoimasia.Foundation.Resource (cleanupFailuresInContext, displayCleanupFailure, withResource)
 import Hetoimasia.Content (ContentFailure, withContentRoot)
 import Hetoimasia.LuaEngine.Boot (ContentConfiguration (..), contentConfiguration)
@@ -240,6 +240,19 @@ stops = describe "stops and signals" $ do
     observedStatus observed `shouldBe` ExitFailure 130
     observedOut observed `shouldContain` ["ui shutdown"]
     observedForced observed `shouldBe` 0
+
+  it "ends the stderr record with the session's closing note when the sink is healthy but slow in scheduler turns, as a stop meets it" $ do
+    seen ← newTVarIO []
+    -- The sink is slow only in scheduler turns, a thousand times the bounded grace a session gives its writer; what it was
+    -- handed is read from the sink, so no timing and no order is asserted.
+    let slow written = do
+          atomically (modifyTVar' seen (entryMessage written :))
+          when (entryMessage written == "session stopping") (replicateM_ 1000000 yield)
+    observed ← observeWith unchanged {changeSink = Just (callbackSinkWith slow (pure ()))} files $ \probe → do
+      probeAwaitOut probe "ui ready"
+      void (probeSignal probe)
+    observedStatus observed `shouldBe` ExitFailure 130
+    readTVarIO seen >>= (`shouldSatisfy` elem "session ended")
 
   it "forces at most once, however many signals arrive, and the first still stops in order" $ do
     observed ← observe files $ \probe → do

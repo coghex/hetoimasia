@@ -65,7 +65,8 @@ import Hetoimasia.Foundation.Time (MonotonicSource, monotonicSource)
 import Hetoimasia.LuaEngine.Facade (GraphicsInjection, OutputSink, withOutput)
 import Hetoimasia.LuaEngine.Profile (Count (Count), CountLimit (IoWorkers), countLimit)
 import Hetoimasia.LuaEngine.Session
-  ( RoleFailure
+  ( Closing (CloseDelivered)
+  , RoleFailure
   , Session
   , SessionOutcome
   , SessionSpec (..)
@@ -250,6 +251,7 @@ runPrepared environment lifetime stop link prepared graphics hook =
                   , sxHarness = noHarness
                   , sxGraphics = injection
                   , sxTerrain = Nothing
+                  , sxClosing = CloseDelivered
                   }
               -- The handle is bound before any VM exists; the callback never blocks.
               callback session = do
