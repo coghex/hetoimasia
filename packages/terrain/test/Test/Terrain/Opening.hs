@@ -130,6 +130,9 @@ spec = describe "Openings" $ do
   contactSpec
   pathSpec
   agreementSpec
+  cornerCatalogSpec
+  cornerBankSpec
+  cornerMatchingSpec
 
 -- | The openings of all sixteen identities in all four orientations.
 catalogSpec ∷ Spec
@@ -661,3 +664,225 @@ agreementSpec = describe "agreement with point and ray queries" $ do
       `shouldBe` Just (5 / 4, point (3 / 4) (1 / 2) (1 / 4))
     -- Above the apex the ray passes the whole cell.
     castRay solid (ray (point 2 (1 / 2) (3 / 4)) (point (-1) 0 0)) `shouldBe` Nothing
+
+-- ---------------------------------------------------------------------------
+-- Corner keys (COR-2, #754): portals from the union of the solid's pieces
+
+-- | The openings of a corner mask, 1 to 15.
+cornerOps ∷ Int → CellOpenings
+cornerOps = keyOpenings . cornerKey
+
+cornerKey ∷ Int → ShapeKey
+cornerKey value = case mkCornerMask value >>= maybe (Left (UnsupportedCornerMask value)) Right . resolveCorner of
+  Right key → key
+  Left err → error (show err)
+
+-- | A positive quarter turn of a corner mask, restated here: each set corner
+-- moves one place, north-west to north-east to south-east to south-west.
+turnMask ∷ Int → Int → Int
+turnMask count mask = iterate (\m → ((m * 2) `mod` 16) + (m `div` 8)) mask !! count
+
+-- | Whether a face point of a cell with this key is covered by its closed solid,
+-- stated from the pieces alone: some piece of positive volume contains the lifted
+-- point, boundary included, that is @n · p <= d@ for every plane of the piece.
+-- Air is never covered.
+coveredBy ∷ Maybe ShapeKey → FaceKind → P2 → Bool
+coveredBy Nothing _ _ = False
+coveredBy (Just key) face p = any holds (convexPieces key)
+  where
+    V3 x y z = liftTo face p
+    holds piece = and [nx * x + ny * y + nz * z <= d | Plane (V3 nx ny nz) d ← piecePlanes piece]
+
+-- | Whether a face point of the openings is open air by the oracle.
+openBy ∷ Maybe ShapeKey → FaceKind → P2 → Bool
+openBy key face = not . coveredBy key face
+
+-- | A grid that reaches the boundaries, diagonals and creases: the ninths and the
+-- eighths of the unit square, endpoints included.
+boundaryGrid ∷ [P2]
+boundaryGrid = [(fromIntegral i / 8, fromIntegral j / 8) | i ← [0 .. 8 ∷ Int], j ← [0 .. 8 ∷ Int]]
+
+-- | The openings of one mask, per face in 'faceOrder': the hand table of D-1 for
+-- one mask of each rotation class, from the issue's review.
+baseAreas ∷ Int → [Rational]
+baseAreas 1 = [1, 1 / 2, 1, 1, 1 / 2, 1 / 2]
+baseAreas 3 = [1, 0, 1 / 2, 1, 1 / 2, 0]
+baseAreas 5 = [1, 1 / 2, 1 / 2, 1 / 2, 1 / 2, 0]
+baseAreas 7 = [1 / 2, 0, 0, 1 / 2, 1 / 2, 0]
+baseAreas _ = replicate 6 0
+
+-- | The area of each face's openings for any mask: the base row of its rotation
+-- class, turned with the walls.
+expectedAreas ∷ Int → [Rational]
+expectedAreas 15 = replicate 6 0
+expectedAreas mask = case [row rep count | rep ← [1, 3, 5, 7], count ← [0 .. 3], turnMask count rep == mask] of
+  found : _ → found
+  [] → error "expectedAreas: a mask outside 1..15"
+  where
+    row rep count = [baseAreas rep !! faceIndex (turnFace (4 - count) face) | face ← faceOrder]
+    faceIndex face = length (takeWhile (/= face) faceOrder)
+
+cornerCatalogSpec ∷ Spec
+cornerCatalogSpec = describe "the openings of the corner keys" $ do
+  it "gives every occupied key its openings, and a corner key its key rather than air" $ do
+    forM_ allShapeKeys $ \key → openingsKey (keyOpenings key) `shouldBe` Just key
+    forM_ [1 .. 15] $ \mask → do
+      openingsKey (cornerOps mask) `shouldBe` Just (cornerKey mask)
+      openingsShape (cornerOps mask) `shouldBe` Nothing
+      cornerOps mask `shouldNotBe` airOpenings
+    openingsKey airOpenings `shouldBe` Nothing
+    forM_ [0 .. 15] $ \identity → do
+      observe (keyOpenings (sideKey (shape identity))) `shouldBe` observe (openings identity)
+      openingsKey (openings identity) `shouldBe` Just (sideKey (shape identity))
+  forM_ [1 .. 15] $ \mask →
+    forM_ [0 .. 3] $ \count →
+      it ("opens corner mask " <> show mask <> " turned " <> show count <> " time(s) with the hand areas and exactly the closed pieces' complement") $ do
+        let turned = turnMask count mask
+            ops = cornerOps turned
+            key = Just (cornerKey turned)
+        map (faceArea ops) faceOrder `shouldBe` expectedAreas turned
+        [(face, p) | face ← faceOrder, p ← lattice <> boundaryGrid, faceHolds ops face p /= openBy key face p] `shouldBe` []
+  it "gives mask 15 no portal and no component, and every other mask one component owning all its portals in face order" $ do
+    cellPortals (cornerOps 15) `shouldBe` []
+    cellComponents (cornerOps 15) `shouldBe` []
+    forM_ [1 .. 14] $ \mask → do
+      let ops = cornerOps mask
+      length (cellComponents ops) `shouldBe` 1
+      forM_ (cellComponents ops) $ \component → do
+        map portalComponent (componentPortals component) `shouldSatisfy` all (== componentIndex component)
+        sort (map portalFace (componentPortals component)) `shouldBe` sort [face | face ← faceOrder, faceArea ops face > 0]
+      sort (map portalFace (concatMap componentPortals (cellComponents ops))) `shouldBe` sort (map portalFace (cellPortals ops))
+  it "splits every corner opening into convex pieces with area and no common interior" $
+    forM_ [1 .. 15] $ \mask →
+      forM_ (cellPortals (cornerOps mask)) $ \portal → do
+        let pieces = openingPieces (portalOpening portal)
+        forM_ pieces $ \piece → do
+          length piece `shouldSatisfy` (>= 3)
+          signedArea piece `shouldSatisfy` (> 0)
+        sum (map signedArea pieces) `shouldBe` openingArea (portalOpening portal)
+        -- No sample point is strictly inside two pieces; a point on the seam between
+        -- two pieces belongs to both closed pieces and is not an overlap.
+        [p | p ← lattice, length [() | piece ← pieces, strictlyInside piece p] > 1] `shouldBe` []
+  it "turns with rotateOpenings: the turned key's openings, four turns restoring the original, and every open point on the turned face" $
+    forM_ [1 .. 15] $ \mask → do
+      observe (rotateOpenings (turns 4) (cornerOps mask)) `shouldBe` observe (cornerOps mask)
+      forM_ [0 .. 3] $ \count → do
+        observe (rotateOpenings (turns count) (cornerOps mask)) `shouldBe` observe (cornerOps (turnMask count mask))
+        observe (rotateOpenings (turns 1) (rotateOpenings (turns count) (cornerOps mask)))
+          `shouldBe` observe (rotateOpenings (turns (count + 1)) (cornerOps mask))
+      forM_ [1 .. 3] $ \count →
+        forM_ faceOrder $ \face → do
+          let turnedOps = rotateOpenings (turns count) (cornerOps mask)
+              move = dropTo (turnFace count face) . (!! count) . iterate quarter . liftTo face
+          [p | p ← lattice, faceHolds (cornerOps mask) face p /= faceHolds turnedOps (turnFace count face) (move p)] `shouldBe` []
+  it "opens the planar corner masks exactly as the side ramps they equal" $
+    forM_ [(3, 4), (6, 8), (9, 2), (12, 1)] $ \(mask, identity) → do
+      map (faceArea (cornerOps mask)) faceOrder `shouldBe` map (faceArea (openings identity)) faceOrder
+      [(face, p) | face ← faceOrder, p ← lattice <> boundaryGrid, faceHolds (cornerOps mask) face p /= faceHolds (openings identity) face p]
+        `shouldBe` []
+  where
+    signedArea piece = sum (zipWith (\(a, b) (c, d) → a * d - b * c) piece (drop 1 piece <> take 1 piece)) / 2
+    strictlyInside piece p = all (\(a, b) → turnOf a b p > 0) (zip piece (drop 1 piece <> take 1 piece))
+    turnOf (ax, ay) (bx, by) (cx, cy) = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
+
+-- | The observable content of a cell's openings: its key, and for each face the
+-- area and the open lattice and grid points, plus which faces each component
+-- owns. Decomposition into convex pieces and enumeration order are not part of
+-- it, so two decompositions of one region are equal here.
+observe ∷ CellOpenings → (Maybe ShapeKey, [(FaceKind, Rational, [P2])], [[FaceKind]])
+observe ops =
+  ( openingsKey ops
+  , [(face, faceArea ops face, [p | p ← lattice <> boundaryGrid, faceHolds ops face p]) | face ← faceOrder]
+  , sort (map (sort . map portalFace . componentPortals) (cellComponents ops))
+  )
+
+-- | The worked examples of D-4: the bank, the valleys, the plateau and the open
+-- space under and above them.
+cornerBankSpec ∷ Spec
+cornerBankSpec = describe "the corner bank, the valleys and the plateau" $ do
+  let origin = tile 0 0 0
+      above = tile 0 0 1
+      bottomOf mask = openingsOn mask BottomFace
+      openingsOn mask face = [portalOpening p | p ← portalsOn face (cornerOps mask)]
+      areaOf = sum . map openingArea
+      holdsOn ops p = any (`openingContains` p) ops
+  it "opens a single NW-high bank at its base over x + y > 1, area one half" $ do
+    areaOf (bottomOf 1) `shouldBe` 1 / 2
+    holdsOn (bottomOf 1) (3 / 4, 3 / 4) `shouldBe` True
+    holdsOn (bottomOf 1) (1 / 4, 1 / 4) `shouldBe` False
+    -- The bottom edges of the East and South faces at the flat half are open.
+    holdsOn (openingsOn 1 (WallFace East)) (1 / 2, 0) `shouldBe` True
+    holdsOn (openingsOn 1 (WallFace South)) (1 / 2, 0) `shouldBe` True
+  it "matches air below the bank over exactly that triangle" $ do
+    let found = connectCells above (cornerOps 1) origin airOpenings
+    map connectionArea found `shouldBe` [1 / 2]
+    map connectionFace found `shouldBe` [BottomFace]
+    -- ... and from the other side.
+    map connectionArea (connectCells origin airOpenings above (cornerOps 1)) `shouldBe` [1 / 2]
+  it "leaves the bank's bottom uncovered above a lower full block and forms no void-to-void connection" $
+    forM_ [openings 0, cornerOps 15] $ \block → do
+      connectCells above (cornerOps 1) origin block `shouldBe` []
+      connectCells origin block above (cornerOps 1) `shouldBe` []
+      -- The uncovered part of the bank's bottom is the exposed part of the block's top.
+      areaOf (bottomOf 1) `shouldBe` 1 / 2
+      holdsOn (bottomOf 1) (3 / 4, 3 / 4) `shouldBe` True
+      cellPortals block `shouldBe` []
+  it "gives both opposite-high valleys no bottom portal, and keeps the crease covered" $
+    forM_ [5, 10] $ \mask → do
+      portalsOn BottomFace (cornerOps mask) `shouldBe` []
+      forM_ [0, 1 / 4, 1 / 2, 1] $ \t → holdsOn (bottomOf mask) (t, t) `shouldBe` False
+      connectCells above (cornerOps mask) origin airOpenings `shouldBe` []
+  it "opens the valley tops between the two high corners, which a hull of the section would cover" $ do
+    let top mask = openingsOn mask TopFace
+    holdsOn (top 5) (1 / 2, 1 / 2) `shouldBe` True
+    forM_ [(0, 0), (1, 1)] $ \corner → holdsOn (top 5) corner `shouldBe` False
+    holdsOn (top 10) (1 / 2, 1 / 2) `shouldBe` True
+    forM_ [(1, 0), (0, 1)] $ \corner → holdsOn (top 10) corner `shouldBe` False
+  it "opens the three-high plateau's top exactly over y > x, and air above connects over one half" $ do
+    let top = openingsOn 7 TopFace
+    areaOf top `shouldBe` 1 / 2
+    holdsOn top (1 / 4, 3 / 4) `shouldBe` True
+    holdsOn top (3 / 4, 1 / 4) `shouldBe` False
+    holdsOn top (1 / 2, 1 / 2) `shouldBe` False
+    map connectionArea (connectCells origin (cornerOps 7) above airOpenings) `shouldBe` [1 / 2]
+  it "keeps a plateau's top covered where it is flat and a lower plateau's open where it is not" $ do
+    -- Mask 7 has its high corners north-west, north-east and south-east: the top
+    -- is covered on y <= x, including the diagonal.
+    forM_ [(0, 0), (1, 0), (1, 1), (1 / 2, 0), (3 / 4, 1 / 4)] $ \p → holdsOn (openingsOn 7 TopFace) p `shouldBe` False
+
+-- | Corner keys across a shared face, against sides, other corners and air, and
+-- the mixed-family twins.
+cornerMatchingSpec ∷ Spec
+cornerMatchingSpec = describe "connections of corner keys" $ do
+  let origin = tile 0 0 0
+      occupied = map Just allShapeKeys
+      neighbourKeys = Nothing : occupied
+      opensOf key = maybe airOpenings keyOpenings key
+      nonAir = filter (/= Nothing)
+  it "connects mask 1 above mask 7 over a quarter and mask 1 above mask 14 not at all" $ do
+    let upper = tile 0 0 1
+        found = connectCells upper (cornerOps 1) origin (cornerOps 7)
+    map connectionArea found `shouldBe` [1 / 4]
+    map connectionArea (connectCells origin (cornerOps 7) upper (cornerOps 1)) `shouldBe` [1 / 4]
+    -- The two openings meet only along the line x + y = 1.
+    connectCells upper (cornerOps 1) origin (cornerOps 14) `shouldBe` []
+    connectCells origin (cornerOps 14) upper (cornerOps 1) `shouldBe` []
+  it "connects any two keys across any of the six faces exactly when some lattice point is open on both sides" $
+    forM_ cellFaces $ \face →
+      forM_ (nonAir neighbourKeys) $ \a →
+        forM_ neighbourKeys $ \b → do
+          let toward = at (0, 0, 0) (stepOf face)
+              found = connectCells origin (opensOf a) toward (opensOf b)
+              shared = [p | p ← lattice, openBy a face p, openBy b (oppositeFace face) p]
+          (not (null found), face, a, b) `shouldBe` (not (null shared), face, a, b)
+          forM_ found $ \connection → connectionArea connection `shouldSatisfy` (> 0)
+  it "connects a corner key to its side twin's every neighbour with the same areas, in all six directions and both orders" $
+    forM_ [(3, 4), (6, 8), (9, 2), (12, 1)] $ \(mask, identity) →
+      forM_ cellFaces $ \face →
+        forM_ neighbourKeys $ \other → do
+          let toward = at (0, 0, 0) (stepOf face)
+              summary found = sort [(connectionFace c, connectionArea c, componentRefIndex (connectionFrom c), componentRefIndex (connectionTo c)) | c ← found]
+          summary (connectCells origin (cornerOps mask) toward (opensOf other))
+            `shouldBe` summary (connectCells origin (openings identity) toward (opensOf other))
+          summary (connectCells toward (opensOf other) origin (cornerOps mask))
+            `shouldBe` summary (connectCells toward (opensOf other) origin (openings identity))
