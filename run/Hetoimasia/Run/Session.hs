@@ -74,7 +74,7 @@ import Hetoimasia.LuaEngine.Session
   , latchTerminalFailure
   , noHarness
   , requestStop
-  , runSession
+  , runSessionWith
   , sessionDiagnosticsEnded
   )
 import Hetoimasia.LuaEngine.Texture
@@ -251,7 +251,6 @@ runPrepared environment lifetime stop link prepared graphics hook =
                   , sxHarness = noHarness
                   , sxGraphics = injection
                   , sxTerrain = Nothing
-                  , sxClosing = CloseDelivered
                   }
               -- The handle is bound before any VM exists; the callback never blocks.
               callback session = do
@@ -262,4 +261,4 @@ runPrepared environment lifetime stop link prepared graphics hook =
                   thread ← forkIO (atomically (stop >>= check) >> requestStop session StopInterrupt)
                   writeIORef forwarder (Just thread)
               endForwarder = readIORef forwarder >>= mapM_ killThread
-          runSession spec callback `finally` endForwarder
+          runSessionWith CloseDelivered spec callback `finally` endForwarder

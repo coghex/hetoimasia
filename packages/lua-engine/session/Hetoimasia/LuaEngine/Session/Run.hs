@@ -90,6 +90,7 @@
 -- the tick and the required-failure latch are the Lua host's.
 module Hetoimasia.LuaEngine.Session.Run
   ( runSession
+  , runSessionWith
   , Session
   , sessionStatus
   , sessionOutcomeNow
@@ -463,6 +464,7 @@ data Env = Env
   -- ^ This run's identity: the marks it makes carry it, and it reads no mark that does not.
   , envRaw ∷ !(IORef [RawEvidence])
   , envWriter ∷ !Writer
+  , envClosing ∷ !Closing
   }
 
 -- | The session's diagnostics writer: the one thread that calls the sink. Owner: 'runSession', which starts it in a masked
@@ -1490,13 +1492,14 @@ startWriter env = unless (driverWrites env) $ do
 newWriter ∷ IO Writer
 newWriter = Writer <$> newTVarIO WriterOpen <*> newIORef Nothing <*> newTVarIO True <*> newTVarIO True
 
--- | Wait until the queue is written, or the writer has ended. Interruptible: it runs through the caller's @restore@. Only
--- under the negative control that removes the abandonment.
+-- | Wait until the queue is written (every diagnostic acknowledged), or the writer has ended: a diagnostic the sink failed or
+-- cancelled stays in the queue and the writer then ends. Interruptible: it runs through the caller's @restore@. Only under
+-- the negative control that removes the abandonment, and in a composition that asked for 'CloseDelivered'.
 awaitWritten ∷ Env → IO ()
 awaitWritten env = atomically $ do
   ended ← readTVar (wrEnded (envWriter env))
   state ← stateOf env
-  check (ended || not (diagnosticsOutstanding state))
+  check (ended || not (diagnosticsUnsettled state))
 
 -- | Let the writer have the scheduler a bounded number of times, and wait for nothing: a writer that is not blocked can
 -- write the last notes meanwhile, and one that is blocked is not waited for. This is a poll that always ends, not a wait on
@@ -1583,7 +1586,12 @@ writable state =
 -- The entry is refused if the calling thread is uninterruptibly masked, before anything is acquired: the waits of the
 -- protocol must stay interruptible, and no mask can be undone from inside one.
 runSession ∷ SessionSpec → (Session → IO ()) → IO SessionOutcome
-runSession spec onReady = do
+runSession = runSessionWith CloseBounded
+
+-- | 'runSession' with a choice of what the call does about its diagnostics writer at the end ('Closing'): a composition
+-- that owns its sink's lifetime asks for 'CloseDelivered' so that the closing notes reach a healthy sink.
+runSessionWith ∷ Closing → SessionSpec → (Session → IO ()) → IO SessionOutcome
+runSessionWith closing spec onReady = do
   masking ← getMaskingState
   when (masking == MaskedUninterruptible) $
     throwIO (SessionRefused "a session cannot be run uninterruptibly masked: its waits must stay interruptible")
@@ -1602,7 +1610,7 @@ runSession spec onReady = do
   serial ← newIORef 0
   identity ← newUnique
   raw ← newIORef []
-  let env = Env spec session limits ids seen tracked (Map.fromList [(riRole info, info) | info ← roles]) retained serial identity raw writer
+  let env = Env spec session limits ids seen tracked (Map.fromList [(riRole info, info) | info ← roles]) retained serial identity raw writer closing
   -- The outer continuation is installed before the handle is given away, before any diagnostic, clock or construction.
   -- The writer is started in the next masked step, before the first diagnostic: from there on a diagnostic is data in the
   -- lifecycle record, and nothing the driver does waits for it to be written. A failure to start it is a failure of the
@@ -1645,14 +1653,15 @@ finish env restore result = do
       unless cancelled ended
       -- (a negative control: the call waits for the writer to write the queue, as a blocking wait; a composition that
       -- asked for the delivery of the closing notes waits the same way, unless the caller was cancelled)
-      if removed env ProtectAbandon || (sxClosing (envSpec env) == CloseDelivered && not cancelled)
+      if removed env ProtectAbandon || (envClosing env == CloseDelivered && not cancelled)
         then probeAt env WriterWait >> void (guarded (True <$ restore (awaitWritten env)))
         else unless cancelled (grace env)
       -- the cut-off: one commit closes the queue and records what was not acknowledged; then the writer is cancelled, and
-      -- nothing waits for it
+      -- nothing waits for it. A cancellation that arrived during the wait is the cause as much as one that came before.
+      cancelledNow ← any (isAsync . rtCaught) <$> readIORef (envRetained env)
       boundary env CuttingOff
       void . commit session . DiagCutOff $
-        if cancelled then "the caller was cancelled" else "the session returned with the diagnostics writer still working"
+        if cancelledNow then "the caller was cancelled" else "the session returned with the diagnostics writer still working"
       abandonWriter env
   raiseRetained env
   atomically (outcomeOf <$> readTVar (sessionState session))

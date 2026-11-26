@@ -589,7 +589,6 @@ withLiveSession env name files held scenario = do
                   , sxHarness = noHarness
                   , sxGraphics = Just injection
                   , sxTerrain = Nothing
-                  , sxClosing = CloseBounded
                   }
           -- However the session ends (normally, with the roles' failure returned before any window existed, or by an
           -- exception), the scenario's thread has ended and been joined before this scope does: the scope's release ends it,

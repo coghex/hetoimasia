@@ -196,7 +196,6 @@ runWithSession scenario = bounded . withSystemTempDirectory "hetoimasia-window-c
                     , sxHarness = noHarness
                     , sxGraphics = Nothing
                     , sxTerrain = Nothing
-                    , sxClosing = CloseBounded
                     }
             -- The scenario's thread is owned by the call (#599): ended and joined however the session's run ends, a cancellation
             -- delivered before the scenario started included.

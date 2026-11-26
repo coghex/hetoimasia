@@ -118,7 +118,6 @@ composingClient =
     , "                    , sxHarness = noHarness"
     , "                    , sxGraphics = Nothing"
     , "                    , sxTerrain = Nothing"
-    , "                    , sxClosing = CloseBounded"
     , "                    }"
     , "            outcome ← runSession spec $ \\session → void . forkIO $ do"
     , "              atomically $ do"

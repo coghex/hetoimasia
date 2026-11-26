@@ -48,6 +48,7 @@
 module Hetoimasia.LuaEngine.Session
   ( -- * Running a session
     runSession
+  , runSessionWith
   , SessionSpec (..)
   , Closing (..)
   , Harness

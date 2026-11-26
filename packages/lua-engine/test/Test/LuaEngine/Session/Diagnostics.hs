@@ -38,7 +38,7 @@ import Test.Support.Owned (withOwnedThreadOpening)
 spec ∷ Spec
 spec = describe "diagnostics" $ do
   classes
-  closing
+  closingNotes
   failing
   free
   construction
@@ -143,13 +143,17 @@ data Returning = Returning
 -- has returned. A scenario that raises stops the session, and what it raises is raised here once the session has
 -- ended; the held sinks are the example's to let go (an example that fails lets them go with 'whileHeld').
 runHeld ∷ SessionEnv → Harness → (Session → Returning → IO ()) → IO SessionOutcome
-runHeld env harness scenario = do
+runHeld = runHeldWith CloseBounded
+
+-- | 'runHeld' for a session that ends as this 'Closing' says.
+runHeldWith ∷ Closing → SessionEnv → Harness → (Session → Returning → IO ()) → IO SessionOutcome
+runHeldWith closing env harness scenario = do
   handleVar ← newEmptyMVar
   returned ← newEmptyMVar ∷ IO (MVar SessionOutcome)
   resultVar ← newEmptyMVar
   -- Owned by the call (#599): ended and joined however the call ends, with the held sink and the reader's gates let go first.
   withOwnedThreadOpening (letScenarioGo env) (scenarioThread handleVar returned resultVar) $ \_ terminated → do
-    outcome ← runSession (scenarioSpec env harness) (putMVar handleVar)
+    outcome ← runSessionWith closing (scenarioSpec env harness) (putMVar handleVar)
     putMVar returned outcome
     result ← bounded (readMVar resultVar)
     terminated
@@ -186,18 +190,12 @@ awaitWriterEnd session = bounded (atomically (sessionDiagnosticsEnded session >>
 -- state in which a bounded call cuts the writer off and records that note as undelivered (the first example: the loss
 -- the command's orderly-stop examples saw). The asking call waits for the writer instead, and returns once the sink,
 -- let go, has been handed everything.
-closing ∷ Spec
-closing = describe "the closing notes of the session" $ do
-  let parkedAt closure env = do
-        held ← holding ["start gate opened"]
-        recorder ← newRecorder
-        let asking = (loggedBy held env) {seSpec = (seSpec (loggedBy held env)) {sxClosing = closure}}
-        pure (held, recorder, asking)
-
+closingNotes ∷ Spec
+closingNotes = describe "the closing notes of the session" $ do
   it "are recorded as undelivered by a call that does not wait for its writer, though the sink is healthy once the writer is let go" $
     withSetup (setup (roleScript printScript)) $ \env → do
-      (held, recorder, asking) ← parkedAt CloseBounded env
-      outcome ← runHeld asking (recordingHarness recorder noHarness) $ \session returning → whileHeld held $ do
+      held ← holding ["start gate opened"]
+      outcome ← runHeldWith CloseBounded (loggedBy held env) noHarness $ \session returning → whileHeld held $ do
         awaitEntered held "start gate opened"
         requestStop session StopQuit
         void (awaitReturn returning)
@@ -205,8 +203,9 @@ closing = describe "the closing notes of the session" $ do
 
   it "are delivered by a call that waits for its writer: it holds until the sink is let go, and then nothing is undelivered" $
     withSetup (setup (roleScript printScript)) $ \env → do
-      (held, recorder, asking) ← parkedAt CloseDelivered env
-      outcome ← runHeld asking (recordingHarness recorder noHarness) $ \session returning → whileHeld held $ do
+      held ← holding ["start gate opened"]
+      recorder ← newRecorder
+      outcome ← runHeldWith CloseDelivered (loggedBy held env) (recordingHarness recorder noHarness) $ \session returning → whileHeld held $ do
         awaitEntered held "start gate opened"
         requestStop session StopQuit
         void (awaitRetired session)
@@ -219,17 +218,45 @@ closing = describe "the closing notes of the session" $ do
       deUndelivered (outDiagnostics outcome) `shouldBe` 0
       readTVarIO (heldAll held) >>= (`shouldSatisfy` elem "session ended")
 
-  it "end their wait when the sink refuses a write: the call returns with the refusal as evidence, and the writer is not waited for again" $
+  it "end their wait when the sink refuses a write: the call returns with the refusal as evidence" $
     withSetup (setup (roleScript printScript)) $ \env → do
       held ← failingAt ["start gate opened"]
-      let asking = (loggedBy held env) {seSpec = (seSpec (loggedBy held env)) {sxClosing = CloseDelivered}}
-      outcome ← runHeld asking noHarness $ \session returning → whileHeld held $ do
+      outcome ← runHeldWith CloseDelivered (loggedBy held env) noHarness $ \session returning → whileHeld held $ do
         awaitEntered held "start gate opened"
         requestStop session StopQuit
-        letGo held
         void (awaitReturn returning)
       deSinkFailures (outDiagnostics outcome) `shouldBe` 1
       outVerdict outcome `shouldBe` VerdictSuccess
+
+  it "keep the evidence of a sink's own cancellation on the final note: the call waits for the writer to record it, and the note is undelivered" $
+    withSetup (setup (roleScript printScript)) $ \env → do
+      held ← cancellingAt ["session ended"]
+      outcome ← runHeldWith CloseDelivered (loggedBy held env) noHarness $ \session returning → whileHeld held $ do
+        awaitPhase session Gameplay Running
+        awaitPhase session Presentation Running
+        requestStop session StopQuit
+        void (awaitReturn returning)
+      deSinkFailures (outDiagnostics outcome) `shouldBe` 1
+      deSinkFirst (outDiagnostics outcome) `shouldSatisfy` any (Text.isInfixOf "a diagnostic write was cancelled")
+      undelivered outcome `shouldBe` ["session ended"]
+
+  it "say that the caller was cancelled when the cancellation arrives while the call waits for its writer" $
+    withSetup (setup (roleScript printScript)) $ \env → do
+      held ← holding ["start gate opened"]
+      recorder ← newRecorder
+      (ended, session) ← runCaughtWith CloseDelivered (loggedBy held env) (recordingHarness recorder noHarness) $ \driver session → (`onException` letGo held) $ do
+        awaitEntered held "start gate opened"
+        requestStop session StopQuit
+        void (awaitRetired session)
+        awaitPoint recorder WriterWait
+        throwTo driver ThreadKilled
+      raisedKilled ended `shouldBe` True
+      found ← outcomeNow session
+      outRetired found `shouldBe` True
+      deCause (outDiagnostics found) `shouldBe` Just "the caller was cancelled"
+      undelivered found `shouldSatisfy` elem "session ended"
+      awaitWriterEnd session
+      letGo held
 
 -- The classes of site ------------------------------------------------------------------------------------------------
 

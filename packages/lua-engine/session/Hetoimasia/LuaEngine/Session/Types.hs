@@ -88,16 +88,14 @@ data SessionSpec = SessionSpec
   -- services, owned and borrowed by the assembly and never closed by the session. 'Nothing' for a composition that injects
   -- none: its facades have no @api.terrain@, no terrain handle type and no terrain request kind, exactly as before. When both
   -- are injected the VM's one lending and lease scope is shared by both.
-  , sxClosing ∷ !Closing
-  -- ^ What the call does about the diagnostics writer once every role has retired.
   }
 
--- | What 'runSession' does about the diagnostics writer after every role has retired and the session's last note is
--- committed, and before it cuts the writer off.
+-- | What a session's call does about the diagnostics writer after every role has retired and the session's last note is
+-- committed, and before it cuts the writer off. 'runSession' is 'CloseBounded'; 'runSessionWith' chooses.
 data Closing
   = -- | Give the writer the scheduler a bounded number of times, wait for nothing and cut it off: D-87's rule. The call
     -- can return with its last notes recorded as undelivered, however healthy the sink. For a caller that must return
-    -- whatever a sink does.
+    -- whatever a sink does: every caller of 'runSession'.
     CloseBounded
   | -- | Wait, interruptibly, until the writer has written the queue or has ended (a sink that raised ends it), and
     -- then cut it off. A cancellation of the caller ends the wait. The call returns only after a healthy sink has been
