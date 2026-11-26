@@ -1681,7 +1681,9 @@ finish env restore result = do
       over ← readTVar (wrEnded (envWriter env))
       state ← readTVar (sessionState session)
       check (over || not (diagnosticsUnsettled state))
-      void (commitSTM session (DiagCutOff "the session returned with the diagnostics writer still working"))
+      void . commitSTM session . DiagCutOff $
+        -- (the cause is kept only when something was not delivered, and then it is the writer's end)
+        "the diagnostics writer ended with diagnostics not acknowledged"
     -- the verdict is said once everything before it has been done
     ended = do
       outcome ← atomically (outcomeOf <$> readTVar (sessionState session))

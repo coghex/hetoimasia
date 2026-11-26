@@ -217,6 +217,7 @@ closingNotes = describe "the closing notes of the session" $ do
       undelivered outcome `shouldBe` []
       deUndelivered (outDiagnostics outcome) `shouldBe` 0
       readTVarIO (heldAll held) >>= (`shouldSatisfy` elem "session ended")
+      deCause (outDiagnostics outcome) `shouldBe` Nothing
 
   it "end their wait when the sink refuses a write: the call returns with the refusal as evidence" $
     withSetup (setup (roleScript printScript)) $ \env → do
@@ -239,6 +240,7 @@ closingNotes = describe "the closing notes of the session" $ do
       deSinkFailures (outDiagnostics outcome) `shouldBe` 1
       deSinkFirst (outDiagnostics outcome) `shouldSatisfy` any (Text.isInfixOf "a diagnostic write was cancelled")
       undelivered outcome `shouldBe` ["session ended"]
+      deCause (outDiagnostics outcome) `shouldBe` Just "the diagnostics writer ended with diagnostics not acknowledged"
 
   it "say that the caller was cancelled when the cancellation arrives while the call waits for its writer" $
     withSetup (setup (roleScript printScript)) $ \env → do
