@@ -292,7 +292,7 @@ cornerSpec = describe "the family tag" $ do
         unpackKey palette packed `shouldBe` Right (Just (material, key))
         unpackCell palette packed `shouldBe` case [n | n ← [0 .. 15], sideK n == key] of
           [n] → Right (Solid material (either (error . show) id (mkShapeId n)))
-          _ → Left (CornerCell (packedShape packed))
+          _ → Right (CornerSolid material (either (error . show) id (mkCornerMask (fromIntegral (packedShape packed)))))
   it "zero-extends every valid historic word to the side key it always meant" $
     forM_ [(i, s) | i ← [1, 2, 0x555, 4095], s ← [0 .. 15]] $ \(i, s) → do
       let w = (i `shiftL` 4) + s ∷ Word16
@@ -328,7 +328,10 @@ cornerSpec = describe "the family tag" $ do
         (packed, palette) = either (error . show) id (internCorner (mustMaterial "soil") mask emptyPalette)
     (packedBits packed, paletteSize palette) `shouldBe` (0x10019, 1)
     unpackKey palette packed `shouldBe` Right (Just (mustMaterial "soil", cornerK 9))
-    unpackCell palette packed `shouldBe` Left (CornerCell 9)
+    unpackCell palette packed `shouldBe` Right (CornerSolid (mustMaterial "soil") mask)
+    packCell palette (CornerSolid (mustMaterial "soil") mask) `shouldBe` Right packed
+    cellShapeKey (CornerSolid (mustMaterial "soil") mask) `shouldBe` Just (cornerK 9)
+    packCell palette (CornerSolid (mustMaterial "soil") (either (error . show) id (mkCornerMask 0))) `shouldBe` Left PackedCornerZero
   it "stores a uniform corner as 3 bytes and a uniform side as 2" $ do
     let corner = build 0 (replicate 32 (stone (cornerK 15)))
     (segmentEncoding corner, segmentPayloadBytes corner) `shouldBe` (Uniform, 3)

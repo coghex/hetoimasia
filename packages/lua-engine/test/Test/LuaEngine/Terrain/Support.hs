@@ -493,4 +493,4 @@ observeCell rig key (x, y, z) = do
   Right answer ← await service reading
   endClient service client
   let Revision revision = cellRevision answer
-  pure (toInteger revision, case cellValue answer of Air → Nothing; Solid material _ → Just (materialIdString material))
+  pure (toInteger revision, case cellValue answer of Air → Nothing; Solid material _ → Just (materialIdString material); CornerSolid material _ → Just (materialIdString material))

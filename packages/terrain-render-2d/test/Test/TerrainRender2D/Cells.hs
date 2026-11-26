@@ -32,14 +32,16 @@ import Hetoimasia.Terrain.Render2D.Assets
 import Hetoimasia.Terrain.Render2D.Camera (camRef)
 import Hetoimasia.Terrain.Render2D.CellPick
 import Hetoimasia.Terrain.Render2D.Cells
-import Hetoimasia.Terrain.Render2D.Facts (chunkOfColumn)
+import Hetoimasia.Terrain.Render2D.Facts (Availability (..), chunkOfColumn)
 import Hetoimasia.Terrain.Render2D.Knowledge
-import Hetoimasia.Terrain.Shape (ShapeId, ViewFacing (..), allViewFacings, mkShapeId)
+import Hetoimasia.Terrain.Shape (ShapeId, ViewFacing (..), allShapeKeys, allViewFacings, keyCorner, mkShapeId)
+import Hetoimasia.Terrain.Shape (cornerMaskValue)
+import Hetoimasia.Terrain.Source (CellSpec (..), PatchSpec (..), SourceSpec (..))
 import System.FilePath ((</>))
 import Test.Hspec
 import Test.TerrainRender2D.Art (texturesDirectory)
 import Test.TerrainRender2D.CellFixtures
-import Test.TerrainRender2D.Fixtures (axis, tileAt)
+import Test.TerrainRender2D.Fixtures (axis, source, tileAt)
 
 shapeNo ∷ Int → ShapeId
 shapeNo n = either (error . show) id (mkShapeId n)
@@ -50,6 +52,7 @@ spec = describe "Cell quads (TRA-16)" $ do
   checkedAssets
   beforeAll (loadAssets 5) $ do
     representation
+    cornerKeys
     agreement
     exactOrder
     negativeControls
@@ -155,6 +158,34 @@ representation = describe "the whole-cell representation table, 16 identities at
             [ (PartFog, Nothing, ColourBlank, MapKey FogPart view)
             , (PartKnown, Just (tileAt 0 0 0), ColourMaterial stoneId, MapKey KnownPart view)
             ]
+
+-- ---------------------------------------------------------------------------
+-- Corner keys
+
+-- The map catalog is side-only: a known corner cell is refused with a typed error naming its key, and
+-- no quad is produced for the request, while every side identity keeps drawing as it did.
+cornerKeys ∷ SpecWith AssetSnapshot
+cornerKeys = describe "a corner key against the side-only map catalog" $ do
+  let cornerScene facing know mask =
+        sceneFrom facing 0 0 0 (source (SourceSpec ["stone"] [] [PatchSpec 0 0 0 1 (SpecCorner "stone" mask)])) (knowledgeOf 1 CellDiscovered [(0, 0, 0, know)]) AllKnown
+      refusal assets scene = either Just (const Nothing) (planSceneWith assets scene)
+      cornerKeyOf mask = case [key | key ← allShapeKeys, fmap cornerMaskValue (keyCorner key) == Just mask] of
+        [key] → key
+        _ → error "no such corner key"
+  forM_ allViewFacings $ \facing → do
+    it ("refuses each of the 15 corner masks as discovered or known solid at " <> show facing <> ", naming the key, with no plan") $ \assets →
+      forM_ [1 .. 15] $ \mask → forM_ [CellDiscovered, CellSolidKnown] $ \know →
+        refusal assets (cornerScene facing know mask) `shouldBe` Just (CellUnsupportedShapeKey (cornerKeyOf mask))
+    it ("still covers an undiscovered corner cell with generic full fog at " <> show facing <> ", whose truth is never read") $ \assets → do
+      let plan = planScene assets (cornerScene facing CellUndiscovered 6)
+      map summary (cellPlanQuads plan) `shouldBe` [(PartFog, Nothing, ColourBlank, MapKey Ordinary (shapeNo 0))]
+  it "refuses the whole request when one corner cell shares it with side cells, and leaves an all-side request as it was" $ \assets → do
+    let mixed =
+          sceneFrom FaceSouth 0 0 0 (source (SourceSpec ["stone"] [] [PatchSpec 0 0 0 1 (SpecSolid "stone" 3), PatchSpec 1 0 0 1 (SpecCorner "stone" 9)]))
+            (knowledgeOf 1 CellDiscovered [(0, 0, 0, CellDiscovered), (1, 0, 0, CellDiscovered)]) AllKnown
+        sides = sceneOf FaceSouth 0 [OCell 0 0 0 3 KnownAll]
+    refusal assets mixed `shouldBe` Just (CellUnsupportedShapeKey (cornerKeyOf 9))
+    map summary (cellPlanQuads (planScene assets sides)) `shouldBe` [(PartOrdinary, Just (tileAt 0 0 0), ColourMaterial stoneId, MapKey Ordinary (expectedViewShape FaceSouth (shapeNo 3)))]
 
 -- ---------------------------------------------------------------------------
 -- Scenes

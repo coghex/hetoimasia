@@ -1,6 +1,8 @@
 -- | Authored materials, cell values and Z intervals.
 --
--- A cell holds 'Air' or a 'Solid' material with a shape identity. Empty space
+-- A cell holds 'Air', a 'Solid' material with a side identity, or a
+-- 'CornerSolid' material with a corner mask ('cornerCell' resolves mask zero to
+-- air). 'cellShapeKey' gives the tagged key a stored cell reads as. Empty space
 -- is a value; it is never a material that needs an allocation, and it is not
 -- the same as an unmaterialized cell (see "Hetoimasia.Terrain.Resident").
 --
@@ -28,6 +30,9 @@ module Hetoimasia.Terrain.Cell
 
     -- * Cells
   , Cell (..)
+  , cornerCell
+  , cellShapeKey
+  , cellOccupant
 
     -- * Z intervals
   , ZRange

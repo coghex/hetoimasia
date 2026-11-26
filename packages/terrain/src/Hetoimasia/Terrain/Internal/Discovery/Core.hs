@@ -97,7 +97,7 @@ import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
 import Data.Maybe (mapMaybe)
 import Data.Word (Word64)
-import Hetoimasia.Terrain.Cell (Cell (..), Column (..), ZRange, mkZRange)
+import Hetoimasia.Terrain.Cell (Cell, Column (..), ZRange, cellShapeKey, mkZRange)
 import Hetoimasia.Terrain.Internal.Cell (bottomLevel, topExclusive)
 import Hetoimasia.Terrain.Changes (emptyChanges)
 import Hetoimasia.Terrain.Coordinate (TileCoord (..), axisValue)
@@ -133,7 +133,7 @@ import Hetoimasia.Terrain.Opening
   , portalFace
   , portalOpening
   , portalsOn
-  , shapeOpenings
+  , keyOpenings
   )
 import Hetoimasia.Terrain.Query (cellAt)
 import Hetoimasia.Terrain.Residency (ArenaId, Revision (..))
@@ -512,8 +512,7 @@ cellNow tile@(TileCoord x y z) = do
 
 openingsOf ∷ CellNow → CellOpenings
 openingsOf (NowRemoved _) = airOpenings
-openingsOf (NowSource Air) = airOpenings
-openingsOf (NowSource (Solid _ shape)) = shapeOpenings shape
+openingsOf (NowSource cell) = maybe airOpenings keyOpenings (cellShapeKey cell)
 
 -- | The node of one void of a tile's current content.
 nodeOf ∷ Env → TileCoord → CellNow → Int → Maybe Node
@@ -774,9 +773,9 @@ stageRemovalTraced env hdr prov allow tile@(TileCoord ax ay az) =
       here ← floorRun col z
       case here of
         Just (_, hi) | hi > z → pure Nothing
-        _ → case cellAt (envSource env) emptyChanges tile of
-          Air → pure Nothing
-          Solid {} → do
+        _ → case cellShapeKey (cellAt (envSource env) emptyChanges tile) of
+          Nothing → pure Nothing
+          Just _ → do
             -- A real change: the frontier must have room and the sequence must
             -- not wrap, before anything is read or staged for it.
             if pendingObligations hdr >= fromIntegral (limitPendingObligations limits)
@@ -1232,10 +1231,11 @@ queryCell env prov tile = runQuery env prov $ do
   voidKnown ← knownVoid env tile now
   case now of
     NowRemoved _ → pure (CellKnowledge NoSolid voidKnown)
-    NowSource Air → pure (CellKnowledge NoSolid voidKnown)
-    NowSource (Solid {}) → do
-      solid ← solidKnown env tile now (voidKnown == VoidKnown)
-      pure (CellKnowledge (if solid then SolidKnown else SolidUnknown) voidKnown)
+    NowSource cell → case cellShapeKey cell of
+      Nothing → pure (CellKnowledge NoSolid voidKnown)
+      Just _ → do
+        solid ← solidKnown env tile now (voidKnown == VoidKnown)
+        pure (CellKnowledge (if solid then SolidKnown else SolidUnknown) voidKnown)
 
 knownVoid ∷ Env → TileCoord → CellNow → M VoidKnowledge
 knownVoid env tile now = case nodeOf env tile now 0 of

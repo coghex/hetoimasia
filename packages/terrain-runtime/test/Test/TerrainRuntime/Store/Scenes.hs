@@ -12,6 +12,9 @@ module Test.TerrainRuntime.Store.Scenes
   , openingA
   , openingB
   , sealedStack
+  , mixedFamilies
+  , mixedWallA
+  , mixedWallB
   , limitsWith
   , envFor
   , Run (..)
@@ -61,6 +64,32 @@ openingB = [(9, 0, z) | z ← [5 .. 7]]
 -- column makes a shaft that joins runs.
 sealedStack ∷ Scene
 sealedStack = Scene "sealed stack" (SourceSpec ["stone", "slab"] [LayerSpec Nothing (Just 8) "stone" 0] [])
+
+-- | The cave of 'twoOpenings' with both families authored into its walls and floor: a corner block, a
+-- side ramp and a corner slope in the west wall, a corner slope and an authored corner zero (air) in the
+-- east wall, and a NW-high corner bank under the cave floor.
+mixedFamilies ∷ Scene
+mixedFamilies =
+  Scene "mixed families" $
+    SourceSpec
+      ["stone", "slab"]
+      [LayerSpec Nothing (Just 8) "stone" 0]
+      ( [PatchSpec x 0 5 6 SpecAir | x ← [2 .. 8]]
+          <> [PatchSpec 5 y 5 6 SpecAir | y ← [1 .. 3]]
+          <> [ PatchSpec 1 0 5 6 (SpecCorner "stone" 15)
+             , PatchSpec 1 0 6 7 (SpecSolid "slab" 3)
+             , PatchSpec 1 0 7 8 (SpecCorner "slab" 9)
+             , PatchSpec 9 0 6 7 (SpecCorner "slab" 6)
+             , PatchSpec 9 0 7 8 (SpecCorner "slab" 0)
+             , PatchSpec 4 0 4 5 (SpecCorner "slab" 1)
+             ]
+      )
+
+-- | The west and east wall cells of 'mixedFamilies'; the last east cell is an authored corner zero, which
+-- is air, so removing it changes nothing.
+mixedWallA, mixedWallB ∷ [(Integer, Integer, Integer)]
+mixedWallA = [(1, 0, z) | z ← [5 .. 7]]
+mixedWallB = [(9, 0, z) | z ← [5 .. 7]]
 
 limitsWith ∷ Integer → DiscoveryLimits
 limitsWith batch = either (error . show) id (mkDiscoveryLimits spec)

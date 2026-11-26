@@ -16,6 +16,8 @@ module Hetoimasia.Terrain.Internal.Shape
   , cornerMaskValue
   , ShapeKey (..)
   , sideKey
+  , keySide
+  , keyCorner
   , resolveCorner
   , allShapeKeys
   , rotateKey
@@ -79,6 +81,17 @@ data ShapeKey = SideKey !ShapeId | CornerKey !CornerMask
 -- | The key of a side identity.
 sideKey ∷ ShapeId → ShapeKey
 sideKey = SideKey
+
+-- | The side identity of a side key, and 'Nothing' for a corner key.
+keySide ∷ ShapeKey → Maybe ShapeId
+keySide (SideKey shape) = Just shape
+keySide (CornerKey _) = Nothing
+
+-- | The corner mask of a corner key, and 'Nothing' for a side key. It is never
+-- mask zero.
+keyCorner ∷ ShapeKey → Maybe CornerMask
+keyCorner (CornerKey mask) = Just mask
+keyCorner (SideKey _) = Nothing
 
 -- | The key of a corner mask: 'Nothing' for mask zero, which is air, and the
 -- tagged key of every other mask.

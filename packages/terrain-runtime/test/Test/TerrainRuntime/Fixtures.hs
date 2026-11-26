@@ -80,7 +80,7 @@ import Hetoimasia.Foundation.Worker (withWorkerGroup)
 import Data.Maybe (fromMaybe, listToMaybe)
 import Data.Text (Text)
 import Hetoimasia.Terrain.Cell (Cell (..), Column, ZRange, mkColumn, mkZRange, materialIdString)
-import Hetoimasia.Terrain.Shape (shapeIdValue)
+import Hetoimasia.Terrain.Shape (cornerMaskValue, shapeIdValue)
 import Hetoimasia.Terrain.Coordinate (RegionCoord (..), TileCoord, tileCoord)
 import Control.Monad (forM_, void, when)
 import Hetoimasia.Terrain.Residency (BusyReason (..), Limits, LimitsSpec (..), RequestId, Revision (..), mkLimits)
@@ -355,11 +355,13 @@ layered layers patches =
     , specPatches = patches
     }
 
--- | The material and shape of a cell, or nothing for air.
+-- | The material and shape of a cell, or nothing for air. A corner mask @m@ is the shape @16 + m@, so a
+-- corner value never equals a side value.
 cellMaterial ∷ Cell → Maybe (String, Int)
 cellMaterial = \case
   Air → Nothing
   Solid m s → Just (materialIdString m, shapeIdValue s)
+  CornerSolid m mask → Just (materialIdString m, 16 + cornerMaskValue mask)
 
 -- | What a cell should hold, worked out from the definition and the removed
 -- cells alone, sharing no code with the library.
@@ -369,9 +371,14 @@ expectedMaterial spec removed at'@(x, y, z)
   | otherwise = case [value | PatchSpec px py lo hi value ← specPatches spec, px == x, py == y, lo <= z, z < hi] of
       (SpecAir : _) → Nothing
       (SpecSolid m shape : _) → Just (m, shape)
-      [] → case [(m, shape) | LayerSpec lo hi m shape ← specLayers spec, maybe True (<= z) lo, maybe True (z <) hi] of
-        (found : _) → Just found
+      (SpecCorner m mask : _) → if mask == 0 then Nothing else Just (m, 16 + mask)
+      [] → case [layerValue l | l ← specLayers spec, maybe True (<= z) (layerMin l), maybe True (z <) (layerMax l)] of
+        (found : _) → found
         [] → Nothing
+  where
+    layerValue l = case l of
+      LayerSpec {} → Just (layerMaterial l, layerShape l)
+      CornerLayerSpec {} → if layerCorner l == 0 then Nothing else Just (layerMaterial l, 16 + layerCorner l)
 
 -- | The four cells a tight extent of 2 x 1 x 2 allows in a region, as world tiles.
 localCells ∷ RegionCoord → [(Integer, Integer, Integer)]

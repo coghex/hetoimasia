@@ -511,24 +511,27 @@ terrainArenaValueSchema ∷ Schema
 terrainArenaValueSchema = SCapability terrainArenaType
 
 -- | A cell: the content revision it was read at, and air or an authored material with its shape.
--- @{revision = INTEGER, air = BOOLEAN, material = TEXT?, shape = INTEGER?}@; the material and shape are present exactly when
--- @air@ is false.
+-- @{revision = INTEGER, air = BOOLEAN, material = TEXT?, shape = INTEGER?, corner_mask = INTEGER?}@; the material is present exactly
+-- when @air@ is false, and then exactly one of the two discriminators is: @shape@ (@0..15@) for a side solid, @corner_mask@ (@1..15@)
+-- for a corner solid. Air carries neither.
 terrainCellValueSchema ∷ Schema
-terrainCellValueSchema = SRecord [("revision", SInteger), ("air", SBoolean), ("material", SOptional SText), ("shape", SOptional SInteger)]
+terrainCellValueSchema = SRecord [("revision", SInteger), ("air", SBoolean), ("material", SOptional SText), ("shape", SOptional SInteger), ("corner_mask", SOptional SInteger)]
 
 -- | A column: the revision and the complete coalesced runs of the half-open range, air included, in ascending order.
--- @{revision = INTEGER, runs = LIST of {z_min = INTEGER, z_max = INTEGER, air = BOOLEAN, material = TEXT?, shape = INTEGER?}}@.
+-- @{revision = INTEGER, runs = LIST of {z_min = INTEGER, z_max = INTEGER, air = BOOLEAN, material = TEXT?, shape = INTEGER?,
+-- corner_mask = INTEGER?}}@; a run's discriminators are those of a cell.
 terrainColumnValueSchema ∷ Schema
 terrainColumnValueSchema =
   SRecord
     [ ("revision", SInteger)
-    , ("runs", SList (SRecord [("z_min", SInteger), ("z_max", SInteger), ("air", SBoolean), ("material", SOptional SText), ("shape", SOptional SInteger)]))
+    , ("runs", SList (SRecord [("z_min", SInteger), ("z_max", SInteger), ("air", SBoolean), ("material", SOptional SText), ("shape", SOptional SInteger), ("corner_mask", SOptional SInteger)]))
     ]
 
 -- | A surface: the revision, and the highest occupied cell, explicitly absent for an empty column.
--- @{revision = INTEGER, occupied = BOOLEAN, z = INTEGER?, material = TEXT?, shape = INTEGER?}@.
+-- @{revision = INTEGER, occupied = BOOLEAN, z = INTEGER?, material = TEXT?, shape = INTEGER?, corner_mask = INTEGER?}@; an occupied
+-- surface carries exactly one of the two discriminators, as a cell does.
 terrainSurfaceValueSchema ∷ Schema
-terrainSurfaceValueSchema = SRecord [("revision", SInteger), ("occupied", SBoolean), ("z", SOptional SInteger), ("material", SOptional SText), ("shape", SOptional SInteger)]
+terrainSurfaceValueSchema = SRecord [("revision", SInteger), ("occupied", SBoolean), ("z", SOptional SInteger), ("material", SOptional SText), ("shape", SOptional SInteger), ("corner_mask", SOptional SInteger)]
 
 -- | A removal: whether anything changed and the committed content revision. @{changed = BOOLEAN, revision = INTEGER}@.
 terrainRemoveValueSchema ∷ Schema
@@ -583,14 +586,15 @@ terrainRetryValueSchema =
 -- @{content_revision = INTEGER, knowledge_revision = INTEGER, terrain = PART, knowledge = PART}@, where a part is
 -- @{state = "ready", cells = LIST}@ or @{state = "unavailable"}@. A list has 'terrainRegionCells' entries, in the order
 -- @1 + x + 16 * y + 256 * z@ of the zero-based local coordinates. A terrain cell is the stock cell without its revision,
--- @{air = BOOLEAN, material = TEXT?, shape = INTEGER?}@ (the material and shape present exactly when @air@ is false); a
+-- @{air = BOOLEAN, material = TEXT?, shape = INTEGER?, corner_mask = INTEGER?}@ (the material and exactly one discriminator present
+-- exactly when @air@ is false); a
 -- knowledge cell is @{solid = KNOWN, void = KNOWN}@ with each of the two @"none"@, @"known"@ or @"unknown"@.
 terrainRegionValueSchema ∷ Schema
 terrainRegionValueSchema =
   SRecord
     [ ("content_revision", SInteger)
     , ("knowledge_revision", SInteger)
-    , ("terrain", part (SRecord [("air", SBoolean), ("material", SOptional SText), ("shape", SOptional SInteger)]))
+    , ("terrain", part (SRecord [("air", SBoolean), ("material", SOptional SText), ("shape", SOptional SInteger), ("corner_mask", SOptional SInteger)]))
     , ("knowledge", part (SRecord [("solid", SText), ("void", SText)]))
     ]
   where

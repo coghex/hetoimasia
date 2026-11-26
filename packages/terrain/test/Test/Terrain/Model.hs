@@ -22,6 +22,9 @@ module Test.Terrain.Model
   , softLayer
   , patchAir
   , patchSolid
+  , patchCorner
+  , cornerLayer
+  , cornerModel
   , soilOverStone
   , fromCell
 
@@ -62,10 +65,21 @@ mustMaterial = either (error . show) id . mkMaterialId
 cellOf ∷ String → Int → Cell
 cellOf material shape = Solid (mustMaterial material) (either (error . show) id (mkShapeId shape))
 
--- | The model's reading of a library cell.
+-- | The model's reading of a library cell. A corner mask @m@ is the model value
+-- @16 + m@, so a corner value never equals a side value: side 0 and corner 15 are
+-- different model values.
 fromCell ∷ Cell → Maybe (String, Int)
 fromCell Air = Nothing
 fromCell (Solid material shape) = Just (materialIdString material, shapeIdValue shape)
+fromCell (CornerSolid material mask) = Just (materialIdString material, cornerModelBase + cornerMaskValue mask)
+
+-- | The model value of corner mask zero is none: corner zero is air.
+cornerModelBase ∷ Int
+cornerModelBase = 16
+
+-- | The model's value of a corner mask: air for zero.
+cornerModel ∷ String → Int → Maybe (String, Int)
+cornerModel material mask = if mask == 0 then Nothing else Just (material, cornerModelBase + mask)
 
 solidSpec ∷ String → Int → CellSpec
 solidSpec = SpecSolid
@@ -80,6 +94,13 @@ softLayer = LayerSpec
 
 patchAir ∷ Integer → Integer → Integer → Integer → PatchSpec
 patchAir x y lo hi = PatchSpec x y lo hi SpecAir
+
+patchCorner ∷ Integer → Integer → Integer → Integer → String → Int → PatchSpec
+patchCorner x y lo hi material mask = PatchSpec x y lo hi (SpecCorner material mask)
+
+-- | A corner layer with both endpoints given.
+cornerLayer ∷ Integer → Integer → String → Int → LayerSpec
+cornerLayer lo hi = CornerLayerSpec (Just lo) (Just hi)
 
 patchSolid ∷ Integer → Integer → Integer → Integer → String → Int → PatchSpec
 patchSolid x y lo hi material shape = PatchSpec x y lo hi (SpecSolid material shape)
@@ -106,14 +127,19 @@ modelCell spec removals (x, y, z)
       case value of
         SpecAir → Nothing
         SpecSolid material shape → Just (material, shape)
+        SpecCorner material mask → cornerModel material mask
   | (found : _) ←
-      [ (layerMaterial l, layerShape l)
+      [ layerValue l
       | l ← specLayers spec
       , fromMaybe lowest (layerMin l) <= z
       , z < fromMaybe topEnd (layerMax l)
       ] =
-      Just found
+      found
   | otherwise = Nothing
+  where
+    layerValue l = case l of
+      LayerSpec {} → Just (layerMaterial l, layerShape l)
+      CornerLayerSpec {} → cornerModel (layerMaterial l) (layerCorner l)
 
 -- | The runs of @[lo, hi)@, level by level then grouped.
 modelRuns ∷ SourceSpec → [Removal] → Integer → Integer → Integer → Integer → [(Integer, Integer, Maybe (String, Int))]
