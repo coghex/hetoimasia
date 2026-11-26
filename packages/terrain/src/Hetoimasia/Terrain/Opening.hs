@@ -84,9 +84,11 @@ module Hetoimasia.Terrain.Opening
     -- * The openings of a cell
   , CellOpenings
   , shapeOpenings
+  , keyOpenings
   , airOpenings
   , rotateOpenings
   , openingsShape
+  , openingsKey
   , Component
   , cellComponents
   , componentIndex
@@ -120,7 +122,8 @@ module Hetoimasia.Terrain.Opening
   ) where
 
 import Data.Int (Int64)
-import Data.Maybe (mapMaybe)
+import qualified Data.Map.Strict as Map
+import Data.Maybe (fromMaybe, mapMaybe)
 import Hetoimasia.Terrain.Coordinate
   ( CoordinateError
   , TileCoord
@@ -128,16 +131,18 @@ import Hetoimasia.Terrain.Coordinate
   , tileDelta
   , translateTile
   )
-import Hetoimasia.Terrain.Geometry (FaceKind (..), V3 (..), cellWorldPoint, shapeSolid, solidVertices)
+import Hetoimasia.Terrain.Geometry (FaceKind (..), V3 (..), cellWorldPoint, convexPieces, piecePlanes)
 import Hetoimasia.Terrain.Internal.Polygon
+import Hetoimasia.Terrain.Internal.Polytope (polytopeVertices)
 import Hetoimasia.Terrain.Internal.Shape
   ( ShapeId
+  , ShapeKey (..)
   , Side (..)
   , Turns
-  , allShapeIds
-  , rotateShape
+  , allShapeKeys
+  , rotateKey
   , rotateSide
-  , shapeIdValue
+  , sideKey
   , turns
   )
 
@@ -222,9 +227,10 @@ faceCoordinates TopFace (V3 x y _) = (x, y)
 
 -- | An exact region of a cell face, in face coordinates: a union of convex
 -- pieces without a common interior, and the part of the face the solid covers
--- (the corners of its section, which can be a segment or a point and so have no
--- area). Obtain one from a 'Portal'.
-data Opening = Opening ![Poly] ![P2]
+-- (one list of corners for the section of each closed convex piece of the solid,
+-- each of which can be a polygon, a segment or a point and so have no area).
+-- Obtain one from a 'Portal'.
+data Opening = Opening ![Poly] ![[P2]]
   deriving stock (Eq, Show)
 
 -- | The convex pieces, each counter-clockwise from its least corner, with the
@@ -241,22 +247,23 @@ openingIsEmpty ∷ Opening → Bool
 openingIsEmpty (Opening pieces _) = null pieces
 
 -- | Whether a face point is open air: in the region and not on the solid. The
--- solid is closed, so every point of its section by the face, edges and corners
--- included, belongs to it and is not air (@classifyPoint@ calls the corresponding
--- cell point a boundary point). A point of the region off the solid, including one
--- on the seam between two pieces or on the edge of the face itself, is exactly a
--- point the solid classifies as exterior. The pieces are closed polygons, which
--- serve the area; this predicate is what stays true to the solid's boundary.
+-- solid is closed, so every point of the section by the face of any of its
+-- convex pieces, edges and corners included, belongs to it and is not air
+-- (@classifyPoint@ calls the corresponding cell point a boundary point of a side
+-- solid). A point of the region off the solid, including one on the seam between
+-- two pieces or on the edge of the face itself, is exactly a point the solid
+-- classifies as exterior. The pieces are closed polygons, which serve the area;
+-- this predicate is what stays true to the solid's boundary.
 openingContains ∷ Opening → (Rational, Rational) → Bool
-openingContains (Opening pieces section) point =
-  any (`containsClosed` point) pieces && not (containsSection section point)
+openingContains (Opening pieces sections) point =
+  any (`containsClosed` point) pieces && not (any (`containsSection` point) sections)
 
 -- ---------------------------------------------------------------------------
 -- The openings of a cell
 
 -- | The openings of a cell: its components and their portals. Obtain one with
--- 'shapeOpenings' or 'airOpenings'; the constructor is private.
-data CellOpenings = CellOpenings !(Maybe ShapeId) ![Component]
+-- 'shapeOpenings', 'keyOpenings' or 'airOpenings'; the constructor is private.
+data CellOpenings = CellOpenings !(Maybe ShapeKey) ![Component]
   deriving stock (Eq, Show)
 
 -- | One connected region of empty space inside a cell, with the portals through
@@ -269,9 +276,17 @@ data Component = Component !Int ![Portal]
 data Portal = Portal !FaceKind !Int !Opening
   deriving stock (Eq, Show)
 
--- | The shape these openings were derived from; 'Nothing' for full air.
+-- | The side shape these openings were derived from; 'Nothing' for full air and
+-- for the openings of a corner key (see 'openingsKey').
 openingsShape ∷ CellOpenings → Maybe ShapeId
-openingsShape (CellOpenings shape _) = shape
+openingsShape (CellOpenings (Just (SideKey shape)) _) = Just shape
+openingsShape _ = Nothing
+
+-- | The key these openings were derived from, of either family; 'Nothing' for
+-- full air. A corner cell's openings carry their key, so they are never mistaken
+-- for air and they turn with 'rotateOpenings'.
+openingsKey ∷ CellOpenings → Maybe ShapeKey
+openingsKey (CellOpenings key _) = key
 
 -- | The cell's empty components: none for a sealed block, one for every other
 -- catalog shape and for air, and in general any number.
@@ -311,32 +326,45 @@ portalOpening (Portal _ _ opening) = opening
 airOpenings ∷ CellOpenings
 airOpenings = CellOpenings Nothing [Component 0 [Portal face 0 (Opening [unitSquare] []) | face ← cellFaces]]
 
--- | The openings of a catalog shape in its authored orientation.
+-- | The openings of a side shape in its authored orientation.
 shapeOpenings ∷ ShapeId → CellOpenings
-shapeOpenings shape = catalog !! shapeIdValue shape
+shapeOpenings = keyOpenings . sideKey
 
--- | The openings after quarter turns. For a shape this is the openings of the
--- turned shape, so facets, components and face coordinates turn together and four
--- turns restore the original; full air is unchanged.
+-- | The openings of any occupied key, side or corner, in its authored
+-- orientation. Air has none of its own: it is 'airOpenings'.
+keyOpenings ∷ ShapeKey → CellOpenings
+keyOpenings key = fromMaybe (error "Terrain.Opening.keyOpenings: a key outside allShapeKeys") (Map.lookup key catalog)
+
+-- | The openings after quarter turns. For a key this is the openings of the
+-- turned key ('rotateKey'), so facets, components and face coordinates turn
+-- together and four turns restore the original; full air is unchanged.
 rotateOpenings ∷ Turns → CellOpenings → CellOpenings
-rotateOpenings count openings = case openingsShape openings of
+rotateOpenings count openings = case openingsKey openings of
   Nothing → openings
-  Just shape → shapeOpenings (rotateShape count shape)
+  Just key → keyOpenings (rotateKey count key)
 
-catalog ∷ [CellOpenings]
-catalog = map build allShapeIds
+catalog ∷ Map.Map ShapeKey CellOpenings
+catalog = Map.fromList [(key, build key) | key ← allShapeKeys]
   where
-    build shape = CellOpenings (Just shape) [Component 0 owned | not (null owned)]
+    build key = CellOpenings (Just key) [Component 0 owned | not (null owned)]
       where
-        vertices = solidVertices (shapeSolid shape)
-        -- A face's opening: the unit square less the solid's section by the
-        -- face's plane, which is the hull of the solid's vertices on that plane.
+        -- The closed convex pieces of the solid, each as the corners of its
+        -- vertices that lie on a face's plane. The plane supports every piece,
+        -- so that is the piece's section by the face.
+        pieceVertices = [polytopeVertices (piecePlanes piece) | piece ← convexPieces key]
+        sections face = filter (not . null) [[faceCoordinates face v | v ← vertices, onFacePlane face v] | vertices ← pieceVertices]
+        -- A face's opening: the unit square less the union of the pieces'
+        -- sections. Each section is a convex polygon, a segment or a point;
+        -- removing the polygons one after another leaves convex pieces without a
+        -- common interior, and the degenerate sections cover only their own
+        -- points, which 'openingContains' keeps out of the region.
         opening face =
-          let covered = [faceCoordinates face v | v ← vertices, onFacePlane face v]
-           in Opening (subtractConvex unitSquare (convexHull covered)) covered
-        -- Every portal belongs to the shape's one component: the empty region
+          let covered = sections face
+              remove regions hull = concatMap (`subtractConvex` hull) regions
+           in Opening (foldl remove [unitSquare] (filter (not . null) (map convexHull covered))) covered
+        -- Every portal belongs to the key's one component: the empty region
         -- lies above a graph, so it is joined upward to the top face (see the
-        -- module header). A shape with no portal of positive area has no empty
+        -- module header). A key with no portal of positive area has no empty
         -- component.
         owned = [Portal face 0 region | face ← cellFaces, let region = opening face, not (openingIsEmpty region)]
 
