@@ -11,7 +11,7 @@
 -- * hold the owner at the point where each kind of work runs, and show the honest model
 --   passes the comparison there; and
 -- * damage the model's side the way a faulty accounting would (a job charged 1 byte
---   instead of 400, a scratch of 1 instead of 578, a handoff duplicate zeroed, a job
+--   instead of 404, a scratch of 1 instead of 579, a handoff duplicate zeroed, a job
 --   forgotten early, a preparation's record or growth dropped) and require the
 --   comparison to fail, naming what is under-charged.
 --
@@ -71,13 +71,13 @@ mentions needle = any (needle `isInfixOf`)
 spec ∷ Spec
 spec = describe "The accounting oracle and its controls" $ do
   -- A load job: a one-cell read in a fresh region. Its coverage is one column and one
-  -- segment. The model grants it 400 bytes of resident (48 for the column index, 32 of segment
-  -- metadata and the 64 of dense payload a segment can need, and the 256 the region's metadata
-  -- costs) and 578 of scratch (a 256-byte frame, two bytes for the one cell, and the removed runs
+  -- segment. The model grants it 404 bytes of resident (48 for the column index, 32 of segment
+  -- metadata and the 68 of payload a segment can need, and the 256 the region's metadata
+  -- costs) and 579 of scratch (a 256-byte frame, three bytes (two and a tag bit) for the one cell, and the removed runs
   -- a load reads of its one column over the region's 32 levels: at most 17 intervals of 16 bytes and
   -- a 48-byte entry, 320). The record holds that grant and,
   -- separately, the least the coverage can hold, worked out from the data layer's sizes: 82
-  -- (48 + 32 + the two payload bytes of a uniform segment) and 578.
+  -- (48 + 32 + the two payload bytes of a uniform segment) and 579.
   describe "a running load job" $ do
     let atJob act = do
           gate <- newDisarmedGate
@@ -94,14 +94,14 @@ spec = describe "The accounting oracle and its controls" $ do
     it "is recorded from the coverage it loads, and the honest model passes" $
       atJob $ \svc → do
         (model, held, charged) <- look svc
-        -- The record: the job as granted (400 and 578, the figures the reviewer's control reduced)
+        -- The record: the job as granted (404 and 579, the figures the reviewer's control reduced)
         -- and the least its coverage can hold from the data layer's sizes (one column index entry,
-        -- 48, and one uniform segment, 32 of metadata and 2 of payload, 82; the scratch, 578).
-        [(hjGrantedResident j, hjGrantedScratch j, hjResident j, hjScratch j, hjSlots j) | j ← heldJobs held] `shouldBe` [(400, 578, 82, 578, 1)]
-        [(cjResident j, cjScratch j) | j ← cJobs charged] `shouldBe` [(400, 578)]
+        -- 48, and one uniform segment, 32 of metadata and 2 of payload, 82; the scratch, 579).
+        [(hjGrantedResident j, hjGrantedScratch j, hjResident j, hjScratch j, hjSlots j) | j ← heldJobs held] `shouldBe` [(404, 579, 82, 579, 1)]
+        [(cjResident j, cjScratch j) | j ← cJobs charged] `shouldBe` [(404, 579)]
         disagreements held charged `shouldBe` []
         slotInUse model LoadJobSlot `shouldBe` 1
-    it "fails the comparison when the model reserves 1 byte of resident and 1 of scratch instead of 400 and 578" $
+    it "fails the comparison when the model reserves 1 byte of resident and 1 of scratch instead of 404 and 579" $
       atJob $ \svc → do
         (_, held, charged) <- look svc
         let found = disagreements held (chargingJobs 1 1 charged)
@@ -112,10 +112,10 @@ spec = describe "The accounting oracle and its controls" $ do
     it "fails the comparison for a reserve one byte short, and for a scratch one byte short" $
       atJob $ \svc → do
         (_, held, charged) <- look svc
-        -- as granted: 400 and 578, so a charge one byte short of either is under-charged
-        mentions "resident reservation" (disagreements held (chargingJobs 399 578 charged)) `shouldBe` True
-        mentions "scratch" (disagreements held (chargingJobs 400 577 charged)) `shouldBe` True
-        disagreements held (chargingJobs 400 578 charged) `shouldBe` []
+        -- as granted: 404 and 579, so a charge one byte short of either is under-charged
+        mentions "resident reservation" (disagreements held (chargingJobs 403 579 charged)) `shouldBe` True
+        mentions "scratch" (disagreements held (chargingJobs 404 578 charged)) `shouldBe` True
+        disagreements held (chargingJobs 404 579 charged) `shouldBe` []
     it "fails the comparison when the model forgot the job early (acknowledged it while it runs)" $
       atJob $ \svc → do
         (model, census) <- snap svc
@@ -188,7 +188,7 @@ spec = describe "The accounting oracle and its controls" $ do
         case runningPreparation (censusRunning census) of
           Nothing → expectationFailure "the owner is preparing a removal but recorded none"
           Just p → do
-            (preparationRemoval p, preparationResident p, preparationStaging p, preparationEdit p) `shouldBe` (True, 62, 512, 64)
+            (preparationRemoval p, preparationResident p, preparationStaging p, preparationEdit p) `shouldBe` (True, 66, 512, 64)
             preparationRecordBytes p `shouldBe` 160
         usageOf svc `shouldReturn` []
     it "fails the comparison when the model forgot the request being prepared, or reserves no growth for it" $
@@ -224,9 +224,9 @@ spec = describe "The accounting oracle and its controls" $ do
     it "is recorded as granted, holds no slot, and the honest model charges it" $
       withWaiting $ \svc → do
         (_, held, charged) <- look svc
-        sort [(hjGrantedResident j, hjGrantedScratch j, hjResident j, hjScratch j, hjSlots j) | j ← heldJobs held] `shouldBe` [(400, 578, 0, 0, 0), (400, 578, 82, 578, 1)]
+        sort [(hjGrantedResident j, hjGrantedScratch j, hjResident j, hjScratch j, hjSlots j) | j ← heldJobs held] `shouldBe` [(404, 579, 0, 0, 0), (404, 579, 82, 579, 1)]
         disagreements held charged `shouldBe` []
-    it "fails the comparison when the model releases only the waiting job's 400 bytes of resident and 578 of scratch" $
+    it "fails the comparison when the model releases only the waiting job's 404 bytes of resident and 579 of scratch" $
       withWaiting $ \svc → do
         (_, held, charged) <- look svc
         let waiting = [hjJob j | j ← heldJobs held, hjSlots j == 0]
@@ -241,8 +241,8 @@ spec = describe "The accounting oracle and its controls" $ do
       withWaiting $ \svc → do
         (_, held, charged) <- look svc
         let waiting = [hjJob j | j ← heldJobs held, hjSlots j == 0]
-        mentions "resident reservation" (disagreements held (chargingJobsWhere ((`elem` waiting) . cjJob) 399 578 charged)) `shouldBe` True
-        mentions "scratch" (disagreements held (chargingJobsWhere ((`elem` waiting) . cjJob) 400 577 charged)) `shouldBe` True
+        mentions "resident reservation" (disagreements held (chargingJobsWhere ((`elem` waiting) . cjJob) 403 579 charged)) `shouldBe` True
+        mentions "scratch" (disagreements held (chargingJobsWhere ((`elem` waiting) . cjJob) 404 578 charged)) `shouldBe` True
 
   -- A borrow's hold names the regions its snapshot covers, and a view's description the
   -- regions its accepted demand describes: both are read from what the service handed out

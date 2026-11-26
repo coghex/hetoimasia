@@ -462,10 +462,10 @@ residencyOutput =
   [ "valid"
   , "LimitNotPositive FieldLoadJobs 0"
   , "LimitUnrepresentable FieldResidentBytes 1099511627777"
-  , "BankBelowMinimum ResidentBank 964 963"
+  , "BankBelowMinimum ResidentBank 974 963"
   , "ArenaOpened"
   , "[JobId 0]"
-  , "(0,400)"
+  , "(0,404)"
   , "Invalid EmptyDemand"
   , "True"
   ]

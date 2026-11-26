@@ -284,7 +284,7 @@ roomyPressure ∷ Limits
 roomyPressure =
   limitsWith $ \s →
     s
-      { specResidentBytes = 9000
+      { specResidentBytes = 9400
       , specEditBytes = 2048
       , specStagingBytes = 12000
       , specLoadJobs = 8
@@ -845,13 +845,13 @@ minimumBudgetsAreEnforced (resident, edit, staging, jobs) (query, x, y, z) =
           }
       columns = x * y
       intervals = columns * ((z + 1) `div` 2)
-      stored = 256 + 48 * columns + 34 * columns * z
-      job = 48 * columns + 96 * intervals
-      -- a frame, two bytes a cell, and the runs a load reads of every column it touches over the
+      stored = 256 + 48 * columns + 35 * columns * z
+      job = 48 * columns + 100 * intervals
+      -- a frame, two bytes and a tag bit a cell, and the runs a load reads of every column it touches over the
       -- extent's z levels: at most z / 2 + 1 of 16 bytes, and a 48-byte entry, a column
-      scratch = 256 + 2 * columns * z + columns * ((z `div` 2 + 1) * 16 + 48)
-      needResident = maximum [4 * stored, stored + job] + maximum [query * (stored + job), stored + 48 + 96 + 62]
-      needStaging = maximum [64 * 4, 192 + 64 + scratch] + maximum [128 + 32 * query + 64 * query + query * scratch, 160 + 512 + 64 + 258 + (z `div` 2 + 1) * 16 + 48, stored]
+      scratch = 256 + 2 * columns * z + (columns * z + 7) `div` 8 + columns * ((z `div` 2 + 1) * 16 + 48)
+      needResident = maximum [4 * stored, stored + job] + maximum [query * (stored + job), stored + 48 + 100 + 66]
+      needStaging = maximum [64 * 4, 192 + 64 + scratch] + maximum [128 + 32 * query + 64 * query + query * scratch, 160 + 512 + 64 + 259 + (z `div` 2 + 1) * 16 + 48, stored]
       expected
         | resident < needResident = Just (BankBelowMinimum ResidentBank needResident resident)
         | edit < 64 = Just (BankBelowMinimum EditBank 64 edit)

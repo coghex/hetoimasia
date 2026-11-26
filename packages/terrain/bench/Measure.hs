@@ -167,10 +167,10 @@ operations name source palette = do
   _ ← evaluate (statSegments (residentStats resident))
   -- Coherent lookups walk consecutive levels of one column; scattered lookups
   -- jump between columns and levels with a fixed multiplicative sequence.
-  let coherent i = maybe 0 (fromIntegral . packedWord) (residentPacked resident (tileAt 3 4 (toInteger (i `mod` 128) - 64)))
+  let coherent i = maybe 0 (fromIntegral . packedBits) (residentPacked resident (tileAt 3 4 (toInteger (i `mod` 128) - 64)))
       scattered i =
         let h = (i * 2654435761) `mod` 32768
-         in maybe 0 (fromIntegral . packedWord) (residentPacked resident (tileAt (toInteger (h `mod` 16)) (toInteger ((h `div` 16) `mod` 16)) (toInteger ((h `div` 256) `mod` 128) - 64)))
+         in maybe 0 (fromIntegral . packedBits) (residentPacked resident (tileAt (toInteger (h `mod` 16)) (toInteger ((h `div` 16) `mod` 16)) (toInteger ((h `div` 256) `mod` 128) - 64)))
   (c1, k1) ← timed 2000000 coherent
   lineFor name "lookup coherent" "ns/op" c1 k1
   (c2, k2) ← timed 2000000 scattered

@@ -27,6 +27,7 @@ module Hetoimasia.Terrain.Internal.Residency.Coverage
   , costBytes
   , reserveCost
   , removalResidentGrowthBytes
+  , cellsScratchBytes
   , regionMetadataBytes
   , interestRecordBytes
   , holdRecordBytes
@@ -51,6 +52,7 @@ import Data.Word (Word64)
 import Hetoimasia.Terrain.Changes (changeColumnBytes, changeIntervalBytes, runsMeetingLevels)
 import Hetoimasia.Terrain.Coordinate (LocalCoord, localX, localY, localZ)
 import Hetoimasia.Terrain.Resident (columnIndexBytes)
+import Hetoimasia.Terrain.Segment (maxSegmentPayloadBytes)
 
 -- | A set of cells inside one region.
 newtype Coverage = Coverage (Map (Int, Int) [(Int, Int)])
@@ -190,25 +192,29 @@ costBytes (Cost columns segments payload) = do
 --   under-charges, the shared index). A job does not depend on any other job to
 --   fund its columns.
 -- * at most one segment per interval of @delta@ (merging only lowers the count);
--- * the dense payload bound, 64 bytes, per interval: an interval becomes, or
---   merges into, one segment of at most 32 cells, and a segment's payload is at
---   most two bytes per cell. Merging into segments that already exist can raise
+-- * the payload bound, 'maxSegmentPayloadBytes' (68) bytes, per interval: an
+--   interval becomes, or merges into, one segment of at most 32 cells, and a
+--   segment's payload is at most two bytes per cell and one tag bit per cell. Merging into segments that already exist can raise
 --   the payload of the merged segment (a uniform 31-cell segment is two bytes,
---   the merged dense segment 64), so a figure proportional to the new cells alone
+--   the merged dense segment 68), so a figure proportional to the new cells alone
 --   would not bound the growth.
 reserveCost ∷ Coverage → Cost
 reserveCost delta =
   Cost
     { costColumns = coverageColumns delta
     , costSegments = coverageSegments delta
-    , costPayloadBytes = 64 * coverageSegments delta
+    , costPayloadBytes = segmentPayloadBound * coverageSegments delta
     }
 
 -- | The most a whole-cell removal can raise the payload of the segment it edits:
--- a segment's payload is at least 2 bytes (uniform) and at most 64 (dense, 32
--- cells), and the edit rebuilds exactly that one segment.
+-- a segment's payload is at least 2 bytes (uniform) and at most 68 (dense, 32
+-- cells, one a corner), and the edit rebuilds exactly that one segment.
 removalResidentGrowthBytes ∷ Word64
-removalResidentGrowthBytes = 62
+removalResidentGrowthBytes = segmentPayloadBound - 2
+
+-- | The most payload bytes one segment holds ('maxSegmentPayloadBytes').
+segmentPayloadBound ∷ Word64
+segmentPayloadBound = fromIntegral maxSegmentPayloadBytes
 
 -- | Fixed metadata charged for each resident region, however little of it is
 -- known: the region key, its coverage index and its bookkeeping. This is what
@@ -234,10 +240,15 @@ descriptionBytes ∷ Word64 → Word64
 descriptionBytes n = 128 + 64 * n
 
 -- | The scratch a load of @delta@ needs (staging), for the load's whole life, in a region whose
--- loadable extent is @levels@ high: a fixed frame, a full extra copy of its cells at two bytes each,
+-- loadable extent is @levels@ high: a fixed frame, a full extra copy of its cells at 'cellsScratchBytes' (two bytes and a tag bit each),
 -- and the removed runs the load reads of the columns it touches ('loadRunsBytes').
 scratchBytes ∷ Word64 → Coverage → Word64
-scratchBytes levels delta = 256 + 2 * coverageCells delta + loadRunsBytes levels (coverageColumns delta)
+scratchBytes levels delta = 256 + cellsScratchBytes (coverageCells delta) + loadRunsBytes levels (coverageColumns delta)
+
+-- | The scratch bytes of a decoded copy of @cells@ cells: their 16-bit words and
+-- one family-tag bit each.
+cellsScratchBytes ∷ Word64 → Word64
+cellsScratchBytes cells = 2 * cells + (cells + 7) `div` 8
 
 -- | The removed runs a load keeps of @columns@ columns, at most, by the figures of
 -- "Hetoimasia.Terrain.Changes". A load reads EVERY COLUMN IT TOUCHES OVER THE REGION'S LOADABLE
@@ -264,11 +275,12 @@ regionColumnReserveBytes ∷ Word64
 regionColumnReserveBytes = fromIntegral columnIndexBytes
 
 -- | What 'reserveCost' charges for one interval of a job: its segment metadata
--- (32) and the dense payload bound (64).
+-- (32) and the payload bound (68).
 regionSegmentReserveBytes ∷ Word64
-regionSegmentReserveBytes = 32 + 64
+regionSegmentReserveBytes = 32 + segmentPayloadBound
 
 -- | What one stored segment can occupy beyond its payload: its metadata. The
--- payload is at most two bytes per cell.
+-- payload is at most three bytes for one cell (a corner), and 'segmentPayloadBound'
+-- for a whole segment.
 regionSegmentStoredBytes ∷ Word64
 regionSegmentStoredBytes = 32

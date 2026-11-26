@@ -102,10 +102,10 @@ removalStaging = 512
 resultRecord = 160
 
 -- | The most a whole-cell removal can raise the payload of the segment it edits: a dense
--- segment of 'maxSegmentLevels' cells is two bytes a cell, a uniform one two bytes in
--- all. The model reserves exactly this for each removal.
+-- segment of 'maxSegmentLevels' cells is two bytes a cell and one tag bit a cell (68), a
+-- uniform one two bytes in all. The model reserves exactly this for each removal.
 removalGrowthBound ∷ Word64
-removalGrowthBound = 2 * fromIntegral maxSegmentLevels - 2
+removalGrowthBound = 2 * fromIntegral maxSegmentLevels + fromIntegral maxSegmentLevels `div` 8 - 2
 
 -- ---------------------------------------------------------------------------
 -- What the service holds

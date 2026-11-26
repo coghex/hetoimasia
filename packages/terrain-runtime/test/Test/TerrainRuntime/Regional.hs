@@ -413,7 +413,7 @@ extentConfig (ex, ey, ez) = defaultConfig {configLimits = limits, configRetained
     first' = fromMaybe (error "no valid limits for the extent") . listToMaybe
     smallest = first' [r | r ← [100, 200 .. 4000000], Just _ ← [valid r 1000000]]
     stagingFor resident = first' [t | t ← [1000, 2000 .. 4000000], Just _ ← [valid resident t]]
-    resident' = smallest + 2 * 400
+    resident' = smallest + 2 * 404
     limits = fromMaybe (error "the extent's limits are invalid") (valid resident' (3 * stagingFor resident' + toInteger retained))
 
 reducedExtentSpec ∷ Spec

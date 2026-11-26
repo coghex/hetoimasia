@@ -55,9 +55,9 @@ metaBytes ∷ Word
 metaBytes = 256
 
 -- | What a one-cell region job reserves: metadata 256, one column entry 48, one
--- segment 32 and the dense payload bound of 64.
+-- segment 32 and the payload bound of 68.
 oneCellResident ∷ Word
-oneCellResident = 256 + 48 + 32 + 64
+oneCellResident = 256 + 48 + 32 + 68
 
 -- | What the data layer stores for one isolated cell: the same, with the payload
 -- it actually needs (two bytes).
@@ -66,12 +66,12 @@ oneCellStored = 256 + 48 + 32 + 2
 
 -- | The resident growth a removal reserves for its rebuilt segment.
 removalGrowth ∷ Word
-removalGrowth = 62
+removalGrowth = 66
 
--- | Scratch of a one-cell load: a 256-byte frame, two bytes per cell, and the removed runs of its
+-- | Scratch of a one-cell load: a 256-byte frame, two bytes and a tag bit (three bytes) for the cell, and the removed runs of its
 -- one column (at most one run of 16 bytes, and a 48-byte column entry).
 oneCellScratch ∷ Word
-oneCellScratch = 256 + 2 + (0 + 1) * 16 + 48
+oneCellScratch = 256 + 3 + (0 + 1) * 16 + 48
 
 interestBytes ∷ Word
 interestBytes = 64
@@ -104,14 +104,14 @@ honestCost m j =
 
 -- | The tiny budget the traces share: two one-cell regions fit, three do not. Its
 -- caps are two regions per request and a one-cell extent, so its banks satisfy
--- the minimum budgets (a request of two regions needs 964 resident bytes).
+-- the minimum budgets (a request of two regions needs 974 resident bytes).
 tiny ∷ Limits
 tiny = limitsWith id
 
 -- | The tiny specification: two regions per query, a one-cell extent, no holds and
 -- no camera (each needs room beyond the explicit minimum), and banks that meet the minimum budgets (a query
--- of two regions needs 964 resident bytes and 994 staging bytes; each region of the
--- largest hold adds 338 and 64).
+-- of two regions needs 974 resident bytes and 994 staging bytes; each region of the
+-- largest hold adds 339 and 64).
 baseSpec ∷ LimitsSpec
 baseSpec =
   LimitsSpec

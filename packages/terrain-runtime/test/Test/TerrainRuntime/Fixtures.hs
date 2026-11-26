@@ -305,7 +305,7 @@ tightConfigStaging factor (ex, ey, ez) spare edit = defaultConfig {configLimits 
     valid bytes staging = either (const Nothing) Just (mkLimits (spec bytes staging))
     smallest = fromMaybe (error "no resident bank satisfies the minimum budgets") (listToMaybe [r | r <- [100, 200 .. 4000000], Just _ <- [valid r 1000000]])
     stagingFor bytes = fromMaybe (error "no staging bank satisfies the minimum budgets") (listToMaybe [t | t <- [1000, 2000 .. 4000000], Just _ <- [valid bytes t]])
-    residentBank = smallest + spare * 400
+    residentBank = smallest + spare * 404
     limits = fromMaybe (error "tight limits are invalid") (valid residentBank (factor * stagingFor residentBank))
 
 -- | The smallest validated limits for a single-cell-wide extent of two levels, one
