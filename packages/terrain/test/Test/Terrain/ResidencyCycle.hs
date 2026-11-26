@@ -303,6 +303,37 @@ spec = describe "Residency over the real data layer" $ do
     (_, admitted) ← stepOk (wModel evens) (SubmitQuery (RequestId 100) a1 rev0 [demand (reg 0 0 0) odds])
     length (admissionJobs (admission' admitted)) `shouldBe` 1
     admissionVictims (admission' admitted) `shouldBe` []
+  it "charges the scratch of the whole segment a one-cell load rebuilds, at the exact staging boundary" $ do
+    -- Extent 1 x 1 x 32, one region per query. Sixteen alternating levels (1, 3, .., 31) are removed, and
+    -- levels 0 to 30 are resident as one 31-cell segment. Loading level 31 merges into it and rebuilds
+    -- a 32-cell dense segment: 256 bytes of frame, 4 x 32 of decoded cells and the removed runs (the
+    -- real records are 16 x 16 + 48 = 304 of the 320 charged), 704, beside a command (160) and an
+    -- interest (64): 928. Another one-cell query already holds 928, so 1,856 staging bytes admit the load
+    -- and 1,855 refuse it, leaving the resident segment as it was.
+    let column = mustColumn 0 0
+        odd' = [1, 3 .. 31]
+        scenario staging = do
+          w0 ← initialWith (limitsWith $ \s → s {specExtentZ = 32, specQueryRegions = 1, specQueuedCommands = 8, specResidentBytes = 8000, specStagingBytes = staging})
+          changes ← foldM (\c z → either (fail . show) (pure . removeResult) (removeCell changeLimits source (mustTile 0 0 z) c)) (wChanges w0) odd'
+          w1 ← submit w0 {wChanges = changes} (SubmitQuery (RequestId 1) a1 rev0 [demand (reg 0 0 0) (box 0 1 0 1 0 31)]) >>= drain >>= \w → settle w 1
+          map segmentLength (residentSegments (wResident w1) column) `shouldBe` [31]
+          (m2, _) ← stepOk (wModel w1) (SubmitQuery (RequestId 2) a1 rev0 [demand (reg 1 0 0) (cell 0 0 0)])
+          ledgersOf m2 `shouldBe` Ledgers (398, 404) (0, 0) (224, 704)
+          pure w1 {wModel = m2}
+        extend w = stepOk (wModel w) (SubmitQuery (RequestId 3) a1 rev0 [demand (reg 0 0 0) (cell 0 0 31)])
+    -- One byte short: refused, and the resident segment is untouched.
+    short ← scenario 1855
+    refusal ← stepRefused (wModel short) (SubmitQuery (RequestId 3) a1 rev0 [demand (reg 0 0 0) (cell 0 0 31)])
+    refusal `shouldBe` Busy (BankFull StagingBank 1855 928 928)
+    map segmentLength (residentSegments (wResident short) column) `shouldBe` [31]
+    -- At the boundary: admitted with the 704 charged, and the real rebuild is the 32-cell dense segment.
+    exact ← scenario 1856
+    (m3, accepted) ← extend exact
+    ledgersOf m3 `shouldBe` Ledgers (398, 552) (0, 0) (448, 1408)
+    w4 ← drain exact {wModel = m3}
+    map segmentLength (residentSegments (wResident w4) column) `shouldBe` [32]
+    assertCharged w4
+    length (admissionJobs (admission' accepted)) `shouldBe` 1
   it "keeps a surviving region charged for the shared column index after each individual release" $ do
     -- Two vertical regions of one column share one real column index entry; each
     -- is charged for its own column, so evicting either leaves the other charged.
