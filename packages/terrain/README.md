@@ -418,7 +418,7 @@ key.
 A `SourceSpec` is plain data: a list of unique authored material identifiers, a
 sorted list of non-overlapping half-open `[z_min, z_max)` layers shared by every
 column, and a list of `(x, y, z_min, z_max, value)` patches that override the
-base with air or a material and shape. A level no layer or patch covers is air.
+base with air or a material and shape of either family. A level no layer or patch covers is air.
 An omitted layer lower end is the lowest supported level and an omitted upper end
 is one past the highest, so the last supported cell is covered. There is no
 callback, Lua value, random stream or game-specific generator, and soil over
@@ -431,9 +431,20 @@ refusal; no partial source exists. It refuses an overlapping layer
 (`OverlappingLayers`) and a layer that begins before its predecessor
 (`LayersOutOfOrder`: the format requires sorted layers), overlapping patches in
 one column, an invalid interval, a coordinate outside the supported range, a
-duplicate or unknown material, an invalid material identifier, a shape outside
-`0..15` and an oversized definition. Creating a source instantiates no column
-and no buried cell; it stores the authored records only.
+duplicate or unknown material, an invalid material identifier, a side identity
+outside `0..15` (`InvalidShape`), a corner mask outside `0..15`
+(`InvalidCornerMask`) and an oversized definition. Creating a source
+instantiates no column and no buried cell; it stores the authored records only.
+
+A layer or patch names its shape in one of two families. The historic forms,
+`LayerSpec` and `SpecSolid`, take a numeric side identity and keep their meaning
+and refusals. The explicit corner forms, `CornerLayerSpec` and `SpecCorner`, take
+a corner mask `0..15`: a nonzero mask is a `CornerSolid` cell and mask zero is
+air. A corner-zero record is validated like any other (interval, order, overlap
+and declared material) and counts as an authored run; its cells read as `Air`,
+join the air beside them in a column read, are never reported by
+`highestOccupied` and connect and discover exactly as air does. An out-of-range
+mask refuses the whole definition.
 
 ### Half-open limits
 
@@ -478,15 +489,19 @@ tested accepting exactly at the limit and refusing one past it.
 (`emptyChanges` for the source alone), so a query consults retained changes
 whether or not any cell is resident and does not depend on request order.
 
-- `cellAt` answers `Air` or `Solid material shape`.
+- `cellAt` answers `Air`, `Solid material side` or `CornerSolid material mask`.
+  `cellShapeKey` gives a stored cell the tagged `ShapeKey` the geometry table
+  lists for it (`Nothing` for air), so a side and a corner cell never share a key:
+  side 0 and corner 15 are different full blocks, and vertically adjacent cells
+  of one material that differ only in family never coalesce into one run.
 - `columnRuns` answers a complete finite half-open range of one column as
   coalesced runs: the runs cover the whole interval, air included, with no gap
   and no two adjacent equal runs. A range longer than `limitRangeLevels` (8,192
   initially) or an answer with more than `limitReturnedRuns` (1,024 initially)
   is refused with `RangeTooLarge` or `TooManyRuns`; it is never truncated, and
   the run count is decided by pulling at most one run past the limit.
-- `highestOccupied` answers the highest solid cell, or `Nothing` for an empty
-  column.
+- `highestOccupied` answers the highest solid cell with its material and tagged
+  `ShapeKey` (`occupiedShape`), or `Nothing` for an empty column.
 
 Every query steps from one interval boundary to the next across the source's
 layers, the column's patches and its removed intervals, so a long stretch of air,
@@ -529,8 +544,8 @@ bottom opening of positive area). Edge and point contact never connects, there i
 no tolerance and no blanket 26-neighbour rule, so a real diagonal path through
 shaped voids exists exactly where a face-by-face chain does. The compiler never
 asks about bounding boxes, shape bits or rendered alpha. It derives every fact
-from `Opening`: which pairs of the 17 content kinds (air and the 16 identities)
-connect along each axis, whether a kind has any void and whether its top face
+from `Opening`: which pairs of the 32 content kinds (air, the 16 side
+identities and the 15 nonzero corner masks) connect along each axis, whether a kind has any void and whether its top face
 opens, by asking about a representative pair of tiles.
 
 ### Representation: boxes, parameters and classes
@@ -948,9 +963,10 @@ carrying any other bit (`NonCanonicalAir`), a bit above the tag (`UnknownTagBits
 and a corner value of zero (`PackedCornerZero`). `mkPackedCell` checks a historic
 word and `mkPackedBits` a 17-bit value; `packKey`, `internKey`, `packCorner`,
 `internCorner` and `packIndexed` build a cell of either family, and `unpackKey`
-decodes one to its material and `ShapeKey`. `Cell` has no corner constructor yet,
-so `unpackCell` (and `residentCell`) returns `CornerCell` for a corner value and
-never a side solid. `packedWord`, the historic word, is `Nothing` for a corner
+decodes one to its material and `ShapeKey`. `unpackCell` (and `residentCell`)
+decodes a side value to `Solid` and a corner value to `CornerSolid`, and
+`packCell` refuses a `CornerSolid` of mask zero, which is air, with
+`PackedCornerZero`. `packedWord`, the historic word, is `Nothing` for a corner
 value; `packedBits` is the whole 17-bit value. Assigned indices are never
 reassigned. This packing is internal: it is not a Lua numeric identifier or a
 save-format promise, and the v1 page store never serializes a packed word.

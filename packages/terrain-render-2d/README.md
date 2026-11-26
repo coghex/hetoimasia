@@ -191,7 +191,7 @@ TRA-2 authority); whether a cell may be *shown* is the residency owner's
 `Availability`: per horizontal chunk (16 × 16 columns), the half-open level
 intervals that are ready, or `AllKnown`. A level in no ready interval is
 **unavailable**, which is neither air nor solid. Every query keeps the three
-answers apart (`FAir`, `FSolid`, `FUnknown`); a missing neighbour or region is
+answers apart (`FAir`, `FSolid` of a material and a tagged shape key, `FUnknown`); a missing neighbour or region is
 never evidence of air. A chunk absent from the map is wholly unavailable,
 including its column summaries; a chunk present has its summaries published, so
 its empty column is known empty. Two adjacent ready intervals coalesce, so a
@@ -438,6 +438,10 @@ is the unit a caller's own account counts.
 | Known solid, void discovered or absent (identity 0) | one quad: the view-turned shape's ordinary map, the material colour |
 | Known shaped solid, void undiscovered | two quads: fog (the shape's cover map, blank colour) then known (its known map, material colour) |
 | Terrain or retained knowledge unavailable | pending: no quad, no fabricated air, no newly forgotten fog |
+
+The catalog is side-only: a known cell whose shape key is a corner key, discovered or known solid, refuses the
+whole request with `CellUnsupportedShapeKey` naming the key and produces no quad, while an undiscovered corner cell
+is covered by generic fog as any undiscovered cell is, and every side identity keeps its map and file name.
 
 The map is the catalog's rotated lookup (`lookupFor`): South 0, West 3, North 2,
 East 1 positive quarter turns, world identities never change. At cut level `k`

@@ -1372,17 +1372,18 @@ other request):
 | Kind | `value` |
 | --- | --- |
 | arena | the arena handle (`terrain_arena`) |
-| cell | `{revision = INT, air = BOOL, material = TEXT?, shape = INT?}`; the material and shape are present exactly when `air` is false |
-| column | `{revision = INT, runs = {{z_min = INT, z_max = INT, air = BOOL, material = TEXT?, shape = INT?}, ...}}` |
-| surface | `{revision = INT, occupied = BOOL, z = INT?, material = TEXT?, shape = INT?}` |
+| cell | `{revision = INT, air = BOOL, material = TEXT?, shape = INT?, corner_mask = INT?}`; the material is present exactly when `air` is false, and then exactly one of `shape` (a side solid) and `corner_mask` (a corner solid) |
+| column | `{revision = INT, runs = {{z_min = INT, z_max = INT, air = BOOL, material = TEXT?, shape = INT?, corner_mask = INT?}, ...}}`; a run's discriminators are a cell's |
+| surface | `{revision = INT, occupied = BOOL, z = INT?, material = TEXT?, shape = INT?, corner_mask = INT?}`; an occupied surface carries one discriminator, as a cell does |
 | remove | `{changed = BOOL, revision = INT}` |
 | status | `{storage = {state = "ready"\|"paused", reason = TEXT?, reserved_bytes = INT, used_bytes = INT, pending_reclaim_bytes = INT, pending_reserved_bytes = INT}, discovery = {state = "idle"\|"pending"\|"paused", pending_items = INT}, content_revision = INT, knowledge_revision = INT}` |
 | grow | `{changed = BOOL, reserved_bytes = INT, storage = {state = TEXT, reason = TEXT?}}` |
 | retry | `{changed = BOOL, cleared = {TEXT...}, remaining = {TEXT...}, until_closed = {TEXT...}, storage = {state = TEXT, reason = TEXT?}, discovery = {state = TEXT}}` |
 | region | `{content_revision = INT, knowledge_revision = INT, terrain = PART, knowledge = PART}`; a `PART` is `{state = "ready", cells = {...}}` or `{state = "unavailable"}` |
 
-Records are fresh copies; material identifiers are the authored text and shapes are the authored identities 0 to 15 (0 and 15
-distinct). A content revision that does not fit a Lua integer is a host defect, never a wrapped value.
+Records are fresh copies; material identifiers are the authored text, a `shape` is an authored side identity 0 to 15 (0 and 15
+distinct) and a `corner_mask` is an authored corner mask 1 to 15 (mask 0 is air and carries neither field; side 0 and corner 15 are
+different solids). A cell keeps three keys when it is solid whichever family it is. A content revision that does not fit a Lua integer is a host defect, never a wrapped value.
 
 **Definitions** are bounded plain data: `{materials = {TEXT...}, layers = {{z_min = INT?, z_max = INT?, material = TEXT, shape = INT}...},
 patches = {{x=, y=, z_min=, z_max=, value = {air = true} | {material = TEXT, shape = INT}}...}?}`. An omitted layer end means the
@@ -1495,9 +1496,10 @@ unavailable when a page its build needed failed or read back invalid; that is no
 the cause as for any read. A ready unknown void is distinct from unavailable knowledge and from air.
 
 `cells` is a dense list of 8,192 entries; for zero-based local coordinates the Lua index is `1 + x + 16 * y + 256 * z`. A terrain cell is
-the stock cell without its revision, `{air = BOOL, material = TEXT?, shape = INT?}` (material and shape present exactly when `air` is
-false). A knowledge cell is exactly `{solid = K, void = K}` with `K` one of `"none"`, `"known"` or `"unknown"`
-(`NoSolid`/`SolidKnown`/`SolidUnknown`, `NoVoidHere`/`VoidKnown`/`VoidUnknown`). No other field is added: a worst-case region is
+the stock cell without its revision, `{air = BOOL, material = TEXT?, shape = INT?, corner_mask = INT?}` (the material, and exactly one of
+`shape` and `corner_mask`, present exactly when `air` is false). A knowledge cell is exactly `{solid = K, void = K}` with `K` one of `"none"`, `"known"` or `"unknown"`
+(`NoSolid`/`SolidKnown`/`SolidUnknown`, `NoVoidHere`/`VoidKnown`/`VoidUnknown`). No other field is added: admission judges every solid at the widest discriminator, the corner field `corner_mask`, whose name is longer than
+`shape`, so no corner reply exceeds what was admitted. A worst-case region is
 57,355 of the fixed M1 profile's 65,536 elements, at depth 5 of 8 and about 1.5 MB of 16 MiB.
 
 | Condition | Outcome |
