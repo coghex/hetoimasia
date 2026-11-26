@@ -85,7 +85,7 @@ import Hetoimasia.Terrain.Segment (maxSegmentLevels)
 -- | The unit prices the design states for records the service keeps (P-5 and the #639
 -- accounting: a command record 128 bytes and 32 a region, an interest 64, a hold record
 -- 64 a region, a view description 128 and 64 a region, a removal's retained edit 64, 16 for
--- the interval and 48 for the column entry, and its staging 512). They are literals here,
+-- the interval and 48 for the column entry, and its staging 544). They are literals here,
 -- stated from the design, and not the model's own functions: the expected side of every
 -- comparison below names no model accessor and no cost function.
 commandRecord, descriptionOf ∷ Word64 → Word64
@@ -96,16 +96,16 @@ interestRecord, holdRecord, removalRetained, removalStaging, resultRecord ∷ Wo
 interestRecord = 64
 holdRecord = 64
 removalRetained = 64
-removalStaging = 512
+removalStaging = 544
 -- | The retained bank's record for each request the service holds (the design's figure for a
 -- result or record not charged elsewhere).
 resultRecord = 160
 
 -- | The most a whole-cell removal can raise the payload of the segment it edits: a dense
--- segment of 'maxSegmentLevels' cells is two bytes a cell, a uniform one two bytes in
--- all. The model reserves exactly this for each removal.
+-- segment of 'maxSegmentLevels' cells is two bytes a cell and one tag bit a cell (68), a
+-- uniform one two bytes in all. The model reserves exactly this for each removal.
 removalGrowthBound ∷ Word64
-removalGrowthBound = 2 * fromIntegral maxSegmentLevels - 2
+removalGrowthBound = 2 * fromIntegral maxSegmentLevels + fromIntegral maxSegmentLevels `div` 8 - 2
 
 -- ---------------------------------------------------------------------------
 -- What the service holds

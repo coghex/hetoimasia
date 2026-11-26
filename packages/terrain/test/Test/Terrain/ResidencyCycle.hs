@@ -55,13 +55,13 @@ changeLimits = ChangeLimits 1000000
 
 -- | Two columns and two levels of a region (the edits touch levels 0 and 1 of the
 -- first region and level 0 of the one above), two regions per request: a region
--- stores at most 488 bytes (every cell its own segment) and a job beyond that
--- reserves 288, so the bank holds 1,552 at the least. Other demand (two queries of
--- two fresh regions, 544 reserved bytes each) does not fit beside an edited region,
+-- stores at most 492 bytes (every cell its own segment) and a job beyond that
+-- reserves 296, so the bank holds 1,576 at the least. Other demand (two queries of
+-- two fresh regions, 552 reserved bytes each) does not fit beside an edited region,
 -- so it must evict it, and reconstructing the edited regions must in turn evict that
 -- demand.
 limits ∷ Limits
-limits = limitsWith $ \s → s {specResidentBytes = 1552, specEditBytes = 256, specExtentX = 2, specExtentZ = 2}
+limits = limitsWith $ \s → s {specResidentBytes = 1576, specEditBytes = 256, specExtentX = 2, specExtentZ = 2}
 
 initial ∷ IO World
 initial = initialWith limits
@@ -226,8 +226,8 @@ spec = describe "Residency over the real data layer" $ do
     let Ledgers (_, residentReserved) (_, editReserved) (stagingOccupied, stagingReserved) = ledgersOf (wModel final)
     (residentReserved, editReserved, stagingOccupied, stagingReserved) `shouldBe` (0, 0, 0, 0)
   it "reconciles every conservative reservation against the real stored cost" $ do
-    -- Levels up to 20 of one column: a region stores at most 256 + 48 + 21 x 34 = 1,018
-    -- bytes here and a job reserves at most 1,104 more.
+    -- Levels up to 20 of one column: a region stores at most 256 + 48 + 21 x 35 = 1,039
+    -- bytes here and a job reserves at most 1,148 more.
     w0 ← initialWith (limitsWith $ \s → s {specResidentBytes = 5000, specStagingBytes = 4096, specExtentZ = 21})
     -- A request over several widely separated cells of one column: the model
     -- reserves for each interval, the real detail stores exactly that.
@@ -239,18 +239,18 @@ spec = describe "Residency over the real data layer" $ do
     w1 ← drain w0 {wModel = m}
     -- 256 metadata + 48 column + 3 x 32 segments + 3 x 2 payload = 406 actually
     -- stored: the three cells do not merge into one segment. The reservation is the
-    -- dense bound, 64 payload bytes for each of the three intervals.
+    -- payload bound, 68 bytes for each of the three intervals.
     let stats = residentStats (wResident w1)
     (statColumns stats, statSegments stats, statKnownCells stats) `shouldBe` (1, 3, 3)
     map regionBytes (modelRegions (wModel w1)) `shouldBe` [256 + 48 + 3 * 32 + 3 * 2]
     -- The reservation covered it (and was larger, by the payload bound).
-    reserved `shouldBe` [256 + 48 + 3 * 32 + 3 * 64]
+    reserved `shouldBe` [256 + 48 + 3 * 32 + 3 * 68]
   it "reserves the growth of a compressed segment and reconciles it with the real rebuilt segment" $ do
-    -- A column of 32 levels: a region stores at most 256 + 48 + 32 x 34 = 1,392 bytes
-    -- and a job beyond it reserves 1,584, so one region per query needs 2,976 bytes.
+    -- A column of 32 levels: a region stores at most 256 + 48 + 32 x 35 = 1,424 bytes
+    -- and a job beyond it reserves 1,648, so one region per query needs 3,072 bytes.
     -- Eight pinned one-cell regions (8 x 338) and the uniform segment (338) leave
-    -- exactly 124 of 3,166: room for two removals' growth (62 each).
-    w00 ← initialWith (limitsWith $ \s → s {specResidentBytes = 3166, specStagingBytes = 4096, specQueuedCommands = 16, specQueryRegions = 1, specExtentZ = 32})
+    -- exactly 132 of 3,174: room for two removals' growth (66 each).
+    w00 ← initialWith (limitsWith $ \s → s {specResidentBytes = 3174, specStagingBytes = 4096, specQueuedCommands = 16, specQueryRegions = 1, specExtentZ = 32})
     w0 ← foldM (\w i → submit w (SubmitQuery (RequestId (fromInteger i)) a1 rev0 [demand (reg (10 + i) 0 0) (cell 0 0 0)]) >>= drain) w00 [11 .. 18]
     -- Region (0,0,-2) is levels -64..-33: all stone, one uniform segment of 2 bytes.
     w1 ← submit w0 (SubmitQuery (RequestId 1) a1 rev0 [demand (reg 0 0 (-2)) (box 0 1 0 1 0 32)]) >>= drain >>= \w → settle w 1
@@ -259,16 +259,16 @@ spec = describe "Residency over the real data layer" $ do
     let tile = mustTile 0 0 (-50)
         (region, cover) = regionOf 0 0 (-50)
     (w2, accepted) ← submitAdmission w1 (SubmitRemoval (RequestId 2) a1 rev0 tile)
-    -- The cell is resident: no job, and the growth is reserved from the free 62.
+    -- The cell is resident: no job, and the growth is reserved from the free 66.
     admissionJobs accepted `shouldBe` []
-    ledgersOf (wModel w2) `shouldBe` Ledgers (3042, 62) (0, 64) (2016, 512)
-    -- A second removal takes the other 62; a third finds the bank full: busy,
+    ledgersOf (wModel w2) `shouldBe` Ledgers (3042, 66) (0, 64) (2016, 544)
+    -- A second removal takes the other 66; a third finds the bank full: busy,
     -- since nothing may be evicted (every other region is pinned).
     (w2b, _) ← submitAdmission w2 (SubmitRemoval (RequestId 3) a1 rev0 (mustTile 0 0 (-51)))
-    ledgersOf (wModel w2b) `shouldBe` Ledgers (3042, 124) (0, 128) (2240, 1024)
+    ledgersOf (wModel w2b) `shouldBe` Ledgers (3042, 132) (0, 128) (2240, 1088)
     refusal ← stepRefused (wModel w2b) (SubmitRemoval (RequestId 5) a1 rev0 (mustTile 0 0 (-52)))
     case refusal of
-      Busy (NoEligibleEviction 62 0 _) → pure ()
+      Busy (NoEligibleEviction 66 0 _) → pure ()
       other → expectationFailure ("expected a busy refusal for the growth, got " <> show other)
     -- Abandoning the second returns its reservations.
     w2c ← settle w2b 3
@@ -280,21 +280,21 @@ spec = describe "Residency over the real data layer" $ do
     regrown `shouldBe` 10
     (m4, committed) ← stepOk (wModel w3) (RemovalCommitted (RequestId 2) (Revision 1) (fromIntegral (changesBytes changes')) (fromIntegral regrown))
     reportDecision committed `shouldBe` Committed (Revision 1) 0 [] [] []
-    -- Occupied now includes the growth; the unused 52 of the reservation returned.
+    -- Occupied now includes the growth; the unused 56 of the reservation returned.
     ledgersOf m4 `shouldBe` Ledgers (3052, 0) (64, 0) (1792, 0)
     assertCharged w3 {wModel = m4}
-    -- The segment now occupies 348 bytes: another removal's 62 still fits (114 free).
+    -- The segment now occupies 348 bytes: another removal's 66 still fits (122 free).
     (w4, again) ← submitAdmission w3 {wModel = m4, wChanges = changes'} (SubmitRemoval (RequestId 4) a1 (Revision 1) (mustTile 0 0 (-51)))
     admissionJobs again `shouldBe` []
-    ledgersOf (wModel w4) `shouldBe` Ledgers (3052, 62) (64, 64) (2016, 512)
+    ledgersOf (wModel w4) `shouldBe` Ledgers (3052, 66) (64, 64) (2016, 544)
   it "keeps a region's accumulated charge within the configured stored maximum as separate jobs fill it" $ do
     -- One 32-level column per region, one region per query, the least bank the
-    -- configuration allows (a region stores at most 256 + 48 + 32 x 34 = 1,392 bytes and
-    -- a job beyond it reserves 1,584: 2,976). Sixteen separate queries load levels 0, 2,
+    -- configuration allows (a region stores at most 256 + 48 + 32 x 35 = 1,424 bytes and
+    -- a job beyond it reserves 1,648: 3,072). Sixteen separate queries load levels 0, 2,
     -- ..., 30 of the column, each completed with the real net growth and withdrawn: the
     -- column entry is charged once, so the region holds the 848 bytes the real detail
     -- needs (256 + 48 + 16 x 34), not a column entry for every job.
-    w0 ← initialWith (limitsWith $ \s → s {specResidentBytes = 2976, specStagingBytes = 4096, specQueryRegions = 1, specExtentZ = 32})
+    w0 ← initialWith (limitsWith $ \s → s {specResidentBytes = 3072, specStagingBytes = 4096, specQueryRegions = 1, specExtentZ = 32})
     evens ← foldM (\w z → submit w (SubmitQuery (RequestId (fromInteger z + 1)) a1 rev0 [demand (reg 0 0 0) (cell 0 0 z)]) >>= drain >>= \x → settle x (z + 1)) w0 [0, 2 .. 30]
     map regionBytes (modelRegions (wModel evens)) `shouldBe` [848]
     assertCharged evens
@@ -303,10 +303,41 @@ spec = describe "Residency over the real data layer" $ do
     (_, admitted) ← stepOk (wModel evens) (SubmitQuery (RequestId 100) a1 rev0 [demand (reg 0 0 0) odds])
     length (admissionJobs (admission' admitted)) `shouldBe` 1
     admissionVictims (admission' admitted) `shouldBe` []
+  it "charges the scratch of the whole segment a one-cell load rebuilds, at the exact staging boundary" $ do
+    -- Extent 1 x 1 x 32, one region per query. Sixteen alternating levels (1, 3, .., 31) are removed, and
+    -- levels 0 to 30 are resident as one 31-cell segment. Loading level 31 merges into it and rebuilds
+    -- a 32-cell dense segment: 256 bytes of frame, 4 x 32 of decoded cells and the removed runs (the
+    -- real records are 16 x 16 + 48 = 304 of the 320 charged), 704, beside a command (160) and an
+    -- interest (64): 928. Another one-cell query already holds 928, so 1,856 staging bytes admit the load
+    -- and 1,855 refuse it, leaving the resident segment as it was.
+    let column = mustColumn 0 0
+        odd' = [1, 3 .. 31]
+        scenario staging = do
+          w0 ← initialWith (limitsWith $ \s → s {specExtentZ = 32, specQueryRegions = 1, specQueuedCommands = 8, specResidentBytes = 8000, specStagingBytes = staging})
+          changes ← foldM (\c z → either (fail . show) (pure . removeResult) (removeCell changeLimits source (mustTile 0 0 z) c)) (wChanges w0) odd'
+          w1 ← submit w0 {wChanges = changes} (SubmitQuery (RequestId 1) a1 rev0 [demand (reg 0 0 0) (box 0 1 0 1 0 31)]) >>= drain >>= \w → settle w 1
+          map segmentLength (residentSegments (wResident w1) column) `shouldBe` [31]
+          (m2, _) ← stepOk (wModel w1) (SubmitQuery (RequestId 2) a1 rev0 [demand (reg 1 0 0) (cell 0 0 0)])
+          ledgersOf m2 `shouldBe` Ledgers (398, 404) (0, 0) (224, 704)
+          pure w1 {wModel = m2}
+        extend w = stepOk (wModel w) (SubmitQuery (RequestId 3) a1 rev0 [demand (reg 0 0 0) (cell 0 0 31)])
+    -- One byte short: refused, and the resident segment is untouched.
+    short ← scenario 1855
+    refusal ← stepRefused (wModel short) (SubmitQuery (RequestId 3) a1 rev0 [demand (reg 0 0 0) (cell 0 0 31)])
+    refusal `shouldBe` Busy (BankFull StagingBank 1855 928 928)
+    map segmentLength (residentSegments (wResident short) column) `shouldBe` [31]
+    -- At the boundary: admitted with the 704 charged, and the real rebuild is the 32-cell dense segment.
+    exact ← scenario 1856
+    (m3, accepted) ← extend exact
+    ledgersOf m3 `shouldBe` Ledgers (398, 552) (0, 0) (448, 1408)
+    w4 ← drain exact {wModel = m3}
+    map segmentLength (residentSegments (wResident w4) column) `shouldBe` [32]
+    assertCharged w4
+    length (admissionJobs (admission' accepted)) `shouldBe` 1
   it "keeps a surviving region charged for the shared column index after each individual release" $ do
     -- Two vertical regions of one column share one real column index entry; each
     -- is charged for its own column, so evicting either leaves the other charged.
-    w0 ← initialWith (limitsWith $ \s → s {specResidentBytes = 964})
+    w0 ← initialWith (limitsWith $ \s → s {specResidentBytes = 974})
     w1 ← submit w0 (SubmitQuery (RequestId 1) a1 rev0 [demand (reg 0 0 0) (cell 0 0 0)]) >>= drain >>= \w → settle w 1
     w2 ← submit w1 (SubmitQuery (RequestId 2) a1 rev0 [demand (reg 0 0 1) (cell 0 0 0)]) >>= drain >>= \w → settle w 2
     statColumns (residentStats (wResident w2)) `shouldBe` 1

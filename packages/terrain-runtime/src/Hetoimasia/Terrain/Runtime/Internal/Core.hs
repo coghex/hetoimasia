@@ -131,7 +131,7 @@ import Hetoimasia.Terrain.Residency (ArenaId (..), HoldId (..), RegionDemand, Re
 import Hetoimasia.Terrain.Runtime.Internal.Content
 import Hetoimasia.Terrain.Runtime.Internal.Snapshot
 import Hetoimasia.Terrain.Resident (ResidentStats (..), columnIndexBytes, discardRegion, residentStats)
-import Hetoimasia.Terrain.Segment (maxSegmentLevels)
+import Hetoimasia.Terrain.Segment (maxSegmentPayloadBytes)
 import Hetoimasia.Terrain.Runtime.Internal.Types
 import Hetoimasia.Terrain.Runtime.Backed.Fault (StorageFault)
 import Hetoimasia.Terrain.Runtime.Backed.RegionCopy (regionReservation)
@@ -905,11 +905,11 @@ retireArenaRecord svc aid = do
 
 -- | What a preparation holds, from the command it runs: the command record it reads
 -- under and, for a removal, the resident growth, staging and retained-edit bytes its
--- buffers and its result can hold (a segment's worst case: two bytes a cell, a dense
--- segment of 'maxSegmentLevels' cells). Recorded for inspection only.
+-- buffers and its result can hold (a segment's worst case, 'maxSegmentPayloadBytes': a dense
+-- segment of 32 cells, two bytes and a tag bit each). Recorded for inspection only.
 preparationWorkOf ∷ RequestId → Req → PreparationWork
 preparationWorkOf rid req = case reqCmd req of
-  CRemove {} → PreparationWork rid (reqArena req) True recordBytes (2 * fromIntegral maxSegmentLevels - 2) R.removalStagingBytes R.removalRetainedBytes
+  CRemove {} → PreparationWork rid (reqArena req) True recordBytes (fromIntegral maxSegmentPayloadBytes - 2) R.removalStagingBytes R.removalRetainedBytes
   _ → PreparationWork rid (reqArena req) False recordBytes 0 0 0
   where
     recordBytes = R.commandRecordBytes (fromIntegral (Set.size (Set.fromList (map R.demandRegion (reqDemand req)))))
@@ -946,7 +946,7 @@ jobWorkOfModel j = JobWork (R.jobId j) (R.jobArena j) (R.jobRegion j) (R.jobActi
 -- decision's value, which is also the input of the work itself) and the data layer's own
 -- sizes, not the model's cost functions: a column index entry is 'columnIndexBytes' (48), a
 -- segment is 32 bytes of metadata and at least two of payload (a uniform one), and the
--- scratch is a 256-byte frame, two bytes a cell, and the removed runs the job reads of its
+-- scratch is a 256-byte frame, four bytes for each cell it decodes (the whole segment each interval merges into, at most 32 cells, and at most the extent's levels in a column: a decoded 32-bit cell), and the removed runs the job reads of its
 -- columns (a column of l levels holds at most l / 2 + 1 runs: by "Hetoimasia.Terrain.Changes"'s
 -- figures, (cells / 2 + columns) intervals and an entry a column).
 startJobWork ∷ Service → R.JobId → R.Coverage → STM ()
@@ -955,7 +955,10 @@ startJobWork svc jid cover =
     st {stateWork = (stateWork st) {rwJobs = Map.adjust running jid (rwJobs (stateWork st))}}
   where
     running (JobWork a b c d e _ _ _) =
-      JobWork a b c d e (R.coverageColumns cover * fromIntegral columnIndexBytes + R.coverageSegments cover * (32 + 2)) (256 + 2 * R.coverageCells cover + runs) 1
+      JobWork a b c d e (R.coverageColumns cover * fromIntegral columnIndexBytes + R.coverageSegments cover * (32 + 2)) (256 + 4 * decoded + runs) 1
+    -- the cells a load decodes: the whole segment each interval merges into (at most 32 cells), at most the
+    -- extent's levels in each column
+    decoded = min (R.coverageColumns cover * extentLevels (serviceConfig svc)) (32 * R.coverageSegments cover)
     -- every column the job touches, over the region's loadable extent (what the job reads)
     runs = R.coverageColumns cover * (runsMeetingLevels (extentLevels (serviceConfig svc)) * fromIntegral changeIntervalBytes + fromIntegral changeColumnBytes)
 

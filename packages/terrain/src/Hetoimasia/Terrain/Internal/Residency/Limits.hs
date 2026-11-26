@@ -40,7 +40,8 @@ module Hetoimasia.Terrain.Internal.Residency.Limits
 
 import Data.Word (Word64)
 import Hetoimasia.Terrain.Internal.Residency.Coverage
-  ( commandRecordBytes
+  ( cellsScratchBytes
+  , commandRecordBytes
   , descriptionBytes
   , holdRecordBytes
   , interestRecordBytes
@@ -53,6 +54,7 @@ import Hetoimasia.Terrain.Internal.Residency.Coverage
   , removalRetainedBytes
   , removalStagingBytes
   )
+import Hetoimasia.Terrain.Segment (maxSegmentLevels)
 
 -- | The three service-wide byte banks. Each cost category the model charges
 -- belongs to exactly one of them (see "Hetoimasia.Terrain.Residency").
@@ -214,15 +216,16 @@ mkLimits spec = do
 
 -- | The most one region can occupy, whatever sequence of requests and edits made
 -- it: its metadata, a column index entry for each of the extent's columns, and for
--- each cell at most one segment of its own (32 bytes of metadata) with two payload
--- bytes. A segment of @k@ cells costs at most @32 + min 64 (2 k)@, which is at most
--- 34 per cell, so a region that removals have fragmented into one-cell segments is
--- the worst case. Computed with exact integers.
+-- each cell at most one segment of its own (32 bytes of metadata) with three payload
+-- bytes. A segment of one cell is uniform, 2 bytes or 3 for a corner; a segment of
+-- @k > 1@ cells costs at most @32 + 2 k + ceil (k / 8)@ (at most 100 for 32), which is
+-- at most 35 per cell, so a region that removals have fragmented into one-cell
+-- segments is the worst case. Computed with exact integers.
 regionStoredBytes ∷ Integer → Integer → Integer → Integer
 regionStoredBytes x y z =
   toInteger regionMetadataBytes
     + toInteger regionColumnReserveBytes * columns
-    + (toInteger regionSegmentStoredBytes + 2) * columns * z
+    + (toInteger regionSegmentStoredBytes + 3) * columns * z
   where
     columns = x * y
 
@@ -262,7 +265,7 @@ explicitMinimumBytes spec bank = case bank of
   StagingBank →
     maximum
       [ toInteger (commandRecordBytes 0) + 32 * queryN + interest * queryN + queryN * scratch
-      , toInteger (commandRecordBytes 1) + toInteger removalStagingBytes + interest + 256 + 2 + toInteger (loadRunsBytes (fromInteger z) 1)
+      , toInteger (commandRecordBytes 1) + toInteger removalStagingBytes + interest + 256 + toInteger (cellsScratchBytes (fromInteger (min z (toInteger maxSegmentLevels)))) + toInteger (loadRunsBytes (fromInteger z) 1)
       , stored
       ]
   where
@@ -273,7 +276,7 @@ explicitMinimumBytes spec bank = case bank of
     stored = regionStoredBytes x y z
     job = regionJobBytes x y z
     interest = toInteger interestRecordBytes
-    scratch = 256 + 2 * x * y * z + toInteger (loadRunsBytes (fromInteger z) (fromInteger (x * y)))
+    scratch = 256 + toInteger (cellsScratchBytes (fromInteger (x * y * z))) + toInteger (loadRunsBytes (fromInteger z) (fromInteger (x * y)))
 
 -- | What each bank must hold. Every bank is partitioned into an explicit reserve (the
 -- explicit worst case, 'explicitMinimumBytes') and a camera share (the rest). Camera
@@ -326,8 +329,8 @@ defaultLimits =
     , lAging = 8
     , lQuery = 257
     , lExtent = (16, 16, 32)
-    , lExplicitStaging = 25354720
-    , lExplicitResident = 179020032
+    , lExplicitStaging = 29565408
+    , lExplicitResident = 185336064
     , lHold = 256
     , lCamera = 16384
     }
@@ -351,7 +354,7 @@ limitQueryRegions = lQuery
 -- | The staging one camera region needs beyond its entry in a description: its interest
 -- and the scratch of a load of the whole extent.
 cameraRegionStagingBytes ∷ Integer → Integer → Integer → Integer
-cameraRegionStagingBytes x y z = toInteger interestRecordBytes + 256 + 2 * x * y * z + toInteger (loadRunsBytes (fromInteger z) (fromInteger (x * y)))
+cameraRegionStagingBytes x y z = toInteger interestRecordBytes + 256 + toInteger (cellsScratchBytes (fromInteger (x * y * z))) + toInteger (loadRunsBytes (fromInteger z) (fromInteger (x * y)))
 
 -- | What a camera region needs of staging beyond its entry in a description (its
 -- interest and the scratch of a load of the whole extent). A description is bounded so

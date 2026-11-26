@@ -55,8 +55,8 @@ oracle m arena demands removal
     -- The contract's charges, restated.
     metadata = 256
     interest = 64
-    growth = if removal then 62 else 0
-    removalStaging = if removal then 512 else 0
+    growth = if removal then 66 else 0
+    removalStaging = if removal then 544 else 0
     retainedBytes = 64
     commandBytes = 128 + 32 * n
 
@@ -88,15 +88,16 @@ oracle m arena demands removal
           absent = isNothing res
           reserve = case new of
             Nothing → 0
-            Just nw → (if absent then metadata else 0) + 48 * toInteger (coverageColumns nw) + 96 * toInteger (coverageSegments nw)
+            Just nw → (if absent then metadata else 0) + 48 * toInteger (coverageColumns nw) + 100 * toInteger (coverageSegments nw)
           promisedLeast = case old of
             Nothing → 0
             Just o → (if absent && isNothing new then metadata else 0) + 48 * toInteger (coverageColumns o) + 34 * toInteger (coverageSegments o)
           scratch = case new of
             Nothing → 0
-            -- a frame, two bytes a cell, and the runs the load reads of every column it touches over the
+            -- a frame, four bytes for each cell it decodes (the whole segment each interval merges into: at most 32 per
+            -- interval and the extent's levels per column), and the runs the load reads of every column it touches over the
             -- extent's levels: at most levels / 2 + 1 runs of 16 bytes, and each column a 48-byte entry
-            Just nw → 256 + 2 * toInteger (coverageCells nw) + toInteger (coverageColumns nw) * ((extentLevels `div` 2 + 1) * 16 + 48)
+            Just nw → 256 + 4 * min (toInteger (coverageColumns nw) * extentLevels) (32 * toInteger (coverageSegments nw)) + toInteger (coverageColumns nw) * ((extentLevels `div` 2 + 1) * 16 + 48)
        in (maybe 0 (toInteger . regionBytes) res, reserve, promisedLeast, scratch, isJust new)
     promisedCover d = case [jobCoverage j | j ← modelJobs m, jobArena j == arena, jobRegion j == demandRegion d, jobPhase j /= JobCancellingPhase] of
       [] → Nothing

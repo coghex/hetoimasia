@@ -8,9 +8,11 @@ module Hetoimasia.Terrain.Internal.Packed
   ( PackedCell (..)
   ) where
 
-import Data.Word (Word16)
+import Data.Word (Word32)
 
--- | A 12-bit palette index over a 4-bit shape identity. The constructor is
--- private.
-newtype PackedCell = PackedCell Word16
+-- | A 17-bit value: bit 16 is the family tag (set for a corner key, clear for a
+-- side key), bits 4 to 15 a palette index and bits 0 to 3 the value within the
+-- family. A clear tag leaves the historic 16-bit word, zero-extended. The
+-- constructor is private; the bits above 16 are always clear.
+newtype PackedCell = PackedCell Word32
   deriving stock (Eq, Ord, Show)
