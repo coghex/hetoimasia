@@ -1389,7 +1389,7 @@ different solids). A cell keeps three keys when it is solid whichever family it 
 patches = {{x=, y=, z_min=, z_max=, value = {air = true} | {material = TEXT, shape = INT} | {material = TEXT, corner_mask = INT}}...}?}`. An omitted layer end means the
 supported extreme (the last supported cell is covered by an omitted upper end). Soil over stone is an ordinary pair of layers.
 
-A solid names its family with exactly one of two fields. `shape` is a side identity 0 to 15, as before. `corner_mask` is a corner mask 0 to 15
+A solid names its family with exactly one of two fields. `shape` is a side identity 0 to 15. `corner_mask` is a corner mask 0 to 15
 with NW = 1, NE = 2, SE = 4 and SW = 8; a nonzero mask is a corner solid and reads back as `corner_mask`. Mask 0 is air, but the record is
 still a solid record until it is validated: it needs a declared `material`, keeps its interval in the layer ordering and overlap checks and in
 the patch overlap checks, and only then its cells read as air, exactly as `{air = true}` cells do. A layer needs one of the two fields, a solid
