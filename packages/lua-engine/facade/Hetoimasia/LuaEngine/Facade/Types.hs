@@ -69,6 +69,7 @@ module Hetoimasia.LuaEngine.Facade.Types
   , TerrainLayer (..)
   , TerrainPatch (..)
   , TerrainPatchValue (..)
+  , TerrainShape (..)
   , terrainArenaType
   , terrainPickType
   , terrainArenaRequestType
@@ -664,13 +665,22 @@ data TerrainDefinition = TerrainDefinition
   }
   deriving (Eq, Show)
 
--- | A base layer: the half-open interval, an omitted end meaning the supported extreme, and the material and shape.
+-- | A base layer: the half-open interval, an omitted end meaning the supported extreme, and the material and the shape selection.
 data TerrainLayer = TerrainLayer
   { tlMin ∷ !(Maybe Int64)
   , tlMax ∷ !(Maybe Int64)
   , tlMaterial ∷ !Text
-  , tlShape ∷ !Int64
+  , tlShape ∷ !TerrainShape
   }
+  deriving (Eq, Show)
+
+-- | The family a solid's shape is selected from, and its value, as a script authored it: a side identity (@shape@, @0..15@, the
+-- historic form) or a corner mask (@corner_mask@, @0..15@, NW = 1, NE = 2, SE = 4, SW = 8). The decode has checked the range and
+-- that exactly one of the two was supplied; a corner mask of zero is air, which the terrain validator normalizes after it has checked
+-- the record's material, interval and overlaps like any other solid's.
+data TerrainShape
+  = ShapeSide !Int64
+  | ShapeCorner !Int64
   deriving (Eq, Show)
 
 -- | A bounded per-column override of the base.
@@ -683,10 +693,10 @@ data TerrainPatch = TerrainPatch
   }
   deriving (Eq, Show)
 
--- | What a patch overrides with: air, or a material and its shape.
+-- | What a patch overrides with: air, or a material and its shape selection.
 data TerrainPatchValue
   = PatchAir
-  | PatchSolid !Text !Int64
+  | PatchSolid !Text !TerrainShape
   deriving (Eq, Show)
 
 -- | What a request-producing terrain service answered once the facade's checks passed.

@@ -484,6 +484,7 @@ test-suite lua-engine-tests
         Test.LuaEngine.Texture.Png
         Test.LuaEngine.Terrain.Basics
         Test.LuaEngine.Terrain.Composition
+        Test.LuaEngine.Terrain.Corners
         Test.LuaEngine.Terrain.Domain
         Test.LuaEngine.Terrain.Fixture
         Test.LuaEngine.Terrain.HostPublished
