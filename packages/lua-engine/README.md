@@ -1385,9 +1385,15 @@ Records are fresh copies; material identifiers are the authored text, a `shape` 
 distinct) and a `corner_mask` is an authored corner mask 1 to 15 (mask 0 is air and carries neither field; side 0 and corner 15 are
 different solids). A cell keeps three keys when it is solid whichever family it is. A content revision that does not fit a Lua integer is a host defect, never a wrapped value.
 
-**Definitions** are bounded plain data: `{materials = {TEXT...}, layers = {{z_min = INT?, z_max = INT?, material = TEXT, shape = INT}...},
-patches = {{x=, y=, z_min=, z_max=, value = {air = true} | {material = TEXT, shape = INT}}...}?}`. An omitted layer end means the
+**Definitions** are bounded plain data: `{materials = {TEXT...}, layers = {{z_min = INT?, z_max = INT?, material = TEXT, shape = INT | corner_mask = INT}...},
+patches = {{x=, y=, z_min=, z_max=, value = {air = true} | {material = TEXT, shape = INT} | {material = TEXT, corner_mask = INT}}...}?}`. An omitted layer end means the
 supported extreme (the last supported cell is covered by an omitted upper end). Soil over stone is an ordinary pair of layers.
+
+A solid names its family with exactly one of two fields. `shape` is a side identity 0 to 15, as before. `corner_mask` is a corner mask 0 to 15
+with NW = 1, NE = 2, SE = 4 and SW = 8; a nonzero mask is a corner solid and reads back as `corner_mask`. Mask 0 is air, but the record is
+still a solid record until it is validated: it needs a declared `material`, keeps its interval in the layer ordering and overlap checks and in
+the patch overlap checks, and only then its cells read as air, exactly as `{air = true}` cells do. A layer needs one of the two fields, a solid
+patch value needs `material` and one of them, and an air patch value carries none of `material`, `shape` or `corner_mask`.
 
 **What is refused, and as what.** The layer that runs first classifies a rejection:
 
@@ -1395,13 +1401,15 @@ supported extreme (the last supported cell is covered by an omitted upper end). 
   no authored metamethod run: wrong arity or fields, a sparse list, a metatable, a cycle, a function, a value of the wrong type or of
   the float subtype (an integral float included), invalid UTF-8, an arena name that is empty or over 128 characters, a material
   identifier that is empty or over 64 UTF-8 bytes, a cell coordinate outside `[-2^62, 2^62 - 1]`, a lower interval end outside it,
-  an upper end above `2^62`, a shape outside 0 to 15, a `column` range that is empty or inverted, a handle of another kind or another
+  an upper end above `2^62`, a shape or a corner mask outside 0 to 15, a layer or patch value that supplies both `shape` and `corner_mask` or neither,
+  a `corner_mask` or `shape` without a `material`, an air patch value that carries a `material`, `shape` or `corner_mask`, a `column` range that is empty or inverted, a handle of another kind or another
   instance, open's options that are not `nil` or a record of at most `storage_bytes`, an allowance (`storage_bytes`, `new_bytes`) that
   is not a Lua integer, is below 64 MiB, is not a whole number of MiB or is above [the largest](#storage-status-growth-and-recovery-tra-23),
   a growth or a retry through a lease that is not the arena's creator lease, and a copy over the bounds (`argumentLimits`: 2 MiB of encoding beside the profile's depth and element limits, the
   tighter of each applies).
 * *The validator* (`hetoimasia-terrain`'s `mkSource`) refuses a definition that decoded completely as the expected `definition`
-  failure: an empty or inverted interval, overlapping or unordered layers, overlapping patches, an unknown material, a duplicate
+  failure: an empty or inverted interval, overlapping or unordered layers, overlapping patches, an unknown material (a zero-mask record's
+  included), a duplicate
   material identifier, a material identifier with a control character, and a definition over 256 KiB or 8,192 authored runs.
 
 **Expected failures** are `not_found`, `arena_closed`, `stale_view`, `definition`, `source_failure`, `too_large` and `name_in_use`, and
