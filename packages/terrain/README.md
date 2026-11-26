@@ -336,15 +336,23 @@ local point as rationals.
 ## Openings and connections
 
 `Hetoimasia.Terrain.Opening` is where empty space can pass. It derives everything
-from the same `Solid` as the geometry above, so a portal, a point query and a ray
-query cannot disagree; it owns no state and does not traverse a world, inspect
-residency or turn missing data into air.
+from the same closed convex pieces (`convexPieces`) as the geometry above, so a
+portal, a point query and a ray query cannot disagree; it owns no state and does
+not traverse a world, inspect residency or turn missing data into air.
+`keyOpenings` gives the openings of every occupied `ShapeKey`, side or corner, and
+`shapeOpenings` keeps its side-only type and results. `openingsKey` names the key
+the openings came from (`Nothing` only for air), so a corner cell is never
+mistaken for air; `openingsShape` stays the side identity, `Nothing` for a corner
+key.
 
-- *The empty region.* An occupied shape's empty region is the unit-cell space
-  strictly above `h`. Identity 0 has none. Every other catalog identity has
+- *The empty region.* An occupied key's empty region is the unit-cell space
+  outside the union of the closed convex pieces of its solid. For a side key that
+  is the space strictly above `h`, and identity 0 has none. For a corner key it is
+  the space above the folded surface, except that the flat half of a bank has no
+  piece and is open down to the base; mask 15 has none. Every other key has
   exactly one connected component (the region lies above a graph, so every point
-  is joined straight up to the top face, whose open part is the footprint less at
-  most an edge or a point). Membership is nonetheless explicit
+  is joined straight up to the top face, whose open part is connected).
+  Membership is nonetheless explicit
   (`cellComponents`, `componentPortals`, `portalComponent`) so no consumer assumes
   a cell has at most one component, and the connection inside a cell is exactly
   "two portals of one component".
@@ -353,9 +361,12 @@ residency or turn missing data into air.
   common interior, `openingArea`, `openingContains`) on one of the six faces
   (`TopFace`, `WallFace side`, `BottomFace`). Face coordinates are `(y, z)` on
   East and West, `(x, z)` on North and South and `(x, y)` on top and bottom, each
-  in `[0, 1]`, so a shared face has the same coordinates from either cell. A
-  horizontal face's opening is its portion with `z > h`; the top opening is where
-  `h < 1`; no occupied shape has a bottom opening of positive area. A selected
+  in `[0, 1]`, so a shared face has the same coordinates from either cell. A side
+  key's horizontal face opening is its portion with `z > h`; its top opening is
+  where `h < 1`; no side key has a bottom opening of positive area. A single-high
+  bank's bottom opening is the half of the footprint under its flat half (for the
+  north-west mask, `x + y > 1`, area 1/2), and both opposite-high valleys have no
+  bottom opening, because their crease at the base is covered. A selected
   side is open above its base and an unselected one may be partly open or sealed
   according to the same height function. N, for example, is fully open to the
   north, sealed to the south, triangular (area 1/2) to the east and west, and open
@@ -363,15 +374,18 @@ residency or turn missing data into air.
   at all below. Full air (`airOpenings`) is one component open over all six faces;
   it is not a seventeenth shape.
 - *How an opening is computed.* The opening of a face is the unit square less the
-  solid's section by that face's plane, which is the convex hull of the solid's
-  vertices on the plane, subtracted as convex pieces. The pieces are one
-  representation of a region, not a canonical form: compare regions by area and
-  containment.
+  union of the sections, by that face's plane, of the solid's closed convex
+  pieces. A piece's section is the convex hull of its vertices on the plane, and
+  can be a polygon, a segment or a point. The polygons are subtracted as convex
+  pieces. The result is one representation of a region, not a canonical form:
+  compare regions by area and containment. A hull of all the solid's vertices on
+  the plane would cover the segment between a valley's two high top corners; the
+  union leaves the valley top open between them.
 - *Connections.* `placePortals` puts a cell's portals on a tile, `connectPortals`
   joins two placed portals and `connectCells` all the portals two neighboring
-  tiles share. Two components connect exactly when their portals are on opposite
-  faces of one world plane and overlap over **positive area**, computed exactly
-  after placement in world coordinates; the result names both components, the face
+  tiles share, whichever family either key belongs to. Two components connect
+  exactly when their portals are on opposite faces of one world plane and overlap
+  over **positive area**, computed exactly after placement in world coordinates; the result names both components, the face
   and the common region (`connectionArea`, `connectionRegion`). Scalar areas are
   never compared: an N ramp beside another N ramp across X shares an opening of
   area 1/2, but an N beside an S shares 1/4 although each opens 1/2, and an
@@ -383,17 +397,18 @@ residency or turn missing data into air.
   therefore turn through the empty region above a ramp into a diagonally situated
   cavity, and be stopped by a sealed neighbor or by a ramp whose open side faces
   away.
-- *Rotation.* `rotateOpenings` follows `rotateShape`; four turns restore the
-  original and full air is unchanged. A camera facing selects the turned openings
+- *Rotation.* `rotateOpenings` follows `rotateKey`, so a corner key's openings turn
+  with it; four turns restore the original and full air is unchanged. A camera facing selects the turned openings
   and never rewrites the authored shape identity or a connection. World placement
   adds the tile's exact integer coordinates to the local points, so it is exact at
   the supported extremes and across negative region seams.
 - *Boundary convention.* The closed-solid convention is unchanged: a boundary point
   belongs to the solid and is not air. `openingContains` is true to it: a face point
-  is in an opening exactly when `classifyPoint` calls the corresponding cell point
-  `Exterior`, so the solid's section by the face (the ramp line, the ridge, the base
-  edge, the top edge and the corners, even where the section has no area) is
-  excluded, while the cell face's own edges, and the artificial seams between an
+  is in an opening exactly when no closed piece of the solid contains the
+  corresponding cell point, which for a side key is what `classifyPoint` calls
+  `Exterior`. The sections of every piece by the face (the ramp line, the ridge,
+  the base edge, the top edge, a valley's crease and the corners, even where a
+  section has no area) are excluded, while the cell face's own edges, and the artificial seams between an
   opening's convex pieces, are air wherever the solid is not. The pieces
   (`openingPieces`) are closed polygons that serve `openingArea`, and a zero-width
   contact never connects.
