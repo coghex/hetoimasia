@@ -2,20 +2,23 @@
 -- the connections between neighboring cells' openings.
 --
 -- This module is the geometric authority for /where empty space can pass/. It
--- derives every opening from the same canonical 'Solid' as
--- "Hetoimasia.Terrain.Geometry", so a portal, a point query and a ray query
--- cannot disagree, and it adds no state, no I/O and no traversal: it reports what
+-- derives every opening from the same closed convex pieces as
+-- "Hetoimasia.Terrain.Geometry" ('convexPieces'), so a portal, a point query and a
+-- ray query cannot disagree, and it adds no state, no I/O and no traversal: it reports what
 -- one cell leaves open and where two cells' openings meet, and nothing else. It
 -- does not inspect residency, turn missing data into air, or walk a world.
 --
 -- = The empty region and its components
 --
--- An occupied shape's empty region is the unit-cell space strictly above its top
--- height @h@ (see "Hetoimasia.Terrain.Geometry"). Identity 0 (@h = 1@) has none.
--- Every other catalog identity has exactly one connected empty component: the
--- region lies above a graph, so every empty point is joined straight up to the
--- top face, and the top face's open part (where @h < 1@, which is the footprint
--- less at most an edge or a point) is connected. Component membership is
+-- An occupied key's empty region is the unit-cell space outside the union of the
+-- closed convex pieces of its solid. For a side key that is the space strictly
+-- above its top height @h@ (see "Hetoimasia.Terrain.Geometry"), and identity 0
+-- (@h = 1@) has none. For a corner key it is the space strictly above the folded
+-- surface, except that a bank's flat half, which has no piece, is open down to the
+-- base. Corner mask 15 has none. Every other key has exactly one connected empty
+-- component: the region lies above a graph, so every empty point is joined
+-- straight up to the top face, and the top face's open part is connected.
+-- Component membership is
 -- nevertheless explicit ('cellComponents'): a 'Component' lists the portals it
 -- owns, and the connection inside a cell is exactly "two portals of one
 -- component are joined". A consumer therefore never assumes that a cell has at
@@ -28,26 +31,32 @@
 -- coordinates are @(y, z)@ on the East and West faces, @(x, z)@ on the North and
 -- South faces and @(x, y)@ on the Top and Bottom faces, each in @[0, 1]@, so a
 -- face shared by two neighbors has the same coordinates seen from either cell.
--- A horizontal face's opening is its portion with @z > h@; the top opening is
--- where @h < 1@; no catalog shape has a bottom opening of positive area. A
--- selected side is open above the base, and an unselected side may be partly open
--- or sealed according to the same height function: nothing here equates an unset
--- bit with a sealed side. Full air ('airOpenings') is one component open over the
--- whole of all six faces; it is not a seventeenth shape identity.
+-- A side key's horizontal face opening is its portion with @z > h@; its top
+-- opening is where @h < 1@, and no side key has a bottom opening of positive area.
+-- A selected side is open above the base, and an unselected side may be partly
+-- open or sealed according to the same height function: nothing here equates an
+-- unset bit with a sealed side. A corner key's single-high bank opens its base
+-- over the half of the footprint under its flat half, and both opposite-high
+-- valleys open no bottom area, because their creases are covered. Full air
+-- ('airOpenings') is one component open over the whole of all six faces; it is not
+-- a shape identity.
 --
--- The opening of a face is the unit square less the face's section of the solid.
--- That section is the convex hull of the solid's vertices on the face's plane
--- (the plane supports the solid, so the section is a face of the polytope), and
--- the difference is split into convex pieces ('openingPieces'). The pieces are
--- one representation of a region, not a canonical one for comparing regions;
--- compare regions by 'openingArea' and 'openingContains'. The area is that of the
--- closed pieces, and 'openingContains' is true to the closed solid: it excludes the
--- solid's own section by the face, edges and corners included.
+-- The opening of a face is the unit square less the union of the sections by the
+-- face's plane of the solid's closed convex pieces. Each section is the hull of
+-- that piece's vertices on the plane (the plane supports the piece, so the section
+-- is one of its faces), and so can be a polygon, a segment or a point; the
+-- difference is split into convex pieces ('openingPieces'). The pieces are one
+-- representation of a region, not a canonical one for comparing regions; compare
+-- regions by 'openingArea' and 'openingContains'. The area is that of the closed
+-- pieces, and 'openingContains' is true to the closed solid: it excludes every
+-- piece's section, edges and corners included, so two covered corners are not
+-- joined by an opening between them.
 --
 -- = Connections
 --
 -- Two neighboring cells' components connect through a shared face exactly when
--- the two portals on it overlap over positive area, computed exactly after both
+-- the two portals on it overlap over positive area, whatever family either key
+-- belongs to, computed exactly after both
 -- are placed in world coordinates ('placePortals', 'connectPortals',
 -- 'connectCells'). Comparing the two areas, or asking whether both sides are
 -- nonempty, is not enough: an N ramp and an S ramp across X each open half of
@@ -59,8 +68,8 @@
 --
 -- = Rotation
 --
--- 'rotateOpenings' follows 'rotateShape': the openings of a shape turned by a
--- number of quarter turns are the openings of the turned shape, with North to
+-- 'rotateOpenings' follows 'rotateKey': the openings of a key turned by a
+-- number of quarter turns are the openings of the turned key, with North to
 -- East to South to West, face coordinates turned with the face, and four turns
 -- restoring the original. A camera facing selects a view orientation and never
 -- rewrites an authored shape identity or a connection.
