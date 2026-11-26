@@ -732,7 +732,7 @@ cornerCatalogSpec = describe "the openings of the corner keys" $ do
       cornerOps mask `shouldNotBe` airOpenings
     openingsKey airOpenings `shouldBe` Nothing
     forM_ [0 .. 15] $ \identity → do
-      keyOpenings (sideKey (shape identity)) `shouldBe` openings identity
+      observe (keyOpenings (sideKey (shape identity))) `shouldBe` observe (openings identity)
       openingsKey (openings identity) `shouldBe` Just (sideKey (shape identity))
   forM_ [1 .. 15] $ \mask →
     forM_ [0 .. 3] $ \count →
