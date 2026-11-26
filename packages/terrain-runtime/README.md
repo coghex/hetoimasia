@@ -645,13 +645,13 @@ transaction of the model event it mirrors, and no production decision reads it:
 
 * **every accepted load job**, from its admission to its report (completed, failed or acknowledged),
   whether it is running, queued or waiting for victims: the resident reservation and the scratch the
-  model **granted** it at that moment (404 and 580 for a one-cell read in a fresh region), so a later
+  model **granted** it at that moment (404 and 704 for a one-cell read in a fresh region), so a later
   reduction while the job still holds them is seen (a stability check of the model against its own grant,
   not an expectation); and, once the owner **runs** it, the **least the job holds**, worked out from the
   coverage the owner is given to load and the data layer's own sizes and not from the model's cost
   functions (a column index entry is 48 bytes, a segment 32 of metadata and at least 2 of payload, the
-  scratch a 256-byte frame, four bytes a cell and the removed runs of every column it touches over the
-  region's 32 levels, 17 runs of 16 and a column entry of 48 for one cell: 82 and 580) together with the load-job slot (1 from its
+  scratch a 256-byte frame, four bytes for each cell it decodes (the whole segment each interval merges into, at most 32 cells and at most the extent's levels in a column) and the removed runs of every column it touches over the
+  region's 32 levels, 17 runs of 16 and a column entry of 48 for one cell: 82 and 704) together with the load-job slot (1 from its
   dispatch, 0 while it waits: a waiting job holds only a promise, so it contributes no expectation). The
   owner marks a job it runs and ends it with its report, so a model that forgets a running job is seen;
 * the **preparation** the owner is running (a removal's resident growth, 66 bytes, staging, 544, and
@@ -693,8 +693,8 @@ client end, before the owner resumes. The property ends with every bank, occupie
 every slot and every arena at zero: no charge outlives its holder.
 `Test.TerrainRuntime.Oracle` pins the record's literal amounts at a gated job (running and waiting),
 preparation, borrow and view, and holds the controls that must fail: a model that charges the running job
-1 byte of resident and 1 of scratch instead of 404 and 580 (and one byte short of each figure), a waiting job
-whose 404 and 580 were released while another job runs (and one byte short), a job the model forgot while it
+1 byte of resident and 1 of scratch instead of 404 and 704 (and one byte short of each figure), a waiting job
+whose 404 and 704 were released while another job runs (and one byte short), a job the model forgot while it
 runs, a 64-byte handoff duplicate charged that the owner never holds, a preparation whose request the model dropped
 or for which it reserved no growth, a borrow's hold shortened from two regions to one (the staging charge with
 it) or dropped, a view's description shortened or dropped, a model rebuilt without the arena beside the
