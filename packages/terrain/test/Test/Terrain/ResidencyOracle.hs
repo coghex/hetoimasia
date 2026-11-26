@@ -56,7 +56,7 @@ oracle m arena demands removal
     metadata = 256
     interest = 64
     growth = if removal then 66 else 0
-    removalStaging = if removal then 512 else 0
+    removalStaging = if removal then 544 else 0
     retainedBytes = 64
     commandBytes = 128 + 32 * n
 
@@ -94,9 +94,9 @@ oracle m arena demands removal
             Just o → (if absent && isNothing new then metadata else 0) + 48 * toInteger (coverageColumns o) + 34 * toInteger (coverageSegments o)
           scratch = case new of
             Nothing → 0
-            -- a frame, two bytes and a tag bit a cell, and the runs the load reads of every column it touches over the
+            -- a frame, four bytes a (decoded) cell, and the runs the load reads of every column it touches over the
             -- extent's levels: at most levels / 2 + 1 runs of 16 bytes, and each column a 48-byte entry
-            Just nw → 256 + 2 * toInteger (coverageCells nw) + (toInteger (coverageCells nw) + 7) `div` 8 + toInteger (coverageColumns nw) * ((extentLevels `div` 2 + 1) * 16 + 48)
+            Just nw → 256 + 4 * toInteger (coverageCells nw) + toInteger (coverageColumns nw) * ((extentLevels `div` 2 + 1) * 16 + 48)
        in (maybe 0 (toInteger . regionBytes) res, reserve, promisedLeast, scratch, isJust new)
     promisedCover d = case [jobCoverage j | j ← modelJobs m, jobArena j == arena, jobRegion j == demandRegion d, jobPhase j /= JobCancellingPhase] of
       [] → Nothing

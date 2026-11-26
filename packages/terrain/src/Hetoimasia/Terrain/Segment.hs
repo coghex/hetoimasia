@@ -45,6 +45,7 @@ module Hetoimasia.Terrain.Segment
   , SegmentError (..)
   , maxSegmentLevels
   , maxSegmentPayloadBytes
+  , decodedCellBytes
   , buildSegment
   , updateSegment
   , segmentStart
@@ -64,7 +65,7 @@ import Data.Array.Unboxed (UArray, bounds, elems, listArray, (!))
 import Data.Bits (setBit, shiftL, shiftR, testBit, (.&.), (.|.))
 import Data.Int (Int64)
 import qualified Data.List.NonEmpty as NE
-import Data.Word (Word16, Word32)
+import Data.Word (Word32, Word8)
 import Hetoimasia.Terrain.Coordinate
 import Hetoimasia.Terrain.Internal.Coordinate (AxisCoord (..))
 import Hetoimasia.Terrain.Internal.Packed (PackedCell (..))
@@ -79,17 +80,25 @@ maxSegmentLevels = 32
 maxSegmentPayloadBytes ∷ Int
 maxSegmentPayloadBytes = 2 * maxSegmentLevels + (maxSegmentLevels + 7) `div` 8
 
+-- | The bytes one decoded cell occupies in scratch: a 'PackedCell' is a 32-bit
+-- value, whatever its 17 significant bits.
+decodedCellBytes ∷ Int
+decodedCellBytes = 4
+
 -- | How a segment's values are stored.
 data Encoding = Uniform | Runs | Dense
   deriving stock (Eq, Ord, Show, Enum, Bounded)
 
--- | The 17-bit values are stored as follows. A run word holds the end offset
--- from bit 17 and the value below it. A dense payload holds the low 16 bits of
--- each cell and, as a bit set over the offsets, which cells are corners.
+-- | The values are stored in exactly the bytes 'segmentPayloadBytes' charges. A
+-- uniform payload is the value's two little-endian bytes of its 16-bit word and
+-- a third, set to 1, for a corner. A run word holds the end offset from bit 17
+-- and the 17-bit value below it. A dense payload is the @N@ 16-bit words, two
+-- little-endian bytes each, and, only when some cell is a corner, @ceil (N / 8)@
+-- more bytes holding one tag bit per cell, bit @i mod 8@ of byte @i div 8@.
 data Payload
-  = PUniform !Word32
+  = PUniform !(UArray Int Word8)
   | PRuns !(UArray Int Word32)
-  | PDense !(UArray Int Word16) !Word32
+  | PDense !(UArray Int Word8)
   deriving stock (Eq, Show)
 
 -- | A known stretch of one column. The constructor is private.
@@ -128,17 +137,36 @@ regionOf z = z `div` fromIntegral maxSegmentLevels
 -- | Choose the encoding by the stated rule and build its payload.
 encode ∷ [Word32] → Payload
 encode values = case runs of
-  [(_, v)] → PUniform v
+  [(_, v)] → PUniform (bytesOf (uniformBytes v))
   _
-    | 4 * r < denseBytes n corners → PRuns (listArray (0, r - 1) [fromIntegral e `shiftL` runValueBits .|. v | (e, v) ← runs])
-    | otherwise → PDense (listArray (0, n - 1) (map fromIntegral values)) corners
+    | 4 * r < denseSize n anyCorner → PRuns (listArray (0, r - 1) [fromIntegral e `shiftL` runValueBits .|. v | (e, v) ← runs])
+    | otherwise → PDense (bytesOf (denseContent n anyCorner values))
   where
     n = length values
     r = length runs
-    corners = foldr (\(i, v) acc → if testBit v cornerBit then setBit acc i else acc) 0 (zip [0 ..] values)
+    anyCorner = any (`testBit` cornerBit) values
     runs = runEnds 0 (NE.group values)
     runEnds _ [] = []
     runEnds off (g : gs) = let e = off + NE.length g in (e, NE.head g) : runEnds e gs
+
+bytesOf ∷ [Word8] → UArray Int Word8
+bytesOf bytes = listArray (0, length bytes - 1) bytes
+
+-- | The two little-endian bytes of a 16-bit word, and a third for a corner.
+uniformBytes ∷ Word32 → [Word8]
+uniformBytes v = wordBytes v <> [1 | testBit v cornerBit]
+
+wordBytes ∷ Word32 → [Word8]
+wordBytes v = [fromIntegral v, fromIntegral (v `shiftR` 8)]
+
+-- | The dense bytes of the values: every 16-bit word, then the tag bytes if some
+-- cell is a corner.
+denseContent ∷ Int → Bool → [Word32] → [Word8]
+denseContent n anyCorner values = concatMap wordBytes values <> (if anyCorner then tagBytes else [])
+  where
+    tagBytes = [foldr (\(i, v) acc → if testBit v cornerBit then setBit acc i else acc) 0 (zip [0 ..] chunk) | chunk ← chunksOf8 (take n values)]
+    chunksOf8 [] = []
+    chunksOf8 xs = let (h, t) = splitAt 8 xs in h : chunksOf8 t
 
 -- | The bit that tags a corner value.
 cornerBit ∷ Int
@@ -148,9 +176,10 @@ cornerBit = 16
 runValueBits ∷ Int
 runValueBits = 17
 
--- | The dense payload bytes of @n@ cells whose tag bits are @corners@.
-denseBytes ∷ Int → Word32 → Int
-denseBytes n corners = 2 * n + (if corners == 0 then 0 else (n + 7) `div` 8)
+-- | The dense payload bytes of @n@ cells, with the tag bits when some cell is a
+-- corner.
+denseSize ∷ Int → Bool → Int
+denseSize n anyCorner = 2 * n + (if anyCorner then (n + 7) `div` 8 else 0)
 
 -- | The first level covered.
 segmentStart ∷ Segment → AxisCoord
@@ -169,7 +198,7 @@ segmentEncoding ∷ Segment → Encoding
 segmentEncoding (Segment _ _ payload) = case payload of
   PUniform _ → Uniform
   PRuns _ → Runs
-  PDense _ _ → Dense
+  PDense _ → Dense
 
 -- | The number of runs a runs encoding stores, and 'Nothing' for the other two.
 segmentRunCount ∷ Segment → Maybe Int
@@ -187,10 +216,12 @@ segmentRunWords _ = []
 -- run, and for dense 2 per cell plus one tag bit per cell when some cell is a
 -- corner. Start, length and the encoding tag are not included.
 segmentPayloadBytes ∷ Segment → Int
-segmentPayloadBytes (Segment _ n payload) = case payload of
-  PUniform v → if testBit v cornerBit then 3 else 2
+segmentPayloadBytes (Segment _ _ payload) = case payload of
+  PUniform bytes → byteCount bytes
   PRuns runs → 4 * (let (lo, hi) = bounds runs in hi - lo + 1)
-  PDense _ corners → denseBytes n corners
+  PDense bytes → byteCount bytes
+  where
+    byteCount bytes = let (lo, hi) = bounds bytes in hi - lo + 1
 
 -- | The conservative accounted bytes of a segment's own metadata: its start, its
 -- length, its encoding tag and the reference to its payload. An accounting
@@ -206,9 +237,10 @@ segmentLookup (Segment start n payload) (AxisCoord z)
   | otherwise = Just (valueAt payload (fromIntegral offset))
   where
     offset = z - start
-    valueAt (PUniform v) _ = PackedCell v
-    valueAt (PDense values corners) i = PackedCell (fromIntegral (values ! i) .|. (if testBit corners i then 1 `shiftL` cornerBit else 0))
+    valueAt (PUniform bytes) _ = PackedCell (wordAt bytes 0 .|. (if snd (bounds bytes) >= 2 then 1 `shiftL` cornerBit else 0))
+    valueAt (PDense bytes) i = PackedCell (wordAt bytes i .|. (if snd (bounds bytes) >= 2 * n && testBit (bytes ! (2 * n + i `div` 8)) (i `mod` 8) then 1 `shiftL` cornerBit else 0))
     valueAt (PRuns runs) i = PackedCell (runs ! search runs i .&. runValueMask)
+    wordAt bytes i = fromIntegral (bytes ! (2 * i)) .|. (fromIntegral (bytes ! (2 * i + 1)) `shiftL` 8)
     runValueMask = (1 `shiftL` runValueBits) - 1
     -- The first run whose exclusive end is above the offset.
     search runs i = go lo0 hi0

@@ -384,6 +384,30 @@ cornerSpec = describe "the family tag" $ do
     (segmentEncoding cleared, segmentPayloadBytes cleared) `shouldBe` (Uniform, 2)
     -- The predecessor stays valid and unchanged.
     segmentCells base `shouldBe` replicate 32 side15
+  it "rebuilds a slice from its returned start and cells to the same keys, run count and charge" $ do
+    let side15 = stone (sideK 15)
+        corner15 = stone (cornerK 15)
+        material = mustMaterial "stone"
+        source = build 0 (replicate 20 side15 <> replicate 12 corner15)
+        alternating = build 0 (concat (replicate 16 [side15, corner15]))
+        rebuilt segment lo hi = case segmentSlice segment lo hi of
+          Just (start, cells) → either (error . show) id (buildSegment start cells)
+          Nothing → error "the slice is empty"
+        crossing = rebuilt source 18 23
+        cornerOnly = rebuilt source 22 30
+        sideOnly = rebuilt source 2 8
+        short = rebuilt alternating 4 7
+    -- A slice across the side-15/corner-15 boundary keeps the two runs.
+    keysOf stonePalette crossing `shouldBe` replicate 2 (Just (material, sideK 15)) <> replicate 3 (Just (material, cornerK 15))
+    (segmentEncoding crossing, segmentRunCount crossing, segmentPayloadBytes crossing) `shouldBe` (Runs, Just 2, 8)
+    -- A slice holding only the corner run is a uniform corner, and one holding only side cells a uniform side.
+    keysOf stonePalette cornerOnly `shouldBe` replicate 8 (Just (material, cornerK 15))
+    (segmentEncoding cornerOnly, segmentPayloadBytes cornerOnly) `shouldBe` (Uniform, 3)
+    keysOf stonePalette sideOnly `shouldBe` replicate 6 (Just (material, sideK 15))
+    (segmentEncoding sideOnly, segmentPayloadBytes sideOnly) `shouldBe` (Uniform, 2)
+    -- Three alternating cells: three runs cost 12 bytes against 6 value bytes and one tag byte.
+    keysOf stonePalette short `shouldBe` [Just (material, sideK 15), Just (material, cornerK 15), Just (material, sideK 15)]
+    (segmentEncoding short, segmentPayloadBytes short) `shouldBe` (Dense, 7)
   it "refuses an update at a level outside the segment without building a mixed one" $ do
     let s = build 4 [stone (sideK 15), stone (sideK 15)]
     updateSegment s [(axis 5, stone (cornerK 15)), (axis 9, stone (cornerK 15))] `shouldBe` Left (LevelNotInSegment 9)

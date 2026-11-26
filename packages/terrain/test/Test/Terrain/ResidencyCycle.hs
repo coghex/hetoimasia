@@ -261,11 +261,11 @@ spec = describe "Residency over the real data layer" $ do
     (w2, accepted) ← submitAdmission w1 (SubmitRemoval (RequestId 2) a1 rev0 tile)
     -- The cell is resident: no job, and the growth is reserved from the free 66.
     admissionJobs accepted `shouldBe` []
-    ledgersOf (wModel w2) `shouldBe` Ledgers (3042, 66) (0, 64) (2016, 512)
+    ledgersOf (wModel w2) `shouldBe` Ledgers (3042, 66) (0, 64) (2016, 544)
     -- A second removal takes the other 66; a third finds the bank full: busy,
     -- since nothing may be evicted (every other region is pinned).
     (w2b, _) ← submitAdmission w2 (SubmitRemoval (RequestId 3) a1 rev0 (mustTile 0 0 (-51)))
-    ledgersOf (wModel w2b) `shouldBe` Ledgers (3042, 132) (0, 128) (2240, 1024)
+    ledgersOf (wModel w2b) `shouldBe` Ledgers (3042, 132) (0, 128) (2240, 1088)
     refusal ← stepRefused (wModel w2b) (SubmitRemoval (RequestId 5) a1 rev0 (mustTile 0 0 (-52)))
     case refusal of
       Busy (NoEligibleEviction 66 0 _) → pure ()
@@ -286,7 +286,7 @@ spec = describe "Residency over the real data layer" $ do
     -- The segment now occupies 348 bytes: another removal's 66 still fits (122 free).
     (w4, again) ← submitAdmission w3 {wModel = m4, wChanges = changes'} (SubmitRemoval (RequestId 4) a1 (Revision 1) (mustTile 0 0 (-51)))
     admissionJobs again `shouldBe` []
-    ledgersOf (wModel w4) `shouldBe` Ledgers (3052, 66) (64, 64) (2016, 512)
+    ledgersOf (wModel w4) `shouldBe` Ledgers (3052, 66) (64, 64) (2016, 544)
   it "keeps a region's accumulated charge within the configured stored maximum as separate jobs fill it" $ do
     -- One 32-level column per region, one region per query, the least bank the
     -- configuration allows (a region stores at most 256 + 48 + 32 x 35 = 1,424 bytes and

@@ -68,10 +68,10 @@ oneCellStored = 256 + 48 + 32 + 2
 removalGrowth ∷ Word
 removalGrowth = 66
 
--- | Scratch of a one-cell load: a 256-byte frame, two bytes and a tag bit (three bytes) for the cell, and the removed runs of its
+-- | Scratch of a one-cell load: a 256-byte frame, four bytes for the decoded cell, and the removed runs of its
 -- one column (at most one run of 16 bytes, and a 48-byte column entry).
 oneCellScratch ∷ Word
-oneCellScratch = 256 + 3 + (0 + 1) * 16 + 48
+oneCellScratch = 256 + 4 + (0 + 1) * 16 + 48
 
 interestBytes ∷ Word
 interestBytes = 64
@@ -84,7 +84,7 @@ removalReserve ∷ Word
 removalReserve = 16 + 48
 
 removalStaging ∷ Word
-removalStaging = 512
+removalStaging = 544
 
 -- | What a data layer reports for one stored cell.
 oneCellCost ∷ Cost
@@ -117,7 +117,7 @@ baseSpec =
   LimitsSpec
     { specResidentBytes = 1000
     , specEditBytes = 192
-    , specStagingBytes = 2048
+    , specStagingBytes = 2112
     , specLoadJobs = 3
     , specQueuedCommands = 3
     , specPinsPerView = 2

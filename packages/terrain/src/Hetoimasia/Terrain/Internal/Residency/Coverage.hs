@@ -52,7 +52,7 @@ import Data.Word (Word64)
 import Hetoimasia.Terrain.Changes (changeColumnBytes, changeIntervalBytes, runsMeetingLevels)
 import Hetoimasia.Terrain.Coordinate (LocalCoord, localX, localY, localZ)
 import Hetoimasia.Terrain.Resident (columnIndexBytes)
-import Hetoimasia.Terrain.Segment (maxSegmentPayloadBytes)
+import Hetoimasia.Terrain.Segment (decodedCellBytes, maxSegmentPayloadBytes)
 
 -- | A set of cells inside one region.
 newtype Coverage = Coverage (Map (Int, Int) [(Int, Int)])
@@ -240,15 +240,14 @@ descriptionBytes ∷ Word64 → Word64
 descriptionBytes n = 128 + 64 * n
 
 -- | The scratch a load of @delta@ needs (staging), for the load's whole life, in a region whose
--- loadable extent is @levels@ high: a fixed frame, a full extra copy of its cells at 'cellsScratchBytes' (two bytes and a tag bit each),
+-- loadable extent is @levels@ high: a fixed frame, a full extra copy of its cells at 'cellsScratchBytes' (four bytes each, a decoded cell),
 -- and the removed runs the load reads of the columns it touches ('loadRunsBytes').
 scratchBytes ∷ Word64 → Coverage → Word64
 scratchBytes levels delta = 256 + cellsScratchBytes (coverageCells delta) + loadRunsBytes levels (coverageColumns delta)
 
--- | The scratch bytes of a decoded copy of @cells@ cells: their 16-bit words and
--- one family-tag bit each.
+-- | The scratch bytes of a decoded copy of @cells@ cells: 'decodedCellBytes' each.
 cellsScratchBytes ∷ Word64 → Word64
-cellsScratchBytes cells = 2 * cells + (cells + 7) `div` 8
+cellsScratchBytes cells = fromIntegral decodedCellBytes * cells
 
 -- | The removed runs a load keeps of @columns@ columns, at most, by the figures of
 -- "Hetoimasia.Terrain.Changes". A load reads EVERY COLUMN IT TOUCHES OVER THE REGION'S LOADABLE
@@ -268,7 +267,7 @@ removalRetainedBytes = fromIntegral (changeIntervalBytes + changeColumnBytes)
 -- | The staging a removal needs: the decoded segment, its rebuilt copy, the
 -- staged overlay and the result settlement.
 removalStagingBytes ∷ Word64
-removalStagingBytes = 512
+removalStagingBytes = 544
 
 -- | What 'reserveCost' charges for one column index entry of a job.
 regionColumnReserveBytes ∷ Word64

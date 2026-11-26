@@ -94,7 +94,7 @@ import Data.Word (Word64)
 import Hetoimasia.Terrain.Cell (Column (..), mkZRange)
 import Hetoimasia.Terrain.Changes (ChangeLimits (..), Changes, changeColumnBytes, changeIntervalBytes, changesFromIntervals)
 import qualified Hetoimasia.Terrain.Query as Q
-import Hetoimasia.Terrain.Segment (maxSegmentPayloadBytes)
+import Hetoimasia.Terrain.Segment (decodedCellBytes, maxSegmentLevels, maxSegmentPayloadBytes)
 import qualified Hetoimasia.Terrain.Connectivity as C
 import Hetoimasia.Terrain.Coordinate (RegionCoord, TileCoord)
 import qualified Hetoimasia.Terrain.Discovery as D
@@ -169,19 +169,20 @@ gathersPerArena config = fromInteger (min (toInteger maxReaders) (A.ebsReadersPe
 -- transaction's write cannot be charged, or a removal is never granted. The spec's arenas are the
 -- service's arena cap, which bounds its backings.
 -- | What the staging a removal reserves for its whole life ('R.removalStagingBytes') holds, each part
--- at its bound: the decoded segment of its cell's column in its region (a segment's worst-case
--- payload, 'maxSegmentPayloadBytes': two bytes a cell and a tag bit), its rebuilt copy, the staged overlay (what its preparation keeps: the changes
+-- at its bound: the decoded segment of its cell's column in its region ('decodedCellBytes' a cell over a
+-- segment's levels), its rebuilt copy (a segment's worst-case payload, 'maxSegmentPayloadBytes'), the staged overlay (what its preparation keeps: the changes
 -- read over the cell and its two neighbours, at most four runs of one column, and the working
 -- interval, one run) and the result settlement (a settled result's record).
 removalStagingParts ∷ [(Text, Integer)]
 removalStagingParts =
-  [ ("decoded segment", segment)
-  , ("rebuilt copy", segment)
+  [ ("decoded segment", decoded)
+  , ("rebuilt copy", rebuilt)
   , ("staged overlay", column + 4 * interval + column + interval)
   , ("result settlement", toInteger resultRecordBytes)
   ]
   where
-    segment = toInteger maxSegmentPayloadBytes
+    decoded = toInteger decodedCellBytes * toInteger maxSegmentLevels
+    rebuilt = toInteger maxSegmentPayloadBytes
     column = toInteger changeColumnBytes
     interval = toInteger changeIntervalBytes
 

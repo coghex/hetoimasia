@@ -946,7 +946,7 @@ jobWorkOfModel j = JobWork (R.jobId j) (R.jobArena j) (R.jobRegion j) (R.jobActi
 -- decision's value, which is also the input of the work itself) and the data layer's own
 -- sizes, not the model's cost functions: a column index entry is 'columnIndexBytes' (48), a
 -- segment is 32 bytes of metadata and at least two of payload (a uniform one), and the
--- scratch is a 256-byte frame, two bytes and a family-tag bit a cell, and the removed runs the job reads of its
+-- scratch is a 256-byte frame, four bytes a cell (a decoded 32-bit cell), and the removed runs the job reads of its
 -- columns (a column of l levels holds at most l / 2 + 1 runs: by "Hetoimasia.Terrain.Changes"'s
 -- figures, (cells / 2 + columns) intervals and an entry a column).
 startJobWork ∷ Service → R.JobId → R.Coverage → STM ()
@@ -955,7 +955,7 @@ startJobWork svc jid cover =
     st {stateWork = (stateWork st) {rwJobs = Map.adjust running jid (rwJobs (stateWork st))}}
   where
     running (JobWork a b c d e _ _ _) =
-      JobWork a b c d e (R.coverageColumns cover * fromIntegral columnIndexBytes + R.coverageSegments cover * (32 + 2)) (256 + 2 * R.coverageCells cover + (R.coverageCells cover + 7) `div` 8 + runs) 1
+      JobWork a b c d e (R.coverageColumns cover * fromIntegral columnIndexBytes + R.coverageSegments cover * (32 + 2)) (256 + 4 * R.coverageCells cover + runs) 1
     -- every column the job touches, over the region's loadable extent (what the job reads)
     runs = R.coverageColumns cover * (runsMeetingLevels (extentLevels (serviceConfig svc)) * fromIntegral changeIntervalBytes + fromIntegral changeColumnBytes)
 
