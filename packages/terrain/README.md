@@ -715,7 +715,8 @@ disposal.
 ## Discovery and knowledge
 
 `Hetoimasia.Terrain.Discovery` (TRA-19) models what the player has discovered of
-the empty space, over the immutable source plus retained removals. It is a pure
+the empty space, over the immutable source plus retained replacements: removed cells
+and cells narrowed to a corner mask. It is a pure
 model of records, bounded candidate deltas and queries. It performs no I/O,
 starts no thread, keeps no mutable registry and has no Lua, graphics or game
 dependency. The page codec and copy-on-write store (TRA-20, in
@@ -730,14 +731,17 @@ service, a file backend or a persistent-save promise.
 
 ### Three separate meanings
 
-* **Terrain** is what a cell holds: the source plus the removals this model
-  retains. A removal only enlarges empty space, so a source component stays a
-  connected subset of the larger space after any removal. Placement, reshaping
-  and any change that could split a space need a split-capable contract and are
-  outside this one. The existing `Changes`, `Query`, `Resident` and `Residency`
-  functions are unchanged; `retainedRemovals` converts the retained runs back
-  for the consumers that read `Changes`, and a removal's `Changes` built through
-  `removeCell` or `changesFromIntervals` is not this model's authority.
+* **Terrain** is what a cell holds: the source plus the replacements this model
+  retains, in the tagged form of [retained replacements](#retained-replacements).
+  A removal or a narrowing only enlarges empty space (clearing corner bits never
+  raises a cell's surface), so a source component stays a connected subset of the
+  larger space after any edit. Placement, reshaping and any change that could
+  split a space need a split-capable contract and are outside this one.
+  `retainedReplacements` reads every retained run, air or mask, in the tagged form
+  of `Changes`; `retainedRemovals` returns the air runs alone for the consumers
+  that read every interval as air, and a mask run is in none of them. A `Changes`
+  built through `removeCell`, `narrowCell` or `changesFromIntervals` is not this
+  model's authority.
 * **Residency** is which detail is materialized. Loading, eviction, camera
   motion and cutaway changes grant no knowledge, and knowledge never pins detail.
   Generic fog is presentation only: it never changes occupancy, a logical query
@@ -769,17 +773,26 @@ identity or auxiliary heap index.
 
 | Key | Record | Meaning |
 | --- | --- | --- |
-| `KeyRun column lo` | `RecRun hi` | a canonical coalesced removed run `[lo, hi)` of one column |
+| `KeyRun column lo` | `RecRun hi` | an air run `[lo, hi)` of one column |
+| `KeyRun column lo` | `RecMaskRun hi mask` | a run of cells each limited to a nonzero corner mask of its own source material |
 | `KeyLink node` | `RecRoot (Root size known)` | a union-find root: members and whether the class is known |
 | `KeyLink node` | `RecChild parent` | a member pointing toward its root |
-| `KeyTodo sequence` | `RecTodo (Todo tile done)` | one removal's unfinished connections |
+| `KeyTodo sequence` | `RecTodo (Todo tile done)` | one edit's unfinished connections |
+
+Runs of a column are disjoint, and two that touch carry different payloads: equal
+neighbours coalesce, so an edit splits, shrinks or merges runs exactly as the
+overlay of `Changes` does.
 
 A `Node` is a source component (`SrcNode`, a canonical `ComponentKey` with its
-row, column and level parameters) or a removed run (`RunNode`, named by the lowest
-level it had when the node was made). A node with no `KeyLink` record is an
-implicit singleton root: a source component is known exactly when the compiled
-source calls it exterior, a run is unknown. **Absent is confirmed unknown**, which
-is a different fact from a record the provider has not supplied (below).
+row, column and level parameters), an air run (`RunNode`, named by the lowest
+level it had when the node was made) or the void of one narrowed cell
+(`CellNode`, named by its column and level). A cell's node is named by the level
+no edit changes, so equal adjacent masks share a storage run and keep separate
+voids, and a split or coalescing of the run never renames one. A narrowed cell has
+at most one void. A node with no `KeyLink` record is an implicit singleton root: a
+source component is known exactly when the compiled source calls it exterior, an
+air run and a narrowed cell's void are unknown. **Absent is confirmed unknown**,
+which is a different fact from a record the provider has not supplied (below).
 
 Joining two classes writes a child pointer and rewrites the larger class's root;
 the new root is known when either was. Joining a known class to an unknown one
@@ -808,6 +821,37 @@ A raw removal inside a sealed unknown space records its connections and joins it
 own classes but joins no known class, so it reveals nothing. A later opening from
 known space joins the whole modified class and discovers it. A removal of a known
 solid beside an unknown void discovers it only through actual new connectivity.
+
+### A narrowing and its obligation
+
+`stageNarrowing env header provider allowance tile target` stages the same paired
+candidate for a cell limited to the corner mask `target`. Whether the pair is a
+narrowing is decided by `narrowedCell` on the cell the model resolves for the tile
+from the source and its own records, never on a cell the caller supplies. A cell
+the transition refuses (air, a side identity other than 0, an equal target, a bit
+the cell does not have) is `NarrowRefused`: no record, obligation or revision, and
+different from `NarrowSuspended`, which is a record the provider has not supplied.
+A target of mask 0 is air, and then the retained runs, joins, obligation and
+drained knowledge are those of removing the cell, and the air coalesces with
+adjacent air from either operation.
+
+The candidate holds the run rewrite and the joins that follow from the cell itself:
+a cell's first edit joins its new void to the void of its source cell, an air
+replacement joins the void of the narrowed cell it replaces, and an air run that
+loses its key joins the run that takes its place. A narrowed cell that is narrowed
+again keeps its node, so its earlier joins stay valid as its void grows. The
+obligation holds the six face connections, resolved against what both cells hold
+when the connection is inspected: two voids connect where their exact openings
+overlap over positive area, and only an open top at the upper boundary of the world
+connects to the exterior. A bank's bottom opening at the lowest level and a side
+opening at an X or Y limit open nothing. Edits made before earlier obligations
+drain stay sound: an obligation reads the current cells, a cell edited again gets a
+new obligation, and the connections are joins that are never undone, so every newly
+available connection is considered whatever the order of edits and batches.
+
+Content advances on every applied edit. Knowledge advances only when known space
+grows, whether a class becomes known or a cell's void joins or widens inside a known
+class.
 
 ### The read set of an operation
 
@@ -865,18 +909,19 @@ What `queryCell` answers for every cell of one 16 × 16 × 32 region, compressed
 copies a region's knowledge (the terrain service's regional snapshot). It is a pure, read-only
 addition: no semantics, record, codec or obligation changes.
 
-* `planRegionKnowledge env region runs` takes the removed runs of the region's 256 columns and the 64
+* `planRegionKnowledge env region runs` takes the runs, air or mask, of the region's 256 columns and the 64
   columns beside it (`regionColumns`, `regionHaloColumns`) over its levels and one beyond each end
   (`regionReadLevels`), read by the caller from one committed version. It reads no record.
 * The plan partitions the columns into **classes** whose inputs are identical (the same lattice
-  intervals for the column and its four side neighbours, no removed run in any of the five, and the
-  column's coordinate wherever a box there keeps it as a component parameter; a column with a removal
+  intervals for the column and its four side neighbours, no run in any of the five, and the
+  column's coordinate wherever a box there keeps it as a component parameter; a column with an edit
   in or beside it is a class of its own), and each class's levels into **pieces** bounded by the
   lattice's Z cuts and the ends of those runs. In a piece every cell but the first and last has the same
   inputs, its up and down neighbours included, so a piece is evaluated at its first, one interior and
   its last cell. A box whose components keep the level as a parameter (stacked non-flat cells, a
-  component per level) is evaluated at every level of the piece, counted apart
-  (`planPerLevelTiles`).
+  component per level), and a piece inside a mask run in the column or beside it (equal masks of
+  adjacent levels share a run and keep separate voids), is evaluated at every level of the piece,
+  counted apart (`planPerLevelTiles`).
 * The caller evaluates `queryCell` at `planTiles`, in order, against the same committed version;
   `assembleRegionKnowledge` coalesces each class's runs and keeps one copy of each distinct column
   (`RegionKnowledge`: its classes, each a run list covering the region's 32 levels, and the class of
@@ -890,23 +935,23 @@ region, never with its 8,192 cells otherwise. State, ownership and lifetime: non
 ### Missing data and replay
 
 An operation reads through a `Provider`, a bounded window, never the whole history:
-an exact record lookup and a floor lookup of the removed run at or below a level. A
+an exact record lookup and a floor lookup of the run, with its payload, at or below a level. A
 record the provider answers `Unavailable` suspends the operation with its obligation
 intact (`EditSuspended`, `Stalled`, `HaltSuspended`, `MissingRecord`). It is never
 read as absent, as air, as newly forgotten fog or as proof that no connection exists,
 and pristine source state is never regenerated in place of a record the model was not
 given. `retainedFromRecords` rebuilds a `Retained` value from a header and its records
 after checking that they are a legitimate state (kinds match their keys, a run lies
-inside the supported range `[-2^62, 2^62]` and runs of a column are disjoint and not
-adjacent, so discovery and the existing `Changes` consumers cannot disagree about a
-restored run); resuming from those records alone
+inside the supported range `[-2^62, 2^62]`, a mask is nonzero, and runs of a column are
+disjoint and no two that touch carry the same payload, so discovery and the existing
+`Changes` consumers cannot disagree about a restored run); resuming from those records alone
 gives the same knowledge and the same remaining work.
 
 ### Authority and candidates
 
 **The revision rule**, stated once (`nextAuthority`; every candidate takes its next
 authority from it): *content* advances exactly when a candidate changes terrain (an
-applied removal); *knowledge* advances exactly when a candidate makes known space that was
+applied removal or narrowing); *knowledge* advances exactly when a candidate makes known space that was
 not known (a class becomes known, or a cell joins a known class: an extended or bridged
 run, a known old void) and never decreases; *store* advances on every candidate
 (obligation progress and unions that change no knowledge). A reader that keyed a derived
@@ -928,7 +973,7 @@ recovery.
 ### Limits and accounting
 
 `DiscoveryLimits` are validated by `mkDiscoveryLimits`: a figure outside its range, or
-too small for one minimal progress step (one removal with its continuation, or one
+too small for one minimal progress step (one edit with its continuation, or one
 structural update with its worst-case inspected input), is refused by field and never
 clamped, so a limit that can never fit gives a typed refusal and not an indefinite
 pending state. An `Allowance` can only tighten them per call.
@@ -936,13 +981,19 @@ pending state. An `Allowance` can only tighten them per call.
 | Field | Range | Default |
 | --- | --- | --- |
 | batch updates | 1 to 64 | 64 |
-| inspected records | `worstEditReads` (197) to 2^24 | 64 × `worstEdgeReads` |
-| delta records | `worstEditWrites` (7) to 2^24 | 64 × `worstEdgeWrites` |
+| inspected records | `worstNarrowReads` (198) to 2^24 | 64 × `worstEdgeReads` |
+| delta records | `worstNarrowWrites` (8) to 2^24 | 64 × `worstEdgeWrites` |
 | delta bytes | `minimumDeltaBytes` to 2^40 | 1 MiB |
 | scratch bytes | `minimumScratchBytes` to 2^40 | 4 MiB |
 | unfinished obligations | 1 to 2^32 | 65,536 |
 | retained bytes | `minimumRetainedBytes` to 2^40 | 48 MiB |
 | boundary page | 6 to 2^16 boxes and faces (the scratch must cover the lookup of the class, `findReadsBound` records, and a page: `boundaryQueryScratch`) | 1,024 |
+
+`worstEditReads` (197) and `worstEditWrites` (7) stay the true bounds of a removal in a history
+of removals alone, with `worstEdgeReads` (132) and `worstEdgeWrites` (3) for one inspection. An
+edit in a history that holds narrowed cells reads one more floor lookup, the run below a cell
+that starts its run, and writes one more run record, so its bounds are the two figures
+above and the minimums of the byte fields follow them.
 
 Bytes and counts are conservative accounted figures (keys, aliases, obligations,
 container overhead and scratch; a deletion is charged as the largest record of its
