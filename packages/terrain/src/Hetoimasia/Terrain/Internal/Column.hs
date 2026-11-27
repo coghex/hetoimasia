@@ -1,10 +1,12 @@
--- | Stepping through one column of source plus retained removals.
+-- | Stepping through one column of source plus retained replacements.
 --
--- A column's content is the composition of three interval maps, in priority
--- order: the retained removals (air), the column's authored patches, and the
--- shared base layers; a level none of them covers is air. 'step' answers, for
--- one level, a run of constant content that ends at the nearest boundary of
--- any of the three, so a long empty, removed or solid stretch is one step. The
+-- A column's content is the composition of three interval maps: the column's
+-- authored patches over the shared base layers give the source cell, and the
+-- retained replacements then make a level air or limit it to a corner mask of
+-- the source cell's own material. A level none of them covers is air. 'step'
+-- answers, for one level, a run of constant content that ends at the nearest
+-- boundary of any of the three, so a long empty, replaced or solid stretch is
+-- one step. The
 -- work of every query here is proportional to the intervals it crosses, never
 -- to the levels between them.
 --
@@ -19,7 +21,6 @@ module Hetoimasia.Terrain.Internal.Column
   ) where
 
 import Data.Int (Int64)
-import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Hetoimasia.Terrain.Internal.Cell
 import Hetoimasia.Terrain.Internal.Changes
@@ -30,7 +31,7 @@ import Hetoimasia.Terrain.Internal.Source
 data ColumnView = ColumnView
   { viewBase ∷ !(IntervalMap Cell)
   , viewPatches ∷ !(IntervalMap Cell)
-  , viewRemoved ∷ !(Map Int64 Int64)
+  , viewReplaced ∷ !(IntervalMap Replacement)
   }
 
 -- | The view of one column; building it reads only that column's records.
@@ -39,25 +40,32 @@ columnView source changes column =
   ColumnView
     { viewBase = sourceLayerMap source
     , viewPatches = Map.findWithDefault Map.empty column (sourcePatchMap source)
-    , viewRemoved = removedSet changes column
+    , viewReplaced = replacementRunMap changes column
     }
 
 -- | The run of constant content around level @z@: @(lo, hi, cell)@ with
 -- @lo <= z < hi@. Not necessarily maximal; adjacent equal runs are coalesced by
--- the caller.
+-- the caller. A mask run is resolved against the source material of this step,
+-- and the step ends at every source boundary, so a mask run that spans a
+-- material boundary reads each level with its own material.
 step ∷ ColumnView → Int64 → (Int64, Int64, Cell)
 step view z = (lo, hi, cell)
   where
     base = spanAt (viewBase view) z
     patch = spanAt (viewPatches view) z
-    removed = spanAtSet (viewRemoved view) z
-    lo = maximum [spanLo base, spanLo patch, spanLo removed]
-    hi = minimum [spanHi base, spanHi patch, spanHi removed]
-    cell = case (spanValue removed, spanValue patch, spanValue base) of
-      (Just (), _, _) → Air
-      (Nothing, Just patched, _) → patched
-      (Nothing, Nothing, Just layered) → layered
-      (Nothing, Nothing, Nothing) → Air
+    replaced = spanAt (viewReplaced view) z
+    lo = maximum [spanLo base, spanLo patch, spanLo replaced]
+    hi = minimum [spanHi base, spanHi patch, spanHi replaced]
+    source = case (spanValue patch, spanValue base) of
+      (Just patched, _) → patched
+      (Nothing, Just layered) → layered
+      (Nothing, Nothing) → Air
+    cell = case spanValue replaced of
+      Nothing → source
+      Just ReplaceAir → Air
+      Just (ReplaceMask mask) → case cellOccupant source of
+        Just (material, _) → cornerCell material mask
+        Nothing → Air
 
 -- | The cell at one level.
 cellIn ∷ ColumnView → Int64 → Cell

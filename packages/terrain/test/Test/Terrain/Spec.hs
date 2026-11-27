@@ -11,6 +11,7 @@ import qualified Test.Terrain.Discovery as Discovery
 import qualified Test.Terrain.DiscoveryRegion as DiscoveryRegion
 import qualified Test.Terrain.Geometry as Geometry
 import qualified Test.Terrain.Growth as Growth
+import qualified Test.Terrain.Narrowing as Narrowing
 import qualified Test.Terrain.Opacity as Opacity
 import qualified Test.Terrain.Opening as Opening
 import qualified Test.Terrain.Query as Query
@@ -36,6 +37,7 @@ spec = describe "Terrain" $ do
   Source.spec
   Segment.spec
   Query.spec
+  Narrowing.spec
   Connectivity.spec
   ConnectivityBounds.spec
   Discovery.spec

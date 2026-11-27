@@ -11,9 +11,7 @@ module Hetoimasia.Terrain.Internal.Interval
   ( IntervalMap
   , Span (..)
   , spanAt
-  , spanAtSet
   , insertDisjoint
-  , insertCoalesced
   ) where
 
 import Data.Int (Int64)
@@ -43,19 +41,6 @@ spanAt intervals z = case Map.lookupLE z intervals of
   where
     nextLo = maybe topExclusive fst (Map.lookupGT z intervals)
 
--- | The same view over a canonical set of removed intervals (inclusive start to
--- exclusive end), searched in place: no copy of the set is made, so the work is
--- logarithmic in the intervals held and nothing is allocated for those outside
--- the neighbourhood of @z@.
-spanAtSet ∷ Map Int64 Int64 → Int64 → Span ()
-spanAtSet set z = case Map.lookupLE z set of
-  Just (lo, hi)
-    | z < hi → Span lo hi (Just ())
-    | otherwise → Span hi nextLo Nothing
-  Nothing → Span bottomLevel nextLo Nothing
-  where
-    nextLo = maybe topExclusive fst (Map.lookupGT z set)
-
 -- | Insert @[lo, hi)@, or 'Nothing' if it overlaps an interval already there.
 -- Touching intervals do not overlap.
 insertDisjoint ∷ Int64 → Int64 → a → IntervalMap a → Maybe (IntervalMap a)
@@ -70,17 +55,3 @@ insertDisjoint lo hi value intervals
     overlapsAbove = case Map.lookupGT lo intervals of
       Just (nextLo, _) → nextLo < hi
       Nothing → False
-
--- | Add @[lo, hi)@ to a canonical set of sorted, disjoint, coalesced
--- intervals, merging every interval it overlaps or touches into one. The work
--- is logarithmic plus the number of intervals absorbed.
-insertCoalesced ∷ Int64 → Int64 → Map Int64 Int64 → Map Int64 Int64
-insertCoalesced lo hi set =
-  Map.union (Map.insert lo' hi' below') above'
-  where
-    (below, rest) = Map.spanAntitone (< lo) set
-    (lo', hi0, below') = case Map.lookupMax below of
-      Just (k, e) | e >= lo → (k, max hi e, Map.deleteMax below)
-      _ → (lo, hi, below)
-    (absorbed, above') = Map.spanAntitone (<= hi0) rest
-    hi' = maximum (hi0 : Map.elems absorbed)

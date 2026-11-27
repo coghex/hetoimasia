@@ -266,7 +266,8 @@ loadRunsBytes levels columns = columns * (runsMeetingLevels levels * fromIntegra
 
 -- | The worst-case retained growth of one whole-cell removal: one new removed
 -- interval and one new column index entry (the figures of
--- "Hetoimasia.Terrain.Changes"). A removal never splits an interval.
+-- "Hetoimasia.Terrain.Changes"). On an overlay that holds only air runs a removal never splits one; a
+-- removal inside a mask run does, and live admission over such overlays replaces this figure.
 removalRetainedBytes ∷ Word64
 removalRetainedBytes = fromIntegral (changeIntervalBytes + changeColumnBytes)
 
