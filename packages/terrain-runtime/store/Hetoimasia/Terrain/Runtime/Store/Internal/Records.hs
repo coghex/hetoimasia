@@ -67,6 +67,7 @@ import Hetoimasia.Terrain.Cell (Column (..), mkColumn)
 import Hetoimasia.Terrain.Connectivity (Axis (..), keyOrigin, keyParameters, mkComponentKey)
 import Hetoimasia.Terrain.Coordinate (AxisCoord, TileCoord (..), axisFromInteger, axisValue, tileCoord)
 import Hetoimasia.Terrain.Discovery (Node (..), Record (..), RecordKey (..), Root (..), Todo (..), edgeCount)
+import Hetoimasia.Terrain.Shape (cornerMaskValue)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Format
 
 -- | The lowest supported level, @-2^62@.
@@ -149,6 +150,9 @@ nodeBytes (SrcNode key) =
   where
     params = keyParameters key
 nodeBytes (RunNode col lo) = BS.concat [BS.singleton 1, columnBytes col, biased lo]
+-- The version 1 pages hold no narrowed cell's void: a tag no 'getNode' reads, so a key or a child that names one
+-- never round-trips and the write that carries it is refused.
+nodeBytes (CellNode col lo) = BS.concat [BS.singleton 2, columnBytes col, biased lo]
 
 getNode ∷ ByteString → Maybe Node
 getNode bs = case BS.uncons bs of
@@ -191,6 +195,9 @@ decodeKey _ _ = Nothing
 -- | The value bytes of a logical record.
 encodeValue ∷ Record → ByteString
 encodeValue (RecRun hi) = biased hi
+-- The version 1 pages hold air runs only: a mask run has a length no 'decodeValue' reads, so it never round-trips as a
+-- removal and the write that carries it is refused.
+encodeValue (RecMaskRun hi mask) = BS.snoc (biased hi) (fromIntegral (cornerMaskValue mask))
 encodeValue (RecRoot (Root size known)) = BS.concat [BS.singleton 0, be64 size, BS.singleton (if known then 1 else 0)]
 encodeValue (RecChild node) = BS.cons 1 (nodeBytes node)
 encodeValue (RecTodo (Todo tile done)) = BS.snoc (tileBytes tile) done

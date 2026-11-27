@@ -37,12 +37,16 @@ module Hetoimasia.Terrain.Internal.Discovery.Limits
   , worstEdgeWrites
   , worstEditReads
   , worstEditWrites
+  , worstNarrowReads
+  , worstNarrowWrites
   , maxRecordBytes
   , headerBytes
   , worstEdgeBytes
   , worstEditBytes
+  , worstNarrowBytes
   , worstEdgeScratch
   , worstEditScratch
+  , worstNarrowScratch
   , minimumDeltaBytes
   , minimumScratchBytes
   , minimumRetainedBytes
@@ -85,6 +89,20 @@ worstEditReads = 2 + 3 * findReadsBound
 worstEditWrites ∷ Int
 worstEditWrites = 7
 
+-- | The most records one edit reads in a history that holds narrowed cells. It
+-- reads the floor lookups that find the cell's run, the run above and, below a
+-- cell that starts its run, the run below, and three root lookups: the run that
+-- takes the cell, the air run it absorbs and the cell's own void. A history of
+-- removals alone stays within 'worstEditReads'.
+worstNarrowReads ∷ Int
+worstNarrowReads = 3 + 3 * findReadsBound
+
+-- | The most records one edit writes in a history that holds narrowed cells: a
+-- run split in three or two runs coalesced, two unions' four records and the
+-- new obligation. A history of removals alone stays within 'worstEditWrites'.
+worstNarrowWrites ∷ Int
+worstNarrowWrites = 3 + 4 + 1
+
 -- | A conservative accounted size of the largest single record entry: the key,
 -- the value and the container overhead.
 maxRecordBytes ∷ Int
@@ -102,6 +120,11 @@ worstEdgeBytes = worstEdgeWrites * maxRecordBytes
 worstEditBytes ∷ Int
 worstEditBytes = worstEditWrites * maxRecordBytes
 
+-- | The most accounted bytes one edit adds to a candidate in a history that holds
+-- narrowed cells.
+worstNarrowBytes ∷ Int
+worstNarrowBytes = worstNarrowWrites * maxRecordBytes
+
 -- | The most scratch bytes one edge inspection holds: every record it reads and
 -- every record it stages.
 worstEdgeScratch ∷ Int
@@ -111,17 +134,21 @@ worstEdgeScratch = (worstEdgeReads + worstEdgeWrites) * maxRecordBytes
 worstEditScratch ∷ Int
 worstEditScratch = (worstEditReads + worstEditWrites) * maxRecordBytes
 
--- | The smallest candidate payload that holds one removal.
+-- | The most scratch bytes one edit holds in a history that holds narrowed cells.
+worstNarrowScratch ∷ Int
+worstNarrowScratch = (worstNarrowReads + worstNarrowWrites) * maxRecordBytes
+
+-- | The smallest candidate payload that holds one edit, a narrowing or a removal.
 minimumDeltaBytes ∷ Int
-minimumDeltaBytes = worstEditBytes + headerBytes
+minimumDeltaBytes = worstNarrowBytes + headerBytes
 
--- | The smallest scratch allowance that holds one removal.
+-- | The smallest scratch allowance that holds one edit.
 minimumScratchBytes ∷ Int
-minimumScratchBytes = max worstEditScratch worstEdgeScratch
+minimumScratchBytes = max worstNarrowScratch worstEdgeScratch
 
--- | The smallest retained-record allowance that holds one removal.
+-- | The smallest retained-record allowance that holds one edit.
 minimumRetainedBytes ∷ Int
-minimumRetainedBytes = headerBytes + worstEditBytes
+minimumRetainedBytes = headerBytes + worstNarrowBytes
 
 -- | The accounted bytes of one boundary face in a query page.
 boundaryFaceBytes ∷ Int
@@ -247,14 +274,16 @@ defaultDiscoveryLimits =
 -- | Validate a specification. The first refused field, in declaration order, is
 -- reported. The admissible ranges are: the batch in @[1, 64]@, the reads and
 -- writes in @[need, 2^24]@, the byte figures in @[need, 2^40]@ and the
--- obligations in @[1, 2^32]@, where @need@ is what one removal costs in the
--- worst case ('worstEditReads', 'worstEditWrites', 'minimumDeltaBytes',
--- 'minimumScratchBytes' and 'minimumRetainedBytes').
+-- obligations in @[1, 2^32]@, where @need@ is what one edit costs in the worst
+-- case, in a history that holds narrowed cells ('worstNarrowReads',
+-- 'worstNarrowWrites', 'minimumDeltaBytes', 'minimumScratchBytes' and
+-- 'minimumRetainedBytes'); a removal-only history stays within the
+-- 'worstEditReads' and 'worstEditWrites' figures.
 mkDiscoveryLimits ∷ DiscoverySpec → Either LimitError DiscoveryLimits
 mkDiscoveryLimits spec = do
   batch ← check FieldBatchUpdates (toInteger maxBatchUpdates) 1 (specBatchUpdates spec)
-  reads' ← check FieldInspectedRecords countCeiling (toInteger worstEditReads) (specInspectedRecords spec)
-  records ← check FieldDeltaRecords countCeiling (toInteger worstEditWrites) (specDeltaRecords spec)
+  reads' ← check FieldInspectedRecords countCeiling (toInteger (max worstEditReads worstNarrowReads)) (specInspectedRecords spec)
+  records ← check FieldDeltaRecords countCeiling (toInteger (max worstEditWrites worstNarrowWrites)) (specDeltaRecords spec)
   deltaBytes ← check FieldDeltaBytes byteCeiling (toInteger minimumDeltaBytes) (specDeltaBytes spec)
   scratch ← check FieldScratchBytes byteCeiling (toInteger minimumScratchBytes) (specScratchBytes spec)
   pending ← check FieldPendingObligations pendingCeiling 1 (specPendingObligations spec)

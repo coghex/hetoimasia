@@ -30,6 +30,7 @@ import qualified Data.Set as Set
 import Data.Int (Int64)
 import Data.Word (Word64)
 import GHC.Stats (RTSStats (..), GCDetails (..), getRTSStats)
+import Hetoimasia.Terrain.Changes (Replacement (..))
 import Hetoimasia.Terrain.Connectivity (Axis (..), ComponentKey, keyParameters, mkComponentKey)
 import Hetoimasia.Terrain.Coordinate (AxisCoord, axisFromInteger)
 import Hetoimasia.Terrain.Discovery (Authority (..), Header (..), Node (..), ReadSet (..), Record (..), RecordKey (..), Root (..), Todo (..), headerBytes, maxBatchUpdates, worstEdgeReads, worstEditReads)
@@ -200,7 +201,7 @@ spec = describe "the accounted-bytes constants against what is retained (forced 
       | (nm, kf, rf) ← validPairs
       ]
         <> [ do
-               v ← retainedPer nFacts (ints nFacts) id (\is → pure (windowCheckpoint (factsOf (Fingerprint ident0 1 [] []) [] (ReadSet [] [((columnAt (big i) (big (i + 1)), fromInteger (big (i + 2))), if odd i then Just (fromInteger (big i), fromInteger (big (i + 1))) else Nothing) | i ← is])) (emptyWindow ident0 1))) (\w → evaluate (windowReadFactCount w))
+               v ← retainedPer nFacts (ints nFacts) id (\is → pure (windowCheckpoint (factsOf (Fingerprint ident0 1 [] []) [] (ReadSet [] [((columnAt (big i) (big (i + 1)), fromInteger (big (i + 2))), if odd i then Just (fromInteger (big i), fromInteger (big (i + 1)), ReplaceAir) else Nothing) | i ← is])) (emptyWindow ident0 1))) (\w → evaluate (windowReadFactCount w))
                pure (Variant "floor answer (16 bytes) or absent" v (Just (BS.length (encodeKey (runKey 1 1 1)) + 16 + readFactOverheadBytes)))
            , do
                v ← retainedPer nFacts (ints nFacts) id (\is → pure (Map.fromList [(toShort (BS.append (be64 (fromIntegral i)) (BS.pack [fromIntegral (i + j) | j ← [1 .. maxKeyBytes - 8]])), toShort (BS.pack [fromIntegral (i + j + 3) | j ← [1 .. maxValueBytes]])) | i ← is])) (\m → evaluate (Map.size m))

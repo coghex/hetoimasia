@@ -161,6 +161,7 @@ import qualified Data.Set as Set
 import Data.Int (Int64)
 import Data.Word (Word32, Word64)
 import Hetoimasia.Terrain.Cell (Column)
+import Hetoimasia.Terrain.Changes (Replacement (..))
 import Hetoimasia.Terrain.Discovery (ReadSet (..), Record, RecordKey (..))
 import Hetoimasia.Terrain.Residency (ArenaId (..))
 import Hetoimasia.Terrain.Runtime.Store.Internal.Format
@@ -319,7 +320,7 @@ packReads ∷ ReadSet → PackedReads
 packReads (ReadSet rs fl) =
   PackedReads
     (Map.fromList [(packKey k, maybe SBS.empty (toShort . encodeValue) v) | (k, v) ← rs])
-    (Map.fromList [(packKey (KeyRun c z), maybe SBS.empty packRun v) | ((c, z), v) ← fl])
+    (Map.fromList [(packKey (KeyRun c z), fact) | ((c, z), v) ← fl, Just fact ← [floorFact v]])
 
 -- | Facts made from what a plan established and read: the reads are packed here, at creation.
 factsOf ∷ Fingerprint → [Fact] → ReadSet → Facts
@@ -432,6 +433,14 @@ windowReadFactBytes w = sum [SBS.length k + SBS.length v + readFactOverheadBytes
 -- (@Codec@: \"a present record never encodes to an empty value\").
 packKey ∷ RecordKey → ShortByteString
 packKey = toShort . encodeKey
+
+-- | The packed fact of a floor answer: the empty value for none, the two ends of an air run. The pages hold air runs only
+-- and answer every run as air, so a mask-tagged answer from another provider has no packed form and keeps no fact; a later
+-- run of the plan reads the pages again.
+floorFact ∷ Maybe (Int64, Int64, Replacement) → Maybe ShortByteString
+floorFact Nothing = Just SBS.empty
+floorFact (Just (lo, hi, ReplaceAir)) = Just (packRun (lo, hi))
+floorFact (Just (_, _, ReplaceMask _)) = Nothing
 
 packRun ∷ (Int64, Int64) → ShortByteString
 packRun (lo, hi) = toShort (BS.append (be64 (fromIntegral lo)) (be64 (fromIntegral hi)))

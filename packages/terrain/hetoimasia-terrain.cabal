@@ -105,6 +105,7 @@ test-suite terrain-tests
         Test.Terrain.CornerOracle
         Test.Terrain.Discovery
         Test.Terrain.DiscoveryHarness
+        Test.Terrain.DiscoveryNarrowing
         Test.Terrain.DiscoveryRegion
         Test.Terrain.Fixtures
         Test.Terrain.Geometry

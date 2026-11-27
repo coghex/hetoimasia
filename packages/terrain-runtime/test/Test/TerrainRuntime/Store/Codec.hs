@@ -20,7 +20,9 @@ import Control.Exception (evaluate)
 import Data.Int (Int64)
 import System.Timeout (timeout)
 import Data.Word (Word64, Word8)
+import Hetoimasia.Terrain.Changes (Replacement (..))
 import Hetoimasia.Terrain.Discovery (Authority (..), Header (..), Node (..), ReadSet (..), Record (..), RecordKey (..))
+import Hetoimasia.Terrain.Shape (mkCornerMask)
 import Hetoimasia.Terrain.Connectivity (Axis (..), mkComponentKey)
 import Hetoimasia.Terrain.Coordinate (axisFromInteger)
 import Hetoimasia.Terrain.Residency (ArenaId (..), Revision (..))
@@ -529,14 +531,31 @@ spec = describe "the private page codec against independent bytes" $ do
       forM_ keys $ \k → decodeValue k BS.empty `shouldBe` Nothing
     it "returns a present and an absent answer through the window as they went in (records, and the 16-byte floor answer)" $ do
       let recKey = KeyLink (srcNode 1 1 1)
-          floors = [((col, 0), Just (minBound, maxBound)), ((col, 1), Just (0, 0)), ((col, 2), Nothing)]
+          floors = [((col, 0), Just (minBound, maxBound, ReplaceAir)), ((col, 1), Just (0, 0, ReplaceAir)), ((col, 2), Nothing)]
           w = windowCheckpoint (factsOf (Fingerprint ident0 1 [] []) [] (ReadSet [(recKey, Just r) | r ← [childRec (srcNode 2 2 2)]] [])) (emptyWindow ident0 1)
           wAbsent = windowCheckpoint (factsOf (Fingerprint ident0 1 [] []) [] (ReadSet [(recKey, Nothing)] floors)) (emptyWindow ident0 1)
       windowReadRecord recKey w `shouldBe` Just (Just (childRec (srcNode 2 2 2)))
       windowReadRecord recKey wAbsent `shouldBe` Just Nothing
       windowReadRecord (KeyLink (srcNode 9 9 9)) w `shouldBe` Nothing
-      forM_ floors $ \(q, a) → windowReadFloor q wAbsent `shouldBe` Just a
+      forM_ floors $ \(q, a) → windowReadFloor q wAbsent `shouldBe` Just (fmap (\(lo, hi, _) → (lo, hi)) a)
       windowReadFloor (col, 3) wAbsent `shouldBe` Nothing
+  describe "what the version 1 pages cannot hold" $ do
+    -- The pages hold air runs and the voids of runs and source components. A mask run and the void of a narrowed cell have no
+    -- encoding that reads back, so a write that carries one is refused by the round-trip check and never stored as a removal.
+    let col = columnAt 3 (-4)
+        mask5 = either (error . show) id (mkCornerMask 5)
+    it "never reads a mask run back, as a removal or as anything else" $ do
+      forM_ [1, 7, maxBound] $ \hi → do
+        BS.null (encodeValue (RecMaskRun hi mask5)) `shouldBe` False
+        decodeValue (runKey 3 (-4) 0) (encodeValue (RecMaskRun hi mask5)) `shouldBe` Nothing
+    it "never reads the void of a narrowed cell back, as a key or as a child" $ do
+      decodeKey TreeLinks (encodeKey (KeyLink (CellNode col 0))) `shouldBe` Nothing
+      decodeValue (KeyLink (RunNode col 0)) (encodeValue (RecChild (CellNode col 0))) `shouldBe` Nothing
+    it "keeps no read fact of a mask-tagged floor answer, and keeps the air ones and the absent ones" $ do
+      let fp = Fingerprint ident0 1 [] []
+          floors = [((col, 0), Just (0, 4, ReplaceMask mask5)), ((col, 1), Just (0, 4, ReplaceAir)), ((col, 2), Nothing)]
+          w = windowCheckpoint (factsOf fp [] (ReadSet [] floors)) (emptyWindow ident0 1)
+      (windowReadFloor (col, 0) w, windowReadFloor (col, 1) w, windowReadFloor (col, 2) w) `shouldBe` (Nothing, Just (Just (0, 4)), Just Nothing)
   describe "revision and version arithmetic" $ do
     it "refuses a revision or version that would wrap, and a delta that names another authority" $ do
       let cfg = either (error . show) id (mkStoreConfig smallSpec)

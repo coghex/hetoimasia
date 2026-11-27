@@ -120,6 +120,7 @@ import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import Data.Word (Word16, Word32, Word64)
 import Hetoimasia.Terrain.Cell (Column)
+import Hetoimasia.Terrain.Changes (Replacement (..))
 import Hetoimasia.Terrain.Discovery
   ( Authority (..)
   , Candidate
@@ -971,10 +972,17 @@ canonicalWrites ws = do
   mapM_ check (Map.toList m)
   Right (Map.toAscList m)
   where
-    check (k, Just r) = case decodeValue k (encodeValue r) of
-      Just r' | r' == r → Right ()
-      _ → refuse (Invalid (MalformedWrite k))
-    check _ = Right ()
+    -- A write the version 1 pages cannot represent (a mask run, the void of a narrowed cell) never round-trips through the
+    -- codec, and is refused here, never written as something else.
+    check (k, mr) = do
+      case decodeKey (treeOfKey k) (encodeKey k) of
+        Just k' | k' == k → Right ()
+        _ → refuse (Invalid (MalformedWrite k))
+      case mr of
+        Just r → case decodeValue k (encodeValue r) of
+          Just r' | r' == r → Right ()
+          _ → refuse (Invalid (MalformedWrite k))
+        Nothing → Right ()
 
 applyWrites
   ∷ Edit
@@ -1354,7 +1362,8 @@ providerFor win rootFor =
         Right Nothing → Absent
         Left _ → Unavailable key
     , fetchFloorRun = \col z → case floorRun win rootFor col z of
-        Right (Just run) → Found run
+        -- the pages hold air runs only: every stored run answers as air
+        Right (Just (lo, hi)) → Found (lo, hi, ReplaceAir)
         Right Nothing → Absent
         Left _ → Unavailable (KeyRun col z)
     }
@@ -1371,7 +1380,7 @@ providerFacts win rootFor =
         Just Nothing → Absent
         Nothing → fetchRecord paged key
     , fetchFloorRun = \col z → case windowReadFloor (col, z) win of
-        Just (Just run) → Found run
+        Just (Just (lo, hi)) → Found (lo, hi, ReplaceAir)
         Just Nothing → Absent
         Nothing → fetchFloorRun paged col z
     }
