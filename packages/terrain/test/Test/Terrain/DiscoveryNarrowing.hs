@@ -226,6 +226,7 @@ spec ∷ Spec
 spec = describe "Discovery of narrowed cells" $ do
   openingsSpec
   stackSpec
+  bankStackSpec
   editsSpec
   restoreSpec
   boundariesSpec
@@ -351,6 +352,35 @@ stackSpec = describe "a stack of equal masks" $ do
         [knowledgeOf env again (2, 2, z) | z ← [0 .. 3]] `shouldBe` [settled z | z ← [0 .. 3]]
         [classOf again z | z ← [0, 1, 3]] `shouldBe` [classOf edited z | z ← [0, 1, 3]]
       Left e → expectationFailure (show e)
+
+-- | Eight equal banks at (2, 2), levels 0 to 7 under open sky, narrowed top first. The banks join one
+-- another, so while the work drains the known cells are those the finished obligations have reached from
+-- the top: adjacent interior levels of the one run differ in knowledge with no lattice cut or run end
+-- between them, and a plan that evaluated only the first, second and last level of the run would give every
+-- interior level the answer of the second.
+bankStackSpec ∷ Spec
+bankStackSpec = describe "a stack of equal banks narrowed from the top down" $ do
+  let w = worldOf (groundScene "banks" 8 (0, 5) (0, 5) 10 [])
+      env = worldEnv w
+      slow = worldSlow w
+      edits = [Narrow (2, 2, z) 1 | z ← [7, 6 .. 0]]
+      queued = staged env edits
+      states = drainStates slow queued
+      pattern ret = [cellVoid (knowledgeOf env ret (2, 2, z)) == VoidKnown | z ← [0 .. 7]]
+      interiorDiffers ret = or (zipWith (/=) (take 4 (drop 2 (pattern ret))) (take 4 (drop 3 (pattern ret))))
+      region = RegionCoord 0 0 0
+      plansEveryLevel ret =
+        let runs = Map.fromListWith (flip (<>)) [(column, [(fromInteger (zRangeLo range), fromInteger (zRangeHi range), p)]) | (column, range, p) ← retainedReplacements ret]
+         in planPerLevelTiles (planRegionKnowledge env region runs)
+  it "shares one run, drains to what the flood finds, and has states whose interior levels differ" $ do
+    runsOf queued `shouldBe` [(columnOf 2 2, [(0, 8, ReplaceMask (mask 1))])]
+    knownVoids w (drain env queued) `shouldBe` oracleKnown w (oracleChanges w edits)
+    length (filter interiorDiffers states) `shouldSatisfy` (> 3)
+  it "answers a whole region with the answer of every cell while the obligations drain, and evaluates every level" $ do
+    let sampled = [ret | (n, ret) ← zip [0 ∷ Int ..] states, n `elem` [0, 9, 18, 27, 36, 45], interiorDiffers ret || n == 0] <> [last states]
+    length sampled `shouldSatisfy` (>= 3)
+    mapM_ (\ret → regionMismatches env ret region `shouldBe` []) sampled
+    mapM_ (\ret → plansEveryLevel ret `shouldSatisfy` (>= 8)) sampled
 
 restored ∷ Header → [(RecordKey, Record)] → Either Integrity Retained
 restored = retainedFromRecords
