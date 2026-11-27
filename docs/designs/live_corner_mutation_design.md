@@ -6,7 +6,7 @@ Design state: `ready for issue processing`
 
 An unchecked entry awaits filing. A checked entry links its tracker number.
 
-- [ ] EPIC. Narrow observed terrain solids in a live arena
+- [x] EPIC. Narrow observed terrain solids in a live arena — [#767]
 - [ ] NARROW-1. Represent and query tagged terrain replacements
 - [ ] NARROW-2. Discover openings through edited corner cells
 - [ ] NARROW-3. Store and replay bounded tagged replacements
