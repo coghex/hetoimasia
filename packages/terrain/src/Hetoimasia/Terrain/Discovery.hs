@@ -1,4 +1,4 @@
--- | Compressed knowledge and resumable discovery over source plus removals: the
+-- | Compressed knowledge and resumable discovery over source plus replacements: the
 -- pure model behind underground fog of war (TRA-19).
 --
 -- The model decides and records; it performs nothing. It has no I/O, thread,
@@ -10,10 +10,11 @@
 -- = Three separate meanings
 --
 -- * /Terrain/ is what a cell holds: the immutable "Hetoimasia.Terrain.Source"
---   plus the removals this model retains. Removals only enlarge empty space, so
---   a source component stays a connected subset of the larger space after any
---   removal. Placement, reshaping and any change that could split a space are
---   outside this contract.
+--   plus the replacements this model retains: removed cells and cells narrowed
+--   to a corner mask. Both only enlarge empty space (clearing corner bits never
+--   raises a surface), so a source component stays a connected subset of the
+--   larger space after any edit. Placement, reshaping and any change that could
+--   split a space are outside this contract.
 --
 -- * /Residency/ ("Hetoimasia.Terrain.Residency", "Hetoimasia.Terrain.Resident")
 --   is which detail is materialized. Loading, eviction, camera motion and cutaway
@@ -39,8 +40,9 @@
 --
 -- = The forest
 --
--- A node is a source component ('SrcNode') or a run of removed levels of one
--- column ('RunNode'). Joining two classes records a child pointer and rewrites
+-- A node is a source component ('SrcNode'), a run of air levels of one column
+-- ('RunNode') or the void of one narrowed cell ('CellNode', named by its own level,
+-- so equal adjacent masks share a storage run and keep separate voids). Joining two classes records a child pointer and rewrites
 -- the larger class's root, which holds the class size and whether it is known.
 -- A class is known when it holds an exterior component or has been joined to
 -- known space, so joining a known class to an unknown one makes every member of
@@ -50,9 +52,11 @@
 -- merged because their bounds overlap; only the components a removal's faces
 -- actually reach are joined. Union by size bounds a chain by 'maxLinkChain'.
 --
--- Removed runs keep their identity across edits: a run whose lower end moves, or
+-- Air runs keep their identity across edits: a run whose lower end moves, or
 -- two runs a new removal bridges, are joined to the run that takes their place
--- in the same candidate, so no alias is left naming a vanished run.
+-- in the same candidate, so no alias is left naming a vanished run. A narrowed
+-- cell keeps its node through every later edit of the cell, and an air
+-- replacement of it joins that void.
 --
 -- = Removal and its obligation
 --
@@ -63,10 +67,17 @@
 -- meets a neighbour's portals over positive area (shared with
 -- "Hetoimasia.Terrain.Opening"; edge and point contact never connects) and the
 -- upper boundary of the world. Removing air or an already removed cell is
--- 'NoChange': no history, no obligation, no revision. The existing
+-- 'NoChange': no history, no obligation, no revision. 'stageNarrowing' stages the
+-- same paired candidate for a cell limited to a corner mask: validity is decided
+-- by the narrowing transition on the cell this model resolves from its own records
+-- ('NarrowRefused' stages nothing), the new void is joined to the void the cell
+-- held, and the faces are resolved against what both cells hold when each is
+-- inspected, so edits made before earlier obligations drain stay sound. A target
+-- of mask 0 is a removal. The existing
 -- "Hetoimasia.Terrain.Changes" functions are unchanged and their result is not
--- this model's authority; 'retainedRemovals' converts the other way for the
--- consumers that read 'Hetoimasia.Terrain.Changes.Changes'.
+-- this model's authority; 'retainedRemovals' converts the other way, as air runs
+-- alone, for the consumers that read every interval as air, and
+-- 'retainedReplacements' reads every run in the tagged form of the overlay.
 --
 -- A raw removal inside a sealed unknown space records its connections and joins
 -- its own classes but joins no known class, so it reveals nothing. A later
