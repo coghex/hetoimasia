@@ -218,10 +218,10 @@ spec = describe "The backed terrain service" $ do
 
   -- A column query, or a surface's window, of at most the range limit keeps at most what that many
   -- levels can hold (a run for each level: runs of different tags alternate), inside the reader's pin
-  -- credit (79 pages of 4,288 bytes, 338,752): what it keeps must leave the 10 pages one read step needs (a
-  -- root-to-leaf path of at most 8 pages and the leaves either side of the target). At 12,326 levels it keeps
-  -- 12,326 x 24 + 48 = 295,872 and leaves 42,880, 10 pages exactly; at 12,327 it would keep 295,896 where at
-  -- most 338,752 - 10 x 4,288 = 295,872 may be kept. The default 8,192 levels keep 196,656 and leave 142,096.
+  -- credit (85 pages of 4,288 bytes, 364,480): what it keeps must leave the 16 pages one read step needs (the
+  -- path to the target's leaf, at most 8 pages, and that of a neighbouring subtree). At 12,326 levels it keeps
+  -- 12,326 x 24 + 48 = 295,872 and leaves 68,608, 16 pages exactly; at 12,327 it would keep 295,896 where at
+  -- most 364,480 - 16 x 4,288 = 295,872 may be kept. The default 8,192 levels keep 196,656 and leave 167,824.
   it "refuses at construction query limits under which a read keeps more runs than its pin credit holds beside one read step's pages, and accepts the largest that leaves them" $ do
     let config n = defaultConfig {configQueryLimits = defaultQueryLimits {limitRangeLevels = n}}
     try (withService (config 12327) (\_ → pure ())) >>= \case

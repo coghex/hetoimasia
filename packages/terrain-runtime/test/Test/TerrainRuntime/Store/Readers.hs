@@ -16,7 +16,7 @@ import qualified Data.ByteString as BS
 import qualified Data.Map.Strict as Map
 import Data.List (nub)
 import Data.Int (Int64)
-import Hetoimasia.Terrain.Discovery (Record (..), RecordKey (..))
+import Hetoimasia.Terrain.Discovery (Record (..), RecordKey (..), maxBatchUpdates)
 import Hetoimasia.Terrain.Residency (ArenaId (..))
 import Hetoimasia.Terrain.Runtime.Store.Internal.Format
 import Hetoimasia.Terrain.Runtime.Store.Internal.Page (Body (..), Page (..), encodePage)
@@ -290,6 +290,32 @@ spec = describe "pinned readers, retirement and reclamation" $ do
     bytes ← either (\e → expectationFailure (show e) >> fail "encode") pure (encodePage (hIdent h3) beyond)
     let tampered = h3 {hDisk = diskWrite (PageNo fr) bytes (hDisk h3), hStore = storeFromRoots (hCfg h3) (hIdent h3) roots {rLoose = []}}
     planOn tampered >>= refusedAsCorrupt "a free extent past the used space"
+  it "holds at most twice the tree's height of pages when a floor read answers, a neighbour under another parent included" $ do
+    -- a runs tree of at least three levels: the first leaf of a parent has its left neighbour under the previous parent, reached from the
+    -- root by a path of its own; the window the read fills never holds more than the path to the target and that one
+    let keys = [runKey (toInteger (i `div` 50)) (toInteger (i `mod` 50)) 10 | i ← [0 .. 11999 ∷ Int]]
+        chunks [] = []
+        chunks ks = let (now, later) = splitAt (3 * maxBatchUpdates - 2) ks in now : chunks later
+    h ← must (foldM (\hh ks → do (hh', out) ← commitDelta hh Ordinary (deltaFor (hStore hh) True False 1 [(k, Just (runRec 20)) | k ← ks]); case out of Committed _ → Right hh'; other → Left ("history was not built: " <> show other)) (newH smallSpec ident0) (chunks keys))
+    let height = heightOf h TreeRuns
+    height `shouldSatisfy` (>= 3)
+    (tok, s1) ← must (either (Left . show) Right (acquireReader (hStore h)))
+    let h1 = h {hStore = s1}
+        pagesHeld k = case k of
+          KeyRun c lo → do
+            w0 ← either (const (Left "stale")) Right (readerWindow (hStore h1) tok)
+            let go w (n ∷ Int) = case readerFloorRun (hStore h1) tok w c lo of
+                  Read _ → Right (windowSize w)
+                  ReadNeeds p | n < 100 → case diskRead (hDisk h1) p of
+                    Just bs → either (Left . show) (\x → go x (n + 1)) (windowInsert (cfgUsablePages (hCfg h1)) p bs w)
+                    Nothing → Left "missing page"
+                  other → Left (show other)
+            go w0 0
+          _ → Right 0
+    sizes ← must (mapM pagesHeld (every 7 keys))
+    maximum sizes `shouldSatisfy` (<= readPathPages height)
+    -- the old estimate (the path and the two leaves beside the target) was too small for a neighbour under another parent
+    maximum sizes `shouldSatisfy` (> height + 2)
   it "refuses more readers than the bound and a token of another store" $ do
     let h = newH smallSpec ident0
         other = newH smallSpec (identOf 2 7)
@@ -307,6 +333,7 @@ spec = describe "pinned readers, retirement and reclamation" $ do
         (x, y) `shouldBe` (Applied, Duplicate)
         when (controlBytes s1 <= controlBytes s2) $ expectationFailure "a released reader should lower the control bytes"
   where
+    every n xs = [x | (i, x) ← zip [0 ∷ Int ..] xs, i `mod` n == 0]
     sortOn' ∷ Ord b ⇒ [b] → [b]
     sortOn' = Map.keys . Map.fromList . map (\x → (x, ()))
     hiOf ∷ Record → Int64

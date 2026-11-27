@@ -184,14 +184,14 @@ data EditBankError
     CacheBelowNeed !Integer !Integer
   deriving stock (Eq, Show)
 
--- | The pages one reader may pin and the replacement runs it may keep, as cache bytes: 79 decoded pages. A ranged read may
+-- | The pages one reader may pin and the replacement runs it may keep, as cache bytes: 85 decoded pages. A ranged read may
 -- keep a run for each level of its range (runs of different tags alternate), so the credit holds the read steps the
--- widest range the service accepts needs (10 pages, 'Hetoimasia.Terrain.Runtime.Internal.Backed.readStepPages': a
--- root-to-leaf path of at most eight and the two neighbouring leaves) beside its kept runs: 12,288 levels of 24-byte
--- runs and the column's entry are 294,960 bytes, 69 pages, and with the steps 79 (338,752 bytes). The default range of
--- 8,192 levels keeps 196,656 bytes and leaves 32 pages.
+-- widest range the service accepts needs (16 pages, 'Hetoimasia.Terrain.Runtime.Internal.Backed.readStepPages': the
+-- path to the target's leaf and the path of a neighbouring subtree, at most twice the tree's height) beside its kept
+-- runs: 12,288 levels of 24-byte runs and the column's entry are 294,960 bytes, 69 pages, and with the steps 85
+-- (364,480 bytes). The default range of 8,192 levels keeps 196,656 bytes and leaves 39 pages.
 readerPinnedCacheBytes ∷ Word64
-readerPinnedCacheBytes = 79 * fromIntegral windowPageBytes
+readerPinnedCacheBytes = 85 * fromIntegral windowPageBytes
 
 -- | The most RAM one transaction can reserve at the format's bounds, by component.
 worstTransactionCharge ∷ RamCharge
