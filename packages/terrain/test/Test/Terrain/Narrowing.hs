@@ -122,6 +122,7 @@ narrowingSpec = describe "conditional narrowing" $ do
             let resulting = if target == 0 then Air else corner material target
                 next = must (narrowAt changes z observed target)
             readsAgree next [(z, resulting)]
+            narrowAt next z observed target `shouldBe` Left StaleObservation
             pure (next, resulting)
       foldM_ go (emptyChanges, full) [14, 12, 8, 0]
   it "refuses a stale duplicate and leaves the previous value" $ do
@@ -191,7 +192,9 @@ runSpec = describe "runs" $ do
           mustSource (SourceSpec ["a", "b"] [layer 0 1 "a" 0, cornerLayer 1 4 "a" 15, cornerLayer 4 6 "b" 15] [patchAir 0 0 3 10])
     map (\z → cellAt openedAbove crossRun (tile z)) [2, 3, 4, 5] `shouldBe` [corner "a" 12, Air, Air, Air]
     case highestOccupied openedAbove crossRun (mustColumn 0 0) of
-      Just o → (toInteger (axisValue (occupiedLevel o)), occupiedMaterial o) `shouldBe` (2, mustMaterial "a")
+      Just o →
+        (toInteger (axisValue (occupiedLevel o)), occupiedMaterial o, Just (occupiedShape o))
+          `shouldBe` (2, mustMaterial "a", cellShapeKey (corner "a" 12))
       Nothing → expectationFailure "the column holds a solid below the opened levels"
 
 accountingSpec ∷ Spec

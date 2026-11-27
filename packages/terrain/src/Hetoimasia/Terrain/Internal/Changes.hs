@@ -65,7 +65,8 @@ meetReplacement (ReplaceMask a) (ReplaceMask b) =
 -- receives the level's current tag ('Nothing' for an untouched level) and
 -- returns its new one ('Nothing' leaves it untouched). A run is split at either
 -- end of the range, and equal neighbours coalesce, so no unaffected level
--- changes. The work is logarithmic plus the runs and gaps the range meets.
+-- changes. The work is logarithmic plus the runs and gaps the range meets: the
+-- result is built from the affected pieces once, never by reinserting them.
 assignRange ∷ Column → Int64 → Int64 → (Maybe Replacement → Maybe Replacement) → Changes → Changes
 assignRange column lo hi f (Changes columns total masks) =
   Changes
@@ -74,7 +75,16 @@ assignRange column lo hi f (Changes columns total masks) =
     (masks - maskRuns existing + maskRuns updated)
   where
     existing = Map.findWithDefault Map.empty column columns
-    updated = foldl' insertCoalesced (Map.union keptBelow keptAbove) (concatMap rewrite (walk lo inRange))
+    updated = Map.union (Map.union (Map.deleteMax keptBelow) rebuilt) (Map.deleteMin keptAbove)
+
+    -- The rewritten pieces, with the run on either side that they may join,
+    -- coalesced once in order and built as one map.
+    rebuilt =
+      Map.fromDistinctAscList
+        [ (a, (b, p))
+        | (a, b, p) ← coalescePieces (maybe [] (pure . triple) (Map.lookupMax keptBelow) ++ concatMap rewrite (walk lo inRange) ++ maybe [] (pure . triple) (Map.lookupMin keptAbove))
+        ]
+    triple (a, (b, p)) = (a, b, p)
 
     -- Only runs from the one before @lo@ to the one at @hi@ can differ, so the
     -- mask count is corrected from that neighbourhood alone.
@@ -108,14 +118,10 @@ assignRange column lo hi f (Changes columns total masks) =
 
     rewrite (a, b, current) = [(a, b, p) | p ← maybe (maybe [] pure current) pure (f current)]
 
--- | Insert a run into a canonical map, merging with an adjacent run of the
--- same tag on either side.
-insertCoalesced ∷ IntervalMap Replacement → (Int64, Int64, Replacement) → IntervalMap Replacement
-insertCoalesced runs (a, b, p) = Map.insert start (end, p) withoutBoth
-  where
-    (start, withoutPrev) = case Map.lookupLT a runs of
-      Just (k, (e, q)) | e == a && q == p → (k, Map.delete k runs)
-      _ → (a, runs)
-    (end, withoutBoth) = case Map.lookup b withoutPrev of
-      Just (e, q) | q == p → (e, Map.delete b withoutPrev)
-      _ → (b, withoutPrev)
+-- | Merge each run with the next when they touch and carry the same tag. The
+-- input is ascending and disjoint.
+coalescePieces ∷ [(Int64, Int64, Replacement)] → [(Int64, Int64, Replacement)]
+coalescePieces ((a, b, p) : (c, d, q) : rest)
+  | b == c && p == q = coalescePieces ((a, d, p) : rest)
+coalescePieces (piece : rest) = piece : coalescePieces rest
+coalescePieces [] = []
