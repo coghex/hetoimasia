@@ -228,7 +228,7 @@ store. A commit retains nothing in RAM: its region is a cache again at once. A l
 pins one committed version and reads the runs of every column it touches over the
 region's loadable extent through the backend, not only its cells (what it makes resident
 merges with the column's resident segments there, which are rebuilt with it); its scratch
-charges what those columns can hold, 320 bytes a column at 32 levels, so an evicted region is loaded again from source plus the stored removals and
+charges what those columns can hold, 816 bytes a column at 32 levels (a 24-byte run for each level, whatever its tag, and the column's entry), so an evicted region is loaded again from source plus the stored removals and
 identical terrain is reconstructed across repeated cycles, buried edits, authored gaps
 and deep shafts included, without materializing the cells between. A page that does not
 arrive keeps its read pending; one that arrives damaged is `storage_integrity`; neither is
@@ -242,13 +242,13 @@ levels read hold no occupied cell, the window ending at the next level the sourc
 them (every level between is empty in the source, and a change only removes), twice as deep and at
 most `limitRangeLevels`, keeping nothing of the one above (no cell above it is occupied, and since a
 source never changes and a change only removes, that stays true): its reads grow with the removed
-occupied cells it meets, never with the width of an empty gap. A read keeps at most what its levels can hold, half of them
-and one more a column (removed runs are coalesced, so two are a level apart): it never cuts an answer
-short, and keeping more is a defect. Its window pins only what the reader's pin credit (32 pages)
+occupied cells it meets, never with the width of an empty gap. A read keeps at most what its levels can hold, a run for each
+(replacement runs are disjoint and adjacent runs may differ in tag, so tags can alternate at every level): it never cuts an answer
+short, and keeping more is a defect. Its window pins only what the reader's pin credit (78 pages)
 leaves beside those runs, so the two never pass the one credit, and construction refuses query limits
 whose widest read would leave fewer than the 9 pages one read step needs (`ConfigQueryKeep`:
-`limitRangeLevels` at most 12,321). A staged removal's overlay is one of the four parts of its
-544-byte staging reservation (the decoded segment 128, its rebuilt copy 68, the overlay 176, the
+`limitRangeLevels` at most 12,326; the default 8,192 keeps 196,656 bytes and leaves 137,808). A staged removal's overlay is one of the four parts of its
+576-byte staging reservation (the decoded segment 128, its rebuilt copy 68, the overlay 216, the
 settlement's record 160), which construction checks against the constant (`ConfigRemovalStaging`).
 
 `arenaStatus` answers the arena's storage (ready, or paused with its cause), its reserved,
@@ -313,7 +313,7 @@ transaction that pinned that version; the incarnation's immutable source (shared
 incarnation is its identity); and for each held region two parts, each `PartReady` or `PartUnavailable`
 (`PartNotHeld` for a region not held):
 
-* terrain (`regionTerrain`): the removed intervals of its 256 columns, clipped to its 32 levels. With the
+* terrain (`regionTerrain`): the removed intervals (the air runs) of its 256 columns, clipped to its 32 levels; a run limited to a corner mask is not in it. With the
   source they answer every cell, as `cellAt` does at the copy's content revision, and
   `changesFromIntervals` turns them into `Changes`;
 * knowledge (`regionKnowledge`): what #661 knows of every cell (`queryCell`, as `knowledgeAt` answers at
@@ -645,17 +645,17 @@ transaction of the model event it mirrors, and no production decision reads it:
 
 * **every accepted load job**, from its admission to its report (completed, failed or acknowledged),
   whether it is running, queued or waiting for victims: the resident reservation and the scratch the
-  model **granted** it at that moment (404 and 704 for a one-cell read in a fresh region), so a later
+  model **granted** it at that moment (404 and 1,200 for a one-cell read in a fresh region), so a later
   reduction while the job still holds them is seen (a stability check of the model against its own grant,
   not an expectation); and, once the owner **runs** it, the **least the job holds**, worked out from the
   coverage the owner is given to load and the data layer's own sizes and not from the model's cost
   functions (a column index entry is 48 bytes, a segment 32 of metadata and at least 2 of payload, the
   scratch a 256-byte frame, four bytes for each cell it decodes (the whole segment each interval merges into, at most 32 cells and at most the extent's levels in a column) and the removed runs of every column it touches over the
-  region's 32 levels, 17 runs of 16 and a column entry of 48 for one cell: 82 and 704) together with the load-job slot (1 from its
+  region's 32 levels, 32 runs of 24 and a column entry of 48 for one cell: 82 and 1,200) together with the load-job slot (1 from its
   dispatch, 0 while it waits: a waiting job holds only a promise, so it contributes no expectation). The
   owner marks a job it runs and ends it with its report, so a model that forgets a running job is seen;
-* the **preparation** the owner is running (a removal's resident growth, 66 bytes, staging, 544, and
-  edit record, 64, and the command record it reads under), from its start to the owner's safe point;
+* the **preparation** the owner is running (a removal's resident growth, 66 bytes, staging, 576, and
+  edit record, 72, and the command record it reads under), from its start to the owner's safe point;
 * each outstanding **borrow**, the regions the snapshot handed out covers and the **accounted bytes it backs**
   (its payload, segment metadata and column index entries, measured on the snapshot value at hand-out, never
   read from the retained-bank ledger), until its borrower releases it, whether its arena is live or closed and
@@ -693,8 +693,8 @@ client end, before the owner resumes. The property ends with every bank, occupie
 every slot and every arena at zero: no charge outlives its holder.
 `Test.TerrainRuntime.Oracle` pins the record's literal amounts at a gated job (running and waiting),
 preparation, borrow and view, and holds the controls that must fail: a model that charges the running job
-1 byte of resident and 1 of scratch instead of 404 and 704 (and one byte short of each figure), a waiting job
-whose 404 and 704 were released while another job runs (and one byte short), a job the model forgot while it
+1 byte of resident and 1 of scratch instead of 404 and 1,200 (and one byte short of each figure), a waiting job
+whose 404 and 1,200 were released while another job runs (and one byte short), a job the model forgot while it
 runs, a 64-byte handoff duplicate charged that the owner never holds, a preparation whose request the model dropped
 or for which it reserved no growth, a borrow's hold shortened from two regions to one (the staging charge with
 it) or dropped, a view's description shortened or dropped, a model rebuilt without the arena beside the
@@ -771,8 +771,8 @@ less than its **atomic unit**: a limit below it means the unit (`windowWorkAtLea
 once: `maintenanceUnitPages`, one page, and `discoveryUnitWrites`, the three writes of one connection inspection,
 which is #661's `worstEdgeWrites`). A standalone removal is one atomic edit and reads no work limit: a window it
 outgrows is a hard capacity result, bounded by `removalWindowPages`. The unit needs a bounded window (the discovery
-unit holds at most `discoveryUnitWindowPages`, 230 pages at the deepest trees and 16 pinned versions, inside the
-removal's 294 and the limit of 305: the edit phase's formula plus the 4 pages of read residue below), so the retry ends in at most six steps with the work done, and never in
+unit holds at most `discoveryUnitWindowPages`, 228 pages at the deepest trees and 16 pinned versions, inside the
+explicit edit's 308 and the limit of 320: the edit phase's formula plus the 2 pages of read residue below), so the retry ends in at most six steps with the work done, and never in
 `Invalid`, `Integrity` or `Stale`: a driver that follows this protocol exactly succeeds from every starting limit
 from 1 to 64 (`Test.TerrainRuntime.Store.Protocol`; the table of the refusals `classifyPlan` maps to `FailInvalid`,
 none of which a valid store reaches, is in the evidence); a caller that retries the same window or restarts at the full work gets the same answer for ever (the
@@ -812,26 +812,26 @@ made. A checkpoint always carries a new fact (a window that cannot hold the plan
 verifies. What a window holds at once is the edit and one proof, `workOneWindowPages` for a unit of one page and
 `removalWindowPages` for a standalone removal, which cannot shrink (the edit phase's formula plus `readResiduePages`,
 below); both rest on `maxLevel` and `maxReaders`
-alone, and both are asserted against `maxWindowBytes / windowPageBytes` (305 pages) for every height 1 to 8 and
+alone, and both are asserted against `maxWindowBytes / windowPageBytes` (320 pages) for every height 1 to 8 and
 every number of pinned readers (the removal's retirement-tree term, at most 17 internal pages, rests on two
 checks the store makes: a non-root page below a quarter of a payload is refused when a plan descends to it
 (`UnderFull`), and a root set retiring more than `maxRetiredPages` pages is refused at every plan).
 
 **The read phase of a removal and of a discovery step is a checkpoint phase too.** A removal reads logical records
-(union-find chains, floor runs, up to `worstEditReads`, 197) before it can say what it writes, and a discovery step up
+(union-find chains, floor runs, up to `maxEditReads`, 198: a narrowing's `worstNarrowReads`, a removal's `worstEditReads` being 197) before it can say what it writes, and a discovery step up
 to `worstEdgeReads` (132) an inspection; every page of every read stays in the caller's window until the plan ends,
 which no formula over the write paths can bound. The records a plan has read are therefore facts it carries through
 `Checkpoint`, exactly as it carries its proofs: the provider answers from them first. A read phase ends in a
 `Checkpoint` of everything read so far when it needs a page the window cannot take (the proof phase's rule, under the
-plan's own bounds), and once more when it ends holding more than `readResiduePages` (4) read pages, so that the edit
+plan's own bounds), and once more when it ends holding more than `readResiduePages` (2) read pages, so that the edit
 starts from an empty window; a checkpoint with no new fact is the typed window result. The window holds at once the
 phase's own pages: the read phase at most the bound it runs under (every promised bound holds one whole read, at most
 `2 * height` pages), the edit phase the edit formula plus the residue. `readResiduePages` is derived from the byte
-limit (the worst removal, `removalWindowPages`, 294 pages at the deepest trees and 16 pinned versions, leaves room for
-4 more whole pages beside its `removalWorstProbes` probes, at the MEASURED page and probe costs below); the probe figures are counted from the pages written
-(`minimumRemovalPages`, 188; the discovery unit's `discoveryUnitPagesWritten`, 120). The facts are RAM, in the plan's
+limit (the worst explicit edit, `removalWindowPages`, 308 pages at the deepest trees and 16 pinned versions, leaves room for
+2 more whole pages beside its `removalWorstProbes` probes, at the MEASURED page and probe costs below); the probe figures are counted from the pages written
+(`minimumRemovalPages`, 205 for the eight writes of `maxEditWrites`; the discovery unit's `discoveryUnitPagesWritten`, 120). The facts are RAM, in the plan's
 charge as a retained continuation (held PACKED, the encoded key and value as two compact byte arrays, and charged from what is held plus 128 bytes an entry: at most
-256 bytes a fact, 50,432 B for a removal's 197 reads and 33,792 B for a unit's 132, under
+256 bytes a fact, 50,688 B for an edit's 198 reads and 33,792 B for a unit's 132, under
 `maxReadFactBytes`; past it the shrinkable `TxnRamExceeded`), and the feasibility proofs count them. They are for the
 retries of ONE plan, and a window of another version drops them. The cost of the rule is one more checkpoint (and one
 replay of staging from the facts) when a read phase held more than the residue. The read-only queries (`queryCell`,
@@ -847,7 +847,7 @@ has its sign bit flipped) so that the byte order of a key is its logical order.
 | Offset | Bytes | Field |
 | --- | --- | --- |
 | 0 | 4 | magic `HTRP` |
-| 4 | 2 | format version (1; any other is refused) |
+| 4 | 2 | format version (2; any other, version 1 included, is refused: one version covers all five trees and the retirement lists, and there is no reader of an older one and no migration) |
 | 6 | 1 | kind: 1 leaf, 2 internal, 3 retirement list |
 | 7 | 1 | tree: 0 runs, 1 links, 2 todo, 3 free, 4 retire (a list page is tree 4) |
 | 8 | 8 | arena incarnation |
@@ -868,8 +868,8 @@ names it, then a strictly increasing run of eight-byte page numbers (at most 505
 
 | Tree | Key | Value |
 | --- | --- | --- |
-| runs | column x(8) y(8), lower level(8): 24 | upper level(8) |
-| links | `0` tile(24) and three optional parameters `present(1) coord(8)` (52), or `1` column(16) level(8) (25) | `0` size(8) known(1), or `1` parent node key |
+| runs | column x(8) y(8), lower level(8): 24 | upper level(8) and the payload tag: `0` for air (9), or `1` and a mask(1), 1 to 15, for a run limited to that corner mask (10) |
+| links | `0` tile(24) and three optional parameters `present(1) coord(8)` (52), `1` column(16) level(8) (25) for an air run's void, or `2` column(16) level(8) (25) for a narrowed cell's void | `0` size(8) known(1), or `1` parent node key |
 | todo | sequence(8) | tile(24) done(1), `done` in 1 to 6 |
 | free | start page(8) | length(8), at least 1 |
 | retire | `0x00` and the version that replaced the pages(8), or `0xFF` and a retired page number(8): both 9 bytes | list page(8) count(2) done(2), `done` below `count`; or the version of the entry that owns the page(8) |
@@ -882,6 +882,7 @@ encoders, never typed here). One key length per tree, except links; the kinds of
 | runs | run | 24 | `0x80` |
 | links | source node | 52 | `0x00` |
 | links | run node | 25 | `0x01` |
+| links | cell node | 25 | `0x02` |
 | todo | sequence | 8 | the number's own first byte |
 | free | extent | 8 | the number's own first byte |
 | retire | entry (version) | 9 | `0x00` |
@@ -905,7 +906,7 @@ it indexes** (a record tree's key decodes; a free extent's key is a page number;
 an entry's tag and version or a retired page's tag and number: a separator no decoder accepts would make a
 descent skip records that exist and answer that they are absent), and the structure of each leaf entry (a
 well-formed key and value of the tree's own category: coordinates in range,
-`lo < hi` inside the level limits (a link's run-node level too, in a key and in a parent value), a class size of at least 1, adjacent runs and free
+`lo < hi` inside the level limits (a link's run-node level too, in a key and in a parent value), a class size of at least 1, runs of one column disjoint and, when they touch, of different payloads (an air run and each mask are distinct, a zero, larger or unknown mask or tag is a malformed value, and touching equal payloads are uncoalesced and refused) and free
 extents already coalesced). A **valid checksum never rescues a malformed page**: the
 same structure checks refuse a re-sealed page. A refusal is an explicit
 `PageError`; it is never an empty index, absent history, air or the pristine source.
@@ -916,11 +917,18 @@ schema, not `Show`/`Read`, never read by another run.
 
 ### The indexes
 
-The version 1 pages hold air runs and the voids of air runs and source components. The
-discovery model can also name a run that limits its levels to a corner mask
-(`RecMaskRun`) and the void of a narrowed cell (`CellNode`); neither has an encoding that
-reads back, so a write that carries one is refused as `MalformedWrite` and never stored as
-something else, and every stored run answers a floor lookup as air.
+The version 2 pages hold every record kind the discovery model stages: an air run (`RecRun`) and
+a run limited to a corner mask (`RecMaskRun`), each with its tag, and the voids of air runs, of narrowed cells
+(`CellNode`) and of source components. A mask is resolved against the source material of the level it is
+asked at, so a run of one mask can cover levels of different materials. Adjacent runs of different tags
+are legal and a level can be a run of its own, so a column can hold one run for each level; touching runs
+with the same payload never exist. A floor lookup answers the run with its tag, and the read facts of a plan keep it.
+
+`planNarrowing` plans one corner-mask narrowing with its obligation as one candidate: the run holding the cell is
+split, or the cell joins the neighbour that carries its payload (across a leaf boundary too), and the void the cell
+held is joined to the new one. A pair that is not a narrowing is `NoWork`. Every explicit edit is proved
+against `maxEditWrites` (8) and `maxEditReads` (198) for every tree height 1 to 8 and every number of pinned readers:
+205 pages written of 256, 308 window pages of 320.
 
 Five B+trees share one generic implementation over the page window: the three record
 categories of #661 (`KeyRun`, `KeyLink`, `KeyTodo`), the **free** tree of free page
@@ -989,7 +997,7 @@ committed page. The supply is checked as it is read: a loose page or free extent
 the used page space, a free extent overlapping the one before it, or any page that would be
 handed out twice is corruption (an `Integrity` refusal), never an allocation. It writes at most **256 pages (1 MiB), index, allocator and
 retirement pages included**; reserves at most **4 MiB of RAM**; reads through a window of at
-most **1.25 MiB of validated page buffers** (305 pages at the measured page cost); and a discovery batch performs at most **64 structural
+most **1.3125 MiB of validated page buffers** (320 pages at the measured page cost: the whole pages of the worst explicit edit, a tagged edit of eight record writes, at the tallest trees with every reader pinned, 306, its 205 ownership probes and one read's page, rounded up to 64 KiB); and a discovery batch performs at most **64 structural
 updates**, where a structural update is #661's: one connection inspected, at most one
 pair of classes joined, and the obligation's progress. The batch keeps its
 continuation in the obligation records; when a tighter bound stops it earlier, it is
@@ -1002,7 +1010,7 @@ planned again with fewer writes, never truncated.
 | page-pin records, root and control records, retained continuation | control and frontier (8 MiB) |
 
 *What the RAM figure counts.* It is the memory a plan really holds: the window keeps the
-validated 4 KiB buffer of each page it read (a small header more, at most 1.25 MiB) and
+validated 4 KiB buffer of each page it read (a small header more, at most 1.3125 MiB) and
 parses entries from a buffer only while a node is visited; the new pages a plan builds
 are held **packed** (their entries as one byte string, about 4.2 KiB each, 256 pages at
 most when it ends) except for the last eight per tree edit, which stay parsed and are
@@ -1176,8 +1184,8 @@ the free pool beside its worst-case claim (324 pages) leaves the reserve intact,
 that claim is reserved before any work, so a refusal (`DiskFull`) precedes any change
 and leaves the prior contents and every discovery obligation intact. The owner maps it
 to `storage_full` and the pause. `minimumRemovalFeasible` shows the supported minimum
-removal (7 record writes at the tallest height, a list page and the bookkeeping
-reserve: 188 pages, 3,945,392 bytes of RAM at the measured costs, 3.76 MiB) fits any accepted configuration in an empty
+edit (8 record writes at the tallest height, a list page and the bookkeeping
+reserve: 205 pages, 4,162,308 bytes of RAM at the measured costs, 3.97 MiB) fits any accepted configuration in an empty
 workspace; if a configuration could not hold it, the counterexample is returned for a
 design decision and no budget is relaxed.
 
@@ -1253,19 +1261,19 @@ cross the API PACKED: a `Facts` holds the read facts in the form a window holds 
 checked against those bytes. The type is the control: `Facts` has no typed field. (3) The read phase IN FLIGHT: #661 holds the typed
 read set while it reads (`typedReadBytes` 576, measured 512). It checks its read allowance only as it reads, so the allowance is
 what bounds that memory: `maxTypedReads` is derived to fill a plan's 4 MiB exactly from its seven terms, the typed reads, a full
-window (1,310,720), the ownership probes (131,072), the packed facts at their ceiling (1,048,576), the proof facts a replayed read
+window (1,376,256), the ownership probes (131,072), the packed facts at their ceiling (1,048,576), the proof facts a replayed read
 phase carries (87,040), the writes staging has accumulated (122,880: 192 at `writeRetainedBytes`) and the fixed records (74,880):
-**2,463 reads**. Both planners pass it as the read allowance (`bdMaxReads`), so a discovery batch that would read more ENDS EARLY as
-progress with the inspections it completed. It is never a refusal: the cap is above what a removal reads (`worstEditReads`, 197) and
+**2,350 reads**. Both planners pass it as the read allowance (`bdMaxReads`), so a discovery batch that would read more ENDS EARLY as
+progress with the inspections it completed. It is never a refusal: the cap is above what an edit reads (`maxEditReads`, 198) and
 what one inspection reads (`worstEdgeReads`, 132), as a property of the suite. #661's own scratch figure (`worstEdgeScratch` and its
 kin) is an accounting limit of that package, a bound it checks its own work against, and not a structure counted here.
 
-**Consequences, stated plainly.** (1) A window holds **305 pages** at `maxWindowBytes`. (2) `readResiduePages` is **4**: the promised
-removal bound is **294** pages and a discovery unit's **230**. (3) The sum of every component's worst case is an ACCOUNT bound:
-**5,663,872** bytes with the read facts at their ceiling (io 1,097,728, decoded 2,697,216, keys 122,880, scratch 613,376, pins 8,192,
-root and control 70,784, continuation 1,053,696) and 4,615,296 without them, above the 4 MiB limit. The one gate is `chargeFor`, which
+**Consequences, stated plainly.** (1) A window holds **320 pages** at `maxWindowBytes`. (2) `readResiduePages` is **2**: the promised
+edit bound is **308** pages and a discovery unit's **228**. (3) The sum of every component's worst case is an ACCOUNT bound:
+**5,729,408** bytes with the read facts at their ceiling (io 1,097,728, decoded 2,762,752, keys 122,880, scratch 613,376, pins 8,192,
+root and control 70,784, continuation 1,053,696) and 4,680,832 without them, above the 4 MiB limit. The one gate is `chargeFor`, which
 refuses (`TxnRamExceeded`) a plan whose own total is past the limit. The promised extremes are each planned and fit: the minimum
-removal needs **3,945,392** bytes and a discovery unit **3,324,256** of 4,194,304 (249 KB of headroom for the removal).
+edit needs **4,162,308** bytes and a discovery unit **3,389,792** of 4,194,304 (32 KB of headroom for the edit).
 
 ### Edit-bank admission
 
