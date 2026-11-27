@@ -916,6 +916,12 @@ schema, not `Show`/`Read`, never read by another run.
 
 ### The indexes
 
+The version 1 pages hold air runs and the voids of air runs and source components. The
+discovery model can also name a run that limits its levels to a corner mask
+(`RecMaskRun`) and the void of a narrowed cell (`CellNode`); neither has an encoding that
+reads back, so a write that carries one is refused as `MalformedWrite` and never stored as
+something else, and every stored run answers a floor lookup as air.
+
 Five B+trees share one generic implementation over the page window: the three record
 categories of #661 (`KeyRun`, `KeyLink`, `KeyTodo`), the **free** tree of free page
 extents (coalesced) and the **retire** tree of retirement work. A tree reads only
