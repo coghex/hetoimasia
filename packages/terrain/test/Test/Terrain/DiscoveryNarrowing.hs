@@ -24,6 +24,7 @@ import Hetoimasia.Terrain.Residency (ArenaId (..), Revision (..))
 import Hetoimasia.Terrain.Shape (CornerMask, mkCornerMask)
 import Hetoimasia.Terrain.Source (CellSpec (..), LayerSpec (..), PatchSpec (..), Source, SourceSpec (..))
 import Test.Hspec
+import Test.Terrain.ConnectivityFixtures (compiled, keyAt)
 import Test.Terrain.ConnectivityOracle (Cell3, Window (..), inWindow, windowCells)
 import Test.Terrain.DiscoveryHarness (Delay (..), Rig (..), Scene (..), delayedProvider, groundScene, newRig, noDelay)
 import Test.Terrain.Model (mustSource, mustTile, topEnd)
@@ -289,6 +290,13 @@ openingsSpec = describe "a sealed space under a narrowed cell" $ do
     -- the edit has staged its obligation and inspected nothing, yet the widened void is still the known one
     pendingObligations (retainedHeader queued) `shouldBe` 1
     voidAt queued `shouldBe` VoidKnown
+    -- the authored void and the narrowed cell's void are one class, not two classes that both read as known
+    case keyAt (compiled (sceneSpec (worldScene w))) (2, 2, 3) of
+      Nothing → expectationFailure "the authored cell has no void"
+      Just key → do
+        let classOf node = observedValue (queryNodeClass env (retainedProvider queued) node)
+        classOf (SrcNode key) `shouldSatisfy` either (const False) (const True)
+        classOf (CellNode (columnOf 2 2) 3) `shouldBe` classOf (SrcNode key)
     knownVoids w (drain env queued) `shouldBe` oracleKnown w (oracleChanges w [Narrow (2, 2, 3) 1])
   it "joins a narrowed cell's void into the air that replaces it" $ do
     let w = pocketWorld
