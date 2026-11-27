@@ -9,7 +9,7 @@ An unchecked entry awaits filing. A checked entry links its tracker number.
 - [x] EPIC. Narrow observed terrain solids in a live arena — [#767]
 - [x] NARROW-1. Represent and query tagged terrain replacements — [#768]
 - [x] NARROW-2. Discover openings through edited corner cells — [#769]
-- [ ] NARROW-3. Store and replay bounded tagged replacements
+- [x] NARROW-3. Store and replay bounded tagged replacements — [#770]
 - [ ] NARROW-4. Publish a conditional corner edit through the live arena
 - [ ] NARROW-5. Expose the conditional edit to Lua
 
