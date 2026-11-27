@@ -1256,8 +1256,8 @@ exact integer arithmetic):
 | Bank | Worst-case footprint it must hold |
 | --- | --- |
 | Resident | the most of: a query's regions, a removal; each region may already hold its stored maximum and then load the largest job beyond it (a removal: the stored maximum, one cell's 148 and its 66 of growth). Camera work and holds leave this much out of their reach. Beside it, the largest camera unit: the largest hold (its regions at the stored maximum) or one region's camera job (the stored maximum plus the largest job), whichever is larger |
-| Staging | the most of: a query (command 128 + 32 per region, an interest and the scratch of the whole extent for each region), a removal (command, its 544 and one cell's scratch) and a handoff duplicate of a region at its stored maximum; this is the headroom camera work and holds leave free. Beside it the larger of the largest hold's records (64 per region) and one camera region (a one-region description, its interest and its scratch) |
-| Edit | one removal's retained growth, 64 |
+| Staging | the most of: a query (command 128 + 32 per region, an interest and the scratch of the whole extent for each region), a removal (command, its 576 and one cell's scratch) and a handoff duplicate of a region at its stored maximum; this is the headroom camera work and holds leave free. Beside it the larger of the largest hold's records (64 per region) and one camera region (a one-region description, its interest and its scratch) |
+| Edit | one cell edit's retained growth, 72 (a split inside a run of another tag is two new runs of 24; the first edit of a column is one run and its 48-byte entry) |
 | Load jobs | one: a slot is taken at dispatch |
 
 `defaultLimits` is the approved initial CPU profile, sized for a normal laptop
@@ -1279,12 +1279,12 @@ exact integer arithmetic):
 
 Their worst cases (computed in the tests): a region stores at most 299,264 bytes at
 that extent and its largest job reserves 421,888 more, so a 257-region query needs
-185,336,064 of the 268,435,456 resident bytes and 29,565,408 of the 134,217,728
-staging bytes (command 128 + 32 x 257, an interest each, and 114,944 of scratch per
-region), which camera work and holds leave free, plus 115,200 for one camera region or
+185,336,064 of the 268,435,456 resident bytes and 62,198,240 of the 134,217,728
+staging bytes (command 128 + 32 x 257, an interest each, and 241,920 of scratch per
+region), which camera work and holds leave free, plus 242,176 for one camera region or
 16,384 for the records of the largest hold (256 regions), and 76,611,584 resident bytes
 for the held regions at their stored maximum (larger than one region's camera job,
-721,152): 261,947,648 of the 268,435,456 in all; a removal needs 64 edit bytes of 67,108,864; a query needs one
+721,152): 261,947,648 of the 268,435,456 in all; a removal needs 72 edit bytes of 67,108,864; a query needs one
 load-job slot of 128. These are engineering defaults for the initial profile, not
 measured capacity.
 
@@ -1304,13 +1304,13 @@ Each cost category is assigned to exactly one bank or slot:
 | Segment metadata | Resident | 32 bytes each |
 | Packed detail payload | Resident | the encoded bytes stored; reserved at the payload bound, 68 per interval |
 | A removal's rebuilt segment (its payload is between 2 and 68 bytes) | Resident | 66 reserved; the growth actually stored is charged at the commit |
-| Retained removals | Edit | 16 per interval and 48 per column entry (worst case for one removal: 64) |
-| Load scratch | Staging | 256 + 4 per decoded 32-bit cell (the whole segment each interval merges into: at most 32 cells per interval and the extent's height in a column; the cells themselves for a whole extent), and the removed runs of every column it touches over the extent's height h: h / 2 + 1 runs of 16 and 48 a column (320 a column at 32 levels; 81,920 for a default region) |
+| Retained replacements | Edit | 16 per air run, 24 per mask run and 48 per column entry (worst case for one cell edit: 72) |
+| Load scratch | Staging | 256 + 4 per decoded 32-bit cell (the whole segment each interval merges into: at most 32 cells per interval and the extent's height in a column; the cells themselves for a whole extent), and the replacement runs of every column it touches over the extent's height h: h runs of 24 (a run for each level: runs of different tags may alternate) and 48 a column (816 a column at 32 levels; 208,896 for a default region) |
 | Interest records | Staging | 64 each |
 | Hold records (borrowers and publication pins) | Staging | 64 per region held |
 | Accepted command records | Staging | 128 + 32 per region |
 | The pending latest-value camera description of a view | Staging | 128 + 64 per region named |
-| Removal staging (the decoded segment, 128, its rebuilt copy, 68, the overlay and the settlement) | Staging | 544 |
+| Removal staging (the decoded segment, 128, its rebuilt copy, 68, the overlay at the tagged-run figure, 216, and the settlement, 160) | Staging | 576 |
 | Temporary duplicate during a handoff | Staging | supplied by the owner |
 | Internal load jobs (taken at dispatch, held until completion or acknowledgement); accepted commands; pins of one view | Slots | one each |
 
