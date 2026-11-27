@@ -218,10 +218,10 @@ spec = describe "The backed terrain service" $ do
 
   -- A column query, or a surface's window, of at most the range limit keeps at most what that many
   -- levels can hold (a run for each level: runs of different tags alternate), inside the reader's pin
-  -- credit (78 pages of 4,288 bytes, 334,464): what it keeps must leave the 9 pages one read step needs (a
-  -- root-to-leaf path of at most 8 levels, and the next leaf). At 12,326 levels it keeps 12,326 x 24 + 48 =
-  -- 295,872 and leaves 38,592, 9 pages exactly; at 12,327 it would keep 295,896 where at most 334,464 - 9 x
-  -- 4,288 = 295,872 may be kept. The default 8,192 levels keep 196,656 and leave 137,808.
+  -- credit (79 pages of 4,288 bytes, 338,752): what it keeps must leave the 10 pages one read step needs (a
+  -- root-to-leaf path of at most 8 pages and the leaves either side of the target). At 12,326 levels it keeps
+  -- 12,326 x 24 + 48 = 295,872 and leaves 42,880, 10 pages exactly; at 12,327 it would keep 295,896 where at
+  -- most 338,752 - 10 x 4,288 = 295,872 may be kept. The default 8,192 levels keep 196,656 and leave 142,096.
   it "refuses at construction query limits under which a read keeps more runs than its pin credit holds beside one read step's pages, and accepts the largest that leaves them" $ do
     let config n = defaultConfig {configQueryLimits = defaultQueryLimits {limitRangeLevels = n}}
     try (withService (config 12327) (\_ → pure ())) >>= \case
@@ -230,6 +230,11 @@ spec = describe "The backed terrain service" $ do
     withService (config 12326) (\_ → pure ())
     -- the public default is accepted whole, and its widest read still returns a complete answer
     withService defaultConfig (\_ → pure ())
+    -- a range limit whose byte figure wraps a fixed-width product, and the largest representable one, are refused by their true size
+    forM_ [768614336404564651, maxBound] $ \n →
+      try (withService (config n) (\_ → pure ())) >>= \case
+        Left (ConfigQueryKeep kept _) → kept `shouldSatisfy` (> 295872)
+        other → expectationFailure ("expected the query limits refused for " <> show n <> ", got " <> either show (const "acceptance") other)
 
   -- The control account must hold, beside the store's own minimum (the worst transaction's control
   -- records, every reader record, the queued descriptors), the storage service's records at their

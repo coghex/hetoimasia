@@ -14,7 +14,7 @@
 module Test.TerrainRuntime.Backed.Ranges (spec) where
 
 import Control.Concurrent.STM
-import Control.Exception (finally)
+import Control.Exception (SomeException, finally, try)
 import Control.Monad (forM_)
 import Data.List (nub)
 import qualified Data.Map.Strict as Map
@@ -23,7 +23,7 @@ import Hetoimasia.Terrain.Cell (Cell (..))
 import Hetoimasia.Terrain.Coordinate (axisValue, decomposeTile)
 import Hetoimasia.Terrain.Cell (zRangeHi, zRangeLo)
 import Hetoimasia.Terrain.Query (Occupied (..), QueryLimits (..), Run (..), defaultQueryLimits)
-import Hetoimasia.Terrain.Residency (JobInfo (..), RegionDemand (..), coverageBox, coverageCells, coverageUnion, modelJobs)
+import Hetoimasia.Terrain.Residency (JobInfo (..), LimitsSpec (..), RegionDemand (..), coverageBox, coverageCells, coverageUnion, mkLimits, modelJobs)
 import Hetoimasia.Terrain.Source (CellSpec (..), LayerSpec (..), PatchSpec (..), SourceSpec (..))
 import Hetoimasia.Terrain.Runtime
 import Hetoimasia.Terrain.Runtime.Backed.Gather (gatherPinLimit)
@@ -159,6 +159,21 @@ spec = describe "What a request keeps of a column" $ do
       -- every level known, and each the store's cell (the three removed ones air)
       detail `shouldBe` Right (map Known authority)
       [z | (z, Air) ← zip levels authority] `shouldBe` [5, 9, 35] <> [40 .. 63]
+
+  -- the smallest edit bank the model allows bounds what an edit may stage and retain, never what a read may rebuild: the
+  -- replacements the store holds are all funded by the read that gathers them
+  it "rebuilds every run a column read gathers whatever the edit bank is" $ do
+    let spec' = LimitsSpec {specResidentBytes = 256 * 1048576, specEditBytes = 72, specStagingBytes = 128 * 1048576, specLoadJobs = 128, specQueuedCommands = 256, specPinsPerView = 2, specAgingQuanta = 8, specQueryRegions = 257, specExtentX = 16, specExtentY = 16, specExtentZ = 32, specHoldRegions = 256, specCameraRegions = 16384}
+        config = defaultConfig {configLimits = either (error . show) id (mkLimits spec')}
+        source = layered [(Just 0, Just 8, "stone", 0)] [PatchSpec 3 3 (2 * k) (2 * k + 1) SpecAir | k ← [0 .. 3]]
+    withServiceUsing config alwaysAdmitting (Probe (const (pure ()))) $ \svc → do
+      client ← okOf (registerClient svc)
+      lease ← okOf (openArena svc client "small" source) >>= await svc >>= expectSuccess
+      removed ← mapM (\z → try (removeCell' svc lease (tile 3 3 z)) ∷ IO (Either SomeException RemoveAnswer)) [0, 2, 4, 6]
+      -- every removal that committed is read back whole
+      answer ← okOf (columnAt svc lease (column 3 3) (range 0 8)) >>= bounded . await svc >>= expectSuccess
+      [(zRangeLo (runRange r), zRangeHi (runRange r), cellMaterial (runCell r)) | r ← columnAnswerRuns answer] `shouldSatisfy` (not . null)
+      length [() | Right _ ← removed] `shouldSatisfy` (>= 1)
 
   -- column (3, 4): sixteen separate removed runs, at the even levels 0 to 30 of its region; a load reads
   -- every column it touches over the region's 32 levels, whatever it covers of it

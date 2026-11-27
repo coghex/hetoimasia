@@ -16,14 +16,16 @@ import Hetoimasia.Terrain.Discovery
 import Hetoimasia.Terrain.Query (cellAt)
 import Hetoimasia.Terrain.Shape (CornerMask, mkCornerMask)
 import Hetoimasia.Terrain.Source (LayerSpec (..), Source, SourceSpec (..), defaultSourceLimits, mkSource)
-import Hetoimasia.Terrain.Runtime.Store.Internal.Format (TreeId (..), maxTxnPages)
+import Hetoimasia.Terrain.Residency (ArenaId (..))
+import Hetoimasia.Terrain.Runtime.Store.Internal.Format (PageNo (..), StoreIdentity (..), TreeId (..), maxTxnPages)
+import Hetoimasia.Terrain.Runtime.Store.Internal.Records (decodeKey)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Model
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan
 import Hetoimasia.Terrain.Runtime.Store.Internal.State (cfgUsablePages)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Tree (Window, windowInsert)
 import Test.Hspec
 import Test.TerrainRuntime.Store.Harness
-import Test.TerrainRuntime.Store.Reference (diskRead)
+import Test.TerrainRuntime.Store.Reference (RefBody (..), RefPage (..), diskRead, parsePage)
 import Test.TerrainRuntime.Store.Scenes
 
 must ∷ Either String a → IO a
@@ -68,6 +70,20 @@ storeChanges run = do
   rs ← allRecords (runH run)
   runs ← sequence [(\z → (c, z, tag)) <$> either (Left . show) Right (mkZRange (toInteger lo) (toInteger hi)) | (KeyRun c lo, r) ← rs, Just (hi, tag) ← [payload r]]
   either (Left . show) Right (changesFromReplacements (ChangeLimits maxBound) runs)
+
+-- | The lowest level of the second leaf of the runs tree of column (0, 0): the key the root separates its first two leaves by.
+leafSeparator ∷ Run → Either String Int64
+leafSeparator run = do
+  let h = runH run
+      ArenaId a = siArena (hIdent h)
+  root ← maybe (Left "no runs tree") (\(PageNo p) → Right p) (committedRoot (hStore h) TreeRuns)
+  bytes ← maybe (Left "no root page") Right (diskRead (hDisk h) (PageNo root))
+  page ← parsePage a (siSource (hIdent h)) bytes
+  case rpBody page of
+    RefInner ((_, _, _) : (k, _, _) : _) → case decodeKey TreeRuns k of
+      Just (KeyRun _ lo) → Right lo
+      _ → Left "the separator is not a run key"
+    _ → Left "the runs tree has no second leaf"
 
 -- | A read of a pinned version through a window filled page by page from the disk.
 through ∷ Show a ⇒ H → ReaderToken → (Window → ReadOutcome a) → Either String a
@@ -123,6 +139,15 @@ spec = describe "tagged replacements through the page-resident store (version 2)
     must (storedRuns twin) >>= \rs → (length rs, and (zipWith (\(_, _, a) (_, _, b) → a /= b) rs (drop 1 rs))) `shouldBe` (40, True)
     -- every step stayed inside the transaction's page envelope of the worst edit
     forM_ (runPlans alt <> runPlans twin) $ \plan → (mPagesWritten (plMeasure plan) <= minimumRemovalPages, mPagesWritten (plMeasure plan) <= maxTxnPages) `shouldBe` (True, True)
+    -- an edit at the separator of two leaves: its two neighbours lie in different leaves, and narrowing it to air joins them, so
+    -- the run of one leaf grows over the run of the other and the run it replaces is deleted from its own leaf
+    separator ← must (leafSeparator alt)
+    let edge = if odd separator then separator else separator - 1
+        startOf level = [lo | (lo, hi, _) ← must' (storedRuns alt), lo <= level, level < hi]
+    (map (< separator) (startOf (edge - 1)), map (>= separator) (startOf (edge + 1))) `shouldBe` ([True], [True])
+    crossing ← must (narrowCell alt (at (toInteger edge)) (mask 0))
+    must (storedRuns crossing) >>= \rs → [(lo, hi) | (lo, hi, ReplaceAir) ← rs, lo <= edge - 1, edge + 1 < hi] `shouldBe` [(edge - 1, edge + 2)]
+    must (storedRuns crossing) >>= (`shouldSatisfy` ((== 198) . length))
     -- joining the neighbours back, level by level through the leaf boundary, coalesces each pair as the model does
     merged ← must (foldM (\r z → narrowCell r (at z) (mask 0)) alt [1, 3 .. 199])
     must (storedRuns merged) `shouldReturn` [(0, 200, ReplaceAir)]

@@ -32,7 +32,7 @@ import Hetoimasia.Terrain.Runtime.Backed.Txn
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Native (NativeOp (..))
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Service (ReadMode (..))
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Types (Errno (..), WorkClass (..))
-import Hetoimasia.Terrain.Runtime.Store.Internal.Format (PageNo (..))
+import Hetoimasia.Terrain.Runtime.Store.Internal.Format (PageNo (..), TreeId (..))
 import Hetoimasia.Terrain.Runtime.Store.Internal.Model (Condition (..), Store, acquireReader, publish, storeConfig, storeRoots, storeVersion)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan (plPages)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Protocol (narrowingPlanner, removalPlanner)
@@ -51,7 +51,7 @@ import Test.TerrainRuntime.Storage.Harness
   , readPages
   , withEnv
   )
-import Test.TerrainRuntime.Store.Harness (H (..), checkH, columnAt, compareRecords, ident0, newH, smallSpec, tileAt)
+import Test.TerrainRuntime.Store.Harness (H (..), checkH, columnAt, compareRecords, heightOf, ident0, newH, smallSpec, tileAt)
 import Test.TerrainRuntime.Store.Reference (diskWrite, emptyDisk)
 import Test.TerrainRuntime.Store.Scenes (envFor, limitsWith, sealedStack)
 
@@ -387,6 +387,11 @@ spec = describe "the owner's transaction runner, through the production storage 
         (later, laterPages) ← pagesOf [columnAt 100 2]
         later `shouldBe` Right [(columnAt 100 2, 3, 4, ReplaceAir)]
         (absentPages, laterPages) `shouldSatisfy` \(a, b) → a > 0 && a <= b
+        -- a read step needs the tree's path and the leaves beside the target (the height and two pages): a window of exactly
+        -- that answers, in a tree of the height this history builds
+        h ← fileAsH env io store
+        (_, atBoundary, _) ← gatherRuns io (heightOf h TreeRuns + 2) store [columnAt 100 2]
+        atBoundary `shouldBe` Right [(columnAt 100 2, 3, 4, ReplaceAir)]
   where
     isRight' = either (const False) (const True)
     isWrite op = case op of OpWriteAt _ _ → True; _ → False

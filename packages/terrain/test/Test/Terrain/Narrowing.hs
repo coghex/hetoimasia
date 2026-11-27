@@ -187,6 +187,14 @@ runSpec = describe "runs" $ do
     runsOfTag joined `shouldBe` [(2, 3, ReplaceMask (mask 12)), (3, 5, ReplaceAir)]
     removedIntervals joined (mustColumn 0 0) `shouldBe` [mustRange 3 5]
     removeChanged (must (removeCell limitless fixture (tile 3) joined)) `shouldBe` False
+  it "rebuilds changes from replacement runs with a mask of zero as air, coalescing it with air beside it" $ do
+    let col0 = mustColumn 0 0
+        built runs = must (either (Left . show) Right (changesFromReplacements limitless [(col0, mustRange lo hi, tag) | (lo, hi, tag) ← runs]))
+        tags changes = [(zRangeLo r, zRangeHi r, t) | (r, t) ← replacementRuns changes col0]
+    tags (built [(0, 5, ReplaceAir), (5, 8, ReplaceMask (mask 0))]) `shouldBe` [(0, 8, ReplaceAir)]
+    tags (built [(5, 8, ReplaceMask (mask 0))]) `shouldBe` [(5, 8, ReplaceAir)]
+    removedIntervals (built [(5, 8, ReplaceMask (mask 0))]) col0 `shouldBe` [mustRange 5 8]
+    tags (built [(0, 3, ReplaceMask (mask 12)), (3, 6, ReplaceMask (mask 0))]) `shouldBe` [(0, 3, ReplaceMask (mask 12)), (3, 6, ReplaceAir)]
   it "gives a replacement no material of its own: a level whose source cell is air reads as air" $ do
     let openedAbove =
           mustSource (SourceSpec ["a", "b"] [layer 0 1 "a" 0, cornerLayer 1 4 "a" 15, cornerLayer 4 6 "b" 15] [patchAir 0 0 3 10])

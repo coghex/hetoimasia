@@ -275,9 +275,11 @@ putStore aid store st =
 
 -- | The replacements a gather read, air or a corner mask, as the pure terrain model's changes.
 changesOfRuns ∷ Config → [GatherRun] → Either Text Changes
-changesOfRuns config runs = do
+changesOfRuns _ runs = do
   replacements ← traverse replacement runs
-  either (Left . Text.pack . show) Right (changesFromReplacements (changeLimitsOf config) replacements)
+  -- the read was funded for exactly these runs (its cap held at every step), and coalescing never adds one:
+  -- the bound is theirs, not the edit staging's
+  either (Left . Text.pack . show) Right (changesFromReplacements (ChangeLimits (length runs)) replacements)
   where
     replacement (column, lo, hi, tag) = either (Left . Text.pack . show) (\r → Right (column, r, tag)) (mkZRange (toInteger lo) (toInteger hi))
 
@@ -673,19 +675,23 @@ keptRunsBytes ∷ Int → Int → Int
 keptRunsBytes cap columns = cap * replacementRunBytes + columns * changeColumnBytes
 
 -- | The pages one step of a ranged read needs in its window: a path from the root to a leaf (the tree is
--- at most 'maxLevel' + 1 levels) and the next leaf, when the range crosses into it.
+-- at most 'maxLevel' + 1 levels) and, when the landing validates its neighbours, the leaves on either side of
+-- the target, which need not share a parent.
 readStepPages ∷ Int
-readStepPages = maxLevel + 2
+readStepPages = maxLevel + 3
 
 -- | The query limits leave every read kind the pages one read step needs beside what it keeps: the
 -- worst kind (a column query, or a surface's window, over the range limit: 'rangeKeep' of it) is
 -- refused at construction otherwise.
 queryKeepChecked ∷ Config → Either ConfigError ()
 queryKeepChecked config
-  | keptPinLimit worst 1 < readStepPages = Left (ConfigQueryKeep (toInteger (keptRunsBytes worst 1)) (toInteger (fromIntegral A.readerPinnedCacheBytes - readStepPages * windowPageBytes)))
+  | kept > allowed = Left (ConfigQueryKeep kept allowed)
   | otherwise = Right ()
   where
-    worst = rangeKeep 0 (fromIntegral (Q.limitRangeLevels (configQueryLimits config)))
+    -- in 'Integer': the public range limit is never multiplied in a fixed width, and the load's
+    -- unbounded cap is not this check's
+    kept = max 0 (toInteger (Q.limitRangeLevels (configQueryLimits config))) * toInteger replacementRunBytes + toInteger changeColumnBytes
+    allowed = toInteger A.readerPinnedCacheBytes - toInteger readStepPages * toInteger windowPageBytes
 
 -- | One step of a pinned read. When it ends, its pin and credit are released in the transaction
 -- that removes it, and then its owner is given the result.
