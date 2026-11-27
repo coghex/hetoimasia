@@ -11,7 +11,7 @@ An unchecked entry awaits filing. A checked entry links its tracker number.
 - [x] NARROW-2. Discover openings through edited corner cells — [#769]
 - [x] NARROW-3. Store and replay bounded tagged replacements — [#770]
 - [x] NARROW-4. Publish a conditional corner edit through the live arena — [#771]
-- [ ] NARROW-5. Expose the conditional edit to Lua
+- [x] NARROW-5. Expose the conditional edit to Lua — [#772]
 
 ## Epic contract
 
