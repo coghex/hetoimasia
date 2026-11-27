@@ -17,13 +17,14 @@ import Control.Concurrent.STM (atomically)
 import Control.Exception (mask_)
 import Control.Monad (foldM, forM, forM_)
 import qualified Data.Map.Strict as Map
-import Data.Int (Int64)
 import Data.Maybe (isJust)
 import Hetoimasia.Terrain.Coordinate (TileCoord)
 import Hetoimasia.Terrain.Cell (Column)
+import Hetoimasia.Terrain.Changes (Replacement (..))
 import Hetoimasia.Terrain.Discovery (Record (..), RecordKey (..), Retained, allowanceOf, applyCandidate, envLimits, newRetained, retainedHeader, retainedProvider, retainedRecords, stageRemoval)
 import qualified Hetoimasia.Terrain.Discovery as D
 import Hetoimasia.Terrain.Residency (ArenaId (..))
+import Hetoimasia.Terrain.Shape (CornerMask, mkCornerMask)
 import Hetoimasia.Terrain.Runtime.Backed.Backend
 import Hetoimasia.Terrain.Runtime.Backed.Fault
 import Hetoimasia.Terrain.Runtime.Backed.Gather
@@ -34,7 +35,7 @@ import Hetoimasia.Terrain.Runtime.Storage.Internal.Types (Errno (..), WorkClass 
 import Hetoimasia.Terrain.Runtime.Store.Internal.Format (PageNo (..))
 import Hetoimasia.Terrain.Runtime.Store.Internal.Model (Condition (..), Store, acquireReader, publish, storeConfig, storeRoots, storeVersion)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan (plPages)
-import Hetoimasia.Terrain.Runtime.Store.Internal.Protocol (removalPlanner)
+import Hetoimasia.Terrain.Runtime.Store.Internal.Protocol (narrowingPlanner, removalPlanner)
 import Hetoimasia.Terrain.Runtime.Store.Internal.State (maxReaders, rHw)
 import Test.Hspec
 import Test.TerrainRuntime.Storage.Harness
@@ -90,6 +91,18 @@ removeAndPublish io store tile = do
     Blocked _ → fail "settle returned a wait"
     More → fail "settle returned a step"
 
+-- | Narrow one cell to a corner mask through the runner and publish when it is ready, as 'removeAndPublish' does.
+narrowAndPublish ∷ Io → Store → TileCoord → CornerMask → IO (Either Done Store)
+narrowAndPublish io store tile target = do
+  (store', _, progress) ← settle io store (start store (narrowingPlanner sceneEnv store tile target))
+  case progress of
+    ReadyToPublish tid _ → case publish tid store' of
+      Right (_, published) → pure (Right published)
+      Left refusal → fail ("publish refused: " <> show refusal)
+    Finished d → pure (Left d)
+    Blocked _ → fail "settle returned a wait"
+    More → fail "settle returned a step"
+
 -- | The claims of an ended transaction are retired: the store takes the next transaction from the same
 -- committed root (a claim left behind would refuse it as busy).
 plansAgain ∷ Io → Store → IO ()
@@ -118,13 +131,17 @@ gatherRuns io pin store0 columns = case startGatherWith pin store0 [(c, minBound
     (g, result) ← loop g0
     pure (endGather store1 g, result, gatherPeakWindow g)
 
-type GProgressResult = Either Handling [(Column, Int64, Int64)]
+type GProgressResult = Either Handling [GatherRun]
 
 -- | The reference's runs of the columns, in the order the columns were asked.
-refRuns ∷ Retained → [Column] → [(Column, Int64, Int64)]
-refRuns ref columns = [(c, lo, hi) | c ← columns, (KeyRun c' lo, RecRun hi) ← Map.toAscList (retainedRecordMap ref), c' == c]
+refRuns ∷ Retained → [Column] → [GatherRun]
+refRuns ref columns = [(c, lo, hi, tag) | c ← columns, (KeyRun c' lo, rec) ← Map.toAscList (retainedRecordMap ref), c' == c, Just (hi, tag) ← [tagged rec]]
   where
     retainedRecordMap = Map.fromList . retainedRecords
+    tagged = \case
+      RecRun hi → Just (hi, ReplaceAir)
+      RecMaskRun hi m → Just (hi, ReplaceMask m)
+      _ → Nothing
 
 -- | The reference's records after the same removal: #661's own retained model, applied to the
 -- candidate it stages.
@@ -134,6 +151,15 @@ refRemove ref tile =
     Right D.NoChange → pure ref
     Right (D.Staged cand) → either (\e → fail ("reference apply: " <> show e)) pure (applyCandidate cand ref)
     Right (D.EditSuspended why) → fail ("reference staging suspended: " <> show why)
+    Left e → fail ("reference staging: " <> show e)
+
+-- | The reference's records after the same narrowing: the pure model's own retained value, applied to the candidate it stages.
+refNarrow ∷ Retained → TileCoord → CornerMask → IO Retained
+refNarrow ref tile target =
+  case D.stageNarrowing sceneEnv (retainedHeader ref) (retainedProvider ref) (allowanceOf (envLimits sceneEnv)) tile target of
+    Right D.NarrowRefused → pure ref
+    Right (D.NarrowStaged cand) → either (\e → fail ("reference apply: " <> show e)) pure (applyCandidate cand ref)
+    Right (D.NarrowSuspended why) → fail ("reference staging suspended: " <> show why)
     Left e → fail ("reference staging: " <> show e)
 
 -- | The file's pages below the high-water mark, read back through the backend, as a disk the
@@ -191,6 +217,29 @@ spec = describe "the owner's transaction runner, through the production storage 
       either expectationFailure pure (compareRecords (retainedRecords ref) h)
       either expectationFailure pure (checkH h)
       storeVersion store `shouldBe` storeVersion store0 + fromIntegral (length tiles)
+  it "writes tagged runs to the file and reads them back, through the pages and through a pinned gather, as the pure model holds them" $
+    withArena $ \env io store0 → do
+      let mask n = either (error . show) id (mkCornerMask n)
+          column = columnAt 2 2
+          edits = [(3, 12), (4, 12), (5, 8), (4, 0), (7, 12), (6, 12)]
+      (store, ref) ← foldM
+        ( \(s, r) (z, m) → do
+            out ← narrowAndPublish io s (tileAt 2 2 z) (mask m)
+            r' ← refNarrow r (tileAt 2 2 z) (mask m)
+            case out of
+              Right s' → pure (s', r')
+              Left d → fail ("a narrowing ended without publishing: " <> show d)
+        )
+        (store0, newRetained (ArenaId 1))
+        edits
+      h ← fileAsH env io store
+      either expectationFailure pure (compareRecords (retainedRecords ref) h)
+      either expectationFailure pure (checkH h)
+      -- the pinned gather reads the runs with their tags, one run for each level at the most
+      (_, gathered, _) ← gatherRuns io gatherPinLimit store [column]
+      gathered `shouldBe` Right (refRuns ref [column])
+      fmap (map (\(_, lo, hi, tag) → (lo, hi, tag))) gathered
+        `shouldBe` Right [(3, 4, ReplaceMask (mask 12)), (4, 5, ReplaceAir), (5, 6, ReplaceMask (mask 8)), (6, 8, ReplaceMask (mask 12))]
   it "appends no history for a removal that changes nothing (air)" $
     withArena $ \_ io store → do
       out ← removeAndPublish io store (tileAt 2 2 9)
@@ -336,7 +385,7 @@ spec = describe "the owner's transaction runner, through the production storage 
         absent `shouldBe` Right []
         -- the later column's own read takes the same first batch from the same floor
         (later, laterPages) ← pagesOf [columnAt 100 2]
-        later `shouldBe` Right [(columnAt 100 2, 3, 4)]
+        later `shouldBe` Right [(columnAt 100 2, 3, 4, ReplaceAir)]
         (absentPages, laterPages) `shouldSatisfy` \(a, b) → a > 0 && a <= b
   where
     isRight' = either (const False) (const True)

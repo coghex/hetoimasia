@@ -77,6 +77,8 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.State
   , looseGrowthUnit
   , looseGrowthOrdinary
   , workOneProbeBytes
+  , maxEditWrites
+  , maxEditReads
   , removalWindowPages
   , editWindowPages
   , readResiduePages
@@ -124,7 +126,7 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.State
   ) where
 
 import Data.Word (Word32, Word64)
-import Hetoimasia.Terrain.Discovery (Authority (..), Header (..), headerBytes, maxBatchUpdates, worstEdgeWrites, worstEditWrites)
+import Hetoimasia.Terrain.Discovery (Authority (..), Header (..), headerBytes, maxBatchUpdates, worstEdgeWrites, worstEditReads, worstEditWrites, worstNarrowReads, worstNarrowWrites)
 import Hetoimasia.Terrain.Residency (ArenaId, Revision (..))
 import Hetoimasia.Terrain.Runtime.Store.Internal.Format
 import Hetoimasia.Terrain.Runtime.Store.Internal.Page (maxPackedPayloadBytes, overlayNodeBytes)
@@ -196,11 +198,17 @@ maxWindowPages = 512
 windowPageBytes ∷ Int
 windowPageBytes = pageSize + windowPageOverhead
 
--- | The most accounted bytes a plan's window may hold: 1.25 MiB (about 310 pages). The
+-- | The most accounted bytes a plan's window may hold: 1.3125 MiB (320 pages). The
 -- window keeps validated page buffers, not decoded entry lists, so this is the memory
 -- it really holds; a plan that needs more is refused with a typed result.
+--
+-- DERIVED, as the removal's was: the whole pages the worst explicit edit holds at once at the tallest trees with every
+-- reader pinned ('editWindowPages' of 'maxEditWrites': 306 pages, 1,312,128 bytes), its ownership probes
+-- ('removalWorstProbes', 205 of 'probeBytes': 52,480 bytes) and one read's page, 1,368,896 bytes, rounded up to the next
+-- 64 KiB. The removal alone (7 writes) fit the former 1.25 MiB; the narrowing's eighth write did not. The 4 MiB of RAM, the
+-- 256 pages and 1 MiB written per transaction and the 64 MiB edit bank are unchanged.
 maxWindowBytes ∷ Int
-maxWindowBytes = 1310720
+maxWindowBytes = 1376256
 
 -- | The most page probes a plan's window may hold: every page it writes below the used
 -- space is probed once ('maxTxnPages'), and a reclamation chunk probes the pages it
@@ -379,8 +387,18 @@ maxRetireInternals = levels (ceilDiv leaves minChildren)
 workOneProbeBytes ∷ Int → Int → Int
 workOneProbeBytes hr hf = (3 * hr + 3 * hf + 2 + maxSpillPages) * probeBytes
 
--- | The pages a standalone explicit removal holds at once. It cannot shrink (it is atomic): its edit is held
--- whole. At most 'worstEditWrites' writes (7) each read a path of @hrec@ pages and replace at most as many;
+-- | The most record writes one explicit edit stages: a removal's 'worstEditWrites' (7) or, in a history that holds narrowed cells,
+-- a narrowing's or a removal's 'worstNarrowWrites' (8: a run split in three or two coalesced, two unions and the obligation). The
+-- ONE figure every explicit-edit bound below is counted from.
+maxEditWrites ∷ Int
+maxEditWrites = max worstEditWrites worstNarrowWrites
+
+-- | The most records one explicit edit reads: 'worstNarrowReads' (198), which also bounds a removal.
+maxEditReads ∷ Int
+maxEditReads = max worstEditReads worstNarrowReads
+
+-- | The pages a standalone explicit edit (a removal or a narrowing) holds at once. It cannot shrink (it is atomic): its edit is
+-- held whole. At most 'maxEditWrites' writes (8) each read a path of @hrec@ pages and replace at most as many;
 -- each replaced page is indexed in the retirement tree, which reads one leaf for each (at most 7 * hrec + 1) and
 -- the internal pages above them, at most @retireInternals@, which is 'maxRetireInternals': the store refuses a
 -- non-root page below a quarter of a payload when it descends to it ('UnderFull') and a root set that retires more
@@ -388,13 +406,13 @@ workOneProbeBytes hr hf = (3 * hr + 3 * hf + 2 + maxSpillPages) * probeBytes
 -- each retired page and an entry for each list) at least 46 to a leaf and 47 children to an internal page, that is
 -- 712 leaves, 16 internal pages and a root; the allocator tree's edit, @3 * hf@; and ONE proof as above.
 removalWindowPages ∷ Int → Int → Int → Int → Int
-removalWindowPages ri hf hrec pins = editWindowPages worstEditWrites ri hf hrec pins + readResiduePages
+removalWindowPages ri hf hrec pins = editWindowPages maxEditWrites ri hf hrec pins + readResiduePages
 
--- | The most pages the supported minimum explicit removal writes at the format bounds: its worst-case record writes
--- ('worstEditWrites') each at the worst cost of an update on the tallest tree, one retirement list page and the bookkeeping
+-- | The most pages the supported worst explicit edit writes at the format bounds: its worst-case record writes
+-- ('maxEditWrites': 8, 205 pages against 'maxTxnPages') each at the worst cost of an update on the tallest tree, one retirement list page and the bookkeeping
 -- reserve. The ONE definition: the feasibility proof of "Model" and the probes below name it.
 minimumRemovalPages ∷ Int
-minimumRemovalPages = worstEditWrites * worstUpdatePages (maxLevel + 1) + 1 + bookkeepingReserve
+minimumRemovalPages = maxEditWrites * worstUpdatePages (maxLevel + 1) + 1 + bookkeepingReserve
 
 -- | The most page probes the proof phase of a standalone removal holds at once ('workOneProbeBytes' counts them for maintenance).
 -- The proof phase classifies, once, each page the plan is about to write below the used space (a page taken from the loose list or
@@ -417,13 +435,13 @@ discoveryUnitWorstProbes = discoveryUnitPagesWritten
 -- | The read pages a plan may still hold when its READ phase ends and its edit phase begins. A read phase (the logical-record
 -- reads of a removal's staging or of a discovery step) holds the pages of what it read until it ends, up to its window bound;
 -- before the edit it either holds no more than this or hands what it read on as facts through a checkpoint and starts the edit
--- from an empty window. It is DERIVED, not chosen: the whole pages the worst removal ('editWindowPages' at the tallest trees,
+-- from an empty window. It is DERIVED, not chosen: the whole pages the worst explicit edit ('editWindowPages' at the tallest trees,
 -- the most retirement internals and every reader pinned) leaves free in the window's byte limit beside its probes, so a window
 -- that holds the edit phase and this residue stays inside 'maxWindowBytes'. The bound a removal or a discovery unit promises is
 -- the edit phase's bound plus this.
 readResiduePages ∷ Int
 readResiduePages =
-  (maxWindowBytes - editWindowPages worstEditWrites maxRetireInternals (maxLevel + 1) (maxLevel + 1) maxReaders * windowPageBytes - removalWorstProbes * probeBytes)
+  (maxWindowBytes - editWindowPages maxEditWrites maxRetireInternals (maxLevel + 1) (maxLevel + 1) maxReaders * windowPageBytes - removalWorstProbes * probeBytes)
     `div` windowPageBytes
 
 -- | The pages the most pages one logical-record read holds: a lookup is one root-to-leaf path, a floor lookup that crosses into
@@ -478,7 +496,7 @@ readPhaseProofFactBytes = maxProofFacts * factBytes
 maxTypedReads ∷ Int
 maxTypedReads = (txnRamLimit - maxWindowBytes - worstOwnershipBytes - maxReadFactBytes - readPhaseProofFactBytes - readPhaseStagedWriteBytes - readPhaseFixedBytes) `div` typedReadBytes
 
--- | The pages an edit of @writes@ record writes holds at once (see 'removalWindowPages', which is the edit of 'worstEditWrites').
+-- | The pages an edit of @writes@ record writes holds at once (see 'removalWindowPages', which is the edit of 'maxEditWrites').
 editWindowPages ∷ Int → Int → Int → Int → Int → Int
 editWindowPages writes retireInternals hf hrec pins =
   writes * hrec + (writes * hrec + 1) + retireInternals + 3 * hf + max ((1 + pins) * hrec) hf

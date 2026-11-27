@@ -114,8 +114,8 @@ spec = describe "pinned readers, retirement and reclamation" $ do
                 Nothing → Left "missing page"
               other → Left (show other)
         r ← must (go w0 0)
-        fmap fst r `shouldBe` Just lo
-        fmap snd r `shouldBe` Just (hiOf v)
+        fmap (\(l, _, _) → l) r `shouldBe` Just lo
+        fmap (\(_, h, _) → h) r `shouldBe` Just (hiOf v)
       _ → pure ()
     must (compareRecords (Map.toList ref2) h2)
   it "answers exact lookups and bounded ordered range reads from pages, across leaves, from and after a key" $ do

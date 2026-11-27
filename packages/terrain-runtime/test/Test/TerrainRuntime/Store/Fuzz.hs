@@ -18,6 +18,7 @@ import Data.Maybe (fromMaybe)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import Data.Word (Word64)
+import Hetoimasia.Terrain.Changes (Replacement (..))
 import Hetoimasia.Terrain.Discovery (Record (..), RecordKey (..))
 import Hetoimasia.Terrain.Residency (ArenaId (..))
 import Hetoimasia.Terrain.Runtime.Store.Internal.Format
@@ -149,7 +150,7 @@ judgeMutated h tok ref keys page offset newByte mutated = do
           Left _ → [IntegrityError]
           Right got
             | Set.member k allowed → [Excused]
-            | got == fmap (const (10, 20)) (Map.lookup k ref) → [EqualAnswer]
+            | got == fmap (const (10, 20, ReplaceAir)) (Map.lookup k ref) → [EqualAnswer]
             | otherwise → [Defect ("floor of " <> show k <> " answered " <> show got)]
         _ → [Excused]
       -- the whole tree by ranged reads, from the first key

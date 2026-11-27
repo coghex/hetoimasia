@@ -84,6 +84,7 @@ import qualified Test.TerrainRuntime.Store.Identity as StoreIdentity
 import qualified Test.TerrainRuntime.Store.Ownership as StoreOwnership
 import qualified Test.TerrainRuntime.Store.Readers as StoreReaders
 import qualified Test.TerrainRuntime.Store.Replay as StoreReplay
+import qualified Test.TerrainRuntime.Store.Tagged as StoreTagged
 
 -- | Whether a module's examples run in the multi-capability pass.
 data Disposition
@@ -122,6 +123,7 @@ entries =
   , Entry "HostPublished" (Concurrent "an attachment issued through a creator lease, against closure and cancellation, ordered by a host that is not yet eligible") HostPublished.spec
   , Entry "Store.Codec" (Alone pureStore) StoreCodec.spec
   , Entry "Store.Replay" (Alone pureStore) StoreReplay.spec
+  , Entry "Store.Tagged" (Alone pureStore) StoreTagged.spec
   , Entry "Store.Faults" (Alone pureStore) StoreFaults.spec
   , Entry "Store.Identity" (Alone pureStore) StoreIdentity.spec
   , Entry "Store.Readers" (Alone pureStore) StoreReaders.spec

@@ -49,7 +49,7 @@ import qualified Data.Map.Strict as Map
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Word (Word64)
-import Hetoimasia.Terrain.Changes (changeColumnBytes, changeIntervalBytes, runsMeetingLevels)
+import Hetoimasia.Terrain.Changes (changeColumnBytes, replacementRunBytes, replacementRunsMeetingLevels)
 import Hetoimasia.Terrain.Coordinate (LocalCoord, localX, localY, localZ)
 import Hetoimasia.Terrain.Resident (columnIndexBytes)
 import Hetoimasia.Terrain.Segment (decodedCellBytes, maxSegmentLevels, maxSegmentPayloadBytes)
@@ -255,26 +255,26 @@ decodedCells levels delta = min (coverageColumns delta * levels) (fromIntegral m
 cellsScratchBytes ∷ Word64 → Word64
 cellsScratchBytes cells = fromIntegral decodedCellBytes * cells
 
--- | The removed runs a load keeps of @columns@ columns, at most, by the figures of
+-- | The replacement runs a load keeps of @columns@ columns, at most, by the tagged-run figures of
 -- "Hetoimasia.Terrain.Changes". A load reads EVERY COLUMN IT TOUCHES OVER THE REGION'S LOADABLE
 -- EXTENT, @levels@ high, not only its cells: what it makes resident merges with the resident segments
--- of the column it touches, and those are rebuilt with it. So each column keeps at most
--- 'runsMeetingLevels' runs of 'changeIntervalBytes' and a 'changeColumnBytes' entry (320 bytes at 32
--- levels; a whole region's columns hold the same as its cells' worth, 81,920 bytes for 16 x 16 x 32).
+-- of the column it touches, and those are rebuilt with it. Runs of different tags may alternate at
+-- every level, so each column keeps at most 'replacementRunsMeetingLevels' (one for each level) runs of
+-- 'replacementRunBytes' and a 'changeColumnBytes' entry (816 bytes at 32 levels; a whole region's
+-- columns hold 208,896 bytes for 16 x 16 x 32).
 loadRunsBytes ∷ Word64 → Word64 → Word64
-loadRunsBytes levels columns = columns * (runsMeetingLevels levels * fromIntegral changeIntervalBytes + fromIntegral changeColumnBytes)
+loadRunsBytes levels columns = columns * (replacementRunsMeetingLevels levels * fromIntegral replacementRunBytes + fromIntegral changeColumnBytes)
 
--- | The worst-case retained growth of one whole-cell removal: one new removed
--- interval and one new column index entry (the figures of
--- "Hetoimasia.Terrain.Changes"). On an overlay that holds only air runs a removal never splits one; a
--- removal inside a mask run does, and live admission over such overlays replaces this figure.
+-- | The worst-case retained growth of one cell edit, a removal or a narrowing, in the figures of
+-- "Hetoimasia.Terrain.Changes": inside a run of another tag the cell splits it in three (two new
+-- runs); in a column that holds no run it is one new run and one new column index entry.
 removalRetainedBytes ∷ Word64
-removalRetainedBytes = fromIntegral (changeIntervalBytes + changeColumnBytes)
+removalRetainedBytes = fromIntegral (max (2 * replacementRunBytes) (replacementRunBytes + changeColumnBytes))
 
--- | The staging a removal needs: the decoded segment, its rebuilt copy, the
--- staged overlay and the result settlement.
+-- | The staging an edit needs: the decoded segment, its rebuilt copy, the
+-- staged overlay (at the tagged-run figure) and the result settlement.
 removalStagingBytes ∷ Word64
-removalStagingBytes = 544
+removalStagingBytes = 576
 
 -- | What 'reserveCost' charges for one column index entry of a job.
 regionColumnReserveBytes ∷ Word64

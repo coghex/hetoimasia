@@ -40,7 +40,7 @@
 --
 -- The RAM a plan reserves (at most 4 MiB, 'ramTotal') is the memory it really holds,
 -- by component. The window keeps validated page /buffers/ (4 KiB and a small header
--- each, at most 1.25 MiB, 'maxWindowBytes'): entries are parsed from a buffer when a
+-- each, at most 'maxWindowBytes', 1.3125 MiB): entries are parsed from a buffer when a
 -- node is visited, never held as lists. The new pages a plan builds are held packed
 -- (their entries as one byte string, at most 'overlayBudgetRecord' and
 -- 'overlayBudgetBookkeeping' while it works, at most 256 pages' worth when it ends)
@@ -388,7 +388,7 @@ data Bounds = Bounds
   }
   deriving stock (Eq, Show)
 
--- | 256 pages (1 MiB of new encoded pages), 4 MiB of RAM, 512 window pages and 1.25 MiB
+-- | 256 pages (1 MiB of new encoded pages), 4 MiB of RAM, 512 window pages and 1.3125 MiB
 -- of window bytes.
 standardBounds ∷ Bounds
 standardBounds = Bounds maxTxnPages txnRamLimit maxWindowPages maxWindowBytes bookkeepingReserve maxBookkeepingPages worstPlanCharge maxTypedReads readResiduePages
@@ -1314,15 +1314,17 @@ lookupRecord win rootFor key = do
       Just r → Right (Just r)
       Nothing → Left (Bad MalformedValue (PageNo 0))
 
--- | The removed run of a column with the greatest lower end at or below a level.
-floorRun ∷ Window → (TreeId → Maybe PageNo) → Column → Int64 → Either Stop (Maybe (Int64, Int64))
+-- | The replacement run of a column with the greatest lower end at or below a level: its two ends and what it does to its
+-- levels.
+floorRun ∷ Window → (TreeId → Maybe PageNo) → Column → Int64 → Either Stop (Maybe (Int64, Int64, Replacement))
 floorRun win rootFor col z = do
   (r, _) ← runM (floorKey TreeRuns (fmap Disk (rootFor TreeRuns)) (encodeKey (KeyRun col z))) (newEdit 0 win)
   case r of
     Nothing → Right Nothing
     Just (k, v) → case decodeKey TreeRuns k of
       Just key@(KeyRun c lo) | c == col → case decodeValue key v of
-        Just (RecRun hi) → Right (Just (lo, hi))
+        Just (RecRun hi) → Right (Just (lo, hi, ReplaceAir))
+        Just (RecMaskRun hi mask) → Right (Just (lo, hi, ReplaceMask mask))
         _ → Left (Bad MalformedValue (PageNo 0))
       Just _ → Right Nothing
       Nothing → Left (Bad MalformedKey (PageNo 0))
@@ -1362,8 +1364,7 @@ providerFor win rootFor =
         Right Nothing → Absent
         Left _ → Unavailable key
     , fetchFloorRun = \col z → case floorRun win rootFor col z of
-        -- the pages hold air runs only: every stored run answers as air
-        Right (Just (lo, hi)) → Found (lo, hi, ReplaceAir)
+        Right (Just run) → Found run
         Right Nothing → Absent
         Left _ → Unavailable (KeyRun col z)
     }
@@ -1380,7 +1381,7 @@ providerFacts win rootFor =
         Just Nothing → Absent
         Nothing → fetchRecord paged key
     , fetchFloorRun = \col z → case windowReadFloor (col, z) win of
-        Just (Just (lo, hi)) → Found (lo, hi, ReplaceAir)
+        Just (Just run) → Found run
         Just Nothing → Absent
         Nothing → fetchFloorRun paged col z
     }

@@ -9,9 +9,11 @@
 --
 -- @
 -- TreeRuns    key  x(8) y(8) lo(8)                       24   -- Column x y, lower end
---             val  hi(8)                                  8
+--             val  hi(8) 0                                9    -- RecRun: an air run
+--                  hi(8) 1 mask(1)                       10   -- RecMaskRun: each level limited to a corner mask 1 .. 15
 -- TreeLinks   key  0 tile(24) 3 * (present(1) coord(8))  52   -- SrcNode
 --                  1 x(8) y(8) lo(8)                      25   -- RunNode
+--                  2 x(8) y(8) lo(8)                      25   -- CellNode
 --             val  0 size(8) known(1)                    10   -- RecRoot
 --                  1 node-key                         26..53   -- RecChild
 -- TreeTodo    key  sequence(8)                            8
@@ -24,7 +26,8 @@
 -- @
 --
 -- A value that decodes is also checked: a tile and a column are in the supported
--- range, an interval has @lo < hi@ inside the level limits, a class size is at
+-- range, an interval has @lo < hi@ inside the level limits, a run's tag is 0 (air) or 1
+-- (a mask, which is then in @1 .. 15@: a zero or larger mask is malformed), a class size is at
 -- least 1, a flag is 0 or 1, an absent optional coordinate is written as zero
 -- bytes, and no byte is left over. Everything is bounded by the format's
 -- 'maxKeyBytes' and 'maxValueBytes'.
@@ -62,12 +65,12 @@ import Data.Bits (shiftL, shiftR, xor, (.|.))
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.Int (Int64)
-import Data.Word (Word16, Word32, Word64)
+import Data.Word (Word16, Word32, Word64, Word8)
 import Hetoimasia.Terrain.Cell (Column (..), mkColumn)
 import Hetoimasia.Terrain.Connectivity (Axis (..), keyOrigin, keyParameters, mkComponentKey)
 import Hetoimasia.Terrain.Coordinate (AxisCoord, TileCoord (..), axisFromInteger, axisValue, tileCoord)
 import Hetoimasia.Terrain.Discovery (Node (..), Record (..), RecordKey (..), Root (..), Todo (..), edgeCount)
-import Hetoimasia.Terrain.Shape (cornerMaskValue)
+import Hetoimasia.Terrain.Shape (cornerMaskValue, mkCornerMask)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Format
 
 -- | The lowest supported level, @-2^62@.
@@ -150,8 +153,6 @@ nodeBytes (SrcNode key) =
   where
     params = keyParameters key
 nodeBytes (RunNode col lo) = BS.concat [BS.singleton 1, columnBytes col, biased lo]
--- The version 1 pages hold no narrowed cell's void: a tag no 'getNode' reads, so a key or a child that names one
--- never round-trips and the write that carries it is refused.
 nodeBytes (CellNode col lo) = BS.concat [BS.singleton 2, columnBytes col, biased lo]
 
 getNode ∷ ByteString → Maybe Node
@@ -160,11 +161,11 @@ getNode bs = case BS.uncons bs of
     origin ← getTile bs 1
     ps ← sequence [optionalAt (25 + 9 * i) axis | (i, axis) ← zip [0 ..] [AxisX, AxisY, AxisZ]]
     SrcNode <$> mkComponentKey origin [p | Just p ← ps]
-  Just (1, _) | BS.length bs == 25 → do
+  Just (tag, _) | (tag == 1 || tag == 2) && BS.length bs == 25 → do
     col ← getColumn bs 1
     let lo = getBiased bs 17
-    -- a run node's level lies in the supported coordinate range, like a run's own
-    if toInteger lo >= levelMin && toInteger lo < levelMaxExclusive then Just (RunNode col lo) else Nothing
+    -- a run's or a cell's level lies in the supported coordinate range, like a run's own
+    if toInteger lo >= levelMin && toInteger lo < levelMaxExclusive then Just ((if tag == 1 then RunNode else CellNode) col lo) else Nothing
   _ → Nothing
   where
     optionalAt off axis = case BS.index bs off of
@@ -194,10 +195,8 @@ decodeKey _ _ = Nothing
 
 -- | The value bytes of a logical record.
 encodeValue ∷ Record → ByteString
-encodeValue (RecRun hi) = biased hi
--- The version 1 pages hold air runs only: a mask run has a length no 'decodeValue' reads, so it never round-trips as a
--- removal and the write that carries it is refused.
-encodeValue (RecMaskRun hi mask) = BS.snoc (biased hi) (fromIntegral (cornerMaskValue mask))
+encodeValue (RecRun hi) = BS.snoc (biased hi) runAirTag
+encodeValue (RecMaskRun hi mask) = BS.append (BS.snoc (biased hi) runMaskTag) (BS.singleton (fromIntegral (cornerMaskValue mask)))
 encodeValue (RecRoot (Root size known)) = BS.concat [BS.singleton 0, be64 size, BS.singleton (if known then 1 else 0)]
 encodeValue (RecChild node) = BS.cons 1 (nodeBytes node)
 encodeValue (RecTodo (Todo tile done)) = BS.snoc (tileBytes tile) done
@@ -206,9 +205,16 @@ encodeValue (RecTodo (Todo tile done)) = BS.snoc (tileBytes tile) done
 -- kind the key requires.
 decodeValue ∷ RecordKey → ByteString → Maybe Record
 decodeValue (KeyRun _ lo) bs
-  | BS.length bs == 8 =
-      let hi = getBiased bs 0
-       in if toInteger hi <= levelMaxExclusive && lo < hi then Just (RecRun hi) else Nothing
+  | BS.length bs >= 9
+  , let hi = getBiased bs 0
+  , toInteger hi <= levelMaxExclusive && lo < hi = case (BS.index bs 8, BS.length bs) of
+      (tag, 9) | tag == runAirTag → Just (RecRun hi)
+      (tag, 10)
+        | tag == runMaskTag
+        , Right mask ← mkCornerMask (fromIntegral (BS.index bs 9))
+        , cornerMaskValue mask /= 0 →
+            Just (RecMaskRun hi mask)
+      _ → Nothing
 decodeValue (KeyLink node) bs = case BS.uncons bs of
   Just (0, rest)
     | BS.length rest == 9
@@ -227,6 +233,14 @@ decodeValue (KeyTodo _) bs
       let done = BS.index bs 24
       if done >= 1 && done < edgeCount then Just (RecTodo (Todo tile done)) else Nothing
 decodeValue _ _ = Nothing
+
+-- | The tag of an air run's value, after its upper end.
+runAirTag ∷ Word8
+runAirTag = 0
+
+-- | The tag of a mask run's value, after its upper end and before its mask.
+runMaskTag ∷ Word8
+runMaskTag = 1
 
 -- ---------------------------------------------------------------------------
 -- Bookkeeping records

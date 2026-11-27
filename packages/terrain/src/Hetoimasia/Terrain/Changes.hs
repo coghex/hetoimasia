@@ -66,6 +66,7 @@ module Hetoimasia.Terrain.Changes
     -- * Merging and restoring
   , mergeChanges
   , changesFromIntervals
+  , changesFromReplacements
   ) where
 
 import Control.Monad (guard)
@@ -255,6 +256,18 @@ changesFromIntervals limits intervals
   | otherwise = Right changes
   where
     changes = foldl' (\acc (column, ZRange lo hi) → assignRange column lo hi (const (Just ReplaceAir)) acc) emptyChanges intervals
+
+-- | Canonical changes from replacement runs of either tag, as a reload of a store's runs hands them
+-- back: a later run replaces what an earlier one set at the same levels, touching runs of one tag
+-- coalesce and whatever the order. A result with more runs than the limit is refused. No cell of a
+-- run is visited.
+changesFromReplacements ∷ ChangeLimits → [(Column, ZRange, Replacement)] → Either ChangeError Changes
+changesFromReplacements limits runs
+  | changeRuns changes > limitRemovedIntervals limits =
+      Left (TooManyRemovedIntervals (limitRemovedIntervals limits))
+  | otherwise = Right changes
+  where
+    changes = foldl' (\acc (column, ZRange lo hi, tag) → assignRange column lo hi (const (Just tag)) acc) emptyChanges runs
 
 -- | The union of two sets of replacements, canonical and coalesced. A level
 -- replaced by both keeps the corners both leave set: air wins over a mask, and

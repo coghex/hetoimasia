@@ -42,6 +42,7 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.Protocol
   ( -- * The planner a driver runs
     Planner
   , removalPlanner
+  , narrowingPlanner
   , discoveryPlanner
   , maintenancePlanner
   , writeProbePlanner
@@ -70,12 +71,13 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.Protocol
 import Data.ByteString (ByteString)
 import Data.Word (Word64)
 import Hetoimasia.Terrain.Coordinate (TileCoord)
-import Hetoimasia.Terrain.Discovery (Env, worstEditReads)
+import Hetoimasia.Terrain.Discovery (Env)
+import Hetoimasia.Terrain.Shape (CornerMask)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Admission (Failure, classifyPlan)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Format (PageError, PageNo, maxTxnPages)
-import Hetoimasia.Terrain.Runtime.Store.Internal.Model (Store, planDiscovery, planMaintenance, planRemoval, planWriteProbeFor, storeConfig, storeWindow)
+import Hetoimasia.Terrain.Runtime.Store.Internal.Model (Store, planDiscovery, planMaintenance, planNarrowing, planRemoval, planWriteProbeFor, storeConfig, storeWindow)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan (CapacityWhy (..), Plan, PlanRefusal (..), Planned (..))
-import Hetoimasia.Terrain.Runtime.Store.Internal.State (cfgTotalPages, maxReclaimPages)
+import Hetoimasia.Terrain.Runtime.Store.Internal.State (cfgTotalPages, maxEditReads, maxReclaimPages)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Tree (Facts, Window, reduceWork, windowCheckpoint, windowInsert, windowPageNumbers, windowProbe, windowReadFactCount, windowSize, windowWork)
 
 -- | One planning call through a window. The production planners are the three below;
@@ -86,6 +88,10 @@ type Planner = Window → Planned
 -- | A removal of one cell, prepared against a discovery environment.
 removalPlanner ∷ Env → Store → TileCoord → Planner
 removalPlanner env store tile window = planRemoval env store window tile
+
+-- | The narrowing of one cell to a corner mask, prepared against a discovery environment.
+narrowingPlanner ∷ Env → Store → TileCoord → CornerMask → Planner
+narrowingPlanner env store tile target window = planNarrowing env store window tile target
 
 -- | One discovery batch.
 discoveryPlanner ∷ Env → Store → Planner
@@ -121,7 +127,7 @@ data Driver = Driver
 -- | Where a driver stopped, and what the caller does next.
 --
 -- 'advance' runs the planner EXACTLY ONCE. A step is therefore bounded by one planner run
--- (the planner's own bounds: at most 4 MiB of RAM, at most 'worstEditReads' records read, at most
+-- (the planner's own bounds: at most 4 MiB of RAM, at most 'maxEditReads' records read, at most
 -- 256 pages written), and the owner serves its cancellation, closure and other arenas between
 -- steps. A checkpoint and a window reduction cost no I/O but are steps of their own ('Continue').
 data Step
@@ -187,7 +193,7 @@ data Supply
 -- transaction takes at most as many as the pages it writes plus the pages it verifies
 -- consumed by an entry it frees, and a read phase one more for each record it reads.
 maxCheckpoints ∷ Int
-maxCheckpoints = maxTxnPages + maxReclaimPages + worstEditReads
+maxCheckpoints = maxTxnPages + maxReclaimPages + maxEditReads
 
 -- | Begin planning against a store through a fresh window.
 newDriver ∷ Store → Planner → Driver

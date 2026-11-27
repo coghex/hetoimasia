@@ -54,7 +54,7 @@ import Hetoimasia.Terrain.Residency (ArenaId (..), RequestId (..), Revision (..)
 import Hetoimasia.Terrain.Resident (Resident, discardRegion, emptyResident)
 import Hetoimasia.Terrain.Runtime.Backed.Backend (Handling (..))
 import Hetoimasia.Terrain.Runtime.Backed.Txn (Done (..), runDraining, runTicket)
-import Hetoimasia.Terrain.Runtime.Backed.Gather (gatherDraining)
+import Hetoimasia.Terrain.Runtime.Backed.Gather (GatherRun, gatherDraining)
 import Hetoimasia.Terrain.Runtime.Backed.Query (queryDraining)
 import Hetoimasia.Terrain.Runtime.Backed.Probe (probeDraining)
 import Hetoimasia.Terrain.Runtime.Backed.Growth (growthDraining)
@@ -906,7 +906,7 @@ delivered svc key gathered = (case key of GatherRequest rid → probe svc (Point
       other → failWith svc (OwnerDefect (Text.pack ("a load's read ended unexpectedly: " <> show other))) []
 
 -- | A request's runs were read: compute its staging from the source and those runs, and stage it.
-stageFromRuns ∷ Service → RequestId → [(Column, Int64, Int64)] → Revision → IO ()
+stageFromRuns ∷ Service → RequestId → [GatherRun] → Revision → IO ()
 stageFromRuns svc rid runs revision = do
   st <- atomically (readSt svc)
   forM_ (Map.lookup rid (stateRequests st)) $ \req →

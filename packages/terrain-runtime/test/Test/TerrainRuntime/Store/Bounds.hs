@@ -187,7 +187,7 @@ spec = describe "transaction bounds, exactly and one past, and work independent 
     n `shouldSatisfy` (> 256)
     ramTotal (mRam (plMeasure p)) `shouldSatisfy` (<= txnRamLimit)
     mWindowPages (plMeasure p) `shouldSatisfy` (<= maxWindowPages)
-  it "bounds the window by its accounted bytes (305 pages accepted, 306 refused) and by its page count" $ do
+  it "bounds the window by its accounted bytes (the whole pages the byte limit holds accepted, one more refused) and by its page count" $ do
     let cfg = either (error . show) id (mkStoreConfig smallSpec)
         roots = storeRoots (hStore (newH smallSpec ident0))
         total = cfgUsablePages cfg
@@ -199,7 +199,8 @@ spec = describe "transaction bounds, exactly and one past, and work independent 
     -- the most whole pages the byte limit holds at the MEASURED page cost (4,288 bytes a page)
     let fitting = maxWindowBytes `div` windowPageBytes
         fitN = fromIntegral fitting
-    fitting `shouldBe` 305
+    -- it holds the worst explicit edit at the tallest trees with every reader pinned, the figure the byte limit is derived from
+    fitting `shouldSatisfy` (>= editWindowPages maxEditWrites maxRetireInternals (maxLevel + 1) (maxLevel + 1) maxReaders)
     windowBytes (windowOf fitN) `shouldBe` fitting * windowPageBytes
     windowBytes (windowOf fitN) `shouldSatisfy` (<= maxWindowBytes)
     windowBytes (windowOf (fitN + 1)) `shouldSatisfy` (> maxWindowBytes)
@@ -216,7 +217,7 @@ spec = describe "transaction bounds, exactly and one past, and work independent 
     enabled `shouldBe` True
     let cfg = either (error . show) id (mkStoreConfig smallSpec)
         total = cfgUsablePages cfg
-        dense n = Page TreeRuns 0 (PageNo n) (Leaf [(encodeKey (runKey 0 (toInteger n) (100 * i)), encodeValue (runRec (100 * i + 3))) | i ← [1 .. 119]])
+        dense n = Page TreeRuns 0 (PageNo n) (Leaf [(encodeKey (runKey 0 (toInteger n) (100 * i)), encodeValue (runRec (100 * i + 3))) | i ← [1 .. 115]])
         build = foldl (\w n → either (error . show) id (windowInsert total (PageNo n) (either (error . show) id (encodePage ident0 (dense n))) w)) (uncheckedWindow ident0 0) [1 .. 310]
     liveBefore ← liveBytes
     w ← evaluate (let w' = build in windowBytes w' `seq` w')
@@ -229,7 +230,7 @@ spec = describe "transaction bounds, exactly and one past, and work independent 
     enabled ← getRTSStatsEnabled
     enabled `shouldBe` True
     let leaves = 180 ∷ Int
-        perLeaf = 119 ∷ Int
+        perLeaf = 115 ∷ Int
         -- hand-built tree of full leaves: pages 0 .. leaves-1, two internal pages, one root
         leafKey ∷ Int → Int → RecordKey
         leafKey l i = runKey (toInteger l) 0 (100 * toInteger i)

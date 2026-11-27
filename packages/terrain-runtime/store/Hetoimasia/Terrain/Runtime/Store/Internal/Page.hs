@@ -8,7 +8,7 @@
 --
 -- @
 --    0  4  magic "HTRP"
---    4  2  format version (1)
+--    4  2  format version (2)
 --    6  1  kind: 1 leaf, 2 internal, 3 retirement list
 --    7  1  tree: 0 runs, 1 links, 2 todo, 3 free, 4 retire (a list page is tree 4)
 --    8  8  arena incarnation
@@ -39,7 +39,9 @@
 -- exactly at the stated end and that the padding is zero, strictly increasing
 -- keys, every child and list reference inside the page space and never the page
 -- itself, and the structure of each leaf entry (a well-formed key and value of the
--- tree's own category, adjacent runs and adjacent free extents already coalesced).
+-- tree's own category), the runs of a column (disjoint; two that touch carry different payloads, air or a mask, since equal
+-- ones are coalesced) and the free extents (disjoint and coalesced). A format version other than 2, version 1 included,
+-- is refused: there is no reader of an older one.
 -- A page with a recomputed valid checksum but a malformed structure is refused by
 -- the same checks. Nothing partial is returned.
 --
@@ -69,6 +71,7 @@ import qualified Data.ByteString.Char8 as BC
 import Data.Word (Word32, Word64, Word8)
 import Hetoimasia.Terrain.Discovery (Record (..), RecordKey (..))
 import Hetoimasia.Terrain.Residency (ArenaId (..))
+import Hetoimasia.Terrain.Shape (cornerMaskValue)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Crc32c (crc32c)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Format
 import Hetoimasia.Terrain.Runtime.Store.Internal.Records
@@ -371,15 +374,23 @@ validateBody tree total (Page _ _ _ body) = case body of
     pairs f es = case es of
       (a : b : rest) → f a b >> pairs f (b : rest)
       _ → Right ()
-    -- Runs of one column are disjoint and never adjacent: they are coalesced.
-    runOk (ka, va) (kb, _) = do
+    -- Runs of one column are disjoint, and two that touch carry different payloads: equal ones are coalesced.
+    runOk (ka, va) (kb, vb) = do
       ka' ← maybe (Left MalformedKey) Right (decodeKey TreeRuns ka)
       kb' ← maybe (Left MalformedKey) Right (decodeKey TreeRuns kb)
       va' ← maybe (Left MalformedValue) Right (decodeValue ka' va)
-      case (ka', va', kb') of
-        (KeyRun ca _, RecRun hi, KeyRun cb lo2)
-          | ca == cb && lo2 <= hi → Left KeyOrder
+      vb' ← maybe (Left MalformedValue) Right (decodeValue kb' vb)
+      case (ka', kb') of
+        (KeyRun ca _, KeyRun cb lo2)
+          | ca == cb
+          , Just (hi, pa) ← runPayload va'
+          , Just (_, pb) ← runPayload vb' →
+              if lo2 < hi || (lo2 == hi && pa == pb) then Left KeyOrder else Right ()
         _ → Right ()
+    runPayload = \case
+      RecRun hi → Just (hi, Nothing)
+      RecMaskRun hi mask → Just (hi, Just (cornerMaskValue mask))
+      _ → Nothing
     -- Free extents are disjoint and coalesced: a gap separates neighbours.
     freeOk (ka, va) (kb, _) = case (decodeFree total ka va, BS.length kb == 8) of
       (Just (s, l), True) | getBe64 kb 0 <= s + l → Left KeyOrder

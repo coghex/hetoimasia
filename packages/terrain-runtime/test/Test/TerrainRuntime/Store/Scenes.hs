@@ -20,6 +20,7 @@ module Test.TerrainRuntime.Store.Scenes
   , Run (..)
   , newRun
   , removeCell
+  , narrowCell
   , batchStep
   , batchStepWith
   , drain
@@ -30,6 +31,7 @@ module Test.TerrainRuntime.Store.Scenes
 import Control.Monad (foldM)
 import Hetoimasia.Terrain.Connectivity (defaultConnectivityLimits, prepareConnectivity)
 import Hetoimasia.Terrain.Coordinate (TileCoord)
+import Hetoimasia.Terrain.Shape (CornerMask)
 import Hetoimasia.Terrain.Discovery
 import Hetoimasia.Terrain.Source (CellSpec (..), LayerSpec (..), PatchSpec (..), SourceSpec (..), defaultSourceLimits, mkSource)
 import Hetoimasia.Terrain.Residency (ArenaId (..))
@@ -138,6 +140,25 @@ removeCell run tile = do
   case (refOutcome, planned) of
     (Right NoChange, NoWork) → Right run
     (Right (Staged cand), Planned plan) → do
+      ref' ← either (Left . ("reference apply: " <>) . show) Right (applyCandidate cand (runRef run))
+      h' ← commitPlan h plan
+      let run' = run {runH = h', runRef = ref', runPlans = plan : runPlans run}
+      compareRecords (retainedRecords ref') h'
+      checkH h'
+      Right run'
+    other → Left ("reference and store disagree: " <> show other)
+
+-- | Narrow one cell to a corner mask through the store's planner and apply the reference candidate. A pair that is not a narrowing is
+-- no work on both sides.
+narrowCell ∷ Run → TileCoord → CornerMask → Either String Run
+narrowCell run tile target = do
+  let h = runH run
+      env = runEnv run
+      refOutcome = stageNarrowing env (retainedHeader (runRef run)) (retainedProvider (runRef run)) (allowanceOf (envLimits env)) tile target
+  (planned, _, _) ← fillWith h (\w → planNarrowing env (hStore h) w tile target)
+  case (refOutcome, planned) of
+    (Right NarrowRefused, NoWork) → Right run
+    (Right (NarrowStaged cand), Planned plan) → do
       ref' ← either (Left . ("reference apply: " <>) . show) Right (applyCandidate cand (runRef run))
       h' ← commitPlan h plan
       let run' = run {runH = h', runRef = ref', runPlans = plan : runPlans run}

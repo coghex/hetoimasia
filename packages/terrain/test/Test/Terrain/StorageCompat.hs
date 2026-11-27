@@ -34,7 +34,7 @@ spec = describe "the RAM-only baseline beside the temporary store" $ do
     (m1, accepted) ← stepOk m0 (SubmitRemoval (RequestId 1) a1 rev0 (either (error . show) id (tileCoord 0 0 0)))
     _ ← pure accepted
     m2 ← stepsOk m1 [Dispatch, JobCompleted (JobId 0) oneCellCost]
-    m3 ← fst <$> stepOk m2 (RemovalCommitted (RequestId 1) (Revision 1) 64 0)
+    m3 ← fst <$> stepOk m2 (RemovalCommitted (RequestId 1) (Revision 1) 72 0)
     ledgersOf m3 `shouldBe` Ledgers (338, 0) (64, 0) (0, 0)
     -- the baseline holds the only copy of the edit: a handoff protects the detail until
     -- its transfer is confirmed, and even then the retained bytes stay charged
@@ -47,20 +47,20 @@ spec = describe "the RAM-only baseline beside the temporary store" $ do
     -- the retained edit bytes are the edit bank's, unchanged by the eviction
     let Ledgers _ edit _ = ledgersOf m5
     edit `shouldBe` (64, 0)
-    [arenaRetainedBytes a | a ← modelArenas m5] `shouldBe` [64]
+    [arenaRetainedBytes a | a ← modelArenas m5] `shouldBe` [72]
   it "still answers exhausted, neither busy nor invalid, at the retained bound, and keeps serving reads" $ do
     let limits = limitsWith $ \s → s {specEditBytes = 64, specResidentBytes = 4000, specStagingBytes = 8192, specLoadJobs = 5, specHoldRegions = 1, specCameraRegions = 64}
     m0 ← fst <$> stepOk (newModel limits) (OpenArena a1 rev0)
     (m1, _) ← stepOk m0 (SubmitRemoval (RequestId 1) a1 rev0 (either (error . show) id (tileCoord 0 0 0)))
     m2 ← stepsOk m1 [Dispatch, JobCompleted (JobId 0) oneCellCost]
-    m3 ← fst <$> stepOk m2 (RemovalCommitted (RequestId 1) (Revision 1) 64 0)
+    m3 ← fst <$> stepOk m2 (RemovalCommitted (RequestId 1) (Revision 1) 72 0)
     refusal ← stepRefused m3 (SubmitRemoval (RequestId 2) a1 (Revision 1) (either (error . show) id (tileCoord 16 0 0)))
     refusal `shouldBe` RetainedEditsExhausted EditBank 64 64 64
     (m4, read') ← stepOk m3 (SubmitQuery (RequestId 3) a1 (Revision 1) [demand (reg 1 0 0) (cell 0 0 0)])
     case reportDecision read' of
       Accepted _ → pure ()
       other → expectationFailure (show other)
-    [arenaRetainedBytes a | a ← modelArenas m4] `shouldBe` [64]
+    [arenaRetainedBytes a | a ← modelArenas m4] `shouldBe` [72]
   describe "the component key's inverse for the store's codec" $ do
     it "rebuilds every key of a layered source from its origin and parameters" $ do
       let spec' = SourceSpec ["stone", "slab"] [LayerSpec Nothing (Just 8) "stone" 0] [PatchSpec x 0 5 6 SpecAir | x ← [2 .. 8]]

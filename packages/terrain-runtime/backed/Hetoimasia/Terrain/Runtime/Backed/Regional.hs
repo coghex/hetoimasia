@@ -60,11 +60,11 @@ import qualified Data.Map.Strict as Map
 import qualified Data.Text as Text
 import Data.Word (Word64)
 import Hetoimasia.Terrain.Cell (Column)
-import Hetoimasia.Terrain.Changes (Replacement (..), runsMeetingLevels)
+import Hetoimasia.Terrain.Changes (Replacement (..), replacementRunsMeetingLevels)
 import Hetoimasia.Terrain.Coordinate (RegionCoord, TileCoord)
 import qualified Hetoimasia.Terrain.Discovery as D
 import Hetoimasia.Terrain.Runtime.Backed.Backend (Closing, Handling (..))
-import Hetoimasia.Terrain.Runtime.Backed.Gather (GProgress (..), Gather, GatherRefusal (..), cancelGather, gatherFetching, gatherOnPin, gatherWindow, stepGather)
+import Hetoimasia.Terrain.Runtime.Backed.Gather (GProgress (..), Gather, GatherRefusal (..), GatherRun, cancelGather, gatherFetching, gatherOnPin, gatherWindow, stepGather)
 import Hetoimasia.Terrain.Runtime.Backed.Query (QProgress (..), Query, cancelQuery, queryFetching, queryOnPin, queryWindow, stepQuery)
 import Hetoimasia.Terrain.Runtime.Backed.RegionCopy (RegionCopy (..), RegionWork (..), packKnowledge, packTerrain)
 import Hetoimasia.Terrain.Runtime.Backed.Txn (Io)
@@ -94,7 +94,7 @@ data Unit
   | -- | A region's own columns.
     OwnRuns !RegionCoord !Gather
   | -- | The columns beside a region, with its own columns' runs.
-    HaloRuns !RegionCoord ![(Column, Int64, Int64)] !Gather
+    HaloRuns !RegionCoord ![GatherRun] !Gather
   | -- | A region's knowledge: its packed terrain, its plan, the tiles still to evaluate, the answers so
     -- far (newest first) and the evaluation in progress or the window the next one starts from.
     Evaluate !RegionCoord !ShortByteString !Int !Int !D.KnowledgePlan ![TileCoord] ![D.CellKnowledge] !Step
@@ -233,7 +233,7 @@ stepOnce io closing store b = case bUnit b of
         QDrained → pure (b {bUnit = Between}, BDrained)
   where
     -- what a read of these columns can keep: the runs the region's levels and one beyond each end hold
-    keep columns = columns * runsMeetingLevels (34 ∷ Int)
+    keep columns = columns * replacementRunsMeetingLevels (34 ∷ Int)
     haloGather window region = let cols = ranged region (D.regionHaloColumns region) in gatherOnPin (bToken b) (bVersion b) window (bRefused b) (keep (length cols)) cols
     ranged region columns = let (lo, hi) = D.regionReadLevels region in [(c, lo, hi) | c ← columns]
     evaluation window tile = queryOnPin (bToken b) (bVersion b) window (bRefused b) (\provider → D.queryCell (bEnv b) provider tile)
@@ -287,8 +287,8 @@ ownGatherOf ∷ Build → Window → RegionCoord → Gather
 ownGatherOf b window region =
   let (lo, hi) = D.regionReadLevels region
       cols = [(c, lo, hi) | c ← D.regionColumns region]
-   in gatherOnPin (bToken b) (bVersion b) window (bRefused b) (length cols * runsMeetingLevels (34 ∷ Int)) cols
+   in gatherOnPin (bToken b) (bVersion b) window (bRefused b) (length cols * replacementRunsMeetingLevels (34 ∷ Int)) cols
 
--- | The runs of each column, for a plan.
-runsByColumn ∷ [(Column, Int64, Int64)] → Map Column [(Int64, Int64, Replacement)]
-runsByColumn runs = Map.map reverse (Map.fromListWith (<>) [(c, [(lo, hi, ReplaceAir)]) | (c, lo, hi) ← runs])
+-- | The runs of each column, air or mask, for a plan.
+runsByColumn ∷ [GatherRun] → Map Column [(Int64, Int64, Replacement)]
+runsByColumn runs = Map.map reverse (Map.fromListWith (<>) [(c, [(lo, hi, tag)]) | (c, lo, hi, tag) ← runs])

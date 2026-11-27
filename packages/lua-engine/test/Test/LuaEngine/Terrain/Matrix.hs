@@ -881,7 +881,7 @@ spec = describe "Terrain matrices" $ do
 
   it "refuses at composition a service configured above 256 KiB of definition, and above 8,192 levels of range, so that no larger definition or range can be accepted" $ do
     refusesComposition defaultConfig {configSourceLimits = defaultSourceLimits {limitDefinitionBytes = 512 * 1024}} "limitDefinitionBytes"
-    -- (past 12,321 levels the service itself refuses the configuration: a read of that range would keep
+    -- (past 12,326 levels the service itself refuses the configuration: a read of that range would keep
     -- more runs than its pin credit holds beside one read step)
     refusesComposition defaultConfig {configQueryLimits = defaultQueryLimits {limitRangeLevels = 12288}} "limitRangeLevels"
 

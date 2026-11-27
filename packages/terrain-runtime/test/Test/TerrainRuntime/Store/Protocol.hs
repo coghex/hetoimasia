@@ -13,7 +13,7 @@ import Control.Monad (foldM, forM, forM_)
 import Data.Bifunctor (first)
 import qualified Data.ByteString as BS
 import Hetoimasia.Terrain.Coordinate (TileCoord)
-import Hetoimasia.Terrain.Discovery (Allowance (..), Env, Node (..), ReadSet (..), Record (..), RecordKey (..), Root (..), allowanceOf, envLimits, maxBatchUpdates, Step (..), candidateReport, reportWrites, pendingObligations, retainedHeader, retainedProvider, stepDiscoveryTraced, worstEdgeReads, worstEdgeWrites, worstEditReads, worstEditWrites)
+import Hetoimasia.Terrain.Discovery (Allowance (..), Env, Node (..), ReadSet (..), Record (..), RecordKey (..), Root (..), allowanceOf, envLimits, maxBatchUpdates, Step (..), candidateReport, reportWrites, pendingObligations, retainedHeader, retainedProvider, stepDiscoveryTraced, worstEdgeReads, worstEdgeWrites)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Format
 import Hetoimasia.Terrain.Runtime.Store.Internal.Model
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan
@@ -52,10 +52,10 @@ drive ∷ H → Int → (H → Window → Planned) → Either String (H, Planned
 drive h0 limit = driveFrom h0 (limitWork limit (storeWindow (hStore h0)))
 
 -- | The most steps (pages fetched and checkpoints) a plan through the protocol may take: every checkpoint carries at least one new
--- read fact, a removal reads at most 'worstEditReads' records (+1 for the end of its read phase) and a window fetches at most
+-- read fact, a removal reads at most 'maxEditReads' records (+1 for the end of its read phase) and a window fetches at most
 -- 'maxWindowPages' pages between two checkpoints.
 maxProtocolSteps ∷ Int
-maxProtocolSteps = (worstEditReads + 1) * (maxWindowPages + 1) + 1000
+maxProtocolSteps = (maxEditReads + 1) * (maxWindowPages + 1) + 1000
 
 -- | 'drive' from a given window (one that may carry facts). The caller is the PRODUCTION driver
 -- ("Hetoimasia.Terrain.Runtime.Store.Internal.Protocol"), which the terrain owner runs: this loop only supplies the pages it
@@ -492,13 +492,17 @@ readPhaseSpec = describe "the read phase: records are facts, a window never hold
     -- (derived: the whole pages the worst removal leaves in the byte limit beside its probes at the MEASURED page and probe costs)
     (readResiduePages >= 1) `shouldBe` True
     -- the probe figures are counted from the pages written, in one place
-    (removalWorstProbes, discoveryUnitWorstProbes) `shouldBe` (worstEditWrites * worstUpdatePages (maxLevel + 1) + 1 + bookkeepingReserve, discoveryUnitWrites * worstUpdatePages (maxLevel + 1) + 1 + bookkeepingReserve)
-    (removalWorstProbes, discoveryUnitWorstProbes, minimumRemovalPages) `shouldBe` (188, 120, 188)
+    (removalWorstProbes, discoveryUnitWorstProbes) `shouldBe` (maxEditWrites * worstUpdatePages (maxLevel + 1) + 1 + bookkeepingReserve, discoveryUnitWrites * worstUpdatePages (maxLevel + 1) + 1 + bookkeepingReserve)
+    (removalWorstProbes, discoveryUnitWorstProbes, minimumRemovalPages) `shouldBe` (205, 120, 205)
     ((removalWindowPages maxRetireInternals (maxLevel + 1) (maxLevel + 1) maxReaders) * windowPageBytes + removalWorstProbes * probeBytes <= maxWindowBytes) `shouldBe` True
     ((removalWindowPages maxRetireInternals (maxLevel + 1) (maxLevel + 1) maxReaders + 1) * windowPageBytes + removalWorstProbes * probeBytes > maxWindowBytes) `shouldBe` True
+    -- the window's byte limit is DERIVED from the worst explicit edit (a tagged edit, the removal's eight-write successor) at the
+    -- tallest trees with every reader pinned: its pages, its ownership probes and one read's page, rounded up to 64 KiB, and no larger
+    let needed = editWindowPages maxEditWrites maxRetireInternals (maxLevel + 1) (maxLevel + 1) maxReaders * windowPageBytes + removalWorstProbes * probeBytes + windowPageBytes
+    (maxWindowBytes >= needed, maxWindowBytes - needed < 64 * 1024, maxWindowBytes `mod` (64 * 1024)) `shouldBe` (True, True, 0)
     -- the facts of the worst removal and of a discovery unit are RAM the feasibility proofs count, and they fit
-    (worstEditReads * recordFactBytes <= maxReadFactBytes, worstEdgeReads * recordFactBytes <= maxReadFactBytes) `shouldBe` (True, True)
-    printLine ("READPHASE bounds: residue " <> show readResiduePages <> " pages; promised removal at (8,8,16) = " <> show (removalWindowPages maxRetireInternals 8 8 16) <> ", discovery unit = " <> show (discoveryUnitWindowPages maxRetireInternals 8 8 16) <> ", one read at 8 levels = " <> show (readPathPages 8) <> "; facts: removal " <> show (worstEditReads * recordFactBytes) <> " B, discovery unit " <> show (worstEdgeReads * recordFactBytes) <> " B, ceiling " <> show maxReadFactBytes)
+    (maxEditReads * recordFactBytes <= maxReadFactBytes, worstEdgeReads * recordFactBytes <= maxReadFactBytes) `shouldBe` (True, True)
+    printLine ("READPHASE bounds: residue " <> show readResiduePages <> " pages; promised removal at (8,8,16) = " <> show (removalWindowPages maxRetireInternals 8 8 16) <> ", discovery unit = " <> show (discoveryUnitWindowPages maxRetireInternals 8 8 16) <> ", one read at 8 levels = " <> show (readPathPages 8) <> "; facts: removal " <> show (maxEditReads * recordFactBytes) <> " B, discovery unit " <> show (worstEdgeReads * recordFactBytes) <> " B, ceiling " <> show maxReadFactBytes)
   it "removes the cell between two runs whose chains are 12 and 64 links long at EXACTLY the promised bound, and plans what the standard bounds plan" $ do
     forM_ [12, 64] $ \hops → do
       (h, env, tile) ← must (chainStore hops 8192)
@@ -526,12 +530,12 @@ readPhaseSpec = describe "the read phase: records are facts, a window never hold
   it "caps the reads of a read phase at what its typed set can hold, and the cap is never a refusal: a removal and a unit fit, a batch ends early" $ do
     -- the derived cap is above everything one removal or one inspection can read (so neither can be refused for it) and below what a
     -- default batch may ask for (so it is the cap that ends a long batch, not the allowance of #661)
-    (maxTypedReads >= worstEditReads, maxTypedReads >= worstEdgeReads, maxTypedReads < maxBatchUpdates * worstEdgeReads) `shouldBe` (True, True, True)
+    (maxTypedReads >= maxEditReads, maxTypedReads >= worstEdgeReads, maxTypedReads < maxBatchUpdates * worstEdgeReads) `shouldBe` (True, True, True)
     -- a removal at EXACTLY its worst read count plans what the standard bounds plan
     (h, env, tile) ← must (chainStore 64 8192)
     let planner bounds hh w = planRemovalWith bounds env (hStore hh) w tile
     std ← must (runThrough h 64 (planner standardBounds))
-    capped ← must (runThrough h 64 (planner (standardBounds {bdMaxReads = worstEditReads})))
+    capped ← must (runThrough h 64 (planner (standardBounds {bdMaxReads = maxEditReads})))
     samePlan (runPlan std) (runPlan capped) `shouldBe` True
     -- a discovery over chains of 40 links (an inspection reads up to 132 records) with the cap at ONE inspection's worst read count and
     -- above it: every batch is planned (never a refusal), a lower cap ends a batch earlier with fewer updates, and every cap drains to
@@ -549,7 +553,7 @@ readPhaseSpec = describe "the read phase: records are facts, a window never hold
       (hc, n, _) ← must (drainThrough hd 64 (batchPlanner cap))
       rc ← must (recordsOfStore hc)
       pure (n, rc == recStd, pendingObligations (storeHeader (hStore hc)))
-    printLine ("READPHASE read cap " <> show maxTypedReads <> " (removal needs at most " <> show worstEditReads <> ", an inspection " <> show worstEdgeReads <> "); updates in the first batch at caps " <> show caps <> " = " <> show updates <> " (standard bounds " <> show (mUpdates (plMeasure (runPlan stdBatch))) <> "); batches to drain " <> show (map (\(n, _, _) → n) drained) <> " (standard " <> show nStd <> ")")
+    printLine ("READPHASE read cap " <> show maxTypedReads <> " (removal needs at most " <> show maxEditReads <> ", an inspection " <> show worstEdgeReads <> "); updates in the first batch at caps " <> show caps <> " = " <> show updates <> " (standard bounds " <> show (mUpdates (plMeasure (runPlan stdBatch))) <> "); batches to drain " <> show (map (\(n, _, _) → n) drained) <> " (standard " <> show nStd <> ")")
     -- the cap at one inspection ends the batch after fewer updates than a cap that holds more; every cap drains to the same records
     -- (the fixture's batches read few records, so the caps above do not bite: every cap plans the same batch, which is the point of a
     -- cap that is never a refusal. The cut itself is shown at #661's step below.)

@@ -217,17 +217,19 @@ spec = describe "The backed terrain service" $ do
     withService (config need) (\_ → pure ())
 
   -- A column query, or a surface's window, of at most the range limit keeps at most what that many
-  -- levels can hold (levels / 2 + 1 coalesced runs), inside the reader's pin credit (32 pages of 4,288
-  -- bytes, 137,216): what it keeps must leave the 9 pages one read step needs (a root-to-leaf path of at
-  -- most 8 levels, and the next leaf). At 12,321 levels it keeps 6,161 x 16 + 48 = 98,624 and leaves
-  -- 38,592, 9 pages exactly; at 12,322 it would keep 98,640 where at most 137,216 - 9 x 4,288 = 98,624
-  -- may be kept.
+  -- levels can hold (a run for each level: runs of different tags alternate), inside the reader's pin
+  -- credit (78 pages of 4,288 bytes, 334,464): what it keeps must leave the 9 pages one read step needs (a
+  -- root-to-leaf path of at most 8 levels, and the next leaf). At 12,326 levels it keeps 12,326 x 24 + 48 =
+  -- 295,872 and leaves 38,592, 9 pages exactly; at 12,327 it would keep 295,896 where at most 334,464 - 9 x
+  -- 4,288 = 295,872 may be kept. The default 8,192 levels keep 196,656 and leave 137,808.
   it "refuses at construction query limits under which a read keeps more runs than its pin credit holds beside one read step's pages, and accepts the largest that leaves them" $ do
     let config n = defaultConfig {configQueryLimits = defaultQueryLimits {limitRangeLevels = n}}
-    try (withService (config 12322) (\_ → pure ())) >>= \case
-      Left (ConfigQueryKeep kept allowed) → (kept, allowed) `shouldBe` (98640, 98624)
+    try (withService (config 12327) (\_ → pure ())) >>= \case
+      Left (ConfigQueryKeep kept allowed) → (kept, allowed) `shouldBe` (295896, 295872)
       other → expectationFailure ("expected the query limits refused, got " <> either show (const "acceptance") other)
-    withService (config 12321) (\_ → pure ())
+    withService (config 12326) (\_ → pure ())
+    -- the public default is accepted whole, and its widest read still returns a complete answer
+    withService defaultConfig (\_ → pure ())
 
   -- The control account must hold, beside the store's own minimum (the worst transaction's control
   -- records, every reader record, the queued descriptors), the storage service's records at their

@@ -33,7 +33,7 @@ import GHC.Stats (RTSStats (..), GCDetails (..), getRTSStats)
 import Hetoimasia.Terrain.Changes (Replacement (..))
 import Hetoimasia.Terrain.Connectivity (Axis (..), ComponentKey, keyParameters, mkComponentKey)
 import Hetoimasia.Terrain.Coordinate (AxisCoord, axisFromInteger)
-import Hetoimasia.Terrain.Discovery (Authority (..), Header (..), Node (..), ReadSet (..), Record (..), RecordKey (..), Root (..), Todo (..), headerBytes, maxBatchUpdates, worstEdgeReads, worstEditReads)
+import Hetoimasia.Terrain.Discovery (Authority (..), Header (..), Node (..), ReadSet (..), Record (..), RecordKey (..), Root (..), Todo (..), headerBytes, maxBatchUpdates, worstEdgeReads)
 import Hetoimasia.Terrain.Residency (ArenaId (..), Revision (..))
 import Hetoimasia.Terrain.Runtime.Store.Internal.Format
 import Hetoimasia.Terrain.Runtime.Store.Internal.Page
@@ -396,10 +396,10 @@ spec = describe "the accounted-bytes constants against what is retained (forced 
             -- facts at their ceiling, the proof facts of a replayed read phase, the writes staging holds (192 at writeRetainedBytes) and
             -- the fixed records
             peak n = n * m + maxWindowBytes + worstOwnershipBytes + maxReadFactBytes + maxProofFacts * factBytes + 3 * maxBatchUpdates * writeRetainedBytes + readPhaseFixedBytes
-        -- a removal reads at most worstEditReads, a unit of discovery worstEdgeReads, a batch the cap; each fits
-        forM_ [worstEdgeReads, worstEditReads, maxTypedReads] $ \n → (n, peak n <= txnRamLimit) `shouldBe` (n, True)
+        -- a removal or a narrowing reads at most maxEditReads, a unit of discovery worstEdgeReads, a batch the cap; each fits
+        forM_ [worstEdgeReads, maxEditReads, maxTypedReads] $ \n → (n, peak n <= txnRamLimit) `shouldBe` (n, True)
         -- and the cap is above what a removal or one inspection can read, so it is never what refuses them
-        (maxTypedReads >= worstEditReads, maxTypedReads >= worstEdgeReads) `shouldBe` (True, True)
+        (maxTypedReads >= maxEditReads, maxTypedReads >= worstEdgeReads) `shouldBe` (True, True)
         -- the cap is the largest the ACCOUNTED typed read allows: one more read at the accounted figure would not fit
         let fixed = maxWindowBytes + worstOwnershipBytes + maxReadFactBytes + maxProofFacts * factBytes + 3 * maxBatchUpdates * writeRetainedBytes + readPhaseFixedBytes
         (maxTypedReads * typedReadBytes + fixed <= txnRamLimit, (maxTypedReads + 1) * typedReadBytes + fixed > txnRamLimit) `shouldBe` (True, True)

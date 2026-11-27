@@ -164,6 +164,7 @@ import Hetoimasia.Terrain.Cell (Column)
 import Hetoimasia.Terrain.Changes (Replacement (..))
 import Hetoimasia.Terrain.Discovery (ReadSet (..), Record, RecordKey (..))
 import Hetoimasia.Terrain.Residency (ArenaId (..))
+import Hetoimasia.Terrain.Shape (cornerMaskValue, mkCornerMask)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Format
 import Hetoimasia.Terrain.Runtime.Store.Internal.Page
 import Hetoimasia.Terrain.Runtime.Store.Internal.Records (be64, decodeValue, encodeKey, encodeValue, getBe64, getLe32)
@@ -307,7 +308,7 @@ data Facts = Facts !Fingerprint ![Fact] !PackedReads
   deriving stock (Eq, Show)
 
 -- | The record and floor facts a plan read, as the bytes the pages hold: two maps from the encoded key to the encoded value (the
--- EMPTY value for an absent answer; a floor answer is its 16 bytes). The form a window holds them in.
+-- EMPTY value for an absent answer; a floor answer is its 17 bytes). The form a window holds them in.
 data PackedReads = PackedReads !(Map ShortByteString ShortByteString) !(Map ShortByteString ShortByteString)
   deriving stock (Eq, Show)
 
@@ -320,7 +321,7 @@ packReads ∷ ReadSet → PackedReads
 packReads (ReadSet rs fl) =
   PackedReads
     (Map.fromList [(packKey k, maybe SBS.empty (toShort . encodeValue) v) | (k, v) ← rs])
-    (Map.fromList [(packKey (KeyRun c z), fact) | ((c, z), v) ← fl, Just fact ← [floorFact v]])
+    (Map.fromList [(packKey (KeyRun c z), floorFact v) | ((c, z), v) ← fl])
 
 -- | Facts made from what a plan established and read: the reads are packed here, at creation.
 factsOf ∷ Fingerprint → [Fact] → ReadSet → Facts
@@ -406,13 +407,12 @@ windowReadRecord k w = case Map.lookup (packKey k) (wReadRecords w) of
         Just r → Just (Just r)
 
 -- | The same for a floor-run query.
-windowReadFloor ∷ (Column, Int64) → Window → Maybe (Maybe (Int64, Int64))
+windowReadFloor ∷ (Column, Int64) → Window → Maybe (Maybe (Int64, Int64, Replacement))
 windowReadFloor (c, z) w = case Map.lookup (packKey (KeyRun c z)) (wReadFloors w) of
   Nothing → Nothing
   Just v
     | SBS.null v → Just Nothing
-    | SBS.length v == 16 → Just (Just (unpackRun v))
-    | otherwise → Nothing
+    | otherwise → Just <$> unpackRun v
 
 -- | How many record and floor facts the window carries.
 windowReadFactCount ∷ Window → Int
@@ -425,28 +425,38 @@ windowReadFactBytes w = sum [SBS.length k + SBS.length v + readFactOverheadBytes
 
 -- | A read fact is held PACKED, as the bytes the pages hold: its key and value as two compact, unpinned byte arrays in a map, never
 -- as the decoded Haskell values (a source node key and child are hundreds of bytes of constructors and thunks). A floor query is
--- keyed as a run key and holds the run's two ends.
+-- keyed as a run key and holds the run's two ends and its payload.
 --
 -- An ABSENT answer (no such record, no such run) is held as the EMPTY value, so it is load-bearing that a PRESENT one never is: every
 -- 'encodeValue' case is at least one byte (a run's 8, a root's 10, a child's tag, a todo's tile and counter) and a floor answer is
--- always its 16 bytes. The suite pins this over every 'Record' constructor at its edges and through the window itself
+-- always its 17 bytes. The suite pins this over every 'Record' constructor at its edges and through the window itself
 -- (@Codec@: \"a present record never encodes to an empty value\").
 packKey ∷ RecordKey → ShortByteString
 packKey = toShort . encodeKey
 
--- | The packed fact of a floor answer: the empty value for none, the two ends of an air run. The pages hold air runs only
--- and answer every run as air, so a mask-tagged answer from another provider has no packed form and keeps no fact; a later
--- run of the plan reads the pages again.
-floorFact ∷ Maybe (Int64, Int64, Replacement) → Maybe ShortByteString
-floorFact Nothing = Just SBS.empty
-floorFact (Just (lo, hi, ReplaceAir)) = Just (packRun (lo, hi))
-floorFact (Just (_, _, ReplaceMask _)) = Nothing
+-- | The packed fact of a floor answer: the empty value for none, else the run's two ends and its payload byte (0 for air, the
+-- mask for a mask run, which is never 0).
+floorFact ∷ Maybe (Int64, Int64, Replacement) → ShortByteString
+floorFact Nothing = SBS.empty
+floorFact (Just (lo, hi, tag)) = packRun (lo, hi, tag)
 
-packRun ∷ (Int64, Int64) → ShortByteString
-packRun (lo, hi) = toShort (BS.append (be64 (fromIntegral lo)) (be64 (fromIntegral hi)))
+packRun ∷ (Int64, Int64, Replacement) → ShortByteString
+packRun (lo, hi, tag) = toShort (BS.concat [be64 (fromIntegral lo), be64 (fromIntegral hi), BS.singleton (payloadByte tag)])
+  where
+    payloadByte ReplaceAir = 0
+    payloadByte (ReplaceMask mask) = fromIntegral (cornerMaskValue mask)
 
-unpackRun ∷ ShortByteString → (Int64, Int64)
-unpackRun v = let b = fromShort v in (fromIntegral (getBe64 b 0), fromIntegral (getBe64 b 8))
+-- | The run a packed floor answer holds, if its bytes are well formed.
+unpackRun ∷ ShortByteString → Maybe (Int64, Int64, Replacement)
+unpackRun v
+  | BS.length b /= 17 = Nothing
+  | BS.index b 16 == 0 = Just (lo, hi, ReplaceAir)
+  | Right mask ← mkCornerMask (fromIntegral (BS.index b 16)) = Just (lo, hi, ReplaceMask mask)
+  | otherwise = Nothing
+  where
+    b = fromShort v
+    lo = fromIntegral (getBe64 b 0)
+    hi = fromIntegral (getBe64 b 8)
 
 -- | The version the window was filled for.
 windowVersion ∷ Window → Word64

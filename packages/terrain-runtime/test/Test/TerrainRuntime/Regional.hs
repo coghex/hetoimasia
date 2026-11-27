@@ -1010,7 +1010,7 @@ retentionSpec = describe "what a regional build retains" $ do
   it "drops the window a read replaces when it starts afresh inside a region: a build never holds more pages than a reader may pin" $
     H.withEnv $ \env → do
       -- runs dense enough that one region's reads need more pages than one window holds
-      let dense = [(x, y, z) | x ← [-1 .. 16], y ← [-1 .. 16], z ← [0, 6 .. 30]]
+      let dense = [(x, y, z) | x ← [-1 .. 16], y ← [-1 .. 16], z ← [0, 2 .. 32]]
       (store, io) ← directStore env dense
       (pinned, b) ← either (fail . show) pure (startBuild store (envOf (fxSpec together)) [region 0 0 0])
       waits ← newIORef (0 ∷ Int)
