@@ -591,7 +591,7 @@ discoveryOutput =
   [ "valid"
   , "LimitNotPositive FieldBatchUpdates 0"
   , "LimitUnrepresentable FieldBatchUpdates 65 64"
-  , "LimitBelowProgress FieldInspectedRecords 1 197"
+  , "LimitBelowProgress FieldInspectedRecords 1 198"
   , "(True,False,False,2)"
   , "1"
   , "Right (CellKnowledge {cellSolid = NoSolid, cellVoid = VoidUnknown})"

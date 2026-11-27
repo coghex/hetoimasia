@@ -7,15 +7,16 @@
 -- reconstruct the same knowledge and the same unfinished work.
 --
 -- @
--- 'KeyRun' column lo       -> 'RecRun' hi        a removed run @[lo, hi)@ of one column
+-- 'KeyRun' column lo       -> 'RecRun' hi        an air run @[lo, hi)@ of one column
+--                          -> 'RecMaskRun' hi m  a run of cells each limited to corner mask @m@
 -- 'KeyLink' node           -> 'RecRoot' root     a union-find root: size and knowledge
 --                          -> 'RecChild' parent  a member pointing toward its root
 -- 'KeyTodo' sequence       -> 'RecTodo' todo     one removal's unfinished connections
 -- @
 --
 -- A node with no 'KeyLink' record is an implicit singleton root: a source
--- component is known exactly when the compiled source calls it exterior, a
--- removed run is unknown. Absent therefore means /confirmed/ unknown, which is a
+-- component is known exactly when the compiled source calls it exterior, an air
+-- run and the void of a narrowed cell are unknown. Absent therefore means /confirmed/ unknown, which is a
 -- different fact from a record the provider has not supplied ('Unavailable').
 --
 -- State, ownership and lifetime: none. Pure, immutable values.
@@ -40,18 +41,24 @@ module Hetoimasia.Terrain.Internal.Discovery.Records
 
 import Data.Int (Int64)
 import Data.Word (Word64, Word8)
+import Hetoimasia.Terrain.Changes (Replacement)
 import Hetoimasia.Terrain.Coordinate (TileCoord)
 import Hetoimasia.Terrain.Internal.Cell (Column)
 import Hetoimasia.Terrain.Internal.Connectivity.Index (ComponentKey)
+import Hetoimasia.Terrain.Internal.Shape (CornerMask)
 import Hetoimasia.Terrain.Residency (ArenaId, Revision)
 
 -- | A member of the connectivity forest: a source component of the compiled
--- source, or a removed run named by the lowest level it had when the node was
--- made. A run whose lower end later moves keeps its old node as a member of the
--- same class, so aliases stay valid when removals extend or merge runs.
+-- source, an air run named by the lowest level it had when the node was made, or
+-- the void of one narrowed cell. A run whose lower end later moves keeps its old
+-- node as a member of the same class, so aliases stay valid when removals
+-- extend or merge runs. A narrowed cell's node is named by its own level, which
+-- no edit changes, so it survives every split and coalescing of the storage run
+-- that holds the cell: equal adjacent masks share a run and keep separate voids.
 data Node
   = SrcNode !ComponentKey
   | RunNode !Column !Int64
+  | CellNode !Column !Int64
   deriving stock (Eq, Ord, Show)
 
 -- | The ordered key of a retained record. Runs of one column are adjacent and
@@ -84,9 +91,12 @@ data Todo = Todo
 edgeCount ∷ Word8
 edgeCount = 7
 
--- | A retained record.
+-- | A retained record. A run is air ('RecRun') or limits each of its levels to a
+-- nonzero corner mask of that level's source material ('RecMaskRun'); two runs
+-- that touch never carry the same payload.
 data Record
   = RecRun !Int64
+  | RecMaskRun !Int64 !CornerMask
   | RecRoot !Root
   | RecChild !Node
   | RecTodo !Todo
@@ -129,11 +139,11 @@ data Fetch a
   deriving stock (Eq, Show)
 
 -- | The bounded window through which an operation reads retained records.
--- 'fetchFloorRun' answers the removed run of a column with the greatest lower
--- end at or below a level (a floor lookup).
+-- 'fetchFloorRun' answers the run of a column with the greatest lower end at or
+-- below a level (a floor lookup): its two ends and what it does to its levels.
 data Provider = Provider
   { fetchRecord ∷ RecordKey → Fetch Record
-  , fetchFloorRun ∷ Column → Int64 → Fetch (Int64, Int64)
+  , fetchFloorRun ∷ Column → Int64 → Fetch (Int64, Int64, Replacement)
   }
 
 -- | The accounted bytes of a node key: a source component key holds a tile and
@@ -141,6 +151,7 @@ data Provider = Provider
 nodeKeyBytes ∷ Node → Int
 nodeKeyBytes (SrcNode _) = 96
 nodeKeyBytes (RunNode _ _) = 40
+nodeKeyBytes (CellNode _ _) = 40
 
 -- | The container overhead of one retained entry.
 entryOverheadBytes ∷ Int
@@ -155,6 +166,7 @@ keyBytes (KeyTodo _) = 16
 -- | The accounted bytes of a record's value.
 recordBytes ∷ Record → Int
 recordBytes (RecRun _) = 8
+recordBytes (RecMaskRun _ _) = 16
 recordBytes (RecRoot _) = 16
 recordBytes (RecChild node) = 8 + nodeKeyBytes node
 recordBytes (RecTodo _) = 40

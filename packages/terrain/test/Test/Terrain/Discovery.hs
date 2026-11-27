@@ -393,8 +393,8 @@ limitSpecs = describe "limits" $ do
     mkDiscoveryLimits baseSpec {specBatchUpdates = 0} `shouldBe` Left (LimitNotPositive FieldBatchUpdates 0)
     mkDiscoveryLimits baseSpec {specBatchUpdates = -1} `shouldBe` Left (LimitNotPositive FieldBatchUpdates (-1))
     mkDiscoveryLimits baseSpec {specBatchUpdates = 65} `shouldBe` Left (LimitUnrepresentable FieldBatchUpdates 65 64)
-    mkDiscoveryLimits baseSpec {specInspectedRecords = 1} `shouldBe` Left (LimitBelowProgress FieldInspectedRecords 1 (toInteger worstEditReads))
-    mkDiscoveryLimits baseSpec {specDeltaRecords = 4} `shouldBe` Left (LimitBelowProgress FieldDeltaRecords 4 (toInteger worstEditWrites))
+    mkDiscoveryLimits baseSpec {specInspectedRecords = 1} `shouldBe` Left (LimitBelowProgress FieldInspectedRecords 1 (toInteger worstNarrowReads))
+    mkDiscoveryLimits baseSpec {specDeltaRecords = 4} `shouldBe` Left (LimitBelowProgress FieldDeltaRecords 4 (toInteger worstNarrowWrites))
     mkDiscoveryLimits baseSpec {specPendingObligations = 0} `shouldBe` Left (LimitNotPositive FieldPendingObligations 0)
     mkDiscoveryLimits baseSpec {specRetainedBytes = 1} `shouldBe` Left (LimitBelowProgress FieldRetainedBytes 1 (toInteger minimumRetainedBytes))
     mkDiscoveryLimits baseSpec {specScratchBytes = 2 ^ (41 ∷ Int)} `shouldBe` Left (LimitUnrepresentable FieldScratchBytes (2 ^ (41 ∷ Int)) (2 ^ (40 ∷ Int)))
@@ -1274,8 +1274,8 @@ boundarySpecs = describe "bounded boundary queries" $ do
             pageNext page `shouldBe` Nothing
           other → expectationFailure ("last page: " <> show (const () <$> Just other))
   it "refuses a page the scratch cannot hold, at validation and never at the query" $ do
-    mkDiscoveryLimits baseSpec {specScratchBytes = 52224, specBoundaryFaces = 1024}
-      `shouldBe` Left (LimitBelowProgress FieldScratchBytes 52224 (toInteger (boundaryQueryScratch 1024)))
+    mkDiscoveryLimits baseSpec {specScratchBytes = toInteger minimumScratchBytes, specBoundaryFaces = 1024}
+      `shouldBe` Left (LimitBelowProgress FieldScratchBytes (toInteger minimumScratchBytes) (toInteger (boundaryQueryScratch 1024)))
     -- the lookup of the class is part of the query: a page alone is not enough.
     mkDiscoveryLimits baseSpec {specScratchBytes = toInteger (boundaryPageBytes 1024), specBoundaryFaces = 1024}
       `shouldBe` Left (LimitBelowProgress FieldScratchBytes (toInteger (boundaryPageBytes 1024)) (toInteger (boundaryQueryScratch 1024)))

@@ -4,28 +4,30 @@
 --
 -- = Why the answer is uniform where it is
 --
--- A cell's knowledge is a function of what it and its six face neighbours hold now (a removed run
--- or the source cell), the nodes of their voids (a removed run's node, or the source component's
--- key) and whether each node's class is known. The compiled connectivity describes the source by a
+-- A cell's knowledge is a function of what it and its six face neighbours hold now (an air run, a
+-- cell narrowed to a corner mask, or the source cell), the nodes of their voids (an air run's node,
+-- a narrowed cell's own node, or the source component's key) and whether each node's class is known. The compiled connectivity describes the source by a
 -- lattice of boxes: inside a box every cell has the same kind of content and its void belongs to
 -- the same class, with the same key unless the box keeps a coordinate as a component parameter. So
--- two cells whose own box and neighbours' boxes agree, with no removal at or beside them and no
+-- two cells whose own box and neighbours' boxes agree, with no edit at or beside them and no
 -- parameter telling their keys apart, have the same answer.
 --
 -- 'planRegionKnowledge' partitions the region by that rule, from the compiled connectivity and the
--- removed runs of the region's columns and of the 64 columns beside it ('regionColumns',
+-- runs of the region's columns and of the 64 columns beside it ('regionColumns',
 -- 'regionHaloColumns'), read by the caller from one committed version over 'regionReadLevels' (the
 -- region's levels and one beyond each end):
 --
 -- * the columns into /classes/ with identical inputs: the same lattice intervals for the column and
---   its four side neighbours, no removed run in any of the five over the levels read, and the
---   column's own coordinate wherever a box there keeps it as a parameter. A column with a removal in
+--   its four side neighbours, no run in any of the five over the levels read, and the
+--   column's own coordinate wherever a box there keeps it as a parameter. A column with an edit in
 --   it or beside it is a class of its own;
 -- * each class's levels into /pieces/, bounded by the lattice's Z cuts and, for a class of its own,
---   the ends of every removed run of the five columns. In a piece every cell but the first and the
+--   the ends of every run of the five columns. In a piece every cell but the first and the
 --   last has the same inputs, its up and down neighbours included, so a piece is evaluated at its
 --   first cell, one interior cell and its last cell. A piece in a box whose components keep the
---   level as a parameter (stacked non-flat cells, a component per level) is evaluated at every level
+--   level as a parameter (stacked non-flat cells, a component per level), and a piece inside a run
+--   of narrowed cells in the column or beside it (equal masks of adjacent levels share a run and keep
+--   separate voids, so their knowledge can differ from level to level), is evaluated at every level
 --   ('planPerLevelTiles' counts those evaluations apart).
 --
 -- The caller evaluates 'queryCell' at 'planTiles', in order, against the same committed version, and
@@ -33,7 +35,7 @@
 -- region whose answer is uniform is one class of one run.
 --
 -- Nothing here reads a record. The plan is arithmetic on the connectivity and the runs it is given;
--- its size grows with the lattice cuts, the removals and the parameterised boxes inside the region,
+-- its size grows with the lattice cuts, the edits and the parameterised boxes inside the region,
 -- never with its 8,192 cells otherwise. State, ownership and lifetime: none; every value is immutable.
 module Hetoimasia.Terrain.Internal.Discovery.Region
   ( -- * What a plan reads
@@ -71,6 +73,7 @@ import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import Data.Word (Word8)
 import Hetoimasia.Terrain.Cell (Column (..))
+import Hetoimasia.Terrain.Changes (Replacement (..))
 import Hetoimasia.Terrain.Coordinate (RegionCoord (..), TileCoord (..), axisFromInteger, axisMaxValue, axisMinValue, axisValue, columnSize, regionLevels)
 import Hetoimasia.Terrain.Internal.Connectivity.Index (Connectivity (..), Node (..), cutIndex, latticeSize)
 import Hetoimasia.Terrain.Internal.Discovery.Core (CellKnowledge (..), Env, SolidKnowledge (..), VoidKnowledge (..), envConnectivity)
@@ -144,17 +147,17 @@ data Piece
 
 -- | What a class's evaluation looks like before the answers come back.
 data Signature
-  = -- | A column with a removal in it or beside it: a class of its own.
+  = -- | A column with an edit in it or beside it: a class of its own.
     Own !Integer !Integer
   | -- | The lattice intervals of the column and its west, east, north and south neighbours, and
     -- the column's coordinates where a box keeps one as a parameter.
     Shared ![(Maybe Int, Maybe Int)] !(Maybe Integer) !(Maybe Integer)
   deriving stock (Eq, Ord, Show)
 
--- | Plan a region from its environment and the removed runs, @[lo, hi)@, that its columns and the
+-- | Plan a region from its environment and the runs, @[lo, hi)@ and what each does, that its columns and the
 -- columns beside it hold over 'regionReadLevels' (a column absent from the map holds none). The runs
 -- must be those of the committed version the answers will be evaluated against.
-planRegionKnowledge ∷ Env → RegionCoord → Map Column [(Int64, Int64)] → KnowledgePlan
+planRegionKnowledge ∷ Env → RegionCoord → Map Column [(Int64, Int64, Replacement)] → KnowledgePlan
 planRegionKnowledge env region runs = KnowledgePlan region classOf (map plan representatives)
   where
     conn = envConnectivity env
@@ -177,7 +180,7 @@ planRegionKnowledge env region runs = KnowledgePlan region classOf (map plan rep
     fiveOf x y = [(x, y), (x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)]
     boxesOf x y = [(xi a, yj b) | (a, b) ← fiveOf x y]
     runsOf (x, y) = maybe [] (\column → Map.findWithDefault [] column runs) (columnAt x y)
-    meeting (lo, hi) = hi > readLo && lo < readHi
+    meeting (lo, hi, _) = hi > readLo && lo < readHi
     special x y = any (any meeting . runsOf) (fiveOf x y)
     signature (cx, cy) =
       let x = x0 + cx
@@ -199,15 +202,21 @@ planRegionKnowledge env region runs = KnowledgePlan region classOf (map plan rep
       where
         cuts = [toInteger c | c ← Set.toAscList (Set.takeWhileAntitone (< fromInteger z1) (Set.dropWhileAntitone (<= fromInteger z0) (cZCuts conn)))]
         runEnds = case sig of
-          Own {} → [toInteger e | col ← fiveOf x y, (lo, hi) ← runsOf col, e ← [lo, hi], toInteger e > z0, toInteger e < z1]
+          Own {} → [toInteger e | col ← fiveOf x y, (lo, hi, _) ← runsOf col, e ← [lo, hi], toInteger e > z0, toInteger e < z1]
           Shared {} → []
         breaks = dedup (sort ([z0, z1] <> cuts <> runEnds))
         boxes = boxesOf x y
+        -- A piece lies inside or outside each run, whose ends are breaks. Equal masks of
+        -- adjacent levels share a run and keep separate voids, so inside a mask run, in
+        -- this column or beside it, the answer can differ from level to level.
+        inMask a b = case sig of
+          Own {} → or [True | col ← fiveOf x y, (lo, hi, ReplaceMask _) ← runsOf col, toInteger lo <= a, b <= toInteger hi]
+          Shared {} → False
         piece (a, b) =
           let levelParam = case zk a of
                 Just k → any (\(mi, mj) → maybe False (\(i, j) → testBit (axesAt i j k) 2) ((,) <$> mi <*> mj)) boxes
                 Nothing → False
-           in (if levelParam then PerLevel else Span) (fromInteger a) (fromInteger b)
+           in (if levelParam || inMask a b then PerLevel else Span) (fromInteger a) (fromInteger b)
 
 -- | The region the plan is for.
 planRegion ∷ KnowledgePlan → RegionCoord

@@ -8,6 +8,7 @@ import qualified Test.Terrain.Coordinate as Coordinate
 import qualified Test.Terrain.Corner as Corner
 import qualified Test.Terrain.CornerAdmission as CornerAdmission
 import qualified Test.Terrain.Discovery as Discovery
+import qualified Test.Terrain.DiscoveryNarrowing as DiscoveryNarrowing
 import qualified Test.Terrain.DiscoveryRegion as DiscoveryRegion
 import qualified Test.Terrain.Geometry as Geometry
 import qualified Test.Terrain.Growth as Growth
@@ -42,6 +43,7 @@ spec = describe "Terrain" $ do
   ConnectivityBounds.spec
   Discovery.spec
   DiscoveryRegion.spec
+  DiscoveryNarrowing.spec
   Resident.spec
   Residency.spec
   ResidencyCycle.spec

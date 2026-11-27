@@ -263,7 +263,7 @@ delayedProvider d p =
         if Set.member c (delayColumns d)
           then Unavailable (KeyRun c z)
           else case fetchFloorRun p c z of
-            Found (lo, _) | Set.member (KeyRun c lo) (delayKeys d) → Unavailable (KeyRun c lo)
+            Found (lo, _, _) | Set.member (KeyRun c lo) (delayKeys d) → Unavailable (KeyRun c lo)
             other → other
     }
 
@@ -289,8 +289,8 @@ windowProvider window p =
   Provider
     { fetchRecord = \k → if k `elem` window then fetchRecord p k else Unavailable k
     , fetchFloorRun = \c z → case fetchFloorRun p c z of
-        Found (lo, hi) | KeyRun c lo `elem` window → Found (lo, hi)
-        Found (lo, _) → Unavailable (KeyRun c lo)
+        Found run@(lo, _, _) | KeyRun c lo `elem` window → Found run
+        Found (lo, _, _) → Unavailable (KeyRun c lo)
         Absent | windowMarker c `elem` window → Absent
         Absent → Unavailable (windowMarker c)
         other → other

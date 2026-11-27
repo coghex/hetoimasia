@@ -8,6 +8,7 @@ import Data.Int (Int64)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import Hetoimasia.Terrain.Cell (Column (..), zRangeHi, zRangeLo)
+import Hetoimasia.Terrain.Changes (Replacement)
 import Hetoimasia.Terrain.Coordinate (RegionCoord (..))
 import Hetoimasia.Terrain.Discovery
 import Hetoimasia.Terrain.Source (CellSpec (..), PatchSpec (..))
@@ -155,12 +156,12 @@ regionsOf rig =
 
 -- | The removed runs a plan reads: those of the region's columns and of the columns beside it, over
 -- its read levels.
-runsFor ∷ Rig → RegionCoord → Map.Map Column [(Int64, Int64)]
+runsFor ∷ Rig → RegionCoord → Map.Map Column [(Int64, Int64, Replacement)]
 runsFor rig region =
   Map.fromListWith
     (flip (<>))
-    [ (column, [(fromInteger (zRangeLo range), fromInteger (zRangeHi range))])
-    | (column, range) ← retainedRemovals (rigRetained rig)
+    [ (column, [(fromInteger (zRangeLo range), fromInteger (zRangeHi range), payload)])
+    | (column, range, payload) ← retainedReplacements (rigRetained rig)
     , Set.member column wanted
     , zRangeHi range > toInteger lo
     , zRangeLo range < toInteger hi

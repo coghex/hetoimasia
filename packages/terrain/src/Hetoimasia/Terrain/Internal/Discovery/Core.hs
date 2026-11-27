@@ -8,9 +8,11 @@
 --
 -- The compiled source gives every empty space a canonical 'Node' and the set of
 -- initially exterior (known) components. A removal makes a full-air cell: its
--- run of removed levels is one node, and the six faces of the cell plus its old
--- void are the connections the removal introduces. Those connections are an
--- /obligation/ staged together with the removal. A discovery batch inspects them
+-- run of air levels is one node. A narrowing limits a cell to a corner mask of
+-- its own material: the cell's void is a node of its own, named by its level, so
+-- equal adjacent masks share a storage run and keep separate voids. The six faces
+-- of the edited cell plus its old void are the connections the edit introduces.
+-- Those connections are an /obligation/ staged together with the edit. A discovery batch inspects them
 -- one connection at a time (a /structural update/): the neighbour's component is
 -- found by exact portal overlap, and the two classes are joined in a union-find
 -- forest whose roots carry whether the class is known. Knowledge therefore
@@ -53,6 +55,9 @@ module Hetoimasia.Terrain.Internal.Discovery.Core
   , StageOutcome (..)
   , stageRemoval
   , stageRemovalTraced
+  , NarrowOutcome (..)
+  , stageNarrowing
+  , stageNarrowingTraced
   , Halt (..)
   , Step (..)
   , stepDiscovery
@@ -67,6 +72,7 @@ module Hetoimasia.Terrain.Internal.Discovery.Core
   , retainedProvider
   , retainedBytes
   , retainedRemovals
+  , retainedReplacements
   , retainedFromRecords
   , ApplyError (..)
   , applyCandidate
@@ -95,11 +101,15 @@ import Data.IntSet (IntSet)
 import Data.List (nub)
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
-import Data.Maybe (mapMaybe)
+import Data.Maybe (isJust)
 import Data.Word (Word64)
-import Hetoimasia.Terrain.Cell (Cell, Column (..), ZRange, cellShapeKey, mkZRange)
+import Control.Monad (forM_, unless)
+import Data.List (sortOn)
+import Hetoimasia.Terrain.Cell (Cell (..), Column (..), ZRange, cellOccupant, cellShapeKey, cornerCell, mkZRange)
+import Hetoimasia.Terrain.Changes (Replacement (..), narrowedCell)
 import Hetoimasia.Terrain.Internal.Cell (bottomLevel, topExclusive)
 import Hetoimasia.Terrain.Changes (emptyChanges)
+import Hetoimasia.Terrain.Internal.Shape (CornerMask, cornerMaskValue, resolveCorner)
 import Hetoimasia.Terrain.Coordinate (TileCoord (..), axisValue)
 import Hetoimasia.Terrain.Internal.Connectivity.Index
   ( BoundaryFace
@@ -122,6 +132,8 @@ import Hetoimasia.Terrain.Opening
   , cellComponents
   , cellFaces
   , componentIndex
+  , connectionFrom
+  , portalComponent
   , componentPortals
   , connectCells
   , connectionArea
@@ -186,8 +198,8 @@ data Integrity
     MalformedRecord !RecordKey
   | -- | The header names an obligation the records do not hold.
     MissingObligation !Word64
-  | -- | An obligation whose cell is not removed.
-    ObligationNotRemoved !TileCoord
+  | -- | An obligation whose cell holds no edit.
+    ObligationNotEdited !TileCoord
   | -- | Portals that connect where the compiled source has no component.
     ConnectionWithoutComponent !TileCoord
   | -- | The provider answered with a run that does not satisfy the floor query.
@@ -257,7 +269,7 @@ data Failure = Failure !Stop !Int !Int !ReadSet
 -- fetched) can answer a later run from them: the operation reads the same records in the same order and gets the same values.
 data ReadSet = ReadSet
   { readRecords ∷ ![(RecordKey, Maybe Record)]
-  , readFloors ∷ ![((Column, Int64), Maybe (Int64, Int64))]
+  , readFloors ∷ ![((Column, Int64), Maybe (Int64, Int64, Replacement))]
   }
   deriving stock (Eq, Show)
 
@@ -286,7 +298,7 @@ data Caps = Caps
 data S = S
   { sOverlay ∷ !(Map RecordKey (Maybe Record))
   , sCache ∷ !(Map RecordKey (Maybe Record))
-  , sFloor ∷ !(Map (Column, Int64) (Maybe (Int64, Int64)))
+  , sFloor ∷ !(Map (Column, Int64) (Maybe (Int64, Int64, Replacement)))
   , sReads ∷ !Int
   , sCost ∷ !Int
   -- ^ The accounted cost of the staged writes.
@@ -400,22 +412,22 @@ getRec key = M $ \_ p s → case Map.lookup key (sOverlay s) of
         Absent → Right (Nothing, s1 {sCache = Map.insert key Nothing (sCache s1)})
         Unavailable k → Left (failure (StopMissing k) s1)
 
--- | The removed run of a column with the greatest lower end at or below a level.
--- Floor answers ignore staged writes: no operation stages a run before it has
--- read every run it depends on.
-floorRun ∷ Column → Int64 → M (Maybe (Int64, Int64))
+-- | The run of a column with the greatest lower end at or below a level: its
+-- two ends and what it does to its levels. Floor answers ignore staged writes:
+-- no operation stages a run before it has read every run it depends on.
+floorRun ∷ Column → Int64 → M (Maybe (Int64, Int64, Replacement))
 floorRun col z = M $ \_ p s → case Map.lookup (col, z) (sFloor s) of
   Just r → Right (r, s)
   Nothing → case charge ChargeRead s of
     Left cap → Left (failure (StopCapacity cap) s)
     Right s1 → case fetchFloorRun p col z of
-      Found run@(lo, hi)
+      Found run@(lo, hi, payload)
         | lo <= z && lo < hi →
             Right
               ( Just run
               , s1
                   { sFloor = Map.insert (col, z) (Just run) (sFloor s1)
-                  , sCache = Map.insert (KeyRun col lo) (Just (RecRun hi)) (sCache s1)
+                  , sCache = Map.insert (KeyRun col lo) (Just (runRecord hi payload)) (sCache s1)
                   }
               )
         | otherwise → Left (failure (StopCorrupt (BadFloor col z)) s1)
@@ -437,8 +449,9 @@ delRec key = stage key Nothing
 -- The forest
 
 -- | The implicit root of a node with no record: a source component is known
--- exactly when the compiled source calls it exterior; a run is unknown (a run
--- reaching the top boundary is made known by its own obligation).
+-- exactly when the compiled source calls it exterior; an air run and a narrowed
+-- cell's void are unknown (one reaching the top boundary is made known by its
+-- own obligation).
 implicitRoot ∷ Node → M Root
 implicitRoot node = case node of
   SrcNode key → do
@@ -447,6 +460,7 @@ implicitRoot node = case node of
       Nothing → corrupt (UnknownComponent key)
       Just ext → pure (Root 1 ext)
   RunNode _ _ → pure (Root 1 False)
+  CellNode _ _ → pure (Root 1 False)
 
 -- | The root of a node's class and the root's value. Reads at most
 -- 'findReadsBound' records.
@@ -498,39 +512,51 @@ markKnown node = do
 -- ---------------------------------------------------------------------------
 -- Cells now
 
--- | What a tile holds now: a removed run (named by its lower level) or its
--- source cell.
-data CellNow = NowRemoved !Int64 | NowSource !Cell
+-- | What a tile holds now: an air run (named by its lower level), a cell limited
+-- to a corner mask of its source material (the cell as it now reads), or its
+-- source cell. A mask over a level whose source cell is air reads as the source
+-- cell, as it does in "Hetoimasia.Terrain.Changes".
+data CellNow = NowRemoved !Int64 | NowNarrowed !Cell | NowSource !Cell
 
 cellNow ∷ TileCoord → M CellNow
 cellNow tile@(TileCoord x y z) = do
   env ← askEnv
   r ← floorRun (Column x y) (axisValue z)
+  let source = cellAt (envSource env) emptyChanges tile
   pure $ case r of
-    Just (lo, hi) | axisValue z < hi → NowRemoved lo
-    _ → NowSource (cellAt (envSource env) emptyChanges tile)
+    Just (lo, hi, payload) | axisValue z < hi → case payload of
+      ReplaceAir → NowRemoved lo
+      ReplaceMask mask → maybe (NowSource source) (\(material, _) → NowNarrowed (cornerCell material mask)) (cellOccupant source)
+    _ → NowSource source
+
+-- | The openings of a cell as the geometry sees it.
+cellOpenings ∷ Cell → CellOpenings
+cellOpenings = maybe airOpenings keyOpenings . cellShapeKey
 
 openingsOf ∷ CellNow → CellOpenings
 openingsOf (NowRemoved _) = airOpenings
-openingsOf (NowSource cell) = maybe airOpenings keyOpenings (cellShapeKey cell)
+openingsOf (NowNarrowed cell) = cellOpenings cell
+openingsOf (NowSource cell) = cellOpenings cell
 
--- | The node of one void of a tile's current content.
+-- | Whether a tile holds solid now.
+occupiedNow ∷ CellNow → Bool
+occupiedNow (NowRemoved _) = False
+occupiedNow (NowNarrowed _) = True
+occupiedNow (NowSource cell) = isJust (cellShapeKey cell)
+
+-- | The node of one void of a tile's current content. A narrowed cell has at
+-- most one void, so it has the one node named by its own level.
 nodeOf ∷ Env → TileCoord → CellNow → Int → Maybe Node
 nodeOf _ (TileCoord x y _) (NowRemoved lo) _ = Just (RunNode (Column x y) lo)
+nodeOf _ (TileCoord x y z) now@(NowNarrowed _) index
+  | index == 0 && not (null (cellComponents (openingsOf now))) = Just (CellNode (Column x y) (axisValue z))
+  | otherwise = Nothing
 nodeOf env tile (NowSource _) index = case lookupVoid (envConn env) tile index of
   InComponent key → Just (SrcNode key)
   _ → Nothing
 
 -- ---------------------------------------------------------------------------
--- The connections of a removal
-
--- | The node of the run holding a removed cell.
-runNodeOf ∷ TileCoord → M Node
-runNodeOf tile@(TileCoord x y z) = do
-  r ← floorRun (Column x y) (axisValue z)
-  case r of
-    Just (lo, hi) | axisValue z < hi → pure (RunNode (Column x y) lo)
-    _ → corrupt (ObligationNotRemoved tile)
+-- The connections of an edit
 
 -- | What inspecting one connection did.
 data EdgeEffect = EdgeNone | EdgeAlready | EdgeJoined | EdgeMarked
@@ -540,32 +566,41 @@ data EdgeResult = EdgeResult
   , edgeNewlyKnown ∷ [Node]
   }
 
--- | Inspect connection @slot@ (1 to 6, in 'cellFaces' order) of a removal. A
--- face joins the cell's run to every component of the neighbour whose portal
--- overlaps the full face over positive area, or marks the class known when the
--- face is the upper boundary of the world. The X and Y limits and the lower
--- boundary open nothing. Slot 0, the cell's own old void, is joined when the
--- removal is staged.
+-- | Inspect connection @slot@ (1 to 6, in 'cellFaces' order) of an edit. A face
+-- joins the edited cell's void to every component of the neighbour whose portal
+-- overlaps one of the cell's own portals over positive area, both read from what
+-- the two cells hold now, or marks the class known when the face is the upper
+-- boundary of the world and the cell is open there. An edge or point contact, the
+-- X and Y limits and the lower boundary open nothing. Slot 0, the cell's own old
+-- void, is joined when the edit is staged.
 inspectEdge ∷ TileCoord → Int → M EdgeResult
 inspectEdge tile slot = do
   env ← askEnv
-  me ← runNodeOf tile
-  let face = cellFaces !! (slot - 1)
+  me ← cellNow tile
+  case me of
+    NowSource _ → corrupt (ObligationNotEdited tile)
+    _ → pure ()
+  let ours = openingsOf me
+      face = cellFaces !! (slot - 1)
   case neighbourTile face tile of
     Left _
-      | face == TopFace → do
-          newly ← markKnown me
-          pure (EdgeResult (if null newly then EdgeAlready else EdgeMarked) newly)
+      | face == TopFace → case [portalComponent p | p ← portalsOn TopFace ours, openingArea (portalOpening p) > 0] of
+          index : _ → case nodeOf env tile me index of
+            Nothing → corrupt (ConnectionWithoutComponent tile)
+            Just node → do
+              newly ← markKnown node
+              pure (EdgeResult (if null newly then EdgeAlready else EdgeMarked) newly)
+          [] → pure (EdgeResult EdgeNone [])
       | otherwise → pure (EdgeResult EdgeNone [])
     Right nb → do
       now ← cellNow nb
-      let connections = connectCells tile airOpenings nb (openingsOf now)
-          indices = nub [componentRefIndex (connectionTo c) | c ← connections]
-          nodes = mapMaybe (nodeOf env nb now) indices
-      if length nodes /= length indices
+      let connections = connectCells tile ours nb (openingsOf now)
+          pairs = nub [(componentRefIndex (connectionFrom c), componentRefIndex (connectionTo c)) | c ← connections]
+          nodes = [(a, b) | (i, j) ← pairs, Just a ← [nodeOf env tile me i], Just b ← [nodeOf env nb now j]]
+      if length nodes /= length pairs
         then corrupt (ConnectionWithoutComponent nb)
         else do
-          results ← mapM (unionNodes me) nodes
+          results ← mapM (uncurry unionNodes) nodes
           let flips = concat [ns | Joined ns ← results]
               joined = not (null [() | Joined _ ← results])
           pure $
@@ -713,19 +748,29 @@ capsOf limits allow hdr =
     , capBase = headerBytes + hBytes hdr
     }
 
--- | The figure a resource needs for one minimal step (an edit or one update) and
--- the figure available, for a typed refusal.
-capacityFigures ∷ Bool → DiscoveryLimits → Caps → Capacity → (Int, Int)
-capacityFigures forEdit limits caps cap = case cap of
-  CapacityReads → (if forEdit then worstEditReads else worstEdgeReads, capReads caps)
-  CapacityWrites → (if forEdit then worstEditWrites else worstEdgeWrites, capWrites caps)
-  CapacityDeltaBytes → (if forEdit then minimumDeltaBytes else headerBytes + worstEdgeBytes, capDelta caps)
-  CapacityScratchBytes → (if forEdit then worstEditScratch else worstEdgeScratch, capScratch caps)
+-- | The operation a capacity figure is for.
+data Work = WorkRemoval | WorkNarrowing | WorkEdge
+
+-- | The figure a resource needs for one minimal step (a removal, a narrowing or
+-- one update) and the figure available, for a typed refusal. A removal's figures
+-- are those of a history without narrowed cells; one that holds them needs at
+-- most the narrowing's.
+capacityFigures ∷ Work → DiscoveryLimits → Caps → Capacity → (Int, Int)
+capacityFigures work limits caps cap = case cap of
+  CapacityReads → (figure worstEditReads worstNarrowReads worstEdgeReads, capReads caps)
+  CapacityWrites → (figure worstEditWrites worstNarrowWrites worstEdgeWrites, capWrites caps)
+  CapacityDeltaBytes → (figure (worstEditBytes + headerBytes) minimumDeltaBytes (headerBytes + worstEdgeBytes), capDelta caps)
+  CapacityScratchBytes → (figure worstEditScratch worstNarrowScratch worstEdgeScratch, capScratch caps)
   CapacityRetainedBytes → (minimumRetainedBytes, capRetained caps)
   CapacityObligations → (1, limitPendingObligations limits)
+  where
+    figure removal narrowing edge = case work of
+      WorkRemoval → removal
+      WorkNarrowing → narrowing
+      WorkEdge → edge
 
 -- ---------------------------------------------------------------------------
--- Staging a removal
+-- Staging an edit
 
 -- | The result of staging a removal.
 data StageOutcome
@@ -739,87 +784,187 @@ data StageOutcome
     EditSuspended !RecordKey
   deriving stock (Eq, Show)
 
--- | Stage the removal of one whole cell, ramp included, together with its
--- connection obligation. Removing air or a cell already removed is
--- 'NoChange'. Merging with the runs above and below keeps every earlier alias
+-- | The result of staging a narrowing.
+data NarrowOutcome
+  = -- | The cell the model resolves from its own records and the target are not a
+    -- narrowing: the cell is air, a side identity other than 0, a corner solid
+    -- with mask 0, or the target equals its corners or sets one it does not have.
+    -- Nothing was staged: no record, obligation or revision, and not a
+    -- suspension.
+    NarrowRefused
+  | -- | The complete paired delta, as for a removal.
+    NarrowStaged !Candidate
+  | -- | A required record has not been supplied. Nothing was staged.
+    NarrowSuspended !RecordKey
+  deriving stock (Eq, Show)
+
+-- | The shared result of staging an edit.
+data EditOutcome = EditNothing | EditStaged !Candidate | EditWaits !RecordKey
+
+-- | Stage the removal of one whole cell, ramp or narrowed cell included, together
+-- with its connection obligation. Removing air or a cell already removed is
+-- 'NoChange'. Merging with the air runs above and below keeps every earlier alias
 -- valid: a run that loses its key is joined to the run that takes its place, in
--- the same candidate. Every read and every staged write is checked against the
--- limits and the allowance before it is made.
+-- the same candidate, and a narrowed cell's void is joined to the air that
+-- replaces it. Every read and every staged write is checked against the limits
+-- and the allowance before it is made.
 stageRemoval ∷ Env → Header → Provider → Allowance → TileCoord → Either Refusal StageOutcome
 stageRemoval env hdr prov allow tile = fst (stageRemovalTraced env hdr prov allow tile)
 
 -- | 'stageRemoval' and the records the provider answered it, whatever the outcome (a suspension included: the records it
 -- resolved before the one it waits for). The outcome is exactly 'stageRemoval''s.
 stageRemovalTraced ∷ Env → Header → Provider → Allowance → TileCoord → (Either Refusal StageOutcome, ReadSet)
-stageRemovalTraced env hdr prov allow tile@(TileCoord ax ay az) =
+stageRemovalTraced env hdr prov allow tile = case stageEdit WorkRemoval removal env hdr prov allow tile of
+  (Left refusal, rs) → (Left refusal, rs)
+  (Right outcome, rs) →
+    ( Right $ case outcome of
+        EditNothing → NoChange
+        EditStaged c → Staged c
+        EditWaits k → EditSuspended k
+    , rs
+    )
+  where
+    removal cell = ReplaceAir <$ cellShapeKey cell
+
+-- | Stage the narrowing of one cell to a corner mask, together with its
+-- connection obligation. Whether the pair is a narrowing is decided by
+-- 'narrowedCell' on the cell the model resolves for the tile from the source and
+-- its own records, never on a cell the caller supplies. A target of mask 0 makes
+-- air, and then the retained runs, joins, obligation and knowledge are those of
+-- the removal of the cell.
+stageNarrowing ∷ Env → Header → Provider → Allowance → TileCoord → CornerMask → Either Refusal NarrowOutcome
+stageNarrowing env hdr prov allow tile target = fst (stageNarrowingTraced env hdr prov allow tile target)
+
+-- | 'stageNarrowing' and the records the provider answered it, whatever the outcome.
+stageNarrowingTraced ∷ Env → Header → Provider → Allowance → TileCoord → CornerMask → (Either Refusal NarrowOutcome, ReadSet)
+stageNarrowingTraced env hdr prov allow tile target = case stageEdit WorkNarrowing narrowing env hdr prov allow tile of
+  (Left refusal, rs) → (Left refusal, rs)
+  (Right outcome, rs) →
+    ( Right $ case outcome of
+        EditNothing → NarrowRefused
+        EditStaged c → NarrowStaged c
+        EditWaits k → NarrowSuspended k
+    , rs
+    )
+  where
+    narrowing cell = do
+      _ ← narrowedCell cell target
+      pure (maybe ReplaceAir (const (ReplaceMask target)) (resolveCorner target))
+
+-- | The record of a run.
+runRecord ∷ Int64 → Replacement → Record
+runRecord hi ReplaceAir = RecRun hi
+runRecord hi (ReplaceMask mask) = RecMaskRun hi mask
+
+-- | The one edit worker. @decide@ is given the cell the tile holds now and
+-- returns what the level becomes, or 'Nothing' when the edit changes nothing.
+-- The level's run is rewritten from the runs it meets, so a split, a coalescing
+-- and a join of the runs on either side are one computation; an air run that
+-- loses its key is joined to the run that takes its place, the new cell's void is
+-- joined to the void the cell held, and the frontier gains the obligation to
+-- inspect the cell's faces.
+stageEdit ∷ Work → (Cell → Maybe Replacement) → Env → Header → Provider → Allowance → TileCoord → (Either Refusal EditOutcome, ReadSet)
+stageEdit work decide env hdr prov allow tile@(TileCoord ax ay az) =
   case runM editM env prov (emptyS caps) of
     Left (Failure (StopCapacity cap) _ _ rs) → (Left (uncurry (CapacityBlocked cap) (editFigures cap)), rs)
-    Left (Failure (StopMissing k) _ _ rs) → (Right (EditSuspended k), rs)
+    Left (Failure (StopMissing k) _ _ rs) → (Right (EditWaits k), rs)
     Left (Failure (StopCorrupt i) _ _ rs) → (Left (Corrupt i), rs)
     Left (Failure StopOverflow _ _ rs) → (Left AuthorityOverflow, rs)
-    Right (Nothing, s) → (Right NoChange, readSetOf s)
+    Right (Nothing, s) → (Right EditNothing, readSetOf s)
     Right (Just (flips, joins), s) → (finish s flips joins, readSetOf s)
   where
     limits = envLimitsField env
     caps = capsOf limits allow hdr
     -- The frontier needs one more obligation than it holds.
     editFigures CapacityObligations = (fromIntegral (pendingObligations hdr) + 1, limitPendingObligations limits)
-    editFigures cap = capacityFigures True limits caps cap
+    editFigures cap = capacityFigures work limits caps cap
     col = Column ax ay
     z = axisValue az
     tailSeq = hTail hdr
     editM ∷ M (Maybe ([Node], Int))
     editM = do
       here ← floorRun col z
-      case here of
-        Just (_, hi) | hi > z → pure Nothing
-        _ → case cellShapeKey (cellAt (envSource env) emptyChanges tile) of
-          Nothing → pure Nothing
-          Just _ → do
-            -- A real change: the frontier must have room and the sequence must
-            -- not wrap, before anything is read or staged for it.
-            if pendingObligations hdr >= fromIntegral (limitPendingObligations limits)
-              then stopWith (StopCapacity CapacityObligations)
-              else pure ()
-            if tailSeq == maxBound then stopWith StopOverflow else pure ()
-            above ← if z + 1 < topExclusive then floorRun col (z + 1) else pure Nothing
-            let below = case here of
-                  Just (lo, hi) | hi == z → Just lo
-                  _ → Nothing
-                up = case above of
-                  Just (lo, hi) | lo == z + 1 → Just hi
-                  _ → Nothing
-            (runKey, merged) ← case (below, up) of
-              (Nothing, Nothing) → do
-                putRec (KeyRun col z) (RecRun (z + 1))
-                pure (z, ([], 0))
-              (Just lo, Nothing) → do
-                putRec (KeyRun col lo) (RecRun (z + 1))
-                pure (lo, ([], 0))
-              (Nothing, Just hi) → do
-                delRec (KeyRun col (z + 1))
-                putRec (KeyRun col z) (RecRun hi)
-                joined ← unionNodes (RunNode col z) (RunNode col (z + 1))
-                pure (z, joinFlips joined)
-              (Just lo, Just hi) → do
-                putRec (KeyRun col lo) (RecRun hi)
-                delRec (KeyRun col (z + 1))
-                joined ← unionNodes (RunNode col lo) (RunNode col (z + 1))
-                pure (lo, joinFlips joined)
-            -- The new full-air cell contains the cell's old void, so the two
-            -- are one space from the start: a cell that was known stays known.
-            (voidFlips, voidJoins) ← case lookupVoid (envConn env) tile 0 of
-              InComponent key → joinFlips <$> unionNodes (RunNode col runKey) (SrcNode key)
-              _ → pure ([], 0)
-            -- The cell is now empty space of its run's class. When that class is
-            -- known the cell is new known space (and exposes new walls): a
-            -- knowledge change even when no class flips, whether the cell
-            -- extended a known run, bridged runs already in one known class or
-            -- joined a known old void.
-            (root, ro) ← findRoot (RunNode col runKey)
-            let gained = [root | rootKnown ro, root `notElem` (fst merged <> voidFlips)]
-            putRec (KeyTodo tailSeq) (RecTodo (Todo tile 1))
-            pure (Just (fst merged <> voidFlips <> gained, snd merged + voidJoins))
+      let cover = case here of
+            Just run@(_, hi, _) | hi > z → Just run
+            _ → Nothing
+          source = cellAt (envSource env) emptyChanges tile
+          effective = case cover of
+            Nothing → source
+            Just (_, _, ReplaceAir) → Air
+            Just (_, _, ReplaceMask mask) → maybe Air (\(material, _) → cornerCell material mask) (cellOccupant source)
+      case decide effective of
+        Nothing → pure Nothing
+        Just payload → do
+          -- A real change: the frontier must have room and the sequence must
+          -- not wrap, before anything is read or staged for it.
+          if pendingObligations hdr >= fromIntegral (limitPendingObligations limits)
+            then stopWith (StopCapacity CapacityObligations)
+            else pure ()
+          if tailSeq == maxBound then stopWith StopOverflow else pure ()
+          above ← if z + 1 < topExclusive then floorRun col (z + 1) else pure Nothing
+          -- The run that ends at the level: the floor answer when the level is
+          -- free, and one more lookup below a cell that starts its run.
+          below ← case cover of
+            Nothing → pure here
+            Just (lo, _, _) | lo == z && z > bottomLevel → floorRun col (z - 1)
+            _ → pure Nothing
+          let belowRun = [run | Just run@(_, hi, _) ← [below], hi == z]
+              aboveRun = [run | Just run@(lo, _, _) ← [above], lo == z + 1]
+              olds = belowRun <> maybe [] pure cover <> aboveRun
+              pieces =
+                sortOn
+                  (\(lo, _, _) → lo)
+                  ( [(lo, min hi z, q) | (lo, hi, q) ← olds, lo < z]
+                      <> [(z, z + 1, payload)]
+                      <> [(z + 1, hi, q) | (_, hi, q) ← olds, hi > z + 1]
+                  )
+              news = coalescePieces pieces
+              newLos = [lo | (lo, _, _) ← news]
+              runKey = case [lo | (lo, hi, _) ← news, lo <= z, z < hi] of lo : _ → lo; [] → z
+          forM_ olds $ \(lo, _, _) → unless (lo `elem` newLos) (delRec (KeyRun col lo))
+          forM_ news $ \run@(lo, hi, q) → unless (run `elem` olds) (putRec (KeyRun col lo) (runRecord hi q))
+          putRec (KeyTodo tailSeq) (RecTodo (Todo tile 1))
+          let newCell = case payload of
+                ReplaceAir → Air
+                ReplaceMask mask → maybe Air (\(material, _) → cornerCell material mask) (cellOccupant effective)
+              hasVoid = payload == ReplaceAir || not (null (cellComponents (cellOpenings newCell)))
+              target = case payload of
+                ReplaceAir → RunNode col runKey
+                ReplaceMask _ → CellNode col z
+              absorbed = [lo | (lo, _, ReplaceAir) ← olds, lo `notElem` newLos]
+          -- An air run that lost its key joins the run that took its place.
+          merged ←
+            if payload == ReplaceAir
+              then mapM (\lo → joinFlips <$> unionNodes (RunNode col runKey) (RunNode col lo)) absorbed
+              else pure []
+          -- The new cell contains the void the cell held, so the two are one
+          -- space from the start: a cell that was known stays known. A cell that
+          -- was never edited held its source void; a narrowed one holds a void of
+          -- its own, which an air replacement now contains.
+          held ←
+            if not hasVoid
+              then pure []
+              else case cover of
+                Nothing → case lookupVoid (envConn env) tile 0 of
+                  InComponent key → (: []) . joinFlips <$> unionNodes target (SrcNode key)
+                  _ → pure []
+                Just _
+                  | payload == ReplaceAir → (: []) . joinFlips <$> unionNodes target (CellNode col z)
+                  | otherwise → pure []
+          let flips = concatMap fst (merged <> held)
+              joins = sum (map snd (merged <> held))
+          -- The cell is now empty space of its class. When that class is known
+          -- the cell is new known space (and exposes new walls): a knowledge
+          -- change even when no class flips, whether the cell extended a known
+          -- run, bridged runs already in one known class, joined a known old void
+          -- or widened a known narrowed cell's void.
+          gained ←
+            if not hasVoid
+              then pure []
+              else do
+                (root, ro) ← findRoot target
+                pure [root | rootKnown ro, root `notElem` flips]
+          pure (Just (flips <> gained, joins))
     joinFlips AlreadyJoined = ([], 0)
     joinFlips (Joined ns) = (ns, 1)
     finish s flips joins = do
@@ -844,7 +989,15 @@ stageRemovalTraced env hdr prov allow tile@(TileCoord ax ay az) =
               , reportNewlyKnown = flips
               , reportPendingAfter = pendingObligations next
               }
-      pure (Staged (Candidate (hAuthority hdr) next writes True (gainsKnowledge flips) report))
+      pure (EditStaged (Candidate (hAuthority hdr) next writes True (gainsKnowledge flips) report))
+
+-- | Merge each run with the next when they touch and carry the same payload. The
+-- input is ascending and disjoint.
+coalescePieces ∷ [(Int64, Int64, Replacement)] → [(Int64, Int64, Replacement)]
+coalescePieces ((a, b, p) : (c, d, q) : rest)
+  | b == c && p == q = coalescePieces ((a, d, p) : rest)
+coalescePieces (piece : rest) = piece : coalescePieces rest
+coalescePieces [] = []
 
 -- ---------------------------------------------------------------------------
 -- Discovery batches
@@ -931,7 +1084,7 @@ stepDiscoveryTraced env hdr0 prov allow
     conclude acc halt failed
       | accUpdates acc == 0 = case halt of
           HaltSuspended k → (Right (Stalled k), failed)
-          HaltCapacity cap → (Left (uncurry (CapacityBlocked cap) (capacityFigures False limits caps cap)), noReads)
+          HaltCapacity cap → (Left (uncurry (CapacityBlocked cap) (capacityFigures WorkEdge limits caps cap)), noReads)
           _ → (Right Idle, noReads)
       | otherwise = (build acc halt, readSetOf (accS acc))
     build acc halt = do
@@ -1013,6 +1166,12 @@ retainedProvider = recordProvider . rRecords
 retainedBytes ∷ Retained → Int
 retainedBytes r = headerBytes + hBytes (rHeader r)
 
+-- | The end and payload of a run record.
+runPayload ∷ Record → Maybe (Int64, Replacement)
+runPayload (RecRun hi) = Just (hi, ReplaceAir)
+runPayload (RecMaskRun hi mask) = Just (hi, ReplaceMask mask)
+runPayload _ = Nothing
+
 -- | A provider over a map of records: exact lookups and a floor lookup over
 -- the runs of a column.
 recordProvider ∷ Map RecordKey Record → Provider
@@ -1020,16 +1179,28 @@ recordProvider m =
   Provider
     { fetchRecord = \k → maybe Absent Found (Map.lookup k m)
     , fetchFloorRun = \col z → case Map.lookupLE (KeyRun col z) m of
-        Just (KeyRun c lo, RecRun hi) | c == col → Found (lo, hi)
+        Just (KeyRun c lo, record) | c == col, Just (hi, payload) ← runPayload record → Found (lo, hi, payload)
         _ → Absent
     }
 
--- | The retained removed runs as validated intervals, for the existing
--- removal-based consumers ('Hetoimasia.Terrain.Changes.changesFromIntervals').
+-- | The retained air runs as validated intervals, for the existing removal-based
+-- consumers ('Hetoimasia.Terrain.Changes.changesFromIntervals'). A run that
+-- limits its levels to a corner mask is not removed and is in none of them: a
+-- consumer reading these intervals reads every one as air.
 retainedRemovals ∷ Retained → [(Column, ZRange)]
 retainedRemovals r =
   [ (col, range)
   | (KeyRun col lo, RecRun hi) ← Map.toAscList (rRecords r)
+  , Right range ← [mkZRange (toInteger lo) (toInteger hi)]
+  ]
+
+-- | Every retained run, air or mask, in ascending order of column and level: the
+-- tagged form of "Hetoimasia.Terrain.Changes".
+retainedReplacements ∷ Retained → [(Column, ZRange, Replacement)]
+retainedReplacements r =
+  [ (col, range, payload)
+  | (KeyRun col lo, record) ← Map.toAscList (rRecords r)
+  , Just (hi, payload) ← [runPayload record]
   , Right range ← [mkZRange (toInteger lo) (toInteger hi)]
   ]
 
@@ -1056,8 +1227,8 @@ applyCandidate c (Retained h records)
     write m (k, Nothing) = Map.delete k m
 
 -- | Rebuild a retained value from a header and records, checking that they are
--- a legitimate state: kinds match their keys, runs are disjoint and not
--- adjacent, forest chains are short and end at a stored root, obligations are
+-- a legitimate state: kinds match their keys, runs are disjoint and no two that
+-- touch carry the same payload, forest chains are short and end at a stored root, obligations are
 -- exactly the sequences the header names and the byte total matches.
 retainedFromRecords ∷ Header → [(RecordKey, Record)] → Either Integrity Retained
 retainedFromRecords h entries = do
@@ -1071,13 +1242,14 @@ retainedFromRecords h entries = do
   where
     kindOk (k, r) = case (k, r) of
       (KeyRun _ lo, RecRun hi) | lo >= bottomLevel && lo < hi && hi <= topExclusive → Right ()
+      (KeyRun _ lo, RecMaskRun hi mask) | lo >= bottomLevel && lo < hi && hi <= topExclusive && cornerMaskValue mask /= 0 → Right ()
       (KeyLink _, RecRoot (Root size _)) | size >= 1 → Right ()
       (KeyLink node, RecChild parent) | parent /= node → Right ()
       (KeyTodo _, RecTodo (Todo _ done)) | done >= 1 && done < edgeCount → Right ()
       _ → Left (MalformedRecord k)
     runsOk m =
-      let runs = [(col, lo, hi) | (KeyRun col lo, RecRun hi) ← Map.toAscList m]
-          bad = [KeyRun c2 l2 | ((c1, _, h1), (c2, l2, _)) ← zip runs (drop 1 runs), c1 == c2, l2 <= h1]
+      let runs = [(col, lo, hi, payload) | (KeyRun col lo, record) ← Map.toAscList m, Just (hi, payload) ← [runPayload record]]
+          bad = [KeyRun c2 l2 | ((c1, _, h1, p1), (c2, l2, _, p2)) ← zip runs (drop 1 runs), c1 == c2, l2 < h1 || (l2 == h1 && p1 == p2)]
        in case bad of
             (k : _) → Left (MalformedRecord k)
             [] → Right ()
@@ -1127,7 +1299,8 @@ nodeKnown node = rootKnown . snd <$> findRoot node
 queryNodeClass ∷ Env → Provider → Node → Observed Node
 queryNodeClass env prov node = runQuery env prov (fst <$> findRoot node)
 
--- | Whether a tile is currently removed.
+-- | Whether a tile is currently air by removal. A narrowed cell still holds solid
+-- and is not removed.
 queryRemoved ∷ Env → Provider → TileCoord → Observed Bool
 queryRemoved env prov tile = runQuery env prov $ do
   now ← cellNow tile
@@ -1221,7 +1394,7 @@ presentation (CellKnowledge solid void) = case (solid, void) of
   (NoSolid, VoidUnknown) → FullyUnknown
   _ → Ordinary
 
--- | What is known of a tile, from the source, the retained removals and the
+-- | What is known of a tile, from the source, the retained replacements and the
 -- retained knowledge alone. Residency, materialization and camera motion are
 -- not inputs. A required record the provider has not supplied is
 -- 'MissingRecord', never unknown.
@@ -1229,13 +1402,11 @@ queryCell ∷ Env → Provider → TileCoord → Observed CellKnowledge
 queryCell env prov tile = runQuery env prov $ do
   now ← cellNow tile
   voidKnown ← knownVoid env tile now
-  case now of
-    NowRemoved _ → pure (CellKnowledge NoSolid voidKnown)
-    NowSource cell → case cellShapeKey cell of
-      Nothing → pure (CellKnowledge NoSolid voidKnown)
-      Just _ → do
-        solid ← solidKnown env tile now (voidKnown == VoidKnown)
-        pure (CellKnowledge (if solid then SolidKnown else SolidUnknown) voidKnown)
+  if occupiedNow now
+    then do
+      solid ← solidKnown env tile now (voidKnown == VoidKnown)
+      pure (CellKnowledge (if solid then SolidKnown else SolidUnknown) voidKnown)
+    else pure (CellKnowledge NoSolid voidKnown)
 
 knownVoid ∷ Env → TileCoord → CellNow → M VoidKnowledge
 knownVoid env tile now = case nodeOf env tile now 0 of

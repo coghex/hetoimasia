@@ -193,6 +193,8 @@ module Hetoimasia.Terrain.Discovery
   , worstEdgeWrites
   , worstEditReads
   , worstEditWrites
+  , worstNarrowReads
+  , worstNarrowWrites
   , maxRecordBytes
   , headerBytes
   , minimumDeltaBytes
@@ -245,6 +247,9 @@ module Hetoimasia.Terrain.Discovery
   , StageOutcome (..)
   , stageRemoval
   , stageRemovalTraced
+  , NarrowOutcome (..)
+  , stageNarrowing
+  , stageNarrowingTraced
   , Halt (..)
   , Step (..)
   , stepDiscovery
@@ -259,6 +264,7 @@ module Hetoimasia.Terrain.Discovery
   , retainedProvider
   , retainedBytes
   , retainedRemovals
+  , retainedReplacements
   , retainedFromRecords
   , ApplyError (..)
   , applyCandidate

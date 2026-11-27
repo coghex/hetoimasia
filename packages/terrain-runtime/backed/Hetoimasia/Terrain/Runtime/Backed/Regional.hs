@@ -60,7 +60,7 @@ import qualified Data.Map.Strict as Map
 import qualified Data.Text as Text
 import Data.Word (Word64)
 import Hetoimasia.Terrain.Cell (Column)
-import Hetoimasia.Terrain.Changes (runsMeetingLevels)
+import Hetoimasia.Terrain.Changes (Replacement (..), runsMeetingLevels)
 import Hetoimasia.Terrain.Coordinate (RegionCoord, TileCoord)
 import qualified Hetoimasia.Terrain.Discovery as D
 import Hetoimasia.Terrain.Runtime.Backed.Backend (Closing, Handling (..))
@@ -290,5 +290,5 @@ ownGatherOf b window region =
    in gatherOnPin (bToken b) (bVersion b) window (bRefused b) (length cols * runsMeetingLevels (34 ∷ Int)) cols
 
 -- | The runs of each column, for a plan.
-runsByColumn ∷ [(Column, Int64, Int64)] → Map Column [(Int64, Int64)]
-runsByColumn runs = Map.map reverse (Map.fromListWith (<>) [(c, [(lo, hi)]) | (c, lo, hi) ← runs])
+runsByColumn ∷ [(Column, Int64, Int64)] → Map Column [(Int64, Int64, Replacement)]
+runsByColumn runs = Map.map reverse (Map.fromListWith (<>) [(c, [(lo, hi, ReplaceAir)]) | (c, lo, hi) ← runs])
