@@ -25,7 +25,7 @@ transactional ownership, revisions and live offload (TRA-4), Lua copying
 | `Hetoimasia.Terrain.Discovery` | The pure discovery model: retained removed runs, a connectivity forest with known/unknown classes, paired removal-plus-obligation candidates, bounded resumable discovery batches, knowledge queries, replay from records, validated limits and allowances |
 | `Hetoimasia.Terrain.Cell` | Authored materials, the air-or-solid cell value, half-open Z intervals, columns |
 | `Hetoimasia.Terrain.Source` | The declarative layered source: definition, validation, limits and byte accounting |
-| `Hetoimasia.Terrain.Changes` | Retained removals: canonical intervals, whole-cell removal, merge and restore |
+| `Hetoimasia.Terrain.Changes` | Retained replacements: tagged air and corner-mask runs, whole-cell removal, conditional narrowing, merge and restore |
 | `Hetoimasia.Terrain.Query` | Cell, complete column-range and highest-occupied queries over source plus changes |
 | `Hetoimasia.Terrain.Palette` | The 12-bit material palette and the 17-bit tagged packed cell |
 | `Hetoimasia.Terrain.Segment` | One known segment of at most 32 levels in uniform, runs or dense encoding |
@@ -504,25 +504,53 @@ whether or not any cell is resident and does not depend on request order.
   `ShapeKey` (`occupiedShape`), or `Nothing` for an empty column.
 
 Every query steps from one interval boundary to the next across the source's
-layers, the column's patches and its removed intervals, so a long stretch of air,
-solid or removed cells is one step however many levels it spans: cost follows the
+layers, the column's patches and its replacement runs, so a long stretch of air,
+solid or replaced cells is one step however many levels it spans: cost follows the
 intervals met, never the levels between them, and no cell is allocated for them.
 
-## Retained removals
+## Retained replacements
 
-`Changes` holds, per column, a sorted, disjoint, coalesced set of removed-cell
-intervals. It is not an operation log. `removeCell` removes the whole cell,
-whatever shape it had (a ramp included), and reshapes no neighbour. Removing air
-or a cell already removed returns `removeChanged = False` and the very value that
-was passed in; any other removal grows or joins an interval, so adjacent removals
-coalesce whatever their order. A caller-supplied `ChangeLimits` bounds the
-retained intervals, and an excess is a typed refusal (`TooManyRemovedIntervals`)
-that leaves the previous value untouched. `emptyChanges` is a fresh session;
-`mergeChanges` is the symmetric, associative union an offload needs, and
-`changesFromIntervals` restores canonical changes from unordered, overlapping
-intervals. `changesBytes` accounts 16 bytes per interval and 48 per column index
-entry. The revision counter, admission reservation and cancellation arbitration
-around a commit belong to TRA-4.
+`Changes` holds, per column, a sorted, disjoint set of half-open level runs, each
+tagged `ReplaceAir` or `ReplaceMask` with a nonzero corner mask. Adjacent runs
+with the same tag coalesce; an edit inside a run splits it and changes no other
+level. It is not an operation log. A mask run limits each of its levels to that
+mask of the level's own source material, so a run across a material boundary
+reads each level with its own material, and a level whose source cell is air
+stays air under any tag: a replacement never creates material. Every read of a
+cell, column range, surface or materialization resolves the same effective cell.
+
+`removeCell` removes the whole cell, whatever it held (a ramp or a narrowed cell
+included), reshapes no neighbour and gives the level the air tag. Removing air or
+a cell already removed returns `removeChanged = False` and the very value that
+was passed in.
+
+`narrowCell limits source tile expected target changes` is the conditional edit.
+The expected cell is side 0 or a corner solid with a nonzero mask; side 0 counts
+as corners 15 for the subset check alone, so side 0 and corner 15 stay different
+observations. The target must be a strict subset of the observed corners, and
+the result keeps the observed material: air for target 0, otherwise a corner
+solid (`narrowedCell` names it). A pair that is no narrowing is `InvalidNarrowing`,
+decided before the current cell is read. A well-formed pair whose expected cell
+differs from the current one in material, family or value, a removed cell and a
+repeated request included, is `StaleObservation`. A result over the limit is
+`NarrowTooManyRuns`. Every refusal leaves the previous value untouched, and a
+success always changes the cell.
+
+`ChangeLimits` bounds, and `changeIntervalCount` and `changesBytes` count, the
+retained runs of either tag. `changesBytes` accounts 48 bytes per column entry,
+16 per air run and 24 per mask run. `changeIntervalBytes`, `changeColumnBytes` and
+`runsMeetingLevels` (`levels / 2 + 1`) describe an overlay of air runs only, as
+every removal-only client builds one; `replacementRunBytes` and
+`replacementRunsMeetingLevels` (one per level) bound any overlay.
+
+`removedIntervals` and `removedColumns` report the air runs alone, so a client
+that rebuilds changes from them with `changesFromIntervals` never reads a
+narrowed level as removed; `replacementRuns` and `replacedColumns` report both
+tags. `mergeChanges` is the symmetric, associative, idempotent union an offload
+needs, with `emptyChanges` as identity: a level replaced by both overlays keeps
+the corners both leave set (air wins, masks meet bitwise). `emptyChanges` is a
+fresh session. The revision counter, admission reservation and cancellation
+arbitration around a commit belong to the service that owns the overlay.
 
 ## Source connectivity
 
