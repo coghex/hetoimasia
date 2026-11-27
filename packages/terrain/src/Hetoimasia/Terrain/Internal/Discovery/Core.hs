@@ -427,7 +427,7 @@ floorRun col z = M $ \_ p s → case Map.lookup (col, z) (sFloor s) of
     Left cap → Left (failure (StopCapacity cap) s)
     Right s1 → case fetchFloorRun p col z of
       Found run@(lo, hi, payload)
-        | lo <= z && lo < hi && validPayload payload →
+        | lo <= z && lo < hi && lo >= bottomLevel && hi <= topExclusive && validPayload payload →
             Right
               ( Just run
               , s1

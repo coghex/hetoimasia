@@ -280,6 +280,16 @@ openingsSpec = describe "a sealed space under a narrowed cell" $ do
     case (removal, zero) of
       (Right (Staged a), Right (NarrowStaged b)) → a `shouldBe` b
       other → expectationFailure (show other)
+  it "keeps an authored cell's known void known from the edit, before any face is inspected" $ do
+    let w = world [PatchSpec 2 2 3 4 (SpecCorner "stone" 5)]
+        env = worldEnv w
+        queued = narrowTo env fresh (2, 2, 3) 1
+        voidAt ret = cellVoid (knowledgeOf env ret (2, 2, 3))
+    voidAt fresh `shouldBe` VoidKnown
+    -- the edit has staged its obligation and inspected nothing, yet the widened void is still the known one
+    pendingObligations (retainedHeader queued) `shouldBe` 1
+    voidAt queued `shouldBe` VoidKnown
+    knownVoids w (drain env queued) `shouldBe` oracleKnown w (oracleChanges w [Narrow (2, 2, 3) 1])
   it "joins a narrowed cell's void into the air that replaces it" $ do
     let w = pocketWorld
         env = worldEnv w
@@ -633,6 +643,16 @@ accountingSpec = describe "the bytes of an edit" $ do
     case observedValue (queryCell env broken (mustTile 2 2 3)) of
       Left (Inconsistent (BadFloor c _)) → c `shouldBe` col
       other → expectationFailure (show other)
+  it "refuses a floor answer outside the supported levels, so a staged run can always be restored" $ do
+    let col = columnOf 2 2
+        top = fromInteger topEnd
+        outside run = Provider {fetchRecord = const Absent, fetchFloorRun = \_ _ → Found run}
+    mapM_
+      ( \run → case stageNarrowing env (retainedHeader fresh) (outside run) (allowance env) (mustTile 2 2 1) (mask 1) of
+          Left (Corrupt (BadFloor c _)) → c `shouldBe` col
+          other → expectationFailure (show run <> ": " <> show other)
+      )
+      [(0, top + 1, ReplaceMask (mask 5)), (negate top - 1, 4, ReplaceMask (mask 5)), (0, top + 1, ReplaceAir)]
 
 limitSpec ∷ Spec
 limitSpec = describe "the figures of an edit" $ do
