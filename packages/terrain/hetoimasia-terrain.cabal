@@ -110,6 +110,7 @@ test-suite terrain-tests
         Test.Terrain.Geometry
         Test.Terrain.Growth
         Test.Terrain.Model
+        Test.Terrain.Narrowing
         Test.Terrain.Opacity
         Test.Terrain.Opening
         Test.Terrain.Query
