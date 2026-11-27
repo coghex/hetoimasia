@@ -14,9 +14,10 @@
 module Test.TerrainRuntime.Backed.Ranges (spec) where
 
 import Control.Concurrent.STM
-import Control.Exception (SomeException, finally, try)
+import Control.Exception (finally)
 import Control.Monad (forM_)
 import Data.List (nub)
+import Data.Maybe (isJust)
 import qualified Data.Map.Strict as Map
 import Hetoimasia.Terrain.Changes (changeColumnBytes, replacementRunBytes)
 import Hetoimasia.Terrain.Cell (Cell (..))
@@ -165,15 +166,17 @@ spec = describe "What a request keeps of a column" $ do
   it "rebuilds every run a column read gathers whatever the edit bank is" $ do
     let spec' = LimitsSpec {specResidentBytes = 256 * 1048576, specEditBytes = 72, specStagingBytes = 128 * 1048576, specLoadJobs = 128, specQueuedCommands = 256, specPinsPerView = 2, specAgingQuanta = 8, specQueryRegions = 257, specExtentX = 16, specExtentY = 16, specExtentZ = 32, specHoldRegions = 256, specCameraRegions = 16384}
         config = defaultConfig {configLimits = either (error . show) id (mkLimits spec')}
-        source = layered [(Just 0, Just 8, "stone", 0)] [PatchSpec 3 3 (2 * k) (2 * k + 1) SpecAir | k ← [0 .. 3]]
+        -- solid stone at every level 0 to 7, so each removal below changes a cell
+        source = layered [(Just 0, Just 8, "stone", 0)] []
     withServiceUsing config alwaysAdmitting (Probe (const (pure ()))) $ \svc → do
       client ← okOf (registerClient svc)
       lease ← okOf (openArena svc client "small" source) >>= await svc >>= expectSuccess
-      removed ← mapM (\z → try (removeCell' svc lease (tile 3 3 z)) ∷ IO (Either SomeException RemoveAnswer)) [0, 2, 4, 6]
-      -- every removal that committed is read back whole
+      changed ← mapM (\z → removeChangedFlag <$> removeCell' svc lease (tile 3 3 z)) [0, 2, 4, 6]
+      changed `shouldBe` [True, True, True, True]
+      -- the four removed runs are read back whole, with the stone between them
       answer ← okOf (columnAt svc lease (column 3 3) (range 0 8)) >>= bounded . await svc >>= expectSuccess
-      [(zRangeLo (runRange r), zRangeHi (runRange r), cellMaterial (runCell r)) | r ← columnAnswerRuns answer] `shouldSatisfy` (not . null)
-      length [() | Right _ ← removed] `shouldSatisfy` (>= 1)
+      [(zRangeLo (runRange r), zRangeHi (runRange r), isJust (cellMaterial (runCell r))) | r ← columnAnswerRuns answer]
+        `shouldBe` [(0, 1, False), (1, 2, True), (2, 3, False), (3, 4, True), (4, 5, False), (5, 6, True), (6, 7, False), (7, 8, True)]
 
   -- column (3, 4): sixteen separate removed runs, at the even levels 0 to 30 of its region; a load reads
   -- every column it touches over the region's 32 levels, whatever it covers of it

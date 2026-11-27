@@ -35,6 +35,7 @@ import Hetoimasia.Terrain.Connectivity (Axis (..), ComponentKey, keyParameters, 
 import Hetoimasia.Terrain.Coordinate (AxisCoord, axisFromInteger)
 import Hetoimasia.Terrain.Discovery (Authority (..), Header (..), Node (..), ReadSet (..), Record (..), RecordKey (..), Root (..), Todo (..), headerBytes, maxBatchUpdates, worstEdgeReads)
 import Hetoimasia.Terrain.Residency (ArenaId (..), Revision (..))
+import Hetoimasia.Terrain.Shape (CornerMask, mkCornerMask)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Format
 import Hetoimasia.Terrain.Runtime.Store.Internal.Page
 import Hetoimasia.Terrain.Runtime.Store.Admission (worstTransactionCharge)
@@ -107,22 +108,37 @@ compKey p i = fromMaybe (error "component key") (mkComponentKey (tileAt (big i) 
 runNode ∷ Int → Node
 runNode i = RunNode (columnAt (big i) (big (i + 1))) (fromInteger (big (i + 2)))
 
+-- | The void of a narrowed cell, named like a run node.
+cellNode ∷ Int → Node
+cellNode i = CellNode (columnAt (big i) (big (i + 1))) (fromInteger (big (i + 2)))
+
+-- | A corner mask from 1 to 15 by the number, so that both a one-bit and a four-bit mask are held.
+maskOf ∷ Int → CornerMask
+maskOf i = either (error . show) id (mkCornerMask (1 + i `mod` 15))
+
+-- | A floor answer of either tag, at the largest ends.
+floorAnswer ∷ Int → (Int64, Int64, Replacement)
+floorAnswer i = (fromInteger (big i), fromInteger (big (i + 1)), if odd (i `div` 2) then ReplaceMask (maskOf i) else ReplaceAir)
+
 -- | Every kind of record key, and every kind of record, as a function of a distinct number.
 keyKinds ∷ [(String, Int → RecordKey)]
 keyKinds =
   [("run key", \i → runKey (big i) (big (i + 1)) (big (i + 2)))]
     <> [("source-node key, " <> show p <> " parameters", \i → KeyLink (SrcNode (compKey p i))) | p ← [0 .. 3]]
     <> [ ("run-node key", \i → KeyLink (runNode i))
+       , ("cell-node key", \i → KeyLink (cellNode i))
        , ("todo key", \i → KeyTodo (fromInteger (big i)))
        ]
 
 recordKinds ∷ [(String, Int → Record)]
 recordKinds =
   [ ("run", \i → RecRun (fromInteger (big i)))
+  , ("mask run", \i → RecMaskRun (fromInteger (big i)) (maskOf i))
   , ("root", \i → RecRoot (Root (fromInteger (big i)) True))
   ]
     <> [("child, source node, " <> show p <> " parameters", \i → RecChild (SrcNode (compKey p (i + 7)))) | p ← [0 .. 3]]
     <> [ ("child, run node", \i → RecChild (runNode (i + 7)))
+       , ("child, cell node", \i → RecChild (cellNode (i + 7)))
        , ("todo", \i → RecTodo (Todo (tileAt (big i) (big (i + 1)) (big (i + 2))) 6))
        ]
 
@@ -192,7 +208,7 @@ spec = describe "the accounted-bytes constants against what is retained (forced 
             <> [("retirement list", \i → ProbeList (fromIntegral i * 4096)), ("nothing a store could read", const ProbeNone)]
       ]
     -- READ FACT, PACKED: the encoded key and value in one map entry. The values a valid fact holds: a record of every kind, the floor
-    -- answer (16 bytes), an absent answer (empty); and the bound itself: a 64-byte key with a 64-byte value, which no valid record reaches
+    -- answer (17 bytes, of either tag), an absent answer (empty); and the bound itself: a 64-byte key with a 64-byte value, which no valid record reaches
     mFact ← lazily "Memory.mFact" $ sequence $
       [ do
           v ← retainedPer nFacts (ints nFacts) id (\is → pure (windowCheckpoint (factsOf (Fingerprint ident0 1 [] []) [] (ReadSet [(kf i, Just (rf i)) | i ← is] [])) (emptyWindow ident0 1))) (\w → evaluate (windowReadFactCount w))
@@ -201,8 +217,8 @@ spec = describe "the accounted-bytes constants against what is retained (forced 
       | (nm, kf, rf) ← validPairs
       ]
         <> [ do
-               v ← retainedPer nFacts (ints nFacts) id (\is → pure (windowCheckpoint (factsOf (Fingerprint ident0 1 [] []) [] (ReadSet [] [((columnAt (big i) (big (i + 1)), fromInteger (big (i + 2))), if odd i then Just (fromInteger (big i), fromInteger (big (i + 1)), ReplaceAir) else Nothing) | i ← is])) (emptyWindow ident0 1))) (\w → evaluate (windowReadFactCount w))
-               pure (Variant "floor answer (16 bytes) or absent" v (Just (BS.length (encodeKey (runKey 1 1 1)) + 16 + readFactOverheadBytes)))
+               v ← retainedPer nFacts (ints nFacts) id (\is → pure (windowCheckpoint (factsOf (Fingerprint ident0 1 [] []) [] (ReadSet [] [((columnAt (big i) (big (i + 1)), fromInteger (big (i + 2))), if odd i then Just (floorAnswer i) else Nothing) | i ← is])) (emptyWindow ident0 1))) (\w → evaluate (windowReadFactCount w))
+               pure (Variant "floor answer (17 bytes, an air or a mask run) or absent" v (Just (BS.length (encodeKey (runKey 1 1 1)) + 17 + readFactOverheadBytes)))
            , do
                v ← retainedPer nFacts (ints nFacts) id (\is → pure (Map.fromList [(toShort (BS.append (be64 (fromIntegral i)) (BS.pack [fromIntegral (i + j) | j ← [1 .. maxKeyBytes - 8]])), toShort (BS.pack [fromIntegral (i + j + 3) | j ← [1 .. maxValueBytes]])) | i ← is])) (\m → evaluate (Map.size m))
                pure (Variant "the bound: a 64-byte key with a 64-byte value (not reachable by a valid record)" v (Just (maxKeyBytes + maxValueBytes + readFactOverheadBytes)))
@@ -318,7 +334,7 @@ spec = describe "the accounted-bytes constants against what is retained (forced 
       | (nm, kf, rf) ← validPairs
       ]
         <> [ do
-               v ← retainedPer 3000 (ints 3000) id (\is → pure (let m = Map.fromList [((columnAt (big i) (big (i + 1)), fromInteger (big (i + 2)) ∷ Int64), if odd i then Just (fromInteger (big i) ∷ Int64, fromInteger (big (i + 1)) ∷ Int64) else Nothing) | i ← is] in (m, Map.toAscList m))) (\(m, l) → evaluate (Map.size m + length l))
+               v ← retainedPer 3000 (ints 3000) id (\is → pure (let m = Map.fromList [((columnAt (big i) (big (i + 1)), fromInteger (big (i + 2)) ∷ Int64), if odd i then Just (floorAnswer i) else Nothing) | i ← is] in (m, Map.toAscList m))) (\(m, l) → evaluate (Map.size m + length l + sum [fromIntegral lo + fromIntegral hi | (_, Just (lo, hi, _)) ← l]))
                pure (Variant "floor query (a column and a level) with its answer" v Nothing)
            ]
     -- DISCOVERY HEADER: the always-resident control record (an authority and three counters), every field at its largest

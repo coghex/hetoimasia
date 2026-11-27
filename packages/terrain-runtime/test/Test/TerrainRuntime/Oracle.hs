@@ -114,7 +114,7 @@ spec = describe "The accounting oracle and its controls" $ do
         (_, held, charged) <- look svc
         -- as granted: 404 and 1200, so a charge one byte short of either is under-charged
         mentions "resident reservation" (disagreements held (chargingJobs 403 1200 charged)) `shouldBe` True
-        mentions "scratch" (disagreements held (chargingJobs 404 703 charged)) `shouldBe` True
+        mentions "scratch" (disagreements held (chargingJobs 404 1199 charged)) `shouldBe` True
         disagreements held (chargingJobs 404 1200 charged) `shouldBe` []
     it "fails the comparison when the model forgot the job early (acknowledged it while it runs)" $
       atJob $ \svc → do
@@ -242,7 +242,7 @@ spec = describe "The accounting oracle and its controls" $ do
         (_, held, charged) <- look svc
         let waiting = [hjJob j | j ← heldJobs held, hjSlots j == 0]
         mentions "resident reservation" (disagreements held (chargingJobsWhere ((`elem` waiting) . cjJob) 403 1200 charged)) `shouldBe` True
-        mentions "scratch" (disagreements held (chargingJobsWhere ((`elem` waiting) . cjJob) 404 703 charged)) `shouldBe` True
+        mentions "scratch" (disagreements held (chargingJobsWhere ((`elem` waiting) . cjJob) 404 1199 charged)) `shouldBe` True
 
   -- A borrow's hold names the regions its snapshot covers, and a view's description the
   -- regions its accepted demand describes: both are read from what the service handed out

@@ -34,7 +34,7 @@ must = either (\e → expectationFailure e >> fail e) pure
 -- | Full cubes of stone below level 10 and of slab from 10 up to 300, open to the sky: one column's levels change source material
 -- at 10, and a column can hold a run for every level.
 tagged ∷ Scene
-tagged = Scene "tagged" (SourceSpec ["stone", "slab"] [LayerSpec Nothing (Just 10) "stone" 0, LayerSpec (Just 10) (Just 300) "slab" 0] [])
+tagged = Scene "tagged" (SourceSpec ["stone", "slab"] [LayerSpec Nothing (Just 10) "stone" 0, LayerSpec (Just 10) (Just 1000) "slab" 0] [])
 
 sourceOf ∷ Scene → Source
 sourceOf scene = either (error . show) id (mkSource defaultSourceLimits (sceneSpec scene))
@@ -152,6 +152,32 @@ spec = describe "tagged replacements through the page-resident store (version 2)
     merged ← must (foldM (\r z → narrowCell r (at z) (mask 0)) alt [1, 3 .. 199])
     must (storedRuns merged) `shouldReturn` [(0, 200, ReplaceAir)]
     checkH' (runH merged)
+  it "splits a multi-level run exactly at a leaf separator, and coalesces the pieces with the neighbours across it, as the pure model does" $ do
+    -- 130 runs of three levels, masks 12 and 8 alternating: more than a leaf of the runs tree holds
+    r0 ← must (foldM (\r z → narrowCell r (at z) (mask (if even (z `div` 3) then 12 else 8))) start [0 .. 3 * 130 - 1])
+    runs0 ← must (storedRuns r0)
+    length runs0 `shouldBe` 130
+    heightOf (runH r0) TreeRuns `shouldSatisfy` (>= 2)
+    separator ← must (leafSeparator r0)
+    -- the run that starts the second leaf is three levels long
+    (lo, hi, tag) ← case [run | run@(l, _, _) ← runs0, l == separator] of
+      [run] → pure run
+      other → expectationFailure ("no run starts at the separator: " <> show other) >> fail "unreachable"
+    hi - lo `shouldBe` 3
+    -- an interior level to air splits it in three, inside the second leaf
+    r1 ← must (narrowCell r0 (at (toInteger lo + 1)) (mask 0))
+    runs1 ← must (storedRuns r1)
+    length runs1 `shouldBe` 132
+    [run | run@(l, h, _) ← runs1, l >= lo, h <= hi] `shouldBe` [(lo, lo + 1, tag), (lo + 1, lo + 2, ReplaceAir), (lo + 2, hi, tag)]
+    -- the first level of that run to air joins the air beside it; the last level of the run before it, in the first leaf, to air
+    -- joins that, so one run of air spans the separator
+    r2 ← must (narrowCell r1 (at (toInteger lo)) (mask 0))
+    must (storedRuns r2) >>= (`shouldContain` [(lo, lo + 2, ReplaceAir)])
+    r3 ← must (narrowCell r2 (at (toInteger lo - 1)) (mask 0))
+    runs3 ← must (storedRuns r3)
+    runs3 `shouldContain` [(lo - 1, lo + 2, ReplaceAir)]
+    length runs3 `shouldBe` 131
+    checkH' (runH r3)
   it "answers every level with the cell the pure overlay gives, source material included, across a change of material" $ do
     let src = sourceOf tagged
         edits = [(8, 12), (9, 12), (10, 12), (11, 8), (12, 0), (14, 4)]
