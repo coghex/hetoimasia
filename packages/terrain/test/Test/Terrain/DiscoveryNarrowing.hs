@@ -20,7 +20,7 @@ import Hetoimasia.Terrain.Discovery
 import Hetoimasia.Terrain.Geometry (FaceKind (..))
 import Hetoimasia.Terrain.Opening (airOpenings, cellComponents, connectCells, keyOpenings, openingArea, portalOpening, portalsOn)
 import Hetoimasia.Terrain.Query (cellAt)
-import Hetoimasia.Terrain.Residency (ArenaId (..))
+import Hetoimasia.Terrain.Residency (ArenaId (..), Revision (..))
 import Hetoimasia.Terrain.Shape (CornerMask, mkCornerMask)
 import Hetoimasia.Terrain.Source (CellSpec (..), LayerSpec (..), PatchSpec (..), Source, SourceSpec (..))
 import Test.Hspec
@@ -231,6 +231,7 @@ spec = describe "Discovery of narrowed cells" $ do
   restoreSpec
   boundariesSpec
   refusalSpec
+  accountingSpec
   limitSpec
 
 -- | A pocket of sealed air at (2, 2, 2), another at (0, 4, 0), and the ground cell (2, 2, 3) between the
@@ -410,12 +411,27 @@ editsSpec = describe "edits made before earlier work drains" $ do
     -- known space only grows
     let sizes = map (Set.size . knowledgeIn) states
     and (zipWith (<=) sizes (drop 1 sizes)) `shouldBe` True
-  it "covers a connection that a later edit opens while an earlier obligation is half inspected" $ do
-    let first = narrowTo slow (staged env [Narrow (2, 2, 1) 5]) (2, 2, 2) 5
-        started = maybe first id (batch slow first)
-        later = narrowTo env started (2, 2, 3) 5
-        edits = [Narrow (2, 2, 1) 5, Narrow (2, 2, 2) 5, Narrow (2, 2, 3) 5]
-    knowledgeIn (drain env later) `shouldBe` oracleKnown w (oracleChanges w edits)
+  it "finds the connection a later edit opens across a face an earlier obligation already inspected" $ do
+    -- level 1 is sealed under the full ground cell at level 2, the top ground cell under open sky; narrowing
+    -- level 2 to a bank opens its bottom onto level 1's top and its top onto the sky
+    let wf = worldOf (groundScene "faces" 3 (0, 5) (0, 5) 5 [])
+        ef = worldEnv wf
+        sf = worldSlow wf
+        edits = [Narrow (2, 2, 1) 5, Narrow (2, 2, 2) 1]
+        queuedFirst = staged ef [Narrow (2, 2, 1) 5]
+        halfInspected = maybe queuedFirst id (batch sf queuedFirst)
+        finished = drain ef queuedFirst
+        expected = oracleKnown wf (oracleChanges wf edits)
+    -- the first obligation has inspected a face and has more to do, and nothing is known of level 1
+    pendingObligations (retainedHeader halfInspected) `shouldBe` 1
+    Set.member (2, 2, 1) (knownVoids wf halfInspected) `shouldBe` False
+    mapM_
+      ( \ret → do
+          let settled = drain ef (narrowTo ef ret (2, 2, 2) 1)
+          knownVoids wf settled `shouldBe` expected
+          Set.member (2, 2, 1) (knownVoids wf settled) `shouldBe` True
+      )
+      [halfInspected, finished]
   it "narrows the same cell again before its first obligation drains" $ do
     let edits = [Narrow (2, 2, 3) 14, Narrow (2, 2, 3) 12, Narrow (2, 2, 3) 8]
         w' = pocketWorld
@@ -427,7 +443,6 @@ editsSpec = describe "edits made before earlier work drains" $ do
   it "advances content on every narrowing and knowledge only when known space grows" $ do
     let w' = pocketWorld
         e' = worldEnv w'
-        header = retainedHeader fresh
         stageOne ret cell m = case stageNarrowing e' (retainedHeader ret) (retainedProvider ret) (allowance e') (uncurry3 mustTile cell) (mask m) of
           Right (NarrowStaged c) → c
           other → error (show other)
@@ -436,19 +451,26 @@ editsSpec = describe "edits made before earlier work drains" $ do
         top = stageOne fresh (2, 2, 3) 1
         topApplied = applied top fresh
         widened = stageOne (drain e' topApplied) (2, 2, 3) 0
+        revisions ret = let a = hAuthority (retainedHeader ret) in (authContent a, authKnowledge a, authStore a)
+        next (Revision n) = Revision (n + 1)
+        advanced (c, k, s) (content, knowledge) = (if content then next c else c, if knowledge then next k else k, next s)
+        from ret = revisions ret
     -- a narrowing inside sealed stone: new content, no known space
     (candidateTerrain buried, candidateKnowledge buried, candidateFrontierOnly buried) `shouldBe` (True, False, False)
+    revisions (applied buried fresh) `shouldBe` advanced (from fresh) (True, False)
     -- a narrowed ground cell has no void before the edit: the edit alone reaches nothing known
     (candidateTerrain top, candidateKnowledge top) `shouldBe` (True, False)
+    revisions topApplied `shouldBe` advanced (from fresh) (True, False)
     -- the batch that joins it to the sky makes space known and changes no content
     case stepDiscovery e' (retainedHeader topApplied) (retainedProvider topApplied) (allowance e') of
       Right (Progress c _) → do
         (candidateTerrain c, candidateFrontierOnly c) `shouldBe` (False, False)
         candidateKnowledge c `shouldBe` True
+        revisions (applied c topApplied) `shouldBe` advanced (from topApplied) (False, True)
       other → expectationFailure (show other)
     -- widening a cell whose void is already known grows known space
     (candidateTerrain widened, candidateKnowledge widened) `shouldBe` (True, True)
-    authContent (hAuthority header) `shouldBe` authContent (hAuthority (retainedHeader fresh))
+    revisions (applied widened (drain e' topApplied)) `shouldBe` advanced (from (drain e' topApplied)) (True, True)
   it "gives a removal-only history the same retained runs it always had" $ do
     let w' = pocketWorld
         e' = worldEnv w'
@@ -579,6 +601,38 @@ refusalSpec = describe "a narrowing the transition refuses" $ do
       Right (NarrowStaged _) → pure ()
       other → expectationFailure (show other)
     narrowed `shouldSatisfy` ((== 1) . pendingObligations . retainedHeader)
+
+accountingSpec ∷ Spec
+accountingSpec = describe "the bytes of an edit" $ do
+  let w = pocketWorld
+      env = worldEnv w
+  it "charges the deletion of a mask run what that run holds, so a tight allowance refuses" $ do
+    -- narrowing the cell below an equal mask run coalesces with it and deletes the upper run's key
+    let base = narrowTo env fresh (3, 3, 1) 5
+        stageWith allow = stageNarrowing env (retainedHeader base) (retainedProvider base) allow (mustTile 3 3 0) (mask 5)
+        full = allowance env
+        retained = Map.fromList (retainedRecords base)
+    case stageWith full of
+      Right (NarrowStaged c) → do
+        let expected = headerBytes + sum [maybe (maybe 0 (entryBytes k) (Map.lookup k retained)) (entryBytes k) v | (k, v) ← candidateWrites c]
+            needed = reportDeltaBytes (candidateReport c)
+        [k | (k, Nothing) ← candidateWrites c] `shouldBe` [KeyRun (columnOf 3 3) 1]
+        needed `shouldBe` expected
+        reportScratchBytes (candidateReport c) `shouldSatisfy` (>= needed)
+        case stageWith full {allowDeltaBytes = needed - 1} of
+          Left (CapacityBlocked CapacityDeltaBytes _ _) → pure ()
+          other → expectationFailure ("a tight allowance did not refuse: " <> show (const () <$> Just other))
+        stageWith full {allowDeltaBytes = needed} `shouldSatisfy` (\r → case r of Right (NarrowStaged _) → True; _ → False)
+      other → expectationFailure (show other)
+  it "refuses a floor answer that names mask zero, when staging and when querying" $ do
+    let col = columnOf 2 2
+        broken = Provider {fetchRecord = const Absent, fetchFloorRun = \_ _ → Found (0, 4, ReplaceMask (mask 0))}
+    case stageNarrowing env (retainedHeader fresh) broken (allowance env) (mustTile 2 2 3) (mask 1) of
+      Left (Corrupt (BadFloor c _)) → c `shouldBe` col
+      other → expectationFailure (show other)
+    case observedValue (queryCell env broken (mustTile 2 2 3)) of
+      Left (Inconsistent (BadFloor c _)) → c `shouldBe` col
+      other → expectationFailure (show other)
 
 limitSpec ∷ Spec
 limitSpec = describe "the figures of an edit" $ do

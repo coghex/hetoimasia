@@ -103,7 +103,7 @@ import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
 import Data.Maybe (isJust)
 import Data.Word (Word64)
-import Control.Monad (forM_, unless)
+import Control.Monad (forM_, join, unless)
 import Data.List (sortOn)
 import Hetoimasia.Terrain.Cell (Cell (..), Column (..), ZRange, cellOccupant, cellShapeKey, cornerCell, mkZRange)
 import Hetoimasia.Terrain.Changes (Replacement (..), narrowedCell)
@@ -328,8 +328,8 @@ overCap s
   where
     caps = sCaps s
 
-overlayCost ∷ RecordKey → Maybe Record → Int
-overlayCost k = maybe (tombstoneBytes k) (entryBytes k)
+overlayCost ∷ S → RecordKey → Maybe Record → Int
+overlayCost s k = maybe (tombstoneBytes s k) (entryBytes k)
 
 -- | Everything an operation can spend. This is the one place a resource is
 -- charged: a provider read, a staged write or the output and traversal state of
@@ -351,8 +351,8 @@ charge what s = case what of
   ChargeOutput n → settle s {sScratch = sScratch s + n}
   ChargeWrite key value →
     let old = Map.lookup key (sOverlay s)
-        before = maybe 0 (overlayCost key) old
-        after = overlayCost key value
+        before = maybe 0 (overlayCost s key) old
+        after = overlayCost s key value
      in settle
           s
             { sOverlay = Map.insert key value (sOverlay s)
@@ -412,6 +412,11 @@ getRec key = M $ \_ p s → case Map.lookup key (sOverlay s) of
         Absent → Right (Nothing, s1 {sCache = Map.insert key Nothing (sCache s1)})
         Unavailable k → Left (failure (StopMissing k) s1)
 
+-- | Whether a run's payload can be one: a mask is never zero, since zero is air.
+validPayload ∷ Replacement → Bool
+validPayload ReplaceAir = True
+validPayload (ReplaceMask mask) = cornerMaskValue mask /= 0
+
 -- | The run of a column with the greatest lower end at or below a level: its
 -- two ends and what it does to its levels. Floor answers ignore staged writes:
 -- no operation stages a run before it has read every run it depends on.
@@ -422,7 +427,7 @@ floorRun col z = M $ \_ p s → case Map.lookup (col, z) (sFloor s) of
     Left cap → Left (failure (StopCapacity cap) s)
     Right s1 → case fetchFloorRun p col z of
       Found run@(lo, hi, payload)
-        | lo <= z && lo < hi →
+        | lo <= z && lo < hi && validPayload payload →
             Right
               ( Just run
               , s1
@@ -729,10 +734,13 @@ settleWrites s = (writes, added - removed)
 
 -- | The accounted bytes of a deletion: charged as the largest record of its
 -- kind, so a candidate's size never shrinks as more updates are staged (a
--- finished obligation costs what its last progress record did).
-tombstoneBytes ∷ RecordKey → Int
-tombstoneBytes k = keyBytes k + entryOverheadBytes + case k of
+-- finished obligation costs what its last progress record did). A run is
+-- deleted only after it was read, and costs the record it held: an air run's
+-- value, or a mask run's.
+tombstoneBytes ∷ S → RecordKey → Int
+tombstoneBytes s k = keyBytes k + entryOverheadBytes + case k of
   KeyTodo _ → 40
+  KeyRun _ _ → maybe 8 recordBytes (join (Map.lookup k (sCache s)))
   _ → 8
 
 -- | The resources an operation may use: the smaller of each validated limit and
