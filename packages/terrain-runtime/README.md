@@ -807,9 +807,12 @@ facts, the work limit and the trust) and plan again; the plan does not repeat a 
 `Facts` are opaque (no constructor reaches a client; the read facts in them are packed when they are created, never typed) and carry the state they were proven against (the store, the
 version, the committed roots and the pinned roots with their versions): a window trusts them only for exactly
 that state, so a reader acquired in between or a commit costs a proof again and never skips one it should have
-made. A checkpoint always carries a new fact (a window that cannot hold the plan's edit and ONE proof is the typed
-`WindowExceeded`), so a transaction takes at most as many checkpoints as the pages it writes plus the 64 it
-verifies. What a window holds at once is the edit and one proof, `workOneWindowPages` for a unit of one page and
+made. A checkpoint always carries a new fact (a window that cannot hold the plan's edit and ONE step is the typed
+`WindowExceeded`), so a transaction takes at most as many checkpoints as the facts it can make (`maxCheckpoints`: a proof of each
+page it writes against each root, the proof that a number it retires is absent from the index, the memos below, the 64 it
+verifies). A lookup of an edit that concludes an absence, a floor or a ceiling reads the chains of the two neighbouring subtrees
+and memoises each (a fact with its bounds by value, at most `maxMemoBytes` held, counted in the plan's RAM), so a window need not
+keep their pages and a checkpoint carries the memo. What a window holds at once is the edit and one step (one landing), `workOneWindowPages` for a unit of one page and
 `removalWindowPages` for a standalone removal, which cannot shrink (the edit phase's formula plus `readResiduePages`,
 below); both rest on `maxLevel` and `maxReaders`
 alone, and both are asserted against `maxWindowBytes / windowPageBytes` (320 pages) for every height 1 to 8 and
@@ -1185,7 +1188,7 @@ that claim is reserved before any work, so a refusal (`DiskFull`) precedes any c
 and leaves the prior contents and every discovery obligation intact. The owner maps it
 to `storage_full` and the pause. `minimumRemovalFeasible` shows the supported minimum
 edit (8 record writes at the tallest height, a list page and the bookkeeping
-reserve: 205 pages, 4,162,308 bytes of RAM at the measured costs, 3.97 MiB) fits any accepted configuration in an empty
+reserve: 205 pages, 4,182,500 bytes of RAM at the measured costs, 3.97 MiB) fits any accepted configuration in an empty
 workspace; if a configuration could not hold it, the counterexample is returned for a
 design decision and no budget is relaxed.
 
@@ -1273,7 +1276,7 @@ edit bound is **308** pages and a discovery unit's **228**. (3) The sum of every
 **5,729,408** bytes with the read facts at their ceiling (io 1,097,728, decoded 2,762,752, keys 122,880, scratch 613,376, pins 8,192,
 root and control 70,784, continuation 1,053,696) and 4,680,832 without them, above the 4 MiB limit. The one gate is `chargeFor`, which
 refuses (`TxnRamExceeded`) a plan whose own total is past the limit. The promised extremes are each planned and fit: the minimum
-edit needs **4,162,308** bytes and a discovery unit **3,389,792** of 4,194,304 (32 KB of headroom for the edit).
+edit needs **4,182,500** bytes and a discovery unit **3,389,792** of 4,194,304 (11 KB of headroom for the edit).
 
 ### Edit-bank admission
 
