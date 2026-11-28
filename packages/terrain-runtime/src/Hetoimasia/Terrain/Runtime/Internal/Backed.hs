@@ -138,11 +138,11 @@ import qualified Hetoimasia.Terrain.Runtime.Storage.Internal.Service as Storage
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Types (IoFailure (..), IoOp (..), WorkClass (..))
 import qualified Hetoimasia.Terrain.Runtime.Store.Internal.Admission as A
 import Hetoimasia.Terrain.Runtime.Store.Internal.Admission (Admission)
-import Hetoimasia.Terrain.Runtime.Store.Internal.Format (PageNo, StoreIdentity (..), maxLevel)
+import Hetoimasia.Terrain.Runtime.Store.Internal.Format (PageNo, StoreIdentity (..))
 import Hetoimasia.Terrain.Runtime.Store.Internal.Model (ActiveView (..), Condition (..), GrowthProposal, Store, activeView, storeConfig, TxnId, conditions, oldestPin, pauseFor, storeFromRoots, storeHeader, storeRoots, storeVersion)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan (Plan, RamCharge (..))
 import Hetoimasia.Terrain.Runtime.Store.Internal.Protocol (discoveryPlanner, maintenancePlanner, removalPlanner)
-import Hetoimasia.Terrain.Runtime.Store.Internal.State (Roots (..), StoreConfig, emptyRoots, maxReaders, readPathPages, windowPageBytes)
+import Hetoimasia.Terrain.Runtime.Store.Internal.State (Roots (..), StoreConfig, emptyRoots, maxReaders, readStepPages, windowPageBytes)
 import Hetoimasia.Terrain.Source (Source)
 
 -- ---------------------------------------------------------------------------
@@ -673,14 +673,6 @@ keptPinLimit cap columns
 -- | The bytes @cap@ runs of @columns@ columns hold, at most.
 keptRunsBytes ∷ Int → Int → Int
 keptRunsBytes cap columns = cap * replacementRunBytes + columns * changeColumnBytes
-
--- | The pages one step of a ranged read needs in its window, by the traversal it makes: the path from the root
--- to the leaf the target lies in (the tree is at most 'maxLevel' + 1 levels), and the landing's neighbouring
--- subtrees, each loaded down to the leaf next to it. The nearest sibling subtree on one side may hang from
--- the root, a path of its own of all but the root's page, while the other side's is the leaf beside it: at
--- most twice the tree's height, 'readPathPages'.
-readStepPages ∷ Int
-readStepPages = readPathPages (maxLevel + 1)
 
 -- | The query limits leave every read kind the pages one read step needs beside what it keeps: the
 -- worst kind (a column query, or a surface's window, over the range limit: 'rangeKeep' of it) is

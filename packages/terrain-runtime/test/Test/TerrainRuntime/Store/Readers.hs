@@ -19,10 +19,10 @@ import Data.Int (Int64)
 import Hetoimasia.Terrain.Discovery (Record (..), RecordKey (..), maxBatchUpdates)
 import Hetoimasia.Terrain.Residency (ArenaId (..))
 import Hetoimasia.Terrain.Runtime.Store.Internal.Format
-import Hetoimasia.Terrain.Runtime.Store.Internal.Page (Body (..), Page (..), encodePage)
+import Hetoimasia.Terrain.Runtime.Store.Internal.Page (Body (..), Page (..), decodePage, encodePage)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Model
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan
-import Hetoimasia.Terrain.Runtime.Store.Internal.Records (be64)
+import Hetoimasia.Terrain.Runtime.Store.Internal.Records (be64, decodeKey)
 import Hetoimasia.Terrain.Runtime.Store.Internal.State
 import Hetoimasia.Terrain.Runtime.Store.Internal.Tree
 import Test.Hspec
@@ -316,6 +316,47 @@ spec = describe "pinned readers, retirement and reclamation" $ do
     maximum sizes `shouldSatisfy` (<= readPathPages height)
     -- the old estimate (the path and the two leaves beside the target) was too small for a neighbour under another parent
     maximum sizes `shouldSatisfy` (> height + 2)
+  it "holds the pages of two landings when a ranged read starts at a floor, at a deleted separator that sends the floor across the root's children" $ do
+    -- the same runs tree, with the records that begin each root child but the first deleted: their separators stay, so a floor read at one
+    -- lands in a leaf of its own child (a path of the whole height) and finds its answer in the last leaf of the child before (another path
+    -- of its own, sharing only the root), and the scan then starts from that key: the window holds what two landings load
+    let keys = [runKey (toInteger (i `div` 50)) (toInteger (i `mod` 50)) 10 | i ← [0 .. 11999 ∷ Int]]
+        chunks [] = []
+        chunks ks = let (now, later) = splitAt (3 * maxBatchUpdates - 2) ks in now : chunks later
+        commit hh ups = do
+          (hh', out) ← commitDelta hh Ordinary (deltaFor (hStore hh) True False 1 ups)
+          case out of
+            Committed _ → Right hh'
+            other → Left ("history was not built: " <> show other)
+    built ← must (foldM (\hh ks → commit hh [(k, Just (runRec 20)) | k ← ks]) (newH smallSpec ident0) (chunks keys))
+    let height = heightOf built TreeRuns
+        total = cfgUsablePages (hCfg built)
+        decodeAt p = either (const Nothing) Just . decodePage (hIdent built) total p =<< diskRead (hDisk built) p
+    height `shouldSatisfy` (>= 3)
+    rootNo ← maybe (expectationFailure "a runs root expected" >> fail "root") pure (rootOf (storeRoots (hStore built)) TreeRuns)
+    separators ← case decodeAt rootNo of
+      Just (Page _ _ _ (Inner es)) → pure [k | key ← drop 1 (map fst es), Just k@(KeyRun _ _) ← [decodeKey TreeRuns key]]
+      other → expectationFailure ("an inner root expected: " <> show other) >> fail "root"
+    length separators `shouldSatisfy` (>= 1)
+    h ← must (commit built [(k, Nothing) | k ← separators])
+    (tok, s1) ← must (either (Left . show) Right (acquireReader (hStore h)))
+    let h1 = h {hStore = s1}
+        survivors = filter (`notElem` separators) keys
+        floorOf k = last (filter (`elem` survivors) (takeWhile (/= k) keys))
+        answer k = do
+          w0 ← either (const (Left "stale")) Right (readerWindow (hStore h1) tok)
+          let go w (n ∷ Int) = case readerRange (hStore h1) tok w TreeRuns (RangeFloor k) 3 of
+                Read rs → Right (map fst rs, windowSize w)
+                ReadNeeds p | n < 200 → case diskRead (hDisk h1) p of
+                  Just bs → either (Left . show) (\x → go x (n + 1)) (windowInsert (cfgUsablePages (hCfg h1)) p bs w)
+                  Nothing → Left "missing page"
+                other → Left (show other)
+          go w0 0
+    answers ← must (mapM (\k → fmap ((,) k) (answer k)) separators)
+    -- every answer starts at the record before the deleted one, in the child before the separator's own
+    forM_ answers $ \(k, (found, _)) → take 1 found `shouldBe` [floorOf k]
+    -- the window holds at most the pages of two landings of a tree of this height, however the two sit
+    maximum [n | (_, (_, n)) ← answers] `shouldSatisfy` (<= 2 * readLandingPages height - 1)
   it "refuses more readers than the bound and a token of another store" $ do
     let h = newH smallSpec ident0
         other = newH smallSpec (identOf 2 7)

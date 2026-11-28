@@ -35,7 +35,7 @@ import Hetoimasia.Terrain.Connectivity (Axis (..), ComponentKey, keyParameters, 
 import Hetoimasia.Terrain.Coordinate (AxisCoord, axisFromInteger)
 import Hetoimasia.Terrain.Discovery (Authority (..), Header (..), Node (..), ReadSet (..), Record (..), RecordKey (..), Root (..), Todo (..), headerBytes, maxBatchUpdates, worstEdgeReads)
 import Hetoimasia.Terrain.Residency (ArenaId (..), Revision (..))
-import Hetoimasia.Terrain.Shape (CornerMask, mkCornerMask)
+import Hetoimasia.Terrain.Shape (CornerMask, cornerMaskValue, mkCornerMask)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Format
 import Hetoimasia.Terrain.Runtime.Store.Internal.Page
 import Hetoimasia.Terrain.Runtime.Store.Admission (worstTransactionCharge)
@@ -116,9 +116,14 @@ cellNode i = CellNode (columnAt (big i) (big (i + 1))) (fromInteger (big (i + 2)
 maskOf ∷ Int → CornerMask
 maskOf i = either (error . show) id (mkCornerMask (1 + i `mod` 15))
 
--- | A floor answer of either tag, at the largest ends.
+-- | A floor answer of either tag, at the largest ends: a run of at least one level (@lo < hi@), as the core accepts one.
 floorAnswer ∷ Int → (Int64, Int64, Replacement)
-floorAnswer i = (fromInteger (big i), fromInteger (big (i + 1)), if odd (i `div` 2) then ReplaceMask (maskOf i) else ReplaceAir)
+floorAnswer i = (fromInteger (big (i + 1)), fromInteger (big i), if odd (i `div` 2) then ReplaceMask (maskOf i) else ReplaceAir)
+
+-- | The record the core keeps beside a floor answer: the run the answer names, under the key of its lower end.
+floorRecord ∷ (Int64, Int64, Replacement) → Record
+floorRecord (_, hi, ReplaceAir) = RecRun hi
+floorRecord (_, hi, ReplaceMask mask) = RecMaskRun hi mask
 
 -- | Every kind of record key, and every kind of record, as a function of a distinct number.
 keyKinds ∷ [(String, Int → RecordKey)]
@@ -334,8 +339,13 @@ spec = describe "the accounted-bytes constants against what is retained (forced 
       | (nm, kf, rf) ← validPairs
       ]
         <> [ do
-               v ← retainedPer 3000 (ints 3000) id (\is → pure (let m = Map.fromList [((columnAt (big i) (big (i + 1)), fromInteger (big (i + 2)) ∷ Int64), if odd i then Just (floorAnswer i) else Nothing) | i ← is] in (m, Map.toAscList m))) (\(m, l) → evaluate (Map.size m + length l + sum [fromIntegral lo + fromIntegral hi | (_, Just (lo, hi, _)) ← l]))
-               pure (Variant "floor query (a column and a level) with its answer" v Nothing)
+               v ← retainedPer 3000 (ints 3000) id (\is → pure (floorReadsOf payload is)) (evaluate . floorReadWeight)
+               pure (Variant ("floor query that found " <> nm <> " (the floor map's answer and the run's record, each with its list)") v Nothing)
+           | (nm, payload) ← [("an air run", const ReplaceAir), ("a mask run", ReplaceMask . maskOf)]
+           ]
+        <> [ do
+               v ← retainedPer 3000 (ints 3000) id (\is → pure (let m = Map.fromList [((columnAt (big i) (big (i + 1)), fromInteger (big (i + 2)) ∷ Int64), Nothing ∷ Maybe (Int64, Int64, Replacement)) | i ← is] in (m, Map.toAscList m))) (\(m, l) → evaluate (Map.size m + length l))
+               pure (Variant "floor query with no run below the level (the absent answer, measured apart)" v Nothing)
            ]
     -- DISCOVERY HEADER: the always-resident control record (an authority and three counters), every field at its largest
     mHeader ← lazily "Memory.mHeader" (retainedPer 1000 (ints 1000) id (\is → pure [headerOf i | i ← is]) (\hs → evaluate (sum [fromIntegral (hHead h) + fromIntegral (hTail h) + hBytes h | h ← hs])))
@@ -434,6 +444,22 @@ spec = describe "the accounted-bytes constants against what is retained (forced 
     unless (nFacts > 0) (expectationFailure "no facts")
   where
     ints n = [1 .. n] ∷ [Int]
+    -- what the floor lookups of the core retain when they SUCCEED, one for each number with the given payload: the answer in its floor
+    -- map (under the column and a level in the run) and the run it names in its record map (under its own key, the column and the lower
+    -- end), and both maps again as the ascending lists the read set is handed over as, all alive together
+    floorReadsOf payload is =
+      let runs = [(columnAt (big i) (big (i + 2)), (lo, hi, payload i)) | i ← is, let (lo, hi, _) = floorAnswer i]
+          floors = Map.fromList [((col, hi - 1), Just run) | (col, run@(_, hi, _)) ← runs]
+          cache = Map.fromList [(KeyRun col lo, Just (floorRecord run)) | (col, run@(lo, _, _)) ← runs]
+       in (floors, cache, Map.toAscList floors, Map.toAscList cache)
+    -- forces every field the lookup holds: the ends, the mask (a lazy field would measure as a thunk), the run record's bytes
+    floorReadWeight (floors, cache, floorList, cacheList) =
+      Map.size floors + Map.size cache + length floorList + length cacheList
+        + sum [fromIntegral lo + fromIntegral hi + payloadWeight p | (_, Just (lo, hi, p)) ← floorList]
+        + sum (map recordWeight cacheList)
+    payloadWeight p = case p of
+      ReplaceAir → 0
+      ReplaceMask mask → fromIntegral (cornerMaskValue mask)
     typedReadsOf kf rf is =
       let m = Map.fromList [(kf i, Just (rf i)) | i ← is]
        in (m, Map.toAscList m)

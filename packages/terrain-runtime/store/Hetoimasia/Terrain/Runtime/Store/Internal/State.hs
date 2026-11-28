@@ -83,6 +83,8 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.State
   , editWindowPages
   , readResiduePages
   , readPathPages
+  , readLandingPages
+  , readStepPages
   , maxReadFactBytes
   , writtenPageBytes
   , typedReadBytes
@@ -449,6 +451,22 @@ readResiduePages =
 -- progress.
 readPathPages ∷ Int → Int
 readPathPages hrec = 2 * hrec
+
+-- | The pages one LANDING of a reader's read holds at the most in a tree of @h@ levels. A landing is the descent to the leaf a
+-- key leads to and the checks that conclusion needs ('Hetoimasia.Terrain.Runtime.Store.Internal.Tree.validateLanding'):
+-- the root-to-leaf path, @h@ pages, and the extreme leaf of the nearest neighbouring subtree on each side, each a path of
+-- its own from that subtree's root down, which hangs below the root, @h - 1@ pages. Nothing else is read: a scan from the
+-- landing's key continues into the leaf beside it, which is one of those neighbours. The count asks nothing of how full a
+-- node is, so every shape of tree and every position of the key is inside it.
+readLandingPages ∷ Int → Int
+readLandingPages h = h + 2 * (h - 1)
+
+-- | The pages one step of a reader's read holds at the most, in the tallest tree: a read makes at most two landings (the
+-- floor of its start, and the scan from the floor's key, which may lie in the leaf before the start's) and the pages one
+-- landing loaded are not loaded again, so the two share at least the root: @2 * 'readLandingPages' - 1@. The reader's pin
+-- credit ('Hetoimasia.Terrain.Runtime.Store.Internal.Admission.readerPinnedCacheBytes') holds this step beside what the read keeps.
+readStepPages ∷ Int
+readStepPages = 2 * readLandingPages (maxLevel + 1) - 1
 
 -- | The RAM the read facts of one plan may hold (as a retained continuation of its RAM charge): a read set past it is the typed,
 -- shrinkable 'TxnRamExceeded' of a discovery batch (the work halves). A standalone removal reads at most 'worstEditReads' records
