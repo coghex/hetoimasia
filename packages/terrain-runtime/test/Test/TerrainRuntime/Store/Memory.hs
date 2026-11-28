@@ -229,7 +229,7 @@ spec = describe "the accounted-bytes constants against what is retained (forced 
                pure (Variant "the bound: a 64-byte key with a 64-byte value (not reachable by a valid record)" v (Just (maxKeyBytes + maxValueBytes + readFactOverheadBytes)))
            ]
     -- PROOF FACT: a member of the window's set of proofs; every constructor, the largest carries a version and a page
-    mProof ← lazily "Memory.mProof" $ sequence
+    mProof ← lazily "Memory.mProof" $ sequence $
       [ do
           v ← retainedPer 20000 (ints 20000) id (\is → pure (Set.fromList [mk i | i ← is])) (\st → evaluate (Set.foldl' (\acc f → acc + factWeight f) (0 ∷ Int) st))
           pure (Variant nm v Nothing)
@@ -239,8 +239,24 @@ spec = describe "the accounted-bytes constants against what is retained (forced 
           , ("not retired", \i → FactNotRetired (PageNo (fromInteger (big i))))
           , ("not free", \i → FactNotFree (PageNo (fromInteger (big i))))
           , ("gone (version and page)", \i → FactGone (fromInteger (big i)) (PageNo (fromInteger (big (i + 1)))))
+          , ("not indexed", \i → FactNotIndexed (PageNo (fromInteger (big i))))
+          , ("out of (a page and a root)", \i → FactOutOf (PageNo (fromInteger (big i))) (PageNo (fromInteger (big (i + 1)))))
           ]
       ]
+    -- MEMOS AND COMPLETED PROOFS: an edit's memo of a neighbouring chain holds its bounds by value, measured at each length of key a tree holds
+    -- (the allocator's 8, the retirement tree's 9, the longest a record tree has), both bounds present, against the figure 'factBytesOf' accounts for
+    -- it; and the facts of completed pages, one each, with the units of their proofs dropped (measured BEFORE the facts are read: a lazily filtered
+    -- list would hold the units until something forced it)
+    mMemo ← lazily "Memory.mMemo" $ sequence $
+      [ do
+          v ← retainedPer 20000 (ints 20000) id (\is → pure (Set.fromList [memoOf len i | i ← is])) (\st → evaluate (Set.foldl' (\acc f → acc + factWeight f) (0 ∷ Int) st))
+          pure (Variant ("memo of a chain, bounds of " <> show len <> " bytes") v (Just (factBytesOf (memoOf len 1))))
+      | len ← [8, retireKeyBytes, maxKeyBytes]
+      ]
+        <> [ do
+               v ← retainedPer 400 (ints 400) id (\is → pure (foldl' (\e i → recordProof (FactUnreachable (PageNo (fromInteger (big i)))) (PageNo (fromInteger (big i))) (foldl' (\e' r → recordFact (FactOutOf (PageNo (fromInteger (big i))) (PageNo (fromInteger (big (i + r))))) e') e [1 .. 16])) (newEdit 0 (emptyWindow ident0 1)) is)) (\e → evaluate (editFreshBytes e))
+               pure (Variant "the proofs of completed pages: one fact each, their 16 root units dropped (read before the facts are forced)" v (Just (factBytes + 24)))
+           ]
     -- LISTS AND SETS OF PAGE NUMBERS: the replaced pages of an edit are a set, the supply and the loose pages are lists
     mCell ← lazily "Memory.mCell" $ sequence
       [ do
@@ -354,6 +370,7 @@ spec = describe "the accounted-bytes constants against what is retained (forced 
       , Row "probe (map entry + key)" "the longest key a valid page holds is 52 bytes (the links tree); the bound a page could carry is 64 (maxKeyBytes), measured too" (Just "key of 64 bytes") probeBytes mProbe
       , Row "read fact, packed (key + value + entry)" "the longest valid key (52) with the longest valid value (53, a child that is a source node); encoded, so the optional coordinates of the typed form do not matter; the bound (64 + 64) is measured too" Nothing recordFactBytes mFact
       , Row "proof fact in a Set" "the constructor with the most fields: a version and a page" (Just "gone (version and page)") factBytes mProof
+      , Row "memo of a neighbouring chain, and the facts of completed proofs" "a memo holds the bounds of a chain by value: the longest key a record tree holds (64 bytes) at both ends; the facts of a completed page's proof are one each" (Just "memo of a chain, bounds of 64 bytes") (factBytesOf (memoOf maxKeyBytes 1)) mMemo
       , Row "page-number list cell (supply, loose pages)" "a cons cell and a boxed number" Nothing pageListCellBytes (take 1 mCell)
       , Row "page-number set element (the replaced pages of an edit)" "a map node, the boxed number and the pointers" Nothing pageSetElemBytes (drop 1 mCell)
       , Row "root set at the loose cap" "every Maybe root present, the header at its largest, five checksums, the loose list at its cap of 1,024 distinct pages" (Just "every root present, header at its largest, 5 checksums, loose list at its cap") rootRecordBytes mRoots
@@ -419,15 +436,15 @@ spec = describe "the accounted-bytes constants against what is retained (forced 
       [r] → do
         let m = ceiling (varMeasured (rowMax r)) ∷ Int
             -- restated here from the raw figures, independent of the derivation: the typed reads, a full window and its probes, the packed
-            -- facts at their ceiling, the proof facts of a replayed read phase, the writes staging holds (192 at writeRetainedBytes) and
+            -- facts at their ceiling, the proof facts and the memos of a replayed read phase, the writes staging holds (192 at writeRetainedBytes) and
             -- the fixed records
-            peak n = n * m + maxWindowBytes + worstOwnershipBytes + maxReadFactBytes + maxProofFacts * factBytes + 3 * maxBatchUpdates * writeRetainedBytes + readPhaseFixedBytes
+            peak n = n * m + maxWindowBytes + worstOwnershipBytes + maxReadFactBytes + maxProofFacts * factBytes + maxMemoBytes + 3 * maxBatchUpdates * writeRetainedBytes + readPhaseFixedBytes
         -- a removal or a narrowing reads at most maxEditReads, a unit of discovery worstEdgeReads, a batch the cap; each fits
         forM_ [worstEdgeReads, maxEditReads, maxTypedReads] $ \n → (n, peak n <= txnRamLimit) `shouldBe` (n, True)
         -- and the cap is above what a removal or one inspection can read, so it is never what refuses them
         (maxTypedReads >= maxEditReads, maxTypedReads >= worstEdgeReads) `shouldBe` (True, True)
         -- the cap is the largest the ACCOUNTED typed read allows: one more read at the accounted figure would not fit
-        let fixed = maxWindowBytes + worstOwnershipBytes + maxReadFactBytes + maxProofFacts * factBytes + 3 * maxBatchUpdates * writeRetainedBytes + readPhaseFixedBytes
+        let fixed = maxWindowBytes + worstOwnershipBytes + maxReadFactBytes + maxProofFacts * factBytes + maxMemoBytes + 3 * maxBatchUpdates * writeRetainedBytes + readPhaseFixedBytes
         (maxTypedReads * typedReadBytes + fixed <= txnRamLimit, (maxTypedReads + 1) * typedReadBytes + fixed > txnRamLimit) `shouldBe` (True, True)
       other → expectationFailure ("expected one typed-read row, found " <> show (length other))
   it "a Facts value of N read facts and N proof facts retains no more than factsRetainedBytes says (measured on one value, accounted on another)" $ do
@@ -475,6 +492,10 @@ spec = describe "the accounted-bytes constants against what is retained (forced 
       FactNotFree (PageNo p) → fromIntegral p
       FactGone v (PageNo p) → fromIntegral (v + p)
       FactOutOf (PageNo a) (PageNo b) → fromIntegral (a + b)
+      FactNotIndexed (PageNo p) → fromIntegral p
+      FactEdge side (PageNo p) crc lo hi lvl → fromEnum side + fromIntegral p + fromIntegral crc + maybe 0 SBS.length lo + maybe 0 SBS.length hi + lvl
+    memoOf len i =
+      FactEdge (even i) (PageNo (fromInteger (big i))) (fromIntegral i) (Just (toShort (BS.pack [fromIntegral (i + j) | j ← [1 .. len]]))) (Just (toShort (BS.pack [fromIntegral (i + j + 7) | j ← [1 .. len]]))) (i `mod` 8)
     rootsOf full loose i =
       let pg k = if full then Just (PageNo (fromInteger (big (i + k)))) else Nothing
        in Roots

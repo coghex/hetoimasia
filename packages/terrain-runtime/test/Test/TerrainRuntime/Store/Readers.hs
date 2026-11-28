@@ -407,6 +407,44 @@ spec = describe "pinned readers, retirement and reclamation" $ do
     -- each root has a page there, a different one
     length (nub (map fst answers)) `shouldBe` 4
     maximum (map snd answers) `shouldSatisfy` (<= readLandingPages height)
+  it "plans an edit's absent-key lookups through a window of the edit and one landing, carrying a memo of each neighbouring chain through a checkpoint, and plans what a wide window plans" $ do
+    -- inserts of absent keys into leaves far apart in a tree of three levels: each lookup concludes an absence from the leaf's neighbours,
+    -- whose pages no window of the edit's paths and ONE landing can keep for all of them; a checkpoint hands on the memos, and the next window
+    -- reads no chain a memo stands for
+    let keys = [runKey (toInteger (i `div` 50)) (toInteger (i `mod` 50)) 10 | i ← [0 .. 11999 ∷ Int]]
+        chunks [] = []
+        chunks ks = let (now, later) = splitAt (3 * maxBatchUpdates - 2) ks in now : chunks later
+        commit hh ups = do
+          (hh', out) ← commitDelta hh Ordinary (deltaFor (hStore hh) True False 1 ups)
+          case out of
+            Committed _ → Right hh'
+            other → Left ("history was not built: " <> show other)
+    h ← must (foldM (\hh ks → commit hh [(k, Just (runRec 20)) | k ← ks]) (newH smallSpec ident0) (chunks keys))
+    let hf = max 1 (heightOf h TreeFree)
+        hrec = heightOf h TreeRuns
+        inserts = [(runKey (toInteger c) 60 10, Just (runRec 20)) | c ← [3, 40, 77, 120, 160, 200 ∷ Int]]
+        delta = deltaFor (hStore h) True False 1 inserts
+        formula = editWindowPages (length inserts) (max 0 (heightOf h TreeRetire - 1)) hf hrec 0
+        bounded n = standardBounds {bdWindowPages = n, bdWindowBytes = n * windowPageBytes}
+        planWith bounds = fillCounting h (storeWindow (hStore h)) (\w → planDeltaPinned bounds (hCfg h) (hIdent h) (storeRoots (hStore h)) (pinnedRoots (hStore h)) w Ordinary delta)
+        -- the smallest window the plan succeeds in (the formula is the promise: this fixture needs far less), by descent from it
+        smallest n = case planWith (bounded (n - 1)) of
+          Right (Planned _, _, _, _) | n > 2 → smallest (n - 1)
+          _ → n
+        lim = smallest formula
+        tight = bounded lim
+    hrec `shouldSatisfy` (>= 3)
+    (wide, _, _, cpsWide) ← must (planWith standardBounds)
+    (narrow, _, _, cps) ← must (planWith tight)
+    cpsWide `shouldBe` 0
+    case (wide, narrow) of
+      (Planned a, Planned b) → do
+        -- the same plan, through checkpoints, in a window that held no more than its bound
+        plPages b `shouldBe` plPages a
+        mPagesWritten (plMeasure b) `shouldBe` mPagesWritten (plMeasure a)
+        (mWindowPages (plMeasure b) <= lim) `shouldBe` True
+        cps `shouldSatisfy` (> 0)
+      other → expectationFailure ("the plans were not both planned: " <> take 300 (show other))
   it "refuses more readers than the bound and a token of another store" $ do
     let h = newH smallSpec ident0
         other = newH smallSpec (identOf 2 7)

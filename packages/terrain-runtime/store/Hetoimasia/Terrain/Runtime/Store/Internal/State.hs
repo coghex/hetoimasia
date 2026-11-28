@@ -67,6 +67,7 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.State
   , pageStateEntryBytes
   , writeRetainedBytes
   , maxProofFacts
+  , maxMemoBytes
   , rootRecordBytes
   , activeRecordBytes
   , looseCap
@@ -132,7 +133,7 @@ import Hetoimasia.Terrain.Discovery (Authority (..), Header (..), headerBytes, m
 import Hetoimasia.Terrain.Residency (ArenaId, Revision (..))
 import Hetoimasia.Terrain.Runtime.Store.Internal.Format
 import Hetoimasia.Terrain.Runtime.Store.Internal.Page (maxPackedPayloadBytes, overlayNodeBytes)
-import Hetoimasia.Terrain.Runtime.Store.Internal.Tree (factBytes)
+import Hetoimasia.Terrain.Runtime.Store.Internal.Tree (factBytes, memoBaseBytes, memoBoundBytes)
 
 mib ∷ Word64
 mib = 1024 * 1024
@@ -351,6 +352,18 @@ looseGrowthUnit hr hf = 2 * hr + 1 + 2 * hf + 3 + hf
 looseGrowthOrdinary ∷ Int → Int
 looseGrowthOrdinary hf = maxClaimPages `div` 56 + 1 + hf
 
+-- | The most accounted bytes of the memos ('Hetoimasia.Terrain.Runtime.Store.Internal.Tree.FactEdge') one plan carries through its
+-- checkpoints, DERIVED from the lookups an edit makes that conclude an absence, or a floor or ceiling, from a tree it stages (a retired
+-- page's number is proven absent first, as a fact of the committed index, so its insertion looks nothing up): each makes at most two
+-- memos, of its two neighbouring chains. The record writes (the largest key a record tree holds), the entry's insertion in the
+-- retirement tree, and the allocator tree's edit, a landing for each page it writes ('maxLevel' + 1 levels, three trees' worth) and
+-- for each loose page it spills ('maxSpillPages').
+maxMemoBytes ∷ Int
+maxMemoBytes =
+  2 * (maxEditWrites * memoOf maxKeyBytes + memoOf retireKeyBytes + (3 * (maxLevel + 1) + maxSpillPages) * memoOf 8)
+  where
+    memoOf keyLen = memoBaseBytes + 2 * memoBoundBytes keyLen
+
 -- | The pages a maintenance transaction of ONE page holds in its window AT ONCE, from the heights of the
 -- retirement tree (@hr@), the allocator tree (@hf@) and the record trees (@hrec@) and the readers pinned at
 -- distinct versions (@pins@). It rests on 'maxLevel' (every height is at most @maxLevel + 1@) and
@@ -502,7 +515,7 @@ readPhaseStagedWriteBytes = 3 * maxBatchUpdates * writeRetainedBytes
 -- | The proof facts the window carries when a read phase is REPLAYED after a proof checkpoint: up to 'maxProofFacts', each
 -- 'factBytes'.
 readPhaseProofFactBytes ∷ Int
-readPhaseProofFactBytes = maxProofFacts * factBytes
+readPhaseProofFactBytes = maxProofFacts * factBytes + maxMemoBytes
 
 -- | The most reads a plan lets #661 make: those whose TYPED read set fits, within a plan's RAM, beside everything else alive while
 -- it reads: a full window (its page bytes and its ownership probes), the packed read facts at their ceiling, the proof facts a

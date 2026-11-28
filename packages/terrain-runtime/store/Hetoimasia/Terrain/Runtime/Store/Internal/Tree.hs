@@ -62,9 +62,14 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.Tree
   , fingerprintBytes
   , factsRetainedBytes
   , recordFact
+  , carryFacts
+  , windowMemoBytes
   , recordProof
   , editFacts
   , factBytes
+  , factBytesOf
+  , memoBaseBytes
+  , memoBoundBytes
   , windowCheckpoint
   , windowFactsFor
   , noReadFacts
@@ -100,6 +105,7 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.Tree
   , Stop (..)
   , M
   , runM
+  , runMKeep
   , Edit
   , newEdit
   , editSteps
@@ -122,13 +128,17 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.Tree
 
     -- * Reads
   , lookupKey
+  , lookupKeyWith
   , livePageAt
   , floorKey
+  , floorKeyWith
   , ceilKey
+  , ceilKeyWith
   , rangeKeys
 
     -- * Updates
   , insertKey
+  , insertAbsentKey
   , deleteKey
 
     -- * Finishing
@@ -290,10 +300,18 @@ data Fact
   | FactNotRetired !PageNo
   | FactNotFree !PageNo
   | FactGone !Word64 !PageNo
+  | -- | The page number is absent from the retired-page index of the committed roots: the proof an edit makes for each page it retires
+    -- before it inserts the number, so that the insertion (of a key known to be absent) reads no neighbour.
+    FactNotIndexed !PageNo
   | -- | The progress of one 'FactUnreachable' or 'FactRetirable' proof: the page is not reachable from THIS root (the root's page).
     -- A proof against every committed and pinned root is a unit for each, so that the window holds one root's paths at a time;
     -- the units of a page are dropped when its proof is complete.
     FactOutOf !PageNo !PageNo
+  | -- | A MEMO of an edit's lookup: the chain of pages from this page (the root of a neighbouring subtree, with the checksum its parent
+    -- records) to its extreme leaf on one side (@True@: the leftmost) was read and every key of every page lay inside the bounds and the
+    -- level the descent gave it. Pages are immutable and the bounds are values, so the fact does not depend on the path that led
+    -- there, a staged one included: the lookup that made it need not load the chain again, and a checkpoint carries it.
+    FactEdge !Bool !PageNo !Word32 !(Maybe ShortByteString) !(Maybe ShortByteString) !Int
   deriving stock (Eq, Ord, Show)
 
 -- | The state a set of facts was proven against: the store, the version, the committed roots with the
@@ -355,7 +373,7 @@ fingerprintBytes = 8192
 -- fact and every packed read fact, counted from what is held. The ceiling on the reads a plan carries ('maxReadFactBytes') is
 -- checked against this form.
 factsRetainedBytes ∷ Facts → Int
-factsRetainedBytes (Facts _ fs pr) = fingerprintBytes + length fs * factBytes + packedReadsBytes pr
+factsRetainedBytes (Facts _ fs pr) = fingerprintBytes + sum (map factBytesOf fs) + packedReadsBytes pr
 
 -- | The accounted bytes of one remembered record fact: its key, its value and the entry around them. A fact is held in the
 -- plan's RAM (as a retained continuation), never in the window's page bytes.
@@ -370,6 +388,24 @@ readFactOverheadBytes = 128
 -- | The accounted bytes of one remembered fact.
 factBytes ∷ Int
 factBytes = 80
+
+-- | The accounted bytes of one fact: 'factBytes', and for a memo of a chain ('FactEdge') what it holds: 112 bytes (the constructor, its
+-- set node and the margin the suite measures it under) and each bound it carries, a @Just@, a byte string and its array (48 bytes)
+-- and the bytes of the key rounded to a word.
+factBytesOf ∷ Fact → Int
+factBytesOf (FactEdge _ _ _ lo hi _) = memoBaseBytes + boundBytes lo + boundBytes hi
+factBytesOf _ = factBytes
+
+-- | The accounted bytes of a memo that holds no bound, and of one bound of a key of the given length.
+memoBaseBytes ∷ Int
+memoBaseBytes = 112
+
+boundBytes ∷ Maybe ShortByteString → Int
+boundBytes = maybe 0 (\b → memoBoundBytes (SBS.length b))
+
+-- | The accounted bytes of a bound of a key of the given length.
+memoBoundBytes ∷ Int → Int
+memoBoundBytes len = 48 + 8 * ((len + 7) `div` 8)
 
 -- | The window of a retry after a plan filled its window while proving: a fresh window for the same store,
 -- version, trust, work and used space, holding none of the pages or probes of the old one and the facts the
@@ -486,7 +522,7 @@ windowBytes w = Map.size (wPages w) * (pageSize + windowPageOverhead)
 
 -- | The accounted bytes of the probes a window holds, 'probeBytes' each.
 windowProbeBytes ∷ Window → Int
-windowProbeBytes w = Map.size (wProbes w) * probeBytes + Set.size (wProven w) * factBytes
+windowProbeBytes w = Map.size (wProbes w) * probeBytes + sum (map factBytesOf (Set.toList (wProven w)))
 
 -- | Decode a page read for a page number against the window's store and add it. A page
 -- that fails any check is refused and the window is unchanged. The window keeps its own
@@ -634,13 +670,22 @@ data Edit = Edit
   -- 'hotNodeBytes' each is accounted in a plan's scratch.
   }
 
+-- | An edit that starts with the facts another edit of the same plan has established (a plan's record and bookkeeping edits are two, and a
+-- checkpoint carries what both made).
+carryFacts ∷ Edit → Edit → Edit
+carryFacts from to = to {eFacts = eFacts from}
+
+-- | The accounted bytes of the memos ('FactEdge') a window carries.
+windowMemoBytes ∷ Window → Int
+windowMemoBytes w = sum [factBytesOf f | f@(FactEdge {}) ← Set.toList (wProven w)]
+
 -- | Note a fact this plan has just established.
 recordFact ∷ Fact → Edit → Edit
 recordFact f e = e {eFacts = f : eFacts e}
 
 -- | Note that a page's proof against every root is complete: its fact, and none of the progress that led to it.
 recordProof ∷ Fact → PageNo → Edit → Edit
-recordProof f pg e = e {eFacts = f : [x | x ← eFacts e, not (partOf x)]}
+recordProof f pg e = let kept = [x | x ← eFacts e, not (partOf x)] in foldr seq () kept `seq` e {eFacts = f : kept}
   where
     partOf (FactOutOf p _) = p == pg
     partOf _ = False
@@ -670,32 +715,40 @@ editReplaced = eReplaced
 editWindow ∷ Edit → Window
 editWindow = eWin
 
-newtype M a = M {unM ∷ Edit → Either Stop (a, Edit)}
+-- | A plan step: it threads the plan's state and, when it stops, hands back the state it had reached, so that the facts established
+-- before the stop (a validated neighbour, a proof) are not lost with it ('runMKeep').
+newtype M a = M {unM ∷ Edit → (Either Stop a, Edit)}
 
 instance Functor M where
   fmap f (M g) = M $ \e → case g e of
-    Left s → Left s
-    Right (a, e') → Right (f a, e')
+    (Left s, e') → (Left s, e')
+    (Right a, e') → (Right (f a), e')
 
 instance Applicative M where
-  pure a = M $ \e → Right (a, e)
+  pure a = M $ \e → (Right a, e)
   M f <*> M g = M $ \e → case f e of
-    Left s → Left s
-    Right (h, e') → case g e' of
-      Left s → Left s
-      Right (a, e'') → Right (h a, e'')
+    (Left s, e') → (Left s, e')
+    (Right h, e') → case g e' of
+      (Left s, e'') → (Left s, e'')
+      (Right a, e'') → (Right (h a), e'')
 
 instance Monad M where
   M g >>= f = M $ \e → case g e of
-    Left s → Left s
-    Right (a, e') → unM (f a) e'
+    (Left s, e') → (Left s, e')
+    (Right a, e') → unM (f a) e'
 
 -- | Run a plan step from a state.
 runM ∷ M a → Edit → Either Stop (a, Edit)
-runM = unM
+runM m e = case unM m e of
+  (Left s, _) → Left s
+  (Right a, e') → Right (a, e')
+
+-- | Run a plan step from a state, and have the state it stopped in too: what the step established before it stopped.
+runMKeep ∷ M a → Edit → (Either Stop a, Edit)
+runMKeep = unM
 
 stop ∷ Stop → M a
-stop s = M (\_ → Left s)
+stop s = M (\e → (Left s, e))
 
 -- | Fail the plan because an invariant of the tree code does not hold.
 failInvariant ∷ TreeId → M a
@@ -707,10 +760,10 @@ liftStop (Left s) = stop s
 liftStop (Right a) = pure a
 
 getEdit ∷ M Edit
-getEdit = M (\e → Right (e, e))
+getEdit = M (\e → (Right e, e))
 
 putEdit ∷ Edit → M ()
-putEdit e = M (\_ → Right ((), e))
+putEdit e = M (\_ → (Right (), e))
 
 -- | Load a node, counting the visit. The tree and level are checked against what
 -- the parent expects.
@@ -823,8 +876,14 @@ extremeLeaf tree leftmost ref lo hi lvl = do
 -- so checked against the bound it shares with the landing node. A key below the first
 -- separator belongs to the first child, never to nothing.
 validateLanding ∷ TreeId → Maybe Ref → ByteString → Int → M ()
-validateLanding _ Nothing _ _ = pure ()
-validateLanding tree (Just root) key stopLevel = go root Nothing Nothing Nothing Nothing Nothing
+validateLanding = validateLandingWith False
+
+-- | 'validateLanding', and when asked (@memo@, an EDIT's lookups: its tree may be a staged one, and a plan holds many) each neighbouring
+-- chain is MEMOISED ('FactEdge') once read, so that it is read only when no memo of it is known: the pages of the chain need not stay in a
+-- window, and a checkpoint carries the memo.
+validateLandingWith ∷ Bool → TreeId → Maybe Ref → ByteString → Int → M ()
+validateLandingWith _ _ Nothing _ _ = pure ()
+validateLandingWith memo tree (Just root) key stopLevel = go root Nothing Nothing Nothing Nothing Nothing
   where
     -- the landing node itself is not loaded here (a page being proved unreachable may not be in the
     -- window): its neighbours are, through the separators the descent used
@@ -839,8 +898,21 @@ validateLanding tree (Just root) key stopLevel = go root Nothing Nothing Nothing
             then sides ls' rs'
             else go (snd (es !! i)) lo' hi' (Just (nLevel n - 1)) ls' rs'
     sides ls rs = do
-      mapM_ (\(Sib r a b l) → extremeLeaf tree False r a b l) ls
-      mapM_ (\(Sib r a b l) → extremeLeaf tree True r a b l) rs
+      mapM_ (\(Sib r a b l) → edgeChecked memo tree False r a b l) ls
+      mapM_ (\(Sib r a b l) → edgeChecked memo tree True r a b l) rs
+
+-- | The extreme leaf of a neighbouring subtree read through its bounds (and not again when a memo of it is known and @memo@ is asked).
+edgeChecked ∷ Bool → TreeId → Bool → Ref → Maybe ByteString → Maybe ByteString → Maybe Int → M ()
+edgeChecked True tree leftmost ref@(DiskRef pg (Just crc)) lo hi lvl = do
+  e ← getEdit
+  let fact = FactEdge leftmost pg crc (toShort <$> lo) (toShort <$> hi) (maybe (-1) id lvl)
+  if windowKnows fact (eWin e) || fact `elem` eFacts e
+    then pure ()
+    else do
+      _ ← extremeLeaf tree leftmost ref lo hi lvl
+      e' ← getEdit
+      putEdit (recordFact fact e')
+edgeChecked _ tree leftmost ref lo hi lvl = () <$ extremeLeaf tree leftmost ref lo hi lvl
 
 -- | The page a tree currently holds at a level on the path of a key, if the tree has
 -- one there: the root when its level is the target, else the child reference of the
@@ -890,8 +962,12 @@ childBounds lo hi es i =
 
 -- | The value stored under a key.
 lookupKey ∷ TreeId → Maybe Ref → ByteString → M (Maybe ByteString)
-lookupKey _ Nothing _ = pure Nothing
-lookupKey tree (Just root) k = go root Nothing Nothing Nothing
+lookupKey = lookupKeyWith False
+
+-- | 'lookupKey' of an edit: the neighbours an absence is concluded from are memoised ('validateLandingWith').
+lookupKeyWith ∷ Bool → TreeId → Maybe Ref → ByteString → M (Maybe ByteString)
+lookupKeyWith _ _ Nothing _ = pure Nothing
+lookupKeyWith memo tree (Just root) k = go root Nothing Nothing Nothing
   where
     go ref lo hi lvl = do
       n ← loadChecked tree lo hi lvl ref
@@ -899,7 +975,7 @@ lookupKey tree (Just root) k = go root Nothing Nothing Nothing
         NLeaf es → case lookup k es of
           Just v → pure (Just v)
           -- an absence is concluded only after the leaf's neighbours were checked against its bounds
-          Nothing → validateLanding tree (Just root) k 0 >> pure Nothing
+          Nothing → validateLandingWith memo tree (Just root) k 0 >> pure Nothing
         -- absence is concluded only from a leaf that passed its bounds: a key below the first
         -- separator is looked for in the first child, which is validated like any other
         NInner es →
@@ -909,8 +985,12 @@ lookupKey tree (Just root) k = go root Nothing Nothing Nothing
 
 -- | The greatest entry whose key is at most the given key.
 floorKey ∷ TreeId → Maybe Ref → ByteString → M (Maybe (ByteString, ByteString))
-floorKey _ Nothing _ = pure Nothing
-floorKey tree (Just root) k = validateLanding tree (Just root) k 0 >> go root Nothing Nothing Nothing
+floorKey = floorKeyWith False
+
+-- | 'floorKey' of an edit ('lookupKeyWith').
+floorKeyWith ∷ Bool → TreeId → Maybe Ref → ByteString → M (Maybe (ByteString, ByteString))
+floorKeyWith _ _ Nothing _ = pure Nothing
+floorKeyWith memo tree (Just root) k = validateLandingWith memo tree (Just root) k 0 >> go root Nothing Nothing Nothing
   where
     go ref lo hi lvl = do
       n ← loadChecked tree lo hi lvl ref
@@ -942,8 +1022,12 @@ floorKey tree (Just root) k = validateLanding tree (Just root) k 0 >> go root No
 
 -- | The least entry whose key is at least (or, when strict, greater than) the key.
 ceilKey ∷ TreeId → Bool → Maybe Ref → ByteString → M (Maybe (ByteString, ByteString))
-ceilKey _ _ Nothing _ = pure Nothing
-ceilKey tree strict (Just root) k = validateLanding tree (Just root) k 0 >> go root Nothing Nothing Nothing
+ceilKey = ceilKeyWith False
+
+-- | 'ceilKey' of an edit ('lookupKeyWith').
+ceilKeyWith ∷ Bool → TreeId → Bool → Maybe Ref → ByteString → M (Maybe (ByteString, ByteString))
+ceilKeyWith _ _ _ Nothing _ = pure Nothing
+ceilKeyWith memo tree strict (Just root) k = validateLandingWith memo tree (Just root) k 0 >> go root Nothing Nothing Nothing
   where
     keep key = if strict then key > k else key >= k
     go ref lo hi lvl = do
@@ -1109,10 +1193,14 @@ data Ins = InsNone | InsOne !Ref | InsTwo !Ref !ByteString !Ref
 -- the value changes nothing (no copy, no replaced page): a no-op appends nothing.
 insertKey ∷ TreeId → Maybe Ref → ByteString → ByteString → M (Maybe Ref)
 insertKey tree root k v = do
-  existing ← lookupKey tree root k
-  if existing == Just v
-    then pure root
-    else case root of
+  existing ← lookupKeyWith True tree root k
+  if existing == Just v then pure root else insertAbsentKey tree root k v
+
+-- | 'insertKey' of a key the caller has PROVEN absent from the tree (a fact of the committed roots, 'FactNotIndexed', and the key is
+-- one no earlier write of the plan made): it looks nothing up, so reads no neighbour, and descends to the leaf alone.
+insertAbsentKey ∷ TreeId → Maybe Ref → ByteString → ByteString → M (Maybe Ref)
+insertAbsentKey tree root k v =
+  case root of
       Nothing → Just <$> fresh (Node tree 0 (NLeaf [(k, v)]))
       Just r → do
         res ← ins r Nothing Nothing Nothing
@@ -1175,7 +1263,7 @@ insertSorted (k, v) es = before ++ [(k, v)] ++ dropWhile ((== k) . fst) after
 deleteKey ∷ TreeId → Maybe Ref → ByteString → M (Maybe Ref)
 deleteKey _ Nothing _ = pure Nothing
 deleteKey tree root@(Just r0) k = do
-  existing ← lookupKey tree root k
+  existing ← lookupKeyWith True tree root k
   case existing of
     Nothing → pure root
     Just _ → do

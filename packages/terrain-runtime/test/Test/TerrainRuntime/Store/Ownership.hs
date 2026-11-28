@@ -28,6 +28,7 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
+import Data.List (isInfixOf)
 import Data.Word (Word64)
 import Hetoimasia.Terrain.Discovery (Record (..), RecordKey (..))
 import Hetoimasia.Terrain.Residency (ArenaId (..))
@@ -40,6 +41,7 @@ import Hetoimasia.Terrain.Runtime.Store.Internal.State
 import Hetoimasia.Terrain.Runtime.Store.Internal.Tree (windowInsert)
 import Test.Hspec
 import Test.TerrainRuntime.Store.Harness
+import Test.TerrainRuntime.Store.Protocol (driveFrom)
 import Test.TerrainRuntime.Store.Reference
 import Test.TerrainRuntime.Store.Workload
 
@@ -264,6 +266,53 @@ spec = describe "page ownership against forged records with valid checksums" $ d
         case unpinned of
           Planned plan → map fst (plPages plan) `shouldSatisfy` (PageNo v `elem`)
           other → expectationFailure ("the unpinned plan should accept the forged extent: " <> take 200 (show other))
+    it "proves a page unreachable one pinned root at a time through a window of one landing: a checkpoint inside the proof, the outcome of a wide window, and a refusal when only a later pinned root owns the page" $ do
+      -- three readers pinned at three versions of a churned store, each with pages no other root reaches; the loose list offers each of those
+      -- pages (a page the supply takes, so that the plan must prove it unreachable): the plan is refused as live through a window of
+      -- the edit and ONE landing, which cannot hold the paths of every root at once, as it is through one that can
+      (h0, ref0, g0) ← fixture
+      let acquire h = do
+            (tok, s') ← must (either (Left . show) Right (acquireReader (hStore h)))
+            pure (h {hStore = s'}, tok)
+          churned st = must (foldM (\s _ → churn s 30) st [1 .. 6 ∷ Int])
+      (h1, t1) ← acquire h0
+      (h2, r2, g2) ← churned (h1, ref0, g0)
+      (h3, t2) ← acquire h2
+      (h4, r4, g4) ← churned (h3, r2, g2)
+      (h5, t3) ← acquire h4
+      (h6, _, _) ← churned (h5, r4, g4)
+      let toks = [t1, t2, t3]
+          walkPin t = case pinsOf (hStore h6) t of
+            Right pins → Set.fromList (twPages (walkTree (arenaOf h6) (sourceOf h6) (diskRead (hDisk h6)) ((\(PageNo p) → p) <$> pinRuns pins)))
+            Left _ → Set.empty
+          walks = map walkPin toks
+          exclusive i = Set.toAscList (Set.difference (walks !! i) (Set.unions (livePages h6 : [w | (j, w) ← zip [0 ∷ Int ..] walks, j /= i])))
+          hf = max 1 (heightOf h6 TreeFree)
+          hrec = max 1 (maximum [heightOf h6 t | t ← [TreeRuns, TreeLinks, TreeTodo]])
+          lim = editWindowPages 1 (max 0 (heightOf h6 TreeRetire - 1)) hf hrec 0
+          tight = standardBounds {bdWindowPages = lim, bdWindowBytes = lim * windowPageBytes}
+          planWith bounds hh = fillCounting hh (storeWindow (hStore hh)) (\w → planDeltaPinned bounds (hCfg hh) (hIdent hh) (storeRoots (hStore hh)) (pinnedRoots (hStore hh)) w Ordinary (oneEdit hh))
+      -- the third (last) pinned root owns pages that neither the committed tree nor the other two reach
+      concatMap exclusive [0 .. 2] `shouldSatisfy` (not . null)
+      checkpointed ← forM [(i, v) | i ← [0 .. 2], v ← take 2 (exclusive i)] $ \(i, v) → do
+        let forged = withRoots h6 (\r → r {rLoose = PageNo v : rLoose r})
+        (wide, _, _, _) ← must (planWith standardBounds forged)
+        (narrow, _, _, cps) ← must (planWith tight forged)
+        refusedLive ("a loose page only pinned root " <> show i <> " reaches, wide") v wide
+        refusedLive ("a loose page only pinned root " <> show i <> " reaches, one landing") v narrow
+        pure cps
+      -- the window could not hold the paths of every root at once: the proofs took checkpoints, in the middle of a page's proof
+      sum checkpointed `shouldSatisfy` (> 0)
+      -- and driven as a caller drives it, through the checkpoint guard that counts a checkpoint for each root of a page's proof: the refusal is the
+      -- driver's own, named, the one the wide window ends in, and never the stall of a guard that ran out
+      forM_ [(i, v) | i ← [0 .. 2], v ← take 1 (exclusive i)] $ \(_, v) → do
+        let forged = withRoots h6 (\r → r {rLoose = PageNo v : rLoose r})
+            driven bounds = driveFrom forged (storeWindow (hStore forged)) (\hh w → planDeltaPinned bounds (hCfg hh) (hIdent hh) (storeRoots (hStore hh)) (pinnedRoots (hStore hh)) w Ordinary (oneEdit hh))
+            named = "SuppliedPageLive (PageNo " <> show v <> ")"
+            refusedAs out = case out of
+              Left msg → (named `isInfixOf` msg, "stalled" `isInfixOf` msg)
+              Right _ → (False, False)
+        (refusedAs (driven standardBounds), refusedAs (driven tight)) `shouldBe` ((True, False), (True, False))
     it "refuses a free extent that lies wholly past the used space, where no tail page and no probe would meet it" $ do
       (h, _, _) ← fixture
       let hw = rHw (storeRoots (hStore h))

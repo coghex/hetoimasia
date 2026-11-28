@@ -7,7 +7,7 @@
 -- the facade documents, for EVERY starting work limit from 1 to 64, for discovery, a standalone removal and maintenance, under
 -- the standard bounds and under the tightest window the at-once bounds allow: pending work always drains, and no step
 -- ever answers 'Invalid', 'Integrity', 'Stale' or any capacity the protocol does not name.
-module Test.TerrainRuntime.Store.Protocol (spec, fullSpec) where
+module Test.TerrainRuntime.Store.Protocol (spec, fullSpec, driveFrom) where
 
 import Control.Monad (foldM, forM, forM_)
 import Data.Bifunctor (first)
@@ -154,7 +154,9 @@ unboundedReads ∷ Bounds
 unboundedReads = standardBounds {bdWindowPages = 1000000, bdWindowBytes = maxBound `div` 2, bdReadResidue = maxBound}
 
 tightBounds ∷ Int → Bounds
-tightBounds lim = standardBounds {bdWindowPages = lim, bdWindowBytes = lim * windowPageBytes}
+-- | A window of the given pages and a read residue of a few: the read phase hands what it read on as facts as soon as it holds more, so the
+-- checkpoints these tests exercise happen whatever the residue of the production bounds leaves a read phase.
+tightBounds lim = standardBounds {bdWindowPages = lim, bdWindowBytes = lim * windowPageBytes, bdReadResidue = 8}
 
 recordHeight ∷ H → Int
 recordHeight h = maximum [heightOf h t | t ← [TreeRuns, TreeLinks, TreeTodo]]
@@ -496,11 +498,18 @@ readPhaseSpec = describe "the read phase: records are facts, a window never hold
     (removalWorstProbes, discoveryUnitWorstProbes, minimumRemovalPages) `shouldBe` (205, 120, 205)
     ((removalWindowPages maxRetireInternals (maxLevel + 1) (maxLevel + 1) maxReaders) * windowPageBytes + removalWorstProbes * probeBytes <= maxWindowBytes) `shouldBe` True
     ((removalWindowPages maxRetireInternals (maxLevel + 1) (maxLevel + 1) maxReaders + 1) * windowPageBytes + removalWorstProbes * probeBytes > maxWindowBytes) `shouldBe` True
-    -- the window's byte limit is the owner's approved figure, 1,376,256 bytes (21 times 64 KiB): it holds the worst explicit edit (a tagged edit of
-    -- eight record writes) at the tallest trees with its ownership probes and one read's page, whatever the readers pinned (a proof of one root at
-    -- a time), and what it leaves beside them is the read residue
-    let needed = editWindowPages maxEditWrites maxRetireInternals (maxLevel + 1) (maxLevel + 1) maxReaders * windowPageBytes + removalWorstProbes * probeBytes + windowPageBytes
-    (maxWindowBytes >= needed, maxWindowBytes, maxWindowBytes `mod` (64 * 1024)) `shouldBe` (True, 1376256, 0)
+    -- the window's byte limit is DERIVED, as it was approved: the whole pages of the worst explicit edit (a tagged edit of eight record writes) at the
+    -- tallest trees with every reader pinned and a path of each root (306 pages, 1,312,128 bytes), its ownership probes and one read's page,
+    -- rounded up to 64 KiB, and no larger: 1,376,256 bytes, and the next multiple down would not hold it
+    let h8 = maxLevel + 1
+        approvedPages = maxEditWrites * h8 + (maxEditWrites * h8 + 1) + maxRetireInternals + 3 * h8 + (1 + maxReaders) * h8
+        approvedNeeded = approvedPages * windowPageBytes + removalWorstProbes * probeBytes + windowPageBytes
+    (approvedPages, maxWindowBytes >= approvedNeeded, maxWindowBytes - approvedNeeded < 64 * 1024, maxWindowBytes `mod` (64 * 1024)) `shouldBe` (306, True, True, 0)
+    (maxWindowBytes - 64 * 1024 < approvedNeeded) `shouldBe` True
+    -- the planner's own requirement now (one proof of one root at a time) is checked against that ceiling apart: it holds the edit and a landing,
+    -- fits the approved window with the probes and a page to spare, and the read residue is what it leaves
+    let needed = editWindowPages maxEditWrites maxRetireInternals h8 h8 maxReaders * windowPageBytes + removalWorstProbes * probeBytes + windowPageBytes
+    (needed <= maxWindowBytes, editWindowPages maxEditWrites maxRetireInternals h8 h8 maxReaders <= approvedPages) `shouldBe` (True, True)
     -- the facts of the worst removal and of a discovery unit are RAM the feasibility proofs count, and they fit
     (maxEditReads * recordFactBytes <= maxReadFactBytes, worstEdgeReads * recordFactBytes <= maxReadFactBytes) `shouldBe` (True, True)
     printLine ("READPHASE bounds: residue " <> show readResiduePages <> " pages; promised removal at (8,8,16) = " <> show (removalWindowPages maxRetireInternals 8 8 16) <> ", discovery unit = " <> show (discoveryUnitWindowPages maxRetireInternals 8 8 16) <> ", one read at 8 levels = " <> show (readPathPages 8) <> "; facts: removal " <> show (maxEditReads * recordFactBytes) <> " B, discovery unit " <> show (worstEdgeReads * recordFactBytes) <> " B, ceiling " <> show maxReadFactBytes)
@@ -655,7 +664,7 @@ readPhaseSpec = describe "the read phase: records are facts, a window never hold
     let planner bounds hh w = planRemovalWith bounds env (hStore hh) w tile
         firstCheckpoint w n
           | n > (4000 ∷ Int) = expectationFailure "no checkpoint" >> fail "cp"
-          | otherwise = case planner standardBounds h w of
+          | otherwise = case planner (tightBounds (removalPromise h)) h w of
               Pending p → case diskRead (hDisk h) p >>= \bs → either (const Nothing) Just (windowInsert (cfgUsablePages (hCfg h)) p bs w) of
                 Just w' → firstCheckpoint w' (n + 1)
                 Nothing → expectationFailure "page" >> fail "page"

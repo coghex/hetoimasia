@@ -74,11 +74,11 @@ import Hetoimasia.Terrain.Coordinate (TileCoord)
 import Hetoimasia.Terrain.Discovery (Env)
 import Hetoimasia.Terrain.Shape (CornerMask)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Admission (Failure, classifyPlan)
-import Hetoimasia.Terrain.Runtime.Store.Internal.Format (PageError, PageNo, maxTxnPages)
+import Hetoimasia.Terrain.Runtime.Store.Internal.Format (PageError, PageNo, maxLevel, maxTxnPages)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Model (Store, planDiscovery, planMaintenance, planNarrowing, planRemoval, planWriteProbeFor, storeConfig, storeWindow)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan (CapacityWhy (..), Plan, PlanRefusal (..), Planned (..))
-import Hetoimasia.Terrain.Runtime.Store.Internal.State (cfgTotalPages, maxEditReads, maxReclaimPages)
-import Hetoimasia.Terrain.Runtime.Store.Internal.Tree (Facts, Window, reduceWork, windowCheckpoint, windowInsert, windowPageNumbers, windowProbe, windowReadFactCount, windowSize, windowWork)
+import Hetoimasia.Terrain.Runtime.Store.Internal.State (cfgTotalPages, maxEditReads, maxEditWrites, maxMemoBytes, maxReaders, maxReclaimPages)
+import Hetoimasia.Terrain.Runtime.Store.Internal.Tree (Facts, Window, memoBaseBytes, reduceWork, windowCheckpoint, windowInsert, windowPageNumbers, windowProbe, windowReadFactCount, windowSize, windowWork)
 
 -- | One planning call through a window. The production planners are the three below;
 -- a suite that plans under tighter bounds supplies its own, so the protocol it checks
@@ -189,11 +189,17 @@ data Supply
   | ProtocolError !Stall
   deriving stock (Show)
 
--- | The checkpoints ONE window can take. A checkpoint always carries a new fact; a
--- transaction takes at most as many as the pages it writes plus the pages it verifies
--- consumed by an entry it frees, and a read phase one more for each record it reads.
+-- | The checkpoints ONE window can take. A checkpoint always carries a new fact, so a plan takes at most as many as the facts it can make:
+-- the proofs of each page it writes (unreachable from the committed root and from each reader pinned, each a fact of its own; not retired;
+-- not free), the proof of each number it retires (absent from the index), the memos of its edit's lookups (each at least 'memoBaseBytes',
+-- the most 'maxMemoBytes' hold), the pages a reclamation chunk consumes, and a read phase one for each record it reads.
 maxCheckpoints ∷ Int
-maxCheckpoints = maxTxnPages + maxReclaimPages + maxEditReads
+maxCheckpoints =
+  maxTxnPages * (maxReaders + 1 + 2)
+    + (maxEditWrites * (maxLevel + 1) + 1)
+    + maxMemoBytes `div` memoBaseBytes
+    + maxReclaimPages
+    + maxEditReads
 
 -- | Begin planning against a store through a fresh window.
 newDriver ∷ Store → Planner → Driver
