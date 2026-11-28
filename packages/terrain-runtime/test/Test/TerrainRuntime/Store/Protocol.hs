@@ -496,10 +496,11 @@ readPhaseSpec = describe "the read phase: records are facts, a window never hold
     (removalWorstProbes, discoveryUnitWorstProbes, minimumRemovalPages) `shouldBe` (205, 120, 205)
     ((removalWindowPages maxRetireInternals (maxLevel + 1) (maxLevel + 1) maxReaders) * windowPageBytes + removalWorstProbes * probeBytes <= maxWindowBytes) `shouldBe` True
     ((removalWindowPages maxRetireInternals (maxLevel + 1) (maxLevel + 1) maxReaders + 1) * windowPageBytes + removalWorstProbes * probeBytes > maxWindowBytes) `shouldBe` True
-    -- the window's byte limit is DERIVED from the worst explicit edit (a tagged edit, the removal's eight-write successor) at the
-    -- tallest trees with every reader pinned: its pages, its ownership probes and one read's page, rounded up to 64 KiB, and no larger
+    -- the window's byte limit is the owner's approved figure, 1,376,256 bytes (21 times 64 KiB): it holds the worst explicit edit (a tagged edit of
+    -- eight record writes) at the tallest trees with its ownership probes and one read's page, whatever the readers pinned (a proof of one root at
+    -- a time), and what it leaves beside them is the read residue
     let needed = editWindowPages maxEditWrites maxRetireInternals (maxLevel + 1) (maxLevel + 1) maxReaders * windowPageBytes + removalWorstProbes * probeBytes + windowPageBytes
-    (maxWindowBytes >= needed, maxWindowBytes - needed < 64 * 1024, maxWindowBytes `mod` (64 * 1024)) `shouldBe` (True, True, 0)
+    (maxWindowBytes >= needed, maxWindowBytes, maxWindowBytes `mod` (64 * 1024)) `shouldBe` (True, 1376256, 0)
     -- the facts of the worst removal and of a discovery unit are RAM the feasibility proofs count, and they fit
     (maxEditReads * recordFactBytes <= maxReadFactBytes, worstEdgeReads * recordFactBytes <= maxReadFactBytes) `shouldBe` (True, True)
     printLine ("READPHASE bounds: residue " <> show readResiduePages <> " pages; promised removal at (8,8,16) = " <> show (removalWindowPages maxRetireInternals 8 8 16) <> ", discovery unit = " <> show (discoveryUnitWindowPages maxRetireInternals 8 8 16) <> ", one read at 8 levels = " <> show (readPathPages 8) <> "; facts: removal " <> show (maxEditReads * recordFactBytes) <> " B, discovery unit " <> show (worstEdgeReads * recordFactBytes) <> " B, ceiling " <> show maxReadFactBytes)

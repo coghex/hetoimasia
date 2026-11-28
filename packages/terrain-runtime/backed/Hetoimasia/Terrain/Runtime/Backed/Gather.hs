@@ -212,9 +212,9 @@ startGatherCapped pin cap store columns = case acquireReader store of
 -- it reads through the window it is given, refuses the pages the caller already failed to read, and
 -- never releases the pin ('endGather' is the caller's own, once, for the pin as a whole). The caller
 -- takes the window back with 'gatherWindow' for its next read on the same pin. Its window may pin the
--- reader's whole credit: what it keeps is charged to its caller's reservation, as a load's is.
-gatherOnPin ∷ ReaderToken → Word64 → Window → Map PageNo Condition → Int → [(Column, Int64, Int64)] → Gather
-gatherOnPin token version window refused cap columns = Gather token window columns Nothing gatherPinLimit maxRangeRecords 0 0 [] cap 0 columns Nothing version False refused
+-- pages it is given (the reader's whole credit, 'gatherPinLimit', in production): what it keeps is charged to its caller's reservation, as a load's is.
+gatherOnPin ∷ Int → ReaderToken → Word64 → Window → Map PageNo Condition → Int → [(Column, Int64, Int64)] → Gather
+gatherOnPin pin token version window refused cap columns = Gather token window columns Nothing pin maxRangeRecords 0 0 [] cap 0 columns Nothing version False refused
 
 -- | The window the gather reads through, for the next read on the same pin.
 gatherWindow ∷ Gather → Window

@@ -19,7 +19,7 @@ import Data.Int (Int64)
 import Hetoimasia.Terrain.Discovery (Record (..), RecordKey (..), maxBatchUpdates)
 import Hetoimasia.Terrain.Residency (ArenaId (..))
 import Hetoimasia.Terrain.Runtime.Store.Internal.Format
-import Hetoimasia.Terrain.Runtime.Store.Internal.Page (Body (..), Page (..), decodePage, encodePage)
+import Hetoimasia.Terrain.Runtime.Store.Internal.Page (Body (..), Child (..), Page (..), decodePage, encodePage)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Model
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan
 import Hetoimasia.Terrain.Runtime.Store.Internal.Records (be64, decodeKey)
@@ -357,6 +357,56 @@ spec = describe "pinned readers, retirement and reclamation" $ do
     forM_ answers $ \(k, (found, _)) → take 1 found `shouldBe` [floorOf k]
     -- the window holds at most the pages of two landings of a tree of this height, however the two sit
     maximum [n | (_, (_, n)) ← answers] `shouldSatisfy` (<= 2 * readLandingPages height - 1)
+  it "proves a page unreachable from each root of distinct pinned versions in the pages of one landing, for a page under an interior child of the root" $ do
+    -- a runs tree whose root has at least three children, three readers pinned at three versions that each replace the page under the middle
+    -- child (so their roots are distinct), and the probe of that page's first key at its level against every one of those roots and the
+    -- committed one: each proof alone holds no more than one landing, however many roots there are (the proof of a root is a unit of its own)
+    let keys = [runKey (toInteger (i `div` 100)) (toInteger (i `mod` 100)) 10 | i ← [0 .. 59999 ∷ Int]]
+        chunks [] = []
+        chunks ks = let (now, later) = splitAt (3 * maxBatchUpdates - 2) ks in now : chunks later
+        commit hh ups = do
+          (hh', out) ← commitDelta hh Ordinary (deltaFor (hStore hh) True False 1 ups)
+          case out of
+            Committed _ → Right hh'
+            other → Left ("history was not built: " <> show other)
+    built ← must (foldM (\hh ks → commit hh [(k, Just (runRec 20)) | k ← ks]) (newH smallSpec ident0) (chunks keys))
+    let height = heightOf built TreeRuns
+        total = cfgUsablePages (hCfg built)
+        decodeAt h p = either (const Nothing) Just . decodePage (hIdent h) total p =<< diskRead (hDisk h) p
+        rootOf' h = maybe (expectationFailure "a runs root expected" >> fail "root") pure (rootOf (storeRoots (hStore h)) TreeRuns)
+    height `shouldSatisfy` (>= 3)
+    root0 ← rootOf' built
+    (probed, child) ← case decodeAt built root0 of
+      Just (Page _ _ _ (Inner es)) | length es >= 3 → case es !! (length es `div` 2) of
+        (k, Child c _) → pure (k, c)
+      other → expectationFailure ("a root of three children or more expected: " <> show (fmap (\(Page _ l _ b) → (l, case b of Inner es → length es; _ → 0)) other)) >> fail "root"
+    probeKey ← maybe (expectationFailure "a run key expected" >> fail "key") pure (decodeKey TreeRuns probed)
+    -- three versions, a reader pinned at each, each replacing the pages under that child by updating the key it starts at
+    let pinnedAfter h key value = do
+          h1 ← must (commit h [(key, Just (runRec value))])
+          (tok, s1) ← must (either (Left . show) Right (acquireReader (hStore h1)))
+          pure (h1 {hStore = s1}, tok)
+    (tok0, s0) ← must (either (Left . show) Right (acquireReader (hStore built)))
+    (hA, tokA) ← pinnedAfter built {hStore = s0} probeKey 21
+    (hB, tokB) ← pinnedAfter hA probeKey 22
+    (hC, tokC) ← pinnedAfter hB probeKey 23
+    roots ← mapM rootOf' [built, hA, hB, hC]
+    length (nub roots) `shouldBe` 4
+    let probeAt h (tok, root) = do
+          w0 ← either (const (Left "stale")) Right (readerWindow (hStore h) tok)
+          let go w (n ∷ Int) = case runM (livePageAt TreeRuns (Just (Disk root)) probed 1) (newEdit 0 w) of
+                Right (found, _) → Right (found, windowSize w)
+                Left (Need p) | n < 400 → case diskRead (hDisk h) p of
+                  Just bs → either (Left . show) (\x → go x (n + 1)) (windowInsert (cfgUsablePages (hCfg h)) p bs w)
+                  Nothing → Left "missing page"
+                Left other → Left (show other)
+          go w0 0
+    answers ← must (mapM (probeAt hC) (zip [tok0, tokA, tokB, tokC] roots))
+    -- the oldest root still holds the page under the middle child; the newer roots hold others there
+    map (== Just child) (map fst answers) `shouldBe` [True, False, False, False]
+    -- each root has a page there, a different one
+    length (nub (map fst answers)) `shouldBe` 4
+    maximum (map snd answers) `shouldSatisfy` (<= readLandingPages height)
   it "refuses more readers than the bound and a token of another store" $ do
     let h = newH smallSpec ident0
         other = newH smallSpec (identOf 2 7)

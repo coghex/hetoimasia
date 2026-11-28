@@ -204,11 +204,11 @@ windowPageBytes = pageSize + windowPageOverhead
 -- window keeps validated page buffers, not decoded entry lists, so this is the memory
 -- it really holds; a plan that needs more is refused with a typed result.
 --
--- DERIVED, as the removal's was: the whole pages the worst explicit edit holds at once at the tallest trees with every
--- reader pinned ('editWindowPages' of 'maxEditWrites': 306 pages, 1,312,128 bytes), its ownership probes
--- ('removalWorstProbes', 205 of 'probeBytes': 52,480 bytes) and one read's page, 1,368,896 bytes, rounded up to the next
--- 64 KiB. The removal alone (7 writes) fit the former 1.25 MiB; the narrowing's eighth write did not. The 4 MiB of RAM, the
--- 256 pages and 1 MiB written per transaction and the 64 MiB edit bank are unchanged.
+-- The owner's approved figure (the amendment of the issue that raised it from 1.25 MiB, when the narrowing's eighth write did not fit),
+-- and it holds: the whole pages the worst explicit edit holds at once at the tallest trees ('editWindowPages' of 'maxEditWrites': 192
+-- pages, 823,296 bytes, with ONE proof of ONE root, a landing of the tallest tree) and its ownership probes ('removalWorstProbes',
+-- 205 of 'probeBytes': 52,480 bytes) leave the rest to the read phase ('readResiduePages'). The 4 MiB of RAM, the 256 pages and
+-- 1 MiB written per transaction and the 64 MiB edit bank are unchanged.
 maxWindowBytes ∷ Int
 maxWindowBytes = 1376256
 
@@ -300,6 +300,8 @@ writeRetainedBytes ∷ Int
 writeRetainedBytes = 640
 
 -- | The most proof facts a plan's window carries: four for each page it may overwrite and one for each page a reclamation chunk consumes.
+-- A page has at most three proofs (unreachable, not retired, not free), and the fourth covers the roots the proof of ONE page has
+-- made when a checkpoint interrupts it, at most 'maxReaders' and one: 'FactOutOf' is dropped when the page's proof is complete.
 maxProofFacts ∷ Int
 maxProofFacts = 4 * maxTxnPages + maxReclaimPages
 
@@ -360,14 +362,15 @@ looseGrowthOrdinary hf = maxClaimPages `div` 56 + 1 + hf
 -- * the unindexing of the page and the update or removal of the entry: @2 * hr@;
 -- * the allocator tree's own edit: @3 * hf@, and the free extents of the loose pages it spills ('maxSpillPages'), one
 --   path each: @maxSpillPages * hf@;
--- * the largest proof: that the page is unreachable, a path in the committed tree and in each pinned one,
---   @(1 + pins) * hrec@; that the retired-page index does not own it or has dropped it, @hr@; that the free
---   extents do not contain it, @hf@.
+-- * the largest proof, which is one LANDING ('readLandingPages'): that the page is unreachable from ONE root, the committed or a
+--   pinned one (the proof against the others is a unit of its own that a checkpoint carries: 'Hetoimasia.Terrain.Runtime.Store.Internal.Tree.FactOutOf'),
+--   of height @hrec@; that the retired-page index does not own it or has dropped it, of height @hr@; that the free extents do not
+--   contain it, of height @hf@. The pinned versions @pins@ do not widen it.
 --
 -- The probes it holds are at most @3 * hr + 3 * hf + 2 + maxSpillPages@ ('workOneProbeBytes').
 workOneWindowPages ∷ Int → Int → Int → Int → Int
-workOneWindowPages hr hf hrec pins =
-  (hr + 1) + 2 * hr + 3 * hf + maxSpillPages * hf + max ((1 + pins) * hrec) (max hr hf)
+workOneWindowPages hr hf hrec _pins =
+  (hr + 1) + 2 * hr + 3 * hf + maxSpillPages * hf + maximum [readLandingPages hrec, readLandingPages hr, readLandingPages hf]
 
 -- | The most internal pages a retirement tree can have, DERIVED from the key and entry sizes and the minimum fill the store
 -- enforces: at most @2 * maxRetiredPages@ records (an index record for each retired page and an entry for each list); a leaf
@@ -514,10 +517,12 @@ readPhaseProofFactBytes = maxProofFacts * factBytes
 maxTypedReads ∷ Int
 maxTypedReads = (txnRamLimit - maxWindowBytes - worstOwnershipBytes - maxReadFactBytes - readPhaseProofFactBytes - readPhaseStagedWriteBytes - readPhaseFixedBytes) `div` typedReadBytes
 
--- | The pages an edit of @writes@ record writes holds at once (see 'removalWindowPages', which is the edit of 'maxEditWrites').
+-- | The pages an edit of @writes@ record writes holds at once (see 'removalWindowPages', which is the edit of 'maxEditWrites'): what it
+-- writes and reads, and ONE proof, a landing of the record trees or of the allocator tree. The readers pinned (the last figure)
+-- are not part of it: each root's proof is a unit of its own.
 editWindowPages ∷ Int → Int → Int → Int → Int → Int
-editWindowPages writes retireInternals hf hrec pins =
-  writes * hrec + (writes * hrec + 1) + retireInternals + 3 * hf + max ((1 + pins) * hrec) hf
+editWindowPages writes retireInternals hf hrec _pins =
+  writes * hrec + (writes * hrec + 1) + retireInternals + 3 * hf + max (readLandingPages hrec) (readLandingPages hf)
 
 -- | The pages the SMALLEST unit of a discovery batch holds at once: one connection inspection, at most 'discoveryUnitWrites'
 -- (3) record writes, an edit like a removal's but of fewer writes, so never more than 'removalWindowPages'.

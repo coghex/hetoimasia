@@ -587,9 +587,35 @@ unreachable ∷ Bounds → Fingerprint → StoreConfig → Roots → [Pins] → 
 unreachable bounds fp cfg roots pins why mk win pages edit0 =
   case [pg | pg ← pages, not (windowKnows (mk pg) win), isNothing (windowProbeOf pg win)] of
     missing@(_ : _) → Left (OutProbes missing)
-    [] → proving bounds fp win mk one pages edit0
+    [] → do
+      edit1 ← proving bounds fp win mk one [pg | pg ← pages, not (isTree pg)] edit0
+      -- a tree page is proven root by root, each a unit of its own and the pages one after another: the window holds the paths of ONE
+      -- root with the edit, and a checkpoint carries the pages proven and the roots done of the page it interrupted
+      foldM
+        ( \e pg →
+            if windowKnows (mk pg) win
+              then Right e
+              else do
+                e' ← proving bounds fp win (\(p, r, _) → FactOutOf p r) viaRoot (unitsOf pg) e
+                Right (recordProof (mk pg) pg e')
+        )
+        edit1
+        [pg | pg ← pages, isTree pg]
   where
     total = cfgTotalPages cfg
+    treeProbe pg = case windowProbeOf pg win of
+      Just (ProbeTree tree level key) → Just (tree, level, key)
+      _ → Nothing
+    isTree = isJust . treeProbe
+    -- the committed root and every pinned one of the page's tree that is not empty, each once
+    unitsOf pg =
+      [ (pg, r, (tree, level, key))
+      | Just (tree, level, key) ← [treeProbe pg]
+      , Just r ← nub (rootOf roots tree : [pinRootFor tree p | p ← pins, isRecordTree tree])
+      ]
+    viaRoot (pg, r, (tree, level, key)) edit = do
+      (found, edit') ← phase edit (livePageAt tree (Just (Disk r)) (fromShort key) level)
+      if found == Just pg then refuse (Integrity (why pg)) else Right edit'
     one pg edit = case windowProbeOf pg win of
       Nothing → Left (OutProbes [pg])
       Just ProbeNone → Right edit
@@ -598,11 +624,7 @@ unreachable bounds fp cfg roots pins why mk win pages edit0 =
         case mv >>= decodeRetire total (versionKey v) of
           Just (_, ret) | retList ret == pg → refuse (Integrity (why pg))
           _ → Right edit'
-      Just (ProbeTree tree level key) →
-        let rootsOf = nub (rootOf roots tree : [pinRootFor tree p | p ← pins, isRecordTree tree])
-         in foldM (\e r → do
-                      (found, e') ← phase e (livePageAt tree (fmap Disk r) (fromShort key) level)
-                      if found == Just pg then refuse (Integrity (why pg)) else Right e') edit rootsOf
+      Just (ProbeTree _ _ _) → Right edit
 
 -- | What a window must hold to take one more page: it would outgrow its page or byte bound.
 windowFull ∷ Bounds → Window → Bool
@@ -621,14 +643,14 @@ fingerprintOf ident roots pins = Fingerprint ident (rVersion roots) (rootTrust r
 -- a committed root ('Disk'), never from a root the plan is staging, so it is the same before the plan stages
 -- its edits and after. No checkpoint carries no new fact: a window that cannot hold the edit and one proof
 -- is the typed window result.
-proving ∷ Bounds → Fingerprint → Window → (PageNo → Fact) → (PageNo → Edit → P Edit) → [PageNo] → Edit → P Edit
-proving bounds fp win mk prove pages edit0 = go edit0 pages
+proving ∷ Bounds → Fingerprint → Window → (u → Fact) → (u → Edit → P Edit) → [u] → Edit → P Edit
+proving bounds fp win mk prove units edit0 = go edit0 units
   where
     go edit [] = Right edit
-    go edit (pg : rest)
-      | windowKnows (mk pg) win = go edit rest
-      | otherwise = case prove pg edit of
-          Right edit' → go (recordFact (mk pg) edit') rest
+    go edit (u : rest)
+      | windowKnows (mk u) win = go edit rest
+      | otherwise = case prove u edit of
+          Right edit' → go (recordFact (mk u) edit') rest
           Left (OutNeed _) | windowFull bounds win → checkpoint edit
           Left o → Left o
     checkpoint edit = case editFacts edit of

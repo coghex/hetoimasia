@@ -474,6 +474,7 @@ spec = describe "the accounted-bytes constants against what is retained (forced 
       FactNotRetired (PageNo p) → fromIntegral p
       FactNotFree (PageNo p) → fromIntegral p
       FactGone v (PageNo p) → fromIntegral (v + p)
+      FactOutOf (PageNo a) (PageNo b) → fromIntegral (a + b)
     rootsOf full loose i =
       let pg k = if full then Just (PageNo (fromInteger (big (i + k)))) else Nothing
        in Roots

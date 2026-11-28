@@ -40,6 +40,7 @@
 module Hetoimasia.Terrain.Runtime.Backed.Regional
   ( Build
   , startBuild
+  , startBuildWith
   , stepBuild
   , cancelBuild
   , endBuild
@@ -64,7 +65,7 @@ import Hetoimasia.Terrain.Changes (Replacement (..), replacementRunsMeetingLevel
 import Hetoimasia.Terrain.Coordinate (RegionCoord, TileCoord)
 import qualified Hetoimasia.Terrain.Discovery as D
 import Hetoimasia.Terrain.Runtime.Backed.Backend (Closing, Handling (..))
-import Hetoimasia.Terrain.Runtime.Backed.Gather (GProgress (..), Gather, GatherRefusal (..), GatherRun, cancelGather, gatherFetching, gatherOnPin, gatherWindow, stepGather)
+import Hetoimasia.Terrain.Runtime.Backed.Gather (GProgress (..), Gather, GatherRefusal (..), GatherRun, cancelGather, gatherFetching, gatherOnPin, gatherPinLimit, gatherWindow, stepGather)
 import Hetoimasia.Terrain.Runtime.Backed.Query (QProgress (..), Query, cancelQuery, queryFetching, queryOnPin, queryWindow, stepQuery)
 import Hetoimasia.Terrain.Runtime.Backed.RegionCopy (RegionCopy (..), RegionWork (..), packKnowledge, packTerrain)
 import Hetoimasia.Terrain.Runtime.Backed.Txn (Io)
@@ -85,6 +86,8 @@ data Build = Build
   , bRefused ∷ !(Map PageNo Condition)
   -- ^ Pages this build failed to read, with their cause.
   , bDraining ∷ !Bool
+  , bPin ∷ !Int
+  -- ^ The pages one read of the build may pin: 'gatherPinLimit' in production.
   }
 
 -- | The read a build is in. The window the build reads through is held in exactly one place: the read in
@@ -126,10 +129,15 @@ data BProgress
 
 -- | Pin the committed version and begin building the regions.
 startBuild ∷ Store → D.Env → [RegionCoord] → Either GatherRefusal (Store, Build)
-startBuild store env regions = case acquireReader store of
+startBuild = startBuildWith gatherPinLimit
+
+-- | The same with the pages one read may pin given: a build on a small store, or one whose reads must start afresh, can be
+-- made with fewer than the reader's credit. The production bound is 'gatherPinLimit'.
+startBuildWith ∷ Int → Store → D.Env → [RegionCoord] → Either GatherRefusal (Store, Build)
+startBuildWith pin store env regions = case acquireReader store of
   Left refusal → Left (NoPin refusal)
   Right (token, pinned) → case (readerWindow pinned token, readerVersion pinned token) of
-    (Right _, Right version) → Right (pinned, Build token version env regions Between [] Map.empty False)
+    (Right _, Right version) → Right (pinned, Build token version env regions Between [] Map.empty False pin)
     _ → Left PinRefused
 
 -- | Release the build's pin (releasing twice changes nothing). Called once no read of it is in flight.
@@ -234,9 +242,9 @@ stepOnce io closing store b = case bUnit b of
   where
     -- what a read of these columns can keep: the runs the region's levels and one beyond each end hold
     keep columns = columns * replacementRunsMeetingLevels (34 ∷ Int)
-    haloGather window region = let cols = ranged region (D.regionHaloColumns region) in gatherOnPin (bToken b) (bVersion b) window (bRefused b) (keep (length cols)) cols
+    haloGather window region = let cols = ranged region (D.regionHaloColumns region) in gatherOnPin (bPin b) (bToken b) (bVersion b) window (bRefused b) (keep (length cols)) cols
     ranged region columns = let (lo, hi) = D.regionReadLevels region in [(c, lo, hi) | c ← columns]
-    evaluation window tile = queryOnPin (bToken b) (bVersion b) window (bRefused b) (\provider → D.queryCell (bEnv b) provider tile)
+    evaluation window tile = queryOnPin (bPin b) (bToken b) (bVersion b) window (bRefused b) (\provider → D.queryCell (bEnv b) provider tile)
     take1 = \case
       t : _ → Just t
       [] → Nothing
@@ -287,7 +295,7 @@ ownGatherOf ∷ Build → Window → RegionCoord → Gather
 ownGatherOf b window region =
   let (lo, hi) = D.regionReadLevels region
       cols = [(c, lo, hi) | c ← D.regionColumns region]
-   in gatherOnPin (bToken b) (bVersion b) window (bRefused b) (length cols * replacementRunsMeetingLevels (34 ∷ Int)) cols
+   in gatherOnPin (bPin b) (bToken b) (bVersion b) window (bRefused b) (length cols * replacementRunsMeetingLevels (34 ∷ Int)) cols
 
 -- | The runs of each column, air or mask, for a plan.
 runsByColumn ∷ [GatherRun] → Map Column [(Int64, Int64, Replacement)]

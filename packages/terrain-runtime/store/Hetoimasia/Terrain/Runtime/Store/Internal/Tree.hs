@@ -62,6 +62,7 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.Tree
   , fingerprintBytes
   , factsRetainedBytes
   , recordFact
+  , recordProof
   , editFacts
   , factBytes
   , windowCheckpoint
@@ -289,6 +290,10 @@ data Fact
   | FactNotRetired !PageNo
   | FactNotFree !PageNo
   | FactGone !Word64 !PageNo
+  | -- | The progress of one 'FactUnreachable' or 'FactRetirable' proof: the page is not reachable from THIS root (the root's page).
+    -- A proof against every committed and pinned root is a unit for each, so that the window holds one root's paths at a time;
+    -- the units of a page are dropped when its proof is complete.
+    FactOutOf !PageNo !PageNo
   deriving stock (Eq, Ord, Show)
 
 -- | The state a set of facts was proven against: the store, the version, the committed roots with the
@@ -379,10 +384,18 @@ windowCheckpoint (Facts fp fs (PackedReads rs fl)) w =
         { wPages = Map.empty
         , wProbes = Map.empty
         , wFacts = Just fp
-        , wProven = Set.union kept (Set.fromList fs)
+        , wProven = settled (Set.union kept (Set.fromList fs))
         , wReadRecords = Map.union rs keptR
         , wReadFloors = Map.union fl keptF
         }
+
+-- | The facts without the progress of a proof that is complete: a 'FactOutOf' of a page whose 'FactUnreachable' or 'FactRetirable'
+-- is known says nothing more. What stays is the progress of the proof a checkpoint interrupted, at most one page's.
+settled ∷ Set Fact → Set Fact
+settled fs = Set.filter live fs
+  where
+    live (FactOutOf pg _) = not (Set.member (FactUnreachable pg) fs || Set.member (FactRetirable pg) fs)
+    live _ = True
 
 -- | The window, with the facts it carries kept only if they were proven against this state.
 windowFactsFor ∷ Fingerprint → Window → Window
@@ -624,6 +637,13 @@ data Edit = Edit
 -- | Note a fact this plan has just established.
 recordFact ∷ Fact → Edit → Edit
 recordFact f e = e {eFacts = f : eFacts e}
+
+-- | Note that a page's proof against every root is complete: its fact, and none of the progress that led to it.
+recordProof ∷ Fact → PageNo → Edit → Edit
+recordProof f pg e = e {eFacts = f : [x | x ← eFacts e, not (partOf x)]}
+  where
+    partOf (FactOutOf p _) = p == pg
+    partOf _ = False
 
 -- | The facts this plan established so far, oldest first.
 editFacts ∷ Edit → [Fact]
