@@ -24,7 +24,7 @@ import Hetoimasia.Terrain.Runtime.Store.Internal.Page (Body (..), Child (..), Pa
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan
 import Hetoimasia.Terrain.Runtime.Store.Internal.Records (Retire (..), be64, encodeFree, encodeKey, encodeRetire, encodeValue, retiredKey)
 import Hetoimasia.Terrain.Runtime.Store.Internal.State
-import Hetoimasia.Terrain.Runtime.Store.Internal.Tree (Fact (..), Facts (..), limitWork, memoBaseBytes, memoBoundBytes, noReadFacts, windowCheckpoint, windowFactCount, windowFactsFor, windowKnows)
+import Hetoimasia.Terrain.Runtime.Store.Internal.Tree (Fact (..), Facts (..), limitWork, memoBaseBytes, memoBoundBytes, windowInsert, windowMemoBytes, windowProbe, windowWork, noReadFacts, windowCheckpoint, windowFactCount, windowFactsFor, windowKnows)
 import Test.TerrainRuntime.Output (printLine)
 import Test.Hspec
 import Test.TerrainRuntime.Store.Depth (Depth (..), atDepth)
@@ -447,19 +447,39 @@ specAtOnce depth = describe "round 13: the window a unit of work holds at once, 
             freedNarrow = mFreed (plMeasure b)
         printLine ("MEMO budget at a reclamation chunk on a two-level allocator: freed " <> show freedWide <> " wide, " <> show freedNarrow <> " with room for 12 memos, " <> show cps <> " checkpoints")
         (freedWide > 8, 0 < freedNarrow && freedNarrow < freedWide, cps > 0) `shouldBe` (True, True, True)
-        -- and in a window so small that the smaller chunk itself must checkpoint before it can finish: the size it reduced to goes with its
-        -- checkpoint, so the next call starts at that size (and not again at 64, which would pass the memo budget again and loop to the
-        -- checkpoint guard), and the memos the small chunk made are kept
+        -- THE WORK LIMIT ACROSS PLANNER CALLS, in the smallest window the smaller chunk plans in (so that it must itself checkpoint): each call
+        -- of the planner, the window it ran through and what it answered. The reduction is a checkpoint that publishes the reduced limit and
+        -- releases the memos the window held; a later checkpoint is taken while the reduced limit is active; the plan resumed from it succeeds
         let planNarrow n = fillCounting h0 work (planMaintenanceWith ((bounded n) {bdMemoBytes = room}) (hStore h0))
             freedAt n = case planNarrow n of
-              Right (Planned pl, _, _, k) → Just (mFreed (plMeasure pl), k)
+              Right (Planned pl, _, _, _) → Just (mFreed (plMeasure pl))
               _ → Nothing
             smallestNarrow n = if n > 2 && freedAt (n - 1) /= Nothing then smallestNarrow (n - 1) else n
             limNarrow = smallestNarrow lim
-        printLine ("MEMO budget, the smaller chunk in the smallest window it plans in (" <> show limNarrow <> " pages): " <> show (freedAt limNarrow))
-        case freedAt limNarrow of
-          Just (f, k) → (0 < f && f < freedWide, k > cps) `shouldBe` (True, True)
-          Nothing → expectationFailure "the smaller chunk did not plan in its smallest window"
+            boundsNarrow = (bounded limNarrow) {bdMemoBytes = room}
+            total = cfgUsablePages (hCfg h0)
+            fetch p = maybe BS.empty id (diskRead (hDisk h0) p)
+            trace w calls (n ∷ Int)
+              | n > 20000 = Left "planning did not settle"
+              | otherwise = case planMaintenanceWith boundsNarrow (hStore h0) w of
+                  Pending p → case diskRead (hDisk h0) p of
+                    Just bs → either (Left . show) (\w' → trace w' calls (n + 1)) (windowInsert total p bs w)
+                    Nothing → Left "missing page"
+                  PendingProbes ps → trace (foldl (\w' p → windowProbe total p (fetch p) w') w ps) calls (n + 1)
+                  Checkpoint facts@(Facts _ fs _) →
+                    let w' = windowCheckpoint facts w
+                        reduced = not (null [() | FactChunk _ ← fs])
+                     in trace w' ((windowWork w, windowWork w', reduced, windowMemoBytes w, windowMemoBytes w') : calls) (n + 1)
+                  other → Right (other, reverse calls)
+        (final, calls) ← must (trace work [] 0)
+        printLine ("MEMO budget, the work limit across planner calls (limit before, limit after, a reduction, memo bytes before, after): " <> show calls)
+        -- a reduction from a window that already holds memos: the limit falls, and the memos are released with the checkpoint
+        [() | (limBefore, limAfter, True, memosBefore, memosAfter) ← calls, limAfter < limBefore, memosBefore > 0, memosAfter == 0] `shouldSatisfy` (not . null)
+        -- and a checkpoint taken while a reduced limit is active (not a reduction itself), which the resumed plan goes on from
+        [() | (limBefore, _, False, _, _) ← calls, limBefore < 64] `shouldSatisfy` (not . null)
+        case final of
+          Planned pl → (0 < mFreed (plMeasure pl), mFreed (plMeasure pl) <= minimum [limAfter | (_, limAfter, _, _, _) ← calls]) `shouldBe` (True, True)
+          other → expectationFailure ("the resumed plan did not succeed: " <> take 200 (show other))
       other → expectationFailure ("both plans were expected, got " <> take 300 (show other))
   it "answers the typed window result, never a checkpoint with no new fact, for every window too small to hold the edit and one proof" $ do
     let (h0, _, _) = fragmented

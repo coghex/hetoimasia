@@ -63,10 +63,11 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.Tree
   , factsRetainedBytes
   , recordFact
   , carryFacts
+  , windowMemoBytes
   , editHeldFacts
   , editHeldFactBytes
   , editHeldMemoBytes
-  , dropMemos
+  , memoListCellBytes
   , withMemoCap
   , edgeFact
   , useMemo
@@ -698,23 +699,32 @@ carryFacts from to = to {eFacts = eFacts from}
 withMemoCap ∷ Int → Edit → Edit
 withMemoCap cap e = e {eMemoCap = cap}
 
+-- | The accounted bytes of the memos ('FactEdge') a window carries.
+windowMemoBytes ∷ Window → Int
+windowMemoBytes w = sum [factBytesOf f | f@(FactEdge {}) ← Set.toList (wProven w)]
+
 -- | THE LEDGER of what a plan holds of facts: every fact its window carries and every one the plan has made or used, each counted ONCE (a
 -- set), at the accounted bytes of its kind ('factBytesOf'). It is the one place the plan's fact bytes are read: the charge of every way a plan
 -- ends (a plan, a header-only plan, a reclamation chunk, a checkpoint) and the memo budget at the record of a memo.
 editHeldFacts ∷ Edit → Set Fact
 editHeldFacts e = Set.union (wProven (eWin e)) (Set.fromList (eFacts e))
 
--- | The accounted bytes of every fact the plan holds ('editHeldFacts').
+-- | The accounted bytes of every fact the plan holds ('editHeldFacts'), and the list cell the edit keeps for each MEMO its window also
+-- carries (a memo used again is two structures: the window's set entry and the edit's list cell, 'memoListCellBytes').
 editHeldFactBytes ∷ Edit → Int
-editHeldFactBytes = sum . map factBytesOf . Set.toList . editHeldFacts
+editHeldFactBytes e = sum (map factBytesOf (Set.toList (editHeldFacts e))) + memoListCellBytes * editSharedMemos e
 
--- | The accounted bytes of the memos ('FactEdge') among them.
+-- | The accounted bytes of the memos ('FactEdge') among them, the shared ones' list cells included.
 editHeldMemoBytes ∷ Edit → Int
-editHeldMemoBytes e = sum [factBytesOf f | f@(FactEdge {}) ← Set.toList (editHeldFacts e)]
+editHeldMemoBytes e = sum [factBytesOf f | f@(FactEdge {}) ← Set.toList (editHeldFacts e)] + memoListCellBytes * editSharedMemos e
 
--- | The edit, holding no memo: what a retry of a smaller unit of work starts from, carrying forward only what it makes or uses again.
-dropMemos ∷ Edit → Edit
-dropMemos e = e {eWin = (eWin e) {wProven = Set.filter (not . isMemo) (wProven (eWin e))}, eFacts = filter (not . isMemo) (eFacts e)}
+-- | The memos the edit has used again that its window carries.
+editSharedMemos ∷ Edit → Int
+editSharedMemos e = length [() | f@(FactEdge {}) ← eFacts e, Set.member f (wProven (eWin e))]
+
+-- | The bytes of the list cell an edit keeps for a fact it holds.
+memoListCellBytes ∷ Int
+memoListCellBytes = 24
 
 isMemo ∷ Fact → Bool
 isMemo (FactEdge {}) = True

@@ -134,7 +134,7 @@ import Hetoimasia.Terrain.Discovery (Authority (..), Header (..), headerBytes, m
 import Hetoimasia.Terrain.Residency (ArenaId, Revision (..))
 import Hetoimasia.Terrain.Runtime.Store.Internal.Format
 import Hetoimasia.Terrain.Runtime.Store.Internal.Page (maxPackedPayloadBytes, overlayNodeBytes)
-import Hetoimasia.Terrain.Runtime.Store.Internal.Tree (factBytes, memoBaseBytes, memoBoundBytes)
+import Hetoimasia.Terrain.Runtime.Store.Internal.Tree (factBytes, memoBaseBytes, memoBoundBytes, memoListCellBytes)
 
 mib ∷ Word64
 mib = 1024 * 1024
@@ -363,7 +363,8 @@ maxMemoBytes ∷ Int
 maxMemoBytes =
   2 * (maxEditWrites * memoOf maxKeyBytes + memoOf retireKeyBytes + (3 * (maxLevel + 1) + maxSpillPages) * memoOf 8)
   where
-    memoOf keyLen = memoBaseBytes + 2 * memoBoundBytes keyLen
+    -- each may be held by the window and used again by the edit: the edit's list cell beside the window's set entry
+    memoOf keyLen = memoBaseBytes + memoListCellBytes + 2 * memoBoundBytes keyLen
 
 -- | The pages a maintenance transaction of ONE page holds in its window AT ONCE, from the heights of the
 -- retirement tree (@hr@), the allocator tree (@hf@) and the record trees (@hrec@) and the readers pinned at

@@ -474,6 +474,32 @@ spec = describe "pinned readers, retirement and reclamation" $ do
         (mPagesWritten m, held > 1) `shouldBe` (0, True)
         (mWindowPages m, ramPagePins (mRam m), ramContinuation (mRam m) >= 8 * held) `shouldBe` (held, 16 * held, True)
       other → expectationFailure ("a header-only plan was expected, got " <> take 200 (show other))
+  it "charges the proof that a retired page is absent from the index at exactly its cost: one committed leaf, no neighbouring chain, no checkpoint" $ do
+    -- a tree of one leaf has no neighbour to read, so the plan that replaces the leaf makes no memo: the facts it holds are proofs, each of a
+    -- known cost and a count the fixture knows without the ledger: one for the committed page it replaced (absent from the index), and for each
+    -- page it writes below the used space three (unreachable, not retired, not free) when the loose list supplies it, two when an extent does
+    let first = runKey 1 0 10
+        keys = first : [runKey 1 (toInteger i) 10 | i ← [1 .. 4 ∷ Int]]
+        commit hh ups = do
+          (hh', out) ← commitDelta hh Ordinary (deltaFor (hStore hh) True False 1 ups)
+          case out of
+            Committed _ → Right hh'
+            other → Left ("history was not built: " <> show other)
+    h ← must (commit (newH smallSpec ident0) [(k, Just (runRec 20)) | k ← keys])
+    heightOf h TreeRuns `shouldBe` 1
+    let delta = deltaFor (hStore h) True False 1 [(first, Just (runRec 21))]
+    (planned, w, _, cps) ← must (fillCounting h (storeWindow (hStore h)) (\win → planDeltaPinned standardBounds (hCfg h) (hIdent h) (storeRoots (hStore h)) (pinnedRoots (hStore h)) win Ordinary delta))
+    case planned of
+      Planned pl → do
+        let m = plMeasure pl
+        (cps, mReplacedRecord m) `shouldBe` (0, 1)
+        -- the held facts are those proofs at their accounted cost, and the charge is exactly its parts
+        let underUsed = length [() | (PageNo q, _) ← plPages pl, q < rHw (storeRoots (hStore h))]
+            fromLoose = length [() | (pg, _) ← plPages pl, pg `elem` rLoose (storeRoots (hStore h))]
+            proofs = mReplacedRecord m + 3 * fromLoose + 2 * (underUsed - fromLoose)
+        (underUsed > 0, mFactBytes m) `shouldBe` (True, factBytes * proofs)
+        ramDecodedCopies (mRam m) `shouldBe` windowBytes w + windowProbesBytes w + factBytes * proofs + mOverlayBytes m
+      other → expectationFailure ("a plan was expected, got " <> take 200 (show other))
   it "refuses more readers than the bound and a token of another store" $ do
     let h = newH smallSpec ident0
         other = newH smallSpec (identOf 2 7)

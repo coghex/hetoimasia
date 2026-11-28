@@ -1180,7 +1180,7 @@ reclaimWith bounds cfg ident roots pins oldest win0 = case reclaimM of
                 List stamp xs | pgTree page == TreeRetire && stamp == e && length xs == fromIntegral (retCount ret) → Right xs
                 _ → refuse (Integrity MalformedRetirement)
               let (prefix, remaining) = splitAt (fromIntegral (retDone ret)) ps
-              attempt e ret prefix remaining version' e0 False (chunkSizes (length remaining))
+              attempt e ret prefix remaining version' e0 (chunkSizes (length remaining))
     -- A page a retirement entry names must be a record-tree page no committed or pinned
     -- tree reaches any more: it lies inside the used space, is classified as a record
     -- page (never a list page, a bookkeeping page or nothing) and is not the page the path
@@ -1200,15 +1200,13 @@ reclaimWith bounds cfg ident roots pins oldest win0 = case reclaimM of
         )
         unproven
       unreachable bounds fp cfg roots pins RetiredPageLive FactRetirable win pages edit0
-    attempt _ _ _ _ _ _ _ [] = refuse (Integrity MalformedRetirement)
-    attempt e ret prefix remaining version' edit reduced (c : cs) = case tryChunk (Just (e, ret, prefix, remaining)) version' edit c of
+    attempt _ _ _ _ _ _ [] = refuse (Integrity MalformedRetirement)
+    attempt e ret prefix remaining version' edit (c : cs) = case tryChunk (Just (e, ret, prefix, remaining)) version' edit c of
       Right plan → Right (Planned plan)
-      -- a chunk past the memo budget (or any other shrinkable refusal) is answered by the next smaller one, from an edit that holds none of
-      -- the larger one's memos; what the smaller one makes it carries through its own checkpoints
-      Left (OutRefuse why) | not (null cs) && tooBig why → attempt e ret prefix remaining version' (dropMemos edit) True cs
-      -- and the size it reduced to goes with the checkpoint, so the next call starts there and not again at the larger chunk
-      Left (OutNeed p fs) | reduced → Left (OutNeed p (FactChunk c : fs))
-      Left (OutCheckpoint (Facts fp' fs pr)) | reduced → Left (OutCheckpoint (Facts fp' (FactChunk c : fs) pr))
+      -- ONE RULE for a smaller chunk (a chunk past the memo budget, or any other shrinkable refusal): it is taken through a CHECKPOINT that
+      -- publishes the reduced work limit ('FactChunk', applied by 'windowCheckpoint') and releases every memo the window holds, and the next
+      -- call starts there, in a fresh window, so the memos a plan holds have one owner and the budget and the charge see all of them
+      Left (OutRefuse why) | (c' : _) ← cs, tooBig why → Left (OutCheckpoint (Facts fp [FactChunk c'] noReadFacts))
       Left o → Left o
     -- a page reclaimed already is absent from the index, or was reused since and retired again under
     -- a newer version (its list keeps the number): only an index record under this entry's own version,

@@ -257,8 +257,9 @@ spec = describe "the accounted-bytes constants against what is retained (forced 
         -- a memo the window carries and an edit uses again is held ONCE by both: the edit keeps the window's value, not the copy the lookup
         -- built to ask for it (measured with the window and the edit alive together, the asking copies dropped)
         <> [ do
-               v ← retainedPer 400 (ints 400) id (\is → pure (let w = windowCheckpoint (Facts (Fingerprint ident0 1 [] []) [memoOf retireKeyBytes i | i ← is] noReadFacts) (emptyWindow ident0 1) in (w, foldl' (\e i → useMemo (memoOf retireKeyBytes i) e) (newEdit 0 w) is))) (\(w, e) → evaluate (windowFactCount w + length (editFacts e)))
-               pure (Variant "memos a window carries and an edit has used, held together (one copy of each)" v (Just (factBytesOf (memoOf retireKeyBytes 1) + 24)))
+               v ← retainedPer 400 (ints 400) id (\is → pure (sharedMemos is)) (\(w, e) → evaluate (windowFactCount w + length (editFacts e)))
+               -- against what the PRODUCTION ledger charges for the same structures: the window's set entry and the edit's list cell of each
+               pure (Variant "memos a window carries and an edit has used, held together (one copy of each)" v (Just (editHeldMemoBytes (snd (sharedMemos [1])))))
            ]
         -- the bounds are slices of a 4 KiB page buffer when the memo is made: the memo copies them (and forces the copies), so it keeps nothing
         -- of the buffer, measured with the buffers dropped and the bounds NOT read before the measurement
@@ -508,6 +509,10 @@ spec = describe "the accounted-bytes constants against what is retained (forced 
       FactNotIndexed (PageNo p) → fromIntegral p
       FactChunk n → n
       FactEdge _ side (PageNo p) crc lo hi lvl → fromEnum side + fromIntegral p + fromIntegral crc + maybe 0 SBS.length lo + maybe 0 SBS.length hi + lvl
+    -- a window that carries the memos of the given numbers, and an edit over it that has used each again through a fresh copy of the lookup
+    sharedMemos is =
+      let w = windowCheckpoint (Facts (Fingerprint ident0 1 [] []) [memoOf retireKeyBytes i | i ← is] noReadFacts) (emptyWindow ident0 1)
+       in (w, foldl' (\e i → useMemo (memoOf retireKeyBytes i) e) (newEdit 0 w) is)
     page4k i = BS.pack [fromIntegral (i + j) | j ← [1 .. pageSize]]
     pageOf f = case f of
       FactEdge _ _ (PageNo p) _ _ _ _ → fromIntegral p
