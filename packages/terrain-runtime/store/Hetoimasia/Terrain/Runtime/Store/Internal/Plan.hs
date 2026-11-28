@@ -441,7 +441,7 @@ settleAt _ _ _ r = settle r
 -- carries, and the plan stops with the shrinkable 'TxnRamExceeded' as it makes one past 'bdMemoBytes', before a checkpoint ever holds more).
 needed ∷ Bounds → Fingerprint → Window → PageNo → [Fact] → Planned
 needed bounds fp win p fs
-  | not (null fs) && windowFull bounds win = Checkpoint (Facts fp fs noReadFacts)
+  | any (\f → not (windowKnows f win)) fs && windowFull bounds win = Checkpoint (Facts fp fs noReadFacts)
   | otherwise = Pending p
 
 -- ---------------------------------------------------------------------------
@@ -676,9 +676,10 @@ proving bounds fp win mk prove units edit0 = go edit0 units
           Right edit' → go (recordFact (mk u) edit') rest
           Left (OutNeed _ _) | windowFull bounds win → checkpoint edit
           Left o → Left o
-    checkpoint edit = case editFacts edit of
+    -- a checkpoint carries a new fact, and everything the plan made or used that it hands on (a memo it did not use is released)
+    checkpoint edit = case [f | f ← editFacts edit, not (windowKnows f win)] of
       [] → Left (OutRefuse (Capacity (if windowSize win + 1 > bdWindowPages bounds then WindowExceeded (windowSize win) else WindowBytesExceeded (windowBytes win))))
-      fs → Left (OutCheckpoint (Facts fp fs noReadFacts))
+      _ → Left (OutCheckpoint (Facts fp (editFacts edit) noReadFacts))
 
 -- | The one proof of ownership every page a plan is about to overwrite passes, against
 -- every owner there is: the committed trees and every pinned reader's tree and the
@@ -870,7 +871,7 @@ planDeltaPinned bounds cfg ident roots pins win0 cls cand = settleAt bounds fp w
                     }
                 windowN = windowSize win
                 steps = editSteps edit1 + editSteps bkEdit3
-            ram ← chargeFor bounds windowN (windowBytes win + windowProbeBytes win + editMemoBytes bkEdit3) (editFreshBytes edit1 + editFreshBytes bkEdit3) written (length writes) (listN + length replBk) m (windowReadFactBytes win)
+            ram ← chargeFor bounds windowN (windowBytes win + windowProbesBytes win + editHeldFactBytes bkEdit3) (editFreshBytes edit1 + editFreshBytes bkEdit3) written (length writes) (listN + length replBk) m (windowReadFactBytes win)
             let measure =
                   Measure
                     { mPagesWritten = written
@@ -922,7 +923,7 @@ headerOnly bounds _ ident roots cls cand next version' edit writes = do
       expected = hAuthority next
       next' = roots {rVersion = version', rHeader = next}
       win0 = editWindow edit
-  ram ← chargeFor bounds 0 (windowBytes win0) 0 0 (length writes) 0 0 (windowReadFactBytes win0)
+  ram ← chargeFor bounds 0 (windowBytes win0 + windowProbesBytes win0 + editHeldFactBytes edit) 0 0 (length writes) 0 0 (windowReadFactBytes win0)
   let measure =
         Measure 0 0 0 0 0 0 0 0 0 (editSteps edit) 0 ram (dlUpdates cand) (length writes) 0
   pure (finishPlan ident cls KindCandidate base next' cand [] measure expected version')
@@ -1196,7 +1197,7 @@ reclaimWith bounds cfg ident roots pins oldest win0 = case reclaimM of
     attempt _ _ _ _ _ _ [] = refuse (Integrity MalformedRetirement)
     attempt e ret prefix remaining version' edit (c : cs) = case tryChunk (Just (e, ret, prefix, remaining)) version' edit c of
       Right plan → Right (Planned plan)
-      Left (OutRefuse why) | not (null cs) && tooBig why → attempt e ret prefix remaining version' edit cs
+      Left (OutRefuse why) | not (null cs) && tooBig why → attempt e ret prefix remaining version' (dropMemos edit) cs
       Left o → Left o
     -- a page reclaimed already is absent from the index, or was reused since and retired again under
     -- a newer version (its list keeps the number): only an index record under this entry's own version,
@@ -1320,7 +1321,7 @@ reclaimWith bounds cfg ident roots pins oldest win0 = case reclaimM of
               , rRootCrcs = rootCrcsAfter roots encoded [(TreeRuns, rRuns roots), (TreeLinks, rLinks roots), (TreeTodo, rTodo roots), (TreeFree, free'), (TreeRetire, retire')]
               }
           windowN = windowSize win
-      ram ← chargeFor bounds windowN (windowBytes win + windowProbeBytes win + editMemoBytes bkEdit4) (editFreshBytes bkEdit4) written 0 (length replBk + c) m (windowReadFactBytes win)
+      ram ← chargeFor bounds windowN (windowBytes win + windowProbesBytes win + editHeldFactBytes bkEdit4) (editFreshBytes bkEdit4) written 0 (length replBk + c) m (windowReadFactBytes win)
       let measure =
             Measure
               { mPagesWritten = written

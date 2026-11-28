@@ -333,16 +333,15 @@ spec = describe "page ownership against forged records with valid checksums" $ d
       -- some checkpoint holds the page's proof against an earlier root, part way, and none holds the page as unreachable
       (length carried, [r | (_, r) ← carriedOut, r `elem` earlierRoots]) `shouldSatisfy` (\(n, rs) → n > 0 && not (null rs))
       [() | fs ← carried, FactUnreachable (PageNo q) ← fs, q == lastOnly] `shouldBe` []
-      -- and driven as a caller drives it, through the checkpoint guard that counts a checkpoint for each root of a page's proof: the refusal is the
-      -- driver's own, named, the one the wide window ends in, and never the stall of a guard that ran out
-      forM_ [(i, v) | i ← [0 .. 2], v ← take 1 (exclusive i)] $ \(_, v) → do
-        let forged = withRoots h6 (\r → r {rLoose = PageNo v : rLoose r})
-            driven bounds = driveFrom forged (storeWindow (hStore forged)) (\hh w → planDeltaPinned bounds (hCfg hh) (hIdent hh) (storeRoots (hStore hh)) (pinnedRoots (hStore hh)) w Ordinary (oneEdit hh))
-            named = "SuppliedPageLive (PageNo " <> show v <> ")"
-            refusedAs out = case out of
-              Left msg → (named `isInfixOf` msg, "stalled" `isInfixOf` msg)
-              Right _ → (False, False)
-        (refusedAs (driven standardBounds), refusedAs (driven tight)) `shouldBe` ((True, False), (True, False))
+      -- and driven as a caller drives it, in the very window that produced those checkpoints, through the checkpoint guard that counts a
+      -- checkpoint for each root of a page's proof: the driver resumes that partial proof and ends in the named refusal the wide window ends in,
+      -- never in the stall of a guard that ran out
+      let driven bounds = driveFrom forgedLast (storeWindow (hStore forgedLast)) (\hh w → planDeltaPinned bounds (hCfg hh) (hIdent hh) (storeRoots (hStore hh)) (pinnedRoots (hStore hh)) w Ordinary (oneEdit hh))
+          named = "SuppliedPageLive (PageNo " <> show lastOnly <> ")"
+          refusedAs out = case out of
+            Left msg → (named `isInfixOf` msg, "stalled" `isInfixOf` msg)
+            Right _ → (False, False)
+      (refusedAs (driven standardBounds), refusedAs (driven (boundedTo tightest))) `shouldBe` ((True, False), (True, False))
     it "refuses a free extent that lies wholly past the used space, where no tail page and no probe would meet it" $ do
       (h, _, _) ← fixture
       let hw = rHw (storeRoots (hStore h))

@@ -63,8 +63,10 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.Tree
   , factsRetainedBytes
   , recordFact
   , carryFacts
-  , windowMemoBytes
-  , editMemoBytes
+  , editHeldFacts
+  , editHeldFactBytes
+  , editHeldMemoBytes
+  , dropMemos
   , withMemoCap
   , edgeFact
   , recordProof
@@ -94,6 +96,7 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.Tree
   , windowProbe
   , windowProbeOf
   , windowProbeBytes
+  , windowProbesBytes
   , windowProbeCount
   , windowSize
   , windowVersion
@@ -416,7 +419,8 @@ memoBoundBytes len = 48 + 8 * ((len + 7) `div` 8)
 windowCheckpoint ∷ Facts → Window → Window
 windowCheckpoint (Facts fp fs (PackedReads rs fl)) w =
   let same = wFacts w == Just fp
-      kept = if same then wProven w else Set.empty
+      -- the memos a plan hands on are the ones it made or used; those it did not touch are released here
+      kept = if same then Set.filter (not . isMemo) (wProven w) else Set.empty
       keptR = if same then wReadRecords w else Map.empty
       keptF = if same then wReadFloors w else Map.empty
    in w
@@ -524,6 +528,9 @@ windowBytes ∷ Window → Int
 windowBytes w = Map.size (wPages w) * (pageSize + windowPageOverhead)
 
 -- | The accounted bytes of the probes a window holds, 'probeBytes' each.
+windowProbesBytes ∷ Window → Int
+windowProbesBytes w = Map.size (wProbes w) * probeBytes
+
 windowProbeBytes ∷ Window → Int
 windowProbeBytes w = Map.size (wProbes w) * probeBytes + sum (map factBytesOf (Set.toList (wProven w)))
 
@@ -686,13 +693,27 @@ carryFacts from to = to {eFacts = eFacts from}
 withMemoCap ∷ Int → Edit → Edit
 withMemoCap cap e = e {eMemoCap = cap}
 
--- | The accounted bytes of the memos ('FactEdge') a plan has made.
-editMemoBytes ∷ Edit → Int
-editMemoBytes e = sum [factBytesOf f | f@(FactEdge {}) ← eFacts e]
+-- | THE LEDGER of what a plan holds of facts: every fact its window carries and every one the plan has made or used, each counted ONCE (a
+-- set), at the accounted bytes of its kind ('factBytesOf'). It is the one place the plan's fact bytes are read: the charge of every way a plan
+-- ends (a plan, a header-only plan, a reclamation chunk, a checkpoint) and the memo budget at the record of a memo.
+editHeldFacts ∷ Edit → Set Fact
+editHeldFacts e = Set.union (wProven (eWin e)) (Set.fromList (eFacts e))
 
--- | The accounted bytes of the memos ('FactEdge') a window carries.
-windowMemoBytes ∷ Window → Int
-windowMemoBytes w = sum [factBytesOf f | f@(FactEdge {}) ← Set.toList (wProven w)]
+-- | The accounted bytes of every fact the plan holds ('editHeldFacts').
+editHeldFactBytes ∷ Edit → Int
+editHeldFactBytes = sum . map factBytesOf . Set.toList . editHeldFacts
+
+-- | The accounted bytes of the memos ('FactEdge') among them.
+editHeldMemoBytes ∷ Edit → Int
+editHeldMemoBytes e = sum [factBytesOf f | f@(FactEdge {}) ← Set.toList (editHeldFacts e)]
+
+-- | The edit, holding no memo: what a retry of a smaller unit of work starts from, carrying forward only what it makes or uses again.
+dropMemos ∷ Edit → Edit
+dropMemos e = e {eWin = (eWin e) {wProven = Set.filter (not . isMemo) (wProven (eWin e))}, eFacts = filter (not . isMemo) (eFacts e)}
+
+isMemo ∷ Fact → Bool
+isMemo (FactEdge {}) = True
+isMemo _ = False
 
 -- | Note a fact this plan has just established.
 recordFact ∷ Fact → Edit → Edit
@@ -921,14 +942,18 @@ edgeChecked ∷ Bool → TreeId → Bool → Ref → Maybe ByteString → Maybe 
 edgeChecked True tree leftmost ref@(DiskRef pg (Just crc)) lo hi lvl = do
   e ← getEdit
   let fact = edgeFact tree leftmost pg crc lo hi lvl
-  if windowKnows fact (eWin e) || fact `elem` eFacts e
+  if fact `elem` eFacts e
     then pure ()
-    else do
-      _ ← extremeLeaf tree leftmost ref lo hi lvl
-      e' ← getEdit
-      -- the memos a plan holds, those its window carries and those it has made, stay inside what the plan's RAM is charged for
-      let held = windowMemoBytes (eWin e') + editMemoBytes e' + factBytesOf fact
-      if held > eMemoCap e' then stop (MemoOver held) else putEdit (recordFact fact e')
+    else
+      if windowKnows fact (eWin e)
+        -- a memo the window carries and this plan uses again is carried forward: it is one the plan made or used that a checkpoint hands on
+        then putEdit (recordFact fact e)
+        else do
+          _ ← extremeLeaf tree leftmost ref lo hi lvl
+          e' ← getEdit
+          -- the memos a plan holds stay inside what its RAM is charged for: the ledger of what it holds, read here
+          let held = editHeldMemoBytes e' + factBytesOf fact
+          if held > eMemoCap e' then stop (MemoOver held) else putEdit (recordFact fact e')
 edgeChecked _ tree leftmost ref lo hi lvl = () <$ extremeLeaf tree leftmost ref lo hi lvl
 
 -- | The memo of a chain, its bounds COPIED out of the page buffers they are slices of and evaluated, so that a fact never keeps a 4 KiB page

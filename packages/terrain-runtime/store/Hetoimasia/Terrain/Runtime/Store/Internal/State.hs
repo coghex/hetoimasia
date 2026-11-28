@@ -476,7 +476,7 @@ readPathPages hrec = 2 * hrec
 -- landing's key continues into the leaf beside it, which is one of those neighbours. The count asks nothing of how full a
 -- node is, so every shape of tree and every position of the key is inside it.
 readLandingPages ∷ Int → Int
-readLandingPages h = h + 2 * (h - 1)
+readLandingPages h = max 0 (h + 2 * (h - 1))
 
 -- | The pages one step of a reader's read holds at the most, in the tallest tree: a read makes at most two landings (the
 -- floor of its start, and the scan from the floor's key, which may lie in the leaf before the start's) and the pages one
@@ -535,7 +535,7 @@ maxTypedReads = (txnRamLimit - maxWindowBytes - worstOwnershipBytes - maxReadFac
 -- or redistributes from a sibling (the leaf, and each level above it but the root), that sibling: @2 * hrec - 1@. Every one of them
 -- is indexed in the retirement tree, and read again by the plan that is run again after a checkpoint.
 worstReplacedPerWrite ∷ Int → Int
-worstReplacedPerWrite hrec = 2 * hrec - 1
+worstReplacedPerWrite hrec = max 0 (2 * hrec - 1)
 
 -- | The pages an edit of @writes@ record writes holds at once (see 'removalWindowPages', which is the edit of 'maxEditWrites'): what it
 -- writes and reads, and ONE proof, a landing of the record trees or of the allocator tree. The readers pinned (the last figure)

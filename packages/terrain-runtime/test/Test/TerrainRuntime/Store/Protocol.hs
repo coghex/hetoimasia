@@ -537,6 +537,15 @@ readPhaseSpec = describe "the read phase: records are facts, a window never hold
       -- the proof phase holds no more probes than the pages the removal writes, which 'removalWorstProbes' is derived from
       (cProbePeak (cOf tight) <= removalWorstProbes, cProbePeak (cOf std) <= removalWorstProbes) `shouldBe` (True, True)
       printLine ("READPHASE removal " <> show hops <> " hops: most probes a window held " <> show (cProbePeak (cOf tight)) <> " (tight), " <> show (cProbePeak (cOf std)) <> " (standard) of " <> show removalWorstProbes)
+  it "counts no negative window for an empty tree: every page count is zero or more at heights 0 to 8, and the first removal's promised window is a whole window" $ do
+    -- an empty tree has height zero: a record write reads and replaces no page of it and a landing holds none (a negative count would have made
+    -- the window of the first removal on a new store negative, refused by the window check before it began)
+    let hs = [0 .. maxLevel + 1]
+        grid = [(hf, hrec, pins) | hf ← hs, hrec ← hs, pins ← [0, maxReaders]]
+    [g | g@(hf, hrec, pins) ← grid, removalWindowPages maxRetireInternals hf hrec pins < 0 || discoveryUnitWindowPages maxRetireInternals hf hrec pins < 0 || workOneWindowPages hf hf hrec pins < 0] `shouldBe` []
+    (worstReplacedPerWrite 0, readLandingPages 0, readLandingPages 1) `shouldBe` (0, 0, 1)
+    let hNew = newH smallSpec ident0
+    (recordHeight hNew, removalPromise hNew > 0, removalPromise hNew <= maxWindowBytes `div` windowPageBytes) `shouldBe` (0, True, True)
   it "caps the reads of a read phase at what its typed set can hold, and the cap is never a refusal: a removal and a unit fit, a batch ends early" $ do
     -- the derived cap is above everything one removal or one inspection can read (so neither can be refused for it) and below what a
     -- default batch may ask for (so it is the cap that ends a long batch, not the allowance of #661)

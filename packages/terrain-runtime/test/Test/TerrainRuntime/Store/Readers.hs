@@ -434,11 +434,14 @@ spec = describe "pinned readers, retirement and reclamation" $ do
         lim = smallest formula
         tight = bounded lim
     hrec `shouldSatisfy` (>= 3)
-    (wide, _, _, cpsWide) ← must (planWith standardBounds)
+    (wide, wideWindow, _, cpsWide) ← must (planWith standardBounds)
     (narrow, _, _, cps) ← must (planWith tight)
     cpsWide `shouldBe` 0
     case (wide, narrow) of
       (Planned a, Planned b) → do
+        -- a plan that ends in one window, with no checkpoint, is charged the facts it holds: the proof that each page it retires is absent from
+        -- the index (one for each committed page it replaced) and the memos of its lookups, beside the pages of its window
+        (ramDecodedCopies (mRam (plMeasure a)) >= windowBytes wideWindow + windowProbesBytes wideWindow + factBytes * mReplacedRecord (plMeasure a), mReplacedRecord (plMeasure a) > 0) `shouldBe` (True, True)
         -- the same plan, through checkpoints, in a window that held no more than its bound
         plPages b `shouldBe` plPages a
         mPagesWritten (plMeasure b) `shouldBe` mPagesWritten (plMeasure a)
