@@ -425,10 +425,13 @@ memoBoundBytes len = 48 + 8 * ((len + 7) `div` 8)
 windowCheckpoint ∷ Facts → Window → Window
 windowCheckpoint (Facts fp fs (PackedReads rs fl)) w =
   let same = wFacts w == Just fp
-      -- the memos a plan hands on are the ones it made or used; those it did not touch are released here
-      kept = if same then Set.filter (not . isMemo) (wProven w) else Set.empty
-      keptR = if same then wReadRecords w else Map.empty
-      keptF = if same then wReadFloors w else Map.empty
+      -- I2: a checkpoint that REDUCES the work (it carries the smaller limit, 'FactChunk') releases all the state of the batch it abandons: the memos,
+      -- the proofs and the packed reads its window held, keeping only what the smaller batch is funded for, which is nothing yet. Any other
+      -- checkpoint hands on the memos the plan made or used (those it did not touch are released here) and keeps its proofs and reads.
+      reduces = same && not (null [() | FactChunk _ ← fs])
+      kept = if same && not reduces then Set.filter (not . isMemo) (wProven w) else Set.empty
+      keptR = if same && not reduces then wReadRecords w else Map.empty
+      keptF = if same && not reduces then wReadFloors w else Map.empty
    in w
         { wPages = Map.empty
         , wProbes = Map.empty

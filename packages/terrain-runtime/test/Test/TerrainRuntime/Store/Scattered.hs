@@ -17,14 +17,14 @@ import Data.List (sortOn)
 import qualified Data.Map.Strict as Map
 import Control.Monad (forM, forM_)
 import Data.Word (Word64)
-import Hetoimasia.Terrain.Discovery (Record, RecordKey)
+import Hetoimasia.Terrain.Discovery (ReadSet (..), Record, RecordKey)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Format
 import Hetoimasia.Terrain.Runtime.Store.Internal.Model
 import Hetoimasia.Terrain.Runtime.Store.Internal.Page (Body (..), Child (..), Page (..), decodePage, encodePage)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan
 import Hetoimasia.Terrain.Runtime.Store.Internal.Records (Retire (..), be64, encodeFree, encodeKey, encodeRetire, encodeValue, retiredKey)
 import Hetoimasia.Terrain.Runtime.Store.Internal.State
-import Hetoimasia.Terrain.Runtime.Store.Internal.Tree (Fact (..), Facts (..), Stop (..), factBytesOf, limitWork, memoListCellBytes, newEdit, runM, useMemoM, withMemoCap, memoBaseBytes, memoBoundBytes, windowInsert, windowMemoBytes, windowProbe, windowWork, noReadFacts, windowCheckpoint, windowFactCount, windowFactsFor, windowKnows)
+import Hetoimasia.Terrain.Runtime.Store.Internal.Tree (Fact (..), Facts (..), Stop (..), factBytesOf, limitWork, memoListCellBytes, newEdit, runM, useMemoM, withMemoCap, memoBaseBytes, memoBoundBytes, windowInsert, windowMemoBytes, windowProbe, windowWork, noReadFacts, windowCheckpoint, windowFactCount, windowReadFactCount, packReads, windowFactsFor, windowKnows)
 import Test.TerrainRuntime.Output (printLine)
 import Test.Hspec
 import Test.TerrainRuntime.Store.Depth (Depth (..), atDepth)
@@ -561,6 +561,26 @@ specFingerprint = describe "round 13: the facts a window carries are trusted onl
     windowMemoBytes w `shouldBe` factBytesOf memo
     at (factBytesOf memo) `shouldBe` Left (MemoOver (factBytesOf memo + memoListCellBytes))
     at (factBytesOf memo + memoListCellBytes) `shouldBe` Right ()
+
+  it "releases ALL the state of an abandoned batch at a reduction, and only the memos it did not use at any other checkpoint" $ do
+    -- INVARIANT 2 at the one place every reduction goes through ('windowCheckpoint'): a window that holds a memo, a proof and a packed read, handed
+    -- a checkpoint that carries a reduced work limit, holds none of the three and the limit; handed any other checkpoint, it keeps the proof and
+    -- the read and releases the memo it did not use again
+    let (h0, firstKeys, _) = fragmented
+        roots = storeRoots (hStore h0)
+        fp = fingerprintOf (hIdent h0) roots []
+        bound = Just (toShort (be64 7))
+        memo = FactEdge TreeTodo True (PageNo 5) 99 bound bound 0
+        proof = FactUnreachable (PageNo 9)
+        key = firstKeys !! 0
+        readSet = ReadSet [(key, Nothing)] []
+        carrying = windowCheckpoint (Facts fp [memo, proof] (packReads readSet)) (limitWork 64 (storeWindow (hStore h0)))
+        held w = (windowMemoBytes w, windowKnows proof w, windowReadFactCount w, windowWork w)
+    held carrying `shouldBe` (factBytesOf memo, True, 1, 64)
+    -- a reduction: nothing is carried but the reduced limit
+    held (windowCheckpoint (Facts fp [FactChunk 8] noReadFacts) carrying) `shouldBe` (0, False, 0, 8)
+    -- any other checkpoint: the proof and the read stay, the unused memo goes
+    held (windowCheckpoint (Facts fp [FactNotIndexed (PageNo 11)] noReadFacts) carrying) `shouldBe` (0, True, 1, 64)
 
 -- | A sparse retirement tree is corruption, not a window result: a non-root page of the retirement tree below a quarter
 -- of a payload, re-sealed with every checksum above it, is refused when a plan descends to it; before the rule a

@@ -575,6 +575,74 @@ readPhaseSpec = describe "the read phase: records are facts, a window never hold
     case (full, answer) of
       (Planned a, Planned b) → (0 < mUpdates (plMeasure b), mUpdates (plMeasure b) < mUpdates (plMeasure a), mRecordWrites (plMeasure b) <= 3) `shouldBe` (True, True, True)
       other → expectationFailure ("both batches were expected, got " <> take 300 (show other))
+  it "never requests a page past a full window: a window of one page that holds the root answers the typed window result at once, to an edit that needs a leaf" $ do
+    -- INVARIANT 1: a window that is full never requests, and so never receives, another page. A tree of two levels, a window of one page, an edit
+    -- of an absent key: the driver asks for the root (the window is empty), and for nothing after it
+    let keys = [runKey (toInteger (i `div` 50)) (toInteger (i `mod` 50)) 10 | i ← [0 .. 2999 ∷ Int]]
+        chunks [] = []
+        chunks ks = let (now, later) = splitAt (3 * maxBatchUpdates - 2) ks in now : chunks later
+        commit hh ups = do
+          (hh', out) ← commitDelta hh Ordinary (deltaFor (hStore hh) True False 1 ups)
+          case out of
+            Committed _ → Right hh'
+            other → Left ("history was not built: " <> show other)
+    h ← must (foldM (\hh ks → commit hh [(k, Just (runRec 20)) | k ← ks]) (newH smallSpec ident0) (chunks keys))
+    heightOf h TreeRuns `shouldSatisfy` (>= 2)
+    let one = standardBounds {bdWindowPages = 1, bdWindowBytes = windowPageBytes}
+        delta = deltaFor (hStore h) True False 1 [(runKey 5 60 10, Just (runRec 20))]
+        planner w = planDeltaPinned one (hCfg h) (hIdent h) (storeRoots (hStore h)) (pinnedRoots (hStore h)) w Ordinary delta
+        run d requests (n ∷ Int)
+          | n > 200 = Left "the protocol did not settle"
+          | otherwise = case P.advance d of
+              (d', Continue) → run d' requests (n + 1)
+              (d', NeedPages ps) →
+                let held = windowSize (driverWindow d')
+                 in do
+                      d'' ← foldM (\dd p → maybe (Left "missing page") (\bs → first supplyText (supplyPage p bs dd)) (diskRead (hDisk h) p)) d' ps
+                      run d'' ((held, ps) : requests) (n + 1)
+              (_, step) → Right (reverse requests, stepName step)
+    (requests, ending) ← must (run (newDriverIn (hStore h) (storeWindow (hStore h)) planner) [] 0)
+    -- every page was asked for by a window that held fewer than its one page; the plan ended in a refusal or a stall, never in a plan
+    ([held | (held, _) ← requests, held >= 1], null requests, ending `elem` ["Refuse", "Stuck"]) `shouldBe` ([], False, True)
+  it "plans a discovery batch refused for a continuation its larger batch's reads would fill, from a window released of them: the reduction hands on no read fact" $ do
+    -- INVARIANT 2: a reduction releases all the state of the batch it abandons. The read phase hands its reads on as facts at each checkpoint; the
+    -- batch of the scene is refused for the continuation bound (shrinkable), and the continuation bound admits the smaller batch ALONE: the
+    -- smaller batch is planned from a window that carries none of the larger one's packed reads
+    run0 ← pure (newRun smallSpec twoOpenings 64)
+    r1 ← must (foldM (\r (x, y, z) → removeCell r (tileAt x y z)) run0 openingA)
+    let scene = runEnv run0
+        h1 = runH r1
+        store = hStore h1
+        base = standardBounds {bdReadResidue = 0}
+        plannerOf bounds = planDiscoveryWith bounds scene store
+        total = cfgUsablePages (hCfg h1)
+    (full, _, _) ← must (fillFrom h1 (storeWindow store) (plannerOf base))
+    (unit, _, _) ← must (fillFrom h1 (limitWork 3 (storeWindow store)) (plannerOf base))
+    case (full, unit) of
+      (Planned a, Planned b) → do
+        let admits = ramContinuation (mRam (plMeasure b))
+            bounded = base {bdWorst = worstPlanCharge {ramContinuation = admits}}
+            trace w calls (k ∷ Int)
+              | k > 4000 = Left "no answer"
+              | otherwise = case plannerOf bounded w of
+                  Pending p → case diskRead (hDisk h1) p of
+                    Just bs → either (Left . show) (\w' → trace w' calls (k + 1)) (windowInsert total p bs w)
+                    Nothing → Left "missing page"
+                  PendingProbes ps → trace (foldl (\w' p → windowProbe total p (maybe BS.empty id (diskRead (hDisk h1) p)) w') w ps) calls (k + 1)
+                  Checkpoint facts@(Facts _ fs _) →
+                    let w' = windowCheckpoint facts w
+                     in trace w' ((not (null [() | FactChunk _ ← fs]), windowReadFactCount w, windowReadFactCount w') : calls) (k + 1)
+                  other → Right (other, reverse calls)
+        (answer, calls) ← must (trace (storeWindow store) [] 0)
+        printLine ("DISCOVERY continuation bound " <> show admits <> " (a reduction, read facts before, after): " <> show calls <> "; full continuation " <> show (ramContinuation (mRam (plMeasure a))))
+        -- the larger batch does not fit the bound alone, and the smaller one does
+        (ramContinuation (mRam (plMeasure a)) > admits) `shouldBe` True
+        -- a reduction was taken from a window that held read facts, and handed none on
+        [() | (True, readsBefore, readsAfter) ← calls, readsBefore > 0, readsAfter == 0] `shouldSatisfy` (not . null)
+        case answer of
+          Planned pl → (0 < mUpdates (plMeasure pl), mUpdates (plMeasure pl) < mUpdates (plMeasure a), ramContinuation (mRam (plMeasure pl)) <= admits) `shouldBe` (True, True, True)
+          other → expectationFailure ("the smaller batch was expected, got " <> take 200 (show other))
+      other → expectationFailure ("both batches were expected, got " <> take 300 (show other))
   it "counts no negative window for an empty tree: every page count is zero or more at heights 0 to 8, and the first removal's promised window is a whole window" $ do
     -- an empty tree has height zero: a record write reads and replaces no page of it and a landing holds none (a negative count would have made
     -- the window of the first removal on a new store negative, refused by the window check before it began)

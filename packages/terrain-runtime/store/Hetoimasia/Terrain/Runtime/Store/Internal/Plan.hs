@@ -445,7 +445,12 @@ settleAt _ _ _ r = settle r
 -- carries, and the plan stops with the shrinkable 'TxnRamExceeded' as it makes one past 'bdMemoBytes', before a checkpoint ever holds more).
 needed ∷ Bounds → Fingerprint → Window → PageNo → [Fact] → Planned
 needed bounds fp win p fs
-  | any (\f → not (windowKnows f win)) fs && windowFull bounds win = Checkpoint (Facts fp fs noReadFacts)
+  -- I1: a window that is full never requests, and so never receives, another page: it hands on what is new, or, with nothing new, it is
+  -- the typed window result of the driver
+  | windowFull bounds win =
+      if any (\f → not (windowKnows f win)) fs
+        then Checkpoint (Facts fp fs noReadFacts)
+        else Refused (Capacity (if windowSize win + 1 > bdWindowPages bounds then WindowExceeded (windowSize win) else WindowBytesExceeded (windowBytes win)))
   | otherwise = Pending p
 
 -- ---------------------------------------------------------------------------
