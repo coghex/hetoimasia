@@ -772,7 +772,7 @@ once: `maintenanceUnitPages`, one page, and `discoveryUnitWrites`, the three wri
 which is #661's `worstEdgeWrites`). A standalone removal is one atomic edit and reads no work limit: a window it
 outgrows is a hard capacity result, bounded by `removalWindowPages`. The unit needs a bounded window (the discovery
 unit holds at most `discoveryUnitWindowPages`, 158 pages at the deepest trees and 16 pinned versions, inside the
-explicit edit's 308 and the limit of 320: the edit phase's formula plus the 2 pages of read residue below), so the retry ends in at most six steps with the work done, and never in
+explicit edit's 308 and the limit of 320: the edit phase's formula plus the 4 pages of read residue below), so the retry ends in at most six steps with the work done, and never in
 `Invalid`, `Integrity` or `Stale`: a driver that follows this protocol exactly succeeds from every starting limit
 from 1 to 64 (`Test.TerrainRuntime.Store.Protocol`; the table of the refusals `classifyPlan` maps to `FailInvalid`,
 none of which a valid store reaches, is in the evidence); a caller that retries the same window or restarts at the full work gets the same answer for ever (the
@@ -811,8 +811,11 @@ made. A checkpoint always carries a new fact (a window that cannot hold the plan
 `WindowExceeded`), so a transaction takes at most as many checkpoints as the facts it can make (`maxCheckpoints`: a proof of each
 page it writes against each root, the proof that a number it retires is absent from the index, the memos below, the 64 it
 verifies). A lookup of an edit that concludes an absence, a floor or a ceiling reads the chains of the two neighbouring subtrees
-and memoises each (a fact with its bounds by value, at most `maxMemoBytes` held, counted in the plan's RAM), so a window need not
-keep their pages and a checkpoint carries the memo. What a window holds at once is the edit and one step (one landing), `workOneWindowPages` for a unit of one page and
+and memoises each (a fact with its tree and its bounds by value, at most `maxMemoBytes` held), so a window need not
+keep their pages and a checkpoint carries the memo. What a plan holds of facts is ONE ledger (the window's and its own, each once, at
+`factBytesOf`): every way a plan ends is charged from it and the memo budget is checked where a memo is recorded, as the shrinkable
+`TxnRamExceeded`; a checkpoint hands on the memos the plan made or used and releases the rest, and a smaller reclamation chunk starts
+without the larger one's memos. What a window holds at once is the edit and one step (one landing), `workOneWindowPages` for a unit of one page and
 `removalWindowPages` for a standalone removal, which cannot shrink (the edit phase's formula plus `readResiduePages`,
 below); both rest on `maxLevel` and `maxReaders`
 alone, and both are asserted against `maxWindowBytes / windowPageBytes` (320 pages) for every height 1 to 8 and
